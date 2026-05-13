@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: videoprocess
+Version: 0.1.0
+Requires-Python: >=3.12
+Requires-Dist: fastapi
+Requires-Dist: uvicorn[standard]
+Requires-Dist: sqlalchemy[asyncio]
+Requires-Dist: asyncpg
+Requires-Dist: alembic
+Requires-Dist: pydantic-settings
+Requires-Dist: python-multipart
+Requires-Dist: redis[hiredis]
+Requires-Dist: minio
+Requires-Dist: aiofiles
+Requires-Dist: httpx
+Provides-Extra: api
+Provides-Extra: worker
+Requires-Dist: faster-whisper; extra == "worker"
+Requires-Dist: google-api-python-client; extra == "worker"
+Requires-Dist: google-auth-httplib2; extra == "worker"
+Requires-Dist: google-auth-oauthlib; extra == "worker"
+Requires-Dist: yt-dlp; extra == "worker"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-asyncio; extra == "dev"
+Requires-Dist: httpx; extra == "dev"

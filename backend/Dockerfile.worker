@@ -1,0 +1,23 @@
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DEBIAN_FRONTEND=noninteractive
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv python3-dev \
+    ffmpeg libpq-dev gcc && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python \
+    && python -m venv ${VIRTUAL_ENV} \
+    && ${VIRTUAL_ENV}/bin/pip install --upgrade pip setuptools wheel
+
+WORKDIR /app
+COPY pyproject.toml .
+RUN pip install ".[worker]" \
+    && pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+
+COPY app /app/app
+COPY worker /app/worker
+
+CMD ["python", "-m", "worker.main"]

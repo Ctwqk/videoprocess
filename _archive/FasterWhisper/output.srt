@@ -1,0 +1,1096 @@
+1
+00:00:00,000 --> 00:00:05,400
+Imagine you're walking home one night through a thick fog. Ahead, you see a vague
+
+2
+00:00:05,400 --> 00:00:11,880
+shape moving towards you. Is it a stray dog, a cat, or maybe just a garbage bag
+
+3
+00:00:11,880 --> 00:00:17,720
+blown by the wind? In this moment, your brain doesn't pick a single answer.
+
+4
+00:00:17,720 --> 00:00:22,560
+Instead, it considers multiple possibilities, each with its own
+
+5
+00:00:22,560 --> 00:00:27,880
+likelihood. This scenario illustrates a fundamental aspect of how our brains
+
+6
+00:00:27,880 --> 00:00:34,400
+process information. We don't just see things as binary, we interpret probabilities.
+
+7
+00:00:34,400 --> 00:00:40,840
+When faced with unclear or incomplete information, we naturally think in terms
+
+8
+00:00:40,840 --> 00:00:46,920
+of likelihoods and uncertainties. This probabilistic view of sensory data also
+
+9
+00:00:46,920 --> 00:00:53,400
+underlies many advancements in modern machine learning. In fact, a surprising
+
+10
+00:00:53,400 --> 00:00:59,400
+number of computational problems, solved by both biological and artificial systems,
+
+11
+00:00:59,400 --> 00:01:04,440
+can be viewed through this lens. Learning the probability distribution of data,
+
+12
+00:01:04,440 --> 00:01:10,880
+performing inference, and synthesizing new samples from it. A capability often
+
+13
+00:01:10,880 --> 00:01:16,320
+referred to as generative modeling. The language of probability and uncertainty
+
+14
+00:01:16,320 --> 00:01:22,800
+is built on a few crucial concepts, such as entropy and KL divergence. These ideas
+
+15
+00:01:22,840 --> 00:01:29,280
+are so fundamental that they appear across diverse fields, from the latest diffusion
+
+16
+00:01:29,280 --> 00:01:36,240
+models in AI, to theories of perception in biological brains, like the free energy principle.
+
+17
+00:01:36,240 --> 00:01:42,880
+Today, we'll dive deep into the core concepts behind probability, starting from the ground up,
+
+18
+00:01:42,880 --> 00:01:49,840
+and demystifying many of the formulas that might appear intimidating at first, but which have a
+
+19
+00:01:49,920 --> 00:01:53,520
+very intuitive understanding. If you're interested, stay tuned.
+
+20
+00:02:00,800 --> 00:02:06,080
+Before we dive into probability theory, let's address the uncertainty lurking in our online
+
+21
+00:02:06,080 --> 00:02:12,800
+lives. NordVPN, who are kindly sponsoring today's video, offers an excellent solution to mitigate
+
+22
+00:02:12,800 --> 00:02:18,400
+that digital uncertainty. Navigating the web is much like walking through that fog we mentioned
+
+23
+00:02:18,400 --> 00:02:23,840
+earlier. But instead of mysterious shapes, you're surrounded by potential threats to your privacy.
+
+24
+00:02:24,480 --> 00:02:30,560
+This risk is particularly high when using public Wi-Fi networks. Using an unsecured connection is
+
+25
+00:02:30,560 --> 00:02:35,440
+like hoping to have a private conversation in a crowded room where anyone could be listening.
+
+26
+00:02:36,240 --> 00:02:42,640
+This is where NordVPN proves invaluable. It encrypts your data, making it unreadable to prying eyes.
+
+27
+00:02:43,280 --> 00:02:48,080
+Remember those annoying banners that somehow know where you live? That's just the tip of the
+
+28
+00:02:48,080 --> 00:02:53,680
+iceberg. Consider all the other sensitive information potentially at risk. Passwords,
+
+29
+00:02:53,680 --> 00:03:00,160
+personal identity, credit card details, the list goes on. This is why using online protection tools
+
+30
+00:03:00,160 --> 00:03:06,560
+is a must in today's reality. NordVPN goes above and beyond basic protection with their
+
+31
+00:03:06,560 --> 00:03:13,440
+Threat Protection Pro feature. It not only encrypts your data, but also scans downloads for malware,
+
+32
+00:03:13,440 --> 00:03:18,000
+blocks suspicious websites, and even eliminates those pop-up ads.
+
+33
+00:03:18,000 --> 00:03:22,800
+For anyone prioritizing both security and a seamless browsing experience,
+
+34
+00:03:22,800 --> 00:03:27,920
+this feature is a game changer. If you're ready to take control of your online security,
+
+35
+00:03:27,920 --> 00:03:34,400
+visit NordVPN.com slash Artem Kirsanov to get four months extra when you sign up for a two-year plan.
+
+36
+00:03:35,120 --> 00:03:41,600
+Still unsure? NordVPN offers a 30-day money-back guarantee. You can try it risk-free,
+
+37
+00:03:41,600 --> 00:03:47,920
+so the probability you'll be satisfied approaches one. NordVPN is committed to privacy.
+
+38
+00:03:47,920 --> 00:03:53,360
+They have a strict no-logs policy, which means they don't track or store online activities.
+
+39
+00:03:53,360 --> 00:03:58,480
+It is also the fastest VPN on the market, ensuring you won't even notice it's running.
+
+40
+00:03:59,120 --> 00:04:05,040
+Don't leave your online security to chance. Head to NordVPN.com slash Artem Kirsanov,
+
+41
+00:04:05,040 --> 00:04:07,920
+link in the description, to claim the exclusive offer.
+
+42
+00:04:08,720 --> 00:04:13,840
+The most fundamental concept in our today's discussion is the notion of a probability
+
+43
+00:04:13,840 --> 00:04:19,040
+distribution. In general, we deal with an abstract set of possible states,
+
+44
+00:04:19,600 --> 00:04:26,960
+and to each of those states, we assign a positive number between 0 and 1. This number
+
+45
+00:04:26,960 --> 00:04:32,800
+reflects our degree of belief in how likely that particular state is to occur.
+
+46
+00:04:33,680 --> 00:04:38,800
+You're probably familiar with thinking about probability in terms of the proportion of
+
+47
+00:04:38,800 --> 00:04:45,280
+outcomes from high school. For example, a six-sided die has six possible states.
+
+48
+00:04:46,000 --> 00:04:52,560
+To find the probability of rolling a three, for example, you would roll the die many times,
+
+49
+00:04:53,200 --> 00:04:59,200
+count how often it lands on three, and divide it by the total number of rolls.
+
+50
+00:05:00,160 --> 00:05:06,000
+As you increase the number of rolls, this ratio converges to 1 over 6,
+
+51
+00:05:06,000 --> 00:05:09,440
+which is the probability for any side of a fair die.
+
+52
+00:05:10,480 --> 00:05:15,600
+This approach, which relies on repeated trials and tracking outcomes,
+
+53
+00:05:15,600 --> 00:05:19,200
+is called the frequentist interpretation of probability.
+
+54
+00:05:20,080 --> 00:05:25,760
+While this interpretation works well for dice or coin flips, it has limitations.
+
+55
+00:05:26,560 --> 00:05:32,640
+Consider a weather forecast stating the probability of rain tomorrow is 70%.
+
+56
+00:05:33,520 --> 00:05:39,120
+We intuitively understand this, but it doesn't fit neatly into the frequentist definition.
+
+57
+00:05:39,920 --> 00:05:46,960
+We can't repeat tomorrow's weather multiple times to find the frequency of rain outcomes.
+
+58
+00:05:46,960 --> 00:05:51,120
+Tomorrow will happen only once, and it will either rain or not.
+
+59
+00:05:51,760 --> 00:05:54,720
+This is why we'll adopt the Bayesian view,
+
+60
+00:05:54,720 --> 00:05:59,280
+which treats probability more generally as the degree of belief.
+
+61
+00:06:00,320 --> 00:06:08,880
+When we say rain with probability 0.7, it means we've assigned a 0.7 degree of certainty to it.
+
+62
+00:06:10,080 --> 00:06:15,120
+While this definition might seem very broad, it still obeys certain laws.
+
+63
+00:06:15,840 --> 00:06:22,400
+The most crucial one is that all the degrees of belief you assign to possible states
+
+64
+00:06:22,400 --> 00:06:24,080
+must sum to 1.
+
+65
+00:06:24,080 --> 00:06:28,560
+For instance, if there are only two outcomes, rain and sun,
+
+66
+00:06:28,560 --> 00:06:36,400
+then saying the probability of rain is 0.7 implies that the probability of sun is 0.3.
+
+67
+00:06:37,200 --> 00:06:40,560
+This brings us to the notion of a probability distribution.
+
+68
+00:06:41,280 --> 00:06:48,080
+Essentially, it is a function that maps each possible state to its assigned probability value.
+
+69
+00:06:48,080 --> 00:06:50,880
+Because probabilities must sum to 1,
+
+70
+00:06:50,880 --> 00:06:55,680
+we can't manipulate this function for one state independently of others.
+
+71
+00:06:56,240 --> 00:06:58,960
+It characterizes the system as a whole,
+
+72
+00:06:58,960 --> 00:07:04,160
+completely describing how uncertainty is distributed among individual states.
+
+73
+00:07:05,040 --> 00:07:08,720
+Here are a few examples of probability distributions.
+
+74
+00:07:08,720 --> 00:07:14,960
+For a fair die, the distribution is uniform, each side has a possibility of 1 over 6.
+
+75
+00:07:15,760 --> 00:07:18,880
+The distribution of heights of adults in a population
+
+76
+00:07:19,520 --> 00:07:23,040
+follows the famous bell-shaped Gaussian distribution.
+
+77
+00:07:23,600 --> 00:07:25,520
+There is a technical detail here.
+
+78
+00:07:25,520 --> 00:07:32,160
+Since height is a continuous variable, the probability distribution must integrate to 1,
+
+79
+00:07:32,160 --> 00:07:35,840
+meaning that the area under the entire curve equals to 1.
+
+80
+00:07:36,560 --> 00:07:39,520
+But this is just a general case of summation.
+
+81
+00:07:39,520 --> 00:07:44,720
+You can think of continuous distributions as being made up of a large number of tiny,
+
+82
+00:07:44,720 --> 00:07:46,160
+discrete bins.
+
+83
+00:07:46,160 --> 00:07:48,800
+It won't change the core concepts we are discussing.
+
+84
+00:07:49,600 --> 00:07:54,000
+So far, we've only looked at the probability distributions over states
+
+85
+00:07:54,000 --> 00:07:57,120
+that can be neatly arranged on a one-dimensional line.
+
+86
+00:07:58,000 --> 00:08:03,920
+But what about more complex scenarios, like states that include both height and weight?
+
+87
+00:08:04,880 --> 00:08:09,520
+We could try to put them on a one-dimensional line, but that's not very enlightening.
+
+88
+00:08:10,400 --> 00:08:16,880
+Instead, it is more natural to think of states as occupying a two-dimensional plane
+
+89
+00:08:16,880 --> 00:08:19,760
+with one coordinate for the height and one for the weight.
+
+90
+00:08:20,400 --> 00:08:25,280
+Then, each point on this plane corresponds to a particular state,
+
+91
+00:08:25,920 --> 00:08:31,200
+and we can represent its probability with color or as a third coordinate.
+
+92
+00:08:32,160 --> 00:08:37,280
+For more coordinates, we can't directly visualize higher dimensions,
+
+93
+00:08:37,280 --> 00:08:39,040
+but the idea remains the same.
+
+94
+00:08:39,760 --> 00:08:44,880
+In machine learning, we often deal with much higher-dimensional probability distributions.
+
+95
+00:08:45,440 --> 00:08:49,440
+For instance, all possible 100x100 pixel images
+
+96
+00:08:50,080 --> 00:08:55,920
+occupy a 10,000-dimensional space with one axis for each pixel's value.
+
+97
+00:08:56,640 --> 00:09:00,640
+We can then reason about the probability distribution of images
+
+98
+00:09:01,200 --> 00:09:05,040
+by assigning a probability to each point in this space.
+
+99
+00:09:05,920 --> 00:09:10,720
+But how do we actually use or interact with these complex distributions?
+
+100
+00:09:11,520 --> 00:09:15,360
+To understand this, let's go back to our simpler example
+
+101
+00:09:15,360 --> 00:09:21,360
+and think about the reverse process of generating outcomes from a probability distribution.
+
+102
+00:09:22,080 --> 00:09:25,040
+This is called sampling and it is a crucial concept
+
+103
+00:09:25,040 --> 00:09:28,640
+that is at the heart of many generative AI models.
+
+104
+00:09:29,280 --> 00:09:35,600
+In the case of a die, rolling it generates a new sample from the underlying distribution,
+
+105
+00:09:36,160 --> 00:09:39,280
+picking one state at random with a certain probability.
+
+106
+00:09:39,840 --> 00:09:45,600
+Similarly, if we have a way to draw samples from a 10,000-dimensional distribution,
+
+107
+00:09:46,480 --> 00:09:48,480
+we can generate new images.
+
+108
+00:09:49,120 --> 00:09:54,480
+Because this distribution captures the structure of data present in natural images,
+
+109
+00:09:55,440 --> 00:10:01,920
+this would be entirely different from randomly selecting values for each pixel independently,
+
+110
+00:10:01,920 --> 00:10:04,240
+as this would always result in noise.
+
+111
+00:10:05,120 --> 00:10:09,680
+Now that we have established a common ground for the language of probability,
+
+112
+00:10:09,680 --> 00:10:15,600
+let's explore the powerful math behind what it takes to describe and model a distribution.
+
+113
+00:10:16,880 --> 00:10:19,040
+Let's start with the notion of surprise.
+
+114
+00:10:20,080 --> 00:10:22,800
+Imagine that before you toss a coin,
+
+115
+00:10:22,880 --> 00:10:26,320
+someone comes up to you and correctly predicts the outcome.
+
+116
+00:10:27,520 --> 00:10:30,560
+Will you be surprised to see this prediction hold?
+
+117
+00:10:31,440 --> 00:10:33,760
+Well, maybe, but not too much.
+
+118
+00:10:33,760 --> 00:10:36,720
+After all, the chance of guessing was 50-50.
+
+119
+00:10:37,840 --> 00:10:40,720
+Now suppose you do the same for rolling a die
+
+120
+00:10:41,280 --> 00:10:45,360
+and someone correctly predicts that it would land on 1.
+
+121
+00:10:46,000 --> 00:10:50,240
+You'd likely be more surprised by this rather than a coin, right?
+
+122
+00:10:51,120 --> 00:10:54,160
+Let's try to formalize this notion of surprise.
+
+123
+00:10:55,040 --> 00:10:59,600
+Essentially, we're looking for a way to assign a positive number,
+
+124
+00:10:59,600 --> 00:11:02,160
+a surprizal measure, to each state.
+
+125
+00:11:03,120 --> 00:11:09,600
+This measure should be a function of probability that gets larger for smaller values
+
+126
+00:11:09,600 --> 00:11:12,880
+and shrinks to 0 when the probability approaches 1.
+
+127
+00:11:14,080 --> 00:11:19,520
+After all, events that are guaranteed to happen should have no surprise at all.
+
+128
+00:11:20,480 --> 00:11:25,440
+A crucial but less obvious aspect is the additive nature of the surprise.
+
+129
+00:11:26,320 --> 00:11:31,440
+If someone correctly predicts the outcomes of 3 dice rolled simultaneously,
+
+130
+00:11:32,000 --> 00:11:35,760
+we'd be about 3 times as surprised as for 1 die.
+
+131
+00:11:36,880 --> 00:11:42,560
+But the probability of such an event would be the product of individual die probabilities.
+
+132
+00:11:43,600 --> 00:11:49,200
+In other words, when probabilities multiply, as for independent events,
+
+133
+00:11:49,200 --> 00:11:51,440
+the surprizal function should add.
+
+134
+00:11:52,720 --> 00:11:58,000
+The function that behaves this way is the logarithm of 1 over the probability.
+
+135
+00:11:59,120 --> 00:12:00,640
+This makes intuitive sense.
+
+136
+00:12:01,280 --> 00:12:06,400
+Surprise is high for rare events and low for common outcomes.
+
+137
+00:12:07,520 --> 00:12:10,480
+Now that each state has its own surprise,
+
+138
+00:12:11,120 --> 00:12:18,000
+we can characterize the entire distribution by finding the average surprise packed into it.
+
+139
+00:12:18,960 --> 00:12:24,000
+This average surprise is what we call the entropy of that distribution.
+
+140
+00:12:24,960 --> 00:12:27,840
+Mathematically, it is expressed in the following way,
+
+141
+00:12:28,640 --> 00:12:31,440
+where we sum over all possible states,
+
+142
+00:12:32,080 --> 00:12:37,120
+multiplying the probability of each state by its surprizal value.
+
+143
+00:12:41,120 --> 00:12:47,280
+For example, consider a thick coin that lands on heads and tails with probability
+
+144
+00:12:47,280 --> 00:12:52,240
+49% each and on its side 2% of the time.
+
+145
+00:12:53,360 --> 00:12:59,920
+If you randomly flip it many times, record your surprizal caused by the outcome of each flip
+
+146
+00:13:00,560 --> 00:13:05,120
+and compute the average surprizal, what value are you going to get?
+
+147
+00:13:06,160 --> 00:13:11,200
+Well, every time you get either a heads or a tails, which in total comprises
+
+148
+00:13:11,200 --> 00:13:16,240
+98% of all the flips, your surprizal is about 0.7.
+
+149
+00:13:17,280 --> 00:13:22,160
+But in the remaining 2%, your surprizal will be around 4.
+
+150
+00:13:22,960 --> 00:13:29,120
+So the weighted average given by this formula is approximately equal to 0.8.
+
+151
+00:13:30,160 --> 00:13:35,760
+Compare this to the entropy of a fair coin that always lands on heads or tails.
+
+152
+00:13:36,560 --> 00:13:41,520
+This value is less, which means you will be on average more surprised
+
+153
+00:13:41,520 --> 00:13:45,200
+by observing outcomes of a coin that lands on its side.
+
+154
+00:13:46,080 --> 00:13:50,720
+In other words, it has more inherent uncertainty packed into it.
+
+155
+00:13:52,720 --> 00:13:55,360
+Now, I'd like to highlight an important point.
+
+156
+00:13:56,320 --> 00:14:00,720
+Computing entropy relies on knowing the probability distribution.
+
+157
+00:14:01,680 --> 00:14:05,920
+But in real world, when we observe a random variable unfold,
+
+158
+00:14:05,920 --> 00:14:10,320
+we don't have access to the true underlying probability distribution.
+
+159
+00:14:10,960 --> 00:14:14,240
+Instead, we usually have an internal model,
+
+160
+00:14:14,240 --> 00:14:17,280
+what we believe the probability distribution should be.
+
+161
+00:14:17,920 --> 00:14:21,040
+And this is what we use to assign the probabilities.
+
+162
+00:14:22,240 --> 00:14:28,160
+The true underlying distribution is hidden and typically far too complex,
+
+163
+00:14:28,160 --> 00:14:31,280
+so all we have are approximate models of it.
+
+164
+00:14:32,400 --> 00:14:34,720
+For instance, consider a fair die.
+
+165
+00:14:35,520 --> 00:14:40,960
+The true probability distribution of its sides slightly deviates from uniform
+
+166
+00:14:41,600 --> 00:14:47,680
+due to inherent microscopic imperfections in the die itself, air resistance, etc.
+
+167
+00:14:48,880 --> 00:14:54,640
+It may even include other outcomes, such as landing exactly on a corner
+
+168
+00:14:54,640 --> 00:14:59,040
+or with vanishingly small probability falling apart in the air.
+
+169
+00:15:00,000 --> 00:15:07,280
+However, we approximate this with a simple uniform distribution, 1 over 6 for each side.
+
+170
+00:15:08,160 --> 00:15:12,000
+This model captures everything we need for practical purposes.
+
+171
+00:15:13,520 --> 00:15:16,880
+But what if the deviation between our internal model
+
+172
+00:15:16,880 --> 00:15:19,680
+and the actual distribution is more drastic?
+
+173
+00:15:20,720 --> 00:15:22,080
+Let's consider an example.
+
+174
+00:15:22,880 --> 00:15:25,520
+Suppose someone gives you a coin to flip.
+
+175
+00:15:26,480 --> 00:15:29,600
+Based on your prior experience with coins,
+
+176
+00:15:29,600 --> 00:15:34,720
+you believe the probabilities for heads and tails to be around 50% each.
+
+177
+00:15:36,080 --> 00:15:40,240
+What you don't know though is that this particular coin is rigged,
+
+178
+00:15:40,240 --> 00:15:46,640
+with its center of mass shifted so that it lands on heads around 99% of the time.
+
+179
+00:15:48,160 --> 00:15:52,560
+You go ahead and flip it 10 times, getting 10 heads in a row.
+
+180
+00:15:53,520 --> 00:15:56,320
+Under your current model of a fair coin,
+
+181
+00:15:56,880 --> 00:16:02,720
+the probability of this happening is extremely small, so you will be very surprised.
+
+182
+00:16:03,280 --> 00:16:09,600
+However, the actual true probability of this outcome is quite high because the coin is rigged.
+
+183
+00:16:10,240 --> 00:16:16,400
+Notice that the surprise you experienced is caused by your belief about the probability
+
+184
+00:16:16,400 --> 00:16:21,120
+distribution being wrong, not because something truly remarkable had happened.
+
+185
+00:16:22,080 --> 00:16:24,720
+This brings us to the idea of cross entropy.
+
+186
+00:16:25,520 --> 00:16:33,040
+Essentially, it is a function of two probability distributions that quantifies the average surprise
+
+187
+00:16:33,040 --> 00:16:39,840
+you might expect when observing a random process generated by one probability distribution
+
+188
+00:16:40,480 --> 00:16:43,040
+while believing it comes from another.
+
+189
+00:16:43,920 --> 00:16:51,120
+Mathematically, the cross entropy between distributions P, the true one, and Q, your model,
+
+190
+00:16:51,680 --> 00:16:59,280
+is defined similarly to entropy, but we use P for the outcome probabilities and Q for the
+
+191
+00:16:59,280 --> 00:17:05,760
+surprizal terms. The surprise given by cross entropy can come from two sources.
+
+192
+00:17:06,480 --> 00:17:10,240
+The discrepancy between your model and the true distribution,
+
+193
+00:17:10,960 --> 00:17:15,840
+as well as the inherent uncertainty of the underlying distribution itself.
+
+194
+00:17:16,880 --> 00:17:22,400
+If P and Q are the same distribution, meaning that you have a perfect model,
+
+195
+00:17:22,960 --> 00:17:26,800
+the cross entropy is simply equal to the entropy of P.
+
+196
+00:17:27,760 --> 00:17:32,000
+A key mathematical property, which we're not going to prove rigorously here,
+
+197
+00:17:32,640 --> 00:17:39,360
+is that the cross entropy of distribution P as the ground truth and Q as its model
+
+198
+00:17:40,000 --> 00:17:46,400
+is always greater than or equal to the entropy of P itself. In other words,
+
+199
+00:17:46,400 --> 00:17:53,040
+believing in their own model of a random variable can only increase the surprise you'll get by
+
+200
+00:17:53,040 --> 00:18:00,560
+observing it, never decrease it. Another important feature of cross entropy is its asymmetry.
+
+201
+00:18:01,360 --> 00:18:07,360
+The roles of P and Q matter and swapping them can lead to very different results.
+
+202
+00:18:07,920 --> 00:18:15,200
+Let's explore this with two examples. First, believing a coin is fair when it is actually
+
+203
+00:18:15,200 --> 00:18:24,480
+rigged. Suppose the true distribution P is a rigged coin, 99% for heads, 1% for tails.
+
+204
+00:18:25,200 --> 00:18:32,400
+But your model Q is a fair coin. For a single flip, the cross entropy can be calculated in
+
+205
+00:18:32,400 --> 00:18:41,120
+the following way and is equal to approximately 0.7. Now let's reverse the scenario. What if you
+
+206
+00:18:41,120 --> 00:18:50,000
+believe a coin is rigged when it is actually fair? Computing the cross entropy gives us 2.3. This
+
+207
+00:18:50,000 --> 00:18:57,520
+value is much larger than the other way around. This is because half the time when you see tails,
+
+208
+00:18:57,600 --> 00:19:03,200
+you will be extremely surprised as your model predicted this was very unlikely.
+
+209
+00:19:04,000 --> 00:19:10,960
+The other half of the time when you see heads, you'll have a very low surprise. But the extreme
+
+210
+00:19:10,960 --> 00:19:17,760
+surprise from tails dominates, leading to a high average surprise measured by the cross entropy.
+
+211
+00:19:19,600 --> 00:19:25,680
+Our examples of cross entropy highlight an important question. How can we quantify the
+
+212
+00:19:25,680 --> 00:19:32,240
+difference between our model's beliefs and the reality? Can we somehow isolate the part of the
+
+213
+00:19:32,240 --> 00:19:38,480
+surprise that comes purely from our model's inaccuracy, rather than from the inherent
+
+214
+00:19:38,480 --> 00:19:44,080
+uncertainty in the data? This is where the concept of Kullback-Liebler divergence,
+
+215
+00:19:44,080 --> 00:19:50,880
+or KL divergence for short, comes into play. It allows us to peel away layers of surprise.
+
+216
+00:19:51,840 --> 00:19:58,240
+Recall our definition of cross entropy. This measures the total surprise when using Q to
+
+217
+00:19:58,240 --> 00:20:06,000
+predict P. Now, what if we subtracted the entropy of P from this? This formula represents the
+
+218
+00:20:06,000 --> 00:20:13,280
+inherent uncertainty in P itself. By subtracting it from the cross entropy and using the properties
+
+219
+00:20:13,360 --> 00:20:22,080
+of logarithms, we are left with this. This is the KL divergence. It measures the extra surprise
+
+220
+00:20:22,080 --> 00:20:28,640
+we get from using Q as our model instead of P, beyond the surprise inherent in P.
+
+221
+00:20:30,080 --> 00:20:36,960
+In our coin analogy, it is like isolating the surprise caused by believing in the wrong model,
+
+222
+00:20:36,960 --> 00:20:40,320
+separate from the surprise caused by the coin flip itself.
+
+223
+00:20:41,360 --> 00:20:45,120
+But why might we need to measure this discrepancy in the first place?
+
+224
+00:20:46,000 --> 00:20:51,280
+Well, the ultimate goal of building and training many machine learning systems
+
+225
+00:20:51,280 --> 00:20:58,240
+is to construct a good approximation, a model of the underlying probability distribution of some
+
+226
+00:20:58,240 --> 00:21:05,760
+data, to later use it for prediction or sampling. For example, suppose you are building an AI system
+
+227
+00:21:05,760 --> 00:21:13,360
+that can create new, lifelike photos of cats. Ideally, you'd want to sample directly from the
+
+228
+00:21:13,360 --> 00:21:20,320
+distribution of all possible cat images in the real world. However, that is an incredibly complex
+
+229
+00:21:20,320 --> 00:21:27,200
+space that we can't directly access or describe, so we'll have to resort to building a model to
+
+230
+00:21:27,200 --> 00:21:33,200
+approximate it. Without diving too deep into the specifics of generative models in this video,
+
+231
+00:21:33,840 --> 00:21:39,840
+I will just say that we usually approximate the shape of that distribution with neural networks.
+
+232
+00:21:40,800 --> 00:21:47,120
+These can be viewed as mathematical functions with enough expressive power to capture complex
+
+233
+00:21:47,120 --> 00:21:53,600
+patterns. Once we have parameterized the distribution with a neural net of some kind,
+
+234
+00:21:54,240 --> 00:21:58,720
+we can optimize its parameters with techniques like gradient descent.
+
+235
+00:21:59,680 --> 00:22:03,360
+If you're not familiar with gradient descent or backpropagation,
+
+236
+00:22:03,360 --> 00:22:08,880
+you can check out my previous video on the topic. But how do we know whether a particular
+
+237
+00:22:08,880 --> 00:22:15,360
+approximation is a good or a bad fit to the true target distribution? After all,
+
+238
+00:22:15,360 --> 00:22:21,040
+we need some kind of error function that we'll be trying to minimize. You might have guessed that
+
+239
+00:22:21,040 --> 00:22:27,600
+the keel divergence between our model and the true distribution is exactly the target objective
+
+240
+00:22:27,600 --> 00:22:33,200
+we would like to make as low as possible. Ideally, we'd aim for zero, which would mean
+
+241
+00:22:33,200 --> 00:22:39,520
+our model perfectly aligns with the data distribution. However, in practice, if you look
+
+242
+00:22:39,520 --> 00:22:45,440
+at the code for training models to capture a probability distribution, you typically won't see
+
+243
+00:22:45,440 --> 00:22:51,680
+the keel divergence as a loss function. Instead, you're likely to see the optimization objective
+
+244
+00:22:51,680 --> 00:22:57,920
+framed as minimizing the cross entropy. So what's the catch here? Let's look at the definition of
+
+245
+00:22:57,920 --> 00:23:03,920
+keel divergence once again. We're trying to find the model Q that would minimize this quantity.
+
+246
+00:23:04,880 --> 00:23:11,680
+However, notice that the term H of P does not depend on our model at all. It is a constant
+
+247
+00:23:11,680 --> 00:23:17,920
+determined by the true distribution P, which we can't change because it stems from the inherent
+
+248
+00:23:17,920 --> 00:23:24,320
+uncertainty in the training data that is fixed. No matter how we tweak the parameters of a neural
+
+249
+00:23:24,320 --> 00:23:31,840
+network, it has absolutely no effect on how diverse cats in the real world are. This is why
+
+250
+00:23:31,840 --> 00:23:38,720
+whatever approximation Q minimizes the keel divergence, it also, by definition, minimizes
+
+251
+00:23:38,720 --> 00:23:45,280
+the cross entropy. In other words, the two objectives are equivalent. The entropy of data
+
+252
+00:23:45,280 --> 00:23:51,840
+term does not affect which Q is optimal. It just shifts the value of keel divergence by a constant
+
+253
+00:23:51,840 --> 00:23:58,560
+amount. Computing the exact value of keel divergence would require estimating the entropy of training
+
+254
+00:23:58,560 --> 00:24:04,960
+data from a finite number of samples. Although you can certainly do it, usually we don't really care
+
+255
+00:24:04,960 --> 00:24:11,040
+about what the actual value of the divergence is as long as it's the lowest one possible. It doesn't
+
+256
+00:24:11,040 --> 00:24:15,760
+affect the resulting model, so we just don't bother with estimating the entropy of data
+
+257
+00:24:15,760 --> 00:24:22,400
+in the first place to save some computation. This forms the basis for many machine learning
+
+258
+00:24:22,400 --> 00:24:28,480
+algorithms, especially in the realm of generative models. By framing our objective in terms of cross
+
+259
+00:24:28,480 --> 00:24:35,280
+entropy minimization, we can train our models to approximate complex real world distributions
+
+260
+00:24:35,280 --> 00:24:41,840
+even when we don't have direct access to those distributions. While minimizing the cross entropy
+
+261
+00:24:41,840 --> 00:24:48,800
+is at the very core of modern generative models, training complex systems like image generation
+
+262
+00:24:48,800 --> 00:24:55,200
+networks in practice often requires additional techniques that go beyond the scope of this video.
+
+263
+00:24:55,840 --> 00:25:01,280
+These may include things like variational inference, which we might explore in the future.
+
+264
+00:25:01,360 --> 00:25:06,640
+My main goal today was to lay a solid foundation for understanding what it means
+
+265
+00:25:06,640 --> 00:25:13,440
+to learn the probability distribution of data. We have explored fundamental concepts like entropy,
+
+266
+00:25:13,440 --> 00:25:19,600
+cross entropy, and keel divergence, showing how they are rooted in intuitive ideas of
+
+267
+00:25:19,600 --> 00:25:26,240
+surprise and uncertainty. These principles are not just abstract mathematical constructs,
+
+268
+00:25:26,800 --> 00:25:33,040
+they form the backbone of how we quantify, model, and learn from data in the real world.
+
+269
+00:25:33,920 --> 00:25:39,440
+So hopefully next time you encounter terms like cross entropy in the minimization problem,
+
+270
+00:25:40,160 --> 00:25:47,360
+you will recognize it not as a mysterious formula but as an intuitive idea of measuring and minimizing
+
+271
+00:25:47,360 --> 00:25:53,440
+the gap between our models and reality. If you liked the video, share it with your friends,
+
+272
+00:25:53,440 --> 00:25:57,200
+press the like button and subscribe to the channel if you haven't already.
+
+273
+00:25:57,200 --> 00:26:01,360
+Stay tuned for more computational neuroscience and machine learning topics coming up.
+
+274
+00:26:02,080 --> 00:26:11,360
+Goodbye and thank you for the interest in the brain.
+

@@ -1,0 +1,48 @@
+services:
+  voice-chat-bot:
+    build: .
+    container_name: voice_chat_bot
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      LLM_URL: "http://192.168.20.2:52415/v1/chat/completions"
+      EXO_MODEL_FILE: "/run/exo/model.txt"
+      TTS_WS_URL: "ws://xtts-api:8000/v1/tts/ws"
+      TTS_LANGUAGE: "zh-cn"
+      STT_MODEL: "medium"
+      STT_DEVICE: "cuda"
+      STT_COMPUTE_TYPE: "float16"
+      STT_LANGUAGE: "zh"
+      HF_HOME: "/models/hf"
+    volumes:
+      - ./models:/models
+      - ../../../infra/exo/model.txt:/run/exo/model.txt:ro
+    networks:
+      - videoprocess_net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  audio-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: voice_audio_client
+    profiles: ["client-linux"]
+    network_mode: host
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - PYTHONUNBUFFERED=1
+    stdin_open: true
+    tty: true
+    command: ["python", "mic_stream_client.py", "--help"]
+
+networks:
+  videoprocess_net:
+    external: true

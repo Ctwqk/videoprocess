@@ -1,0 +1,20 @@
+services:
+  xtts-api:
+    build: .
+    container_name: xtts_v2_api
+    network_mode: host
+    environment:
+      - USE_GPU=true
+      - TTS_DEVICE=cuda
+      - XTTS_MODEL_NAME=tts_models/multilingual/multi-dataset/xtts_v2
+      - OUTPUT_DIR=/app/output
+      - SPEAKER_CACHE_DIR=/app/speaker-cache
+      - COQUI_TOS_AGREED=1
+      - DEFAULT_SPEAKER_WAV=/app/voicesource/sample.wav
+    volumes:
+      - ./output:/app/output
+      - ./models:/root/.local/share/tts
+      - ./speaker-cache:/app/speaker-cache
+      - ./voicesource:/app/voicesource:ro
+    gpus: all
+    restart: unless-stopped

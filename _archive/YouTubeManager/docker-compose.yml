@@ -1,0 +1,20 @@
+services:
+  youtube-manager:
+    build: .
+    container_name: youtube_manager
+    ports:
+      - "8899:8899"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./credentials:/app/credentials
+    environment:
+      - GOOGLE_CLIENT_SECRETS_FILE=/app/credentials/client_secrets.json
+      - DOWNLOAD_DIR=/app/downloads
+      - OAUTH_REDIRECT_URI=http://localhost:8899/api/auth/callback
+    restart: unless-stopped
+    networks:
+      - videoprocess_net
+
+networks:
+  videoprocess_net:
+    external: true

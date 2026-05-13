@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Voice Chat Bot</title>
+  <style>
+    :root {
+      --bg: #f7f7f5;
+      --card: #ffffff;
+      --text: #111111;
+      --muted: #666666;
+      --line: #e2e2de;
+      --accent: #1f6feb;
+    }
+    body { margin: 0; font-family: "IBM Plex Sans", "Noto Sans", sans-serif; background: radial-gradient(circle at 20% 0, #eceff7 0, var(--bg) 45%); color: var(--text); }
+    .wrap { max-width: 920px; margin: 24px auto; padding: 0 16px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.05); }
+    h1 { margin: 0 0 10px; font-size: 24px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .col { display: flex; flex-direction: column; gap: 8px; }
+    label { font-size: 13px; color: var(--muted); }
+    select, input, button { font: inherit; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+    button { cursor: pointer; }
+    .primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+    .status { margin-top: 8px; color: var(--muted); font-size: 13px; }
+    .logs { margin-top: 14px; white-space: pre-wrap; background: #fbfbfa; border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-height: 140px; max-height: 280px; overflow: auto; }
+    @media (max-width: 760px) { .row { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Voice Chat Bot Web UI</h1>
+      <div class="row">
+        <div class="col">
+          <label for="inDev">Input Device (Mic)</label>
+          <select id="inDev"></select>
+        </div>
+        <div class="col">
+          <label for="outDev">Output Device (Speaker)</label>
+          <select id="outDev"></select>
+        </div>
+        <div class="col">
+          <label for="sttLang">STT Language</label>
+          <input id="sttLang" value="zh" />
+        </div>
+        <div class="col">
+          <label for="ttsLang">TTS Language</label>
+          <input id="ttsLang" value="zh-cn" />
+        </div>
+      </div>
+      <div class="controls">
+        <button id="refreshBtn">Refresh Devices</button>
+        <button id="connectBtn" class="primary">Connect</button>
+        <button id="talkBtn" disabled>Start Auto Talk</button>
+        <button id="stopBtn" disabled>Stop Listening</button>
+        <button id="closeBtn" disabled>Close Session</button>
+      </div>
+      <div id="status" class="status">Idle</div>
+      <div id="logs" class="logs"></div>
+    </div>
+  </div>
+
+  <script>
+    const inDev = document.getElementById("inDev");
+    const outDev = document.getElementById("outDev");
+    const sttLang = document.getElementById("sttLang");
+    const ttsLang = document.getElementById("ttsLang");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const connectBtn = document.getElementById("connectBtn");
+    const talkBtn = document.getElementById("talkBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const closeBtn = document.getElementById("closeBtn");
+    const statusEl = document.getElementById("status");
+    const logsEl = document.getElementById("logs");
+
+    let ws = null;
+    let stream = null;
+    let audioCtx = null;
+    let srcNode = null;
+    let procNode = null;
+    let silentGain = null;
+    let listening = false;
+    let awaitingReply = false;
+    let playQueue = Promise.resolve();
+    let outputDeviceId = "";
+
+    // Client-side VAD thresholds (20ms chunks after downsampling to 16kHz)
+    const START_RMS = 0.015;
+    const END_RMS = 0.008;
+    const CHUNK_MS = 20;
+    const MIN_SPEECH_FRAMES = Math.floor(280 / CHUNK_MS);
+    const SILENCE_FRAMES_TO_COMMIT = Math.floor(550 / CHUNK_MS);
+    const MAX_UTTER_FRAMES = Math.floor(10000 / CHUNK_MS);
+
+    let vadSpeaking = false;
+    let speechFrames = 0;
+    let silenceFrames = 0;
+    let pendingChunks = [];
+
+    const log = (s) => {
+      logsEl.textContent += s + "\n";
+      logsEl.scrollTop = logsEl.scrollHeight;
+    };
+
+    const setStatus = (s) => statusEl.textContent = s;
+
+    function wsUrl() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      return `${proto}://${location.host}/ws/voice`;
+    }
+
+    async function ensurePermission() {
+      const tmp = await navigator.mediaDevices.getUserMedia({ audio: true });
+      tmp.getTracks().forEach(t => t.stop());
+    }
+
+    async function refreshDevices() {
+      await ensurePermission();
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      inDev.innerHTML = "";
+      outDev.innerHTML = "";
+      for (const d of devs) {
+        const opt = document.createElement("option");
+        opt.value = d.deviceId;
+        opt.textContent = `${d.label || d.kind} (${d.deviceId.slice(0,8)})`;
+        if (d.kind === "audioinput") inDev.appendChild(opt);
+        if (d.kind === "audiooutput") outDev.appendChild(opt);
+      }
+    }
+
+    function downsampleTo16k(float32, inputRate) {
+      if (inputRate === 16000) return float32;
+      const ratio = inputRate / 16000;
+      const newLen = Math.max(1, Math.floor(float32.length / ratio));
+      const out = new Float32Array(newLen);
+      let pos = 0;
+      for (let i = 0; i < newLen; i++) {
+        const next = Math.min(float32.length, Math.floor((i + 1) * ratio));
+        let sum = 0;
+        let n = 0;
+        while (pos < next) { sum += float32[pos++]; n++; }
+        out[i] = n ? sum / n : 0;
+      }
+      return out;
+    }
+
+    function floatToPCM16Buffer(float32) {
+      const buf = new ArrayBuffer(float32.length * 2);
+      const view = new DataView(buf);
+      for (let i = 0; i < float32.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      }
+      return buf;
+    }
+
+    function mergeBuffers(buffers) {
+      let total = 0;
+      for (const b of buffers) total += b.byteLength;
+      const out = new Uint8Array(total);
+      let offset = 0;
+      for (const b of buffers) {
+        out.set(new Uint8Array(b), offset);
+        offset += b.byteLength;
+      }
+      return out.buffer;
+    }
+
+    function rms(float32) {
+      let sum = 0;
+      for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+      return Math.sqrt(sum / Math.max(1, float32.length));
+    }
+
+    async function playWavChunk(wavBytes) {
+      const blob = new Blob([wavBytes], { type: "audio/wav" });
+      const url = URL.createObjectURL(blob);
+      const a = new Audio(url);
+      if (outputDeviceId && typeof a.setSinkId === "function") {
+        try { await a.setSinkId(outputDeviceId); } catch (e) { log(`[warn] setSinkId failed: ${e}`); }
+      }
+      await a.play();
+      await new Promise((resolve) => { a.onended = resolve; a.onerror = resolve; });
+      URL.revokeObjectURL(url);
+    }
+
+    async function sendCurrentUtterance(force = false) {
+      if (!ws || ws.readyState !== WebSocket.OPEN || awaitingReply) return;
+      if (!pendingChunks.length) return;
+      if (!force && speechFrames < MIN_SPEECH_FRAMES) return;
+
+      const payload = mergeBuffers(pendingChunks);
+      pendingChunks = [];
+      vadSpeaking = false;
+      speechFrames = 0;
+      silenceFrames = 0;
+      awaitingReply = true;
+
+      ws.send(payload);
+      ws.send("commit");
+      setStatus("Committed, waiting reply...");
+    }
+
+    async function connectWs() {
+      if (ws && ws.readyState <= 1) return;
+      ws = new WebSocket(wsUrl());
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => { setStatus("Connected"); closeBtn.disabled = false; talkBtn.disabled = false; };
+      ws.onclose = () => {
+        setStatus("Disconnected");
+        closeBtn.disabled = true;
+        talkBtn.disabled = true;
+        stopBtn.disabled = true;
+        listening = false;
+        awaitingReply = false;
+      };
+      ws.onerror = () => setStatus("WebSocket error");
+
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          try {
+            const obj = JSON.parse(ev.data);
+            if (obj.type === "stt") log(`[you] ${obj.text || ""}`);
+            else if (obj.type === "llm_delta") logsEl.textContent += obj.text || "";
+            else if (obj.type === "done") {
+              log("\n[done]");
+              awaitingReply = false;
+              if (listening) setStatus("Listening (auto)...");
+            } else if (obj.type === "error") {
+              log(`\n[error] ${obj.detail}`);
+              awaitingReply = false;
+            } else if (obj.type === "ready") {
+              ws.send(JSON.stringify({
+                type: "config",
+                sample_rate: 16000,
+                stt_language: sttLang.value.trim() || "zh",
+                tts_language: ttsLang.value.trim() || "zh-cn",
+              }));
+            }
+          } catch {
+            log(ev.data);
+          }
+          return;
+        }
+
+        const arr = ev.data;
+        playQueue = playQueue.then(() => playWavChunk(arr));
+      };
+    }
+
+    async function startTalking() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log("[error] websocket not connected");
+        return;
+      }
+      if (listening) return;
+
+      outputDeviceId = outDev.value;
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: inDev.value ? { exact: inDev.value } : undefined,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        }
+      });
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      srcNode = audioCtx.createMediaStreamSource(stream);
+      procNode = audioCtx.createScriptProcessor(4096, 1, 1);
+
+      pendingChunks = [];
+      vadSpeaking = false;
+      speechFrames = 0;
+      silenceFrames = 0;
+
+      procNode.onaudioprocess = (e) => {
+        if (!listening || !ws || ws.readyState !== WebSocket.OPEN || awaitingReply) return;
+
+        const input = e.inputBuffer.getChannelData(0);
+        const mono16k = downsampleTo16k(input, audioCtx.sampleRate);
+        const level = rms(mono16k);
+        const pcmBuf = floatToPCM16Buffer(mono16k);
+
+        if (!vadSpeaking) {
+          if (level >= START_RMS) {
+            vadSpeaking = true;
+            speechFrames = 1;
+            silenceFrames = 0;
+            pendingChunks.push(pcmBuf);
+          }
+          return;
+        }
+
+        pendingChunks.push(pcmBuf);
+        speechFrames += 1;
+
+        if (level < END_RMS) silenceFrames += 1;
+        else silenceFrames = 0;
+
+        if (speechFrames >= MAX_UTTER_FRAMES || (speechFrames >= MIN_SPEECH_FRAMES && silenceFrames >= SILENCE_FRAMES_TO_COMMIT)) {
+          sendCurrentUtterance(false);
+        }
+      };
+
+      srcNode.connect(procNode);
+      silentGain = audioCtx.createGain();
+      silentGain.gain.value = 0;
+      procNode.connect(silentGain);
+      silentGain.connect(audioCtx.destination);
+
+      listening = true;
+      talkBtn.disabled = true;
+      stopBtn.disabled = false;
+      setStatus("Listening (auto)...");
+    }
+
+    async function stopTalking() {
+      if (!listening) return;
+      listening = false;
+      stopBtn.disabled = true;
+      talkBtn.disabled = false;
+
+      await sendCurrentUtterance(true);
+
+      try { srcNode && srcNode.disconnect(); } catch {}
+      try { procNode && procNode.disconnect(); } catch {}
+      try { silentGain && silentGain.disconnect(); } catch {}
+      try { stream && stream.getTracks().forEach(t => t.stop()); } catch {}
+      try { audioCtx && (await audioCtx.close()); } catch {}
+
+      srcNode = null;
+      procNode = null;
+      silentGain = null;
+      stream = null;
+      audioCtx = null;
+
+      setStatus("Stopped");
+    }
+
+    async function closeSession() {
+      await stopTalking();
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send("close");
+      try { ws && ws.close(); } catch {}
+      ws = null;
+    }
+
+    refreshBtn.onclick = () => refreshDevices().catch(e => log(`[error] refresh devices failed: ${e}`));
+    connectBtn.onclick = () => connectWs().catch(e => log(`[error] connect failed: ${e}`));
+    talkBtn.onclick = () => startTalking().catch(e => log(`[error] start talk failed: ${e}`));
+    stopBtn.onclick = () => stopTalking().catch(e => log(`[error] stop failed: ${e}`));
+    closeBtn.onclick = () => closeSession().catch(e => log(`[error] close failed: ${e}`));
+
+    refreshDevices().catch(e => log(`[warn] initial device list failed: ${e}`));
+  </script>
+</body>
+</html>
