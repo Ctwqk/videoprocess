@@ -7,9 +7,25 @@ from worker.handlers import HANDLER_MAP
 def test_autoflow_video_nodes_are_registered_with_handlers():
     registry = NodeTypeRegistry.get()
 
-    for type_name in ("concat_many", "montage_assembler", "vertical_crop", "title_overlay"):
+    for type_name in ("smart_trim", "concat_many", "montage_assembler", "vertical_crop", "title_overlay"):
         assert registry.get_type(type_name) is not None
         assert type_name in HANDLER_MAP
+
+
+def test_smart_trim_node_contract_matches_storyboard_builder_needs():
+    definition = NodeTypeRegistry.get().get_type("smart_trim")
+
+    assert definition is not None
+    assert definition.worker_type == "vision"
+    assert [port.name for port in definition.inputs] == ["input"]
+    assert [port.name for port in definition.outputs] == ["output"]
+    params = {param.name: param for param in definition.params}
+    assert params["prompt"].required is True
+    assert params["mode"].options == ["auto", "best_clip", "all_matches_montage", "full_if_match", "no_full_video"]
+    assert params["mode"].default == "auto"
+    assert params["target_duration"].default == 0
+    assert params["return_full_threshold"].default == 0.65
+    assert params["no_match_policy"].default == "placeholder"
 
 
 def test_montage_assembler_node_contract_is_fixed_for_autoflow():

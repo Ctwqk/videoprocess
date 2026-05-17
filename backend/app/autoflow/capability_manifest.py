@@ -50,6 +50,7 @@ TAG_OVERRIDES = {
     "source": (["source", "asset", "owned_media"], ["compilation", "remix"]),
     "url_download": (["source", "external_url", "draft_only"], ["research", "remix"]),
     "trim": (["clip", "duration", "transform"], ["compilation", "shorts", "remix"]),
+    "smart_trim": (["clip", "prompt", "vision", "transform"], ["compilation", "shorts", "remix", "storyboard"]),
     "vertical_crop": (["aspect_ratio", "shorts", "transform", "vertical"], ["compilation", "shorts", "remix"]),
     "concat_timeline": (["timeline", "assembly", "transform"], ["compilation", "remix"]),
     "concat_many": (["timeline", "assembly", "transform"], ["compilation", "remix"]),

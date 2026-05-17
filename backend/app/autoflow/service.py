@@ -13,6 +13,7 @@ from app.autoflow.material_selector import MaterialSelector
 from app.autoflow.metadata_generator import MetadataGenerator
 from app.autoflow.pipeline_builder import PipelineBuilder
 from app.autoflow.rights_policy import RightsPolicy
+from app.autoflow.storyboard_generator import StoryboardGenerator
 from app.autoflow.template_library import TemplateLibrary
 from app.autoflow.validation_repair import AutoFlowRepairService
 from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
@@ -27,6 +28,8 @@ from app.schemas.autoflow import (
     AutoFlowPlanPatch,
     AutoFlowRequest,
     AutoFlowRun,
+    AutoFlowStoryboardRequest,
+    StoryboardPlan,
 )
 from app.schemas.pipeline import PipelineCreate, PipelineDefinition
 from app.services.job_runtime import start_or_defer_jobs
@@ -53,6 +56,7 @@ class AutoFlowService:
         self.intent_parser = RuleBasedIntentParser()
         self.template_library = TemplateLibrary()
         self.metadata_generator = MetadataGenerator()
+        self.storyboard_generator = StoryboardGenerator()
         self.pipeline_builder = PipelineBuilder()
         self.validation_repair = AutoFlowRepairService()
         self.rights_policy = RightsPolicy()
@@ -62,6 +66,9 @@ class AutoFlowService:
         self._runs: dict[str, AutoFlowRun] = {}
 
     async def plan(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
+        if _uses_storyboard_planner(request):
+            return await self._plan_storyboard(request, db)
+
         intent = self.intent_parser.parse(request)
         template = self.template_library.select_template(intent)
         warnings: list[str] = []
@@ -116,6 +123,144 @@ class AutoFlowService:
         self._plans[plan.plan_id] = plan
         return plan
 
+    async def storyboard(
+        self,
+        request: AutoFlowStoryboardRequest,
+    ):
+        return self.storyboard_generator.generate(request)
+
+    async def _plan_storyboard(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
+        storyboard_request = _storyboard_request_from_autoflow(request)
+        storyboard_response = self.storyboard_generator.generate(storyboard_request)
+        storyboard = storyboard_response.storyboard
+        warnings = list(storyboard_response.warnings)
+        warnings.extend(storyboard.warnings)
+
+        intent = self.intent_parser.parse(request)
+        metadata = _metadata_from_storyboard(storyboard)
+        candidates: list[AutoFlowClipCandidate] = []
+
+        if storyboard.source_strategy in {"material_library", "hybrid"} and db is not None:
+            material_warnings = await self._materialize_storyboard_shots(storyboard, request, db)
+            warnings.extend(material_warnings)
+            candidates = _candidates_from_storyboard_matches(storyboard)
+
+        if storyboard.source_strategy == "input_video" or (
+            storyboard.source_strategy == "hybrid" and request.input_asset_id
+        ):
+            if not request.input_asset_id:
+                definition = PipelineDefinition(nodes=[], edges=[])
+                warnings.append("Storyboard input_video strategy requires input_asset_id.")
+            else:
+                candidates = [
+                    AutoFlowClipCandidate(
+                        id=f"storyboard-input-{request.input_asset_id}",
+                        title=storyboard.title or "Storyboard input video",
+                        source_type="asset",
+                        asset_id=request.input_asset_id,
+                        start_sec=0,
+                        end_sec=storyboard.total_duration,
+                        rights_status="allowed",
+                        metadata={"storyboard_source": "input_video"},
+                    )
+                ]
+                definition = self.pipeline_builder.build_storyboard_input_video(
+                    storyboard,
+                    input_asset_id=request.input_asset_id,
+                    metadata=metadata,
+                )
+        else:
+            definition = self.pipeline_builder.build_storyboard_material_library(storyboard, metadata=metadata)
+            if not definition.nodes:
+                warnings.append("Storyboard found no matched material clips; no executable media pipeline was generated.")
+
+        if storyboard.allow_video_generation:
+            for shot in storyboard.shots:
+                if shot.match_status in {"pending", "missing"}:
+                    shot.generation.enabled = True
+            warnings.append("Video generation is represented as storyboard metadata only; no video_generate node is available yet.")
+        elif storyboard.source_strategy in {"material_library", "hybrid"}:
+            for shot in storyboard.shots:
+                if shot.match_status == "pending":
+                    shot.match_status = "missing"
+
+        validation = validate_pipeline(definition)
+        rights_payload = self.rights_policy.evaluate(request, candidates).model_dump()
+        plan = AutoFlowPlan(
+            plan_id=str(uuid.uuid4()),
+            request=request,
+            intent=intent,
+            template_id=f"storyboard_{storyboard.source_strategy}",
+            pipeline_definition=definition,
+            storyboard=storyboard,
+            candidates=candidates,
+            metadata=metadata,
+            validation={
+                "valid": validation.valid,
+                "errors": [error.model_dump(mode="json") for error in validation.errors],
+                "warnings": [warning.model_dump(mode="json") for warning in validation.warnings],
+                "repairs": [],
+                "plan_warnings": warnings,
+            },
+            rights=rights_payload,
+            warnings=warnings,
+            needs_review=_needs_review(rights_payload, review_approved_at=None),
+            status=_status_for(rights_payload, request.publish_mode),
+        )
+        if db is not None:
+            return await self._save_plan(db, plan)
+
+        self._plans[plan.plan_id] = plan
+        return plan
+
+    async def _materialize_storyboard_shots(
+        self,
+        storyboard: StoryboardPlan,
+        request: AutoFlowRequest,
+        db: AsyncSession,
+    ) -> list[str]:
+        warnings: list[str] = []
+        if not request.material_library_ids:
+            for shot in storyboard.shots:
+                shot.match_status = "missing"
+            return ["Storyboard material_library strategy requires material_library_ids."]
+
+        from app.schemas.material import MaterialSearchRequest
+        from app.services.material_service import materialize_material_search
+
+        for shot in storyboard.shots:
+            payload = MaterialSearchRequest(
+                query=shot.search_query,
+                source_library_ids=request.material_library_ids,
+                result_library_ids=list(request.constraints.get("result_material_library_ids") or request.material_library_ids),
+                top_k=int(request.constraints.get("top_k") or 8),
+                rerank_top_m=int(request.constraints.get("rerank_top_m") or 4),
+                min_duration=shot.min_duration,
+                max_duration=shot.max_duration,
+            )
+            try:
+                _query, results = await materialize_material_search(db, payload)
+            except Exception as exc:
+                shot.match_status = "missing"
+                warnings.append(f"{shot.id} material search failed: {exc}")
+                continue
+
+            if not results:
+                shot.match_status = "missing"
+                continue
+
+            best = results[0]
+            shot.match_status = "matched"
+            shot.matched_asset_id = _string_or_none(best.get("asset_id"))
+            shot.matched_source_asset_id = _string_or_none(best.get("source_asset_id"))
+            shot.matched_start_sec = _float_or_none(best.get("start_sec"))
+            shot.matched_end_sec = _float_or_none(best.get("end_sec"))
+            shot.match_score = _float_or_none(best.get("confidence") or best.get("lighthouse_score") or best.get("coarse_score"))
+            if not shot.matched_asset_id:
+                shot.match_status = "missing"
+                warnings.append(f"{shot.id} material search returned no refined asset_id.")
+        return warnings
+
     async def list_plans(self, db: AsyncSession | None = None) -> list[AutoFlowPlan]:
         if db is None:
             return list(self._plans.values())
@@ -158,8 +303,21 @@ class AutoFlowService:
         warnings = list(plan.warnings)
 
         if patch.rebuild_definition:
-            template = self.template_library.get_template(plan.template_id)
-            definition = self.pipeline_builder.build(template, intent, candidates, metadata)
+            if plan.storyboard:
+                if plan.storyboard.source_strategy == "input_video" or (
+                    plan.storyboard.source_strategy == "hybrid" and request.input_asset_id
+                ):
+                    if request.input_asset_id:
+                        definition = self.pipeline_builder.build_storyboard_input_video(
+                            plan.storyboard,
+                            input_asset_id=request.input_asset_id,
+                            metadata=metadata,
+                        )
+                else:
+                    definition = self.pipeline_builder.build_storyboard_material_library(plan.storyboard, metadata=metadata)
+            else:
+                template = self.template_library.get_template(plan.template_id)
+                definition = self.pipeline_builder.build(template, intent, candidates, metadata)
 
         if patch.run_validation:
             validation = validate_pipeline(definition)
@@ -185,6 +343,7 @@ class AutoFlowService:
                 "request": request,
                 "intent": intent,
                 "pipeline_definition": definition,
+                "storyboard": plan.storyboard,
                 "candidates": candidates,
                 "metadata": metadata,
                 "validation": validation_payload,
@@ -400,6 +559,8 @@ class AutoFlowService:
         row.intent_json = plan.intent.model_dump(mode="json")
         row.template_id = plan.template_id
         row.pipeline_definition = plan.pipeline_definition.model_dump(mode="json")
+        if hasattr(row, "storyboard_json"):
+            row.storyboard_json = plan.storyboard.model_dump(mode="json") if plan.storyboard else None
         row.candidates_json = [candidate.model_dump(mode="json") for candidate in plan.candidates]
         row.metadata_json = plan.metadata.model_dump(mode="json")
         row.rights_json = dict(plan.rights)
@@ -504,6 +665,7 @@ def _plan_from_model(row: AutoFlowPlanModel) -> AutoFlowPlan:
         intent=AutoFlowIntent.model_validate(row.intent_json),
         template_id=row.template_id,
         pipeline_definition=PipelineDefinition.model_validate(row.pipeline_definition),
+        storyboard=StoryboardPlan.model_validate(row.storyboard_json) if getattr(row, "storyboard_json", None) else None,
         candidates=[AutoFlowClipCandidate.model_validate(candidate) for candidate in (row.candidates_json or [])],
         metadata=AutoFlowMetadata.model_validate(row.metadata_json or {}),
         validation=validation,
@@ -545,8 +707,86 @@ def _request_json(row: AutoFlowPlanModel) -> dict[str, Any]:
         "source_policy": intent.get("source_policy") or "owned_only",
         "publish_mode": intent.get("publish_mode") or "preview_only",
         "material_library_ids": [],
+        "source_strategy": "auto",
+        "input_asset_id": None,
+        "allow_video_generation": False,
+        "min_shots": 3,
+        "max_shots": 8,
+        "provider_config_id": None,
+        "model": None,
+        "constraints": {},
         "user_constraints": {},
     }
+
+
+def _uses_storyboard_planner(request: AutoFlowRequest) -> bool:
+    return bool(
+        request.input_asset_id
+        or request.source_strategy != "auto"
+        or request.allow_video_generation
+        or request.constraints.get("use_storyboard")
+    )
+
+
+def _storyboard_request_from_autoflow(request: AutoFlowRequest) -> AutoFlowStoryboardRequest:
+    target_duration = float(request.duration_sec or request.constraints.get("target_duration") or 30)
+    strategy = request.source_strategy
+    if strategy == "auto" and request.input_asset_id:
+        strategy = "input_video"
+    elif strategy == "auto" and request.material_library_ids:
+        strategy = "material_library"
+    return AutoFlowStoryboardRequest(
+        prompt=request.prompt,
+        input_asset_id=request.input_asset_id,
+        material_library_ids=request.material_library_ids,
+        target_duration=target_duration,
+        aspect_ratio=request.aspect_ratio,
+        target_platforms=request.target_platforms,
+        source_strategy=strategy,
+        allow_video_generation=request.allow_video_generation,
+        max_shots=request.max_shots,
+        min_shots=request.min_shots,
+        style=str(request.constraints.get("style") or "auto"),
+        provider_config_id=request.provider_config_id,
+        model=request.model,
+        constraints={**request.user_constraints, **request.constraints},
+    )
+
+
+def _metadata_from_storyboard(storyboard: StoryboardPlan) -> AutoFlowMetadata:
+    return AutoFlowMetadata(
+        title_candidates=storyboard.title_candidates or ([storyboard.title] if storyboard.title else []),
+        selected_title=storyboard.title or (storyboard.title_candidates[0] if storyboard.title_candidates else None),
+        description=storyboard.description or storyboard.logline,
+        tags=storyboard.tags,
+        hashtags=storyboard.hashtags,
+        thumbnail_text_candidates=storyboard.title_candidates[:3],
+        platform_payloads={},
+    )
+
+
+def _candidates_from_storyboard_matches(storyboard: StoryboardPlan) -> list[AutoFlowClipCandidate]:
+    candidates: list[AutoFlowClipCandidate] = []
+    for shot in storyboard.shots:
+        if shot.match_status != "matched" or not shot.matched_asset_id:
+            continue
+        candidates.append(
+            AutoFlowClipCandidate(
+                id=f"storyboard-{shot.id}",
+                title=shot.search_query,
+                source_type="material",
+                asset_id=shot.matched_asset_id,
+                start_sec=shot.matched_start_sec,
+                end_sec=shot.matched_end_sec,
+                score=shot.match_score or 0,
+                rights_status="allowed",
+                metadata={
+                    "storyboard_shot_id": shot.id,
+                    "source_asset_id": shot.matched_source_asset_id,
+                },
+            )
+        )
+    return candidates
 
 
 def _patched_request(request: AutoFlowRequest, patch: AutoFlowPlanPatch) -> AutoFlowRequest:
@@ -663,6 +903,21 @@ def _assert_execute_allowed(plan: AutoFlowPlan, request: AutoFlowExecuteRequest)
     public_approved = bool(plan.public_approved_at)
     if publish_mode == "public_after_review" and not public_approved:
         raise PermissionError("AutoFlow plan requires public approval before public execution")
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _uuid_or_none(value: str) -> uuid.UUID | None:

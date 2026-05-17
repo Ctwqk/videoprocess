@@ -127,7 +127,7 @@ export default function AutoFlowWorkflowPreview({
             </ReactFlow>
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 12, marginTop: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 180px), 1fr))', gap: 12, marginTop: 12 }}>
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 6 }}>Nodes</div>
               <div style={{ display: 'grid', gap: 5 }}>

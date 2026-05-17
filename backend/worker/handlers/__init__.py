@@ -10,6 +10,7 @@ from worker.handlers.concat_vertical_timeline import ConcatVerticalTimelineHandl
 from worker.handlers.watermark import WatermarkHandler
 from worker.handlers.subtitle import SubtitleHandler
 from worker.handlers.speech_to_subtitle import SpeechToSubtitleHandler
+from worker.handlers.smart_trim import SmartTrimHandler
 from worker.handlers.subtitle_translate import SubtitleTranslateHandler
 from worker.handlers.subtitle_to_speech import SubtitleToSpeechHandler
 from worker.handlers.bgm import BgmHandler
@@ -35,6 +36,7 @@ HANDLER_MAP: dict[str, type[BaseHandler]] = {
     "watermark": WatermarkHandler,
     "subtitle": SubtitleHandler,
     "speech_to_subtitle": SpeechToSubtitleHandler,
+    "smart_trim": SmartTrimHandler,
     "subtitle_translate": SubtitleTranslateHandler,
     "subtitle_to_speech": SubtitleToSpeechHandler,
     "bgm": BgmHandler,

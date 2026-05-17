@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.node_registry.registry import NodeTypeRegistry
-from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent, AutoFlowMetadata, WorkflowTemplate
+from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent, AutoFlowMetadata, StoryboardPlan, WorkflowTemplate
 from app.schemas.pipeline import PipelineDefinition, PipelineEdge, PipelineNode, PipelineNodeData
 
 
@@ -136,6 +136,215 @@ class PipelineBuilder:
             )
 
         return PipelineDefinition(nodes=nodes, edges=edges)
+
+    def build_storyboard_input_video(
+        self,
+        storyboard: StoryboardPlan,
+        *,
+        input_asset_id: str,
+        metadata: AutoFlowMetadata | None = None,
+    ) -> PipelineDefinition:
+        nodes: list[PipelineNode] = [
+            PipelineNode(
+                id="source_1",
+                type="source",
+                position=self._position(0, 0),
+                data=PipelineNodeData(
+                    label="Storyboard Source",
+                    config={"asset_id": input_asset_id, "media_type": "video"},
+                    asset_id=input_asset_id,
+                ),
+            )
+        ]
+        edges: list[PipelineEdge] = []
+        trim_node_ids: list[str] = []
+
+        for index, shot in enumerate(storyboard.shots, start=1):
+            node_id = f"smart_trim_{index}"
+            trim_node_ids.append(node_id)
+            nodes.append(
+                PipelineNode(
+                    id=node_id,
+                    type="smart_trim",
+                    position=self._position(1, index - 1),
+                    data=PipelineNodeData(
+                        label=f"Smart Trim {shot.id}",
+                        config={
+                            "prompt": shot.search_query,
+                            "negative_prompt": ", ".join([*shot.negative_queries, *shot.must_not_have]),
+                            "mode": "best_clip",
+                            "target_duration": shot.target_duration,
+                            "min_clip_duration": shot.min_duration,
+                            "max_clip_duration": shot.max_duration,
+                            "max_clips": 1,
+                            "sample_fps": 1,
+                            "match_threshold": 0.35,
+                            "return_full_threshold": 0.65,
+                            "padding_before": 0.5,
+                            "padding_after": 0.5,
+                            "merge_gap": 1.0,
+                            "use_visual": True,
+                            "use_asr": True,
+                            "use_vlm_verify": False,
+                            "language": "zh",
+                            "output_format": "mp4",
+                            "no_match_policy": "placeholder",
+                            "storyboard_shot_id": shot.id,
+                        },
+                    ),
+                )
+            )
+            edges.append(
+                PipelineEdge(
+                    id=f"e-source_1-{node_id}",
+                    source="source_1",
+                    target=node_id,
+                    sourceHandle="output",
+                    targetHandle="input",
+                )
+            )
+
+        assembly_output = self._append_storyboard_assembly(
+            nodes,
+            edges,
+            trim_node_ids,
+            storyboard=storyboard,
+            metadata=metadata,
+        )
+        self._append_storyboard_output(nodes, edges, assembly_output, storyboard=storyboard, metadata=metadata)
+        return PipelineDefinition(nodes=nodes, edges=edges)
+
+    def build_storyboard_material_library(
+        self,
+        storyboard: StoryboardPlan,
+        *,
+        metadata: AutoFlowMetadata | None = None,
+    ) -> PipelineDefinition:
+        nodes: list[PipelineNode] = []
+        edges: list[PipelineEdge] = []
+        source_node_ids: list[str] = []
+
+        matched_shots = [shot for shot in storyboard.shots if shot.match_status == "matched" and shot.matched_asset_id]
+        for index, shot in enumerate(matched_shots, start=1):
+            node_id = f"source_{index}"
+            source_node_ids.append(node_id)
+            nodes.append(
+                PipelineNode(
+                    id=node_id,
+                    type="source",
+                    position=self._position(0, index - 1),
+                    data=PipelineNodeData(
+                        label=f"Matched {shot.id}",
+                        config={"asset_id": shot.matched_asset_id, "media_type": "video"},
+                        asset_id=shot.matched_asset_id,
+                    ),
+                )
+            )
+
+        if not source_node_ids:
+            return PipelineDefinition(nodes=[], edges=[])
+
+        assembly_output = self._append_storyboard_assembly(
+            nodes,
+            edges,
+            source_node_ids,
+            storyboard=storyboard,
+            metadata=metadata,
+        )
+        self._append_storyboard_output(nodes, edges, assembly_output, storyboard=storyboard, metadata=metadata)
+        return PipelineDefinition(nodes=nodes, edges=edges)
+
+    def _append_storyboard_assembly(
+        self,
+        nodes: list[PipelineNode],
+        edges: list[PipelineEdge],
+        input_node_ids: list[str],
+        *,
+        storyboard: StoryboardPlan,
+        metadata: AutoFlowMetadata | None,
+    ) -> str:
+        if len(input_node_ids) < 2:
+            return input_node_ids[0]
+
+        width, height = _target_dimensions(storyboard.aspect_ratio)
+        assembly = PipelineNode(
+            id="concat_many_1",
+            type="concat_many",
+            position=self._position(3, 0),
+            data=PipelineNodeData(
+                label="Storyboard Assembly",
+                config={
+                    "input_count": min(len(input_node_ids), 12),
+                    "output_format": "mp4",
+                    "transition": "none",
+                    "transition_duration": 0,
+                    "target_duration": storyboard.total_duration,
+                    "normalize_resolution": True,
+                    "width": width,
+                    "height": height,
+                },
+            ),
+        )
+        nodes.append(assembly)
+        for index, source_id in enumerate(input_node_ids[:12], start=1):
+            edges.append(
+                PipelineEdge(
+                    id=f"e-{source_id}-{assembly.id}",
+                    source=source_id,
+                    target=assembly.id,
+                    sourceHandle="output",
+                    targetHandle=f"video_{index}",
+                )
+            )
+        return assembly.id
+
+    def _append_storyboard_output(
+        self,
+        nodes: list[PipelineNode],
+        edges: list[PipelineEdge],
+        input_node_id: str,
+        *,
+        storyboard: StoryboardPlan,
+        metadata: AutoFlowMetadata | None,
+    ) -> None:
+        title = (metadata.selected_title if metadata else None) or storyboard.title or "Storyboard Preview"
+        transcode = PipelineNode(
+            id="transcode_1",
+            type="transcode",
+            position=self._position(4, 0),
+            data=PipelineNodeData(
+                label="Transcode",
+                config={"format": "mp4", "video_codec": "libx264", "audio_codec": "aac", "crf": 23},
+            ),
+        )
+        export = PipelineNode(
+            id="export_1",
+            type="export",
+            position=self._position(5, 0),
+            data=PipelineNodeData(
+                label="Export Preview",
+                config={"output_dir": "/tmp/vp_autoflow_exports", "filename": _safe_filename(title)},
+            ),
+        )
+        nodes.extend([transcode, export])
+        edges.extend(
+            [
+                PipelineEdge(
+                    id=f"e-{input_node_id}-transcode_1",
+                    source=input_node_id,
+                    target="transcode_1",
+                    sourceHandle="output",
+                    targetHandle="input",
+                ),
+                PipelineEdge(
+                    id="e-transcode_1-export_1",
+                    source="transcode_1",
+                    target="export_1",
+                    sourceHandle="output",
+                    targetHandle="input",
+                ),
+            ]
+        )
 
     def _source_node(
         self,

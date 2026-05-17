@@ -17,6 +17,7 @@ import AutoFlowPlanPanel from '../components/autoflow/AutoFlowPlanPanel';
 import AutoFlowPromptBox from '../components/autoflow/AutoFlowPromptBox';
 import AutoFlowReviewGate from '../components/autoflow/AutoFlowReviewGate';
 import AutoFlowRunStatus from '../components/autoflow/AutoFlowRunStatus';
+import AutoFlowStoryboardPreview from '../components/autoflow/AutoFlowStoryboardPreview';
 import AutoFlowWorkflowPreview from '../components/autoflow/AutoFlowWorkflowPreview';
 import type {
   AutoFlowCandidateEditDraft,
@@ -32,9 +33,11 @@ import type {
   ExecuteOptions,
   WorkflowTemplate,
 } from '../types/autoflow';
+import './AutoFlowPage.css';
 
 const defaultRequest: AutoFlowRequest = {
   prompt: '我要一个 30 秒小猫视频集锦，竖屏，可爱快节奏，先导出预览，不要公开发布。',
+  input_asset_id: null,
   target_platforms: ['youtube_shorts'],
   source_platforms: ['youtube', 'bilibili', 'x', 'xiaohongshu'],
   duration_sec: 30,
@@ -42,6 +45,13 @@ const defaultRequest: AutoFlowRequest = {
   source_policy: 'owned_only',
   publish_mode: 'preview_only',
   material_library_ids: [],
+  source_strategy: 'auto',
+  allow_video_generation: false,
+  min_shots: 3,
+  max_shots: 8,
+  provider_config_id: null,
+  model: null,
+  constraints: {},
   user_constraints: {},
 };
 
@@ -406,18 +416,9 @@ export default function AutoFlowPage() {
   };
 
   return (
-    <div
-      style={{
-        height: '100%',
-        overflowY: 'auto',
-        backgroundColor: '#020617',
-        color: '#e2e8f0',
-        padding: 18,
-        boxSizing: 'border-box',
-      }}
-    >
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 420px) minmax(0, 1fr)', gap: 16, alignItems: 'start' }}>
-        <div style={{ display: 'grid', gap: 12 }}>
+    <div className="autoflow-page">
+      <div className="autoflow-layout">
+        <div className="autoflow-primary">
           <AutoFlowPromptBox
             value={request}
             templates={templates}
@@ -449,7 +450,7 @@ export default function AutoFlowPage() {
           />
         </div>
 
-        <div style={{ display: 'grid', gap: 12, minWidth: 0 }}>
+        <div className="autoflow-secondary">
           {error ? (
             <div
               style={{
@@ -465,6 +466,7 @@ export default function AutoFlowPage() {
             </div>
           ) : null}
           <AutoFlowPlanPanel plan={plan} templates={templates} />
+          <AutoFlowStoryboardPreview storyboard={plan?.storyboard ?? null} />
           <AutoFlowMetadataEditor
             plan={plan}
             draft={metadataDraft}

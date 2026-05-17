@@ -13,8 +13,17 @@ export type AutoFlowPublishMode =
   | 'unlisted_upload'
   | 'public_after_review';
 
+export type AutoFlowSourceStrategy =
+  | 'auto'
+  | 'input_video'
+  | 'material_library'
+  | 'external_research'
+  | 'generate_missing'
+  | 'hybrid';
+
 export interface AutoFlowRequest {
   prompt: string;
+  input_asset_id?: string | null;
   target_platforms: string[];
   source_platforms: string[];
   duration_sec: number | null;
@@ -22,6 +31,13 @@ export interface AutoFlowRequest {
   source_policy: AutoFlowSourcePolicy;
   publish_mode: AutoFlowPublishMode;
   material_library_ids: string[];
+  source_strategy: AutoFlowSourceStrategy;
+  allow_video_generation: boolean;
+  min_shots: number;
+  max_shots: number;
+  provider_config_id?: string | null;
+  model?: string | null;
+  constraints: Record<string, unknown>;
   user_constraints: Record<string, unknown>;
 }
 
@@ -63,6 +79,112 @@ export interface AutoFlowMetadata {
   hashtags: string[];
   thumbnail_text_candidates: string[];
   platform_payloads: Record<string, Record<string, unknown>>;
+}
+
+export interface VideoGenerationHints {
+  enabled: boolean;
+  prompt: string;
+  negative_prompt: string;
+  reference_asset_ids: string[];
+  reference_image_asset_id?: string | null;
+  reference_video_asset_id?: string | null;
+  first_frame_asset_id?: string | null;
+  last_frame_asset_id?: string | null;
+  model_hint: string;
+  resolution: string;
+  fps?: number | null;
+  seed?: number | null;
+  guidance_scale?: number | null;
+  motion_strength?: number | null;
+  extra: Record<string, unknown>;
+}
+
+export interface CameraSpec {
+  shot_size: string;
+  angle: string;
+  movement: string;
+  lens: string;
+  composition: string;
+}
+
+export interface VisualStyleSpec {
+  mood: string;
+  lighting: string;
+  color_palette: string;
+  realism: string;
+  texture: string;
+  platform_style: string;
+}
+
+export interface ShotSpec {
+  id: string;
+  role: string;
+  description: string;
+  director_notes: string;
+  search_query: string;
+  search_queries: string[];
+  negative_queries: string[];
+  must_have: string[];
+  nice_to_have: string[];
+  must_not_have: string[];
+  target_duration: number;
+  min_duration: number;
+  max_duration: number;
+  camera: CameraSpec;
+  visual_style: VisualStyleSpec;
+  narration: string;
+  on_screen_text: string;
+  sound_design: string;
+  generation: VideoGenerationHints;
+  matched_asset_id?: string | null;
+  matched_source_asset_id?: string | null;
+  matched_start_sec?: number | null;
+  matched_end_sec?: number | null;
+  match_score?: number | null;
+  match_status: 'pending' | 'matched' | 'missing' | 'generated' | 'skipped';
+  extra: Record<string, unknown>;
+}
+
+export interface StoryboardPlan {
+  subject: string;
+  title: string;
+  logline: string;
+  style: string;
+  target_platforms: string[];
+  aspect_ratio: AutoFlowAspectRatio;
+  total_duration: number;
+  source_strategy: Exclude<AutoFlowSourceStrategy, 'auto'>;
+  allow_video_generation: boolean;
+  shots: ShotSpec[];
+  title_candidates: string[];
+  description: string;
+  tags: string[];
+  hashtags: string[];
+  warnings: string[];
+  extra: Record<string, unknown>;
+}
+
+export interface AutoFlowStoryboardRequest {
+  prompt: string;
+  input_asset_id?: string | null;
+  material_library_ids: string[];
+  target_duration: number;
+  aspect_ratio: AutoFlowAspectRatio;
+  target_platforms: string[];
+  source_strategy: AutoFlowSourceStrategy;
+  allow_video_generation: boolean;
+  max_shots: number;
+  min_shots: number;
+  style: string;
+  provider_config_id?: string | null;
+  model?: string | null;
+  constraints: Record<string, unknown>;
+}
+
+export interface AutoFlowStoryboardResponse {
+  storyboard: StoryboardPlan;
+  raw_model_output?: string | null;
+  warnings: string[];
 }
 
 export type AutoFlowPlanStatus =
@@ -130,6 +252,7 @@ export interface AutoFlowPlan {
   intent: AutoFlowIntent;
   template_id: string;
   pipeline_definition: Record<string, unknown>;
+  storyboard?: StoryboardPlan | null;
   candidates: AutoFlowClipCandidate[];
   metadata: AutoFlowMetadata;
   validation: Record<string, unknown>;

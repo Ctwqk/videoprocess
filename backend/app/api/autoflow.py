@@ -20,6 +20,8 @@ from app.schemas.autoflow import (
     AutoFlowRejectRequest,
     AutoFlowRequest,
     AutoFlowRun,
+    AutoFlowStoryboardRequest,
+    AutoFlowStoryboardResponse,
     WorkflowTemplate,
 )
 
@@ -33,6 +35,11 @@ content_strategy_service = ContentStrategyService()
 @router.post("/plan", response_model=AutoFlowPlan)
 async def create_plan(data: AutoFlowRequest, db: AsyncSession | None = Depends(get_db)):
     return await autoflow_service.plan(data, db)
+
+
+@router.post("/storyboard", response_model=AutoFlowStoryboardResponse)
+async def create_storyboard(data: AutoFlowStoryboardRequest):
+    return await autoflow_service.storyboard(data)
 
 
 @router.get("/plans", response_model=list[AutoFlowPlan])

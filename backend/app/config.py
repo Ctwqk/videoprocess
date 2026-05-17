@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     material_qdrant_collection: str = "videoprocess_material_clips"
     material_lighthouse_url: str = ""
     material_univtg_url: str = ""
+    vision_embedding_url: str = ""
+    smart_trim_vlm_url: str = ""
+    smart_trim_default_worker_type: str = "vision"
 
     video_schedule_default_state: str = "OPEN"
 

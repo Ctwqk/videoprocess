@@ -121,7 +121,7 @@ export default function AutoFlowMetricsPanel({
         </div>
       ) : null}
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))', gap: 12 }}>
         <div style={panelStyle}>
           <div style={panelTitleStyle}>Trend Suggestions</div>
           {suggestions.length ? suggestions.map(item => (

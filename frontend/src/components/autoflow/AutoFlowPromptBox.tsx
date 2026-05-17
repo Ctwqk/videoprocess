@@ -3,6 +3,7 @@ import type {
   AutoFlowPublishMode,
   AutoFlowRequest,
   AutoFlowSourcePolicy,
+  AutoFlowSourceStrategy,
   CapabilityManifest,
   WorkflowTemplate,
 } from '../../types/autoflow';
@@ -17,6 +18,13 @@ const DEFAULT_SOURCE_POLICIES: AutoFlowSourcePolicy[] = [
   'research_only',
   'remix_with_review',
 ];
+const DEFAULT_SOURCE_STRATEGIES: AutoFlowSourceStrategy[] = [
+  'auto',
+  'input_video',
+  'material_library',
+  'hybrid',
+  'generate_missing',
+];
 const DEFAULT_PUBLISH_MODES: AutoFlowPublishMode[] = [
   'preview_only',
   'private_upload',
@@ -30,6 +38,15 @@ const SOURCE_POLICY_LABELS: Record<AutoFlowSourcePolicy, string> = {
   public_domain_or_cc: 'Public domain / CC',
   research_only: 'Research only',
   remix_with_review: 'Remix with review',
+};
+
+const SOURCE_STRATEGY_LABELS: Record<AutoFlowSourceStrategy, string> = {
+  auto: 'Auto',
+  input_video: 'Input video',
+  material_library: 'Material library',
+  external_research: 'External research',
+  generate_missing: 'Generate missing',
+  hybrid: 'Hybrid',
 };
 
 const PUBLISH_MODE_LABELS: Record<AutoFlowPublishMode, string> = {
@@ -72,6 +89,7 @@ export default function AutoFlowPromptBox({
   const sourcePlatformOptions = capabilities?.source_platforms ?? DEFAULT_SOURCE_PLATFORMS;
   const aspectRatios = capabilities?.aspect_ratios ?? DEFAULT_ASPECT_RATIOS;
   const sourcePolicies = capabilities?.source_policies ?? DEFAULT_SOURCE_POLICIES;
+  const sourceStrategies = DEFAULT_SOURCE_STRATEGIES;
   const publishModes = capabilities?.publish_modes ?? DEFAULT_PUBLISH_MODES;
   const materialLibraries = capabilities?.material_libraries ?? [];
 
@@ -231,6 +249,26 @@ export default function AutoFlowPromptBox({
         </label>
 
         <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+          Source strategy
+          <select
+            value={value.source_strategy}
+            onChange={event => update('source_strategy', event.target.value as AutoFlowSourceStrategy)}
+            style={{
+              borderRadius: 6,
+              border: '1px solid #334155',
+              backgroundColor: '#020617',
+              color: '#e2e8f0',
+              padding: '8px 10px',
+              fontSize: 13,
+            }}
+          >
+            {sourceStrategies.map(option => (
+              <option key={option} value={option}>{SOURCE_STRATEGY_LABELS[option]}</option>
+            ))}
+          </select>
+        </label>
+
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
           Publish mode
           <select
             value={value.publish_mode}
@@ -248,6 +286,83 @@ export default function AutoFlowPromptBox({
               <option key={option} value={option}>{PUBLISH_MODE_LABELS[option] ?? titleCase(option)}</option>
             ))}
           </select>
+        </label>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 12 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+          Input asset ID
+          <input
+            type="text"
+            value={value.input_asset_id ?? ''}
+            onChange={event => update('input_asset_id', event.target.value.trim() || null)}
+            placeholder="Optional uploaded video asset"
+            style={{
+              borderRadius: 6,
+              border: '1px solid #334155',
+              backgroundColor: '#020617',
+              color: '#e2e8f0',
+              padding: '8px 10px',
+              fontSize: 13,
+            }}
+          />
+        </label>
+
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+          Min shots
+          <input
+            type="number"
+            min={1}
+            max={24}
+            value={value.min_shots}
+            onChange={event => update('min_shots', Number(event.target.value) || 1)}
+            style={{
+              borderRadius: 6,
+              border: '1px solid #334155',
+              backgroundColor: '#020617',
+              color: '#e2e8f0',
+              padding: '8px 10px',
+              fontSize: 13,
+            }}
+          />
+        </label>
+
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+          Max shots
+          <input
+            type="number"
+            min={1}
+            max={24}
+            value={value.max_shots}
+            onChange={event => update('max_shots', Number(event.target.value) || 1)}
+            style={{
+              borderRadius: 6,
+              border: '1px solid #334155',
+              backgroundColor: '#020617',
+              color: '#e2e8f0',
+              padding: '8px 10px',
+              fontSize: 13,
+            }}
+          />
+        </label>
+
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            fontSize: 12,
+            color: '#cbd5e1',
+            fontWeight: 600,
+            paddingTop: 20,
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={value.allow_video_generation}
+            onChange={event => update('allow_video_generation', event.target.checked)}
+          />
+          Allow generation placeholders
         </label>
       </div>
 

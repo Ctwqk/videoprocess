@@ -76,16 +76,21 @@ def test_autoflow_orm_models_import_and_define_expected_tables():
 def test_autoflow_migration_declares_required_tables():
     migration = Path("alembic/versions/004_autoflow.py")
     review_state_migration = Path("alembic/versions/005_autoflow_review_state.py")
+    storyboard_migration = Path("alembic/versions/006_autoflow_storyboard.py")
 
     assert migration.exists()
     assert review_state_migration.exists()
+    assert storyboard_migration.exists()
     text = migration.read_text()
     review_state_text = review_state_migration.read_text()
+    storyboard_text = storyboard_migration.read_text()
 
     assert 'revision: str = "004"' in text
     assert 'down_revision: Union[str, None] = "003"' in text
     assert 'revision: str = "005"' in review_state_text
     assert 'down_revision: Union[str, None] = "004"' in review_state_text
+    assert 'revision: str = "006"' in storyboard_text
+    assert 'down_revision: Union[str, None] = "005"' in storyboard_text
     for table_name in (
         "autoflow_plans",
         "autoflow_runs",
@@ -102,3 +107,4 @@ def test_autoflow_migration_declares_required_tables():
         "error_message",
     ):
         assert column_name in review_state_text
+    assert "storyboard_json" in storyboard_text

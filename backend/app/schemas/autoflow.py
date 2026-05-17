@@ -17,6 +17,14 @@ SourcePolicy = Literal[
 ]
 PublishMode = Literal["preview_only", "private_upload", "unlisted_upload", "public_after_review"]
 AspectRatio = Literal["9:16", "16:9", "1:1", "auto"]
+SourceStrategy = Literal[
+    "auto",
+    "input_video",
+    "material_library",
+    "external_research",
+    "generate_missing",
+    "hybrid",
+]
 AutoFlowPlanStatus = Literal[
     "drafted",
     "review_required",
@@ -30,6 +38,7 @@ AutoFlowPlanStatus = Literal[
 
 class AutoFlowRequest(BaseModel):
     prompt: str
+    input_asset_id: str | None = None
     target_platforms: list[str] = Field(default_factory=list)
     source_platforms: list[str] = Field(default_factory=lambda: ["youtube", "bilibili", "x", "xiaohongshu"])
     duration_sec: int | None = None
@@ -37,6 +46,13 @@ class AutoFlowRequest(BaseModel):
     source_policy: SourcePolicy = "owned_only"
     publish_mode: PublishMode = "preview_only"
     material_library_ids: list[str] = Field(default_factory=list)
+    source_strategy: SourceStrategy = "auto"
+    allow_video_generation: bool = False
+    min_shots: int = Field(default=3, ge=1, le=24)
+    max_shots: int = Field(default=8, ge=1, le=24)
+    provider_config_id: str | None = None
+    model: str | None = None
+    constraints: dict[str, Any] = Field(default_factory=dict)
     user_constraints: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("prompt")
@@ -89,12 +105,166 @@ class AutoFlowMetadata(BaseModel):
     platform_payloads: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
+class VideoGenerationHints(BaseModel):
+    enabled: bool = False
+    prompt: str = ""
+    negative_prompt: str = ""
+    reference_asset_ids: list[str] = Field(default_factory=list)
+    reference_image_asset_id: str | None = None
+    reference_video_asset_id: str | None = None
+    first_frame_asset_id: str | None = None
+    last_frame_asset_id: str | None = None
+    model_hint: str = "auto"
+    resolution: str = "auto"
+    fps: int | None = None
+    seed: int | None = None
+    guidance_scale: float | None = None
+    motion_strength: float | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class CameraSpec(BaseModel):
+    shot_size: Literal[
+        "extreme_close_up",
+        "close_up",
+        "medium",
+        "wide",
+        "establishing",
+        "auto",
+    ] = "auto"
+    angle: Literal[
+        "eye_level",
+        "low_angle",
+        "high_angle",
+        "top_down",
+        "dutch_angle",
+        "auto",
+    ] = "auto"
+    movement: Literal[
+        "static",
+        "handheld",
+        "push_in",
+        "pull_out",
+        "pan",
+        "tilt",
+        "tracking",
+        "orbit",
+        "auto",
+    ] = "auto"
+    lens: str = ""
+    composition: str = ""
+
+
+class VisualStyleSpec(BaseModel):
+    mood: str = ""
+    lighting: str = ""
+    color_palette: str = ""
+    realism: Literal["realistic", "cinematic", "documentary", "anime", "illustration", "auto"] = "auto"
+    texture: str = ""
+    platform_style: str = ""
+
+
+class ShotSpec(BaseModel):
+    id: str
+    role: Literal[
+        "hook",
+        "setup",
+        "action",
+        "reaction",
+        "detail",
+        "transition",
+        "ending",
+        "b_roll",
+    ] = "action"
+    description: str = ""
+    director_notes: str = ""
+    search_query: str
+    search_queries: list[str] = Field(default_factory=list)
+    negative_queries: list[str] = Field(default_factory=list)
+    must_have: list[str] = Field(default_factory=list)
+    nice_to_have: list[str] = Field(default_factory=list)
+    must_not_have: list[str] = Field(default_factory=list)
+    target_duration: float = 4.0
+    min_duration: float = 1.5
+    max_duration: float = 8.0
+    camera: CameraSpec = Field(default_factory=CameraSpec)
+    visual_style: VisualStyleSpec = Field(default_factory=VisualStyleSpec)
+    narration: str = ""
+    on_screen_text: str = ""
+    sound_design: str = ""
+    generation: VideoGenerationHints = Field(default_factory=VideoGenerationHints)
+    matched_asset_id: str | None = None
+    matched_source_asset_id: str | None = None
+    matched_start_sec: float | None = None
+    matched_end_sec: float | None = None
+    match_score: float | None = None
+    match_status: Literal["pending", "matched", "missing", "generated", "skipped"] = "pending"
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class StoryboardPlan(BaseModel):
+    subject: str
+    title: str = ""
+    logline: str = ""
+    style: str = "auto"
+    target_platforms: list[str] = Field(default_factory=list)
+    aspect_ratio: AspectRatio = "auto"
+    total_duration: float = 30
+    source_strategy: Literal[
+        "input_video",
+        "material_library",
+        "external_research",
+        "generate_missing",
+        "hybrid",
+    ] = "input_video"
+    allow_video_generation: bool = False
+    shots: list[ShotSpec]
+    title_candidates: list[str] = Field(default_factory=list)
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+    hashtags: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class AutoFlowStoryboardRequest(BaseModel):
+    prompt: str
+    input_asset_id: str | None = None
+    material_library_ids: list[str] = Field(default_factory=list)
+    target_duration: float = 30
+    aspect_ratio: AspectRatio = "auto"
+    target_platforms: list[str] = Field(default_factory=list)
+    source_strategy: SourceStrategy = "input_video"
+    allow_video_generation: bool = False
+    max_shots: int = Field(default=8, ge=1, le=24)
+    min_shots: int = Field(default=3, ge=1, le=24)
+    style: str = "auto"
+    provider_config_id: str | None = None
+    model: str | None = None
+    constraints: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("prompt")
+    @classmethod
+    def prompt_must_not_be_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("prompt must not be blank")
+        return cleaned
+
+
+class AutoFlowStoryboardResponse(BaseModel):
+    storyboard: StoryboardPlan
+    raw_model_output: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class AutoFlowPlan(BaseModel):
     plan_id: str
     request: AutoFlowRequest
     intent: AutoFlowIntent
     template_id: str
     pipeline_definition: PipelineDefinition
+    storyboard: StoryboardPlan | None = None
     candidates: list[AutoFlowClipCandidate] = Field(default_factory=list)
     metadata: AutoFlowMetadata = Field(default_factory=AutoFlowMetadata)
     validation: dict[str, Any] = Field(default_factory=dict)

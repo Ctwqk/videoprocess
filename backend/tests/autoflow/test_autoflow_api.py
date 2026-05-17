@@ -481,8 +481,109 @@ async def test_patch_plan_can_clear_last_candidate_lock(autoflow_db_session):
             },
         )
 
-    assert unlocked.status_code == 200
-    assert unlocked.json()["candidates"][0]["metadata"]["locked"] is False
+        assert unlocked.status_code == 200
+        assert unlocked.json()["candidates"][0]["metadata"]["locked"] is False
+
+
+@pytest.mark.asyncio
+async def test_storyboard_endpoint_and_input_video_plan_persist_storyboard(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        storyboard_response = await client.post(
+            "/api/v1/autoflow/storyboard",
+            json={
+                "prompt": "我要一个 15 秒小猫视频，竖屏，可爱快节奏",
+                "input_asset_id": "asset-cat",
+                "target_duration": 15,
+                "aspect_ratio": "9:16",
+                "source_strategy": "input_video",
+                "min_shots": 3,
+                "max_shots": 3,
+            },
+        )
+        assert storyboard_response.status_code == 200
+        storyboard_payload = storyboard_response.json()
+        assert len(storyboard_payload["storyboard"]["shots"]) == 3
+        assert storyboard_payload["storyboard"]["shots"][0]["generation"]["prompt"]
+
+        plan_response = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "我要一个 15 秒小猫视频，竖屏，可爱快节奏",
+                "input_asset_id": "asset-cat",
+                "target_platforms": ["youtube_shorts"],
+                "duration_sec": 15,
+                "aspect_ratio": "9:16",
+                "source_strategy": "input_video",
+                "min_shots": 3,
+                "max_shots": 3,
+            },
+        )
+        assert plan_response.status_code == 200
+        plan = plan_response.json()
+        assert plan["storyboard"]["subject"] == "小猫"
+        assert plan["validation"]["valid"] is True
+        assert [node["type"] for node in plan["pipeline_definition"]["nodes"]].count("smart_trim") == 3
+
+        autoflow_api_module.autoflow_service._plans.clear()
+
+        fetched = await client.get(f"/api/v1/autoflow/plans/{plan['plan_id']}")
+        assert fetched.status_code == 200
+        assert fetched.json()["storyboard"]["subject"] == "小猫"
+
+
+@pytest.mark.asyncio
+async def test_storyboard_material_plan_materializes_matches_and_keeps_missing_shot(
+    autoflow_db_session, monkeypatch
+):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+    calls = []
+
+    async def fake_materialize_material_search(db, payload):
+        calls.append(payload.query)
+        if len(calls) <= 2:
+            return SimpleNamespace(id=uuid.uuid4()), [
+                {
+                    "id": f"result-{len(calls)}",
+                    "title": f"Matched shot {len(calls)}",
+                    "asset_id": f"asset-matched-{len(calls)}",
+                    "source_asset_id": f"asset-source-{len(calls)}",
+                    "start_sec": float(len(calls)),
+                    "end_sec": float(len(calls) + 3),
+                    "confidence": 0.88,
+                }
+            ]
+        return SimpleNamespace(id=uuid.uuid4()), []
+
+    monkeypatch.setattr(
+        "app.services.material_service.materialize_material_search",
+        fake_materialize_material_search,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "我要一个 12 秒小猫视频，竖屏，可爱快节奏",
+                "duration_sec": 12,
+                "aspect_ratio": "9:16",
+                "source_strategy": "material_library",
+                "material_library_ids": [str(uuid.uuid4())],
+                "min_shots": 3,
+                "max_shots": 3,
+            },
+        )
+
+    assert response.status_code == 200
+    plan = response.json()
+    statuses = [shot["match_status"] for shot in plan["storyboard"]["shots"]]
+    assert statuses == ["matched", "matched", "missing"]
+    assert [node["type"] for node in plan["pipeline_definition"]["nodes"]].count("source") == 2
+    assert [node["type"] for node in plan["pipeline_definition"]["nodes"]].count("smart_trim") == 0
+    assert plan["validation"]["valid"] is True
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,8 @@ import type {
   AutoFlowRejectRequest,
   AutoFlowRequest,
   AutoFlowRun,
+  AutoFlowStoryboardRequest,
+  AutoFlowStoryboardResponse,
   AutoFlowIdea,
   AutoFlowMetric,
   AutoFlowTemplateMetricSummary,
@@ -23,6 +25,11 @@ function unwrapItems<T>(payload: T[] | { items?: T[] }): T[] {
 
 export async function createAutoFlowPlan(payload: AutoFlowRequest): Promise<AutoFlowPlan> {
   const res = await apiClient.post<AutoFlowPlan>('/autoflow/plan', payload);
+  return res.data;
+}
+
+export async function createAutoFlowStoryboard(payload: AutoFlowStoryboardRequest): Promise<AutoFlowStoryboardResponse> {
+  const res = await apiClient.post<AutoFlowStoryboardResponse>('/autoflow/storyboard', payload);
   return res.data;
 }
 

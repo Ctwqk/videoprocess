@@ -18,6 +18,7 @@ class AutoFlowPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     intent_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     template_id: Mapped[str] = mapped_column(String(255), nullable=False)
     pipeline_definition: Mapped[dict] = mapped_column(JSON, nullable=False)
+    storyboard_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     candidates_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     rights_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
