@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import uuid as uuid_mod
+from datetime import datetime
+
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+
+
+class AutoFlowPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "autoflow_plans"
+
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    intent_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    template_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    pipeline_definition: Mapped[dict] = mapped_column(JSON, nullable=False)
+    candidates_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    rights_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    validation_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="drafted", nullable=False)
+
+
+class AutoFlowRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "autoflow_runs"
+
+    plan_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("autoflow_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    pipeline_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pipelines.id", ondelete="SET NULL"), nullable=True
+    )
+    job_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    artifacts_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    publish_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class ContentMetric(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "content_metrics"
+
+    run_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("autoflow_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    platform: Mapped[str] = mapped_column(String(64), nullable=False)
+    platform_content_id: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    likes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    comments: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    shares: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    watch_time_sec: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    avg_view_duration_sec: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    retention_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    collected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class TrendSignal(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "trend_signals"
+
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    keyword: Mapped[str] = mapped_column(String(255), nullable=False)
+    score: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
