@@ -5,7 +5,7 @@ import re
 import tempfile
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +24,22 @@ from app.models.material import (
     MaterialQueryResult,
 )
 from app.services.asset_service import _extract_media_info, create_asset_from_local_file
+from app.services.visual_analysis_service import VisualAnalysisService
 from app.storage.manager import get_storage
 
 
 DEFAULT_VECTOR_SIZE = 1024
+VISUAL_METADATA_KEYS = (
+    "duration",
+    "aspect_ratio",
+    "width",
+    "height",
+    "motion_score",
+    "scene_change_score",
+    "watermark_score",
+    "quality_score",
+    "file_size_bytes",
+)
 
 
 class MaterialLibraryConflictError(ValueError):
@@ -45,6 +57,7 @@ class CandidateWindow:
     neighbor_clip_ids: list[str]
     member_clip_ids: list[str]
     clips: list[dict[str, Any]]
+    visual_metadata: dict[str, Any] = field(default_factory=dict)
     lighthouse_score: float = 0.0
 
 
@@ -62,6 +75,53 @@ def _overlap_score(query: str, text: str) -> float:
     if not query_tokens or not text_tokens:
         return 0.0
     return len(query_tokens & text_tokens) / max(1, len(query_tokens))
+
+
+def _extract_visual_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    result = {key: metadata[key] for key in VISUAL_METADATA_KEYS if key in metadata}
+    visual = metadata.get("visual")
+    if isinstance(visual, dict):
+        result["visual"] = dict(visual)
+    return result
+
+
+def _merge_visual_metadata(*sources: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for source in sources:
+        visual_metadata = _extract_visual_metadata(source)
+        if not visual_metadata:
+            continue
+        for key, value in visual_metadata.items():
+            if key == "visual" and isinstance(value, dict):
+                current = merged.get("visual") if isinstance(merged.get("visual"), dict) else {}
+                merged["visual"] = {**current, **value}
+            else:
+                merged[key] = value
+    return merged
+
+
+def _with_visual_metadata(base: dict[str, Any], visual_metadata: dict[str, Any] | None) -> dict[str, Any]:
+    result = dict(base)
+    result.update(_merge_visual_metadata(visual_metadata))
+    return result
+
+
+def _material_visual_metadata(asset: Asset, media_info: dict[str, Any]) -> dict[str, Any]:
+    local_path: str | None = None
+    try:
+        local_path = get_storage(asset.storage_backend).get_local_path(asset.storage_path)
+    except Exception:
+        local_path = None
+    if not local_path and not media_info:
+        return {}
+    analysis = VisualAnalysisService().analyze(source_path=local_path, metadata=media_info)
+    return _extract_visual_metadata(analysis)
+
+
+def _material_result_metadata(window: CandidateWindow) -> dict[str, Any]:
+    return _merge_visual_metadata(window.visual_metadata)
 
 
 async def list_material_libraries(db: AsyncSession, skip: int = 0, limit: int = 100) -> tuple[list[MaterialLibrary], int]:
@@ -249,6 +309,9 @@ async def ingest_material_asset(
         asset.media_info = media_info
         await db.flush()
 
+    visual_metadata = _material_visual_metadata(asset, media_info)
+    item_metadata = _with_visual_metadata({"clip_len": clip_len, "stride": stride}, visual_metadata)
+
     windows: list[tuple[float, float]] = []
     cursor = 0.0
     while cursor < duration:
@@ -318,7 +381,7 @@ async def ingest_material_asset(
             item.status = "READY"
             item.duration = duration
             item.subtitle_source = subtitle_mode
-            item.metadata_json = {"clip_len": clip_len, "stride": stride}
+            item.metadata_json = item_metadata
         else:
             item = MaterialItem(
                 library_id=library_id,
@@ -326,7 +389,7 @@ async def ingest_material_asset(
                 status="READY",
                 duration=duration,
                 subtitle_source=subtitle_mode,
-                metadata_json={"clip_len": clip_len, "stride": stride},
+                metadata_json=item_metadata,
             )
             db.add(item)
             await db.flush()
@@ -342,7 +405,7 @@ async def ingest_material_asset(
                 subtitle_text=payload["subtitle_text"],
                 neighbor_clip_ids=payload["neighbor_clip_ids"],
                 clip_kind="coarse_window",
-                metadata_json={"index": clip_index},
+                metadata_json=_with_visual_metadata({"index": clip_index}, visual_metadata),
             )
             db.add(clip)
             await db.flush()
@@ -361,6 +424,7 @@ async def ingest_material_asset(
                         "end_sec": payload["end_sec"],
                         "subtitle_text": payload["subtitle_text"],
                         "neighbor_clip_ids": payload["neighbor_clip_ids"],
+                        "metadata": clip.metadata_json,
                     },
                 }
             )
@@ -407,7 +471,8 @@ async def _qdrant_search(vector_name: str, vector: list[float], source_library_i
 async def _fallback_db_search(db: AsyncSession, query: str, source_library_ids: list[str], limit: int) -> list[dict[str, Any]]:
     rows = (
         await db.execute(
-            select(MaterialClip)
+            select(MaterialClip, MaterialItem.metadata_json)
+            .outerjoin(MaterialItem, MaterialClip.parent_material_item_id == MaterialItem.id)
             .where(
                 MaterialClip.library_id.in_([uuid.UUID(item) for item in source_library_ids]),
                 MaterialClip.clip_kind == "coarse_window",
@@ -415,10 +480,10 @@ async def _fallback_db_search(db: AsyncSession, query: str, source_library_ids: 
             .order_by(MaterialClip.created_at.desc())
             .limit(max(limit * 4, 100))
         )
-    ).scalars().all()
+    ).all()
     scored = sorted(
         rows,
-        key=lambda clip: _overlap_score(query, clip.subtitle_text or ""),
+        key=lambda row: _overlap_score(query, row[0].subtitle_text or ""),
         reverse=True,
     )[:limit]
     return [
@@ -433,9 +498,10 @@ async def _fallback_db_search(db: AsyncSession, query: str, source_library_ids: 
                 "end_sec": clip.end_sec,
                 "subtitle_text": clip.subtitle_text,
                 "neighbor_clip_ids": clip.neighbor_clip_ids,
+                "metadata": _merge_visual_metadata(item_metadata, clip.metadata_json),
             },
         }
-        for clip in scored
+        for clip, item_metadata in scored
     ]
 
 
@@ -447,6 +513,7 @@ def _merge_candidates(raw_results: list[dict[str, Any]]) -> list[dict[str, Any]]
         score = float(item.get("score") or 0.0)
         existing = merged.get(point_id)
         if existing is None or score > existing["coarse_score"]:
+            metadata = _merge_visual_metadata(payload.get("metadata"), payload)
             merged[point_id] = {
                 "id": point_id,
                 "library_id": str(payload.get("library_id")),
@@ -457,6 +524,7 @@ def _merge_candidates(raw_results: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "subtitle_text": str(payload.get("subtitle_text") or ""),
                 "neighbor_clip_ids": payload.get("neighbor_clip_ids") or [],
                 "coarse_score": score,
+                "metadata": metadata,
             }
     return sorted(merged.values(), key=lambda item: item["coarse_score"], reverse=True)
 
@@ -507,6 +575,7 @@ def _candidate_window_from_cluster(cluster: list[dict[str, Any]]) -> CandidateWi
         neighbor_clip_ids=sorted(set(neighbor_clip_ids)),
         member_clip_ids=member_clip_ids,
         clips=cluster,
+        visual_metadata=_merge_visual_metadata(*(item.get("metadata") for item in cluster)),
         lighthouse_score=0.0,
     )
 
@@ -529,6 +598,7 @@ def _expand_windows(windows: list[CandidateWindow], expand_left: float, expand_r
                 neighbor_clip_ids=window.neighbor_clip_ids,
                 member_clip_ids=window.member_clip_ids,
                 clips=window.clips,
+                visual_metadata=window.visual_metadata,
             )
         )
     return expanded
@@ -724,6 +794,7 @@ async def preview_material_search(db: AsyncSession, request) -> tuple[MaterialQu
                 "confidence": confidence,
                 "member_clip_ids": window.member_clip_ids,
                 "neighbor_clip_ids": window.neighbor_clip_ids,
+                "metadata": _material_result_metadata(window),
             }
         )
     await db.commit()
@@ -772,12 +843,15 @@ async def materialize_material_search(db: AsyncSession, request) -> tuple[Materi
                 neighbor_clip_ids=item["neighbor_clip_ids"],
                 clip_kind="final_refined",
                 storage_asset_id=final_asset.id,
-                metadata_json={
-                    "query": request.query,
-                    "coarse_score": item["coarse_score"],
-                    "lighthouse_score": item["lighthouse_score"],
-                    "confidence": item["confidence"],
-                },
+                metadata_json=_with_visual_metadata(
+                    {
+                        "query": request.query,
+                        "coarse_score": item["coarse_score"],
+                        "lighthouse_score": item["lighthouse_score"],
+                        "confidence": item["confidence"],
+                    },
+                    item.get("metadata"),
+                ),
             )
             db.add(clip)
             await db.flush()
@@ -794,13 +868,16 @@ async def materialize_material_search(db: AsyncSession, request) -> tuple[Materi
                 confidence=item["confidence"],
                 start_sec=item["start_sec"],
                 end_sec=item["end_sec"],
-                metadata_json={
-                    "member_clip_ids": item["member_clip_ids"],
-                    "neighbor_clip_ids": item["neighbor_clip_ids"],
-                    "storage_asset_id": str(final_asset.id),
-                    "result_library_id": str(clip.library_id),
-                    "material_clip_id": str(clip.id),
-                },
+                metadata_json=_with_visual_metadata(
+                    {
+                        "member_clip_ids": item["member_clip_ids"],
+                        "neighbor_clip_ids": item["neighbor_clip_ids"],
+                        "storage_asset_id": str(final_asset.id),
+                        "result_library_id": str(clip.library_id),
+                        "material_clip_id": str(clip.id),
+                    },
+                    item.get("metadata"),
+                ),
             )
             db.add(query_result)
             await db.flush()
@@ -817,11 +894,14 @@ async def materialize_material_search(db: AsyncSession, request) -> tuple[Materi
                     "coarse_score": item["coarse_score"],
                     "lighthouse_score": item["lighthouse_score"],
                     "confidence": item["confidence"],
-                    "metadata": {
-                        "storage_asset_id": str(final_asset.id),
-                        "material_clip_id": str(clip.id),
-                        "result_library_id": str(clip.library_id),
-                    },
+                    "metadata": _with_visual_metadata(
+                        {
+                            "storage_asset_id": str(final_asset.id),
+                            "material_clip_id": str(clip.id),
+                            "result_library_id": str(clip.library_id),
+                        },
+                        item.get("metadata"),
+                    ),
                 }
             )
 

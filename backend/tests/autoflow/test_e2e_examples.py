@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from app.autoflow.service import AutoFlowService
 from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import AutoFlowRequest
+from app.services.material_service import _candidate_window_from_cluster, _material_result_metadata
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _assert_valid_plan(plan, *, intent_type: str, template_id: str) -> None:
@@ -98,3 +104,63 @@ async def test_material_library_remix_uses_owned_material_defaults_and_validates
     assert {"source", "trim", "vertical_crop", "montage_assembler", "title_overlay", "transcode", "export"}.issubset(
         set(_node_types(plan))
     )
+
+
+def test_material_search_result_metadata_keeps_source_visual_metadata():
+    window = _candidate_window_from_cluster(
+        [
+            {
+                "library_id": "library-1",
+                "source_asset_id": "asset-1",
+                "clip_id": "asset-1:1",
+                "start_sec": 0.0,
+                "end_sec": 5.0,
+                "subtitle_text": "sunset over the water",
+                "neighbor_clip_ids": [],
+                "coarse_score": 0.76,
+                "metadata": {
+                    "aspect_ratio": "9:16",
+                    "width": 1080,
+                    "height": 1920,
+                    "visual": {
+                        "motion_score": 0.82,
+                        "scene_change_score": 0.34,
+                        "watermark_score": 0.08,
+                        "suggested_crop": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+                    },
+                },
+            }
+        ]
+    )
+
+    metadata = _material_result_metadata(window)
+
+    assert metadata["aspect_ratio"] == "9:16"
+    assert metadata["width"] == 1080
+    assert metadata["height"] == 1920
+    assert metadata["visual"]["motion_score"] == 0.82
+    assert metadata["visual"]["scene_change_score"] == 0.34
+    assert metadata["visual"]["watermark_score"] == 0.08
+    assert window.visual_metadata == metadata
+
+
+def test_autoflow_docs_and_demo_scripts_document_production_review_boundaries():
+    docs = "\n".join(
+        [
+            (REPO_ROOT / "docs/autoflow/architecture.md").read_text(),
+            (REPO_ROOT / "docs/autoflow/codex-task-guide.md").read_text(),
+        ]
+    )
+    demo_scripts = "\n".join(
+        [
+            (REPO_ROOT / "scripts/autoflow_demo_cat_compilation.py").read_text(),
+            (REPO_ROOT / "scripts/autoflow_demo_hot_topic.py").read_text(),
+            (REPO_ROOT / "scripts/autoflow_demo_material_remix.py").read_text(),
+        ]
+    )
+
+    assert "plan patch" in docs.lower()
+    assert "public approval" in docs.lower()
+    assert "db-backed metrics" in docs.lower()
+    assert "review gate" in demo_scripts.lower()
+    assert "db-backed metrics" in demo_scripts.lower()

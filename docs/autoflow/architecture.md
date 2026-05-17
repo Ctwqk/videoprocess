@@ -24,6 +24,12 @@ must pass `validate_pipeline()` before execution.
 10. The plan is returned with validation data, rights state, candidates,
    metadata, and `needs_review`.
 
+Plan patch flows may update a reviewed plan before execution, but patches must
+stay inside the same deterministic template/capability boundary and must be
+revalidated with `validate_pipeline()`. Public approval is a separate human
+decision: research candidates, external platform assets, or public upload modes
+must remain blocked until review explicitly approves them.
+
 ## Core Modules
 
 | Module | Responsibility |
@@ -43,6 +49,11 @@ must pass `validate_pipeline()` before execution.
 | `backend/app/autoflow/trend_service.py` | Manual trend signals and opportunity scoring. |
 | `backend/app/autoflow/content_strategy.py` | Ideas generated from trend suggestions and template performance. |
 | `backend/app/schemas/autoflow.py` | Public request, plan, candidate, metadata, template, and run schemas. |
+
+Production deployments should replace the MVP in-memory metrics/trends with
+DB-backed metrics and trend APIs. Rankers and strategy helpers should treat
+those values as optional context, never as authority to bypass template
+validation, rights checks, or public approval.
 
 ## Execution Boundary
 
@@ -68,6 +79,8 @@ Execution is separate:
 - External URL candidates may be used for research/preview, but require human
   review before publication.
 - Upload nodes must default to `private` or `unlisted`.
+- DB-backed metrics can influence ranking and content strategy, but they must
+  not directly define arbitrary workflow graphs.
 
 ## Testing Strategy
 

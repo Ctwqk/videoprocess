@@ -85,6 +85,11 @@ def _summary(plan: dict[str, Any]) -> dict[str, Any]:
         "candidate_count": len(plan.get("candidates", [])),
         "keywords": plan.get("intent", {}).get("keywords", []),
         "node_types": [node.get("type") for node in plan.get("pipeline_definition", {}).get("nodes", [])],
+        "safety_notes": [
+            "Review gate remains required before any public upload.",
+            "Plan patch APIs can adjust a reviewed plan before execution.",
+            "DB-backed metrics are production inputs, not provided by this demo client.",
+        ],
         "warnings": plan.get("warnings", []),
     }
 
