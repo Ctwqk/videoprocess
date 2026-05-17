@@ -9,6 +9,7 @@
 __pycache__/
 .pytest_cache/
 .playwright-cli/
+.worktrees/
 .venv/
 venv/
 **/*venv/
@@ -49,4 +50,3 @@ secrets/
 *client_secret*.json
 token.json
 .DS_Store
-
