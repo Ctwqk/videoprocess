@@ -12,7 +12,16 @@ from app.autoflow.service import autoflow_service
 from app.autoflow.template_library import TemplateLibrary
 from app.autoflow.trend_service import TrendService
 from app.db import get_db
-from app.schemas.autoflow import AutoFlowExecuteRequest, AutoFlowPlan, AutoFlowRequest, AutoFlowRun, WorkflowTemplate
+from app.schemas.autoflow import (
+    AutoFlowApprovalRequest,
+    AutoFlowExecuteRequest,
+    AutoFlowPlan,
+    AutoFlowPlanPatch,
+    AutoFlowRejectRequest,
+    AutoFlowRequest,
+    AutoFlowRun,
+    WorkflowTemplate,
+)
 
 
 router = APIRouter(prefix="/api/v1/autoflow", tags=["autoflow"])
@@ -27,21 +36,70 @@ async def create_plan(data: AutoFlowRequest, db: AsyncSession | None = Depends(g
 
 
 @router.get("/plans", response_model=list[AutoFlowPlan])
-async def list_plans():
-    return await autoflow_service.list_plans()
+async def list_plans(db: AsyncSession | None = Depends(get_db)):
+    return await autoflow_service.list_plans(db)
 
 
 @router.get("/plans/{plan_id}", response_model=AutoFlowPlan)
-async def get_plan(plan_id: str):
-    plan = await autoflow_service.get_plan(plan_id)
+async def get_plan(plan_id: str, db: AsyncSession | None = Depends(get_db)):
+    plan = await autoflow_service.get_plan(plan_id, db)
+    if not plan:
+        raise HTTPException(status_code=404, detail="AutoFlow plan not found")
+    return plan
+
+
+@router.patch("/plans/{plan_id}", response_model=AutoFlowPlan)
+async def patch_plan(
+    plan_id: str,
+    data: AutoFlowPlanPatch,
+    db: AsyncSession | None = Depends(get_db),
+):
+    try:
+        plan = await autoflow_service.patch_plan(plan_id, data, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not plan:
         raise HTTPException(status_code=404, detail="AutoFlow plan not found")
     return plan
 
 
 @router.post("/plans/{plan_id}/approve", response_model=AutoFlowPlan)
-async def approve_plan(plan_id: str):
-    plan = await autoflow_service.approve(plan_id)
+async def approve_plan(
+    plan_id: str,
+    data: AutoFlowApprovalRequest | None = None,
+    db: AsyncSession | None = Depends(get_db),
+):
+    try:
+        plan = await autoflow_service.approve(plan_id, db, review_notes=data.review_notes if data else None)
+    except PermissionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not plan:
+        raise HTTPException(status_code=404, detail="AutoFlow plan not found")
+    return plan
+
+
+@router.post("/plans/{plan_id}/approve-public", response_model=AutoFlowPlan)
+async def approve_plan_public(
+    plan_id: str,
+    data: AutoFlowApprovalRequest | None = None,
+    db: AsyncSession | None = Depends(get_db),
+):
+    try:
+        plan = await autoflow_service.approve_public(plan_id, db, review_notes=data.review_notes if data else None)
+    except PermissionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not plan:
+        raise HTTPException(status_code=404, detail="AutoFlow plan not found")
+    return plan
+
+
+@router.post("/plans/{plan_id}/reject", response_model=AutoFlowPlan)
+async def reject_plan(
+    plan_id: str,
+    data: AutoFlowRejectRequest | None = None,
+    db: AsyncSession | None = Depends(get_db),
+):
+    plan = await autoflow_service.reject(plan_id, db, rejected_reason=data.rejected_reason if data else None)
     if not plan:
         raise HTTPException(status_code=404, detail="AutoFlow plan not found")
     return plan
@@ -58,26 +116,32 @@ async def execute_plan(data: AutoFlowExecuteRequest, db: AsyncSession | None = D
 
 
 @router.get("/runs", response_model=list[AutoFlowRun])
-async def list_runs():
-    return await autoflow_service.list_runs()
+async def list_runs(db: AsyncSession | None = Depends(get_db)):
+    return await autoflow_service.list_runs(db)
 
 
 @router.get("/runs/{run_id}", response_model=AutoFlowRun)
-async def get_run(run_id: str):
-    run = await autoflow_service.get_run(run_id)
+async def get_run(run_id: str, db: AsyncSession | None = Depends(get_db)):
+    run = await autoflow_service.get_run(run_id, db)
     if not run:
         raise HTTPException(status_code=404, detail="AutoFlow run not found")
     return run
 
 
 @router.post("/runs/{run_id}/collect-metrics")
-async def collect_metrics(run_id: str, payload: dict[str, Any]):
-    run = await autoflow_service.get_run(run_id)
+async def collect_metrics(run_id: str, payload: dict[str, Any], db: AsyncSession | None = Depends(get_db)):
+    run = await autoflow_service.get_run(run_id, db)
     if not run:
         raise HTTPException(status_code=404, detail="AutoFlow run not found")
+    if db is not None:
+        try:
+            return await metrics_service.save_manual_metrics_db(run_id, payload, db)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     enriched = dict(payload)
     if run.plan_id:
-        plan = await autoflow_service.get_plan(run.plan_id)
+        plan = await autoflow_service.get_plan(run.plan_id, db)
         if plan:
             enriched.setdefault("template_id", plan.template_id)
             enriched.setdefault("intent_type", plan.intent.intent_type)
@@ -85,26 +149,32 @@ async def collect_metrics(run_id: str, payload: dict[str, Any]):
 
 
 @router.get("/runs/{run_id}/collect-metrics")
-async def collect_metrics_placeholder(run_id: str):
-    if not await autoflow_service.get_run(run_id):
+async def collect_metrics_placeholder(run_id: str, db: AsyncSession | None = Depends(get_db)):
+    if not await autoflow_service.get_run(run_id, db):
         raise HTTPException(status_code=404, detail="AutoFlow run not found")
     return {"status": "not_implemented", "run_id": run_id}
 
 
 @router.get("/runs/{run_id}/metrics")
-async def list_run_metrics(run_id: str):
-    if not await autoflow_service.get_run(run_id):
+async def list_run_metrics(run_id: str, db: AsyncSession | None = Depends(get_db)):
+    if not await autoflow_service.get_run(run_id, db):
         raise HTTPException(status_code=404, detail="AutoFlow run not found")
+    if db is not None:
+        return await metrics_service.list_for_run_db(run_id, db)
     return metrics_service.list_for_run(run_id)
 
 
 @router.get("/metrics/templates")
-async def template_metrics_summary():
+async def template_metrics_summary(db: AsyncSession | None = Depends(get_db)):
+    if db is not None:
+        return await metrics_service.aggregate_by_template_db(db)
     return metrics_service.aggregate_by_template()
 
 
 @router.post("/trend-signals")
-async def create_trend_signal(payload: dict[str, Any]):
+async def create_trend_signal(payload: dict[str, Any], db: AsyncSession | None = Depends(get_db)):
+    if db is not None:
+        return await trend_service.add_signal_db(payload, db)
     return trend_service.add_signal(payload)
 
 
@@ -113,8 +183,17 @@ async def trend_suggestions(
     source_policy: str = "owned_only",
     material_library_ids: str | None = None,
     limit: int = 10,
+    db: AsyncSession | None = Depends(get_db),
 ):
     libraries = _split_param(material_library_ids)
+    if db is not None:
+        return await trend_service.suggest_db(
+            db,
+            material_library_ids=libraries,
+            source_policy=source_policy,
+            template_performance=await metrics_service.aggregate_by_template_db(db),
+            limit=limit,
+        )
     return trend_service.suggest(
         material_library_ids=libraries,
         source_policy=source_policy,
@@ -124,19 +203,30 @@ async def trend_suggestions(
 
 
 @router.post("/ideas")
-async def create_ideas(payload: dict[str, Any]):
+async def create_ideas(payload: dict[str, Any], db: AsyncSession | None = Depends(get_db)):
     source_policy = str(payload.get("source_policy") or "owned_only")
     libraries = [str(item) for item in payload.get("material_library_ids") or []]
-    suggestions = trend_service.suggest(
-        material_library_ids=libraries,
-        source_policy=source_policy,
-        template_performance=metrics_service.aggregate_by_template(),
-        limit=int(payload.get("count") or 10),
-    )
+    if db is not None:
+        template_performance = await metrics_service.aggregate_by_template_db(db)
+        suggestions = await trend_service.suggest_db(
+            db,
+            material_library_ids=libraries,
+            source_policy=source_policy,
+            template_performance=template_performance,
+            limit=int(payload.get("count") or 10),
+        )
+    else:
+        template_performance = metrics_service.aggregate_by_template()
+        suggestions = trend_service.suggest(
+            material_library_ids=libraries,
+            source_policy=source_policy,
+            template_performance=template_performance,
+            limit=int(payload.get("count") or 10),
+        )
     return content_strategy_service.generate_ideas(
         payload,
         trend_suggestions=suggestions,
-        template_performance=metrics_service.aggregate_by_template(),
+        template_performance=template_performance,
     )
 
 

@@ -4,8 +4,10 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from app.api import autoflow as autoflow_api_module
 from app.api.autoflow import router
 from app.autoflow.content_strategy import ContentStrategyService
+from app.db import get_db
 
 
 def test_content_strategy_generates_ranked_ideas_from_trends_and_template_performance():
@@ -74,8 +76,11 @@ def test_content_strategy_falls_back_to_template_recommendations_without_trends(
 
 @pytest.mark.asyncio
 async def test_ideas_api_combines_trend_suggestions_and_metrics_summary():
+    autoflow_api_module.metrics_service._metrics.clear()
+    autoflow_api_module.trend_service._signals.clear()
     app = FastAPI()
     app.include_router(router)
+    app.dependency_overrides[get_db] = lambda: None
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         await client.post(

@@ -1,15 +1,116 @@
 from __future__ import annotations
 
+import uuid
+from types import SimpleNamespace
+
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.autoflow import router
+from app.api import autoflow as autoflow_api_module
 from app.db import get_db
+from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
+from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
+from app.models.autoflow import ContentMetric, TrendSignal
+
+
+@pytest.fixture
+async def autoflow_db_session():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        for table in (
+            AutoFlowPlanModel.__table__,
+            AutoFlowRunModel.__table__,
+            ContentMetric.__table__,
+            TrendSignal.__table__,
+        ):
+            await conn.run_sync(table.create)
+
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        yield session
+
+    await engine.dispose()
+
+
+def _reset_autoflow_singletons() -> None:
+    autoflow_api_module.autoflow_service._plans.clear()
+    autoflow_api_module.autoflow_service._runs.clear()
+    autoflow_api_module.metrics_service._metrics.clear()
+    autoflow_api_module.trend_service._signals.clear()
+
+
+def _app_with_db(db_session):
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_db] = lambda: db_session
+    return app
+
+
+def _plan_row(
+    *,
+    plan_id: uuid.UUID | None = None,
+    prompt: str = "Review a database-backed AutoFlow plan",
+    publish_mode: str = "preview_only",
+    source_policy: str = "owned_only",
+    rights_status: str = "allowed",
+    status: str = "drafted",
+):
+    plan_uuid = plan_id or uuid.uuid4()
+    request_json = {
+        "prompt": prompt,
+        "target_platforms": ["youtube_shorts"],
+        "duration_sec": None,
+        "aspect_ratio": "auto",
+        "source_policy": source_policy,
+        "publish_mode": publish_mode,
+        "material_library_ids": [],
+        "user_constraints": {},
+    }
+    intent_json = {
+        "intent_type": "generic_video",
+        "subject": "database-backed plan",
+        "style": "auto",
+        "duration_sec": 30,
+        "aspect_ratio": "9:16",
+        "target_platforms": ["youtube_shorts"],
+        "source_policy": source_policy,
+        "publish_mode": publish_mode,
+        "keywords": [],
+        "negative_keywords": [],
+        "needs_voiceover": False,
+        "needs_subtitles": True,
+        "needs_bgm": True,
+        "user_confirmation_questions": [],
+    }
+    kwargs = {
+        "id": plan_uuid,
+        "prompt": prompt,
+        "intent_json": intent_json,
+        "template_id": "material_library_remix",
+        "pipeline_definition": {"nodes": [], "edges": [], "viewport": {"x": 0, "y": 0, "zoom": 1}},
+        "candidates_json": [],
+        "metadata_json": {},
+        "rights_json": {
+            "status": rights_status,
+            "reasons": ["test rights decision"],
+            "allowed_publish_modes": ["preview_only", "private_upload", "unlisted_upload"],
+            "execute_allowed": rights_status != "blocked",
+            "publish_allowed": rights_status == "allowed",
+        },
+        "validation_json": {"valid": True, "errors": [], "warnings": [], "repairs": []},
+        "status": status,
+    }
+    if "request_json" in AutoFlowPlanModel.__table__.c:
+        kwargs["request_json"] = request_json
+    return AutoFlowPlanModel(**kwargs)
 
 
 @pytest.mark.asyncio
 async def test_autoflow_plan_approve_execute_api_without_live_database():
+    _reset_autoflow_singletons()
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_db] = lambda: None
@@ -44,3 +145,211 @@ async def test_autoflow_plan_approve_execute_api_without_live_database():
         run = executed.json()
         assert run["plan_id"] == plan["plan_id"]
         assert run["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_db_backed_plan_get_and_list_read_persisted_plan(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create a 30 second cat compilation backed by the database.",
+                "target_platforms": ["youtube_shorts"],
+            },
+        )
+        assert response.status_code == 200
+        plan = response.json()
+
+        autoflow_api_module.autoflow_service._plans.clear()
+
+        fetched = await client.get(f"/api/v1/autoflow/plans/{plan['plan_id']}")
+        assert fetched.status_code == 200
+        assert fetched.json()["plan_id"] == plan["plan_id"]
+        assert fetched.json()["request"]["prompt"] == plan["request"]["prompt"]
+
+        listed = await client.get("/api/v1/autoflow/plans")
+        assert listed.status_code == 200
+        assert [item["plan_id"] for item in listed.json()] == [plan["plan_id"]]
+
+
+@pytest.mark.asyncio
+async def test_blocked_db_plan_cannot_be_approved(autoflow_db_session):
+    _reset_autoflow_singletons()
+    plan_id = uuid.uuid4()
+    autoflow_db_session.add(
+        _plan_row(plan_id=plan_id, rights_status="blocked", status="blocked", source_policy="owned_only")
+    )
+    await autoflow_db_session.commit()
+    app = _app_with_db(autoflow_db_session)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(f"/api/v1/autoflow/plans/{plan_id}/approve")
+
+    assert response.status_code == 400
+    assert "blocked" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_public_after_review_requires_public_approval_after_ordinary_approval(
+    autoflow_db_session, monkeypatch
+):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async def fake_create_pipeline(db, data):
+        return SimpleNamespace(id=uuid.uuid4())
+
+    async def fake_create_job(db, pipeline_id):
+        return SimpleNamespace(id=uuid.uuid4(), status=SimpleNamespace(value="PENDING"))
+
+    async def fake_start_or_defer_jobs(db, jobs):
+        return None
+
+    monkeypatch.setattr("app.autoflow.service.create_pipeline", fake_create_pipeline)
+    monkeypatch.setattr("app.autoflow.service.create_job", fake_create_job)
+    monkeypatch.setattr("app.autoflow.service.start_or_defer_jobs", fake_start_or_defer_jobs)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create a 30 second cat compilation for public publication after review.",
+                "target_platforms": ["youtube_shorts"],
+                "publish_mode": "public_after_review",
+            },
+        )
+        assert response.status_code == 200
+        plan = response.json()
+
+        approved = await client.post(f"/api/v1/autoflow/plans/{plan['plan_id']}/approve")
+        assert approved.status_code == 200
+        assert approved.json()["review_approved_at"] is not None
+        assert approved.json()["public_approved_at"] is None
+
+        blocked_execute = await client.post("/api/v1/autoflow/execute", json={"plan_id": plan["plan_id"]})
+        assert blocked_execute.status_code == 400
+        assert "public" in blocked_execute.json()["detail"].lower()
+
+        public_approved = await client.post(f"/api/v1/autoflow/plans/{plan['plan_id']}/approve-public")
+        assert public_approved.status_code == 200
+        assert public_approved.json()["public_approved_at"] is not None
+
+        executed = await client.post("/api/v1/autoflow/execute", json={"plan_id": plan["plan_id"]})
+        assert executed.status_code == 200
+        run = executed.json()
+        assert run["plan_id"] == plan["plan_id"]
+        assert run["pipeline_id"] is not None
+        assert run["job_id"] is not None
+
+        autoflow_api_module.autoflow_service._runs.clear()
+
+        fetched_run = await client.get(f"/api/v1/autoflow/runs/{run['run_id']}")
+        assert fetched_run.status_code == 200
+        assert fetched_run.json()["run_id"] == run["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_patch_plan_replaces_candidates_metadata_rebuilds_and_persists(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create a 30 second cat compilation with editable candidates.",
+                "target_platforms": ["youtube_shorts"],
+            },
+        )
+        assert created.status_code == 200
+        plan = created.json()
+
+        patched = await client.patch(
+            f"/api/v1/autoflow/plans/{plan['plan_id']}",
+            json={
+                "selected_candidate_ids": ["replacement-owned"],
+                "locked_candidate_ids": ["replacement-owned"],
+                "replacement_candidates": [
+                    {
+                        "id": "replacement-owned",
+                        "title": "Replacement owned clip",
+                        "source_type": "asset",
+                        "asset_id": "asset-replacement-owned",
+                        "start_sec": 2,
+                        "end_sec": 8,
+                        "score": 0.99,
+                        "rights_status": "allowed",
+                        "metadata": {"license": "owned"},
+                    }
+                ],
+                "metadata": {
+                    "selected_title": "Reviewed replacement edit",
+                    "description": "A reviewed replacement description.",
+                    "tags": ["cat", "reviewed"],
+                    "hashtags": ["#cat"],
+                    "title_candidates": ["Reviewed replacement edit"],
+                    "thumbnail_text_candidates": ["Reviewed"],
+                    "platform_payloads": {},
+                },
+                "publish_mode": "private_upload",
+                "rebuild_definition": True,
+                "validate": True,
+                "evaluate_rights": True,
+            },
+        )
+        assert patched.status_code == 200
+        payload = patched.json()
+        assert [candidate["id"] for candidate in payload["candidates"]] == ["replacement-owned"]
+        assert payload["candidates"][0]["metadata"]["locked"] is True
+        assert payload["metadata"]["selected_title"] == "Reviewed replacement edit"
+        assert payload["request"]["publish_mode"] == "private_upload"
+        assert payload["validation"]["valid"] is True
+        assert payload["rights"]["status"] == "allowed"
+        assert any(node["id"] == "youtube_upload_1" for node in payload["pipeline_definition"]["nodes"])
+
+        autoflow_api_module.autoflow_service._plans.clear()
+
+        fetched = await client.get(f"/api/v1/autoflow/plans/{plan['plan_id']}")
+        assert fetched.status_code == 200
+        assert fetched.json()["metadata"]["selected_title"] == "Reviewed replacement edit"
+
+
+@pytest.mark.asyncio
+async def test_execute_persists_failed_run_when_job_creation_fails(autoflow_db_session, monkeypatch):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async def fake_create_pipeline(db, data):
+        return SimpleNamespace(id=uuid.uuid4())
+
+    async def fake_create_job(db, pipeline_id):
+        raise RuntimeError("job planner unavailable")
+
+    monkeypatch.setattr("app.autoflow.service.create_pipeline", fake_create_pipeline)
+    monkeypatch.setattr("app.autoflow.service.create_job", fake_create_job)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create a 30 second cat compilation that will fail job creation.",
+                "target_platforms": ["youtube_shorts"],
+            },
+        )
+        assert created.status_code == 200
+        plan = created.json()
+
+        executed = await client.post("/api/v1/autoflow/execute", json={"plan_id": plan["plan_id"]})
+        assert executed.status_code == 200
+        run = executed.json()
+        assert run["status"] == "failed"
+        assert "job planner unavailable" in run["error_message"]
+
+        autoflow_api_module.autoflow_service._runs.clear()
+
+        fetched_run = await client.get(f"/api/v1/autoflow/runs/{run['run_id']}")
+        assert fetched_run.status_code == 200
+        assert fetched_run.json()["status"] == "failed"
