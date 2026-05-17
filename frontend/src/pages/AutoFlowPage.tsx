@@ -8,6 +8,7 @@ import {
   listAutoFlowTemplates,
 } from '../api/autoflow';
 import AutoFlowCandidateClips from '../components/autoflow/AutoFlowCandidateClips';
+import AutoFlowMetricsPanel from '../components/autoflow/AutoFlowMetricsPanel';
 import AutoFlowPlanPanel from '../components/autoflow/AutoFlowPlanPanel';
 import AutoFlowPromptBox from '../components/autoflow/AutoFlowPromptBox';
 import AutoFlowReviewGate from '../components/autoflow/AutoFlowReviewGate';
@@ -142,6 +143,11 @@ export default function AutoFlowPage() {
             onExecute={() => void handleExecute()}
           />
           <AutoFlowRunStatus run={run} />
+          <AutoFlowMetricsPanel
+            request={request}
+            run={run}
+            onUseIdea={prompt => setRequest(current => ({ ...current, prompt }))}
+          />
         </div>
 
         <div style={{ display: 'grid', gap: 12, minWidth: 0 }}>
