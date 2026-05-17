@@ -183,3 +183,66 @@ export interface CapabilityManifest {
   material_libraries?: MaterialLibraryOption[];
   [key: string]: unknown;
 }
+
+export interface AutoFlowMetric {
+  metric_id: string;
+  run_id: string;
+  template_id: string;
+  intent_type: string;
+  platform: string;
+  platform_content_id: string;
+  views: number;
+  likes: number;
+  comments: number;
+  shares: number;
+  like_rate: number;
+  comment_rate: number;
+  share_rate: number;
+  avg_retention: number;
+  virality_score: number;
+}
+
+export interface AutoFlowTemplateMetricSummary {
+  template_id: string;
+  metric_count: number;
+  total_views: number;
+  avg_views: number;
+  avg_like_rate: number;
+  avg_comment_rate: number;
+  avg_share_rate: number;
+  avg_retention: number;
+  avg_virality_score: number;
+  intent_type?: string;
+}
+
+export interface AutoFlowTrendSignalInput {
+  source: string;
+  keyword: string;
+  score?: number;
+  trend_growth?: number;
+  cross_platform_mentions?: number;
+  material_availability?: number;
+  competition?: number;
+  rights_risk?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface AutoFlowTrendSuggestion {
+  keyword: string;
+  opportunity_score: number;
+  recommended_template: string;
+  estimated_material_count: number;
+  rights_risk: number;
+  reason: string;
+}
+
+export interface AutoFlowIdea {
+  idea_id: string;
+  prompt: string;
+  template_id: string;
+  opportunity_score: number;
+  estimated_material_count: number;
+  risk: string;
+  target_platforms: string[];
+  source_policy: string;
+}
