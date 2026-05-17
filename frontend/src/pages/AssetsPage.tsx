@@ -30,7 +30,7 @@ export default function AssetsPage() {
         timeout: 300000,
       });
       fetchAssets();
-    } catch (err) {
+    } catch {
       alert('Upload failed');
     } finally {
       setUploading(false);

@@ -142,6 +142,8 @@ export default function ConfigPanel() {
     }
 
     setSearchQuery('');
+  // Reset search state only when the selected node changes, not for each config edit.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [node?.id, node?.data.nodeType]);
 
   if (!node || !typeDef) {

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import apiClient from '../api/client';
 import type { Job, NodeExecution } from '../api/types';
@@ -41,19 +41,19 @@ export default function JobDetailPage() {
   const [job, setJob] = useState<JobDetail | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const fetchJob = () => {
+  const fetchJob = useCallback(() => {
     if (!jobId) return;
     apiClient.get(`/jobs/${jobId}`).then(res => {
       setJob(res.data);
       setLoading(false);
     }).catch(() => setLoading(false));
-  };
+  }, [jobId]);
 
   useEffect(() => {
     fetchJob();
     const interval = setInterval(fetchJob, 3000);
     return () => clearInterval(interval);
-  }, [jobId]);
+  }, [fetchJob]);
 
   const handleCancel = async () => {
     if (!jobId) return;

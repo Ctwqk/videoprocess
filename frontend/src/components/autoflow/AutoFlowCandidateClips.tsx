@@ -1,5 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
-import type { AutoFlowClipCandidate } from '../../types/autoflow';
+import type { AutoFlowCandidateEditDraft, AutoFlowClipCandidate } from '../../types/autoflow';
+
+const DEFAULT_CANDIDATE_EDIT: AutoFlowCandidateEditDraft = {
+  selected: true,
+  locked: false,
+  replacement: '',
+};
 
 function metadataString(candidate: AutoFlowClipCandidate, key: string) {
   const value = candidate.metadata[key];
@@ -34,21 +39,17 @@ function rightsColor(status: string) {
 
 export default function AutoFlowCandidateClips({
   candidates,
+  candidateEdits,
+  onCandidateEditChange,
 }: {
   candidates: AutoFlowClipCandidate[];
+  candidateEdits: Record<string, AutoFlowCandidateEditDraft>;
+  onCandidateEditChange: (candidateId: string, edit: Partial<AutoFlowCandidateEditDraft>) => void;
 }) {
-  const candidateIds = useMemo(() => candidates.map(candidate => candidate.id), [candidates]);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set(candidateIds));
-  const [lockedIds, setLockedIds] = useState<Set<string>>(() => new Set());
-  const [replacementValues, setReplacementValues] = useState<Record<string, string>>({});
-
-  useEffect(() => {
-    setSelectedIds(new Set(candidateIds));
-    setLockedIds(new Set());
-    setReplacementValues({});
-  }, [candidateIds]);
-
-  const selectedCount = candidates.filter(candidate => selectedIds.has(candidate.id)).length;
+  const selectedCount = candidates.filter(candidate => {
+    const edit = candidateEdits[candidate.id] ?? DEFAULT_CANDIDATE_EDIT;
+    return edit.selected;
+  }).length;
 
   if (candidates.length === 0) {
     return (
@@ -84,10 +85,11 @@ export default function AutoFlowCandidateClips({
 
       <div style={{ display: 'grid', gap: 10 }}>
         {candidates.map(candidate => {
-          const selected = selectedIds.has(candidate.id);
-          const locked = lockedIds.has(candidate.id);
+          const edit = candidateEdits[candidate.id] ?? DEFAULT_CANDIDATE_EDIT;
+          const selected = edit.selected;
+          const locked = edit.locked;
           const thumbnailUrl = metadataString(candidate, 'thumbnail_url') ?? metadataString(candidate, 'thumbnail');
-          const replacementValue = replacementValues[candidate.id] ?? '';
+          const replacementValue = edit.replacement;
 
           return (
             <div
@@ -147,14 +149,7 @@ export default function AutoFlowCandidateClips({
                       type="checkbox"
                       checked={selected}
                       disabled={locked}
-                      onChange={() => {
-                        setSelectedIds(previous => {
-                          const next = new Set(previous);
-                          if (next.has(candidate.id)) next.delete(candidate.id);
-                          else next.add(candidate.id);
-                          return next;
-                        });
-                      }}
+                      onChange={() => onCandidateEditChange(candidate.id, { selected: !selected })}
                     />
                     Use
                   </label>
@@ -185,23 +180,13 @@ export default function AutoFlowCandidateClips({
                     <input
                       type="checkbox"
                       checked={locked}
-                      onChange={() => {
-                        setLockedIds(previous => {
-                          const next = new Set(previous);
-                          if (next.has(candidate.id)) next.delete(candidate.id);
-                          else next.add(candidate.id);
-                          return next;
-                        });
-                      }}
+                      onChange={() => onCandidateEditChange(candidate.id, { locked: !locked })}
                     />
                     Lock
                   </label>
                   <input
                     value={replacementValue}
-                    onChange={event => setReplacementValues(previous => ({
-                      ...previous,
-                      [candidate.id]: event.target.value,
-                    }))}
+                    onChange={event => onCandidateEditChange(candidate.id, { replacement: event.target.value })}
                     placeholder="Replacement URL or asset ID"
                     style={{
                       borderRadius: 6,

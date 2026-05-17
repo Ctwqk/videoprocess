@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 export type PlatformKey = 'x' | 'xiaohongshu' | 'bilibili';
 
@@ -37,7 +37,7 @@ export function usePlatformAuth(platform: PlatformKey) {
   const [authError, setAuthError] = useState<string | null>(null);
   const [authInitialized, setAuthInitialized] = useState(false);
 
-  async function refreshAuthStatus() {
+  const refreshAuthStatus = useCallback(async () => {
     let lastError: Error | null = null;
 
     for (const delayMs of AUTH_STATUS_RETRY_DELAYS_MS) {
@@ -71,9 +71,9 @@ export function usePlatformAuth(platform: PlatformKey) {
     setAuthError(lastError?.message || 'Platform auth status unavailable');
     setAuthInitialized(true);
     return null;
-  }
+  }, [authBase, storageKey]);
 
-  async function openPlatformAuth() {
+  const openPlatformAuth = useCallback(async () => {
     try {
       setAuthLoading(true);
       setAuthError(null);
@@ -93,9 +93,9 @@ export function usePlatformAuth(platform: PlatformKey) {
     } finally {
       window.setTimeout(() => setAuthLoading(false), 300);
     }
-  }
+  }, [authBase, platform]);
 
-  async function logoutPlatformAuth() {
+  const logoutPlatformAuth = useCallback(async () => {
     try {
       setAuthLoading(true);
       const response = await fetch(`${authBase}/auth/logout`, { method: 'POST' });
@@ -108,7 +108,7 @@ export function usePlatformAuth(platform: PlatformKey) {
     } finally {
       setAuthLoading(false);
     }
-  }
+  }, [authBase, refreshAuthStatus]);
 
   useEffect(() => {
     void refreshAuthStatus();
@@ -132,7 +132,7 @@ export function usePlatformAuth(platform: PlatformKey) {
       window.removeEventListener('focus', handleFocus);
       window.removeEventListener('message', handleMessage);
     };
-  }, [platform]);
+  }, [platform, refreshAuthStatus]);
 
   return {
     authStatus,
