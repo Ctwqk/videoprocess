@@ -4,6 +4,7 @@ import EditorPage from './pages/EditorPage';
 import JobsPage from './pages/JobsPage';
 import JobDetailPage from './pages/JobDetailPage';
 import AssetsPage from './pages/AssetsPage';
+import AutoFlowPage from './pages/AutoFlowPage';
 import TemplatesPage from './pages/TemplatesPage';
 
 function App() {
@@ -12,6 +13,7 @@ function App() {
       <Routes>
         <Route element={<AppShell />}>
           <Route path="/" element={<Navigate to="/editor" replace />} />
+          <Route path="/autoflow" element={<AutoFlowPage />} />
           <Route path="/editor" element={<EditorPage />} />
           <Route path="/editor/:pipelineId" element={<EditorPage />} />
           <Route path="/jobs" element={<JobsPage />} />
