@@ -16,73 +16,71 @@ class PipelineBuilder:
         if not candidates:
             raise ValueError("AutoFlow requires at least one candidate to build a pipeline")
 
+        nodes: list[PipelineNode] = []
+        edges: list[PipelineEdge] = []
         source_nodes: list[PipelineNode] = []
         trim_nodes: list[PipelineNode] = []
-        edges: list[PipelineEdge] = []
-        trimmed_node_ids: list[str] = []
+        vertical_nodes: list[PipelineNode] = []
+        assembly_inputs: list[str] = []
+        needs_vertical = _needs_vertical_crop(intent, template)
 
         for index, candidate in enumerate(candidates, start=1):
             source_node = self._source_node(index, candidate, intent)
             trim_node = self._trim_node(index, candidate)
             source_nodes.append(source_node)
             trim_nodes.append(trim_node)
-            source_port = "output"
             edges.append(
                 PipelineEdge(
                     id=f"e-{source_node.id}-{trim_node.id}",
                     source=source_node.id,
                     target=trim_node.id,
-                    sourceHandle=source_port,
+                    sourceHandle="output",
                     targetHandle="input",
                 )
             )
-            trimmed_node_ids.append(trim_node.id)
 
-        nodes: list[PipelineNode] = [*source_nodes, *trim_nodes]
-
-        assembly_output = trimmed_node_ids[0]
-        concat_count = 0
-        while len(trimmed_node_ids) > 1:
-            first = trimmed_node_ids.pop(0)
-            second = trimmed_node_ids.pop(0)
-            concat_count += 1
-            concat_id = f"concat_timeline_{concat_count}"
-            nodes.append(
-                PipelineNode(
-                    id=concat_id,
-                    type="concat_timeline",
-                    position=self._position(2 + concat_count, concat_count - 1),
-                    data=PipelineNodeData(
-                        label=f"Concat {concat_count}",
-                        config={"output_format": "mp4", "transition": "none", "transition_duration": 0},
-                    ),
+            current_output = trim_node.id
+            if needs_vertical:
+                vertical_node = self._vertical_crop_node(index, intent)
+                vertical_nodes.append(vertical_node)
+                edges.append(
+                    PipelineEdge(
+                        id=f"e-{trim_node.id}-{vertical_node.id}",
+                        source=trim_node.id,
+                        target=vertical_node.id,
+                        sourceHandle="output",
+                        targetHandle="input",
+                    )
                 )
-            )
-            edges.extend(
-                [
-                    PipelineEdge(
-                        id=f"e-{first}-{concat_id}",
-                        source=first,
-                        target=concat_id,
-                        sourceHandle="output",
-                        targetHandle="video_first",
-                    ),
-                    PipelineEdge(
-                        id=f"e-{second}-{concat_id}",
-                        source=second,
-                        target=concat_id,
-                        sourceHandle="output",
-                        targetHandle="video_second",
-                    ),
-                ]
-            )
-            trimmed_node_ids.insert(0, concat_id)
-            assembly_output = concat_id
+                current_output = vertical_node.id
+            assembly_inputs.append(current_output)
 
+        nodes.extend([*source_nodes, *trim_nodes, *vertical_nodes])
+        target_duration = _target_duration(intent, template)
+        width, height = _target_dimensions(intent.aspect_ratio)
+
+        if len(assembly_inputs) >= 2:
+            assembly = self._assembly_node(intent, target_duration, width, height, len(assembly_inputs), metadata)
+            nodes.append(assembly)
+            for index, input_node_id in enumerate(assembly_inputs, start=1):
+                edges.append(
+                    PipelineEdge(
+                        id=f"e-{input_node_id}-{assembly.id}",
+                        source=input_node_id,
+                        target=assembly.id,
+                        sourceHandle="output",
+                        targetHandle=f"video_{index}",
+                    )
+                )
+            assembly_output = assembly.id
+        else:
+            assembly_output = assembly_inputs[0]
+
+        title = self._title_node(metadata, target_duration)
         transcode = PipelineNode(
             id="transcode_1",
             type="transcode",
-            position=self._position(4, 0),
+            position=self._position(5, 0),
             data=PipelineNodeData(
                 label="Transcode",
                 config={"format": "mp4", "video_codec": "libx264", "audio_codec": "aac", "crf": 23},
@@ -91,30 +89,37 @@ class PipelineBuilder:
         export = PipelineNode(
             id="export_1",
             type="export",
-            position=self._position(5, 0),
+            position=self._position(6, 0),
             data=PipelineNodeData(
                 label="Export Preview",
                 config={"output_dir": "/tmp/vp_autoflow_exports", "filename": _safe_filename(metadata.selected_title)},
             ),
         )
-        nodes.extend([transcode, export])
-        edges.append(
-            PipelineEdge(
-                id=f"e-{assembly_output}-transcode_1",
-                source=assembly_output,
-                target="transcode_1",
-                sourceHandle="output",
-                targetHandle="input",
-            )
-        )
-        edges.append(
-            PipelineEdge(
-                id="e-transcode_1-export_1",
-                source="transcode_1",
-                target="export_1",
-                sourceHandle="output",
-                targetHandle="input",
-            )
+        nodes.extend([title, transcode, export])
+        edges.extend(
+            [
+                PipelineEdge(
+                    id=f"e-{assembly_output}-title_overlay_1",
+                    source=assembly_output,
+                    target="title_overlay_1",
+                    sourceHandle="output",
+                    targetHandle="input",
+                ),
+                PipelineEdge(
+                    id="e-title_overlay_1-transcode_1",
+                    source="title_overlay_1",
+                    target="transcode_1",
+                    sourceHandle="output",
+                    targetHandle="input",
+                ),
+                PipelineEdge(
+                    id="e-transcode_1-export_1",
+                    source="transcode_1",
+                    target="export_1",
+                    sourceHandle="output",
+                    targetHandle="input",
+                ),
+            ]
         )
 
         if intent.publish_mode in {"private_upload", "unlisted_upload", "public_after_review"}:
@@ -154,7 +159,7 @@ class PipelineBuilder:
             )
         asset_id = candidate.asset_id or candidate.id
         return PipelineNode(
-            id=f"src_{index}",
+            id=f"source_{index}",
             type="source",
             position=self._position(0, index - 1),
             data=PipelineNodeData(
@@ -181,6 +186,87 @@ class PipelineBuilder:
             ),
         )
 
+    def _vertical_crop_node(self, index: int, intent: AutoFlowIntent) -> PipelineNode:
+        width, height = _target_dimensions(intent.aspect_ratio)
+        return PipelineNode(
+            id=f"vertical_crop_{index}",
+            type="vertical_crop",
+            position=self._position(2, index - 1),
+            data=PipelineNodeData(
+                label=f"Vertical Crop {index}",
+                config={"mode": "smart_subject", "width": width, "height": height, "background": "blur"},
+            ),
+        )
+
+    def _assembly_node(
+        self,
+        intent: AutoFlowIntent,
+        target_duration: int,
+        width: int,
+        height: int,
+        input_count: int,
+        metadata: AutoFlowMetadata,
+    ) -> PipelineNode:
+        use_montage = NodeTypeRegistry.get().get_type("montage_assembler") is not None
+        if use_montage:
+            return PipelineNode(
+                id="montage_1",
+                type="montage_assembler",
+                position=self._position(3, 0),
+                data=PipelineNodeData(
+                    label="Montage",
+                    config={
+                        "style": intent.style if intent.style != "auto" else "fast_cuts",
+                        "target_duration": target_duration,
+                        "aspect_ratio": intent.aspect_ratio,
+                        "beat_sync": bool(intent.needs_bgm),
+                        "max_clip_duration": 6,
+                        "min_clip_duration": 1,
+                        "intro_hook": metadata.selected_title or intent.subject,
+                        "width": width,
+                        "height": height,
+                    },
+                ),
+            )
+
+        return PipelineNode(
+            id="concat_many_1",
+            type="concat_many",
+            position=self._position(3, 0),
+            data=PipelineNodeData(
+                label="Concat Many",
+                config={
+                    "input_count": min(input_count, 12),
+                    "output_format": "mp4",
+                    "transition": "none",
+                    "transition_duration": 0,
+                    "target_duration": target_duration,
+                    "normalize_resolution": True,
+                    "width": width,
+                    "height": height,
+                },
+            ),
+        )
+
+    def _title_node(self, metadata: AutoFlowMetadata, target_duration: int) -> PipelineNode:
+        title = metadata.selected_title or "AutoFlow Preview"
+        return PipelineNode(
+            id="title_overlay_1",
+            type="title_overlay",
+            position=self._position(4, 0),
+            data=PipelineNodeData(
+                label="Title Overlay",
+                config={
+                    "text": title,
+                    "position": "top",
+                    "start_time": 0,
+                    "duration": min(3, max(1, target_duration)),
+                    "font_size": 72,
+                    "safe_area": True,
+                },
+            ),
+        )
+
     def _upload_node(self, intent: AutoFlowIntent, metadata: AutoFlowMetadata) -> PipelineNode:
         privacy = "private"
         if intent.publish_mode == "unlisted_upload":
@@ -190,7 +276,7 @@ class PipelineBuilder:
         return PipelineNode(
             id="youtube_upload_1",
             type="youtube_upload",
-            position=self._position(6, 0),
+            position=self._position(7, 0),
             data=PipelineNodeData(
                 label="YouTube Upload",
                 config={
@@ -205,6 +291,22 @@ class PipelineBuilder:
 
     def _position(self, stage_index: int, row_index: int) -> dict[str, float]:
         return {"x": stage_index * 260, "y": row_index * 140}
+
+
+def _needs_vertical_crop(intent: AutoFlowIntent, template: WorkflowTemplate) -> bool:
+    return intent.aspect_ratio == "9:16" or template.default_slots.get("aspect_ratio") == "9:16"
+
+
+def _target_duration(intent: AutoFlowIntent, template: WorkflowTemplate) -> int:
+    return int(intent.duration_sec or template.default_slots.get("target_duration") or 30)
+
+
+def _target_dimensions(aspect_ratio: str) -> tuple[int, int]:
+    if aspect_ratio == "16:9":
+        return 1920, 1080
+    if aspect_ratio == "1:1":
+        return 1080, 1080
+    return 1080, 1920
 
 
 def _safe_filename(title: str | None) -> str:

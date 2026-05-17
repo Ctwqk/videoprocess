@@ -29,20 +29,25 @@ def test_builder_creates_valid_two_clip_asset_pipeline():
 
     assert validation.valid, [error.message for error in validation.errors]
     assert [node.id for node in definition.nodes] == [
-        "src_1",
-        "src_2",
+        "source_1",
+        "source_2",
         "trim_1",
         "trim_2",
-        "concat_timeline_1",
+        "vertical_crop_1",
+        "vertical_crop_2",
+        "montage_1",
+        "title_overlay_1",
         "transcode_1",
         "export_1",
     ]
     assert definition.nodes[0].position == {"x": 0, "y": 0}
     assert definition.nodes[2].data.config["duration"] == "5"
+    assert next(node for node in definition.nodes if node.id == "montage_1").type == "montage_assembler"
+    assert next(node for node in definition.nodes if node.id == "title_overlay_1").data.config["text"] == metadata.selected_title
     assert definition.nodes[-1].type == "export"
 
 
-def test_builder_uses_binary_concat_timeline_fallback_for_three_clips():
+def test_builder_uses_single_montage_node_for_three_clips():
     intent = AutoFlowIntent(intent_type="material_library_remix", subject="旅行素材", duration_sec=15)
     candidates = [candidate(1), candidate(2), candidate(3)]
     template = TemplateLibrary().get_template("material_library_remix")
@@ -54,10 +59,10 @@ def test_builder_uses_binary_concat_timeline_fallback_for_three_clips():
 
     assert first.model_dump() == second.model_dump()
     assert validate_pipeline(first).valid
-    assert [node.id for node in first.nodes if node.type == "concat_timeline"] == [
-        "concat_timeline_1",
-        "concat_timeline_2",
-    ]
+    montage = next(node for node in first.nodes if node.id == "montage_1")
+    assert montage.type == "montage_assembler"
+    assert montage.data.config["target_duration"] == 15
+    assert [edge.targetHandle for edge in first.edges if edge.target == "montage_1"] == ["video_1", "video_2", "video_3"]
 
 
 def test_builder_uses_url_download_when_source_policy_allows_research_preview():
@@ -86,6 +91,7 @@ def test_builder_uses_url_download_when_source_policy_allows_research_preview():
     assert validate_pipeline(definition).valid
     assert definition.nodes[0].type == "url_download"
     assert definition.nodes[0].data.config["url"] == "https://example.test/cat.mp4"
+    assert "vertical_crop_1" in {node.id for node in definition.nodes}
 
 
 def test_builder_adds_private_upload_node_when_publish_mode_requests_it():
