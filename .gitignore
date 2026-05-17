@@ -23,6 +23,8 @@ models/
 **/models/
 !backend/app/models/
 !backend/app/models/**
+backend/app/models/__pycache__/
+backend/app/models/**/*.py[cod]
 hf/
 hub/
 xet/
