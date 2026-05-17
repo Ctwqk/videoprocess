@@ -84,6 +84,48 @@ def test_ranker_scores_with_explainable_breakdown_and_visual_metadata():
     assert ranked[0].score_breakdown["visual_motion_score"] == 0.92
 
 
+def test_ranker_historical_performance_fit_boosts_matching_template():
+    ranker = ClipRanker(
+        historical_performance={
+            "templates": {
+                "animal_compilation_short": {"score": 0.95},
+                "generic_short": {"score": 0.1},
+            },
+            "intent_types": {"animal_compilation": {"score": 0.8}},
+        }
+    )
+
+    shared_metadata = {
+        "duration": 5,
+        "aspect_ratio": "9:16",
+        "visual": {"motion_score": 0.75, "watermark_score": 0.0},
+        "quality_score": 0.8,
+        "first_seconds_hook_score": 0.7,
+    }
+    ranked = ranker.rank(
+        intent(),
+        [
+            candidate(
+                "generic",
+                title="小猫 balanced edit b",
+                asset_id="asset-generic",
+                metadata={**shared_metadata, "template_id": "generic_short"},
+            ),
+            candidate(
+                "proven",
+                title="小猫 balanced edit a",
+                asset_id="asset-proven",
+                metadata={**shared_metadata, "template_id": "animal_compilation_short"},
+            ),
+        ],
+    )
+
+    assert [item.id for item in ranked] == ["proven", "generic"]
+    assert ranked[0].score_breakdown["historical_performance_fit"] == 0.95
+    assert ranked[1].score_breakdown["historical_performance_fit"] == 0.1
+    assert ranked[0].score > ranked[1].score
+
+
 def test_ranker_dedupes_urls_assets_titles_and_overlapping_source_windows():
     same_url = "https://example.test/cat-clip.mp4"
     ranked = ClipRanker().rank(

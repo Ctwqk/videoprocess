@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from typing import Any
 
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent
 
 
 class ClipRanker:
+    def __init__(self, historical_performance: dict[str, Any] | None = None) -> None:
+        self.historical_performance = historical_performance or {}
+
     def rank(
         self,
         intent: AutoFlowIntent,
         candidates: Iterable[AutoFlowClipCandidate],
+        historical_performance: dict[str, Any] | None = None,
     ) -> list[AutoFlowClipCandidate]:
         deduped = self._dedupe(list(candidates))
-        ranked = [self._score_candidate(intent, candidate) for candidate in deduped]
+        performance = historical_performance if historical_performance is not None else self.historical_performance
+        ranked = [self._score_candidate(intent, candidate, performance) for candidate in deduped]
         return sorted(ranked, key=lambda candidate: candidate.score, reverse=True)
 
     def _dedupe(self, candidates: list[AutoFlowClipCandidate]) -> list[AutoFlowClipCandidate]:
@@ -57,6 +63,7 @@ class ClipRanker:
         self,
         intent: AutoFlowIntent,
         candidate: AutoFlowClipCandidate,
+        historical_performance: dict[str, Any],
     ) -> AutoFlowClipCandidate:
         visual = candidate.metadata.get("visual") if isinstance(candidate.metadata.get("visual"), dict) else {}
         topic_relevance = _topic_relevance(intent, candidate)
@@ -70,6 +77,7 @@ class ClipRanker:
         copyright_risk = _copyright_risk(candidate)
         duplicate_penalty = _clamp_float(candidate.metadata.get("duplicate_penalty", 0.0))
         watermark_penalty = _clamp_float(visual.get("watermark_score", candidate.metadata.get("watermark_score", 0.0)))
+        historical_performance_fit = _historical_performance_fit(intent, candidate, historical_performance)
 
         breakdown = {
             "topic_relevance": topic_relevance,
@@ -83,6 +91,7 @@ class ClipRanker:
             "copyright_risk": copyright_risk,
             "duplicate_penalty": duplicate_penalty,
             "watermark_penalty": watermark_penalty,
+            "historical_performance_fit": historical_performance_fit,
         }
         score = (
             0.25 * topic_relevance
@@ -93,6 +102,7 @@ class ClipRanker:
             + 0.10 * quality_score
             + 0.05 * source_reputation
             + 0.05 * novelty_score
+            + 0.05 * historical_performance_fit
             - 0.20 * copyright_risk
             - 0.10 * duplicate_penalty
             - 0.10 * watermark_penalty
@@ -147,6 +157,51 @@ def _copyright_risk(candidate: AutoFlowClipCandidate) -> float:
     if candidate.url:
         return 0.55
     return 0.35
+
+
+def _historical_performance_fit(
+    intent: AutoFlowIntent,
+    candidate: AutoFlowClipCandidate,
+    historical_performance: dict[str, Any] | None,
+) -> float:
+    if not historical_performance:
+        return 0.0
+
+    template_id = str(candidate.metadata.get("template_id") or candidate.metadata.get("workflow_template_id") or "")
+    intent_type = str(candidate.metadata.get("intent_type") or intent.intent_type or "")
+
+    templates = (
+        historical_performance.get("templates")
+        if isinstance(historical_performance.get("templates"), dict)
+        else {}
+    )
+    intent_types = (
+        historical_performance.get("intent_types") if isinstance(historical_performance.get("intent_types"), dict) else {}
+    )
+
+    for key, source in (
+        (template_id, templates),
+        (template_id, historical_performance),
+        (intent_type, intent_types),
+        (intent_type, historical_performance),
+    ):
+        if not key or not isinstance(source, dict) or key not in source:
+            continue
+        score = _performance_value(source[key])
+        if score is not None:
+            return score
+    return 0.0
+
+
+def _performance_value(value: Any) -> float | None:
+    if isinstance(value, dict):
+        for key in ("score", "performance_score", "historical_performance_fit", "success_rate"):
+            if key in value:
+                return _clamp_float(value[key])
+        return None
+    if isinstance(value, (int, float, str)):
+        return _clamp_float(value)
+    return None
 
 
 def _normalize_title(value: str) -> str:

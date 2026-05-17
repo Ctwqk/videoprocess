@@ -32,6 +32,10 @@ the assigned branch and files, especially when multiple workers are active.
 - Keep default safety settings conservative:
   `source_policy=owned_only`, `publish_mode=preview_only`.
 - Do not remove existing APIs unless explicitly requested.
+- If a task touches plan patch behavior, keep patches deterministic, schema
+  compatible, and revalidated with `validate_pipeline()`.
+- Treat DB-backed metrics and trend APIs as optional ranking/strategy context;
+  they must not bypass templates, rights checks, or human public approval.
 
 ## Test Pattern
 
@@ -72,6 +76,10 @@ python3 scripts/autoflow_demo_material_remix.py --base-url http://127.0.0.1:8000
 Each script exits non-zero if the API returns an invalid plan, the selected
 intent/template does not match the scenario, or the expected safety state is
 missing.
+
+Demo summaries should keep the review gate visible: public approval is required
+before public upload, plan patch flows must revalidate patched plans, and
+DB-backed metrics are production context rather than demo-script inputs.
 
 ## Review Checklist
 
