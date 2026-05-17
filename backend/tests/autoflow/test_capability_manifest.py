@@ -31,3 +31,16 @@ def test_manifest_preserves_registry_ports_params_and_worker_type():
     assert trim.outputs[0].name == "output"
     assert {param.name for param in trim.params} >= {"start_time", "duration"}
     assert trim.worker_type == "ffmpeg"
+
+
+def test_manifest_exposes_supported_source_platforms():
+    manifest = get_capability_manifest()
+
+    assert manifest.source_platforms == ["youtube", "bilibili", "x", "xiaohongshu"]
+
+
+def test_manifest_exposes_supported_target_platforms_without_bilibili():
+    manifest = get_capability_manifest()
+
+    assert manifest.target_platforms == ["youtube", "youtube_shorts", "x", "xiaohongshu"]
+    assert "bilibili" not in manifest.target_platforms

@@ -17,6 +17,7 @@ def test_autoflow_request_defaults_are_conservative():
     assert request.publish_mode == "preview_only"
     assert request.aspect_ratio == "auto"
     assert request.material_library_ids == []
+    assert request.source_platforms == ["youtube", "bilibili", "x", "xiaohongshu"]
     assert request.user_constraints == {}
 
 
@@ -87,3 +88,12 @@ def test_autoflow_migration_declares_required_tables():
         "trend_signals",
     ):
         assert f'"{table_name}"' in text
+
+
+def test_deployed_revision_005_is_present_as_compatibility_migration():
+    migration = Path("alembic/versions/005_deployed_schema_compatibility.py")
+
+    assert migration.exists()
+    text = migration.read_text()
+    assert 'revision: str = "005"' in text
+    assert 'down_revision: Union[str, None] = "004"' in text

@@ -112,8 +112,6 @@ def _target_platforms_from_prompt(prompt: str) -> list[str]:
         platforms.append("x")
     if "小红书" in prompt:
         platforms.append("xiaohongshu")
-    if "b站" in prompt or "bilibili" in lowered:
-        platforms.append("bilibili")
     return platforms
 
 

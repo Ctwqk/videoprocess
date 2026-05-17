@@ -16,6 +16,7 @@ export type AutoFlowPublishMode =
 export interface AutoFlowRequest {
   prompt: string;
   target_platforms: string[];
+  source_platforms: string[];
   duration_sec: number | null;
   aspect_ratio: AutoFlowAspectRatio;
   source_policy: AutoFlowSourcePolicy;
@@ -177,6 +178,7 @@ export interface CapabilityManifest {
   templates?: WorkflowTemplate[];
   platforms?: string[];
   target_platforms?: string[];
+  source_platforms?: string[];
   source_policies?: AutoFlowSourcePolicy[];
   publish_modes?: AutoFlowPublishMode[];
   aspect_ratios?: AutoFlowAspectRatio[];

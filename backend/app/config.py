@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     api_port: int = 8080
     cors_origins: list[str] = ["*"]
     exo_watchdog_url: str = "http://localhost:8000"
+    youtube_manager_url: str = "http://localhost:8899"
     platform_browser_manager_url: str = "http://localhost:8898"
     x_platform_browser_manager_url: str = ""
     bilibili_platform_browser_manager_url: str = ""

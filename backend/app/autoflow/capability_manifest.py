@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from app.autoflow.platform_media_client import SUPPORTED_SOURCE_PLATFORMS
 from app.node_registry.registry import NodeTypeRegistry
+
+SUPPORTED_TARGET_PLATFORMS = ("youtube", "youtube_shorts", "x", "xiaohongshu")
 
 
 class CapabilityPort(BaseModel):
@@ -39,6 +42,8 @@ class CapabilityNode(BaseModel):
 
 class CapabilityManifest(BaseModel):
     nodes: list[CapabilityNode]
+    target_platforms: list[str] = Field(default_factory=list)
+    source_platforms: list[str] = Field(default_factory=list)
 
 
 TAG_OVERRIDES = {
@@ -130,4 +135,8 @@ def get_capability_manifest() -> CapabilityManifest:
                 suitable_for=list(suitable_for),
             )
         )
-    return CapabilityManifest(nodes=nodes)
+    return CapabilityManifest(
+        nodes=nodes,
+        target_platforms=list(SUPPORTED_TARGET_PLATFORMS),
+        source_platforms=list(SUPPORTED_SOURCE_PLATFORMS),
+    )
