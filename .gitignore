@@ -21,6 +21,8 @@ build/
 target/
 models/
 **/models/
+!backend/app/models/
+!backend/app/models/**
 hf/
 hub/
 xet/
