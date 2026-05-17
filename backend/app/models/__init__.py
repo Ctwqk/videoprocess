@@ -11,6 +11,7 @@ from app.models.material import (
     MaterialQueryResult,
 )
 from app.models.schedule import RuntimeSchedule
+from app.models.autoflow import AutoFlowPlan, AutoFlowRun, ContentMetric, TrendSignal
 
 __all__ = [
     "Base",
@@ -28,4 +29,8 @@ __all__ = [
     "MaterialQuery",
     "MaterialQueryResult",
     "RuntimeSchedule",
+    "AutoFlowPlan",
+    "AutoFlowRun",
+    "ContentMetric",
+    "TrendSignal",
 ]
