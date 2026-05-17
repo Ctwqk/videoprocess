@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import uuid
+from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.autoflow.clip_ranker import ClipRanker
 from app.autoflow.intent_parser import RuleBasedIntentParser
+from app.autoflow.material_selector import MaterialSelector
 from app.autoflow.metadata_generator import MetadataGenerator
 from app.autoflow.pipeline_builder import PipelineBuilder
 from app.autoflow.rights_policy import RightsPolicy
@@ -24,38 +27,61 @@ from app.services.job_service import create_job
 from app.services.pipeline_service import create_pipeline
 
 
+class CandidateSelector(Protocol):
+    async def find_candidates(
+        self,
+        intent,
+        request: AutoFlowRequest,
+        db: AsyncSession | None = None,
+    ) -> list[AutoFlowClipCandidate]:
+        ...
+
+
 class AutoFlowService:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        material_selector: CandidateSelector | None = None,
+        clip_ranker: ClipRanker | None = None,
+    ) -> None:
         self.intent_parser = RuleBasedIntentParser()
         self.template_library = TemplateLibrary()
         self.metadata_generator = MetadataGenerator()
         self.pipeline_builder = PipelineBuilder()
         self.validation_repair = AutoFlowRepairService()
         self.rights_policy = RightsPolicy()
+        self.material_selector = material_selector or MaterialSelector()
+        self.clip_ranker = clip_ranker or ClipRanker()
         self._plans: dict[str, AutoFlowPlan] = {}
         self._runs: dict[str, AutoFlowRun] = {}
 
     async def plan(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
         intent = self.intent_parser.parse(request)
         template = self.template_library.select_template(intent)
-        candidates = self._fixture_candidates(intent, request)
-        metadata = self.metadata_generator.generate(intent, candidates)
-        definition = self.pipeline_builder.build(template, intent, candidates, metadata)
+        warnings: list[str] = []
+        candidates = await self.material_selector.find_candidates(intent, request, db=db)
+        if not candidates:
+            candidates = self._fixture_candidates(intent, request)
+            warnings.append("Material selector returned no candidates; using AutoFlow fixture candidates.")
+        ranked_candidates = self.clip_ranker.rank(intent, candidates)
+        if len(ranked_candidates) < 5:
+            warnings.append("AutoFlow found fewer than 5 candidate clips; review material coverage before publishing.")
+        metadata = self.metadata_generator.generate(intent, ranked_candidates)
+        definition = self.pipeline_builder.build(template, intent, ranked_candidates, metadata)
         validation = validate_pipeline(definition)
         repair_result = None
         if not validation.valid:
-            repair_result = self.validation_repair.repair(definition, validation.errors, candidates)
+            repair_result = self.validation_repair.repair(definition, validation.errors, ranked_candidates)
             definition = repair_result.definition
             validation = validate_pipeline(definition)
 
-        rights = self.rights_policy.evaluate(request, candidates)
+        rights = self.rights_policy.evaluate(request, ranked_candidates)
         plan = AutoFlowPlan(
             plan_id=str(uuid.uuid4()),
             request=request,
             intent=intent,
             template_id=template.id,
             pipeline_definition=definition,
-            candidates=candidates,
+            candidates=ranked_candidates,
             metadata=metadata,
             validation={
                 "valid": validation.valid,
@@ -64,7 +90,7 @@ class AutoFlowService:
                 "repairs": repair_result.applied_repairs if repair_result else [],
             },
             rights=rights.model_dump(),
-            warnings=[] if validation.valid else ["Generated workflow still needs manual repair."],
+            warnings=warnings if validation.valid else [*warnings, "Generated workflow still needs manual repair."],
             needs_review=rights.status != "allowed",
         )
         self._plans[plan.plan_id] = plan
