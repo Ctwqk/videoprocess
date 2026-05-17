@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,7 +25,18 @@ class SearchService:
         if db is None or not request.material_library_ids:
             return []
 
-        payload = _material_search_request(intent, request, max_results)
+        source_library_ids = _valid_uuid_strings(request.material_library_ids)
+        if not source_library_ids:
+            logger.warning("AutoFlow material search skipped because material_library_ids are not UUIDs")
+            return []
+
+        result_library_ids = _valid_uuid_strings(
+            list(request.user_constraints.get("result_material_library_ids") or request.material_library_ids)
+        )
+        if not result_library_ids:
+            result_library_ids = source_library_ids
+
+        payload = _material_search_request(intent, request, max_results, source_library_ids, result_library_ids)
         try:
             _query, results = await _materialize_material_search(db, payload)
         except Exception as exc:
@@ -85,14 +97,16 @@ def _material_search_request(
     intent: AutoFlowIntent,
     request: AutoFlowRequest,
     max_results: int,
+    source_library_ids: list[str],
+    result_library_ids: list[str],
 ) -> MaterialSearchRequest:
     top_k = max(1, int(max_results))
     max_duration = float(request.user_constraints.get("max_clip_duration") or 20.0)
     min_duration = float(request.user_constraints.get("min_clip_duration") or 1.5)
     return MaterialSearchRequest(
         query=_material_query(intent, request),
-        source_library_ids=list(request.material_library_ids),
-        result_library_ids=list(request.user_constraints.get("result_material_library_ids") or request.material_library_ids),
+        source_library_ids=source_library_ids,
+        result_library_ids=result_library_ids,
         top_k=top_k,
         rerank_top_m=min(top_k, 8),
         min_duration=min_duration,
@@ -109,6 +123,16 @@ def _material_query(intent: AutoFlowIntent, request: AutoFlowRequest) -> str:
     if not terms:
         terms.append(request.prompt)
     return " ".join(terms)
+
+
+def _valid_uuid_strings(values: list[str]) -> list[str]:
+    valid: list[str] = []
+    for value in values:
+        try:
+            valid.append(str(uuid.UUID(str(value))))
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return valid
 
 
 def _candidate_from_material_result(

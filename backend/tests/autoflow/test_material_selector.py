@@ -9,6 +9,9 @@ from app.autoflow.service import AutoFlowService
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent, AutoFlowRequest
 
 
+VALID_LIBRARY_ID = "00000000-0000-0000-0000-000000000101"
+
+
 def intent(policy: str = "owned_only") -> AutoFlowIntent:
     return AutoFlowIntent(
         intent_type="animal_compilation",
@@ -134,6 +137,28 @@ async def test_search_service_returns_empty_without_db_or_material_libraries():
 
 
 @pytest.mark.asyncio
+async def test_search_material_ignores_non_uuid_library_ids(monkeypatch):
+    async def fail_materialize(db, payload):
+        pytest.fail("invalid material library ids should not reach material search")
+
+    async def fail_preview(db, payload):
+        pytest.fail("invalid material library ids should not reach preview search")
+
+    monkeypatch.setattr("app.autoflow.search_service.materialize_material_search", fail_materialize, raising=False)
+    monkeypatch.setattr("app.autoflow.search_service.preview_material_search", fail_preview, raising=False)
+
+    request = AutoFlowRequest(
+        prompt="用素材库里的旅行素材做一个 20 秒混剪",
+        source_policy="owned_only",
+        material_library_ids=["travel-library"],
+    )
+
+    candidates = await SearchService().search_material(intent("owned_only"), request, db=object())
+
+    assert candidates == []
+
+
+@pytest.mark.asyncio
 async def test_search_material_uses_material_service_materialized_results(monkeypatch):
     calls = {}
 
@@ -167,12 +192,12 @@ async def test_search_material_uses_material_service_materialized_results(monkey
     request = AutoFlowRequest(
         prompt="我要小猫素材",
         source_policy="owned_only",
-        material_library_ids=["library-1"],
+        material_library_ids=[VALID_LIBRARY_ID],
     )
 
     candidates = await SearchService().search_material(intent("owned_only"), request, db=object(), max_results=3)
 
-    assert calls["materialize"].source_library_ids == ["library-1"]
+    assert calls["materialize"].source_library_ids == [VALID_LIBRARY_ID]
     assert calls["materialize"].top_k == 3
     assert candidates == [
         AutoFlowClipCandidate(
@@ -226,7 +251,7 @@ async def test_search_material_falls_back_to_preview_asset_when_materialization_
     request = AutoFlowRequest(
         prompt="我要小猫素材",
         source_policy="owned_only",
-        material_library_ids=["library-1"],
+        material_library_ids=[VALID_LIBRARY_ID],
     )
 
     candidates = await SearchService().search_material(intent("owned_only"), request, db=object(), max_results=2)
