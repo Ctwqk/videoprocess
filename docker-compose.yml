@@ -111,7 +111,7 @@ services:
       VIDEO_TTS_BASE_URL: ${VP_XTTS_BASE_URL:-http://host.docker.internal:8010}
     volumes:
       - ${VP_STORAGE_ROOT:-./k8s-data/storage}:/data/storage
-      - ../../platform-upload/YouTubeManager/credentials:/app/youtube_credentials
+      - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/YouTubeManager/credentials:/app/youtube_credentials
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -119,7 +119,7 @@ services:
 
   youtube-manager:
     build:
-      context: ../../platform-upload/YouTubeManager
+      context: ${PLATFORM_UPLOAD_ROOT:-../constructure-platform-upload}/YouTubeManager
       dockerfile: Dockerfile
     container_name: vp_youtube_manager
     restart: unless-stopped
@@ -128,14 +128,16 @@ services:
       DOWNLOAD_DIR: /app/downloads
       OAUTH_REDIRECT_URI: http://localhost:3001/youtube/api/auth/callback
     volumes:
-      - ../../platform-upload/YouTubeManager/downloads:/app/downloads
-      - ../../platform-upload/YouTubeManager/credentials:/app/credentials
+      - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/YouTubeManager/downloads:/app/downloads
+      - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/YouTubeManager/credentials:/app/credentials
+    ports:
+      - "${YOUTUBE_MANAGER_PORT:-18999}:8899"
     networks:
       - vp_internal
 
   platform-browser-manager:
     build:
-      context: ../../platform-upload/PlatformBrowserManager
+      context: ${PLATFORM_UPLOAD_ROOT:-../constructure-platform-upload}/PlatformBrowserManager
       dockerfile: Dockerfile
     container_name: vp_platform_browser_manager
     restart: unless-stopped
@@ -148,13 +150,13 @@ services:
       X_CDP_URL: ${X_CDP_URL:-http://127.0.0.1:18810}
       X_CDP_TARGET: ${X_CDP_TARGET:-x.com}
     volumes:
-      - ../../platform-upload/PlatformBrowserManager/downloads:/app/downloads
-      - ../../platform-upload/PlatformBrowserManager/browser-profiles:/app/browser-profiles
+      - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/PlatformBrowserManager/downloads:/app/downloads
+      - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/PlatformBrowserManager/browser-profiles:/app/browser-profiles
     network_mode: host
 
   xiaohongshu-browser-manager:
     build:
-      context: ../../platform-upload/PlatformBrowserManager
+      context: ${PLATFORM_UPLOAD_ROOT:-../constructure-platform-upload}/PlatformBrowserManager
       dockerfile: Dockerfile
     container_name: vp_xiaohongshu_browser_manager
     restart: unless-stopped
@@ -169,8 +171,8 @@ services:
     ports:
       - "8897:8898"
     volumes:
-      - ../../platform-upload/PlatformBrowserManager/downloads:/app/downloads
-      - ../../platform-upload/PlatformBrowserManager/browser-profiles:/app/browser-profiles
+      - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/PlatformBrowserManager/downloads:/app/downloads
+      - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/PlatformBrowserManager/browser-profiles:/app/browser-profiles
     networks:
       - vp_internal
 

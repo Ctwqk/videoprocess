@@ -258,12 +258,12 @@ Cluster-level deploy ownership:
 
 Repo-local implementation details:
 
-- [README.md](/home/taiwei/Constructure/apps/VideoProcess/deploy/macos/README.md)
-- [common.sh](/home/taiwei/Constructure/apps/VideoProcess/deploy/macos/common.sh)
-- [deploy_videoprocess_workers.sh](/home/taiwei/Constructure/apps/VideoProcess/deploy/macos/deploy_videoprocess_workers.sh)
-- [deploy_videoprocess_everywhere.sh](/home/taiwei/Constructure/apps/VideoProcess/deploy/macos/deploy_videoprocess_everywhere.sh)
-- [deploy_news_stack.sh](/home/taiwei/Constructure/apps/VideoProcess/deploy/macos/deploy_news_stack.sh)
-- [offload_to_macs.sh](/home/taiwei/Constructure/apps/VideoProcess/deploy/macos/offload_to_macs.sh)
+- [README.md](/home/taiwei/Constructure-repos/videoprocess/deploy/macos/README.md)
+- [common.sh](/home/taiwei/Constructure-repos/videoprocess/deploy/macos/common.sh)
+- [deploy_videoprocess_workers.sh](/home/taiwei/Constructure-repos/videoprocess/deploy/macos/deploy_videoprocess_workers.sh)
+- [deploy_videoprocess_everywhere.sh](/home/taiwei/Constructure-repos/videoprocess/deploy/macos/deploy_videoprocess_everywhere.sh)
+- [deploy_news_stack.sh](/home/taiwei/Constructure-repos/videoprocess/deploy/macos/deploy_news_stack.sh)
+- [offload_to_macs.sh](/home/taiwei/Constructure-repos/videoprocess/deploy/macos/offload_to_macs.sh)
 
 `offload_to_macs.sh` is now only a compatibility wrapper. Normal deploys should start from `~/k8s-Constructure/k8s-constructure`.
 
@@ -309,7 +309,7 @@ ssh magi1 '~/Constructure/services/embedding-gateway/status.sh'
 
 ## Handoff Notes For Agents
 
-- If the task is about queueing, node lifecycle, worker handlers, or ffmpeg behavior, start in `VideoProcess/backend`.
+- If the task is about queueing, node lifecycle, worker handlers, or ffmpeg behavior, start in `Constructure-repos/videoprocess/backend`.
 - If the task is about where a service runs, how cross-machine traffic is routed, or which deploy command is authoritative, read `cluster-runtime-map.md`.
 - If the task is about why a code change is not visible on Mac workers, assume redeploy is missing before assuming the code is wrong.
 - If the task is about YouTube login or upload, remember the browser enters through frontend `:3001`, then `/youtube/*` is proxied to the sidecar on the main host.
@@ -319,7 +319,7 @@ ssh magi1 '~/Constructure/services/embedding-gateway/status.sh'
 Run the current repo smoke test from:
 
 ```bash
-cd /home/taiwei/Constructure/apps/VideoProcess
+cd /home/taiwei/Constructure-repos/videoprocess
 make smoke-test
 ```
 

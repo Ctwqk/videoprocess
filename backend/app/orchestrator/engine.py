@@ -335,6 +335,8 @@ class JobEngine:
                     definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
                     ne_by_node_id = {n.node_id: n for n in job.node_executions}
                     input_artifacts = {}
+                    dep_map = job.execution_plan.get("dependencies", {}) if job.execution_plan else {}
+                    deps = dep_map.get(ne.node_id, [])
                     preferred_hosts = self._preferred_hosts_for_node(ne_by_node_id, deps)
                     for edge in definition.edges:
                         if edge.target == ne.node_id:

@@ -33,7 +33,7 @@ infra
 | Runtime Control | `Constructure-repos/constructure-runtime-control/` | always-on privileged control plane | `runtime-control` | Docker socket and host mounts, cron spool, `shared-postgres` databases `arb`, `news`, and `runtime_control`, `arb-redis`, `shared-qdrant`, `exo-watchdog`, `news-server` |
 | IBKR | `Constructure-repos/ibkr/` | always-on broker adapter | `ibkr` | `shared-postgres` database `ibkr`, `arb-redis` for watchlist/alerts, `vnc-manager.service` / IB Gateway |
 | Dashboard | `apps/dashboard/` | always-on UI/BFF | `dashboard` | `runtime-control` API, `ibkr` API |
-| VideoProcess | `apps/VideoProcess/` | always-on UI/API plus scheduled workers | `api`, `frontend`, `ffmpeg-worker`, `xtts-api`; consumes `youtube-manager`, `platform-browser-manager`, `xiaohongshu-browser-manager` | `shared-postgres` database `videoprocess`, `vp-redis`, MinIO, `shared-qdrant`, `exo-watchdog`, Exo model metadata, embedding gateway, VNC/Chrome CDP through platform-upload |
+| VideoProcess | `Constructure-repos/videoprocess/` | always-on UI/API plus scheduled workers | `api`, `frontend`, `ffmpeg-worker`, `xtts-api`; consumes `youtube-manager`, `platform-browser-manager`, `xiaohongshu-browser-manager` | `shared-postgres` database `videoprocess`, `vp-redis`, MinIO, `shared-qdrant`, `exo-watchdog`, Exo model metadata, embedding gateway, VNC/Chrome CDP through platform-upload |
 | Arb | `apps/arb/` | always-on trading services plus scheduled maintenance | `collector`, `strategy`, `executor-kalshi`, `resolver`, `validator`, `arb-executor-polymarket` | `arb-redis`, `shared-postgres` database `arb`, `shared-qdrant`, `exo-watchdog`, Exo model metadata, Polymarket VPN namespace |
 | News | `apps/news/` and Mac3 native service dirs | always-on API plus scheduled collector | `news-server`, `news-collector` | `shared-postgres` database `news`, `shared-qdrant`, `exo-watchdog`, Exo model metadata, embedding gateway |
 | News Publisher | `apps/news-publisher/` | scheduled one-shot job | `news-publisher` | `news-server`, `x-bot` for X posting, optional Upstash cache mirror; indirectly uses VNC/Chrome CDP through platform-upload |
@@ -64,7 +64,7 @@ Detailed service notes live under `docs/services/`:
 | `Constructure-repos/constructure-runtime-control/docker-compose.yml` | `runtime-control` | privileged operations API |
 | `Constructure-repos/ibkr/docker-compose.yml` | `ibkr` | broker adapter and portfolio/order API |
 | `apps/dashboard/docker-compose.yml` | `dashboard` | UI and BFF proxy |
-| `apps/VideoProcess/docker-compose.yml` | `api`, `frontend` | media workflow API and UI |
+| `Constructure-repos/videoprocess/docker-compose.yml` | `api`, `frontend` | media workflow API and UI |
 | `apps/arb/docker-compose.yml` | `collector`, `strategy`, `executor-kalshi` | live market ingestion, arbitrage detection, Kalshi execution |
 
 `ops/compose/apps-status.sh` also reports services that may be schedule-managed:

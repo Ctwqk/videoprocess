@@ -3,7 +3,8 @@ set -euo pipefail
 
 MACOS_DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_PROCESS_ROOT="$(cd "$MACOS_DEPLOY_DIR/../.." && pwd)"
-CONSTRUCTURE_ROOT="$(cd "$VIDEO_PROCESS_ROOT/../.." && pwd)"
+CONSTRUCTURE_REPOS_DIR="${CONSTRUCTURE_REPOS_DIR:-$(cd "$VIDEO_PROCESS_ROOT/.." && pwd)}"
+LEGACY_CONSTRUCTURE_ROOT="${LEGACY_CONSTRUCTURE_ROOT:-$HOME/Constructure}"
 
 pick_first_existing_dir() {
   local candidate
@@ -16,10 +17,10 @@ pick_first_existing_dir() {
   printf '%s\n' "${*: -1}"
 }
 
-INFRA_ROOT="${INFRA_ROOT:-$CONSTRUCTURE_ROOT/infra}"
-PLATFORM_UPLOAD_ROOT="${PLATFORM_UPLOAD_ROOT:-$CONSTRUCTURE_ROOT/platform-upload}"
-K8S_HOME_ROOT="${K8S_HOME_ROOT:-$(pick_first_existing_dir "$HOME/k8s-Constructure" "$CONSTRUCTURE_ROOT")}"
-K8S_CONSTRUCTURE_ROOT="${K8S_CONSTRUCTURE_ROOT:-$(pick_first_existing_dir "$K8S_HOME_ROOT/k8s-constructure" "$CONSTRUCTURE_ROOT/k8s-constructure")}"
+INFRA_ROOT="${INFRA_ROOT:-$CONSTRUCTURE_REPOS_DIR/constructure-runtime/infra}"
+PLATFORM_UPLOAD_ROOT="${PLATFORM_UPLOAD_ROOT:-$CONSTRUCTURE_REPOS_DIR/constructure-platform-upload}"
+K8S_HOME_ROOT="${K8S_HOME_ROOT:-$(pick_first_existing_dir "$HOME/k8s-Constructure" "$LEGACY_CONSTRUCTURE_ROOT")}"
+K8S_CONSTRUCTURE_ROOT="${K8S_CONSTRUCTURE_ROOT:-$(pick_first_existing_dir "$K8S_HOME_ROOT/k8s-constructure" "$LEGACY_CONSTRUCTURE_ROOT/k8s-constructure")}"
 
 SSH_KEY="${SSH_KEY:-/home/taiwei/.ssh/id_mini_wenjie}"
 KNOWN_HOSTS="${KNOWN_HOSTS:-/tmp/vp_mac_known_hosts}"
