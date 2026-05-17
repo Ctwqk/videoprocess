@@ -65,7 +65,14 @@ class AutoFlowService:
         intent = self.intent_parser.parse(request)
         template = self.template_library.select_template(intent)
         warnings: list[str] = []
-        candidates = await self.material_selector.find_candidates(intent, request, db=db)
+        select_with_warnings = getattr(self.material_selector, "find_candidates_with_warnings", None)
+        if callable(select_with_warnings):
+            selection = await select_with_warnings(intent, request, db=db)
+            candidates = selection.candidates
+            warnings.extend(selection.warnings)
+        else:
+            candidates = await self.material_selector.find_candidates(intent, request, db=db)
+            warnings.extend(getattr(self.material_selector, "last_warnings", []))
         if not candidates:
             candidates = self._fixture_candidates(intent, request)
             warnings.append("Material selector returned no candidates; using AutoFlow fixture candidates.")

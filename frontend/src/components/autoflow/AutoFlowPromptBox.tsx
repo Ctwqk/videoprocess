@@ -7,7 +7,8 @@ import type {
   WorkflowTemplate,
 } from '../../types/autoflow';
 
-const DEFAULT_PLATFORMS = ['youtube', 'x', 'xiaohongshu', 'bilibili'];
+const DEFAULT_PLATFORMS = ['youtube', 'youtube_shorts', 'x', 'xiaohongshu'];
+const DEFAULT_SOURCE_PLATFORMS = ['youtube', 'bilibili', 'x', 'xiaohongshu'];
 const DEFAULT_ASPECT_RATIOS: AutoFlowAspectRatio[] = ['auto', '9:16', '16:9', '1:1'];
 const DEFAULT_SOURCE_POLICIES: AutoFlowSourcePolicy[] = [
   'owned_only',
@@ -68,6 +69,7 @@ export default function AutoFlowPromptBox({
   onSubmit: () => void;
 }) {
   const platformOptions = capabilities?.target_platforms ?? capabilities?.platforms ?? DEFAULT_PLATFORMS;
+  const sourcePlatformOptions = capabilities?.source_platforms ?? DEFAULT_SOURCE_PLATFORMS;
   const aspectRatios = capabilities?.aspect_ratios ?? DEFAULT_ASPECT_RATIOS;
   const sourcePolicies = capabilities?.source_policies ?? DEFAULT_SOURCE_POLICIES;
   const publishModes = capabilities?.publish_modes ?? DEFAULT_PUBLISH_MODES;
@@ -84,6 +86,16 @@ export default function AutoFlowPromptBox({
       enabled
         ? value.target_platforms.filter(item => item !== platform)
         : [...value.target_platforms, platform],
+    );
+  };
+
+  const toggleSourcePlatform = (platform: string) => {
+    const enabled = value.source_platforms.includes(platform);
+    update(
+      'source_platforms',
+      enabled
+        ? value.source_platforms.filter(item => item !== platform)
+        : [...value.source_platforms, platform],
     );
   };
 
@@ -255,6 +267,34 @@ export default function AutoFlowPromptBox({
                   padding: '7px 10px',
                   backgroundColor: selected ? '#172554' : '#020617',
                   color: selected ? '#bfdbfe' : '#94a3b8',
+                  cursor: 'pointer',
+                  fontSize: 12,
+                  fontWeight: 600,
+                }}
+              >
+                {titleCase(platform)}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div style={{ display: 'grid', gap: 8 }}>
+        <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>Source platforms</div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {sourcePlatformOptions.map(platform => {
+            const selected = value.source_platforms.includes(platform);
+            return (
+              <button
+                key={platform}
+                type="button"
+                onClick={() => toggleSourcePlatform(platform)}
+                style={{
+                  border: `1px solid ${selected ? '#0f766e' : '#334155'}`,
+                  borderRadius: 6,
+                  padding: '7px 10px',
+                  backgroundColor: selected ? '#134e4a' : '#020617',
+                  color: selected ? '#ccfbf1' : '#94a3b8',
                   cursor: 'pointer',
                   fontSize: 12,
                   fontWeight: 600,

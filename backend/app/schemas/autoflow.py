@@ -31,6 +31,7 @@ AutoFlowPlanStatus = Literal[
 class AutoFlowRequest(BaseModel):
     prompt: str
     target_platforms: list[str] = Field(default_factory=list)
+    source_platforms: list[str] = Field(default_factory=lambda: ["youtube", "bilibili", "x", "xiaohongshu"])
     duration_sec: int | None = None
     aspect_ratio: AspectRatio = "auto"
     source_policy: SourcePolicy = "owned_only"

@@ -67,3 +67,9 @@ def test_fallback_generic_intent_has_confirmation_question():
     assert intent.intent_type == "generic_video"
     assert intent.subject == "视频"
     assert intent.user_confirmation_questions
+
+
+def test_bilibili_prompt_does_not_infer_unsupported_publish_target():
+    intent = parse("从 b站找小猫素材，做一个 30 秒预览。")
+
+    assert "bilibili" not in intent.target_platforms

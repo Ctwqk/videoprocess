@@ -36,6 +36,7 @@ import type {
 const defaultRequest: AutoFlowRequest = {
   prompt: '我要一个 30 秒小猫视频集锦，竖屏，可爱快节奏，先导出预览，不要公开发布。',
   target_platforms: ['youtube_shorts'],
+  source_platforms: ['youtube', 'bilibili', 'x', 'xiaohongshu'],
   duration_sec: 30,
   aspect_ratio: '9:16',
   source_policy: 'owned_only',

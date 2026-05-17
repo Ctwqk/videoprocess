@@ -4,13 +4,31 @@ from pathlib import Path
 
 import pytest
 
+from app.autoflow.material_selector import MaterialSelector
+from app.autoflow.search_service import SearchService
 from app.autoflow.service import AutoFlowService
 from app.orchestrator.dag import validate_pipeline
-from app.schemas.autoflow import AutoFlowRequest
+from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowRequest
 from app.services.material_service import _candidate_window_from_cluster, _material_result_metadata
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+class FakePlatformClient:
+    async def search(self, platform: str, query: str, max_results: int = 8):
+        return [
+            AutoFlowClipCandidate(
+                id=f"{platform}-{index}",
+                title=f"{query} {platform} reference {index}",
+                source_type=platform,
+                url=f"https://media.invalid/{platform}/{index}.mp4",
+                start_sec=0,
+                end_sec=5,
+                rights_status="review_required",
+            )
+            for index in range(1, min(max_results, 4) + 1)
+        ]
 
 
 def _assert_valid_plan(plan, *, intent_type: str, template_id: str) -> None:
@@ -54,7 +72,7 @@ async def test_cat_compilation_generates_valid_private_preview_plan():
 
 @pytest.mark.asyncio
 async def test_hot_topic_explainer_keeps_external_research_in_review_preview():
-    service = AutoFlowService()
+    service = AutoFlowService(material_selector=MaterialSelector(SearchService(platform_client=FakePlatformClient())))
 
     plan = await service.plan(
         AutoFlowRequest(
@@ -63,6 +81,7 @@ async def test_hot_topic_explainer_keeps_external_research_in_review_preview():
             source_policy="research_only",
             publish_mode="preview_only",
             target_platforms=["youtube_shorts"],
+            source_platforms=["youtube"],
         )
     )
 
@@ -73,12 +92,12 @@ async def test_hot_topic_explainer_keeps_external_research_in_review_preview():
     assert plan.rights["status"] == "review_required"
     assert plan.needs_review is True
     assert any("external" in reason.lower() for reason in plan.rights["reasons"])
-    external_candidates = [candidate for candidate in plan.candidates if candidate.source_type == "external_url"]
+    external_candidates = [candidate for candidate in plan.candidates if candidate.source_type == "youtube"]
     assert external_candidates
-    assert all(candidate.url is None for candidate in external_candidates)
+    assert all(candidate.url for candidate in external_candidates)
     assert all("example.test" not in str(candidate.model_dump()) for candidate in plan.candidates)
     assert all(candidate.rights_status == "review_required" for candidate in external_candidates)
-    assert "source" in _node_types(plan)
+    assert "url_download" in _node_types(plan)
     assert "youtube_upload" not in _node_types(plan)
 
 

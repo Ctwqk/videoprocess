@@ -17,6 +17,7 @@ def test_autoflow_request_defaults_are_conservative():
     assert request.publish_mode == "preview_only"
     assert request.aspect_ratio == "auto"
     assert request.material_library_ids == []
+    assert request.source_platforms == ["youtube", "bilibili", "x", "xiaohongshu"]
     assert request.user_constraints == {}
 
 

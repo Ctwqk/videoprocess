@@ -78,6 +78,7 @@ services:
       EMBEDDING_GATEWAY_URL: ${VP_EMBEDDING_GATEWAY_URL:-http://host.docker.internal:8080}
       QDRANT_URL: ${VP_QDRANT_URL:-http://host.docker.internal:6333}
       VIDEO_SCHEDULE_DEFAULT_STATE: ${VIDEO_SCHEDULE_DEFAULT_STATE:-OPEN}
+      YOUTUBE_MANAGER_URL: ${YOUTUBE_MANAGER_URL:-http://youtube-manager:8899}
       PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
       X_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
       XIAOHONGSHU_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8897
@@ -149,6 +150,7 @@ services:
       PLATFORM_ENABLED_PLATFORMS: bilibili,x
       X_CDP_URL: ${X_CDP_URL:-http://127.0.0.1:18810}
       X_CDP_TARGET: ${X_CDP_TARGET:-x.com}
+      X_BEARER_TOKEN: ${X_BEARER_TOKEN:-}
     volumes:
       - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/PlatformBrowserManager/downloads:/app/downloads
       - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/PlatformBrowserManager/browser-profiles:/app/browser-profiles
