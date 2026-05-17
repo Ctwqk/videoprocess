@@ -171,6 +171,8 @@ class AutoFlowService:
         approvals_reset = _patch_resets_approval(patch)
         review_approved_at = None if approvals_reset else plan.review_approved_at
         public_approved_at = None if approvals_reset else plan.public_approved_at
+        if approvals_reset:
+            rights_payload = _rights_without_approval_state(rights_payload, request.publish_mode)
         updated = plan.model_copy(
             update={
                 "request": request,
@@ -340,8 +342,8 @@ class AutoFlowService:
             artifacts=artifacts,
             publish={
                 "mode": plan.request.publish_mode,
-                "review_approved": bool(plan.review_approved_at or request.review_approved),
-                "public_approved": bool(plan.public_approved_at or request.public_approved),
+                "review_approved": bool(plan.review_approved_at),
+                "public_approved": bool(plan.public_approved_at),
             },
             error_message=error_message,
         )
@@ -376,7 +378,7 @@ class AutoFlowService:
         if request.plan_id:
             return await self.get_plan(request.plan_id, db)
         if request.plan and db is not None:
-            return await self._save_plan(db, request.plan)
+            raise PermissionError("AutoFlow execute requires plan_id for persisted execution")
         return request.plan
 
     async def _save_plan(self, db: AsyncSession, plan: AutoFlowPlan) -> AutoFlowPlan:
@@ -445,21 +447,23 @@ class AutoFlowService:
             return [
                 AutoFlowClipCandidate(
                     id="external-1",
-                    title=f"{subject} external clip 1",
-                    source_type="youtube",
-                    url="https://example.test/autoflow-clip-1.mp4",
+                    title=f"{subject} review-required placeholder 1",
+                    source_type="external_url",
+                    asset_id="autoflow-review-placeholder-1",
                     start_sec=0,
                     end_sec=5,
                     rights_status="review_required",
+                    metadata={"placeholder": True, "source_policy": request.source_policy},
                 ),
                 AutoFlowClipCandidate(
                     id="external-2",
-                    title=f"{subject} external clip 2",
-                    source_type="youtube",
-                    url="https://example.test/autoflow-clip-2.mp4",
+                    title=f"{subject} review-required placeholder 2",
+                    source_type="external_url",
+                    asset_id="autoflow-review-placeholder-2",
                     start_sec=0,
                     end_sec=5,
                     rights_status="review_required",
+                    metadata={"placeholder": True, "source_policy": request.source_policy},
                 ),
             ]
         return [
@@ -564,7 +568,7 @@ def _patched_candidates(
         selected = list(by_id.values())
 
     locked_ids = set(patch.locked_candidate_ids or [])
-    if locked_ids:
+    if patch.locked_candidate_ids is not None:
         selected = [
             candidate.model_copy(update={"metadata": {**candidate.metadata, "locked": candidate.id in locked_ids}})
             for candidate in selected
@@ -584,10 +588,20 @@ def _patch_resets_approval(patch: AutoFlowPlanPatch) -> bool:
             patch.selected_candidate_ids is not None,
             patch.locked_candidate_ids is not None,
             patch.replacement_candidates is not None,
+            patch.metadata is not None,
             patch.publish_mode is not None,
             bool(patch.publish_settings),
         )
     )
+
+
+def _rights_without_approval_state(rights: dict[str, Any], publish_mode: str) -> dict[str, Any]:
+    cleaned = dict(rights)
+    cleaned.pop("review_approved", None)
+    cleaned.pop("public_approved", None)
+    if publish_mode == "public_after_review":
+        cleaned["publish_allowed"] = False
+    return cleaned
 
 
 def _status_for(
@@ -635,11 +649,11 @@ def _assert_execute_allowed(plan: AutoFlowPlan, request: AutoFlowExecuteRequest)
 
     publish_mode = plan.request.publish_mode
     upload_requested = publish_mode in {"private_upload", "unlisted_upload", "public_after_review"}
-    review_approved = bool(plan.review_approved_at or request.review_approved)
+    review_approved = bool(plan.review_approved_at)
     if plan.rights.get("status") == "review_required" and upload_requested and not review_approved:
         raise PermissionError("AutoFlow plan requires review approval before upload execution")
 
-    public_approved = bool(plan.public_approved_at or request.public_approved)
+    public_approved = bool(plan.public_approved_at)
     if publish_mode == "public_after_review" and not public_approved:
         raise PermissionError("AutoFlow plan requires public approval before public execution")
 

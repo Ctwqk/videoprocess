@@ -79,13 +79,6 @@ export interface AutoFlowCandidateEditDraft {
   replacement: string;
 }
 
-export interface AutoFlowCandidateEdit {
-  candidate_id: string;
-  selected?: boolean;
-  locked?: boolean;
-  replacement?: string | null;
-}
-
 export interface AutoFlowMetadataPatch {
   selected_title?: string | null;
   description?: string;
@@ -101,21 +94,27 @@ export interface AutoFlowMetadataEditDraft {
   publish_mode: AutoFlowPublishMode;
 }
 
-export interface AutoFlowPublishPatch {
-  publish_mode?: AutoFlowPublishMode;
-  target_platforms?: string[];
-}
-
 export interface AutoFlowPlanPatch {
-  candidate_edits?: AutoFlowCandidateEdit[];
+  selected_candidate_ids?: string[];
+  locked_candidate_ids?: string[];
+  replacement_candidates?: AutoFlowClipCandidate[];
   metadata?: AutoFlowMetadataPatch;
-  publish?: AutoFlowPublishPatch;
-  review_notes?: string | null;
+  publish_mode?: AutoFlowPublishMode;
+  publish_settings?: Record<string, unknown>;
+  target_platforms?: string[];
+  user_constraints?: Record<string, unknown>;
+  rebuild_definition?: boolean;
+  validate?: boolean;
+  evaluate_rights?: boolean;
 }
 
 export interface AutoFlowPublicApprovalRequest {
   review_notes?: string | null;
   public_approved?: boolean;
+}
+
+export interface AutoFlowApprovalRequest {
+  review_notes?: string | null;
 }
 
 export interface AutoFlowRejectRequest {
@@ -183,8 +182,6 @@ export interface AutoFlowRun {
 export interface ExecuteOptions {
   save_as_template?: boolean;
   execute?: boolean;
-  review_approved?: boolean;
-  public_approved?: boolean;
   plan?: AutoFlowPlan;
 }
 

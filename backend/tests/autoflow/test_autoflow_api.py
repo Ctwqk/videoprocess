@@ -252,6 +252,99 @@ async def test_public_after_review_requires_public_approval_after_ordinary_appro
 
 
 @pytest.mark.asyncio
+async def test_public_after_review_does_not_trust_execute_payload_public_approval(
+    autoflow_db_session, monkeypatch
+):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async def fake_create_pipeline(db, data):
+        pytest.fail("execution should be blocked before pipeline creation")
+
+    monkeypatch.setattr("app.autoflow.service.create_pipeline", fake_create_pipeline)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create a public cat compilation after review.",
+                "target_platforms": ["youtube_shorts"],
+                "publish_mode": "public_after_review",
+            },
+        )
+        assert created.status_code == 200
+        plan = created.json()
+
+        approved = await client.post(f"/api/v1/autoflow/plans/{plan['plan_id']}/approve")
+        assert approved.status_code == 200
+
+        bypass = await client.post(
+            "/api/v1/autoflow/execute",
+            json={"plan_id": plan["plan_id"], "public_approved": True, "review_approved": True},
+        )
+
+    assert bypass.status_code == 400
+    assert "public approval" in bypass.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_external_url_public_after_review_requires_persisted_public_approval(
+    autoflow_db_session, monkeypatch
+):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async def fake_create_pipeline(db, data):
+        pytest.fail("external public execution should be blocked before pipeline creation")
+
+    monkeypatch.setattr("app.autoflow.service.create_pipeline", fake_create_pipeline)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create a public hot-topic explainer from external research.",
+                "source_policy": "research_only",
+                "publish_mode": "public_after_review",
+                "target_platforms": ["youtube_shorts"],
+            },
+        )
+        assert created.status_code == 200
+        plan = created.json()
+        assert plan["rights"]["status"] == "review_required"
+
+        approved = await client.post(f"/api/v1/autoflow/plans/{plan['plan_id']}/approve")
+        assert approved.status_code == 200
+        assert approved.json()["review_approved_at"] is not None
+        assert approved.json()["public_approved_at"] is None
+
+        blocked = await client.post("/api/v1/autoflow/execute", json={"plan_id": plan["plan_id"]})
+
+    assert blocked.status_code == 400
+    assert "public approval" in blocked.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_db_execute_rejects_client_supplied_plan_graph(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/autoflow/plan",
+            json={"prompt": "Create a cat compilation for persisted execution."},
+        )
+        assert created.status_code == 200
+        client_plan = created.json()
+        client_plan["pipeline_definition"] = {"nodes": [], "edges": []}
+
+        response = await client.post("/api/v1/autoflow/execute", json={"plan": client_plan})
+
+    assert response.status_code == 400
+    assert "plan_id" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_patch_plan_replaces_candidates_metadata_rebuilds_and_persists(autoflow_db_session):
     _reset_autoflow_singletons()
     app = _app_with_db(autoflow_db_session)
@@ -315,6 +408,81 @@ async def test_patch_plan_replaces_candidates_metadata_rebuilds_and_persists(aut
         fetched = await client.get(f"/api/v1/autoflow/plans/{plan['plan_id']}")
         assert fetched.status_code == 200
         assert fetched.json()["metadata"]["selected_title"] == "Reviewed replacement edit"
+
+
+@pytest.mark.asyncio
+async def test_metadata_patch_resets_previous_public_approval(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create a public cat compilation with editable metadata.",
+                "target_platforms": ["youtube_shorts"],
+                "publish_mode": "public_after_review",
+            },
+        )
+        assert created.status_code == 200
+        plan = created.json()
+
+        approved = await client.post(f"/api/v1/autoflow/plans/{plan['plan_id']}/approve")
+        assert approved.status_code == 200
+        public_approved = await client.post(f"/api/v1/autoflow/plans/{plan['plan_id']}/approve-public")
+        assert public_approved.status_code == 200
+        assert public_approved.json()["public_approved_at"] is not None
+
+        patched = await client.patch(
+            f"/api/v1/autoflow/plans/{plan['plan_id']}",
+            json={"metadata": {"selected_title": "Changed after approval"}, "evaluate_rights": False},
+        )
+
+    assert patched.status_code == 200
+    payload = patched.json()
+    assert payload["metadata"]["selected_title"] == "Changed after approval"
+    assert payload["review_approved_at"] is None
+    assert payload["public_approved_at"] is None
+    assert payload["rights"].get("review_approved") is not True
+    assert payload["rights"].get("public_approved") is not True
+    assert payload["rights"].get("publish_allowed") is not True
+    assert payload["status"] == "review_required"
+
+
+@pytest.mark.asyncio
+async def test_patch_plan_can_clear_last_candidate_lock(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/autoflow/plan",
+            json={"prompt": "Create a 30 second cat compilation with a lockable candidate."},
+        )
+        assert created.status_code == 200
+        plan = created.json()
+        first_candidate_id = plan["candidates"][0]["id"]
+
+        locked = await client.patch(
+            f"/api/v1/autoflow/plans/{plan['plan_id']}",
+            json={
+                "selected_candidate_ids": [first_candidate_id],
+                "locked_candidate_ids": [first_candidate_id],
+            },
+        )
+        assert locked.status_code == 200
+        assert locked.json()["candidates"][0]["metadata"]["locked"] is True
+
+        unlocked = await client.patch(
+            f"/api/v1/autoflow/plans/{plan['plan_id']}",
+            json={
+                "selected_candidate_ids": [first_candidate_id],
+                "locked_candidate_ids": [],
+            },
+        )
+
+    assert unlocked.status_code == 200
+    assert unlocked.json()["candidates"][0]["metadata"]["locked"] is False
 
 
 @pytest.mark.asyncio

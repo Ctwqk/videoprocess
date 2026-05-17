@@ -19,7 +19,6 @@ import AutoFlowReviewGate from '../components/autoflow/AutoFlowReviewGate';
 import AutoFlowRunStatus from '../components/autoflow/AutoFlowRunStatus';
 import AutoFlowWorkflowPreview from '../components/autoflow/AutoFlowWorkflowPreview';
 import type {
-  AutoFlowCandidateEdit,
   AutoFlowCandidateEditDraft,
   AutoFlowClipCandidate,
   AutoFlowMetadataEditDraft,
@@ -113,29 +112,58 @@ function arraysEqual(first: string[], second: string[]) {
   return first.length === second.length && first.every((value, index) => value === second[index]);
 }
 
+function replacementCandidateFor(
+  candidate: AutoFlowClipCandidate,
+  replacement: string,
+): AutoFlowClipCandidate {
+  const isExternalUrl = /^https?:\/\//i.test(replacement);
+  return {
+    ...candidate,
+    title: `Replacement for ${candidate.title}`,
+    source_type: isExternalUrl ? 'external_url' : 'asset',
+    url: isExternalUrl ? replacement : null,
+    asset_id: isExternalUrl ? null : replacement,
+    rights_status: isExternalUrl ? 'review_required' : 'allowed',
+    metadata: {
+      ...candidate.metadata,
+      replacement,
+      replacement_for: candidate.id,
+    },
+  };
+}
+
 function buildCandidatePatch(
   plan: AutoFlowPlan,
   candidateEdits: Record<string, AutoFlowCandidateEditDraft>,
-): AutoFlowCandidateEdit[] {
-  return plan.candidates.flatMap(candidate => {
+): Pick<AutoFlowPlanPatch, 'selected_candidate_ids' | 'locked_candidate_ids' | 'replacement_candidates'> | null {
+  let hasCandidateChanges = false;
+  const selectedCandidateIds: string[] = [];
+  const lockedCandidateIds: string[] = [];
+  const replacementCandidates: AutoFlowClipCandidate[] = [];
+
+  for (const candidate of plan.candidates) {
     const base = candidateDraftFromCandidate(candidate);
     const edit = candidateEdits[candidate.id] ?? base;
     const replacement = edit.replacement.trim();
-    if (
-      base.selected === edit.selected
-      && base.locked === edit.locked
-      && base.replacement.trim() === replacement
-    ) {
-      return [];
-    }
+    if (edit.selected) selectedCandidateIds.push(candidate.id);
+    if (edit.selected && edit.locked) lockedCandidateIds.push(candidate.id);
+    if (replacement) replacementCandidates.push(replacementCandidateFor(candidate, replacement));
 
-    return [{
-      candidate_id: candidate.id,
-      selected: edit.selected,
-      locked: edit.locked,
-      replacement: replacement || null,
-    }];
-  });
+    if (
+      base.selected !== edit.selected
+      || base.locked !== edit.locked
+      || base.replacement.trim() !== replacement
+    ) {
+      hasCandidateChanges = true;
+    }
+  }
+
+  if (!hasCandidateChanges) return null;
+  return {
+    selected_candidate_ids: selectedCandidateIds,
+    locked_candidate_ids: lockedCandidateIds,
+    ...(replacementCandidates.length > 0 ? { replacement_candidates: replacementCandidates } : {}),
+  };
 }
 
 function buildMetadataPatch(plan: AutoFlowPlan, draft: AutoFlowMetadataEditDraft): AutoFlowMetadataPatch | null {
@@ -161,10 +189,15 @@ function buildPlanPatch(
   const metadataPatch = buildMetadataPatch(plan, metadataDraft);
   const basePublishMode = planPublishMode(plan);
 
-  if (candidatePatch.length > 0) patch.candidate_edits = candidatePatch;
+  if (candidatePatch) Object.assign(patch, candidatePatch);
   if (metadataPatch) patch.metadata = metadataPatch;
   if (basePublishMode !== metadataDraft.publish_mode) {
-    patch.publish = { publish_mode: metadataDraft.publish_mode };
+    patch.publish_mode = metadataDraft.publish_mode;
+  }
+  if (Object.keys(patch).length > 0) {
+    patch.rebuild_definition = true;
+    patch.validate = true;
+    patch.evaluate_rights = true;
   }
 
   return Object.keys(patch).length > 0 ? patch : null;
@@ -361,13 +394,7 @@ export default function AutoFlowPage() {
         return;
       }
 
-      const executeOptions: ExecuteOptions = {
-        review_approved: isReviewApproved(latestPlan),
-      };
-      if (latestPlan.public_approved_at) {
-        executeOptions.public_approved = true;
-      }
-
+      const executeOptions: ExecuteOptions = {};
       const nextRun = await executeAutoFlowPlan(latestPlan.plan_id, executeOptions);
       setRun(nextRun);
     } catch (err) {

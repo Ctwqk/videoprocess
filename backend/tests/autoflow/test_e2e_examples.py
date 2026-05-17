@@ -72,12 +72,13 @@ async def test_hot_topic_explainer_keeps_external_research_in_review_preview():
     assert plan.request.publish_mode == "preview_only"
     assert plan.rights["status"] == "review_required"
     assert plan.needs_review is True
-    assert any("external URL candidates require human review" in reason for reason in plan.rights["reasons"])
-    external_candidates = [candidate for candidate in plan.candidates if candidate.url]
+    assert any("external" in reason.lower() for reason in plan.rights["reasons"])
+    external_candidates = [candidate for candidate in plan.candidates if candidate.source_type == "external_url"]
     assert external_candidates
-    assert all(candidate.source_type == "youtube" for candidate in external_candidates)
+    assert all(candidate.url is None for candidate in external_candidates)
+    assert all("example.test" not in str(candidate.model_dump()) for candidate in plan.candidates)
     assert all(candidate.rights_status == "review_required" for candidate in external_candidates)
-    assert "url_download" in _node_types(plan)
+    assert "source" in _node_types(plan)
     assert "youtube_upload" not in _node_types(plan)
 
 
