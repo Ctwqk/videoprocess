@@ -5,6 +5,7 @@ from worker.handlers.concat_horizontal import ConcatHorizontalHandler
 from worker.handlers.concat_vertical import ConcatVerticalHandler
 from worker.handlers.concat_timeline import ConcatTimelineHandler
 from worker.handlers.concat_many import ConcatManyHandler
+from worker.handlers.montage_assembler import MontageAssemblerHandler
 from worker.handlers.concat_vertical_timeline import ConcatVerticalTimelineHandler
 from worker.handlers.watermark import WatermarkHandler
 from worker.handlers.subtitle import SubtitleHandler
@@ -29,6 +30,7 @@ HANDLER_MAP: dict[str, type[BaseHandler]] = {
     "concat_vertical": ConcatVerticalHandler,
     "concat_timeline": ConcatTimelineHandler,
     "concat_many": ConcatManyHandler,
+    "montage_assembler": MontageAssemblerHandler,
     "concat_vertical_timeline": ConcatVerticalTimelineHandler,
     "watermark": WatermarkHandler,
     "subtitle": SubtitleHandler,

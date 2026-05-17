@@ -95,4 +95,6 @@ async def test_material_library_remix_uses_owned_material_defaults_and_validates
     assert plan.needs_review is False
     assert all(candidate.asset_id for candidate in plan.candidates)
     assert all(candidate.rights_status == "allowed" for candidate in plan.candidates)
-    assert {"source", "trim", "concat_timeline", "transcode", "export"}.issubset(set(_node_types(plan)))
+    assert {"source", "trim", "vertical_crop", "montage_assembler", "title_overlay", "transcode", "export"}.issubset(
+        set(_node_types(plan))
+    )

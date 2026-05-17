@@ -29,6 +29,13 @@ def test_template_required_capabilities_exist_in_manifest():
         assert missing == set()
 
 
+def test_animal_template_prefers_montage_assembly_blueprint():
+    template = TemplateLibrary().get_template("animal_compilation_short")
+
+    assert "montage_assembler" in template.required_capabilities
+    assert any(node["role"] == "assembly" and node["type"] == "montage_assembler|concat_many" for node in template.node_blueprint)
+
+
 def test_template_selection_matches_intent_classes():
     library = TemplateLibrary()
 
