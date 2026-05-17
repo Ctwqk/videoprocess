@@ -100,6 +100,17 @@ class AutoFlowExecuteRequest(BaseModel):
     review_approved: bool = False
 
 
+class AutoFlowRun(BaseModel):
+    run_id: str
+    plan_id: str | None = None
+    pipeline_id: str | None = None
+    job_id: str | None = None
+    status: str = "pending"
+    artifacts: dict[str, Any] = Field(default_factory=dict)
+    publish: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+
+
 class WorkflowTemplate(BaseModel):
     id: str
     name: str
