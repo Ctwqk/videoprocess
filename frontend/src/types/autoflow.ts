@@ -64,8 +64,68 @@ export interface AutoFlowMetadata {
   platform_payloads: Record<string, Record<string, unknown>>;
 }
 
+export type AutoFlowPlanStatus =
+  | 'blocked'
+  | 'needs_review'
+  | 'approved'
+  | 'public_approved'
+  | 'rejected'
+  | 'executed'
+  | (string & {});
+
+export interface AutoFlowCandidateEditDraft {
+  selected: boolean;
+  locked: boolean;
+  replacement: string;
+}
+
+export interface AutoFlowCandidateEdit {
+  candidate_id: string;
+  selected?: boolean;
+  locked?: boolean;
+  replacement?: string | null;
+}
+
+export interface AutoFlowMetadataPatch {
+  selected_title?: string | null;
+  description?: string;
+  tags?: string[];
+  hashtags?: string[];
+}
+
+export interface AutoFlowMetadataEditDraft {
+  selected_title: string;
+  description: string;
+  tags: string[];
+  hashtags: string[];
+  publish_mode: AutoFlowPublishMode;
+}
+
+export interface AutoFlowPublishPatch {
+  publish_mode?: AutoFlowPublishMode;
+  target_platforms?: string[];
+}
+
+export interface AutoFlowPlanPatch {
+  candidate_edits?: AutoFlowCandidateEdit[];
+  metadata?: AutoFlowMetadataPatch;
+  publish?: AutoFlowPublishPatch;
+  review_notes?: string | null;
+}
+
+export interface AutoFlowPublicApprovalRequest {
+  review_notes?: string | null;
+  public_approved?: boolean;
+}
+
+export interface AutoFlowRejectRequest {
+  review_notes?: string | null;
+  rejected_reason?: string | null;
+}
+
 export interface AutoFlowPlan {
   plan_id: string;
+  status?: AutoFlowPlanStatus;
   request: AutoFlowRequest;
   intent: AutoFlowIntent;
   template_id: string;
@@ -76,6 +136,10 @@ export interface AutoFlowPlan {
   rights: Record<string, unknown>;
   warnings: string[];
   needs_review: boolean;
+  review_approved_at?: string | null;
+  public_approved_at?: string | null;
+  review_notes?: string | null;
+  rejected_reason?: string | null;
 }
 
 export type AutoFlowRunStatus =
@@ -120,6 +184,7 @@ export interface ExecuteOptions {
   save_as_template?: boolean;
   execute?: boolean;
   review_approved?: boolean;
+  public_approved?: boolean;
   plan?: AutoFlowPlan;
 }
 

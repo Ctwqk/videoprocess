@@ -1,6 +1,9 @@
 import apiClient from './client';
 import type {
+  AutoFlowPlanPatch,
   AutoFlowPlan,
+  AutoFlowPublicApprovalRequest,
+  AutoFlowRejectRequest,
   AutoFlowRequest,
   AutoFlowRun,
   AutoFlowIdea,
@@ -22,8 +25,29 @@ export async function createAutoFlowPlan(payload: AutoFlowRequest): Promise<Auto
   return res.data;
 }
 
+export async function patchAutoFlowPlan(planId: string, payload: AutoFlowPlanPatch): Promise<AutoFlowPlan> {
+  const res = await apiClient.patch<AutoFlowPlan>(`/autoflow/plans/${planId}`, payload);
+  return res.data;
+}
+
 export async function approveAutoFlowPlan(planId: string): Promise<AutoFlowPlan> {
   const res = await apiClient.post<AutoFlowPlan>(`/autoflow/plans/${planId}/approve`);
+  return res.data;
+}
+
+export async function approveAutoFlowPlanPublic(
+  planId: string,
+  payload: AutoFlowPublicApprovalRequest = {},
+): Promise<AutoFlowPlan> {
+  const res = await apiClient.post<AutoFlowPlan>(`/autoflow/plans/${planId}/approve-public`, payload);
+  return res.data;
+}
+
+export async function rejectAutoFlowPlan(
+  planId: string,
+  payload: AutoFlowRejectRequest = {},
+): Promise<AutoFlowPlan> {
+  const res = await apiClient.post<AutoFlowPlan>(`/autoflow/plans/${planId}/reject`, payload);
   return res.data;
 }
 

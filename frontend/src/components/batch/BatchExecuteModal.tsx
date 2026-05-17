@@ -1,5 +1,6 @@
 import type { CSSProperties } from 'react';
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function parseBatchItems(input: string): Array<Record<string, unknown>> {
   const parsed = JSON.parse(input);
   if (!Array.isArray(parsed) || parsed.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {

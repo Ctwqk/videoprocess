@@ -2,19 +2,37 @@ import { useEffect, useState } from 'react';
 
 import {
   approveAutoFlowPlan,
+  approveAutoFlowPlanPublic,
   createAutoFlowPlan,
   executeAutoFlowPlan,
   getAutoFlowCapabilities,
   listAutoFlowTemplates,
+  patchAutoFlowPlan,
+  rejectAutoFlowPlan,
 } from '../api/autoflow';
 import AutoFlowCandidateClips from '../components/autoflow/AutoFlowCandidateClips';
 import AutoFlowMetricsPanel from '../components/autoflow/AutoFlowMetricsPanel';
+import AutoFlowMetadataEditor from '../components/autoflow/AutoFlowMetadataEditor';
 import AutoFlowPlanPanel from '../components/autoflow/AutoFlowPlanPanel';
 import AutoFlowPromptBox from '../components/autoflow/AutoFlowPromptBox';
 import AutoFlowReviewGate from '../components/autoflow/AutoFlowReviewGate';
 import AutoFlowRunStatus from '../components/autoflow/AutoFlowRunStatus';
 import AutoFlowWorkflowPreview from '../components/autoflow/AutoFlowWorkflowPreview';
-import type { AutoFlowPlan, AutoFlowRequest, AutoFlowRun, CapabilityManifest, WorkflowTemplate } from '../types/autoflow';
+import type {
+  AutoFlowCandidateEdit,
+  AutoFlowCandidateEditDraft,
+  AutoFlowClipCandidate,
+  AutoFlowMetadataEditDraft,
+  AutoFlowMetadataPatch,
+  AutoFlowPlan,
+  AutoFlowPlanPatch,
+  AutoFlowPublishMode,
+  AutoFlowRequest,
+  AutoFlowRun,
+  CapabilityManifest,
+  ExecuteOptions,
+  WorkflowTemplate,
+} from '../types/autoflow';
 
 const defaultRequest: AutoFlowRequest = {
   prompt: '我要一个 30 秒小猫视频集锦，竖屏，可爱快节奏，先导出预览，不要公开发布。',
@@ -27,16 +45,174 @@ const defaultRequest: AutoFlowRequest = {
   user_constraints: {},
 };
 
+const publishModes: AutoFlowPublishMode[] = [
+  'preview_only',
+  'private_upload',
+  'unlisted_upload',
+  'public_after_review',
+];
+
+const defaultMetadataDraft: AutoFlowMetadataEditDraft = {
+  selected_title: '',
+  description: '',
+  tags: [],
+  hashtags: [],
+  publish_mode: 'preview_only',
+};
+
+function isPublishMode(value: string): value is AutoFlowPublishMode {
+  return publishModes.includes(value as AutoFlowPublishMode);
+}
+
+function metadataBoolean(candidate: AutoFlowClipCandidate, keys: string[], fallback: boolean) {
+  for (const key of keys) {
+    const value = candidate.metadata[key];
+    if (typeof value === 'boolean') return value;
+  }
+  return fallback;
+}
+
+function metadataString(candidate: AutoFlowClipCandidate, keys: string[]) {
+  for (const key of keys) {
+    const value = candidate.metadata[key];
+    if (typeof value === 'string') return value;
+  }
+  return '';
+}
+
+function candidateDraftFromCandidate(candidate: AutoFlowClipCandidate): AutoFlowCandidateEditDraft {
+  return {
+    selected: metadataBoolean(candidate, ['selected', 'autoflow_selected', 'included'], true),
+    locked: metadataBoolean(candidate, ['locked', 'autoflow_locked'], false),
+    replacement: metadataString(candidate, ['replacement', 'replacement_url', 'replacement_asset_id']),
+  };
+}
+
+function candidateDraftsFromPlan(plan: AutoFlowPlan): Record<string, AutoFlowCandidateEditDraft> {
+  return Object.fromEntries(
+    plan.candidates.map(candidate => [candidate.id, candidateDraftFromCandidate(candidate)]),
+  );
+}
+
+function planPublishMode(plan: AutoFlowPlan): AutoFlowPublishMode {
+  const mode = plan.request.publish_mode || plan.intent.publish_mode;
+  return isPublishMode(mode) ? mode : 'preview_only';
+}
+
+function metadataDraftFromPlan(plan: AutoFlowPlan): AutoFlowMetadataEditDraft {
+  return {
+    selected_title: plan.metadata.selected_title ?? plan.metadata.title_candidates[0] ?? '',
+    description: plan.metadata.description,
+    tags: [...plan.metadata.tags],
+    hashtags: [...plan.metadata.hashtags],
+    publish_mode: planPublishMode(plan),
+  };
+}
+
+function arraysEqual(first: string[], second: string[]) {
+  return first.length === second.length && first.every((value, index) => value === second[index]);
+}
+
+function buildCandidatePatch(
+  plan: AutoFlowPlan,
+  candidateEdits: Record<string, AutoFlowCandidateEditDraft>,
+): AutoFlowCandidateEdit[] {
+  return plan.candidates.flatMap(candidate => {
+    const base = candidateDraftFromCandidate(candidate);
+    const edit = candidateEdits[candidate.id] ?? base;
+    const replacement = edit.replacement.trim();
+    if (
+      base.selected === edit.selected
+      && base.locked === edit.locked
+      && base.replacement.trim() === replacement
+    ) {
+      return [];
+    }
+
+    return [{
+      candidate_id: candidate.id,
+      selected: edit.selected,
+      locked: edit.locked,
+      replacement: replacement || null,
+    }];
+  });
+}
+
+function buildMetadataPatch(plan: AutoFlowPlan, draft: AutoFlowMetadataEditDraft): AutoFlowMetadataPatch | null {
+  const base = metadataDraftFromPlan(plan);
+  const patch: AutoFlowMetadataPatch = {};
+  const selectedTitle = draft.selected_title.trim();
+
+  if (base.selected_title !== selectedTitle) patch.selected_title = selectedTitle || null;
+  if (base.description !== draft.description) patch.description = draft.description;
+  if (!arraysEqual(base.tags, draft.tags)) patch.tags = draft.tags;
+  if (!arraysEqual(base.hashtags, draft.hashtags)) patch.hashtags = draft.hashtags;
+
+  return Object.keys(patch).length > 0 ? patch : null;
+}
+
+function buildPlanPatch(
+  plan: AutoFlowPlan,
+  candidateEdits: Record<string, AutoFlowCandidateEditDraft>,
+  metadataDraft: AutoFlowMetadataEditDraft,
+): AutoFlowPlanPatch | null {
+  const patch: AutoFlowPlanPatch = {};
+  const candidatePatch = buildCandidatePatch(plan, candidateEdits);
+  const metadataPatch = buildMetadataPatch(plan, metadataDraft);
+  const basePublishMode = planPublishMode(plan);
+
+  if (candidatePatch.length > 0) patch.candidate_edits = candidatePatch;
+  if (metadataPatch) patch.metadata = metadataPatch;
+  if (basePublishMode !== metadataDraft.publish_mode) {
+    patch.publish = { publish_mode: metadataDraft.publish_mode };
+  }
+
+  return Object.keys(patch).length > 0 ? patch : null;
+}
+
+function isReviewApproved(plan: AutoFlowPlan) {
+  return !plan.needs_review || Boolean(plan.review_approved_at);
+}
+
+function requiresPublicApproval(plan: AutoFlowPlan) {
+  return planPublishMode(plan) === 'public_after_review';
+}
+
+function executeBlockReason(plan: AutoFlowPlan) {
+  const status = (plan.status ?? '').toLowerCase();
+  const rightsStatus = String(plan.rights.status ?? plan.rights.decision ?? '').toLowerCase();
+  const rejected = status === 'rejected' || Boolean(plan.rejected_reason);
+  const blocked = ['blocked', 'denied', 'rejected'].includes(status)
+    || ['blocked', 'denied', 'rejected'].includes(rightsStatus)
+    || plan.rights.execute_allowed === false
+    || plan.rights.allowed === false;
+
+  if (rejected) return 'Rejected plans cannot be executed.';
+  if (blocked) return 'AutoFlow plan is blocked by rights policy.';
+  if (!isReviewApproved(plan)) return 'Human review is required before execution.';
+  if (plan.rights.publish_allowed === false || plan.rights.can_publish === false) {
+    return 'Publishing is blocked by rights policy.';
+  }
+  if (requiresPublicApproval(plan) && !plan.public_approved_at) {
+    return 'Public publishing requires public approval before execution.';
+  }
+  return null;
+}
+
 export default function AutoFlowPage() {
   const [request, setRequest] = useState<AutoFlowRequest>(defaultRequest);
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([]);
   const [capabilities, setCapabilities] = useState<CapabilityManifest | null>(null);
   const [plan, setPlan] = useState<AutoFlowPlan | null>(null);
   const [run, setRun] = useState<AutoFlowRun | null>(null);
-  const [approved, setApproved] = useState(false);
+  const [candidateEdits, setCandidateEdits] = useState<Record<string, AutoFlowCandidateEditDraft>>({});
+  const [metadataDraft, setMetadataDraft] = useState<AutoFlowMetadataEditDraft>(defaultMetadataDraft);
   const [loadingReferenceData, setLoadingReferenceData] = useState(true);
   const [planning, setPlanning] = useState(false);
   const [approving, setApproving] = useState(false);
+  const [publicApproving, setPublicApproving] = useState(false);
+  const [rejecting, setRejecting] = useState(false);
+  const [savingPlanPatch, setSavingPlanPatch] = useState(false);
   const [executing, setExecuting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -67,19 +243,59 @@ export default function AutoFlowPage() {
     };
   }, []);
 
+  const hydratePlanDrafts = (nextPlan: AutoFlowPlan) => {
+    setPlan(nextPlan);
+    setCandidateEdits(candidateDraftsFromPlan(nextPlan));
+    setMetadataDraft(metadataDraftFromPlan(nextPlan));
+  };
+
+  const hasUnsavedPlanEdits = plan ? Boolean(buildPlanPatch(plan, candidateEdits, metadataDraft)) : false;
+
+  const savePendingPlanEdits = async (basePlan: AutoFlowPlan) => {
+    const patch = buildPlanPatch(basePlan, candidateEdits, metadataDraft);
+    if (!patch) return basePlan;
+
+    setSavingPlanPatch(true);
+    try {
+      const nextPlan = await patchAutoFlowPlan(basePlan.plan_id, patch);
+      hydratePlanDrafts(nextPlan);
+      return nextPlan;
+    } finally {
+      setSavingPlanPatch(false);
+    }
+  };
+
   const handleCreatePlan = async () => {
     setPlanning(true);
     setError(null);
     setRun(null);
-    setApproved(false);
     try {
       const nextPlan = await createAutoFlowPlan(request);
-      setPlan(nextPlan);
-      setApproved(!nextPlan.needs_review);
+      hydratePlanDrafts(nextPlan);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to generate plan');
     } finally {
       setPlanning(false);
+    }
+  };
+
+  const handleCandidateEditChange = (candidateId: string, edit: Partial<AutoFlowCandidateEditDraft>) => {
+    setCandidateEdits(current => ({
+      ...current,
+      [candidateId]: {
+        ...(current[candidateId] ?? { selected: true, locked: false, replacement: '' }),
+        ...edit,
+      },
+    }));
+  };
+
+  const handleSavePlanEdits = async () => {
+    if (!plan) return;
+    setError(null);
+    try {
+      await savePendingPlanEdits(plan);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save plan edits');
     }
   };
 
@@ -88,13 +304,48 @@ export default function AutoFlowPage() {
     setApproving(true);
     setError(null);
     try {
-      const nextPlan = await approveAutoFlowPlan(plan.plan_id);
-      setPlan(nextPlan);
-      setApproved(true);
+      const latestPlan = await savePendingPlanEdits(plan);
+      const nextPlan = await approveAutoFlowPlan(latestPlan.plan_id);
+      hydratePlanDrafts(nextPlan);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to approve plan');
     } finally {
       setApproving(false);
+    }
+  };
+
+  const handleApprovePublic = async (reviewNotes: string) => {
+    if (!plan) return;
+    setPublicApproving(true);
+    setError(null);
+    try {
+      const latestPlan = await savePendingPlanEdits(plan);
+      const nextPlan = await approveAutoFlowPlanPublic(latestPlan.plan_id, {
+        public_approved: true,
+        review_notes: reviewNotes.trim() || null,
+      });
+      hydratePlanDrafts(nextPlan);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to approve public publishing');
+    } finally {
+      setPublicApproving(false);
+    }
+  };
+
+  const handleReject = async (reason: string) => {
+    if (!plan) return;
+    setRejecting(true);
+    setError(null);
+    try {
+      const nextPlan = await rejectAutoFlowPlan(plan.plan_id, {
+        rejected_reason: reason.trim() || null,
+        review_notes: reason.trim() || null,
+      });
+      hydratePlanDrafts(nextPlan);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to reject plan');
+    } finally {
+      setRejecting(false);
     }
   };
 
@@ -103,7 +354,21 @@ export default function AutoFlowPage() {
     setExecuting(true);
     setError(null);
     try {
-      const nextRun = await executeAutoFlowPlan(plan.plan_id, { review_approved: approved });
+      const latestPlan = await savePendingPlanEdits(plan);
+      const blockReason = executeBlockReason(latestPlan);
+      if (blockReason) {
+        setError(blockReason);
+        return;
+      }
+
+      const executeOptions: ExecuteOptions = {
+        review_approved: isReviewApproved(latestPlan),
+      };
+      if (latestPlan.public_approved_at) {
+        executeOptions.public_approved = true;
+      }
+
+      const nextRun = await executeAutoFlowPlan(latestPlan.plan_id, executeOptions);
       setRun(nextRun);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to execute plan');
@@ -136,10 +401,16 @@ export default function AutoFlowPage() {
           />
           <AutoFlowReviewGate
             plan={plan}
-            approved={approved}
             approving={approving}
+            publicApproving={publicApproving}
+            rejecting={rejecting}
+            saving={savingPlanPatch}
             executing={executing}
+            hasUnsavedEdits={hasUnsavedPlanEdits}
+            publishMode={metadataDraft.publish_mode}
             onApprove={() => void handleApprove()}
+            onApprovePublic={reviewNotes => void handleApprovePublic(reviewNotes)}
+            onReject={reason => void handleReject(reason)}
             onExecute={() => void handleExecute()}
           />
           <AutoFlowRunStatus run={run} />
@@ -166,8 +437,20 @@ export default function AutoFlowPage() {
             </div>
           ) : null}
           <AutoFlowPlanPanel plan={plan} templates={templates} />
+          <AutoFlowMetadataEditor
+            plan={plan}
+            draft={metadataDraft}
+            dirty={hasUnsavedPlanEdits}
+            saving={savingPlanPatch}
+            onChange={setMetadataDraft}
+            onSave={() => void handleSavePlanEdits()}
+          />
           <AutoFlowWorkflowPreview pipelineDefinition={plan?.pipeline_definition ?? null} />
-          <AutoFlowCandidateClips candidates={plan?.candidates ?? []} />
+          <AutoFlowCandidateClips
+            candidates={plan?.candidates ?? []}
+            candidateEdits={candidateEdits}
+            onCandidateEditChange={handleCandidateEditChange}
+          />
         </div>
       </div>
     </div>
