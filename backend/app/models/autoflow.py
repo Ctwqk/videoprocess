@@ -14,6 +14,7 @@ class AutoFlowPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "autoflow_plans"
 
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    request_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     intent_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     template_id: Mapped[str] = mapped_column(String(255), nullable=False)
     pipeline_definition: Mapped[dict] = mapped_column(JSON, nullable=False)
@@ -22,6 +23,10 @@ class AutoFlowPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     rights_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     validation_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="drafted", nullable=False)
+    review_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    public_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rejected_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class AutoFlowRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -39,6 +44,7 @@ class AutoFlowRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     artifacts_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     publish_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ContentMetric(UUIDPrimaryKeyMixin, Base):

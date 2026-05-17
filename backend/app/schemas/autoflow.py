@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -16,6 +17,15 @@ SourcePolicy = Literal[
 ]
 PublishMode = Literal["preview_only", "private_upload", "unlisted_upload", "public_after_review"]
 AspectRatio = Literal["9:16", "16:9", "1:1", "auto"]
+AutoFlowPlanStatus = Literal[
+    "drafted",
+    "review_required",
+    "review_approved",
+    "public_approved",
+    "rejected",
+    "blocked",
+    "executed",
+]
 
 
 class AutoFlowRequest(BaseModel):
@@ -90,6 +100,34 @@ class AutoFlowPlan(BaseModel):
     rights: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     needs_review: bool = True
+    status: AutoFlowPlanStatus = "drafted"
+    review_approved_at: datetime | None = None
+    public_approved_at: datetime | None = None
+    review_notes: str | None = None
+    rejected_reason: str | None = None
+
+
+class AutoFlowPlanPatch(BaseModel):
+    selected_candidate_ids: list[str] | None = None
+    locked_candidate_ids: list[str] | None = None
+    replacement_candidates: list[AutoFlowClipCandidate] | None = None
+    metadata: dict[str, Any] | None = None
+    publish_mode: PublishMode | None = None
+    publish_settings: dict[str, Any] = Field(default_factory=dict)
+    target_platforms: list[str] | None = None
+    user_constraints: dict[str, Any] | None = None
+    rebuild_definition: bool = True
+    run_validation: bool = Field(default=True, alias="validate")
+    evaluate_rights: bool = True
+    model_config = {"populate_by_name": True}
+
+
+class AutoFlowApprovalRequest(BaseModel):
+    review_notes: str | None = None
+
+
+class AutoFlowRejectRequest(BaseModel):
+    rejected_reason: str | None = None
 
 
 class AutoFlowExecuteRequest(BaseModel):
@@ -98,6 +136,7 @@ class AutoFlowExecuteRequest(BaseModel):
     save_as_template: bool = False
     execute: bool = True
     review_approved: bool = False
+    public_approved: bool = False
 
 
 class AutoFlowRun(BaseModel):
