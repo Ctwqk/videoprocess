@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.autoflow.metadata_generator import MetadataGenerator
 from app.autoflow.pipeline_builder import PipelineBuilder
 from app.autoflow.template_library import TemplateLibrary
+from app.node_registry.registry import NodeTypeRegistry
 from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent
 
@@ -63,6 +64,33 @@ def test_builder_uses_single_montage_node_for_three_clips():
     assert montage.type == "montage_assembler"
     assert montage.data.config["target_duration"] == 15
     assert [edge.targetHandle for edge in first.edges if edge.target == "montage_1"] == ["video_1", "video_2", "video_3"]
+
+
+def test_builder_concat_many_fallback_carries_intent_aspect_ratio(monkeypatch):
+    registry = NodeTypeRegistry.get()
+    monkeypatch.delitem(registry._types, "montage_assembler", raising=False)
+    intent = AutoFlowIntent(
+        intent_type="material_library_remix",
+        subject="旅行素材",
+        duration_sec=15,
+        aspect_ratio="16:9",
+    )
+    candidates = [candidate(1), candidate(2)]
+    template = TemplateLibrary().get_template("material_library_remix")
+    metadata = MetadataGenerator().generate(intent, candidates)
+
+    definition = PipelineBuilder().build(template, intent, candidates, metadata)
+
+    assert validate_pipeline(definition).valid
+    assembly = next(node for node in definition.nodes if node.id == "concat_many_1")
+    assert assembly.type == "concat_many"
+    assert assembly.data.config["aspect_ratio"] == "16:9"
+    assert assembly.data.config["width"] == 1920
+    assert assembly.data.config["height"] == 1080
+    assert [edge.targetHandle for edge in definition.edges if edge.target == "concat_many_1"] == [
+        "video_1",
+        "video_2",
+    ]
 
 
 def test_builder_uses_url_download_when_source_policy_allows_research_preview():

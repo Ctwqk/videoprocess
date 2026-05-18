@@ -439,11 +439,11 @@ class PipelineBuilder:
             )
 
         return PipelineNode(
-            id="concat_timeline_1",
-            type="concat_timeline",
+            id="concat_many_1",
+            type="concat_many",
             position=self._position(3, 0),
             data=PipelineNodeData(
-                label="Timeline Concat",
+                label="Concat Many",
                 config={
                     "input_count": input_count,
                     "output_format": "mp4",
@@ -451,6 +451,7 @@ class PipelineBuilder:
                     "transition_duration": 0,
                     "target_duration": target_duration,
                     "normalize_resolution": True,
+                    "aspect_ratio": intent.aspect_ratio,
                     "width": width,
                     "height": height,
                 },

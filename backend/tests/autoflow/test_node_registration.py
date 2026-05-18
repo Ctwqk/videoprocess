@@ -50,6 +50,15 @@ def test_montage_assembler_node_contract_is_fixed_for_autoflow():
     }
 
 
+def test_concat_many_node_contract_exposes_aspect_ratio():
+    definition = NodeTypeRegistry.get().get_type("concat_many")
+
+    assert definition is not None
+    params = {param.name: param for param in definition.params}
+    assert params["aspect_ratio"].default == "9:16"
+    assert params["aspect_ratio"].options == ["9:16", "16:9", "1:1", "auto"]
+
+
 def test_concat_timeline_exposes_only_default_dynamic_inputs():
     definition = NodeTypeRegistry.get().get_type("concat_timeline")
 

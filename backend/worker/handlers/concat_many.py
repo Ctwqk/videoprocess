@@ -15,12 +15,12 @@ class ConcatManyHandler(BaseHandler):
         await self.run_ffmpeg(args)
 
     def build_concat_args(self, node_config: dict[str, Any], input_paths: dict[str, str], output_path: str) -> list[str]:
-        selected = self._selected_inputs(node_config, input_paths)
+        selected_items = self._selected_input_items(node_config, input_paths)
+        selected = [path for _handle, path in selected_items]
         if len(selected) < 2:
             raise ValueError("concat_many requires at least two video inputs")
 
-        width = int(node_config.get("width") or 1080)
-        height = int(node_config.get("height") or 1920)
+        width, height = _target_dimensions(node_config, [handle for handle, _path in selected_items])
         normalize = self.parse_bool_param(node_config.get("normalize_resolution"), True)
         target_duration = _positive_float_or_none(node_config.get("target_duration"))
 
@@ -62,18 +62,84 @@ class ConcatManyHandler(BaseHandler):
     def _selected_inputs(self, node_config: dict[str, Any], input_paths: dict[str, str]) -> list[str]:
         return selected_video_inputs(input_paths)
 
+    def _selected_input_items(self, node_config: dict[str, Any], input_paths: dict[str, str]) -> list[tuple[str, str]]:
+        return selected_video_input_items(input_paths)
+
 
 def selected_video_inputs(input_paths: dict[str, str]) -> list[str]:
-    indexed: dict[int, str] = {}
+    return [path for _handle, path in selected_video_input_items(input_paths)]
+
+
+def selected_video_input_items(input_paths: dict[str, str]) -> list[tuple[str, str]]:
+    indexed: dict[int, tuple[str, str]] = {}
     for handle, path in input_paths.items():
         match = VIDEO_INPUT_RE.match(handle)
         if match:
-            indexed[int(match.group(1))] = path
+            indexed[int(match.group(1))] = (handle, path)
             continue
         legacy_index = LEGACY_TIMELINE_INPUT_ORDER.get(handle)
         if legacy_index is not None and legacy_index not in indexed:
-            indexed[legacy_index] = path
+            indexed[legacy_index] = (handle, path)
     return [indexed[index] for index in sorted(indexed)]
+
+
+def _target_dimensions(node_config: dict[str, Any], selected_handles: list[str]) -> tuple[int, int]:
+    aspect_ratio = str(node_config.get("aspect_ratio") or "9:16").strip().lower()
+    if aspect_ratio == "auto":
+        auto_dimensions = _auto_dimensions(node_config, selected_handles)
+        if auto_dimensions is not None:
+            return auto_dimensions
+        return _configured_or_default_dimensions(node_config, (1080, 1920))
+    return _configured_or_default_dimensions(node_config, _dimensions_for_aspect_ratio(aspect_ratio))
+
+
+def _configured_or_default_dimensions(
+    node_config: dict[str, Any],
+    default_dimensions: tuple[int, int],
+) -> tuple[int, int]:
+    default_width, default_height = default_dimensions
+    width = _positive_int_or_none(node_config.get("width")) or default_width
+    height = _positive_int_or_none(node_config.get("height")) or default_height
+    return width, height
+
+
+def _dimensions_for_aspect_ratio(aspect_ratio: str) -> tuple[int, int]:
+    if aspect_ratio == "16:9":
+        return 1920, 1080
+    if aspect_ratio == "1:1":
+        return 1080, 1080
+    return 1080, 1920
+
+
+def _auto_dimensions(node_config: dict[str, Any], selected_handles: list[str]) -> tuple[int, int] | None:
+    input_meta = node_config.get("_input_artifact_meta") or {}
+    if not isinstance(input_meta, dict):
+        return None
+    for handle in selected_handles:
+        dimensions = _dimensions_from_media_info(input_meta.get(handle) or {})
+        if dimensions is not None:
+            return dimensions
+    return None
+
+
+def _dimensions_from_media_info(media_info: Any) -> tuple[int, int] | None:
+    if not isinstance(media_info, dict):
+        return None
+    width = _positive_int_or_none(media_info.get("width"))
+    height = _positive_int_or_none(media_info.get("height"))
+    if width is None or height is None:
+        return None
+    return width, height
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return numeric if numeric > 0 else None
 
 
 def _positive_float_or_none(value: Any) -> float | None:

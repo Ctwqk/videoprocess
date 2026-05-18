@@ -52,6 +52,75 @@ async def test_concat_many_uses_numbered_inputs_without_explicit_input_count(mon
 
 
 @pytest.mark.asyncio
+async def test_concat_many_uses_aspect_ratio_for_default_dimensions(monkeypatch):
+    captured = {}
+
+    async def fake_run_ffmpeg(self, args):
+        captured["args"] = args
+        return ""
+
+    monkeypatch.setattr(ConcatManyHandler, "run_ffmpeg", fake_run_ffmpeg)
+
+    await ConcatManyHandler().execute(
+        {"aspect_ratio": "16:9"},
+        {"video_1": "a.mp4", "video_2": "b.mp4"},
+        "out.mp4",
+    )
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "scale=1920:1080" in filter_complex
+    assert "pad=1920:1080" in filter_complex
+
+
+@pytest.mark.asyncio
+async def test_concat_many_explicit_dimensions_override_aspect_ratio(monkeypatch):
+    captured = {}
+
+    async def fake_run_ffmpeg(self, args):
+        captured["args"] = args
+        return ""
+
+    monkeypatch.setattr(ConcatManyHandler, "run_ffmpeg", fake_run_ffmpeg)
+
+    await ConcatManyHandler().execute(
+        {"aspect_ratio": "16:9", "width": 720, "height": 1280},
+        {"video_1": "a.mp4", "video_2": "b.mp4"},
+        "out.mp4",
+    )
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "scale=720:1280" in filter_complex
+    assert "pad=720:1280" in filter_complex
+
+
+@pytest.mark.asyncio
+async def test_concat_many_auto_aspect_uses_first_input_metadata(monkeypatch):
+    captured = {}
+
+    async def fake_run_ffmpeg(self, args):
+        captured["args"] = args
+        return ""
+
+    monkeypatch.setattr(ConcatManyHandler, "run_ffmpeg", fake_run_ffmpeg)
+
+    await ConcatManyHandler().execute(
+        {
+            "aspect_ratio": "auto",
+            "_input_artifact_meta": {
+                "video_1": {"width": 1280, "height": 720},
+                "video_2": {"width": 720, "height": 1280},
+            },
+        },
+        {"video_2": "b.mp4", "video_1": "a.mp4"},
+        "out.mp4",
+    )
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "scale=1280:720" in filter_complex
+    assert "pad=1280:720" in filter_complex
+
+
+@pytest.mark.asyncio
 async def test_concat_many_uses_all_dynamic_numbered_inputs_even_past_legacy_limit(monkeypatch):
     captured = {}
 
