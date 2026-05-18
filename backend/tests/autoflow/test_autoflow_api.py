@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.autoflow import router
 from app.api import autoflow as autoflow_api_module
+from app.autoflow.clip_ranker import ClipRanker
+from app.autoflow.service import AutoFlowService
 from app.db import get_db
 from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
 from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
 from app.models.autoflow import AutoFlowUsedClip
 from app.models.autoflow import ContentMetric, TrendSignal
+from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowExecuteRequest, AutoFlowRequest
 
 
 @pytest.fixture
@@ -49,6 +54,32 @@ def _app_with_db(db_session):
     app.include_router(router)
     app.dependency_overrides[get_db] = lambda: db_session
     return app
+
+
+class StaticSelector:
+    async def find_candidates(self, intent, request: AutoFlowRequest, db=None):
+        return [
+            AutoFlowClipCandidate(
+                id="recent",
+                title=f"{intent.subject} recent",
+                source_type="asset",
+                asset_id="asset-recent",
+                start_sec=0,
+                end_sec=5,
+                rights_status="allowed",
+                metadata={"duration": 5, "aspect_ratio": "9:16"},
+            ),
+            AutoFlowClipCandidate(
+                id="fresh",
+                title=f"{intent.subject} fresh",
+                source_type="asset",
+                asset_id="asset-fresh",
+                start_sec=0,
+                end_sec=5,
+                rights_status="allowed",
+                metadata={"duration": 5, "aspect_ratio": "9:16"},
+            ),
+        ]
 
 
 def _plan_row(
@@ -229,6 +260,54 @@ async def test_db_backed_plan_get_and_list_read_persisted_plan(autoflow_db_sessi
         listed = await client.get("/api/v1/autoflow/plans")
         assert listed.status_code == 200
         assert [item["plan_id"] for item in listed.json()] == [plan["plan_id"]]
+
+
+@pytest.mark.asyncio
+async def test_db_backed_plan_penalizes_recently_used_clips(autoflow_db_session):
+    autoflow_db_session.add(
+        AutoFlowUsedClip(
+            run_id=uuid.uuid4(),
+            asset_id="asset-recent",
+            selected_at=datetime.now(timezone.utc),
+        )
+    )
+    await autoflow_db_session.commit()
+    service = AutoFlowService(material_selector=StaticSelector(), clip_ranker=ClipRanker())
+
+    plan = await service.plan(
+        AutoFlowRequest(
+            prompt="我要一个 30 秒小猫视频集锦，竖屏，可爱快节奏。",
+            target_platforms=["youtube_shorts"],
+        ),
+        db=autoflow_db_session,
+    )
+
+    assert [candidate.asset_id for candidate in plan.candidates[:2]] == ["asset-fresh", "asset-recent"]
+    assert plan.candidates[1].score_breakdown["recent_used_penalty"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_db_backed_execute_records_selected_clip_usage(autoflow_db_session):
+    service = AutoFlowService(material_selector=StaticSelector(), clip_ranker=ClipRanker())
+    plan = await service.plan(
+        AutoFlowRequest(
+            prompt="我要一个 30 秒小猫视频集锦，竖屏，可爱快节奏。",
+            target_platforms=["youtube_shorts"],
+        ),
+        db=autoflow_db_session,
+    )
+
+    run = await service.execute(
+        AutoFlowExecuteRequest(plan_id=plan.plan_id, execute=False),
+        db=autoflow_db_session,
+    )
+
+    rows = (
+        await autoflow_db_session.execute(
+            select(AutoFlowUsedClip).where(AutoFlowUsedClip.run_id == uuid.UUID(run.run_id))
+        )
+    ).scalars().all()
+    assert {row.asset_id for row in rows} == {"asset-fresh", "asset-recent"}
 
 
 @pytest.mark.asyncio

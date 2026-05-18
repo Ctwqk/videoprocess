@@ -7,12 +7,16 @@ from typing import Any, Protocol
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.autoflow.clip_ranker import ClipRanker
+from app.autoflow.embedding_relevance import EmbeddingRelevanceService
 from app.autoflow.graph_planner import AutoFlowGraphPlanner, GraphPlanningFailed, GraphPlanningUnavailable
 from app.autoflow.intent_parser import RuleBasedIntentParser
 from app.autoflow.material_selector import MaterialSelector
-from app.autoflow.metadata_generator import MetadataGenerator
+from app.autoflow.metadata_generator import LLMGatewayMetadataClient, MetadataGenerator
 from app.autoflow.pipeline_builder import PipelineBuilder
+from app.autoflow.platform_profiles import PlatformProfileService
+from app.autoflow.recent_usage import RecentClipUsageStore
 from app.autoflow.rights_policy import RightsPolicy
 from app.autoflow.storyboard_generator import StoryboardGenerator
 from app.autoflow.template_library import TemplateLibrary
@@ -56,7 +60,11 @@ class AutoFlowService:
     ) -> None:
         self.intent_parser = RuleBasedIntentParser()
         self.template_library = TemplateLibrary()
-        self.metadata_generator = MetadataGenerator()
+        self.platform_profiles = PlatformProfileService()
+        self.metadata_generator = MetadataGenerator(
+            llm_client=_llm_metadata_client() if settings.autoflow_ai_enabled else None,
+            platform_profiles=self.platform_profiles,
+        )
         self.storyboard_generator = StoryboardGenerator()
         self.graph_planner = AutoFlowGraphPlanner()
         self.pipeline_builder = PipelineBuilder()
@@ -64,6 +72,11 @@ class AutoFlowService:
         self.rights_policy = RightsPolicy()
         self.material_selector = material_selector or MaterialSelector()
         self.clip_ranker = clip_ranker or ClipRanker()
+        self.embedding_relevance = EmbeddingRelevanceService(
+            embedding_url=settings.autoflow_embedding_url if settings.autoflow_ai_enabled else "",
+            timeout_seconds=settings.autoflow_ai_timeout_seconds,
+        )
+        self.recent_usage_store = RecentClipUsageStore()
         self._plans: dict[str, AutoFlowPlan] = {}
         self._runs: dict[str, AutoFlowRun] = {}
 
@@ -94,7 +107,22 @@ class AutoFlowService:
         if not candidates:
             candidates = self._fixture_candidates(intent, request)
             warnings.append("Material selector returned no candidates; using AutoFlow fixture candidates.")
-        ranked_candidates = self.clip_ranker.rank(intent, candidates)
+        recent_used_asset_ids: set[str] = set()
+        if db is not None:
+            try:
+                recent_used_asset_ids = await self.recent_usage_store.load_recent_asset_ids(db)
+            except Exception:
+                warnings.append("recent_clip_usage_unavailable")
+        relevance = await self.embedding_relevance.score(intent, candidates)
+        warnings.extend(relevance.warnings)
+        platform_profile = self.platform_profiles.for_platforms(intent.target_platforms)
+        ranked_candidates = self.clip_ranker.rank(
+            intent,
+            candidates,
+            semantic_relevance_scores=relevance.scores,
+            recent_used_asset_ids=recent_used_asset_ids,
+            platform_profile=platform_profile,
+        )
         if len(ranked_candidates) < 5:
             warnings.append("AutoFlow found fewer than 5 candidate clips; review material coverage before publishing.")
         metadata = self.metadata_generator.generate(intent, ranked_candidates)
@@ -622,7 +650,12 @@ class AutoFlowService:
             error_message=error_message,
         )
         if db is not None:
-            return await self._save_run(db, run, mark_plan_executed=request.execute and error_message is None)
+            return await self._save_run(
+                db,
+                run,
+                mark_plan_executed=request.execute and error_message is None,
+                selected_candidates=plan.candidates,
+            )
 
         self._runs[run.run_id] = run
         return run
@@ -689,6 +722,7 @@ class AutoFlowService:
         run: AutoFlowRun,
         *,
         mark_plan_executed: bool,
+        selected_candidates: list[AutoFlowClipCandidate] | None = None,
     ) -> AutoFlowRun:
         run_uuid = uuid.UUID(run.run_id)
         plan_uuid = uuid.UUID(run.plan_id) if run.plan_id else None
@@ -711,6 +745,23 @@ class AutoFlowService:
 
         await db.commit()
         await db.refresh(row)
+        if selected_candidates:
+            try:
+                await self.recent_usage_store.record_selected_clips(
+                    db,
+                    run_id=run.run_id,
+                    candidates=selected_candidates,
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                artifacts = dict(row.artifacts_json or {})
+                warnings = list(artifacts.get("warnings") or [])
+                warnings.append("recent_clip_usage_write_failed")
+                artifacts["warnings"] = warnings
+                row.artifacts_json = artifacts
+                await db.commit()
+            await db.refresh(row)
         return _run_from_model(row)
 
     def _fixture_candidates(
@@ -762,6 +813,15 @@ class AutoFlowService:
                 rights_status="allowed",
             ),
         ]
+
+
+def _llm_metadata_client() -> LLMGatewayMetadataClient:
+    return LLMGatewayMetadataClient(
+        base_url=settings.autoflow_llm_gateway_url,
+        timeout_seconds=settings.autoflow_ai_timeout_seconds,
+        source=settings.autoflow_llm_source,
+        profile=settings.autoflow_llm_profile,
+    )
 
 
 def _plan_from_model(row: AutoFlowPlanModel) -> AutoFlowPlan:

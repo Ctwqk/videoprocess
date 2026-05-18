@@ -42,6 +42,16 @@ class Settings(BaseSettings):
     smart_trim_vlm_url: str = ""
     smart_trim_default_worker_type: str = "vision"
 
+    # AutoFlow AI assistance. Disabled by default so tests and constrained
+    # workers remain deterministic unless explicitly opted in.
+    autoflow_ai_enabled: bool = False
+    autoflow_llm_gateway_url: str = "http://127.0.0.1:8000"
+    autoflow_llm_source: str = "videoprocess"
+    autoflow_llm_profile: str = "generic_chat"
+    autoflow_embedding_url: str = ""
+    autoflow_qdrant_url: str = "http://127.0.0.1:6333"
+    autoflow_ai_timeout_seconds: float = 8.0
+
     video_schedule_default_state: str = "OPEN"
 
     # Video worker features

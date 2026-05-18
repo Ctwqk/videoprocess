@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Protocol
+
+import httpx
 
 from app.autoflow.platform_profiles import PlatformProfileService
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent, AutoFlowMetadata
@@ -122,6 +125,59 @@ class MetadataGenerator:
         return payload
 
 
+class LLMGatewayMetadataClient:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        timeout_seconds: float,
+        source: str = "videoprocess",
+        profile: str = "generic_chat",
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.source = source
+        self.profile = profile
+
+    def generate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request_payload = {
+            "model": "auto",
+            "temperature": 0.3,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate VideoProcess AutoFlow metadata as strict JSON. "
+                        "Only use facts supplied in the user message. Do not invent visual events."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": _json_dumps(
+                        {
+                            "source": self.source,
+                            "profile": self.profile,
+                            "input": payload,
+                            "required_shape": {
+                                "titles": ["string"],
+                                "thumbnail_texts": ["string"],
+                                "tags": ["string"],
+                                "rationale": "string",
+                            },
+                        }
+                    ),
+                },
+            ],
+        }
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            response = client.post(f"{self.base_url}/v1/chat/completions", json=request_payload)
+        response.raise_for_status()
+        data = response.json()
+        content = str(data["choices"][0]["message"]["content"])
+        return _json_object_from_text(content)
+
+
 def _clip_fact(candidate: AutoFlowClipCandidate) -> dict[str, Any]:
     metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
     visual = metadata.get("visual") if isinstance(metadata.get("visual"), dict) else {}
@@ -137,6 +193,25 @@ def _clip_fact(candidate: AutoFlowClipCandidate) -> dict[str, Any]:
         "duration": _duration(candidate),
         "source_platform": str(metadata.get("source_platform") or metadata.get("platform") or candidate.source_type),
     }
+
+
+def _json_dumps(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _json_object_from_text(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
+        cleaned = re.sub(r"```$", "", cleaned).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("LLM response did not contain a JSON object")
+    payload = json.loads(cleaned[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("LLM response was not a JSON object")
+    return payload
 
 
 def _fallback_metadata(
