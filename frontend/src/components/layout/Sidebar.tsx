@@ -4,6 +4,7 @@ import { usePlatformAuth } from '../../hooks/usePlatformAuth';
 
 const links = [
   { to: '/autoflow', label: 'AutoFlow', icon: '⚙' },
+  { to: '/channel-ops', label: 'ChannelOps', icon: '◎' },
   { to: '/editor', label: 'Editor', icon: '⬡' },
   { to: '/jobs', label: 'Jobs', icon: '▶' },
   { to: '/assets', label: 'Assets', icon: '📁' },

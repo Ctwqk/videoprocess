@@ -5,6 +5,7 @@ import JobsPage from './pages/JobsPage';
 import JobDetailPage from './pages/JobDetailPage';
 import AssetsPage from './pages/AssetsPage';
 import AutoFlowPage from './pages/AutoFlowPage';
+import ChannelOpsStatusPage from './pages/ChannelOpsStatusPage';
 import TemplatesPage from './pages/TemplatesPage';
 
 function App() {
@@ -14,6 +15,7 @@ function App() {
         <Route element={<AppShell />}>
           <Route path="/" element={<Navigate to="/editor" replace />} />
           <Route path="/autoflow" element={<AutoFlowPage />} />
+          <Route path="/channel-ops" element={<ChannelOpsStatusPage />} />
           <Route path="/editor" element={<EditorPage />} />
           <Route path="/editor/:pipelineId" element={<EditorPage />} />
           <Route path="/jobs" element={<JobsPage />} />
