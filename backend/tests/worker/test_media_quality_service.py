@@ -135,3 +135,30 @@ async def test_qa_export_keeps_original_when_repair_fails(tmp_path: Path):
     )
     assert result.repaired_path is None
     assert "repair_failed" in result.report["warnings"]
+
+
+async def test_qa_export_omits_non_finite_loudnorm_values_from_report(tmp_path: Path):
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "output.mp4"
+    source.write_bytes(b"source")
+    output.write_bytes(b"output")
+    result = await FakeQualityService(
+        vmaf_score=None,
+        audio_stats={
+            "input_i": "-inf",
+            "input_tp": "-inf",
+            "input_lra": "0.00",
+            "input_thresh": "-70.00",
+            "target_offset": "inf",
+        },
+    ).qa_export(
+        source_path=str(source),
+        output_path=str(output),
+        node_config={},
+    )
+
+    assert result.report["audio_lufs"] is None
+    assert result.report["audio_true_peak"] is None
+    assert result.report["audio_lra"] is None
+    assert "loudnorm_non_finite" in result.report["warnings"]
+    json.dumps(result.report, allow_nan=False)

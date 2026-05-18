@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import tempfile
 from dataclasses import dataclass
@@ -115,10 +116,13 @@ class MediaQualityService:
         except Exception:
             loudnorm_stats = None
             report["warnings"].append("loudnorm_measure_failed")
-        if loudnorm_stats:
+        if loudnorm_stats and _loudnorm_stats_are_finite(loudnorm_stats):
             report["audio_lufs"] = _float_param(loudnorm_stats.get("input_i"), 0.0)
             report["audio_true_peak"] = _float_param(loudnorm_stats.get("input_tp"), 0.0)
             report["audio_lra"] = _float_param(loudnorm_stats.get("input_lra"), 0.0)
+        elif loudnorm_stats:
+            loudnorm_stats = None
+            report["warnings"].append("loudnorm_non_finite")
 
         needs_repair = _needs_repair(report, config)
         if not needs_repair or config.gate_mode != "soft_repair_once":
@@ -231,9 +235,22 @@ def _float_param(value: Any, default: float) -> float:
     if value in (None, ""):
         return default
     try:
-        return float(value)
+        numeric = float(value)
     except (TypeError, ValueError):
         return default
+    return numeric if math.isfinite(numeric) else default
+
+
+def _loudnorm_stats_are_finite(stats: dict[str, str]) -> bool:
+    required = ("input_i", "input_tp", "input_lra", "input_thresh", "target_offset")
+    for key in required:
+        try:
+            value = float(stats[key])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not math.isfinite(value):
+            return False
+    return True
 
 
 def _format_number(value: float) -> str:
@@ -249,6 +266,7 @@ def _base_report(config: QualityQAConfig) -> dict[str, Any]:
         "vmaf_score": None,
         "audio_lufs": None,
         "audio_true_peak": None,
+        "audio_lra": None,
         "thresholds": {
             "vmaf_min_score": config.vmaf_min_score,
             "loudnorm_target_i": config.loudnorm_target_i,
