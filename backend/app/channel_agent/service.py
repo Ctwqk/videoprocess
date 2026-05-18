@@ -149,6 +149,7 @@ class ChannelAgentService:
                 idempotency_key=f"plan_task:{task.id}",
                 payload={"production_task_id": str(task.id)},
                 priority=50,
+                channel_profile_id=channel.id,
             )
             selected += 1
 
@@ -183,6 +184,7 @@ class ChannelAgentService:
             idempotency_key=f"execute_task:{task.id}",
             payload={"production_task_id": str(task.id)},
             priority=60,
+            channel_profile_id=task.channel_profile_id,
             parent_queue_item_id=item.id,
         )
         await db.commit()
@@ -207,6 +209,7 @@ class ChannelAgentService:
                 severity="warning",
                 message="YouTube quota remaining below 20%",
                 details={"remaining_fraction": remaining},
+                channel_profile_id=task.channel_profile_id,
             )
             await db.commit()
             return None
@@ -265,6 +268,7 @@ class ChannelAgentService:
                 "target_visibility": publication.desired_privacy,
             },
             priority=70,
+            channel_profile_id=task.channel_profile_id,
             parent_queue_item_id=item.id,
         )
         await db.commit()
@@ -306,6 +310,7 @@ class ChannelAgentService:
                 severity="warning",
                 message="YouTube OAuth token refresh failed",
                 details={"account_label": account.account_label},
+                channel_profile_id=account.channel_profile_id,
             )
         await db.commit()
         await db.refresh(account)
@@ -331,6 +336,10 @@ class ChannelAgentService:
         )
         db.add(event)
         account = await db.get(PublishingAccount, publication.account_id)
+        task = await db.get(ProductionTask, publication.production_task_id)
+        channel_profile_id = task.channel_profile_id if task is not None else None
+        if channel_profile_id is None and account is not None:
+            channel_profile_id = account.channel_profile_id
         actions: list[str] = []
         if account is not None and severity == "severe":
             account.enabled = False
@@ -343,6 +352,7 @@ class ChannelAgentService:
             severity=severity,
             message=f"YouTube takedown event logged: {event_type}",
             details={"event_type": event_type, "publication_id": str(publication.id)},
+            channel_profile_id=channel_profile_id,
         )
         await db.commit()
         await db.refresh(event)
@@ -378,6 +388,7 @@ class ChannelAgentService:
                     severity="warning",
                     message="Lane material supply below candidate threshold for three ticks",
                     details={"channel_id": str(channel.id), "eligible_count": count},
+                    channel_profile_id=channel.id,
                 )
                 triggered.append({"guard": "material_supply_low", "lane_id": lane_id})
         return triggered
@@ -391,6 +402,7 @@ class ChannelAgentService:
         severity: str,
         message: str,
         details: dict[str, Any] | None = None,
+        channel_profile_id=None,
     ) -> ChannelOpsQueueItem:
         payload = build_alert_payload(
             alert_type,
@@ -406,6 +418,7 @@ class ChannelAgentService:
             idempotency_key=str(payload["dedupe_key"]),
             payload=payload,
             priority=5,
+            channel_profile_id=channel_profile_id,
         )
 
     async def _resolve_account(

@@ -144,6 +144,7 @@ async def test_active_tick_creates_task_and_plan_queue_item(service_session):
         )
     ).scalar_one()
     assert queue_item.idempotency_key == f"plan_task:{task.id}"
+    assert queue_item.channel_profile_id == channel.id
 
 
 @pytest.mark.asyncio
@@ -174,6 +175,39 @@ async def test_plan_task_holds_when_autoflow_omits_youtube_upload(service_sessio
 
     assert task.state == "held"
     assert task.blocked_by_guard == "missing_youtube_upload_node"
+
+
+@pytest.mark.asyncio
+async def test_plan_task_enqueues_execute_with_channel_scope(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        title_seed="test",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.commit()
+
+    item = ChannelOpsQueueItem(
+        kind="plan_task",
+        idempotency_key=f"plan_task:{task.id}",
+        payload_json={"production_task_id": str(task.id)},
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    await _service().handle_plan_task(service_session, item)
+
+    execute = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "execute_task")
+        )
+    ).scalar_one()
+    assert execute.channel_profile_id == channel.id
 
 
 @pytest.mark.asyncio
@@ -210,6 +244,7 @@ async def test_publish_task_observes_upload_and_auto_enqueues_promote(service_se
         )
     ).scalar_one()
     assert str(publication.id) in promote.idempotency_key
+    assert promote.channel_profile_id == channel.id
 
 
 @pytest.mark.asyncio
@@ -289,6 +324,7 @@ async def test_quota_exhaustion_holds_publish_and_alerts(service_session):
         )
     ).scalar_one()
     assert alert.payload_json["type"] == "quota_below_20pct"
+    assert alert.channel_profile_id == channel.id
 
 
 @pytest.mark.asyncio
@@ -313,6 +349,7 @@ async def test_token_refresh_failure_pauses_account_and_alerts(service_session):
         )
     ).scalar_one()
     assert alert.payload_json["type"] == "token_expiring_24h"
+    assert alert.channel_profile_id == channel.id
 
 
 @pytest.mark.asyncio
@@ -359,3 +396,4 @@ async def test_severe_takedown_pauses_account_and_alerts(service_session):
         )
     ).scalar_one()
     assert alert.payload_json["type"] == "takedown_event_logged"
+    assert alert.channel_profile_id == channel.id

@@ -111,7 +111,9 @@ async def test_channel_agent_api_config_seed_enqueue_and_status(api_session):
 
         tick_response = await client.post(f"/api/v1/channel-agent/channels/{channel['id']}/enqueue-tick")
         assert tick_response.status_code == 200
-        assert tick_response.json()["kind"] == "agent_tick"
+        tick_item = tick_response.json()
+        assert tick_item["kind"] == "agent_tick"
+        assert tick_item["channel_profile_id"] == channel["id"]
 
         dry_run_response = await client.patch(
             f"/api/v1/channel-agent/channels/{channel['id']}/dry-run",
@@ -139,7 +141,9 @@ async def test_channel_agent_api_config_seed_enqueue_and_status(api_session):
 
         queue_response = await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/queue")
         assert queue_response.status_code == 200
-        assert len(queue_response.json()) == 1
+        queue_items = queue_response.json()
+        assert len(queue_items) == 1
+        assert queue_items[0]["channel_profile_id"] == channel["id"]
 
         tasks_response = await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/tasks")
         assert tasks_response.status_code == 200

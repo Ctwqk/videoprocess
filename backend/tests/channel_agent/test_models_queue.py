@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.channel_agent.alerts import AlertService, build_alert_payload
@@ -196,13 +195,18 @@ async def test_lane_format_source_platforms_and_queue_channel_scope(channel_agen
     channel_agent_session.add(lane)
     await channel_agent_session.flush()
 
+    default_lane_format = LaneFormatMatrix(
+        topic_lane_id=lane.id,
+        format_key="default_shorts",
+    )
     lane_format = LaneFormatMatrix(
         topic_lane_id=lane.id,
         format_key="shorts_9x16",
         source_platforms_json=["bilibili", "youtube"],
     )
-    channel_agent_session.add(lane_format)
+    channel_agent_session.add_all([default_lane_format, lane_format])
     await channel_agent_session.commit()
+    await channel_agent_session.refresh(default_lane_format)
     await channel_agent_session.refresh(lane_format)
 
     queue = ChannelOpsQueueService()
@@ -215,6 +219,7 @@ async def test_lane_format_source_platforms_and_queue_channel_scope(channel_agen
     )
     await channel_agent_session.refresh(item)
 
+    assert default_lane_format.source_platforms_json == []
     assert lane_format.source_platforms_json == ["bilibili", "youtube"]
     assert item.channel_profile_id == channel.id
 
@@ -244,20 +249,28 @@ async def test_enqueue_recovers_from_idempotency_integrity_race(channel_agent_se
     await channel_agent_session.commit()
     await channel_agent_session.refresh(existing)
 
+    existing_id = existing.id
     queue = ChannelOpsQueueService()
     lookups = 0
+    rollbacks = 0
+    original_get_by_key = queue.get_by_key
+    original_rollback = channel_agent_session.rollback
 
-    async def fake_get_by_key(db, idempotency_key):
+    async def first_lookup_misses(db, idempotency_key):
         nonlocal lookups
         lookups += 1
         assert idempotency_key == "agent_tick:race:2026-05-18-08"
-        return None if lookups == 1 else existing
+        if lookups == 1:
+            return None
+        return await original_get_by_key(db, idempotency_key)
 
-    async def fake_commit():
-        raise IntegrityError("insert channel_ops_queue_items", {}, Exception("duplicate idempotency key"))
+    async def counting_rollback():
+        nonlocal rollbacks
+        rollbacks += 1
+        await original_rollback()
 
-    monkeypatch.setattr(queue, "get_by_key", fake_get_by_key)
-    monkeypatch.setattr(channel_agent_session, "commit", fake_commit)
+    monkeypatch.setattr(queue, "get_by_key", first_lookup_misses)
+    monkeypatch.setattr(channel_agent_session, "rollback", counting_rollback)
 
     item = await queue.enqueue(
         channel_agent_session,
@@ -267,9 +280,19 @@ async def test_enqueue_recovers_from_idempotency_integrity_race(channel_agent_se
         priority=20,
     )
 
-    assert item.id == existing.id
+    assert item.id == existing_id
     assert item.payload_json == {"channel_id": "race"}
     assert lookups == 2
+    assert rollbacks == 1
+
+    rows = (
+        await channel_agent_session.execute(
+            select(ChannelOpsQueueItem).where(
+                ChannelOpsQueueItem.idempotency_key == "agent_tick:race:2026-05-18-08"
+            )
+        )
+    ).scalars().all()
+    assert [row.id for row in rows] == [existing_id]
 
 
 @pytest.mark.asyncio
@@ -283,21 +306,20 @@ async def test_queue_retry_uses_exponential_backoff(channel_agent_session):
         idempotency_key="agent_tick:retry:2026-05-18-08",
         payload={"channel_id": "retry"},
         priority=20,
-        max_attempts=3,
+        max_attempts=6,
     )
 
-    first_claim = await queue.claim_next(channel_agent_session, worker_id="worker-1")
-    assert first_claim is not None
-    await queue.mark_failed_or_retry(channel_agent_session, first_claim, "first failure")
-    await channel_agent_session.refresh(first_claim)
-    assert _sqlite_utc(first_claim.run_after) == datetime(2026, 5, 18, 8, 5, tzinfo=timezone.utc)
+    for attempt, delay_minutes in enumerate([5, 10, 20, 30], start=1):
+        claim = await queue.claim_next(channel_agent_session, worker_id="worker-1")
+        assert claim is not None
+        assert claim.attempt_count == attempt
+        failed_at = clock.now()
 
-    clock.advance(timedelta(minutes=5))
-    second_claim = await queue.claim_next(channel_agent_session, worker_id="worker-1")
-    assert second_claim is not None
-    await queue.mark_failed_or_retry(channel_agent_session, second_claim, "second failure")
-    await channel_agent_session.refresh(second_claim)
-    assert _sqlite_utc(second_claim.run_after) == datetime(2026, 5, 18, 8, 15, tzinfo=timezone.utc)
+        await queue.mark_failed_or_retry(channel_agent_session, claim, f"failure {attempt}")
+        await channel_agent_session.refresh(claim)
+
+        assert _sqlite_utc(claim.run_after) == failed_at + timedelta(minutes=delay_minutes)
+        clock.advance(timedelta(minutes=delay_minutes))
 
 
 def test_utc_hour_bucket_and_alert_payloads_are_stable():

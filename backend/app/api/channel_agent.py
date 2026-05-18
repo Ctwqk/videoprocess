@@ -203,6 +203,7 @@ async def enqueue_tick(channel_id: str, db: AsyncSession = Depends(get_db)):
         idempotency_key=f"agent_tick:{channel_id}:{utc_hour_bucket(now)}",
         payload={"channel_id": channel_id},
         priority=20,
+        channel_profile_id=_uuid(channel_id),
     )
     return _queue(item)
 
@@ -441,6 +442,7 @@ def _queue(row: ChannelOpsQueueItem) -> QueueItemRead:
         id=str(row.id),
         kind=row.kind,
         idempotency_key=row.idempotency_key,
+        channel_profile_id=str(row.channel_profile_id) if row.channel_profile_id else None,
         priority=row.priority,
         status=row.status,
         payload_json=dict(row.payload_json or {}),
@@ -474,4 +476,3 @@ def _publication(row: PublicationRecord) -> dict[str, Any]:
         "publish_status": row.publish_status,
         "warnings_json": row.warnings_json,
     }
-
