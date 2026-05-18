@@ -9,15 +9,17 @@ from app.schemas.autoflow import (
     VideoGenerationHints,
     VisualStyleSpec,
 )
+from app.autoflow.platform_profiles import PlatformProfile, PlatformProfileService
 
 
 class StoryboardGenerator:
     def generate(self, request: AutoFlowStoryboardRequest) -> AutoFlowStoryboardResponse:
         strategy = _storyboard_strategy(request)
+        platform_profile = PlatformProfileService().for_platforms(request.target_platforms)
         subject = _subject(request.prompt)
         base_shots = _shot_templates(subject, request.allow_video_generation or strategy == "generate_missing")
         shot_count = max(request.min_shots, min(request.max_shots, len(base_shots)))
-        shots = _fit_durations(base_shots[:shot_count], request.target_duration)
+        shots, pacing_warnings = _fit_durations(base_shots[:shot_count], request.target_duration, platform_profile)
         storyboard = StoryboardPlan(
             subject=subject,
             title=_title(subject),
@@ -33,6 +35,8 @@ class StoryboardGenerator:
             description=f"围绕{subject}组织的短视频分镜计划，优先使用确定性素材检索和剪辑节点生成工作流。",
             tags=[subject, "短视频", "AutoFlow"],
             hashtags=[f"#{subject}", "#短视频"],
+            warnings=pacing_warnings,
+            extra={"platform_profile": platform_profile.to_dict()},
         )
         return AutoFlowStoryboardResponse(storyboard=storyboard)
 
@@ -218,17 +222,128 @@ def _shot(
     )
 
 
-def _fit_durations(shots: list[ShotSpec], target_duration: float) -> list[ShotSpec]:
+def _fit_durations(
+    shots: list[ShotSpec],
+    target_duration: float,
+    profile: PlatformProfile,
+) -> tuple[list[ShotSpec], list[str]]:
     if not shots:
-        return []
+        return [], []
     total = float(target_duration or len(shots) * 4)
-    base = round(total / len(shots), 3)
-    durations = [base for _shot_item in shots]
-    durations[-1] = round(total - sum(durations[:-1]), 3)
-    return [
-        shot.model_copy(update={"target_duration": durations[index], "max_duration": max(8.0, durations[index])})
+    count = len(shots)
+    min_total = profile.min_shot_seconds * count
+    max_total = profile.max_shot_seconds * count
+    relaxed = total < min_total or total > max_total
+
+    if count == 1:
+        durations = [total]
+    else:
+        hook = _clamp(total, profile.min_shot_seconds, profile.max_shot_seconds)
+        hook = min(hook, profile.hook_seconds)
+        hook = _clamp(hook, profile.min_shot_seconds, profile.max_shot_seconds)
+        remaining = max(0.0, total - hook)
+        weights = _pacing_weights(count - 1, profile.pacing_curve)
+        weight_sum = sum(weights) or 1.0
+        durations = [hook, *[remaining * weight / weight_sum for weight in weights]]
+
+    if relaxed:
+        durations = _redistribute_relaxed(durations, total)
+    else:
+        durations = [_clamp_duration(duration, profile) for duration in durations]
+        durations = _redistribute_to_total(durations, total, profile, protected_indices={0})
+
+    rounded = [round(duration, 3) for duration in durations]
+    if rounded:
+        rounded[-1] = round(total - sum(rounded[:-1]), 3)
+    updated = [
+        shot.model_copy(
+            update={
+                "target_duration": rounded[index],
+                "min_duration": profile.min_shot_seconds,
+                "max_duration": max(profile.max_shot_seconds, rounded[index]),
+            }
+        )
         for index, shot in enumerate(shots)
     ]
+    return updated, (["platform_pacing_relaxed"] if relaxed else [])
+
+
+def _pacing_weights(count: int, pacing_curve: str) -> list[float]:
+    if count <= 0:
+        return []
+    if pacing_curve == "front_loaded":
+        return [1.0 + (count - index - 1) * 0.25 for index in range(count)]
+    if pacing_curve == "long_form":
+        return [0.85 + index * 0.15 for index in range(count)]
+    return [1.0 for _index in range(count)]
+
+
+def _redistribute_to_total(
+    durations: list[float],
+    total: float,
+    profile: PlatformProfile,
+    *,
+    protected_indices: set[int] | None = None,
+) -> list[float]:
+    adjusted = list(durations)
+    protected = protected_indices or set()
+    for _iteration in range(len(adjusted) * 4):
+        diff = total - sum(adjusted)
+        if abs(diff) < 0.0005:
+            break
+        if diff > 0:
+            candidates = [
+                index
+                for index, duration in enumerate(adjusted)
+                if index not in protected and duration < profile.max_shot_seconds - 0.0005
+            ]
+            if not candidates:
+                candidates = [
+                    index
+                    for index, duration in enumerate(adjusted)
+                    if duration < profile.max_shot_seconds - 0.0005
+                ]
+            if not candidates:
+                break
+            increment = diff / len(candidates)
+            for index in candidates:
+                adjusted[index] = min(profile.max_shot_seconds, adjusted[index] + increment)
+        else:
+            candidates = [
+                index
+                for index, duration in enumerate(adjusted)
+                if index not in protected and duration > profile.min_shot_seconds + 0.0005
+            ]
+            if not candidates:
+                candidates = [
+                    index
+                    for index, duration in enumerate(adjusted)
+                    if duration > profile.min_shot_seconds + 0.0005
+                ]
+            if not candidates:
+                break
+            decrement = abs(diff) / len(candidates)
+            for index in candidates:
+                adjusted[index] = max(profile.min_shot_seconds, adjusted[index] - decrement)
+    return adjusted
+
+
+def _redistribute_relaxed(durations: list[float], total: float) -> list[float]:
+    if not durations:
+        return []
+    current = sum(durations)
+    if current <= 0:
+        return [total / len(durations) for _duration in durations]
+    scale = total / current
+    return [duration * scale for duration in durations]
+
+
+def _clamp_duration(duration: float, profile: PlatformProfile) -> float:
+    return _clamp(duration, profile.min_shot_seconds, profile.max_shot_seconds)
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
 
 
 def _title(subject: str) -> str:

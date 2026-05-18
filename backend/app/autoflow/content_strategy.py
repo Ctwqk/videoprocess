@@ -3,6 +3,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from app.autoflow.platform_profiles import PlatformProfileService
+
 
 class ContentStrategyService:
     def generate_ideas(
@@ -15,16 +17,33 @@ class ContentStrategyService:
         count = int(request.get("count") or 10)
         target_platforms = list(request.get("target_platforms") or [])
         source_policy = str(request.get("source_policy") or "owned_only")
+        platform_profile = PlatformProfileService().for_platforms(target_platforms).to_dict()
 
         if trend_suggestions:
             ideas = [
-                self._idea_from_trend(suggestion, target_platforms, source_policy, template_performance)
+                self._idea_from_trend(
+                    suggestion,
+                    target_platforms,
+                    source_policy,
+                    template_performance,
+                    platform_profile,
+                )
                 for suggestion in trend_suggestions
             ]
         else:
-            ideas = [self._fallback_idea(item, target_platforms, source_policy) for item in template_performance]
+            ideas = [
+                self._fallback_idea(item, target_platforms, source_policy, platform_profile)
+                for item in template_performance
+            ]
             if not ideas:
-                ideas = [self._fallback_idea({"template_id": "material_library_remix"}, target_platforms, source_policy)]
+                ideas = [
+                    self._fallback_idea(
+                        {"template_id": "material_library_remix"},
+                        target_platforms,
+                        source_policy,
+                        platform_profile,
+                    )
+                ]
 
         return sorted(ideas, key=lambda item: item["opportunity_score"], reverse=True)[:count]
 
@@ -34,6 +53,7 @@ class ContentStrategyService:
         target_platforms: list[str],
         source_policy: str,
         template_performance: list[dict[str, Any]],
+        platform_profile: dict[str, object],
     ) -> dict[str, Any]:
         template_id = str(suggestion.get("recommended_template") or "material_library_remix")
         performance_boost = 0.05 * _template_virality(template_id, template_performance)
@@ -48,6 +68,7 @@ class ContentStrategyService:
             "risk": _risk_label(source_policy, rights_risk),
             "target_platforms": target_platforms,
             "source_policy": source_policy,
+            "platform_profile": platform_profile,
         }
 
     def _fallback_idea(
@@ -55,6 +76,7 @@ class ContentStrategyService:
         template_performance: dict[str, Any],
         target_platforms: list[str],
         source_policy: str,
+        platform_profile: dict[str, object],
     ) -> dict[str, Any]:
         template_id = str(template_performance.get("template_id") or "material_library_remix")
         virality = float(template_performance.get("avg_virality_score") or 0.45)
@@ -67,6 +89,7 @@ class ContentStrategyService:
             "risk": _risk_label(source_policy, 0.05),
             "target_platforms": target_platforms,
             "source_policy": source_policy,
+            "platform_profile": platform_profile,
         }
 
 

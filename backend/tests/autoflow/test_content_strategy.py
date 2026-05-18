@@ -47,6 +47,8 @@ def test_content_strategy_generates_ranked_ideas_from_trends_and_template_perfor
     assert idea["estimated_material_count"] == 18
     assert idea["risk"] == "low"
     assert idea["target_platforms"] == ["youtube_shorts"]
+    assert idea["platform_profile"]["platform_key"] == "youtube_shorts"
+    assert idea["platform_profile"]["max_shot_seconds"] == 2.0
 
 
 def test_content_strategy_falls_back_to_template_recommendations_without_trends():

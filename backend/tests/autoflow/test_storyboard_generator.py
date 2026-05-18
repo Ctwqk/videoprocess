@@ -46,3 +46,24 @@ def test_rule_based_storyboard_marks_generation_enabled_when_allowed():
     assert storyboard.allow_video_generation is True
     assert all(shot.generation.enabled is True for shot in storyboard.shots)
     assert all(shot.match_status == "pending" for shot in storyboard.shots)
+
+
+def test_storyboard_fit_uses_short_video_hook_and_clamps():
+    request = AutoFlowStoryboardRequest(
+        prompt="我要一个 8 秒小猫视频，竖屏，可爱快节奏。",
+        target_duration=8,
+        aspect_ratio="9:16",
+        target_platforms=["douyin"],
+        source_strategy="input_video",
+        allow_video_generation=False,
+        min_shots=5,
+        max_shots=5,
+    )
+
+    storyboard = StoryboardGenerator().generate(request).storyboard
+    durations = [shot.target_duration for shot in storyboard.shots]
+
+    assert sum(durations) == 8
+    assert durations[0] == 1.0
+    assert all(0.5 <= duration <= 2.0 for duration in durations)
+    assert storyboard.extra["platform_profile"]["platform_key"] == "douyin"
