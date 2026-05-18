@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 from app.api.artifacts import router as artifacts_router
 from app.api.assets import router as assets_router
 from app.api.autoflow import router as autoflow_router
+from app.api.channel_agent import router as channel_agent_router
 from app.api.internal_schedule import router as internal_schedule_router
 from app.api.jobs import router as jobs_router
 from app.api.llm import router as llm_router
@@ -139,6 +140,7 @@ def create_app() -> FastAPI:
 
     app.include_router(node_types_router)
     app.include_router(autoflow_router)
+    app.include_router(channel_agent_router)
     app.include_router(pipelines_router)
     app.include_router(assets_router)
     app.include_router(artifacts_router)

@@ -1,0 +1,477 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.channel_agent.clock import Clock
+from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
+from app.db import get_db
+from app.models.channel_agent import (
+    ChannelOpsQueueItem,
+    ChannelProfile,
+    LaneFormatMatrix,
+    ManualSeed,
+    ProductionTask,
+    PublicationRecord,
+    PublishingAccount,
+    TopicLane,
+)
+from app.schemas.channel_agent import (
+    ChannelProfileCreate,
+    HealthSummary,
+    LaneFormatCreate,
+    ManualSeedCreate,
+    PublishingAccountCreate,
+    QueueItemRead,
+    TopicLaneCreate,
+)
+
+
+router = APIRouter(prefix="/api/v1/channel-agent", tags=["channel-agent"])
+
+
+class DryRunPatch(BaseModel):
+    dry_run: bool
+
+
+class HaltRequest(BaseModel):
+    reason: str
+
+
+@router.post("/channels")
+async def create_channel(data: ChannelProfileCreate, db: AsyncSession = Depends(get_db)):
+    row = ChannelProfile(**data.model_dump())
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return _channel(row)
+
+
+@router.get("/channels")
+async def list_channels(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(ChannelProfile).order_by(ChannelProfile.created_at.desc()))
+    return [_channel(row) for row in result.scalars().all()]
+
+
+@router.get("/channels/{channel_id}")
+async def get_channel(channel_id: str, db: AsyncSession = Depends(get_db)):
+    channel = await db.get(ChannelProfile, _uuid(channel_id))
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    return _channel(channel)
+
+
+@router.patch("/channels/{channel_id}")
+async def patch_channel(channel_id: str, data: dict[str, Any], db: AsyncSession = Depends(get_db)):
+    channel = await db.get(ChannelProfile, _uuid(channel_id))
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    for field in (
+        "name",
+        "positioning",
+        "language",
+        "default_aspect_ratio",
+        "risk_policy_json",
+        "content_mix_policy_json",
+        "cadence_policy_json",
+        "alert_policy_json",
+        "enabled",
+    ):
+        if field in data:
+            setattr(channel, field, data[field])
+    channel.config_version += 1
+    await db.commit()
+    await db.refresh(channel)
+    return _channel(channel)
+
+
+@router.post("/channels/{channel_id}/lanes")
+async def create_lane(channel_id: str, data: TopicLaneCreate, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    row = TopicLane(channel_profile_id=_uuid(channel_id), **data.model_dump())
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return _lane(row)
+
+
+@router.patch("/channels/{channel_id}/lanes/{lane_id}")
+async def patch_lane(channel_id: str, lane_id: str, data: dict[str, Any], db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    lane = await db.get(TopicLane, _uuid(lane_id))
+    if lane is None:
+        raise HTTPException(status_code=404, detail="Lane not found")
+    for field in (
+        "name",
+        "description",
+        "weight",
+        "keywords_json",
+        "negative_keywords_json",
+        "min_posts_per_week",
+        "max_posts_per_day",
+        "enabled",
+        "paused_until",
+    ):
+        if field in data:
+            setattr(lane, field, data[field])
+    await db.commit()
+    await db.refresh(lane)
+    return _lane(lane)
+
+
+@router.post("/channels/{channel_id}/accounts")
+async def create_account(channel_id: str, data: PublishingAccountCreate, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    row = PublishingAccount(channel_profile_id=_uuid(channel_id), **data.model_dump())
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return _account(row)
+
+
+@router.patch("/channels/{channel_id}/accounts/{account_id}")
+async def patch_account(channel_id: str, account_id: str, data: dict[str, Any], db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    account = await db.get(PublishingAccount, _uuid(account_id))
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    for field in (
+        "account_label",
+        "platform_account_id",
+        "credential_ref",
+        "platform_specific_config_json",
+        "default_privacy",
+        "external_asset_auto_publish",
+        "enabled",
+        "paused_until",
+    ):
+        if field in data:
+            setattr(account, field, data[field])
+    await db.commit()
+    await db.refresh(account)
+    return _account(account)
+
+
+@router.post("/lanes/{lane_id}/formats")
+async def create_lane_format(lane_id: str, data: LaneFormatCreate, db: AsyncSession = Depends(get_db)):
+    lane = await db.get(TopicLane, _uuid(lane_id))
+    if lane is None:
+        raise HTTPException(status_code=404, detail="Lane not found")
+    row = LaneFormatMatrix(topic_lane_id=lane.id, **data.model_dump())
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return _lane_format(row)
+
+
+@router.patch("/lane-formats/{lane_format_id}")
+async def patch_lane_format(lane_format_id: str, data: dict[str, Any], db: AsyncSession = Depends(get_db)):
+    row = await db.get(LaneFormatMatrix, _uuid(lane_format_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Lane format not found")
+    for field in ("format_key", "enabled", "weight", "target_duration_sec", "template_pool_json", "default_publish_visibility"):
+        if field in data:
+            setattr(row, field, data[field])
+    await db.commit()
+    await db.refresh(row)
+    return _lane_format(row)
+
+
+@router.post("/channels/{channel_id}/manual-seeds")
+async def create_manual_seed(channel_id: str, data: ManualSeedCreate, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    row = ManualSeed(channel_profile_id=_uuid(channel_id), **_seed_payload(data))
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return _seed(row)
+
+
+@router.post("/channels/{channel_id}/enqueue-tick", response_model=QueueItemRead)
+async def enqueue_tick(channel_id: str, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    now = Clock().now()
+    item = await ChannelOpsQueueService().enqueue(
+        db,
+        kind="agent_tick",
+        idempotency_key=f"agent_tick:{channel_id}:{utc_hour_bucket(now)}",
+        payload={"channel_id": channel_id},
+        priority=20,
+    )
+    return _queue(item)
+
+
+@router.patch("/channels/{channel_id}/dry-run")
+async def patch_dry_run(channel_id: str, data: DryRunPatch, db: AsyncSession = Depends(get_db)):
+    channel = await _require_channel(db, channel_id)
+    channel.dry_run = data.dry_run
+    channel.config_version += 1
+    await db.commit()
+    await db.refresh(channel)
+    return _channel(channel)
+
+
+@router.post("/channels/{channel_id}/halt")
+async def halt_channel(channel_id: str, data: HaltRequest, db: AsyncSession = Depends(get_db)):
+    channel = await _require_channel(db, channel_id)
+    channel.halted_at = datetime.now(timezone.utc)
+    channel.halt_reason = data.reason
+    await db.commit()
+    await db.refresh(channel)
+    return _channel(channel)
+
+
+@router.post("/channels/{channel_id}/resume")
+async def resume_channel(channel_id: str, db: AsyncSession = Depends(get_db)):
+    channel = await _require_channel(db, channel_id)
+    channel.halted_at = None
+    channel.halt_reason = None
+    await db.commit()
+    await db.refresh(channel)
+    return _channel(channel)
+
+
+@router.get("/channels/{channel_id}/health", response_model=HealthSummary)
+async def channel_health(channel_id: str, db: AsyncSession = Depends(get_db)):
+    channel = await _require_channel(db, channel_id)
+    queued = (await db.execute(select(ChannelOpsQueueItem))).scalars().all()
+    tasks = (
+        await db.execute(select(ProductionTask).where(ProductionTask.channel_profile_id == channel.id))
+    ).scalars().all()
+    return HealthSummary(
+        channel_id=str(channel.id),
+        dry_run=channel.dry_run,
+        halted=channel.halted_at is not None,
+        active_tasks=sum(1 for task in tasks if task.state not in {"failed", "cancelled", "rejected", "measured"}),
+        queued_items=sum(1 for item in queued if item.status == "queued"),
+        recent_failures=sum(1 for item in queued if item.status in {"failed", "dead_lettered"}),
+        warnings=[],
+    )
+
+
+@router.get("/channels/{channel_id}/queue")
+async def channel_queue(channel_id: str, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    result = await db.execute(select(ChannelOpsQueueItem).order_by(ChannelOpsQueueItem.created_at.desc()))
+    return [_queue(row).model_dump(mode="json") for row in result.scalars().all()]
+
+
+@router.get("/channels/{channel_id}/tasks")
+async def channel_tasks(channel_id: str, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    result = await db.execute(select(ProductionTask).where(ProductionTask.channel_profile_id == _uuid(channel_id)))
+    return [_task(row) for row in result.scalars().all()]
+
+
+@router.get("/tasks/{task_id}")
+async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
+    task = await db.get(ProductionTask, _uuid(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return _task(task)
+
+
+@router.get("/channels/{channel_id}/publications")
+async def channel_publications(channel_id: str, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    result = await db.execute(select(PublicationRecord).order_by(PublicationRecord.created_at.desc()))
+    return [_publication(row) for row in result.scalars().all()]
+
+
+@router.get("/publications/{publication_id}")
+async def get_publication(publication_id: str, db: AsyncSession = Depends(get_db)):
+    row = await db.get(PublicationRecord, _uuid(publication_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    return _publication(row)
+
+
+@router.post("/publications/{publication_id}/enqueue-metrics")
+async def enqueue_metrics(publication_id: str, db: AsyncSession = Depends(get_db)):
+    publication = await db.get(PublicationRecord, _uuid(publication_id))
+    if publication is None:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    bucket = utc_hour_bucket(Clock().now())
+    item = await ChannelOpsQueueService().enqueue(
+        db,
+        kind="collect_metrics",
+        idempotency_key=f"collect_metrics:{publication_id}:{bucket}",
+        payload={"publication_id": publication_id},
+        priority=90,
+    )
+    return _queue(item)
+
+
+@router.get("/channels/{channel_id}/metrics/funnel")
+async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    return {
+        "days": days,
+        "seeded": 0,
+        "selected": 0,
+        "planned": 0,
+        "produced": 0,
+        "uploaded": 0,
+        "scheduled": 0,
+        "published": 0,
+        "measured": 0,
+    }
+
+
+@router.get("/channels/{channel_id}/lanes/health")
+async def lanes_health(channel_id: str, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    rows = (
+        await db.execute(select(TopicLane).where(TopicLane.channel_profile_id == _uuid(channel_id)))
+    ).scalars().all()
+    return [{"lane_id": str(row.id), "name": row.name, "enabled": row.enabled, "paused_until": row.paused_until} for row in rows]
+
+
+@router.get("/channels/{channel_id}/accounts/health")
+async def accounts_health(channel_id: str, db: AsyncSession = Depends(get_db)):
+    await _require_channel(db, channel_id)
+    rows = (
+        await db.execute(select(PublishingAccount).where(PublishingAccount.channel_profile_id == _uuid(channel_id)))
+    ).scalars().all()
+    return [_account(row) for row in rows]
+
+
+async def _require_channel(db: AsyncSession, channel_id: str) -> ChannelProfile:
+    channel = await db.get(ChannelProfile, _uuid(channel_id))
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    return channel
+
+
+def _uuid(value: str) -> uuid.UUID:
+    return uuid.UUID(str(value))
+
+
+def _seed_payload(data: ManualSeedCreate) -> dict[str, Any]:
+    payload = data.model_dump()
+    for key in ("topic_lane_id", "target_account_id"):
+        if payload.get(key):
+            payload[key] = _uuid(payload[key])
+    return payload
+
+
+def _channel(row: ChannelProfile) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "positioning": row.positioning,
+        "language": row.language,
+        "default_aspect_ratio": row.default_aspect_ratio,
+        "risk_policy_json": row.risk_policy_json,
+        "content_mix_policy_json": row.content_mix_policy_json,
+        "cadence_policy_json": row.cadence_policy_json,
+        "alert_policy_json": row.alert_policy_json,
+        "enabled": row.enabled,
+        "dry_run": row.dry_run,
+        "halted_at": row.halted_at,
+        "halt_reason": row.halt_reason,
+        "config_version": row.config_version,
+    }
+
+
+def _lane(row: TopicLane) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "channel_profile_id": str(row.channel_profile_id),
+        "name": row.name,
+        "description": row.description,
+        "weight": row.weight,
+        "keywords_json": row.keywords_json,
+        "negative_keywords_json": row.negative_keywords_json,
+        "enabled": row.enabled,
+        "paused_until": row.paused_until,
+    }
+
+
+def _account(row: PublishingAccount) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "channel_profile_id": str(row.channel_profile_id),
+        "platform": row.platform,
+        "account_label": row.account_label,
+        "platform_account_id": row.platform_account_id,
+        "credential_ref": row.credential_ref,
+        "platform_specific_config_json": row.platform_specific_config_json,
+        "default_privacy": row.default_privacy,
+        "external_asset_auto_publish": row.external_asset_auto_publish,
+        "enabled": row.enabled,
+        "paused_until": row.paused_until,
+        "last_token_check_status": row.last_token_check_status,
+    }
+
+
+def _lane_format(row: LaneFormatMatrix) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "topic_lane_id": str(row.topic_lane_id),
+        "format_key": row.format_key,
+        "enabled": row.enabled,
+        "weight": row.weight,
+        "target_duration_sec": row.target_duration_sec,
+        "template_pool_json": row.template_pool_json,
+        "default_publish_visibility": row.default_publish_visibility,
+    }
+
+
+def _seed(row: ManualSeed) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "channel_profile_id": str(row.channel_profile_id),
+        "topic_lane_id": str(row.topic_lane_id) if row.topic_lane_id else None,
+        "target_account_id": str(row.target_account_id) if row.target_account_id else None,
+        "prompt": row.prompt,
+        "title_seed": row.title_seed,
+        "status": row.status,
+    }
+
+
+def _queue(row: ChannelOpsQueueItem) -> QueueItemRead:
+    return QueueItemRead(
+        id=str(row.id),
+        kind=row.kind,
+        idempotency_key=row.idempotency_key,
+        priority=row.priority,
+        status=row.status,
+        payload_json=dict(row.payload_json or {}),
+        attempt_count=row.attempt_count,
+        last_error=row.last_error,
+    )
+
+
+def _task(row: ProductionTask) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "channel_profile_id": str(row.channel_profile_id),
+        "target_account_id": str(row.target_account_id),
+        "state": row.state,
+        "prompt": row.prompt,
+        "title_seed": row.title_seed,
+        "blocked_by_guard": row.blocked_by_guard,
+        "failure_reason": row.failure_reason,
+    }
+
+
+def _publication(row: PublicationRecord) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "production_task_id": str(row.production_task_id),
+        "platform": row.platform,
+        "platform_content_id": row.platform_content_id,
+        "title": row.title,
+        "desired_privacy": row.desired_privacy,
+        "current_privacy": row.current_privacy,
+        "publish_status": row.publish_status,
+        "warnings_json": row.warnings_json,
+    }
+
