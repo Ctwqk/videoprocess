@@ -3,11 +3,13 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
+import httpx
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.channel_agent.alerts import build_alert_payload
+from app.channel_agent.alerts import AlertService, build_alert_payload
+from app.channel_agent.clients import MiniMaxImageClient
 from app.channel_agent.clock import FakeClock
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
 from app.models.channel_agent import (
@@ -187,3 +189,65 @@ def test_utc_hour_bucket_and_alert_payloads_are_stable():
     assert payload["severity"] == "warning"
     assert payload["details"]["hours_remaining"] == 23
     assert payload["dedupe_key"] == "send_alert:token_expiring_24h:account-1:2026-05-18-08"
+
+
+@pytest.mark.asyncio
+async def test_alert_service_posts_slack_webhook_payload():
+    requests: list[dict[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append({"url": str(request.url), "body": request.content.decode("utf-8")})
+        return httpx.Response(200, json={"ok": True})
+
+    service = AlertService(
+        slack_webhook_url="https://hooks.slack.test/channel-ops",
+        transport=httpx.MockTransport(handler),
+    )
+    result = await service.send(
+        {
+            "type": "quota_below_20pct",
+            "resource_id": "account-1",
+            "severity": "warning",
+            "message": "YouTube quota remaining below 20%",
+            "details": {"remaining_fraction": 0.12},
+        }
+    )
+
+    assert result["status"] == "sent"
+    assert result["slack_status_code"] == 200
+    assert requests[0]["url"] == "https://hooks.slack.test/channel-ops"
+    assert "quota_below_20pct" in requests[0]["body"]
+
+
+@pytest.mark.asyncio
+async def test_minimax_image_client_posts_cn_endpoint_and_parses_url():
+    requests: list[dict[str, str]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append({"url": str(request.url), "auth": request.headers["Authorization"], "body": request.content.decode()})
+        return httpx.Response(
+            200,
+            json={
+                "id": "image-task-1",
+                "data": {"image_urls": ["https://cdn.example/thumb.png"]},
+                "base_resp": {"status_code": 0, "status_msg": "success"},
+            },
+        )
+
+    client = MiniMaxImageClient(
+        api_key="test-key",
+        endpoint="https://api.minimaxi.com/v1/image_generation",
+        model="image-01",
+        timeout_seconds=30,
+        retry_count=1,
+        max_qps=0,
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.generate_thumbnail(prompt="make a test short", title="test")
+
+    assert result["image_url"] == "https://cdn.example/thumb.png"
+    assert result["request_id"] == "image-task-1"
+    assert requests[0]["url"] == "https://api.minimaxi.com/v1/image_generation"
+    assert requests[0]["auth"] == "Bearer test-key"
+    assert '"model":"image-01"' in requests[0]["body"]
+    assert '"response_format":"url"' in requests[0]["body"]

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
+
+import httpx
+
+from app.config import settings
 
 
 @dataclass(frozen=True)
@@ -82,3 +87,88 @@ class FakeMiniMaxClient:
             raise RuntimeError("minimax failed")
         return {"storage_path": f"/tmp/{title or 'thumbnail'}.png", "provider": "minimax"}
 
+
+class MiniMaxImageClient:
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        endpoint: str | None = None,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+        retry_count: int | None = None,
+        max_qps: float | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.api_key = settings.minimax_api_key if api_key is None else api_key
+        self.endpoint = settings.minimax_image_generation_url if endpoint is None else endpoint
+        self.model = settings.minimax_model if model is None else model
+        self.timeout_seconds = settings.minimax_timeout_seconds if timeout_seconds is None else timeout_seconds
+        self.retry_count = settings.minimax_retry_count if retry_count is None else retry_count
+        self.max_qps = settings.minimax_max_qps if max_qps is None else max_qps
+        self.transport = transport
+        self._rate_lock = asyncio.Lock()
+        self._last_request_at = 0.0
+
+    async def generate_thumbnail(self, *, prompt: str, title: str) -> dict[str, Any]:
+        if not self.api_key:
+            raise RuntimeError("MINIMAX_API_KEY is not configured")
+
+        payload = {
+            "model": self.model,
+            "prompt": _thumbnail_prompt(prompt=prompt, title=title),
+            "aspect_ratio": "16:9",
+            "response_format": "url",
+            "n": 1,
+            "prompt_optimizer": True,
+            "aigc_watermark": False,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        last_error: Exception | None = None
+        for attempt in range(self.retry_count + 1):
+            try:
+                await self._pace()
+                async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
+                    response = await client.post(self.endpoint, headers=headers, json=payload)
+                    response.raise_for_status()
+                body = response.json()
+                urls = list(((body.get("data") or {}).get("image_urls") or []))
+                if not urls:
+                    raise RuntimeError("MiniMax image_generation returned no image_urls")
+                return {
+                    "provider": "minimax",
+                    "request_id": body.get("id"),
+                    "image_url": urls[0],
+                    "raw": body,
+                }
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self.retry_count:
+                    break
+                await asyncio.sleep(0.5 * (attempt + 1))
+
+        raise RuntimeError(f"MiniMax thumbnail generation failed: {last_error}") from last_error
+
+    async def _pace(self) -> None:
+        if self.max_qps <= 0:
+            return
+        interval = 1.0 / self.max_qps
+        loop = asyncio.get_running_loop()
+        async with self._rate_lock:
+            now = loop.time()
+            wait_seconds = interval - (now - self._last_request_at)
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+            self._last_request_at = loop.time()
+
+
+def _thumbnail_prompt(*, prompt: str, title: str) -> str:
+    base = title.strip() or prompt.strip()[:80] or "YouTube thumbnail"
+    return (
+        f"YouTube thumbnail for: {base}. "
+        "High contrast, clear subject, readable composition, no text overlay, 16:9."
+    )

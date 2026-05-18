@@ -12,8 +12,8 @@ from app.channel_agent.clock import Clock
 from app.channel_agent.clients import (
     AutoFlowClient,
     FakeAutoFlowClient,
-    FakeMiniMaxClient,
     FakeYouTubeClient,
+    MiniMaxImageClient,
     MiniMaxClient,
     YouTubeClient,
 )
@@ -59,7 +59,7 @@ class ChannelAgentService:
         self.queue = queue or ChannelOpsQueueService(clock=self.clock)
         self.autoflow_client = autoflow_client or FakeAutoFlowClient()
         self.youtube_client = youtube_client or FakeYouTubeClient()
-        self.minimax_client = minimax_client or FakeMiniMaxClient()
+        self.minimax_client = minimax_client or MiniMaxImageClient()
 
     async def tick(self, db: AsyncSession, *, channel_id) -> AgentTickAudit:
         channel = await db.get(ChannelProfile, _uuid(channel_id))
@@ -248,7 +248,7 @@ class ChannelAgentService:
 
         try:
             thumbnail = await self.minimax_client.generate_thumbnail(prompt=task.prompt, title=publication.title)
-            publication.thumbnail_storage_path = str(thumbnail.get("storage_path") or "")
+            publication.thumbnail_storage_path = str(thumbnail.get("storage_path") or thumbnail.get("image_url") or "")
         except Exception as exc:
             publication.warnings_json = [*list(publication.warnings_json or []), f"thumbnail_failed:{exc}"]
 
@@ -508,4 +508,3 @@ def _parse_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
-

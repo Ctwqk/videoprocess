@@ -52,6 +52,20 @@ class Settings(BaseSettings):
     autoflow_qdrant_url: str = "http://127.0.0.1:6333"
     autoflow_ai_timeout_seconds: float = 8.0
 
+    # ChannelOps Agent
+    channel_agent_alert_slack_webhook_url: str = ""
+    channel_agent_alert_email_to: str = ""
+    channel_agent_runner_poll_seconds: float = 5.0
+
+    # MiniMax image generation. Default endpoint/model were checked against
+    # the MiniMax CN docs for the image_generation API on 2026-05-18.
+    minimax_api_key: str = ""
+    minimax_image_generation_url: str = "https://api.minimaxi.com/v1/image_generation"
+    minimax_model: str = "image-01"
+    minimax_timeout_seconds: float = 30.0
+    minimax_retry_count: int = 1
+    minimax_max_qps: float = 2.0
+
     video_schedule_default_state: str = "OPEN"
 
     # Video worker features

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from app.channel_agent.alerts import AlertService
 from app.channel_agent.queue import ChannelOpsQueueService
 from app.channel_agent.service import ChannelAgentService
 from app.db import async_session
@@ -11,10 +12,11 @@ logger = logging.getLogger(__name__)
 
 
 class ChannelAgentRunner:
-    def __init__(self, *, worker_id: str = "channel-agent-runner") -> None:
+    def __init__(self, *, worker_id: str = "channel-agent-runner", alert_service: AlertService | None = None) -> None:
         self.worker_id = worker_id
         self.queue = ChannelOpsQueueService()
         self.service = ChannelAgentService(queue=self.queue)
+        self.alert_service = alert_service or AlertService()
 
     async def run_once(self) -> bool:
         async with async_session() as db:
@@ -47,11 +49,12 @@ class ChannelAgentRunner:
             await self.service.handle_promote_publication(db, item)
         elif item.kind == "account_health":
             await self.service.handle_account_health(db, item)
-        elif item.kind in {"send_alert", "collect_metrics", "execute_task", "observe_job"}:
+        elif item.kind == "send_alert":
+            await self.alert_service.send(dict(item.payload_json or {}))
+        elif item.kind in {"collect_metrics", "execute_task", "observe_job"}:
             # These kinds are durable no-ops until the concrete external
             # integrations are configured; keeping them recognized prevents
             # dead-letter loops during alpha dry runs.
             return
         else:
             raise ValueError(f"Unsupported ChannelOps queue kind: {item.kind}")
-

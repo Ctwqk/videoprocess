@@ -51,25 +51,25 @@
 - Create: `backend/app/schemas/channel_agent.py`
 - Test: `backend/tests/channel_agent/test_models_queue.py`
 
-- [ ] **Step 1: Write failing model smoke tests**
+- [x] **Step 1: Write failing model smoke tests**
 
 Create `backend/tests/channel_agent/test_models_queue.py` with tests that create the new tables in SQLite, insert a channel with `dry_run=True`, insert queue rows with `priority`, `parent_queue_item_id`, `dead_letter_at`, and insert a `PublicationRecord` with non-null `compliance_disposition`.
 
-- [ ] **Step 2: Run red test**
+- [x] **Step 2: Run red test**
 
 Run: `cd backend && python3 -m pytest tests/channel_agent/test_models_queue.py -q`
 
 Expected: import fails because `app.models.channel_agent` does not exist.
 
-- [ ] **Step 3: Add models and migrations**
+- [x] **Step 3: Add models and migrations**
 
 Implement the models and migration columns from `docs/superpowers/specs/2026-05-18-channel-ops-agent-implementation-design.md`, preserving JSON fields and nullable future slots exactly as specified.
 
-- [ ] **Step 4: Add Pydantic schemas**
+- [x] **Step 4: Add Pydantic schemas**
 
 Define create/update/read schemas for channels, lanes, accounts, lane formats, manual seeds, queue items, tasks, publications, feedback snapshots, health summaries, and control requests.
 
-- [ ] **Step 5: Run green test**
+- [x] **Step 5: Run green test**
 
 Run: `cd backend && python3 -m pytest tests/channel_agent/test_models_queue.py -q`
 
@@ -85,21 +85,21 @@ Expected: pass.
 - Create: `backend/app/channel_agent/clients.py`
 - Test: `backend/tests/channel_agent/test_models_queue.py`
 
-- [ ] **Step 1: Add failing queue/alert tests**
+- [x] **Step 1: Add failing queue/alert tests**
 
 Extend `test_models_queue.py` with tests for idempotent enqueue, priority ordering, dead-letter after max attempts, UTC hour idempotency key helpers, and alert payload creation for `token_expiring_24h`, `quota_below_20pct`, `takedown_event_logged`, and `material_supply_low`.
 
-- [ ] **Step 2: Run red test**
+- [x] **Step 2: Run red test**
 
 Run: `cd backend && python3 -m pytest tests/channel_agent/test_models_queue.py -q`
 
 Expected: imports for `app.channel_agent.queue` and `alerts` fail.
 
-- [ ] **Step 3: Implement queue and alert helpers**
+- [x] **Step 3: Implement queue and alert helpers**
 
 Implement `ChannelOpsQueueService.enqueue()`, `claim_next()`, `mark_succeeded()`, `mark_failed_or_retry()`, idempotency key builders, `Clock`/`FakeClock`, and `AlertService` with fake-friendly Slack/email delivery.
 
-- [ ] **Step 4: Run green test**
+- [x] **Step 4: Run green test**
 
 Run: `cd backend && python3 -m pytest tests/channel_agent/test_models_queue.py -q`
 
@@ -112,7 +112,7 @@ Expected: pass.
 - Create: `backend/app/channel_agent/service.py`
 - Test: `backend/tests/channel_agent/test_service.py`
 
-- [ ] **Step 1: Write failing service tests**
+- [x] **Step 1: Write failing service tests**
 
 Create tests for:
 
@@ -126,17 +126,17 @@ Create tests for:
 - quota at 95% holds publish instead of retrying upload.
 - token refresh failure holds the account and enqueues alert.
 
-- [ ] **Step 2: Run red test**
+- [x] **Step 2: Run red test**
 
 Run: `cd backend && python3 -m pytest tests/channel_agent/test_service.py -q`
 
 Expected: imports fail because service modules do not exist.
 
-- [ ] **Step 3: Implement store and service**
+- [x] **Step 3: Implement store and service**
 
 Implement store methods and service handlers using fake-friendly clients. Keep real network calls behind injected clients; default alpha clients should fail safe or no-op unless configured.
 
-- [ ] **Step 4: Run green test**
+- [x] **Step 4: Run green test**
 
 Run: `cd backend && python3 -m pytest tests/channel_agent/test_service.py -q`
 
@@ -151,21 +151,21 @@ Expected: pass.
 - Create: `backend/channel_agent_runner.py`
 - Test: `backend/tests/channel_agent/test_api.py`
 
-- [ ] **Step 1: Write failing API tests**
+- [x] **Step 1: Write failing API tests**
 
 Create API tests for channel creation, manual seed creation, enqueue tick, dry-run patch, halt/resume, health, queue, tasks, publications, and metrics/funnel read endpoints.
 
-- [ ] **Step 2: Run red test**
+- [x] **Step 2: Run red test**
 
 Run: `cd backend && python3 -m pytest tests/channel_agent/test_api.py -q`
 
 Expected: 404 or import failure for the new router.
 
-- [ ] **Step 3: Implement router and runner**
+- [x] **Step 3: Implement router and runner**
 
 Add router endpoints under `/api/v1/channel-agent`. Add runner loop and one-shot CLI that claims and handles queue items with `ChannelAgentService`.
 
-- [ ] **Step 4: Run green test**
+- [x] **Step 4: Run green test**
 
 Run: `cd backend && python3 -m pytest tests/channel_agent/test_api.py -q`
 
@@ -180,15 +180,15 @@ Expected: pass.
 - Modify: `frontend/src/components/layout/Sidebar.tsx`
 - Modify: `frontend/src/App.tsx`
 
-- [ ] **Step 1: Add API client and page**
+- [x] **Step 1: Add API client and page**
 
 Implement a status page with health cards, 7-day funnel, account/lane summaries, queue/task/publication tables, dry-run status, and halt/resume controls.
 
-- [ ] **Step 2: Wire navigation**
+- [x] **Step 2: Wire navigation**
 
 Add a sidebar entry and route to render the page.
 
-- [ ] **Step 3: Build frontend**
+- [x] **Step 3: Build frontend**
 
 Run: `cd frontend && npm run build`
 
@@ -201,15 +201,15 @@ Expected: build succeeds.
 - Modify: `docker-compose.yml`
 - Update: `docs/superpowers/plans/2026-05-18-channel-ops-agent-alpha.md` checkboxes as work completes.
 
-- [ ] **Step 1: Add settings**
+- [x] **Step 1: Add settings**
 
 Add MiniMax, alert, and runner settings without exposing secrets.
 
-- [ ] **Step 2: Add Compose service**
+- [x] **Step 2: Add Compose service**
 
 Add `channel-agent-runner` service using backend image, `python channel_agent_runner.py run`, and same database/storage env as API.
 
-- [ ] **Step 3: Run backend focused tests**
+- [x] **Step 3: Run backend focused tests**
 
 Run:
 
@@ -220,7 +220,7 @@ python3 -m pytest tests/channel_agent tests/autoflow/test_autoflow_api.py -q
 
 Expected: pass.
 
-- [ ] **Step 4: Run required checks**
+- [x] **Step 4: Run required checks**
 
 Run:
 

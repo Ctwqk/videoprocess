@@ -93,6 +93,44 @@ services:
     networks:
       - vp_internal
 
+  channel-agent-runner:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+    container_name: vp_channel_agent_runner
+    restart: unless-stopped
+    command: ["python", "channel_agent_runner.py", "run"]
+    environment:
+      DEPLOY_MODE: ${DEPLOY_MODE:-shared}
+      DATABASE_URL: ${VP_DATABASE_URL:-postgresql+asyncpg://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@host.docker.internal:5435/videoprocess}
+      REDIS_URL: ${VP_REDIS_URL:-redis://host.docker.internal:6380/0}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      STORAGE_LOCAL_ROOT: /data/storage
+      MINIO_ENDPOINT: ${VP_MINIO_ENDPOINT:-host.docker.internal:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: videoprocess
+      YOUTUBE_MANAGER_URL: ${YOUTUBE_MANAGER_URL:-http://youtube-manager:8899}
+      CHANNEL_AGENT_RUNNER_POLL_SECONDS: ${CHANNEL_AGENT_RUNNER_POLL_SECONDS:-5}
+      CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL: ${CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL:-}
+      CHANNEL_AGENT_ALERT_EMAIL_TO: ${CHANNEL_AGENT_ALERT_EMAIL_TO:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      MINIMAX_IMAGE_GENERATION_URL: ${MINIMAX_IMAGE_GENERATION_URL:-https://api.minimaxi.com/v1/image_generation}
+      MINIMAX_MODEL: ${MINIMAX_MODEL:-image-01}
+      MINIMAX_TIMEOUT_SECONDS: ${MINIMAX_TIMEOUT_SECONDS:-30}
+      MINIMAX_RETRY_COUNT: ${MINIMAX_RETRY_COUNT:-1}
+      MINIMAX_MAX_QPS: ${MINIMAX_MAX_QPS:-2}
+    volumes:
+      - ${VP_STORAGE_ROOT:-./k8s-data/storage}:/data/storage
+      - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/YouTubeManager/credentials:/app/youtube_credentials
+    depends_on:
+      - api
+      - youtube-manager
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - vp_internal
+
   ffmpeg-worker:
     build:
       context: ./backend
