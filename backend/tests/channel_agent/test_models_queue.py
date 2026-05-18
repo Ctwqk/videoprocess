@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.channel_agent.alerts import AlertService, build_alert_payload
@@ -42,6 +43,12 @@ CHANNEL_AGENT_TABLES = (
     TakedownEvent.__table__,
     FeedbackSnapshot.__table__,
 )
+
+
+def _sqlite_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 @pytest.fixture
@@ -169,6 +176,115 @@ async def test_queue_service_idempotency_priority_and_dead_letter(channel_agent_
     await channel_agent_session.refresh(claimed)
     assert claimed.status == "dead_lettered"
     assert claimed.dead_letter_at is not None
+
+
+@pytest.mark.asyncio
+async def test_lane_format_source_platforms_and_queue_channel_scope(channel_agent_session):
+    channel = ChannelProfile(
+        name="Platform Lab",
+        positioning="Cross-platform shorts",
+        language="zh",
+    )
+    channel_agent_session.add(channel)
+    await channel_agent_session.flush()
+
+    lane = TopicLane(
+        channel_profile_id=channel.id,
+        name="platform clips",
+    )
+    channel_agent_session.add(lane)
+    await channel_agent_session.flush()
+
+    lane_format = LaneFormatMatrix(
+        topic_lane_id=lane.id,
+        format_key="shorts_9x16",
+        source_platforms_json=["bilibili", "youtube"],
+    )
+    channel_agent_session.add(lane_format)
+    await channel_agent_session.commit()
+    await channel_agent_session.refresh(lane_format)
+
+    queue = ChannelOpsQueueService()
+    item = await queue.enqueue(
+        channel_agent_session,
+        kind="agent_tick",
+        idempotency_key=f"agent_tick:{channel.id}:2026-05-18-08",
+        payload={"channel_id": str(channel.id)},
+        channel_profile_id=channel.id,
+    )
+    await channel_agent_session.refresh(item)
+
+    assert lane_format.source_platforms_json == ["bilibili", "youtube"]
+    assert item.channel_profile_id == channel.id
+
+
+@pytest.mark.asyncio
+async def test_enqueue_recovers_from_idempotency_integrity_race(channel_agent_session, monkeypatch):
+    existing = ChannelOpsQueueItem(
+        kind="agent_tick",
+        idempotency_key="agent_tick:race:2026-05-18-08",
+        payload_json={"channel_id": "race"},
+        priority=20,
+        run_after=datetime(2026, 5, 18, 8, 0, tzinfo=timezone.utc),
+    )
+    channel_agent_session.add(existing)
+    await channel_agent_session.commit()
+    await channel_agent_session.refresh(existing)
+
+    queue = ChannelOpsQueueService()
+    lookups = 0
+
+    async def fake_get_by_key(db, idempotency_key):
+        nonlocal lookups
+        lookups += 1
+        assert idempotency_key == "agent_tick:race:2026-05-18-08"
+        return None if lookups == 1 else existing
+
+    async def fake_commit():
+        raise IntegrityError("insert channel_ops_queue_items", {}, Exception("duplicate idempotency key"))
+
+    monkeypatch.setattr(queue, "get_by_key", fake_get_by_key)
+    monkeypatch.setattr(channel_agent_session, "commit", fake_commit)
+
+    item = await queue.enqueue(
+        channel_agent_session,
+        kind="agent_tick",
+        idempotency_key="agent_tick:race:2026-05-18-08",
+        payload={"channel_id": "race"},
+        priority=20,
+    )
+
+    assert item.id == existing.id
+    assert item.payload_json == {"channel_id": "race"}
+    assert lookups == 2
+
+
+@pytest.mark.asyncio
+async def test_queue_retry_uses_exponential_backoff(channel_agent_session):
+    clock = FakeClock(datetime(2026, 5, 18, 8, 0, tzinfo=timezone.utc))
+    queue = ChannelOpsQueueService(clock=clock)
+
+    await queue.enqueue(
+        channel_agent_session,
+        kind="agent_tick",
+        idempotency_key="agent_tick:retry:2026-05-18-08",
+        payload={"channel_id": "retry"},
+        priority=20,
+        max_attempts=3,
+    )
+
+    first_claim = await queue.claim_next(channel_agent_session, worker_id="worker-1")
+    assert first_claim is not None
+    await queue.mark_failed_or_retry(channel_agent_session, first_claim, "first failure")
+    await channel_agent_session.refresh(first_claim)
+    assert _sqlite_utc(first_claim.run_after) == datetime(2026, 5, 18, 8, 5, tzinfo=timezone.utc)
+
+    clock.advance(timedelta(minutes=5))
+    second_claim = await queue.claim_next(channel_agent_session, worker_id="worker-1")
+    assert second_claim is not None
+    await queue.mark_failed_or_retry(channel_agent_session, second_claim, "second failure")
+    await channel_agent_session.refresh(second_claim)
+    assert _sqlite_utc(second_claim.run_after) == datetime(2026, 5, 18, 8, 15, tzinfo=timezone.utc)
 
 
 def test_utc_hour_bucket_and_alert_payloads_are_stable():

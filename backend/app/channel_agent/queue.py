@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent.clock import Clock
@@ -37,6 +38,7 @@ class ChannelOpsQueueService:
         payload: dict[str, Any] | None = None,
         priority: int = 100,
         run_after: datetime | None = None,
+        channel_profile_id=None,
         parent_queue_item_id=None,
         max_attempts: int = 3,
     ) -> ChannelOpsQueueItem:
@@ -47,6 +49,7 @@ class ChannelOpsQueueService:
         item = ChannelOpsQueueItem(
             kind=kind,
             idempotency_key=idempotency_key,
+            channel_profile_id=channel_profile_id,
             payload_json=dict(payload or {}),
             priority=priority,
             run_after=run_after or self.clock.now(),
@@ -54,7 +57,15 @@ class ChannelOpsQueueService:
             max_attempts=max_attempts,
         )
         db.add(item)
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            existing = await self.get_by_key(db, idempotency_key)
+            if existing is None:
+                raise
+            await db.refresh(existing)
+            return existing
         await db.refresh(item)
         return item
 
@@ -109,7 +120,9 @@ class ChannelOpsQueueService:
             item.dead_letter_at = self.clock.now()
         else:
             item.status = QUEUE_QUEUED
-            item.run_after = self.clock.now() + (retry_delay or timedelta(minutes=5))
+            if retry_delay is None:
+                retry_delay = timedelta(minutes=min(5 * (2 ** (int(item.attempt_count or 1) - 1)), 30))
+            item.run_after = self.clock.now() + retry_delay
             item.locked_at = None
             item.locked_by = None
         await db.commit()
@@ -122,4 +135,3 @@ class ChannelOpsQueueService:
         await db.commit()
         await db.refresh(item)
         return item
-

@@ -82,6 +82,7 @@ class LaneFormatMatrix(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     weight: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     target_duration_sec: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     template_pool_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    source_platforms_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     default_publish_visibility: Mapped[str] = mapped_column(String(32), default="public", nullable=False)
 
 
@@ -90,10 +91,15 @@ class ChannelOpsQueueItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_channel_ops_queue_idempotency_key"),
         Index("ix_channel_ops_queue_ready", "status", "run_after", "priority"),
+        Index("ix_channel_ops_queue_channel_profile_id", "channel_profile_id"),
+        Index("ix_channel_ops_queue_channel_ready", "channel_profile_id", "status", "run_after", "priority"),
     )
 
     kind: Mapped[str] = mapped_column(String(64), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    channel_profile_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("channel_profiles.id", ondelete="SET NULL"), nullable=True
+    )
     priority: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     parent_queue_item_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     payload_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
@@ -247,4 +253,3 @@ class FeedbackSnapshot(UUIDPrimaryKeyMixin, Base):
     impressions: Mapped[int | None] = mapped_column(Integer, nullable=True)
     virality_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     raw_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-

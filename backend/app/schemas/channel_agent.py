@@ -69,6 +69,7 @@ class LaneFormatCreate(BaseModel):
     weight: float = 1.0
     target_duration_sec: int = 30
     template_pool_json: list[str] = Field(default_factory=lambda: ["material_library_remix"])
+    source_platforms_json: list[str] = Field(default_factory=list)
     default_publish_visibility: str = "public"
 
 
@@ -107,4 +108,3 @@ class HealthSummary(BaseModel):
     queued_items: int = 0
     recent_failures: int = 0
     warnings: list[str] = Field(default_factory=list)
-
