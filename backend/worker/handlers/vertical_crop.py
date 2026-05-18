@@ -12,20 +12,20 @@ class VerticalCropHandler(BaseHandler):
 
         if mode == "blur_bg":
             vf = (
-                f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"[0:v]{self.scale_filter(width, height, force_original_aspect_ratio='increase')},"
                 f"crop={width}:{height},boxblur=20:1[bg];"
-                f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
+                f"[0:v]{self.scale_filter(width, height, force_original_aspect_ratio='decrease')}[fg];"
                 f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1"
             )
         else:
-            vf = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1"
+            vf = f"{self.scale_filter(width, height, force_original_aspect_ratio='increase')},crop={width}:{height},setsar=1"
 
         args = [
             "-i",
             video,
             "-vf",
             vf,
-            *self.build_video_encode_args("libx264", preset="fast", crf=23),
+            *self.intermediate_video_encode_args("libx264"),
             "-c:a",
             "aac",
             output_path,

@@ -53,6 +53,7 @@ class SmartTrimConfig:
     use_asr: bool = True
     use_vlm_verify: bool = False
     language: str = "zh"
+    whisper_model: str = "medium"
     output_format: str = "mp4"
     no_match_policy: str = "placeholder"
 
@@ -76,6 +77,11 @@ class SmartTrimConfig:
             use_asr=BaseHandler.parse_bool_param(node_config.get("use_asr"), True),
             use_vlm_verify=BaseHandler.parse_bool_param(node_config.get("use_vlm_verify"), False),
             language=str(node_config.get("language") or "zh"),
+            whisper_model=_select_value(
+                node_config.get("whisper_model"),
+                "medium",
+                {"tiny", "base", "small", "medium", "large-v3"},
+            ),
             output_format=_select_value(node_config.get("output_format"), "mp4", {"mp4", "mkv", "webm"}),
             no_match_policy=_select_value(node_config.get("no_match_policy"), "placeholder", {"placeholder", "fail"}),
         )
@@ -159,7 +165,7 @@ class SmartTrimHandler(BaseHandler):
             "0:v:0",
             "-map",
             "1:a:0",
-            *self.build_video_encode_args("libx264", preset="fast", crf=28),
+            *self.build_video_encode_args("libx264", preset="medium", crf=28),
             "-c:a",
             "aac",
             "-shortest",
@@ -177,7 +183,7 @@ class SmartTrimHandler(BaseHandler):
             "0:v:0",
             "-map",
             "0:a?",
-            *self.build_video_encode_args("libx264", preset="fast", crf=23),
+            *self.intermediate_video_encode_args("libx264"),
             "-c:a",
             "aac",
             output_path,
@@ -195,7 +201,7 @@ class SmartTrimHandler(BaseHandler):
             "0:v:0",
             "-map",
             "0:a?",
-            *self.build_video_encode_args("libx264", preset="fast", crf=23),
+            *self.intermediate_video_encode_args("libx264"),
             "-c:a",
             "aac",
             output_path,
@@ -231,7 +237,7 @@ class SmartTrimHandler(BaseHandler):
             filters.append("".join(concat_inputs) + f"concat=n={len(segments)}:v=1:a=0[outv]")
             maps = ["-map", "[outv]"]
 
-        args.extend(["-filter_complex", ";".join(filters), *maps, *self.build_video_encode_args("libx264", preset="fast", crf=23)])
+        args.extend(["-filter_complex", ";".join(filters), *maps, *self.intermediate_video_encode_args("libx264")])
         if has_audio:
             args.extend(["-c:a", "aac"])
         args.append(output_path)
@@ -367,8 +373,16 @@ class SmartTrimHandler(BaseHandler):
 
         device = "cuda" if self.gpu_enabled() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
-        model = WhisperModel("small", device=device, compute_type=compute_type)
-        segments, _info = model.transcribe(video_path, language=config.language or None, beam_size=5)
+        model = WhisperModel(config.whisper_model, device=device, compute_type=compute_type)
+        segments, _info = model.transcribe(
+            video_path,
+            language=config.language or None,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+            word_timestamps=True,
+            condition_on_previous_text=False,
+        )
         cues: list[SubtitleCue] = []
         for index, segment in enumerate(segments, start=1):
             text = segment.text.strip()

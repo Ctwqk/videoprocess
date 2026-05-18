@@ -48,3 +48,14 @@ def test_montage_assembler_node_contract_is_fixed_for_autoflow():
         "width",
         "height",
     }
+
+
+def test_concat_timeline_exposes_only_default_dynamic_inputs():
+    definition = NodeTypeRegistry.get().get_type("concat_timeline")
+
+    assert definition is not None
+    assert [port.name for port in definition.inputs] == ["video_1", "video_2"]
+    assert all(port.required for port in definition.inputs)
+    params = {param.name: param for param in definition.params}
+    assert params["input_count"].default == 2
+    assert params["input_count"].max_value is None

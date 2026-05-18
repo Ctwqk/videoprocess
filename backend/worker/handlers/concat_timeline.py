@@ -1,20 +1,23 @@
 import os
 import tempfile
 from worker.handlers.base import BaseHandler
+from worker.handlers.concat_many import ConcatManyHandler, selected_video_inputs
 
 
 class ConcatTimelineHandler(BaseHandler):
     async def execute(self, node_config, input_paths, output_path):
-        first = input_paths["video_first"]
-        second = input_paths["video_second"]
+        selected = selected_video_inputs(input_paths)
+        if len(selected) < 2:
+            raise ValueError("concat_timeline requires at least two video inputs")
+
         transition = node_config.get("transition", "none")
         transition_dur = float(node_config.get("transition_duration", 0.5))
 
         if transition == "none" or transition_dur <= 0:
             # Use concat demuxer for simple concatenation
             with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-                f.write(f"file '{first}'\n")
-                f.write(f"file '{second}'\n")
+                for path in selected:
+                    f.write(f"file '{path}'\n")
                 concat_file = f.name
 
             try:
@@ -28,6 +31,13 @@ class ConcatTimelineHandler(BaseHandler):
             finally:
                 os.unlink(concat_file)
         else:
+            if len(selected) > 2:
+                config = dict(node_config)
+                config.setdefault("normalize_resolution", True)
+                await ConcatManyHandler().execute(config, input_paths, output_path)
+                return
+
+            first, second = selected
             # Use xfade filter for transitions
             # Need to know duration of first video
             probe = await self.run_ffprobe(first)
@@ -50,7 +60,7 @@ class ConcatTimelineHandler(BaseHandler):
             args.extend([
                 "-filter_complex", ";".join(filter_complex),
                 "-map", "[v]",
-                *self.build_video_encode_args("libx264", preset="fast", crf=23),
+                    *self.intermediate_video_encode_args("libx264"),
             ])
             if first_has_audio and second_has_audio:
                 args.extend(["-map", "[a]", "-c:a", "aac"])

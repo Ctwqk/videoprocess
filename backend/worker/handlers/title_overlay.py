@@ -29,7 +29,7 @@ class TitleOverlayHandler(BaseHandler):
             video,
             "-vf",
             drawtext,
-            *self.build_video_encode_args("libx264", preset="fast", crf=23),
+            *self.intermediate_video_encode_args("libx264"),
             "-c:a",
             "aac",
             output_path,

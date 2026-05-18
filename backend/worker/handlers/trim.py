@@ -19,7 +19,7 @@ class TrimHandler(BaseHandler):
         args.extend([
             "-map", "0:v:0",
             "-map", "0:a?",
-            *self.build_video_encode_args("libx264", preset="fast", crf=23),
+            *self.intermediate_video_encode_args("libx264"),
             "-c:a", "aac",
             output_path,
         ])

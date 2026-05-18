@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.autoflow.clip_ranker import ClipRanker
+from app.autoflow.graph_planner import AutoFlowGraphPlanner, GraphPlanningFailed, GraphPlanningUnavailable
 from app.autoflow.intent_parser import RuleBasedIntentParser
 from app.autoflow.material_selector import MaterialSelector
 from app.autoflow.metadata_generator import MetadataGenerator
@@ -15,7 +16,7 @@ from app.autoflow.pipeline_builder import PipelineBuilder
 from app.autoflow.rights_policy import RightsPolicy
 from app.autoflow.storyboard_generator import StoryboardGenerator
 from app.autoflow.template_library import TemplateLibrary
-from app.autoflow.validation_repair import AutoFlowRepairService
+from app.autoflow.validation_repair import AutoFlowRepairService, AutoFlowUnrepairableError
 from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
 from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
 from app.orchestrator.dag import validate_pipeline
@@ -57,6 +58,7 @@ class AutoFlowService:
         self.template_library = TemplateLibrary()
         self.metadata_generator = MetadataGenerator()
         self.storyboard_generator = StoryboardGenerator()
+        self.graph_planner = AutoFlowGraphPlanner()
         self.pipeline_builder = PipelineBuilder()
         self.validation_repair = AutoFlowRepairService()
         self.rights_policy = RightsPolicy()
@@ -66,12 +68,21 @@ class AutoFlowService:
         self._runs: dict[str, AutoFlowRun] = {}
 
     async def plan(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
+        fallback_warnings: list[str] = []
+        if request.planning_mode == "ai_graph":
+            try:
+                return await self._plan_graph(request, db)
+            except GraphPlanningUnavailable as exc:
+                fallback_warnings.append(f"AI graph planner unavailable: {exc}")
+            except GraphPlanningFailed as exc:
+                fallback_warnings.append(f"AI graph planner failed validation: {exc}")
+
         if _uses_storyboard_planner(request):
             return await self._plan_storyboard(request, db)
 
         intent = self.intent_parser.parse(request)
         template = self.template_library.select_template(intent)
-        warnings: list[str] = []
+        warnings: list[str] = list(fallback_warnings)
         select_with_warnings = getattr(self.material_selector, "find_candidates_with_warnings", None)
         if callable(select_with_warnings):
             selection = await select_with_warnings(intent, request, db=db)
@@ -91,9 +102,31 @@ class AutoFlowService:
         validation = validate_pipeline(definition)
         repair_result = None
         if not validation.valid:
-            repair_result = self.validation_repair.repair(definition, validation.errors, ranked_candidates)
-            definition = repair_result.definition
-            validation = validate_pipeline(definition)
+            try:
+                repair_result = self.validation_repair.repair(definition, validation.errors, ranked_candidates)
+            except AutoFlowUnrepairableError as exc:
+                warnings.append(
+                    "Generated workflow was unrepairable; rebuilt with material_library_remix fallback."
+                )
+                warnings.extend(f"Unrepairable workflow error: {error}" for error in exc.unrepairable_errors)
+                template = self.template_library.get_template("material_library_remix")
+                definition = self.pipeline_builder.build(template, intent, ranked_candidates, metadata)
+                validation = validate_pipeline(definition)
+                if not validation.valid:
+                    try:
+                        repair_result = self.validation_repair.repair(definition, validation.errors, ranked_candidates)
+                    except AutoFlowUnrepairableError as fallback_exc:
+                        warnings.extend(
+                            f"Fallback workflow unrepairable error: {error}"
+                            for error in fallback_exc.unrepairable_errors
+                        )
+                        repair_result = None
+                    else:
+                        definition = repair_result.definition
+                        validation = validate_pipeline(definition)
+            else:
+                definition = repair_result.definition
+                validation = validate_pipeline(definition)
 
         rights = self.rights_policy.evaluate(request, ranked_candidates)
         rights_payload = rights.model_dump()
@@ -123,11 +156,59 @@ class AutoFlowService:
         self._plans[plan.plan_id] = plan
         return plan
 
+    async def plan_graph(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
+        return await self._plan_graph(request.model_copy(update={"planning_mode": "ai_graph"}), db)
+
     async def storyboard(
         self,
         request: AutoFlowStoryboardRequest,
     ):
         return self.storyboard_generator.generate(request)
+
+    async def _plan_graph(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
+        outcome = await self.graph_planner.plan(request)
+        intent = self.intent_parser.parse(request)
+        rights_payload = self.rights_policy.evaluate(request, outcome.candidates).model_dump(mode="json")
+        if outcome.policy.requires_review and rights_payload.get("status") == "allowed":
+            rights_payload = {
+                **rights_payload,
+                "status": "review_required",
+                "reasons": [
+                    *list(rights_payload.get("reasons") or []),
+                    "AI graph policy requires human review before upload or public publishing",
+                ],
+                "publish_allowed": request.publish_mode in {"preview_only", "private_upload", "unlisted_upload"},
+            }
+
+        validation_payload = {
+            "valid": outcome.validation.valid and outcome.policy.valid,
+            "errors": [error.model_dump(mode="json") for error in outcome.validation.errors],
+            "warnings": [warning.model_dump(mode="json") for warning in outcome.validation.warnings],
+            "repairs": outcome.graph_result.attempts[-1].repairs if outcome.graph_result.attempts else [],
+            "graph_planning": outcome.graph_result.model_dump(mode="json"),
+            "policy": outcome.policy.model_dump(mode="json", exclude={"definition"}),
+            "plan_warnings": outcome.warnings,
+        }
+        plan = AutoFlowPlan(
+            plan_id=str(uuid.uuid4()),
+            request=request,
+            intent=intent,
+            template_id="ai_graph",
+            pipeline_definition=outcome.definition,
+            candidates=outcome.candidates,
+            metadata=outcome.metadata,
+            validation=validation_payload,
+            rights=rights_payload,
+            warnings=outcome.warnings,
+            needs_review=_needs_review(rights_payload, review_approved_at=None),
+            status=_status_for(rights_payload, request.publish_mode),
+        )
+        if db is not None:
+            return await self._save_plan(db, plan)
+
+        self._plans[plan.plan_id] = plan
+        return plan
+
 
     async def _plan_storyboard(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
         storyboard_request = _storyboard_request_from_autoflow(request)
@@ -321,12 +402,39 @@ class AutoFlowService:
 
         if patch.run_validation:
             validation = validate_pipeline(definition)
+            repair_result = None
+            if not validation.valid:
+                try:
+                    repair_result = self.validation_repair.repair(definition, validation.errors, candidates)
+                except AutoFlowUnrepairableError as exc:
+                    warnings.append(
+                        "Generated workflow was unrepairable; rebuilt with material_library_remix fallback."
+                    )
+                    warnings.extend(f"Unrepairable workflow error: {error}" for error in exc.unrepairable_errors)
+                    fallback_template = self.template_library.get_template("material_library_remix")
+                    definition = self.pipeline_builder.build(fallback_template, intent, candidates, metadata)
+                    validation = validate_pipeline(definition)
+                    if not validation.valid:
+                        try:
+                            repair_result = self.validation_repair.repair(definition, validation.errors, candidates)
+                        except AutoFlowUnrepairableError as fallback_exc:
+                            warnings.extend(
+                                f"Fallback workflow unrepairable error: {error}"
+                                for error in fallback_exc.unrepairable_errors
+                            )
+                            repair_result = None
+                        else:
+                            definition = repair_result.definition
+                            validation = validate_pipeline(definition)
+                else:
+                    definition = repair_result.definition
+                    validation = validate_pipeline(definition)
             validation_payload = {
                 "valid": validation.valid,
                 "errors": [error.model_dump(mode="json") for error in validation.errors],
                 "warnings": [warning.model_dump(mode="json") for warning in validation.warnings],
-                "repairs": [],
-                "plan_warnings": warnings,
+                "repairs": repair_result.applied_repairs if repair_result else [],
+                "plan_warnings": warnings if validation.valid else [*warnings, "Generated workflow still needs manual repair."],
             }
 
         rights_payload = dict(plan.rights)
@@ -716,6 +824,9 @@ def _request_json(row: AutoFlowPlanModel) -> dict[str, Any]:
         "model": None,
         "constraints": {},
         "user_constraints": {},
+        "planning_mode": "auto",
+        "max_repair_attempts": 3,
+        "allow_experimental_graph_planning": False,
     }
 
 
@@ -889,6 +1000,8 @@ def _assert_not_blocked_or_rejected(plan: AutoFlowPlan, *, action: str) -> None:
 
 
 def _assert_execute_allowed(plan: AutoFlowPlan, request: AutoFlowExecuteRequest) -> None:
+    if plan.validation and plan.validation.get("valid") is not True:
+        raise PermissionError("AutoFlow plan must have a valid workflow before execution")
     if plan.status == "blocked" or plan.rights.get("status") == "blocked":
         raise PermissionError("AutoFlow plan is blocked by rights policy")
     if plan.status == "rejected":

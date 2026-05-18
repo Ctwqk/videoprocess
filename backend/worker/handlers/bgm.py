@@ -32,17 +32,22 @@ class BgmHandler(BaseHandler):
 
         if video_has_audio:
             filter_complex = (
-                f"[0:a]volume={original_volume}[orig];"
-                f"[1:a]{bgm_filter_chain}[bgm];"
-                f"[orig][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]"
+                f"[0:a]aresample=48000:async=1,volume={original_volume}[orig];"
+                f"[1:a]aresample=48000:async=1,{bgm_filter_chain}[bgm];"
+                "[bgm][orig]sidechaincompress=threshold=0.03:ratio=8:attack=200:release=800[ducked];"
+                "[orig][ducked]amix=inputs=2:duration=first:normalize=0[mix];"
+                "[mix]loudnorm=I=-16:LRA=11:TP=-1.5[a]"
             )
         else:
-            filter_complex = f"[1:a]{bgm_filter_chain}[a]"
+            filter_complex = f"[1:a]aresample=48000:async=1,{bgm_filter_chain},loudnorm=I=-16:LRA=11:TP=-1.5[a]"
 
         args = input_args + [
             "-filter_complex", filter_complex,
             "-map", "0:v", "-map", "[a]",
             "-c:v", "copy",
+            "-c:a", "aac",
+            "-ar", "48000",
+            "-ac", "2",
             "-shortest",
             output_path,
         ]

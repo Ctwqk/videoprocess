@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from worker.handlers.base import BaseHandler
+
+VIDEO_INPUT_RE = re.compile(r"^video_(\d+)$")
+LEGACY_TIMELINE_INPUT_ORDER = {"video_first": 1, "video_second": 2}
 
 
 class ConcatManyHandler(BaseHandler):
@@ -29,7 +33,7 @@ class ConcatManyHandler(BaseHandler):
         for index in range(len(selected)):
             if normalize:
                 filters.append(
-                    f"[{index}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                    f"[{index}:v]{self.scale_filter(width, height, force_original_aspect_ratio='decrease')},"
                     f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1[v{index}]"
                 )
             else:
@@ -44,7 +48,7 @@ class ConcatManyHandler(BaseHandler):
                 "[v]",
                 "-map",
                 f"{len(selected)}:a",
-                *self.build_video_encode_args("libx264", preset="fast", crf=23),
+                *self.intermediate_video_encode_args("libx264"),
                 "-c:a",
                 "aac",
                 "-shortest",
@@ -56,13 +60,20 @@ class ConcatManyHandler(BaseHandler):
         return args
 
     def _selected_inputs(self, node_config: dict[str, Any], input_paths: dict[str, str]) -> list[str]:
-        input_count = node_config.get("input_count")
-        max_index = min(int(input_count), 12) if input_count is not None else 12
-        return [
-            input_paths[f"video_{index}"]
-            for index in range(1, max_index + 1)
-            if input_paths.get(f"video_{index}")
-        ]
+        return selected_video_inputs(input_paths)
+
+
+def selected_video_inputs(input_paths: dict[str, str]) -> list[str]:
+    indexed: dict[int, str] = {}
+    for handle, path in input_paths.items():
+        match = VIDEO_INPUT_RE.match(handle)
+        if match:
+            indexed[int(match.group(1))] = path
+            continue
+        legacy_index = LEGACY_TIMELINE_INPUT_ORDER.get(handle)
+        if legacy_index is not None and legacy_index not in indexed:
+            indexed[legacy_index] = path
+    return [indexed[index] for index in sorted(indexed)]
 
 
 def _positive_float_or_none(value: Any) -> float | None:

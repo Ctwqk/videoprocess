@@ -14,6 +14,13 @@ class AutoFlowRepairResult(BaseModel):
     unrepairable_errors: list[str] = Field(default_factory=list)
 
 
+class AutoFlowUnrepairableError(RuntimeError):
+    def __init__(self, *, unrepairable_errors: list[str], applied_repairs: list[str]) -> None:
+        super().__init__("AutoFlow workflow could not be repaired")
+        self.unrepairable_errors = unrepairable_errors
+        self.applied_repairs = applied_repairs
+
+
 class AutoFlowRepairService:
     def repair(
         self,
@@ -50,11 +57,9 @@ class AutoFlowRepairService:
             unrepairable.append(error.type)
 
         if unrepairable:
-            return AutoFlowRepairResult(
-                definition=definition,
-                repaired=False,
-                applied_repairs=applied,
+            raise AutoFlowUnrepairableError(
                 unrepairable_errors=unrepairable,
+                applied_repairs=applied,
             )
 
         repaired_definition = PipelineDefinition.model_validate(data)

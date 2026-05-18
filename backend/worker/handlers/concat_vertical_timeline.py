@@ -56,7 +56,7 @@ class ConcatVerticalTimelineHandler(BaseHandler):
                 "-filter_complex", filter_complex,
                 "-map", "[v]",
                 "-map", "[a]",
-                *self.build_video_encode_args("libx264", preset="fast", crf=23),
+                *self.intermediate_video_encode_args("libx264"),
                 "-c:a", "aac",
                 output_path,
             ]
@@ -96,9 +96,9 @@ class ConcatVerticalTimelineHandler(BaseHandler):
             bottom_source = "[0:v]"
 
         filter_complex = (
-            f"{top_source}scale={pane_width}:{pane_height}:force_original_aspect_ratio=decrease,"
+            f"{top_source}{self.scale_filter(pane_width, pane_height, force_original_aspect_ratio='decrease')},"
             f"pad={pane_width}:{pane_height}:(ow-iw)/2:(oh-ih)/2:color={background_color},fps=30[top];"
-            f"{bottom_source}scale={pane_width}:{pane_height}:force_original_aspect_ratio=decrease,"
+            f"{bottom_source}{self.scale_filter(pane_width, pane_height, force_original_aspect_ratio='decrease')},"
             f"pad={pane_width}:{pane_height}:(ow-iw)/2:(oh-ih)/2:color={background_color},fps=30[bottom];"
             "[top][bottom]vstack=inputs=2[v]"
         )
@@ -114,7 +114,7 @@ class ConcatVerticalTimelineHandler(BaseHandler):
             args.extend([
                 "-f", "lavfi",
                 "-t", f"{duration:.3f}",
-                "-i", "anullsrc=r=44100:cl=stereo",
+                "-i", "anullsrc=r=48000:cl=stereo",
             ])
 
         args.extend([
@@ -128,9 +128,8 @@ class ConcatVerticalTimelineHandler(BaseHandler):
             args.extend(["-map", "2:a:0"])
 
         args.extend([
-            *self.build_video_encode_args("libx264", preset="fast", crf=23),
+            *self.intermediate_video_encode_args("libx264"),
             "-c:a", "aac",
-            "-pix_fmt", "yuv420p",
             "-shortest",
             output_file.name,
         ])

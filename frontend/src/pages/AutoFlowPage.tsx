@@ -11,6 +11,7 @@ import {
   rejectAutoFlowPlan,
 } from '../api/autoflow';
 import AutoFlowCandidateClips from '../components/autoflow/AutoFlowCandidateClips';
+import AutoFlowGraphPlannerDetails from '../components/autoflow/AutoFlowGraphPlannerDetails';
 import AutoFlowMetricsPanel from '../components/autoflow/AutoFlowMetricsPanel';
 import AutoFlowMetadataEditor from '../components/autoflow/AutoFlowMetadataEditor';
 import AutoFlowPlanPanel from '../components/autoflow/AutoFlowPlanPanel';
@@ -53,6 +54,9 @@ const defaultRequest: AutoFlowRequest = {
   model: null,
   constraints: {},
   user_constraints: {},
+  planning_mode: 'auto',
+  max_repair_attempts: 3,
+  allow_experimental_graph_planning: false,
 };
 
 const publishModes: AutoFlowPublishMode[] = [
@@ -466,6 +470,7 @@ export default function AutoFlowPage() {
             </div>
           ) : null}
           <AutoFlowPlanPanel plan={plan} templates={templates} />
+          <AutoFlowGraphPlannerDetails plan={plan} />
           <AutoFlowStoryboardPreview storyboard={plan?.storyboard ?? null} />
           <AutoFlowMetadataEditor
             plan={plan}

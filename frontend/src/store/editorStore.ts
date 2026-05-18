@@ -31,6 +31,51 @@ interface EditorState {
   clear: () => void;
 }
 
+const DYNAMIC_CONCAT_NODE_TYPES = new Set(['concat_timeline', 'concat_many']);
+const VIDEO_INPUT_HANDLE_RE = /^video_(\d+)$/;
+
+function getNodeType(node: Node) {
+  const data = node.data as { nodeType?: unknown } | undefined;
+  return typeof data?.nodeType === 'string' ? data.nodeType : String(node.type || '');
+}
+
+function getNodeConfig(node: Node): Record<string, unknown> {
+  const data = node.data as { config?: unknown } | undefined;
+  return typeof data?.config === 'object' && data.config !== null
+    ? data.config as Record<string, unknown>
+    : {};
+}
+
+function numericInputCount(value: unknown) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(2, Math.floor(parsed)) : 2;
+}
+
+function maybeExpandDynamicConcatInput(node: Node, targetNodeId: string | null | undefined, targetHandle: string | null | undefined) {
+  if (node.id !== targetNodeId || !targetHandle || !DYNAMIC_CONCAT_NODE_TYPES.has(getNodeType(node))) {
+    return node;
+  }
+  const match = VIDEO_INPUT_HANDLE_RE.exec(targetHandle);
+  if (!match) return node;
+
+  const connectedIndex = Number(match[1]);
+  const config = getNodeConfig(node);
+  const currentCount = numericInputCount(config.input_count);
+  const nextCount = Math.max(currentCount, connectedIndex + 1);
+  if (nextCount === currentCount) return node;
+
+  return {
+    ...node,
+    data: {
+      ...node.data,
+      config: {
+        ...config,
+        input_count: nextCount,
+      },
+    },
+  };
+}
+
 const useEditorStore = create<EditorState>()(persist((set, get) => ({
   nodes: [],
   edges: [],
@@ -56,6 +101,7 @@ const useEditorStore = create<EditorState>()(persist((set, get) => ({
   onConnect: (connection) => {
     set({
       edges: addEdge(connection, get().edges),
+      nodes: get().nodes.map(node => maybeExpandDynamicConcatInput(node, connection.target, connection.targetHandle)),
       isDirty: true,
     });
   },

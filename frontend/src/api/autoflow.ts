@@ -28,6 +28,14 @@ export async function createAutoFlowPlan(payload: AutoFlowRequest): Promise<Auto
   return res.data;
 }
 
+export async function createAutoFlowGraphPlan(payload: AutoFlowRequest): Promise<AutoFlowPlan> {
+  const res = await apiClient.post<AutoFlowPlan>('/autoflow/plan/graph', {
+    ...payload,
+    planning_mode: 'ai_graph',
+  });
+  return res.data;
+}
+
 export async function createAutoFlowStoryboard(payload: AutoFlowStoryboardRequest): Promise<AutoFlowStoryboardResponse> {
   const res = await apiClient.post<AutoFlowStoryboardResponse>('/autoflow/storyboard', payload);
   return res.data;

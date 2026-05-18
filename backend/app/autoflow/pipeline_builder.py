@@ -83,7 +83,7 @@ class PipelineBuilder:
             position=self._position(5, 0),
             data=PipelineNodeData(
                 label="Transcode",
-                config={"format": "mp4", "video_codec": "libx264", "audio_codec": "aac", "crf": 23},
+                config={"format": "mp4", "video_codec": "libx264", "audio_codec": "aac", "crf": 20},
             ),
         )
         export = PipelineNode(
@@ -268,13 +268,13 @@ class PipelineBuilder:
 
         width, height = _target_dimensions(storyboard.aspect_ratio)
         assembly = PipelineNode(
-            id="concat_many_1",
-            type="concat_many",
+            id="concat_timeline_1",
+            type="concat_timeline",
             position=self._position(3, 0),
             data=PipelineNodeData(
                 label="Storyboard Assembly",
                 config={
-                    "input_count": min(len(input_node_ids), 12),
+                    "input_count": len(input_node_ids),
                     "output_format": "mp4",
                     "transition": "none",
                     "transition_duration": 0,
@@ -286,7 +286,7 @@ class PipelineBuilder:
             ),
         )
         nodes.append(assembly)
-        for index, source_id in enumerate(input_node_ids[:12], start=1):
+        for index, source_id in enumerate(input_node_ids, start=1):
             edges.append(
                 PipelineEdge(
                     id=f"e-{source_id}-{assembly.id}",
@@ -314,7 +314,7 @@ class PipelineBuilder:
             position=self._position(4, 0),
             data=PipelineNodeData(
                 label="Transcode",
-                config={"format": "mp4", "video_codec": "libx264", "audio_codec": "aac", "crf": 23},
+                config={"format": "mp4", "video_codec": "libx264", "audio_codec": "aac", "crf": 20},
             ),
         )
         export = PipelineNode(
@@ -439,13 +439,13 @@ class PipelineBuilder:
             )
 
         return PipelineNode(
-            id="concat_many_1",
-            type="concat_many",
+            id="concat_timeline_1",
+            type="concat_timeline",
             position=self._position(3, 0),
             data=PipelineNodeData(
-                label="Concat Many",
+                label="Timeline Concat",
                 config={
-                    "input_count": min(input_count, 12),
+                    "input_count": input_count,
                     "output_format": "mp4",
                     "transition": "none",
                     "transition_duration": 0,

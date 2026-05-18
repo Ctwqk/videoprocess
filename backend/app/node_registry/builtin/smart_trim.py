@@ -38,6 +38,13 @@ DEFINITION = NodeTypeDefinition(
         ParamDefinition(name="use_asr", param_type="boolean", default=True),
         ParamDefinition(name="use_vlm_verify", param_type="boolean", default=False),
         ParamDefinition(name="language", param_type="string", default="zh"),
+        ParamDefinition(
+            name="whisper_model",
+            param_type="select",
+            default="medium",
+            options=["tiny", "base", "small", "medium", "large-v3"],
+            description="Whisper model used when ASR scoring is enabled",
+        ),
         ParamDefinition(name="output_format", param_type="select", default="mp4", required=True, options=["mp4", "mkv", "webm"]),
         ParamDefinition(
             name="no_match_policy",

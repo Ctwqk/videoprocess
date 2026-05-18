@@ -1,5 +1,6 @@
 import type {
   AutoFlowAspectRatio,
+  AutoFlowPlanningMode,
   AutoFlowPublishMode,
   AutoFlowRequest,
   AutoFlowSourcePolicy,
@@ -31,6 +32,7 @@ const DEFAULT_PUBLISH_MODES: AutoFlowPublishMode[] = [
   'unlisted_upload',
   'public_after_review',
 ];
+const PLANNING_MODES: AutoFlowPlanningMode[] = ['auto', 'template', 'storyboard', 'ai_graph'];
 
 const SOURCE_POLICY_LABELS: Record<AutoFlowSourcePolicy, string> = {
   owned_only: 'Owned only',
@@ -54,6 +56,13 @@ const PUBLISH_MODE_LABELS: Record<AutoFlowPublishMode, string> = {
   private_upload: 'Private upload',
   unlisted_upload: 'Unlisted upload',
   public_after_review: 'Public after review',
+};
+
+const PLANNING_MODE_LABELS: Record<AutoFlowPlanningMode, string> = {
+  auto: 'Auto',
+  template: 'Template',
+  storyboard: 'Storyboard',
+  ai_graph: 'AI graph',
 };
 
 function titleCase(value: string) {
@@ -188,6 +197,26 @@ export default function AutoFlowPromptBox({
       </label>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 12 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+          Planning mode
+          <select
+            value={value.planning_mode}
+            onChange={event => update('planning_mode', event.target.value as AutoFlowPlanningMode)}
+            style={{
+              borderRadius: 6,
+              border: '1px solid #334155',
+              backgroundColor: '#020617',
+              color: '#e2e8f0',
+              padding: '8px 10px',
+              fontSize: 13,
+            }}
+          >
+            {PLANNING_MODES.map(option => (
+              <option key={option} value={option}>{PLANNING_MODE_LABELS[option]}</option>
+            ))}
+          </select>
+        </label>
+
         <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
           Duration
           <input

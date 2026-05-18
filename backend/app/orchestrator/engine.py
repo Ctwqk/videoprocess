@@ -45,6 +45,11 @@ def _redis() -> aioredis.Redis:
     return aioredis.from_url(settings.redis_url, decode_responses=True)
 
 
+def _leaf_node_ids(definition: PipelineDefinition) -> set[str]:
+    has_outgoing = {edge.source for edge in definition.edges}
+    return {node.id for node in definition.nodes if node.id not in has_outgoing}
+
+
 class JobEngine:
     """Orchestrates job execution by dispatching nodes to workers via Redis Streams."""
 
@@ -56,7 +61,13 @@ class JobEngine:
             return False
 
         has_success = any(status == NodeStatus.SUCCEEDED for status in statuses)
-        has_fail = any(status == NodeStatus.FAILED for status in statuses)
+        failed_statuses = {NodeStatus.FAILED, NodeStatus.SKIPPED, NodeStatus.CANCELLED}
+        has_fail = any(status in failed_statuses for status in statuses)
+        definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
+        leaf_node_ids = _leaf_node_ids(definition)
+        leaf_executions = [node for node in job.node_executions if node.node_id in leaf_node_ids]
+        has_successful_leaf = any(node.status == NodeStatus.SUCCEEDED for node in leaf_executions)
+        has_failed_leaf = any(node.status in failed_statuses for node in leaf_executions)
 
         if all(status == NodeStatus.SUCCEEDED for status in statuses):
             job.status = JobStatus.SUCCEEDED
@@ -67,14 +78,19 @@ class JobEngine:
             return True
 
         if has_fail:
-            job.status = JobStatus.PARTIALLY_FAILED if has_success else JobStatus.FAILED
+            job.status = JobStatus.FAILED if has_failed_leaf or not has_successful_leaf else JobStatus.PARTIALLY_FAILED
             if not job.error_message:
-                failed_nodes = [n.node_label or n.node_id for n in job.node_executions if n.status == NodeStatus.FAILED]
+                failed_nodes = [
+                    n.node_label or n.node_id
+                    for n in job.node_executions
+                    if n.status in failed_statuses
+                ]
                 if failed_nodes:
                     job.error_message = f"Failed nodes: {', '.join(failed_nodes)}"
             job.completed_at = datetime.utcnow()
             await db.commit()
-            await self._mark_final_artifacts(db, job)
+            if job.status != JobStatus.FAILED:
+                await self._mark_final_artifacts(db, job)
             logger.info(f"Job {job.id} {job.status.value}")
             return True
 
@@ -412,11 +428,10 @@ class JobEngine:
     async def _mark_final_artifacts(self, db: AsyncSession, job: Job) -> None:
         """Mark output artifacts of terminal nodes as FINAL."""
         definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
-        has_outgoing = {e.source for e in definition.edges}
-        terminal_node_ids = {n.id for n in definition.nodes if n.id not in has_outgoing}
+        terminal_node_ids = _leaf_node_ids(definition)
 
         for ne in job.node_executions:
-            if ne.node_id in terminal_node_ids and ne.output_artifact_id:
+            if ne.node_id in terminal_node_ids and ne.status == NodeStatus.SUCCEEDED and ne.output_artifact_id:
                 artifact = await db.get(Artifact, ne.output_artifact_id)
                 if artifact:
                     artifact.kind = ArtifactKind.FINAL

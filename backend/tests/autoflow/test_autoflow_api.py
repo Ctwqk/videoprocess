@@ -148,6 +148,60 @@ async def test_autoflow_plan_approve_execute_api_without_live_database():
 
 
 @pytest.mark.asyncio
+async def test_autoflow_graph_plan_api_builds_dog_cat_vertical_timeline_without_live_database():
+    _reset_autoflow_singletons()
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_db] = lambda: None
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/autoflow/plan/graph",
+            json={
+                "prompt": "生成一个视频，上半部分是小狗，下半部分是小猫视频，上半部分先播放，下半部分后播放",
+                "planning_mode": "ai_graph",
+                "publish_mode": "private_upload",
+                "target_platforms": ["youtube"],
+            },
+        )
+
+    assert response.status_code == 200
+    plan = response.json()
+    node_types = [node["type"] for node in plan["pipeline_definition"]["nodes"]]
+    upload = next(node for node in plan["pipeline_definition"]["nodes"] if node["type"] == "youtube_upload")
+    assert plan["template_id"] == "ai_graph"
+    assert plan["validation"]["valid"] is True
+    assert "concat_vertical_timeline" in node_types
+    assert upload["data"]["config"]["privacy"] == "private"
+    assert plan["validation"]["graph_planning"]["attempts"][0]["source"] == "rule.dog_cat_vertical_timeline"
+    assert plan["needs_review"] is True
+
+
+@pytest.mark.asyncio
+async def test_autoflow_plan_with_ai_graph_mode_falls_back_to_template_when_unavailable():
+    _reset_autoflow_singletons()
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_db] = lambda: None
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "我要一个 30 秒小猫视频集锦，竖屏，可爱快节奏，先导出预览，不要公开发布。",
+                "planning_mode": "ai_graph",
+                "target_platforms": ["youtube_shorts"],
+            },
+        )
+
+    assert response.status_code == 200
+    plan = response.json()
+    assert plan["template_id"] == "animal_compilation_short"
+    assert plan["validation"]["valid"] is True
+    assert any("AI graph planner unavailable" in warning for warning in plan["warnings"])
+
+
+@pytest.mark.asyncio
 async def test_db_backed_plan_get_and_list_read_persisted_plan(autoflow_db_session):
     _reset_autoflow_singletons()
     app = _app_with_db(autoflow_db_session)
@@ -408,6 +462,48 @@ async def test_patch_plan_replaces_candidates_metadata_rebuilds_and_persists(aut
         fetched = await client.get(f"/api/v1/autoflow/plans/{plan['plan_id']}")
         assert fetched.status_code == 200
         assert fetched.json()["metadata"]["selected_title"] == "Reviewed replacement edit"
+
+
+@pytest.mark.asyncio
+async def test_metadata_patch_rebuild_reapplies_validation_repairs(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create a 20 second funny dog compilation for YouTube Shorts.",
+                "target_platforms": ["youtube_shorts"],
+                "publish_mode": "private_upload",
+            },
+        )
+        assert created.status_code == 200
+        plan = created.json()
+        assert plan["validation"]["valid"] is True
+        assert plan["validation"]["repairs"] == ["invalid_param:montage_1.style"]
+
+        patched = await client.patch(
+            f"/api/v1/autoflow/plans/{plan['plan_id']}",
+            json={
+                "metadata": {
+                    "selected_title": "Reviewed dog montage",
+                    "description": "Metadata-only review edit.",
+                },
+                "rebuild_definition": True,
+                "validate": True,
+                "evaluate_rights": True,
+            },
+        )
+
+    assert patched.status_code == 200
+    payload = patched.json()
+    assert payload["metadata"]["selected_title"] == "Reviewed dog montage"
+    assert payload["validation"]["valid"] is True
+    assert payload["validation"]["errors"] == []
+    assert payload["validation"]["repairs"] == ["invalid_param:montage_1.style"]
+    montage = next(node for node in payload["pipeline_definition"]["nodes"] if node["id"] == "montage_1")
+    assert montage["data"]["config"]["style"] == "fast_cuts"
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,113 @@
   min-width: 0;
 }
 
+.autoflow-graph-panel {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  background: #0f172a;
+}
+
+.autoflow-graph-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.autoflow-graph-header h2 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.25;
+  color: #f8fafc;
+}
+
+.autoflow-graph-header p {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.autoflow-graph-header > span,
+.autoflow-graph-list span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid #334155;
+  border-radius: 999px;
+  background: #020617;
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.autoflow-graph-block {
+  display: grid;
+  gap: 8px;
+}
+
+.autoflow-graph-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #cbd5e1;
+}
+
+.autoflow-graph-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.autoflow-graph-attempts {
+  display: grid;
+  gap: 8px;
+}
+
+.autoflow-graph-attempt {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  background: #020617;
+}
+
+.autoflow-graph-attempt-header {
+  display: grid;
+  grid-template-columns: minmax(70px, auto) minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  color: #94a3b8;
+}
+
+.autoflow-graph-attempt-header span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.autoflow-graph-ok {
+  color: #86efac;
+}
+
+.autoflow-graph-error {
+  color: #fca5a5;
+}
+
+.autoflow-graph-issues {
+  margin: 0;
+  padding-left: 18px;
+  color: #fca5a5;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 @media (max-width: 980px) {
   .autoflow-page {
     padding: 12px;

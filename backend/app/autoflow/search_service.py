@@ -84,7 +84,7 @@ class SearchService:
         request: AutoFlowRequest,
         max_results: int = 8,
     ) -> ExternalSearchResult:
-        query = _query_for_intent(intent)
+        query = _external_query_for_request(intent, request)
         platforms = _source_platforms(request)
         total_limit = max(0, min(int(max_results), 50))
         results: list[AutoFlowClipCandidate] = []
@@ -222,6 +222,19 @@ def _material_metadata(
 def _query_for_intent(intent: AutoFlowIntent) -> str:
     keywords = [keyword for keyword in intent.keywords if keyword]
     return " ".join(keywords[:3]) or intent.subject or "video"
+
+
+def _external_query_for_request(intent: AutoFlowIntent, request: AutoFlowRequest) -> str:
+    constraints = request.constraints if isinstance(request.constraints, dict) else {}
+    for key in ("external_search_query", "search_query", "query"):
+        value = str(constraints.get(key) or "").strip()
+        if value:
+            return value[:180]
+
+    prompt = request.prompt.strip()
+    if prompt:
+        return prompt[:180]
+    return _query_for_intent(intent)
 
 
 def _source_platforms(request: AutoFlowRequest) -> list[str]:

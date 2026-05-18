@@ -5,17 +5,23 @@ DEFINITION = NodeTypeDefinition(
     type_name="concat_many",
     display_name="Concat Many",
     category="combine",
-    description="Concatenate up to 12 videos sequentially.",
+    description="Concatenate videos sequentially with dynamic timeline inputs.",
     icon="git-merge",
     inputs=[
-        PortDefinition(name=f"video_{index}", port_type=PortType.VIDEO, required=index <= 2, description=f"Video input {index}")
-        for index in range(1, 13)
+        PortDefinition(name="video_1", port_type=PortType.VIDEO, description="Video input 1"),
+        PortDefinition(name="video_2", port_type=PortType.VIDEO, description="Video input 2"),
     ],
     outputs=[
         PortDefinition(name="output", port_type=PortType.VIDEO, description="Concatenated video"),
     ],
     params=[
-        ParamDefinition(name="input_count", param_type="number", default=6, min_value=2, max_value=12, description="Inputs to use"),
+        ParamDefinition(
+            name="input_count",
+            param_type="number",
+            default=2,
+            min_value=2,
+            description="Visible timeline input ports; expands automatically as inputs are connected",
+        ),
         ParamDefinition(name="output_format", param_type="select", default="mp4", options=["mp4", "mkv", "webm"]),
         ParamDefinition(name="transition", param_type="select", default="none", options=["none", "fade", "dissolve"]),
         ParamDefinition(name="transition_duration", param_type="number", default=0.3, min_value=0, max_value=5),

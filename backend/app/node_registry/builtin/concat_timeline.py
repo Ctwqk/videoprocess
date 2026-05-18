@@ -4,16 +4,23 @@ DEFINITION = NodeTypeDefinition(
     type_name="concat_timeline",
     display_name="Timeline Concat",
     category="combine",
-    description="Concatenate videos sequentially on a timeline",
+    description="Concatenate videos sequentially on a dynamic timeline.",
     icon="git-merge",
     inputs=[
-        PortDefinition(name="video_first", port_type=PortType.VIDEO, description="First video"),
-        PortDefinition(name="video_second", port_type=PortType.VIDEO, description="Second video"),
+        PortDefinition(name="video_1", port_type=PortType.VIDEO, description="Video input 1"),
+        PortDefinition(name="video_2", port_type=PortType.VIDEO, description="Video input 2"),
     ],
     outputs=[
         PortDefinition(name="output", port_type=PortType.VIDEO, description="Concatenated video"),
     ],
     params=[
+        ParamDefinition(
+            name="input_count",
+            param_type="number",
+            default=2,
+            min_value=2,
+            description="Visible timeline input ports; expands automatically as inputs are connected",
+        ),
         ParamDefinition(name="output_format", param_type="select", default="mp4",
                        options=["mp4", "mkv", "webm"]),
         ParamDefinition(name="transition", param_type="select", default="none",

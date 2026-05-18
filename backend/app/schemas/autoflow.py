@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.pipeline import PipelineDefinition
 
@@ -25,6 +25,7 @@ SourceStrategy = Literal[
     "generate_missing",
     "hybrid",
 ]
+PlanningMode = Literal["auto", "template", "storyboard", "ai_graph"]
 AutoFlowPlanStatus = Literal[
     "drafted",
     "review_required",
@@ -54,6 +55,9 @@ class AutoFlowRequest(BaseModel):
     model: str | None = None
     constraints: dict[str, Any] = Field(default_factory=dict)
     user_constraints: dict[str, Any] = Field(default_factory=dict)
+    planning_mode: PlanningMode = "auto"
+    max_repair_attempts: int = Field(default=3, ge=0, le=5)
+    allow_experimental_graph_planning: bool = False
 
     @field_validator("prompt")
     @classmethod
@@ -103,6 +107,86 @@ class AutoFlowMetadata(BaseModel):
     hashtags: list[str] = Field(default_factory=list)
     thumbnail_text_candidates: list[str] = Field(default_factory=list)
     platform_payloads: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class DraftNode(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    type: str
+    label: str = ""
+    config: dict[str, Any] = Field(default_factory=dict)
+    asset_id: str | None = None
+    position: dict[str, float] | None = None
+
+
+class DraftEdge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str | None = None
+    source: str
+    sourceHandle: str
+    target: str
+    targetHandle: str
+
+
+class PipelineDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = "AI Graph Plan"
+    description: str = ""
+    nodes: list[DraftNode]
+    edges: list[DraftEdge]
+    planner_notes: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    risk_flags: list[str] = Field(default_factory=list)
+
+
+class DraftNodeUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    label: str | None = None
+    config: dict[str, Any] | None = None
+    asset_id: str | None = None
+    position: dict[str, float] | None = None
+
+
+class DraftEdgeReplacement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    remove_edge_id: str | None = None
+    remove: DraftEdge | None = None
+    add: DraftEdge
+
+
+class PipelineDraftPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    add_nodes: list[DraftNode] = Field(default_factory=list)
+    update_nodes: list[DraftNodeUpdate] = Field(default_factory=list)
+    remove_node_ids: list[str] = Field(default_factory=list)
+    add_edges: list[DraftEdge] = Field(default_factory=list)
+    remove_edge_ids: list[str] = Field(default_factory=list)
+    replace_edges: list[DraftEdgeReplacement] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class GraphPlanningAttempt(BaseModel):
+    attempt: int
+    source: str
+    valid: bool
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+    repairs: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class GraphPlanningResult(BaseModel):
+    draft: PipelineDraft | None = None
+    attempts: list[GraphPlanningAttempt] = Field(default_factory=list)
+    used_fallback: bool = False
+    policy: dict[str, Any] = Field(default_factory=dict)
 
 
 class VideoGenerationHints(BaseModel):

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from app.autoflow.validation_repair import AutoFlowRepairService
+import pytest
+
+from app.autoflow.service import _assert_execute_allowed
+from app.autoflow.validation_repair import AutoFlowRepairService, AutoFlowUnrepairableError
 from app.orchestrator.dag import validate_pipeline
-from app.schemas.autoflow import AutoFlowClipCandidate
+from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowExecuteRequest, AutoFlowIntent, AutoFlowPlan, AutoFlowRequest
 from app.schemas.pipeline import PipelineDefinition, PipelineEdge, PipelineNode, PipelineNodeData
 
 
@@ -49,7 +52,7 @@ def test_repair_invalid_param_uses_registry_default():
     assert "invalid_param:transcode_1.crf" in result.applied_repairs
     assert validate_pipeline(result.definition).valid
     transcode = next(item for item in result.definition.nodes if item.id == "transcode_1")
-    assert transcode.data.config["crf"] == 23
+    assert transcode.data.config["crf"] == 20
 
 
 def test_repair_missing_asset_uses_candidate_asset_id():
@@ -71,7 +74,7 @@ def test_repair_missing_asset_uses_candidate_asset_id():
     assert validate_pipeline(result.definition).valid
 
 
-def test_cycle_detected_is_not_repaired():
+def test_cycle_detected_raises_unrepairable_error():
     definition = PipelineDefinition(
         nodes=[
             node("src_1", "source", {"asset_id": "asset-1", "media_type": "video"}),
@@ -85,14 +88,14 @@ def test_cycle_detected_is_not_repaired():
     validation = validate_pipeline(definition)
     assert any(error.type == "cycle_detected" for error in validation.errors)
 
-    result = AutoFlowRepairService().repair(definition, validation.errors, candidates=[])
+    with pytest.raises(AutoFlowUnrepairableError) as exc_info:
+        AutoFlowRepairService().repair(definition, validation.errors, candidates=[])
 
-    assert result.repaired is False
-    assert result.definition == definition
-    assert "cycle_detected" in result.unrepairable_errors
+    assert "cycle_detected" in exc_info.value.unrepairable_errors
+    assert exc_info.value.applied_repairs == []
 
 
-def test_port_type_mismatch_returns_manual_repair_reason():
+def test_port_type_mismatch_raises_unrepairable_error():
     definition = PipelineDefinition(
         nodes=[
             node("src_1", "source", {"asset_id": "asset-1", "media_type": "audio"}),
@@ -103,7 +106,25 @@ def test_port_type_mismatch_returns_manual_repair_reason():
     validation = validate_pipeline(definition)
     assert any(error.type == "port_type_mismatch" for error in validation.errors)
 
-    result = AutoFlowRepairService().repair(definition, validation.errors, candidates=[])
+    with pytest.raises(AutoFlowUnrepairableError) as exc_info:
+        AutoFlowRepairService().repair(definition, validation.errors, candidates=[])
 
-    assert result.repaired is False
-    assert "port_type_mismatch:e1" in result.unrepairable_errors
+    assert exc_info.value.unrepairable_errors == ["port_type_mismatch:e1"]
+
+
+def test_execute_gate_rejects_invalid_autoflow_plan():
+    definition = PipelineDefinition(nodes=[node("src_1", "source", {"media_type": "video"})], edges=[])
+    plan = AutoFlowPlan(
+        plan_id="plan-invalid",
+        request=AutoFlowRequest(prompt="make a preview"),
+        intent=AutoFlowIntent(intent_type="generic_video", subject="preview"),
+        template_id="material_library_remix",
+        pipeline_definition=definition,
+        validation={"valid": False, "errors": [{"type": "missing_asset"}]},
+        rights={"status": "allowed"},
+        status="drafted",
+        needs_review=False,
+    )
+
+    with pytest.raises(PermissionError, match="valid workflow"):
+        _assert_execute_allowed(plan, AutoFlowExecuteRequest(plan_id="plan-invalid"))

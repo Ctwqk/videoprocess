@@ -21,6 +21,8 @@ export type AutoFlowSourceStrategy =
   | 'generate_missing'
   | 'hybrid';
 
+export type AutoFlowPlanningMode = 'auto' | 'template' | 'storyboard' | 'ai_graph';
+
 export interface AutoFlowRequest {
   prompt: string;
   input_asset_id?: string | null;
@@ -39,6 +41,9 @@ export interface AutoFlowRequest {
   model?: string | null;
   constraints: Record<string, unknown>;
   user_constraints: Record<string, unknown>;
+  planning_mode: AutoFlowPlanningMode;
+  max_repair_attempts: number;
+  allow_experimental_graph_planning: boolean;
 }
 
 export interface AutoFlowIntent {
@@ -265,6 +270,50 @@ export interface AutoFlowPlan {
   rejected_reason?: string | null;
 }
 
+export interface DraftNode {
+  id: string;
+  type: string;
+  label: string;
+  config: Record<string, unknown>;
+  asset_id?: string | null;
+  position?: Record<string, number> | null;
+}
+
+export interface DraftEdge {
+  id?: string | null;
+  source: string;
+  sourceHandle: string;
+  target: string;
+  targetHandle: string;
+}
+
+export interface PipelineDraft {
+  name: string;
+  description: string;
+  nodes: DraftNode[];
+  edges: DraftEdge[];
+  planner_notes: string[];
+  assumptions: string[];
+  risk_flags: string[];
+}
+
+export interface GraphPlanningAttempt {
+  attempt: number;
+  source: string;
+  valid: boolean;
+  errors: Record<string, unknown>[];
+  warnings: Record<string, unknown>[];
+  repairs: string[];
+  notes: string[];
+}
+
+export interface GraphPlanningResult {
+  draft?: PipelineDraft | null;
+  attempts: GraphPlanningAttempt[];
+  used_fallback: boolean;
+  policy: Record<string, unknown>;
+}
+
 export type AutoFlowRunStatus =
   | 'PENDING'
   | 'PLANNING'
@@ -329,6 +378,8 @@ export interface CapabilityNodeParam {
   required?: boolean;
   description?: string;
   options?: string[] | null;
+  min_value?: number | null;
+  max_value?: number | null;
 }
 
 export interface CapabilityNodePort {
@@ -336,6 +387,39 @@ export interface CapabilityNodePort {
   port_type?: string;
   required?: boolean;
   description?: string;
+}
+
+export interface CapabilityDynamicInput {
+  pattern: string;
+  port_type: string;
+  min_count: number;
+  max_count?: number | null;
+  ordered: boolean;
+  description?: string;
+}
+
+export interface CapabilityExecutionContract {
+  effects: string[];
+  worker_type: string;
+  planner_only: boolean;
+  auto_executable: boolean;
+}
+
+export interface CapabilityPolicyContract {
+  requires_review: boolean;
+  source_policies: string[];
+  rights_risk: string;
+  default_privacy?: string | null;
+  allowed_privacy: string[];
+  public_requires_approval: boolean;
+}
+
+export interface CapabilityPlannerHints {
+  tags: string[];
+  use_when: string[];
+  common_upstream: string[];
+  common_downstream: string[];
+  fallback_nodes: string[];
 }
 
 export interface CapabilityNode {
@@ -349,6 +433,11 @@ export interface CapabilityNode {
   params?: CapabilityNodeParam[];
   worker_type?: string;
   autoflow_tags?: string[];
+  suitable_for?: string[];
+  dynamic_inputs?: CapabilityDynamicInput[];
+  execution?: CapabilityExecutionContract;
+  policy?: CapabilityPolicyContract;
+  planner_hints?: CapabilityPlannerHints;
 }
 
 export interface MaterialLibraryOption {

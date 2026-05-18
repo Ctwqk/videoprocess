@@ -120,6 +120,9 @@ mixing:
 - Output `aac`, `-ar 48000`, and `-ac 2`.
 
 For videos with no original audio, BGM still uses 48 kHz stereo and loudnorm.
+Silent placeholder audio in video composition handlers, including
+`concat_vertical_timeline`, should also use 48 kHz stereo sources instead of
+44.1 kHz so later audio stages do not force an avoidable resample.
 
 `subtitle.py` should generate ASS style from node config:
 
@@ -135,8 +138,11 @@ For videos with no original audio, BGM still uses 48 kHz stereo and loudnorm.
 - Node registry default `alignment_max_speedup` changes from `1.35` to `1.10`.
 - Audio block mixing changes `dropout_transition=0` to a small value such as
   `0.05`.
-- This phase records or surfaces long-overlap warnings where practical, but does
-  not introduce LLM text compression or resynthesis.
+- When a block still overshoots the safe `1.10` alignment budget, the handler
+  writes an explicit warning into artifact metadata rather than only logging it,
+  so downstream nodes and reviewers can see that generated speech was accelerated
+  beyond the normal quality target.
+- This phase does not introduce LLM text compression or resynthesis.
 
 Whisper defaults should improve accuracy without forcing the heaviest model:
 

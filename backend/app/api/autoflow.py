@@ -37,6 +37,14 @@ async def create_plan(data: AutoFlowRequest, db: AsyncSession | None = Depends(g
     return await autoflow_service.plan(data, db)
 
 
+@router.post("/plan/graph", response_model=AutoFlowPlan)
+async def create_graph_plan(data: AutoFlowRequest, db: AsyncSession | None = Depends(get_db)):
+    try:
+        return await autoflow_service.plan_graph(data, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/storyboard", response_model=AutoFlowStoryboardResponse)
 async def create_storyboard(data: AutoFlowStoryboardRequest):
     return await autoflow_service.storyboard(data)

@@ -8,7 +8,7 @@ from app.api.downloads import build_download_response
 from app.db import get_db
 from app.models.asset import Asset
 from app.models.artifact import Artifact, ArtifactKind
-from app.models.job import Job, JobStatus, NodeExecution
+from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.schemas.artifact import ArtifactResponse
 from app.storage.manager import get_storage
 
@@ -76,8 +76,8 @@ async def cleanup_intermediates(
             terminal_nodes = {node_id for node_id in node_ids if node_id not in edge_sources}
             terminal_cache[job.id] = terminal_nodes
 
-        # Preserve terminal-node outputs even if kind has not been promoted to FINAL yet.
-        if node_execution.node_id in terminal_nodes:
+        # Preserve successful terminal-node outputs even if kind has not been promoted to FINAL yet.
+        if node_execution.node_id in terminal_nodes and node_execution.status == NodeStatus.SUCCEEDED:
             continue
 
         # Download cache objects are intentionally shared across jobs and should

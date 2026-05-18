@@ -27,7 +27,7 @@ DEFINITION = NodeTypeDefinition(
                        description="Output resolution"),
         ParamDefinition(name="bitrate", param_type="string", default="",
                        description="Video bitrate (e.g. 5M, 2000k, empty for auto)"),
-        ParamDefinition(name="crf", param_type="number", default=23,
+        ParamDefinition(name="crf", param_type="number", default=20,
                        min_value=0, max_value=51,
                        description="Constant Rate Factor (lower = better quality)"),
         ParamDefinition(name="preset", param_type="select", default="medium",

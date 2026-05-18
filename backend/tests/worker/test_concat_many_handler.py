@@ -49,3 +49,24 @@ async def test_concat_many_uses_numbered_inputs_without_explicit_input_count(mon
     filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
     assert "concat=n=6:v=1:a=0[v]" in filter_complex
     assert filter_complex.count("scale=720:1280") == 6
+
+
+@pytest.mark.asyncio
+async def test_concat_many_uses_all_dynamic_numbered_inputs_even_past_legacy_limit(monkeypatch):
+    captured = {}
+
+    async def fake_run_ffmpeg(self, args):
+        captured["args"] = args
+        return ""
+
+    monkeypatch.setattr(ConcatManyHandler, "run_ffmpeg", fake_run_ffmpeg)
+
+    await ConcatManyHandler().execute(
+        {"input_count": 2, "width": 720, "height": 1280},
+        {f"video_{index}": f"{index}.mp4" for index in range(1, 15)},
+        "out.mp4",
+    )
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "concat=n=14:v=1:a=0[v]" in filter_complex
+    assert captured["args"].count("-i") == 15

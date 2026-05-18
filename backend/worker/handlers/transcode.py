@@ -8,7 +8,7 @@ class TranscodeHandler(BaseHandler):
         audio_codec = node_config.get("audio_codec", "aac")
         resolution = node_config.get("resolution", "")
         bitrate = node_config.get("bitrate", "")
-        crf = node_config.get("crf", 23)
+        crf = node_config.get("crf", 20)
         preset = node_config.get("preset", "medium")
 
         args = ["-i", video]
@@ -24,8 +24,8 @@ class TranscodeHandler(BaseHandler):
 
         # Resolution (convert WxH → W:H for ffmpeg scale filter)
         if video_codec != "copy" and resolution and resolution != "original":
-            scale_val = resolution.replace("x", ":")
-            args.extend(["-vf", f"scale={scale_val}"])
+            width, height = resolution.split("x", 1)
+            args.extend(["-vf", self.scale_filter(width, height)])
 
         # Audio codec
         args.extend(["-c:a", audio_codec])

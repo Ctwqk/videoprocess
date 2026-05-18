@@ -44,3 +44,35 @@ def test_manifest_exposes_supported_target_platforms_without_bilibili():
 
     assert manifest.target_platforms == ["youtube", "youtube_shorts", "x", "xiaohongshu"]
     assert "bilibili" not in manifest.target_platforms
+
+
+def test_manifest_exposes_dynamic_video_inputs_for_timeline_concat_nodes():
+    nodes = _node_by_type()
+
+    concat_many = nodes["concat_many"]
+    assert concat_many.dynamic_inputs
+    assert concat_many.dynamic_inputs[0].pattern == "video_{n}"
+    assert concat_many.dynamic_inputs[0].port_type == "video"
+    assert concat_many.dynamic_inputs[0].min_count == 2
+    assert concat_many.dynamic_inputs[0].max_count == 64
+    assert concat_many.dynamic_inputs[0].ordered is True
+
+
+def test_manifest_exposes_policy_and_execution_contracts_for_upload_nodes():
+    nodes = _node_by_type()
+
+    upload = nodes["youtube_upload"]
+    assert "external_platform_write" in upload.execution.effects
+    assert upload.policy.requires_review is True
+    assert upload.policy.default_privacy == "private"
+    assert upload.policy.allowed_privacy == ["private", "unlisted"]
+
+
+def test_manifest_exposes_planner_hints_for_vertical_timeline():
+    nodes = _node_by_type()
+
+    vertical_timeline = nodes["concat_vertical_timeline"]
+    assert "vertical_split" in vertical_timeline.planner_hints.tags
+    assert "smart_trim" in vertical_timeline.planner_hints.common_upstream
+    assert "transcode" in vertical_timeline.planner_hints.common_downstream
+    assert any("top" in text and "bottom" in text for text in vertical_timeline.planner_hints.use_when)

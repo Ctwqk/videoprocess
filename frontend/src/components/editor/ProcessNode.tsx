@@ -43,6 +43,21 @@ function formatPortLabel(name: string) {
   return name.replace(/_/g, ' ');
 }
 
+const DYNAMIC_CONCAT_NODE_TYPES = new Set(['concat_timeline', 'concat_many']);
+
+function getDynamicConcatInputCount(config: Record<string, unknown>) {
+  const parsed = Number(config.input_count);
+  return Number.isFinite(parsed) ? Math.max(2, Math.floor(parsed)) : 2;
+}
+
+function buildDynamicConcatInputs(typeName: string, config: Record<string, unknown>) {
+  if (!DYNAMIC_CONCAT_NODE_TYPES.has(typeName)) return null;
+  return Array.from({ length: getDynamicConcatInputCount(config) }, (_, index) => ({
+    name: `video_${index + 1}`,
+    port_type: 'video',
+  }));
+}
+
 function ProcessNode({ id, data, selected }: NodeProps) {
   const { nodeTypes } = useNodeTypes();
   const updateNodeInternals = useUpdateNodeInternals();
@@ -52,12 +67,14 @@ function ProcessNode({ id, data, selected }: NodeProps) {
 
   const zipChannelCount = getZipChannelCount(nodeData.config);
 
-  const inputs = typeName === 'zip_records'
-    ? Array.from({ length: zipChannelCount }, (_, index) => ({
-        name: `input_${index + 1}`,
-        port_type: 'search_results',
-      }))
-    : (typeDef?.inputs || []);
+  const dynamicConcatInputs = buildDynamicConcatInputs(typeName, nodeData.config);
+  const inputs = dynamicConcatInputs
+    ?? (typeName === 'zip_records'
+      ? Array.from({ length: zipChannelCount }, (_, index) => ({
+          name: `input_${index + 1}`,
+          port_type: 'search_results',
+        }))
+      : (typeDef?.inputs || []));
   const outputs = typeName === 'zip_records'
     ? Array.from({ length: zipChannelCount }, (_, index) => ({
         name: `output_${index + 1}`,

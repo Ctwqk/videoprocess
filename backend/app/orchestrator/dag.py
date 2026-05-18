@@ -1,5 +1,6 @@
 from __future__ import annotations
 from collections import defaultdict, deque
+import re
 from app.orchestrator.planner import (
     ASSET_INPUT_HANDLE,
     SEARCH_RESULTS_HANDLE,
@@ -15,6 +16,11 @@ from app.schemas.pipeline import (
 )
 from app.node_registry.base import PortType
 from app.node_registry.registry import NodeTypeRegistry
+
+VIDEO_INPUT_RE = re.compile(r"^video_(\d+)$")
+DYNAMIC_VIDEO_INPUT_NODE_TYPES = {"concat_timeline", "concat_many"}
+DYNAMIC_VIDEO_INPUT_MAX_COUNTS = {"concat_timeline": 64, "concat_many": 64}
+LEGACY_TIMELINE_INPUT_HANDLES = {"video_first": "video_1", "video_second": "video_2"}
 
 
 def _infer_actual_output_port_type(node) -> PortType | None:
@@ -34,6 +40,57 @@ def _infer_actual_output_port_type(node) -> PortType | None:
         return PortType.VIDEO
 
     return None
+
+
+def _dynamic_video_input_index(node_type: str, handle: str) -> int | None:
+    if node_type not in DYNAMIC_VIDEO_INPUT_NODE_TYPES:
+        return None
+    if node_type == "concat_timeline" and handle in LEGACY_TIMELINE_INPUT_HANDLES:
+        handle = LEGACY_TIMELINE_INPUT_HANDLES[handle]
+    match = VIDEO_INPUT_RE.match(handle)
+    if not match:
+        return None
+    index = int(match.group(1))
+    return index if index >= 1 else None
+
+
+def _dynamic_video_input_limit_error(node_type: str, handle: str) -> str | None:
+    if node_type not in DYNAMIC_VIDEO_INPUT_NODE_TYPES:
+        return None
+    canonical = _canonical_target_handle(node_type, handle)
+    match = VIDEO_INPUT_RE.match(canonical)
+    if not match:
+        return None
+    index = int(match.group(1))
+    max_count = DYNAMIC_VIDEO_INPUT_MAX_COUNTS.get(node_type)
+    if max_count is not None and index > max_count:
+        return f"Dynamic input '{handle}' exceeds max input count {max_count}"
+    return None
+
+
+def _canonical_target_handle(node_type: str, handle: str) -> str:
+    if node_type == "concat_timeline":
+        return LEGACY_TIMELINE_INPUT_HANDLES.get(handle, handle)
+    return handle
+
+
+def _validate_dynamic_video_input_edge(
+    registry: NodeTypeRegistry,
+    source_type: str,
+    source_port: str,
+    source_node,
+) -> bool:
+    source_type_def = registry.get_type(source_type)
+    if not source_type_def:
+        return False
+    source_port_def = next((p for p in source_type_def.outputs if p.name == source_port), None)
+    if not source_port_def:
+        return False
+    if source_port_def.port_type not in {PortType.VIDEO, PortType.ANY_MEDIA}:
+        return False
+
+    actual_source_type = _infer_actual_output_port_type(source_node)
+    return actual_source_type in {None, PortType.VIDEO}
 
 
 def _build_graph(definition: PipelineDefinition) -> tuple[dict[str, int], dict[str, list[str]], list[ValidationError]]:
@@ -138,6 +195,28 @@ def validate_pipeline(definition: PipelineDefinition) -> ValidationResult:
         if not src_node or not tgt_node:
             continue
 
+        dynamic_input_limit_error = _dynamic_video_input_limit_error(tgt_node.type, edge.targetHandle)
+        if dynamic_input_limit_error is not None:
+            errors.append(ValidationError(
+                type="invalid_dynamic_input",
+                edge_id=edge.id,
+                source_port=edge.sourceHandle,
+                target_port=edge.targetHandle,
+                message=dynamic_input_limit_error,
+            ))
+            continue
+
+        if _dynamic_video_input_index(tgt_node.type, edge.targetHandle) is not None:
+            if not _validate_dynamic_video_input_edge(registry, src_node.type, edge.sourceHandle, src_node):
+                errors.append(ValidationError(
+                    type="port_type_mismatch",
+                    edge_id=edge.id,
+                    source_port=edge.sourceHandle,
+                    target_port=edge.targetHandle,
+                    message=f"Cannot connect '{edge.sourceHandle}' to '{edge.targetHandle}' (type mismatch)",
+                ))
+            continue
+
         if is_search_node_type(src_node.type) or tgt_node.type == "zip_records" or src_node.type == "zip_records":
             planner_valid = False
             if is_search_node_type(src_node.type) and tgt_node.type == "zip_records":
@@ -207,21 +286,35 @@ def validate_pipeline(definition: PipelineDefinition) -> ValidationResult:
     # 5. Duplicate input port check + required input check
     connected_inputs: dict[str, set[str]] = defaultdict(set)
     for edge in definition.edges:
-        key = (edge.target, edge.targetHandle)
-        if edge.targetHandle in connected_inputs.get(edge.target, set()):
-            tgt_node = nodes_by_id.get(edge.target)
+        tgt_node = nodes_by_id.get(edge.target)
+        target_handle = _canonical_target_handle(tgt_node.type, edge.targetHandle) if tgt_node else edge.targetHandle
+        if target_handle in connected_inputs.get(edge.target, set()):
             tgt_label = (tgt_node.data.label or tgt_node.type) if tgt_node else edge.target
             errors.append(ValidationError(
                 type="duplicate_input_port",
                 node_id=edge.target,
-                target_port=edge.targetHandle,
-                message=f"Input port '{edge.targetHandle}' on '{tgt_label}' has multiple connections (only one allowed)",
+                target_port=target_handle,
+                message=f"Input port '{target_handle}' on '{tgt_label}' has multiple connections (only one allowed)",
             ))
-        connected_inputs[edge.target].add(edge.targetHandle)
+        connected_inputs[edge.target].add(target_handle)
 
     for node in definition.nodes:
         node_def = registry.get_type(node.type)
         if not node_def:
+            continue
+        if node.type in DYNAMIC_VIDEO_INPUT_NODE_TYPES:
+            connected_dynamic_inputs = {
+                _canonical_target_handle(node.type, edge.targetHandle)
+                for edge in definition.edges
+                if edge.target == node.id and _dynamic_video_input_index(node.type, edge.targetHandle) is not None
+            }
+            if len(connected_dynamic_inputs) < 2:
+                errors.append(ValidationError(
+                    type="missing_required_input",
+                    node_id=node.id,
+                    target_port="video_*",
+                    message=f"At least two video inputs on '{node.data.label or node.type}' must be connected",
+                ))
             continue
         if node.type == "zip_records":
             channel_count = get_zip_channel_count(node.data.config)

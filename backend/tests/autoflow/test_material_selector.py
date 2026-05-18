@@ -417,6 +417,38 @@ async def test_external_search_caps_total_results_across_platforms():
 
 
 @pytest.mark.asyncio
+async def test_external_search_prefers_user_prompt_as_query():
+    request = AutoFlowRequest(
+        prompt="funny puppy short clip 10 seconds",
+        source_policy="remix_with_review",
+        source_platforms=["youtube"],
+    )
+    client = RecordingPlatformClient()
+    service = SearchService(platform_client=client)
+
+    await service.search_external(intent("remix_with_review"), request, max_results=3)
+
+    assert client.calls == [("youtube", "funny puppy short clip 10 seconds", 3)]
+
+
+@pytest.mark.asyncio
+async def test_external_search_honors_max_candidates_constraint():
+    request = AutoFlowRequest(
+        prompt="funny puppy short clip 10 seconds",
+        source_policy="remix_with_review",
+        source_platforms=["youtube"],
+        constraints={"max_candidates": 4},
+    )
+    client = RecordingPlatformClient()
+    selector = MaterialSelector(search_service=SearchService(platform_client=client))
+
+    candidates = await selector.find_candidates(intent("remix_with_review"), request)
+
+    assert len(candidates) == 4
+    assert client.calls == [("youtube", "funny puppy short clip 10 seconds", 4)]
+
+
+@pytest.mark.asyncio
 async def test_empty_source_platforms_skip_external_search():
     request = AutoFlowRequest(prompt="不要外部搜索", source_policy="research_only", source_platforms=[])
     client = RecordingPlatformClient()

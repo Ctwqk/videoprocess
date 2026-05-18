@@ -11,7 +11,7 @@ class WatermarkHandler(BaseHandler):
         margin = int(node_config.get("margin", 10))
 
         # Scale watermark relative to video width
-        scale_filter = f"[1:v]scale=iw*{scale}:-1,format=rgba,colorchannelmixer=aa={opacity}[wm]"
+        scale_filter = f"[1:v]scale=iw*{scale}:-1:flags=lanczos,format=rgba,colorchannelmixer=aa={opacity}[wm]"
 
         # Position mapping
         positions = {
@@ -30,7 +30,7 @@ class WatermarkHandler(BaseHandler):
             "-i", image,
             "-filter_complex", filter_complex,
             "-map", "[v]", "-map", "0:a?",
-            *self.build_video_encode_args("libx264", preset="fast", crf=23),
+            *self.intermediate_video_encode_args("libx264"),
             "-c:a", "copy",
             output_path,
         ]

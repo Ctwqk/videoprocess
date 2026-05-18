@@ -35,7 +35,8 @@ class MaterialSelector:
         request: AutoFlowRequest,
         db: AsyncSession | None = None,
     ) -> CandidateSelectionResult:
-        material = await self.search_service.search_material(intent, request, db=db)
+        max_results = _max_candidate_count(request)
+        material = await self.search_service.search_material(intent, request, db=db, max_results=max_results)
 
         if request.source_policy == "owned_only":
             return CandidateSelectionResult([candidate for candidate in material if _is_owned_material(candidate)], [])
@@ -46,14 +47,14 @@ class MaterialSelector:
         if request.source_policy in {"research_only", "remix_with_review"}:
             search_with_warnings = getattr(self.search_service, "search_external_platforms_with_warnings", None)
             if callable(search_with_warnings):
-                external_result = await search_with_warnings(intent, request)
+                external_result = await search_with_warnings(intent, request, max_results=max_results)
                 external = external_result.candidates
                 warnings = external_result.warnings
             elif hasattr(self.search_service, "search_external_platforms"):
-                external = await self.search_service.search_external_platforms(intent, request)
+                external = await self.search_service.search_external_platforms(intent, request, max_results=max_results)
                 warnings = list(getattr(self.search_service, "last_warnings", []))
             else:
-                external = await self.search_service.search_external(intent, request)
+                external = await self.search_service.search_external(intent, request, max_results=max_results)
                 warnings = list(getattr(self.search_service, "last_warnings", []))
             return CandidateSelectionResult(
                 [
@@ -97,3 +98,13 @@ def _force_review_required(candidate: AutoFlowClipCandidate) -> AutoFlowClipCand
     if not candidate.url:
         return candidate
     return candidate.model_copy(update={"rights_status": "review_required"})
+
+
+def _max_candidate_count(request: AutoFlowRequest) -> int:
+    constraints = request.constraints if isinstance(request.constraints, dict) else {}
+    raw_value = constraints.get("max_candidates") or constraints.get("max_results")
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return 8
+    return max(1, min(value, 50))

@@ -65,7 +65,7 @@ DEFINITION = NodeTypeDefinition(
         ParamDefinition(
             name="alignment_max_speedup",
             param_type="number",
-            default=1.35,
+            default=1.10,
             description="Maximum atempo speed-up used to prevent overlap when generated speech runs long",
         ),
         ParamDefinition(

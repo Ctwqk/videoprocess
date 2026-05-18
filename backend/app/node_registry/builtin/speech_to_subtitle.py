@@ -17,7 +17,7 @@ DEFINITION = NodeTypeDefinition(
         ParamDefinition(
             name="model",
             param_type="select",
-            default="small",
+            default="medium",
             options=["tiny", "base", "small", "medium", "large-v3"],
             description="Whisper model size",
         ),

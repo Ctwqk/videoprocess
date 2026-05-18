@@ -20,14 +20,14 @@ async def execute_stack_concat(
     if stack_axis == "horizontal":
         if resize_mode == "match_height":
             filter_complex = (
-                f"[0:v]scale=-2:480[{primary_label}];"
-                f"[1:v]scale=-2:480[{secondary_label}];"
+                f"[0:v]scale=-2:480:flags=lanczos[{primary_label}];"
+                f"[1:v]scale=-2:480:flags=lanczos[{secondary_label}];"
                 f"[{primary_label}][{secondary_label}]hstack=inputs=2[v]"
             )
         elif resize_mode == "match_width":
             filter_complex = (
-                f"[0:v]scale=640:-2[{primary_label}];"
-                f"[1:v]scale=640:-2[{secondary_label}];"
+                f"[0:v]scale=640:-2:flags=lanczos[{primary_label}];"
+                f"[1:v]scale=640:-2:flags=lanczos[{secondary_label}];"
                 f"[{primary_label}][{secondary_label}]hstack=inputs=2[v]"
             )
         else:
@@ -35,14 +35,14 @@ async def execute_stack_concat(
     else:
         if resize_mode == "match_width":
             filter_complex = (
-                f"[0:v]scale=640:-2[{primary_label}];"
-                f"[1:v]scale=640:-2[{secondary_label}];"
+                f"[0:v]scale=640:-2:flags=lanczos[{primary_label}];"
+                f"[1:v]scale=640:-2:flags=lanczos[{secondary_label}];"
                 f"[{primary_label}][{secondary_label}]vstack=inputs=2[v]"
             )
         elif resize_mode == "match_height":
             filter_complex = (
-                f"[0:v]scale=-2:480[{primary_label}];"
-                f"[1:v]scale=-2:480[{secondary_label}];"
+                f"[0:v]scale=-2:480:flags=lanczos[{primary_label}];"
+                f"[1:v]scale=-2:480:flags=lanczos[{secondary_label}];"
                 f"[{primary_label}][{secondary_label}]vstack=inputs=2[v]"
             )
         else:
@@ -64,8 +64,7 @@ async def execute_stack_concat(
     elif secondary_has_audio:
         args.extend(["-map", "1:a:0", "-c:a", "aac"])
     args.extend([
-        *handler.build_video_encode_args("libx264", preset="fast", crf=23),
+        *handler.intermediate_video_encode_args("libx264"),
         output_path,
     ])
     await handler.run_ffmpeg(args)
-

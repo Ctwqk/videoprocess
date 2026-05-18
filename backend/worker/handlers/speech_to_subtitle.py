@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class SpeechToSubtitleHandler(BaseHandler):
     async def execute(self, node_config, input_paths, output_path):
         media_path = input_paths["media"]
-        model_name = str(node_config.get("model", "small") or "small")
+        model_name = str(node_config.get("model", "medium") or "medium")
         language = str(node_config.get("language", "") or "").strip() or None
         beam_size = int(node_config.get("beam_size", 5) or 5)
         merge_adjacent = self.parse_bool_param(node_config.get("merge_adjacent"), True)
@@ -115,6 +115,10 @@ class SpeechToSubtitleHandler(BaseHandler):
             media_path,
             language=language,
             beam_size=beam_size,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
+            word_timestamps=True,
+            condition_on_previous_text=False,
         )
 
         cues: list[SubtitleCue] = []

@@ -38,6 +38,14 @@ class GeneratedAudioBlock:
     provider: str
 
 
+@dataclass
+class AlignmentResult:
+    audio_inputs: list[tuple[str, int]]
+    final_duration: float
+    peak_shift_ms: int
+    warnings: list[dict]
+
+
 class SubtitleToSpeechHandler(BaseHandler):
     async def execute(self, node_config, input_paths, output_path):
         subtitle_path = input_paths["subtitle_file"]
@@ -50,7 +58,7 @@ class SubtitleToSpeechHandler(BaseHandler):
         block_max_chars = int(node_config.get("block_max_chars", 220) or 220)
         block_min_duration_seconds = float(node_config.get("block_min_duration_seconds", 2.5) or 2.5)
         block_max_duration_seconds = float(node_config.get("block_max_duration_seconds", 10.0) or 10.0)
-        alignment_max_speedup = float(node_config.get("alignment_max_speedup", 1.35) or 1.35)
+        alignment_max_speedup = float(node_config.get("alignment_max_speedup", 1.10) or 1.10)
         alignment_max_leading_delay_ms = int(
             node_config.get("alignment_max_leading_delay_ms", 800) or 800
         )
@@ -160,7 +168,7 @@ class SubtitleToSpeechHandler(BaseHandler):
             finally:
                 await client.aclose()
 
-            aligned_inputs, final_duration, peak_shift_ms = await self._align_audio_blocks(
+            alignment = await self._align_audio_blocks(
                 audio_blocks=audio_blocks,
                 timeline_duration=max(cue.end_seconds for cue in cues),
                 max_speedup=alignment_max_speedup,
@@ -168,8 +176,8 @@ class SubtitleToSpeechHandler(BaseHandler):
                 temp_audio_files=temp_audio_files,
             )
             await self._mix_audio_timeline(
-                audio_inputs=aligned_inputs,
-                duration=final_duration,
+                audio_inputs=alignment.audio_inputs,
+                duration=alignment.final_duration,
                 output_path=output_path,
             )
         finally:
@@ -188,12 +196,14 @@ class SubtitleToSpeechHandler(BaseHandler):
             "subtitle_segments": len(cues),
             "speech_blocks": len(speech_blocks),
             "tts_language": language,
-            "output_duration": final_duration,
+            "output_duration": alignment.final_duration,
             "tts_provider": provider_used or "local",
             "tts_fallback_reason": minimax_fallback_reason,
             "reference_text_used": bool(local_speaker_text),
             "alignment_strategy": "subdub-inspired-block-fit",
-            "alignment_peak_shift_ms": peak_shift_ms,
+            "alignment_peak_shift_ms": alignment.peak_shift_ms,
+            "tts_alignment_warnings": alignment.warnings,
+            "warnings": [warning["message"] for warning in alignment.warnings],
         }
 
     def _local_tts_base_urls(self) -> list[str]:
@@ -720,8 +730,9 @@ class SubtitleToSpeechHandler(BaseHandler):
         max_speedup: float,
         max_leading_delay_ms: int,
         temp_audio_files: list[str],
-    ) -> tuple[list[tuple[str, int]], float, int]:
+    ) -> AlignmentResult:
         audio_inputs: list[tuple[str, int]] = []
+        warnings: list[dict] = []
         current_time_ms = 0
         total_shift_ms = 0
         peak_shift_ms = 0
@@ -744,15 +755,28 @@ class SubtitleToSpeechHandler(BaseHandler):
                 delay_ms = min(max_leading_delay_ms, int(spare_ms * 0.7))
 
             speedup_factor = 1.0
+            required_speedup_factor = 1.0
             if total_shift_ms > 0 and max_speedup > 1.0:
-                speedup_factor = min(
-                    max_speedup,
-                    (selected_duration_ms + total_shift_ms) / max(selected_duration_ms, 1),
-                )
+                required_speedup_factor = (selected_duration_ms + total_shift_ms) / max(selected_duration_ms, 1)
+                speedup_factor = min(max_speedup, required_speedup_factor)
             elif total_shift_ms <= 0 and selected_duration_ms > slot_ms and max_speedup > 1.0:
-                speedup_factor = min(
-                    max_speedup,
-                    selected_duration_ms / max(slot_ms, 1),
+                required_speedup_factor = selected_duration_ms / max(slot_ms, 1)
+                speedup_factor = min(max_speedup, required_speedup_factor)
+
+            if required_speedup_factor > 1.10:
+                warnings.append(
+                    {
+                        "type": "tts_alignment_speedup_overshoot",
+                        "block_index": block.block.index,
+                        "cue_indexes": list(block.block.cue_indexes),
+                        "required_speedup": round(required_speedup_factor, 3),
+                        "applied_speedup": round(speedup_factor, 3),
+                        "safe_speedup": 1.10,
+                        "message": (
+                            f"Generated speech block {block.block.index} required "
+                            f"{required_speedup_factor:.2f}x speed-up; applied {speedup_factor:.2f}x cap."
+                        ),
+                    }
                 )
 
             if speedup_factor > 1.01:
@@ -775,7 +799,12 @@ class SubtitleToSpeechHandler(BaseHandler):
             peak_shift_ms = max(peak_shift_ms, total_shift_ms)
 
         final_duration = max(timeline_duration, current_time_ms / 1000)
-        return audio_inputs, final_duration, peak_shift_ms
+        return AlignmentResult(
+            audio_inputs=audio_inputs,
+            final_duration=final_duration,
+            peak_shift_ms=peak_shift_ms,
+            warnings=warnings,
+        )
 
     async def _speed_up_audio(
         self,
@@ -841,7 +870,7 @@ class SubtitleToSpeechHandler(BaseHandler):
             mix_inputs.append(f"[{delayed_label}]")
 
         filter_parts.append(
-            "".join(mix_inputs) + f"amix=inputs={len(mix_inputs)}:duration=longest:dropout_transition=0[aout]"
+            "".join(mix_inputs) + f"amix=inputs={len(mix_inputs)}:duration=longest:dropout_transition=0.05[aout]"
         )
         args.extend([
             "-filter_complex", ";".join(filter_parts),

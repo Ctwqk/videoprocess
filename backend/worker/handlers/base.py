@@ -87,9 +87,10 @@ class BaseHandler(abc.ABC):
         self,
         codec: str | None = None,
         *,
-        preset: str = "fast",
-        crf: int | None = None,
+        preset: str = "medium",
+        crf: int | None = 20,
         bitrate: str = "",
+        mp4_compatible: bool = True,
     ) -> list[str]:
         selected = self.preferred_video_codec(codec)
         args = ["-c:v", selected]
@@ -111,7 +112,65 @@ class BaseHandler(abc.ABC):
             if selected not in ("h264_videotoolbox", "hevc_videotoolbox"):
                 args.extend(["-b:v", bitrate])
 
+        if mp4_compatible and selected in {
+            "libx264",
+            "libx265",
+            "h264_nvenc",
+            "hevc_nvenc",
+            "h264_videotoolbox",
+            "hevc_videotoolbox",
+        }:
+            args.extend([
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+            ])
+
         return args
+
+    def intermediate_video_encode_args(
+        self,
+        codec: str | None = "libx264",
+        *,
+        bitrate: str = "",
+        mp4_compatible: bool = True,
+    ) -> list[str]:
+        return self.build_video_encode_args(
+            codec,
+            preset="slow",
+            crf=18,
+            bitrate=bitrate,
+            mp4_compatible=mp4_compatible,
+        )
+
+    def final_video_encode_args(
+        self,
+        codec: str | None = "libx264",
+        *,
+        bitrate: str = "",
+        mp4_compatible: bool = True,
+    ) -> list[str]:
+        return self.build_video_encode_args(
+            codec,
+            preset="medium",
+            crf=20,
+            bitrate=bitrate,
+            mp4_compatible=mp4_compatible,
+        )
+
+    def scale_filter(self, width: int | str, height: int | str, *, force_original_aspect_ratio: str | None = None) -> str:
+        parts = [f"scale={width}:{height}"]
+        if force_original_aspect_ratio:
+            parts.append(f"force_original_aspect_ratio={force_original_aspect_ratio}")
+        parts.append("flags=lanczos")
+        return ":".join(parts)
 
     def _default_videotoolbox_bitrate(self, codec: str) -> str:
         return {
@@ -163,10 +222,18 @@ class BaseHandler(abc.ABC):
             i += 1
 
         if removed_cq is not None and not has_crf:
-            insert_at = len(rewritten) - 1 if rewritten and not rewritten[-1].startswith("-") else len(rewritten)
-            rewritten[insert_at:insert_at] = ["-crf", removed_cq]
+            mapped_crf = str(self._nvenc_cq_to_libx264_crf(removed_cq))
+            insert_at = 2 if len(rewritten) >= 2 and rewritten[0] == "-c:v" else len(rewritten)
+            rewritten[insert_at:insert_at] = ["-crf", mapped_crf]
 
         return rewritten
+
+    def _nvenc_cq_to_libx264_crf(self, cq: str) -> int:
+        try:
+            value = int(float(cq))
+        except (TypeError, ValueError):
+            return 21
+        return max(18, value - 2)
 
     async def _gpu_looks_busy(self) -> bool:
         if not self.gpu_enabled() or not self.gpu_fallback_enabled():

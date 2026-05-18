@@ -12,6 +12,9 @@ type PlannerNodeSearchResult = PlannerSearchResult;
 type SourceMediaKind = 'video' | 'audio' | 'subtitle' | 'image';
 type RemoteSearchNodeType = 'youtube_search' | 'x_search' | 'xiaohongshu_search' | 'bilibili_search';
 
+const DYNAMIC_CONCAT_NODE_TYPES = new Set(['concat_timeline', 'concat_many']);
+const VIDEO_INPUT_HANDLE_RE = /^video_(\d+)$/;
+
 const REMOTE_SEARCH_NODE_CONFIG: Record<RemoteSearchNodeType, {
   platform: 'youtube' | 'x' | 'xiaohongshu' | 'bilibili';
   label: string;
@@ -327,6 +330,12 @@ export default function ConfigPanel() {
   const remoteSearchConfig = isRemoteSearchNodeType(node.data.nodeType)
     ? REMOTE_SEARCH_NODE_CONFIG[node.data.nodeType]
     : null;
+  const dynamicConcatNode = isDynamicConcatNodeType(node.data.nodeType);
+  const concatInputCount = getDynamicConcatInputCount(config);
+  const highestConnectedConcatInput = dynamicConcatNode
+    ? getHighestConnectedDynamicConcatInputIndex(edges, node.id)
+    : 0;
+  const minVisibleConcatInputs = Math.max(2, highestConnectedConcatInput);
 
   return (
     <div style={panelStyle}>
@@ -342,6 +351,42 @@ export default function ConfigPanel() {
       <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>
         {typeDef.icon} {typeDef.display_name}
       </div>
+
+      {dynamicConcatNode && (
+        <div style={cardStyle}>
+          <div style={{ fontSize: 11, color: '#93c5fd', fontWeight: 700, marginBottom: 8 }}>
+            Timeline Inputs
+          </div>
+          <div style={{ fontSize: 11, color: '#64748b', marginBottom: 10 }}>
+            Add ports as the timeline grows. Connected inputs are read in numeric order.
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 8 }}>
+            <button
+              type="button"
+              onClick={() => handleChange('input_count', concatInputCount + 1)}
+              style={smallActionButtonStyle}
+            >
+              Add input
+            </button>
+            <button
+              type="button"
+              disabled={concatInputCount <= minVisibleConcatInputs}
+              onClick={() => handleChange('input_count', Math.max(minVisibleConcatInputs, concatInputCount - 1))}
+              style={{
+                ...smallActionButtonStyle,
+                opacity: concatInputCount <= minVisibleConcatInputs ? 0.45 : 1,
+                cursor: concatInputCount <= minVisibleConcatInputs ? 'default' : 'pointer',
+              }}
+            >
+              Remove empty
+            </button>
+          </div>
+          <div style={{ fontSize: 11, color: '#94a3b8' }}>
+            Showing {concatInputCount} inputs
+            {highestConnectedConcatInput > 0 ? ` · highest connected: video_${highestConnectedConcatInput}` : ''}
+          </div>
+        </div>
+      )}
 
       {node.data.nodeType === 'source' && (
         <div style={cardStyle}>
@@ -729,6 +774,7 @@ export default function ConfigPanel() {
         .filter(p => !(isRemoteSearchNodeType(node.data.nodeType) && p.name === 'query'))
         .filter(p => !(node.data.nodeType === 'material_search' && ['query', 'source_library_ids', 'result_library_ids'].includes(p.name)))
         .filter(p => !(node.data.nodeType === 'material_library_ingest' && p.name === 'target_library_ids'))
+        .filter(p => !(dynamicConcatNode && p.name === 'input_count'))
         .map(param => (
           <ParamField
             key={param.name}
@@ -772,6 +818,26 @@ function formatDuration(duration?: number | null) {
 
 function isRemoteSearchNodeType(value: unknown): value is RemoteSearchNodeType {
   return value === 'youtube_search' || value === 'x_search' || value === 'xiaohongshu_search' || value === 'bilibili_search';
+}
+
+function isDynamicConcatNodeType(value: unknown): value is 'concat_timeline' | 'concat_many' {
+  return typeof value === 'string' && DYNAMIC_CONCAT_NODE_TYPES.has(value);
+}
+
+function getDynamicConcatInputCount(config: Record<string, unknown>) {
+  const parsed = Number(config.input_count);
+  return Number.isFinite(parsed) ? Math.max(2, Math.floor(parsed)) : 2;
+}
+
+function getHighestConnectedDynamicConcatInputIndex(edges: Array<{ target?: string; targetHandle?: string | null }>, nodeId: string) {
+  let highest = 0;
+  for (const edge of edges) {
+    if (edge.target !== nodeId || !edge.targetHandle) continue;
+    const match = VIDEO_INPUT_HANDLE_RE.exec(edge.targetHandle);
+    if (!match) continue;
+    highest = Math.max(highest, Number(match[1]));
+  }
+  return highest;
 }
 
 function ensurePlannerResultPlatform(
@@ -941,6 +1007,17 @@ const inputStyle: CSSProperties = {
   color: '#e2e8f0',
   fontSize: 13,
   outline: 'none',
+};
+
+const smallActionButtonStyle: CSSProperties = {
+  border: '1px solid #334155',
+  borderRadius: 6,
+  backgroundColor: '#1e293b',
+  color: '#e2e8f0',
+  cursor: 'pointer',
+  fontSize: 12,
+  fontWeight: 700,
+  padding: '7px 8px',
 };
 
 const cardStyle: CSSProperties = {
