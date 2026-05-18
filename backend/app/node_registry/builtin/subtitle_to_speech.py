@@ -74,5 +74,23 @@ DEFINITION = NodeTypeDefinition(
             default=800,
             description="Maximum extra delay before a short speech block when there is spare room",
         ),
+        ParamDefinition(
+            name="alignment_rewrite_with_llm",
+            param_type="boolean",
+            default=True,
+            description="Use the LLM gateway to shorten long speech blocks before applying speed-up alignment",
+        ),
+        ParamDefinition(
+            name="alignment_rewrite_min_speedup",
+            param_type="number",
+            default=1.10,
+            description="Required speed-up ratio that triggers LLM rewrite and re-synthesis",
+        ),
+        ParamDefinition(
+            name="alignment_rewrite_model",
+            param_type="string",
+            default="",
+            description="Optional model override for TTS alignment rewrite requests",
+        ),
     ],
 )

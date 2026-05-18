@@ -298,3 +298,5 @@ def test_smart_trim_transcribe_uses_configured_model_and_vad_options(monkeypatch
 
 def test_subtitle_to_speech_default_speedup_is_quality_safe():
     assert _param_default(subtitle_to_speech_node.DEFINITION, "alignment_max_speedup") == 1.10
+    assert _param_default(subtitle_to_speech_node.DEFINITION, "alignment_rewrite_with_llm") is True
+    assert _param_default(subtitle_to_speech_node.DEFINITION, "alignment_rewrite_min_speedup") == 1.10

@@ -121,6 +121,34 @@ async def test_concat_many_auto_aspect_uses_first_input_metadata(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_concat_many_auto_aspect_uses_dominant_input_orientation(monkeypatch):
+    captured = {}
+
+    async def fake_run_ffmpeg(self, args):
+        captured["args"] = args
+        return ""
+
+    monkeypatch.setattr(ConcatManyHandler, "run_ffmpeg", fake_run_ffmpeg)
+
+    await ConcatManyHandler().execute(
+        {
+            "aspect_ratio": "auto",
+            "_input_artifact_meta": {
+                "video_1": {"width": 1280, "height": 720},
+                "video_2": {"width": 720, "height": 1280},
+                "video_3": {"width": 720, "height": 1280},
+            },
+        },
+        {"video_1": "a.mp4", "video_2": "b.mp4", "video_3": "c.mp4"},
+        "out.mp4",
+    )
+
+    filter_complex = captured["args"][captured["args"].index("-filter_complex") + 1]
+    assert "scale=720:1280" in filter_complex
+    assert "pad=720:1280" in filter_complex
+
+
+@pytest.mark.asyncio
 async def test_concat_many_uses_all_dynamic_numbered_inputs_even_past_legacy_limit(monkeypatch):
     captured = {}
 

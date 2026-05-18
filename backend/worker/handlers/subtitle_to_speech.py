@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 import logging
 import os
 import platform
 import re
 import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import httpx
@@ -62,6 +64,16 @@ class SubtitleToSpeechHandler(BaseHandler):
         alignment_max_leading_delay_ms = int(
             node_config.get("alignment_max_leading_delay_ms", 800) or 800
         )
+        alignment_rewrite_with_llm = self.parse_bool_param(
+            node_config.get("alignment_rewrite_with_llm"),
+            True,
+        )
+        alignment_rewrite_min_speedup = float(
+            node_config.get("alignment_rewrite_min_speedup", 1.10) or 1.10
+        )
+        alignment_rewrite_model = (
+            str(node_config.get("alignment_rewrite_model", "") or "").strip() or None
+        )
 
         try:
             with open(subtitle_path, "r", encoding="utf-8") as handle:
@@ -111,55 +123,84 @@ class SubtitleToSpeechHandler(BaseHandler):
                         speaker_text=local_speaker_text,
                     )
                     if local_speaker_id is None:
-                        logger.warning("Local TTS speaker registration failed on all local TTS services; using per-request speaker upload")
+                        logger.warning(
+                            "Local TTS speaker registration failed on all local TTS services; "
+                            "using per-request speaker upload"
+                        )
 
                 audio_blocks: list[GeneratedAudioBlock] = []
+                resynth_warnings: list[dict] = []
                 total_blocks = len(speech_blocks)
                 for block_index, block in enumerate(speech_blocks, start=1):
                     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
                     temp_output.close()
                     temp_audio_files.append(temp_output.name)
-                    if prefer_minimax:
-                        try:
-                            await self._synthesize_cue_with_minimax(
-                                text=block.text,
-                                language=language,
-                                output_path=temp_output.name,
-                            )
-                            provider_used = self._merge_provider(provider_used, "minimax")
-                        except Exception as exc:
-                            minimax_fallback_reason = str(exc)
-                            logger.warning(
-                                "MiniMax TTS failed for subtitle block %s; falling back to local TTS: %s",
-                                block.index,
-                                exc,
-                            )
-                            prefer_minimax = False
 
-                    block_provider = "minimax" if prefer_minimax else "local"
-                    if not prefer_minimax:
-                        local_provider, client, current_tts_base_url, local_speaker_id = await self._synthesize_cue_with_local_fallback(
+                    async def synthesize_text(text: str, output_path: str) -> str:
+                        nonlocal client
+                        nonlocal current_tts_base_url
+                        nonlocal local_speaker_id
+                        nonlocal minimax_fallback_reason
+                        nonlocal prefer_minimax
+                        nonlocal provider_used
+
+                        if prefer_minimax:
+                            try:
+                                await self._synthesize_cue_with_minimax(
+                                    text=text,
+                                    language=language,
+                                    output_path=output_path,
+                                )
+                                provider_used = self._merge_provider(provider_used, "minimax")
+                                return "minimax"
+                            except Exception as exc:
+                                minimax_fallback_reason = str(exc)
+                                logger.warning(
+                                    "MiniMax TTS failed for subtitle block %s; falling back to local TTS: %s",
+                                    block.index,
+                                    exc,
+                                )
+                                prefer_minimax = False
+
+                        (
+                            local_provider,
+                            client,
+                            current_tts_base_url,
+                            local_speaker_id,
+                        ) = await self._synthesize_cue_with_local_fallback(
                             tts_base_urls=tts_base_urls,
                             current_base_url=current_tts_base_url,
                             client=client,
-                            text=block.text,
+                            text=text,
                             language=language,
-                            output_path=temp_output.name,
+                            output_path=output_path,
                             reference_audio_path=temp_reference_audio,
                             speaker_id=local_speaker_id,
                             speaker_text=local_speaker_text,
                         )
-                        block_provider = local_provider
                         provider_used = self._merge_provider(provider_used, local_provider)
+                        return local_provider
+
+                    block_provider = await synthesize_text(block.text, temp_output.name)
                     block_duration_ms = await self._probe_audio_duration_ms(temp_output.name)
-                    audio_blocks.append(
-                        GeneratedAudioBlock(
-                            block=block,
-                            audio_path=temp_output.name,
-                            duration_ms=block_duration_ms,
-                            provider=block_provider,
-                        )
+                    audio_block = GeneratedAudioBlock(
+                        block=block,
+                        audio_path=temp_output.name,
+                        duration_ms=block_duration_ms,
+                        provider=block_provider,
                     )
+                    audio_block, block_resynth_warnings = await self._maybe_rewrite_and_resynthesize_block(
+                        audio_block,
+                        slot_ms=self._slot_ms_for_block(speech_blocks, block_index - 1),
+                        language=language,
+                        rewrite_enabled=alignment_rewrite_with_llm,
+                        rewrite_min_speedup=alignment_rewrite_min_speedup,
+                        rewrite_model=alignment_rewrite_model,
+                        temp_audio_files=temp_audio_files,
+                        synthesize_text=synthesize_text,
+                    )
+                    resynth_warnings.extend(block_resynth_warnings)
+                    audio_blocks.append(audio_block)
                     logger.info(
                         "subtitle_to_speech progress: %s/%s blocks finished",
                         block_index,
@@ -202,9 +243,225 @@ class SubtitleToSpeechHandler(BaseHandler):
             "reference_text_used": bool(local_speaker_text),
             "alignment_strategy": "subdub-inspired-block-fit",
             "alignment_peak_shift_ms": alignment.peak_shift_ms,
-            "tts_alignment_warnings": alignment.warnings,
-            "warnings": [warning["message"] for warning in alignment.warnings],
+            "tts_alignment_warnings": [*resynth_warnings, *alignment.warnings],
+            "tts_resynth_warnings": resynth_warnings,
+            "warnings": [
+                warning["message"] for warning in [*resynth_warnings, *alignment.warnings]
+            ],
         }
+
+    def _slot_ms_for_block(self, speech_blocks: list[SpeechBlock], block_index: int) -> int:
+        block = speech_blocks[block_index]
+        if block_index < len(speech_blocks) - 1:
+            next_block = speech_blocks[block_index + 1]
+            return max(1, int(round((next_block.start_seconds - block.start_seconds) * 1000)))
+        return max(1, int(round((block.end_seconds - block.start_seconds) * 1000)))
+
+    async def _maybe_rewrite_and_resynthesize_block(
+        self,
+        audio_block: GeneratedAudioBlock,
+        *,
+        slot_ms: int,
+        language: str,
+        rewrite_enabled: bool,
+        rewrite_min_speedup: float,
+        rewrite_model: str | None,
+        temp_audio_files: list[str],
+        synthesize_text: Callable[[str, str], Awaitable[str]],
+    ) -> tuple[GeneratedAudioBlock, list[dict]]:
+        required_speedup = audio_block.duration_ms / max(slot_ms, 1)
+        if not rewrite_enabled or required_speedup <= rewrite_min_speedup:
+            return audio_block, []
+
+        try:
+            rewritten_text = await self._rewrite_text_for_tts_slot(
+                text=audio_block.block.text,
+                language=language,
+                duration_ms=audio_block.duration_ms,
+                slot_ms=slot_ms,
+                model=rewrite_model,
+            )
+        except Exception as exc:
+            return audio_block, [
+                self._tts_resynth_warning(
+                    "tts_llm_rewrite_failed",
+                    audio_block,
+                    slot_ms,
+                    required_speedup,
+                    f"LLM rewrite failed for speech block {audio_block.block.index}: {exc}",
+                )
+            ]
+
+        rewritten_text = self._normalize_tts_text(rewritten_text)
+        if not rewritten_text or rewritten_text == audio_block.block.text:
+            return audio_block, [
+                self._tts_resynth_warning(
+                    "tts_llm_rewrite_unchanged",
+                    audio_block,
+                    slot_ms,
+                    required_speedup,
+                    f"LLM rewrite did not shorten speech block {audio_block.block.index}.",
+                )
+            ]
+
+        temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        temp_output.close()
+        temp_audio_files.append(temp_output.name)
+        try:
+            provider = await synthesize_text(rewritten_text, temp_output.name)
+            rewritten_duration_ms = await self._probe_audio_duration_ms(temp_output.name)
+        except Exception as exc:
+            return audio_block, [
+                self._tts_resynth_warning(
+                    "tts_llm_resynth_failed",
+                    audio_block,
+                    slot_ms,
+                    required_speedup,
+                    f"LLM rewritten speech block {audio_block.block.index} could not be synthesized: {exc}",
+                    rewritten_text=rewritten_text,
+                )
+            ]
+
+        if rewritten_duration_ms >= audio_block.duration_ms:
+            return audio_block, [
+                self._tts_resynth_warning(
+                    "tts_llm_rewrite_not_shorter",
+                    audio_block,
+                    slot_ms,
+                    required_speedup,
+                    f"LLM rewritten speech block {audio_block.block.index} was not shorter after synthesis.",
+                    rewritten_text=rewritten_text,
+                    rewritten_duration_ms=rewritten_duration_ms,
+                )
+            ]
+
+        rewritten_block = SpeechBlock(
+            index=audio_block.block.index,
+            start_seconds=audio_block.block.start_seconds,
+            end_seconds=audio_block.block.end_seconds,
+            text=rewritten_text,
+            cue_indexes=list(audio_block.block.cue_indexes),
+        )
+        result = GeneratedAudioBlock(
+            block=rewritten_block,
+            audio_path=temp_output.name,
+            duration_ms=rewritten_duration_ms,
+            provider=provider,
+        )
+        return result, [
+            self._tts_resynth_warning(
+                "tts_llm_rewrite_resynth_applied",
+                audio_block,
+                slot_ms,
+                required_speedup,
+                f"LLM rewrite shortened speech block {audio_block.block.index} before speed-up alignment.",
+                rewritten_text=rewritten_text,
+                rewritten_duration_ms=rewritten_duration_ms,
+            )
+        ]
+
+    async def _rewrite_text_for_tts_slot(
+        self,
+        *,
+        text: str,
+        language: str,
+        duration_ms: int,
+        slot_ms: int,
+        model: str | None,
+    ) -> str:
+        ratio = max(0.1, slot_ms / max(duration_ms, 1))
+        target_chars = max(4, int(len(text) * ratio * 0.95))
+        request_body = {
+            "source": "videoprocess",
+            "profile": "generic_chat",
+            "temperature": 0.1,
+            "max_tokens": 512,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Rewrite the text for text-to-speech so it fits a shorter subtitle timing slot. "
+                        "Preserve the original meaning and language. Return only JSON: "
+                        '{"text": "..."}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "language": language,
+                            "target_chars": target_chars,
+                            "slot_ms": slot_ms,
+                            "current_audio_ms": duration_ms,
+                            "text": text,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+        }
+        if model:
+            request_body["model"] = model
+
+        async with httpx.AsyncClient(
+            base_url=os.environ.get(
+                "VIDEO_LLM_BASE_URL",
+                "http://127.0.0.1:8000/v1",
+            ).rstrip("/"),
+            timeout=float(os.environ.get("VIDEO_TTS_REWRITE_TIMEOUT_SECONDS", "20") or "20"),
+        ) as client:
+            response = await client.post("/chat/completions", json=request_body)
+            response.raise_for_status()
+            payload = response.json()
+
+        content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+        rewritten = self._parse_rewritten_tts_text(content)
+        if len(rewritten) > max(len(text), target_chars * 2):
+            raise RuntimeError("LLM rewrite expanded the speech block")
+        return rewritten
+
+    def _parse_rewritten_tts_text(self, raw_content: str) -> str:
+        content = raw_content.strip()
+        fenced_match = re.search(r"```(?:json)?\s*(.*?)```", content, flags=re.DOTALL)
+        if fenced_match:
+            content = fenced_match.group(1).strip()
+        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+        if content.startswith("{"):
+            payload = json.loads(content)
+            if not isinstance(payload, dict):
+                raise RuntimeError("LLM rewrite returned non-object JSON")
+            text = str(payload.get("text") or "").strip()
+        else:
+            text = content
+        if not text:
+            raise RuntimeError("LLM rewrite returned empty text")
+        return text
+
+    def _tts_resynth_warning(
+        self,
+        warning_type: str,
+        audio_block: GeneratedAudioBlock,
+        slot_ms: int,
+        required_speedup: float,
+        message: str,
+        *,
+        rewritten_text: str | None = None,
+        rewritten_duration_ms: int | None = None,
+    ) -> dict:
+        warning = {
+            "type": warning_type,
+            "block_index": audio_block.block.index,
+            "cue_indexes": list(audio_block.block.cue_indexes),
+            "slot_ms": slot_ms,
+            "original_duration_ms": audio_block.duration_ms,
+            "required_speedup": round(required_speedup, 3),
+            "message": message,
+        }
+        if rewritten_text is not None:
+            warning["rewritten_text"] = rewritten_text
+        if rewritten_duration_ms is not None:
+            warning["rewritten_duration_ms"] = rewritten_duration_ms
+        return warning
 
     def _local_tts_base_urls(self) -> list[str]:
         primary = str(os.environ.get("VIDEO_TTS_BASE_URL", "http://127.0.0.1:8010") or "").rstrip("/")

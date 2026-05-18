@@ -115,11 +115,20 @@ def _auto_dimensions(node_config: dict[str, Any], selected_handles: list[str]) -
     input_meta = node_config.get("_input_artifact_meta") or {}
     if not isinstance(input_meta, dict):
         return None
+    candidates: list[tuple[str, tuple[int, int]]] = []
     for handle in selected_handles:
         dimensions = _dimensions_from_media_info(input_meta.get(handle) or {})
         if dimensions is not None:
-            return dimensions
-    return None
+            candidates.append((_aspect_bucket(dimensions), dimensions))
+    if not candidates:
+        return None
+
+    counts: dict[str, int] = {}
+    for bucket, _dimensions in candidates:
+        counts[bucket] = counts.get(bucket, 0) + 1
+    max_count = max(counts.values())
+    dominant_bucket = next(bucket for bucket, _dimensions in candidates if counts[bucket] == max_count)
+    return next(dimensions for bucket, dimensions in candidates if bucket == dominant_bucket)
 
 
 def _dimensions_from_media_info(media_info: Any) -> tuple[int, int] | None:
@@ -130,6 +139,20 @@ def _dimensions_from_media_info(media_info: Any) -> tuple[int, int] | None:
     if width is None or height is None:
         return None
     return width, height
+
+
+def _aspect_bucket(dimensions: tuple[int, int]) -> str:
+    width, height = dimensions
+    if width <= 0 or height <= 0:
+        return "unknown"
+    ratio = width / height
+    if abs(ratio - 16 / 9) < 0.08:
+        return "16:9"
+    if abs(ratio - 9 / 16) < 0.08:
+        return "9:16"
+    if abs(ratio - 1.0) < 0.08:
+        return "1:1"
+    return f"{round(ratio, 3)}"
 
 
 def _positive_int_or_none(value: Any) -> int | None:
