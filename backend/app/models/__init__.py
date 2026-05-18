@@ -2,7 +2,7 @@ from app.models.base import Base
 from app.models.pipeline import Pipeline
 from app.models.job import Job, NodeExecution, JobStatus, NodeStatus
 from app.models.asset import Asset
-from app.models.artifact import Artifact, ArtifactKind
+from app.models.artifact import Artifact, ArtifactKind, IntermediateArtifactCache
 from app.models.material import (
     MaterialLibrary,
     MaterialItem,
@@ -23,6 +23,7 @@ __all__ = [
     "Asset",
     "Artifact",
     "ArtifactKind",
+    "IntermediateArtifactCache",
     "MaterialLibrary",
     "MaterialItem",
     "MaterialClip",
