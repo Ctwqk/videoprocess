@@ -135,7 +135,7 @@ class ChannelAgentService:
                 state=TASK_SELECTED,
                 state_updated_at=self.clock.now(),
                 channel_config_version_snapshot=channel.config_version,
-                channel_config_snapshot_json=_snapshot(channel, account, lane_format),
+                channel_config_snapshot_json=_snapshot(channel, account, lane_format, manual_seed=seed),
                 transition_history_json=[
                     _transition("seeded", TASK_SELECTED, "agent_tick", self.clock.now()),
                 ],
@@ -457,33 +457,70 @@ class ChannelAgentService:
         return result.scalar_one_or_none()
 
     def _desired_privacy(self, task: ProductionTask, account: PublishingAccount) -> str:
+        snapshot_privacy = self._desired_privacy_from_snapshot(task)
+        if snapshot_privacy in {"private", "unlisted"}:
+            return snapshot_privacy
+        account_privacy = str(account.default_privacy or "").lower()
+        if account_privacy in {"private", "unlisted"}:
+            return account_privacy
+        return "unlisted"
+
+    def _desired_privacy_from_snapshot(self, task: ProductionTask) -> str:
         snapshot = dict(task.channel_config_snapshot_json or {})
         lane_format = dict(snapshot.get("lane_format") or {})
-        return str(lane_format.get("default_publish_visibility") or account.default_privacy or "public")
+        desired = str(lane_format.get("default_publish_visibility") or "").lower()
+        if desired in {"private", "unlisted"}:
+            return desired
+        return "unlisted"
 
     def _autoflow_request(self, task: ProductionTask) -> dict[str, Any]:
+        snapshot = dict(task.channel_config_snapshot_json or {})
+        channel = dict(snapshot.get("channel") or {})
+        lane_format = dict(snapshot.get("lane_format") or {})
+        manual_seed = dict(snapshot.get("manual_seed") or {})
+        lane = dict(snapshot.get("lane") or {})
+        risk_policy = dict(channel.get("risk_policy_json") or {})
+        constraints = {
+            "lane_id": lane.get("id"),
+            "lane_format_id": lane_format.get("id"),
+            "template_pool_json": list(lane_format.get("template_pool_json") or []),
+        }
+        constraints.update(dict(manual_seed.get("constraints_json") or {}))
+
+        source_platforms = list(task.source_platforms_json or lane_format.get("source_platforms_json") or [])
         return {
             "prompt": task.prompt,
             "target_platforms": ["youtube"],
-            "source_platforms": list(task.source_platforms_json or []),
-            "duration_sec": None,
-            "aspect_ratio": "9:16",
+            "source_platforms": source_platforms,
+            "duration_sec": int(lane_format.get("target_duration_sec") or 30),
+            "aspect_ratio": str(channel.get("default_aspect_ratio") or "9:16"),
             "source_policy": "remix_with_review" if task.uses_external_assets else "owned_only",
-            "publish_mode": "private_upload",
+            "publish_mode": self._autoflow_publish_mode(task),
             "material_library_ids": list(task.material_library_ids_json or []),
-            "constraints": {},
+            "source_strategy": str(manual_seed.get("source_strategy") or risk_policy.get("source_strategy") or "auto"),
+            "planning_mode": str(manual_seed.get("planning_mode") or risk_policy.get("planning_mode") or "auto"),
+            "constraints": constraints,
         }
+
+    def _autoflow_publish_mode(self, task: ProductionTask) -> str:
+        privacy = self._desired_privacy_from_snapshot(task)
+        if privacy == "unlisted":
+            return "unlisted_upload"
+        return "private_upload"
 
 
 def _snapshot(
     channel: ChannelProfile,
     account: PublishingAccount,
     lane_format: LaneFormatMatrix | None,
+    *,
+    manual_seed: ManualSeed | None = None,
 ) -> dict[str, Any]:
-    return {
+    snapshot = {
         "channel": {
             "id": str(channel.id),
             "dry_run": channel.dry_run,
+            "default_aspect_ratio": channel.default_aspect_ratio,
             "risk_policy_json": dict(channel.risk_policy_json or {}),
             "cadence_policy_json": dict(channel.cadence_policy_json or {}),
             "content_mix_policy_json": dict(channel.content_mix_policy_json or {}),
@@ -493,12 +530,21 @@ def _snapshot(
             "default_privacy": account.default_privacy,
             "external_asset_auto_publish": account.external_asset_auto_publish,
         },
+        "lane": {
+            "id": str(lane_format.topic_lane_id) if lane_format else None,
+        },
         "lane_format": {
             "id": str(lane_format.id) if lane_format else None,
-            "default_publish_visibility": lane_format.default_publish_visibility if lane_format else "public",
+            "format_key": lane_format.format_key if lane_format else "",
+            "default_publish_visibility": lane_format.default_publish_visibility if lane_format else "private",
             "target_duration_sec": lane_format.target_duration_sec if lane_format else 30,
+            "template_pool_json": list(lane_format.template_pool_json or []) if lane_format else [],
+            "source_platforms_json": list(lane_format.source_platforms_json or []) if lane_format else [],
         },
     }
+    if manual_seed is not None:
+        snapshot["manual_seed"] = {"constraints_json": dict(manual_seed.constraints_json or {})}
+    return snapshot
 
 
 def _transition(from_state: str, to_state: str, actor: str, now: datetime) -> dict[str, Any]:

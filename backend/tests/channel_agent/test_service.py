@@ -94,6 +94,67 @@ def _service(*, clock=None, autoflow=None, youtube=None, minimax=None) -> Channe
     )
 
 
+def test_autoflow_request_uses_task_snapshot_configuration():
+    task = ProductionTask(
+        channel_profile_id=uuid.uuid4(),
+        target_account_id=uuid.uuid4(),
+        source="lane_seed",
+        prompt="Create a tech short",
+        title_seed="AI news",
+        source_platforms_json=["bilibili", "youtube"],
+        material_library_ids_json=["library-1"],
+        uses_external_assets=True,
+        channel_config_snapshot_json={
+            "channel": {
+                "id": "channel-1",
+                "default_aspect_ratio": "16:9",
+                "risk_policy_json": {
+                    "source_strategy": "external_search",
+                    "planning_mode": "ai_graph",
+                },
+            },
+            "lane": {"id": "lane-1", "name": "Tech"},
+            "lane_format": {
+                "id": "format-1",
+                "format_key": "long_16x9",
+                "target_duration_sec": 60,
+                "template_pool_json": ["news_remix"],
+                "default_publish_visibility": "unlisted",
+            },
+            "manual_seed": {"constraints_json": {"tone": "calm"}},
+        },
+    )
+    request = _service()._autoflow_request(task)
+
+    assert request["duration_sec"] == 60
+    assert request["aspect_ratio"] == "16:9"
+    assert request["source_platforms"] == ["bilibili", "youtube"]
+    assert request["source_strategy"] == "external_search"
+    assert request["planning_mode"] == "ai_graph"
+    assert request["constraints"]["template_pool_json"] == ["news_remix"]
+    assert request["constraints"]["tone"] == "calm"
+    assert request["publish_mode"] == "unlisted_upload"
+
+
+def test_desired_privacy_falls_back_to_unlisted_not_public():
+    task = ProductionTask(
+        channel_profile_id=uuid.uuid4(),
+        target_account_id=uuid.uuid4(),
+        source="lane_seed",
+        prompt="Create a short",
+        channel_config_snapshot_json={"lane_format": {}},
+    )
+    account = PublishingAccount(
+        channel_profile_id=uuid.uuid4(),
+        account_label="main",
+        platform_account_id="yt",
+        credential_ref="youtube/main",
+        default_privacy="public",
+    )
+
+    assert _service()._desired_privacy(task, account) == "unlisted"
+
+
 @pytest.mark.asyncio
 async def test_dry_run_tick_writes_audit_without_tasks(service_session):
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=True)
