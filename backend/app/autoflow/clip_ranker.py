@@ -4,6 +4,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from app.autoflow.platform_profiles import PlatformProfile
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent
 
 
@@ -16,10 +17,24 @@ class ClipRanker:
         intent: AutoFlowIntent,
         candidates: Iterable[AutoFlowClipCandidate],
         historical_performance: dict[str, Any] | None = None,
+        *,
+        semantic_relevance_scores: dict[str, float] | None = None,
+        recent_used_asset_ids: set[str] | None = None,
+        platform_profile: PlatformProfile | None = None,
     ) -> list[AutoFlowClipCandidate]:
         deduped = self._dedupe(list(candidates))
         performance = historical_performance if historical_performance is not None else self.historical_performance
-        ranked = [self._score_candidate(intent, candidate, performance) for candidate in deduped]
+        ranked = [
+            self._score_candidate(
+                intent,
+                candidate,
+                performance,
+                semantic_relevance_scores=semantic_relevance_scores or {},
+                recent_used_asset_ids=recent_used_asset_ids or set(),
+                platform_profile=platform_profile,
+            )
+            for candidate in deduped
+        ]
         return sorted(ranked, key=lambda candidate: candidate.score, reverse=True)
 
     def _dedupe(self, candidates: list[AutoFlowClipCandidate]) -> list[AutoFlowClipCandidate]:
@@ -64,9 +79,14 @@ class ClipRanker:
         intent: AutoFlowIntent,
         candidate: AutoFlowClipCandidate,
         historical_performance: dict[str, Any],
+        *,
+        semantic_relevance_scores: dict[str, float],
+        recent_used_asset_ids: set[str],
+        platform_profile: PlatformProfile | None,
     ) -> AutoFlowClipCandidate:
         visual = candidate.metadata.get("visual") if isinstance(candidate.metadata.get("visual"), dict) else {}
         topic_relevance = _topic_relevance(intent, candidate)
+        semantic_relevance = _semantic_relevance(candidate, semantic_relevance_scores, topic_relevance)
         duration_fit = _duration_fit(intent, candidate)
         visual_motion_score = _clamp_float(visual.get("motion_score", candidate.metadata.get("motion_score", 0.45)))
         first_seconds_hook_score = _clamp_float(candidate.metadata.get("first_seconds_hook_score", 0.5))
@@ -78,9 +98,20 @@ class ClipRanker:
         duplicate_penalty = _clamp_float(candidate.metadata.get("duplicate_penalty", 0.0))
         watermark_penalty = _clamp_float(visual.get("watermark_score", candidate.metadata.get("watermark_score", 0.0)))
         historical_performance_fit = _historical_performance_fit(intent, candidate, historical_performance)
+        face_present = _face_present_score(visual, candidate.metadata)
+        scene_change_diversity = _clamp_float(
+            visual.get("scene_change_diversity", visual.get("scene_change_score", candidate.metadata.get("scene_change_score", 0.5)))
+        )
+        brightness_fit = _clamp_float(
+            visual.get("brightness_fit", visual.get("brightness_score", candidate.metadata.get("brightness_score", 0.5)))
+        )
+        platform_fit = _platform_fit(candidate, intent, platform_profile, aspect_ratio_fit)
+        recent_used_penalty = 1.0 if _candidate_key(candidate) in recent_used_asset_ids else 0.0
+        intent_fit = max(topic_relevance, duration_fit * 0.5 + aspect_ratio_fit * 0.5)
 
         breakdown = {
             "topic_relevance": topic_relevance,
+            "semantic_relevance": semantic_relevance,
             "duration_fit": duration_fit,
             "visual_motion_score": visual_motion_score,
             "first_seconds_hook_score": first_seconds_hook_score,
@@ -92,20 +123,32 @@ class ClipRanker:
             "duplicate_penalty": duplicate_penalty,
             "watermark_penalty": watermark_penalty,
             "historical_performance_fit": historical_performance_fit,
+            "intent_fit": intent_fit,
+            "face_present": face_present,
+            "scene_change_diversity": scene_change_diversity,
+            "brightness_fit": brightness_fit,
+            "platform_fit": platform_fit,
+            "recent_used_penalty": recent_used_penalty,
         }
         score = (
-            0.25 * topic_relevance
-            + 0.15 * duration_fit
-            + 0.15 * visual_motion_score
-            + 0.10 * first_seconds_hook_score
-            + 0.10 * aspect_ratio_fit
-            + 0.10 * quality_score
+            0.30 * semantic_relevance
+            + 0.10 * duration_fit
+            + 0.20 * visual_motion_score
+            + 0.08 * first_seconds_hook_score
+            + 0.06 * aspect_ratio_fit
+            + 0.08 * quality_score
             + 0.05 * source_reputation
-            + 0.05 * novelty_score
+            + 0.04 * novelty_score
             + 0.05 * historical_performance_fit
+            + 0.10 * intent_fit
+            + 0.06 * face_present
+            + 0.05 * scene_change_diversity
+            + 0.04 * brightness_fit
+            + 0.03 * platform_fit
             - 0.20 * copyright_risk
             - 0.10 * duplicate_penalty
             - 0.10 * watermark_penalty
+            - 0.15 * recent_used_penalty
         )
         return candidate.model_copy(
             update={
@@ -116,13 +159,62 @@ class ClipRanker:
 
 
 def _topic_relevance(intent: AutoFlowIntent, candidate: AutoFlowClipCandidate) -> float:
-    text = " ".join([candidate.title, str(candidate.metadata.get("description", ""))]).lower()
+    visual = candidate.metadata.get("visual") if isinstance(candidate.metadata.get("visual"), dict) else {}
+    text_parts = [
+        candidate.title,
+        str(candidate.metadata.get("description", "")),
+        str(candidate.metadata.get("platform", candidate.metadata.get("source_platform", ""))),
+        str(visual.get("dominant_action", candidate.metadata.get("dominant_action", ""))),
+    ]
+    for key in ("tags", "keywords", "object_labels"):
+        value = candidate.metadata.get(key, visual.get(key))
+        if isinstance(value, list):
+            text_parts.extend(str(item) for item in value)
+        elif value:
+            text_parts.append(str(value))
+    text = " ".join(text_parts).lower()
     keywords = [intent.subject, *intent.keywords]
     tokens = [_normalize_title(keyword) for keyword in keywords if keyword]
     if not tokens:
         return 0.5
     matches = sum(1 for token in tokens if token and token in text)
     return _clamp_float(matches / max(1, min(len(tokens), 4)))
+
+
+def _semantic_relevance(
+    candidate: AutoFlowClipCandidate,
+    semantic_relevance_scores: dict[str, float],
+    fallback: float,
+) -> float:
+    for key in (_candidate_key(candidate), candidate.id):
+        if key in semantic_relevance_scores:
+            return _clamp_float(semantic_relevance_scores[key])
+    return fallback
+
+
+def _candidate_key(candidate: AutoFlowClipCandidate) -> str:
+    return candidate.asset_id or candidate.id
+
+
+def _face_present_score(visual: dict[str, Any], metadata: dict[str, Any]) -> float:
+    value = visual.get("face_present", metadata.get("face_present"))
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    return _clamp_float(visual.get("face_score", metadata.get("face_score", 0.5)))
+
+
+def _platform_fit(
+    candidate: AutoFlowClipCandidate,
+    intent: AutoFlowIntent,
+    platform_profile: PlatformProfile | None,
+    aspect_ratio_fit: float,
+) -> float:
+    if platform_profile is None:
+        return aspect_ratio_fit
+    aspect_ratio = str(candidate.metadata.get("aspect_ratio") or intent.aspect_ratio or "")
+    if aspect_ratio in platform_profile.preferred_aspect_ratios or aspect_ratio in {"", "auto"}:
+        return 1.0
+    return 0.5
 
 
 def _duration_fit(intent: AutoFlowIntent, candidate: AutoFlowClipCandidate) -> float:

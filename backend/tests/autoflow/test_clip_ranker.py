@@ -160,3 +160,59 @@ def test_ranker_dedupes_urls_assets_titles_and_overlapping_source_windows():
     assert len([item for item in ranked if item.asset_id == "asset-1"]) == 1
     assert len([item for item in ranked if item.title.lower() == "cat rooftop jump"]) == 1
     assert len([item for item in ranked if item.metadata.get("source_video_id") == "source-video-1"]) == 1
+
+
+def test_ranker_uses_semantic_relevance_scores_when_available():
+    ranked = ClipRanker().rank(
+        intent(),
+        [
+            candidate("weak", title="generic office clip", asset_id="asset-weak", metadata={"duration": 5}),
+            candidate("semantic", title="playful animal clip", asset_id="asset-semantic", metadata={"duration": 5}),
+        ],
+        semantic_relevance_scores={"asset-weak": 0.05, "asset-semantic": 0.98},
+    )
+
+    assert [item.id for item in ranked] == ["semantic", "weak"]
+    assert ranked[0].score_breakdown["semantic_relevance"] == 0.98
+
+
+def test_ranker_penalizes_recently_used_asset_ids():
+    ranked = ClipRanker().rank(
+        intent(),
+        [
+            candidate("fresh", title="小猫 fresh", asset_id="asset-fresh", metadata={"duration": 5}),
+            candidate("recent", title="小猫 recent", asset_id="asset-recent", metadata={"duration": 5}),
+        ],
+        recent_used_asset_ids={"asset-recent"},
+    )
+
+    assert [item.id for item in ranked] == ["fresh", "recent"]
+    assert ranked[1].score_breakdown["recent_used_penalty"] == 1.0
+
+
+def test_ranker_uses_visual_face_scene_and_brightness_signals():
+    ranked = ClipRanker().rank(
+        intent(),
+        [
+            candidate("plain", title="小猫 plain", asset_id="asset-plain", metadata={"duration": 5}),
+            candidate(
+                "visual",
+                title="小猫 visual",
+                asset_id="asset-visual",
+                metadata={
+                    "duration": 5,
+                    "visual": {
+                        "motion_score": 0.8,
+                        "face_present": True,
+                        "scene_change_score": 0.9,
+                        "brightness_score": 0.85,
+                    },
+                },
+            ),
+        ],
+    )
+
+    assert [item.id for item in ranked] == ["visual", "plain"]
+    assert ranked[0].score_breakdown["face_present"] == 1.0
+    assert ranked[0].score_breakdown["scene_change_diversity"] == 0.9
+    assert ranked[0].score_breakdown["brightness_fit"] == 0.85
