@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 import pytest
@@ -148,3 +150,51 @@ async def test_channel_agent_api_config_seed_enqueue_and_status(api_session):
         tasks_response = await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/tasks")
         assert tasks_response.status_code == 200
         assert tasks_response.json() == []
+
+
+@pytest.mark.asyncio
+async def test_enqueue_metrics_returns_channel_scoped_queue_item(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        created_channel = await client.post(
+            "/api/v1/channel-agent/channels",
+            json={"name": "Metrics Channel", "language": "zh"},
+        )
+        assert created_channel.status_code == 200
+        channel = created_channel.json()
+
+        account_response = await client.post(
+            f"/api/v1/channel-agent/channels/{channel['id']}/accounts",
+            json={
+                "account_label": "yt-main",
+                "platform_account_id": "yt-1",
+                "credential_ref": "youtube/main",
+            },
+        )
+        assert account_response.status_code == 200
+        account = account_response.json()
+
+        task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="measure this short",
+            channel_config_snapshot_json={},
+        )
+        api_session.add(task)
+        await api_session.flush()
+        publication = PublicationRecord(
+            production_task_id=task.id,
+            account_id=uuid.UUID(account["id"]),
+            platform_content_id="yt-video-1",
+            title="metrics short",
+            compliance_disposition="assumed_fair_use",
+        )
+        api_session.add(publication)
+        await api_session.commit()
+
+        response = await client.post(f"/api/v1/channel-agent/publications/{publication.id}/enqueue-metrics")
+
+        assert response.status_code == 200
+        queue_item = response.json()
+        assert queue_item["kind"] == "collect_metrics"
+        assert queue_item["channel_profile_id"] == channel["id"]

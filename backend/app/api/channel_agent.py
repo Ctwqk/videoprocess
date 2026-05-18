@@ -298,6 +298,9 @@ async def enqueue_metrics(publication_id: str, db: AsyncSession = Depends(get_db
     publication = await db.get(PublicationRecord, _uuid(publication_id))
     if publication is None:
         raise HTTPException(status_code=404, detail="Publication not found")
+    task = await db.get(ProductionTask, publication.production_task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Production task not found")
     bucket = utc_hour_bucket(Clock().now())
     item = await ChannelOpsQueueService().enqueue(
         db,
@@ -305,6 +308,7 @@ async def enqueue_metrics(publication_id: str, db: AsyncSession = Depends(get_db
         idempotency_key=f"collect_metrics:{publication_id}:{bucket}",
         payload={"publication_id": publication_id},
         priority=90,
+        channel_profile_id=task.channel_profile_id,
     )
     return _queue(item)
 
