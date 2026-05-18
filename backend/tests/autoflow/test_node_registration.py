@@ -68,3 +68,17 @@ def test_concat_timeline_exposes_only_default_dynamic_inputs():
     params = {param.name: param for param in definition.params}
     assert params["input_count"].default == 2
     assert params["input_count"].max_value is None
+
+
+def test_export_node_contract_exposes_quality_qa_params():
+    definition = NodeTypeRegistry.get().get_type("export")
+
+    assert definition is not None
+    params = {param.name: param for param in definition.params}
+    assert params["enable_quality_qa"].default is True
+    assert params["quality_gate_mode"].default == "soft_repair_once"
+    assert params["quality_gate_mode"].options == ["soft_repair_once"]
+    assert params["vmaf_min_score"].default == 80
+    assert params["loudnorm_target_i"].default == -16
+    assert params["loudnorm_target_lra"].default == 11
+    assert params["loudnorm_target_tp"].default == -1.5
