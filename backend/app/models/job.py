@@ -84,7 +84,7 @@ class NodeExecution(UUIDPrimaryKeyMixin, Base):
     error_trace: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     input_artifact_ids: Mapped[list[uuid_mod.UUID]] = mapped_column(
-        ARRAY(UUID(as_uuid=True)), default=list
+        ARRAY(UUID(as_uuid=True)).with_variant(JSON, "sqlite"), default=list
     )
     output_artifact_id: Mapped[uuid_mod.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True

@@ -17,6 +17,7 @@ from app.models.asset import Asset
 from app.models.artifact import Artifact, ArtifactKind
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.node_registry.registry import NodeTypeRegistry
+from app.orchestrator.artifact_cache import IntermediateArtifactCacheService
 from app.schemas.pipeline import PipelineDefinition
 from app.orchestrator.dag import topological_sort, build_dependency_map
 from app.services.schedule_service import get_video_schedule_state, park_job_for_window, should_defer_job_start
@@ -52,6 +53,9 @@ def _leaf_node_ids(definition: PipelineDefinition) -> set[str]:
 
 class JobEngine:
     """Orchestrates job execution by dispatching nodes to workers via Redis Streams."""
+
+    def __init__(self, artifact_cache: IntermediateArtifactCacheService | None = None) -> None:
+        self.artifact_cache = artifact_cache or IntermediateArtifactCacheService()
 
     async def _maybe_finalize_job(self, db: AsyncSession, job: Job) -> bool:
         """Mark the job terminal once all node executions have reached a terminal state."""
@@ -237,6 +241,9 @@ class JobEngine:
                         upstream_ne = ne_by_node_id.get(edge.source)
                         if upstream_ne and upstream_ne.output_artifact_id:
                             input_artifacts[edge.targetHandle] = str(upstream_ne.output_artifact_id)
+                input_artifact_objects = await self._input_artifacts_by_handle(db, input_artifacts)
+                if await self._apply_cached_artifact_if_available(db, job, ne, input_artifact_objects):
+                    continue
 
                 ne.status = NodeStatus.QUEUED
                 ne.queued_at = datetime.utcnow()
@@ -270,6 +277,106 @@ class JobEngine:
                 )
         finally:
             await r.aclose()
+        await self._maybe_finalize_job(db, job)
+
+    async def _apply_cached_artifact_if_available(
+        self,
+        db: AsyncSession,
+        job: Job,
+        ne: NodeExecution,
+        input_artifacts: dict[str, Artifact],
+    ) -> bool:
+        if not input_artifacts:
+            return False
+        try:
+            entry = await self.artifact_cache.lookup(
+                db,
+                node_type=ne.node_type,
+                node_config=ne.node_config or {},
+                input_artifacts=input_artifacts,
+            )
+        except Exception:
+            logger.exception("Artifact cache lookup failed for job=%s node=%s", job.id, ne.node_id)
+            return False
+        if entry is None:
+            return False
+
+        ne.status = NodeStatus.SUCCEEDED
+        ne.started_at = ne.started_at or datetime.utcnow()
+        ne.completed_at = datetime.utcnow()
+        ne.progress = 100
+        ne.output_artifact_id = entry.output_artifact_id
+        ne.input_artifact_ids = [artifact.id for artifact in input_artifacts.values()]
+        await self.artifact_cache.record_hit(db, entry)
+        await db.commit()
+        logger.info(
+            "Reused cached artifact for job=%s node=%s artifact=%s",
+            job.id,
+            ne.node_id,
+            entry.output_artifact_id,
+        )
+        return True
+
+    async def _input_artifacts_by_handle(
+        self,
+        db: AsyncSession,
+        input_artifact_ids: dict[str, str],
+    ) -> dict[str, Artifact]:
+        input_artifacts: dict[str, Artifact] = {}
+        for handle, artifact_id in input_artifact_ids.items():
+            artifact = await db.get(Artifact, uuid.UUID(str(artifact_id)))
+            if artifact:
+                input_artifacts[handle] = artifact
+        return input_artifacts
+
+    async def _input_artifacts_for_node(
+        self,
+        db: AsyncSession,
+        job: Job,
+        ne: NodeExecution,
+    ) -> dict[str, Artifact]:
+        ne_by_node_id = {node.node_id: node for node in job.node_executions}
+        definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
+        input_artifact_ids: dict[str, str] = {}
+        for edge in definition.edges:
+            if edge.target != ne.node_id:
+                continue
+            upstream_ne = ne_by_node_id.get(edge.source)
+            if upstream_ne and upstream_ne.output_artifact_id:
+                input_artifact_ids[edge.targetHandle] = str(upstream_ne.output_artifact_id)
+        if input_artifact_ids:
+            return await self._input_artifacts_by_handle(db, input_artifact_ids)
+
+        fallback_artifact_ids = list(ne.input_artifact_ids or [])
+        if not fallback_artifact_ids:
+            return {}
+        fallback_handles = {
+            ("input" if index == 0 else f"input_{index + 1}"): str(artifact_id)
+            for index, artifact_id in enumerate(fallback_artifact_ids)
+        }
+        return await self._input_artifacts_by_handle(db, fallback_handles)
+
+    async def _write_artifact_cache_for_node(
+        self,
+        db: AsyncSession,
+        job: Job,
+        ne: NodeExecution,
+    ) -> None:
+        if not ne.output_artifact_id:
+            return
+        output_artifact = await db.get(Artifact, ne.output_artifact_id)
+        if not output_artifact:
+            return
+        input_artifacts = await self._input_artifacts_for_node(db, job, ne)
+        await self.artifact_cache.store(
+            db,
+            node_type=ne.node_type,
+            node_config=ne.node_config or {},
+            input_artifacts=input_artifacts,
+            output_artifact=output_artifact,
+            node_id=ne.node_id,
+            job_id=job.id,
+        )
 
     @staticmethod
     def _preferred_hosts_for_node(
@@ -311,6 +418,16 @@ class JobEngine:
             ne.completed_at = datetime.utcnow()
             ne.progress = 100
             await db.commit()
+            try:
+                await self._write_artifact_cache_for_node(db, job, ne)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.exception(
+                    "Failed to write artifact cache for job=%s node=%s",
+                    job.id,
+                    ne.node_id,
+                )
 
             if await self._maybe_finalize_job(db, job):
                 return
