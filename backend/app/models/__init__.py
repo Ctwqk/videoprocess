@@ -12,6 +12,20 @@ from app.models.material import (
 )
 from app.models.schedule import RuntimeSchedule
 from app.models.autoflow import AutoFlowPlan, AutoFlowRun, AutoFlowUsedClip, ContentMetric, TrendSignal
+from app.models.channel_agent import (
+    AgentTickAudit,
+    ChannelOpsQueueItem,
+    ChannelProfile,
+    FeedbackSnapshot,
+    LaneFormatMatrix,
+    ManualSeed,
+    MaterialUsageLedger,
+    ProductionTask,
+    PublicationRecord,
+    PublishingAccount,
+    TakedownEvent,
+    TopicLane,
+)
 
 __all__ = [
     "Base",
@@ -35,4 +49,16 @@ __all__ = [
     "AutoFlowUsedClip",
     "ContentMetric",
     "TrendSignal",
+    "ChannelProfile",
+    "TopicLane",
+    "PublishingAccount",
+    "LaneFormatMatrix",
+    "ChannelOpsQueueItem",
+    "AgentTickAudit",
+    "ManualSeed",
+    "ProductionTask",
+    "MaterialUsageLedger",
+    "PublicationRecord",
+    "TakedownEvent",
+    "FeedbackSnapshot",
 ]
