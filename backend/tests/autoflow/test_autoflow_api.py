@@ -13,6 +13,7 @@ from app.api import autoflow as autoflow_api_module
 from app.db import get_db
 from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
 from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
+from app.models.autoflow import AutoFlowUsedClip
 from app.models.autoflow import ContentMetric, TrendSignal
 
 
@@ -23,6 +24,7 @@ async def autoflow_db_session():
         for table in (
             AutoFlowPlanModel.__table__,
             AutoFlowRunModel.__table__,
+            AutoFlowUsedClip.__table__,
             ContentMetric.__table__,
             TrendSignal.__table__,
         ):

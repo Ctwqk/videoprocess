@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid as uuid_mod
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -46,6 +46,23 @@ class AutoFlowRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     artifacts_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     publish_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AutoFlowUsedClip(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "autoflow_used_clips"
+    __table_args__ = (
+        Index("ix_autoflow_used_clips_asset_selected_at", "asset_id", "selected_at"),
+        Index("ix_autoflow_used_clips_run_id", "run_id"),
+    )
+
+    run_id: Mapped[uuid_mod.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    asset_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_platform: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    candidate_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    selected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class ContentMetric(UUIDPrimaryKeyMixin, Base):
