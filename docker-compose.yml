@@ -82,6 +82,8 @@ services:
       PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
       X_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
       XIAOHONGSHU_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8897
+      AUTOFLOW_EMBEDDING_URL: ${VP_AUTOFLOW_EMBEDDING_URL:-}
+      HF_TOKEN: ${HF_TOKEN:-}
     volumes:
       - ${VP_STORAGE_ROOT:-./k8s-data/storage}:/data/storage
     ports:
@@ -110,6 +112,8 @@ services:
       XIAOHONGSHU_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8897
       VIDEO_LLM_BASE_URL: ${VP_LLM_BASE_URL:-http://host.docker.internal:8000/v1}
       VIDEO_TTS_BASE_URL: ${VP_XTTS_BASE_URL:-http://host.docker.internal:8010}
+      VISION_EMBEDDING_URL: ${VP_VISION_EMBEDDING_URL:-}
+      HF_TOKEN: ${HF_TOKEN:-}
     volumes:
       - ${VP_STORAGE_ROOT:-./k8s-data/storage}:/data/storage
       - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/YouTubeManager/credentials:/app/youtube_credentials
@@ -137,6 +141,8 @@ services:
       XIAOHONGSHU_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8897
       VIDEO_LLM_BASE_URL: ${VP_LLM_BASE_URL:-http://host.docker.internal:8000/v1}
       VIDEO_TTS_BASE_URL: ${VP_XTTS_BASE_URL:-http://host.docker.internal:8010}
+      VISION_EMBEDDING_URL: ${VP_VISION_EMBEDDING_URL:-}
+      HF_TOKEN: ${HF_TOKEN:-}
     volumes:
       - ${VP_STORAGE_ROOT:-./k8s-data/storage}:/data/storage
       - ${PLATFORM_UPLOAD_RUNTIME_ROOT:-../constructure-platform-upload}/YouTubeManager/credentials:/app/youtube_credentials

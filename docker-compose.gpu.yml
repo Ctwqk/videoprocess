@@ -3,5 +3,16 @@ services:
     gpus: all
     environment:
       VIDEO_USE_GPU: "true"
+      VIDEO_GPU_FALLBACK_TO_CPU: "true"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+
+  vision-worker:
+    gpus: all
+    environment:
+      VIDEO_USE_GPU: "true"
+      VIDEO_GPU_FALLBACK_TO_CPU: "true"
+      VIDEO_WHISPER_DEVICE: cuda
+      VIDEO_WHISPER_COMPUTE_TYPE: float16
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
