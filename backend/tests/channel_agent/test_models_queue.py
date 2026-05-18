@@ -27,6 +27,7 @@ from app.models.channel_agent import (
     TakedownEvent,
     TopicLane,
 )
+from app.schemas.channel_agent import QueueItemRead
 
 
 CHANNEL_AGENT_TABLES = (
@@ -216,6 +217,18 @@ async def test_lane_format_source_platforms_and_queue_channel_scope(channel_agen
 
     assert lane_format.source_platforms_json == ["bilibili", "youtube"]
     assert item.channel_profile_id == channel.id
+
+    queue_read = QueueItemRead(
+        id=str(item.id),
+        kind=item.kind,
+        idempotency_key=item.idempotency_key,
+        priority=item.priority,
+        status=item.status,
+        payload_json=dict(item.payload_json or {}),
+        attempt_count=item.attempt_count,
+        channel_profile_id=str(item.channel_profile_id),
+    )
+    assert queue_read.channel_profile_id == str(channel.id)
 
 
 @pytest.mark.asyncio

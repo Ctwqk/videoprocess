@@ -93,6 +93,7 @@ class QueueItemRead(BaseModel):
     id: str
     kind: str
     idempotency_key: str
+    channel_profile_id: str | None = None
     priority: int
     status: str
     payload_json: dict[str, Any]
