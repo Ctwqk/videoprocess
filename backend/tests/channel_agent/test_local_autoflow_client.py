@@ -127,6 +127,60 @@ async def test_local_autoflow_client_rejects_run_job_mismatch():
 
 
 @pytest.mark.asyncio
+async def test_local_autoflow_client_rejects_unlinked_run_with_supplied_job():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await _create_local_autoflow_tables(conn)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as db:
+        plan = _autoflow_plan()
+        db.add(plan)
+        await db.flush()
+        job = Job(pipeline_id=uuid.uuid4(), pipeline_snapshot={}, status=JobStatus.SUCCEEDED)
+        db.add(job)
+        await db.flush()
+        run = AutoFlowRunModel(
+            plan_id=plan.id,
+            pipeline_id=None,
+            job_id=None,
+            status="SUCCEEDED",
+            artifacts_json={},
+            publish_json={},
+        )
+        db.add(run)
+        await db.flush()
+        node = NodeExecution(
+            job_id=job.id,
+            node_id="youtube_upload_1",
+            node_type="youtube_upload",
+            node_config={},
+            status=NodeStatus.SUCCEEDED,
+        )
+        db.add(node)
+        await db.flush()
+        artifact = Artifact(
+            job_id=job.id,
+            node_execution_id=node.id,
+            kind=ArtifactKind.FINAL,
+            filename="upload.mp4",
+            storage_backend="local",
+            storage_path="/tmp/upload.mp4",
+            media_info={"youtube": {"video_id": "yt-wrong-job"}},
+        )
+        db.add(artifact)
+        await db.flush()
+        node.output_artifact_id = artifact.id
+        await db.commit()
+
+        observation = await LocalAutoFlowClient().observe_job(db, run_id=str(run.id), job_id=str(job.id))
+
+    await engine.dispose()
+    assert observation.status == "failed"
+    assert "mismatch" in observation.error_message
+    assert "no linked job" in observation.error_message
+
+
+@pytest.mark.asyncio
 async def test_local_autoflow_client_execute_task_returns_failed_for_expected_refusal(monkeypatch):
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     session_factory = async_sessionmaker(engine, expire_on_commit=False)

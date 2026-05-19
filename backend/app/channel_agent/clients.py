@@ -209,7 +209,16 @@ class LocalAutoFlowClient:
                 error_message="Invalid AutoFlow job id",
             )
 
-        if run.job_id and run.job_id != job_uuid:
+        if run.job_id is None:
+            return AutoFlowJobObservation(
+                run_id=str(run.id),
+                pipeline_id=str(run.pipeline_id) if run.pipeline_id else None,
+                job_id=job_id,
+                status="failed",
+                error_message=f"AutoFlow run/job mismatch: run {run.id} has no linked job",
+            )
+
+        if run.job_id != job_uuid:
             return AutoFlowJobObservation(
                 run_id=str(run.id),
                 pipeline_id=str(run.pipeline_id) if run.pipeline_id else None,
