@@ -53,12 +53,13 @@ func main() {
 	}
 
 	runtimeEnv := worker.RuntimeEnv{
-		Store:          st,
-		Storage:        storageBackend,
-		StorageBackend: appCfg.StorageBackend,
-		LocalRoot:      appCfg.StorageLocalRoot,
-		WorkerID:       cfg.WorkerID,
-		Logger:         slog.Default(),
+		Store:              st,
+		Storage:            storageBackend,
+		StorageBackend:     appCfg.StorageBackend,
+		LocalRoot:          appCfg.StorageLocalRoot,
+		WorkerID:           cfg.WorkerID,
+		Logger:             slog.Default(),
+		CancelPollInterval: cfg.CancelPollInterval,
 	}
 	trim := worker.NewMediaTaskHandler(runtimeEnv, handlers.TrimHandler{Runner: vpffmpeg.NewRunner()})
 

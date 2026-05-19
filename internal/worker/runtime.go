@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/contracts"
 	"github.com/Ctwqk/videoprocess/internal/storage"
@@ -22,12 +23,13 @@ type TaskStore interface {
 }
 
 type RuntimeEnv struct {
-	Store          TaskStore
-	Storage        storage.Backend
-	StorageBackend string
-	LocalRoot      string
-	WorkerID       string
-	Logger         *slog.Logger
+	Store              TaskStore
+	Storage            storage.Backend
+	StorageBackend     string
+	LocalRoot          string
+	WorkerID           string
+	Logger             *slog.Logger
+	CancelPollInterval time.Duration
 }
 
 type MediaHandler interface {
@@ -85,8 +87,23 @@ func (h MediaTaskHandler) Execute(ctx context.Context, task TaskMessage) (NodeRe
 		return NodeResult{}, err
 	}
 
-	if err := h.media.Execute(ctx, inputPath, outputLocalPath, task.Config); err != nil {
-		return NodeResult{}, err
+	execCtx, cancel := context.WithCancel(ctx)
+	cancelled := make(chan struct{}, 1)
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		h.watchCancellation(execCtx, cancel, task.NodeExecutionID, cancelled)
+	}()
+	err = h.media.Execute(execCtx, inputPath, outputLocalPath, task.Config)
+	cancel()
+	<-watchDone
+	if err != nil {
+		select {
+		case <-cancelled:
+			return NodeResult{}, ErrConfirmedCancellation
+		default:
+			return NodeResult{}, err
+		}
 	}
 	info, err := os.Stat(outputLocalPath)
 	if err != nil {

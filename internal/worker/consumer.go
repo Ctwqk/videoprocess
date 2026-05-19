@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/redisstream"
@@ -52,6 +53,7 @@ type Consumer struct {
 	WorkerID      string
 	ConsumerGroup string
 	BlockTimeout  time.Duration
+	cfg           Config
 	handlers      map[string]Handler
 	log           *slog.Logger
 }
@@ -70,6 +72,7 @@ func NewConsumer(client *redis.Client, cfg Config, handlers ...Handler) *Consume
 		WorkerID:      cfg.WorkerID,
 		ConsumerGroup: cfg.WorkerType + "-workers",
 		BlockTimeout:  5 * time.Second,
+		cfg:           cfg,
 		handlers:      registry,
 		log:           slog.With("worker_id", cfg.WorkerID, "worker_type", cfg.WorkerType),
 	}
@@ -96,10 +99,28 @@ func (c *Consumer) Run(ctx context.Context) error {
 	if err := c.EnsureGroup(ctx); err != nil {
 		return err
 	}
+	if _, err := c.ReclaimPending(ctx); err != nil {
+		c.log.Warn("initial pending reclaim failed", "error", err)
+	}
 	stream := redisstream.TaskStream(c.WorkerType)
+	concurrency := c.cfg.Concurrency
+	if concurrency <= 0 {
+		concurrency = 2
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	reclaimTicker := time.NewTicker(c.reclaimInterval())
+	defer reclaimTicker.Stop()
 	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		select {
+		case <-ctx.Done():
+			return c.waitForActive(ctx, &wg)
+		case <-reclaimTicker.C:
+			if _, err := c.ReclaimPending(ctx); err != nil {
+				c.log.Warn("periodic pending reclaim failed", "error", err)
+			}
+			continue
+		case sem <- struct{}{}:
 		}
 		res, err := c.Redis.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    c.ConsumerGroup,
@@ -109,18 +130,60 @@ func (c *Consumer) Run(ctx context.Context) error {
 			Count:    1,
 		}).Result()
 		if err != nil {
-			if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
+			<-sem
+			if errors.Is(err, context.Canceled) {
+				return c.waitForActive(ctx, &wg)
+			}
+			if errors.Is(err, redis.Nil) {
 				continue
 			}
 			c.log.Warn("xreadgroup failed", "error", err)
 			time.Sleep(time.Second)
 			continue
 		}
+		dispatched := false
 		for _, stream := range res {
 			for _, msg := range stream.Messages {
-				c.handleMessage(ctx, msg)
+				dispatched = true
+				wg.Add(1)
+				go func(m redis.XMessage) {
+					defer wg.Done()
+					defer func() { <-sem }()
+					c.handleMessage(ctx, m)
+				}(msg)
 			}
 		}
+		if !dispatched {
+			<-sem
+		}
+	}
+}
+
+func (c *Consumer) reclaimInterval() time.Duration {
+	if c.cfg.PELReclaimInterval > 0 {
+		return c.cfg.PELReclaimInterval
+	}
+	return 60 * time.Second
+}
+
+func (c *Consumer) waitForActive(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	timeout := c.cfg.ShutdownGracePeriod
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return ctx.Err()
+	case <-timer.C:
+		c.log.Warn("worker shutdown grace period expired")
+		return ctx.Err()
 	}
 }
 
@@ -133,6 +196,13 @@ func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
 		return
 	}
 
+	if c.shouldDeferForAffinity(task, time.Now().UTC()) {
+		if err := c.deferForAffinity(ctx, msg, task); err != nil {
+			c.log.Warn("affinity defer failed; leaving message pending", "msg_id", msg.ID, "error", err)
+		}
+		return
+	}
+
 	handler, ok := c.handlers[task.NodeType]
 	if !ok {
 		c.log.Error("no handler", "msg_id", msg.ID, "node_type", task.NodeType)
@@ -141,15 +211,25 @@ func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
 		return
 	}
 
-	result, err := handler.Execute(ctx, task)
+	taskCtx, taskCancel := context.WithCancel(ctx)
+	heartbeatDone := c.StartHeartbeat(taskCtx, msg.ID)
+	result, err := handler.Execute(taskCtx, task)
+	taskCancel()
+	<-heartbeatDone
 	switch {
 	case err == nil:
 		if strings.TrimSpace(result.OutputArtifactID) == "" {
-			_ = c.publishFailed(ctx, task, "handler succeeded without output_artifact_id")
+			if pubErr := c.publishFailed(ctx, task, "handler succeeded without output_artifact_id"); pubErr != nil {
+				c.log.Error("publish failed event failed; leaving message pending", "msg_id", msg.ID, "error", pubErr)
+				return
+			}
 			c.ack(ctx, msg.ID)
 			return
 		}
-		_ = c.publishCompleted(ctx, task, result.OutputArtifactID)
+		if pubErr := c.publishCompleted(ctx, task, result.OutputArtifactID); pubErr != nil {
+			c.log.Error("publish completed event failed; leaving message pending", "msg_id", msg.ID, "error", pubErr)
+			return
+		}
 		c.ack(ctx, msg.ID)
 	case errors.Is(err, ErrConfirmedCancellation):
 		c.log.Info("task cancelled by recorded job/node state, acking without event", "msg_id", msg.ID, "node_id", task.NodeID)
@@ -158,7 +238,10 @@ func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
 		c.log.Info("worker context cancelled, leaving message pending", "msg_id", msg.ID, "node_id", task.NodeID)
 	default:
 		c.log.Error("handler failed", "msg_id", msg.ID, "node_id", task.NodeID, "error", err)
-		_ = c.publishFailed(ctx, task, err.Error())
+		if pubErr := c.publishFailed(ctx, task, err.Error()); pubErr != nil {
+			c.log.Error("publish failed event failed; leaving message pending", "msg_id", msg.ID, "error", pubErr)
+			return
+		}
 		c.ack(ctx, msg.ID)
 	}
 }
@@ -216,4 +299,39 @@ func decodeTask(values map[string]any) (TaskMessage, error) {
 		_ = json.Unmarshal([]byte(raw), &task.PreferredHosts)
 	}
 	return task, nil
+}
+
+func encodeTask(task TaskMessage) (map[string]any, error) {
+	if task.Config == nil {
+		task.Config = map[string]any{}
+	}
+	if task.InputArtifacts == nil {
+		task.InputArtifacts = map[string]any{}
+	}
+	if task.PreferredHosts == nil {
+		task.PreferredHosts = []string{}
+	}
+	config, err := json.Marshal(task.Config)
+	if err != nil {
+		return nil, err
+	}
+	inputArtifacts, err := json.Marshal(task.InputArtifacts)
+	if err != nil {
+		return nil, err
+	}
+	preferredHosts, err := json.Marshal(task.PreferredHosts)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"job_id":               task.JobID,
+		"node_execution_id":    task.NodeExecutionID,
+		"node_id":              task.NodeID,
+		"node_type":            task.NodeType,
+		"config":               string(config),
+		"input_artifacts":      string(inputArtifacts),
+		"preferred_hosts":      string(preferredHosts),
+		"affinity_enqueued_at": task.AffinityEnqueuedAt,
+		"affinity_bounces":     task.AffinityBounces,
+	}, nil
 }

@@ -3,7 +3,9 @@ package worker
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // DefaultWorkerType returns the Go ffmpeg worker's queue type. The new
@@ -18,12 +20,20 @@ func DefaultWorkerType() string {
 // the Redis Streams task/event protocol. Field names mirror the env vars
 // expected by `backend/worker/main.py` so deployment templates port directly.
 type Config struct {
-	WorkerType       string
-	WorkerID         string
-	RedisURL         string
-	DatabaseURL      string
-	StorageBackend   string
-	StorageLocalRoot string
+	WorkerType          string
+	WorkerID            string
+	RedisURL            string
+	DatabaseURL         string
+	StorageBackend      string
+	StorageLocalRoot    string
+	Concurrency         int
+	PELMinIdle          time.Duration
+	PELReclaimInterval  time.Duration
+	HeartbeatInterval   time.Duration
+	AffinityWait        time.Duration
+	AffinityMaxBounces  int
+	ShutdownGracePeriod time.Duration
+	CancelPollInterval  time.Duration
 }
 
 // LoadConfig builds a Config from environment, applying defaults that match
@@ -62,11 +72,55 @@ func LoadConfig() Config {
 		storageLocalRoot = "/tmp/vp_storage"
 	}
 	return Config{
-		WorkerType:       workerType,
-		WorkerID:         fmt.Sprintf("%s-worker@%s:%d", workerType, host, os.Getpid()),
-		RedisURL:         redisURL,
-		DatabaseURL:      databaseURL,
-		StorageBackend:   storageBackend,
-		StorageLocalRoot: storageLocalRoot,
+		WorkerType:          workerType,
+		WorkerID:            fmt.Sprintf("%s-worker@%s:%d", workerType, host, os.Getpid()),
+		RedisURL:            redisURL,
+		DatabaseURL:         databaseURL,
+		StorageBackend:      storageBackend,
+		StorageLocalRoot:    storageLocalRoot,
+		Concurrency:         intEnv("WORKER_CONCURRENCY", 2),
+		PELMinIdle:          durationMillisEnv("WORKER_PEL_MIN_IDLE_MS", 15*time.Minute),
+		PELReclaimInterval:  durationSecondsEnv("WORKER_PEL_RECLAIM_INTERVAL_SECONDS", 60*time.Second),
+		HeartbeatInterval:   durationSecondsEnv("WORKER_HEARTBEAT_INTERVAL_SECONDS", 15*time.Second),
+		AffinityWait:        durationSecondsEnv("WORKER_AFFINITY_WAIT_SECONDS", 20*time.Second),
+		AffinityMaxBounces:  intEnv("WORKER_AFFINITY_MAX_BOUNCES", 6),
+		ShutdownGracePeriod: durationSecondsEnv("WORKER_SHUTDOWN_GRACE_SECONDS", 30*time.Second),
+		CancelPollInterval:  durationSecondsEnv("WORKER_CANCEL_POLL_SECONDS", 2*time.Second),
 	}
+}
+
+func intEnv(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func durationSecondsEnv(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return time.Duration(parsed) * time.Second
+}
+
+func durationMillisEnv(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return time.Duration(parsed) * time.Millisecond
 }

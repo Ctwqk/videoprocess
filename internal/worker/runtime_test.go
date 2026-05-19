@@ -2,9 +2,12 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/contracts"
 	"github.com/Ctwqk/videoprocess/internal/storage"
@@ -99,5 +102,81 @@ func TestMediaTaskHandlerCreatesArtifactResult(t *testing.T) {
 	}
 	if media.seenInput != inputPath {
 		t.Fatalf("input path = %q", media.seenInput)
+	}
+}
+
+type cancelAfterRunningStore struct {
+	fakeTaskStore
+	loads atomic.Int32
+}
+
+func (f *cancelAfterRunningStore) LoadExecutionState(ctx context.Context, nodeExecutionID string) (store.ExecutionState, error) {
+	count := f.loads.Add(1)
+	if count >= 2 {
+		state := f.state
+		state.NodeStatus = contracts.NodeStatusCancelled
+		return state, nil
+	}
+	return f.state, nil
+}
+
+type blockingMediaHandler struct {
+	cancelled chan struct{}
+}
+
+func (h *blockingMediaHandler) NodeType() string { return "trim" }
+
+func (h *blockingMediaHandler) Execute(ctx context.Context, inputPath string, outputPath string, config map[string]any) error {
+	<-ctx.Done()
+	close(h.cancelled)
+	return ctx.Err()
+}
+
+func TestMediaTaskHandlerCancelsDuringExecutionWhenStateChanges(t *testing.T) {
+	root := t.TempDir()
+	inputPath := filepath.Join(root, "input.mp4")
+	if err := os.WriteFile(inputPath, []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	storeFake := &cancelAfterRunningStore{
+		fakeTaskStore: fakeTaskStore{
+			state: store.ExecutionState{
+				JobID:           "00000000-0000-0000-0000-000000000101",
+				NodeExecutionID: "00000000-0000-0000-0000-000000000201",
+				JobStatus:       contracts.JobStatusRunning,
+				NodeStatus:      contracts.NodeStatusQueued,
+			},
+			input: store.ArtifactRow{
+				ID:             "00000000-0000-0000-0000-000000000301",
+				Filename:       "input.mp4",
+				StorageBackend: "local",
+				StoragePath:    inputPath,
+			},
+		},
+	}
+	media := &blockingMediaHandler{cancelled: make(chan struct{})}
+	handler := NewMediaTaskHandler(RuntimeEnv{
+		Store:              storeFake,
+		Storage:            storage.LocalBackend{Root: root},
+		StorageBackend:     "local",
+		LocalRoot:          root,
+		WorkerID:           "ffmpeg_go-worker@test:1",
+		CancelPollInterval: time.Millisecond,
+	}, media)
+
+	_, err := handler.Execute(context.Background(), TaskMessage{
+		JobID:           "00000000-0000-0000-0000-000000000101",
+		NodeExecutionID: "00000000-0000-0000-0000-000000000201",
+		NodeType:        "trim",
+		Config:          map[string]any{"duration": "1"},
+		InputArtifacts:  map[string]any{"input": "00000000-0000-0000-0000-000000000301"},
+	})
+	if !errors.Is(err, ErrConfirmedCancellation) {
+		t.Fatalf("err = %v; want ErrConfirmedCancellation", err)
+	}
+	select {
+	case <-media.cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("media handler context was not cancelled")
 	}
 }
