@@ -1,0 +1,72 @@
+{
+  "nodes": [
+    {
+      "id": "source_1",
+      "type": "source",
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "data": {
+        "label": "Source",
+        "config": {
+          "asset_id": "00000000-0000-0000-0000-000000000001",
+          "media_type": "video"
+        },
+        "asset_id": "00000000-0000-0000-0000-000000000001"
+      }
+    },
+    {
+      "id": "trim_1",
+      "type": "trim",
+      "position": {
+        "x": 260,
+        "y": 0
+      },
+      "data": {
+        "label": "Trim",
+        "config": {
+          "start_time": "0",
+          "duration": "2",
+          "output_format": "mp4"
+        }
+      }
+    },
+    {
+      "id": "export_1",
+      "type": "export",
+      "position": {
+        "x": 520,
+        "y": 0
+      },
+      "data": {
+        "label": "Export Preview",
+        "config": {
+          "output_dir": "/tmp/vp_autoflow_exports",
+          "filename": "basic.mp4"
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-source_1-trim_1",
+      "source": "source_1",
+      "target": "trim_1",
+      "sourceHandle": "output",
+      "targetHandle": "input"
+    },
+    {
+      "id": "e-trim_1-export_1",
+      "source": "trim_1",
+      "target": "export_1",
+      "sourceHandle": "output",
+      "targetHandle": "input"
+    }
+  ],
+  "viewport": {
+    "x": 0,
+    "y": 0,
+    "zoom": 1
+  }
+}

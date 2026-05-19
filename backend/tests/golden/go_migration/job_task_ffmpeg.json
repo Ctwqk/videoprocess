@@ -1,0 +1,11 @@
+{
+  "job_id": "00000000-0000-0000-0000-000000000101",
+  "node_execution_id": "00000000-0000-0000-0000-000000000201",
+  "node_id": "trim_1",
+  "node_type": "trim",
+  "config": "{\"start\":0,\"duration\":2,\"output_format\":\"mp4\"}",
+  "input_artifacts": "{\"input\":\"00000000-0000-0000-0000-000000000301\"}",
+  "preferred_hosts": "[]",
+  "affinity_enqueued_at": "1779120000",
+  "affinity_bounces": "0"
+}

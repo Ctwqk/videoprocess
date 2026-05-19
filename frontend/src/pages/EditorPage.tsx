@@ -1,4 +1,4 @@
-import { useCallback, useRef, useEffect, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import { ReactFlow, Background, Controls, MiniMap } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
@@ -24,7 +24,6 @@ export default function EditorPage() {
 
   const rfNodeTypes = useMemo(() => ({ processNode: ProcessNode }), []);
 
-  // Load pipeline from route
   useEffect(() => {
     if (routePipelineId) {
       apiClient.get(`/pipelines/${routePipelineId}`).then(res => {
@@ -40,10 +39,7 @@ export default function EditorPage() {
           },
         }));
         setPipeline(p.id, p.name, loadedNodes, def.edges || []);
-      }).catch(() => {
-        // Pipeline not found, start fresh
-        clear();
-      });
+      }).catch(() => clear());
     }
   }, [routePipelineId, setPipeline, clear]);
 
@@ -64,14 +60,11 @@ export default function EditorPage() {
     e.preventDefault();
     const typeName = e.dataTransfer.getData('application/reactflow-type');
     if (!typeName) return;
-
-    // Get position relative to the React Flow canvas
     const bounds = reactFlowWrapper.current?.getBoundingClientRect();
     const position = {
       x: e.clientX - (bounds?.left || 0),
       y: e.clientY - (bounds?.top || 0),
     };
-
     addNode(createEditorNode(typeName, nodeTypes, position));
   }, [nodeTypes, addNode]);
 
@@ -84,11 +77,21 @@ export default function EditorPage() {
   }, [setSelectedNodeId]);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
       <EditorToolbar />
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden', minHeight: 0 }}>
         <NodePalette onAddNode={handleAddNode} />
-        <div ref={reactFlowWrapper} style={{ flex: 1 }} onDragOver={onDragOver} onDrop={onDrop}>
+        <div
+          ref={reactFlowWrapper}
+          style={{
+            flex: 1,
+            backgroundColor: 'var(--bg-0)',
+            backgroundImage: 'radial-gradient(circle, #1a1a1f 1px, transparent 1px)',
+            backgroundSize: '22px 22px',
+          }}
+          onDragOver={onDragOver}
+          onDrop={onDrop}
+        >
           <ReactFlow
             nodes={nodes}
             edges={edges}
@@ -98,16 +101,17 @@ export default function EditorPage() {
             onNodeClick={onNodeClick}
             onPaneClick={onPaneClick}
             nodeTypes={rfNodeTypes}
-            deleteKeyCode={["Backspace", "Delete"]}
+            deleteKeyCode={['Backspace', 'Delete']}
             fitView
-            style={{ backgroundColor: '#020617' }}
+            style={{ backgroundColor: 'transparent' }}
+            proOptions={{ hideAttribution: true }}
           >
-            <Background color="#1e293b" gap={20} />
+            <Background color="var(--border-2)" gap={20} />
             <Controls />
             <MiniMap
-              nodeColor={() => '#3b82f6'}
-              maskColor="rgba(0,0,0,0.7)"
-              style={{ backgroundColor: '#0f172a' }}
+              nodeColor={() => 'var(--acc)'}
+              maskColor="rgba(9,9,11,0.7)"
+              style={{ backgroundColor: 'var(--bg-1)' }}
             />
           </ReactFlow>
         </div>

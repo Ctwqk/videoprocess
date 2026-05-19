@@ -1,10 +1,22 @@
 @import "tailwindcss";
-
-body {
-  margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
-}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import './styles/tokens.css';
 
 .react-flow__node {
   font-size: 12px;
 }
+
+/* ReactFlow visual tweaks to match design system */
+.react-flow__controls,
+.react-flow__minimap {
+  background: var(--bg-1);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-2);
+}
+.react-flow__controls button {
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border-1);
+  color: var(--fg-3);
+}
+.react-flow__controls button:hover { background: var(--bg-2); color: var(--fg-1); }
+.react-flow__attribution { background: transparent !important; color: var(--fg-5) !important; }

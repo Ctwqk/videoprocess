@@ -1,14 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
-  AlertTriangle,
-  CheckCircle2,
-  PauseCircle,
-  PlayCircle,
-  RefreshCw,
-  ShieldAlert,
-} from 'lucide-react';
-
-import {
   fetchChannelOverview,
   fetchChannels,
   haltChannel,
@@ -22,83 +13,67 @@ import {
   type ChannelTask,
   type LaneHealth,
 } from '../api/channelAgent';
-import './ChannelOpsStatusPage.css';
+import { Badge, Icons, Tag, type StatusTone } from '../components/common/ui';
 
-type DetailItem =
-  | { type: 'queue'; item: ChannelQueueItem }
-  | { type: 'task'; item: ChannelTask }
-  | { type: 'publication'; item: ChannelPublication };
+type TabKey = 'queue' | 'tasks' | 'pubs';
 
-const statusTone: Record<string, string> = {
-  pending: 'muted',
-  queued: 'muted',
-  claimed: 'info',
-  running: 'info',
-  completed: 'good',
-  succeeded: 'good',
-  failed: 'bad',
-  dead_lettered: 'bad',
-  held: 'warn',
-  uploaded_private: 'warn',
-  scheduled: 'good',
-  published: 'good',
+const STATE_TONE: Record<string, StatusTone> = {
+  active: 'ok', running: 'run', completed: 'ok', succeeded: 'ok',
+  queued: 'queue', claimed: 'queue', pending: 'queue',
+  failed: 'fail', dead_lettered: 'fail',
+  held: 'run', paused: 'run', uploaded_private: 'run',
+  token_invalid: 'fail',
+  scheduled: 'ok', published: 'ok',
+  disabled: 'idle',
 };
 
-function toneFor(value: string | null | undefined) {
-  if (!value) return 'muted';
-  return statusTone[value.toLowerCase()] ?? 'muted';
+function tone(value: string | null | undefined): StatusTone {
+  if (!value) return 'idle';
+  return STATE_TONE[value.toLowerCase()] ?? 'idle';
 }
 
-function shortId(id: string | null | undefined) {
-  return id ? `${id.slice(0, 8)}` : '-';
-}
-
-function formatDate(value: string | null | undefined) {
-  if (!value) return '-';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString();
-}
-
-function formatJson(value: unknown) {
-  return JSON.stringify(value, null, 2);
-}
-
-function HealthCard({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string | number;
-  tone?: 'good' | 'warn' | 'bad' | 'info';
+function Kpi({ label, value, toneName, sub }: {
+  label: string; value: number; toneName: StatusTone; sub: string;
 }) {
+  const c: Record<StatusTone, string> = {
+    ok: 'var(--status-ok)',
+    run: 'var(--status-run)',
+    fail: 'var(--status-fail)',
+    queue: 'var(--status-queue)',
+    idle: 'var(--fg-5)',
+  };
   return (
-    <div className={`channel-ops-card ${tone ? `channel-ops-card--${tone}` : ''}`}>
-      <div className="channel-ops-card__label">{label}</div>
-      <div className="channel-ops-card__value">{value}</div>
+    <div className="vp-card" style={{ padding: '14px 18px' }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: 'var(--fg-4)',
+        textTransform: 'uppercase', letterSpacing: '.08em', fontFamily: 'var(--font-mono)',
+      }}>
+        <span style={{ width: 5, height: 5, borderRadius: 99, background: c[toneName] }} />
+        {label}
+      </div>
+      <div style={{
+        fontSize: 28, fontWeight: 600, letterSpacing: '-0.02em', marginTop: 6,
+        fontVariantNumeric: 'tabular-nums',
+      }}>{value}</div>
+      <div className="muted" style={{ fontSize: 11.5, marginTop: 4 }}>{sub}</div>
     </div>
   );
 }
 
-function StatusPill({ value }: { value: string | null | undefined }) {
-  return <span className={`channel-ops-pill channel-ops-pill--${toneFor(value)}`}>{value || '-'}</span>;
-}
-
-function MiniStatus({
-  items,
-  empty,
-  render,
-}: {
-  items: Array<LaneHealth | AccountHealth>;
-  empty: string;
-  render: (item: LaneHealth | AccountHealth) => ReactNode;
+function StatPanel({ title, count, children, action }: {
+  title: string; count?: ReactNode; children: ReactNode; action?: ReactNode;
 }) {
-  if (items.length === 0) {
-    return <div className="channel-ops-empty channel-ops-empty--inline">{empty}</div>;
-  }
-
-  return <div className="channel-ops-mini-list">{items.map(render)}</div>;
+  return (
+    <div className="vp-card">
+      <div className="vp-section-head">
+        <h3>{title}</h3>
+        {count !== undefined && <span className="vp-count">{count}</span>}
+        <div className="vp-spacer" />
+        {action}
+      </div>
+      {children}
+    </div>
+  );
 }
 
 export default function ChannelOpsStatusPage() {
@@ -108,8 +83,7 @@ export default function ChannelOpsStatusPage() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [detail, setDetail] = useState<DetailItem | null>(null);
-  const [lastUpdated, setLastUpdated] = useState<string | null>(null);
+  const [tab, setTab] = useState<TabKey>('queue');
 
   const selectedChannel = useMemo(
     () => channels.find(channel => channel.id === selectedChannelId) ?? null,
@@ -124,13 +98,9 @@ export default function ChannelOpsStatusPage() {
   }, []);
 
   const loadOverview = useCallback(async (channelId: string) => {
-    if (!channelId) {
-      setOverview(null);
-      return;
-    }
+    if (!channelId) { setOverview(null); return; }
     const data = await fetchChannelOverview(channelId);
     setOverview(data);
-    setLastUpdated(new Date().toISOString());
   }, []);
 
   const refresh = useCallback(async () => {
@@ -149,9 +119,8 @@ export default function ChannelOpsStatusPage() {
 
   useEffect(() => {
     setLoading(true);
-    setError(null);
     void loadChannels()
-      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load ChannelOps channels'))
+      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load channels'))
       .finally(() => setLoading(false));
   }, [loadChannels]);
 
@@ -159,9 +128,8 @@ export default function ChannelOpsStatusPage() {
     if (!selectedChannelId) return;
     setLoading(true);
     setError(null);
-    setDetail(null);
     void loadOverview(selectedChannelId)
-      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load ChannelOps status'))
+      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load overview'))
       .finally(() => setLoading(false));
   }, [loadOverview, selectedChannelId]);
 
@@ -178,7 +146,7 @@ export default function ChannelOpsStatusPage() {
     setError(null);
     try {
       const updated = await operation();
-      setChannels(current => current.map(channel => (channel.id === updated.id ? updated : channel)));
+      setChannels(current => current.map(c => c.id === updated.id ? updated : c));
       await loadOverview(updated.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Channel control failed');
@@ -205,334 +173,374 @@ export default function ChannelOpsStatusPage() {
     const funnel = overview?.funnel ?? {};
     const entries = Object.entries(funnel);
     const max = Math.max(1, ...entries.map(([, value]) => value));
-    return entries.map(([label, value]) => ({
-      label,
-      value,
-      width: `${Math.max(4, Math.round((value / max) * 100))}%`,
+    return entries.map(([label, value], i) => ({
+      label, value,
+      pct: (value / max) * 100,
+      drop: i > 0 ? ((entries[i - 1][1] - value) / entries[i - 1][1]) * 100 : 0,
     }));
   }, [overview]);
 
+  if (channels.length === 0 && !loading) {
+    return (
+      <div className="vp-empty" style={{ flex: 1 }}>
+        <div className="ico"><Icons.branch size={22} /></div>
+        <div style={{ fontSize: 14, color: 'var(--fg-2)', marginBottom: 4 }}>No ChannelOps profiles yet.</div>
+        <div className="muted" style={{ fontSize: 12.5 }}>Create a profile to begin automated publishing.</div>
+      </div>
+    );
+  }
+
   return (
-    <div className="channel-ops-page">
-      <header className="channel-ops-header">
-        <div>
-          <h1>ChannelOps</h1>
-          <div className="channel-ops-subtitle">
-            {selectedChannel ? `${selectedChannel.name} · config v${selectedChannel.config_version}` : 'No channel selected'}
-          </div>
-        </div>
-
-        <div className="channel-ops-toolbar">
+    <div className="vp-page">
+      <div style={{ padding: '20px 24px 0' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
+          <h2 style={{ margin: 0, fontSize: 20, fontWeight: 600, letterSpacing: '-0.02em' }}>ChannelOps</h2>
+          {selectedChannel && (
+            <span className="muted mono" style={{ fontSize: 12 }}>
+              · {selectedChannel.name} · config v{selectedChannel.config_version}
+            </span>
+          )}
+          <div style={{ flex: 1 }} />
           <select
-            className="channel-ops-select"
+            className="vp-input"
             value={selectedChannelId}
-            onChange={event => setSelectedChannelId(event.target.value)}
+            onChange={e => setSelectedChannelId(e.target.value)}
             disabled={channels.length === 0}
+            style={{ width: 220 }}
           >
-            {channels.length === 0 ? (
-              <option value="">No channels</option>
-            ) : (
-              channels.map(channel => (
-                <option key={channel.id} value={channel.id}>
-                  {channel.name}
-                </option>
-              ))
-            )}
+            {channels.length === 0
+              ? <option value="">No channels</option>
+              : channels.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
-          <button
-            type="button"
-            className="channel-ops-button"
-            onClick={() => void refresh()}
-            disabled={loading}
-            title="Refresh status"
-          >
-            <RefreshCw size={16} />
-            Refresh
+          <button type="button" onClick={() => void refresh()} disabled={loading}
+                  className="vp-btn vp-btn-sm">
+            <Icons.history size={12} />Refresh
           </button>
-        </div>
-      </header>
-
-      {error ? (
-        <div className="channel-ops-alert">
-          <ShieldAlert size={16} />
-          <span>{error}</span>
-        </div>
-      ) : null}
-
-      {loading && !overview ? (
-        <div className="channel-ops-empty">Loading...</div>
-      ) : channels.length === 0 ? (
-        <div className="channel-ops-empty">No ChannelOps profiles yet.</div>
-      ) : selectedChannel && overview ? (
-        <>
-          <section className="channel-ops-control-row">
-            <div className="channel-ops-mode">
-              <span className={`channel-ops-pill ${selectedChannel.dry_run ? 'channel-ops-pill--warn' : 'channel-ops-pill--good'}`}>
-                {selectedChannel.dry_run ? 'dry-run' : 'live'}
-              </span>
-              <span className={`channel-ops-pill ${selectedChannel.halted_at ? 'channel-ops-pill--bad' : 'channel-ops-pill--good'}`}>
-                {selectedChannel.halted_at ? 'halted' : 'running'}
-              </span>
-              {selectedChannel.halt_reason ? <span className="channel-ops-muted">{selectedChannel.halt_reason}</span> : null}
-            </div>
-            <div className="channel-ops-actions">
+          {selectedChannel && (
+            <>
               <button
                 type="button"
-                className="channel-ops-button channel-ops-button--secondary"
                 onClick={handleDryRunToggle}
                 disabled={busy === 'control'}
-                title={selectedChannel.dry_run ? 'Disable dry-run' : 'Enable dry-run'}
+                className="vp-btn vp-btn-sm"
               >
-                {selectedChannel.dry_run ? <PlayCircle size={16} /> : <PauseCircle size={16} />}
-                {selectedChannel.dry_run ? 'Enable Live' : 'Dry-run'}
+                {selectedChannel.dry_run ? <Icons.play size={12} /> : <Icons.pause size={12} />}
+                {selectedChannel.dry_run ? 'Enable live' : 'Dry-run'}
               </button>
               <button
                 type="button"
-                className={`channel-ops-button ${selectedChannel.halted_at ? 'channel-ops-button--good' : 'channel-ops-button--danger'}`}
                 onClick={handleHaltToggle}
                 disabled={busy === 'control'}
-                title={selectedChannel.halted_at ? 'Resume channel' : 'Halt channel'}
+                className={`vp-btn vp-btn-sm ${selectedChannel.halted_at ? 'vp-btn-primary' : 'vp-btn-danger'}`}
               >
-                {selectedChannel.halted_at ? <PlayCircle size={16} /> : <PauseCircle size={16} />}
+                {selectedChannel.halted_at ? <Icons.play size={12} /> : <Icons.x size={12} />}
                 {selectedChannel.halted_at ? 'Resume' : 'Halt'}
               </button>
-            </div>
-          </section>
+            </>
+          )}
+        </div>
 
-          <section className="channel-ops-grid channel-ops-grid--cards">
-            <HealthCard label="Active tasks" value={overview.health.active_tasks} tone="info" />
-            <HealthCard label="Queued items" value={overview.health.queued_items} />
-            <HealthCard
-              label="Recent failures"
-              value={overview.health.recent_failures}
-              tone={overview.health.recent_failures > 0 ? 'bad' : 'good'}
-            />
-            <HealthCard
-              label="Warnings"
-              value={overview.health.warnings.length}
-              tone={overview.health.warnings.length > 0 ? 'warn' : 'good'}
-            />
-          </section>
+        {selectedChannel && (
+          <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+            <Badge status={selectedChannel.dry_run ? 'run' : 'ok'}>
+              {selectedChannel.dry_run ? 'DRY-RUN' : 'LIVE'}
+            </Badge>
+            <Badge status={selectedChannel.halted_at ? 'fail' : 'ok'}>
+              {selectedChannel.halted_at ? 'HALTED' : 'RUNNING'}
+            </Badge>
+            {selectedChannel.halt_reason && (
+              <span className="muted mono" style={{ fontSize: 12 }}>
+                reason: {selectedChannel.halt_reason}
+              </span>
+            )}
+          </div>
+        )}
 
-          {overview.health.warnings.length > 0 ? (
-            <section className="channel-ops-warning-list">
-              {overview.health.warnings.map(warning => (
-                <div key={warning} className="channel-ops-warning">
-                  <AlertTriangle size={15} />
-                  <span>{warning}</span>
-                </div>
-              ))}
-            </section>
-          ) : null}
+        {error && (
+          <div style={{
+            marginBottom: 14, padding: '10px 12px', borderRadius: 8,
+            background: 'var(--status-fail-soft)', color: 'var(--status-fail)',
+            border: '1px solid var(--status-fail)', fontSize: 13,
+          }}>
+            {error}
+          </div>
+        )}
 
-          <section className="channel-ops-grid channel-ops-grid--main">
-            <div className="channel-ops-panel">
-              <div className="channel-ops-panel__header">
-                <h2>7-day funnel</h2>
-              </div>
-              {funnelEntries.length === 0 ? (
-                <div className="channel-ops-empty channel-ops-empty--inline">No funnel data</div>
-              ) : (
-                <div className="channel-ops-funnel">
-                  {funnelEntries.map(entry => (
-                    <div key={entry.label} className="channel-ops-funnel__row">
-                      <div className="channel-ops-funnel__label">{entry.label}</div>
-                      <div className="channel-ops-funnel__track">
-                        <div className="channel-ops-funnel__bar" style={{ width: entry.width }} />
+        {overview && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 18 }}>
+            <Kpi label="Active tasks"    value={overview.health.active_tasks}  toneName="queue" sub="claimed + running" />
+            <Kpi label="Queued items"    value={overview.health.queued_items}  toneName="idle"  sub="awaiting claim" />
+            <Kpi label="Recent failures" value={overview.health.recent_failures}
+                 toneName={overview.health.recent_failures > 0 ? 'fail' : 'ok'} sub="last 24h" />
+            <Kpi label="Warnings"        value={overview.health.warnings.length}
+                 toneName={overview.health.warnings.length > 0 ? 'run' : 'ok'} sub="needs attention" />
+          </div>
+        )}
+      </div>
+
+      {!overview ? (
+        <div className="muted" style={{ padding: 24 }}>{loading ? 'Loading…' : 'No data'}</div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 18, padding: '0 24px 24px' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <StatPanel title="7-day funnel" count={selectedChannel?.name}>
+              <div style={{ padding: '4px 20px 20px' }}>
+                {funnelEntries.length === 0 ? (
+                  <div className="muted" style={{ fontSize: 12 }}>No funnel data</div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {funnelEntries.map((f, i) => (
+                      <div key={f.label} style={{
+                        display: 'grid', gridTemplateColumns: '150px 1fr 80px',
+                        gap: 14, alignItems: 'center',
+                      }}>
+                        <span className="mono dim" style={{
+                          fontSize: 11, textTransform: 'uppercase', letterSpacing: '.05em',
+                        }}>{f.label}</span>
+                        <div style={{
+                          position: 'relative', height: 26,
+                          background: 'var(--bg-2)', borderRadius: 4, overflow: 'hidden',
+                        }}>
+                          <div style={{
+                            position: 'absolute', left: 0, top: 0, bottom: 0,
+                            width: `${Math.max(4, f.pct)}%`,
+                            background: 'linear-gradient(90deg, var(--acc) 0%, var(--acc-2) 100%)',
+                            opacity: 0.85 - i * 0.08,
+                          }} />
+                          <span style={{
+                            position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)',
+                            fontSize: 11.5, fontFamily: 'var(--font-mono)',
+                            color: 'var(--acc-fg)', fontWeight: 600, mixBlendMode: 'screen',
+                          }}>{f.pct.toFixed(0)}%</span>
+                        </div>
+                        <div style={{ textAlign: 'right' }}>
+                          <span className="mono" style={{ fontVariantNumeric: 'tabular-nums' }}>{f.value}</span>
+                          {f.drop > 0 && (
+                            <span className="muted mono" style={{ fontSize: 10.5, marginLeft: 6 }}>
+                              −{f.drop.toFixed(0)}%
+                            </span>
+                          )}
+                        </div>
                       </div>
-                      <div className="channel-ops-funnel__value">{entry.value}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </StatPanel>
+
+            <div className="vp-card">
+              <div className="vp-section-head">
+                <h3>Work</h3>
+                <div className="vp-spacer" />
+                <div style={{
+                  display: 'flex', gap: 2, padding: 3,
+                  background: 'var(--bg-2)', border: '1px solid var(--border-1)', borderRadius: 7,
+                }}>
+                  {(['queue', 'tasks', 'pubs'] as TabKey[]).map(k => {
+                    const labels: Record<TabKey, string> = { queue: 'Queue', tasks: 'Tasks', pubs: 'Publications' };
+                    const counts: Record<TabKey, number> = {
+                      queue: overview.queue.length,
+                      tasks: overview.tasks.length,
+                      pubs: overview.publications.length,
+                    };
+                    return (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => setTab(k)}
+                        className="vp-btn vp-btn-sm"
+                        style={{
+                          background: tab === k ? 'var(--bg-3)' : 'transparent',
+                          border: '1px solid ' + (tab === k ? 'var(--border-2)' : 'transparent'),
+                          color: tab === k ? 'var(--fg-1)' : 'var(--fg-3)',
+                        }}
+                      >
+                        {labels[k]}
+                        <span className="mono dim" style={{ marginLeft: 6, fontSize: 10.5 }}>{counts[k]}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {tab === 'queue' && <QueueTable items={overview.queue} />}
+              {tab === 'tasks' && <TasksTable items={overview.tasks} />}
+              {tab === 'pubs' && <PublicationsTable items={overview.publications} />}
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {overview.health.warnings.length > 0 && (
+              <StatPanel title="Warnings" count={overview.health.warnings.length}>
+                <div style={{ padding: '0 20px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {overview.health.warnings.map(w => (
+                    <div key={w} style={{
+                      display: 'flex', gap: 10, padding: '10px 12px', borderRadius: 6,
+                      background: 'var(--status-run-soft)',
+                      border: '1px solid var(--status-run)',
+                      fontSize: 12.5,
+                    }}>
+                      <Icons.spark size={14} style={{ color: 'var(--status-run)', marginTop: 1 }} />
+                      <div style={{ flex: 1 }}>{w}</div>
                     </div>
                   ))}
                 </div>
-              )}
-            </div>
-
-            <div className="channel-ops-panel">
-              <div className="channel-ops-panel__header">
-                <h2>Lanes</h2>
-              </div>
-              <MiniStatus
-                items={overview.lanes}
-                empty="No lanes"
-                render={item => {
-                  const lane = item as LaneHealth;
-                  return (
-                    <div key={lane.lane_id} className="channel-ops-mini-row">
-                      <div>
-                        <div className="channel-ops-mini-row__title">{lane.name}</div>
-                        <div className="channel-ops-muted">{shortId(lane.lane_id)}</div>
-                      </div>
-                      <StatusPill value={lane.paused_until ? 'paused' : lane.enabled ? 'active' : 'disabled'} />
-                    </div>
-                  );
-                }}
-              />
-            </div>
-
-            <div className="channel-ops-panel">
-              <div className="channel-ops-panel__header">
-                <h2>Accounts</h2>
-              </div>
-              <MiniStatus
-                items={overview.accounts}
-                empty="No accounts"
-                render={item => {
-                  const account = item as AccountHealth;
-                  return (
-                    <div key={account.id} className="channel-ops-mini-row">
-                      <div>
-                        <div className="channel-ops-mini-row__title">{account.account_label}</div>
-                        <div className="channel-ops-muted">{account.platform}</div>
-                      </div>
-                      <StatusPill
-                        value={
-                          account.paused_until
-                            ? 'paused'
-                            : account.enabled
-                              ? account.last_token_check_status || 'active'
-                              : 'disabled'
-                        }
-                      />
-                    </div>
-                  );
-                }}
-              />
-            </div>
-          </section>
-
-          <section className="channel-ops-table-grid">
-            <div className="channel-ops-panel">
-              <div className="channel-ops-panel__header">
-                <h2>Queue</h2>
-              </div>
-              <div className="channel-ops-table-wrap">
-                <table className="channel-ops-table">
-                  <thead>
-                    <tr>
-                      <th>Kind</th>
-                      <th>Status</th>
-                      <th>Priority</th>
-                      <th>Attempts</th>
-                      <th>Key</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {overview.queue.length === 0 ? (
-                      <tr>
-                        <td colSpan={5}>No queue items</td>
-                      </tr>
-                    ) : (
-                      overview.queue.map(item => (
-                        <tr key={item.id} onClick={() => setDetail({ type: 'queue', item })}>
-                          <td>{item.kind}</td>
-                          <td><StatusPill value={item.status} /></td>
-                          <td>{item.priority}</td>
-                          <td>{item.attempt_count}</td>
-                          <td className="channel-ops-mono">{item.idempotency_key}</td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            <div className="channel-ops-panel">
-              <div className="channel-ops-panel__header">
-                <h2>Tasks</h2>
-              </div>
-              <div className="channel-ops-table-wrap">
-                <table className="channel-ops-table">
-                  <thead>
-                    <tr>
-                      <th>ID</th>
-                      <th>State</th>
-                      <th>Prompt</th>
-                      <th>Guard</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {overview.tasks.length === 0 ? (
-                      <tr>
-                        <td colSpan={4}>No tasks</td>
-                      </tr>
-                    ) : (
-                      overview.tasks.map(task => (
-                        <tr key={task.id} onClick={() => setDetail({ type: 'task', item: task })}>
-                          <td className="channel-ops-mono">{shortId(task.id)}</td>
-                          <td><StatusPill value={task.state} /></td>
-                          <td>{task.prompt || task.title_seed || '-'}</td>
-                          <td>{task.blocked_by_guard || task.failure_reason || '-'}</td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            <div className="channel-ops-panel">
-              <div className="channel-ops-panel__header">
-                <h2>Publications</h2>
-              </div>
-              <div className="channel-ops-table-wrap">
-                <table className="channel-ops-table">
-                  <thead>
-                    <tr>
-                      <th>Title</th>
-                      <th>Status</th>
-                      <th>Privacy</th>
-                      <th>Platform ID</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {overview.publications.length === 0 ? (
-                      <tr>
-                        <td colSpan={4}>No publications</td>
-                      </tr>
-                    ) : (
-                      overview.publications.map(publication => (
-                        <tr
-                          key={publication.id}
-                          onClick={() => setDetail({ type: 'publication', item: publication })}
-                        >
-                          <td>{publication.title}</td>
-                          <td><StatusPill value={publication.publish_status} /></td>
-                          <td>{publication.current_privacy || publication.desired_privacy}</td>
-                          <td className="channel-ops-mono">{publication.platform_content_id || '-'}</td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </section>
-
-          <aside className="channel-ops-detail">
-            <div className="channel-ops-panel__header">
-              <h2>Selected detail</h2>
-              {detail ? (
-                <button type="button" className="channel-ops-text-button" onClick={() => setDetail(null)}>
-                  Clear
-                </button>
-              ) : null}
-            </div>
-            {detail ? (
-              <pre>{formatJson(detail.item)}</pre>
-            ) : (
-              <div className="channel-ops-empty channel-ops-empty--inline">
-                Select a queue item, task, or publication.
-              </div>
+              </StatPanel>
             )}
-          </aside>
 
-          <footer className="channel-ops-footer">
-            <CheckCircle2 size={15} />
-            <span>Last refreshed {formatDate(lastUpdated)}</span>
-          </footer>
-        </>
-      ) : null}
+            <StatPanel title="Lanes" count={overview.lanes.length}>
+              <div style={{ padding: '0 20px 18px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {overview.lanes.length === 0
+                  ? <div className="muted" style={{ fontSize: 12 }}>No lanes</div>
+                  : overview.lanes.map(l => <LaneRow key={l.lane_id} lane={l} />)}
+              </div>
+            </StatPanel>
+
+            <StatPanel title="Accounts" count={overview.accounts.length}>
+              <div style={{ padding: '0 20px 18px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {overview.accounts.length === 0
+                  ? <div className="muted" style={{ fontSize: 12 }}>No accounts</div>
+                  : overview.accounts.map(a => <AccountRow key={a.id} account={a} />)}
+              </div>
+            </StatPanel>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QueueTable({ items }: { items: ChannelQueueItem[] }) {
+  if (items.length === 0) return <div className="muted" style={{ padding: 20 }}>Queue is empty</div>;
+  return (
+    <table className="vp-table">
+      <thead><tr>
+        <th style={{ width: 110 }}>ID</th>
+        <th style={{ width: 110 }}>Kind</th>
+        <th>Payload</th>
+        <th style={{ width: 70 }}>Prio</th>
+        <th style={{ width: 110 }}>Status</th>
+        <th style={{ width: 70 }}>Attempts</th>
+      </tr></thead>
+      <tbody>
+        {items.map(q => (
+          <tr key={q.id}>
+            <td className="id">{q.id.slice(0, 8)}</td>
+            <td><Tag>{q.kind}</Tag></td>
+            <td className="muted" style={{ fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+              {q.idempotency_key.slice(0, 60)}
+            </td>
+            <td className="mono">{q.priority}</td>
+            <td><Badge status={tone(q.status)}>{q.status}</Badge></td>
+            <td className="mono dim">{q.attempt_count}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function TasksTable({ items }: { items: ChannelTask[] }) {
+  if (items.length === 0) return <div className="muted" style={{ padding: 20 }}>No tasks</div>;
+  return (
+    <table className="vp-table">
+      <thead><tr>
+        <th style={{ width: 110 }}>ID</th>
+        <th>Prompt</th>
+        <th style={{ width: 130 }}>State</th>
+        <th style={{ width: 130 }}>Guard</th>
+      </tr></thead>
+      <tbody>
+        {items.map(t => (
+          <tr key={t.id}>
+            <td className="id">{t.id.slice(0, 8)}</td>
+            <td>
+              <div style={{ fontSize: 13 }}>{t.title_seed || t.prompt.slice(0, 80)}</div>
+              {t.failure_reason && (
+                <div style={{ fontSize: 11, color: 'var(--status-fail)', marginTop: 2 }}>
+                  {t.failure_reason}
+                </div>
+              )}
+            </td>
+            <td><Badge status={tone(t.state)}>{t.state}</Badge></td>
+            <td className="mono dim" style={{ fontSize: 11.5 }}>
+              {t.blocked_by_guard || '—'}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function PublicationsTable({ items }: { items: ChannelPublication[] }) {
+  if (items.length === 0) return <div className="muted" style={{ padding: 20 }}>No publications</div>;
+  return (
+    <table className="vp-table">
+      <thead><tr>
+        <th style={{ width: 90 }}>ID</th>
+        <th style={{ width: 110 }}>Platform</th>
+        <th>Title</th>
+        <th style={{ width: 130 }}>Privacy</th>
+        <th style={{ width: 130 }}>Status</th>
+      </tr></thead>
+      <tbody>
+        {items.map(p => (
+          <tr key={p.id}>
+            <td className="id">{p.id.slice(0, 8)}</td>
+            <td><Tag>{p.platform}</Tag></td>
+            <td>
+              <span className="vp-row-link">{p.title}</span>
+              {p.warnings_json.length > 0 && (
+                <div style={{ display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' }}>
+                  {p.warnings_json.map(w => (
+                    <span key={w} className="vp-tag" style={{ color: 'var(--status-run)' }}>{w}</span>
+                  ))}
+                </div>
+              )}
+            </td>
+            <td className="muted mono" style={{ fontSize: 12 }}>
+              {p.current_privacy} <span style={{ color: 'var(--fg-5)' }}>→</span> {p.desired_privacy}
+            </td>
+            <td><Badge status={tone(p.publish_status)}>{p.publish_status}</Badge></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function LaneRow({ lane }: { lane: LaneHealth }) {
+  const state = lane.paused_until ? 'paused' : lane.enabled ? 'active' : 'disabled';
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10, padding: '9px 0',
+      borderBottom: '1px solid var(--border-1)',
+    }}>
+      <div>
+        <div style={{ fontWeight: 500, fontSize: 13 }}>{lane.name}</div>
+        <div className="muted mono" style={{ fontSize: 11 }}>{lane.lane_id.slice(0, 8)}</div>
+      </div>
+      <div style={{ flex: 1 }} />
+      <Badge status={tone(state)}>{state}</Badge>
+    </div>
+  );
+}
+
+function AccountRow({ account }: { account: AccountHealth }) {
+  const state = account.paused_until ? 'paused' :
+                account.enabled ? account.last_token_check_status || 'active' : 'disabled';
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 10, padding: '9px 0',
+      borderBottom: '1px solid var(--border-1)',
+    }}>
+      <div>
+        <div style={{ fontWeight: 500, fontSize: 13 }}>{account.account_label}</div>
+        <div className="muted mono" style={{ fontSize: 11 }}>{account.platform}</div>
+      </div>
+      <div style={{ flex: 1 }} />
+      <Badge status={tone(state)}>{state}</Badge>
     </div>
   );
 }
