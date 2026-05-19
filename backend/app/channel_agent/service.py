@@ -29,6 +29,7 @@ from app.channel_agent.constants import (
     TASK_PLANNING,
     TASK_SELECTED,
     TASK_UPLOADED_PRIVATE,
+    TERMINAL_TASK_STATES,
     UPLOAD_FAILURE_KEYWORDS,
 )
 from app.channel_agent.lane_prompts import build_lane_prompt
