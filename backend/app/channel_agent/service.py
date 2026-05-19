@@ -29,6 +29,7 @@ from app.channel_agent.constants import (
     TASK_SELECTED,
     TASK_UPLOADED_PRIVATE,
 )
+from app.channel_agent.lane_prompts import build_lane_prompt
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
 from app.models.channel_agent import (
     AgentTickAudit,
@@ -50,6 +51,13 @@ _SAFE_PRIVACY_VALUES = {"private", "unlisted"}
 _SOURCE_STRATEGY_ALIASES = {"external_search": "external_research"}
 _ALLOWED_SOURCE_STRATEGIES = set(get_args(SourceStrategy))
 _ALLOWED_PLANNING_MODES = set(get_args(PlanningMode))
+_ACTIVE_TASK_STATES = {
+    TASK_SELECTED,
+    TASK_PLANNING,
+    TASK_HELD,
+    TASK_UPLOADED_PRIVATE,
+    TASK_SCHEDULED,
+}
 
 
 class ChannelAgentService:
@@ -73,9 +81,14 @@ class ChannelAgentService:
         if channel is None:
             raise ValueError("Channel not found")
 
+        now = self.clock.now()
+        bucket = utc_hour_bucket(now)
         lanes = (
             await db.execute(
-                select(TopicLane).where(TopicLane.channel_profile_id == channel.id).where(TopicLane.enabled.is_(True))
+                select(TopicLane)
+                .where(TopicLane.channel_profile_id == channel.id)
+                .where(TopicLane.enabled.is_(True))
+                .order_by(TopicLane.weight.desc(), TopicLane.created_at.asc())
             )
         ).scalars().all()
         accounts = (
@@ -83,6 +96,7 @@ class ChannelAgentService:
                 select(PublishingAccount)
                 .where(PublishingAccount.channel_profile_id == channel.id)
                 .where(PublishingAccount.enabled.is_(True))
+                .order_by(PublishingAccount.created_at.asc())
             )
         ).scalars().all()
         seeds = (
@@ -94,65 +108,67 @@ class ChannelAgentService:
             )
         ).scalars().all()
 
-        per_lane = {str(lane.id): 0 for lane in lanes}
-        for seed in seeds:
-            lane_id = str(seed.topic_lane_id or (lanes[0].id if lanes else "unassigned"))
-            per_lane[lane_id] = per_lane.get(lane_id, 0) + 1
+        lane_formats_by_lane = await self._lane_formats_by_lane(db, lanes)
+        candidates = await self._build_tick_candidates(
+            db,
+            channel=channel,
+            lanes=lanes,
+            accounts=accounts,
+            seeds=seeds,
+            lane_formats_by_lane=lane_formats_by_lane,
+            bucket=bucket,
+        )
+        accepted_candidates, rejected_candidates = await self._evaluate_tick_candidates(db, candidates)
+        per_lane = _per_lane_counts(lanes, candidates)
+        side_effects_disabled = bool(channel.dry_run or channel.halted_at is not None)
 
         audit = AgentTickAudit(
             channel_profile_id=channel.id,
-            tick_id=f"tick:{channel.id}:{utc_hour_bucket(self.clock.now())}",
+            tick_id=f"tick:{channel.id}:{bucket}",
             dry_run=bool(channel.dry_run),
-            started_at=self.clock.now(),
+            started_at=now,
             finished_at=self.clock.now(),
-            ideas_discovered=len(seeds),
-            candidates_scored=len(seeds),
-            tasks_selected=0,
-            tasks_rejected=0,
-            decision_summary_json={"per_lane_eligible_count": per_lane},
+            ideas_discovered=len(candidates),
+            candidates_scored=len(candidates),
+            tasks_selected=0 if side_effects_disabled else len(accepted_candidates),
+            tasks_rejected=len(rejected_candidates),
+            decision_summary_json={
+                "per_lane_eligible_count": per_lane,
+                "rejected_candidates": rejected_candidates,
+            },
         )
         db.add(audit)
 
         low_supply_alerts = await self._maybe_alert_low_supply(db, channel, per_lane)
-        audit.guards_triggered_json = low_supply_alerts
+        audit.guards_triggered_json = [
+            *low_supply_alerts,
+            *[
+                {
+                    "guard": rejected["guard"],
+                    "candidate_id": rejected["candidate_id"],
+                    "lane_id": rejected["lane_id"],
+                    "account_id": rejected["account_id"],
+                }
+                for rejected in rejected_candidates
+            ],
+        ]
 
-        if channel.dry_run or channel.halted_at is not None:
+        if side_effects_disabled:
             await db.commit()
             await db.refresh(audit)
             return audit
 
         selected = 0
-        for seed in seeds:
-            account = await self._resolve_account(db, seed, accounts)
-            lane_id = seed.topic_lane_id or (lanes[0].id if lanes else None)
-            lane_format = await self._resolve_lane_format(db, lane_id)
-            source_platforms = _string_list(seed.source_platforms_json) or _string_list(
-                lane_format.source_platforms_json if lane_format else []
-            )
-            material_library_ids = _string_list(seed.material_library_ids_json)
-            task = ProductionTask(
-                channel_profile_id=channel.id,
-                topic_lane_id=lane_id,
-                lane_format_id=lane_format.id if lane_format else None,
-                target_account_id=account.id,
-                manual_seed_id=seed.id,
-                source="manual_seed",
-                title_seed=seed.title_seed,
-                prompt=seed.prompt,
-                portfolio_bucket="explore",
-                source_platforms_json=source_platforms,
-                material_library_ids_json=material_library_ids,
-                uses_external_assets=bool(source_platforms),
-                state=TASK_SELECTED,
-                state_updated_at=self.clock.now(),
-                channel_config_version_snapshot=channel.config_version,
-                channel_config_snapshot_json=_snapshot(channel, account, lane_format, manual_seed=seed),
-                transition_history_json=[
-                    _transition("seeded", TASK_SELECTED, "agent_tick", self.clock.now()),
-                ],
+        for candidate in accepted_candidates:
+            task = self._task_from_candidate(
+                channel,
+                candidate,
+                created_at=now + timedelta(microseconds=selected),
             )
             db.add(task)
-            seed.status = "exhausted"
+            seed = candidate.get("seed")
+            if seed is not None:
+                seed.status = "exhausted"
             await db.flush()
             await self.queue.enqueue(
                 db,
@@ -168,6 +184,244 @@ class ChannelAgentService:
         await db.commit()
         await db.refresh(audit)
         return audit
+
+    async def _lane_formats_by_lane(
+        self,
+        db: AsyncSession,
+        lanes: list[TopicLane],
+    ) -> dict[str, list[LaneFormatMatrix]]:
+        if not lanes:
+            return {}
+        result = await db.execute(
+            select(LaneFormatMatrix)
+            .where(LaneFormatMatrix.topic_lane_id.in_([lane.id for lane in lanes]))
+            .where(LaneFormatMatrix.enabled.is_(True))
+            .order_by(LaneFormatMatrix.weight.desc(), LaneFormatMatrix.created_at.asc())
+        )
+        grouped: dict[str, list[LaneFormatMatrix]] = {str(lane.id): [] for lane in lanes}
+        for lane_format in result.scalars().all():
+            grouped.setdefault(str(lane_format.topic_lane_id), []).append(lane_format)
+        return grouped
+
+    async def _build_tick_candidates(
+        self,
+        db: AsyncSession,
+        *,
+        channel: ChannelProfile,
+        lanes: list[TopicLane],
+        accounts: list[PublishingAccount],
+        seeds: list[ManualSeed],
+        lane_formats_by_lane: dict[str, list[LaneFormatMatrix]],
+        bucket: str,
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+        lane_by_id = {str(lane.id): lane for lane in lanes}
+        fallback_lane = lanes[0] if lanes else None
+        claimed_account_ids: set[str] = set()
+        manual_count_by_lane: dict[str, int] = {}
+
+        for seed in seeds:
+            lane = lane_by_id.get(str(seed.topic_lane_id)) if seed.topic_lane_id else fallback_lane
+            lane_key = str(lane.id) if lane is not None else "unassigned"
+            lane_formats = lane_formats_by_lane.get(lane_key, [])
+            lane_format = lane_formats[0] if lane_formats else None
+            account = await self._resolve_candidate_account(db, seed, accounts, claimed_account_ids)
+            claimed_account_ids.add(str(account.id))
+            manual_count_by_lane[lane_key] = manual_count_by_lane.get(lane_key, 0) + 1
+            source_platforms = _string_list(seed.source_platforms_json) or _string_list(
+                lane_format.source_platforms_json if lane_format else []
+            )
+            candidates.append(
+                {
+                    "candidate_id": _candidate_id(
+                        "manual_seed",
+                        lane.id if lane is not None else None,
+                        lane_format.id if lane_format is not None else None,
+                        bucket,
+                    ),
+                    "source": "manual_seed",
+                    "seed": seed,
+                    "lane": lane,
+                    "lane_format": lane_format,
+                    "account": account,
+                    "prompt": seed.prompt,
+                    "title_seed": seed.title_seed,
+                    "source_platforms_json": source_platforms,
+                    "material_library_ids_json": _string_list(seed.material_library_ids_json),
+                    "constraints_json": _dict_value(seed.constraints_json),
+                }
+            )
+
+        for lane in lanes:
+            lane_key = str(lane.id)
+            lane_budget = max(_positive_int(lane.max_posts_per_day, default=1), 1)
+            remaining = lane_budget - manual_count_by_lane.get(lane_key, 0)
+            if remaining <= 0:
+                continue
+
+            generated = 0
+            for lane_format in lane_formats_by_lane.get(lane_key, []):
+                if generated >= remaining:
+                    break
+                account = self._select_account_for_tick(accounts, claimed_account_ids)
+                claimed_account_ids.add(str(account.id))
+                candidates.append(
+                    {
+                        "candidate_id": _candidate_id("lane_seed", lane.id, lane_format.id, bucket),
+                        "source": "lane_seed",
+                        "seed": None,
+                        "lane": lane,
+                        "lane_format": lane_format,
+                        "account": account,
+                        "prompt": build_lane_prompt(
+                            lane_name=lane.name,
+                            lane_description=lane.description,
+                            keywords=_string_list(lane.keywords_json),
+                            format_key=lane_format.format_key,
+                            duration_sec=_positive_int(lane_format.target_duration_sec, default=30),
+                            aspect_ratio=channel.default_aspect_ratio or "9:16",
+                        ),
+                        "title_seed": lane.name,
+                        "source_platforms_json": self._lane_source_platforms(channel, lane_format),
+                        "material_library_ids_json": [],
+                        "constraints_json": {
+                            "template_pool_json": _string_list(lane_format.template_pool_json),
+                        },
+                    }
+                )
+                generated += 1
+
+        return candidates
+
+    async def _resolve_candidate_account(
+        self,
+        db: AsyncSession,
+        seed: ManualSeed,
+        accounts: list[PublishingAccount],
+        claimed_account_ids: set[str],
+    ) -> PublishingAccount:
+        if seed.target_account_id:
+            account = await db.get(PublishingAccount, seed.target_account_id)
+            if account is not None:
+                return account
+        return self._select_account_for_tick(accounts, claimed_account_ids)
+
+    def _select_account_for_tick(
+        self,
+        accounts: list[PublishingAccount],
+        claimed_account_ids: set[str],
+    ) -> PublishingAccount:
+        if not accounts:
+            raise ValueError("No enabled publishing account")
+        for account in accounts:
+            if str(account.id) not in claimed_account_ids:
+                return account
+        return accounts[0]
+
+    def _lane_source_platforms(
+        self,
+        channel: ChannelProfile,
+        lane_format: LaneFormatMatrix,
+    ) -> list[str]:
+        return (
+            _string_list(lane_format.source_platforms_json)
+            or _string_list(_dict_value(channel.risk_policy_json).get("default_source_platforms"))
+            or ["youtube"]
+        )
+
+    async def _evaluate_tick_candidates(
+        self,
+        db: AsyncSession,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        accepted: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        selected_account_counts: dict[str, int] = {}
+        for candidate in candidates:
+            rejection = await self._evaluate_candidate_guards(db, candidate, selected_account_counts)
+            if rejection is not None:
+                rejected.append(rejection)
+                continue
+            accepted.append(candidate)
+            account_id = str(candidate["account"].id)
+            selected_account_counts[account_id] = selected_account_counts.get(account_id, 0) + 1
+        return accepted, rejected
+
+    async def _evaluate_candidate_guards(
+        self,
+        db: AsyncSession,
+        candidate: dict[str, Any],
+        selected_account_counts: dict[str, int],
+    ) -> dict[str, Any] | None:
+        account = candidate["account"]
+        account_id = str(account.id)
+        active_count = await self._active_task_count_for_account(db, account.id)
+        active_count += selected_account_counts.get(account_id, 0)
+        if active_count <= 0:
+            return None
+
+        lane = candidate.get("lane")
+        lane_format = candidate.get("lane_format")
+        task_label = "task" if active_count == 1 else "tasks"
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "lane_id": str(lane.id) if lane is not None else "",
+            "format_id": str(lane_format.id) if lane_format is not None else "",
+            "account_id": account_id,
+            "guard": "account_concurrency",
+            "reason": f"Account {account_id} has {active_count} active {task_label}; account concurrency is limited to 1.",
+        }
+
+    async def _active_task_count_for_account(self, db: AsyncSession, account_id) -> int:
+        result = await db.execute(
+            select(func.count(ProductionTask.id))
+            .where(ProductionTask.target_account_id == account_id)
+            .where(ProductionTask.state.in_(_ACTIVE_TASK_STATES))
+        )
+        return int(result.scalar_one() or 0)
+
+    def _task_from_candidate(
+        self,
+        channel: ChannelProfile,
+        candidate: dict[str, Any],
+        *,
+        created_at: datetime,
+    ) -> ProductionTask:
+        account = candidate["account"]
+        lane = candidate.get("lane")
+        lane_format = candidate.get("lane_format")
+        seed = candidate.get("seed")
+        task = ProductionTask(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id if lane is not None else None,
+            lane_format_id=lane_format.id if lane_format is not None else None,
+            target_account_id=account.id,
+            manual_seed_id=seed.id if seed is not None else None,
+            source=candidate["source"],
+            title_seed=candidate["title_seed"],
+            prompt=candidate["prompt"],
+            portfolio_bucket="explore",
+            source_platforms_json=list(candidate["source_platforms_json"]),
+            material_library_ids_json=list(candidate["material_library_ids_json"]),
+            uses_external_assets=False,
+            state=TASK_SELECTED,
+            created_at=created_at,
+            updated_at=created_at,
+            state_updated_at=self.clock.now(),
+            channel_config_version_snapshot=channel.config_version,
+            channel_config_snapshot_json=_snapshot(
+                channel,
+                account,
+                lane_format,
+                lane=lane,
+                manual_seed=seed,
+            ),
+            transition_history_json=[
+                _transition("seeded", TASK_SELECTED, "agent_tick", self.clock.now()),
+            ],
+        )
+        task.uses_external_assets = self._uses_external_assets(task)
+        return task
 
     async def handle_plan_task(self, db: AsyncSession, item: ChannelOpsQueueItem) -> ProductionTask:
         task = await self._task_from_item(db, item)
@@ -550,8 +804,10 @@ def _snapshot(
     account: PublishingAccount,
     lane_format: LaneFormatMatrix | None,
     *,
+    lane: TopicLane | None = None,
     manual_seed: ManualSeed | None = None,
 ) -> dict[str, Any]:
+    lane_id = lane.id if lane is not None else (lane_format.topic_lane_id if lane_format else None)
     snapshot = {
         "channel": {
             "id": str(channel.id),
@@ -567,7 +823,10 @@ def _snapshot(
             "external_asset_auto_publish": account.external_asset_auto_publish,
         },
         "lane": {
-            "id": str(lane_format.topic_lane_id) if lane_format else None,
+            "id": str(lane_id) if lane_id else None,
+            "name": lane.name if lane is not None else "",
+            "description": lane.description if lane is not None else "",
+            "keywords_json": _string_list(lane.keywords_json) if lane is not None else [],
         },
         "lane_format": {
             "id": str(lane_format.id) if lane_format else None,
@@ -581,6 +840,19 @@ def _snapshot(
     if manual_seed is not None:
         snapshot["manual_seed"] = {"constraints_json": _dict_value(manual_seed.constraints_json)}
     return snapshot
+
+
+def _per_lane_counts(lanes: list[TopicLane], candidates: list[dict[str, Any]]) -> dict[str, int]:
+    per_lane = {str(lane.id): 0 for lane in lanes}
+    for candidate in candidates:
+        lane = candidate.get("lane")
+        lane_id = str(lane.id) if lane is not None else "unassigned"
+        per_lane[lane_id] = per_lane.get(lane_id, 0) + 1
+    return per_lane
+
+
+def _candidate_id(source: str, lane_id, format_id, bucket: str) -> str:
+    return f"{source}:lane:{lane_id or 'unassigned'}:format:{format_id or 'none'}:{bucket}"
 
 
 def _transition(from_state: str, to_state: str, actor: str, now: datetime) -> dict[str, Any]:

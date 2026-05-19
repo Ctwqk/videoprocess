@@ -95,6 +95,24 @@ def _service(*, clock=None, autoflow=None, youtube=None, minimax=None) -> Channe
     )
 
 
+def test_lane_prompt_template_is_structured():
+    from app.channel_agent.lane_prompts import build_lane_prompt
+
+    prompt = build_lane_prompt(
+        lane_name="Tech News",
+        lane_description="Daily AI product updates",
+        keywords=["AI", "robots"],
+        format_key="shorts_9x16",
+        duration_sec=30,
+        aspect_ratio="9:16",
+    )
+
+    assert 'Create a shorts_9x16 video for the "Tech News" topic.' in prompt
+    assert "Theme: Daily AI product updates" in prompt
+    assert "Keywords: AI, robots" in prompt
+    assert "Target duration: 30s, aspect ratio 9:16." in prompt
+
+
 def test_autoflow_request_uses_task_snapshot_configuration():
     task = ProductionTask(
         channel_profile_id=uuid.uuid4(),
@@ -333,6 +351,97 @@ async def test_active_tick_stores_lane_format_platforms_when_seed_has_none(servi
     task = (await service_session.execute(select(ProductionTask))).scalar_one()
     assert task.source_platforms_json == ["bilibili"]
     assert task.uses_external_assets is True
+
+
+@pytest.mark.asyncio
+async def test_lane_driven_tick_creates_task_without_manual_seed(service_session):
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.description = "Daily AI updates"
+    lane.keywords_json = ["AI"]
+    lane_format.source_platforms_json = ["bilibili", "youtube"]
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=channel.id)
+
+    assert audit.tasks_selected == 1
+    task = (await service_session.execute(select(ProductionTask))).scalar_one()
+    assert task.source == "lane_seed"
+    assert task.manual_seed_id is None
+    assert task.topic_lane_id == lane.id
+    assert task.lane_format_id == lane_format.id
+    assert task.source_platforms_json == ["bilibili", "youtube"]
+    assert task.uses_external_assets is True
+    assert "Daily AI updates" in task.prompt
+
+
+@pytest.mark.asyncio
+async def test_manual_seed_consumes_first_then_lane_driven_fills_budget(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.max_posts_per_day = 3
+    second_account = PublishingAccount(
+        channel_profile_id=channel.id,
+        account_label="second",
+        platform_account_id="yt-2",
+        credential_ref="youtube/second",
+        external_asset_auto_publish=True,
+    )
+    service_session.add(second_account)
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=second_account.id,
+            prompt="manual short",
+            title_seed="manual",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=channel.id)
+    tasks = (
+        await service_session.execute(select(ProductionTask).order_by(ProductionTask.created_at.asc()))
+    ).scalars().all()
+
+    assert audit.tasks_selected == 2
+    assert [task.source for task in tasks] == ["manual_seed", "lane_seed"]
+    assert {task.target_account_id for task in tasks} == {account.id, second_account.id}
+
+
+@pytest.mark.asyncio
+async def test_dry_run_evaluates_candidates_without_creating_tasks_or_queue(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=True)
+    service_session.add(
+        ProductionTask(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            source="manual_seed",
+            prompt="held task",
+            state="held",
+            channel_config_snapshot_json={},
+        )
+    )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="dry run candidate",
+            title_seed="dry",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=channel.id)
+
+    tasks = (await service_session.execute(select(ProductionTask))).scalars().all()
+    queue_items = (await service_session.execute(select(ChannelOpsQueueItem))).scalars().all()
+    rejected = audit.decision_summary_json["rejected_candidates"]
+
+    assert len(tasks) == 1
+    assert queue_items == []
+    assert audit.candidates_scored >= 1
+    assert rejected[0]["guard"] == "account_concurrency"
 
 
 @pytest.mark.asyncio
