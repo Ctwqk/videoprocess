@@ -158,6 +158,7 @@ class ChannelAgentService:
             db,
             manual_candidates,
             enqueue_alerts=not side_effects_disabled,
+            pds_enabled=not side_effects_disabled,
         )
         lane_candidates = await self._build_lane_driven_candidates(
             db,
@@ -179,6 +180,7 @@ class ChannelAgentService:
             db,
             lane_candidates,
             enqueue_alerts=not side_effects_disabled,
+            pds_enabled=not side_effects_disabled,
             initial_account_counts=selected_account_counts,
             initial_lane_counts=selected_lane_counts,
         )
@@ -248,6 +250,7 @@ class ChannelAgentService:
                 payload={"production_task_id": str(task.id)},
                 priority=50,
                 channel_profile_id=channel.id,
+                commit=False,
             )
             await self._emit_candidate_accepted(db, candidate, task)
             selected += 1
@@ -489,6 +492,7 @@ class ChannelAgentService:
         candidates: list[dict[str, Any]],
         *,
         enqueue_alerts: bool,
+        pds_enabled: bool,
         initial_account_counts: dict[str, int] | None = None,
         initial_lane_counts: dict[str, int] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int], dict[str, int]]:
@@ -503,6 +507,7 @@ class ChannelAgentService:
                 selected_account_counts,
                 selected_lane_counts,
                 enqueue_alerts=enqueue_alerts,
+                pds_enabled=pds_enabled,
             )
             if rejection is not None:
                 rejected.append(rejection)
@@ -524,6 +529,7 @@ class ChannelAgentService:
         selected_lane_counts: dict[str, int],
         *,
         enqueue_alerts: bool,
+        pds_enabled: bool,
     ) -> dict[str, Any] | None:
         pre_rejection = candidate.get("pre_rejection")
         if isinstance(pre_rejection, dict):
@@ -570,23 +576,25 @@ class ChannelAgentService:
         if upload_failure_rejection is not None:
             return upload_failure_rejection
 
-        pds_rejection = await self._pds_candidate_guard(
-            db,
-            candidate,
-            emit_outbox=enqueue_alerts,
-        )
-        if pds_rejection is not None:
-            return pds_rejection
-
         lane = candidate.get("lane")
         accepted_lane_count = (
             selected_lane_counts.get(str(lane.id), 0) if lane is not None else 0
         )
-        return await self._lane_cadence_guard(
+        lane_cadence_rejection = await self._lane_cadence_guard(
             db,
             candidate,
             accepted_lane_count=accepted_lane_count,
         )
+        if lane_cadence_rejection is not None:
+            return lane_cadence_rejection
+
+        if pds_enabled:
+            return await self._pds_candidate_guard(
+                db,
+                candidate,
+                emit_outbox=enqueue_alerts,
+            )
+        return None
 
     async def _pds_candidate_guard(
         self,
@@ -634,9 +642,8 @@ class ChannelAgentService:
                 metadata={
                     "lane_id": str(lane.id) if lane is not None else "",
                     "candidate_id": str(candidate.get("candidate_id") or ""),
-                    "decision_id": decision.decision_id,
-                    "verdict": decision.verdict,
                     "guard": marker,
+                    **_pds_decision_event_metadata(decision),
                 },
             )
         return _candidate_rejection(
@@ -1231,9 +1238,8 @@ class ChannelAgentService:
                 platform=str(publication.platform or "youtube"),
                 metadata={
                     **promotion_metadata,
-                    "decision_id": decision.decision_id,
-                    "verdict": decision.verdict,
                     "guard": marker,
+                    **_pds_decision_event_metadata(decision),
                 },
             )
             await db.commit()
@@ -1262,8 +1268,7 @@ class ChannelAgentService:
             platform=str(publication.platform or "youtube"),
             metadata={
                 **promotion_metadata,
-                "decision_id": decision.decision_id,
-                "verdict": decision.verdict,
+                **_pds_decision_event_metadata(decision),
             },
         )
         await self.queue.enqueue(
@@ -1474,7 +1479,7 @@ class ChannelAgentService:
             "source": str(candidate.get("source") or ""),
         }
         if isinstance(decision, PDSDecision):
-            metadata.update({"decision_id": decision.decision_id, "verdict": decision.verdict})
+            metadata.update(_pds_decision_event_metadata(decision))
         await self._emit_actor_action_event(
             db,
             actor_id=str(account.id),
@@ -1749,6 +1754,24 @@ def _candidate_id(source: str, lane_id, format_id, bucket: str, *, seed_id=None)
 
 def _account_platform(account: PublishingAccount) -> str:
     return str(account.platform or "youtube")
+
+
+def _pds_decision_event_metadata(decision: PDSDecision) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "decision_id": str(decision.decision_id or ""),
+        "verdict": str(decision.verdict or ""),
+        "score": float(decision.score or 0.0),
+        "rules_version": str(decision.rules_version or ""),
+        "reason_codes": [
+            str(reason.get("code"))
+            for reason in decision.reasons
+            if isinstance(reason, dict) and reason.get("code") not in {None, ""}
+        ],
+    }
+    warning = decision.metadata.get("warning") if isinstance(decision.metadata, dict) else None
+    if warning is not None:
+        metadata["warning"] = str(warning)
+    return metadata
 
 
 def _transition(from_state: str, to_state: str, actor: str, now: datetime) -> dict[str, Any]:

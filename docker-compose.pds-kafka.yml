@@ -78,6 +78,8 @@ services:
       - vp_internal
 
   channel-agent-runner:
+    depends_on:
+      - pds
     environment:
       PDS_ENABLED: "true"
       PDS_BASE_URL: http://pds:8080

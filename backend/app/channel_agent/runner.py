@@ -9,6 +9,7 @@ from app.channel_agent.queue import ChannelOpsQueueService
 from app.channel_agent.service import ChannelAgentService
 from app.config import settings
 from app.db import async_session
+from app.models.channel_agent import ChannelOpsQueueItem
 from app.pds_client import NoopPDSClient, PDSClient, PolicyDecisionClient
 
 logger = logging.getLogger(__name__)
@@ -45,11 +46,16 @@ class ChannelAgentRunner:
             item = await self.queue.claim_next(db, worker_id=self.worker_id)
             if item is None:
                 return False
+            item_id = item.id
             try:
                 await self.handle_item(db, item)
             except Exception as exc:
-                logger.exception("ChannelOps queue item failed: %s", item.id)
-                await self.queue.mark_failed_or_retry(db, item, str(exc))
+                logger.exception("ChannelOps queue item failed: %s", item_id)
+                await db.rollback()
+                failed_item = await db.get(ChannelOpsQueueItem, item_id)
+                if failed_item is None:
+                    raise
+                await self.queue.mark_failed_or_retry(db, failed_item, str(exc))
                 return True
             await self.queue.mark_succeeded(db, item)
             return True
