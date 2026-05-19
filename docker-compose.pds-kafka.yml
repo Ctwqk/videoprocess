@@ -21,6 +21,7 @@ services:
     build:
       context: /home/taiwei/Constructure-repos/policy-decision-service
       dockerfile: deploy/Dockerfile
+    user: "0:0"
     environment:
       PDS_HTTP_ADDR: ":8080"
       PDS_DATABASE_URL: ${PDS_DATABASE_URL:-postgres://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@host.docker.internal:5435/videoprocess?sslmode=disable}
@@ -30,6 +31,9 @@ services:
       PDS_KAFKA_BROKERS: redpanda:9092
       RISK_KAFKA_BROKERS: redpanda:9092
       RISK_VP_ACTIONS_TOPIC: vp.actor.actions.v1
+      PDS_RULES_PATH: /etc/pds/rules.example.yaml
+    volumes:
+      - /home/taiwei/Constructure-repos/policy-decision-service/config:/etc/pds:ro
     depends_on:
       - redpanda
       - vp-feature-aggregator

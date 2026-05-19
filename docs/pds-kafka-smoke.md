@@ -14,6 +14,15 @@ Render the merged compose file before starting services:
 docker compose -f docker-compose.yml -f docker-compose.pds-kafka.yml config
 ```
 
+The override mounts
+`/home/taiwei/Constructure-repos/policy-decision-service/config` at `/etc/pds`
+inside the scratch PDS image and sets
+`PDS_RULES_PATH=/etc/pds/rules.example.yaml`. Keep the whole config directory
+mounted because `rules.example.yaml` references `blocklist.example.txt`
+relative to the rules file. The smoke override runs PDS as `0:0` so it can read
+the local read-only bind mount even when the source checkout has restrictive
+file permissions.
+
 Start the PDS/Kafka smoke stack:
 
 ```bash
@@ -29,8 +38,9 @@ curl -fsS "http://localhost:${API_PORT:-18080}/health"
 ```
 
 PDS is service-local in `docker-compose.pds-kafka.yml`; it is not host-published
-unless you add a local ports override. Because the PDS image is `scratch`, probe
-it from another Python-based service on the compose network:
+unless you add a local ports override. PDS exposes `/healthz` and `/readyz`,
+while `/health` is the VP API endpoint above. Because the PDS image is
+`scratch`, probe it from another Python-based service on the compose network:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.pds-kafka.yml exec vp-feature-aggregator \

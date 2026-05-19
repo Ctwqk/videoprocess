@@ -49,10 +49,22 @@ async def run_forever() -> None:
     start_http_server(metrics_port)
     logger.info("event_outbox_relay metrics on :%d", metrics_port)
 
-    producer = KafkaEventProducer(brokers=settings.risk_kafka_brokers)
     delay = base_delay
+    producer = None
     try:
-        await producer.start()
+        startup_delay = base_delay
+        while producer is None:
+            candidate = KafkaEventProducer(brokers=settings.risk_kafka_brokers)
+            try:
+                await candidate.start()
+            except Exception:
+                logger.exception("event_outbox_relay producer startup failed")
+                OutboxSendErrors.inc()
+                await asyncio.sleep(startup_delay)
+                startup_delay = min(startup_delay * 2, max_delay)
+            else:
+                producer = candidate
+
         relay = EventOutboxRelay(producer=producer)
         while True:
             try:
@@ -69,7 +81,8 @@ async def run_forever() -> None:
                 delay = min(delay * 2, max_delay)
             await asyncio.sleep(delay)
     finally:
-        await producer.stop()
+        if producer is not None:
+            await producer.stop()
 
 
 if __name__ == "__main__":
