@@ -7,13 +7,20 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/Ctwqk/videoprocess/internal/config"
+	"github.com/Ctwqk/videoprocess/internal/storage"
+	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/Ctwqk/videoprocess/internal/worker"
+	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
+	"github.com/Ctwqk/videoprocess/internal/worker/handlers"
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
 	cfg := worker.LoadConfig()
+	appCfg := config.Load()
 	slog.Info("starting vp-ffmpeg-worker-go",
 		"worker_type", cfg.WorkerType,
 		"worker_id", cfg.WorkerID,
@@ -30,9 +37,34 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	openCtx, openCancel := context.WithTimeout(ctx, 10*time.Second)
+	st, err := store.Open(openCtx, appCfg.DatabaseURL)
+	openCancel()
+	if err != nil {
+		slog.Error("open worker database", "error", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	storageBackend, err := storage.FromConfig(ctx, appCfg)
+	if err != nil {
+		slog.Error("open worker storage", "error", err)
+		os.Exit(1)
+	}
+
+	runtimeEnv := worker.RuntimeEnv{
+		Store:          st,
+		Storage:        storageBackend,
+		StorageBackend: appCfg.StorageBackend,
+		LocalRoot:      appCfg.StorageLocalRoot,
+		WorkerID:       cfg.WorkerID,
+		Logger:         slog.Default(),
+	}
+	trim := worker.NewMediaTaskHandler(runtimeEnv, handlers.TrimHandler{Runner: vpffmpeg.NewRunner()})
+
 	// Handler registration happens here so adding new node types is a
 	// single-file change. Each handler must self-identify via NodeType().
-	consumer := worker.NewConsumer(client, cfg /* handlers go here as they land */)
+	consumer := worker.NewConsumer(client, cfg, trim)
 
 	if err := consumer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("vp-ffmpeg-worker-go stopped", "error", err)

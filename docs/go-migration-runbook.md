@@ -43,6 +43,18 @@ docker compose logs --tail=100 ffmpeg-worker-go
 
 Healthy startup logs `starting vp-ffmpeg-worker-go worker_type=ffmpeg_go worker_id=...`. The worker creates the `ffmpeg_go-workers` consumer group on first run. Until a node registry entry switches to `ffmpeg_go`, the Go worker idles on an empty stream — that is expected, not a bug.
 
+The worker now registers the `trim` task handler. It still consumes only
+`vp:tasks:ffmpeg_go`; no live jobs reach it until the Python node registry
+switches `trim.worker_type` to `ffmpeg_go`.
+
+Before any registry switch, confirm:
+
+```bash
+go test ./internal/worker ./internal/worker/handlers ./cmd/vp-ffmpeg-worker
+docker compose up -d --build ffmpeg-worker-go
+docker compose logs --tail=100 ffmpeg-worker-go
+```
+
 ## GPU Sidecar Start
 
 ```bash
