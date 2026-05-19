@@ -377,11 +377,13 @@ class ChannelAgentService:
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         selected_account_counts: dict[str, int] = {}
+        selected_lane_counts: dict[str, int] = {}
         for candidate in candidates:
             rejection = await self._evaluate_candidate_guards(
                 db,
                 candidate,
                 selected_account_counts,
+                selected_lane_counts,
                 enqueue_alerts=enqueue_alerts,
             )
             if rejection is not None:
@@ -390,6 +392,10 @@ class ChannelAgentService:
             accepted.append(candidate)
             account_id = str(candidate["account"].id)
             selected_account_counts[account_id] = selected_account_counts.get(account_id, 0) + 1
+            lane = candidate.get("lane")
+            if lane is not None:
+                lane_id = str(lane.id)
+                selected_lane_counts[lane_id] = selected_lane_counts.get(lane_id, 0) + 1
         return accepted, rejected
 
     async def _evaluate_candidate_guards(
@@ -397,6 +403,7 @@ class ChannelAgentService:
         db: AsyncSession,
         candidate: dict[str, Any],
         selected_account_counts: dict[str, int],
+        selected_lane_counts: dict[str, int],
         *,
         enqueue_alerts: bool,
     ) -> dict[str, Any] | None:
@@ -430,7 +437,15 @@ class ChannelAgentService:
         if upload_failure_rejection is not None:
             return upload_failure_rejection
 
-        return await self._lane_cadence_guard(db, candidate)
+        lane = candidate.get("lane")
+        accepted_lane_count = (
+            selected_lane_counts.get(str(lane.id), 0) if lane is not None else 0
+        )
+        return await self._lane_cadence_guard(
+            db,
+            candidate,
+            accepted_lane_count=accepted_lane_count,
+        )
 
     async def _active_task_count_for_account(self, db: AsyncSession, account_id) -> int:
         result = await db.execute(
@@ -455,6 +470,7 @@ class ChannelAgentService:
             await db.execute(
                 select(ProductionTask)
                 .where(ProductionTask.target_account_id == account.id)
+                .where(ProductionTask.state.in_(TERMINAL_TASK_STATES))
                 .order_by(ProductionTask.created_at.desc())
                 .limit(5)
             )
@@ -512,6 +528,8 @@ class ChannelAgentService:
         self,
         db: AsyncSession,
         candidate: dict[str, Any],
+        *,
+        accepted_lane_count: int = 0,
     ) -> dict[str, Any] | None:
         lane = candidate.get("lane")
         if lane is None:
@@ -522,13 +540,17 @@ class ChannelAgentService:
         max_posts_per_day = int(lane.max_posts_per_day or 0)
         if max_posts_per_day > 0:
             cutoff = now - timedelta(hours=24)
-            recent_count = sum(1 for _publication, effective_at in publications if cutoff <= effective_at <= now)
-            if recent_count >= max_posts_per_day:
+            recent_count = sum(
+                1 for _publication, effective_at in publications if cutoff <= effective_at <= now
+            )
+            effective_count = recent_count + accepted_lane_count
+            if effective_count >= max_posts_per_day:
                 return _candidate_rejection(
                     candidate,
                     guard="lane_cadence",
                     reason=(
-                        f"Lane {lane.id} has {recent_count} scheduled/public publications in the past 24 hours; "
+                        f"Lane {lane.id} has {effective_count} scheduled/public publications or "
+                        "same-tick reservations in the past 24 hours; "
                         f"max_posts_per_day is {max_posts_per_day}."
                     ),
                 )
@@ -537,6 +559,8 @@ class ChannelAgentService:
         if cooldown_minutes > 0 and publications:
             latest_effective_at = publications[0][1]
             cooldown = timedelta(minutes=cooldown_minutes)
+            # Future scheduled records reserve cooldown/streak slots.
+            # Daily cap stays a past-24h lookback.
             if now - latest_effective_at < cooldown:
                 return _candidate_rejection(
                     candidate,
@@ -1122,12 +1146,27 @@ def _datetime_to_utc(value: datetime) -> datetime:
 
 
 def _publication_effective_time(publication: PublicationRecord) -> datetime | None:
-    value = (
-        publication.scheduled_publish_at
-        or publication.public_at
-        or publication.uploaded_at
-        or publication.created_at
-    )
+    if publication.publish_status == "public":
+        value = (
+            publication.public_at
+            or publication.scheduled_publish_at
+            or publication.uploaded_at
+            or publication.created_at
+        )
+    elif publication.publish_status == "scheduled":
+        value = (
+            publication.scheduled_publish_at
+            or publication.public_at
+            or publication.uploaded_at
+            or publication.created_at
+        )
+    else:
+        value = (
+            publication.scheduled_publish_at
+            or publication.public_at
+            or publication.uploaded_at
+            or publication.created_at
+        )
     if value is None:
         return None
     return _datetime_to_utc(value)
