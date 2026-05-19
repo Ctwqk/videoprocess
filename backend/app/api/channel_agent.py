@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent.clock import Clock
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
 from app.db import get_db
 from app.models.channel_agent import (
+    AgentTickAudit,
     ChannelOpsQueueItem,
     ChannelProfile,
     LaneFormatMatrix,
@@ -42,6 +43,11 @@ class DryRunPatch(BaseModel):
 
 class HaltRequest(BaseModel):
     reason: str
+
+
+class PauseRequest(BaseModel):
+    reason: str = "operator"
+    until: datetime | None = None
 
 
 @router.post("/channels")
@@ -115,6 +121,8 @@ async def patch_lane(channel_id: str, lane_id: str, data: dict[str, Any], db: As
         "negative_keywords_json",
         "min_posts_per_week",
         "max_posts_per_day",
+        "max_consecutive_streak",
+        "cooldown_after_post_minutes",
         "enabled",
         "paused_until",
     ):
@@ -175,7 +183,15 @@ async def patch_lane_format(lane_format_id: str, data: dict[str, Any], db: Async
     row = await db.get(LaneFormatMatrix, _uuid(lane_format_id))
     if row is None:
         raise HTTPException(status_code=404, detail="Lane format not found")
-    for field in ("format_key", "enabled", "weight", "target_duration_sec", "template_pool_json", "default_publish_visibility"):
+    for field in (
+        "format_key",
+        "enabled",
+        "weight",
+        "target_duration_sec",
+        "template_pool_json",
+        "source_platforms_json",
+        "default_publish_visibility",
+    ):
         if field in data:
             setattr(row, field, data[field])
     await db.commit()
@@ -241,7 +257,9 @@ async def resume_channel(channel_id: str, db: AsyncSession = Depends(get_db)):
 @router.get("/channels/{channel_id}/health", response_model=HealthSummary)
 async def channel_health(channel_id: str, db: AsyncSession = Depends(get_db)):
     channel = await _require_channel(db, channel_id)
-    queued = (await db.execute(select(ChannelOpsQueueItem))).scalars().all()
+    queued = (
+        await db.execute(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.channel_profile_id == channel.id))
+    ).scalars().all()
     tasks = (
         await db.execute(select(ProductionTask).where(ProductionTask.channel_profile_id == channel.id))
     ).scalars().all()
@@ -258,9 +276,24 @@ async def channel_health(channel_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.get("/channels/{channel_id}/queue")
 async def channel_queue(channel_id: str, db: AsyncSession = Depends(get_db)):
-    await _require_channel(db, channel_id)
-    result = await db.execute(select(ChannelOpsQueueItem).order_by(ChannelOpsQueueItem.created_at.desc()))
+    channel = await _require_channel(db, channel_id)
+    result = await db.execute(
+        select(ChannelOpsQueueItem)
+        .where(ChannelOpsQueueItem.channel_profile_id == channel.id)
+        .order_by(ChannelOpsQueueItem.created_at.desc())
+    )
     return [_queue(row).model_dump(mode="json") for row in result.scalars().all()]
+
+
+@router.get("/channels/{channel_id}/ticks")
+async def channel_ticks(channel_id: str, db: AsyncSession = Depends(get_db)):
+    channel = await _require_channel(db, channel_id)
+    result = await db.execute(
+        select(AgentTickAudit)
+        .where(AgentTickAudit.channel_profile_id == channel.id)
+        .order_by(AgentTickAudit.started_at.desc())
+    )
+    return [_tick(row) for row in result.scalars().all()]
 
 
 @router.get("/channels/{channel_id}/tasks")
@@ -280,8 +313,13 @@ async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.get("/channels/{channel_id}/publications")
 async def channel_publications(channel_id: str, db: AsyncSession = Depends(get_db)):
-    await _require_channel(db, channel_id)
-    result = await db.execute(select(PublicationRecord).order_by(PublicationRecord.created_at.desc()))
+    channel = await _require_channel(db, channel_id)
+    result = await db.execute(
+        select(PublicationRecord)
+        .join(ProductionTask, PublicationRecord.production_task_id == ProductionTask.id)
+        .where(ProductionTask.channel_profile_id == channel.id)
+        .order_by(PublicationRecord.created_at.desc())
+    )
     return [_publication(row) for row in result.scalars().all()]
 
 
@@ -313,20 +351,109 @@ async def enqueue_metrics(publication_id: str, db: AsyncSession = Depends(get_db
     return _queue(item)
 
 
+@router.post("/accounts/{account_id}/pause")
+async def pause_account(account_id: str, data: PauseRequest, db: AsyncSession = Depends(get_db)):
+    account = await db.get(PublishingAccount, _uuid(account_id))
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    account.enabled = False
+    account.paused_until = data.until
+    await db.commit()
+    await db.refresh(account)
+    return _account(account)
+
+
+@router.post("/accounts/{account_id}/resume")
+async def resume_account(account_id: str, db: AsyncSession = Depends(get_db)):
+    account = await db.get(PublishingAccount, _uuid(account_id))
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    account.enabled = True
+    account.paused_until = None
+    await db.commit()
+    await db.refresh(account)
+    return _account(account)
+
+
+@router.post("/lanes/{lane_id}/pause")
+async def pause_lane(lane_id: str, data: PauseRequest, db: AsyncSession = Depends(get_db)):
+    lane = await db.get(TopicLane, _uuid(lane_id))
+    if lane is None:
+        raise HTTPException(status_code=404, detail="Lane not found")
+    lane.paused_until = data.until or datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(lane)
+    return _lane(lane)
+
+
+@router.post("/lanes/{lane_id}/resume")
+async def resume_lane(lane_id: str, db: AsyncSession = Depends(get_db)):
+    lane = await db.get(TopicLane, _uuid(lane_id))
+    if lane is None:
+        raise HTTPException(status_code=404, detail="Lane not found")
+    lane.paused_until = None
+    await db.commit()
+    await db.refresh(lane)
+    return _lane(lane)
+
+
+@router.post("/publications/{publication_id}/promote")
+async def promote_publication(publication_id: str, db: AsyncSession = Depends(get_db)):
+    publication, task = await _publication_with_task(db, publication_id)
+    item = await ChannelOpsQueueService().enqueue(
+        db,
+        kind="promote_publication",
+        idempotency_key=f"promote_publication:{publication.id}:{publication.desired_privacy}:manual",
+        payload={
+            "publication_id": str(publication.id),
+            "target_visibility": publication.desired_privacy,
+            "channel_profile_id": str(task.channel_profile_id),
+        },
+        priority=70,
+        channel_profile_id=task.channel_profile_id,
+    )
+    return _queue(item)
+
+
+@router.post("/publications/{publication_id}/reject")
+async def reject_publication(publication_id: str, db: AsyncSession = Depends(get_db)):
+    publication, task = await _publication_with_task(db, publication_id)
+    now = datetime.now(timezone.utc)
+    publication.publish_status = "rejected"
+    task.state = "rejected"
+    task.state_updated_at = now
+    await db.commit()
+    await db.refresh(publication)
+    return _publication(publication)
+
+
 @router.get("/channels/{channel_id}/metrics/funnel")
 async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_db)):
-    await _require_channel(db, channel_id)
-    return {
+    channel = await _require_channel(db, channel_id)
+    since = Clock().now() - timedelta(days=max(days, 0))
+    states = {
         "days": days,
         "seeded": 0,
         "selected": 0,
-        "planned": 0,
-        "produced": 0,
-        "uploaded": 0,
+        "planning": 0,
+        "producing": 0,
+        "uploaded_private": 0,
         "scheduled": 0,
         "published": 0,
         "measured": 0,
+        "failed": 0,
+        "held": 0,
     }
+    result = await db.execute(
+        select(ProductionTask.state, func.count(ProductionTask.id))
+        .where(ProductionTask.channel_profile_id == channel.id)
+        .where(ProductionTask.created_at >= since)
+        .group_by(ProductionTask.state)
+    )
+    for state, count in result.all():
+        if state in states:
+            states[state] = int(count)
+    return states
 
 
 @router.get("/channels/{channel_id}/lanes/health")
@@ -352,6 +479,16 @@ async def _require_channel(db: AsyncSession, channel_id: str) -> ChannelProfile:
     if channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
     return channel
+
+
+async def _publication_with_task(db: AsyncSession, publication_id: str) -> tuple[PublicationRecord, ProductionTask]:
+    publication = await db.get(PublicationRecord, _uuid(publication_id))
+    if publication is None:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    task = await db.get(ProductionTask, publication.production_task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Production task not found")
+    return publication, task
 
 
 def _uuid(value: str) -> uuid.UUID:
@@ -394,6 +531,10 @@ def _lane(row: TopicLane) -> dict[str, Any]:
         "weight": row.weight,
         "keywords_json": row.keywords_json,
         "negative_keywords_json": row.negative_keywords_json,
+        "min_posts_per_week": row.min_posts_per_week,
+        "max_posts_per_day": row.max_posts_per_day,
+        "max_consecutive_streak": row.max_consecutive_streak,
+        "cooldown_after_post_minutes": row.cooldown_after_post_minutes,
         "enabled": row.enabled,
         "paused_until": row.paused_until,
     }
@@ -425,6 +566,7 @@ def _lane_format(row: LaneFormatMatrix) -> dict[str, Any]:
         "weight": row.weight,
         "target_duration_sec": row.target_duration_sec,
         "template_pool_json": row.template_pool_json,
+        "source_platforms_json": row.source_platforms_json,
         "default_publish_visibility": row.default_publish_visibility,
     }
 
@@ -453,6 +595,21 @@ def _queue(row: ChannelOpsQueueItem) -> QueueItemRead:
         attempt_count=row.attempt_count,
         last_error=row.last_error,
     )
+
+
+def _tick(row: AgentTickAudit) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "tick_id": row.tick_id,
+        "dry_run": row.dry_run,
+        "started_at": row.started_at,
+        "finished_at": row.finished_at,
+        "tasks_selected": row.tasks_selected,
+        "tasks_rejected": row.tasks_rejected,
+        "guards_triggered_json": row.guards_triggered_json,
+        "decision_summary_json": row.decision_summary_json,
+        "error_message": row.error_message,
+    }
 
 
 def _task(row: ProductionTask) -> dict[str, Any]:

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.channel_agent import router
@@ -198,3 +198,141 @@ async def test_enqueue_metrics_returns_channel_scoped_queue_item(api_session):
         queue_item = response.json()
         assert queue_item["kind"] == "collect_metrics"
         assert queue_item["channel_profile_id"] == channel["id"]
+
+
+@pytest.mark.asyncio
+async def test_channel_queue_and_health_are_channel_scoped(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        first = (await client.post("/api/v1/channel-agent/channels", json={"name": "A"})).json()
+        second = (await client.post("/api/v1/channel-agent/channels", json={"name": "B"})).json()
+        await client.post(f"/api/v1/channel-agent/channels/{first['id']}/enqueue-tick")
+        await client.post(f"/api/v1/channel-agent/channels/{second['id']}/enqueue-tick")
+
+        first_queue = (await client.get(f"/api/v1/channel-agent/channels/{first['id']}/queue")).json()
+        first_health = (await client.get(f"/api/v1/channel-agent/channels/{first['id']}/health")).json()
+
+        assert len(first_queue) == 1
+        assert first_queue[0]["payload_json"]["channel_id"] == first["id"]
+        assert first_health["queued_items"] == 1
+
+
+@pytest.mark.asyncio
+async def test_pause_resume_lane_account_and_publication_controls(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Ops"})).json()
+        lane = (await client.post(f"/api/v1/channel-agent/channels/{channel['id']}/lanes", json={"name": "Tech"})).json()
+        account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{channel['id']}/accounts",
+                json={
+                    "account_label": "main",
+                    "platform_account_id": "yt",
+                    "credential_ref": "youtube/main",
+                },
+            )
+        ).json()
+
+        task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="publication control",
+            state="uploaded_private",
+            channel_config_snapshot_json={},
+        )
+        api_session.add(task)
+        await api_session.flush()
+        publication = PublicationRecord(
+            production_task_id=task.id,
+            account_id=uuid.UUID(account["id"]),
+            platform_content_id="yt-video-1",
+            title="publication control",
+            desired_privacy="unlisted",
+            current_privacy="private",
+            publish_status="uploaded",
+            compliance_disposition="assumed_fair_use",
+        )
+        api_session.add(publication)
+        await api_session.commit()
+
+        paused_account = (
+            await client.post(f"/api/v1/channel-agent/accounts/{account['id']}/pause", json={"reason": "operator"})
+        ).json()
+        resumed_account = (await client.post(f"/api/v1/channel-agent/accounts/{account['id']}/resume")).json()
+        paused_lane = (
+            await client.post(f"/api/v1/channel-agent/lanes/{lane['id']}/pause", json={"reason": "operator"})
+        ).json()
+        resumed_lane = (await client.post(f"/api/v1/channel-agent/lanes/{lane['id']}/resume")).json()
+        promoted = (await client.post(f"/api/v1/channel-agent/publications/{publication.id}/promote")).json()
+        rejected = (await client.post(f"/api/v1/channel-agent/publications/{publication.id}/reject")).json()
+        refreshed_task = await api_session.get(ProductionTask, task.id)
+
+        assert paused_account["enabled"] is False
+        assert resumed_account["enabled"] is True
+        assert paused_lane["paused_until"] is not None
+        assert resumed_lane["paused_until"] is None
+        assert promoted["kind"] == "promote_publication"
+        assert promoted["channel_profile_id"] == channel["id"]
+        assert promoted["payload_json"]["publication_id"] == str(publication.id)
+        assert promoted["payload_json"]["target_visibility"] == "unlisted"
+        assert rejected["publish_status"] == "rejected"
+        assert refreshed_task is not None
+        assert refreshed_task.state == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_ticks_and_funnel_return_real_data(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Metrics"})).json()
+        await client.post(f"/api/v1/channel-agent/channels/{channel['id']}/enqueue-tick")
+
+        tick = AgentTickAudit(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            tick_id="tick-1",
+            dry_run=True,
+            started_at=datetime.now(timezone.utc),
+            tasks_selected=2,
+            tasks_rejected=1,
+            guards_triggered_json=["cadence"],
+            decision_summary_json={"selected": 2},
+        )
+        api_session.add(tick)
+
+        account = PublishingAccount(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            account_label="main",
+            platform_account_id="yt",
+            credential_ref="youtube/main",
+        )
+        api_session.add(account)
+        await api_session.flush()
+        selected_task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=account.id,
+            source="manual_seed",
+            prompt="selected",
+            state="selected",
+            channel_config_snapshot_json={},
+        )
+        scheduled_task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=account.id,
+            source="manual_seed",
+            prompt="scheduled",
+            state="scheduled",
+            channel_config_snapshot_json={},
+        )
+        api_session.add_all([selected_task, scheduled_task])
+        await api_session.commit()
+
+        ticks = (await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/ticks")).json()
+        funnel = (await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/metrics/funnel?days=7")).json()
+
+        assert isinstance(ticks, list)
+        assert ticks[0]["tick_id"] == "tick-1"
+        assert ticks[0]["tasks_selected"] == 2
+        assert ticks[0]["guards_triggered_json"] == ["cadence"]
+        assert "selected" in funnel
+        assert "scheduled" in funnel
+        assert funnel["selected"] >= 1
+        assert funnel["scheduled"] >= 1
