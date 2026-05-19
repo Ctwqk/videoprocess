@@ -8,7 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.channel_agent.clock import FakeClock
-from app.channel_agent.clients import FakeAutoFlowClient, FakeMiniMaxClient, FakeYouTubeClient
+from app.channel_agent.clients import (
+    AutoFlowExecutionObservation,
+    AutoFlowJobObservation,
+    FakeAutoFlowClient,
+    FakeMiniMaxClient,
+    FakeYouTubeClient,
+)
 from app.channel_agent.queue import ChannelOpsQueueService
 from app.channel_agent.service import ChannelAgentService
 from app.models.channel_agent import (
@@ -95,6 +101,12 @@ def _service(*, clock=None, autoflow=None, youtube=None, minimax=None) -> Channe
     )
 
 
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _publication_for_task(
     task: ProductionTask,
     account: PublishingAccount,
@@ -119,6 +131,47 @@ def _publication_for_task(
         uploaded_at=uploaded_at,
         compliance_disposition="assumed_fair_use",
     )
+
+
+class FailedExecutionAutoFlowClient(FakeAutoFlowClient):
+    async def execute_task(self, task, request):
+        return AutoFlowExecutionObservation(
+            run_id="",
+            pipeline_id=None,
+            job_id=None,
+            status="failed",
+            error_message="review approval is required before execution",
+        )
+
+
+class IncompleteExecutionAutoFlowClient(FakeAutoFlowClient):
+    async def execute_task(self, task, request):
+        return AutoFlowExecutionObservation(
+            run_id=str(uuid.uuid4()),
+            pipeline_id=str(uuid.uuid4()),
+            job_id=None,
+            status="running",
+        )
+
+
+class CountingExecuteAutoFlowClient(FakeAutoFlowClient):
+    def __init__(self):
+        super().__init__()
+        self.execute_calls = 0
+
+    async def execute_task(self, task, request):
+        self.execute_calls += 1
+        return await super().execute_task(task, request)
+
+
+class AlwaysRunningAutoFlowClient(FakeAutoFlowClient):
+    async def observe_job(self, db, *, run_id: str, job_id: str):
+        return AutoFlowJobObservation(
+            run_id=run_id,
+            pipeline_id=None,
+            job_id=job_id,
+            status="running",
+        )
 
 
 def test_lane_prompt_template_is_structured():
@@ -1282,6 +1335,169 @@ async def test_plan_task_enqueues_execute_with_channel_scope(service_session):
 
 
 @pytest.mark.asyncio
+async def test_execute_task_failed_observation_marks_task_failed_without_observe(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        title_seed="test",
+        state="planning",
+        autoflow_plan_id=uuid.uuid4(),
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="execute_task",
+        idempotency_key=f"execute_task:{task.id}",
+        payload_json={"production_task_id": str(task.id)},
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    await _service(autoflow=FailedExecutionAutoFlowClient()).handle_execute_task(service_session, item)
+    await service_session.refresh(task)
+
+    assert task.state == "failed"
+    assert "review approval is required" in task.failure_reason
+    observe_items = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "observe_job")
+        )
+    ).scalars().all()
+    assert observe_items == []
+
+
+@pytest.mark.asyncio
+async def test_execute_task_incomplete_success_observation_marks_failed_without_observe(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        title_seed="test",
+        state="planning",
+        autoflow_plan_id=uuid.uuid4(),
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="execute_task",
+        idempotency_key=f"execute_task:{task.id}",
+        payload_json={"production_task_id": str(task.id)},
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    await _service(autoflow=IncompleteExecutionAutoFlowClient()).handle_execute_task(service_session, item)
+    await service_session.refresh(task)
+
+    assert task.state == "failed"
+    assert "job_id" in task.failure_reason
+    observe_items = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "observe_job")
+        )
+    ).scalars().all()
+    assert observe_items == []
+
+
+@pytest.mark.asyncio
+async def test_execute_task_reuses_existing_run_and_job_without_reexecuting(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    run_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        title_seed="test",
+        state="planning",
+        autoflow_plan_id=uuid.uuid4(),
+        autoflow_run_id=run_id,
+        job_id=job_id,
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="execute_task",
+        idempotency_key=f"execute_task:{task.id}",
+        payload_json={"production_task_id": str(task.id)},
+    )
+    service_session.add(item)
+    await service_session.commit()
+    client = CountingExecuteAutoFlowClient()
+
+    await _service(autoflow=client).handle_execute_task(service_session, item)
+    await service_session.refresh(task)
+
+    assert client.execute_calls == 0
+    assert task.state == "producing"
+    observe = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "observe_job")
+        )
+    ).scalar_one()
+    assert observe.idempotency_key == f"observe_job:{task.id}:{run_id}:{job_id}:0"
+    assert observe.payload_json["run_id"] == str(run_id)
+    assert observe.payload_json["job_id"] == str(job_id)
+
+
+@pytest.mark.asyncio
+async def test_observe_job_max_count_holds_without_requeue(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    run_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        title_seed="test",
+        state="producing",
+        autoflow_run_id=run_id,
+        job_id=job_id,
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="observe_job",
+        idempotency_key=f"observe_job:{task.id}:{run_id}:{job_id}:20",
+        payload_json={
+            "production_task_id": str(task.id),
+            "run_id": str(run_id),
+            "job_id": str(job_id),
+            "observe_count": 20,
+        },
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    await _service(autoflow=AlwaysRunningAutoFlowClient()).handle_observe_job(service_session, item)
+    await service_session.refresh(task)
+
+    assert task.state == "held"
+    assert task.blocked_by_guard == "autoflow_observe_timeout"
+    observe_items = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "observe_job")
+        )
+    ).scalars().all()
+    assert observe_items == [item]
+
+
+@pytest.mark.asyncio
 async def test_publish_task_observes_upload_and_auto_enqueues_promote(service_session):
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
     task = ProductionTask(
@@ -1397,6 +1613,113 @@ async def test_promote_publication_schedules_youtube_publish_at(service_session)
     assert publication.publish_status == "scheduled"
     assert publication.scheduled_publish_at is not None
     assert youtube.scheduled[0]["video_id"] == "yt-video-1"
+    metrics_item = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "collect_metrics")
+        )
+    ).scalar_one()
+    assert _as_utc(metrics_item.run_after) == datetime(2026, 5, 18, 11, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics_without_metrics_requeues_without_snapshot_or_measured(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        state="scheduled",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    publication = _publication_for_task(
+        task,
+        account,
+        publish_status="scheduled",
+        scheduled_publish_at=clock.now() - timedelta(minutes=5),
+    )
+    service_session.add(publication)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="collect_metrics",
+        idempotency_key=f"collect_metrics:{publication.id}:poll:0",
+        payload_json={"publication_id": str(publication.id)},
+        channel_profile_id=channel.id,
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    snapshot = await _service(clock=clock).handle_collect_metrics(service_session, item)
+    await service_session.refresh(task)
+
+    assert snapshot is None
+    assert task.state == "scheduled"
+    snapshots = (await service_session.execute(select(FeedbackSnapshot))).scalars().all()
+    assert snapshots == []
+    requeued = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem)
+            .where(ChannelOpsQueueItem.kind == "collect_metrics")
+            .where(ChannelOpsQueueItem.id != item.id)
+        )
+    ).scalar_one()
+    assert requeued.payload_json == {
+        "publication_id": str(publication.id),
+        "metrics_poll_count": 1,
+    }
+    assert _as_utc(requeued.run_after) == clock.now() + timedelta(hours=1)
+    assert requeued.channel_profile_id == channel.id
+    assert requeued.parent_queue_item_id == item.id
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics_max_poll_count_holds_without_snapshot_or_requeue(service_session):
+    clock = FakeClock(datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        state="scheduled",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    publication = _publication_for_task(
+        task,
+        account,
+        publish_status="scheduled",
+        scheduled_publish_at=clock.now() - timedelta(days=1),
+    )
+    service_session.add(publication)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="collect_metrics",
+        idempotency_key=f"collect_metrics:{publication.id}:poll:23",
+        payload_json={"publication_id": str(publication.id), "metrics_poll_count": 23},
+        channel_profile_id=channel.id,
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    snapshot = await _service(clock=clock).handle_collect_metrics(service_session, item)
+    await service_session.refresh(task)
+
+    assert snapshot is None
+    assert task.state == "held"
+    assert task.blocked_by_guard == "metrics_unavailable"
+    snapshots = (await service_session.execute(select(FeedbackSnapshot))).scalars().all()
+    assert snapshots == []
+    collect_items = (
+        await service_session.execute(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "collect_metrics"))
+    ).scalars().all()
+    assert collect_items == [item]
 
 
 @pytest.mark.asyncio
@@ -1543,6 +1866,25 @@ async def test_queue_flow_reaches_scheduled_publication_and_metrics(service_sess
     publication = await service.handle_publish_task(service_session, publish_item)
     promote_item = await queue.claim_next(service_session, worker_id="test")
     await service.handle_promote_publication(service_session, promote_item)
+    assert await queue.claim_next(service_session, worker_id="test") is None
+    queued_metrics_item = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "collect_metrics")
+        )
+    ).scalar_one()
+    assert _as_utc(queued_metrics_item.run_after) == clock.now() + timedelta(hours=2)
+    queued_metrics_item.payload_json = {
+        **queued_metrics_item.payload_json,
+        "metrics": {
+            "views": 120,
+            "likes": 12,
+            "comments": 3,
+            "shares": 2,
+            "avg_view_duration_sec": 14.5,
+        },
+    }
+    await service_session.commit()
+    clock.advance(timedelta(hours=2))
     metrics_item = await queue.claim_next(service_session, worker_id="test")
     snapshot = await service.handle_collect_metrics(service_session, metrics_item)
 
@@ -1552,3 +1894,4 @@ async def test_queue_flow_reaches_scheduled_publication_and_metrics(service_sess
     assert publication.publish_status == "scheduled"
     assert publication.platform_content_id == "yt-video-1"
     assert snapshot.publication_id == publication.id
+    assert snapshot.views == 120

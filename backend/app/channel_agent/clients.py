@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.artifact import Artifact, ArtifactKind
+from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
 from app.models.job import Job, JobStatus, NodeExecution
 
 
@@ -155,10 +156,19 @@ class LocalAutoFlowClient:
         from app.schemas.autoflow import AutoFlowExecuteRequest
 
         factory = self.session_factory or async_session
-        async with factory() as db:
-            run = await autoflow_service.execute(
-                AutoFlowExecuteRequest(plan_id=str(task.autoflow_plan_id), execute=True),
-                db,
+        try:
+            async with factory() as db:
+                run = await autoflow_service.execute(
+                    AutoFlowExecuteRequest(plan_id=str(task.autoflow_plan_id), execute=True),
+                    db,
+                )
+        except (PermissionError, ValueError) as exc:
+            return AutoFlowExecutionObservation(
+                run_id="",
+                pipeline_id=None,
+                job_id=None,
+                status="failed",
+                error_message=str(exc),
             )
         return AutoFlowExecutionObservation(
             run_id=run.run_id,
@@ -169,6 +179,26 @@ class LocalAutoFlowClient:
         )
 
     async def observe_job(self, db: AsyncSession, *, run_id: str, job_id: str) -> AutoFlowJobObservation:
+        run_uuid = _uuid_or_none(run_id)
+        if run_uuid is None:
+            return AutoFlowJobObservation(
+                run_id=run_id,
+                pipeline_id=None,
+                job_id=job_id,
+                status="failed",
+                error_message="Invalid AutoFlow run id",
+            )
+
+        run = await db.get(AutoFlowRunModel, run_uuid)
+        if run is None:
+            return AutoFlowJobObservation(
+                run_id=run_id,
+                pipeline_id=None,
+                job_id=job_id,
+                status="failed",
+                error_message="AutoFlow run not found",
+            )
+
         job_uuid = _uuid_or_none(job_id)
         if job_uuid is None:
             return AutoFlowJobObservation(
@@ -179,11 +209,20 @@ class LocalAutoFlowClient:
                 error_message="Invalid AutoFlow job id",
             )
 
+        if run.job_id and run.job_id != job_uuid:
+            return AutoFlowJobObservation(
+                run_id=str(run.id),
+                pipeline_id=str(run.pipeline_id) if run.pipeline_id else None,
+                job_id=job_id,
+                status="failed",
+                error_message=f"AutoFlow run/job mismatch: run {run.id} is linked to job {run.job_id}",
+            )
+
         job = await db.get(Job, job_uuid)
         if job is None:
             return AutoFlowJobObservation(
-                run_id=run_id,
-                pipeline_id=None,
+                run_id=str(run.id),
+                pipeline_id=str(run.pipeline_id) if run.pipeline_id else None,
                 job_id=job_id,
                 status="failed",
                 error_message="AutoFlow job not found",
@@ -192,8 +231,8 @@ class LocalAutoFlowClient:
         status = _job_status(job.status)
         youtube = await self._youtube_from_job(db, job) if status == "succeeded" else None
         return AutoFlowJobObservation(
-            run_id=run_id,
-            pipeline_id=str(job.pipeline_id) if job.pipeline_id else None,
+            run_id=str(run.id),
+            pipeline_id=str(run.pipeline_id or job.pipeline_id) if (run.pipeline_id or job.pipeline_id) else None,
             job_id=str(job.id),
             status=status,
             error_message=job.error_message if status == "failed" else None,

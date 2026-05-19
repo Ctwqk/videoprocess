@@ -58,6 +58,21 @@ _SOURCE_STRATEGY_ALIASES = {"external_search": "external_research"}
 _ALLOWED_SOURCE_STRATEGIES = set(get_args(SourceStrategy))
 _ALLOWED_PLANNING_MODES = set(get_args(PlanningMode))
 _PUBLICATION_CADENCE_STATUSES = {"public", "scheduled"}
+_MAX_AUTOFLOW_OBSERVE_POLLS = 20
+_MAX_METRICS_POLLS = 24
+_METRICS_POLL_DELAY = timedelta(hours=1)
+_RECOGNIZED_METRIC_KEYS = {
+    "views",
+    "likes",
+    "comments",
+    "shares",
+    "avg_view_duration_sec",
+    "retention_curve_json",
+    "retention_curve",
+    "ctr",
+    "impressions",
+    "virality_score",
+}
 
 
 class ChannelAgentService:
@@ -704,6 +719,36 @@ class ChannelAgentService:
 
     async def handle_execute_task(self, db: AsyncSession, item: ChannelOpsQueueItem) -> ProductionTask:
         task = await self._task_from_item(db, item)
+        if task.autoflow_run_id and task.job_id:
+            run_id = str(task.autoflow_run_id)
+            job_id = str(task.job_id)
+            previous_state = task.state
+            if task.state not in TERMINAL_TASK_STATES and task.state != TASK_HELD:
+                task.state = TASK_PRODUCING
+                task.state_updated_at = self.clock.now()
+                if previous_state != TASK_PRODUCING:
+                    task.transition_history_json = [
+                        *list(task.transition_history_json or []),
+                        _transition(previous_state, TASK_PRODUCING, "execute_task", self.clock.now()),
+                    ]
+            await self.queue.enqueue(
+                db,
+                kind="observe_job",
+                idempotency_key=f"observe_job:{task.id}:{run_id}:{job_id}:0",
+                payload={
+                    "production_task_id": str(task.id),
+                    "run_id": run_id,
+                    "job_id": job_id,
+                    "observe_count": 0,
+                },
+                priority=65,
+                channel_profile_id=task.channel_profile_id,
+                parent_queue_item_id=item.id,
+            )
+            await db.commit()
+            await db.refresh(task)
+            return task
+
         observation = await self.autoflow_client.execute_task(task, self._autoflow_request(task))
         if _status_value(observation.status) == "failed":
             previous_state = task.state
@@ -718,12 +763,33 @@ class ChannelAgentService:
             await db.refresh(task)
             return task
 
-        if observation.run_id:
-            task.autoflow_run_id = _uuid(observation.run_id)
-        if observation.pipeline_id:
-            task.pipeline_id = _uuid(observation.pipeline_id)
-        if observation.job_id:
-            task.job_id = _uuid(observation.job_id)
+        run_id = _uuid_or_none(observation.run_id)
+        job_id = _uuid_or_none(observation.job_id)
+        pipeline_id = _uuid_or_none(observation.pipeline_id) if observation.pipeline_id else None
+        validation_error = None
+        if run_id is None:
+            validation_error = "AutoFlow execution observation missing valid run_id"
+        elif job_id is None:
+            validation_error = "AutoFlow execution observation missing valid job_id"
+        elif observation.pipeline_id and pipeline_id is None:
+            validation_error = "AutoFlow execution observation contains invalid pipeline_id"
+        if validation_error is not None:
+            previous_state = task.state
+            task.state = TASK_FAILED
+            task.failure_reason = validation_error
+            task.state_updated_at = self.clock.now()
+            task.transition_history_json = [
+                *list(task.transition_history_json or []),
+                _transition(previous_state, TASK_FAILED, "execute_task", self.clock.now()),
+            ]
+            await db.commit()
+            await db.refresh(task)
+            return task
+
+        task.autoflow_run_id = run_id
+        task.job_id = job_id
+        if pipeline_id:
+            task.pipeline_id = pipeline_id
         previous_state = task.state
         task.state = TASK_PRODUCING
         task.state_updated_at = self.clock.now()
@@ -734,11 +800,11 @@ class ChannelAgentService:
         await self.queue.enqueue(
             db,
             kind="observe_job",
-            idempotency_key=f"observe_job:{task.id}:{observation.run_id}:{observation.job_id}:0",
+            idempotency_key=f"observe_job:{task.id}:{run_id}:{job_id}:0",
             payload={
                 "production_task_id": str(task.id),
-                "run_id": observation.run_id,
-                "job_id": observation.job_id,
+                "run_id": str(run_id),
+                "job_id": str(job_id),
                 "observe_count": 0,
             },
             priority=65,
@@ -755,6 +821,20 @@ class ChannelAgentService:
         run_id = str(payload.get("run_id") or task.autoflow_run_id or "")
         job_id = str(payload.get("job_id") or task.job_id or "")
         observe_count = _nonnegative_int(payload.get("observe_count"), default=0)
+        if observe_count >= _MAX_AUTOFLOW_OBSERVE_POLLS:
+            previous_state = task.state
+            task.state = TASK_HELD
+            task.blocked_by_guard = "autoflow_observe_timeout"
+            task.failure_reason = "AutoFlow job observation timed out"
+            task.state_updated_at = self.clock.now()
+            task.transition_history_json = [
+                *list(task.transition_history_json or []),
+                _transition(previous_state, TASK_HELD, "observe_job", self.clock.now()),
+            ]
+            await db.commit()
+            await db.refresh(task)
+            return task
+
         observation = await self.autoflow_client.observe_job(db, run_id=run_id, job_id=job_id)
         status = _status_value(observation.status)
 
@@ -933,9 +1013,10 @@ class ChannelAgentService:
         await self.queue.enqueue(
             db,
             kind="collect_metrics",
-            idempotency_key=f"collect_metrics:{publication.id}:{utc_hour_bucket(self.clock.now())}",
-            payload={"publication_id": str(publication.id)},
+            idempotency_key=f"collect_metrics:{publication.id}:poll:0",
+            payload={"publication_id": str(publication.id), "metrics_poll_count": 0},
             priority=90,
+            run_after=scheduled_at + _METRICS_POLL_DELAY,
             parent_queue_item_id=item.id,
             channel_profile_id=task.channel_profile_id if task else None,
         )
@@ -943,13 +1024,46 @@ class ChannelAgentService:
         await db.refresh(publication)
         return publication
 
-    async def handle_collect_metrics(self, db: AsyncSession, item: ChannelOpsQueueItem) -> FeedbackSnapshot:
+    async def handle_collect_metrics(self, db: AsyncSession, item: ChannelOpsQueueItem) -> FeedbackSnapshot | None:
         publication_id = _uuid(item.payload_json["publication_id"])
         publication = await db.get(PublicationRecord, publication_id)
         if publication is None:
             raise ValueError("Publication not found")
 
-        metrics = _dict_value(item.payload_json.get("metrics")) or _dict_value(item.payload_json)
+        payload = dict(item.payload_json or {})
+        metrics = _dict_value(payload.get("metrics"))
+        task = await db.get(ProductionTask, publication.production_task_id)
+        if not _has_real_metrics(metrics):
+            poll_count = _nonnegative_int(payload.get("metrics_poll_count"), default=0)
+            next_count = poll_count + 1
+            publication.last_metrics_polled_at = self.clock.now()
+            if next_count >= _MAX_METRICS_POLLS:
+                if task is not None:
+                    previous_state = task.state
+                    task.state = TASK_HELD
+                    task.blocked_by_guard = "metrics_unavailable"
+                    task.failure_reason = "Publication metrics were unavailable after polling"
+                    task.state_updated_at = self.clock.now()
+                    task.transition_history_json = [
+                        *list(task.transition_history_json or []),
+                        _transition(previous_state, TASK_HELD, "collect_metrics", self.clock.now()),
+                    ]
+                await db.commit()
+                return None
+
+            await self.queue.enqueue(
+                db,
+                kind="collect_metrics",
+                idempotency_key=f"collect_metrics:{publication.id}:poll:{next_count}",
+                payload={"publication_id": str(publication.id), "metrics_poll_count": next_count},
+                priority=90,
+                run_after=self.clock.now() + _METRICS_POLL_DELAY,
+                channel_profile_id=task.channel_profile_id if task else item.channel_profile_id,
+                parent_queue_item_id=item.id,
+            )
+            await db.commit()
+            return None
+
         snapshot = FeedbackSnapshot(
             publication_id=publication.id,
             collected_at=self.clock.now(),
@@ -962,12 +1076,11 @@ class ChannelAgentService:
             ctr=_optional_float(metrics.get("ctr")),
             impressions=_optional_int(metrics.get("impressions")),
             virality_score=_nonnegative_float(metrics.get("virality_score"), default=0.0),
-            raw_json=dict(item.payload_json or {}),
+            raw_json=payload,
         )
         db.add(snapshot)
         publication.last_metrics_polled_at = self.clock.now()
 
-        task = await db.get(ProductionTask, publication.production_task_id)
         if task is not None:
             previous_state = task.state
             task.state = TASK_MEASURED
@@ -1311,6 +1424,13 @@ def _uuid(value) -> uuid.UUID:
     return uuid.UUID(str(value))
 
 
+def _uuid_or_none(value: Any) -> uuid.UUID | None:
+    try:
+        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_datetime(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None:
@@ -1362,6 +1482,10 @@ def _dict_value(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
     return {}
+
+
+def _has_real_metrics(metrics: dict[str, Any]) -> bool:
+    return any(key in metrics for key in _RECOGNIZED_METRIC_KEYS)
 
 
 def _string_list(value: Any) -> list[str]:
