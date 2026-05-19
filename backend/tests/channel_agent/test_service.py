@@ -445,6 +445,187 @@ async def test_dry_run_evaluates_candidates_without_creating_tasks_or_queue(serv
 
 
 @pytest.mark.asyncio
+async def test_dry_run_low_supply_records_guard_without_alert_queue(service_session):
+    channel = ChannelProfile(name="Channel", language="zh", dry_run=True)
+    service_session.add(channel)
+    await service_session.flush()
+    lane = TopicLane(channel_profile_id=channel.id, name="empty lane")
+    account = PublishingAccount(
+        channel_profile_id=channel.id,
+        account_label="main",
+        platform_account_id="yt-1",
+        credential_ref="youtube/main",
+    )
+    service_session.add_all([lane, account])
+    await service_session.flush()
+    for offset in (2, 1):
+        service_session.add(
+            AgentTickAudit(
+                channel_profile_id=channel.id,
+                tick_id=f"prior:{offset}",
+                dry_run=True,
+                started_at=datetime(2026, 5, 18, 9 - offset, 0, tzinfo=timezone.utc),
+                finished_at=datetime(2026, 5, 18, 9 - offset, 1, tzinfo=timezone.utc),
+                decision_summary_json={"per_lane_eligible_count": {str(lane.id): 0}},
+            )
+        )
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=channel.id)
+
+    queue_items = (await service_session.execute(select(ChannelOpsQueueItem))).scalars().all()
+    assert queue_items == []
+    assert audit.guards_triggered_json == [{"guard": "material_supply_low", "lane_id": str(lane.id)}]
+
+
+@pytest.mark.asyncio
+async def test_untargeted_manual_seed_uses_free_account_before_lane_candidate(service_session):
+    channel, lane, busy_account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.max_posts_per_day = 2
+    free_account = PublishingAccount(
+        channel_profile_id=channel.id,
+        account_label="free",
+        platform_account_id="yt-2",
+        credential_ref="youtube/free",
+        external_asset_auto_publish=True,
+    )
+    service_session.add(free_account)
+    service_session.add(
+        ProductionTask(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=busy_account.id,
+            source="lane_seed",
+            prompt="busy task",
+            state="held",
+            channel_config_snapshot_json={},
+        )
+    )
+    seed = ManualSeed(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        prompt="manual short",
+        title_seed="manual",
+    )
+    service_session.add(seed)
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=channel.id)
+
+    created = (
+        await service_session.execute(
+            select(ProductionTask)
+            .where(ProductionTask.prompt != "busy task")
+            .order_by(ProductionTask.created_at.asc())
+        )
+    ).scalars().all()
+    await service_session.refresh(seed)
+
+    assert audit.tasks_selected == 1
+    assert len(created) == 1
+    assert created[0].source == "manual_seed"
+    assert created[0].target_account_id == free_account.id
+    assert created[0].manual_seed_id == seed.id
+    assert seed.status == "exhausted"
+
+
+@pytest.mark.asyncio
+async def test_producing_task_blocks_same_account_candidate(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    service_session.add(
+        ProductionTask(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            source="lane_seed",
+            prompt="producing task",
+            state="producing",
+            channel_config_snapshot_json={},
+        )
+    )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="manual blocked by producing",
+            title_seed="blocked",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=channel.id)
+
+    tasks = (await service_session.execute(select(ProductionTask))).scalars().all()
+    queue_items = (await service_session.execute(select(ChannelOpsQueueItem))).scalars().all()
+    rejected = audit.decision_summary_json["rejected_candidates"]
+    assert len(tasks) == 1
+    assert queue_items == []
+    assert audit.tasks_selected == 0
+    assert rejected[0]["guard"] == "account_concurrency"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_without_enabled_account_audits_rejection(service_session):
+    channel = ChannelProfile(name="Channel", language="zh", dry_run=True)
+    service_session.add(channel)
+    await service_session.flush()
+    lane = TopicLane(channel_profile_id=channel.id, name="lane")
+    service_session.add(lane)
+    await service_session.flush()
+    service_session.add(
+        LaneFormatMatrix(
+            topic_lane_id=lane.id,
+            format_key="shorts_9x16",
+            target_duration_sec=30,
+            template_pool_json=["material_library_remix"],
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=channel.id)
+
+    tasks = (await service_session.execute(select(ProductionTask))).scalars().all()
+    queue_items = (await service_session.execute(select(ChannelOpsQueueItem))).scalars().all()
+    rejected = audit.decision_summary_json["rejected_candidates"]
+    assert tasks == []
+    assert queue_items == []
+    assert audit.tasks_rejected >= 1
+    assert rejected[0]["guard"] == "no_enabled_account"
+
+
+@pytest.mark.asyncio
+async def test_manual_seed_candidate_ids_include_seed_id(service_session):
+    channel, lane, first_account, lane_format = await _channel_graph(service_session, dry_run=True)
+    second_account = PublishingAccount(
+        channel_profile_id=channel.id,
+        account_label="second",
+        platform_account_id="yt-2",
+        credential_ref="youtube/second",
+    )
+    first_seed = ManualSeed(channel_profile_id=channel.id, topic_lane_id=lane.id, prompt="first manual")
+    second_seed = ManualSeed(channel_profile_id=channel.id, topic_lane_id=lane.id, prompt="second manual")
+    service_session.add_all([second_account, first_seed, second_seed])
+    await service_session.commit()
+
+    candidates = await _service()._build_tick_candidates(
+        service_session,
+        channel=channel,
+        lanes=[lane],
+        accounts=[first_account, second_account],
+        seeds=[first_seed, second_seed],
+        lane_formats_by_lane={str(lane.id): [lane_format]},
+        bucket="2026-05-18-09",
+    )
+
+    manual_ids = [candidate["candidate_id"] for candidate in candidates if candidate["source"] == "manual_seed"]
+    assert manual_ids == [
+        f"manual_seed:{first_seed.id}:lane:{lane.id}:format:{lane_format.id}:2026-05-18-09",
+        f"manual_seed:{second_seed.id}:lane:{lane.id}:format:{lane_format.id}:2026-05-18-09",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_plan_task_holds_when_autoflow_omits_youtube_upload(service_session):
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
     task = ProductionTask(

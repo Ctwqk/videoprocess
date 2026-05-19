@@ -25,6 +25,7 @@ from app.channel_agent.constants import (
     TASK_FAILED,
     TASK_HELD,
     TASK_PLANNING,
+    TASK_PRODUCING,
     TASK_SCHEDULED,
     TASK_SELECTED,
     TASK_UPLOADED_PRIVATE,
@@ -55,6 +56,7 @@ _ACTIVE_TASK_STATES = {
     TASK_SELECTED,
     TASK_PLANNING,
     TASK_HELD,
+    TASK_PRODUCING,
     TASK_UPLOADED_PRIVATE,
     TASK_SCHEDULED,
 }
@@ -121,6 +123,12 @@ class ChannelAgentService:
         accepted_candidates, rejected_candidates = await self._evaluate_tick_candidates(db, candidates)
         per_lane = _per_lane_counts(lanes, candidates)
         side_effects_disabled = bool(channel.dry_run or channel.halted_at is not None)
+        low_supply_alerts = await self._maybe_alert_low_supply(
+            db,
+            channel,
+            per_lane,
+            enqueue_alerts=not side_effects_disabled,
+        )
 
         audit = AgentTickAudit(
             channel_profile_id=channel.id,
@@ -135,11 +143,11 @@ class ChannelAgentService:
             decision_summary_json={
                 "per_lane_eligible_count": per_lane,
                 "rejected_candidates": rejected_candidates,
+                "low_supply_alerts": low_supply_alerts,
             },
         )
         db.add(audit)
 
-        low_supply_alerts = await self._maybe_alert_low_supply(db, channel, per_lane)
         audit.guards_triggered_json = [
             *low_supply_alerts,
             *[
@@ -226,7 +234,8 @@ class ChannelAgentService:
             lane_formats = lane_formats_by_lane.get(lane_key, [])
             lane_format = lane_formats[0] if lane_formats else None
             account = await self._resolve_candidate_account(db, seed, accounts, claimed_account_ids)
-            claimed_account_ids.add(str(account.id))
+            if account is not None:
+                claimed_account_ids.add(str(account.id))
             manual_count_by_lane[lane_key] = manual_count_by_lane.get(lane_key, 0) + 1
             source_platforms = _string_list(seed.source_platforms_json) or _string_list(
                 lane_format.source_platforms_json if lane_format else []
@@ -238,6 +247,7 @@ class ChannelAgentService:
                         lane.id if lane is not None else None,
                         lane_format.id if lane_format is not None else None,
                         bucket,
+                        seed_id=seed.id,
                     ),
                     "source": "manual_seed",
                     "seed": seed,
@@ -263,8 +273,14 @@ class ChannelAgentService:
             for lane_format in lane_formats_by_lane.get(lane_key, []):
                 if generated >= remaining:
                     break
-                account = self._select_account_for_tick(accounts, claimed_account_ids)
-                claimed_account_ids.add(str(account.id))
+                account = await self._select_candidate_account_for_tick(
+                    db,
+                    accounts,
+                    claimed_account_ids,
+                    prefer_unblocked=True,
+                )
+                if account is not None:
+                    claimed_account_ids.add(str(account.id))
                 candidates.append(
                     {
                         "candidate_id": _candidate_id("lane_seed", lane.id, lane_format.id, bucket),
@@ -299,20 +315,43 @@ class ChannelAgentService:
         seed: ManualSeed,
         accounts: list[PublishingAccount],
         claimed_account_ids: set[str],
-    ) -> PublishingAccount:
+    ) -> PublishingAccount | None:
         if seed.target_account_id:
             account = await db.get(PublishingAccount, seed.target_account_id)
             if account is not None:
                 return account
-        return self._select_account_for_tick(accounts, claimed_account_ids)
+        return await self._select_candidate_account_for_tick(
+            db,
+            accounts,
+            claimed_account_ids,
+            prefer_unblocked=True,
+        )
+
+    async def _select_candidate_account_for_tick(
+        self,
+        db: AsyncSession,
+        accounts: list[PublishingAccount],
+        claimed_account_ids: set[str],
+        *,
+        prefer_unblocked: bool = False,
+    ) -> PublishingAccount | None:
+        if not accounts:
+            return None
+        unclaimed_accounts = [account for account in accounts if str(account.id) not in claimed_account_ids]
+        candidate_accounts = unclaimed_accounts or accounts
+        if prefer_unblocked:
+            for account in candidate_accounts:
+                if await self._active_task_count_for_account(db, account.id) <= 0:
+                    return account
+        return candidate_accounts[0]
 
     def _select_account_for_tick(
         self,
         accounts: list[PublishingAccount],
         claimed_account_ids: set[str],
-    ) -> PublishingAccount:
+    ) -> PublishingAccount | None:
         if not accounts:
-            raise ValueError("No enabled publishing account")
+            return None
         for account in accounts:
             if str(account.id) not in claimed_account_ids:
                 return account
@@ -353,15 +392,25 @@ class ChannelAgentService:
         candidate: dict[str, Any],
         selected_account_counts: dict[str, int],
     ) -> dict[str, Any] | None:
-        account = candidate["account"]
+        account = candidate.get("account")
+        lane = candidate.get("lane")
+        lane_format = candidate.get("lane_format")
+        if account is None:
+            return {
+                "candidate_id": candidate["candidate_id"],
+                "lane_id": str(lane.id) if lane is not None else "",
+                "format_id": str(lane_format.id) if lane_format is not None else "",
+                "account_id": "",
+                "guard": "no_enabled_account",
+                "reason": "No enabled publishing account is available for this candidate.",
+            }
+
         account_id = str(account.id)
         active_count = await self._active_task_count_for_account(db, account.id)
         active_count += selected_account_counts.get(account_id, 0)
         if active_count <= 0:
             return None
 
-        lane = candidate.get("lane")
-        lane_format = candidate.get("lane_format")
         task_label = "task" if active_count == 1 else "tasks"
         return {
             "candidate_id": candidate["candidate_id"],
@@ -628,6 +677,8 @@ class ChannelAgentService:
         db: AsyncSession,
         channel: ChannelProfile,
         per_lane: dict[str, int],
+        *,
+        enqueue_alerts: bool = True,
     ) -> list[dict[str, Any]]:
         triggered: list[dict[str, Any]] = []
         for lane_id, count in per_lane.items():
@@ -646,15 +697,16 @@ class ChannelAgentService:
                 for audit in recent
             )
             if len(recent) >= 2 and previous_low:
-                await self._enqueue_alert(
-                    db,
-                    ALERT_MATERIAL_SUPPLY_LOW,
-                    resource_id=lane_id,
-                    severity="warning",
-                    message="Lane material supply below candidate threshold for three ticks",
-                    details={"channel_id": str(channel.id), "eligible_count": count},
-                    channel_profile_id=channel.id,
-                )
+                if enqueue_alerts:
+                    await self._enqueue_alert(
+                        db,
+                        ALERT_MATERIAL_SUPPLY_LOW,
+                        resource_id=lane_id,
+                        severity="warning",
+                        message="Lane material supply below candidate threshold for three ticks",
+                        details={"channel_id": str(channel.id), "eligible_count": count},
+                        channel_profile_id=channel.id,
+                    )
                 triggered.append({"guard": "material_supply_low", "lane_id": lane_id})
         return triggered
 
@@ -851,7 +903,9 @@ def _per_lane_counts(lanes: list[TopicLane], candidates: list[dict[str, Any]]) -
     return per_lane
 
 
-def _candidate_id(source: str, lane_id, format_id, bucket: str) -> str:
+def _candidate_id(source: str, lane_id, format_id, bucket: str, *, seed_id=None) -> str:
+    if source == "manual_seed" and seed_id is not None:
+        return f"{source}:{seed_id}:lane:{lane_id or 'unassigned'}:format:{format_id or 'none'}:{bucket}"
     return f"{source}:lane:{lane_id or 'unassigned'}:format:{format_id or 'none'}:{bucket}"
 
 
