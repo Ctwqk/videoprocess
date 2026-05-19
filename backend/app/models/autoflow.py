@@ -26,6 +26,7 @@ class AutoFlowPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="drafted", nullable=False)
     review_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     public_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    agent_approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     rejected_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 

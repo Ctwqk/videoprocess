@@ -17,6 +17,7 @@ from app.models.channel_agent import (
     ChannelOpsQueueItem,
     ChannelProfile,
     FeedbackSnapshot,
+    InternalSchedulerRun,
     LaneFormatMatrix,
     ManualSeed,
     MaterialUsageLedger,
@@ -61,4 +62,5 @@ __all__ = [
     "PublicationRecord",
     "TakedownEvent",
     "FeedbackSnapshot",
+    "InternalSchedulerRun",
 ]

@@ -51,6 +51,13 @@ def _sqlite_utc(value: datetime) -> datetime:
     return value
 
 
+def test_agent_tick_audit_has_channel_tick_uniqueness_constraint():
+    assert any(
+        constraint.name == "uq_agent_tick_audit_channel_tick"
+        for constraint in AgentTickAudit.__table__.constraints
+    )
+
+
 @pytest.fixture
 async def channel_agent_session():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")

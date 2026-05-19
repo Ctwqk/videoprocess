@@ -108,4 +108,5 @@ class HealthSummary(BaseModel):
     active_tasks: int = 0
     queued_items: int = 0
     recent_failures: int = 0
+    last_successful_measured_at: datetime | None = None
     warnings: list[str] = Field(default_factory=list)

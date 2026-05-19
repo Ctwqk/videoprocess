@@ -277,9 +277,14 @@ class AutoFlowService:
                     storyboard,
                     input_asset_id=request.input_asset_id,
                     metadata=metadata,
+                    publish_mode=request.publish_mode,
                 )
         else:
-            definition = self.pipeline_builder.build_storyboard_material_library(storyboard, metadata=metadata)
+            definition = self.pipeline_builder.build_storyboard_material_library(
+                storyboard,
+                metadata=metadata,
+                publish_mode=request.publish_mode,
+            )
             if not definition.nodes:
                 warnings.append("Storyboard found no matched material clips; no executable media pipeline was generated.")
 
@@ -421,9 +426,14 @@ class AutoFlowService:
                             plan.storyboard,
                             input_asset_id=request.input_asset_id,
                             metadata=metadata,
+                            publish_mode=request.publish_mode,
                         )
                 else:
-                    definition = self.pipeline_builder.build_storyboard_material_library(plan.storyboard, metadata=metadata)
+                    definition = self.pipeline_builder.build_storyboard_material_library(
+                        plan.storyboard,
+                        metadata=metadata,
+                        publish_mode=request.publish_mode,
+                    )
             else:
                 template = self.template_library.get_template(plan.template_id)
                 definition = self.pipeline_builder.build(template, intent, candidates, metadata)
@@ -472,6 +482,7 @@ class AutoFlowService:
         approvals_reset = _patch_resets_approval(patch)
         review_approved_at = None if approvals_reset else plan.review_approved_at
         public_approved_at = None if approvals_reset else plan.public_approved_at
+        agent_approved_by = None if approvals_reset else plan.agent_approved_by
         if approvals_reset:
             rights_payload = _rights_without_approval_state(rights_payload, request.publish_mode)
         updated = plan.model_copy(
@@ -485,19 +496,67 @@ class AutoFlowService:
                 "validation": validation_payload,
                 "rights": rights_payload,
                 "warnings": warnings,
-                "needs_review": _needs_review(rights_payload, review_approved_at=review_approved_at),
+                "needs_review": _needs_review(
+                    rights_payload,
+                    review_approved_at=review_approved_at,
+                    agent_approved_by=agent_approved_by,
+                ),
                 "status": _status_for(
                     rights_payload,
                     request.publish_mode,
                     review_approved_at=review_approved_at,
                     public_approved_at=public_approved_at,
+                    agent_approved_by=agent_approved_by,
                 ),
                 "review_approved_at": review_approved_at,
                 "public_approved_at": public_approved_at,
+                "agent_approved_by": agent_approved_by,
                 "rejected_reason": None,
             }
         )
 
+        if db is not None:
+            return await self._save_plan(db, updated)
+
+        self._plans[plan_id] = updated
+        return updated
+
+    async def approve_internal(
+        self,
+        plan_id: str,
+        db: AsyncSession | None = None,
+        *,
+        approved_by: str,
+        evidence: dict[str, Any],
+    ) -> AutoFlowPlan | None:
+        plan = await self.get_plan(plan_id, db)
+        if not plan:
+            return None
+        _assert_not_blocked_or_rejected(plan, action="approve internally")
+
+        rights = {
+            **plan.rights,
+            "review_approved": True,
+            "agent_approval": {
+                "approved_by": approved_by,
+                "evidence": dict(evidence),
+            },
+        }
+        updated = plan.model_copy(
+            update={
+                "needs_review": False,
+                "rights": rights,
+                "status": _status_for(
+                    rights,
+                    plan.request.publish_mode,
+                    review_approved_at=plan.review_approved_at,
+                    public_approved_at=plan.public_approved_at,
+                    agent_approved_by=approved_by,
+                ),
+                "agent_approved_by": approved_by,
+                "rejected_reason": None,
+            }
+        )
         if db is not None:
             return await self._save_plan(db, updated)
 
@@ -528,6 +587,7 @@ class AutoFlowService:
                     public_approved_at=plan.public_approved_at,
                 ),
                 "review_approved_at": now,
+                "agent_approved_by": None,
                 "review_notes": review_notes,
                 "rejected_reason": None,
             }
@@ -548,7 +608,7 @@ class AutoFlowService:
         if not plan:
             return None
         _assert_not_blocked_or_rejected(plan, action="approve public publication")
-        if _requires_review_approval(plan) and not plan.review_approved_at:
+        if _requires_review_approval(plan) and not (plan.review_approved_at or plan.agent_approved_by):
             raise PermissionError("AutoFlow plan requires review approval before public approval")
 
         now = _utcnow()
@@ -560,6 +620,7 @@ class AutoFlowService:
                 "status": "public_approved",
                 "review_approved_at": plan.review_approved_at or now,
                 "public_approved_at": now,
+                "agent_approved_by": plan.agent_approved_by,
                 "review_notes": review_notes if review_notes is not None else plan.review_notes,
                 "rejected_reason": None,
             }
@@ -585,6 +646,7 @@ class AutoFlowService:
                 "needs_review": True,
                 "review_approved_at": None,
                 "public_approved_at": None,
+                "agent_approved_by": None,
                 "rejected_reason": rejected_reason or "Rejected by reviewer",
             }
         )
@@ -644,7 +706,8 @@ class AutoFlowService:
             artifacts=artifacts,
             publish={
                 "mode": plan.request.publish_mode,
-                "review_approved": bool(plan.review_approved_at),
+                "review_approved": bool(plan.review_approved_at or plan.agent_approved_by),
+                "agent_approved_by": plan.agent_approved_by,
                 "public_approved": bool(plan.public_approved_at),
             },
             error_message=error_message,
@@ -709,6 +772,7 @@ class AutoFlowService:
         row.status = plan.status
         row.review_approved_at = plan.review_approved_at
         row.public_approved_at = plan.public_approved_at
+        row.agent_approved_by = plan.agent_approved_by
         row.review_notes = plan.review_notes
         row.rejected_reason = plan.rejected_reason
 
@@ -839,10 +903,11 @@ def _plan_from_model(row: AutoFlowPlanModel) -> AutoFlowPlan:
         validation=validation,
         rights=rights,
         warnings=list(validation.get("plan_warnings") or []),
-        needs_review=_needs_review(rights, row.review_approved_at),
+        needs_review=_needs_review(rights, row.review_approved_at, agent_approved_by=row.agent_approved_by),
         status=row.status,
         review_approved_at=row.review_approved_at,
         public_approved_at=row.public_approved_at,
+        agent_approved_by=row.agent_approved_by,
         review_notes=row.review_notes,
         rejected_reason=row.rejected_reason,
     )
@@ -1017,6 +1082,7 @@ def _rights_without_approval_state(rights: dict[str, Any], publish_mode: str) ->
     cleaned = dict(rights)
     cleaned.pop("review_approved", None)
     cleaned.pop("public_approved", None)
+    cleaned.pop("agent_approval", None)
     if publish_mode == "public_after_review":
         cleaned["publish_allowed"] = False
     return cleaned
@@ -1028,20 +1094,26 @@ def _status_for(
     *,
     review_approved_at: datetime | None = None,
     public_approved_at: datetime | None = None,
+    agent_approved_by: str | None = None,
 ) -> str:
     if rights.get("status") == "blocked":
         return "blocked"
     if public_approved_at is not None:
         return "public_approved"
-    if review_approved_at is not None:
+    if review_approved_at is not None or agent_approved_by:
         return "review_approved"
     if rights.get("status") == "review_required" or publish_mode == "public_after_review":
         return "review_required"
     return "drafted"
 
 
-def _needs_review(rights: dict[str, Any], review_approved_at: datetime | None) -> bool:
-    return rights.get("status") != "allowed" and review_approved_at is None
+def _needs_review(
+    rights: dict[str, Any],
+    review_approved_at: datetime | None,
+    *,
+    agent_approved_by: str | None = None,
+) -> bool:
+    return rights.get("status") != "allowed" and review_approved_at is None and not agent_approved_by
 
 
 def _requires_review_approval(plan: AutoFlowPlan) -> bool:
@@ -1069,7 +1141,7 @@ def _assert_execute_allowed(plan: AutoFlowPlan, request: AutoFlowExecuteRequest)
 
     publish_mode = plan.request.publish_mode
     upload_requested = publish_mode in {"private_upload", "unlisted_upload", "public_after_review"}
-    review_approved = bool(plan.review_approved_at)
+    review_approved = bool(plan.review_approved_at) or bool(plan.agent_approved_by)
     if plan.rights.get("status") == "review_required" and upload_requested and not review_approved:
         raise PermissionError("AutoFlow plan requires review approval before upload execution")
 

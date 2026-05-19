@@ -57,6 +57,34 @@ def test_storyboard_material_pipeline_uses_matched_assets_and_skips_missing_shot
     assert any(node.type == "concat_timeline" for node in definition.nodes)
 
 
+def test_storyboard_material_pipeline_adds_private_upload_node_when_requested():
+    storyboard = StoryboardGenerator().generate(
+        AutoFlowStoryboardRequest(
+            prompt="Create a 10 second generic product video",
+            target_duration=10,
+            source_strategy="material_library",
+            min_shots=3,
+            max_shots=3,
+            target_platforms=["youtube"],
+        )
+    ).storyboard
+    storyboard.shots[0].matched_asset_id = "asset-1"
+    storyboard.shots[0].match_status = "matched"
+    storyboard.shots[1].matched_asset_id = "asset-2"
+    storyboard.shots[1].match_status = "matched"
+
+    definition = PipelineBuilder().build_storyboard_material_library(
+        storyboard,
+        publish_mode="private_upload",
+    )
+
+    assert validate_pipeline(definition).valid
+    upload = next(node for node in definition.nodes if node.id == "youtube_upload_1")
+    assert upload.type == "youtube_upload"
+    assert upload.data.config["privacy"] == "private"
+    assert any(edge.source == "transcode_1" and edge.target == "youtube_upload_1" for edge in definition.edges)
+
+
 def test_storyboard_input_video_pipeline_does_not_truncate_more_than_twelve_shots():
     storyboard = StoryboardGenerator().generate(
         AutoFlowStoryboardRequest(

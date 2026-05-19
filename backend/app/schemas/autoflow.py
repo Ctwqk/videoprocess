@@ -358,6 +358,7 @@ class AutoFlowPlan(BaseModel):
     status: AutoFlowPlanStatus = "drafted"
     review_approved_at: datetime | None = None
     public_approved_at: datetime | None = None
+    agent_approved_by: str | None = None
     review_notes: str | None = None
     rejected_reason: str | None = None
 

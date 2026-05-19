@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent.alerts import build_alert_payload
 from app.channel_agent.clock import Clock
+from app.channel_agent.candidate_scoring import score_candidate
 from app.channel_agent.clients import (
     AutoFlowClient,
     FakeAutoFlowClient,
@@ -37,6 +38,12 @@ from app.channel_agent.constants import (
     UPLOAD_FAILURE_KEYWORDS,
 )
 from app.channel_agent.lane_prompts import build_lane_prompt
+from app.channel_agent.material_usage import (
+    MaterialReference,
+    UsageGuardResult,
+    extract_material_references,
+    recent_usage_flags,
+)
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
 from app.events.outbox import EventOutbox
 from app.events.schemas import TOPIC_VP_ACTIONS, build_actor_action_event
@@ -47,12 +54,15 @@ from app.models.channel_agent import (
     FeedbackSnapshot,
     LaneFormatMatrix,
     ManualSeed,
+    MaterialUsageLedger,
     ProductionTask,
     PublicationRecord,
     PublishingAccount,
     TakedownEvent,
     TopicLane,
 )
+from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
+from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
 from app.pds_client import (
     NoopPDSClient,
     PDSDecision,
@@ -588,6 +598,10 @@ class ChannelAgentService:
         if lane_cadence_rejection is not None:
             return lane_cadence_rejection
 
+        usage_rejection = await self._material_usage_guard(db, candidate)
+        if usage_rejection is not None:
+            return usage_rejection
+
         if pds_enabled:
             return await self._pds_candidate_guard(
                 db,
@@ -595,6 +609,38 @@ class ChannelAgentService:
                 emit_outbox=enqueue_alerts,
             )
         return None
+
+    async def _material_usage_guard(
+        self,
+        db: AsyncSession,
+        candidate: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        references = _candidate_material_references(candidate)
+        if not references:
+            return None
+        account = candidate.get("account")
+        lane = candidate.get("lane")
+        if account is None:
+            return None
+        result = await recent_usage_flags(
+            db,
+            channel_id=str(account.channel_profile_id),
+            lane_id=str(lane.id) if lane is not None else None,
+            account_id=str(account.id),
+            references=references,
+            now=self.clock.now(),
+        )
+        if not result.blocked:
+            return None
+        candidate["_material_usage_guard"] = result
+        if candidate.get("source") == "manual_seed":
+            return None
+        guard = "cross_account_rejected" if result.cross_account_rejected else "repetition_rejected"
+        return _candidate_rejection(
+            candidate,
+            guard=guard,
+            reason=f"Material usage guard rejected candidate: {guard}",
+        )
 
     async def _pds_candidate_guard(
         self,
@@ -839,6 +885,16 @@ class ChannelAgentService:
         lane = candidate.get("lane")
         lane_format = candidate.get("lane_format")
         seed = candidate.get("seed")
+        created_timestamp = _naive_utc(created_at)
+        rationale = {}
+        usage_guard = candidate.get("_material_usage_guard")
+        if isinstance(usage_guard, UsageGuardResult):
+            rationale["material_usage_guard"] = {
+                "manual_override": candidate.get("source") == "manual_seed",
+                "repetition_rejected": usage_guard.repetition_rejected,
+                "cross_account_rejected": usage_guard.cross_account_rejected,
+                "hits": list(usage_guard.hits),
+            }
         task = ProductionTask(
             channel_profile_id=channel.id,
             topic_lane_id=lane.id if lane is not None else None,
@@ -848,13 +904,17 @@ class ChannelAgentService:
             source=candidate["source"],
             title_seed=candidate["title_seed"],
             prompt=candidate["prompt"],
+            rationale_json=rationale,
+            score_breakdown_json=score_candidate(candidate, now=self.clock.now()),
             portfolio_bucket="explore",
             source_platforms_json=list(candidate["source_platforms_json"]),
             material_library_ids_json=list(candidate["material_library_ids_json"]),
             uses_external_assets=False,
+            approval_mode="human" if candidate["source"] == "manual_seed" else "agent",
+            agent_approval_evidence_json={},
             state=TASK_SELECTED,
-            created_at=created_at,
-            updated_at=created_at,
+            created_at=created_timestamp,
+            updated_at=created_timestamp,
             state_updated_at=self.clock.now(),
             channel_config_version_snapshot=channel.config_version,
             channel_config_snapshot_json=_snapshot(
@@ -889,6 +949,31 @@ class ChannelAgentService:
             return task
 
         task.autoflow_plan_id = uuid.UUID(observation.plan_id)
+        if task.approval_mode == "agent":
+            account = await db.get(PublishingAccount, task.target_account_id)
+            decision = await self.pds_client.decide(
+                PDSDecisionRequest(
+                    actor_id=str(task.target_account_id),
+                    action_type="plan_approval",
+                    platform=_account_platform(account) if account is not None else "youtube",
+                    content={
+                        "title": task.title_seed,
+                        "description": task.prompt,
+                    },
+                    context={
+                        "production_task_id": str(task.id),
+                        "autoflow_plan_id": str(task.autoflow_plan_id),
+                    },
+                )
+            )
+            evidence = _pds_decision_event_metadata(decision)
+            if decision.verdict == "allow":
+                await self.autoflow_client.approve_plan(
+                    str(task.autoflow_plan_id),
+                    approved_by="channel_agent",
+                    evidence=evidence,
+                )
+                task.agent_approval_evidence_json = evidence
         task.state = TASK_PLANNING
         task.state_updated_at = self.clock.now()
         await self.queue.enqueue(
@@ -1138,6 +1223,12 @@ class ChannelAgentService:
             )
             db.add(publication)
             await db.flush()
+        await self._write_material_usage_ledger(
+            db,
+            task=task,
+            publication=publication,
+            upload_metadata=youtube,
+        )
 
         if self._uses_external_assets(task) and not account.external_asset_auto_publish:
             task.state = TASK_HELD
@@ -1281,6 +1372,76 @@ class ChannelAgentService:
             parent_queue_item_id=item.id,
             channel_profile_id=task.channel_profile_id,
         )
+        await self.queue.enqueue(
+            db,
+            kind="reconcile_publication",
+            idempotency_key=f"reconcile_publication:{publication.id}:{scheduled_at.isoformat()}",
+            payload={"publication_id": str(publication.id)},
+            priority=80,
+            run_after=scheduled_at + timedelta(minutes=30),
+            parent_queue_item_id=item.id,
+            channel_profile_id=task.channel_profile_id,
+        )
+        await db.commit()
+        await db.refresh(publication)
+        return publication
+
+    async def handle_reconcile_publication(
+        self,
+        db: AsyncSession,
+        item: ChannelOpsQueueItem,
+    ) -> PublicationRecord:
+        publication_id = _uuid(item.payload_json["publication_id"])
+        publication = await db.get(PublicationRecord, publication_id)
+        if publication is None:
+            raise ValueError("Publication not found")
+
+        status = await self.youtube_client.fetch_status(video_id=publication.platform_content_id)
+        privacy = str(status.get("privacy") or status.get("current_privacy") or "").strip().lower()
+        if privacy:
+            publication.current_privacy = privacy
+
+        publish_status = str(
+            status.get("publish_status")
+            or status.get("processing_state")
+            or status.get("upload_status")
+            or publication.publish_status
+        ).strip().lower()
+        if publish_status:
+            publication.publish_status = publish_status
+
+        permalink = str(status.get("permalink") or status.get("url") or "").strip()
+        if permalink:
+            publication.permalink = permalink
+
+        error_message = str(status.get("error_message") or status.get("failure_reason") or "").strip()
+        task = await db.get(ProductionTask, publication.production_task_id)
+        severe_states = {"rejected", "removed", "failed", "claim", "claimed", "blocked"}
+        if error_message:
+            publication.warnings_json = [*list(publication.warnings_json or []), f"platform_status:{error_message}"]
+            if task is not None:
+                task.failure_reason = error_message
+        if publish_status in severe_states:
+            publication.publish_status = "removed" if publish_status in {"removed", "claim", "claimed"} else "rejected"
+            if task is not None:
+                previous_state = task.state
+                task.state = TASK_HELD
+                task.blocked_by_guard = "platform_rejected"
+                task.failure_reason = error_message or f"YouTube reported {publish_status}"
+                task.state_updated_at = self.clock.now()
+                task.transition_history_json = [
+                    *list(task.transition_history_json or []),
+                    _transition(previous_state, TASK_HELD, "reconcile_publication", self.clock.now()),
+                ]
+            db.add(
+                TakedownEvent(
+                    publication_id=publication.id,
+                    event_type=publish_status,
+                    severity="severe",
+                    raw_payload_json=dict(status),
+                )
+            )
+
         await db.commit()
         await db.refresh(publication)
         return publication
@@ -1296,6 +1457,15 @@ class ChannelAgentService:
         task = await db.get(ProductionTask, publication.production_task_id)
         if publication.publish_status == "rejected" or (task is not None and task.state == TASK_REJECTED):
             return None
+        if not _has_real_metrics(metrics) and publication.platform_content_id:
+            try:
+                fetched_metrics = await self.youtube_client.fetch_metrics(video_id=publication.platform_content_id)
+            except Exception:
+                fetched_metrics = {}
+            if _has_real_metrics(fetched_metrics):
+                metrics = fetched_metrics
+                payload["metrics"] = metrics
+                payload["metrics_source"] = "youtube_manager"
         if not _has_real_metrics(metrics):
             poll_count = _nonnegative_int(payload.get("metrics_poll_count"), default=0)
             next_count = poll_count + 1
@@ -1422,6 +1592,64 @@ class ChannelAgentService:
         await db.commit()
         await db.refresh(event)
         return event
+
+    async def _write_material_usage_ledger(
+        self,
+        db: AsyncSession,
+        *,
+        task: ProductionTask,
+        publication: PublicationRecord,
+        upload_metadata: dict[str, Any],
+    ) -> None:
+        plan_payload: dict[str, Any] = {}
+        run_payload: dict[str, Any] = {}
+        if task.autoflow_plan_id is not None:
+            plan = await db.get(AutoFlowPlanModel, task.autoflow_plan_id)
+            if plan is not None:
+                plan_payload = {
+                    "candidates": list(plan.candidates_json or []),
+                    "metadata": dict(plan.metadata_json or {}),
+                    "rights": dict(plan.rights_json or {}),
+                }
+        if task.autoflow_run_id is not None:
+            run = await db.get(AutoFlowRunModel, task.autoflow_run_id)
+            if run is not None:
+                run_payload = {
+                    "artifacts": dict(run.artifacts_json or {}),
+                    "publish": dict(run.publish_json or {}),
+                }
+        references = extract_material_references(
+            plan_payload=plan_payload,
+            run_payload=run_payload,
+            upload_metadata=upload_metadata,
+        )
+        if not references:
+            return
+        existing_rows = (
+            await db.execute(
+                select(MaterialUsageLedger)
+                .where(MaterialUsageLedger.publication_id == publication.id)
+            )
+        ).scalars().all()
+        existing = {(row.material_id, row.segment_signature) for row in existing_rows}
+        for ref in references:
+            key = (ref.material_id, ref.segment_signature)
+            if key in existing:
+                continue
+            db.add(
+                MaterialUsageLedger(
+                    material_id=ref.material_id,
+                    asset_id=_uuid_or_none(ref.asset_id),
+                    channel_profile_id=task.channel_profile_id,
+                    topic_lane_id=task.topic_lane_id,
+                    publishing_account_id=task.target_account_id,
+                    publication_id=publication.id,
+                    used_at=self.clock.now(),
+                    segment_signature=ref.segment_signature,
+                    metadata_json=ref.metadata,
+                )
+            )
+            existing.add(key)
 
     async def _maybe_alert_low_supply(
         self,
@@ -1746,6 +1974,20 @@ def _candidate_rejection(candidate: dict[str, Any], *, guard: str, reason: str) 
     }
 
 
+def _candidate_material_references(candidate: dict[str, Any]) -> list[MaterialReference]:
+    constraints = _dict_value(candidate.get("constraints_json"))
+    refs_payload = {
+        "material_refs": constraints.get("material_refs") or constraints.get("material_references") or [],
+    }
+    seed = candidate.get("seed")
+    if seed is not None:
+        seed_constraints = _dict_value(getattr(seed, "constraints_json", None))
+        refs_payload["seed_material_refs"] = (
+            seed_constraints.get("material_refs") or seed_constraints.get("material_references") or []
+        )
+    return extract_material_references(plan_payload={}, run_payload={}, upload_metadata=refs_payload)
+
+
 def _candidate_id(source: str, lane_id, format_id, bucket: str, *, seed_id=None) -> str:
     if source == "manual_seed" and seed_id is not None:
         return f"{source}:{seed_id}:lane:{lane_id or 'unassigned'}:format:{format_id or 'none'}:{bucket}"
@@ -1926,6 +2168,12 @@ def _safe_privacy(value: Any) -> str | None:
     if desired in _SAFE_PRIVACY_VALUES:
         return desired
     return None
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _status_value(value: Any) -> str:

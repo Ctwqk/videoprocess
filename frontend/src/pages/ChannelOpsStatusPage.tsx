@@ -32,6 +32,17 @@ function tone(value: string | null | undefined): StatusTone {
   return STATE_TONE[value.toLowerCase()] ?? 'idle';
 }
 
+function liveLoopStatus(measuredAt: string | null | undefined): { tone: StatusTone; label: string } {
+  if (!measuredAt) return { tone: 'fail', label: 'NO MEASURED LOOP' };
+  const measuredMs = Date.parse(measuredAt);
+  if (!Number.isFinite(measuredMs)) return { tone: 'fail', label: 'MEASURED UNKNOWN' };
+  const ageHours = (Date.now() - measuredMs) / 3_600_000;
+  if (ageHours > 48) return { tone: 'fail', label: `MEASURED ${Math.floor(ageHours)}H AGO` };
+  if (ageHours > 24) return { tone: 'run', label: `MEASURED ${Math.floor(ageHours)}H AGO` };
+  if (ageHours >= 1) return { tone: 'ok', label: `MEASURED ${Math.floor(ageHours)}H AGO` };
+  return { tone: 'ok', label: 'MEASURED <1H AGO' };
+}
+
 function Kpi({ label, value, toneName, sub }: {
   label: string; value: number; toneName: StatusTone; sub: string;
 }) {
@@ -180,6 +191,11 @@ export default function ChannelOpsStatusPage() {
     }));
   }, [overview]);
 
+  const loopStatus = useMemo(
+    () => liveLoopStatus(overview?.health.last_successful_measured_at),
+    [overview],
+  );
+
   if (channels.length === 0 && !loading) {
     return (
       <div className="vp-empty" style={{ flex: 1 }}>
@@ -248,6 +264,7 @@ export default function ChannelOpsStatusPage() {
             <Badge status={selectedChannel.halted_at ? 'fail' : 'ok'}>
               {selectedChannel.halted_at ? 'HALTED' : 'RUNNING'}
             </Badge>
+            <Badge status={loopStatus.tone}>{loopStatus.label}</Badge>
             {selectedChannel.halt_reason && (
               <span className="muted mono" style={{ fontSize: 12 }}>
                 reason: {selectedChannel.halt_reason}

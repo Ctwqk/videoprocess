@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -279,6 +279,57 @@ async def test_channel_health_does_not_count_published_tasks_as_active(api_sessi
         health = (await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/health")).json()
 
         assert health["active_tasks"] == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_health_reports_last_successful_measured_at(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Health"})).json()
+        account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{channel['id']}/accounts",
+                json={
+                    "account_label": "main",
+                    "platform_account_id": "yt",
+                    "credential_ref": "youtube/main",
+                },
+            )
+        ).json()
+        task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="measured task",
+            state="measured",
+            channel_config_snapshot_json={},
+        )
+        api_session.add(task)
+        await api_session.flush()
+        publication = PublicationRecord(
+            production_task_id=task.id,
+            account_id=uuid.UUID(account["id"]),
+            platform_content_id="yt-video-1",
+            title="measured",
+            desired_privacy="private",
+            current_privacy="private",
+            publish_status="scheduled",
+            compliance_disposition="assumed_fair_use",
+        )
+        api_session.add(publication)
+        await api_session.flush()
+        older = datetime(2026, 5, 19, 10, 0, tzinfo=timezone.utc)
+        latest = older + timedelta(hours=2)
+        api_session.add_all(
+            [
+                FeedbackSnapshot(publication_id=publication.id, collected_at=older, views=10),
+                FeedbackSnapshot(publication_id=publication.id, collected_at=latest, views=20),
+            ]
+        )
+        await api_session.commit()
+
+        health = (await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/health")).json()
+
+        assert health["last_successful_measured_at"] == "2026-05-19T12:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -569,7 +620,11 @@ async def test_ticks_and_funnel_return_real_data(api_session):
             started_at=datetime.now(timezone.utc),
             tasks_selected=2,
             tasks_rejected=1,
-            guards_triggered_json=["cadence"],
+            guards_triggered_json=[
+                {"guard": "repetition_rejected"},
+                {"guard": "cross_account_rejected"},
+                "cadence",
+            ],
             decision_summary_json={"selected": 2},
         )
         api_session.add(tick)
@@ -640,7 +695,7 @@ async def test_ticks_and_funnel_return_real_data(api_session):
         assert isinstance(ticks, list)
         assert ticks[0]["tick_id"] == "tick-1"
         assert ticks[0]["tasks_selected"] == 2
-        assert ticks[0]["guards_triggered_json"] == ["cadence"]
+        assert ticks[0]["guards_triggered_json"][2] == "cadence"
         assert clamped_funnel["days"] >= 0
         assert "selected" in funnel
         assert "scheduled" in funnel
@@ -652,6 +707,8 @@ async def test_ticks_and_funnel_return_real_data(api_session):
         assert funnel["scheduled"] >= 1
         assert funnel["rejected"] >= 1
         assert funnel["other"] >= 1
+        assert funnel["repetition_rejected"] == 1
+        assert funnel["cross_account_rejected"] == 1
 
 
 @pytest.mark.asyncio

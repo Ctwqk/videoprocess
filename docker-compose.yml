@@ -79,6 +79,9 @@ services:
       QDRANT_URL: ${VP_QDRANT_URL:-http://host.docker.internal:6333}
       VIDEO_SCHEDULE_DEFAULT_STATE: ${VIDEO_SCHEDULE_DEFAULT_STATE:-OPEN}
       YOUTUBE_MANAGER_URL: ${YOUTUBE_MANAGER_URL:-http://youtube-manager:8899}
+      PDS_ENABLED: ${PDS_ENABLED:-true}
+      PDS_BASE_URL: ${PDS_BASE_URL:-http://pds:8080}
+      PDS_CLIENT_ID: ${PDS_CLIENT_ID:-videoprocess-channel-agent}
       PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
       X_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
       XIAOHONGSHU_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8897
@@ -145,6 +148,9 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET: videoprocess
       YOUTUBE_MANAGER_URL: ${YOUTUBE_MANAGER_URL:-http://youtube-manager:8899}
+      PDS_ENABLED: ${PDS_ENABLED:-true}
+      PDS_BASE_URL: ${PDS_BASE_URL:-http://pds:8080}
+      PDS_CLIENT_ID: ${PDS_CLIENT_ID:-videoprocess-channel-agent}
       CHANNEL_AGENT_RUNNER_POLL_SECONDS: ${CHANNEL_AGENT_RUNNER_POLL_SECONDS:-5}
       CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL: ${CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL:-}
       CHANNEL_AGENT_ALERT_EMAIL_TO: ${CHANNEL_AGENT_ALERT_EMAIL_TO:-}

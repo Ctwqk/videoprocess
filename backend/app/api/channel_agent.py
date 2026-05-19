@@ -25,6 +25,7 @@ from app.models.channel_agent import (
     AgentTickAudit,
     ChannelOpsQueueItem,
     ChannelProfile,
+    FeedbackSnapshot,
     LaneFormatMatrix,
     ManualSeed,
     ProductionTask,
@@ -304,6 +305,12 @@ async def channel_health(channel_id: str, db: AsyncSession = Depends(get_db)):
     tasks = (
         await db.execute(select(ProductionTask).where(ProductionTask.channel_profile_id == channel.id))
     ).scalars().all()
+    last_successful_measured_at = await db.scalar(
+        select(func.max(FeedbackSnapshot.collected_at))
+        .join(PublicationRecord, FeedbackSnapshot.publication_id == PublicationRecord.id)
+        .join(ProductionTask, PublicationRecord.production_task_id == ProductionTask.id)
+        .where(ProductionTask.channel_profile_id == channel.id)
+    )
     return HealthSummary(
         channel_id=str(channel.id),
         dry_run=channel.dry_run,
@@ -311,6 +318,7 @@ async def channel_health(channel_id: str, db: AsyncSession = Depends(get_db)):
         active_tasks=sum(1 for task in tasks if task.state in ACTIVE_TASK_STATES),
         queued_items=sum(1 for item in queued if item.status == "queued"),
         recent_failures=sum(1 for item in queued if item.status in {"failed", "dead_lettered"}),
+        last_successful_measured_at=_as_utc(last_successful_measured_at),
         warnings=[],
     )
 
@@ -481,6 +489,7 @@ async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_
     channel = await _require_channel(db, channel_id)
     clamped_days = max(days, 0)
     since = Clock().now() - timedelta(days=clamped_days)
+    since_naive = _naive_utc(since)
     states = {
         "days": clamped_days,
         "seeded": 0,
@@ -496,11 +505,13 @@ async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_
         "rejected": 0,
         "cancelled": 0,
         "other": 0,
+        "repetition_rejected": 0,
+        "cross_account_rejected": 0,
     }
     result = await db.execute(
         select(ProductionTask.state, func.count(ProductionTask.id))
         .where(ProductionTask.channel_profile_id == channel.id)
-        .where(ProductionTask.created_at >= since)
+        .where(ProductionTask.created_at >= since_naive)
         .group_by(ProductionTask.state)
     )
     for state, count in result.all():
@@ -514,15 +525,27 @@ async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_
         select(func.count(ProductionTask.id))
         .where(ProductionTask.channel_profile_id == channel.id)
         .where(ProductionTask.state == TASK_SEEDED)
-        .where(ProductionTask.created_at >= since)
+        .where(ProductionTask.created_at >= since_naive)
     )
     seed_count = await db.scalar(
         select(func.count(ManualSeed.id))
         .where(ManualSeed.channel_profile_id == channel.id)
         .where(ManualSeed.status == "active")
-        .where(ManualSeed.created_at >= since)
+        .where(ManualSeed.created_at >= since_naive)
     )
     states["seeded"] = int(task_seed_count or 0) + int(seed_count or 0)
+    tick_rows = (
+        await db.execute(
+            select(AgentTickAudit.guards_triggered_json)
+            .where(AgentTickAudit.channel_profile_id == channel.id)
+            .where(AgentTickAudit.started_at >= since)
+        )
+    ).all()
+    for (guards,) in tick_rows:
+        for guard in guards or []:
+            guard_name = guard.get("guard") if isinstance(guard, dict) else guard
+            if guard_name in {"repetition_rejected", "cross_account_rejected"}:
+                states[guard_name] += 1
     return states
 
 
@@ -601,6 +624,20 @@ def _safe_promotion_visibility(value: Any) -> str:
 
 def _uuid(value: str) -> uuid.UUID:
     return uuid.UUID(str(value))
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _seed_payload(data: ManualSeedCreate) -> dict[str, Any]:

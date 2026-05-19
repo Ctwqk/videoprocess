@@ -43,6 +43,13 @@ class FailingSideEffectRunner(ChannelAgentRunner):
         raise RuntimeError("handler boom")
 
 
+def test_live_runner_requires_youtube_manager_url(monkeypatch):
+    monkeypatch.setattr(runner_module.settings, "youtube_manager_url", "")
+
+    with pytest.raises(RuntimeError, match="YOUTUBE_MANAGER_URL"):
+        ChannelAgentRunner(worker_id="test-runner")
+
+
 @pytest.mark.asyncio
 async def test_runner_rolls_back_handler_side_effects_before_retry_mark(
     runner_session_factory,

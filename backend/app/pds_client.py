@@ -9,6 +9,12 @@ from app.config import settings
 
 
 SUPPORTED_VERDICTS = {"allow", "flag", "block"}
+FAIL_POLICY_BY_ACTION = {
+    "candidate_accept": "allow",
+    "plan_approval": "flag",
+    "publish": "block",
+    "promote_publication": "block",
+}
 
 
 @dataclass(frozen=True)
@@ -38,8 +44,8 @@ class PolicyDecisionClient(Protocol):
 
 
 class NoopPDSClient:
-    async def decide(self, _request: PDSDecisionRequest) -> PDSDecision:
-        return _fail_open("pds_disabled")
+    async def decide(self, request: PDSDecisionRequest) -> PDSDecision:
+        return _fail_policy_decision(request.action_type, "pds_disabled")
 
 
 class PDSClient:
@@ -69,10 +75,10 @@ class PDSClient:
         try:
             response = await self._post(url, headers=headers, payload=payload)
         except httpx.RequestError:
-            return _fail_open("pds_unavailable")
+            return _fail_policy_decision(request.action_type, "pds_unavailable")
 
         if response.status_code >= 500:
-            return _fail_open("pds_unavailable")
+            return _fail_policy_decision(request.action_type, "pds_unavailable")
 
         response.raise_for_status()
 
@@ -80,7 +86,7 @@ class PDSClient:
             data = response.json()
             return _decision_from_payload(data)
         except (TypeError, ValueError, OverflowError):
-            return _fail_open("pds_parse_failed")
+            return _fail_policy_decision(request.action_type, "pds_parse_failed")
 
     async def _post(self, url: str, *, headers: dict[str, str], payload: dict[str, Any]) -> httpx.Response:
         if self._http_client is not None:
@@ -145,5 +151,6 @@ def _str_list(value: Any) -> list[str]:
     return [str(item) for item in value]
 
 
-def _fail_open(warning: str) -> PDSDecision:
-    return PDSDecision(decision_id="", verdict="allow", metadata={"warning": warning})
+def _fail_policy_decision(action_type: str, warning: str) -> PDSDecision:
+    verdict = FAIL_POLICY_BY_ACTION.get(action_type, "allow")
+    return PDSDecision(decision_id="", verdict=verdict, metadata={"warning": warning, "fail_policy": verdict})

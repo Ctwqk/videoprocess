@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     channel_agent_alert_slack_webhook_url: str = ""
     channel_agent_alert_email_to: str = ""
     channel_agent_runner_poll_seconds: float = 5.0
+    channel_agent_retention_queue_days: int = 30
+    channel_agent_retention_audit_days: int = 90
+    channel_agent_retention_feedback_days: int = 365
 
     # Policy Decision Service
     pds_enabled: bool = False

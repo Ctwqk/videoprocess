@@ -9,10 +9,10 @@ from app.pds_client import NoopPDSClient, PDSClient, PDSDecisionRequest
 
 
 @pytest.mark.asyncio
-async def test_noop_pds_client_returns_disabled_allow_warning() -> None:
+async def test_noop_pds_client_applies_disabled_fail_policy() -> None:
     decision = await NoopPDSClient().decide(PDSDecisionRequest(actor_id="actor-1", action_type="publish"))
 
-    assert decision.verdict == "allow"
+    assert decision.verdict == "block"
     assert decision.metadata["warning"] == "pds_disabled"
 
 
@@ -83,7 +83,7 @@ async def test_pds_client_returns_block_decision_and_forwards_client_id() -> Non
 
 
 @pytest.mark.asyncio
-async def test_pds_client_fails_open_on_500() -> None:
+async def test_pds_client_blocks_publish_on_500() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, json={"error": "down"})
 
@@ -97,12 +97,12 @@ async def test_pds_client_fails_open_on_500() -> None:
 
         decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="publish"))
 
-    assert decision.verdict == "allow"
+    assert decision.verdict == "block"
     assert decision.metadata["warning"] == "pds_unavailable"
 
 
 @pytest.mark.asyncio
-async def test_pds_client_fails_open_on_network_error() -> None:
+async def test_pds_client_allows_candidate_accept_on_network_error() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
 
@@ -114,14 +114,14 @@ async def test_pds_client_fails_open_on_network_error() -> None:
             http_client=http_client,
         )
 
-        decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="publish"))
+        decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="candidate_accept"))
 
     assert decision.verdict == "allow"
     assert decision.metadata["warning"] == "pds_unavailable"
 
 
 @pytest.mark.asyncio
-async def test_pds_client_fails_open_on_timeout() -> None:
+async def test_pds_client_flags_plan_approval_on_timeout() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)
 
@@ -133,14 +133,14 @@ async def test_pds_client_fails_open_on_timeout() -> None:
             http_client=http_client,
         )
 
-        decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="publish"))
+        decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="plan_approval"))
 
-    assert decision.verdict == "allow"
+    assert decision.verdict == "flag"
     assert decision.metadata["warning"] == "pds_unavailable"
 
 
 @pytest.mark.asyncio
-async def test_pds_client_fails_open_on_invalid_json() -> None:
+async def test_pds_client_blocks_promote_publication_on_invalid_json() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"{not-json")
 
@@ -152,14 +152,14 @@ async def test_pds_client_fails_open_on_invalid_json() -> None:
             http_client=http_client,
         )
 
-        decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="publish"))
+        decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="promote_publication"))
 
-    assert decision.verdict == "allow"
+    assert decision.verdict == "block"
     assert decision.metadata["warning"] == "pds_parse_failed"
 
 
 @pytest.mark.asyncio
-async def test_pds_client_fails_open_on_non_object_200_response() -> None:
+async def test_pds_client_blocks_publish_on_non_object_200_response() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=["not", "an", "object"])
 
@@ -173,12 +173,12 @@ async def test_pds_client_fails_open_on_non_object_200_response() -> None:
 
         decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="publish"))
 
-    assert decision.verdict == "allow"
+    assert decision.verdict == "block"
     assert decision.metadata["warning"] == "pds_parse_failed"
 
 
 @pytest.mark.asyncio
-async def test_pds_client_fails_open_on_missing_verdict() -> None:
+async def test_pds_client_blocks_publish_on_missing_verdict() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"decision_id": "decision-1"})
 
@@ -192,12 +192,12 @@ async def test_pds_client_fails_open_on_missing_verdict() -> None:
 
         decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="publish"))
 
-    assert decision.verdict == "allow"
+    assert decision.verdict == "block"
     assert decision.metadata["warning"] == "pds_parse_failed"
 
 
 @pytest.mark.asyncio
-async def test_pds_client_fails_open_on_invalid_verdict() -> None:
+async def test_pds_client_blocks_publish_on_invalid_verdict() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"decision_id": "decision-1", "verdict": "deny"})
 
@@ -211,7 +211,7 @@ async def test_pds_client_fails_open_on_invalid_verdict() -> None:
 
         decision = await client.decide(PDSDecisionRequest(actor_id="actor-1", action_type="publish"))
 
-    assert decision.verdict == "allow"
+    assert decision.verdict == "block"
     assert decision.metadata["warning"] == "pds_parse_failed"
 
 

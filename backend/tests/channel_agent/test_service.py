@@ -32,11 +32,14 @@ from app.models.channel_agent import (
     TakedownEvent,
     TopicLane,
 )
+from app.models.autoflow import AutoFlowPlan, AutoFlowRun
 from app.pds_client import PDSDecision, PDSDecisionRequest
 from app.schemas.autoflow import AutoFlowRequest
 
 
 CHANNEL_AGENT_TABLES = (
+    AutoFlowPlan.__table__,
+    AutoFlowRun.__table__,
     ChannelProfile.__table__,
     TopicLane.__table__,
     PublishingAccount.__table__,
@@ -177,6 +180,21 @@ class CountingExecuteAutoFlowClient(FakeAutoFlowClient):
         return await super().execute_task(task, request)
 
 
+class ApprovalRecordingAutoFlowClient(FakeAutoFlowClient):
+    def __init__(self):
+        super().__init__()
+        self.approvals: list[dict[str, object]] = []
+
+    async def approve_plan(self, plan_id: str, *, approved_by: str, evidence: dict):
+        self.approvals.append(
+            {
+                "plan_id": plan_id,
+                "approved_by": approved_by,
+                "evidence": dict(evidence),
+            }
+        )
+
+
 class AlwaysRunningAutoFlowClient(FakeAutoFlowClient):
     async def observe_job(self, db, *, run_id: str, job_id: str):
         return AutoFlowJobObservation(
@@ -268,6 +286,31 @@ def test_autoflow_request_uses_task_snapshot_configuration():
     assert request["constraints"]["tone"] == "calm"
     assert request["publish_mode"] == "unlisted_upload"
     AutoFlowRequest.model_validate(request)
+
+
+@pytest.mark.asyncio
+async def test_task_from_candidate_uses_naive_timestamp_mixin_fields(service_session):
+    clock = FakeClock(datetime(2026, 5, 19, 18, 0, tzinfo=timezone.utc))
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    task = _service(clock=clock)._task_from_candidate(
+        channel,
+        {
+            "account": account,
+            "lane": lane,
+            "lane_format": lane_format,
+            "seed": None,
+            "source": "lane_seed",
+            "title_seed": "timestamp smoke",
+            "prompt": "timestamp smoke",
+            "source_platforms_json": [],
+            "material_library_ids_json": [],
+        },
+        created_at=clock.now(),
+    )
+
+    assert task.created_at.tzinfo is None
+    assert task.updated_at.tzinfo is None
+    assert task.state_updated_at.tzinfo is not None
 
 
 def test_autoflow_request_falls_back_for_invalid_strategy_and_planning_mode():
@@ -434,6 +477,17 @@ async def test_active_tick_creates_task_and_plan_queue_item(service_session):
     assert audit.tasks_selected == 1
     task = (await service_session.execute(select(ProductionTask))).scalar_one()
     assert task.state == "selected"
+    assert set(task.score_breakdown_json) >= {
+        "lane_weight",
+        "material_fit",
+        "freshness",
+        "account_fit",
+        "timing",
+        "novelty",
+        "repetition_risk",
+        "compliance_risk",
+        "total_score",
+    }
     assert task.channel_config_snapshot_json["channel"]["dry_run"] is False
     queue_item = (
         await service_session.execute(
@@ -450,6 +504,150 @@ async def test_active_tick_creates_task_and_plan_queue_item(service_session):
     assert payloads[0]["metadata"]["score"] == 0.0
     assert payloads[0]["metadata"]["reason_codes"] == []
     assert payloads[0]["metadata"]["warning"] == "pds_disabled"
+
+
+@pytest.mark.asyncio
+async def test_lane_seed_task_defaults_to_agent_approval_mode(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc))
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+
+    task = _service(clock=clock)._task_from_candidate(
+        channel,
+        {
+            "candidate_id": "lane-candidate",
+            "source": "lane_seed",
+            "seed": None,
+            "lane": lane,
+            "lane_format": lane_format,
+            "account": account,
+            "prompt": "make a lane short",
+            "title_seed": "lane short",
+            "source_platforms_json": [],
+            "material_library_ids_json": [],
+        },
+        created_at=clock.now(),
+    )
+
+    assert task.approval_mode == "agent"
+    assert task.agent_approval_evidence_json == {}
+
+
+@pytest.mark.asyncio
+async def test_manual_seed_task_defaults_to_human_approval_mode(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc))
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    seed = ManualSeed(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        prompt="manual prompt",
+        title_seed="manual",
+    )
+    service_session.add(seed)
+    await service_session.flush()
+
+    task = _service(clock=clock)._task_from_candidate(
+        channel,
+        {
+            "candidate_id": "manual-candidate",
+            "source": "manual_seed",
+            "seed": seed,
+            "lane": lane,
+            "lane_format": lane_format,
+            "account": account,
+            "prompt": seed.prompt,
+            "title_seed": seed.title_seed,
+            "source_platforms_json": [],
+            "material_library_ids_json": [],
+        },
+        created_at=clock.now(),
+    )
+
+    assert task.approval_mode == "human"
+    assert task.agent_approval_evidence_json == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_plan_task_agent_approves_lane_seed_when_pds_allows(service_session):
+    channel, _lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        source="lane_seed",
+        approval_mode="agent",
+        prompt="make a lane short",
+        state="selected",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    item = ChannelOpsQueueItem(
+        kind="plan_task",
+        idempotency_key=f"plan_task:{task.id}",
+        payload_json={"production_task_id": str(task.id)},
+    )
+    service_session.add(item)
+    await service_session.commit()
+    autoflow = ApprovalRecordingAutoFlowClient()
+    pds = FakePDSClient(
+        PDSDecision(
+            decision_id="plan-allow",
+            verdict="allow",
+            score=0.03,
+            reasons=[{"code": "safe"}],
+            rules_version="risk-v4",
+        )
+    )
+
+    result = await _service(autoflow=autoflow, pds=pds).handle_plan_task(service_session, item)
+
+    assert result.autoflow_plan_id is not None
+    assert autoflow.approvals == [
+        {
+            "plan_id": str(result.autoflow_plan_id),
+            "approved_by": "channel_agent",
+            "evidence": {
+                "decision_id": "plan-allow",
+                "verdict": "allow",
+                "score": 0.03,
+                "rules_version": "risk-v4",
+                "reason_codes": ["safe"],
+            },
+        }
+    ]
+    assert result.agent_approval_evidence_json["decision_id"] == "plan-allow"
+    assert pds.requests[0].action_type == "plan_approval"
+
+
+@pytest.mark.asyncio
+async def test_handle_plan_task_does_not_agent_approve_manual_seed(service_session):
+    channel, _lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        approval_mode="human",
+        prompt="manual prompt",
+        state="selected",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    item = ChannelOpsQueueItem(
+        kind="plan_task",
+        idempotency_key=f"plan_task:{task.id}",
+        payload_json={"production_task_id": str(task.id)},
+    )
+    service_session.add(item)
+    await service_session.commit()
+    autoflow = ApprovalRecordingAutoFlowClient()
+    pds = FakePDSClient(PDSDecision(decision_id="plan-allow", verdict="allow"))
+
+    result = await _service(autoflow=autoflow, pds=pds).handle_plan_task(service_session, item)
+
+    assert result.autoflow_plan_id is not None
+    assert autoflow.approvals == []
+    assert result.agent_approval_evidence_json == {}
 
 
 @pytest.mark.asyncio
@@ -1967,6 +2165,134 @@ async def test_publish_task_holds_when_external_platforms_come_from_snapshot(ser
 
 
 @pytest.mark.asyncio
+async def test_publish_task_writes_material_usage_ledger_from_upload_metadata(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        title_seed="test",
+        state="uploaded_private",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="publish_task",
+        idempotency_key=f"publish_task:{task.id}",
+        payload_json={
+            "production_task_id": str(task.id),
+            "youtube": {
+                "video_id": "yt-video-1",
+                "material_refs": [
+                    {
+                        "material_id": "mat-1",
+                        "asset_id": str(uuid.uuid4()),
+                        "start_ms": 1000,
+                        "end_ms": 5000,
+                    }
+                ],
+            },
+        },
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    publication = await _service().handle_publish_task(service_session, item)
+
+    ledger = (await service_session.execute(select(MaterialUsageLedger))).scalar_one()
+    assert ledger.publication_id == publication.id
+    assert ledger.material_id == "mat-1"
+    assert ledger.topic_lane_id == lane.id
+    assert ledger.publishing_account_id == account.id
+    assert ledger.segment_signature
+
+
+@pytest.mark.asyncio
+async def test_lane_candidate_rejects_recent_material_usage(service_session):
+    clock = FakeClock(datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    service_session.add(
+        MaterialUsageLedger(
+            material_id="mat-1",
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            publishing_account_id=account.id,
+            segment_signature="existing-segment",
+            used_at=clock.now() - timedelta(days=1),
+        )
+    )
+    await service_session.commit()
+    candidate = {
+        "candidate_id": "lane-candidate",
+        "source": "lane_seed",
+        "seed": None,
+        "lane": lane,
+        "lane_format": lane_format,
+        "account": account,
+        "prompt": "lane prompt",
+        "title_seed": "lane",
+        "constraints_json": {
+            "material_refs": [
+                {"material_id": "mat-1", "segment_signature": "existing-segment"},
+            ]
+        },
+    }
+
+    rejection = await _service(clock=clock)._evaluate_candidate_guards(
+        service_session,
+        candidate,
+        {},
+        {},
+        enqueue_alerts=False,
+        pds_enabled=False,
+    )
+
+    assert rejection is not None
+    assert rejection["guard"] == "repetition_rejected"
+
+
+@pytest.mark.asyncio
+async def test_manual_seed_repetition_override_is_annotated(service_session):
+    clock = FakeClock(datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    service_session.add(
+        MaterialUsageLedger(
+            material_id="mat-1",
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            publishing_account_id=account.id,
+            segment_signature="existing-segment",
+            used_at=clock.now() - timedelta(days=1),
+        )
+    )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="manual repeat",
+            title_seed="repeat",
+            constraints_json={
+                "material_refs": [
+                    {"material_id": "mat-1", "segment_signature": "existing-segment"},
+                ]
+            },
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service(clock=clock).tick(service_session, channel_id=channel.id)
+
+    task = (await service_session.execute(select(ProductionTask))).scalar_one()
+    assert audit.tasks_selected == 1
+    assert task.rationale_json["material_usage_guard"]["manual_override"] is True
+    assert task.rationale_json["material_usage_guard"]["hits"][0]["guard"] == "repetition_rejected"
+
+
+@pytest.mark.asyncio
 async def test_promote_publication_schedules_youtube_publish_at(service_session):
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
     task = ProductionTask(
@@ -2149,6 +2475,50 @@ async def test_handle_promote_publication_ignores_rejected_publication(service_s
 
 
 @pytest.mark.asyncio
+async def test_reconcile_publication_updates_status_from_youtube(service_session):
+    channel, _lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        state="scheduled",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    publication = _publication_for_task(task, account, publish_status="scheduled", title="scheduled")
+    publication.platform_content_id = "yt-video-1"
+    service_session.add(publication)
+    await service_session.flush()
+    item = ChannelOpsQueueItem(
+        kind="reconcile_publication",
+        idempotency_key=f"reconcile_publication:{publication.id}",
+        payload_json={"publication_id": str(publication.id)},
+    )
+    service_session.add(item)
+    await service_session.commit()
+    youtube = FakeYouTubeClient(
+        status_by_video={
+            "yt-video-1": {
+                "privacy": "private",
+                "processing_state": "processed",
+                "publish_status": "processed",
+                "permalink": "https://youtu.be/yt-video-1",
+            }
+        }
+    )
+
+    result = await _service(youtube=youtube).handle_reconcile_publication(service_session, item)
+    await service_session.refresh(task)
+
+    assert result.current_privacy == "private"
+    assert result.publish_status == "processed"
+    assert result.permalink == "https://youtu.be/yt-video-1"
+    assert task.failure_reason is None
+
+
+@pytest.mark.asyncio
 async def test_collect_metrics_without_metrics_requeues_without_snapshot_or_measured(service_session):
     clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
@@ -2201,6 +2571,59 @@ async def test_collect_metrics_without_metrics_requeues_without_snapshot_or_meas
     assert _as_utc(requeued.run_after) == clock.now() + timedelta(hours=1)
     assert requeued.channel_profile_id == channel.id
     assert requeued.parent_queue_item_id == item.id
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics_fetches_metrics_from_youtube_when_payload_has_none(service_session):
+    clock = FakeClock(datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        state="scheduled",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    publication = PublicationRecord(
+        production_task_id=task.id,
+        platform="youtube",
+        account_id=account.id,
+        platform_content_id="yt-live-1",
+        title="metrics",
+        desired_privacy="private",
+        current_privacy="private",
+        publish_status="scheduled",
+        scheduled_publish_at=clock.now() - timedelta(hours=1),
+        compliance_disposition="assumed_fair_use",
+    )
+    service_session.add(publication)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="collect_metrics",
+        idempotency_key=f"collect_metrics:{publication.id}:poll:0",
+        payload_json={"publication_id": str(publication.id), "metrics_poll_count": 0},
+        channel_profile_id=channel.id,
+    )
+    service_session.add(item)
+    await service_session.commit()
+    youtube = FakeYouTubeClient(metrics_by_video={"yt-live-1": {"views": 321, "likes": 17, "comments": 4}})
+
+    snapshot = await _service(clock=clock, youtube=youtube).handle_collect_metrics(service_session, item)
+    await service_session.refresh(task)
+
+    assert snapshot is not None
+    assert snapshot.views == 321
+    assert snapshot.likes == 17
+    assert snapshot.comments == 4
+    assert task.state == "measured"
+    collect_items = (
+        await service_session.execute(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "collect_metrics"))
+    ).scalars().all()
+    assert collect_items == [item]
 
 
 @pytest.mark.asyncio
@@ -2488,6 +2911,7 @@ async def test_queue_flow_reaches_scheduled_publication_and_metrics(service_sess
         autoflow_client=FakeAutoFlowClient(include_upload=True, youtube_video_id="yt-video-1"),
         youtube_client=FakeYouTubeClient(),
         minimax_client=FakeMiniMaxClient(),
+        pds_client=FakePDSClient(PDSDecision(decision_id="allow", verdict="allow")),
     )
 
     await service.tick(service_session, channel_id=channel.id)
@@ -2520,7 +2944,11 @@ async def test_queue_flow_reaches_scheduled_publication_and_metrics(service_sess
     }
     await service_session.commit()
     clock.advance(timedelta(hours=2))
+    reconcile_item = await queue.claim_next(service_session, worker_id="test")
+    assert reconcile_item.kind == "reconcile_publication"
+    await service.handle_reconcile_publication(service_session, reconcile_item)
     metrics_item = await queue.claim_next(service_session, worker_id="test")
+    assert metrics_item.kind == "collect_metrics"
     snapshot = await service.handle_collect_metrics(service_session, metrics_item)
 
     await service_session.refresh(publication)

@@ -18,6 +18,7 @@ export type ChannelHealth = {
   active_tasks: number;
   queued_items: number;
   recent_failures: number;
+  last_successful_measured_at: string | null;
   warnings: string[];
 };
 

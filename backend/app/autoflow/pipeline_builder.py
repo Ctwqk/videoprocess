@@ -143,6 +143,7 @@ class PipelineBuilder:
         *,
         input_asset_id: str,
         metadata: AutoFlowMetadata | None = None,
+        publish_mode: str = "preview_only",
     ) -> PipelineDefinition:
         nodes: list[PipelineNode] = [
             PipelineNode(
@@ -212,6 +213,7 @@ class PipelineBuilder:
             metadata=metadata,
         )
         self._append_storyboard_output(nodes, edges, assembly_output, storyboard=storyboard, metadata=metadata)
+        self._append_storyboard_upload(nodes, edges, storyboard=storyboard, metadata=metadata, publish_mode=publish_mode)
         return PipelineDefinition(nodes=nodes, edges=edges)
 
     def build_storyboard_material_library(
@@ -219,6 +221,7 @@ class PipelineBuilder:
         storyboard: StoryboardPlan,
         *,
         metadata: AutoFlowMetadata | None = None,
+        publish_mode: str = "preview_only",
     ) -> PipelineDefinition:
         nodes: list[PipelineNode] = []
         edges: list[PipelineEdge] = []
@@ -252,6 +255,7 @@ class PipelineBuilder:
             metadata=metadata,
         )
         self._append_storyboard_output(nodes, edges, assembly_output, storyboard=storyboard, metadata=metadata)
+        self._append_storyboard_upload(nodes, edges, storyboard=storyboard, metadata=metadata, publish_mode=publish_mode)
         return PipelineDefinition(nodes=nodes, edges=edges)
 
     def _append_storyboard_assembly(
@@ -344,6 +348,48 @@ class PipelineBuilder:
                     targetHandle="input",
                 ),
             ]
+        )
+
+    def _append_storyboard_upload(
+        self,
+        nodes: list[PipelineNode],
+        edges: list[PipelineEdge],
+        *,
+        storyboard: StoryboardPlan,
+        metadata: AutoFlowMetadata | None,
+        publish_mode: str,
+    ) -> None:
+        if publish_mode not in {"private_upload", "unlisted_upload", "public_after_review"}:
+            return
+        title = (metadata.selected_title if metadata else None) or storyboard.title or "Storyboard Preview"
+        description = (metadata.description if metadata else None) or storyboard.description
+        tags = metadata.tags if metadata else storyboard.tags
+        privacy = "unlisted" if publish_mode == "unlisted_upload" else "private"
+        nodes.append(
+            PipelineNode(
+                id="youtube_upload_1",
+                type="youtube_upload",
+                position=self._position(6, 0),
+                data=PipelineNodeData(
+                    label="YouTube Upload",
+                    config={
+                        "title": title,
+                        "description": description,
+                        "privacy": privacy,
+                        "made_for_kids": "not_set",
+                        "tags": ",".join(tags),
+                    },
+                ),
+            )
+        )
+        edges.append(
+            PipelineEdge(
+                id="e-transcode_1-youtube_upload_1",
+                source="transcode_1",
+                target="youtube_upload_1",
+                sourceHandle="output",
+                targetHandle="input",
+            )
         )
 
     def _source_node(

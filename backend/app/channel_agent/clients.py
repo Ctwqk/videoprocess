@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
+from urllib.parse import quote
 
 import httpx
 from sqlalchemy import select
@@ -61,6 +62,9 @@ class AutoFlowClient(Protocol):
     async def observe_job(self, db, *, run_id: str, job_id: str) -> AutoFlowJobObservation:
         ...
 
+    async def approve_plan(self, plan_id: str, *, approved_by: str, evidence: dict[str, Any]) -> None:
+        ...
+
 
 class YouTubeClient(Protocol):
     async def quota_remaining_fraction(self, account) -> float:
@@ -69,7 +73,23 @@ class YouTubeClient(Protocol):
     async def schedule_publish(self, *, video_id: str, scheduled_at: datetime, privacy: str) -> dict[str, Any]:
         ...
 
+    async def fetch_metrics(self, *, video_id: str) -> dict[str, Any]:
+        ...
+
+    async def fetch_status(self, *, video_id: str) -> dict[str, Any]:
+        ...
+
     async def refresh_token(self, account) -> bool:
+        ...
+
+    async def search_videos(
+        self,
+        *,
+        query: str,
+        published_after: datetime,
+        region_code: str,
+        max_results: int,
+    ) -> list[dict[str, Any]]:
         ...
 
 
@@ -128,6 +148,9 @@ class FakeAutoFlowClient:
             status="succeeded",
             youtube={"video_id": self.youtube_video_id},
         )
+
+    async def approve_plan(self, plan_id: str, *, approved_by: str, evidence: dict[str, Any]) -> None:
+        return None
 
 
 class LocalAutoFlowClient:
@@ -254,6 +277,21 @@ class LocalAutoFlowClient:
             youtube=youtube,
         )
 
+    async def approve_plan(self, plan_id: str, *, approved_by: str, evidence: dict[str, Any]) -> None:
+        from app.autoflow.service import autoflow_service
+        from app.db import async_session
+
+        factory = self.session_factory or async_session
+        async with factory() as db:
+            approved = await autoflow_service.approve_internal(
+                plan_id,
+                db=db,
+                approved_by=approved_by,
+                evidence=evidence,
+            )
+            if approved is None:
+                raise ValueError("AutoFlow plan not found")
+
     async def _youtube_from_job(self, db: AsyncSession, job: Job) -> dict[str, Any] | None:
         result = await db.execute(
             select(NodeExecution)
@@ -285,9 +323,18 @@ class LocalAutoFlowClient:
 
 
 class FakeYouTubeClient:
-    def __init__(self, *, quota_remaining_fraction: float = 1.0, token_valid: bool = True):
+    def __init__(
+        self,
+        *,
+        quota_remaining_fraction: float = 1.0,
+        token_valid: bool = True,
+        metrics_by_video: dict[str, dict[str, Any]] | None = None,
+        status_by_video: dict[str, dict[str, Any]] | None = None,
+    ):
         self._quota_remaining_fraction = quota_remaining_fraction
         self.token_valid = token_valid
+        self.metrics_by_video = dict(metrics_by_video or {})
+        self.status_by_video = dict(status_by_video or {})
         self.scheduled: list[dict[str, Any]] = []
 
     async def quota_remaining_fraction(self, account) -> float:
@@ -298,8 +345,105 @@ class FakeYouTubeClient:
         self.scheduled.append(payload)
         return payload
 
+    async def fetch_metrics(self, *, video_id: str) -> dict[str, Any]:
+        return dict(self.metrics_by_video.get(video_id) or {})
+
+    async def fetch_status(self, *, video_id: str) -> dict[str, Any]:
+        return dict(self.status_by_video.get(video_id) or {})
+
     async def refresh_token(self, account) -> bool:
         return self.token_valid
+
+    async def search_videos(
+        self,
+        *,
+        query: str,
+        published_after: datetime,
+        region_code: str,
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        return []
+
+
+class YouTubeManagerClient:
+    def __init__(
+        self,
+        *,
+        base_url: str | None = None,
+        timeout_seconds: float = 20.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        resolved = settings.youtube_manager_url if base_url is None else base_url
+        self.base_url = resolved.rstrip("/")
+        if not self.base_url:
+            raise RuntimeError("YOUTUBE_MANAGER_URL is required for live ChannelOps runner mode")
+        self.timeout_seconds = timeout_seconds
+        self.transport = transport
+
+    async def quota_remaining_fraction(self, account) -> float:
+        payload = await self._get("/api/auth/status")
+        if payload.get("authenticated") is False:
+            return 0.0
+        quota = payload.get("quota_estimate") if isinstance(payload.get("quota_estimate"), dict) else {}
+        limit = _positive_float(quota.get("daily_limit"), default=0.0)
+        remaining = _positive_float(quota.get("estimated_units_remaining"), default=0.0)
+        if limit <= 0:
+            return 1.0
+        return max(0.0, min(1.0, remaining / limit))
+
+    async def schedule_publish(self, *, video_id: str, scheduled_at: datetime, privacy: str) -> dict[str, Any]:
+        return await self._post(
+            f"/api/videos/{quote(video_id, safe='')}/schedule",
+            json={"scheduled_at": scheduled_at.isoformat(), "privacy": privacy},
+        )
+
+    async def fetch_metrics(self, *, video_id: str) -> dict[str, Any]:
+        payload = await self._get(f"/api/videos/{quote(video_id, safe='')}/metrics")
+        metrics = payload.get("metrics")
+        if isinstance(metrics, dict):
+            return dict(metrics)
+        return dict(payload)
+
+    async def fetch_status(self, *, video_id: str) -> dict[str, Any]:
+        return await self._get(f"/api/videos/{quote(video_id, safe='')}/status")
+
+    async def refresh_token(self, account) -> bool:
+        payload = await self._get("/api/auth/status")
+        return bool(payload.get("authenticated"))
+
+    async def search_videos(
+        self,
+        *,
+        query: str,
+        published_after: datetime,
+        region_code: str,
+        max_results: int,
+    ) -> list[dict[str, Any]]:
+        payload = await self._get(
+            "/api/search/youtube",
+            params={
+                "q": query,
+                "published_after": published_after.isoformat(),
+                "region_code": region_code,
+                "max_results": max_results,
+            },
+        )
+        items = payload.get("items") or payload.get("results") or []
+        if not isinstance(items, list):
+            return []
+        return [dict(item) for item in items if isinstance(item, dict)]
+
+    async def _get(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
+            response = await client.get(f"{self.base_url}{path}", params=params)
+            response.raise_for_status()
+            return _dict_response(response)
+
+    async def _post(self, path: str, *, json: dict[str, Any]) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
+            response = await client.post(f"{self.base_url}{path}", json=json)
+            response.raise_for_status()
+            return _dict_response(response)
 
 
 class FakeMiniMaxClient:
@@ -437,6 +581,21 @@ def _youtube_from_media_info(media_info: Any) -> dict[str, Any] | None:
     if not video_id:
         return None
     return dict(youtube)
+
+
+def _dict_response(response: httpx.Response) -> dict[str, Any]:
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("YouTubeManager returned a non-object JSON response")
+    return dict(payload)
+
+
+def _positive_float(value: Any, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _uuid_or_none(value: Any) -> uuid.UUID | None:

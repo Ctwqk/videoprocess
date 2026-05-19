@@ -27,6 +27,7 @@ class ChannelProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     halted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     halt_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     config_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    tick_interval_minutes: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
 
 
 class TopicLane(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -115,7 +116,10 @@ class ChannelOpsQueueItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 class AgentTickAudit(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "agent_tick_audits"
-    __table_args__ = (Index("ix_agent_tick_audits_channel_profile_id", "channel_profile_id"),)
+    __table_args__ = (
+        UniqueConstraint("channel_profile_id", "tick_id", name="uq_agent_tick_audit_channel_tick"),
+        Index("ix_agent_tick_audits_channel_profile_id", "channel_profile_id"),
+    )
 
     channel_profile_id: Mapped[uuid_mod.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("channel_profiles.id", ondelete="CASCADE"), nullable=False
@@ -172,6 +176,8 @@ class ProductionTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     source_platforms_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     material_library_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     uses_external_assets: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    approval_mode: Mapped[str] = mapped_column(String(16), default="agent", nullable=False)
+    agent_approval_evidence_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     autoflow_plan_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     autoflow_run_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     pipeline_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
@@ -190,6 +196,15 @@ class ProductionTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 class MaterialUsageLedger(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "material_usage_ledger"
+    __table_args__ = (
+        Index(
+            "ix_material_usage_channel_lane_segment_used",
+            "channel_profile_id",
+            "topic_lane_id",
+            "segment_signature",
+            "used_at",
+        ),
+    )
 
     material_id: Mapped[str] = mapped_column(String(255), nullable=False)
     asset_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
@@ -253,3 +268,18 @@ class FeedbackSnapshot(UUIDPrimaryKeyMixin, Base):
     impressions: Mapped[int | None] = mapped_column(Integer, nullable=True)
     virality_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     raw_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class InternalSchedulerRun(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "internal_scheduler_runs"
+    __table_args__ = (
+        UniqueConstraint("channel_profile_id", "bucket", name="uq_internal_scheduler_channel_bucket"),
+        Index("ix_internal_scheduler_runs_channel_profile_id", "channel_profile_id"),
+    )
+
+    channel_profile_id: Mapped[uuid_mod.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    bucket: Mapped[str] = mapped_column(String(64), nullable=False)
+    enqueued_queue_item_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    ran_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="succeeded", nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
