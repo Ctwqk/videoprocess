@@ -249,12 +249,20 @@ class ChannelAgentService:
         manual_count_by_lane: dict[str, int] = {}
 
         for seed in seeds:
-            lane = lane_by_id.get(str(seed.topic_lane_id)) if seed.topic_lane_id else fallback_lane
+            explicit_lane_id = str(seed.topic_lane_id) if seed.topic_lane_id else None
+            lane = lane_by_id.get(explicit_lane_id) if explicit_lane_id else fallback_lane
+            pre_rejection = None
+            if explicit_lane_id and lane is None:
+                pre_rejection = {
+                    "guard": "lane_unavailable",
+                    "reason": f"Target topic lane {explicit_lane_id} is disabled, paused, or unavailable.",
+                    "lane_id": explicit_lane_id,
+                }
             lane_key = str(lane.id) if lane is not None else "unassigned"
             lane_formats = lane_formats_by_lane.get(lane_key, [])
             lane_format = lane_formats[0] if lane_formats else None
             account, account_rejection = await self._resolve_candidate_account(db, seed, accounts, claimed_account_ids)
-            if account is not None:
+            if account is not None and pre_rejection is None:
                 claimed_account_ids.add(str(account.id))
             manual_count_by_lane[lane_key] = manual_count_by_lane.get(lane_key, 0) + 1
             source_platforms = _string_list(seed.source_platforms_json) or _string_list(
@@ -264,7 +272,7 @@ class ChannelAgentService:
                 {
                     "candidate_id": _candidate_id(
                         "manual_seed",
-                        lane.id if lane is not None else None,
+                        lane.id if lane is not None else explicit_lane_id,
                         lane_format.id if lane_format is not None else None,
                         bucket,
                         seed_id=seed.id,
@@ -275,6 +283,7 @@ class ChannelAgentService:
                     "lane_format": lane_format,
                     "account": account,
                     "account_rejection": account_rejection,
+                    "pre_rejection": pre_rejection,
                     "prompt": seed.prompt,
                     "title_seed": seed.title_seed,
                     "source_platforms_json": source_platforms,
@@ -448,6 +457,14 @@ class ChannelAgentService:
         *,
         enqueue_alerts: bool,
     ) -> dict[str, Any] | None:
+        pre_rejection = candidate.get("pre_rejection")
+        if isinstance(pre_rejection, dict):
+            return _candidate_rejection(
+                candidate,
+                guard=str(pre_rejection.get("guard") or "candidate_unavailable"),
+                reason=str(pre_rejection.get("reason") or "Candidate is unavailable."),
+            )
+
         account = candidate.get("account")
         if account is None:
             account_rejection = candidate.get("account_rejection")
@@ -1430,12 +1447,16 @@ def _candidate_rejection(candidate: dict[str, Any], *, guard: str, reason: str) 
     lane_format = candidate.get("lane_format")
     account = candidate.get("account")
     account_rejection = candidate.get("account_rejection")
+    pre_rejection = candidate.get("pre_rejection")
     account_id = str(account.id) if account is not None else ""
     if not account_id and isinstance(account_rejection, dict):
         account_id = str(account_rejection.get("account_id") or "")
+    lane_id = str(lane.id) if lane is not None else ""
+    if not lane_id and isinstance(pre_rejection, dict):
+        lane_id = str(pre_rejection.get("lane_id") or "")
     return {
         "candidate_id": candidate["candidate_id"],
-        "lane_id": str(lane.id) if lane is not None else "",
+        "lane_id": lane_id,
         "format_id": str(lane_format.id) if lane_format is not None else "",
         "account_id": account_id,
         "guard": guard,

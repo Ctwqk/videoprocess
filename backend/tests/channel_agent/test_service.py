@@ -470,6 +470,35 @@ async def test_tick_excludes_lane_paused_until_future(service_session):
 
 
 @pytest.mark.asyncio
+async def test_targeted_manual_seed_rejects_paused_lane_without_unassigned_task(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.enabled = False
+    lane.paused_until = clock.now() + timedelta(hours=1)
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="manual blocked by lane pause",
+            title_seed="blocked",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service(clock=clock).tick(service_session, channel_id=channel.id)
+
+    tasks = (await service_session.execute(select(ProductionTask))).scalars().all()
+    queue_items = (await service_session.execute(select(ChannelOpsQueueItem))).scalars().all()
+    rejected = audit.decision_summary_json["rejected_candidates"]
+    assert audit.tasks_selected == 0
+    assert tasks == []
+    assert queue_items == []
+    assert rejected[0]["guard"] == "lane_unavailable"
+    assert rejected[0]["lane_id"] == str(lane.id)
+
+
+@pytest.mark.asyncio
 async def test_targeted_manual_seed_rejects_paused_account_without_fallback(service_session):
     clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)

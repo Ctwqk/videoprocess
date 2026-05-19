@@ -377,16 +377,76 @@ async def test_reject_cancels_queued_promote_and_marks_records_rejected(api_sess
         await api_session.commit()
 
         promote_response = await client.post(f"/api/v1/channel-agent/publications/{publication.id}/promote")
+        metrics_queue = ChannelOpsQueueItem(
+            kind="collect_metrics",
+            idempotency_key=f"collect_metrics:{publication.id}:manual",
+            payload_json={"publication_id": str(publication.id)},
+            channel_profile_id=uuid.UUID(channel["id"]),
+        )
+        api_session.add(metrics_queue)
+        await api_session.commit()
+
         reject_response = await client.post(f"/api/v1/channel-agent/publications/{publication.id}/reject")
         queued = await api_session.get(ChannelOpsQueueItem, uuid.UUID(promote_response.json()["id"]))
+        metrics_queued = await api_session.get(ChannelOpsQueueItem, metrics_queue.id)
         refreshed_task = await api_session.get(ProductionTask, task.id)
 
         assert reject_response.status_code == 200
         assert reject_response.json()["publish_status"] == "rejected"
         assert queued is not None
         assert queued.status == "cancelled"
+        assert metrics_queued is not None
+        assert metrics_queued.status == "cancelled"
         assert refreshed_task is not None
         assert refreshed_task.state == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_reject_scheduled_publication_returns_conflict_without_state_change(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Ops"})).json()
+        account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{channel['id']}/accounts",
+                json={
+                    "account_label": "main",
+                    "platform_account_id": "yt",
+                    "credential_ref": "youtube/main",
+                },
+            )
+        ).json()
+        task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="publication control",
+            state="scheduled",
+            channel_config_snapshot_json={},
+        )
+        api_session.add(task)
+        await api_session.flush()
+        publication = PublicationRecord(
+            production_task_id=task.id,
+            account_id=uuid.UUID(account["id"]),
+            platform_content_id="yt-video-1",
+            title="publication control",
+            desired_privacy="unlisted",
+            current_privacy="private",
+            publish_status="scheduled",
+            scheduled_publish_at=datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc),
+            compliance_disposition="assumed_fair_use",
+        )
+        api_session.add(publication)
+        await api_session.commit()
+
+        response = await client.post(f"/api/v1/channel-agent/publications/{publication.id}/reject")
+        await api_session.refresh(publication)
+        refreshed_task = await api_session.get(ProductionTask, task.id)
+
+        assert response.status_code == 409
+        assert publication.publish_status == "scheduled"
+        assert refreshed_task is not None
+        assert refreshed_task.state == "scheduled"
 
 
 @pytest.mark.asyncio

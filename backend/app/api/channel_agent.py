@@ -430,11 +430,13 @@ async def promote_publication(publication_id: str, db: AsyncSession = Depends(ge
 @router.post("/publications/{publication_id}/reject")
 async def reject_publication(publication_id: str, db: AsyncSession = Depends(get_db)):
     publication, task = await _publication_with_task(db, publication_id)
+    if publication.publish_status not in {"uploaded", "held", "rejected"}:
+        raise HTTPException(status_code=409, detail="Publication cannot be safely rejected from its current state")
     now = datetime.now(timezone.utc)
     publication.publish_status = "rejected"
     task.state = TASK_REJECTED
     task.state_updated_at = now
-    await _cancel_queued_promotes(db, publication.id)
+    await _cancel_queued_publication_items(db, publication.id, kinds={"promote_publication", "collect_metrics"})
     await db.commit()
     await db.refresh(publication)
     return _publication(publication)
@@ -510,10 +512,15 @@ async def _publication_with_task(db: AsyncSession, publication_id: str) -> tuple
     return publication, task
 
 
-async def _cancel_queued_promotes(db: AsyncSession, publication_id: uuid.UUID) -> None:
+async def _cancel_queued_publication_items(
+    db: AsyncSession,
+    publication_id: uuid.UUID,
+    *,
+    kinds: set[str],
+) -> None:
     result = await db.execute(
         select(ChannelOpsQueueItem)
-        .where(ChannelOpsQueueItem.kind == "promote_publication")
+        .where(ChannelOpsQueueItem.kind.in_(sorted(kinds)))
         .where(ChannelOpsQueueItem.status == QUEUE_QUEUED)
     )
     for item in result.scalars().all():
