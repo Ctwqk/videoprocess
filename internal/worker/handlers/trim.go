@@ -10,6 +10,10 @@ type TrimHandler struct {
 	Runner vpffmpeg.Runner
 }
 
+func (h TrimHandler) NodeType() string {
+	return "trim"
+}
+
 func (h TrimHandler) Args(inputPath, outputPath string, config map[string]any) []string {
 	start := stringValue(config["start_time"], "00:00:00")
 	end := stringValue(config["end_time"], "")
