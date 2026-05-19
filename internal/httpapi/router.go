@@ -42,6 +42,8 @@ func NewServerWithOptions(s *store.Store, opts ServerOptions) *Server {
 
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(recoverPanic)
+	r.Use(logRequests)
 	r.Get("/health", s.health)
 	r.Get("/readyz", s.readyz)
 	r.Route("/api/v1", func(r chi.Router) {

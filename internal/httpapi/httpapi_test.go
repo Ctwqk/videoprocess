@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
 )
 
 func TestHealth(t *testing.T) {
@@ -131,5 +133,28 @@ func TestListEndpointsFailClosedWhenStubStoreDisabled(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRecoveryMiddlewareReturnsFastAPIStyleError(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/panic-test", nil)
+	rec := httptest.NewRecorder()
+	r := chi.NewRouter()
+	r.Use(recoverPanic)
+	r.Get("/panic-test", func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})
+
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["detail"] != "internal server error" {
+		t.Fatalf("payload = %#v", payload)
 	}
 }
