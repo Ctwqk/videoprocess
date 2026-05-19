@@ -25,6 +25,7 @@ from app.models.channel_agent import (
     TakedownEvent,
     TopicLane,
 )
+from app.schemas.autoflow import AutoFlowRequest
 
 
 CHANNEL_AGENT_TABLES = (
@@ -129,11 +130,77 @@ def test_autoflow_request_uses_task_snapshot_configuration():
     assert request["duration_sec"] == 60
     assert request["aspect_ratio"] == "16:9"
     assert request["source_platforms"] == ["bilibili", "youtube"]
-    assert request["source_strategy"] == "external_search"
+    assert request["source_strategy"] == "external_research"
     assert request["planning_mode"] == "ai_graph"
     assert request["constraints"]["template_pool_json"] == ["news_remix"]
     assert request["constraints"]["tone"] == "calm"
     assert request["publish_mode"] == "unlisted_upload"
+    AutoFlowRequest.model_validate(request)
+
+
+def test_autoflow_request_falls_back_for_invalid_strategy_and_planning_mode():
+    task = ProductionTask(
+        channel_profile_id=uuid.uuid4(),
+        target_account_id=uuid.uuid4(),
+        source="lane_seed",
+        prompt="Create a tech short",
+        title_seed="AI news",
+        source_platforms_json="youtube",
+        material_library_ids_json="library-1",
+        uses_external_assets=False,
+        channel_config_snapshot_json={
+            "channel": {
+                "id": "channel-1",
+                "default_aspect_ratio": "9:16",
+                "risk_policy_json": {
+                    "source_strategy": "unknown_source",
+                    "planning_mode": "surprise_me",
+                },
+            },
+            "lane_format": {
+                "id": "format-1",
+                "target_duration_sec": -5,
+                "template_pool_json": "news_remix",
+            },
+            "manual_seed": {"constraints_json": "not-a-dict"},
+        },
+    )
+
+    request = _service()._autoflow_request(task)
+
+    assert request["source_strategy"] == "auto"
+    assert request["planning_mode"] == "auto"
+    assert request["source_platforms"] == ["youtube"]
+    assert request["material_library_ids"] == ["library-1"]
+    assert request["duration_sec"] == 30
+    assert request["constraints"]["template_pool_json"] == ["news_remix"]
+    AutoFlowRequest.model_validate(request)
+
+
+def test_autoflow_request_uses_lane_format_platforms_for_source_policy():
+    task = ProductionTask(
+        channel_profile_id=uuid.uuid4(),
+        target_account_id=uuid.uuid4(),
+        source="lane_seed",
+        prompt="Create a tech short",
+        title_seed="AI news",
+        source_platforms_json=[],
+        uses_external_assets=False,
+        channel_config_snapshot_json={
+            "channel": {"id": "channel-1", "default_aspect_ratio": "9:16"},
+            "lane_format": {
+                "id": "format-1",
+                "source_platforms_json": ["bilibili"],
+                "target_duration_sec": 45,
+            },
+        },
+    )
+
+    request = _service()._autoflow_request(task)
+
+    assert request["source_platforms"] == ["bilibili"]
+    assert request["source_policy"] == "remix_with_review"
+    AutoFlowRequest.model_validate(request)
 
 
 def test_desired_privacy_falls_back_to_unlisted_not_public():
@@ -153,6 +220,43 @@ def test_desired_privacy_falls_back_to_unlisted_not_public():
     )
 
     assert _service()._desired_privacy(task, account) == "unlisted"
+
+
+def test_desired_privacy_preserves_private_account_default():
+    task = ProductionTask(
+        channel_profile_id=uuid.uuid4(),
+        target_account_id=uuid.uuid4(),
+        source="lane_seed",
+        prompt="Create a short",
+        channel_config_snapshot_json={"lane_format": {"default_publish_visibility": "public"}},
+    )
+    account = PublishingAccount(
+        channel_profile_id=uuid.uuid4(),
+        account_label="main",
+        platform_account_id="yt",
+        credential_ref="youtube/main",
+        default_privacy="private",
+    )
+
+    assert _service()._desired_privacy(task, account) == "private"
+
+
+def test_autoflow_publish_mode_uses_safe_account_snapshot_default():
+    task = ProductionTask(
+        channel_profile_id=uuid.uuid4(),
+        target_account_id=uuid.uuid4(),
+        source="lane_seed",
+        prompt="Create a short",
+        channel_config_snapshot_json={
+            "account": {"default_privacy": "private"},
+            "lane_format": {"default_publish_visibility": "public"},
+        },
+    )
+
+    request = _service()._autoflow_request(task)
+
+    assert request["publish_mode"] == "private_upload"
+    AutoFlowRequest.model_validate(request)
 
 
 @pytest.mark.asyncio
@@ -206,6 +310,29 @@ async def test_active_tick_creates_task_and_plan_queue_item(service_session):
     ).scalar_one()
     assert queue_item.idempotency_key == f"plan_task:{task.id}"
     assert queue_item.channel_profile_id == channel.id
+
+
+@pytest.mark.asyncio
+async def test_active_tick_stores_lane_format_platforms_when_seed_has_none(service_session):
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    lane_format.source_platforms_json = ["bilibili"]
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="make a test short",
+            title_seed="test short",
+            source_platforms_json=[],
+        )
+    )
+    await service_session.commit()
+
+    await _service().tick(service_session, channel_id=channel.id)
+
+    task = (await service_session.execute(select(ProductionTask))).scalar_one()
+    assert task.source_platforms_json == ["bilibili"]
+    assert task.uses_external_assets is True
 
 
 @pytest.mark.asyncio
@@ -306,6 +433,44 @@ async def test_publish_task_observes_upload_and_auto_enqueues_promote(service_se
     ).scalar_one()
     assert str(publication.id) in promote.idempotency_key
     assert promote.channel_profile_id == channel.id
+
+
+@pytest.mark.asyncio
+async def test_publish_task_holds_when_external_platforms_come_from_snapshot(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(
+        service_session,
+        dry_run=False,
+        external_auto=False,
+    )
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        title_seed="test",
+        source_platforms_json=[],
+        uses_external_assets=False,
+        state="uploaded_private",
+        channel_config_snapshot_json={"lane_format": {"source_platforms_json": ["bilibili"]}},
+    )
+    service_session.add(task)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="publish_task",
+        idempotency_key=f"publish_task:{task.id}",
+        payload_json={"production_task_id": str(task.id), "youtube": {"video_id": "yt-video-1"}},
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    publication = await _service().handle_publish_task(service_session, item)
+    await service_session.refresh(task)
+
+    assert publication is not None
+    assert task.state == "held"
+    assert task.blocked_by_guard == "external_asset_auto_publish_required"
+    assert publication.publish_status == "held"
 
 
 @pytest.mark.asyncio

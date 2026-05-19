@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, get_args
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,6 +43,13 @@ from app.models.channel_agent import (
     TakedownEvent,
     TopicLane,
 )
+from app.schemas.autoflow import AutoFlowRequest, PlanningMode, SourceStrategy
+
+
+_SAFE_PRIVACY_VALUES = {"private", "unlisted"}
+_SOURCE_STRATEGY_ALIASES = {"external_search": "external_research"}
+_ALLOWED_SOURCE_STRATEGIES = set(get_args(SourceStrategy))
+_ALLOWED_PLANNING_MODES = set(get_args(PlanningMode))
 
 
 class ChannelAgentService:
@@ -119,6 +126,10 @@ class ChannelAgentService:
             account = await self._resolve_account(db, seed, accounts)
             lane_id = seed.topic_lane_id or (lanes[0].id if lanes else None)
             lane_format = await self._resolve_lane_format(db, lane_id)
+            source_platforms = _string_list(seed.source_platforms_json) or _string_list(
+                lane_format.source_platforms_json if lane_format else []
+            )
+            material_library_ids = _string_list(seed.material_library_ids_json)
             task = ProductionTask(
                 channel_profile_id=channel.id,
                 topic_lane_id=lane_id,
@@ -129,9 +140,9 @@ class ChannelAgentService:
                 title_seed=seed.title_seed,
                 prompt=seed.prompt,
                 portfolio_bucket="explore",
-                source_platforms_json=list(seed.source_platforms_json or []),
-                material_library_ids_json=list(seed.material_library_ids_json or []),
-                uses_external_assets=bool(seed.source_platforms_json),
+                source_platforms_json=source_platforms,
+                material_library_ids_json=material_library_ids,
+                uses_external_assets=bool(source_platforms),
                 state=TASK_SELECTED,
                 state_updated_at=self.clock.now(),
                 channel_config_version_snapshot=channel.config_version,
@@ -241,7 +252,7 @@ class ChannelAgentService:
             db.add(publication)
             await db.flush()
 
-        if task.uses_external_assets and not account.external_asset_auto_publish:
+        if self._uses_external_assets(task) and not account.external_asset_auto_publish:
             task.state = TASK_HELD
             task.blocked_by_guard = "external_asset_auto_publish_required"
             publication.publish_status = "held"
@@ -458,55 +469,80 @@ class ChannelAgentService:
 
     def _desired_privacy(self, task: ProductionTask, account: PublishingAccount) -> str:
         snapshot_privacy = self._desired_privacy_from_snapshot(task)
-        if snapshot_privacy in {"private", "unlisted"}:
+        if snapshot_privacy is not None:
             return snapshot_privacy
-        account_privacy = str(account.default_privacy or "").lower()
-        if account_privacy in {"private", "unlisted"}:
+        account_privacy = _safe_privacy(account.default_privacy)
+        if account_privacy is not None:
             return account_privacy
         return "unlisted"
 
-    def _desired_privacy_from_snapshot(self, task: ProductionTask) -> str:
-        snapshot = dict(task.channel_config_snapshot_json or {})
-        lane_format = dict(snapshot.get("lane_format") or {})
-        desired = str(lane_format.get("default_publish_visibility") or "").lower()
-        if desired in {"private", "unlisted"}:
-            return desired
-        return "unlisted"
+    def _desired_privacy_from_snapshot(self, task: ProductionTask) -> str | None:
+        snapshot = _dict_value(task.channel_config_snapshot_json)
+        lane_format = _dict_value(snapshot.get("lane_format"))
+        return _safe_privacy(lane_format.get("default_publish_visibility"))
 
     def _autoflow_request(self, task: ProductionTask) -> dict[str, Any]:
-        snapshot = dict(task.channel_config_snapshot_json or {})
-        channel = dict(snapshot.get("channel") or {})
-        lane_format = dict(snapshot.get("lane_format") or {})
-        manual_seed = dict(snapshot.get("manual_seed") or {})
-        lane = dict(snapshot.get("lane") or {})
-        risk_policy = dict(channel.get("risk_policy_json") or {})
+        snapshot = _dict_value(task.channel_config_snapshot_json)
+        channel = _dict_value(snapshot.get("channel"))
+        lane_format = _dict_value(snapshot.get("lane_format"))
+        manual_seed = _dict_value(snapshot.get("manual_seed"))
+        lane = _dict_value(snapshot.get("lane"))
+        risk_policy = _dict_value(channel.get("risk_policy_json"))
+        manual_seed_constraints = _dict_value(manual_seed.get("constraints_json"))
         constraints = {
             "lane_id": lane.get("id"),
             "lane_format_id": lane_format.get("id"),
-            "template_pool_json": list(lane_format.get("template_pool_json") or []),
+            "template_pool_json": _string_list(lane_format.get("template_pool_json")),
         }
-        constraints.update(dict(manual_seed.get("constraints_json") or {}))
+        constraints.update(manual_seed_constraints)
 
-        source_platforms = list(task.source_platforms_json or lane_format.get("source_platforms_json") or [])
-        return {
+        source_platforms = self._effective_source_platforms(task)
+        request = {
             "prompt": task.prompt,
             "target_platforms": ["youtube"],
             "source_platforms": source_platforms,
-            "duration_sec": int(lane_format.get("target_duration_sec") or 30),
+            "duration_sec": _positive_int(lane_format.get("target_duration_sec"), default=30),
             "aspect_ratio": str(channel.get("default_aspect_ratio") or "9:16"),
-            "source_policy": "remix_with_review" if task.uses_external_assets else "owned_only",
+            "source_policy": "remix_with_review" if self._uses_external_assets(task) else "owned_only",
             "publish_mode": self._autoflow_publish_mode(task),
-            "material_library_ids": list(task.material_library_ids_json or []),
-            "source_strategy": str(manual_seed.get("source_strategy") or risk_policy.get("source_strategy") or "auto"),
-            "planning_mode": str(manual_seed.get("planning_mode") or risk_policy.get("planning_mode") or "auto"),
+            "material_library_ids": _string_list(task.material_library_ids_json),
+            "source_strategy": _normalize_source_strategy(
+                manual_seed.get("source_strategy")
+                or manual_seed_constraints.get("source_strategy")
+                or risk_policy.get("source_strategy")
+            ),
+            "planning_mode": _normalize_planning_mode(
+                manual_seed.get("planning_mode")
+                or manual_seed_constraints.get("planning_mode")
+                or risk_policy.get("planning_mode")
+            ),
             "constraints": constraints,
         }
+        validated = AutoFlowRequest.model_validate(request)
+        return validated.model_dump(include=set(request))
 
     def _autoflow_publish_mode(self, task: ProductionTask) -> str:
-        privacy = self._desired_privacy_from_snapshot(task)
+        privacy = (
+            self._desired_privacy_from_snapshot(task)
+            or self._account_default_privacy_from_snapshot(task)
+            or "unlisted"
+        )
         if privacy == "unlisted":
             return "unlisted_upload"
         return "private_upload"
+
+    def _account_default_privacy_from_snapshot(self, task: ProductionTask) -> str | None:
+        snapshot = _dict_value(task.channel_config_snapshot_json)
+        account = _dict_value(snapshot.get("account"))
+        return _safe_privacy(account.get("default_privacy"))
+
+    def _effective_source_platforms(self, task: ProductionTask) -> list[str]:
+        snapshot = _dict_value(task.channel_config_snapshot_json)
+        lane_format = _dict_value(snapshot.get("lane_format"))
+        return _string_list(task.source_platforms_json) or _string_list(lane_format.get("source_platforms_json"))
+
+    def _uses_external_assets(self, task: ProductionTask) -> bool:
+        return bool(task.uses_external_assets) or bool(self._effective_source_platforms(task))
 
 
 def _snapshot(
@@ -538,12 +574,12 @@ def _snapshot(
             "format_key": lane_format.format_key if lane_format else "",
             "default_publish_visibility": lane_format.default_publish_visibility if lane_format else "private",
             "target_duration_sec": lane_format.target_duration_sec if lane_format else 30,
-            "template_pool_json": list(lane_format.template_pool_json or []) if lane_format else [],
-            "source_platforms_json": list(lane_format.source_platforms_json or []) if lane_format else [],
+            "template_pool_json": _string_list(lane_format.template_pool_json) if lane_format else [],
+            "source_platforms_json": _string_list(lane_format.source_platforms_json) if lane_format else [],
         },
     }
     if manual_seed is not None:
-        snapshot["manual_seed"] = {"constraints_json": dict(manual_seed.constraints_json or {})}
+        snapshot["manual_seed"] = {"constraints_json": _dict_value(manual_seed.constraints_json)}
     return snapshot
 
 
@@ -567,3 +603,57 @@ def _parse_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _dict_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return [cleaned] if cleaned else []
+    if isinstance(value, (list, tuple, set)):
+        cleaned_items = []
+        for item in value:
+            if item is None:
+                continue
+            cleaned = str(item).strip()
+            if cleaned:
+                cleaned_items.append(cleaned)
+        return cleaned_items
+    return []
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _safe_privacy(value: Any) -> str | None:
+    desired = str(value or "").strip().lower()
+    if desired in _SAFE_PRIVACY_VALUES:
+        return desired
+    return None
+
+
+def _normalize_source_strategy(value: Any) -> str:
+    requested = str(value or "auto").strip().lower()
+    normalized = _SOURCE_STRATEGY_ALIASES.get(requested, requested)
+    if normalized in _ALLOWED_SOURCE_STRATEGIES:
+        return normalized
+    return "auto"
+
+
+def _normalize_planning_mode(value: Any) -> str:
+    requested = str(value or "auto").strip().lower()
+    if requested in _ALLOWED_PLANNING_MODES:
+        return requested
+    return "auto"
