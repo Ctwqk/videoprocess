@@ -1086,6 +1086,8 @@ class ChannelAgentService:
         payload = dict(item.payload_json or {})
         metrics = _dict_value(payload.get("metrics"))
         task = await db.get(ProductionTask, publication.production_task_id)
+        if publication.publish_status == "rejected" or (task is not None and task.state == TASK_REJECTED):
+            return None
         if not _has_real_metrics(metrics):
             poll_count = _nonnegative_int(payload.get("metrics_poll_count"), default=0)
             next_count = poll_count + 1

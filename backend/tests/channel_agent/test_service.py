@@ -1849,6 +1849,57 @@ async def test_collect_metrics_max_poll_count_holds_without_snapshot_or_requeue(
 
 
 @pytest.mark.asyncio
+async def test_collect_metrics_ignores_rejected_publication_without_snapshot_or_requeue(service_session):
+    clock = FakeClock(datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        state="rejected",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    publication = _publication_for_task(
+        task,
+        account,
+        publish_status="rejected",
+        scheduled_publish_at=clock.now() - timedelta(days=1),
+    )
+    service_session.add(publication)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="collect_metrics",
+        idempotency_key=f"collect_metrics:{publication.id}:poll:0",
+        payload_json={
+            "publication_id": str(publication.id),
+            "metrics_poll_count": 0,
+            "metrics": {"views": 100, "likes": 10},
+        },
+        channel_profile_id=channel.id,
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    snapshot = await _service(clock=clock).handle_collect_metrics(service_session, item)
+    await service_session.refresh(task)
+    await service_session.refresh(publication)
+
+    assert snapshot is None
+    assert task.state == "rejected"
+    assert publication.publish_status == "rejected"
+    snapshots = (await service_session.execute(select(FeedbackSnapshot))).scalars().all()
+    assert snapshots == []
+    collect_items = (
+        await service_session.execute(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "collect_metrics"))
+    ).scalars().all()
+    assert collect_items == [item]
+
+
+@pytest.mark.asyncio
 async def test_quota_exhaustion_holds_publish_and_alerts(service_session):
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
     task = ProductionTask(
