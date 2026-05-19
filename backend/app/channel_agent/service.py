@@ -127,7 +127,7 @@ class ChannelAgentService:
         ).scalars().all()
 
         lane_formats_by_lane = await self._lane_formats_by_lane(db, lanes)
-        candidates = await self._build_tick_candidates(
+        manual_candidates = await self._build_tick_candidates(
             db,
             channel=channel,
             lanes=lanes,
@@ -137,11 +137,42 @@ class ChannelAgentService:
             bucket=bucket,
         )
         side_effects_disabled = bool(channel.dry_run or channel.halted_at is not None)
-        accepted_candidates, rejected_candidates = await self._evaluate_tick_candidates(
+        (
+            accepted_manual_candidates,
+            rejected_manual_candidates,
+            selected_account_counts,
+            selected_lane_counts,
+        ) = await self._evaluate_tick_candidates(
             db,
-            candidates,
+            manual_candidates,
             enqueue_alerts=not side_effects_disabled,
         )
+        lane_candidates = await self._build_lane_driven_candidates(
+            db,
+            channel=channel,
+            lanes=lanes,
+            accounts=accounts,
+            lane_formats_by_lane=lane_formats_by_lane,
+            bucket=bucket,
+            selected_lane_counts=selected_lane_counts,
+            claimed_account_ids=set(selected_account_counts),
+            suppressed_lane_ids=_suppressed_lane_ids_from_manual_rejections(rejected_manual_candidates),
+        )
+        (
+            accepted_lane_candidates,
+            rejected_lane_candidates,
+            _selected_account_counts,
+            _selected_lane_counts,
+        ) = await self._evaluate_tick_candidates(
+            db,
+            lane_candidates,
+            enqueue_alerts=not side_effects_disabled,
+            initial_account_counts=selected_account_counts,
+            initial_lane_counts=selected_lane_counts,
+        )
+        candidates = [*manual_candidates, *lane_candidates]
+        accepted_candidates = [*accepted_manual_candidates, *accepted_lane_candidates]
+        rejected_candidates = [*rejected_manual_candidates, *rejected_lane_candidates]
         per_lane = _per_lane_counts(lanes, candidates)
         low_supply_alerts = await self._maybe_alert_low_supply(
             db,
@@ -246,7 +277,6 @@ class ChannelAgentService:
         lane_by_id = {str(lane.id): lane for lane in lanes}
         fallback_lane = lanes[0] if lanes else None
         claimed_account_ids: set[str] = set()
-        manual_count_by_lane: dict[str, int] = {}
 
         for seed in seeds:
             explicit_lane_id = str(seed.topic_lane_id) if seed.topic_lane_id else None
@@ -264,7 +294,6 @@ class ChannelAgentService:
             account, account_rejection = await self._resolve_candidate_account(db, seed, accounts, claimed_account_ids)
             if account is not None and pre_rejection is None:
                 claimed_account_ids.add(str(account.id))
-            manual_count_by_lane[lane_key] = manual_count_by_lane.get(lane_key, 0) + 1
             source_platforms = _string_list(seed.source_platforms_json) or _string_list(
                 lane_format.source_platforms_json if lane_format else []
             )
@@ -292,10 +321,28 @@ class ChannelAgentService:
                 }
             )
 
+        return candidates
+
+    async def _build_lane_driven_candidates(
+        self,
+        db: AsyncSession,
+        *,
+        channel: ChannelProfile,
+        lanes: list[TopicLane],
+        accounts: list[PublishingAccount],
+        lane_formats_by_lane: dict[str, list[LaneFormatMatrix]],
+        bucket: str,
+        selected_lane_counts: dict[str, int],
+        claimed_account_ids: set[str],
+        suppressed_lane_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
         for lane in lanes:
             lane_key = str(lane.id)
+            if lane_key in suppressed_lane_ids:
+                continue
             lane_budget = max(_positive_int(lane.max_posts_per_day, default=1), 1)
-            remaining = lane_budget - manual_count_by_lane.get(lane_key, 0)
+            remaining = lane_budget - selected_lane_counts.get(lane_key, 0)
             if remaining <= 0:
                 continue
 
@@ -429,11 +476,13 @@ class ChannelAgentService:
         candidates: list[dict[str, Any]],
         *,
         enqueue_alerts: bool,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        initial_account_counts: dict[str, int] | None = None,
+        initial_lane_counts: dict[str, int] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int], dict[str, int]]:
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
-        selected_account_counts: dict[str, int] = {}
-        selected_lane_counts: dict[str, int] = {}
+        selected_account_counts: dict[str, int] = dict(initial_account_counts or {})
+        selected_lane_counts: dict[str, int] = dict(initial_lane_counts or {})
         for candidate in candidates:
             rejection = await self._evaluate_candidate_guards(
                 db,
@@ -452,7 +501,7 @@ class ChannelAgentService:
             if lane is not None:
                 lane_id = str(lane.id)
                 selected_lane_counts[lane_id] = selected_lane_counts.get(lane_id, 0) + 1
-        return accepted, rejected
+        return accepted, rejected, selected_account_counts, selected_lane_counts
 
     async def _evaluate_candidate_guards(
         self,
@@ -893,7 +942,7 @@ class ChannelAgentService:
 
         if status in {"pending", "running", "queued", "waiting_window", "validating", "planning"}:
             next_count = observe_count + 1
-            delay_seconds = min(30 * 2 ** max(0, observe_count - 1), 300)
+            delay_seconds = min(30 * 2 ** observe_count, 300)
             await self.queue.enqueue(
                 db,
                 kind="observe_job",
@@ -1125,21 +1174,23 @@ class ChannelAgentService:
             await db.commit()
             return None
 
-        snapshot = FeedbackSnapshot(
-            publication_id=publication.id,
-            collected_at=self.clock.now(),
-            views=_nonnegative_int(metrics.get("views"), default=0),
-            likes=_nonnegative_int(metrics.get("likes"), default=0),
-            comments=_nonnegative_int(metrics.get("comments"), default=0),
-            shares=_nonnegative_int(metrics.get("shares"), default=0),
-            avg_view_duration_sec=_nonnegative_float(metrics.get("avg_view_duration_sec"), default=0.0),
-            retention_curve_json=_list_value(metrics.get("retention_curve_json") or metrics.get("retention_curve")),
-            ctr=_optional_float(metrics.get("ctr")),
-            impressions=_optional_int(metrics.get("impressions")),
-            virality_score=_nonnegative_float(metrics.get("virality_score"), default=0.0),
-            raw_json=payload,
+        snapshot = await self._feedback_snapshot_for_publication(db, publication)
+        if snapshot is None:
+            snapshot = FeedbackSnapshot(publication_id=publication.id)
+            db.add(snapshot)
+        snapshot.collected_at = self.clock.now()
+        snapshot.views = _nonnegative_int(metrics.get("views"), default=0)
+        snapshot.likes = _nonnegative_int(metrics.get("likes"), default=0)
+        snapshot.comments = _nonnegative_int(metrics.get("comments"), default=0)
+        snapshot.shares = _nonnegative_int(metrics.get("shares"), default=0)
+        snapshot.avg_view_duration_sec = _nonnegative_float(metrics.get("avg_view_duration_sec"), default=0.0)
+        snapshot.retention_curve_json = _list_value(
+            metrics.get("retention_curve_json") or metrics.get("retention_curve")
         )
-        db.add(snapshot)
+        snapshot.ctr = _optional_float(metrics.get("ctr"))
+        snapshot.impressions = _optional_int(metrics.get("impressions"))
+        snapshot.virality_score = _nonnegative_float(metrics.get("virality_score"), default=0.0)
+        snapshot.raw_json = payload
         publication.last_metrics_polled_at = self.clock.now()
 
         if task is not None:
@@ -1320,6 +1371,18 @@ class ChannelAgentService:
         result = await db.execute(select(PublicationRecord).where(PublicationRecord.production_task_id == task.id))
         return result.scalar_one_or_none()
 
+    async def _feedback_snapshot_for_publication(
+        self,
+        db: AsyncSession,
+        publication: PublicationRecord,
+    ) -> FeedbackSnapshot | None:
+        result = await db.execute(
+            select(FeedbackSnapshot)
+            .where(FeedbackSnapshot.publication_id == publication.id)
+            .order_by(FeedbackSnapshot.collected_at.desc())
+        )
+        return result.scalars().first()
+
     def _desired_privacy(self, task: ProductionTask, account: PublishingAccount) -> str:
         snapshot_privacy = self._desired_privacy_from_snapshot(task)
         if snapshot_privacy is not None:
@@ -1448,6 +1511,14 @@ def _per_lane_counts(lanes: list[TopicLane], candidates: list[dict[str, Any]]) -
         lane_id = str(lane.id) if lane is not None else "unassigned"
         per_lane[lane_id] = per_lane.get(lane_id, 0) + 1
     return per_lane
+
+
+def _suppressed_lane_ids_from_manual_rejections(rejected_candidates: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(candidate.get("lane_id"))
+        for candidate in rejected_candidates
+        if candidate.get("guard") in {"account_unavailable", "lane_unavailable"} and candidate.get("lane_id")
+    }
 
 
 def _candidate_rejection(candidate: dict[str, Any], *, guard: str, reason: str) -> dict[str, Any]:

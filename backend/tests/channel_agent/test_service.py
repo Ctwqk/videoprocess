@@ -598,6 +598,56 @@ async def test_manual_seed_consumes_first_then_lane_driven_fills_budget(service_
 
 
 @pytest.mark.asyncio
+async def test_rejected_manual_seed_does_not_consume_lane_driven_budget(service_session):
+    channel, lane, busy_account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.max_posts_per_day = 1
+    free_account = PublishingAccount(
+        channel_profile_id=channel.id,
+        account_label="free",
+        platform_account_id="yt-free",
+        credential_ref="youtube/free",
+        external_asset_auto_publish=True,
+    )
+    service_session.add(free_account)
+    service_session.add(
+        ProductionTask(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=busy_account.id,
+            source="manual_seed",
+            prompt="busy account task",
+            state="held",
+            channel_config_snapshot_json={},
+        )
+    )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=busy_account.id,
+            prompt="manual that will be rejected",
+            title_seed="manual rejected",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=channel.id)
+    created_tasks = (
+        await service_session.execute(
+            select(ProductionTask)
+            .where(ProductionTask.channel_profile_id == channel.id)
+            .where(ProductionTask.prompt != "busy account task")
+        )
+    ).scalars().all()
+    rejected = audit.decision_summary_json["rejected_candidates"]
+
+    assert audit.tasks_selected == 1
+    assert [task.source for task in created_tasks] == ["lane_seed"]
+    assert created_tasks[0].target_account_id == free_account.id
+    assert rejected[0]["guard"] == "account_concurrency"
+
+
+@pytest.mark.asyncio
 async def test_dry_run_evaluates_candidates_without_creating_tasks_or_queue(service_session):
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=True)
     service_session.add(
@@ -1609,6 +1659,52 @@ async def test_observe_job_max_count_holds_without_requeue(service_session):
 
 
 @pytest.mark.asyncio
+async def test_observe_job_backoff_uses_observe_count_multiplier(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    run_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        title_seed="test",
+        state="producing",
+        autoflow_run_id=run_id,
+        job_id=job_id,
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="observe_job",
+        idempotency_key=f"observe_job:{task.id}:{run_id}:{job_id}:1",
+        payload_json={
+            "production_task_id": str(task.id),
+            "run_id": str(run_id),
+            "job_id": str(job_id),
+            "observe_count": 1,
+        },
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    await _service(clock=clock, autoflow=AlwaysRunningAutoFlowClient()).handle_observe_job(service_session, item)
+
+    requeued = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem)
+            .where(ChannelOpsQueueItem.kind == "observe_job")
+            .where(ChannelOpsQueueItem.id != item.id)
+        )
+    ).scalar_one()
+    assert requeued.payload_json["observe_count"] == 2
+    assert _as_utc(requeued.run_after) == clock.now() + timedelta(seconds=60)
+
+
+@pytest.mark.asyncio
 async def test_publish_task_observes_upload_and_auto_enqueues_promote(service_session):
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
     task = ProductionTask(
@@ -1935,6 +2031,63 @@ async def test_collect_metrics_ignores_rejected_publication_without_snapshot_or_
         await service_session.execute(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "collect_metrics"))
     ).scalars().all()
     assert collect_items == [item]
+
+
+@pytest.mark.asyncio
+async def test_collect_metrics_updates_existing_publication_snapshot(service_session):
+    clock = FakeClock(datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        state="scheduled",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    publication = _publication_for_task(
+        task,
+        account,
+        publish_status="scheduled",
+        scheduled_publish_at=clock.now() - timedelta(hours=1),
+    )
+    service_session.add(publication)
+    await service_session.flush()
+    existing = FeedbackSnapshot(
+        publication_id=publication.id,
+        collected_at=clock.now() - timedelta(hours=1),
+        views=10,
+        likes=1,
+        raw_json={"publication_id": str(publication.id), "metrics": {"views": 10}},
+    )
+    service_session.add(existing)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="collect_metrics",
+        idempotency_key=f"collect_metrics:{publication.id}:poll:1",
+        payload_json={
+            "publication_id": str(publication.id),
+            "metrics_poll_count": 1,
+            "metrics": {"views": 125, "likes": 12, "avg_view_duration_sec": 9.5},
+        },
+        channel_profile_id=channel.id,
+    )
+    service_session.add(item)
+    await service_session.commit()
+
+    snapshot = await _service(clock=clock).handle_collect_metrics(service_session, item)
+
+    snapshots = (await service_session.execute(select(FeedbackSnapshot))).scalars().all()
+    assert snapshot is not None
+    assert snapshot.id == existing.id
+    assert len(snapshots) == 1
+    assert snapshots[0].views == 125
+    assert snapshots[0].likes == 12
+    assert snapshots[0].avg_view_duration_sec == 9.5
+    assert _as_utc(snapshots[0].collected_at) == clock.now()
 
 
 @pytest.mark.asyncio
