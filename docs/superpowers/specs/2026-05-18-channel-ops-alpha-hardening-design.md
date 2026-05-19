@@ -135,10 +135,14 @@ id can be found, the task must be held with
 `handle_observe_job`:
 
 - Reads task run/job identifiers.
-- If running, re-enqueues itself with backoff.
+- If running, re-enqueues itself with backoff. Backoff parameters: base
+  30 seconds, multiplier `2 ** observe_count`, capped at 5 minutes. Track
+  `observe_count` in `payload_json` so each requeue advances the wait.
 - If failed, marks task failed and records failure.
 - If succeeded with `youtube.video_id`, enqueues
-  `publish_task:<production_task_id>`.
+  `publish_task:<production_task_id>` and writes the observed
+  `youtube` block into the publish_task payload so `handle_publish_task`
+  does not need to re-read job artifacts.
 - If succeeded without upload observation, marks task held with
   `missing_youtube_observation`.
 
@@ -195,6 +199,16 @@ Lane-driven task defaults:
   `ChannelProfile.risk_policy_json.default_source_platforms`.
 - If neither is configured, use `["youtube"]`.
 - Publication compliance defaults to `known_risk_accepted`.
+
+`target_account_id` resolution for lane-driven candidates:
+
+- If the channel has exactly one enabled `PublishingAccount`, use that account.
+- If the channel has multiple enabled accounts, alpha picks the first by
+  `created_at` ascending. Round-robin or load-aware routing is deferred and
+  listed in §13.
+- If the channel has zero enabled accounts, the candidate is rejected with
+  guard reason `no_enabled_account` and recorded in `rejected_candidates`.
+  Lane-driven generation must not raise.
 
 `LaneFormatMatrix` must gain:
 
@@ -268,6 +282,13 @@ Terminal/inactive states:
 the agent can keep filling the same account with work while a prior task is
 blocked.
 
+Consequence: on a channel with multiple lanes but only one enabled account,
+this guard serializes lane-driven candidates across the account. Within a
+single tick at most one lane will produce a new task; subsequent lanes will be
+rejected with `account_concurrency`. This is intentional for alpha. Multi-lane
+parallelism on shared accounts is part of the multi-account routing deferred
+in §13.
+
 ### 6.2 ConsecutiveUploadFailureGuard
 
 This guard uses a window, not a lifetime cumulative count.
@@ -330,6 +351,10 @@ Required fields:
   `auto`.
 - `planning_mode`: from manual seed constraints or channel defaults, fallback
   `auto`.
+- `publish_mode`: alpha default `private_upload`. Lane/account configuration
+  may opt into `public_after_review` when `external_asset_auto_publish=true`
+  on the account. Never hard-code `public` at the AutoFlow request layer; that
+  decision belongs to the promote step.
 - `material_library_ids`: from task/manual seed.
 - `source_platforms`: from manual seed or lane format source platforms.
 - `constraints`: include `template_pool_json`, `lane_id`, `lane_format_id`,
@@ -339,10 +364,15 @@ Do not hard-code `duration_sec=None` or `aspect_ratio="9:16"`.
 
 Privacy must fail safe:
 
-- Default upload privacy is `private` or `unlisted`.
+- `PublicationRecord.current_privacy` always starts as `private` until the
+  promote step runs.
+- `PublicationRecord.desired_privacy` is the target visibility the promote
+  step will apply. Its fallback when no lane/account/format config is found
+  must be `unlisted`, not `public`. `_desired_privacy()` must encode this
+  fallback explicitly.
 - If lane/account configuration asks for public visibility, the publish step
   must still go through promotion/public approval rules.
-- Missing config must not fall back to `public`.
+- Missing config must never resolve to `public` anywhere in the chain.
 
 ## 8. Queue Hardening
 
@@ -350,22 +380,17 @@ Privacy must fail safe:
 
 Add nullable `channel_profile_id` to `ChannelOpsQueueItem` with an index.
 
-All queue enqueue calls that relate to a channel must fill the field:
+All alpha queue kinds must fill `channel_profile_id`. Every kind in scope for
+this pass has a channel context: `agent_tick`, `plan_task`, `execute_task`,
+`observe_job`, `publish_task`, `promote_publication`, `collect_metrics`,
+`account_health`, and `send_alert` (alert resource is always derivable to a
+channel for the four alpha alert types). The field is left nullable on the
+column only so legacy rows from before this migration can stay claimable; new
+code must always populate it.
 
-- `agent_tick`
-- `plan_task`
-- `execute_task`
-- `observe_job`
-- `publish_task`
-- `promote_publication`
-- `collect_metrics`
-- `account_health`
-- `send_alert` when the alert has channel context
-
-Channel dashboard endpoints must filter by `channel_profile_id`.
-
-Legacy/null queue rows must not appear in `/channels/{id}/queue` or health
-counts. They may remain claimable by the runner if otherwise valid.
+Channel dashboard endpoints must filter by `channel_profile_id`. Legacy/null
+queue rows must not appear in `/channels/{id}/queue` or health counts. They
+may remain claimable by the runner if otherwise valid.
 
 ### 8.2 Enqueue Race Handling
 
@@ -418,20 +443,33 @@ Inputs:
 - `ProductionTask` rows for the channel created or updated in the window.
 - `PublicationRecord` rows joined through `ProductionTask`.
 
-Required output keys:
+Source data for each key (alpha implementation; all counts scoped to the
+channel and the window `created_at >= now() - days`):
+
+- `seeded`: count of `ManualSeed` rows with `status='active'` in the window
+  plus `ProductionTask` rows currently in state `seeded`.
+- `selected`, `planning`, `producing`, `uploaded_private`, `scheduled`,
+  `published`, `measured`, `failed`, `held`: count of `ProductionTask` rows
+  whose **current** `state` equals that bucket. The funnel reports current
+  state distribution, not lifetime transitions. Transition history is
+  available per task via `transition_history_json` for deeper analysis.
+
+Required output keys (renamed to match `ProductionTask.state` exactly so the
+backend SQL is a single `GROUP BY state` query):
 
 - `seeded`
 - `selected`
-- `planned`
+- `planning`
 - `producing`
-- `uploaded`
+- `uploaded_private`
 - `scheduled`
 - `published`
 - `measured`
 - `failed`
 - `held`
 
-The endpoint must not return hard-coded zeros.
+The endpoint must not return hard-coded zeros. Frontend display labels can
+remap `uploaded_private -> uploaded` and `planning -> planned` for brevity.
 
 ## 11. Alert Strategy
 
