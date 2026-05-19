@@ -596,6 +596,14 @@ async def test_ticks_and_funnel_return_real_data(api_session):
             state="selected",
             channel_config_snapshot_json={},
         )
+        seeded_task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=account.id,
+            source="manual_seed",
+            prompt="seeded",
+            state="seeded",
+            channel_config_snapshot_json={},
+        )
         scheduled_task = ProductionTask(
             channel_profile_id=uuid.UUID(channel["id"]),
             target_account_id=account.id,
@@ -620,7 +628,7 @@ async def test_ticks_and_funnel_return_real_data(api_session):
             state="surprise",
             channel_config_snapshot_json={},
         )
-        api_session.add_all([selected_task, scheduled_task, rejected_task, unknown_task])
+        api_session.add_all([selected_task, seeded_task, scheduled_task, rejected_task, unknown_task])
         await api_session.commit()
 
         ticks = (await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/ticks")).json()
@@ -640,7 +648,7 @@ async def test_ticks_and_funnel_return_real_data(api_session):
         assert "cancelled" in funnel
         assert "other" in funnel
         assert funnel["selected"] >= 1
-        assert funnel["seeded"] >= 1
+        assert funnel["seeded"] == 2
         assert funnel["scheduled"] >= 1
         assert funnel["rejected"] >= 1
         assert funnel["other"] >= 1
@@ -652,6 +660,12 @@ async def test_channel_prefixed_patch_routes_reject_cross_channel_children(api_s
         first = (await client.post("/api/v1/channel-agent/channels", json={"name": "A"})).json()
         second = (await client.post("/api/v1/channel-agent/channels", json={"name": "B"})).json()
         first_lane = (await client.post(f"/api/v1/channel-agent/channels/{first['id']}/lanes", json={"name": "A lane"})).json()
+        first_format = (
+            await client.post(
+                f"/api/v1/channel-agent/lanes/{first_lane['id']}/formats",
+                json={"format_key": "shorts_9x16"},
+            )
+        ).json()
         first_account = (
             await client.post(
                 f"/api/v1/channel-agent/channels/{first['id']}/accounts",
@@ -671,6 +685,23 @@ async def test_channel_prefixed_patch_routes_reject_cross_channel_children(api_s
             f"/api/v1/channel-agent/channels/{second['id']}/accounts/{first_account['id']}",
             json={"account_label": "wrong channel"},
         )
+        format_response = await client.patch(
+            f"/api/v1/channel-agent/channels/{second['id']}/lanes/{first_lane['id']}/formats/{first_format['id']}",
+            json={"format_key": "wrong_channel"},
+        )
+        unscoped_format_response = await client.patch(
+            f"/api/v1/channel-agent/lane-formats/{first_format['id']}",
+            json={"format_key": "unscoped"},
+        )
+        scoped_format_response = await client.patch(
+            f"/api/v1/channel-agent/channels/{first['id']}/lanes/{first_lane['id']}/formats/{first_format['id']}",
+            json={"format_key": "longform_16x9", "source_platforms_json": ["youtube", "bilibili"]},
+        )
 
         assert lane_response.status_code == 404
         assert account_response.status_code == 404
+        assert format_response.status_code == 404
+        assert unscoped_format_response.status_code == 410
+        assert scoped_format_response.status_code == 200
+        assert scoped_format_response.json()["format_key"] == "longform_16x9"
+        assert scoped_format_response.json()["source_platforms_json"] == ["youtube", "bilibili"]

@@ -16,6 +16,7 @@ from app.channel_agent.constants import (
     QUEUE_QUEUED,
     TASK_HELD,
     TASK_REJECTED,
+    TASK_SEEDED,
     TASK_UPLOADED_PRIVATE,
 )
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
@@ -188,9 +189,28 @@ async def create_lane_format(lane_id: str, data: LaneFormatCreate, db: AsyncSess
 
 @router.patch("/lane-formats/{lane_format_id}")
 async def patch_lane_format(lane_format_id: str, data: dict[str, Any], db: AsyncSession = Depends(get_db)):
-    row = await db.get(LaneFormatMatrix, _uuid(lane_format_id))
-    if row is None:
-        raise HTTPException(status_code=404, detail="Lane format not found")
+    raise HTTPException(
+        status_code=410,
+        detail="Use /channels/{channel_id}/lanes/{lane_id}/formats/{lane_format_id}",
+    )
+
+
+@router.patch("/channels/{channel_id}/lanes/{lane_id}/formats/{lane_format_id}")
+async def patch_channel_lane_format(
+    channel_id: str,
+    lane_id: str,
+    lane_format_id: str,
+    data: dict[str, Any],
+    db: AsyncSession = Depends(get_db),
+):
+    row = await _lane_format_for_channel(db, channel_id, lane_id, lane_format_id)
+    _apply_lane_format_patch(row, data)
+    await db.commit()
+    await db.refresh(row)
+    return _lane_format(row)
+
+
+def _apply_lane_format_patch(row: LaneFormatMatrix, data: dict[str, Any]) -> None:
     for field in (
         "format_key",
         "enabled",
@@ -202,9 +222,21 @@ async def patch_lane_format(lane_format_id: str, data: dict[str, Any], db: Async
     ):
         if field in data:
             setattr(row, field, data[field])
-    await db.commit()
-    await db.refresh(row)
-    return _lane_format(row)
+
+
+async def _lane_format_for_channel(
+    db: AsyncSession,
+    channel_id: str,
+    lane_id: str,
+    lane_format_id: str,
+) -> LaneFormatMatrix:
+    row = await db.get(LaneFormatMatrix, _uuid(lane_format_id))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Lane format not found")
+    lane = await db.get(TopicLane, _uuid(lane_id))
+    if lane is None or lane.channel_profile_id != _uuid(channel_id) or row.topic_lane_id != lane.id:
+        raise HTTPException(status_code=404, detail="Lane format not found")
+    return row
 
 
 @router.post("/channels/{channel_id}/manual-seeds")
@@ -472,17 +504,25 @@ async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_
         .group_by(ProductionTask.state)
     )
     for state, count in result.all():
+        if state == TASK_SEEDED:
+            continue
         if state in states:
             states[state] = int(count)
         else:
             states["other"] += int(count)
+    task_seed_count = await db.scalar(
+        select(func.count(ProductionTask.id))
+        .where(ProductionTask.channel_profile_id == channel.id)
+        .where(ProductionTask.state == TASK_SEEDED)
+        .where(ProductionTask.created_at >= since)
+    )
     seed_count = await db.scalar(
         select(func.count(ManualSeed.id))
         .where(ManualSeed.channel_profile_id == channel.id)
         .where(ManualSeed.status == "active")
         .where(ManualSeed.created_at >= since)
     )
-    states["seeded"] += int(seed_count or 0)
+    states["seeded"] = int(task_seed_count or 0) + int(seed_count or 0)
     return states
 
 
