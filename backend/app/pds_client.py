@@ -8,6 +8,9 @@ import httpx
 from app.config import settings
 
 
+SUPPORTED_VERDICTS = {"allow", "flag", "block"}
+
+
 @dataclass(frozen=True)
 class PDSDecisionRequest:
     actor_id: str
@@ -76,8 +79,8 @@ class PDSClient:
         try:
             data = response.json()
             return _decision_from_payload(data)
-        except (TypeError, ValueError):
-            return _fail_open("pds_unavailable")
+        except (TypeError, ValueError, OverflowError):
+            return _fail_open("pds_parse_failed")
 
     async def _post(self, url: str, *, headers: dict[str, str], payload: dict[str, Any]) -> httpx.Response:
         if self._http_client is not None:
@@ -96,9 +99,10 @@ def _decision_from_payload(data: Any) -> PDSDecision:
     if not isinstance(data, dict):
         raise TypeError("PDS decision response must be an object")
 
+    verdict = _verdict(data.get("verdict"))
     return PDSDecision(
         decision_id=str(data.get("decision_id") or ""),
-        verdict=str(data.get("verdict") or "allow"),
+        verdict=verdict,
         score=float(data.get("score") or 0.0),
         reasons=_dict_list(data.get("reasons")),
         evaluated_rules=_str_list(data.get("evaluated_rules")),
@@ -106,6 +110,15 @@ def _decision_from_payload(data: Any) -> PDSDecision:
         latency_ms=int(data.get("latency_ms") or 0),
         metadata=_dict(data.get("metadata")),
     )
+
+
+def _verdict(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("PDS decision response missing verdict")
+    verdict = value.strip().lower()
+    if verdict not in SUPPORTED_VERDICTS:
+        raise ValueError(f"Unsupported PDS verdict: {value}")
+    return verdict
 
 
 def _dict(value: Any) -> dict[str, Any]:
