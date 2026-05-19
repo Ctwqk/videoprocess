@@ -1059,6 +1059,61 @@ async def test_lane_cadence_guard_counts_future_scheduled_publication_for_cooldo
 
 
 @pytest.mark.asyncio
+async def test_lane_cadence_guard_counts_future_scheduled_publication_in_streak(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.max_posts_per_day = 5
+    lane.cooldown_after_post_minutes = 0
+    lane.max_consecutive_streak = 1
+    second_account = PublishingAccount(
+        channel_profile_id=channel.id,
+        account_label="second",
+        platform_account_id="yt-2",
+        credential_ref="youtube/second",
+        external_asset_auto_publish=True,
+    )
+    service_session.add(second_account)
+    scheduled_task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        lane_format_id=lane_format.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="scheduled",
+        state="scheduled",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(scheduled_task)
+    await service_session.flush()
+    service_session.add(
+        _publication_for_task(
+            scheduled_task,
+            account,
+            publish_status="scheduled",
+            scheduled_publish_at=clock.now() + timedelta(hours=1),
+        )
+    )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=second_account.id,
+            prompt="new",
+            title_seed="new",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service(clock=clock).tick(service_session, channel_id=channel.id)
+
+    rejected = audit.decision_summary_json["rejected_candidates"][0]
+    assert audit.tasks_selected == 0
+    assert rejected["guard"] == "lane_cadence"
+    assert "publication streak" in rejected["reason"]
+    assert "max_consecutive_streak is 1" in rejected["reason"]
+
+
+@pytest.mark.asyncio
 async def test_lane_cadence_guard_ignores_held_tasks_without_publications(service_session):
     clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
     channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
