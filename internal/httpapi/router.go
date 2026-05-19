@@ -3,13 +3,26 @@ package httpapi
 import (
 	"net/http"
 
+	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/go-chi/chi/v5"
 )
 
-type Server struct{}
+// Server holds shared dependencies for HTTP handlers. The store is optional;
+// when nil, list endpoints respond with empty pages so unit tests can run
+// without Postgres. Production cmd/vp-api wires a real store.
+type Server struct {
+	store *store.Store
+}
 
+// NewServer constructs a Server without a backing store. Useful for tests
+// that only exercise the routing/health surface.
 func NewServer() *Server {
 	return &Server{}
+}
+
+// NewServerWithStore is the production constructor used by cmd/vp-api.
+func NewServerWithStore(s *store.Store) *Server {
+	return &Server{store: s}
 }
 
 func (s *Server) Router() http.Handler {
@@ -20,6 +33,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/node-types/{typeName}", s.getNodeType)
 		r.Get("/pipelines", s.listPipelines)
 		r.Get("/templates", s.listTemplates)
+		r.Get("/assets", s.listAssets)
 		r.Get("/jobs", s.listJobs)
 	})
 	r.Route("/internal/schedule/video", func(r chi.Router) {
