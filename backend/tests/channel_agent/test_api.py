@@ -217,6 +217,71 @@ async def test_channel_queue_and_health_are_channel_scoped(api_session):
 
 
 @pytest.mark.asyncio
+async def test_create_manual_seed_rejects_cross_channel_target_account(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        first = (await client.post("/api/v1/channel-agent/channels", json={"name": "A"})).json()
+        second = (await client.post("/api/v1/channel-agent/channels", json={"name": "B"})).json()
+        account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{second['id']}/accounts",
+                json={
+                    "account_label": "b-main",
+                    "platform_account_id": "yt-b",
+                    "credential_ref": "youtube/b",
+                },
+            )
+        ).json()
+
+        response = await client.post(
+            f"/api/v1/channel-agent/channels/{first['id']}/manual-seeds",
+            json={
+                "target_account_id": account["id"],
+                "prompt": "this seed should not cross channels",
+            },
+        )
+
+        assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_channel_health_does_not_count_published_tasks_as_active(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Health"})).json()
+        account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{channel['id']}/accounts",
+                json={
+                    "account_label": "main",
+                    "platform_account_id": "yt",
+                    "credential_ref": "youtube/main",
+                },
+            )
+        ).json()
+        published = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="published task",
+            state="published",
+            channel_config_snapshot_json={},
+        )
+        active = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="active task",
+            state="scheduled",
+            channel_config_snapshot_json={},
+        )
+        api_session.add_all([published, active])
+        await api_session.commit()
+
+        health = (await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/health")).json()
+
+        assert health["active_tasks"] == 1
+
+
+@pytest.mark.asyncio
 async def test_pause_resume_lane_account_and_publication_controls(api_session):
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
         channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Ops"})).json()
@@ -508,6 +573,12 @@ async def test_ticks_and_funnel_return_real_data(api_session):
             decision_summary_json={"selected": 2},
         )
         api_session.add(tick)
+        seed = ManualSeed(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            prompt="active seed",
+            status="active",
+        )
+        api_session.add(seed)
 
         account = PublishingAccount(
             channel_profile_id=uuid.UUID(channel["id"]),
@@ -569,6 +640,7 @@ async def test_ticks_and_funnel_return_real_data(api_session):
         assert "cancelled" in funnel
         assert "other" in funnel
         assert funnel["selected"] >= 1
+        assert funnel["seeded"] >= 1
         assert funnel["scheduled"] >= 1
         assert funnel["rejected"] >= 1
         assert funnel["other"] >= 1

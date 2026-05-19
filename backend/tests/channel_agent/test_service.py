@@ -527,6 +527,44 @@ async def test_targeted_manual_seed_rejects_paused_account_without_fallback(serv
 
 
 @pytest.mark.asyncio
+async def test_targeted_manual_seed_rejects_cross_channel_account_without_task(service_session):
+    first_channel, first_lane, _first_account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    _second_channel, _second_lane, second_account, _second_lane_format = await _channel_graph(
+        service_session,
+        dry_run=False,
+    )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=first_channel.id,
+            topic_lane_id=first_lane.id,
+            target_account_id=second_account.id,
+            prompt="manual blocked by cross-channel account",
+            title_seed="blocked",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=first_channel.id)
+
+    tasks = (
+        await service_session.execute(
+            select(ProductionTask).where(ProductionTask.channel_profile_id == first_channel.id)
+        )
+    ).scalars().all()
+    queue_items = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.channel_profile_id == first_channel.id)
+        )
+    ).scalars().all()
+    rejected = audit.decision_summary_json["rejected_candidates"]
+    assert audit.tasks_selected == 0
+    assert tasks == []
+    assert queue_items == []
+    assert rejected[0]["guard"] == "account_unavailable"
+    assert rejected[0]["account_id"] == str(second_account.id)
+
+
+@pytest.mark.asyncio
 async def test_manual_seed_consumes_first_then_lane_driven_fills_budget(service_session):
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
     lane.max_posts_per_day = 3

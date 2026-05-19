@@ -354,6 +354,12 @@ class ChannelAgentService:
                     "reason": f"Target publishing account {seed.target_account_id} was not found.",
                     "account_id": str(seed.target_account_id),
                 }
+            if account.channel_profile_id != seed.channel_profile_id:
+                return None, {
+                    "guard": "account_unavailable",
+                    "reason": f"Target publishing account {account.id} does not belong to channel {seed.channel_profile_id}.",
+                    "account_id": str(account.id),
+                }
             if not self._account_available(account):
                 return None, {
                     "guard": "account_unavailable",

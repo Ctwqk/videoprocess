@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent.clock import Clock
 from app.channel_agent.constants import (
+    ACTIVE_TASK_STATES,
     QUEUE_CANCELLED,
     QUEUE_QUEUED,
     TASK_HELD,
@@ -208,7 +209,8 @@ async def patch_lane_format(lane_format_id: str, data: dict[str, Any], db: Async
 
 @router.post("/channels/{channel_id}/manual-seeds")
 async def create_manual_seed(channel_id: str, data: ManualSeedCreate, db: AsyncSession = Depends(get_db)):
-    await _require_channel(db, channel_id)
+    channel = await _require_channel(db, channel_id)
+    await _validate_manual_seed_references(db, channel.id, data)
     row = ManualSeed(channel_profile_id=_uuid(channel_id), **_seed_payload(data))
     db.add(row)
     await db.commit()
@@ -274,7 +276,7 @@ async def channel_health(channel_id: str, db: AsyncSession = Depends(get_db)):
         channel_id=str(channel.id),
         dry_run=channel.dry_run,
         halted=channel.halted_at is not None,
-        active_tasks=sum(1 for task in tasks if task.state not in {"failed", "cancelled", "rejected", "measured"}),
+        active_tasks=sum(1 for task in tasks if task.state in ACTIVE_TASK_STATES),
         queued_items=sum(1 for item in queued if item.status == "queued"),
         recent_failures=sum(1 for item in queued if item.status in {"failed", "dead_lettered"}),
         warnings=[],
@@ -474,6 +476,13 @@ async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_
             states[state] = int(count)
         else:
             states["other"] += int(count)
+    seed_count = await db.scalar(
+        select(func.count(ManualSeed.id))
+        .where(ManualSeed.channel_profile_id == channel.id)
+        .where(ManualSeed.status == "active")
+        .where(ManualSeed.created_at >= since)
+    )
+    states["seeded"] += int(seed_count or 0)
     return states
 
 
@@ -510,6 +519,21 @@ async def _publication_with_task(db: AsyncSession, publication_id: str) -> tuple
     if task is None:
         raise HTTPException(status_code=404, detail="Production task not found")
     return publication, task
+
+
+async def _validate_manual_seed_references(
+    db: AsyncSession,
+    channel_id: uuid.UUID,
+    data: ManualSeedCreate,
+) -> None:
+    if data.topic_lane_id:
+        lane = await db.get(TopicLane, _uuid(data.topic_lane_id))
+        if lane is None or lane.channel_profile_id != channel_id:
+            raise HTTPException(status_code=400, detail="Manual seed topic lane does not belong to channel")
+    if data.target_account_id:
+        account = await db.get(PublishingAccount, _uuid(data.target_account_id))
+        if account is None or account.channel_profile_id != channel_id:
+            raise HTTPException(status_code=400, detail="Manual seed target account does not belong to channel")
 
 
 async def _cancel_queued_publication_items(
