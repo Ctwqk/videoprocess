@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/redisstream"
-	"github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
@@ -20,9 +20,19 @@ type fakeHandler struct {
 }
 
 func (f *fakeHandler) NodeType() string { return f.node }
-func (f *fakeHandler) Execute(ctx context.Context, task TaskMessage) error {
+func (f *fakeHandler) Execute(ctx context.Context, task TaskMessage) (NodeResult, error) {
 	f.seen = append(f.seen, task)
-	return f.err
+	if f.err != nil {
+		return NodeResult{}, f.err
+	}
+	return NodeResult{OutputArtifactID: "artifact-1"}, nil
+}
+
+type emptyArtifactHandler struct{}
+
+func (h emptyArtifactHandler) NodeType() string { return "trim" }
+func (h emptyArtifactHandler) Execute(context.Context, TaskMessage) (NodeResult, error) {
+	return NodeResult{}, nil
 }
 
 func newRedis(t *testing.T) (*redis.Client, *miniredis.Miniredis) {
@@ -138,10 +148,10 @@ func TestConsumerHandlerFailurePublishesFailed(t *testing.T) {
 	}
 }
 
-func TestConsumerCancellationLeavesMessagePending(t *testing.T) {
+func TestConsumerConfirmedCancellationAcksWithoutEvent(t *testing.T) {
 	client, _ := newRedis(t)
 	cfg := Config{WorkerType: "ffmpeg_go", WorkerID: "test-3"}
-	handler := &fakeHandler{node: "trim", err: ffmpeg.ErrCancelled}
+	handler := &fakeHandler{node: "trim", err: ErrConfirmedCancellation}
 	consumer := NewConsumer(client, cfg, handler)
 	consumer.BlockTimeout = 50 * time.Millisecond
 
@@ -154,13 +164,32 @@ func TestConsumerCancellationLeavesMessagePending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("xpending: %v", err)
 	}
-	if pending.Count != 1 {
-		t.Fatalf("cancelled task must stay pending for PEL reclaim, got %d", pending.Count)
+	if pending.Count != 0 {
+		t.Fatalf("confirmed cancelled task should be acked, pending = %d", pending.Count)
 	}
 
 	events, _ := client.XRange(context.Background(), redisstream.EventStream, "-", "+").Result()
 	if len(events) != 0 {
-		t.Fatalf("cancellation must not publish events, got %#v", events)
+		t.Fatalf("confirmed cancellation must not publish events, got %#v", events)
+	}
+}
+
+func TestConsumerRejectsSuccessWithoutOutputArtifactID(t *testing.T) {
+	client, _ := newRedis(t)
+	cfg := Config{WorkerType: "ffmpeg_go", WorkerID: "test-empty-artifact"}
+	consumer := NewConsumer(client, cfg, emptyArtifactHandler{})
+	consumer.BlockTimeout = 50 * time.Millisecond
+
+	withGroup(t, consumer)
+	enqueueTrim(t, client, cfg.WorkerType)
+	runOneTick(t, consumer)
+
+	events, _ := client.XRange(context.Background(), redisstream.EventStream, "-", "+").Result()
+	if len(events) != 1 || events[0].Values["event"] != "node_failed" {
+		t.Fatalf("events = %#v", events)
+	}
+	if got, _ := events[0].Values["error"].(string); !strings.Contains(got, "output_artifact_id") {
+		t.Fatalf("error = %q", got)
 	}
 }
 

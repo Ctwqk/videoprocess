@@ -10,9 +10,10 @@ import (
 	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/redisstream"
-	"github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
 	"github.com/redis/go-redis/v9"
 )
+
+var ErrConfirmedCancellation = errors.New("confirmed cancellation")
 
 // Handler executes a single node's media transform. Each implementation is
 // responsible for resolving input/output paths via the Storage backend and
@@ -20,7 +21,11 @@ import (
 // ffmpeg.ErrCancelled tells the consumer to skip ack and event publication.
 type Handler interface {
 	NodeType() string
-	Execute(ctx context.Context, task TaskMessage) error
+	Execute(ctx context.Context, task TaskMessage) (NodeResult, error)
+}
+
+type NodeResult struct {
+	OutputArtifactID string
 }
 
 // TaskMessage is the decoded Redis Streams payload the Python orchestrator
@@ -136,16 +141,21 @@ func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
 		return
 	}
 
-	err = handler.Execute(ctx, task)
+	result, err := handler.Execute(ctx, task)
 	switch {
 	case err == nil:
-		_ = c.publishCompleted(ctx, task)
+		if strings.TrimSpace(result.OutputArtifactID) == "" {
+			_ = c.publishFailed(ctx, task, "handler succeeded without output_artifact_id")
+			c.ack(ctx, msg.ID)
+			return
+		}
+		_ = c.publishCompleted(ctx, task, result.OutputArtifactID)
 		c.ack(ctx, msg.ID)
-	case errors.Is(err, ffmpeg.ErrCancelled) || errors.Is(err, context.Canceled):
-		// Cancelled tasks must NOT be acked. The orchestrator either
-		// cancels the node explicitly (state recorded elsewhere) or the
-		// PEL reclaim will reassign the work.
-		c.log.Info("task cancelled, leaving message pending", "msg_id", msg.ID, "node_id", task.NodeID)
+	case errors.Is(err, ErrConfirmedCancellation):
+		c.log.Info("task cancelled by recorded job/node state, acking without event", "msg_id", msg.ID, "node_id", task.NodeID)
+		c.ack(ctx, msg.ID)
+	case errors.Is(err, context.Canceled):
+		c.log.Info("worker context cancelled, leaving message pending", "msg_id", msg.ID, "node_id", task.NodeID)
 	default:
 		c.log.Error("handler failed", "msg_id", msg.ID, "node_id", task.NodeID, "error", err)
 		_ = c.publishFailed(ctx, task, err.Error())
@@ -160,14 +170,11 @@ func (c *Consumer) ack(ctx context.Context, msgID string) {
 	}
 }
 
-func (c *Consumer) publishCompleted(ctx context.Context, task TaskMessage) error {
+func (c *Consumer) publishCompleted(ctx context.Context, task TaskMessage, artifactID string) error {
 	return redisstream.PublishNodeCompleted(ctx, c.Redis, redisstream.NodeEvent{
-		JobID:           task.JobID,
-		NodeExecutionID: task.NodeExecutionID,
-		// OutputArtifactID is populated by the handler in a follow-up
-		// (handler resolves storage path then we will plumb the result
-		// through here). For now publishing without it preserves the
-		// stream shape; downstream listeners treat missing as "lookup".
+		JobID:            task.JobID,
+		NodeExecutionID:  task.NodeExecutionID,
+		OutputArtifactID: artifactID,
 	})
 }
 
