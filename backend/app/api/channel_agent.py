@@ -10,6 +10,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent.clock import Clock
+from app.channel_agent.constants import (
+    QUEUE_CANCELLED,
+    QUEUE_QUEUED,
+    TASK_HELD,
+    TASK_REJECTED,
+    TASK_UPLOADED_PRIVATE,
+)
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
 from app.db import get_db
 from app.models.channel_agent import (
@@ -109,9 +116,9 @@ async def create_lane(channel_id: str, data: TopicLaneCreate, db: AsyncSession =
 
 @router.patch("/channels/{channel_id}/lanes/{lane_id}")
 async def patch_lane(channel_id: str, lane_id: str, data: dict[str, Any], db: AsyncSession = Depends(get_db)):
-    await _require_channel(db, channel_id)
+    channel = await _require_channel(db, channel_id)
     lane = await db.get(TopicLane, _uuid(lane_id))
-    if lane is None:
+    if lane is None or lane.channel_profile_id != channel.id:
         raise HTTPException(status_code=404, detail="Lane not found")
     for field in (
         "name",
@@ -145,9 +152,9 @@ async def create_account(channel_id: str, data: PublishingAccountCreate, db: Asy
 
 @router.patch("/channels/{channel_id}/accounts/{account_id}")
 async def patch_account(channel_id: str, account_id: str, data: dict[str, Any], db: AsyncSession = Depends(get_db)):
-    await _require_channel(db, channel_id)
+    channel = await _require_channel(db, channel_id)
     account = await db.get(PublishingAccount, _uuid(account_id))
-    if account is None:
+    if account is None or account.channel_profile_id != channel.id:
         raise HTTPException(status_code=404, detail="Account not found")
     for field in (
         "account_label",
@@ -380,7 +387,8 @@ async def pause_lane(lane_id: str, data: PauseRequest, db: AsyncSession = Depend
     lane = await db.get(TopicLane, _uuid(lane_id))
     if lane is None:
         raise HTTPException(status_code=404, detail="Lane not found")
-    lane.paused_until = data.until or datetime.now(timezone.utc)
+    lane.enabled = False
+    lane.paused_until = data.until
     await db.commit()
     await db.refresh(lane)
     return _lane(lane)
@@ -391,6 +399,7 @@ async def resume_lane(lane_id: str, db: AsyncSession = Depends(get_db)):
     lane = await db.get(TopicLane, _uuid(lane_id))
     if lane is None:
         raise HTTPException(status_code=404, detail="Lane not found")
+    lane.enabled = True
     lane.paused_until = None
     await db.commit()
     await db.refresh(lane)
@@ -400,13 +409,16 @@ async def resume_lane(lane_id: str, db: AsyncSession = Depends(get_db)):
 @router.post("/publications/{publication_id}/promote")
 async def promote_publication(publication_id: str, db: AsyncSession = Depends(get_db)):
     publication, task = await _publication_with_task(db, publication_id)
+    if publication.publish_status != "uploaded" or task.state not in {TASK_UPLOADED_PRIVATE, TASK_HELD}:
+        raise HTTPException(status_code=409, detail="Publication is not ready for promotion")
+    target_visibility = _safe_promotion_visibility(publication.desired_privacy)
     item = await ChannelOpsQueueService().enqueue(
         db,
         kind="promote_publication",
-        idempotency_key=f"promote_publication:{publication.id}:{publication.desired_privacy}:manual",
+        idempotency_key=f"promote_publication:{publication.id}:{target_visibility}:manual",
         payload={
             "publication_id": str(publication.id),
-            "target_visibility": publication.desired_privacy,
+            "target_visibility": target_visibility,
             "channel_profile_id": str(task.channel_profile_id),
         },
         priority=70,
@@ -420,8 +432,9 @@ async def reject_publication(publication_id: str, db: AsyncSession = Depends(get
     publication, task = await _publication_with_task(db, publication_id)
     now = datetime.now(timezone.utc)
     publication.publish_status = "rejected"
-    task.state = "rejected"
+    task.state = TASK_REJECTED
     task.state_updated_at = now
+    await _cancel_queued_promotes(db, publication.id)
     await db.commit()
     await db.refresh(publication)
     return _publication(publication)
@@ -430,9 +443,10 @@ async def reject_publication(publication_id: str, db: AsyncSession = Depends(get
 @router.get("/channels/{channel_id}/metrics/funnel")
 async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_db)):
     channel = await _require_channel(db, channel_id)
-    since = Clock().now() - timedelta(days=max(days, 0))
+    clamped_days = max(days, 0)
+    since = Clock().now() - timedelta(days=clamped_days)
     states = {
-        "days": days,
+        "days": clamped_days,
         "seeded": 0,
         "selected": 0,
         "planning": 0,
@@ -443,6 +457,9 @@ async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_
         "measured": 0,
         "failed": 0,
         "held": 0,
+        "rejected": 0,
+        "cancelled": 0,
+        "other": 0,
     }
     result = await db.execute(
         select(ProductionTask.state, func.count(ProductionTask.id))
@@ -453,6 +470,8 @@ async def funnel(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_
     for state, count in result.all():
         if state in states:
             states[state] = int(count)
+        else:
+            states["other"] += int(count)
     return states
 
 
@@ -489,6 +508,24 @@ async def _publication_with_task(db: AsyncSession, publication_id: str) -> tuple
     if task is None:
         raise HTTPException(status_code=404, detail="Production task not found")
     return publication, task
+
+
+async def _cancel_queued_promotes(db: AsyncSession, publication_id: uuid.UUID) -> None:
+    result = await db.execute(
+        select(ChannelOpsQueueItem)
+        .where(ChannelOpsQueueItem.kind == "promote_publication")
+        .where(ChannelOpsQueueItem.status == QUEUE_QUEUED)
+    )
+    for item in result.scalars().all():
+        if str((item.payload_json or {}).get("publication_id") or "") == str(publication_id):
+            item.status = QUEUE_CANCELLED
+
+
+def _safe_promotion_visibility(value: Any) -> str:
+    visibility = str(value or "").strip().lower()
+    if visibility in {"private", "unlisted"}:
+        return visibility
+    return "unlisted"
 
 
 def _uuid(value: str) -> uuid.UUID:

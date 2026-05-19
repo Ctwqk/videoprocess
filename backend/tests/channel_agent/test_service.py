@@ -454,6 +454,50 @@ async def test_lane_driven_tick_creates_task_without_manual_seed(service_session
 
 
 @pytest.mark.asyncio
+async def test_tick_excludes_lane_paused_until_future(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, _account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.paused_until = clock.now() + timedelta(hours=1)
+    await service_session.commit()
+
+    audit = await _service(clock=clock).tick(service_session, channel_id=channel.id)
+
+    tasks = (await service_session.execute(select(ProductionTask))).scalars().all()
+    queue_items = (await service_session.execute(select(ChannelOpsQueueItem))).scalars().all()
+    assert audit.tasks_selected == 0
+    assert tasks == []
+    assert queue_items == []
+
+
+@pytest.mark.asyncio
+async def test_targeted_manual_seed_rejects_paused_account_without_fallback(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    account.enabled = False
+    account.paused_until = clock.now() + timedelta(hours=1)
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="manual blocked by account pause",
+            title_seed="blocked",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service(clock=clock).tick(service_session, channel_id=channel.id)
+
+    tasks = (await service_session.execute(select(ProductionTask))).scalars().all()
+    queue_items = (await service_session.execute(select(ChannelOpsQueueItem))).scalars().all()
+    rejected = audit.decision_summary_json["rejected_candidates"]
+    assert audit.tasks_selected == 0
+    assert tasks == []
+    assert queue_items == []
+    assert rejected[0]["guard"] in {"account_unavailable", "no_enabled_account"}
+
+
+@pytest.mark.asyncio
 async def test_manual_seed_consumes_first_then_lane_driven_fills_budget(service_session):
     channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
     lane.max_posts_per_day = 3
@@ -1619,6 +1663,59 @@ async def test_promote_publication_schedules_youtube_publish_at(service_session)
         )
     ).scalar_one()
     assert _as_utc(metrics_item.run_after) == datetime(2026, 5, 18, 11, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_handle_promote_publication_ignores_rejected_publication(service_session):
+    channel, _lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="make a test short",
+        state="rejected",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    publication = PublicationRecord(
+        production_task_id=task.id,
+        platform="youtube",
+        account_id=account.id,
+        platform_content_id="yt-video-1",
+        title="test",
+        desired_privacy="unlisted",
+        current_privacy="private",
+        publish_status="rejected",
+        compliance_disposition="assumed_fair_use",
+    )
+    service_session.add(publication)
+    await service_session.commit()
+    item = ChannelOpsQueueItem(
+        kind="promote_publication",
+        idempotency_key=f"promote_publication:{publication.id}:unlisted:2026-05-18T10:00:00+00:00",
+        payload_json={
+            "publication_id": str(publication.id),
+            "scheduled_at": "2026-05-18T10:00:00+00:00",
+            "target_visibility": "unlisted",
+        },
+    )
+    service_session.add(item)
+    await service_session.commit()
+    youtube = FakeYouTubeClient()
+
+    result = await _service(youtube=youtube).handle_promote_publication(service_session, item)
+    await service_session.refresh(task)
+    await service_session.refresh(publication)
+
+    assert result.id == publication.id
+    assert youtube.scheduled == []
+    assert publication.publish_status == "rejected"
+    assert task.state == "rejected"
+    metrics_items = (
+        await service_session.execute(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "collect_metrics"))
+    ).scalars().all()
+    assert metrics_items == []
 
 
 @pytest.mark.asyncio

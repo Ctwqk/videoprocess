@@ -269,7 +269,8 @@ async def test_pause_resume_lane_account_and_publication_controls(api_session):
 
         assert paused_account["enabled"] is False
         assert resumed_account["enabled"] is True
-        assert paused_lane["paused_until"] is not None
+        assert paused_lane["enabled"] is False
+        assert resumed_lane["enabled"] is True
         assert resumed_lane["paused_until"] is None
         assert promoted["kind"] == "promote_publication"
         assert promoted["channel_profile_id"] == channel["id"]
@@ -278,6 +279,156 @@ async def test_pause_resume_lane_account_and_publication_controls(api_session):
         assert rejected["publish_status"] == "rejected"
         assert refreshed_task is not None
         assert refreshed_task.state == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_pause_resume_lane_toggles_enabled(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Ops"})).json()
+        lane = (await client.post(f"/api/v1/channel-agent/channels/{channel['id']}/lanes", json={"name": "Tech"})).json()
+
+        paused = (await client.post(f"/api/v1/channel-agent/lanes/{lane['id']}/pause", json={"reason": "operator"})).json()
+        resumed = (await client.post(f"/api/v1/channel-agent/lanes/{lane['id']}/resume")).json()
+
+        assert paused["enabled"] is False
+        assert resumed["enabled"] is True
+        assert resumed["paused_until"] is None
+
+
+@pytest.mark.asyncio
+async def test_promote_clamps_public_desired_privacy_to_unlisted(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Ops"})).json()
+        account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{channel['id']}/accounts",
+                json={
+                    "account_label": "main",
+                    "platform_account_id": "yt",
+                    "credential_ref": "youtube/main",
+                },
+            )
+        ).json()
+        task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="publication control",
+            state="uploaded_private",
+            channel_config_snapshot_json={},
+        )
+        api_session.add(task)
+        await api_session.flush()
+        publication = PublicationRecord(
+            production_task_id=task.id,
+            account_id=uuid.UUID(account["id"]),
+            platform_content_id="yt-video-1",
+            title="publication control",
+            desired_privacy="public",
+            current_privacy="private",
+            publish_status="uploaded",
+            compliance_disposition="assumed_fair_use",
+        )
+        api_session.add(publication)
+        await api_session.commit()
+
+        response = await client.post(f"/api/v1/channel-agent/publications/{publication.id}/promote")
+
+        assert response.status_code == 200
+        queue_item = response.json()
+        assert queue_item["payload_json"]["target_visibility"] == "unlisted"
+
+
+@pytest.mark.asyncio
+async def test_reject_cancels_queued_promote_and_marks_records_rejected(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Ops"})).json()
+        account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{channel['id']}/accounts",
+                json={
+                    "account_label": "main",
+                    "platform_account_id": "yt",
+                    "credential_ref": "youtube/main",
+                },
+            )
+        ).json()
+        task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="publication control",
+            state="uploaded_private",
+            channel_config_snapshot_json={},
+        )
+        api_session.add(task)
+        await api_session.flush()
+        publication = PublicationRecord(
+            production_task_id=task.id,
+            account_id=uuid.UUID(account["id"]),
+            platform_content_id="yt-video-1",
+            title="publication control",
+            desired_privacy="unlisted",
+            current_privacy="private",
+            publish_status="uploaded",
+            compliance_disposition="assumed_fair_use",
+        )
+        api_session.add(publication)
+        await api_session.commit()
+
+        promote_response = await client.post(f"/api/v1/channel-agent/publications/{publication.id}/promote")
+        reject_response = await client.post(f"/api/v1/channel-agent/publications/{publication.id}/reject")
+        queued = await api_session.get(ChannelOpsQueueItem, uuid.UUID(promote_response.json()["id"]))
+        refreshed_task = await api_session.get(ProductionTask, task.id)
+
+        assert reject_response.status_code == 200
+        assert reject_response.json()["publish_status"] == "rejected"
+        assert queued is not None
+        assert queued.status == "cancelled"
+        assert refreshed_task is not None
+        assert refreshed_task.state == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_promote_rejected_publication_returns_conflict(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Ops"})).json()
+        account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{channel['id']}/accounts",
+                json={
+                    "account_label": "main",
+                    "platform_account_id": "yt",
+                    "credential_ref": "youtube/main",
+                },
+            )
+        ).json()
+        task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="publication control",
+            state="rejected",
+            channel_config_snapshot_json={},
+        )
+        api_session.add(task)
+        await api_session.flush()
+        publication = PublicationRecord(
+            production_task_id=task.id,
+            account_id=uuid.UUID(account["id"]),
+            platform_content_id="yt-video-1",
+            title="publication control",
+            desired_privacy="unlisted",
+            current_privacy="private",
+            publish_status="rejected",
+            compliance_disposition="assumed_fair_use",
+        )
+        api_session.add(publication)
+        await api_session.commit()
+
+        response = await client.post(f"/api/v1/channel-agent/publications/{publication.id}/promote")
+
+        assert response.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -322,17 +473,72 @@ async def test_ticks_and_funnel_return_real_data(api_session):
             state="scheduled",
             channel_config_snapshot_json={},
         )
-        api_session.add_all([selected_task, scheduled_task])
+        rejected_task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=account.id,
+            source="manual_seed",
+            prompt="rejected",
+            state="rejected",
+            channel_config_snapshot_json={},
+        )
+        unknown_task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=account.id,
+            source="manual_seed",
+            prompt="unknown",
+            state="surprise",
+            channel_config_snapshot_json={},
+        )
+        api_session.add_all([selected_task, scheduled_task, rejected_task, unknown_task])
         await api_session.commit()
 
         ticks = (await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/ticks")).json()
         funnel = (await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/metrics/funnel?days=7")).json()
+        clamped_funnel = (
+            await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/metrics/funnel?days=-1")
+        ).json()
 
         assert isinstance(ticks, list)
         assert ticks[0]["tick_id"] == "tick-1"
         assert ticks[0]["tasks_selected"] == 2
         assert ticks[0]["guards_triggered_json"] == ["cadence"]
+        assert clamped_funnel["days"] >= 0
         assert "selected" in funnel
         assert "scheduled" in funnel
+        assert "rejected" in funnel
+        assert "cancelled" in funnel
+        assert "other" in funnel
         assert funnel["selected"] >= 1
         assert funnel["scheduled"] >= 1
+        assert funnel["rejected"] >= 1
+        assert funnel["other"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_channel_prefixed_patch_routes_reject_cross_channel_children(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        first = (await client.post("/api/v1/channel-agent/channels", json={"name": "A"})).json()
+        second = (await client.post("/api/v1/channel-agent/channels", json={"name": "B"})).json()
+        first_lane = (await client.post(f"/api/v1/channel-agent/channels/{first['id']}/lanes", json={"name": "A lane"})).json()
+        first_account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{first['id']}/accounts",
+                json={
+                    "account_label": "main",
+                    "platform_account_id": "yt",
+                    "credential_ref": "youtube/main",
+                },
+            )
+        ).json()
+
+        lane_response = await client.patch(
+            f"/api/v1/channel-agent/channels/{second['id']}/lanes/{first_lane['id']}",
+            json={"name": "wrong channel"},
+        )
+        account_response = await client.patch(
+            f"/api/v1/channel-agent/channels/{second['id']}/accounts/{first_account['id']}",
+            json={"account_label": "wrong channel"},
+        )
+
+        assert lane_response.status_code == 404
+        assert account_response.status_code == 404

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, get_args
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent.alerts import build_alert_payload
@@ -29,6 +29,7 @@ from app.channel_agent.constants import (
     TASK_MEASURED,
     TASK_PLANNING,
     TASK_PRODUCING,
+    TASK_REJECTED,
     TASK_SCHEDULED,
     TASK_SELECTED,
     TASK_UPLOADED_PRIVATE,
@@ -103,6 +104,7 @@ class ChannelAgentService:
                 select(TopicLane)
                 .where(TopicLane.channel_profile_id == channel.id)
                 .where(TopicLane.enabled.is_(True))
+                .where(or_(TopicLane.paused_until.is_(None), TopicLane.paused_until <= now))
                 .order_by(TopicLane.weight.desc(), TopicLane.created_at.asc())
             )
         ).scalars().all()
@@ -111,6 +113,7 @@ class ChannelAgentService:
                 select(PublishingAccount)
                 .where(PublishingAccount.channel_profile_id == channel.id)
                 .where(PublishingAccount.enabled.is_(True))
+                .where(or_(PublishingAccount.paused_until.is_(None), PublishingAccount.paused_until <= now))
                 .order_by(PublishingAccount.created_at.asc())
             )
         ).scalars().all()
@@ -250,7 +253,7 @@ class ChannelAgentService:
             lane_key = str(lane.id) if lane is not None else "unassigned"
             lane_formats = lane_formats_by_lane.get(lane_key, [])
             lane_format = lane_formats[0] if lane_formats else None
-            account = await self._resolve_candidate_account(db, seed, accounts, claimed_account_ids)
+            account, account_rejection = await self._resolve_candidate_account(db, seed, accounts, claimed_account_ids)
             if account is not None:
                 claimed_account_ids.add(str(account.id))
             manual_count_by_lane[lane_key] = manual_count_by_lane.get(lane_key, 0) + 1
@@ -271,6 +274,7 @@ class ChannelAgentService:
                     "lane": lane,
                     "lane_format": lane_format,
                     "account": account,
+                    "account_rejection": account_rejection,
                     "prompt": seed.prompt,
                     "title_seed": seed.title_seed,
                     "source_platforms_json": source_platforms,
@@ -332,17 +336,28 @@ class ChannelAgentService:
         seed: ManualSeed,
         accounts: list[PublishingAccount],
         claimed_account_ids: set[str],
-    ) -> PublishingAccount | None:
+    ) -> tuple[PublishingAccount | None, dict[str, str] | None]:
         if seed.target_account_id:
             account = await db.get(PublishingAccount, seed.target_account_id)
-            if account is not None:
-                return account
+            if account is None:
+                return None, {
+                    "guard": "account_unavailable",
+                    "reason": f"Target publishing account {seed.target_account_id} was not found.",
+                    "account_id": str(seed.target_account_id),
+                }
+            if not self._account_available(account):
+                return None, {
+                    "guard": "account_unavailable",
+                    "reason": f"Target publishing account {account.id} is disabled or paused.",
+                    "account_id": str(account.id),
+                }
+            return account, None
         return await self._select_candidate_account_for_tick(
             db,
             accounts,
             claimed_account_ids,
             prefer_unblocked=True,
-        )
+        ), None
 
     async def _select_candidate_account_for_tick(
         self,
@@ -352,15 +367,23 @@ class ChannelAgentService:
         *,
         prefer_unblocked: bool = False,
     ) -> PublishingAccount | None:
-        if not accounts:
+        available_accounts = [account for account in accounts if self._account_available(account)]
+        if not available_accounts:
             return None
-        unclaimed_accounts = [account for account in accounts if str(account.id) not in claimed_account_ids]
-        candidate_accounts = unclaimed_accounts or accounts
+        unclaimed_accounts = [account for account in available_accounts if str(account.id) not in claimed_account_ids]
+        candidate_accounts = unclaimed_accounts or available_accounts
         if prefer_unblocked:
             for account in candidate_accounts:
                 if await self._active_task_count_for_account(db, account.id) <= 0:
                     return account
         return candidate_accounts[0]
+
+    def _account_available(self, account: PublishingAccount) -> bool:
+        if not account.enabled:
+            return False
+        if account.paused_until is None:
+            return True
+        return _datetime_to_utc(account.paused_until) <= _datetime_to_utc(self.clock.now())
 
     def _select_account_for_tick(
         self,
@@ -427,6 +450,13 @@ class ChannelAgentService:
     ) -> dict[str, Any] | None:
         account = candidate.get("account")
         if account is None:
+            account_rejection = candidate.get("account_rejection")
+            if isinstance(account_rejection, dict):
+                return _candidate_rejection(
+                    candidate,
+                    guard=str(account_rejection.get("guard") or "account_unavailable"),
+                    reason=str(account_rejection.get("reason") or "Target publishing account is unavailable."),
+                )
             return _candidate_rejection(
                 candidate,
                 guard="no_enabled_account",
@@ -991,8 +1021,16 @@ class ChannelAgentService:
         publication = await db.get(PublicationRecord, publication_id)
         if publication is None:
             raise ValueError("Publication not found")
+        task = await db.get(ProductionTask, publication.production_task_id)
+        if publication.publish_status == "rejected" or (task is not None and task.state == TASK_REJECTED):
+            return publication
+        if publication.publish_status != "uploaded" or task is None or task.state not in {
+            TASK_UPLOADED_PRIVATE,
+            TASK_HELD,
+        }:
+            raise ValueError("Publication is not ready for promotion")
         scheduled_at = _parse_datetime(str(item.payload_json.get("scheduled_at") or self.clock.now().isoformat()))
-        visibility = str(item.payload_json.get("target_visibility") or publication.desired_privacy or "public")
+        visibility = _safe_privacy(item.payload_json.get("target_visibility") or publication.desired_privacy) or "unlisted"
         await self.youtube_client.schedule_publish(
             video_id=publication.platform_content_id,
             scheduled_at=scheduled_at,
@@ -1001,15 +1039,13 @@ class ChannelAgentService:
         publication.publish_status = "scheduled"
         publication.desired_privacy = visibility
         publication.scheduled_publish_at = scheduled_at
-        task = await db.get(ProductionTask, publication.production_task_id)
-        if task is not None:
-            previous_state = task.state
-            task.state = TASK_SCHEDULED
-            task.state_updated_at = self.clock.now()
-            task.transition_history_json = [
-                *list(task.transition_history_json or []),
-                _transition(previous_state, TASK_SCHEDULED, "promote_publication", self.clock.now()),
-            ]
+        previous_state = task.state
+        task.state = TASK_SCHEDULED
+        task.state_updated_at = self.clock.now()
+        task.transition_history_json = [
+            *list(task.transition_history_json or []),
+            _transition(previous_state, TASK_SCHEDULED, "promote_publication", self.clock.now()),
+        ]
         await self.queue.enqueue(
             db,
             kind="collect_metrics",
@@ -1018,7 +1054,7 @@ class ChannelAgentService:
             priority=90,
             run_after=scheduled_at + _METRICS_POLL_DELAY,
             parent_queue_item_id=item.id,
-            channel_profile_id=task.channel_profile_id if task else None,
+            channel_profile_id=task.channel_profile_id,
         )
         await db.commit()
         await db.refresh(publication)
@@ -1393,11 +1429,15 @@ def _candidate_rejection(candidate: dict[str, Any], *, guard: str, reason: str) 
     lane = candidate.get("lane")
     lane_format = candidate.get("lane_format")
     account = candidate.get("account")
+    account_rejection = candidate.get("account_rejection")
+    account_id = str(account.id) if account is not None else ""
+    if not account_id and isinstance(account_rejection, dict):
+        account_id = str(account_rejection.get("account_id") or "")
     return {
         "candidate_id": candidate["candidate_id"],
         "lane_id": str(lane.id) if lane is not None else "",
         "format_id": str(lane_format.id) if lane_format is not None else "",
-        "account_id": str(account.id) if account is not None else "",
+        "account_id": account_id,
         "guard": guard,
         "reason": reason,
     }
