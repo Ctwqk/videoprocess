@@ -15,6 +15,7 @@ from app.channel_agent.clients import (
     FakeMiniMaxClient,
     FakeYouTubeClient,
 )
+from app.channel_agent.material_usage import segment_signature
 from app.channel_agent.queue import ChannelOpsQueueService
 from app.channel_agent.service import ChannelAgentService
 from app.events.outbox import event_outbox_table
@@ -103,6 +104,7 @@ def _service(
     minimax=None,
     pds=None,
     event_outbox=None,
+    pds_health_monitor_enabled: bool = False,
 ) -> ChannelAgentService:
     clock = clock or FakeClock(datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc))
     queue = ChannelOpsQueueService(clock=clock)
@@ -114,6 +116,7 @@ def _service(
         minimax_client=minimax or FakeMiniMaxClient(),
         pds_client=pds,
         event_outbox=event_outbox,
+        pds_health_monitor_enabled=pds_health_monitor_enabled,
     )
 
 
@@ -147,6 +150,68 @@ def _publication_for_task(
         uploaded_at=uploaded_at,
         compliance_disposition="assumed_fair_use",
     )
+
+
+async def _promotion_item_graph(db, *, target_visibility: str = "unlisted"):
+    channel, _lane, account, _lane_format = await _channel_graph(db, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="publish risky video",
+        state="uploaded_private",
+        channel_config_snapshot_json={},
+    )
+    db.add(task)
+    await db.flush()
+    publication = _publication_for_task(task, account, publish_status="uploaded", title="risky")
+    db.add(publication)
+    await db.flush()
+    item = ChannelOpsQueueItem(
+        kind="promote_publication",
+        idempotency_key=f"promote_publication:{publication.id}:{target_visibility}",
+        payload_json={"publication_id": str(publication.id), "target_visibility": target_visibility},
+    )
+    db.add(item)
+    await db.commit()
+    return channel, task, publication, item
+
+
+async def _publish_task_with_material(db, *, source: str):
+    channel, lane, account, _lane_format = await _channel_graph(db, dry_run=False)
+    material_id = "mat-final-guard"
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        source=source,
+        prompt="make a test short",
+        title_seed="test",
+        state="uploaded_private",
+        channel_config_snapshot_json={},
+    )
+    db.add(task)
+    await db.commit()
+    item = ChannelOpsQueueItem(
+        kind="publish_task",
+        idempotency_key=f"publish_task:{task.id}",
+        payload_json={
+            "production_task_id": str(task.id),
+            "youtube": {
+                "video_id": f"yt-{source}",
+                "material_refs": [
+                    {
+                        "material_id": material_id,
+                        "start_ms": 0,
+                        "end_ms": 1000,
+                    }
+                ],
+            },
+        },
+    )
+    db.add(item)
+    await db.commit()
+    return channel, lane, account, task, item, material_id
 
 
 class FailedExecutionAutoFlowClient(FakeAutoFlowClient):
@@ -213,6 +278,18 @@ class FakePDSClient:
     async def decide(self, request: PDSDecisionRequest) -> PDSDecision:
         self.requests.append(request)
         return self.decision
+
+
+class SequencePDSClient:
+    def __init__(self, decisions: list[PDSDecision]) -> None:
+        self.decisions = list(decisions)
+        self.requests: list[PDSDecisionRequest] = []
+
+    async def decide(self, request: PDSDecisionRequest) -> PDSDecision:
+        self.requests.append(request)
+        if len(self.decisions) > 1:
+            return self.decisions.pop(0)
+        return self.decisions[0]
 
 
 class RaisingEventOutbox:
@@ -2211,6 +2288,65 @@ async def test_publish_task_writes_material_usage_ledger_from_upload_metadata(se
 
 
 @pytest.mark.asyncio
+async def test_publish_task_holds_lane_task_when_material_recently_used(service_session):
+    clock = FakeClock(datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, task, item, material_id = await _publish_task_with_material(
+        service_session,
+        source="lane_seed",
+    )
+    service_session.add(
+        MaterialUsageLedger(
+            material_id=material_id,
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            publishing_account_id=account.id,
+            segment_signature=segment_signature(material_id, 0, 1000),
+            used_at=clock.now() - timedelta(minutes=5),
+        )
+    )
+    await service_session.commit()
+
+    publication = await _service(clock=clock).handle_publish_task(service_session, item)
+    await service_session.refresh(task)
+    publications = (await service_session.execute(select(PublicationRecord))).scalars().all()
+
+    assert publication is None
+    assert publications == []
+    assert task.state == "held"
+    assert task.blocked_by_guard == "repetition_rejected"
+    assert "publish-time material usage guard" in task.failure_reason
+    assert task.rationale_json["material_usage_guard"]["repetition_rejected"] is True
+
+
+@pytest.mark.asyncio
+async def test_publish_task_manual_seed_repetition_override_is_recorded(service_session):
+    clock = FakeClock(datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, task, item, material_id = await _publish_task_with_material(
+        service_session,
+        source="manual_seed",
+    )
+    service_session.add(
+        MaterialUsageLedger(
+            material_id=material_id,
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            publishing_account_id=account.id,
+            segment_signature=segment_signature(material_id, 0, 1000),
+            used_at=clock.now() - timedelta(minutes=5),
+        )
+    )
+    await service_session.commit()
+
+    publication = await _service(clock=clock).handle_publish_task(service_session, item)
+    await service_session.refresh(task)
+
+    assert publication is not None
+    assert publication.platform_content_id == "yt-manual_seed"
+    assert task.rationale_json["material_usage_guard"]["manual_override"] is True
+    assert task.rationale_json["material_usage_guard"]["repetition_rejected"] is True
+
+
+@pytest.mark.asyncio
 async def test_lane_candidate_rejects_recent_material_usage(service_session):
     clock = FakeClock(datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc))
     channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
@@ -2290,6 +2426,67 @@ async def test_manual_seed_repetition_override_is_annotated(service_session):
     assert audit.tasks_selected == 1
     assert task.rationale_json["material_usage_guard"]["manual_override"] is True
     assert task.rationale_json["material_usage_guard"]["hits"][0]["guard"] == "repetition_rejected"
+
+
+@pytest.mark.asyncio
+async def test_pds_unavailable_decision_enqueues_outage_alert(service_session):
+    _channel, task, _publication, item = await _promotion_item_graph(service_session)
+    service = _service(
+        pds=SequencePDSClient(
+            [
+                PDSDecision(
+                    decision_id="",
+                    verdict="block",
+                    metadata={"warning": "pds_unavailable", "fail_policy": "block"},
+                )
+            ]
+        ),
+        pds_health_monitor_enabled=True,
+    )
+
+    await service.handle_promote_publication(service_session, item)
+    await service_session.refresh(task)
+
+    assert task.state == "held"
+    alert = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "send_alert")
+        )
+    ).scalar_one()
+    assert alert.payload_json["type"] == "pds_outage"
+    assert alert.payload_json["resource_id"] == "service:pds"
+    assert alert.payload_json["severity"] == "critical"
+    assert alert.payload_json["details"]["action_type"] == "publish"
+    assert alert.payload_json["details"]["warning"] == "pds_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_pds_outage_alert_is_deduped_per_hour(service_session):
+    _first_channel, _first_task, _first_publication, first_item = await _promotion_item_graph(service_session)
+    _second_channel, _second_task, _second_publication, second_item = await _promotion_item_graph(service_session)
+    service = _service(
+        pds=SequencePDSClient(
+            [
+                PDSDecision(
+                    decision_id="",
+                    verdict="block",
+                    metadata={"warning": "pds_unavailable", "fail_policy": "block"},
+                )
+            ]
+        ),
+        pds_health_monitor_enabled=True,
+    )
+
+    await service.handle_promote_publication(service_session, first_item)
+    await service.handle_promote_publication(service_session, second_item)
+
+    alerts = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "send_alert")
+        )
+    ).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].payload_json["type"] == "pds_outage"
 
 
 @pytest.mark.asyncio
