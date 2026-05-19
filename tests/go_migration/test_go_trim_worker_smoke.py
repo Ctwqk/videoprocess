@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+import redis
 
 
 STRICT = os.environ.get("VP_GO_WORKER_SMOKE_STRICT", "").lower() in {"1", "true", "yes", "on"}
@@ -30,6 +31,18 @@ def get_json(path: str) -> dict[str, Any]:
     response = httpx.get(f"{PYTHON_API}{path}", timeout=20)
     response.raise_for_status()
     return response.json()
+
+
+def redis_client() -> redis.Redis:
+    url = os.environ.get("VP_REDIS_URL", "redis://127.0.0.1:6380/0")
+    return redis.Redis.from_url(url, decode_responses=True)
+
+
+def pending_count() -> int:
+    pending = redis_client().xpending("vp:tasks:ffmpeg_go", "ffmpeg_go-workers")
+    if isinstance(pending, dict):
+        return int(pending.get("pending", 0))
+    return int(pending["pending"])
 
 
 def wait_for_job(job_id: str) -> dict[str, Any]:
@@ -157,3 +170,6 @@ def test_trim_worker_mixed_mode_smoke_requires_real_job_completion() -> None:
     assert len(trim_nodes) == 1
     assert trim_nodes[0]["status"] == "SUCCEEDED"
     assert trim_nodes[0]["output_artifact_id"]
+    assert trim_nodes[0]["worker_id"]
+    assert "ffmpeg_go-worker@" in trim_nodes[0]["worker_id"]
+    assert pending_count() == 0
