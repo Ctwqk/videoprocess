@@ -151,7 +151,7 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
     assert len(fake_redis.added) == 1
 
     stream_key, task = fake_redis.added[0]
-    assert stream_key == "vp:tasks:ffmpeg"
+    assert stream_key == "vp:tasks:ffmpeg_go"
     assert task["node_id"] == "trim"
     assert json.loads(task["input_artifacts"]) == {"input": str(source_output_artifact_id)}
     assert json.loads(task["preferred_hosts"]) == ["preferred-host"]
