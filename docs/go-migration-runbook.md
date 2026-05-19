@@ -14,6 +14,7 @@ Run API parity in strict mode after both services are healthy:
 
 ```bash
 VP_GO_PARITY_STRICT=1 python3 -m pytest tests/go_migration/test_go_api_parity.py -q
+VP_GO_PARITY_STRICT=1 python3 -m pytest tests/go_migration/test_go_api_read_parity.py -q
 ```
 
 CI must use strict mode. Without `VP_GO_PARITY_STRICT=1` an unreachable service is reported as `skip`, which is convenient for local runs but silently hides regressions in CI. The strict guard belongs in whatever script invokes the parity suite.
@@ -53,6 +54,14 @@ Before any registry switch, confirm:
 go test ./internal/worker ./internal/worker/handlers ./cmd/vp-ffmpeg-worker
 docker compose up -d --build ffmpeg-worker-go
 docker compose logs --tail=100 ffmpeg-worker-go
+```
+
+After the `trim` registry switch, run the mixed-mode smoke with a real video
+asset id from the Python API:
+
+```bash
+VP_GO_SMOKE_ASSET_ID="$(curl -fsS http://127.0.0.1:18080/api/v1/assets?limit=1 | python3 -c 'import json,sys; p=json.load(sys.stdin); print(p["items"][0]["id"])')"
+VP_GO_WORKER_SMOKE_STRICT=1 VP_GO_SMOKE_ASSET_ID="$VP_GO_SMOKE_ASSET_ID" python3 -m pytest tests/go_migration/test_go_trim_worker_smoke.py -q
 ```
 
 ## GPU Sidecar Start
