@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     # Risk event Kafka
     risk_kafka_brokers: str = "redpanda:9092"
     risk_vp_actions_topic: str = "vp.actor.actions.v1"
+    risk_outbox_batch_size: int = 100
+    risk_outbox_poll_seconds: float = 1.0
+    risk_outbox_max_backoff_seconds: float = 60.0
+    risk_outbox_metrics_port: int = 9101
 
     # MiniMax image generation. Default endpoint/model were checked against
     # the MiniMax CN docs for the image_generation API on 2026-05-18.
