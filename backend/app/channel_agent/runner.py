@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from app.channel_agent.alerts import AlertService
+from app.channel_agent.clients import LocalAutoFlowClient
 from app.channel_agent.queue import ChannelOpsQueueService
 from app.channel_agent.service import ChannelAgentService
 from app.db import async_session
@@ -15,7 +16,7 @@ class ChannelAgentRunner:
     def __init__(self, *, worker_id: str = "channel-agent-runner", alert_service: AlertService | None = None) -> None:
         self.worker_id = worker_id
         self.queue = ChannelOpsQueueService()
-        self.service = ChannelAgentService(queue=self.queue)
+        self.service = ChannelAgentService(queue=self.queue, autoflow_client=LocalAutoFlowClient())
         self.alert_service = alert_service or AlertService()
 
     async def run_once(self) -> bool:
@@ -43,18 +44,19 @@ class ChannelAgentRunner:
             await self.service.tick(db, channel_id=item.payload_json["channel_id"])
         elif item.kind == "plan_task":
             await self.service.handle_plan_task(db, item)
+        elif item.kind == "execute_task":
+            await self.service.handle_execute_task(db, item)
+        elif item.kind == "observe_job":
+            await self.service.handle_observe_job(db, item)
         elif item.kind == "publish_task":
             await self.service.handle_publish_task(db, item)
         elif item.kind == "promote_publication":
             await self.service.handle_promote_publication(db, item)
+        elif item.kind == "collect_metrics":
+            await self.service.handle_collect_metrics(db, item)
         elif item.kind == "account_health":
             await self.service.handle_account_health(db, item)
         elif item.kind == "send_alert":
             await self.alert_service.send(dict(item.payload_json or {}))
-        elif item.kind in {"collect_metrics", "execute_task", "observe_job"}:
-            # These kinds are durable no-ops until the concrete external
-            # integrations are configured; keeping them recognized prevents
-            # dead-letter loops during alpha dry runs.
-            return
         else:
             raise ValueError(f"Unsupported ChannelOps queue kind: {item.kind}")

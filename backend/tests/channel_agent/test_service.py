@@ -1506,3 +1506,49 @@ async def test_severe_takedown_pauses_account_and_alerts(service_session):
     ).scalar_one()
     assert alert.payload_json["type"] == "takedown_event_logged"
     assert alert.channel_profile_id == channel.id
+
+
+@pytest.mark.asyncio
+async def test_queue_flow_reaches_scheduled_publication_and_metrics(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    account.external_asset_auto_publish = True
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="make a test short",
+            title_seed="test short",
+        )
+    )
+    await service_session.commit()
+    queue = ChannelOpsQueueService(clock=clock)
+    service = ChannelAgentService(
+        queue=queue,
+        clock=clock,
+        autoflow_client=FakeAutoFlowClient(include_upload=True, youtube_video_id="yt-video-1"),
+        youtube_client=FakeYouTubeClient(),
+        minimax_client=FakeMiniMaxClient(),
+    )
+
+    await service.tick(service_session, channel_id=channel.id)
+    plan_item = await queue.claim_next(service_session, worker_id="test")
+    await service.handle_plan_task(service_session, plan_item)
+    execute_item = await queue.claim_next(service_session, worker_id="test")
+    await service.handle_execute_task(service_session, execute_item)
+    observe_item = await queue.claim_next(service_session, worker_id="test")
+    await service.handle_observe_job(service_session, observe_item)
+    publish_item = await queue.claim_next(service_session, worker_id="test")
+    publication = await service.handle_publish_task(service_session, publish_item)
+    promote_item = await queue.claim_next(service_session, worker_id="test")
+    await service.handle_promote_publication(service_session, promote_item)
+    metrics_item = await queue.claim_next(service_session, worker_id="test")
+    snapshot = await service.handle_collect_metrics(service_session, metrics_item)
+
+    await service_session.refresh(publication)
+    task = (await service_session.execute(select(ProductionTask))).scalar_one()
+    assert task.state == "measured"
+    assert publication.publish_status == "scheduled"
+    assert publication.platform_content_id == "yt-video-1"
+    assert snapshot.publication_id == publication.id

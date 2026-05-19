@@ -26,7 +26,10 @@ from app.channel_agent.constants import (
     ALERT_TOKEN_EXPIRING,
     TASK_FAILED,
     TASK_HELD,
+    TASK_MEASURED,
     TASK_PLANNING,
+    TASK_PRODUCING,
+    TASK_SCHEDULED,
     TASK_SELECTED,
     TASK_UPLOADED_PRIVATE,
     TERMINAL_TASK_STATES,
@@ -699,6 +702,126 @@ class ChannelAgentService:
         await db.refresh(task)
         return task
 
+    async def handle_execute_task(self, db: AsyncSession, item: ChannelOpsQueueItem) -> ProductionTask:
+        task = await self._task_from_item(db, item)
+        observation = await self.autoflow_client.execute_task(task, self._autoflow_request(task))
+        if _status_value(observation.status) == "failed":
+            previous_state = task.state
+            task.state = TASK_FAILED
+            task.failure_reason = observation.error_message or "AutoFlow execution failed"
+            task.state_updated_at = self.clock.now()
+            task.transition_history_json = [
+                *list(task.transition_history_json or []),
+                _transition(previous_state, TASK_FAILED, "execute_task", self.clock.now()),
+            ]
+            await db.commit()
+            await db.refresh(task)
+            return task
+
+        if observation.run_id:
+            task.autoflow_run_id = _uuid(observation.run_id)
+        if observation.pipeline_id:
+            task.pipeline_id = _uuid(observation.pipeline_id)
+        if observation.job_id:
+            task.job_id = _uuid(observation.job_id)
+        previous_state = task.state
+        task.state = TASK_PRODUCING
+        task.state_updated_at = self.clock.now()
+        task.transition_history_json = [
+            *list(task.transition_history_json or []),
+            _transition(previous_state, TASK_PRODUCING, "execute_task", self.clock.now()),
+        ]
+        await self.queue.enqueue(
+            db,
+            kind="observe_job",
+            idempotency_key=f"observe_job:{task.id}:{observation.run_id}:{observation.job_id}:0",
+            payload={
+                "production_task_id": str(task.id),
+                "run_id": observation.run_id,
+                "job_id": observation.job_id,
+                "observe_count": 0,
+            },
+            priority=65,
+            channel_profile_id=task.channel_profile_id,
+            parent_queue_item_id=item.id,
+        )
+        await db.commit()
+        await db.refresh(task)
+        return task
+
+    async def handle_observe_job(self, db: AsyncSession, item: ChannelOpsQueueItem) -> ProductionTask:
+        task = await self._task_from_item(db, item)
+        payload = dict(item.payload_json or {})
+        run_id = str(payload.get("run_id") or task.autoflow_run_id or "")
+        job_id = str(payload.get("job_id") or task.job_id or "")
+        observe_count = _nonnegative_int(payload.get("observe_count"), default=0)
+        observation = await self.autoflow_client.observe_job(db, run_id=run_id, job_id=job_id)
+        status = _status_value(observation.status)
+
+        if status in {"pending", "running", "queued", "waiting_window", "validating", "planning"}:
+            next_count = observe_count + 1
+            delay_seconds = min(30 * 2 ** max(0, observe_count - 1), 300)
+            await self.queue.enqueue(
+                db,
+                kind="observe_job",
+                idempotency_key=f"observe_job:{task.id}:{run_id}:{job_id}:{next_count}",
+                payload={
+                    "production_task_id": str(task.id),
+                    "run_id": run_id,
+                    "job_id": job_id,
+                    "observe_count": next_count,
+                },
+                priority=65,
+                run_after=self.clock.now() + timedelta(seconds=delay_seconds),
+                channel_profile_id=task.channel_profile_id,
+                parent_queue_item_id=item.id,
+            )
+            await db.commit()
+            await db.refresh(task)
+            return task
+
+        if status == "failed":
+            previous_state = task.state
+            task.state = TASK_FAILED
+            task.failure_reason = observation.error_message or "AutoFlow job failed"
+            task.state_updated_at = self.clock.now()
+            task.transition_history_json = [
+                *list(task.transition_history_json or []),
+                _transition(previous_state, TASK_FAILED, "observe_job", self.clock.now()),
+            ]
+            await db.commit()
+            await db.refresh(task)
+            return task
+
+        youtube = dict(observation.youtube or {})
+        video_id = str(youtube.get("video_id") or "").strip()
+        if not video_id:
+            previous_state = task.state
+            task.state = TASK_HELD
+            task.blocked_by_guard = "missing_youtube_observation"
+            task.failure_reason = "AutoFlow job succeeded without a YouTube video id observation"
+            task.state_updated_at = self.clock.now()
+            task.transition_history_json = [
+                *list(task.transition_history_json or []),
+                _transition(previous_state, TASK_HELD, "observe_job", self.clock.now()),
+            ]
+            await db.commit()
+            await db.refresh(task)
+            return task
+
+        await self.queue.enqueue(
+            db,
+            kind="publish_task",
+            idempotency_key=f"publish_task:{task.id}",
+            payload={"production_task_id": str(task.id), "youtube": youtube},
+            priority=66,
+            channel_profile_id=task.channel_profile_id,
+            parent_queue_item_id=item.id,
+        )
+        await db.commit()
+        await db.refresh(task)
+        return task
+
     async def handle_publish_task(self, db: AsyncSession, item: ChannelOpsQueueItem) -> PublicationRecord | None:
         task = await self._task_from_item(db, item)
         account = await db.get(PublishingAccount, task.target_account_id)
@@ -798,9 +921,65 @@ class ChannelAgentService:
         publication.publish_status = "scheduled"
         publication.desired_privacy = visibility
         publication.scheduled_publish_at = scheduled_at
+        task = await db.get(ProductionTask, publication.production_task_id)
+        if task is not None:
+            previous_state = task.state
+            task.state = TASK_SCHEDULED
+            task.state_updated_at = self.clock.now()
+            task.transition_history_json = [
+                *list(task.transition_history_json or []),
+                _transition(previous_state, TASK_SCHEDULED, "promote_publication", self.clock.now()),
+            ]
+        await self.queue.enqueue(
+            db,
+            kind="collect_metrics",
+            idempotency_key=f"collect_metrics:{publication.id}:{utc_hour_bucket(self.clock.now())}",
+            payload={"publication_id": str(publication.id)},
+            priority=90,
+            parent_queue_item_id=item.id,
+            channel_profile_id=task.channel_profile_id if task else None,
+        )
         await db.commit()
         await db.refresh(publication)
         return publication
+
+    async def handle_collect_metrics(self, db: AsyncSession, item: ChannelOpsQueueItem) -> FeedbackSnapshot:
+        publication_id = _uuid(item.payload_json["publication_id"])
+        publication = await db.get(PublicationRecord, publication_id)
+        if publication is None:
+            raise ValueError("Publication not found")
+
+        metrics = _dict_value(item.payload_json.get("metrics")) or _dict_value(item.payload_json)
+        snapshot = FeedbackSnapshot(
+            publication_id=publication.id,
+            collected_at=self.clock.now(),
+            views=_nonnegative_int(metrics.get("views"), default=0),
+            likes=_nonnegative_int(metrics.get("likes"), default=0),
+            comments=_nonnegative_int(metrics.get("comments"), default=0),
+            shares=_nonnegative_int(metrics.get("shares"), default=0),
+            avg_view_duration_sec=_nonnegative_float(metrics.get("avg_view_duration_sec"), default=0.0),
+            retention_curve_json=_list_value(metrics.get("retention_curve_json") or metrics.get("retention_curve")),
+            ctr=_optional_float(metrics.get("ctr")),
+            impressions=_optional_int(metrics.get("impressions")),
+            virality_score=_nonnegative_float(metrics.get("virality_score"), default=0.0),
+            raw_json=dict(item.payload_json or {}),
+        )
+        db.add(snapshot)
+        publication.last_metrics_polled_at = self.clock.now()
+
+        task = await db.get(ProductionTask, publication.production_task_id)
+        if task is not None:
+            previous_state = task.state
+            task.state = TASK_MEASURED
+            task.state_updated_at = self.clock.now()
+            task.transition_history_json = [
+                *list(task.transition_history_json or []),
+                _transition(previous_state, TASK_MEASURED, "collect_metrics", self.clock.now()),
+            ]
+
+        await db.commit()
+        await db.refresh(snapshot)
+        return snapshot
 
     async def handle_account_health(self, db: AsyncSession, item: ChannelOpsQueueItem) -> PublishingAccount:
         account = await db.get(PublishingAccount, _uuid(item.payload_json["account_id"]))
@@ -1211,11 +1390,58 @@ def _positive_int(value: Any, *, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _nonnegative_int(value: Any, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _nonnegative_float(value: Any, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _list_value(value: Any) -> list | None:
+    if isinstance(value, list):
+        return list(value)
+    return None
+
+
 def _safe_privacy(value: Any) -> str | None:
     desired = str(value or "").strip().lower()
     if desired in _SAFE_PRIVACY_VALUES:
         return desired
     return None
+
+
+def _status_value(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip().lower()
 
 
 def _normalize_source_strategy(value: Any) -> str:

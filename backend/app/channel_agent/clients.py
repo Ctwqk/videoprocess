@@ -7,8 +7,12 @@ from datetime import datetime
 from typing import Any, Protocol
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.models.artifact import Artifact, ArtifactKind
+from app.models.job import Job, JobStatus, NodeExecution
 
 
 @dataclass(frozen=True)
@@ -21,8 +25,33 @@ class AutoFlowPlanObservation:
         return sum(1 for node in self.pipeline_definition.get("nodes", []) if node.get("type") == "youtube_upload")
 
 
+@dataclass(frozen=True)
+class AutoFlowExecutionObservation:
+    run_id: str
+    pipeline_id: str | None
+    job_id: str | None
+    status: str
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class AutoFlowJobObservation:
+    run_id: str
+    pipeline_id: str | None
+    job_id: str | None
+    status: str
+    error_message: str | None = None
+    youtube: dict[str, Any] | None = None
+
+
 class AutoFlowClient(Protocol):
     async def plan_task(self, task, request: dict[str, Any]) -> AutoFlowPlanObservation:
+        ...
+
+    async def execute_task(self, task, request: dict[str, Any]) -> AutoFlowExecutionObservation:
+        ...
+
+    async def observe_job(self, db, *, run_id: str, job_id: str) -> AutoFlowJobObservation:
         ...
 
 
@@ -43,9 +72,18 @@ class MiniMaxClient(Protocol):
 
 
 class FakeAutoFlowClient:
-    def __init__(self, *, include_upload: bool = True):
+    def __init__(
+        self,
+        *,
+        include_upload: bool = True,
+        youtube_video_id: str = "yt-fake-1",
+        observe_running_once: bool = False,
+    ):
         self.include_upload = include_upload
+        self.youtube_video_id = youtube_video_id
+        self.observe_running_once = observe_running_once
         self.requests: list[dict[str, Any]] = []
+        self._running_observed: set[str] = set()
 
     async def plan_task(self, task, request: dict[str, Any]) -> AutoFlowPlanObservation:
         self.requests.append(dict(request))
@@ -56,6 +94,140 @@ class FakeAutoFlowClient:
             plan_id=str(uuid.uuid4()),
             pipeline_definition={"nodes": nodes, "edges": []},
         )
+
+    async def execute_task(self, task, request: dict[str, Any]) -> AutoFlowExecutionObservation:
+        seed = f"channel-agent:{task.id}:{task.autoflow_plan_id}"
+        return AutoFlowExecutionObservation(
+            run_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{seed}:run")),
+            pipeline_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{seed}:pipeline")),
+            job_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{seed}:job")),
+            status="running",
+        )
+
+    async def observe_job(self, db, *, run_id: str, job_id: str) -> AutoFlowJobObservation:
+        key = f"{run_id}:{job_id}"
+        if self.observe_running_once and key not in self._running_observed:
+            self._running_observed.add(key)
+            return AutoFlowJobObservation(
+                run_id=run_id,
+                pipeline_id=None,
+                job_id=job_id,
+                status="running",
+            )
+        return AutoFlowJobObservation(
+            run_id=run_id,
+            pipeline_id=None,
+            job_id=job_id,
+            status="succeeded",
+            youtube={"video_id": self.youtube_video_id},
+        )
+
+
+class LocalAutoFlowClient:
+    def __init__(self, *, session_factory=None) -> None:
+        self.session_factory = session_factory
+
+    async def plan_task(self, task, request: dict[str, Any]) -> AutoFlowPlanObservation:
+        from app.autoflow.service import autoflow_service
+        from app.db import async_session
+        from app.schemas.autoflow import AutoFlowRequest
+
+        factory = self.session_factory or async_session
+        async with factory() as db:
+            plan = await autoflow_service.plan(AutoFlowRequest.model_validate(request), db)
+        return AutoFlowPlanObservation(
+            plan_id=plan.plan_id,
+            pipeline_definition=plan.pipeline_definition.model_dump(mode="json"),
+        )
+
+    async def execute_task(self, task, request: dict[str, Any]) -> AutoFlowExecutionObservation:
+        if not task.autoflow_plan_id:
+            return AutoFlowExecutionObservation(
+                run_id="",
+                pipeline_id=None,
+                job_id=None,
+                status="failed",
+                error_message="Production task has no AutoFlow plan id",
+            )
+
+        from app.autoflow.service import autoflow_service
+        from app.db import async_session
+        from app.schemas.autoflow import AutoFlowExecuteRequest
+
+        factory = self.session_factory or async_session
+        async with factory() as db:
+            run = await autoflow_service.execute(
+                AutoFlowExecuteRequest(plan_id=str(task.autoflow_plan_id), execute=True),
+                db,
+            )
+        return AutoFlowExecutionObservation(
+            run_id=run.run_id,
+            pipeline_id=run.pipeline_id,
+            job_id=run.job_id,
+            status=_execution_status(run.status),
+            error_message=run.error_message,
+        )
+
+    async def observe_job(self, db: AsyncSession, *, run_id: str, job_id: str) -> AutoFlowJobObservation:
+        job_uuid = _uuid_or_none(job_id)
+        if job_uuid is None:
+            return AutoFlowJobObservation(
+                run_id=run_id,
+                pipeline_id=None,
+                job_id=job_id,
+                status="failed",
+                error_message="Invalid AutoFlow job id",
+            )
+
+        job = await db.get(Job, job_uuid)
+        if job is None:
+            return AutoFlowJobObservation(
+                run_id=run_id,
+                pipeline_id=None,
+                job_id=job_id,
+                status="failed",
+                error_message="AutoFlow job not found",
+            )
+
+        status = _job_status(job.status)
+        youtube = await self._youtube_from_job(db, job) if status == "succeeded" else None
+        return AutoFlowJobObservation(
+            run_id=run_id,
+            pipeline_id=str(job.pipeline_id) if job.pipeline_id else None,
+            job_id=str(job.id),
+            status=status,
+            error_message=job.error_message if status == "failed" else None,
+            youtube=youtube,
+        )
+
+    async def _youtube_from_job(self, db: AsyncSession, job: Job) -> dict[str, Any] | None:
+        result = await db.execute(
+            select(NodeExecution)
+            .where(NodeExecution.job_id == job.id)
+            .where(NodeExecution.node_type == "youtube_upload")
+            .order_by(NodeExecution.node_id.asc())
+        )
+        node = result.scalars().first()
+        if node is None:
+            return None
+
+        artifact: Artifact | None = None
+        if node.output_artifact_id:
+            artifact = await db.get(Artifact, node.output_artifact_id)
+
+        if artifact is None:
+            artifact_result = await db.execute(
+                select(Artifact)
+                .where(Artifact.job_id == job.id)
+                .where(Artifact.node_execution_id == node.id)
+                .where(Artifact.kind == ArtifactKind.FINAL)
+                .order_by(Artifact.created_at.desc())
+            )
+            artifact = artifact_result.scalars().first()
+
+        if artifact is None:
+            return None
+        return _youtube_from_media_info(artifact.media_info)
 
 
 class FakeYouTubeClient:
@@ -172,3 +344,49 @@ def _thumbnail_prompt(*, prompt: str, title: str) -> str:
         f"YouTube thumbnail for: {base}. "
         "High contrast, clear subject, readable composition, no text overlay, 16:9."
     )
+
+
+def _status_value(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip().lower()
+
+
+def _execution_status(value: Any) -> str:
+    status = _status_value(value)
+    if status in {"failed", "cancelled", "partially_failed"}:
+        return "failed"
+    if status == "succeeded":
+        return "succeeded"
+    return "running"
+
+
+def _job_status(value: Any) -> str:
+    status = _status_value(value)
+    if status == _status_value(JobStatus.SUCCEEDED):
+        return "succeeded"
+    if status in {
+        _status_value(JobStatus.FAILED),
+        _status_value(JobStatus.CANCELLED),
+        _status_value(JobStatus.PARTIALLY_FAILED),
+    }:
+        return "failed"
+    return "running"
+
+
+def _youtube_from_media_info(media_info: Any) -> dict[str, Any] | None:
+    if not isinstance(media_info, dict):
+        return None
+    youtube = media_info.get("youtube")
+    if not isinstance(youtube, dict):
+        return None
+    video_id = str(youtube.get("video_id") or "").strip()
+    if not video_id:
+        return None
+    return dict(youtube)
+
+
+def _uuid_or_none(value: Any) -> uuid.UUID | None:
+    try:
+        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+    except (TypeError, ValueError):
+        return None
