@@ -1,0 +1,14 @@
+[
+  {
+    "type_name": "trim",
+    "display_name": "Trim",
+    "category": "transform",
+    "worker_type": "ffmpeg"
+  },
+  {
+    "type_name": "smart_trim",
+    "display_name": "Smart Trim",
+    "category": "ai_transform",
+    "worker_type": "vision"
+  }
+]

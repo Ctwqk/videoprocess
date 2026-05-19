@@ -1,0 +1,82 @@
+package httpapi
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestHealth(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["status"] != "ok" {
+		t.Fatalf("status payload = %#v", payload)
+	}
+}
+
+func TestNodeTypesIncludesTrim(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/node-types/trim", nil)
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["type_name"] != "trim" {
+		t.Fatalf("type_name = %#v", payload["type_name"])
+	}
+	if payload["worker_type"] != "ffmpeg" {
+		t.Fatalf("worker_type = %#v", payload["worker_type"])
+	}
+}
+
+func TestListEndpointsShapeMatchesPython(t *testing.T) {
+	// Without a store the API should still return the FastAPI shape
+	// `{"items": [...], "total": N}` rather than 500 or undefined.
+	cases := []string{
+		"/api/v1/pipelines",
+		"/api/v1/templates",
+		"/api/v1/jobs",
+		"/api/v1/assets",
+	}
+	for _, path := range cases {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+
+		NewServer().Router().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		items, ok := payload["items"].([]any)
+		if !ok {
+			t.Fatalf("%s: items field has wrong type %T", path, payload["items"])
+		}
+		if items == nil {
+			t.Fatalf("%s: items must be an empty array, not null", path)
+		}
+		if _, ok := payload["total"]; !ok {
+			t.Fatalf("%s: missing total key", path)
+		}
+	}
+}
