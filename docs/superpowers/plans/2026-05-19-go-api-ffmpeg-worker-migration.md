@@ -1640,11 +1640,12 @@ FROM golang:1.24-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
-RUN go build -o /out/vp-api-go ./cmd/vp-api
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vp-api-go ./cmd/vp-api
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/vp-api-go /usr/local/bin/vp-api-go
 EXPOSE 8080
 CMD ["vp-api-go"]
@@ -1659,8 +1660,9 @@ FROM golang:1.24-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
-RUN go build -o /out/vp-ffmpeg-worker-go ./cmd/vp-ffmpeg-worker
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vp-ffmpeg-worker-go ./cmd/vp-ffmpeg-worker
 
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
@@ -1691,6 +1693,13 @@ Add these services to `docker-compose.yml` without removing `api` or `ffmpeg-wor
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET: videoprocess
       EXO_WATCHDOG_URL: ${VP_WATCHDOG_URL:-http://host.docker.internal:8000}
+      EMBEDDING_GATEWAY_URL: ${VP_EMBEDDING_GATEWAY_URL:-http://host.docker.internal:8080}
+      QDRANT_URL: ${VP_QDRANT_URL:-http://host.docker.internal:6333}
+      VIDEO_SCHEDULE_DEFAULT_STATE: ${VIDEO_SCHEDULE_DEFAULT_STATE:-OPEN}
+      YOUTUBE_MANAGER_URL: ${YOUTUBE_MANAGER_URL:-http://youtube-manager:8899}
+      PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
+      X_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
+      XIAOHONGSHU_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8897
       API_PORT: "8080"
     volumes:
       - ${VP_STORAGE_ROOT:-./k8s-data/storage}:/data/storage
