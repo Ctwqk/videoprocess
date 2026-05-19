@@ -18,6 +18,8 @@ from app.channel_agent.clients import (
     YouTubeClient,
 )
 from app.channel_agent.constants import (
+    ACTIVE_TASK_STATES,
+    ALERT_CONSECUTIVE_UPLOAD_FAILURE,
     ALERT_MATERIAL_SUPPLY_LOW,
     ALERT_QUOTA_LOW,
     ALERT_TAKEDOWN,
@@ -25,10 +27,9 @@ from app.channel_agent.constants import (
     TASK_FAILED,
     TASK_HELD,
     TASK_PLANNING,
-    TASK_PRODUCING,
-    TASK_SCHEDULED,
     TASK_SELECTED,
     TASK_UPLOADED_PRIVATE,
+    UPLOAD_FAILURE_KEYWORDS,
 )
 from app.channel_agent.lane_prompts import build_lane_prompt
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
@@ -52,14 +53,7 @@ _SAFE_PRIVACY_VALUES = {"private", "unlisted"}
 _SOURCE_STRATEGY_ALIASES = {"external_search": "external_research"}
 _ALLOWED_SOURCE_STRATEGIES = set(get_args(SourceStrategy))
 _ALLOWED_PLANNING_MODES = set(get_args(PlanningMode))
-_ACTIVE_TASK_STATES = {
-    TASK_SELECTED,
-    TASK_PLANNING,
-    TASK_HELD,
-    TASK_PRODUCING,
-    TASK_UPLOADED_PRIVATE,
-    TASK_SCHEDULED,
-}
+_PUBLICATION_CADENCE_STATUSES = {"public", "scheduled"}
 
 
 class ChannelAgentService:
@@ -120,9 +114,13 @@ class ChannelAgentService:
             lane_formats_by_lane=lane_formats_by_lane,
             bucket=bucket,
         )
-        accepted_candidates, rejected_candidates = await self._evaluate_tick_candidates(db, candidates)
-        per_lane = _per_lane_counts(lanes, candidates)
         side_effects_disabled = bool(channel.dry_run or channel.halted_at is not None)
+        accepted_candidates, rejected_candidates = await self._evaluate_tick_candidates(
+            db,
+            candidates,
+            enqueue_alerts=not side_effects_disabled,
+        )
+        per_lane = _per_lane_counts(lanes, candidates)
         low_supply_alerts = await self._maybe_alert_low_supply(
             db,
             channel,
@@ -372,12 +370,19 @@ class ChannelAgentService:
         self,
         db: AsyncSession,
         candidates: list[dict[str, Any]],
+        *,
+        enqueue_alerts: bool,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         accepted: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
         selected_account_counts: dict[str, int] = {}
         for candidate in candidates:
-            rejection = await self._evaluate_candidate_guards(db, candidate, selected_account_counts)
+            rejection = await self._evaluate_candidate_guards(
+                db,
+                candidate,
+                selected_account_counts,
+                enqueue_alerts=enqueue_alerts,
+            )
             if rejection is not None:
                 rejected.append(rejection)
                 continue
@@ -391,43 +396,207 @@ class ChannelAgentService:
         db: AsyncSession,
         candidate: dict[str, Any],
         selected_account_counts: dict[str, int],
+        *,
+        enqueue_alerts: bool,
     ) -> dict[str, Any] | None:
         account = candidate.get("account")
-        lane = candidate.get("lane")
-        lane_format = candidate.get("lane_format")
         if account is None:
-            return {
-                "candidate_id": candidate["candidate_id"],
-                "lane_id": str(lane.id) if lane is not None else "",
-                "format_id": str(lane_format.id) if lane_format is not None else "",
-                "account_id": "",
-                "guard": "no_enabled_account",
-                "reason": "No enabled publishing account is available for this candidate.",
-            }
+            return _candidate_rejection(
+                candidate,
+                guard="no_enabled_account",
+                reason="No enabled publishing account is available for this candidate.",
+            )
 
         account_id = str(account.id)
         active_count = await self._active_task_count_for_account(db, account.id)
         active_count += selected_account_counts.get(account_id, 0)
-        if active_count <= 0:
-            return None
+        if active_count > 0:
+            task_label = "task" if active_count == 1 else "tasks"
+            return _candidate_rejection(
+                candidate,
+                guard="account_concurrency",
+                reason=(
+                    f"Account {account_id} has {active_count} active {task_label}; "
+                    "account concurrency is limited to 1."
+                ),
+            )
 
-        task_label = "task" if active_count == 1 else "tasks"
-        return {
-            "candidate_id": candidate["candidate_id"],
-            "lane_id": str(lane.id) if lane is not None else "",
-            "format_id": str(lane_format.id) if lane_format is not None else "",
-            "account_id": account_id,
-            "guard": "account_concurrency",
-            "reason": f"Account {account_id} has {active_count} active {task_label}; account concurrency is limited to 1.",
-        }
+        upload_failure_rejection = await self._consecutive_upload_failure_guard(
+            db,
+            candidate,
+            enqueue_alerts=enqueue_alerts,
+        )
+        if upload_failure_rejection is not None:
+            return upload_failure_rejection
+
+        return await self._lane_cadence_guard(db, candidate)
 
     async def _active_task_count_for_account(self, db: AsyncSession, account_id) -> int:
         result = await db.execute(
             select(func.count(ProductionTask.id))
             .where(ProductionTask.target_account_id == account_id)
-            .where(ProductionTask.state.in_(_ACTIVE_TASK_STATES))
+            .where(ProductionTask.state.in_(ACTIVE_TASK_STATES))
         )
         return int(result.scalar_one() or 0)
+
+    async def _consecutive_upload_failure_guard(
+        self,
+        db: AsyncSession,
+        candidate: dict[str, Any],
+        *,
+        enqueue_alerts: bool,
+    ) -> dict[str, Any] | None:
+        account = candidate.get("account")
+        if account is None:
+            return None
+
+        recent_tasks = (
+            await db.execute(
+                select(ProductionTask)
+                .where(ProductionTask.target_account_id == account.id)
+                .order_by(ProductionTask.created_at.desc())
+                .limit(5)
+            )
+        ).scalars().all()
+        created_times = [_datetime_to_utc(task.created_at) for task in recent_tasks if task.created_at is not None]
+        if not created_times:
+            return None
+
+        oldest_considered = min(created_times)
+        if oldest_considered < self.clock.now() - timedelta(hours=24):
+            return None
+
+        failed_upload_tasks = [task for task in recent_tasks if _is_upload_failure_task(task)]
+        if len(failed_upload_tasks) < 3:
+            return None
+
+        if enqueue_alerts:
+            await self._enqueue_consecutive_upload_failure_alert(db, account, failed_upload_tasks)
+        return _candidate_rejection(
+            candidate,
+            guard="consecutive_upload_failure",
+            reason=(
+                f"Account {account.id} has {len(failed_upload_tasks)} upload-like failures "
+                "in the recent task window."
+            ),
+        )
+
+    async def _enqueue_consecutive_upload_failure_alert(
+        self,
+        db: AsyncSession,
+        account: PublishingAccount,
+        failed_tasks: list[ProductionTask],
+    ) -> None:
+        channel_id = str(account.channel_profile_id)
+        account_id = str(account.id)
+        await self._enqueue_alert(
+            db,
+            ALERT_CONSECUTIVE_UPLOAD_FAILURE,
+            resource_id=account_id,
+            severity="critical",
+            message=(
+                f"Account {account_id} has repeated upload/publish failures; pause the account with "
+                f"POST /api/v1/channel-agent/accounts/{account_id}/pause, then inspect failed tasks at "
+                f"/api/v1/channel-agent/channels/{channel_id}/tasks?account_id={account_id}&state=failed."
+            ),
+            details={
+                "account_id": account_id,
+                "failed_task_ids": [str(task.id) for task in failed_tasks],
+                "failure_reasons": [task.failure_reason or "" for task in failed_tasks],
+            },
+            channel_profile_id=account.channel_profile_id,
+        )
+
+    async def _lane_cadence_guard(
+        self,
+        db: AsyncSession,
+        candidate: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        lane = candidate.get("lane")
+        if lane is None:
+            return None
+
+        publications = await self._published_publications_for_lane(db, lane)
+        now = self.clock.now()
+        max_posts_per_day = int(lane.max_posts_per_day or 0)
+        if max_posts_per_day > 0:
+            cutoff = now - timedelta(hours=24)
+            recent_count = sum(1 for _publication, effective_at in publications if cutoff <= effective_at <= now)
+            if recent_count >= max_posts_per_day:
+                return _candidate_rejection(
+                    candidate,
+                    guard="lane_cadence",
+                    reason=(
+                        f"Lane {lane.id} has {recent_count} scheduled/public publications in the past 24 hours; "
+                        f"max_posts_per_day is {max_posts_per_day}."
+                    ),
+                )
+
+        cooldown_minutes = int(lane.cooldown_after_post_minutes or 0)
+        if cooldown_minutes > 0 and publications:
+            latest_effective_at = publications[0][1]
+            cooldown = timedelta(minutes=cooldown_minutes)
+            if now - latest_effective_at < cooldown:
+                return _candidate_rejection(
+                    candidate,
+                    guard="lane_cadence",
+                    reason=(
+                        f"Lane {lane.id} is inside the {cooldown_minutes} minute post cooldown "
+                        f"after {latest_effective_at.isoformat()}."
+                    ),
+                )
+
+        max_streak = int(lane.max_consecutive_streak or 0)
+        if max_streak > 0:
+            current_streak = await self._current_lane_publication_streak(db, lane)
+            if current_streak >= max_streak:
+                return _candidate_rejection(
+                    candidate,
+                    guard="lane_cadence",
+                    reason=(
+                        f"Lane {lane.id} has a publication streak of {current_streak}; "
+                        f"max_consecutive_streak is {max_streak}."
+                    ),
+                )
+
+        return None
+
+    async def _published_publications_for_lane(
+        self,
+        db: AsyncSession,
+        lane: TopicLane,
+    ) -> list[tuple[PublicationRecord, datetime]]:
+        result = await db.execute(
+            select(PublicationRecord, ProductionTask)
+            .join(ProductionTask, PublicationRecord.production_task_id == ProductionTask.id)
+            .where(ProductionTask.topic_lane_id == lane.id)
+            .where(PublicationRecord.publish_status.in_(_PUBLICATION_CADENCE_STATUSES))
+        )
+        publications: list[tuple[PublicationRecord, datetime]] = []
+        for publication, _task in result.all():
+            effective_at = _publication_effective_time(publication)
+            if effective_at is not None:
+                publications.append((publication, effective_at))
+        return sorted(publications, key=lambda item: item[1], reverse=True)
+
+    async def _current_lane_publication_streak(self, db: AsyncSession, lane: TopicLane) -> int:
+        result = await db.execute(
+            select(PublicationRecord, ProductionTask)
+            .join(ProductionTask, PublicationRecord.production_task_id == ProductionTask.id)
+            .where(ProductionTask.channel_profile_id == lane.channel_profile_id)
+            .where(PublicationRecord.publish_status.in_(_PUBLICATION_CADENCE_STATUSES))
+        )
+        rows: list[tuple[ProductionTask, datetime]] = []
+        for publication, task in result.all():
+            effective_at = _publication_effective_time(publication)
+            if effective_at is not None:
+                rows.append((task, effective_at))
+        streak = 0
+        for task, _effective_at in sorted(rows, key=lambda item: item[1], reverse=True):
+            if task.topic_lane_id != lane.id:
+                break
+            streak += 1
+        return streak
 
     def _task_from_candidate(
         self,
@@ -903,6 +1072,20 @@ def _per_lane_counts(lanes: list[TopicLane], candidates: list[dict[str, Any]]) -
     return per_lane
 
 
+def _candidate_rejection(candidate: dict[str, Any], *, guard: str, reason: str) -> dict[str, Any]:
+    lane = candidate.get("lane")
+    lane_format = candidate.get("lane_format")
+    account = candidate.get("account")
+    return {
+        "candidate_id": candidate["candidate_id"],
+        "lane_id": str(lane.id) if lane is not None else "",
+        "format_id": str(lane_format.id) if lane_format is not None else "",
+        "account_id": str(account.id) if account is not None else "",
+        "guard": guard,
+        "reason": reason,
+    }
+
+
 def _candidate_id(source: str, lane_id, format_id, bucket: str, *, seed_id=None) -> str:
     if source == "manual_seed" and seed_id is not None:
         return f"{source}:{seed_id}:lane:{lane_id or 'unassigned'}:format:{format_id or 'none'}:{bucket}"
@@ -929,6 +1112,31 @@ def _parse_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _datetime_to_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _publication_effective_time(publication: PublicationRecord) -> datetime | None:
+    value = (
+        publication.scheduled_publish_at
+        or publication.public_at
+        or publication.uploaded_at
+        or publication.created_at
+    )
+    if value is None:
+        return None
+    return _datetime_to_utc(value)
+
+
+def _is_upload_failure_task(task: ProductionTask) -> bool:
+    if task.state != TASK_FAILED:
+        return False
+    reason = str(task.failure_reason or "").casefold()
+    return any(keyword.casefold() in reason for keyword in UPLOAD_FAILURE_KEYWORDS)
 
 
 def _dict_value(value: Any) -> dict[str, Any]:

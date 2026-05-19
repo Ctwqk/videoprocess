@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
@@ -563,6 +563,212 @@ async def test_producing_task_blocks_same_account_candidate(service_session):
     assert queue_items == []
     assert audit.tasks_selected == 0
     assert rejected[0]["guard"] == "account_concurrency"
+
+
+@pytest.mark.asyncio
+async def test_account_concurrency_guard_blocks_active_account(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    service_session.add(
+        ProductionTask(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            source="manual_seed",
+            prompt="held task",
+            state="held",
+            channel_config_snapshot_json={},
+        )
+    )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="new task",
+            title_seed="new",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service().tick(service_session, channel_id=channel.id)
+
+    assert audit.tasks_selected == 0
+    assert audit.tasks_rejected >= 1
+    assert audit.decision_summary_json["rejected_candidates"][0]["guard"] == "account_concurrency"
+
+
+@pytest.mark.asyncio
+async def test_consecutive_upload_failure_guard_uses_recent_window_and_alerts(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    for index, reason in enumerate(
+        ["youtube upload failed", "ok", "quota exhausted", "thumbnail failed", "publish failed"]
+    ):
+        state = "failed" if index != 1 else "measured"
+        task = ProductionTask(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            source="manual_seed",
+            prompt=f"task {index}",
+            state=state,
+            failure_reason=reason if state == "failed" else None,
+            channel_config_snapshot_json={},
+            created_at=clock.now() - timedelta(hours=5 - index),
+        )
+        service_session.add(task)
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="blocked",
+            title_seed="blocked",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service(clock=clock).tick(service_session, channel_id=channel.id)
+
+    assert audit.tasks_selected == 0
+    rejected = audit.decision_summary_json["rejected_candidates"][0]
+    assert rejected["guard"] == "consecutive_upload_failure"
+    alert = (
+        await service_session.execute(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "send_alert"))
+    ).scalar_one()
+    assert "pause the account" in alert.payload_json["message"]
+    assert str(account.id) in alert.payload_json["message"]
+
+
+@pytest.mark.asyncio
+async def test_consecutive_upload_failure_guard_allows_old_recent_window(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    for index, reason in enumerate(
+        ["youtube upload failed", "quota exhausted", "thumbnail failed", "publish failed", "oauth failed"]
+    ):
+        task = ProductionTask(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            source="manual_seed",
+            prompt=f"task {index}",
+            state="failed",
+            failure_reason=reason,
+            channel_config_snapshot_json={},
+            created_at=clock.now() - timedelta(hours=30 - index),
+        )
+        service_session.add(task)
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="allowed",
+            title_seed="allowed",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service(clock=clock).tick(service_session, channel_id=channel.id)
+
+    assert audit.tasks_selected == 1
+    assert audit.decision_summary_json["rejected_candidates"] == []
+    alerts = (await service_session.execute(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "send_alert"))).scalars().all()
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_lane_cadence_guard_counts_publications_not_created_tasks(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.max_posts_per_day = 1
+    published_task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        lane_format_id=lane_format.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="published",
+        state="published",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(published_task)
+    await service_session.flush()
+    service_session.add(
+        PublicationRecord(
+            production_task_id=published_task.id,
+            platform="youtube",
+            account_id=account.id,
+            platform_content_id="yt-1",
+            title="published",
+            desired_privacy="unlisted",
+            current_privacy="private",
+            publish_status="scheduled",
+            scheduled_publish_at=clock.now() - timedelta(hours=1),
+            compliance_disposition="assumed_fair_use",
+        )
+    )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="new",
+            title_seed="new",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service(clock=clock).tick(service_session, channel_id=channel.id)
+
+    assert audit.tasks_selected == 0
+    assert audit.decision_summary_json["rejected_candidates"][0]["guard"] == "lane_cadence"
+
+
+@pytest.mark.asyncio
+async def test_lane_cadence_guard_ignores_held_tasks_without_publications(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.max_posts_per_day = 1
+    busy_account = PublishingAccount(
+        channel_profile_id=channel.id,
+        account_label="busy",
+        platform_account_id="yt-2",
+        credential_ref="youtube/busy",
+        external_asset_auto_publish=True,
+    )
+    service_session.add(busy_account)
+    await service_session.flush()
+    for index in range(4):
+        service_session.add(
+            ProductionTask(
+                channel_profile_id=channel.id,
+                topic_lane_id=lane.id,
+                lane_format_id=lane_format.id,
+                target_account_id=busy_account.id,
+                source="manual_seed",
+                prompt=f"held {index}",
+                state="held",
+                channel_config_snapshot_json={},
+                created_at=clock.now() - timedelta(hours=index),
+            )
+        )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="new",
+            title_seed="new",
+        )
+    )
+    await service_session.commit()
+
+    audit = await _service(clock=clock).tick(service_session, channel_id=channel.id)
+
+    assert audit.tasks_selected == 1
+    assert audit.decision_summary_json["rejected_candidates"] == []
 
 
 @pytest.mark.asyncio

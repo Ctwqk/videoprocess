@@ -21,8 +21,33 @@ TASK_FAILED = "failed"
 TASK_CANCELLED = "cancelled"
 TASK_REJECTED = "rejected"
 
+ACTIVE_TASK_STATES = {
+    TASK_SELECTED,
+    TASK_PLANNING,
+    TASK_PRODUCING,
+    TASK_UPLOADED_PRIVATE,
+    TASK_HELD,
+    TASK_SCHEDULED,
+}
+TERMINAL_TASK_STATES = {
+    TASK_FAILED,
+    TASK_REJECTED,
+    TASK_CANCELLED,
+    TASK_PUBLISHED,
+    TASK_MEASURED,
+}
+UPLOAD_FAILURE_KEYWORDS = {
+    "upload",
+    "publish",
+    "youtube",
+    "quota",
+    "oauth",
+    "video_id",
+    "thumbnail",
+}
+
+ALERT_CONSECUTIVE_UPLOAD_FAILURE = "consecutive_upload_failure"
 ALERT_TOKEN_EXPIRING = "token_expiring_24h"
 ALERT_QUOTA_LOW = "quota_below_20pct"
 ALERT_TAKEDOWN = "takedown_event_logged"
 ALERT_MATERIAL_SUPPLY_LOW = "material_supply_low"
-
