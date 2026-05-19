@@ -136,6 +136,50 @@ func TestListEndpointsFailClosedWhenStubStoreDisabled(t *testing.T) {
 	}
 }
 
+func TestDetailEndpointsFailClosedWhenStubStoreDisabled(t *testing.T) {
+	cases := []string{
+		"/api/v1/pipelines/00000000-0000-0000-0000-000000000001",
+		"/api/v1/assets/00000000-0000-0000-0000-000000000002",
+		"/api/v1/artifacts/00000000-0000-0000-0000-000000000003",
+		"/api/v1/jobs/00000000-0000-0000-0000-000000000004",
+	}
+	for _, path := range cases {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+
+		NewServerWithOptions(nil, ServerOptions{AllowStubStore: false}).Router().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		var payload map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s payload: %v", path, err)
+		}
+		if payload["detail"] != "database unavailable" {
+			t.Fatalf("%s payload = %#v", path, payload)
+		}
+	}
+}
+
+func TestScheduleStatusFailsClosedWithoutStore(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/internal/schedule/video/status", nil)
+	rec := httptest.NewRecorder()
+
+	NewServerWithOptions(nil, ServerOptions{AllowStubStore: false}).Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["detail"] != "database unavailable" {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
 func TestRecoveryMiddlewareReturnsFastAPIStyleError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/panic-test", nil)
 	rec := httptest.NewRecorder()

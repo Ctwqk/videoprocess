@@ -28,10 +28,6 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "total": total})
 }
 
-func (s *Server) scheduleStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"state": "OPEN"})
-}
-
 func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
 		if !s.allowStubStore {

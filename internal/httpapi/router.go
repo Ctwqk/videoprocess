@@ -50,9 +50,13 @@ func (s *Server) Router() http.Handler {
 		r.Get("/node-types", s.listNodeTypes)
 		r.Get("/node-types/{typeName}", s.getNodeType)
 		r.Get("/pipelines", s.listPipelines)
+		r.Get("/pipelines/{pipelineID}", s.getPipeline)
 		r.Get("/templates", s.listTemplates)
 		r.Get("/assets", s.listAssets)
+		r.Get("/assets/{assetID}", s.getAsset)
+		r.Get("/artifacts/{artifactID}", s.getArtifact)
 		r.Get("/jobs", s.listJobs)
+		r.Get("/jobs/{jobID}", s.getJob)
 	})
 	r.Route("/internal/schedule/video", func(r chi.Router) {
 		r.Get("/status", s.scheduleStatus)
