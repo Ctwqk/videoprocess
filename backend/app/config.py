@@ -57,6 +57,20 @@ class Settings(BaseSettings):
     channel_agent_alert_email_to: str = ""
     channel_agent_runner_poll_seconds: float = 5.0
 
+    # Policy Decision Service
+    pds_enabled: bool = False
+    pds_base_url: str = "http://pds:8080"
+    pds_client_id: str = "videoprocess-channel-agent"
+    pds_timeout_seconds: float = 0.5
+
+    # Risk event Kafka
+    risk_kafka_brokers: str = "redpanda:9092"
+    risk_vp_actions_topic: str = "vp.actor.actions.v1"
+    risk_outbox_batch_size: int = 100
+    risk_outbox_poll_seconds: float = 1.0
+    risk_outbox_max_backoff_seconds: float = 60.0
+    risk_outbox_metrics_port: int = 9101
+
     # MiniMax image generation. Default endpoint/model were checked against
     # the MiniMax CN docs for the image_generation API on 2026-05-18.
     minimax_api_key: str = ""

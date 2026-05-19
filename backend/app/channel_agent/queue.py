@@ -41,6 +41,7 @@ class ChannelOpsQueueService:
         channel_profile_id=None,
         parent_queue_item_id=None,
         max_attempts: int = 3,
+        commit: bool = True,
     ) -> ChannelOpsQueueItem:
         existing = await self.get_by_key(db, idempotency_key)
         if existing is not None:
@@ -57,6 +58,10 @@ class ChannelOpsQueueService:
             max_attempts=max_attempts,
         )
         db.add(item)
+        if not commit:
+            await db.flush()
+            return item
+
         try:
             await db.commit()
         except IntegrityError:

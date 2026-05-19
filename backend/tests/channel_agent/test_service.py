@@ -17,6 +17,7 @@ from app.channel_agent.clients import (
 )
 from app.channel_agent.queue import ChannelOpsQueueService
 from app.channel_agent.service import ChannelAgentService
+from app.events.outbox import event_outbox_table
 from app.models.channel_agent import (
     AgentTickAudit,
     ChannelOpsQueueItem,
@@ -31,6 +32,7 @@ from app.models.channel_agent import (
     TakedownEvent,
     TopicLane,
 )
+from app.pds_client import PDSDecision, PDSDecisionRequest
 from app.schemas.autoflow import AutoFlowRequest
 
 
@@ -47,6 +49,7 @@ CHANNEL_AGENT_TABLES = (
     PublicationRecord.__table__,
     TakedownEvent.__table__,
     FeedbackSnapshot.__table__,
+    event_outbox_table,
 )
 
 
@@ -89,7 +92,15 @@ async def _channel_graph(db, *, dry_run: bool = True, external_auto: bool = True
     return channel, lane, account, lane_format
 
 
-def _service(*, clock=None, autoflow=None, youtube=None, minimax=None) -> ChannelAgentService:
+def _service(
+    *,
+    clock=None,
+    autoflow=None,
+    youtube=None,
+    minimax=None,
+    pds=None,
+    event_outbox=None,
+) -> ChannelAgentService:
     clock = clock or FakeClock(datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc))
     queue = ChannelOpsQueueService(clock=clock)
     return ChannelAgentService(
@@ -98,6 +109,8 @@ def _service(*, clock=None, autoflow=None, youtube=None, minimax=None) -> Channe
         autoflow_client=autoflow or FakeAutoFlowClient(),
         youtube_client=youtube or FakeYouTubeClient(),
         minimax_client=minimax or FakeMiniMaxClient(),
+        pds_client=pds,
+        event_outbox=event_outbox,
     )
 
 
@@ -172,6 +185,28 @@ class AlwaysRunningAutoFlowClient(FakeAutoFlowClient):
             job_id=job_id,
             status="running",
         )
+
+
+class FakePDSClient:
+    def __init__(self, decision: PDSDecision | None = None) -> None:
+        self.decision = decision or PDSDecision(decision_id="decision-allow", verdict="allow")
+        self.requests: list[PDSDecisionRequest] = []
+
+    async def decide(self, request: PDSDecisionRequest) -> PDSDecision:
+        self.requests.append(request)
+        return self.decision
+
+
+class RaisingEventOutbox:
+    async def enqueue(self, *args, **kwargs) -> str:
+        raise RuntimeError("outbox unavailable")
+
+
+async def _outbox_payloads(db) -> list[dict]:
+    result = await db.execute(
+        select(event_outbox_table.c.payload).order_by(event_outbox_table.c.created_at.asc())
+    )
+    return [dict(row[0]) for row in result.all()]
 
 
 def test_lane_prompt_template_is_structured():
@@ -407,6 +442,158 @@ async def test_active_tick_creates_task_and_plan_queue_item(service_session):
     ).scalar_one()
     assert queue_item.idempotency_key == f"plan_task:{task.id}"
     assert queue_item.channel_profile_id == channel.id
+    payloads = await _outbox_payloads(service_session)
+    assert [payload["action_type"] for payload in payloads] == ["candidate_accepted"]
+    assert payloads[0]["actor_id"] == str(account.id)
+    assert payloads[0]["metadata"]["candidate_id"]
+    assert payloads[0]["metadata"]["task_id"] == str(task.id)
+    assert payloads[0]["metadata"]["score"] == 0.0
+    assert payloads[0]["metadata"]["reason_codes"] == []
+    assert payloads[0]["metadata"]["warning"] == "pds_disabled"
+
+
+@pytest.mark.asyncio
+async def test_tick_rejects_candidate_when_pds_blocks(service_session):
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    lane_format.enabled = False
+    seed = ManualSeed(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        target_account_id=account.id,
+        prompt="publish risky video",
+        title_seed="risky",
+        status="active",
+    )
+    service_session.add(seed)
+    await service_session.commit()
+    pds = FakePDSClient(
+        PDSDecision(
+            decision_id="decision-block",
+            verdict="block",
+            score=0.91,
+            reasons=[{"code": "publishing_burst", "rule": "burst_publish_feature_flag"}],
+            rules_version="risk-v1",
+            metadata={"warning": "feature_provider_unavailable"},
+        )
+    )
+
+    audit = await _service(pds=pds).tick(service_session, channel_id=channel.id)
+
+    tasks = (await service_session.execute(select(ProductionTask))).scalars().all()
+    assert tasks == []
+    assert audit.tasks_selected == 0
+    assert audit.tasks_rejected == 1
+    assert pds.requests
+    assert pds.requests[0].action_type == "candidate_accept"
+    assert pds.requests[0].actor_id == str(account.id)
+    assert pds.requests[0].context["lane_id"] == str(lane.id)
+    assert audit.guards_triggered_json[0]["guard"] == "pds_blocked"
+    payloads = await _outbox_payloads(service_session)
+    assert [payload["action_type"] for payload in payloads] == ["candidate_blocked"]
+    assert payloads[0]["metadata"]["decision_id"] == "decision-block"
+    assert payloads[0]["metadata"]["verdict"] == "block"
+    assert payloads[0]["metadata"]["score"] == 0.91
+    assert payloads[0]["metadata"]["rules_version"] == "risk-v1"
+    assert payloads[0]["metadata"]["reason_codes"] == ["publishing_burst"]
+    assert payloads[0]["metadata"]["warning"] == "feature_provider_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_tick_skips_candidate_pds_gate(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=True)
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="dry run candidate",
+            title_seed="dry run",
+        )
+    )
+    await service_session.commit()
+    pds = FakePDSClient(PDSDecision(decision_id="decision-block", verdict="block"))
+
+    audit = await _service(pds=pds).tick(service_session, channel_id=channel.id)
+
+    assert pds.requests == []
+    assert audit.tasks_selected == 0
+    assert audit.tasks_rejected == 0
+    assert audit.decision_summary_json["rejected_candidates"] == []
+    tasks = (await service_session.execute(select(ProductionTask))).scalars().all()
+    assert tasks == []
+
+
+@pytest.mark.asyncio
+async def test_lane_cadence_rejection_happens_before_pds(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc))
+    channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)
+    lane.max_posts_per_day = 1
+    published_task = ProductionTask(
+        channel_profile_id=channel.id,
+        topic_lane_id=lane.id,
+        lane_format_id=lane_format.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="published",
+        state="published",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(published_task)
+    await service_session.flush()
+    service_session.add(
+        _publication_for_task(
+            published_task,
+            account,
+            publish_status="scheduled",
+            scheduled_publish_at=clock.now() - timedelta(hours=1),
+        )
+    )
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="new candidate",
+            title_seed="new",
+        )
+    )
+    await service_session.commit()
+    pds = FakePDSClient(PDSDecision(decision_id="decision-block", verdict="block"))
+
+    audit = await _service(clock=clock, pds=pds).tick(service_session, channel_id=channel.id)
+
+    assert pds.requests == []
+    assert audit.tasks_selected == 0
+    assert audit.tasks_rejected >= 1
+    assert audit.decision_summary_json["rejected_candidates"][0]["guard"] == "lane_cadence"
+
+
+@pytest.mark.asyncio
+async def test_candidate_accepted_outbox_failure_rolls_back_task_and_plan_queue(service_session):
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="make a test short",
+            title_seed="test short",
+        )
+    )
+    await service_session.commit()
+
+    with pytest.raises(RuntimeError, match="outbox unavailable"):
+        await _service(event_outbox=RaisingEventOutbox()).tick(service_session, channel_id=channel.id)
+    await service_session.rollback()
+
+    tasks = (await service_session.execute(select(ProductionTask))).scalars().all()
+    plan_items = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "plan_task")
+        )
+    ).scalars().all()
+    assert tasks == []
+    assert plan_items == []
 
 
 @pytest.mark.asyncio
@@ -1813,19 +2000,99 @@ async def test_promote_publication_schedules_youtube_publish_at(service_session)
     service_session.add(item)
     await service_session.commit()
     youtube = FakeYouTubeClient()
+    pds = FakePDSClient(
+        PDSDecision(
+            decision_id="decision-allow",
+            verdict="allow",
+            score=0.12,
+            reasons=[{"code": "low_risk"}],
+            rules_version="risk-v2",
+            metadata={"warning": "feature_cache_miss"},
+        )
+    )
 
-    await _service(youtube=youtube).handle_promote_publication(service_session, item)
+    await _service(youtube=youtube, pds=pds).handle_promote_publication(service_session, item)
     await service_session.refresh(publication)
 
     assert publication.publish_status == "scheduled"
     assert publication.scheduled_publish_at is not None
     assert youtube.scheduled[0]["video_id"] == "yt-video-1"
+    assert pds.requests
+    assert pds.requests[0].action_type == "publish"
     metrics_item = (
         await service_session.execute(
             select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "collect_metrics")
         )
     ).scalar_one()
     assert _as_utc(metrics_item.run_after) == datetime(2026, 5, 18, 11, 0, tzinfo=timezone.utc)
+    payloads = await _outbox_payloads(service_session)
+    assert [payload["action_type"] for payload in payloads] == [
+        "publication_promotion_attempted",
+        "publication_scheduled",
+    ]
+    assert payloads[1]["metadata"]["publication_id"] == str(publication.id)
+    assert payloads[1]["metadata"]["decision_id"] == "decision-allow"
+    assert payloads[1]["metadata"]["score"] == 0.12
+    assert payloads[1]["metadata"]["rules_version"] == "risk-v2"
+    assert payloads[1]["metadata"]["reason_codes"] == ["low_risk"]
+    assert payloads[1]["metadata"]["warning"] == "feature_cache_miss"
+
+
+@pytest.mark.asyncio
+async def test_promote_publication_holds_when_pds_blocks(service_session):
+    channel, _lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        source="manual_seed",
+        prompt="publish risky video",
+        state="uploaded_private",
+        channel_config_snapshot_json={},
+    )
+    service_session.add(task)
+    await service_session.flush()
+    publication = _publication_for_task(task, account, publish_status="uploaded", title="risky")
+    service_session.add(publication)
+    await service_session.flush()
+    item = ChannelOpsQueueItem(
+        kind="promote_publication",
+        idempotency_key=f"promote_publication:{publication.id}:unlisted",
+        payload_json={"publication_id": str(publication.id), "target_visibility": "unlisted"},
+    )
+    service_session.add(item)
+    await service_session.commit()
+    pds = FakePDSClient(
+        PDSDecision(
+            decision_id="decision-block",
+            verdict="block",
+            score=0.94,
+            reasons=[{"code": "burst"}],
+            rules_version="risk-v3",
+            metadata={"warning": "aggregator_stale"},
+        )
+    )
+    youtube = FakeYouTubeClient()
+
+    result = await _service(youtube=youtube, pds=pds).handle_promote_publication(service_session, item)
+    await service_session.refresh(task)
+
+    assert result.publish_status == "held"
+    assert task.state == "held"
+    assert "pds_blocked:decision-block" in list(result.warnings_json or [])
+    assert youtube.scheduled == []
+    assert pds.requests
+    assert pds.requests[0].action_type == "publish"
+    payloads = await _outbox_payloads(service_session)
+    assert [payload["action_type"] for payload in payloads] == [
+        "publication_promotion_attempted",
+        "publication_promotion_blocked",
+    ]
+    assert payloads[1]["metadata"]["decision_id"] == "decision-block"
+    assert payloads[1]["metadata"]["verdict"] == "block"
+    assert payloads[1]["metadata"]["score"] == 0.94
+    assert payloads[1]["metadata"]["rules_version"] == "risk-v3"
+    assert payloads[1]["metadata"]["reason_codes"] == ["burst"]
+    assert payloads[1]["metadata"]["warning"] == "aggregator_stale"
 
 
 @pytest.mark.asyncio
