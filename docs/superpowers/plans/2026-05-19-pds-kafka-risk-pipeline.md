@@ -92,6 +92,7 @@
 
 - Create `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/redpanda.yaml`: Redpanda StatefulSet and Service.
 - Create `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/vp-feature-aggregator.yaml`: aggregator Deployment, Service, ConfigMap.
+- Create `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/event-outbox-relay.yaml`: relay Deployment that reuses the VideoProcess backend image with the `python event_outbox_relay.py` command.
 - Modify `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/kustomization.yaml`: include new manifests.
 
 ## Task 1: PDS EvalState And Feature Providers
@@ -101,11 +102,17 @@
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/engine/engine.go`
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/rule.go`
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/cel.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/keyword.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/rate_limit.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/combiner.go`
 - Create: `/home/taiwei/Constructure-repos/policy-decision-service/internal/profile/provider.go`
 - Create: `/home/taiwei/Constructure-repos/policy-decision-service/internal/profile/http_provider.go`
 - Create: `/home/taiwei/Constructure-repos/policy-decision-service/internal/profile/provider_test.go`
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/engine/rule_engine_test.go`
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/cel_test.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/keyword_test.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/rate_limit_test.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/combiner_test.go`
 
 - [ ] **Step 1: Write provider fail-open tests**
 
@@ -473,6 +480,11 @@ out, _, err := r.program.Eval(map[string]any{
 ```
 
 Apply the same `EvalState` signature to keyword, rate-limit, and combiner rules.
+Concretely:
+
+- In `internal/rules/keyword.go` and `internal/rules/rate_limit.go`, change `Evaluate(ctx, req DecideRequest)` to `Evaluate(ctx, state EvalState)` and read fields via `state.Request.*`. No feature-namespace access is added in this step; these two rule types stay request-driven.
+- In `internal/rules/combiner.go`, change both `Evaluate(ctx, state EvalState)` and `EvaluateWithResults(ctx, state EvalState, prior map[string]RuleResult)`. When a dependency in `prior` has `Err != nil`, treat it as not-matched but record the skipped dependency on `RuleResult.Reason.Detail` (for example `"skipped_dep=cel_burst err=context deadline exceeded"`) so observability has a signal. The Prometheus counter that surfaces this is added in Task 2 Step 5b.
+- Update the matching test files (`keyword_test.go`, `rate_limit_test.go`, `combiner_test.go`) so all callers build an `EvalState` instead of a raw `DecideRequest`. The combiner test gains a case where a dependency `RuleResult` carries an `Err` and the combiner reports the dependency in `Reason.Detail` without panicking or matching.
 
 - [ ] **Step 8: Run PDS rule tests**
 
@@ -505,8 +517,13 @@ Expected: commit contains only PDS EvalState, feature provider, and related test
 - Create: `/home/taiwei/Constructure-repos/policy-decision-service/internal/sink/sink.go`
 - Create: `/home/taiwei/Constructure-repos/policy-decision-service/internal/sink/kafka.go`
 - Create: `/home/taiwei/Constructure-repos/policy-decision-service/internal/sink/kafka_test.go`
+- Create: `/home/taiwei/Constructure-repos/policy-decision-service/internal/sink/franz.go`
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/store/audit.go`
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/telemetry/metrics.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/engine/engine.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/combiner.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/rules/combiner_test.go`
+- Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/profile/http_provider.go`
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/api/http.go`
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/api/http_test.go`
 - Modify: `/home/taiwei/Constructure-repos/policy-decision-service/internal/config/config.go`
@@ -797,6 +814,84 @@ func (p *FranzPublisher) Close() {
 	}
 }
 ```
+
+- [ ] **Step 5b: Register decision and combiner metrics**
+
+Update `/home/taiwei/Constructure-repos/policy-decision-service/internal/telemetry/metrics.go` to register the counters and histograms named in the design spec, including the combiner dependency-error counter that surfaces silently fail-open combinator behavior:
+
+```go
+package telemetry
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+	DecisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pds_decisions_total",
+		Help: "Total decisions by verdict, action_type, and client.",
+	}, []string{"verdict", "action_type", "client"})
+
+	DecisionLatencySeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "pds_decision_latency_seconds",
+		Help:    "End-to-end /v1/decide latency.",
+		Buckets: prometheus.ExponentialBuckets(0.001, 2, 12),
+	}, []string{"action_type"})
+
+	RuleEvaluationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pds_rule_evaluations_total",
+		Help: "Per-rule evaluation outcomes.",
+	}, []string{"rule_id", "matched"})
+
+	RuleEvalErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pds_rule_eval_errors_total",
+		Help: "Per-rule evaluation errors (rule fails open).",
+	}, []string{"rule_id"})
+
+	CombinerDepErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "pds_combiner_skipped_dep_errored_total",
+		Help: "Combiner saw a dependency rule with a non-nil Err and treated it as not-matched.",
+	}, []string{"rule_id", "dep_id"})
+
+	FeatureLookupLatencySeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "pds_feature_lookup_seconds",
+		Help:    "Feature provider lookup latency.",
+		Buckets: prometheus.ExponentialBuckets(0.001, 2, 10),
+	})
+
+	FeatureLookupDegradedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "pds_feature_lookup_degraded_total",
+		Help: "Feature provider lookups that returned degraded=true.",
+	})
+
+	KafkaSinkQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "pds_kafka_sink_queue_depth",
+		Help: "Current depth of the Kafka decision sink internal queue.",
+	})
+
+	KafkaSinkDroppedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "pds_kafka_sink_dropped_total",
+		Help: "Decisions dropped because the Kafka sink queue was full.",
+	})
+
+	AuditWriteErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "pds_audit_write_errors_total",
+		Help: "Audit flush errors against Postgres.",
+	})
+)
+```
+
+Wire the counters at their emission sites:
+
+- In `internal/engine/engine.go`, after each rule evaluation, increment `RuleEvaluationsTotal{rule_id, matched}` and increment `RuleEvalErrorsTotal{rule_id}` when `err != nil`.
+- In `internal/engine/engine.go`, after combining, observe `DecisionLatencySeconds{action_type}` with `time.Since(started).Seconds()` and increment `DecisionsTotal{verdict, action_type, client}`.
+- In `internal/rules/combiner.go`, when iterating `prior` and a dep has `Err != nil`, increment `CombinerDepErrorsTotal{rule_id, dep_id}` once per offending dependency, in addition to writing the dependency name into `RuleResult.Reason.Detail` as specified in Task 1 Step 7.
+- In `internal/profile/http_provider.go`, observe `FeatureLookupLatencySeconds` for every call and increment `FeatureLookupDegradedTotal` when returning `degraded=true`.
+- In `internal/sink/kafka.go`, set `KafkaSinkQueueDepth` after every enqueue/dequeue and increment `KafkaSinkDroppedTotal` on overflow.
+- In `internal/store/audit.go`, increment `AuditWriteErrorsTotal` inside `flush` when an INSERT returns an error.
+
+Add a test in `internal/rules/combiner_test.go` that asserts `CombinerDepErrorsTotal` is incremented when a dependency carries an `Err`, using `testutil.ToFloat64(CombinerDepErrorsTotal.WithLabelValues("combo_rule", "dep_rule"))` from `github.com/prometheus/client_golang/prometheus/testutil`.
 
 - [ ] **Step 6: Add config values**
 
@@ -1838,6 +1933,7 @@ Expected: commit contains window logic, store shells, and tests.
 - Modify: `/home/taiwei/Constructure-repos/vp-feature-aggregator/README.md`
 - Create: `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/redpanda.yaml`
 - Create: `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/vp-feature-aggregator.yaml`
+- Create: `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/event-outbox-relay.yaml`
 - Modify: `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/kustomization.yaml`
 
 - [ ] **Step 1: Write consumer tests**
@@ -2091,11 +2187,65 @@ spec:
       targetPort: http
 ```
 
+Create `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/event-outbox-relay.yaml`. The relay reuses the existing VideoProcess backend image and overrides only the command, per the design spec, so no new image is built here. Replace `videoprocess-backend:local` with the actual tag used by the existing VP backend build if it differs:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-outbox-relay
+  namespace: videoprocess
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: event-outbox-relay
+  template:
+    metadata:
+      labels:
+        app: event-outbox-relay
+    spec:
+      containers:
+        - name: relay
+          image: videoprocess-backend:local
+          imagePullPolicy: IfNotPresent
+          command: ["python", "event_outbox_relay.py"]
+          workingDir: /app/backend
+          env:
+            - name: RISK_KAFKA_BROKERS
+              value: redpanda:9092
+            - name: RISK_OUTBOX_BATCH_SIZE
+              value: "100"
+            - name: RISK_OUTBOX_POLL_SECONDS
+              value: "1.0"
+            - name: RISK_OUTBOX_MAX_BACKOFF_SECONDS
+              value: "60.0"
+            - name: RISK_OUTBOX_METRICS_PORT
+              value: "9101"
+          ports:
+            - name: metrics
+              containerPort: 9101
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: event-outbox-relay
+  namespace: videoprocess
+spec:
+  selector:
+    app: event-outbox-relay
+  ports:
+    - name: metrics
+      port: 9101
+      targetPort: metrics
+```
+
 Add these resources to `/home/taiwei/k8s-Constructure/k8s-constructure/videoprocess/kustomization.yaml`:
 
 ```yaml
   - redpanda.yaml
   - vp-feature-aggregator.yaml
+  - event-outbox-relay.yaml
 ```
 
 - [ ] **Step 6: Run aggregator and k8s checks**
@@ -2367,7 +2517,7 @@ git commit -m "feat: add fail-open pds client"
 
 Expected: commit contains only VP PDS client and config wiring.
 
-## Task 8: VideoProcess Event Outbox And Relay
+## Task 8: VideoProcess Event Outbox And Relay With Backoff
 
 **Files:**
 - Create: `/home/taiwei/.codex/worktrees/d1d5/videoprocess/backend/app/events/__init__.py`
@@ -2379,6 +2529,8 @@ Expected: commit contains only VP PDS client and config wiring.
 - Create: `/home/taiwei/.codex/worktrees/d1d5/videoprocess/backend/alembic/versions/013_event_outbox.py`
 - Create: `/home/taiwei/.codex/worktrees/d1d5/videoprocess/backend/tests/events/test_outbox.py`
 - Create: `/home/taiwei/.codex/worktrees/d1d5/videoprocess/backend/tests/events/test_relay.py`
+- Modify: `/home/taiwei/.codex/worktrees/d1d5/videoprocess/backend/app/config.py` (add `risk_outbox_*` settings)
+- Modify: `/home/taiwei/.codex/worktrees/d1d5/videoprocess/backend/pyproject.toml` (add `prometheus-client` dependency)
 
 - [ ] **Step 1: Check migration revision**
 
@@ -2734,38 +2886,106 @@ class EventOutboxRelay:
         return delivered
 ```
 
-- [ ] **Step 9: Add relay entry point**
+- [ ] **Step 9: Add relay entry point with backoff and metrics**
 
-Create `/home/taiwei/.codex/worktrees/d1d5/videoprocess/backend/event_outbox_relay.py`:
+The design spec requires the relay to back off on Kafka errors, cap each batch, and expose three metrics so a Kafka outage is observable and bounded: `vp_event_outbox_unsent` (gauge), `vp_event_outbox_sent_total` (counter), and `vp_event_outbox_send_errors_total` (counter).
+
+First, modify `app/events/relay.py` from Step 8 so `run_once` returns a result that carries both the delivered count and the error count (instead of returning only delivered):
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class RelayCycleResult:
+    delivered: int
+    errors: int
+```
+
+Update `EventOutboxRelay.run_once` to count exceptions per row into `RelayCycleResult.errors` and return the dataclass. Adapt the existing relay test (`test_relay_marks_event_delivered_after_send`) to assert on `result.delivered` and `result.errors == 0`.
+
+Then create `/home/taiwei/.codex/worktrees/d1d5/videoprocess/backend/event_outbox_relay.py`:
 
 ```python
 from __future__ import annotations
 
 import asyncio
+import logging
+
+import sqlalchemy as sa
+from prometheus_client import Counter, Gauge, start_http_server
 
 from app.config import settings
 from app.db import async_session
+from app.events.outbox import event_outbox_table
 from app.events.producer import KafkaEventProducer
 from app.events.relay import EventOutboxRelay
 
+logger = logging.getLogger(__name__)
+
+OutboxUnsent = Gauge(
+    "vp_event_outbox_unsent",
+    "Current count of undelivered events in the VideoProcess outbox.",
+)
+OutboxSent = Counter(
+    "vp_event_outbox_sent_total",
+    "Total events successfully delivered from the outbox.",
+)
+OutboxSendErrors = Counter(
+    "vp_event_outbox_send_errors_total",
+    "Total failed delivery attempts from the outbox.",
+)
+
+
+async def _refresh_unsent_gauge(db) -> None:
+    row = (await db.execute(sa.select(sa.func.count()).select_from(event_outbox_table).where(event_outbox_table.c.delivered_at.is_(None)))).one()
+    OutboxUnsent.set(int(row[0]))
+
 
 async def run_forever() -> None:
+    batch_size = int(getattr(settings, "risk_outbox_batch_size", 100))
+    base_delay = float(getattr(settings, "risk_outbox_poll_seconds", 1.0))
+    max_delay = float(getattr(settings, "risk_outbox_max_backoff_seconds", 60.0))
+    metrics_port = int(getattr(settings, "risk_outbox_metrics_port", 9101))
+
+    start_http_server(metrics_port)
+    logger.info("event_outbox_relay metrics on :%d", metrics_port)
+
     producer = KafkaEventProducer(brokers=settings.risk_kafka_brokers)
     await producer.start()
+    delay = base_delay
     try:
         relay = EventOutboxRelay(producer=producer)
         while True:
-            async with async_session() as db:
-                await relay.run_once(db)
-                await db.commit()
-            await asyncio.sleep(1.0)
+            try:
+                async with async_session() as db:
+                    result = await relay.run_once(db, batch_size=batch_size)
+                    await db.commit()
+                    await _refresh_unsent_gauge(db)
+                OutboxSent.inc(result.delivered)
+                OutboxSendErrors.inc(result.errors)
+                if result.errors > 0:
+                    delay = min(delay * 2, max_delay)
+                else:
+                    delay = base_delay
+            except Exception:
+                logger.exception("event_outbox_relay cycle failed")
+                OutboxSendErrors.inc()
+                delay = min(delay * 2, max_delay)
+            await asyncio.sleep(delay)
     finally:
         await producer.stop()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(run_forever())
 ```
+
+Add `prometheus-client` to the backend dependency manifest (e.g. `pyproject.toml` or `requirements.txt`) if it is not already present.
+
+Add three settings to `backend/app/config.py` with safe defaults: `risk_outbox_batch_size: int = 100`, `risk_outbox_poll_seconds: float = 1.0`, `risk_outbox_max_backoff_seconds: float = 60.0`, `risk_outbox_metrics_port: int = 9101`.
+
+Update the outbox relay test file (`backend/tests/events/test_relay.py`) to assert that when the producer raises, `run_once` returns a `RelayCycleResult` with `errors >= 1` and the failed row's `attempt_count` is incremented.
 
 - [ ] **Step 10: Run event tests**
 

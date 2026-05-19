@@ -133,8 +133,22 @@ Operational endpoints:
 - SIGHUP reloads rule files.
 - Optional file watching can be added only after explicit reload works.
 - Prometheus metrics cover decisions, rule results, PDS client errors, feature
-  provider latency, audit writes, and Kafka sink queue/drop counts.
+  provider latency, audit writes, Kafka sink queue/drop counts, and combiner
+  dependency-error counts so silently fail-open combinator behavior remains
+  observable.
 - gRPC shares the same engine and store path as HTTP.
+
+### Actor Data Namespaces
+
+CEL rules reference two distinct actor data sources. Static actor metadata such
+as age, tier, account_type, or account creation timestamp flows through
+`req.Context["actor"]` and is exposed in CEL as fields under `actor.*`.
+Aggregator-derived behavioral counters such as `publishes_5m`, `blocks_24h`,
+`flags_7d`, and `comment_burst_1m` flow through the feature provider and are
+exposed in CEL as fields under `features.*`. Rules that need both reference
+both namespaces explicitly. The `degraded.feature_provider` flag tells rules
+when the feature lookup failed so they can choose to skip behavior-derived
+checks rather than treat zero counters as truth.
 
 ## VideoProcess Integration Design
 
@@ -197,7 +211,14 @@ The first VP events are limited to ChannelOps:
 
 The relay runs as an independent process, for example
 `backend/event_outbox_relay.py run`, and has its own compose service. It is separate
-from `channel-agent-runner`.
+from `channel-agent-runner`. The relay polls the outbox with exponential backoff
+when Kafka send errors occur, caps each batch at a configurable size to avoid
+long-running transactions, and exposes `vp_event_outbox_unsent` (gauge, current
+backlog), `vp_event_outbox_sent_total` (counter), and
+`vp_event_outbox_send_errors_total` (counter) metrics. Kafka outage is therefore observable
+and bounded: the outbox table grows during the outage, but VideoProcess request
+paths continue without blocking, and the relay drains automatically once Kafka
+recovers.
 
 ## Kafka Contracts and Feature Aggregator
 
@@ -261,10 +282,14 @@ needed.
 Kubernetes ownership:
 
 - PDS manifests live in the PDS repo.
-- Redpanda and `vp-feature-aggregator` manifests live with VideoProcess/Constructure
-  deployment assets, under the existing k8s Constructure area.
-- Service names should stay stable: `pds`, `redpanda`, and
-  `vp-feature-aggregator`.
+- Redpanda, `vp-feature-aggregator`, and the `event-outbox-relay` Deployment
+  manifests live with VideoProcess/Constructure deployment assets, under the
+  existing k8s Constructure area.
+- The relay Deployment reuses the existing VideoProcess backend image and only
+  overrides the command to `python event_outbox_relay.py` so the relay does not
+  introduce a separately built image.
+- Service names should stay stable: `pds`, `redpanda`, `vp-feature-aggregator`,
+  and `event-outbox-relay`.
 
 ## Testing and Verification
 
