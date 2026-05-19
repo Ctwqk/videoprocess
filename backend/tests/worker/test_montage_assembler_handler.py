@@ -25,6 +25,6 @@ async def test_montage_assembler_builds_vertical_audio_tolerant_concat(monkeypat
     filter_complex = args[args.index("-filter_complex") + 1]
     assert "scale=1080:1920" in filter_complex
     assert "concat=n=3:v=1:a=0[v]" in filter_complex
-    assert "anullsrc=channel_layout=stereo:sample_rate=48000" in args
+    assert "anullsrc=channel_layout=stereo:sample_rate=48000:duration=12" in args
     assert args[args.index("-t") + 1] == "12"
     assert args[-1] == "out.mp4"

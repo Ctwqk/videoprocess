@@ -24,10 +24,13 @@ class ConcatManyHandler(BaseHandler):
         normalize = self.parse_bool_param(node_config.get("normalize_resolution"), True)
         target_duration = _positive_float_or_none(node_config.get("target_duration"))
 
+        silence_duration = _silence_duration(node_config, selected_items, target_duration)
+        silence_source = _silence_source(silence_duration)
+
         args: list[str] = []
         for path in selected:
             args.extend(["-i", path])
-        args.extend(["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
+        args.extend(["-f", "lavfi", "-i", silence_source])
 
         filters = []
         for index in range(len(selected)):
@@ -174,3 +177,34 @@ def _positive_float_or_none(value: Any) -> float | None:
 
 def _format_seconds(value: float) -> str:
     return str(int(value)) if value.is_integer() else f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def _silence_source(duration: float | None) -> str:
+    source = "anullsrc=channel_layout=stereo:sample_rate=48000"
+    if duration is None:
+        return source
+    return f"{source}:duration={_format_seconds(duration)}"
+
+
+def _silence_duration(
+    node_config: dict[str, Any],
+    selected_items: list[tuple[str, str]],
+    target_duration: float | None,
+) -> float | None:
+    if target_duration is not None:
+        return target_duration
+
+    input_meta = node_config.get("_input_artifact_meta") or {}
+    if not isinstance(input_meta, dict):
+        return None
+
+    total = 0.0
+    for handle, _path in selected_items:
+        media_info = input_meta.get(handle) or {}
+        if not isinstance(media_info, dict):
+            return None
+        duration = _positive_float_or_none(media_info.get("duration"))
+        if duration is None:
+            return None
+        total += duration
+    return total if total > 0 else None
