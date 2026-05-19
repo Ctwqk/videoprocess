@@ -44,6 +44,7 @@ from app.channel_agent.material_usage import (
     extract_material_references,
     recent_usage_flags,
 )
+from app.channel_agent.pds_health import should_enqueue_pds_outage_alert
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
 from app.events.outbox import EventOutbox
 from app.events.schemas import TOPIC_VP_ACTIONS, build_actor_action_event
@@ -105,6 +106,7 @@ class ChannelAgentService:
         minimax_client: MiniMaxClient | None = None,
         pds_client: PolicyDecisionClient | None = None,
         event_outbox: EventOutbox | None = None,
+        pds_health_monitor_enabled: bool = False,
     ) -> None:
         self.clock = clock or Clock()
         self.queue = queue or ChannelOpsQueueService(clock=self.clock)
@@ -113,6 +115,9 @@ class ChannelAgentService:
         self.minimax_client = minimax_client or MiniMaxImageClient()
         self.pds_client = pds_client or NoopPDSClient()
         self.event_outbox = event_outbox or EventOutbox()
+        self.pds_health_monitor_enabled = pds_health_monitor_enabled
+        self._pds_last_success_at: datetime | None = None
+        self._pds_last_alert_bucket: str | None = None
 
     async def tick(self, db: AsyncSession, *, channel_id) -> AgentTickAudit:
         channel = await db.get(ChannelProfile, _uuid(channel_id))
@@ -654,7 +659,8 @@ class ChannelAgentService:
             return None
 
         lane = candidate.get("lane")
-        decision = await self.pds_client.decide(
+        decision = await self._decide_pds(
+            db,
             PDSDecisionRequest(
                 actor_id=str(account.id),
                 action_type="candidate_accept",
@@ -672,7 +678,7 @@ class ChannelAgentService:
                     "lane_id": str(lane.id) if lane is not None else "",
                     "candidate_id": str(candidate.get("candidate_id") or ""),
                 },
-            )
+            ),
         )
         candidate["_pds_decision"] = decision
         if decision.verdict not in {"block", "flag"}:
@@ -951,7 +957,8 @@ class ChannelAgentService:
         task.autoflow_plan_id = uuid.UUID(observation.plan_id)
         if task.approval_mode == "agent":
             account = await db.get(PublishingAccount, task.target_account_id)
-            decision = await self.pds_client.decide(
+            decision = await self._decide_pds(
+                db,
                 PDSDecisionRequest(
                     actor_id=str(task.target_account_id),
                     action_type="plan_approval",
@@ -964,7 +971,7 @@ class ChannelAgentService:
                         "production_task_id": str(task.id),
                         "autoflow_plan_id": str(task.autoflow_plan_id),
                     },
-                )
+                ),
             )
             evidence = _pds_decision_event_metadata(decision)
             if decision.verdict == "allow":
@@ -1207,6 +1214,20 @@ class ChannelAgentService:
 
         publication = await self._publication_for_task(db, task)
         if publication is None:
+            material_references = await self._material_references_for_publish(
+                db,
+                task=task,
+                upload_metadata=youtube,
+            )
+            blocked_guard = await self._publish_time_material_usage_guard(
+                db,
+                task=task,
+                references=material_references,
+            )
+            if blocked_guard is not None:
+                await db.commit()
+                await db.refresh(task)
+                return None
             publication = PublicationRecord(
                 production_task_id=task.id,
                 platform="youtube",
@@ -1223,11 +1244,18 @@ class ChannelAgentService:
             )
             db.add(publication)
             await db.flush()
+        else:
+            material_references = await self._material_references_for_publish(
+                db,
+                task=task,
+                upload_metadata=youtube,
+            )
         await self._write_material_usage_ledger(
             db,
             task=task,
             publication=publication,
             upload_metadata=youtube,
+            references=material_references,
         )
 
         if self._uses_external_assets(task) and not account.external_asset_auto_publish:
@@ -1292,7 +1320,8 @@ class ChannelAgentService:
             platform=str(publication.platform or "youtube"),
             metadata=promotion_metadata,
         )
-        decision = await self.pds_client.decide(
+        decision = await self._decide_pds(
+            db,
             PDSDecisionRequest(
                 actor_id=str(publication.account_id),
                 action_type="publish",
@@ -1306,7 +1335,7 @@ class ChannelAgentService:
                     "task_id": str(task.id),
                     "target_visibility": visibility,
                 },
-            )
+            ),
         )
         if decision.verdict in {"block", "flag"}:
             publication.publish_status = "held"
@@ -1593,14 +1622,62 @@ class ChannelAgentService:
         await db.refresh(event)
         return event
 
-    async def _write_material_usage_ledger(
+    async def _decide_pds(self, db: AsyncSession, request: PDSDecisionRequest) -> PDSDecision:
+        decision = await self.pds_client.decide(request)
+        if _is_pds_fail_policy_decision(decision):
+            await self._maybe_enqueue_pds_outage_alert(db, decision=decision, request=request)
+            return decision
+        self._pds_last_success_at = self.clock.now()
+        return decision
+
+    async def _maybe_enqueue_pds_outage_alert(
         self,
         db: AsyncSession,
         *,
-        task: ProductionTask,
-        publication: PublicationRecord,
-        upload_metadata: dict[str, Any],
+        decision: PDSDecision,
+        request: PDSDecisionRequest,
     ) -> None:
+        if not self.pds_health_monitor_enabled:
+            return
+        now = self.clock.now()
+        health = should_enqueue_pds_outage_alert(
+            now=now,
+            last_success_at=self._pds_last_success_at,
+            last_alert_bucket=self._pds_last_alert_bucket,
+        )
+        if not health.should_alert:
+            return
+
+        metadata = decision.metadata if isinstance(decision.metadata, dict) else {}
+        payload = build_alert_payload(
+            "pds_outage",
+            resource_id="service:pds",
+            severity="critical",
+            message="Policy Decision Service is unavailable or returning fail-policy decisions",
+            details={
+                "action_type": request.action_type,
+                "verdict": decision.verdict,
+                "decision_id": decision.decision_id,
+                "warning": str(metadata.get("warning") or ""),
+                "fail_policy": str(metadata.get("fail_policy") or ""),
+            },
+            now=now,
+        )
+        await self.queue.enqueue(
+            db,
+            kind="send_alert",
+            idempotency_key=str(payload["dedupe_key"]),
+            payload=payload,
+            priority=5,
+            commit=False,
+        )
+        self._pds_last_alert_bucket = utc_hour_bucket(now)
+
+    async def _material_payloads_for_task(
+        self,
+        db: AsyncSession,
+        task: ProductionTask,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         plan_payload: dict[str, Any] = {}
         run_payload: dict[str, Any] = {}
         if task.autoflow_plan_id is not None:
@@ -1618,11 +1695,79 @@ class ChannelAgentService:
                     "artifacts": dict(run.artifacts_json or {}),
                     "publish": dict(run.publish_json or {}),
                 }
-        references = extract_material_references(
+        return plan_payload, run_payload
+
+    async def _material_references_for_publish(
+        self,
+        db: AsyncSession,
+        *,
+        task: ProductionTask,
+        upload_metadata: dict[str, Any],
+    ) -> list[MaterialReference]:
+        plan_payload, run_payload = await self._material_payloads_for_task(db, task)
+        return extract_material_references(
             plan_payload=plan_payload,
             run_payload=run_payload,
             upload_metadata=upload_metadata,
         )
+
+    async def _publish_time_material_usage_guard(
+        self,
+        db: AsyncSession,
+        *,
+        task: ProductionTask,
+        references: list[MaterialReference],
+    ) -> str | None:
+        if not references:
+            return None
+        result = await recent_usage_flags(
+            db,
+            channel_id=str(task.channel_profile_id),
+            lane_id=str(task.topic_lane_id) if task.topic_lane_id is not None else None,
+            account_id=str(task.target_account_id) if task.target_account_id is not None else None,
+            references=references,
+            now=self.clock.now(),
+        )
+        if not result.blocked:
+            return None
+
+        manual_override = task.source == "manual_seed"
+        rationale = dict(task.rationale_json or {})
+        rationale["material_usage_guard"] = _material_usage_guard_payload(
+            result,
+            manual_override=manual_override,
+        )
+        task.rationale_json = rationale
+        if manual_override:
+            return None
+
+        guard = "cross_account_rejected" if result.cross_account_rejected else "repetition_rejected"
+        previous_state = task.state
+        task.state = TASK_HELD
+        task.blocked_by_guard = guard
+        task.failure_reason = f"publish-time material usage guard rejected task: {guard}"
+        task.state_updated_at = self.clock.now()
+        task.transition_history_json = [
+            *list(task.transition_history_json or []),
+            _transition(previous_state, TASK_HELD, "publish_task_material_guard", self.clock.now()),
+        ]
+        return guard
+
+    async def _write_material_usage_ledger(
+        self,
+        db: AsyncSession,
+        *,
+        task: ProductionTask,
+        publication: PublicationRecord,
+        upload_metadata: dict[str, Any],
+        references: list[MaterialReference] | None = None,
+    ) -> None:
+        if references is None:
+            references = await self._material_references_for_publish(
+                db,
+                task=task,
+                upload_metadata=upload_metadata,
+            )
         if not references:
             return
         existing_rows = (
@@ -2014,6 +2159,29 @@ def _pds_decision_event_metadata(decision: PDSDecision) -> dict[str, Any]:
     if warning is not None:
         metadata["warning"] = str(warning)
     return metadata
+
+
+def _is_pds_fail_policy_decision(decision: PDSDecision) -> bool:
+    metadata = decision.metadata if isinstance(decision.metadata, dict) else {}
+    warning = str(metadata.get("warning") or "")
+    return bool(metadata.get("fail_policy")) or warning in {
+        "pds_disabled",
+        "pds_unavailable",
+        "pds_parse_failed",
+    }
+
+
+def _material_usage_guard_payload(
+    result: UsageGuardResult,
+    *,
+    manual_override: bool,
+) -> dict[str, Any]:
+    return {
+        "manual_override": manual_override,
+        "repetition_rejected": result.repetition_rejected,
+        "cross_account_rejected": result.cross_account_rejected,
+        "hits": list(result.hits),
+    }
 
 
 def _transition(from_state: str, to_state: str, actor: str, now: datetime) -> dict[str, Any]:

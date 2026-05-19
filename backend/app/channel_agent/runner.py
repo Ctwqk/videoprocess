@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 from app.channel_agent.alerts import AlertService
@@ -49,13 +50,16 @@ class ChannelAgentRunner:
             youtube_client=_build_youtube_client(),
             minimax_client=MiniMaxImageClient(),
             pds_client=_build_pds_client(),
+            pds_health_monitor_enabled=settings.pds_enabled,
         )
         self.alert_service = alert_service or AlertService()
 
-    async def run_once(self) -> bool:
+    async def run_once(self, *, run_scheduler_when_idle: bool = True) -> bool:
         async with async_session() as db:
             item = await self.queue.claim_next(db, worker_id=self.worker_id)
             if item is None:
+                if not run_scheduler_when_idle:
+                    return False
                 scheduler_result = await self.scheduler.run_once(db)
                 return scheduler_result.enqueued_count > 0
             item_id = item.id
@@ -73,10 +77,27 @@ class ChannelAgentRunner:
             return True
 
     async def run_forever(self, *, poll_seconds: float = 5.0) -> None:
+        scheduler_task = asyncio.create_task(
+            self._run_scheduler_forever(poll_seconds=settings.channel_agent_scheduler_poll_seconds)
+        )
+        try:
+            while True:
+                handled = await self.run_once(run_scheduler_when_idle=False)
+                if not handled:
+                    await asyncio.sleep(poll_seconds)
+        finally:
+            scheduler_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await scheduler_task
+
+    async def _run_scheduler_forever(self, *, poll_seconds: float) -> None:
         while True:
-            handled = await self.run_once()
-            if not handled:
-                await asyncio.sleep(poll_seconds)
+            try:
+                async with async_session() as db:
+                    await self.scheduler.run_once(db)
+            except Exception:
+                logger.exception("ChannelOps scheduler tick failed")
+            await asyncio.sleep(poll_seconds)
 
     async def handle_item(self, db, item) -> None:
         if item.kind == "agent_tick":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -43,6 +44,18 @@ class FailingSideEffectRunner(ChannelAgentRunner):
         raise RuntimeError("handler boom")
 
 
+class NoDbRunner(ChannelAgentRunner):
+    def __init__(self, *, original_sleep):
+        super().__init__(worker_id="test-runner")
+        self.original_sleep = original_sleep
+        self.run_once_scheduler_flags: list[bool] = []
+
+    async def run_once(self, *, run_scheduler_when_idle: bool = True) -> bool:
+        self.run_once_scheduler_flags.append(run_scheduler_when_idle)
+        await self.original_sleep(0)
+        return False
+
+
 def test_live_runner_requires_youtube_manager_url(monkeypatch):
     monkeypatch.setattr(runner_module.settings, "youtube_manager_url", "")
 
@@ -82,3 +95,26 @@ async def test_runner_rolls_back_handler_side_effects_before_retry_mark(
     assert queued_item.status == "queued"
     assert queued_item.last_error == "handler boom"
     assert outbox_count == 0
+
+
+@pytest.mark.asyncio
+async def test_run_forever_starts_scheduler_loop_independently(monkeypatch):
+    original_sleep = asyncio.sleep
+    runner = NoDbRunner(original_sleep=original_sleep)
+    calls = {"scheduler": 0}
+
+    async def fake_scheduler_loop(*, poll_seconds: float) -> None:
+        calls["scheduler"] += 1
+        await original_sleep(3600)
+
+    async def stop_after_first_idle_sleep(seconds: float) -> None:
+        raise StopAsyncIteration
+
+    runner._run_scheduler_forever = fake_scheduler_loop
+    monkeypatch.setattr(asyncio, "sleep", stop_after_first_idle_sleep)
+
+    with pytest.raises(StopAsyncIteration):
+        await runner.run_forever(poll_seconds=0.01)
+
+    assert calls["scheduler"] == 1
+    assert runner.run_once_scheduler_flags == [False]
