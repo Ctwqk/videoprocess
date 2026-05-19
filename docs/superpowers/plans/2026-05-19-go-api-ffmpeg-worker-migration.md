@@ -6,7 +6,7 @@
 
 **Architecture:** Add `vp-api-go` and `vp-ffmpeg-worker-go` beside the current Python services. Reuse the existing Postgres schema, Alembic migrations, Redis Streams, storage paths, frontend `/api/v1` contract, and Python vision/ASR/TTS workers. Migrate by contracts first, then read APIs, write APIs, orchestrator, worker runner, and handler batches.
 
-**Tech Stack:** Go 1.23+, `net/http`, `github.com/go-chi/chi/v5`, `github.com/jackc/pgx/v5/pgxpool`, `github.com/redis/go-redis/v9`, `github.com/minio/minio-go/v7`, `log/slog`, Docker Compose, existing Python pytest fixtures.
+**Tech Stack:** Go 1.24+, `net/http`, `github.com/go-chi/chi/v5`, `github.com/jackc/pgx/v5/pgxpool`, `github.com/redis/go-redis/v9`, `github.com/minio/minio-go/v7`, `log/slog`, Docker Compose, existing Python pytest fixtures.
 
 ---
 
@@ -66,7 +66,7 @@ Create `backend/tests/golden/go_migration/pipeline_basic.json`:
       "position": {"x": 260, "y": 0},
       "data": {
         "label": "Trim",
-        "config": {"start": 0, "duration": 2, "output_format": "mp4"}
+        "config": {"start_time": "0", "duration": "2", "output_format": "mp4"}
       }
     },
     {
@@ -117,7 +117,7 @@ Create `backend/tests/golden/go_migration/job_task_ffmpeg.json`:
   "node_execution_id": "00000000-0000-0000-0000-000000000201",
   "node_id": "trim_1",
   "node_type": "trim",
-  "config": "{\"start\":0,\"duration\":2,\"output_format\":\"mp4\"}",
+  "config": "{\"start_time\":\"0\",\"duration\":\"2\",\"output_format\":\"mp4\"}",
   "input_artifacts": "{\"input\":\"00000000-0000-0000-0000-000000000301\"}",
   "preferred_hosts": "[]",
   "affinity_enqueued_at": "1779120000",
@@ -225,7 +225,7 @@ Run:
 
 ```bash
 go mod init github.com/Ctwqk/videoprocess
-go get github.com/go-chi/chi/v5 github.com/jackc/pgx/v5/pgxpool github.com/redis/go-redis/v9 github.com/minio/minio-go/v7
+go mod edit -go=1.24
 ```
 
 Expected: `go.mod` contains module `github.com/Ctwqk/videoprocess`.
@@ -389,7 +389,7 @@ ok  	github.com/Ctwqk/videoprocess/internal/config
 - [ ] **Step 5: Commit**
 
 ```bash
-git add go.mod go.sum internal/config
+git add go.mod internal/config
 git commit -m "feat: add go config foundation"
 ```
 
@@ -1496,44 +1496,54 @@ package handlers
 
 import (
 	"context"
-	"fmt"
 
-	"github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
+	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
 )
 
 type TrimHandler struct {
-	Runner ffmpeg.Runner
+	Runner vpffmpeg.Runner
 }
 
 func (h TrimHandler) Args(inputPath, outputPath string, config map[string]any) []string {
-	start := number(config["start"], 0)
-	duration := number(config["duration"], 0)
-	args := []string{"-ss", fmt.Sprintf("%.3f", start), "-i", inputPath}
-	if duration > 0 {
-		args = append(args, "-t", fmt.Sprintf("%.3f", duration))
+	start := stringValue(config["start_time"], "00:00:00")
+	end := stringValue(config["end_time"], "")
+	duration := stringValue(config["duration"], "")
+
+	args := []string{}
+	if start != "" {
+		args = append(args, "-ss", start)
 	}
-	args = append(args, "-map", "0:v:0", "-map", "0:a?", "-c", "copy", outputPath)
+	args = append(args, "-i", inputPath)
+	if end != "" {
+		args = append(args, "-to", end)
+	} else if duration != "" {
+		args = append(args, "-t", duration)
+	}
+	args = append(args, "-map", "0:v:0", "-map", "0:a?")
+	args = append(args, vpffmpeg.VideoEncodeArgs(vpffmpeg.EncodeConfig{
+		Codec:         "libx264",
+		Preset:        "slow",
+		CRF:           18,
+		MP4Compatible: true,
+	})...)
+	args = append(args, "-c:a", "aac", outputPath)
 	return args
 }
 
 func (h TrimHandler) Execute(ctx context.Context, inputPath, outputPath string, config map[string]any) error {
 	runner := h.Runner
 	if runner.Binary == "" {
-		runner = ffmpeg.NewRunner()
+		runner = vpffmpeg.NewRunner()
 	}
 	_, err := runner.Run(ctx, h.Args(inputPath, outputPath, config))
 	return err
 }
 
-func number(value any, fallback float64) float64 {
-	switch v := value.(type) {
-	case float64:
-		return v
-	case int:
-		return float64(v)
-	default:
-		return fallback
+func stringValue(value any, fallback string) string {
+	if raw, ok := value.(string); ok {
+		return raw
 	}
+	return fallback
 }
 ```
 
@@ -1548,13 +1558,13 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
+	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
 )
 
-func TestTrimArgs(t *testing.T) {
-	handler := TrimHandler{Runner: ffmpeg.Runner{Binary: "ffmpeg"}}
-	got := handler.Args("/input.mp4", "/output.mp4", map[string]any{"start": 1.25, "duration": 2.5})
-	want := []string{"-ss", "1.250", "-i", "/input.mp4", "-t", "2.500", "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "/output.mp4"}
+func TestTrimArgsMatchPythonHandler(t *testing.T) {
+	handler := TrimHandler{Runner: vpffmpeg.Runner{Binary: "ffmpeg"}}
+	got := handler.Args("/input.mp4", "/output.mp4", map[string]any{"start_time": "1.250", "duration": "2.500"})
+	want := []string{"-ss", "1.250", "-i", "/input.mp4", "-t", "2.500", "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-c:a", "aac", "/output.mp4"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %#v", got)
 	}
@@ -1626,7 +1636,7 @@ git commit -m "feat: add go ffmpeg worker shell"
 Create `backend/Dockerfile.api-go`:
 
 ```dockerfile
-FROM golang:1.23-bookworm AS build
+FROM golang:1.24-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -1645,7 +1655,7 @@ CMD ["vp-api-go"]
 Create `backend/Dockerfile.ffmpeg-worker-go`:
 
 ```dockerfile
-FROM golang:1.23-bookworm AS build
+FROM golang:1.24-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
