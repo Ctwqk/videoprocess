@@ -38,6 +38,8 @@ from app.channel_agent.constants import (
 )
 from app.channel_agent.lane_prompts import build_lane_prompt
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
+from app.events.outbox import EventOutbox
+from app.events.schemas import TOPIC_VP_ACTIONS, build_actor_action_event
 from app.models.channel_agent import (
     AgentTickAudit,
     ChannelOpsQueueItem,
@@ -50,6 +52,12 @@ from app.models.channel_agent import (
     PublishingAccount,
     TakedownEvent,
     TopicLane,
+)
+from app.pds_client import (
+    NoopPDSClient,
+    PDSDecision,
+    PDSDecisionRequest,
+    PolicyDecisionClient,
 )
 from app.schemas.autoflow import AutoFlowRequest, PlanningMode, SourceStrategy
 
@@ -85,12 +93,16 @@ class ChannelAgentService:
         autoflow_client: AutoFlowClient | None = None,
         youtube_client: YouTubeClient | None = None,
         minimax_client: MiniMaxClient | None = None,
+        pds_client: PolicyDecisionClient | None = None,
+        event_outbox: EventOutbox | None = None,
     ) -> None:
         self.clock = clock or Clock()
         self.queue = queue or ChannelOpsQueueService(clock=self.clock)
         self.autoflow_client = autoflow_client or FakeAutoFlowClient()
         self.youtube_client = youtube_client or FakeYouTubeClient()
         self.minimax_client = minimax_client or MiniMaxImageClient()
+        self.pds_client = pds_client or NoopPDSClient()
+        self.event_outbox = event_outbox or EventOutbox()
 
     async def tick(self, db: AsyncSession, *, channel_id) -> AgentTickAudit:
         channel = await db.get(ChannelProfile, _uuid(channel_id))
@@ -237,6 +249,7 @@ class ChannelAgentService:
                 priority=50,
                 channel_profile_id=channel.id,
             )
+            await self._emit_candidate_accepted(db, candidate, task)
             selected += 1
 
         audit.tasks_selected = selected
@@ -557,6 +570,14 @@ class ChannelAgentService:
         if upload_failure_rejection is not None:
             return upload_failure_rejection
 
+        pds_rejection = await self._pds_candidate_guard(
+            db,
+            candidate,
+            emit_outbox=enqueue_alerts,
+        )
+        if pds_rejection is not None:
+            return pds_rejection
+
         lane = candidate.get("lane")
         accepted_lane_count = (
             selected_lane_counts.get(str(lane.id), 0) if lane is not None else 0
@@ -565,6 +586,63 @@ class ChannelAgentService:
             db,
             candidate,
             accepted_lane_count=accepted_lane_count,
+        )
+
+    async def _pds_candidate_guard(
+        self,
+        db: AsyncSession,
+        candidate: dict[str, Any],
+        *,
+        emit_outbox: bool,
+    ) -> dict[str, Any] | None:
+        account = candidate.get("account")
+        if account is None:
+            return None
+
+        lane = candidate.get("lane")
+        decision = await self.pds_client.decide(
+            PDSDecisionRequest(
+                actor_id=str(account.id),
+                action_type="candidate_accept",
+                platform=_account_platform(account),
+                content={
+                    "title": str(
+                        candidate.get("title")
+                        or candidate.get("title_seed")
+                        or candidate.get("prompt")
+                        or ""
+                    ),
+                    "description": str(candidate.get("description") or candidate.get("prompt") or ""),
+                },
+                context={
+                    "lane_id": str(lane.id) if lane is not None else "",
+                    "candidate_id": str(candidate.get("candidate_id") or ""),
+                },
+            )
+        )
+        candidate["_pds_decision"] = decision
+        if decision.verdict not in {"block", "flag"}:
+            return None
+
+        marker = "pds_blocked" if decision.verdict == "block" else "pds_flagged_for_review"
+        if emit_outbox:
+            await self._emit_actor_action_event(
+                db,
+                actor_id=str(account.id),
+                action_type="candidate_blocked" if decision.verdict == "block" else "candidate_flagged",
+                platform=_account_platform(account),
+                metadata={
+                    "lane_id": str(lane.id) if lane is not None else "",
+                    "candidate_id": str(candidate.get("candidate_id") or ""),
+                    "decision_id": decision.decision_id,
+                    "verdict": decision.verdict,
+                    "guard": marker,
+                },
+            )
+        return _candidate_rejection(
+            candidate,
+            guard=marker,
+            reason=f"PDS {decision.verdict} candidate: {decision.decision_id}",
         )
 
     async def _active_task_count_for_account(self, db: AsyncSession, account_id) -> int:
@@ -1103,6 +1181,65 @@ class ChannelAgentService:
             raise ValueError("Publication is not ready for promotion")
         scheduled_at = _parse_datetime(str(item.payload_json.get("scheduled_at") or self.clock.now().isoformat()))
         visibility = _safe_privacy(item.payload_json.get("target_visibility") or publication.desired_privacy) or "unlisted"
+        promotion_metadata = {
+            "task_id": str(task.id),
+            "publication_id": str(publication.id),
+            "target_visibility": visibility,
+            "scheduled_at": scheduled_at.isoformat(),
+        }
+        await self._emit_actor_action_event(
+            db,
+            actor_id=str(publication.account_id),
+            action_type="publication_promotion_attempted",
+            platform=str(publication.platform or "youtube"),
+            metadata=promotion_metadata,
+        )
+        decision = await self.pds_client.decide(
+            PDSDecisionRequest(
+                actor_id=str(publication.account_id),
+                action_type="publish",
+                platform=str(publication.platform or "youtube"),
+                content={
+                    "title": publication.title,
+                    "description": publication.description or "",
+                },
+                context={
+                    "publication_id": str(publication.id),
+                    "task_id": str(task.id),
+                    "target_visibility": visibility,
+                },
+            )
+        )
+        if decision.verdict in {"block", "flag"}:
+            publication.publish_status = "held"
+            previous_state = task.state
+            task.state = TASK_HELD
+            task.state_updated_at = self.clock.now()
+            task.transition_history_json = [
+                *list(task.transition_history_json or []),
+                _transition(previous_state, TASK_HELD, "pds_gate", self.clock.now()),
+            ]
+            marker = "pds_blocked" if decision.verdict == "block" else "pds_flagged_for_review"
+            publication.warnings_json = [
+                *list(publication.warnings_json or []),
+                f"{marker}:{decision.decision_id}",
+            ]
+            await self._emit_actor_action_event(
+                db,
+                actor_id=str(publication.account_id),
+                action_type="publication_promotion_blocked",
+                platform=str(publication.platform or "youtube"),
+                metadata={
+                    **promotion_metadata,
+                    "decision_id": decision.decision_id,
+                    "verdict": decision.verdict,
+                    "guard": marker,
+                },
+            )
+            await db.commit()
+            await db.refresh(publication)
+            return publication
+
         await self.youtube_client.schedule_publish(
             video_id=publication.platform_content_id,
             scheduled_at=scheduled_at,
@@ -1118,6 +1255,17 @@ class ChannelAgentService:
             *list(task.transition_history_json or []),
             _transition(previous_state, TASK_SCHEDULED, "promote_publication", self.clock.now()),
         ]
+        await self._emit_actor_action_event(
+            db,
+            actor_id=str(publication.account_id),
+            action_type="publication_scheduled",
+            platform=str(publication.platform or "youtube"),
+            metadata={
+                **promotion_metadata,
+                "decision_id": decision.decision_id,
+                "verdict": decision.verdict,
+            },
+        )
         await self.queue.enqueue(
             db,
             kind="collect_metrics",
@@ -1307,6 +1455,56 @@ class ChannelAgentService:
                     )
                 triggered.append({"guard": "material_supply_low", "lane_id": lane_id})
         return triggered
+
+    async def _emit_candidate_accepted(
+        self,
+        db: AsyncSession,
+        candidate: dict[str, Any],
+        task: ProductionTask,
+    ) -> None:
+        account = candidate.get("account")
+        if account is None:
+            return
+        lane = candidate.get("lane")
+        decision = candidate.get("_pds_decision")
+        metadata = {
+            "lane_id": str(lane.id) if lane is not None else "",
+            "candidate_id": str(candidate.get("candidate_id") or ""),
+            "task_id": str(task.id),
+            "source": str(candidate.get("source") or ""),
+        }
+        if isinstance(decision, PDSDecision):
+            metadata.update({"decision_id": decision.decision_id, "verdict": decision.verdict})
+        await self._emit_actor_action_event(
+            db,
+            actor_id=str(account.id),
+            action_type="candidate_accepted",
+            platform=_account_platform(account),
+            metadata=metadata,
+        )
+
+    async def _emit_actor_action_event(
+        self,
+        db: AsyncSession,
+        *,
+        actor_id: str,
+        action_type: str,
+        platform: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        payload = build_actor_action_event(
+            actor_id=actor_id,
+            action_type=action_type,
+            platform=platform,
+            metadata=metadata,
+            occurred_at=self.clock.now(),
+        )
+        await self.event_outbox.enqueue(
+            db,
+            topic=TOPIC_VP_ACTIONS,
+            key=payload["actor_id"],
+            payload=payload,
+        )
 
     async def _enqueue_alert(
         self,
@@ -1547,6 +1745,10 @@ def _candidate_id(source: str, lane_id, format_id, bucket: str, *, seed_id=None)
     if source == "manual_seed" and seed_id is not None:
         return f"{source}:{seed_id}:lane:{lane_id or 'unassigned'}:format:{format_id or 'none'}:{bucket}"
     return f"{source}:lane:{lane_id or 'unassigned'}:format:{format_id or 'none'}:{bucket}"
+
+
+def _account_platform(account: PublishingAccount) -> str:
+    return str(account.platform or "youtube")
 
 
 def _transition(from_state: str, to_state: str, actor: str, now: datetime) -> dict[str, Any]:

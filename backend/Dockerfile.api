@@ -10,6 +10,7 @@ COPY pyproject.toml .
 RUN pip install --upgrade pip && pip install ".[api]"
 
 COPY app /app/app
+COPY channel_agent_runner.py /app/channel_agent_runner.py
 COPY event_outbox_relay.py /app/event_outbox_relay.py
 COPY alembic.ini /app/alembic.ini
 COPY alembic /app/alembic

@@ -1,0 +1,84 @@
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.3.5
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=0.0.0.0:9092
+      - --advertise-kafka-addr=redpanda:9092
+    ports:
+      - "${VP_REDPANDA_PORT:-19092}:9092"
+    networks:
+      - vp_internal
+
+  pds:
+    build:
+      context: /home/taiwei/Constructure-repos/policy-decision-service
+      dockerfile: deploy/Dockerfile
+    environment:
+      PDS_HTTP_ADDR: ":8080"
+      PDS_DATABASE_URL: ${PDS_DATABASE_URL:-postgres://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@host.docker.internal:5435/videoprocess?sslmode=disable}
+      PDS_REDIS_URL: ${PDS_REDIS_URL:-redis://host.docker.internal:6380/1}
+      PDS_FEATURE_PROVIDER_URL: http://vp-feature-aggregator:8080
+      PDS_KAFKA_ENABLED: "true"
+      PDS_KAFKA_BROKERS: redpanda:9092
+      RISK_KAFKA_BROKERS: redpanda:9092
+      RISK_VP_ACTIONS_TOPIC: vp.actor.actions.v1
+    depends_on:
+      - redpanda
+      - vp-feature-aggregator
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - vp_internal
+
+  vp-feature-aggregator:
+    build:
+      context: /home/taiwei/Constructure-repos/vp-feature-aggregator
+      dockerfile: deploy/Dockerfile
+    environment:
+      AGG_ENABLE_CONSUMER: "true"
+      AGG_KAFKA_BROKERS: redpanda:9092
+      AGG_REDIS_URL: ${VP_REDIS_URL:-redis://host.docker.internal:6380/2}
+      AGG_DATABASE_URL: ${AGG_DATABASE_URL:-postgresql://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@host.docker.internal:5435/videoprocess}
+      RISK_KAFKA_BROKERS: redpanda:9092
+      RISK_VP_ACTIONS_TOPIC: vp.actor.actions.v1
+    depends_on:
+      - redpanda
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - vp_internal
+
+  event-outbox-relay:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+    command: ["python", "event_outbox_relay.py"]
+    environment:
+      DATABASE_URL: ${VP_DATABASE_URL:-postgresql+asyncpg://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@host.docker.internal:5435/videoprocess}
+      RISK_KAFKA_BROKERS: redpanda:9092
+      RISK_VP_ACTIONS_TOPIC: vp.actor.actions.v1
+      RISK_OUTBOX_BATCH_SIZE: ${RISK_OUTBOX_BATCH_SIZE:-100}
+      RISK_OUTBOX_POLL_SECONDS: ${RISK_OUTBOX_POLL_SECONDS:-1}
+      RISK_OUTBOX_MAX_BACKOFF_SECONDS: ${RISK_OUTBOX_MAX_BACKOFF_SECONDS:-60}
+      RISK_OUTBOX_METRICS_PORT: ${RISK_OUTBOX_METRICS_PORT:-9101}
+    depends_on:
+      - redpanda
+      - api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - vp_internal
+
+  channel-agent-runner:
+    environment:
+      PDS_ENABLED: "true"
+      PDS_BASE_URL: http://pds:8080
+      PDS_CLIENT_ID: videoprocess-channel-agent
