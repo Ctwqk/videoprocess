@@ -17,6 +17,8 @@ event_outbox_table = sa.Table(
     sa.Column("payload", sa.JSON(), nullable=False),
     sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     sa.Column("delivered_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
+    sa.Column("claim_token", sa.String(length=64), nullable=True),
     sa.Column("attempt_count", sa.Integer(), nullable=False),
     sa.Column("last_error", sa.Text(), nullable=True),
 )
@@ -32,12 +34,14 @@ class EventOutbox:
         payload: dict[str, Any],
     ) -> str:
         event_id = str(payload.get("event_id") or uuid.uuid4())
+        payload_with_id = dict(payload)
+        payload_with_id["event_id"] = event_id
         await db.execute(
             sa.insert(event_outbox_table).values(
                 id=event_id,
                 topic=topic,
                 key=key,
-                payload=payload,
+                payload=payload_with_id,
                 created_at=datetime.now(timezone.utc),
                 attempt_count=0,
             )

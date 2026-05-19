@@ -29,12 +29,16 @@ def upgrade() -> None:
         sa.Column("payload", sa.JSON(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("delivered_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("claim_token", sa.String(length=64), nullable=True),
         sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("last_error", sa.Text(), nullable=True),
     )
     op.create_index("ix_event_outbox_undelivered", "event_outbox", ["delivered_at", "created_at"])
+    op.create_index("ix_event_outbox_claim_token", "event_outbox", ["claim_token"])
 
 
 def downgrade() -> None:
+    op.drop_index("ix_event_outbox_claim_token", table_name="event_outbox")
     op.drop_index("ix_event_outbox_undelivered", table_name="event_outbox")
     op.drop_table("event_outbox")
