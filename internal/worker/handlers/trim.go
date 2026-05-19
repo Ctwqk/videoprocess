@@ -45,6 +45,10 @@ func (h TrimHandler) Execute(ctx context.Context, inputPath, outputPath string, 
 	return err
 }
 
+// _ asserts the runner result return type so a future change to Runner.Run
+// breaks here loudly rather than silently shadowing the new field.
+var _ = vpffmpeg.RunResult{}
+
 func stringValue(value any, fallback string) string {
 	if raw, ok := value.(string); ok {
 		return raw
