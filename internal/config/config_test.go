@@ -29,3 +29,23 @@ func TestBoolEnvAcceptsPythonStyleTruth(t *testing.T) {
 		t.Fatalf("VideoUseGPU = false")
 	}
 }
+
+func TestAPIGoAllowStubStoreDefaultsFalse(t *testing.T) {
+	t.Setenv("VP_API_GO_ALLOW_STUB_STORE", "")
+
+	cfg := Load()
+
+	if cfg.APIGoAllowStubStore {
+		t.Fatal("APIGoAllowStubStore must default false so production read APIs fail closed")
+	}
+}
+
+func TestAPIGoAllowStubStoreReadsTruthyValues(t *testing.T) {
+	t.Setenv("VP_API_GO_ALLOW_STUB_STORE", "true")
+
+	cfg := Load()
+
+	if !cfg.APIGoAllowStubStore {
+		t.Fatal("APIGoAllowStubStore should read true")
+	}
+}

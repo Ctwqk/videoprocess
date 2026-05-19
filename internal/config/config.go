@@ -19,6 +19,7 @@ type Config struct {
 	MinIOSecure                          bool
 	APIHost                              string
 	APIPort                              int
+	APIGoAllowStubStore                  bool
 	ExoWatchdogURL                       string
 	YouTubeManagerURL                    string
 	PlatformBrowserManagerURL            string
@@ -50,6 +51,7 @@ func Load() Config {
 		MinIOSecure:                          boolEnv("MINIO_SECURE", false),
 		APIHost:                              env("API_HOST", "0.0.0.0"),
 		APIPort:                              intEnv("API_PORT", 8080),
+		APIGoAllowStubStore:                  boolEnv("VP_API_GO_ALLOW_STUB_STORE", false),
 		ExoWatchdogURL:                       env("EXO_WATCHDOG_URL", "http://localhost:8000"),
 		YouTubeManagerURL:                    env("YOUTUBE_MANAGER_URL", "http://localhost:8899"),
 		PlatformBrowserManagerURL:            env("PLATFORM_BROWSER_MANAGER_URL", "http://localhost:8898"),

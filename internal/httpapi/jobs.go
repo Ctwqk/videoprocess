@@ -4,6 +4,10 @@ import "net/http"
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
+		if !s.allowStubStore {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "database unavailable"})
+			return
+		}
 		writeJSON(w, http.StatusOK, emptyPage())
 		return
 	}
@@ -30,6 +34,10 @@ func (s *Server) scheduleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listAssets(w http.ResponseWriter, r *http.Request) {
 	if s.store == nil {
+		if !s.allowStubStore {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "database unavailable"})
+			return
+		}
 		writeJSON(w, http.StatusOK, emptyPage())
 		return
 	}

@@ -27,14 +27,28 @@ func main() {
 	openCancel()
 
 	var server *httpapi.Server
+	var pgProbe httpapi.ReadinessProbe
 	if err != nil {
 		// A missing DB during dev shouldn't crash the smoke binary, but log
 		// loudly so it isn't silently mistaken for a real listener.
-		slog.Error("vp-api-go: database unavailable, serving stub list endpoints", "error", err)
-		server = httpapi.NewServer()
+		slog.Error("vp-api-go: database unavailable", "error", err)
+		dbErr := err
+		pgProbe = func(context.Context) error { return dbErr }
+		server = httpapi.NewServerWithOptions(nil, httpapi.ServerOptions{
+			AllowStubStore: cfg.APIGoAllowStubStore,
+			Readiness: httpapi.ReadinessDeps{
+				Postgres: pgProbe,
+			},
+		})
 	} else {
 		defer st.Close()
-		server = httpapi.NewServerWithStore(st)
+		pgProbe = st.Ping
+		server = httpapi.NewServerWithOptions(st, httpapi.ServerOptions{
+			AllowStubStore: cfg.APIGoAllowStubStore,
+			Readiness: httpapi.ReadinessDeps{
+				Postgres: pgProbe,
+			},
+		})
 	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.APIHost, cfg.APIPort)

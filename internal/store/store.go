@@ -34,6 +34,13 @@ func (s *Store) Close() {
 	}
 }
 
+func (s *Store) Ping(ctx context.Context) error {
+	if s == nil || s.Pool == nil {
+		return pgx.ErrNoRows
+	}
+	return s.Pool.Ping(ctx)
+}
+
 // PipelineRow mirrors backend/app/schemas/pipeline.py PipelineResponse.
 type PipelineRow struct {
 	ID           string    `json:"id"`

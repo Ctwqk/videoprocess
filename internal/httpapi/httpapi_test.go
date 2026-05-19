@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -78,5 +80,56 @@ func TestListEndpointsShapeMatchesPython(t *testing.T) {
 		if _, ok := payload["total"]; !ok {
 			t.Fatalf("%s: missing total key", path)
 		}
+	}
+}
+
+func TestReadyzReportsHealthyDependencies(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	srv := NewServerWithOptions(nil, ServerOptions{
+		AllowStubStore: true,
+		Readiness: ReadinessDeps{
+			Postgres: func(context.Context) error { return nil },
+		},
+	})
+
+	srv.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["status"] != "ready" || payload["postgres"] != "ok" {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestReadyzFailsWhenDependencyFails(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	srv := NewServerWithOptions(nil, ServerOptions{
+		Readiness: ReadinessDeps{
+			Postgres: func(context.Context) error { return errors.New("down") },
+		},
+	})
+
+	srv.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestListEndpointsFailClosedWhenStubStoreDisabled(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/pipelines", nil)
+	rec := httptest.NewRecorder()
+
+	NewServerWithOptions(nil, ServerOptions{AllowStubStore: false}).Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
