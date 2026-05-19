@@ -13,7 +13,9 @@ import (
 
 	"github.com/Ctwqk/videoprocess/internal/config"
 	"github.com/Ctwqk/videoprocess/internal/httpapi"
+	"github.com/Ctwqk/videoprocess/internal/storage"
 	"github.com/Ctwqk/videoprocess/internal/store"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -21,6 +23,9 @@ func main() {
 
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	redisProbe := redisReadinessProbe(cfg.RedisURL)
+	storageProbe := storageReadinessProbe(rootCtx, cfg)
 
 	openCtx, openCancel := context.WithTimeout(rootCtx, 10*time.Second)
 	st, err := store.Open(openCtx, cfg.DatabaseURL)
@@ -38,6 +43,8 @@ func main() {
 			AllowStubStore: cfg.APIGoAllowStubStore,
 			Readiness: httpapi.ReadinessDeps{
 				Postgres: pgProbe,
+				Redis:    redisProbe,
+				Storage:  storageProbe,
 			},
 		})
 	} else {
@@ -47,6 +54,8 @@ func main() {
 			AllowStubStore: cfg.APIGoAllowStubStore,
 			Readiness: httpapi.ReadinessDeps{
 				Postgres: pgProbe,
+				Redis:    redisProbe,
+				Storage:  storageProbe,
 			},
 		})
 	}
@@ -70,5 +79,27 @@ func main() {
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("vp-api-go stopped", "error", err)
 		os.Exit(1)
+	}
+}
+
+func redisReadinessProbe(redisURL string) httpapi.ReadinessProbe {
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return func(context.Context) error { return err }
+	}
+	client := redis.NewClient(opts)
+	return func(ctx context.Context) error {
+		return client.Ping(ctx).Err()
+	}
+}
+
+func storageReadinessProbe(ctx context.Context, cfg config.Config) httpapi.ReadinessProbe {
+	backend, err := storage.FromConfig(ctx, cfg)
+	if err != nil {
+		return func(context.Context) error { return err }
+	}
+	return func(ctx context.Context) error {
+		_, err := backend.Exists(ctx, ".")
+		return err
 	}
 }

@@ -45,7 +45,7 @@ func TestNodeTypesIncludesTrim(t *testing.T) {
 	if payload["type_name"] != "trim" {
 		t.Fatalf("type_name = %#v", payload["type_name"])
 	}
-	if payload["worker_type"] != "ffmpeg" {
+	if payload["worker_type"] != "ffmpeg_go" {
 		t.Fatalf("worker_type = %#v", payload["worker_type"])
 	}
 }

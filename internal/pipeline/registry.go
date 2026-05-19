@@ -44,7 +44,7 @@ func BuiltinRegistry() map[string]NodeTypeDefinition {
 			TypeName:    "trim",
 			DisplayName: "Trim",
 			Category:    "transform",
-			WorkerType:  "ffmpeg",
+			WorkerType:  "ffmpeg_go",
 			Inputs: []PortDefinition{
 				{Name: "input", PortType: PortVideo, Required: true},
 			},

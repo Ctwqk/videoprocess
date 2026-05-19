@@ -6,6 +6,7 @@ DEFINITION = NodeTypeDefinition(
     category="transform",
     description="Trim a video to a specific time range",
     icon="scissors",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="input", port_type=PortType.VIDEO, description="Input video"),
     ],

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import httpx
@@ -15,8 +18,6 @@ PYTHON_API = os.environ.get("VP_PYTHON_API", "http://127.0.0.1:18080")
 def require_strict() -> None:
     if not STRICT:
         pytest.skip("set VP_GO_WORKER_SMOKE_STRICT=1 after compose services and fixture media are ready")
-    if not os.environ.get("VP_GO_SMOKE_ASSET_ID"):
-        pytest.fail("VP_GO_SMOKE_ASSET_ID must point to an existing video asset id")
 
 
 def post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -42,9 +43,52 @@ def wait_for_job(job_id: str) -> dict[str, Any]:
     pytest.fail(f"job {job_id} did not finish before timeout; last payload={last_payload}")
 
 
+def ensure_asset_id() -> str:
+    if asset_id := os.environ.get("VP_GO_SMOKE_ASSET_ID"):
+        return asset_id
+
+    with TemporaryDirectory() as tmp:
+        source = Path(tmp) / "go-trim-smoke-source.mp4"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=48000",
+                "-t",
+                "3",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                str(source),
+            ],
+            check=True,
+        )
+        with source.open("rb") as fh:
+            response = httpx.post(
+                f"{PYTHON_API}/api/v1/assets/upload",
+                files={"file": ("go-trim-smoke-source.mp4", fh, "video/mp4")},
+                timeout=60,
+            )
+        response.raise_for_status()
+        return response.json()["id"]
+
+
 def test_trim_worker_mixed_mode_smoke_requires_real_job_completion() -> None:
     require_strict()
-    asset_id = os.environ["VP_GO_SMOKE_ASSET_ID"]
+    asset_id = ensure_asset_id()
     pipeline_payload = {
         "name": "go-trim-smoke",
         "description": "Mixed-mode smoke: Python orchestrator dispatches trim to ffmpeg_go.",

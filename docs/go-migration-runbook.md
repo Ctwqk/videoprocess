@@ -56,12 +56,11 @@ docker compose up -d --build ffmpeg-worker-go
 docker compose logs --tail=100 ffmpeg-worker-go
 ```
 
-After the `trim` registry switch, run the mixed-mode smoke with a real video
-asset id from the Python API:
+After the `trim` registry switch, run the mixed-mode smoke. The test creates
+and uploads a small fixture video when `VP_GO_SMOKE_ASSET_ID` is not provided:
 
 ```bash
-VP_GO_SMOKE_ASSET_ID="$(curl -fsS http://127.0.0.1:18080/api/v1/assets?limit=1 | python3 -c 'import json,sys; p=json.load(sys.stdin); print(p["items"][0]["id"])')"
-VP_GO_WORKER_SMOKE_STRICT=1 VP_GO_SMOKE_ASSET_ID="$VP_GO_SMOKE_ASSET_ID" python3 -m pytest tests/go_migration/test_go_trim_worker_smoke.py -q
+VP_GO_WORKER_SMOKE_STRICT=1 python3 -m pytest tests/go_migration/test_go_trim_worker_smoke.py -q
 ```
 
 ## GPU Sidecar Start
