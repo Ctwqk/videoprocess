@@ -20,3 +20,93 @@
 }
 .react-flow__controls button:hover { background: var(--bg-2); color: var(--fg-1); }
 .react-flow__attribution { background: transparent !important; color: var(--fg-5) !important; }
+
+.job-detail-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.job-detail-toolbar-spacer {
+  flex: 1 1 auto;
+}
+
+.job-progress-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 14px;
+  overflow: hidden;
+}
+
+.job-progress-node {
+  flex: 1 1 28px;
+  min-width: 22px;
+  max-width: 92px;
+  height: 22px;
+  border-radius: 4px;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.job-detail-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 18px;
+  padding: 0 24px 24px;
+}
+
+.job-execution-row {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.job-execution-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 900px) {
+  .job-detail-toolbar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .job-detail-toolbar-spacer {
+    display: none;
+  }
+
+  .job-detail-layout {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0 16px 20px;
+  }
+}
+
+@media (max-width: 520px) {
+  .job-progress-node {
+    flex: 0 0 12px;
+    min-width: 12px;
+    max-width: 12px;
+    color: transparent !important;
+  }
+
+  .job-execution-row {
+    grid-template-columns: 26px minmax(0, 1fr);
+  }
+
+  .job-execution-row > :last-child {
+    grid-column: 2;
+    align-items: flex-start !important;
+  }
+}

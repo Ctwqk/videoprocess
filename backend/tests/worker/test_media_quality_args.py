@@ -160,7 +160,10 @@ async def test_bgm_uses_sidechain_ducking_loudnorm_and_48k_stereo(monkeypatch):
     args = captured["args"]
     filter_complex = _value_after(args, "-filter_complex")
     assert "aresample=48000:async=1" in filter_complex
+    assert filter_complex.count("aformat=sample_fmts=fltp:channel_layouts=stereo") == 2
+    assert f"volume=1.0,asplit=2[orig_mix][orig_sidechain]" in filter_complex
     assert "sidechaincompress=threshold=0.03:ratio=8:attack=200:release=800" in filter_complex
+    assert "[orig_mix][ducked]amix=inputs=2:duration=first:normalize=0" in filter_complex
     assert "loudnorm=I=-16:LRA=11:TP=-1.5" in filter_complex
     assert ["-c:a", "aac"] == args[args.index("-c:a") : args.index("-c:a") + 2]
     assert ["-ar", "48000"] == args[args.index("-ar") : args.index("-ar") + 2]

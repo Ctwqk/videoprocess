@@ -15,19 +15,36 @@ class VerticalCropHandler(BaseHandler):
                 f"[0:v]{self.scale_filter(width, height, force_original_aspect_ratio='increase')},"
                 f"crop={width}:{height},boxblur=20:1[bg];"
                 f"[0:v]{self.scale_filter(width, height, force_original_aspect_ratio='decrease')}[fg];"
-                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[v]"
+            )
+            args = (
+                [
+                    "-i",
+                    video,
+                    "-filter_complex",
+                    vf,
+                    "-map",
+                    "[v]",
+                    "-map",
+                    "0:a?",
+                ]
+                + self.intermediate_video_encode_args("libx264")
+                + [
+                    "-c:a",
+                    "aac",
+                    output_path,
+                ]
             )
         else:
             vf = f"{self.scale_filter(width, height, force_original_aspect_ratio='increase')},crop={width}:{height},setsar=1"
-
-        args = [
-            "-i",
-            video,
-            "-vf",
-            vf,
-            *self.intermediate_video_encode_args("libx264"),
-            "-c:a",
-            "aac",
-            output_path,
-        ]
+            args = [
+                "-i",
+                video,
+                "-vf",
+                vf,
+                *self.intermediate_video_encode_args("libx264"),
+                "-c:a",
+                "aac",
+                output_path,
+            ]
         await self.run_ffmpeg(args)

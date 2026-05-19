@@ -108,7 +108,7 @@ export default function JobDetailPage() {
   return (
     <div className="vp-page">
       <div style={{ padding: '20px 24px 0' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 14 }}>
+        <div className="job-detail-toolbar">
           <Link to="/jobs" className="vp-btn vp-btn-sm vp-btn-ghost">
             <Icons.chevron size={12} style={{ transform: 'rotate(180deg)' }} /> Jobs
           </Link>
@@ -117,7 +117,7 @@ export default function JobDetailPage() {
           </h2>
           <Tag>{job.id}</Tag>
           <Badge status={s.tone}>{s.label}</Badge>
-          <div style={{ flex: 1 }} />
+          <div className="job-detail-toolbar-spacer" />
           <button type="button" onClick={handleOpenPipeline} className="vp-btn vp-btn-sm">
             <Icons.flow size={12} />Edit pipeline
           </button>
@@ -148,7 +148,7 @@ export default function JobDetailPage() {
               <div style={{ width: `${progress}%` }} />
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 6, marginTop: 14 }}>
+          <div className="job-progress-strip">
             {job.node_executions.map(n => {
               const tone = toneForNodeStatus(n.status);
               const colorMap: Record<string, string> = {
@@ -169,15 +169,11 @@ export default function JobDetailPage() {
                 <div
                   key={n.id}
                   title={n.node_label}
+                  className="job-progress-node"
                   style={{
-                    flex: 1, height: 22,
                     background: bgMap[tone],
                     border: `1px solid ${colorMap[tone]}`,
-                    borderRadius: 4,
-                    display: 'grid', placeItems: 'center',
-                    fontSize: 10, fontFamily: 'var(--font-mono)',
                     color: tone === 'queue' || tone === 'idle' ? 'var(--fg-4)' : colorMap[tone],
-                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
                   }}
                 >
                   {n.node_label.slice(0, 10)}
@@ -198,9 +194,7 @@ export default function JobDetailPage() {
         )}
       </div>
 
-      <div style={{
-        display: 'grid', gridTemplateColumns: '1fr 360px', gap: 18, padding: '0 24px 24px',
-      }}>
+      <div className="job-detail-layout">
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
             <h3 style={{ margin: 0, fontSize: 13, fontWeight: 600, color: 'var(--fg-2)' }}>Node executions</h3>
@@ -231,9 +225,7 @@ export default function JobDetailPage() {
                     borderColor: ne.status === 'RUNNING' ? 'rgba(245,185,66,0.3)' : 'var(--border-1)',
                   }}
                 >
-                  <div style={{
-                    display: 'grid', gridTemplateColumns: '26px 1fr auto', gap: 12, alignItems: 'center',
-                  }}>
+                  <div className="job-execution-row">
                     <div style={{
                       width: 26, height: 26, borderRadius: 999,
                       display: 'grid', placeItems: 'center',
@@ -248,8 +240,8 @@ export default function JobDetailPage() {
                        ne.status === 'RUNNING' ? <Icons.play size={11} /> :
                        ne.status === 'FAILED' ? <Icons.x size={13} /> : '·'}
                     </div>
-                    <div>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div className="job-execution-title">
                         <span style={{ fontSize: 13.5, fontWeight: 500 }}>{ne.node_label}</span>
                         <Tag>{ne.node_type}</Tag>
                         {isFinal && <Badge status="ok">FINAL</Badge>}

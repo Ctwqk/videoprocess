@@ -23,6 +23,7 @@ class BgmHandler(BaseHandler):
             bgm_filters.append(f"afade=t=out:st={fade_start}:d={fade_out}")
 
         bgm_filter_chain = ",".join(bgm_filters)
+        sidechain_audio_format = "aformat=sample_fmts=fltp:channel_layouts=stereo"
 
         input_args = ["-i", video]
         if loop:
@@ -32,10 +33,11 @@ class BgmHandler(BaseHandler):
 
         if video_has_audio:
             filter_complex = (
-                f"[0:a]aresample=48000:async=1,volume={original_volume}[orig];"
-                f"[1:a]aresample=48000:async=1,{bgm_filter_chain}[bgm];"
-                "[bgm][orig]sidechaincompress=threshold=0.03:ratio=8:attack=200:release=800[ducked];"
-                "[orig][ducked]amix=inputs=2:duration=first:normalize=0[mix];"
+                f"[0:a]aresample=48000:async=1,{sidechain_audio_format},"
+                f"volume={original_volume},asplit=2[orig_mix][orig_sidechain];"
+                f"[1:a]aresample=48000:async=1,{sidechain_audio_format},{bgm_filter_chain}[bgm];"
+                "[bgm][orig_sidechain]sidechaincompress=threshold=0.03:ratio=8:attack=200:release=800[ducked];"
+                "[orig_mix][ducked]amix=inputs=2:duration=first:normalize=0[mix];"
                 "[mix]loudnorm=I=-16:LRA=11:TP=-1.5[a]"
             )
         else:
