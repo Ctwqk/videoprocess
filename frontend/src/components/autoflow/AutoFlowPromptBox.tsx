@@ -155,25 +155,25 @@ export default function AutoFlowPromptBox({
       style={{
         display: 'grid',
         gap: 14,
-        backgroundColor: '#0f172a',
-        border: '1px solid #1e293b',
-        borderRadius: 8,
-        padding: 16,
+        backgroundColor: 'transparent',
+        border: 'none',
+        borderRadius: 0,
+        padding: '0 20px 18px',
       }}
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
         <div>
-          <h1 style={{ margin: 0, fontSize: 20, lineHeight: 1.2, color: '#f8fafc' }}>AutoFlow</h1>
-          <div style={{ marginTop: 4, fontSize: 12, color: '#94a3b8' }}>
+          <h1 style={{ margin: 0, fontSize: 20, lineHeight: 1.2, color: 'var(--fg-1)' }}>AutoFlow</h1>
+          <div style={{ marginTop: 4, fontSize: 12, color: 'var(--fg-3)' }}>
             Generate a reviewed workflow without opening the editor.
           </div>
         </div>
         {loadingReferenceData ? (
-          <div style={{ fontSize: 12, color: '#93c5fd' }}>Loading capabilities...</div>
+          <div style={{ fontSize: 12, color: 'var(--acc)' }}>Loading capabilities...</div>
         ) : null}
       </div>
 
-      <label style={{ display: 'grid', gap: 8, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+      <label style={{ display: 'grid', gap: 8, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
         Prompt
         <textarea
           value={value.prompt}
@@ -186,9 +186,9 @@ export default function AutoFlowPromptBox({
             resize: 'vertical',
             minHeight: 112,
             borderRadius: 8,
-            border: '1px solid #334155',
-            backgroundColor: '#020617',
-            color: '#e2e8f0',
+            border: '1px solid var(--border-2)',
+            backgroundColor: 'var(--bg-0)',
+            color: 'var(--fg-1)',
             padding: 12,
             fontSize: 13,
             lineHeight: 1.5,
@@ -197,16 +197,16 @@ export default function AutoFlowPromptBox({
       </label>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 12 }}>
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Planning mode
           <select
             value={value.planning_mode}
             onChange={event => update('planning_mode', event.target.value as AutoFlowPlanningMode)}
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
@@ -217,7 +217,7 @@ export default function AutoFlowPromptBox({
           </select>
         </label>
 
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Duration
           <input
             type="number"
@@ -228,25 +228,25 @@ export default function AutoFlowPromptBox({
             placeholder="Auto"
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
           />
         </label>
 
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Aspect ratio
           <select
             value={value.aspect_ratio}
             onChange={event => update('aspect_ratio', event.target.value as AutoFlowAspectRatio)}
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
@@ -257,16 +257,16 @@ export default function AutoFlowPromptBox({
           </select>
         </label>
 
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Source policy
           <select
             value={value.source_policy}
             onChange={event => update('source_policy', event.target.value as AutoFlowSourcePolicy)}
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
@@ -277,16 +277,16 @@ export default function AutoFlowPromptBox({
           </select>
         </label>
 
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Source strategy
           <select
             value={value.source_strategy}
             onChange={event => update('source_strategy', event.target.value as AutoFlowSourceStrategy)}
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
@@ -297,16 +297,16 @@ export default function AutoFlowPromptBox({
           </select>
         </label>
 
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Publish mode
           <select
             value={value.publish_mode}
             onChange={event => update('publish_mode', event.target.value as AutoFlowPublishMode)}
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
@@ -319,7 +319,7 @@ export default function AutoFlowPromptBox({
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 12 }}>
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Input asset ID
           <input
             type="text"
@@ -328,16 +328,16 @@ export default function AutoFlowPromptBox({
             placeholder="Optional uploaded video asset"
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
           />
         </label>
 
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Min shots
           <input
             type="number"
@@ -347,16 +347,16 @@ export default function AutoFlowPromptBox({
             onChange={event => update('min_shots', Number(event.target.value) || 1)}
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
           />
         </label>
 
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Max shots
           <input
             type="number"
@@ -366,9 +366,9 @@ export default function AutoFlowPromptBox({
             onChange={event => update('max_shots', Number(event.target.value) || 1)}
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
@@ -381,7 +381,7 @@ export default function AutoFlowPromptBox({
             alignItems: 'center',
             gap: 8,
             fontSize: 12,
-            color: '#cbd5e1',
+            color: 'var(--fg-2)',
             fontWeight: 600,
             paddingTop: 20,
           }}
@@ -396,7 +396,7 @@ export default function AutoFlowPromptBox({
       </div>
 
       <div style={{ display: 'grid', gap: 8 }}>
-        <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>Target platforms</div>
+        <div style={{ fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>Target platforms</div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           {platformOptions.map(platform => {
             const selected = value.target_platforms.includes(platform);
@@ -406,11 +406,11 @@ export default function AutoFlowPromptBox({
                 type="button"
                 onClick={() => togglePlatform(platform)}
                 style={{
-                  border: `1px solid ${selected ? '#2563eb' : '#334155'}`,
+                  border: `1px solid ${selected ? 'var(--acc)' : 'var(--border-2)'}`,
                   borderRadius: 6,
                   padding: '7px 10px',
-                  backgroundColor: selected ? '#172554' : '#020617',
-                  color: selected ? '#bfdbfe' : '#94a3b8',
+                  backgroundColor: selected ? 'var(--acc-soft)' : 'var(--bg-0)',
+                  color: selected ? 'var(--acc)' : 'var(--fg-3)',
                   cursor: 'pointer',
                   fontSize: 12,
                   fontWeight: 600,
@@ -424,7 +424,7 @@ export default function AutoFlowPromptBox({
       </div>
 
       <div style={{ display: 'grid', gap: 8 }}>
-        <div style={{ fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>Source platforms</div>
+        <div style={{ fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>Source platforms</div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           {sourcePlatformOptions.map(platform => {
             const selected = value.source_platforms.includes(platform);
@@ -434,11 +434,11 @@ export default function AutoFlowPromptBox({
                 type="button"
                 onClick={() => toggleSourcePlatform(platform)}
                 style={{
-                  border: `1px solid ${selected ? '#0f766e' : '#334155'}`,
+                  border: `1px solid ${selected ? 'var(--acc)' : 'var(--border-2)'}`,
                   borderRadius: 6,
                   padding: '7px 10px',
-                  backgroundColor: selected ? '#134e4a' : '#020617',
-                  color: selected ? '#ccfbf1' : '#94a3b8',
+                  backgroundColor: selected ? 'var(--acc-soft)' : 'var(--bg-0)',
+                  color: selected ? 'var(--acc)' : 'var(--fg-3)',
                   cursor: 'pointer',
                   fontSize: 12,
                   fontWeight: 600,
@@ -452,16 +452,16 @@ export default function AutoFlowPromptBox({
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Template hint
           <select
             value={getPreferredTemplateId(value)}
             onChange={event => updatePreferredTemplate(event.target.value)}
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
@@ -473,7 +473,7 @@ export default function AutoFlowPromptBox({
           </select>
         </label>
 
-        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: '#cbd5e1', fontWeight: 600 }}>
+        <label style={{ display: 'grid', gap: 6, fontSize: 12, color: 'var(--fg-2)', fontWeight: 600 }}>
           Material library IDs
           <input
             value={value.material_library_ids.join(', ')}
@@ -481,9 +481,9 @@ export default function AutoFlowPromptBox({
             placeholder="library-id-1, library-id-2"
             style={{
               borderRadius: 6,
-              border: '1px solid #334155',
-              backgroundColor: '#020617',
-              color: '#e2e8f0',
+              border: '1px solid var(--border-2)',
+              backgroundColor: 'var(--bg-0)',
+              color: 'var(--fg-1)',
               padding: '8px 10px',
               fontSize: 13,
             }}
@@ -502,11 +502,11 @@ export default function AutoFlowPromptBox({
                 onClick={() => toggleMaterialLibrary(library.id)}
                 title={library.description ?? undefined}
                 style={{
-                  border: `1px solid ${selected ? '#0f766e' : '#334155'}`,
+                  border: `1px solid ${selected ? 'var(--acc)' : 'var(--border-2)'}`,
                   borderRadius: 6,
                   padding: '6px 9px',
-                  backgroundColor: selected ? '#134e4a' : '#020617',
-                  color: selected ? '#ccfbf1' : '#94a3b8',
+                  backgroundColor: selected ? 'var(--acc-soft)' : 'var(--bg-0)',
+                  color: selected ? 'var(--acc)' : 'var(--fg-3)',
                   cursor: 'pointer',
                   fontSize: 12,
                 }}
@@ -526,8 +526,8 @@ export default function AutoFlowPromptBox({
             border: 'none',
             borderRadius: 6,
             padding: '9px 16px',
-            backgroundColor: planning || !value.prompt.trim() ? '#334155' : '#2563eb',
-            color: '#fff',
+            backgroundColor: planning || !value.prompt.trim() ? 'var(--border-2)' : 'var(--acc)',
+            color: 'var(--acc-fg)',
             cursor: planning || !value.prompt.trim() ? 'default' : 'pointer',
             fontSize: 13,
             fontWeight: 700,
