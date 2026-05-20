@@ -159,8 +159,14 @@ func preferredVideoCodec(codec string) string {
 	return codec
 }
 
-func envEnabled(key string) bool {
+func envEnabled(key string, fallback ...bool) bool {
 	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		if len(fallback) > 0 {
+			return fallback[0]
+		}
+		return false
+	}
 	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 

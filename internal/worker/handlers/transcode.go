@@ -67,6 +67,23 @@ func runFFmpeg(ctx context.Context, runner vpffmpeg.Runner, args []string) error
 	if runner.Binary == "" {
 		runner = vpffmpeg.NewRunner()
 	}
-	_, err := runner.Run(ctx, args)
+	result, err := runner.Run(ctx, args)
+	if err != nil && result.GPUCapacity && containsHardwareCodec(args) && envEnabled("VIDEO_GPU_FALLBACK_TO_CPU", true) {
+		_, retryErr := runner.Run(ctx, vpffmpeg.RewriteHardwareArgsForCPU(args))
+		if retryErr == nil {
+			return nil
+		}
+		return retryErr
+	}
 	return err
+}
+
+func containsHardwareCodec(args []string) bool {
+	for _, token := range args {
+		switch token {
+		case "h264_nvenc", "hevc_nvenc", "h264_videotoolbox", "hevc_videotoolbox":
+			return true
+		}
+	}
+	return false
 }

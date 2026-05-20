@@ -5,7 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
 )
 
 func TestScaleFilter(t *testing.T) {
@@ -373,4 +376,47 @@ func TestTranscodeArgsPrefersHardwareCodecFromEnv(t *testing.T) {
 			t.Fatalf("args = %#v", got)
 		}
 	})
+}
+
+func TestRunFFmpegRetriesHardwareCapacityFailureOnCPU(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "args.log")
+	markerPath := filepath.Join(root, "failed_once")
+	scriptPath := filepath.Join(root, "fake-ffmpeg.sh")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> " + shellQuote(logPath) + "\n" +
+		"if [ ! -e " + shellQuote(markerPath) + " ]; then\n" +
+		"  touch " + shellQuote(markerPath) + "\n" +
+		"  echo 'OpenEncodeSessionEx failed: out of memory' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runFFmpeg(context.Background(), vpffmpeg.Runner{Binary: scriptPath, PreArgs: nil}, []string{
+		"-c:v", "h264_nvenc",
+		"-rc:v", "vbr",
+		"-cq:v", "23",
+		"-preset", "fast",
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(mustReadFile(t, logPath))), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("run count = %d, lines=%#v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "h264_nvenc") {
+		t.Fatalf("first run args = %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "libx264") || strings.Contains(lines[1], "h264_nvenc") || strings.Contains(lines[1], "-cq:v") {
+		t.Fatalf("retry args = %q", lines[1])
+	}
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
