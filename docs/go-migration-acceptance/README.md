@@ -69,6 +69,29 @@ Write parity: 5 passed
 Redis XPENDING vp:tasks:ffmpeg_go ffmpeg_go-workers: 0
 ```
 
+## Production-Style Acceptance
+
+Commands run:
+
+```bash
+python3 scripts/go_migration_acceptance.py --help
+python3 -m py_compile scripts/go_migration_acceptance.py
+python3 scripts/go_migration_acceptance.py --api-url http://127.0.0.1:18080 --redis-url redis://127.0.0.1:6380/0 --count 1
+python3 scripts/go_migration_acceptance.py --api-url http://127.0.0.1:18080 --redis-url redis://127.0.0.1:6380/0 --count 20
+redis-cli -u redis://127.0.0.1:6380/0 XPENDING vp:tasks:ffmpeg_go ffmpeg_go-workers
+```
+
+Observed result:
+
+```text
+--help includes --api-url, --redis-url, --count, and --timeout-seconds.
+py_compile: pass
+count=1 smoke: every migrated node completed=1, redis_pending=0, missing_output_artifact_id=0, missing_storage_path=0, wrong_worker=0
+count=20 acceptance: every migrated node completed=20, redis_pending=0, missing_output_artifact_id=0, missing_storage_path=0, wrong_worker=0
+Redis XPENDING after acceptance: 0
+p95_seconds range: 2.039856790192425 to 4.04803975042887
+```
+
 ## Baseline
 
 Commands run before non-Phase-6 completion work:
