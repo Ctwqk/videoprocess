@@ -21,6 +21,36 @@ func TestDrawTextEscaping(t *testing.T) {
 	}
 }
 
+func TestBoolValueMatchesPythonParseBoolParam(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    any
+		fallback bool
+		want     bool
+	}{
+		{name: "nil uses fallback true", value: nil, fallback: true, want: true},
+		{name: "nil uses fallback false", value: nil, fallback: false, want: false},
+		{name: "bool true", value: true, fallback: false, want: true},
+		{name: "bool false", value: false, fallback: true, want: false},
+		{name: "truthy string one", value: "1", fallback: false, want: true},
+		{name: "truthy string true", value: "true", fallback: false, want: true},
+		{name: "truthy string yes", value: "yes", fallback: false, want: true},
+		{name: "truthy string on", value: "on", fallback: false, want: true},
+		{name: "truthy string uppercase with spaces", value: " YES ", fallback: false, want: true},
+		{name: "false string ignores fallback", value: "false", fallback: true, want: false},
+		{name: "unknown string ignores fallback", value: "falsey", fallback: true, want: false},
+		{name: "numeric zero ignores fallback", value: 0, fallback: true, want: false},
+		{name: "numeric two ignores fallback", value: 2, fallback: true, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := boolValue(tt.value, tt.fallback); got != tt.want {
+				t.Fatalf("boolValue(%#v, %v) = %v, want %v", tt.value, tt.fallback, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIntermediateVideoEncodeArgs(t *testing.T) {
 	got := intermediateVideoEncodeArgs("libx264")
 	want := []string{

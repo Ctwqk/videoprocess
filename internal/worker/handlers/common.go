@@ -115,15 +115,8 @@ func boolValue(value any, fallback bool) bool {
 		return fallback
 	case bool:
 		return typed
-	case string:
-		switch strings.ToLower(strings.TrimSpace(typed)) {
-		case "1", "true", "yes", "on":
-			return true
-		case "0", "false", "no", "off":
-			return false
-		}
 	}
-	return fallback
+	return strings.Contains("|1|true|yes|on|", "|"+strings.ToLower(strings.TrimSpace(fmt.Sprint(value)))+"|")
 }
 
 func stringValue(value any, fallback string) string {
