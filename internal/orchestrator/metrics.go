@@ -44,6 +44,22 @@ func observeGoOrchestratorEvent(event string, result string) {
 	metricGoOrchestratorEvents.WithLabelValues(eventMetricLabel(event), result).Inc()
 }
 
+func observeGoJobStarted(result string) {
+	metricGoOrchestratorJobsStarted.WithLabelValues(result).Inc()
+}
+
+func observeGoDispatch(nodeType string) {
+	metricGoOrchestratorDispatches.WithLabelValues(nodeTypeMetricLabel(nodeType)).Inc()
+}
+
+func observeGoRetry(nodeType string) {
+	metricGoOrchestratorRetries.WithLabelValues(nodeTypeMetricLabel(nodeType)).Inc()
+}
+
+func observeGoFinalized(status string) {
+	metricGoOrchestratorJobsFinalized.WithLabelValues(jobStatusMetricLabel(status)).Inc()
+}
+
 func observeGoOrchestratorEventFailure(event string) {
 	metricGoOrchestratorEventFailures.WithLabelValues(eventMetricLabel(event)).Inc()
 }
@@ -67,5 +83,23 @@ func eventMetricLabel(event string) string {
 		return "malformed"
 	default:
 		return "unknown"
+	}
+}
+
+func nodeTypeMetricLabel(nodeType string) string {
+	if nodeType == "" {
+		return "unknown"
+	}
+	return nodeType
+}
+
+func jobStatusMetricLabel(status string) string {
+	switch status {
+	case "SUCCEEDED", "FAILED", "CANCELLED", "PARTIALLY_FAILED":
+		return status
+	case "":
+		return "unknown"
+	default:
+		return "other"
 	}
 }

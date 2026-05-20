@@ -69,12 +69,22 @@ type NodeExecutionView struct {
 	ErrorMessage     string
 }
 
-func (e *Engine) StartJob(ctx context.Context, jobID string) error {
+func (e *Engine) StartJob(ctx context.Context, jobID string) (err error) {
+	startResult := "error"
+	defer func() {
+		observeGoJobStarted(startResult)
+	}()
+
 	job, err := e.Store.GetJobDetail(ctx, jobID)
 	if err != nil {
 		return err
 	}
-	if !shouldProcessGoJob(job) || isTerminalJobStatus(job.Status) {
+	if !shouldProcessGoJob(job) {
+		startResult = "skipped"
+		return nil
+	}
+	if isTerminalJobStatus(job.Status) {
+		startResult = "terminal"
 		return nil
 	}
 
@@ -98,12 +108,16 @@ func (e *Engine) StartJob(ctx context.Context, jobID string) error {
 		return err
 	}
 	if isTerminalJobStatus(job.Status) {
+		startResult = "started"
 		return nil
 	}
 	if err := e.dispatchReadyNodes(ctx, &job, depMap); err != nil {
 		return err
 	}
-	_, err = e.maybeFinalizeJob(ctx, job)
+	if _, err := e.maybeFinalizeJob(ctx, job); err != nil {
+		return err
+	}
+	startResult = "started"
 	return err
 }
 
@@ -162,6 +176,7 @@ func (e *Engine) OnNodeFailed(ctx context.Context, jobID string, nodeExecutionID
 		if err := e.Store.IncrementGoNodeRetry(ctx, jobID, nodeExecutionID); err != nil {
 			return err
 		}
+		observeGoRetry(node.NodeType)
 		job, err = e.Store.GetJobDetail(ctx, jobID)
 		if err != nil {
 			return err
@@ -170,7 +185,10 @@ func (e *Engine) OnNodeFailed(ctx context.Context, jobID string, nodeExecutionID
 		if retryNode == nil {
 			return nil
 		}
-		return e.dispatchNode(ctx, &job, retryNode, dependenciesForJob(job))
+		if err := e.dispatchNode(ctx, &job, retryNode, dependenciesForJob(job)); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	if err := e.Store.MarkGoNodeFailed(ctx, jobID, nodeExecutionID, errorMessage); err != nil {
@@ -319,6 +337,7 @@ func (e *Engine) dispatchNode(ctx context.Context, job *JobView, node *NodeExecu
 		node.InputArtifactIDs = nil
 		return err
 	}
+	observeGoDispatch(node.NodeType)
 	return nil
 }
 
@@ -347,6 +366,7 @@ func (e *Engine) maybeFinalizeJob(ctx context.Context, job JobView) (bool, error
 	if err := e.Store.FinalizeGoJob(ctx, job.ID, status, errorMessage, successfulLeafIDs); err != nil {
 		return false, err
 	}
+	observeGoFinalized(status)
 	return true, nil
 }
 
