@@ -115,3 +115,103 @@ backend pytest: 331 passed, 8 warnings
 ruff: /usr/bin/python3: No module named ruff
 mypy: /usr/bin/python3: No module named mypy
 ```
+
+## Final Spec Audit
+
+Source spec:
+
+```text
+/home/taiwei/Constructure-repos/videoprocess/docs/videoprocess-go-partial-migration-spec.md
+```
+
+Implemented non-Phase-6 scope:
+
+```text
+Phase 0 Baseline/Gates:
+- Go sidecars run beside Python services.
+- /readyz reports postgres/redis/storage readiness.
+- production stub-store behavior is fail-closed unless explicitly enabled.
+
+Phase 1 Go API read-only parity:
+- /api/v1 read routes and detail routes have Python-shape parity tests.
+- /internal/schedule/video/status reads real schedule state instead of fixed OPEN.
+- request id/logging/metrics middleware is present.
+
+Phase 2 Go worker trim MVP:
+- vp-ffmpeg-worker-go registers task-level media handlers.
+- runtime resolves input artifacts, writes output media, creates artifact rows, emits non-empty output_artifact_id, and cleans temp files.
+- cancellation ack contract is aligned with Python for confirmed cancellation.
+- Python orchestrator can dispatch to ffmpeg_go and complete jobs through the Python event listener.
+
+Phase 3 Worker production semantics:
+- PEL reclaim, heartbeat, host affinity defer, bounded concurrency, graceful shutdown, and worker metrics are implemented and covered by Go tests.
+
+Phase 4 First-wave pure ffmpeg nodes:
+- Node registry cutover routes the first-wave pure ffmpeg nodes to worker_type=ffmpeg_go:
+  trim, transcode, export, vertical_crop, watermark, title_overlay, bgm, replace_audio, concat_horizontal, concat_vertical, concat_many, concat_timeline, concat_vertical_timeline, montage_assembler.
+- Strict per-node mixed-mode tests verify real job execution through the Go worker.
+
+Phase 5 Selective Go API writes:
+- pipeline validation and deterministic pipeline/asset/artifact/schedule/job write surfaces are implemented with mixed-mode ownership guards.
+- Phase-6-owned writes such as job create/batch/rerun remain Python-owned or explicitly unsupported in Go unless a Python handoff is configured.
+```
+
+Intentionally not implemented here:
+
+```text
+Phase 6:
+- Go event listener.
+- Go startup recovery.
+- Go job dispatch / DAG scheduling.
+- Go retry/downstream skip/final artifact ownership.
+
+Spec non-goals retained:
+- AutoFlow graph planner Go rewrite.
+- LLM/ASR/TTS/search/material/external platform publish handler Go rewrite.
+- public publishing behavior changes.
+- Alembic replacement or Postgres schema ownership transfer.
+```
+
+Python code deletion status:
+
+```text
+Old Python API, orchestrator, worker handlers, schemas, and Alembic code are intentionally retained.
+The source spec explicitly keeps Python as the reference implementation and rollback path.
+Rollback for migrated nodes remains worker_type ffmpeg_go -> ffmpeg plus stopping vp-ffmpeg-worker-go; no DB restore is required.
+```
+
+Fresh final verification:
+
+```text
+go test ./...: pass
+go vet ./...: pass
+cd backend && python3 -m pytest: 336 passed, 8 warnings
+cd backend && python3 -m ruff check . || true: /usr/bin/python3: No module named ruff
+cd backend && python3 -m mypy app || true: /usr/bin/python3: No module named mypy
+
+Python API health: {"status":"ok"}
+Go API health: {"status":"ok"}
+Go API readyz: {"postgres":"ok","redis":"ok","status":"ready","storage":"ok"}
+Go worker process: vp-ffmpeg-worker-go
+Go worker WORKER_TYPE: ffmpeg_go
+
+API parity/read/registry/validator strict gate: 22 passed
+trim worker strict smoke: 1 passed
+first-wave worker cutover strict gate: 14 passed
+Go write strict gate: 5 passed
+Redis XPENDING vp:tasks:ffmpeg_go ffmpeg_go-workers: 0
+```
+
+Fresh production-style acceptance:
+
+```text
+python3 scripts/go_migration_acceptance.py --api-url http://127.0.0.1:18080 --redis-url redis://127.0.0.1:6380/0 --count 20
+
+Result:
+- every migrated node completed=20
+- redis_pending=0 for every migrated node
+- missing_output_artifact_id=0 for every migrated node
+- missing_storage_path=0 for every migrated node
+- wrong_worker=0 for every migrated node
+- p95_seconds range: 2.040999120241031 to 4.050431395694614
+```
