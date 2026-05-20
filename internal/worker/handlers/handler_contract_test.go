@@ -192,3 +192,49 @@ func TestBatch4AArgs(t *testing.T) {
 		})
 	}
 }
+
+func TestTranscodeArgsPrefersHardwareCodecFromEnv(t *testing.T) {
+	t.Run("gpu maps libx264 to nvenc", func(t *testing.T) {
+		t.Setenv("VIDEO_USE_GPU", "true")
+		t.Setenv("VIDEO_USE_VIDEOTOOLBOX", "")
+		got := TranscodeArgs("/in.mp4", "/out.mp4", map[string]any{"video_codec": "libx264"})
+		want := []string{
+			"-i", "/in.mp4",
+			"-c:v", "h264_nvenc",
+			"-rc:v", "vbr",
+			"-cq:v", "20",
+			"-preset", "medium",
+			"-pix_fmt", "yuv420p",
+			"-movflags", "+faststart",
+			"-color_primaries", "bt709",
+			"-color_trc", "bt709",
+			"-colorspace", "bt709",
+			"-c:a", "aac",
+			"/out.mp4",
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("args = %#v", got)
+		}
+	})
+
+	t.Run("videotoolbox maps libx265 to hevc videotoolbox", func(t *testing.T) {
+		t.Setenv("VIDEO_USE_GPU", "")
+		t.Setenv("VIDEO_USE_VIDEOTOOLBOX", "on")
+		got := TranscodeArgs("/in.mp4", "/out.mp4", map[string]any{"video_codec": "libx265"})
+		want := []string{
+			"-i", "/in.mp4",
+			"-c:v", "hevc_videotoolbox",
+			"-b:v", "4M",
+			"-pix_fmt", "yuv420p",
+			"-movflags", "+faststart",
+			"-color_primaries", "bt709",
+			"-color_trc", "bt709",
+			"-colorspace", "bt709",
+			"-c:a", "aac",
+			"/out.mp4",
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("args = %#v", got)
+		}
+	})
+}
