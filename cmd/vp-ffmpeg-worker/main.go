@@ -14,7 +14,7 @@ import (
 	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/Ctwqk/videoprocess/internal/worker"
 	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
-	"github.com/Ctwqk/videoprocess/internal/worker/handlers"
+	handlerspkg "github.com/Ctwqk/videoprocess/internal/worker/handlers"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -61,11 +61,19 @@ func main() {
 		Logger:             slog.Default(),
 		CancelPollInterval: cfg.CancelPollInterval,
 	}
-	trim := worker.NewMediaTaskHandler(runtimeEnv, handlers.TrimHandler{Runner: vpffmpeg.NewRunner()})
+	runner := vpffmpeg.NewRunner()
+	mediaHandlers := []worker.Handler{
+		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.TrimHandler{Runner: runner}),
+		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.TranscodeHandler{Runner: runner}),
+		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.ExportHandler{Runner: runner}),
+		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.VerticalCropHandler{Runner: runner}),
+		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.WatermarkHandler{Runner: runner}),
+		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.TitleOverlayHandler{Runner: runner}),
+	}
 
 	// Handler registration happens here so adding new node types is a
 	// single-file change. Each handler must self-identify via NodeType().
-	consumer := worker.NewConsumer(client, cfg, trim)
+	consumer := worker.NewConsumer(client, cfg, mediaHandlers...)
 
 	if err := consumer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("vp-ffmpeg-worker-go stopped", "error", err)

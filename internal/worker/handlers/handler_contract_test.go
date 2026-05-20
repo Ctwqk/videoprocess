@@ -67,3 +67,93 @@ func TestIntermediateVideoEncodeArgs(t *testing.T) {
 		t.Fatalf("args = %#v", got)
 	}
 }
+
+func TestBatch4AArgs(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		expect []string
+	}{
+		{
+			name: "transcode default",
+			args: TranscodeArgs("/in.mp4", "/out.mp4", map[string]any{}),
+			expect: []string{
+				"-i", "/in.mp4",
+				"-c:v", "libx264",
+				"-crf", "20",
+				"-preset", "medium",
+				"-pix_fmt", "yuv420p",
+				"-movflags", "+faststart",
+				"-color_primaries", "bt709",
+				"-color_trc", "bt709",
+				"-colorspace", "bt709",
+				"-c:a", "aac",
+				"/out.mp4",
+			},
+		},
+		{
+			name: "vertical crop center",
+			args: VerticalCropArgs("/in.mp4", "/out.mp4", map[string]any{"width": 1080.0, "height": 1920.0, "mode": "center_crop"}),
+			expect: []string{
+				"-i", "/in.mp4",
+				"-vf", "scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920,setsar=1",
+				"-c:v", "libx264",
+				"-crf", "18",
+				"-preset", "slow",
+				"-pix_fmt", "yuv420p",
+				"-movflags", "+faststart",
+				"-color_primaries", "bt709",
+				"-color_trc", "bt709",
+				"-colorspace", "bt709",
+				"-c:a", "aac",
+				"/out.mp4",
+			},
+		},
+		{
+			name: "watermark bottom right",
+			args: WatermarkArgs("/video.mp4", "/wm.png", "/out.mp4", map[string]any{"position": "bottom_right", "opacity": 0.8, "scale": 0.15, "margin": 10.0}),
+			expect: []string{
+				"-i", "/video.mp4",
+				"-i", "/wm.png",
+				"-filter_complex", "[1:v]scale=iw*0.15:-1:flags=lanczos,format=rgba,colorchannelmixer=aa=0.8[wm];[0:v][wm]overlay=W-w-10:H-h-10[v]",
+				"-map", "[v]",
+				"-map", "0:a?",
+				"-c:v", "libx264",
+				"-crf", "18",
+				"-preset", "slow",
+				"-pix_fmt", "yuv420p",
+				"-movflags", "+faststart",
+				"-color_primaries", "bt709",
+				"-color_trc", "bt709",
+				"-colorspace", "bt709",
+				"-c:a", "copy",
+				"/out.mp4",
+			},
+		},
+		{
+			name: "title overlay",
+			args: TitleOverlayArgs("/in.mp4", "/out.mp4", map[string]any{"text": "Hello: A", "position": "top", "start_time": 0.0, "duration": 3.0, "font_size": 72.0, "safe_area": true}),
+			expect: []string{
+				"-i", "/in.mp4",
+				"-vf", "drawtext=text='Hello\\: A':fontcolor=white:fontsize=72:box=1:boxcolor=black@0.45:boxborderw=18:x=(w-text_w)/2:y=h*0.12:enable='between(t,0,3)'",
+				"-c:v", "libx264",
+				"-crf", "18",
+				"-preset", "slow",
+				"-pix_fmt", "yuv420p",
+				"-movflags", "+faststart",
+				"-color_primaries", "bt709",
+				"-color_trc", "bt709",
+				"-colorspace", "bt709",
+				"-c:a", "aac",
+				"/out.mp4",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !reflect.DeepEqual(tt.args, tt.expect) {
+				t.Fatalf("args = %#v", tt.args)
+			}
+		})
+	}
+}
