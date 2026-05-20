@@ -50,6 +50,7 @@ func (s *Server) Router() http.Handler {
 		r.Get("/node-types", s.listNodeTypes)
 		r.Get("/node-types/{typeName}", s.getNodeType)
 		r.Get("/pipelines", s.listPipelines)
+		r.Post("/pipelines/validate", s.validatePipeline)
 		r.Get("/pipelines/{pipelineID}", s.getPipeline)
 		r.Get("/templates", s.listTemplates)
 		r.Get("/assets", s.listAssets)

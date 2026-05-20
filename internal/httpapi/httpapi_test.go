@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -82,6 +83,52 @@ func TestListEndpointsShapeMatchesPython(t *testing.T) {
 		if _, ok := payload["total"]; !ok {
 			t.Fatalf("%s: missing total key", path)
 		}
+	}
+}
+
+func TestValidatePipelineReturnsValidationResult(t *testing.T) {
+	body := `{
+		"nodes": [
+			{"id":"source_1","type":"source","position":{},"data":{"label":"Source","asset_id":"00000000-0000-0000-0000-000000000001"}},
+			{"id":"export_1","type":"export","position":{},"data":{"label":"Export"}}
+		],
+		"edges": [
+			{"id":"edge_1","source":"source_1","target":"export_1","sourceHandle":"output","targetHandle":"input"}
+		],
+		"viewport": {"x":0,"y":0,"zoom":1}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/pipelines/validate", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["valid"] != true {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestValidatePipelineRejectsMalformedJSON(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/pipelines/validate", strings.NewReader(`{"nodes": [`))
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["detail"] != "invalid pipeline definition" {
+		t.Fatalf("payload = %#v", payload)
 	}
 }
 
