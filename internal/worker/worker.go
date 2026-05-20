@@ -37,6 +37,23 @@ type Config struct {
 	MetricsAddr         string
 }
 
+// TaskMessage is the decoded Redis Streams payload written to
+// `vp:tasks:{worker_type}`. Keys mirror the producer side in
+// `backend/app/orchestrator/engine.py` and the Go orchestrator producer.
+type TaskMessage struct {
+	JobID              string         `json:"job_id"`
+	NodeExecutionID    string         `json:"node_execution_id"`
+	NodeID             string         `json:"node_id"`
+	NodeType           string         `json:"node_type"`
+	EventStream        string         `json:"event_stream"`
+	OrchestratorOwner  string         `json:"orchestrator_owner"`
+	Config             map[string]any `json:"config"`
+	InputArtifacts     map[string]any `json:"input_artifacts"`
+	PreferredHosts     []string       `json:"preferred_hosts"`
+	AffinityEnqueuedAt string         `json:"affinity_enqueued_at"`
+	AffinityBounces    string         `json:"affinity_bounces"`
+}
+
 // LoadConfig builds a Config from environment, applying defaults that match
 // the Python worker:
 //

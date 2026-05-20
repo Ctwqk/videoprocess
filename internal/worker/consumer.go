@@ -29,21 +29,6 @@ type NodeResult struct {
 	OutputArtifactID string
 }
 
-// TaskMessage is the decoded Redis Streams payload the Python orchestrator
-// writes to `vp:tasks:{worker_type}`. Keys mirror the producer side in
-// `backend/app/orchestrator/engine.py`.
-type TaskMessage struct {
-	JobID              string         `json:"job_id"`
-	NodeExecutionID    string         `json:"node_execution_id"`
-	NodeID             string         `json:"node_id"`
-	NodeType           string         `json:"node_type"`
-	Config             map[string]any `json:"config"`
-	InputArtifacts     map[string]any `json:"input_artifacts"`
-	PreferredHosts     []string       `json:"preferred_hosts"`
-	AffinityEnqueuedAt string         `json:"affinity_enqueued_at"`
-	AffinityBounces    string         `json:"affinity_bounces"`
-}
-
 // Consumer drives the Redis Streams loop for one Go worker instance. The
 // design mirrors the Python worker minus the heartbeat/PEL-reclaim helpers,
 // which can be added in a follow-up alongside cancellation listeners.
@@ -267,6 +252,7 @@ func (c *Consumer) ack(ctx context.Context, msgID string) {
 
 func (c *Consumer) publishCompleted(ctx context.Context, task TaskMessage, artifactID string) error {
 	return redisstream.PublishNodeCompleted(ctx, c.Redis, redisstream.NodeEvent{
+		EventStream:      task.EventStream,
 		JobID:            task.JobID,
 		NodeExecutionID:  task.NodeExecutionID,
 		OutputArtifactID: artifactID,
@@ -275,6 +261,7 @@ func (c *Consumer) publishCompleted(ctx context.Context, task TaskMessage, artif
 
 func (c *Consumer) publishFailed(ctx context.Context, task TaskMessage, errMsg string) error {
 	return redisstream.PublishNodeFailed(ctx, c.Redis, redisstream.NodeEvent{
+		EventStream:     task.EventStream,
 		JobID:           task.JobID,
 		NodeExecutionID: task.NodeExecutionID,
 		Error:           errMsg,
@@ -294,6 +281,8 @@ func decodeTask(values map[string]any) (TaskMessage, error) {
 		NodeExecutionID:    get("node_execution_id"),
 		NodeID:             get("node_id"),
 		NodeType:           get("node_type"),
+		EventStream:        get("event_stream"),
+		OrchestratorOwner:  get("orchestrator_owner"),
 		AffinityEnqueuedAt: get("affinity_enqueued_at"),
 		AffinityBounces:    get("affinity_bounces"),
 	}
@@ -340,6 +329,8 @@ func encodeTask(task TaskMessage) (map[string]any, error) {
 		"node_execution_id":    task.NodeExecutionID,
 		"node_id":              task.NodeID,
 		"node_type":            task.NodeType,
+		"event_stream":         task.EventStream,
+		"orchestrator_owner":   task.OrchestratorOwner,
 		"config":               string(config),
 		"input_artifacts":      string(inputArtifacts),
 		"preferred_hosts":      string(preferredHosts),

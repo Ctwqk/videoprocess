@@ -139,6 +139,63 @@ func TestConsumerSuccessAcksAndEmitsCompleted(t *testing.T) {
 	}
 }
 
+func TestConsumerSuccessPublishesToTaskEventStream(t *testing.T) {
+	client, _ := newRedis(t)
+	cfg := Config{WorkerType: "ffmpeg_go", WorkerID: "test-go-event-stream"}
+	handler := &fakeHandler{node: "trim"}
+	consumer := NewConsumer(client, cfg, handler)
+	consumer.BlockTimeout = 50 * time.Millisecond
+	goEventStream := "vp:events:go"
+
+	withGroup(t, consumer)
+	stream := redisstream.TaskStream(cfg.WorkerType)
+	configJSON, _ := json.Marshal(map[string]any{"start_time": "0", "duration": "1"})
+	if _, err := client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: stream,
+		Values: map[string]any{
+			"job_id":             "job-1",
+			"node_execution_id":  "ne-1",
+			"node_id":            "trim_1",
+			"node_type":          "trim",
+			"config":             string(configJSON),
+			"input_artifacts":    "{}",
+			"preferred_hosts":    "[]",
+			"event_stream":       goEventStream,
+			"orchestrator_owner": "go",
+		},
+	}).Result(); err != nil {
+		t.Fatalf("xadd: %v", err)
+	}
+	runOneTick(t, consumer)
+
+	if len(handler.seen) != 1 {
+		t.Fatalf("handler invocations = %d; want 1", len(handler.seen))
+	}
+	if handler.seen[0].EventStream != goEventStream {
+		t.Fatalf("task event stream = %q", handler.seen[0].EventStream)
+	}
+	if handler.seen[0].OrchestratorOwner != "go" {
+		t.Fatalf("task orchestrator owner = %q", handler.seen[0].OrchestratorOwner)
+	}
+	goEvents, err := client.XRange(context.Background(), goEventStream, "-", "+").Result()
+	if err != nil {
+		t.Fatalf("xrange go stream: %v", err)
+	}
+	if len(goEvents) != 1 {
+		t.Fatalf("go stream events = %d; want 1", len(goEvents))
+	}
+	if goEvents[0].Values["event"] != "node_completed" {
+		t.Fatalf("event = %q", goEvents[0].Values["event"])
+	}
+	defaultEvents, err := client.XRange(context.Background(), redisstream.EventStream, "-", "+").Result()
+	if err != nil {
+		t.Fatalf("xrange default stream: %v", err)
+	}
+	if len(defaultEvents) != 0 {
+		t.Fatalf("default stream events = %d; want 0", len(defaultEvents))
+	}
+}
+
 func TestConsumerHandlerFailurePublishesFailed(t *testing.T) {
 	client, _ := newRedis(t)
 	cfg := Config{WorkerType: "ffmpeg_go", WorkerID: "test-2"}
