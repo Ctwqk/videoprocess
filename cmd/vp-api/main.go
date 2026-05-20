@@ -13,6 +13,7 @@ import (
 
 	"github.com/Ctwqk/videoprocess/internal/config"
 	"github.com/Ctwqk/videoprocess/internal/httpapi"
+	"github.com/Ctwqk/videoprocess/internal/orchestrator"
 	"github.com/Ctwqk/videoprocess/internal/storage"
 	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/redis/go-redis/v9"
@@ -53,10 +54,13 @@ func main() {
 	} else {
 		defer st.Close()
 		pgProbe = st.Ping
+		goJobService := buildGoOrchestrator(rootCtx, cfg, st)
 		server = httpapi.NewServerWithOptions(st, httpapi.ServerOptions{
 			AllowStubStore: cfg.APIGoAllowStubStore,
 			Storage:        storageBackend,
 			StorageBackend: cfg.StorageBackend,
+			GoJobsEnabled:  cfg.GoOrchestratorEnabled && cfg.GoOrchestratorJobWrites && goJobService != nil,
+			GoJobs:         goJobService,
 			Readiness: httpapi.ReadinessDeps{
 				Postgres: pgProbe,
 				Redis:    redisProbe,
@@ -85,6 +89,58 @@ func main() {
 		slog.Error("vp-api-go stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func buildGoOrchestrator(rootCtx context.Context, cfg config.Config, st *store.Store) *orchestrator.JobService {
+	if !cfg.GoOrchestratorEnabled {
+		return nil
+	}
+	opts, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		slog.Error("vp-api-go: Go orchestrator redis unavailable", "error", err)
+		return nil
+	}
+	client := redis.NewClient(opts)
+	go func() {
+		<-rootCtx.Done()
+		_ = client.Close()
+	}()
+
+	adapter := orchestrator.NewStoreAdapter(st)
+	engine := &orchestrator.Engine{
+		Store:       adapter,
+		Dispatcher:  orchestrator.RedisDispatcher{Client: client},
+		EventStream: cfg.GoEventStream,
+	}
+	listener := &orchestrator.EventListener{
+		Client: client,
+		Engine: engine,
+		Stream: cfg.GoEventStream,
+	}
+	recovery := &orchestrator.RecoveryRunner{
+		Store:        adapter,
+		Engine:       engine,
+		Interval:     time.Duration(cfg.GoOrchestratorRecoveryIntervalSeconds) * time.Second,
+		StaleNodeAge: time.Duration(cfg.GoOrchestratorStaleNodeSeconds) * time.Second,
+	}
+	go func() {
+		logBackground("Go event listener", listener.Run(rootCtx))
+	}()
+	go func() {
+		logBackground("Go recovery runner", recovery.Run(rootCtx))
+	}()
+	return &orchestrator.JobService{
+		Store:        st,
+		Starter:      engine,
+		StartContext: rootCtx,
+	}
+}
+
+func logBackground(name string, err error) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	slog.Error("vp-api-go: background task stopped", "task", name, "error", err)
 }
 
 func redisReadinessProbe(redisURL string) httpapi.ReadinessProbe {

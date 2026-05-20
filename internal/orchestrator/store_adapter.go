@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/contracts"
 	"github.com/Ctwqk/videoprocess/internal/store"
@@ -63,6 +64,26 @@ func (a *StoreAdapter) SkipGoDownstreamNodes(ctx context.Context, jobID string, 
 
 func (a *StoreAdapter) FinalizeGoJob(ctx context.Context, jobID string, status string, errorMessage *string, finalArtifactNodeIDs []string) error {
 	return a.Store.FinalizeGoJob(ctx, jobID, status, errorMessage, finalArtifactNodeIDs)
+}
+
+func (a *StoreAdapter) ListRecoverableGoJobs(ctx context.Context) ([]JobView, error) {
+	rows, err := a.Store.ListRecoverableGoJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	jobs := make([]JobView, 0, len(rows))
+	for _, row := range rows {
+		job, err := JobViewFromStoreRow(row)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
+}
+
+func (a *StoreAdapter) ResetStaleGoNodes(ctx context.Context, jobID string, staleBefore time.Time) error {
+	return a.Store.ResetStaleGoNodes(ctx, jobID, staleBefore)
 }
 
 func JobViewFromStoreRow(row store.JobDetailRow) (JobView, error) {

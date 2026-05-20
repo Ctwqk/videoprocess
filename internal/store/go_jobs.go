@@ -25,15 +25,53 @@ type GoNodeExecutionInput struct {
 }
 
 func (s *Store) CreateGoJob(ctx context.Context, in GoJobCreateInput) (JobDetailRow, error) {
-	tx, err := s.Pool.Begin(ctx)
+	rows, err := s.CreateGoJobs(ctx, []GoJobCreateInput{in})
 	if err != nil {
 		return JobDetailRow{}, err
 	}
+	if len(rows) != 1 {
+		return JobDetailRow{}, fmt.Errorf("created %d Go jobs, want 1", len(rows))
+	}
+	return rows[0], nil
+}
+
+func (s *Store) CreateGoJobs(ctx context.Context, inputs []GoJobCreateInput) ([]JobDetailRow, error) {
+	if len(inputs) == 0 {
+		return []JobDetailRow{}, nil
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer tx.Rollback(ctx)
 
+	jobIDs := make([]string, 0, len(inputs))
+	for _, in := range inputs {
+		jobID, err := createGoJobInTx(ctx, tx, in)
+		if err != nil {
+			return nil, err
+		}
+		jobIDs = append(jobIDs, jobID)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	rows := make([]JobDetailRow, 0, len(jobIDs))
+	for _, jobID := range jobIDs {
+		row, err := s.GetJobDetail(ctx, jobID)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+func createGoJobInTx(ctx context.Context, tx pgx.Tx, in GoJobCreateInput) (string, error) {
 	snapshot, err := json.Marshal(in.PipelineSnapshot)
 	if err != nil {
-		return JobDetailRow{}, err
+		return "", err
 	}
 
 	var jobID [16]byte
@@ -43,7 +81,7 @@ func (s *Store) CreateGoJob(ctx context.Context, in GoJobCreateInput) (JobDetail
         RETURNING id
     `, in.PipelineID, string(snapshot), goSubmittedBy(in.SubmittedBy)).Scan(&jobID)
 	if err != nil {
-		return JobDetailRow{}, err
+		return "", err
 	}
 	jobIDStr := uuidString(jobID)
 
@@ -52,14 +90,10 @@ func (s *Store) CreateGoJob(ctx context.Context, in GoJobCreateInput) (JobDetail
             INSERT INTO node_executions (job_id, node_id, node_type, node_label, node_config, status)
             VALUES ($1, $2, $3, $4, $5, 'PENDING')
         `, jobIDStr, node.ID, node.Type, goNodeLabel(node), goNodeConfig(node)); err != nil {
-			return JobDetailRow{}, err
+			return "", err
 		}
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return JobDetailRow{}, err
-	}
-	return s.GetJobDetail(ctx, jobIDStr)
+	return jobIDStr, nil
 }
 
 func (s *Store) LoadGoJobForUpdate(ctx context.Context, jobID string) (JobDetailRow, error) {

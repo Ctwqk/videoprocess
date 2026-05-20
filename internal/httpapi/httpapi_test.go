@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -235,7 +236,7 @@ func TestPipelineCreateRejectsMalformedJSON(t *testing.T) {
 	}
 }
 
-func TestJobCreationIsExplicitlyPythonOwned(t *testing.T) {
+func TestCreateJobRejectedWhenGoWritesDisabled(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs", strings.NewReader(`{"pipeline_id":"00000000-0000-0000-0000-000000000000"}`))
 	rec := httptest.NewRecorder()
 
@@ -244,8 +245,123 @@ func TestJobCreationIsExplicitlyPythonOwned(t *testing.T) {
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "Python") {
-		t.Fatalf("body = %s", rec.Body.String())
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["detail"] != "Go orchestrator job writes are disabled" {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestCreateJobRejectsNonEligiblePipelineWithoutCreatingJob(t *testing.T) {
+	fake := &fakeGoJobService{
+		createErr: fakeUnsupportedGoJobError{reason: `node type "smart_trim" remains Python-owned`},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs", strings.NewReader(`{"pipeline_id":"pipe-1","inputs":{}}`))
+	rec := httptest.NewRecorder()
+
+	NewServerWithOptions(nil, ServerOptions{
+		GoJobsEnabled: true,
+		GoJobs:        fake,
+	}).Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	want := `job orchestration for this pipeline remains Python-owned: node type "smart_trim" remains Python-owned`
+	if payload["detail"] != want {
+		t.Fatalf("detail = %q; want %q", payload["detail"], want)
+	}
+	if fake.createCalls != 1 {
+		t.Fatalf("create calls = %d; want 1", fake.createCalls)
+	}
+}
+
+func TestCreateJobDelegatesEligiblePipelineToGoJobService(t *testing.T) {
+	fake := &fakeGoJobService{
+		createRow: store.JobDetailRow{
+			JobRow: store.JobRow{
+				ID:                "job-1",
+				PipelineID:        "pipe-1",
+				Status:            "PENDING",
+				SubmittedBy:       "system",
+				OrchestratorOwner: "go",
+			},
+			NodeExecutions: []store.NodeExecutionRow{},
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs", strings.NewReader(`{"pipeline_id":"pipe-1","inputs":{"asset_id":"asset-1"}}`))
+	rec := httptest.NewRecorder()
+
+	NewServerWithOptions(nil, ServerOptions{
+		GoJobsEnabled: true,
+		GoJobs:        fake,
+	}).Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if fake.createCalls != 1 || fake.lastPipelineID != "pipe-1" || fake.lastInputs["asset_id"] != "asset-1" {
+		t.Fatalf("fake service state = %#v", fake)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["orchestrator_owner"] != "go" {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestCreateJobBatchIsAllOrNothing(t *testing.T) {
+	fake := &fakeGoJobService{
+		batchErr: fakeUnsupportedGoJobError{reason: `node type "smart_trim" remains Python-owned`},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/batch", strings.NewReader(`{"pipeline_id":"pipe-1","inputs":[{"asset_id":"a1"},{"asset_id":"a2"}]}`))
+	rec := httptest.NewRecorder()
+
+	NewServerWithOptions(nil, ServerOptions{
+		GoJobsEnabled: true,
+		GoJobs:        fake,
+	}).Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if fake.createCalls != 0 {
+		t.Fatalf("route called per-item CreateJob %d times; want 0", fake.createCalls)
+	}
+	if fake.batchCalls != 1 || len(fake.lastBatchInputs) != 2 {
+		t.Fatalf("batch state = %#v", fake)
+	}
+}
+
+func TestRerunRejectsPythonOwnedJob(t *testing.T) {
+	fake := &fakeGoJobService{
+		rerunErr: fakeUnsupportedGoJobError{reason: "job is Python-owned"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/job-1/rerun", nil)
+	rec := httptest.NewRecorder()
+
+	NewServerWithOptions(nil, ServerOptions{
+		GoJobsEnabled: true,
+		GoJobs:        fake,
+	}).Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["detail"] != "job orchestration for this pipeline remains Python-owned: job is Python-owned" {
+		t.Fatalf("payload = %#v", payload)
 	}
 }
 
@@ -409,4 +525,52 @@ func TestRecoveryMiddlewareReturnsFastAPIStyleError(t *testing.T) {
 	if payload["detail"] != "internal server error" {
 		t.Fatalf("payload = %#v", payload)
 	}
+}
+
+type fakeGoJobService struct {
+	createCalls     int
+	batchCalls      int
+	rerunCalls      int
+	lastPipelineID  string
+	lastInputs      map[string]any
+	lastBatchInputs []map[string]any
+	lastRerunJobID  string
+	createRow       store.JobDetailRow
+	createErr       error
+	batchRows       []store.JobDetailRow
+	batchErr        error
+	rerunRow        store.JobDetailRow
+	rerunErr        error
+}
+
+func (f *fakeGoJobService) CreateJob(_ context.Context, pipelineID string, inputs map[string]any) (store.JobDetailRow, error) {
+	f.createCalls++
+	f.lastPipelineID = pipelineID
+	f.lastInputs = inputs
+	return f.createRow, f.createErr
+}
+
+func (f *fakeGoJobService) CreateJobBatch(_ context.Context, pipelineID string, inputs []map[string]any) ([]store.JobDetailRow, error) {
+	f.batchCalls++
+	f.lastPipelineID = pipelineID
+	f.lastBatchInputs = inputs
+	return f.batchRows, f.batchErr
+}
+
+func (f *fakeGoJobService) RerunJob(_ context.Context, jobID string) (store.JobDetailRow, error) {
+	f.rerunCalls++
+	f.lastRerunJobID = jobID
+	return f.rerunRow, f.rerunErr
+}
+
+type fakeUnsupportedGoJobError struct {
+	reason string
+}
+
+func (e fakeUnsupportedGoJobError) Error() string {
+	return "job orchestration for this pipeline remains Python-owned: " + e.UnsupportedReason()
+}
+
+func (e fakeUnsupportedGoJobError) UnsupportedReason() string {
+	return e.reason
 }

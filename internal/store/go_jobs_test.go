@@ -88,6 +88,7 @@ func TestFinalArtifactNodeListSkipsEmptyAndDeduplicates(t *testing.T) {
 func TestGoJobStoreMethodSignatures(t *testing.T) {
 	var s *Store
 	var _ func(context.Context, GoJobCreateInput) (JobDetailRow, error) = s.CreateGoJob
+	var _ func(context.Context, []GoJobCreateInput) ([]JobDetailRow, error) = s.CreateGoJobs
 	var _ func(context.Context, string) (JobDetailRow, error) = s.LoadGoJobForUpdate
 	var _ func(context.Context, string, map[string]any) error = s.MarkGoJobPlanning
 	var _ func(context.Context, string) error = s.MarkGoJobRunning

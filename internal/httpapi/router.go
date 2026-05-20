@@ -17,6 +17,8 @@ type Server struct {
 	storageBackend string
 	readiness      ReadinessDeps
 	allowStubStore bool
+	goJobsEnabled  bool
+	goJobs         GoJobService
 }
 
 type ServerOptions struct {
@@ -24,6 +26,8 @@ type ServerOptions struct {
 	AllowStubStore bool
 	Storage        storage.Backend
 	StorageBackend string
+	GoJobsEnabled  bool
+	GoJobs         GoJobService
 }
 
 // NewServer constructs a Server without a backing store. Useful for tests
@@ -44,6 +48,8 @@ func NewServerWithOptions(s *store.Store, opts ServerOptions) *Server {
 		storageBackend: opts.StorageBackend,
 		readiness:      opts.Readiness,
 		allowStubStore: opts.AllowStubStore,
+		goJobsEnabled:  opts.GoJobsEnabled,
+		goJobs:         opts.GoJobs,
 	}
 }
 
