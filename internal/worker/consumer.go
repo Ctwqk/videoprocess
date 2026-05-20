@@ -188,10 +188,13 @@ func (c *Consumer) waitForActive(ctx context.Context, wg *sync.WaitGroup) error 
 }
 
 func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
+	started := time.Now()
 	task, err := decodeTask(msg.Values)
 	if err != nil {
 		c.log.Error("invalid task payload", "msg_id", msg.ID, "error", err)
 		_ = c.publishFailed(ctx, task, fmt.Sprintf("invalid task payload: %v", err))
+		workerTaskFailuresTotal.WithLabelValues(c.WorkerType, "unknown").Inc()
+		observeTask(c.WorkerType, task, "failed", started)
 		c.ack(ctx, msg.ID)
 		return
 	}
@@ -207,6 +210,8 @@ func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
 	if !ok {
 		c.log.Error("no handler", "msg_id", msg.ID, "node_type", task.NodeType)
 		_ = c.publishFailed(ctx, task, fmt.Sprintf("no handler for node_type %q", task.NodeType))
+		workerTaskFailuresTotal.WithLabelValues(c.WorkerType, task.NodeType).Inc()
+		observeTask(c.WorkerType, task, "failed", started)
 		c.ack(ctx, msg.ID)
 		return
 	}
@@ -223,6 +228,8 @@ func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
 				c.log.Error("publish failed event failed; leaving message pending", "msg_id", msg.ID, "error", pubErr)
 				return
 			}
+			workerTaskFailuresTotal.WithLabelValues(c.WorkerType, task.NodeType).Inc()
+			observeTask(c.WorkerType, task, "failed", started)
 			c.ack(ctx, msg.ID)
 			return
 		}
@@ -230,9 +237,12 @@ func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
 			c.log.Error("publish completed event failed; leaving message pending", "msg_id", msg.ID, "error", pubErr)
 			return
 		}
+		observeTask(c.WorkerType, task, "succeeded", started)
 		c.ack(ctx, msg.ID)
 	case errors.Is(err, ErrConfirmedCancellation):
 		c.log.Info("task cancelled by recorded job/node state, acking without event", "msg_id", msg.ID, "node_id", task.NodeID)
+		workerTaskCancellationsTotal.WithLabelValues(c.WorkerType, task.NodeType).Inc()
+		observeTask(c.WorkerType, task, "cancelled", started)
 		c.ack(ctx, msg.ID)
 	case errors.Is(err, context.Canceled):
 		c.log.Info("worker context cancelled, leaving message pending", "msg_id", msg.ID, "node_id", task.NodeID)
@@ -242,6 +252,8 @@ func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
 			c.log.Error("publish failed event failed; leaving message pending", "msg_id", msg.ID, "error", pubErr)
 			return
 		}
+		workerTaskFailuresTotal.WithLabelValues(c.WorkerType, task.NodeType).Inc()
+		observeTask(c.WorkerType, task, "failed", started)
 		c.ack(ctx, msg.ID)
 	}
 }

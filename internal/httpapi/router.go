@@ -42,10 +42,13 @@ func NewServerWithOptions(s *store.Store, opts ServerOptions) *Server {
 
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(requestID)
+	r.Use(metricsMiddleware)
 	r.Use(recoverPanic)
 	r.Use(logRequests)
 	r.Get("/health", s.health)
 	r.Get("/readyz", s.readyz)
+	r.Handle("/metrics", metricsHandler())
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/node-types", s.listNodeTypes)
 		r.Get("/node-types/{typeName}", s.getNodeType)

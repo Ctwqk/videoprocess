@@ -30,6 +30,28 @@ func TestHealth(t *testing.T) {
 	}
 }
 
+func TestMetricsEndpointExposesHTTPMetrics(t *testing.T) {
+	server := NewServer()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+
+	server.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, metric := range []string{
+		"http_requests_total",
+		"http_request_duration_seconds",
+		"http_request_errors_total",
+	} {
+		if !strings.Contains(body, metric) {
+			t.Fatalf("metrics body missing %s: %s", metric, body)
+		}
+	}
+}
+
 func TestNodeTypesIncludesTrim(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/node-types/trim", nil)
 	rec := httptest.NewRecorder()

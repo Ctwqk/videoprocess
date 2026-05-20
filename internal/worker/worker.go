@@ -34,6 +34,7 @@ type Config struct {
 	AffinityMaxBounces  int
 	ShutdownGracePeriod time.Duration
 	CancelPollInterval  time.Duration
+	MetricsAddr         string
 }
 
 // LoadConfig builds a Config from environment, applying defaults that match
@@ -86,6 +87,7 @@ func LoadConfig() Config {
 		AffinityMaxBounces:  intEnv("WORKER_AFFINITY_MAX_BOUNCES", 6),
 		ShutdownGracePeriod: durationSecondsEnv("WORKER_SHUTDOWN_GRACE_SECONDS", 30*time.Second),
 		CancelPollInterval:  durationSecondsEnv("WORKER_CANCEL_POLL_SECONDS", 2*time.Second),
+		MetricsAddr:         strings.TrimSpace(os.Getenv("WORKER_METRICS_ADDR")),
 	}
 }
 

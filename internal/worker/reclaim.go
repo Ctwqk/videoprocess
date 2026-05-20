@@ -25,6 +25,9 @@ func (c *Consumer) ReclaimPending(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	if len(messages) > 0 {
+		workerPendingReclaimsTotal.WithLabelValues(c.WorkerType).Add(float64(len(messages)))
+	}
 	for _, msg := range messages {
 		c.handleMessage(ctx, msg)
 	}

@@ -45,6 +45,7 @@ func NewRunner() Runner {
 // RunResult.GPUCapacity is true when stderr looks like an NVENC/VideoToolbox
 // capacity error, so the caller can fall back to a CPU encoder.
 func (r Runner) Run(ctx context.Context, args []string) (RunResult, error) {
+	ffmpegRunsTotal.Inc()
 	binary := r.Binary
 	if binary == "" {
 		binary = "ffmpeg"
@@ -62,6 +63,7 @@ func (r Runner) Run(ctx context.Context, args []string) (RunResult, error) {
 	if err == nil {
 		return result, nil
 	}
+	ffmpegFailuresTotal.Inc()
 
 	// If the context was cancelled, exec returns either context.Canceled or
 	// a *exec.ExitError after exec.CommandContext sent SIGKILL. Treat both
@@ -74,6 +76,9 @@ func (r Runner) Run(ctx context.Context, args []string) (RunResult, error) {
 	}
 
 	result.GPUCapacity = IsGPUCapacityError(result.Stderr)
+	if result.GPUCapacity {
+		ffmpegGPUFallbacksTotal.Inc()
+	}
 	return result, fmt.Errorf("ffmpeg failed: %w: %s", err, tail(result.Stderr, 2000))
 }
 

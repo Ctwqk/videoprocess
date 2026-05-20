@@ -215,8 +215,11 @@ services:
       DATABASE_URL: ${VP_DATABASE_URL_GO:-postgres://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@host.docker.internal:5435/videoprocess}
       VIDEO_USE_GPU: ${VIDEO_USE_GPU:-false}
       VIDEO_GPU_FALLBACK_TO_CPU: ${VIDEO_GPU_FALLBACK_TO_CPU:-true}
+      WORKER_METRICS_ADDR: ":9091"
     volumes:
       - ${VP_STORAGE_ROOT:-./k8s-data/storage}:/data/storage
+    ports:
+      - "${FFMPEG_WORKER_GO_METRICS_PORT:-19091}:9091"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

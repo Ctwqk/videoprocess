@@ -32,6 +32,7 @@ func (c *Consumer) StartHeartbeat(ctx context.Context, msgID string) <-chan stru
 					Messages: []string{msgID},
 				}).Err(); err != nil && err != redis.Nil {
 					c.log.Warn("worker heartbeat failed", "msg_id", msgID, "error", err)
+					workerHeartbeatFailuresTotal.WithLabelValues(c.WorkerType).Inc()
 				}
 			}
 		}

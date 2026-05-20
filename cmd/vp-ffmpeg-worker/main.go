@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,6 +16,7 @@ import (
 	"github.com/Ctwqk/videoprocess/internal/worker"
 	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
 	handlerspkg "github.com/Ctwqk/videoprocess/internal/worker/handlers"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -36,6 +38,8 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	stopMetrics := startMetricsServer(ctx, cfg.MetricsAddr)
+	defer stopMetrics()
 
 	openCtx, openCancel := context.WithTimeout(ctx, 10*time.Second)
 	st, err := store.Open(openCtx, appCfg.DatabaseURL)
@@ -88,4 +92,34 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("vp-ffmpeg-worker-go: shut down cleanly")
+}
+
+func startMetricsServer(ctx context.Context, addr string) func() {
+	if addr == "" {
+		return func() {}
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		slog.Info("starting vp-ffmpeg-worker-go metrics", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("vp-ffmpeg-worker-go metrics stopped", "error", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+	return func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = server.Shutdown(shutdownCtx)
+	}
 }

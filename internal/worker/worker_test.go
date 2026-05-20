@@ -27,6 +27,7 @@ func TestLoadConfigProductionRuntimeDefaults(t *testing.T) {
 	t.Setenv("WORKER_AFFINITY_MAX_BOUNCES", "")
 	t.Setenv("WORKER_SHUTDOWN_GRACE_SECONDS", "")
 	t.Setenv("WORKER_CANCEL_POLL_SECONDS", "")
+	t.Setenv("WORKER_METRICS_ADDR", "")
 
 	cfg := LoadConfig()
 
@@ -45,6 +46,9 @@ func TestLoadConfigProductionRuntimeDefaults(t *testing.T) {
 	if cfg.AffinityMaxBounces != 6 {
 		t.Fatalf("AffinityMaxBounces = %d", cfg.AffinityMaxBounces)
 	}
+	if cfg.MetricsAddr != "" {
+		t.Fatalf("MetricsAddr = %q", cfg.MetricsAddr)
+	}
 }
 
 func TestLoadConfigProductionRuntimeOverrides(t *testing.T) {
@@ -56,6 +60,7 @@ func TestLoadConfigProductionRuntimeOverrides(t *testing.T) {
 	t.Setenv("WORKER_AFFINITY_MAX_BOUNCES", "2")
 	t.Setenv("WORKER_SHUTDOWN_GRACE_SECONDS", "9")
 	t.Setenv("WORKER_CANCEL_POLL_SECONDS", "1")
+	t.Setenv("WORKER_METRICS_ADDR", ":9091")
 
 	cfg := LoadConfig()
 
@@ -67,5 +72,8 @@ func TestLoadConfigProductionRuntimeOverrides(t *testing.T) {
 	}
 	if cfg.ShutdownGracePeriod != 9*time.Second || cfg.CancelPollInterval != time.Second {
 		t.Fatalf("config = %#v", cfg)
+	}
+	if cfg.MetricsAddr != ":9091" {
+		t.Fatalf("MetricsAddr = %q", cfg.MetricsAddr)
 	}
 }
