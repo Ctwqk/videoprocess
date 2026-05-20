@@ -31,12 +31,7 @@ func (h TrimHandler) Args(inputPath, outputPath string, config map[string]any) [
 		args = append(args, "-t", duration)
 	}
 	args = append(args, "-map", "0:v:0", "-map", "0:a?")
-	args = append(args, vpffmpeg.VideoEncodeArgs(vpffmpeg.EncodeConfig{
-		Codec:         "libx264",
-		Preset:        "slow",
-		CRF:           18,
-		MP4Compatible: true,
-	})...)
+	args = append(args, intermediateVideoEncodeArgs("libx264")...)
 	args = append(args, "-c:a", "aac", outputPath)
 	return args
 }
@@ -60,10 +55,3 @@ func (h TrimHandler) Execute(ctx context.Context, inputPaths map[string]string, 
 // _ asserts the runner result return type so a future change to Runner.Run
 // breaks here loudly rather than silently shadowing the new field.
 var _ = vpffmpeg.RunResult{}
-
-func stringValue(value any, fallback string) string {
-	if raw, ok := value.(string); ok {
-		return raw
-	}
-	return fallback
-}
