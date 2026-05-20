@@ -91,6 +91,25 @@ func TestProbeExitErrorReturnsEmptyResult(t *testing.T) {
 	}
 }
 
+func TestCountVideoFramesParsesFrameCount(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "fake-ffprobe.sh")
+	script := "#!/bin/sh\n" +
+		"printf '37\\n'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := Runner{ProbeBinary: scriptPath}.CountVideoFrames(context.Background(), "/input.mp4")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 37 {
+		t.Fatalf("count = %d", count)
+	}
+}
+
 func TestIsGPUCapacityErrorDetectsKnownIndicators(t *testing.T) {
 	cases := map[string]bool{
 		"":                                false,

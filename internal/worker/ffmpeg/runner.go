@@ -164,6 +164,42 @@ func (p ProbeResult) DurationSeconds() float64 {
 	return value
 }
 
+func (r Runner) CountVideoFrames(ctx context.Context, inputPath string) (int, error) {
+	binary := r.probeBinary()
+	cmd := exec.CommandContext(ctx, binary,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-count_frames",
+		"-show_entries", "stream=nb_read_frames",
+		"-of", "default=nokey=1:noprint_wrappers=1",
+		inputPath,
+	)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("%w: %v", ErrCancelled, ctxErr)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return 0, fmt.Errorf("%w: %v", ErrCancelled, err)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("ffprobe count frames failed: %w: %s", err, tail(stderr.String(), 2000))
+	}
+	raw := strings.TrimSpace(stdout.String())
+	count, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, nil
+	}
+	return count, nil
+}
+
 // gpuCapacityIndicators mirrors the keyword list in
 // backend/worker/handlers/base.py `_is_gpu_capacity_error`. Keep in sync when
 // either side changes.

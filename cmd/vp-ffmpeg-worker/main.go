@@ -74,6 +74,9 @@ func main() {
 		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.ConcatHorizontalHandler{Runner: runner}),
 		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.ConcatVerticalHandler{Runner: runner}),
 		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.ConcatManyHandler{Runner: runner}),
+		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.ConcatTimelineHandler{Runner: runner}),
+		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.ConcatVerticalTimelineHandler{Runner: runner}),
+		worker.NewMediaTaskHandler(runtimeEnv, handlerspkg.MontageAssemblerHandler{Runner: runner}),
 	}
 
 	// Handler registration happens here so adding new node types is a

@@ -622,6 +622,114 @@ func TestConcatManyAutoDimensionsAndMetadataSilence(t *testing.T) {
 	}
 }
 
+func TestTimelineTempConcatFileContents(t *testing.T) {
+	got := concatDemuxerFileContent([]string{"/a.mp4", "/b c.mp4"})
+	want := "file '/a.mp4'\nfile '/b c.mp4'\n"
+	if got != want {
+		t.Fatalf("concat file = %q", got)
+	}
+}
+
+func TestMontageDimensions(t *testing.T) {
+	tests := []struct {
+		config map[string]any
+		width  int
+		height int
+	}{
+		{map[string]any{}, 1080, 1920},
+		{map[string]any{"aspect_ratio": "16:9"}, 1920, 1080},
+		{map[string]any{"aspect_ratio": "1:1"}, 1080, 1080},
+		{map[string]any{"width": 720.0, "height": 1280.0}, 720, 1280},
+	}
+	for _, tt := range tests {
+		width, height := montageDimensions(tt.config)
+		if width != tt.width || height != tt.height {
+			t.Fatalf("dimensions = %dx%d", width, height)
+		}
+	}
+}
+
+func TestConcatTimelineTransitionArgs(t *testing.T) {
+	got := ConcatTimelineTransitionArgs(
+		"/first.mp4",
+		"/second.mp4",
+		"/out.mp4",
+		map[string]any{"transition": "fade", "transition_duration": 0.5},
+		probeSummary{Duration: 5, HasAudio: true},
+		probeSummary{HasAudio: true},
+	)
+	want := []string{
+		"-i", "/first.mp4",
+		"-i", "/second.mp4",
+		"-filter_complex", "[0:v][1:v]xfade=transition=fade:duration=0.5:offset=4.5[v];[0:a][1:a]acrossfade=d=0.5[a]",
+		"-map", "[v]",
+		"-c:v", "libx264",
+		"-crf", "18",
+		"-preset", "slow",
+		"-pix_fmt", "yuv420p",
+		"-movflags", "+faststart",
+		"-color_primaries", "bt709",
+		"-color_trc", "bt709",
+		"-colorspace", "bt709",
+		"-map", "[a]",
+		"-c:a", "aac",
+		"/out.mp4",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v", got)
+	}
+}
+
+func TestVerticalTimelineSegmentArgsSynthesizesAudio(t *testing.T) {
+	got := VerticalTimelineSegmentArgs("/active.mp4", "/still.png", "/segment.mp4", "bottom", 640, 360, "black", probeSummary{Duration: 3.25, HasAudio: false})
+	want := []string{
+		"-i", "/active.mp4",
+		"-loop", "1",
+		"-t", "3.250",
+		"-i", "/still.png",
+		"-f", "lavfi",
+		"-t", "3.250",
+		"-i", "anullsrc=r=48000:cl=stereo",
+		"-filter_complex", "[1:v]scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=30[top];[0:v]scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=30[bottom];[top][bottom]vstack=inputs=2[v]",
+		"-map", "[v]",
+		"-map", "2:a:0",
+		"-c:v", "libx264",
+		"-crf", "18",
+		"-preset", "slow",
+		"-pix_fmt", "yuv420p",
+		"-movflags", "+faststart",
+		"-color_primaries", "bt709",
+		"-color_trc", "bt709",
+		"-colorspace", "bt709",
+		"-c:a", "aac",
+		"-shortest",
+		"/segment.mp4",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v", got)
+	}
+}
+
+func TestDefaultFrameIndex(t *testing.T) {
+	tests := []struct {
+		frameCount    int
+		preferFromEnd bool
+		want          int
+	}{
+		{0, true, 0},
+		{10, true, 0},
+		{20, true, 5},
+		{10, false, 9},
+		{20, false, 14},
+	}
+	for _, tt := range tests {
+		got := defaultFrameIndex(tt.frameCount, tt.preferFromEnd)
+		if got != tt.want {
+			t.Fatalf("frame index for count=%d end=%v = %d", tt.frameCount, tt.preferFromEnd, got)
+		}
+	}
+}
+
 func TestConcatManySelectedInputOrder(t *testing.T) {
 	inputs := map[string]string{
 		"video_10":     "/10.mp4",
