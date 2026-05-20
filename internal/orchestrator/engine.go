@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -24,7 +25,8 @@ type EngineStore interface {
 	CreateSourceArtifact(ctx context.Context, jobID string, nodeExecutionID string, assetID string) (string, error)
 	MarkGoJobPlanning(ctx context.Context, jobID string, executionPlan map[string]any) error
 	MarkGoJobRunning(ctx context.Context, jobID string) error
-	MarkGoNodeQueued(ctx context.Context, nodeExecutionID string, inputArtifactIDs []string) error
+	MarkGoNodeQueued(ctx context.Context, nodeExecutionID string, inputArtifactIDs []string) (bool, error)
+	ReleaseGoNodeQueueClaim(ctx context.Context, nodeExecutionID string) error
 	MarkGoNodeSucceeded(ctx context.Context, jobID string, nodeExecutionID string, outputArtifactID string) error
 	MarkGoNodeFailed(ctx context.Context, jobID string, nodeExecutionID string, errorMessage string) error
 	IncrementGoNodeRetry(ctx context.Context, jobID string, nodeExecutionID string) error
@@ -94,6 +96,9 @@ func (e *Engine) StartJob(ctx context.Context, jobID string) error {
 
 	if err := e.resolveSourceNodes(ctx, &job); err != nil {
 		return err
+	}
+	if isTerminalJobStatus(job.Status) {
+		return nil
 	}
 	if err := e.dispatchReadyNodes(ctx, &job, depMap); err != nil {
 		return err
@@ -199,16 +204,49 @@ func (e *Engine) resolveSourceNodes(ctx context.Context, job *JobView) error {
 		}
 		assetID, ok := stringValue(node.NodeConfig["asset_id"])
 		if !ok || assetID == "" {
+			if err := e.failSourceNode(ctx, job, node, "source node missing asset_id"); err != nil {
+				return err
+			}
 			continue
 		}
 		artifactID, err := e.Store.CreateSourceArtifact(ctx, job.ID, node.ID, assetID)
 		if err != nil {
-			return err
+			if err := e.failSourceNode(ctx, job, node, err.Error()); err != nil {
+				return err
+			}
+			continue
 		}
 		node.Status = string(contracts.NodeStatusSucceeded)
 		node.OutputArtifactID = artifactID
 	}
 	return nil
+}
+
+func (e *Engine) failSourceNode(ctx context.Context, job *JobView, node *NodeExecutionView, errorMessage string) error {
+	if err := e.Store.MarkGoNodeFailed(ctx, job.ID, node.ID, errorMessage); err != nil {
+		return err
+	}
+	depMap := dependenciesForJob(*job)
+	if err := e.Store.SkipGoDownstreamNodes(ctx, job.ID, downstreamNodeIDs(node.NodeID, depMap)); err != nil {
+		return err
+	}
+	reloaded, err := e.Store.GetJobDetail(ctx, job.ID)
+	if err != nil {
+		return err
+	}
+	*job = reloaded
+	finalized, err := e.maybeFinalizeJob(ctx, reloaded)
+	if err != nil {
+		return err
+	}
+	if finalized {
+		finalizedJob, err := e.Store.GetJobDetail(ctx, job.ID)
+		if err != nil {
+			return err
+		}
+		*job = finalizedJob
+	}
+	return err
 }
 
 func (e *Engine) dispatchReadyNodes(ctx context.Context, job *JobView, depMap map[string][]string) error {
@@ -250,13 +288,17 @@ func (e *Engine) dispatchNode(ctx context.Context, job *JobView, node *NodeExecu
 		return err
 	}
 
-	if err := e.Store.MarkGoNodeQueued(ctx, node.ID, inputArtifactIDs); err != nil {
+	claimed, err := e.Store.MarkGoNodeQueued(ctx, node.ID, inputArtifactIDs)
+	if err != nil {
 		return err
+	}
+	if !claimed {
+		return nil
 	}
 	node.Status = string(contracts.NodeStatusQueued)
 	node.InputArtifactIDs = append([]string(nil), inputArtifactIDs...)
 
-	return e.Dispatcher.Dispatch(ctx, goWorkerType, TaskPayload{
+	payload := TaskPayload{
 		JobID:              job.ID,
 		NodeExecutionID:    node.ID,
 		NodeID:             node.NodeID,
@@ -268,10 +310,22 @@ func (e *Engine) dispatchNode(ctx context.Context, job *JobView, node *NodeExecu
 		AffinityBounces:    "0",
 		EventStream:        e.eventStream(),
 		OrchestratorOwner:  goOrchestratorOwner,
-	})
+	}
+	if err := e.Dispatcher.Dispatch(ctx, goWorkerType, payload); err != nil {
+		if releaseErr := e.Store.ReleaseGoNodeQueueClaim(ctx, node.ID); releaseErr != nil {
+			return errors.Join(err, fmt.Errorf("release queue claim for node execution %s: %w", node.ID, releaseErr))
+		}
+		node.Status = string(contracts.NodeStatusPending)
+		node.InputArtifactIDs = nil
+		return err
+	}
+	return nil
 }
 
 func (e *Engine) maybeFinalizeJob(ctx context.Context, job JobView) (bool, error) {
+	if isTerminalJobStatus(job.Status) {
+		return true, nil
+	}
 	if hasActiveNode(job.Nodes) {
 		return false, nil
 	}

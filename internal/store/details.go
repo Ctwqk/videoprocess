@@ -19,21 +19,23 @@ type ArtifactDetailRow struct {
 }
 
 type NodeExecutionRow struct {
-	ID                      string     `json:"id"`
-	NodeID                  string     `json:"node_id"`
-	NodeType                string     `json:"node_type"`
-	NodeLabel               string     `json:"node_label"`
-	Status                  string     `json:"status"`
-	Progress                int        `json:"progress"`
-	WorkerID                *string    `json:"worker_id"`
-	QueuedAt                *time.Time `json:"queued_at"`
-	StartedAt               *time.Time `json:"started_at"`
-	CompletedAt             *time.Time `json:"completed_at"`
-	ErrorMessage            *string    `json:"error_message"`
-	InputArtifactIDs        []string   `json:"input_artifact_ids"`
-	OutputArtifactID        *string    `json:"output_artifact_id"`
-	OutputArtifactFilename  *string    `json:"output_artifact_filename"`
-	OutputArtifactMediaInfo any        `json:"output_artifact_media_info"`
+	ID                      string         `json:"id"`
+	NodeID                  string         `json:"node_id"`
+	NodeType                string         `json:"node_type"`
+	NodeLabel               string         `json:"node_label"`
+	Status                  string         `json:"status"`
+	Progress                int            `json:"progress"`
+	NodeConfig              map[string]any `json:"-"`
+	RetryCount              int            `json:"-"`
+	WorkerID                *string        `json:"worker_id"`
+	QueuedAt                *time.Time     `json:"queued_at"`
+	StartedAt               *time.Time     `json:"started_at"`
+	CompletedAt             *time.Time     `json:"completed_at"`
+	ErrorMessage            *string        `json:"error_message"`
+	InputArtifactIDs        []string       `json:"input_artifact_ids"`
+	OutputArtifactID        *string        `json:"output_artifact_id"`
+	OutputArtifactFilename  *string        `json:"output_artifact_filename"`
+	OutputArtifactMediaInfo any            `json:"output_artifact_media_info"`
 }
 
 type JobDetailRow struct {
@@ -126,7 +128,7 @@ func (s *Store) GetJobDetail(ctx context.Context, id string) (JobDetailRow, erro
 func (s *Store) listNodeExecutions(ctx context.Context, jobID string) ([]NodeExecutionRow, error) {
 	rows, err := s.Pool.Query(ctx, `
 		SELECT ne.id, ne.node_id, ne.node_type, ne.node_label, ne.status::text, ne.progress,
-		       ne.worker_id, ne.queued_at, ne.started_at, ne.completed_at, ne.error_message,
+		       ne.node_config, ne.retry_count, ne.worker_id, ne.queued_at, ne.started_at, ne.completed_at, ne.error_message,
 		       ne.input_artifact_ids, ne.output_artifact_id, a.filename, a.media_info
 		FROM node_executions ne
 		LEFT JOIN artifacts a ON a.id = ne.output_artifact_id
@@ -145,7 +147,7 @@ func (s *Store) listNodeExecutions(ctx context.Context, jobID string) ([]NodeExe
 		var inputUUIDs []pgtype.UUID
 		var outputUUID pgtype.UUID
 		if err := rows.Scan(&uuid, &row.NodeID, &row.NodeType, &row.NodeLabel, &row.Status,
-			&row.Progress, &row.WorkerID, &row.QueuedAt, &row.StartedAt, &row.CompletedAt,
+			&row.Progress, &row.NodeConfig, &row.RetryCount, &row.WorkerID, &row.QueuedAt, &row.StartedAt, &row.CompletedAt,
 			&row.ErrorMessage, &inputUUIDs, &outputUUID, &row.OutputArtifactFilename,
 			&row.OutputArtifactMediaInfo); err != nil {
 			return nil, err

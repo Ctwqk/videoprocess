@@ -95,10 +95,10 @@ func (s *Store) MarkGoJobRunning(ctx context.Context, jobID string) error {
 	return guardedExecResult(tag.RowsAffected(), err)
 }
 
-func (s *Store) MarkGoNodeQueued(ctx context.Context, nodeExecutionID string, inputArtifactIDs []string) error {
+func (s *Store) MarkGoNodeQueued(ctx context.Context, nodeExecutionID string, inputArtifactIDs []string) (bool, error) {
 	inputUUIDs, err := uuidArray(inputArtifactIDs)
 	if err != nil {
-		return err
+		return false, err
 	}
 	tag, err := s.Pool.Exec(ctx, `
         UPDATE node_executions
@@ -108,13 +108,46 @@ func (s *Store) MarkGoNodeQueued(ctx context.Context, nodeExecutionID string, in
             error_message = NULL,
             error_trace = NULL
         WHERE id = $1
+          AND status = 'PENDING'
           AND EXISTS (
               SELECT 1 FROM jobs j
               WHERE j.id = node_executions.job_id
                 AND j.orchestrator_owner = 'go'
           )
     `, nodeExecutionID, inputUUIDs)
-	return guardedExecResult(tag.RowsAffected(), err)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() > 0 {
+		return true, nil
+	}
+	if err := s.ensureGoNodeExists(ctx, nodeExecutionID); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (s *Store) ReleaseGoNodeQueueClaim(ctx context.Context, nodeExecutionID string) error {
+	tag, err := s.Pool.Exec(ctx, `
+        UPDATE node_executions
+        SET status = 'PENDING',
+            queued_at = NULL,
+            input_artifact_ids = ARRAY[]::uuid[]
+        WHERE id = $1
+          AND status = 'QUEUED'
+          AND EXISTS (
+              SELECT 1 FROM jobs j
+              WHERE j.id = node_executions.job_id
+                AND j.orchestrator_owner = 'go'
+          )
+    `, nodeExecutionID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	return s.ensureGoNodeExists(ctx, nodeExecutionID)
 }
 
 func (s *Store) MarkGoNodeSucceeded(ctx context.Context, jobID string, nodeExecutionID string, outputArtifactID string) error {
@@ -318,14 +351,18 @@ func (s *Store) ResetStaleGoNodes(ctx context.Context, jobID string, staleBefore
 	}
 	_, err := s.Pool.Exec(ctx, `
         UPDATE node_executions
-        SET status = 'QUEUED',
+        SET status = 'PENDING',
+            queued_at = NULL,
             started_at = NULL,
             worker_id = NULL,
+            input_artifact_ids = ARRAY[]::uuid[],
             error_message = NULL,
             error_trace = NULL
         WHERE job_id = $1
-          AND status = 'RUNNING'
-          AND started_at < $2
+          AND (
+              (status = 'RUNNING' AND (started_at IS NULL OR started_at < $2))
+              OR (status = 'QUEUED' AND (queued_at IS NULL OR queued_at < $2))
+          )
           AND EXISTS (
               SELECT 1 FROM jobs j
               WHERE j.id = node_executions.job_id
@@ -475,6 +512,24 @@ func (s *Store) ensureGoJobExists(ctx context.Context, jobID string) error {
             WHERE id = $1 AND orchestrator_owner = 'go'
         )
     `, jobID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) ensureGoNodeExists(ctx context.Context, nodeExecutionID string) error {
+	var exists bool
+	if err := s.Pool.QueryRow(ctx, `
+        SELECT EXISTS (
+            SELECT 1
+            FROM node_executions ne
+            JOIN jobs j ON j.id = ne.job_id
+            WHERE ne.id = $1 AND j.orchestrator_owner = 'go'
+        )
+    `, nodeExecutionID).Scan(&exists); err != nil {
 		return err
 	}
 	if !exists {

@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,7 +91,8 @@ func TestGoJobStoreMethodSignatures(t *testing.T) {
 	var _ func(context.Context, string) (JobDetailRow, error) = s.LoadGoJobForUpdate
 	var _ func(context.Context, string, map[string]any) error = s.MarkGoJobPlanning
 	var _ func(context.Context, string) error = s.MarkGoJobRunning
-	var _ func(context.Context, string, []string) error = s.MarkGoNodeQueued
+	var _ func(context.Context, string, []string) (bool, error) = s.MarkGoNodeQueued
+	var _ func(context.Context, string) error = s.ReleaseGoNodeQueueClaim
 	var _ func(context.Context, string, string, string) error = s.MarkGoNodeSucceeded
 	var _ func(context.Context, string, string, string) error = s.MarkGoNodeFailed
 	var _ func(context.Context, string, string) error = s.IncrementGoNodeRetry
@@ -98,4 +101,22 @@ func TestGoJobStoreMethodSignatures(t *testing.T) {
 	var _ func(context.Context) ([]JobDetailRow, error) = s.ListRecoverableGoJobs
 	var _ func(context.Context, string, time.Time) error = s.ResetStaleGoNodes
 	var _ func(context.Context, string, string, string) (string, error) = s.CreateSourceArtifact
+}
+
+func TestNodeExecutionRowInternalFieldsAreJSONIgnored(t *testing.T) {
+	raw, err := json.Marshal(NodeExecutionRow{
+		ID:         "node-exec",
+		NodeConfig: map[string]any{"preset": "copy"},
+		RetryCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(raw)
+	if strings.Contains(body, "node_config") {
+		t.Fatalf("NodeConfig leaked into JSON: %s", body)
+	}
+	if strings.Contains(body, "retry_count") {
+		t.Fatalf("RetryCount leaked into JSON: %s", body)
+	}
 }

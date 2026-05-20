@@ -3,7 +3,9 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +44,99 @@ func TestStartJobDispatchesReadyNodeWithGoEventStream(t *testing.T) {
 	}
 	if got := store.planningPlan["dependencies"]; !reflect.DeepEqual(got, map[string][]string{"source": []string{}, "trim": []string{"source"}, "encode": []string{"trim"}}) {
 		t.Fatalf("dependencies = %#v", got)
+	}
+}
+
+func TestStartJobSkipsDispatchWhenQueueClaimLost(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim")))
+	store.queueClaim = false
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	if err := engine.StartJob(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := store.node("trim").Status; got != "PENDING" {
+		t.Fatalf("trim status = %q; want PENDING", got)
+	}
+	if len(dispatcher.calls) != 0 {
+		t.Fatalf("dispatch calls = %d; want 0", len(dispatcher.calls))
+	}
+}
+
+func TestDispatchFailureReleasesQueueClaim(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim")))
+	dispatchErr := errors.New("redis down")
+	dispatcher := &fakeDispatcher{err: dispatchErr}
+	engine := testEngine(store, dispatcher)
+
+	err := engine.StartJob(context.Background(), "job-1")
+	if !errors.Is(err, dispatchErr) {
+		t.Fatalf("StartJob error = %v; want redis down", err)
+	}
+
+	if got := store.node("trim").Status; got != "PENDING" {
+		t.Fatalf("trim status = %q; want PENDING", got)
+	}
+	if store.releaseCount != 1 {
+		t.Fatalf("release count = %d; want 1", store.releaseCount)
+	}
+	if len(dispatcher.calls) != 1 {
+		t.Fatalf("dispatch calls = %d; want 1", len(dispatcher.calls))
+	}
+}
+
+func TestStartJobFailsSourceWithoutAssetID(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNodeNoAsset("source-exec"), pendingNode("trim-exec", "trim"), pendingNode("encode-exec", "encode")))
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	if err := engine.StartJob(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := store.node("source").Status; got != "FAILED" {
+		t.Fatalf("source status = %q; want FAILED", got)
+	}
+	if !strings.Contains(store.node("source").ErrorMessage, "asset_id") {
+		t.Fatalf("source error = %q; want asset_id message", store.node("source").ErrorMessage)
+	}
+	if got := store.node("trim").Status; got != "SKIPPED" {
+		t.Fatalf("trim status = %q; want SKIPPED", got)
+	}
+	if store.finalStatus != "FAILED" {
+		t.Fatalf("final status = %q; want FAILED", store.finalStatus)
+	}
+	if len(dispatcher.calls) != 0 {
+		t.Fatalf("dispatch calls = %d; want 0", len(dispatcher.calls))
+	}
+}
+
+func TestStartJobFailsSourceWhenCreateArtifactFails(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim"), pendingNode("encode-exec", "encode")))
+	store.createSourceErr = errors.New("asset lookup failed")
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	if err := engine.StartJob(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := store.node("source").Status; got != "FAILED" {
+		t.Fatalf("source status = %q; want FAILED", got)
+	}
+	if !strings.Contains(store.node("source").ErrorMessage, "asset lookup failed") {
+		t.Fatalf("source error = %q; want create artifact error", store.node("source").ErrorMessage)
+	}
+	if got := store.node("trim").Status; got != "SKIPPED" {
+		t.Fatalf("trim status = %q; want SKIPPED", got)
+	}
+	if store.finalStatus != "FAILED" {
+		t.Fatalf("final status = %q; want FAILED", store.finalStatus)
+	}
+	if len(dispatcher.calls) != 0 {
+		t.Fatalf("dispatch calls = %d; want 0", len(dispatcher.calls))
 	}
 }
 
@@ -258,6 +353,17 @@ func sourceNode(id string, assetID string) NodeExecutionView {
 	}
 }
 
+func sourceNodeNoAsset(id string) NodeExecutionView {
+	return NodeExecutionView{
+		ID:         id,
+		NodeID:     "source",
+		NodeType:   "source",
+		NodeLabel:  "Source",
+		Status:     "PENDING",
+		NodeConfig: map[string]any{},
+	}
+}
+
 func pendingNode(id string, nodeID string) NodeExecutionView {
 	return NodeExecutionView{
 		ID:         id,
@@ -297,24 +403,28 @@ type dispatchCall struct {
 
 type fakeDispatcher struct {
 	calls []dispatchCall
+	err   error
 }
 
 func (d *fakeDispatcher) Dispatch(_ context.Context, workerType string, payload TaskPayload) error {
 	d.calls = append(d.calls, dispatchCall{workerType: workerType, payload: payload})
-	return nil
+	return d.err
 }
 
 type fakeEngineStore struct {
-	job            JobView
-	planningPlan   map[string]any
-	skippedNodeIDs []string
-	finalStatus    string
-	finalError     *string
-	finalNodeIDs   []string
+	job             JobView
+	planningPlan    map[string]any
+	skippedNodeIDs  []string
+	finalStatus     string
+	finalError      *string
+	finalNodeIDs    []string
+	queueClaim      bool
+	releaseCount    int
+	createSourceErr error
 }
 
 func newFakeEngineStore(job JobView) *fakeEngineStore {
-	return &fakeEngineStore{job: cloneJob(job)}
+	return &fakeEngineStore{job: cloneJob(job), queueClaim: true}
 }
 
 func (s *fakeEngineStore) GetJobDetail(_ context.Context, _ string) (JobView, error) {
@@ -322,6 +432,9 @@ func (s *fakeEngineStore) GetJobDetail(_ context.Context, _ string) (JobView, er
 }
 
 func (s *fakeEngineStore) CreateSourceArtifact(_ context.Context, _ string, nodeExecutionID string, _ string) (string, error) {
+	if s.createSourceErr != nil {
+		return "", s.createSourceErr
+	}
 	artifactID := "artifact-" + nodeExecutionID
 	node := s.nodeByExecutionID(nodeExecutionID)
 	node.Status = "SUCCEEDED"
@@ -341,10 +454,26 @@ func (s *fakeEngineStore) MarkGoJobRunning(_ context.Context, _ string) error {
 	return nil
 }
 
-func (s *fakeEngineStore) MarkGoNodeQueued(_ context.Context, nodeExecutionID string, inputArtifactIDs []string) error {
+func (s *fakeEngineStore) MarkGoNodeQueued(_ context.Context, nodeExecutionID string, inputArtifactIDs []string) (bool, error) {
+	if !s.queueClaim {
+		return false, nil
+	}
 	node := s.nodeByExecutionID(nodeExecutionID)
+	if node.Status != "PENDING" {
+		return false, nil
+	}
 	node.Status = "QUEUED"
 	node.InputArtifactIDs = append([]string(nil), inputArtifactIDs...)
+	return true, nil
+}
+
+func (s *fakeEngineStore) ReleaseGoNodeQueueClaim(_ context.Context, nodeExecutionID string) error {
+	s.releaseCount++
+	node := s.nodeByExecutionID(nodeExecutionID)
+	if node.Status == "QUEUED" {
+		node.Status = "PENDING"
+		node.InputArtifactIDs = nil
+	}
 	return nil
 }
 
