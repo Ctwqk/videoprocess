@@ -111,7 +111,7 @@ func TestListEndpointsShapeMatchesPython(t *testing.T) {
 func TestValidatePipelineReturnsValidationResult(t *testing.T) {
 	body := `{
 		"nodes": [
-			{"id":"source_1","type":"source","position":{},"data":{"label":"Source","asset_id":"00000000-0000-0000-0000-000000000001"}},
+			{"id":"source_1","type":"source","position":{},"data":{"label":"Source","asset_id":"00000000-0000-0000-0000-000000000001","config":{"asset_id":"00000000-0000-0000-0000-000000000001"}}},
 			{"id":"export_1","type":"export","position":{},"data":{"label":"Export"}}
 		],
 		"edges": [
@@ -202,7 +202,7 @@ func TestPipelineCreateRequiresStoreAfterValidation(t *testing.T) {
 		"template_tags": [],
 		"definition": {
 			"nodes": [
-				{"id":"source_1","type":"source","position":{},"data":{"label":"Source","asset_id":"00000000-0000-0000-0000-000000000001","config":{}}},
+				{"id":"source_1","type":"source","position":{},"data":{"label":"Source","asset_id":"00000000-0000-0000-0000-000000000001","config":{"asset_id":"00000000-0000-0000-0000-000000000001"}}},
 				{"id":"export_1","type":"export","position":{},"data":{"label":"Export","config":{}}}
 			],
 			"edges": [

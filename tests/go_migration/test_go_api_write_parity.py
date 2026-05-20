@@ -27,7 +27,7 @@ def first_wave_pipeline(name: str = "go-write-parity") -> dict[str, Any]:
                     "data": {
                         "label": "Source",
                         "asset_id": "00000000-0000-0000-0000-000000000001",
-                        "config": {},
+                        "config": {"asset_id": "00000000-0000-0000-0000-000000000001"},
                     },
                 },
                 {

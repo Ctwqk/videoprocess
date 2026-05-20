@@ -182,6 +182,20 @@ func Validate(def contracts.PipelineDefinition) contracts.ValidationResult {
 				Message: fmt.Sprintf("Source node '%s' is missing an asset binding", label),
 			})
 		}
+		for _, param := range typeDef.Params {
+			value := node.Data.Config[param.Name]
+			if param.Required && requiredParamMissing(value) {
+				id := node.ID
+				paramName := param.Name
+				label := nodeLabel(node)
+				errors = append(errors, contracts.ValidationError{
+					Type:      "invalid_param",
+					NodeID:    &id,
+					ParamName: &paramName,
+					Message:   fmt.Sprintf("Required parameter '%s' on '%s' is missing or empty", param.Name, label),
+				})
+			}
+		}
 	}
 
 	return contracts.ValidationResult{Valid: len(errors) == 0, Errors: errors, Warnings: warnings}
@@ -204,6 +218,16 @@ func sourceHasAsset(node contracts.PipelineNode, connectedInputs map[string]map[
 		}
 	}
 	if inputs, ok := connectedInputs[node.ID]; ok && len(inputs) > 0 {
+		return true
+	}
+	return false
+}
+
+func requiredParamMissing(value any) bool {
+	if value == nil {
+		return true
+	}
+	if str, ok := value.(string); ok && str == "" {
 		return true
 	}
 	return false

@@ -35,7 +35,10 @@ def first_wave_ffmpeg_graph() -> dict[str, Any]:
                 "data": {
                     "label": "Source",
                     "asset_id": "00000000-0000-0000-0000-000000000001",
-                    "config": {"media_type": "video"},
+                    "config": {
+                        "asset_id": "00000000-0000-0000-0000-000000000001",
+                        "media_type": "video",
+                    },
                 },
             },
             {

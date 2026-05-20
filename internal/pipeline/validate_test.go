@@ -62,7 +62,7 @@ func TestValidateFlagsMissingAssetOnSourceNode(t *testing.T) {
 	}
 }
 
-func TestValidateAcceptsSourceWithAssetID(t *testing.T) {
+func TestValidateTopLevelSourceAssetStillRequiresConfigParam(t *testing.T) {
 	def := contracts.PipelineDefinition{
 		Nodes: []contracts.PipelineNode{
 			{
@@ -74,7 +74,10 @@ func TestValidateAcceptsSourceWithAssetID(t *testing.T) {
 	}
 	result := Validate(def)
 	if hasError(result, "missing_asset") {
-		t.Fatalf("source with asset_id should not flag missing_asset: %#v", result.Errors)
+		t.Fatalf("top-level asset_id should not flag missing_asset: %#v", result.Errors)
+	}
+	if !hasError(result, "invalid_param") {
+		t.Fatalf("top-level asset_id should still require config.asset_id param: %#v", result.Errors)
 	}
 }
 
@@ -183,6 +186,7 @@ func firstWaveFFmpegGraph() contracts.PipelineDefinition {
 				Data: contracts.PipelineNodeData{
 					Label:   "Source",
 					AssetID: ptr("00000000-0000-0000-0000-000000000001"),
+					Config:  map[string]any{"asset_id": "00000000-0000-0000-0000-000000000001"},
 				},
 			},
 			{ID: "crop_1", Type: "vertical_crop", Data: contracts.PipelineNodeData{Label: "Vertical Crop"}},
