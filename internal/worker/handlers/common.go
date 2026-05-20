@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-
-	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
 )
 
 func scaleFilter(width string, height string, forceOriginalAspectRatio string) string {
@@ -140,20 +138,60 @@ func escapeDrawText(text string) string {
 	return text
 }
 
+func videoEncodeArgs(codec string, preset string, crf int, bitrate string, mp4Compatible bool) []string {
+	if codec == "" {
+		codec = "libx264"
+	}
+	if preset == "" {
+		preset = "medium"
+	}
+	args := []string{"-c:v", codec}
+	switch codec {
+	case "libx264", "libx265":
+		args = append(args, "-crf", strconv.Itoa(crf), "-preset", preset)
+	case "h264_nvenc", "hevc_nvenc":
+		args = append(args, "-rc:v", "vbr", "-cq:v", strconv.Itoa(crf), "-preset", preset)
+	case "h264_videotoolbox", "hevc_videotoolbox":
+		args = append(args, "-b:v", defaultVideotoolboxBitrate(codec, bitrate))
+	}
+	if bitrate != "" && codec != "h264_videotoolbox" && codec != "hevc_videotoolbox" {
+		args = append(args, "-b:v", bitrate)
+	}
+	if mp4Compatible && isMP4CompatibleCodec(codec) {
+		args = append(args,
+			"-pix_fmt", "yuv420p",
+			"-movflags", "+faststart",
+			"-color_primaries", "bt709",
+			"-color_trc", "bt709",
+			"-colorspace", "bt709",
+		)
+	}
+	return args
+}
+
 func intermediateVideoEncodeArgs(codec string) []string {
-	return vpffmpeg.VideoEncodeArgs(vpffmpeg.EncodeConfig{
-		Codec:         codec,
-		Preset:        "slow",
-		CRF:           18,
-		MP4Compatible: true,
-	})
+	return videoEncodeArgs(codec, "slow", 18, "", true)
 }
 
 func finalVideoEncodeArgs(codec string) []string {
-	return vpffmpeg.VideoEncodeArgs(vpffmpeg.EncodeConfig{
-		Codec:         codec,
-		Preset:        "medium",
-		CRF:           20,
-		MP4Compatible: true,
-	})
+	return videoEncodeArgs(codec, "medium", 20, "", true)
+}
+
+func defaultVideotoolboxBitrate(codec string, bitrate string) string {
+	if bitrate != "" {
+		return bitrate
+	}
+	if codec == "hevc_videotoolbox" {
+		return "4M"
+	}
+	return "6M"
+}
+
+func isMP4CompatibleCodec(codec string) bool {
+	switch codec {
+	case "libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_videotoolbox", "hevc_videotoolbox":
+		return true
+	default:
+		return false
+	}
 }

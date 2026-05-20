@@ -35,10 +35,7 @@ func TranscodeArgs(inputPath string, outputPath string, config map[string]any) [
 			args = append(args, "-b:v", bitrate)
 		}
 	default:
-		args = append(args, finalVideoEncodeArgs(videoCodec)...)
-		if preset != "medium" || crf != 20 || bitrate != "" {
-			args = replaceEncodeDefaults(args, preset, crf, bitrate)
-		}
+		args = append(args, videoEncodeArgs(videoCodec, preset, crf, bitrate, true)...)
 	}
 
 	if videoCodec != "copy" && resolution != "" && resolution != "original" {
@@ -72,22 +69,4 @@ func runFFmpeg(ctx context.Context, runner vpffmpeg.Runner, args []string) error
 	}
 	_, err := runner.Run(ctx, args)
 	return err
-}
-
-func replaceEncodeDefaults(args []string, preset string, crf int, bitrate string) []string {
-	out := append([]string{}, args...)
-	for i := 0; i+1 < len(out); i++ {
-		switch out[i] {
-		case "-crf":
-			out[i+1] = strconv.Itoa(crf)
-			i++
-		case "-preset":
-			out[i+1] = preset
-			i++
-		}
-	}
-	if bitrate != "" {
-		out = append(out, "-b:v", bitrate)
-	}
-	return out
 }
