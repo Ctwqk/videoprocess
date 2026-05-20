@@ -94,8 +94,12 @@ func ConcatTimelineTransitionArgs(firstPath string, secondPath string, outputPat
 		transitionName = "fade"
 	}
 
+	normalizedFirst := "[0:v]" + scaleFilter("1080", "1920", "decrease") + ",pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,settb=AVTB[v0]"
+	normalizedSecond := "[1:v]" + scaleFilter("1080", "1920", "decrease") + ",pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,settb=AVTB[v1]"
 	filterComplex := []string{
-		"[0:v][1:v]xfade=transition=" + transitionName + ":duration=" + formatFloat(transitionDuration) + ":offset=" + formatFloat(offset) + "[v]",
+		normalizedFirst,
+		normalizedSecond,
+		"[v0][v1]xfade=transition=" + transitionName + ":duration=" + formatFloat(transitionDuration) + ":offset=" + formatFloat(offset) + "[v]",
 	}
 	args := []string{"-i", firstPath, "-i", secondPath}
 	if firstProbe.HasAudio && secondProbe.HasAudio {

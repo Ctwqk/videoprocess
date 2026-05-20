@@ -661,7 +661,7 @@ func TestConcatTimelineTransitionArgs(t *testing.T) {
 	want := []string{
 		"-i", "/first.mp4",
 		"-i", "/second.mp4",
-		"-filter_complex", "[0:v][1:v]xfade=transition=fade:duration=0.5:offset=4.5[v];[0:a][1:a]acrossfade=d=0.5[a]",
+		"-filter_complex", "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,settb=AVTB[v0];[1:v]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,settb=AVTB[v1];[v0][v1]xfade=transition=fade:duration=0.5:offset=4.5[v];[0:a][1:a]acrossfade=d=0.5[a]",
 		"-map", "[v]",
 		"-c:v", "libx264",
 		"-crf", "18",
