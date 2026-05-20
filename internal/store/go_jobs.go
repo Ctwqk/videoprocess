@@ -63,12 +63,14 @@ func (s *Store) CreateGoJob(ctx context.Context, in GoJobCreateInput) (JobDetail
 }
 
 func (s *Store) LoadGoJobForUpdate(ctx context.Context, jobID string) (JobDetailRow, error) {
+	// This is an owner-guarded load only. It intentionally does not issue
+	// SELECT FOR UPDATE because Store methods do not expose transaction scope
+	// to callers, so any row lock would be released before the caller can act.
 	var id [16]byte
 	if err := s.Pool.QueryRow(ctx, `
         SELECT id
         FROM jobs
         WHERE id = $1 AND orchestrator_owner = 'go'
-        FOR UPDATE
     `, jobID).Scan(&id); err != nil {
 		return JobDetailRow{}, err
 	}
@@ -175,10 +177,13 @@ func (s *Store) IncrementGoNodeRetry(ctx context.Context, jobID string, nodeExec
 }
 
 func (s *Store) SkipGoDownstreamNodes(ctx context.Context, jobID string, nodeIDs []string) error {
+	if err := s.ensureGoJobExists(ctx, jobID); err != nil {
+		return err
+	}
 	if len(nodeIDs) == 0 {
 		return nil
 	}
-	tag, err := s.Pool.Exec(ctx, `
+	_, err := s.Pool.Exec(ctx, `
         UPDATE node_executions
         SET status = 'SKIPPED',
             completed_at = COALESCE(completed_at, NOW())
@@ -191,7 +196,7 @@ func (s *Store) SkipGoDownstreamNodes(ctx context.Context, jobID string, nodeIDs
                 AND j.orchestrator_owner = 'go'
           )
     `, jobID, nodeIDs)
-	return guardedExecResult(tag.RowsAffected(), err)
+	return err
 }
 
 func (s *Store) FinalizeGoJob(ctx context.Context, jobID string, status string, errorMessage *string, finalArtifactNodeIDs []string) error {
@@ -201,8 +206,41 @@ func (s *Store) FinalizeGoJob(ctx context.Context, jobID string, status string, 
 	}
 	defer tx.Rollback(ctx)
 
-	if len(finalArtifactNodeSet(finalArtifactNodeIDs)) > 0 {
-		if _, err := tx.Exec(ctx, `
+	var jobExists bool
+	if err := tx.QueryRow(ctx, `
+        SELECT EXISTS (
+            SELECT 1 FROM jobs
+            WHERE id = $1 AND orchestrator_owner = 'go'
+        )
+    `, jobID).Scan(&jobExists); err != nil {
+		return err
+	}
+	if !jobExists {
+		return pgx.ErrNoRows
+	}
+
+	finalNodeIDs := finalArtifactNodeList(finalArtifactNodeIDs)
+	if len(finalNodeIDs) > 0 {
+		var validFinalNodes int
+		if err := tx.QueryRow(ctx, `
+            SELECT COUNT(DISTINCT ne.node_id)
+            FROM node_executions ne
+            JOIN jobs j ON j.id = ne.job_id
+            JOIN artifacts a ON a.id = ne.output_artifact_id
+            WHERE ne.job_id = $1
+              AND ne.node_id = ANY($2)
+              AND ne.status = 'SUCCEEDED'
+              AND j.orchestrator_owner = 'go'
+              AND a.job_id = ne.job_id
+              AND a.node_execution_id = ne.id
+        `, jobID, finalNodeIDs).Scan(&validFinalNodes); err != nil {
+			return err
+		}
+		if validFinalNodes != len(finalNodeIDs) {
+			return fmt.Errorf("%w: final artifact nodes must have successful output artifacts", ErrConflict)
+		}
+
+		tag, err := tx.Exec(ctx, `
             UPDATE artifacts
             SET kind = 'FINAL'
             WHERE job_id = $1
@@ -213,9 +251,15 @@ func (s *Store) FinalizeGoJob(ctx context.Context, jobID string, status string, 
                   WHERE ne.job_id = $1
                     AND ne.node_id = ANY($2)
                     AND j.orchestrator_owner = 'go'
+                    AND ne.status = 'SUCCEEDED'
+                    AND ne.output_artifact_id = artifacts.id
               )
-        `, jobID, finalArtifactNodeIDs); err != nil {
+        `, jobID, finalNodeIDs)
+		if err != nil {
 			return err
+		}
+		if tag.RowsAffected() != int64(len(finalNodeIDs)) {
+			return fmt.Errorf("%w: final artifact promotion count mismatch", ErrConflict)
 		}
 	}
 
@@ -269,7 +313,10 @@ func (s *Store) ListRecoverableGoJobs(ctx context.Context) ([]JobDetailRow, erro
 }
 
 func (s *Store) ResetStaleGoNodes(ctx context.Context, jobID string, staleBefore time.Time) error {
-	tag, err := s.Pool.Exec(ctx, `
+	if err := s.ensureGoJobExists(ctx, jobID); err != nil {
+		return err
+	}
+	_, err := s.Pool.Exec(ctx, `
         UPDATE node_executions
         SET status = 'QUEUED',
             started_at = NULL,
@@ -285,7 +332,7 @@ func (s *Store) ResetStaleGoNodes(ctx context.Context, jobID string, staleBefore
                 AND j.orchestrator_owner = 'go'
           )
     `, jobID, staleBefore)
-	return guardedExecResult(tag.RowsAffected(), err)
+	return err
 }
 
 func (s *Store) CreateSourceArtifact(ctx context.Context, jobID string, nodeExecutionID string, assetID string) (string, error) {
@@ -402,6 +449,38 @@ func finalArtifactNodeSet(nodeIDs []string) map[string]struct{} {
 		}
 	}
 	return set
+}
+
+func finalArtifactNodeList(nodeIDs []string) []string {
+	seen := finalArtifactNodeSet(nil)
+	out := make([]string, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if nodeID == "" {
+			continue
+		}
+		if _, ok := seen[nodeID]; ok {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		out = append(out, nodeID)
+	}
+	return out
+}
+
+func (s *Store) ensureGoJobExists(ctx context.Context, jobID string) error {
+	var exists bool
+	if err := s.Pool.QueryRow(ctx, `
+        SELECT EXISTS (
+            SELECT 1 FROM jobs
+            WHERE id = $1 AND orchestrator_owner = 'go'
+        )
+    `, jobID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return pgx.ErrNoRows
+	}
+	return nil
 }
 
 func guardedExecResult(rowsAffected int64, err error) error {

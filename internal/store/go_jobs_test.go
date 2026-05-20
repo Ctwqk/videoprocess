@@ -70,6 +70,19 @@ func TestFinalArtifactNodeSetHandlesEmptySlice(t *testing.T) {
 	}
 }
 
+func TestFinalArtifactNodeListSkipsEmptyAndDeduplicates(t *testing.T) {
+	got := finalArtifactNodeList([]string{"tail", "", "main", "tail"})
+	want := []string{"tail", "main"}
+	if len(got) != len(want) {
+		t.Fatalf("finalArtifactNodeList len = %d; want %d (%#v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("finalArtifactNodeList[%d] = %q; want %q (%#v)", i, got[i], want[i], got)
+		}
+	}
+}
+
 func TestGoJobStoreMethodSignatures(t *testing.T) {
 	var s *Store
 	var _ func(context.Context, GoJobCreateInput) (JobDetailRow, error) = s.CreateGoJob
