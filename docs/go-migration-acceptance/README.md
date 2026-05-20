@@ -118,6 +118,37 @@ Current live-run note:
 ```text
 Task 2 eligibility and input overrides are intentionally user-owned and currently fail closed.
 Run the strict command and acceptance runner after Task 2 is implemented.
+
+Current strict result before Task 2:
+1 failed, 1 passed
+Eligible Go job creation failed closed with:
+job orchestration for this pipeline remains Python-owned: Go eligibility classifier is not implemented yet
+```
+
+Assistant-owned verification before Task 2:
+
+```text
+docker compose up -d --build api api-go ffmpeg-worker-go: pass
+Python API health: {"status":"ok"}
+Go API health: {"status":"ok"}
+Go API readyz: {"postgres":"ok","redis":"ok","status":"ready","storage":"ok"}
+
+go test ./...: pass
+go vet ./...: pass
+cd backend && python3 -m pytest: 338 passed, 8 warnings
+cd backend && python3 -m ruff check . || true: /usr/bin/python3: No module named ruff
+cd backend && python3 -m mypy app || true: /usr/bin/python3: No module named mypy
+
+Go API parity/read/registry/validator strict gate: 22 passed
+Go write strict gate: 5 passed
+Go trim worker strict smoke: 1 passed
+Go first-wave worker strict gate: 14 passed
+Redis XPENDING vp:tasks:ffmpeg_go ffmpeg_go-workers: 0
+Redis XPENDING vp:events:go orchestrator-go: 0
+
+python3 scripts/go_phase6_acceptance.py --help: pass
+python3 -m py_compile scripts/go_phase6_acceptance.py: pass
+python3 -m py_compile tests/go_migration/test_go_orchestrator_phase6.py: pass
 ```
 
 ## Baseline
