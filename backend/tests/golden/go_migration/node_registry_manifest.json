@@ -80,7 +80,7 @@
         }
       ],
       "type_name": "bgm",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "planner",
@@ -179,7 +179,7 @@
         }
       ],
       "type_name": "concat_horizontal",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "combine",
@@ -314,7 +314,7 @@
         }
       ],
       "type_name": "concat_many",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "combine",
@@ -394,7 +394,7 @@
         }
       ],
       "type_name": "concat_timeline",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "combine",
@@ -454,7 +454,7 @@
         }
       ],
       "type_name": "concat_vertical",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "combine",
@@ -542,7 +542,7 @@
         }
       ],
       "type_name": "concat_vertical_timeline",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "output",
@@ -643,7 +643,7 @@
         }
       ],
       "type_name": "export",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "transform",
@@ -1042,7 +1042,7 @@
         }
       ],
       "type_name": "montage_assembler",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "audio",
@@ -1094,7 +1094,7 @@
         }
       ],
       "type_name": "replace_audio",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "ai_transform",
@@ -1872,7 +1872,7 @@
         }
       ],
       "type_name": "title_overlay",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "output",
@@ -2002,7 +2002,7 @@
         }
       ],
       "type_name": "transcode",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "transform",
@@ -2184,7 +2184,7 @@
         }
       ],
       "type_name": "vertical_crop",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "transform",
@@ -2262,7 +2262,7 @@
         }
       ],
       "type_name": "watermark",
-      "worker_type": "ffmpeg"
+      "worker_type": "ffmpeg_go"
     },
     {
       "category": "planner",

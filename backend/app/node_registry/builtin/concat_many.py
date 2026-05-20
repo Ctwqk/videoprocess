@@ -7,6 +7,7 @@ DEFINITION = NodeTypeDefinition(
     category="combine",
     description="Concatenate videos sequentially with dynamic timeline inputs.",
     icon="git-merge",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="video_1", port_type=PortType.VIDEO, description="Video input 1"),
         PortDefinition(name="video_2", port_type=PortType.VIDEO, description="Video input 2"),

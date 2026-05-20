@@ -7,6 +7,7 @@ DEFINITION = NodeTypeDefinition(
     category="transform",
     description="Convert video to a vertical frame with crop or blurred background.",
     icon="crop",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="input", port_type=PortType.VIDEO, description="Input video"),
     ],

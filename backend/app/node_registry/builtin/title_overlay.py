@@ -7,6 +7,7 @@ DEFINITION = NodeTypeDefinition(
     category="transform",
     description="Overlay short title text on video.",
     icon="type",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="input", port_type=PortType.VIDEO, description="Input video"),
     ],

@@ -7,6 +7,7 @@ DEFINITION = NodeTypeDefinition(
     category="audio",
     description="Replace a video's audio track with a supplied audio file",
     icon="replace",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="video", port_type=PortType.VIDEO, description="Input video"),
         PortDefinition(name="audio", port_type=PortType.AUDIO, description="Replacement audio"),

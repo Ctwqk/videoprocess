@@ -69,5 +69,5 @@ DEFINITION = NodeTypeDefinition(
             description="True peak target",
         ),
     ],
-    worker_type="ffmpeg",
+    worker_type="ffmpeg_go",
 )

@@ -13,6 +13,22 @@ Evidence sections:
 5. Docker health, readiness, and metrics.
 6. Staging jobs, Redis pending, artifacts, p95, failure, cancellation, and rollback.
 
+## Per-Node Worker Cutover
+
+Command:
+
+```bash
+VP_GO_WORKER_NODE_STRICT=1 VP_REDIS_URL=redis://127.0.0.1:6380/0 python3 -m pytest tests/go_migration/test_go_worker_nodes.py -q
+redis-cli -u redis://127.0.0.1:6380/0 XPENDING vp:tasks:ffmpeg_go ffmpeg_go-workers
+```
+
+Expected evidence:
+
+```text
+14 passed
+XPENDING summary count: 0
+```
+
 ## Baseline
 
 Commands run before non-Phase-6 completion work:
