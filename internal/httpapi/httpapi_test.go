@@ -115,20 +115,33 @@ func TestValidatePipelineReturnsValidationResult(t *testing.T) {
 }
 
 func TestValidatePipelineRejectsMalformedJSON(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/pipelines/validate", strings.NewReader(`{"nodes": [`))
-	rec := httptest.NewRecorder()
-
-	NewServer().Router().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "broken json", body: `{"nodes": [`},
+		{name: "missing required fields", body: `{}`},
+		{name: "trailing object", body: `{"nodes":[],"edges":[],"viewport":{}} {}`},
+		{name: "trailing garbage", body: `{"nodes":[],"edges":[],"viewport":{}} trailing`},
 	}
-	var payload map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload["detail"] != "invalid pipeline definition" {
-		t.Fatalf("payload = %#v", payload)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/pipelines/validate", strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+
+			NewServer().Router().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+			}
+			var payload map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["detail"] != "invalid pipeline definition" {
+				t.Fatalf("payload = %#v", payload)
+			}
+		})
 	}
 }
 
