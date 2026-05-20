@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -138,6 +139,31 @@ func escapeDrawText(text string) string {
 	return text
 }
 
+func preferredVideoCodec(codec string) string {
+	if envEnabled("VIDEO_USE_GPU") {
+		switch codec {
+		case "libx264":
+			return "h264_nvenc"
+		case "libx265":
+			return "hevc_nvenc"
+		}
+	}
+	if envEnabled("VIDEO_USE_VIDEOTOOLBOX") {
+		switch codec {
+		case "libx264":
+			return "h264_videotoolbox"
+		case "libx265":
+			return "hevc_videotoolbox"
+		}
+	}
+	return codec
+}
+
+func envEnabled(key string) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
 func videoEncodeArgs(codec string, preset string, crf int, bitrate string, mp4Compatible bool) []string {
 	if codec == "" {
 		codec = "libx264"
@@ -170,11 +196,11 @@ func videoEncodeArgs(codec string, preset string, crf int, bitrate string, mp4Co
 }
 
 func intermediateVideoEncodeArgs(codec string) []string {
-	return videoEncodeArgs(codec, "slow", 18, "", true)
+	return videoEncodeArgs(preferredVideoCodec(codec), "slow", 18, "", true)
 }
 
 func finalVideoEncodeArgs(codec string) []string {
-	return videoEncodeArgs(codec, "medium", 20, "", true)
+	return videoEncodeArgs(preferredVideoCodec(codec), "medium", 20, "", true)
 }
 
 func defaultVideotoolboxBitrate(codec string, bitrate string) string {

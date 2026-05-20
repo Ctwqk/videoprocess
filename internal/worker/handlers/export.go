@@ -48,6 +48,11 @@ func (h ExportHandler) Execute(ctx context.Context, inputPaths map[string]string
 }
 
 func copyFile(src string, dst string) error {
+	if same, err := sameFilePath(src, dst); err != nil {
+		return err
+	} else if same {
+		return fmt.Errorf("source and destination are the same file: %s", src)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -71,4 +76,27 @@ func copyFile(src string, dst string) error {
 		return copyErr
 	}
 	return closeErr
+}
+
+func sameFilePath(src string, dst string) (bool, error) {
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return false, err
+	}
+	dstInfo, err := os.Stat(dst)
+	if err == nil {
+		return os.SameFile(srcInfo, dstInfo), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	absSrc, srcErr := filepath.Abs(src)
+	if srcErr != nil {
+		return false, srcErr
+	}
+	absDst, dstErr := filepath.Abs(dst)
+	if dstErr != nil {
+		return false, dstErr
+	}
+	return absSrc == absDst, nil
 }

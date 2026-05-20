@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -65,6 +67,43 @@ func TestIntermediateVideoEncodeArgs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %#v", got)
+	}
+}
+
+func TestIntermediateVideoEncodeArgsPrefersHardwareCodecFromEnv(t *testing.T) {
+	t.Setenv("VIDEO_USE_GPU", "1")
+	t.Setenv("VIDEO_USE_VIDEOTOOLBOX", "")
+	got := intermediateVideoEncodeArgs("libx264")
+	want := []string{
+		"-c:v", "h264_nvenc",
+		"-rc:v", "vbr",
+		"-cq:v", "18",
+		"-preset", "slow",
+		"-pix_fmt", "yuv420p",
+		"-movflags", "+faststart",
+		"-color_primaries", "bt709",
+		"-color_trc", "bt709",
+		"-colorspace", "bt709",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v", got)
+	}
+}
+
+func TestCopyFileRejectsSameFile(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "input.mp4")
+	if err := os.WriteFile(src, []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyFile(src, src); err == nil {
+		t.Fatal("copyFile should reject same source and destination")
+	}
+	if got, err := os.ReadFile(src); err != nil {
+		t.Fatal(err)
+	} else if string(got) != "input" {
+		t.Fatalf("source was modified: %q", string(got))
 	}
 }
 

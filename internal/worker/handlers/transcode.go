@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"errors"
-	"os"
 	"strconv"
 	"strings"
 
@@ -47,31 +46,6 @@ func TranscodeArgs(inputPath string, outputPath string, config map[string]any) [
 	}
 	args = append(args, "-c:a", audioCodec, outputPath)
 	return args
-}
-
-func preferredVideoCodec(codec string) string {
-	if envEnabled("VIDEO_USE_GPU") {
-		switch codec {
-		case "libx264":
-			return "h264_nvenc"
-		case "libx265":
-			return "hevc_nvenc"
-		}
-	}
-	if envEnabled("VIDEO_USE_VIDEOTOOLBOX") {
-		switch codec {
-		case "libx264":
-			return "h264_videotoolbox"
-		case "libx265":
-			return "hevc_videotoolbox"
-		}
-	}
-	return codec
-}
-
-func envEnabled(key string) bool {
-	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
-	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
 func (h TranscodeHandler) Args(inputPath, outputPath string, config map[string]any) []string {
