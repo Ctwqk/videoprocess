@@ -260,6 +260,39 @@ func TestJobCancelRequiresStore(t *testing.T) {
 	}
 }
 
+func TestAssetUploadRequiresStorage(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/assets/upload", nil)
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestArtifactCleanupRequiresStorage(t *testing.T) {
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/artifacts/cleanup", nil)
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestScheduleOpenRequiresStore(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/internal/schedule/video/open", nil)
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestReadyzReportsHealthyDependencies(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()

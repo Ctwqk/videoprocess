@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 
+	"github.com/Ctwqk/videoprocess/internal/storage"
 	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/go-chi/chi/v5"
 )
@@ -12,6 +13,8 @@ import (
 // without Postgres. Production cmd/vp-api wires a real store.
 type Server struct {
 	store          *store.Store
+	storage        storage.Backend
+	storageBackend string
 	readiness      ReadinessDeps
 	allowStubStore bool
 }
@@ -19,6 +22,8 @@ type Server struct {
 type ServerOptions struct {
 	Readiness      ReadinessDeps
 	AllowStubStore bool
+	Storage        storage.Backend
+	StorageBackend string
 }
 
 // NewServer constructs a Server without a backing store. Useful for tests
@@ -35,6 +40,8 @@ func NewServerWithStore(s *store.Store) *Server {
 func NewServerWithOptions(s *store.Store, opts ServerOptions) *Server {
 	return &Server{
 		store:          s,
+		storage:        opts.Storage,
+		storageBackend: opts.StorageBackend,
 		readiness:      opts.Readiness,
 		allowStubStore: opts.AllowStubStore,
 	}
@@ -62,7 +69,12 @@ func (s *Server) Router() http.Handler {
 		r.Get("/templates", s.listTemplates)
 		r.Get("/assets", s.listAssets)
 		r.Get("/assets/{assetID}", s.getAsset)
+		r.Post("/assets/upload", s.uploadAsset)
+		r.Get("/assets/{assetID}/download", s.downloadAsset)
+		r.Delete("/assets/{assetID}", s.deleteAsset)
 		r.Get("/artifacts/{artifactID}", s.getArtifact)
+		r.Get("/artifacts/{artifactID}/download", s.downloadArtifact)
+		r.Delete("/artifacts/cleanup", s.cleanupArtifacts)
 		r.Get("/jobs", s.listJobs)
 		r.Post("/jobs", s.createJob)
 		r.Post("/jobs/batch", s.createJobBatch)
@@ -73,6 +85,9 @@ func (s *Server) Router() http.Handler {
 	})
 	r.Route("/internal/schedule/video", func(r chi.Router) {
 		r.Get("/status", s.scheduleStatus)
+		r.Post("/open", s.openVideoSchedule)
+		r.Post("/drain", s.drainVideoSchedule)
+		r.Post("/close", s.closeVideoSchedule)
 	})
 	return r
 }

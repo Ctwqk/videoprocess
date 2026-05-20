@@ -25,7 +25,8 @@ func main() {
 	defer cancel()
 
 	redisProbe := redisReadinessProbe(cfg.RedisURL)
-	storageProbe := storageReadinessProbe(rootCtx, cfg)
+	storageBackend, storageErr := storage.FromConfig(rootCtx, cfg)
+	storageProbe := storageReadinessProbe(storageBackend, storageErr)
 
 	openCtx, openCancel := context.WithTimeout(rootCtx, 10*time.Second)
 	st, err := store.Open(openCtx, cfg.DatabaseURL)
@@ -41,6 +42,8 @@ func main() {
 		pgProbe = func(context.Context) error { return dbErr }
 		server = httpapi.NewServerWithOptions(nil, httpapi.ServerOptions{
 			AllowStubStore: cfg.APIGoAllowStubStore,
+			Storage:        storageBackend,
+			StorageBackend: cfg.StorageBackend,
 			Readiness: httpapi.ReadinessDeps{
 				Postgres: pgProbe,
 				Redis:    redisProbe,
@@ -52,6 +55,8 @@ func main() {
 		pgProbe = st.Ping
 		server = httpapi.NewServerWithOptions(st, httpapi.ServerOptions{
 			AllowStubStore: cfg.APIGoAllowStubStore,
+			Storage:        storageBackend,
+			StorageBackend: cfg.StorageBackend,
 			Readiness: httpapi.ReadinessDeps{
 				Postgres: pgProbe,
 				Redis:    redisProbe,
@@ -93,10 +98,9 @@ func redisReadinessProbe(redisURL string) httpapi.ReadinessProbe {
 	}
 }
 
-func storageReadinessProbe(ctx context.Context, cfg config.Config) httpapi.ReadinessProbe {
-	backend, err := storage.FromConfig(ctx, cfg)
-	if err != nil {
-		return func(context.Context) error { return err }
+func storageReadinessProbe(backend storage.Backend, openErr error) httpapi.ReadinessProbe {
+	if openErr != nil {
+		return func(context.Context) error { return openErr }
 	}
 	return func(ctx context.Context) error {
 		_, err := backend.Exists(ctx, ".")
