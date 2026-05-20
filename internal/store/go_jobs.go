@@ -314,7 +314,7 @@ func (s *Store) ListRecoverableGoJobs(ctx context.Context) ([]JobDetailRow, erro
         SELECT id
         FROM jobs
         WHERE orchestrator_owner = 'go'
-          AND status IN ('PENDING', 'PLANNING', 'RUNNING')
+          AND status IN ('PENDING', 'WAITING_WINDOW', 'PLANNING', 'RUNNING')
         ORDER BY submitted_at ASC
     `)
 	if err != nil {
@@ -354,7 +354,9 @@ func (s *Store) ResetStaleGoNodes(ctx context.Context, jobID string, staleBefore
         SET status = 'PENDING',
             queued_at = NULL,
             started_at = NULL,
+            completed_at = NULL,
             worker_id = NULL,
+            progress = 0,
             input_artifact_ids = ARRAY[]::uuid[],
             error_message = NULL,
             error_trace = NULL
