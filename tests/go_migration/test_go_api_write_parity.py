@@ -75,3 +75,15 @@ def test_go_pipeline_create_update_duplicate_delete() -> None:
         if duplicate_id:
             duplicate_deleted = requests.delete(f"{GO_API}/api/v1/pipelines/{duplicate_id}", timeout=10)
             assert duplicate_deleted.status_code in {200, 204}, duplicate_deleted.text
+
+
+@pytest.mark.skipif(not STRICT, reason="set VP_GO_WRITE_STRICT=1 for live Go write parity")
+def test_go_job_start_is_explicitly_python_owned_or_handed_off() -> None:
+    response = requests.post(
+        f"{GO_API}/api/v1/jobs",
+        json={"pipeline_id": "00000000-0000-0000-0000-000000000000"},
+        timeout=10,
+    )
+    assert response.status_code in {201, 202, 404, 501}
+    if response.status_code == 501:
+        assert "Python" in response.json()["detail"]

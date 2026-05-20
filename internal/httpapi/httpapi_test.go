@@ -235,6 +235,31 @@ func TestPipelineCreateRejectsMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestJobCreationIsExplicitlyPythonOwned(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs", strings.NewReader(`{"pipeline_id":"00000000-0000-0000-0000-000000000000"}`))
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Python") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestJobCancelRequiresStore(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/00000000-0000-0000-0000-000000000000/cancel", nil)
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestReadyzReportsHealthyDependencies(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()

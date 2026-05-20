@@ -29,6 +29,10 @@ Expected evidence:
 XPENDING summary count: 0
 ```
 
+## Job Write Ownership
+
+`POST /api/v1/jobs`, `POST /api/v1/jobs/batch`, and `POST /api/v1/jobs/{id}/rerun` remain Python-owned unless a Python start-job handoff endpoint is explicitly configured. This preserves the Phase 6 exclusion: Go does not schedule DAGs or listen to worker events in this milestone.
+
 ## Baseline
 
 Commands run before non-Phase-6 completion work:

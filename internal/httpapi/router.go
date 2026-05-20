@@ -64,7 +64,12 @@ func (s *Server) Router() http.Handler {
 		r.Get("/assets/{assetID}", s.getAsset)
 		r.Get("/artifacts/{artifactID}", s.getArtifact)
 		r.Get("/jobs", s.listJobs)
+		r.Post("/jobs", s.createJob)
+		r.Post("/jobs/batch", s.createJobBatch)
 		r.Get("/jobs/{jobID}", s.getJob)
+		r.Post("/jobs/{jobID}/cancel", s.cancelJob)
+		r.Post("/jobs/{jobID}/rerun", s.rerunJob)
+		r.Delete("/jobs/{jobID}", s.deleteJob)
 	})
 	r.Route("/internal/schedule/video", func(r chi.Router) {
 		r.Get("/status", s.scheduleStatus)
