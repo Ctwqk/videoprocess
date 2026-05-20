@@ -2,7 +2,10 @@ package handlers
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
@@ -44,5 +47,41 @@ func TestTrimExecuteReadsInputPortAndReturnsNoMetadata(t *testing.T) {
 	}
 	if len(metadata) != 0 {
 		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func TestTrimExecuteRetriesHardwareCapacityFailureOnCPU(t *testing.T) {
+	root := t.TempDir()
+	logPath := filepath.Join(root, "args.log")
+	markerPath := filepath.Join(root, "failed_once")
+	scriptPath := filepath.Join(root, "fake-ffmpeg.sh")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> " + shellQuote(logPath) + "\n" +
+		"if [ ! -e " + shellQuote(markerPath) + " ]; then\n" +
+		"  touch " + shellQuote(markerPath) + "\n" +
+		"  echo 'OpenEncodeSessionEx failed: out of memory' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VIDEO_USE_GPU", "1")
+
+	handler := TrimHandler{Runner: vpffmpeg.Runner{Binary: scriptPath, PreArgs: nil}}
+	_, err := handler.Execute(context.Background(), map[string]string{"input": "/input.mp4"}, "/output.mp4", map[string]any{})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(mustReadFile(t, logPath))), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("run count = %d, lines=%#v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "h264_nvenc") {
+		t.Fatalf("first run args = %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "libx264") || strings.Contains(lines[1], "h264_nvenc") || strings.Contains(lines[1], "-cq:v") {
+		t.Fatalf("retry args = %q", lines[1])
 	}
 }

@@ -47,9 +47,9 @@ func TestRunMissingBinaryDoesNotPanic(t *testing.T) {
 
 func TestIsGPUCapacityErrorDetectsKnownIndicators(t *testing.T) {
 	cases := map[string]bool{
-		"":                                              false,
-		"frame=  120 fps=30 q=23.0 size=":              false,
-		"OpenEncodeSessionEx failed: out of memory":    true,
+		"":                                false,
+		"frame=  120 fps=30 q=23.0 size=": false,
+		"OpenEncodeSessionEx failed: out of memory":     true,
 		"No NVENC capable devices found":                true,
 		"Cannot init CUDA":                              true,
 		"videotoolbox encoder error":                    true,
@@ -76,6 +76,32 @@ func TestRewriteHardwareArgsForCPUMapsNVENCToLibx264(t *testing.T) {
 		"-crf", "21",
 		"-preset", "fast",
 		"-pix_fmt", "yuv420p",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rewrite = %#v\nwant   %#v", got, want)
+	}
+}
+
+func TestRewriteHardwareArgsForCPUInsertsCRFAfterCodecInRealHandlerArgs(t *testing.T) {
+	in := []string{
+		"-i", "/input.mp4",
+		"-map", "0:v:0",
+		"-map", "0:a?",
+		"-c:v", "h264_nvenc",
+		"-rc:v", "vbr",
+		"-cq:v", "23",
+		"-preset", "slow",
+		"/output.mp4",
+	}
+	got := RewriteHardwareArgsForCPU(in)
+	want := []string{
+		"-i", "/input.mp4",
+		"-map", "0:v:0",
+		"-map", "0:a?",
+		"-c:v", "libx264",
+		"-crf", "21",
+		"-preset", "slow",
+		"/output.mp4",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("rewrite = %#v\nwant   %#v", got, want)

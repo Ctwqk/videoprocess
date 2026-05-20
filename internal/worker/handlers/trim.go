@@ -41,12 +41,7 @@ func (h TrimHandler) Execute(ctx context.Context, inputPaths map[string]string, 
 	if inputPath == "" {
 		return nil, errors.New("missing input path on input port")
 	}
-	runner := h.Runner
-	if runner.Binary == "" {
-		runner = vpffmpeg.NewRunner()
-	}
-	_, err := runner.Run(ctx, h.Args(inputPath, outputPath, config))
-	if err != nil {
+	if err := runFFmpeg(ctx, h.Runner, h.Args(inputPath, outputPath, config)); err != nil {
 		return nil, err
 	}
 	return map[string]any{}, nil

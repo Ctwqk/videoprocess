@@ -150,9 +150,12 @@ func RewriteHardwareArgsForCPU(args []string) []string {
 	}
 	if removedCQ != "" && !hasCRF {
 		mapped := nvencCQToLibx264CRF(removedCQ)
-		insertAt := 0
-		if len(rewritten) >= 2 && rewritten[0] == "-c:v" {
-			insertAt = 2
+		insertAt := len(rewritten)
+		for i := 0; i+1 < len(rewritten); i++ {
+			if rewritten[i] == "-c:v" && (rewritten[i+1] == "libx264" || rewritten[i+1] == "libx265") {
+				insertAt = i + 2
+				break
+			}
 		}
 		rewritten = append(rewritten[:insertAt], append([]string{"-crf", mapped}, rewritten[insertAt:]...)...)
 	}
