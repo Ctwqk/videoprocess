@@ -56,15 +56,16 @@ type PipelineRow struct {
 
 // JobRow mirrors backend/app/schemas/job.py JobResponse.
 type JobRow struct {
-	ID           string     `json:"id"`
-	PipelineID   string     `json:"pipeline_id"`
-	Status       string     `json:"status"`
-	SubmittedAt  time.Time  `json:"submitted_at"`
-	StartedAt    *time.Time `json:"started_at"`
-	CompletedAt  *time.Time `json:"completed_at"`
-	ErrorMessage *string    `json:"error_message"`
-	SubmittedBy  string     `json:"submitted_by"`
-	RetryCount   int        `json:"retry_count"`
+	ID                string     `json:"id"`
+	PipelineID        string     `json:"pipeline_id"`
+	Status            string     `json:"status"`
+	SubmittedAt       time.Time  `json:"submitted_at"`
+	StartedAt         *time.Time `json:"started_at"`
+	CompletedAt       *time.Time `json:"completed_at"`
+	ErrorMessage      *string    `json:"error_message"`
+	SubmittedBy       string     `json:"submitted_by"`
+	RetryCount        int        `json:"retry_count"`
+	OrchestratorOwner string     `json:"orchestrator_owner"`
 }
 
 // AssetRow mirrors backend/app/schemas/asset.py AssetResponse.
@@ -170,7 +171,7 @@ func (s *Store) ListJobs(ctx context.Context, opts PageOptions, pipelineID *stri
 	limitArg := strconv.Itoa(len(args) - 1)
 	offsetArg := strconv.Itoa(len(args))
 	query := "SELECT id, pipeline_id, status::text, submitted_at, started_at, completed_at, " +
-		"error_message, submitted_by, retry_count FROM jobs" + where +
+		"error_message, submitted_by, retry_count, orchestrator_owner FROM jobs" + where +
 		" ORDER BY submitted_at DESC LIMIT $" + limitArg + " OFFSET $" + offsetArg
 	rows, err := s.Pool.Query(ctx, query, args...)
 	if err != nil {
@@ -183,7 +184,7 @@ func (s *Store) ListJobs(ctx context.Context, opts PageOptions, pipelineID *stri
 		var id [16]byte
 		var pipelineUUID [16]byte
 		if err := rows.Scan(&id, &pipelineUUID, &row.Status, &row.SubmittedAt, &row.StartedAt,
-			&row.CompletedAt, &row.ErrorMessage, &row.SubmittedBy, &row.RetryCount); err != nil {
+			&row.CompletedAt, &row.ErrorMessage, &row.SubmittedBy, &row.RetryCount, &row.OrchestratorOwner); err != nil {
 			return nil, 0, err
 		}
 		row.ID = uuidString(id)

@@ -49,3 +49,29 @@ func TestAPIGoAllowStubStoreReadsTruthyValues(t *testing.T) {
 		t.Fatal("APIGoAllowStubStore should read true")
 	}
 }
+
+func TestGoOrchestratorFlagsDefaultClosed(t *testing.T) {
+	t.Setenv("VP_GO_ORCHESTRATOR_ENABLED", "")
+	t.Setenv("VP_GO_ORCHESTRATOR_JOB_WRITES", "")
+	t.Setenv("VP_GO_EVENT_STREAM", "")
+	t.Setenv("VP_GO_ORCHESTRATOR_RECOVERY_INTERVAL_SECONDS", "")
+	t.Setenv("VP_GO_ORCHESTRATOR_STALE_NODE_SECONDS", "")
+
+	cfg := Load()
+
+	if cfg.GoOrchestratorEnabled {
+		t.Fatal("GoOrchestratorEnabled must default false")
+	}
+	if cfg.GoOrchestratorJobWrites {
+		t.Fatal("GoOrchestratorJobWrites must default false")
+	}
+	if cfg.GoEventStream != "vp:events:go" {
+		t.Fatalf("GoEventStream = %q", cfg.GoEventStream)
+	}
+	if cfg.GoOrchestratorRecoveryIntervalSeconds != 60 {
+		t.Fatalf("GoOrchestratorRecoveryIntervalSeconds = %d", cfg.GoOrchestratorRecoveryIntervalSeconds)
+	}
+	if cfg.GoOrchestratorStaleNodeSeconds != 600 {
+		t.Fatalf("GoOrchestratorStaleNodeSeconds = %d", cfg.GoOrchestratorStaleNodeSeconds)
+	}
+}

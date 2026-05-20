@@ -53,6 +53,9 @@ class Job(UUIDPrimaryKeyMixin, Base):
         UUID(as_uuid=True), ForeignKey("jobs.id"), nullable=True
     )
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    orchestrator_owner: Mapped[str] = mapped_column(
+        String(32), default="python", nullable=False
+    )
 
     node_executions: Mapped[list["NodeExecution"]] = relationship(
         back_populates="job", cascade="all, delete-orphan"

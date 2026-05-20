@@ -103,12 +103,12 @@ func (s *Store) GetJobDetail(ctx context.Context, id string) (JobDetailRow, erro
 	var pipelineUUID [16]byte
 	err := s.Pool.QueryRow(ctx, `
 		SELECT id, pipeline_id, status::text, submitted_at, started_at, completed_at,
-		       error_message, submitted_by, retry_count, pipeline_snapshot, execution_plan
+		       error_message, submitted_by, retry_count, orchestrator_owner, pipeline_snapshot, execution_plan
 		FROM jobs
 		WHERE id = $1
 	`, id).Scan(&jobUUID, &pipelineUUID, &row.Status, &row.SubmittedAt, &row.StartedAt,
 		&row.CompletedAt, &row.ErrorMessage, &row.SubmittedBy, &row.RetryCount,
-		&row.PipelineSnapshot, &row.ExecutionPlan)
+		&row.OrchestratorOwner, &row.PipelineSnapshot, &row.ExecutionPlan)
 	if err != nil {
 		return row, err
 	}

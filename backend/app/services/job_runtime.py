@@ -49,6 +49,7 @@ def to_job_response(job) -> JobResponse:
         error_message=job.error_message,
         submitted_by=job.submitted_by,
         retry_count=job.retry_count,
+        orchestrator_owner=getattr(job, "orchestrator_owner", "python"),
     )
 
 
