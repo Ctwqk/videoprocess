@@ -213,7 +213,11 @@ func (s MediaQualityService) run(ctx context.Context, args []string) (vpffmpeg.R
 	if runner.Binary == "" {
 		runner = vpffmpeg.NewRunner()
 	}
-	return runner.Run(ctx, args)
+	result, err := runner.Run(ctx, args)
+	if err != nil && result.GPUCapacity && containsHardwareCodec(args) && envEnabled("VIDEO_GPU_FALLBACK_TO_CPU", true) {
+		return runner.Run(ctx, vpffmpeg.RewriteHardwareArgsForCPU(args))
+	}
+	return result, err
 }
 
 func (s MediaQualityService) measureVMAF(ctx context.Context, sourcePath string, outputPath string) (*float64, error) {
