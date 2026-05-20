@@ -3,7 +3,9 @@ package ffmpeg
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"testing"
@@ -42,6 +44,50 @@ func TestRunMissingBinaryDoesNotPanic(t *testing.T) {
 	}
 	if errors.Is(err, ErrCancelled) {
 		t.Fatalf("missing binary must not surface as ErrCancelled: %v", err)
+	}
+}
+
+func TestProbeParsesJSONMetadata(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "fake-ffprobe.sh")
+	script := "#!/bin/sh\n" +
+		"cat <<'JSON'\n" +
+		"{\"streams\":[{\"codec_type\":\"video\",\"width\":1920,\"height\":1080},{\"codec_type\":\"audio\"}],\"format\":{\"duration\":\"12.500000\"}}\n" +
+		"JSON\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Runner{ProbeBinary: scriptPath}.Probe(context.Background(), "/input.mp4")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.HasAudio() {
+		t.Fatalf("expected audio stream: %#v", result.Streams)
+	}
+	if got := result.DurationSeconds(); got != 12.5 {
+		t.Fatalf("duration = %v", got)
+	}
+}
+
+func TestProbeExitErrorReturnsEmptyResult(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "fake-ffprobe.sh")
+	script := "#!/bin/sh\n" +
+		"echo 'probe failed' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Runner{ProbeBinary: scriptPath}.Probe(context.Background(), "/input.mp4")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.HasAudio() || result.DurationSeconds() != 0 {
+		t.Fatalf("result = %#v", result)
 	}
 }
 

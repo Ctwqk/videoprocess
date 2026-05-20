@@ -118,6 +118,46 @@ func boolValue(value any, fallback bool) bool {
 	return strings.Contains("|1|true|yes|on|", "|"+strings.ToLower(strings.TrimSpace(fmt.Sprint(value)))+"|")
 }
 
+func truthyValue(value any, fallback bool) bool {
+	switch typed := value.(type) {
+	case nil:
+		return fallback
+	case bool:
+		return typed
+	case string:
+		return typed != ""
+	case json.Number:
+		parsed, err := typed.Float64()
+		return err != nil || parsed != 0
+	case int:
+		return typed != 0
+	case int8:
+		return typed != 0
+	case int16:
+		return typed != 0
+	case int32:
+		return typed != 0
+	case int64:
+		return typed != 0
+	case uint:
+		return typed != 0
+	case uint8:
+		return typed != 0
+	case uint16:
+		return typed != 0
+	case uint32:
+		return typed != 0
+	case uint64:
+		return typed != 0
+	case float32:
+		return typed != 0
+	case float64:
+		return typed != 0
+	default:
+		return true
+	}
+}
+
 func stringValue(value any, fallback string) string {
 	switch typed := value.(type) {
 	case nil:

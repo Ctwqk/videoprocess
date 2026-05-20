@@ -458,6 +458,198 @@ func TestRunFFmpegRetriesHardwareCapacityFailureOnCPU(t *testing.T) {
 	}
 }
 
+func TestBatch4BInputPorts(t *testing.T) {
+	tests := map[string]struct {
+		handler interface{ NodeType() string }
+		ports   []string
+	}{
+		"bgm":               {handler: BgmHandler{}, ports: []string{"video", "audio"}},
+		"replace_audio":     {handler: ReplaceAudioHandler{}, ports: []string{"video", "audio"}},
+		"concat_horizontal": {handler: ConcatHorizontalHandler{}, ports: []string{"video_left", "video_right"}},
+		"concat_vertical":   {handler: ConcatVerticalHandler{}, ports: []string{"video_top", "video_bottom"}},
+		"concat_many":       {handler: ConcatManyHandler{}, ports: []string{"video_1", "video_2"}},
+	}
+	for nodeType, tt := range tests {
+		t.Run(nodeType, func(t *testing.T) {
+			if tt.handler.NodeType() != nodeType {
+				t.Fatalf("node type = %q", tt.handler.NodeType())
+			}
+			if len(tt.ports) < 2 {
+				t.Fatalf("%s ports = %#v", nodeType, tt.ports)
+			}
+		})
+	}
+}
+
+func TestBatch4BArgs(t *testing.T) {
+	tests := []struct {
+		name   string
+		args   []string
+		expect []string
+	}{
+		{
+			name: "bgm with original audio ducking and fades",
+			args: BgmArgs("/video.mp4", "/music.wav", "/out.mp4", map[string]any{
+				"volume": 0.25, "original_volume": 0.8, "loop": true, "fade_in": 1.0, "fade_out": 2.0,
+			}, probeSummary{Duration: 12.5, HasAudio: true}),
+			expect: []string{
+				"-i", "/video.mp4",
+				"-stream_loop", "-1", "-i", "/music.wav",
+				"-filter_complex", "[0:a]aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.8,asplit=2[orig_mix][orig_sidechain];[1:a]aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.25,afade=t=in:d=1,afade=t=out:st=10.5:d=2[bgm];[bgm][orig_sidechain]sidechaincompress=threshold=0.03:ratio=8:attack=200:release=800[ducked];[orig_mix][ducked]amix=inputs=2:duration=first:normalize=0[mix];[mix]loudnorm=I=-16:LRA=11:TP=-1.5[a]",
+				"-map", "0:v", "-map", "[a]",
+				"-c:v", "copy",
+				"-c:a", "aac",
+				"-ar", "48000",
+				"-ac", "2",
+				"-shortest",
+				"/out.mp4",
+			},
+		},
+		{
+			name: "replace audio no loop pads to video duration",
+			args: ReplaceAudioArgs("/video.mp4", "/audio.wav", "/out.mp4", map[string]any{
+				"loop_if_shorter": false, "audio_volume": 0.7,
+			}, probeSummary{Duration: 8.25}),
+			expect: []string{
+				"-i", "/video.mp4",
+				"-i", "/audio.wav",
+				"-filter_complex", "[1:a]volume=0.7,apad[aout]",
+				"-map", "0:v:0",
+				"-map", "[aout]",
+				"-c:v", "copy",
+				"-c:a", "aac",
+				"-t", "8.250",
+				"/out.mp4",
+			},
+		},
+		{
+			name: "horizontal stack mixes both audio tracks",
+			args: ConcatStackArgs("/left.mp4", "/right.mp4", "/out.mp4", concatStackConfig{
+				PrimaryLabel: "left", SecondaryLabel: "right", StackAxis: "horizontal", ResizeMode: "match_height",
+				PrimaryHasAudio: true, SecondaryHasAudio: true,
+			}),
+			expect: []string{
+				"-i", "/left.mp4",
+				"-i", "/right.mp4",
+				"-filter_complex", "[0:v]scale=-2:480:flags=lanczos[left];[1:v]scale=-2:480:flags=lanczos[right];[left][right]hstack=inputs=2[v];[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=2[a]",
+				"-map", "[v]",
+				"-map", "[a]",
+				"-c:a", "aac",
+				"-c:v", "libx264",
+				"-crf", "18",
+				"-preset", "slow",
+				"-pix_fmt", "yuv420p",
+				"-movflags", "+faststart",
+				"-color_primaries", "bt709",
+				"-color_trc", "bt709",
+				"-colorspace", "bt709",
+				"/out.mp4",
+			},
+		},
+		{
+			name: "vertical stack maps top audio track",
+			args: ConcatStackArgs("/top.mp4", "/bottom.mp4", "/out.mp4", concatStackConfig{
+				PrimaryLabel: "top", SecondaryLabel: "bottom", StackAxis: "vertical", ResizeMode: "match_width",
+				PrimaryHasAudio: true, SecondaryHasAudio: false,
+			}),
+			expect: []string{
+				"-i", "/top.mp4",
+				"-i", "/bottom.mp4",
+				"-filter_complex", "[0:v]scale=640:-2:flags=lanczos[top];[1:v]scale=640:-2:flags=lanczos[bottom];[top][bottom]vstack=inputs=2[v]",
+				"-map", "[v]",
+				"-map", "0:a:0",
+				"-c:a", "aac",
+				"-c:v", "libx264",
+				"-crf", "18",
+				"-preset", "slow",
+				"-pix_fmt", "yuv420p",
+				"-movflags", "+faststart",
+				"-color_primaries", "bt709",
+				"-color_trc", "bt709",
+				"-colorspace", "bt709",
+				"/out.mp4",
+			},
+		},
+		{
+			name: "concat many normalizes selected inputs with finite silence",
+			args: mustConcatManyArgs(t, map[string]string{"video_2": "/2.mp4", "video_1": "/1.mp4"}, "/out.mp4", map[string]any{"target_duration": 5.5}),
+			expect: []string{
+				"-i", "/1.mp4",
+				"-i", "/2.mp4",
+				"-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000:duration=5.5",
+				"-filter_complex", "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[v0];[1:v]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1[v1];[v0][v1]concat=n=2:v=1:a=0[v]",
+				"-map", "[v]",
+				"-map", "2:a",
+				"-c:v", "libx264",
+				"-crf", "18",
+				"-preset", "slow",
+				"-pix_fmt", "yuv420p",
+				"-movflags", "+faststart",
+				"-color_primaries", "bt709",
+				"-color_trc", "bt709",
+				"-colorspace", "bt709",
+				"-c:a", "aac",
+				"-shortest",
+				"-t", "5.5",
+				"/out.mp4",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !reflect.DeepEqual(tt.args, tt.expect) {
+				t.Fatalf("args = %#v", tt.args)
+			}
+		})
+	}
+}
+
+func TestConcatManyAutoDimensionsAndMetadataSilence(t *testing.T) {
+	config := map[string]any{
+		"aspect_ratio": "auto",
+		"_input_artifact_meta": map[string]any{
+			"video_1": map[string]any{"width": 1920.0, "height": 1080.0, "duration": 1.25},
+			"video_2": map[string]any{"width": 1280.0, "height": 720.0, "duration": 2.75},
+		},
+	}
+	items := []inputItem{{handle: "video_1", path: "/1.mp4"}, {handle: "video_2", path: "/2.mp4"}}
+	width, height := targetDimensions(config, []string{"video_1", "video_2"})
+	if width != 1920 || height != 1080 {
+		t.Fatalf("dimensions = %dx%d", width, height)
+	}
+	if got := silenceSource(silenceDuration(config, items, nil)); got != "anullsrc=channel_layout=stereo:sample_rate=48000:duration=4" {
+		t.Fatalf("silence source = %q", got)
+	}
+}
+
+func TestConcatManySelectedInputOrder(t *testing.T) {
+	inputs := map[string]string{
+		"video_10":     "/10.mp4",
+		"video_2":      "/2.mp4",
+		"video_1":      "/1.mp4",
+		"video_first":  "/legacy-first.mp4",
+		"video_second": "/legacy-second.mp4",
+	}
+	got := selectedVideoInputItems(inputs)
+	want := []inputItem{
+		{handle: "video_1", path: "/1.mp4"},
+		{handle: "video_2", path: "/2.mp4"},
+		{handle: "video_10", path: "/10.mp4"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("selected = %#v", got)
+	}
+}
+
+func mustConcatManyArgs(t *testing.T, inputPaths map[string]string, outputPath string, config map[string]any) []string {
+	t.Helper()
+	args, err := ConcatManyArgs(inputPaths, outputPath, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return args
+}
+
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
