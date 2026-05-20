@@ -92,6 +92,34 @@ Redis XPENDING after acceptance: 0
 p95_seconds range: 2.039856790192425 to 4.04803975042887
 ```
 
+## Phase 6 Go Orchestrator Acceptance
+
+Commands:
+
+```bash
+docker compose up -d --build api api-go ffmpeg-worker-go
+VP_GO_PHASE6_STRICT=1 VP_GO_API_URL=http://127.0.0.1:18081 VP_PYTHON_API=http://127.0.0.1:18080 VP_REDIS_URL=redis://127.0.0.1:6380/0 python3 -m pytest tests/go_migration/test_go_orchestrator_phase6.py -q
+python3 scripts/go_phase6_acceptance.py --api-go-url http://127.0.0.1:18081 --python-api-url http://127.0.0.1:18080 --redis-url redis://127.0.0.1:6380/0 --count 20
+```
+
+Expected result:
+
+```text
+Go API creates Go-owned jobs.
+Go worker emits events to vp:events:go.
+Go listener finalizes jobs.
+Python API agrees on terminal status.
+Redis pending counts are zero.
+Non-eligible pipeline is rejected without fallback.
+```
+
+Current live-run note:
+
+```text
+Task 2 eligibility and input overrides are intentionally user-owned and currently fail closed.
+Run the strict command and acceptance runner after Task 2 is implemented.
+```
+
 ## Baseline
 
 Commands run before non-Phase-6 completion work:
