@@ -34,7 +34,7 @@ type RuntimeEnv struct {
 
 type MediaHandler interface {
 	NodeType() string
-	Execute(ctx context.Context, inputPath string, outputPath string, config map[string]any) error
+	Execute(ctx context.Context, inputPaths map[string]string, outputPath string, config map[string]any) (map[string]any, error)
 }
 
 type MediaTaskHandler struct {
@@ -65,19 +65,13 @@ func (h MediaTaskHandler) Execute(ctx context.Context, task TaskMessage) (NodeRe
 		return NodeResult{}, fmt.Errorf("mark node running: %w", err)
 	}
 
-	inputArtifactID, ok := task.InputArtifacts["input"].(string)
-	if !ok || inputArtifactID == "" {
-		return NodeResult{}, errors.New("missing input artifact on input port")
-	}
-	input, err := h.env.Store.GetArtifact(ctx, inputArtifactID)
-	if err != nil {
-		return NodeResult{}, fmt.Errorf("load input artifact: %w", err)
-	}
-	inputPath, cleanup, err := h.resolveInput(ctx, input)
+	inputs, cleanup, err := h.BuildInputMap(ctx, task.InputArtifacts)
 	if err != nil {
 		return NodeResult{}, err
 	}
 	defer cleanup()
+	handlerConfig := cloneConfig(task.Config)
+	handlerConfig["_input_artifact_meta"] = inputs.MediaInfo
 
 	ext := outputExtension(task.NodeType, task.Config)
 	filename := task.NodeExecutionID + ext
@@ -94,7 +88,7 @@ func (h MediaTaskHandler) Execute(ctx context.Context, task TaskMessage) (NodeRe
 		defer close(watchDone)
 		h.watchCancellation(execCtx, cancel, task.NodeExecutionID, cancelled)
 	}()
-	err = h.media.Execute(execCtx, inputPath, outputLocalPath, task.Config)
+	mediaInfo, err := h.media.Execute(execCtx, inputs.Paths, outputLocalPath, handlerConfig)
 	cancel()
 	<-watchDone
 	if err != nil {
@@ -123,12 +117,19 @@ func (h MediaTaskHandler) Execute(ctx context.Context, task TaskMessage) (NodeRe
 		FileSize:        info.Size(),
 		StorageBackend:  storageBackend,
 		StoragePath:     storagePath,
-		MediaInfo:       map[string]any{},
+		MediaInfo:       normalizeMediaInfo(mediaInfo),
 	})
 	if err != nil {
 		return NodeResult{}, fmt.Errorf("create artifact row: %w", err)
 	}
 	return NodeResult{OutputArtifactID: artifactID}, nil
+}
+
+func normalizeMediaInfo(mediaInfo map[string]any) map[string]any {
+	if mediaInfo == nil {
+		return map[string]any{}
+	}
+	return mediaInfo
 }
 
 func (h MediaTaskHandler) localRoot() string {

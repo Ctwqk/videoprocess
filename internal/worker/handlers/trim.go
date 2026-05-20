@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 
 	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
 )
@@ -40,13 +41,20 @@ func (h TrimHandler) Args(inputPath, outputPath string, config map[string]any) [
 	return args
 }
 
-func (h TrimHandler) Execute(ctx context.Context, inputPath, outputPath string, config map[string]any) error {
+func (h TrimHandler) Execute(ctx context.Context, inputPaths map[string]string, outputPath string, config map[string]any) (map[string]any, error) {
+	inputPath := inputPaths["input"]
+	if inputPath == "" {
+		return nil, errors.New("missing input path on input port")
+	}
 	runner := h.Runner
 	if runner.Binary == "" {
 		runner = vpffmpeg.NewRunner()
 	}
 	_, err := runner.Run(ctx, h.Args(inputPath, outputPath, config))
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{}, nil
 }
 
 // _ asserts the runner result return type so a future change to Runner.Run

@@ -17,6 +17,7 @@ import (
 type fakeTaskStore struct {
 	state        store.ExecutionState
 	input        store.ArtifactRow
+	artifacts    map[string]store.ArtifactRow
 	createdInput store.CreateArtifactInput
 	runningNode  string
 }
@@ -30,7 +31,14 @@ func (f *fakeTaskStore) MarkNodeRunning(_ context.Context, nodeExecutionID strin
 	return nil
 }
 
-func (f *fakeTaskStore) GetArtifact(context.Context, string) (store.ArtifactRow, error) {
+func (f *fakeTaskStore) GetArtifact(_ context.Context, id string) (store.ArtifactRow, error) {
+	if f.artifacts != nil {
+		artifact, ok := f.artifacts[id]
+		if !ok {
+			return store.ArtifactRow{}, errors.New("artifact not found")
+		}
+		return artifact, nil
+	}
 	return f.input, nil
 }
 
@@ -40,16 +48,189 @@ func (f *fakeTaskStore) CreateIntermediateArtifact(_ context.Context, in store.C
 }
 
 type fakeMediaHandler struct {
-	seenInput  string
+	seenInputs map[string]string
 	seenOutput string
+	seenConfig map[string]any
+	metadata   map[string]any
 }
 
 func (h *fakeMediaHandler) NodeType() string { return "trim" }
 
-func (h *fakeMediaHandler) Execute(ctx context.Context, inputPath string, outputPath string, config map[string]any) error {
-	h.seenInput = inputPath
+func (h *fakeMediaHandler) Execute(ctx context.Context, inputPaths map[string]string, outputPath string, config map[string]any) (map[string]any, error) {
+	h.seenInputs = inputPaths
 	h.seenOutput = outputPath
-	return os.WriteFile(outputPath, []byte("media"), 0o644)
+	h.seenConfig = config
+	return h.metadata, os.WriteFile(outputPath, []byte("media"), 0o644)
+}
+
+func TestBuildInputMapResolvesNamedPortsAndCopiesMediaInfo(t *testing.T) {
+	root := t.TempDir()
+	videoPath := filepath.Join(root, "video.mp4")
+	audioPath := filepath.Join(root, "audio.wav")
+	if err := os.WriteFile(videoPath, []byte("video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(audioPath, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	storeFake := &fakeTaskStore{
+		artifacts: map[string]store.ArtifactRow{
+			"video-artifact": {
+				ID:             "video-artifact",
+				Filename:       "video.mp4",
+				StorageBackend: "local",
+				StoragePath:    videoPath,
+				MediaInfo:      map[string]any{"width": 1920.0},
+			},
+			"audio-artifact": {
+				ID:             "audio-artifact",
+				Filename:       "audio.wav",
+				StorageBackend: "local",
+				StoragePath:    audioPath,
+				MediaInfo:      map[string]any{"channels": 2.0},
+			},
+		},
+	}
+	handler := NewMediaTaskHandler(RuntimeEnv{
+		Store:     storeFake,
+		Storage:   storage.LocalBackend{Root: root},
+		LocalRoot: root,
+	}, &fakeMediaHandler{})
+
+	inputs, cleanup, err := handler.BuildInputMap(context.Background(), map[string]any{
+		"video": "video-artifact",
+		"audio": "audio-artifact",
+	})
+	defer cleanup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inputs.Paths["video"] != videoPath || inputs.Paths["audio"] != audioPath {
+		t.Fatalf("paths = %#v", inputs.Paths)
+	}
+	videoMeta := inputs.MediaInfo["video"].(map[string]any)
+	audioMeta := inputs.MediaInfo["audio"].(map[string]any)
+	videoMeta["width"] = 1280.0
+	audioMeta["channels"] = 1.0
+	if storeFake.artifacts["video-artifact"].MediaInfo.(map[string]any)["width"] != 1920.0 {
+		t.Fatalf("video media info was not copied: %#v", storeFake.artifacts["video-artifact"].MediaInfo)
+	}
+	if storeFake.artifacts["audio-artifact"].MediaInfo.(map[string]any)["channels"] != 2.0 {
+		t.Fatalf("audio media info was not copied: %#v", storeFake.artifacts["audio-artifact"].MediaInfo)
+	}
+}
+
+type memoryStorage struct {
+	data map[string][]byte
+}
+
+func (s memoryStorage) Read(_ context.Context, path string) ([]byte, error) {
+	return s.data[path], nil
+}
+
+func (s memoryStorage) Save(context.Context, string, []byte) error {
+	return nil
+}
+
+func (s memoryStorage) Exists(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (s memoryStorage) Delete(context.Context, string) error {
+	return nil
+}
+
+func (s memoryStorage) LocalPath(string) (string, bool) {
+	return "", false
+}
+
+func TestBuildInputMapCleanupRemovesDownloadedInputs(t *testing.T) {
+	storeFake := &fakeTaskStore{
+		artifacts: map[string]store.ArtifactRow{
+			"remote-artifact": {
+				ID:             "remote-artifact",
+				Filename:       "remote.mp4",
+				StorageBackend: "minio",
+				StoragePath:    "bucket/remote.mp4",
+			},
+		},
+	}
+	handler := NewMediaTaskHandler(RuntimeEnv{
+		Store:   storeFake,
+		Storage: memoryStorage{data: map[string][]byte{"bucket/remote.mp4": []byte("remote")}},
+	}, &fakeMediaHandler{})
+
+	inputs, cleanup, err := handler.BuildInputMap(context.Background(), map[string]any{"input": "remote-artifact"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputPath := inputs.Paths["input"]
+	if _, err := os.Stat(inputPath); err != nil {
+		t.Fatalf("downloaded input was not written: %v", err)
+	}
+	cleanup()
+	if _, err := os.Stat(inputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("downloaded input was not cleaned up: %v", err)
+	}
+}
+
+func TestMediaTaskHandlerInjectsInputArtifactMetaIntoClonedConfig(t *testing.T) {
+	root := t.TempDir()
+	inputPath := filepath.Join(root, "input.mp4")
+	if err := os.WriteFile(inputPath, []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	originalConfig := map[string]any{"duration": "1", "output_format": "mp4"}
+	storeFake := &fakeTaskStore{
+		state: store.ExecutionState{
+			JobID:           "00000000-0000-0000-0000-000000000101",
+			NodeExecutionID: "00000000-0000-0000-0000-000000000201",
+			JobStatus:       contracts.JobStatusRunning,
+			NodeStatus:      contracts.NodeStatusQueued,
+		},
+		artifacts: map[string]store.ArtifactRow{
+			"input-artifact": {
+				ID:             "input-artifact",
+				Filename:       "input.mp4",
+				StorageBackend: "local",
+				StoragePath:    inputPath,
+				MediaInfo:      map[string]any{"duration": 3.5},
+			},
+		},
+	}
+	media := &fakeMediaHandler{metadata: map[string]any{"duration": 1.0}}
+	handler := NewMediaTaskHandler(RuntimeEnv{
+		Store:          storeFake,
+		Storage:        storage.LocalBackend{Root: root},
+		StorageBackend: "local",
+		LocalRoot:      root,
+		WorkerID:       "ffmpeg_go-worker@test:1",
+	}, media)
+
+	_, err := handler.Execute(context.Background(), TaskMessage{
+		JobID:           "00000000-0000-0000-0000-000000000101",
+		NodeExecutionID: "00000000-0000-0000-0000-000000000201",
+		NodeType:        "trim",
+		Config:          originalConfig,
+		InputArtifacts:  map[string]any{"input": "input-artifact"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, mutated := originalConfig["_input_artifact_meta"]; mutated {
+		t.Fatalf("task config was mutated: %#v", originalConfig)
+	}
+	metaByPort, ok := media.seenConfig["_input_artifact_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing input artifact meta in cloned config: %#v", media.seenConfig)
+	}
+	inputMeta := metaByPort["input"].(map[string]any)
+	if inputMeta["duration"] != 3.5 {
+		t.Fatalf("input meta = %#v", inputMeta)
+	}
+	if storeFake.createdInput.MediaInfo.(map[string]any)["duration"] != 1.0 {
+		t.Fatalf("created media info = %#v", storeFake.createdInput.MediaInfo)
+	}
 }
 
 func TestMediaTaskHandlerCreatesArtifactResult(t *testing.T) {
@@ -100,8 +281,8 @@ func TestMediaTaskHandlerCreatesArtifactResult(t *testing.T) {
 	if storeFake.createdInput.StorageBackend != "local" || storeFake.createdInput.StoragePath == "" {
 		t.Fatalf("created artifact = %#v", storeFake.createdInput)
 	}
-	if media.seenInput != inputPath {
-		t.Fatalf("input path = %q", media.seenInput)
+	if media.seenInputs["input"] != inputPath {
+		t.Fatalf("input path = %q", media.seenInputs["input"])
 	}
 }
 
@@ -126,10 +307,10 @@ type blockingMediaHandler struct {
 
 func (h *blockingMediaHandler) NodeType() string { return "trim" }
 
-func (h *blockingMediaHandler) Execute(ctx context.Context, inputPath string, outputPath string, config map[string]any) error {
+func (h *blockingMediaHandler) Execute(ctx context.Context, inputPaths map[string]string, outputPath string, config map[string]any) (map[string]any, error) {
 	<-ctx.Done()
 	close(h.cancelled)
-	return ctx.Err()
+	return nil, ctx.Err()
 }
 
 func TestMediaTaskHandlerCancelsDuringExecutionWhenStateChanges(t *testing.T) {

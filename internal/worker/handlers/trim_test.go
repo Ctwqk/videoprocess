@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
@@ -32,5 +33,16 @@ func TestTrimArgsMatchPythonHandler(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %#v", got)
+	}
+}
+
+func TestTrimExecuteReadsInputPortAndReturnsNoMetadata(t *testing.T) {
+	handler := TrimHandler{Runner: vpffmpeg.Runner{Binary: "true"}}
+	metadata, err := handler.Execute(context.Background(), map[string]string{"input": "/input.mp4"}, "/output.mp4", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata) != 0 {
+		t.Fatalf("metadata = %#v", metadata)
 	}
 }
