@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -45,4 +46,12 @@ func TestDetailRowsExposePythonCompatibleJSONKeys(t *testing.T) {
 	assertJSONKey("asset", asset, "original_name")
 	assertJSONKey("artifact", artifact, "node_execution_id")
 	assertJSONKey("job", job, "node_executions")
+}
+
+func TestStoreConflictClassifier(t *testing.T) {
+	err := fmt.Errorf("%w: pipeline is referenced", ErrConflict)
+
+	if !IsConflict(err) {
+		t.Fatalf("IsConflict(%v) = false", err)
+	}
 }

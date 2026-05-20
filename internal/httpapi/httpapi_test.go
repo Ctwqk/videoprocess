@@ -167,6 +167,74 @@ func TestValidatePipelineRejectsMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestPipelineCreateRejectsUnsupportedGraphBeforeStore(t *testing.T) {
+	body := `{
+		"name": "python-owned",
+		"description": "",
+		"is_template": false,
+		"template_tags": [],
+		"definition": {
+			"nodes": [
+				{"id":"search_1","type":"youtube_search","position":{},"data":{"label":"Search","config":{}}}
+			],
+			"edges": [],
+			"viewport": {"x":0,"y":0,"zoom":1}
+		}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/pipelines", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Python") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestPipelineCreateRequiresStoreAfterValidation(t *testing.T) {
+	body := `{
+		"name": "go-owned",
+		"description": "",
+		"is_template": false,
+		"template_tags": [],
+		"definition": {
+			"nodes": [
+				{"id":"source_1","type":"source","position":{},"data":{"label":"Source","asset_id":"00000000-0000-0000-0000-000000000001","config":{}}},
+				{"id":"export_1","type":"export","position":{},"data":{"label":"Export","config":{}}}
+			],
+			"edges": [
+				{"id":"edge_1","source":"source_1","target":"export_1","sourceHandle":"output","targetHandle":"input"}
+			],
+			"viewport": {"x":0,"y":0,"zoom":1}
+		}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/pipelines", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPipelineCreateRejectsMalformedJSON(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/pipelines", strings.NewReader("{"))
+	rec := httptest.NewRecorder()
+
+	NewServer().Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"detail"`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
 func TestReadyzReportsHealthyDependencies(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()

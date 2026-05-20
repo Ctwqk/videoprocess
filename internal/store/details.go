@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -168,8 +167,4 @@ func (s *Store) listNodeExecutions(ctx context.Context, jobID string) ([]NodeExe
 		return nil, err
 	}
 	return items, nil
-}
-
-func IsNotFound(err error) bool {
-	return err == pgx.ErrNoRows
 }
