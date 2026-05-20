@@ -65,6 +65,31 @@ func TestRecoveryResetsStaleQueuedNode(t *testing.T) {
 	}
 }
 
+func TestRecoveryFinalizesTerminalJobInsteadOfDispatching(t *testing.T) {
+	store := &fakeRecoveryStore{jobs: []JobView{{
+		ID:                "job-terminal",
+		Status:            "RUNNING",
+		OrchestratorOwner: "go",
+		Nodes: []NodeExecutionView{
+			{ID: "source-exec", NodeID: "source", Status: "SUCCEEDED", OutputArtifactID: "artifact-source"},
+			{ID: "encode-exec", NodeID: "encode", Status: "SUCCEEDED", OutputArtifactID: "artifact-encode"},
+		},
+	}}}
+	engine := &fakeRecoveryEngine{}
+	runner := testRecoveryRunner(store, engine)
+
+	if err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(engine.started, []string{"job-terminal"}) {
+		t.Fatalf("started jobs = %#v; want [job-terminal]", engine.started)
+	}
+	if engine.recoveryDispatches != 0 {
+		t.Fatalf("recovery dispatches = %d; want 0", engine.recoveryDispatches)
+	}
+}
+
 func TestRecoveryReturnsStartJobError(t *testing.T) {
 	store := &fakeRecoveryStore{jobs: []JobView{{ID: "job-1", Status: "RUNNING", OrchestratorOwner: "go"}}}
 	engine := &fakeRecoveryEngine{err: errors.New("dispatch failed")}
@@ -103,8 +128,9 @@ func (s *fakeRecoveryStore) ResetStaleGoNodes(_ context.Context, jobID string, s
 }
 
 type fakeRecoveryEngine struct {
-	started []string
-	err     error
+	started            []string
+	recoveryDispatches int
+	err                error
 }
 
 func (e *fakeRecoveryEngine) StartJob(_ context.Context, jobID string) error {

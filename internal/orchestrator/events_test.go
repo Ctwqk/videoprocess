@@ -78,6 +78,52 @@ func TestEventListenerDoesNotAckWhenEngineFails(t *testing.T) {
 	}
 }
 
+func TestEventListenerAcksPythonOwnedEventAfterGuard(t *testing.T) {
+	ctx := context.Background()
+	client, _ := newEventRedis(t)
+	engine := newFakeEventEngine()
+	engine.err = ErrNonGoEvent
+	listener := testEventListener(client, engine)
+	listener.BlockTimeout = 25 * time.Millisecond
+
+	if err := listener.EnsureGroup(ctx); err != nil {
+		t.Fatalf("EnsureGroup: %v", err)
+	}
+	msgID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: "vp:events:go",
+		Values: map[string]any{
+			"event":              "node_completed",
+			"job_id":             "python-owned-job",
+			"node_execution_id":  "node-exec-1",
+			"output_artifact_id": "artifact-1",
+			"orchestrator_owner": "python",
+		},
+	}).Result()
+	if err != nil {
+		t.Fatalf("xadd: %v", err)
+	}
+
+	runEventListenerUntil(t, listener, func() bool {
+		if engine.callCount() != 1 {
+			return false
+		}
+		pending, err := client.XPending(ctx, "vp:events:go", "orchestrator-go").Result()
+		if err != nil || pending.Count != 0 {
+			return false
+		}
+		groups, err := client.XInfoGroups(ctx, "vp:events:go").Result()
+		if err != nil || len(groups) != 1 {
+			return false
+		}
+		return groups[0].LastDeliveredID == msgID
+	})
+
+	if got := engine.callCount(); got != 1 {
+		t.Fatalf("engine call count = %d; want 1", got)
+	}
+	assertNoEventPending(t, client)
+}
+
 func TestEventListenerReclaimsPendingEvents(t *testing.T) {
 	ctx := context.Background()
 	client, _ := newEventRedis(t)

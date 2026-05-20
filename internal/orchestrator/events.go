@@ -17,6 +17,8 @@ const (
 	defaultGoReclaimMinIdle       = 5 * time.Minute
 )
 
+var ErrNonGoEvent = errors.New("non-Go orchestrator event ignored")
+
 type NodeEventHandler interface {
 	OnNodeCompleted(ctx context.Context, jobID string, nodeExecutionID string, outputArtifactID string) error
 	OnNodeFailed(ctx context.Context, jobID string, nodeExecutionID string, errorMessage string) error
@@ -158,6 +160,11 @@ func (l *EventListener) handle(ctx context.Context, msg redis.XMessage) error {
 			return errors.New("event listener engine is nil")
 		}
 		if err := l.Engine.OnNodeCompleted(ctx, jobID, nodeExecutionID, outputArtifactID); err != nil {
+			if errors.Is(err, ErrNonGoEvent) {
+				observeGoOrchestratorEvent(eventName, "ignored")
+				l.logger().Warn("ignored non-Go node_completed event", "msg_id", msg.ID, "job_id", jobID)
+				return nil
+			}
 			return err
 		}
 		observeGoOrchestratorEvent(eventName, "handled")
@@ -179,6 +186,11 @@ func (l *EventListener) handle(ctx context.Context, msg redis.XMessage) error {
 			return errors.New("event listener engine is nil")
 		}
 		if err := l.Engine.OnNodeFailed(ctx, jobID, nodeExecutionID, errorMessage); err != nil {
+			if errors.Is(err, ErrNonGoEvent) {
+				observeGoOrchestratorEvent(eventName, "ignored")
+				l.logger().Warn("ignored non-Go node_failed event", "msg_id", msg.ID, "job_id", jobID)
+				return nil
+			}
 			return err
 		}
 		observeGoOrchestratorEvent(eventName, "handled")
