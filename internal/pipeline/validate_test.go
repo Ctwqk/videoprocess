@@ -62,7 +62,7 @@ func TestValidateFlagsMissingAssetOnSourceNode(t *testing.T) {
 	}
 }
 
-func TestValidateAcceptsSourceWithAssetID(t *testing.T) {
+func TestValidateTopLevelSourceAssetStillRequiresConfigParam(t *testing.T) {
 	def := contracts.PipelineDefinition{
 		Nodes: []contracts.PipelineNode{
 			{
@@ -74,7 +74,10 @@ func TestValidateAcceptsSourceWithAssetID(t *testing.T) {
 	}
 	result := Validate(def)
 	if hasError(result, "missing_asset") {
-		t.Fatalf("source with asset_id should not flag missing_asset: %#v", result.Errors)
+		t.Fatalf("top-level asset_id should not flag missing_asset: %#v", result.Errors)
+	}
+	if !hasError(result, "invalid_param") {
+		t.Fatalf("top-level asset_id should still require config.asset_id param: %#v", result.Errors)
 	}
 }
 
@@ -94,6 +97,57 @@ func TestValidateAcceptsSourceAssetInConfig(t *testing.T) {
 	result := Validate(def)
 	if hasError(result, "missing_asset") {
 		t.Fatalf("config.asset_id binding should satisfy missing_asset: %#v", result.Errors)
+	}
+}
+
+func TestValidateRejectsUnsupportedPythonOwnedGraph(t *testing.T) {
+	def := contracts.PipelineDefinition{
+		Nodes: []contracts.PipelineNode{
+			{
+				ID:   "search_1",
+				Type: "youtube_search",
+				Data: contracts.PipelineNodeData{Label: "YouTube Search"},
+			},
+		},
+	}
+
+	result := Validate(def)
+
+	if result.Valid {
+		t.Fatal("expected validation to fail")
+	}
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected exactly one error, got %#v", result.Errors)
+	}
+	err := result.Errors[0]
+	if err.Type != "unsupported_go_validation" {
+		t.Fatalf("error type = %q", err.Type)
+	}
+	if err.NodeID == nil || *err.NodeID != "search_1" {
+		t.Fatalf("node_id = %#v", err.NodeID)
+	}
+	expected := "Go validator does not own validation for node type 'youtube_search'; route this graph to Python"
+	if err.Message != expected {
+		t.Fatalf("message = %q", err.Message)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("warnings = %#v", result.Warnings)
+	}
+}
+
+func TestValidateAcceptsFirstWaveFFmpegGraph(t *testing.T) {
+	def := firstWaveFFmpegGraph()
+
+	result := Validate(def)
+
+	if !result.Valid {
+		t.Fatalf("result.Valid = false, errors = %#v", result.Errors)
+	}
+	if len(result.Errors) != 0 {
+		t.Fatalf("errors = %#v", result.Errors)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("warnings = %#v", result.Warnings)
 	}
 }
 
@@ -120,6 +174,31 @@ func TestValidateFlagsDuplicateInputPort(t *testing.T) {
 	result := Validate(def)
 	if !hasError(result, "duplicate_input_port") {
 		t.Fatalf("expected duplicate_input_port, got %#v", result.Errors)
+	}
+}
+
+func firstWaveFFmpegGraph() contracts.PipelineDefinition {
+	return contracts.PipelineDefinition{
+		Nodes: []contracts.PipelineNode{
+			{
+				ID:   "source_1",
+				Type: "source",
+				Data: contracts.PipelineNodeData{
+					Label:   "Source",
+					AssetID: ptr("00000000-0000-0000-0000-000000000001"),
+					Config:  map[string]any{"asset_id": "00000000-0000-0000-0000-000000000001"},
+				},
+			},
+			{ID: "crop_1", Type: "vertical_crop", Data: contracts.PipelineNodeData{Label: "Vertical Crop"}},
+			{ID: "title_1", Type: "title_overlay", Data: contracts.PipelineNodeData{Label: "Title Overlay"}},
+			{ID: "export_1", Type: "export", Data: contracts.PipelineNodeData{Label: "Export"}},
+		},
+		Edges: []contracts.PipelineEdge{
+			{ID: "edge_1", Source: "source_1", Target: "crop_1", SourceHandle: "output", TargetHandle: "input"},
+			{ID: "edge_2", Source: "crop_1", Target: "title_1", SourceHandle: "output", TargetHandle: "input"},
+			{ID: "edge_3", Source: "title_1", Target: "export_1", SourceHandle: "output", TargetHandle: "input"},
+		},
+		Viewport: map[string]float64{"x": 0, "y": 0, "zoom": 1},
 	}
 }
 

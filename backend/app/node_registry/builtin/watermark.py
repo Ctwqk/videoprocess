@@ -6,6 +6,7 @@ DEFINITION = NodeTypeDefinition(
     category="transform",
     description="Add an image watermark overlay to a video",
     icon="image",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="video", port_type=PortType.VIDEO, description="Input video"),
         PortDefinition(name="overlay", port_type=PortType.IMAGE, description="Watermark image"),

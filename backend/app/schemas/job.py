@@ -58,6 +58,7 @@ class JobResponse(BaseModel):
     error_message: str | None
     submitted_by: str
     retry_count: int
+    orchestrator_owner: str = "python"
 
 
 class JobDetailResponse(JobResponse):

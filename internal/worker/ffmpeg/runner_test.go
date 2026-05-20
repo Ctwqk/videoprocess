@@ -3,7 +3,9 @@ package ffmpeg
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"testing"
@@ -45,11 +47,74 @@ func TestRunMissingBinaryDoesNotPanic(t *testing.T) {
 	}
 }
 
+func TestProbeParsesJSONMetadata(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "fake-ffprobe.sh")
+	script := "#!/bin/sh\n" +
+		"cat <<'JSON'\n" +
+		"{\"streams\":[{\"codec_type\":\"video\",\"width\":1920,\"height\":1080},{\"codec_type\":\"audio\"}],\"format\":{\"duration\":\"12.500000\"}}\n" +
+		"JSON\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Runner{ProbeBinary: scriptPath}.Probe(context.Background(), "/input.mp4")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.HasAudio() {
+		t.Fatalf("expected audio stream: %#v", result.Streams)
+	}
+	if got := result.DurationSeconds(); got != 12.5 {
+		t.Fatalf("duration = %v", got)
+	}
+}
+
+func TestProbeExitErrorReturnsEmptyResult(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "fake-ffprobe.sh")
+	script := "#!/bin/sh\n" +
+		"echo 'probe failed' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Runner{ProbeBinary: scriptPath}.Probe(context.Background(), "/input.mp4")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.HasAudio() || result.DurationSeconds() != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestCountVideoFramesParsesFrameCount(t *testing.T) {
+	root := t.TempDir()
+	scriptPath := filepath.Join(root, "fake-ffprobe.sh")
+	script := "#!/bin/sh\n" +
+		"printf '37\\n'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := Runner{ProbeBinary: scriptPath}.CountVideoFrames(context.Background(), "/input.mp4")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 37 {
+		t.Fatalf("count = %d", count)
+	}
+}
+
 func TestIsGPUCapacityErrorDetectsKnownIndicators(t *testing.T) {
 	cases := map[string]bool{
-		"":                                              false,
-		"frame=  120 fps=30 q=23.0 size=":              false,
-		"OpenEncodeSessionEx failed: out of memory":    true,
+		"":                                false,
+		"frame=  120 fps=30 q=23.0 size=": false,
+		"OpenEncodeSessionEx failed: out of memory":     true,
 		"No NVENC capable devices found":                true,
 		"Cannot init CUDA":                              true,
 		"videotoolbox encoder error":                    true,
@@ -76,6 +141,32 @@ func TestRewriteHardwareArgsForCPUMapsNVENCToLibx264(t *testing.T) {
 		"-crf", "21",
 		"-preset", "fast",
 		"-pix_fmt", "yuv420p",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rewrite = %#v\nwant   %#v", got, want)
+	}
+}
+
+func TestRewriteHardwareArgsForCPUInsertsCRFAfterCodecInRealHandlerArgs(t *testing.T) {
+	in := []string{
+		"-i", "/input.mp4",
+		"-map", "0:v:0",
+		"-map", "0:a?",
+		"-c:v", "h264_nvenc",
+		"-rc:v", "vbr",
+		"-cq:v", "23",
+		"-preset", "slow",
+		"/output.mp4",
+	}
+	got := RewriteHardwareArgsForCPU(in)
+	want := []string{
+		"-i", "/input.mp4",
+		"-map", "0:v:0",
+		"-map", "0:a?",
+		"-c:v", "libx264",
+		"-crf", "21",
+		"-preset", "slow",
+		"/output.mp4",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("rewrite = %#v\nwant   %#v", got, want)

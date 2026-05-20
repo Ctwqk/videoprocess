@@ -3,9 +3,12 @@ package ffmpeg
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -24,6 +27,9 @@ type RunResult struct {
 
 type Runner struct {
 	Binary string
+	// ProbeBinary runs ffprobe for metadata lookup. Defaults to ffprobe when
+	// unset, or a sibling ffprobe binary when Binary points at an ffmpeg path.
+	ProbeBinary string
 	// PreArgs is prepended before user-supplied args. Defaults to the
 	// ffmpeg flags `-y -hide_banner` when the runner is constructed via
 	// NewRunner; tests may set it to nil to use other binaries.
@@ -31,7 +37,7 @@ type Runner struct {
 }
 
 func NewRunner() Runner {
-	return Runner{Binary: "ffmpeg", PreArgs: []string{"-y", "-hide_banner"}}
+	return Runner{Binary: "ffmpeg", ProbeBinary: "ffprobe", PreArgs: []string{"-y", "-hide_banner"}}
 }
 
 // Run executes ffmpeg with the supplied args. On non-zero exit it returns
@@ -39,6 +45,7 @@ func NewRunner() Runner {
 // RunResult.GPUCapacity is true when stderr looks like an NVENC/VideoToolbox
 // capacity error, so the caller can fall back to a CPU encoder.
 func (r Runner) Run(ctx context.Context, args []string) (RunResult, error) {
+	ffmpegRunsTotal.Inc()
 	binary := r.Binary
 	if binary == "" {
 		binary = "ffmpeg"
@@ -56,6 +63,7 @@ func (r Runner) Run(ctx context.Context, args []string) (RunResult, error) {
 	if err == nil {
 		return result, nil
 	}
+	ffmpegFailuresTotal.Inc()
 
 	// If the context was cancelled, exec returns either context.Canceled or
 	// a *exec.ExitError after exec.CommandContext sent SIGKILL. Treat both
@@ -68,7 +76,133 @@ func (r Runner) Run(ctx context.Context, args []string) (RunResult, error) {
 	}
 
 	result.GPUCapacity = IsGPUCapacityError(result.Stderr)
+	if result.GPUCapacity {
+		ffmpegGPUFallbacksTotal.Inc()
+	}
 	return result, fmt.Errorf("ffmpeg failed: %w: %s", err, tail(result.Stderr, 2000))
+}
+
+type ProbeResult struct {
+	Streams []ProbeStream `json:"streams"`
+	Format  ProbeFormat   `json:"format"`
+}
+
+type ProbeStream struct {
+	CodecType string `json:"codec_type"`
+	Width     int    `json:"width,omitempty"`
+	Height    int    `json:"height,omitempty"`
+}
+
+type ProbeFormat struct {
+	Duration string `json:"duration"`
+}
+
+func (r Runner) Probe(ctx context.Context, inputPath string) (ProbeResult, error) {
+	binary := r.probeBinary()
+	cmd := exec.CommandContext(ctx, binary,
+		"-v", "error",
+		"-show_streams",
+		"-show_format",
+		"-of", "json",
+		inputPath,
+	)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ProbeResult{}, fmt.Errorf("%w: %v", ErrCancelled, ctxErr)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return ProbeResult{}, fmt.Errorf("%w: %v", ErrCancelled, err)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return ProbeResult{}, nil
+		}
+		return ProbeResult{}, fmt.Errorf("ffprobe failed: %w: %s", err, tail(stderr.String(), 2000))
+	}
+	var result ProbeResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return ProbeResult{}, nil
+	}
+	return result, nil
+}
+
+func (r Runner) probeBinary() string {
+	if r.ProbeBinary != "" {
+		return r.ProbeBinary
+	}
+	if r.Binary == "" || r.Binary == "ffmpeg" {
+		return "ffprobe"
+	}
+	dir := filepath.Dir(r.Binary)
+	base := filepath.Base(r.Binary)
+	if base == "ffmpeg" {
+		return filepath.Join(dir, "ffprobe")
+	}
+	if strings.Contains(base, "ffmpeg") {
+		return filepath.Join(dir, strings.Replace(base, "ffmpeg", "ffprobe", 1))
+	}
+	return "ffprobe"
+}
+
+func (p ProbeResult) HasAudio() bool {
+	for _, stream := range p.Streams {
+		if stream.CodecType == "audio" {
+			return true
+		}
+	}
+	return false
+}
+
+func (p ProbeResult) DurationSeconds() float64 {
+	if p.Format.Duration == "" {
+		return 0
+	}
+	value, err := strconv.ParseFloat(p.Format.Duration, 64)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+func (r Runner) CountVideoFrames(ctx context.Context, inputPath string) (int, error) {
+	binary := r.probeBinary()
+	cmd := exec.CommandContext(ctx, binary,
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-count_frames",
+		"-show_entries", "stream=nb_read_frames",
+		"-of", "default=nokey=1:noprint_wrappers=1",
+		inputPath,
+	)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, fmt.Errorf("%w: %v", ErrCancelled, ctxErr)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return 0, fmt.Errorf("%w: %v", ErrCancelled, err)
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("ffprobe count frames failed: %w: %s", err, tail(stderr.String(), 2000))
+	}
+	raw := strings.TrimSpace(stdout.String())
+	count, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, nil
+	}
+	return count, nil
 }
 
 // gpuCapacityIndicators mirrors the keyword list in
@@ -150,9 +284,12 @@ func RewriteHardwareArgsForCPU(args []string) []string {
 	}
 	if removedCQ != "" && !hasCRF {
 		mapped := nvencCQToLibx264CRF(removedCQ)
-		insertAt := 0
-		if len(rewritten) >= 2 && rewritten[0] == "-c:v" {
-			insertAt = 2
+		insertAt := len(rewritten)
+		for i := 0; i+1 < len(rewritten); i++ {
+			if rewritten[i] == "-c:v" && (rewritten[i+1] == "libx264" || rewritten[i+1] == "libx265") {
+				insertAt = i + 2
+				break
+			}
 		}
 		rewritten = append(rewritten[:insertAt], append([]string{"-crf", mapped}, rewritten[insertAt:]...)...)
 	}

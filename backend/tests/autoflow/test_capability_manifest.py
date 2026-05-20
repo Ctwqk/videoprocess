@@ -30,7 +30,7 @@ def test_manifest_preserves_registry_ports_params_and_worker_type():
     assert trim.inputs[0].name == "input"
     assert trim.outputs[0].name == "output"
     assert {param.name for param in trim.params} >= {"start_time", "duration"}
-    assert trim.worker_type == "ffmpeg"
+    assert trim.worker_type == "ffmpeg_go"
 
 
 def test_manifest_exposes_supported_source_platforms():

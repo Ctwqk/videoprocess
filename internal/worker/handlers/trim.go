@@ -2,12 +2,17 @@ package handlers
 
 import (
 	"context"
+	"errors"
 
 	vpffmpeg "github.com/Ctwqk/videoprocess/internal/worker/ffmpeg"
 )
 
 type TrimHandler struct {
 	Runner vpffmpeg.Runner
+}
+
+func (h TrimHandler) NodeType() string {
+	return "trim"
 }
 
 func (h TrimHandler) Args(inputPath, outputPath string, config map[string]any) []string {
@@ -26,32 +31,22 @@ func (h TrimHandler) Args(inputPath, outputPath string, config map[string]any) [
 		args = append(args, "-t", duration)
 	}
 	args = append(args, "-map", "0:v:0", "-map", "0:a?")
-	args = append(args, vpffmpeg.VideoEncodeArgs(vpffmpeg.EncodeConfig{
-		Codec:         "libx264",
-		Preset:        "slow",
-		CRF:           18,
-		MP4Compatible: true,
-	})...)
+	args = append(args, intermediateVideoEncodeArgs("libx264")...)
 	args = append(args, "-c:a", "aac", outputPath)
 	return args
 }
 
-func (h TrimHandler) Execute(ctx context.Context, inputPath, outputPath string, config map[string]any) error {
-	runner := h.Runner
-	if runner.Binary == "" {
-		runner = vpffmpeg.NewRunner()
+func (h TrimHandler) Execute(ctx context.Context, inputPaths map[string]string, outputPath string, config map[string]any) (map[string]any, error) {
+	inputPath := inputPaths["input"]
+	if inputPath == "" {
+		return nil, errors.New("missing input path on input port")
 	}
-	_, err := runner.Run(ctx, h.Args(inputPath, outputPath, config))
-	return err
+	if err := runFFmpeg(ctx, h.Runner, h.Args(inputPath, outputPath, config)); err != nil {
+		return nil, err
+	}
+	return map[string]any{}, nil
 }
 
 // _ asserts the runner result return type so a future change to Runner.Run
 // breaks here loudly rather than silently shadowing the new field.
 var _ = vpffmpeg.RunResult{}
-
-func stringValue(value any, fallback string) string {
-	if raw, ok := value.(string); ok {
-		return raw
-	}
-	return fallback
-}

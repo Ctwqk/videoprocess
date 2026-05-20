@@ -6,6 +6,7 @@ DEFINITION = NodeTypeDefinition(
     category="audio",
     description="Add background music to a video",
     icon="music",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="video", port_type=PortType.VIDEO, description="Input video"),
         PortDefinition(name="audio", port_type=PortType.AUDIO, description="Background music"),

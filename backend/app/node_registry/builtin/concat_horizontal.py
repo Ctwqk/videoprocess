@@ -6,6 +6,7 @@ DEFINITION = NodeTypeDefinition(
     category="combine",
     description="Place two videos side by side horizontally",
     icon="columns",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="video_left", port_type=PortType.VIDEO, description="Left video"),
         PortDefinition(name="video_right", port_type=PortType.VIDEO, description="Right video"),

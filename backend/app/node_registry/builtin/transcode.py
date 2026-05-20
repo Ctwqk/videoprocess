@@ -6,6 +6,7 @@ DEFINITION = NodeTypeDefinition(
     category="output",
     description="Transcode video to a different format or codec",
     icon="file-output",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="input", port_type=PortType.VIDEO, description="Input video"),
     ],

@@ -20,73 +20,58 @@ type PortDefinition struct {
 	Description string   `json:"description"`
 }
 
+type ParamDefinition struct {
+	Name        string `json:"name"`
+	ParamType   string `json:"param_type"`
+	Required    bool   `json:"required"`
+	Default     any    `json:"default"`
+	Options     []any  `json:"options"`
+	MinValue    any    `json:"min_value"`
+	MaxValue    any    `json:"max_value"`
+	Description string `json:"description"`
+}
+
 type NodeTypeDefinition struct {
-	TypeName    string           `json:"type_name"`
-	DisplayName string           `json:"display_name"`
-	Category    string           `json:"category"`
-	Inputs      []PortDefinition `json:"inputs"`
-	Outputs     []PortDefinition `json:"outputs"`
-	WorkerType  string           `json:"worker_type"`
+	TypeName    string            `json:"type_name"`
+	DisplayName string            `json:"display_name"`
+	Category    string            `json:"category"`
+	Description string            `json:"description"`
+	Icon        string            `json:"icon"`
+	Inputs      []PortDefinition  `json:"inputs"`
+	Outputs     []PortDefinition  `json:"outputs"`
+	Params      []ParamDefinition `json:"params"`
+	WorkerType  string            `json:"worker_type"`
 }
 
 func BuiltinRegistry() map[string]NodeTypeDefinition {
-	return map[string]NodeTypeDefinition{
-		"source": {
-			TypeName:    "source",
-			DisplayName: "Source",
-			Category:    "source",
-			WorkerType:  "none",
-			Outputs: []PortDefinition{
-				{Name: "output", PortType: PortAnyMedia, Required: true},
-			},
-		},
-		"trim": {
-			TypeName:    "trim",
-			DisplayName: "Trim",
-			Category:    "transform",
-			WorkerType:  "ffmpeg",
-			Inputs: []PortDefinition{
-				{Name: "input", PortType: PortVideo, Required: true},
-			},
-			Outputs: []PortDefinition{
-				{Name: "output", PortType: PortVideo, Required: true},
-			},
-		},
-		"transcode": {
-			TypeName:    "transcode",
-			DisplayName: "Transcode",
-			Category:    "transform",
-			WorkerType:  "ffmpeg",
-			Inputs: []PortDefinition{
-				{Name: "input", PortType: PortAnyMedia, Required: true},
-			},
-			Outputs: []PortDefinition{
-				{Name: "output", PortType: PortAnyMedia, Required: true},
-			},
-		},
-		"export": {
-			TypeName:    "export",
-			DisplayName: "Export",
-			Category:    "output",
-			WorkerType:  "ffmpeg",
-			Inputs: []PortDefinition{
-				{Name: "input", PortType: PortAnyMedia, Required: true},
-			},
-			Outputs: []PortDefinition{
-				{Name: "output", PortType: PortAnyMedia, Required: true},
-			},
-		},
-		"smart_trim": {
-			TypeName:    "smart_trim",
-			DisplayName: "Smart Trim",
-			Category:    "ai_transform",
-			WorkerType:  "vision",
-			Inputs: []PortDefinition{
-				{Name: "input", PortType: PortVideo, Required: true},
-			},
-			Outputs: []PortDefinition{
-				{Name: "output", PortType: PortVideo, Required: true},
-			},
-		},
+	registry, err := loadBuiltinRegistryManifest()
+	if err != nil {
+		panic(err)
 	}
+	return registry
+}
+
+type nodeRegistryManifest struct {
+	SchemaVersion int                  `json:"schema_version"`
+	NodeTypes     []NodeTypeDefinition `json:"node_types"`
+}
+
+func registryFromManifest(manifest nodeRegistryManifest) (map[string]NodeTypeDefinition, error) {
+	if manifest.SchemaVersion != 1 {
+		return nil, errInvalidRegistryManifest("unsupported schema_version")
+	}
+	if len(manifest.NodeTypes) == 0 {
+		return nil, errInvalidRegistryManifest("node_types must not be empty")
+	}
+	registry := make(map[string]NodeTypeDefinition, len(manifest.NodeTypes))
+	for _, node := range manifest.NodeTypes {
+		if node.TypeName == "" {
+			return nil, errInvalidRegistryManifest("node type missing type_name")
+		}
+		if _, ok := registry[node.TypeName]; ok {
+			return nil, errInvalidRegistryManifest("duplicate node type " + node.TypeName)
+		}
+		registry[node.TypeName] = node
+	}
+	return registry, nil
 }

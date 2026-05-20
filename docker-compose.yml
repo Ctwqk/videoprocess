@@ -120,6 +120,11 @@ services:
       PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
       X_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8898
       XIAOHONGSHU_PLATFORM_BROWSER_MANAGER_URL: http://host.docker.internal:8897
+      VP_GO_ORCHESTRATOR_ENABLED: ${VP_GO_ORCHESTRATOR_ENABLED:-true}
+      VP_GO_ORCHESTRATOR_JOB_WRITES: ${VP_GO_ORCHESTRATOR_JOB_WRITES:-true}
+      VP_GO_EVENT_STREAM: ${VP_GO_EVENT_STREAM:-vp:events:go}
+      VP_GO_ORCHESTRATOR_RECOVERY_INTERVAL_SECONDS: ${VP_GO_ORCHESTRATOR_RECOVERY_INTERVAL_SECONDS:-60}
+      VP_GO_ORCHESTRATOR_STALE_NODE_SECONDS: ${VP_GO_ORCHESTRATOR_STALE_NODE_SECONDS:-600}
       API_PORT: "8080"
     volumes:
       - ${VP_STORAGE_ROOT:-./k8s-data/storage}:/data/storage
@@ -215,8 +220,11 @@ services:
       DATABASE_URL: ${VP_DATABASE_URL_GO:-postgres://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@host.docker.internal:5435/videoprocess}
       VIDEO_USE_GPU: ${VIDEO_USE_GPU:-false}
       VIDEO_GPU_FALLBACK_TO_CPU: ${VIDEO_GPU_FALLBACK_TO_CPU:-true}
+      WORKER_METRICS_ADDR: ":9091"
     volumes:
       - ${VP_STORAGE_ROOT:-./k8s-data/storage}:/data/storage
+    ports:
+      - "${FFMPEG_WORKER_GO_METRICS_PORT:-19091}:9091"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

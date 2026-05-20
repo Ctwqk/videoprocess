@@ -14,6 +14,7 @@ Run API parity in strict mode after both services are healthy:
 
 ```bash
 VP_GO_PARITY_STRICT=1 python3 -m pytest tests/go_migration/test_go_api_parity.py -q
+VP_GO_PARITY_STRICT=1 python3 -m pytest tests/go_migration/test_go_api_read_parity.py -q
 ```
 
 CI must use strict mode. Without `VP_GO_PARITY_STRICT=1` an unreachable service is reported as `skip`, which is convenient for local runs but silently hides regressions in CI. The strict guard belongs in whatever script invokes the parity suite.
@@ -42,6 +43,25 @@ docker compose logs --tail=100 ffmpeg-worker-go
 ```
 
 Healthy startup logs `starting vp-ffmpeg-worker-go worker_type=ffmpeg_go worker_id=...`. The worker creates the `ffmpeg_go-workers` consumer group on first run. Until a node registry entry switches to `ffmpeg_go`, the Go worker idles on an empty stream — that is expected, not a bug.
+
+The worker now registers the `trim` task handler. It still consumes only
+`vp:tasks:ffmpeg_go`; no live jobs reach it until the Python node registry
+switches `trim.worker_type` to `ffmpeg_go`.
+
+Before any registry switch, confirm:
+
+```bash
+go test ./internal/worker ./internal/worker/handlers ./cmd/vp-ffmpeg-worker
+docker compose up -d --build ffmpeg-worker-go
+docker compose logs --tail=100 ffmpeg-worker-go
+```
+
+After the `trim` registry switch, run the mixed-mode smoke. The test creates
+and uploads a small fixture video when `VP_GO_SMOKE_ASSET_ID` is not provided:
+
+```bash
+VP_GO_WORKER_SMOKE_STRICT=1 python3 -m pytest tests/go_migration/test_go_trim_worker_smoke.py -q
+```
 
 ## GPU Sidecar Start
 

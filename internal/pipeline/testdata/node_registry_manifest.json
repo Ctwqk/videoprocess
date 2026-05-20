@@ -1,0 +1,2654 @@
+{
+  "node_types": [
+    {
+      "category": "audio",
+      "description": "Add background music to a video",
+      "display_name": "Background Music",
+      "icon": "music",
+      "inputs": [
+        {
+          "description": "Input video",
+          "name": "video",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Background music",
+          "name": "audio",
+          "port_type": "audio",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Video with background music",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": 0.3,
+          "description": "Background music volume (0-2)",
+          "max_value": 2.0,
+          "min_value": 0.0,
+          "name": "volume",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 1.0,
+          "description": "Original audio volume (0-2)",
+          "max_value": 2.0,
+          "min_value": 0.0,
+          "name": "original_volume",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": true,
+          "description": "Loop music if shorter than video",
+          "max_value": null,
+          "min_value": null,
+          "name": "loop",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": 0.0,
+          "description": "Fade in duration in seconds",
+          "max_value": 10.0,
+          "min_value": 0.0,
+          "name": "fade_in",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 0.0,
+          "description": "Fade out duration in seconds",
+          "max_value": 10.0,
+          "min_value": 0.0,
+          "name": "fade_out",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        }
+      ],
+      "type_name": "bgm",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "planner",
+      "description": "Search Bilibili and prepare a selectable result list for batch planning",
+      "display_name": "Bilibili Search",
+      "icon": "search",
+      "inputs": [],
+      "outputs": [
+        {
+          "description": "Search result list for planner nodes",
+          "name": "results",
+          "port_type": "search_results",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": null,
+          "description": "Bilibili search query",
+          "max_value": null,
+          "min_value": null,
+          "name": "query",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": 8,
+          "description": "Maximum number of search results to keep",
+          "max_value": 50,
+          "min_value": 1,
+          "name": "max_results",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        }
+      ],
+      "type_name": "bilibili_search",
+      "worker_type": "planner"
+    },
+    {
+      "category": "combine",
+      "description": "Place two videos side by side horizontally",
+      "display_name": "Horizontal Concat",
+      "icon": "columns",
+      "inputs": [
+        {
+          "description": "Left video",
+          "name": "video_left",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Right video",
+          "name": "video_right",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Combined video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "mp4",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "output_format",
+          "options": [
+            "mp4",
+            "mkv",
+            "webm"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "match_height",
+          "description": "How to handle different resolutions",
+          "max_value": null,
+          "min_value": null,
+          "name": "resize_mode",
+          "options": [
+            "match_height",
+            "match_width",
+            "none"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "concat_horizontal",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "combine",
+      "description": "Concatenate videos sequentially with dynamic timeline inputs.",
+      "display_name": "Concat Many",
+      "icon": "git-merge",
+      "inputs": [
+        {
+          "description": "Video input 1",
+          "name": "video_1",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Video input 2",
+          "name": "video_2",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Concatenated video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": 2,
+          "description": "Visible timeline input ports; expands automatically as inputs are connected",
+          "max_value": null,
+          "min_value": 2,
+          "name": "input_count",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": "mp4",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "output_format",
+          "options": [
+            "mp4",
+            "mkv",
+            "webm"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "none",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "transition",
+          "options": [
+            "none",
+            "fade",
+            "dissolve"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": 0.3,
+          "description": "",
+          "max_value": 5,
+          "min_value": 0,
+          "name": "transition_duration",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 30,
+          "description": "",
+          "max_value": 3600,
+          "min_value": 0,
+          "name": "target_duration",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": true,
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "normalize_resolution",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": "9:16",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "aspect_ratio",
+          "options": [
+            "9:16",
+            "16:9",
+            "1:1",
+            "auto"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": 1080,
+          "description": "",
+          "max_value": 7680,
+          "min_value": 64,
+          "name": "width",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 1920,
+          "description": "",
+          "max_value": 7680,
+          "min_value": 64,
+          "name": "height",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        }
+      ],
+      "type_name": "concat_many",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "combine",
+      "description": "Concatenate videos sequentially on a dynamic timeline.",
+      "display_name": "Timeline Concat",
+      "icon": "git-merge",
+      "inputs": [
+        {
+          "description": "Video input 1",
+          "name": "video_1",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Video input 2",
+          "name": "video_2",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Concatenated video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": 2,
+          "description": "Visible timeline input ports; expands automatically as inputs are connected",
+          "max_value": null,
+          "min_value": 2,
+          "name": "input_count",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": "mp4",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "output_format",
+          "options": [
+            "mp4",
+            "mkv",
+            "webm"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "none",
+          "description": "Transition effect between clips",
+          "max_value": null,
+          "min_value": null,
+          "name": "transition",
+          "options": [
+            "none",
+            "fade",
+            "dissolve"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": 0.5,
+          "description": "Transition duration in seconds",
+          "max_value": 5.0,
+          "min_value": 0.0,
+          "name": "transition_duration",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        }
+      ],
+      "type_name": "concat_timeline",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "combine",
+      "description": "Stack two videos vertically (top and bottom)",
+      "display_name": "Vertical Concat",
+      "icon": "rows",
+      "inputs": [
+        {
+          "description": "Top video",
+          "name": "video_top",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Bottom video",
+          "name": "video_bottom",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Combined video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "mp4",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "output_format",
+          "options": [
+            "mp4",
+            "mkv",
+            "webm"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "match_width",
+          "description": "How to handle different resolutions",
+          "max_value": null,
+          "min_value": null,
+          "name": "resize_mode",
+          "options": [
+            "match_height",
+            "match_width",
+            "none"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "concat_vertical",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "combine",
+      "description": "Play one video on top with a static bottom image, then switch to a second video on bottom with a static top image.",
+      "display_name": "Vertical Timeline Concat",
+      "icon": "rows-3",
+      "inputs": [
+        {
+          "description": "Video shown in the first segment",
+          "name": "video_first",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Video shown in the second segment",
+          "name": "video_second",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Optional static image shown on top during the second segment. Defaults to the fifteenth frame from the end of the first video, or the last frame if the video is shorter.",
+          "name": "image_top",
+          "port_type": "image",
+          "required": false
+        },
+        {
+          "description": "Optional static image shown on bottom during the first segment. Defaults to the fifteenth frame of the second video, or the last frame if the video is shorter.",
+          "name": "image_bottom",
+          "port_type": "image",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Combined vertical timeline video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": 640,
+          "description": "Width of each pane in pixels",
+          "max_value": 2160,
+          "min_value": 160,
+          "name": "pane_width",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 360,
+          "description": "Height of each pane in pixels",
+          "max_value": 2160,
+          "min_value": 90,
+          "name": "pane_height",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": "black",
+          "description": "Pad color used when media aspect ratios do not match the pane size",
+          "max_value": null,
+          "min_value": null,
+          "name": "background_color",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "mp4",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "output_format",
+          "options": [
+            "mp4",
+            "mkv",
+            "webm"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "concat_vertical_timeline",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "output",
+      "description": "Export processed video to a directory or destination",
+      "display_name": "Export",
+      "icon": "folder-output",
+      "inputs": [
+        {
+          "description": "File to export",
+          "name": "input",
+          "port_type": "any_media",
+          "required": true
+        }
+      ],
+      "outputs": [],
+      "params": [
+        {
+          "default": "/tmp/vp_export",
+          "description": "Destination directory path",
+          "max_value": null,
+          "min_value": null,
+          "name": "output_dir",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "Output filename (empty = use original name)",
+          "max_value": null,
+          "min_value": null,
+          "name": "filename",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": true,
+          "description": "Run export quality QA",
+          "max_value": null,
+          "min_value": null,
+          "name": "enable_quality_qa",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": "soft_repair_once",
+          "description": "Soft quality repair policy",
+          "max_value": null,
+          "min_value": null,
+          "name": "quality_gate_mode",
+          "options": [
+            "soft_repair_once"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": 80,
+          "description": "Minimum VMAF score before soft repair",
+          "max_value": 100,
+          "min_value": 0,
+          "name": "vmaf_min_score",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": -16,
+          "description": "Integrated loudness target",
+          "max_value": 0,
+          "min_value": -40,
+          "name": "loudnorm_target_i",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 11,
+          "description": "Loudness range target",
+          "max_value": 30,
+          "min_value": 1,
+          "name": "loudnorm_target_lra",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": -1.5,
+          "description": "True peak target",
+          "max_value": 0,
+          "min_value": -9,
+          "name": "loudnorm_target_tp",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        }
+      ],
+      "type_name": "export",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "transform",
+      "description": "Slice a source video into indexed material clips and store them in one or more material libraries",
+      "display_name": "Material Library Ingest",
+      "icon": "database-zap",
+      "inputs": [
+        {
+          "description": "Source video asset to index",
+          "name": "video",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "JSON summary artifact",
+          "name": "output",
+          "port_type": "any_media",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": null,
+          "description": "Material libraries to ingest into",
+          "max_value": null,
+          "min_value": null,
+          "name": "target_library_ids",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": 8,
+          "description": "Clip length in seconds",
+          "max_value": 120,
+          "min_value": 1,
+          "name": "clip_len",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 4,
+          "description": "Sliding window stride in seconds",
+          "max_value": 120,
+          "min_value": 1,
+          "name": "stride",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": "asr_if_missing",
+          "description": "How subtitles are generated for indexing",
+          "max_value": null,
+          "min_value": null,
+          "name": "subtitle_mode",
+          "options": [
+            "asr_if_missing",
+            "asr_always"
+          ],
+          "param_type": "select",
+          "required": true
+        },
+        {
+          "default": true,
+          "description": "Store neighboring clip ids for later expansion",
+          "max_value": null,
+          "min_value": null,
+          "name": "store_neighbors",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        }
+      ],
+      "type_name": "material_library_ingest",
+      "worker_type": "ffmpeg"
+    },
+    {
+      "category": "planner",
+      "description": "Search one or more material libraries with natural language and materialize refined clip assets",
+      "display_name": "Material Search",
+      "icon": "library",
+      "inputs": [],
+      "outputs": [
+        {
+          "description": "Material search result list for planner nodes",
+          "name": "results",
+          "port_type": "search_results",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": null,
+          "description": "Natural language query",
+          "max_value": null,
+          "min_value": null,
+          "name": "query",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": null,
+          "description": "Material libraries to search",
+          "max_value": null,
+          "min_value": null,
+          "name": "source_library_ids",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": null,
+          "description": "Material libraries to save refined clips into",
+          "max_value": null,
+          "min_value": null,
+          "name": "result_library_ids",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": 50,
+          "description": "Coarse recall top-k",
+          "max_value": 200,
+          "min_value": 1,
+          "name": "top_k",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 5,
+          "description": "Cluster merge gap in seconds",
+          "max_value": 30,
+          "min_value": 0,
+          "name": "merge_gap",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 4,
+          "description": "Context expansion before cluster",
+          "max_value": 30,
+          "min_value": 0,
+          "name": "expand_left",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 4,
+          "description": "Context expansion after cluster",
+          "max_value": 30,
+          "min_value": 0,
+          "name": "expand_right",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 8,
+          "description": "Top windows to rerank/refine",
+          "max_value": 50,
+          "min_value": 1,
+          "name": "rerank_top_m",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 1.5,
+          "description": "Minimum final duration",
+          "max_value": 60,
+          "min_value": 0.5,
+          "name": "min_duration",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 20,
+          "description": "Maximum final duration",
+          "max_value": 120,
+          "min_value": 1,
+          "name": "max_duration",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 0.6,
+          "description": "Overlap ratio used to dedupe refined results",
+          "max_value": 1,
+          "min_value": 0,
+          "name": "dedupe_overlap_threshold",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        }
+      ],
+      "type_name": "material_search",
+      "worker_type": "planner"
+    },
+    {
+      "category": "combine",
+      "description": "Assemble 2 to 12 clips into a short-form montage.",
+      "display_name": "Montage Assembler",
+      "icon": "film",
+      "inputs": [
+        {
+          "description": "Video input 1",
+          "name": "video_1",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Video input 2",
+          "name": "video_2",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Video input 3",
+          "name": "video_3",
+          "port_type": "video",
+          "required": false
+        },
+        {
+          "description": "Video input 4",
+          "name": "video_4",
+          "port_type": "video",
+          "required": false
+        },
+        {
+          "description": "Video input 5",
+          "name": "video_5",
+          "port_type": "video",
+          "required": false
+        },
+        {
+          "description": "Video input 6",
+          "name": "video_6",
+          "port_type": "video",
+          "required": false
+        },
+        {
+          "description": "Video input 7",
+          "name": "video_7",
+          "port_type": "video",
+          "required": false
+        },
+        {
+          "description": "Video input 8",
+          "name": "video_8",
+          "port_type": "video",
+          "required": false
+        },
+        {
+          "description": "Video input 9",
+          "name": "video_9",
+          "port_type": "video",
+          "required": false
+        },
+        {
+          "description": "Video input 10",
+          "name": "video_10",
+          "port_type": "video",
+          "required": false
+        },
+        {
+          "description": "Video input 11",
+          "name": "video_11",
+          "port_type": "video",
+          "required": false
+        },
+        {
+          "description": "Video input 12",
+          "name": "video_12",
+          "port_type": "video",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Assembled montage video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "fast_cuts",
+          "description": "Montage pacing style",
+          "max_value": null,
+          "min_value": null,
+          "name": "style",
+          "options": [
+            "fast_cuts",
+            "balanced",
+            "cinematic"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": 30,
+          "description": "",
+          "max_value": 3600,
+          "min_value": 0,
+          "name": "target_duration",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": "9:16",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "aspect_ratio",
+          "options": [
+            "9:16",
+            "16:9",
+            "1:1",
+            "auto"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": false,
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "beat_sync",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": 6,
+          "description": "",
+          "max_value": 120,
+          "min_value": 0.5,
+          "name": "max_clip_duration",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 1,
+          "description": "",
+          "max_value": 120,
+          "min_value": 0.1,
+          "name": "min_clip_duration",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "intro_hook",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": 1080,
+          "description": "",
+          "max_value": 7680,
+          "min_value": 64,
+          "name": "width",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 1920,
+          "description": "",
+          "max_value": 7680,
+          "min_value": 64,
+          "name": "height",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        }
+      ],
+      "type_name": "montage_assembler",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "audio",
+      "description": "Replace a video's audio track with a supplied audio file",
+      "display_name": "Replace Audio",
+      "icon": "replace",
+      "inputs": [
+        {
+          "description": "Input video",
+          "name": "video",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Replacement audio",
+          "name": "audio",
+          "port_type": "audio",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Video with replaced audio",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": true,
+          "description": "Loop the replacement audio when it is shorter than the video",
+          "max_value": null,
+          "min_value": null,
+          "name": "loop_if_shorter",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": 1.0,
+          "description": "Replacement audio volume multiplier",
+          "max_value": 4.0,
+          "min_value": 0.0,
+          "name": "audio_volume",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        }
+      ],
+      "type_name": "replace_audio",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "ai_transform",
+      "description": "Find and trim video segments by natural language prompt",
+      "display_name": "Smart Trim",
+      "icon": "sparkles-scissors",
+      "inputs": [
+        {
+          "description": "Input video",
+          "name": "input",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Matched video clip, montage, or original video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": null,
+          "description": "Natural language segment description",
+          "max_value": null,
+          "min_value": null,
+          "name": "prompt",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": "",
+          "description": "Things that should not appear",
+          "max_value": null,
+          "min_value": null,
+          "name": "negative_prompt",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "auto",
+          "description": "Output selection policy",
+          "max_value": null,
+          "min_value": null,
+          "name": "mode",
+          "options": [
+            "auto",
+            "best_clip",
+            "all_matches_montage",
+            "full_if_match",
+            "no_full_video"
+          ],
+          "param_type": "select",
+          "required": true
+        },
+        {
+          "default": 0,
+          "description": "",
+          "max_value": 600,
+          "min_value": 0,
+          "name": "target_duration",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 1.5,
+          "description": "",
+          "max_value": 30,
+          "min_value": 0.3,
+          "name": "min_clip_duration",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 8,
+          "description": "",
+          "max_value": 120,
+          "min_value": 1,
+          "name": "max_clip_duration",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 8,
+          "description": "",
+          "max_value": 30,
+          "min_value": 1,
+          "name": "max_clips",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 1,
+          "description": "",
+          "max_value": 4,
+          "min_value": 0.1,
+          "name": "sample_fps",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 0.35,
+          "description": "",
+          "max_value": 1,
+          "min_value": 0,
+          "name": "match_threshold",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 0.65,
+          "description": "",
+          "max_value": 1,
+          "min_value": 0,
+          "name": "return_full_threshold",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 0.5,
+          "description": "",
+          "max_value": 10,
+          "min_value": 0,
+          "name": "padding_before",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 0.5,
+          "description": "",
+          "max_value": 10,
+          "min_value": 0,
+          "name": "padding_after",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 1.0,
+          "description": "",
+          "max_value": 10,
+          "min_value": 0,
+          "name": "merge_gap",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": true,
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "use_visual",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": true,
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "use_asr",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": false,
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "use_vlm_verify",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": "zh",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "language",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "medium",
+          "description": "Whisper model used when ASR scoring is enabled",
+          "max_value": null,
+          "min_value": null,
+          "name": "whisper_model",
+          "options": [
+            "tiny",
+            "base",
+            "small",
+            "medium",
+            "large-v3"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "mp4",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "output_format",
+          "options": [
+            "mp4",
+            "mkv",
+            "webm"
+          ],
+          "param_type": "select",
+          "required": true
+        },
+        {
+          "default": "placeholder",
+          "description": "How to handle no matched segment",
+          "max_value": null,
+          "min_value": null,
+          "name": "no_match_policy",
+          "options": [
+            "placeholder",
+            "fail"
+          ],
+          "param_type": "select",
+          "required": true
+        }
+      ],
+      "type_name": "smart_trim",
+      "worker_type": "vision"
+    },
+    {
+      "category": "source",
+      "description": "Input source referencing an uploaded asset",
+      "display_name": "Source",
+      "icon": "upload",
+      "inputs": [
+        {
+          "description": "Optional planner-provided asset reference",
+          "name": "asset_input",
+          "port_type": "asset_value",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Source media output",
+          "name": "output",
+          "port_type": "any_media",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": null,
+          "description": "ID of the uploaded asset",
+          "max_value": null,
+          "min_value": null,
+          "name": "asset_id",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": "video",
+          "description": "Type of the source media",
+          "max_value": null,
+          "min_value": null,
+          "name": "media_type",
+          "options": [
+            "video",
+            "audio",
+            "image",
+            "subtitle"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "source",
+      "worker_type": "none"
+    },
+    {
+      "category": "audio",
+      "description": "Transcribe spoken audio from a media input into an SRT subtitle file",
+      "display_name": "Speech To Subtitle",
+      "icon": "mic",
+      "inputs": [
+        {
+          "description": "Audio or video source",
+          "name": "media",
+          "port_type": "any_media",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Generated subtitle file",
+          "name": "output",
+          "port_type": "subtitle",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "medium",
+          "description": "Whisper model size",
+          "max_value": null,
+          "min_value": null,
+          "name": "model",
+          "options": [
+            "tiny",
+            "base",
+            "small",
+            "medium",
+            "large-v3"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "Optional language hint such as en or zh",
+          "max_value": null,
+          "min_value": null,
+          "name": "language",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": 5,
+          "description": "Decoding beam size",
+          "max_value": 10,
+          "min_value": 1,
+          "name": "beam_size",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": true,
+          "description": "Merge adjacent short subtitle segments to make downstream translation/TTS smoother",
+          "max_value": null,
+          "min_value": null,
+          "name": "merge_adjacent",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": 0.6,
+          "description": "Maximum silence gap allowed when merging neighboring subtitle cues",
+          "max_value": 5,
+          "min_value": 0,
+          "name": "merge_max_gap_seconds",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 40,
+          "description": "Treat subtitle cues shorter than this as merge candidates",
+          "max_value": 200,
+          "min_value": 1,
+          "name": "merge_min_chars",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 2.2,
+          "description": "Treat subtitle cues shorter than this duration as merge candidates",
+          "max_value": 10,
+          "min_value": 0.1,
+          "name": "merge_min_duration_seconds",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 8.0,
+          "description": "Never merge subtitle cues into a segment longer than this duration",
+          "max_value": 30,
+          "min_value": 0.5,
+          "name": "merge_max_duration_seconds",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        }
+      ],
+      "type_name": "speech_to_subtitle",
+      "worker_type": "ffmpeg"
+    },
+    {
+      "category": "transform",
+      "description": "Burn subtitles into a video",
+      "display_name": "Subtitle",
+      "icon": "captions",
+      "inputs": [
+        {
+          "description": "Input video",
+          "name": "video",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Subtitle file (SRT/ASS)",
+          "name": "subtitle_file",
+          "port_type": "subtitle",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Video with subtitles",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": 24,
+          "description": "Subtitle font size",
+          "max_value": 72,
+          "min_value": 8,
+          "name": "font_size",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": "white",
+          "description": "Subtitle font color",
+          "max_value": null,
+          "min_value": null,
+          "name": "font_color",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "black",
+          "description": "Subtitle outline color",
+          "max_value": null,
+          "min_value": null,
+          "name": "outline_color",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "bottom",
+          "description": "Subtitle vertical position",
+          "max_value": null,
+          "min_value": null,
+          "name": "position",
+          "options": [
+            "top",
+            "center",
+            "bottom"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "subtitle",
+      "worker_type": "ffmpeg"
+    },
+    {
+      "category": "audio",
+      "description": "Generate a timed speech track from subtitle cues using the configured TTS service",
+      "display_name": "Subtitle To Speech",
+      "icon": "audio-lines",
+      "inputs": [
+        {
+          "description": "Input subtitle file",
+          "name": "subtitle_file",
+          "port_type": "subtitle",
+          "required": true
+        },
+        {
+          "description": "Optional reference voice audio/video",
+          "name": "reference_audio",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional transcript/subtitle file matching the reference voice audio",
+          "name": "ref_text",
+          "port_type": "subtitle",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Generated speech audio",
+          "name": "output",
+          "port_type": "audio",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "en",
+          "description": "TTS language code",
+          "max_value": null,
+          "min_value": null,
+          "name": "language",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": 0.6,
+          "description": "Merge nearby subtitle cues into one speech block when the gap is small",
+          "max_value": null,
+          "min_value": null,
+          "name": "block_merge_gap_seconds",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 70,
+          "description": "Try to merge short subtitle cues until each speech block is at least this long",
+          "max_value": null,
+          "min_value": null,
+          "name": "block_min_chars",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 220,
+          "description": "Soft upper bound for text length inside one speech block",
+          "max_value": null,
+          "min_value": null,
+          "name": "block_max_chars",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 2.5,
+          "description": "Try to merge subtitle cues until each speech block lasts at least this long",
+          "max_value": null,
+          "min_value": null,
+          "name": "block_min_duration_seconds",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 10.0,
+          "description": "Soft upper bound for a single speech block duration",
+          "max_value": null,
+          "min_value": null,
+          "name": "block_max_duration_seconds",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 1.1,
+          "description": "Maximum atempo speed-up used to prevent overlap when generated speech runs long",
+          "max_value": null,
+          "min_value": null,
+          "name": "alignment_max_speedup",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 800,
+          "description": "Maximum extra delay before a short speech block when there is spare room",
+          "max_value": null,
+          "min_value": null,
+          "name": "alignment_max_leading_delay_ms",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": true,
+          "description": "Use the LLM gateway to shorten long speech blocks before applying speed-up alignment",
+          "max_value": null,
+          "min_value": null,
+          "name": "alignment_rewrite_with_llm",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": 1.1,
+          "description": "Required speed-up ratio that triggers LLM rewrite and re-synthesis",
+          "max_value": null,
+          "min_value": null,
+          "name": "alignment_rewrite_min_speedup",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "Optional model override for TTS alignment rewrite requests",
+          "max_value": null,
+          "min_value": null,
+          "name": "alignment_rewrite_model",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        }
+      ],
+      "type_name": "subtitle_to_speech",
+      "worker_type": "ffmpeg"
+    },
+    {
+      "category": "audio",
+      "description": "Translate an SRT subtitle file into another language",
+      "display_name": "Subtitle Translate",
+      "icon": "languages",
+      "inputs": [
+        {
+          "description": "Input subtitle file",
+          "name": "subtitle_file",
+          "port_type": "subtitle",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Translated subtitle file",
+          "name": "output",
+          "port_type": "subtitle",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "en",
+          "description": "Target language code or name",
+          "max_value": null,
+          "min_value": null,
+          "name": "target_language",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": "",
+          "description": "Optional source language hint",
+          "max_value": null,
+          "min_value": null,
+          "name": "source_language",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "Optional watchdog route/model override",
+          "max_value": null,
+          "min_value": null,
+          "name": "model",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        }
+      ],
+      "type_name": "subtitle_translate",
+      "worker_type": "ffmpeg"
+    },
+    {
+      "category": "transform",
+      "description": "Overlay short title text on video.",
+      "display_name": "Title Overlay",
+      "icon": "type",
+      "inputs": [
+        {
+          "description": "Input video",
+          "name": "input",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Titled video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "",
+          "description": "Overlay text",
+          "max_value": null,
+          "min_value": null,
+          "name": "text",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "top",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "position",
+          "options": [
+            "top",
+            "center",
+            "bottom"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": 0,
+          "description": "",
+          "max_value": null,
+          "min_value": 0,
+          "name": "start_time",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 3,
+          "description": "",
+          "max_value": 3600,
+          "min_value": 0.1,
+          "name": "duration",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 72,
+          "description": "",
+          "max_value": 240,
+          "min_value": 8,
+          "name": "font_size",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": true,
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "safe_area",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        }
+      ],
+      "type_name": "title_overlay",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "output",
+      "description": "Transcode video to a different format or codec",
+      "display_name": "Transcode",
+      "icon": "file-output",
+      "inputs": [
+        {
+          "description": "Input video",
+          "name": "input",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Transcoded video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "mp4",
+          "description": "Output container format",
+          "max_value": null,
+          "min_value": null,
+          "name": "format",
+          "options": [
+            "mp4",
+            "mkv",
+            "webm",
+            "avi",
+            "mov"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "libx264",
+          "description": "Video codec",
+          "max_value": null,
+          "min_value": null,
+          "name": "video_codec",
+          "options": [
+            "libx264",
+            "libx265",
+            "h264_nvenc",
+            "hevc_nvenc",
+            "libvpx-vp9",
+            "copy"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "aac",
+          "description": "Audio codec",
+          "max_value": null,
+          "min_value": null,
+          "name": "audio_codec",
+          "options": [
+            "aac",
+            "libopus",
+            "libmp3lame",
+            "copy"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "original",
+          "description": "Output resolution",
+          "max_value": null,
+          "min_value": null,
+          "name": "resolution",
+          "options": [
+            "original",
+            "3840x2160",
+            "1920x1080",
+            "1280x720",
+            "854x480"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "Video bitrate (e.g. 5M, 2000k, empty for auto)",
+          "max_value": null,
+          "min_value": null,
+          "name": "bitrate",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": 20,
+          "description": "Constant Rate Factor (lower = better quality)",
+          "max_value": 51,
+          "min_value": 0,
+          "name": "crf",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": "medium",
+          "description": "Encoding speed preset",
+          "max_value": null,
+          "min_value": null,
+          "name": "preset",
+          "options": [
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "transcode",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "transform",
+      "description": "Trim a video to a specific time range",
+      "display_name": "Trim",
+      "icon": "scissors",
+      "inputs": [
+        {
+          "description": "Input video",
+          "name": "input",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Trimmed video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "00:00:00",
+          "description": "Start time (HH:MM:SS or seconds)",
+          "max_value": null,
+          "min_value": null,
+          "name": "start_time",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": "",
+          "description": "End time (HH:MM:SS or seconds, empty for end of video)",
+          "max_value": null,
+          "min_value": null,
+          "name": "end_time",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "Duration (alternative to end_time)",
+          "max_value": null,
+          "min_value": null,
+          "name": "duration",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        }
+      ],
+      "type_name": "trim",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "source",
+      "description": "Download media from YouTube, X, Bilibili, Xiaohongshu, or direct URLs",
+      "display_name": "URL Download",
+      "icon": "download",
+      "inputs": [
+        {
+          "description": "Planner-provided URL",
+          "name": "url_input",
+          "port_type": "url_value",
+          "required": false
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Downloaded video",
+          "name": "output",
+          "port_type": "any_media",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": null,
+          "description": "YouTube, X, Bilibili, Xiaohongshu, or direct media URL",
+          "max_value": null,
+          "min_value": null,
+          "name": "url",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": "best",
+          "description": "Download quality",
+          "max_value": null,
+          "min_value": null,
+          "name": "format",
+          "options": [
+            "best",
+            "1080p",
+            "720p",
+            "480p",
+            "audio_only"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "url_download",
+      "worker_type": "ffmpeg"
+    },
+    {
+      "category": "transform",
+      "description": "Convert video to a vertical frame with crop or blurred background.",
+      "display_name": "Vertical Crop",
+      "icon": "crop",
+      "inputs": [
+        {
+          "description": "Input video",
+          "name": "input",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Vertical video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "center_crop",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "mode",
+          "options": [
+            "center_crop",
+            "blur_bg",
+            "smart_subject"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": 1080,
+          "description": "",
+          "max_value": 4320,
+          "min_value": 64,
+          "name": "width",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 1920,
+          "description": "",
+          "max_value": 7680,
+          "min_value": 64,
+          "name": "height",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": "blur",
+          "description": "",
+          "max_value": null,
+          "min_value": null,
+          "name": "background",
+          "options": [
+            "blur",
+            "black",
+            "white"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "vertical_crop",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "transform",
+      "description": "Add an image watermark overlay to a video",
+      "display_name": "Watermark",
+      "icon": "image",
+      "inputs": [
+        {
+          "description": "Input video",
+          "name": "video",
+          "port_type": "video",
+          "required": true
+        },
+        {
+          "description": "Watermark image",
+          "name": "overlay",
+          "port_type": "image",
+          "required": true
+        }
+      ],
+      "outputs": [
+        {
+          "description": "Watermarked video",
+          "name": "output",
+          "port_type": "video",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": "bottom_right",
+          "description": "Watermark position",
+          "max_value": null,
+          "min_value": null,
+          "name": "position",
+          "options": [
+            "top_left",
+            "top_right",
+            "bottom_left",
+            "bottom_right",
+            "center"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": 0.8,
+          "description": "Watermark opacity (0-1)",
+          "max_value": 1.0,
+          "min_value": 0.0,
+          "name": "opacity",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 0.15,
+          "description": "Watermark scale relative to video width",
+          "max_value": 1.0,
+          "min_value": 0.01,
+          "name": "scale",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        },
+        {
+          "default": 10,
+          "description": "Margin from edge in pixels",
+          "max_value": 500,
+          "min_value": 0,
+          "name": "margin",
+          "options": null,
+          "param_type": "number",
+          "required": false
+        }
+      ],
+      "type_name": "watermark",
+      "worker_type": "ffmpeg_go"
+    },
+    {
+      "category": "planner",
+      "description": "Search X and prepare a selectable result list for batch planning",
+      "display_name": "X Search",
+      "icon": "search",
+      "inputs": [],
+      "outputs": [
+        {
+          "description": "Search result list for planner nodes",
+          "name": "results",
+          "port_type": "search_results",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": null,
+          "description": "X search query",
+          "max_value": null,
+          "min_value": null,
+          "name": "query",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": 8,
+          "description": "Maximum number of search results to keep",
+          "max_value": 50,
+          "min_value": 1,
+          "name": "max_results",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        }
+      ],
+      "type_name": "x_search",
+      "worker_type": "planner"
+    },
+    {
+      "category": "output",
+      "description": "Publish a media post to X through the unified platform browser service",
+      "display_name": "X Upload",
+      "icon": "upload",
+      "inputs": [
+        {
+          "description": "Media file to attach to the X post",
+          "name": "input",
+          "port_type": "any_media",
+          "required": true
+        }
+      ],
+      "outputs": [],
+      "params": [
+        {
+          "default": null,
+          "description": "Post text to publish on X",
+          "max_value": null,
+          "min_value": null,
+          "name": "text",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": "",
+          "description": "Optional X post URL to reply to",
+          "max_value": null,
+          "min_value": null,
+          "name": "reply_to_url",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        }
+      ],
+      "type_name": "x_upload",
+      "worker_type": "ffmpeg"
+    },
+    {
+      "category": "planner",
+      "description": "Search Xiaohongshu and prepare a selectable result list for batch planning",
+      "display_name": "Xiaohongshu Search",
+      "icon": "search",
+      "inputs": [],
+      "outputs": [
+        {
+          "description": "Search result list for planner nodes",
+          "name": "results",
+          "port_type": "search_results",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": null,
+          "description": "Xiaohongshu search query",
+          "max_value": null,
+          "min_value": null,
+          "name": "query",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": 8,
+          "description": "Maximum number of search results to keep",
+          "max_value": 50,
+          "min_value": 1,
+          "name": "max_results",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        }
+      ],
+      "type_name": "xiaohongshu_search",
+      "worker_type": "planner"
+    },
+    {
+      "category": "output",
+      "description": "Publish a Xiaohongshu image note or video note through the unified platform browser service",
+      "display_name": "Xiaohongshu Upload",
+      "icon": "upload",
+      "inputs": [
+        {
+          "description": "Primary media file for the Xiaohongshu note",
+          "name": "input",
+          "port_type": "any_media",
+          "required": true
+        },
+        {
+          "description": "Optional second image for image-note publishing",
+          "name": "image_2",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional third image for image-note publishing",
+          "name": "image_3",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional fourth image for image-note publishing",
+          "name": "image_4",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional fifth image for image-note publishing",
+          "name": "image_5",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional sixth image for image-note publishing",
+          "name": "image_6",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional seventh image for image-note publishing",
+          "name": "image_7",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional eighth image for image-note publishing",
+          "name": "image_8",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional ninth image for image-note publishing",
+          "name": "image_9",
+          "port_type": "any_media",
+          "required": false
+        }
+      ],
+      "outputs": [],
+      "params": [
+        {
+          "default": null,
+          "description": "Note body content",
+          "max_value": null,
+          "min_value": null,
+          "name": "content",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": "",
+          "description": "Optional note title",
+          "max_value": null,
+          "min_value": null,
+          "name": "title",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "Comma-separated Xiaohongshu topics without #",
+          "max_value": null,
+          "min_value": null,
+          "name": "topics",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": false,
+          "description": "Save as draft instead of publishing immediately",
+          "max_value": null,
+          "min_value": null,
+          "name": "draft",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": "image_note",
+          "description": "Choose whether to publish an image note or a video note",
+          "max_value": null,
+          "min_value": null,
+          "name": "publish_mode",
+          "options": [
+            "image_note",
+            "video_note"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "xiaohongshu_upload",
+      "worker_type": "ffmpeg"
+    },
+    {
+      "category": "planner",
+      "description": "Search YouTube and prepare a selectable result list for batch planning",
+      "display_name": "YouTube Search",
+      "icon": "search",
+      "inputs": [],
+      "outputs": [
+        {
+          "description": "Search result list for planner nodes",
+          "name": "results",
+          "port_type": "search_results",
+          "required": true
+        }
+      ],
+      "params": [
+        {
+          "default": null,
+          "description": "YouTube search query",
+          "max_value": null,
+          "min_value": null,
+          "name": "query",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": 8,
+          "description": "Maximum number of search results to keep",
+          "max_value": 50,
+          "min_value": 1,
+          "name": "max_results",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        }
+      ],
+      "type_name": "youtube_search",
+      "worker_type": "planner"
+    },
+    {
+      "category": "output",
+      "description": "Upload video to YouTube via API",
+      "display_name": "YouTube Upload",
+      "icon": "upload",
+      "inputs": [
+        {
+          "description": "Video to upload",
+          "name": "input",
+          "port_type": "any_media",
+          "required": true
+        }
+      ],
+      "outputs": [],
+      "params": [
+        {
+          "default": null,
+          "description": "Video title",
+          "max_value": null,
+          "min_value": null,
+          "name": "title",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": "",
+          "description": "Video description",
+          "max_value": null,
+          "min_value": null,
+          "name": "description",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "private",
+          "description": "Privacy status",
+          "max_value": null,
+          "min_value": null,
+          "name": "privacy",
+          "options": [
+            "public",
+            "unlisted",
+            "private"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "not_set",
+          "description": "Set YouTube audience flag during upload",
+          "max_value": null,
+          "min_value": null,
+          "name": "made_for_kids",
+          "options": [
+            "not_set",
+            "yes",
+            "no"
+          ],
+          "param_type": "select",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "Comma-separated tags",
+          "max_value": null,
+          "min_value": null,
+          "name": "tags",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        }
+      ],
+      "type_name": "youtube_upload",
+      "worker_type": "ffmpeg"
+    },
+    {
+      "category": "planner",
+      "description": "Zip multiple search result channels into aligned batch records",
+      "display_name": "Zip Records",
+      "icon": "workflow",
+      "inputs": [],
+      "outputs": [],
+      "params": [
+        {
+          "default": 2,
+          "description": "Number of search channels to zip",
+          "max_value": 12,
+          "min_value": 1,
+          "name": "channel_count",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        },
+        {
+          "default": 0,
+          "description": "Maximum number of output records (0 = auto)",
+          "max_value": 500,
+          "min_value": 0,
+          "name": "record_limit",
+          "options": null,
+          "param_type": "number",
+          "required": true
+        }
+      ],
+      "type_name": "zip_records",
+      "worker_type": "planner"
+    }
+  ],
+  "schema_version": 1
+}

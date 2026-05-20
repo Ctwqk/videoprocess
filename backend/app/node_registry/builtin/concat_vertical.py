@@ -6,6 +6,7 @@ DEFINITION = NodeTypeDefinition(
     category="combine",
     description="Stack two videos vertically (top and bottom)",
     icon="rows",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="video_top", port_type=PortType.VIDEO, description="Top video"),
         PortDefinition(name="video_bottom", port_type=PortType.VIDEO, description="Bottom video"),

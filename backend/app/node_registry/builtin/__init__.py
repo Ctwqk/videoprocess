@@ -26,6 +26,7 @@ from app.node_registry.builtin import (
     x_search,
     x_upload,
     xiaohongshu_search,
+    xiaohongshu_upload,
     youtube_search,
     youtube_upload,
     zip_records,
@@ -62,6 +63,7 @@ BUILTIN_MODULES = (
     export,
     youtube_upload,
     x_upload,
+    xiaohongshu_upload,
 )
 
 __all__ = [

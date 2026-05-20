@@ -6,6 +6,24 @@ import (
 	"github.com/Ctwqk/videoprocess/internal/contracts"
 )
 
+var unsupportedGoValidationNodeTypes = map[string]struct{}{
+	"zip_records":             {},
+	"material_search":         {},
+	"youtube_search":          {},
+	"x_search":                {},
+	"xiaohongshu_search":      {},
+	"bilibili_search":         {},
+	"youtube_upload":          {},
+	"x_upload":                {},
+	"xiaohongshu_upload":      {},
+	"material_library_ingest": {},
+	"url_download":            {},
+	"smart_trim":              {},
+	"speech_to_subtitle":      {},
+	"subtitle_translate":      {},
+	"subtitle_to_speech":      {},
+}
+
 // Validate mirrors backend/app/orchestrator/dag.py `validate_pipeline` for
 // the contract surfaces the Go API exposes today. AutoFlow-specific shapes
 // (zip_records / dynamic video inputs / planner-bound sources) are not yet
@@ -15,6 +33,24 @@ func Validate(def contracts.PipelineDefinition) contracts.ValidationResult {
 	errors := make([]contracts.ValidationError, 0)
 	warnings := make([]contracts.ValidationWarning, 0)
 	registry := BuiltinRegistry()
+
+	for _, node := range def.Nodes {
+		if _, unsupported := unsupportedGoValidationNodeTypes[node.Type]; unsupported {
+			id := node.ID
+			return contracts.ValidationResult{
+				Valid: false,
+				Errors: []contracts.ValidationError{
+					{
+						Type:    "unsupported_go_validation",
+						NodeID:  &id,
+						Message: fmt.Sprintf("Go validator does not own validation for node type '%s'; route this graph to Python", node.Type),
+					},
+				},
+				Warnings: []contracts.ValidationWarning{},
+			}
+		}
+	}
+
 	nodesByID := map[string]contracts.PipelineNode{}
 	inDegree := map[string]int{}
 	adjacency := map[string][]string{}
@@ -146,6 +182,20 @@ func Validate(def contracts.PipelineDefinition) contracts.ValidationResult {
 				Message: fmt.Sprintf("Source node '%s' is missing an asset binding", label),
 			})
 		}
+		for _, param := range typeDef.Params {
+			value := node.Data.Config[param.Name]
+			if param.Required && requiredParamMissing(value) {
+				id := node.ID
+				paramName := param.Name
+				label := nodeLabel(node)
+				errors = append(errors, contracts.ValidationError{
+					Type:      "invalid_param",
+					NodeID:    &id,
+					ParamName: &paramName,
+					Message:   fmt.Sprintf("Required parameter '%s' on '%s' is missing or empty", param.Name, label),
+				})
+			}
+		}
 	}
 
 	return contracts.ValidationResult{Valid: len(errors) == 0, Errors: errors, Warnings: warnings}
@@ -168,6 +218,16 @@ func sourceHasAsset(node contracts.PipelineNode, connectedInputs map[string]map[
 		}
 	}
 	if inputs, ok := connectedInputs[node.ID]; ok && len(inputs) > 0 {
+		return true
+	}
+	return false
+}
+
+func requiredParamMissing(value any) bool {
+	if value == nil {
+		return true
+	}
+	if str, ok := value.(string); ok && str == "" {
 		return true
 	}
 	return false

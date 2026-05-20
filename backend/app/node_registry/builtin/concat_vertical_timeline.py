@@ -7,6 +7,7 @@ DEFINITION = NodeTypeDefinition(
     category="combine",
     description="Play one video on top with a static bottom image, then switch to a second video on bottom with a static top image.",
     icon="rows-3",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name="video_first", port_type=PortType.VIDEO, description="Video shown in the first segment"),
         PortDefinition(name="video_second", port_type=PortType.VIDEO, description="Video shown in the second segment"),

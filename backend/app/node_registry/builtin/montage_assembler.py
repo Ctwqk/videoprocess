@@ -7,6 +7,7 @@ DEFINITION = NodeTypeDefinition(
     category="combine",
     description="Assemble 2 to 12 clips into a short-form montage.",
     icon="film",
+    worker_type="ffmpeg_go",
     inputs=[
         PortDefinition(name=f"video_{index}", port_type=PortType.VIDEO, required=index <= 2, description=f"Video input {index}")
         for index in range(1, 13)

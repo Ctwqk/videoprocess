@@ -14,15 +14,23 @@ func TaskStream(workerType string) string {
 
 type NodeEvent struct {
 	Event            string
+	EventStream      string
 	JobID            string
 	NodeExecutionID  string
 	OutputArtifactID string
 	Error            string
 }
 
+func (event NodeEvent) streamOrDefault() string {
+	if event.EventStream != "" {
+		return event.EventStream
+	}
+	return EventStream
+}
+
 func PublishNodeCompleted(ctx context.Context, client *redis.Client, event NodeEvent) error {
 	return client.XAdd(ctx, &redis.XAddArgs{
-		Stream: EventStream,
+		Stream: event.streamOrDefault(),
 		Values: map[string]any{
 			"event":              "node_completed",
 			"job_id":             event.JobID,
@@ -38,7 +46,7 @@ func PublishNodeFailed(ctx context.Context, client *redis.Client, event NodeEven
 		errorText = errorText[:2000]
 	}
 	return client.XAdd(ctx, &redis.XAddArgs{
-		Stream: EventStream,
+		Stream: event.streamOrDefault(),
 		Values: map[string]any{
 			"event":             "node_failed",
 			"job_id":            event.JobID,

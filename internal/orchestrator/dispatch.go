@@ -10,6 +10,8 @@ type TaskPayload struct {
 	PreferredHostsJSON string
 	AffinityEnqueuedAt string
 	AffinityBounces    string
+	EventStream        string
+	OrchestratorOwner  string
 }
 
 func (p TaskPayload) RedisValues() map[string]any {
@@ -23,5 +25,7 @@ func (p TaskPayload) RedisValues() map[string]any {
 		"preferred_hosts":      p.PreferredHostsJSON,
 		"affinity_enqueued_at": p.AffinityEnqueuedAt,
 		"affinity_bounces":     p.AffinityBounces,
+		"event_stream":         p.EventStream,
+		"orchestrator_owner":   p.OrchestratorOwner,
 	}
 }

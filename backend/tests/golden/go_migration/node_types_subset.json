@@ -3,7 +3,7 @@
     "type_name": "trim",
     "display_name": "Trim",
     "category": "transform",
-    "worker_type": "ffmpeg"
+    "worker_type": "ffmpeg_go"
   },
   {
     "type_name": "smart_trim",
