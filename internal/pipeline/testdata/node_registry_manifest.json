@@ -2382,6 +2382,126 @@
       "worker_type": "planner"
     },
     {
+      "category": "output",
+      "description": "Publish a Xiaohongshu image note or video note through the unified platform browser service",
+      "display_name": "Xiaohongshu Upload",
+      "icon": "upload",
+      "inputs": [
+        {
+          "description": "Primary media file for the Xiaohongshu note",
+          "name": "input",
+          "port_type": "any_media",
+          "required": true
+        },
+        {
+          "description": "Optional second image for image-note publishing",
+          "name": "image_2",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional third image for image-note publishing",
+          "name": "image_3",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional fourth image for image-note publishing",
+          "name": "image_4",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional fifth image for image-note publishing",
+          "name": "image_5",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional sixth image for image-note publishing",
+          "name": "image_6",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional seventh image for image-note publishing",
+          "name": "image_7",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional eighth image for image-note publishing",
+          "name": "image_8",
+          "port_type": "any_media",
+          "required": false
+        },
+        {
+          "description": "Optional ninth image for image-note publishing",
+          "name": "image_9",
+          "port_type": "any_media",
+          "required": false
+        }
+      ],
+      "outputs": [],
+      "params": [
+        {
+          "default": null,
+          "description": "Note body content",
+          "max_value": null,
+          "min_value": null,
+          "name": "content",
+          "options": null,
+          "param_type": "string",
+          "required": true
+        },
+        {
+          "default": "",
+          "description": "Optional note title",
+          "max_value": null,
+          "min_value": null,
+          "name": "title",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": "",
+          "description": "Comma-separated Xiaohongshu topics without #",
+          "max_value": null,
+          "min_value": null,
+          "name": "topics",
+          "options": null,
+          "param_type": "string",
+          "required": false
+        },
+        {
+          "default": false,
+          "description": "Save as draft instead of publishing immediately",
+          "max_value": null,
+          "min_value": null,
+          "name": "draft",
+          "options": null,
+          "param_type": "boolean",
+          "required": false
+        },
+        {
+          "default": "image_note",
+          "description": "Choose whether to publish an image note or a video note",
+          "max_value": null,
+          "min_value": null,
+          "name": "publish_mode",
+          "options": [
+            "image_note",
+            "video_note"
+          ],
+          "param_type": "select",
+          "required": false
+        }
+      ],
+      "type_name": "xiaohongshu_upload",
+      "worker_type": "ffmpeg"
+    },
+    {
       "category": "planner",
       "description": "Search YouTube and prepare a selectable result list for batch planning",
       "display_name": "YouTube Search",

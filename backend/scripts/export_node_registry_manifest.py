@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -11,10 +12,16 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.node_registry.base import NodeTypeDefinition, ParamDefinition, PortDefinition
+from app.node_registry.builtin import BUILTIN_MODULES
 from app.node_registry.registry import NodeTypeRegistry
 
 
 SCHEMA_VERSION = 1
+REPO_ROOT = BACKEND_ROOT.parent
+DEFAULT_OUTPUT_PATHS = (
+    REPO_ROOT / "backend/tests/golden/go_migration/node_registry_manifest.json",
+    REPO_ROOT / "internal/pipeline/testdata/node_registry_manifest.json",
+)
 
 
 def _serialize_port(port: PortDefinition) -> dict[str, Any]:
@@ -64,6 +71,23 @@ def build_manifest() -> dict[str, Any]:
     }
 
 
+def builtin_definition_modules() -> dict[str, Any]:
+    builtin_dir = BACKEND_ROOT / "app/node_registry/builtin"
+    modules: dict[str, Any] = {}
+    for path in sorted(builtin_dir.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        module_name = f"app.node_registry.builtin.{path.stem}"
+        module = importlib.import_module(module_name)
+        if hasattr(module, "DEFINITION"):
+            modules[module.DEFINITION.type_name] = module
+    return modules
+
+
+def registered_builtin_type_names() -> set[str]:
+    return {module.DEFINITION.type_name for module in BUILTIN_MODULES}
+
+
 def manifest_json(manifest: dict[str, Any] | None = None) -> str:
     return json.dumps(
         build_manifest() if manifest is None else manifest,
@@ -89,11 +113,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.paths:
-        print(manifest_json(), end="")
-        return
-
-    for path in args.paths:
+    paths = tuple(args.paths) if args.paths else DEFAULT_OUTPUT_PATHS
+    for path in paths:
         write_manifest(path)
 
 
