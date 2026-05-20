@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -105,6 +106,102 @@ func TestCopyFileRejectsSameFile(t *testing.T) {
 	} else if string(got) != "input" {
 		t.Fatalf("source was modified: %q", string(got))
 	}
+}
+
+type fakeExportQualityService struct {
+	result ExportQualityResult
+	calls  []fakeExportQualityCall
+}
+
+type fakeExportQualityCall struct {
+	sourcePath string
+	outputPath string
+	config     map[string]any
+}
+
+func (s *fakeExportQualityService) QAExport(_ context.Context, sourcePath string, outputPath string, config map[string]any) (ExportQualityResult, error) {
+	s.calls = append(s.calls, fakeExportQualityCall{sourcePath: sourcePath, outputPath: outputPath, config: config})
+	return s.result, nil
+}
+
+func TestExportReturnsQualityReportMetadata(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "input.mp4")
+	output := filepath.Join(root, "artifact.mp4")
+	exportDir := filepath.Join(root, "exports")
+	if err := os.WriteFile(source, []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	quality := &fakeExportQualityService{
+		result: ExportQualityResult{Report: map[string]any{"enabled": true, "qa_action": "passed"}},
+	}
+	handler := ExportHandler{QualityService: quality}
+
+	result, err := handler.Execute(context.Background(), map[string]string{"input": source}, output, map[string]any{"output_dir": exportDir, "filename": "final.mp4"})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(mustReadFile(t, output)); got != "input" {
+		t.Fatalf("output = %q", got)
+	}
+	if got := string(mustReadFile(t, filepath.Join(exportDir, "final.mp4"))); got != "input" {
+		t.Fatalf("export = %q", got)
+	}
+	if !reflect.DeepEqual(result, map[string]any{"quality_report": map[string]any{"enabled": true, "qa_action": "passed"}}) {
+		t.Fatalf("metadata = %#v", result)
+	}
+	if len(quality.calls) != 1 || quality.calls[0].sourcePath != source || quality.calls[0].outputPath != output {
+		t.Fatalf("quality calls = %#v", quality.calls)
+	}
+}
+
+func TestExportReplacesOutputWithRepairedFile(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "input.mp4")
+	repaired := filepath.Join(root, "repaired.mp4")
+	output := filepath.Join(root, "artifact.mp4")
+	exportDir := filepath.Join(root, "exports")
+	if err := os.WriteFile(source, []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repaired, []byte("repaired"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	quality := &fakeExportQualityService{
+		result: ExportQualityResult{
+			Report:       map[string]any{"qa_action": "reencoded_once"},
+			RepairedPath: repaired,
+		},
+	}
+	handler := ExportHandler{QualityService: quality}
+
+	result, err := handler.Execute(context.Background(), map[string]string{"input": source}, output, map[string]any{"output_dir": exportDir, "filename": "final.mp4"})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(mustReadFile(t, output)); got != "repaired" {
+		t.Fatalf("output = %q", got)
+	}
+	if got := string(mustReadFile(t, filepath.Join(exportDir, "final.mp4"))); got != "repaired" {
+		t.Fatalf("export = %q", got)
+	}
+	if result["quality_report"].(map[string]any)["qa_action"] != "reencoded_once" {
+		t.Fatalf("metadata = %#v", result)
+	}
+	if _, err := os.Stat(repaired); !os.IsNotExist(err) {
+		t.Fatalf("repaired temp should be removed, err=%v", err)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestBatch4AArgs(t *testing.T) {
