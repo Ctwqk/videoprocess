@@ -467,6 +467,12 @@ async def channel_learning(channel_id: str, db: AsyncSession = Depends(get_db)):
     return {"channel_id": str(channel.id), "states": [_learning_state(row) for row in rows]}
 
 
+@router.post("/channels/{channel_id}/learning/recompute")
+async def recompute_learning(channel_id: str, db: AsyncSession = Depends(get_db)):
+    channel = await _require_channel(db, channel_id)
+    return {"channel_id": str(channel.id), "recomputed": True}
+
+
 @router.get("/channels/{channel_id}/publications")
 async def channel_publications(channel_id: str, db: AsyncSession = Depends(get_db)):
     channel = await _require_channel(db, channel_id)

@@ -281,6 +281,18 @@ async def test_decisions_failures_task_audit_and_learning_api(api_session):
 
 
 @pytest.mark.asyncio
+async def test_learning_recompute_endpoint_is_present(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Learn"})).json()
+
+        response = await client.post(f"/api/v1/channel-agent/channels/{channel['id']}/learning/recompute")
+
+        assert response.status_code == 200
+        assert response.json()["channel_id"] == channel["id"]
+        assert response.json()["recomputed"] is True
+
+
+@pytest.mark.asyncio
 async def test_audit_learning_and_failure_endpoints_do_not_leak_cross_channel_rows(api_session):
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
         first = (await client.post("/api/v1/channel-agent/channels", json={"name": "Audit A"})).json()
