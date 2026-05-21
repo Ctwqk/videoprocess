@@ -3,6 +3,7 @@ package channelops
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -32,5 +33,23 @@ func TestRunnerRunWaitsForCancellation(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Run did not return after cancellation")
+	}
+}
+
+func TestRunnerRunOnceRejectsMissingHandlerDependencies(t *testing.T) {
+	store := &Store{Now: func() time.Time {
+		return time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC)
+	}}
+	runner := &Runner{
+		Store:    store,
+		Handlers: HandlerService{Store: store, PDS: PDSClient{}},
+	}
+
+	err := runner.runOnce(context.Background())
+	if err == nil {
+		t.Fatal("expected missing handler dependencies to return an error")
+	}
+	if !strings.Contains(err.Error(), "autoflow client is not configured") {
+		t.Fatalf("error = %v", err)
 	}
 }

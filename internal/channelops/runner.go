@@ -2,15 +2,15 @@ package channelops
 
 import (
 	"context"
-	"fmt"
+	"net/http"
 	"time"
 )
 
 type Runner struct {
-	Config         Config
-	Store          *Store
-	Scheduler      Scheduler
-	ClaimableKinds []string
+	Config    Config
+	Store     *Store
+	Scheduler Scheduler
+	Handlers  HandlerService
 }
 
 func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
@@ -18,8 +18,17 @@ func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
-	runner := &Runner{Config: cfg, Store: st, ClaimableKinds: []string{}}
+	pds := PDSClient{
+		Enabled:     cfg.PDSEnabled,
+		DevAllowAll: cfg.DevAllowAllPDS,
+		BaseURL:     cfg.PDSBaseURL,
+		ClientID:    cfg.PDSClientID,
+		Timeout:     cfg.PDSTimeout,
+		HTTPClient:  &http.Client{Timeout: cfg.PDSTimeout},
+	}
+	runner := &Runner{Config: cfg, Store: st}
 	runner.Scheduler = Scheduler{Store: st}
+	runner.Handlers = HandlerService{Store: st, PDS: pds, Config: cfg}
 	return runner, nil
 }
 
@@ -45,17 +54,24 @@ func (r *Runner) runOnce(ctx context.Context) error {
 	if r.Scheduler.Store != nil {
 		_, _ = r.Scheduler.RunOnce(ctx, r.Store.Now())
 	}
-	if len(r.ClaimableKinds) == 0 {
+	if err := r.Handlers.ReadinessError(); err != nil {
+		return err
+	}
+	claimableKinds := r.Handlers.ClaimableKinds()
+	if len(claimableKinds) == 0 {
 		return nil
 	}
-	item, err := r.Store.ClaimNextForKinds(ctx, "channelops-go-runner", r.ClaimableKinds)
+	item, err := r.Store.ClaimNextForKinds(ctx, "channelops-go-runner", claimableKinds)
 	if err != nil {
 		return err
 	}
 	if item == nil {
 		return nil
 	}
-	return r.Store.MarkQueueFailedOrRetry(ctx, *item, fmt.Sprintf("handler not registered yet: %s", item.Kind))
+	if err := r.Handlers.Handle(ctx, *item); err != nil {
+		return r.Store.MarkQueueFailedOrRetry(ctx, *item, err.Error())
+	}
+	return r.Store.MarkQueueDone(ctx, item.ID)
 }
 
 func (r *Runner) Close() {
