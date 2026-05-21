@@ -156,7 +156,7 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 	if err != nil {
 		return err
 	}
-	if err := s.updateTaskState(ctx, publication.ProductionTaskID, TaskScheduled, "", "", "promote_publication", now); err != nil {
+	if err := s.updateTaskState(ctx, publication.ProductionTaskID, TaskScheduled, "", "", "promote_publication", "", now); err != nil {
 		return err
 	}
 	parentID, err := optionalUUID("parent_queue_item_id", parentQueueItemID)
@@ -326,7 +326,7 @@ func (s *Store) MarkPublicationSevereDedup(ctx context.Context, publication Publ
 	`, publication.ID, severeStatus, safePrivacy(status.Privacy), status.Permalink, rawJSON, now.UTC()); err != nil {
 		return err
 	}
-	return s.updateTaskState(ctx, publication.ProductionTaskID, TaskHeld, "platform_rejected", "YouTube reported "+eventType, "reconcile_publication", now.UTC())
+	return s.updateTaskState(ctx, publication.ProductionTaskID, TaskHeld, "platform_rejected", "YouTube reported "+eventType, "reconcile_publication", FailureYouTubeStatus, now.UTC())
 }
 
 func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication PublicationRow, item QueueItemRow, maxPolls int, metricsDelay time.Duration) error {
@@ -347,7 +347,7 @@ func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication Publicatio
 		return err
 	}
 	if nextCount >= maxPolls {
-		return s.updateTaskState(ctx, publication.ProductionTaskID, TaskHeld, "metrics_unavailable", "Publication metrics were unavailable after polling", "collect_metrics", now)
+		return s.updateTaskState(ctx, publication.ProductionTaskID, TaskHeld, "metrics_unavailable", "Publication metrics were unavailable after polling", "collect_metrics", FailureMetrics, now)
 	}
 	parentID, err := optionalUUID("parent_queue_item_id", item.ID)
 	if err != nil {
@@ -434,7 +434,7 @@ func (s *Store) UpsertFeedbackSnapshot(ctx context.Context, publication Publicat
 	`, publication.ID, now); err != nil {
 		return err
 	}
-	return s.updateTaskState(ctx, publication.ProductionTaskID, TaskMeasured, "", "", "collect_metrics", now)
+	return s.updateTaskState(ctx, publication.ProductionTaskID, TaskMeasured, "", "", "collect_metrics", "", now)
 }
 
 func (s *Store) UpdateAccountHealth(ctx context.Context, accountID string, health YouTubeAccountHealth) error {
@@ -535,10 +535,10 @@ func (s *Store) getPublishingAccount(ctx context.Context, accountID string) (Pub
 }
 
 func (s *Store) markTaskUploadedPrivate(ctx context.Context, taskID string, now time.Time) error {
-	return s.updateTaskState(ctx, taskID, TaskUploadedPrivate, "", "", "publish_task", now)
+	return s.updateTaskState(ctx, taskID, TaskUploadedPrivate, "", "", "publish_task", "", now)
 }
 
-func (s *Store) updateTaskState(ctx context.Context, taskID string, state string, guard string, reason string, transitionReason string, now time.Time) error {
+func (s *Store) updateTaskState(ctx context.Context, taskID string, state string, guard string, reason string, transitionReason string, failureCategory string, now time.Time) error {
 	if err := requireUUID("production_task_id", taskID); err != nil {
 		return err
 	}
@@ -550,11 +550,16 @@ func (s *Store) updateTaskState(ctx context.Context, taskID string, state string
 	if reason != "" {
 		reasonValue = &reason
 	}
+	var categoryValue *string
+	if failureCategory != "" {
+		categoryValue = &failureCategory
+	}
 	_, err := s.Pool.Exec(ctx, `
 		UPDATE production_tasks
 		SET state = $2::text,
 		    blocked_by_guard = $3::text,
 		    failure_reason = $4::text,
+		    failure_category = $7::text,
 		    state_updated_at = $5::timestamptz,
 		    updated_at = $5::timestamp,
 		    transition_history_json = (
@@ -567,7 +572,7 @@ func (s *Store) updateTaskState(ctx context.Context, taskID string, state string
 		        ))
 		    )::json
 		WHERE id = $1::uuid
-	`, taskID, state, guardValue, reasonValue, now.UTC(), transitionReason)
+	`, taskID, state, guardValue, reasonValue, now.UTC(), transitionReason, categoryValue)
 	return err
 }
 
