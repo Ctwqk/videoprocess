@@ -161,6 +161,7 @@ def upgrade() -> None:
                 summary = EXCLUDED.summary,
                 keywords_json = EXCLUDED.keywords_json,
                 observed_at = EXCLUDED.observed_at,
+                expires_at = COALESCE(EXCLUDED.expires_at, discovery_signals.expires_at),
                 trend_score = EXCLUDED.trend_score,
                 novelty_score = EXCLUDED.novelty_score,
                 raw_json = EXCLUDED.raw_json,

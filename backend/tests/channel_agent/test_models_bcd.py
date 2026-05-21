@@ -55,6 +55,7 @@ def test_trend_seed_migration_preserves_ingester_metadata():
 
     assert "constraints_json->>'source_video_id'" in source
     assert "constraints_json->>'expires_at'" in source
+    assert "expires_at = COALESCE(EXCLUDED.expires_at, discovery_signals.expires_at)" in source
     assert "'view_count'" in source
     assert "'raw_constraints'" in source
 
