@@ -382,6 +382,19 @@ func TestRunTickBackfillsDecisionAuditCreatedTaskID(t *testing.T) {
 	decodeDecisionAuditObject(t, "learning_context_json", row.LearningContextJSON)
 }
 
+func TestAttachDecisionAuditTaskErrorsWhenDecisionAuditMissing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	if err := fixture.Store.AttachDecisionAuditTask(ctx, testUUID(t, "missing-audit"), testUUID(t, "task")); err == nil {
+		t.Fatal("AttachDecisionAuditTask returned nil for a missing audit row")
+	}
+}
+
 type decisionAuditFixtureRow struct {
 	TickAuditID         string
 	CandidateID         string

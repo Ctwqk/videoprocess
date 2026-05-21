@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -11,6 +13,11 @@ type Store struct {
 	Pool               *pgxpool.Pool
 	Now                func() time.Time
 	DefaultMaxAttempts int
+}
+
+type dbExecutor interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
 func OpenStore(ctx context.Context, databaseURL string) (*Store, error) {

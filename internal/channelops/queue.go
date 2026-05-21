@@ -115,6 +115,10 @@ type EnqueueOptions struct {
 }
 
 func (s *Store) Enqueue(ctx context.Context, opts EnqueueOptions) (string, error) {
+	return s.enqueue(ctx, s.Pool, opts)
+}
+
+func (s *Store) enqueue(ctx context.Context, db dbExecutor, opts EnqueueOptions) (string, error) {
 	if opts.MaxAttempts <= 0 {
 		opts.MaxAttempts = s.defaultMaxAttempts()
 	}
@@ -127,7 +131,7 @@ func (s *Store) Enqueue(ctx context.Context, opts EnqueueOptions) (string, error
 	}
 
 	var id string
-	err = s.Pool.QueryRow(ctx, `
+	err = db.QueryRow(ctx, `
 		INSERT INTO channel_ops_queue_items
 			(id, kind, idempotency_key, payload_json, status, priority, run_after, attempt_count,
 			 max_attempts, channel_profile_id, parent_queue_item_id)

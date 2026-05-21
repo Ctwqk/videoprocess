@@ -255,6 +255,10 @@ func (s *Store) ListLaneFormats(ctx context.Context, lanes []TopicLaneRow) (map[
 }
 
 func (s *Store) InsertTickAudit(ctx context.Context, channelID string, bucket string, result TickResult, summary map[string]any) (string, error) {
+	return s.insertTickAudit(ctx, s.Pool, channelID, bucket, result, summary)
+}
+
+func (s *Store) insertTickAudit(ctx context.Context, db dbExecutor, channelID string, bucket string, result TickResult, summary map[string]any) (string, error) {
 	now := s.Now().UTC()
 	tickID := fmt.Sprintf("tick:%s:%s", channelID, bucket)
 	decisionSummary := jsonObject(summary)
@@ -272,7 +276,7 @@ func (s *Store) InsertTickAudit(ctx context.Context, channelID string, bucket st
 	}
 
 	var id string
-	err = s.Pool.QueryRow(ctx, `
+	err = db.QueryRow(ctx, `
 		INSERT INTO agent_tick_audits (
 			id, channel_profile_id, tick_id, started_at, finished_at, dry_run,
 			ideas_discovered, candidates_scored, tasks_selected, tasks_rejected,
@@ -296,6 +300,10 @@ func (s *Store) InsertTickAudit(ctx context.Context, channelID string, bucket st
 }
 
 func (s *Store) InsertDecisionAuditEntries(ctx context.Context, tickAuditID string, channelID string, result TickResult) (map[string]string, error) {
+	return s.insertDecisionAuditEntries(ctx, s.Pool, tickAuditID, channelID, result)
+}
+
+func (s *Store) insertDecisionAuditEntries(ctx context.Context, db dbExecutor, tickAuditID string, channelID string, result TickResult) (map[string]string, error) {
 	ids := map[string]string{}
 	candidates := make([]TickCandidate, 0, len(result.Accepted)+len(result.Rejected))
 	candidates = append(candidates, result.Accepted...)
@@ -315,7 +323,7 @@ func (s *Store) InsertDecisionAuditEntries(ctx context.Context, tickAuditID stri
 		}
 		pdsJSON := []byte("{}")
 		var id string
-		err = s.Pool.QueryRow(ctx, `
+		err = db.QueryRow(ctx, `
 			INSERT INTO decision_audit_entries (
 				id, tick_audit_id, channel_profile_id, candidate_id, candidate_source,
 				topic_lane_id, lane_format_id, target_account_id, score_json, guard_results_json,
@@ -339,15 +347,29 @@ func (s *Store) InsertDecisionAuditEntries(ctx context.Context, tickAuditID stri
 }
 
 func (s *Store) AttachDecisionAuditTask(ctx context.Context, auditID string, taskID string) error {
-	_, err := s.Pool.Exec(ctx, `
+	return s.attachDecisionAuditTask(ctx, s.Pool, auditID, taskID)
+}
+
+func (s *Store) attachDecisionAuditTask(ctx context.Context, db dbExecutor, auditID string, taskID string) error {
+	tag, err := db.Exec(ctx, `
 		UPDATE decision_audit_entries
 		SET created_task_id = $2::uuid
 		WHERE id = $1::uuid
 	`, auditID, taskID)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("decision audit entry %s not found", auditID)
+	}
+	return nil
 }
 
 func (s *Store) InsertProductionTask(ctx context.Context, channel ChannelProfileRow, candidate TickCandidate, now time.Time) (string, error) {
+	return s.insertProductionTask(ctx, s.Pool, channel, candidate, now)
+}
+
+func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel ChannelProfileRow, candidate TickCandidate, now time.Time) (string, error) {
 	if candidate.Account == nil {
 		return "", errors.New("production task candidate has no target account")
 	}
@@ -395,7 +417,7 @@ func (s *Store) InsertProductionTask(ctx context.Context, channel ChannelProfile
 	}
 
 	var id string
-	err = s.Pool.QueryRow(ctx, `
+	err = db.QueryRow(ctx, `
 		INSERT INTO production_tasks (
 			id, channel_profile_id, topic_lane_id, lane_format_id, target_account_id,
 			manual_seed_id, source, title_seed, prompt, rationale_json,
