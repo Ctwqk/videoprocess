@@ -13,7 +13,7 @@ func validConfig() Config {
 		PDSTimeout:              500 * time.Millisecond,
 		RunnerPollSeconds:       5,
 		SchedulerPollSeconds:    60,
-		MaxQueueAttempts:        5,
+		MaxQueueAttempts:        3,
 		MetricsPollMaxAttempts:  24,
 		MetricsPollDelayMinutes: 60,
 	}
@@ -34,6 +34,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.SchedulerPollSeconds != 60 {
 		t.Fatalf("SchedulerPollSeconds = %v", cfg.SchedulerPollSeconds)
+	}
+	if cfg.MaxQueueAttempts != 3 {
+		t.Fatalf("MaxQueueAttempts = %v, want Python default 3", cfg.MaxQueueAttempts)
 	}
 	if cfg.DevAllowAllPDS {
 		t.Fatal("DevAllowAllPDS default should be false")

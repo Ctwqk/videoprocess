@@ -40,7 +40,7 @@ func LoadConfig() Config {
 		SlackWebhookURL:         env("CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL", ""),
 		AlertEmailTo:            env("CHANNEL_AGENT_ALERT_EMAIL_TO", ""),
 		LiveMode:                boolEnv("CHANNELOPS_LIVE_MODE", true),
-		MaxQueueAttempts:        intEnv("CHANNELOPS_QUEUE_MAX_ATTEMPTS", 5),
+		MaxQueueAttempts:        intEnv("CHANNELOPS_QUEUE_MAX_ATTEMPTS", 3),
 		MetricsPollMaxAttempts:  intEnv("CHANNELOPS_METRICS_MAX_POLLS", 24),
 		MetricsPollDelayMinutes: intEnv("CHANNELOPS_METRICS_POLL_DELAY_MINUTES", 60),
 	}

@@ -2,12 +2,14 @@ package channelops
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
 type Runner struct {
-	Config Config
-	Store  *Store
+	Config         Config
+	Store          *Store
+	ClaimableKinds []string
 }
 
 func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
@@ -15,7 +17,7 @@ func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{Config: cfg, Store: st}, nil
+	return &Runner{Config: cfg, Store: st, ClaimableKinds: []string{}}, nil
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -26,9 +28,25 @@ func (r *Runner) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			// Queue and scheduler work is wired in later tasks.
+			if err := r.runOnce(ctx); err != nil {
+				return err
+			}
 		}
 	}
+}
+
+func (r *Runner) runOnce(ctx context.Context) error {
+	if r.Store == nil || len(r.ClaimableKinds) == 0 {
+		return nil
+	}
+	item, err := r.Store.ClaimNextForKinds(ctx, "channelops-go-runner", r.ClaimableKinds)
+	if err != nil {
+		return err
+	}
+	if item == nil {
+		return nil
+	}
+	return r.Store.MarkQueueFailedOrRetry(ctx, *item, fmt.Sprintf("handler not registered yet: %s", item.Kind))
 }
 
 func (r *Runner) Close() {
