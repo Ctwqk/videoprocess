@@ -292,7 +292,7 @@ func (s *Store) MarkPublicationSevereDedup(ctx context.Context, publication Publ
 			)
 			VALUES (
 				gen_random_uuid(), $1::uuid, $2, $3, 'severe', $4::json,
-				jsonb_build_array(jsonb_build_object('action', 'hold_task', 'dedup_key', $5, 'at', $6))::json
+				jsonb_build_array(jsonb_build_object('action', 'hold_task', 'dedup_key', $5::text, 'at', $6::text))::json
 			)
 		`, publication.ID, eventType, now.UTC(), rawJSON, dedupKey, now.UTC().Format(time.RFC3339))
 	} else {
@@ -300,7 +300,7 @@ func (s *Store) MarkPublicationSevereDedup(ctx context.Context, publication Publ
 			UPDATE takedown_events
 			SET auto_actions_taken_json = (
 				COALESCE(auto_actions_taken_json, '[]'::json)::jsonb ||
-				jsonb_build_array(jsonb_build_object('repeat', true, 'dedup_key', $2, 'at', $3, 'raw', $4::jsonb))
+				jsonb_build_array(jsonb_build_object('repeat', true, 'dedup_key', $2::text, 'at', $3::text, 'raw', $4::jsonb))
 			)::json
 			WHERE id = $1::uuid
 		`, existingID, dedupKey, now.UTC().Format(time.RFC3339), rawJSON)

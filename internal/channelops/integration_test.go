@@ -206,6 +206,50 @@ func TestPublicationMetricsFailureCategoryPersistsAndClears(t *testing.T) {
 	}
 }
 
+func TestPublicationYouTubeStatusFailureCategoryPersists(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote.ID); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+	publicationID, _ := promote.PayloadJSON["publication_id"].(string)
+	publication, err := fixture.Store.GetPublication(ctx, publicationID)
+	if err != nil {
+		t.Fatalf("GetPublication: %v", err)
+	}
+	handler.YouTube = fakeSevereStatusYouTube{fakeYouTube{}}
+
+	err = handler.HandleReconcilePublication(ctx, QueueItemRow{
+		ID:          testUUID(t, "reconcile-item"),
+		Kind:        QueueReconcilePublication,
+		PayloadJSON: map[string]any{"publication_id": publicationID},
+	})
+	if err != nil {
+		t.Fatalf("HandleReconcilePublication: %v", err)
+	}
+	task, err := fixture.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+	if err != nil {
+		t.Fatalf("GetProductionTask: %v", err)
+	}
+	if task.FailureCategory == nil || *task.FailureCategory != FailureYouTubeStatus {
+		t.Fatalf("youtube status task failure category = %#v, want %q", task.FailureCategory, FailureYouTubeStatus)
+	}
+}
+
 type ChannelOpsFixture struct {
 	T         *testing.T
 	Store     *Store
@@ -597,4 +641,18 @@ type fakeNoMetricsYouTube struct {
 
 func (fakeNoMetricsYouTube) FetchMetrics(ctx context.Context, videoID string) (map[string]any, error) {
 	return map[string]any{}, nil
+}
+
+type fakeSevereStatusYouTube struct {
+	fakeYouTube
+}
+
+func (fakeSevereStatusYouTube) PublicationStatus(ctx context.Context, videoID string) (YouTubePublicationStatus, error) {
+	return YouTubePublicationStatus{
+		VideoID:       videoID,
+		PublishStatus: "rejected",
+		Privacy:       "private",
+		Permalink:     "https://youtu.be/" + videoID,
+		Raw:           map[string]any{"status": "rejected"},
+	}, nil
 }
