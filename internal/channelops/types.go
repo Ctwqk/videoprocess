@@ -47,8 +47,6 @@ type ChannelProfileRow struct {
 	CadencePolicyJSON    map[string]any
 	ContentMixPolicyJSON map[string]any
 	DefaultAspectRatio   string
-	ExternalAutoPublish  bool
-	MaxPostsPerDay       int
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 }
@@ -90,7 +88,7 @@ type PublishingAccountRow struct {
 	Enabled             bool
 	PausedUntil         *time.Time
 	DefaultPrivacy      string
-	QuotaUnitsRemaining int
+	ExternalAutoPublish bool
 	CreatedAt           time.Time
 }
 

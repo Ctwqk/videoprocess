@@ -1,0 +1,287 @@
+package channelops
+
+import (
+	"fmt"
+	"strings"
+)
+
+type TickCandidate struct {
+	CandidateID            string
+	Source                 string
+	SourceKind             string
+	Seed                   *ManualSeedRow
+	Lane                   *TopicLaneRow
+	LaneFormat             *LaneFormatRow
+	Account                *PublishingAccountRow
+	Prompt                 string
+	TitleSeed              string
+	SourcePlatformsJSON    []string
+	MaterialLibraryIDsJSON []string
+	ConstraintsJSON        map[string]any
+	ManualMaterialOverride bool
+	Rejected               bool
+	RejectionGuard         string
+	RejectionReason        string
+}
+
+type TickResult struct {
+	DryRun   bool
+	Accepted []TickCandidate
+	Rejected []TickCandidate
+}
+
+func (r TickResult) TasksToCreate() int {
+	if r.DryRun {
+		return 0
+	}
+	return len(r.Accepted)
+}
+
+func BuildTickCandidates(
+	channel ChannelProfileRow,
+	lanes []TopicLaneRow,
+	accounts []PublishingAccountRow,
+	seeds []ManualSeedRow,
+	laneFormats map[string][]LaneFormatRow,
+	bucket string,
+) []TickCandidate {
+	candidates := []TickCandidate{}
+	activeLanes := enabledLanes(lanes)
+	activeAccounts := enabledAccounts(accounts)
+	laneByID := map[string]TopicLaneRow{}
+	for _, lane := range activeLanes {
+		laneByID[lane.ID] = lane
+	}
+
+	var fallbackLane *TopicLaneRow
+	if len(activeLanes) > 0 {
+		laneCopy := activeLanes[0]
+		fallbackLane = &laneCopy
+	}
+
+	selectedByLane := map[string]int{}
+	for _, seed := range seeds {
+		lane, laneRejection := resolveSeedLane(seed, fallbackLane, laneByID)
+		laneFormat := firstEnabledLaneFormat(lane, laneFormats)
+		account, accountRejection := resolveSeedAccount(seed, activeAccounts)
+		candidate := CandidateFromManualSeed(seed, lane, laneFormat, account, bucket)
+		switch {
+		case laneRejection != "":
+			candidate.Rejected = true
+			candidate.RejectionGuard = "lane_unavailable"
+			candidate.RejectionReason = laneRejection
+		case accountRejection != "":
+			candidate.Rejected = true
+			candidate.RejectionGuard = "account_unavailable"
+			candidate.RejectionReason = accountRejection
+		}
+		candidates = append(candidates, candidate)
+		if !candidate.Rejected && lane != nil {
+			selectedByLane[lane.ID]++
+		}
+	}
+
+	accountIndex := 0
+	generatedLaneFormats := map[string]bool{}
+	for _, lane := range activeLanes {
+		laneBudget := positiveInt(lane.MaxPostsPerDay, 1)
+		remaining := laneBudget - selectedByLane[lane.ID]
+		if remaining <= 0 {
+			continue
+		}
+		generated := 0
+		for _, format := range laneFormats[lane.ID] {
+			if !format.Enabled || generated >= remaining {
+				continue
+			}
+			laneFormatKey := lane.ID + ":" + format.ID
+			if generatedLaneFormats[laneFormatKey] {
+				continue
+			}
+			generatedLaneFormats[laneFormatKey] = true
+
+			var account *PublishingAccountRow
+			if len(activeAccounts) > 0 {
+				accountCopy := activeAccounts[accountIndex%len(activeAccounts)]
+				account = &accountCopy
+				accountIndex++
+			}
+			laneCopy := lane
+			formatCopy := format
+			candidate := TickCandidate{
+				CandidateID:         candidateID(SourceLaneSeed, lane.ID, format.ID, bucket, ""),
+				Source:              SourceLaneSeed,
+				SourceKind:          SourceLaneSeed,
+				Lane:                &laneCopy,
+				LaneFormat:          &formatCopy,
+				Account:             account,
+				Prompt:              LanePrompt(channel, lane, format),
+				TitleSeed:           lane.Name,
+				SourcePlatformsJSON: stringSlice(format.SourcePlatformsJSON),
+				ConstraintsJSON: map[string]any{
+					"template_pool_json": stringSlice(format.TemplatePoolJSON),
+				},
+			}
+			if account == nil {
+				candidate.Rejected = true
+				candidate.RejectionGuard = "account_unavailable"
+				candidate.RejectionReason = "No active publishing account is available."
+			}
+			candidates = append(candidates, candidate)
+			generated++
+		}
+	}
+	return candidates
+}
+
+func CandidateFromManualSeed(seed ManualSeedRow, lane *TopicLaneRow, laneFormat *LaneFormatRow, account *PublishingAccountRow, bucket string) TickCandidate {
+	sourceKind := SourceManualSeed
+	if seed.SourcePolicy == SourceTrendYT {
+		sourceKind = SourceTrendYT
+	}
+	laneID := ""
+	if lane != nil {
+		laneID = lane.ID
+	} else if seed.TopicLaneID != nil {
+		laneID = *seed.TopicLaneID
+	}
+	formatID := ""
+	if laneFormat != nil {
+		formatID = laneFormat.ID
+	}
+	sourcePlatforms := stringSlice(seed.SourcePlatformsJSON)
+	if len(sourcePlatforms) == 0 && laneFormat != nil {
+		sourcePlatforms = stringSlice(laneFormat.SourcePlatformsJSON)
+	}
+	return TickCandidate{
+		CandidateID:            candidateID(SourceManualSeed, laneID, formatID, bucket, seed.ID),
+		Source:                 SourceManualSeed,
+		SourceKind:             sourceKind,
+		Seed:                   &seed,
+		Lane:                   lane,
+		LaneFormat:             laneFormat,
+		Account:                account,
+		Prompt:                 seed.Prompt,
+		TitleSeed:              seed.TitleSeed,
+		SourcePlatformsJSON:    sourcePlatforms,
+		MaterialLibraryIDsJSON: stringSlice(seed.MaterialLibraryIDsJSON),
+		ConstraintsJSON:        jsonObject(seed.ConstraintsJSON),
+		ManualMaterialOverride: sourceKind == SourceManualSeed,
+	}
+}
+
+func LanePrompt(channel ChannelProfileRow, lane TopicLaneRow, format LaneFormatRow) string {
+	duration := positiveInt(format.TargetDurationSec, 30)
+	aspectRatio := strings.TrimSpace(channel.DefaultAspectRatio)
+	if aspectRatio == "" {
+		aspectRatio = "9:16"
+	}
+	return fmt.Sprintf(
+		"Create a %s video for the %q topic. Theme: %s. Keywords: %v. Target duration: %ds. Aspect ratio: %s.",
+		format.FormatKey,
+		lane.Name,
+		lane.Description,
+		lane.KeywordsJSON,
+		duration,
+		aspectRatio,
+	)
+}
+
+func acceptedRejected(candidates []TickCandidate) ([]TickCandidate, []TickCandidate) {
+	accepted := []TickCandidate{}
+	rejected := []TickCandidate{}
+	for _, candidate := range candidates {
+		if candidate.Rejected {
+			rejected = append(rejected, candidate)
+		} else {
+			accepted = append(accepted, candidate)
+		}
+	}
+	return accepted, rejected
+}
+
+func candidateID(source string, laneID string, formatID string, bucket string, seedID string) string {
+	if laneID == "" {
+		laneID = "unassigned"
+	}
+	if formatID == "" {
+		formatID = "none"
+	}
+	if source == SourceManualSeed && seedID != "" {
+		return fmt.Sprintf("%s:%s:lane:%s:format:%s:%s", source, seedID, laneID, formatID, bucket)
+	}
+	return fmt.Sprintf("%s:lane:%s:format:%s:%s", source, laneID, formatID, bucket)
+}
+
+func enabledLanes(lanes []TopicLaneRow) []TopicLaneRow {
+	result := []TopicLaneRow{}
+	for _, lane := range lanes {
+		if lane.Enabled {
+			result = append(result, lane)
+		}
+	}
+	return result
+}
+
+func enabledAccounts(accounts []PublishingAccountRow) []PublishingAccountRow {
+	result := []PublishingAccountRow{}
+	for _, account := range accounts {
+		if account.Enabled {
+			result = append(result, account)
+		}
+	}
+	return result
+}
+
+func resolveSeedLane(seed ManualSeedRow, fallback *TopicLaneRow, laneByID map[string]TopicLaneRow) (*TopicLaneRow, string) {
+	if seed.TopicLaneID == nil {
+		if fallback == nil {
+			return nil, "No active topic lane is available."
+		}
+		laneCopy := *fallback
+		return &laneCopy, ""
+	}
+	lane, ok := laneByID[*seed.TopicLaneID]
+	if !ok {
+		return nil, fmt.Sprintf("Target topic lane %s is disabled, paused, or unavailable.", *seed.TopicLaneID)
+	}
+	laneCopy := lane
+	return &laneCopy, ""
+}
+
+func resolveSeedAccount(seed ManualSeedRow, accounts []PublishingAccountRow) (*PublishingAccountRow, string) {
+	if seed.TargetAccountID != nil {
+		for _, account := range accounts {
+			if account.ID == *seed.TargetAccountID {
+				accountCopy := account
+				return &accountCopy, ""
+			}
+		}
+		return nil, fmt.Sprintf("Target publishing account %s is disabled, paused, or unavailable.", *seed.TargetAccountID)
+	}
+	if len(accounts) == 0 {
+		return nil, "No active publishing account is available."
+	}
+	accountCopy := accounts[0]
+	return &accountCopy, ""
+}
+
+func firstEnabledLaneFormat(lane *TopicLaneRow, laneFormats map[string][]LaneFormatRow) *LaneFormatRow {
+	if lane == nil {
+		return nil
+	}
+	for _, format := range laneFormats[lane.ID] {
+		if format.Enabled {
+			formatCopy := format
+			return &formatCopy
+		}
+	}
+	return nil
+}
+
+func positiveInt(value int, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
