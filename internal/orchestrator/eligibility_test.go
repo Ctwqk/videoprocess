@@ -7,7 +7,7 @@ import (
 )
 
 func TestClassifyGoEligibilityTask2Cases(t *testing.T) {
-	t.Skip("Task 2 user-owned implementation: remove this skip while implementing eligibility")
+	// t.Skip("Task 2 user-owned implementation: remove this skip while implementing eligibility")
 
 	tests := []struct {
 		name       string
