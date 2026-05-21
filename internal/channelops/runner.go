@@ -28,7 +28,8 @@ func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
 	}
 	runner := &Runner{Config: cfg, Store: st}
 	runner.Scheduler = Scheduler{Store: st}
-	runner.Handlers = HandlerService{Store: st, PDS: pds, Config: cfg}
+	youtube := YouTubeManagerClient{BaseURL: cfg.YouTubeManagerURL, Timeout: 20 * time.Second}
+	runner.Handlers = HandlerService{Store: st, PDS: pds, YouTube: youtube, Config: cfg}
 	return runner, nil
 }
 

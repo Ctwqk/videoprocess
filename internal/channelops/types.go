@@ -19,14 +19,15 @@ const (
 	QueueStatusFailed       = "failed"
 	QueueStatusDeadLettered = "dead_lettered"
 
-	TaskSelected  = "selected"
-	TaskPlanning  = "planning"
-	TaskProducing = "producing"
-	TaskScheduled = "scheduled"
-	TaskMeasured  = "measured"
-	TaskHeld      = "held"
-	TaskFailed    = "failed"
-	TaskRejected  = "rejected"
+	TaskSelected        = "selected"
+	TaskPlanning        = "planning"
+	TaskProducing       = "producing"
+	TaskScheduled       = "scheduled"
+	TaskUploadedPrivate = "uploaded_private"
+	TaskMeasured        = "measured"
+	TaskHeld            = "held"
+	TaskFailed          = "failed"
+	TaskRejected        = "rejected"
 
 	ApprovalAgent = "agent"
 	ApprovalHuman = "human"
@@ -121,6 +122,7 @@ type ProductionTaskRow struct {
 	ScoreBreakdownJSON           map[string]any
 	SourcePlatformsJSON          []string
 	MaterialLibraryIDsJSON       []string
+	UsesExternalAssets           bool
 	ApprovalMode                 string
 	AutoFlowPlanID               *string
 	AutoFlowRunID                *string
@@ -150,4 +152,27 @@ type QueueItemRow struct {
 	DeadLetterAt      *time.Time
 	ChannelProfileID  *string
 	ParentQueueItemID *string
+}
+
+type PublicationRow struct {
+	ID                    string
+	ProductionTaskID      string
+	Platform              string
+	AccountID             string
+	PlatformContentID     string
+	Permalink             *string
+	Title                 string
+	Description           string
+	DesiredPrivacy        string
+	CurrentPrivacy        string
+	PublishStatus         string
+	UploadedAt            *time.Time
+	ScheduledPublishAt    *time.Time
+	PublicAt              *time.Time
+	ComplianceDisposition string
+	QuotaUnitsEstimated   int
+	LastMetricsPolledAt   *time.Time
+	WarningsJSON          []any
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }

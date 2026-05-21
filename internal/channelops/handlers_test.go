@@ -1,6 +1,9 @@
 package channelops
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestPlanDecisionFlagHoldsTask(t *testing.T) {
 	result := PlanDecisionResult(PDSDecision{DecisionID: "d-flag", Verdict: "flag"})
@@ -46,4 +49,34 @@ func TestExistingExecutionRequiresRunAndJob(t *testing.T) {
 	if _, _, ok := ExistingExecution(task); ok {
 		t.Fatal("run without job should not count as existing execution")
 	}
+}
+
+func TestTakedownDedupKeyUsesPublicationEventDay(t *testing.T) {
+	key := TakedownDedupKey("pub-1", "rejected", mustTime("2026-05-21T17:15:00Z"))
+	if key != "pub-1:rejected:2026-05-21" {
+		t.Fatalf("key = %s", key)
+	}
+}
+
+func TestPromotionVisibilityDoesNotAllowPublic(t *testing.T) {
+	if got := safePromotionVisibility("public"); got != "" {
+		t.Fatalf("public promotion visibility = %q", got)
+	}
+	if got := safePromotionVisibility("unlisted"); got != "unlisted" {
+		t.Fatalf("unlisted promotion visibility = %q", got)
+	}
+}
+
+func TestObservedPrivacyAllowsPublic(t *testing.T) {
+	if got := observedPrivacy("public"); got != "public" {
+		t.Fatalf("observed privacy = %q", got)
+	}
+}
+
+func mustTime(value string) time.Time {
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		panic(err)
+	}
+	return parsed
 }

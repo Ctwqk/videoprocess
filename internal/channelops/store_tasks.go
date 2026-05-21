@@ -61,7 +61,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		SELECT id, channel_profile_id, topic_lane_id, lane_format_id, target_account_id,
 		       manual_seed_id, source, title_seed, prompt, rationale_json,
 		       score_breakdown_json, source_platforms_json, material_library_ids_json,
-		       approval_mode, autoflow_plan_id, autoflow_run_id, job_id, state,
+		       uses_external_assets, approval_mode, autoflow_plan_id, autoflow_run_id, job_id, state,
 		       blocked_by_guard, failure_reason, transition_history_json,
 		       channel_config_version_snapshot, channel_config_snapshot_json,
 		       state_updated_at
@@ -81,6 +81,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		&scoreJSON,
 		&sourcePlatformsJSON,
 		&materialIDsJSON,
+		&row.UsesExternalAssets,
 		&row.ApprovalMode,
 		&row.AutoFlowPlanID,
 		&row.AutoFlowRunID,
