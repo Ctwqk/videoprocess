@@ -7,10 +7,15 @@ import (
 
 type Runner struct {
 	Config Config
+	Store  *Store
 }
 
 func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
-	return &Runner{Config: cfg}, nil
+	st, err := OpenStore(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return &Runner{Config: cfg, Store: st}, nil
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -26,4 +31,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 }
 
-func (r *Runner) Close() {}
+func (r *Runner) Close() {
+	if r.Store != nil {
+		r.Store.Close()
+	}
+}
