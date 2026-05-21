@@ -25,9 +25,12 @@ from app.models.channel_agent import (
     AgentTickAudit,
     ChannelOpsQueueItem,
     ChannelProfile,
+    DecisionAuditEntry,
     FeedbackSnapshot,
     LaneFormatMatrix,
+    LearningState,
     ManualSeed,
+    MaterialUsageLedger,
     ProductionTask,
     PublicationRecord,
     PublishingAccount,
@@ -358,6 +361,101 @@ async def get_task(task_id: str, db: AsyncSession = Depends(get_db)):
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return _task(task)
+
+
+@router.get("/channels/{channel_id}/decisions")
+async def channel_decisions(
+    channel_id: str,
+    tick_audit_id: str | None = None,
+    candidate_source: str | None = None,
+    selected: bool | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    channel = await _require_channel(db, channel_id)
+    query = select(DecisionAuditEntry).where(DecisionAuditEntry.channel_profile_id == channel.id)
+    if tick_audit_id:
+        query = query.where(DecisionAuditEntry.tick_audit_id == _uuid(tick_audit_id))
+    if candidate_source:
+        query = query.where(DecisionAuditEntry.candidate_source == candidate_source)
+    if selected is not None:
+        query = query.where(DecisionAuditEntry.selected.is_(selected))
+    rows = (
+        await db.execute(
+            query.order_by(DecisionAuditEntry.created_at.desc())
+            .offset(max(offset, 0))
+            .limit(min(max(limit, 1), 500))
+        )
+    ).scalars().all()
+    return [_decision(row) for row in rows]
+
+
+@router.get("/tasks/{task_id}/audit")
+async def task_audit(task_id: str, db: AsyncSession = Depends(get_db)):
+    task = await db.get(ProductionTask, _uuid(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="Production task not found")
+    decision = (
+        await db.execute(
+            select(DecisionAuditEntry)
+            .where(DecisionAuditEntry.created_task_id == task.id)
+            .where(DecisionAuditEntry.channel_profile_id == task.channel_profile_id)
+            .limit(1)
+        )
+    ).scalars().first()
+    publication = (
+        await db.execute(select(PublicationRecord).where(PublicationRecord.production_task_id == task.id).limit(1))
+    ).scalars().first()
+    material_rows = []
+    if publication is not None:
+        material_rows = (
+            await db.execute(
+                select(MaterialUsageLedger)
+                .where(MaterialUsageLedger.publication_id == publication.id)
+                .where(MaterialUsageLedger.channel_profile_id == task.channel_profile_id)
+            )
+        ).scalars().all()
+    return {
+        "task": _task(task),
+        "decision": _decision(decision) if decision else None,
+        "publication": _publication(publication) if publication else None,
+        "material_usage": [_material_usage(row) for row in material_rows],
+    }
+
+
+@router.get("/channels/{channel_id}/failures")
+async def channel_failures(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_db)):
+    channel = await _require_channel(db, channel_id)
+    clamped_days = max(days, 0)
+    since = _naive_utc(Clock().now() - timedelta(days=clamped_days))
+    rows = (
+        await db.execute(
+            select(ProductionTask.failure_category, func.count(ProductionTask.id))
+            .where(ProductionTask.channel_profile_id == channel.id)
+            .where(ProductionTask.created_at >= since)
+            .where(ProductionTask.failure_category.is_not(None))
+            .group_by(ProductionTask.failure_category)
+        )
+    ).all()
+    return {"days": clamped_days, "categories": {str(category): int(count) for category, count in rows}}
+
+
+@router.get("/channels/{channel_id}/learning")
+async def channel_learning(channel_id: str, db: AsyncSession = Depends(get_db)):
+    channel = await _require_channel(db, channel_id)
+    rows = (
+        await db.execute(
+            select(LearningState)
+            .where(LearningState.channel_profile_id == channel.id)
+            .order_by(
+                LearningState.dimension_type.asc(),
+                LearningState.dimension_key.asc(),
+                LearningState.window_days.asc(),
+            )
+        )
+    ).scalars().all()
+    return {"channel_id": str(channel.id), "states": [_learning_state(row) for row in rows]}
 
 
 @router.get("/channels/{channel_id}/publications")
@@ -767,6 +865,8 @@ def _task(row: ProductionTask) -> dict[str, Any]:
         "title_seed": row.title_seed,
         "blocked_by_guard": row.blocked_by_guard,
         "failure_reason": row.failure_reason,
+        "failure_category": row.failure_category,
+        "discovery_signal_id": str(row.discovery_signal_id) if row.discovery_signal_id else None,
     }
 
 
@@ -781,4 +881,50 @@ def _publication(row: PublicationRecord) -> dict[str, Any]:
         "current_privacy": row.current_privacy,
         "publish_status": row.publish_status,
         "warnings_json": row.warnings_json,
+    }
+
+
+def _decision(row: DecisionAuditEntry) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "tick_audit_id": str(row.tick_audit_id),
+        "channel_profile_id": str(row.channel_profile_id),
+        "candidate_id": row.candidate_id,
+        "candidate_source": row.candidate_source,
+        "topic_lane_id": str(row.topic_lane_id) if row.topic_lane_id else None,
+        "lane_format_id": str(row.lane_format_id) if row.lane_format_id else None,
+        "target_account_id": str(row.target_account_id) if row.target_account_id else None,
+        "score_json": row.score_json or {},
+        "guard_results_json": row.guard_results_json or [],
+        "pds_decision_json": row.pds_decision_json or {},
+        "learning_context_json": row.learning_context_json or {},
+        "selected": row.selected,
+        "rejection_reason": row.rejection_reason,
+        "created_task_id": str(row.created_task_id) if row.created_task_id else None,
+        "created_at": row.created_at,
+    }
+
+
+def _learning_state(row: LearningState) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "channel_profile_id": str(row.channel_profile_id),
+        "dimension_type": row.dimension_type,
+        "dimension_key": row.dimension_key,
+        "window_days": row.window_days,
+        "sample_count": row.sample_count,
+        "avg_reward": row.avg_reward,
+        "confidence": row.confidence,
+        "recommendation_json": row.recommendation_json or {},
+        "last_computed_at": row.last_computed_at,
+    }
+
+
+def _material_usage(row: MaterialUsageLedger) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "material_id": row.material_id,
+        "asset_id": str(row.asset_id) if row.asset_id else None,
+        "segment_signature": row.segment_signature,
+        "metadata_json": row.metadata_json or {},
     }

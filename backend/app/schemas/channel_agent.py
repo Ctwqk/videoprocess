@@ -110,3 +110,35 @@ class HealthSummary(BaseModel):
     recent_failures: int = 0
     last_successful_measured_at: datetime | None = None
     warnings: list[str] = Field(default_factory=list)
+
+
+class DecisionAuditEntryRead(BaseModel):
+    id: str
+    tick_audit_id: str
+    channel_profile_id: str
+    candidate_id: str
+    candidate_source: str
+    topic_lane_id: str | None = None
+    lane_format_id: str | None = None
+    target_account_id: str | None = None
+    score_json: dict[str, Any]
+    guard_results_json: list[Any]
+    pds_decision_json: dict[str, Any]
+    learning_context_json: dict[str, Any]
+    selected: bool
+    rejection_reason: str | None = None
+    created_task_id: str | None = None
+    created_at: datetime
+
+
+class LearningStateRead(BaseModel):
+    id: str
+    channel_profile_id: str
+    dimension_type: str
+    dimension_key: str
+    window_days: int
+    sample_count: int
+    avg_reward: float
+    confidence: float
+    recommendation_json: dict[str, Any]
+    last_computed_at: datetime

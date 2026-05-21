@@ -14,8 +14,11 @@ from app.models.channel_agent import (
     AgentTickAudit,
     ChannelOpsQueueItem,
     ChannelProfile,
+    DecisionAuditEntry,
+    DiscoverySignal,
     FeedbackSnapshot,
     LaneFormatMatrix,
+    LearningState,
     ManualSeed,
     MaterialUsageLedger,
     ProductionTask,
@@ -34,11 +37,14 @@ CHANNEL_AGENT_TABLES = (
     ChannelOpsQueueItem.__table__,
     AgentTickAudit.__table__,
     ManualSeed.__table__,
+    DiscoverySignal.__table__,
     ProductionTask.__table__,
     MaterialUsageLedger.__table__,
     PublicationRecord.__table__,
     TakedownEvent.__table__,
     FeedbackSnapshot.__table__,
+    DecisionAuditEntry.__table__,
+    LearningState.__table__,
 )
 
 
@@ -198,6 +204,80 @@ async def test_enqueue_metrics_returns_channel_scoped_queue_item(api_session):
         queue_item = response.json()
         assert queue_item["kind"] == "collect_metrics"
         assert queue_item["channel_profile_id"] == channel["id"]
+
+
+@pytest.mark.asyncio
+async def test_decisions_failures_task_audit_and_learning_api(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Audit"})).json()
+        account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{channel['id']}/accounts",
+                json={"account_label": "main", "platform_account_id": "yt", "credential_ref": "youtube/main"},
+            )
+        ).json()
+        task = ProductionTask(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            target_account_id=uuid.UUID(account["id"]),
+            source="manual_seed",
+            prompt="audit task",
+            title_seed="audit",
+            state="failed",
+            failure_reason="quota exhausted",
+            failure_category="quota",
+            channel_config_snapshot_json={},
+        )
+        api_session.add(task)
+        await api_session.flush()
+        tick = AgentTickAudit(channel_profile_id=uuid.UUID(channel["id"]), tick_id="tick:audit", dry_run=False)
+        api_session.add(tick)
+        await api_session.flush()
+        decision = DecisionAuditEntry(
+            tick_audit_id=tick.id,
+            channel_profile_id=uuid.UUID(channel["id"]),
+            candidate_id="manual_seed:example",
+            candidate_source="manual_seed",
+            target_account_id=uuid.UUID(account["id"]),
+            selected=True,
+            created_task_id=task.id,
+            guard_results_json=[{"guard": "account_concurrency", "verdict": "allow", "reason": "idle"}],
+        )
+        publication = PublicationRecord(
+            production_task_id=task.id,
+            account_id=uuid.UUID(account["id"]),
+            platform_content_id="yt-audit",
+            title="audit",
+            compliance_disposition="assumed_fair_use",
+        )
+        state = LearningState(
+            channel_profile_id=uuid.UUID(channel["id"]),
+            dimension_type="source",
+            dimension_key="manual_seed",
+            window_days=7,
+            sample_count=12,
+            avg_reward=0.42,
+            confidence=0.6,
+            recommendation_json={"action": "observe"},
+        )
+        api_session.add_all([decision, publication, state])
+        await api_session.commit()
+
+        decisions = await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/decisions")
+        assert decisions.status_code == 200
+        assert decisions.json()[0]["candidate_id"] == "manual_seed:example"
+
+        failures = await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/failures?days=7")
+        assert failures.status_code == 200
+        assert failures.json()["categories"]["quota"] == 1
+
+        audit = await client.get(f"/api/v1/channel-agent/tasks/{task.id}/audit")
+        assert audit.status_code == 200
+        assert audit.json()["task"]["failure_category"] == "quota"
+        assert audit.json()["decision"]["candidate_id"] == "manual_seed:example"
+
+        learning = await client.get(f"/api/v1/channel-agent/channels/{channel['id']}/learning")
+        assert learning.status_code == 200
+        assert learning.json()["states"][0]["dimension_type"] == "source"
 
 
 @pytest.mark.asyncio
