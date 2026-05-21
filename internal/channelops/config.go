@@ -11,6 +11,8 @@ import (
 type Config struct {
 	DatabaseURL             string
 	YouTubeManagerURL       string
+	AutoFlowBaseURL         string
+	AutoFlowTimeout         time.Duration
 	PDSEnabled              bool
 	PDSBaseURL              string
 	PDSClientID             string
@@ -30,6 +32,8 @@ func LoadConfig() Config {
 	return Config{
 		DatabaseURL:             env("DATABASE_URL", "postgresql://vp:vp_secret@localhost:5435/videoprocess"),
 		YouTubeManagerURL:       env("YOUTUBE_MANAGER_URL", ""),
+		AutoFlowBaseURL:         env("AUTOFLOW_BASE_URL", "http://api:8080"),
+		AutoFlowTimeout:         time.Duration(floatEnv("AUTOFLOW_TIMEOUT_SECONDS", 10) * float64(time.Second)),
 		PDSEnabled:              boolEnv("PDS_ENABLED", false),
 		PDSBaseURL:              env("PDS_BASE_URL", "http://pds:8080"),
 		PDSClientID:             env("PDS_CLIENT_ID", "videoprocess-channel-agent"),
@@ -52,6 +56,12 @@ func (c Config) Validate() error {
 	}
 	if c.LiveMode && strings.TrimSpace(c.YouTubeManagerURL) == "" {
 		return errors.New("YOUTUBE_MANAGER_URL is required in live ChannelOps mode")
+	}
+	if c.LiveMode && strings.TrimSpace(c.AutoFlowBaseURL) == "" {
+		return errors.New("AUTOFLOW_BASE_URL is required in live ChannelOps mode")
+	}
+	if c.AutoFlowTimeout <= 0 {
+		return errors.New("AUTOFLOW_TIMEOUT_SECONDS must be positive")
 	}
 	if c.PDSTimeout <= 0 {
 		return errors.New("PDS_TIMEOUT_SECONDS must be positive")

@@ -53,3 +53,16 @@ func TestRunnerRunOnceRejectsMissingHandlerDependencies(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestNewRunnerHandlerServiceConfiguresAutoFlowClient(t *testing.T) {
+	store := &Store{Now: func() time.Time {
+		return time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC)
+	}}
+	handler := newRunnerHandlerService(store, validConfig())
+	if handler.AutoFlow == nil {
+		t.Fatal("AutoFlow client is nil")
+	}
+	if err := handler.ReadinessError(); err != nil {
+		t.Fatalf("ReadinessError returned error: %v", err)
+	}
+}

@@ -9,6 +9,8 @@ func validConfig() Config {
 	return Config{
 		DatabaseURL:             "postgresql://vp:vp@localhost:5432/vp",
 		YouTubeManagerURL:       "http://youtube:8899",
+		AutoFlowBaseURL:         "http://api:8080",
+		AutoFlowTimeout:         10 * time.Second,
 		LiveMode:                true,
 		PDSTimeout:              500 * time.Millisecond,
 		RunnerPollSeconds:       5,
@@ -28,6 +30,12 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.YouTubeManagerURL != "http://youtube:8899" {
 		t.Fatalf("YouTubeManagerURL = %q", cfg.YouTubeManagerURL)
+	}
+	if cfg.AutoFlowBaseURL != "http://api:8080" {
+		t.Fatalf("AutoFlowBaseURL = %q", cfg.AutoFlowBaseURL)
+	}
+	if cfg.AutoFlowTimeout != 10*time.Second {
+		t.Fatalf("AutoFlowTimeout = %v", cfg.AutoFlowTimeout)
 	}
 	if cfg.RunnerPollSeconds != 5 {
 		t.Fatalf("RunnerPollSeconds = %v", cfg.RunnerPollSeconds)
@@ -50,6 +58,18 @@ func TestValidateLiveRequiresYouTubeManagerURL(t *testing.T) {
 		t.Fatal("expected Validate to reject missing YouTubeManagerURL")
 	}
 	cfg.YouTubeManagerURL = "http://youtube:8899"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+}
+
+func TestValidateLiveRequiresAutoFlowBaseURL(t *testing.T) {
+	cfg := validConfig()
+	cfg.AutoFlowBaseURL = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected Validate to reject missing AutoFlowBaseURL")
+	}
+	cfg.AutoFlowBaseURL = "http://api:8080"
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate returned error: %v", err)
 	}
@@ -94,6 +114,12 @@ func TestValidateRejectsNonPositivePollsAndAttempts(t *testing.T) {
 			name: "pds timeout",
 			mutate: func(cfg *Config) {
 				cfg.PDSTimeout = 0
+			},
+		},
+		{
+			name: "autoflow timeout",
+			mutate: func(cfg *Config) {
+				cfg.AutoFlowTimeout = 0
 			},
 		},
 	}

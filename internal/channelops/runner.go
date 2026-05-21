@@ -28,9 +28,25 @@ func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
 	}
 	runner := &Runner{Config: cfg, Store: st}
 	runner.Scheduler = Scheduler{Store: st}
-	youtube := YouTubeManagerClient{BaseURL: cfg.YouTubeManagerURL, Timeout: 20 * time.Second}
-	runner.Handlers = HandlerService{Store: st, PDS: pds, YouTube: youtube, Config: cfg}
+	runner.Handlers = newRunnerHandlerService(st, cfg, pds)
 	return runner, nil
+}
+
+func newRunnerHandlerService(st *Store, cfg Config, pdsOverride ...PDSDecider) HandlerService {
+	var pds PDSDecider = PDSClient{
+		Enabled:     cfg.PDSEnabled,
+		DevAllowAll: cfg.DevAllowAllPDS,
+		BaseURL:     cfg.PDSBaseURL,
+		ClientID:    cfg.PDSClientID,
+		Timeout:     cfg.PDSTimeout,
+		HTTPClient:  &http.Client{Timeout: cfg.PDSTimeout},
+	}
+	if len(pdsOverride) > 0 && pdsOverride[0] != nil {
+		pds = pdsOverride[0]
+	}
+	youtube := YouTubeManagerClient{BaseURL: cfg.YouTubeManagerURL, Timeout: 20 * time.Second}
+	autoflow := HTTPAutoFlowClient{BaseURL: cfg.AutoFlowBaseURL, Timeout: cfg.AutoFlowTimeout}
+	return HandlerService{Store: st, PDS: pds, AutoFlow: autoflow, YouTube: youtube, Config: cfg}
 }
 
 func (r *Runner) Run(ctx context.Context) error {

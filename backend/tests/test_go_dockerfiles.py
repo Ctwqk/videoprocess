@@ -15,6 +15,7 @@ def test_go_dockerfiles_use_go_mod_toolchain_version():
 
     dockerfiles = [
         ROOT / "backend" / "Dockerfile.api-go",
+        ROOT / "backend" / "Dockerfile.channelops-runner-go",
         ROOT / "backend" / "Dockerfile.ffmpeg-worker-go",
     ]
     for dockerfile in dockerfiles:

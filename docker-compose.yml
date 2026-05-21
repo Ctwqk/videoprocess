@@ -1,6 +1,6 @@
 services:
   postgres:
-    profiles: ["standalone"]
+    profiles: ["standalone", "channelops-go"]
     image: postgres:16-alpine
     container_name: vp_postgres
     environment:
@@ -136,6 +136,7 @@ services:
       - vp_internal
 
   channel-agent-runner:
+    profiles: ["channelops-python"]
     build:
       context: ./backend
       dockerfile: Dockerfile.api
@@ -173,6 +174,37 @@ services:
       - youtube-manager
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - vp_internal
+
+  channelops-runner-go:
+    profiles: ["channelops-go"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.channelops-runner-go
+    container_name: vp_channelops_runner_go
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${VP_DATABASE_URL_GO:-postgres://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@postgres:5432/videoprocess}
+      YOUTUBE_MANAGER_URL: ${YOUTUBE_MANAGER_URL:-http://youtube-manager:8899}
+      AUTOFLOW_BASE_URL: ${AUTOFLOW_BASE_URL:-http://api:8080}
+      AUTOFLOW_TIMEOUT_SECONDS: ${AUTOFLOW_TIMEOUT_SECONDS:-30}
+      PDS_ENABLED: ${PDS_ENABLED:-true}
+      PDS_BASE_URL: ${PDS_BASE_URL:-http://pds:8080}
+      PDS_CLIENT_ID: ${PDS_CLIENT_ID:-videoprocess-channel-agent}
+      PDS_TIMEOUT_SECONDS: ${PDS_TIMEOUT_SECONDS:-0.5}
+      CHANNEL_AGENT_DEV_ALLOW_ALL_PDS: ${CHANNEL_AGENT_DEV_ALLOW_ALL_PDS:-false}
+      CHANNELOPS_RUNNER_POLL_SECONDS: ${CHANNELOPS_RUNNER_POLL_SECONDS:-5}
+      CHANNELOPS_SCHEDULER_POLL_SECONDS: ${CHANNELOPS_SCHEDULER_POLL_SECONDS:-60}
+      CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL: ${CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL:-}
+      CHANNEL_AGENT_ALERT_EMAIL_TO: ${CHANNEL_AGENT_ALERT_EMAIL_TO:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+      youtube-manager:
+        condition: service_started
     networks:
       - vp_internal
 
