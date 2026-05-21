@@ -381,8 +381,10 @@ func (h HandlerService) HandleCollectMetrics(ctx context.Context, item QueueItem
 	if !HasRecognizedMetrics(metrics) {
 		return h.Store.RequeueOrHoldMetrics(ctx, publication, item, h.Config.MetricsPollMaxAttempts, metricsPollDelay(h.Config))
 	}
+	stage := SnapshotStageFromPayload(item.PayloadJSON)
 	score, fields := MetricsCompleteness(metrics)
-	return h.Store.UpsertFeedbackSnapshot(ctx, publication, metrics, score, fields)
+	reward, components := RewardScore(metrics, PublicationRewardContext{StablePublication: true})
+	return h.Store.UpsertFeedbackSnapshot(ctx, publication, metrics, stage, score, fields, reward, components)
 }
 
 func (h HandlerService) HandleAccountHealth(ctx context.Context, item QueueItemRow) error {

@@ -154,6 +154,123 @@ func TestCollectMetricsRequeueUsesConfiguredDelay(t *testing.T) {
 	}
 }
 
+func TestCollectMetricsUpsertsStagedRewardSnapshot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote.ID); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	publicationID, _ := collect.PayloadJSON["publication_id"].(string)
+	collect.PayloadJSON["snapshot_stage"] = "6h"
+	collect.PayloadJSON["metrics"] = map[string]any{
+		"views":                 1000,
+		"likes":                 50,
+		"comments":              10,
+		"avg_view_duration_sec": 18.0,
+	}
+	if err := handler.HandleCollectMetrics(ctx, collect); err != nil {
+		t.Fatalf("HandleCollectMetrics first: %v", err)
+	}
+	collect.PayloadJSON["metrics"] = map[string]any{
+		"views":                 1200,
+		"likes":                 75,
+		"comments":              15,
+		"avg_view_duration_sec": 20.0,
+	}
+	if err := handler.HandleCollectMetrics(ctx, collect); err != nil {
+		t.Fatalf("HandleCollectMetrics second: %v", err)
+	}
+
+	var count int
+	var stage string
+	var likes int
+	var hasReward bool
+	var hasEngagement bool
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(MAX(snapshot_stage), ''),
+		       COALESCE(MAX(likes), 0),
+		       bool_or(reward_score IS NOT NULL),
+		       bool_or(reward_components_json::jsonb ? 'engagement_rate')
+		FROM feedback_snapshots
+		WHERE publication_id = $1::uuid
+	`, publicationID).Scan(&count, &stage, &likes, &hasReward, &hasEngagement); err != nil {
+		t.Fatalf("select feedback snapshots: %v", err)
+	}
+	if count != 1 || stage != "6h" || likes != 75 || !hasReward || !hasEngagement {
+		t.Fatalf("snapshot summary count/stage/likes/reward/engagement = %d/%s/%d/%v/%v", count, stage, likes, hasReward, hasEngagement)
+	}
+}
+
+func TestRecomputeLearningStateForSourcesAggregatesReward(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote.ID); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	collect.PayloadJSON["metrics"] = map[string]any{
+		"views":                 1000,
+		"likes":                 50,
+		"comments":              10,
+		"avg_view_duration_sec": 18.0,
+	}
+	if err := handler.HandleCollectMetrics(ctx, collect); err != nil {
+		t.Fatalf("HandleCollectMetrics: %v", err)
+	}
+
+	if err := fixture.Store.RecomputeLearningState(ctx, fixture.ChannelID, 7); err != nil {
+		t.Fatalf("RecomputeLearningState: %v", err)
+	}
+
+	var sampleCount int
+	var avgReward float64
+	var confidence float64
+	var recommendation string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT sample_count, avg_reward, confidence, recommendation_json ->> 'action'
+		FROM learning_states
+		WHERE channel_profile_id = $1::uuid
+		  AND dimension_type = 'source'
+		  AND dimension_key = $2
+		  AND window_days = 7
+	`, fixture.ChannelID, SourceLaneSeed).Scan(&sampleCount, &avgReward, &confidence, &recommendation); err != nil {
+		t.Fatalf("select learning state: %v", err)
+	}
+	if sampleCount != 1 || avgReward <= 0 || confidence <= 0 || recommendation != "insufficient_data" {
+		t.Fatalf("learning sample/reward/confidence/action = %d/%f/%f/%s", sampleCount, avgReward, confidence, recommendation)
+	}
+}
+
 func TestPublicationMetricsFailureCategoryPersistsAndClears(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -912,6 +1029,8 @@ func (f *ChannelOpsFixture) cleanup(ctx context.Context) {
 			DELETE FROM decision_audit_entries WHERE channel_profile_id = $1::uuid
 		), deleted_discovery AS (
 			DELETE FROM discovery_signals WHERE channel_profile_id = $1::uuid
+		), deleted_learning AS (
+			DELETE FROM learning_states WHERE channel_profile_id = $1::uuid
 		), deleted_audits AS (
 			DELETE FROM agent_tick_audits WHERE channel_profile_id = $1::uuid
 		), deleted_scheduler AS (

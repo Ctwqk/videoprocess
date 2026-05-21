@@ -369,61 +369,48 @@ func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication Publicatio
 	return err
 }
 
-func (s *Store) UpsertFeedbackSnapshot(ctx context.Context, publication PublicationRow, metrics map[string]any, score float64, fields []string) error {
+func (s *Store) UpsertFeedbackSnapshot(ctx context.Context, publication PublicationRow, metrics map[string]any, stage string, score float64, fields []string, reward float64, rewardComponents map[string]any) error {
 	now := s.Now().UTC()
+	stage = SnapshotStageFromPayload(map[string]any{"snapshot_stage": stage})
 	rawJSON := mustJSON(metrics)
 	fieldsJSON := mustJSON(fields)
+	rewardComponentsJSON := mustJSON(rewardComponents)
 	retentionJSON := []byte("null")
 	if retention := listValue(firstAny(metrics, "retention_curve_json", "retention_curve")); retention != nil {
 		retentionJSON = mustJSON(retention)
 	}
 	values := feedbackValues(metrics)
-	var snapshotID string
-	err := s.Pool.QueryRow(ctx, `
-		SELECT id
-		FROM feedback_snapshots
-		WHERE publication_id = $1::uuid
-		ORDER BY collected_at DESC
-		LIMIT 1
-	`, publication.ID).Scan(&snapshotID)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return err
-	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		_, err = s.Pool.Exec(ctx, `
-			INSERT INTO feedback_snapshots (
-				id, publication_id, collected_at, views, likes, comments, shares,
-				avg_view_duration_sec, retention_curve_json, ctr, impressions,
-				metrics_completeness_score, available_fields_json, virality_score, raw_json
-			)
-			VALUES (
-					gen_random_uuid(), $1::uuid, $2::timestamptz, $3, $4, $5, $6, $7, $8::json, $9, $10,
-				$11, $12::json, $13, $14::json
-			)
-		`, publication.ID, now, values.Views, values.Likes, values.Comments, values.Shares,
-			values.AvgViewDurationSec, retentionJSON, values.CTR, values.Impressions, score, fieldsJSON,
-			values.ViralityScore, rawJSON)
-	} else {
-		_, err = s.Pool.Exec(ctx, `
-			UPDATE feedback_snapshots
-				SET collected_at = $2::timestamptz,
-			    views = $3,
-			    likes = $4,
-			    comments = $5,
-			    shares = $6,
-			    avg_view_duration_sec = $7,
-			    retention_curve_json = $8::json,
-			    ctr = $9,
-			    impressions = $10,
-			    metrics_completeness_score = $11,
-			    available_fields_json = $12::json,
-			    virality_score = $13,
-			    raw_json = $14::json
-			WHERE id = $1::uuid
-		`, snapshotID, now, values.Views, values.Likes, values.Comments, values.Shares,
-			values.AvgViewDurationSec, retentionJSON, values.CTR, values.Impressions, score, fieldsJSON,
-			values.ViralityScore, rawJSON)
-	}
+	_, err := s.Pool.Exec(ctx, `
+		INSERT INTO feedback_snapshots (
+			id, publication_id, snapshot_stage, collected_at, views, likes, comments, shares,
+			avg_view_duration_sec, retention_curve_json, ctr, impressions,
+			metrics_completeness_score, available_fields_json, virality_score, raw_json,
+			reward_score, reward_components_json
+		)
+		VALUES (
+			gen_random_uuid(), $1::uuid, $2, $3::timestamptz, $4, $5, $6, $7,
+			$8, $9::json, $10, $11, $12, $13::json, $14, $15::json,
+			$16, $17::json
+		)
+		ON CONFLICT (publication_id, snapshot_stage) DO UPDATE
+		SET collected_at = EXCLUDED.collected_at,
+		    views = EXCLUDED.views,
+		    likes = EXCLUDED.likes,
+		    comments = EXCLUDED.comments,
+		    shares = EXCLUDED.shares,
+		    avg_view_duration_sec = EXCLUDED.avg_view_duration_sec,
+		    retention_curve_json = EXCLUDED.retention_curve_json,
+		    ctr = EXCLUDED.ctr,
+		    impressions = EXCLUDED.impressions,
+		    metrics_completeness_score = EXCLUDED.metrics_completeness_score,
+		    available_fields_json = EXCLUDED.available_fields_json,
+		    virality_score = EXCLUDED.virality_score,
+		    raw_json = EXCLUDED.raw_json,
+		    reward_score = EXCLUDED.reward_score,
+		    reward_components_json = EXCLUDED.reward_components_json
+	`, publication.ID, stage, now, values.Views, values.Likes, values.Comments, values.Shares,
+		values.AvgViewDurationSec, retentionJSON, values.CTR, values.Impressions, score, fieldsJSON,
+		values.ViralityScore, rawJSON, reward, rewardComponentsJSON)
 	if err != nil {
 		return err
 	}
