@@ -164,9 +164,9 @@ func (f *ChannelOpsFixture) ProcessAllQueueItems(ctx context.Context, handler Ha
 	f.T.Helper()
 	for i := 0; i < 20; i++ {
 		f.makeQueuedItemsReady(ctx)
-		item, err := f.Store.ClaimNextForKinds(ctx, "channelops-integration-test", handler.ClaimableKinds())
+		item, err := f.Store.ClaimNextForChannelAndKinds(ctx, "channelops-integration-test", f.ChannelID, handler.ClaimableKinds())
 		if err != nil {
-			f.T.Fatalf("ClaimNextForKinds: %v", err)
+			f.T.Fatalf("ClaimNextForChannelAndKinds: %v", err)
 		}
 		if item == nil {
 			return

@@ -57,6 +57,31 @@ const claimNextForKindsQuery = `
 	          q.last_error, q.dead_letter_at, q.channel_profile_id, q.parent_queue_item_id
 `
 
+const claimNextForChannelAndKindsQuery = `
+	WITH picked AS (
+		SELECT id
+		FROM channel_ops_queue_items
+		WHERE status = $2
+		  AND dead_letter_at IS NULL
+		  AND run_after <= NOW()
+		  AND kind = ANY($4)
+		  AND channel_profile_id = $5::uuid
+		ORDER BY priority ASC, created_at ASC
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	)
+	UPDATE channel_ops_queue_items q
+	SET status = $3,
+	    locked_by = $1,
+	    locked_at = NOW(),
+	    attempt_count = attempt_count + 1
+	FROM picked
+	WHERE q.id = picked.id
+	RETURNING q.id, q.kind, q.idempotency_key, q.payload_json, q.status, q.priority,
+	          q.attempt_count, q.max_attempts, q.run_after, q.locked_at, q.locked_by,
+	          q.last_error, q.dead_letter_at, q.channel_profile_id, q.parent_queue_item_id
+`
+
 func RetryDelay(attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
@@ -133,6 +158,25 @@ func (s *Store) ClaimNextForKinds(ctx context.Context, workerID string, kinds []
 		return nil, nil
 	}
 	row := s.Pool.QueryRow(ctx, claimNextForKindsQuery, workerID, QueueStatusQueued, QueueStatusRunning, kinds)
+
+	item, err := scanQueueItem(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
+func (s *Store) ClaimNextForChannelAndKinds(ctx context.Context, workerID string, channelID string, kinds []string) (*QueueItemRow, error) {
+	if len(kinds) == 0 {
+		return nil, nil
+	}
+	if err := requireUUID("channel_profile_id", channelID); err != nil {
+		return nil, err
+	}
+	row := s.Pool.QueryRow(ctx, claimNextForChannelAndKindsQuery, workerID, QueueStatusQueued, QueueStatusRunning, kinds, channelID)
 
 	item, err := scanQueueItem(row)
 	if errors.Is(err, pgx.ErrNoRows) {

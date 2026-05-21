@@ -60,6 +60,15 @@ func TestClaimNextForKindsQueryFiltersAndOrdersLikePython(t *testing.T) {
 	}
 }
 
+func TestClaimNextForChannelAndKindsQueryScopesChannel(t *testing.T) {
+	if !strings.Contains(claimNextForChannelAndKindsQuery, "channel_profile_id = $5::uuid") {
+		t.Fatalf("scoped claim query does not filter by channel_profile_id:\n%s", claimNextForChannelAndKindsQuery)
+	}
+	if !strings.Contains(claimNextForChannelAndKindsQuery, "kind = ANY($4)") {
+		t.Fatalf("scoped claim query does not filter by owned kinds:\n%s", claimNextForChannelAndKindsQuery)
+	}
+}
+
 func TestQueueStatusConstantsForSQL(t *testing.T) {
 	if QueueStatusQueued != "queued" {
 		t.Fatalf("QueueStatusQueued = %q", QueueStatusQueued)
