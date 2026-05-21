@@ -7,8 +7,6 @@ import (
 )
 
 func TestApplyInputOverridesTask2Cases(t *testing.T) {
-	t.Skip("Task 2 user-owned implementation: remove this skip while implementing overrides")
-
 	tests := []struct {
 		name         string
 		overrides    map[string]any
@@ -29,7 +27,7 @@ func TestApplyInputOverridesTask2Cases(t *testing.T) {
 		},
 		{
 			name:         "nested node map overrides config",
-			overrides:    map[string]any{"transcode_1": map[string]any{"crf": 23}},
+			overrides:    map[string]any{"transcode_1": map[string]any{"crf": float64(23)}},
 			wantSourceID: "asset-original",
 			wantCRF:      23,
 		},
@@ -60,8 +58,6 @@ func TestApplyInputOverridesTask2Cases(t *testing.T) {
 }
 
 func TestApplyInputOverridesDoesNotMutateOriginal(t *testing.T) {
-	t.Skip("Task 2 user-owned implementation: remove this skip while implementing overrides")
-
 	original := task2OverridePipeline()
 	_ = ApplyInputOverrides(original, map[string]any{"asset_id": "asset-new", "trim_1.duration": "2"})
 
@@ -70,6 +66,31 @@ func TestApplyInputOverridesDoesNotMutateOriginal(t *testing.T) {
 	}
 	if duration, _ := original.Nodes[1].Data.Config["duration"].(string); duration != "1" {
 		t.Fatalf("original trim duration mutated: %q", duration)
+	}
+}
+
+func TestApplyInputOverridesTopLevelAssetOnlyAppliesToFirstSource(t *testing.T) {
+	got := ApplyInputOverrides(task2TwoSourcePipeline(), map[string]any{
+		"asset_id":          "asset-top",
+		"source_2.asset_id": "asset-second",
+	})
+
+	if got.Nodes[0].Data.AssetID == nil || *got.Nodes[0].Data.AssetID != "asset-top" {
+		t.Fatalf("source_1 asset_id = %v; want asset-top", got.Nodes[0].Data.AssetID)
+	}
+	if got.Nodes[1].Data.AssetID == nil || *got.Nodes[1].Data.AssetID != "asset-second" {
+		t.Fatalf("source_2 asset_id = %v; want asset-second", got.Nodes[1].Data.AssetID)
+	}
+}
+
+func TestApplyInputOverridesNodeIDValueSetsAssetID(t *testing.T) {
+	got := ApplyInputOverrides(task2OverridePipeline(), map[string]any{"source_1": "asset-node"})
+
+	if got.Nodes[0].Data.AssetID == nil || *got.Nodes[0].Data.AssetID != "asset-node" {
+		t.Fatalf("source_1 asset_id = %v; want asset-node", got.Nodes[0].Data.AssetID)
+	}
+	if configID, _ := got.Nodes[0].Data.Config["asset_id"].(string); configID != "asset-node" {
+		t.Fatalf("source_1 config asset_id = %q; want asset-node", configID)
 	}
 }
 
@@ -83,6 +104,21 @@ func task2OverridePipeline() contracts.PipelineDefinition {
 			Config: map[string]any{"crf": float64(20)},
 		},
 	}, def.Nodes[2])
+	def.Edges = []contracts.PipelineEdge{
+		{ID: "e1", Source: "source_1", SourceHandle: "output", Target: "trim_1", TargetHandle: "input"},
+		{ID: "e2", Source: "trim_1", SourceHandle: "output", Target: "transcode_1", TargetHandle: "input"},
+		{ID: "e3", Source: "transcode_1", SourceHandle: "output", Target: "export_1", TargetHandle: "input"},
+	}
+	return def
+}
+
+func task2TwoSourcePipeline() contracts.PipelineDefinition {
+	def := task2OverridePipeline()
+	def.Nodes = append([]contracts.PipelineNode{
+		task2SourceNode("asset-original"),
+		task2SourceNode("asset-original-2"),
+	}, def.Nodes[1:]...)
+	def.Nodes[1].ID = "source_2"
 	def.Edges = []contracts.PipelineEdge{
 		{ID: "e1", Source: "source_1", SourceHandle: "output", Target: "trim_1", TargetHandle: "input"},
 		{ID: "e2", Source: "trim_1", SourceHandle: "output", Target: "transcode_1", TargetHandle: "input"},
