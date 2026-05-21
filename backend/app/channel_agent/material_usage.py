@@ -131,6 +131,9 @@ async def recent_usage_flags(
 
 def _reference_from_dict(item: dict[str, Any]) -> MaterialReference | None:
     material_id = str(item.get("material_id") or item.get("materialId") or "").strip()
+    asset_id = item.get("asset_id") or item.get("assetId")
+    if not material_id and asset_id:
+        material_id = str(asset_id).strip()
     if not material_id:
         return None
     start_ms = _millis(item.get("start_ms"), item.get("start_sec"))
@@ -138,7 +141,6 @@ def _reference_from_dict(item: dict[str, Any]) -> MaterialReference | None:
     signature = str(item.get("segment_signature") or item.get("segmentSignature") or "").strip()
     if not signature:
         signature = segment_signature(material_id, start_ms, end_ms)
-    asset_id = item.get("asset_id") or item.get("assetId")
     return MaterialReference(
         material_id=material_id,
         asset_id=str(asset_id) if asset_id else None,

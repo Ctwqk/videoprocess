@@ -48,6 +48,17 @@ def test_extract_material_references_from_nested_payloads():
     assert refs[0].segment_signature == segment_signature("mat-1", 1500, 4000)
 
 
+def test_extract_material_references_falls_back_to_asset_id():
+    refs = extract_material_references(
+        plan_payload={"clips": [{"asset_id": "asset-legacy", "start_sec": 1, "end_sec": 2}]},
+        run_payload={},
+        upload_metadata={},
+    )
+
+    assert len(refs) == 1
+    assert refs[0].material_id == "asset-legacy"
+
+
 @pytest.mark.asyncio
 async def test_recent_usage_flags_same_lane_same_account_and_sibling_account(usage_session):
     now = datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc)

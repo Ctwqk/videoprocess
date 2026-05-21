@@ -58,6 +58,16 @@ def test_agent_tick_audit_has_channel_tick_uniqueness_constraint():
     )
 
 
+def test_feedback_snapshot_completeness_columns_exist():
+    assert "metrics_completeness_score" in FeedbackSnapshot.__table__.columns
+    assert "available_fields_json" in FeedbackSnapshot.__table__.columns
+
+
+def test_takedown_event_has_dedup_lookup_index():
+    index_names = {index.name for index in TakedownEvent.__table__.indexes}
+    assert "ix_takedown_events_publication_event_detected" in index_names
+
+
 @pytest.fixture
 async def channel_agent_session():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")

@@ -89,6 +89,7 @@ class AutoFlowClipCandidate(BaseModel):
     id: str
     title: str
     source_type: str
+    material_id: str | None = None
     url: str | None = None
     asset_id: str | None = None
     start_sec: float | None = None

@@ -244,6 +244,9 @@ class PublicationRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 class TakedownEvent(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "takedown_events"
+    __table_args__ = (
+        Index("ix_takedown_events_publication_event_detected", "publication_id", "event_type", "detected_at"),
+    )
 
     publication_id: Mapped[uuid_mod.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -266,6 +269,8 @@ class FeedbackSnapshot(UUIDPrimaryKeyMixin, Base):
     retention_curve_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
     ctr: Mapped[float | None] = mapped_column(Float, nullable=True)
     impressions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metrics_completeness_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    available_fields_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     virality_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     raw_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 

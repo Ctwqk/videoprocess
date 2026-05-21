@@ -183,6 +183,7 @@ def _candidate_from_material_result(
 ) -> AutoFlowClipCandidate:
     source_asset_id = _string_or_none(result.get("source_asset_id"))
     materialized_asset_id = _string_or_none(result.get("asset_id"))
+    material_id = _string_or_none(result.get("material_id")) or materialized_asset_id
     asset_id = materialized_asset_id or source_asset_id
     start_sec = _float_or_none(result.get("start_sec"))
     end_sec = _float_or_none(result.get("end_sec"))
@@ -190,16 +191,18 @@ def _candidate_from_material_result(
         id=_string_or_none(result.get("id")) or _material_result_id(index, source_asset_id, start_sec, end_sec),
         title=str(result.get("title") or result.get("subtitle_text") or f"Material clip {index}"),
         source_type="material",
+        material_id=material_id,
         asset_id=asset_id,
         start_sec=start_sec,
         end_sec=end_sec,
         rights_status="allowed",
-        metadata=_material_metadata(result, materialized_asset_id, source_asset_id),
+        metadata=_material_metadata(result, material_id, materialized_asset_id, source_asset_id),
     )
 
 
 def _material_metadata(
     result: dict[str, Any],
+    material_id: str | None,
     materialized_asset_id: str | None,
     source_asset_id: str | None,
 ) -> dict[str, Any]:
@@ -209,6 +212,7 @@ def _material_metadata(
 
     metadata: dict[str, Any] = {}
     _put_if_present(metadata, "library_id", _string_or_none(result.get("library_id")))
+    _put_if_present(metadata, "material_id", material_id)
     _put_if_present(metadata, "source_asset_id", source_asset_id)
     _put_if_present(metadata, "asset_id", materialized_asset_id)
     _put_if_present(metadata, "coarse", result.get("coarse") or result.get("coarse_score"))

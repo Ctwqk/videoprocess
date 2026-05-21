@@ -1011,6 +1011,7 @@ def _candidates_from_storyboard_matches(storyboard: StoryboardPlan) -> list[Auto
                 id=f"storyboard-{shot.id}",
                 title=shot.search_query,
                 source_type="material",
+                material_id=str(shot.extra.get("material_id") or shot.matched_asset_id or ""),
                 asset_id=shot.matched_asset_id,
                 start_sec=shot.matched_start_sec,
                 end_sec=shot.matched_end_sec,
