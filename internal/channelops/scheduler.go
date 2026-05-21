@@ -66,8 +66,7 @@ func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]C
 	rows, err := s.Pool.Query(ctx, `
 		SELECT id, enabled, dry_run, halted_at, tick_interval_minutes, config_version,
 		       risk_policy_json, cadence_policy_json, content_mix_policy_json,
-		       default_aspect_ratio, false AS external_asset_auto_publish, 0 AS max_posts_per_day,
-		       created_at, updated_at
+		       default_aspect_ratio, created_at, updated_at
 		FROM channel_profiles
 		WHERE enabled = TRUE AND halted_at IS NULL
 		ORDER BY created_at ASC
@@ -82,7 +81,7 @@ func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]C
 		var row ChannelProfileRow
 		if err := rows.Scan(&row.ID, &row.Enabled, &row.DryRun, &row.HaltedAt, &row.TickIntervalMinutes,
 			&row.ConfigVersion, &row.RiskPolicyJSON, &row.CadencePolicyJSON, &row.ContentMixPolicyJSON,
-			&row.DefaultAspectRatio, &row.ExternalAutoPublish, &row.MaxPostsPerDay, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			&row.DefaultAspectRatio, &row.CreatedAt, &row.UpdatedAt); err != nil {
 			return nil, err
 		}
 		result = append(result, row)
