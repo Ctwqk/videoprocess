@@ -9,6 +9,7 @@ import (
 type Runner struct {
 	Config         Config
 	Store          *Store
+	Scheduler      Scheduler
 	ClaimableKinds []string
 }
 
@@ -17,7 +18,9 @@ func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{Config: cfg, Store: st, ClaimableKinds: []string{}}, nil
+	runner := &Runner{Config: cfg, Store: st, ClaimableKinds: []string{}}
+	runner.Scheduler = Scheduler{Store: st}
+	return runner, nil
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -36,7 +39,13 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) runOnce(ctx context.Context) error {
-	if r.Store == nil || len(r.ClaimableKinds) == 0 {
+	if r.Store == nil {
+		return nil
+	}
+	if r.Scheduler.Store != nil {
+		_, _ = r.Scheduler.RunOnce(ctx, r.Store.Now())
+	}
+	if len(r.ClaimableKinds) == 0 {
 		return nil
 	}
 	item, err := r.Store.ClaimNextForKinds(ctx, "channelops-go-runner", r.ClaimableKinds)
