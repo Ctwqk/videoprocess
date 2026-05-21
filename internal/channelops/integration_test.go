@@ -153,6 +153,59 @@ func TestCollectMetricsRequeueUsesConfiguredDelay(t *testing.T) {
 	}
 }
 
+func TestPublicationMetricsFailureCategoryPersistsAndClears(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote.ID); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	publicationID, _ := collect.PayloadJSON["publication_id"].(string)
+	publication, err := fixture.Store.GetPublication(ctx, publicationID)
+	if err != nil {
+		t.Fatalf("GetPublication: %v", err)
+	}
+
+	if err := fixture.Store.RequeueOrHoldMetrics(ctx, publication, collect, 1, time.Minute); err != nil {
+		t.Fatalf("RequeueOrHoldMetrics: %v", err)
+	}
+	heldTask, err := fixture.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+	if err != nil {
+		t.Fatalf("GetProductionTask held: %v", err)
+	}
+	if heldTask.FailureCategory == nil || *heldTask.FailureCategory != FailureMetrics {
+		t.Fatalf("held task failure category = %#v, want %q", heldTask.FailureCategory, FailureMetrics)
+	}
+
+	if err := fixture.Store.markTaskUploadedPrivate(ctx, publication.ProductionTaskID, fixture.Store.Now()); err != nil {
+		t.Fatalf("markTaskUploadedPrivate: %v", err)
+	}
+	clearedTask, err := fixture.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+	if err != nil {
+		t.Fatalf("GetProductionTask cleared: %v", err)
+	}
+	if clearedTask.FailureCategory != nil {
+		t.Fatalf("cleared task failure category = %#v, want nil", *clearedTask.FailureCategory)
+	}
+	if clearedTask.FailureReason != nil {
+		t.Fatalf("cleared task failure reason = %#v, want nil", *clearedTask.FailureReason)
+	}
+}
+
 type ChannelOpsFixture struct {
 	T         *testing.T
 	Store     *Store

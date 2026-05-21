@@ -1,10 +1,6 @@
 package channelops
 
-import (
-	"os"
-	"strings"
-	"testing"
-)
+import "testing"
 
 func TestFailureCategoryForContextPrefersHandlerContext(t *testing.T) {
 	tests := []struct {
@@ -21,26 +17,6 @@ func TestFailureCategoryForContextPrefersHandlerContext(t *testing.T) {
 	for _, tt := range tests {
 		if got := FailureCategoryFor(tt.context, tt.reason); got != tt.want {
 			t.Fatalf("FailureCategoryFor(%q, %q)=%q want %q", tt.context, tt.reason, got, tt.want)
-		}
-	}
-}
-
-func TestPublicationStateTransitionsPersistFailureCategory(t *testing.T) {
-	source, err := os.ReadFile("store_publications.go")
-	if err != nil {
-		t.Fatalf("read store_publications.go: %v", err)
-	}
-	text := string(source)
-	for _, want := range []string{
-		"failure_category = $7::text",
-		"FailureYouTubeStatus",
-		"FailureMetrics",
-		`TaskScheduled, "", "", "promote_publication", "", now`,
-		`TaskMeasured, "", "", "collect_metrics", "", now`,
-		`TaskUploadedPrivate, "", "", "publish_task", "", now`,
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("store_publications.go missing %q", want)
 		}
 	}
 }
