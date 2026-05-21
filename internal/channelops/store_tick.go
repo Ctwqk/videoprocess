@@ -274,11 +274,11 @@ func (s *Store) InsertTickAudit(ctx context.Context, channelID string, bucket st
 	var id string
 	err = s.Pool.QueryRow(ctx, `
 		INSERT INTO agent_tick_audits (
-			channel_profile_id, tick_id, started_at, finished_at, dry_run,
+			id, channel_profile_id, tick_id, started_at, finished_at, dry_run,
 			ideas_discovered, candidates_scored, tasks_selected, tasks_rejected,
 			guards_triggered_json, decision_summary_json, error_message
 		)
-		VALUES ($1::uuid, $2, $3, $4, $5, $6, $6, $7, $8, $9::json, $10::json, NULL)
+		VALUES (gen_random_uuid(), $1::uuid, $2, $3, $4, $5, $6, $6, $7, $8, $9::json, $10::json, NULL)
 		ON CONFLICT (channel_profile_id, tick_id) DO UPDATE
 		SET finished_at = EXCLUDED.finished_at,
 		    dry_run = EXCLUDED.dry_run,
@@ -356,8 +356,8 @@ func (s *Store) InsertProductionTask(ctx context.Context, channel ChannelProfile
 		VALUES (
 			gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8,
 			$9::json, $10::json, 'explore', $11::json, $12::json,
-			$13, $14, '{}'::json, 0.0, $15, $16, 0, $17, $18::json,
-			$19::json, $16, $16
+			$13, $14, '{}'::json, 0.0, $15, $16::timestamptz, 0, $17, $18::json,
+			$19::json, $16::timestamp, $16::timestamp
 		)
 		RETURNING id
 	`, channel.ID, laneID, formatID, candidate.Account.ID, manualSeedID, candidate.Source,

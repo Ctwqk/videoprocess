@@ -155,7 +155,7 @@ func (h HandlerService) HandlePlanTask(ctx context.Context, item QueueItemRow) e
 	if err := h.AutoFlow.ApprovePlan(ctx, observation.PlanID, map[string]any{"decision_id": decision.DecisionID, "verdict": decision.Verdict}); err != nil {
 		return err
 	}
-	return h.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, observation.PlanID, item.ID)
+	return h.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, observation.PlanID, observation.PlanPayload, item.ID)
 }
 
 func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow) error {

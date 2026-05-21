@@ -135,7 +135,7 @@ func (s *Store) HoldTaskWithPlanAndPDS(ctx context.Context, taskID string, planI
 	return s.holdTask(ctx, taskID, planID, guard, reason, decision, transitionReason)
 }
 
-func (s *Store) MarkTaskPlanningAndEnqueueExecute(ctx context.Context, taskID string, planID string, parentQueueItemID string) error {
+func (s *Store) MarkTaskPlanningAndEnqueueExecute(ctx context.Context, taskID string, planID string, planPayload map[string]any, parentQueueItemID string) error {
 	if err := requireUUID("production_task_id", taskID); err != nil {
 		return err
 	}
@@ -146,26 +146,31 @@ func (s *Store) MarkTaskPlanningAndEnqueueExecute(ctx context.Context, taskID st
 	if err != nil {
 		return err
 	}
+	rationalePatch, err := json.Marshal(map[string]any{"autoflow_plan_payload": jsonObject(planPayload)})
+	if err != nil {
+		return err
+	}
 	now := s.Now().UTC()
 	if _, err := s.Pool.Exec(ctx, `
 		UPDATE production_tasks
 		SET autoflow_plan_id = $2::uuid,
-		    state = $3,
+		    state = $3::text,
 		    blocked_by_guard = NULL,
 		    failure_reason = NULL,
-		    state_updated_at = $4,
-		    updated_at = $4,
+		    rationale_json = (COALESCE(rationale_json, '{}'::json)::jsonb || $6::jsonb)::json,
+		    state_updated_at = $4::timestamptz,
+		    updated_at = $4::timestamp,
 		    transition_history_json = (
 		        COALESCE(transition_history_json, '[]'::json)::jsonb ||
 		        jsonb_build_array(jsonb_build_object(
 		            'from', state,
-		            'to', $3,
-		            'reason', $5,
-		            'at', to_char($4 AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		            'to', $3::text,
+		            'reason', $5::text,
+		            'at', to_char($4::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 		        ))
 		    )::json
 		WHERE id = $1::uuid
-	`, taskID, planID, TaskPlanning, now, "plan_task"); err != nil {
+	`, taskID, planID, TaskPlanning, now, "plan_task", rationalePatch); err != nil {
 		return err
 	}
 	parentID, err := optionalUUID("parent_queue_item_id", parentQueueItemID)
@@ -203,18 +208,18 @@ func (s *Store) MarkTaskProducingAndEnqueueObserve(ctx context.Context, taskID s
 		UPDATE production_tasks
 		SET autoflow_run_id = $2::uuid,
 		    job_id = $3::uuid,
-		    state = $4,
+		    state = $4::text,
 		    blocked_by_guard = NULL,
 		    failure_reason = NULL,
-		    state_updated_at = $5,
-		    updated_at = $5,
+		    state_updated_at = $5::timestamptz,
+		    updated_at = $5::timestamp,
 		    transition_history_json = (
 		        COALESCE(transition_history_json, '[]'::json)::jsonb ||
 		        jsonb_build_array(jsonb_build_object(
 		            'from', state,
-		            'to', $4,
-		            'reason', $6,
-		            'at', to_char($5 AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		            'to', $4::text,
+		            'reason', $6::text,
+		            'at', to_char($5::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 		        ))
 		    )::json
 		WHERE id = $1::uuid
@@ -285,19 +290,19 @@ func (s *Store) MarkTaskReadyToPublish(ctx context.Context, task ProductionTaskR
 	}
 	if _, err := s.Pool.Exec(ctx, `
 		UPDATE production_tasks
-		SET state = $2,
+		SET state = $2::text,
 		    blocked_by_guard = NULL,
 		    failure_reason = NULL,
 		    rationale_json = (COALESCE(rationale_json, '{}'::json)::jsonb || $3::jsonb)::json,
-		    state_updated_at = $4,
-		    updated_at = $4,
+		    state_updated_at = $4::timestamptz,
+		    updated_at = $4::timestamp,
 		    transition_history_json = (
 		        COALESCE(transition_history_json, '[]'::json)::jsonb ||
 		        jsonb_build_array(jsonb_build_object(
 		            'from', state,
-		            'to', $2,
-		            'reason', $5,
-		            'at', to_char($4 AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		            'to', $2::text,
+		            'reason', $5::text,
+		            'at', to_char($4::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 		        ))
 		    )::json
 		WHERE id = $1::uuid
@@ -330,17 +335,17 @@ func (s *Store) FailTask(ctx context.Context, taskID string, reason string, tran
 	now := s.Now().UTC()
 	_, err := s.Pool.Exec(ctx, `
 		UPDATE production_tasks
-		SET state = $2,
-		    failure_reason = $3,
-		    state_updated_at = $4,
-		    updated_at = $4,
+		SET state = $2::text,
+		    failure_reason = $3::text,
+		    state_updated_at = $4::timestamptz,
+		    updated_at = $4::timestamp,
 		    transition_history_json = (
 		        COALESCE(transition_history_json, '[]'::json)::jsonb ||
 		        jsonb_build_array(jsonb_build_object(
 		            'from', state,
-		            'to', $2,
-		            'reason', $5,
-		            'at', to_char($4 AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		            'to', $2::text,
+		            'reason', $5::text,
+		            'at', to_char($4::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 		        ))
 		    )::json
 		WHERE id = $1::uuid
@@ -368,19 +373,19 @@ func (s *Store) holdTask(ctx context.Context, taskID string, planID string, guar
 	_, err = s.Pool.Exec(ctx, `
 		UPDATE production_tasks
 		SET autoflow_plan_id = COALESCE($2::uuid, autoflow_plan_id),
-		    state = $3,
-		    blocked_by_guard = $4,
-		    failure_reason = $5,
+		    state = $3::text,
+		    blocked_by_guard = $4::text,
+		    failure_reason = $5::text,
 		    agent_approval_evidence_json = CASE WHEN $6 THEN $7::json ELSE agent_approval_evidence_json END,
-		    state_updated_at = $8,
-		    updated_at = $8,
+		    state_updated_at = $8::timestamptz,
+		    updated_at = $8::timestamp,
 		    transition_history_json = (
 		        COALESCE(transition_history_json, '[]'::json)::jsonb ||
 		        jsonb_build_array(jsonb_build_object(
 		            'from', state,
-		            'to', $3,
-		            'reason', $9,
-		            'at', to_char($8 AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		            'to', $3::text,
+		            'reason', $9::text,
+		            'at', to_char($8::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 		        ))
 		    )::json
 		WHERE id = $1::uuid

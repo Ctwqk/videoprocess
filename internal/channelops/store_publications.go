@@ -51,10 +51,10 @@ func (s *Store) CreateOrUpdatePublicationFromTask(ctx context.Context, task Prod
 			    desired_privacy = $6,
 			    current_privacy = $7,
 			    publish_status = CASE WHEN p.publish_status IN ('held', 'uploaded') THEN $8 ELSE p.publish_status END,
-			    uploaded_at = COALESCE(p.uploaded_at, $9),
+			    uploaded_at = COALESCE(p.uploaded_at, $9::timestamptz),
 			    compliance_disposition = $10,
 			    quota_units_estimated = CASE WHEN p.quota_units_estimated = 0 THEN 1600 ELSE p.quota_units_estimated END,
-			    updated_at = $9
+			    updated_at = $9::timestamp
 			FROM existing
 			WHERE p.id = existing.id
 			RETURNING p.id
@@ -67,8 +67,8 @@ func (s *Store) CreateOrUpdatePublicationFromTask(ctx context.Context, task Prod
 				warnings_json, created_at, updated_at
 			)
 			SELECT gen_random_uuid(), $1::uuid, 'youtube', $2::uuid, $3, NULL,
-			       $4, $5, '[]'::json, NULL, $6, $7, $8, $9, NULL, NULL,
-			       $10, 1600, NULL, '[]'::json, $9, $9
+				       $4, $5, '[]'::json, NULL, $6, $7, $8, $9::timestamptz, NULL, NULL,
+				       $10, 1600, NULL, '[]'::json, $9::timestamp, $9::timestamp
 			WHERE NOT EXISTS (SELECT 1 FROM existing)
 			RETURNING id
 		)
@@ -83,6 +83,9 @@ func (s *Store) CreateOrUpdatePublicationFromTask(ctx context.Context, task Prod
 
 	if status == "held" {
 		return s.HoldTask(ctx, task.ID, "external_asset_auto_publish_required", "External platform assets require human review before publication", "publish_task")
+	}
+	if err := s.writeMaterialUsageLedgerFromTask(ctx, task, publicationID, now); err != nil {
+		return err
 	}
 	if err := s.markTaskUploadedPrivate(ctx, task.ID, now); err != nil {
 		return err
@@ -138,13 +141,13 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 		SET desired_privacy = $2,
 		    current_privacy = CASE WHEN $3 = 'public' THEN $2 ELSE current_privacy END,
 		    publish_status = $3,
-		    scheduled_publish_at = $4,
-		    public_at = COALESCE($5, public_at),
+			    scheduled_publish_at = $4::timestamptz,
+			    public_at = COALESCE($5::timestamptz, public_at),
 		    warnings_json = (
 		        COALESCE(warnings_json, '[]'::json)::jsonb ||
 		        jsonb_build_array(jsonb_build_object('promotion_decision', $6::jsonb))
 		    )::json,
-		    updated_at = $7
+			    updated_at = $7::timestamp
 		WHERE id = $1::uuid
 	`, publication.ID, visibility, status, scheduledAt.UTC(), publicAt, mustJSON(decision), now)
 	if err != nil {
@@ -247,10 +250,10 @@ func (s *Store) UpdatePublicationStatus(ctx context.Context, publicationID strin
 		    current_privacy = COALESCE(NULLIF($3, ''), current_privacy),
 		    permalink = COALESCE(NULLIF($4, ''), permalink),
 		    public_at = CASE
-		        WHEN COALESCE(NULLIF($2, ''), publish_status) = 'public' THEN COALESCE(public_at, $5)
+			        WHEN COALESCE(NULLIF($2, ''), publish_status) = 'public' THEN COALESCE(public_at, $5::timestamptz)
 		        ELSE public_at
 		    END,
-		    updated_at = $5
+			    updated_at = $5::timestamp
 		WHERE id = $1::uuid
 	`, publicationID, publishStatus, privacy, status.Permalink, now)
 	return err
@@ -332,7 +335,7 @@ func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication Publicatio
 	nextCount := pollCount + 1
 	if _, err := s.Pool.Exec(ctx, `
 		UPDATE publication_records
-		SET last_metrics_polled_at = $2, updated_at = $2
+			SET last_metrics_polled_at = $2::timestamptz, updated_at = $2::timestamp
 		WHERE id = $1::uuid
 	`, publication.ID, now); err != nil {
 		return err
@@ -388,7 +391,7 @@ func (s *Store) UpsertFeedbackSnapshot(ctx context.Context, publication Publicat
 				metrics_completeness_score, available_fields_json, virality_score, raw_json
 			)
 			VALUES (
-				gen_random_uuid(), $1::uuid, $2, $3, $4, $5, $6, $7, $8::json, $9, $10,
+					gen_random_uuid(), $1::uuid, $2::timestamptz, $3, $4, $5, $6, $7, $8::json, $9, $10,
 				$11, $12::json, $13, $14::json
 			)
 		`, publication.ID, now, values.Views, values.Likes, values.Comments, values.Shares,
@@ -397,7 +400,7 @@ func (s *Store) UpsertFeedbackSnapshot(ctx context.Context, publication Publicat
 	} else {
 		_, err = s.Pool.Exec(ctx, `
 			UPDATE feedback_snapshots
-			SET collected_at = $2,
+				SET collected_at = $2::timestamptz,
 			    views = $3,
 			    likes = $4,
 			    comments = $5,
@@ -420,7 +423,7 @@ func (s *Store) UpsertFeedbackSnapshot(ctx context.Context, publication Publicat
 	}
 	if _, err := s.Pool.Exec(ctx, `
 		UPDATE publication_records
-		SET last_metrics_polled_at = $2, updated_at = $2
+			SET last_metrics_polled_at = $2::timestamptz, updated_at = $2::timestamp
 		WHERE id = $1::uuid
 	`, publication.ID, now); err != nil {
 		return err
@@ -457,6 +460,47 @@ func (s *Store) UpdateAccountHealth(ctx context.Context, accountID string, healt
 		WHERE id = $1::uuid
 	`, accountID, now, status, health.Authenticated, healthJSON)
 	return err
+}
+
+func (s *Store) writeMaterialUsageLedgerFromTask(ctx context.Context, task ProductionTaskRow, publicationID string, now time.Time) error {
+	if err := requireUUID("publication_id", publicationID); err != nil {
+		return err
+	}
+	observation := mapFromAny(jsonObject(task.RationaleJSON)["autoflow_job_observation"])
+	planPayload := mapFromAny(jsonObject(task.RationaleJSON)["autoflow_plan_payload"])
+	refs := ExtractMaterialReferences(
+		planPayload,
+		mapFromAny(observation["run_payload"]),
+		mapFromAny(observation["upload_metadata"]),
+	)
+	for _, ref := range refs {
+		metadataJSON := mustJSON(ref.Metadata)
+		var assetID *string
+		if uuidPattern.MatchString(ref.AssetID) {
+			assetID = &ref.AssetID
+		}
+		_, err := s.Pool.Exec(ctx, `
+			INSERT INTO material_usage_ledger (
+				id, material_id, asset_id, channel_profile_id, topic_lane_id,
+				publishing_account_id, publication_id, used_at, segment_signature,
+				metadata_json
+			)
+			SELECT gen_random_uuid(), $1::text, $2::uuid, $3::uuid, $4::uuid,
+			       $5::uuid, $6::uuid, $7::timestamptz, $8::text, $9::json
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM material_usage_ledger
+				WHERE publication_id = $6::uuid
+				  AND material_id = $1::text
+				  AND segment_signature = $8::text
+			)
+		`, ref.MaterialID, assetID, task.ChannelProfileID, task.TopicLaneID, task.TargetAccountID,
+			publicationID, now.UTC(), ref.SegmentSignature, metadataJSON)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) getPublishingAccount(ctx context.Context, accountID string) (PublishingAccountRow, error) {
@@ -502,18 +546,18 @@ func (s *Store) updateTaskState(ctx context.Context, taskID string, state string
 	}
 	_, err := s.Pool.Exec(ctx, `
 		UPDATE production_tasks
-		SET state = $2,
-		    blocked_by_guard = $3,
-		    failure_reason = $4,
-		    state_updated_at = $5,
-		    updated_at = $5,
+		SET state = $2::text,
+		    blocked_by_guard = $3::text,
+		    failure_reason = $4::text,
+		    state_updated_at = $5::timestamptz,
+		    updated_at = $5::timestamp,
 		    transition_history_json = (
 		        COALESCE(transition_history_json, '[]'::json)::jsonb ||
 		        jsonb_build_array(jsonb_build_object(
 		            'from', state,
-		            'to', $2,
-		            'reason', $6,
-		            'at', to_char($5 AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		            'to', $2::text,
+		            'reason', $6::text,
+		            'at', to_char($5::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
 		        ))
 		    )::json
 		WHERE id = $1::uuid

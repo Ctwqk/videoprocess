@@ -104,9 +104,9 @@ func (s *Store) Enqueue(ctx context.Context, opts EnqueueOptions) (string, error
 	var id string
 	err = s.Pool.QueryRow(ctx, `
 		INSERT INTO channel_ops_queue_items
-			(kind, idempotency_key, payload_json, status, priority, run_after, attempt_count,
+			(id, kind, idempotency_key, payload_json, status, priority, run_after, attempt_count,
 			 max_attempts, channel_profile_id, parent_queue_item_id)
-		VALUES ($1, $2, $3::jsonb, $4, $5, $6, 0, $7, $8, $9)
+		VALUES (gen_random_uuid(), $1, $2, $3::jsonb, $4, $5, $6, 0, $7, $8, $9)
 		ON CONFLICT (idempotency_key) DO UPDATE
 		SET idempotency_key = EXCLUDED.idempotency_key
 		RETURNING id

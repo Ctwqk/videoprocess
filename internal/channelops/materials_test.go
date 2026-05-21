@@ -56,6 +56,21 @@ func TestExtractMaterialReferencesDedupesMaterialAndSegmentSignature(t *testing.
 	}
 }
 
+func TestExtractMaterialReferencesKeepsPlanPayloadPrecedence(t *testing.T) {
+	refs := ExtractMaterialReferences(
+		map[string]any{"clips": []any{map[string]any{"material_id": "mat-1", "asset_id": "asset-plan"}}},
+		map[string]any{"clips": []any{map[string]any{"material_id": "mat-1", "asset_id": "asset-run"}}},
+		map[string]any{"material_refs": []any{map[string]any{"material_id": "mat-1", "asset_id": "asset-upload"}}},
+	)
+
+	if len(refs) != 1 {
+		t.Fatalf("refs len = %d refs=%#v", len(refs), refs)
+	}
+	if refs[0].AssetID != "asset-plan" {
+		t.Fatalf("AssetID = %q", refs[0].AssetID)
+	}
+}
+
 func TestExtractMaterialReferencesReadsCamelCaseSegmentSignature(t *testing.T) {
 	refs := ExtractMaterialReferences(map[string]any{
 		"materialId":       "mat-1",
