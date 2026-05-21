@@ -138,6 +138,34 @@ class AgentTickAudit(UUIDPrimaryKeyMixin, Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class DecisionAuditEntry(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "decision_audit_entries"
+    __table_args__ = (
+        Index("ix_decision_audit_entries_tick", "tick_audit_id"),
+        Index("ix_decision_audit_entries_channel_created", "channel_profile_id", "created_at"),
+        Index("ix_decision_audit_entries_task", "created_task_id"),
+        Index("ix_decision_audit_entries_source_created", "candidate_source", "created_at"),
+    )
+
+    tick_audit_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_tick_audits.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_profile_id: Mapped[uuid_mod.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    candidate_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    candidate_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    topic_lane_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    lane_format_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    target_account_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    score_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    guard_results_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    pds_decision_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    learning_context_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    selected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    rejection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_task_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class ManualSeed(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "manual_seeds"
 
@@ -155,6 +183,38 @@ class ManualSeed(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
 
 
+class DiscoverySignal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "discovery_signals"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_profile_id",
+            "source",
+            "source_external_id",
+            name="uq_discovery_signal_channel_source_external",
+        ),
+        Index("ix_discovery_signals_channel_lane_observed", "channel_profile_id", "topic_lane_id", "observed_at"),
+        Index("ix_discovery_signals_channel_status_expires", "channel_profile_id", "status", "expires_at"),
+    )
+
+    channel_profile_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("channel_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    topic_lane_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_external_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    keywords_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    trend_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    novelty_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    raw_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    converted_task_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
 class ProductionTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "production_tasks"
     __table_args__ = (Index("ix_production_tasks_channel_state", "channel_profile_id", "state"),)
@@ -167,6 +227,7 @@ class ProductionTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     lane_format_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     target_account_id: Mapped[uuid_mod.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     manual_seed_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    discovery_signal_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     source: Mapped[str] = mapped_column(String(64), default="manual_seed", nullable=False)
     title_seed: Mapped[str] = mapped_column(Text, default="", nullable=False)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
@@ -187,6 +248,7 @@ class ProductionTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     state: Mapped[str] = mapped_column(String(32), default="seeded", nullable=False)
     state_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     blocked_by_guard: Mapped[str | None] = mapped_column(String(255), nullable=True)
     channel_config_version_snapshot: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
@@ -258,8 +320,12 @@ class TakedownEvent(UUIDPrimaryKeyMixin, Base):
 
 class FeedbackSnapshot(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "feedback_snapshots"
+    __table_args__ = (
+        Index("ux_feedback_snapshots_publication_stage", "publication_id", "snapshot_stage", unique=True),
+    )
 
     publication_id: Mapped[uuid_mod.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    snapshot_stage: Mapped[str] = mapped_column(String(16), default="24h", nullable=False)
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     likes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -271,8 +337,34 @@ class FeedbackSnapshot(UUIDPrimaryKeyMixin, Base):
     impressions: Mapped[int | None] = mapped_column(Integer, nullable=True)
     metrics_completeness_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     available_fields_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    reward_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reward_components_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     virality_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     raw_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class LearningState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "learning_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_profile_id",
+            "dimension_type",
+            "dimension_key",
+            "window_days",
+            name="uq_learning_state_channel_dimension_window",
+        ),
+        Index("ix_learning_states_channel_dimension", "channel_profile_id", "dimension_type"),
+    )
+
+    channel_profile_id: Mapped[uuid_mod.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    dimension_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    dimension_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    window_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    avg_reward: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    recommendation_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    last_computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class InternalSchedulerRun(UUIDPrimaryKeyMixin, Base):
