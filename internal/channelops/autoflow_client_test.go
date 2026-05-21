@@ -191,12 +191,38 @@ func TestHTTPAutoFlowGetJobRejectsRunJobMismatch(t *testing.T) {
 	defer server.Close()
 
 	client := HTTPAutoFlowClient{BaseURL: server.URL}
-	_, err := client.GetJob(context.Background(), "run-1", "job-1")
-	if err == nil {
-		t.Fatal("expected mismatch error")
+	observation, err := client.GetJob(context.Background(), "run-1", "job-1")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "run/job mismatch") {
-		t.Fatalf("error = %v", err)
+	if observation.Status != "failed" {
+		t.Fatalf("Status = %q, want failed", observation.Status)
+	}
+	if !strings.Contains(observation.ErrorMessage, "run/job mismatch") {
+		t.Fatalf("ErrorMessage = %q", observation.ErrorMessage)
+	}
+}
+
+func TestHTTPAutoFlowGetJobReturnsFailedWhenRunHasNoLinkedJob(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/autoflow/runs/run-1" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"run_id":"run-1","job_id":null,"status":"failed"}`))
+	}))
+	defer server.Close()
+
+	client := HTTPAutoFlowClient{BaseURL: server.URL}
+	observation, err := client.GetJob(context.Background(), "run-1", "job-1")
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if observation.Status != "failed" {
+		t.Fatalf("Status = %q, want failed", observation.Status)
+	}
+	if !strings.Contains(observation.ErrorMessage, "has no linked job_id") {
+		t.Fatalf("ErrorMessage = %q", observation.ErrorMessage)
 	}
 }
 

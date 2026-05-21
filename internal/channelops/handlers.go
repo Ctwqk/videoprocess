@@ -182,10 +182,10 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 		return h.Store.FailTask(ctx, task.ID, observation.ErrorMessage, "execute_task")
 	}
 	if strings.TrimSpace(observation.RunID) == "" {
-		return errors.New("autoflow execute response missing run_id")
+		return h.Store.FailTask(ctx, task.ID, "autoflow execute response missing run_id", "execute_task")
 	}
 	if strings.TrimSpace(observation.JobID) == "" {
-		return errors.New("autoflow execute response missing job_id")
+		return h.Store.FailTask(ctx, task.ID, "autoflow execute response missing job_id", "execute_task")
 	}
 	return h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, observation.RunID, observation.JobID, item.ID)
 }
@@ -435,7 +435,7 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 		"target_platforms":     []string{"youtube"},
 		"source_platforms":     sourcePlatforms,
 		"duration_sec":         positiveAnyInt(laneFormat["target_duration_sec"], 30),
-		"aspect_ratio":         stringOrFallback(channel["default_aspect_ratio"], "9:16"),
+		"aspect_ratio":         normalizeAspectRatio(channel["default_aspect_ratio"]),
 		"source_policy":        autoflowSourcePolicy(task),
 		"publish_mode":         autoflowPublishMode(laneFormat, account),
 		"material_library_ids": stringSlice(task.MaterialLibraryIDsJSON),
@@ -490,6 +490,16 @@ func normalizePlanningMode(value any) string {
 		return requested
 	default:
 		return "auto"
+	}
+}
+
+func normalizeAspectRatio(value any) string {
+	requested := strings.TrimSpace(fmt.Sprint(value))
+	switch requested {
+	case "9:16", "16:9", "1:1", "auto":
+		return requested
+	default:
+		return "9:16"
 	}
 }
 

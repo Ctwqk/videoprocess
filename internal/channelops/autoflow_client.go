@@ -122,10 +122,20 @@ func (c HTTPAutoFlowClient) GetJob(ctx context.Context, runID string, jobID stri
 	}
 	runJobID := firstString(runPayload, "job_id")
 	if runJobID == "" {
-		return AutoFlowJobObservation{}, fmt.Errorf("autoflow run %s has no linked job_id", runID)
+		return AutoFlowJobObservation{
+			Status:         "failed",
+			RunPayload:     map[string]any{"run": runPayload},
+			UploadMetadata: map[string]any{},
+			ErrorMessage:   fmt.Sprintf("autoflow run %s has no linked job_id", runID),
+		}, nil
 	}
 	if runJobID != jobID {
-		return AutoFlowJobObservation{}, fmt.Errorf("autoflow run/job mismatch: run %s is linked to job %s, not %s", runID, runJobID, jobID)
+		return AutoFlowJobObservation{
+			Status:         "failed",
+			RunPayload:     map[string]any{"run": runPayload},
+			UploadMetadata: map[string]any{},
+			ErrorMessage:   fmt.Sprintf("autoflow run/job mismatch: run %s is linked to job %s, not %s", runID, runJobID, jobID),
+		}, nil
 	}
 	jobPayload, err := c.getJSON(ctx, "/api/v1/jobs/"+url.PathEscape(jobID))
 	if err != nil {

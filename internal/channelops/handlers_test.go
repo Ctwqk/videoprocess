@@ -152,6 +152,25 @@ func TestAutoFlowRequestForTaskExternalAssetsUseReviewPolicyAndPrivateDefault(t 
 	}
 }
 
+func TestAutoFlowRequestForTaskInvalidAspectRatioFallsBack(t *testing.T) {
+	task := ProductionTaskRow{
+		ID:     "task-1",
+		Prompt: "Make a short",
+		ChannelConfigSnapshotJSON: map[string]any{
+			"channel": map[string]any{
+				"default_aspect_ratio": "vertical",
+			},
+			"lane_format": map[string]any{},
+		},
+	}
+
+	request := AutoFlowRequestForTask(task)
+
+	if request["aspect_ratio"] != "9:16" {
+		t.Fatalf("aspect_ratio = %#v, want 9:16", request["aspect_ratio"])
+	}
+}
+
 func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionFails(t *testing.T) {
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)
@@ -187,6 +206,64 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionFails(t *testing.T) {
 	}
 }
 
+func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingRunID(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	task := fixture.RequireSingleTask(ctx)
+	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, ""); err != nil {
+		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
+	}
+	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{
+		Status: "running",
+		JobID:  "00000000-0000-0000-0000-000000000301",
+	}}
+
+	err := handler.HandleExecuteTask(ctx, QueueItemRow{
+		ID:          "00000000-0000-0000-0000-000000000401",
+		PayloadJSON: map[string]any{"production_task_id": task.ID},
+	})
+	if err != nil {
+		t.Fatalf("HandleExecuteTask returned error: %v", err)
+	}
+	assertTaskFailedWithReason(t, fixture.Store, ctx, task.ID, "autoflow execute response missing run_id")
+}
+
+func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingJobID(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	task := fixture.RequireSingleTask(ctx)
+	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, ""); err != nil {
+		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
+	}
+	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{
+		Status: "running",
+		RunID:  "00000000-0000-0000-0000-000000000201",
+	}}
+
+	err := handler.HandleExecuteTask(ctx, QueueItemRow{
+		ID:          "00000000-0000-0000-0000-000000000401",
+		PayloadJSON: map[string]any{"production_task_id": task.ID},
+	})
+	if err != nil {
+		t.Fatalf("HandleExecuteTask returned error: %v", err)
+	}
+	assertTaskFailedWithReason(t, fixture.Store, ctx, task.ID, "autoflow execute response missing job_id")
+}
+
 func TestHandleObserveJobRequiresRunIDPayload(t *testing.T) {
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)
@@ -217,6 +294,20 @@ func TestHandleObserveJobRequiresRunIDPayload(t *testing.T) {
 	}
 	if err.Error() != "observe_job payload missing run_id" {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func assertTaskFailedWithReason(t *testing.T, store *Store, ctx context.Context, taskID string, wantReason string) {
+	t.Helper()
+	updated, err := store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetProductionTask: %v", err)
+	}
+	if updated.State != TaskFailed {
+		t.Fatalf("state = %s", updated.State)
+	}
+	if updated.FailureReason == nil || *updated.FailureReason != wantReason {
+		t.Fatalf("failure reason = %#v, want %q", updated.FailureReason, wantReason)
 	}
 }
 
