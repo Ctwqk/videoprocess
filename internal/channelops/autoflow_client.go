@@ -16,7 +16,7 @@ type AutoFlowClient interface {
 	PlanTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowPlanObservation, error)
 	ApprovePlan(ctx context.Context, planID string, evidence map[string]any) error
 	ExecuteTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error)
-	GetJob(ctx context.Context, jobID string) (AutoFlowJobObservation, error)
+	GetJob(ctx context.Context, runID string, jobID string) (AutoFlowJobObservation, error)
 }
 
 type HTTPAutoFlowClient struct {
@@ -32,10 +32,12 @@ type AutoFlowPlanObservation struct {
 }
 
 type AutoFlowExecuteObservation struct {
-	RunID      string
-	JobID      string
-	Status     string
-	RunPayload map[string]any
+	RunID        string
+	PipelineID   string
+	JobID        string
+	Status       string
+	ErrorMessage string
+	RunPayload   map[string]any
 }
 
 type AutoFlowJobObservation struct {
@@ -96,33 +98,50 @@ func (c HTTPAutoFlowClient) ExecuteTask(ctx context.Context, task ProductionTask
 		return AutoFlowExecuteObservation{}, err
 	}
 	return AutoFlowExecuteObservation{
-		RunID:      firstString(payload, "run_id"),
-		JobID:      firstString(payload, "job_id"),
-		Status:     firstString(payload, "status"),
-		RunPayload: payload,
+		RunID:        firstString(payload, "run_id"),
+		PipelineID:   firstString(payload, "pipeline_id"),
+		JobID:        firstString(payload, "job_id"),
+		Status:       firstString(payload, "status"),
+		ErrorMessage: firstString(payload, "error_message", "detail"),
+		RunPayload:   payload,
 	}, nil
 }
 
-func (c HTTPAutoFlowClient) GetJob(ctx context.Context, jobID string) (AutoFlowJobObservation, error) {
+func (c HTTPAutoFlowClient) GetJob(ctx context.Context, runID string, jobID string) (AutoFlowJobObservation, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return AutoFlowJobObservation{}, fmt.Errorf("autoflow run_id is required")
+	}
 	jobID = strings.TrimSpace(jobID)
 	if jobID == "" {
 		return AutoFlowJobObservation{}, fmt.Errorf("autoflow job_id is required")
 	}
-	payload, err := c.getJSON(ctx, "/api/v1/jobs/"+url.PathEscape(jobID))
+	runPayload, err := c.getJSON(ctx, "/api/v1/autoflow/runs/"+url.PathEscape(runID))
 	if err != nil {
 		return AutoFlowJobObservation{}, err
 	}
-	status := autoflowJobStatus(firstString(payload, "status"))
+	runJobID := firstString(runPayload, "job_id")
+	if runJobID == "" {
+		return AutoFlowJobObservation{}, fmt.Errorf("autoflow run %s has no linked job_id", runID)
+	}
+	if runJobID != jobID {
+		return AutoFlowJobObservation{}, fmt.Errorf("autoflow run/job mismatch: run %s is linked to job %s, not %s", runID, runJobID, jobID)
+	}
+	jobPayload, err := c.getJSON(ctx, "/api/v1/jobs/"+url.PathEscape(jobID))
+	if err != nil {
+		return AutoFlowJobObservation{}, err
+	}
+	status := autoflowJobStatus(firstString(jobPayload, "status"))
 	observation := AutoFlowJobObservation{
 		Status:         status,
-		RunPayload:     payload,
+		RunPayload:     map[string]any{"run": runPayload, "job": jobPayload},
 		UploadMetadata: map[string]any{},
 	}
 	if status == "failed" {
-		observation.ErrorMessage = firstString(payload, "error_message", "detail")
+		observation.ErrorMessage = firstString(jobPayload, "error_message", "detail")
 	}
 	if status == "succeeded" {
-		observation.UploadMetadata = youtubeUploadMetadata(payload)
+		observation.UploadMetadata = youtubeUploadMetadata(jobPayload)
 	}
 	return observation, nil
 }

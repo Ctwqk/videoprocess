@@ -120,12 +120,39 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 	}
 }
 
+func TestHTTPAutoFlowExecuteTaskMapsFailedRun(t *testing.T) {
+	planID := "plan-from-task"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"run_id":"","job_id":"","status":"failed","error_message":"execute blocked"}`))
+	}))
+	defer server.Close()
+
+	client := HTTPAutoFlowClient{BaseURL: server.URL}
+	observation, err := client.ExecuteTask(context.Background(), ProductionTaskRow{ID: "task-1", AutoFlowPlanID: &planID}, nil)
+	if err != nil {
+		t.Fatalf("ExecuteTask returned error: %v", err)
+	}
+	if observation.Status != "failed" {
+		t.Fatalf("Status = %q", observation.Status)
+	}
+	if observation.ErrorMessage != "execute blocked" {
+		t.Fatalf("ErrorMessage = %q", observation.ErrorMessage)
+	}
+}
+
 func TestHTTPAutoFlowGetJobMapsStatusAndExtractsYouTubeMetadata(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("method = %s", r.Method)
 		}
-		if r.URL.Path != "/api/v1/jobs/job-1" {
+		switch r.URL.Path {
+		case "/api/v1/autoflow/runs/run-1":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"run_id":"run-1","job_id":"job-1","status":"pending"}`))
+			return
+		case "/api/v1/jobs/job-1":
+		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -141,7 +168,7 @@ func TestHTTPAutoFlowGetJobMapsStatusAndExtractsYouTubeMetadata(t *testing.T) {
 	defer server.Close()
 
 	client := HTTPAutoFlowClient{BaseURL: server.URL}
-	observation, err := client.GetJob(context.Background(), "job-1")
+	observation, err := client.GetJob(context.Background(), "run-1", "job-1")
 	if err != nil {
 		t.Fatalf("GetJob returned error: %v", err)
 	}
@@ -150,6 +177,26 @@ func TestHTTPAutoFlowGetJobMapsStatusAndExtractsYouTubeMetadata(t *testing.T) {
 	}
 	if observation.UploadMetadata["video_id"] != "yt-1" {
 		t.Fatalf("UploadMetadata = %#v", observation.UploadMetadata)
+	}
+}
+
+func TestHTTPAutoFlowGetJobRejectsRunJobMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/autoflow/runs/run-1" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"run_id":"run-1","job_id":"other-job","status":"pending"}`))
+	}))
+	defer server.Close()
+
+	client := HTTPAutoFlowClient{BaseURL: server.URL}
+	_, err := client.GetJob(context.Background(), "run-1", "job-1")
+	if err == nil {
+		t.Fatal("expected mismatch error")
+	}
+	if !strings.Contains(err.Error(), "run/job mismatch") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

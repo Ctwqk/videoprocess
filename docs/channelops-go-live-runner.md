@@ -10,8 +10,22 @@ runner is behind the `channelops-go` profile.
 
 ## Dev No-PDS Startup
 
-For a local development run that bypasses PDS decisions, start the standalone
-dependencies and the Go runner with `CHANNEL_AGENT_DEV_ALLOW_ALL_PDS=true`:
+For a local development run that bypasses PDS decisions against the repo's
+default host database, start the Go runner with `CHANNEL_AGENT_DEV_ALLOW_ALL_PDS=true`:
+
+```bash
+CHANNEL_AGENT_DEV_ALLOW_ALL_PDS=true \
+PDS_ENABLED=false \
+docker compose --profile channelops-go up channelops-runner-go
+```
+
+This requires the API, host Postgres, and YouTube manager to be reachable. The
+runner's default Compose AutoFlow endpoint is `http://api:8080`, and both API
+and Go runner default to the same host database at
+`host.docker.internal:5435/videoprocess`.
+
+To use the Compose `postgres` service instead, explicitly override both API and
+Go runner database URLs:
 
 ```bash
 CHANNEL_AGENT_DEV_ALLOW_ALL_PDS=true \
@@ -20,9 +34,6 @@ VP_DATABASE_URL=postgresql+asyncpg://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@postg
 VP_DATABASE_URL_GO=postgres://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@postgres:5432/videoprocess \
 docker compose --profile standalone --profile channelops-go up channelops-runner-go
 ```
-
-This still requires `postgres`, `api`, and `youtube-manager` to be reachable.
-The runner's default Compose AutoFlow endpoint is `http://api:8080`.
 
 ## Production-Like Startup
 
@@ -35,9 +46,7 @@ PDS_BASE_URL=http://pds:8080 \
 PDS_CLIENT_ID=videoprocess-channel-agent \
 AUTOFLOW_BASE_URL=http://api:8080 \
 YOUTUBE_MANAGER_URL=http://youtube-manager:8899 \
-VP_DATABASE_URL=postgresql+asyncpg://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@postgres:5432/videoprocess \
-VP_DATABASE_URL_GO=postgres://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@postgres:5432/videoprocess \
-docker compose --profile standalone --profile channelops-go up channelops-runner-go
+docker compose --profile channelops-go up channelops-runner-go
 ```
 
 Do not include `--profile channelops-python` in the same run unless you are
@@ -65,6 +74,9 @@ pipelines, jobs, and run records through the API, while the Go runner reads and
 updates ChannelOps task state directly through `DATABASE_URL`. If these point at
 different databases, plan approval, execution, and job observation will not line
 up.
+
+The `channelops-runner-go` service defaults `PDS_ENABLED=false` for dev-safe
+startup. Set `PDS_ENABLED=true` explicitly for production-like validation.
 
 Relevant runner environment:
 

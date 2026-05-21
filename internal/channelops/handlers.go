@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -177,6 +178,15 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	if err != nil {
 		return err
 	}
+	if observation.Status == "failed" {
+		return h.Store.FailTask(ctx, task.ID, observation.ErrorMessage, "execute_task")
+	}
+	if strings.TrimSpace(observation.RunID) == "" {
+		return errors.New("autoflow execute response missing run_id")
+	}
+	if strings.TrimSpace(observation.JobID) == "" {
+		return errors.New("autoflow execute response missing job_id")
+	}
 	return h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, observation.RunID, observation.JobID, item.ID)
 }
 
@@ -198,6 +208,14 @@ func (h HandlerService) HandleObserveJob(ctx context.Context, item QueueItemRow)
 	if taskID == "" {
 		return errors.New("observe_job payload missing production_task_id")
 	}
+	runID, _ := item.PayloadJSON["run_id"].(string)
+	if strings.TrimSpace(runID) == "" {
+		return errors.New("observe_job payload missing run_id")
+	}
+	jobID, _ := item.PayloadJSON["job_id"].(string)
+	if strings.TrimSpace(jobID) == "" {
+		return errors.New("observe_job payload missing job_id")
+	}
 	task, err := h.Store.GetProductionTask(ctx, taskID)
 	if err != nil {
 		return err
@@ -205,7 +223,16 @@ func (h HandlerService) HandleObserveJob(ctx context.Context, item QueueItemRow)
 	if task.JobID == nil || *task.JobID == "" {
 		return fmt.Errorf("task %s has no AutoFlow job id", task.ID)
 	}
-	observation, err := h.AutoFlow.GetJob(ctx, *task.JobID)
+	if task.AutoFlowRunID == nil || *task.AutoFlowRunID == "" {
+		return fmt.Errorf("task %s has no AutoFlow run id", task.ID)
+	}
+	if *task.AutoFlowRunID != runID {
+		return fmt.Errorf("observe_job payload run_id %s does not match task %s run_id %s", runID, task.ID, *task.AutoFlowRunID)
+	}
+	if *task.JobID != jobID {
+		return fmt.Errorf("observe_job payload job_id %s does not match task %s job_id %s", jobID, task.ID, *task.JobID)
+	}
+	observation, err := h.AutoFlow.GetJob(ctx, runID, jobID)
 	if err != nil {
 		return err
 	}
@@ -374,34 +401,132 @@ func (h HandlerService) HandleAccountHealth(ctx context.Context, item QueueItemR
 }
 
 func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
-	request := map[string]any{
-		"production_task_id":        task.ID,
-		"channel_profile_id":        task.ChannelProfileID,
-		"target_account_id":         task.TargetAccountID,
-		"title_seed":                task.TitleSeed,
-		"prompt":                    task.Prompt,
-		"source":                    task.Source,
-		"source_platforms":          stringSlice(task.SourcePlatformsJSON),
-		"material_library_ids":      stringSlice(task.MaterialLibraryIDsJSON),
-		"rationale":                 jsonObject(task.RationaleJSON),
-		"score_breakdown":           jsonObject(task.ScoreBreakdownJSON),
-		"channel_config_version":    task.ChannelConfigVersionSnapshot,
-		"channel_config_snapshot":   jsonObject(task.ChannelConfigSnapshotJSON),
-		"transition_history_length": len(task.TransitionHistoryJSON),
+	snapshot := jsonObject(task.ChannelConfigSnapshotJSON)
+	channel := mapFromAny(snapshot["channel"])
+	account := mapFromAny(snapshot["account"])
+	lane := mapFromAny(snapshot["lane"])
+	laneFormat := mapFromAny(snapshot["lane_format"])
+	manualSeed := mapFromAny(snapshot["manual_seed"])
+	riskPolicy := mapFromAny(channel["risk_policy_json"])
+	manualSeedConstraints := mapFromAny(manualSeed["constraints_json"])
+	sourcePlatforms := effectiveSourcePlatforms(task, laneFormat)
+	constraints := map[string]any{
+		"lane_id":            firstString(lane, "id"),
+		"lane_format_id":     firstString(laneFormat, "id"),
+		"template_pool_json": stringListFromAny(laneFormat["template_pool_json"]),
+		"channelops": map[string]any{
+			"production_task_id":        task.ID,
+			"channel_profile_id":        task.ChannelProfileID,
+			"target_account_id":         task.TargetAccountID,
+			"title_seed":                task.TitleSeed,
+			"source":                    task.Source,
+			"rationale":                 jsonObject(task.RationaleJSON),
+			"score_breakdown":           jsonObject(task.ScoreBreakdownJSON),
+			"channel_config_version":    task.ChannelConfigVersionSnapshot,
+			"transition_history_length": len(task.TransitionHistoryJSON),
+		},
 	}
-	if task.TopicLaneID != nil {
-		request["topic_lane_id"] = *task.TopicLaneID
+	for key, value := range manualSeedConstraints {
+		constraints[key] = value
 	}
-	if task.LaneFormatID != nil {
-		request["lane_format_id"] = *task.LaneFormatID
+
+	return map[string]any{
+		"prompt":               task.Prompt,
+		"target_platforms":     []string{"youtube"},
+		"source_platforms":     sourcePlatforms,
+		"duration_sec":         positiveAnyInt(laneFormat["target_duration_sec"], 30),
+		"aspect_ratio":         stringOrFallback(channel["default_aspect_ratio"], "9:16"),
+		"source_policy":        autoflowSourcePolicy(task),
+		"publish_mode":         autoflowPublishMode(laneFormat, account),
+		"material_library_ids": stringSlice(task.MaterialLibraryIDsJSON),
+		"source_strategy":      normalizeSourceStrategy(firstNonBlank(manualSeed["source_strategy"], manualSeedConstraints["source_strategy"], riskPolicy["source_strategy"])),
+		"planning_mode":        normalizePlanningMode(firstNonBlank(manualSeed["planning_mode"], manualSeedConstraints["planning_mode"], riskPolicy["planning_mode"])),
+		"constraints":          constraints,
 	}
-	if task.ManualSeedID != nil {
-		request["manual_seed_id"] = *task.ManualSeedID
+}
+
+func effectiveSourcePlatforms(task ProductionTaskRow, laneFormat map[string]any) []string {
+	if len(task.SourcePlatformsJSON) > 0 {
+		return stringSlice(task.SourcePlatformsJSON)
 	}
-	if task.AutoFlowPlanID != nil {
-		request["autoflow_plan_id"] = *task.AutoFlowPlanID
+	return stringListFromAny(laneFormat["source_platforms_json"])
+}
+
+func autoflowSourcePolicy(task ProductionTaskRow) string {
+	if taskUsesExternalAssets(task) {
+		return "remix_with_review"
 	}
-	return request
+	return "owned_only"
+}
+
+func autoflowPublishMode(laneFormat map[string]any, account map[string]any) string {
+	privacy := safePrivacy(firstNonBlank(laneFormat["default_publish_visibility"], account["default_privacy"]))
+	if privacy == "unlisted" {
+		return "unlisted_upload"
+	}
+	return "private_upload"
+}
+
+func normalizeSourceStrategy(value any) string {
+	requested := strings.ToLower(strings.TrimSpace(fmt.Sprint(value)))
+	if requested == "" || requested == "<nil>" {
+		return "auto"
+	}
+	if requested == "external_search" {
+		requested = "external_research"
+	}
+	switch requested {
+	case "auto", "input_video", "material_library", "external_research", "generate_missing", "hybrid":
+		return requested
+	default:
+		return "auto"
+	}
+}
+
+func normalizePlanningMode(value any) string {
+	requested := strings.ToLower(strings.TrimSpace(fmt.Sprint(value)))
+	switch requested {
+	case "auto", "template", "storyboard", "ai_graph":
+		return requested
+	default:
+		return "auto"
+	}
+}
+
+func positiveAnyInt(value any, fallback int) int {
+	parsed := intOrDefault(value, fallback)
+	if parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func firstNonBlank(values ...any) any {
+	for _, value := range values {
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text != "" && text != "<nil>" {
+			return value
+		}
+	}
+	return ""
+}
+
+func stringListFromAny(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return stringSlice(typed)
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text := stringOrFallback(item, "")
+			if text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return []string{}
+	}
 }
 
 func TakedownDedupKey(publicationID string, eventType string, at time.Time) string {

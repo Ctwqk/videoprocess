@@ -319,7 +319,11 @@ func (f fakePDS) Decide(ctx context.Context, req PDSDecisionRequest) (PDSDecisio
 	return decision, nil
 }
 
-type fakeAutoFlow struct{}
+type fakeAutoFlow struct {
+	executeObservation AutoFlowExecuteObservation
+	getJobObservation  AutoFlowJobObservation
+	getJobErr          error
+}
 
 func (fakeAutoFlow) PlanTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowPlanObservation, error) {
 	return AutoFlowPlanObservation{
@@ -335,7 +339,10 @@ func (fakeAutoFlow) ApprovePlan(ctx context.Context, planID string, evidence map
 	return nil
 }
 
-func (fakeAutoFlow) ExecuteTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error) {
+func (f fakeAutoFlow) ExecuteTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error) {
+	if f.executeObservation.Status != "" || f.executeObservation.ErrorMessage != "" {
+		return f.executeObservation, nil
+	}
 	return AutoFlowExecuteObservation{
 		RunID:  "00000000-0000-0000-0000-000000000201",
 		JobID:  "00000000-0000-0000-0000-000000000301",
@@ -343,7 +350,13 @@ func (fakeAutoFlow) ExecuteTask(ctx context.Context, task ProductionTaskRow, req
 	}, nil
 }
 
-func (fakeAutoFlow) GetJob(ctx context.Context, jobID string) (AutoFlowJobObservation, error) {
+func (f fakeAutoFlow) GetJob(ctx context.Context, runID string, jobID string) (AutoFlowJobObservation, error) {
+	if f.getJobErr != nil {
+		return AutoFlowJobObservation{}, f.getJobErr
+	}
+	if f.getJobObservation.Status != "" {
+		return f.getJobObservation, nil
+	}
 	return AutoFlowJobObservation{
 		Status:         "succeeded",
 		RunPayload:     map[string]any{"rendered": true},

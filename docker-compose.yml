@@ -1,6 +1,6 @@
 services:
   postgres:
-    profiles: ["standalone", "channelops-go"]
+    profiles: ["standalone"]
     image: postgres:16-alpine
     container_name: vp_postgres
     environment:
@@ -185,11 +185,11 @@ services:
     container_name: vp_channelops_runner_go
     restart: unless-stopped
     environment:
-      DATABASE_URL: ${VP_DATABASE_URL_GO:-postgres://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@postgres:5432/videoprocess}
+      DATABASE_URL: ${VP_DATABASE_URL_GO:-postgres://vp:${VP_POSTGRES_PASSWORD:-vp_secret}@host.docker.internal:5435/videoprocess}
       YOUTUBE_MANAGER_URL: ${YOUTUBE_MANAGER_URL:-http://youtube-manager:8899}
       AUTOFLOW_BASE_URL: ${AUTOFLOW_BASE_URL:-http://api:8080}
       AUTOFLOW_TIMEOUT_SECONDS: ${AUTOFLOW_TIMEOUT_SECONDS:-30}
-      PDS_ENABLED: ${PDS_ENABLED:-true}
+      PDS_ENABLED: ${PDS_ENABLED:-false}
       PDS_BASE_URL: ${PDS_BASE_URL:-http://pds:8080}
       PDS_CLIENT_ID: ${PDS_CLIENT_ID:-videoprocess-channel-agent}
       PDS_TIMEOUT_SECONDS: ${PDS_TIMEOUT_SECONDS:-0.5}
@@ -199,12 +199,12 @@ services:
       CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL: ${CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL:-}
       CHANNEL_AGENT_ALERT_EMAIL_TO: ${CHANNEL_AGENT_ALERT_EMAIL_TO:-}
     depends_on:
-      postgres:
-        condition: service_healthy
       api:
         condition: service_started
       youtube-manager:
         condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - vp_internal
 
