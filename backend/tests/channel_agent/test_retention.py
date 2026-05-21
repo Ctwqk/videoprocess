@@ -60,10 +60,12 @@ async def test_cleanup_expired_deletes_old_terminal_rows_and_preserves_recent(re
     )
     old_feedback = FeedbackSnapshot(
         publication_id=uuid.UUID("bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"),
+        snapshot_stage="24h",
         collected_at=now - timedelta(days=400),
     )
     recent_feedback = FeedbackSnapshot(
         publication_id=uuid.UUID("bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"),
+        snapshot_stage="7d",
         collected_at=now - timedelta(days=10),
     )
     retention_session.add_all(

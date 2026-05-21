@@ -321,8 +321,8 @@ async def test_channel_health_reports_last_successful_measured_at(api_session):
         latest = older + timedelta(hours=2)
         api_session.add_all(
             [
-                FeedbackSnapshot(publication_id=publication.id, collected_at=older, views=10),
-                FeedbackSnapshot(publication_id=publication.id, collected_at=latest, views=20),
+                FeedbackSnapshot(publication_id=publication.id, snapshot_stage="1h", collected_at=older, views=10),
+                FeedbackSnapshot(publication_id=publication.id, snapshot_stage="24h", collected_at=latest, views=20),
             ]
         )
         await api_session.commit()
