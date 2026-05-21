@@ -129,6 +129,20 @@ func (s *Store) MarkGoJobRunning(ctx context.Context, jobID string) error {
 	return guardedExecResult(tag.RowsAffected(), err)
 }
 
+func (s *Store) MarkGoJobWaitingWindow(ctx context.Context, jobID string) error {
+	tag, err := s.Pool.Exec(ctx, `
+        UPDATE jobs
+        SET status = 'WAITING_WINDOW',
+            started_at = NULL,
+            completed_at = NULL,
+            error_message = NULL
+        WHERE id = $1
+          AND orchestrator_owner = 'go'
+          AND status NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'PARTIALLY_FAILED')
+    `, jobID)
+	return guardedExecResult(tag.RowsAffected(), err)
+}
+
 func (s *Store) MarkGoNodeQueued(ctx context.Context, nodeExecutionID string, inputArtifactIDs []string) (bool, error) {
 	inputUUIDs, err := uuidArray(inputArtifactIDs)
 	if err != nil {

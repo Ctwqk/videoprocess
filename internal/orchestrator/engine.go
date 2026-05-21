@@ -23,8 +23,10 @@ const (
 type EngineStore interface {
 	GetJobDetail(ctx context.Context, id string) (JobView, error)
 	CreateSourceArtifact(ctx context.Context, jobID string, nodeExecutionID string, assetID string) (string, error)
+	GetVideoScheduleState(ctx context.Context) (string, error)
 	MarkGoJobPlanning(ctx context.Context, jobID string, executionPlan map[string]any) error
 	MarkGoJobRunning(ctx context.Context, jobID string) error
+	MarkGoJobWaitingWindow(ctx context.Context, jobID string) error
 	MarkGoNodeQueued(ctx context.Context, nodeExecutionID string, inputArtifactIDs []string) (bool, error)
 	ReleaseGoNodeQueueClaim(ctx context.Context, nodeExecutionID string) error
 	MarkGoNodeSucceeded(ctx context.Context, jobID string, nodeExecutionID string, outputArtifactID string) error
@@ -87,6 +89,14 @@ func (e *Engine) StartJob(ctx context.Context, jobID string) (err error) {
 		startResult = "terminal"
 		return nil
 	}
+	waiting, err := e.shouldWaitForSchedule(ctx, job)
+	if err != nil {
+		return err
+	}
+	if waiting {
+		startResult = "waiting_window"
+		return nil
+	}
 
 	depMap := DependencyMap(job.PipelineSnapshot)
 	executionPlan := map[string]any{
@@ -119,6 +129,28 @@ func (e *Engine) StartJob(ctx context.Context, jobID string) (err error) {
 	}
 	startResult = "started"
 	return err
+}
+
+func (e *Engine) shouldWaitForSchedule(ctx context.Context, job JobView) (bool, error) {
+	state, err := e.Store.GetVideoScheduleState(ctx)
+	if err != nil {
+		return false, err
+	}
+	state = strings.ToUpper(strings.TrimSpace(state))
+	if state != "CLOSED" && state != "DRAINING" {
+		return false, nil
+	}
+	alreadyWaiting := job.Status == string(contracts.JobStatusWaitingWindow)
+	freshSubmission := job.Status == string(contracts.JobStatusPending)
+	if state == "DRAINING" && !alreadyWaiting && !freshSubmission {
+		return false, nil
+	}
+	if !alreadyWaiting {
+		if err := e.Store.MarkGoJobWaitingWindow(ctx, job.ID); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func (e *Engine) OnNodeCompleted(ctx context.Context, jobID string, nodeExecutionID string, outputArtifactID string) error {

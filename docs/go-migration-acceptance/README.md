@@ -1,8 +1,8 @@
 # Go Migration Acceptance Evidence
 
-Scope: non-Phase-6 completion for `/home/taiwei/Constructure-repos/videoprocess/docs/videoprocess-go-partial-migration-spec.md`.
+Scope: completed Go partial migration for `/home/taiwei/Constructure-repos/videoprocess/docs/videoprocess-go-partial-migration-spec.md`, including the narrow Phase 6 Go orchestrator slice.
 
-Python remains authoritative for orchestration, event listening, schema migration, and rollback.
+Python remains authoritative outside the Go-eligible first-wave ffmpeg slice, and remains the schema migration and rollback reference implementation.
 
 Evidence sections:
 
@@ -12,6 +12,7 @@ Evidence sections:
 4. Per-route Go API write gate.
 5. Docker health, readiness, and metrics.
 6. Staging jobs, Redis pending, artifacts, p95, failure, cancellation, and rollback.
+7. Phase 6 Go-owned job creation, scheduling, event listening, recovery, and final artifact marking.
 
 ## Per-Node Worker Cutover
 
@@ -31,7 +32,7 @@ XPENDING summary count: 0
 
 ## Job Write Ownership
 
-`POST /api/v1/jobs`, `POST /api/v1/jobs/batch`, and `POST /api/v1/jobs/{id}/rerun` remain Python-owned unless a Python start-job handoff endpoint is explicitly configured. This preserves the Phase 6 exclusion: Go does not schedule DAGs or listen to worker events in this milestone.
+`POST /api/v1/jobs`, `POST /api/v1/jobs/batch`, and `POST /api/v1/jobs/{id}/rerun` are Go-owned only for pipelines that the deterministic Go eligibility classifier accepts. Non-eligible pipelines are rejected without Python fallback so mixed ownership cannot leak into a single Phase 6 job.
 
 ## Docker And Strict Parity
 
@@ -113,42 +114,33 @@ Redis pending counts are zero.
 Non-eligible pipeline is rejected without fallback.
 ```
 
-Current live-run note:
+Observed result:
 
 ```text
-Task 2 eligibility and input overrides are intentionally user-owned and currently fail closed.
-Run the strict command and acceptance runner after Task 2 is implemented.
-
-Current strict result before Task 2:
-1 failed, 1 passed
-Eligible Go job creation failed closed with:
-job orchestration for this pipeline remains Python-owned: Go eligibility classifier is not implemented yet
-```
-
-Assistant-owned verification before Task 2:
-
-```text
-docker compose up -d --build api api-go ffmpeg-worker-go: pass
+docker compose up -d --build api-go ffmpeg-worker-go: pass
 Python API health: {"status":"ok"}
-Go API health: {"status":"ok"}
 Go API readyz: {"postgres":"ok","redis":"ok","status":"ready","storage":"ok"}
 
-go test ./...: pass
-go vet ./...: pass
+go test ./cmd/... ./internal/...: pass
+go vet ./cmd/... ./internal/...: pass
+gofmt -l $(find cmd internal -name '*.go' -type f): no output
 cd backend && python3 -m pytest: 338 passed, 8 warnings
 cd backend && python3 -m ruff check . || true: /usr/bin/python3: No module named ruff
 cd backend && python3 -m mypy app || true: /usr/bin/python3: No module named mypy
 
-Go API parity/read/registry/validator strict gate: 22 passed
-Go write strict gate: 5 passed
-Go trim worker strict smoke: 1 passed
-Go first-wave worker strict gate: 14 passed
+Phase 6 strict live pytest: 2 passed
+Phase 6 count=1 acceptance:
+  jobs_completed=1, missing_final_artifact=0, non_eligible_rejected=true,
+  wrong_owner=0, wrong_worker=0, go_event_pending=0, go_task_pending=0
+Phase 6 count=20 acceptance:
+  jobs_completed=20, missing_final_artifact=0, non_eligible_rejected=true,
+  wrong_owner=0, wrong_worker=0, go_event_pending=0, go_task_pending=0
+Schedule gate live check:
+  waiting_status=WAITING_WINDOW, terminal_status=SUCCEEDED, final_artifact_ok=true
+
 Redis XPENDING vp:tasks:ffmpeg_go ffmpeg_go-workers: 0
 Redis XPENDING vp:events:go orchestrator-go: 0
-
-python3 scripts/go_phase6_acceptance.py --help: pass
-python3 -m py_compile scripts/go_phase6_acceptance.py: pass
-python3 -m py_compile tests/go_migration/test_go_orchestrator_phase6.py: pass
+Schedule state after live check: OPEN, waiting_jobs=0, queued_nodes=0, running_nodes=0
 ```
 
 ## Baseline
@@ -183,7 +175,7 @@ Source spec:
 /home/taiwei/Constructure-repos/videoprocess/docs/videoprocess-go-partial-migration-spec.md
 ```
 
-Implemented non-Phase-6 scope:
+Implemented scope:
 
 ```text
 Phase 0 Baseline/Gates:
@@ -212,17 +204,15 @@ Phase 4 First-wave pure ffmpeg nodes:
 
 Phase 5 Selective Go API writes:
 - pipeline validation and deterministic pipeline/asset/artifact/schedule/job write surfaces are implemented with mixed-mode ownership guards.
-- Phase-6-owned writes such as job create/batch/rerun remain Python-owned or explicitly unsupported in Go unless a Python handoff is configured.
-```
+- job create/batch/rerun are Go-owned for eligible Phase 6 pipelines and reject non-eligible pipelines without fallback.
 
-Intentionally not implemented here:
-
-```text
-Phase 6:
-- Go event listener.
-- Go startup recovery.
-- Go job dispatch / DAG scheduling.
-- Go retry/downstream skip/final artifact ownership.
+Phase 6 Go orchestrator slice:
+- Go API creates owner-tagged Go jobs for fully eligible first-wave ffmpeg pipelines.
+- Go engine schedules source resolution, DAG dispatch, retries, downstream skip, and final artifact promotion.
+- Go workers emit to vp:events:go and the Go event listener finalizes jobs.
+- Startup recovery resumes Go-owned PENDING, WAITING_WINDOW, PLANNING, and RUNNING jobs.
+- Schedule CLOSED/DRAINING gates park fresh Go jobs in WAITING_WINDOW and release them when schedule opens.
+- Go local storage can download both relative and Python-style absolute local artifact paths.
 
 Spec non-goals retained:
 - AutoFlow graph planner Go rewrite.
@@ -237,28 +227,28 @@ Python code deletion status:
 Old Python API, orchestrator, worker handlers, schemas, and Alembic code are intentionally retained.
 The source spec explicitly keeps Python as the reference implementation and rollback path.
 Rollback for migrated nodes remains worker_type ffmpeg_go -> ffmpeg plus stopping vp-ffmpeg-worker-go; no DB restore is required.
+For eligible Phase 6 jobs, rollback is disabling Go job-write/orchestrator flags and routing new jobs back to Python.
 ```
 
 Fresh final verification:
 
 ```text
-go test ./...: pass
-go vet ./...: pass
-cd backend && python3 -m pytest: 336 passed, 8 warnings
+go test ./cmd/... ./internal/...: pass
+go vet ./cmd/... ./internal/...: pass
+gofmt -l $(find cmd internal -name '*.go' -type f): no output
+cd backend && python3 -m pytest: 338 passed, 8 warnings
 cd backend && python3 -m ruff check . || true: /usr/bin/python3: No module named ruff
 cd backend && python3 -m mypy app || true: /usr/bin/python3: No module named mypy
 
 Python API health: {"status":"ok"}
-Go API health: {"status":"ok"}
 Go API readyz: {"postgres":"ok","redis":"ok","status":"ready","storage":"ok"}
-Go worker process: vp-ffmpeg-worker-go
-Go worker WORKER_TYPE: ffmpeg_go
 
 API parity/read/registry/validator strict gate: 22 passed
 trim worker strict smoke: 1 passed
 first-wave worker cutover strict gate: 14 passed
 Go write strict gate: 5 passed
 Redis XPENDING vp:tasks:ffmpeg_go ffmpeg_go-workers: 0
+Redis XPENDING vp:events:go orchestrator-go: 0
 ```
 
 Fresh production-style acceptance:

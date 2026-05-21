@@ -92,6 +92,7 @@ func TestGoJobStoreMethodSignatures(t *testing.T) {
 	var _ func(context.Context, string) (JobDetailRow, error) = s.LoadGoJobForUpdate
 	var _ func(context.Context, string, map[string]any) error = s.MarkGoJobPlanning
 	var _ func(context.Context, string) error = s.MarkGoJobRunning
+	var _ func(context.Context, string) error = s.MarkGoJobWaitingWindow
 	var _ func(context.Context, string, []string) (bool, error) = s.MarkGoNodeQueued
 	var _ func(context.Context, string) error = s.ReleaseGoNodeQueueClaim
 	var _ func(context.Context, string, string, string) error = s.MarkGoNodeSucceeded

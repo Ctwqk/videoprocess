@@ -29,6 +29,9 @@ type LocalBackend struct {
 }
 
 func (b LocalBackend) fullPath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
 	return filepath.Join(b.Root, path)
 }
 

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -49,6 +50,32 @@ func TestLocalBackendRoundTrip(t *testing.T) {
 	// Delete of a missing path must not error, mirroring LocalStorageBackend.delete.
 	if err := backend.Delete(ctx, "missing"); err != nil {
 		t.Fatalf("Delete missing path: %v", err)
+	}
+}
+
+func TestLocalBackendAcceptsAbsoluteStoragePath(t *testing.T) {
+	dir := t.TempDir()
+	backend := LocalBackend{Root: filepath.Join(dir, "root")}
+	ctx := context.Background()
+	absolutePath := filepath.Join(dir, "absolute-artifact.bin")
+	if err := os.WriteFile(absolutePath, []byte("artifact"), 0o644); err != nil {
+		t.Fatalf("write absolute artifact: %v", err)
+	}
+
+	got, err := backend.Read(ctx, absolutePath)
+	if err != nil {
+		t.Fatalf("Read absolute path: %v", err)
+	}
+	if string(got) != "artifact" {
+		t.Fatalf("Read absolute path = %q; want artifact", string(got))
+	}
+
+	resolved, ok := backend.LocalPath(absolutePath)
+	if !ok {
+		t.Fatal("LocalPath should return ok=true for local backend")
+	}
+	if resolved != absolutePath {
+		t.Fatalf("LocalPath absolute = %q; want %q", resolved, absolutePath)
 	}
 }
 

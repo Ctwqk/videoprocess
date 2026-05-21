@@ -30,12 +30,24 @@ func (a *StoreAdapter) CreateSourceArtifact(ctx context.Context, jobID string, n
 	return a.Store.CreateSourceArtifact(ctx, jobID, nodeExecutionID, assetID)
 }
 
+func (a *StoreAdapter) GetVideoScheduleState(ctx context.Context) (string, error) {
+	status, err := a.Store.GetVideoScheduleStatus(ctx)
+	if err != nil {
+		return "", err
+	}
+	return status.State, nil
+}
+
 func (a *StoreAdapter) MarkGoJobPlanning(ctx context.Context, jobID string, executionPlan map[string]any) error {
 	return a.Store.MarkGoJobPlanning(ctx, jobID, executionPlan)
 }
 
 func (a *StoreAdapter) MarkGoJobRunning(ctx context.Context, jobID string) error {
 	return a.Store.MarkGoJobRunning(ctx, jobID)
+}
+
+func (a *StoreAdapter) MarkGoJobWaitingWindow(ctx context.Context, jobID string) error {
+	return a.Store.MarkGoJobWaitingWindow(ctx, jobID)
 }
 
 func (a *StoreAdapter) MarkGoNodeQueued(ctx context.Context, nodeExecutionID string, inputArtifactIDs []string) (bool, error) {

@@ -87,6 +87,51 @@ func TestDispatchFailureReleasesQueueClaim(t *testing.T) {
 	}
 }
 
+func TestStartJobParksFreshJobWhenScheduleClosed(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim")))
+	store.scheduleState = "CLOSED"
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	if err := engine.StartJob(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if store.job.Status != "WAITING_WINDOW" {
+		t.Fatalf("job status = %q; want WAITING_WINDOW", store.job.Status)
+	}
+	if store.waitingWindowCount != 1 {
+		t.Fatalf("waiting window count = %d; want 1", store.waitingWindowCount)
+	}
+	if store.planningPlan != nil {
+		t.Fatalf("planning plan = %#v; want nil", store.planningPlan)
+	}
+	if len(dispatcher.calls) != 0 {
+		t.Fatalf("dispatch calls = %d; want 0", len(dispatcher.calls))
+	}
+}
+
+func TestStartJobParksFreshJobWhenScheduleDraining(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim")))
+	store.scheduleState = "DRAINING"
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	if err := engine.StartJob(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if store.job.Status != "WAITING_WINDOW" {
+		t.Fatalf("job status = %q; want WAITING_WINDOW", store.job.Status)
+	}
+	if store.waitingWindowCount != 1 {
+		t.Fatalf("waiting window count = %d; want 1", store.waitingWindowCount)
+	}
+	if len(dispatcher.calls) != 0 {
+		t.Fatalf("dispatch calls = %d; want 0", len(dispatcher.calls))
+	}
+}
+
 func TestStartJobFailsSourceWithoutAssetID(t *testing.T) {
 	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNodeNoAsset("source-exec"), pendingNode("trim-exec", "trim"), pendingNode("encode-exec", "encode")))
 	dispatcher := &fakeDispatcher{}
@@ -412,19 +457,21 @@ func (d *fakeDispatcher) Dispatch(_ context.Context, workerType string, payload 
 }
 
 type fakeEngineStore struct {
-	job             JobView
-	planningPlan    map[string]any
-	skippedNodeIDs  []string
-	finalStatus     string
-	finalError      *string
-	finalNodeIDs    []string
-	queueClaim      bool
-	releaseCount    int
-	createSourceErr error
+	job                JobView
+	planningPlan       map[string]any
+	skippedNodeIDs     []string
+	finalStatus        string
+	finalError         *string
+	finalNodeIDs       []string
+	scheduleState      string
+	waitingWindowCount int
+	queueClaim         bool
+	releaseCount       int
+	createSourceErr    error
 }
 
 func newFakeEngineStore(job JobView) *fakeEngineStore {
-	return &fakeEngineStore{job: cloneJob(job), queueClaim: true}
+	return &fakeEngineStore{job: cloneJob(job), scheduleState: "OPEN", queueClaim: true}
 }
 
 func (s *fakeEngineStore) GetJobDetail(_ context.Context, _ string) (JobView, error) {
@@ -451,6 +498,16 @@ func (s *fakeEngineStore) MarkGoJobPlanning(_ context.Context, _ string, executi
 
 func (s *fakeEngineStore) MarkGoJobRunning(_ context.Context, _ string) error {
 	s.job.Status = "RUNNING"
+	return nil
+}
+
+func (s *fakeEngineStore) GetVideoScheduleState(_ context.Context) (string, error) {
+	return s.scheduleState, nil
+}
+
+func (s *fakeEngineStore) MarkGoJobWaitingWindow(_ context.Context, _ string) error {
+	s.job.Status = "WAITING_WINDOW"
+	s.waitingWindowCount++
 	return nil
 }
 
