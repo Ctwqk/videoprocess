@@ -10,12 +10,31 @@ func ChannelDueForTick(channel ChannelProfileRow, now time.Time) bool {
 	if !channel.Enabled || channel.HaltedAt != nil {
 		return false
 	}
-	interval := channel.TickIntervalMinutes
-	if interval <= 0 {
-		interval = 60
+	return true
+}
+
+func SchedulerBucket(now time.Time, intervalMinutes int) string {
+	current := now.UTC()
+	interval := normalizedTickIntervalMinutes(intervalMinutes)
+	minutesSinceMidnight := current.Hour()*60 + current.Minute()
+	bucketStart := (minutesSinceMidnight / interval) * interval
+	bucketHour := bucketStart / 60
+	bucketMinute := bucketStart % 60
+	bucketTime := time.Date(current.Year(), current.Month(), current.Day(), bucketHour, bucketMinute, 0, 0, time.UTC)
+	if interval >= 60 && bucketMinute == 0 {
+		return bucketTime.Format("2006-01-02-15")
 	}
-	minute := now.UTC().Minute()
-	return minute%interval == 0
+	return bucketTime.Format("2006-01-02-15-04")
+}
+
+func normalizedTickIntervalMinutes(value int) int {
+	if value <= 0 {
+		value = 60
+	}
+	if value < 15 {
+		return 15
+	}
+	return value
 }
 
 func TickIdempotencyKey(channelID string, bucket string) string {
@@ -33,11 +52,11 @@ func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 	}
 
 	enqueued := 0
-	bucket := UTCBucket(now)
 	for _, channel := range channels {
 		if !ChannelDueForTick(channel, now) {
 			continue
 		}
+		bucket := SchedulerBucket(now, channel.TickIntervalMinutes)
 		created, err := s.Store.InsertSchedulerRun(ctx, channel.ID, bucket)
 		if err != nil {
 			return enqueued, err
@@ -50,7 +69,7 @@ func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 		_, err = s.Store.Enqueue(ctx, EnqueueOptions{
 			Kind:             QueueAgentTick,
 			IdempotencyKey:   TickIdempotencyKey(channel.ID, bucket),
-			Payload:          map[string]any{"channel_id": channel.ID, "bucket": bucket},
+			Payload:          map[string]any{"channel_id": channel.ID, "bucket": bucket, "scheduler_bucket": bucket},
 			Priority:         100,
 			ChannelProfileID: &channelID,
 		})

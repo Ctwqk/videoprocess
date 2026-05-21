@@ -83,3 +83,37 @@ func TestQueueStatusConstantsForSQL(t *testing.T) {
 		t.Fatalf("QueueStatusDeadLettered = %q", QueueStatusDeadLettered)
 	}
 }
+
+func TestEnqueueUsesStoreDefaultMaxAttempts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	fixture.Store.DefaultMaxAttempts = 5
+	channelID := fixture.ChannelID
+	itemID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:             QueueAccountHealth,
+		IdempotencyKey:   "account_health:" + fixture.AccountID + ":default-attempts",
+		Payload:          map[string]any{"account_id": fixture.AccountID},
+		ChannelProfileID: &channelID,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	var maxAttempts int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT max_attempts
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+	`, itemID).Scan(&maxAttempts); err != nil {
+		t.Fatalf("select max_attempts: %v", err)
+	}
+	if maxAttempts != 5 {
+		t.Fatalf("max_attempts = %d, want 5", maxAttempts)
+	}
+}

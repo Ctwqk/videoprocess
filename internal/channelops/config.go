@@ -84,6 +84,14 @@ func (c Config) Validate() error {
 	return nil
 }
 
+func metricsPollDelay(c Config) time.Duration {
+	minutes := c.MetricsPollDelayMinutes
+	if minutes <= 0 {
+		minutes = 60
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
 func env(key string, fallback string) string {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {

@@ -7,10 +7,11 @@ import (
 )
 
 type Runner struct {
-	Config    Config
-	Store     *Store
-	Scheduler Scheduler
-	Handlers  HandlerService
+	Config           Config
+	Store            *Store
+	Scheduler        Scheduler
+	Handlers         HandlerService
+	lastSchedulerRun time.Time
 }
 
 func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
@@ -18,6 +19,7 @@ func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	st.DefaultMaxAttempts = cfg.MaxQueueAttempts
 	pds := PDSClient{
 		Enabled:     cfg.PDSEnabled,
 		DevAllowAll: cfg.DevAllowAllPDS,
@@ -68,8 +70,10 @@ func (r *Runner) runOnce(ctx context.Context) error {
 	if r.Store == nil {
 		return nil
 	}
-	if r.Scheduler.Store != nil {
-		_, _ = r.Scheduler.RunOnce(ctx, r.Store.Now())
+	now := r.Store.Now()
+	if r.Scheduler.Store != nil && ShouldRunScheduler(r.lastSchedulerRun, now, r.Config.SchedulerPollSeconds) {
+		_, _ = r.Scheduler.RunOnce(ctx, now)
+		r.lastSchedulerRun = now
 	}
 	if err := r.Handlers.ReadinessError(); err != nil {
 		return err
@@ -89,6 +93,16 @@ func (r *Runner) runOnce(ctx context.Context) error {
 		return r.Store.MarkQueueFailedOrRetry(ctx, *item, err.Error())
 	}
 	return r.Store.MarkQueueDone(ctx, item.ID)
+}
+
+func ShouldRunScheduler(lastRun time.Time, now time.Time, pollSeconds int) bool {
+	if lastRun.IsZero() {
+		return true
+	}
+	if pollSeconds <= 0 {
+		pollSeconds = 60
+	}
+	return !now.Before(lastRun.Add(time.Duration(pollSeconds) * time.Second))
 }
 
 func (r *Runner) Close() {

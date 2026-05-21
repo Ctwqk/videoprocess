@@ -47,6 +47,9 @@ func (s *Store) RunLiveSmoke(ctx context.Context, channelID string, handler Hand
 	}
 	claimableKinds := handler.ClaimableKinds()
 	for i := 0; i < liveSmokeQueueLimit; i++ {
+		if err := s.advanceLiveSmokeQueue(ctx, channelID, claimableKinds); err != nil {
+			return SmokeResult{}, err
+		}
 		item, err := s.claimNextLiveSmokeForChannelAndKinds(ctx, channelID, "channelops-live-smoke", claimableKinds)
 		if err != nil {
 			return SmokeResult{}, err
@@ -63,6 +66,22 @@ func (s *Store) RunLiveSmoke(ctx context.Context, channelID string, handler Hand
 		}
 	}
 	return s.SmokeResultForChannel(ctx, channelID)
+}
+
+func (s *Store) advanceLiveSmokeQueue(ctx context.Context, channelID string, kinds []string) error {
+	if len(kinds) == 0 {
+		return nil
+	}
+	_, err := s.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET run_after = NOW()
+		WHERE channel_profile_id = $1::uuid
+		  AND status = $2
+		  AND dead_letter_at IS NULL
+		  AND kind = ANY($3)
+		  AND run_after > NOW()
+	`, channelID, QueueStatusQueued, kinds)
+	return err
 }
 
 func (s *Store) claimNextLiveSmokeForChannelAndKinds(ctx context.Context, channelID string, workerID string, kinds []string) (*QueueItemRow, error) {

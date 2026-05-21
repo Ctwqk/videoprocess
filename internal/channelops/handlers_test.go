@@ -56,6 +56,68 @@ func TestExistingExecutionRequiresRunAndJob(t *testing.T) {
 	}
 }
 
+func TestHandleAgentTickReadsSchedulerBucketPayload(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	item := QueueItemRow{
+		Kind:        QueueAgentTick,
+		PayloadJSON: map[string]any{"channel_id": fixture.ChannelID, "scheduler_bucket": "2026-05-21-18-15"},
+	}
+
+	if err := handler.HandleAgentTick(ctx, item); err != nil {
+		t.Fatalf("HandleAgentTick: %v", err)
+	}
+
+	var tickID string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT tick_id
+		FROM agent_tick_audits
+		WHERE channel_profile_id = $1::uuid
+	`, fixture.ChannelID).Scan(&tickID); err != nil {
+		t.Fatalf("select tick audit: %v", err)
+	}
+	if tickID != "tick:"+fixture.ChannelID+":2026-05-21-18-15" {
+		t.Fatalf("tick_id = %q", tickID)
+	}
+}
+
+func TestHandleAgentTickPrefersBucketPayload(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	item := QueueItemRow{
+		Kind: QueueAgentTick,
+		PayloadJSON: map[string]any{
+			"channel_id":       fixture.ChannelID,
+			"bucket":           "2026-05-21-18-30",
+			"scheduler_bucket": "2026-05-21-18-15",
+		},
+	}
+
+	if err := handler.HandleAgentTick(ctx, item); err != nil {
+		t.Fatalf("HandleAgentTick: %v", err)
+	}
+
+	var tickID string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT tick_id
+		FROM agent_tick_audits
+		WHERE channel_profile_id = $1::uuid
+	`, fixture.ChannelID).Scan(&tickID); err != nil {
+		t.Fatalf("select tick audit: %v", err)
+	}
+	if tickID != "tick:"+fixture.ChannelID+":2026-05-21-18-30" {
+		t.Fatalf("tick_id = %q", tickID)
+	}
+}
+
 func TestAutoFlowRequestForTaskBuildsUploadRequestFromSnapshot(t *testing.T) {
 	task := representativeAutoFlowRequestTask()
 

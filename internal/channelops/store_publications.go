@@ -108,7 +108,7 @@ func (s *Store) CreateOrUpdatePublicationFromTask(ctx context.Context, task Prod
 	return err
 }
 
-func (s *Store) PromotePublication(ctx context.Context, publicationID string, targetVisibility string, scheduledAt time.Time, decision PDSDecision, parentQueueItemID string) error {
+func (s *Store) PromotePublication(ctx context.Context, publicationID string, targetVisibility string, scheduledAt time.Time, decision PDSDecision, parentQueueItemID string, metricsDelay time.Duration) error {
 	publication, err := s.GetPublication(ctx, publicationID)
 	if err != nil {
 		return err
@@ -129,6 +129,9 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 	now := s.Now().UTC()
 	if scheduledAt.IsZero() {
 		scheduledAt = now
+	}
+	if metricsDelay <= 0 {
+		metricsDelay = time.Hour
 	}
 	status := "scheduled"
 	var publicAt *time.Time
@@ -169,7 +172,7 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 		IdempotencyKey:    fmt.Sprintf("collect_metrics:%s:poll:0", publication.ID),
 		Payload:           map[string]any{"publication_id": publication.ID, "metrics_poll_count": 0},
 		Priority:          90,
-		RunAfter:          scheduledAt.UTC().Add(time.Hour),
+		RunAfter:          scheduledAt.UTC().Add(metricsDelay),
 		ChannelProfileID:  &channelProfileID,
 		ParentQueueItemID: parentID,
 	})
@@ -326,9 +329,12 @@ func (s *Store) MarkPublicationSevereDedup(ctx context.Context, publication Publ
 	return s.updateTaskState(ctx, publication.ProductionTaskID, TaskHeld, "platform_rejected", "YouTube reported "+eventType, "reconcile_publication", now.UTC())
 }
 
-func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication PublicationRow, item QueueItemRow, maxPolls int) error {
+func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication PublicationRow, item QueueItemRow, maxPolls int, metricsDelay time.Duration) error {
 	if maxPolls <= 0 {
 		maxPolls = 24
+	}
+	if metricsDelay <= 0 {
+		metricsDelay = time.Hour
 	}
 	now := s.Now().UTC()
 	pollCount := intOrDefault(item.PayloadJSON["metrics_poll_count"], 0)
@@ -356,7 +362,7 @@ func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication Publicatio
 		IdempotencyKey:    fmt.Sprintf("collect_metrics:%s:poll:%d", publication.ID, nextCount),
 		Payload:           map[string]any{"publication_id": publication.ID, "metrics_poll_count": nextCount},
 		Priority:          90,
-		RunAfter:          now.Add(time.Hour),
+		RunAfter:          now.Add(metricsDelay),
 		ChannelProfileID:  &channelProfileID,
 		ParentQueueItemID: parentID,
 	})

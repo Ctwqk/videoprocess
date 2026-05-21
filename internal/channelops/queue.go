@@ -116,7 +116,7 @@ type EnqueueOptions struct {
 
 func (s *Store) Enqueue(ctx context.Context, opts EnqueueOptions) (string, error) {
 	if opts.MaxAttempts <= 0 {
-		opts.MaxAttempts = 3
+		opts.MaxAttempts = s.defaultMaxAttempts()
 	}
 	if opts.RunAfter.IsZero() {
 		opts.RunAfter = s.Now().UTC()
@@ -138,6 +138,13 @@ func (s *Store) Enqueue(ctx context.Context, opts EnqueueOptions) (string, error
 	`, opts.Kind, opts.IdempotencyKey, payload, QueueStatusQueued, opts.Priority, opts.RunAfter,
 		opts.MaxAttempts, opts.ChannelProfileID, opts.ParentQueueItemID).Scan(&id)
 	return id, err
+}
+
+func (s *Store) defaultMaxAttempts() int {
+	if s != nil && s.DefaultMaxAttempts > 0 {
+		return s.DefaultMaxAttempts
+	}
+	return 3
 }
 
 func (s *Store) ClaimNext(ctx context.Context, workerID string) (*QueueItemRow, error) {

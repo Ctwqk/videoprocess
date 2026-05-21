@@ -8,8 +8,9 @@ import (
 )
 
 type Store struct {
-	Pool *pgxpool.Pool
-	Now  func() time.Time
+	Pool               *pgxpool.Pool
+	Now                func() time.Time
+	DefaultMaxAttempts int
 }
 
 func OpenStore(ctx context.Context, databaseURL string) (*Store, error) {
@@ -21,7 +22,7 @@ func OpenStore(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Store{Pool: pool, Now: func() time.Time { return time.Now().UTC() }}, nil
+	return &Store{Pool: pool, Now: func() time.Time { return time.Now().UTC() }, DefaultMaxAttempts: 3}, nil
 }
 
 func (s *Store) Close() {

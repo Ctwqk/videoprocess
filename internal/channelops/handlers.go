@@ -104,9 +104,9 @@ func (h HandlerService) Handle(ctx context.Context, item QueueItemRow) error {
 
 func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) error {
 	channelID, _ := item.PayloadJSON["channel_id"].(string)
-	bucket, _ := item.PayloadJSON["bucket"].(string)
+	bucket := firstString(item.PayloadJSON, "bucket", "scheduler_bucket")
 	if bucket == "" {
-		bucket = UTCBucket(h.Store.Now())
+		bucket = SchedulerBucket(h.Store.Now(), 60)
 	}
 	if channelID == "" {
 		return errors.New("agent_tick payload missing channel_id")
@@ -337,7 +337,7 @@ func (h HandlerService) HandlePromotePublication(ctx context.Context, item Queue
 	if err := h.YouTube.SchedulePublish(ctx, publication.PlatformContentID, scheduledAt, targetVisibility); err != nil {
 		return err
 	}
-	return h.Store.PromotePublication(ctx, publication.ID, targetVisibility, scheduledAt, decision, item.ID)
+	return h.Store.PromotePublication(ctx, publication.ID, targetVisibility, scheduledAt, decision, item.ID, metricsPollDelay(h.Config))
 }
 
 func (h HandlerService) HandleReconcilePublication(ctx context.Context, item QueueItemRow) error {
@@ -379,7 +379,7 @@ func (h HandlerService) HandleCollectMetrics(ctx context.Context, item QueueItem
 		}
 	}
 	if !HasRecognizedMetrics(metrics) {
-		return h.Store.RequeueOrHoldMetrics(ctx, publication, item, h.Config.MetricsPollMaxAttempts)
+		return h.Store.RequeueOrHoldMetrics(ctx, publication, item, h.Config.MetricsPollMaxAttempts, metricsPollDelay(h.Config))
 	}
 	score, fields := MetricsCompleteness(metrics)
 	return h.Store.UpsertFeedbackSnapshot(ctx, publication, metrics, score, fields)

@@ -66,3 +66,37 @@ func TestNewRunnerHandlerServiceConfiguresAutoFlowClient(t *testing.T) {
 		t.Fatalf("ReadinessError returned error: %v", err)
 	}
 }
+
+func TestShouldRunSchedulerHonorsPollSeconds(t *testing.T) {
+	lastRun := time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC)
+
+	if ShouldRunScheduler(lastRun, lastRun.Add(59*time.Second), 60) {
+		t.Fatal("scheduler should not run before configured poll interval")
+	}
+	if !ShouldRunScheduler(lastRun, lastRun.Add(60*time.Second), 60) {
+		t.Fatal("scheduler should run at configured poll interval")
+	}
+	if !ShouldRunScheduler(time.Time{}, lastRun, 60) {
+		t.Fatal("scheduler should run when it has not run yet")
+	}
+}
+
+func TestNewRunnerAppliesQueueMaxAttemptsConfig(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	cfg := LoadConfig()
+	cfg.LiveMode = false
+	cfg.MaxQueueAttempts = 6
+
+	runner, err := NewRunner(ctx, cfg)
+	if err != nil {
+		t.Skipf("ChannelOps runner test requires reachable DATABASE_URL %q: %v", cfg.DatabaseURL, err)
+	}
+	defer runner.Close()
+
+	if runner.Store.DefaultMaxAttempts != 6 {
+		t.Fatalf("DefaultMaxAttempts = %d, want 6", runner.Store.DefaultMaxAttempts)
+	}
+}

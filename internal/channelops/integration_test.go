@@ -47,6 +47,112 @@ func TestFakeLiveFlowReachesMeasured(t *testing.T) {
 	}
 }
 
+func TestRunLiveSmokeFreshSmokeCompletesWithDelayedQueue(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+
+	result, err := fixture.Store.RunLiveSmoke(ctx, fixture.ChannelID, handler)
+	if err != nil {
+		t.Fatalf("RunLiveSmoke: %v", err)
+	}
+	if err := result.Validate(); err != nil {
+		t.Fatalf("fresh live smoke did not validate: %v; result=%#v", err, result)
+	}
+}
+
+func TestPromotePublicationUsesConfiguredMetricsDelay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	handler.Config.MetricsPollDelayMinutes = 7
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	item := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, item); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, item.ID); err != nil {
+		t.Fatalf("MarkQueueDone: %v", err)
+	}
+
+	publicationID, _ := item.PayloadJSON["publication_id"].(string)
+	scheduledRaw, _ := item.PayloadJSON["scheduled_at"].(string)
+	scheduledAt, err := time.Parse(time.RFC3339, scheduledRaw)
+	if err != nil {
+		t.Fatalf("parse scheduled_at: %v", err)
+	}
+	var runAfter time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT run_after
+		FROM channel_ops_queue_items
+		WHERE kind = $1
+		  AND idempotency_key = $2
+	`, QueueCollectMetrics, fmt.Sprintf("collect_metrics:%s:poll:0", publicationID)).Scan(&runAfter); err != nil {
+		t.Fatalf("select collect_metrics run_after: %v", err)
+	}
+	if want := scheduledAt.UTC().Add(7 * time.Minute); !runAfter.Equal(want) {
+		t.Fatalf("collect_metrics run_after = %s, want %s", runAfter, want)
+	}
+}
+
+func TestCollectMetricsRequeueUsesConfiguredDelay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote.ID); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	handler.YouTube = fakeNoMetricsYouTube{fakeYouTube{}}
+	handler.Config.MetricsPollDelayMinutes = 11
+	handler.Config.MetricsPollMaxAttempts = 3
+
+	if err := handler.HandleCollectMetrics(ctx, collect); err != nil {
+		t.Fatalf("HandleCollectMetrics: %v", err)
+	}
+
+	publicationID, _ := collect.PayloadJSON["publication_id"].(string)
+	var runAfter time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT run_after
+		FROM channel_ops_queue_items
+		WHERE kind = $1
+		  AND idempotency_key = $2
+	`, QueueCollectMetrics, fmt.Sprintf("collect_metrics:%s:poll:1", publicationID)).Scan(&runAfter); err != nil {
+		t.Fatalf("select requeued collect_metrics run_after: %v", err)
+	}
+	if want := fixture.Store.Now().UTC().Add(11 * time.Minute); !runAfter.Equal(want) {
+		t.Fatalf("requeued collect_metrics run_after = %s, want %s", runAfter, want)
+	}
+}
+
 type ChannelOpsFixture struct {
 	T         *testing.T
 	Store     *Store
@@ -150,6 +256,18 @@ func (f *ChannelOpsFixture) InsertChannelWithLaneAccountSeed(ctx context.Context
 	}
 }
 
+func (f *ChannelOpsFixture) SetTickInterval(ctx context.Context, intervalMinutes int) {
+	f.T.Helper()
+	_, err := f.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles
+		SET tick_interval_minutes = $2
+		WHERE id = $1::uuid
+	`, f.ChannelID, intervalMinutes)
+	if err != nil {
+		f.T.Fatalf("set tick interval: %v", err)
+	}
+}
+
 func (f *ChannelOpsFixture) HandlerService(decision PDSDecision) HandlerService {
 	return HandlerService{
 		Store:    f.Store,
@@ -180,6 +298,32 @@ func (f *ChannelOpsFixture) ProcessAllQueueItems(ctx context.Context, handler Ha
 		}
 	}
 	f.T.Fatal("queue did not drain within 20 items")
+}
+
+func (f *ChannelOpsFixture) ProcessUntilQueueKind(ctx context.Context, handler HandlerService, kind string) QueueItemRow {
+	f.T.Helper()
+	for i := 0; i < 20; i++ {
+		f.makeQueuedItemsReady(ctx)
+		item, err := f.Store.ClaimNextForChannelAndKinds(ctx, "channelops-integration-test", f.ChannelID, handler.ClaimableKinds())
+		if err != nil {
+			f.T.Fatalf("ClaimNextForChannelAndKinds: %v", err)
+		}
+		if item == nil {
+			f.T.Fatalf("queue drained before %s", kind)
+		}
+		if item.Kind == kind {
+			return *item
+		}
+		if err := handler.Handle(ctx, *item); err != nil {
+			_ = f.Store.MarkQueueFailedOrRetry(ctx, *item, err.Error())
+			f.T.Fatalf("Handle %s: %v", item.Kind, err)
+		}
+		if err := f.Store.MarkQueueDone(ctx, item.ID); err != nil {
+			f.T.Fatalf("MarkQueueDone %s: %v", item.ID, err)
+		}
+	}
+	f.T.Fatalf("queue did not reach %s within 20 items", kind)
+	return QueueItemRow{}
 }
 
 func (f *ChannelOpsFixture) RequireSingleTask(ctx context.Context) ProductionTaskRow {
@@ -392,4 +536,12 @@ func (fakeYouTube) PublicationStatus(ctx context.Context, videoID string) (YouTu
 
 func (fakeYouTube) FetchMetrics(ctx context.Context, videoID string) (map[string]any, error) {
 	return map[string]any{"views": 10, "likes": 2, "impressions": 100}, nil
+}
+
+type fakeNoMetricsYouTube struct {
+	fakeYouTube
+}
+
+func (fakeNoMetricsYouTube) FetchMetrics(ctx context.Context, videoID string) (map[string]any, error) {
+	return map[string]any{}, nil
 }
