@@ -1,0 +1,37 @@
+{
+  "aspect_ratio": "16:9",
+  "constraints": {
+    "channelops": {
+      "channel_config_version": 0,
+      "channel_profile_id": "channel-1",
+      "production_task_id": "task-1",
+      "rationale": {},
+      "score_breakdown": {},
+      "source": "manual_seed",
+      "target_account_id": "account-1",
+      "title_seed": "Title",
+      "transition_history_length": 0
+    },
+    "lane_format_id": "format-1",
+    "lane_id": "lane-1",
+    "template_pool_json": [
+      "template-a"
+    ],
+    "tone": "dry"
+  },
+  "duration_sec": 45,
+  "material_library_ids": [
+    "library-1"
+  ],
+  "planning_mode": "template",
+  "prompt": "Make a short",
+  "publish_mode": "unlisted_upload",
+  "source_platforms": [
+    "bilibili"
+  ],
+  "source_policy": "remix_with_review",
+  "source_strategy": "external_research",
+  "target_platforms": [
+    "youtube"
+  ]
+}

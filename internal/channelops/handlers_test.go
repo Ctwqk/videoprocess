@@ -2,7 +2,10 @@ package channelops
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -54,38 +57,7 @@ func TestExistingExecutionRequiresRunAndJob(t *testing.T) {
 }
 
 func TestAutoFlowRequestForTaskBuildsUploadRequestFromSnapshot(t *testing.T) {
-	task := ProductionTaskRow{
-		ID:                     "task-1",
-		ChannelProfileID:       "channel-1",
-		TargetAccountID:        "account-1",
-		Source:                 SourceManualSeed,
-		TitleSeed:              "Title",
-		Prompt:                 "Make a short",
-		SourcePlatformsJSON:    []string{"bilibili"},
-		MaterialLibraryIDsJSON: []string{"library-1"},
-		ChannelConfigSnapshotJSON: map[string]any{
-			"channel": map[string]any{
-				"default_aspect_ratio": "16:9",
-				"risk_policy_json": map[string]any{
-					"source_strategy": "external_search",
-				},
-			},
-			"lane": map[string]any{"id": "lane-1"},
-			"lane_format": map[string]any{
-				"id":                         "format-1",
-				"default_publish_visibility": "unlisted",
-				"target_duration_sec":        45,
-				"template_pool_json":         []any{"template-a"},
-				"source_platforms_json":      []any{"youtube"},
-			},
-			"manual_seed": map[string]any{
-				"planning_mode": "template",
-				"constraints_json": map[string]any{
-					"tone": "dry",
-				},
-			},
-		},
-	}
+	task := representativeAutoFlowRequestTask()
 
 	request := AutoFlowRequestForTask(task)
 
@@ -122,6 +94,25 @@ func TestAutoFlowRequestForTaskBuildsUploadRequestFromSnapshot(t *testing.T) {
 	}
 	if got := stringSliceFromAny(constraints["template_pool_json"]); len(got) != 1 || got[0] != "template-a" {
 		t.Fatalf("template_pool_json = %#v", constraints["template_pool_json"])
+	}
+}
+
+func TestAutoFlowRequestForTaskMatchesSharedFixture(t *testing.T) {
+	raw, err := os.ReadFile("testdata/autoflow_request.json")
+	if err != nil {
+		t.Fatalf("read shared fixture: %v", err)
+	}
+	var fixture map[string]any
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("decode shared fixture: %v", err)
+	}
+
+	got := normalizeJSONMap(t, AutoFlowRequestForTask(representativeAutoFlowRequestTask()))
+
+	if !reflect.DeepEqual(got, fixture) {
+		gotJSON, _ := json.MarshalIndent(got, "", "  ")
+		fixtureJSON, _ := json.MarshalIndent(fixture, "", "  ")
+		t.Fatalf("AutoFlowRequestForTask drifted from shared fixture\ngot:\n%s\nfixture:\n%s", gotJSON, fixtureJSON)
 	}
 }
 
@@ -331,6 +322,54 @@ func stringSliceFromAny(value any) []string {
 	default:
 		return nil
 	}
+}
+
+func representativeAutoFlowRequestTask() ProductionTaskRow {
+	return ProductionTaskRow{
+		ID:                     "task-1",
+		ChannelProfileID:       "channel-1",
+		TargetAccountID:        "account-1",
+		Source:                 SourceManualSeed,
+		TitleSeed:              "Title",
+		Prompt:                 "Make a short",
+		SourcePlatformsJSON:    []string{"bilibili"},
+		MaterialLibraryIDsJSON: []string{"library-1"},
+		ChannelConfigSnapshotJSON: map[string]any{
+			"channel": map[string]any{
+				"default_aspect_ratio": "16:9",
+				"risk_policy_json": map[string]any{
+					"source_strategy": "external_search",
+				},
+			},
+			"lane": map[string]any{"id": "lane-1"},
+			"lane_format": map[string]any{
+				"id":                         "format-1",
+				"default_publish_visibility": "unlisted",
+				"target_duration_sec":        45,
+				"template_pool_json":         []any{"template-a"},
+				"source_platforms_json":      []any{"youtube"},
+			},
+			"manual_seed": map[string]any{
+				"planning_mode": "template",
+				"constraints_json": map[string]any{
+					"tone": "dry",
+				},
+			},
+		},
+	}
+}
+
+func normalizeJSONMap(t *testing.T, value map[string]any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal JSON: %v", err)
+	}
+	var normalized map[string]any
+	if err := json.Unmarshal(raw, &normalized); err != nil {
+		t.Fatalf("unmarshal normalized JSON: %v", err)
+	}
+	return normalized
 }
 
 func TestPromotionVisibilityDoesNotAllowPublic(t *testing.T) {
