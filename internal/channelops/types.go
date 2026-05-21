@@ -35,6 +35,19 @@ const (
 	SourceManualSeed = "manual_seed"
 	SourceLaneSeed   = "lane_seed"
 	SourceTrendYT    = "trend_youtube"
+
+	FailureAuth          = "auth"
+	FailureQuota         = "quota"
+	FailureUpload        = "upload"
+	FailureRender        = "render"
+	FailurePlanning      = "planning"
+	FailureValidation    = "validation"
+	FailurePDS           = "pds"
+	FailureYouTubeStatus = "youtube_status"
+	FailureMetrics       = "metrics"
+	FailureDiscovery     = "discovery"
+	FailureLearning      = "learning"
+	FailureOther         = "other"
 )
 
 type ChannelProfileRow struct {
@@ -115,6 +128,7 @@ type ProductionTaskRow struct {
 	LaneFormatID                 *string
 	TargetAccountID              string
 	ManualSeedID                 *string
+	DiscoverySignalID            *string
 	Source                       string
 	TitleSeed                    string
 	Prompt                       string
@@ -130,6 +144,7 @@ type ProductionTaskRow struct {
 	State                        string
 	BlockedByGuard               *string
 	FailureReason                *string
+	FailureCategory              *string
 	TransitionHistoryJSON        []map[string]any
 	ChannelConfigVersionSnapshot int
 	ChannelConfigSnapshotJSON    map[string]any

@@ -59,10 +59,10 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 	var rationaleJSON, scoreJSON, sourcePlatformsJSON, materialIDsJSON, transitionJSON, snapshotJSON []byte
 	err := s.Pool.QueryRow(ctx, `
 		SELECT id, channel_profile_id, topic_lane_id, lane_format_id, target_account_id,
-		       manual_seed_id, source, title_seed, prompt, rationale_json,
+		       manual_seed_id, discovery_signal_id, source, title_seed, prompt, rationale_json,
 		       score_breakdown_json, source_platforms_json, material_library_ids_json,
 		       uses_external_assets, approval_mode, autoflow_plan_id, autoflow_run_id, job_id, state,
-		       blocked_by_guard, failure_reason, transition_history_json,
+		       blocked_by_guard, failure_reason, failure_category, transition_history_json,
 		       channel_config_version_snapshot, channel_config_snapshot_json,
 		       state_updated_at
 		FROM production_tasks
@@ -74,6 +74,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		&row.LaneFormatID,
 		&row.TargetAccountID,
 		&row.ManualSeedID,
+		&row.DiscoverySignalID,
 		&row.Source,
 		&row.TitleSeed,
 		&row.Prompt,
@@ -89,6 +90,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		&row.State,
 		&row.BlockedByGuard,
 		&row.FailureReason,
+		&row.FailureCategory,
 		&transitionJSON,
 		&row.ChannelConfigVersionSnapshot,
 		&snapshotJSON,
@@ -157,6 +159,7 @@ func (s *Store) MarkTaskPlanningAndEnqueueExecute(ctx context.Context, taskID st
 		    state = $3::text,
 		    blocked_by_guard = NULL,
 		    failure_reason = NULL,
+		    failure_category = NULL,
 		    rationale_json = (COALESCE(rationale_json, '{}'::json)::jsonb || $6::jsonb)::json,
 		    state_updated_at = $4::timestamptz,
 		    updated_at = $4::timestamp,
@@ -211,6 +214,7 @@ func (s *Store) MarkTaskProducingAndEnqueueObserve(ctx context.Context, taskID s
 		    state = $4::text,
 		    blocked_by_guard = NULL,
 		    failure_reason = NULL,
+		    failure_category = NULL,
 		    state_updated_at = $5::timestamptz,
 		    updated_at = $5::timestamp,
 		    transition_history_json = (
@@ -293,6 +297,7 @@ func (s *Store) MarkTaskReadyToPublish(ctx context.Context, task ProductionTaskR
 		SET state = $2::text,
 		    blocked_by_guard = NULL,
 		    failure_reason = NULL,
+		    failure_category = NULL,
 		    rationale_json = (COALESCE(rationale_json, '{}'::json)::jsonb || $3::jsonb)::json,
 		    state_updated_at = $4::timestamptz,
 		    updated_at = $4::timestamp,
@@ -332,11 +337,13 @@ func (s *Store) FailTask(ctx context.Context, taskID string, reason string, tran
 	if reason == "" {
 		reason = "AutoFlow job failed"
 	}
+	category := FailureCategoryFor(transitionReason, reason)
 	now := s.Now().UTC()
 	_, err := s.Pool.Exec(ctx, `
 		UPDATE production_tasks
 		SET state = $2::text,
 		    failure_reason = $3::text,
+		    failure_category = $6::text,
 		    state_updated_at = $4::timestamptz,
 		    updated_at = $4::timestamp,
 		    transition_history_json = (
@@ -349,7 +356,7 @@ func (s *Store) FailTask(ctx context.Context, taskID string, reason string, tran
 		        ))
 		    )::json
 		WHERE id = $1::uuid
-	`, taskID, TaskFailed, reason, now, transitionReason)
+	`, taskID, TaskFailed, reason, now, transitionReason, category)
 	return err
 }
 
@@ -369,6 +376,7 @@ func (s *Store) holdTask(ctx context.Context, taskID string, planID string, guar
 			return err
 		}
 	}
+	category := holdFailureCategoryFor(guard, reason, transitionReason, decision)
 	now := s.Now().UTC()
 	_, err = s.Pool.Exec(ctx, `
 		UPDATE production_tasks
@@ -376,6 +384,7 @@ func (s *Store) holdTask(ctx context.Context, taskID string, planID string, guar
 		    state = $3::text,
 		    blocked_by_guard = $4::text,
 		    failure_reason = $5::text,
+		    failure_category = $10::text,
 		    agent_approval_evidence_json = CASE WHEN $6 THEN $7::json ELSE agent_approval_evidence_json END,
 		    state_updated_at = $8::timestamptz,
 		    updated_at = $8::timestamp,
@@ -389,7 +398,7 @@ func (s *Store) holdTask(ctx context.Context, taskID string, planID string, guar
 		        ))
 		    )::json
 		WHERE id = $1::uuid
-	`, taskID, planIDValue, TaskHeld, guard, reason, hasEvidence, evidenceJSON, now, transitionReason)
+	`, taskID, planIDValue, TaskHeld, guard, reason, hasEvidence, evidenceJSON, now, transitionReason, category)
 	return err
 }
 
