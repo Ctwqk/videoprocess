@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -15,6 +17,11 @@ from app.models.channel_agent import (
     PublicationRecord,
     PublishingAccount,
     TopicLane,
+)
+
+
+MIGRATION_021 = (
+    Path(__file__).resolve().parents[2] / "alembic/versions/021_channelops_discovery_signals.py"
 )
 
 
@@ -41,3 +48,19 @@ async def test_bcd_models_create_in_sqlite():
         DiscoverySignal.__table__,
         LearningState.__table__,
     )
+
+
+def test_trend_seed_migration_preserves_ingester_metadata():
+    source = MIGRATION_021.read_text()
+
+    assert "constraints_json->>'source_video_id'" in source
+    assert "constraints_json->>'expires_at'" in source
+    assert "'view_count'" in source
+    assert "'raw_constraints'" in source
+
+
+def test_trend_seed_migration_downgrade_reactivates_legacy_seed_ids():
+    source = MIGRATION_021.read_text()
+
+    assert "raw_json->>'legacy_manual_seed_id'" in source
+    assert "SET status = 'active'" in source

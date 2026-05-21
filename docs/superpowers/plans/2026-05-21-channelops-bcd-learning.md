@@ -41,7 +41,6 @@
 - Add: `backend/alembic/versions/022_channelops_feedback_learning.py`
 - Add: `backend/tests/channel_agent/test_models_bcd.py`
 - Modify: `backend/tests/channel_agent/test_api.py`
-- Modify: `backend/tests/channel_agent/test_trend_ingester.py`
 
 - [ ] **Step 1: Write failing model table test**
 

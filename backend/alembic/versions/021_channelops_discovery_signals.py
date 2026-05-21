@@ -103,6 +103,7 @@ def upgrade() -> None:
                 ),
                 LEFT(
                     COALESCE(
+                        NULLIF(constraints_json->>'source_video_id', ''),
                         NULLIF(constraints_json->>'source_external_id', ''),
                         NULLIF(constraints_json->>'external_id', ''),
                         id::text
@@ -117,7 +118,12 @@ def upgrade() -> None:
                     ELSE '[]'::json
                 END,
                 COALESCE(updated_at, created_at, now()),
-                NULL,
+                CASE
+                    WHEN NULLIF(constraints_json->>'expires_at', '') ~
+                        '^[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}'
+                    THEN (constraints_json->>'expires_at')::timestamptz
+                    ELSE NULL
+                END,
                 CASE
                     WHEN NULLIF(constraints_json->>'trend_score', '') ~ '^-?[0-9]+([.][0-9]+)?$'
                     THEN (constraints_json->>'trend_score')::float
@@ -130,6 +136,13 @@ def upgrade() -> None:
                 END,
                 json_build_object(
                     'legacy_manual_seed_id', id::text,
+                    'source_video_id', constraints_json->>'source_video_id',
+                    'source_url', COALESCE(
+                        NULLIF(constraints_json->>'source_url', ''),
+                        NULLIF(constraints_json->>'url', '')
+                    ),
+                    'view_count', constraints_json->'view_count',
+                    'raw_constraints', constraints_json,
                     'constraints', constraints_json,
                     'source_platforms', source_platforms_json,
                     'material_library_ids', material_library_ids_json
@@ -170,6 +183,19 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(
+        sa.text(
+            """
+            UPDATE manual_seeds
+            SET status = 'active',
+                updated_at = now()
+            FROM discovery_signals
+            WHERE manual_seeds.id::text = discovery_signals.raw_json->>'legacy_manual_seed_id'
+              AND manual_seeds.source_policy = 'trend_youtube'
+              AND manual_seeds.status = 'exhausted'
+            """
+        )
+    )
     op.drop_column("production_tasks", "discovery_signal_id")
     op.drop_index("ix_discovery_signals_channel_status_expires", table_name="discovery_signals")
     op.drop_index("ix_discovery_signals_channel_lane_observed", table_name="discovery_signals")
