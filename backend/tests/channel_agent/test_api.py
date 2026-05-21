@@ -337,6 +337,7 @@ async def test_audit_learning_and_failure_endpoints_do_not_leak_cross_channel_ro
             created_at=now - timedelta(minutes=3),
         )
         newer_decision = DecisionAuditEntry(
+            id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
             tick_audit_id=first_tick.id,
             channel_profile_id=uuid.UUID(first["id"]),
             candidate_id="a:newer",
@@ -365,6 +366,7 @@ async def test_audit_learning_and_failure_endpoints_do_not_leak_cross_channel_ro
             created_at=now - timedelta(minutes=3),
         )
         newer_publication = PublicationRecord(
+            id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
             production_task_id=first_task.id,
             account_id=uuid.UUID(first_account["id"]),
             platform_content_id="yt-a-new",
@@ -413,21 +415,55 @@ async def test_audit_learning_and_failure_endpoints_do_not_leak_cross_channel_ro
             ]
         )
         await api_session.flush()
+        tie_decision_id = uuid.UUID("ffffffff-ffff-ffff-ffff-ffffffffffff")
+        tie_publication_id = uuid.UUID("ffffffff-ffff-ffff-ffff-fffffffffffe")
+        tie_material_id = uuid.UUID("ffffffff-ffff-ffff-ffff-fffffffffffd")
         api_session.add_all(
             [
-                MaterialUsageLedger(
-                    material_id=f"a-material-{index:03d}",
+                DecisionAuditEntry(
+                    id=tie_decision_id,
+                    tick_audit_id=first_tick.id,
                     channel_profile_id=uuid.UUID(first["id"]),
-                    publication_id=newer_publication.id,
-                    used_at=now + timedelta(seconds=index),
-                )
-                for index in range(201)
+                    candidate_id="a:tie",
+                    candidate_source="manual_seed",
+                    target_account_id=uuid.UUID(first_account["id"]),
+                    selected=True,
+                    created_task_id=first_task.id,
+                    created_at=newer_decision.created_at,
+                ),
+                PublicationRecord(
+                    id=tie_publication_id,
+                    production_task_id=first_task.id,
+                    account_id=uuid.UUID(first_account["id"]),
+                    platform_content_id="yt-a-tie",
+                    title="tie",
+                    compliance_disposition="assumed_fair_use",
+                    created_at=newer_publication.created_at,
+                ),
+                MaterialUsageLedger(
+                    id=tie_material_id,
+                    material_id="a-material-tie",
+                    channel_profile_id=uuid.UUID(first["id"]),
+                    publication_id=tie_publication_id,
+                    used_at=now + timedelta(seconds=200),
+                ),
+            ]
+        )
+        api_session.add_all(
+            [
+                    MaterialUsageLedger(
+                        material_id=f"a-material-{index:03d}",
+                        channel_profile_id=uuid.UUID(first["id"]),
+                        publication_id=tie_publication_id,
+                        used_at=now + timedelta(seconds=index),
+                    )
+                    for index in range(201)
             ]
             + [
                 MaterialUsageLedger(
                     material_id="b-leak",
                     channel_profile_id=uuid.UUID(second["id"]),
-                    publication_id=newer_publication.id,
+                    publication_id=tie_publication_id,
                     used_at=now + timedelta(seconds=999),
                 ),
                 MaterialUsageLedger(
@@ -445,14 +481,15 @@ async def test_audit_learning_and_failure_endpoints_do_not_leak_cross_channel_ro
         learning = (await client.get(f"/api/v1/channel-agent/channels/{first['id']}/learning")).json()
         audit = (await client.get(f"/api/v1/channel-agent/tasks/{first_task.id}/audit")).json()
 
-        assert {row["candidate_id"] for row in decisions} == {"a:older", "a:newer"}
+        assert {row["candidate_id"] for row in decisions} == {"a:older", "a:newer", "a:tie"}
         assert failures["categories"] == {"quota": 1}
         assert [row["dimension_key"] for row in learning["states"]] == ["manual_seed:first"]
-        assert audit["decision"]["candidate_id"] == "a:newer"
-        assert audit["publication"]["platform_content_id"] == "yt-a-new"
+        assert audit["decision"]["id"] == str(tie_decision_id)
+        assert audit["publication"]["id"] == str(tie_publication_id)
         material_ids = [row["material_id"] for row in audit["material_usage"]]
         assert len(material_ids) == 200
-        assert material_ids[0] == "a-material-200"
+        assert material_ids[0] == "a-material-tie"
+        assert audit["material_usage"][0]["id"] == str(tie_material_id)
         assert "a-material-000" not in material_ids
         assert "b-leak" not in material_ids
         assert "shared-material" not in material_ids
