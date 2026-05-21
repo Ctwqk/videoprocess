@@ -224,9 +224,17 @@ Spec non-goals retained:
 Python code deletion status:
 
 ```text
-Old Python API, orchestrator, worker handlers, schemas, and Alembic code are intentionally retained.
-The source spec explicitly keeps Python as the reference implementation and rollback path.
-Rollback for migrated nodes remains worker_type ffmpeg_go -> ffmpeg plus stopping vp-ffmpeg-worker-go; no DB restore is required.
+Python worker handlers for Go cutover first-wave ffmpeg nodes have been removed:
+trim, transcode, export, vertical_crop, watermark, title_overlay, bgm,
+replace_audio, concat_horizontal, concat_vertical, concat_many,
+concat_timeline, concat_vertical_timeline, montage_assembler.
+
+The node registry definitions are intentionally retained so frontend, AutoFlow,
+validation, and Python orchestration can still route those node types to worker_type=ffmpeg_go.
+
+Old Python API, Python orchestrator, non-Go worker handlers, schemas, and Alembic code are intentionally retained.
+The source spec keeps Python as the reference implementation outside the Go-eligible slice and as the rollback path.
+Rollback for migrated nodes requires restoring the removed Python handlers if direct Python ffmpeg fallback is needed again.
 For eligible Phase 6 jobs, rollback is disabling Go job-write/orchestrator flags and routing new jobs back to Python.
 ```
 
@@ -236,7 +244,7 @@ Fresh final verification:
 go test ./cmd/... ./internal/...: pass
 go vet ./cmd/... ./internal/...: pass
 gofmt -l $(find cmd internal -name '*.go' -type f): no output
-cd backend && python3 -m pytest: 338 passed, 8 warnings
+cd backend && python3 -m pytest: 315 passed, 8 warnings
 cd backend && python3 -m ruff check . || true: /usr/bin/python3: No module named ruff
 cd backend && python3 -m mypy app || true: /usr/bin/python3: No module named mypy
 
@@ -247,6 +255,18 @@ API parity/read/registry/validator strict gate: 22 passed
 trim worker strict smoke: 1 passed
 first-wave worker cutover strict gate: 14 passed
 Go write strict gate: 5 passed
+Phase 6 strict live pytest: 2 passed
+Phase 6 count=20 acceptance:
+  jobs_completed=20, missing_final_artifact=0, non_eligible_rejected=true,
+  wrong_owner=0, wrong_worker=0, go_event_pending=0, go_task_pending=0
+Single-job max-coverage acceptance:
+  command: python3 scripts/go_max_coverage_acceptance.py --api-go-url http://127.0.0.1:18081 --python-api-url http://127.0.0.1:18080 --redis-url redis://127.0.0.1:6380/0 --timeout-seconds 600
+  pipeline_id=22412042-4129-4ea5-ac04-bdc1884282bf
+  job_id=a70c7888-10da-49f5-8ea5-4b96cd21f8ba
+  status=SUCCEEDED, orchestrator_owner=go, worker_node_count=16
+  covered_types=14, missing_types=0, failed_nodes=0, wrong_workers=0
+  final_artifact_id=d4fba92c-99e3-4e28-9f18-b59cd682154f, final_artifact_ok=true
+  go_event_pending=0, go_task_pending=0
 Redis XPENDING vp:tasks:ffmpeg_go ffmpeg_go-workers: 0
 Redis XPENDING vp:events:go orchestrator-go: 0
 ```

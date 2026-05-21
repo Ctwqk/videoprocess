@@ -126,10 +126,10 @@ func VerticalTimelineSegmentArgs(activeVideo string, staticImage string, outputP
 	}
 
 	filterComplex := topSource + scaleFilter(strconv.Itoa(paneWidth), strconv.Itoa(paneHeight), "decrease") +
-		",pad=" + strconv.Itoa(paneWidth) + ":" + strconv.Itoa(paneHeight) + ":(ow-iw)/2:(oh-ih)/2:color=" + backgroundColor + ",fps=30[top];" +
+		",pad=" + strconv.Itoa(paneWidth) + ":" + strconv.Itoa(paneHeight) + ":(ow-iw)/2:(oh-ih)/2:color=" + backgroundColor + ",setsar=1,fps=30[top];" +
 		bottomSource + scaleFilter(strconv.Itoa(paneWidth), strconv.Itoa(paneHeight), "decrease") +
-		",pad=" + strconv.Itoa(paneWidth) + ":" + strconv.Itoa(paneHeight) + ":(ow-iw)/2:(oh-ih)/2:color=" + backgroundColor + ",fps=30[bottom];" +
-		"[top][bottom]vstack=inputs=2[v]"
+		",pad=" + strconv.Itoa(paneWidth) + ":" + strconv.Itoa(paneHeight) + ":(ow-iw)/2:(oh-ih)/2:color=" + backgroundColor + ",setsar=1,fps=30[bottom];" +
+		"[top][bottom]vstack=inputs=2,setsar=1[v]"
 
 	args := []string{
 		"-i", activeVideo,

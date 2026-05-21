@@ -9,13 +9,9 @@ from app.node_registry.builtin import smart_trim as smart_trim_node
 from app.node_registry.builtin import speech_to_subtitle as speech_to_subtitle_node
 from app.node_registry.builtin import subtitle_to_speech as subtitle_to_speech_node
 from worker.handlers.base import BaseHandler
-from worker.handlers.bgm import BgmHandler
-from worker.handlers.concat_many import ConcatManyHandler
-from worker.handlers.concat_vertical_timeline import ConcatVerticalTimelineHandler
 from worker.handlers.smart_trim import SmartTrimConfig, SmartTrimHandler
 from worker.handlers.speech_to_subtitle import SpeechToSubtitleHandler
 from worker.handlers.subtitle import SubtitleHandler
-from worker.handlers.transcode import TranscodeHandler
 
 
 class DummyHandler(BaseHandler):
@@ -61,113 +57,6 @@ def test_nvenc_cq_fallback_maps_to_better_cpu_crf():
     )
 
     assert rewritten[:4] == ["-c:v", "libx264", "-crf", "21"]
-
-
-@pytest.mark.asyncio
-async def test_transcode_defaults_to_final_quality_and_lanczos_scale(monkeypatch):
-    captured = {}
-
-    async def fake_run_ffmpeg(self, args):
-        captured["args"] = args
-        return ""
-
-    monkeypatch.setattr(TranscodeHandler, "run_ffmpeg", fake_run_ffmpeg)
-
-    await TranscodeHandler().execute(
-        {"video_codec": "libx264", "resolution": "1280x720"},
-        {"input": "in.mp4"},
-        "out.mp4",
-    )
-
-    args = captured["args"]
-    assert _value_after(args, "-preset") == "medium"
-    assert _value_after(args, "-crf") == "20"
-    assert _value_after(args, "-vf") == "scale=1280:720:flags=lanczos"
-    assert "-pix_fmt" in args
-    assert "-movflags" in args
-
-
-@pytest.mark.asyncio
-async def test_concat_many_uses_intermediate_quality_and_lanczos(monkeypatch):
-    captured = {}
-
-    async def fake_run_ffmpeg(self, args):
-        captured["args"] = args
-        return ""
-
-    monkeypatch.setattr(ConcatManyHandler, "run_ffmpeg", fake_run_ffmpeg)
-
-    await ConcatManyHandler().execute(
-        {"width": 720, "height": 1280},
-        {"video_1": "a.mp4", "video_2": "b.mp4"},
-        "out.mp4",
-    )
-
-    args = captured["args"]
-    filter_complex = _value_after(args, "-filter_complex")
-    assert "scale=720:1280:force_original_aspect_ratio=decrease:flags=lanczos" in filter_complex
-    assert _value_after(args, "-preset") == "slow"
-    assert _value_after(args, "-crf") == "18"
-
-
-@pytest.mark.asyncio
-async def test_concat_vertical_timeline_uses_48k_silent_audio(monkeypatch):
-    captured = {}
-
-    async def fake_run_ffprobe(self, _path):
-        return {"format": {"duration": "2.0"}, "streams": [{"codec_type": "video"}]}
-
-    async def fake_run_ffmpeg(self, args):
-        captured["args"] = args
-        return ""
-
-    monkeypatch.setattr(ConcatVerticalTimelineHandler, "run_ffprobe", fake_run_ffprobe)
-    monkeypatch.setattr(ConcatVerticalTimelineHandler, "run_ffmpeg", fake_run_ffmpeg)
-
-    await ConcatVerticalTimelineHandler()._render_segment(
-        active_video="active.mp4",
-        static_image="still.png",
-        active_position="top",
-        pane_width=720,
-        pane_height=640,
-        background_color="black",
-    )
-
-    args = captured["args"]
-    assert "anullsrc=r=48000:cl=stereo" in args
-
-
-@pytest.mark.asyncio
-async def test_bgm_uses_sidechain_ducking_loudnorm_and_48k_stereo(monkeypatch):
-    captured = {}
-
-    async def fake_run_ffprobe(self, _path):
-        return {"format": {"duration": "8.0"}, "streams": [{"codec_type": "audio"}]}
-
-    async def fake_run_ffmpeg(self, args):
-        captured["args"] = args
-        return ""
-
-    monkeypatch.setattr(BgmHandler, "run_ffprobe", fake_run_ffprobe)
-    monkeypatch.setattr(BgmHandler, "run_ffmpeg", fake_run_ffmpeg)
-
-    await BgmHandler().execute(
-        {"volume": 0.3, "original_volume": 1.0, "loop": True},
-        {"video": "video.mp4", "audio": "bgm.wav"},
-        "out.mp4",
-    )
-
-    args = captured["args"]
-    filter_complex = _value_after(args, "-filter_complex")
-    assert "aresample=48000:async=1" in filter_complex
-    assert filter_complex.count("aformat=sample_fmts=fltp:channel_layouts=stereo") == 2
-    assert f"volume=1.0,asplit=2[orig_mix][orig_sidechain]" in filter_complex
-    assert "sidechaincompress=threshold=0.03:ratio=8:attack=200:release=800" in filter_complex
-    assert "[orig_mix][ducked]amix=inputs=2:duration=first:normalize=0" in filter_complex
-    assert "loudnorm=I=-16:LRA=11:TP=-1.5" in filter_complex
-    assert ["-c:a", "aac"] == args[args.index("-c:a") : args.index("-c:a") + 2]
-    assert ["-ar", "48000"] == args[args.index("-ar") : args.index("-ar") + 2]
-    assert ["-ac", "2"] == args[args.index("-ac") : args.index("-ac") + 2]
 
 
 @pytest.mark.asyncio

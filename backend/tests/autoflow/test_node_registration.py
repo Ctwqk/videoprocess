@@ -7,9 +7,19 @@ from worker.handlers import HANDLER_MAP
 def test_autoflow_video_nodes_are_registered_with_handlers():
     registry = NodeTypeRegistry.get()
 
-    for type_name in ("smart_trim", "concat_many", "montage_assembler", "vertical_crop", "title_overlay"):
-        assert registry.get_type(type_name) is not None
-        assert type_name in HANDLER_MAP
+    definition = registry.get_type("smart_trim")
+    assert definition is not None
+    assert "smart_trim" in HANDLER_MAP
+
+
+def test_go_cutover_video_nodes_keep_registry_contract_without_python_handlers():
+    registry = NodeTypeRegistry.get()
+
+    for type_name in ("concat_many", "montage_assembler", "vertical_crop", "title_overlay"):
+        definition = registry.get_type(type_name)
+        assert definition is not None
+        assert definition.worker_type == "ffmpeg_go"
+        assert type_name not in HANDLER_MAP
 
 
 def test_smart_trim_node_contract_matches_storyboard_builder_needs():

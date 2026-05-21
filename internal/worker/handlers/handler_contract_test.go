@@ -690,7 +690,7 @@ func TestVerticalTimelineSegmentArgsSynthesizesAudio(t *testing.T) {
 		"-f", "lavfi",
 		"-t", "3.250",
 		"-i", "anullsrc=r=48000:cl=stereo",
-		"-filter_complex", "[1:v]scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=30[top];[0:v]scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=30[bottom];[top][bottom]vstack=inputs=2[v]",
+		"-filter_complex", "[1:v]scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30[top];[0:v]scale=640:360:force_original_aspect_ratio=decrease:flags=lanczos,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30[bottom];[top][bottom]vstack=inputs=2,setsar=1[v]",
 		"-map", "[v]",
 		"-map", "2:a:0",
 		"-c:v", "libx264",
