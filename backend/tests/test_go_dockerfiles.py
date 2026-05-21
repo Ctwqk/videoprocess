@@ -21,3 +21,16 @@ def test_go_dockerfiles_use_go_mod_toolchain_version():
     for dockerfile in dockerfiles:
         text = dockerfile.read_text(encoding="utf-8")
         assert f"FROM golang:{go_version}-bookworm AS build" in text
+
+
+def test_channelops_go_runner_exposes_queue_and_metrics_envs():
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    docs = (ROOT / "docs" / "channelops-go-live-runner.md").read_text(encoding="utf-8")
+
+    for env_name in [
+        "CHANNELOPS_QUEUE_MAX_ATTEMPTS",
+        "CHANNELOPS_METRICS_MAX_POLLS",
+        "CHANNELOPS_METRICS_POLL_DELAY_MINUTES",
+    ]:
+        assert env_name in compose
+        assert f"`{env_name}`" in docs
