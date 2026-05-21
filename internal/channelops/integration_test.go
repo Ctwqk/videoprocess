@@ -382,6 +382,121 @@ func TestRunTickBackfillsDecisionAuditCreatedTaskID(t *testing.T) {
 	decodeDecisionAuditObject(t, "learning_context_json", row.LearningContextJSON)
 }
 
+func TestRunTickConvertsDiscoverySignalCandidate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	signalID := testUUID(t, "discovery-signal")
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	fixture.InsertDiscoverySignal(ctx, signalID)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+
+	task := fixture.RequireSingleTask(ctx)
+	if task.Source != SourceTrendYT {
+		t.Fatalf("task source = %q, want %q", task.Source, SourceTrendYT)
+	}
+	if task.DiscoverySignalID == nil || *task.DiscoverySignalID != signalID {
+		t.Fatalf("discovery_signal_id = %#v, want %s", task.DiscoverySignalID, signalID)
+	}
+	if task.ManualSeedID != nil {
+		t.Fatalf("manual_seed_id = %#v, want nil", *task.ManualSeedID)
+	}
+	if got := task.RationaleJSON["discovery_signal_id"]; got != signalID {
+		t.Fatalf("rationale discovery_signal_id = %#v, want %s", got, signalID)
+	}
+	row := fixture.RequireSingleDecisionAudit(ctx)
+	if row.CandidateSource != SourceTrendYT {
+		t.Fatalf("decision candidate_source = %q, want %q", row.CandidateSource, SourceTrendYT)
+	}
+	if row.CreatedTaskID == nil || *row.CreatedTaskID != task.ID {
+		t.Fatalf("decision created_task_id = %#v, want %s", row.CreatedTaskID, task.ID)
+	}
+	var status string
+	var convertedTaskID string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, converted_task_id::text
+		FROM discovery_signals
+		WHERE id = $1::uuid
+	`, signalID).Scan(&status, &convertedTaskID); err != nil {
+		t.Fatalf("select discovery signal: %v", err)
+	}
+	if status != "converted" || convertedTaskID != task.ID {
+		t.Fatalf("discovery signal status/task = %s/%s, want converted/%s", status, convertedTaskID, task.ID)
+	}
+}
+
+func TestListActiveDiscoverySignalsFiltersSourceAndCapsPerLane(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	now := fixture.Store.Now().UTC()
+	var lowestID string
+	for i := 0; i < 51; i++ {
+		id := uuid.NewString()
+		if i == 0 {
+			lowestID = id
+		}
+		_, err := fixture.Store.Pool.Exec(ctx, `
+			INSERT INTO discovery_signals (
+				id, channel_profile_id, topic_lane_id, source, source_url, source_external_id,
+				title, summary, keywords_json, observed_at, expires_at, trend_score, novelty_score,
+				raw_json, status, created_at, updated_at
+			)
+			VALUES (
+				$1::uuid, $2::uuid, $3::uuid, 'youtube_search', '', $4,
+				$5, '', '[]'::json, $6::timestamptz, $7::timestamptz, $8, 0,
+				'{}'::json, 'active', $6::timestamp, $6::timestamp
+			)
+		`, id, fixture.ChannelID, fixture.LaneID, fmt.Sprintf("yt-%02d", i), fmt.Sprintf("trend-%02d", i), now, now.Add(24*time.Hour), float64(100+i))
+		if err != nil {
+			t.Fatalf("insert discovery signal %d: %v", i, err)
+		}
+	}
+	_, err := fixture.Store.Pool.Exec(ctx, `
+		INSERT INTO discovery_signals (
+			id, channel_profile_id, topic_lane_id, source, source_external_id,
+			title, summary, keywords_json, observed_at, expires_at, trend_score, novelty_score,
+			raw_json, status, created_at, updated_at
+		)
+		VALUES (
+			$1::uuid, $2::uuid, $3::uuid, 'x_search', 'x-1',
+			'x trend', '', '[]'::json, $4::timestamptz, $5::timestamptz, 99999, 0,
+			'{}'::json, 'active', $4::timestamp, $4::timestamp
+		)
+	`, uuid.NewString(), fixture.ChannelID, fixture.LaneID, now, now.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("insert non-youtube discovery signal: %v", err)
+	}
+
+	signals, err := fixture.Store.ListActiveDiscoverySignals(ctx, fixture.ChannelID, now)
+	if err != nil {
+		t.Fatalf("ListActiveDiscoverySignals: %v", err)
+	}
+	if len(signals) != 50 {
+		t.Fatalf("signal count = %d, want 50", len(signals))
+	}
+	for _, signal := range signals {
+		if signal.Source != "youtube_search" {
+			t.Fatalf("source = %q, want youtube_search", signal.Source)
+		}
+		if signal.ID == lowestID {
+			t.Fatalf("lowest ranked signal %s should have been capped out", lowestID)
+		}
+	}
+}
+
 func TestAttachDecisionAuditTaskErrorsWhenDecisionAuditMissing(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -536,6 +651,27 @@ func (f *ChannelOpsFixture) SetDryRun(ctx context.Context, dryRun bool) {
 	`, f.ChannelID, dryRun)
 	if err != nil {
 		f.T.Fatalf("set dry_run: %v", err)
+	}
+}
+
+func (f *ChannelOpsFixture) InsertDiscoverySignal(ctx context.Context, signalID string) {
+	f.T.Helper()
+	now := f.Store.Now().UTC()
+	_, err := f.Store.Pool.Exec(ctx, `
+		INSERT INTO discovery_signals (
+			id, channel_profile_id, topic_lane_id, source, source_url, source_external_id,
+			title, summary, keywords_json, observed_at, expires_at, trend_score, novelty_score,
+			raw_json, status, created_at, updated_at
+		)
+		VALUES (
+			$1::uuid, $2::uuid, $3::uuid, 'youtube_search', 'https://youtu.be/trend-1',
+			'trend-1', 'Trend title', 'Trend summary', '["trend"]'::json, $4::timestamptz,
+			$5::timestamptz, 2500, 0, '{"video_id": "trend-1"}'::json, 'active',
+			$4::timestamp, $4::timestamp
+		)
+	`, signalID, f.ChannelID, f.LaneID, now, now.Add(24*time.Hour))
+	if err != nil {
+		f.T.Fatalf("insert discovery signal: %v", err)
 	}
 }
 
@@ -774,6 +910,8 @@ func (f *ChannelOpsFixture) cleanup(ctx context.Context) {
 			   OR (payload_json ->> 'publication_id') IN (SELECT id::text FROM fixture_publications)
 		), deleted_decisions AS (
 			DELETE FROM decision_audit_entries WHERE channel_profile_id = $1::uuid
+		), deleted_discovery AS (
+			DELETE FROM discovery_signals WHERE channel_profile_id = $1::uuid
 		), deleted_audits AS (
 			DELETE FROM agent_tick_audits WHERE channel_profile_id = $1::uuid
 		), deleted_scheduler AS (

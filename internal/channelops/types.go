@@ -121,6 +121,25 @@ type ManualSeedRow struct {
 	CreatedAt              time.Time
 }
 
+type DiscoverySignalRow struct {
+	ID               string
+	ChannelProfileID string
+	TopicLaneID      *string
+	Source           string
+	SourceURL        *string
+	SourceExternalID string
+	Title            string
+	Summary          string
+	KeywordsJSON     []string
+	TrendScore       float64
+	NoveltyScore     float64
+	RawJSON          map[string]any
+	Status           string
+	ExpiresAt        *time.Time
+	ObservedAt       time.Time
+	CreatedAt        time.Time
+}
+
 type ProductionTaskRow struct {
 	ID                           string
 	ChannelProfileID             string

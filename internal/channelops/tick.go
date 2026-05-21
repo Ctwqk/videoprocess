@@ -22,6 +22,7 @@ type TickCandidate struct {
 	ScoreJSON              map[string]any
 	GuardResultsJSON       []map[string]any
 	LearningContextJSON    map[string]any
+	DiscoverySignal        *DiscoverySignalRow
 	Rejected               bool
 	RejectionGuard         string
 	RejectionReason        string
@@ -45,6 +46,7 @@ func BuildTickCandidates(
 	lanes []TopicLaneRow,
 	accounts []PublishingAccountRow,
 	seeds []ManualSeedRow,
+	signals []DiscoverySignalRow,
 	laneFormats map[string][]LaneFormatRow,
 	bucket string,
 ) []TickCandidate {
@@ -63,6 +65,7 @@ func BuildTickCandidates(
 	}
 
 	selectedByLane := map[string]int{}
+	accountIndex := 0
 	for _, seed := range seeds {
 		lane, laneRejection := resolveSeedLane(seed, fallbackLane, laneByID)
 		laneFormat := firstEnabledLaneFormat(lane, laneFormats)
@@ -80,7 +83,28 @@ func BuildTickCandidates(
 		}
 	}
 
-	accountIndex := 0
+	for _, signal := range signals {
+		lane, laneRejection := resolveSignalLane(signal, fallbackLane, laneByID)
+		laneFormat := firstEnabledLaneFormat(lane, laneFormats)
+		var account *PublishingAccountRow
+		if len(activeAccounts) > 0 {
+			accountCopy := activeAccounts[accountIndex%len(activeAccounts)]
+			account = &accountCopy
+			accountIndex++
+		}
+		candidate := CandidateFromDiscoverySignal(channel, signal, lane, laneFormat, account, bucket)
+		switch {
+		case laneRejection != "":
+			rejectCandidate(&candidate, "lane_unavailable", laneRejection)
+		case account == nil:
+			rejectCandidate(&candidate, "account_unavailable", "No active publishing account is available.")
+		}
+		candidates = append(candidates, candidate)
+		if !candidate.Rejected && lane != nil {
+			selectedByLane[lane.ID]++
+		}
+	}
+
 	generatedLaneFormats := map[string]bool{}
 	for _, lane := range activeLanes {
 		laneBudget := positiveInt(lane.MaxPostsPerDay, 1)
@@ -137,6 +161,52 @@ func BuildTickCandidates(
 		}
 	}
 	return candidates
+}
+
+func CandidateFromDiscoverySignal(
+	channel ChannelProfileRow,
+	signal DiscoverySignalRow,
+	lane *TopicLaneRow,
+	laneFormat *LaneFormatRow,
+	account *PublishingAccountRow,
+	bucket string,
+) TickCandidate {
+	laneID := ""
+	if lane != nil {
+		laneID = lane.ID
+	} else if signal.TopicLaneID != nil {
+		laneID = *signal.TopicLaneID
+	}
+	formatID := ""
+	sourcePlatforms := []string{"youtube"}
+	if laneFormat != nil {
+		formatID = laneFormat.ID
+		if len(laneFormat.SourcePlatformsJSON) > 0 {
+			sourcePlatforms = stringSlice(laneFormat.SourcePlatformsJSON)
+		}
+	}
+	signalCopy := signal
+	return TickCandidate{
+		CandidateID:            candidateID(SourceTrendYT, laneID, formatID, bucket, signal.ID),
+		Source:                 SourceTrendYT,
+		SourceKind:             SourceTrendYT,
+		DiscoverySignal:        &signalCopy,
+		Lane:                   lane,
+		LaneFormat:             laneFormat,
+		Account:                account,
+		Prompt:                 DiscoveryPrompt(channel, signal, lane, laneFormat),
+		TitleSeed:              signal.Title,
+		SourcePlatformsJSON:    sourcePlatforms,
+		ManualMaterialOverride: false,
+		ScoreJSON: map[string]any{
+			"source":              SourceTrendYT,
+			"source_kind":         SourceTrendYT,
+			"discovery_signal_id": signal.ID,
+			"trend_score":         signal.TrendScore,
+			"novelty_score":       signal.NoveltyScore,
+		},
+		LearningContextJSON: map[string]any{},
+	}
 }
 
 func CandidateFromManualSeed(seed ManualSeedRow, lane *TopicLaneRow, laneFormat *LaneFormatRow, account *PublishingAccountRow, bucket string) TickCandidate {
@@ -199,6 +269,40 @@ func LanePrompt(channel ChannelProfileRow, lane TopicLaneRow, format LaneFormatR
 	)
 }
 
+func DiscoveryPrompt(channel ChannelProfileRow, signal DiscoverySignalRow, lane *TopicLaneRow, format *LaneFormatRow) string {
+	laneName := "general"
+	laneDescription := ""
+	keywords := signal.KeywordsJSON
+	if lane != nil {
+		laneName = lane.Name
+		laneDescription = lane.Description
+		if len(keywords) == 0 {
+			keywords = lane.KeywordsJSON
+		}
+	}
+	formatKey := "short"
+	duration := 30
+	if format != nil {
+		formatKey = format.FormatKey
+		duration = positiveInt(format.TargetDurationSec, 30)
+	}
+	aspectRatio := strings.TrimSpace(channel.DefaultAspectRatio)
+	if aspectRatio == "" {
+		aspectRatio = "9:16"
+	}
+	return fmt.Sprintf(
+		"Create a %s video for the %q topic based on this YouTube trend. Trend title: %s. Summary: %s. Theme: %s. Keywords: %v. Target duration: %ds. Aspect ratio: %s.",
+		formatKey,
+		laneName,
+		signal.Title,
+		signal.Summary,
+		laneDescription,
+		keywords,
+		duration,
+		aspectRatio,
+	)
+}
+
 func acceptedRejected(candidates []TickCandidate) ([]TickCandidate, []TickCandidate) {
 	accepted := []TickCandidate{}
 	rejected := []TickCandidate{}
@@ -233,10 +337,26 @@ func candidateID(source string, laneID string, formatID string, bucket string, s
 	if formatID == "" {
 		formatID = "none"
 	}
-	if source == SourceManualSeed && seedID != "" {
+	if seedID != "" {
 		return fmt.Sprintf("%s:%s:lane:%s:format:%s:%s", source, seedID, laneID, formatID, bucket)
 	}
 	return fmt.Sprintf("%s:lane:%s:format:%s:%s", source, laneID, formatID, bucket)
+}
+
+func resolveSignalLane(signal DiscoverySignalRow, fallback *TopicLaneRow, laneByID map[string]TopicLaneRow) (*TopicLaneRow, string) {
+	if signal.TopicLaneID == nil {
+		if fallback == nil {
+			return nil, "No active topic lane is available."
+		}
+		laneCopy := *fallback
+		return &laneCopy, ""
+	}
+	lane, ok := laneByID[*signal.TopicLaneID]
+	if !ok {
+		return nil, fmt.Sprintf("Discovery signal topic lane %s is disabled, paused, or unavailable.", *signal.TopicLaneID)
+	}
+	laneCopy := lane
+	return &laneCopy, ""
 }
 
 func enabledLanes(lanes []TopicLaneRow) []TopicLaneRow {

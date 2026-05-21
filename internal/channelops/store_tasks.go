@@ -12,11 +12,11 @@ var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[
 
 func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h HandlerService) error {
 	now := s.Now().UTC()
-	channel, lanes, accounts, seeds, laneFormats, err := s.LoadTickInputs(ctx, channelID, now)
+	channel, lanes, accounts, seeds, signals, laneFormats, err := s.LoadTickInputs(ctx, channelID, now)
 	if err != nil {
 		return err
 	}
-	candidates := BuildTickCandidates(channel, lanes, accounts, seeds, laneFormats, bucket)
+	candidates := BuildTickCandidates(channel, lanes, accounts, seeds, signals, laneFormats, bucket)
 	accepted, rejected := acceptedRejected(candidates)
 	result := TickResult{DryRun: channel.DryRun, Accepted: accepted, Rejected: rejected}
 	tx, err := s.Pool.Begin(ctx)
@@ -56,6 +56,11 @@ func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h 
 		taskID, err := s.insertProductionTask(ctx, tx, channel, candidate, now)
 		if err != nil {
 			return err
+		}
+		if candidate.DiscoverySignal != nil {
+			if err := s.markDiscoverySignalConverted(ctx, tx, candidate.DiscoverySignal.ID, taskID); err != nil {
+				return err
+			}
 		}
 		if auditID := decisionAuditIDs[candidate.CandidateID]; auditID != "" {
 			if err := s.attachDecisionAuditTask(ctx, tx, auditID, taskID); err != nil {

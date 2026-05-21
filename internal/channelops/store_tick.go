@@ -8,28 +8,32 @@ import (
 	"time"
 )
 
-func (s *Store) LoadTickInputs(ctx context.Context, channelID string, now time.Time) (ChannelProfileRow, []TopicLaneRow, []PublishingAccountRow, []ManualSeedRow, map[string][]LaneFormatRow, error) {
+func (s *Store) LoadTickInputs(ctx context.Context, channelID string, now time.Time) (ChannelProfileRow, []TopicLaneRow, []PublishingAccountRow, []ManualSeedRow, []DiscoverySignalRow, map[string][]LaneFormatRow, error) {
 	channel, err := s.GetChannelProfile(ctx, channelID)
 	if err != nil {
-		return ChannelProfileRow{}, nil, nil, nil, nil, err
+		return ChannelProfileRow{}, nil, nil, nil, nil, nil, err
 	}
 	lanes, err := s.ListActiveLanes(ctx, channelID, now)
 	if err != nil {
-		return ChannelProfileRow{}, nil, nil, nil, nil, err
+		return ChannelProfileRow{}, nil, nil, nil, nil, nil, err
 	}
 	accounts, err := s.ListActiveAccounts(ctx, channelID, now)
 	if err != nil {
-		return ChannelProfileRow{}, nil, nil, nil, nil, err
+		return ChannelProfileRow{}, nil, nil, nil, nil, nil, err
 	}
 	seeds, err := s.ListActiveManualSeeds(ctx, channelID)
 	if err != nil {
-		return ChannelProfileRow{}, nil, nil, nil, nil, err
+		return ChannelProfileRow{}, nil, nil, nil, nil, nil, err
+	}
+	signals, err := s.ListActiveDiscoverySignals(ctx, channelID, now)
+	if err != nil {
+		return ChannelProfileRow{}, nil, nil, nil, nil, nil, err
 	}
 	formats, err := s.ListLaneFormats(ctx, lanes)
 	if err != nil {
-		return ChannelProfileRow{}, nil, nil, nil, nil, err
+		return ChannelProfileRow{}, nil, nil, nil, nil, nil, err
 	}
-	return channel, lanes, accounts, seeds, formats, nil
+	return channel, lanes, accounts, seeds, signals, formats, nil
 }
 
 func (s *Store) GetChannelProfile(ctx context.Context, channelID string) (ChannelProfileRow, error) {
@@ -195,6 +199,70 @@ func (s *Store) ListActiveManualSeeds(ctx context.Context, channelID string) ([]
 		}
 		if err := unmarshalJSONObject(constraintsJSON, &row.ConstraintsJSON); err != nil {
 			return nil, fmt.Errorf("scan manual_seeds.constraints_json: %w", err)
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) ListActiveDiscoverySignals(ctx context.Context, channelID string, now time.Time) ([]DiscoverySignalRow, error) {
+	rows, err := s.Pool.Query(ctx, `
+		WITH ranked_signals AS (
+			SELECT id, channel_profile_id, topic_lane_id, source, source_url, source_external_id,
+			       title, summary, keywords_json, trend_score, novelty_score, raw_json, status,
+			       expires_at, observed_at, created_at,
+			       row_number() OVER (
+			           PARTITION BY topic_lane_id
+			           ORDER BY trend_score DESC, observed_at DESC, created_at ASC
+			       ) AS lane_rank
+			FROM discovery_signals
+			WHERE channel_profile_id = $1::uuid
+			  AND source = 'youtube_search'
+			  AND status = 'active'
+			  AND (expires_at IS NULL OR expires_at > $2::timestamptz)
+		)
+		SELECT id, channel_profile_id, topic_lane_id, source, source_url, source_external_id,
+		       title, summary, keywords_json, trend_score, novelty_score, raw_json, status,
+		       expires_at, observed_at, created_at
+		FROM ranked_signals
+		WHERE lane_rank <= 50
+		ORDER BY trend_score DESC, observed_at DESC, created_at ASC
+		LIMIT 250
+	`, channelID, now.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := []DiscoverySignalRow{}
+	for rows.Next() {
+		var row DiscoverySignalRow
+		var keywordsJSON, rawJSON []byte
+		if err := rows.Scan(
+			&row.ID,
+			&row.ChannelProfileID,
+			&row.TopicLaneID,
+			&row.Source,
+			&row.SourceURL,
+			&row.SourceExternalID,
+			&row.Title,
+			&row.Summary,
+			&keywordsJSON,
+			&row.TrendScore,
+			&row.NoveltyScore,
+			&rawJSON,
+			&row.Status,
+			&row.ExpiresAt,
+			&row.ObservedAt,
+			&row.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if err := unmarshalJSONStringSlice(keywordsJSON, &row.KeywordsJSON); err != nil {
+			return nil, fmt.Errorf("scan discovery_signals.keywords_json: %w", err)
+		}
+		if err := unmarshalJSONObject(rawJSON, &row.RawJSON); err != nil {
+			return nil, fmt.Errorf("scan discovery_signals.raw_json: %w", err)
 		}
 		result = append(result, row)
 	}
@@ -376,6 +444,7 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 	laneID := candidateLaneID(candidate)
 	formatID := candidateFormatID(candidate)
 	manualSeedID := candidateManualSeedID(candidate)
+	discoverySignalID := candidateDiscoverySignalID(candidate)
 	approvalMode := ApprovalAgent
 	if candidate.SourceKind == SourceManualSeed {
 		approvalMode = ApprovalHuman
@@ -383,6 +452,9 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 	rationale := map[string]any{
 		"candidate_id": candidate.CandidateID,
 		"source_kind":  candidate.SourceKind,
+	}
+	if candidate.DiscoverySignal != nil {
+		rationale["discovery_signal_id"] = candidate.DiscoverySignal.ID
 	}
 	scoreBreakdown := map[string]any{
 		"source":      candidate.Source,
@@ -420,7 +492,7 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 	err = db.QueryRow(ctx, `
 		INSERT INTO production_tasks (
 			id, channel_profile_id, topic_lane_id, lane_format_id, target_account_id,
-			manual_seed_id, source, title_seed, prompt, rationale_json,
+			manual_seed_id, discovery_signal_id, source, title_seed, prompt, rationale_json,
 			score_breakdown_json, portfolio_bucket, source_platforms_json,
 			material_library_ids_json, uses_external_assets, approval_mode,
 			agent_approval_evidence_json, priority, state, state_updated_at, retry_count,
@@ -428,13 +500,13 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 			transition_history_json, created_at, updated_at
 		)
 		VALUES (
-			gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7, $8,
-			$9::json, $10::json, 'explore', $11::json, $12::json,
-			$13, $14, '{}'::json, 0.0, $15, $16::timestamptz, 0, $17, $18::json,
-			$19::json, $16::timestamp, $16::timestamp
+			gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7, $8, $9,
+			$10::json, $11::json, 'explore', $12::json, $13::json,
+			$14, $15, '{}'::json, 0.0, $16, $17::timestamptz, 0, $18, $19::json,
+			$20::json, $17::timestamp, $17::timestamp
 		)
 		RETURNING id
-	`, channel.ID, laneID, formatID, candidate.Account.ID, manualSeedID, candidate.Source,
+	`, channel.ID, laneID, formatID, candidate.Account.ID, manualSeedID, discoverySignalID, candidate.Source,
 		candidate.TitleSeed, candidate.Prompt, rationaleJSON, scoreJSON, sourcePlatformsJSON,
 		materialLibraryIDsJSON, usesExternalAssets(candidate), approvalMode, TaskSelected, now.UTC(),
 		channel.ConfigVersion, snapshotJSON, transitionJSON).Scan(&id)
@@ -442,6 +514,27 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 		return "", err
 	}
 	return id, nil
+}
+
+func (s *Store) MarkDiscoverySignalConverted(ctx context.Context, signalID string, taskID string) error {
+	return s.markDiscoverySignalConverted(ctx, s.Pool, signalID, taskID)
+}
+
+func (s *Store) markDiscoverySignalConverted(ctx context.Context, db dbExecutor, signalID string, taskID string) error {
+	tag, err := db.Exec(ctx, `
+		UPDATE discovery_signals
+		SET status = 'converted',
+		    converted_task_id = $2::uuid,
+		    updated_at = $3::timestamp
+		WHERE id = $1::uuid
+	`, signalID, taskID, s.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("discovery signal %s not found", signalID)
+	}
+	return nil
 }
 
 func unmarshalJSONObject(raw []byte, dest *map[string]any) error {
@@ -553,6 +646,15 @@ func channelConfigSnapshot(channel ChannelProfileRow, candidate TickCandidate) m
 			"constraints_json": jsonObject(candidate.Seed.ConstraintsJSON),
 		}
 	}
+	if candidate.DiscoverySignal != nil {
+		snapshot["discovery_signal"] = map[string]any{
+			"id":                 candidate.DiscoverySignal.ID,
+			"source":             candidate.DiscoverySignal.Source,
+			"source_external_id": candidate.DiscoverySignal.SourceExternalID,
+			"title":              candidate.DiscoverySignal.Title,
+			"trend_score":        candidate.DiscoverySignal.TrendScore,
+		}
+	}
 	return snapshot
 }
 
@@ -577,6 +679,14 @@ func candidateManualSeedID(candidate TickCandidate) *string {
 		return nil
 	}
 	value := candidate.Seed.ID
+	return &value
+}
+
+func candidateDiscoverySignalID(candidate TickCandidate) *string {
+	if candidate.DiscoverySignal == nil {
+		return nil
+	}
+	value := candidate.DiscoverySignal.ID
 	return &value
 }
 

@@ -8,7 +8,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.channel_agent import ChannelProfile, ManualSeed, TopicLane
+from app.models.channel_agent import ChannelProfile, DiscoverySignal, TopicLane
 
 
 @dataclass(frozen=True)
@@ -57,22 +57,43 @@ class YouTubeTrendIngester:
             for result in results:
                 if _view_count(result) < self.min_view_count:
                     continue
-                if await self._existing_seed(db, channel=channel, source_video_id=str(result.get("video_id") or "")):
+                source_external_id = _source_external_id(result)
+                if not source_external_id:
+                    continue
+                existing = await self._existing_signal(
+                    db,
+                    channel=channel,
+                    source_external_id=source_external_id,
+                )
+                if existing is not None:
+                    existing.topic_lane_id = lane.id
+                    existing.source_url = str(result.get("url") or "")
+                    existing.title = str(result.get("title") or "YouTube trend")
+                    existing.summary = str(result.get("description") or "")
+                    existing.keywords_json = list(lane.keywords_json or [])
+                    existing.observed_at = current
+                    existing.expires_at = current + self.seed_ttl
+                    existing.trend_score = float(_view_count(result))
+                    existing.raw_json = dict(result)
+                    if existing.status == "expired":
+                        existing.status = "active"
                     continue
                 db.add(
-                    ManualSeed(
+                    DiscoverySignal(
                         channel_profile_id=channel.id,
                         topic_lane_id=lane.id,
-                        prompt=_prompt(result),
-                        title_seed=str(result.get("title") or "YouTube trend"),
-                        source_policy="trend_youtube",
-                        source_platforms_json=["youtube"],
-                        constraints_json={
-                            "source_video_id": str(result.get("video_id") or ""),
-                            "source_url": str(result.get("url") or ""),
-                            "view_count": _view_count(result),
-                            "expires_at": (current + self.seed_ttl).isoformat(),
-                        },
+                        source="youtube_search",
+                        source_url=str(result.get("url") or ""),
+                        source_external_id=source_external_id,
+                        title=str(result.get("title") or "YouTube trend"),
+                        summary=str(result.get("description") or ""),
+                        keywords_json=list(lane.keywords_json or []),
+                        observed_at=current,
+                        expires_at=current + self.seed_ttl,
+                        trend_score=float(_view_count(result)),
+                        novelty_score=0.0,
+                        raw_json=dict(result),
+                        status="active",
                     )
                 )
                 created += 1
@@ -80,34 +101,40 @@ class YouTubeTrendIngester:
         return TrendIngestResult(created_count=created, expired_count=expired)
 
     async def _expire_stale(self, db: AsyncSession, *, channel: ChannelProfile, now: datetime) -> int:
-        seeds = (
+        signals = (
             await db.execute(
-                select(ManualSeed)
-                .where(ManualSeed.channel_profile_id == channel.id)
-                .where(ManualSeed.source_policy == "trend_youtube")
-                .where(ManualSeed.status == "active")
+                select(DiscoverySignal)
+                .where(DiscoverySignal.channel_profile_id == channel.id)
+                .where(DiscoverySignal.source == "youtube_search")
+                .where(DiscoverySignal.status == "active")
             )
         ).scalars().all()
         expired = 0
-        for seed in seeds:
-            expires_at = _parse_datetime((seed.constraints_json or {}).get("expires_at"))
+        for signal in signals:
+            expires_at = _parse_datetime(signal.expires_at)
             if expires_at is not None and expires_at < now:
-                seed.status = "expired"
+                signal.status = "expired"
                 expired += 1
         return expired
 
-    async def _existing_seed(self, db: AsyncSession, *, channel: ChannelProfile, source_video_id: str) -> bool:
-        if not source_video_id:
-            return False
-        seeds = (
+    async def _existing_signal(
+        self,
+        db: AsyncSession,
+        *,
+        channel: ChannelProfile,
+        source_external_id: str,
+    ) -> DiscoverySignal | None:
+        if not source_external_id:
+            return None
+        return (
             await db.execute(
-                select(ManualSeed)
-                .where(ManualSeed.channel_profile_id == channel.id)
-                .where(ManualSeed.source_policy == "trend_youtube")
-                .where(ManualSeed.status == "active")
+                select(DiscoverySignal)
+                .where(DiscoverySignal.channel_profile_id == channel.id)
+                .where(DiscoverySignal.source == "youtube_search")
+                .where(DiscoverySignal.source_external_id == source_external_id)
+                .limit(1)
             )
-        ).scalars().all()
-        return any(str((seed.constraints_json or {}).get("source_video_id") or "") == source_video_id for seed in seeds)
+        ).scalars().first()
 
 
 def _lane_query(lane: TopicLane) -> str:
@@ -127,12 +154,8 @@ def _view_count(result: dict[str, Any]) -> int:
         return 0
 
 
-def _prompt(result: dict[str, Any]) -> str:
-    title = str(result.get("title") or "YouTube trend")
-    description = str(result.get("description") or "").strip()
-    if description:
-        return f"Create a short video inspired by this YouTube trend: {title}. Source summary: {description}"
-    return f"Create a short video inspired by this YouTube trend: {title}."
+def _source_external_id(result: dict[str, Any]) -> str:
+    return str(result.get("video_id") or result.get("id") or result.get("url") or "").strip()
 
 
 def _parse_datetime(value: Any) -> datetime | None:

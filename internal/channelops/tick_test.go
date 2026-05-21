@@ -37,6 +37,7 @@ func TestBuildCandidatesManualThenLaneDriven(t *testing.T) {
 		[]TopicLaneRow{lane},
 		[]PublishingAccountRow{account},
 		[]ManualSeedRow{manual},
+		nil,
 		map[string][]LaneFormatRow{laneID: {shortFormat, longFormat}},
 		"2026-05-21-18",
 	)
@@ -71,6 +72,7 @@ func TestBuildCandidatesLimitsLaneFormatToOneCandidatePerTick(t *testing.T) {
 		ChannelProfileRow{ID: "ch"},
 		[]TopicLaneRow{lane},
 		[]PublishingAccountRow{account},
+		nil,
 		nil,
 		map[string][]LaneFormatRow{laneID: {format}},
 		"2026-05-21-18",
