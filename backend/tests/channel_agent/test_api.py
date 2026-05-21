@@ -281,6 +281,184 @@ async def test_decisions_failures_task_audit_and_learning_api(api_session):
 
 
 @pytest.mark.asyncio
+async def test_audit_learning_and_failure_endpoints_do_not_leak_cross_channel_rows(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        first = (await client.post("/api/v1/channel-agent/channels", json={"name": "Audit A"})).json()
+        second = (await client.post("/api/v1/channel-agent/channels", json={"name": "Audit B"})).json()
+        first_account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{first['id']}/accounts",
+                json={"account_label": "a-main", "platform_account_id": "yt-a", "credential_ref": "youtube/a"},
+            )
+        ).json()
+        second_account = (
+            await client.post(
+                f"/api/v1/channel-agent/channels/{second['id']}/accounts",
+                json={"account_label": "b-main", "platform_account_id": "yt-b", "credential_ref": "youtube/b"},
+            )
+        ).json()
+        now = datetime.now(timezone.utc)
+        first_task = ProductionTask(
+            channel_profile_id=uuid.UUID(first["id"]),
+            target_account_id=uuid.UUID(first_account["id"]),
+            source="manual_seed",
+            prompt="first audit",
+            state="failed",
+            failure_category="quota",
+            channel_config_snapshot_json={},
+            created_at=now - timedelta(hours=1),
+        )
+        second_task = ProductionTask(
+            channel_profile_id=uuid.UUID(second["id"]),
+            target_account_id=uuid.UUID(second_account["id"]),
+            source="manual_seed",
+            prompt="second audit",
+            state="failed",
+            failure_category="token",
+            channel_config_snapshot_json={},
+            created_at=now - timedelta(hours=1),
+        )
+        api_session.add_all([first_task, second_task])
+        await api_session.flush()
+
+        first_tick = AgentTickAudit(channel_profile_id=uuid.UUID(first["id"]), tick_id="tick:first", dry_run=False)
+        second_tick = AgentTickAudit(channel_profile_id=uuid.UUID(second["id"]), tick_id="tick:second", dry_run=False)
+        api_session.add_all([first_tick, second_tick])
+        await api_session.flush()
+
+        older_decision = DecisionAuditEntry(
+            tick_audit_id=first_tick.id,
+            channel_profile_id=uuid.UUID(first["id"]),
+            candidate_id="a:older",
+            candidate_source="manual_seed",
+            target_account_id=uuid.UUID(first_account["id"]),
+            selected=False,
+            created_task_id=first_task.id,
+            created_at=now - timedelta(minutes=3),
+        )
+        newer_decision = DecisionAuditEntry(
+            tick_audit_id=first_tick.id,
+            channel_profile_id=uuid.UUID(first["id"]),
+            candidate_id="a:newer",
+            candidate_source="manual_seed",
+            target_account_id=uuid.UUID(first_account["id"]),
+            selected=True,
+            created_task_id=first_task.id,
+            created_at=now - timedelta(minutes=1),
+        )
+        second_decision = DecisionAuditEntry(
+            tick_audit_id=second_tick.id,
+            channel_profile_id=uuid.UUID(second["id"]),
+            candidate_id="b:decision",
+            candidate_source="manual_seed",
+            target_account_id=uuid.UUID(second_account["id"]),
+            selected=True,
+            created_task_id=second_task.id,
+            created_at=now,
+        )
+        older_publication = PublicationRecord(
+            production_task_id=first_task.id,
+            account_id=uuid.UUID(first_account["id"]),
+            platform_content_id="yt-a-old",
+            title="old",
+            compliance_disposition="assumed_fair_use",
+            created_at=now - timedelta(minutes=3),
+        )
+        newer_publication = PublicationRecord(
+            production_task_id=first_task.id,
+            account_id=uuid.UUID(first_account["id"]),
+            platform_content_id="yt-a-new",
+            title="new",
+            compliance_disposition="assumed_fair_use",
+            created_at=now - timedelta(minutes=1),
+        )
+        second_publication = PublicationRecord(
+            production_task_id=second_task.id,
+            account_id=uuid.UUID(second_account["id"]),
+            platform_content_id="yt-b",
+            title="second",
+            compliance_disposition="assumed_fair_use",
+            created_at=now,
+        )
+        first_learning = LearningState(
+            channel_profile_id=uuid.UUID(first["id"]),
+            dimension_type="source",
+            dimension_key="manual_seed:first",
+            window_days=7,
+            sample_count=2,
+            avg_reward=0.2,
+            confidence=0.5,
+            recommendation_json={"channel": "first"},
+        )
+        second_learning = LearningState(
+            channel_profile_id=uuid.UUID(second["id"]),
+            dimension_type="source",
+            dimension_key="manual_seed:second",
+            window_days=7,
+            sample_count=3,
+            avg_reward=0.3,
+            confidence=0.6,
+            recommendation_json={"channel": "second"},
+        )
+        api_session.add_all(
+            [
+                older_decision,
+                newer_decision,
+                second_decision,
+                older_publication,
+                newer_publication,
+                second_publication,
+                first_learning,
+                second_learning,
+            ]
+        )
+        await api_session.flush()
+        api_session.add_all(
+            [
+                MaterialUsageLedger(
+                    material_id=f"a-material-{index:03d}",
+                    channel_profile_id=uuid.UUID(first["id"]),
+                    publication_id=newer_publication.id,
+                    used_at=now + timedelta(seconds=index),
+                )
+                for index in range(201)
+            ]
+            + [
+                MaterialUsageLedger(
+                    material_id="b-leak",
+                    channel_profile_id=uuid.UUID(second["id"]),
+                    publication_id=newer_publication.id,
+                    used_at=now + timedelta(seconds=999),
+                ),
+                MaterialUsageLedger(
+                    material_id="shared-material",
+                    channel_profile_id=uuid.UUID(second["id"]),
+                    publication_id=second_publication.id,
+                    used_at=now + timedelta(seconds=998),
+                ),
+            ]
+        )
+        await api_session.commit()
+
+        decisions = (await client.get(f"/api/v1/channel-agent/channels/{first['id']}/decisions")).json()
+        failures = (await client.get(f"/api/v1/channel-agent/channels/{first['id']}/failures?days=7")).json()
+        learning = (await client.get(f"/api/v1/channel-agent/channels/{first['id']}/learning")).json()
+        audit = (await client.get(f"/api/v1/channel-agent/tasks/{first_task.id}/audit")).json()
+
+        assert {row["candidate_id"] for row in decisions} == {"a:older", "a:newer"}
+        assert failures["categories"] == {"quota": 1}
+        assert [row["dimension_key"] for row in learning["states"]] == ["manual_seed:first"]
+        assert audit["decision"]["candidate_id"] == "a:newer"
+        assert audit["publication"]["platform_content_id"] == "yt-a-new"
+        material_ids = [row["material_id"] for row in audit["material_usage"]]
+        assert len(material_ids) == 200
+        assert material_ids[0] == "a-material-200"
+        assert "a-material-000" not in material_ids
+        assert "b-leak" not in material_ids
+        assert "shared-material" not in material_ids
+
+
+@pytest.mark.asyncio
 async def test_channel_queue_and_health_are_channel_scoped(api_session):
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
         first = (await client.post("/api/v1/channel-agent/channels", json={"name": "A"})).json()

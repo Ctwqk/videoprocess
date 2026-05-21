@@ -401,11 +401,17 @@ async def task_audit(task_id: str, db: AsyncSession = Depends(get_db)):
             select(DecisionAuditEntry)
             .where(DecisionAuditEntry.created_task_id == task.id)
             .where(DecisionAuditEntry.channel_profile_id == task.channel_profile_id)
+            .order_by(DecisionAuditEntry.selected.desc(), DecisionAuditEntry.created_at.desc())
             .limit(1)
         )
     ).scalars().first()
     publication = (
-        await db.execute(select(PublicationRecord).where(PublicationRecord.production_task_id == task.id).limit(1))
+        await db.execute(
+            select(PublicationRecord)
+            .where(PublicationRecord.production_task_id == task.id)
+            .order_by(PublicationRecord.created_at.desc())
+            .limit(1)
+        )
     ).scalars().first()
     material_rows = []
     if publication is not None:
@@ -414,6 +420,8 @@ async def task_audit(task_id: str, db: AsyncSession = Depends(get_db)):
                 select(MaterialUsageLedger)
                 .where(MaterialUsageLedger.publication_id == publication.id)
                 .where(MaterialUsageLedger.channel_profile_id == task.channel_profile_id)
+                .order_by(MaterialUsageLedger.used_at.desc())
+                .limit(200)
             )
         ).scalars().all()
     return {
@@ -427,7 +435,7 @@ async def task_audit(task_id: str, db: AsyncSession = Depends(get_db)):
 @router.get("/channels/{channel_id}/failures")
 async def channel_failures(channel_id: str, days: int = 7, db: AsyncSession = Depends(get_db)):
     channel = await _require_channel(db, channel_id)
-    clamped_days = max(days, 0)
+    clamped_days = min(max(days, 0), 90)
     since = _naive_utc(Clock().now() - timedelta(days=clamped_days))
     rows = (
         await db.execute(
@@ -453,6 +461,7 @@ async def channel_learning(channel_id: str, db: AsyncSession = Depends(get_db)):
                 LearningState.dimension_key.asc(),
                 LearningState.window_days.asc(),
             )
+            .limit(500)
         )
     ).scalars().all()
     return {"channel_id": str(channel.id), "states": [_learning_state(row) for row in rows]}
