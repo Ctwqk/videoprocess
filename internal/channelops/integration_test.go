@@ -2,6 +2,7 @@ package channelops
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -250,6 +251,154 @@ func TestPublicationYouTubeStatusFailureCategoryPersists(t *testing.T) {
 	}
 }
 
+func TestRunTickWritesDecisionAuditDryRunWithoutTasks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	fixture.SetDryRun(ctx, true)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+
+	if got := fixture.CountProductionTasks(ctx); got != 0 {
+		t.Fatalf("production task count = %d, want 0", got)
+	}
+
+	row := fixture.RequireSingleDecisionAudit(ctx)
+	if !row.Selected {
+		t.Fatal("dry-run accepted candidate audit selected = false, want true")
+	}
+	if row.CreatedTaskID != nil {
+		t.Fatalf("dry-run decision audit created_task_id = %v, want nil", *row.CreatedTaskID)
+	}
+	if row.TargetAccountID == nil || *row.TargetAccountID != fixture.AccountID {
+		t.Fatalf("target_account_id = %#v, want %s", row.TargetAccountID, fixture.AccountID)
+	}
+	if row.CandidateSource != SourceLaneSeed {
+		t.Fatalf("candidate source = %q, want %q", row.CandidateSource, SourceLaneSeed)
+	}
+	if row.RejectionReason != nil {
+		t.Fatalf("dry-run accepted decision audit rejection_reason = %v, want nil", *row.RejectionReason)
+	}
+	guards := decodeDecisionAuditArray(t, "guard_results_json", row.GuardResultsJSON)
+	if len(guards) != 0 {
+		t.Fatalf("guard_results_json length = %d, want 0: %s", len(guards), row.GuardResultsJSON)
+	}
+	decodeDecisionAuditObject(t, "score_json", row.ScoreJSON)
+	decodeDecisionAuditObject(t, "pds_decision_json", row.PDSDecisionJSON)
+	decodeDecisionAuditObject(t, "learning_context_json", row.LearningContextJSON)
+}
+
+func TestRunTickWritesDecisionAuditRejectedGuardResults(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	fixture.SetAccountEnabled(ctx, false)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+
+	if got := fixture.CountProductionTasks(ctx); got != 0 {
+		t.Fatalf("production task count = %d, want 0", got)
+	}
+
+	row := fixture.RequireSingleDecisionAudit(ctx)
+	if row.Selected {
+		t.Fatal("rejected candidate audit selected = true, want false")
+	}
+	if row.CreatedTaskID != nil {
+		t.Fatalf("rejected decision audit created_task_id = %v, want nil", *row.CreatedTaskID)
+	}
+	if row.CandidateSource != SourceLaneSeed {
+		t.Fatalf("candidate source = %q, want %q", row.CandidateSource, SourceLaneSeed)
+	}
+	if row.RejectionReason == nil || *row.RejectionReason == "" {
+		t.Fatalf("rejection_reason = %#v, want non-empty", row.RejectionReason)
+	}
+	guards := decodeDecisionAuditArray(t, "guard_results_json", row.GuardResultsJSON)
+	if len(guards) != 1 {
+		t.Fatalf("guard_results_json length = %d, want 1: %s", len(guards), row.GuardResultsJSON)
+	}
+	if guards[0]["guard"] != "account_unavailable" || guards[0]["verdict"] != "reject" {
+		t.Fatalf("guard_results_json = %#v, want account_unavailable reject", guards)
+	}
+	decodeDecisionAuditObject(t, "score_json", row.ScoreJSON)
+	decodeDecisionAuditObject(t, "pds_decision_json", row.PDSDecisionJSON)
+	decodeDecisionAuditObject(t, "learning_context_json", row.LearningContextJSON)
+}
+
+func TestRunTickBackfillsDecisionAuditCreatedTaskID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+
+	task := fixture.RequireSingleTask(ctx)
+	row := fixture.RequireSingleDecisionAudit(ctx)
+	if !row.Selected {
+		t.Fatal("accepted candidate audit selected = false, want true")
+	}
+	if row.RejectionReason != nil {
+		t.Fatalf("accepted decision audit rejection_reason = %v, want nil", *row.RejectionReason)
+	}
+	if row.CreatedTaskID == nil || *row.CreatedTaskID != task.ID {
+		t.Fatalf("created_task_id = %#v, want %s", row.CreatedTaskID, task.ID)
+	}
+	if row.TargetAccountID == nil || *row.TargetAccountID != fixture.AccountID {
+		t.Fatalf("target_account_id = %#v, want %s", row.TargetAccountID, fixture.AccountID)
+	}
+	if row.CandidateSource != SourceLaneSeed {
+		t.Fatalf("candidate source = %q, want %q", row.CandidateSource, SourceLaneSeed)
+	}
+	guards := decodeDecisionAuditArray(t, "guard_results_json", row.GuardResultsJSON)
+	if len(guards) != 0 {
+		t.Fatalf("guard_results_json length = %d, want 0: %s", len(guards), row.GuardResultsJSON)
+	}
+	score := decodeDecisionAuditObject(t, "score_json", row.ScoreJSON)
+	if score["source_kind"] != SourceLaneSeed {
+		t.Fatalf("score_json source_kind = %#v, want %q", score["source_kind"], SourceLaneSeed)
+	}
+	decodeDecisionAuditObject(t, "pds_decision_json", row.PDSDecisionJSON)
+	decodeDecisionAuditObject(t, "learning_context_json", row.LearningContextJSON)
+}
+
+type decisionAuditFixtureRow struct {
+	TickAuditID         string
+	CandidateID         string
+	CandidateSource     string
+	TopicLaneID         *string
+	LaneFormatID        *string
+	TargetAccountID     *string
+	ScoreJSON           []byte
+	GuardResultsJSON    []byte
+	PDSDecisionJSON     []byte
+	LearningContextJSON []byte
+	Selected            bool
+	RejectionReason     *string
+	CreatedTaskID       *string
+	CreatedAt           time.Time
+}
+
 type ChannelOpsFixture struct {
 	T         *testing.T
 	Store     *Store
@@ -365,6 +514,30 @@ func (f *ChannelOpsFixture) SetTickInterval(ctx context.Context, intervalMinutes
 	}
 }
 
+func (f *ChannelOpsFixture) SetDryRun(ctx context.Context, dryRun bool) {
+	f.T.Helper()
+	_, err := f.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles
+		SET dry_run = $2
+		WHERE id = $1::uuid
+	`, f.ChannelID, dryRun)
+	if err != nil {
+		f.T.Fatalf("set dry_run: %v", err)
+	}
+}
+
+func (f *ChannelOpsFixture) SetAccountEnabled(ctx context.Context, enabled bool) {
+	f.T.Helper()
+	_, err := f.Store.Pool.Exec(ctx, `
+		UPDATE publishing_accounts
+		SET enabled = $2
+		WHERE id = $1::uuid
+	`, f.AccountID, enabled)
+	if err != nil {
+		f.T.Fatalf("set account enabled: %v", err)
+	}
+}
+
 func (f *ChannelOpsFixture) HandlerService(decision PDSDecision) HandlerService {
 	return HandlerService{
 		Store:    f.Store,
@@ -454,6 +627,77 @@ func (f *ChannelOpsFixture) RequireSingleTask(ctx context.Context) ProductionTas
 	return task
 }
 
+func (f *ChannelOpsFixture) CountProductionTasks(ctx context.Context) int {
+	f.T.Helper()
+	var count int
+	if err := f.Store.Pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM production_tasks
+		WHERE channel_profile_id = $1::uuid
+	`, f.ChannelID).Scan(&count); err != nil {
+		f.T.Fatalf("count production tasks: %v", err)
+	}
+	return count
+}
+
+func (f *ChannelOpsFixture) RequireSingleDecisionAudit(ctx context.Context) decisionAuditFixtureRow {
+	f.T.Helper()
+	var row decisionAuditFixtureRow
+	err := f.Store.Pool.QueryRow(ctx, `
+		SELECT tick_audit_id::text, candidate_id, candidate_source,
+		       topic_lane_id::text, lane_format_id::text, target_account_id::text,
+		       score_json, guard_results_json, pds_decision_json, learning_context_json,
+		       selected, rejection_reason, created_task_id::text, created_at
+		FROM decision_audit_entries
+		WHERE channel_profile_id = $1::uuid
+	`, f.ChannelID).Scan(
+		&row.TickAuditID,
+		&row.CandidateID,
+		&row.CandidateSource,
+		&row.TopicLaneID,
+		&row.LaneFormatID,
+		&row.TargetAccountID,
+		&row.ScoreJSON,
+		&row.GuardResultsJSON,
+		&row.PDSDecisionJSON,
+		&row.LearningContextJSON,
+		&row.Selected,
+		&row.RejectionReason,
+		&row.CreatedTaskID,
+		&row.CreatedAt,
+	)
+	if err != nil {
+		f.T.Fatalf("select decision audit: %v", err)
+	}
+	var count int
+	if err := f.Store.Pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM decision_audit_entries
+		WHERE channel_profile_id = $1::uuid
+	`, f.ChannelID).Scan(&count); err != nil {
+		f.T.Fatalf("count decision audit rows: %v", err)
+	}
+	if count != 1 {
+		f.T.Fatalf("decision audit row count = %d, want 1", count)
+	}
+	if row.TickAuditID == "" {
+		f.T.Fatal("decision audit tick_audit_id is empty")
+	}
+	if row.CandidateID == "" {
+		f.T.Fatal("decision audit candidate_id is empty")
+	}
+	if row.TopicLaneID == nil || *row.TopicLaneID != f.LaneID {
+		f.T.Fatalf("topic_lane_id = %#v, want %s", row.TopicLaneID, f.LaneID)
+	}
+	if row.LaneFormatID == nil || *row.LaneFormatID != f.FormatID {
+		f.T.Fatalf("lane_format_id = %#v, want %s", row.LaneFormatID, f.FormatID)
+	}
+	if row.CreatedAt.IsZero() {
+		f.T.Fatal("decision audit created_at is zero")
+	}
+	return row
+}
+
 func (f *ChannelOpsFixture) CountRows(ctx context.Context, table string) int {
 	f.T.Helper()
 	queries := map[string]string{
@@ -515,6 +759,8 @@ func (f *ChannelOpsFixture) cleanup(ctx context.Context) {
 			   OR (payload_json ->> 'channel_id') = $1::text
 			   OR (payload_json ->> 'production_task_id') IN (SELECT id::text FROM fixture_tasks)
 			   OR (payload_json ->> 'publication_id') IN (SELECT id::text FROM fixture_publications)
+		), deleted_decisions AS (
+			DELETE FROM decision_audit_entries WHERE channel_profile_id = $1::uuid
 		), deleted_audits AS (
 			DELETE FROM agent_tick_audits WHERE channel_profile_id = $1::uuid
 		), deleted_scheduler AS (
@@ -543,6 +789,30 @@ func (f *ChannelOpsFixture) makeQueuedItemsReady(ctx context.Context) {
 	if err != nil {
 		f.T.Fatalf("make queued items ready: %v", err)
 	}
+}
+
+func decodeDecisionAuditObject(t *testing.T, field string, raw []byte) map[string]any {
+	t.Helper()
+	var value map[string]any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatalf("decode %s: %v; raw=%s", field, err, raw)
+	}
+	if value == nil {
+		t.Fatalf("%s decoded as nil object; raw=%s", field, raw)
+	}
+	return value
+}
+
+func decodeDecisionAuditArray(t *testing.T, field string, raw []byte) []map[string]any {
+	t.Helper()
+	var value []map[string]any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatalf("decode %s: %v; raw=%s", field, err, raw)
+	}
+	if value == nil {
+		t.Fatalf("%s decoded as nil array; raw=%s", field, raw)
+	}
+	return value
 }
 
 type fakePDS struct {

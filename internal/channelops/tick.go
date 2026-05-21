@@ -19,6 +19,9 @@ type TickCandidate struct {
 	MaterialLibraryIDsJSON []string
 	ConstraintsJSON        map[string]any
 	ManualMaterialOverride bool
+	ScoreJSON              map[string]any
+	GuardResultsJSON       []map[string]any
+	LearningContextJSON    map[string]any
 	Rejected               bool
 	RejectionGuard         string
 	RejectionReason        string
@@ -67,13 +70,9 @@ func BuildTickCandidates(
 		candidate := CandidateFromManualSeed(seed, lane, laneFormat, account, bucket)
 		switch {
 		case laneRejection != "":
-			candidate.Rejected = true
-			candidate.RejectionGuard = "lane_unavailable"
-			candidate.RejectionReason = laneRejection
+			rejectCandidate(&candidate, "lane_unavailable", laneRejection)
 		case accountRejection != "":
-			candidate.Rejected = true
-			candidate.RejectionGuard = "account_unavailable"
-			candidate.RejectionReason = accountRejection
+			rejectCandidate(&candidate, "account_unavailable", accountRejection)
 		}
 		candidates = append(candidates, candidate)
 		if !candidate.Rejected && lane != nil {
@@ -121,11 +120,17 @@ func BuildTickCandidates(
 				ConstraintsJSON: map[string]any{
 					"template_pool_json": stringSlice(format.TemplatePoolJSON),
 				},
+				ScoreJSON: map[string]any{
+					"source":        SourceLaneSeed,
+					"source_kind":   SourceLaneSeed,
+					"lane_weight":   lane.Weight,
+					"format_key":    format.FormatKey,
+					"format_weight": format.Weight,
+				},
+				LearningContextJSON: map[string]any{},
 			}
 			if account == nil {
-				candidate.Rejected = true
-				candidate.RejectionGuard = "account_unavailable"
-				candidate.RejectionReason = "No active publishing account is available."
+				rejectCandidate(&candidate, "account_unavailable", "No active publishing account is available.")
 			}
 			candidates = append(candidates, candidate)
 			generated++
@@ -167,6 +172,13 @@ func CandidateFromManualSeed(seed ManualSeedRow, lane *TopicLaneRow, laneFormat 
 		MaterialLibraryIDsJSON: stringSlice(seed.MaterialLibraryIDsJSON),
 		ConstraintsJSON:        jsonObject(seed.ConstraintsJSON),
 		ManualMaterialOverride: sourceKind == SourceManualSeed,
+		ScoreJSON: map[string]any{
+			"source":                   SourceManualSeed,
+			"source_kind":              sourceKind,
+			"source_policy":            seed.SourcePolicy,
+			"manual_material_override": sourceKind == SourceManualSeed,
+		},
+		LearningContextJSON: map[string]any{},
 	}
 }
 
@@ -191,6 +203,9 @@ func acceptedRejected(candidates []TickCandidate) ([]TickCandidate, []TickCandid
 	accepted := []TickCandidate{}
 	rejected := []TickCandidate{}
 	for _, candidate := range candidates {
+		if candidate.Rejected && len(candidate.GuardResultsJSON) == 0 {
+			rejectCandidate(&candidate, candidate.RejectionGuard, candidate.RejectionReason)
+		}
 		if candidate.Rejected {
 			rejected = append(rejected, candidate)
 		} else {
@@ -198,6 +213,17 @@ func acceptedRejected(candidates []TickCandidate) ([]TickCandidate, []TickCandid
 		}
 	}
 	return accepted, rejected
+}
+
+func rejectCandidate(candidate *TickCandidate, guard string, reason string) {
+	candidate.Rejected = true
+	candidate.RejectionGuard = guard
+	candidate.RejectionReason = reason
+	candidate.GuardResultsJSON = []map[string]any{{
+		"guard":   guard,
+		"verdict": "reject",
+		"reason":  reason,
+	}}
 }
 
 func candidateID(source string, laneID string, formatID string, bucket string, seedID string) string {

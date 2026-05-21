@@ -19,13 +19,18 @@ func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h 
 	candidates := BuildTickCandidates(channel, lanes, accounts, seeds, laneFormats, bucket)
 	accepted, rejected := acceptedRejected(candidates)
 	result := TickResult{DryRun: channel.DryRun, Accepted: accepted, Rejected: rejected}
-	if _, err := s.InsertTickAudit(ctx, channelID, bucket, result, map[string]any{
+	tickAuditID, err := s.InsertTickAudit(ctx, channelID, bucket, result, map[string]any{
 		"bucket":          bucket,
 		"config_version":  channel.ConfigVersion,
 		"accepted_count":  len(accepted),
 		"rejected_count":  len(rejected),
 		"handler_version": "go",
-	}); err != nil {
+	})
+	if err != nil {
+		return err
+	}
+	decisionAuditIDs, err := s.InsertDecisionAuditEntries(ctx, tickAuditID, channelID, result)
+	if err != nil {
 		return err
 	}
 	if channel.DryRun {
@@ -36,6 +41,11 @@ func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h 
 		taskID, err := s.InsertProductionTask(ctx, channel, candidate, now)
 		if err != nil {
 			return err
+		}
+		if auditID := decisionAuditIDs[candidate.CandidateID]; auditID != "" {
+			if err := s.AttachDecisionAuditTask(ctx, auditID, taskID); err != nil {
+				return err
+			}
 		}
 		channelProfileID := channel.ID
 		if _, err := s.Enqueue(ctx, EnqueueOptions{

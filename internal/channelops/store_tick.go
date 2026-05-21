@@ -295,6 +295,58 @@ func (s *Store) InsertTickAudit(ctx context.Context, channelID string, bucket st
 	return id, err
 }
 
+func (s *Store) InsertDecisionAuditEntries(ctx context.Context, tickAuditID string, channelID string, result TickResult) (map[string]string, error) {
+	ids := map[string]string{}
+	candidates := make([]TickCandidate, 0, len(result.Accepted)+len(result.Rejected))
+	candidates = append(candidates, result.Accepted...)
+	candidates = append(candidates, result.Rejected...)
+	for _, candidate := range candidates {
+		scoreJSON, err := json.Marshal(candidateScoreJSON(candidate))
+		if err != nil {
+			return nil, err
+		}
+		guardsJSON, err := json.Marshal(candidateGuardResultsJSON(candidate))
+		if err != nil {
+			return nil, err
+		}
+		learningJSON, err := json.Marshal(jsonObject(candidate.LearningContextJSON))
+		if err != nil {
+			return nil, err
+		}
+		pdsJSON := []byte("{}")
+		var id string
+		err = s.Pool.QueryRow(ctx, `
+			INSERT INTO decision_audit_entries (
+				id, tick_audit_id, channel_profile_id, candidate_id, candidate_source,
+				topic_lane_id, lane_format_id, target_account_id, score_json, guard_results_json,
+				pds_decision_json, learning_context_json, selected, rejection_reason, created_at
+			)
+			VALUES (
+				gen_random_uuid(), $1::uuid, $2::uuid, $3, $4, $5::uuid, $6::uuid, $7::uuid,
+				$8::json, $9::json, $10::json, $11::json, $12, $13, $14::timestamptz
+			)
+			RETURNING id
+		`, tickAuditID, channelID, candidate.CandidateID, candidateSource(candidate),
+			candidateLaneID(candidate), candidateFormatID(candidate), candidateAccountUUID(candidate),
+			scoreJSON, guardsJSON, pdsJSON, learningJSON, !candidate.Rejected,
+			candidateRejectionReason(candidate), s.Now().UTC()).Scan(&id)
+		if err != nil {
+			return nil, err
+		}
+		ids[candidate.CandidateID] = id
+	}
+	return ids, nil
+}
+
+func (s *Store) AttachDecisionAuditTask(ctx context.Context, auditID string, taskID string) error {
+	_, err := s.Pool.Exec(ctx, `
+		UPDATE decision_audit_entries
+		SET created_task_id = $2::uuid
+		WHERE id = $1::uuid
+	`, auditID, taskID)
+	return err
+}
+
 func (s *Store) InsertProductionTask(ctx context.Context, channel ChannelProfileRow, candidate TickCandidate, now time.Time) (string, error) {
 	if candidate.Account == nil {
 		return "", errors.New("production task candidate has no target account")
@@ -506,11 +558,62 @@ func candidateManualSeedID(candidate TickCandidate) *string {
 	return &value
 }
 
+func candidateAccountUUID(candidate TickCandidate) *string {
+	if candidate.Account == nil {
+		return nil
+	}
+	value := candidate.Account.ID
+	return &value
+}
+
 func candidateAccountID(candidate TickCandidate) string {
 	if candidate.Account == nil {
 		return ""
 	}
 	return candidate.Account.ID
+}
+
+func candidateSource(candidate TickCandidate) string {
+	if candidate.SourceKind != "" {
+		return candidate.SourceKind
+	}
+	if candidate.Source != "" {
+		return candidate.Source
+	}
+	return "unknown"
+}
+
+func candidateScoreJSON(candidate TickCandidate) map[string]any {
+	score := jsonObject(candidate.ScoreJSON)
+	if _, ok := score["source"]; !ok && candidate.Source != "" {
+		score["source"] = candidate.Source
+	}
+	if _, ok := score["source_kind"]; !ok {
+		score["source_kind"] = candidateSource(candidate)
+	}
+	return score
+}
+
+func candidateGuardResultsJSON(candidate TickCandidate) []map[string]any {
+	if len(candidate.GuardResultsJSON) > 0 {
+		return candidate.GuardResultsJSON
+	}
+	if candidate.Rejected {
+		return []map[string]any{{
+			"guard":   candidate.RejectionGuard,
+			"verdict": "reject",
+			"reason":  candidate.RejectionReason,
+		}}
+	}
+	return []map[string]any{}
+}
+
+func candidateRejectionReason(candidate TickCandidate) *string {
+	if !candidate.Rejected || candidate.RejectionReason == "" {
+		return nil
+	}
+	value := candidate.RejectionReason
+	return &value
 }
 
 func usesExternalAssets(candidate TickCandidate) bool {
