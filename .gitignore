@@ -35,6 +35,7 @@ data/
 runtime/
 output/
 **/output/
+e2e-output/
 logs/
 k8s-data/
 browser-profiles/
