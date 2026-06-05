@@ -30,7 +30,7 @@ Production is deployed by GitHub-tracked repositories, but the runtime copies on
 | ForWin | `10.0.0.246:/home/kikuhiko/ForWin` on branch `master` | `10.0.0.126:/Users/magi1/ForWin-swarm` |
 | VideoProcess | Preferred dev checkout `10.0.0.246:/home/kikuhiko/videoprocess` on branch `main`; auxiliary checkouts `10.0.0.126:/Users/magi1/VideoProcess-app` and `10.0.0.150:/home/taiwei/Constructure-repos/videoprocess` | `10.0.0.127:/Users/wenjieliu/VideoProcess-app` |
 | Policy Decision Service | `10.0.0.150:/home/taiwei/Constructure-repos/policy-decision-service` | `10.0.0.127:/Users/wenjieliu/.deploy-build/policy-decision-service` |
-| VP Feature Aggregator | `10.0.0.150:/home/taiwei/Constructure-repos/vp-feature-aggregator` | `10.0.0.127:/Users/wenjieliu/.deploy-build/vp-feature-aggregator` |
+| VP Feature Aggregator | VideoProcess repo subdirectory `services/vp-feature-aggregator` | `10.0.0.127:/Users/wenjieliu/.deploy-build/vp-feature-aggregator` |
 | Arb | `10.0.0.150:/home/taiwei/Constructure-repos/arb` | `10.0.0.127:/Users/wenjieliu/arb-swarm-src` |
 | News | GitHub repo `Ctwqk/news`; deploy mirror currently at `10.0.0.150:/home/taiwei/deploy-github-sync/repos/news` | `10.0.0.126:/Users/magi1/Constructure/news` |
 | IBKR | `10.0.0.150:/home/taiwei/Constructure-repos/ibkr` | 150 only |

@@ -8,9 +8,9 @@ VideoProcess composes three concentric layers:
 
 1. **Ingestion and processing** — FFmpeg transcode, vision inference, headless browser automation across YouTube and other platforms, and Faster-Whisper transcription utilities.
 2. **Channel-ops orchestration** — a typed node registry, a DAG-based workflow orchestrator (`autoflow`), and LLM-driven channel agents that compose pipelines from registered node types and decouple capability declaration from execution.
-3. **Risk-control extension** — a Postgres event outbox, a Kafka relay, and a fail-open pre-flight gate that calls the standalone [`policy-decision-service`](https://github.com/Ctwqk/policy-decision-service) and reads actor features from [`vp-feature-aggregator`](https://github.com/Ctwqk/vp-feature-aggregator) before publication decisions.
+3. **Risk-control extension** — a Postgres event outbox, a Kafka relay, and a fail-open pre-flight gate that calls the standalone [`policy-decision-service`](https://github.com/Ctwqk/policy-decision-service) and reads actor features from the in-repo `services/vp-feature-aggregator/` service before publication decisions.
 
-The repository is a polyrepo-friendly monorepo: PDS and the feature aggregator live in their own repos and communicate over HTTP and Kafka topics, while this repository owns the media workflows, the channel-ops orchestrator, and the Python integration glue.
+The repository is a polyrepo-friendly monorepo: PDS remains a standalone repo, while the VP feature aggregator now lives under `services/vp-feature-aggregator/` and still communicates with PDS over HTTP and Kafka topics.
 
 ## Highlights
 
@@ -62,6 +62,8 @@ internal/                     # Go internal packages
 ├── config/, contracts/       # Config and shared types
 
 frontend/                     # React + TS + Vite UI
+services/
+└── vp-feature-aggregator/     # Python Kafka consumer + actor feature API for PDS
 docker-compose.yml            # Base local stack (~11 services)
 docker-compose.pds-kafka.yml  # Risk-control extension override (+5 services)
 docs/                         # Architecture, design specs, smoke runbooks
@@ -168,7 +170,7 @@ gofmt -l cmd internal | (! grep .)
 ## Related Repositories
 
 - [`Ctwqk/policy-decision-service`](https://github.com/Ctwqk/policy-decision-service) — Go-based policy decision service (HTTP + gRPC, CEL rules, Aho-Corasick keywords, Kafka decision sink).
-- [`Ctwqk/vp-feature-aggregator`](https://github.com/Ctwqk/vp-feature-aggregator) — Python aiokafka consumer building per-actor sliding-window features for PDS.
+- [`Ctwqk/vp-feature-aggregator`](https://github.com/Ctwqk/vp-feature-aggregator) — historical source repository for the aggregator now vendored under `services/vp-feature-aggregator/`.
 
 ## Notes
 

@@ -3,7 +3,7 @@
 Run these commands from the VideoProcess worktree:
 
 ```bash
-cd /home/taiwei/.codex/worktrees/d1d5/videoprocess
+cd /home/kikuhiko/videoprocess
 ```
 
 ## Compose Check
@@ -14,14 +14,17 @@ Render the merged compose file before starting services:
 docker compose -f docker-compose.yml -f docker-compose.pds-kafka.yml config
 ```
 
-The override mounts
-`/home/taiwei/Constructure-repos/policy-decision-service/config` at `/etc/pds`
-inside the scratch PDS image and sets
+The override mounts `${PDS_CONFIG_PATH:-../policy-decision-service/config}` at
+`/etc/pds` inside the scratch PDS image and sets
 `PDS_RULES_PATH=/etc/pds/rules.example.yaml`. Keep the whole config directory
 mounted because `rules.example.yaml` references `blocklist.example.txt`
 relative to the rules file. The smoke override runs PDS as `0:0` so it can read
 the local read-only bind mount even when the source checkout has restrictive
 file permissions.
+
+`vp-feature-aggregator` now builds from `services/vp-feature-aggregator/`
+inside this repository. Override `PDS_REPO_PATH` or `PDS_CONFIG_PATH` only when
+the PDS checkout is not at `../policy-decision-service`.
 
 Start the PDS/Kafka smoke stack:
 

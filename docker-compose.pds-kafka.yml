@@ -19,7 +19,7 @@ services:
 
   pds:
     build:
-      context: /home/taiwei/Constructure-repos/policy-decision-service
+      context: ${PDS_REPO_PATH:-../policy-decision-service}
       dockerfile: deploy/Dockerfile
     user: "0:0"
     environment:
@@ -33,7 +33,7 @@ services:
       RISK_VP_ACTIONS_TOPIC: vp.actor.actions.v1
       PDS_RULES_PATH: /etc/pds/rules.example.yaml
     volumes:
-      - /home/taiwei/Constructure-repos/policy-decision-service/config:/etc/pds:ro
+      - ${PDS_CONFIG_PATH:-../policy-decision-service/config}:/etc/pds:ro
     depends_on:
       - redpanda
       - vp-feature-aggregator
@@ -44,7 +44,7 @@ services:
 
   vp-feature-aggregator:
     build:
-      context: /home/taiwei/Constructure-repos/vp-feature-aggregator
+      context: ./services/vp-feature-aggregator
       dockerfile: deploy/Dockerfile
     environment:
       AGG_ENABLE_CONSUMER: "true"

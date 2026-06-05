@@ -102,7 +102,7 @@ change, redeploy the affected VP services together.
 | API or job orchestration issue | `backend/app/` | `vp-api-swarm` |
 | Worker/node execution issue | `backend/worker/` and node handlers | `vp-channel-agent-runner-swarm` and sometimes API |
 | PDS integration | VP event/outbox code plus `Ctwqk/policy-decision-service` | `vp-pds-swarm`, `vp-event-outbox-relay-swarm` |
-| Feature aggregation | VP event schema plus `Ctwqk/vp-feature-aggregator` | `vp-feature-aggregator-swarm` |
+| Feature aggregation | VP event schema plus `services/vp-feature-aggregator` | `vp-feature-aggregator-swarm` |
 | Browser/platform upload issue | VP platform/browser manager code and 150 browser infra | service-specific; check credentials and browser state |
 
 ## Failure Domains

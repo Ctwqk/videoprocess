@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pds.decisions.v1",
+  "type": "object",
+  "required": ["event_id", "topic_version", "actor_id", "action_type", "verdict", "score", "decision_id", "occurred_at"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "topic_version": {"const": "pds.decisions.v1"},
+    "actor_id": {"type": "string", "minLength": 1},
+    "action_type": {"type": "string", "minLength": 1},
+    "platform": {"type": "string"},
+    "verdict": {"type": "string", "enum": ["allow", "flag", "block"]},
+    "score": {"type": "number"},
+    "reasons": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": {"type": "string"},
+          "rule": {"type": "string"},
+          "detail": {"type": "string"}
+        },
+        "required": ["code"],
+        "additionalProperties": false
+      }
+    },
+    "decision_id": {"type": "string", "minLength": 1},
+    "client": {"type": "string"},
+    "occurred_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

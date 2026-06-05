@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vp.actor.actions.v1",
+  "type": "object",
+  "required": ["event_id", "topic_version", "actor_id", "action_type", "occurred_at", "source"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "topic_version": {"const": "vp.actor.actions.v1"},
+    "actor_id": {"type": "string", "minLength": 1},
+    "action_type": {
+      "type": "string",
+      "enum": [
+        "candidate_accepted",
+        "candidate_blocked",
+        "candidate_flagged",
+        "post_comment",
+        "publication_promotion_attempted",
+        "publication_promotion_blocked",
+        "publication_scheduled"
+      ]
+    },
+    "platform": {"type": "string"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "source": {"const": "videoprocess.channel_ops"},
+    "metadata": {"type": "object", "additionalProperties": true}
+  },
+  "additionalProperties": false
+}
