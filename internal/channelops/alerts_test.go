@@ -113,3 +113,22 @@ func TestHandleSendAlertUsesConfiguredSink(t *testing.T) {
 		t.Fatalf("details = %#v", got.Details)
 	}
 }
+
+func TestQuotaLowAlertIncludesZeroRemaining(t *testing.T) {
+	alert, ok := quotaLowAlert("channel-1", "account-1", 0)
+	if !ok {
+		t.Fatal("quotaLowAlert returned ok=false for exhausted quota")
+	}
+	if alert.Kind != "quota_low" || alert.Severity != "critical" {
+		t.Fatalf("alert kind/severity = %s/%s", alert.Kind, alert.Severity)
+	}
+	if alert.Details["quota_remaining"] != 0 {
+		t.Fatalf("quota_remaining detail = %#v, want 0", alert.Details["quota_remaining"])
+	}
+}
+
+func TestQuotaLowAlertSkipsUnknownRemaining(t *testing.T) {
+	if alert, ok := quotaLowAlert("channel-1", "account-1", -1); ok {
+		t.Fatalf("quotaLowAlert returned alert for unknown quota: %#v", alert)
+	}
+}

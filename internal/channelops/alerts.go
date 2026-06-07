@@ -237,12 +237,16 @@ func pdsDecisionAuditJSON(decision PDSDecision) map[string]any {
 }
 
 func quotaLowAlert(channelID string, accountID string, remaining int) (AlertPayload, bool) {
-	if remaining <= 0 || remaining >= 2000 {
+	if remaining < 0 || remaining >= 2000 {
 		return AlertPayload{}, false
+	}
+	severity := "warning"
+	if remaining == 0 {
+		severity = "critical"
 	}
 	return AlertPayload{
 		Kind:       "quota_low",
-		Severity:   "warning",
+		Severity:   severity,
 		ChannelID:  channelID,
 		ResourceID: accountID,
 		Message:    "YouTube quota remaining is below the ChannelOps safety threshold",

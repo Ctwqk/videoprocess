@@ -47,7 +47,7 @@ func (c YouTubeManagerClient) AccountHealth(ctx context.Context, accountID strin
 	quota := mapFromAny(payload["quota_estimate"])
 	return YouTubeAccountHealth{
 		Authenticated:  boolValue(payload["authenticated"]),
-		QuotaRemaining: intOrDefault(quota["estimated_units_remaining"], 0),
+		QuotaRemaining: intOrDefault(quota["estimated_units_remaining"], -1),
 		Raw:            payload,
 	}, nil
 }
