@@ -21,6 +21,7 @@ type TickCandidate struct {
 	ManualMaterialOverride bool
 	ScoreJSON              map[string]any
 	GuardResultsJSON       []map[string]any
+	PDSDecisionJSON        map[string]any
 	LearningContextJSON    map[string]any
 	DiscoverySignal        *DiscoverySignalRow
 	Rejected               bool

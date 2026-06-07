@@ -7,17 +7,26 @@ import (
 
 func validConfig() Config {
 	return Config{
-		DatabaseURL:             "postgresql://vp:vp@localhost:5432/vp",
-		YouTubeManagerURL:       "http://youtube:8899",
-		AutoFlowBaseURL:         "http://api:8080",
-		AutoFlowTimeout:         10 * time.Second,
-		LiveMode:                true,
-		PDSTimeout:              500 * time.Millisecond,
-		RunnerPollSeconds:       5,
-		SchedulerPollSeconds:    60,
-		MaxQueueAttempts:        3,
-		MetricsPollMaxAttempts:  24,
-		MetricsPollDelayMinutes: 60,
+		DatabaseURL:                  "postgresql://vp:vp@localhost:5432/vp",
+		YouTubeManagerURL:            "http://youtube:8899",
+		AutoFlowBaseURL:              "http://api:8080",
+		AutoFlowTimeout:              10 * time.Second,
+		LiveMode:                     true,
+		PDSTimeout:                   500 * time.Millisecond,
+		RunnerPollSeconds:            5,
+		SchedulerPollSeconds:         60,
+		HealthPort:                   8080,
+		ThrottleTimeZone:             "America/Los_Angeles",
+		ThrottleStartHour:            8,
+		ThrottleEndHour:              24,
+		ThrottleRunnerPollSeconds:    300,
+		ThrottleSchedulerPollSeconds: 1800,
+		MaxQueueAttempts:             3,
+		MetricsPollMaxAttempts:       24,
+		MetricsPollDelayMinutes:      60,
+		RetentionQueueDays:           30,
+		RetentionAuditDays:           90,
+		RetentionFeedbackDays:        365,
 	}
 }
 
@@ -43,8 +52,20 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.SchedulerPollSeconds != 60 {
 		t.Fatalf("SchedulerPollSeconds = %v", cfg.SchedulerPollSeconds)
 	}
+	if cfg.HealthPort != 8080 {
+		t.Fatalf("HealthPort = %v", cfg.HealthPort)
+	}
+	if cfg.ThrottleEnabled {
+		t.Fatal("ThrottleEnabled default should be false")
+	}
+	if cfg.ThrottleTimeZone != "America/Los_Angeles" {
+		t.Fatalf("ThrottleTimeZone = %q", cfg.ThrottleTimeZone)
+	}
 	if cfg.MaxQueueAttempts != 3 {
 		t.Fatalf("MaxQueueAttempts = %v, want Python default 3", cfg.MaxQueueAttempts)
+	}
+	if cfg.RetentionQueueDays != 30 || cfg.RetentionAuditDays != 90 || cfg.RetentionFeedbackDays != 365 {
+		t.Fatalf("retention defaults = %d/%d/%d, want 30/90/365", cfg.RetentionQueueDays, cfg.RetentionAuditDays, cfg.RetentionFeedbackDays)
 	}
 	if cfg.DevAllowAllPDS {
 		t.Fatal("DevAllowAllPDS default should be false")
@@ -108,6 +129,58 @@ func TestValidateRejectsNonPositivePollsAndAttempts(t *testing.T) {
 			name: "metrics poll delay minutes",
 			mutate: func(cfg *Config) {
 				cfg.MetricsPollDelayMinutes = 0
+			},
+		},
+		{
+			name: "health port",
+			mutate: func(cfg *Config) {
+				cfg.HealthPort = 0
+			},
+		},
+		{
+			name: "throttle start hour",
+			mutate: func(cfg *Config) {
+				cfg.ThrottleEnabled = true
+				cfg.ThrottleStartHour = -1
+			},
+		},
+		{
+			name: "throttle end hour",
+			mutate: func(cfg *Config) {
+				cfg.ThrottleEnabled = true
+				cfg.ThrottleEndHour = 25
+			},
+		},
+		{
+			name: "throttle runner poll seconds",
+			mutate: func(cfg *Config) {
+				cfg.ThrottleEnabled = true
+				cfg.ThrottleRunnerPollSeconds = 0
+			},
+		},
+		{
+			name: "throttle scheduler poll seconds",
+			mutate: func(cfg *Config) {
+				cfg.ThrottleEnabled = true
+				cfg.ThrottleSchedulerPollSeconds = 0
+			},
+		},
+		{
+			name: "queue retention days",
+			mutate: func(cfg *Config) {
+				cfg.RetentionQueueDays = 0
+			},
+		},
+		{
+			name: "audit retention days",
+			mutate: func(cfg *Config) {
+				cfg.RetentionAuditDays = 0
+			},
+		},
+		{
+			name: "feedback retention days",
+			mutate: func(cfg *Config) {
+				cfg.RetentionFeedbackDays = 0
 			},
 		},
 		{

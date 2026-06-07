@@ -9,44 +9,64 @@ import (
 )
 
 type Config struct {
-	DatabaseURL             string
-	YouTubeManagerURL       string
-	AutoFlowBaseURL         string
-	AutoFlowTimeout         time.Duration
-	PDSEnabled              bool
-	PDSBaseURL              string
-	PDSClientID             string
-	PDSTimeout              time.Duration
-	DevAllowAllPDS          bool
-	RunnerPollSeconds       int
-	SchedulerPollSeconds    int
-	SlackWebhookURL         string
-	AlertEmailTo            string
-	LiveMode                bool
-	MaxQueueAttempts        int
-	MetricsPollMaxAttempts  int
-	MetricsPollDelayMinutes int
+	DatabaseURL                  string
+	YouTubeManagerURL            string
+	AutoFlowBaseURL              string
+	AutoFlowTimeout              time.Duration
+	PDSEnabled                   bool
+	PDSBaseURL                   string
+	PDSClientID                  string
+	PDSTimeout                   time.Duration
+	DevAllowAllPDS               bool
+	RunnerPollSeconds            int
+	SchedulerPollSeconds         int
+	HealthPort                   int
+	ThrottleEnabled              bool
+	ThrottleTimeZone             string
+	ThrottleStartHour            int
+	ThrottleEndHour              int
+	ThrottleRunnerPollSeconds    int
+	ThrottleSchedulerPollSeconds int
+	SlackWebhookURL              string
+	AlertEmailTo                 string
+	LiveMode                     bool
+	MaxQueueAttempts             int
+	MetricsPollMaxAttempts       int
+	MetricsPollDelayMinutes      int
+	RetentionQueueDays           int
+	RetentionAuditDays           int
+	RetentionFeedbackDays        int
 }
 
 func LoadConfig() Config {
 	return Config{
-		DatabaseURL:             env("DATABASE_URL", "postgresql://vp:vp_secret@localhost:5435/videoprocess"),
-		YouTubeManagerURL:       env("YOUTUBE_MANAGER_URL", ""),
-		AutoFlowBaseURL:         env("AUTOFLOW_BASE_URL", "http://api:8080"),
-		AutoFlowTimeout:         time.Duration(floatEnv("AUTOFLOW_TIMEOUT_SECONDS", 10) * float64(time.Second)),
-		PDSEnabled:              boolEnv("PDS_ENABLED", false),
-		PDSBaseURL:              env("PDS_BASE_URL", "http://pds:8080"),
-		PDSClientID:             env("PDS_CLIENT_ID", "videoprocess-channel-agent"),
-		PDSTimeout:              time.Duration(floatEnv("PDS_TIMEOUT_SECONDS", 0.5) * float64(time.Second)),
-		DevAllowAllPDS:          boolEnv("CHANNEL_AGENT_DEV_ALLOW_ALL_PDS", false),
-		RunnerPollSeconds:       intEnv("CHANNELOPS_RUNNER_POLL_SECONDS", 5),
-		SchedulerPollSeconds:    intEnv("CHANNELOPS_SCHEDULER_POLL_SECONDS", 60),
-		SlackWebhookURL:         env("CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL", ""),
-		AlertEmailTo:            env("CHANNEL_AGENT_ALERT_EMAIL_TO", ""),
-		LiveMode:                boolEnv("CHANNELOPS_LIVE_MODE", true),
-		MaxQueueAttempts:        intEnv("CHANNELOPS_QUEUE_MAX_ATTEMPTS", 3),
-		MetricsPollMaxAttempts:  intEnv("CHANNELOPS_METRICS_MAX_POLLS", 24),
-		MetricsPollDelayMinutes: intEnv("CHANNELOPS_METRICS_POLL_DELAY_MINUTES", 60),
+		DatabaseURL:                  env("DATABASE_URL", "postgresql://vp:vp_secret@localhost:5435/videoprocess"),
+		YouTubeManagerURL:            env("YOUTUBE_MANAGER_URL", ""),
+		AutoFlowBaseURL:              env("AUTOFLOW_BASE_URL", "http://api:8080"),
+		AutoFlowTimeout:              time.Duration(floatEnv("AUTOFLOW_TIMEOUT_SECONDS", 10) * float64(time.Second)),
+		PDSEnabled:                   boolEnv("PDS_ENABLED", false),
+		PDSBaseURL:                   env("PDS_BASE_URL", "http://pds:8080"),
+		PDSClientID:                  env("PDS_CLIENT_ID", "videoprocess-channel-agent"),
+		PDSTimeout:                   time.Duration(floatEnv("PDS_TIMEOUT_SECONDS", 0.5) * float64(time.Second)),
+		DevAllowAllPDS:               boolEnv("CHANNEL_AGENT_DEV_ALLOW_ALL_PDS", false),
+		RunnerPollSeconds:            intEnv("CHANNELOPS_RUNNER_POLL_SECONDS", 5),
+		SchedulerPollSeconds:         intEnv("CHANNELOPS_SCHEDULER_POLL_SECONDS", 60),
+		HealthPort:                   intEnv("CHANNELOPS_HEALTH_PORT", 8080),
+		ThrottleEnabled:              boolEnv("CHANNELOPS_THROTTLE_ENABLED", false),
+		ThrottleTimeZone:             env("CHANNELOPS_THROTTLE_TIME_ZONE", "America/Los_Angeles"),
+		ThrottleStartHour:            intEnv("CHANNELOPS_THROTTLE_START_HOUR", 8),
+		ThrottleEndHour:              intEnv("CHANNELOPS_THROTTLE_END_HOUR", 24),
+		ThrottleRunnerPollSeconds:    intEnv("CHANNELOPS_THROTTLE_RUNNER_POLL_SECONDS", 300),
+		ThrottleSchedulerPollSeconds: intEnv("CHANNELOPS_THROTTLE_SCHEDULER_POLL_SECONDS", 1800),
+		SlackWebhookURL:              env("CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL", ""),
+		AlertEmailTo:                 env("CHANNEL_AGENT_ALERT_EMAIL_TO", ""),
+		LiveMode:                     boolEnv("CHANNELOPS_LIVE_MODE", true),
+		MaxQueueAttempts:             intEnv("CHANNELOPS_QUEUE_MAX_ATTEMPTS", 3),
+		MetricsPollMaxAttempts:       intEnv("CHANNELOPS_METRICS_MAX_POLLS", 24),
+		MetricsPollDelayMinutes:      intEnv("CHANNELOPS_METRICS_POLL_DELAY_MINUTES", 60),
+		RetentionQueueDays:           intEnv("CHANNELOPS_RETENTION_QUEUE_DAYS", 30),
+		RetentionAuditDays:           intEnv("CHANNELOPS_RETENTION_AUDIT_DAYS", 90),
+		RetentionFeedbackDays:        intEnv("CHANNELOPS_RETENTION_FEEDBACK_DAYS", 365),
 	}
 }
 
@@ -72,6 +92,29 @@ func (c Config) Validate() error {
 	if c.SchedulerPollSeconds <= 0 {
 		return errors.New("CHANNELOPS_SCHEDULER_POLL_SECONDS must be positive")
 	}
+	if c.HealthPort <= 0 {
+		return errors.New("CHANNELOPS_HEALTH_PORT must be positive")
+	}
+	if c.ThrottleEnabled {
+		if _, err := time.LoadLocation(c.ThrottleTimeZone); err != nil {
+			return errors.New("CHANNELOPS_THROTTLE_TIME_ZONE must be a valid IANA time zone")
+		}
+		if c.ThrottleStartHour < 0 || c.ThrottleStartHour > 23 {
+			return errors.New("CHANNELOPS_THROTTLE_START_HOUR must be between 0 and 23")
+		}
+		if c.ThrottleEndHour < 1 || c.ThrottleEndHour > 24 {
+			return errors.New("CHANNELOPS_THROTTLE_END_HOUR must be between 1 and 24")
+		}
+		if c.ThrottleStartHour >= c.ThrottleEndHour {
+			return errors.New("CHANNELOPS_THROTTLE_START_HOUR must be before CHANNELOPS_THROTTLE_END_HOUR")
+		}
+		if c.ThrottleRunnerPollSeconds <= 0 {
+			return errors.New("CHANNELOPS_THROTTLE_RUNNER_POLL_SECONDS must be positive")
+		}
+		if c.ThrottleSchedulerPollSeconds <= 0 {
+			return errors.New("CHANNELOPS_THROTTLE_SCHEDULER_POLL_SECONDS must be positive")
+		}
+	}
 	if c.MaxQueueAttempts <= 0 {
 		return errors.New("CHANNELOPS_QUEUE_MAX_ATTEMPTS must be positive")
 	}
@@ -81,7 +124,42 @@ func (c Config) Validate() error {
 	if c.MetricsPollDelayMinutes <= 0 {
 		return errors.New("CHANNELOPS_METRICS_POLL_DELAY_MINUTES must be positive")
 	}
+	if c.RetentionQueueDays <= 0 {
+		return errors.New("CHANNELOPS_RETENTION_QUEUE_DAYS must be positive")
+	}
+	if c.RetentionAuditDays <= 0 {
+		return errors.New("CHANNELOPS_RETENTION_AUDIT_DAYS must be positive")
+	}
+	if c.RetentionFeedbackDays <= 0 {
+		return errors.New("CHANNELOPS_RETENTION_FEEDBACK_DAYS must be positive")
+	}
 	return nil
+}
+
+func (c Config) EffectiveRunnerPollSeconds(now time.Time) int {
+	if c.throttleActiveAt(now) {
+		return c.ThrottleRunnerPollSeconds
+	}
+	return c.RunnerPollSeconds
+}
+
+func (c Config) EffectiveSchedulerPollSeconds(now time.Time) int {
+	if c.throttleActiveAt(now) {
+		return c.ThrottleSchedulerPollSeconds
+	}
+	return c.SchedulerPollSeconds
+}
+
+func (c Config) throttleActiveAt(now time.Time) bool {
+	if !c.ThrottleEnabled {
+		return false
+	}
+	loc, err := time.LoadLocation(c.ThrottleTimeZone)
+	if err != nil {
+		return false
+	}
+	hour := now.In(loc).Hour()
+	return hour >= c.ThrottleStartHour && hour < c.ThrottleEndHour
 }
 
 func metricsPollDelay(c Config) time.Duration {

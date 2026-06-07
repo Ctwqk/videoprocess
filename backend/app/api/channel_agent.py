@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func, select
@@ -20,6 +21,7 @@ from app.channel_agent.constants import (
     TASK_UPLOADED_PRIVATE,
 )
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
+from app.config import settings
 from app.db import get_db
 from app.models.channel_agent import (
     AgentTickAudit,
@@ -468,9 +470,26 @@ async def channel_learning(channel_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/channels/{channel_id}/learning/recompute")
-async def recompute_learning(channel_id: str, db: AsyncSession = Depends(get_db)):
+async def recompute_learning(channel_id: str, window_days: int = 7, db: AsyncSession = Depends(get_db)):
     channel = await _require_channel(db, channel_id)
-    return {"channel_id": str(channel.id), "recomputed": True}
+    return await _trigger_runner_learning_recompute(str(channel.id), window_days=window_days)
+
+
+async def _trigger_runner_learning_recompute(channel_id: str, window_days: int = 7) -> dict[str, Any]:
+    base_url = settings.channelops_runner_admin_url.rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{base_url}/internal/learning/recompute",
+                params={"channel_id": channel_id, "window_days": window_days},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"ChannelOps runner learning recompute failed: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="ChannelOps runner learning recompute returned a non-object response")
+    return payload
 
 
 @router.get("/channels/{channel_id}/publications")

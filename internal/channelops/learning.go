@@ -3,6 +3,7 @@ package channelops
 import (
 	"context"
 	"math"
+	"strconv"
 )
 
 type LearningStateInput struct {
@@ -26,6 +27,56 @@ func LearningRecommendation(sampleCount int, avgReward float64) map[string]any {
 		}
 	}
 	return map[string]any{"action": action, "sample_count": sampleCount, "avg_reward": avgReward}
+}
+
+func learningRecomputeWindows(value any) []int {
+	windows := []int{}
+	appendWindow := func(raw any) {
+		window := intFromAny(raw)
+		if window > 0 {
+			windows = append(windows, window)
+		}
+	}
+	switch typed := value.(type) {
+	case nil:
+	case []int:
+		for _, item := range typed {
+			appendWindow(item)
+		}
+	case []any:
+		for _, item := range typed {
+			appendWindow(item)
+		}
+	default:
+		appendWindow(typed)
+	}
+	if len(windows) == 0 {
+		return []int{7, 30}
+	}
+	return windows
+}
+
+func intFromAny(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case float32:
+		return int(typed)
+	case string:
+		parsed, err := strconv.Atoi(typed)
+		if err != nil {
+			return 0
+		}
+		return parsed
+	default:
+		return 0
+	}
 }
 
 func (s *Store) RecomputeLearningState(ctx context.Context, channelID string, windowDays int) error {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -29,8 +30,18 @@ func main() {
 	}
 	defer runner.Close()
 
-	slog.Info("starting channelops-runner-go")
-	if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- channelops.RunHTTPServer(ctx, fmt.Sprintf(":%d", cfg.HealthPort), channelops.NewRunnerHTTPHandler(runner))
+	}()
+	go func() {
+		errCh <- runner.Run(ctx)
+	}()
+
+	slog.Info("starting channelops-runner-go", "health_port", cfg.HealthPort)
+	err = <-errCh
+	cancel()
+	if err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("channelops-runner-go stopped", "error", err)
 		os.Exit(1)
 	}

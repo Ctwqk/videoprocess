@@ -12,6 +12,9 @@ const (
 	QueueReconcilePublication = "reconcile_publication"
 	QueueCollectMetrics       = "collect_metrics"
 	QueueAccountHealth        = "account_health"
+	QueueSendAlert            = "send_alert"
+	QueueCleanupExpired       = "cleanup_expired"
+	QueueLearningRecompute    = "learning_recompute"
 
 	QueueStatusQueued       = "queued"
 	QueueStatusRunning      = "running"

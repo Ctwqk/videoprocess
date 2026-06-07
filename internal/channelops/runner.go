@@ -3,6 +3,7 @@ package channelops
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -11,6 +12,7 @@ type Runner struct {
 	Store            *Store
 	Scheduler        Scheduler
 	Handlers         HandlerService
+	schedulerMu      sync.RWMutex
 	lastSchedulerRun time.Time
 }
 
@@ -48,17 +50,17 @@ func newRunnerHandlerService(st *Store, cfg Config, pdsOverride ...PDSDecider) H
 	}
 	youtube := YouTubeManagerClient{BaseURL: cfg.YouTubeManagerURL, Timeout: 20 * time.Second}
 	autoflow := HTTPAutoFlowClient{BaseURL: cfg.AutoFlowBaseURL, Timeout: cfg.AutoFlowTimeout}
-	return HandlerService{Store: st, PDS: pds, AutoFlow: autoflow, YouTube: youtube, Config: cfg}
+	return HandlerService{Store: st, PDS: pds, AutoFlow: autoflow, YouTube: youtube, Alerts: NewAlertSink(cfg), Config: cfg}
 }
 
 func (r *Runner) Run(ctx context.Context) error {
-	ticker := time.NewTicker(time.Duration(r.Config.RunnerPollSeconds) * time.Second)
-	defer ticker.Stop()
 	for {
+		timer := time.NewTimer(time.Duration(r.Config.EffectiveRunnerPollSeconds(r.now())) * time.Second)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 			if err := r.runOnce(ctx); err != nil {
 				return err
 			}
@@ -71,9 +73,9 @@ func (r *Runner) runOnce(ctx context.Context) error {
 		return nil
 	}
 	now := r.Store.Now()
-	if r.Scheduler.Store != nil && ShouldRunScheduler(r.lastSchedulerRun, now, r.Config.SchedulerPollSeconds) {
+	if r.Scheduler.Store != nil && ShouldRunScheduler(r.LastSchedulerRun(), now, r.Config.EffectiveSchedulerPollSeconds(now)) {
 		_, _ = r.Scheduler.RunOnce(ctx, now)
-		r.lastSchedulerRun = now
+		r.SetLastSchedulerRun(now)
 	}
 	if err := r.Handlers.ReadinessError(); err != nil {
 		return err
@@ -103,6 +105,25 @@ func ShouldRunScheduler(lastRun time.Time, now time.Time, pollSeconds int) bool 
 		pollSeconds = 60
 	}
 	return !now.Before(lastRun.Add(time.Duration(pollSeconds) * time.Second))
+}
+
+func (r *Runner) now() time.Time {
+	if r.Store != nil && r.Store.Now != nil {
+		return r.Store.Now()
+	}
+	return time.Now().UTC()
+}
+
+func (r *Runner) LastSchedulerRun() time.Time {
+	r.schedulerMu.RLock()
+	defer r.schedulerMu.RUnlock()
+	return r.lastSchedulerRun
+}
+
+func (r *Runner) SetLastSchedulerRun(value time.Time) {
+	r.schedulerMu.Lock()
+	defer r.schedulerMu.Unlock()
+	r.lastSchedulerRun = value.UTC()
 }
 
 func (r *Runner) Close() {

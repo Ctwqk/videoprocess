@@ -56,6 +56,98 @@ func TestExistingExecutionRequiresRunAndJob(t *testing.T) {
 	}
 }
 
+func TestClaimableKindsIncludesOperationalQueueKinds(t *testing.T) {
+	handler := HandlerService{
+		Store:    &Store{},
+		PDS:      fakePDS{decision: PDSDecision{Verdict: "allow"}},
+		AutoFlow: fakeAutoFlow{},
+		YouTube:  fakeYouTube{},
+		Alerts:   &recordingAlertSink{},
+	}
+
+	kinds := handler.ClaimableKinds()
+
+	for _, want := range []string{QueueSendAlert, QueueCleanupExpired, QueueLearningRecompute} {
+		if !containsString(kinds, want) {
+			t.Fatalf("ClaimableKinds() = %#v, missing %s", kinds, want)
+		}
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestHandleLearningRecomputeRunsConfiguredWindows(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote.ID); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	collect.PayloadJSON["metrics"] = map[string]any{
+		"views":                 1000,
+		"likes":                 50,
+		"comments":              10,
+		"avg_view_duration_sec": 18.0,
+	}
+	if err := handler.HandleCollectMetrics(ctx, collect); err != nil {
+		t.Fatalf("HandleCollectMetrics: %v", err)
+	}
+
+	err := handler.HandleLearningRecompute(ctx, QueueItemRow{
+		Kind:        QueueLearningRecompute,
+		PayloadJSON: map[string]any{"channel_id": fixture.ChannelID, "window_days": []any{7.0, 30.0}},
+	})
+
+	if err != nil {
+		t.Fatalf("HandleLearningRecompute: %v", err)
+	}
+	var windows []int
+	rows, err := fixture.Store.Pool.Query(ctx, `
+		SELECT window_days
+		FROM learning_states
+		WHERE channel_profile_id = $1::uuid
+		ORDER BY window_days
+	`, fixture.ChannelID)
+	if err != nil {
+		t.Fatalf("query learning windows: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var window int
+		if err := rows.Scan(&window); err != nil {
+			t.Fatalf("scan window: %v", err)
+		}
+		windows = append(windows, window)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("learning windows rows: %v", err)
+	}
+	if !reflect.DeepEqual(windows, []int{7, 30}) {
+		t.Fatalf("learning windows = %#v, want [7 30]", windows)
+	}
+}
+
 func TestHandleAgentTickReadsSchedulerBucketPayload(t *testing.T) {
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)

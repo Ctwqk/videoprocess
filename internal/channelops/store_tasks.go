@@ -17,7 +17,17 @@ func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h 
 		return err
 	}
 	candidates := BuildTickCandidates(channel, lanes, accounts, seeds, signals, laneFormats, bucket)
+	alerts := []AlertPayload{}
+	evaluatedCandidates, pdsAlerts, err := evaluateTickCandidatePolicy(ctx, channel, candidates, h)
+	if err != nil {
+		return err
+	}
+	candidates = evaluatedCandidates
+	alerts = append(alerts, pdsAlerts...)
 	accepted, rejected := acceptedRejected(candidates)
+	if len(accepted) == 0 {
+		alerts = append(alerts, materialLowSupplyAlert(channelID, bucket, len(accepted), len(rejected)))
+	}
 	result := TickResult{DryRun: channel.DryRun, Accepted: accepted, Rejected: rejected}
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -43,6 +53,11 @@ func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h 
 	decisionAuditIDs, err := s.insertDecisionAuditEntries(ctx, tx, tickAuditID, channelID, result)
 	if err != nil {
 		return err
+	}
+	for _, alert := range alerts {
+		if _, err := s.enqueueAlert(ctx, tx, alert, 5, ""); err != nil {
+			return err
+		}
 	}
 	if channel.DryRun {
 		if err := tx.Commit(ctx); err != nil {
@@ -83,6 +98,50 @@ func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h 
 	}
 	committed = true
 	return nil
+}
+
+func evaluateTickCandidatePolicy(ctx context.Context, channel ChannelProfileRow, candidates []TickCandidate, h HandlerService) ([]TickCandidate, []AlertPayload, error) {
+	if h.PDS == nil {
+		return candidates, nil, nil
+	}
+	alerts := []AlertPayload{}
+	for i := range candidates {
+		candidate := &candidates[i]
+		if candidate.Rejected || candidate.Account == nil {
+			continue
+		}
+		decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
+			ActorID:    candidate.Account.ID,
+			ActionType: "candidate_accept",
+			Platform:   "youtube",
+			Content: map[string]any{
+				"title":       candidate.TitleSeed,
+				"description": candidate.Prompt,
+			},
+			Context: map[string]any{
+				"channel_profile_id": channel.ID,
+				"candidate_id":       candidate.CandidateID,
+				"source_kind":        candidate.SourceKind,
+				"topic_lane_id":      candidateLaneID(*candidate),
+				"lane_format_id":     candidateFormatID(*candidate),
+			},
+		})
+		if err != nil {
+			return candidates, nil, err
+		}
+		candidate.PDSDecisionJSON = pdsDecisionAuditJSON(decision)
+		if alert, ok := maybePDSOutageAlert(decision, channel.ID, candidate.CandidateID, "candidate_accept"); ok {
+			alerts = append(alerts, alert)
+		}
+		switch decision.Verdict {
+		case "", "allow":
+		case "block":
+			rejectCandidate(candidate, "pds_blocked", "PDS blocked candidate acceptance.")
+		default:
+			rejectCandidate(candidate, "pds_flagged_for_review", "PDS flagged candidate acceptance for review.")
+		}
+	}
+	return candidates, alerts, nil
 }
 
 func (s *Store) GetProductionTask(ctx context.Context, taskID string) (ProductionTaskRow, error) {

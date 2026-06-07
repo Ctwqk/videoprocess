@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+import app.api.channel_agent as channel_agent_api
 from app.api.channel_agent import router
 from app.db import get_db
 from app.models.channel_agent import (
@@ -281,7 +282,15 @@ async def test_decisions_failures_task_audit_and_learning_api(api_session):
 
 
 @pytest.mark.asyncio
-async def test_learning_recompute_endpoint_is_present(api_session):
+async def test_learning_recompute_endpoint_triggers_runner_admin(api_session, monkeypatch):
+    calls: list[tuple[str, int]] = []
+
+    async def fake_trigger(channel_id: str, window_days: int = 7):
+        calls.append((channel_id, window_days))
+        return {"channel_id": channel_id, "window_days": window_days, "recomputed": True}
+
+    monkeypatch.setattr(channel_agent_api, "_trigger_runner_learning_recompute", fake_trigger)
+
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
         channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Learn"})).json()
 
@@ -290,6 +299,7 @@ async def test_learning_recompute_endpoint_is_present(api_session):
         assert response.status_code == 200
         assert response.json()["channel_id"] == channel["id"]
         assert response.json()["recomputed"] is True
+        assert calls == [(channel["id"], 7)]
 
 
 @pytest.mark.asyncio

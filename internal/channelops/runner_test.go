@@ -62,6 +62,9 @@ func TestNewRunnerHandlerServiceConfiguresAutoFlowClient(t *testing.T) {
 	if handler.AutoFlow == nil {
 		t.Fatal("AutoFlow client is nil")
 	}
+	if handler.Alerts == nil {
+		t.Fatal("Alerts sink is nil")
+	}
 	if err := handler.ReadinessError(); err != nil {
 		t.Fatalf("ReadinessError returned error: %v", err)
 	}
@@ -78,6 +81,32 @@ func TestShouldRunSchedulerHonorsPollSeconds(t *testing.T) {
 	}
 	if !ShouldRunScheduler(time.Time{}, lastRun, 60) {
 		t.Fatal("scheduler should run when it has not run yet")
+	}
+}
+
+func TestConfigEffectivePollSecondsUsesDaytimeThrottleWindow(t *testing.T) {
+	cfg := validConfig()
+	cfg.ThrottleEnabled = true
+	cfg.ThrottleTimeZone = "America/Los_Angeles"
+	cfg.ThrottleStartHour = 8
+	cfg.ThrottleEndHour = 24
+	cfg.ThrottleRunnerPollSeconds = 300
+	cfg.ThrottleSchedulerPollSeconds = 1800
+
+	daytimePacific := time.Date(2026, 6, 7, 17, 0, 0, 0, time.UTC) // 10:00 PDT
+	if got := cfg.EffectiveRunnerPollSeconds(daytimePacific); got != 300 {
+		t.Fatalf("daytime runner poll = %d, want 300", got)
+	}
+	if got := cfg.EffectiveSchedulerPollSeconds(daytimePacific); got != 1800 {
+		t.Fatalf("daytime scheduler poll = %d, want 1800", got)
+	}
+
+	overnightPacific := time.Date(2026, 6, 7, 8, 0, 0, 0, time.UTC) // 01:00 PDT
+	if got := cfg.EffectiveRunnerPollSeconds(overnightPacific); got != 5 {
+		t.Fatalf("overnight runner poll = %d, want 5", got)
+	}
+	if got := cfg.EffectiveSchedulerPollSeconds(overnightPacific); got != 60 {
+		t.Fatalf("overnight scheduler poll = %d, want 60", got)
 	}
 }
 

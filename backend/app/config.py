@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     channel_agent_retention_queue_days: int = 30
     channel_agent_retention_audit_days: int = 90
     channel_agent_retention_feedback_days: int = 365
+    channelops_runner_admin_url: str = "http://channelops-runner-go:8080"
 
     # Policy Decision Service
     pds_enabled: bool = False

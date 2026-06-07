@@ -110,6 +110,41 @@ func TestPromotePublicationUsesConfiguredMetricsDelay(t *testing.T) {
 	}
 }
 
+func TestPublishTaskEnqueuesQuotaLowAlert(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	publish := fixture.ProcessUntilQueueKind(ctx, handler, QueuePublishTask)
+	handler.YouTube = fakeLowQuotaYouTube{fakeYouTube{}}
+
+	if err := handler.HandlePublishTask(ctx, publish); err != nil {
+		t.Fatalf("HandlePublishTask: %v", err)
+	}
+
+	var alertKind string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT payload_json ->> 'kind'
+		FROM channel_ops_queue_items
+		WHERE kind = $1
+		  AND channel_profile_id = $2::uuid
+		  AND payload_json ->> 'kind' = 'quota_low'
+	`, QueueSendAlert, fixture.ChannelID).Scan(&alertKind); err != nil {
+		t.Fatalf("select quota alert: %v", err)
+	}
+	if alertKind != "quota_low" {
+		t.Fatalf("quota alert kind = %q", alertKind)
+	}
+}
+
 func TestCollectMetricsRequeueUsesConfiguredDelay(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -366,6 +401,19 @@ func TestPublicationYouTubeStatusFailureCategoryPersists(t *testing.T) {
 	if task.FailureCategory == nil || *task.FailureCategory != FailureYouTubeStatus {
 		t.Fatalf("youtube status task failure category = %#v, want %q", task.FailureCategory, FailureYouTubeStatus)
 	}
+	var alertKind string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT payload_json ->> 'kind'
+		FROM channel_ops_queue_items
+		WHERE kind = $1
+		  AND channel_profile_id = $2::uuid
+		  AND payload_json ->> 'kind' = 'platform_rejected'
+	`, QueueSendAlert, fixture.ChannelID).Scan(&alertKind); err != nil {
+		t.Fatalf("select platform alert: %v", err)
+	}
+	if alertKind != "platform_rejected" {
+		t.Fatalf("platform alert kind = %q", alertKind)
+	}
 }
 
 func TestRunTickWritesDecisionAuditDryRunWithoutTasks(t *testing.T) {
@@ -495,8 +543,47 @@ func TestRunTickBackfillsDecisionAuditCreatedTaskID(t *testing.T) {
 	if score["source_kind"] != SourceLaneSeed {
 		t.Fatalf("score_json source_kind = %#v, want %q", score["source_kind"], SourceLaneSeed)
 	}
-	decodeDecisionAuditObject(t, "pds_decision_json", row.PDSDecisionJSON)
+	pdsDecision := decodeDecisionAuditObject(t, "pds_decision_json", row.PDSDecisionJSON)
+	if pdsDecision["verdict"] != "allow" || pdsDecision["decision_id"] != "allow" {
+		t.Fatalf("pds_decision_json = %#v, want verdict and decision_id", pdsDecision)
+	}
 	decodeDecisionAuditObject(t, "learning_context_json", row.LearningContextJSON)
+}
+
+func TestRunTickEnqueuesPDSOutageAlertWhenCandidateDecisionUsesFailPolicy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{
+		Verdict: "allow",
+		Metadata: map[string]any{
+			"warning":     "pds_unavailable",
+			"fail_policy": "allow",
+		},
+	})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+
+	var alertKind string
+	var severity string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT payload_json ->> 'kind', payload_json ->> 'severity'
+		FROM channel_ops_queue_items
+		WHERE channel_profile_id = $1::uuid
+		  AND kind = $2
+		  AND payload_json ->> 'kind' = 'pds_outage'
+	`, fixture.ChannelID, QueueSendAlert).Scan(&alertKind, &severity); err != nil {
+		t.Fatalf("select pds outage alert: %v", err)
+	}
+	if alertKind != "pds_outage" || severity != "warning" {
+		t.Fatalf("alert kind/severity = %s/%s", alertKind, severity)
+	}
 }
 
 func TestRunTickConvertsDiscoverySignalCandidate(t *testing.T) {
@@ -1181,6 +1268,14 @@ type fakeNoMetricsYouTube struct {
 
 func (fakeNoMetricsYouTube) FetchMetrics(ctx context.Context, videoID string) (map[string]any, error) {
 	return map[string]any{}, nil
+}
+
+type fakeLowQuotaYouTube struct {
+	fakeYouTube
+}
+
+func (fakeLowQuotaYouTube) AccountHealth(ctx context.Context, accountID string) (YouTubeAccountHealth, error) {
+	return YouTubeAccountHealth{Authenticated: true, QuotaRemaining: 1200, Raw: map[string]any{"quota": "low"}}, nil
 }
 
 type fakeSevereStatusYouTube struct {

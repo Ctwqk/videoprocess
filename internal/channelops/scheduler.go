@@ -41,6 +41,14 @@ func TickIdempotencyKey(channelID string, bucket string) string {
 	return fmt.Sprintf("agent_tick:%s:%s", channelID, bucket)
 }
 
+func CleanupIdempotencyKey(day string) string {
+	return fmt.Sprintf("cleanup_expired:%s", day)
+}
+
+func LearningRecomputeIdempotencyKey(channelID string, bucket string) string {
+	return fmt.Sprintf("learning_recompute:%s:%s", channelID, bucket)
+}
+
 type Scheduler struct {
 	Store *Store
 }
@@ -78,7 +86,42 @@ func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 		}
 		enqueued++
 	}
+	if err := s.enqueueOperationalMaintenance(ctx, channels, now); err != nil {
+		return enqueued, err
+	}
 	return enqueued, nil
+}
+
+func (s Scheduler) enqueueOperationalMaintenance(ctx context.Context, channels []ChannelProfileRow, now time.Time) error {
+	if s.Store == nil {
+		return nil
+	}
+	day := now.UTC().Format("2006-01-02")
+	if _, err := s.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueCleanupExpired,
+		IdempotencyKey: CleanupIdempotencyKey(day),
+		Payload:        map[string]any{"day": day},
+		Priority:       200,
+	}); err != nil {
+		return err
+	}
+	bucket := SchedulerBucket(now, 360)
+	for _, channel := range channels {
+		if !ChannelDueForTick(channel, now) {
+			continue
+		}
+		channelID := channel.ID
+		if _, err := s.Store.Enqueue(ctx, EnqueueOptions{
+			Kind:             QueueLearningRecompute,
+			IdempotencyKey:   LearningRecomputeIdempotencyKey(channel.ID, bucket),
+			Payload:          map[string]any{"channel_id": channel.ID, "bucket": bucket, "window_days": []int{7, 30}},
+			Priority:         180,
+			ChannelProfileID: &channelID,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]ChannelProfileRow, error) {

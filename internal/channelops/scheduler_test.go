@@ -110,3 +110,34 @@ func TestSchedulerRunOnceDoesNotRepeatSameFourHourBucket(t *testing.T) {
 		t.Fatalf("RunOnce second same 4h bucket = %d, %v", got, err)
 	}
 }
+
+func TestSchedulerRunOnceEnqueuesOperationalMaintenance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	scheduler := Scheduler{Store: fixture.Store}
+	now := time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC)
+
+	if _, err := scheduler.RunOnce(ctx, now); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	for _, want := range []string{QueueCleanupExpired, QueueLearningRecompute} {
+		var count int
+		if err := fixture.Store.Pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM channel_ops_queue_items
+			WHERE kind = $1
+		`, want).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", want, err)
+		}
+		if count != 1 {
+			t.Fatalf("%s queue count = %d, want 1", want, count)
+		}
+	}
+}

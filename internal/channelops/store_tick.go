@@ -389,7 +389,10 @@ func (s *Store) insertDecisionAuditEntries(ctx context.Context, db dbExecutor, t
 		if err != nil {
 			return nil, err
 		}
-		pdsJSON := []byte("{}")
+		pdsJSON, err := json.Marshal(jsonObject(candidate.PDSDecisionJSON))
+		if err != nil {
+			return nil, err
+		}
 		var id string
 		err = db.QueryRow(ctx, `
 			INSERT INTO decision_audit_entries (

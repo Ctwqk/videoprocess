@@ -17,6 +17,7 @@ type HandlerService struct {
 	PDS      PDSDecider
 	AutoFlow AutoFlowClient
 	YouTube  YouTubeClient
+	Alerts   AlertSink
 	Config   Config
 }
 
@@ -71,6 +72,9 @@ func (h HandlerService) ClaimableKinds() []string {
 		QueueReconcilePublication,
 		QueueCollectMetrics,
 		QueueAccountHealth,
+		QueueSendAlert,
+		QueueCleanupExpired,
+		QueueLearningRecompute,
 	}
 }
 
@@ -97,6 +101,12 @@ func (h HandlerService) Handle(ctx context.Context, item QueueItemRow) error {
 		return h.HandleCollectMetrics(ctx, item)
 	case QueueAccountHealth:
 		return h.HandleAccountHealth(ctx, item)
+	case QueueSendAlert:
+		return h.HandleSendAlert(ctx, item)
+	case QueueCleanupExpired:
+		return h.HandleCleanupExpired(ctx, item)
+	case QueueLearningRecompute:
+		return h.HandleLearningRecompute(ctx, item)
 	default:
 		return fmt.Errorf("unknown ChannelOps queue kind: %s", item.Kind)
 	}
@@ -148,6 +158,11 @@ func (h HandlerService) HandlePlanTask(ctx context.Context, item QueueItemRow) e
 	})
 	if err != nil {
 		return err
+	}
+	if alert, ok := maybePDSOutageAlert(decision, task.ChannelProfileID, task.ID, "plan_approval"); ok {
+		if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+			return err
+		}
 	}
 	result := PlanDecisionResult(decision)
 	if !result.EnqueueExecute {
@@ -260,6 +275,16 @@ func (h HandlerService) HandlePublishTask(ctx context.Context, item QueueItemRow
 	if err != nil {
 		return err
 	}
+	if h.YouTube != nil {
+		health, err := h.YouTube.AccountHealth(ctx, task.TargetAccountID)
+		if err == nil {
+			if alert, ok := quotaLowAlert(task.ChannelProfileID, task.TargetAccountID, health.QuotaRemaining); ok {
+				if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
 		ActorID:    task.TargetAccountID,
 		ActionType: "publish",
@@ -272,6 +297,11 @@ func (h HandlerService) HandlePublishTask(ctx context.Context, item QueueItemRow
 	})
 	if err != nil {
 		return err
+	}
+	if alert, ok := maybePDSOutageAlert(decision, task.ChannelProfileID, task.ID, "publish"); ok {
+		if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+			return err
+		}
 	}
 	if decision.Verdict != "allow" {
 		guard := "pds_blocked"
@@ -327,6 +357,15 @@ func (h HandlerService) HandlePromotePublication(ctx context.Context, item Queue
 	if err != nil {
 		return err
 	}
+	channelID := ""
+	if task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID); err == nil {
+		channelID = task.ChannelProfileID
+	}
+	if alert, ok := maybePDSOutageAlert(decision, channelID, publication.ID, "publish"); ok {
+		if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+			return err
+		}
+	}
 	if decision.Verdict != "allow" {
 		guard := "pds_blocked"
 		if decision.Verdict == "flag" {
@@ -357,7 +396,15 @@ func (h HandlerService) HandleReconcilePublication(ctx context.Context, item Que
 		return err
 	}
 	if isSeverePublicationStatus(status.PublishStatus) {
-		return h.Store.MarkPublicationSevereDedup(ctx, publication, status, h.Store.Now())
+		if err := h.Store.MarkPublicationSevereDedup(ctx, publication, status, h.Store.Now()); err != nil {
+			return err
+		}
+		channelID := ""
+		if task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID); err == nil {
+			channelID = task.ChannelProfileID
+		}
+		_, err := h.Store.EnqueueAlert(ctx, platformRejectedAlert(publication, channelID, status), 5, item.ID)
+		return err
 	}
 	return h.Store.UpdatePublicationStatus(ctx, publication.ID, status)
 }
@@ -399,7 +446,55 @@ func (h HandlerService) HandleAccountHealth(ctx context.Context, item QueueItemR
 	if err != nil {
 		return err
 	}
+	channelID := ""
+	if account, err := h.Store.getPublishingAccount(ctx, accountID); err == nil {
+		channelID = account.ChannelProfileID
+	}
+	if alert, ok := quotaLowAlert(channelID, accountID, health.QuotaRemaining); ok {
+		if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+			return err
+		}
+	}
 	return h.Store.UpdateAccountHealth(ctx, accountID, health)
+}
+
+func (h HandlerService) HandleSendAlert(ctx context.Context, item QueueItemRow) error {
+	now := time.Now().UTC()
+	if h.Store != nil && h.Store.Now != nil {
+		now = h.Store.Now().UTC()
+	}
+	alert, err := parseAlertPayload(item.PayloadJSON, now)
+	if err != nil {
+		return err
+	}
+	sink := h.Alerts
+	if sink == nil {
+		sink = LogAlertSink{}
+	}
+	return sink.Send(ctx, alert)
+}
+
+func (h HandlerService) HandleCleanupExpired(ctx context.Context, item QueueItemRow) error {
+	cfg := RetentionConfig{
+		QueueDays:    positiveAnyInt(item.PayloadJSON["queue_days"], h.Config.RetentionQueueDays),
+		AuditDays:    positiveAnyInt(item.PayloadJSON["audit_days"], h.Config.RetentionAuditDays),
+		FeedbackDays: positiveAnyInt(item.PayloadJSON["feedback_days"], h.Config.RetentionFeedbackDays),
+	}
+	_, err := h.Store.CleanupExpired(ctx, h.Store.Now().UTC(), cfg)
+	return err
+}
+
+func (h HandlerService) HandleLearningRecompute(ctx context.Context, item QueueItemRow) error {
+	channelID := firstString(item.PayloadJSON, "channel_id")
+	if channelID == "" {
+		return errors.New("learning_recompute payload missing channel_id")
+	}
+	for _, windowDays := range learningRecomputeWindows(item.PayloadJSON["window_days"]) {
+		if err := h.Store.RecomputeLearningState(ctx, channelID, windowDays); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {

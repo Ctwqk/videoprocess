@@ -91,8 +91,35 @@ Relevant runner environment:
 - `CHANNEL_AGENT_DEV_ALLOW_ALL_PDS`
 - `CHANNELOPS_RUNNER_POLL_SECONDS`
 - `CHANNELOPS_SCHEDULER_POLL_SECONDS`
+- `CHANNELOPS_THROTTLE_ENABLED`
+- `CHANNELOPS_THROTTLE_TIME_ZONE`
+- `CHANNELOPS_THROTTLE_START_HOUR`
+- `CHANNELOPS_THROTTLE_END_HOUR`
+- `CHANNELOPS_THROTTLE_RUNNER_POLL_SECONDS`
+- `CHANNELOPS_THROTTLE_SCHEDULER_POLL_SECONDS`
 - `CHANNELOPS_QUEUE_MAX_ATTEMPTS`
 - `CHANNELOPS_METRICS_MAX_POLLS`
 - `CHANNELOPS_METRICS_POLL_DELAY_MINUTES`
 - `CHANNEL_AGENT_ALERT_SLACK_WEBHOOK_URL`
 - `CHANNEL_AGENT_ALERT_EMAIL_TO`
+
+## Low-Noise Production Trial
+
+For the 10.0.0.150 shared-infra path, enable the daytime throttle during the
+West Coast 08:00-24:00 window so ChannelOps polls shared Postgres/Redis less
+often while people are using the machine:
+
+```bash
+PDS_ENABLED=true \
+CHANNELOPS_THROTTLE_ENABLED=true \
+CHANNELOPS_THROTTLE_TIME_ZONE=America/Los_Angeles \
+CHANNELOPS_THROTTLE_START_HOUR=8 \
+CHANNELOPS_THROTTLE_END_HOUR=24 \
+CHANNELOPS_THROTTLE_RUNNER_POLL_SECONDS=300 \
+CHANNELOPS_THROTTLE_SCHEDULER_POLL_SECONDS=1800 \
+CHANNELOPS_METRICS_POLL_DELAY_MINUTES=120 \
+docker compose --profile channelops-go up -d channelops-runner-go
+```
+
+Keep the trial channel at low cadence, with YouTube privacy `unlisted` or
+`private`, and do not run the legacy Python runner concurrently.
