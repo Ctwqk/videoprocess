@@ -756,6 +756,9 @@ async def preview_material_search(db: AsyncSession, request) -> tuple[MaterialQu
     try:
         content_hits = await _qdrant_search("content", query_embedding, request.source_library_ids, request.top_k)
         subtitle_hits = await _qdrant_search("subtitle", query_embedding, request.source_library_ids, request.top_k)
+        if not content_hits and not subtitle_hits:
+            content_hits = await _fallback_db_search(db, request.query, request.source_library_ids, request.top_k)
+            subtitle_hits = []
     except Exception:
         content_hits = await _fallback_db_search(db, request.query, request.source_library_ids, request.top_k)
         subtitle_hits = []

@@ -7,6 +7,8 @@ from app.autoflow.material_selector import CandidateSelectionResult, MaterialSel
 from app.autoflow.search_service import ExternalSearchResult, SearchService
 from app.autoflow.service import AutoFlowService
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent, AutoFlowRequest
+from app.schemas.material import MaterialSearchRequest
+from app.services import material_service
 
 
 VALID_LIBRARY_ID = "00000000-0000-0000-0000-000000000101"
@@ -384,6 +386,75 @@ async def test_search_material_falls_back_to_preview_asset_when_materialization_
     assert candidates[0].asset_id == "source-asset-1"
     assert candidates[0].metadata["subtitle"] == "preview subtitle"
     assert candidates[0].metadata["visual"] == {"objects": ["cat"]}
+
+
+@pytest.mark.asyncio
+async def test_preview_material_search_falls_back_to_db_when_qdrant_has_no_hits(monkeypatch):
+    fallback_calls = []
+
+    class FakeDB:
+        def add(self, row):
+            self.row = row
+
+        async def flush(self):
+            pass
+
+        async def commit(self):
+            pass
+
+        async def refresh(self, row):
+            pass
+
+    async def fake_embed_texts(texts):
+        return [[0.1, 0.2]]
+
+    async def fake_qdrant_search(vector_name, query_embedding, source_library_ids, limit):
+        return []
+
+    async def fake_fallback_db_search(db, query, source_library_ids, limit):
+        fallback_calls.append((query, source_library_ids, limit))
+        return [
+            {
+                "id": "clip-point-1",
+                "score": 0.9,
+                "payload": {
+                    "library_id": VALID_LIBRARY_ID,
+                    "source_asset_id": "00000000-0000-0000-0000-000000000201",
+                    "clip_id": "clip-1",
+                    "start_sec": 0.0,
+                    "end_sec": 4.0,
+                    "subtitle_text": "cat jump",
+                    "neighbor_clip_ids": [],
+                    "metadata": {"visual": {"objects": ["cat"]}},
+                },
+            }
+        ]
+
+    async def fake_lighthouse_rerank(query, windows, top_m):
+        return windows[:top_m]
+
+    async def fake_univtg_refine(query, window, min_duration, max_duration):
+        return window.start_sec, window.end_sec, 0.8
+
+    monkeypatch.setattr(material_service, "_embed_texts", fake_embed_texts)
+    monkeypatch.setattr(material_service, "_qdrant_search", fake_qdrant_search)
+    monkeypatch.setattr(material_service, "_fallback_db_search", fake_fallback_db_search)
+    monkeypatch.setattr(material_service, "_lighthouse_rerank", fake_lighthouse_rerank)
+    monkeypatch.setattr(material_service, "_univtg_refine", fake_univtg_refine)
+
+    _query, results = await material_service.preview_material_search(
+        FakeDB(),
+        MaterialSearchRequest(
+            query="cat jump",
+            source_library_ids=[VALID_LIBRARY_ID],
+            result_library_ids=[VALID_LIBRARY_ID],
+            top_k=2,
+        ),
+    )
+
+    assert fallback_calls == [("cat jump", [VALID_LIBRARY_ID], 2)]
+    assert results[0]["source_asset_id"] == "00000000-0000-0000-0000-000000000201"
+    assert results[0]["metadata"]["visual"] == {"objects": ["cat"]}
 
 
 @pytest.mark.asyncio
