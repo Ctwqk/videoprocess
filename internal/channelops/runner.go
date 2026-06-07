@@ -54,6 +54,12 @@ func newRunnerHandlerService(st *Store, cfg Config, pdsOverride ...PDSDecider) H
 }
 
 func (r *Runner) Run(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := r.runOnce(ctx); err != nil {
+		return err
+	}
 	for {
 		timer := time.NewTimer(time.Duration(r.Config.EffectiveRunnerPollSeconds(r.now())) * time.Second)
 		select {

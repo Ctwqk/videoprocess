@@ -29,6 +29,28 @@ func TestRunnerHealthCheckRejectsStaleSchedulerRun(t *testing.T) {
 	}
 }
 
+func TestRunnerHealthCheckUsesThrottledSchedulerStaleness(t *testing.T) {
+	now := time.Date(2026, 6, 7, 17, 20, 0, 0, time.UTC) // 10:20 PDT
+	runner := &Runner{
+		Config: Config{
+			SchedulerPollSeconds:         60,
+			ThrottleEnabled:              true,
+			ThrottleTimeZone:             "America/Los_Angeles",
+			ThrottleStartHour:            8,
+			ThrottleEndHour:              24,
+			ThrottleSchedulerPollSeconds: 1800,
+		},
+		Store: &Store{Now: func() time.Time { return now }},
+	}
+	runner.SetLastSchedulerRun(now.Add(-20 * time.Minute))
+
+	status := runner.HealthCheck(context.Background())
+
+	if _, ok := status.Errors["scheduler"]; ok {
+		t.Fatalf("scheduler health error = %q, want no scheduler error during throttled window", status.Errors["scheduler"])
+	}
+}
+
 func TestHealthHandlerReturns503WhenUnhealthy(t *testing.T) {
 	checker := healthCheckerFunc(func(ctx context.Context) HealthStatus {
 		return HealthStatus{Status: "unhealthy", DB: "ok", Errors: map[string]string{"scheduler": "stale"}}

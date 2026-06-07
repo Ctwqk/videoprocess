@@ -45,7 +45,7 @@ func (r *Runner) HealthCheck(ctx context.Context) HealthStatus {
 		last := lastRun.UTC()
 		status.LastSchedulerRun = &last
 	}
-	allowedStaleness := 2 * time.Duration(r.Config.SchedulerPollSeconds) * time.Second
+	allowedStaleness := 2 * time.Duration(r.Config.EffectiveSchedulerPollSeconds(now)) * time.Second
 	if allowedStaleness <= 0 {
 		allowedStaleness = 2 * time.Minute
 	}

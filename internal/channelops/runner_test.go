@@ -36,6 +36,33 @@ func TestRunnerRunWaitsForCancellation(t *testing.T) {
 	}
 }
 
+func TestRunnerRunPerformsInitialRunBeforeFirstSleep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := &Store{Now: func() time.Time {
+		return time.Date(2026, 6, 7, 17, 0, 0, 0, time.UTC)
+	}}
+	runner := &Runner{
+		Config:   Config{RunnerPollSeconds: 60},
+		Store:    store,
+		Handlers: HandlerService{Store: store, PDS: PDSClient{}},
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runner.Run(ctx)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "autoflow client is not configured") {
+			t.Fatalf("Run returned %v, want initial readiness error", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Run did not perform initial run before sleeping")
+	}
+}
+
 func TestRunnerRunOnceRejectsMissingHandlerDependencies(t *testing.T) {
 	store := &Store{Now: func() time.Time {
 		return time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC)
