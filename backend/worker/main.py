@@ -37,6 +37,9 @@ PEL_MIN_IDLE = int(os.environ.get("WORKER_PEL_MIN_IDLE_MS", "900000"))
 HEARTBEAT_INTERVAL = int(os.environ.get("WORKER_HEARTBEAT_INTERVAL_SECONDS", "15"))
 AFFINITY_WAIT_SECONDS = int(os.environ.get("WORKER_AFFINITY_WAIT_SECONDS", "20"))
 AFFINITY_MAX_BOUNCES = int(os.environ.get("WORKER_AFFINITY_MAX_BOUNCES", "6"))
+REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("WORKER_REDIS_CONNECT_TIMEOUT_SECONDS", "5"))
+REDIS_SOCKET_TIMEOUT_SECONDS = float(os.environ.get("WORKER_REDIS_SOCKET_TIMEOUT_SECONDS", "30"))
+REDIS_HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get("WORKER_REDIS_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
 
 # DB session for worker. Remote Mac workers can hold idle DB connections long
 # enough for the server/network to close them, so we proactively ping/recycle.
@@ -47,6 +50,16 @@ engine_db = create_async_engine(
     pool_recycle=300,
 )
 worker_session = async_sessionmaker(engine_db, expire_on_commit=False)
+
+
+def _redis() -> aioredis.Redis:
+    return aioredis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+        socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+        health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
+    )
 
 
 @dataclass(frozen=True)
@@ -265,7 +278,7 @@ async def process_task(data: dict) -> None:
 
 
 async def _report_success(job_id: str, node_execution_id: str, artifact_id: str) -> None:
-    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    r = _redis()
     try:
         await r.xadd(EVENT_STREAM, {
             "event": "node_completed",
@@ -278,7 +291,7 @@ async def _report_success(job_id: str, node_execution_id: str, artifact_id: str)
 
 
 async def _report_failure(job_id: str, node_execution_id: str, error: str) -> None:
-    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    r = _redis()
     try:
         await r.xadd(EVENT_STREAM, {
             "event": "node_failed",
@@ -448,7 +461,7 @@ async def _maybe_defer_for_affinity(r: aioredis.Redis, msg_id: str, data: dict) 
 
 async def main() -> None:
     """Main worker loop: consume tasks from Redis Stream."""
-    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    r = _redis()
 
     # Create consumer group
     try:
