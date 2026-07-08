@@ -86,6 +86,8 @@ class Settings(BaseSettings):
     minimax_max_qps: float = 2.0
 
     video_schedule_default_state: str = "OPEN"
+    startup_recovery_enabled: bool = True
+    event_listener_enabled: bool = True
 
     # Video worker features
     video_use_gpu: bool = False

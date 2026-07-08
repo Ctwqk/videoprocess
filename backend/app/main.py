@@ -109,18 +109,26 @@ async def _recover_stale_jobs():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(event_listener())
-    logger.info("Orchestrator event listener background task started")
+    task = None
+    if settings.event_listener_enabled:
+        task = asyncio.create_task(event_listener())
+        logger.info("Orchestrator event listener background task started")
+    else:
+        logger.info("Orchestrator event listener disabled by configuration")
 
-    await _recover_stale_jobs()
+    if settings.startup_recovery_enabled:
+        await _recover_stale_jobs()
+    else:
+        logger.info("Startup job recovery disabled by configuration")
 
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    logger.info("Orchestrator event listener stopped")
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Orchestrator event listener stopped")
 
 
 def create_app() -> FastAPI:
