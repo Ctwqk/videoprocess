@@ -277,6 +277,7 @@ git commit -m "feat: add worker admission guard"
 **Files:**
 - Modify: `backend/worker/main.py`
 - Modify: `docker-compose.yml`
+- Create: `backend/tests/worker/test_worker_startup.py`
 - Create: `tests/test_compose_worker_profiles.py`
 
 **Interfaces:**
@@ -378,6 +379,10 @@ async def main() -> None:
     r = _redis()
 ```
 
+Add startup-order tests that prove importing the module does not create the DB
+engine, admission runs before DB/Redis setup, and a denied worker exits before
+either dependency is touched.
+
 Modify final cleanup to handle the lazy engine:
 
 ```python
@@ -401,9 +406,26 @@ In `docker-compose.yml`, edit the `ffmpeg-worker` service:
     restart: unless-stopped
     environment:
       DEPLOY_MODE: ${DEPLOY_MODE:-local}
+      REDIS_URL: ${VP_REDIS_URL:-redis://host.docker.internal:6380/0}
+      WORKER_TYPE: ffmpeg
+      WORKER_HOST: ${FFMPEG_WORKER_HOST:-vp-local-python-worker}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-minio}
+      MINIO_ENDPOINT: ${VP_MINIO_ENDPOINT:-host.docker.internal:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${VP_MINIO_BUCKET:-videoprocess}
 ```
 
-Leave the rest of the service unchanged.
+The profile defaults must themselves pass `validate_worker_admission()`. Do
+not special-case `host.docker.internal` as local; unsafe environment overrides
+must continue to fail closed.
+
+Because `vision-worker` uses the same Python entrypoint and remains a default
+Compose service, give it an independent explicit identity as well:
+
+```yaml
+      WORKER_HOST: ${VISION_WORKER_HOST:-vp-vision-worker}
+```
 
 - [ ] **Step 5: Run focused tests**
 
@@ -411,7 +433,7 @@ Run:
 
 ```bash
 cd backend
-python3 -m pytest tests/worker/test_worker_admission.py -q
+python3 -m pytest tests/worker/test_worker_admission.py tests/worker/test_worker_startup.py -q
 cd ..
 python3 -m pytest tests/test_compose_worker_profiles.py -q
 ```

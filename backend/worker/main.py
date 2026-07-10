@@ -12,12 +12,20 @@ from datetime import datetime
 from pathlib import Path
 
 import redis.asyncio as aioredis
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.config import settings
 from app.models.artifact import Artifact, ArtifactKind
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.services.worker_admission import (
+    WorkerAdmissionError,
+    enforce_worker_admission_from_env,
+)
 from app.storage.manager import get_storage
 from worker.handlers import HANDLER_MAP
 from worker.handlers.base import CancelledError
@@ -41,15 +49,32 @@ REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("WORKER_REDIS_CONNEC
 REDIS_SOCKET_TIMEOUT_SECONDS = float(os.environ.get("WORKER_REDIS_SOCKET_TIMEOUT_SECONDS", "30"))
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get("WORKER_REDIS_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
 
-# DB session for worker. Remote Mac workers can hold idle DB connections long
-# enough for the server/network to close them, so we proactively ping/recycle.
-engine_db = create_async_engine(
-    settings.database_url,
-    echo=False,
-    pool_pre_ping=True,
-    pool_recycle=300,
-)
-worker_session = async_sessionmaker(engine_db, expire_on_commit=False)
+engine_db: AsyncEngine | None = None
+worker_session: async_sessionmaker[AsyncSession] | None = None
+
+
+def configure_worker_database() -> None:
+    """Initialize worker DB state only after startup admission succeeds."""
+    global engine_db, worker_session
+    if engine_db is not None and worker_session is not None:
+        return
+
+    # Remote workers can hold idle DB connections long enough for the
+    # server/network to close them, so proactively ping and recycle.
+    engine_db = create_async_engine(
+        settings.database_url,
+        echo=False,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
+    worker_session = async_sessionmaker(engine_db, expire_on_commit=False)
+
+
+def get_worker_session() -> async_sessionmaker[AsyncSession]:
+    if worker_session is None:
+        configure_worker_database()
+    assert worker_session is not None
+    return worker_session
 
 
 def _redis() -> aioredis.Redis:
@@ -73,7 +98,7 @@ class CancelState:
 
 async def _load_cancel_state(node_execution_id: str) -> CancelState:
     """Load node/job cancellation state for a worker task in a single DB session."""
-    async with worker_session() as db:
+    async with get_worker_session()() as db:
         ne = await db.get(NodeExecution, uuid.UUID(node_execution_id))
         if not ne:
             return CancelState(
@@ -138,7 +163,7 @@ async def process_task(data: dict) -> None:
         )
         return
 
-    async with worker_session() as db:
+    async with get_worker_session()() as db:
         ne = await db.get(NodeExecution, uuid.UUID(node_execution_id))
         if ne:
             ne.status = NodeStatus.RUNNING
@@ -169,7 +194,7 @@ async def process_task(data: dict) -> None:
     try:
         # Resolve input artifact paths to local file paths
         input_paths: dict[str, str] = {}
-        async with worker_session() as db:
+        async with get_worker_session()() as db:
             input_artifact_meta: dict[str, dict] = {}
             for port_name, artifact_id_str in input_artifacts_map.items():
                 artifact = await db.get(Artifact, uuid.UUID(artifact_id_str))
@@ -235,7 +260,7 @@ async def process_task(data: dict) -> None:
                 await output_storage.save(artifact_storage_path, f)
 
         # Create artifact record
-        async with worker_session() as db:
+        async with get_worker_session()() as db:
             artifact = Artifact(
                 job_id=uuid.UUID(job_id),
                 node_execution_id=uuid.UUID(node_execution_id),
@@ -461,6 +486,13 @@ async def _maybe_defer_for_affinity(r: aioredis.Redis, msg_id: str, data: dict) 
 
 async def main() -> None:
     """Main worker loop: consume tasks from Redis Stream."""
+    try:
+        enforce_worker_admission_from_env()
+    except WorkerAdmissionError as exc:
+        logger.critical("Worker admission denied: %s", exc)
+        raise SystemExit(2) from exc
+
+    configure_worker_database()
     r = _redis()
 
     # Create consumer group
@@ -519,7 +551,8 @@ async def main() -> None:
                 await asyncio.sleep(2)
     finally:
         await r.aclose()
-        await engine_db.dispose()
+        if engine_db is not None:
+            await engine_db.dispose()
 
 
 if __name__ == "__main__":

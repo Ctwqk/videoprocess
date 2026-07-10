@@ -62,7 +62,15 @@ clear fatal message and exits non-zero.
 
 The local Compose `ffmpeg-worker` service will be moved behind
 `profiles: ["local-python-worker"]` and will set `DEPLOY_MODE=local` by
-default. Developers can still opt in with:
+default. Its default Redis endpoint is `host.docker.internal`, which is
+intentionally classified as remote, so the profile will also provide an
+explicit `WORKER_HOST` and complete MinIO defaults. This lets the opt-in
+configuration satisfy the same production admission contract without adding a
+special Docker-host bypass. Environment overrides remain subject to the guard.
+The default Compose `vision-worker` shares this entrypoint, so it also receives
+its own explicit `WORKER_HOST` to preserve existing startup behavior.
+
+Developers can opt in with:
 
 ```bash
 docker compose --profile local-python-worker up ffmpeg-worker
@@ -90,8 +98,10 @@ Add unit tests for:
   allowed;
 - `DEPLOY_MODE=shared` is treated as production even with localhost Redis.
 
-Add a Compose safety test that parses `docker-compose.yml` and asserts
-`ffmpeg-worker` includes the `local-python-worker` profile.
+Add Compose safety tests that parse `docker-compose.yml`, assert
+`ffmpeg-worker` includes the `local-python-worker` profile, and prove its
+resolved default environment passes the worker admission validator. The same
+test covers `vision-worker` because it uses the guarded Python entrypoint.
 
 ## Rollout
 
