@@ -15,6 +15,8 @@ grep -Fq -- '--network-mode bridged' <<<"$plan"
 grep -Fq -- '--network-interface en1' <<<"$plan"
 grep -Fq '10.0.0.150:2377' <<<"$plan"
 grep -Fq 'vp.runtime=true' <<<"$plan"
+grep -Fq '*/5 * * * * /opt/homebrew/bin/colima start --profile swarmbridged' \
+  "$INSTALLER"
 if grep -Fq '10.0.0.126' <<<"$plan"; then
   echo 'FAIL: 126 must not appear in the VP node installer' >&2
   exit 1

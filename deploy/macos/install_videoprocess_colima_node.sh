@@ -10,6 +10,8 @@ PLIST_LABEL="com.constructure.vp-colima"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLIST_SOURCE="$SCRIPT_DIR/$PLIST_LABEL.plist"
 PLIST_TARGET="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+CRON_REBOOT='@reboot /opt/homebrew/bin/colima start --profile swarmbridged >> /Users/wenjieliu/Library/Logs/constructure/vp-colima-cron.log 2>&1'
+CRON_WATCHDOG='*/5 * * * * /opt/homebrew/bin/colima start --profile swarmbridged >> /Users/wenjieliu/Library/Logs/constructure/vp-colima-cron.log 2>&1'
 
 run() {
   if [[ "${VP_DRY_RUN:-false}" == "true" ]]; then
@@ -36,6 +38,29 @@ doctor() {
     return 1
   fi
   ssh -o BatchMode=yes -o ConnectTimeout=5 "$MANAGER_HOST" true
+}
+
+install_cron_fallback() {
+  local current
+  current="$(crontab -l 2>/dev/null || true)"
+  if grep -Fqx "$CRON_REBOOT" <<<"$current" \
+    && grep -Fqx "$CRON_WATCHDOG" <<<"$current"; then
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  if [[ -n "$current" ]]; then
+    printf '%s\n' "$current" >"$tmp"
+  fi
+  if ! grep -Fqx "$CRON_REBOOT" <<<"$current"; then
+    printf '%s\n' "$CRON_REBOOT" >>"$tmp"
+  fi
+  if ! grep -Fqx "$CRON_WATCHDOG" <<<"$current"; then
+    printf '%s\n' "$CRON_WATCHDOG" >>"$tmp"
+  fi
+  crontab "$tmp"
+  rm -f "$tmp"
 }
 
 install_node() {
@@ -72,7 +97,10 @@ install_node() {
   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/constructure"
   install -m 0644 "$PLIST_SOURCE" "$PLIST_TARGET"
   if ! launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_TARGET"
+    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_TARGET"; then
+      echo "GUI launchd domain unavailable; installing cron persistence fallback" >&2
+      install_cron_fallback
+    fi
   fi
 }
 
