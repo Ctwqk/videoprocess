@@ -2,7 +2,7 @@
 
 This file is the fast-entry summary for agents working in `VideoProcess`.
 
-Status date: 2026-07-10.
+Status date: 2026-07-11.
 
 ## Agent Quick View
 
@@ -36,8 +36,10 @@ Status date: 2026-07-10.
 
 - `vp-frontend-swarm`
 - `vp-api-swarm`
+- `vp-autoflow-api-swarm`
 - `vp-channel-agent-runner-swarm`
 - `vp-event-outbox-relay-swarm`
+- `vp-ffmpeg-worker-go-swarm`
 - `vp-pds-swarm`
 - `vp-feature-aggregator-swarm`
 - `arb-resolver-swarm` and `arb-validator-swarm` when the arb window is open
@@ -56,14 +58,15 @@ Host forwards:
 - Qdrant `10.0.0.150:6333/6334`
 - Redpanda host bridge `10.0.0.150:19092`, overlay `redpanda:9092`
 - Embedding gateway `http://10.0.0.150:8080`
-- GPU workers and browser/account infrastructure that remain 150-local
+- Managed Python FFmpeg worker (CPU fallback until Swarm GPU allocation is configured)
+- Browser/account infrastructure that remains 150-local
 
 ## Entry Points And Ports
 
 | Surface | URL / Port | Notes |
 | --- | --- | --- |
 | Frontend | `http://10.0.0.127:3001` | main user-facing entry |
-| API | `http://10.0.0.127:18080` | FastAPI control plane |
+| API | `http://10.0.0.127:18080` | Go control plane; AutoFlow Python services remain internal |
 | Node catalog smoke test | `http://10.0.0.127:18080/api/v1/node-types` | should return JSON list |
 | Redpanda | `redpanda:9092` on overlay, `10.0.0.150:19092` from host/LAN | PDS and aggregator event path |
 | Redis | `redis://10.0.0.150:6380` or overlay env | queues and scheduling state |
@@ -102,7 +105,7 @@ The normal scoped deployment command is:
 
 ```bash
 /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh \
-  --apply --project vp-app --project vp-feature-aggregator
+  --apply --project vp-app --project vp-feature-aggregator --project vp-pds
 ```
 
 The first deployment of a commit is run manually and verified. Only then may
@@ -124,7 +127,7 @@ deploy job as part of a VideoProcess release.
 | Task type | Start here | Usually redeploy |
 | --- | --- | --- |
 | Frontend page/proxy issue | `frontend/` | `vp-frontend-swarm` |
-| API or job orchestration issue | `backend/app/` | `vp-api-swarm` |
+| API or job orchestration issue | `cmd/vp-api/`, `internal/orchestrator/`, and `backend/app/` | `vp-api-swarm` and sometimes `vp-autoflow-api-swarm` |
 | Worker/node execution issue | `backend/worker/` and node handlers | `vp-channel-agent-runner-swarm` and sometimes API |
 | PDS integration | VP event/outbox code plus `Ctwqk/policy-decision-service` | `vp-pds-swarm`, `vp-event-outbox-relay-swarm` |
 | Feature aggregation | VP event schema plus `services/vp-feature-aggregator` | `vp-feature-aggregator-swarm` |
