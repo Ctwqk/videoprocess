@@ -71,14 +71,25 @@ vp_update_runtime_service() {
   local service_args=()
   if [[ "$service" == "vp-api-swarm" ]]; then
     service_args+=(--no-healthcheck)
-    if vp_service_values "$service" \
-      '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
-      | awk -F= '$1 == "DATABASE_URL" { found=1 } END { exit found ? 0 : 1 }'; then
-      service_args+=(--env-rm DATABASE_URL)
-    fi
+    local api_env_key
+    for api_env_key in \
+      DATABASE_URL \
+      VP_GO_ORCHESTRATOR_ENABLED \
+      VP_GO_ORCHESTRATOR_JOB_WRITES; do
+      if vp_service_values "$service" \
+        '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
+        | awk -F= -v key="$api_env_key" \
+          '$1 == key { found=1 } END { exit found ? 0 : 1 }'; then
+        service_args+=(--env-rm "$api_env_key")
+      fi
+    done
     service_args+=(
       --env-add
       "DATABASE_URL=$VP_API_DATABASE_URL_GO"
+      --env-add
+      "VP_GO_ORCHESTRATOR_ENABLED=true"
+      --env-add
+      "VP_GO_ORCHESTRATOR_JOB_WRITES=true"
     )
   fi
   if [[ "$service" == "vp-ffmpeg-worker-go-swarm" ]]; then

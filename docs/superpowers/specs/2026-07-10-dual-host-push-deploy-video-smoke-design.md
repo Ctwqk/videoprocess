@@ -135,6 +135,8 @@ The `vp-app` deployment must build and update these image/service relationships:
 | Go FFmpeg worker | 127 | `vp-ffmpeg-worker-go-swarm` |
 | Python worker | 150 | `vp-ffmpeg-worker-gpu-swarm` |
 
+The Go API service explicitly enables `VP_GO_ORCHESTRATOR_ENABLED` and `VP_GO_ORCHESTRATOR_JOB_WRITES`. These match the repository Compose defaults and make the documented production `/api/v1/jobs` entry point operational for Go-eligible, validated pipelines.
+
 The 150 Python worker receives explicit production Postgres, Redis, MinIO, bucket, worker-host, and CPU-safe video settings. Database and MinIO credentials have no source-controlled fallback; the deploy fails before service mutation unless all required settings are present. Platform-publication credentials are deliberately absent until a separate worker and explicit human-review gate exist. GPU processing remains disabled until Swarm service-level device allocation and task-level verification are configured. The worker-admission guard must pass before it opens Redis or Postgres. Any legacy standalone Python FFmpeg process remains stopped.
 
 The deploy controller records the exact Git commit only after builds, service updates, and health gates succeed. A failure leaves diagnostic logs and does not advance the deployment marker. Before mutation, the extension snapshots current images. On failure it restores those images while retaining `vp.runtime`/`vp.gpu` placement, and removes a Python worker created by the failed attempt. It never invokes generic Swarm spec rollback because that could restore `node.labels.role==app` and move work back to 126.
