@@ -79,7 +79,7 @@ install_node() {
 status_node() {
   colima list
   ssh "$MANAGER_HOST" docker node inspect "$VM_HOSTNAME" \
-    --format 'state={{.Status.State}} labels={{json .Spec.Labels}}'
+    --format 'state={{.Status.State}},labels={{.Spec.Labels}}'
 }
 
 case "${1:-doctor}" in

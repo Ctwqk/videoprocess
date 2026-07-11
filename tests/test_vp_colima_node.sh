@@ -19,3 +19,28 @@ if grep -Fq '10.0.0.126' <<<"$plan"; then
   echo 'FAIL: 126 must not appear in the VP node installer' >&2
   exit 1
 fi
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+mkdir -p "$tmp_dir/bin"
+
+cat >"$tmp_dir/bin/colima" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat >"$tmp_dir/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+shift
+bash -c "$*"
+EOF
+cat >"$tmp_dir/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '<%s>\n' "$@" >"$VP_TEST_DOCKER_ARGS"
+EOF
+chmod +x "$tmp_dir/bin/colima" "$tmp_dir/bin/ssh" "$tmp_dir/bin/docker"
+
+VP_TEST_DOCKER_ARGS="$tmp_dir/docker-args" \
+  PATH="$tmp_dir/bin:$PATH" \
+  "$INSTALLER" status
+grep -Fqx '<state={{.Status.State}},labels={{.Spec.Labels}}>' \
+  "$tmp_dir/docker-args"
