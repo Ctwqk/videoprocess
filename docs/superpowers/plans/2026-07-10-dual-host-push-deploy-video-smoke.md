@@ -1037,6 +1037,8 @@ load_vp_extension() {
 
 Call `load_vp_extension` immediately after `prepare_repo` in `vp-app` and `vp-feature-aggregator`. In `vp-pds`, call it after preparing the PDS repo and require the already-fetched VideoProcess mirror to exist. Do not change ForWin/news branches.
 
+Also replace the controller's legacy four-service `vp-app` failure and rollback list with the complete extension-owned set: `vp-api-swarm`, `vp-frontend-swarm`, `vp-autoflow-api-swarm`, `vp-event-outbox-relay-swarm`, `vp-channel-agent-runner-swarm`, `vp-ffmpeg-worker-go-swarm`, and `vp-ffmpeg-worker-gpu-swarm`. This ensures a partially applied deployment rolls back every service mutated by the extension.
+
 - [ ] **Step 2: Validate the installed controller**
 
 ```bash
