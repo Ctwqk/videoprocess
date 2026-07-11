@@ -8,6 +8,7 @@
 *.py[cod]
 __pycache__/
 .pytest_cache/
+.runtime/
 .playwright-cli/
 .worktrees/
 .venv/

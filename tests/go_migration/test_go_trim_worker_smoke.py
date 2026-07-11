@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -54,6 +57,79 @@ def wait_for_job(job_id: str) -> dict[str, Any]:
             return last_payload
         time.sleep(2)
     pytest.fail(f"job {job_id} did not finish before timeout; last payload={last_payload}")
+
+
+def node_by_id(job: dict[str, Any], node_id: str) -> dict[str, Any]:
+    matches = [node for node in job["node_executions"] if node["node_id"] == node_id]
+    assert len(matches) == 1, job
+    return matches[0]
+
+
+def download_artifact(artifact_id: str, output_path: Path) -> None:
+    response = httpx.get(
+        f"{PYTHON_API}/api/v1/artifacts/{artifact_id}/download",
+        timeout=60,
+        follow_redirects=True,
+    )
+    response.raise_for_status()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(response.content)
+    assert output_path.stat().st_size > 0
+
+
+def probe_video(output_path: Path) -> dict[str, Any]:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    probe = json.loads(result.stdout)
+    assert any(stream.get("codec_type") == "video" for stream in probe.get("streams", []))
+    assert float(probe.get("format", {}).get("duration", 0)) > 0
+    return probe
+
+
+def write_smoke_evidence(
+    output_path: Path,
+    *,
+    asset_id: str,
+    pipeline_id: str,
+    job: dict[str, Any],
+    artifact_id: str,
+    worker_ids: list[str],
+    probe: dict[str, Any],
+) -> Path:
+    evidence_path = output_path.with_suffix(".json")
+    evidence = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "api_url": PYTHON_API,
+        "source_commit": os.environ.get("VP_SMOKE_COMMIT", ""),
+        "deployed_commit": os.environ.get("VP_SMOKE_DEPLOYED_COMMIT", ""),
+        "asset_id": asset_id,
+        "pipeline_id": pipeline_id,
+        "job_id": job["id"],
+        "job_status": job["status"],
+        "artifact_id": artifact_id,
+        "worker_ids": worker_ids,
+        "sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
+        "file_size": output_path.stat().st_size,
+        "probe": probe,
+    }
+    evidence_path.write_text(
+        json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return evidence_path
 
 
 def ensure_asset_id() -> str:
@@ -166,10 +242,30 @@ def test_trim_worker_mixed_mode_smoke_requires_real_job_completion() -> None:
     final_job = wait_for_job(job["id"])
 
     assert final_job["status"] == "SUCCEEDED", final_job
-    trim_nodes = [node for node in final_job["node_executions"] if node["node_id"] == "trim_1"]
-    assert len(trim_nodes) == 1
-    assert trim_nodes[0]["status"] == "SUCCEEDED"
-    assert trim_nodes[0]["output_artifact_id"]
-    assert trim_nodes[0]["worker_id"]
-    assert "ffmpeg_go-worker@" in trim_nodes[0]["worker_id"]
+    source_node = node_by_id(final_job, "source_1")
+    trim_node = node_by_id(final_job, "trim_1")
+    export_node = node_by_id(final_job, "export_1")
+    for node in (source_node, trim_node, export_node):
+        assert node["status"] == "SUCCEEDED", final_job
+    for node in (trim_node, export_node):
+        assert node["output_artifact_id"]
+        assert node["worker_id"]
+        assert "ffmpeg_go-worker@" in node["worker_id"]
+
+    if output_value := os.environ.get("VP_GO_SMOKE_OUTPUT"):
+        output_path = Path(output_value).expanduser().resolve()
+        artifact_id = export_node["output_artifact_id"]
+        download_artifact(artifact_id, output_path)
+        probe = probe_video(output_path)
+        evidence_path = write_smoke_evidence(
+            output_path,
+            asset_id=asset_id,
+            pipeline_id=pipeline["id"],
+            job=final_job,
+            artifact_id=artifact_id,
+            worker_ids=[trim_node["worker_id"], export_node["worker_id"]],
+            probe=probe,
+        )
+        print(f"retained_video={output_path}")
+        print(f"retained_evidence={evidence_path}")
     assert pending_count() == 0
