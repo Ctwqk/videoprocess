@@ -5,7 +5,7 @@ runtime. Use it when changing application services so production keeps one
 shared infra layer instead of recreating databases or browser managers inside
 each app.
 
-Status date: 2026-05-29.
+Status date: 2026-07-10.
 
 ## Current Topology
 
@@ -40,6 +40,11 @@ The 126/127 directories with `.deploy-sync-project` and
 `.deploy-sync-source-commit` are deployment outputs. Do not create long-lived
 Codex coding projects there unless the task is explicitly about inspecting a
 deployed artifact.
+
+The auxiliary 126 VideoProcess checkout is not a normal build target, runtime,
+health endpoint, or automatic failover target. Normal VP images are built on
+127 because Swarm uses node-local images, and normal VP services are constrained
+to the 127 node label `vp.runtime=true`.
 
 ## Infra Inventory
 
@@ -130,16 +135,29 @@ namespace/wallet path unless that networking model is redesigned.
 
 ## Deployment Sync
 
-The 150 cron job runs:
+The legacy all-project cron entry invoked the unscoped command below. That
+entry is disabled and remains disabled:
 
 ```bash
 /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --apply
 ```
 
-It tracks GitHub branches, builds deploy images, rsyncs target directories to
+The deploy controller tracks GitHub branches, builds deploy images, rsyncs target directories to
 126/127, updates Swarm services, and writes `.deploy-sync-project` plus
 `.deploy-sync-source-commit` markers. ForWin changes must be made in the 246
 ForWin repo and pushed to `master` before this deploy path can pick them up.
+
+VideoProcess uses a scoped invocation so an application release cannot update
+ForWin, arb, or news:
+
+```bash
+/home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh \
+  --apply --project vp-app --project vp-feature-aggregator
+```
+
+The VP schedule is enabled only after a manual scoped apply passes build,
+placement, HTTP health, worker, and artifact checks. The all-project deploy
+schedule remains disabled.
 
 ## Triage Commands
 
