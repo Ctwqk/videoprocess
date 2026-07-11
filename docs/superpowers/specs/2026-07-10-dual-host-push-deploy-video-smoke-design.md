@@ -134,9 +134,9 @@ The `vp-app` deployment must build and update these image/service relationships:
 | Go FFmpeg worker | 127 | `vp-ffmpeg-worker-go-swarm` |
 | Python worker | 150 | `vp-ffmpeg-worker-gpu-swarm` |
 
-The 150 GPU worker receives explicit production Postgres, Redis, MinIO, bucket, worker-host, credentials-directory, and GPU settings. The worker-admission guard must pass before it opens Redis or Postgres. Any legacy standalone Python FFmpeg process remains stopped.
+The 150 GPU worker receives explicit production Postgres, Redis, MinIO, bucket, worker-host, credentials-directory, and GPU settings. Database and MinIO credentials have no source-controlled fallback; the deploy fails before service mutation unless all required settings are present. The worker-admission guard must pass before it opens Redis or Postgres. Any legacy standalone Python FFmpeg process remains stopped.
 
-The deploy controller records the exact Git commit only after builds, service updates, and health gates succeed. A failure leaves diagnostic logs and does not advance the deployment marker. Existing service rollback behavior remains active.
+The deploy controller records the exact Git commit only after builds, service updates, and health gates succeed. A failure leaves diagnostic logs and does not advance the deployment marker. Before mutation, the extension snapshots current images. On failure it restores those images while retaining `vp.runtime`/`vp.gpu` placement, and removes a Python worker created by the failed attempt. It never invokes generic Swarm spec rollback because that could restore `node.labels.role==app` and move work back to 126.
 
 ## Real Video Smoke
 
@@ -157,7 +157,7 @@ The smoke uses the production entry point without invoking any publication node:
 - Every normal VideoProcess service is `1/1`; the feature aggregator is not left at `0/1`.
 - `docker service ps` shows application services on `colima-127` and the Python GPU worker on the 150 node.
 - 127 frontend and API host forwards answer on their documented ports.
-- Redis consumer groups have no unexpected active Python FFmpeg consumer and no pending smoke message.
+- Redis consumer groups have no unexpected active Python FFmpeg consumer and no pending message belonging to the smoke node executions.
 - The deployed source marker equals the pushed commit.
 - Restarting API and worker services preserves the completed job and artifact.
 - A later timed soak can measure long-duration reliability; it is not implied by this initial run.

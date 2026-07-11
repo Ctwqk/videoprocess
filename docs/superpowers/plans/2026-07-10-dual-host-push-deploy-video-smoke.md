@@ -308,8 +308,10 @@ build_image_on_host 10.0.0.127 /Users/wenjieliu/VideoProcess-app \
   backend/Dockerfile.channelops-runner-go "vp-channelops-runner-go:deploy-$short"
 build_image_on_host 10.0.0.127 /Users/wenjieliu/VideoProcess-app \
   backend/Dockerfile.ffmpeg-worker-go "vp-ffmpeg-worker-go:deploy-$short"
-build_image_on_host 10.0.0.150 "$REPO_ROOT/videoprocess/backend" \
-  Dockerfile.worker "vp-ffmpeg-worker-python:deploy-$short"
+docker build \
+  -f "$REPO_ROOT/videoprocess/backend/Dockerfile.worker" \
+  -t "vp-ffmpeg-worker-python:deploy-$short" \
+  "$REPO_ROOT/videoprocess/backend"
 ```
 
 - [ ] **Step 4: Implement atomic image plus placement updates**
@@ -348,7 +350,7 @@ name=vp-ffmpeg-worker-gpu-swarm
 constraint=node.labels.vp.gpu==true
 network=vp-pipeline-net
 DEPLOY_MODE=shared
-DATABASE_URL=${VP_PYTHON_WORKER_DATABASE_URL:-postgresql+asyncpg://vp:vp_secret@10.0.0.150:5435/videoprocess}
+DATABASE_URL=${VP_PYTHON_WORKER_DATABASE_URL}
 REDIS_URL=redis://10.0.0.150:6380/0
 STORAGE_BACKEND=minio
 MINIO_ENDPOINT=10.0.0.150:9000
@@ -359,11 +361,13 @@ VIDEO_GPU_FALLBACK_TO_CPU=true
 YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials
 ```
 
-Read credentials and secret values from the existing deploy environment. Require `VP_YOUTUBE_CREDENTIALS_HOST_DIR` to exist and default it to `/home/taiwei/Constructure-repos/constructure-platform-upload/YouTubeManager/credentials`. Mount it read-only. Keep `VIDEO_USE_GPU=false` unless `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi -L` exits zero and the operator sets `VP_GPU_RUNTIME_READY=true`; never claim GPU acceleration based only on the host label.
+Read credentials and secret values from the existing deploy environment. Require `VP_API_DATABASE_URL_GO`, `VP_PYTHON_WORKER_DATABASE_URL`, `VP_MINIO_ACCESS_KEY`, and `VP_MINIO_SECRET_KEY`; do not provide source-controlled defaults. Require `VP_YOUTUBE_CREDENTIALS_HOST_DIR` to exist and default it to `/home/taiwei/Constructure-repos/constructure-platform-upload/YouTubeManager/credentials`. Mount it read-only because `youtube_upload` is routed to the `ffmpeg` worker. Keep `VIDEO_USE_GPU=false` unless the operator sets `VP_GPU_RUNTIME_READY=true` and `docker run --rm --gpus all <worker-image> nvidia-smi` succeeds; never claim GPU acceleration based only on the host label.
 
 If the service exists, update image, placement, and known worker env keys. If absent, create it. In both cases require `swarm_service_running vp-ffmpeg-worker-gpu-swarm`.
 
-After Steps 3-5, `deploy/swarm/deploy-sync-extension.sh` must contain this complete implementation:
+Review amendment: snapshot all existing VP service images before the first mutation. If any update or health gate fails, restore the captured images with `vp.runtime`/`vp.gpu` constraints still enforced and remove a newly created Python worker. Do not call generic `docker service rollback`, which can restore the legacy `role=app` constraint and schedule on 126. Also set `WORKER_HOST=colima-127` on the Go FFmpeg worker and test the idempotent Bash 3.2 path where no constraint arguments are needed.
+
+The following was the initial implementation sketch. The review amendment above and the source-controlled `deploy/swarm/deploy-sync-extension.sh` are authoritative for credential validation, manager-local builds, GPU preflight, Bash 3.2 idempotence, worker identity, and rollback behavior:
 
 ```bash
 #!/usr/bin/env bash
@@ -422,7 +426,7 @@ vp_update_runtime_service() {
       | awk -F= '$1 == "DATABASE_URL" { found=1 } END { exit found ? 0 : 1 }'; then
       api_args+=(--env-rm DATABASE_URL)
     fi
-    api_args+=(--env-add "DATABASE_URL=${VP_API_DATABASE_URL_GO:-postgres://vp:vp_secret@10.0.0.150:5435/videoprocess}")
+    api_args+=(--env-add "DATABASE_URL=$VP_API_DATABASE_URL_GO")
   fi
 
   docker service update --detach=false --no-resolve-image \
@@ -452,17 +456,17 @@ build_vp_app_images() {
     backend/Dockerfile.channelops-runner-go "$channelops_runner" || return 1
   build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app \
     backend/Dockerfile.ffmpeg-worker-go "$ffmpeg_go" || return 1
-  build_image_on_host 10.0.0.150 "$REPO_ROOT/videoprocess/backend" \
-    Dockerfile.worker "$python_worker" || return 1
+  docker build -f "$REPO_ROOT/videoprocess/backend/Dockerfile.worker" \
+    -t "$python_worker" "$REPO_ROOT/videoprocess/backend" || return 1
 
   printf '%s %s %s %s %s %s\n' \
     "$api" "$frontend" "$backend" "$channelops_runner" "$ffmpeg_go" "$python_worker"
 }
 
 vp_python_worker_env() {
-  local db_url="${VP_PYTHON_WORKER_DATABASE_URL:-postgresql+asyncpg://vp:vp_secret@10.0.0.150:5435/videoprocess}"
-  local minio_access="${VP_MINIO_ACCESS_KEY:-minioadmin}"
-  local minio_secret="${VP_MINIO_SECRET_KEY:-minioadmin}"
+  local db_url="$VP_PYTHON_WORKER_DATABASE_URL"
+  local minio_access="$VP_MINIO_ACCESS_KEY"
+  local minio_secret="$VP_MINIO_SECRET_KEY"
   local use_gpu="${VP_GPU_RUNTIME_READY:-false}"
   printf '%s\n' \
     "DEPLOY_MODE=shared" \
@@ -1035,9 +1039,9 @@ load_vp_extension() {
 }
 ```
 
-Call `load_vp_extension` immediately after `prepare_repo` in `vp-app` and `vp-feature-aggregator`. In `vp-pds`, call it after preparing the PDS repo and require the already-fetched VideoProcess mirror to exist. Do not change ForWin/news branches.
+Call `load_vp_extension` immediately after `prepare_repo` in `vp-app` and `vp-feature-aggregator`. In `vp-pds`, prepare both the PDS repo and the VideoProcess mirror before loading the extension so a standalone PDS deployment cannot use stale topology logic. Do not change ForWin/news branches.
 
-Also replace the controller's legacy four-service `vp-app` failure and rollback list with the complete extension-owned set: `vp-api-swarm`, `vp-frontend-swarm`, `vp-autoflow-api-swarm`, `vp-event-outbox-relay-swarm`, `vp-channel-agent-runner-swarm`, `vp-ffmpeg-worker-go-swarm`, and `vp-ffmpeg-worker-gpu-swarm`. This ensures a partially applied deployment rolls back every service mutated by the extension.
+Also replace the controller's legacy four-service `vp-app` state list with the complete extension-owned set: `vp-api-swarm`, `vp-frontend-swarm`, `vp-autoflow-api-swarm`, `vp-event-outbox-relay-swarm`, `vp-channel-agent-runner-swarm`, `vp-ffmpeg-worker-go-swarm`, and `vp-ffmpeg-worker-gpu-swarm`. Remove the controller's generic `docker service rollback` calls for `vp-app`, `vp-pds`, and `vp-feature-aggregator`: the extension restores captured images itself while preserving `vp.runtime`/`vp.gpu` placement and removes a newly created Python worker on failure. A generic spec rollback could restore `node.labels.role==app` and schedule work on 126.
 
 - [ ] **Step 2: Validate the installed controller**
 

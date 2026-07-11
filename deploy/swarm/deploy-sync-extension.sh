@@ -8,11 +8,35 @@ fi
 : "${REPO_ROOT:?REPO_ROOT must be set by deploy-github-sync.sh}"
 
 VP_RUNTIME_HOST="${VP_RUNTIME_HOST:-10.0.0.127}"
+VP_RUNTIME_NODE="${VP_RUNTIME_NODE:-colima-127}"
 VP_RUNTIME_CONSTRAINT="node.labels.vp.runtime==true"
 VP_GPU_CONSTRAINT="node.labels.vp.gpu==true"
 VP_MANAGER_NODE="${VP_MANAGER_NODE:-ccttww-lap}"
 VP_PIPELINE_NETWORK="${VP_PIPELINE_NETWORK:-vp-pipeline-net}"
 VP_PYTHON_WORKER_SERVICE="vp-ffmpeg-worker-gpu-swarm"
+VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE"
+
+vp_validate_deploy_config() {
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    return 0
+  fi
+
+  local missing=""
+  [[ -n "${VP_API_DATABASE_URL_GO:-}" ]] || missing="$missing VP_API_DATABASE_URL_GO"
+  [[ -n "${VP_PYTHON_WORKER_DATABASE_URL:-}" ]] || missing="$missing VP_PYTHON_WORKER_DATABASE_URL"
+  [[ -n "${VP_MINIO_ACCESS_KEY:-}" ]] || missing="$missing VP_MINIO_ACCESS_KEY"
+  [[ -n "${VP_MINIO_SECRET_KEY:-}" ]] || missing="$missing VP_MINIO_SECRET_KEY"
+  if [[ -n "$missing" ]]; then
+    echo "missing required VideoProcess deploy settings:$missing" >&2
+    return 1
+  fi
+
+  local credentials_dir="${VP_YOUTUBE_CREDENTIALS_HOST_DIR:-/home/taiwei/Constructure-repos/constructure-platform-upload/YouTubeManager/credentials}"
+  if [[ ! -d "$credentials_dir" ]]; then
+    echo "missing YouTube credentials directory: $credentials_dir" >&2
+    return 1
+  fi
+}
 
 vp_service_values() {
   local service="$1"
@@ -50,29 +74,51 @@ vp_update_runtime_service() {
     constraint_args+=(--constraint-add "$VP_RUNTIME_CONSTRAINT")
   fi
 
-  local api_args=()
+  local service_args=()
   if [[ "$service" == "vp-api-swarm" ]]; then
-    api_args+=(--no-healthcheck)
+    service_args+=(--no-healthcheck)
     if vp_service_values "$service" \
       '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
       | awk -F= '$1 == "DATABASE_URL" { found=1 } END { exit found ? 0 : 1 }'; then
-      api_args+=(--env-rm DATABASE_URL)
+      service_args+=(--env-rm DATABASE_URL)
     fi
-    api_args+=(
+    service_args+=(
       --env-add
-      "DATABASE_URL=${VP_API_DATABASE_URL_GO:-postgres://vp:vp_secret@10.0.0.150:5435/videoprocess}"
+      "DATABASE_URL=$VP_API_DATABASE_URL_GO"
     )
+  fi
+  if [[ "$service" == "vp-ffmpeg-worker-go-swarm" ]]; then
+    if vp_service_values "$service" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
+      | awk -F= '$1 == "WORKER_HOST" { found=1 } END { exit found ? 0 : 1 }'; then
+      service_args+=(--env-rm WORKER_HOST)
+    fi
+    service_args+=(--env-add "WORKER_HOST=$VP_RUNTIME_NODE")
   fi
 
   local update_args=(
     service update --detach=false --no-resolve-image --update-order "$order"
   )
-  update_args+=("${constraint_args[@]}")
-  if [[ "${#api_args[@]}" -gt 0 ]]; then
-    update_args+=("${api_args[@]}")
+  if [[ "${#constraint_args[@]}" -gt 0 ]]; then
+    update_args+=("${constraint_args[@]}")
+  fi
+  if [[ "${#service_args[@]}" -gt 0 ]]; then
+    update_args+=("${service_args[@]}")
   fi
   update_args+=(--image "$image" "$service")
   docker "${update_args[@]}" >&2
+}
+
+vp_build_manager_image() {
+  local context_dir="$1"
+  local dockerfile="$2"
+  local image="$3"
+  if [[ "${BUILD_IMAGES:-1}" -eq 0 ]]; then
+    log "build skipped 10.0.0.150:$context_dir $image"
+    return 0
+  fi
+  log "build 10.0.0.150:$context_dir $image"
+  docker build -f "$context_dir/$dockerfile" -t "$image" "$context_dir" >&2
 }
 
 build_vp_app_images() {
@@ -96,18 +142,39 @@ build_vp_app_images() {
     backend/Dockerfile.channelops-runner-go "$channelops_runner" || return 1
   build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app \
     backend/Dockerfile.ffmpeg-worker-go "$ffmpeg_go" || return 1
-  build_image_on_host 10.0.0.150 "$REPO_ROOT/videoprocess/backend" \
+  vp_build_manager_image "$REPO_ROOT/videoprocess/backend" \
     Dockerfile.worker "$python_worker" || return 1
 
   printf '%s %s %s %s %s %s\n' \
     "$api" "$frontend" "$backend" "$channelops_runner" "$ffmpeg_go" "$python_worker"
 }
 
+vp_resolve_gpu_mode() {
+  local image="$1"
+  case "${VP_GPU_RUNTIME_READY:-false}" in
+    true|TRUE|1|yes|YES|on|ON)
+      log "preflight NVIDIA runtime with $image"
+      if ! docker run --rm --gpus all "$image" nvidia-smi >/dev/null 2>&1; then
+        echo "GPU mode requested but the NVIDIA container runtime preflight failed" >&2
+        return 1
+      fi
+      printf 'true\n'
+      ;;
+    false|FALSE|0|no|NO|off|OFF|'')
+      printf 'false\n'
+      ;;
+    *)
+      echo "invalid VP_GPU_RUNTIME_READY value" >&2
+      return 1
+      ;;
+  esac
+}
+
 vp_python_worker_env() {
-  local db_url="${VP_PYTHON_WORKER_DATABASE_URL:-postgresql+asyncpg://vp:vp_secret@10.0.0.150:5435/videoprocess}"
-  local minio_access="${VP_MINIO_ACCESS_KEY:-minioadmin}"
-  local minio_secret="${VP_MINIO_SECRET_KEY:-minioadmin}"
-  local use_gpu="${VP_GPU_RUNTIME_READY:-false}"
+  local use_gpu="$1"
+  local db_url="$VP_PYTHON_WORKER_DATABASE_URL"
+  local minio_access="$VP_MINIO_ACCESS_KEY"
+  local minio_secret="$VP_MINIO_SECRET_KEY"
   printf '%s\n' \
     "DEPLOY_MODE=shared" \
     "DATABASE_URL=$db_url" \
@@ -140,6 +207,8 @@ vp_deploy_python_worker() {
     echo "missing YouTube credentials directory: $credentials_dir" >&2
     return 1
   fi
+  local gpu_mode
+  gpu_mode="$(vp_resolve_gpu_mode "$image")" || return 1
   docker node update --label-add vp.gpu=true "$VP_MANAGER_NODE" >/dev/null
 
   local env_key
@@ -154,7 +223,7 @@ vp_deploy_python_worker() {
       env_args+=(--env-rm "$env_key")
     fi
     env_args+=(--env-add "$env_value")
-  done < <(vp_python_worker_env)
+  done < <(vp_python_worker_env "$gpu_mode")
 
   if docker service inspect "$VP_PYTHON_WORKER_SERVICE" >/dev/null 2>&1; then
     local update_args=(
@@ -206,20 +275,102 @@ vp_deploy_python_worker() {
     local create_env=()
     while IFS= read -r env_value; do
       create_env+=(--env "$env_value")
-    done < <(vp_python_worker_env)
+    done < <(vp_python_worker_env "$gpu_mode")
     docker "${create_args[@]}" "${create_env[@]}" "$image" >&2
   fi
   swarm_service_running "$VP_PYTHON_WORKER_SERVICE"
 }
 
-deploy_vp_app_services() {
+vp_capture_app_snapshots() {
+  local service
+  local image
+  for service in $VP_APP_SERVICES; do
+    if ! docker service inspect "$service" >/dev/null 2>&1; then
+      if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" ]]; then
+        continue
+      fi
+      echo "missing required VideoProcess service: $service" >&2
+      return 1
+    fi
+    image="$(vp_service_values "$service" '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" || return 1
+    if [[ -z "$image" ]]; then
+      echo "missing current image for VideoProcess service: $service" >&2
+      return 1
+    fi
+    printf '%s|%s\n' "$service" "$image"
+  done
+}
+
+vp_restore_gpu_service() {
+  local image="$1"
+  local constraint
+  local has_gpu=false
+  local constraint_args=()
+  while IFS= read -r constraint; do
+    [[ -n "$constraint" ]] || continue
+    case "$constraint" in
+      node.labels.role==app)
+        constraint_args+=(--constraint-rm "$constraint")
+        ;;
+      "$VP_GPU_CONSTRAINT")
+        has_gpu=true
+        ;;
+    esac
+  done < <(
+    vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
+      '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
+  )
+  if [[ "$has_gpu" != true ]]; then
+    constraint_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
+  fi
+
+  local update_args=(
+    service update --detach=false --no-resolve-image --update-order stop-first
+  )
+  if [[ "${#constraint_args[@]}" -gt 0 ]]; then
+    update_args+=("${constraint_args[@]}")
+  fi
+  update_args+=(--image "$image" "$VP_PYTHON_WORKER_SERVICE")
+  docker "${update_args[@]}" >&2
+}
+
+vp_restore_app_snapshots() {
+  local snapshots="$1"
+  local service
+  local image
+  local gpu_was_present=false
+  local status=0
+
+  while IFS='|' read -r service image; do
+    [[ -n "$service" ]] || continue
+    log "restore $service -> $image with dedicated VP placement"
+    if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" ]]; then
+      gpu_was_present=true
+      if ! vp_restore_gpu_service "$image"; then
+        status=1
+      fi
+    elif ! vp_update_runtime_service "$service" "$image" stop-first; then
+      status=1
+    fi
+  done < <(printf '%s\n' "$snapshots")
+
+  if [[ "$gpu_was_present" != true ]] \
+    && docker service inspect "$VP_PYTHON_WORKER_SERVICE" >/dev/null 2>&1; then
+    log "remove newly created $VP_PYTHON_WORKER_SERVICE"
+    if ! docker service rm "$VP_PYTHON_WORKER_SERVICE" >&2; then
+      status=1
+    fi
+  fi
+  return "$status"
+}
+
+vp_apply_app_services() {
   local api="$1"
   local frontend="$2"
   local backend="$3"
   local channelops_runner="$4"
   local ffmpeg_go="$5"
   local python_worker="$6"
-  local services="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE"
 
   vp_update_runtime_service vp-api-swarm "$api" stop-first || return 1
   http_health vp-api "http://$VP_RUNTIME_HOST:18080/health" || return 1
@@ -232,22 +383,70 @@ deploy_vp_app_services() {
   vp_deploy_python_worker "$python_worker" || return 1
 
   local service
-  for service in $services; do
+  for service in $VP_APP_SERVICES; do
     swarm_service_running "$service" || return 1
   done
-  printf '%s\n' "$services"
+}
+
+deploy_vp_app_services() {
+  vp_validate_deploy_config || return 1
+
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    vp_apply_app_services "$@" || return 1
+    printf '%s\n' "$VP_APP_SERVICES"
+    return 0
+  fi
+
+  local snapshots
+  snapshots="$(vp_capture_app_snapshots)" || return 1
+  if ! vp_apply_app_services "$@"; then
+    log "VideoProcess service apply failed; restoring prior images without legacy placement"
+    if ! vp_restore_app_snapshots "$snapshots"; then
+      echo "VideoProcess image restore did not fully converge" >&2
+    fi
+    return 1
+  fi
+  printf '%s\n' "$VP_APP_SERVICES"
+}
+
+vp_deploy_single_runtime_service() {
+  local service="$1"
+  local image="$2"
+  local order="$3"
+
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    vp_update_runtime_service "$service" "$image" "$order" || return 1
+    swarm_service_running "$service" || return 1
+    printf '%s\n' "$service"
+    return 0
+  fi
+
+  local baseline_image
+  baseline_image="$(vp_service_values "$service" '{{.Spec.TaskTemplate.ContainerSpec.Image}}')" \
+    || return 1
+  if [[ -z "$baseline_image" ]]; then
+    echo "missing current image for VideoProcess service: $service" >&2
+    return 1
+  fi
+
+  if vp_update_runtime_service "$service" "$image" "$order" \
+    && swarm_service_running "$service"; then
+    printf '%s\n' "$service"
+    return 0
+  fi
+
+  log "restore $service -> $baseline_image with dedicated VP placement"
+  if ! vp_update_runtime_service "$service" "$baseline_image" stop-first; then
+    echo "VideoProcess image restore did not converge for $service" >&2
+  fi
+  return 1
 }
 
 deploy_feature_aggregator_services() {
-  local image="$1"
-  vp_update_runtime_service vp-feature-aggregator-swarm "$image" start-first || return 1
-  swarm_service_running vp-feature-aggregator-swarm || return 1
-  printf '%s\n' vp-feature-aggregator-swarm
+  vp_deploy_single_runtime_service \
+    vp-feature-aggregator-swarm "$1" start-first
 }
 
 deploy_pds_services() {
-  local image="$1"
-  vp_update_runtime_service vp-pds-swarm "$image" start-first || return 1
-  swarm_service_running vp-pds-swarm || return 1
-  printf '%s\n' vp-pds-swarm
+  vp_deploy_single_runtime_service vp-pds-swarm "$1" start-first
 }

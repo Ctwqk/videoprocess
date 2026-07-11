@@ -41,11 +41,63 @@ def redis_client() -> redis.Redis:
     return redis.Redis.from_url(url, decode_responses=True)
 
 
-def pending_count() -> int:
-    pending = redis_client().xpending("vp:tasks:ffmpeg_go", "ffmpeg_go-workers")
-    if isinstance(pending, dict):
-        return int(pending.get("pending", 0))
-    return int(pending["pending"])
+def pending_node_execution_ids(client: Any, node_execution_ids: set[str]) -> list[str]:
+    matching: list[str] = []
+    pending_entries = client.xpending_range(
+        "vp:tasks:ffmpeg_go",
+        "ffmpeg_go-workers",
+        min="-",
+        max="+",
+        count=1000,
+    )
+    for pending in pending_entries:
+        message_id = str(pending["message_id"])
+        entries = client.xrange(
+            "vp:tasks:ffmpeg_go",
+            min=message_id,
+            max=message_id,
+            count=1,
+        )
+        for _, data in entries:
+            node_execution_id = str(data.get("node_execution_id", ""))
+            if node_execution_id in node_execution_ids:
+                matching.append(node_execution_id)
+    return matching
+
+
+def wait_for_node_acknowledgements(node_execution_ids: set[str]) -> None:
+    client = redis_client()
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        pending = pending_node_execution_ids(client, node_execution_ids)
+        if not pending:
+            return
+        time.sleep(0.25)
+    pytest.fail(f"smoke node messages remain pending: {pending}")
+
+
+class _PendingRedisStub:
+    def xpending_range(self, *_args: Any, **_kwargs: Any) -> list[dict[str, str]]:
+        return [{"message_id": "1-0"}, {"message_id": "2-0"}]
+
+    def xrange(
+        self,
+        _stream: str,
+        *,
+        min: str,
+        max: str,
+        count: int,
+    ) -> list[tuple[str, dict[str, str]]]:
+        assert min == max
+        assert count == 1
+        node_id = "target-node" if min == "1-0" else "unrelated-node"
+        return [(min, {"node_execution_id": node_id})]
+
+
+def test_pending_node_execution_ids_filters_unrelated_production_work() -> None:
+    assert pending_node_execution_ids(_PendingRedisStub(), {"target-node"}) == [
+        "target-node"
+    ]
 
 
 def wait_for_job(job_id: str) -> dict[str, Any]:
@@ -250,7 +302,7 @@ def test_trim_worker_mixed_mode_smoke_requires_real_job_completion() -> None:
     for node in (trim_node, export_node):
         assert node["output_artifact_id"]
         assert node["worker_id"]
-        assert "ffmpeg_go-worker@" in node["worker_id"]
+        assert node["worker_id"].startswith("ffmpeg_go-worker@colima-127:")
 
     if output_value := os.environ.get("VP_GO_SMOKE_OUTPUT"):
         output_path = Path(output_value).expanduser().resolve()
@@ -268,4 +320,4 @@ def test_trim_worker_mixed_mode_smoke_requires_real_job_completion() -> None:
         )
         print(f"retained_video={output_path}")
         print(f"retained_evidence={evidence_path}")
-    assert pending_count() == 0
+    wait_for_node_acknowledgements({trim_node["id"], export_node["id"]})
