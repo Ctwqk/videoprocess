@@ -947,7 +947,7 @@ Expected: `origin/main` advances to local `HEAD`.
 
 ```bash
 ssh 10.0.0.150 \
-  '/home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --dry-run --project vp-app --project vp-feature-aggregator'
+  '/home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --dry-run --project vp-app --project vp-feature-aggregator --project vp-pds'
 ```
 
 Expected: fetch/stage/rsync dry-run references the pushed commit, only host 127, and no service update.
@@ -1034,7 +1034,7 @@ Also replace the controller's legacy four-service `vp-app` state list with the c
 ```bash
 ssh 10.0.0.150 'bash -n /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh'
 ssh 10.0.0.150 \
-  '/home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --dry-run --project vp-app --project vp-feature-aggregator'
+  '/home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --dry-run --project vp-app --project vp-feature-aggregator --project vp-pds'
 ```
 
 Expected: exact pushed commit, target 127, no 126 reference in VP calls, no service mutation.
@@ -1110,7 +1110,7 @@ Expected: managed identities only, pending count zero for smoke, no stale standa
 Install exactly this scoped schedule while preserving the disabled global line:
 
 ```cron
-*/15 * * * * /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --apply --project vp-app --project vp-feature-aggregator >> /home/taiwei/deploy-github-sync/logs/vp-cron.log 2>&1
+*/15 * * * * /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --apply --project vp-app --project vp-feature-aggregator --project vp-pds >> /home/taiwei/deploy-github-sync/logs/vp-cron.log 2>&1
 ```
 
 Do not include `forwin`, `arb`, `news-server`, or an unscoped invocation.

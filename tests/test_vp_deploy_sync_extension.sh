@@ -79,10 +79,16 @@ docker() {
           echo 'DATABASE_URL=legacy'
         elif [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" ]]; then
           echo 'WORKER_HOST=legacy'
+          echo 'YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials'
         fi
         ;;
       *TaskTemplate.Networks*)
         echo legacy-network-id
+        ;;
+      *ContainerSpec.Mounts*)
+        if [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" ]]; then
+          echo /app/youtube_credentials
+        fi
         ;;
     esac
   fi
@@ -120,6 +126,8 @@ grep -Fq -- '--constraint-rm node.labels.role==app' "$CALLS"
 grep -Fq -- '--constraint-add node.labels.vp.runtime==true' "$CALLS"
 grep -Fq -- '--env-rm DATABASE_URL' "$CALLS"
 grep -Fq -- '--env-add WORKER_HOST=colima-127' "$CALLS"
+grep -Fq -- '--mount-rm /app/youtube_credentials' "$CALLS"
+grep -Fq -- '--env-rm YOUTUBE_CREDENTIALS_DIR' "$CALLS"
 
 if (
   unset VP_API_DATABASE_URL_GO VP_PYTHON_WORKER_DATABASE_URL \
