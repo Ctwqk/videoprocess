@@ -16,6 +16,12 @@ grep -Fq 'VP_GO_WORKER_SMOKE_STRICT=1' "$SCRIPT"
 grep -Fq '.runtime/video-smoke' "$SCRIPT"
 grep -Fq 'ffmpeg_go-worker@colima-127:' \
   "$ROOT_DIR/tests/go_migration/test_go_trim_worker_smoke.py"
+grep -Fq '"/internal/schedule/video/open"' \
+  "$ROOT_DIR/tests/go_migration/test_go_trim_worker_smoke.py"
+grep -Fq '"/internal/schedule/video/drain"' \
+  "$ROOT_DIR/tests/go_migration/test_go_trim_worker_smoke.py"
+grep -Fq '"/internal/schedule/video/close"' \
+  "$ROOT_DIR/tests/go_migration/test_go_trim_worker_smoke.py"
 if grep -Eiq 'youtube|bilibili|xiaohongshu|private_upload|public_after_review' "$SCRIPT"; then
   echo 'FAIL: production video smoke must not publish' >&2
   exit 1

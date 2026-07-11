@@ -148,11 +148,12 @@ The smoke uses the production entry point without invoking any publication node:
 1. Generate a short H.264/AAC source clip with FFmpeg test sources.
 2. Upload it through the 127 API.
 3. Create a validated `source -> trim -> export` pipeline.
-4. Submit the job and wait for a terminal state.
-5. Require all nodes to succeed and require media nodes to report the expected managed worker identity.
-6. Download the final artifact from shared MinIO through the API.
-7. Verify the MP4 with `ffprobe`, including a video stream and positive duration.
-8. Persist MP4 plus JSON evidence containing commit, deployment marker, asset, pipeline, job, artifact, worker, probe, and SHA-256 values.
+4. Require a closed, idle video schedule; briefly open it for this one submission.
+5. As soon as the job leaves `PENDING`/`WAITING_WINDOW`, switch the schedule to `DRAINING`, and always restore `CLOSED` in cleanup.
+6. Wait for a terminal state and require all nodes to succeed with the expected managed worker identity.
+7. Download the final artifact from shared MinIO through the API.
+8. Verify the MP4 with `ffprobe`, including a video stream and positive duration.
+9. Persist MP4 plus JSON evidence containing commit, deployment marker, asset, pipeline, job, artifact, worker, probe, and SHA-256 values.
 
 ## Health And Long-Running Checks
 

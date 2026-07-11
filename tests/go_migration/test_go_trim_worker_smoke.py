@@ -30,6 +30,12 @@ def post_json(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     return response.json()
 
 
+def post_empty(path: str) -> dict[str, Any]:
+    response = httpx.post(f"{PYTHON_API}{path}", timeout=20)
+    response.raise_for_status()
+    return response.json()
+
+
 def get_json(path: str) -> dict[str, Any]:
     response = httpx.get(f"{PYTHON_API}{path}", timeout=20)
     response.raise_for_status()
@@ -129,6 +135,28 @@ def wait_for_job(job_id: str) -> dict[str, Any]:
             return last_payload
         time.sleep(2)
     pytest.fail(f"job {job_id} did not finish before timeout; last payload={last_payload}")
+
+
+def wait_for_job_to_leave_schedule_window(job_id: str) -> dict[str, Any]:
+    deadline = time.time() + 15
+    last_payload: dict[str, Any] = {}
+    while time.time() < deadline:
+        last_payload = get_json(f"/api/v1/jobs/{job_id}")
+        if last_payload["status"] not in {"PENDING", "WAITING_WINDOW"}:
+            return last_payload
+        time.sleep(0.1)
+    pytest.fail(f"job {job_id} did not start before schedule guard timeout: {last_payload}")
+
+
+def open_schedule_for_single_smoke_job() -> None:
+    status = get_json("/internal/schedule/video/status")
+    assert status["state"] == "CLOSED", status
+    assert status["waiting_jobs"] == 0, status
+    assert status["queued_nodes"] == 0, status
+    assert status["running_nodes"] == 0, status
+    opened = post_empty("/internal/schedule/video/open")
+    assert opened["state"] == "OPEN", opened
+    assert opened["released_jobs"] == 0, opened
 
 
 def node_by_id(job: dict[str, Any], node_id: str) -> dict[str, Any]:
@@ -310,8 +338,19 @@ def test_trim_worker_mixed_mode_smoke_requires_real_job_completion() -> None:
     }
 
     pipeline = post_json("/api/v1/pipelines", pipeline_payload)
-    job = post_json("/api/v1/jobs", {"pipeline_id": pipeline["id"], "inputs": {}})
-    final_job = wait_for_job(job["id"])
+    schedule_opened = False
+    try:
+        open_schedule_for_single_smoke_job()
+        schedule_opened = True
+        job = post_json("/api/v1/jobs", {"pipeline_id": pipeline["id"], "inputs": {}})
+        wait_for_job_to_leave_schedule_window(job["id"])
+        draining = post_empty("/internal/schedule/video/drain")
+        assert draining["state"] == "DRAINING", draining
+        final_job = wait_for_job(job["id"])
+    finally:
+        if schedule_opened:
+            closed = post_empty("/internal/schedule/video/close")
+            assert closed["state"] == "CLOSED", closed
 
     assert final_job["status"] == "SUCCEEDED", final_job
     source_node = node_by_id(final_job, "source_1")
