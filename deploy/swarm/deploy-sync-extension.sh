@@ -30,12 +30,6 @@ vp_validate_deploy_config() {
     echo "missing required VideoProcess deploy settings:$missing" >&2
     return 1
   fi
-
-  local credentials_dir="${VP_YOUTUBE_CREDENTIALS_HOST_DIR:-/home/taiwei/Constructure-repos/constructure-platform-upload/YouTubeManager/credentials}"
-  if [[ ! -d "$credentials_dir" ]]; then
-    echo "missing YouTube credentials directory: $credentials_dir" >&2
-    return 1
-  fi
 }
 
 vp_service_values() {
@@ -158,7 +152,8 @@ vp_resolve_gpu_mode() {
         echo "GPU mode requested but the NVIDIA container runtime preflight failed" >&2
         return 1
       fi
-      printf 'true\n'
+      echo "GPU host preflight passed, but Swarm task GPU allocation is not configured" >&2
+      return 1
       ;;
     false|FALSE|0|no|NO|off|OFF|'')
       printf 'false\n'
@@ -191,8 +186,7 @@ vp_python_worker_env() {
     "VIDEO_USE_GPU=$use_gpu" \
     "VIDEO_GPU_FALLBACK_TO_CPU=true" \
     "NVIDIA_VISIBLE_DEVICES=all" \
-    "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility" \
-    "YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials"
+    "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility"
 }
 
 vp_deploy_python_worker() {
@@ -202,11 +196,6 @@ vp_deploy_python_worker() {
     return 0
   fi
 
-  local credentials_dir="${VP_YOUTUBE_CREDENTIALS_HOST_DIR:-/home/taiwei/Constructure-repos/constructure-platform-upload/YouTubeManager/credentials}"
-  if [[ ! -d "$credentials_dir" ]]; then
-    echo "missing YouTube credentials directory: $credentials_dir" >&2
-    return 1
-  fi
   local gpu_mode
   gpu_mode="$(vp_resolve_gpu_mode "$image")" || return 1
   docker node update --label-add vp.gpu=true "$VP_MANAGER_NODE" >/dev/null
@@ -253,13 +242,15 @@ vp_deploy_python_worker() {
       | grep -Fxq "$network_id"; then
       update_args+=(--network-add "$VP_PIPELINE_NETWORK")
     fi
-    if ! vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
+    if vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
       '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{println .Target}}{{end}}' \
       | grep -Fxq /app/youtube_credentials; then
-      update_args+=(
-        --mount-add
-        "type=bind,src=$credentials_dir,dst=/app/youtube_credentials,readonly"
-      )
+      update_args+=(--mount-rm /app/youtube_credentials)
+    fi
+    if vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
+      | awk -F= '$1 == "YOUTUBE_CREDENTIALS_DIR" { found=1 } END { exit found ? 0 : 1 }'; then
+      update_args+=(--env-rm YOUTUBE_CREDENTIALS_DIR)
     fi
     docker "${update_args[@]}" "${env_args[@]}" \
       "$VP_PYTHON_WORKER_SERVICE" >&2
@@ -269,7 +260,6 @@ vp_deploy_python_worker() {
       --constraint "$VP_GPU_CONSTRAINT"
       --network "$VP_PIPELINE_NETWORK"
       --restart-condition any --restart-delay 5s
-      --mount "type=bind,src=$credentials_dir,dst=/app/youtube_credentials,readonly"
       --mount type=volume,src=vp-gpu-worker-scratch,dst=/data/storage
     )
     local create_env=()

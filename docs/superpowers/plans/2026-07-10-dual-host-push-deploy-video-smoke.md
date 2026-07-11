@@ -4,7 +4,7 @@
 
 **Goal:** Restore the intended 150 support/control plus 127 VideoProcess runtime, make `main` pushes deploy through a VideoProcess-only 150 sync loop, and prove the deployment by retaining a real generated MP4.
 
-**Architecture:** Recreate the 127 Colima Swarm worker as `colima-127`, label it `vp.runtime=true`, and source-control the VideoProcess-specific build/update behavior in a deploy-sync extension. The existing 150 controller keeps repository polling, staging, state, and rollback ownership, while the extension builds node-local images on 127, builds the managed Python worker on 150, and combines image plus placement changes in one Swarm update. Host 126 is excluded from VideoProcess builds, placement, health checks, and automatic failover.
+**Architecture:** Recreate the 127 Colima Swarm worker as `colima-127`, label it `vp.runtime=true`, and source-control the VideoProcess-specific build/update behavior in a deploy-sync extension. The existing 150 controller keeps repository polling, staging, and deployment state ownership. The extension owns VP image restoration, builds node-local images on 127, builds the managed Python worker on 150, and combines image plus placement changes in one Swarm update. Host 126 is excluded from VideoProcess builds, placement, health checks, and automatic failover.
 
 **Tech Stack:** Bash, launchd, Colima, Docker Swarm, Git, Python 3.12, pytest, Go 1.25, Redis Streams, Postgres, MinIO, FFmpeg/ffprobe.
 
@@ -241,7 +241,7 @@ git commit -m "ops: define the 127 videoprocess swarm node"
 - Create: `tests/test_vp_deploy_sync_extension.sh`
 
 **Interfaces:**
-- Consumes from the installed 150 controller: `REPO_ROOT`, `build_image_on_host`, `http_health`, `swarm_service_running`, `record_state`, and `rollback_services`.
+- Consumes from the installed 150 controller: `REPO_ROOT`, `build_image_on_host`, `http_health`, and `swarm_service_running`. The controller records state, while the extension restores VP images without calling generic Swarm rollback.
 - Produces overrides: `build_vp_app_images(commit)`, `deploy_vp_app_services(api, frontend, backend, channelops_runner, ffmpeg_go, python_worker)`, `deploy_feature_aggregator_services(image)`, and `deploy_pds_services(image)`.
 - Produces helper: `vp_update_runtime_service(service, image, order)` that applies image and placement atomically.
 
@@ -262,7 +262,6 @@ REPO_ROOT=/home/taiwei/deploy-github-sync/repos
 BUILD_IMAGES=1
 UPDATE_SERVICES=1
 HEALTH_CHECKS=1
-VP_YOUTUBE_CREDENTIALS_HOST_DIR=/tmp
 
 build_image_on_host() { printf 'build|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >>"$CALLS"; }
 http_health() { printf 'health|%s|%s\n' "$1" "$2" >>"$CALLS"; }
@@ -358,10 +357,9 @@ MINIO_BUCKET=videoprocess
 WORKER_TYPE=ffmpeg
 WORKER_HOST=150-gpu
 VIDEO_GPU_FALLBACK_TO_CPU=true
-YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials
 ```
 
-Read credentials and secret values from the existing deploy environment. Require `VP_API_DATABASE_URL_GO`, `VP_PYTHON_WORKER_DATABASE_URL`, `VP_MINIO_ACCESS_KEY`, and `VP_MINIO_SECRET_KEY`; do not provide source-controlled defaults. Require `VP_YOUTUBE_CREDENTIALS_HOST_DIR` to exist and default it to `/home/taiwei/Constructure-repos/constructure-platform-upload/YouTubeManager/credentials`. Mount it read-only because `youtube_upload` is routed to the `ffmpeg` worker. Keep `VIDEO_USE_GPU=false` unless the operator sets `VP_GPU_RUNTIME_READY=true` and `docker run --rm --gpus all <worker-image> nvidia-smi` succeeds; never claim GPU acceleration based only on the host label.
+Read database and MinIO secret values from the protected deploy environment. Require `VP_API_DATABASE_URL_GO`, `VP_PYTHON_WORKER_DATABASE_URL`, `VP_MINIO_ACCESS_KEY`, and `VP_MINIO_SECRET_KEY`; do not provide source-controlled defaults. Do not mount platform-publication credentials into this general worker: publication remains disabled until a separate worker and explicit human-review gate are implemented. Keep `VIDEO_USE_GPU=false`; a successful host `docker run --gpus all` preflight is insufficient until Swarm service-level GPU allocation and task-level verification are configured.
 
 If the service exists, update image, placement, and known worker env keys. If absent, create it. In both cases require `swarm_service_running vp-ffmpeg-worker-gpu-swarm`.
 
@@ -467,7 +465,7 @@ vp_python_worker_env() {
   local db_url="$VP_PYTHON_WORKER_DATABASE_URL"
   local minio_access="$VP_MINIO_ACCESS_KEY"
   local minio_secret="$VP_MINIO_SECRET_KEY"
-  local use_gpu="${VP_GPU_RUNTIME_READY:-false}"
+  local use_gpu="false"
   printf '%s\n' \
     "DEPLOY_MODE=shared" \
     "DATABASE_URL=$db_url" \
@@ -484,8 +482,7 @@ vp_python_worker_env() {
     "VIDEO_USE_GPU=$use_gpu" \
     "VIDEO_GPU_FALLBACK_TO_CPU=true" \
     "NVIDIA_VISIBLE_DEVICES=all" \
-    "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility" \
-    "YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials"
+    "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility"
 }
 
 vp_deploy_python_worker() {
@@ -495,11 +492,6 @@ vp_deploy_python_worker() {
     return 0
   fi
 
-  local credentials_dir="${VP_YOUTUBE_CREDENTIALS_HOST_DIR:-/home/taiwei/Constructure-repos/constructure-platform-upload/YouTubeManager/credentials}"
-  [[ -d "$credentials_dir" ]] || {
-    echo "missing YouTube credentials directory: $credentials_dir" >&2
-    return 1
-  }
   docker node update --label-add vp.gpu=true "$VP_MANAGER_NODE" >/dev/null
 
   local env_key
@@ -532,11 +524,6 @@ vp_deploy_python_worker() {
       | grep -Fxq "$network_id"; then
       update_args+=(--network-add "$VP_PIPELINE_NETWORK")
     fi
-    if ! vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
-      '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{println .Target}}{{end}}' \
-      | grep -Fxq /app/youtube_credentials; then
-      update_args+=(--mount-add "type=bind,src=$credentials_dir,dst=/app/youtube_credentials,readonly")
-    fi
     docker "${update_args[@]}" "${env_args[@]}" "$VP_PYTHON_WORKER_SERVICE" >&2
   else
     local create_args=(
@@ -544,7 +531,6 @@ vp_deploy_python_worker() {
       --constraint "$VP_GPU_CONSTRAINT"
       --network "$VP_PIPELINE_NETWORK"
       --restart-condition any --restart-delay 5s
-      --mount "type=bind,src=$credentials_dir,dst=/app/youtube_credentials,readonly"
       --mount type=volume,src=vp-gpu-worker-scratch,dst=/data/storage
     )
     local create_env=()
@@ -662,7 +648,7 @@ Expected: fail because the wrapper does not exist.
 After the job succeeds:
 
 - Require `source_1`, `trim_1`, and `export_1` to be `SUCCEEDED`.
-- Require `trim_1` and `export_1` worker IDs to start with `ffmpeg_go-worker@`.
+- Require `trim_1` and `export_1` worker IDs to start with `ffmpeg_go-worker@colima-127:`.
 - Download `export_1.output_artifact_id` from `/api/v1/artifacts/{id}/download`.
 - Save it when `VP_GO_SMOKE_OUTPUT` is set.
 - Run:
@@ -764,7 +750,7 @@ for node in (source_node, trim_node, export_node):
 for node in (trim_node, export_node):
     assert node["output_artifact_id"]
     assert node["worker_id"]
-    assert "ffmpeg_go-worker@" in node["worker_id"]
+    assert node["worker_id"].startswith("ffmpeg_go-worker@colima-127:")
 
 if output_value := os.environ.get("VP_GO_SMOKE_OUTPUT"):
     output_path = Path(output_value).expanduser().resolve()
@@ -1072,7 +1058,7 @@ curl -fsS http://10.0.0.127:18080/health
 curl -fsS http://10.0.0.127:3001/ >/dev/null
 ```
 
-Expected: normal VP services run on `colima-127`, Python GPU worker runs on `ccttww-lap`, and no normal VP task runs on `colima-swarmbridged`.
+Expected: normal VP services run on `colima-127`, the CPU-mode Python worker runs on `ccttww-lap`, and no normal VP task runs on `colima-swarmbridged`.
 
 ---
 

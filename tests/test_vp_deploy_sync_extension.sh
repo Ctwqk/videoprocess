@@ -10,7 +10,6 @@ REPO_ROOT=/home/taiwei/deploy-github-sync/repos
 BUILD_IMAGES=1
 UPDATE_SERVICES=1
 HEALTH_CHECKS=1
-VP_YOUTUBE_CREDENTIALS_HOST_DIR=/tmp
 VP_API_DATABASE_URL_GO=postgres://test:test@10.0.0.150:5435/videoprocess
 VP_PYTHON_WORKER_DATABASE_URL=postgresql+asyncpg://test:test@10.0.0.150:5435/videoprocess
 VP_MINIO_ACCESS_KEY=test-access
@@ -93,6 +92,10 @@ if [[ ! -f "$EXTENSION" ]]; then
   echo "FAIL: missing deploy extension: $EXTENSION" >&2
   exit 1
 fi
+if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credentials|--mount .*youtube_credentials' "$EXTENSION"; then
+  echo 'FAIL: general production worker must not receive publication credentials' >&2
+  exit 1
+fi
 source "$EXTENSION"
 images="$(build_vp_app_images 0123456789abcdef)"
 if ! deploy_vp_app_services $images >/dev/null; then
@@ -147,8 +150,13 @@ if vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-preflight-test >/dev/null
   exit 1
 fi
 grep -Fq 'docker|run --rm --gpus all vp-ffmpeg-worker-python:gpu-preflight-test nvidia-smi' "$CALLS"
-VP_GPU_RUNTIME_READY=false
 GPU_PREFLIGHT_SUCCEEDS=true
+if vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-swarm-allocation-test \
+  >/dev/null 2>&1; then
+  echo 'FAIL: GPU mode must remain disabled until Swarm task allocation is configured' >&2
+  exit 1
+fi
+VP_GPU_RUNTIME_READY=false
 
 : >"$CALLS"
 GPU_SERVICE_EXISTS=true

@@ -17,7 +17,7 @@ The 150 deploy-sync job is also disabled. Its last VideoProcess attempt copied c
 - Restore the intended 150 support/control plus 127 VideoProcess runtime topology.
 - Keep 126 isolated to ForWin and news during normal operation.
 - Make a push to `main` deploy VideoProcess through a scoped 150 deploy-sync job without re-enabling unrelated ForWin automation.
-- Deploy all runtime images affected by this repository, including the Python API image, Go API, frontend, Go ChannelOps runner, Go FFmpeg worker, and the managed Python GPU worker.
+- Deploy all runtime images affected by this repository, including the Python API image, Go API, frontend, Go ChannelOps runner, Go FFmpeg worker, and the managed Python worker image on 150.
 - Prove the deployment with a real `source -> trim -> export` job using 150 Postgres/Redis/MinIO and workers placed on the intended hosts.
 - Retain a downloadable MP4 and machine-readable run evidence.
 - Keep all smoke output private; do not start or invoke a public upload.
@@ -49,7 +49,7 @@ This could react immediately to pushes, but it duplicates the existing deploy-sy
 
 ## Target Distribution
 
-### Host 150: support, control, and GPU worker
+### Host 150: support, control, and managed Python worker
 
 - Docker Swarm manager and deployment controller.
 - Shared Postgres `:5435`, VideoProcess Redis `:6380`, MinIO `:9000`, Qdrant, Redpanda, embedding, and browser/account services.
@@ -91,20 +91,21 @@ developer push to GitHub main
           +--> fetch exact commit and stage source
           +--> sync runtime source to 127
           +--> build 127-consumed images on 127
-          +--> build Python GPU-worker image on 150
+          +--> build Python worker image on 150
           +--> update/create Swarm services with host-specific constraints
           +--> wait for service convergence and health
           +--> write commit markers and deployment state
           v
 127 serves frontend/API and processes Go media work
-150 serves shared state/artifacts and Python GPU work
+150 serves shared state/artifacts and Python media work in CPU mode
 ```
 
 The first deployment remains manual and scoped:
 
 ```bash
 /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh \
-  --apply --project vp-app --project vp-feature-aggregator
+  --apply --force \
+  --project vp-app --project vp-feature-aggregator --project vp-pds
 ```
 
 Only after that succeeds is a dedicated cron entry enabled for the same projects. The previously disabled all-project cron remains disabled so this work cannot redeploy ForWin.
@@ -117,7 +118,7 @@ The 127 Colima profile is recreated with persisted CPU, memory, disk, VM hostnam
 - 127 node: `vp.runtime=true`.
 - 126 node: no `vp.runtime` label.
 
-VideoProcess application services replace `node.labels.role==app` with `node.labels.vp.runtime==true`. The managed Python GPU worker uses `node.labels.vp.gpu==true`. This prevents opportunistic scheduling onto 126.
+VideoProcess application services replace `node.labels.role==app` with `node.labels.vp.runtime==true`. The managed Python worker uses `node.labels.vp.gpu==true` as a 150 placement label only; it does not claim that Swarm GPU device allocation is ready. This prevents opportunistic scheduling onto 126.
 
 A user LaunchAgent on 127 starts the named Colima profile after login. Swarm restart policies remain responsible for restarting containers after the node returns.
 
@@ -134,7 +135,7 @@ The `vp-app` deployment must build and update these image/service relationships:
 | Go FFmpeg worker | 127 | `vp-ffmpeg-worker-go-swarm` |
 | Python worker | 150 | `vp-ffmpeg-worker-gpu-swarm` |
 
-The 150 GPU worker receives explicit production Postgres, Redis, MinIO, bucket, worker-host, credentials-directory, and GPU settings. Database and MinIO credentials have no source-controlled fallback; the deploy fails before service mutation unless all required settings are present. The worker-admission guard must pass before it opens Redis or Postgres. Any legacy standalone Python FFmpeg process remains stopped.
+The 150 Python worker receives explicit production Postgres, Redis, MinIO, bucket, worker-host, and CPU-safe video settings. Database and MinIO credentials have no source-controlled fallback; the deploy fails before service mutation unless all required settings are present. Platform-publication credentials are deliberately absent until a separate worker and explicit human-review gate exist. GPU processing remains disabled until Swarm service-level device allocation and task-level verification are configured. The worker-admission guard must pass before it opens Redis or Postgres. Any legacy standalone Python FFmpeg process remains stopped.
 
 The deploy controller records the exact Git commit only after builds, service updates, and health gates succeed. A failure leaves diagnostic logs and does not advance the deployment marker. Before mutation, the extension snapshots current images. On failure it restores those images while retaining `vp.runtime`/`vp.gpu` placement, and removes a Python worker created by the failed attempt. It never invokes generic Swarm spec rollback because that could restore `node.labels.role==app` and move work back to 126.
 
@@ -155,7 +156,7 @@ The smoke uses the production entry point without invoking any publication node:
 
 - 150 reports both `ccttww-lap` and `colima-127` as Ready.
 - Every normal VideoProcess service is `1/1`; the feature aggregator is not left at `0/1`.
-- `docker service ps` shows application services on `colima-127` and the Python GPU worker on the 150 node.
+- `docker service ps` shows application services on `colima-127` and the CPU-mode Python worker on the 150 node.
 - 127 frontend and API host forwards answer on their documented ports.
 - Redis consumer groups have no unexpected active Python FFmpeg consumer and no pending message belonging to the smoke node executions.
 - The deployed source marker equals the pushed commit.
@@ -170,7 +171,7 @@ The smoke uses the production entry point without invoking any publication node:
 - If 127 is unavailable, fail the VideoProcess deployment closed instead of scheduling or building on 126.
 - If the scoped manual deployment fails, keep the VP cron disabled.
 - If the video job fails, preserve job payload, service logs, Redis state, and artifacts for systematic diagnosis.
-- If the 150 GPU worker fails admission, it must remain outside the production queue.
+- If the 150 Python worker fails admission, it must remain outside the production queue.
 
 ## Testing And Evidence
 
@@ -186,7 +187,7 @@ The smoke uses the production entry point without invoking any publication node:
 - `main` is pushed and the 150 mirror observes the exact commit.
 - 127 is a Ready Swarm node named `colima-127` with `vp.runtime=true`.
 - Normal VideoProcess services run on 127, not 126.
-- The managed Python GPU worker runs on 150 with admission-approved configuration.
+- The managed Python worker runs on 150 with admission-approved CPU-mode configuration.
 - The VP-only deploy schedule is enabled while the all-project schedule remains disabled.
 - A real pipeline produces a retained, playable MP4 through 127 workers and 150 shared storage.
 - The completed job and artifact remain readable after service restart.

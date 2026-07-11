@@ -41,27 +41,39 @@ def redis_client() -> redis.Redis:
     return redis.Redis.from_url(url, decode_responses=True)
 
 
-def pending_node_execution_ids(client: Any, node_execution_ids: set[str]) -> list[str]:
+def pending_node_execution_ids(
+    client: Any,
+    node_execution_ids: set[str],
+    *,
+    page_size: int = 100,
+) -> list[str]:
     matching: list[str] = []
-    pending_entries = client.xpending_range(
-        "vp:tasks:ffmpeg_go",
-        "ffmpeg_go-workers",
-        min="-",
-        max="+",
-        count=1000,
-    )
-    for pending in pending_entries:
-        message_id = str(pending["message_id"])
-        entries = client.xrange(
+    page_min = "-"
+    while True:
+        pending_entries = client.xpending_range(
             "vp:tasks:ffmpeg_go",
-            min=message_id,
-            max=message_id,
-            count=1,
+            "ffmpeg_go-workers",
+            min=page_min,
+            max="+",
+            count=page_size,
         )
-        for _, data in entries:
-            node_execution_id = str(data.get("node_execution_id", ""))
-            if node_execution_id in node_execution_ids:
-                matching.append(node_execution_id)
+        if not pending_entries:
+            break
+        for pending in pending_entries:
+            message_id = str(pending["message_id"])
+            entries = client.xrange(
+                "vp:tasks:ffmpeg_go",
+                min=message_id,
+                max=message_id,
+                count=1,
+            )
+            for _, data in entries:
+                node_execution_id = str(data.get("node_execution_id", ""))
+                if node_execution_id in node_execution_ids:
+                    matching.append(node_execution_id)
+        if len(pending_entries) < page_size:
+            break
+        page_min = f"({message_id}"
     return matching
 
 
@@ -77,8 +89,12 @@ def wait_for_node_acknowledgements(node_execution_ids: set[str]) -> None:
 
 
 class _PendingRedisStub:
-    def xpending_range(self, *_args: Any, **_kwargs: Any) -> list[dict[str, str]]:
-        return [{"message_id": "1-0"}, {"message_id": "2-0"}]
+    def xpending_range(self, *_args: Any, **kwargs: Any) -> list[dict[str, str]]:
+        if kwargs["min"] == "-":
+            return [{"message_id": "1-0"}, {"message_id": "2-0"}]
+        if kwargs["min"] == "(2-0":
+            return [{"message_id": "3-0"}]
+        return []
 
     def xrange(
         self,
@@ -90,12 +106,16 @@ class _PendingRedisStub:
     ) -> list[tuple[str, dict[str, str]]]:
         assert min == max
         assert count == 1
-        node_id = "target-node" if min == "1-0" else "unrelated-node"
+        node_id = "target-node" if min == "3-0" else "unrelated-node"
         return [(min, {"node_execution_id": node_id})]
 
 
 def test_pending_node_execution_ids_filters_unrelated_production_work() -> None:
-    assert pending_node_execution_ids(_PendingRedisStub(), {"target-node"}) == [
+    assert pending_node_execution_ids(
+        _PendingRedisStub(),
+        {"target-node"},
+        page_size=2,
+    ) == [
         "target-node"
     ]
 
