@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import Mapping
 from urllib.parse import urlparse
 
@@ -43,7 +44,7 @@ def validate_worker_admission(env: Mapping[str, str]) -> WorkerAdmissionDecision
 
     if worker_type == "youtube_publisher":
         manager_url = _env_value(env, "YOUTUBE_MANAGER_URL", "")
-        if not manager_url or _host_from_url(manager_url) in LOCAL_HOSTS:
+        if not manager_url or _is_local_host(_host_from_url(manager_url)):
             reasons.append(
                 "production youtube_publisher workers require a non-local YOUTUBE_MANAGER_URL"
             )
@@ -84,14 +85,14 @@ def _append_minio_reasons(
             reasons.append(f"{worker_label} require {key}")
 
     minio_endpoint = _env_value(env, "MINIO_ENDPOINT", "")
-    if minio_endpoint and _host_from_endpoint(minio_endpoint) in LOCAL_HOSTS:
+    if minio_endpoint and _is_local_host(_host_from_endpoint(minio_endpoint)):
         reasons.append(f"production MinIO endpoint must not point at {minio_endpoint}")
 
 
 def _is_production_queue_consumer(*, deploy_mode: str, redis_url: str) -> bool:
     if deploy_mode in PRODUCTION_DEPLOY_MODES:
         return True
-    return _host_from_url(redis_url) not in LOCAL_HOSTS
+    return not _is_local_host(_host_from_url(redis_url))
 
 
 def _host_from_url(url: str) -> str:
@@ -108,3 +109,14 @@ def _host_from_endpoint(endpoint: str) -> str:
 
 def _normalize_host(hostname: str | None) -> str:
     return (hostname or "").lower().strip("[]").removesuffix(".")
+
+
+def _is_local_host(hostname: str) -> bool:
+    normalized_hostname = _normalize_host(hostname)
+    if normalized_hostname in LOCAL_HOSTS:
+        return True
+    try:
+        address = ip_address(normalized_hostname)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified

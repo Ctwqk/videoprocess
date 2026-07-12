@@ -51,6 +51,23 @@ def test_production_youtube_publisher_rejects_root_qualified_local_manager_url()
 
 
 @pytest.mark.parametrize(
+    "manager_url",
+    ("http://[0:0:0:0:0:0:0:1]:8899", "http://[::]:8899"),
+    ids=("expanded-loopback", "unspecified"),
+)
+def test_production_youtube_publisher_rejects_ipv6_loopback_or_unspecified_manager(
+    manager_url: str,
+) -> None:
+    env = _publisher_env()
+    env["YOUTUBE_MANAGER_URL"] = manager_url
+
+    decision = validate_worker_admission(env)
+
+    assert decision.allowed is False
+    assert "production youtube_publisher workers require a non-local YOUTUBE_MANAGER_URL" in decision.reasons
+
+
+@pytest.mark.parametrize(
     "missing_key",
     ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET"),
 )
@@ -161,6 +178,32 @@ def test_remote_ffmpeg_worker_rejects_root_qualified_localhost_minio_endpoint() 
 
     assert decision.allowed is False
     assert "production MinIO endpoint must not point at localhost.:9000" in decision.reasons
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ("[0:0:0:0:0:0:0:1]:9000", "[::]:9000"),
+    ids=("expanded-loopback", "unspecified"),
+)
+def test_remote_ffmpeg_worker_rejects_ipv6_loopback_or_unspecified_minio_endpoint(
+    endpoint: str,
+) -> None:
+    decision = validate_worker_admission(
+        {
+            "DEPLOY_MODE": "local",
+            "REDIS_URL": "redis://10.0.0.150:6380/0",
+            "WORKER_TYPE": "ffmpeg",
+            "WORKER_HOST": "150-gpu",
+            "STORAGE_BACKEND": "minio",
+            "MINIO_ENDPOINT": endpoint,
+            "MINIO_ACCESS_KEY": "minioadmin",
+            "MINIO_SECRET_KEY": "minioadmin",
+            "MINIO_BUCKET": "videoprocess",
+        }
+    )
+
+    assert decision.allowed is False
+    assert f"production MinIO endpoint must not point at {endpoint}" in decision.reasons
 
 
 def test_remote_ffmpeg_worker_with_minio_and_explicit_host_is_allowed() -> None:
