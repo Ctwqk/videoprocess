@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -196,7 +197,6 @@ async def test_mark_succeeded_rejects_duplicate_platform_video_id(operation_sess
 @pytest.mark.asyncio
 async def test_competing_successes_cannot_replace_the_winning_receipt(
     operation_session_factory,
-    monkeypatch,
 ):
     store = YouTubeUploadOperationStore(operation_session_factory)
     async with operation_session_factory() as db:
@@ -204,39 +204,19 @@ async def test_competing_successes_cannot_replace_the_winning_receipt(
     claim = await store.claim(context)
     await store.mark_submitted(claim.operation.id, "manager-task-1")
 
-    original_operation = YouTubeUploadOperationStore._operation
-    both_reads_complete = asyncio.Event()
-    read_count = 0
+    start_barrier = asyncio.Barrier(2)
 
-    async def force_stale_read_interleaving(db, operation_id):
-        nonlocal read_count
-        operation = await original_operation(db, operation_id)
-        await db.commit()
-        read_count += 1
-        if read_count == 2:
-            both_reads_complete.set()
-        try:
-            await asyncio.wait_for(both_reads_complete.wait(), timeout=0.5)
-        except TimeoutError:
-            pass
-        return operation
+    async def transition(platform_video_id: str, title: str):
+        await start_barrier.wait()
+        return await store.mark_succeeded(
+            claim.operation.id,
+            platform_video_id,
+            {"video_id": platform_video_id, "title": title},
+        )
 
-    monkeypatch.setattr(
-        YouTubeUploadOperationStore,
-        "_operation",
-        staticmethod(force_stale_read_interleaving),
-    )
     results = await asyncio.gather(
-        store.mark_succeeded(
-            claim.operation.id,
-            "video-win-a",
-            {"video_id": "video-win-a", "title": "receipt-a"},
-        ),
-        store.mark_succeeded(
-            claim.operation.id,
-            "video-win-b",
-            {"video_id": "video-win-b", "title": "receipt-b"},
-        ),
+        transition("video-win-a", "receipt-a"),
+        transition("video-win-b", "receipt-b"),
         return_exceptions=True,
     )
 
@@ -273,12 +253,21 @@ def test_operation_model_requires_manager_task_for_submitted_and_succeeded_state
         if isinstance(constraint, CheckConstraint)
     }
     assert checks["ck_youtube_upload_operations_manager_task"] == (
-        "status NOT IN ('submitted', 'succeeded') OR manager_task_id IS NOT NULL"
+        "status NOT IN ('submitted', 'succeeded') OR "
+        "(manager_task_id IS NOT NULL AND length(trim(manager_task_id)) > 0)"
     )
 
 
+@pytest.mark.parametrize(
+    "manager_task_id",
+    [None, "", "   "],
+    ids=["null", "empty", "whitespace"],
+)
 @pytest.mark.asyncio
-async def test_database_rejects_submitted_operation_without_manager_task(operation_session_factory):
+async def test_database_rejects_submitted_operation_without_nonblank_manager_task(
+    operation_session_factory,
+    manager_task_id,
+):
     store = YouTubeUploadOperationStore(operation_session_factory)
     async with operation_session_factory() as db:
         context = await _context_for(db)
@@ -288,15 +277,27 @@ async def test_database_rejects_submitted_operation_without_manager_task(operati
         operation = await db.get(YouTubeUploadOperation, claim.operation.id)
         assert operation is not None
         operation.status = "submitted"
-        operation.manager_task_id = None
+        operation.manager_task_id = manager_task_id
         with pytest.raises(IntegrityError):
             await db.commit()
         await db.rollback()
 
 
+@pytest.mark.asyncio
+async def test_mark_submitted_rejects_whitespace_manager_task(operation_session_factory):
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+    claim = await store.claim(context)
+
+    with pytest.raises(ValueError, match="manager task id is required"):
+        await store.mark_submitted(claim.operation.id, "   ")
+
+
 @pytest.mark.parametrize("status", ["submitted", "succeeded"])
-def test_managerless_durable_state_fails_closed(status):
-    operation = YouTubeUploadOperation(status=status, manager_task_id=None)
+@pytest.mark.parametrize("manager_task_id", [None, "", "   "])
+def test_managerless_durable_state_fails_closed(status, manager_task_id):
+    operation = YouTubeUploadOperation(status=status, manager_task_id=manager_task_id)
     assert YouTubeUploadOperationStore._action_for(operation) == "block"
 
 
@@ -333,6 +334,58 @@ async def test_receipt_quota_estimate_is_a_finite_numeric_scalar_or_none(
     assert succeeded.receipt_json["quota_estimate"] == expected
 
 
+@pytest.mark.asyncio
+async def test_receipt_never_stringifies_nested_or_non_string_values(operation_session_factory):
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+    claim = await store.claim(context)
+    await store.mark_submitted(claim.operation.id, "manager-task-1")
+
+    secrets = {
+        "RECEIPT_VIDEO_TOKEN",
+        "RECEIPT_URL_TOKEN",
+        "RECEIPT_VIDEO_URL_TOKEN",
+        "RECEIPT_TITLE_TOKEN",
+        "RECEIPT_PRIVACY_TOKEN",
+        "RECEIPT_TAG_DICT_TOKEN",
+        "RECEIPT_TAG_LIST_TOKEN",
+        "RECEIPT_QUOTA_TOKEN",
+        "RECEIPT_IGNORED_TOKEN",
+    }
+    succeeded = await store.mark_succeeded(
+        claim.operation.id,
+        "safe-video-id",
+        {
+            "video_id": {"access_token": "RECEIPT_VIDEO_TOKEN"},
+            "url": {"access_token": "RECEIPT_URL_TOKEN"},
+            "video_url": [{"refresh_token": "RECEIPT_VIDEO_URL_TOKEN"}],
+            "title": {"token": "RECEIPT_TITLE_TOKEN"},
+            "privacy": {"token": "RECEIPT_PRIVACY_TOKEN"},
+            "tags": [
+                "safe-tag",
+                {"access_token": "RECEIPT_TAG_DICT_TOKEN"},
+                ["RECEIPT_TAG_LIST_TOKEN"],
+                True,
+                1600,
+            ],
+            "quota_estimate": {"access_token": "RECEIPT_QUOTA_TOKEN"},
+            "ignored": {"access_token": "RECEIPT_IGNORED_TOKEN"},
+        },
+    )
+
+    assert succeeded.receipt_json == {
+        "video_id": "safe-video-id",
+        "url": "",
+        "title": "Owned canary",
+        "privacy": "unlisted",
+        "tags": ["safe-tag"],
+        "quota_estimate": None,
+    }
+    serialized = json.dumps(succeeded.receipt_json, sort_keys=True)
+    assert all(secret not in serialized for secret in secrets)
+
+
 def test_publication_record_orm_has_migration_unique_indexes():
     indexes = {index.name: index for index in PublicationRecord.__table__.indexes}
 
@@ -362,4 +415,12 @@ def test_alembic_upgrade_head_renders_offline_postgresql_sql():
     assert "DO $$" in completed.stdout
     assert "RAISE EXCEPTION 'cannot add ux_publication_records_production_task" in completed.stdout
     assert "RAISE EXCEPTION 'cannot add ux_publication_records_platform_content" in completed.stdout
+
+    widening = "ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(128)"
+    revision_update = (
+        "UPDATE alembic_version SET version_num='020_channelops_decision_audit_failure_category'"
+    )
+    assert widening in completed.stdout
+    assert completed.stdout.index(widening) < completed.stdout.index(revision_update)
     assert "CONSTRAINT ck_youtube_upload_operations_manager_task CHECK" in completed.stdout
+    assert "length(trim(manager_task_id)) > 0" in completed.stdout

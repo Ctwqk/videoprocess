@@ -123,7 +123,8 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["input_artifact_id"], ["artifacts.id"]),
         sa.PrimaryKeyConstraint("id"),
         sa.CheckConstraint(
-            "status NOT IN ('submitted', 'succeeded') OR manager_task_id IS NOT NULL",
+            "status NOT IN ('submitted', 'succeeded') OR "
+            "(manager_task_id IS NOT NULL AND length(trim(manager_task_id)) > 0)",
             name="ck_youtube_upload_operations_manager_task",
         ),
         sa.UniqueConstraint("node_execution_id", name="uq_youtube_upload_operations_node_execution"),

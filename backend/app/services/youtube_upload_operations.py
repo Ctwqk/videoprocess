@@ -71,7 +71,7 @@ class YouTubeUploadOperationStore:
             return UploadOperationClaim("submit", operation)
 
     async def mark_submitted(self, operation_id: uuid.UUID, manager_task_id: str) -> YouTubeUploadOperation:
-        if not manager_task_id:
+        if not self._is_nonblank_string(manager_task_id):
             raise ValueError("manager task id is required")
 
         async with self._session_factory() as db:
@@ -105,7 +105,7 @@ class YouTubeUploadOperationStore:
         platform_video_id: str,
         receipt: dict[str, Any],
     ) -> YouTubeUploadOperation:
-        if not platform_video_id:
+        if not self._is_nonblank_string(platform_video_id):
             raise ValueError("platform video id is required")
 
         async with self._session_factory() as db:
@@ -251,9 +251,13 @@ class YouTubeUploadOperationStore:
 
     @staticmethod
     def _action_for(operation: YouTubeUploadOperation) -> str:
-        if operation.status == "submitted" and operation.manager_task_id:
+        if operation.status == "submitted" and YouTubeUploadOperationStore._is_nonblank_string(
+            operation.manager_task_id
+        ):
             return "resume"
-        if operation.status == "succeeded" and operation.manager_task_id:
+        if operation.status == "succeeded" and YouTubeUploadOperationStore._is_nonblank_string(
+            operation.manager_task_id
+        ):
             return "replay"
         return "block"
 
@@ -266,12 +270,15 @@ class YouTubeUploadOperationStore:
         receipt: dict[str, Any],
     ) -> dict[str, Any]:
         raw_tags = receipt.get("tags", [])
-        tags = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
+        tags = [tag for tag in raw_tags if isinstance(tag, str)] if isinstance(raw_tags, list) else []
+        url = receipt.get("url")
+        if not isinstance(url, str):
+            url = receipt.get("video_url")
         return {
             "video_id": platform_video_id,
-            "url": str(receipt.get("url") or receipt.get("video_url") or ""),
-            "title": str(receipt.get("title") or title),
-            "privacy": str(receipt.get("privacy") or privacy),
+            "url": url if isinstance(url, str) else "",
+            "title": receipt["title"] if isinstance(receipt.get("title"), str) else title,
+            "privacy": receipt["privacy"] if isinstance(receipt.get("privacy"), str) else privacy,
             "tags": tags,
             "quota_estimate": YouTubeUploadOperationStore._finite_number_or_none(
                 receipt.get("quota_estimate", receipt.get("quota_units_estimated"))
@@ -289,3 +296,7 @@ class YouTubeUploadOperationStore:
         except (TypeError, ValueError, OverflowError):
             return None
         return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _is_nonblank_string(value: Any) -> bool:
+        return isinstance(value, str) and bool(value.strip())
