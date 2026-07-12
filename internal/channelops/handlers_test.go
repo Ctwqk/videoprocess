@@ -297,6 +297,77 @@ func TestAutoFlowRequestForTaskExternalAssetsUseReviewPolicyAndPrivateDefault(t 
 	}
 }
 
+func TestAutoFlowRequestForTaskOwnedInputAsset(t *testing.T) {
+	task := ProductionTaskRow{
+		ID:                  "task-1",
+		ChannelProfileID:    "channel-1",
+		TargetAccountID:     "account-1",
+		Prompt:              "Make a short",
+		UsesExternalAssets:  true,
+		SourcePlatformsJSON: []string{"youtube", "bilibili"},
+		ChannelConfigSnapshotJSON: map[string]any{
+			"channel":     map[string]any{},
+			"lane_format": map[string]any{},
+			"manual_seed": map[string]any{
+				"constraints_json": map[string]any{
+					"input_asset_id":  "00000000-0000-0000-0000-000000000123",
+					"source_strategy": "input_video",
+					"planning_mode":   "template",
+				},
+			},
+		},
+	}
+
+	request := AutoFlowRequestForTask(task)
+
+	if request["input_asset_id"] != "00000000-0000-0000-0000-000000000123" {
+		t.Fatalf("input_asset_id = %#v", request["input_asset_id"])
+	}
+	if request["source_strategy"] != "input_video" {
+		t.Fatalf("source_strategy = %#v", request["source_strategy"])
+	}
+	if request["planning_mode"] != "template" {
+		t.Fatalf("planning_mode = %#v", request["planning_mode"])
+	}
+	if request["source_policy"] != "owned_only" {
+		t.Fatalf("source_policy = %#v", request["source_policy"])
+	}
+	if got := stringSliceFromAny(request["source_platforms"]); len(got) != 0 {
+		t.Fatalf("source_platforms = %#v, want no external platforms", got)
+	}
+	if _, ok := mapFromAny(request["constraints"])["input_asset_id"]; ok {
+		t.Fatalf("constraints must not retain input_asset_id: %#v", request["constraints"])
+	}
+}
+
+func TestAutoFlowRequestForTaskInvalidInputAssetIDFailsClosed(t *testing.T) {
+	for _, inputAssetID := range []string{
+		"",
+		"00000000-0000-0000-0000-00000000012",
+		"00000000-0000-0000-0000-000000000123 ",
+		"00000000-0000-0000-0000-00000000012G",
+		"00000000-0000-0000-0000-000000000123"[:35],
+		"00000000-0000-0000-0000-000000000123\n",
+		"ABCDEFAB-1234-4ABC-8DEF-ABCDEFABCDEF",
+	} {
+		t.Run(inputAssetID, func(t *testing.T) {
+			task := representativeAutoFlowRequestTask()
+			task.ChannelConfigSnapshotJSON["manual_seed"] = map[string]any{
+				"constraints_json": map[string]any{"input_asset_id": inputAssetID},
+			}
+
+			request := AutoFlowRequestForTask(task)
+
+			if _, ok := request["input_asset_id"]; ok {
+				t.Fatalf("invalid input_asset_id forwarded: %#v", request["input_asset_id"])
+			}
+			if _, ok := mapFromAny(request["constraints"])["input_asset_id"]; ok {
+				t.Fatalf("constraints retained invalid input_asset_id: %#v", request["constraints"])
+			}
+		})
+	}
+}
+
 func TestAutoFlowRequestForTaskInvalidAspectRatioFallsBack(t *testing.T) {
 	task := ProductionTaskRow{
 		ID:     "task-1",

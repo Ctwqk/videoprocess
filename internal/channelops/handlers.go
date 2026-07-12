@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type PDSDecider interface {
@@ -507,6 +509,7 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 	riskPolicy := mapFromAny(channel["risk_policy_json"])
 	manualSeedConstraints := mapFromAny(manualSeed["constraints_json"])
 	sourcePlatforms := effectiveSourcePlatforms(task, laneFormat)
+	inputAssetID := ownedInputAssetID(manualSeedConstraints)
 	constraints := map[string]any{
 		"lane_id":            firstString(lane, "id"),
 		"lane_format_id":     firstString(laneFormat, "id"),
@@ -524,10 +527,13 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 		},
 	}
 	for key, value := range manualSeedConstraints {
+		if key == "input_asset_id" {
+			continue
+		}
 		constraints[key] = value
 	}
 
-	return map[string]any{
+	request := map[string]any{
 		"prompt":               task.Prompt,
 		"target_platforms":     []string{"youtube"},
 		"source_platforms":     sourcePlatforms,
@@ -540,6 +546,26 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 		"planning_mode":        normalizePlanningMode(firstNonBlank(manualSeed["planning_mode"], manualSeedConstraints["planning_mode"], riskPolicy["planning_mode"])),
 		"constraints":          constraints,
 	}
+	if inputAssetID != "" {
+		request["input_asset_id"] = inputAssetID
+		request["source_platforms"] = []string{}
+		request["source_policy"] = "owned_only"
+		request["source_strategy"] = "input_video"
+		request["planning_mode"] = "template"
+	}
+	return request
+}
+
+func ownedInputAssetID(constraints map[string]any) string {
+	value, ok := constraints["input_asset_id"].(string)
+	if !ok || value == "" {
+		return ""
+	}
+	parsed, err := uuid.Parse(value)
+	if err != nil || parsed.String() != value {
+		return ""
+	}
+	return value
 }
 
 func effectiveSourcePlatforms(task ProductionTaskRow, laneFormat map[string]any) []string {

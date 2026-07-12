@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ChannelProfileCreate(BaseModel):
@@ -87,6 +88,29 @@ class ManualSeedCreate(BaseModel):
     source_platforms_json: list[str] = Field(default_factory=list)
     material_library_ids_json: list[str] = Field(default_factory=list)
     constraints_json: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_owned_input_canary(self) -> ManualSeedCreate:
+        input_asset_id = self.constraints_json.get("input_asset_id")
+        if input_asset_id in (None, ""):
+            return self
+        if not isinstance(input_asset_id, str):
+            raise ValueError("input_asset_id must be a canonical UUID")
+        try:
+            canonical_asset_id = str(UUID(input_asset_id))
+        except ValueError as error:
+            raise ValueError("input_asset_id must be a canonical UUID") from error
+        if input_asset_id != canonical_asset_id:
+            raise ValueError("input_asset_id must be a canonical UUID")
+        if self.source_platforms_json:
+            raise ValueError("owned input canaries cannot select external source platforms")
+        if self.source_policy != "owned_only":
+            raise ValueError("owned input canaries require source_policy=owned_only")
+        if self.constraints_json.get("source_strategy") not in (None, "input_video"):
+            raise ValueError("owned input canaries require source_strategy=input_video")
+        if self.constraints_json.get("planning_mode") not in (None, "template"):
+            raise ValueError("owned input canaries require planning_mode=template")
+        return self
 
 
 class QueueItemRead(BaseModel):
