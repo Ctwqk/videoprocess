@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.autoflow.capability_manifest import get_capability_manifest
 from app.autoflow.content_strategy import ContentStrategyService
 from app.autoflow.metrics_service import MetricsService
-from app.autoflow.service import autoflow_service
+from app.autoflow.service import OwnedInputAssetError, autoflow_service
 from app.autoflow.template_library import TemplateLibrary
 from app.autoflow.trend_service import TrendService
 from app.db import get_db
@@ -34,13 +34,18 @@ content_strategy_service = ContentStrategyService()
 
 @router.post("/plan", response_model=AutoFlowPlan)
 async def create_plan(data: AutoFlowRequest, db: AsyncSession | None = Depends(get_db)):
-    return await autoflow_service.plan(data, db)
+    try:
+        return await autoflow_service.plan(data, db)
+    except OwnedInputAssetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/plan/graph", response_model=AutoFlowPlan)
 async def create_graph_plan(data: AutoFlowRequest, db: AsyncSession | None = Depends(get_db)):
     try:
         return await autoflow_service.plan_graph(data, db)
+    except OwnedInputAssetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -124,6 +129,8 @@ async def reject_plan(
 async def execute_plan(data: AutoFlowExecuteRequest, db: AsyncSession | None = Depends(get_db)):
     try:
         return await autoflow_service.execute(data, db)
+    except OwnedInputAssetError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:

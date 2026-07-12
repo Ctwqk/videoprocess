@@ -19,7 +19,10 @@ from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
 from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
 from app.models.autoflow import AutoFlowUsedClip
 from app.models.autoflow import ContentMetric, TrendSignal
+from app.models.asset import Asset
+from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowExecuteRequest, AutoFlowRequest
+from app.schemas.pipeline import PipelineDefinition
 
 
 @pytest.fixture
@@ -27,6 +30,7 @@ async def autoflow_db_session():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
         for table in (
+            Asset.__table__,
             AutoFlowPlanModel.__table__,
             AutoFlowRunModel.__table__,
             AutoFlowUsedClip.__table__,
@@ -54,6 +58,18 @@ def _app_with_db(db_session):
     app.include_router(router)
     app.dependency_overrides[get_db] = lambda: db_session
     return app
+
+
+def _owned_generated_video_asset(asset_id: uuid.UUID | None = None) -> Asset:
+    asset_id = asset_id or uuid.uuid4()
+    return Asset(
+        id=asset_id,
+        filename=f"{asset_id}.mp4",
+        original_name="owned-input.mp4",
+        mime_type="video/mp4",
+        storage_path=f"assets/{asset_id}.mp4",
+        media_info={"license": "owned", "provenance": "generated"},
+    )
 
 
 class StaticSelector:
@@ -260,6 +276,119 @@ async def test_db_backed_plan_get_and_list_read_persisted_plan(autoflow_db_sessi
         listed = await client.get("/api/v1/autoflow/plans")
         assert listed.status_code == 200
         assert [item["plan_id"] for item in listed.json()] == [plan["plan_id"]]
+
+
+@pytest.mark.asyncio
+async def test_db_plan_rejects_untrusted_owned_input_assets(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+    unowned_asset = _owned_generated_video_asset()
+    unowned_asset.media_info = {"license": "external", "provenance": "generated"}
+    image_asset = _owned_generated_video_asset()
+    image_asset.mime_type = "image/png"
+    autoflow_db_session.add_all([unowned_asset, image_asset])
+    await autoflow_db_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        payload = {
+            "prompt": "Create an owned input canary.",
+            "input_asset_id": str(uuid.uuid4()),
+            "source_strategy": "input_video",
+            "publish_mode": "unlisted_upload",
+        }
+        missing = await client.post("/api/v1/autoflow/plan", json=payload)
+        unowned = await client.post(
+            "/api/v1/autoflow/plan",
+            json={**payload, "input_asset_id": str(unowned_asset.id)},
+        )
+        wrong_type = await client.post(
+            "/api/v1/autoflow/plan",
+            json={**payload, "input_asset_id": str(image_asset.id)},
+        )
+        graph = await client.post(
+            "/api/v1/autoflow/plan/graph",
+            json={
+                **payload,
+                "prompt": "生成一个视频，上半部分是小狗，下半部分是小猫视频，上半部分先播放，下半部分后播放",
+                "input_asset_id": str(uuid.uuid4()),
+                "planning_mode": "ai_graph",
+            },
+        )
+
+    assert missing.status_code == 400
+    assert unowned.status_code == 400
+    assert wrong_type.status_code == 400
+    assert graph.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_db_plan_accepts_owned_generated_video_input_asset(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+    asset = _owned_generated_video_asset()
+    autoflow_db_session.add(asset)
+    await autoflow_db_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create an owned input canary.",
+                "input_asset_id": str(asset.id),
+                "source_strategy": "input_video",
+                "publish_mode": "unlisted_upload",
+                "min_shots": 3,
+                "max_shots": 3,
+            },
+        )
+
+    assert response.status_code == 200
+    plan = response.json()
+    definition = PipelineDefinition.model_validate(plan["pipeline_definition"])
+    assert definition.nodes
+    assert [node.type for node in definition.nodes].count("youtube_upload") == 1
+    assert validate_pipeline(definition).valid
+
+
+@pytest.mark.asyncio
+async def test_db_execute_revalidates_owned_input_asset_before_pipeline_creation(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+    asset = _owned_generated_video_asset()
+    autoflow_db_session.add(asset)
+    await autoflow_db_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        planned = await client.post(
+            "/api/v1/autoflow/plan",
+            json={
+                "prompt": "Create an owned input canary.",
+                "input_asset_id": str(asset.id),
+                "source_strategy": "input_video",
+                "publish_mode": "unlisted_upload",
+            },
+        )
+        assert planned.status_code == 200
+        await autoflow_db_session.delete(asset)
+        await autoflow_db_session.commit()
+        executed = await client.post("/api/v1/autoflow/execute", json={"plan_id": planned.json()["plan_id"]})
+
+    assert executed.status_code == 400
+    assert (await autoflow_db_session.execute(select(AutoFlowRunModel))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_db_plan_treats_empty_input_asset_id_as_ordinary_request(autoflow_db_session):
+    _reset_autoflow_singletons()
+    app = _app_with_db(autoflow_db_session)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/autoflow/plan",
+            json={"prompt": "Create an ordinary preview.", "input_asset_id": ""},
+        )
+
+    assert response.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -666,13 +795,16 @@ async def test_patch_plan_can_clear_last_candidate_lock(autoflow_db_session):
 async def test_storyboard_endpoint_and_input_video_plan_persist_storyboard(autoflow_db_session):
     _reset_autoflow_singletons()
     app = _app_with_db(autoflow_db_session)
+    asset = _owned_generated_video_asset()
+    autoflow_db_session.add(asset)
+    await autoflow_db_session.commit()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         storyboard_response = await client.post(
             "/api/v1/autoflow/storyboard",
             json={
                 "prompt": "我要一个 15 秒小猫视频，竖屏，可爱快节奏",
-                "input_asset_id": "asset-cat",
+                "input_asset_id": str(asset.id),
                 "target_duration": 15,
                 "aspect_ratio": "9:16",
                 "source_strategy": "input_video",
@@ -689,7 +821,7 @@ async def test_storyboard_endpoint_and_input_video_plan_persist_storyboard(autof
             "/api/v1/autoflow/plan",
             json={
                 "prompt": "我要一个 15 秒小猫视频，竖屏，可爱快节奏",
-                "input_asset_id": "asset-cat",
+                "input_asset_id": str(asset.id),
                 "target_platforms": ["youtube_shorts"],
                 "duration_sec": 15,
                 "aspect_ratio": "9:16",

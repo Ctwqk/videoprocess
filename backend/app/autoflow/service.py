@@ -23,6 +23,7 @@ from app.autoflow.template_library import TemplateLibrary
 from app.autoflow.validation_repair import AutoFlowRepairService, AutoFlowUnrepairableError
 from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
 from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
+from app.models.asset import Asset
 from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import (
     AutoFlowClipCandidate,
@@ -50,6 +51,10 @@ class CandidateSelector(Protocol):
         db: AsyncSession | None = None,
     ) -> list[AutoFlowClipCandidate]:
         ...
+
+
+class OwnedInputAssetError(ValueError):
+    pass
 
 
 class AutoFlowService:
@@ -81,6 +86,7 @@ class AutoFlowService:
         self._runs: dict[str, AutoFlowRun] = {}
 
     async def plan(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
+        await self._validate_owned_input_asset(request, db)
         fallback_warnings: list[str] = []
         if request.planning_mode == "ai_graph":
             try:
@@ -185,7 +191,9 @@ class AutoFlowService:
         return plan
 
     async def plan_graph(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
-        return await self._plan_graph(request.model_copy(update={"planning_mode": "ai_graph"}), db)
+        graph_request = request.model_copy(update={"planning_mode": "ai_graph"})
+        await self._validate_owned_input_asset(graph_request, db)
+        return await self._plan_graph(graph_request, db)
 
     async def storyboard(
         self,
@@ -673,6 +681,7 @@ class AutoFlowService:
         error_message: str | None = None
         artifacts: dict[str, Any] = {}
         if db is not None and request.execute:
+            await self._validate_owned_input_asset(plan.request, db)
             try:
                 pipeline = await create_pipeline(
                     db,
@@ -722,6 +731,28 @@ class AutoFlowService:
 
         self._runs[run.run_id] = run
         return run
+
+    async def _validate_owned_input_asset(
+        self,
+        request: AutoFlowRequest,
+        db: AsyncSession | None,
+    ) -> None:
+        if db is None or not request.input_asset_id:
+            return
+        asset_id = _uuid_or_none(request.input_asset_id)
+        if asset_id is None or str(asset_id) != request.input_asset_id:
+            raise OwnedInputAssetError("input_asset_id must be a canonical owned generated video asset UUID")
+        asset = await db.get(Asset, asset_id)
+        if asset is None:
+            raise OwnedInputAssetError("Owned input asset was not found")
+        media_info = asset.media_info if isinstance(asset.media_info, dict) else {}
+        if (
+            not isinstance(asset.mime_type, str)
+            or not asset.mime_type.startswith("video/")
+            or media_info.get("license") != "owned"
+            or media_info.get("provenance") != "generated"
+        ):
+            raise OwnedInputAssetError("Input asset must be an owned generated video")
 
     async def list_runs(self, db: AsyncSession | None = None) -> list[AutoFlowRun]:
         if db is None:
