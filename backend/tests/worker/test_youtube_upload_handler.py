@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 from pathlib import Path
@@ -9,6 +10,7 @@ import httpx
 import pytest
 
 from app.services.youtube_upload_operations import UploadOperationClaim
+from worker.handlers.base import CancelledError
 from worker.handlers.youtube_upload import YouTubeUploadHandler
 
 
@@ -524,4 +526,258 @@ async def test_ambiguous_submission_marks_uncertain_and_a_retry_never_posts_agai
 
     assert post_count == 1
     assert store.uncertain and store.uncertain[0][0] == OPERATION_ID
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_handler_does_not_claim_or_call_manager(media_paths):
+    store = FakeOperationStore(["submit"])
+    seen: list[httpx.Request] = []
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        raise AssertionError("cancelled handler must not call YouTubeManager")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client)
+        handler.cancel()
+        with pytest.raises(CancelledError):
+            await handler.execute(upload_config(), input_paths, output_path)
+
+    assert store.claim_contexts == []
+    assert seen == []
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_preflight_prevents_upload_post(media_paths):
+    store = FakeOperationStore(["submit"])
+    seen: list[tuple[str, str]] = []
+    handler: YouTubeUploadHandler
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            handler.cancel()
+            return httpx.Response(200, json=auth_payload())
+        raise AssertionError("cancellation during preflight must prevent upload POST")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client)
+        with pytest.raises(CancelledError):
+            await handler.execute(upload_config(), input_paths, output_path)
+
+    assert seen == [("GET", "/api/auth/status")]
+    assert len(store.claim_contexts) == 1
+    assert store.submitted == []
+    assert store.uncertain == []
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_upload_persists_submitted_then_uncertain_and_never_reposts(media_paths):
+    store = FakeOperationStore(["submit", "block"])
+    post_count = 0
+    handler: YouTubeUploadHandler
+
+    def route(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            post_count += 1
+            handler.cancel()
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID, "status": "pending"})
+        raise AssertionError("cancelled upload must not begin polling")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client)
+        with pytest.raises(CancelledError):
+            await handler.execute(upload_config(), input_paths, output_path)
+        retry_handler = make_handler(store, client)
+        with pytest.raises(RuntimeError, match="cannot safely"):
+            await retry_handler.execute(upload_config(), input_paths, output_path)
+
+    assert post_count == 1
+    assert store.submitted == [(OPERATION_ID, MANAGER_TASK_ID)]
+    assert store.uncertain and store.uncertain[-1][0] == OPERATION_ID
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_polling_marks_uncertain_without_output(media_paths):
+    store = FakeOperationStore(["submit", "block"])
+    handler: YouTubeUploadHandler
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID, "status": "pending"})
+        if request.method == "GET" and request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            handler.cancel()
+            return httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "result": {
+                        "video_id": "video-123",
+                        "url": "https://www.youtube.com/watch?v=video-123",
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client)
+        with pytest.raises(CancelledError):
+            await handler.execute(upload_config(), input_paths, output_path)
+        retry_handler = make_handler(store, client)
+        with pytest.raises(RuntimeError, match="cannot safely"):
+            await retry_handler.execute(upload_config(), input_paths, output_path)
+
+    assert store.submitted == [(OPERATION_ID, MANAGER_TASK_ID)]
+    assert store.uncertain and store.uncertain[-1][0] == OPERATION_ID
+    assert store.succeeded == []
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_binds_hash_upload_and_output_to_original_bytes(media_paths):
+    store = FakeOperationStore(["submit"])
+    input_paths, output_path = media_paths
+    input_path = Path(input_paths["input"])
+    original = input_path.read_bytes()
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            assert original in request.content
+            input_path.write_bytes(b"mutated after durable claim")
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID, "status": "pending"})
+        if request.method == "GET" and request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "result": {
+                        "video_id": "video-123",
+                        "url": "https://www.youtube.com/watch?v=video-123",
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        await make_handler(store, client).execute(upload_config(), input_paths, output_path)
+
+    assert store.claim_contexts[0].content_sha256 == hashlib.sha256(original).hexdigest()
+    assert Path(output_path).read_bytes() == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "http://www.youtube.com/watch?v=video-123",
+        "https://www.youtube.com/watch?v=other-video",
+    ],
+)
+async def test_completed_result_requires_canonical_watch_url(url, media_paths):
+    store = FakeOperationStore(["submit"])
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID, "status": "pending"})
+        if request.method == "GET" and request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            return httpx.Response(
+                200,
+                json={"status": "completed", "result": {"video_id": "video-123", "url": url}},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        with pytest.raises(RuntimeError, match="invalid result"):
+            await make_handler(store, client).execute(upload_config(), input_paths, output_path)
+
+    assert store.succeeded == []
+    assert store.uncertain and store.uncertain[-1][0] == OPERATION_ID
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["upload", "status"])
+async def test_hanging_manager_request_uses_wall_clock_timeout_and_marks_uncertain(phase, media_paths):
+    store = FakeOperationStore(["submit", "block"])
+    post_count = 0
+
+    async def route(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            post_count += 1
+            if phase == "upload":
+                await asyncio.Event().wait()
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID, "status": "pending"})
+        if request.method == "GET" and request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            assert phase == "status"
+            await asyncio.Event().wait()
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client, timeout_seconds=0.01)
+        with pytest.raises(RuntimeError, match="uncertain"):
+            await asyncio.wait_for(handler.execute(upload_config(), input_paths, output_path), timeout=0.2)
+        with pytest.raises(RuntimeError, match="cannot safely"):
+            await handler.execute(upload_config(), input_paths, output_path)
+
+    assert post_count == 1
+    assert store.uncertain and store.uncertain[-1][0] == OPERATION_ID
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "expected_state"),
+    [(422, "failed"), (500, "uncertain")],
+)
+async def test_upload_response_classification_blocks_retry_without_copying_output(
+    status_code,
+    expected_state,
+    media_paths,
+):
+    store = FakeOperationStore(["submit", "block"])
+    post_count = 0
+
+    def route(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            post_count += 1
+            return httpx.Response(status_code, json={"detail": "rejected"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client)
+        with pytest.raises(RuntimeError):
+            await handler.execute(upload_config(), input_paths, output_path)
+        with pytest.raises(RuntimeError, match="cannot safely"):
+            await handler.execute(upload_config(), input_paths, output_path)
+
+    assert post_count == 1
+    assert bool(store.failed) is (expected_state == "failed")
+    assert bool(store.uncertain) is (expected_state == "uncertain")
     assert not Path(output_path).exists()

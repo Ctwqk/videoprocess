@@ -113,12 +113,22 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
             return None
 
     input_artifact = SimpleNamespace(
+        job_id=job_id,
         media_info={},
         storage_backend="local",
         storage_path=str(input_path),
         filename="input.mp4",
     )
-    node_execution = SimpleNamespace(status=None, started_at=None, worker_id=None)
+    node_execution = SimpleNamespace(
+        job_id=job_id,
+        node_id="youtube_upload_1",
+        node_type="youtube_upload",
+        node_config={"title": "Canary"},
+        input_artifact_ids=[input_artifact_id],
+        status=None,
+        started_at=None,
+        worker_id=None,
+    )
 
     class FakeSession:
         async def __aenter__(self):
@@ -147,7 +157,8 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
         def get_local_path(self, path: str) -> str:
             return path
 
-    process_session_factory = lambda: FakeSession()
+    def process_session_factory():
+        return FakeSession()
 
     async def not_cancelled(_node_execution_id: str):
         return worker_main.CancelState(None, None, None, False, None)

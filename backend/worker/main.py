@@ -144,9 +144,6 @@ async def process_task(data: dict) -> None:
     node_type = data["node_type"]
     config = json.loads(data.get("config", "{}"))
     input_artifacts_map = json.loads(data.get("input_artifacts", "{}"))
-    config["_job_id"] = job_id
-    config["_node_execution_id"] = node_execution_id
-    config["_input_artifact_ids"] = dict(input_artifacts_map)
 
     logger.info(f"Processing node {data['node_id']} (type={node_type}) for job {job_id}")
 
@@ -155,6 +152,21 @@ async def process_task(data: dict) -> None:
     if not handler_cls:
         await _report_failure(job_id, node_execution_id, f"No handler for node type: {node_type}")
         return
+
+    if node_type == "youtube_upload":
+        try:
+            config, input_artifacts_map = await _authoritative_youtube_upload_inputs(
+                job_id=job_id,
+                node_execution_id=node_execution_id,
+                node_id=data["node_id"],
+                input_artifacts_map=input_artifacts_map,
+            )
+        except Exception as exc:
+            await _report_failure(job_id, node_execution_id, str(exc))
+            return
+        config["_job_id"] = job_id
+        config["_node_execution_id"] = node_execution_id
+        config["_input_artifact_ids"] = dict(input_artifacts_map)
 
     # Check if cancelled before starting, then update status to RUNNING
     cancel_state = await _load_cancel_state(node_execution_id)
@@ -224,6 +236,8 @@ async def process_task(data: dict) -> None:
                 input_paths[port_name] = local_path
 
         config["_input_artifact_meta"] = input_artifact_meta
+        if node_type != "youtube_upload":
+            config["_input_artifact_ids"] = dict(input_artifacts_map)
 
         # Prepare output path
         output_ext = _get_output_extension(node_type, config)
@@ -307,6 +321,48 @@ async def process_task(data: dict) -> None:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+async def _authoritative_youtube_upload_inputs(
+    *,
+    job_id: str,
+    node_execution_id: str,
+    node_id: object,
+    input_artifacts_map: object,
+) -> tuple[dict, dict[str, str]]:
+    if not isinstance(node_id, str) or not node_id:
+        raise RuntimeError("youtube upload queue message has an invalid node id")
+    if not isinstance(input_artifacts_map, dict) or set(input_artifacts_map) != {"input"}:
+        raise RuntimeError("youtube upload queue message must contain exactly the input artifact port")
+
+    try:
+        authoritative_job_id = uuid.UUID(job_id)
+        authoritative_node_execution_id = uuid.UUID(node_execution_id)
+        queued_input_artifact_id = uuid.UUID(str(input_artifacts_map["input"]))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("youtube upload queue message has invalid UUID identifiers") from exc
+
+    async with get_worker_session()() as db:
+        node_execution = await db.get(NodeExecution, authoritative_node_execution_id)
+        if node_execution is None:
+            raise RuntimeError("youtube upload node execution was not found")
+        if node_execution.job_id != authoritative_job_id:
+            raise RuntimeError("youtube upload node execution does not belong to the queued job")
+        if node_execution.node_id != node_id:
+            raise RuntimeError("youtube upload node id does not match the queued node")
+        if node_execution.node_type != "youtube_upload":
+            raise RuntimeError("youtube upload node type does not match the queued node")
+        expected_input_ids = list(node_execution.input_artifact_ids or [])
+        if expected_input_ids != [queued_input_artifact_id]:
+            raise RuntimeError("youtube upload input artifacts do not match the node execution")
+        artifact = await db.get(Artifact, queued_input_artifact_id)
+        if artifact is None:
+            raise RuntimeError("youtube upload input artifact was not found")
+        if artifact.job_id != authoritative_job_id:
+            raise RuntimeError("youtube upload input artifact does not belong to the queued job")
+        if not isinstance(node_execution.node_config, dict):
+            raise RuntimeError("youtube upload node configuration is invalid")
+        return dict(node_execution.node_config), {"input": str(queued_input_artifact_id)}
 
 
 async def _report_success(job_id: str, node_execution_id: str, artifact_id: str) -> None:
