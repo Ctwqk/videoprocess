@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import stat
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +35,7 @@ class FakeOperationStore:
             status="reserved",
             manager_task_id=None,
             receipt_json={},
+            content_sha256=None,
         )
         self.durable_receipt = durable_receipt or {
             "video_id": "video-123",
@@ -48,13 +50,21 @@ class FakeOperationStore:
         self.succeeded: list[tuple[uuid.UUID, str, dict]] = []
         self.failed: list[tuple[uuid.UUID, str]] = []
         self.uncertain: list[tuple[uuid.UUID, str]] = []
+        self.mark_submitted_started: asyncio.Event | None = None
+        self.mark_submitted_continue: asyncio.Event | None = None
 
     async def claim(self, context):
         self.claim_contexts.append(context)
+        if self.operation.content_sha256 is None:
+            self.operation.content_sha256 = context.content_sha256
         action = self._actions.pop(0)
         return UploadOperationClaim(action=action, operation=self.operation)
 
     async def mark_submitted(self, operation_id: uuid.UUID, manager_task_id: str):
+        if self.mark_submitted_started is not None:
+            self.mark_submitted_started.set()
+            assert self.mark_submitted_continue is not None
+            await self.mark_submitted_continue.wait()
         self.submitted.append((operation_id, manager_task_id))
         self.operation.status = "submitted"
         self.operation.manager_task_id = manager_task_id
@@ -750,7 +760,7 @@ async def test_hanging_manager_request_uses_wall_clock_timeout_and_marks_uncerta
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status_code", "expected_state"),
-    [(422, "failed"), (500, "uncertain")],
+    [(404, "failed"), (422, "failed"), (500, "uncertain")],
 )
 async def test_upload_response_classification_blocks_retry_without_copying_output(
     status_code,
@@ -780,4 +790,135 @@ async def test_upload_response_classification_blocks_retry_without_copying_outpu
     assert post_count == 1
     assert bool(store.failed) is (expected_state == "failed")
     assert bool(store.uncertain) is (expected_state == "uncertain")
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_resume_with_snapshot_hash_mismatch_marks_uncertain_without_http_or_output(media_paths):
+    store = FakeOperationStore(["resume", "block"])
+    input_paths, output_path = media_paths
+    original_hash = hashlib.sha256(Path(input_paths["input"]).read_bytes()).hexdigest()
+    store.operation.status = "submitted"
+    store.operation.manager_task_id = MANAGER_TASK_ID
+    store.operation.content_sha256 = original_hash
+    Path(input_paths["input"]).write_bytes(b"mutated after prior submission")
+    seen: list[httpx.Request] = []
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        raise AssertionError("hash-mismatched resume must not call YouTubeManager")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client)
+        with pytest.raises(RuntimeError, match="content hash"):
+            await handler.execute(upload_config(), input_paths, output_path)
+        retry_handler = make_handler(store, client)
+        with pytest.raises(RuntimeError, match="cannot safely"):
+            await retry_handler.execute(upload_config(), input_paths, output_path)
+
+    assert seen == []
+    assert store.uncertain and store.uncertain[-1][0] == OPERATION_ID
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_replay_with_snapshot_hash_mismatch_never_rewrites_terminal_success(media_paths):
+    store = FakeOperationStore(["replay"])
+    input_paths, output_path = media_paths
+    original_hash = hashlib.sha256(Path(input_paths["input"]).read_bytes()).hexdigest()
+    store.operation.status = "succeeded"
+    store.operation.content_sha256 = original_hash
+    store.operation.receipt_json = dict(store.durable_receipt)
+    Path(input_paths["input"]).write_bytes(b"mutated after prior success")
+    seen: list[httpx.Request] = []
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        raise AssertionError("hash-mismatched replay must not call YouTubeManager")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        with pytest.raises(RuntimeError, match="content hash"):
+            await make_handler(store, client).execute(upload_config(), input_paths, output_path)
+
+    assert seen == []
+    assert store.uncertain == []
+    assert store.failed == []
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_persisting_manager_task_reaches_submitted_then_uncertain(media_paths):
+    store = FakeOperationStore(["submit", "block"])
+    store.mark_submitted_started = asyncio.Event()
+    store.mark_submitted_continue = asyncio.Event()
+    post_count = 0
+
+    def route(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            post_count += 1
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID, "status": "pending"})
+        raise AssertionError("cancellation while persisting must not poll")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client)
+        execution = asyncio.create_task(handler.execute(upload_config(), input_paths, output_path))
+        await store.mark_submitted_started.wait()
+        execution.cancel()
+        store.mark_submitted_continue.set()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+        retry_handler = make_handler(store, client)
+        with pytest.raises(RuntimeError, match="cannot safely"):
+            await retry_handler.execute(upload_config(), input_paths, output_path)
+
+    assert post_count == 1
+    assert store.submitted == [(OPERATION_ID, MANAGER_TASK_ID)]
+    assert store.uncertain and store.uncertain[-1][0] == OPERATION_ID
+    assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_replay_replaces_read_only_output_with_normal_worker_permissions(media_paths):
+    store = FakeOperationStore(["replay", "replay"])
+    store.operation.status = "succeeded"
+    store.operation.receipt_json = dict(store.durable_receipt)
+    input_paths, output_path = media_paths
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: None)) as client:
+        await make_handler(store, client).execute(upload_config(), input_paths, output_path)
+        Path(output_path).chmod(0o400)
+        await make_handler(store, client).execute(upload_config(), input_paths, output_path)
+
+    assert Path(output_path).read_bytes() == Path(input_paths["input"]).read_bytes()
+    assert stat.S_IMODE(Path(output_path).stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_polling_404_remains_uncertain(media_paths):
+    store = FakeOperationStore(["submit", "block"])
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID, "status": "pending"})
+        if request.method == "GET" and request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            return httpx.Response(404, json={"detail": "missing"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client)
+        with pytest.raises(RuntimeError, match="status is uncertain"):
+            await handler.execute(upload_config(), input_paths, output_path)
+        retry_handler = make_handler(store, client)
+        with pytest.raises(RuntimeError, match="cannot safely"):
+            await retry_handler.execute(upload_config(), input_paths, output_path)
+
+    assert store.failed == []
+    assert store.uncertain and store.uncertain[-1][0] == OPERATION_ID
     assert not Path(output_path).exists()

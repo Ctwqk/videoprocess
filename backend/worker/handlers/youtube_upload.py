@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import math
 import mimetypes
 import os
@@ -27,7 +28,7 @@ from worker.handlers.base import BaseHandler, CancelledError
 UPLOAD_INSERT_COST = 1_600
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_TIMEOUT_SECONDS = 600.0
-DEFINITE_UPLOAD_REJECTION_STATUSES = frozenset({400, 401, 403, 413, 415, 422})
+DEFINITE_UPLOAD_REJECTION_STATUSES = frozenset({400, 401, 403, 404, 413, 415, 422})
 
 
 class YouTubeUploadHandler(BaseHandler):
@@ -87,6 +88,13 @@ class YouTubeUploadHandler(BaseHandler):
             self._raise_if_cancelled()
             claim = await self._operation_store.claim(context)
             self._raise_if_cancelled()
+
+            if claim.action != "block":
+                await self._verify_claim_content_hash(
+                    claim.action,
+                    claim.operation,
+                    content_sha256,
+                )
 
             if claim.action == "replay":
                 return self._copy_durable_receipt(claim.operation, snapshot_path, output_path)
@@ -153,7 +161,7 @@ class YouTubeUploadHandler(BaseHandler):
                 "YouTubeManager authentication or quota preflight failed",
             )
             raise RuntimeError("YouTubeManager authentication or quota preflight failed") from exc
-        except BaseException:
+        except (KeyboardInterrupt, SystemExit):
             raise
 
         self._raise_if_cancelled()
@@ -209,7 +217,7 @@ class YouTubeUploadHandler(BaseHandler):
         except Exception as exc:
             await self._mark_uncertain(operation, "YouTubeManager upload submission outcome is uncertain")
             raise RuntimeError("YouTubeManager upload submission outcome is uncertain") from exc
-        except BaseException:
+        except (KeyboardInterrupt, SystemExit):
             await self._mark_uncertain(operation, "YouTubeManager upload submission was interrupted")
             raise
 
@@ -233,7 +241,9 @@ class YouTubeUploadHandler(BaseHandler):
             manager_task_id = self._require_canonical_manager_task_id(payload.get("task_id"))
             if manager_task_id is None:
                 raise RuntimeError("YouTubeManager upload submission returned no canonical task id")
-            await self._operation_store.mark_submitted(operation.id, manager_task_id)
+            await self._persist_manager_task(operation, manager_task_id)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             await self._mark_uncertain(operation, "YouTubeManager upload submission outcome is uncertain")
             if isinstance(exc, RuntimeError):
@@ -266,7 +276,7 @@ class YouTubeUploadHandler(BaseHandler):
             except Exception as exc:
                 await self._mark_uncertain(operation, "YouTubeManager upload status is uncertain")
                 raise RuntimeError("YouTubeManager upload status is uncertain") from exc
-            except BaseException:
+            except (KeyboardInterrupt, SystemExit):
                 await self._mark_uncertain(operation, "YouTubeManager upload polling was interrupted")
                 raise
 
@@ -320,8 +330,45 @@ class YouTubeUploadHandler(BaseHandler):
         async with asyncio.timeout(self._timeout_seconds):
             return await request
 
+    async def _persist_manager_task(self, operation: Any, manager_task_id: str) -> None:
+        transition = asyncio.create_task(
+            self._operation_store.mark_submitted(operation.id, manager_task_id)
+        )
+        try:
+            await asyncio.shield(transition)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(transition)
+            except Exception:
+                pass
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager upload submission was cancelled after manager task creation",
+            )
+            raise
+
     async def _mark_uncertain(self, operation: Any, message: str) -> None:
         await self._operation_store.mark_uncertain(operation.id, message)
+
+    async def _verify_claim_content_hash(
+        self,
+        action: str,
+        operation: Any,
+        snapshot_sha256: str,
+    ) -> None:
+        expected_sha256 = getattr(operation, "content_sha256", None)
+        matches = isinstance(expected_sha256, str) and hmac.compare_digest(
+            expected_sha256,
+            snapshot_sha256,
+        )
+        if matches:
+            return
+        if action == "resume":
+            await self._mark_uncertain(
+                operation,
+                "youtube upload snapshot content hash does not match the claimed operation",
+            )
+        raise RuntimeError("youtube upload snapshot content hash does not match the claimed operation")
 
     def _raise_if_cancelled(self) -> None:
         if self._cancelled:
@@ -410,6 +457,7 @@ class YouTubeUploadHandler(BaseHandler):
     def _create_input_snapshot(input_file: str) -> str:
         suffix = Path(input_file).suffix
         descriptor, snapshot_path = tempfile.mkstemp(prefix="vp_youtube_upload_", suffix=suffix)
+        completed = False
         try:
             os.fchmod(descriptor, 0o600)
             snapshot_file = os.fdopen(descriptor, "wb")
@@ -417,12 +465,13 @@ class YouTubeUploadHandler(BaseHandler):
             with snapshot_file, open(input_file, "rb") as source_file:
                 shutil.copyfileobj(source_file, snapshot_file, length=1024 * 1024)
             os.chmod(snapshot_path, 0o400)
+            completed = True
             return snapshot_path
-        except BaseException:
+        finally:
             if descriptor >= 0:
                 os.close(descriptor)
-            Path(snapshot_path).unlink(missing_ok=True)
-            raise
+            if not completed:
+                Path(snapshot_path).unlink(missing_ok=True)
 
     @staticmethod
     def _content_sha256(path: str) -> str:
@@ -464,5 +513,24 @@ class YouTubeUploadHandler(BaseHandler):
         video_id = receipt.get("video_id")
         if not isinstance(video_id, str) or not video_id.strip():
             raise RuntimeError("youtube upload operation has an invalid durable receipt")
-        shutil.copy2(input_file, output_path)
+        destination = Path(output_path)
+        descriptor, temporary_output = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=destination.suffix,
+            dir=destination.parent,
+        )
+        completed = False
+        try:
+            os.fchmod(descriptor, 0o600)
+            output_file = os.fdopen(descriptor, "wb")
+            descriptor = -1
+            with output_file, open(input_file, "rb") as source_file:
+                shutil.copyfileobj(source_file, output_file, length=1024 * 1024)
+            os.replace(temporary_output, destination)
+            completed = True
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if not completed:
+                Path(temporary_output).unlink(missing_ok=True)
         return {"youtube": dict(receipt)}
