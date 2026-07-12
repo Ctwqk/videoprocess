@@ -144,6 +144,25 @@ def test_remote_ffmpeg_worker_rejects_localhost_minio_endpoint() -> None:
     assert "production MinIO endpoint must not point at localhost:9000" in decision.reasons
 
 
+def test_remote_ffmpeg_worker_rejects_root_qualified_localhost_minio_endpoint() -> None:
+    decision = validate_worker_admission(
+        {
+            "DEPLOY_MODE": "local",
+            "REDIS_URL": "redis://10.0.0.150:6380/0",
+            "WORKER_TYPE": "ffmpeg",
+            "WORKER_HOST": "150-gpu",
+            "STORAGE_BACKEND": "minio",
+            "MINIO_ENDPOINT": "localhost.:9000",
+            "MINIO_ACCESS_KEY": "minioadmin",
+            "MINIO_SECRET_KEY": "minioadmin",
+            "MINIO_BUCKET": "videoprocess",
+        }
+    )
+
+    assert decision.allowed is False
+    assert "production MinIO endpoint must not point at localhost.:9000" in decision.reasons
+
+
 def test_remote_ffmpeg_worker_with_minio_and_explicit_host_is_allowed() -> None:
     decision = validate_worker_admission(
         {
