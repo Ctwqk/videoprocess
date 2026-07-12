@@ -98,7 +98,7 @@ def _host_from_url(url: str) -> str:
     if not url:
         return ""
     parsed = urlparse(url if "://" in url else f"//{url}")
-    return (parsed.hostname or "").lower().strip("[]")
+    return (parsed.hostname or "").lower().strip("[]").removesuffix(".")
 
 
 def _host_from_endpoint(endpoint: str) -> str:

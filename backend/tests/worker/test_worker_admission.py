@@ -40,6 +40,16 @@ def test_production_youtube_publisher_rejects_local_manager_url() -> None:
     assert "production youtube_publisher workers require a non-local YOUTUBE_MANAGER_URL" in decision.reasons
 
 
+def test_production_youtube_publisher_rejects_root_qualified_local_manager_url() -> None:
+    env = _publisher_env()
+    env["YOUTUBE_MANAGER_URL"] = "http://localhost.:8899"
+
+    decision = validate_worker_admission(env)
+
+    assert decision.allowed is False
+    assert "production youtube_publisher workers require a non-local YOUTUBE_MANAGER_URL" in decision.reasons
+
+
 @pytest.mark.parametrize(
     "missing_key",
     ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET"),
