@@ -365,6 +365,70 @@ def test_autoflow_request_uses_task_snapshot_configuration():
     AutoFlowRequest.model_validate(request)
 
 
+def test_autoflow_request_uses_owned_input_asset_profile():
+    task = ProductionTask(
+        channel_profile_id=uuid.uuid4(),
+        target_account_id=uuid.uuid4(),
+        source="manual_seed",
+        prompt="Create a canary",
+        source_platforms_json=["youtube", "bilibili"],
+        uses_external_assets=True,
+        channel_config_snapshot_json={
+            "channel": {
+                "default_aspect_ratio": "16:9",
+                "risk_policy_json": {
+                    "source_strategy": "external_research",
+                    "planning_mode": "storyboard",
+                },
+            },
+            "lane_format": {"source_platforms_json": ["youtube"]},
+            "manual_seed": {
+                "constraints_json": {
+                    "input_asset_id": "00000000-0000-0000-0000-000000000123",
+                    "source_strategy": "input_video",
+                    "planning_mode": "template",
+                }
+            },
+        },
+    )
+
+    request = _service()._autoflow_request(task)
+
+    assert request["input_asset_id"] == "00000000-0000-0000-0000-000000000123"
+    assert request["source_platforms"] == []
+    assert request["source_policy"] == "owned_only"
+    assert request["source_strategy"] == "input_video"
+    assert request["planning_mode"] == "template"
+    assert "input_asset_id" not in request["constraints"]
+    AutoFlowRequest.model_validate(request)
+
+
+@pytest.mark.parametrize("input_asset_id", [None, {}, [], 123, "not-a-uuid"])
+def test_autoflow_request_invalid_owned_input_asset_fails_closed(input_asset_id):
+    task = ProductionTask(
+        channel_profile_id=uuid.uuid4(),
+        target_account_id=uuid.uuid4(),
+        source="manual_seed",
+        prompt="Create a canary",
+        source_platforms_json=["youtube"],
+        uses_external_assets=True,
+        channel_config_snapshot_json={
+            "channel": {"risk_policy_json": {"source_strategy": "external_research"}},
+            "manual_seed": {"constraints_json": {"input_asset_id": input_asset_id}},
+        },
+    )
+
+    request = _service()._autoflow_request(task)
+
+    assert "input_asset_id" not in request
+    assert "input_asset_id" not in request["constraints"]
+    assert request["source_platforms"] == []
+    assert request["source_policy"] == "owned_only"
+    assert request["source_strategy"] == "input_video"
+    assert request["planning_mode"] == "template"
+    AutoFlowRequest.model_validate(request)
+
+
 @pytest.mark.asyncio
 async def test_task_from_candidate_uses_naive_timestamp_mixin_fields(service_session):
     clock = FakeClock(datetime(2026, 5, 19, 18, 0, tzinfo=timezone.utc))

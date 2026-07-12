@@ -28,9 +28,11 @@ from app.models.channel_agent import (
     TakedownEvent,
     TopicLane,
 )
+from app.models.asset import Asset
 
 
 CHANNEL_AGENT_TABLES = (
+    Asset.__table__,
     ChannelProfile.__table__,
     TopicLane.__table__,
     PublishingAccount.__table__,
@@ -574,6 +576,71 @@ async def test_create_manual_seed_rejects_cross_channel_target_account(api_sessi
         )
 
         assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_manual_seed_validates_owned_generated_video_input_asset(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "Owned input"})).json()
+        unowned_asset = Asset(
+            id=uuid.uuid4(),
+            filename="unowned.mp4",
+            original_name="unowned.mp4",
+            mime_type="video/mp4",
+            storage_path="assets/unowned.mp4",
+            media_info={"license": "external", "provenance": "generated"},
+        )
+        image_asset = Asset(
+            id=uuid.uuid4(),
+            filename="image.png",
+            original_name="image.png",
+            mime_type="image/png",
+            storage_path="assets/image.png",
+            media_info={"license": "owned", "provenance": "generated"},
+        )
+        owned_video_asset = Asset(
+            id=uuid.uuid4(),
+            filename="owned.mp4",
+            original_name="owned.mp4",
+            mime_type="video/mp4",
+            storage_path="assets/owned.mp4",
+            media_info={"license": "owned", "provenance": "generated"},
+        )
+        api_session.add_all([unowned_asset, image_asset, owned_video_asset])
+        await api_session.flush()
+
+        def payload(asset_id: uuid.UUID) -> dict[str, object]:
+            return {
+                "prompt": "Create an owned canary",
+                "source_policy": "owned_only",
+                "constraints_json": {
+                    "input_asset_id": str(asset_id),
+                    "source_strategy": "input_video",
+                    "planning_mode": "template",
+                },
+            }
+
+        missing = await client.post(
+            f"/api/v1/channel-agent/channels/{channel['id']}/manual-seeds",
+            json=payload(uuid.uuid4()),
+        )
+        unowned = await client.post(
+            f"/api/v1/channel-agent/channels/{channel['id']}/manual-seeds",
+            json=payload(unowned_asset.id),
+        )
+        wrong_type = await client.post(
+            f"/api/v1/channel-agent/channels/{channel['id']}/manual-seeds",
+            json=payload(image_asset.id),
+        )
+        accepted = await client.post(
+            f"/api/v1/channel-agent/channels/{channel['id']}/manual-seeds",
+            json=payload(owned_video_asset.id),
+        )
+
+        assert missing.status_code == 400
+        assert unowned.status_code == 400
+        assert wrong_type.status_code == 400
+        assert accepted.status_code == 200
 
 
 @pytest.mark.asyncio

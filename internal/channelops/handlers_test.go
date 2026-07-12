@@ -340,20 +340,45 @@ func TestAutoFlowRequestForTaskOwnedInputAsset(t *testing.T) {
 	}
 }
 
+func TestAutoFlowRequestForTaskEmptyInputAssetIDPreservesOrdinaryBehavior(t *testing.T) {
+	task := representativeAutoFlowRequestTask()
+	task.ChannelConfigSnapshotJSON["manual_seed"] = map[string]any{
+		"constraints_json": map[string]any{"input_asset_id": ""},
+	}
+
+	request := AutoFlowRequestForTask(task)
+
+	if _, ok := request["input_asset_id"]; ok {
+		t.Fatalf("empty input_asset_id forwarded: %#v", request["input_asset_id"])
+	}
+	if request["source_strategy"] != "external_research" {
+		t.Fatalf("source_strategy = %#v", request["source_strategy"])
+	}
+	if got := stringSliceFromAny(request["source_platforms"]); len(got) != 1 || got[0] != "bilibili" {
+		t.Fatalf("source_platforms = %#v", got)
+	}
+}
+
 func TestAutoFlowRequestForTaskInvalidInputAssetIDFailsClosed(t *testing.T) {
-	for _, inputAssetID := range []string{
-		"",
-		"00000000-0000-0000-0000-00000000012",
-		"00000000-0000-0000-0000-000000000123 ",
-		"00000000-0000-0000-0000-00000000012G",
-		"00000000-0000-0000-0000-000000000123"[:35],
-		"00000000-0000-0000-0000-000000000123\n",
-		"ABCDEFAB-1234-4ABC-8DEF-ABCDEFABCDEF",
+	for _, test := range []struct {
+		name  string
+		value any
+	}{
+		{name: "short", value: "00000000-0000-0000-0000-00000000012"},
+		{name: "whitespace", value: "00000000-0000-0000-0000-000000000123 "},
+		{name: "invalid_hex", value: "00000000-0000-0000-0000-00000000012G"},
+		{name: "truncated", value: "00000000-0000-0000-0000-000000000123"[:35]},
+		{name: "newline", value: "00000000-0000-0000-0000-000000000123\n"},
+		{name: "uppercase", value: "ABCDEFAB-1234-4ABC-8DEF-ABCDEFABCDEF"},
+		{name: "null", value: nil},
+		{name: "object", value: map[string]any{}},
+		{name: "array", value: []any{}},
+		{name: "number", value: 123},
 	} {
-		t.Run(inputAssetID, func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			task := representativeAutoFlowRequestTask()
 			task.ChannelConfigSnapshotJSON["manual_seed"] = map[string]any{
-				"constraints_json": map[string]any{"input_asset_id": inputAssetID},
+				"constraints_json": map[string]any{"input_asset_id": test.value},
 			}
 
 			request := AutoFlowRequestForTask(task)
@@ -363,6 +388,18 @@ func TestAutoFlowRequestForTaskInvalidInputAssetIDFailsClosed(t *testing.T) {
 			}
 			if _, ok := mapFromAny(request["constraints"])["input_asset_id"]; ok {
 				t.Fatalf("constraints retained invalid input_asset_id: %#v", request["constraints"])
+			}
+			if request["source_policy"] != "owned_only" {
+				t.Fatalf("source_policy = %#v", request["source_policy"])
+			}
+			if request["source_strategy"] != "input_video" {
+				t.Fatalf("source_strategy = %#v", request["source_strategy"])
+			}
+			if request["planning_mode"] != "template" {
+				t.Fatalf("planning_mode = %#v", request["planning_mode"])
+			}
+			if got := stringSliceFromAny(request["source_platforms"]); len(got) != 0 {
+				t.Fatalf("source_platforms = %#v, want no external platforms", got)
 			}
 		})
 	}

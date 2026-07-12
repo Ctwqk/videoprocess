@@ -23,6 +23,7 @@ from app.channel_agent.constants import (
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
 from app.config import settings
 from app.db import get_db
+from app.models.asset import Asset
 from app.models.channel_agent import (
     AgentTickAudit,
     ChannelOpsQueueItem,
@@ -729,6 +730,20 @@ async def _validate_manual_seed_references(
         account = await db.get(PublishingAccount, _uuid(data.target_account_id))
         if account is None or account.channel_profile_id != channel_id:
             raise HTTPException(status_code=400, detail="Manual seed target account does not belong to channel")
+    constraints = data.constraints_json
+    if "input_asset_id" not in constraints or constraints["input_asset_id"] == "":
+        return
+    asset = await db.get(Asset, _uuid(constraints["input_asset_id"]))
+    if asset is None:
+        raise HTTPException(status_code=400, detail="Owned input asset was not found")
+    media_info = asset.media_info if isinstance(asset.media_info, dict) else {}
+    if (
+        not isinstance(asset.mime_type, str)
+        or not asset.mime_type.startswith("video/")
+        or media_info.get("license") != "owned"
+        or media_info.get("provenance") != "generated"
+    ):
+        raise HTTPException(status_code=400, detail="Input asset must be an owned generated video")
 
 
 async def _cancel_queued_publication_items(

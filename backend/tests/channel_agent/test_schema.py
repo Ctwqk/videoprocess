@@ -66,6 +66,10 @@ def test_manual_seed_create_accepts_external_sources_without_owned_input_asset()
         "00000000-0000-0000-0000-000000000123 ",
         "00000000-0000-0000-0000-00000000012G",
         "abcdefab-1234-4abc-8def-abcdefabcdef".upper(),
+        None,
+        {},
+        [],
+        123,
     ],
 )
 def test_manual_seed_create_rejects_noncanonical_owned_input_asset_id(input_asset_id):

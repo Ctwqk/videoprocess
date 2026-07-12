@@ -91,8 +91,10 @@ class ManualSeedCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_owned_input_canary(self) -> ManualSeedCreate:
-        input_asset_id = self.constraints_json.get("input_asset_id")
-        if input_asset_id in (None, ""):
+        if "input_asset_id" not in self.constraints_json:
+            return self
+        input_asset_id = self.constraints_json["input_asset_id"]
+        if input_asset_id == "":
             return self
         if not isinstance(input_asset_id, str):
             raise ValueError("input_asset_id must be a canonical UUID")

@@ -509,7 +509,7 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 	riskPolicy := mapFromAny(channel["risk_policy_json"])
 	manualSeedConstraints := mapFromAny(manualSeed["constraints_json"])
 	sourcePlatforms := effectiveSourcePlatforms(task, laneFormat)
-	inputAssetID := ownedInputAssetID(manualSeedConstraints)
+	inputAssetID, ownedInputProfile := ownedInputAssetID(manualSeedConstraints)
 	constraints := map[string]any{
 		"lane_id":            firstString(lane, "id"),
 		"lane_format_id":     firstString(laneFormat, "id"),
@@ -546,8 +546,10 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 		"planning_mode":        normalizePlanningMode(firstNonBlank(manualSeed["planning_mode"], manualSeedConstraints["planning_mode"], riskPolicy["planning_mode"])),
 		"constraints":          constraints,
 	}
-	if inputAssetID != "" {
-		request["input_asset_id"] = inputAssetID
+	if ownedInputProfile {
+		if inputAssetID != "" {
+			request["input_asset_id"] = inputAssetID
+		}
 		request["source_platforms"] = []string{}
 		request["source_policy"] = "owned_only"
 		request["source_strategy"] = "input_video"
@@ -556,16 +558,23 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 	return request
 }
 
-func ownedInputAssetID(constraints map[string]any) string {
-	value, ok := constraints["input_asset_id"].(string)
-	if !ok || value == "" {
-		return ""
+func ownedInputAssetID(constraints map[string]any) (string, bool) {
+	rawValue, present := constraints["input_asset_id"]
+	if !present {
+		return "", false
+	}
+	value, ok := rawValue.(string)
+	if ok && value == "" {
+		return "", false
+	}
+	if !ok {
+		return "", true
 	}
 	parsed, err := uuid.Parse(value)
 	if err != nil || parsed.String() != value {
-		return ""
+		return "", true
 	}
-	return value
+	return value, true
 }
 
 func effectiveSourcePlatforms(task ProductionTaskRow, laneFormat map[string]any) []string {

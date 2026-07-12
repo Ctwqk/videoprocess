@@ -1981,12 +1981,15 @@ class ChannelAgentService:
         lane = _dict_value(snapshot.get("lane"))
         risk_policy = _dict_value(channel.get("risk_policy_json"))
         manual_seed_constraints = _dict_value(manual_seed.get("constraints_json"))
+        input_asset_id, owned_input_profile = _owned_input_asset_id(manual_seed_constraints)
         constraints = {
             "lane_id": lane.get("id"),
             "lane_format_id": lane_format.get("id"),
             "template_pool_json": _string_list(lane_format.get("template_pool_json")),
         }
-        constraints.update(manual_seed_constraints)
+        constraints.update(
+            {key: value for key, value in manual_seed_constraints.items() if key != "input_asset_id"}
+        )
 
         source_platforms = self._effective_source_platforms(task)
         request = {
@@ -2010,6 +2013,13 @@ class ChannelAgentService:
             ),
             "constraints": constraints,
         }
+        if owned_input_profile:
+            if input_asset_id is not None:
+                request["input_asset_id"] = input_asset_id
+            request["source_platforms"] = []
+            request["source_policy"] = "owned_only"
+            request["source_strategy"] = "input_video"
+            request["planning_mode"] = "template"
         validated = AutoFlowRequest.model_validate(request)
         return validated.model_dump(include=set(request))
 
@@ -2204,6 +2214,20 @@ def _uuid_or_none(value: Any) -> uuid.UUID | None:
         return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _owned_input_asset_id(constraints: dict[str, Any]) -> tuple[str | None, bool]:
+    if "input_asset_id" not in constraints:
+        return None, False
+    value = constraints["input_asset_id"]
+    if value == "":
+        return None, False
+    if not isinstance(value, str):
+        return None, True
+    parsed = _uuid_or_none(value)
+    if parsed is None or str(parsed) != value:
+        return None, True
+    return value, True
 
 
 def _parse_datetime(value: str) -> datetime:
