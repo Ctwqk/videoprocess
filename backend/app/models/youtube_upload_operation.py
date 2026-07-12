@@ -10,13 +10,32 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
+def _manager_task_id_check_sql() -> str:
+    non_hex_characters = "replace(manager_task_id, '-', '')"
+    for character in "0123456789abcdef":
+        non_hex_characters = f"replace({non_hex_characters}, '{character}', '')"
+    canonical_shape = (
+        "length(manager_task_id) = 36 "
+        "AND manager_task_id = lower(manager_task_id) "
+        "AND substr(manager_task_id, 9, 1) = '-' "
+        "AND substr(manager_task_id, 14, 1) = '-' "
+        "AND substr(manager_task_id, 19, 1) = '-' "
+        "AND substr(manager_task_id, 24, 1) = '-' "
+        "AND length(replace(manager_task_id, '-', '')) = 32 "
+        f"AND {non_hex_characters} = ''"
+    )
+    return (
+        f"(manager_task_id IS NULL OR ({canonical_shape})) "
+        "AND (status NOT IN ('submitted', 'succeeded') OR manager_task_id IS NOT NULL)"
+    )
+
+
 class YouTubeUploadOperation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "youtube_upload_operations"
     __table_args__ = (
         UniqueConstraint("node_execution_id", name="uq_youtube_upload_operations_node_execution"),
         CheckConstraint(
-            "status NOT IN ('submitted', 'succeeded') OR "
-            "(manager_task_id IS NOT NULL AND length(trim(manager_task_id)) > 0)",
+            _manager_task_id_check_sql(),
             name="ck_youtube_upload_operations_manager_task",
         ),
         Index(

@@ -71,8 +71,9 @@ class YouTubeUploadOperationStore:
             return UploadOperationClaim("submit", operation)
 
     async def mark_submitted(self, operation_id: uuid.UUID, manager_task_id: str) -> YouTubeUploadOperation:
-        if not self._is_nonblank_string(manager_task_id):
-            raise ValueError("manager task id is required")
+        canonical_manager_task_id = self._canonical_manager_task_id(manager_task_id)
+        if canonical_manager_task_id is None:
+            raise ValueError("manager task id must be a canonical UUID")
 
         async with self._session_factory() as db:
             result = await db.execute(
@@ -81,7 +82,7 @@ class YouTubeUploadOperationStore:
                 .where(YouTubeUploadOperation.status == "reserved")
                 .values(
                     status="submitted",
-                    manager_task_id=manager_task_id,
+                    manager_task_id=canonical_manager_task_id,
                     request_attempted_at=datetime.now(timezone.utc),
                     error_message=None,
                     updated_at=func.now(),
@@ -95,7 +96,10 @@ class YouTubeUploadOperationStore:
 
             await db.rollback()
             current = await self._operation(db, operation_id)
-            if current.status == "submitted" and current.manager_task_id == manager_task_id:
+            if (
+                current.status == "submitted"
+                and current.manager_task_id == canonical_manager_task_id
+            ):
                 return current
             raise ValueError(f"cannot mark {current.status} operation submitted")
 
@@ -251,13 +255,12 @@ class YouTubeUploadOperationStore:
 
     @staticmethod
     def _action_for(operation: YouTubeUploadOperation) -> str:
-        if operation.status == "submitted" and YouTubeUploadOperationStore._is_nonblank_string(
+        manager_task_id = YouTubeUploadOperationStore._canonical_manager_task_id(
             operation.manager_task_id
-        ):
+        )
+        if operation.status == "submitted" and manager_task_id is not None:
             return "resume"
-        if operation.status == "succeeded" and YouTubeUploadOperationStore._is_nonblank_string(
-            operation.manager_task_id
-        ):
+        if operation.status == "succeeded" and manager_task_id is not None:
             return "replay"
         return "block"
 
@@ -300,3 +303,13 @@ class YouTubeUploadOperationStore:
     @staticmethod
     def _is_nonblank_string(value: Any) -> bool:
         return isinstance(value, str) and bool(value.strip())
+
+    @staticmethod
+    def _canonical_manager_task_id(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            canonical = str(uuid.UUID(value))
+        except (AttributeError, ValueError):
+            return None
+        return canonical if value == canonical else None

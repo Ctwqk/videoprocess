@@ -24,6 +24,25 @@ from app.services.youtube_upload_operations import (
 )
 
 
+MANAGER_TASK_ID = "a0b1c2d3-e4f5-4678-9abc-def012345678"
+SECOND_MANAGER_TASK_ID = "12345678-90ab-4cde-8f01-23456789abcd"
+INVALID_MANAGER_TASK_ID_CASES = (
+    pytest.param(None, id="null"),
+    pytest.param("", id="empty"),
+    pytest.param("   ", id="spaces"),
+    pytest.param("\t", id="tab"),
+    pytest.param("\n", id="newline"),
+    pytest.param("\t\n", id="control-whitespace"),
+    pytest.param("manager-task-1", id="legacy-placeholder"),
+    pytest.param("a0b1c2d3e4f546789abcdef012345678", id="compact"),
+    pytest.param("{a0b1c2d3-e4f5-4678-9abc-def012345678}", id="braced"),
+    pytest.param("A0B1C2D3-E4F5-4678-9ABC-DEF012345678", id="uppercase"),
+    pytest.param("g0b1c2d3-e4f5-4678-9abc-def012345678", id="non-hex"),
+    pytest.param("a0b1c2d3-e4f5-4678-9abc-def01234567-", id="extra-hyphen"),
+    pytest.param(f"{MANAGER_TASK_ID}\n", id="valid-plus-newline"),
+)
+
+
 @pytest.fixture
 async def operation_session_factory(tmp_path):
     engine = create_async_engine(
@@ -111,7 +130,8 @@ async def test_claim_reserves_once_then_resumes_and_replays(operation_session_fa
     assert again.action == "block"
     assert again.operation.id == claim.operation.id
 
-    await store.mark_submitted(claim.operation.id, "manager-task-1")
+    submitted = await store.mark_submitted(claim.operation.id, MANAGER_TASK_ID)
+    assert submitted.manager_task_id == MANAGER_TASK_ID
     assert (await store.claim(context)).action == "resume"
 
     receipt = {
@@ -183,9 +203,9 @@ async def test_mark_succeeded_rejects_duplicate_platform_video_id(operation_sess
     first = await store.claim(first_context)
     second = await store.claim(second_context)
 
-    await store.mark_submitted(first.operation.id, "manager-task-1")
+    await store.mark_submitted(first.operation.id, MANAGER_TASK_ID)
     await store.mark_succeeded(first.operation.id, "abcdefghijk", {"video_id": "abcdefghijk"})
-    await store.mark_submitted(second.operation.id, "manager-task-2")
+    await store.mark_submitted(second.operation.id, SECOND_MANAGER_TASK_ID)
 
     with pytest.raises(
         UploadOperationConflictError,
@@ -202,7 +222,7 @@ async def test_competing_successes_cannot_replace_the_winning_receipt(
     async with operation_session_factory() as db:
         context = await _context_for(db)
     claim = await store.claim(context)
-    await store.mark_submitted(claim.operation.id, "manager-task-1")
+    await store.mark_submitted(claim.operation.id, MANAGER_TASK_ID)
 
     start_barrier = asyncio.Barrier(2)
 
@@ -252,19 +272,27 @@ def test_operation_model_requires_manager_task_for_submitted_and_succeeded_state
         for constraint in YouTubeUploadOperation.__table__.constraints
         if isinstance(constraint, CheckConstraint)
     }
-    assert checks["ck_youtube_upload_operations_manager_task"] == (
-        "status NOT IN ('submitted', 'succeeded') OR "
-        "(manager_task_id IS NOT NULL AND length(trim(manager_task_id)) > 0)"
+    manager_check = checks["ck_youtube_upload_operations_manager_task"]
+    assert manager_check.startswith("(manager_task_id IS NULL OR (")
+    assert (
+        ")) AND (status NOT IN ('submitted', 'succeeded') OR manager_task_id IS NOT NULL)"
+        in manager_check
     )
+    assert "length(manager_task_id) = 36" in manager_check
+    assert "manager_task_id = lower(manager_task_id)" in manager_check
+    assert "length(replace(manager_task_id, '-', '')) = 32" in manager_check
+    for position in (9, 14, 19, 24):
+        assert f"substr(manager_task_id, {position}, 1) = '-'" in manager_check
+    for character in "0123456789abcdef":
+        assert f", '{character}', '')" in manager_check
 
 
 @pytest.mark.parametrize(
     "manager_task_id",
-    [None, "", "   "],
-    ids=["null", "empty", "whitespace"],
+    INVALID_MANAGER_TASK_ID_CASES,
 )
 @pytest.mark.asyncio
-async def test_database_rejects_submitted_operation_without_nonblank_manager_task(
+async def test_database_rejects_submitted_operation_without_canonical_manager_uuid(
     operation_session_factory,
     manager_task_id,
 ):
@@ -283,20 +311,73 @@ async def test_database_rejects_submitted_operation_without_nonblank_manager_tas
         await db.rollback()
 
 
+@pytest.mark.parametrize(
+    "manager_task_id",
+    [
+        pytest.param("\t", id="tab"),
+        pytest.param("\n", id="newline"),
+        pytest.param("manager-task-1", id="malformed"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_mark_submitted_rejects_whitespace_manager_task(operation_session_factory):
+async def test_database_rejects_noncanonical_manager_uuid_before_submission(
+    operation_session_factory,
+    manager_task_id,
+):
     store = YouTubeUploadOperationStore(operation_session_factory)
     async with operation_session_factory() as db:
         context = await _context_for(db)
     claim = await store.claim(context)
 
-    with pytest.raises(ValueError, match="manager task id is required"):
-        await store.mark_submitted(claim.operation.id, "   ")
+    async with operation_session_factory() as db:
+        operation = await db.get(YouTubeUploadOperation, claim.operation.id)
+        assert operation is not None
+        operation.manager_task_id = manager_task_id
+        with pytest.raises(IntegrityError):
+            await db.commit()
+        await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_database_accepts_submitted_operation_with_canonical_manager_uuid(
+    operation_session_factory,
+):
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+    claim = await store.claim(context)
+
+    async with operation_session_factory() as db:
+        operation = await db.get(YouTubeUploadOperation, claim.operation.id)
+        assert operation is not None
+        operation.status = "submitted"
+        operation.manager_task_id = MANAGER_TASK_ID
+        await db.commit()
+
+    async with operation_session_factory() as db:
+        stored = await db.get(YouTubeUploadOperation, claim.operation.id)
+    assert stored is not None
+    assert stored.manager_task_id == MANAGER_TASK_ID
+
+
+@pytest.mark.parametrize("manager_task_id", INVALID_MANAGER_TASK_ID_CASES)
+@pytest.mark.asyncio
+async def test_mark_submitted_rejects_noncanonical_manager_task(
+    operation_session_factory,
+    manager_task_id,
+):
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+    claim = await store.claim(context)
+
+    with pytest.raises(ValueError, match="manager task id"):
+        await store.mark_submitted(claim.operation.id, manager_task_id)
 
 
 @pytest.mark.parametrize("status", ["submitted", "succeeded"])
-@pytest.mark.parametrize("manager_task_id", [None, "", "   "])
-def test_managerless_durable_state_fails_closed(status, manager_task_id):
+@pytest.mark.parametrize("manager_task_id", INVALID_MANAGER_TASK_ID_CASES)
+def test_noncanonical_manager_durable_state_fails_closed(status, manager_task_id):
     operation = YouTubeUploadOperation(status=status, manager_task_id=manager_task_id)
     assert YouTubeUploadOperationStore._action_for(operation) == "block"
 
@@ -324,7 +405,7 @@ async def test_receipt_quota_estimate_is_a_finite_numeric_scalar_or_none(
     async with operation_session_factory() as db:
         context = await _context_for(db)
     claim = await store.claim(context)
-    await store.mark_submitted(claim.operation.id, "manager-task-1")
+    await store.mark_submitted(claim.operation.id, MANAGER_TASK_ID)
 
     succeeded = await store.mark_succeeded(
         claim.operation.id,
@@ -340,7 +421,7 @@ async def test_receipt_never_stringifies_nested_or_non_string_values(operation_s
     async with operation_session_factory() as db:
         context = await _context_for(db)
     claim = await store.claim(context)
-    await store.mark_submitted(claim.operation.id, "manager-task-1")
+    await store.mark_submitted(claim.operation.id, MANAGER_TASK_ID)
 
     secrets = {
         "RECEIPT_VIDEO_TOKEN",
@@ -423,4 +504,15 @@ def test_alembic_upgrade_head_renders_offline_postgresql_sql():
     assert widening in completed.stdout
     assert completed.stdout.index(widening) < completed.stdout.index(revision_update)
     assert "CONSTRAINT ck_youtube_upload_operations_manager_task CHECK" in completed.stdout
-    assert "length(trim(manager_task_id)) > 0" in completed.stdout
+    assert "(manager_task_id IS NULL OR (" in completed.stdout
+    assert (
+        ")) AND (status NOT IN ('submitted', 'succeeded') OR manager_task_id IS NOT NULL)"
+        in completed.stdout
+    )
+    assert "length(manager_task_id) = 36" in completed.stdout
+    assert "manager_task_id = lower(manager_task_id)" in completed.stdout
+    assert "length(replace(manager_task_id, '-', '')) = 32" in completed.stdout
+    for position in (9, 14, 19, 24):
+        assert f"substr(manager_task_id, {position}, 1) = '-'" in completed.stdout
+    for character in "0123456789abcdef":
+        assert f", '{character}', '')" in completed.stdout
