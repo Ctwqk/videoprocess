@@ -28,7 +28,8 @@ from app.services.worker_admission import (
 )
 from app.storage.manager import get_storage
 from worker.handlers import HANDLER_MAP
-from worker.handlers.base import CancelledError
+from worker.handlers.base import BaseHandler, CancelledError
+from worker.handlers.youtube_upload import YouTubeUploadHandler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("worker")
@@ -143,6 +144,9 @@ async def process_task(data: dict) -> None:
     node_type = data["node_type"]
     config = json.loads(data.get("config", "{}"))
     input_artifacts_map = json.loads(data.get("input_artifacts", "{}"))
+    config["_job_id"] = job_id
+    config["_node_execution_id"] = node_execution_id
+    config["_input_artifact_ids"] = dict(input_artifacts_map)
 
     logger.info(f"Processing node {data['node_id']} (type={node_type}) for job {job_id}")
 
@@ -171,7 +175,11 @@ async def process_task(data: dict) -> None:
             ne.worker_id = WORKER_ID
             await db.commit()
 
-    handler = handler_cls()
+    handler: BaseHandler
+    if node_type == "youtube_upload":
+        handler = YouTubeUploadHandler(session_factory=get_worker_session())
+    else:
+        handler = handler_cls()
 
     # Background task: periodically check cancel status and kill handler if needed
     cancel_check_task = None
@@ -216,7 +224,6 @@ async def process_task(data: dict) -> None:
                 input_paths[port_name] = local_path
 
         config["_input_artifact_meta"] = input_artifact_meta
-        config["_input_artifact_ids"] = dict(input_artifacts_map)
 
         # Prepare output path
         output_ext = _get_output_extension(node_type, config)
