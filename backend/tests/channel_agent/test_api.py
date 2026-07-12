@@ -340,7 +340,23 @@ async def test_audit_learning_and_failure_endpoints_do_not_leak_cross_channel_ro
             channel_config_snapshot_json={},
             created_at=now - timedelta(hours=1),
         )
-        api_session.add_all([first_task, second_task])
+        older_publication_task = ProductionTask(
+            channel_profile_id=uuid.UUID(first["id"]),
+            target_account_id=uuid.UUID(first_account["id"]),
+            source="manual_seed",
+            prompt="older publication audit",
+            channel_config_snapshot_json={},
+        )
+        newer_publication_task = ProductionTask(
+            channel_profile_id=uuid.UUID(first["id"]),
+            target_account_id=uuid.UUID(first_account["id"]),
+            source="manual_seed",
+            prompt="newer publication audit",
+            channel_config_snapshot_json={},
+        )
+        api_session.add_all(
+            [first_task, second_task, older_publication_task, newer_publication_task]
+        )
         await api_session.flush()
 
         first_tick = AgentTickAudit(channel_profile_id=uuid.UUID(first["id"]), tick_id="tick:first", dry_run=False)
@@ -380,7 +396,7 @@ async def test_audit_learning_and_failure_endpoints_do_not_leak_cross_channel_ro
             created_at=now,
         )
         older_publication = PublicationRecord(
-            production_task_id=first_task.id,
+            production_task_id=older_publication_task.id,
             account_id=uuid.UUID(first_account["id"]),
             platform_content_id="yt-a-old",
             title="old",
@@ -389,7 +405,7 @@ async def test_audit_learning_and_failure_endpoints_do_not_leak_cross_channel_ro
         )
         newer_publication = PublicationRecord(
             id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
-            production_task_id=first_task.id,
+            production_task_id=newer_publication_task.id,
             account_id=uuid.UUID(first_account["id"]),
             platform_content_id="yt-a-new",
             title="new",

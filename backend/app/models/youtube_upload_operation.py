@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid as uuid_mod
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, String, Text, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, JSON, DateTime, ForeignKey, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,6 +14,10 @@ class YouTubeUploadOperation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "youtube_upload_operations"
     __table_args__ = (
         UniqueConstraint("node_execution_id", name="uq_youtube_upload_operations_node_execution"),
+        CheckConstraint(
+            "status NOT IN ('submitted', 'succeeded') OR manager_task_id IS NOT NULL",
+            name="ck_youtube_upload_operations_manager_task",
+        ),
         Index(
             "ux_youtube_upload_operations_production_task",
             "production_task_id",

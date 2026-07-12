@@ -21,8 +21,59 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    bind = op.get_bind()
-    _raise_on_publication_conflicts(bind)
+    op.execute(
+        sa.text(
+            """
+            DO $$
+            DECLARE
+                duplicate_record RECORD;
+            BEGIN
+                SELECT production_task_id, count(*) AS duplicate_count
+                INTO duplicate_record
+                FROM publication_records
+                GROUP BY production_task_id
+                HAVING count(*) > 1
+                ORDER BY production_task_id
+                LIMIT 1;
+
+                IF FOUND THEN
+                    RAISE EXCEPTION 'cannot add ux_publication_records_production_task: '
+                        'production_task_id % has % records',
+                        duplicate_record.production_task_id,
+                        duplicate_record.duplicate_count;
+                END IF;
+            END
+            $$
+            """
+        )
+    )
+    op.execute(
+        sa.text(
+            """
+            DO $$
+            DECLARE
+                duplicate_record RECORD;
+            BEGIN
+                SELECT platform, platform_content_id, count(*) AS duplicate_count
+                INTO duplicate_record
+                FROM publication_records
+                GROUP BY platform, platform_content_id
+                HAVING count(*) > 1
+                ORDER BY platform, platform_content_id
+                LIMIT 1;
+
+                IF FOUND THEN
+                    RAISE EXCEPTION 'cannot add ux_publication_records_platform_content: '
+                        'platform % content % has % records',
+                        duplicate_record.platform,
+                        duplicate_record.platform_content_id,
+                        duplicate_record.duplicate_count;
+                END IF;
+            END
+            $$
+            """
+        )
+    )
 
     op.execute(
         """
@@ -71,6 +122,10 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["node_execution_id"], ["node_executions.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["input_artifact_id"], ["artifacts.id"]),
         sa.PrimaryKeyConstraint("id"),
+        sa.CheckConstraint(
+            "status NOT IN ('submitted', 'succeeded') OR manager_task_id IS NOT NULL",
+            name="ck_youtube_upload_operations_manager_task",
+        ),
         sa.UniqueConstraint("node_execution_id", name="uq_youtube_upload_operations_node_execution"),
     )
     op.execute(
@@ -95,42 +150,3 @@ def downgrade() -> None:
     op.drop_table("youtube_upload_operations")
     op.execute("DROP INDEX IF EXISTS ux_publication_records_platform_content")
     op.execute("DROP INDEX IF EXISTS ux_publication_records_production_task")
-
-
-def _raise_on_publication_conflicts(bind: sa.Connection) -> None:
-    task_conflict = bind.execute(
-        sa.text(
-            """
-            SELECT production_task_id, count(*) AS duplicate_count
-            FROM publication_records
-            GROUP BY production_task_id
-            HAVING count(*) > 1
-            ORDER BY production_task_id
-            LIMIT 1
-            """
-        )
-    ).first()
-    if task_conflict is not None:
-        raise RuntimeError(
-            "cannot add ux_publication_records_production_task: "
-            f"production_task_id {task_conflict.production_task_id} has {task_conflict.duplicate_count} records"
-        )
-
-    platform_conflict = bind.execute(
-        sa.text(
-            """
-            SELECT platform, platform_content_id, count(*) AS duplicate_count
-            FROM publication_records
-            GROUP BY platform, platform_content_id
-            HAVING count(*) > 1
-            ORDER BY platform, platform_content_id
-            LIMIT 1
-            """
-        )
-    ).first()
-    if platform_conflict is not None:
-        raise RuntimeError(
-            "cannot add ux_publication_records_platform_content: "
-            f"platform {platform_conflict.platform}, content {platform_conflict.platform_content_id} "
-            f"has {platform_conflict.duplicate_count} records"
-        )

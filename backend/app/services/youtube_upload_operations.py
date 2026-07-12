@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -74,16 +75,29 @@ class YouTubeUploadOperationStore:
             raise ValueError("manager task id is required")
 
         async with self._session_factory() as db:
-            operation = await self._operation(db, operation_id)
-            if operation.status == "submitted" and operation.manager_task_id == manager_task_id:
+            result = await db.execute(
+                update(YouTubeUploadOperation)
+                .where(YouTubeUploadOperation.id == operation_id)
+                .where(YouTubeUploadOperation.status == "reserved")
+                .values(
+                    status="submitted",
+                    manager_task_id=manager_task_id,
+                    request_attempted_at=datetime.now(timezone.utc),
+                    error_message=None,
+                    updated_at=func.now(),
+                )
+                .returning(YouTubeUploadOperation)
+            )
+            operation = result.scalar_one_or_none()
+            if operation is not None:
+                await db.commit()
                 return operation
-            if operation.status != "reserved":
-                raise ValueError(f"cannot mark {operation.status} operation submitted")
-            operation.status = "submitted"
-            operation.manager_task_id = manager_task_id
-            operation.request_attempted_at = datetime.now(timezone.utc)
-            operation.error_message = None
-            return await self._commit_and_refresh(db, operation)
+
+            await db.rollback()
+            current = await self._operation(db, operation_id)
+            if current.status == "submitted" and current.manager_task_id == manager_task_id:
+                return current
+            raise ValueError(f"cannot mark {current.status} operation submitted")
 
     async def mark_succeeded(
         self,
@@ -95,23 +109,39 @@ class YouTubeUploadOperationStore:
             raise ValueError("platform video id is required")
 
         async with self._session_factory() as db:
-            operation = await self._operation(db, operation_id)
-            if operation.status == "succeeded":
-                if operation.platform_video_id != platform_video_id:
-                    raise UploadOperationConflictError(
-                        "operation already belongs to a different platform video id"
-                    )
-                return operation
-            if operation.status != "submitted":
-                raise ValueError(f"cannot mark {operation.status} operation succeeded")
-
-            operation.status = "succeeded"
-            operation.platform_video_id = platform_video_id
-            operation.receipt_json = self._receipt_for(operation, platform_video_id, receipt)
-            operation.completed_at = datetime.now(timezone.utc)
-            operation.error_message = None
+            metadata_result = await db.execute(
+                select(YouTubeUploadOperation.title, YouTubeUploadOperation.privacy).where(
+                    YouTubeUploadOperation.id == operation_id
+                )
+            )
+            metadata = metadata_result.one_or_none()
+            if metadata is None:
+                raise LookupError(f"YouTube upload operation {operation_id} was not found")
+            receipt_json = self._receipt_for(
+                title=metadata.title,
+                privacy=metadata.privacy,
+                platform_video_id=platform_video_id,
+                receipt=receipt,
+            )
             try:
-                return await self._commit_and_refresh(db, operation)
+                result = await db.execute(
+                    update(YouTubeUploadOperation)
+                    .where(YouTubeUploadOperation.id == operation_id)
+                    .where(YouTubeUploadOperation.status == "submitted")
+                    .values(
+                        status="succeeded",
+                        platform_video_id=platform_video_id,
+                        receipt_json=receipt_json,
+                        completed_at=datetime.now(timezone.utc),
+                        error_message=None,
+                        updated_at=func.now(),
+                    )
+                    .returning(YouTubeUploadOperation)
+                )
+                operation = result.scalar_one_or_none()
+                if operation is not None:
+                    await db.commit()
+                    return operation
             except IntegrityError:
                 await db.rollback()
                 conflicting = await self._operation_for_platform_video(db, platform_video_id)
@@ -120,6 +150,16 @@ class YouTubeUploadOperationStore:
                         "platform video id already belongs to a YouTube upload operation"
                     ) from None
                 raise
+
+            await db.rollback()
+            current = await self._operation(db, operation_id)
+            if current.status == "succeeded":
+                if current.platform_video_id == platform_video_id:
+                    return current
+                raise UploadOperationConflictError(
+                    "operation already belongs to a different platform video id"
+                )
+            raise ValueError(f"cannot mark {current.status} operation succeeded")
 
     async def mark_uncertain(self, operation_id: uuid.UUID, error_message: str) -> YouTubeUploadOperation:
         return await self._mark_terminal(operation_id, "uncertain", error_message)
@@ -134,12 +174,27 @@ class YouTubeUploadOperationStore:
         error_message: str,
     ) -> YouTubeUploadOperation:
         async with self._session_factory() as db:
-            operation = await self._operation(db, operation_id)
-            if operation.status == "succeeded":
-                raise ValueError("cannot change a succeeded operation")
-            operation.status = status
-            operation.error_message = error_message
-            return await self._commit_and_refresh(db, operation)
+            result = await db.execute(
+                update(YouTubeUploadOperation)
+                .where(YouTubeUploadOperation.id == operation_id)
+                .where(YouTubeUploadOperation.status.in_(("reserved", "submitted")))
+                .values(
+                    status=status,
+                    error_message=error_message,
+                    updated_at=func.now(),
+                )
+                .returning(YouTubeUploadOperation)
+            )
+            operation = result.scalar_one_or_none()
+            if operation is not None:
+                await db.commit()
+                return operation
+
+            await db.rollback()
+            current = await self._operation(db, operation_id)
+            if current.status == status:
+                return current
+            raise ValueError(f"cannot mark {current.status} operation {status}")
 
     @staticmethod
     async def _production_task_id(db: AsyncSession, job_id: uuid.UUID) -> uuid.UUID | None:
@@ -195,25 +250,18 @@ class YouTubeUploadOperationStore:
         return result.scalar_one_or_none()
 
     @staticmethod
-    async def _commit_and_refresh(
-        db: AsyncSession,
-        operation: YouTubeUploadOperation,
-    ) -> YouTubeUploadOperation:
-        await db.commit()
-        await db.refresh(operation)
-        return operation
-
-    @staticmethod
     def _action_for(operation: YouTubeUploadOperation) -> str:
         if operation.status == "submitted" and operation.manager_task_id:
             return "resume"
-        if operation.status == "succeeded":
+        if operation.status == "succeeded" and operation.manager_task_id:
             return "replay"
         return "block"
 
     @staticmethod
     def _receipt_for(
-        operation: YouTubeUploadOperation,
+        *,
+        title: str,
+        privacy: str,
         platform_video_id: str,
         receipt: dict[str, Any],
     ) -> dict[str, Any]:
@@ -222,8 +270,22 @@ class YouTubeUploadOperationStore:
         return {
             "video_id": platform_video_id,
             "url": str(receipt.get("url") or receipt.get("video_url") or ""),
-            "title": str(receipt.get("title") or operation.title),
-            "privacy": str(receipt.get("privacy") or operation.privacy),
+            "title": str(receipt.get("title") or title),
+            "privacy": str(receipt.get("privacy") or privacy),
             "tags": tags,
-            "quota_estimate": receipt.get("quota_estimate", receipt.get("quota_units_estimated")),
+            "quota_estimate": YouTubeUploadOperationStore._finite_number_or_none(
+                receipt.get("quota_estimate", receipt.get("quota_units_estimated"))
+            ),
         }
+
+    @staticmethod
+    def _finite_number_or_none(value: Any) -> int | float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None

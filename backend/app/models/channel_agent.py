@@ -281,7 +281,16 @@ class MaterialUsageLedger(UUIDPrimaryKeyMixin, Base):
 
 class PublicationRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "publication_records"
-    __table_args__ = (Index("ix_publication_records_task", "production_task_id"),)
+    __table_args__ = (
+        Index("ix_publication_records_task", "production_task_id"),
+        Index("ux_publication_records_production_task", "production_task_id", unique=True),
+        Index(
+            "ux_publication_records_platform_content",
+            "platform",
+            "platform_content_id",
+            unique=True,
+        ),
+    )
 
     production_task_id: Mapped[uuid_mod.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     platform: Mapped[str] = mapped_column(String(64), default="youtube", nullable=False)
