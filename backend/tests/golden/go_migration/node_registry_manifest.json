@@ -2615,7 +2615,7 @@
         }
       ],
       "type_name": "youtube_upload",
-      "worker_type": "ffmpeg"
+      "worker_type": "youtube_publisher"
     },
     {
       "category": "planner",

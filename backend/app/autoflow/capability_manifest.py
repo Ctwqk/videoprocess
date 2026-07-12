@@ -141,7 +141,7 @@ EXECUTION_OVERRIDES = {
     "material_search": ExecutionContract(effects=["material_library_read"], worker_type="planner", planner_only=True),
     "zip_records": ExecutionContract(effects=["planner_batch"], worker_type="planner", planner_only=True),
     "url_download": ExecutionContract(effects=["external_network_read", "external_media_ingest"], worker_type="ffmpeg"),
-    "youtube_upload": ExecutionContract(effects=["external_platform_write"], worker_type="ffmpeg"),
+    "youtube_upload": ExecutionContract(effects=["external_platform_write"], worker_type="youtube_publisher"),
     "x_upload": ExecutionContract(effects=["external_platform_write"], worker_type="ffmpeg"),
     "xiaohongshu_upload": ExecutionContract(effects=["external_platform_write"], worker_type="ffmpeg"),
 }

@@ -24,5 +24,5 @@ DEFINITION = NodeTypeDefinition(
         ParamDefinition(name="tags", param_type="string", default="",
                        description="Comma-separated tags"),
     ],
-    worker_type="ffmpeg",
+    worker_type="youtube_publisher",
 )

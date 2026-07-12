@@ -9,6 +9,83 @@ from app.services.worker_admission import (
 )
 
 
+def _publisher_env() -> dict[str, str]:
+    return {
+        "DEPLOY_MODE": "production",
+        "REDIS_URL": "redis://10.0.0.150:6380/0",
+        "WORKER_TYPE": "youtube_publisher",
+        "WORKER_HOST": "150-publisher",
+        "STORAGE_BACKEND": "minio",
+        "MINIO_ENDPOINT": "10.0.0.150:9000",
+        "MINIO_ACCESS_KEY": "x",
+        "MINIO_SECRET_KEY": "y",
+        "MINIO_BUCKET": "videoprocess",
+        "YOUTUBE_MANAGER_URL": "http://10.0.0.150:18999",
+        "YOUTUBE_PUBLISH_ENABLED": "true",
+        "PUBLIC_PUBLISH_ENABLED": "false",
+    }
+
+
+def test_production_youtube_publisher_is_admitted_with_explicit_contract() -> None:
+    assert validate_worker_admission(_publisher_env()).allowed
+
+
+def test_production_youtube_publisher_rejects_local_manager_url() -> None:
+    env = _publisher_env()
+    env["YOUTUBE_MANAGER_URL"] = "http://localhost:8899"
+
+    decision = validate_worker_admission(env)
+
+    assert decision.allowed is False
+    assert "production youtube_publisher workers require a non-local YOUTUBE_MANAGER_URL" in decision.reasons
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET"),
+)
+def test_production_youtube_publisher_requires_each_minio_setting(missing_key: str) -> None:
+    env = _publisher_env()
+    env.pop(missing_key)
+
+    decision = validate_worker_admission(env)
+
+    assert decision.allowed is False
+    assert f"production youtube_publisher workers require {missing_key}" in decision.reasons
+
+
+def test_production_youtube_publisher_rejects_public_publish() -> None:
+    env = _publisher_env()
+    env["PUBLIC_PUBLISH_ENABLED"] = "true"
+
+    decision = validate_worker_admission(env)
+
+    assert decision.allowed is False
+    assert "production youtube_publisher workers require PUBLIC_PUBLISH_ENABLED=false" in decision.reasons
+
+
+def test_production_youtube_publisher_rejects_disabled_publishing() -> None:
+    env = _publisher_env()
+    env["YOUTUBE_PUBLISH_ENABLED"] = "false"
+
+    decision = validate_worker_admission(env)
+
+    assert decision.allowed is False
+    assert "production youtube_publisher workers require YOUTUBE_PUBLISH_ENABLED=true" in decision.reasons
+
+
+@pytest.mark.parametrize("worker_type", ("youtube_publisher", "ffmpeg"))
+def test_production_workers_reject_youtube_credentials_directory(worker_type: str) -> None:
+    env = _publisher_env()
+    env["WORKER_TYPE"] = worker_type
+    env["YOUTUBE_CREDENTIALS_DIR"] = "/app/youtube_credentials"
+
+    decision = validate_worker_admission(env)
+
+    assert decision.allowed is False
+    assert "production workers must not set YOUTUBE_CREDENTIALS_DIR" in decision.reasons
+
+
 def test_local_worker_with_local_storage_is_allowed() -> None:
     decision = validate_worker_admission(
         {

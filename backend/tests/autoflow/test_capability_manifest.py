@@ -63,6 +63,8 @@ def test_manifest_exposes_policy_and_execution_contracts_for_upload_nodes():
 
     upload = nodes["youtube_upload"]
     assert "external_platform_write" in upload.execution.effects
+    assert upload.worker_type == "youtube_publisher"
+    assert upload.execution.worker_type == "youtube_publisher"
     assert upload.policy.requires_review is True
     assert upload.policy.default_privacy == "private"
     assert upload.policy.allowed_privacy == ["private", "unlisted"]

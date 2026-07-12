@@ -51,7 +51,7 @@ class PublishingAccountCreate(BaseModel):
     platform_account_id: str = ""
     credential_ref: str = ""
     platform_specific_config_json: dict[str, Any] = Field(default_factory=dict)
-    default_privacy: str = "public"
+    default_privacy: str = "private"
     external_asset_auto_publish: bool = False
 
 
@@ -70,7 +70,7 @@ class LaneFormatCreate(BaseModel):
     target_duration_sec: int = 30
     template_pool_json: list[str] = Field(default_factory=lambda: ["material_library_remix"])
     source_platforms_json: list[str] = Field(default_factory=list)
-    default_publish_visibility: str = "public"
+    default_publish_visibility: str = "private"
 
 
 class LaneFormatRead(LaneFormatCreate):

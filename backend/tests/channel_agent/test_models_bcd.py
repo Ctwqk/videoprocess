@@ -18,11 +18,25 @@ from app.models.channel_agent import (
     PublishingAccount,
     TopicLane,
 )
+from app.schemas.channel_agent import LaneFormatCreate, PublishingAccountCreate
 
 
 MIGRATION_021 = (
     Path(__file__).resolve().parents[2] / "alembic/versions/021_channelops_discovery_signals.py"
 )
+
+
+def test_new_publishing_defaults_are_private() -> None:
+    assert PublishingAccountCreate(account_label="canary").default_privacy == "private"
+    assert LaneFormatCreate().default_publish_visibility == "private"
+
+
+def test_explicit_legacy_public_values_remain_accepted() -> None:
+    assert PublishingAccountCreate(
+        account_label="legacy",
+        default_privacy="public",
+    ).default_privacy == "public"
+    assert LaneFormatCreate(default_publish_visibility="public").default_publish_visibility == "public"
 
 
 async def _create_tables(*tables):
