@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.models.channel_agent import ProductionTask
+from app.models.youtube_upload_operation import YouTubeUploadOperation
+
+
+@dataclass(frozen=True)
+class UploadOperationContext:
+    job_id: uuid.UUID
+    node_execution_id: uuid.UUID
+    input_artifact_id: uuid.UUID
+    content_sha256: str
+    title: str
+    privacy: str
+
+
+@dataclass(frozen=True)
+class UploadOperationClaim:
+    action: str
+    operation: YouTubeUploadOperation
+
+
+class UploadOperationConflictError(RuntimeError):
+    pass
+
+
+class YouTubeUploadOperationStore:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def claim(self, context: UploadOperationContext) -> UploadOperationClaim:
+        async with self._session_factory() as db:
+            production_task_id = await self._production_task_id(db, context.job_id)
+            operation = YouTubeUploadOperation(
+                production_task_id=production_task_id,
+                job_id=context.job_id,
+                node_execution_id=context.node_execution_id,
+                input_artifact_id=context.input_artifact_id,
+                content_sha256=context.content_sha256,
+                title=context.title,
+                privacy=context.privacy,
+                status="reserved",
+            )
+            db.add(operation)
+            try:
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
+                existing = await self._operation_for_node(db, context.node_execution_id)
+                if existing is not None:
+                    return UploadOperationClaim(self._action_for(existing), existing)
+                if production_task_id is not None:
+                    conflicting = await self._operation_for_production_task(db, production_task_id)
+                    if conflicting is not None:
+                        raise UploadOperationConflictError(
+                            "production task already has a YouTube upload operation"
+                        ) from None
+                raise
+
+            await db.refresh(operation)
+            return UploadOperationClaim("submit", operation)
+
+    async def mark_submitted(self, operation_id: uuid.UUID, manager_task_id: str) -> YouTubeUploadOperation:
+        if not manager_task_id:
+            raise ValueError("manager task id is required")
+
+        async with self._session_factory() as db:
+            operation = await self._operation(db, operation_id)
+            if operation.status == "submitted" and operation.manager_task_id == manager_task_id:
+                return operation
+            if operation.status != "reserved":
+                raise ValueError(f"cannot mark {operation.status} operation submitted")
+            operation.status = "submitted"
+            operation.manager_task_id = manager_task_id
+            operation.request_attempted_at = datetime.now(timezone.utc)
+            operation.error_message = None
+            return await self._commit_and_refresh(db, operation)
+
+    async def mark_succeeded(
+        self,
+        operation_id: uuid.UUID,
+        platform_video_id: str,
+        receipt: dict[str, Any],
+    ) -> YouTubeUploadOperation:
+        if not platform_video_id:
+            raise ValueError("platform video id is required")
+
+        async with self._session_factory() as db:
+            operation = await self._operation(db, operation_id)
+            if operation.status == "succeeded":
+                if operation.platform_video_id != platform_video_id:
+                    raise UploadOperationConflictError(
+                        "operation already belongs to a different platform video id"
+                    )
+                return operation
+            if operation.status != "submitted":
+                raise ValueError(f"cannot mark {operation.status} operation succeeded")
+
+            operation.status = "succeeded"
+            operation.platform_video_id = platform_video_id
+            operation.receipt_json = self._receipt_for(operation, platform_video_id, receipt)
+            operation.completed_at = datetime.now(timezone.utc)
+            operation.error_message = None
+            try:
+                return await self._commit_and_refresh(db, operation)
+            except IntegrityError:
+                await db.rollback()
+                conflicting = await self._operation_for_platform_video(db, platform_video_id)
+                if conflicting is not None:
+                    raise UploadOperationConflictError(
+                        "platform video id already belongs to a YouTube upload operation"
+                    ) from None
+                raise
+
+    async def mark_uncertain(self, operation_id: uuid.UUID, error_message: str) -> YouTubeUploadOperation:
+        return await self._mark_terminal(operation_id, "uncertain", error_message)
+
+    async def mark_failed(self, operation_id: uuid.UUID, error_message: str) -> YouTubeUploadOperation:
+        return await self._mark_terminal(operation_id, "failed", error_message)
+
+    async def _mark_terminal(
+        self,
+        operation_id: uuid.UUID,
+        status: str,
+        error_message: str,
+    ) -> YouTubeUploadOperation:
+        async with self._session_factory() as db:
+            operation = await self._operation(db, operation_id)
+            if operation.status == "succeeded":
+                raise ValueError("cannot change a succeeded operation")
+            operation.status = status
+            operation.error_message = error_message
+            return await self._commit_and_refresh(db, operation)
+
+    @staticmethod
+    async def _production_task_id(db: AsyncSession, job_id: uuid.UUID) -> uuid.UUID | None:
+        result = await db.execute(
+            select(ProductionTask.id).where(ProductionTask.job_id == job_id).limit(2)
+        )
+        production_task_ids = list(result.scalars())
+        if len(production_task_ids) > 1:
+            raise UploadOperationConflictError("job is linked to multiple production tasks")
+        return production_task_ids[0] if production_task_ids else None
+
+    @staticmethod
+    async def _operation(db: AsyncSession, operation_id: uuid.UUID) -> YouTubeUploadOperation:
+        operation = await db.get(YouTubeUploadOperation, operation_id)
+        if operation is None:
+            raise LookupError(f"YouTube upload operation {operation_id} was not found")
+        return operation
+
+    @staticmethod
+    async def _operation_for_node(
+        db: AsyncSession,
+        node_execution_id: uuid.UUID,
+    ) -> YouTubeUploadOperation | None:
+        result = await db.execute(
+            select(YouTubeUploadOperation).where(
+                YouTubeUploadOperation.node_execution_id == node_execution_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def _operation_for_production_task(
+        db: AsyncSession,
+        production_task_id: uuid.UUID,
+    ) -> YouTubeUploadOperation | None:
+        result = await db.execute(
+            select(YouTubeUploadOperation).where(
+                YouTubeUploadOperation.production_task_id == production_task_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def _operation_for_platform_video(
+        db: AsyncSession,
+        platform_video_id: str,
+    ) -> YouTubeUploadOperation | None:
+        result = await db.execute(
+            select(YouTubeUploadOperation).where(
+                YouTubeUploadOperation.platform_video_id == platform_video_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def _commit_and_refresh(
+        db: AsyncSession,
+        operation: YouTubeUploadOperation,
+    ) -> YouTubeUploadOperation:
+        await db.commit()
+        await db.refresh(operation)
+        return operation
+
+    @staticmethod
+    def _action_for(operation: YouTubeUploadOperation) -> str:
+        if operation.status == "submitted" and operation.manager_task_id:
+            return "resume"
+        if operation.status == "succeeded":
+            return "replay"
+        return "block"
+
+    @staticmethod
+    def _receipt_for(
+        operation: YouTubeUploadOperation,
+        platform_video_id: str,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_tags = receipt.get("tags", [])
+        tags = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else []
+        return {
+            "video_id": platform_video_id,
+            "url": str(receipt.get("url") or receipt.get("video_url") or ""),
+            "title": str(receipt.get("title") or operation.title),
+            "privacy": str(receipt.get("privacy") or operation.privacy),
+            "tags": tags,
+            "quota_estimate": receipt.get("quota_estimate", receipt.get("quota_units_estimated")),
+        }

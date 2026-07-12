@@ -1,0 +1,136 @@
+"""add durable YouTube upload operations
+
+Revision ID: 023_youtube_upload_operations
+Revises: 022_channelops_feedback_learning
+Create Date: 2026-07-12 00:00:00.000000
+"""
+
+from __future__ import annotations
+
+from typing import Sequence, Union
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+
+revision: str = "023_youtube_upload_operations"
+down_revision: Union[str, None] = "022_channelops_feedback_learning"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+    _raise_on_publication_conflicts(bind)
+
+    op.execute(
+        """
+        CREATE UNIQUE INDEX ux_publication_records_production_task
+        ON publication_records (production_task_id)
+        """
+    )
+    op.execute(
+        """
+        CREATE UNIQUE INDEX ux_publication_records_platform_content
+        ON publication_records (platform, platform_content_id)
+        """
+    )
+
+    op.create_table(
+        "youtube_upload_operations",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column("production_task_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("job_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("node_execution_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("input_artifact_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("content_sha256", sa.String(length=64), nullable=False),
+        sa.Column("title", sa.Text(), nullable=False),
+        sa.Column("privacy", sa.String(length=32), nullable=False),
+        sa.Column("status", sa.String(length=16), nullable=False),
+        sa.Column("manager_task_id", sa.String(length=255), nullable=True),
+        sa.Column("platform_video_id", sa.String(length=255), nullable=True),
+        sa.Column(
+            "receipt_json",
+            postgresql.JSON(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::json"),
+            nullable=False,
+        ),
+        sa.Column("error_message", sa.Text(), nullable=True),
+        sa.Column("request_attempted_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
+        sa.ForeignKeyConstraint(["production_task_id"], ["production_tasks.id"], ondelete="SET NULL"),
+        sa.ForeignKeyConstraint(["job_id"], ["jobs.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["node_execution_id"], ["node_executions.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["input_artifact_id"], ["artifacts.id"]),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("node_execution_id", name="uq_youtube_upload_operations_node_execution"),
+    )
+    op.execute(
+        """
+        CREATE UNIQUE INDEX ux_youtube_upload_operations_production_task
+        ON youtube_upload_operations (production_task_id)
+        WHERE production_task_id IS NOT NULL
+        """
+    )
+    op.execute(
+        """
+        CREATE UNIQUE INDEX ux_youtube_upload_operations_platform_video
+        ON youtube_upload_operations (platform_video_id)
+        WHERE platform_video_id IS NOT NULL
+        """
+    )
+
+
+def downgrade() -> None:
+    op.execute("DROP INDEX IF EXISTS ux_youtube_upload_operations_platform_video")
+    op.execute("DROP INDEX IF EXISTS ux_youtube_upload_operations_production_task")
+    op.drop_table("youtube_upload_operations")
+    op.execute("DROP INDEX IF EXISTS ux_publication_records_platform_content")
+    op.execute("DROP INDEX IF EXISTS ux_publication_records_production_task")
+
+
+def _raise_on_publication_conflicts(bind: sa.Connection) -> None:
+    task_conflict = bind.execute(
+        sa.text(
+            """
+            SELECT production_task_id, count(*) AS duplicate_count
+            FROM publication_records
+            GROUP BY production_task_id
+            HAVING count(*) > 1
+            ORDER BY production_task_id
+            LIMIT 1
+            """
+        )
+    ).first()
+    if task_conflict is not None:
+        raise RuntimeError(
+            "cannot add ux_publication_records_production_task: "
+            f"production_task_id {task_conflict.production_task_id} has {task_conflict.duplicate_count} records"
+        )
+
+    platform_conflict = bind.execute(
+        sa.text(
+            """
+            SELECT platform, platform_content_id, count(*) AS duplicate_count
+            FROM publication_records
+            GROUP BY platform, platform_content_id
+            HAVING count(*) > 1
+            ORDER BY platform, platform_content_id
+            LIMIT 1
+            """
+        )
+    ).first()
+    if platform_conflict is not None:
+        raise RuntimeError(
+            "cannot add ux_publication_records_platform_content: "
+            f"platform {platform_conflict.platform}, content {platform_conflict.platform_content_id} "
+            f"has {platform_conflict.duplicate_count} records"
+        )
