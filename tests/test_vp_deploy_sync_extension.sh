@@ -19,12 +19,17 @@ PUBLISHER_SERVICE_EXISTS=true
 CONSTRAINT_MODE=legacy
 PUBLISHER_CONSTRAINT_MODE=legacy
 PUBLISHER_NETWORK_MODE=legacy
-PUBLISHER_CREDENTIALS_PRESENT=true
+PUBLISHER_MOUNT_MODE=wrong
+PUBLISHER_ENV_MODE=credentials
+PUBLISHER_REPLICAS=3
 GPU_PREFLIGHT_SUCCEEDS=true
 FAIL_UPDATE_SERVICE=
 FAIL_UPDATE_IMAGE=
 FAIL_RUNNING_SERVICE=
 FAIL_HEALTH_CHECK=
+FAIL_NODE_UPDATE=false
+FAIL_NETWORK_INSPECT=false
+FAIL_PUBLISHER_CREATE=false
 
 log() {
   printf 'log|%s\n' "$*" >>"$CALLS"
@@ -49,11 +54,17 @@ docker() {
   if [[ "${1:-}" == "run" && "$GPU_PREFLIGHT_SUCCEEDS" != "true" ]]; then
     return 1
   fi
+  if [[ "${1:-} ${2:-}" == "node update" && "$FAIL_NODE_UPDATE" == "true" ]]; then
+    return 1
+  fi
   if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-ffmpeg-worker-gpu-swarm"* ]]; then
     GPU_SERVICE_EXISTS=true
   fi
   if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-youtube-publisher-swarm"* ]]; then
     PUBLISHER_SERVICE_EXISTS=true
+    if [[ "$FAIL_PUBLISHER_CREATE" == "true" ]]; then
+      return 1
+    fi
   fi
   if [[ "${1:-} ${2:-} ${3:-}" == "service rm vp-ffmpeg-worker-gpu-swarm" ]]; then
     GPU_SERVICE_EXISTS=false
@@ -67,6 +78,9 @@ docker() {
     return 1
   fi
   if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
+    if [[ "$FAIL_NETWORK_INSPECT" == "true" ]]; then
+      return 1
+    fi
     echo vp-pipeline-network-id
     return 0
   fi
@@ -76,11 +90,17 @@ docker() {
       return 1
     fi
     if [[ "$service" == "vp-youtube-publisher-swarm" && "$PUBLISHER_SERVICE_EXISTS" != "true" ]]; then
+      echo "no such service: $service" >&2
       return 1
     fi
     case "$*" in
       *ContainerSpec.Image*)
         echo "baseline-$service:stable"
+        ;;
+      *Spec.Mode.Replicated.Replicas*)
+        if [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
+          echo "$PUBLISHER_REPLICAS"
+        fi
         ;;
       *Placement.Constraints*)
         if [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
@@ -89,9 +109,12 @@ docker() {
               echo 'node.labels.vp.publisher==true'
               echo 'node.hostname==ccttww-lap'
               ;;
-            stale-hostname)
+            stale)
               echo 'node.labels.vp.publisher==true'
+              echo 'node.labels.vp.runtime==true'
+              echo 'node.labels.vp.gpu==true'
               echo 'node.hostname==colima-swarmbridged'
+              echo 'node.labels.vp.legacy==true'
               ;;
             *)
               echo 'node.labels.role==app'
@@ -111,8 +134,14 @@ docker() {
           echo 'YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials'
         elif [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
           echo 'WORKER_HOST=legacy'
-          if [[ "$PUBLISHER_CREDENTIALS_PRESENT" == "true" ]]; then
+          if [[ "$PUBLISHER_ENV_MODE" == "credentials" ]]; then
+            echo 'YOUTUBE_MANAGER_URL=http://10.0.0.150:18999'
+            echo 'YOUTUBE_PUBLISH_ENABLED=false'
             echo 'YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials'
+            echo 'YOUTUBE_CREDENTIALS_JSON=fixture-json'
+            echo 'YOUTUBE_LEGACY_MODE=fixture'
+            echo 'GOOGLE_CLIENT_SECRETS_FILE=fixture-file'
+            echo 'YOUTUBE_REFRESH_TOKEN=fixture-token'
           fi
         fi
       ;;
@@ -126,8 +155,22 @@ docker() {
       *ContainerSpec.Mounts*)
         if [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" ]]; then
           echo /app/youtube_credentials
-        elif [[ "$service" == "vp-youtube-publisher-swarm" && "$PUBLISHER_CREDENTIALS_PRESENT" == "true" ]]; then
-          echo /app/youtube_credentials
+        elif [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
+          case "$PUBLISHER_MOUNT_MODE" in
+            desired)
+              echo 'vp-youtube-publisher-scratch|/data/storage'
+              ;;
+            wrong)
+              echo 'legacy-publisher-scratch|/data/storage'
+              echo 'legacy-auth|/app/youtube_credentials'
+              echo 'legacy-auth|/app/credentials'
+              echo 'legacy-auth|~/.youtube_credentials'
+              echo 'legacy-auth|/var/run/oauth-token'
+              ;;
+            missing)
+              echo 'legacy-auth|/app/credentials'
+              ;;
+          esac
         fi
         ;;
     esac
@@ -184,6 +227,25 @@ grep -Fq -- '--env-add YOUTUBE_MANAGER_URL=http://10.0.0.150:18999' "$CALLS"
 grep -Fq -- '--env-add YOUTUBE_PUBLISH_ENABLED=true' "$CALLS"
 grep -Fq -- '--env-add PUBLIC_PUBLISH_ENABLED=false' "$CALLS"
 grep -Fq -- '--env-add WORKER_CONCURRENCY=1' "$CALLS"
+grep -Fq -- '--replicas 1' "$CALLS"
+grep -Fq -- '--mount-rm /data/storage' "$CALLS"
+grep -Fq -- '--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' "$CALLS"
+grep -Fq -- '--mount-rm /app/credentials' "$CALLS"
+grep -Fq -- '--mount-rm ~/.youtube_credentials' "$CALLS"
+grep -Fq -- '--mount-rm /var/run/oauth-token' "$CALLS"
+for publisher_env in \
+  YOUTUBE_CREDENTIALS_DIR \
+  YOUTUBE_CREDENTIALS_JSON \
+  YOUTUBE_LEGACY_MODE \
+  GOOGLE_CLIENT_SECRETS_FILE \
+  YOUTUBE_REFRESH_TOKEN; do
+  grep -Fq -- "--env-rm $publisher_env" "$CALLS"
+  if grep -Fq -- "--env-add $publisher_env=" "$CALLS"; then
+    echo "FAIL: publisher deploy re-added removed credential environment $publisher_env" >&2
+    exit 1
+  fi
+done
+grep -Fq -- '--env-add MINIO_SECRET_KEY=' "$CALLS"
 
 publisher_calls="$(grep -F 'vp-youtube-publisher-swarm' "$CALLS" || true)"
 if printf '%s\n' "$publisher_calls" | grep -Eq -- 'YOUTUBE_(OAUTH|CLIENT|CREDENTIALS|TOKEN|REFRESH)_[A-Z_]*='; then
@@ -228,7 +290,8 @@ CONSTRAINT_MODE=legacy
 PUBLISHER_SERVICE_EXISTS=true
 PUBLISHER_CONSTRAINT_MODE=publisher
 PUBLISHER_NETWORK_MODE=pipeline
-PUBLISHER_CREDENTIALS_PRESENT=false
+PUBLISHER_MOUNT_MODE=desired
+PUBLISHER_ENV_MODE=desired
 if ! vp_deploy_publisher vp-ffmpeg-worker-python:publisher-repeat-test >/dev/null 2>>"$CALLS"; then
   echo 'FAIL: repeat publisher update returned non-zero' >&2
   exit 1
@@ -239,15 +302,19 @@ if grep -Fq 'unbound variable' "$CALLS"; then
 fi
 grep -Fq 'docker|service update --detach=false --no-resolve-image --update-order stop-first' "$CALLS"
 grep -Fq -- '--image vp-ffmpeg-worker-python:publisher-repeat-test vp-youtube-publisher-swarm' "$CALLS"
+grep -Fq -- '--replicas 1' "$CALLS"
 if grep -Fq -- '--constraint-add node.labels.vp.publisher==true' "$CALLS" \
   || grep -Fq -- '--constraint-add node.hostname==ccttww-lap' "$CALLS" \
-  || grep -Fq -- '--network-add vp-pipeline-net' "$CALLS"; then
-  echo 'FAIL: repeat publisher update must not duplicate desired placement or network' >&2
+  || grep -Fq -- '--network-add vp-pipeline-net' "$CALLS" \
+  || grep -Fq -- '--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' "$CALLS" \
+  || grep -Fq -- '--mount-rm /data/storage' "$CALLS"; then
+  echo 'FAIL: repeat publisher update must not duplicate desired placement, network, or scratch mount' >&2
   exit 1
 fi
 PUBLISHER_CONSTRAINT_MODE=legacy
 PUBLISHER_NETWORK_MODE=legacy
-PUBLISHER_CREDENTIALS_PRESENT=true
+PUBLISHER_MOUNT_MODE=wrong
+PUBLISHER_ENV_MODE=credentials
 
 : >"$CALLS"
 FAIL_HEALTH_CHECK=vp-youtube-manager
@@ -263,6 +330,66 @@ if grep -Fq 'docker|node update --label-add vp.publisher=true ccttww-lap' "$CALL
   exit 1
 fi
 FAIL_HEALTH_CHECK=
+
+: >"$CALLS"
+PUBLISHER_SERVICE_EXISTS=true
+PUBLISHER_CONSTRAINT_MODE=publisher
+PUBLISHER_NETWORK_MODE=pipeline
+PUBLISHER_MOUNT_MODE=desired
+PUBLISHER_ENV_MODE=desired
+FAIL_NODE_UPDATE=true
+if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-node-failure-test >/dev/null 2>&1; then
+  echo 'FAIL: publisher deploy must return non-zero when manager label update fails' >&2
+  exit 1
+fi
+grep -Fq 'docker|node update --label-add vp.publisher=true ccttww-lap' "$CALLS"
+if grep -Fq 'docker|service update' "$CALLS" || grep -Fq 'docker|service create' "$CALLS"; then
+  echo 'FAIL: publisher deploy continued after manager label update failure' >&2
+  exit 1
+fi
+FAIL_NODE_UPDATE=false
+
+: >"$CALLS"
+FAIL_NETWORK_INSPECT=true
+if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-network-failure-test >/dev/null 2>&1; then
+  echo 'FAIL: publisher deploy must return non-zero when network inspection fails' >&2
+  exit 1
+fi
+grep -Fq 'docker|network inspect vp-pipeline-net --format {{.ID}}' "$CALLS"
+if grep -Fq 'docker|service update' "$CALLS"; then
+  echo 'FAIL: publisher deploy continued after pipeline network inspection failure' >&2
+  exit 1
+fi
+FAIL_NETWORK_INSPECT=false
+
+: >"$CALLS"
+PUBLISHER_SERVICE_EXISTS=false
+FAIL_PUBLISHER_CREATE=true
+if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-create-failure-test >/dev/null 2>&1; then
+  echo 'FAIL: publisher deploy must return non-zero when service creation fails' >&2
+  exit 1
+fi
+grep -Fq 'docker|service create --detach=false --name vp-youtube-publisher-swarm' "$CALLS"
+FAIL_PUBLISHER_CREATE=false
+
+: >"$CALLS"
+GPU_SERVICE_EXISTS=true
+PUBLISHER_SERVICE_EXISTS=true
+FAIL_UPDATE_SERVICE=vp-youtube-publisher-swarm
+FAIL_UPDATE_IMAGE=vp-ffmpeg-worker-python:publisher-update-failure-test
+if deploy_vp_app_services \
+  vp-api:publisher-update-failure-test \
+  vp-frontend:publisher-update-failure-test \
+  vp-backend-api:publisher-update-failure-test \
+  vp-channelops-runner-go:publisher-update-failure-test \
+  vp-ffmpeg-worker-go:publisher-update-failure-test \
+  vp-ffmpeg-worker-python:publisher-update-failure-test >/dev/null 2>&1; then
+  echo 'FAIL: failed publisher update with an old running service unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -Fq -- '--image baseline-vp-youtube-publisher-swarm:stable vp-youtube-publisher-swarm' "$CALLS"
+FAIL_UPDATE_SERVICE=
+FAIL_UPDATE_IMAGE=
 
 VP_GPU_RUNTIME_READY=true
 GPU_PREFLIGHT_SUCCEEDS=false
@@ -359,15 +486,34 @@ FAIL_RUNNING_SERVICE=
 
 : >"$CALLS"
 PUBLISHER_SERVICE_EXISTS=true
-PUBLISHER_CONSTRAINT_MODE=stale-hostname
+PUBLISHER_CONSTRAINT_MODE=stale
+PUBLISHER_NETWORK_MODE=pipeline
+PUBLISHER_MOUNT_MODE=desired
+PUBLISHER_ENV_MODE=desired
 vp_deploy_publisher vp-ffmpeg-worker-python:publisher-placement-test >/dev/null
+grep -Fq -- '--constraint-rm node.labels.vp.runtime==true' "$CALLS"
+grep -Fq -- '--constraint-rm node.labels.vp.gpu==true' "$CALLS"
 grep -Fq -- '--constraint-rm node.hostname==colima-swarmbridged' "$CALLS"
+grep -Fq -- '--constraint-rm node.labels.vp.legacy==true' "$CALLS"
 grep -Fq -- '--constraint-add node.hostname==ccttww-lap' "$CALLS"
 if grep -Fq '10.0.0.126' "$CALLS"; then
   echo 'FAIL: publisher deployment must never target 126' >&2
   exit 1
 fi
 PUBLISHER_CONSTRAINT_MODE=legacy
+
+: >"$CALLS"
+PUBLISHER_CONSTRAINT_MODE=publisher
+PUBLISHER_MOUNT_MODE=missing
+vp_deploy_publisher vp-ffmpeg-worker-python:publisher-missing-scratch-test >/dev/null
+grep -Fq -- '--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' "$CALLS"
+if grep -Fq -- '--mount-rm /data/storage' "$CALLS"; then
+  echo 'FAIL: publisher deploy removed an absent scratch target' >&2
+  exit 1
+fi
+PUBLISHER_CONSTRAINT_MODE=legacy
+PUBLISHER_MOUNT_MODE=wrong
+PUBLISHER_ENV_MODE=credentials
 
 : >"$CALLS"
 GPU_SERVICE_EXISTS=true
@@ -399,3 +545,4 @@ grep -Fq -- '--constraint node.labels.vp.publisher==true' "$CALLS"
 grep -Fq -- '--constraint node.hostname==ccttww-lap' "$CALLS"
 grep -Fq -- '--network vp-pipeline-net' "$CALLS"
 grep -Fq -- '--mount type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' "$CALLS"
+grep -Fq -- '--replicas 1' "$CALLS"

@@ -117,9 +117,10 @@ markers on target hosts.
 
 `vp-youtube-publisher-swarm` uses the same Python worker image as the managed
 FFmpeg worker but has one publisher concurrency and a separate scratch volume.
-It reaches shared Postgres, the VP Redis instance, and MinIO through the
-pipeline network, then submits only through YouTubeManager on 150. Public
-publication is disabled for this service.
+It attaches to the pipeline network, but reaches shared Postgres, the VP Redis
+instance, and MinIO through their `10.0.0.150` host endpoints, then submits
+only through YouTubeManager on 150. Public publication is disabled for this
+service.
 
 The deploy extension adds `vp.publisher=true` only to `ccttww-lap` and requires
 both that label and `node.hostname==ccttww-lap` for the service. Never add the

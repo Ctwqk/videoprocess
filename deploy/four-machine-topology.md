@@ -125,10 +125,11 @@ deploy job as part of a VideoProcess release.
   `vp-youtube-publisher-swarm` with both that label and
   `node.hostname == ccttww-lap`; the hostname constraint prevents stale labels
   from placing the publisher on another node.
-- The publisher uses the shared VP Postgres, Redis, and MinIO services through
-  the pipeline network, validates YouTubeManager's read-only auth-status route
-  before deployment, and publishes only through its dedicated unlisted stream.
-  Do not supply OAuth credentials through its Swarm environment or mounts.
+- The publisher attaches to the pipeline network, but its shared VP Postgres,
+  Redis, and MinIO settings use the `10.0.0.150` host endpoints. It validates
+  YouTubeManager's read-only auth-status route before deployment and publishes
+  only through its dedicated unlisted stream. Do not supply OAuth credentials
+  through its Swarm environment or mounts.
 - Do not add `vp.runtime` to the 126 node.
 - Never add `vp.publisher` to the 126 node or treat it as a publisher failover
   target.

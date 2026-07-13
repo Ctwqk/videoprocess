@@ -225,6 +225,29 @@ vp_publisher_env() {
     "PUBLIC_PUBLISH_ENABLED=false"
 }
 
+vp_publisher_mount_is_sensitive() {
+  local target="$1"
+  case "$target" in
+    *credential*|*credentials*|*oauth*|*token*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+vp_publisher_env_is_sensitive() {
+  local key="$1"
+  case "$key" in
+    YOUTUBE_MANAGER_URL|YOUTUBE_PUBLISH_ENABLED)
+      return 1
+      ;;
+    YOUTUBE_*|GOOGLE_*|*OAUTH*|*oauth*|*CLIENT_SECRET*|*client_secret*|*ACCESS_TOKEN*|*access_token*|*REFRESH_TOKEN*|*refresh_token*|*CREDENTIALS_JSON|*credentials_json*|*CREDENTIALS_FILE|*credentials_file*|*CREDENTIAL_FILE|*credential_file*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 vp_deploy_python_worker() {
   local image="$1"
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
@@ -315,50 +338,59 @@ vp_deploy_publisher() {
   fi
 
   http_health vp-youtube-manager "http://10.0.0.150:18999/api/auth/status" || return 1
-  docker node update --label-add vp.publisher=true "$VP_MANAGER_NODE" >/dev/null
+  docker node update --label-add vp.publisher=true "$VP_MANAGER_NODE" >/dev/null || return 1
 
   local env_key
   local env_value
   local env_args=()
+  local publisher_exists=false
+  local inspect_error
+  if inspect_error="$(docker service inspect "$VP_PUBLISHER_SERVICE" --format '{{.ID}}' 2>&1)"; then
+    publisher_exists=true
+  elif [[ "$inspect_error" != *"no such service"* && "$inspect_error" != *"not found"* ]]; then
+    printf '%s\n' "$inspect_error" >&2
+    return 1
+  fi
+
+  local existing_env=""
+  if [[ "$publisher_exists" == true ]]; then
+    existing_env="$(vp_service_values "$VP_PUBLISHER_SERVICE" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}')" || return 1
+  fi
   while IFS= read -r env_value; do
     env_key="${env_value%%=*}"
-    if docker service inspect "$VP_PUBLISHER_SERVICE" \
-      --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
-      2>/dev/null \
-      | awk -F= -v key="$env_key" '$1 == key { found=1 } END { exit found ? 0 : 1 }'; then
+    if [[ "$publisher_exists" == true ]] \
+      && awk -F= -v key="$env_key" \
+        '$1 == key { found=1 } END { exit found ? 0 : 1 }' <<<"$existing_env"; then
       env_args+=(--env-rm "$env_key")
     fi
     env_args+=(--env-add "$env_value")
   done < <(vp_publisher_env)
 
-  if docker service inspect "$VP_PUBLISHER_SERVICE" >/dev/null 2>&1; then
+  if [[ "$publisher_exists" == true ]]; then
     local update_args=(
-      service update --detach=false --no-resolve-image --update-order stop-first
+      service update --detach=false --no-resolve-image --update-order stop-first --replicas 1
     )
     local constraint
     local has_publisher=false
     local has_manager=false
+    local existing_constraints
+    existing_constraints="$(vp_service_values "$VP_PUBLISHER_SERVICE" \
+      '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}')" || return 1
     while IFS= read -r constraint; do
       [[ -n "$constraint" ]] || continue
       case "$constraint" in
-        node.labels.role==app)
-          update_args+=(--constraint-rm "$constraint")
-          ;;
-        node.hostname==*)
-          if [[ "$constraint" == "$VP_PUBLISHER_MANAGER_CONSTRAINT" ]]; then
-            has_manager=true
-          else
-            update_args+=(--constraint-rm "$constraint")
-          fi
-          ;;
         "$VP_PUBLISHER_CONSTRAINT")
           has_publisher=true
           ;;
+        "$VP_PUBLISHER_MANAGER_CONSTRAINT")
+          has_manager=true
+          ;;
+        *)
+          update_args+=(--constraint-rm "$constraint")
+          ;;
       esac
-    done < <(
-      vp_service_values "$VP_PUBLISHER_SERVICE" \
-        '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
-    )
+    done <<<"$existing_constraints"
     if [[ "$has_publisher" != true ]]; then
       update_args+=(--constraint-add "$VP_PUBLISHER_CONSTRAINT")
     fi
@@ -367,33 +399,49 @@ vp_deploy_publisher() {
     fi
 
     local network_id
-    network_id="$(docker network inspect "$VP_PIPELINE_NETWORK" --format '{{.ID}}')"
-    if ! vp_service_values "$VP_PUBLISHER_SERVICE" \
-      '{{range .Spec.TaskTemplate.Networks}}{{println .Target}}{{end}}' \
-      | grep -Fxq "$network_id"; then
+    network_id="$(docker network inspect "$VP_PIPELINE_NETWORK" --format '{{.ID}}')" || return 1
+    local existing_networks
+    existing_networks="$(vp_service_values "$VP_PUBLISHER_SERVICE" \
+      '{{range .Spec.TaskTemplate.Networks}}{{println .Target}}{{end}}')" || return 1
+    if ! grep -Fxq "$network_id" <<<"$existing_networks"; then
       update_args+=(--network-add "$VP_PIPELINE_NETWORK")
     fi
-    if vp_service_values "$VP_PUBLISHER_SERVICE" \
-      '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{println .Target}}{{end}}' \
-      | grep -Fxq /app/youtube_credentials; then
-      update_args+=(--mount-rm /app/youtube_credentials)
+
+    local existing_mounts
+    existing_mounts="$(vp_service_values "$VP_PUBLISHER_SERVICE" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{printf "%s|%s\\n" .Source .Target}}{{end}}')" || return 1
+    local mount_source
+    local mount_target
+    local scratch_needs_add=true
+    while IFS='|' read -r mount_source mount_target; do
+      [[ -n "$mount_target" ]] || continue
+      if [[ "$mount_target" == /data/storage ]]; then
+        if [[ "$mount_source" == "vp-youtube-publisher-scratch" ]]; then
+          scratch_needs_add=false
+        else
+          update_args+=(--mount-rm "$mount_target")
+          scratch_needs_add=true
+        fi
+      elif vp_publisher_mount_is_sensitive "$mount_target"; then
+        update_args+=(--mount-rm "$mount_target")
+      fi
+    done <<<"$existing_mounts"
+    if [[ "$scratch_needs_add" == true ]]; then
+      update_args+=(--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage)
     fi
+
     while IFS= read -r env_value; do
       env_key="${env_value%%=*}"
-      case "$env_key" in
-        YOUTUBE_CREDENTIALS_DIR|YOUTUBE_CLIENT_ID|YOUTUBE_CLIENT_SECRET|YOUTUBE_ACCESS_TOKEN|YOUTUBE_REFRESH_TOKEN|YOUTUBE_OAUTH_*)
-          update_args+=(--env-rm "$env_key")
-          ;;
-      esac
-    done < <(
-      vp_service_values "$VP_PUBLISHER_SERVICE" \
-        '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}'
-    )
+      if vp_publisher_env_is_sensitive "$env_key"; then
+        update_args+=(--env-rm "$env_key")
+      fi
+    done <<<"$existing_env"
     docker "${update_args[@]}" "${env_args[@]}" \
-      --image "$image" "$VP_PUBLISHER_SERVICE" >&2
+      --image "$image" "$VP_PUBLISHER_SERVICE" >&2 || return 1
   else
     local create_args=(
       service create --detach=false --name "$VP_PUBLISHER_SERVICE"
+      --replicas 1
       --constraint "$VP_PUBLISHER_CONSTRAINT"
       --constraint "$VP_PUBLISHER_MANAGER_CONSTRAINT"
       --network "$VP_PIPELINE_NETWORK"
@@ -404,9 +452,9 @@ vp_deploy_publisher() {
     while IFS= read -r env_value; do
       create_env+=(--env "$env_value")
     done < <(vp_publisher_env)
-    docker "${create_args[@]}" "${create_env[@]}" "$image" >&2
+    docker "${create_args[@]}" "${create_env[@]}" "$image" >&2 || return 1
   fi
-  swarm_service_running "$VP_PUBLISHER_SERVICE"
+  swarm_service_running "$VP_PUBLISHER_SERVICE" || return 1
 }
 
 vp_capture_app_snapshots() {
