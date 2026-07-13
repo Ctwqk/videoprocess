@@ -73,3 +73,68 @@ red failures.
   runner persists immediate feedback only when the manager exposes recognized
   fields; otherwise it requires and records pending durable metrics work and
   fabricates no snapshot.
+
+## Production Reachability Fix
+
+Live topology probing found that `10.0.0.127:18080` is the Go control-plane API
+and returns 404 for `/api/v1/channel-agent/*`; the Python ChannelAgent API is
+internal-only and unreachable from the intended host runner. A red-green fix
+removed all ChannelAgent HTTP calls from the canary runner and now uses the
+existing ORM plus `ChannelOpsQueueService` for equivalent transactional work:
+
+- creates the complete owned/unlisted graph and one `agent_tick` atomically;
+- revalidates the Asset as an owned generated video before graph commit;
+- atomically cancels the delayed promotion and enqueues one immediate unlisted
+  promotion with the API-equivalent key, payload, and priority;
+- enqueues the immediate metrics probe with the API-equivalent hourly key.
+
+Red evidence:
+
+- `backend/.venv/bin/python -m pytest tests/services/test_unlisted_canary_runner.py -q`
+  failed 4 tests because the old HTTP signature and local queue helpers were
+  absent.
+- `bash tests/test_vp_unlisted_canary_scripts.sh` failed because the old script
+  still contained `/api/v1/channel-agent`.
+
+Green verification:
+
+- focused runner database tests: `4 passed`;
+- quarantine plus runner database tests: `8 passed`;
+- full backend: `520 passed, 11 warnings` in 63.68 seconds;
+- `go test ./...`: passed;
+- canary, deploy-sync, and production-smoke shell contracts: passed;
+- script `py_compile`: passed;
+- targeted Ruff: passed;
+- targeted mypy with `MYPYPATH=backend`: passed;
+- project Ruff baseline remains 21 pre-existing findings outside owned files;
+- project mypy baseline remains 66 pre-existing findings outside owned files.
+
+## Final Integration Review Fixes
+
+The whole-branch review found and fixed two release-blocking cross-runtime
+issues:
+
+- The deployed `vp-channel-agent-runner-swarm` is the Go runner and claims the
+  next queue row immediately after `agent_tick`; there is no five-second
+  approval window. Canary ticks now carry a strictly bounded
+  `plan_delay_seconds=300`. Both Python and Go runners propagate the delay to
+  `plan_task.run_after`; the canary preapproval transaction halts the channel,
+  records operator approval, and advances that one plan row to the current
+  time. Invalid, fractional, boolean, string, negative, and over-one-hour Go
+  payloads fail closed.
+- A schedule close exception raised from `finally` could leave evidence marked
+  `succeeded`. Close failure now always records `status=failed` and
+  `schedule.final_state=UNKNOWN` without overwriting an earlier root failure.
+
+Final fresh verification:
+
+- full backend: `528 passed, 11 warnings` in 63.59 seconds;
+- fresh PostgreSQL 16 migration: revisions `001` through
+  `023_youtube_upload_operations` applied successfully;
+- Go plan-delay integration test against that migrated database: passed and
+  observed exactly `run_after = now + 300 seconds`;
+- full `go test ./...` against the migrated disposable database: passed;
+- all required deployment, topology, smoke, and canary shell contracts: passed;
+- owned changed-file Ruff: passed;
+- canary script targeted mypy: passed;
+- script `py_compile` and `git diff --check`: passed.

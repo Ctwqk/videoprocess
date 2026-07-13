@@ -43,6 +43,8 @@ grep -Fq '"/internal/schedule/video/drain"' "$CANARY"
 grep -Fq '"/internal/schedule/video/open"' "$CANARY"
 grep -Fq 'never deletes the YouTube video' "$CANARY"
 grep -Fq 'operator_canary_failure' "$CANARY"
+grep -Fq 'CANARY_PLAN_DELAY_SECONDS = 300' "$CANARY"
+grep -Fq 'mark_schedule_close_failure(evidence, close_error)' "$CANARY"
 if grep -Fq '/api/v1/channel-agent' "$CANARY"; then
   echo "FAIL: canary runner must not call the unexposed ChannelAgent HTTP API" >&2
   exit 1

@@ -123,7 +123,35 @@ func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) 
 	if channelID == "" {
 		return errors.New("agent_tick payload missing channel_id")
 	}
-	return h.Store.RunTick(ctx, channelID, bucket, h)
+	planDelay, err := agentTickPlanDelay(item.PayloadJSON)
+	if err != nil {
+		return err
+	}
+	return h.Store.RunTickWithPlanDelay(ctx, channelID, bucket, planDelay, h)
+}
+
+func agentTickPlanDelay(payload map[string]any) (time.Duration, error) {
+	raw, ok := payload["plan_delay_seconds"]
+	if !ok {
+		return 0, nil
+	}
+	switch raw.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+	default:
+		return 0, errors.New("agent_tick plan_delay_seconds must be a numeric integer")
+	}
+	seconds, ok := intValue(raw)
+	if !ok {
+		return 0, errors.New("agent_tick plan_delay_seconds must be a numeric integer")
+	}
+	number, ok := floatValue(raw)
+	if !ok || number != float64(seconds) {
+		return 0, errors.New("agent_tick plan_delay_seconds must be a numeric integer")
+	}
+	if seconds < 0 || seconds > 3_600 {
+		return 0, errors.New("agent_tick plan_delay_seconds must be from 0 through 3600")
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 func (h HandlerService) HandlePlanTask(ctx context.Context, item QueueItemRow) error {

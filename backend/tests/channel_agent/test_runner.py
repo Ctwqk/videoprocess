@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, select
@@ -56,11 +57,50 @@ class NoDbRunner(ChannelAgentRunner):
         return False
 
 
+class CapturingTickService:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def tick(self, db, **kwargs):
+        self.calls.append((db, kwargs))
+
+
 def test_live_runner_requires_youtube_manager_url(monkeypatch):
     monkeypatch.setattr(runner_module.settings, "youtube_manager_url", "")
 
     with pytest.raises(RuntimeError, match="YOUTUBE_MANAGER_URL"):
         ChannelAgentRunner(worker_id="test-runner")
+
+
+@pytest.mark.asyncio
+async def test_agent_tick_passes_bounded_plan_delay_to_service():
+    runner = object.__new__(ChannelAgentRunner)
+    runner.service = CapturingTickService()
+    db = object()
+    item = SimpleNamespace(
+        kind="agent_tick",
+        payload_json={"channel_id": "channel-1", "plan_delay_seconds": 300},
+    )
+
+    await runner.handle_item(db, item)
+
+    assert runner.service.calls == [
+        (db, {"channel_id": "channel-1", "plan_delay_seconds": 300})
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delay", [-1, 3_601, True, "300"])
+async def test_agent_tick_rejects_invalid_plan_delay(delay):
+    runner = object.__new__(ChannelAgentRunner)
+    runner.service = CapturingTickService()
+    item = SimpleNamespace(
+        kind="agent_tick",
+        payload_json={"channel_id": "channel-1", "plan_delay_seconds": delay},
+    )
+
+    with pytest.raises(ValueError, match="plan_delay_seconds"):
+        await runner.handle_item(object(), item)
 
 
 @pytest.mark.asyncio

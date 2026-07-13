@@ -103,6 +103,10 @@ async def test_create_graph_is_atomic_unlisted_and_enqueues_one_tick(db: AsyncSe
     assert seed.source_policy == "owned_only"
     assert seed.constraints_json["input_asset_id"] == str(asset.id)
     assert [(row.kind, row.status) for row in ticks] == [("agent_tick", "queued")]
+    assert ticks[0].payload_json == {
+        "channel_id": str(channel.id),
+        "plan_delay_seconds": 300,
+    }
     assert graph["agent_tick_id"] == str(ticks[0].id)
 
 
@@ -199,3 +203,32 @@ async def test_metrics_probe_uses_api_equivalent_hour_bucket_idempotency(db: Asy
     assert first.priority == 90
     assert first.payload_json == {"publication_id": str(publication.id)}
     assert first.idempotency_key.startswith(f"collect_metrics:{publication.id}:")
+
+
+def test_schedule_close_failure_marks_evidence_failed_without_overwriting_root_failure():
+    runner = load_runner()
+    evidence = {
+        "status": "failed",
+        "failure": {"type": "CanaryError", "message": "root failure"},
+        "schedule": {"final_state": None},
+    }
+
+    runner.mark_schedule_close_failure(evidence, RuntimeError("sensitive detail"))
+
+    assert evidence["status"] == "failed"
+    assert evidence["failure"] == {"type": "CanaryError", "message": "root failure"}
+    assert evidence["schedule"]["final_state"] == "UNKNOWN"
+    assert evidence["schedule"]["close_error"] == "RuntimeError"
+
+
+def test_schedule_close_failure_creates_sanitized_failure_after_success():
+    runner = load_runner()
+    evidence = {"status": "succeeded", "schedule": {"final_state": None}}
+
+    runner.mark_schedule_close_failure(evidence, RuntimeError("postgresql://user:secret@example/db"))
+
+    assert evidence["status"] == "failed"
+    assert evidence["failure"] == {
+        "type": "RuntimeError",
+        "message": "final schedule close failed",
+    }

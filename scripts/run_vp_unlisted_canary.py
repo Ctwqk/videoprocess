@@ -48,6 +48,7 @@ from app.models.youtube_upload_operation import YouTubeUploadOperation  # noqa: 
 ADVISORY_LOCK_KEY = 8_537_601_337_126
 CANARY_APPROVAL_REASON = "operator_preapproved_live_unlisted_canary"
 CANARY_FAILURE_REASON = "operator_canary_failure"
+CANARY_PLAN_DELAY_SECONDS = 300
 NO_DELETE_POLICY = "This runner never deletes the YouTube video automatically."
 SCHEDULE_STATUS_PATH = "/internal/schedule/video/status"
 SCHEDULE_OPEN_PATH = "/internal/schedule/video/open"
@@ -358,6 +359,20 @@ def record_schedule(evidence: dict[str, Any], action: str, payload: dict[str, An
     )
 
 
+def mark_schedule_close_failure(evidence: dict[str, Any], close_error: BaseException) -> None:
+    evidence["status"] = "failed"
+    evidence.setdefault(
+        "failure",
+        {
+            "type": type(close_error).__name__,
+            "message": "final schedule close failed",
+        },
+    )
+    schedule = evidence.setdefault("schedule", {})
+    schedule["final_state"] = "UNKNOWN"
+    schedule["close_error"] = type(close_error).__name__
+
+
 async def close_schedule(
     args: argparse.Namespace,
     client: httpx.AsyncClient,
@@ -638,7 +653,10 @@ async def create_canary_graph(
             db,
             kind="agent_tick",
             idempotency_key=f"agent_tick:{channel.id}:{utc_hour_bucket(utc_now())}",
-            payload={"channel_id": str(channel.id)},
+            payload={
+                "channel_id": str(channel.id),
+                "plan_delay_seconds": CANARY_PLAN_DELAY_SECONDS,
+            },
             priority=20,
             channel_profile_id=channel.id,
             commit=False,
@@ -748,7 +766,7 @@ async def wait_for_single_task_and_preapprove(
     return await poll_until(
         check,
         timeout_seconds=timeout_seconds,
-        description="one canary task before the runner's 5s plan loop",
+        description="one canary task inside the guarded plan delay",
         interval_seconds=0.05,
     )
 
@@ -1640,8 +1658,7 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
                             await close_schedule(args, client, evidence)
                         except BaseException as exc:
                             close_error = exc
-                            evidence.setdefault("schedule", {})["final_state"] = "UNKNOWN"
-                            evidence["schedule"]["close_error"] = type(exc).__name__
+                            mark_schedule_close_failure(evidence, close_error)
                         evidence["redis_stream_pending_audit"] = await redis_pending_audit(args.redis_url)
                         evidence["completed_at"] = utc_now().isoformat()
                         atomic_write_json(path, evidence)

@@ -648,6 +648,34 @@ async def test_active_tick_creates_task_and_plan_queue_item(service_session):
 
 
 @pytest.mark.asyncio
+async def test_tick_can_delay_plan_queue_for_guarded_preapproval(service_session):
+    clock = FakeClock(datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc))
+    channel, lane, account, _lane_format = await _channel_graph(service_session, dry_run=False)
+    service_session.add(
+        ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="make one guarded short",
+        )
+    )
+    await service_session.commit()
+
+    await _service(clock=clock).tick(
+        service_session,
+        channel_id=channel.id,
+        plan_delay_seconds=300,
+    )
+
+    queue_item = (
+        await service_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "plan_task")
+        )
+    ).scalar_one()
+    assert queue_item.run_after == (clock.now() + timedelta(seconds=300)).replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
 async def test_lane_seed_task_defaults_to_agent_approval_mode(service_session):
     clock = FakeClock(datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc))
     channel, lane, account, lane_format = await _channel_graph(service_session, dry_run=False)

@@ -119,7 +119,19 @@ class ChannelAgentService:
         self._pds_last_success_at: datetime | None = None
         self._pds_last_alert_bucket: str | None = None
 
-    async def tick(self, db: AsyncSession, *, channel_id) -> AgentTickAudit:
+    async def tick(
+        self,
+        db: AsyncSession,
+        *,
+        channel_id,
+        plan_delay_seconds: int = 0,
+    ) -> AgentTickAudit:
+        if (
+            isinstance(plan_delay_seconds, bool)
+            or not isinstance(plan_delay_seconds, int)
+            or not 0 <= plan_delay_seconds <= 3_600
+        ):
+            raise ValueError("plan_delay_seconds must be an integer from 0 through 3600")
         channel = await db.get(ChannelProfile, _uuid(channel_id))
         if channel is None:
             raise ValueError("Channel not found")
@@ -264,6 +276,7 @@ class ChannelAgentService:
                 idempotency_key=f"plan_task:{task.id}",
                 payload={"production_task_id": str(task.id)},
                 priority=50,
+                run_after=now + timedelta(seconds=plan_delay_seconds),
                 channel_profile_id=channel.id,
                 commit=False,
             )

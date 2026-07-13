@@ -101,7 +101,18 @@ class ChannelAgentRunner:
 
     async def handle_item(self, db, item) -> None:
         if item.kind == "agent_tick":
-            await self.service.tick(db, channel_id=item.payload_json["channel_id"])
+            plan_delay_seconds = item.payload_json.get("plan_delay_seconds", 0)
+            if (
+                isinstance(plan_delay_seconds, bool)
+                or not isinstance(plan_delay_seconds, int)
+                or not 0 <= plan_delay_seconds <= 3_600
+            ):
+                raise ValueError("plan_delay_seconds must be an integer from 0 through 3600")
+            await self.service.tick(
+                db,
+                channel_id=item.payload_json["channel_id"],
+                plan_delay_seconds=plan_delay_seconds,
+            )
         elif item.kind == "plan_task":
             await self.service.handle_plan_task(db, item)
         elif item.kind == "execute_task":

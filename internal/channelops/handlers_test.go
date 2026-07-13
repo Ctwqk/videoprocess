@@ -177,6 +177,78 @@ func TestHandleAgentTickReadsSchedulerBucketPayload(t *testing.T) {
 	}
 }
 
+func TestAgentTickPlanDelaySecondsIsBounded(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   any
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "absent", value: nil, want: 0},
+		{name: "json number", value: float64(300), want: 300 * time.Second},
+		{name: "integer", value: 300, want: 300 * time.Second},
+		{name: "negative", value: -1, wantErr: true},
+		{name: "too large", value: 3601, wantErr: true},
+		{name: "fraction", value: 300.5, wantErr: true},
+		{name: "boolean", value: true, wantErr: true},
+		{name: "string", value: "300", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := map[string]any{}
+			if tt.value != nil {
+				payload["plan_delay_seconds"] = tt.value
+			}
+			got, err := agentTickPlanDelay(payload)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("agentTickPlanDelay(%#v) error = nil", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("agentTickPlanDelay(%#v): %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("agentTickPlanDelay(%#v) = %s, want %s", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandleAgentTickDelaysPlanTaskForGuardedPreapproval(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	item := QueueItemRow{
+		Kind: QueueAgentTick,
+		PayloadJSON: map[string]any{
+			"channel_id":         fixture.ChannelID,
+			"plan_delay_seconds": float64(300),
+		},
+	}
+
+	if err := handler.HandleAgentTick(ctx, item); err != nil {
+		t.Fatalf("HandleAgentTick: %v", err)
+	}
+
+	var runAfter time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT run_after
+		FROM channel_ops_queue_items
+		WHERE channel_profile_id = $1::uuid AND kind = 'plan_task'
+	`, fixture.ChannelID).Scan(&runAfter); err != nil {
+		t.Fatalf("select plan_task run_after: %v", err)
+	}
+	want := fixture.Store.Now().UTC().Add(300 * time.Second)
+	if !runAfter.Equal(want) {
+		t.Fatalf("plan_task run_after = %s, want %s", runAfter, want)
+	}
+}
+
 func TestHandleAgentTickPrefersBucketPayload(t *testing.T) {
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)

@@ -3,6 +3,7 @@ package channelops
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"time"
@@ -11,6 +12,19 @@ import (
 var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h HandlerService) error {
+	return s.RunTickWithPlanDelay(ctx, channelID, bucket, 0, h)
+}
+
+func (s *Store) RunTickWithPlanDelay(
+	ctx context.Context,
+	channelID string,
+	bucket string,
+	planDelay time.Duration,
+	h HandlerService,
+) error {
+	if planDelay < 0 || planDelay > time.Hour {
+		return errors.New("plan delay must be from 0 through 1 hour")
+	}
 	now := s.Now().UTC()
 	channel, lanes, accounts, seeds, signals, laneFormats, err := s.LoadTickInputs(ctx, channelID, now)
 	if err != nil {
@@ -88,6 +102,7 @@ func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h 
 			IdempotencyKey:   "plan_task:" + taskID,
 			Payload:          map[string]any{"production_task_id": taskID, "channel_id": channel.ID},
 			Priority:         100,
+			RunAfter:         now.Add(planDelay),
 			ChannelProfileID: &channelProfileID,
 		}); err != nil {
 			return err
