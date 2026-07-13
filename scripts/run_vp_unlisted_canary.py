@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from app.channel_agent.constants import TERMINAL_TASK_STATES  # noqa: E402
+from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket  # noqa: E402
 from app.models.asset import Asset  # noqa: E402
 from app.models.channel_agent import (  # noqa: E402
     ChannelOpsQueueItem,
@@ -544,106 +545,112 @@ async def upload_and_attest_asset(
 
 
 async def create_canary_graph(
-    args: argparse.Namespace,
-    client: httpx.AsyncClient,
+    db: AsyncSession,
     run_id: str,
     asset_id: str,
 ) -> dict[str, str]:
-    base = f"{api_root(args.api_url)}/api/v1/channel-agent"
-    channel = await request_json(
-        client,
-        "POST",
-        f"{base}/channels",
-        json={
-            "name": f"youtube-unlisted-canary-{run_id}",
-            "positioning": "Owned generated VideoProcess unlisted canary",
-            "language": "en",
-            "default_aspect_ratio": "9:16",
-            "risk_policy_json": {"publication_privacy": "unlisted", "external_sources": False},
-            "content_mix_policy_json": {"manual_seed_only": True},
-            "cadence_policy_json": {"max_posts_per_day": 1, "max_posts_per_tick": 1},
-            "alert_policy_json": {},
-        },
-    )
-    channel_id = str(channel["id"])
-    lane = await request_json(
-        client,
-        "POST",
-        f"{base}/channels/{channel_id}/lanes",
-        json={
-            "name": f"owned-canary-{run_id}",
-            "description": "One owned generated vertical canary",
-            "weight": 1.0,
-            "keywords_json": ["videoprocess", "canary"],
-            "negative_keywords_json": [],
-            "min_posts_per_week": 0,
-            "max_posts_per_day": 1,
-            "max_consecutive_streak": 1,
-            "cooldown_after_post_minutes": 1_440,
-        },
-    )
-    account = await request_json(
-        client,
-        "POST",
-        f"{base}/channels/{channel_id}/accounts",
-        json={
-            "account_label": f"youtube-unlisted-canary-{run_id}",
-            "platform": "youtube",
-            "platform_account_id": "",
-            "credential_ref": "",
-            "platform_specific_config_json": {"canary_run_id": run_id},
-            "default_privacy": "unlisted",
-            "external_asset_auto_publish": False,
-        },
-    )
-    lane_format = await request_json(
-        client,
-        "POST",
-        f"{base}/lanes/{lane['id']}/formats",
-        json={
-            "format_key": f"owned_unlisted_9x16_{run_id}",
-            "enabled": True,
-            "weight": 1.0,
-            "target_duration_sec": 8,
-            "template_pool_json": ["material_library_remix"],
-            "source_platforms_json": [],
-            "default_publish_visibility": "unlisted",
-        },
-    )
-    seed = await request_json(
-        client,
-        "POST",
-        f"{base}/channels/{channel_id}/manual-seeds",
-        json={
-            "topic_lane_id": str(lane["id"]),
-            "target_account_id": str(account["id"]),
-            "prompt": "Create one deterministic eight-second owned vertical canary with no external media.",
-            "title_seed": f"VideoProcess Unlisted Canary {run_id[:8]}",
-            "source_policy": "owned_only",
-            "source_platforms_json": [],
-            "material_library_ids_json": [],
-            "constraints_json": {
+    try:
+        owned_asset_id = uuid.UUID(asset_id)
+    except ValueError as exc:
+        raise CanaryError("owned input asset ID is invalid") from exc
+
+    queue = ChannelOpsQueueService()
+    async with db.begin():
+        asset = await db.get(Asset, owned_asset_id)
+        media_info = asset.media_info if asset is not None and isinstance(asset.media_info, dict) else {}
+        if (
+            asset is None
+            or not isinstance(asset.mime_type, str)
+            or not asset.mime_type.startswith("video/")
+            or media_info.get("license") != "owned"
+            or media_info.get("provenance") != "generated"
+        ):
+            raise CanaryError("input asset must be an owned generated video")
+
+        channel = ChannelProfile(
+            name=f"youtube-unlisted-canary-{run_id}",
+            positioning="Owned generated VideoProcess unlisted canary",
+            language="en",
+            default_aspect_ratio="9:16",
+            risk_policy_json={"publication_privacy": "unlisted", "external_sources": False},
+            content_mix_policy_json={"manual_seed_only": True},
+            cadence_policy_json={"max_posts_per_day": 1, "max_posts_per_tick": 1},
+            alert_policy_json={},
+            enabled=True,
+            dry_run=False,
+        )
+        db.add(channel)
+        await db.flush()
+
+        lane = TopicLane(
+            channel_profile_id=channel.id,
+            name=f"owned-canary-{run_id}",
+            description="One owned generated vertical canary",
+            weight=1.0,
+            keywords_json=["videoprocess", "canary"],
+            negative_keywords_json=[],
+            min_posts_per_week=0,
+            max_posts_per_day=1,
+            max_consecutive_streak=1,
+            cooldown_after_post_minutes=1_440,
+        )
+        account = PublishingAccount(
+            channel_profile_id=channel.id,
+            account_label=f"youtube-unlisted-canary-{run_id}",
+            platform="youtube",
+            platform_account_id="",
+            credential_ref="",
+            platform_specific_config_json={"canary_run_id": run_id},
+            default_privacy="unlisted",
+            external_asset_auto_publish=False,
+        )
+        db.add_all((lane, account))
+        await db.flush()
+
+        lane_format = LaneFormatMatrix(
+            topic_lane_id=lane.id,
+            format_key=f"owned_unlisted_9x16_{run_id}",
+            enabled=True,
+            weight=1.0,
+            target_duration_sec=8,
+            template_pool_json=["material_library_remix"],
+            source_platforms_json=[],
+            default_publish_visibility="unlisted",
+        )
+        seed = ManualSeed(
+            channel_profile_id=channel.id,
+            topic_lane_id=lane.id,
+            target_account_id=account.id,
+            prompt="Create one deterministic eight-second owned vertical canary with no external media.",
+            title_seed=f"VideoProcess Unlisted Canary {run_id[:8]}",
+            source_policy="owned_only",
+            source_platforms_json=[],
+            material_library_ids_json=[],
+            constraints_json={
                 "input_asset_id": asset_id,
                 "source_strategy": "input_video",
                 "planning_mode": "template",
                 "target_duration": 8,
             },
-        },
-    )
-    live_channel = await request_json(
-        client,
-        "PATCH",
-        f"{base}/channels/{channel_id}/dry-run",
-        json={"dry_run": False},
-    )
-    if live_channel.get("enabled") is not True or live_channel.get("dry_run") is not False:
-        raise CanaryError("canary channel did not enter enabled non-dry-run mode")
+        )
+        db.add_all((lane_format, seed))
+        tick = await queue.enqueue(
+            db,
+            kind="agent_tick",
+            idempotency_key=f"agent_tick:{channel.id}:{utc_hour_bucket(utc_now())}",
+            payload={"channel_id": str(channel.id)},
+            priority=20,
+            channel_profile_id=channel.id,
+            commit=False,
+        )
+
     return {
-        "channel_id": channel_id,
-        "lane_id": str(lane["id"]),
-        "account_id": str(account["id"]),
-        "lane_format_id": str(lane_format["id"]),
-        "manual_seed_id": str(seed["id"]),
+        "channel_id": str(channel.id),
+        "lane_id": str(lane.id),
+        "account_id": str(account.id),
+        "lane_format_id": str(lane_format.id),
+        "manual_seed_id": str(seed.id),
+        "agent_tick_id": str(tick.id),
     }
 
 
@@ -932,13 +939,38 @@ async def wait_for_manager_ready(
     )
 
 
-async def cancel_auto_promotion_duplicate(
+async def replace_auto_promotion_with_immediate(
     db: AsyncSession,
     channel_id: uuid.UUID,
     publication_id: uuid.UUID,
-) -> list[str]:
+) -> tuple[list[str], ChannelOpsQueueItem]:
     now = utc_now()
+    queue = ChannelOpsQueueService()
+    immediate_key = f"promote_publication:{publication_id}:unlisted:manual"
     async with db.begin():
+        publication = (
+            await db.execute(
+                select(PublicationRecord)
+                .where(PublicationRecord.id == publication_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if publication is None:
+            raise CanaryError("canary publication disappeared before promotion")
+        task = (
+            await db.execute(
+                select(ProductionTask)
+                .where(ProductionTask.id == publication.production_task_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if task is None or task.channel_profile_id != channel_id:
+            raise CanaryError("canary publication task does not belong to its channel")
+        if publication.publish_status != "uploaded" or task.state not in {"uploaded_private", "held"}:
+            raise CanaryError("publication is not ready for immediate promotion")
+        if publication.desired_privacy != "unlisted":
+            raise CanaryError("immediate canary promotion must remain unlisted")
+
         rows = list(
             (
                 await db.execute(
@@ -954,19 +986,67 @@ async def cancel_auto_promotion_duplicate(
             for row in rows
             if str((row.payload_json or {}).get("publication_id")) == str(publication_id)
         ]
-        running = [row for row in rows if row.status == "running"]
-        if running:
+        immediate_rows = [row for row in rows if row.idempotency_key == immediate_key]
+        if len(immediate_rows) > 1:
+            raise CanaryError("duplicate immediate promotion rows already exist")
+        running_automatic = [
+            row for row in rows if row.status == "running" and row.idempotency_key != immediate_key
+        ]
+        if running_automatic:
             raise CanaryError("automatic promotion is already running; refusing duplicate promotion")
-        queued = [row for row in rows if row.status == "queued"]
-        if len(queued) != 1:
+        queued_automatic = [
+            row for row in rows if row.status == "queued" and row.idempotency_key != immediate_key
+        ]
+        if not immediate_rows and len(queued_automatic) != 1:
             raise CanaryError("expected exactly one queued automatic promotion to cancel")
-        for row in queued:
+        for row in queued_automatic:
             row.status = "cancelled"
             row.last_error = "replaced_by_immediate_unlisted_canary_promotion"
             row.locked_at = None
             row.locked_by = None
             row.dead_letter_at = now
-    return sorted(str(row.id) for row in queued)
+        if immediate_rows:
+            immediate = immediate_rows[0]
+            if immediate.status not in {"queued", "running", "succeeded"}:
+                raise CanaryError(f"existing immediate promotion is {immediate.status}")
+        else:
+            immediate = await queue.enqueue(
+                db,
+                kind="promote_publication",
+                idempotency_key=immediate_key,
+                payload={
+                    "publication_id": str(publication.id),
+                    "target_visibility": "unlisted",
+                    "channel_profile_id": str(task.channel_profile_id),
+                },
+                priority=70,
+                channel_profile_id=task.channel_profile_id,
+                commit=False,
+            )
+    return sorted(str(row.id) for row in queued_automatic), immediate
+
+
+async def enqueue_metrics_probe(
+    db: AsyncSession,
+    publication_id: uuid.UUID,
+) -> ChannelOpsQueueItem:
+    queue = ChannelOpsQueueService()
+    async with db.begin():
+        publication = await db.get(PublicationRecord, publication_id)
+        if publication is None:
+            raise CanaryError("canary publication disappeared before metrics enqueue")
+        task = await db.get(ProductionTask, publication.production_task_id)
+        if task is None:
+            raise CanaryError("canary publication task disappeared before metrics enqueue")
+        return await queue.enqueue(
+            db,
+            kind="collect_metrics",
+            idempotency_key=f"collect_metrics:{publication.id}:{utc_hour_bucket(utc_now())}",
+            payload={"publication_id": str(publication.id)},
+            priority=90,
+            channel_profile_id=task.channel_profile_id,
+            commit=False,
+        )
 
 
 async def wait_for_queue_success(
@@ -1321,13 +1401,11 @@ async def execute_canary(
 
     asset = await upload_and_attest_asset(args, client, db, media_path, media, generated_at)
     evidence["asset"].update(asset)
-    graph = await create_canary_graph(args, client, evidence["run_id"], asset["id"])
+    graph = await create_canary_graph(db, evidence["run_id"], asset["id"])
     evidence["graph"] = graph
     atomic_write_json(path, evidence)
 
-    base = f"{api_root(args.api_url)}/api/v1/channel-agent"
-    tick = await request_json(client, "POST", f"{base}/channels/{graph['channel_id']}/enqueue-tick")
-    evidence["queue"] = {"agent_tick_id": str(tick["id"])}
+    evidence["queue"] = {"agent_tick_id": graph["agent_tick_id"]}
     task, plan_item = await wait_for_single_task_and_preapprove(
         db,
         uuid.UUID(graph["channel_id"]),
@@ -1408,29 +1486,28 @@ async def execute_canary(
     )
     evidence["manager"].update({"upload_task": manager_task, "video_status": manager_video})
 
-    cancelled = await cancel_auto_promotion_duplicate(
+    cancelled, promotion = await replace_auto_promotion_with_immediate(
         db,
         uuid.UUID(graph["channel_id"]),
         publication.id,
     )
-    promotion = await request_json(client, "POST", f"{base}/publications/{publication.id}/promote")
     metrics_payload = await request_json(
         client,
         "GET",
         f"{manager_root(args.youtube_manager_url)}/api/videos/{operation.platform_video_id}/metrics",
     )
     immediate_metrics = recognized_metrics(metrics_payload)
-    metrics_item = await request_json(client, "POST", f"{base}/publications/{publication.id}/enqueue-metrics")
+    metrics_item = await enqueue_metrics_probe(db, publication.id)
     evidence["queue"].update(
         {
             "cancelled_auto_promotion_ids": cancelled,
-            "immediate_promotion_id": str(promotion["id"]),
-            "immediate_metrics_id": str(metrics_item["id"]),
+            "immediate_promotion_id": str(promotion.id),
+            "immediate_metrics_id": str(metrics_item.id),
         }
     )
     await wait_for_queue_success(
         db,
-        uuid.UUID(str(promotion["id"])),
+        promotion.id,
         min(args.timeout_seconds, 180.0),
         "immediate unlisted promotion",
     )
@@ -1452,7 +1529,7 @@ async def execute_canary(
 
     await wait_for_queue_success(
         db,
-        uuid.UUID(str(metrics_item["id"])),
+        metrics_item.id,
         min(args.timeout_seconds, 180.0),
         "immediate metrics probe",
     )
