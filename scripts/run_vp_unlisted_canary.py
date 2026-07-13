@@ -88,6 +88,7 @@ CONNECTION_URL_PATTERN = re.compile(
     r"(?i)(?:postgres(?:ql)?(?:\+asyncpg)?|rediss?)://[^\s'\"<>]+"
 )
 READINESS_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+NON_PUBLISHING_MAINTENANCE_QUEUE_KINDS = {"cleanup_expired"}
 
 
 class CanaryError(RuntimeError):
@@ -406,7 +407,11 @@ async def active_backlog(
     allowed_channel_id: uuid.UUID | None = None,
 ) -> dict[str, list[str]]:
     job_stmt = select(Job.id).where(Job.status.in_(RUNNABLE_JOB_STATUSES))
-    queue_stmt = select(ChannelOpsQueueItem.id).where(ChannelOpsQueueItem.status.in_(("queued", "running")))
+    queue_stmt = (
+        select(ChannelOpsQueueItem.id)
+        .where(ChannelOpsQueueItem.status.in_(("queued", "running")))
+        .where(ChannelOpsQueueItem.kind.not_in(sorted(NON_PUBLISHING_MAINTENANCE_QUEUE_KINDS)))
+    )
     publication_task_ids = select(PublicationRecord.production_task_id)
     task_stmt = (
         select(ProductionTask.id)

@@ -138,3 +138,11 @@ Final fresh verification:
 - owned changed-file Ruff: passed;
 - canary script targeted mypy: passed;
 - script `py_compile` and `git diff --check`: passed.
+
+Production preflight also found seven global `cleanup_expired` queue rows. They
+perform retention maintenance only and cannot generate a task, job, upload, or
+publication. The canary backlog gate now excludes exactly that queue kind while
+continuing to reject every other global or foreign-channel queued/running row;
+a focused database test proves both sides of the rule. The production dry-run
+still reports the old soak channel's 47 tasks, 42 jobs, 294 nodes, and 71 active
+queue rows for explicit quarantine before activation.

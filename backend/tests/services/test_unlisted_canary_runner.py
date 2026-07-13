@@ -50,6 +50,9 @@ async def db():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         await connection.run_sync(lambda sync_connection: Base.metadata.create_all(sync_connection, tables=TABLES))
+        await connection.exec_driver_sql(
+            "CREATE TABLE jobs (id CHAR(32) PRIMARY KEY NOT NULL, status VARCHAR(32) NOT NULL)"
+        )
     async with AsyncSession(engine, expire_on_commit=False) as session:
         yield session
     await engine.dispose()
@@ -232,3 +235,33 @@ def test_schedule_close_failure_creates_sanitized_failure_after_success():
         "type": "RuntimeError",
         "message": "final schedule close failed",
     }
+
+
+@pytest.mark.anyio
+async def test_backlog_ignores_only_global_cleanup_maintenance(db: AsyncSession):
+    runner = load_runner()
+    cleanup = ChannelOpsQueueItem(
+        kind="cleanup_expired",
+        idempotency_key="cleanup_expired:2026-07-12",
+        channel_profile_id=None,
+        payload_json={},
+    )
+    db.add(cleanup)
+    await db.commit()
+
+    report = await runner.active_backlog(db)
+
+    assert report["unsafe_queue_item_ids"] == []
+
+    unsafe = ChannelOpsQueueItem(
+        kind="agent_tick",
+        idempotency_key="agent_tick:global:2026-07-12-18",
+        channel_profile_id=None,
+        payload_json={"channel_id": str(uuid.uuid4())},
+    )
+    db.add(unsafe)
+    await db.commit()
+
+    report = await runner.active_backlog(db)
+
+    assert report["unsafe_queue_item_ids"] == [str(unsafe.id)]
