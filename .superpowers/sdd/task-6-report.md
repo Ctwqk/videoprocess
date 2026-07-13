@@ -1,0 +1,75 @@
+# Task 6 Report: Backlog Quarantine And Canary Runner
+
+## Status
+
+Implemented offline at base commit `855e9dcf8daa423d22267442def22a171f5de014`.
+No live quarantine, deployment, schedule opening, YouTube upload, promotion, or
+metrics mutation was run as part of Task 6.
+
+## Delivered
+
+- Added a channel-scoped, single-transaction quarantine service with dry-run
+  default behavior, exact retained/changed IDs, idempotent apply behavior, and
+  protection for terminal, measured, and publication-backed task/job evidence.
+- Added a quarantine CLI requiring `DATABASE_URL`, `--channel-id`, and an
+  evidence path. Mutation requires explicit `--apply`; evidence is written
+  atomically with mode `0600` and no database URL is emitted.
+- Added a guarded live-unlisted canary runner requiring
+  `--confirm-live-unlisted` and `DATABASE_URL`.
+- The canary holds a PostgreSQL advisory lock for its lifetime, verifies the
+  closed schedule and empty unsafe backlog, checks deployed commit/publisher
+  readiness and manager auth/quota, creates deterministic owned 8-second
+  1080x1920 media, attests its SHA-256/provenance, and creates one isolated
+  channel graph.
+- The runner performs the manual-seed approval handoff atomically before plan
+  processing, releases exactly one waiting job, drains after observing RUNNING,
+  closes the schedule in `finally`, and never deletes the YouTube video.
+- The runner requires one durable succeeded upload operation/publication/video,
+  replaces the delayed auto-promotion with one immediate unlisted promotion,
+  probes manager status/metrics, and distinguishes immediate platform feedback
+  from pending age-appropriate durable metrics work in restrictive evidence.
+- Failure after task creation halts the canary channel, holds remaining tasks,
+  dead-letters its runnable queue rows, cancels active jobs/nodes, closes the
+  schedule, and preserves durable audit rows without retrying an upload.
+
+## TDD Evidence
+
+The initial focused pytest run failed with missing
+`app.services.channelops_quarantine`; the initial shell contract failed because
+both scripts were absent. Implementations were added only after those expected
+red failures.
+
+## Verification
+
+- Focused quarantine: `4 passed`.
+- Canary shell/AST/helper contract: passed.
+- Script `py_compile`: passed.
+- Targeted Ruff on all owned Python files: passed.
+- Targeted mypy on the service and both scripts: passed.
+- Independent read-only Codex review completed. It identified caller-owned
+  directory permission mutation and an incomplete quota-cost comparison; both
+  were fixed with focused regression coverage. Its suggestion to cancel
+  publication-backed runnable jobs was not applied because the binding
+  requirement explicitly says to retain publication-backed task/job evidence;
+  the canary preflight still refuses to open while any such job is runnable.
+- Deterministic FFmpeg check: two independent files produced SHA-256
+  `e6212dd80d5abbc67745a0bad40b375e9f50bba58b371e52c7afab9051b6a8ae`,
+  duration 8 seconds, 1080x1920.
+- Full backend: `516 passed, 11 warnings` in the final 63.48-second run. Warnings are existing
+  `datetime.utcnow()` deprecations outside Task 6.
+- Project-wide Ruff baseline: 21 existing findings outside owned files.
+- Project-wide mypy baseline: 37 existing findings in 15 files outside owned
+  files.
+
+## Residual Concerns
+
+- Live-only behavior still requires Task 7 deployment and the explicit live
+  command. This task intentionally did not contact production PostgreSQL,
+  Redis, Swarm, the deployed API, or YouTubeManager.
+- Deployment readiness assumes the documented runtime marker path on 127, the
+  publisher service name `vp-youtube-publisher-swarm`, and the documented 150
+  placement constraints. The live runner fails closed if any differ.
+- YouTube processing and metric availability are inherently asynchronous. The
+  runner persists immediate feedback only when the manager exposes recognized
+  fields; otherwise it requires and records pending durable metrics work and
+  fabricates no snapshot.
