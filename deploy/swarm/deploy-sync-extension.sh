@@ -225,16 +225,6 @@ vp_publisher_env() {
     "PUBLIC_PUBLISH_ENABLED=false"
 }
 
-vp_publisher_mount_is_sensitive() {
-  local target="$1"
-  case "$target" in
-    *credential*|*credentials*|*oauth*|*token*)
-      return 0
-      ;;
-  esac
-  return 1
-}
-
 vp_publisher_env_is_sensitive() {
   local key="$1"
   case "$key" in
@@ -246,6 +236,25 @@ vp_publisher_env_is_sensitive() {
       ;;
   esac
   return 1
+}
+
+vp_publisher_service_state() {
+  local service_names
+  service_names="$(docker service ls \
+    --filter "name=$VP_PUBLISHER_SERVICE" \
+    --format '{{.Name}}')" || return 1
+  case "$service_names" in
+    "$VP_PUBLISHER_SERVICE")
+      printf 'exists\n'
+      ;;
+    '')
+      printf 'absent\n'
+      ;;
+    *)
+      echo "unexpected publisher service list result" >&2
+      return 1
+      ;;
+  esac
 }
 
 vp_deploy_python_worker() {
@@ -344,13 +353,18 @@ vp_deploy_publisher() {
   local env_value
   local env_args=()
   local publisher_exists=false
-  local inspect_error
-  if inspect_error="$(docker service inspect "$VP_PUBLISHER_SERVICE" --format '{{.ID}}' 2>&1)"; then
-    publisher_exists=true
-  elif [[ "$inspect_error" != *"no such service"* && "$inspect_error" != *"not found"* ]]; then
-    printf '%s\n' "$inspect_error" >&2
-    return 1
-  fi
+  local publisher_state
+  publisher_state="$(vp_publisher_service_state)" || return 1
+  case "$publisher_state" in
+    exists)
+      publisher_exists=true
+      ;;
+    absent)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 
   local existing_env=""
   if [[ "$publisher_exists" == true ]]; then
@@ -409,26 +423,56 @@ vp_deploy_publisher() {
 
     local existing_mounts
     existing_mounts="$(vp_service_values "$VP_PUBLISHER_SERVICE" \
-      '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{printf "%s|%s\\n" .Source .Target}}{{end}}')" || return 1
+      '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{printf "%s|%s|%s|%t\\n" .Type .Source .Target .ReadOnly}}{{end}}')" || return 1
+    local mount_type
     local mount_source
     local mount_target
-    local scratch_needs_add=true
-    while IFS='|' read -r mount_source mount_target; do
-      [[ -n "$mount_target" ]] || continue
-      if [[ "$mount_target" == /data/storage ]]; then
-        if [[ "$mount_source" == "vp-youtube-publisher-scratch" ]]; then
-          scratch_needs_add=false
-        else
+    local mount_readonly
+    local desired_scratch_count=0
+    local rebuild_scratch=false
+    while IFS='|' read -r mount_type mount_source mount_target mount_readonly; do
+      [[ -n "$mount_type$mount_source$mount_target$mount_readonly" ]] || continue
+      if [[ -z "$mount_target" ]]; then
+        echo "publisher mount has no target" >&2
+        return 1
+      fi
+      if [[ "$mount_type" == volume \
+        && "$mount_source" == "vp-youtube-publisher-scratch" \
+        && "$mount_target" == /data/storage \
+        && "$mount_readonly" == false ]]; then
+        desired_scratch_count=$((desired_scratch_count + 1))
+        if [[ "$desired_scratch_count" -gt 1 ]]; then
           update_args+=(--mount-rm "$mount_target")
-          scratch_needs_add=true
+          rebuild_scratch=true
         fi
-      elif vp_publisher_mount_is_sensitive "$mount_target"; then
+      else
         update_args+=(--mount-rm "$mount_target")
+        if [[ "$mount_target" == /data/storage ]]; then
+          rebuild_scratch=true
+        fi
       fi
     done <<<"$existing_mounts"
-    if [[ "$scratch_needs_add" == true ]]; then
+    if [[ "$desired_scratch_count" -ne 1 || "$rebuild_scratch" == true ]]; then
       update_args+=(--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage)
     fi
+
+    local existing_secrets
+    existing_secrets="$(vp_service_values "$VP_PUBLISHER_SERVICE" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Secrets}}{{println .SecretName}}{{end}}')" || return 1
+    local secret_name
+    while IFS= read -r secret_name; do
+      [[ -n "$secret_name" ]] || continue
+      update_args+=(--secret-rm "$secret_name")
+    done <<<"$existing_secrets"
+
+    local existing_configs
+    existing_configs="$(vp_service_values "$VP_PUBLISHER_SERVICE" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Configs}}{{println .ConfigName}}{{end}}')" || return 1
+    local config_name
+    while IFS= read -r config_name; do
+      [[ -n "$config_name" ]] || continue
+      update_args+=(--config-rm "$config_name")
+    done <<<"$existing_configs"
 
     while IFS= read -r env_value; do
       env_key="${env_value%%=*}"
@@ -460,10 +504,15 @@ vp_deploy_publisher() {
 vp_capture_app_snapshots() {
   local service
   local image
+  local publisher_state
   for service in $VP_APP_SERVICES; do
-    if ! docker service inspect "$service" >/dev/null 2>&1; then
-      if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" \
-        || "$service" == "$VP_PUBLISHER_SERVICE" ]]; then
+    if [[ "$service" == "$VP_PUBLISHER_SERVICE" ]]; then
+      publisher_state="$(vp_publisher_service_state)" || return 1
+      if [[ "$publisher_state" == absent ]]; then
+        continue
+      fi
+    elif ! docker service inspect "$service" >/dev/null 2>&1; then
+      if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" ]]; then
         continue
       fi
       echo "missing required VideoProcess service: $service" >&2
@@ -544,11 +593,14 @@ vp_restore_app_snapshots() {
       status=1
     fi
   fi
-  if [[ "$publisher_was_present" != true ]] \
-    && docker service inspect "$VP_PUBLISHER_SERVICE" >/dev/null 2>&1; then
-    log "remove newly created $VP_PUBLISHER_SERVICE"
-    if ! docker service rm "$VP_PUBLISHER_SERVICE" >&2; then
-      status=1
+  if [[ "$publisher_was_present" != true ]]; then
+    local publisher_state
+    publisher_state="$(vp_publisher_service_state)" || return 1
+    if [[ "$publisher_state" == exists ]]; then
+      log "remove newly created $VP_PUBLISHER_SERVICE"
+      if ! docker service rm "$VP_PUBLISHER_SERVICE" >&2; then
+        status=1
+      fi
     fi
   fi
   return "$status"
