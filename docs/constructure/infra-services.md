@@ -11,7 +11,7 @@ Status date: 2026-07-10.
 
 | Host | Role | Runtime identity |
 | --- | --- | --- |
-| `10.0.0.150` / `ccttww-lap` | Swarm manager, shared infrastructure, GPU services, dashboard, IBKR, VNC/browser state | Docker Swarm manager node `ccttww-lap` |
+| `10.0.0.150` / `ccttww-lap` | Swarm manager, shared infrastructure, GPU services, YouTubeManager/publisher, dashboard, IBKR, VNC/browser state | Docker Swarm manager node `ccttww-lap` |
 | `10.0.0.126` / `CASPERs-Mac-mini.local` | ForWin and news application runtime | Colima/Swarm node `colima-swarmbridged`; host forwards expose app ports |
 | `10.0.0.127` / `Wenjies-Mac-mini.local` | VideoProcess, PDS, feature aggregator, and arb application runtime | Colima/Swarm node `colima-127`; host forwards expose app ports |
 
@@ -46,6 +46,10 @@ health endpoint, or automatic failover target. Normal VP images are built on
 127 because Swarm uses node-local images, and normal VP services are constrained
 to the 127 node label `vp.runtime=true`.
 
+The dedicated YouTube publisher is the exception to normal VP application
+placement: it uses the manager-built Python worker image and runs only on 150.
+It is neither a 127 runtime service nor a 126 failover target.
+
 ## Infra Inventory
 
 All shared stateful infrastructure is centralized on `10.0.0.150`.
@@ -62,6 +66,7 @@ All shared stateful infrastructure is centralized on `10.0.0.150`.
 | Dashboard | SSH-tunneled `http://127.0.0.1:7700` on 150 | operator UI |
 | IBKR API | `http://127.0.0.1:7701` on 150 | dashboard IBKR tab and IBKR clients |
 | VNC manager | API `127.0.0.1:7799`, VNC `127.0.0.1:5999`, IB Gateway `127.0.0.1:4001` on 150 | durable browser desktop, IBKR login |
+| YouTubeManager | `http://10.0.0.150:18999` | dedicated VP publisher; deployment checks `/api/auth/status` before publisher mutation |
 
 Applications may contain database code, migrations, compose files, and local
 development profiles. That does not mean production should start app-local
@@ -98,6 +103,7 @@ Current production service names:
 | `vp-event-outbox-relay-swarm` | `1/1` | VP event relay on 127 |
 | `vp-pds-swarm` | `1/1` | PDS on 127 |
 | `vp-feature-aggregator-swarm` | `1/1` | Feature aggregator on 127 |
+| `vp-youtube-publisher-swarm` | `1/1` | Dedicated unlisted VP publisher on 150 |
 | `arb-resolver-swarm` | scheduled by arb open/close window | Arb matching on 127 |
 | `arb-validator-swarm` | scheduled by arb open/close window | Arb validation on 127 |
 | `arb-executor-polymarket-swarm` | `1/1` | Wallet/VPN-bound execution; keep on 150 |
@@ -106,6 +112,21 @@ Current production service names:
 Do not infer service health only from repository files. Verify with
 `docker service ls`, browser checks for UI surfaces, and the `.deploy-sync-*`
 markers on target hosts.
+
+## VideoProcess Publication Isolation
+
+`vp-youtube-publisher-swarm` uses the same Python worker image as the managed
+FFmpeg worker but has one publisher concurrency and a separate scratch volume.
+It reaches shared Postgres, the VP Redis instance, and MinIO through the
+pipeline network, then submits only through YouTubeManager on 150. Public
+publication is disabled for this service.
+
+The deploy extension adds `vp.publisher=true` only to `ccttww-lap` and requires
+both that label and `node.hostname==ccttww-lap` for the service. Never add the
+publisher label to 126: the hostname constraint is intentional defense against
+stale labels and 126 is never an eligible publisher node. The publisher has no
+OAuth credential environment or mount; keep its authorization boundary inside
+YouTubeManager.
 
 ## Data Store Rules
 

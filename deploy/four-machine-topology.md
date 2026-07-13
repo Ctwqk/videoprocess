@@ -11,8 +11,9 @@ Status date: 2026-07-11.
 - API traffic is forwarded through `http://10.0.0.127:18080`.
 - Shared Postgres, Redis, MinIO, Qdrant, Redpanda, embedding, dashboard, and
   IBKR infrastructure stay on `10.0.0.150`.
-- The managed Python FFmpeg worker runs on 150; normal VP application services
-  and the Go FFmpeg worker run on 127.
+- The managed Python FFmpeg worker, YouTubeManager, and dedicated YouTube
+  publisher run on 150; normal VP application services and the Go FFmpeg worker
+  run on 127.
 - 126 is not a VideoProcess automatic failover target. It remains the
   ForWin/news node during normal VP builds, deploys, and runtime placement.
 - The deployment directory on 127 is not the source-of-truth git workspace.
@@ -59,6 +60,8 @@ Host forwards:
 - Redpanda host bridge `10.0.0.150:19092`, overlay `redpanda:9092`
 - Embedding gateway `http://10.0.0.150:8080`
 - Managed Python FFmpeg worker (CPU fallback until Swarm GPU allocation is configured)
+- YouTubeManager and `vp-youtube-publisher-swarm` for the dedicated unlisted
+  publication stream
 - Browser/account infrastructure that remains 150-local
 
 ## Entry Points And Ports
@@ -118,7 +121,17 @@ deploy job as part of a VideoProcess release.
 - Constrain normal VP services to `node.labels.vp.runtime == true`.
 - Label the 150 manager with `node.labels.vp.gpu == true` and constrain the
   managed Python worker to that label.
+- Label only the 150 manager with `node.labels.vp.publisher == true`. Constrain
+  `vp-youtube-publisher-swarm` with both that label and
+  `node.hostname == ccttww-lap`; the hostname constraint prevents stale labels
+  from placing the publisher on another node.
+- The publisher uses the shared VP Postgres, Redis, and MinIO services through
+  the pipeline network, validates YouTubeManager's read-only auth-status route
+  before deployment, and publishes only through its dedicated unlisted stream.
+  Do not supply OAuth credentials through its Swarm environment or mounts.
 - Do not add `vp.runtime` to the 126 node.
+- Never add `vp.publisher` to the 126 node or treat it as a publisher failover
+  target.
 - If 127 is unavailable, fail the VP deployment instead of scheduling or
   building on 126.
 

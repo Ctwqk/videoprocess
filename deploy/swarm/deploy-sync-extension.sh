@@ -12,9 +12,12 @@ VP_RUNTIME_NODE="${VP_RUNTIME_NODE:-colima-127}"
 VP_RUNTIME_CONSTRAINT="node.labels.vp.runtime==true"
 VP_GPU_CONSTRAINT="node.labels.vp.gpu==true"
 VP_MANAGER_NODE="${VP_MANAGER_NODE:-ccttww-lap}"
+VP_PUBLISHER_CONSTRAINT="node.labels.vp.publisher==true"
+VP_PUBLISHER_MANAGER_CONSTRAINT="node.hostname==$VP_MANAGER_NODE"
 VP_PIPELINE_NETWORK="${VP_PIPELINE_NETWORK:-vp-pipeline-net}"
 VP_PYTHON_WORKER_SERVICE="vp-ffmpeg-worker-gpu-swarm"
-VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE"
+VP_PUBLISHER_SERVICE="vp-youtube-publisher-swarm"
+VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE $VP_PUBLISHER_SERVICE"
 
 vp_validate_deploy_config() {
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
@@ -200,6 +203,28 @@ vp_python_worker_env() {
     "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility"
 }
 
+vp_publisher_env() {
+  local db_url="$VP_PYTHON_WORKER_DATABASE_URL"
+  local minio_access="$VP_MINIO_ACCESS_KEY"
+  local minio_secret="$VP_MINIO_SECRET_KEY"
+  printf '%s\n' \
+    "DEPLOY_MODE=shared" \
+    "DATABASE_URL=$db_url" \
+    "REDIS_URL=redis://10.0.0.150:6380/0" \
+    "STORAGE_BACKEND=minio" \
+    "STORAGE_LOCAL_ROOT=/data/storage" \
+    "MINIO_ENDPOINT=10.0.0.150:9000" \
+    "MINIO_ACCESS_KEY=$minio_access" \
+    "MINIO_SECRET_KEY=$minio_secret" \
+    "MINIO_BUCKET=videoprocess" \
+    "WORKER_TYPE=youtube_publisher" \
+    "WORKER_HOST=150-publisher" \
+    "WORKER_CONCURRENCY=1" \
+    "YOUTUBE_MANAGER_URL=http://10.0.0.150:18999" \
+    "YOUTUBE_PUBLISH_ENABLED=true" \
+    "PUBLIC_PUBLISH_ENABLED=false"
+}
+
 vp_deploy_python_worker() {
   local image="$1"
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
@@ -282,12 +307,115 @@ vp_deploy_python_worker() {
   swarm_service_running "$VP_PYTHON_WORKER_SERVICE"
 }
 
+vp_deploy_publisher() {
+  local image="$1"
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    log "service update skipped $VP_PUBLISHER_SERVICE $image"
+    return 0
+  fi
+
+  http_health vp-youtube-manager "http://10.0.0.150:18999/api/auth/status" || return 1
+  docker node update --label-add vp.publisher=true "$VP_MANAGER_NODE" >/dev/null
+
+  local env_key
+  local env_value
+  local env_args=()
+  while IFS= read -r env_value; do
+    env_key="${env_value%%=*}"
+    if docker service inspect "$VP_PUBLISHER_SERVICE" \
+      --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
+      2>/dev/null \
+      | awk -F= -v key="$env_key" '$1 == key { found=1 } END { exit found ? 0 : 1 }'; then
+      env_args+=(--env-rm "$env_key")
+    fi
+    env_args+=(--env-add "$env_value")
+  done < <(vp_publisher_env)
+
+  if docker service inspect "$VP_PUBLISHER_SERVICE" >/dev/null 2>&1; then
+    local update_args=(
+      service update --detach=false --no-resolve-image --update-order stop-first
+    )
+    local constraint
+    local has_publisher=false
+    local has_manager=false
+    while IFS= read -r constraint; do
+      [[ -n "$constraint" ]] || continue
+      case "$constraint" in
+        node.labels.role==app)
+          update_args+=(--constraint-rm "$constraint")
+          ;;
+        node.hostname==*)
+          if [[ "$constraint" == "$VP_PUBLISHER_MANAGER_CONSTRAINT" ]]; then
+            has_manager=true
+          else
+            update_args+=(--constraint-rm "$constraint")
+          fi
+          ;;
+        "$VP_PUBLISHER_CONSTRAINT")
+          has_publisher=true
+          ;;
+      esac
+    done < <(
+      vp_service_values "$VP_PUBLISHER_SERVICE" \
+        '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
+    )
+    if [[ "$has_publisher" != true ]]; then
+      update_args+=(--constraint-add "$VP_PUBLISHER_CONSTRAINT")
+    fi
+    if [[ "$has_manager" != true ]]; then
+      update_args+=(--constraint-add "$VP_PUBLISHER_MANAGER_CONSTRAINT")
+    fi
+
+    local network_id
+    network_id="$(docker network inspect "$VP_PIPELINE_NETWORK" --format '{{.ID}}')"
+    if ! vp_service_values "$VP_PUBLISHER_SERVICE" \
+      '{{range .Spec.TaskTemplate.Networks}}{{println .Target}}{{end}}' \
+      | grep -Fxq "$network_id"; then
+      update_args+=(--network-add "$VP_PIPELINE_NETWORK")
+    fi
+    if vp_service_values "$VP_PUBLISHER_SERVICE" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{println .Target}}{{end}}' \
+      | grep -Fxq /app/youtube_credentials; then
+      update_args+=(--mount-rm /app/youtube_credentials)
+    fi
+    while IFS= read -r env_value; do
+      env_key="${env_value%%=*}"
+      case "$env_key" in
+        YOUTUBE_CREDENTIALS_DIR|YOUTUBE_CLIENT_ID|YOUTUBE_CLIENT_SECRET|YOUTUBE_ACCESS_TOKEN|YOUTUBE_REFRESH_TOKEN|YOUTUBE_OAUTH_*)
+          update_args+=(--env-rm "$env_key")
+          ;;
+      esac
+    done < <(
+      vp_service_values "$VP_PUBLISHER_SERVICE" \
+        '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}'
+    )
+    docker "${update_args[@]}" "${env_args[@]}" \
+      --image "$image" "$VP_PUBLISHER_SERVICE" >&2
+  else
+    local create_args=(
+      service create --detach=false --name "$VP_PUBLISHER_SERVICE"
+      --constraint "$VP_PUBLISHER_CONSTRAINT"
+      --constraint "$VP_PUBLISHER_MANAGER_CONSTRAINT"
+      --network "$VP_PIPELINE_NETWORK"
+      --restart-condition any --restart-delay 5s
+      --mount type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage
+    )
+    local create_env=()
+    while IFS= read -r env_value; do
+      create_env+=(--env "$env_value")
+    done < <(vp_publisher_env)
+    docker "${create_args[@]}" "${create_env[@]}" "$image" >&2
+  fi
+  swarm_service_running "$VP_PUBLISHER_SERVICE"
+}
+
 vp_capture_app_snapshots() {
   local service
   local image
   for service in $VP_APP_SERVICES; do
     if ! docker service inspect "$service" >/dev/null 2>&1; then
-      if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" ]]; then
+      if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" \
+        || "$service" == "$VP_PUBLISHER_SERVICE" ]]; then
         continue
       fi
       echo "missing required VideoProcess service: $service" >&2
@@ -340,6 +468,7 @@ vp_restore_app_snapshots() {
   local service
   local image
   local gpu_was_present=false
+  local publisher_was_present=false
   local status=0
 
   while IFS='|' read -r service image; do
@@ -348,6 +477,11 @@ vp_restore_app_snapshots() {
     if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" ]]; then
       gpu_was_present=true
       if ! vp_restore_gpu_service "$image"; then
+        status=1
+      fi
+    elif [[ "$service" == "$VP_PUBLISHER_SERVICE" ]]; then
+      publisher_was_present=true
+      if ! vp_deploy_publisher "$image"; then
         status=1
       fi
     elif ! vp_update_runtime_service "$service" "$image" stop-first; then
@@ -359,6 +493,13 @@ vp_restore_app_snapshots() {
     && docker service inspect "$VP_PYTHON_WORKER_SERVICE" >/dev/null 2>&1; then
     log "remove newly created $VP_PYTHON_WORKER_SERVICE"
     if ! docker service rm "$VP_PYTHON_WORKER_SERVICE" >&2; then
+      status=1
+    fi
+  fi
+  if [[ "$publisher_was_present" != true ]] \
+    && docker service inspect "$VP_PUBLISHER_SERVICE" >/dev/null 2>&1; then
+    log "remove newly created $VP_PUBLISHER_SERVICE"
+    if ! docker service rm "$VP_PUBLISHER_SERVICE" >&2; then
       status=1
     fi
   fi
@@ -382,6 +523,7 @@ vp_apply_app_services() {
   vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" start-first || return 1
   vp_update_runtime_service vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first || return 1
   vp_deploy_python_worker "$python_worker" || return 1
+  vp_deploy_publisher "$python_worker" || return 1
 
   local service
   for service in $VP_APP_SERVICES; do
