@@ -232,13 +232,13 @@ def _hold_task(task: ProductionTask, now: datetime) -> None:
 
 def _cancel_job(job: Job, now: datetime) -> None:
     job.status = JobStatus.CANCELLED
-    job.completed_at = now
+    job.completed_at = _naive_utc(now)
     job.error_message = QUARANTINE_REASON
 
 
 def _cancel_node(node: NodeExecution, now: datetime) -> None:
     node.status = NodeStatus.CANCELLED
-    node.completed_at = now
+    node.completed_at = _naive_utc(now)
     node.worker_id = None
     node.error_message = QUARANTINE_REASON
 
@@ -253,6 +253,12 @@ def _dead_letter_queue_item(item: ChannelOpsQueueItem, now: datetime) -> None:
 
 def _uuid(value: uuid.UUID | str) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _sorted_ids(rows: list[Any]) -> list[str]:

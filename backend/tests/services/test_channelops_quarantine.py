@@ -17,6 +17,8 @@ from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.services.channelops_quarantine import (
     QUARANTINE_REASON,
     UnknownChannelError,
+    _cancel_job,
+    _cancel_node,
     quarantine_channelops_backlog,
 )
 
@@ -75,6 +77,17 @@ def _job(status: JobStatus, node_status: NodeStatus) -> tuple[Job, NodeExecution
         started_at=NOW,
     )
     return job, node
+
+
+def test_cancel_timestamps_follow_naive_utc_job_model_contract():
+    job, node = _job(JobStatus.RUNNING, NodeStatus.RUNNING)
+
+    _cancel_job(job, NOW)
+    _cancel_node(node, NOW)
+
+    expected = NOW.replace(tzinfo=None)
+    assert job.completed_at == expected
+    assert node.completed_at == expected
 
 
 async def _seed_graph(session):
