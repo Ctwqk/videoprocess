@@ -49,6 +49,8 @@ ADVISORY_LOCK_KEY = 8_537_601_337_126
 CANARY_APPROVAL_REASON = "operator_preapproved_live_unlisted_canary"
 CANARY_FAILURE_REASON = "operator_canary_failure"
 CANARY_PLAN_DELAY_SECONDS = 300
+CHANNEL_OPS_RUNNER_SERVICE = "vp-channel-agent-runner-swarm"
+RUNNER_POLL_CUSHION_SECONDS = 60
 NO_DELETE_POLICY = "This runner never deletes the YouTube video automatically."
 SCHEDULE_STATUS_PATH = "/internal/schedule/video/status"
 SCHEDULE_OPEN_PATH = "/internal/schedule/video/open"
@@ -225,6 +227,34 @@ def manager_root(value: str) -> str:
     return value.rstrip("/").removesuffix("/api")
 
 
+def runner_task_wait_seconds(environment_output: str) -> int:
+    environment = {}
+    for row in environment_output.splitlines():
+        key, separator, value = row.partition("=")
+        if separator:
+            environment[key.strip()] = value.strip()
+
+    def positive_integer(name: str, default: int) -> int:
+        raw = environment.get(name, str(default))
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise CanaryError(f"deployed runner {name} is not an integer") from exc
+        if value <= 0:
+            raise CanaryError(f"deployed runner {name} must be positive")
+        return value
+
+    regular_poll = positive_integer("CHANNELOPS_RUNNER_POLL_SECONDS", 5)
+    throttle_raw = environment.get("CHANNELOPS_THROTTLE_ENABLED", "false").casefold()
+    if throttle_raw in {"1", "true", "yes", "on"}:
+        throttle_poll = positive_integer("CHANNELOPS_THROTTLE_RUNNER_POLL_SECONDS", 300)
+    elif throttle_raw in {"0", "false", "no", "off"}:
+        throttle_poll = regular_poll
+    else:
+        raise CanaryError("deployed runner CHANNELOPS_THROTTLE_ENABLED is malformed")
+    return max(regular_poll, throttle_poll) + RUNNER_POLL_CUSHION_SECONDS
+
+
 def evidence_path(args: argparse.Namespace, run_id: str) -> Path:
     return args.evidence or ROOT / ".runtime" / "youtube-canary" / f"unlisted-canary-{run_id}.json"
 
@@ -292,6 +322,53 @@ async def deployment_readiness(args: argparse.Namespace, client: httpx.AsyncClie
     constraint_rows = {row.strip() for row in constraints.splitlines() if row.strip()}
     if "node.labels.vp.publisher==true" not in constraint_rows or "node.hostname==ccttww-lap" not in constraint_rows:
         raise CanaryError("publisher placement constraints are not ready")
+
+    runner_row = await asyncio.to_thread(
+        run_readonly_command,
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            args.manager_host,
+            (
+                f"docker service ls --filter name={CHANNEL_OPS_RUNNER_SERVICE} "
+                "--format '{{.Name}}|{{.Replicas}}'"
+            ),
+        ],
+    )
+    if runner_row != f"{CHANNEL_OPS_RUNNER_SERVICE}|1/1":
+        raise CanaryError("deployed ChannelOps runner service is not exactly 1/1")
+    runner_image = await asyncio.to_thread(
+        run_readonly_command,
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            args.manager_host,
+            (
+                f"docker service inspect {CHANNEL_OPS_RUNNER_SERVICE} "
+                "--format '{{.Spec.TaskTemplate.ContainerSpec.Image}}'"
+            ),
+        ],
+    )
+    if expected_image_tag not in runner_image.split("@", 1)[0]:
+        raise CanaryError("deployed ChannelOps runner image does not match the source commit")
+    runner_environment = await asyncio.to_thread(
+        run_readonly_command,
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            args.manager_host,
+            (
+                f"docker service inspect {CHANNEL_OPS_RUNNER_SERVICE} "
+                "--format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}'"
+            ),
+        ],
+    )
+    task_wait_seconds = runner_task_wait_seconds(runner_environment)
     await request_json(client, "GET", f"{api_root(args.api_url)}/health")
     return {
         "source_commit": source_commit,
@@ -301,6 +378,10 @@ async def deployment_readiness(args: argparse.Namespace, client: httpx.AsyncClie
         "publisher_image": publisher_image,
         "publisher_expected_commit_tag": expected_image_tag,
         "publisher_constraints": sorted(constraint_rows),
+        "channelops_runner_service": CHANNEL_OPS_RUNNER_SERVICE,
+        "channelops_runner_replicas": "1/1",
+        "channelops_runner_image": runner_image,
+        "channelops_task_wait_seconds": task_wait_seconds,
     }
 
 
@@ -1429,11 +1510,12 @@ async def execute_canary(
     atomic_write_json(path, evidence)
 
     evidence["queue"] = {"agent_tick_id": graph["agent_tick_id"]}
+    task_wait_seconds = float(evidence["deployment"]["channelops_task_wait_seconds"])
     task, plan_item = await wait_for_single_task_and_preapprove(
         db,
         uuid.UUID(graph["channel_id"]),
         evidence["run_id"],
-        min(args.timeout_seconds, 60.0),
+        min(args.timeout_seconds, task_wait_seconds),
     )
     evidence["task"] = {
         "id": str(task.id),

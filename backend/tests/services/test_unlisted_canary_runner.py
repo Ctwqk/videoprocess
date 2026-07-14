@@ -237,6 +237,22 @@ def test_schedule_close_failure_creates_sanitized_failure_after_success():
     }
 
 
+def test_runner_task_wait_covers_deployed_daytime_throttle():
+    runner = load_runner()
+
+    wait_seconds = runner.runner_task_wait_seconds(
+        "\n".join(
+            (
+                "CHANNELOPS_RUNNER_POLL_SECONDS=5",
+                "CHANNELOPS_THROTTLE_ENABLED=true",
+                "CHANNELOPS_THROTTLE_RUNNER_POLL_SECONDS=300",
+            )
+        )
+    )
+
+    assert wait_seconds == 360
+
+
 @pytest.mark.anyio
 async def test_backlog_ignores_only_global_cleanup_maintenance(db: AsyncSession):
     runner = load_runner()
