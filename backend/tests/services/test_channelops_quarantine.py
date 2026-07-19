@@ -14,6 +14,7 @@ from app.models.channel_agent import (
     PublicationRecord,
 )
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.models.schedule import RuntimeSchedule
 from app.services.channelops_quarantine import (
     QUARANTINE_REASON,
     UnknownChannelError,
@@ -21,6 +22,7 @@ from app.services.channelops_quarantine import (
     _cancel_node,
     quarantine_channelops_backlog,
 )
+from app.services.schedule_service import VIDEO_SCHEDULE_SERVICE, VideoScheduleState
 
 
 TABLES = (
@@ -31,8 +33,10 @@ TABLES = (
     FeedbackSnapshot.__table__,
     Job.__table__,
     NodeExecution.__table__,
+    RuntimeSchedule.__table__,
 )
 NOW = datetime(2026, 7, 12, 18, 0, tzinfo=timezone.utc)
+SOAK_REASON = "automated_channelops_soak_guard"
 
 
 @pytest.fixture
@@ -325,6 +329,89 @@ async def test_second_apply_is_idempotent(quarantine_session):
     }
     await quarantine_session.refresh(rows["active_task"])
     assert len(rows["active_task"].transition_history_json) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_uses_custom_reason_and_closes_schedule_atomically(quarantine_session):
+    rows = await _seed_graph(quarantine_session)
+
+    report = await quarantine_channelops_backlog(
+        quarantine_session,
+        rows["target"].id,
+        apply=True,
+        now=NOW,
+        reason=SOAK_REASON,
+        close_schedule=True,
+    )
+
+    schedule = await quarantine_session.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+    assert schedule is not None
+    assert schedule.state == VideoScheduleState.CLOSED.value
+    assert schedule.updated_by == SOAK_REASON
+    assert report["schedule"] == {
+        "requested_close": True,
+        "changed": True,
+        "previous_state": None,
+        "final_state": "CLOSED",
+    }
+    assert rows["target"].halt_reason == SOAK_REASON
+    assert rows["active_task"].blocked_by_guard == SOAK_REASON
+    assert rows["active_job"].error_message == SOAK_REASON
+    assert rows["active_node"].error_message == SOAK_REASON
+    assert rows["running"].last_error == SOAK_REASON
+    assert rows["active_task"].transition_history_json[-1] == {
+        "from": "producing",
+        "to": "held",
+        "actor": SOAK_REASON,
+        "at": NOW.isoformat(),
+    }
+    await quarantine_session.commit()
+
+    second = await quarantine_channelops_backlog(
+        quarantine_session,
+        rows["target"].id,
+        apply=True,
+        now=NOW,
+        reason=SOAK_REASON,
+        close_schedule=True,
+    )
+
+    assert second["schedule"] == {
+        "requested_close": True,
+        "changed": False,
+        "previous_state": "CLOSED",
+        "final_state": "CLOSED",
+    }
+    await quarantine_session.refresh(rows["active_task"])
+    assert len(rows["active_task"].transition_history_json) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["", "x" * 256])
+async def test_rejects_invalid_reason_before_mutation(quarantine_session, reason):
+    rows = await _seed_graph(quarantine_session)
+
+    with pytest.raises(ValueError, match="reason"):
+        await quarantine_channelops_backlog(
+            quarantine_session,
+            rows["target"].id,
+            apply=True,
+            now=NOW,
+            reason=reason,
+            close_schedule=True,
+        )
+
+    await quarantine_session.refresh(rows["target"])
+    await quarantine_session.refresh(rows["active_task"])
+    await quarantine_session.refresh(rows["active_job"])
+    await quarantine_session.refresh(rows["active_node"])
+    await quarantine_session.refresh(rows["running"])
+    assert rows["target"].halted_at is None
+    assert rows["active_task"].state == "producing"
+    assert rows["active_job"].status == JobStatus.RUNNING
+    assert rows["active_node"].status == NodeStatus.RUNNING
+    assert rows["running"].status == "running"
+    assert await quarantine_session.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE) is None
 
 
 @pytest.mark.asyncio

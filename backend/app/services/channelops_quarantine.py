@@ -16,6 +16,8 @@ from app.models.channel_agent import (
     PublicationRecord,
 )
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.models.schedule import RuntimeSchedule
+from app.services.schedule_service import VIDEO_SCHEDULE_SERVICE, VideoScheduleState
 
 
 QUARANTINE_REASON = "operator_quarantine_before_unlisted_canary"
@@ -44,8 +46,13 @@ async def quarantine_channelops_backlog(
     *,
     apply: bool = False,
     now: datetime | None = None,
+    reason: str = QUARANTINE_REASON,
+    close_schedule: bool = False,
 ) -> dict[str, Any]:
     """Report or quarantine one channel's runnable backlog in one transaction."""
+    if not reason or len(reason) > 255:
+        raise ValueError("reason must be between 1 and 255 characters")
+
     resolved_channel_id = _uuid(channel_id)
     changed_at = now or datetime.now(timezone.utc)
 
@@ -79,7 +86,7 @@ async def quarantine_channelops_backlog(
             for task in tasks
             if task.id not in publication_task_ids
             and task.state not in TERMINAL_TASK_STATES
-            and not _already_quarantined(task)
+            and not _already_quarantined(task, reason)
         ]
         changed_task_ids = {task.id for task in changed_tasks}
         retained_tasks = [task for task in tasks if task.id not in changed_task_ids]
@@ -107,17 +114,48 @@ async def quarantine_channelops_backlog(
         changed_queue_ids = {item.id for item in changed_queue_items}
         retained_queue_items = [item for item in queue_items if item.id not in changed_queue_ids]
 
-        channel_changed = channel.halted_at is None or channel.halt_reason != QUARANTINE_REASON
+        schedule = None
+        previous_schedule_state = None
+        if close_schedule:
+            schedule_stmt = select(RuntimeSchedule).where(
+                RuntimeSchedule.service_name == VIDEO_SCHEDULE_SERVICE
+            )
+            if apply:
+                schedule_stmt = schedule_stmt.with_for_update()
+            schedule = (await db.execute(schedule_stmt)).scalar_one_or_none()
+            previous_schedule_state = schedule.state if schedule is not None else None
+        schedule_changed = (
+            close_schedule and previous_schedule_state != VideoScheduleState.CLOSED.value
+        )
+        final_schedule_state = (
+            VideoScheduleState.CLOSED.value if close_schedule else previous_schedule_state
+        )
+
+        channel_changed = channel.halted_at is None or channel.halt_reason != reason
         if apply:
-            _apply_channel_halt(channel, changed_at)
+            _apply_channel_halt(channel, changed_at, reason)
             for task in changed_tasks:
-                _hold_task(task, changed_at)
+                _hold_task(task, changed_at, reason)
             for job in changed_jobs:
-                _cancel_job(job, changed_at)
+                _cancel_job(job, changed_at, reason)
             for node in changed_nodes:
-                _cancel_node(node, changed_at)
+                _cancel_node(node, changed_at, reason)
             for item in changed_queue_items:
-                _dead_letter_queue_item(item, changed_at)
+                _dead_letter_queue_item(item, changed_at, reason)
+            if close_schedule:
+                if schedule is None:
+                    db.add(
+                        RuntimeSchedule(
+                            service_name=VIDEO_SCHEDULE_SERVICE,
+                            state=VideoScheduleState.CLOSED.value,
+                            updated_by=reason,
+                            updated_at=changed_at,
+                        )
+                    )
+                else:
+                    schedule.state = VideoScheduleState.CLOSED.value
+                    schedule.updated_by = reason
+                    schedule.updated_at = changed_at
 
         changed_ids = {
             "channel_ids": [str(channel.id)] if channel_changed else [],
@@ -137,8 +175,14 @@ async def quarantine_channelops_backlog(
         return {
             "channel_id": str(channel.id),
             "applied": apply,
-            "reason": QUARANTINE_REASON,
+            "reason": reason,
             "generated_at": changed_at.isoformat(),
+            "schedule": {
+                "requested_close": close_schedule,
+                "changed": schedule_changed,
+                "previous_state": previous_schedule_state,
+                "final_state": final_schedule_state,
+            },
             "changed_ids": changed_ids,
             "retained_ids": retained_ids,
             "counts": {
@@ -199,53 +243,53 @@ async def _nodes_for_jobs(
     return list((await db.execute(stmt)).scalars().all())
 
 
-def _already_quarantined(task: ProductionTask) -> bool:
+def _already_quarantined(task: ProductionTask, reason: str) -> bool:
     return (
         task.state == "held"
-        and task.blocked_by_guard == QUARANTINE_REASON
-        and task.failure_reason == QUARANTINE_REASON
+        and task.blocked_by_guard == reason
+        and task.failure_reason == reason
     )
 
 
-def _apply_channel_halt(channel: ChannelProfile, now: datetime) -> None:
+def _apply_channel_halt(channel: ChannelProfile, now: datetime, reason: str) -> None:
     if channel.halted_at is None:
         channel.halted_at = now
-    channel.halt_reason = QUARANTINE_REASON
+    channel.halt_reason = reason
 
 
-def _hold_task(task: ProductionTask, now: datetime) -> None:
+def _hold_task(task: ProductionTask, now: datetime, reason: str) -> None:
     previous_state = task.state
     task.state = "held"
     task.state_updated_at = now
-    task.blocked_by_guard = QUARANTINE_REASON
-    task.failure_reason = QUARANTINE_REASON
+    task.blocked_by_guard = reason
+    task.failure_reason = reason
     task.transition_history_json = [
         *list(task.transition_history_json or []),
         {
             "from": previous_state,
             "to": "held",
-            "actor": QUARANTINE_REASON,
+            "actor": reason,
             "at": now.isoformat(),
         },
     ]
 
 
-def _cancel_job(job: Job, now: datetime) -> None:
+def _cancel_job(job: Job, now: datetime, reason: str = QUARANTINE_REASON) -> None:
     job.status = JobStatus.CANCELLED
     job.completed_at = _naive_utc(now)
-    job.error_message = QUARANTINE_REASON
+    job.error_message = reason
 
 
-def _cancel_node(node: NodeExecution, now: datetime) -> None:
+def _cancel_node(node: NodeExecution, now: datetime, reason: str = QUARANTINE_REASON) -> None:
     node.status = NodeStatus.CANCELLED
     node.completed_at = _naive_utc(now)
     node.worker_id = None
-    node.error_message = QUARANTINE_REASON
+    node.error_message = reason
 
 
-def _dead_letter_queue_item(item: ChannelOpsQueueItem, now: datetime) -> None:
+def _dead_letter_queue_item(item: ChannelOpsQueueItem, now: datetime, reason: str) -> None:
     item.status = "dead_lettered"
-    item.last_error = QUARANTINE_REASON
+    item.last_error = reason
     item.dead_letter_at = now
     item.locked_at = None
     item.locked_by = None
