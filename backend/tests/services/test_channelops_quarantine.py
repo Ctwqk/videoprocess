@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models.channel_agent import (
@@ -15,6 +17,7 @@ from app.models.channel_agent import (
 )
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.schedule import RuntimeSchedule
+from app.services import channelops_quarantine as channelops_quarantine_service
 from app.services.channelops_quarantine import (
     QUARANTINE_REASON,
     UnknownChannelError,
@@ -49,6 +52,31 @@ async def quarantine_session():
     async with factory() as session:
         yield session
     await engine.dispose()
+
+
+@pytest.fixture
+async def concurrent_quarantine_session_factory(tmp_path):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'channelops-quarantine.sqlite3'}",
+        connect_args={"timeout": 10},
+    )
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def configure_sqlite_connection(dbapi_connection, _):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA busy_timeout = 10000")
+        cursor.close()
+
+    async with engine.begin() as connection:
+        await connection.exec_driver_sql("PRAGMA journal_mode = WAL")
+        for table in TABLES:
+            await connection.run_sync(table.create)
+
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield factory
+    finally:
+        await engine.dispose()
 
 
 def _task(channel_id: uuid.UUID, *, state: str, job_id: uuid.UUID | None = None) -> ProductionTask:
@@ -434,6 +462,72 @@ async def test_close_schedule_reuses_conflicting_schedule_row(quarantine_session
     assert schedule.updated_by == SOAK_REASON
     assert rows["target"].halt_reason == SOAK_REASON
     assert rows["active_task"].blocked_by_guard == SOAK_REASON
+
+
+@pytest.mark.asyncio
+async def test_concurrent_schedule_close_commits_both_quarantines(
+    concurrent_quarantine_session_factory,
+    monkeypatch,
+):
+    async with concurrent_quarantine_session_factory() as seed_session:
+        rows = await _seed_graph(seed_session)
+        channel_ids = (rows["target"].id, rows["other"].id)
+        assert await seed_session.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE) is None
+
+    schedule_insert_barrier = asyncio.Barrier(2)
+    original_create_or_lock = channelops_quarantine_service._create_or_lock_runtime_schedule
+
+    async def coordinate_schedule_create(*args, **kwargs):
+        await schedule_insert_barrier.wait()
+        return await original_create_or_lock(*args, **kwargs)
+
+    monkeypatch.setattr(
+        channelops_quarantine_service,
+        "_create_or_lock_runtime_schedule",
+        coordinate_schedule_create,
+    )
+
+    async def quarantine(channel_id):
+        async with concurrent_quarantine_session_factory() as session:
+            return await quarantine_channelops_backlog(
+                session,
+                channel_id,
+                apply=True,
+                now=NOW,
+                reason=SOAK_REASON,
+                close_schedule=True,
+            )
+
+    reports = await asyncio.wait_for(
+        asyncio.gather(*(quarantine(channel_id) for channel_id in channel_ids)),
+        timeout=15,
+    )
+
+    assert all(report["applied"] for report in reports)
+    assert sorted(report["schedule"]["changed"] for report in reports) == [False, True]
+    assert all(report["schedule"]["final_state"] == "CLOSED" for report in reports)
+    assert sorted(
+        report["schedule"]["previous_state"] for report in reports if report["schedule"]["previous_state"]
+    ) == ["CLOSED"]
+    assert sum(report["schedule"]["previous_state"] is None for report in reports) == 1
+    async with concurrent_quarantine_session_factory() as verification_session:
+        schedules = list(
+            (
+                await verification_session.execute(
+                    select(RuntimeSchedule).where(
+                        RuntimeSchedule.service_name == VIDEO_SCHEDULE_SERVICE
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(schedules) == 1
+        assert schedules[0].state == VideoScheduleState.CLOSED.value
+        for channel_id in channel_ids:
+            channel = await verification_session.get(ChannelProfile, channel_id)
+            assert channel is not None
+            assert channel.halt_reason == SOAK_REASON
 
 
 @pytest.mark.asyncio
