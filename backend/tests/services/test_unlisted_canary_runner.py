@@ -89,6 +89,85 @@ def test_evidence_path_distinguishes_preflight_mode():
     )
 
 
+def test_ssh_readonly_command_adds_optional_jump():
+    runner = load_runner()
+
+    assert runner.ssh_readonly_command("10.0.0.127", "hostname") == [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "10.0.0.127",
+        "hostname",
+    ]
+    assert runner.ssh_readonly_command(
+        "10.0.0.150",
+        "hostname",
+        jump_host="10.0.0.127",
+    ) == [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-J",
+        "10.0.0.127",
+        "10.0.0.150",
+        "hostname",
+    ]
+
+
+@pytest.mark.anyio
+async def test_deployment_readiness_routes_manager_ssh_through_jump(monkeypatch):
+    runner = load_runner()
+    commit = "a" * 40
+    responses = iter(
+        (
+            commit,
+            commit,
+            "publisher|1/1",
+            "vp-worker:deploy-aaaaaaaaaaaa",
+            "node.labels.vp.publisher==true\nnode.hostname==ccttww-lap",
+            f"{runner.CHANNEL_OPS_RUNNER_SERVICE}|1/1",
+            "vp-runner:deploy-aaaaaaaaaaaa",
+            "CHANNELOPS_RUNNER_POLL_SECONDS=5\nCHANNELOPS_THROTTLE_ENABLED=false",
+        )
+    )
+    commands: list[list[str]] = []
+
+    def run_readonly(command, **_kwargs):
+        commands.append(command)
+        return next(responses)
+
+    async def request_json(*_args, **_kwargs):
+        return {"status": "ok"}
+
+    monkeypatch.setattr(runner, "run_readonly_command", run_readonly)
+    monkeypatch.setattr(runner, "request_json", request_json)
+    args = SimpleNamespace(
+        api_url="http://api",
+        runtime_host="runtime-host",
+        manager_host="manager-host",
+        manager_ssh_jump="jump-host",
+        publisher_service="publisher",
+    )
+
+    deployment = await runner.deployment_readiness(args, object())
+
+    runtime_commands = [command for command in commands if "runtime-host" in command]
+    manager_commands = [command for command in commands if "manager-host" in command]
+    assert len(runtime_commands) == 1
+    assert "-J" not in runtime_commands[0]
+    assert len(manager_commands) == 6
+    assert all(
+        command[command.index("-J") + 1] == "jump-host"
+        for command in manager_commands
+    )
+    assert deployment["manager_host"] == "manager-host"
+    assert deployment["manager_ssh_jump"] == "jump-host"
+
+
 @pytest.mark.anyio
 async def test_mode_aware_dispatch_and_schedule_close(monkeypatch: pytest.MonkeyPatch):
     runner = load_runner()

@@ -307,7 +307,7 @@ git diff --check
 
 Expected: all commands exit 0.
 
-- [ ] **Step 2: Push and observe automatic deployment**
+- [x] **Step 2: Push and observe automatic deployment**
 
 ```bash
 git push origin main
@@ -328,3 +328,26 @@ Expected: exit 0 with a local evidence path; schedule remains `CLOSED`; active j
 - [ ] **Step 4: Close the tunnel and audit evidence**
 
 Validate JSON with `jq empty`, inspect file mode `0600`, confirm no secret URLs or tokens are present, and re-query production counts to prove no state was created.
+
+### Task 4: Express The 127 To 150 SSH Jump
+
+**Files:**
+- Modify: `scripts/run_vp_unlisted_canary.py`
+- Test: `backend/tests/services/test_unlisted_canary_runner.py`
+- Modify: `tests/test_vp_unlisted_canary_scripts.sh`
+
+- [x] **Step 1: Write and run a failing command-builder test**
+
+Prove the no-jump command stays direct and the manager command places
+`-J 10.0.0.127` before `10.0.0.150`.
+
+- [x] **Step 2: Implement and wire `--manager-ssh-jump`**
+
+Use one command builder for runtime and manager SSH readiness calls. Apply the
+jump only to manager calls and validate the optional value with
+`READINESS_NAME_PATTERN` before any database connection.
+
+- [x] **Step 3: Verify and commit**
+
+Run the runner tests, shell contract, changed-file Ruff, Python compile, and
+`git diff --check`; then commit the focused fix.

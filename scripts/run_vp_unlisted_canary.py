@@ -122,6 +122,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--redis-url", default=os.environ.get("REDIS_URL", ""))
     parser.add_argument("--runtime-host", default="10.0.0.127")
     parser.add_argument("--manager-host", default="10.0.0.150")
+    parser.add_argument("--manager-ssh-jump", default="")
     parser.add_argument("--publisher-service", default="vp-youtube-publisher-swarm")
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--timeout-seconds", type=float, default=1_200.0)
@@ -219,6 +220,19 @@ def run_readonly_command(command: list[str], *, timeout_seconds: float = 30.0) -
     return completed.stdout.strip()
 
 
+def ssh_readonly_command(
+    host: str,
+    remote_command: str,
+    *,
+    jump_host: str = "",
+) -> list[str]:
+    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    if jump_host:
+        command.extend(("-J", jump_host))
+    command.extend((host, remote_command))
+    return command
+
+
 async def request_json(
     client: httpx.AsyncClient,
     method: str,
@@ -294,58 +308,45 @@ async def deployment_readiness(args: argparse.Namespace, client: httpx.AsyncClie
     )
     deployed_commit = await asyncio.to_thread(
         run_readonly_command,
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
+        ssh_readonly_command(
             args.runtime_host,
             "tr -d '\\n' < /Users/wenjieliu/VideoProcess-app/.deploy-sync-source-commit",
-        ],
+        ),
     )
     if not source_commit or source_commit != deployed_commit:
         raise CanaryError("source/deployed commit mismatch")
 
     service_row = await asyncio.to_thread(
         run_readonly_command,
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
+        ssh_readonly_command(
             args.manager_host,
             f"docker service ls --filter name={args.publisher_service} --format '{{{{.Name}}}}|{{{{.Replicas}}}}'",
-        ],
+            jump_host=args.manager_ssh_jump,
+        ),
     )
     if service_row != f"{args.publisher_service}|1/1":
         raise CanaryError("deployed publisher service is not exactly 1/1")
     publisher_image = await asyncio.to_thread(
         run_readonly_command,
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
+        ssh_readonly_command(
             args.manager_host,
             f"docker service inspect {args.publisher_service} --format '{{{{.Spec.TaskTemplate.ContainerSpec.Image}}}}'",
-        ],
+            jump_host=args.manager_ssh_jump,
+        ),
     )
     expected_image_tag = f":deploy-{source_commit[:12]}"
     if expected_image_tag not in publisher_image.split("@", 1)[0]:
         raise CanaryError("deployed publisher image does not match the source commit")
     constraints = await asyncio.to_thread(
         run_readonly_command,
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
+        ssh_readonly_command(
             args.manager_host,
             (
                 f"docker service inspect {args.publisher_service} "
                 "--format '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'"
             ),
-        ],
+            jump_host=args.manager_ssh_jump,
+        ),
     )
     constraint_rows = {row.strip() for row in constraints.splitlines() if row.strip()}
     if "node.labels.vp.publisher==true" not in constraint_rows or "node.hostname==ccttww-lap" not in constraint_rows:
@@ -353,54 +354,48 @@ async def deployment_readiness(args: argparse.Namespace, client: httpx.AsyncClie
 
     runner_row = await asyncio.to_thread(
         run_readonly_command,
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
+        ssh_readonly_command(
             args.manager_host,
             (
                 f"docker service ls --filter name={CHANNEL_OPS_RUNNER_SERVICE} "
                 "--format '{{.Name}}|{{.Replicas}}'"
             ),
-        ],
+            jump_host=args.manager_ssh_jump,
+        ),
     )
     if runner_row != f"{CHANNEL_OPS_RUNNER_SERVICE}|1/1":
         raise CanaryError("deployed ChannelOps runner service is not exactly 1/1")
     runner_image = await asyncio.to_thread(
         run_readonly_command,
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
+        ssh_readonly_command(
             args.manager_host,
             (
                 f"docker service inspect {CHANNEL_OPS_RUNNER_SERVICE} "
                 "--format '{{.Spec.TaskTemplate.ContainerSpec.Image}}'"
             ),
-        ],
+            jump_host=args.manager_ssh_jump,
+        ),
     )
     if expected_image_tag not in runner_image.split("@", 1)[0]:
         raise CanaryError("deployed ChannelOps runner image does not match the source commit")
     runner_environment = await asyncio.to_thread(
         run_readonly_command,
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
+        ssh_readonly_command(
             args.manager_host,
             (
                 f"docker service inspect {CHANNEL_OPS_RUNNER_SERVICE} "
                 "--format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}'"
             ),
-        ],
+            jump_host=args.manager_ssh_jump,
+        ),
     )
     task_wait_seconds = runner_task_wait_seconds(runner_environment)
     await request_json(client, "GET", f"{api_root(args.api_url)}/health")
     return {
         "source_commit": source_commit,
         "deployed_commit": deployed_commit,
+        "manager_host": args.manager_host,
+        "manager_ssh_jump": args.manager_ssh_jump or None,
         "publisher_service": args.publisher_service,
         "publisher_replicas": "1/1",
         "publisher_image": publisher_image,
@@ -1879,6 +1874,9 @@ def main() -> int:
         if not READINESS_NAME_PATTERN.fullmatch(value):
             print(f"{label} contains unsupported characters", file=sys.stderr)
             return 2
+    if args.manager_ssh_jump and not READINESS_NAME_PATTERN.fullmatch(args.manager_ssh_jump):
+        print("--manager-ssh-jump contains unsupported characters", file=sys.stderr)
+        return 2
     install_signal_guards()
     label = "canary preflight" if mode == MODE_PREFLIGHT else "unlisted canary"
     try:

@@ -25,6 +25,12 @@ The two execution flags are mutually exclusive:
 - Supplying neither or both exits with status 2 before opening a database
   connection.
 
+The readiness topology is explicit. `--manager-ssh-jump` is optional and, when
+set, is passed to manager-host read-only SSH commands as `ssh -J <jump>`. It is
+needed when the operator machine reaches 150 through 127. Runtime-host checks
+remain direct, and the jump value is subject to the same restricted hostname
+validation as the runtime and manager hosts.
+
 ## Read-Only Contract
 
 Preflight performs only these operations:

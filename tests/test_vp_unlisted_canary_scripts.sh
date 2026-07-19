@@ -20,6 +20,7 @@ grep -Fq -- '--evidence' "$QUARANTINE"
 
 grep -Fq -- '--confirm-live-unlisted' "$CANARY"
 grep -Fq -- '--preflight-only' "$CANARY"
+grep -Fq -- '--manager-ssh-jump' "$CANARY"
 grep -Fq 'MODE_PREFLIGHT = "preflight_only"' "$CANARY"
 grep -Fq 'DATABASE_URL' "$CANARY"
 grep -Fq 'pg_try_advisory_lock' "$CANARY"
@@ -47,6 +48,10 @@ grep -Fq 'never deletes the YouTube video' "$CANARY"
 grep -Fq 'operator_canary_failure' "$CANARY"
 grep -Fq 'CANARY_PLAN_DELAY_SECONDS = 300' "$CANARY"
 grep -Fq 'mark_schedule_close_failure(evidence, close_error)' "$CANARY"
+if [[ "$(grep -Fc 'jump_host=args.manager_ssh_jump' "$CANARY")" -ne 6 ]]; then
+  echo "FAIL: every manager readiness SSH call must use the configured jump" >&2
+  exit 1
+fi
 if grep -Fq '/api/v1/channel-agent' "$CANARY"; then
   echo "FAIL: canary runner must not call the unexposed ChannelAgent HTTP API" >&2
   exit 1
