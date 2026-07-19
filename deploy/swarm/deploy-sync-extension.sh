@@ -631,68 +631,250 @@ vp_install_soak_watch() {
     return 1
   fi
 
-  local target="$sync_root/bin/channelops-soak-watch.sh"
-  local log_file="$sync_root/logs/channelops-soak-watch.log"
-  mkdir -p "$sync_root/bin" "$sync_root/logs" "$sync_root/state" || return 1
-  install -m 0755 "$source" "$target" || return 1
+  (
+    local target="$sync_root/bin/channelops-soak-watch.sh"
+    local log_file="$sync_root/logs/channelops-soak-watch.log"
+    local cron_begin="# BEGIN VIDEOPROCESS SOAK WATCH"
+    local cron_end="# END VIDEOPROCESS SOAK WATCH"
+    local cron_command="*/30 * * * * DEPLOY_GITHUB_SYNC_ROOT=$sync_root $target >> $log_file 2>&1"
+    local temp_dir=""
+    local watch_txn_dir=""
+    local current_cron=""
+    local next_cron=""
+    local verify_cron=""
+    local prior_cron_absent=false
+    local watcher_had_prior=false
+    local watcher_replaced=false
+    local cron_may_have_changed=false
+    local transaction_status=1
+    local failure_reason=""
+    local vp_soak_read_absent=false
 
-  local cron_begin="# BEGIN VIDEOPROCESS CHANNELOPS SOAK WATCH"
-  local cron_end="# END VIDEOPROCESS CHANNELOPS SOAK WATCH"
-  local cron_command="*/5 * * * * DEPLOY_GITHUB_SYNC_ROOT=$sync_root $target >> $log_file 2>&1"
-  local temp_dir
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/vp-soak-watch-cron.XXXXXX")" || return 1
-  local current_cron="$temp_dir/current"
-  local next_cron="$temp_dir/next"
+    vp_soak_watch_is_no_crontab_error() {
+      awk 'NR == 1 && /^no crontab for .+$/ { matched=1; next }
+        { matched=0; exit }
+        END { exit matched ? 0 : 1 }' "$1"
+    }
 
-  if ! crontab -l >"$current_cron" 2>/dev/null; then
-    : >"$current_cron"
-  fi
-  if ! awk -v begin="$cron_begin" -v end="$cron_end" -v watcher="channelops-soak-watch.sh" '
-    BEGIN { in_managed = 0; invalid = 0 }
-    $0 == begin {
-      if (in_managed) {
-        invalid = 1
-        exit
-      }
-      in_managed = 1
-      next
+    vp_soak_watch_read_cron() {
+      local output="$1"
+      local error_output="$2"
+      vp_soak_read_absent=false
+      if LC_ALL=C crontab -l >"$output" 2>"$error_output"; then
+        return 0
+      fi
+      if vp_soak_watch_is_no_crontab_error "$error_output"; then
+        : >"$output"
+        vp_soak_read_absent=true
+        return 0
+      fi
+      cat "$error_output" >&2
+      return 1
     }
-    $0 == end {
-      if (!in_managed) {
-        invalid = 1
-        exit
-      }
-      in_managed = 0
-      next
-    }
-    in_managed { next }
-    $0 !~ /^[[:space:]]*#/ && index($0, watcher) != 0 { next }
-    { print }
-    END {
-      if (in_managed) {
-        invalid = 1
-      }
-      if (invalid) {
-        exit 1
-      }
-    }
-  ' "$current_cron" >"$next_cron"; then
-    echo "ChannelOps soak watcher managed cron block is malformed" >&2
-    rm -rf "$temp_dir"
-    return 1
-  fi
 
-  if ! printf '%s\n%s\n%s\n' "$cron_begin" "$cron_command" "$cron_end" >>"$next_cron"; then
-    echo "ChannelOps soak watcher managed cron render failed" >&2
-    rm -rf "$temp_dir"
-    return 1
-  fi
-  if ! crontab "$next_cron"; then
-    echo "ChannelOps soak watcher crontab install failed" >&2
-    rm -rf "$temp_dir"
-    return 1
-  fi
-  rm -rf "$temp_dir"
+    vp_soak_watch_cleanup() {
+      local cleanup_status=0
+      if [[ -n "$watch_txn_dir" ]]; then
+        if rm -rf "$watch_txn_dir"; then
+          watch_txn_dir=""
+        else
+          cleanup_status=1
+        fi
+      fi
+      if [[ -n "$temp_dir" ]]; then
+        if rm -rf "$temp_dir"; then
+          temp_dir=""
+        else
+          cleanup_status=1
+        fi
+      fi
+      return "$cleanup_status"
+    }
+
+    vp_soak_watch_restore() {
+      local restore_status=0
+      local rollback_read="$temp_dir/rollback-read"
+      local rollback_error="$temp_dir/rollback-error"
+
+      if [[ "$cron_may_have_changed" == true ]]; then
+        if [[ "$prior_cron_absent" == true ]]; then
+          if ! LC_ALL=C crontab -r 2>"$rollback_error" \
+            && ! vp_soak_watch_is_no_crontab_error "$rollback_error"; then
+            cat "$rollback_error" >&2
+            restore_status=1
+          elif ! vp_soak_watch_read_cron "$rollback_read" "$rollback_error" \
+            || [[ "$vp_soak_read_absent" != true ]]; then
+            echo "ChannelOps soak watcher no-crontab rollback verification failed" >&2
+            restore_status=1
+          fi
+        else
+          if ! LC_ALL=C crontab "$current_cron"; then
+            echo "ChannelOps soak watcher crontab rollback install failed" >&2
+            restore_status=1
+          elif ! vp_soak_watch_read_cron "$rollback_read" "$rollback_error" \
+            || [[ "$vp_soak_read_absent" == true ]] \
+            || ! cmp -s "$current_cron" "$rollback_read"; then
+            echo "ChannelOps soak watcher crontab rollback verification failed" >&2
+            restore_status=1
+          fi
+        fi
+      fi
+
+      if [[ "$watcher_replaced" == true ]]; then
+        if [[ "$watcher_had_prior" == true ]]; then
+          if ! cp -p "$watch_txn_dir/prior-watcher" "$watch_txn_dir/restore-watcher" \
+            || ! mv -f "$watch_txn_dir/restore-watcher" "$target" \
+            || ! cmp -s "$watch_txn_dir/prior-watcher" "$target"; then
+            echo "ChannelOps soak watcher target rollback failed" >&2
+            restore_status=1
+          fi
+        elif ! rm -f "$target" || [[ -e "$target" ]]; then
+          echo "ChannelOps soak watcher target absence rollback failed" >&2
+          restore_status=1
+        fi
+      fi
+      return "$restore_status"
+    }
+
+    vp_soak_watch_interrupted() {
+      local signal_name="$1"
+      local signal_status="$2"
+      trap - HUP INT TERM
+      echo "ChannelOps soak watcher install interrupted by $signal_name" >&2
+      if ! vp_soak_watch_restore; then
+        echo "ChannelOps soak watcher rollback failed after $signal_name" >&2
+      fi
+      if ! vp_soak_watch_cleanup; then
+        echo "ChannelOps soak watcher cleanup failed after $signal_name" >&2
+      fi
+      exit "$signal_status"
+    }
+
+    trap 'vp_soak_watch_interrupted HUP 129' HUP
+    trap 'vp_soak_watch_interrupted INT 130' INT
+    trap 'vp_soak_watch_interrupted TERM 143' TERM
+
+    while :; do
+      temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/vp-soak-watch-cron.XXXXXX")" || {
+        failure_reason="could not create cron transaction directory"
+        break
+      }
+      current_cron="$temp_dir/current"
+      next_cron="$temp_dir/next"
+      verify_cron="$temp_dir/verify"
+
+      if ! vp_soak_watch_read_cron "$current_cron" "$temp_dir/read-error"; then
+        failure_reason="crontab read failed"
+        break
+      fi
+      prior_cron_absent="$vp_soak_read_absent"
+
+      if ! awk -v begin="$cron_begin" -v end="$cron_end" \
+        -v target="$target" -v source="$source" \
+        -v root_assignment="DEPLOY_GITHUB_SYNC_ROOT=$sync_root" '
+        BEGIN { in_managed = 0; expected_end = ""; invalid = 0 }
+        $0 == begin {
+          if (in_managed) {
+            invalid = 1
+            exit
+          }
+          in_managed = 1
+          expected_end = end
+          next
+        }
+        $0 == end {
+          if (!in_managed || $0 != expected_end) {
+            invalid = 1
+            exit
+          }
+          in_managed = 0
+          expected_end = ""
+          next
+        }
+        in_managed { next }
+        $1 !~ /^#/ && NF >= 6 && ($6 == target || $6 == source) { next }
+        $1 !~ /^#/ && NF >= 7 && $6 == root_assignment && ($7 == target || $7 == source) { next }
+        { print }
+        END {
+          if (in_managed) {
+            invalid = 1
+          }
+          if (invalid) {
+            exit 1
+          }
+        }
+      ' "$current_cron" >"$next_cron"; then
+        failure_reason="managed cron block is malformed"
+        break
+      fi
+      if ! printf '%s\n%s\n%s\n' \
+        "$cron_begin" "$cron_command" "$cron_end" >>"$next_cron"; then
+        failure_reason="managed cron render failed"
+        break
+      fi
+
+      if ! mkdir -p "$sync_root/bin" "$sync_root/logs" "$sync_root/state"; then
+        failure_reason="watcher directories could not be created"
+        break
+      fi
+      watch_txn_dir="$(mktemp -d "$sync_root/bin/.channelops-soak-watch.txn.XXXXXX")" || {
+        failure_reason="watcher transaction directory could not be created"
+        break
+      }
+      if ! install -m 0755 "$source" "$watch_txn_dir/staged-watcher" \
+        || [[ ! -x "$watch_txn_dir/staged-watcher" ]] \
+        || ! cmp -s "$source" "$watch_txn_dir/staged-watcher"; then
+        failure_reason="staged watcher verification failed"
+        break
+      fi
+      if [[ -e "$target" ]]; then
+        watcher_had_prior=true
+        if ! cp -p "$target" "$watch_txn_dir/prior-watcher"; then
+          failure_reason="prior watcher backup failed"
+          break
+        fi
+      fi
+
+      watcher_replaced=true
+      if ! mv -f "$watch_txn_dir/staged-watcher" "$target"; then
+        failure_reason="atomic watcher install failed"
+        break
+      fi
+      cron_may_have_changed=true
+      if ! LC_ALL=C crontab "$next_cron"; then
+        failure_reason="crontab install failed"
+        break
+      fi
+      if ! vp_soak_watch_read_cron "$verify_cron" "$temp_dir/verify-error" \
+        || [[ "$vp_soak_read_absent" == true ]] \
+        || ! cmp -s "$next_cron" "$verify_cron"; then
+        failure_reason="crontab verification failed"
+        break
+      fi
+      if [[ ! -x "$target" ]] || ! cmp -s "$source" "$target"; then
+        failure_reason="installed watcher verification failed"
+        break
+      fi
+
+      transaction_status=0
+      break
+    done
+
+    if [[ "$transaction_status" -ne 0 ]]; then
+      if [[ -n "$failure_reason" ]]; then
+        echo "ChannelOps soak watcher $failure_reason" >&2
+      fi
+      if ! vp_soak_watch_restore; then
+        echo "ChannelOps soak watcher rollback failed" >&2
+      fi
+    fi
+    trap - HUP INT TERM
+    if ! vp_soak_watch_cleanup; then
+      echo "ChannelOps soak watcher cleanup failed" >&2
+      transaction_status=1
+    fi
+    exit "$transaction_status"
+  )
 }
 
 vp_apply_app_services() {

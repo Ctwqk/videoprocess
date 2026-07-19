@@ -9,6 +9,8 @@ ROOT="$TEST_ROOT/deploy-github-sync"
 FAKE_BIN="$TEST_ROOT/bin"
 FAKE_CRONTAB="$TEST_ROOT/crontab"
 FAKE_CRONTAB_CALLS="$TEST_ROOT/crontab-calls"
+FAKE_CRONTAB_FAILURE_USED="$TEST_ROOT/crontab-failure-used"
+FAKE_WATCH_TARGET="$ROOT/bin/channelops-soak-watch.sh"
 VP_SOAK_WATCH_SOURCE="$ROOT_DIR/deploy/swarm/channelops-soak-watch.sh"
 trap 'status=$?; rm -rf "$TEST_ROOT"; exit "$status"' EXIT
 
@@ -17,21 +19,94 @@ cat >"$FAKE_BIN/crontab" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
+printf 'crontab|%s|lc_all=%s\n' "$*" "${LC_ALL:-}" >>"$CALLS"
+
 if [[ "${1:-}" == "-l" ]]; then
+  if [[ "${FAKE_CRONTAB_READ_MODE:-normal}" == "error" ]]; then
+    echo 'crontab: permission denied' >&2
+    exit 1
+  fi
   if [[ -f "$FAKE_CRONTAB" ]]; then
     cat "$FAKE_CRONTAB"
     exit 0
   fi
+  echo 'no crontab for video-test' >&2
   exit 1
 fi
 
+if [[ "${1:-}" == "-r" ]]; then
+  if [[ "${FAKE_CRONTAB_ROLLBACK_FAIL:-false}" == "true" ]]; then
+    echo 'crontab: injected rollback removal failure' >&2
+    exit 1
+  fi
+  if [[ ! -f "$FAKE_CRONTAB" ]]; then
+    echo 'no crontab for video-test' >&2
+    exit 1
+  fi
+  rm -f "$FAKE_CRONTAB"
+  printf 'remove\n' >>"$FAKE_CRONTAB_CALLS"
+  exit 0
+fi
+
 [[ "$#" -eq 1 ]]
+if [[ "${FAKE_CRONTAB_ROLLBACK_FAIL:-false}" == "true" \
+  && -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
+  echo 'crontab: injected rollback install failure' >&2
+  exit 1
+fi
+case "${FAKE_CRONTAB_INSTALL_MODE:-normal}" in
+  fail-before)
+    if [[ ! -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
+      : >"$FAKE_CRONTAB_FAILURE_USED"
+      echo 'crontab: injected install failure' >&2
+      exit 1
+    fi
+    ;;
+  mutate-then-fail)
+    if [[ ! -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
+      cp "$1" "$FAKE_CRONTAB"
+      : >"$FAKE_CRONTAB_FAILURE_USED"
+      echo 'crontab: injected post-mutation failure' >&2
+      exit 1
+    fi
+    ;;
+  verify-mismatch)
+    if [[ ! -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
+      cp "$1" "$FAKE_CRONTAB"
+      printf '# injected verification mismatch\n' >>"$FAKE_CRONTAB"
+      : >"$FAKE_CRONTAB_FAILURE_USED"
+      printf 'write-mismatch\n' >>"$FAKE_CRONTAB_CALLS"
+      exit 0
+    fi
+    ;;
+  target-verify-mismatch)
+    if [[ ! -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
+      cp "$1" "$FAKE_CRONTAB"
+      printf '#!/usr/bin/env bash\nprintf "injected target mismatch\\n"\n' >"$FAKE_WATCH_TARGET"
+      chmod 0644 "$FAKE_WATCH_TARGET"
+      : >"$FAKE_CRONTAB_FAILURE_USED"
+      printf 'write-target-mismatch\n' >>"$FAKE_CRONTAB_CALLS"
+      exit 0
+    fi
+    ;;
+  signal-term)
+    if [[ ! -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
+      cp "$1" "$FAKE_CRONTAB"
+      : >"$FAKE_CRONTAB_FAILURE_USED"
+      kill -TERM "$PPID"
+      exit 0
+    fi
+    ;;
+esac
 cp "$1" "$FAKE_CRONTAB"
 printf 'write\n' >>"$FAKE_CRONTAB_CALLS"
-printf 'crontab|install\n' >>"$CALLS"
 EOF
 chmod +x "$FAKE_BIN/crontab"
-export CALLS FAKE_CRONTAB FAKE_CRONTAB_CALLS
+export CALLS FAKE_CRONTAB FAKE_CRONTAB_CALLS FAKE_CRONTAB_FAILURE_USED FAKE_WATCH_TARGET
+FAKE_CRONTAB_READ_MODE=normal
+FAKE_CRONTAB_INSTALL_MODE=normal
+FAKE_CRONTAB_ROLLBACK_FAIL=false
+export FAKE_CRONTAB_READ_MODE FAKE_CRONTAB_INSTALL_MODE FAKE_CRONTAB_ROLLBACK_FAIL
 PATH="$FAKE_BIN:$PATH"
 export PATH
 
@@ -39,10 +114,14 @@ cat >"$FAKE_CRONTAB" <<EOF
 MAILTO=video-ops@example.com
 0 2 * * * /usr/local/bin/backup-video-state
 */10 * * * * $VP_SOAK_WATCH_SOURCE >> $ROOT/logs/channelops-soak-watch.log 2>&1
-# BEGIN VIDEOPROCESS CHANNELOPS SOAK WATCH
+*/15 * * * * DEPLOY_GITHUB_SYNC_ROOT=$ROOT $ROOT/bin/channelops-soak-watch.sh >> $ROOT/logs/legacy-soak-watch.log 2>&1
+# BEGIN VIDEOPROCESS SOAK WATCH
 0 * * * * $ROOT/bin/channelops-soak-watch.sh --legacy
-# END VIDEOPROCESS CHANNELOPS SOAK WATCH
+# END VIDEOPROCESS SOAK WATCH
 @reboot /usr/local/bin/restore-video-network
+5 * * * * /usr/bin/sha256sum $ROOT/bin/channelops-soak-watch.sh >> $ROOT/logs/watcher-audit.log 2>&1
+10 * * * * /usr/local/bin/notify-ops channelops-soak-watch.sh
+# audit checksum notification for $ROOT/bin/channelops-soak-watch.sh
 EOF
 
 REPO_ROOT=/home/taiwei/deploy-github-sync/repos
@@ -84,6 +163,11 @@ printf() {
 
 log() {
   printf 'log|%s\n' "$*" >>"$CALLS"
+}
+
+mv() {
+  printf 'mv|%s\n' "$*" >>"$CALLS"
+  command mv "$@"
 }
 
 build_image_on_host() {
@@ -277,33 +361,42 @@ cat >"$TEST_ROOT/expected-crontab" <<EOF
 MAILTO=video-ops@example.com
 0 2 * * * /usr/local/bin/backup-video-state
 @reboot /usr/local/bin/restore-video-network
-# BEGIN VIDEOPROCESS CHANNELOPS SOAK WATCH
-*/5 * * * * DEPLOY_GITHUB_SYNC_ROOT=$ROOT $ROOT/bin/channelops-soak-watch.sh >> $ROOT/logs/channelops-soak-watch.log 2>&1
-# END VIDEOPROCESS CHANNELOPS SOAK WATCH
+5 * * * * /usr/bin/sha256sum $ROOT/bin/channelops-soak-watch.sh >> $ROOT/logs/watcher-audit.log 2>&1
+10 * * * * /usr/local/bin/notify-ops channelops-soak-watch.sh
+# audit checksum notification for $ROOT/bin/channelops-soak-watch.sh
+# BEGIN VIDEOPROCESS SOAK WATCH
+*/30 * * * * DEPLOY_GITHUB_SYNC_ROOT=$ROOT $ROOT/bin/channelops-soak-watch.sh >> $ROOT/logs/channelops-soak-watch.log 2>&1
+# END VIDEOPROCESS SOAK WATCH
 EOF
 if ! cmp -s "$TEST_ROOT/expected-crontab" "$FAKE_CRONTAB"; then
   echo 'FAIL: managed soak watcher cron did not preserve unrelated entries exactly' >&2
   diff -u "$TEST_ROOT/expected-crontab" "$FAKE_CRONTAB" >&2 || true
   exit 1
 fi
-if [[ "$(grep -Fc '# BEGIN VIDEOPROCESS CHANNELOPS SOAK WATCH' "$FAKE_CRONTAB" || true)" -ne 1 \
-  || "$(grep -Fc '# END VIDEOPROCESS CHANNELOPS SOAK WATCH' "$FAKE_CRONTAB" || true)" -ne 1 ]]; then
+if [[ "$(grep -Fc '# BEGIN VIDEOPROCESS SOAK WATCH' "$FAKE_CRONTAB" || true)" -ne 1 \
+  || "$(grep -Fc '# END VIDEOPROCESS SOAK WATCH' "$FAKE_CRONTAB" || true)" -ne 1 ]]; then
   echo 'FAIL: successful deployment must leave exactly one managed cron block' >&2
   exit 1
 fi
-if [[ "$(grep -Fc 'channelops-soak-watch.sh' "$FAKE_CRONTAB" || true)" -ne 1 ]]; then
-  echo 'FAIL: successful deployment must leave exactly one soak watcher cron command' >&2
+if [[ "$(grep -Fc "*/30 * * * * DEPLOY_GITHUB_SYNC_ROOT=$ROOT $ROOT/bin/channelops-soak-watch.sh" "$FAKE_CRONTAB" || true)" -ne 1 ]]; then
+  echo 'FAIL: successful deployment must leave exactly one managed soak watcher command' >&2
   exit 1
 fi
 if grep -Fq '*/10 * * * *' "$FAKE_CRONTAB"; then
   echo 'FAIL: successful deployment retained the historical unmarked watcher line' >&2
   exit 1
 fi
-final_health_line="$(grep -nF 'running|vp-youtube-publisher-swarm' "$CALLS" | tail -n 1 | cut -d: -f1)"
-cron_install_line="$(grep -nF 'crontab|install' "$CALLS" | tail -n 1 | cut -d: -f1)"
-if [[ -z "$final_health_line" || -z "$cron_install_line" \
-  || "$final_health_line" -ge "$cron_install_line" ]]; then
-  echo 'FAIL: soak watcher cron must install after every VP service health check passes' >&2
+if grep -E '^crontab\|-l\|lc_all=' "$CALLS" | grep -Fvq 'lc_all=C'; then
+  echo 'FAIL: a crontab read did not force the C locale' >&2
+  exit 1
+fi
+final_health_line="$(grep -nF 'running|vp-youtube-publisher-swarm' "$CALLS" | tail -n 1 | cut -d: -f1 || true)"
+watcher_rename_line="$(grep -nE "mv\|-f .*/\.channelops-soak-watch\.txn\.[^/]+/staged-watcher $ROOT/bin/channelops-soak-watch.sh$" "$CALLS" | tail -n 1 | cut -d: -f1 || true)"
+cron_install_line="$(grep -nE 'crontab\|/.+\|lc_all=C$' "$CALLS" | tail -n 1 | cut -d: -f1 || true)"
+if [[ -z "$final_health_line" || -z "$watcher_rename_line" || -z "$cron_install_line" \
+  || "$final_health_line" -ge "$watcher_rename_line" \
+  || "$watcher_rename_line" -ge "$cron_install_line" ]]; then
+  echo 'FAIL: atomic watcher rename and cron install must follow every VP service health check' >&2
   exit 1
 fi
 
@@ -314,6 +407,177 @@ if ! deploy_vp_app_services $images >/dev/null; then
 fi
 if ! cmp -s "$TEST_ROOT/cron-after-first-install" "$FAKE_CRONTAB"; then
   echo 'FAIL: repeated watcher installation is not idempotent' >&2
+  exit 1
+fi
+
+cp "$FAKE_CRONTAB" "$TEST_ROOT/cron-before-no-crontab-test"
+rm -f "$FAKE_CRONTAB"
+if ! vp_install_soak_watch >/dev/null 2>&1; then
+  echo 'FAIL: recognized no-crontab response did not allow first cron install' >&2
+  exit 1
+fi
+cat >"$TEST_ROOT/expected-empty-crontab-install" <<EOF
+# BEGIN VIDEOPROCESS SOAK WATCH
+*/30 * * * * DEPLOY_GITHUB_SYNC_ROOT=$ROOT $ROOT/bin/channelops-soak-watch.sh >> $ROOT/logs/channelops-soak-watch.log 2>&1
+# END VIDEOPROCESS SOAK WATCH
+EOF
+if ! cmp -s "$TEST_ROOT/expected-empty-crontab-install" "$FAKE_CRONTAB"; then
+  echo 'FAIL: recognized no-crontab response produced unexpected managed cron' >&2
+  exit 1
+fi
+cp "$TEST_ROOT/cron-before-no-crontab-test" "$FAKE_CRONTAB"
+
+printf '#!/usr/bin/env bash\nprintf "prior watcher\\n"\n' >"$ROOT/bin/channelops-soak-watch.sh"
+chmod 0755 "$ROOT/bin/channelops-soak-watch.sh"
+cp "$ROOT/bin/channelops-soak-watch.sh" "$TEST_ROOT/target-before-read-error"
+cp "$FAKE_CRONTAB" "$TEST_ROOT/cron-before-read-error"
+FAKE_CRONTAB_READ_MODE=error
+if vp_install_soak_watch >"$TEST_ROOT/read-error.out" 2>&1; then
+  echo 'FAIL: unrecognized crontab read error unexpectedly allowed installation' >&2
+  exit 1
+fi
+FAKE_CRONTAB_READ_MODE=normal
+if ! cmp -s "$TEST_ROOT/target-before-read-error" "$ROOT/bin/channelops-soak-watch.sh" \
+  || ! cmp -s "$TEST_ROOT/cron-before-read-error" "$FAKE_CRONTAB"; then
+  echo 'FAIL: crontab read error changed the prior watcher or crontab' >&2
+  exit 1
+fi
+if ! grep -Fq 'permission denied' "$TEST_ROOT/read-error.out"; then
+  echo 'FAIL: crontab read error was not reported' >&2
+  exit 1
+fi
+install -m 0755 "$VP_SOAK_WATCH_SOURCE" "$ROOT/bin/channelops-soak-watch.sh"
+
+cat >"$FAKE_CRONTAB" <<EOF
+MAILTO=transaction-test@example.com
+7 1 * * * /usr/local/bin/prior-job
+EOF
+for install_mode in fail-before mutate-then-fail verify-mismatch target-verify-mismatch; do
+  printf '#!/usr/bin/env bash\nprintf "prior-%s\\n"\n' "$install_mode" \
+    >"$ROOT/bin/channelops-soak-watch.sh"
+  chmod 0755 "$ROOT/bin/channelops-soak-watch.sh"
+  cp "$ROOT/bin/channelops-soak-watch.sh" "$TEST_ROOT/target-before-$install_mode"
+  cp "$FAKE_CRONTAB" "$TEST_ROOT/cron-before-$install_mode"
+  rm -f "$FAKE_CRONTAB_FAILURE_USED"
+  FAKE_CRONTAB_INSTALL_MODE="$install_mode"
+  if vp_install_soak_watch >"$TEST_ROOT/$install_mode.out" 2>&1; then
+    echo "FAIL: $install_mode unexpectedly allowed watcher and cron convergence" >&2
+    exit 1
+  fi
+  FAKE_CRONTAB_INSTALL_MODE=normal
+  if ! cmp -s "$TEST_ROOT/target-before-$install_mode" "$ROOT/bin/channelops-soak-watch.sh" \
+    || [[ ! -x "$ROOT/bin/channelops-soak-watch.sh" ]] \
+    || ! cmp -s "$TEST_ROOT/cron-before-$install_mode" "$FAKE_CRONTAB"; then
+    echo "FAIL: $install_mode did not restore the prior watcher and crontab" >&2
+    exit 1
+  fi
+done
+
+rm -f "$FAKE_CRONTAB" "$ROOT/bin/channelops-soak-watch.sh" "$FAKE_CRONTAB_FAILURE_USED"
+FAKE_CRONTAB_INSTALL_MODE=mutate-then-fail
+if vp_install_soak_watch >"$TEST_ROOT/absent-rollback.out" 2>&1; then
+  echo 'FAIL: mutate-then-fail with absent prior artifacts unexpectedly succeeded' >&2
+  exit 1
+fi
+FAKE_CRONTAB_INSTALL_MODE=normal
+if [[ -e "$FAKE_CRONTAB" || -e "$ROOT/bin/channelops-soak-watch.sh" ]]; then
+  echo 'FAIL: rollback did not restore absent watcher and no-crontab state' >&2
+  exit 1
+fi
+
+cat >"$FAKE_CRONTAB" <<EOF
+MAILTO=rollback-failure@example.com
+EOF
+printf '#!/usr/bin/env bash\nprintf "rollback-failure-prior\\n"\n' \
+  >"$ROOT/bin/channelops-soak-watch.sh"
+chmod 0755 "$ROOT/bin/channelops-soak-watch.sh"
+cp "$ROOT/bin/channelops-soak-watch.sh" "$TEST_ROOT/target-before-rollback-failure"
+rm -f "$FAKE_CRONTAB_FAILURE_USED"
+FAKE_CRONTAB_INSTALL_MODE=mutate-then-fail
+FAKE_CRONTAB_ROLLBACK_FAIL=true
+if vp_install_soak_watch >"$TEST_ROOT/rollback-failure.out" 2>&1; then
+  echo 'FAIL: rollback failure unexpectedly claimed convergence' >&2
+  exit 1
+fi
+FAKE_CRONTAB_INSTALL_MODE=normal
+FAKE_CRONTAB_ROLLBACK_FAIL=false
+if ! cmp -s "$TEST_ROOT/target-before-rollback-failure" "$ROOT/bin/channelops-soak-watch.sh"; then
+  echo 'FAIL: cron rollback failure prevented watcher rollback' >&2
+  exit 1
+fi
+if ! grep -Fq 'rollback failed' "$TEST_ROOT/rollback-failure.out"; then
+  echo 'FAIL: rollback failure was not reported' >&2
+  exit 1
+fi
+
+cat >"$FAKE_CRONTAB" <<EOF
+MAILTO=signal-test@example.com
+11 4 * * * /usr/local/bin/prior-signal-job
+EOF
+printf '#!/usr/bin/env bash\nprintf "signal-prior\\n"\n' \
+  >"$ROOT/bin/channelops-soak-watch.sh"
+chmod 0755 "$ROOT/bin/channelops-soak-watch.sh"
+cp "$ROOT/bin/channelops-soak-watch.sh" "$TEST_ROOT/target-before-signal"
+cp "$FAKE_CRONTAB" "$TEST_ROOT/cron-before-signal"
+rm -f "$FAKE_CRONTAB_FAILURE_USED"
+trap ':' HUP
+trap ':' INT
+trap ':' TERM
+parent_hup_trap="$(trap -p HUP)"
+parent_int_trap="$(trap -p INT)"
+parent_term_trap="$(trap -p TERM)"
+FAKE_CRONTAB_INSTALL_MODE=signal-term
+set +e
+vp_install_soak_watch >"$TEST_ROOT/signal-term.out" 2>&1
+signal_status=$?
+set -e
+FAKE_CRONTAB_INSTALL_MODE=normal
+if [[ "$signal_status" -ne 143 ]]; then
+  echo "FAIL: TERM-interrupted installer returned $signal_status instead of 143" >&2
+  exit 1
+fi
+if ! cmp -s "$TEST_ROOT/target-before-signal" "$ROOT/bin/channelops-soak-watch.sh" \
+  || ! cmp -s "$TEST_ROOT/cron-before-signal" "$FAKE_CRONTAB"; then
+  echo 'FAIL: TERM-interrupted installer did not restore prior artifacts' >&2
+  exit 1
+fi
+if [[ "$(trap -p HUP)" != "$parent_hup_trap" \
+  || "$(trap -p INT)" != "$parent_int_trap" \
+  || "$(trap -p TERM)" != "$parent_term_trap" ]]; then
+  echo 'FAIL: installer signal handling clobbered a parent trap' >&2
+  exit 1
+fi
+trap - HUP INT TERM
+if ! grep -Fq 'interrupted by TERM' "$TEST_ROOT/signal-term.out"; then
+  echo 'FAIL: TERM interruption was not reported' >&2
+  exit 1
+fi
+
+cat >"$FAKE_CRONTAB" <<EOF
+MAILTO=malformed-marker@example.com
+# BEGIN VIDEOPROCESS SOAK WATCH
+3 * * * * /usr/local/bin/unrelated-inside-malformed-block
+EOF
+printf '#!/usr/bin/env bash\nprintf "malformed-prior\\n"\n' \
+  >"$ROOT/bin/channelops-soak-watch.sh"
+chmod 0755 "$ROOT/bin/channelops-soak-watch.sh"
+cp "$ROOT/bin/channelops-soak-watch.sh" "$TEST_ROOT/target-before-malformed-marker"
+cp "$FAKE_CRONTAB" "$TEST_ROOT/cron-before-malformed-marker"
+rm -f "$FAKE_CRONTAB_FAILURE_USED"
+if vp_install_soak_watch >"$TEST_ROOT/malformed-marker.out" 2>&1; then
+  echo 'FAIL: malformed managed markers unexpectedly allowed convergence' >&2
+  exit 1
+fi
+if ! cmp -s "$TEST_ROOT/target-before-malformed-marker" "$ROOT/bin/channelops-soak-watch.sh" \
+  || ! cmp -s "$TEST_ROOT/cron-before-malformed-marker" "$FAKE_CRONTAB"; then
+  echo 'FAIL: malformed managed markers changed the watcher or crontab' >&2
+  exit 1
+fi
+
+cp "$TEST_ROOT/cron-before-no-crontab-test" "$FAKE_CRONTAB"
+install -m 0755 "$VP_SOAK_WATCH_SOURCE" "$ROOT/bin/channelops-soak-watch.sh"
+if [[ -n "$(find "$ROOT/bin" -maxdepth 1 -name '.channelops-soak-watch.txn.*' -print -quit)" ]]; then
+  echo 'FAIL: transaction failure leaked a watcher staging directory' >&2
   exit 1
 fi
 
