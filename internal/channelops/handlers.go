@@ -84,6 +84,17 @@ func (h HandlerService) Handle(ctx context.Context, item QueueItemRow) error {
 	if h.Store == nil {
 		return errors.New("channelops handler store is not configured")
 	}
+	if item.ChannelProfileID == nil {
+		return h.dispatch(ctx, item)
+	}
+	return h.Store.WithChannelExecutionFence(ctx, *item.ChannelProfileID, func(fencedStore *Store) error {
+		fencedHandler := h
+		fencedHandler.Store = fencedStore
+		return fencedHandler.dispatch(ctx, item)
+	})
+}
+
+func (h HandlerService) dispatch(ctx context.Context, item QueueItemRow) error {
 	switch item.Kind {
 	case QueueAgentTick:
 		return h.HandleAgentTick(ctx, item)
@@ -166,6 +177,9 @@ func (h HandlerService) HandlePlanTask(ctx context.Context, item QueueItemRow) e
 	if err != nil {
 		return err
 	}
+	if task.State != TaskSelected {
+		return nil
+	}
 	observation, err := h.AutoFlow.PlanTask(ctx, task, AutoFlowRequestForTask(task))
 	if err != nil {
 		return err
@@ -173,7 +187,7 @@ func (h HandlerService) HandlePlanTask(ctx context.Context, item QueueItemRow) e
 	if observation.UploadNodeCount != 1 {
 		return h.Store.HoldTaskWithPlan(ctx, task.ID, observation.PlanID, "missing_youtube_upload_node", "AutoFlow plan must contain exactly one youtube_upload node", "plan_task")
 	}
-	if task.ApprovalMode == ApprovalHuman {
+	if task.ApprovalMode == ApprovalHuman || taskUsesExternalAssets(task) {
 		return h.Store.HoldTaskWithPlan(ctx, task.ID, observation.PlanID, "human_approval_required", "AutoFlow plan requires human approval before execution", "plan_task_human_approval")
 	}
 	if h.PDS == nil {
@@ -215,6 +229,9 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	task, err := h.Store.GetProductionTask(ctx, taskID)
 	if err != nil {
 		return err
+	}
+	if task.State != TaskPlanning {
+		return nil
 	}
 	if runID, jobID, ok := ExistingExecution(task); ok {
 		return h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, runID, jobID, item.ID)
@@ -265,6 +282,9 @@ func (h HandlerService) HandleObserveJob(ctx context.Context, item QueueItemRow)
 	if err != nil {
 		return err
 	}
+	if task.State != TaskProducing {
+		return nil
+	}
 	if task.JobID == nil || *task.JobID == "" {
 		return fmt.Errorf("task %s has no AutoFlow job id", task.ID)
 	}
@@ -304,6 +324,9 @@ func (h HandlerService) HandlePublishTask(ctx context.Context, item QueueItemRow
 	task, err := h.Store.GetProductionTask(ctx, taskID)
 	if err != nil {
 		return err
+	}
+	if task.State != TaskScheduled {
+		return nil
 	}
 	if h.YouTube != nil {
 		health, err := h.YouTube.AccountHealth(ctx, task.TargetAccountID)
@@ -358,6 +381,13 @@ func (h HandlerService) HandlePromotePublication(ctx context.Context, item Queue
 	if err != nil {
 		return err
 	}
+	task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+	if err != nil {
+		return err
+	}
+	if task.State != TaskUploadedPrivate {
+		return nil
+	}
 	targetVisibility := safePromotionVisibility(firstString(item.PayloadJSON, "target_visibility"))
 	if targetVisibility == "" {
 		targetVisibility = safePromotionVisibility(publication.DesiredPrivacy)
@@ -387,10 +417,7 @@ func (h HandlerService) HandlePromotePublication(ctx context.Context, item Queue
 	if err != nil {
 		return err
 	}
-	channelID := ""
-	if task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID); err == nil {
-		channelID = task.ChannelProfileID
-	}
+	channelID := task.ChannelProfileID
 	if alert, ok := maybePDSOutageAlert(decision, channelID, publication.ID, "publish"); ok {
 		if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
 			return err
@@ -421,6 +448,13 @@ func (h HandlerService) HandleReconcilePublication(ctx context.Context, item Que
 	if err != nil {
 		return err
 	}
+	task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+	if err != nil {
+		return err
+	}
+	if task.State == TaskHeld || task.State == TaskFailed || task.State == TaskRejected {
+		return nil
+	}
 	status, err := h.YouTube.PublicationStatus(ctx, publication.PlatformContentID)
 	if err != nil {
 		return err
@@ -429,10 +463,7 @@ func (h HandlerService) HandleReconcilePublication(ctx context.Context, item Que
 		if err := h.Store.MarkPublicationSevereDedup(ctx, publication, status, h.Store.Now()); err != nil {
 			return err
 		}
-		channelID := ""
-		if task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID); err == nil {
-			channelID = task.ChannelProfileID
-		}
+		channelID := task.ChannelProfileID
 		_, err := h.Store.EnqueueAlert(ctx, platformRejectedAlert(publication, channelID, status), 5, item.ID)
 		return err
 	}
@@ -447,6 +478,13 @@ func (h HandlerService) HandleCollectMetrics(ctx context.Context, item QueueItem
 	publication, err := h.Store.GetPublication(ctx, publicationID)
 	if err != nil {
 		return err
+	}
+	task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+	if err != nil {
+		return err
+	}
+	if task.State == TaskHeld || task.State == TaskFailed || task.State == TaskRejected {
+		return nil
 	}
 	metrics := mapFromAny(item.PayloadJSON["metrics"])
 	if !HasRecognizedMetrics(metrics) && publication.PlatformContentID != "" && h.YouTube != nil {

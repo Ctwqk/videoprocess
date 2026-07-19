@@ -125,7 +125,7 @@ func (s Scheduler) enqueueOperationalMaintenance(ctx context.Context, channels [
 }
 
 func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]ChannelProfileRow, error) {
-	rows, err := s.Pool.Query(ctx, `
+	rows, err := s.db().Query(ctx, `
 		SELECT id, enabled, dry_run, halted_at, tick_interval_minutes, config_version,
 		       risk_policy_json, cadence_policy_json, content_mix_policy_json,
 		       default_aspect_ratio, created_at, updated_at
@@ -152,7 +152,7 @@ func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]C
 }
 
 func (s *Store) InsertSchedulerRun(ctx context.Context, channelID string, bucket string) (bool, error) {
-	tag, err := s.Pool.Exec(ctx, `
+	tag, err := s.db().Exec(ctx, `
 		INSERT INTO internal_scheduler_runs (channel_profile_id, bucket, status, metadata_json)
 		VALUES ($1, $2, 'succeeded', '{}'::jsonb)
 		ON CONFLICT (channel_profile_id, bucket) DO NOTHING

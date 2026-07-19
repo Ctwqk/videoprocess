@@ -39,7 +39,7 @@ func (s *Store) LoadTickInputs(ctx context.Context, channelID string, now time.T
 func (s *Store) GetChannelProfile(ctx context.Context, channelID string) (ChannelProfileRow, error) {
 	var row ChannelProfileRow
 	var riskJSON, cadenceJSON, contentMixJSON []byte
-	err := s.Pool.QueryRow(ctx, `
+	err := s.db().QueryRow(ctx, `
 		SELECT id, enabled, dry_run, halted_at, tick_interval_minutes, config_version,
 	       risk_policy_json, cadence_policy_json, content_mix_policy_json,
 	       default_aspect_ratio, created_at, updated_at
@@ -75,7 +75,7 @@ func (s *Store) GetChannelProfile(ctx context.Context, channelID string) (Channe
 }
 
 func (s *Store) ListActiveLanes(ctx context.Context, channelID string, now time.Time) ([]TopicLaneRow, error) {
-	rows, err := s.Pool.Query(ctx, `
+	rows, err := s.db().Query(ctx, `
 		SELECT id, channel_profile_id, name, description, keywords_json, enabled, paused_until,
 		       weight, max_posts_per_day, cooldown_after_post_minutes, max_consecutive_streak,
 		       created_at
@@ -119,7 +119,7 @@ func (s *Store) ListActiveLanes(ctx context.Context, channelID string, now time.
 }
 
 func (s *Store) ListActiveAccounts(ctx context.Context, channelID string, now time.Time) ([]PublishingAccountRow, error) {
-	rows, err := s.Pool.Query(ctx, `
+	rows, err := s.db().Query(ctx, `
 		SELECT id, channel_profile_id, platform, account_label, platform_account_id,
 		       enabled, paused_until, default_privacy, external_asset_auto_publish,
 		       created_at
@@ -157,7 +157,7 @@ func (s *Store) ListActiveAccounts(ctx context.Context, channelID string, now ti
 }
 
 func (s *Store) ListActiveManualSeeds(ctx context.Context, channelID string) ([]ManualSeedRow, error) {
-	rows, err := s.Pool.Query(ctx, `
+	rows, err := s.db().Query(ctx, `
 		SELECT id, channel_profile_id, topic_lane_id, target_account_id, prompt, title_seed,
 		       source_policy, source_platforms_json, material_library_ids_json,
 		       constraints_json, status, created_at
@@ -206,7 +206,7 @@ func (s *Store) ListActiveManualSeeds(ctx context.Context, channelID string) ([]
 }
 
 func (s *Store) ListActiveDiscoverySignals(ctx context.Context, channelID string, now time.Time) ([]DiscoverySignalRow, error) {
-	rows, err := s.Pool.Query(ctx, `
+	rows, err := s.db().Query(ctx, `
 		WITH ranked_signals AS (
 			SELECT id, channel_profile_id, topic_lane_id, source, source_url, source_external_id,
 			       title, summary, keywords_json, trend_score, novelty_score, raw_json, status,
@@ -280,7 +280,7 @@ func (s *Store) ListLaneFormats(ctx context.Context, lanes []TopicLaneRow) (map[
 		return result, nil
 	}
 
-	rows, err := s.Pool.Query(ctx, `
+	rows, err := s.db().Query(ctx, `
 		SELECT id, topic_lane_id, format_key, enabled, weight, target_duration_sec,
 		       default_publish_visibility, template_pool_json, source_platforms_json,
 		       created_at
@@ -323,7 +323,7 @@ func (s *Store) ListLaneFormats(ctx context.Context, lanes []TopicLaneRow) (map[
 }
 
 func (s *Store) InsertTickAudit(ctx context.Context, channelID string, bucket string, result TickResult, summary map[string]any) (string, error) {
-	return s.insertTickAudit(ctx, s.Pool, channelID, bucket, result, summary)
+	return s.insertTickAudit(ctx, s.db(), channelID, bucket, result, summary)
 }
 
 func (s *Store) insertTickAudit(ctx context.Context, db dbExecutor, channelID string, bucket string, result TickResult, summary map[string]any) (string, error) {
@@ -368,7 +368,7 @@ func (s *Store) insertTickAudit(ctx context.Context, db dbExecutor, channelID st
 }
 
 func (s *Store) InsertDecisionAuditEntries(ctx context.Context, tickAuditID string, channelID string, result TickResult) (map[string]string, error) {
-	return s.insertDecisionAuditEntries(ctx, s.Pool, tickAuditID, channelID, result)
+	return s.insertDecisionAuditEntries(ctx, s.db(), tickAuditID, channelID, result)
 }
 
 func (s *Store) insertDecisionAuditEntries(ctx context.Context, db dbExecutor, tickAuditID string, channelID string, result TickResult) (map[string]string, error) {
@@ -418,7 +418,7 @@ func (s *Store) insertDecisionAuditEntries(ctx context.Context, db dbExecutor, t
 }
 
 func (s *Store) AttachDecisionAuditTask(ctx context.Context, auditID string, taskID string) error {
-	return s.attachDecisionAuditTask(ctx, s.Pool, auditID, taskID)
+	return s.attachDecisionAuditTask(ctx, s.db(), auditID, taskID)
 }
 
 func (s *Store) attachDecisionAuditTask(ctx context.Context, db dbExecutor, auditID string, taskID string) error {
@@ -437,7 +437,7 @@ func (s *Store) attachDecisionAuditTask(ctx context.Context, db dbExecutor, audi
 }
 
 func (s *Store) InsertProductionTask(ctx context.Context, channel ChannelProfileRow, candidate TickCandidate, now time.Time) (string, error) {
-	return s.insertProductionTask(ctx, s.Pool, channel, candidate, now)
+	return s.insertProductionTask(ctx, s.db(), channel, candidate, now)
 }
 
 func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel ChannelProfileRow, candidate TickCandidate, now time.Time) (string, error) {
@@ -520,7 +520,7 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 }
 
 func (s *Store) MarkDiscoverySignalConverted(ctx context.Context, signalID string, taskID string) error {
-	return s.markDiscoverySignalConverted(ctx, s.Pool, signalID, taskID)
+	return s.markDiscoverySignalConverted(ctx, s.db(), signalID, taskID)
 }
 
 func (s *Store) markDiscoverySignalConverted(ctx context.Context, db dbExecutor, signalID string, taskID string) error {

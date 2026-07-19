@@ -76,7 +76,6 @@ async def quarantine_channelops_backlog(
 
         task_ids = {task.id for task in tasks}
         publications = await _publications_for_tasks(db, task_ids, apply=apply)
-        publication_task_ids = {publication.production_task_id for publication in publications}
         feedback = await _feedback_for_publications(
             db,
             {publication.id for publication in publications},
@@ -86,8 +85,7 @@ async def quarantine_channelops_backlog(
         changed_tasks = [
             task
             for task in tasks
-            if task.id not in publication_task_ids
-            and task.state not in TERMINAL_TASK_STATES
+            if task.state not in TERMINAL_TASK_STATES
             and not _already_quarantined(task, reason)
         ]
         changed_task_ids = {task.id for task in changed_tasks}

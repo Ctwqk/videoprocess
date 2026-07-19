@@ -100,7 +100,7 @@ func TestHandleLearningRecomputeRunsConfiguredWindows(t *testing.T) {
 	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
 		t.Fatalf("HandlePromotePublication: %v", err)
 	}
-	if err := fixture.Store.MarkQueueDone(ctx, promote.ID); err != nil {
+	if err := fixture.Store.MarkQueueDone(ctx, promote); err != nil {
 		t.Fatalf("MarkQueueDone promote: %v", err)
 	}
 	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)

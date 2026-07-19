@@ -12,12 +12,22 @@ import (
 
 const claimNextQuery = `
 	WITH picked AS (
-		SELECT id
-		FROM channel_ops_queue_items
-		WHERE status = $2
-		  AND dead_letter_at IS NULL
-		  AND run_after <= NOW()
-		ORDER BY priority ASC, created_at ASC
+		SELECT q.id
+		FROM channel_ops_queue_items q
+		WHERE q.status = $2
+		  AND q.dead_letter_at IS NULL
+		  AND q.run_after <= NOW()
+		  AND (
+		    q.channel_profile_id IS NULL
+		    OR EXISTS (
+		      SELECT 1
+		      FROM channel_profiles c
+		      WHERE c.id = q.channel_profile_id
+		        AND c.enabled = TRUE
+		        AND c.halted_at IS NULL
+		    )
+		  )
+		ORDER BY q.priority ASC, q.created_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
 	)
@@ -35,13 +45,23 @@ const claimNextQuery = `
 
 const claimNextForKindsQuery = `
 	WITH picked AS (
-		SELECT id
-		FROM channel_ops_queue_items
-		WHERE status = $2
-		  AND dead_letter_at IS NULL
-		  AND run_after <= NOW()
-		  AND kind = ANY($4)
-		ORDER BY priority ASC, created_at ASC
+		SELECT q.id
+		FROM channel_ops_queue_items q
+		WHERE q.status = $2
+		  AND q.dead_letter_at IS NULL
+		  AND q.run_after <= NOW()
+		  AND q.kind = ANY($4)
+		  AND (
+		    q.channel_profile_id IS NULL
+		    OR EXISTS (
+		      SELECT 1
+		      FROM channel_profiles c
+		      WHERE c.id = q.channel_profile_id
+		        AND c.enabled = TRUE
+		        AND c.halted_at IS NULL
+		    )
+		  )
+		ORDER BY q.priority ASC, q.created_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
 	)
@@ -59,14 +79,21 @@ const claimNextForKindsQuery = `
 
 const claimNextForChannelAndKindsQuery = `
 	WITH picked AS (
-		SELECT id
-		FROM channel_ops_queue_items
-		WHERE status = $2
-		  AND dead_letter_at IS NULL
-		  AND run_after <= NOW()
-		  AND kind = ANY($4)
-		  AND channel_profile_id = $5::uuid
-		ORDER BY priority ASC, created_at ASC
+		SELECT q.id
+		FROM channel_ops_queue_items q
+		WHERE q.status = $2
+		  AND q.dead_letter_at IS NULL
+		  AND q.run_after <= NOW()
+		  AND q.kind = ANY($4)
+		  AND q.channel_profile_id = $5::uuid
+		  AND EXISTS (
+		    SELECT 1
+		    FROM channel_profiles c
+		    WHERE c.id = q.channel_profile_id
+		      AND c.enabled = TRUE
+		      AND c.halted_at IS NULL
+		  )
+		ORDER BY q.priority ASC, q.created_at ASC
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
 	)
@@ -115,7 +142,7 @@ type EnqueueOptions struct {
 }
 
 func (s *Store) Enqueue(ctx context.Context, opts EnqueueOptions) (string, error) {
-	return s.enqueue(ctx, s.Pool, opts)
+	return s.enqueue(ctx, s.db(), opts)
 }
 
 func (s *Store) enqueue(ctx context.Context, db dbExecutor, opts EnqueueOptions) (string, error) {
@@ -152,7 +179,7 @@ func (s *Store) defaultMaxAttempts() int {
 }
 
 func (s *Store) ClaimNext(ctx context.Context, workerID string) (*QueueItemRow, error) {
-	row := s.Pool.QueryRow(ctx, claimNextQuery, workerID, QueueStatusQueued, QueueStatusRunning)
+	row := s.db().QueryRow(ctx, claimNextQuery, workerID, QueueStatusQueued, QueueStatusRunning)
 
 	item, err := scanQueueItem(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -168,7 +195,7 @@ func (s *Store) ClaimNextForKinds(ctx context.Context, workerID string, kinds []
 	if len(kinds) == 0 {
 		return nil, nil
 	}
-	row := s.Pool.QueryRow(ctx, claimNextForKindsQuery, workerID, QueueStatusQueued, QueueStatusRunning, kinds)
+	row := s.db().QueryRow(ctx, claimNextForKindsQuery, workerID, QueueStatusQueued, QueueStatusRunning, kinds)
 
 	item, err := scanQueueItem(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -187,7 +214,7 @@ func (s *Store) ClaimNextForChannelAndKinds(ctx context.Context, workerID string
 	if err := requireUUID("channel_profile_id", channelID); err != nil {
 		return nil, err
 	}
-	row := s.Pool.QueryRow(ctx, claimNextForChannelAndKindsQuery, workerID, QueueStatusQueued, QueueStatusRunning, kinds, channelID)
+	row := s.db().QueryRow(ctx, claimNextForChannelAndKindsQuery, workerID, QueueStatusQueued, QueueStatusRunning, kinds, channelID)
 
 	item, err := scanQueueItem(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -199,42 +226,67 @@ func (s *Store) ClaimNextForChannelAndKinds(ctx context.Context, workerID string
 	return item, nil
 }
 
-func (s *Store) MarkQueueDone(ctx context.Context, id string) error {
-	_, err := s.Pool.Exec(ctx, `
+func (s *Store) MarkQueueDone(ctx context.Context, item QueueItemRow) error {
+	lockedBy, lockedAt, err := runningLease(item)
+	if err != nil {
+		return err
+	}
+	_, err = s.db().Exec(ctx, `
 		UPDATE channel_ops_queue_items
 		SET status = $2,
 		    last_error = NULL,
 		    locked_by = NULL,
 		    locked_at = NULL
-		WHERE id = $1
-	`, id, QueueStatusSucceeded)
+		WHERE id = $1::uuid
+		  AND status = $3
+		  AND locked_by = $4
+		  AND locked_at = $5
+	`, item.ID, QueueStatusSucceeded, QueueStatusRunning, lockedBy, lockedAt)
 	return err
 }
 
 func (s *Store) MarkQueueFailedOrRetry(ctx context.Context, item QueueItemRow, message string) error {
+	lockedBy, lockedAt, err := runningLease(item)
+	if err != nil {
+		return err
+	}
 	if ShouldDeadLetter(item.AttemptCount, item.MaxAttempts) {
-		_, err := s.Pool.Exec(ctx, `
+		_, err := s.db().Exec(ctx, `
 			UPDATE channel_ops_queue_items
 			SET status = $2,
 			    last_error = $3,
 			    dead_letter_at = NOW(),
 			    locked_by = NULL,
 			    locked_at = NULL
-			WHERE id = $1
-		`, item.ID, QueueStatusDeadLettered, message)
+			WHERE id = $1::uuid
+			  AND status = $4
+			  AND locked_by = $5
+			  AND locked_at = $6
+		`, item.ID, QueueStatusDeadLettered, message, QueueStatusRunning, lockedBy, lockedAt)
 		return err
 	}
 
-	_, err := s.Pool.Exec(ctx, `
+	_, err = s.db().Exec(ctx, `
 		UPDATE channel_ops_queue_items
 		SET status = $2,
 		    last_error = $3,
 		    run_after = NOW() + $4::interval,
 		    locked_by = NULL,
 		    locked_at = NULL
-		WHERE id = $1
-	`, item.ID, QueueStatusQueued, message, pgInterval(RetryDelay(item.AttemptCount)))
+		WHERE id = $1::uuid
+		  AND status = $5
+		  AND locked_by = $6
+		  AND locked_at = $7
+	`, item.ID, QueueStatusQueued, message, pgInterval(RetryDelay(item.AttemptCount)),
+		QueueStatusRunning, lockedBy, lockedAt)
 	return err
+}
+
+func runningLease(item QueueItemRow) (string, time.Time, error) {
+	if item.Status != QueueStatusRunning || item.LockedBy == nil || item.LockedAt == nil {
+		return "", time.Time{}, fmt.Errorf("queue item %s has no running lease", item.ID)
+	}
+	return *item.LockedBy, *item.LockedAt, nil
 }
 
 type queueItemScanner interface {

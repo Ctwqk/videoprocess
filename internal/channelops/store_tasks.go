@@ -43,7 +43,7 @@ func (s *Store) RunTickWithPlanDelay(
 		alerts = append(alerts, materialLowSupplyAlert(channelID, bucket, len(accepted), len(rejected)))
 	}
 	result := TickResult{DryRun: channel.DryRun, Accepted: accepted, Rejected: rejected}
-	tx, err := s.Pool.Begin(ctx)
+	tx, ownsTransaction, err := s.beginOrReuse(ctx)
 	if err != nil {
 		return err
 	}
@@ -74,8 +74,10 @@ func (s *Store) RunTickWithPlanDelay(
 		}
 	}
 	if channel.DryRun {
-		if err := tx.Commit(ctx); err != nil {
-			return err
+		if ownsTransaction {
+			if err := tx.Commit(ctx); err != nil {
+				return err
+			}
 		}
 		committed = true
 		return nil
@@ -108,8 +110,10 @@ func (s *Store) RunTickWithPlanDelay(
 			return err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
+	if ownsTransaction {
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
 	}
 	committed = true
 	return nil
@@ -165,7 +169,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 	}
 	var row ProductionTaskRow
 	var rationaleJSON, scoreJSON, sourcePlatformsJSON, materialIDsJSON, transitionJSON, snapshotJSON []byte
-	err := s.Pool.QueryRow(ctx, `
+	err := s.db().QueryRow(ctx, `
 		SELECT id, channel_profile_id, topic_lane_id, lane_format_id, target_account_id,
 		       manual_seed_id, discovery_signal_id, source, title_seed, prompt, rationale_json,
 		       score_breakdown_json, source_platforms_json, material_library_ids_json,
@@ -261,7 +265,7 @@ func (s *Store) MarkTaskPlanningAndEnqueueExecute(ctx context.Context, taskID st
 		return err
 	}
 	now := s.Now().UTC()
-	if _, err := s.Pool.Exec(ctx, `
+	if _, err := s.db().Exec(ctx, `
 		UPDATE production_tasks
 		SET autoflow_plan_id = $2::uuid,
 		    state = $3::text,
@@ -315,7 +319,7 @@ func (s *Store) MarkTaskProducingAndEnqueueObserve(ctx context.Context, taskID s
 		return err
 	}
 	now := s.Now().UTC()
-	if _, err := s.Pool.Exec(ctx, `
+	if _, err := s.db().Exec(ctx, `
 		UPDATE production_tasks
 		SET autoflow_run_id = $2::uuid,
 		    job_id = $3::uuid,
@@ -400,7 +404,7 @@ func (s *Store) MarkTaskReadyToPublish(ctx context.Context, task ProductionTaskR
 	if err != nil {
 		return err
 	}
-	if _, err := s.Pool.Exec(ctx, `
+	if _, err := s.db().Exec(ctx, `
 		UPDATE production_tasks
 		SET state = $2::text,
 		    blocked_by_guard = NULL,
@@ -447,7 +451,7 @@ func (s *Store) FailTask(ctx context.Context, taskID string, reason string, tran
 	}
 	category := FailureCategoryFor(transitionReason, reason)
 	now := s.Now().UTC()
-	_, err := s.Pool.Exec(ctx, `
+	_, err := s.db().Exec(ctx, `
 		UPDATE production_tasks
 		SET state = $2::text,
 		    failure_reason = $3::text,
@@ -486,7 +490,7 @@ func (s *Store) holdTask(ctx context.Context, taskID string, planID string, guar
 	}
 	category := holdFailureCategoryFor(guard, reason, transitionReason, decision)
 	now := s.Now().UTC()
-	_, err = s.Pool.Exec(ctx, `
+	_, err = s.db().Exec(ctx, `
 		UPDATE production_tasks
 		SET autoflow_plan_id = COALESCE($2::uuid, autoflow_plan_id),
 		    state = $3::text,

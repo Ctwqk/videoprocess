@@ -61,7 +61,7 @@ func (s *Store) RunLiveSmoke(ctx context.Context, channelID string, handler Hand
 			_ = s.MarkQueueFailedOrRetry(ctx, *item, err.Error())
 			return SmokeResult{}, err
 		}
-		if err := s.MarkQueueDone(ctx, item.ID); err != nil {
+		if err := s.MarkQueueDone(ctx, *item); err != nil {
 			return SmokeResult{}, err
 		}
 	}
@@ -72,7 +72,7 @@ func (s *Store) advanceLiveSmokeQueue(ctx context.Context, channelID string, kin
 	if len(kinds) == 0 {
 		return nil
 	}
-	_, err := s.Pool.Exec(ctx, `
+	_, err := s.db().Exec(ctx, `
 		UPDATE channel_ops_queue_items
 		SET run_after = NOW()
 		WHERE channel_profile_id = $1::uuid
@@ -88,7 +88,7 @@ func (s *Store) claimNextLiveSmokeForChannelAndKinds(ctx context.Context, channe
 	if len(kinds) == 0 {
 		return nil, nil
 	}
-	row := s.Pool.QueryRow(ctx, claimNextLiveSmokeForChannelAndKindsQuery, channelID, workerID, QueueStatusQueued, QueueStatusRunning, kinds)
+	row := s.db().QueryRow(ctx, claimNextLiveSmokeForChannelAndKindsQuery, channelID, workerID, QueueStatusQueued, QueueStatusRunning, kinds)
 
 	item, err := scanQueueItem(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -102,7 +102,7 @@ func (s *Store) claimNextLiveSmokeForChannelAndKinds(ctx context.Context, channe
 
 func (s *Store) SmokeResultForChannel(ctx context.Context, channelID string) (SmokeResult, error) {
 	var result SmokeResult
-	err := s.Pool.QueryRow(ctx, `
+	err := s.db().QueryRow(ctx, `
 		SELECT
 			EXISTS(
 				SELECT 1

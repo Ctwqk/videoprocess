@@ -52,7 +52,7 @@ func TestClaimNextForKindsQueryFiltersAndOrdersLikePython(t *testing.T) {
 	if !strings.Contains(claimNextForKindsQuery, "kind = ANY($4)") {
 		t.Fatalf("claim query does not filter by owned kinds:\n%s", claimNextForKindsQuery)
 	}
-	if !strings.Contains(claimNextForKindsQuery, "ORDER BY priority ASC, created_at ASC") {
+	if !strings.Contains(claimNextForKindsQuery, "ORDER BY q.priority ASC, q.created_at ASC") {
 		t.Fatalf("claim query does not match Python ordering:\n%s", claimNextForKindsQuery)
 	}
 	if strings.Contains(claimNextForKindsQuery, "run_after ASC, created_at") {
@@ -115,5 +115,140 @@ func TestEnqueueUsesStoreDefaultMaxAttempts(t *testing.T) {
 	}
 	if maxAttempts != 5 {
 		t.Fatalf("max_attempts = %d, want 5", maxAttempts)
+	}
+}
+
+func TestClaimRejectsDisabledAndHaltedChannelsButKeepsGlobalItems(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	channelID := fixture.ChannelID
+	_, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:             QueueAccountHealth,
+		IdempotencyKey:   "account_health:" + fixture.AccountID + ":channel-state",
+		Payload:          map[string]any{"account_id": fixture.AccountID},
+		ChannelProfileID: &channelID,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue channel item: %v", err)
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles SET enabled = FALSE WHERE id = $1::uuid
+	`, fixture.ChannelID); err != nil {
+		t.Fatalf("disable channel: %v", err)
+	}
+	item, err := fixture.Store.ClaimNextForChannelAndKinds(
+		ctx, "disabled-worker", fixture.ChannelID, []string{QueueAccountHealth},
+	)
+	if err != nil {
+		t.Fatalf("claim disabled channel: %v", err)
+	}
+	if item != nil {
+		t.Fatalf("claimed disabled channel item: %#v", item)
+	}
+
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles
+		SET enabled = TRUE, halted_at = NOW()
+		WHERE id = $1::uuid
+	`, fixture.ChannelID); err != nil {
+		t.Fatalf("halt channel: %v", err)
+	}
+	item, err = fixture.Store.ClaimNextForKinds(ctx, "halted-worker", []string{QueueAccountHealth})
+	if err != nil {
+		t.Fatalf("claim halted channel: %v", err)
+	}
+	if item != nil {
+		t.Fatalf("claimed halted channel item: %#v", item)
+	}
+
+	globalID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueCleanupExpired,
+		IdempotencyKey: "cleanup_expired:global-channel-state-test:" + time.Now().UTC().Format("20060102150405.000000000"),
+		Payload:        map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("Enqueue global item: %v", err)
+	}
+	defer func() {
+		_, _ = fixture.Store.Pool.Exec(ctx, `
+			DELETE FROM channel_ops_queue_items WHERE id = $1::uuid
+		`, globalID)
+	}()
+	item, err = fixture.Store.ClaimNextForKinds(ctx, "global-worker", []string{QueueCleanupExpired})
+	if err != nil {
+		t.Fatalf("claim global item: %v", err)
+	}
+	if item == nil || item.ID != globalID {
+		t.Fatalf("global claim = %#v, want %s", item, globalID)
+	}
+}
+
+func TestQueueLeasePreventsStaleSuccessAndRetryAfterDeadLetter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	for _, completion := range []string{"success", "retry"} {
+		t.Run(completion, func(t *testing.T) {
+			channelID := fixture.ChannelID
+			_, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+				Kind:             QueueAccountHealth,
+				IdempotencyKey:   "account_health:" + fixture.AccountID + ":stale-" + completion,
+				Payload:          map[string]any{"account_id": fixture.AccountID},
+				ChannelProfileID: &channelID,
+			})
+			if err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			item, err := fixture.Store.ClaimNextForKinds(ctx, "lease-worker", []string{QueueAccountHealth})
+			if err != nil {
+				t.Fatalf("ClaimNextForKinds: %v", err)
+			}
+			if item == nil || item.LockedAt == nil || item.LockedBy == nil {
+				t.Fatalf("claimed item has no running lease: %#v", item)
+			}
+			if _, err := fixture.Store.Pool.Exec(ctx, `
+				UPDATE channel_ops_queue_items
+				SET status = $2, dead_letter_at = NOW(), locked_by = NULL, locked_at = NULL
+				WHERE id = $1::uuid
+			`, item.ID, QueueStatusDeadLettered); err != nil {
+				t.Fatalf("dead-letter claimed item: %v", err)
+			}
+
+			switch completion {
+			case "success":
+				err = fixture.Store.MarkQueueDone(ctx, *item)
+			case "retry":
+				err = fixture.Store.MarkQueueFailedOrRetry(ctx, *item, "stale runner failure")
+			}
+			if err != nil {
+				t.Fatalf("stale %s completion: %v", completion, err)
+			}
+
+			var status string
+			var lockedBy *string
+			var lockedAt *time.Time
+			var deadLetterAt *time.Time
+			if err := fixture.Store.Pool.QueryRow(ctx, `
+				SELECT status, locked_by, locked_at, dead_letter_at
+				FROM channel_ops_queue_items
+				WHERE id = $1::uuid
+			`, item.ID).Scan(&status, &lockedBy, &lockedAt, &deadLetterAt); err != nil {
+				t.Fatalf("select queue item: %v", err)
+			}
+			if status != QueueStatusDeadLettered || lockedBy != nil || lockedAt != nil || deadLetterAt == nil {
+				t.Fatalf("queue state after stale %s = %s/%v/%v/%v", completion, status, lockedBy, lockedAt, deadLetterAt)
+			}
+		})
 	}
 }

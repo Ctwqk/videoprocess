@@ -38,7 +38,7 @@ func (s *Store) CreateOrUpdatePublicationFromTask(ctx context.Context, task Prod
 	}
 
 	var publicationID string
-	err = s.Pool.QueryRow(ctx, `
+	err = s.db().QueryRow(ctx, `
 		WITH existing AS (
 			SELECT id FROM publication_records WHERE production_task_id = $1::uuid LIMIT 1
 		), updated AS (
@@ -139,7 +139,7 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 		status = "public"
 		publicAt = &now
 	}
-	_, err = s.Pool.Exec(ctx, `
+	_, err = s.db().Exec(ctx, `
 		UPDATE publication_records
 		SET desired_privacy = $2,
 		    current_privacy = CASE WHEN $3 = 'public' THEN $2 ELSE current_privacy END,
@@ -197,7 +197,7 @@ func (s *Store) GetPublication(ctx context.Context, publicationID string) (Publi
 	}
 	var row PublicationRow
 	var warningsJSON []byte
-	err := s.Pool.QueryRow(ctx, `
+	err := s.db().QueryRow(ctx, `
 		SELECT id, production_task_id, platform, account_id, platform_content_id, permalink,
 		       title, description, desired_privacy, current_privacy, publish_status,
 		       uploaded_at, scheduled_publish_at, public_at, compliance_disposition,
@@ -247,7 +247,7 @@ func (s *Store) UpdatePublicationStatus(ctx context.Context, publicationID strin
 	if privacy == "public" && (publishStatus == "" || publishStatus == "uploaded" || publishStatus == "scheduled") {
 		publishStatus = "public"
 	}
-	_, err := s.Pool.Exec(ctx, `
+	_, err := s.db().Exec(ctx, `
 		UPDATE publication_records
 		SET publish_status = COALESCE(NULLIF($2, ''), publish_status),
 		    current_privacy = COALESCE(NULLIF($3, ''), current_privacy),
@@ -272,7 +272,7 @@ func (s *Store) MarkPublicationSevereDedup(ctx context.Context, publication Publ
 	dedupKey := TakedownDedupKey(publication.ID, eventType, now)
 	rawJSON := mustJSON(status.Raw)
 	var existingID string
-	err := s.Pool.QueryRow(ctx, `
+	err := s.db().QueryRow(ctx, `
 		SELECT id
 		FROM takedown_events
 		WHERE publication_id = $1::uuid
@@ -286,7 +286,7 @@ func (s *Store) MarkPublicationSevereDedup(ctx context.Context, publication Publ
 		return err
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		_, err = s.Pool.Exec(ctx, `
+		_, err = s.db().Exec(ctx, `
 			INSERT INTO takedown_events (
 				id, publication_id, event_type, detected_at, severity, raw_payload_json, auto_actions_taken_json
 			)
@@ -296,7 +296,7 @@ func (s *Store) MarkPublicationSevereDedup(ctx context.Context, publication Publ
 			)
 		`, publication.ID, eventType, now.UTC(), rawJSON, dedupKey, now.UTC().Format(time.RFC3339))
 	} else {
-		_, err = s.Pool.Exec(ctx, `
+		_, err = s.db().Exec(ctx, `
 			UPDATE takedown_events
 			SET auto_actions_taken_json = (
 				COALESCE(auto_actions_taken_json, '[]'::json)::jsonb ||
@@ -312,7 +312,7 @@ func (s *Store) MarkPublicationSevereDedup(ctx context.Context, publication Publ
 	if eventType == "removed" || eventType == "claim" || eventType == "claimed" || eventType == "takedown" {
 		severeStatus = "removed"
 	}
-	if _, err := s.Pool.Exec(ctx, `
+	if _, err := s.db().Exec(ctx, `
 		UPDATE publication_records
 		SET publish_status = $2,
 		    current_privacy = COALESCE(NULLIF($3, ''), current_privacy),
@@ -339,7 +339,7 @@ func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication Publicatio
 	now := s.Now().UTC()
 	pollCount := intOrDefault(item.PayloadJSON["metrics_poll_count"], 0)
 	nextCount := pollCount + 1
-	if _, err := s.Pool.Exec(ctx, `
+	if _, err := s.db().Exec(ctx, `
 		UPDATE publication_records
 			SET last_metrics_polled_at = $2::timestamptz, updated_at = $2::timestamp
 		WHERE id = $1::uuid
@@ -380,7 +380,7 @@ func (s *Store) UpsertFeedbackSnapshot(ctx context.Context, publication Publicat
 		retentionJSON = mustJSON(retention)
 	}
 	values := feedbackValues(metrics)
-	_, err := s.Pool.Exec(ctx, `
+	_, err := s.db().Exec(ctx, `
 		INSERT INTO feedback_snapshots (
 			id, publication_id, snapshot_stage, collected_at, views, likes, comments, shares,
 			avg_view_duration_sec, retention_curve_json, ctr, impressions,
@@ -414,7 +414,7 @@ func (s *Store) UpsertFeedbackSnapshot(ctx context.Context, publication Publicat
 	if err != nil {
 		return err
 	}
-	if _, err := s.Pool.Exec(ctx, `
+	if _, err := s.db().Exec(ctx, `
 		UPDATE publication_records
 			SET last_metrics_polled_at = $2::timestamptz, updated_at = $2::timestamp
 		WHERE id = $1::uuid
@@ -441,7 +441,7 @@ func (s *Store) UpdateAccountHealth(ctx context.Context, accountID string, healt
 			"raw":             jsonObject(health.Raw),
 		},
 	})
-	_, err := s.Pool.Exec(ctx, `
+	_, err := s.db().Exec(ctx, `
 		UPDATE publishing_accounts
 		SET last_token_check_at = $2,
 		    last_token_check_status = $3,
@@ -472,7 +472,7 @@ func (s *Store) writeMaterialUsageLedgerFromTask(ctx context.Context, task Produ
 		if uuidPattern.MatchString(ref.AssetID) {
 			assetID = &ref.AssetID
 		}
-		_, err := s.Pool.Exec(ctx, `
+		_, err := s.db().Exec(ctx, `
 			INSERT INTO material_usage_ledger (
 				id, material_id, asset_id, channel_profile_id, topic_lane_id,
 				publishing_account_id, publication_id, used_at, segment_signature,
@@ -501,7 +501,7 @@ func (s *Store) getPublishingAccount(ctx context.Context, accountID string) (Pub
 		return PublishingAccountRow{}, err
 	}
 	var row PublishingAccountRow
-	err := s.Pool.QueryRow(ctx, `
+	err := s.db().QueryRow(ctx, `
 		SELECT id, channel_profile_id, platform, account_label, platform_account_id,
 		       enabled, paused_until, default_privacy, external_asset_auto_publish, created_at
 		FROM publishing_accounts
@@ -541,7 +541,7 @@ func (s *Store) updateTaskState(ctx context.Context, taskID string, state string
 	if failureCategory != "" {
 		categoryValue = &failureCategory
 	}
-	_, err := s.Pool.Exec(ctx, `
+	_, err := s.db().Exec(ctx, `
 		UPDATE production_tasks
 		SET state = $2::text,
 		    blocked_by_guard = $3::text,
@@ -568,7 +568,7 @@ func (s *Store) channelProfileIDForTask(ctx context.Context, taskID string) (str
 		return "", err
 	}
 	var channelProfileID string
-	err := s.Pool.QueryRow(ctx, `
+	err := s.db().QueryRow(ctx, `
 		SELECT channel_profile_id FROM production_tasks WHERE id = $1::uuid
 	`, taskID).Scan(&channelProfileID)
 	return channelProfileID, err

@@ -35,7 +35,7 @@ func (s *Store) CleanupExpired(ctx context.Context, now time.Time, cfg Retention
 	auditBefore := now.UTC().AddDate(0, 0, -cfg.AuditDays)
 	feedbackBefore := now.UTC().AddDate(0, 0, -cfg.FeedbackDays)
 
-	tag, err := s.Pool.Exec(ctx, `
+	tag, err := s.db().Exec(ctx, `
 		DELETE FROM channel_ops_queue_items
 		WHERE status IN ($1, $2, 'dead_letter')
 		  AND updated_at < $3::timestamp
@@ -45,7 +45,7 @@ func (s *Store) CleanupExpired(ctx context.Context, now time.Time, cfg Retention
 	}
 	result.QueueItemsDeleted = tag.RowsAffected()
 
-	tag, err = s.Pool.Exec(ctx, `
+	tag, err = s.db().Exec(ctx, `
 		DELETE FROM agent_tick_audits
 		WHERE started_at < $1::timestamptz
 	`, auditBefore)
@@ -54,7 +54,7 @@ func (s *Store) CleanupExpired(ctx context.Context, now time.Time, cfg Retention
 	}
 	result.TickAuditsDeleted = tag.RowsAffected()
 
-	tag, err = s.Pool.Exec(ctx, `
+	tag, err = s.db().Exec(ctx, `
 		DELETE FROM feedback_snapshots
 		WHERE collected_at < $1::timestamptz
 	`, feedbackBefore)

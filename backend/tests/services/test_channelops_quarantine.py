@@ -233,9 +233,15 @@ async def test_dry_run_reports_exact_changes_without_mutating(quarantine_session
     assert report["reason"] == QUARANTINE_REASON
     assert report["changed_ids"] == {
         "channel_ids": [str(rows["target"].id)],
-        "task_ids": [str(rows["active_task"].id)],
-        "job_ids": [str(rows["active_job"].id)],
-        "node_execution_ids": [str(rows["active_node"].id)],
+        "task_ids": sorted(
+            [str(rows["active_task"].id), str(rows["published_task"].id)]
+        ),
+        "job_ids": sorted(
+            [str(rows["active_job"].id), str(rows["published_job"].id)]
+        ),
+        "node_execution_ids": sorted(
+            [str(rows["active_node"].id), str(rows["published_node"].id)]
+        ),
         "queue_item_ids": sorted([str(rows["queued"].id), str(rows["running"].id)]),
     }
     assert report["counts"]["changed"] == {
@@ -307,13 +313,13 @@ async def test_apply_is_channel_specific_and_retains_publication_evidence(quaran
 
     assert rows["measured_task"].state == "measured"
     assert rows["measured_job"].status == JobStatus.SUCCEEDED
-    assert rows["published_task"].state == "producing"
-    assert rows["published_job"].status == JobStatus.RUNNING
-    assert rows["published_node"].status == NodeStatus.RUNNING
+    assert rows["published_task"].state == "held"
+    assert rows["published_job"].status == JobStatus.CANCELLED
+    assert rows["published_node"].status == NodeStatus.CANCELLED
     assert report["retained_ids"]["publication_ids"] == [str(rows["publication"].id)]
     assert report["retained_ids"]["feedback_snapshot_ids"] == [str(rows["feedback"].id)]
-    assert str(rows["published_task"].id) in report["retained_ids"]["task_ids"]
-    assert str(rows["published_job"].id) in report["retained_ids"]["job_ids"]
+    assert str(rows["published_task"].id) in report["changed_ids"]["task_ids"]
+    assert str(rows["published_job"].id) in report["changed_ids"]["job_ids"]
 
     assert rows["queued"].status == "dead_lettered"
     assert rows["running"].status == "dead_lettered"
@@ -327,6 +333,39 @@ async def test_apply_is_channel_specific_and_retains_publication_evidence(quaran
     assert rows["other_job"].status == JobStatus.RUNNING
     assert rows["other_node"].status == NodeStatus.RUNNING
     assert rows["other_queued"].status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_nonterminal_task_with_publication_is_held_but_evidence_is_retained(
+    quarantine_session,
+):
+    rows = await _seed_graph(quarantine_session)
+
+    report = await quarantine_channelops_backlog(
+        quarantine_session,
+        rows["target"].id,
+        apply=True,
+        now=NOW,
+    )
+
+    for key in (
+        "published_task",
+        "published_job",
+        "published_node",
+        "publication",
+        "feedback",
+    ):
+        await quarantine_session.refresh(rows[key])
+
+    assert rows["published_task"].state == "held"
+    assert rows["published_job"].status == JobStatus.CANCELLED
+    assert rows["published_node"].status == NodeStatus.CANCELLED
+    assert str(rows["published_task"].id) in report["changed_ids"]["task_ids"]
+    assert str(rows["published_job"].id) in report["changed_ids"]["job_ids"]
+    assert report["retained_ids"]["publication_ids"] == [str(rows["publication"].id)]
+    assert report["retained_ids"]["feedback_snapshot_ids"] == [str(rows["feedback"].id)]
+    assert rows["publication"].platform_content_id == "retained-video"
+    assert rows["feedback"].snapshot_stage == "24h"
 
 
 @pytest.mark.asyncio

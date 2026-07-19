@@ -36,7 +36,7 @@ func TestRunTickUsesTransactionForDecisionAuditWrites(t *testing.T) {
 		t.Fatalf("read store_tasks.go: %v", err)
 	}
 	text := string(source)
-	for _, want := range []string{"s.Pool.Begin(ctx)", "tx.Commit(ctx)", "tx.Rollback(ctx)"} {
+	for _, want := range []string{"s.beginOrReuse(ctx)", "tx.Commit(ctx)", "tx.Rollback(ctx)"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("RunTick transaction path missing %q", want)
 		}

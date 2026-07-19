@@ -92,7 +92,7 @@ func (s *Store) RecomputeLearningStateForSources(ctx context.Context, channelID 
 	}
 	now := s.Now().UTC()
 	since := now.AddDate(0, 0, -windowDays)
-	tx, err := s.Pool.Begin(ctx)
+	tx, ownsTransaction, err := s.beginOrReuse(ctx)
 	if err != nil {
 		return err
 	}
@@ -162,8 +162,10 @@ func (s *Store) RecomputeLearningStateForSources(ctx context.Context, channelID 
 			return err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
+	if ownsTransaction {
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
 	}
 	committed = true
 	return nil

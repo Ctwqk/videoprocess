@@ -100,7 +100,7 @@ func (r *Runner) runOnce(ctx context.Context) error {
 	if err := r.Handlers.Handle(ctx, *item); err != nil {
 		return r.Store.MarkQueueFailedOrRetry(ctx, *item, err.Error())
 	}
-	return r.Store.MarkQueueDone(ctx, item.ID)
+	return r.Store.MarkQueueDone(ctx, *item)
 }
 
 func ShouldRunScheduler(lastRun time.Time, now time.Time, pollSeconds int) bool {

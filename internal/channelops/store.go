@@ -13,10 +13,12 @@ type Store struct {
 	Pool               *pgxpool.Pool
 	Now                func() time.Time
 	DefaultMaxAttempts int
+	executionDB        dbExecutor
 }
 
 type dbExecutor interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
@@ -36,6 +38,27 @@ func (s *Store) Close() {
 	if s != nil && s.Pool != nil {
 		s.Pool.Close()
 	}
+}
+
+func (s *Store) db() dbExecutor {
+	if s != nil && s.executionDB != nil {
+		return s.executionDB
+	}
+	return s.Pool
+}
+
+func (s *Store) withExecutionDB(db dbExecutor) *Store {
+	clone := *s
+	clone.executionDB = db
+	return &clone
+}
+
+func (s *Store) beginOrReuse(ctx context.Context) (pgx.Tx, bool, error) {
+	if tx, ok := s.executionDB.(pgx.Tx); ok {
+		return tx, false, nil
+	}
+	tx, err := s.Pool.Begin(ctx)
+	return tx, true, err
 }
 
 func UTCBucket(now time.Time) string {

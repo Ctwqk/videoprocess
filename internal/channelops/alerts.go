@@ -160,7 +160,7 @@ func (a AlertPayload) queuePayload(now time.Time) map[string]any {
 }
 
 func (s *Store) EnqueueAlert(ctx context.Context, alert AlertPayload, priority int, parentQueueItemID string) (string, error) {
-	return s.enqueueAlert(ctx, s.Pool, alert, priority, parentQueueItemID)
+	return s.enqueueAlert(ctx, s.db(), alert, priority, parentQueueItemID)
 }
 
 func (s *Store) enqueueAlert(ctx context.Context, db dbExecutor, alert AlertPayload, priority int, parentQueueItemID string) (string, error) {
