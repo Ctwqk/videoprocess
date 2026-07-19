@@ -3,8 +3,47 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTENSION="$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
-CALLS="$(mktemp)"
-trap 'status=$?; rm -f "$CALLS"; exit "$status"' EXIT
+TEST_ROOT="$(mktemp -d)"
+CALLS="$TEST_ROOT/calls"
+ROOT="$TEST_ROOT/deploy-github-sync"
+FAKE_BIN="$TEST_ROOT/bin"
+FAKE_CRONTAB="$TEST_ROOT/crontab"
+FAKE_CRONTAB_CALLS="$TEST_ROOT/crontab-calls"
+VP_SOAK_WATCH_SOURCE="$ROOT_DIR/deploy/swarm/channelops-soak-watch.sh"
+trap 'status=$?; rm -rf "$TEST_ROOT"; exit "$status"' EXIT
+
+mkdir -p "$FAKE_BIN"
+cat >"$FAKE_BIN/crontab" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-l" ]]; then
+  if [[ -f "$FAKE_CRONTAB" ]]; then
+    cat "$FAKE_CRONTAB"
+    exit 0
+  fi
+  exit 1
+fi
+
+[[ "$#" -eq 1 ]]
+cp "$1" "$FAKE_CRONTAB"
+printf 'write\n' >>"$FAKE_CRONTAB_CALLS"
+printf 'crontab|install\n' >>"$CALLS"
+EOF
+chmod +x "$FAKE_BIN/crontab"
+export CALLS FAKE_CRONTAB FAKE_CRONTAB_CALLS
+PATH="$FAKE_BIN:$PATH"
+export PATH
+
+cat >"$FAKE_CRONTAB" <<EOF
+MAILTO=video-ops@example.com
+0 2 * * * /usr/local/bin/backup-video-state
+*/10 * * * * $VP_SOAK_WATCH_SOURCE >> $ROOT/logs/channelops-soak-watch.log 2>&1
+# BEGIN VIDEOPROCESS CHANNELOPS SOAK WATCH
+0 * * * * $ROOT/bin/channelops-soak-watch.sh --legacy
+# END VIDEOPROCESS CHANNELOPS SOAK WATCH
+@reboot /usr/local/bin/restore-video-network
+EOF
 
 REPO_ROOT=/home/taiwei/deploy-github-sync/repos
 BUILD_IMAGES=1
@@ -33,6 +72,15 @@ FAIL_HEALTH_CHECK=
 FAIL_NODE_UPDATE=false
 FAIL_NETWORK_INSPECT=false
 FAIL_PUBLISHER_CREATE=false
+FAIL_MANAGED_CRON_PRINTF=false
+
+printf() {
+  if [[ "$FAIL_MANAGED_CRON_PRINTF" == "true" \
+    && "${1:-}" == '%s\n%s\n%s\n' ]]; then
+    return 1
+  fi
+  builtin printf "$@"
+}
 
 log() {
   printf 'log|%s\n' "$*" >>"$CALLS"
@@ -214,6 +262,116 @@ source "$EXTENSION"
 images="$(build_vp_app_images 0123456789abcdef)"
 if ! deploy_vp_app_services $images >/dev/null; then
   echo 'FAIL: deploy_vp_app_services returned non-zero' >&2
+  exit 1
+fi
+
+if [[ ! -x "$ROOT/bin/channelops-soak-watch.sh" ]]; then
+  echo 'FAIL: successful deployment did not install an executable soak watcher' >&2
+  exit 1
+fi
+if ! cmp -s "$VP_SOAK_WATCH_SOURCE" "$ROOT/bin/channelops-soak-watch.sh"; then
+  echo 'FAIL: installed soak watcher differs from the repository source' >&2
+  exit 1
+fi
+cat >"$TEST_ROOT/expected-crontab" <<EOF
+MAILTO=video-ops@example.com
+0 2 * * * /usr/local/bin/backup-video-state
+@reboot /usr/local/bin/restore-video-network
+# BEGIN VIDEOPROCESS CHANNELOPS SOAK WATCH
+*/5 * * * * DEPLOY_GITHUB_SYNC_ROOT=$ROOT $ROOT/bin/channelops-soak-watch.sh >> $ROOT/logs/channelops-soak-watch.log 2>&1
+# END VIDEOPROCESS CHANNELOPS SOAK WATCH
+EOF
+if ! cmp -s "$TEST_ROOT/expected-crontab" "$FAKE_CRONTAB"; then
+  echo 'FAIL: managed soak watcher cron did not preserve unrelated entries exactly' >&2
+  diff -u "$TEST_ROOT/expected-crontab" "$FAKE_CRONTAB" >&2 || true
+  exit 1
+fi
+if [[ "$(grep -Fc '# BEGIN VIDEOPROCESS CHANNELOPS SOAK WATCH' "$FAKE_CRONTAB" || true)" -ne 1 \
+  || "$(grep -Fc '# END VIDEOPROCESS CHANNELOPS SOAK WATCH' "$FAKE_CRONTAB" || true)" -ne 1 ]]; then
+  echo 'FAIL: successful deployment must leave exactly one managed cron block' >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'channelops-soak-watch.sh' "$FAKE_CRONTAB" || true)" -ne 1 ]]; then
+  echo 'FAIL: successful deployment must leave exactly one soak watcher cron command' >&2
+  exit 1
+fi
+if grep -Fq '*/10 * * * *' "$FAKE_CRONTAB"; then
+  echo 'FAIL: successful deployment retained the historical unmarked watcher line' >&2
+  exit 1
+fi
+final_health_line="$(grep -nF 'running|vp-youtube-publisher-swarm' "$CALLS" | tail -n 1 | cut -d: -f1)"
+cron_install_line="$(grep -nF 'crontab|install' "$CALLS" | tail -n 1 | cut -d: -f1)"
+if [[ -z "$final_health_line" || -z "$cron_install_line" \
+  || "$final_health_line" -ge "$cron_install_line" ]]; then
+  echo 'FAIL: soak watcher cron must install after every VP service health check passes' >&2
+  exit 1
+fi
+
+cp "$FAKE_CRONTAB" "$TEST_ROOT/cron-after-first-install"
+if ! deploy_vp_app_services $images >/dev/null; then
+  echo 'FAIL: repeated deploy_vp_app_services returned non-zero' >&2
+  exit 1
+fi
+if ! cmp -s "$TEST_ROOT/cron-after-first-install" "$FAKE_CRONTAB"; then
+  echo 'FAIL: repeated watcher installation is not idempotent' >&2
+  exit 1
+fi
+
+cp "$FAKE_CRONTAB" "$TEST_ROOT/cron-before-skips"
+cron_writes_before="$(wc -l <"$FAKE_CRONTAB_CALLS" | tr -d ' ')"
+UPDATE_SERVICES=0
+if ! deploy_vp_app_services $images >/dev/null; then
+  echo 'FAIL: UPDATE_SERVICES=0 deployment returned non-zero' >&2
+  exit 1
+fi
+UPDATE_SERVICES=1
+if ! cmp -s "$TEST_ROOT/cron-before-skips" "$FAKE_CRONTAB"; then
+  echo 'FAIL: UPDATE_SERVICES=0 rewrote the crontab' >&2
+  exit 1
+fi
+
+FAIL_RUNNING_SERVICE=vp-api-swarm
+if deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: failed service convergence unexpectedly succeeded' >&2
+  exit 1
+fi
+FAIL_RUNNING_SERVICE=
+if ! cmp -s "$TEST_ROOT/cron-before-skips" "$FAKE_CRONTAB"; then
+  echo 'FAIL: failed service convergence rewrote the crontab' >&2
+  exit 1
+fi
+
+printf 'if then\n' >"$TEST_ROOT/invalid-channelops-soak-watch.sh"
+VP_SOAK_WATCH_SOURCE="$TEST_ROOT/invalid-channelops-soak-watch.sh"
+if deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: invalid watcher syntax unexpectedly allowed deployment' >&2
+  exit 1
+fi
+VP_SOAK_WATCH_SOURCE="$ROOT_DIR/deploy/swarm/channelops-soak-watch.sh"
+if ! cmp -s "$TEST_ROOT/cron-before-skips" "$FAKE_CRONTAB"; then
+  echo 'FAIL: invalid watcher syntax rewrote the crontab' >&2
+  exit 1
+fi
+
+TMPDIR="$TEST_ROOT/tmp"
+mkdir -p "$TMPDIR"
+FAIL_MANAGED_CRON_PRINTF=true
+if vp_install_soak_watch >/dev/null 2>&1; then
+  echo 'FAIL: managed cron rendering failure unexpectedly succeeded' >&2
+  exit 1
+fi
+FAIL_MANAGED_CRON_PRINTF=false
+if ! cmp -s "$TEST_ROOT/cron-before-skips" "$FAKE_CRONTAB"; then
+  echo 'FAIL: managed cron rendering failure rewrote the crontab' >&2
+  exit 1
+fi
+if [[ -n "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  echo 'FAIL: managed cron rendering failure leaked a temporary path' >&2
+  exit 1
+fi
+cron_writes_after="$(wc -l <"$FAKE_CRONTAB_CALLS" | tr -d ' ')"
+if [[ "$cron_writes_after" -ne "$cron_writes_before" ]]; then
+  echo 'FAIL: skipped or failed deployment called crontab with an install file' >&2
   exit 1
 fi
 

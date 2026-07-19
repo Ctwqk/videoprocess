@@ -609,6 +609,92 @@ vp_restore_app_snapshots() {
   return "$status"
 }
 
+vp_install_soak_watch() {
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    log "ChannelOps soak watcher install skipped"
+    return 0
+  fi
+
+  local sync_root="${ROOT:-}"
+  if [[ -z "$sync_root" ]]; then
+    echo "ROOT must be set by deploy-github-sync.sh" >&2
+    return 1
+  fi
+
+  local source="${VP_SOAK_WATCH_SOURCE:-$REPO_ROOT/videoprocess/deploy/swarm/channelops-soak-watch.sh}"
+  if [[ ! -r "$source" ]]; then
+    echo "ChannelOps soak watcher source is not readable: $source" >&2
+    return 1
+  fi
+  if ! bash -n "$source"; then
+    echo "ChannelOps soak watcher source has invalid syntax: $source" >&2
+    return 1
+  fi
+
+  local target="$sync_root/bin/channelops-soak-watch.sh"
+  local log_file="$sync_root/logs/channelops-soak-watch.log"
+  mkdir -p "$sync_root/bin" "$sync_root/logs" "$sync_root/state" || return 1
+  install -m 0755 "$source" "$target" || return 1
+
+  local cron_begin="# BEGIN VIDEOPROCESS CHANNELOPS SOAK WATCH"
+  local cron_end="# END VIDEOPROCESS CHANNELOPS SOAK WATCH"
+  local cron_command="*/5 * * * * DEPLOY_GITHUB_SYNC_ROOT=$sync_root $target >> $log_file 2>&1"
+  local temp_dir
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/vp-soak-watch-cron.XXXXXX")" || return 1
+  local current_cron="$temp_dir/current"
+  local next_cron="$temp_dir/next"
+
+  if ! crontab -l >"$current_cron" 2>/dev/null; then
+    : >"$current_cron"
+  fi
+  if ! awk -v begin="$cron_begin" -v end="$cron_end" -v watcher="channelops-soak-watch.sh" '
+    BEGIN { in_managed = 0; invalid = 0 }
+    $0 == begin {
+      if (in_managed) {
+        invalid = 1
+        exit
+      }
+      in_managed = 1
+      next
+    }
+    $0 == end {
+      if (!in_managed) {
+        invalid = 1
+        exit
+      }
+      in_managed = 0
+      next
+    }
+    in_managed { next }
+    $0 !~ /^[[:space:]]*#/ && index($0, watcher) != 0 { next }
+    { print }
+    END {
+      if (in_managed) {
+        invalid = 1
+      }
+      if (invalid) {
+        exit 1
+      }
+    }
+  ' "$current_cron" >"$next_cron"; then
+    echo "ChannelOps soak watcher managed cron block is malformed" >&2
+    rm -rf "$temp_dir"
+    return 1
+  fi
+
+  if ! printf '%s\n%s\n%s\n' "$cron_begin" "$cron_command" "$cron_end" >>"$next_cron"; then
+    echo "ChannelOps soak watcher managed cron render failed" >&2
+    rm -rf "$temp_dir"
+    return 1
+  fi
+  if ! crontab "$next_cron"; then
+    echo "ChannelOps soak watcher crontab install failed" >&2
+    rm -rf "$temp_dir"
+    return 1
+  fi
+  rm -rf "$temp_dir"
+}
+
 vp_apply_app_services() {
   local api="$1"
   local frontend="$2"
@@ -632,6 +718,7 @@ vp_apply_app_services() {
   for service in $VP_APP_SERVICES; do
     swarm_service_running "$service" || return 1
   done
+  vp_install_soak_watch || return 1
 }
 
 deploy_vp_app_services() {
