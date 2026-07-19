@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent.constants import TERMINAL_TASK_STATES
@@ -117,13 +119,19 @@ async def quarantine_channelops_backlog(
         schedule = None
         previous_schedule_state = None
         if close_schedule:
-            schedule_stmt = select(RuntimeSchedule).where(
-                RuntimeSchedule.service_name == VIDEO_SCHEDULE_SERVICE
-            )
             if apply:
-                schedule_stmt = schedule_stmt.with_for_update()
-            schedule = (await db.execute(schedule_stmt)).scalar_one_or_none()
-            previous_schedule_state = schedule.state if schedule is not None else None
+                schedule, schedule_created = await _create_or_lock_runtime_schedule(
+                    db,
+                    reason=reason,
+                    changed_at=changed_at,
+                )
+                previous_schedule_state = None if schedule_created else schedule.state
+            else:
+                schedule_stmt = select(RuntimeSchedule).where(
+                    RuntimeSchedule.service_name == VIDEO_SCHEDULE_SERVICE
+                )
+                schedule = (await db.execute(schedule_stmt)).scalar_one_or_none()
+                previous_schedule_state = schedule.state if schedule is not None else None
         schedule_changed = (
             close_schedule and previous_schedule_state != VideoScheduleState.CLOSED.value
         )
@@ -143,19 +151,10 @@ async def quarantine_channelops_backlog(
             for item in changed_queue_items:
                 _dead_letter_queue_item(item, changed_at, reason)
             if close_schedule:
-                if schedule is None:
-                    db.add(
-                        RuntimeSchedule(
-                            service_name=VIDEO_SCHEDULE_SERVICE,
-                            state=VideoScheduleState.CLOSED.value,
-                            updated_by=reason,
-                            updated_at=changed_at,
-                        )
-                    )
-                else:
-                    schedule.state = VideoScheduleState.CLOSED.value
-                    schedule.updated_by = reason
-                    schedule.updated_at = changed_at
+                assert schedule is not None
+                schedule.state = VideoScheduleState.CLOSED.value
+                schedule.updated_by = reason
+                schedule.updated_at = changed_at
 
         changed_ids = {
             "channel_ids": [str(channel.id)] if channel_changed else [],
@@ -190,6 +189,38 @@ async def quarantine_channelops_backlog(
                 "retained": {key: len(value) for key, value in retained_ids.items()},
             },
         }
+
+
+async def _create_or_lock_runtime_schedule(
+    db: AsyncSession,
+    *,
+    reason: str,
+    changed_at: datetime,
+) -> tuple[RuntimeSchedule, bool]:
+    dialect_name = db.get_bind().dialect.name
+    insert_values = {
+        "service_name": VIDEO_SCHEDULE_SERVICE,
+        "state": VideoScheduleState.CLOSED.value,
+        "updated_by": reason,
+        "updated_at": changed_at,
+    }
+    if dialect_name == "postgresql":
+        insert_stmt = postgresql_insert(RuntimeSchedule).values(**insert_values)
+    elif dialect_name == "sqlite":
+        insert_stmt = sqlite_insert(RuntimeSchedule).values(**insert_values)
+    else:
+        raise RuntimeError(f"Unsupported runtime schedule dialect: {dialect_name}")
+
+    result = await db.execute(
+        insert_stmt.on_conflict_do_nothing(index_elements=[RuntimeSchedule.service_name])
+    )
+    schedule_stmt = (
+        select(RuntimeSchedule)
+        .where(RuntimeSchedule.service_name == VIDEO_SCHEDULE_SERVICE)
+        .with_for_update()
+    )
+    schedule = (await db.execute(schedule_stmt)).scalar_one()
+    return schedule, result.rowcount == 1
 
 
 async def _publications_for_tasks(

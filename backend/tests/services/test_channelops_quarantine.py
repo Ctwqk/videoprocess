@@ -387,6 +387,56 @@ async def test_apply_uses_custom_reason_and_closes_schedule_atomically(quarantin
 
 
 @pytest.mark.asyncio
+async def test_close_schedule_reuses_conflicting_schedule_row(quarantine_session, monkeypatch):
+    rows = await _seed_graph(quarantine_session)
+    quarantine_session.add(
+        RuntimeSchedule(
+            service_name=VIDEO_SCHEDULE_SERVICE,
+            state=VideoScheduleState.OPEN.value,
+            updated_by="scheduler",
+            updated_at=NOW,
+        )
+    )
+    await quarantine_session.commit()
+
+    schedule_inserts = []
+    original_execute = quarantine_session.execute
+
+    async def track_schedule_insert(statement, *args, **kwargs):
+        if getattr(getattr(statement, "table", None), "name", None) == RuntimeSchedule.__tablename__:
+            schedule_inserts.append(statement)
+        return await original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(quarantine_session, "execute", track_schedule_insert)
+
+    report = await quarantine_channelops_backlog(
+        quarantine_session,
+        rows["target"].id,
+        apply=True,
+        now=NOW,
+        reason=SOAK_REASON,
+        close_schedule=True,
+    )
+
+    assert schedule_inserts
+    compiled = str(schedule_inserts[0].compile(dialect=quarantine_session.bind.dialect))
+    assert "ON CONFLICT" in compiled
+    assert "DO NOTHING" in compiled
+    assert report["schedule"] == {
+        "requested_close": True,
+        "changed": True,
+        "previous_state": "OPEN",
+        "final_state": "CLOSED",
+    }
+    schedule = await quarantine_session.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+    assert schedule is not None
+    assert schedule.state == VideoScheduleState.CLOSED.value
+    assert schedule.updated_by == SOAK_REASON
+    assert rows["target"].halt_reason == SOAK_REASON
+    assert rows["active_task"].blocked_by_guard == SOAK_REASON
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reason", ["", "x" * 256])
 async def test_rejects_invalid_reason_before_mutation(quarantine_session, reason):
     rows = await _seed_graph(quarantine_session)
