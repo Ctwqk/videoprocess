@@ -2,8 +2,6 @@ package httpapi
 
 import (
 	"net/http"
-
-	"github.com/Ctwqk/videoprocess/internal/store"
 )
 
 func (s *Server) openVideoSchedule(w http.ResponseWriter, r *http.Request) {
@@ -19,12 +17,14 @@ func (s *Server) closeVideoSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setVideoSchedule(w http.ResponseWriter, r *http.Request, state string) {
-	s.withWriteStore(w, func(st *store.Store) {
-		row, err := st.SetVideoScheduleState(r.Context(), state)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, row)
-	})
+	if s.schedule == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "database unavailable"})
+		return
+	}
+	row, err := s.schedule.SetState(r.Context(), state)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, row)
 }

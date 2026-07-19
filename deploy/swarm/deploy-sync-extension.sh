@@ -78,7 +78,8 @@ vp_update_runtime_service() {
     for api_env_key in \
       DATABASE_URL \
       VP_GO_ORCHESTRATOR_ENABLED \
-      VP_GO_ORCHESTRATOR_JOB_WRITES; do
+      VP_GO_ORCHESTRATOR_JOB_WRITES \
+      VP_PYTHON_SCHEDULE_URL; do
       if vp_service_values "$service" \
         '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
         | awk -F= -v key="$api_env_key" \
@@ -93,6 +94,8 @@ vp_update_runtime_service() {
       "VP_GO_ORCHESTRATOR_ENABLED=true"
       --env-add
       "VP_GO_ORCHESTRATOR_JOB_WRITES=true"
+      --env-add
+      "VP_PYTHON_SCHEDULE_URL=http://vp-autoflow-api-swarm:8080"
     )
   fi
   if [[ "$service" == "vp-ffmpeg-worker-go-swarm" ]]; then

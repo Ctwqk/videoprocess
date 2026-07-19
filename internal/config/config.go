@@ -40,6 +40,7 @@ type Config struct {
 	GoEventStream                         string
 	GoOrchestratorRecoveryIntervalSeconds int
 	GoOrchestratorStaleNodeSeconds        int
+	PythonScheduleURL                     string
 }
 
 func Load() Config {
@@ -77,6 +78,7 @@ func Load() Config {
 		GoEventStream:                         env("VP_GO_EVENT_STREAM", "vp:events:go"),
 		GoOrchestratorRecoveryIntervalSeconds: intEnv("VP_GO_ORCHESTRATOR_RECOVERY_INTERVAL_SECONDS", 60),
 		GoOrchestratorStaleNodeSeconds:        intEnv("VP_GO_ORCHESTRATOR_STALE_NODE_SECONDS", 600),
+		PythonScheduleURL:                     env("VP_PYTHON_SCHEDULE_URL", "http://vp-autoflow-api-swarm:8080"),
 	}
 }
 

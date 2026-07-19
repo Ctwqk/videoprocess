@@ -19,6 +19,7 @@ type Server struct {
 	allowStubStore bool
 	goJobsEnabled  bool
 	goJobs         GoJobService
+	schedule       ScheduleController
 }
 
 type ServerOptions struct {
@@ -28,6 +29,7 @@ type ServerOptions struct {
 	StorageBackend string
 	GoJobsEnabled  bool
 	GoJobs         GoJobService
+	Schedule       ScheduleController
 }
 
 // NewServer constructs a Server without a backing store. Useful for tests
@@ -38,10 +40,14 @@ func NewServer() *Server {
 
 // NewServerWithStore is the production constructor used by cmd/vp-api.
 func NewServerWithStore(s *store.Store) *Server {
-	return &Server{store: s, allowStubStore: true}
+	return &Server{store: s, allowStubStore: true, schedule: NewStoreScheduleController(s)}
 }
 
 func NewServerWithOptions(s *store.Store, opts ServerOptions) *Server {
+	schedule := opts.Schedule
+	if schedule == nil && s != nil {
+		schedule = NewStoreScheduleController(s)
+	}
 	return &Server{
 		store:          s,
 		storage:        opts.Storage,
@@ -50,6 +56,7 @@ func NewServerWithOptions(s *store.Store, opts ServerOptions) *Server {
 		allowStubStore: opts.AllowStubStore,
 		goJobsEnabled:  opts.GoJobsEnabled,
 		goJobs:         opts.GoJobs,
+		schedule:       schedule,
 	}
 }
 

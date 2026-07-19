@@ -105,6 +105,12 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run exactly one guarded live unlisted YouTube canary")
     parser.add_argument("--confirm-live-unlisted", action="store_true", default=False)
@@ -253,6 +259,12 @@ def runner_task_wait_seconds(environment_output: str) -> int:
     else:
         raise CanaryError("deployed runner CHANNELOPS_THROTTLE_ENABLED is malformed")
     return max(regular_poll, throttle_poll) + RUNNER_POLL_CUSHION_SECONDS
+
+
+def channelops_wait_seconds(*, timeout_seconds: float, deployed_wait_seconds: float) -> float:
+    if timeout_seconds <= 0 or deployed_wait_seconds <= 0:
+        raise CanaryError("ChannelOps wait budgets must be positive")
+    return min(timeout_seconds, deployed_wait_seconds)
 
 
 def evidence_path(args: argparse.Namespace, run_id: str) -> Path:
@@ -1429,11 +1441,12 @@ async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, 
             ).scalars()
         ) if job_ids else []
         cancelled_job_ids: list[str] = []
+        naive_now = naive_utc(now)
         for job in jobs:
             if job.status not in RUNNABLE_JOB_STATUSES:
                 continue
             job.status = JobStatus.CANCELLED
-            job.completed_at = now
+            job.completed_at = naive_now
             job.error_message = CANARY_FAILURE_REASON
             cancelled_job_ids.append(str(job.id))
         nodes = list(
@@ -1446,7 +1459,7 @@ async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, 
             if node.status not in ACTIVE_NODE_STATUSES:
                 continue
             node.status = NodeStatus.CANCELLED
-            node.completed_at = now
+            node.completed_at = naive_now
             node.worker_id = None
             node.error_message = CANARY_FAILURE_REASON
             cancelled_node_ids.append(str(node.id))
@@ -1511,11 +1524,15 @@ async def execute_canary(
 
     evidence["queue"] = {"agent_tick_id": graph["agent_tick_id"]}
     task_wait_seconds = float(evidence["deployment"]["channelops_task_wait_seconds"])
+    channelops_wait = channelops_wait_seconds(
+        timeout_seconds=args.timeout_seconds,
+        deployed_wait_seconds=task_wait_seconds,
+    )
     task, plan_item = await wait_for_single_task_and_preapprove(
         db,
         uuid.UUID(graph["channel_id"]),
         evidence["run_id"],
-        min(args.timeout_seconds, task_wait_seconds),
+        channelops_wait,
     )
     evidence["task"] = {
         "id": str(task.id),
@@ -1613,7 +1630,7 @@ async def execute_canary(
     await wait_for_queue_success(
         db,
         promotion.id,
-        min(args.timeout_seconds, 180.0),
+        channelops_wait,
         "immediate unlisted promotion",
     )
     evidence["publication"]["after_immediate_promotion"] = await assert_promotion_succeeded(
@@ -1635,12 +1652,12 @@ async def execute_canary(
     await wait_for_queue_success(
         db,
         metrics_item.id,
-        min(args.timeout_seconds, 180.0),
+        channelops_wait,
         "immediate metrics probe",
     )
     durable_pending = await pending_metrics_rows(db, publication.id)
     if immediate_metrics:
-        snapshot = await wait_for_feedback_snapshot(db, publication.id, min(args.timeout_seconds, 180.0))
+        snapshot = await wait_for_feedback_snapshot(db, publication.id, channelops_wait)
         evidence["feedback"] = {
             "immediate_platform_feedback": {
                 "available": True,

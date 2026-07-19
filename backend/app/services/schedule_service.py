@@ -148,6 +148,7 @@ async def list_waiting_video_jobs(db: AsyncSession) -> list[Job]:
     stmt = (
         select(Job)
         .where(Job.status == JobStatus.WAITING_WINDOW)
+        .where(Job.orchestrator_owner == "python")
         .options(selectinload(Job.node_executions))
         .order_by(Job.submitted_at.asc(), Job.id.asc())
     )
@@ -181,6 +182,7 @@ async def load_video_jobs_for_recovery(db: AsyncSession) -> list[Job]:
                 ]
             )
         )
+        .where(Job.orchestrator_owner == "python")
         .options(selectinload(Job.node_executions))
     )
     result = await db.execute(stmt)

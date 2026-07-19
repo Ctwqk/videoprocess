@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import uuid
+from datetime import timezone
 from pathlib import Path
 from types import ModuleType
 
@@ -21,6 +22,8 @@ from app.models.channel_agent import (
     PublishingAccount,
     TopicLane,
 )
+from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.services.schedule_service import load_video_jobs_for_recovery, release_waiting_video_jobs
 
 
 TABLES = [
@@ -30,6 +33,8 @@ TABLES = [
     PublishingAccount.__table__,
     LaneFormatMatrix.__table__,
     ManualSeed.__table__,
+    Job.__table__,
+    NodeExecution.__table__,
     ProductionTask.__table__,
     PublicationRecord.__table__,
     ChannelOpsQueueItem.__table__,
@@ -50,9 +55,6 @@ async def db():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         await connection.run_sync(lambda sync_connection: Base.metadata.create_all(sync_connection, tables=TABLES))
-        await connection.exec_driver_sql(
-            "CREATE TABLE jobs (id CHAR(32) PRIMARY KEY NOT NULL, status VARCHAR(32) NOT NULL)"
-        )
     async with AsyncSession(engine, expire_on_commit=False) as session:
         yield session
     await engine.dispose()
@@ -251,6 +253,111 @@ def test_runner_task_wait_covers_deployed_daytime_throttle():
     )
 
     assert wait_seconds == 360
+
+
+def test_channelops_wait_budget_covers_deployed_runner_poll():
+    runner = load_runner()
+
+    wait_seconds = runner.channelops_wait_seconds(
+        timeout_seconds=1_200,
+        deployed_wait_seconds=360,
+    )
+
+    assert wait_seconds == 360
+
+
+@pytest.mark.anyio
+async def test_failure_cleanup_uses_naive_utc_for_job_and_node_columns(db: AsyncSession):
+    runner = load_runner()
+    channel = ChannelProfile(name="failed canary", dry_run=False)
+    db.add(channel)
+    await db.flush()
+    job = Job(
+        pipeline_id=uuid.uuid4(),
+        pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+        status=JobStatus.PENDING,
+    )
+    db.add(job)
+    await db.flush()
+    node = NodeExecution(
+        job_id=job.id,
+        node_id="source_1",
+        node_type="source",
+        status=NodeStatus.PENDING,
+    )
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=uuid.uuid4(),
+        prompt="owned canary",
+        state="producing",
+        job_id=job.id,
+    )
+    queue_item = ChannelOpsQueueItem(
+        kind="observe_job",
+        idempotency_key=f"observe_job:{job.id}:test",
+        channel_profile_id=channel.id,
+        payload_json={"job_id": str(job.id)},
+    )
+    db.add_all((node, task, queue_item))
+    await db.commit()
+
+    report = await runner.failure_cleanup(db, channel.id)
+
+    assert report["cancelled_job_ids"] == [str(job.id)]
+    assert report["cancelled_node_execution_ids"] == [str(node.id)]
+    assert job.status == JobStatus.CANCELLED
+    assert job.completed_at is not None and job.completed_at.tzinfo is None
+    assert node.status == NodeStatus.CANCELLED
+    assert node.completed_at is not None and node.completed_at.tzinfo is None
+    assert task.state == "held"
+    assert task.state_updated_at.tzinfo is timezone.utc
+    assert queue_item.status == "dead_lettered"
+
+
+@pytest.mark.anyio
+async def test_python_schedule_releases_only_python_owned_jobs(db: AsyncSession):
+    python_job = Job(
+        pipeline_id=uuid.uuid4(),
+        pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+        status=JobStatus.WAITING_WINDOW,
+        orchestrator_owner="python",
+    )
+    go_job = Job(
+        pipeline_id=uuid.uuid4(),
+        pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+        status=JobStatus.WAITING_WINDOW,
+        orchestrator_owner="go",
+    )
+    db.add_all((python_job, go_job))
+    await db.commit()
+
+    released = await release_waiting_video_jobs(db)
+
+    assert released == [str(python_job.id)]
+    assert python_job.status == JobStatus.PENDING
+    assert go_job.status == JobStatus.WAITING_WINDOW
+
+
+@pytest.mark.anyio
+async def test_python_recovery_loads_only_python_owned_jobs(db: AsyncSession):
+    python_job = Job(
+        pipeline_id=uuid.uuid4(),
+        pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+        status=JobStatus.PENDING,
+        orchestrator_owner="python",
+    )
+    go_job = Job(
+        pipeline_id=uuid.uuid4(),
+        pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+        status=JobStatus.PENDING,
+        orchestrator_owner="go",
+    )
+    db.add_all((python_job, go_job))
+    await db.commit()
+
+    jobs = await load_video_jobs_for_recovery(db)
+
+    assert [job.id for job in jobs] == [python_job.id]
 
 
 @pytest.mark.anyio

@@ -55,12 +55,17 @@ func main() {
 		defer st.Close()
 		pgProbe = st.Ping
 		goJobService := buildGoOrchestrator(rootCtx, cfg, st)
+		schedule := httpapi.NewCoordinatedScheduleController(
+			httpapi.NewStoreScheduleController(st),
+			httpapi.NewHTTPScheduleController(cfg.PythonScheduleURL, &http.Client{Timeout: 10 * time.Second}),
+		)
 		server = httpapi.NewServerWithOptions(st, httpapi.ServerOptions{
 			AllowStubStore: cfg.APIGoAllowStubStore,
 			Storage:        storageBackend,
 			StorageBackend: cfg.StorageBackend,
 			GoJobsEnabled:  cfg.GoOrchestratorEnabled && cfg.GoOrchestratorJobWrites && goJobService != nil,
 			GoJobs:         goJobService,
+			Schedule:       schedule,
 			Readiness: httpapi.ReadinessDeps{
 				Postgres: pgProbe,
 				Redis:    redisProbe,

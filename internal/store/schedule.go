@@ -38,6 +38,7 @@ func (s *Store) SetVideoScheduleState(ctx context.Context, state string) (VideoS
 			UPDATE jobs
 			SET status = 'PENDING', error_message = NULL, completed_at = NULL
 			WHERE status = 'WAITING_WINDOW'
+			  AND orchestrator_owner = 'go'
 		`)
 		if err != nil {
 			return VideoScheduleStatusRow{}, err

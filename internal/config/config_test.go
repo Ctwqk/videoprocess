@@ -74,4 +74,7 @@ func TestGoOrchestratorFlagsDefaultClosed(t *testing.T) {
 	if cfg.GoOrchestratorStaleNodeSeconds != 600 {
 		t.Fatalf("GoOrchestratorStaleNodeSeconds = %d", cfg.GoOrchestratorStaleNodeSeconds)
 	}
+	if cfg.PythonScheduleURL != "http://vp-autoflow-api-swarm:8080" {
+		t.Fatalf("PythonScheduleURL = %q", cfg.PythonScheduleURL)
+	}
 }

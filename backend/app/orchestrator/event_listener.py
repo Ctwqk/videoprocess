@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio
-import json
 import logging
 import uuid
 
@@ -14,6 +13,19 @@ CONSUMER_GROUP = "orchestrator"
 CONSUMER_NAME = "orchestrator-api-1"
 PEL_RECLAIM_INTERVAL = 60  # seconds
 PEL_MIN_IDLE = 30000       # ms
+REDIS_BLOCK_MILLISECONDS = 5000
+REDIS_SOCKET_TIMEOUT_SECONDS = 30.0
+
+
+def _redis() -> aioredis.Redis:
+    return aioredis.from_url(
+        settings.redis_url,
+        decode_responses=True,
+        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+        socket_connect_timeout=5.0,
+        health_check_interval=30,
+        retry_on_timeout=True,
+    )
 
 
 async def _reclaim_pending(r: aioredis.Redis) -> None:
@@ -40,7 +52,7 @@ async def _reclaim_pending(r: aioredis.Redis) -> None:
 
 async def event_listener() -> None:
     """Background task that consumes worker events from Redis Stream and drives the orchestrator."""
-    r = aioredis.from_url(settings.redis_url, decode_responses=True)
+    r = _redis()
 
     # Create consumer group (ignore if already exists)
     try:
@@ -70,7 +82,7 @@ async def event_listener() -> None:
                     CONSUMER_NAME,
                     {EVENT_STREAM: ">"},
                     count=10,
-                    block=5000,  # block 5 seconds
+                    block=REDIS_BLOCK_MILLISECONDS,
                 )
 
                 if not messages:
