@@ -262,6 +262,12 @@ run_watcher
 assert_contains 'status=configuration_error reason=invalid_started_at' "$OUTPUT"
 [[ ! -s "$CALLS" ]] || fail "impossible timestamp contacted Docker"
 
+write_state true 123e4567-e89b-12d3-a456-426614174000 2099-07-19T18:30:00Z
+run_watcher
+[[ "$WATCHER_EXIT" -ne 0 ]] || fail "future activation timestamp must fail"
+assert_contains 'status=configuration_error reason=future_started_at' "$OUTPUT"
+[[ ! -s "$CALLS" ]] || fail "future timestamp contacted Docker"
+
 write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:30:00Z 0
 run_watcher
 [[ "$WATCHER_EXIT" -ne 0 ]] || fail "non-positive threshold must fail"

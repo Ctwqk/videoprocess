@@ -50,6 +50,16 @@ is_rfc3339_utc() {
   [[ "$day" -le "$max_day" ]]
 }
 
+rfc3339_utc_epoch() {
+  local value="$1"
+  local normalized="$value"
+  if [[ "$normalized" == *.*Z ]]; then
+    normalized="${normalized%%.*}Z"
+  fi
+  date -u -d "$normalized" +%s 2>/dev/null \
+    || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$normalized" +%s 2>/dev/null
+}
+
 sync_root="${DEPLOY_GITHUB_SYNC_ROOT:-/home/taiwei/deploy-github-sync}"
 state_file="$sync_root/state/vp-soak-watch.env"
 
@@ -81,6 +91,13 @@ if [[ ! "$channel_id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdi
 fi
 if ! is_rfc3339_utc "$started_at"; then
   configuration_error invalid_started_at
+fi
+if ! started_at_epoch="$(rfc3339_utc_epoch "$started_at")"; then
+  configuration_error invalid_started_at
+fi
+now_epoch="$(date -u +%s)"
+if (( started_at_epoch > now_epoch + 300 )); then
+  configuration_error future_started_at
 fi
 if ! is_positive_integer "$max_publications"; then
   configuration_error invalid_max_publications_per_24h

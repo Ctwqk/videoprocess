@@ -61,6 +61,7 @@ _EXTERNAL_ASSET_REVIEW_STATES = frozenset(
     {"uploaded_private", "scheduled", "published", "measured"}
 )
 _STALE_UPLOAD_STATUSES = frozenset({"reserved", "submitted"})
+_FUTURE_START_TOLERANCE = timedelta(seconds=300)
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,8 @@ async def assess_channelops_soak(
 
     assessed_at = _utc(now or datetime.now(timezone.utc))
     started_at = _utc(policy.started_at)
+    validate_soak_started_at(started_at, assessed_at)
+    naive_started_at = _naive_utc(started_at)
     critical_codes = set(external_codes)
     metrics = _empty_metrics(policy.channel_id)
     metrics["external_condition_count"] = len(external_codes)
@@ -189,8 +192,8 @@ async def assess_channelops_soak(
         critical_codes.add("unsafe_lane_privacy")
 
     task_recency = or_(
-        ProductionTask.created_at >= started_at,
-        ProductionTask.updated_at >= started_at,
+        ProductionTask.created_at >= naive_started_at,
+        ProductionTask.updated_at >= naive_started_at,
         ProductionTask.state_updated_at >= started_at,
     )
     tasks = list(
@@ -222,8 +225,8 @@ async def assess_channelops_soak(
         critical_codes.add("external_asset_human_approval_missing")
 
     publication_recency = or_(
-        PublicationRecord.created_at >= started_at,
-        PublicationRecord.updated_at >= started_at,
+        PublicationRecord.created_at >= naive_started_at,
+        PublicationRecord.updated_at >= naive_started_at,
         PublicationRecord.uploaded_at >= started_at,
         PublicationRecord.public_at >= started_at,
     )
@@ -294,8 +297,8 @@ async def assess_channelops_soak(
         critical_codes.add("feedback_missing_after_grace")
 
     operation_recency = or_(
-        YouTubeUploadOperation.created_at >= started_at,
-        YouTubeUploadOperation.updated_at >= started_at,
+        YouTubeUploadOperation.created_at >= naive_started_at,
+        YouTubeUploadOperation.updated_at >= naive_started_at,
         YouTubeUploadOperation.request_attempted_at >= started_at,
         YouTubeUploadOperation.completed_at >= started_at,
     )
@@ -343,8 +346,8 @@ async def assess_channelops_soak(
         critical_codes.add("stale_upload_operation")
 
     queue_recency = or_(
-        ChannelOpsQueueItem.created_at >= started_at,
-        ChannelOpsQueueItem.updated_at >= started_at,
+        ChannelOpsQueueItem.created_at >= naive_started_at,
+        ChannelOpsQueueItem.updated_at >= naive_started_at,
         ChannelOpsQueueItem.dead_letter_at >= started_at,
     )
     queue_items = list(
@@ -413,9 +416,18 @@ def _upload_activity_timestamp(operation: YouTubeUploadOperation) -> datetime:
     return _utc(value)
 
 
+def validate_soak_started_at(started_at: datetime, assessed_at: datetime) -> None:
+    if _utc(started_at) > _utc(assessed_at) + _FUTURE_START_TOLERANCE:
+        raise ValueError("started_at must not be more than 300 seconds in the future")
+
+
 def _utc(value: datetime) -> datetime:
     if not isinstance(value, datetime):
         raise ValueError("timestamp must be a datetime")
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _naive_utc(value: datetime) -> datetime:
+    return _utc(value).replace(tzinfo=None)

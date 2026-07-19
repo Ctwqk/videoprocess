@@ -15,6 +15,7 @@ from app.services.channelops_soak_guard import (
     SOAK_GUARD_REASON,
     SoakGuardPolicy,
     assess_channelops_soak,
+    validate_soak_started_at,
 )
 
 
@@ -86,6 +87,11 @@ async def run(argv: Sequence[str] | None = None) -> int:
         return 2
 
     assessed_at = datetime.now(timezone.utc)
+    try:
+        validate_soak_started_at(policy.started_at, assessed_at)
+    except ValueError:
+        _emit("invalid_arguments")
+        return 2
     try:
         session_factory = get_session_factory()
         async with session_factory() as db:

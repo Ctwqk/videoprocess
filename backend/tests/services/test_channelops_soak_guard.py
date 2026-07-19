@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from app.services.channelops_soak_guard import (
 NOW = datetime(2026, 7, 19, 18, 0, tzinfo=timezone.utc)
 STARTED_AT = NOW - timedelta(hours=72)
 ROW_CREATED_AT = STARTED_AT + timedelta(minutes=5)
+NAIVE_ROW_CREATED_AT = ROW_CREATED_AT.replace(tzinfo=None)
 TABLES = (
     ChannelProfile.__table__,
     TopicLane.__table__,
@@ -68,8 +70,8 @@ def _task(channel_id: uuid.UUID, account_id: uuid.UUID, **overrides) -> Producti
         "prompt": "sensitive prompt must never enter metrics",
         "state": "measured",
         "state_updated_at": ROW_CREATED_AT,
-        "created_at": ROW_CREATED_AT,
-        "updated_at": ROW_CREATED_AT,
+        "created_at": NAIVE_ROW_CREATED_AT,
+        "updated_at": NAIVE_ROW_CREATED_AT,
     }
     values.update(overrides)
     return ProductionTask(**values)
@@ -87,8 +89,8 @@ def _publication(task: ProductionTask, **overrides) -> PublicationRecord:
         "publish_status": "published",
         "compliance_disposition": "owned",
         "uploaded_at": NOW - timedelta(hours=2),
-        "created_at": ROW_CREATED_AT,
-        "updated_at": ROW_CREATED_AT,
+        "created_at": NAIVE_ROW_CREATED_AT,
+        "updated_at": NAIVE_ROW_CREATED_AT,
     }
     values.update(overrides)
     return PublicationRecord(**values)
@@ -107,21 +109,21 @@ def _operation(task: ProductionTask, **overrides) -> YouTubeUploadOperation:
         "manager_task_id": str(uuid.uuid4()),
         "platform_video_id": f"video-{uuid.uuid4()}",
         "error_message": "postgresql://user:secret@database/internal",
-        "created_at": ROW_CREATED_AT,
-        "updated_at": ROW_CREATED_AT,
+        "created_at": NAIVE_ROW_CREATED_AT,
+        "updated_at": NAIVE_ROW_CREATED_AT,
         "completed_at": NOW - timedelta(hours=2),
     }
     values.update(overrides)
     return YouTubeUploadOperation(**values)
 
 
-async def _seed_graph(session):
+async def _seed_graph(session, *, include_operation: bool = True):
     channel = ChannelProfile(
         name="soak channel",
         enabled=True,
         dry_run=False,
-        created_at=ROW_CREATED_AT,
-        updated_at=ROW_CREATED_AT,
+        created_at=NAIVE_ROW_CREATED_AT,
+        updated_at=NAIVE_ROW_CREATED_AT,
     )
     session.add(channel)
     await session.flush()
@@ -133,15 +135,15 @@ async def _seed_graph(session):
         default_privacy="unlisted",
         external_asset_auto_publish=False,
         enabled=True,
-        created_at=ROW_CREATED_AT,
-        updated_at=ROW_CREATED_AT,
+        created_at=NAIVE_ROW_CREATED_AT,
+        updated_at=NAIVE_ROW_CREATED_AT,
     )
     lane = TopicLane(
         channel_profile_id=channel.id,
         name="soak lane",
         enabled=True,
-        created_at=ROW_CREATED_AT,
-        updated_at=ROW_CREATED_AT,
+        created_at=NAIVE_ROW_CREATED_AT,
+        updated_at=NAIVE_ROW_CREATED_AT,
     )
     session.add_all([account, lane])
     await session.flush()
@@ -151,25 +153,27 @@ async def _seed_graph(session):
         format_key="short",
         enabled=True,
         default_publish_visibility="unlisted",
-        created_at=ROW_CREATED_AT,
-        updated_at=ROW_CREATED_AT,
+        created_at=NAIVE_ROW_CREATED_AT,
+        updated_at=NAIVE_ROW_CREATED_AT,
     )
     task = _task(channel.id, account.id)
     session.add_all([lane_format, task])
     await session.flush()
 
     publication = _publication(task)
-    operation = _operation(task)
+    operation = _operation(task) if include_operation else None
     queue = ChannelOpsQueueItem(
         kind="observe_job",
         idempotency_key=f"soak-{uuid.uuid4()}",
         channel_profile_id=channel.id,
         status="succeeded",
         last_error="sensitive queue error payload",
-        created_at=ROW_CREATED_AT,
-        updated_at=ROW_CREATED_AT,
+        created_at=NAIVE_ROW_CREATED_AT,
+        updated_at=NAIVE_ROW_CREATED_AT,
     )
-    session.add_all([publication, operation, queue])
+    session.add_all(
+        [row for row in (publication, operation, queue) if row is not None]
+    )
     await session.flush()
     feedback = FeedbackSnapshot(
         publication_id=publication.id,
@@ -429,6 +433,33 @@ async def test_unknown_external_condition_is_rejected_before_database_access():
 
 
 @pytest.mark.asyncio
+async def test_started_at_exactly_five_minutes_in_future_is_accepted(soak_session):
+    rows = await _seed_graph(soak_session)
+
+    assessment = await assess_channelops_soak(
+        soak_session,
+        _policy(rows["channel"].id, started_at=NOW + timedelta(seconds=300)),
+        now=NOW,
+    )
+
+    assert assessment.metrics["channel_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_started_at_over_five_minutes_in_future_is_rejected_before_database_access():
+    db = AsyncMock()
+
+    with pytest.raises(ValueError, match="300 seconds"):
+        await assess_channelops_soak(
+            db,
+            _policy(uuid.uuid4(), started_at=NOW + timedelta(seconds=301)),
+            now=NOW,
+        )
+
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mutation", "expected_code"),
     [
@@ -545,3 +576,35 @@ def test_policy_and_assessment_are_frozen_and_policy_normalizes_utc():
         policy.max_publications_per_24h = 2
     with pytest.raises(FrozenInstanceError):
         assessment.metrics = {}
+
+
+@pytest.mark.asyncio
+async def test_postgresql_assessment_accepts_mixed_timestamp_column_contracts():
+    """Set CHANNEL_OPS_POSTGRES_TEST_URL to a migrated asyncpg test database."""
+    database_url = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL")
+    if not database_url:
+        pytest.skip("CHANNEL_OPS_POSTGRES_TEST_URL is not set")
+    engine = create_async_engine(database_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    channel_id = None
+    try:
+        async with factory() as session:
+            rows = await _seed_graph(session, include_operation=False)
+            channel_id = rows["channel"].id
+
+            assessment = await assess_channelops_soak(
+                session,
+                _policy(channel_id),
+                now=NOW,
+            )
+
+            assert assessment.metrics["channel_count"] == 1
+            assert assessment.metrics["production_task_count"] == 1
+    finally:
+        if channel_id is not None:
+            async with factory() as cleanup_session:
+                channel = await cleanup_session.get(ChannelProfile, channel_id)
+                if channel is not None:
+                    await cleanup_session.delete(channel)
+                    await cleanup_session.commit()
+        await engine.dispose()

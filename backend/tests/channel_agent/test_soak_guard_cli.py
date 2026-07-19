@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
@@ -235,6 +236,32 @@ async def test_invalid_arguments_return_two_without_opening_database(
         "metrics": {},
         "status": "invalid_arguments",
     }
+
+
+@pytest.mark.asyncio
+async def test_future_activation_returns_invalid_arguments_without_opening_database(
+    monkeypatch,
+    capsys,
+):
+    now = datetime(2026, 7, 19, 18, 0, tzinfo=timezone.utc)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    get_factory = Mock(side_effect=AssertionError("database must not be opened"))
+    monkeypatch.setattr(soak_guard_cli, "datetime", FixedDatetime)
+    monkeypatch.setattr(soak_guard_cli, "get_session_factory", get_factory)
+    future = (now + timedelta(seconds=301)).isoformat().replace("+00:00", "Z")
+
+    exit_code = await soak_guard_cli.run(
+        ["--channel-id", str(CHANNEL_ID), "--started-at", future]
+    )
+
+    assert exit_code == 2
+    get_factory.assert_not_called()
+    assert _payload(capsys)["status"] == "invalid_arguments"
 
 
 @pytest.mark.asyncio
