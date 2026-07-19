@@ -152,6 +152,7 @@ FAIL_NODE_UPDATE=false
 FAIL_NETWORK_INSPECT=false
 FAIL_PUBLISHER_CREATE=false
 FAIL_MANAGED_CRON_PRINTF=false
+FAIL_SOAK_CLEANUP=false
 
 printf() {
   if [[ "$FAIL_MANAGED_CRON_PRINTF" == "true" \
@@ -168,6 +169,16 @@ log() {
 mv() {
   printf 'mv|%s\n' "$*" >>"$CALLS"
   command mv "$@"
+}
+
+rm() {
+  if [[ "$FAIL_SOAK_CLEANUP" == "true" \
+    && "$*" == *"vp-soak-watch-cron."* || "$FAIL_SOAK_CLEANUP" == "true" \
+    && "$*" == *".channelops-soak-watch.txn."* ]]; then
+    printf 'rm-failed|%s\n' "$*" >>"$CALLS"
+    return 1
+  fi
+  command rm "$@"
 }
 
 build_image_on_host() {
@@ -409,6 +420,42 @@ if ! cmp -s "$TEST_ROOT/cron-after-first-install" "$FAKE_CRONTAB"; then
   echo 'FAIL: repeated watcher installation is not idempotent' >&2
   exit 1
 fi
+
+TMPDIR="$TEST_ROOT/tmp"
+mkdir -p "$TMPDIR"
+FAIL_SOAK_CLEANUP=true
+if ! vp_install_soak_watch >"$TEST_ROOT/post-commit-cleanup.out" 2>&1; then
+  echo 'FAIL: post-commit cleanup failure turned verified watcher install into failure' >&2
+  exit 1
+fi
+FAIL_SOAK_CLEANUP=false
+if ! grep -Fq 'cleanup failed' "$TEST_ROOT/post-commit-cleanup.out"; then
+  echo 'FAIL: post-commit cleanup warning was not reported' >&2
+  exit 1
+fi
+command rm -rf "$TMPDIR"/vp-soak-watch-cron.* "$ROOT/bin"/.channelops-soak-watch.txn.*
+
+cp "$ROOT/bin/channelops-soak-watch.sh" "$TEST_ROOT/target-before-precommit-cleanup"
+cp "$FAKE_CRONTAB" "$TEST_ROOT/cron-before-precommit-cleanup"
+rm -f "$FAKE_CRONTAB_FAILURE_USED"
+FAKE_CRONTAB_INSTALL_MODE=fail-before
+FAIL_SOAK_CLEANUP=true
+if vp_install_soak_watch >"$TEST_ROOT/precommit-cleanup.out" 2>&1; then
+  echo 'FAIL: pre-commit install failure with cleanup failure unexpectedly succeeded' >&2
+  exit 1
+fi
+FAKE_CRONTAB_INSTALL_MODE=normal
+FAIL_SOAK_CLEANUP=false
+if ! cmp -s "$TEST_ROOT/target-before-precommit-cleanup" "$ROOT/bin/channelops-soak-watch.sh" \
+  || ! cmp -s "$TEST_ROOT/cron-before-precommit-cleanup" "$FAKE_CRONTAB"; then
+  echo 'FAIL: pre-commit cleanup failure prevented rollback' >&2
+  exit 1
+fi
+if ! grep -Fq 'cleanup failed' "$TEST_ROOT/precommit-cleanup.out"; then
+  echo 'FAIL: pre-commit cleanup failure was not reported' >&2
+  exit 1
+fi
+command rm -rf "$TMPDIR"/vp-soak-watch-cron.* "$ROOT/bin"/.channelops-soak-watch.txn.*
 
 cp "$FAKE_CRONTAB" "$TEST_ROOT/cron-before-no-crontab-test"
 rm -f "$FAKE_CRONTAB"

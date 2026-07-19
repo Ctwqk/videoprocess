@@ -123,3 +123,29 @@ docker compose --profile channelops-go up -d channelops-runner-go
 
 Keep the trial channel at low cadence, with YouTube privacy `unlisted` or
 `private`, and do not run the legacy Python runner concurrently.
+
+External-platform assets are held after planning and before AutoFlow execution.
+This is a pre-upload human-review gate for private and unlisted workflows too;
+it is not only a public-promotion check. The Go runner must not execute, upload,
+or promote those tasks until an explicit human review path releases them.
+
+## Soak Activation Window
+
+The soak guard and watcher reject `VP_SOAK_STARTED_AT` values more than 300
+seconds after assessment time. The five-minute tolerance is only for clock skew;
+a value exactly 300 seconds ahead is accepted. Future-window rejection is a
+configuration error and occurs before topology checks or database assessment.
+
+## Watcher Image CLI Smoke
+
+Use the exact Python worker or publisher image selected by the watcher and an
+isolated, migrated test database. This command runs the real module with no
+`--apply` flag and a deliberately missing channel, so guard exit 20 proves the
+image can reach the test database without activation, upload, or publication:
+
+```bash
+VP_SOAK_SMOKE_IMAGE=vp-ffmpeg-worker-python:<deployed-tag> \
+VP_SOAK_SMOKE_DATABASE_URL=postgresql+asyncpg://vp:password@host.docker.internal:55432/videoprocess \
+VP_SOAK_SMOKE_TEST_DATABASE=true \
+bash tests/test_channelops_soak_image_smoke.sh
+```

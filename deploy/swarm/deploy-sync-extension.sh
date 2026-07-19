@@ -870,8 +870,11 @@ vp_install_soak_watch() {
     fi
     trap - HUP INT TERM
     if ! vp_soak_watch_cleanup; then
-      echo "ChannelOps soak watcher cleanup failed" >&2
-      transaction_status=1
+      if [[ "$transaction_status" -eq 0 ]]; then
+        echo "ChannelOps soak watcher cleanup failed after verified install; continuing" >&2
+      else
+        echo "ChannelOps soak watcher cleanup failed" >&2
+      fi
     fi
     exit "$transaction_status"
   )
