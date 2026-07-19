@@ -158,6 +158,10 @@ replace the watcher and its managed cron entry, but it cannot create activation
 state, activate a channel, resume a halted channel, or reopen the video
 schedule.
 
+External-platform asset automatic publication remains disabled. Explicit human
+review is required before any external-platform asset upload or publication.
+Public publication and promotion remain disabled.
+
 Once explicitly enabled, the watcher checks VP service health, Redis consumer
 groups, and task placement before running the channel-scoped database guard.
 On a critical result with `VP_SOAK_AUTO_HOLD=true`, the guard quarantines only
