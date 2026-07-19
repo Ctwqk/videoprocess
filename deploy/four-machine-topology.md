@@ -100,20 +100,78 @@ Do not use `10.0.0.127:/Users/wenjieliu/VideoProcess-app` as a long-lived code
 project. It is the deploy output marked by `.deploy-sync-project` and
 `.deploy-sync-source-commit`.
 
-Production updates flow through GitHub and the 150 deploy sync job, then into
-Swarm services on 127. If queue payloads, API contracts, or worker behavior
-change, redeploy the affected VP services together.
+Production updates flow through GitHub and the scoped 150 deploy controller,
+then into Swarm services on 127. Normal GitHub pushes are pulled and deployed
+by the scoped 15-minute cron; do not enable the unscoped all-project deploy
+job as part of a VideoProcess release. A manual first deployment is reserved
+for exceptional migration or runbook changes, not for every commit.
 
-The normal scoped deployment command is:
+The scoped controller deploys `vp-app` and the in-repository
+`vp-feature-aggregator` project from this repository. PDS remains an
+independent repository and deploy project: a PDS change is deployed from its
+own repository through the scoped `vp-pds` project, without requiring a
+VideoProcess operations-asset rewrite.
+
+The normal scoped deployment command, for exceptional manual deployment or
+runbook work, is:
 
 ```bash
 /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh \
   --apply --project vp-app --project vp-feature-aggregator --project vp-pds
 ```
 
-The first deployment of a commit is run manually and verified. Only then may
-the same scoped command run from cron. Do not enable the unscoped all-project
-deploy job as part of a VideoProcess release.
+## ChannelOps Managed Soak Guard
+
+The scoped deploy controller on `10.0.0.150` owns the ChannelOps soak watcher.
+After the VP services converge, it validates and atomically installs the
+repository watcher at:
+
+```text
+/home/taiwei/deploy-github-sync/bin/channelops-soak-watch.sh
+```
+
+The controller owns exactly one marked `VIDEOPROCESS SOAK WATCH` cron block on
+150. Its managed command runs every 30 minutes and writes to the controller
+log directory:
+
+```text
+*/30 * * * * DEPLOY_GITHUB_SYNC_ROOT=/home/taiwei/deploy-github-sync /home/taiwei/deploy-github-sync/bin/channelops-soak-watch.sh >> /home/taiwei/deploy-github-sync/logs/channelops-soak-watch.log 2>&1
+```
+
+The watcher is disabled by default. Its only activation state is:
+
+```text
+/home/taiwei/deploy-github-sync/state/vp-soak-watch.env
+```
+
+When that file is absent, the watcher exits successfully with
+`status=disabled reason=state_missing`. A present file is still disabled unless
+`VP_SOAK_WATCH_ENABLED=true`; any other value reports
+`status=disabled reason=not_enabled`. Invalid state, unavailable credentials,
+or an unavailable trusted worker image is a non-zero configuration error and
+does not perform a speculative mutation.
+
+Creating or enabling the state file is a separate human activation action and
+requires a separately approved, successful unlisted canary. The required
+approval for the next attempt is `批准第三次 unlisted canary`. Deploying code may
+replace the watcher and its managed cron entry, but it cannot create activation
+state, activate a channel, resume a halted channel, or reopen the video
+schedule.
+
+Once explicitly enabled, the watcher checks VP service health, Redis consumer
+groups, and task placement before running the channel-scoped database guard.
+On a critical result with `VP_SOAK_AUTO_HOLD=true`, the guard quarantines only
+the configured channel: it halts the channel, holds non-terminal tasks,
+cancels non-terminal jobs and nodes, dead-letters runnable queue items, and
+sets the global VideoProcess runtime schedule to `CLOSED` in the same
+transaction. Its mutations only reduce activity; it never uploads, publishes,
+enqueues, resumes, or opens a schedule. A guard trip remains non-zero for cron
+visibility.
+
+The 150 controller, watcher, and all normal VP deployment placement remain
+strictly scoped to 150 and 127. Host 126 is forbidden for VP builds, deployment,
+watcher placement, publisher placement, and automatic failover. A missing 127
+runtime fails the VP deployment closed rather than moving work to 126.
 
 ## Placement Policy
 
