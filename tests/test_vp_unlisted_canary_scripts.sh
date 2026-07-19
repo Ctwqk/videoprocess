@@ -19,6 +19,8 @@ grep -Fq 'DATABASE_URL' "$QUARANTINE"
 grep -Fq -- '--evidence' "$QUARANTINE"
 
 grep -Fq -- '--confirm-live-unlisted' "$CANARY"
+grep -Fq -- '--preflight-only' "$CANARY"
+grep -Fq 'MODE_PREFLIGHT = "preflight_only"' "$CANARY"
 grep -Fq 'DATABASE_URL' "$CANARY"
 grep -Fq 'pg_try_advisory_lock' "$CANARY"
 grep -Fq '1080x1920' "$CANARY"
@@ -57,6 +59,11 @@ import sys
 
 tree = ast.parse(pathlib.Path(sys.argv[1]).read_text())
 finally_calls = []
+functions = {
+    node.name: node
+    for node in tree.body
+    if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+}
 for node in ast.walk(tree):
     if isinstance(node, ast.Try) and node.finalbody:
         finally_calls.extend(
@@ -67,6 +74,42 @@ for node in ast.walk(tree):
         )
 if not any("close_schedule" in ast.unparse(call.func) for call in finally_calls):
     raise SystemExit("FAIL: schedule close must be called from a finally block")
+
+preflight = functions.get("execute_preflight")
+if preflight is None:
+    raise SystemExit("FAIL: missing execute_preflight")
+preflight_calls = {
+    ast.unparse(call.func)
+    for call in ast.walk(preflight)
+    if isinstance(call, ast.Call)
+}
+for forbidden in (
+    "close_schedule",
+    "mutate_schedule",
+    "execute_canary",
+    "generate_owned_video",
+    "upload_and_attest_asset",
+    "create_canary_graph",
+):
+    if forbidden in preflight_calls:
+        raise SystemExit(f"FAIL: preflight calls forbidden live operation: {forbidden}")
+
+mode_close = functions.get("close_schedule_for_mode")
+if mode_close is None:
+    raise SystemExit("FAIL: missing close_schedule_for_mode")
+live_guarded_close = any(
+    isinstance(node, ast.If)
+    and ast.unparse(node.test) == "mode == MODE_LIVE"
+    and any(
+        isinstance(child, ast.Call)
+        and ast.unparse(child.func) == "close_schedule"
+        for statement in node.body
+        for child in ast.walk(statement)
+    )
+    for node in ast.walk(mode_close)
+)
+if not live_guarded_close:
+    raise SystemExit("FAIL: schedule close must be guarded by live mode")
 PY
 
 "$ROOT_DIR/backend/.venv/bin/python" - "$CANARY" "$QUARANTINE" <<'PY'

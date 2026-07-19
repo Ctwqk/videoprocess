@@ -52,6 +52,8 @@ CANARY_PLAN_DELAY_SECONDS = 300
 CHANNEL_OPS_RUNNER_SERVICE = "vp-channel-agent-runner-swarm"
 RUNNER_POLL_CUSHION_SECONDS = 60
 NO_DELETE_POLICY = "This runner never deletes the YouTube video automatically."
+MODE_PREFLIGHT = "preflight_only"
+MODE_LIVE = "live_unlisted"
 SCHEDULE_STATUS_PATH = "/internal/schedule/video/status"
 SCHEDULE_OPEN_PATH = "/internal/schedule/video/open"
 SCHEDULE_DRAIN_PATH = "/internal/schedule/video/drain"
@@ -113,6 +115,7 @@ def naive_utc(value: datetime) -> datetime:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run exactly one guarded live unlisted YouTube canary")
+    parser.add_argument("--preflight-only", action="store_true", default=False)
     parser.add_argument("--confirm-live-unlisted", action="store_true", default=False)
     parser.add_argument("--api-url", default="http://10.0.0.127:18080")
     parser.add_argument("--youtube-manager-url", default="http://10.0.0.150:18999")
@@ -123,6 +126,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--timeout-seconds", type=float, default=1_200.0)
     return parser.parse_args()
+
+
+def execution_mode(args: argparse.Namespace) -> str:
+    preflight = bool(args.preflight_only)
+    live = bool(args.confirm_live_unlisted)
+    if preflight == live:
+        raise CanaryError(
+            "exactly one of --preflight-only or --confirm-live-unlisted is required"
+        )
+    return MODE_PREFLIGHT if preflight else MODE_LIVE
 
 
 def async_database_url(value: str) -> str:
@@ -267,8 +280,11 @@ def channelops_wait_seconds(*, timeout_seconds: float, deployed_wait_seconds: fl
     return min(timeout_seconds, deployed_wait_seconds)
 
 
-def evidence_path(args: argparse.Namespace, run_id: str) -> Path:
-    return args.evidence or ROOT / ".runtime" / "youtube-canary" / f"unlisted-canary-{run_id}.json"
+def evidence_path(args: argparse.Namespace, run_id: str, mode: str) -> Path:
+    if args.evidence:
+        return args.evidence
+    prefix = "unlisted-canary-preflight" if mode == MODE_PREFLIGHT else "unlisted-canary"
+    return ROOT / ".runtime" / "youtube-canary" / f"{prefix}-{run_id}.json"
 
 
 async def deployment_readiness(args: argparse.Namespace, client: httpx.AsyncClient) -> dict[str, Any]:
@@ -1491,6 +1507,28 @@ async def release_advisory_lock(connection: AsyncConnection) -> None:
         await connection.rollback()
 
 
+async def execute_preflight(
+    args: argparse.Namespace,
+    db: AsyncSession,
+    client: httpx.AsyncClient,
+    evidence: dict[str, Any],
+    path: Path,
+) -> None:
+    initial_schedule = await schedule_status(args, client)
+    record_schedule(evidence, "initial", initial_schedule)
+    evidence["schedule"]["final_state"] = initial_schedule.get("state")
+    if initial_schedule.get("state") != "CLOSED":
+        raise CanaryError("global video schedule must be CLOSED before canary preflight")
+
+    backlog = await active_backlog(db)
+    evidence["preflight_backlog"] = backlog
+    assert_no_preexisting_backlog(backlog)
+    evidence["deployment"] = await deployment_readiness(args, client)
+    evidence["manager"] = {"auth": await manager_readiness(args, client)}
+    evidence["status"] = "succeeded"
+    atomic_write_json(path, evidence)
+
+
 async def execute_canary(
     args: argparse.Namespace,
     db: AsyncSession,
@@ -1709,20 +1747,55 @@ async def execute_canary(
     atomic_write_json(path, evidence)
 
 
+async def execute_selected_mode(
+    mode: str,
+    args: argparse.Namespace,
+    db: AsyncSession,
+    client: httpx.AsyncClient,
+    evidence: dict[str, Any],
+    path: Path,
+) -> None:
+    if mode == MODE_PREFLIGHT:
+        await execute_preflight(args, db, client, evidence, path)
+        return
+    await execute_canary(args, db, client, evidence, path)
+
+
+async def close_schedule_for_mode(
+    mode: str,
+    args: argparse.Namespace,
+    client: httpx.AsyncClient,
+    evidence: dict[str, Any],
+) -> None:
+    if mode == MODE_LIVE:
+        await close_schedule(args, client, evidence)
+
+
 async def run(args: argparse.Namespace, database_url: str) -> Path:
+    mode = execution_mode(args)
     run_id = str(uuid.uuid4())
-    path = evidence_path(args, run_id)
-    evidence: dict[str, Any] = {
-        "schema_version": 1,
-        "run_id": run_id,
-        "status": "running",
-        "started_at": utc_now().isoformat(),
-        "safety": {
+    path = evidence_path(args, run_id, mode)
+    safety = {
+        "confirmation": "--preflight-only",
+        "privacy": None,
+        "external_sources": False,
+        "external_side_effects": False,
+        "application_state_mutations": False,
+    }
+    if mode == MODE_LIVE:
+        safety = {
             "confirmation": "--confirm-live-unlisted",
             "privacy": "unlisted",
             "external_sources": False,
             "automatic_video_deletion": False,
-        },
+        }
+    evidence: dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "mode": mode,
+        "status": "running",
+        "started_at": utc_now().isoformat(),
+        "safety": safety,
         "schedule": {"transitions": [], "final_state": None},
     }
     atomic_write_json(path, evidence)
@@ -1734,7 +1807,7 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
                     try:
-                        await execute_canary(args, db, client, evidence, path)
+                        await execute_selected_mode(mode, args, db, client, evidence, path)
                     except BaseException as exc:
                         evidence["status"] = "failed"
                         evidence["failure"] = {
@@ -1743,7 +1816,7 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
                             "at": utc_now().isoformat(),
                         }
                         graph = evidence.get("graph")
-                        if isinstance(graph, dict) and graph.get("channel_id"):
+                        if mode == MODE_LIVE and isinstance(graph, dict) and graph.get("channel_id"):
                             try:
                                 await db.rollback()
                                 evidence["failure_cleanup"] = await failure_cleanup(
@@ -1759,7 +1832,7 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
                     finally:
                         close_error: BaseException | None = None
                         try:
-                            await close_schedule(args, client, evidence)
+                            await close_schedule_for_mode(mode, args, client, evidence)
                         except BaseException as exc:
                             close_error = exc
                             mark_schedule_close_failure(evidence, close_error)
@@ -1786,8 +1859,10 @@ def install_signal_guards() -> None:
 
 def main() -> int:
     args = parse_args()
-    if not args.confirm_live_unlisted:
-        print("refusing live canary without --confirm-live-unlisted", file=sys.stderr)
+    try:
+        mode = execution_mode(args)
+    except CanaryError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if not database_url:
@@ -1805,12 +1880,13 @@ def main() -> int:
             print(f"{label} contains unsupported characters", file=sys.stderr)
             return 2
     install_signal_guards()
+    label = "canary preflight" if mode == MODE_PREFLIGHT else "unlisted canary"
     try:
         path = asyncio.run(run(args, database_url))
     except BaseException as exc:
-        print(f"unlisted canary failed: {type(exc).__name__}: {safe_failure_message(exc)}", file=sys.stderr)
+        print(f"{label} failed: {type(exc).__name__}: {safe_failure_message(exc)}", file=sys.stderr)
         return 1
-    print(f"unlisted canary evidence={path}")
+    print(f"{label} evidence={path}")
     return 0
 
 

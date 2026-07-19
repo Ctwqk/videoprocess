@@ -29,7 +29,7 @@
 - Produces: `execute_preflight(args, db, client, evidence, path) -> None`
 - Consumes: existing readiness and evidence helpers.
 
-- [ ] **Step 1: Write failing mode-validation tests**
+- [x] **Step 1: Write failing mode-validation tests**
 
 ```python
 from types import SimpleNamespace
@@ -59,7 +59,7 @@ def test_execution_mode_rejects_ambiguous_mode(preflight, live):
         runner.execution_mode(args)
 ```
 
-- [ ] **Step 2: Run the mode tests and verify RED**
+- [x] **Step 2: Run the mode tests and verify RED**
 
 ```bash
 cd backend
@@ -68,7 +68,7 @@ cd backend
 
 Expected: FAIL because `execution_mode` and `preflight_only` do not exist.
 
-- [ ] **Step 3: Add the CLI flag and minimal mode selector**
+- [x] **Step 3: Add the CLI flag and minimal mode selector**
 
 ```python
 MODE_PREFLIGHT = "preflight_only"
@@ -87,13 +87,13 @@ def execution_mode(args: argparse.Namespace) -> str:
 
 Add `parser.add_argument("--preflight-only", action="store_true", default=False)` next to the existing confirmation flag.
 
-- [ ] **Step 4: Run the mode tests and verify GREEN**
+- [x] **Step 4: Run the mode tests and verify GREEN**
 
 Run the command from Step 2.
 
 Expected: all selected tests PASS.
 
-- [ ] **Step 5: Write the failing read-only executor test**
+- [x] **Step 5: Write the failing read-only executor test**
 
 ```python
 @pytest.mark.anyio
@@ -140,11 +140,11 @@ async def test_execute_preflight_reads_readiness_without_live_side_effects(
     ]
     assert evidence["status"] == "succeeded"
     assert evidence["schedule"]["final_state"] == "CLOSED"
-    assert evidence["preflight_backlog"]["active_job_ids"] == []
+    assert evidence["preflight_backlog"]["runnable_job_ids"] == []
     assert path.exists()
 ```
 
-- [ ] **Step 6: Run the executor test and verify RED**
+- [x] **Step 6: Run the executor test and verify RED**
 
 ```bash
 cd backend
@@ -153,7 +153,7 @@ cd backend
 
 Expected: FAIL because `execute_preflight` does not exist.
 
-- [ ] **Step 7: Implement the minimal read-only executor**
+- [x] **Step 7: Implement the minimal read-only executor**
 
 ```python
 async def execute_preflight(args, db, client, evidence, path) -> None:
@@ -171,7 +171,7 @@ async def execute_preflight(args, db, client, evidence, path) -> None:
     atomic_write_json(path, evidence)
 ```
 
-- [ ] **Step 8: Run the executor and full runner test file**
+- [x] **Step 8: Run the executor and full runner test file**
 
 ```bash
 cd backend
@@ -193,7 +193,7 @@ Expected: all tests PASS.
 - Produces: `close_schedule_for_mode(mode, args, client, evidence) -> None`.
 - Preserves: `run(args, database_url) -> Path` and `main() -> int`.
 
-- [ ] **Step 1: Add a failing finalization test**
+- [x] **Step 1: Add a failing finalization test**
 
 ```python
 from unittest.mock import AsyncMock
@@ -228,7 +228,7 @@ async def test_mode_aware_dispatch_and_schedule_close(monkeypatch):
     close.assert_awaited_once_with(values[0], values[2], values[3])
 ```
 
-- [ ] **Step 2: Run the finalization test and verify RED**
+- [x] **Step 2: Run the finalization test and verify RED**
 
 ```bash
 cd backend
@@ -237,7 +237,7 @@ cd backend
 
 Expected: FAIL because the run path always assumes a live canary.
 
-- [ ] **Step 3: Make `run` and `main` mode-aware**
+- [x] **Step 3: Make `run` and `main` mode-aware**
 
 Add these dispatch helpers:
 
@@ -258,11 +258,11 @@ Compute `mode = execution_mode(args)` before evidence creation. Record the mode 
 
 In `main`, validate the mode before reading `DATABASE_URL`, return exit 2 on ambiguity, and print mode-specific success/failure text.
 
-- [ ] **Step 4: Extend the shell contract**
+- [x] **Step 4: Extend the shell contract**
 
 Add checks for `--preflight-only`, `MODE_PREFLIGHT`, and the live-mode guard around `close_schedule`. Keep the existing AST assertion that live close remains inside a `finally` block.
 
-- [ ] **Step 5: Run targeted verification**
+- [x] **Step 5: Run targeted verification**
 
 ```bash
 cd backend
@@ -275,7 +275,7 @@ git diff --check
 
 Expected: every command exits 0.
 
-- [ ] **Step 6: Commit implementation**
+- [x] **Step 6: Commit implementation**
 
 ```bash
 git add scripts/run_vp_unlisted_canary.py \
@@ -294,7 +294,7 @@ git commit -m "feat: add read-only YouTube canary preflight"
 - Consumes: deployed `scripts/run_vp_unlisted_canary.py --preflight-only`.
 - Produces: sanitized E4 preflight evidence without an upload or publication.
 
-- [ ] **Step 1: Run repository verification**
+- [x] **Step 1: Run repository verification**
 
 ```bash
 cd backend

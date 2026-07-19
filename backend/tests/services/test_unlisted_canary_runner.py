@@ -4,7 +4,8 @@ import importlib.util
 import uuid
 from datetime import timezone
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import func, select
@@ -50,6 +51,79 @@ def load_runner() -> ModuleType:
     return module
 
 
+@pytest.mark.parametrize(
+    ("preflight", "live", "expected"),
+    ((True, False, "preflight_only"), (False, True, "live_unlisted")),
+)
+def test_execution_mode_accepts_exactly_one_mode(preflight, live, expected):
+    runner = load_runner()
+    args = SimpleNamespace(
+        preflight_only=preflight,
+        confirm_live_unlisted=live,
+    )
+
+    assert runner.execution_mode(args) == expected
+
+
+@pytest.mark.parametrize(("preflight", "live"), ((False, False), (True, True)))
+def test_execution_mode_rejects_ambiguous_mode(preflight, live):
+    runner = load_runner()
+    args = SimpleNamespace(
+        preflight_only=preflight,
+        confirm_live_unlisted=live,
+    )
+
+    with pytest.raises(runner.CanaryError, match="exactly one"):
+        runner.execution_mode(args)
+
+
+def test_evidence_path_distinguishes_preflight_mode():
+    runner = load_runner()
+    args = SimpleNamespace(evidence=None)
+
+    assert runner.evidence_path(args, "run-123", runner.MODE_PREFLIGHT).name == (
+        "unlisted-canary-preflight-run-123.json"
+    )
+    assert runner.evidence_path(args, "run-123", runner.MODE_LIVE).name == (
+        "unlisted-canary-run-123.json"
+    )
+
+
+@pytest.mark.anyio
+async def test_mode_aware_dispatch_and_schedule_close(monkeypatch: pytest.MonkeyPatch):
+    runner = load_runner()
+    preflight = AsyncMock()
+    canary = AsyncMock()
+    close = AsyncMock()
+    monkeypatch.setattr(runner, "execute_preflight", preflight)
+    monkeypatch.setattr(runner, "execute_canary", canary)
+    monkeypatch.setattr(runner, "close_schedule", close)
+    values = (object(), object(), object(), {}, Path("evidence.json"))
+
+    await runner.execute_selected_mode(runner.MODE_PREFLIGHT, *values)
+    await runner.close_schedule_for_mode(
+        runner.MODE_PREFLIGHT,
+        values[0],
+        values[2],
+        values[3],
+    )
+
+    preflight.assert_awaited_once_with(*values)
+    canary.assert_not_awaited()
+    close.assert_not_awaited()
+
+    await runner.execute_selected_mode(runner.MODE_LIVE, *values)
+    await runner.close_schedule_for_mode(
+        runner.MODE_LIVE,
+        values[0],
+        values[2],
+        values[3],
+    )
+
+    canary.assert_awaited_once_with(*values)
+    close.assert_awaited_once_with(values[0], values[2], values[3])
+
+
 @pytest.fixture
 async def db():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -79,6 +153,87 @@ async def add_asset(
     db.add(asset)
     await db.commit()
     return asset
+
+
+@pytest.mark.anyio
+async def test_execute_preflight_reads_readiness_without_live_side_effects(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    calls: list[str] = []
+
+    async def schedule_status(*_args):
+        calls.append("schedule_status")
+        return {"state": "CLOSED", "active_jobs": 0}
+
+    async def deployment_readiness(*_args):
+        calls.append("deployment_readiness")
+        return {"ready": True}
+
+    async def manager_readiness(*_args):
+        calls.append("manager_readiness")
+        return {"authenticated": True}
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("preflight invoked a live mutation")
+
+    monkeypatch.setattr(runner, "schedule_status", schedule_status)
+    monkeypatch.setattr(runner, "deployment_readiness", deployment_readiness)
+    monkeypatch.setattr(runner, "manager_readiness", manager_readiness)
+    monkeypatch.setattr(runner, "mutate_schedule", forbidden)
+    monkeypatch.setattr(runner, "close_schedule", forbidden)
+    monkeypatch.setattr(runner, "execute_canary", forbidden)
+    evidence = {
+        "mode": "preflight_only",
+        "status": "running",
+        "schedule": {"transitions": [], "final_state": None},
+    }
+    path = tmp_path / "preflight.json"
+
+    await runner.execute_preflight(object(), db, object(), evidence, path)
+
+    assert calls == ["schedule_status", "deployment_readiness", "manager_readiness"]
+    assert evidence["status"] == "succeeded"
+    assert evidence["schedule"]["final_state"] == "CLOSED"
+    assert evidence["preflight_backlog"]["runnable_job_ids"] == []
+    assert path.exists()
+
+
+@pytest.mark.anyio
+async def test_execute_preflight_fails_closed_without_followup_checks(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+
+    async def schedule_status(*_args):
+        return {"state": "OPEN", "active_jobs": 0}
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("unsafe follow-up check ran")
+
+    monkeypatch.setattr(runner, "schedule_status", schedule_status)
+    monkeypatch.setattr(runner, "deployment_readiness", forbidden)
+    monkeypatch.setattr(runner, "manager_readiness", forbidden)
+    evidence = {
+        "mode": runner.MODE_PREFLIGHT,
+        "status": "running",
+        "schedule": {"transitions": [], "final_state": None},
+    }
+
+    with pytest.raises(runner.CanaryError, match="must be CLOSED"):
+        await runner.execute_preflight(
+            object(),
+            db,
+            object(),
+            evidence,
+            tmp_path / "preflight.json",
+        )
+
+    assert evidence["schedule"]["final_state"] == "OPEN"
 
 
 @pytest.mark.anyio
