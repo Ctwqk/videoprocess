@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import uuid
 from datetime import timezone
 from pathlib import Path
@@ -201,6 +202,55 @@ async def test_mode_aware_dispatch_and_schedule_close(monkeypatch: pytest.Monkey
 
     canary.assert_awaited_once_with(*values)
     close.assert_awaited_once_with(values[0], values[2], values[3])
+
+
+@pytest.mark.anyio
+async def test_run_records_connection_failure_without_schedule_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    disposed = False
+
+    class FailingConnectionContext:
+        async def __aenter__(self):
+            raise ConnectionRefusedError("database unavailable")
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FailingEngine:
+        def connect(self):
+            return FailingConnectionContext()
+
+        async def dispose(self):
+            nonlocal disposed
+            disposed = True
+
+    close = AsyncMock()
+    monkeypatch.setattr(runner, "create_async_engine", lambda *_args, **_kwargs: FailingEngine())
+    monkeypatch.setattr(runner, "close_schedule", close)
+    path = tmp_path / "connection-failure.json"
+    args = SimpleNamespace(
+        evidence=path,
+        preflight_only=True,
+        confirm_live_unlisted=False,
+        redis_url="",
+    )
+
+    with pytest.raises(ConnectionRefusedError):
+        await runner.run(args, "postgresql+asyncpg://unavailable")
+
+    payload = json.loads(path.read_text())
+    assert payload["status"] == "failed"
+    assert payload["failure"]["type"] == "ConnectionRefusedError"
+    assert payload["failure"]["message"] == (
+        "unexpected failure; inspect sanitized service logs by exception type"
+    )
+    assert payload["completed_at"]
+    assert payload["schedule"]["final_state"] is None
+    close.assert_not_awaited()
+    assert disposed is True
 
 
 @pytest.fixture

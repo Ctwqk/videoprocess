@@ -351,3 +351,26 @@ jump only to manager calls and validate the optional value with
 
 Run the runner tests, shell contract, changed-file Ruff, Python compile, and
 `git diff --check`; then commit the focused fix.
+
+### Task 5: Persist Failures Before Database Connection
+
+**Files:**
+- Modify: `scripts/run_vp_unlisted_canary.py`
+- Test: `backend/tests/services/test_unlisted_canary_runner.py`
+
+- [x] **Step 1: Prove the connection-failure evidence gap**
+
+Use a fake async engine whose connection context raises
+`ConnectionRefusedError`. Require a sanitized `failed` evidence record and no
+schedule mutation.
+
+- [x] **Step 2: Add outer failure persistence**
+
+Wrap the full connection lifecycle so failures before session/client creation
+set failure type/message/time, set `completed_at`, atomically rewrite evidence,
+dispose the engine, and re-raise. Preserve any more specific inner failure.
+
+- [x] **Step 3: Verify and commit**
+
+Run targeted and full runner tests, shell contract, changed-file Ruff, compile,
+and `git diff --check` before committing.

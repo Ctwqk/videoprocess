@@ -1839,6 +1839,19 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
             finally:
                 await db.close()
                 await release_advisory_lock(connection)
+    except BaseException as exc:
+        evidence["status"] = "failed"
+        evidence.setdefault(
+            "failure",
+            {
+                "type": type(exc).__name__,
+                "message": safe_failure_message(exc),
+                "at": utc_now().isoformat(),
+            },
+        )
+        evidence.setdefault("completed_at", utc_now().isoformat())
+        atomic_write_json(path, evidence)
+        raise
     finally:
         await engine.dispose()
     return path
