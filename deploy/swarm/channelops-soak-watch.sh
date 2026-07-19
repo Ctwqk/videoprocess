@@ -50,7 +50,7 @@ is_rfc3339_utc() {
   [[ "$day" -le "$max_day" ]]
 }
 
-sync_root="${DEPLOY_GITHUB_SYNC_ROOT:?DEPLOY_GITHUB_SYNC_ROOT must be set}"
+sync_root="${DEPLOY_GITHUB_SYNC_ROOT:-/home/taiwei/deploy-github-sync}"
 state_file="$sync_root/state/vp-soak-watch.env"
 
 if [[ ! -f "$state_file" ]]; then
@@ -74,7 +74,7 @@ upload_stale_minutes="${VP_SOAK_UPLOAD_STALE_MINUTES:-45}"
 feedback_grace_hours="${VP_SOAK_FEEDBACK_GRACE_HOURS:-30}"
 auto_hold="${VP_SOAK_AUTO_HOLD:-false}"
 forbidden_pattern="${VP_SOAK_FORBIDDEN_NODE_PATTERN:-CASPERs-Mac-mini|10.0.0.126}"
-redis_container="${VP_SOAK_REDIS_CONTAINER:-vp-redis}"
+redis_container="${VP_SOAK_REDIS_CONTAINER:-constructure_vp_redis}"
 
 if [[ ! "$channel_id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
   configuration_error invalid_channel_id
@@ -106,7 +106,7 @@ if [[ "$pattern_status" -gt 1 ]]; then
   configuration_error invalid_forbidden_node_pattern
 fi
 
-deploy_env="${DEPLOY_GITHUB_SYNC_ENV:-$sync_root/deploy.env}"
+deploy_env="${DEPLOY_GITHUB_SYNC_ENV_FILE:-$sync_root/env/deploy.env}"
 if [[ ! -r "$deploy_env" ]]; then
   configuration_error deploy_environment_missing
 fi
@@ -128,25 +128,41 @@ vp-youtube-publisher-swarm
 vp-feature-aggregator-swarm
 vp-pds-swarm'
 external_conditions=''
+trusted_python_image=''
 
 while IFS= read -r service; do
   [[ -n "$service" ]] || continue
-  if ! desired_replicas="$(docker service inspect "$service" \
-    --format '{{if .Spec.Mode.Replicated}}{{.Spec.Mode.Replicated.Replicas}}{{else}}1{{end}}' \
+  if ! service_details="$(docker service inspect "$service" \
+    --format '{{if .Spec.Mode.Replicated}}{{.Spec.Mode.Replicated.Replicas}}{{else}}1{{end}}|{{.Spec.TaskTemplate.ContainerSpec.Image}}' \
     2>/dev/null)"; then
     log_status "service=$service status=missing"
     add_external_condition service_missing
     continue
   fi
+  desired_replicas="${service_details%%|*}"
+  service_image="${service_details#*|}"
+  case "$service" in
+    vp-ffmpeg-worker-gpu-swarm)
+      if [[ -n "$service_image" ]]; then
+        trusted_python_image="$service_image"
+      fi
+      ;;
+    vp-youtube-publisher-swarm)
+      if [[ -n "$service_image" ]]; then
+        trusted_python_image="$service_image"
+      fi
+      ;;
+  esac
 
   if ! running_nodes="$(docker service ps "$service" \
-    --filter desired-state=running --format '{{.Node}}' 2>/dev/null)"; then
+    --filter desired-state=running --format '{{.Node}}|{{.CurrentState}}' 2>/dev/null)"; then
     log_status "service=$service status=unhealthy"
     add_external_condition service_unhealthy
     continue
   fi
 
-  running_replicas="$(printf '%s\n' "$running_nodes" | awk 'NF { count++ } END { print count + 0 }')"
+  running_replicas="$(printf '%s\n' "$running_nodes" \
+    | awk -F'|' '$2 ~ /^Running([[:space:]]|$)/ { count++ } END { print count + 0 }')"
   if [[ ! "$desired_replicas" =~ ^[1-9][0-9]*$ ]] \
     || [[ "$running_replicas" -ne "$desired_replicas" ]]; then
     log_status "service=$service status=unhealthy desired=${desired_replicas:-unknown} running=$running_replicas"
@@ -156,7 +172,8 @@ while IFS= read -r service; do
   fi
 
   if [[ -n "$running_nodes" ]] \
-    && printf '%s\n' "$running_nodes" | grep -Eq -- "$forbidden_pattern"; then
+    && printf '%s\n' "$running_nodes" | awk -F'|' 'NF { print $1 }' \
+      | grep -Eq -- "$forbidden_pattern"; then
     log_status "service=$service placement=forbidden"
     add_external_condition forbidden_node_placement
   fi
@@ -214,16 +231,14 @@ while IFS='|' read -r stream group; do
   fi
 done <<<"$stream_groups"
 
-if ! publisher_image="$(docker service inspect vp-youtube-publisher-swarm \
-  --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' 2>/dev/null)" \
-  || [[ -z "$publisher_image" ]]; then
-  configuration_error publisher_image_missing
+if [[ -z "$trusted_python_image" ]]; then
+  configuration_error trusted_python_image_missing
 fi
 
 guard_args=(
   run --rm
   --env DATABASE_URL
-  "$publisher_image"
+  "$trusted_python_image"
   python -m app.channel_agent.soak_guard_cli
   --channel-id "$channel_id"
   --started-at "$started_at"

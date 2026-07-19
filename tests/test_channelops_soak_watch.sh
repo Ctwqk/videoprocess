@@ -6,9 +6,12 @@ WATCHER="$ROOT_DIR/deploy/swarm/channelops-soak-watch.sh"
 TEST_ROOT="$(mktemp -d)"
 FAKE_BIN="$TEST_ROOT/bin"
 CALLS="$TEST_ROOT/docker.calls"
+ALL_CALLS="$TEST_ROOT/docker.all.calls"
 OUTPUT="$TEST_ROOT/watcher.out"
 STATE_DIR="$TEST_ROOT/state"
 DEPLOY_ENV="$TEST_ROOT/deploy.env"
+DEFAULT_ROOT="$TEST_ROOT/home/taiwei/deploy-github-sync"
+DEFAULT_WATCHER="$TEST_ROOT/channelops-soak-watch-default.sh"
 SECRET_URL='postgresql+asyncpg://guard:do-not-log@database.example/videoprocess'
 
 cleanup() {
@@ -38,15 +41,34 @@ assert_not_contains() {
 }
 
 run_watcher() {
+  : >"$CALLS"
   : >"$OUTPUT"
   set +e
   DEPLOY_GITHUB_SYNC_ROOT="$TEST_ROOT" \
-    DEPLOY_GITHUB_SYNC_ENV="$DEPLOY_ENV" \
+    DEPLOY_GITHUB_SYNC_ENV_FILE="$DEPLOY_ENV" \
     PATH="$FAKE_BIN:$PATH" \
     FAKE_DOCKER_CALLS="$CALLS" \
+    FAKE_DOCKER_ALL_CALLS="$ALL_CALLS" \
     FAKE_DOCKER_MODE="${FAKE_DOCKER_MODE:-healthy}" \
+    FAKE_MISSING_SERVICES="${FAKE_MISSING_SERVICES:-}" \
     FAKE_CLI_EXIT="${FAKE_CLI_EXIT:-0}" \
     bash "$WATCHER" >"$OUTPUT" 2>&1
+  WATCHER_EXIT=$?
+  set -e
+}
+
+run_default_watcher() {
+  : >"$CALLS"
+  : >"$OUTPUT"
+  set +e
+  env -u DEPLOY_GITHUB_SYNC_ROOT -u DEPLOY_GITHUB_SYNC_ENV_FILE \
+    PATH="$FAKE_BIN:$PATH" \
+    FAKE_DOCKER_CALLS="$CALLS" \
+    FAKE_DOCKER_ALL_CALLS="$ALL_CALLS" \
+    FAKE_DOCKER_MODE="${FAKE_DOCKER_MODE:-healthy}" \
+    FAKE_MISSING_SERVICES="${FAKE_MISSING_SERVICES:-}" \
+    FAKE_CLI_EXIT="${FAKE_CLI_EXIT:-0}" \
+    bash "$DEFAULT_WATCHER" >"$OUTPUT" 2>&1
   WATCHER_EXIT=$?
   set -e
 }
@@ -74,53 +96,77 @@ write_state() {
 
 mkdir -p "$FAKE_BIN"
 : >"$CALLS"
+: >"$ALL_CALLS"
 printf 'VP_PYTHON_WORKER_DATABASE_URL=%s\n' "$SECRET_URL" >"$DEPLOY_ENV"
 
 cat >"$FAKE_BIN/docker" <<'FAKE_DOCKER'
 #!/usr/bin/env bash
 set -euo pipefail
 
-{
-  printf 'docker'
-  for argument in "$@"; do
-    printf '|%s' "$argument"
-  done
-  printf '\n'
-} >>"$FAKE_DOCKER_CALLS"
+log_call() {
+  local destination="$1"
+  shift
+  {
+    printf 'docker'
+    for argument in "$@"; do
+      printf '|%s' "$argument"
+    done
+    printf '\n'
+  } >>"$destination"
+}
+
+service_is_missing() {
+  case " ${FAKE_MISSING_SERVICES:-} " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+log_call "$FAKE_DOCKER_CALLS" "$@"
+log_call "$FAKE_DOCKER_ALL_CALLS" "$@"
 
 if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
   service="${3:-}"
-  if [[ "$*" == *ContainerSpec.Image* ]]; then
-    printf 'vp-ffmpeg-worker-python:deployed\n'
-  elif [[ "${FAKE_DOCKER_MODE:-healthy}" == "zero_desired" \
-    && "$service" == "vp-api-swarm" ]]; then
-    printf '0\n'
-  else
-    printf '1\n'
+  if service_is_missing "$service"; then
+    exit 1
   fi
+  desired=1
+  if [[ "${FAKE_DOCKER_MODE:-healthy}" == "zero_desired" \
+    && "$service" == "vp-api-swarm" ]]; then
+    desired=0
+  fi
+  case "$service" in
+    vp-youtube-publisher-swarm) image=vp-ffmpeg-worker-python:publisher-deployed ;;
+    vp-ffmpeg-worker-gpu-swarm) image=vp-ffmpeg-worker-python:gpu-deployed ;;
+    *) image="fixture-$service:deployed" ;;
+  esac
+  printf '%s|%s\n' "$desired" "$image"
   exit 0
 fi
 
 if [[ "${1:-} ${2:-}" == "service ps" ]]; then
   service="${3:-}"
-  if [[ "${FAKE_DOCKER_MODE:-healthy}" == "unhealthy" \
-    && "$service" == "vp-api-swarm" ]]; then
-    exit 0
+  if service_is_missing "$service"; then
+    exit 1
   fi
-  if [[ "${FAKE_DOCKER_MODE:-healthy}" == "zero_desired" \
-    && "$service" == "vp-api-swarm" ]]; then
-    exit 0
+  if [[ "$service" == "vp-api-swarm" ]]; then
+    case "${FAKE_DOCKER_MODE:-healthy}" in
+      unhealthy|zero_desired) exit 0 ;;
+      starting) printf 'colima-127|Starting 2 seconds ago\n'; exit 0 ;;
+      preparing) printf 'colima-127|Preparing 2 seconds ago\n'; exit 0 ;;
+      rejected) printf 'colima-127|Rejected 2 seconds ago\n'; exit 0 ;;
+    esac
   fi
   if [[ "${FAKE_DOCKER_MODE:-healthy}" == "forbidden" \
     && "$service" == "vp-ffmpeg-worker-go-swarm" ]]; then
-    printf '10.0.0.126\n'
+    printf '10.0.0.126|Starting 2 seconds ago\n'
   else
-    printf 'colima-127\n'
+    printf 'colima-127|Running 2 minutes ago\n'
   fi
   exit 0
 fi
 
-if [[ "${1:-} ${2:-}" == "exec vp-redis" ]]; then
+if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" ]]; then
   stream="${@: -1}"
   case "$stream" in
     vp:tasks:ffmpeg_go) group=ffmpeg_go-workers ;;
@@ -153,6 +199,35 @@ chmod +x "$FAKE_BIN/docker"
 if [[ ! -f "$WATCHER" ]]; then
   fail "missing watcher: $WATCHER"
 fi
+
+# Relocate only the literal default root in a test copy. Calls omit both
+# controller path overrides and therefore exercise production-shaped defaults.
+assert_contains 'DEPLOY_GITHUB_SYNC_ROOT:-/home/taiwei/deploy-github-sync' "$WATCHER"
+assert_contains 'DEPLOY_GITHUB_SYNC_ENV_FILE:-$sync_root/env/deploy.env' "$WATCHER"
+mkdir -p "$(dirname "$DEFAULT_ROOT")"
+sed "s#/home/taiwei/deploy-github-sync#$DEFAULT_ROOT#g" "$WATCHER" >"$DEFAULT_WATCHER"
+chmod +x "$DEFAULT_WATCHER"
+
+run_default_watcher
+[[ "$WATCHER_EXIT" -eq 0 ]] || fail "default missing state must exit zero"
+assert_contains 'status=disabled reason=state_missing' "$OUTPUT"
+[[ ! -s "$CALLS" ]] || fail "default missing state contacted Docker"
+[[ ! -e "$DEFAULT_ROOT/state/vp-soak-watch.env" ]] || fail "default watcher created state"
+
+mkdir -p "$DEFAULT_ROOT/state" "$DEFAULT_ROOT/env"
+cp "$DEPLOY_ENV" "$DEFAULT_ROOT/env/deploy.env"
+cp /dev/null "$DEFAULT_ROOT/state/vp-soak-watch.env"
+{
+  printf 'VP_SOAK_WATCH_ENABLED=true\n'
+  printf 'VP_SOAK_CHANNEL_ID=123e4567-e89b-12d3-a456-426614174000\n'
+  printf 'VP_SOAK_STARTED_AT=2026-07-19T18:30:00Z\n'
+} >"$DEFAULT_ROOT/state/vp-soak-watch.env"
+FAKE_DOCKER_MODE=healthy
+FAKE_MISSING_SERVICES=
+FAKE_CLI_EXIT=0
+run_default_watcher
+[[ "$WATCHER_EXIT" -eq 0 ]] || fail "production-shaped default paths failed"
+assert_contains '|--channel-id|123e4567-e89b-12d3-a456-426614174000' "$CALLS"
 
 # Missing and explicitly disabled state are successful no-ops before Docker.
 run_watcher
@@ -193,13 +268,17 @@ run_watcher
 assert_contains 'status=configuration_error reason=invalid_max_publications_per_24h' "$OUTPUT"
 [[ ! -s "$CALLS" ]] || fail "invalid threshold contacted Docker"
 
-# A healthy run checks every service and group, then invokes the guard safely.
+# A healthy run checks every service and group exactly once, then invokes guard.
 write_state
-: >"$CALLS"
 FAKE_DOCKER_MODE=healthy
+FAKE_MISSING_SERVICES=
 FAKE_CLI_EXIT=0
 run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "healthy watcher run failed"
+[[ "$(grep -Fc 'docker|service|inspect|' "$CALLS")" -eq 10 ]] \
+  || fail "healthy run must inspect exactly 10 services"
+[[ "$(grep -Fc 'docker|service|ps|' "$CALLS")" -eq 10 ]] \
+  || fail "healthy run must query exactly 10 service task sets"
 for service in \
   vp-api-swarm \
   vp-frontend-swarm \
@@ -221,10 +300,12 @@ for pair in \
   'vp:events|orchestrator'; do
   stream="${pair%%|*}"
   group="${pair#*|}"
-  assert_contains "docker|exec|vp-redis|redis-cli|--raw|XINFO|GROUPS|$stream" "$CALLS"
+  assert_contains "docker|exec|constructure_vp_redis|redis-cli|--raw|XINFO|GROUPS|$stream" "$CALLS"
   assert_contains "stream=$stream group=$group status=healthy" "$OUTPUT"
 done
-assert_contains 'docker|run|--rm|--env|DATABASE_URL|vp-ffmpeg-worker-python:deployed|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
+[[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|--raw|XINFO|GROUPS|' "$CALLS")" -eq 4 ]] \
+  || fail "healthy run must query exactly 4 Redis streams"
+assert_contains 'docker|run|--rm|--env|DATABASE_URL|vp-ffmpeg-worker-python:publisher-deployed|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
 assert_contains '|--channel-id|123e4567-e89b-12d3-a456-426614174000' "$CALLS"
 assert_contains '|--started-at|2026-07-19T18:30:00Z' "$CALLS"
 assert_not_contains "$SECRET_URL" "$CALLS"
@@ -233,55 +314,77 @@ assert_not_contains '|--apply' "$CALLS"
 
 # Auto-hold is the sole switch that adds the mutating guard flag.
 write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:30:00Z 1 45 30 true
-: >"$CALLS"
 run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "auto-hold healthy run failed"
 assert_contains '|--apply' "$CALLS"
 
 # Host findings become only the fixed external condition codes.
 write_state
-: >"$CALLS"
 FAKE_DOCKER_MODE=unhealthy
 run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "unhealthy service assessment did not run"
 assert_contains '|--external-condition|service_unhealthy' "$CALLS"
 
-: >"$CALLS"
 FAKE_DOCKER_MODE=zero_desired
 run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "zero-replica service assessment did not run"
 assert_contains '|--external-condition|service_unhealthy' "$CALLS"
 
-: >"$CALLS"
+for task_state in starting preparing rejected; do
+  FAKE_DOCKER_MODE="$task_state"
+  run_watcher
+  [[ "$WATCHER_EXIT" -eq 0 ]] || fail "$task_state service assessment did not run"
+  assert_contains '|--external-condition|service_unhealthy' "$CALLS"
+done
+
 FAKE_DOCKER_MODE=forbidden
 run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "forbidden placement assessment did not run"
 assert_contains '|--external-condition|forbidden_node_placement' "$CALLS"
 
-: >"$CALLS"
 FAKE_DOCKER_MODE=unknown_group
 run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "missing Redis group assessment did not run"
 assert_contains 'youtube_publisher-workers' "$OUTPUT"
 assert_contains '|--external-condition|redis_group_missing' "$CALLS"
 
-: >"$CALLS"
 FAKE_DOCKER_MODE=redis_pending
 run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "pending Redis assessment did not run"
 assert_contains '|--external-condition|redis_pending_exceeded' "$CALLS"
 
-# A guard trip remains nonzero for cron, including when quarantine was requested.
+# A missing publisher still runs and applies the guard in the companion image.
 write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:30:00Z 1 45 30 true
-: >"$CALLS"
 FAKE_DOCKER_MODE=healthy
+FAKE_MISSING_SERVICES=vp-youtube-publisher-swarm
+run_watcher
+[[ "$WATCHER_EXIT" -eq 0 ]] || fail "publisher-missing guard assessment did not run"
+assert_contains '|--external-condition|service_missing' "$CALLS"
+assert_contains '|--apply' "$CALLS"
+assert_contains '|vp-ffmpeg-worker-python:gpu-deployed|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
+
+# With neither trusted Python image available, fail before claiming protection.
+FAKE_MISSING_SERVICES='vp-youtube-publisher-swarm vp-ffmpeg-worker-gpu-swarm'
+run_watcher
+[[ "$WATCHER_EXIT" -ne 0 ]] || fail "missing trusted Python images must fail"
+assert_contains 'status=configuration_error reason=trusted_python_image_missing' "$OUTPUT"
+assert_not_contains 'docker|run|' "$CALLS"
+assert_not_contains 'status=guard_tripped' "$OUTPUT"
+assert_not_contains 'status=healthy guard_exit=' "$OUTPUT"
+
+# A guard trip remains nonzero for cron, including when quarantine was requested.
+FAKE_DOCKER_MODE=healthy
+FAKE_MISSING_SERVICES=
 FAKE_CLI_EXIT=20
 run_watcher
 [[ "$WATCHER_EXIT" -eq 20 ]] || fail "guard exit 20 must remain nonzero"
 assert_contains 'status=guard_tripped guard_exit=20' "$OUTPUT"
 
+assert_not_contains "$SECRET_URL" "$ALL_CALLS"
 for forbidden_command in upload resume enqueue schedule-open schedule_open; do
-  assert_not_contains "|$forbidden_command|" "$CALLS"
+  if tr '|' '\n' <"$ALL_CALLS" | grep -Fiqx -- "$forbidden_command"; then
+    fail "aggregate Docker calls contained prohibited action '$forbidden_command'"
+  fi
 done
 
 echo 'PASS: channelops soak watcher contract'
