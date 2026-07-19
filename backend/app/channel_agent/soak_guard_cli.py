@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, Never
 
@@ -16,6 +16,23 @@ from app.services.channelops_soak_guard import (
     SoakGuardPolicy,
     assess_channelops_soak,
 )
+
+
+_QUARANTINE_COUNT_KEYS = {
+    "changed": frozenset(
+        {"channel_ids", "task_ids", "job_ids", "node_execution_ids", "queue_item_ids"}
+    ),
+    "retained": frozenset(
+        {
+            "task_ids",
+            "job_ids",
+            "node_execution_ids",
+            "queue_item_ids",
+            "publication_ids",
+            "feedback_snapshot_ids",
+        }
+    ),
+}
 
 
 class _CLIUsageError(ValueError):
@@ -102,11 +119,12 @@ async def run(argv: Sequence[str] | None = None) -> int:
                     close_schedule=True,
                     now=assessed_at,
                 )
+                quarantine_counts = _validated_quarantine_counts(quarantine)
         except Exception:
             _emit("quarantine_error")
             return 3
         payload["status"] = "quarantined"
-        payload["quarantine_counts"] = quarantine["counts"]
+        payload["quarantine_counts"] = quarantine_counts
 
     _emit_payload(payload)
     return 20
@@ -162,6 +180,32 @@ def _positive_integer(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def _validated_quarantine_counts(result: object) -> dict[str, dict[str, int]]:
+    if not isinstance(result, Mapping):
+        raise ValueError("invalid quarantine result")
+    counts = result.get("counts")
+    if not isinstance(counts, Mapping) or set(counts) != {"changed", "retained"}:
+        raise ValueError("invalid quarantine counts")
+
+    validated: dict[str, dict[str, int]] = {}
+    for group_name in ("changed", "retained"):
+        group = counts[group_name]
+        if not isinstance(group, Mapping) or set(group) != _QUARANTINE_COUNT_KEYS[group_name]:
+            raise ValueError("invalid quarantine count group")
+        validated_group: dict[str, int] = {}
+        for key, value in group.items():
+            if (
+                not isinstance(key, str)
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError("invalid quarantine count")
+            validated_group[key] = value
+        validated[group_name] = validated_group
+    return validated
 
 
 def _emit(status: str) -> None:

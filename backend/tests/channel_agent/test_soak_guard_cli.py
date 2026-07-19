@@ -17,6 +17,23 @@ from app.services.channelops_soak_guard import (
 
 CHANNEL_ID = uuid.UUID("d6c5ee75-734a-42a4-b758-9d7d0ec89532")
 STARTED_AT = "2026-07-16T18:00:00Z"
+QUARANTINE_COUNTS = {
+    "changed": {
+        "channel_ids": 1,
+        "task_ids": 2,
+        "job_ids": 0,
+        "node_execution_ids": 0,
+        "queue_item_ids": 0,
+    },
+    "retained": {
+        "task_ids": 0,
+        "job_ids": 0,
+        "node_execution_ids": 0,
+        "queue_item_ids": 0,
+        "publication_ids": 1,
+        "feedback_snapshot_ids": 1,
+    },
+}
 
 
 class _SessionContext:
@@ -157,10 +174,7 @@ async def test_apply_uses_fresh_session_and_exact_fail_closed_arguments(
     )
     quarantine = AsyncMock(
         return_value={
-            "counts": {
-                "changed": {"channel_ids": 1, "task_ids": 2},
-                "retained": {"publication_ids": 1},
-            }
+            "counts": QUARANTINE_COUNTS,
         }
     )
     monkeypatch.setattr(soak_guard_cli, "get_session_factory", lambda: factory)
@@ -186,10 +200,7 @@ async def test_apply_uses_fresh_session_and_exact_fail_closed_arguments(
             "channel_id": str(CHANNEL_ID),
             "unsafe_account_privacy_count": 1,
         },
-        "quarantine_counts": {
-            "changed": {"channel_ids": 1, "task_ids": 2},
-            "retained": {"publication_ids": 1},
-        },
+        "quarantine_counts": QUARANTINE_COUNTS,
         "status": "quarantined",
     }
 
@@ -278,3 +289,55 @@ async def test_quarantine_failure_returns_three_without_claiming_protection(
     output = capsys.readouterr().out
     assert "secret" not in output
     assert json.loads(output)["status"] == "quarantine_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "malformed_result",
+    [
+        None,
+        {},
+        {"counts": {"changed": {"task_ids": 1}}},
+        {"counts": {"changed": {"task_ids": 1}, "retained": {}}},
+        {"counts": {"changed": [], "retained": {}}},
+        {
+            "counts": {
+                "changed": {"task_ids": "postgresql://secret"},
+                "retained": {},
+            }
+        },
+        {
+            "counts": {
+                "changed": {"DATABASE_URL=postgresql://secret": 1},
+                "retained": {},
+            }
+        },
+    ],
+)
+async def test_malformed_quarantine_result_returns_fixed_error(
+    monkeypatch,
+    capsys,
+    malformed_result,
+):
+    factory = _SessionFactory(object(), object())
+    assess = AsyncMock(
+        return_value=SoakGuardAssessment(
+            critical_codes=("service_missing",),
+            metrics={"channel_id": str(CHANNEL_ID), "external_condition_count": 1},
+        )
+    )
+    quarantine = AsyncMock(return_value=malformed_result)
+    monkeypatch.setattr(soak_guard_cli, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(soak_guard_cli, "assess_channelops_soak", assess)
+    monkeypatch.setattr(soak_guard_cli, "quarantine_channelops_backlog", quarantine)
+
+    exit_code = await soak_guard_cli.run(_arguments("--apply"))
+
+    assert exit_code == 3
+    output = capsys.readouterr().out
+    assert "secret" not in output
+    assert json.loads(output) == {
+        "critical_codes": [],
+        "metrics": {},
+        "status": "quarantine_error",
+    }

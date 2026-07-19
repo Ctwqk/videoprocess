@@ -50,6 +50,7 @@ _INTERNAL_CRITICAL_CODES = frozenset(
         "unsafe_account_privacy",
         "unsafe_lane_privacy",
         "unsafe_publication_privacy",
+        "unsafe_upload_operation_privacy",
     }
 )
 CRITICAL_CODES = _INTERNAL_CRITICAL_CODES | ALLOWED_EXTERNAL_CONDITIONS
@@ -246,7 +247,8 @@ async def assess_channelops_soak(
     unsafe_publications = [
         publication
         for publication in publications
-        if publication.current_privacy not in _ALLOWED_PRIVACY
+        if publication.desired_privacy not in _ALLOWED_PRIVACY
+        or publication.current_privacy not in _ALLOWED_PRIVACY
     ]
     cadence_start = max(started_at, assessed_at - timedelta(hours=24))
     recent_publications = [
@@ -316,6 +318,9 @@ async def assess_channelops_soak(
     )
     ambiguous_operations = [operation for operation in operations if operation.status == "uncertain"]
     failed_operations = [operation for operation in operations if operation.status == "failed"]
+    unsafe_privacy_operations = [
+        operation for operation in operations if operation.privacy not in _ALLOWED_PRIVACY
+    ]
     upload_cutoff = assessed_at - timedelta(minutes=policy.upload_stale_minutes)
     stale_operations = [
         operation
@@ -326,11 +331,14 @@ async def assess_channelops_soak(
     metrics["upload_operation_count"] = len(operations)
     metrics["ambiguous_upload_operation_count"] = len(ambiguous_operations)
     metrics["failed_upload_operation_count"] = len(failed_operations)
+    metrics["unsafe_upload_operation_privacy_count"] = len(unsafe_privacy_operations)
     metrics["stale_upload_operation_count"] = len(stale_operations)
     if ambiguous_operations:
         critical_codes.add("ambiguous_upload_operation")
     if failed_operations:
         critical_codes.add("failed_upload_operation")
+    if unsafe_privacy_operations:
+        critical_codes.add("unsafe_upload_operation_privacy")
     if stale_operations:
         critical_codes.add("stale_upload_operation")
 
@@ -380,6 +388,7 @@ def _empty_metrics(channel_id: uuid.UUID) -> dict[str, str | int]:
         "upload_operation_count": 0,
         "ambiguous_upload_operation_count": 0,
         "failed_upload_operation_count": 0,
+        "unsafe_upload_operation_privacy_count": 0,
         "stale_upload_operation_count": 0,
         "channelops_queue_item_count": 0,
         "channelops_queue_failure_count": 0,

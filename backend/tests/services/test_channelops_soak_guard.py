@@ -4,6 +4,7 @@ import json
 import uuid
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -259,6 +260,33 @@ async def test_unsafe_publication_privacy_is_critical(soak_session):
 
 
 @pytest.mark.asyncio
+async def test_desired_public_current_private_publication_is_critical(soak_session):
+    rows = await _seed_graph(soak_session)
+    rows["publication"].desired_privacy = "public"
+    rows["publication"].current_privacy = "private"
+    await soak_session.commit()
+
+    assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
+
+    assert "unsafe_publication_privacy" in assessment.critical_codes
+    assert assessment.metrics["unsafe_publication_privacy_count"] == 1
+    assert "public" not in assessment.metrics.values()
+
+
+@pytest.mark.asyncio
+async def test_public_upload_operation_privacy_is_critical(soak_session):
+    rows = await _seed_graph(soak_session)
+    rows["operation"].privacy = "public"
+    await soak_session.commit()
+
+    assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
+
+    assert "unsafe_upload_operation_privacy" in assessment.critical_codes
+    assert assessment.metrics["unsafe_upload_operation_privacy_count"] == 1
+    assert "public" not in assessment.metrics.values()
+
+
+@pytest.mark.asyncio
 async def test_uncertain_upload_operation_is_critical(soak_session):
     rows = await _seed_graph(soak_session)
     rows["operation"].status = "uncertain"
@@ -267,6 +295,18 @@ async def test_uncertain_upload_operation_is_critical(soak_session):
     assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
 
     assert "ambiguous_upload_operation" in assessment.critical_codes
+
+
+@pytest.mark.asyncio
+async def test_failed_upload_operation_is_critical(soak_session):
+    rows = await _seed_graph(soak_session)
+    rows["operation"].status = "failed"
+    await soak_session.commit()
+
+    assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
+
+    assert "failed_upload_operation" in assessment.critical_codes
+    assert assessment.metrics["failed_upload_operation_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -374,14 +414,18 @@ async def test_allowed_external_conditions_are_sorted_and_deduplicated(soak_sess
 
 
 @pytest.mark.asyncio
-async def test_unknown_external_condition_is_rejected_before_database_access(soak_session):
+async def test_unknown_external_condition_is_rejected_before_database_access():
+    db = AsyncMock()
+
     with pytest.raises(ValueError, match="external condition"):
         await assess_channelops_soak(
-            soak_session,
+            db,
             _policy(uuid.uuid4()),
             external_conditions=("database_url=postgresql://secret",),
             now=NOW,
         )
+
+    db.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -425,17 +469,54 @@ async def test_assessment_is_channel_scoped_and_metrics_never_expose_payloads(so
         external_asset_auto_publish=True,
         enabled=True,
     )
-    soak_session.add(other_account)
+    other_lane = TopicLane(channel_profile_id=other.id, name="other lane", enabled=True)
+    soak_session.add_all([other_account, other_lane])
     await soak_session.flush()
+    other_lane_format = LaneFormatMatrix(
+        topic_lane_id=other_lane.id,
+        format_key="other-short",
+        enabled=True,
+        default_publish_visibility="public",
+    )
     other_task = _task(other.id, other_account.id, state="failed")
-    soak_session.add(other_task)
+    soak_session.add_all([other_lane_format, other_task])
     await soak_session.flush()
-    soak_session.add(_operation(other_task, status="uncertain"))
+    other_publication = _publication(
+        other_task,
+        desired_privacy="public",
+        current_privacy="public",
+    )
+    soak_session.add(other_publication)
+    await soak_session.flush()
+    soak_session.add_all(
+        [
+            _operation(other_task, status="uncertain", privacy="public"),
+            FeedbackSnapshot(
+                publication_id=other_publication.id,
+                snapshot_stage="24h",
+                collected_at=NOW,
+                raw_json={"secret": "foreign feedback payload"},
+            ),
+            ChannelOpsQueueItem(
+                kind="observe_job",
+                idempotency_key=f"foreign-{uuid.uuid4()}",
+                channel_profile_id=other.id,
+                status="dead_lettered",
+                last_error="foreign queue failure payload",
+            ),
+        ]
+    )
     await soak_session.commit()
 
     assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
 
     assert assessment.critical_codes == ()
+    assert assessment.metrics["enabled_account_count"] == 1
+    assert assessment.metrics["enabled_lane_format_count"] == 1
+    assert assessment.metrics["publication_count"] == 1
+    assert assessment.metrics["feedback_snapshot_count"] == 1
+    assert assessment.metrics["upload_operation_count"] == 1
+    assert assessment.metrics["channelops_queue_item_count"] == 1
     encoded = json.dumps(dict(assessment.metrics), sort_keys=True)
     for sensitive in (
         "sensitive",
