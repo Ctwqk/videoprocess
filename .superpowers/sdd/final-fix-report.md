@@ -543,3 +543,170 @@ Implementation commit:
 - Full-tree Ruff and mypy remain nonzero only for the recorded pre-existing
   baselines: 19 Ruff findings and 68 mypy errors in 25 files. Changed-file Ruff
   is clean and no new mypy count was introduced.
+
+## Final Review 4 Consolidated Fix Wave
+
+### Status And Scope
+
+`DONE_WITH_CONCERNS`. Work remained on `codex/channelops-soak-guard` in the
+required worktree. No deployment, push, production access, host 126 access,
+activation-state change, real PDS/YouTube call, upload, publication, or edit to
+the user-owned root `vp_autonomous_production_feedback_loop_plan.md` occurred.
+
+Implementation commit:
+
+- `256c5c613e016bb23177f3854e49819e462c3453` -
+  `fix: fence final review 4 authority races`
+- The report-only commit is listed in the final task response because this
+  section must be written after the implementation commit exists.
+
+### Implemented Fixes
+
+- Persisted AutoFlow mutation and execution now use row locks. Execution owns
+  schedule, plan, pipeline, job, run, usage, and plan-state changes in one
+  transaction; it revalidates locked plan authority and starts background work
+  only after commit. Persistence rejects stale in-memory execution revisions.
+- Revision 026 adds database-owned `execution_revision`, approval-bound
+  `approved_revision`, and run `request_fingerprint`. Its PostgreSQL trigger
+  compares every canonical execution field, excludes approval-only rights
+  keys, rotates revision on canonical change, and clears all authority for
+  changed, blocked, rejected, or incorrectly revision-bound writes.
+- Python and Go review evidence now carry and validate the numeric approved
+  revision as well as plan id, timestamp, and SHA-256 revision hash. Go direct
+  promotion enters the queue/channel transaction fence when needed, locks task,
+  publication, and plan authority before PDS/YouTube, and holds the locks
+  through durable promotion writes.
+- Manual promotion and publication rejection share channel -> task ->
+  publication -> plan operator locking. Quarantine follows channel -> schedule
+  -> task/publication/job; AutoFlow follows schedule -> plan -> job; the durable
+  starter follows schedule -> job and atomically parks CLOSED jobs without
+  dispatch.
+- Every persisted execute request uses the same transactional path. Its key is
+  bound to canonical JSON for all request behavior fields except the key and
+  inline plan. Exact replay succeeds, changed flags conflict, and legacy keyed
+  rows without fingerprints fail closed. Review-free owned plans retain their
+  existing execution compatibility while review-gated plans require exact
+  current authority.
+
+### Changed Files
+
+- Migration/model/schema: `backend/alembic/versions/026_autoflow_authority_fence.py`,
+  `backend/app/models/autoflow.py`, `backend/app/schemas/autoflow.py`.
+- Python authority/runtime: `backend/app/api/channel_agent.py`,
+  `backend/app/autoflow/service.py`,
+  `backend/app/channel_agent/human_review.py`,
+  `backend/app/orchestrator/engine.py`,
+  `backend/app/services/channelops_quarantine.py`,
+  `backend/app/services/schedule_service.py`.
+- Python tests: `backend/tests/autoflow/test_autoflow_api.py`,
+  `backend/tests/autoflow/test_execute_idempotency_postgres.py`,
+  `backend/tests/channel_agent/test_api.py`,
+  `backend/tests/migrations/test_final_review3_postgres.py`,
+  `backend/tests/migrations/test_final_review4_postgres.py`,
+  `backend/tests/services/test_channelops_quarantine.py`,
+  `backend/tests/services/test_channelops_soak_guard.py`.
+- Go runtime: `internal/channelops/autoflow_client.go`,
+  `internal/channelops/handlers.go`, `internal/channelops/human_review.go`,
+  `internal/channelops/store.go`, `internal/channelops/store_publications.go`,
+  `internal/channelops/store_tasks.go`, `internal/channelops/types.go`.
+- Go tests: `internal/channelops/autoflow_client_test.go`,
+  `internal/channelops/integration_test.go`.
+
+### RED Evidence
+
+- Execute request fingerprint:
+  `cd backend && CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55435/videoprocess .venv/bin/python3 -m pytest tests/autoflow/test_execute_idempotency_postgres.py -k 'idempotency_key_rejects_execute_flag_change or idempotency_key_rejects_save_as_template_change or exact_request_fingerprint_replay or legacy_keyed_run_without_fingerprint' -q`
+  -> `3 failed, 1 passed, 9 deselected`; changed execution/template flags
+  silently reused a key and the legacy fingerprint column was absent.
+- Python plan and schedule interleavings:
+  `cd backend && CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55435/videoprocess .venv/bin/python3 -m pytest tests/autoflow/test_execute_idempotency_postgres.py -k 'execute_first_holds_plan_authority or reject_first_revokes_authority or schedule_close_between_creation' -q`
+  -> `3 failed, 10 deselected`; patch/reject did not observe the required plan
+  lock and the durable starter did not wait for schedule-close authority.
+- Review evidence revision:
+  `cd backend && .venv/bin/python3 -m pytest tests/channel_agent/test_api.py -k 'human_review_release_approves_exact_plan or manual_promotion_preserves_external_plan_review_token' -q`
+  -> `2 failed, 31 deselected`; execution/approved revision was not persisted or
+  emitted in evidence.
+- Migration authority:
+  `cd backend && CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55435/videoprocess .venv/bin/python3 -m pytest tests/migrations/test_final_review4_postgres.py -q`
+  -> `1 failed`; head remained 025 and no database revision fence existed.
+- Go promotion interleavings:
+  `DATABASE_URL=postgres://vp:vp_test@127.0.0.1:55435/videoprocess go test ./internal/channelops -run 'TestPlanRejectFirstPreventsDirectPromotionSideEffects|TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites' -count=1 -v -timeout=60s`
+  -> both tests failed; direct promotion and concurrent invalidation completed
+  without waiting on plan authority.
+
+### GREEN And Full Verification
+
+- The fingerprint focus above passed all four selected tests; the complete
+  PostgreSQL AutoFlow execution file passed `13 passed in 2.07s`.
+- Python race focus passed `3 passed, 10 deselected in 0.80s`; API evidence
+  focus passed `2 passed, 31 deselected`; migration focus passed `1 passed`.
+- The Go promotion focus passed both deterministic tests. Full
+  `internal/channelops` later passed, including valid/invalid external evidence,
+  direct promotion, retry idempotency, and both invalidation linearization
+  orders.
+- Final real PostgreSQL acceptance command:
+  `cd backend && CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55435/videoprocess .venv/bin/python3 -m pytest tests/migrations/test_final_review4_postgres.py tests/migrations/test_final_review3_postgres.py tests/channel_agent/test_operator_quarantine_postgres.py tests/autoflow/test_execute_idempotency_postgres.py tests/channel_agent/test_api.py -q`
+  -> `52 passed in 6.17s`.
+- Fresh database migration: an empty `videoprocess` database upgraded from 001
+  through `026_autoflow_authority_fence`; the migration test additionally
+  proved fresh upgrade, literal 025-era canonical update revision rotation,
+  literal 025-era approval failure, valid revision-bound approval, and downgrade
+  removal of the trigger and three new columns.
+- Required backend test command `cd backend && python3 -m pytest` could not load
+  pytest from Homebrew Python 3.14. The project environment equivalent,
+  `cd backend && .venv/bin/python3 -m pytest`, passed
+  `641 passed, 20 skipped, 11 warnings in 65.24s`.
+- `cd backend && python3 -m ruff check . || true` likewise could not load Ruff.
+  `.venv/bin/python3 -m ruff check .` reports 17 existing repository findings,
+  improved from the recorded baseline of 19. Ruff over every changed Python
+  file reports `All checks passed!`.
+- `cd backend && python3 -m mypy app || true` could not load mypy.
+  `.venv/bin/python3 -m mypy app` reports 66 existing errors in 24 files,
+  improved from the recorded 68 errors in 25 files; the new shared schedule
+  helper has no mypy errors.
+- `DATABASE_URL=postgres://vp:vp_test@127.0.0.1:55435/videoprocess go test ./... -count=1`
+  -> all Go packages passed against the fresh revision-026 database.
+- `bash tests/test_channelops_soak_watch.sh` ->
+  `PASS: channelops soak watcher contract`; `bash tests/test_vp_deploy_sync_extension.sh`
+  exited 0. Watcher, deploy extension, both contract scripts, and image-smoke
+  script all passed `bash -n`.
+- `git diff --check` exited 0. Pre-commit `git status --short` contained exactly
+  the 25 implementation/test files listed above; no unrelated or root-plan file
+  was present.
+
+### PostgreSQL 16 And Cleanup
+
+- Disposable container `vp-final-review-4-postgres`, id
+  `0cc4727c42f5f9857358acf4750cc8630d5ff5260eb9d38eb0dcea5c9557ddef`,
+  used `postgres:16-alpine` image id
+  `sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777`.
+- Server was `PostgreSQL 16.14` on `127.0.0.1:55435`. The main database was
+  recreated from empty before the final Go suite. The container was force
+  removed after verification and its absence was checked.
+
+### Self-Review
+
+- Lock order is acyclic across the changed paths: an existing Go fence owns
+  channel first; Python quarantine then owns schedule before task/publication/
+  job; AutoFlow owns schedule before plan/job; starters own schedule before job.
+- Plan and schedule losing writers wait on real PostgreSQL locks. Commit order
+  determines the result: execution/promotion first permits that exact approved
+  revision and invalidation follows; invalidation first makes execution or
+  promotion fail closed before external effects.
+- AutoFlow reservation and all executable rows roll back together on planning
+  or job-creation failure. Replays validate plan, approval hash, approved
+  revision, and full request fingerprint before returning durable state.
+- Go promotion acquires exact manual/external plan evidence before PDS or
+  YouTube and keeps the transaction through durable writes. Tests use fakes;
+  invalidation-first asserts zero YouTube calls. No verification touched a real
+  external platform.
+
+### Concerns
+
+- The exact system-`python3` commands cannot run because that interpreter lacks
+  pytest, Ruff, and mypy; all project-environment commands completed as recorded.
+- Full-tree Ruff and mypy remain nonzero only for pre-existing baseline findings;
+  changed-file Ruff and the newly typed helper are clean.
+- Per the binding brief, the deployed-image smoke was not run. It remains the
+  post-push check against the exact naturally deployed image; its script syntax
+  passed.
