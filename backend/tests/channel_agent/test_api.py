@@ -959,6 +959,10 @@ async def test_human_review_release_approves_exact_plan_and_enqueues_execution(a
     assert datetime.fromisoformat(evidence["plan_review_approved_at"]) == persisted_token
     assert evidence["plan_approved_revision"] == plan.approved_revision
     assert evidence["review_notes"] == "assets checked"
+    task_authority = task.rationale_json["autoflow_plan_payload"]
+    assert task_authority["plan_id"] == str(plan.id)
+    assert task_authority["expected_approved_revision_hash"] == plan.approved_revision_hash
+    assert task_authority["expected_approved_revision"] == plan.approved_revision
     queue_rows = (
         await api_session.execute(
             select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.idempotency_key == f"execute_task:{task.id}")
@@ -966,6 +970,8 @@ async def test_human_review_release_approves_exact_plan_and_enqueues_execution(a
     ).scalars().all()
     assert len(queue_rows) == 1
     assert queue_rows[0].channel_profile_id == channel.id
+    assert queue_rows[0].payload_json["expected_approved_revision_hash"] == plan.approved_revision_hash
+    assert queue_rows[0].payload_json["expected_approved_revision"] == plan.approved_revision
 
 
 @pytest.mark.asyncio

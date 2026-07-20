@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -11,7 +12,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.autoflow.clip_ranker import ClipRanker
-from app.autoflow.service import AutoFlowService
+from app.autoflow.service import AutoFlowService, execute_request_fingerprint
 from app.models.autoflow import AutoFlowPlan, AutoFlowRun
 from app.models.job import Job, JobStatus
 from app.models.pipeline import Pipeline
@@ -166,6 +167,213 @@ async def test_response_loss_replay_returns_same_durable_execution(postgres_idem
     assert (first.run_id, first.pipeline_id, first.job_id) == (replay.run_id, replay.pipeline_id, replay.job_id)
     assert await _counts(factory) == (1, 1, 1)
     assert starts == [first.job_id]
+
+
+async def test_pre_expected_authority_fingerprint_remains_replayable(postgres_idempotency_db):
+    _engine, factory, starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Legacy fingerprint response loss")
+    request = AutoFlowExecuteRequest(
+        plan_id=plan.plan_id,
+        idempotency_key=f"legacy-fingerprint:{plan.plan_id}",
+    )
+
+    async with factory() as first_db:
+        first = await service.execute(request, first_db)
+
+    legacy_payload = request.model_dump(
+        mode="json",
+        exclude={
+            "idempotency_key",
+            "plan",
+            "expected_approved_revision_hash",
+            "expected_approved_revision",
+        },
+    )
+    legacy_payload["plan_id"] = str(uuid.UUID(plan.plan_id))
+    legacy_canonical = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    legacy_fingerprint = hashlib.sha256(legacy_canonical.encode("utf-8")).hexdigest()
+    async with factory() as legacy_db:
+        await legacy_db.execute(
+            text("UPDATE autoflow_runs SET request_fingerprint = :fingerprint WHERE id = :run_id"),
+            {"fingerprint": legacy_fingerprint, "run_id": first.run_id},
+        )
+        await legacy_db.commit()
+
+    async with factory() as replay_db:
+        replay = await service.execute(request, replay_db)
+
+    assert (first.run_id, first.pipeline_id, first.job_id) == (replay.run_id, replay.pipeline_id, replay.job_id)
+    assert await _counts(factory) == (1, 1, 1)
+    assert starts == [first.job_id]
+
+
+async def test_observed_r1_rejects_first_execute_after_r2_reapproval(postgres_idempotency_db):
+    _engine, factory, starts = postgres_idempotency_db
+    service, observed_r1 = await _approved_plan(factory, prompt="Observed R1 must not execute R2")
+    request_r1 = AutoFlowExecuteRequest(
+        plan_id=observed_r1.plan_id,
+        expected_approved_revision_hash=observed_r1.approved_revision_hash,
+        expected_approved_revision=observed_r1.approved_revision,
+        idempotency_key=f"observed-r1:{observed_r1.plan_id}",
+    )
+
+    async with factory() as patch_db:
+        current_r2 = await service.patch_plan(
+            observed_r1.plan_id,
+            AutoFlowPlanPatch(
+                metadata={"selected_title": "R2 title"},
+                rebuild_definition=False,
+                validate=False,
+                evaluate_rights=False,
+            ),
+            patch_db,
+        )
+        assert current_r2 is not None
+        current_r2 = await service.approve(current_r2.plan_id, patch_db)
+    assert current_r2 is not None
+    assert current_r2.approved_revision != observed_r1.approved_revision
+
+    async with factory() as execute_db:
+        with pytest.raises(ValueError, match="expected approved revision"):
+            await service.execute(request_r1, execute_db)
+
+    assert await _counts(factory) == (0, 0, 0)
+    assert starts == []
+
+
+async def test_r1_response_loss_then_r2_exact_retry_returns_r1_execution(postgres_idempotency_db):
+    _engine, factory, starts = postgres_idempotency_db
+    service, observed_r1 = await _approved_plan(factory, prompt="R1 response loss before R2")
+    request_r1 = AutoFlowExecuteRequest(
+        plan_id=observed_r1.plan_id,
+        expected_approved_revision_hash=observed_r1.approved_revision_hash,
+        expected_approved_revision=observed_r1.approved_revision,
+        idempotency_key=f"response-loss-r1:{observed_r1.plan_id}",
+    )
+
+    async with factory() as first_db:
+        first_r1 = await service.execute(request_r1, first_db)
+
+    async with factory() as patch_db:
+        current_r2 = await service.patch_plan(
+            observed_r1.plan_id,
+            AutoFlowPlanPatch(
+                metadata={"selected_title": "R2 after committed R1"},
+                rebuild_definition=False,
+                validate=False,
+                evaluate_rights=False,
+            ),
+            patch_db,
+        )
+        assert current_r2 is not None
+        current_r2 = await service.approve(current_r2.plan_id, patch_db)
+    assert current_r2 is not None
+    assert current_r2.approved_revision != observed_r1.approved_revision
+
+    async with factory() as replay_db:
+        replay_r1 = await service.execute(request_r1, replay_db)
+
+    assert (replay_r1.run_id, replay_r1.pipeline_id, replay_r1.job_id) == (
+        first_r1.run_id,
+        first_r1.pipeline_id,
+        first_r1.job_id,
+    )
+    assert await _counts(factory) == (1, 1, 1)
+    assert starts == [first_r1.job_id]
+
+
+async def test_r1_retry_rechecks_committed_key_before_live_r2_authority(postgres_idempotency_db):
+    engine, factory, starts = postgres_idempotency_db
+    service, observed_r1 = await _approved_plan(factory, prompt="R1 commits while retry waits")
+    request_r1 = AutoFlowExecuteRequest(
+        plan_id=observed_r1.plan_id,
+        expected_approved_revision_hash=observed_r1.approved_revision_hash,
+        expected_approved_revision=observed_r1.approved_revision,
+        idempotency_key=f"waiting-r1-retry:{observed_r1.plan_id}",
+    )
+    durable_r1_id = uuid.uuid4()
+
+    async with factory() as schedule_db:
+        schedule_db.add(
+            RuntimeSchedule(
+                service_name=VIDEO_SCHEDULE_SERVICE,
+                state=VideoScheduleState.OPEN.value,
+                updated_by="test",
+            )
+        )
+        await schedule_db.commit()
+
+    async with factory() as patch_db:
+        current_r2 = await service.patch_plan(
+            observed_r1.plan_id,
+            AutoFlowPlanPatch(
+                metadata={"selected_title": "R2 before delayed R1 visibility"},
+                rebuild_definition=False,
+                validate=False,
+                evaluate_rights=False,
+            ),
+            patch_db,
+        )
+        assert current_r2 is not None
+        current_r2 = await service.approve(current_r2.plan_id, patch_db)
+    assert current_r2 is not None
+    assert current_r2.approved_revision != observed_r1.approved_revision
+
+    blocker = factory()
+    try:
+        await blocker.execute(
+            select(RuntimeSchedule)
+            .where(RuntimeSchedule.service_name == VIDEO_SCHEDULE_SERVICE)
+            .with_for_update()
+        )
+        blocker.add(
+            AutoFlowRun(
+                id=durable_r1_id,
+                plan_id=uuid.UUID(observed_r1.plan_id),
+                status="pending",
+                artifacts_json={},
+                publish_json={
+                    "approved_revision_hash": observed_r1.approved_revision_hash,
+                    "approved_revision": observed_r1.approved_revision,
+                },
+                execute_idempotency_key=request_r1.idempotency_key,
+                request_fingerprint=execute_request_fingerprint(request_r1, observed_r1.plan_id),
+            )
+        )
+        await blocker.flush()
+
+        async def replay_waiting_on_schedule():
+            async with factory() as replay_db:
+                return await service.execute(request_r1, replay_db)
+
+        retry = asyncio.create_task(replay_waiting_on_schedule())
+        await _wait_until_lock_wait(engine, "runtime_schedules", retry)
+
+        await blocker.commit()
+        replay = await asyncio.wait_for(retry, timeout=5)
+    finally:
+        if blocker.in_transaction():
+            await blocker.rollback()
+        await blocker.close()
+
+    assert replay.run_id == str(durable_r1_id)
+    assert await _counts(factory) == (1, 0, 0)
+    assert starts == []
+
+
+async def test_whitespace_idempotency_key_is_rejected_without_effects(postgres_idempotency_db):
+    _engine, factory, starts = postgres_idempotency_db
+    service, observed_plan = await _approved_plan(factory, prompt="Whitespace execute key")
+
+    async with factory() as db:
+        with pytest.raises(ValueError, match="idempotency_key must not be blank"):
+            await service.execute(
+                AutoFlowExecuteRequest(plan_id=observed_plan.plan_id, idempotency_key="   "),
+                db,
+            )
+
+    assert await _counts(factory) == (0, 0, 0)
+    assert starts == []
 
 
 async def test_failure_after_reservation_rolls_back_all_execution_rows(postgres_idempotency_db, monkeypatch):

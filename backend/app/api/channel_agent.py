@@ -737,6 +737,21 @@ async def release_human_review(
         "pre_upload",
         evidence,
     )
+    current_rationale = dict(task.rationale_json or {})
+    current_plan_payload = current_rationale.get("autoflow_plan_payload")
+    if not isinstance(current_plan_payload, dict):
+        current_plan_payload = {}
+    task.rationale_json = {
+        **current_rationale,
+        "autoflow_plan_payload": {
+            **current_plan_payload,
+            "plan_id": approved.plan_id,
+            "approved_revision_hash": approved.approved_revision_hash,
+            "approved_revision": approved.approved_revision,
+            "expected_approved_revision_hash": approved.approved_revision_hash,
+            "expected_approved_revision": approved.approved_revision,
+        },
+    }
     task.state = "planning"
     task.blocked_by_guard = None
     task.failure_reason = None
@@ -765,6 +780,8 @@ async def release_human_review(
         payload={
             "production_task_id": str(task.id),
             "autoflow_plan_id": str(task.autoflow_plan_id),
+            "expected_approved_revision_hash": approved.approved_revision_hash,
+            "expected_approved_revision": approved.approved_revision,
         },
         priority=100,
         channel_profile_id=task.channel_profile_id,

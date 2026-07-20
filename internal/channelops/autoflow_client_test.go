@@ -73,19 +73,27 @@ func TestHTTPAutoFlowApprovePlanPostsReviewNotes(t *testing.T) {
 			t.Fatalf("review_notes = %q", notes)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"plan_id":"plan-1"}`))
+		_, _ = w.Write([]byte(`{
+			"plan_id":"plan-1",
+			"approved_revision_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"approved_revision":7
+		}`))
 	}))
 	defer server.Close()
 
 	client := HTTPAutoFlowClient{BaseURL: server.URL}
-	if err := client.ApprovePlan(context.Background(), "plan-1", map[string]any{"decision_id": "dec-1"}); err != nil {
+	observation, err := client.ApprovePlan(context.Background(), "plan-1", map[string]any{"decision_id": "dec-1"})
+	if err != nil {
 		t.Fatalf("ApprovePlan returned error: %v", err)
+	}
+	if observation.PlanID != "plan-1" || observation.ApprovedRevisionHash != strings.Repeat("a", 64) || observation.ApprovedRevision != 7 {
+		t.Fatalf("approval observation = %#v", observation)
 	}
 }
 
 func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 	planID := "plan-from-task"
-	approvedRevisionHash := "approved-revision-hash"
+	approvedRevisionHash := strings.Repeat("b", 64)
 	approvedRevision := int64(7)
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -109,6 +117,12 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 		wantKey := "channelops-execute:task-1:" + planID + ":7:" + approvedRevisionHash
 		if payload["idempotency_key"] != wantKey {
 			t.Fatalf("idempotency_key = %#v, want %q", payload["idempotency_key"], wantKey)
+		}
+		if payload["expected_approved_revision_hash"] != approvedRevisionHash {
+			t.Fatalf("expected_approved_revision_hash = %#v", payload["expected_approved_revision_hash"])
+		}
+		if payload["expected_approved_revision"] != float64(approvedRevision) {
+			t.Fatalf("expected_approved_revision = %#v", payload["expected_approved_revision"])
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"run_id":"run-1","job_id":"job-1","status":"pending"}`))

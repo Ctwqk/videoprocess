@@ -14,6 +14,7 @@ type Store struct {
 	Now                func() time.Time
 	DefaultMaxAttempts int
 	executionDB        dbExecutor
+	executionChannelID *string
 }
 
 type dbExecutor interface {
@@ -47,9 +48,10 @@ func (s *Store) db() dbExecutor {
 	return s.Pool
 }
 
-func (s *Store) withExecutionDB(db dbExecutor) *Store {
+func (s *Store) withExecutionDB(db dbExecutor, channelID *string) *Store {
 	clone := *s
 	clone.executionDB = db
+	clone.executionChannelID = channelID
 	return &clone
 }
 

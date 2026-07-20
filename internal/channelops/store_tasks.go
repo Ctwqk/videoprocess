@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -176,13 +177,12 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		       task.score_breakdown_json, task.source_platforms_json,
 		       task.material_library_ids_json, task.uses_external_assets,
 		       task.approval_mode, task.human_review_evidence_json,
-		       task.autoflow_plan_id, plan.approved_revision_hash, plan.approved_revision,
+		       task.autoflow_plan_id,
 		       task.autoflow_run_id, task.job_id, task.state, task.blocked_by_guard,
 		       task.failure_reason, task.failure_category, task.transition_history_json,
 		       task.channel_config_version_snapshot, task.channel_config_snapshot_json,
 		       task.state_updated_at
 		FROM production_tasks AS task
-		LEFT JOIN autoflow_plans AS plan ON plan.id = task.autoflow_plan_id
 		WHERE task.id = $1::uuid
 	`, taskID).Scan(
 		&row.ID,
@@ -203,8 +203,6 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		&row.ApprovalMode,
 		&humanReviewJSON,
 		&row.AutoFlowPlanID,
-		&row.AutoFlowApprovedRevisionHash,
-		&row.AutoFlowApprovedRevision,
 		&row.AutoFlowRunID,
 		&row.JobID,
 		&row.State,
@@ -222,6 +220,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 	if err := unmarshalJSONObject(rationaleJSON, &row.RationaleJSON); err != nil {
 		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.rationale_json: %w", err)
 	}
+	loadDurableTaskPlanAuthority(&row)
 	if err := unmarshalJSONObject(scoreJSON, &row.ScoreBreakdownJSON); err != nil {
 		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.score_breakdown_json: %w", err)
 	}
@@ -243,6 +242,24 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 	return row, nil
 }
 
+func loadDurableTaskPlanAuthority(task *ProductionTaskRow) {
+	if task == nil || task.AutoFlowPlanID == nil {
+		return
+	}
+	payload := mapFromAny(jsonObject(task.RationaleJSON)["autoflow_plan_payload"])
+	if firstString(payload, "plan_id") != strings.TrimSpace(*task.AutoFlowPlanID) {
+		return
+	}
+	hash := strings.TrimSpace(firstString(payload, "expected_approved_revision_hash"))
+	revision, ok := intValue(payload["expected_approved_revision"])
+	if len(hash) != 64 || !ok || revision < 1 {
+		return
+	}
+	task.AutoFlowApprovedRevisionHash = &hash
+	revision64 := int64(revision)
+	task.AutoFlowApprovedRevision = &revision64
+}
+
 func (s *Store) HoldTask(ctx context.Context, taskID string, guard string, reason string, transitionReason string) error {
 	return s.holdTask(ctx, taskID, "", guard, reason, nil, transitionReason)
 }
@@ -260,18 +277,43 @@ func (s *Store) HoldTaskWithPlanAndPDS(ctx context.Context, taskID string, planI
 	return s.holdTask(ctx, taskID, planID, guard, reason, decision, transitionReason)
 }
 
-func (s *Store) MarkTaskPlanningAndEnqueueExecute(ctx context.Context, taskID string, planID string, planPayload map[string]any, parentQueueItemID string) error {
+func (s *Store) MarkTaskPlanningAndEnqueueExecute(
+	ctx context.Context,
+	taskID string,
+	planID string,
+	planPayload map[string]any,
+	approval AutoFlowApprovalObservation,
+	parentQueueItemID string,
+) error {
 	if err := requireUUID("production_task_id", taskID); err != nil {
 		return err
 	}
 	if err := requireUUID("autoflow_plan_id", planID); err != nil {
 		return err
 	}
+	if approval.PlanID != planID {
+		return fmt.Errorf("autoflow approval observation plan_id mismatch")
+	}
+	if len(strings.TrimSpace(approval.ApprovedRevisionHash)) != 64 {
+		return fmt.Errorf("autoflow approval observation missing approved revision hash")
+	}
+	if approval.ApprovedRevision < 1 {
+		return fmt.Errorf("autoflow approval observation missing approved revision")
+	}
 	task, err := s.GetProductionTask(ctx, taskID)
 	if err != nil {
 		return err
 	}
-	rationalePatch, err := json.Marshal(map[string]any{"autoflow_plan_payload": jsonObject(planPayload)})
+	durablePlanPayload := map[string]any{}
+	for key, value := range jsonObject(planPayload) {
+		durablePlanPayload[key] = value
+	}
+	durablePlanPayload["plan_id"] = planID
+	durablePlanPayload["approved_revision_hash"] = approval.ApprovedRevisionHash
+	durablePlanPayload["approved_revision"] = approval.ApprovedRevision
+	durablePlanPayload["expected_approved_revision_hash"] = approval.ApprovedRevisionHash
+	durablePlanPayload["expected_approved_revision"] = approval.ApprovedRevision
+	rationalePatch, err := json.Marshal(map[string]any{"autoflow_plan_payload": durablePlanPayload})
 	if err != nil {
 		return err
 	}
@@ -305,9 +347,14 @@ func (s *Store) MarkTaskPlanningAndEnqueueExecute(ctx context.Context, taskID st
 	}
 	channelProfileID := task.ChannelProfileID
 	_, err = s.Enqueue(ctx, EnqueueOptions{
-		Kind:              QueueExecuteTask,
-		IdempotencyKey:    "execute_task:" + taskID,
-		Payload:           map[string]any{"production_task_id": taskID, "autoflow_plan_id": planID},
+		Kind:           QueueExecuteTask,
+		IdempotencyKey: "execute_task:" + taskID,
+		Payload: map[string]any{
+			"production_task_id":              taskID,
+			"autoflow_plan_id":                planID,
+			"expected_approved_revision_hash": approval.ApprovedRevisionHash,
+			"expected_approved_revision":      approval.ApprovedRevision,
+		},
 		Priority:          100,
 		ChannelProfileID:  &channelProfileID,
 		ParentQueueItemID: parentID,

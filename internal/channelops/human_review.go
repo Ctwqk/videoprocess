@@ -105,6 +105,26 @@ func (s *Store) ValidPromotionHumanReview(
 		intValuesMatch(evidence["plan_approved_revision"], preUpload["plan_approved_revision"]), nil
 }
 
+func (s *Store) ValidPromotionPlanAuthority(ctx context.Context, task ProductionTaskRow) (bool, error) {
+	if task.AutoFlowPlanID == nil || strings.TrimSpace(*task.AutoFlowPlanID) == "" {
+		return true, nil
+	}
+	if task.AutoFlowApprovedRevisionHash == nil || task.AutoFlowApprovedRevision == nil {
+		return false, nil
+	}
+	plan, err := s.loadPlanReviewAuthority(ctx, *task.AutoFlowPlanID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return validPlanReviewAuthority(plan) &&
+		plan.ID == *task.AutoFlowPlanID &&
+		*plan.ApprovedRevisionHash == *task.AutoFlowApprovedRevisionHash &&
+		*plan.ApprovedRevision == *task.AutoFlowApprovedRevision, nil
+}
+
 func (s *Store) loadPlanReviewAuthority(ctx context.Context, planID string) (planReviewAuthority, error) {
 	if err := requireUUID("autoflow_plan_id", planID); err != nil {
 		return planReviewAuthority{}, err
@@ -143,7 +163,7 @@ func invalidReviewPlan(plan planReviewAuthority) bool {
 
 func validPlanReviewAuthority(plan planReviewAuthority) bool {
 	return !invalidReviewPlan(plan) && plan.ReviewApprovedAt != nil &&
-		plan.ApprovedRevisionHash != nil && strings.TrimSpace(*plan.ApprovedRevisionHash) != "" &&
+		plan.ApprovedRevisionHash != nil && len(strings.TrimSpace(*plan.ApprovedRevisionHash)) == 64 &&
 		plan.ApprovedRevision != nil && *plan.ApprovedRevision == plan.ExecutionRevision
 }
 

@@ -18,7 +18,12 @@ from app.models.channel_agent import (
     PublicationRecord,
     PublishingAccount,
 )
+from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.models.pipeline import Pipeline
+from app.models.schedule import RuntimeSchedule
+from app.orchestrator.engine import JobEngine
 from app.services.channelops_quarantine import QUARANTINE_REASON, quarantine_channelops_backlog
+from app.services.schedule_service import VIDEO_SCHEDULE_SERVICE, VideoScheduleState
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -83,7 +88,8 @@ async def postgres_race_db():
         await conn.execute(
             text(
                 "TRUNCATE channel_ops_queue_items, publication_records, production_tasks, "
-                "publishing_accounts, autoflow_runs, autoflow_plans RESTART IDENTITY CASCADE"
+                "publishing_accounts, autoflow_runs, autoflow_plans, node_executions, jobs, "
+                "pipelines, runtime_schedules RESTART IDENTITY CASCADE"
             )
         )
     try:
@@ -325,3 +331,118 @@ async def test_quarantine_first_makes_manual_promotion_conflict_without_evidence
             await db.scalar(select(ChannelOpsQueueItem.id).where(ChannelOpsQueueItem.kind == "promote_publication"))
             is None
         )
+
+
+async def test_quarantine_after_running_commit_prevents_stale_initial_dispatch(
+    postgres_race_db,
+    monkeypatch,
+):
+    _engine, factory = postgres_race_db
+    definition = {
+        "nodes": [
+            {
+                "id": "trim_1",
+                "type": "trim",
+                "position": {"x": 0, "y": 0},
+                "data": {"label": "Trim", "config": {"start_time": 0, "end_time": 1}},
+            }
+        ],
+        "edges": [],
+    }
+    async with factory() as db:
+        channel = ChannelProfile(name="dispatch race", enabled=True, dry_run=False)
+        db.add(channel)
+        await db.flush()
+        account = PublishingAccount(
+            channel_profile_id=channel.id,
+            account_label="dispatch race",
+            credential_ref="youtube/dispatch-race",
+            default_privacy="unlisted",
+        )
+        pipeline = Pipeline(name="dispatch race", description="", definition=definition)
+        db.add_all([account, pipeline])
+        await db.flush()
+        job = Job(
+            pipeline_id=pipeline.id,
+            pipeline_snapshot=definition,
+            status=JobStatus.PENDING,
+            orchestrator_owner="python",
+        )
+        db.add(job)
+        await db.flush()
+        node = NodeExecution(
+            job_id=job.id,
+            node_id="trim_1",
+            node_type="trim",
+            node_label="Trim",
+            node_config={"start_time": 0, "end_time": 1},
+            status=NodeStatus.PENDING,
+        )
+        task = ProductionTask(
+            channel_profile_id=channel.id,
+            target_account_id=account.id,
+            prompt="dispatch race",
+            state="producing",
+            job_id=job.id,
+            channel_config_snapshot_json={},
+        )
+        db.add_all([node, task])
+        await db.commit()
+        channel_id = channel.id
+        task_id = task.id
+        job_id = job.id
+        node_id = node.id
+
+    entered_after_running_commit = asyncio.Event()
+    release_starter = asyncio.Event()
+
+    async def pause_after_running_commit(_job_id):
+        entered_after_running_commit.set()
+        await release_starter.wait()
+
+    class RecordingRedis:
+        def __init__(self) -> None:
+            self.dispatches: list[tuple[str, dict]] = []
+
+        async def xadd(self, stream_key: str, payload: dict) -> None:
+            self.dispatches.append((stream_key, payload))
+
+        async def aclose(self) -> None:
+            return None
+
+    redis = RecordingRedis()
+    job_engine = JobEngine()
+    monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
+    monkeypatch.setattr("app.orchestrator.engine._redis", lambda: redis)
+    monkeypatch.setattr(
+        job_engine,
+        "_before_initial_launch_recheck",
+        pause_after_running_commit,
+        raising=False,
+    )
+
+    starter = asyncio.create_task(job_engine.start_job(job_id))
+    await asyncio.wait_for(entered_after_running_commit.wait(), timeout=5)
+    try:
+        async with factory() as quarantine_db:
+            result = await quarantine_channelops_backlog(
+                quarantine_db,
+                channel_id,
+                apply=True,
+                close_schedule=True,
+            )
+        assert result["schedule"]["final_state"] == VideoScheduleState.CLOSED.value
+    finally:
+        release_starter.set()
+        await asyncio.wait_for(starter, timeout=5)
+
+    async with factory() as db:
+        stored_task = await db.get(ProductionTask, task_id)
+        stored_job = await db.get(Job, job_id)
+        stored_node = await db.get(NodeExecution, node_id)
+        stored_schedule = await db.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+    assert stored_task is not None and stored_task.state == "held"
+    assert stored_job is not None and stored_job.status == JobStatus.CANCELLED
+    assert stored_node is not None and stored_node.status == NodeStatus.CANCELLED
+    assert stored_schedule is not None and stored_schedule.state == VideoScheduleState.CLOSED.value
+    assert redis.dispatches == []

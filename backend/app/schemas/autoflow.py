@@ -398,6 +398,13 @@ class AutoFlowExecuteRequest(BaseModel):
     review_approved: bool = False
     public_approved: bool = False
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=512)
+    expected_approved_revision_hash: str | None = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    expected_approved_revision: int | None = Field(default=None, ge=1)
 
 
 class AutoFlowRun(BaseModel):

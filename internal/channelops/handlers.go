@@ -209,10 +209,18 @@ func (h HandlerService) HandlePlanTask(ctx context.Context, item QueueItemRow) e
 	if !result.EnqueueExecute {
 		return h.Store.HoldTaskWithPlanAndPDS(ctx, task.ID, observation.PlanID, result.BlockedByGuard, decision, "plan_task_pds")
 	}
-	if err := h.AutoFlow.ApprovePlan(ctx, observation.PlanID, map[string]any{"decision_id": decision.DecisionID, "verdict": decision.Verdict}); err != nil {
+	approval, err := h.AutoFlow.ApprovePlan(ctx, observation.PlanID, map[string]any{"decision_id": decision.DecisionID, "verdict": decision.Verdict})
+	if err != nil {
 		return err
 	}
-	return h.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, observation.PlanID, observation.PlanPayload, item.ID)
+	return h.Store.MarkTaskPlanningAndEnqueueExecute(
+		ctx,
+		task.ID,
+		observation.PlanID,
+		observation.PlanPayload,
+		approval,
+		item.ID,
+	)
 }
 
 func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow) error {
@@ -229,6 +237,9 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	}
 	if task.State != TaskPlanning {
 		return nil
+	}
+	if err := validateExecuteTaskAuthority(item, task); err != nil {
+		return err
 	}
 	if held, err := h.holdInvalidPreUploadReview(ctx, task, "execute_task_human_review"); held {
 		return err
@@ -250,6 +261,28 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 		return h.Store.FailTask(ctx, task.ID, "autoflow execute response missing job_id", "execute_task")
 	}
 	return h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, observation.RunID, observation.JobID, item.ID)
+}
+
+func validateExecuteTaskAuthority(item QueueItemRow, task ProductionTaskRow) error {
+	if task.AutoFlowPlanID == nil || strings.TrimSpace(*task.AutoFlowPlanID) == "" {
+		return fmt.Errorf("%w: execute task has no durable plan id", ErrQueueAuthorityInvalid)
+	}
+	queuePlanID := strings.TrimSpace(firstString(item.PayloadJSON, "autoflow_plan_id"))
+	if queuePlanID == "" || queuePlanID != strings.TrimSpace(*task.AutoFlowPlanID) {
+		return fmt.Errorf("%w: execute queue plan does not match task plan", ErrQueueAuthorityInvalid)
+	}
+	if task.AutoFlowApprovedRevisionHash == nil || task.AutoFlowApprovedRevision == nil {
+		return fmt.Errorf("%w: execute task has no durable expected plan authority", ErrQueueAuthorityInvalid)
+	}
+	queueRevisionHash := strings.TrimSpace(firstString(item.PayloadJSON, "expected_approved_revision_hash"))
+	queueRevision, ok := intValue(item.PayloadJSON["expected_approved_revision"])
+	if len(queueRevisionHash) != 64 || !ok || queueRevision < 1 {
+		return fmt.Errorf("%w: execute queue has no valid expected plan authority", ErrQueueAuthorityInvalid)
+	}
+	if queueRevisionHash != *task.AutoFlowApprovedRevisionHash || int64(queueRevision) != *task.AutoFlowApprovedRevision {
+		return fmt.Errorf("%w: execute queue authority does not match task snapshot", ErrQueueAuthorityInvalid)
+	}
+	return nil
 }
 
 func ExistingExecution(task ProductionTaskRow) (string, string, bool) {
@@ -407,6 +440,21 @@ func (h HandlerService) handlePromotePublication(ctx context.Context, item Queue
 	}
 	if targetVisibility == "" {
 		targetVisibility = "unlisted"
+	}
+	if task.AutoFlowPlanID != nil {
+		valid, err := h.Store.ValidPromotionPlanAuthority(ctx, task)
+		if err != nil {
+			return err
+		}
+		if !valid {
+			return h.Store.HoldTask(
+				ctx,
+				task.ID,
+				"autoflow_plan_authority_invalid",
+				"Publication promotion plan authority is missing, stale, or revoked",
+				"promote_publication_plan_authority",
+			)
+		}
 	}
 	if held, err := h.holdInvalidPreUploadReview(ctx, task, "promote_publication_human_review"); held {
 		return err

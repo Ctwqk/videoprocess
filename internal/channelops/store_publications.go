@@ -258,11 +258,23 @@ func (s *Store) LockPromotionOperatorScope(ctx context.Context, publicationID st
 		return PublicationRow{}, ProductionTaskRow{}, err
 	}
 	if lockedPublicationTaskID != lockedTaskID {
-		return PublicationRow{}, ProductionTaskRow{}, fmt.Errorf("publication %s authority changed", publicationID)
+		return PublicationRow{}, ProductionTaskRow{}, fmt.Errorf(
+			"%w: publication %s task authority changed",
+			ErrQueueAuthorityInvalid,
+			publicationID,
+		)
 	}
 	task, err := s.GetProductionTask(ctx, lockedTaskID)
 	if err != nil {
 		return PublicationRow{}, ProductionTaskRow{}, err
+	}
+	if s.executionChannelID != nil && !strings.EqualFold(task.ChannelProfileID, *s.executionChannelID) {
+		return PublicationRow{}, ProductionTaskRow{}, fmt.Errorf(
+			"%w: promotion task channel %s differs from fenced channel %s",
+			ErrQueueAuthorityInvalid,
+			task.ChannelProfileID,
+			*s.executionChannelID,
+		)
 	}
 	publication, err := s.GetPublication(ctx, publicationID)
 	if err != nil {

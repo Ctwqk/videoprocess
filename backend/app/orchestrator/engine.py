@@ -161,18 +161,93 @@ class JobEngine:
                 job.status = JobStatus.RUNNING
                 await db.commit()
 
+                await self._before_initial_launch_recheck(job_id)
+                job = await self._lock_initial_launch_authority(db, job_id)
+                if job is None:
+                    return
+
                 # Resolve input artifacts for source nodes (asset -> artifact)
                 await self._resolve_source_nodes(db, job)
+                await db.commit()
+
+                job = await self._lock_initial_launch_authority(db, job_id)
+                if job is None:
+                    return
 
                 # Dispatch nodes that have no dependencies (root nodes)
-                await self._dispatch_ready_nodes(db, job, dep_map)
+                await self._dispatch_ready_nodes(db, job, dep_map, guard_initial_launch=True)
 
             except Exception as e:
                 logger.exception(f"Failed to start job {job_id}")
-                job.status = JobStatus.FAILED
-                job.error_message = str(e)
-                job.completed_at = datetime.utcnow()
+                await db.rollback()
+                fresh_job = await self._lock_initial_launch_authority(db, job_id)
+                if fresh_job is None:
+                    return
+                fresh_job.status = JobStatus.FAILED
+                fresh_job.error_message = str(e)
+                fresh_job.completed_at = datetime.utcnow()
                 await db.commit()
+
+    async def _before_initial_launch_recheck(self, job_id: uuid.UUID) -> None:
+        return None
+
+    async def _lock_initial_launch_authority(
+        self,
+        db: AsyncSession,
+        job_id: uuid.UUID,
+    ) -> Job | None:
+        schedule, _created = await get_or_create_and_lock_runtime_schedule(db)
+        job = (
+            await db.execute(
+                select(Job)
+                .where(Job.id == job_id)
+                .options(selectinload(Job.node_executions))
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if job is None:
+            await db.rollback()
+            return None
+        (
+            await db.execute(
+                select(NodeExecution)
+                .where(NodeExecution.job_id == job_id)
+                .order_by(NodeExecution.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalars().all()
+        await db.refresh(job, attribute_names=["node_executions"])
+        if job.status in {
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+            JobStatus.PARTIALLY_FAILED,
+        }:
+            await db.rollback()
+            return None
+        try:
+            schedule_state = VideoScheduleState(schedule.state)
+        except ValueError:
+            schedule_state = default_video_schedule_state()
+        if should_defer_job_start(job, schedule_state):
+            for node in job.node_executions:
+                if node.status in {NodeStatus.PENDING, NodeStatus.QUEUED, NodeStatus.RUNNING}:
+                    node.status = NodeStatus.PENDING
+                    node.worker_id = None
+                    node.queued_at = None
+                    node.started_at = None
+                    node.completed_at = None
+                    node.progress = 0
+                    node.error_message = None
+                    node.error_trace = None
+            job.status = JobStatus.WAITING_WINDOW
+            job.error_message = None
+            job.completed_at = None
+            await db.commit()
+            return None
+        return job
 
     async def _resolve_source_nodes(self, db: AsyncSession, job: Job) -> None:
         """For source nodes, create an artifact pointing to the asset file."""
@@ -183,13 +258,14 @@ class JobEngine:
             # Skip already resolved source nodes (idempotent for restart recovery)
             if ne.status == NodeStatus.SUCCEEDED and ne.output_artifact_id:
                 continue
+            if ne.status in {NodeStatus.CANCELLED, NodeStatus.FAILED, NodeStatus.SKIPPED}:
+                continue
 
             asset_id_str = ne.node_config.get("asset_id")
             if not asset_id_str:
                 ne.status = NodeStatus.FAILED
                 ne.error_message = "No asset_id configured"
                 ne.completed_at = datetime.utcnow()
-                await db.commit()
                 continue
 
             asset = await db.get(Asset, uuid.UUID(asset_id_str))
@@ -197,7 +273,6 @@ class JobEngine:
                 ne.status = NodeStatus.FAILED
                 ne.error_message = f"Asset {asset_id_str} not found"
                 ne.completed_at = datetime.utcnow()
-                await db.commit()
                 continue
 
             # Create an artifact that references the asset's storage path
@@ -226,10 +301,13 @@ class JobEngine:
             ne.completed_at = datetime.utcnow()
             ne.progress = 100
 
-        await db.commit()
-
     async def _dispatch_ready_nodes(
-        self, db: AsyncSession, job: Job, dep_map: dict[str, list[str]]
+        self,
+        db: AsyncSession,
+        job: Job,
+        dep_map: dict[str, list[str]],
+        *,
+        guard_initial_launch: bool = False,
     ) -> None:
         """Find nodes whose dependencies are all satisfied and dispatch them."""
         # Don't dispatch if job is cancelled
@@ -273,6 +351,12 @@ class JobEngine:
                 ]
                 await db.commit()
 
+                if guard_initial_launch:
+                    locked = await self._lock_initial_dispatch_authority(db, job.id, ne.id)
+                    if locked is None:
+                        continue
+                    job, ne = locked
+
                 # Determine worker_type from node registry
                 registry = NodeTypeRegistry.get()
                 node_def = registry.get_type(ne.node_type)
@@ -292,6 +376,8 @@ class JobEngine:
                 }
                 stream_key = TASK_STREAM.format(worker_type=worker_type)
                 await r.xadd(stream_key, task)
+                if guard_initial_launch:
+                    await db.commit()
                 logger.info(
                     "Dispatched node %s (type=%s) to %s for job %s with preferred_hosts=%s",
                     ne.node_id, ne.node_type, stream_key, job.id, preferred_hosts,
@@ -299,6 +385,24 @@ class JobEngine:
         finally:
             await r.aclose()
         await self._maybe_finalize_job(db, job)
+
+    async def _lock_initial_dispatch_authority(
+        self,
+        db: AsyncSession,
+        job_id: uuid.UUID,
+        node_execution_id: uuid.UUID,
+    ) -> tuple[Job, NodeExecution] | None:
+        job = await self._lock_initial_launch_authority(db, job_id)
+        if job is None:
+            return None
+        node = next(
+            (item for item in job.node_executions if item.id == node_execution_id),
+            None,
+        )
+        if node is None or job.status != JobStatus.RUNNING or node.status != NodeStatus.QUEUED:
+            await db.rollback()
+            return None
+        return job, node
 
     async def _apply_cached_artifact_if_available(
         self,

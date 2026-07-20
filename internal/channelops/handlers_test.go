@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -507,14 +508,14 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionFails(t *testing.T) {
 		t.Fatalf("RunTick: %v", err)
 	}
 	task := fixture.RequireSingleTask(ctx)
-	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, ""); err != nil {
+	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
 	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{Status: "failed", ErrorMessage: "execute blocked"}}
 
 	err := handler.HandleExecuteTask(ctx, QueueItemRow{
 		ID:          "00000000-0000-0000-0000-000000000401",
-		PayloadJSON: map[string]any{"production_task_id": task.ID},
+		PayloadJSON: testExecuteQueuePayload(task.ID),
 	})
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
@@ -531,6 +532,64 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionFails(t *testing.T) {
 	}
 }
 
+func TestHandleExecuteTaskRejectsMissingOrMismatchedDurableAuthorityBeforeAutoFlow(t *testing.T) {
+	for _, testCase := range []string{"missing-task-snapshot", "mismatched-queue-snapshot"} {
+		t.Run(testCase, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+			if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+				t.Fatalf("RunTick: %v", err)
+			}
+			task := fixture.RequireSingleTask(ctx)
+			if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(
+				ctx,
+				task.ID,
+				"00000000-0000-0000-0000-000000000101",
+				map[string]any{},
+				testApprovalObservation(),
+				"",
+			); err != nil {
+				t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
+			}
+			payload := map[string]any{
+				"production_task_id":              task.ID,
+				"autoflow_plan_id":                testApprovalObservation().PlanID,
+				"expected_approved_revision_hash": testApprovalObservation().ApprovedRevisionHash,
+				"expected_approved_revision":      testApprovalObservation().ApprovedRevision,
+			}
+			if testCase == "missing-task-snapshot" {
+				if _, err := fixture.Store.Pool.Exec(ctx, `
+					UPDATE production_tasks
+					SET rationale_json = (COALESCE(rationale_json, '{}'::json)::jsonb - 'autoflow_plan_payload')::json
+					WHERE id = $1::uuid
+				`, task.ID); err != nil {
+					t.Fatalf("clear task authority snapshot: %v", err)
+				}
+			} else {
+				payload["expected_approved_revision_hash"] = strings.Repeat("b", 64)
+			}
+			recorder := &externalCallRecorder{}
+			handler.AutoFlow = &recordingAutoFlow{recorder: recorder}
+
+			err := handler.HandleExecuteTask(ctx, QueueItemRow{
+				ID:          "00000000-0000-0000-0000-000000000401",
+				Kind:        QueueExecuteTask,
+				PayloadJSON: payload,
+			})
+
+			if !errors.Is(err, ErrQueueAuthorityInvalid) {
+				t.Fatalf("HandleExecuteTask error = %v, want invalid queue authority", err)
+			}
+			if recorder.execute.Load() != 0 {
+				t.Fatalf("AutoFlow execute calls = %d, want 0", recorder.execute.Load())
+			}
+		})
+	}
+}
+
 func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingRunID(t *testing.T) {
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)
@@ -542,7 +601,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingRunID(t *testing.
 		t.Fatalf("RunTick: %v", err)
 	}
 	task := fixture.RequireSingleTask(ctx)
-	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, ""); err != nil {
+	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
 	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{
@@ -552,7 +611,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingRunID(t *testing.
 
 	err := handler.HandleExecuteTask(ctx, QueueItemRow{
 		ID:          "00000000-0000-0000-0000-000000000401",
-		PayloadJSON: map[string]any{"production_task_id": task.ID},
+		PayloadJSON: testExecuteQueuePayload(task.ID),
 	})
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
@@ -571,7 +630,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingJobID(t *testing.
 		t.Fatalf("RunTick: %v", err)
 	}
 	task := fixture.RequireSingleTask(ctx)
-	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, ""); err != nil {
+	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
 	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{
@@ -581,7 +640,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingJobID(t *testing.
 
 	err := handler.HandleExecuteTask(ctx, QueueItemRow{
 		ID:          "00000000-0000-0000-0000-000000000401",
-		PayloadJSON: map[string]any{"production_task_id": task.ID},
+		PayloadJSON: testExecuteQueuePayload(task.ID),
 	})
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
@@ -602,7 +661,7 @@ func TestHandleObserveJobRequiresRunIDPayload(t *testing.T) {
 	task := fixture.RequireSingleTask(ctx)
 	runID := "00000000-0000-0000-0000-000000000201"
 	jobID := "00000000-0000-0000-0000-000000000301"
-	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, ""); err != nil {
+	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
 	if err := fixture.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, runID, jobID, ""); err != nil {
@@ -633,6 +692,24 @@ func assertTaskFailedWithReason(t *testing.T, store *Store, ctx context.Context,
 	}
 	if updated.FailureReason == nil || *updated.FailureReason != wantReason {
 		t.Fatalf("failure reason = %#v, want %q", updated.FailureReason, wantReason)
+	}
+}
+
+func testApprovalObservation() AutoFlowApprovalObservation {
+	return AutoFlowApprovalObservation{
+		PlanID:               "00000000-0000-0000-0000-000000000101",
+		ApprovedRevisionHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ApprovedRevision:     1,
+	}
+}
+
+func testExecuteQueuePayload(taskID string) map[string]any {
+	approval := testApprovalObservation()
+	return map[string]any{
+		"production_task_id":              taskID,
+		"autoflow_plan_id":                approval.PlanID,
+		"expected_approved_revision_hash": approval.ApprovedRevisionHash,
+		"expected_approved_revision":      approval.ApprovedRevision,
 	}
 }
 

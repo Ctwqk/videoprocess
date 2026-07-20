@@ -51,7 +51,7 @@ func (s *Store) WithQueueExecutionFence(ctx context.Context, item QueueItemRow, 
 			return err
 		}
 	}
-	if err := dispatch(s.withExecutionDB(tx)); err != nil {
+	if err := dispatch(s.withExecutionDB(tx, channelID)); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -79,7 +79,7 @@ func (s *Store) WithChannelExecutionFence(ctx context.Context, channelID string,
 	if err := lockExecutableChannel(ctx, tx, channelID); err != nil {
 		return err
 	}
-	if err := dispatch(s.withExecutionDB(tx)); err != nil {
+	if err := dispatch(s.withExecutionDB(tx, &channelID)); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {

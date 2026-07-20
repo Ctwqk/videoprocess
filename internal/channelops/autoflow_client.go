@@ -14,7 +14,7 @@ import (
 
 type AutoFlowClient interface {
 	PlanTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowPlanObservation, error)
-	ApprovePlan(ctx context.Context, planID string, evidence map[string]any) error
+	ApprovePlan(ctx context.Context, planID string, evidence map[string]any) (AutoFlowApprovalObservation, error)
 	ExecuteTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error)
 	GetJob(ctx context.Context, runID string, jobID string) (AutoFlowJobObservation, error)
 }
@@ -40,6 +40,13 @@ type AutoFlowExecuteObservation struct {
 	RunPayload   map[string]any
 }
 
+type AutoFlowApprovalObservation struct {
+	PlanID                  string
+	ApprovedRevisionHash    string
+	ApprovedRevision        int64
+	ApprovalResponsePayload map[string]any
+}
+
 type AutoFlowJobObservation struct {
 	Status         string
 	RunPayload     map[string]any
@@ -60,23 +67,43 @@ func (c HTTPAutoFlowClient) PlanTask(ctx context.Context, task ProductionTaskRow
 	}, nil
 }
 
-func (c HTTPAutoFlowClient) ApprovePlan(ctx context.Context, planID string, evidence map[string]any) error {
+func (c HTTPAutoFlowClient) ApprovePlan(ctx context.Context, planID string, evidence map[string]any) (AutoFlowApprovalObservation, error) {
 	planID = strings.TrimSpace(planID)
 	if planID == "" {
-		return fmt.Errorf("autoflow plan_id is required")
+		return AutoFlowApprovalObservation{}, fmt.Errorf("autoflow plan_id is required")
 	}
 	notes := "ChannelOps Go runner approval"
 	if len(evidence) > 0 {
 		raw, err := json.Marshal(evidence)
 		if err != nil {
-			return err
+			return AutoFlowApprovalObservation{}, err
 		}
 		notes = "ChannelOps Go runner approval evidence: " + string(raw)
 	}
-	_, err := c.postJSON(ctx, "/api/v1/autoflow/plans/"+url.PathEscape(planID)+"/approve", map[string]any{
+	payload, err := c.postJSON(ctx, "/api/v1/autoflow/plans/"+url.PathEscape(planID)+"/approve", map[string]any{
 		"review_notes": notes,
 	})
-	return err
+	if err != nil {
+		return AutoFlowApprovalObservation{}, err
+	}
+	observedPlanID := strings.TrimSpace(firstString(payload, "plan_id"))
+	approvedRevisionHash := strings.TrimSpace(firstString(payload, "approved_revision_hash"))
+	approvedRevision, ok := intValue(payload["approved_revision"])
+	if observedPlanID != planID {
+		return AutoFlowApprovalObservation{}, fmt.Errorf("autoflow approval response plan_id mismatch")
+	}
+	if len(approvedRevisionHash) != 64 {
+		return AutoFlowApprovalObservation{}, fmt.Errorf("autoflow approval response missing approved revision hash")
+	}
+	if !ok || approvedRevision < 1 {
+		return AutoFlowApprovalObservation{}, fmt.Errorf("autoflow approval response missing approved revision")
+	}
+	return AutoFlowApprovalObservation{
+		PlanID:                  observedPlanID,
+		ApprovedRevisionHash:    approvedRevisionHash,
+		ApprovedRevision:        int64(approvedRevision),
+		ApprovalResponsePayload: payload,
+	}, nil
 }
 
 func (c HTTPAutoFlowClient) ExecuteTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error) {
@@ -112,9 +139,11 @@ func (c HTTPAutoFlowClient) ExecuteTask(ctx context.Context, task ProductionTask
 		approvedRevisionHash,
 	)
 	payload, err := c.postJSON(ctx, "/api/v1/autoflow/execute", map[string]any{
-		"plan_id":         planID,
-		"execute":         true,
-		"idempotency_key": idempotencyKey,
+		"plan_id":                         planID,
+		"execute":                         true,
+		"idempotency_key":                 idempotencyKey,
+		"expected_approved_revision_hash": approvedRevisionHash,
+		"expected_approved_revision":      *task.AutoFlowApprovedRevision,
 	})
 	if err != nil {
 		return AutoFlowExecuteObservation{}, err

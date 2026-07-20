@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -433,6 +434,250 @@ func TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites(t *test
 	}
 	if approvedRevisionHash != nil || approvedRevision != nil {
 		t.Fatalf("plan authority survived canonical patch: hash=%v revision=%v", approvedRevisionHash, approvedRevision)
+	}
+}
+
+func TestAutomaticOwnedPromotionRejectFirstPreventsPDSAndYouTube(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
+	taskID := taskIDForQueueItem(t, ctx, fixture, promote)
+	setAutomaticOwnedPlanAuthorityForTest(t, ctx, fixture, taskID)
+	task, err := fixture.Store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetProductionTask: %v", err)
+	}
+	if taskUsesExternalAssets(task) || task.ApprovalMode == ApprovalHuman || boolValue(promote.PayloadJSON["manual_review"]) {
+		t.Fatalf("promotion test must use the automatic owned path: task=%#v payload=%#v", task, promote.PayloadJSON)
+	}
+
+	rejectTx, err := fixture.Store.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin plan rejection: %v", err)
+	}
+	defer rejectTx.Rollback(ctx)
+	if _, err := rejectTx.Exec(ctx, `
+		UPDATE autoflow_plans
+		SET status = 'rejected', rejected_reason = 'automatic promotion rejection wins'
+		WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
+	`); err != nil {
+		t.Fatalf("stage plan rejection: %v", err)
+	}
+	var rejectPID int
+	if err := rejectTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&rejectPID); err != nil {
+		t.Fatalf("read rejection pid: %v", err)
+	}
+
+	recorder := &externalCallRecorder{}
+	releaseYouTube := make(chan struct{})
+	close(releaseYouTube)
+	youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
+	handler := baseHandler
+	handler.PDS = &recordingPDS{recorder: recorder}
+	handler.YouTube = youtube
+	handleDone := make(chan error, 1)
+	go func() { handleDone <- handler.HandlePromotePublication(ctx, promote) }()
+
+	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, handleDone)
+	if err := rejectTx.Commit(ctx); err != nil {
+		t.Fatalf("commit plan rejection: %v", err)
+	}
+	if err := <-handleDone; err != nil {
+		t.Fatalf("automatic promotion after rejection: %v", err)
+	}
+	if recorder.pds.Load() != 0 || youtube.calls.Load() != 0 {
+		t.Fatalf("automatic promotion side effects pds/youtube = %d/%d, want 0/0", recorder.pds.Load(), youtube.calls.Load())
+	}
+	storedTask, err := fixture.Store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetProductionTask after rejection: %v", err)
+	}
+	if storedTask.State != TaskHeld {
+		t.Fatalf("task state = %s, want held", storedTask.State)
+	}
+}
+
+func TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
+	taskID := taskIDForQueueItem(t, ctx, fixture, promote)
+	setAutomaticOwnedPlanAuthorityForTest(t, ctx, fixture, taskID)
+
+	recorder := &externalCallRecorder{}
+	releaseYouTube := make(chan struct{})
+	youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
+	handler := baseHandler
+	handler.PDS = &recordingPDS{recorder: recorder}
+	handler.YouTube = youtube
+	handleDone := make(chan error, 1)
+	go func() { handleDone <- handler.HandlePromotePublication(ctx, promote) }()
+	var releaseOnce sync.Once
+	handleFinished := false
+	defer func() {
+		releaseOnce.Do(func() { close(releaseYouTube) })
+		if handleFinished {
+			return
+		}
+		select {
+		case <-handleDone:
+		case <-time.After(5 * time.Second):
+		}
+	}()
+	select {
+	case <-youtube.started:
+	case <-time.After(5 * time.Second):
+		close(releaseYouTube)
+		t.Fatal("automatic promotion did not reach YouTube")
+	}
+
+	conn, err := fixture.Store.Pool.Acquire(ctx)
+	if err != nil {
+		close(releaseYouTube)
+		t.Fatalf("acquire invalidation connection: %v", err)
+	}
+	defer conn.Release()
+	var invalidationPID int
+	if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&invalidationPID); err != nil {
+		close(releaseYouTube)
+		t.Fatalf("read invalidation pid: %v", err)
+	}
+	invalidationDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Exec(ctx, `
+			UPDATE autoflow_plans
+			SET prompt = prompt || ' automatic concurrent patch'
+			WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
+		`)
+		invalidationDone <- err
+	}()
+	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationDone)
+
+	releaseOnce.Do(func() { close(releaseYouTube) })
+	handleErr := <-handleDone
+	handleFinished = true
+	if handleErr != nil {
+		t.Fatalf("automatic promotion: %v", handleErr)
+	}
+	if err := <-invalidationDone; err != nil {
+		t.Fatalf("canonical invalidation: %v", err)
+	}
+	if recorder.pds.Load() != 1 || youtube.calls.Load() != 1 {
+		t.Fatalf("automatic promotion side effects pds/youtube = %d/%d, want 1/1", recorder.pds.Load(), youtube.calls.Load())
+	}
+	publication, err := fixture.Store.GetPublication(ctx, firstString(promote.PayloadJSON, "publication_id"))
+	if err != nil {
+		t.Fatalf("GetPublication: %v", err)
+	}
+	if publication.PublishStatus != "scheduled" || publication.ScheduledPublishAt == nil {
+		t.Fatalf("publication did not durably linearize before invalidation: %#v", publication)
+	}
+}
+
+func TestPromotionRevalidatesFencedChannelAfterTaskScopeLock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	for _, haltedB := range []bool{false, true} {
+		name := "enabled-b"
+		if haltedB {
+			name = "halted-b"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+			promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
+			taskID := taskIDForQueueItem(t, ctx, fixture, promote)
+			setAutomaticOwnedPlanAuthorityForTest(t, ctx, fixture, taskID)
+
+			channelB := testUUID(t, name)
+			var haltedAt any
+			if haltedB {
+				haltedAt = fixture.Store.Now().UTC()
+			}
+			if _, err := fixture.Store.Pool.Exec(ctx, `
+				INSERT INTO channel_profiles (
+					id, name, positioning, language, default_aspect_ratio, risk_policy_json,
+					content_mix_policy_json, cadence_policy_json, alert_policy_json, enabled,
+					dry_run, halted_at, halt_reason, config_version, tick_interval_minutes,
+					created_at, updated_at
+				) VALUES (
+					$1::uuid, $2, '', 'en', '9:16', '{}'::json, '{}'::json, '{}'::json,
+					'{}'::json, TRUE, FALSE, $3::timestamptz,
+					CASE WHEN $3::timestamptz IS NULL THEN NULL ELSE 'halted test channel' END,
+					1, 60, NOW(), NOW()
+				)
+			`, channelB, name, haltedAt); err != nil {
+				t.Fatalf("insert channel B: %v", err)
+			}
+			fixture.AdditionalChannelIDs = append(fixture.AdditionalChannelIDs, channelB)
+			defer func() {
+				_, _ = fixture.Store.Pool.Exec(ctx, `
+					UPDATE production_tasks SET channel_profile_id = $2::uuid WHERE id = $1::uuid
+				`, taskID, fixture.ChannelID)
+			}()
+
+			blocker, err := fixture.Store.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin channel A blocker: %v", err)
+			}
+			defer blocker.Rollback(ctx)
+			var lockedChannel string
+			if err := blocker.QueryRow(ctx, `
+				SELECT id::text FROM channel_profiles WHERE id = $1::uuid FOR UPDATE
+			`, fixture.ChannelID).Scan(&lockedChannel); err != nil {
+				t.Fatalf("lock channel A: %v", err)
+			}
+			var blockerPID int
+			if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+				t.Fatalf("read channel A blocker pid: %v", err)
+			}
+
+			recorder := &externalCallRecorder{}
+			releaseYouTube := make(chan struct{})
+			close(releaseYouTube)
+			youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
+			handler := baseHandler
+			handler.PDS = &recordingPDS{recorder: recorder}
+			handler.YouTube = youtube
+			handleDone := make(chan error, 1)
+			go func() { handleDone <- handler.Handle(ctx, promote) }()
+			waitForChannelLockOrExternalCall(t, ctx, fixture, blockerPID, youtube)
+
+			if _, err := blocker.Exec(ctx, `
+				UPDATE production_tasks SET channel_profile_id = $2::uuid WHERE id = $1::uuid
+			`, taskID, channelB); err != nil {
+				t.Fatalf("reassign task authority to channel B: %v", err)
+			}
+			if err := blocker.Commit(ctx); err != nil {
+				t.Fatalf("commit task reassignment: %v", err)
+			}
+			handleErr := <-handleDone
+			if !errors.Is(handleErr, ErrQueueAuthorityInvalid) {
+				t.Fatalf("Handle error = %v, want invalid queue authority", handleErr)
+			}
+			if recorder.pds.Load() != 0 || youtube.calls.Load() != 0 {
+				t.Fatalf("reassigned promotion side effects pds/youtube = %d/%d, want 0/0", recorder.pds.Load(), youtube.calls.Load())
+			}
+			if children := countQueueChildren(t, ctx, fixture, promote.ID); children != 0 {
+				t.Fatalf("promotion descendant count = %d, want 0", children)
+			}
+		})
 	}
 }
 
@@ -1747,6 +1992,26 @@ func (f *ChannelOpsFixture) InsertChannelWithLaneAccountSeed(ctx context.Context
 	if err != nil {
 		f.T.Fatalf("insert publishing_accounts: %v", err)
 	}
+
+	_, err = f.Store.Pool.Exec(ctx, `
+		INSERT INTO autoflow_plans (
+			id, prompt, request_json, intent_json, template_id, pipeline_definition,
+			candidates_json, metadata_json, rights_json, validation_json, status,
+			execution_revision, review_approved_at, approved_revision_hash,
+			approved_revision, created_at, updated_at
+		) VALUES (
+			'00000000-0000-0000-0000-000000000101'::uuid,
+			'ChannelOps fake approved plan', '{}'::json, '{}'::json, 'channelops-live',
+			'{"nodes": [], "edges": []}'::json, '[]'::json, '{}'::json,
+			'{"status": "allowed"}'::json, '{"valid": true}'::json, 'review_approved',
+			1, $1::timestamptz,
+			'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+			1, $1::timestamp, $1::timestamp
+		)
+	`, now)
+	if err != nil {
+		f.T.Fatalf("insert fake approved AutoFlow plan: %v", err)
+	}
 }
 
 func (f *ChannelOpsFixture) SetTickInterval(ctx context.Context, intervalMinutes int) {
@@ -2143,7 +2408,7 @@ func (f *recordingAutoFlow) PlanTask(ctx context.Context, task ProductionTaskRow
 	return f.fakeAutoFlow.PlanTask(ctx, task, request)
 }
 
-func (f *recordingAutoFlow) ApprovePlan(ctx context.Context, planID string, evidence map[string]any) error {
+func (f *recordingAutoFlow) ApprovePlan(ctx context.Context, planID string, evidence map[string]any) (AutoFlowApprovalObservation, error) {
 	f.recorder.approve.Add(1)
 	return f.fakeAutoFlow.ApprovePlan(ctx, planID, evidence)
 }
@@ -2177,8 +2442,12 @@ func (fakeAutoFlow) PlanTask(ctx context.Context, task ProductionTaskRow, reques
 	}, nil
 }
 
-func (fakeAutoFlow) ApprovePlan(ctx context.Context, planID string, evidence map[string]any) error {
-	return nil
+func (fakeAutoFlow) ApprovePlan(ctx context.Context, planID string, evidence map[string]any) (AutoFlowApprovalObservation, error) {
+	return AutoFlowApprovalObservation{
+		PlanID:               planID,
+		ApprovedRevisionHash: strings.Repeat("a", 64),
+		ApprovedRevision:     1,
+	}, nil
 }
 
 func (f fakeAutoFlow) ExecuteTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error) {
@@ -2487,6 +2756,53 @@ func setHumanReviewEvidenceForTest(
 		WHERE id = $1::uuid
 	`, taskID, ApprovalHuman, planID, mustJSON(evidence), mustJSON(agentEvidence)); err != nil {
 		t.Fatalf("set task review evidence: %v", err)
+	}
+}
+
+func setAutomaticOwnedPlanAuthorityForTest(
+	t *testing.T,
+	ctx context.Context,
+	fixture *ChannelOpsFixture,
+	taskID string,
+) {
+	t.Helper()
+	planID := "00000000-0000-0000-0000-000000000101"
+	approvedRevisionHash := strings.Repeat("a", 64)
+	approvedRevision := int64(1)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		INSERT INTO autoflow_plans (
+			id, prompt, request_json, intent_json, template_id, pipeline_definition,
+			candidates_json, metadata_json, rights_json, validation_json, status,
+			execution_revision, review_approved_at, approved_revision_hash,
+			approved_revision, created_at, updated_at
+		) VALUES (
+			$1::uuid, 'automatic owned fixture', '{}'::json, '{}'::json, 'channelops-live',
+			'{"nodes": [], "edges": []}'::json, '[]'::json, '{}'::json,
+			'{"status": "allowed"}'::json, '{"valid": true}'::json, 'review_approved',
+			1, NOW(), $2, $3, NOW(), NOW()
+		)
+		ON CONFLICT (id) DO UPDATE
+		SET status = 'review_approved',
+			rights_json = '{"status": "allowed"}'::json,
+			review_approved_at = NOW(),
+			approved_revision_hash = $2,
+			approved_revision = autoflow_plans.execution_revision
+	`, planID, approvedRevisionHash, approvedRevision); err != nil {
+		t.Fatalf("upsert automatic owned AutoFlow plan: %v", err)
+	}
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT execution_revision FROM autoflow_plans WHERE id = $1::uuid
+	`, planID).Scan(&approvedRevision); err != nil {
+		t.Fatalf("read automatic owned execution revision: %v", err)
+	}
+	task, err := fixture.Store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("read automatic owned task authority: %v", err)
+	}
+	if task.AutoFlowPlanID == nil || *task.AutoFlowPlanID != planID ||
+		task.AutoFlowApprovedRevisionHash == nil || *task.AutoFlowApprovedRevisionHash != approvedRevisionHash ||
+		task.AutoFlowApprovedRevision == nil || *task.AutoFlowApprovedRevision != approvedRevision {
+		t.Fatalf("automatic owned task did not preserve approval observation: %#v", task)
 	}
 }
 

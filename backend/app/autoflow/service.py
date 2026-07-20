@@ -747,24 +747,10 @@ class AutoFlowService:
         request: AutoFlowExecuteRequest,
         db: AsyncSession,
     ) -> AutoFlowRun:
-        schedule, _schedule_created = await get_or_create_and_lock_runtime_schedule(db)
-        plan = await self._get_plan_for_update(str(request.plan_id), db)
-        if plan is None:
-            await db.rollback()
-            raise ValueError("AutoFlow plan not found")
-        _assert_execute_allowed(plan, request)
-
-        approved_revision_hash = plan.approved_revision_hash
-        key = str(request.idempotency_key or f"autoflow-one-shot:{uuid.uuid4()}").strip()
-        request_fingerprint = execute_request_fingerprint(request, plan.plan_id)
-        publish = {
-            "mode": plan.request.publish_mode,
-            "review_approved": bool(plan.review_approved_at or plan.agent_approved_by),
-            "agent_approved_by": plan.agent_approved_by,
-            "public_approved": bool(plan.public_approved_at),
-            "approved_revision_hash": approved_revision_hash,
-            "approved_revision": plan.approved_revision,
-        }
+        plan_id = str(uuid.UUID(str(request.plan_id)))
+        key = _execute_idempotency_key(request)
+        expected_revision_hash, expected_revision = _expected_execute_authority(request)
+        request_fingerprint = execute_request_fingerprint(request, plan_id)
         existing = (
             await db.execute(
                 select(AutoFlowRunModel).where(AutoFlowRunModel.execute_idempotency_key == key)
@@ -774,8 +760,9 @@ class AutoFlowService:
             try:
                 run = _validate_idempotent_replay(
                     existing,
-                    plan,
-                    approved_revision_hash,
+                    plan_id,
+                    expected_revision_hash,
+                    expected_revision,
                     request_fingerprint,
                 )
             except Exception:
@@ -783,6 +770,44 @@ class AutoFlowService:
                 raise
             await db.commit()
             return run
+
+        schedule, _schedule_created = await get_or_create_and_lock_runtime_schedule(db)
+        existing = (
+            await db.execute(
+                select(AutoFlowRunModel).where(AutoFlowRunModel.execute_idempotency_key == key)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            try:
+                run = _validate_idempotent_replay(
+                    existing,
+                    plan_id,
+                    expected_revision_hash,
+                    expected_revision,
+                    request_fingerprint,
+                )
+            except Exception:
+                await db.rollback()
+                raise
+            await db.commit()
+            return run
+
+        plan = await self._get_plan_for_update(plan_id, db)
+        if plan is None:
+            await db.rollback()
+            raise ValueError("AutoFlow plan not found")
+        _assert_execute_allowed(plan, request)
+        _assert_expected_execute_authority(plan, expected_revision_hash, expected_revision)
+
+        approved_revision_hash = plan.approved_revision_hash
+        publish = {
+            "mode": plan.request.publish_mode,
+            "review_approved": bool(plan.review_approved_at or plan.agent_approved_by),
+            "agent_approved_by": plan.agent_approved_by,
+            "public_approved": bool(plan.public_approved_at),
+            "approved_revision_hash": approved_revision_hash,
+            "approved_revision": plan.approved_revision,
+        }
 
         reservation = AutoFlowRunModel(
             id=uuid.uuid4(),
@@ -809,8 +834,9 @@ class AutoFlowService:
             try:
                 run = _validate_idempotent_replay(
                     existing,
-                    plan,
-                    approved_revision_hash,
+                    plan_id,
+                    expected_revision_hash,
+                    expected_revision,
                     request_fingerprint,
                 )
             except Exception:
@@ -1135,16 +1161,17 @@ def _run_from_model(row: AutoFlowRunModel) -> AutoFlowRun:
 
 def _validate_idempotent_replay(
     row: AutoFlowRunModel,
-    plan: AutoFlowPlan,
-    approved_revision_hash: str | None,
+    plan_id: str,
+    expected_revision_hash: str | None,
+    expected_revision: int | None,
     request_fingerprint: str,
 ) -> AutoFlowRun:
     stored_revision_hash = (row.publish_json or {}).get("approved_revision_hash")
     stored_revision = (row.publish_json or {}).get("approved_revision")
-    if (
-        row.plan_id != uuid.UUID(plan.plan_id)
-        or stored_revision_hash != approved_revision_hash
-        or stored_revision != plan.approved_revision
+    if row.plan_id != uuid.UUID(plan_id):
+        raise ValueError("AutoFlow execute idempotency key was already used for a different plan or revision")
+    if expected_revision_hash is not None and (
+        stored_revision_hash != expected_revision_hash or stored_revision != expected_revision
     ):
         raise ValueError("AutoFlow execute idempotency key was already used for a different plan or revision")
     if not row.request_fingerprint:
@@ -1154,10 +1181,47 @@ def _validate_idempotent_replay(
     return _run_from_model(row)
 
 
+def _execute_idempotency_key(request: AutoFlowExecuteRequest) -> str:
+    if request.idempotency_key is None:
+        return f"autoflow-one-shot:{uuid.uuid4()}"
+    key = request.idempotency_key.strip()
+    if not key:
+        raise ValueError("AutoFlow execute idempotency_key must not be blank")
+    return key
+
+
+def _expected_execute_authority(request: AutoFlowExecuteRequest) -> tuple[str | None, int | None]:
+    revision_hash = request.expected_approved_revision_hash
+    revision = request.expected_approved_revision
+    if (revision_hash is None) != (revision is None):
+        raise ValueError("AutoFlow expected approved revision hash and revision must be provided together")
+    return revision_hash, revision
+
+
+def _assert_expected_execute_authority(
+    plan: AutoFlowPlan,
+    expected_revision_hash: str | None,
+    expected_revision: int | None,
+) -> None:
+    if expected_revision_hash is None:
+        return
+    if (
+        plan.approved_revision_hash != expected_revision_hash
+        or plan.approved_revision != expected_revision
+        or plan.approved_revision != plan.execution_revision
+    ):
+        raise ValueError("AutoFlow expected approved revision does not match current plan authority")
+
+
 def execute_request_fingerprint(request: AutoFlowExecuteRequest, plan_id: str) -> str:
+    excluded_fields = {"idempotency_key", "plan"}
+    if request.expected_approved_revision_hash is None:
+        excluded_fields.add("expected_approved_revision_hash")
+    if request.expected_approved_revision is None:
+        excluded_fields.add("expected_approved_revision")
     payload = request.model_dump(
         mode="json",
-        exclude={"idempotency_key", "plan"},
+        exclude=excluded_fields,
     )
     payload["plan_id"] = str(uuid.UUID(plan_id))
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
