@@ -710,3 +710,170 @@ Implementation commit:
 - Per the binding brief, the deployed-image smoke was not run. It remains the
   post-push check against the exact naturally deployed image; its script syntax
   passed.
+
+## Final Review 5 Consolidated Fix Wave
+
+### Status And Scope
+
+`DONE_WITH_CONCERNS`. Work remained on `codex/channelops-soak-guard` in the
+required worktree and started from clean commit
+`649e1fcd197315bdc2cd85a544aa110b65fa1317`.
+
+Implementation commit:
+
+- `2e575c1985f713353038e70e7517400dda008eb1` -
+  `fix: close final review 5 authority gaps`
+- The report-only commit is listed in the final task response because this
+  section was written after the implementation commit existed.
+
+No deployment, push, production access, host 126 access, activation-state
+write, real PDS/YouTube call, upload, publication, or edit to the user-owned
+root `vp_autonomous_production_feedback_loop_plan.md` occurred. Migration 026
+was preserved unchanged; no migration was needed because the existing
+`production_tasks.rationale_json.autoflow_plan_payload` is the durable task
+snapshot.
+
+### Implemented Fixes
+
+- Go approval now captures a typed observation containing exact plan id,
+  approved revision hash, and positive approved revision. The planning
+  transition persists that authority in task rationale and copies it into the
+  durable execute queue payload. Python human-review release writes the same
+  snapshot. Task reads no longer derive expected execution authority from a
+  live plan join.
+- Execute handling cross-checks queue and task snapshots before AutoFlow HTTP.
+  Go sends a stable idempotency key and both expected fields. Python validates
+  the caller-observed pair under schedule -> plan locks before new work, while
+  exact committed replays are checked before live-plan authority so R1 remains
+  replayable after R2. A post-schedule key recheck closes the insert visibility
+  race, and absent new fields preserve pre-upgrade request fingerprints.
+- Every plan-backed promotion, including the automatic owned path, locks the
+  exact live plan and compares it with the durable task snapshot before PDS or
+  YouTube. The plan remains locked through PDS, scheduling, and durable writes;
+  missing, rejected, blocked, stale, or revision-mismatched authority holds or
+  rejects before external effects. Existing external/manual evidence checks
+  remain additive.
+- Queue fences carry their authoritative locked channel into the transactional
+  Store. Promotion locks channel -> task -> publication, then revalidates task
+  channel and publication ownership before plan/PDS/YouTube, returning
+  `ErrQueueAuthorityInvalid` on drift.
+- The initial Python job launch reacquires fresh schedule -> job -> node state
+  after every authority-releasing commit. The final queued-node check holds
+  those locks through Redis dispatch, so quarantine-first cancellation cannot
+  be revived or dispatched while dispatch-first may linearize before later
+  cancellation. Worker-visible QUEUED state is committed before Redis emission.
+- Provided idempotency keys are trimmed and blank/whitespace-only values raise
+  before any durable effect. Truly absent keys remain one-shot requests.
+
+### Changed Files
+
+- Python runtime/schema: `backend/app/api/channel_agent.py`,
+  `backend/app/autoflow/service.py`, `backend/app/orchestrator/engine.py`, and
+  `backend/app/schemas/autoflow.py`.
+- Python tests: `backend/tests/autoflow/test_execute_idempotency_postgres.py`,
+  `backend/tests/channel_agent/test_api.py`, and
+  `backend/tests/channel_agent/test_operator_quarantine_postgres.py`.
+- Go runtime: `internal/channelops/autoflow_client.go`,
+  `internal/channelops/execution_fence.go`, `internal/channelops/handlers.go`,
+  `internal/channelops/human_review.go`, `internal/channelops/store.go`,
+  `internal/channelops/store_publications.go`, and
+  `internal/channelops/store_tasks.go`.
+- Go tests: `internal/channelops/autoflow_client_test.go`,
+  `internal/channelops/handlers_test.go`, and
+  `internal/channelops/integration_test.go`.
+
+### RED Evidence
+
+- Caller-observed revision, response-loss replay, and whitespace key:
+  `cd backend && CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55436/videoprocess .venv/bin/python3 -m pytest tests/autoflow/test_execute_idempotency_postgres.py -k 'observed_r1 or r1_response_loss or whitespace_idempotency' -q`
+  -> `3 failed, 13 deselected`; R1 silently executed current R2, exact R1 retry
+  rejected after R2, and a whitespace key created work.
+- Python human-review task snapshot:
+  `cd backend && .venv/bin/python3 -m pytest tests/channel_agent/test_api.py::test_human_review_release_approves_exact_plan_and_enqueues_execution -q`
+  -> failed with missing `autoflow_plan_payload` authority.
+- Initial dispatch race:
+  `cd backend && CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55436/videoprocess .venv/bin/python3 -m pytest tests/channel_agent/test_operator_quarantine_postgres.py::test_quarantine_after_running_commit_prevents_stale_initial_dispatch -q`
+  -> failed because the starter had no post-RUNNING authority boundary and did
+  not reach the deterministic pause before stale dispatch.
+- Go approval/execute contract:
+  `go test ./internal/channelops -run 'TestHTTPAutoFlowApprovePlanPostsReviewNotes|TestHTTPAutoFlowExecuteTaskUsesTaskPlanID' -count=1`
+  -> compile-time failure because `ApprovePlan` returned no observation.
+- Automatic promotion and channel races:
+  `DATABASE_URL=postgres://vp:vp_test@127.0.0.1:55436/videoprocess go test ./internal/channelops -run 'TestAutomaticOwnedPromotionRejectFirstPreventsPDSAndYouTube|TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites|TestPromotionRevalidatesFencedChannelAfterTaskScopeLock' -count=1`
+  -> rejection did not block promotion, canonical invalidation did not wait on
+  promotion, and enabled/halted channel-B reassignment reached the old path.
+- Execute snapshot cross-check:
+  `DATABASE_URL=postgres://vp:vp_test@127.0.0.1:55436/videoprocess go test ./internal/channelops -run 'TestHandleExecuteTaskRejectsMissingOrMismatchedDurableAuthorityBeforeAutoFlow' -count=1`
+  -> both missing task authority and mismatched queue authority reached AutoFlow.
+- Final self-review added two more RED replay regressions. The pre-upgrade
+  fingerprint test failed with `AutoFlow execute idempotency key was already
+  used for a different request`; the deterministic post-schedule visibility
+  test failed with `AutoFlow expected approved revision does not match current
+  plan authority` before rechecking the now-visible R1 row.
+
+### GREEN And Full Verification
+
+- Final focused execute command covering observed R1/current R2, committed R1
+  after R2, delayed R1 visibility, legacy fingerprints, and whitespace keys ->
+  `5 passed, 13 deselected in 1.01s`.
+- Full execute file plus quarantine-after-RUNNING race ->
+  `19 passed, 1 warning in 3.38s`.
+- Focused Go automatic promotion, channel reassignment, execute cross-check,
+  approval observation, and stable execute payload command -> passed in
+  `0.846s`.
+- Final PostgreSQL acceptance command:
+  `cd backend && CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55436/videoprocess .venv/bin/python3 -m pytest tests/migrations/test_final_review4_postgres.py tests/migrations/test_final_review3_postgres.py tests/channel_agent/test_operator_quarantine_postgres.py tests/autoflow/test_execute_idempotency_postgres.py tests/channel_agent/test_api.py -q`
+  -> `58 passed, 1 warning in 7.65s`.
+- Full backend: `cd backend && .venv/bin/python3 -m pytest` ->
+  `641 passed, 26 skipped, 11 warnings in 65.31s`; opt-in PostgreSQL tests are
+  ordinary skips and passed separately above.
+- An empty database migrated through `026_autoflow_authority_fence`. Against a
+  second fresh migration-head database,
+  `DATABASE_URL=postgres://vp:vp_test@127.0.0.1:55436/videoprocess go test ./... -count=1`
+  -> all Go packages passed.
+- Ruff over every changed Python file -> `All checks passed!`. Full Ruff remains
+  the exact pre-existing baseline of 17 findings. `mypy app` remains the exact
+  pre-existing baseline of 66 errors in 24 files.
+- `bash tests/test_channelops_soak_watch.sh` ->
+  `PASS: channelops soak watcher contract`;
+  `bash tests/test_vp_deploy_sync_extension.sh` exited 0. The watcher, deploy
+  extension, and image-smoke scripts all passed required `bash -n` checks.
+- `git diff --check` and staged `git diff --cached --check` exited 0. `gofmt -l`
+  returned no files. The staged boundary contained exactly the 17 files listed
+  above and excluded the root plan.
+
+### Lock And Replay Review
+
+- Promotion lock order is channel -> task -> publication -> plan. The fenced
+  channel is rechecked only after task/publication locks, so a channel-A fence
+  cannot authorize a task that moved to enabled or halted channel B. Plan
+  invalidation-first makes promotion hold with zero PDS/YouTube; promotion-first
+  blocks invalidation until external and durable writes finish.
+- New execute work owns schedule -> plan before reservation and effects. Replay
+  performs an initial key lookup, then a second lookup after schedule
+  serialization and before live-plan validation. Exact stored plan id,
+  approved hash/revision, and request fingerprint return the original run;
+  changed expected authority or behavior conflicts. Unique-key recovery still
+  validates the same stored tuple.
+- Initial dispatch owns schedule -> job -> ordered nodes for its final
+  eligibility check and Redis emission, then commits immediately. It never
+  holds those SQL locks for the video-job lifetime. A CLOSED/deferrable schedule
+  parks work, and terminal/cancelled job or node state is never overwritten.
+
+### PostgreSQL 16 And Cleanup
+
+- Disposable container `vp-final-review-5-postgres`, id
+  `33290b5ba46fdc07f1e01d1ae81f32582822d14745883eb4c8bd5d98dd5b23e6`,
+  used `postgres:16-alpine` image id
+  `sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777`.
+- Server was PostgreSQL `16.14` on `127.0.0.1:55436`. The database was recreated
+  from empty and migrated to head before final Go verification. The container
+  was force removed, and an exact-name `docker ps -a` check confirmed absence.
+
+### Concerns
+
+- Full-tree Ruff and mypy remain nonzero only for the recorded pre-existing
+  baselines: 17 Ruff findings and 66 mypy errors in 24 files. Changed-file Ruff
+  is clean.
+- Per the binding brief, the deployed-image smoke was not run before natural
+  deployment. Its script syntax and local watcher/deploy contracts passed.
