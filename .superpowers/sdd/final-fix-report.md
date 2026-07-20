@@ -877,3 +877,117 @@ snapshot.
   is clean.
 - Per the binding brief, the deployed-image smoke was not run before natural
   deployment. Its script syntax and local watcher/deploy contracts passed.
+
+## Final Review 6 Consolidated Fix Wave
+
+### Status And Scope
+
+`DONE_WITH_CONCERNS`. Work remained on `codex/channelops-soak-guard` in the
+required worktree and started from clean commit
+`7c544459cd302564359d1cb777e2157cf75671d5`.
+
+Implementation commit:
+
+- `fc72056f84c38c9b32c53dfc06520d39f8fa0a5a` -
+  `fix: fence multi-root initial dispatch`
+- The report-only commit is listed in the final task response because this
+  section was written after the implementation commit existed.
+
+No deployment, push, production write, activation-state write, real external
+network call, host 126 access, upload, publication, or edit to the user-owned
+root `vp_autonomous_production_feedback_loop_plan.md` occurred.
+
+### Implemented Fixes
+
+- Guarded initial dispatch now invokes a per-candidate recheck boundary and
+  reacquires schedule -> job -> ordered node locks before considering every
+  root. It rebuilds the dependency map and node map from that freshly loaded
+  collection before dependency, input, cache, or queue decisions. A closed
+  schedule or cancelled/terminal job ends the scan without mutating the next
+  root.
+- The existing queue commit followed by a final schedule -> job -> node lock
+  remains in place before Redis emission. This preserves worker-visible
+  ordering and the valid dispatcher-first linearization while preventing a
+  quarantine-first root from being revived by an ORM object retained across a
+  prior root's commit.
+- The four direct completion receives introduced in the reviewed Final Review
+  5 Go race tests now use explicit `select` statements with
+  `time.After(5 * time.Second)`. Both handler and canonical invalidation waits
+  are bounded where applicable. Existing buffered completion channels and the
+  bounded release/drain defer remain intact.
+
+### Changed Files
+
+- Runtime: `backend/app/orchestrator/engine.py`.
+- PostgreSQL regression:
+  `backend/tests/channel_agent/test_operator_quarantine_postgres.py`.
+- Bounded Go race-test waits: `internal/channelops/integration_test.go`.
+
+### Deterministic RED Evidence
+
+Before changing runtime code, with PostgreSQL 16 at migration head 026:
+
+`cd backend && CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55437/videoprocess .venv/bin/python3 -m pytest tests/channel_agent/test_operator_quarantine_postgres.py::test_quarantine_between_initial_roots_does_not_revive_second_root -q`
+
+Result: `1 failed, 3 warnings in 0.60s`. Root A was the only Redis emission,
+quarantine closed the schedule and cancelled the job/task/root B, then the old
+loop committed its retained root-B object as `QUEUED`. The exact assertion was
+`NodeStatus.QUEUED != NodeStatus.CANCELLED`.
+
+The regression uses two independent roots and `asyncio.Event` boundaries. On
+the old path it pauses at the real cache/queue boundary after root A's dispatch;
+on the fixed path it pauses before root B reacquires authority. It then runs the
+real quarantine transaction and resumes the real dispatcher. No sleeps or
+eligibility stubs are used.
+
+### GREEN And Full Verification
+
+- The exact RED command after the runtime fix ->
+  `1 passed, 2 warnings in 0.47s`.
+- A shell loop reran that exact PostgreSQL regression 10 times -> all 10 runs
+  passed (`0.47s` to `0.52s` each).
+- Full operator-quarantine PostgreSQL file ->
+  `6 passed, 3 warnings in 1.39s`.
+- Focused reviewed Go races:
+  `DATABASE_URL=postgres://vp:vp_test@127.0.0.1:55437/videoprocess go test ./internal/channelops -run 'TestAutomaticOwnedPromotionRejectFirstPreventsPDSAndYouTube|TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites|TestPromotionRevalidatesFencedChannelAfterTaskScopeLock' -count=1`
+  -> passed in `0.811s`.
+- Final Review 5 PostgreSQL acceptance set:
+  `cd backend && CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55437/videoprocess .venv/bin/python3 -m pytest tests/migrations/test_final_review4_postgres.py tests/migrations/test_final_review3_postgres.py tests/channel_agent/test_operator_quarantine_postgres.py tests/autoflow/test_execute_idempotency_postgres.py tests/channel_agent/test_api.py -q`
+  -> `59 passed, 3 warnings in 7.81s`.
+- Full backend: `cd backend && .venv/bin/python3 -m pytest` ->
+  `641 passed, 27 skipped, 11 warnings in 65.31s`. The added PostgreSQL test is
+  one of the opt-in skips and passed explicitly above.
+- The database was dropped, recreated empty, and migrated through
+  `026_autoflow_authority_fence (head)`. Against that fresh database,
+  `DATABASE_URL=postgres://vp:vp_test@127.0.0.1:55437/videoprocess go test ./... -count=1`
+  -> all Go packages passed; `internal/channelops` completed in `5.494s`.
+- Changed-file Ruff -> `All checks passed!`. Full Ruff remains the exact
+  pre-existing 17-finding baseline. `mypy app` remains the exact pre-existing
+  baseline of 66 errors in 24 files.
+- `bash tests/test_channelops_soak_watch.sh` ->
+  `PASS: channelops soak watcher contract`;
+  `bash tests/test_vp_deploy_sync_extension.sh` exited 0.
+- `bash -n` passed for `deploy/swarm/channelops-soak-watch.sh`,
+  `deploy/swarm/deploy-sync-extension.sh`, and
+  `tests/test_channelops_soak_image_smoke.sh`.
+- `gofmt -l internal/channelops/integration_test.go` returned no files.
+  `git diff --check` and staged `git diff --cached --check` exited 0, and the
+  implementation commit contained exactly the three changed files listed
+  above.
+
+### PostgreSQL 16 And Cleanup
+
+- Disposable container `vp-final-review-6-postgres`, id
+  `7bcf42f871263927b6bd271da0d40d20c4a0c8b18f16376cc302dc5a53683b35`,
+  used `postgres:16-alpine` image id
+  `sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777`.
+- Server was PostgreSQL `16.14` on `127.0.0.1:55437`. The container was force
+  removed, and an exact-name `docker ps -a` check returned `absent`.
+
+### Concerns
+
+- Full-tree Ruff and mypy remain nonzero only for the recorded pre-existing
+  baselines: 17 Ruff findings and 66 mypy errors in 24 files. Changed-file Ruff
+  is clean.
+- Per the binding brief, deployed-image smoke was not run and no deployment or
+  external interaction occurred.
