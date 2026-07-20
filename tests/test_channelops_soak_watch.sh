@@ -52,6 +52,7 @@ run_watcher() {
     FAKE_DOCKER_MODE="${FAKE_DOCKER_MODE:-healthy}" \
     FAKE_MISSING_SERVICES="${FAKE_MISSING_SERVICES:-}" \
     FAKE_CLI_EXIT="${FAKE_CLI_EXIT:-0}" \
+    FAKE_DATE_MODE="${FAKE_DATE_MODE:-gnu}" \
     bash "$WATCHER" >"$OUTPUT" 2>&1
   WATCHER_EXIT=$?
   set -e
@@ -267,6 +268,48 @@ run_watcher
 [[ "$WATCHER_EXIT" -ne 0 ]] || fail "future activation timestamp must fail"
 assert_contains 'status=configuration_error reason=future_started_at' "$OUTPUT"
 [[ ! -s "$CALLS" ]] || fail "future timestamp contacted Docker"
+
+# Exercise the exact future-skew boundary through both supported date parsers.
+cat >"$FAKE_BIN/date" <<'FAKE_DATE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$*" == "-u +%s" ]]; then
+  printf '1000000\n'
+  exit 0
+fi
+if [[ "${FAKE_DATE_MODE:-gnu}" == "bsd" && " $* " == *" -d "* ]]; then
+  exit 1
+fi
+case "$*" in
+  *2026-07-19T18:35:00Z*) printf '1000300\n' ;;
+  *2026-07-19T18:35:01Z*) printf '1000301\n' ;;
+  *) exit 1 ;;
+esac
+FAKE_DATE
+chmod +x "$FAKE_BIN/date"
+
+for FAKE_DATE_MODE in gnu bsd; do
+  write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:35:00Z 0
+  run_watcher
+  [[ "$WATCHER_EXIT" -ne 0 ]] || fail "$FAKE_DATE_MODE exact 300-second boundary must reach threshold validation"
+  assert_contains 'status=configuration_error reason=invalid_max_publications_per_24h' "$OUTPUT"
+  [[ ! -s "$CALLS" ]] || fail "$FAKE_DATE_MODE exact boundary contacted Docker"
+
+  write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:35:00.1Z 0
+  run_watcher
+  [[ "$WATCHER_EXIT" -ne 0 ]] || fail "$FAKE_DATE_MODE fractional future boundary must fail"
+  assert_contains 'status=configuration_error reason=future_started_at' "$OUTPUT"
+  [[ ! -s "$CALLS" ]] || fail "$FAKE_DATE_MODE fractional boundary contacted Docker"
+
+  write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:35:01Z 0
+  run_watcher
+  [[ "$WATCHER_EXIT" -ne 0 ]] || fail "$FAKE_DATE_MODE 301-second boundary must fail"
+  assert_contains 'status=configuration_error reason=future_started_at' "$OUTPUT"
+  [[ ! -s "$CALLS" ]] || fail "$FAKE_DATE_MODE 301-second boundary contacted Docker"
+done
+rm "$FAKE_BIN/date"
+unset FAKE_DATE_MODE
 
 write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:30:00Z 0
 run_watcher

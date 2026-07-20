@@ -20,6 +20,9 @@ from app.models.channel_agent import (
     PublishingAccount,
     TopicLane,
 )
+from app.models.autoflow import AutoFlowPlan
+from app.autoflow.service import autoflow_service
+from app.schemas.autoflow import AutoFlowPlanPatch
 from app.models.youtube_upload_operation import YouTubeUploadOperation
 from app.services.channelops_soak_guard import (
     ALLOWED_EXTERNAL_CONDITIONS,
@@ -34,6 +37,7 @@ STARTED_AT = NOW - timedelta(hours=72)
 ROW_CREATED_AT = STARTED_AT + timedelta(minutes=5)
 NAIVE_ROW_CREATED_AT = ROW_CREATED_AT.replace(tzinfo=None)
 TABLES = (
+    AutoFlowPlan.__table__,
     ChannelProfile.__table__,
     TopicLane.__table__,
     PublishingAccount.__table__,
@@ -44,6 +48,61 @@ TABLES = (
     FeedbackSnapshot.__table__,
     YouTubeUploadOperation.__table__,
 )
+
+
+def _review_plan(*, review_approved_at: datetime | None = None, status: str = "review_approved") -> AutoFlowPlan:
+    return AutoFlowPlan(
+        prompt="external review",
+        request_json={
+            "prompt": "external review",
+            "target_platforms": ["youtube_shorts"],
+            "duration_sec": 30,
+            "aspect_ratio": "9:16",
+            "source_policy": "remix_with_review",
+            "publish_mode": "private_upload",
+            "material_library_ids": [],
+            "user_constraints": {},
+        },
+        intent_json={
+            "intent_type": "generic_video",
+            "subject": "external review",
+            "style": "documentary",
+            "duration_sec": 30,
+            "aspect_ratio": "9:16",
+            "target_platforms": ["youtube_shorts"],
+            "source_policy": "remix_with_review",
+            "publish_mode": "private_upload",
+            "keywords": [],
+            "negative_keywords": [],
+            "needs_voiceover": False,
+            "needs_subtitles": True,
+            "needs_bgm": False,
+            "user_confirmation_questions": [],
+        },
+        template_id="material_library_remix",
+        pipeline_definition={"nodes": [], "edges": [], "viewport": {"x": 0, "y": 0, "zoom": 1}},
+        candidates_json=[],
+        metadata_json={},
+        rights_json={"status": "review_required", "reasons": [], "allowed_publish_modes": ["private_upload"]},
+        validation_json={"valid": True, "errors": [], "warnings": [], "repairs": []},
+        status=status,
+        review_approved_at=review_approved_at,
+    )
+
+
+def _pre_upload_evidence(task: ProductionTask, plan: AutoFlowPlan, *, token: datetime | None = None, plan_id=None):
+    resolved_token = token or plan.review_approved_at
+    return {
+        "pre_upload": {
+            "kind": "human_review",
+            "scope": "external_asset_pre_upload",
+            "human_actor": "operator@example.com",
+            "reviewed_at": resolved_token.isoformat() if resolved_token else "",
+            "autoflow_plan_id": str(plan_id or plan.id),
+            "plan_review_approved_at": resolved_token.isoformat() if resolved_token else "",
+            "review_notes": "reviewed",
+        }
+    }
 
 
 @pytest.fixture
@@ -362,6 +421,107 @@ async def test_external_asset_progress_requires_human_approval(soak_session, sta
 
     assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
 
+    assert "external_asset_human_approval_missing" in assessment.critical_codes
+
+
+@pytest.mark.asyncio
+async def test_snapshot_external_asset_planning_requires_durable_human_evidence(soak_session):
+    rows = await _seed_graph(soak_session)
+    rows["task"].uses_external_assets = False
+    rows["task"].source_platforms_json = []
+    rows["task"].channel_config_snapshot_json = {
+        "lane_format": {"source_platforms_json": ["youtube"]}
+    }
+    rows["task"].state = "planning"
+    await soak_session.commit()
+
+    assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
+
+    assert "external_asset_human_approval_missing" in assessment.critical_codes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence_case", ["missing", "agent_only", "stale", "mismatched", "rejected"])
+async def test_external_asset_planning_rejects_invalid_durable_human_evidence(soak_session, evidence_case):
+    rows = await _seed_graph(soak_session)
+    approved_at = NOW - timedelta(hours=1)
+    plan = _review_plan(review_approved_at=approved_at)
+    soak_session.add(plan)
+    await soak_session.flush()
+    task = rows["task"]
+    task.uses_external_assets = True
+    task.approval_mode = "human"
+    task.autoflow_plan_id = plan.id
+    task.state = "planning"
+    if evidence_case == "agent_only":
+        task.agent_approval_evidence_json = {"approved_by": "channel_agent"}
+    elif evidence_case == "stale":
+        task.human_review_evidence_json = _pre_upload_evidence(
+            task,
+            plan,
+            token=approved_at - timedelta(seconds=1),
+        )
+    elif evidence_case == "mismatched":
+        task.human_review_evidence_json = _pre_upload_evidence(task, plan, plan_id=uuid.uuid4())
+    elif evidence_case == "rejected":
+        task.human_review_evidence_json = _pre_upload_evidence(task, plan)
+        plan.status = "rejected"
+        plan.review_approved_at = None
+    await soak_session.commit()
+
+    assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
+
+    assert "external_asset_human_approval_missing" in assessment.critical_codes
+
+
+@pytest.mark.asyncio
+async def test_external_asset_planning_accepts_current_human_review_evidence(soak_session):
+    rows = await _seed_graph(soak_session)
+    approved_at = NOW - timedelta(hours=1)
+    plan = _review_plan(review_approved_at=approved_at)
+    soak_session.add(plan)
+    await soak_session.flush()
+    task = rows["task"]
+    task.uses_external_assets = True
+    task.approval_mode = "human"
+    task.autoflow_plan_id = plan.id
+    task.state = "planning"
+    task.human_review_evidence_json = _pre_upload_evidence(task, plan)
+    await soak_session.commit()
+
+    assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
+
+    assert "external_asset_human_approval_missing" not in assessment.critical_codes
+
+
+@pytest.mark.asyncio
+async def test_approval_relevant_plan_patch_invalidates_task_human_review_evidence(soak_session):
+    rows = await _seed_graph(soak_session)
+    approved_at = NOW - timedelta(hours=1)
+    plan = _review_plan(review_approved_at=approved_at)
+    soak_session.add(plan)
+    await soak_session.flush()
+    task = rows["task"]
+    task.uses_external_assets = True
+    task.autoflow_plan_id = plan.id
+    task.state = "planning"
+    task.human_review_evidence_json = _pre_upload_evidence(task, plan)
+    await soak_session.commit()
+
+    patched = await autoflow_service.patch_plan(
+        str(plan.id),
+        AutoFlowPlanPatch(
+            metadata={"description": "changed after review"},
+            rebuild_definition=False,
+            validate=False,
+            evaluate_rights=False,
+        ),
+        soak_session,
+    )
+    assert patched is not None
+    assert patched.review_approved_at is None
+
+    assessment = await assess_channelops_soak(soak_session, _policy(rows["channel"].id), now=NOW)
     assert "external_asset_human_approval_missing" in assessment.critical_codes
 
 

@@ -84,10 +84,7 @@ func (h HandlerService) Handle(ctx context.Context, item QueueItemRow) error {
 	if h.Store == nil {
 		return errors.New("channelops handler store is not configured")
 	}
-	if item.ChannelProfileID == nil {
-		return h.dispatch(ctx, item)
-	}
-	return h.Store.WithChannelExecutionFence(ctx, *item.ChannelProfileID, func(fencedStore *Store) error {
+	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
 		fencedHandler := h
 		fencedHandler.Store = fencedStore
 		return fencedHandler.dispatch(ctx, item)
@@ -233,6 +230,9 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	if task.State != TaskPlanning {
 		return nil
 	}
+	if held, err := h.holdInvalidPreUploadReview(ctx, task, "execute_task_human_review"); held {
+		return err
+	}
 	if runID, jobID, ok := ExistingExecution(task); ok {
 		return h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, runID, jobID, item.ID)
 	}
@@ -328,6 +328,9 @@ func (h HandlerService) HandlePublishTask(ctx context.Context, item QueueItemRow
 	if task.State != TaskScheduled {
 		return nil
 	}
+	if held, err := h.holdInvalidPreUploadReview(ctx, task, "publish_task_human_review"); held {
+		return err
+	}
 	if h.YouTube != nil {
 		health, err := h.YouTube.AccountHealth(ctx, task.TargetAccountID)
 		if err == nil {
@@ -394,6 +397,24 @@ func (h HandlerService) HandlePromotePublication(ctx context.Context, item Queue
 	}
 	if targetVisibility == "" {
 		targetVisibility = "unlisted"
+	}
+	if held, err := h.holdInvalidPreUploadReview(ctx, task, "promote_publication_human_review"); held {
+		return err
+	}
+	if taskUsesExternalAssets(task) || boolValue(item.PayloadJSON["manual_review"]) {
+		valid, err := h.Store.ValidPromotionHumanReview(ctx, task, publication, targetVisibility)
+		if err != nil {
+			return err
+		}
+		if !valid {
+			return h.Store.HoldTask(
+				ctx,
+				task.ID,
+				"human_review_evidence_invalid",
+				"Publication promotion human review evidence is missing or stale",
+				"promote_publication_human_review",
+			)
+		}
 	}
 	scheduledAt := h.Store.Now().UTC()
 	if raw := firstString(item.PayloadJSON, "scheduled_at"); raw != "" {

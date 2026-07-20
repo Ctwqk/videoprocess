@@ -265,6 +265,204 @@ func TestQuarantineFirstPreventsPromotionSideEffects(t *testing.T) {
 	requireQuarantinedPromotion(t, ctx, fixture, promote, 0)
 }
 
+func TestPromotionAuthorityFencesReferencedChannelWithNullOrMismatchedMetadata(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	for _, metadata := range []string{"null", "mismatched"} {
+		t.Run(metadata, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+			if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+				t.Fatalf("RunTick: %v", err)
+			}
+			promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+			setPromotionMetadataForAuthorityTest(t, ctx, fixture, &promote, metadata)
+
+			releaseYouTube := make(chan struct{})
+			youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
+			handler.YouTube = youtube
+			handleDone := make(chan error, 1)
+			go func() { handleDone <- handler.Handle(ctx, promote) }()
+			if metadata == "mismatched" {
+				select {
+				case handleErr := <-handleDone:
+					close(releaseYouTube)
+					if handleErr == nil || !strings.Contains(handleErr.Error(), "queue authority mismatch") {
+						t.Fatalf("Handle error = %v, want queue authority mismatch", handleErr)
+					}
+				case <-time.After(2 * time.Second):
+					close(releaseYouTube)
+					t.Fatal("mismatched promotion did not fail closed")
+				}
+				if youtube.calls.Load() != 0 {
+					t.Fatalf("YouTube calls = %d, want 0", youtube.calls.Load())
+				}
+				if children := countQueueChildren(t, ctx, fixture, promote.ID); children != 0 {
+					t.Fatalf("promotion descendant count = %d, want 0", children)
+				}
+				return
+			}
+
+			select {
+			case <-youtube.started:
+			case <-time.After(2 * time.Second):
+				close(releaseYouTube)
+				t.Fatal("promotion did not reach blocking YouTube client")
+			}
+
+			lockTx, err := fixture.Store.Pool.Begin(ctx)
+			if err != nil {
+				close(releaseYouTube)
+				t.Fatalf("begin lock probe: %v", err)
+			}
+			if _, err := lockTx.Exec(ctx, `SET LOCAL lock_timeout = '100ms'`); err != nil {
+				_ = lockTx.Rollback(ctx)
+				close(releaseYouTube)
+				t.Fatalf("set lock timeout: %v", err)
+			}
+			var channelID string
+			err = lockTx.QueryRow(ctx, `
+				SELECT id::text FROM channel_profiles WHERE id = $1::uuid FOR UPDATE
+			`, fixture.ChannelID).Scan(&channelID)
+			_ = lockTx.Rollback(ctx)
+			if err == nil {
+				close(releaseYouTube)
+				<-handleDone
+				t.Fatal("referenced channel lock was not held during promotion")
+			}
+
+			close(releaseYouTube)
+			if err := <-handleDone; err != nil {
+				t.Fatalf("Handle promotion: %v", err)
+			}
+			if youtube.calls.Load() != 1 {
+				t.Fatalf("YouTube calls = %d, want 1", youtube.calls.Load())
+			}
+		})
+	}
+}
+
+func TestQuarantineFirstBlocksNullOrMismatchedPromotionMetadata(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	for _, metadata := range []string{"null", "mismatched"} {
+		t.Run(metadata, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+			if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+				t.Fatalf("RunTick: %v", err)
+			}
+			promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+			setPromotionMetadataForAuthorityTest(t, ctx, fixture, &promote, metadata)
+
+			quarantineTx, err := fixture.Store.Pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin quarantine: %v", err)
+			}
+			defer func() { _ = quarantineTx.Rollback(ctx) }()
+			var quarantinePID int
+			if err := quarantineTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&quarantinePID); err != nil {
+				t.Fatalf("select quarantine backend pid: %v", err)
+			}
+			var channelID string
+			if err := quarantineTx.QueryRow(ctx, `
+				SELECT id::text FROM channel_profiles WHERE id = $1::uuid FOR UPDATE
+			`, fixture.ChannelID).Scan(&channelID); err != nil {
+				t.Fatalf("lock channel: %v", err)
+			}
+			if err := applyFenceTestQuarantine(ctx, quarantineTx, fixture.ChannelID); err != nil {
+				t.Fatalf("apply quarantine: %v", err)
+			}
+
+			releaseYouTube := make(chan struct{})
+			close(releaseYouTube)
+			youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
+			handler.YouTube = youtube
+			handleDone := make(chan error, 1)
+			go func() { handleDone <- handler.Handle(ctx, promote) }()
+			if metadata == "mismatched" {
+				var handleErr error
+				select {
+				case handleErr = <-handleDone:
+				case <-time.After(2 * time.Second):
+					t.Fatal("mismatched promotion did not fail closed")
+				}
+				if err := quarantineTx.Commit(ctx); err != nil {
+					t.Fatalf("commit quarantine: %v", err)
+				}
+				if handleErr == nil || !strings.Contains(handleErr.Error(), "queue authority mismatch") {
+					t.Fatalf("Handle error = %v, want queue authority mismatch", handleErr)
+				}
+				if youtube.calls.Load() != 0 {
+					t.Fatalf("YouTube calls after quarantine = %d, want 0", youtube.calls.Load())
+				}
+				if children := countQueueChildren(t, ctx, fixture, promote.ID); children != 0 {
+					t.Fatalf("promotion descendant count = %d, want 0", children)
+				}
+				return
+			}
+
+			waitForChannelLockOrExternalCall(t, ctx, fixture, quarantinePID, youtube)
+			if err := quarantineTx.Commit(ctx); err != nil {
+				t.Fatalf("commit quarantine: %v", err)
+			}
+			handleErr := <-handleDone
+			if handleErr == nil || !strings.Contains(handleErr.Error(), "channel execution blocked") {
+				t.Fatalf("Handle error = %v, want channel execution blocked", handleErr)
+			}
+			if youtube.calls.Load() != 0 {
+				t.Fatalf("YouTube calls after quarantine = %d, want 0", youtube.calls.Load())
+			}
+			if children := countQueueChildren(t, ctx, fixture, promote.ID); children != 0 {
+				t.Fatalf("promotion descendant count = %d, want 0", children)
+			}
+		})
+	}
+}
+
+func TestGlobalCleanupAndAlertDispatchWithoutChannelMetadata(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	sink := &recordingAlertSink{}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	handler.Alerts = sink
+
+	if err := handler.Handle(ctx, QueueItemRow{
+		ID:          testUUID(t, "global-cleanup"),
+		Kind:        QueueCleanupExpired,
+		PayloadJSON: map[string]any{},
+	}); err != nil {
+		t.Fatalf("global cleanup: %v", err)
+	}
+	if err := handler.Handle(ctx, QueueItemRow{
+		ID:   testUUID(t, "global-alert"),
+		Kind: QueueSendAlert,
+		PayloadJSON: map[string]any{
+			"kind":    "global_test",
+			"message": "global alert",
+		},
+	}); err != nil {
+		t.Fatalf("global alert: %v", err)
+	}
+	if len(sink.payloads) != 1 || sink.payloads[0].ChannelID != "" {
+		t.Fatalf("global alert payloads = %#v", sink.payloads)
+	}
+}
+
 func TestHeldPromotionIsStaleBeforeExternalSideEffects(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -425,6 +623,88 @@ func TestExternalAssetPlanRequiresHumanReviewBeforeExecution(t *testing.T) {
 	}
 	if children := countQueueChildren(t, ctx, fixture, item.ID); children != 0 {
 		t.Fatalf("external plan descendant count = %d, want 0", children)
+	}
+}
+
+func TestExternalAssetExecuteRejectsInvalidHumanReviewEvidence(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	for _, evidenceCase := range []string{"missing", "agent_only", "stale", "mismatched", "rejected"} {
+		t.Run(evidenceCase, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+			item := prepareQueueKind(t, ctx, fixture, baseHandler, QueueExecuteTask)
+			taskID := taskIDForQueueItem(t, ctx, fixture, item)
+			setHumanReviewEvidenceForTest(t, ctx, fixture, taskID, evidenceCase, "", "")
+			recorder := &externalCallRecorder{}
+			handler := baseHandler
+			handler.PDS = &recordingPDS{recorder: recorder}
+			handler.AutoFlow = &recordingAutoFlow{recorder: recorder}
+			handler.YouTube = &recordingYouTube{recorder: recorder}
+
+			if err := handler.Handle(ctx, item); err != nil {
+				t.Fatalf("Handle execute: %v", err)
+			}
+			if calls := recorder.total(); calls != 0 {
+				t.Fatalf("external calls = %d, want 0", calls)
+			}
+			task, err := fixture.Store.GetProductionTask(ctx, taskID)
+			if err != nil {
+				t.Fatalf("GetProductionTask: %v", err)
+			}
+			if task.State != TaskHeld || task.BlockedByGuard == nil || *task.BlockedByGuard != "human_review_evidence_invalid" {
+				t.Fatalf("task state/guard = %s/%v", task.State, task.BlockedByGuard)
+			}
+		})
+	}
+}
+
+func TestValidHumanReviewEvidenceReachesExecutePublishAndManualPromotion(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	for _, kind := range []string{QueueExecuteTask, QueuePublishTask, QueuePromotePublication} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+			item := prepareQueueKind(t, ctx, fixture, baseHandler, kind)
+			taskID := taskIDForQueueItem(t, ctx, fixture, item)
+			publicationID := firstString(item.PayloadJSON, "publication_id")
+			setHumanReviewEvidenceForTest(t, ctx, fixture, taskID, "valid", publicationID, "unlisted")
+			if kind == QueuePromotePublication {
+				item.PayloadJSON["manual_review"] = true
+			}
+			recorder := &externalCallRecorder{}
+			handler := baseHandler
+			handler.PDS = &recordingPDS{recorder: recorder}
+			handler.AutoFlow = &recordingAutoFlow{recorder: recorder}
+			handler.YouTube = &recordingYouTube{recorder: recorder}
+
+			if err := handler.Handle(ctx, item); err != nil {
+				t.Fatalf("Handle %s: %v", kind, err)
+			}
+			switch kind {
+			case QueueExecuteTask:
+				if recorder.execute.Load() != 1 {
+					t.Fatalf("execute calls = %d, want 1", recorder.execute.Load())
+				}
+			case QueuePublishTask:
+				if recorder.pds.Load() != 1 {
+					t.Fatalf("PDS calls = %d, want 1", recorder.pds.Load())
+				}
+			case QueuePromotePublication:
+				if recorder.pds.Load() != 1 || recorder.schedulePublish.Load() != 1 {
+					t.Fatalf("promotion PDS/YouTube calls = %d/%d, want 1/1", recorder.pds.Load(), recorder.schedulePublish.Load())
+				}
+			}
+		})
 	}
 }
 
@@ -1050,12 +1330,13 @@ type decisionAuditFixtureRow struct {
 }
 
 type ChannelOpsFixture struct {
-	T         *testing.T
-	Store     *Store
-	ChannelID string
-	LaneID    string
-	FormatID  string
-	AccountID string
+	T                    *testing.T
+	Store                *Store
+	ChannelID            string
+	LaneID               string
+	FormatID             string
+	AccountID            string
+	AdditionalChannelIDs []string
 }
 
 func NewChannelOpsFixture(t *testing.T) *ChannelOpsFixture {
@@ -1443,6 +1724,9 @@ func (f *ChannelOpsFixture) cleanup(ctx context.Context) {
 		)
 		DELETE FROM channel_profiles WHERE id = $1::uuid
 	`, f.ChannelID)
+	for _, channelID := range f.AdditionalChannelIDs {
+		_, _ = f.Store.Pool.Exec(ctx, `DELETE FROM channel_profiles WHERE id = $1::uuid`, channelID)
+	}
 }
 
 func testUUID(t *testing.T, label string) string {
@@ -1703,6 +1987,160 @@ func applyFenceTestQuarantine(ctx context.Context, tx pgx.Tx, channelID string) 
 		  AND status IN ($3, $4)
 	`, channelID, QueueStatusDeadLettered, QueueStatusQueued, QueueStatusRunning)
 	return err
+}
+
+func setPromotionMetadataForAuthorityTest(
+	t *testing.T,
+	ctx context.Context,
+	fixture *ChannelOpsFixture,
+	promote *QueueItemRow,
+	metadata string,
+) {
+	t.Helper()
+	var storedChannelID *string
+	if metadata == "mismatched" {
+		mismatchedChannelID := testUUID(t, "mismatched-channel")
+		if _, err := fixture.Store.Pool.Exec(ctx, `
+			INSERT INTO channel_profiles (
+				id, name, positioning, language, default_aspect_ratio, risk_policy_json,
+				content_mix_policy_json, cadence_policy_json, alert_policy_json, enabled,
+				dry_run, config_version, tick_interval_minutes, created_at, updated_at
+			) VALUES (
+				$1::uuid, 'mismatched queue metadata', '', 'en', '9:16', '{}'::json,
+				'{}'::json, '{}'::json, '{}'::json, TRUE, FALSE, 1, 60, NOW(), NOW()
+			)
+		`, mismatchedChannelID); err != nil {
+			t.Fatalf("insert mismatched channel: %v", err)
+		}
+		fixture.AdditionalChannelIDs = append(fixture.AdditionalChannelIDs, mismatchedChannelID)
+		storedChannelID = &mismatchedChannelID
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items SET channel_profile_id = $2::uuid WHERE id = $1::uuid
+	`, promote.ID, storedChannelID); err != nil {
+		t.Fatalf("update promotion metadata: %v", err)
+	}
+	promote.ChannelProfileID = storedChannelID
+}
+
+func setHumanReviewEvidenceForTest(
+	t *testing.T,
+	ctx context.Context,
+	fixture *ChannelOpsFixture,
+	taskID string,
+	evidenceCase string,
+	publicationID string,
+	targetVisibility string,
+) {
+	t.Helper()
+	planID := "00000000-0000-0000-0000-000000000101"
+	approvedAt := fixture.Store.Now().UTC().Add(-time.Hour)
+	planStatus := "review_approved"
+	planToken := approvedAt
+	evidencePlanID := planID
+	if evidenceCase == "stale" {
+		planToken = approvedAt.Add(-time.Second)
+	}
+	if evidenceCase == "mismatched" {
+		evidencePlanID = "00000000-0000-0000-0000-000000000102"
+	}
+	if evidenceCase == "rejected" {
+		planStatus = "rejected"
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		INSERT INTO autoflow_plans (
+			id, prompt, request_json, intent_json, template_id, pipeline_definition,
+			candidates_json, metadata_json, rights_json, validation_json, status,
+			review_approved_at, created_at, updated_at
+		) VALUES (
+			$1::uuid, 'review fixture', '{}'::json, '{}'::json, 'material_library_remix',
+			'{"nodes": [], "edges": []}'::json, '[]'::json, '{}'::json,
+			'{"status": "review_required"}'::json, '{"valid": true}'::json, $2,
+			$3::timestamptz, NOW(), NOW()
+		)
+		ON CONFLICT (id) DO UPDATE
+		SET status = EXCLUDED.status, review_approved_at = EXCLUDED.review_approved_at
+	`, planID, planStatus, approvedAt); err != nil {
+		t.Fatalf("upsert AutoFlow plan: %v", err)
+	}
+	evidence := map[string]any{}
+	if evidenceCase != "missing" && evidenceCase != "agent_only" {
+		evidence["pre_upload"] = map[string]any{
+			"kind":                    "human_review",
+			"scope":                   "external_asset_pre_upload",
+			"human_actor":             "operator@example.com",
+			"reviewed_at":             planToken.Format(time.RFC3339Nano),
+			"autoflow_plan_id":        evidencePlanID,
+			"plan_review_approved_at": planToken.Format(time.RFC3339Nano),
+		}
+	}
+	if evidenceCase == "valid" && publicationID != "" {
+		evidence["promotion"] = map[string]any{
+			"kind":                    "human_review",
+			"scope":                   "publication_promotion",
+			"human_actor":             "operator@example.com",
+			"reviewed_at":             fixture.Store.Now().UTC().Format(time.RFC3339Nano),
+			"production_task_id":      taskID,
+			"publication_id":          publicationID,
+			"target_visibility":       targetVisibility,
+			"autoflow_plan_id":        planID,
+			"plan_review_approved_at": approvedAt.Format(time.RFC3339Nano),
+		}
+	}
+	agentEvidence := map[string]any{}
+	if evidenceCase == "agent_only" {
+		agentEvidence = map[string]any{"approved_by": "channel_agent"}
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE production_tasks
+		SET uses_external_assets = TRUE,
+		    approval_mode = $2,
+		    autoflow_plan_id = $3::uuid,
+		    human_review_evidence_json = $4::json,
+		    agent_approval_evidence_json = $5::json
+		WHERE id = $1::uuid
+	`, taskID, ApprovalHuman, planID, mustJSON(evidence), mustJSON(agentEvidence)); err != nil {
+		t.Fatalf("set task review evidence: %v", err)
+	}
+}
+
+func waitForChannelLockOrExternalCall(
+	t *testing.T,
+	ctx context.Context,
+	fixture *ChannelOpsFixture,
+	quarantinePID int,
+	youtube *blockingPromotionYouTube,
+) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-youtube.started:
+			t.Fatal("promotion called YouTube before quarantine committed")
+		default:
+		}
+		var waiting bool
+		if err := fixture.Store.Pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_locks waiter
+				JOIN pg_locks blocker
+				  ON blocker.locktype = 'transactionid'
+				 AND blocker.transactionid = waiter.transactionid
+				 AND blocker.granted
+				WHERE waiter.locktype = 'transactionid'
+				  AND NOT waiter.granted
+				  AND blocker.pid = $1
+			)
+		`, quarantinePID).Scan(&waiting); err != nil {
+			t.Fatalf("inspect channel lock waiter: %v", err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("promotion did not wait on quarantined channel lock")
 }
 
 func countQueueChildren(t *testing.T, ctx context.Context, fixture *ChannelOpsFixture, parentID string) int {

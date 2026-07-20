@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.api.channel_agent as channel_agent_api
@@ -29,10 +30,12 @@ from app.models.channel_agent import (
     TopicLane,
 )
 from app.models.asset import Asset
+from app.models.autoflow import AutoFlowPlan
 
 
 CHANNEL_AGENT_TABLES = (
     Asset.__table__,
+    AutoFlowPlan.__table__,
     ChannelProfile.__table__,
     TopicLane.__table__,
     PublishingAccount.__table__,
@@ -49,6 +52,51 @@ CHANNEL_AGENT_TABLES = (
     DecisionAuditEntry.__table__,
     LearningState.__table__,
 )
+
+
+def _review_plan(*, status: str = "review_required", rights_status: str = "review_required") -> AutoFlowPlan:
+    return AutoFlowPlan(
+        prompt="Review this external asset plan",
+        request_json={
+            "prompt": "Review this external asset plan",
+            "target_platforms": ["youtube_shorts"],
+            "duration_sec": 30,
+            "aspect_ratio": "9:16",
+            "source_policy": "remix_with_review",
+            "publish_mode": "private_upload",
+            "material_library_ids": [],
+            "user_constraints": {},
+        },
+        intent_json={
+            "intent_type": "generic_video",
+            "subject": "external review",
+            "style": "documentary",
+            "duration_sec": 30,
+            "aspect_ratio": "9:16",
+            "target_platforms": ["youtube_shorts"],
+            "source_policy": "remix_with_review",
+            "publish_mode": "private_upload",
+            "keywords": [],
+            "negative_keywords": [],
+            "needs_voiceover": False,
+            "needs_subtitles": True,
+            "needs_bgm": False,
+            "user_confirmation_questions": [],
+        },
+        template_id="material_library_remix",
+        pipeline_definition={"nodes": [], "edges": [], "viewport": {"x": 0, "y": 0, "zoom": 1}},
+        candidates_json=[],
+        metadata_json={},
+        rights_json={
+            "status": rights_status,
+            "reasons": ["human review required"],
+            "allowed_publish_modes": ["private_upload", "unlisted_upload"],
+            "execute_allowed": True,
+            "publish_allowed": True,
+        },
+        validation_json={"valid": True, "errors": [], "warnings": [], "repairs": []},
+        status=status,
+    )
 
 
 @pytest.fixture
@@ -853,6 +901,412 @@ async def test_promote_clamps_public_desired_privacy_to_unlisted(api_session):
         assert response.status_code == 200
         queue_item = response.json()
         assert queue_item["payload_json"]["target_visibility"] == "unlisted"
+
+
+@pytest.mark.asyncio
+async def test_human_review_release_approves_exact_plan_and_enqueues_execution(api_session):
+    channel = ChannelProfile(name="review release", enabled=True, dry_run=False)
+    api_session.add(channel)
+    await api_session.flush()
+    account = PublishingAccount(
+        channel_profile_id=channel.id,
+        account_label="review account",
+        credential_ref="youtube/review",
+        default_privacy="unlisted",
+    )
+    plan = _review_plan()
+    api_session.add_all([account, plan])
+    await api_session.flush()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        source="trend_youtube",
+        prompt="review me",
+        uses_external_assets=True,
+        approval_mode="human",
+        autoflow_plan_id=plan.id,
+        state="held",
+        blocked_by_guard="human_approval_required",
+        channel_config_snapshot_json={},
+    )
+    api_session.add(task)
+    await api_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/channel-agent/tasks/{task.id}/review-release",
+            json={"human_actor": "operator@example.com", "review_notes": "assets checked"},
+        )
+
+    assert response.status_code == 200, response.text
+    await api_session.refresh(task)
+    await api_session.refresh(plan)
+    assert task.state == "planning"
+    assert task.blocked_by_guard is None
+    assert plan.review_approved_at is not None
+    evidence = task.human_review_evidence_json["pre_upload"]
+    assert evidence["kind"] == "human_review"
+    assert evidence["scope"] == "external_asset_pre_upload"
+    assert evidence["human_actor"] == "operator@example.com"
+    assert evidence["autoflow_plan_id"] == str(plan.id)
+    persisted_token = plan.review_approved_at
+    if persisted_token.tzinfo is None:
+        persisted_token = persisted_token.replace(tzinfo=timezone.utc)
+    assert datetime.fromisoformat(evidence["plan_review_approved_at"]) == persisted_token
+    assert evidence["review_notes"] == "assets checked"
+    queue_rows = (
+        await api_session.execute(
+            select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.idempotency_key == f"execute_task:{task.id}")
+        )
+    ).scalars().all()
+    assert len(queue_rows) == 1
+    assert queue_rows[0].channel_profile_id == channel.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel_enabled", "halted", "guard"),
+    [
+        (False, False, "human_approval_required"),
+        (True, True, "human_approval_required"),
+        (True, False, "automated_channelops_soak_guard"),
+        (True, False, "metrics_unavailable"),
+    ],
+)
+async def test_human_review_release_rejects_disabled_halted_or_unrelated_holds(
+    api_session,
+    channel_enabled,
+    halted,
+    guard,
+):
+    channel = ChannelProfile(
+        name="blocked release",
+        enabled=channel_enabled,
+        dry_run=False,
+        halted_at=datetime.now(timezone.utc) if halted else None,
+    )
+    api_session.add(channel)
+    await api_session.flush()
+    account = PublishingAccount(channel_profile_id=channel.id, account_label="blocked", credential_ref="youtube/x")
+    plan = _review_plan()
+    api_session.add_all([account, plan])
+    await api_session.flush()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        prompt="blocked",
+        uses_external_assets=True,
+        autoflow_plan_id=plan.id,
+        state="held",
+        blocked_by_guard=guard,
+        channel_config_snapshot_json={},
+    )
+    api_session.add(task)
+    await api_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/channel-agent/tasks/{task.id}/review-release",
+            json={"human_actor": "operator"},
+        )
+
+    assert response.status_code == 409
+    await api_session.refresh(task)
+    assert task.state == "held"
+    assert task.human_review_evidence_json == {}
+
+
+@pytest.mark.asyncio
+async def test_human_review_release_rejects_blank_actor(api_session):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/channel-agent/tasks/{uuid.uuid4()}/review-release",
+            json={"human_actor": "   "},
+        )
+    assert response.status_code in {400, 422}
+
+
+@pytest.mark.asyncio
+async def test_manual_promotion_restores_pds_held_task_and_persists_review(api_session):
+    channel = ChannelProfile(name="PDS held", enabled=True, dry_run=False)
+    api_session.add(channel)
+    await api_session.flush()
+    account = PublishingAccount(channel_profile_id=channel.id, account_label="pds", credential_ref="youtube/pds")
+    api_session.add(account)
+    await api_session.flush()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        prompt="pds held upload",
+        state="held",
+        blocked_by_guard="pds_flagged_for_review",
+        failure_category="pds",
+        channel_config_snapshot_json={},
+    )
+    api_session.add(task)
+    await api_session.flush()
+    publication = PublicationRecord(
+        production_task_id=task.id,
+        account_id=account.id,
+        platform_content_id="yt-pds-held",
+        title="pds held upload",
+        desired_privacy="unlisted",
+        current_privacy="private",
+        publish_status="uploaded",
+        compliance_disposition="owned",
+    )
+    api_session.add(publication)
+    await api_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/channel-agent/publications/{publication.id}/promote",
+            json={"human_actor": "release-operator", "review_notes": "PDS concerns reviewed"},
+        )
+
+    assert response.status_code == 200, response.text
+    await api_session.refresh(task)
+    assert task.state == "uploaded_private"
+    assert task.blocked_by_guard is None
+    evidence = task.human_review_evidence_json["promotion"]
+    assert evidence["scope"] == "publication_promotion"
+    assert evidence["human_actor"] == "release-operator"
+    assert evidence["production_task_id"] == str(task.id)
+    assert evidence["publication_id"] == str(publication.id)
+    assert evidence["target_visibility"] == "unlisted"
+    assert response.json()["payload_json"]["manual_review"] is True
+
+
+@pytest.mark.asyncio
+async def test_manual_promotion_requeues_after_prior_terminal_review_attempt(api_session):
+    channel = ChannelProfile(name="PDS retry", enabled=True, dry_run=False)
+    api_session.add(channel)
+    await api_session.flush()
+    account = PublishingAccount(channel_profile_id=channel.id, account_label="retry", credential_ref="youtube/retry")
+    api_session.add(account)
+    await api_session.flush()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        prompt="retry PDS review",
+        state="held",
+        blocked_by_guard="pds_blocked",
+        channel_config_snapshot_json={},
+    )
+    api_session.add(task)
+    await api_session.flush()
+    publication = PublicationRecord(
+        production_task_id=task.id,
+        account_id=account.id,
+        platform_content_id="yt-pds-retry",
+        title="retry",
+        desired_privacy="unlisted",
+        current_privacy="private",
+        publish_status="uploaded",
+        compliance_disposition="owned",
+    )
+    api_session.add(publication)
+    await api_session.flush()
+    prior = ChannelOpsQueueItem(
+        kind="promote_publication",
+        idempotency_key=f"promote_publication:{publication.id}:unlisted:manual-review",
+        channel_profile_id=channel.id,
+        payload_json={"publication_id": str(publication.id), "manual_review": True},
+        status="succeeded",
+    )
+    api_session.add(prior)
+    await api_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/channel-agent/publications/{publication.id}/promote",
+            json={"human_actor": "retry-operator"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "queued"
+    assert response.json()["id"] != str(prior.id)
+    queue_count = await api_session.scalar(
+        select(func.count(ChannelOpsQueueItem.id)).where(ChannelOpsQueueItem.kind == "promote_publication")
+    )
+    assert queue_count == 2
+
+
+@pytest.mark.asyncio
+async def test_manual_promotion_preserves_external_plan_review_token(api_session):
+    approved_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    channel = ChannelProfile(name="reviewed external", enabled=True, dry_run=False)
+    api_session.add(channel)
+    await api_session.flush()
+    account = PublishingAccount(
+        channel_profile_id=channel.id,
+        account_label="reviewed",
+        credential_ref="youtube/reviewed",
+        default_privacy="unlisted",
+    )
+    plan = _review_plan(status="review_approved")
+    plan.review_approved_at = approved_at
+    api_session.add_all([account, plan])
+    await api_session.flush()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        prompt="reviewed external upload",
+        uses_external_assets=True,
+        approval_mode="human",
+        autoflow_plan_id=plan.id,
+        human_review_evidence_json={
+            "pre_upload": {
+                "kind": "human_review",
+                "scope": "external_asset_pre_upload",
+                "human_actor": "preupload-operator",
+                "reviewed_at": approved_at.isoformat(),
+                "autoflow_plan_id": str(plan.id),
+                "plan_review_approved_at": approved_at.isoformat(),
+            }
+        },
+        state="uploaded_private",
+        channel_config_snapshot_json={},
+    )
+    api_session.add(task)
+    await api_session.flush()
+    publication = PublicationRecord(
+        production_task_id=task.id,
+        account_id=account.id,
+        platform_content_id="yt-reviewed-external",
+        title="reviewed external",
+        desired_privacy="unlisted",
+        current_privacy="private",
+        publish_status="uploaded",
+        compliance_disposition="known_risk_accepted",
+    )
+    api_session.add(publication)
+    await api_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/channel-agent/publications/{publication.id}/promote",
+            json={"human_actor": "promotion-operator"},
+        )
+
+    assert response.status_code == 200, response.text
+    await api_session.refresh(task)
+    promotion = task.human_review_evidence_json["promotion"]
+    assert promotion["autoflow_plan_id"] == str(plan.id)
+    assert datetime.fromisoformat(promotion["plan_review_approved_at"]) == approved_at
+    assert promotion["publication_id"] == str(publication.id)
+
+
+@pytest.mark.asyncio
+async def test_manual_promotion_rejects_external_asset_with_stale_preupload_review(api_session):
+    approved_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    channel = ChannelProfile(name="stale external", enabled=True, dry_run=False)
+    api_session.add(channel)
+    await api_session.flush()
+    account = PublishingAccount(channel_profile_id=channel.id, account_label="stale", credential_ref="youtube/stale")
+    plan = _review_plan(status="review_approved")
+    plan.review_approved_at = approved_at
+    api_session.add_all([account, plan])
+    await api_session.flush()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        prompt="stale review",
+        uses_external_assets=True,
+        autoflow_plan_id=plan.id,
+        human_review_evidence_json={
+            "pre_upload": {
+                "kind": "human_review",
+                "scope": "external_asset_pre_upload",
+                "human_actor": "operator",
+                "reviewed_at": approved_at.isoformat(),
+                "autoflow_plan_id": str(plan.id),
+                "plan_review_approved_at": (approved_at - timedelta(seconds=1)).isoformat(),
+            }
+        },
+        state="uploaded_private",
+        channel_config_snapshot_json={},
+    )
+    api_session.add(task)
+    await api_session.flush()
+    publication = PublicationRecord(
+        production_task_id=task.id,
+        account_id=account.id,
+        platform_content_id="yt-stale-external",
+        title="stale",
+        desired_privacy="unlisted",
+        current_privacy="private",
+        publish_status="uploaded",
+        compliance_disposition="known_risk_accepted",
+    )
+    api_session.add(publication)
+    await api_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/channel-agent/publications/{publication.id}/promote",
+            json={"human_actor": "operator"},
+        )
+
+    assert response.status_code == 409
+    queue_count = await api_session.scalar(
+        select(func.count(ChannelOpsQueueItem.id)).where(ChannelOpsQueueItem.kind == "promote_publication")
+    )
+    assert queue_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_state", "guard"),
+    [
+        ("held", "automated_channelops_soak_guard"),
+        ("held", "human_approval_required"),
+        ("held", "metrics_unavailable"),
+        ("held", "platform_rejected"),
+        ("rejected", None),
+    ],
+)
+async def test_manual_promotion_rejects_ineligible_held_work(api_session, task_state, guard):
+    channel = ChannelProfile(name="ineligible", enabled=True, dry_run=False)
+    api_session.add(channel)
+    await api_session.flush()
+    account = PublishingAccount(channel_profile_id=channel.id, account_label="x", credential_ref="youtube/x")
+    api_session.add(account)
+    await api_session.flush()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=account.id,
+        prompt="ineligible",
+        state=task_state,
+        blocked_by_guard=guard,
+        channel_config_snapshot_json={},
+    )
+    api_session.add(task)
+    await api_session.flush()
+    publication = PublicationRecord(
+        production_task_id=task.id,
+        account_id=account.id,
+        platform_content_id=f"yt-{uuid.uuid4()}",
+        title="ineligible",
+        desired_privacy="unlisted",
+        current_privacy="private",
+        publish_status="uploaded",
+        compliance_disposition="owned",
+    )
+    api_session.add(publication)
+    await api_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/channel-agent/publications/{publication.id}/promote",
+            json={"human_actor": "operator"},
+        )
+
+    assert response.status_code == 409
+    queue_count = await api_session.scalar(
+        select(func.count(ChannelOpsQueueItem.id)).where(ChannelOpsQueueItem.kind == "promote_publication")
+    )
+    assert queue_count == 0
 
 
 @pytest.mark.asyncio

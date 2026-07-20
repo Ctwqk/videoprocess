@@ -9,6 +9,7 @@ from typing import Iterable, Mapping
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.channel_agent.human_review import task_uses_external_assets, valid_pre_upload_evidence
 from app.models.channel_agent import (
     ChannelOpsQueueItem,
     ChannelProfile,
@@ -19,6 +20,7 @@ from app.models.channel_agent import (
     PublishingAccount,
     TopicLane,
 )
+from app.models.autoflow import AutoFlowPlan
 from app.models.youtube_upload_operation import YouTubeUploadOperation
 
 
@@ -58,7 +60,7 @@ _ALLOWED_PRIVACY = frozenset({"private", "unlisted"})
 _FAILED_TASK_STATES = frozenset({"failed", "held"})
 _FAILED_QUEUE_STATUSES = frozenset({"failed", "dead_lettered"})
 _EXTERNAL_ASSET_REVIEW_STATES = frozenset(
-    {"uploaded_private", "scheduled", "published", "measured"}
+    {"planning", "producing", "uploaded_private", "scheduled", "published", "measured"}
 )
 _STALE_UPLOAD_STATUSES = frozenset({"reserved", "submitted"})
 _FUTURE_START_TOLERANCE = timedelta(seconds=300)
@@ -209,12 +211,32 @@ async def assess_channelops_soak(
         .all()
     )
     failed_tasks = [task for task in tasks if task.state in _FAILED_TASK_STATES]
+    external_plan_ids = {
+        task.autoflow_plan_id
+        for task in tasks
+        if task_uses_external_assets(task)
+        and task.state in _EXTERNAL_ASSET_REVIEW_STATES
+        and task.autoflow_plan_id is not None
+    }
+    plans_by_id: dict[uuid.UUID, AutoFlowPlan] = {}
+    if external_plan_ids:
+        plans = list(
+            (
+                await db.execute(select(AutoFlowPlan).where(AutoFlowPlan.id.in_(external_plan_ids)))
+            )
+            .scalars()
+            .all()
+        )
+        plans_by_id = {plan.id: plan for plan in plans}
     external_review_violations = [
         task
         for task in tasks
-        if task.uses_external_assets
+        if task_uses_external_assets(task)
         and task.state in _EXTERNAL_ASSET_REVIEW_STATES
-        and task.approval_mode != "human"
+        and not valid_pre_upload_evidence(
+            task,
+            plans_by_id.get(task.autoflow_plan_id) if task.autoflow_plan_id is not None else None,
+        )
     ]
     metrics["production_task_count"] = len(tasks)
     metrics["production_task_failure_count"] = len(failed_tasks)

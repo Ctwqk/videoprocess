@@ -239,6 +239,7 @@ class ProductionTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     uses_external_assets: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     approval_mode: Mapped[str] = mapped_column(String(16), default="agent", nullable=False)
     agent_approval_evidence_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    human_review_evidence_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     autoflow_plan_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     autoflow_run_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     pipeline_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)

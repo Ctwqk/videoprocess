@@ -129,12 +129,43 @@ This is a pre-upload human-review gate for private and unlisted workflows too;
 it is not only a public-promotion check. The Go runner must not execute, upload,
 or promote those tasks until an explicit human review path releases them.
 
+Release a task held by `human_approval_required` through the Channel Agent API:
+
+```bash
+curl -X POST "$VP_API_URL/api/v1/channel-agent/tasks/$TASK_ID/review-release" \
+  -H 'Content-Type: application/json' \
+  -d '{"human_actor":"operator@example.com","review_notes":"source and rights reviewed"}'
+```
+
+The API approves that task's exact AutoFlow plan, records the plan's current
+`review_approved_at` token, transitions the task to `planning`, and enqueues
+`execute_task`. Any approval-relevant AutoFlow patch resets the token and makes
+the evidence stale. Disabled or halted channels and unrelated holds cannot be
+released through this endpoint.
+
+After a reviewed external upload reaches `uploaded_private`, or when PDS has
+explicitly held an uploaded publication for review, promote it with:
+
+```bash
+curl -X POST "$VP_API_URL/api/v1/channel-agent/publications/$PUBLICATION_ID/promote" \
+  -H 'Content-Type: application/json' \
+  -d '{"human_actor":"operator@example.com","review_notes":"publication reviewed"}'
+```
+
+The request body remains optional for compatibility and defaults the actor to
+`channel_agent_operator`. Manual promotion records publication-specific review
+evidence, restores only eligible PDS-held tasks to `uploaded_private`, clamps
+visibility to `private` or `unlisted`, and still runs the PDS publication gate.
+Quarantine, pre-upload review, metrics, platform-error, disabled, halted, and
+rejected holds are not eligible.
+
 ## Soak Activation Window
 
 The soak guard and watcher reject `VP_SOAK_STARTED_AT` values more than 300
 seconds after assessment time. The five-minute tolerance is only for clock skew;
-a value exactly 300 seconds ahead is accepted. Future-window rejection is a
-configuration error and occurs before topology checks or database assessment.
+a value exactly 300 seconds ahead is accepted, while any positive fractional
+part beyond 300 seconds is rejected. Future-window rejection is a configuration
+error and occurs before topology checks or database assessment.
 
 ## Watcher Image CLI Smoke
 

@@ -516,3 +516,8 @@ def test_alembic_upgrade_head_renders_offline_postgresql_sql():
         assert f"substr(manager_task_id, {position}, 1) = '-'" in completed.stdout
     for character in "0123456789abcdef":
         assert f", '{character}', '')" in completed.stdout
+
+    assert "ADD COLUMN human_review_evidence_json JSON" in completed.stdout
+    assert "UPDATE channel_ops_queue_items AS q" in completed.stdout
+    assert "authoritative_channel_id" in completed.stdout
+    assert "queue_authority_unresolved" in completed.stdout

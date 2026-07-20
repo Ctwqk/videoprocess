@@ -168,12 +168,13 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		return ProductionTaskRow{}, err
 	}
 	var row ProductionTaskRow
-	var rationaleJSON, scoreJSON, sourcePlatformsJSON, materialIDsJSON, transitionJSON, snapshotJSON []byte
+	var rationaleJSON, scoreJSON, sourcePlatformsJSON, materialIDsJSON, humanReviewJSON, transitionJSON, snapshotJSON []byte
 	err := s.db().QueryRow(ctx, `
 		SELECT id, channel_profile_id, topic_lane_id, lane_format_id, target_account_id,
 		       manual_seed_id, discovery_signal_id, source, title_seed, prompt, rationale_json,
 		       score_breakdown_json, source_platforms_json, material_library_ids_json,
-		       uses_external_assets, approval_mode, autoflow_plan_id, autoflow_run_id, job_id, state,
+		       uses_external_assets, approval_mode, human_review_evidence_json,
+		       autoflow_plan_id, autoflow_run_id, job_id, state,
 		       blocked_by_guard, failure_reason, failure_category, transition_history_json,
 		       channel_config_version_snapshot, channel_config_snapshot_json,
 		       state_updated_at
@@ -196,6 +197,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		&materialIDsJSON,
 		&row.UsesExternalAssets,
 		&row.ApprovalMode,
+		&humanReviewJSON,
 		&row.AutoFlowPlanID,
 		&row.AutoFlowRunID,
 		&row.JobID,
@@ -222,6 +224,9 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 	}
 	if err := unmarshalJSONStringSlice(materialIDsJSON, &row.MaterialLibraryIDsJSON); err != nil {
 		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.material_library_ids_json: %w", err)
+	}
+	if err := unmarshalJSONObject(humanReviewJSON, &row.HumanReviewEvidenceJSON); err != nil {
+		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.human_review_evidence_json: %w", err)
 	}
 	if err := unmarshalJSONMapSlice(transitionJSON, &row.TransitionHistoryJSON); err != nil {
 		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.transition_history_json: %w", err)

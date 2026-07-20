@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.autoflow.service import autoflow_service
 from app.channel_agent.clock import Clock
 from app.channel_agent.constants import (
     ACTIVE_TASK_STATES,
@@ -21,9 +22,17 @@ from app.channel_agent.constants import (
     TASK_UPLOADED_PRIVATE,
 )
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
+from app.channel_agent.human_review import (
+    build_pre_upload_evidence,
+    build_promotion_evidence,
+    merge_human_review_evidence,
+    task_uses_external_assets,
+    valid_pre_upload_evidence,
+)
 from app.config import settings
 from app.db import get_db
 from app.models.asset import Asset
+from app.models.autoflow import AutoFlowPlan
 from app.models.channel_agent import (
     AgentTickAudit,
     ChannelOpsQueueItem,
@@ -64,6 +73,11 @@ class HaltRequest(BaseModel):
 class PauseRequest(BaseModel):
     reason: str = "operator"
     until: datetime | None = None
+
+
+class HumanReviewRequest(BaseModel):
+    human_actor: str = "channel_agent_operator"
+    review_notes: str | None = None
 
 
 @router.post("/channels")
@@ -582,24 +596,181 @@ async def resume_lane(lane_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/publications/{publication_id}/promote")
-async def promote_publication(publication_id: str, db: AsyncSession = Depends(get_db)):
+async def promote_publication(
+    publication_id: str,
+    data: HumanReviewRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    review = data or HumanReviewRequest()
+    human_actor = review.human_actor.strip()
+    if not human_actor:
+        raise HTTPException(status_code=400, detail="human_actor must be nonblank")
     publication, task = await _publication_with_task(db, publication_id)
-    if publication.publish_status != "uploaded" or task.state not in {TASK_UPLOADED_PRIVATE, TASK_HELD}:
+    channel = await db.get(ChannelProfile, task.channel_profile_id)
+    if channel is None or not channel.enabled or channel.halted_at is not None:
+        raise HTTPException(status_code=409, detail="Channel is disabled or halted")
+    eligible_pds_hold = task.state == TASK_HELD and task.blocked_by_guard in {
+        "pds_blocked",
+        "pds_flagged_for_review",
+    }
+    if publication.publish_status != "uploaded" or not (
+        task.state == TASK_UPLOADED_PRIVATE or eligible_pds_hold
+    ):
         raise HTTPException(status_code=409, detail="Publication is not ready for promotion")
     target_visibility = _safe_promotion_visibility(publication.desired_privacy)
-    item = await ChannelOpsQueueService().enqueue(
+    plan = await db.get(AutoFlowPlan, task.autoflow_plan_id) if task.autoflow_plan_id else None
+    if task_uses_external_assets(task) and not valid_pre_upload_evidence(task, plan):
+        raise HTTPException(status_code=409, detail="External asset review evidence is missing or stale")
+    if plan is not None and plan.review_approved_at is None:
+        plan = None
+    now = datetime.now(timezone.utc)
+    try:
+        promotion_evidence = build_promotion_evidence(
+            task=task,
+            publication_id=publication.id,
+            target_visibility=target_visibility,
+            human_actor=human_actor,
+            reviewed_at=now,
+            review_notes=review.review_notes,
+            plan=plan,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    task.human_review_evidence_json = merge_human_review_evidence(
+        task.human_review_evidence_json,
+        "promotion",
+        promotion_evidence,
+    )
+    if eligible_pds_hold:
+        previous_state = task.state
+        task.state = TASK_UPLOADED_PRIVATE
+        task.blocked_by_guard = None
+        task.failure_reason = None
+        task.failure_category = None
+        task.state_updated_at = now
+        task.transition_history_json = [
+            *list(task.transition_history_json or []),
+            {
+                "from": previous_state,
+                "to": TASK_UPLOADED_PRIVATE,
+                "reason": "manual_promotion_review",
+                "at": now.isoformat(),
+            },
+        ]
+    queue = ChannelOpsQueueService()
+    base_idempotency_key = f"promote_publication:{publication.id}:{target_visibility}:manual-review"
+    prior_attempt = await queue.get_by_key(db, base_idempotency_key)
+    idempotency_key = base_idempotency_key
+    if prior_attempt is not None and prior_attempt.status not in {"queued", "running"}:
+        review_token = now.strftime("%Y%m%dT%H%M%S%fZ")
+        idempotency_key = f"{base_idempotency_key}:{review_token}"
+    item = await queue.enqueue(
         db,
         kind="promote_publication",
-        idempotency_key=f"promote_publication:{publication.id}:{target_visibility}:manual",
+        idempotency_key=idempotency_key,
         payload={
             "publication_id": str(publication.id),
             "target_visibility": target_visibility,
             "channel_profile_id": str(task.channel_profile_id),
+            "manual_review": True,
         },
         priority=70,
         channel_profile_id=task.channel_profile_id,
+        commit=False,
     )
+    await db.commit()
+    await db.refresh(item)
     return _queue(item)
+
+
+@router.post("/tasks/{task_id}/review-release")
+async def release_human_review(
+    task_id: str,
+    data: HumanReviewRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    human_actor = data.human_actor.strip()
+    if not human_actor:
+        raise HTTPException(status_code=400, detail="human_actor must be nonblank")
+    task = await db.get(ProductionTask, _uuid(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="Production task not found")
+    channel = await db.get(ChannelProfile, task.channel_profile_id)
+    if channel is None or not channel.enabled or channel.halted_at is not None:
+        raise HTTPException(status_code=409, detail="Channel is disabled or halted")
+    if task.state != TASK_HELD or task.blocked_by_guard != "human_approval_required":
+        raise HTTPException(status_code=409, detail="Task is not held for human review")
+    if task.autoflow_plan_id is None:
+        raise HTTPException(status_code=409, detail="Task has no AutoFlow plan to review")
+    try:
+        approved = await autoflow_service.approve(
+            str(task.autoflow_plan_id),
+            db,
+            review_notes=data.review_notes,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if approved is None or str(approved.plan_id) != str(task.autoflow_plan_id):
+        raise HTTPException(status_code=409, detail="Task AutoFlow plan was not found")
+    approved_plan = await db.get(AutoFlowPlan, task.autoflow_plan_id)
+    if approved_plan is None:
+        raise HTTPException(status_code=409, detail="Task AutoFlow plan was not found")
+    await db.refresh(approved_plan)
+    try:
+        evidence = build_pre_upload_evidence(
+            plan=approved_plan,
+            human_actor=human_actor,
+            review_notes=data.review_notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    review_approved_at = approved_plan.review_approved_at
+    if review_approved_at is None:
+        raise HTTPException(status_code=409, detail="AutoFlow plan has no human review approval token")
+    now = datetime.now(timezone.utc)
+    previous_state = task.state
+    task.approval_mode = "human"
+    task.human_review_evidence_json = merge_human_review_evidence(
+        task.human_review_evidence_json,
+        "pre_upload",
+        evidence,
+    )
+    task.state = "planning"
+    task.blocked_by_guard = None
+    task.failure_reason = None
+    task.failure_category = None
+    task.state_updated_at = now
+    task.transition_history_json = [
+        *list(task.transition_history_json or []),
+        {
+            "from": previous_state,
+            "to": "planning",
+            "reason": "human_review_release",
+            "at": now.isoformat(),
+        },
+    ]
+    queue = ChannelOpsQueueService()
+    base_idempotency_key = f"execute_task:{task.id}"
+    prior_attempt = await queue.get_by_key(db, base_idempotency_key)
+    idempotency_key = base_idempotency_key
+    if prior_attempt is not None and prior_attempt.status not in {"queued", "running"}:
+        review_token = review_approved_at.strftime("%Y%m%dT%H%M%S%fZ")
+        idempotency_key = f"{base_idempotency_key}:{review_token}"
+    await queue.enqueue(
+        db,
+        kind="execute_task",
+        idempotency_key=idempotency_key,
+        payload={
+            "production_task_id": str(task.id),
+            "autoflow_plan_id": str(task.autoflow_plan_id),
+        },
+        priority=100,
+        channel_profile_id=task.channel_profile_id,
+        commit=False,
+    )
+    await db.commit()
+    await db.refresh(task)
+    return _task(task)
 
 
 @router.post("/publications/{publication_id}/reject")
@@ -915,6 +1086,9 @@ def _task(row: ProductionTask) -> dict[str, Any]:
         "blocked_by_guard": row.blocked_by_guard,
         "failure_reason": row.failure_reason,
         "failure_category": row.failure_category,
+        "approval_mode": row.approval_mode,
+        "human_review_evidence_json": row.human_review_evidence_json or {},
+        "autoflow_plan_id": str(row.autoflow_plan_id) if row.autoflow_plan_id else None,
         "discovery_signal_id": str(row.discovery_signal_id) if row.discovery_signal_id else None,
     }
 

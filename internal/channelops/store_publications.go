@@ -33,9 +33,6 @@ func (s *Store) CreateOrUpdatePublicationFromTask(ctx context.Context, task Prod
 		compliance = "assumed_fair_use"
 	}
 	status := "uploaded"
-	if taskUsesExternalAssets(task) && !account.ExternalAutoPublish {
-		status = "held"
-	}
 
 	var publicationID string
 	err = s.db().QueryRow(ctx, `
@@ -81,14 +78,14 @@ func (s *Store) CreateOrUpdatePublicationFromTask(ctx context.Context, task Prod
 		return err
 	}
 
-	if status == "held" {
-		return s.HoldTask(ctx, task.ID, "external_asset_auto_publish_required", "External platform assets require human review before publication", "publish_task")
-	}
 	if err := s.writeMaterialUsageLedgerFromTask(ctx, task, publicationID, now); err != nil {
 		return err
 	}
 	if err := s.markTaskUploadedPrivate(ctx, task.ID, now); err != nil {
 		return err
+	}
+	if taskUsesExternalAssets(task) {
+		return nil
 	}
 	parentID, err := optionalUUID("parent_queue_item_id", parentQueueItemID)
 	if err != nil {

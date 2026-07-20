@@ -160,6 +160,7 @@ type ProductionTaskRow struct {
 	MaterialLibraryIDsJSON       []string
 	UsesExternalAssets           bool
 	ApprovalMode                 string
+	HumanReviewEvidenceJSON      map[string]any
 	AutoFlowPlanID               *string
 	AutoFlowRunID                *string
 	JobID                        *string

@@ -498,14 +498,15 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 			manual_seed_id, discovery_signal_id, source, title_seed, prompt, rationale_json,
 			score_breakdown_json, portfolio_bucket, source_platforms_json,
 			material_library_ids_json, uses_external_assets, approval_mode,
-			agent_approval_evidence_json, priority, state, state_updated_at, retry_count,
+			agent_approval_evidence_json, human_review_evidence_json,
+			priority, state, state_updated_at, retry_count,
 			channel_config_version_snapshot, channel_config_snapshot_json,
 			transition_history_json, created_at, updated_at
 		)
 		VALUES (
 			gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7, $8, $9,
 			$10::json, $11::json, 'explore', $12::json, $13::json,
-			$14, $15, '{}'::json, 0.0, $16, $17::timestamptz, 0, $18, $19::json,
+			$14, $15, '{}'::json, '{}'::json, 0.0, $16, $17::timestamptz, 0, $18, $19::json,
 			$20::json, $17::timestamp, $17::timestamp
 		)
 		RETURNING id

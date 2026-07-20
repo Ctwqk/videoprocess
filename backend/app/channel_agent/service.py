@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent.alerts import build_alert_payload
 from app.channel_agent.clock import Clock
+from app.channel_agent.human_review import valid_pre_upload_evidence, valid_promotion_evidence
 from app.channel_agent.candidate_scoring import score_candidate
 from app.channel_agent.clients import (
     AutoFlowClient,
@@ -968,6 +969,20 @@ class ChannelAgentService:
             return task
 
         task.autoflow_plan_id = uuid.UUID(observation.plan_id)
+        if self._uses_external_assets(task):
+            previous_state = task.state
+            task.approval_mode = "human"
+            task.state = TASK_HELD
+            task.blocked_by_guard = "human_approval_required"
+            task.failure_reason = "AutoFlow plan requires human approval before execution"
+            task.state_updated_at = self.clock.now()
+            task.transition_history_json = [
+                *list(task.transition_history_json or []),
+                _transition(previous_state, TASK_HELD, "plan_task_human_approval", self.clock.now()),
+            ]
+            await db.commit()
+            await db.refresh(task)
+            return task
         if task.approval_mode == "agent":
             account = await db.get(PublishingAccount, task.target_account_id)
             decision = await self._decide_pds(
@@ -1011,6 +1026,8 @@ class ChannelAgentService:
 
     async def handle_execute_task(self, db: AsyncSession, item: ChannelOpsQueueItem) -> ProductionTask:
         task = await self._task_from_item(db, item)
+        if await self._hold_invalid_external_review(db, task, "execute_task_human_review"):
+            return task
         if task.autoflow_run_id and task.job_id:
             run_id = str(task.autoflow_run_id)
             job_id = str(task.job_id)
@@ -1196,6 +1213,8 @@ class ChannelAgentService:
 
     async def handle_publish_task(self, db: AsyncSession, item: ChannelOpsQueueItem) -> PublicationRecord | None:
         task = await self._task_from_item(db, item)
+        if await self._hold_invalid_external_review(db, task, "publish_task_human_review"):
+            return None
         account = await db.get(PublishingAccount, task.target_account_id)
         if account is None:
             raise ValueError("Publishing account not found")
@@ -1271,14 +1290,6 @@ class ChannelAgentService:
             references=material_references,
         )
 
-        if self._uses_external_assets(task) and not account.external_asset_auto_publish:
-            task.state = TASK_HELD
-            task.blocked_by_guard = "external_asset_auto_publish_required"
-            publication.publish_status = "held"
-            await db.commit()
-            await db.refresh(publication)
-            return publication
-
         try:
             thumbnail = await self.minimax_client.generate_thumbnail(prompt=task.prompt, title=publication.title)
             publication.thumbnail_storage_path = str(thumbnail.get("storage_path") or thumbnail.get("image_url") or "")
@@ -1287,6 +1298,10 @@ class ChannelAgentService:
 
         task.state = TASK_UPLOADED_PRIVATE
         task.state_updated_at = self.clock.now()
+        if self._uses_external_assets(task):
+            await db.commit()
+            await db.refresh(publication)
+            return publication
         scheduled = self.clock.now() + timedelta(hours=1)
         await self.queue.enqueue(
             db,
@@ -1320,6 +1335,21 @@ class ChannelAgentService:
             raise ValueError("Publication is not ready for promotion")
         scheduled_at = _parse_datetime(str(item.payload_json.get("scheduled_at") or self.clock.now().isoformat()))
         visibility = _safe_privacy(item.payload_json.get("target_visibility") or publication.desired_privacy) or "unlisted"
+        external_assets = self._uses_external_assets(task)
+        plan = await db.get(AutoFlowPlanModel, task.autoflow_plan_id) if task.autoflow_plan_id else None
+        requires_promotion_review = external_assets or bool(item.payload_json.get("manual_review"))
+        if external_assets and not valid_pre_upload_evidence(task, plan):
+            await self._hold_task_for_review(db, task, "promote_publication_human_review")
+            return publication
+        if requires_promotion_review and not valid_promotion_evidence(
+            task,
+            plan,
+            publication_id=publication.id,
+            target_visibility=visibility,
+            require_plan=external_assets,
+        ):
+            await self._hold_task_for_review(db, task, "promote_publication_human_review")
+            return publication
         promotion_metadata = {
             "task_id": str(task.id),
             "publication_id": str(publication.id),
@@ -1351,7 +1381,6 @@ class ChannelAgentService:
             ),
         )
         if decision.verdict in {"block", "flag"}:
-            publication.publish_status = "held"
             previous_state = task.state
             task.state = TASK_HELD
             task.state_updated_at = self.clock.now()
@@ -1360,6 +1389,9 @@ class ChannelAgentService:
                 _transition(previous_state, TASK_HELD, "pds_gate", self.clock.now()),
             ]
             marker = "pds_blocked" if decision.verdict == "block" else "pds_flagged_for_review"
+            task.blocked_by_guard = marker
+            task.failure_reason = f"PDS verdict: {decision.verdict}"
+            task.failure_category = "pds"
             publication.warnings_json = [
                 *list(publication.warnings_json or []),
                 f"{marker}:{decision.decision_id}",
@@ -2058,6 +2090,38 @@ class ChannelAgentService:
 
     def _uses_external_assets(self, task: ProductionTask) -> bool:
         return bool(task.uses_external_assets) or bool(self._effective_source_platforms(task))
+
+    async def _hold_invalid_external_review(
+        self,
+        db: AsyncSession,
+        task: ProductionTask,
+        transition_reason: str,
+    ) -> bool:
+        if not self._uses_external_assets(task):
+            return False
+        plan = await db.get(AutoFlowPlanModel, task.autoflow_plan_id) if task.autoflow_plan_id else None
+        if valid_pre_upload_evidence(task, plan):
+            return False
+        await self._hold_task_for_review(db, task, transition_reason)
+        return True
+
+    async def _hold_task_for_review(
+        self,
+        db: AsyncSession,
+        task: ProductionTask,
+        transition_reason: str,
+    ) -> None:
+        previous_state = task.state
+        task.state = TASK_HELD
+        task.blocked_by_guard = "human_review_evidence_invalid"
+        task.failure_reason = "External asset human review evidence is missing or stale"
+        task.state_updated_at = self.clock.now()
+        task.transition_history_json = [
+            *list(task.transition_history_json or []),
+            _transition(previous_state, TASK_HELD, transition_reason, self.clock.now()),
+        ]
+        await db.commit()
+        await db.refresh(task)
 
 
 def _snapshot(

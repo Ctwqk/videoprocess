@@ -60,6 +60,15 @@ rfc3339_utc_epoch() {
     || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$normalized" +%s 2>/dev/null
 }
 
+rfc3339_has_positive_fraction() {
+  local value="$1"
+  local fraction
+  [[ "$value" == *.*Z ]] || return 1
+  fraction="${value#*.}"
+  fraction="${fraction%Z}"
+  [[ "$fraction" =~ [1-9] ]]
+}
+
 sync_root="${DEPLOY_GITHUB_SYNC_ROOT:-/home/taiwei/deploy-github-sync}"
 state_file="$sync_root/state/vp-soak-watch.env"
 
@@ -96,7 +105,8 @@ if ! started_at_epoch="$(rfc3339_utc_epoch "$started_at")"; then
   configuration_error invalid_started_at
 fi
 now_epoch="$(date -u +%s)"
-if (( started_at_epoch > now_epoch + 300 )); then
+if (( started_at_epoch > now_epoch + 300 )) \
+  || { (( started_at_epoch == now_epoch + 300 )) && rfc3339_has_positive_fraction "$started_at"; }; then
   configuration_error future_started_at
 fi
 if ! is_positive_integer "$max_publications"; then

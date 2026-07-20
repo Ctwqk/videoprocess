@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.channel_agent.clock import FakeClock
@@ -2296,7 +2296,7 @@ async def test_publish_task_observes_upload_and_auto_enqueues_promote(service_se
 
 
 @pytest.mark.asyncio
-async def test_publish_task_holds_when_external_platforms_come_from_snapshot(service_session):
+async def test_publish_task_rejects_snapshot_external_assets_without_human_evidence(service_session):
     channel, lane, account, _lane_format = await _channel_graph(
         service_session,
         dry_run=False,
@@ -2327,10 +2327,11 @@ async def test_publish_task_holds_when_external_platforms_come_from_snapshot(ser
     publication = await _service().handle_publish_task(service_session, item)
     await service_session.refresh(task)
 
-    assert publication is not None
+    assert publication is None
     assert task.state == "held"
-    assert task.blocked_by_guard == "external_asset_auto_publish_required"
-    assert publication.publish_status == "held"
+    assert task.blocked_by_guard == "human_review_evidence_invalid"
+    publication_count = await service_session.scalar(select(func.count(PublicationRecord.id)))
+    assert publication_count == 0
 
 
 @pytest.mark.asyncio
@@ -2691,8 +2692,10 @@ async def test_promote_publication_holds_when_pds_blocks(service_session):
     result = await _service(youtube=youtube, pds=pds).handle_promote_publication(service_session, item)
     await service_session.refresh(task)
 
-    assert result.publish_status == "held"
+    assert result.publish_status == "uploaded"
     assert task.state == "held"
+    assert task.blocked_by_guard == "pds_blocked"
+    assert task.failure_category == "pds"
     assert "pds_blocked:decision-block" in list(result.warnings_json or [])
     assert youtube.scheduled == []
     assert pds.requests
