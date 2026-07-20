@@ -170,16 +170,20 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 	var row ProductionTaskRow
 	var rationaleJSON, scoreJSON, sourcePlatformsJSON, materialIDsJSON, humanReviewJSON, transitionJSON, snapshotJSON []byte
 	err := s.db().QueryRow(ctx, `
-		SELECT id, channel_profile_id, topic_lane_id, lane_format_id, target_account_id,
-		       manual_seed_id, discovery_signal_id, source, title_seed, prompt, rationale_json,
-		       score_breakdown_json, source_platforms_json, material_library_ids_json,
-		       uses_external_assets, approval_mode, human_review_evidence_json,
-		       autoflow_plan_id, autoflow_run_id, job_id, state,
-		       blocked_by_guard, failure_reason, failure_category, transition_history_json,
-		       channel_config_version_snapshot, channel_config_snapshot_json,
-		       state_updated_at
-		FROM production_tasks
-		WHERE id = $1::uuid
+		SELECT task.id, task.channel_profile_id, task.topic_lane_id, task.lane_format_id,
+		       task.target_account_id, task.manual_seed_id, task.discovery_signal_id,
+		       task.source, task.title_seed, task.prompt, task.rationale_json,
+		       task.score_breakdown_json, task.source_platforms_json,
+		       task.material_library_ids_json, task.uses_external_assets,
+		       task.approval_mode, task.human_review_evidence_json,
+		       task.autoflow_plan_id, plan.approved_revision_hash,
+		       task.autoflow_run_id, task.job_id, task.state, task.blocked_by_guard,
+		       task.failure_reason, task.failure_category, task.transition_history_json,
+		       task.channel_config_version_snapshot, task.channel_config_snapshot_json,
+		       task.state_updated_at
+		FROM production_tasks AS task
+		LEFT JOIN autoflow_plans AS plan ON plan.id = task.autoflow_plan_id
+		WHERE task.id = $1::uuid
 	`, taskID).Scan(
 		&row.ID,
 		&row.ChannelProfileID,
@@ -199,6 +203,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		&row.ApprovalMode,
 		&humanReviewJSON,
 		&row.AutoFlowPlanID,
+		&row.AutoFlowApprovedRevisionHash,
 		&row.AutoFlowRunID,
 		&row.JobID,
 		&row.State,

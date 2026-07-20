@@ -10,7 +10,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-var ErrChannelExecutionBlocked = errors.New("channel execution blocked")
+var (
+	ErrChannelExecutionBlocked = errors.New("channel execution blocked")
+	ErrQueueAuthorityInvalid   = errors.New("queue authority invalid")
+)
 
 func (s *Store) WithQueueExecutionFence(ctx context.Context, item QueueItemRow, dispatch func(*Store) error) error {
 	tx, err := s.Pool.Begin(ctx)
@@ -29,10 +32,17 @@ func (s *Store) WithQueueExecutionFence(ctx context.Context, item QueueItemRow, 
 		return err
 	}
 	if channelID != nil {
-		if item.ChannelProfileID != nil && !strings.EqualFold(*item.ChannelProfileID, *channelID) {
+		if item.ChannelProfileID == nil {
+			return fmt.Errorf(
+				"%w: stored channel is null, authoritative channel %s",
+				ErrQueueAuthorityInvalid,
+				*channelID,
+			)
+		}
+		if !strings.EqualFold(*item.ChannelProfileID, *channelID) {
 			return fmt.Errorf(
 				"%w: queue authority mismatch: stored channel %s, authoritative channel %s",
-				ErrChannelExecutionBlocked,
+				ErrQueueAuthorityInvalid,
 				*item.ChannelProfileID,
 				*channelID,
 			)
@@ -115,14 +125,23 @@ func resolveQueueAuthority(ctx context.Context, db dbExecutor, item QueueItemRow
 		if err := requireUUID("channel_id", channelID); err != nil {
 			return nil, queueAuthorityError(item, err)
 		}
+		err = db.QueryRow(ctx, `
+			SELECT id::text FROM channel_profiles WHERE id = $1::uuid
+		`, channelID).Scan(&channelID)
 	case QueueSendAlert:
 		channelID = firstString(item.PayloadJSON, "channel_id")
 		if channelID == "" {
-			return nil, nil
+			if item.ChannelProfileID == nil {
+				return nil, nil
+			}
+			channelID = *item.ChannelProfileID
 		}
 		if err := requireUUID("channel_id", channelID); err != nil {
 			return nil, queueAuthorityError(item, err)
 		}
+		err = db.QueryRow(ctx, `
+			SELECT id::text FROM channel_profiles WHERE id = $1::uuid
+		`, channelID).Scan(&channelID)
 	case QueueCleanupExpired:
 		return nil, nil
 	default:
@@ -138,7 +157,7 @@ func resolveQueueAuthority(ctx context.Context, db dbExecutor, item QueueItemRow
 }
 
 func queueAuthorityError(item QueueItemRow, cause error) error {
-	return fmt.Errorf("%w: queue authority unresolved for %s %s: %v", ErrChannelExecutionBlocked, item.Kind, item.ID, cause)
+	return fmt.Errorf("%w: queue authority unresolved for %s %s: %v", ErrQueueAuthorityInvalid, item.Kind, item.ID, cause)
 }
 
 func lockExecutableChannel(ctx context.Context, db dbExecutor, channelID string) error {

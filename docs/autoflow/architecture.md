@@ -67,6 +67,13 @@ Execution is separate:
   a real pipeline/job.
 - With a database and `execute=true`, the service creates a pipeline, creates a
   job, and defers or dispatches through the normal job runtime.
+- `POST /api/v1/autoflow/execute` accepts an optional `idempotency_key`. Keyed
+  execution requires the plan's current `approved_revision_hash`; the run
+  reservation, pipeline, job, plan status, and schedule decision commit in one
+  transaction. A replay returns the existing run and never schedules a second
+  background start. Legacy callers that omit the key retain the prior behavior.
+- An idempotency key is bound to one exact plan and approved revision. Reusing
+  it for another plan or a newly approved revision fails closed.
 
 ## Safety Invariants
 
@@ -76,6 +83,9 @@ Execution is separate:
 - Default request safety is `source_policy=owned_only` and
   `publish_mode=preview_only`.
 - Public publishing must require explicit review.
+- Human and agent approvals authorize only the canonical execution revision
+  recorded in `approved_revision_hash`; execution-relevant edits clear all
+  approval tokens until the plan is reviewed again.
 - External URL candidates may be used for research/preview, but require human
   review before publication.
 - Upload nodes must default to `private` or `unlisted`.

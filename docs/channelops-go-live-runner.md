@@ -137,11 +137,17 @@ curl -X POST "$VP_API_URL/api/v1/channel-agent/tasks/$TASK_ID/review-release" \
   -d '{"human_actor":"operator@example.com","review_notes":"source and rights reviewed"}'
 ```
 
-The API approves that task's exact AutoFlow plan, records the plan's current
-`review_approved_at` token, transitions the task to `planning`, and enqueues
-`execute_task`. Any approval-relevant AutoFlow patch resets the token and makes
-the evidence stale. Disabled or halted channels and unrelated holds cannot be
-released through this endpoint.
+The API approves that task's exact AutoFlow plan, records both the current
+`review_approved_at` token and `approved_revision_hash`, transitions the task
+to `planning`, and enqueues `execute_task` in the same transaction. Any
+execution-relevant AutoFlow change clears approval and makes the evidence
+stale. Disabled or halted channels and unrelated holds cannot be released
+through this endpoint.
+
+Every Go `execute_task` retry sends
+`channelops-execute:<task-id>:<plan-id>:<approved-revision-hash>` as the AutoFlow
+execute idempotency key. A lost HTTP response therefore reuses the one durable
+run, pipeline, and job rather than starting a second job.
 
 After a reviewed external upload reaches `uploaded_private`, or when PDS has
 explicitly held an uploaded publication for review, promote it with:

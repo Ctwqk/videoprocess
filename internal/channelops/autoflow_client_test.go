@@ -85,7 +85,10 @@ func TestHTTPAutoFlowApprovePlanPostsReviewNotes(t *testing.T) {
 
 func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 	planID := "plan-from-task"
+	approvedRevisionHash := "approved-revision-hash"
+	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
 		if r.Method != http.MethodPost {
 			t.Fatalf("method = %s", r.Method)
 		}
@@ -102,13 +105,22 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 		if payload["execute"] != true {
 			t.Fatalf("execute = %#v", payload["execute"])
 		}
+		wantKey := "channelops-execute:task-1:" + planID + ":" + approvedRevisionHash
+		if payload["idempotency_key"] != wantKey {
+			t.Fatalf("idempotency_key = %#v, want %q", payload["idempotency_key"], wantKey)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"run_id":"run-1","job_id":"job-1","status":"pending"}`))
 	}))
 	defer server.Close()
 
 	client := HTTPAutoFlowClient{BaseURL: server.URL}
-	observation, err := client.ExecuteTask(context.Background(), ProductionTaskRow{ID: "task-1", AutoFlowPlanID: &planID}, nil)
+	task := ProductionTaskRow{
+		ID:                           "task-1",
+		AutoFlowPlanID:               &planID,
+		AutoFlowApprovedRevisionHash: &approvedRevisionHash,
+	}
+	observation, err := client.ExecuteTask(context.Background(), task, nil)
 	if err != nil {
 		t.Fatalf("ExecuteTask returned error: %v", err)
 	}
@@ -118,10 +130,31 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 	if observation.RunPayload["run_id"] != "run-1" {
 		t.Fatalf("RunPayload = %#v", observation.RunPayload)
 	}
+	replay, err := client.ExecuteTask(context.Background(), task, nil)
+	if err != nil {
+		t.Fatalf("ExecuteTask replay returned error: %v", err)
+	}
+	if replay.RunID != observation.RunID || requestCount != 2 {
+		t.Fatalf("replay = %#v request_count = %d", replay, requestCount)
+	}
+}
+
+func TestHTTPAutoFlowExecuteTaskRequiresApprovedRevisionHash(t *testing.T) {
+	planID := "plan-from-task"
+	client := HTTPAutoFlowClient{BaseURL: "http://should-not-be-called.invalid"}
+	_, err := client.ExecuteTask(
+		context.Background(),
+		ProductionTaskRow{ID: "task-1", AutoFlowPlanID: &planID},
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "approved revision") {
+		t.Fatalf("ExecuteTask error = %v, want approved revision failure", err)
+	}
 }
 
 func TestHTTPAutoFlowExecuteTaskMapsFailedRun(t *testing.T) {
 	planID := "plan-from-task"
+	approvedRevisionHash := "approved-revision-hash"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"run_id":"","job_id":"","status":"failed","error_message":"execute blocked"}`))
@@ -129,7 +162,11 @@ func TestHTTPAutoFlowExecuteTaskMapsFailedRun(t *testing.T) {
 	defer server.Close()
 
 	client := HTTPAutoFlowClient{BaseURL: server.URL}
-	observation, err := client.ExecuteTask(context.Background(), ProductionTaskRow{ID: "task-1", AutoFlowPlanID: &planID}, nil)
+	observation, err := client.ExecuteTask(context.Background(), ProductionTaskRow{
+		ID:                           "task-1",
+		AutoFlowPlanID:               &planID,
+		AutoFlowApprovedRevisionHash: &approvedRevisionHash,
+	}, nil)
 	if err != nil {
 		t.Fatalf("ExecuteTask returned error: %v", err)
 	}

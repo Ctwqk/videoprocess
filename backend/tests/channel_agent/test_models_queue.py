@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -349,14 +348,16 @@ def test_utc_hour_bucket_and_alert_payloads_are_stable():
         severity="warning",
         message="YouTube token expires soon",
         details={"hours_remaining": 23},
+        channel_id="channel-1",
         now=now,
     )
 
     assert payload["type"] == "token_expiring_24h"
     assert payload["resource_id"] == "account-1"
     assert payload["severity"] == "warning"
+    assert payload["channel_id"] == "channel-1"
     assert payload["details"]["hours_remaining"] == 23
-    assert payload["dedupe_key"] == "send_alert:token_expiring_24h:account-1:2026-05-18-08"
+    assert payload["dedupe_key"] == "send_alert:token_expiring_24h:account-1:channel-1:2026-05-18-08"
 
 
 @pytest.mark.asyncio

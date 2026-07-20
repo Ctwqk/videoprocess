@@ -162,6 +162,7 @@ type ProductionTaskRow struct {
 	ApprovalMode                 string
 	HumanReviewEvidenceJSON      map[string]any
 	AutoFlowPlanID               *string
+	AutoFlowApprovedRevisionHash *string
 	AutoFlowRunID                *string
 	JobID                        *string
 	State                        string

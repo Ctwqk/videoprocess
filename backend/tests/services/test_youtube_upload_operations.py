@@ -518,6 +518,10 @@ def test_alembic_upgrade_head_renders_offline_postgresql_sql():
         assert f", '{character}', '')" in completed.stdout
 
     assert "ADD COLUMN human_review_evidence_json JSON" in completed.stdout
+    assert "ALTER COLUMN human_review_evidence_json DROP DEFAULT" not in completed.stdout
     assert "UPDATE channel_ops_queue_items AS q" in completed.stdout
     assert "authoritative_channel_id" in completed.stdout
     assert "queue_authority_unresolved" in completed.stdout
+    assert "ADD COLUMN approved_revision_hash VARCHAR(64)" in completed.stdout
+    assert "ADD COLUMN execute_idempotency_key VARCHAR(512)" in completed.stdout
+    assert "uq_autoflow_runs_execute_idempotency_key" in completed.stdout

@@ -90,9 +90,22 @@ func (c HTTPAutoFlowClient) ExecuteTask(ctx context.Context, task ProductionTask
 	if planID == "" {
 		return AutoFlowExecuteObservation{}, fmt.Errorf("autoflow plan_id is required")
 	}
+	taskID := strings.TrimSpace(task.ID)
+	if taskID == "" {
+		return AutoFlowExecuteObservation{}, fmt.Errorf("production task id is required for AutoFlow execution")
+	}
+	approvedRevisionHash := ""
+	if task.AutoFlowApprovedRevisionHash != nil {
+		approvedRevisionHash = strings.TrimSpace(*task.AutoFlowApprovedRevisionHash)
+	}
+	if approvedRevisionHash == "" {
+		return AutoFlowExecuteObservation{}, fmt.Errorf("autoflow approved revision hash is required")
+	}
+	idempotencyKey := "channelops-execute:" + taskID + ":" + planID + ":" + approvedRevisionHash
 	payload, err := c.postJSON(ctx, "/api/v1/autoflow/execute", map[string]any{
-		"plan_id": planID,
-		"execute": true,
+		"plan_id":         planID,
+		"execute":         true,
+		"idempotency_key": idempotencyKey,
 	})
 	if err != nil {
 		return AutoFlowExecuteObservation{}, err

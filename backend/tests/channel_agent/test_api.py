@@ -96,6 +96,7 @@ def _review_plan(*, status: str = "review_required", rights_status: str = "revie
         },
         validation_json={"valid": True, "errors": [], "warnings": [], "repairs": []},
         status=status,
+        approved_revision_hash="a" * 64 if status == "review_approved" else None,
     )
 
 
@@ -1163,6 +1164,7 @@ async def test_manual_promotion_preserves_external_plan_review_token(api_session
                 "reviewed_at": approved_at.isoformat(),
                 "autoflow_plan_id": str(plan.id),
                 "plan_review_approved_at": approved_at.isoformat(),
+                "plan_approved_revision_hash": plan.approved_revision_hash,
             }
         },
         state="uploaded_private",
@@ -1194,6 +1196,7 @@ async def test_manual_promotion_preserves_external_plan_review_token(api_session
     promotion = task.human_review_evidence_json["promotion"]
     assert promotion["autoflow_plan_id"] == str(plan.id)
     assert datetime.fromisoformat(promotion["plan_review_approved_at"]) == approved_at
+    assert promotion["plan_approved_revision_hash"] == plan.approved_revision_hash
     assert promotion["publication_id"] == str(publication.id)
 
 

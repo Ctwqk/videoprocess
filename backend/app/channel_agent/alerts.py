@@ -16,18 +16,24 @@ def build_alert_payload(
     severity: str,
     message: str,
     details: dict[str, Any] | None = None,
+    channel_id: str | None = None,
     now: datetime,
 ) -> dict[str, Any]:
     bucket = utc_hour_bucket(now)
-    return {
+    payload = {
         "type": alert_type,
         "resource_id": resource_id,
         "severity": severity,
         "message": message,
         "details": dict(details or {}),
         "created_at": now.isoformat(),
-        "dedupe_key": f"send_alert:{alert_type}:{resource_id}:{bucket}",
     }
+    if channel_id:
+        payload["channel_id"] = channel_id
+        payload["dedupe_key"] = f"send_alert:{alert_type}:{resource_id}:{channel_id}:{bucket}"
+    else:
+        payload["dedupe_key"] = f"send_alert:{alert_type}:{resource_id}:{bucket}"
+    return payload
 
 
 class AlertService:

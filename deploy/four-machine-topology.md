@@ -151,6 +151,11 @@ When that file is absent, the watcher exits successfully with
 or an unavailable trusted worker image is a non-zero configuration error and
 does not perform a speculative mutation.
 
+The state file is parsed as literal `KEY=value` data using an explicit key
+allowlist; it is never sourced as shell code. `VP_SOAK_FORBIDDEN_NODE_PATTERN`
+may add placement exclusions, but it cannot replace the immutable
+`CASPERs-Mac-mini`, `colima-swarmbridged`, and `10.0.0.126` baseline.
+
 Creating or enabling the state file is a separate human activation action and
 requires a separately approved, successful unlisted canary. The required
 approval for the next attempt is `批准第三次 unlisted canary`. Deploying code may

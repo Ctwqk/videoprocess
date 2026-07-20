@@ -10,25 +10,97 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const claimNextQuery = `
-	WITH picked AS (
+const queueAuthorityCTE = `
+	WITH queue_references AS (
+		SELECT
+			q.id,
+			q.kind,
+			q.channel_profile_id AS stored_channel_id,
+			CASE
+				WHEN q.payload_json ->> 'production_task_id' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+				THEN (q.payload_json ->> 'production_task_id')::uuid
+			END AS task_id,
+			CASE
+				WHEN q.payload_json ->> 'publication_id' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+				THEN (q.payload_json ->> 'publication_id')::uuid
+			END AS publication_id,
+			CASE
+				WHEN q.payload_json ->> 'account_id' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+				THEN (q.payload_json ->> 'account_id')::uuid
+			END AS account_id,
+			CASE
+				WHEN q.payload_json ->> 'channel_id' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+				THEN (q.payload_json ->> 'channel_id')::uuid
+			END AS payload_channel_id,
+			NULLIF(BTRIM(q.payload_json ->> 'channel_id'), '') AS payload_channel_value
+		FROM channel_ops_queue_items AS q
+	), authoritative_queue_channels AS (
+		SELECT
+			refs.id,
+			CASE
+				WHEN refs.kind IN ('plan_task', 'execute_task', 'observe_job', 'publish_task')
+					THEN task.channel_profile_id
+				WHEN refs.kind IN ('promote_publication', 'reconcile_publication', 'collect_metrics')
+					THEN publication_task.channel_profile_id
+				WHEN refs.kind = 'account_health' THEN account.channel_profile_id
+				WHEN refs.kind IN ('agent_tick', 'learning_recompute') THEN payload_channel.id
+				WHEN refs.kind = 'send_alert' THEN
+					CASE
+						WHEN refs.payload_channel_value IS NULL THEN stored_channel.id
+						ELSE payload_channel.id
+					END
+			END AS authoritative_channel_id,
+			refs.kind = 'cleanup_expired'
+				OR (
+					refs.kind = 'send_alert'
+					AND refs.payload_channel_value IS NULL
+					AND refs.stored_channel_id IS NULL
+				) AS is_global
+		FROM queue_references AS refs
+		LEFT JOIN production_tasks AS task ON task.id = refs.task_id
+		LEFT JOIN publication_records AS publication ON publication.id = refs.publication_id
+		LEFT JOIN production_tasks AS publication_task
+			ON publication_task.id = publication.production_task_id
+		LEFT JOIN publishing_accounts AS account ON account.id = refs.account_id
+		LEFT JOIN channel_profiles AS payload_channel ON payload_channel.id = refs.payload_channel_id
+		LEFT JOIN channel_profiles AS stored_channel ON stored_channel.id = refs.stored_channel_id
+	)
+`
+
+const queueAuthorityClaimPredicate = `
+		  AND (
+			authority.is_global
+			OR (
+				authority.authoritative_channel_id IS NOT NULL
+				AND q.channel_profile_id IS NOT DISTINCT FROM authority.authoritative_channel_id
+				AND EXISTS (
+					SELECT 1 FROM channel_profiles AS executable_channel
+					WHERE executable_channel.id = authority.authoritative_channel_id
+					  AND executable_channel.enabled = TRUE
+					  AND executable_channel.halted_at IS NULL
+				)
+			)
+			OR (
+				NOT authority.is_global
+				AND (
+					authority.authoritative_channel_id IS NULL
+					OR q.channel_profile_id IS DISTINCT FROM authority.authoritative_channel_id
+				)
+			)
+		  )
+`
+
+const claimNextQuery = queueAuthorityCTE + `
+	, picked AS (
 		SELECT q.id
 		FROM channel_ops_queue_items q
+		JOIN authoritative_queue_channels AS authority ON authority.id = q.id
 		WHERE q.status = $2
 		  AND q.dead_letter_at IS NULL
 		  AND q.run_after <= NOW()
-		  AND (
-		    q.channel_profile_id IS NULL
-		    OR EXISTS (
-		      SELECT 1
-		      FROM channel_profiles c
-		      WHERE c.id = q.channel_profile_id
-		        AND c.enabled = TRUE
-		        AND c.halted_at IS NULL
-		    )
-		  )
+		` + queueAuthorityClaimPredicate + `
 		ORDER BY q.priority ASC, q.created_at ASC
-		FOR UPDATE SKIP LOCKED
+		FOR UPDATE OF q SKIP LOCKED
 		LIMIT 1
 	)
 	UPDATE channel_ops_queue_items q
@@ -43,26 +115,18 @@ const claimNextQuery = `
 	          q.last_error, q.dead_letter_at, q.channel_profile_id, q.parent_queue_item_id
 `
 
-const claimNextForKindsQuery = `
-	WITH picked AS (
+const claimNextForKindsQuery = queueAuthorityCTE + `
+	, picked AS (
 		SELECT q.id
 		FROM channel_ops_queue_items q
+		JOIN authoritative_queue_channels AS authority ON authority.id = q.id
 		WHERE q.status = $2
 		  AND q.dead_letter_at IS NULL
 		  AND q.run_after <= NOW()
 		  AND q.kind = ANY($4)
-		  AND (
-		    q.channel_profile_id IS NULL
-		    OR EXISTS (
-		      SELECT 1
-		      FROM channel_profiles c
-		      WHERE c.id = q.channel_profile_id
-		        AND c.enabled = TRUE
-		        AND c.halted_at IS NULL
-		    )
-		  )
+		` + queueAuthorityClaimPredicate + `
 		ORDER BY q.priority ASC, q.created_at ASC
-		FOR UPDATE SKIP LOCKED
+		FOR UPDATE OF q SKIP LOCKED
 		LIMIT 1
 	)
 	UPDATE channel_ops_queue_items q
@@ -77,24 +141,19 @@ const claimNextForKindsQuery = `
 	          q.last_error, q.dead_letter_at, q.channel_profile_id, q.parent_queue_item_id
 `
 
-const claimNextForChannelAndKindsQuery = `
-	WITH picked AS (
+const claimNextForChannelAndKindsQuery = queueAuthorityCTE + `
+	, picked AS (
 		SELECT q.id
 		FROM channel_ops_queue_items q
+		JOIN authoritative_queue_channels AS authority ON authority.id = q.id
 		WHERE q.status = $2
 		  AND q.dead_letter_at IS NULL
 		  AND q.run_after <= NOW()
 		  AND q.kind = ANY($4)
-		  AND q.channel_profile_id = $5::uuid
-		  AND EXISTS (
-		    SELECT 1
-		    FROM channel_profiles c
-		    WHERE c.id = q.channel_profile_id
-		      AND c.enabled = TRUE
-		      AND c.halted_at IS NULL
-		  )
+		  AND COALESCE(q.channel_profile_id, authority.authoritative_channel_id) = $5::uuid
+		` + queueAuthorityClaimPredicate + `
 		ORDER BY q.priority ASC, q.created_at ASC
-		FOR UPDATE SKIP LOCKED
+		FOR UPDATE OF q SKIP LOCKED
 		LIMIT 1
 	)
 	UPDATE channel_ops_queue_items q
@@ -279,6 +338,26 @@ func (s *Store) MarkQueueFailedOrRetry(ctx context.Context, item QueueItemRow, m
 		  AND locked_at = $7
 	`, item.ID, QueueStatusQueued, message, pgInterval(RetryDelay(item.AttemptCount)),
 		QueueStatusRunning, lockedBy, lockedAt)
+	return err
+}
+
+func (s *Store) MarkQueueRejected(ctx context.Context, item QueueItemRow, message string) error {
+	lockedBy, lockedAt, err := runningLease(item)
+	if err != nil {
+		return err
+	}
+	_, err = s.db().Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = $2,
+		    last_error = $3,
+		    dead_letter_at = NOW(),
+		    locked_by = NULL,
+		    locked_at = NULL
+		WHERE id = $1::uuid
+		  AND status = $4
+		  AND locked_by = $5
+		  AND locked_at = $6
+	`, item.ID, QueueStatusDeadLettered, message, QueueStatusRunning, lockedBy, lockedAt)
 	return err
 }
 

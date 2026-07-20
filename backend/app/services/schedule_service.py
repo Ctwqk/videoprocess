@@ -57,6 +57,8 @@ async def _get_or_create_runtime_schedule(
     db: AsyncSession,
     service_name: str,
     default_state: VideoScheduleState,
+    *,
+    commit: bool = True,
 ) -> RuntimeSchedule:
     schedule = await db.get(RuntimeSchedule, service_name)
     if schedule:
@@ -68,21 +70,25 @@ async def _get_or_create_runtime_schedule(
         updated_by="system",
     )
     db.add(schedule)
+    if not commit:
+        await db.flush()
+        return schedule
     await db.commit()
     await db.refresh(schedule)
     return schedule
 
 
-async def get_video_schedule_record(db: AsyncSession) -> RuntimeSchedule:
+async def get_video_schedule_record(db: AsyncSession, *, commit: bool = True) -> RuntimeSchedule:
     return await _get_or_create_runtime_schedule(
         db,
         VIDEO_SCHEDULE_SERVICE,
         default_video_schedule_state(),
+        commit=commit,
     )
 
 
-async def get_video_schedule_state(db: AsyncSession) -> VideoScheduleState:
-    schedule = await get_video_schedule_record(db)
+async def get_video_schedule_state(db: AsyncSession, *, commit: bool = True) -> VideoScheduleState:
+    schedule = await get_video_schedule_record(db, commit=commit)
     try:
         return VideoScheduleState(schedule.state)
     except ValueError:
@@ -112,13 +118,21 @@ async def park_job_for_window(db: AsyncSession, job: Job) -> Job:
     return job
 
 
-async def park_jobs_for_window(db: AsyncSession, jobs: list[Job]) -> list[Job]:
+async def park_jobs_for_window(
+    db: AsyncSession,
+    jobs: list[Job],
+    *,
+    commit: bool = True,
+) -> list[Job]:
     if not jobs:
         return []
     for job in jobs:
         job.status = JobStatus.WAITING_WINDOW
         job.error_message = None
         job.completed_at = None
+    if not commit:
+        await db.flush()
+        return jobs
     await db.commit()
     for job in jobs:
         await db.refresh(job, attribute_names=["node_executions"])

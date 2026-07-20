@@ -61,13 +61,19 @@ def _authority_cte() -> str:
                     WHEN refs.kind IN ('promote_publication', 'reconcile_publication', 'collect_metrics')
                         THEN publication_task.channel_profile_id
                     WHEN refs.kind = 'account_health' THEN account.channel_profile_id
-                    WHEN refs.kind IN ('agent_tick', 'learning_recompute', 'send_alert')
-                        THEN payload_channel.id
+                    WHEN refs.kind IN ('agent_tick', 'learning_recompute') THEN payload_channel.id
+                    WHEN refs.kind = 'send_alert' THEN
+                        CASE
+                            WHEN NULLIF(BTRIM(refs.payload_channel_value), '') IS NULL
+                                THEN stored_channel.id
+                            ELSE payload_channel.id
+                        END
                 END AS authoritative_channel_id,
                 refs.kind = 'cleanup_expired'
                     OR (
                         refs.kind = 'send_alert'
                         AND NULLIF(BTRIM(refs.payload_channel_value), '') IS NULL
+                        AND refs.stored_channel_id IS NULL
                     )
                     AS is_global
             FROM queue_references AS refs
@@ -77,6 +83,7 @@ def _authority_cte() -> str:
                 ON publication_task.id = publication.production_task_id
             LEFT JOIN publishing_accounts AS account ON account.id = refs.account_id
             LEFT JOIN channel_profiles AS payload_channel ON payload_channel.id = refs.payload_channel_id
+            LEFT JOIN channel_profiles AS stored_channel ON stored_channel.id = refs.stored_channel_id
         )
     """
 
@@ -91,7 +98,6 @@ def upgrade() -> None:
             nullable=False,
         ),
     )
-    op.alter_column("production_tasks", "human_review_evidence_json", server_default=None)
 
     op.execute(
         sa.text(

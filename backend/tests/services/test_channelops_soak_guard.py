@@ -87,6 +87,7 @@ def _review_plan(*, review_approved_at: datetime | None = None, status: str = "r
         validation_json={"valid": True, "errors": [], "warnings": [], "repairs": []},
         status=status,
         review_approved_at=review_approved_at,
+        approved_revision_hash="a" * 64 if status == "review_approved" and review_approved_at else None,
     )
 
 
@@ -100,6 +101,7 @@ def _pre_upload_evidence(task: ProductionTask, plan: AutoFlowPlan, *, token: dat
             "reviewed_at": resolved_token.isoformat() if resolved_token else "",
             "autoflow_plan_id": str(plan_id or plan.id),
             "plan_review_approved_at": resolved_token.isoformat() if resolved_token else "",
+            "plan_approved_revision_hash": plan.approved_revision_hash,
             "review_notes": "reviewed",
         }
     }

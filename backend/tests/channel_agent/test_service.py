@@ -2523,7 +2523,7 @@ async def test_manual_seed_repetition_override_is_annotated(service_session):
 
 @pytest.mark.asyncio
 async def test_pds_unavailable_decision_enqueues_outage_alert(service_session):
-    _channel, task, _publication, item = await _promotion_item_graph(service_session)
+    channel, task, _publication, item = await _promotion_item_graph(service_session)
     service = _service(
         pds=SequencePDSClient(
             [
@@ -2549,14 +2549,16 @@ async def test_pds_unavailable_decision_enqueues_outage_alert(service_session):
     assert alert.payload_json["type"] == "pds_outage"
     assert alert.payload_json["resource_id"] == "service:pds"
     assert alert.payload_json["severity"] == "critical"
+    assert alert.payload_json["channel_id"] == str(channel.id)
+    assert alert.channel_profile_id == channel.id
     assert alert.payload_json["details"]["action_type"] == "publish"
     assert alert.payload_json["details"]["warning"] == "pds_unavailable"
 
 
 @pytest.mark.asyncio
 async def test_pds_outage_alert_is_deduped_per_hour(service_session):
-    _first_channel, _first_task, _first_publication, first_item = await _promotion_item_graph(service_session)
-    _second_channel, _second_task, _second_publication, second_item = await _promotion_item_graph(service_session)
+    first_channel, _first_task, _first_publication, first_item = await _promotion_item_graph(service_session)
+    second_channel, _second_task, _second_publication, second_item = await _promotion_item_graph(service_session)
     service = _service(
         pds=SequencePDSClient(
             [
@@ -2578,8 +2580,12 @@ async def test_pds_outage_alert_is_deduped_per_hour(service_session):
             select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.kind == "send_alert")
         )
     ).scalars().all()
-    assert len(alerts) == 1
-    assert alerts[0].payload_json["type"] == "pds_outage"
+    assert len(alerts) == 2
+    assert {alert.payload_json["channel_id"] for alert in alerts} == {
+        str(first_channel.id),
+        str(second_channel.id),
+    }
+    assert all(alert.payload_json["type"] == "pds_outage" for alert in alerts)
 
 
 @pytest.mark.asyncio

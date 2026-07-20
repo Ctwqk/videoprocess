@@ -2,6 +2,7 @@ package channelops
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -98,6 +99,9 @@ func (r *Runner) runOnce(ctx context.Context) error {
 		return nil
 	}
 	if err := r.Handlers.Handle(ctx, *item); err != nil {
+		if errors.Is(err, ErrQueueAuthorityInvalid) {
+			return r.Store.MarkQueueRejected(ctx, *item, err.Error())
+		}
 		return r.Store.MarkQueueFailedOrRetry(ctx, *item, err.Error())
 	}
 	return r.Store.MarkQueueDone(ctx, *item)

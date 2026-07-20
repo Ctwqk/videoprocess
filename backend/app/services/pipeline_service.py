@@ -9,7 +9,7 @@ from app.schemas.pipeline import PipelineCreate, PipelineUpdate, PipelineDefinit
 from app.orchestrator.dag import validate_pipeline
 
 
-async def create_pipeline(db: AsyncSession, data: PipelineCreate) -> Pipeline:
+async def create_pipeline(db: AsyncSession, data: PipelineCreate, *, commit: bool = True) -> Pipeline:
     pipeline = Pipeline(
         name=data.name,
         description=data.description,
@@ -18,6 +18,9 @@ async def create_pipeline(db: AsyncSession, data: PipelineCreate) -> Pipeline:
         template_tags=data.template_tags,
     )
     db.add(pipeline)
+    if not commit:
+        await db.flush()
+        return pipeline
     await db.commit()
     await db.refresh(pipeline)
     return pipeline

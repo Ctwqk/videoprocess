@@ -77,9 +77,38 @@ if [[ ! -f "$state_file" ]]; then
   exit 0
 fi
 
-if ! source "$state_file" >/dev/null 2>&1; then
-  configuration_error invalid_state_file
-fi
+VP_SOAK_WATCH_ENABLED=''
+VP_SOAK_CHANNEL_ID=''
+VP_SOAK_STARTED_AT=''
+VP_SOAK_MAX_PUBLICATIONS_PER_24H=''
+VP_SOAK_UPLOAD_STALE_MINUTES=''
+VP_SOAK_FEEDBACK_GRACE_HOURS=''
+VP_SOAK_AUTO_HOLD=''
+VP_SOAK_FORBIDDEN_NODE_PATTERN=''
+VP_SOAK_REDIS_CONTAINER=''
+seen_state_keys=' '
+while IFS= read -r state_record || [[ -n "$state_record" ]]; do
+  case "$state_record" in
+    ''|'#'*) continue ;;
+  esac
+  if [[ "$state_record" != *=* ]]; then
+    configuration_error invalid_state_file
+  fi
+  state_key="${state_record%%=*}"
+  state_value="${state_record#*=}"
+  case "$state_key" in
+    VP_SOAK_WATCH_ENABLED|VP_SOAK_CHANNEL_ID|VP_SOAK_STARTED_AT|\
+    VP_SOAK_MAX_PUBLICATIONS_PER_24H|VP_SOAK_UPLOAD_STALE_MINUTES|\
+    VP_SOAK_FEEDBACK_GRACE_HOURS|VP_SOAK_AUTO_HOLD|\
+    VP_SOAK_FORBIDDEN_NODE_PATTERN|VP_SOAK_REDIS_CONTAINER) ;;
+    *) configuration_error unsupported_state_key ;;
+  esac
+  case "$seen_state_keys" in
+    *" $state_key "*) configuration_error duplicate_state_key ;;
+  esac
+  seen_state_keys="${seen_state_keys}${state_key} "
+  printf -v "$state_key" '%s' "$state_value"
+done <"$state_file"
 
 if [[ "${VP_SOAK_WATCH_ENABLED:-}" != "true" ]]; then
   log_status 'status=disabled reason=not_enabled'
@@ -92,7 +121,9 @@ max_publications="${VP_SOAK_MAX_PUBLICATIONS_PER_24H:-1}"
 upload_stale_minutes="${VP_SOAK_UPLOAD_STALE_MINUTES:-45}"
 feedback_grace_hours="${VP_SOAK_FEEDBACK_GRACE_HOURS:-30}"
 auto_hold="${VP_SOAK_AUTO_HOLD:-false}"
-forbidden_pattern="${VP_SOAK_FORBIDDEN_NODE_PATTERN:-CASPERs-Mac-mini|10.0.0.126}"
+extra_forbidden_pattern="${VP_SOAK_FORBIDDEN_NODE_PATTERN:-}"
+forbidden_baseline='CASPERs-Mac-mini|colima-swarmbridged|10\.0\.0\.126'
+forbidden_pattern="$forbidden_baseline"
 redis_container="${VP_SOAK_REDIS_CONTAINER:-constructure_vp_redis}"
 
 if [[ ! "$channel_id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
@@ -122,15 +153,15 @@ case "$auto_hold" in
   true|false) ;;
   *) configuration_error invalid_auto_hold ;;
 esac
-if [[ -z "$forbidden_pattern" ]]; then
-  configuration_error invalid_forbidden_node_pattern
-fi
-set +e
-printf '' | grep -Eq -- "$forbidden_pattern"
-pattern_status=$?
-set -e
-if [[ "$pattern_status" -gt 1 ]]; then
-  configuration_error invalid_forbidden_node_pattern
+if [[ -n "$extra_forbidden_pattern" ]]; then
+  set +e
+  printf '' | grep -Eq -- "$extra_forbidden_pattern"
+  pattern_status=$?
+  set -e
+  if [[ "$pattern_status" -gt 1 ]]; then
+    configuration_error invalid_forbidden_node_pattern
+  fi
+  forbidden_pattern="($forbidden_baseline)|($extra_forbidden_pattern)"
 fi
 
 deploy_env="${DEPLOY_GITHUB_SYNC_ENV_FILE:-$sync_root/env/deploy.env}"

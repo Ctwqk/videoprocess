@@ -605,8 +605,7 @@ async def promote_publication(
     human_actor = review.human_actor.strip()
     if not human_actor:
         raise HTTPException(status_code=400, detail="human_actor must be nonblank")
-    publication, task = await _publication_with_task(db, publication_id)
-    channel = await db.get(ChannelProfile, task.channel_profile_id)
+    channel, task, publication = await _lock_publication_operator_scope(db, publication_id)
     if channel is None or not channel.enabled or channel.halted_at is not None:
         raise HTTPException(status_code=409, detail="Channel is disabled or halted")
     eligible_pds_hold = task.state == TASK_HELD and task.blocked_by_guard in {
@@ -692,30 +691,34 @@ async def release_human_review(
     human_actor = data.human_actor.strip()
     if not human_actor:
         raise HTTPException(status_code=400, detail="human_actor must be nonblank")
-    task = await db.get(ProductionTask, _uuid(task_id))
-    if task is None:
-        raise HTTPException(status_code=404, detail="Production task not found")
-    channel = await db.get(ChannelProfile, task.channel_profile_id)
+    channel, task = await _lock_task_operator_scope(db, task_id)
     if channel is None or not channel.enabled or channel.halted_at is not None:
         raise HTTPException(status_code=409, detail="Channel is disabled or halted")
     if task.state != TASK_HELD or task.blocked_by_guard != "human_approval_required":
         raise HTTPException(status_code=409, detail="Task is not held for human review")
     if task.autoflow_plan_id is None:
         raise HTTPException(status_code=409, detail="Task has no AutoFlow plan to review")
+    approved_plan = (
+        await db.execute(
+            select(AutoFlowPlan)
+            .where(AutoFlowPlan.id == task.autoflow_plan_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if approved_plan is None:
+        raise HTTPException(status_code=409, detail="Task AutoFlow plan was not found")
     try:
         approved = await autoflow_service.approve(
             str(task.autoflow_plan_id),
             db,
             review_notes=data.review_notes,
+            commit=False,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if approved is None or str(approved.plan_id) != str(task.autoflow_plan_id):
         raise HTTPException(status_code=409, detail="Task AutoFlow plan was not found")
-    approved_plan = await db.get(AutoFlowPlan, task.autoflow_plan_id)
-    if approved_plan is None:
-        raise HTTPException(status_code=409, detail="Task AutoFlow plan was not found")
-    await db.refresh(approved_plan)
     try:
         evidence = build_pre_upload_evidence(
             plan=approved_plan,
@@ -886,6 +889,83 @@ async def _publication_with_task(db: AsyncSession, publication_id: str) -> tuple
     if task is None:
         raise HTTPException(status_code=404, detail="Production task not found")
     return publication, task
+
+
+async def _lock_task_operator_scope(
+    db: AsyncSession,
+    task_id: str,
+) -> tuple[ChannelProfile, ProductionTask]:
+    task_uuid = _uuid(task_id)
+    discovered = await db.get(ProductionTask, task_uuid)
+    if discovered is None:
+        raise HTTPException(status_code=404, detail="Production task not found")
+    channel = (
+        await db.execute(
+            select(ChannelProfile)
+            .where(ChannelProfile.id == discovered.channel_profile_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if channel is None:
+        raise HTTPException(status_code=409, detail="Production task channel was not found")
+    task = (
+        await db.execute(
+            select(ProductionTask)
+            .where(ProductionTask.id == task_uuid)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Production task not found")
+    if task.channel_profile_id != channel.id:
+        raise HTTPException(status_code=409, detail="Production task channel changed during review")
+    return channel, task
+
+
+async def _lock_publication_operator_scope(
+    db: AsyncSession,
+    publication_id: str,
+) -> tuple[ChannelProfile, ProductionTask, PublicationRecord]:
+    publication_uuid = _uuid(publication_id)
+    discovered_publication = await db.get(PublicationRecord, publication_uuid)
+    if discovered_publication is None:
+        raise HTTPException(status_code=404, detail="Publication not found")
+    discovered_task = await db.get(ProductionTask, discovered_publication.production_task_id)
+    if discovered_task is None:
+        raise HTTPException(status_code=404, detail="Production task not found")
+    channel = (
+        await db.execute(
+            select(ChannelProfile)
+            .where(ChannelProfile.id == discovered_task.channel_profile_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if channel is None:
+        raise HTTPException(status_code=409, detail="Publication channel was not found")
+    task = (
+        await db.execute(
+            select(ProductionTask)
+            .where(ProductionTask.id == discovered_task.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    publication = (
+        await db.execute(
+            select(PublicationRecord)
+            .where(PublicationRecord.id == publication_uuid)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if task is None or publication is None:
+        raise HTTPException(status_code=409, detail="Publication state changed during review")
+    if task.channel_profile_id != channel.id or publication.production_task_id != task.id:
+        raise HTTPException(status_code=409, detail="Publication authority changed during review")
+    return channel, task, publication
 
 
 async def _validate_manual_seed_references(

@@ -99,6 +99,8 @@ async def _create_job_from_definition(
     db: AsyncSession,
     pipeline_id: uuid.UUID,
     definition: PipelineDefinition,
+    *,
+    commit: bool = True,
 ) -> Job:
     validation = validate_pipeline(definition)
     if not validation.valid:
@@ -129,6 +131,9 @@ async def _create_job_from_definition(
                 node_exec.node_config = {**node_exec.node_config, "asset_id": asset_id}
         db.add(node_exec)
 
+    if not commit:
+        await db.flush()
+        return job
     await db.commit()
     await db.refresh(job, attribute_names=["node_executions"])
     return job
@@ -138,6 +143,8 @@ async def create_job(
     db: AsyncSession,
     pipeline_id: uuid.UUID,
     input_overrides: dict[str, Any] | None = None,
+    *,
+    commit: bool = True,
 ) -> Job:
     """Create a new job from a pipeline. Does NOT start execution - that's the orchestrator's job.
 
@@ -159,16 +166,18 @@ async def create_job(
         raise ValueError(f"Pipeline validation failed: {error_msgs}")
 
     runtime_definition = compile_runtime_definition(effective_definition)
-    return await _create_job_from_definition(db, pipeline_id, runtime_definition)
+    return await _create_job_from_definition(db, pipeline_id, runtime_definition, commit=commit)
 
 
 async def create_job_from_snapshot(
     db: AsyncSession,
     pipeline_id: uuid.UUID,
     pipeline_snapshot: dict,
+    *,
+    commit: bool = True,
 ) -> Job:
     definition = PipelineDefinition.model_validate(pipeline_snapshot)
-    return await _create_job_from_definition(db, pipeline_id, definition)
+    return await _create_job_from_definition(db, pipeline_id, definition, commit=commit)
 
 
 async def get_job(db: AsyncSession, job_id: uuid.UUID) -> Job | None:

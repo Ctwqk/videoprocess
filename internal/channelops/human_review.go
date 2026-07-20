@@ -16,10 +16,11 @@ const (
 )
 
 type planReviewAuthority struct {
-	ID               string
-	Status           string
-	Rights           map[string]any
-	ReviewApprovedAt *time.Time
+	ID                   string
+	Status               string
+	Rights               map[string]any
+	ReviewApprovedAt     *time.Time
+	ApprovedRevisionHash *string
 }
 
 func (s *Store) ValidPreUploadHumanReview(ctx context.Context, task ProductionTaskRow) (bool, error) {
@@ -33,7 +34,8 @@ func (s *Store) ValidPreUploadHumanReview(ctx context.Context, task ProductionTa
 	if err != nil {
 		return false, err
 	}
-	if invalidReviewPlan(plan) || plan.ReviewApprovedAt == nil || plan.ID != *task.AutoFlowPlanID {
+	if invalidReviewPlan(plan) || plan.ReviewApprovedAt == nil || plan.ApprovedRevisionHash == nil ||
+		strings.TrimSpace(*plan.ApprovedRevisionHash) == "" || plan.ID != *task.AutoFlowPlanID {
 		return false, nil
 	}
 	evidence := mapFromAny(task.HumanReviewEvidenceJSON["pre_upload"])
@@ -44,6 +46,9 @@ func (s *Store) ValidPreUploadHumanReview(ctx context.Context, task ProductionTa
 		return false, nil
 	}
 	if firstString(evidence, "autoflow_plan_id") != plan.ID {
+		return false, nil
+	}
+	if firstString(evidence, "plan_approved_revision_hash") != *plan.ApprovedRevisionHash {
 		return false, nil
 	}
 	return timestampMatches(firstString(evidence, "plan_review_approved_at"), *plan.ReviewApprovedAt), nil
@@ -77,7 +82,8 @@ func (s *Store) ValidPromotionHumanReview(
 	}
 	preUpload := mapFromAny(task.HumanReviewEvidenceJSON["pre_upload"])
 	return firstString(evidence, "autoflow_plan_id") == firstString(preUpload, "autoflow_plan_id") &&
-		firstString(evidence, "plan_review_approved_at") == firstString(preUpload, "plan_review_approved_at"), nil
+		firstString(evidence, "plan_review_approved_at") == firstString(preUpload, "plan_review_approved_at") &&
+		firstString(evidence, "plan_approved_revision_hash") == firstString(preUpload, "plan_approved_revision_hash"), nil
 }
 
 func (s *Store) loadPlanReviewAuthority(ctx context.Context, planID string) (planReviewAuthority, error) {
@@ -87,10 +93,10 @@ func (s *Store) loadPlanReviewAuthority(ctx context.Context, planID string) (pla
 	var plan planReviewAuthority
 	var rightsJSON []byte
 	err := s.db().QueryRow(ctx, `
-		SELECT id, status, rights_json, review_approved_at
+		SELECT id, status, rights_json, review_approved_at, approved_revision_hash
 		FROM autoflow_plans
 		WHERE id = $1::uuid
-	`, planID).Scan(&plan.ID, &plan.Status, &rightsJSON, &plan.ReviewApprovedAt)
+	`, planID).Scan(&plan.ID, &plan.Status, &rightsJSON, &plan.ReviewApprovedAt, &plan.ApprovedRevisionHash)
 	if err != nil {
 		return planReviewAuthority{}, err
 	}

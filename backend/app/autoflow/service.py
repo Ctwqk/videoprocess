@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -38,9 +41,10 @@ from app.schemas.autoflow import (
     StoryboardPlan,
 )
 from app.schemas.pipeline import PipelineCreate, PipelineDefinition
-from app.services.job_runtime import start_or_defer_jobs
+from app.services.job_runtime import start_jobs_background, start_or_defer_jobs
 from app.services.job_service import create_job
 from app.services.pipeline_service import create_pipeline
+from app.services.schedule_service import VideoScheduleState, get_video_schedule_state, park_jobs_for_window
 
 
 class CandidateSelector(Protocol):
@@ -487,12 +491,9 @@ class AutoFlowService:
         if patch.evaluate_rights:
             rights_payload = self.rights_policy.evaluate(request, candidates).model_dump(mode="json")
 
-        approvals_reset = _patch_resets_approval(patch)
-        review_approved_at = None if approvals_reset else plan.review_approved_at
-        public_approved_at = None if approvals_reset else plan.public_approved_at
-        agent_approved_by = None if approvals_reset else plan.agent_approved_by
-        if approvals_reset:
-            rights_payload = _rights_without_approval_state(rights_payload, request.publish_mode)
+        review_approved_at = plan.review_approved_at
+        public_approved_at = plan.public_approved_at
+        agent_approved_by = plan.agent_approved_by
         updated = plan.model_copy(
             update={
                 "request": request,
@@ -519,6 +520,7 @@ class AutoFlowService:
                 "review_approved_at": review_approved_at,
                 "public_approved_at": public_approved_at,
                 "agent_approved_by": agent_approved_by,
+                "approved_revision_hash": plan.approved_revision_hash,
                 "rejected_reason": None,
             }
         )
@@ -526,6 +528,7 @@ class AutoFlowService:
         if db is not None:
             return await self._save_plan(db, updated)
 
+        updated = _invalidate_approval_for_revision_change(plan, updated)
         self._plans[plan_id] = updated
         return updated
 
@@ -565,6 +568,7 @@ class AutoFlowService:
                 "rejected_reason": None,
             }
         )
+        updated = updated.model_copy(update={"approved_revision_hash": execution_revision_hash(updated)})
         if db is not None:
             return await self._save_plan(db, updated)
 
@@ -576,6 +580,8 @@ class AutoFlowService:
         plan_id: str,
         db: AsyncSession | None = None,
         review_notes: str | None = None,
+        *,
+        commit: bool = True,
     ) -> AutoFlowPlan | None:
         plan = await self.get_plan(plan_id, db)
         if not plan:
@@ -600,8 +606,9 @@ class AutoFlowService:
                 "rejected_reason": None,
             }
         )
+        updated = updated.model_copy(update={"approved_revision_hash": execution_revision_hash(updated)})
         if db is not None:
-            return await self._save_plan(db, updated)
+            return await self._save_plan(db, updated, commit=commit)
 
         self._plans[plan_id] = updated
         return updated
@@ -633,6 +640,7 @@ class AutoFlowService:
                 "rejected_reason": None,
             }
         )
+        updated = updated.model_copy(update={"approved_revision_hash": execution_revision_hash(updated)})
         if db is not None:
             return await self._save_plan(db, updated)
 
@@ -655,6 +663,7 @@ class AutoFlowService:
                 "review_approved_at": None,
                 "public_approved_at": None,
                 "agent_approved_by": None,
+                "approved_revision_hash": None,
                 "rejected_reason": rejected_reason or "Rejected by reviewer",
             }
         )
@@ -674,6 +683,9 @@ class AutoFlowService:
             raise ValueError("AutoFlow plan not found")
 
         _assert_execute_allowed(plan, request)
+
+        if db is not None and request.idempotency_key is not None:
+            return await self._execute_idempotent(request, plan, db)
 
         pipeline_id: str | None = None
         job_id: str | None = None
@@ -732,6 +744,103 @@ class AutoFlowService:
         self._runs[run.run_id] = run
         return run
 
+    async def _execute_idempotent(
+        self,
+        request: AutoFlowExecuteRequest,
+        plan: AutoFlowPlan,
+        db: AsyncSession,
+    ) -> AutoFlowRun:
+        approved_revision_hash = plan.approved_revision_hash
+        if (
+            not approved_revision_hash
+            or approved_revision_hash != execution_revision_hash(plan)
+        ):
+            raise PermissionError("Idempotent AutoFlow execution requires an exact approved revision")
+
+        key = str(request.idempotency_key or "").strip()
+        if not key:
+            raise ValueError("AutoFlow execute idempotency key cannot be blank")
+        publish = {
+            "mode": plan.request.publish_mode,
+            "review_approved": bool(plan.review_approved_at or plan.agent_approved_by),
+            "agent_approved_by": plan.agent_approved_by,
+            "public_approved": bool(plan.public_approved_at),
+            "approved_revision_hash": approved_revision_hash,
+        }
+        reservation = AutoFlowRunModel(
+            id=uuid.uuid4(),
+            plan_id=uuid.UUID(plan.plan_id),
+            status="pending",
+            artifacts_json={},
+            publish_json=publish,
+            execute_idempotency_key=key,
+        )
+        db.add(reservation)
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            existing = (
+                await db.execute(
+                    select(AutoFlowRunModel).where(AutoFlowRunModel.execute_idempotency_key == key)
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                raise
+            return _validate_idempotent_replay(existing, plan, approved_revision_hash)
+
+        job_id: uuid.UUID | None = None
+        should_start = False
+        try:
+            if request.execute:
+                await self._validate_owned_input_asset(plan.request, db)
+                pipeline = await create_pipeline(
+                    db,
+                    PipelineCreate(
+                        name=f"AutoFlow {plan.intent.subject}",
+                        description=f"Generated from prompt: {plan.request.prompt}",
+                        definition=plan.pipeline_definition,
+                        is_template=request.save_as_template,
+                        template_tags=["autoflow", plan.template_id],
+                    ),
+                    commit=False,
+                )
+                job = await create_job(db, pipeline.id, commit=False)
+                schedule_state = await get_video_schedule_state(db, commit=False)
+                if schedule_state == VideoScheduleState.OPEN:
+                    should_start = True
+                else:
+                    await park_jobs_for_window(db, [job], commit=False)
+
+                job_id = job.id
+                reservation.pipeline_id = pipeline.id
+                reservation.job_id = job.id
+                reservation.status = str(job.status.value)
+                reservation.artifacts_json = {
+                    "pipeline_id": str(pipeline.id),
+                    "job_id": str(job.id),
+                }
+                plan_row = await db.get(AutoFlowPlanModel, uuid.UUID(plan.plan_id))
+                if plan_row is not None:
+                    plan_row.status = "executed"
+
+            if plan.candidates:
+                await self.recent_usage_store.record_selected_clips(
+                    db,
+                    run_id=str(reservation.id),
+                    candidates=plan.candidates,
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+        await db.refresh(reservation)
+        run = _run_from_model(reservation)
+        if should_start and job_id is not None:
+            await start_jobs_background([job_id])
+        return run
+
     async def _validate_owned_input_asset(
         self,
         request: AutoFlowRequest,
@@ -782,9 +891,17 @@ class AutoFlowService:
             raise PermissionError("AutoFlow execute requires plan_id for persisted execution")
         return request.plan
 
-    async def _save_plan(self, db: AsyncSession, plan: AutoFlowPlan) -> AutoFlowPlan:
+    async def _save_plan(
+        self,
+        db: AsyncSession,
+        plan: AutoFlowPlan,
+        *,
+        commit: bool = True,
+    ) -> AutoFlowPlan:
         plan_uuid = uuid.UUID(plan.plan_id)
         row = await db.get(AutoFlowPlanModel, plan_uuid)
+        if row is not None:
+            plan = _invalidate_approval_for_revision_change(_plan_from_model(row), plan)
         if row is None:
             row = AutoFlowPlanModel(id=plan_uuid)
             db.add(row)
@@ -802,11 +919,15 @@ class AutoFlowService:
         row.validation_json = dict(plan.validation)
         row.status = plan.status
         row.review_approved_at = plan.review_approved_at
+        row.approved_revision_hash = plan.approved_revision_hash
         row.public_approved_at = plan.public_approved_at
         row.agent_approved_by = plan.agent_approved_by
         row.review_notes = plan.review_notes
         row.rejected_reason = plan.rejected_reason
 
+        if not commit:
+            await db.flush()
+            return _plan_from_model(row)
         await db.commit()
         await db.refresh(row)
         return _plan_from_model(row)
@@ -937,6 +1058,7 @@ def _plan_from_model(row: AutoFlowPlanModel) -> AutoFlowPlan:
         needs_review=_needs_review(rights, row.review_approved_at, agent_approved_by=row.agent_approved_by),
         status=row.status,
         review_approved_at=row.review_approved_at,
+        approved_revision_hash=row.approved_revision_hash,
         public_approved_at=row.public_approved_at,
         agent_approved_by=row.agent_approved_by,
         review_notes=row.review_notes,
@@ -955,6 +1077,17 @@ def _run_from_model(row: AutoFlowRunModel) -> AutoFlowRun:
         publish=dict(row.publish_json or {}),
         error_message=row.error_message,
     )
+
+
+def _validate_idempotent_replay(
+    row: AutoFlowRunModel,
+    plan: AutoFlowPlan,
+    approved_revision_hash: str,
+) -> AutoFlowRun:
+    stored_revision_hash = str((row.publish_json or {}).get("approved_revision_hash") or "")
+    if row.plan_id != uuid.UUID(plan.plan_id) or stored_revision_hash != approved_revision_hash:
+        raise ValueError("AutoFlow execute idempotency key was already used for a different plan or revision")
+    return _run_from_model(row)
 
 
 def _request_json(row: AutoFlowPlanModel) -> dict[str, Any]:
@@ -1097,16 +1230,47 @@ def _patched_metadata(metadata: AutoFlowMetadata, patch_metadata: dict[str, Any]
     return AutoFlowMetadata.model_validate({**metadata.model_dump(mode="json"), **patch_metadata})
 
 
-def _patch_resets_approval(patch: AutoFlowPlanPatch) -> bool:
-    return any(
-        (
-            patch.selected_candidate_ids is not None,
-            patch.locked_candidate_ids is not None,
-            patch.replacement_candidates is not None,
-            patch.metadata is not None,
-            patch.publish_mode is not None,
-            bool(patch.publish_settings),
-        )
+def execution_revision_payload(plan: AutoFlowPlan) -> dict[str, Any]:
+    rights = dict(plan.rights)
+    for field in ("review_approved", "public_approved", "agent_approval", "publish_allowed"):
+        rights.pop(field, None)
+    return {
+        "request": plan.request.model_dump(mode="json"),
+        "intent": plan.intent.model_dump(mode="json"),
+        "template_id": plan.template_id,
+        "pipeline_definition": plan.pipeline_definition.model_dump(mode="json"),
+        "storyboard": plan.storyboard.model_dump(mode="json") if plan.storyboard else None,
+        "candidates": [candidate.model_dump(mode="json") for candidate in plan.candidates],
+        "metadata": plan.metadata.model_dump(mode="json"),
+        "validation": dict(plan.validation),
+        "rights": rights,
+    }
+
+
+def execution_revision_hash(plan: AutoFlowPlan) -> str:
+    canonical = json.dumps(
+        execution_revision_payload(plan),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _invalidate_approval_for_revision_change(previous: AutoFlowPlan, updated: AutoFlowPlan) -> AutoFlowPlan:
+    if execution_revision_hash(previous) == execution_revision_hash(updated):
+        return updated
+    rights = _rights_without_approval_state(updated.rights, updated.request.publish_mode)
+    return updated.model_copy(
+        update={
+            "rights": rights,
+            "review_approved_at": None,
+            "approved_revision_hash": None,
+            "public_approved_at": None,
+            "agent_approved_by": None,
+            "needs_review": _needs_review(rights, None),
+            "status": _status_for(rights, updated.request.publish_mode),
+        }
     )
 
 
@@ -1174,6 +1338,11 @@ def _assert_execute_allowed(plan: AutoFlowPlan, request: AutoFlowExecuteRequest)
     publish_mode = plan.request.publish_mode
     upload_requested = publish_mode in {"private_upload", "unlisted_upload", "public_after_review"}
     review_approved = bool(plan.review_approved_at) or bool(plan.agent_approved_by)
+    if review_approved and (
+        not plan.approved_revision_hash
+        or plan.approved_revision_hash != execution_revision_hash(plan)
+    ):
+        raise PermissionError("AutoFlow plan approval does not match the current execution revision")
     if plan.rights.get("status") == "review_required" and upload_requested and not review_approved:
         raise PermissionError("AutoFlow plan requires review approval before upload execution")
 

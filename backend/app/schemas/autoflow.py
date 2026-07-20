@@ -358,6 +358,7 @@ class AutoFlowPlan(BaseModel):
     needs_review: bool = True
     status: AutoFlowPlanStatus = "drafted"
     review_approved_at: datetime | None = None
+    approved_revision_hash: str | None = None
     public_approved_at: datetime | None = None
     agent_approved_by: str | None = None
     review_notes: str | None = None
@@ -394,6 +395,7 @@ class AutoFlowExecuteRequest(BaseModel):
     execute: bool = True
     review_approved: bool = False
     public_approved: bool = False
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=512)
 
 
 class AutoFlowRun(BaseModel):

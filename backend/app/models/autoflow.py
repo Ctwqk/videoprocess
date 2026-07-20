@@ -25,6 +25,7 @@ class AutoFlowPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     validation_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="drafted", nullable=False)
     review_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_revision_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     public_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     agent_approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -47,6 +48,7 @@ class AutoFlowRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     artifacts_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     publish_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    execute_idempotency_key: Mapped[str | None] = mapped_column(String(512), unique=True, nullable=True)
 
 
 class AutoFlowUsedClip(UUIDPrimaryKeyMixin, Base):

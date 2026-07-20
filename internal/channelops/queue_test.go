@@ -61,7 +61,7 @@ func TestClaimNextForKindsQueryFiltersAndOrdersLikePython(t *testing.T) {
 }
 
 func TestClaimNextForChannelAndKindsQueryScopesChannel(t *testing.T) {
-	if !strings.Contains(claimNextForChannelAndKindsQuery, "channel_profile_id = $5::uuid") {
+	if !strings.Contains(claimNextForChannelAndKindsQuery, "COALESCE(q.channel_profile_id, authority.authoritative_channel_id) = $5::uuid") {
 		t.Fatalf("scoped claim query does not filter by channel_profile_id:\n%s", claimNextForChannelAndKindsQuery)
 	}
 	if !strings.Contains(claimNextForChannelAndKindsQuery, "kind = ANY($4)") {

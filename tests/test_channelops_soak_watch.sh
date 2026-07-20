@@ -82,6 +82,7 @@ write_state() {
   local stale_minutes="${5:-45}"
   local grace_hours="${6:-30}"
   local auto_hold="${7:-false}"
+  local extra_forbidden_pattern="${8:-}"
 
   mkdir -p "$STATE_DIR"
   {
@@ -92,6 +93,9 @@ write_state() {
     printf 'VP_SOAK_UPLOAD_STALE_MINUTES=%s\n' "$stale_minutes"
     printf 'VP_SOAK_FEEDBACK_GRACE_HOURS=%s\n' "$grace_hours"
     printf 'VP_SOAK_AUTO_HOLD=%s\n' "$auto_hold"
+    if [[ -n "$extra_forbidden_pattern" ]]; then
+      printf 'VP_SOAK_FORBIDDEN_NODE_PATTERN=%s\n' "$extra_forbidden_pattern"
+    fi
   } >"$STATE_DIR/vp-soak-watch.env"
 }
 
@@ -156,6 +160,13 @@ if [[ "${1:-} ${2:-}" == "service ps" ]]; then
       starting) printf 'colima-127|Starting 2 seconds ago\n'; exit 0 ;;
       preparing) printf 'colima-127|Preparing 2 seconds ago\n'; exit 0 ;;
       rejected) printf 'colima-127|Rejected 2 seconds ago\n'; exit 0 ;;
+    esac
+  fi
+  if [[ "$service" == "vp-ffmpeg-worker-go-swarm" ]]; then
+    case "${FAKE_DOCKER_MODE:-healthy}" in
+      forbidden_hostname) printf 'CASPERs-Mac-mini|Running 2 minutes ago\n'; exit 0 ;;
+      forbidden_bridge) printf 'colima-swarmbridged|Running 2 minutes ago\n'; exit 0 ;;
+      forbidden_ip) printf '10.0.0.126|Running 2 minutes ago\n'; exit 0 ;;
     esac
   fi
   if [[ "${FAKE_DOCKER_MODE:-healthy}" == "forbidden" \
@@ -244,6 +255,38 @@ assert_contains 'status=disabled reason=not_enabled' "$OUTPUT"
 [[ ! -s "$CALLS" ]] || fail "disabled state contacted Docker"
 assert_contains 'VP_SOAK_WATCH_ENABLED=false' "$STATE_DIR/vp-soak-watch.env"
 
+# State values are literal data, and unsupported shell syntax never executes.
+marker="$TEST_ROOT/state-parser-command-ran"
+mkdir -p "$STATE_DIR"
+{
+  printf 'VP_SOAK_WATCH_ENABLED=false\n'
+  printf 'VP_SOAK_CHANNEL_ID=$(touch %s)\n' "$marker"
+} >"$STATE_DIR/vp-soak-watch.env"
+run_watcher
+[[ "$WATCHER_EXIT" -eq 0 ]] || fail "literal command substitution in disabled state must remain disabled"
+assert_contains 'status=disabled reason=not_enabled' "$OUTPUT"
+[[ ! -e "$marker" ]] || fail "state command substitution executed"
+[[ ! -s "$CALLS" ]] || fail "literal disabled state contacted Docker"
+
+{
+  printf 'VP_SOAK_WATCH_ENABLED=false\n'
+  printf 'malicious() { touch %s; }\n' "$marker"
+} >"$STATE_DIR/vp-soak-watch.env"
+run_watcher
+[[ "$WATCHER_EXIT" -ne 0 ]] || fail "function syntax must fail configuration"
+assert_contains 'status=configuration_error reason=invalid_state_file' "$OUTPUT"
+[[ ! -e "$marker" ]] || fail "state function syntax executed"
+[[ ! -s "$CALLS" ]] || fail "function syntax contacted Docker"
+
+{
+  printf 'VP_SOAK_WATCH_ENABLED=false\n'
+  printf 'UNSUPPORTED_STATE_KEY=value\n'
+} >"$STATE_DIR/vp-soak-watch.env"
+run_watcher
+[[ "$WATCHER_EXIT" -ne 0 ]] || fail "unsupported state key must fail configuration"
+assert_contains 'status=configuration_error reason=unsupported_state_key' "$OUTPUT"
+[[ ! -s "$CALLS" ]] || fail "unsupported state key contacted Docker"
+
 # Enabled invalid state fails closed before credentials or Docker are touched.
 write_state true not-a-uuid
 run_watcher
@@ -307,9 +350,24 @@ for FAKE_DATE_MODE in gnu bsd; do
   [[ "$WATCHER_EXIT" -ne 0 ]] || fail "$FAKE_DATE_MODE 301-second boundary must fail"
   assert_contains 'status=configuration_error reason=future_started_at' "$OUTPUT"
   [[ ! -s "$CALLS" ]] || fail "$FAKE_DATE_MODE 301-second boundary contacted Docker"
+
+  for forbidden_mode in forbidden_hostname forbidden_bridge forbidden_ip; do
+    write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:35:00Z 1 45 30 false '^$'
+    FAKE_DOCKER_MODE="$forbidden_mode"
+    run_watcher
+    [[ "$WATCHER_EXIT" -eq 0 ]] || fail "$FAKE_DATE_MODE immutable forbidden-node check failed"
+    assert_contains '|--external-condition|forbidden_node_placement' "$CALLS"
+  done
 done
 rm "$FAKE_BIN/date"
 unset FAKE_DATE_MODE
+FAKE_DOCKER_MODE=healthy
+
+write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:30:00Z 1 45 30 false '['
+run_watcher
+[[ "$WATCHER_EXIT" -ne 0 ]] || fail "invalid extra forbidden-node regex must fail"
+assert_contains 'status=configuration_error reason=invalid_forbidden_node_pattern' "$OUTPUT"
+[[ ! -s "$CALLS" ]] || fail "invalid extra forbidden-node regex contacted Docker"
 
 write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:30:00Z 0
 run_watcher

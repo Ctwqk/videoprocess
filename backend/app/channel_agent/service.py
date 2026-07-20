@@ -118,7 +118,7 @@ class ChannelAgentService:
         self.event_outbox = event_outbox or EventOutbox()
         self.pds_health_monitor_enabled = pds_health_monitor_enabled
         self._pds_last_success_at: datetime | None = None
-        self._pds_last_alert_bucket: str | None = None
+        self._pds_last_alert_buckets: dict[str, str] = {}
 
     async def tick(
         self,
@@ -691,6 +691,7 @@ class ChannelAgentService:
                 context={
                     "lane_id": str(lane.id) if lane is not None else "",
                     "candidate_id": str(candidate.get("candidate_id") or ""),
+                    "channel_id": str(account.channel_profile_id),
                 },
             ),
         )
@@ -998,6 +999,7 @@ class ChannelAgentService:
                     context={
                         "production_task_id": str(task.id),
                         "autoflow_plan_id": str(task.autoflow_plan_id),
+                        "channel_id": str(task.channel_profile_id),
                     },
                 ),
             )
@@ -1377,6 +1379,7 @@ class ChannelAgentService:
                     "publication_id": str(publication.id),
                     "task_id": str(task.id),
                     "target_visibility": visibility,
+                    "channel_id": str(task.channel_profile_id),
                 },
             ),
         )
@@ -1685,10 +1688,12 @@ class ChannelAgentService:
         if not self.pds_health_monitor_enabled:
             return
         now = self.clock.now()
+        channel_id = str(request.context.get("channel_id") or "").strip()
+        alert_scope = channel_id or "global"
         health = should_enqueue_pds_outage_alert(
             now=now,
             last_success_at=self._pds_last_success_at,
-            last_alert_bucket=self._pds_last_alert_bucket,
+            last_alert_bucket=self._pds_last_alert_buckets.get(alert_scope),
         )
         if not health.should_alert:
             return
@@ -1706,6 +1711,7 @@ class ChannelAgentService:
                 "warning": str(metadata.get("warning") or ""),
                 "fail_policy": str(metadata.get("fail_policy") or ""),
             },
+            channel_id=channel_id or None,
             now=now,
         )
         await self.queue.enqueue(
@@ -1714,9 +1720,10 @@ class ChannelAgentService:
             idempotency_key=str(payload["dedupe_key"]),
             payload=payload,
             priority=5,
+            channel_profile_id=_uuid(channel_id) if channel_id else None,
             commit=False,
         )
-        self._pds_last_alert_bucket = utc_hour_bucket(now)
+        self._pds_last_alert_buckets[alert_scope] = utc_hour_bucket(now)
 
     async def _material_payloads_for_task(
         self,
@@ -1946,6 +1953,7 @@ class ChannelAgentService:
             severity=severity,
             message=message,
             details=details or {},
+            channel_id=str(channel_profile_id) if channel_profile_id is not None else None,
             now=self.clock.now(),
         )
         return await self.queue.enqueue(

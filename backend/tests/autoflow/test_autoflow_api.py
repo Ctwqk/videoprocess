@@ -21,7 +21,12 @@ from app.models.autoflow import AutoFlowUsedClip
 from app.models.autoflow import ContentMetric, TrendSignal
 from app.models.asset import Asset
 from app.orchestrator.dag import validate_pipeline
-from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowExecuteRequest, AutoFlowRequest
+from app.schemas.autoflow import (
+    AutoFlowClipCandidate,
+    AutoFlowExecuteRequest,
+    AutoFlowPlanPatch,
+    AutoFlowRequest,
+)
 from app.schemas.pipeline import PipelineDefinition
 
 
@@ -454,6 +459,194 @@ async def test_blocked_db_plan_cannot_be_approved(autoflow_db_session):
 
     assert response.status_code == 400
     assert "blocked" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_approved_plan_persists_exact_execution_revision_hash(autoflow_db_session):
+    service = AutoFlowService()
+    plan = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_required")
+    autoflow_db_session.add(plan)
+    await autoflow_db_session.commit()
+
+    approved = await service.approve(str(plan.id), autoflow_db_session, review_notes="exact revision reviewed")
+
+    assert approved is not None
+    assert approved.review_approved_at is not None
+    assert approved.approved_revision_hash is not None
+    assert len(approved.approved_revision_hash) == 64
+    await autoflow_db_session.refresh(plan)
+    assert plan.approved_revision_hash == approved.approved_revision_hash
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "request",
+        "intent",
+        "template",
+        "pipeline_definition",
+        "candidates",
+        "metadata",
+        "validation",
+        "rights",
+    ],
+)
+async def test_save_invalidates_approval_when_execution_revision_changes(autoflow_db_session, mutation):
+    service = AutoFlowService()
+    row = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_required")
+    autoflow_db_session.add(row)
+    await autoflow_db_session.commit()
+    approved = await service.approve(str(row.id), autoflow_db_session)
+    assert approved is not None
+
+    if mutation == "request":
+        changed = approved.model_copy(
+            update={"request": approved.request.model_copy(update={"prompt": "Changed executable request"})}
+        )
+    elif mutation == "intent":
+        changed = approved.model_copy(
+            update={"intent": approved.intent.model_copy(update={"style": "changed-style"})}
+        )
+    elif mutation == "template":
+        changed = approved.model_copy(update={"template_id": "changed-template"})
+    elif mutation == "pipeline_definition":
+        definition = approved.pipeline_definition.model_dump(mode="json")
+        definition["viewport"] = {"x": 1, "y": 0, "zoom": 1}
+        changed = approved.model_copy(
+            update={"pipeline_definition": PipelineDefinition.model_validate(definition)}
+        )
+    elif mutation == "candidates":
+        changed = approved.model_copy(
+            update={
+                "candidates": [
+                    AutoFlowClipCandidate(
+                        id="changed-candidate",
+                        title="Changed candidate",
+                        source_type="asset",
+                        asset_id="changed-asset",
+                        rights_status="allowed",
+                    )
+                ]
+            }
+        )
+    elif mutation == "metadata":
+        changed = approved.model_copy(
+            update={"metadata": approved.metadata.model_copy(update={"description": "Changed metadata"})}
+        )
+    elif mutation == "validation":
+        changed = approved.model_copy(
+            update={"validation": {**approved.validation, "repairs": ["changed repair"]}}
+        )
+    else:
+        changed = approved.model_copy(
+            update={"rights": {**approved.rights, "reasons": ["changed rights finding"]}}
+        )
+
+    saved = await service._save_plan(autoflow_db_session, changed)
+
+    assert saved.review_approved_at is None
+    assert saved.public_approved_at is None
+    assert saved.agent_approved_by is None
+    assert saved.approved_revision_hash is None
+    assert saved.needs_review is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("patch", "expected_request_field"),
+    [
+        (
+            AutoFlowPlanPatch(
+                target_platforms=["youtube"],
+                rebuild_definition=False,
+                validate=False,
+                evaluate_rights=False,
+            ),
+            "target_platforms",
+        ),
+        (
+            AutoFlowPlanPatch(
+                user_constraints={"tone": "strict"},
+                rebuild_definition=False,
+                validate=False,
+                evaluate_rights=False,
+            ),
+            "user_constraints",
+        ),
+    ],
+)
+async def test_target_platform_and_constraint_patches_invalidate_exact_approval(
+    autoflow_db_session,
+    patch,
+    expected_request_field,
+):
+    service = AutoFlowService()
+    row = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_required")
+    autoflow_db_session.add(row)
+    await autoflow_db_session.commit()
+    approved = await service.approve(str(row.id), autoflow_db_session)
+    assert approved is not None
+
+    changed = await service.patch_plan(str(row.id), patch, autoflow_db_session)
+
+    assert changed is not None
+    assert changed.review_approved_at is None
+    assert changed.approved_revision_hash is None
+    if expected_request_field == "target_platforms":
+        assert changed.request.target_platforms == ["youtube"]
+    else:
+        assert changed.request.user_constraints == {"tone": "strict"}
+
+
+@pytest.mark.asyncio
+async def test_true_noop_patch_and_save_preserve_exact_approval(autoflow_db_session):
+    service = AutoFlowService()
+    row = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_required")
+    autoflow_db_session.add(row)
+    await autoflow_db_session.commit()
+    approved = await service.approve(str(row.id), autoflow_db_session)
+    assert approved is not None
+    approved_at = approved.review_approved_at
+    approved_hash = approved.approved_revision_hash
+
+    saved = await service._save_plan(autoflow_db_session, approved)
+    patched = await service.patch_plan(
+        str(row.id),
+        AutoFlowPlanPatch(
+            target_platforms=list(approved.request.target_platforms),
+            user_constraints={},
+            rebuild_definition=False,
+            validate=False,
+            evaluate_rights=False,
+        ),
+        autoflow_db_session,
+    )
+
+    assert saved.review_approved_at == approved_at
+    assert saved.approved_revision_hash == approved_hash
+    assert patched is not None
+    assert patched.review_approved_at == approved_at
+    assert patched.approved_revision_hash == approved_hash
+
+
+@pytest.mark.asyncio
+async def test_legacy_approved_plan_without_revision_hash_fails_closed_until_reapproved(autoflow_db_session):
+    service = AutoFlowService()
+    row = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_approved")
+    row.review_approved_at = datetime.now(timezone.utc)
+    autoflow_db_session.add(row)
+    await autoflow_db_session.commit()
+
+    with pytest.raises(PermissionError, match="revision"):
+        await service.execute(
+            AutoFlowExecuteRequest(plan_id=str(row.id), execute=False),
+            db=autoflow_db_session,
+        )
+
+    reapproved = await service.approve(str(row.id), autoflow_db_session)
+    assert reapproved is not None
+    assert reapproved.approved_revision_hash is not None
 
 
 @pytest.mark.asyncio
