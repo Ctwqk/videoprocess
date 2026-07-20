@@ -191,6 +191,13 @@ class JobEngine:
     async def _before_initial_launch_recheck(self, job_id: uuid.UUID) -> None:
         return None
 
+    async def _before_initial_node_launch_recheck(
+        self,
+        job_id: uuid.UUID,
+        node_id: str,
+    ) -> None:
+        return None
+
     async def _lock_initial_launch_authority(
         self,
         db: AsyncSession,
@@ -318,7 +325,21 @@ class JobEngine:
 
         r = _redis()
         try:
-            for node_id, deps in dep_map.items():
+            for node_id in dep_map:
+                current_dep_map = dep_map
+                if guard_initial_launch:
+                    await self._before_initial_node_launch_recheck(job.id, node_id)
+                    fresh_job = await self._lock_initial_launch_authority(db, job.id)
+                    if fresh_job is None:
+                        return
+                    job = fresh_job
+                    definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
+                    current_dep_map = build_dependency_map(definition)
+                    ne_by_node_id = {ne.node_id: ne for ne in job.node_executions}
+
+                deps = current_dep_map.get(node_id)
+                if deps is None:
+                    continue
                 ne = ne_by_node_id.get(node_id)
                 if not ne or ne.status != NodeStatus.PENDING:
                     continue

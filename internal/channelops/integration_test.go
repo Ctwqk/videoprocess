@@ -488,8 +488,13 @@ func TestAutomaticOwnedPromotionRejectFirstPreventsPDSAndYouTube(t *testing.T) {
 	if err := rejectTx.Commit(ctx); err != nil {
 		t.Fatalf("commit plan rejection: %v", err)
 	}
-	if err := <-handleDone; err != nil {
-		t.Fatalf("automatic promotion after rejection: %v", err)
+	select {
+	case err := <-handleDone:
+		if err != nil {
+			t.Fatalf("automatic promotion after rejection: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for automatic promotion after rejection")
 	}
 	if recorder.pds.Load() != 0 || youtube.calls.Load() != 0 {
 		t.Fatalf("automatic promotion side effects pds/youtube = %d/%d, want 0/0", recorder.pds.Load(), youtube.calls.Load())
@@ -566,13 +571,23 @@ func TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites(t *testing.T) 
 	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationDone)
 
 	releaseOnce.Do(func() { close(releaseYouTube) })
-	handleErr := <-handleDone
+	var handleErr error
+	select {
+	case handleErr = <-handleDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for automatic promotion completion")
+	}
 	handleFinished = true
 	if handleErr != nil {
 		t.Fatalf("automatic promotion: %v", handleErr)
 	}
-	if err := <-invalidationDone; err != nil {
-		t.Fatalf("canonical invalidation: %v", err)
+	select {
+	case err := <-invalidationDone:
+		if err != nil {
+			t.Fatalf("canonical invalidation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for canonical invalidation completion")
 	}
 	if recorder.pds.Load() != 1 || youtube.calls.Load() != 1 {
 		t.Fatalf("automatic promotion side effects pds/youtube = %d/%d, want 1/1", recorder.pds.Load(), youtube.calls.Load())
@@ -667,7 +682,12 @@ func TestPromotionRevalidatesFencedChannelAfterTaskScopeLock(t *testing.T) {
 			if err := blocker.Commit(ctx); err != nil {
 				t.Fatalf("commit task reassignment: %v", err)
 			}
-			handleErr := <-handleDone
+			var handleErr error
+			select {
+			case handleErr = <-handleDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for reassigned promotion completion")
+			}
 			if !errors.Is(handleErr, ErrQueueAuthorityInvalid) {
 				t.Fatalf("Handle error = %v, want invalid queue authority", handleErr)
 			}

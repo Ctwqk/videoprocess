@@ -446,3 +446,151 @@ async def test_quarantine_after_running_commit_prevents_stale_initial_dispatch(
     assert stored_node is not None and stored_node.status == NodeStatus.CANCELLED
     assert stored_schedule is not None and stored_schedule.state == VideoScheduleState.CLOSED.value
     assert redis.dispatches == []
+
+
+async def test_quarantine_between_initial_roots_does_not_revive_second_root(
+    postgres_race_db,
+    monkeypatch,
+):
+    _engine, factory = postgres_race_db
+    definition = {
+        "nodes": [
+            {
+                "id": "trim_a",
+                "type": "trim",
+                "position": {"x": 0, "y": 0},
+                "data": {"label": "Trim A", "config": {"start_time": 0, "end_time": 1}},
+            },
+            {
+                "id": "trim_b",
+                "type": "trim",
+                "position": {"x": 200, "y": 0},
+                "data": {"label": "Trim B", "config": {"start_time": 1, "end_time": 2}},
+            },
+        ],
+        "edges": [],
+    }
+    async with factory() as db:
+        channel = ChannelProfile(name="two-root dispatch race", enabled=True, dry_run=False)
+        db.add(channel)
+        await db.flush()
+        account = PublishingAccount(
+            channel_profile_id=channel.id,
+            account_label="two-root dispatch race",
+            credential_ref="youtube/two-root-dispatch-race",
+            default_privacy="unlisted",
+        )
+        pipeline = Pipeline(name="two-root dispatch race", description="", definition=definition)
+        db.add_all([account, pipeline])
+        await db.flush()
+        job = Job(
+            pipeline_id=pipeline.id,
+            pipeline_snapshot=definition,
+            status=JobStatus.PENDING,
+            orchestrator_owner="python",
+        )
+        db.add(job)
+        await db.flush()
+        root_a = NodeExecution(
+            job_id=job.id,
+            node_id="trim_a",
+            node_type="trim",
+            node_label="Trim A",
+            node_config={"start_time": 0, "end_time": 1},
+            status=NodeStatus.PENDING,
+        )
+        root_b = NodeExecution(
+            job_id=job.id,
+            node_id="trim_b",
+            node_type="trim",
+            node_label="Trim B",
+            node_config={"start_time": 1, "end_time": 2},
+            status=NodeStatus.PENDING,
+        )
+        task = ProductionTask(
+            channel_profile_id=channel.id,
+            target_account_id=account.id,
+            prompt="two-root dispatch race",
+            state="producing",
+            job_id=job.id,
+            channel_config_snapshot_json={},
+        )
+        db.add_all([root_a, root_b, task])
+        await db.commit()
+        channel_id = channel.id
+        task_id = task.id
+        job_id = job.id
+        root_b_id = root_b.id
+
+    before_root_b_authority = asyncio.Event()
+    release_starter = asyncio.Event()
+    used_per_root_recheck = False
+
+    class RecordingRedis:
+        def __init__(self) -> None:
+            self.dispatches: list[tuple[str, dict]] = []
+
+        async def xadd(self, stream_key: str, payload: dict) -> None:
+            self.dispatches.append((stream_key, payload))
+
+        async def aclose(self) -> None:
+            return None
+
+    redis = RecordingRedis()
+    job_engine = JobEngine()
+    original_cache_check = job_engine._apply_cached_artifact_if_available
+
+    async def pause_before_root_recheck(_job_id, node_id):
+        nonlocal used_per_root_recheck
+        if node_id != "trim_b":
+            return
+        used_per_root_recheck = True
+        before_root_b_authority.set()
+        await release_starter.wait()
+
+    async def pause_old_path_before_root_b_queue(db, current_job, node, input_artifacts):
+        if node.node_id == "trim_b" and not used_per_root_recheck:
+            before_root_b_authority.set()
+            await release_starter.wait()
+        return await original_cache_check(db, current_job, node, input_artifacts)
+
+    monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
+    monkeypatch.setattr("app.orchestrator.engine._redis", lambda: redis)
+    monkeypatch.setattr(
+        job_engine,
+        "_before_initial_node_launch_recheck",
+        pause_before_root_recheck,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        job_engine,
+        "_apply_cached_artifact_if_available",
+        pause_old_path_before_root_b_queue,
+    )
+
+    starter = asyncio.create_task(job_engine.start_job(job_id))
+    await asyncio.wait_for(before_root_b_authority.wait(), timeout=5)
+    assert [payload["node_id"] for _stream, payload in redis.dispatches] == ["trim_a"]
+    try:
+        async with factory() as quarantine_db:
+            result = await quarantine_channelops_backlog(
+                quarantine_db,
+                channel_id,
+                apply=True,
+                close_schedule=True,
+            )
+        assert result["schedule"]["final_state"] == VideoScheduleState.CLOSED.value
+    finally:
+        release_starter.set()
+        await asyncio.wait_for(starter, timeout=5)
+
+    async with factory() as db:
+        stored_task = await db.get(ProductionTask, task_id)
+        stored_job = await db.get(Job, job_id)
+        stored_root_b = await db.get(NodeExecution, root_b_id)
+        stored_schedule = await db.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+    assert [payload["node_id"] for _stream, payload in redis.dispatches] == ["trim_a"]
+    assert stored_task is not None and stored_task.state == "held"
+    assert stored_job is not None and stored_job.status == JobStatus.CANCELLED
+    assert stored_root_b is not None and stored_root_b.status == NodeStatus.CANCELLED
+    assert stored_schedule is not None and stored_schedule.state == VideoScheduleState.CLOSED.value
