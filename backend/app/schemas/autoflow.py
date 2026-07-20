@@ -357,8 +357,10 @@ class AutoFlowPlan(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     needs_review: bool = True
     status: AutoFlowPlanStatus = "drafted"
+    execution_revision: int = 1
     review_approved_at: datetime | None = None
     approved_revision_hash: str | None = None
+    approved_revision: int | None = None
     public_approved_at: datetime | None = None
     agent_approved_by: str | None = None
     review_notes: str | None = None

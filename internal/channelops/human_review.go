@@ -19,8 +19,10 @@ type planReviewAuthority struct {
 	ID                   string
 	Status               string
 	Rights               map[string]any
+	ExecutionRevision    int64
 	ReviewApprovedAt     *time.Time
 	ApprovedRevisionHash *string
+	ApprovedRevision     *int64
 }
 
 func (s *Store) ValidPreUploadHumanReview(ctx context.Context, task ProductionTaskRow) (bool, error) {
@@ -34,8 +36,7 @@ func (s *Store) ValidPreUploadHumanReview(ctx context.Context, task ProductionTa
 	if err != nil {
 		return false, err
 	}
-	if invalidReviewPlan(plan) || plan.ReviewApprovedAt == nil || plan.ApprovedRevisionHash == nil ||
-		strings.TrimSpace(*plan.ApprovedRevisionHash) == "" || plan.ID != *task.AutoFlowPlanID {
+	if !validPlanReviewAuthority(plan) || plan.ID != *task.AutoFlowPlanID {
 		return false, nil
 	}
 	evidence := mapFromAny(task.HumanReviewEvidenceJSON["pre_upload"])
@@ -49,6 +50,9 @@ func (s *Store) ValidPreUploadHumanReview(ctx context.Context, task ProductionTa
 		return false, nil
 	}
 	if firstString(evidence, "plan_approved_revision_hash") != *plan.ApprovedRevisionHash {
+		return false, nil
+	}
+	if revision, ok := intValue(evidence["plan_approved_revision"]); !ok || int64(revision) != *plan.ApprovedRevision {
 		return false, nil
 	}
 	return timestampMatches(firstString(evidence, "plan_review_approved_at"), *plan.ReviewApprovedAt), nil
@@ -74,7 +78,21 @@ func (s *Store) ValidPromotionHumanReview(
 		return false, nil
 	}
 	if !taskUsesExternalAssets(task) {
-		return true, nil
+		if task.AutoFlowPlanID == nil {
+			return true, nil
+		}
+		plan, err := s.loadPlanReviewAuthority(ctx, *task.AutoFlowPlanID)
+		if err != nil {
+			return false, err
+		}
+		if !validPlanReviewAuthority(plan) {
+			return false, nil
+		}
+		revision, ok := intValue(evidence["plan_approved_revision"])
+		return ok && firstString(evidence, "autoflow_plan_id") == plan.ID &&
+			timestampMatches(firstString(evidence, "plan_review_approved_at"), *plan.ReviewApprovedAt) &&
+			firstString(evidence, "plan_approved_revision_hash") == *plan.ApprovedRevisionHash &&
+			int64(revision) == *plan.ApprovedRevision, nil
 	}
 	validPreUpload, err := s.ValidPreUploadHumanReview(ctx, task)
 	if err != nil || !validPreUpload {
@@ -83,7 +101,8 @@ func (s *Store) ValidPromotionHumanReview(
 	preUpload := mapFromAny(task.HumanReviewEvidenceJSON["pre_upload"])
 	return firstString(evidence, "autoflow_plan_id") == firstString(preUpload, "autoflow_plan_id") &&
 		firstString(evidence, "plan_review_approved_at") == firstString(preUpload, "plan_review_approved_at") &&
-		firstString(evidence, "plan_approved_revision_hash") == firstString(preUpload, "plan_approved_revision_hash"), nil
+		firstString(evidence, "plan_approved_revision_hash") == firstString(preUpload, "plan_approved_revision_hash") &&
+		intValuesMatch(evidence["plan_approved_revision"], preUpload["plan_approved_revision"]), nil
 }
 
 func (s *Store) loadPlanReviewAuthority(ctx context.Context, planID string) (planReviewAuthority, error) {
@@ -93,10 +112,20 @@ func (s *Store) loadPlanReviewAuthority(ctx context.Context, planID string) (pla
 	var plan planReviewAuthority
 	var rightsJSON []byte
 	err := s.db().QueryRow(ctx, `
-		SELECT id, status, rights_json, review_approved_at, approved_revision_hash
+		SELECT id, status, rights_json, execution_revision, review_approved_at,
+		       approved_revision_hash, approved_revision
 		FROM autoflow_plans
 		WHERE id = $1::uuid
-	`, planID).Scan(&plan.ID, &plan.Status, &rightsJSON, &plan.ReviewApprovedAt, &plan.ApprovedRevisionHash)
+		FOR UPDATE
+	`, planID).Scan(
+		&plan.ID,
+		&plan.Status,
+		&rightsJSON,
+		&plan.ExecutionRevision,
+		&plan.ReviewApprovedAt,
+		&plan.ApprovedRevisionHash,
+		&plan.ApprovedRevision,
+	)
 	if err != nil {
 		return planReviewAuthority{}, err
 	}
@@ -110,6 +139,18 @@ func invalidReviewPlan(plan planReviewAuthority) bool {
 	status := strings.ToLower(strings.TrimSpace(plan.Status))
 	rightsStatus := strings.ToLower(strings.TrimSpace(firstString(plan.Rights, "status")))
 	return status == "blocked" || status == "rejected" || rightsStatus == "blocked" || rightsStatus == "rejected"
+}
+
+func validPlanReviewAuthority(plan planReviewAuthority) bool {
+	return !invalidReviewPlan(plan) && plan.ReviewApprovedAt != nil &&
+		plan.ApprovedRevisionHash != nil && strings.TrimSpace(*plan.ApprovedRevisionHash) != "" &&
+		plan.ApprovedRevision != nil && *plan.ApprovedRevision == plan.ExecutionRevision
+}
+
+func intValuesMatch(left any, right any) bool {
+	leftValue, leftOK := intValue(left)
+	rightValue, rightOK := intValue(right)
+	return leftOK && rightOK && leftValue == rightValue
 }
 
 func validReviewTimestamp(raw string) bool {

@@ -20,6 +20,7 @@ from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
 from app.models.autoflow import AutoFlowUsedClip
 from app.models.autoflow import ContentMetric, TrendSignal
 from app.models.asset import Asset
+from app.models.schedule import RuntimeSchedule
 from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import (
     AutoFlowClipCandidate,
@@ -36,6 +37,7 @@ async def autoflow_db_session():
     async with engine.begin() as conn:
         for table in (
             Asset.__table__,
+            RuntimeSchedule.__table__,
             AutoFlowPlanModel.__table__,
             AutoFlowRunModel.__table__,
             AutoFlowUsedClip.__table__,
@@ -656,18 +658,18 @@ async def test_public_after_review_requires_public_approval_after_ordinary_appro
     _reset_autoflow_singletons()
     app = _app_with_db(autoflow_db_session)
 
-    async def fake_create_pipeline(db, data):
+    async def fake_create_pipeline(db, data, *, commit=True):
         return SimpleNamespace(id=uuid.uuid4())
 
-    async def fake_create_job(db, pipeline_id):
+    async def fake_create_job(db, pipeline_id, *, commit=True):
         return SimpleNamespace(id=uuid.uuid4(), status=SimpleNamespace(value="PENDING"))
 
-    async def fake_start_or_defer_jobs(db, jobs):
+    async def fake_start_jobs_background(job_ids):
         return None
 
     monkeypatch.setattr("app.autoflow.service.create_pipeline", fake_create_pipeline)
     monkeypatch.setattr("app.autoflow.service.create_job", fake_create_job)
-    monkeypatch.setattr("app.autoflow.service.start_or_defer_jobs", fake_start_or_defer_jobs)
+    monkeypatch.setattr("app.autoflow.service.start_jobs_background", fake_start_jobs_background)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.post(
@@ -1089,14 +1091,14 @@ async def test_storyboard_material_plan_materializes_matches_and_keeps_missing_s
 
 
 @pytest.mark.asyncio
-async def test_execute_persists_failed_run_when_job_creation_fails(autoflow_db_session, monkeypatch):
+async def test_execute_rolls_back_run_when_job_creation_fails(autoflow_db_session, monkeypatch):
     _reset_autoflow_singletons()
     app = _app_with_db(autoflow_db_session)
 
-    async def fake_create_pipeline(db, data):
+    async def fake_create_pipeline(db, data, *, commit=True):
         return SimpleNamespace(id=uuid.uuid4())
 
-    async def fake_create_job(db, pipeline_id):
+    async def fake_create_job(db, pipeline_id, *, commit=True):
         raise RuntimeError("job planner unavailable")
 
     monkeypatch.setattr("app.autoflow.service.create_pipeline", fake_create_pipeline)
@@ -1113,14 +1115,8 @@ async def test_execute_persists_failed_run_when_job_creation_fails(autoflow_db_s
         assert created.status_code == 200
         plan = created.json()
 
-        executed = await client.post("/api/v1/autoflow/execute", json={"plan_id": plan["plan_id"]})
-        assert executed.status_code == 200
-        run = executed.json()
-        assert run["status"] == "failed"
-        assert "job planner unavailable" in run["error_message"]
+        with pytest.raises(RuntimeError, match="job planner unavailable"):
+            await client.post("/api/v1/autoflow/execute", json={"plan_id": plan["plan_id"]})
 
-        autoflow_api_module.autoflow_service._runs.clear()
-
-        fetched_run = await client.get(f"/api/v1/autoflow/runs/{run['run_id']}")
-        assert fetched_run.status_code == 200
-        assert fetched_run.json()["status"] == "failed"
+    runs = (await autoflow_db_session.execute(select(AutoFlowRunModel))).scalars().all()
+    assert runs == []

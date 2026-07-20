@@ -61,6 +61,14 @@ func (s *Store) beginOrReuse(ctx context.Context) (pgx.Tx, bool, error) {
 	return tx, true, err
 }
 
+func (s *Store) hasExecutionTransaction() bool {
+	if s == nil {
+		return false
+	}
+	_, ok := s.executionDB.(pgx.Tx)
+	return ok
+}
+
 func UTCBucket(now time.Time) string {
 	return now.UTC().Format("2006-01-02-15")
 }

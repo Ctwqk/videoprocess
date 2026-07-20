@@ -20,7 +20,12 @@ from app.node_registry.registry import NodeTypeRegistry
 from app.orchestrator.artifact_cache import IntermediateArtifactCacheService
 from app.schemas.pipeline import PipelineDefinition
 from app.orchestrator.dag import topological_sort, build_dependency_map
-from app.services.schedule_service import get_video_schedule_state, park_job_for_window, should_defer_job_start
+from app.services.schedule_service import (
+    VideoScheduleState,
+    default_video_schedule_state,
+    get_or_create_and_lock_runtime_schedule,
+    should_defer_job_start,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +69,6 @@ class JobEngine:
         if any(status in active_statuses for status in statuses):
             return False
 
-        has_success = any(status == NodeStatus.SUCCEEDED for status in statuses)
         failed_statuses = {NodeStatus.FAILED, NodeStatus.SKIPPED, NodeStatus.CANCELLED}
         has_fail = any(status in failed_statuses for status in statuses)
         definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
@@ -103,9 +107,19 @@ class JobEngine:
     async def start_job(self, job_id: uuid.UUID) -> None:
         """Start executing a job: validate, plan, and dispatch root nodes."""
         async with async_session() as db:
-            job = await db.get(Job, job_id, options=[selectinload(Job.node_executions)])
+            schedule, _created = await get_or_create_and_lock_runtime_schedule(db)
+            job = (
+                await db.execute(
+                    select(Job)
+                    .where(Job.id == job_id)
+                    .options(selectinload(Job.node_executions))
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
             if not job:
                 logger.error(f"Job {job_id} not found")
+                await db.rollback()
                 return
             if job.status in {
                 JobStatus.SUCCEEDED,
@@ -113,11 +127,18 @@ class JobEngine:
                 JobStatus.CANCELLED,
                 JobStatus.PARTIALLY_FAILED,
             }:
+                await db.rollback()
                 return
 
-            schedule_state = await get_video_schedule_state(db)
+            try:
+                schedule_state = VideoScheduleState(schedule.state)
+            except ValueError:
+                schedule_state = default_video_schedule_state()
             if should_defer_job_start(job, schedule_state):
-                await park_job_for_window(db, job)
+                job.status = JobStatus.WAITING_WINDOW
+                job.error_message = None
+                job.completed_at = None
+                await db.commit()
                 logger.info(
                     "Deferred job %s until next video window (state=%s)",
                     job_id,

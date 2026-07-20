@@ -310,6 +310,132 @@ func TestPromotionAuthorityFencesReferencedChannelWithNullOrMismatchedMetadata(t
 	}
 }
 
+func TestPlanRejectFirstPreventsDirectPromotionSideEffects(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
+	taskID := taskIDForQueueItem(t, ctx, fixture, promote)
+	publicationID := firstString(promote.PayloadJSON, "publication_id")
+	setHumanReviewEvidenceForTest(t, ctx, fixture, taskID, "valid", publicationID, "unlisted")
+	promote.PayloadJSON["manual_review"] = true
+
+	rejectTx, err := fixture.Store.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin plan rejection: %v", err)
+	}
+	defer rejectTx.Rollback(ctx)
+	if _, err := rejectTx.Exec(ctx, `
+		UPDATE autoflow_plans
+		SET status = 'rejected', rejected_reason = 'concurrent reviewer rejection'
+		WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
+	`); err != nil {
+		t.Fatalf("stage plan rejection: %v", err)
+	}
+	var rejectPID int
+	if err := rejectTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&rejectPID); err != nil {
+		t.Fatalf("read rejection pid: %v", err)
+	}
+
+	releaseYouTube := make(chan struct{})
+	close(releaseYouTube)
+	youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
+	handler := baseHandler
+	handler.YouTube = youtube
+	handleDone := make(chan error, 1)
+	go func() { handleDone <- handler.HandlePromotePublication(ctx, promote) }()
+
+	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, handleDone)
+	if err := rejectTx.Commit(ctx); err != nil {
+		t.Fatalf("commit plan rejection: %v", err)
+	}
+	if err := <-handleDone; err != nil {
+		t.Fatalf("direct promotion after rejection: %v", err)
+	}
+	if youtube.calls.Load() != 0 {
+		t.Fatalf("YouTube calls after rejection = %d, want 0", youtube.calls.Load())
+	}
+}
+
+func TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
+	taskID := taskIDForQueueItem(t, ctx, fixture, promote)
+	publicationID := firstString(promote.PayloadJSON, "publication_id")
+	setHumanReviewEvidenceForTest(t, ctx, fixture, taskID, "valid", publicationID, "unlisted")
+	promote.PayloadJSON["manual_review"] = true
+
+	releaseYouTube := make(chan struct{})
+	youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
+	handler := baseHandler
+	handler.YouTube = youtube
+	handleDone := make(chan error, 1)
+	go func() { handleDone <- handler.HandlePromotePublication(ctx, promote) }()
+	select {
+	case <-youtube.started:
+	case <-time.After(5 * time.Second):
+		close(releaseYouTube)
+		t.Fatal("direct promotion did not reach YouTube")
+	}
+
+	conn, err := fixture.Store.Pool.Acquire(ctx)
+	if err != nil {
+		close(releaseYouTube)
+		t.Fatalf("acquire invalidation connection: %v", err)
+	}
+	defer conn.Release()
+	var invalidationPID int
+	if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&invalidationPID); err != nil {
+		close(releaseYouTube)
+		t.Fatalf("read invalidation pid: %v", err)
+	}
+	invalidationDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Exec(ctx, `
+			UPDATE autoflow_plans
+			SET prompt = prompt || ' concurrent canonical patch'
+			WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
+		`)
+		invalidationDone <- err
+	}()
+	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationDone)
+
+	close(releaseYouTube)
+	if err := <-handleDone; err != nil {
+		t.Fatalf("direct promotion: %v", err)
+	}
+	if err := <-invalidationDone; err != nil {
+		t.Fatalf("canonical invalidation: %v", err)
+	}
+	if youtube.calls.Load() != 1 {
+		t.Fatalf("YouTube calls = %d, want 1", youtube.calls.Load())
+	}
+	var approvedRevisionHash *string
+	var approvedRevision *int64
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT approved_revision_hash, approved_revision
+		FROM autoflow_plans
+		WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
+	`).Scan(&approvedRevisionHash, &approvedRevision); err != nil {
+		t.Fatalf("read invalidated plan authority: %v", err)
+	}
+	if approvedRevisionHash != nil || approvedRevision != nil {
+		t.Fatalf("plan authority survived canonical patch: hash=%v revision=%v", approvedRevisionHash, approvedRevision)
+	}
+}
+
 func TestRunnerImmediatelyRejectsInvalidQueueAuthority(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -1914,6 +2040,10 @@ func (f *ChannelOpsFixture) cleanup(ctx context.Context) {
 		)
 		DELETE FROM channel_profiles WHERE id = $1::uuid
 	`, f.ChannelID)
+	_, _ = f.Store.Pool.Exec(ctx, `
+		DELETE FROM autoflow_plans
+		WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
+	`)
 	for _, channelID := range f.AdditionalChannelIDs {
 		_, _ = f.Store.Pool.Exec(ctx, `DELETE FROM channel_profiles WHERE id = $1::uuid`, channelID)
 	}
@@ -2275,6 +2405,7 @@ func setHumanReviewEvidenceForTest(
 	evidencePlanID := planID
 	approvedRevisionHash := strings.Repeat("a", 64)
 	evidenceRevisionHash := approvedRevisionHash
+	approvedRevision := int64(1)
 	if evidenceCase == "stale" {
 		planToken = approvedAt.Add(-time.Second)
 	}
@@ -2291,19 +2422,28 @@ func setHumanReviewEvidenceForTest(
 		INSERT INTO autoflow_plans (
 			id, prompt, request_json, intent_json, template_id, pipeline_definition,
 			candidates_json, metadata_json, rights_json, validation_json, status,
-			review_approved_at, approved_revision_hash, created_at, updated_at
+			execution_revision, review_approved_at, approved_revision_hash,
+			approved_revision, created_at, updated_at
 		) VALUES (
 			$1::uuid, 'review fixture', '{}'::json, '{}'::json, 'material_library_remix',
 			'{"nodes": [], "edges": []}'::json, '[]'::json, '{}'::json,
 			'{"status": "review_required"}'::json, '{"valid": true}'::json, $2,
-			$3::timestamptz, $4, NOW(), NOW()
+			1, $3::timestamptz, $4, $5, NOW(), NOW()
 		)
 		ON CONFLICT (id) DO UPDATE
 		SET status = EXCLUDED.status,
 		    review_approved_at = EXCLUDED.review_approved_at,
-		    approved_revision_hash = EXCLUDED.approved_revision_hash
-	`, planID, planStatus, approvedAt, approvedRevisionHash); err != nil {
+		    approved_revision_hash = EXCLUDED.approved_revision_hash,
+		    approved_revision = autoflow_plans.execution_revision
+	`, planID, planStatus, approvedAt, approvedRevisionHash, approvedRevision); err != nil {
 		t.Fatalf("upsert AutoFlow plan: %v", err)
+	}
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT execution_revision
+		FROM autoflow_plans
+		WHERE id = $1::uuid
+	`, planID).Scan(&approvedRevision); err != nil {
+		t.Fatalf("read AutoFlow execution revision: %v", err)
 	}
 	evidence := map[string]any{}
 	if evidenceCase != "missing" && evidenceCase != "agent_only" {
@@ -2315,6 +2455,7 @@ func setHumanReviewEvidenceForTest(
 			"autoflow_plan_id":            evidencePlanID,
 			"plan_review_approved_at":     planToken.Format(time.RFC3339Nano),
 			"plan_approved_revision_hash": evidenceRevisionHash,
+			"plan_approved_revision":      approvedRevision,
 		}
 	}
 	if evidenceCase == "valid" && publicationID != "" {
@@ -2329,6 +2470,7 @@ func setHumanReviewEvidenceForTest(
 			"autoflow_plan_id":            planID,
 			"plan_review_approved_at":     approvedAt.Format(time.RFC3339Nano),
 			"plan_approved_revision_hash": approvedRevisionHash,
+			"plan_approved_revision":      approvedRevision,
 		}
 	}
 	agentEvidence := map[string]any{}
@@ -2385,6 +2527,79 @@ func waitForChannelLockOrExternalCall(
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("promotion did not wait on quarantined channel lock")
+}
+
+func waitForPlanLockOrExternalCall(
+	t *testing.T,
+	ctx context.Context,
+	fixture *ChannelOpsFixture,
+	blockerPID int,
+	youtube *blockingPromotionYouTube,
+	handleDone <-chan error,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-youtube.started:
+			t.Fatal("promotion called YouTube before rejected plan authority committed")
+		case err := <-handleDone:
+			t.Fatalf("promotion completed before waiting on plan authority: %v", err)
+		default:
+		}
+		var waiting bool
+		if err := fixture.Store.Pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_locks waiter
+				JOIN pg_locks blocker
+				  ON blocker.locktype = 'transactionid'
+				 AND blocker.transactionid = waiter.transactionid
+				 AND blocker.granted
+				WHERE waiter.locktype = 'transactionid'
+				  AND NOT waiter.granted
+				  AND blocker.pid = $1
+			)
+		`, blockerPID).Scan(&waiting); err != nil {
+			t.Fatalf("inspect plan lock waiter: %v", err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("promotion did not wait on rejected plan authority")
+}
+
+func waitForDatabaseLock(
+	t *testing.T,
+	ctx context.Context,
+	fixture *ChannelOpsFixture,
+	pid int,
+	operationDone <-chan error,
+) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-operationDone:
+			t.Fatalf("database writer completed before expected lock: %v", err)
+		default:
+		}
+		var waiting bool
+		if err := fixture.Store.Pool.QueryRow(ctx, `
+			SELECT COALESCE(wait_event_type = 'Lock', FALSE)
+			FROM pg_stat_activity
+			WHERE pid = $1
+		`, pid).Scan(&waiting); err != nil {
+			t.Fatalf("inspect database writer wait: %v", err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("database writer did not reach expected lock")
 }
 
 func countQueueChildren(t *testing.T, ctx context.Context, fixture *ChannelOpsFixture, parentID string) int {

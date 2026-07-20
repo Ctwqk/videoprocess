@@ -101,7 +101,16 @@ func (c HTTPAutoFlowClient) ExecuteTask(ctx context.Context, task ProductionTask
 	if approvedRevisionHash == "" {
 		return AutoFlowExecuteObservation{}, fmt.Errorf("autoflow approved revision hash is required")
 	}
-	idempotencyKey := "channelops-execute:" + taskID + ":" + planID + ":" + approvedRevisionHash
+	if task.AutoFlowApprovedRevision == nil || *task.AutoFlowApprovedRevision < 1 {
+		return AutoFlowExecuteObservation{}, fmt.Errorf("autoflow approved revision is required")
+	}
+	idempotencyKey := fmt.Sprintf(
+		"channelops-execute:%s:%s:%d:%s",
+		taskID,
+		planID,
+		*task.AutoFlowApprovedRevision,
+		approvedRevisionHash,
+	)
 	payload, err := c.postJSON(ctx, "/api/v1/autoflow/execute", map[string]any{
 		"plan_id":         planID,
 		"execute":         true,

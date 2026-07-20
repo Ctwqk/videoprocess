@@ -605,7 +605,7 @@ async def promote_publication(
     human_actor = review.human_actor.strip()
     if not human_actor:
         raise HTTPException(status_code=400, detail="human_actor must be nonblank")
-    channel, task, publication = await _lock_publication_operator_scope(db, publication_id)
+    channel, task, publication, plan = await _lock_publication_operator_scope(db, publication_id)
     if channel is None or not channel.enabled or channel.halted_at is not None:
         raise HTTPException(status_code=409, detail="Channel is disabled or halted")
     eligible_pds_hold = task.state == TASK_HELD and task.blocked_by_guard in {
@@ -617,7 +617,6 @@ async def promote_publication(
     ):
         raise HTTPException(status_code=409, detail="Publication is not ready for promotion")
     target_visibility = _safe_promotion_visibility(publication.desired_privacy)
-    plan = await db.get(AutoFlowPlan, task.autoflow_plan_id) if task.autoflow_plan_id else None
     if task_uses_external_assets(task) and not valid_pre_upload_evidence(task, plan):
         raise HTTPException(status_code=409, detail="External asset review evidence is missing or stale")
     if plan is not None and plan.review_approved_at is None:
@@ -778,7 +777,7 @@ async def release_human_review(
 
 @router.post("/publications/{publication_id}/reject")
 async def reject_publication(publication_id: str, db: AsyncSession = Depends(get_db)):
-    publication, task = await _publication_with_task(db, publication_id)
+    _channel, task, publication, _plan = await _lock_publication_operator_scope(db, publication_id)
     if publication.publish_status not in {"uploaded", "held", "rejected"}:
         raise HTTPException(status_code=409, detail="Publication cannot be safely rejected from its current state")
     now = datetime.now(timezone.utc)
@@ -927,7 +926,7 @@ async def _lock_task_operator_scope(
 async def _lock_publication_operator_scope(
     db: AsyncSession,
     publication_id: str,
-) -> tuple[ChannelProfile, ProductionTask, PublicationRecord]:
+) -> tuple[ChannelProfile, ProductionTask, PublicationRecord, AutoFlowPlan | None]:
     publication_uuid = _uuid(publication_id)
     discovered_publication = await db.get(PublicationRecord, publication_uuid)
     if discovered_publication is None:
@@ -965,7 +964,19 @@ async def _lock_publication_operator_scope(
         raise HTTPException(status_code=409, detail="Publication state changed during review")
     if task.channel_profile_id != channel.id or publication.production_task_id != task.id:
         raise HTTPException(status_code=409, detail="Publication authority changed during review")
-    return channel, task, publication
+    plan = None
+    if task.autoflow_plan_id is not None:
+        plan = (
+            await db.execute(
+                select(AutoFlowPlan)
+                .where(AutoFlowPlan.id == task.autoflow_plan_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if plan is None:
+            raise HTTPException(status_code=409, detail="Publication AutoFlow plan was not found")
+    return channel, task, publication, plan
 
 
 async def _validate_manual_seed_references(

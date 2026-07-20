@@ -86,6 +86,7 @@ func TestHTTPAutoFlowApprovePlanPostsReviewNotes(t *testing.T) {
 func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 	planID := "plan-from-task"
 	approvedRevisionHash := "approved-revision-hash"
+	approvedRevision := int64(7)
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -105,7 +106,7 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 		if payload["execute"] != true {
 			t.Fatalf("execute = %#v", payload["execute"])
 		}
-		wantKey := "channelops-execute:task-1:" + planID + ":" + approvedRevisionHash
+		wantKey := "channelops-execute:task-1:" + planID + ":7:" + approvedRevisionHash
 		if payload["idempotency_key"] != wantKey {
 			t.Fatalf("idempotency_key = %#v, want %q", payload["idempotency_key"], wantKey)
 		}
@@ -119,6 +120,7 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 		ID:                           "task-1",
 		AutoFlowPlanID:               &planID,
 		AutoFlowApprovedRevisionHash: &approvedRevisionHash,
+		AutoFlowApprovedRevision:     &approvedRevision,
 	}
 	observation, err := client.ExecuteTask(context.Background(), task, nil)
 	if err != nil {
@@ -155,6 +157,7 @@ func TestHTTPAutoFlowExecuteTaskRequiresApprovedRevisionHash(t *testing.T) {
 func TestHTTPAutoFlowExecuteTaskMapsFailedRun(t *testing.T) {
 	planID := "plan-from-task"
 	approvedRevisionHash := "approved-revision-hash"
+	approvedRevision := int64(1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"run_id":"","job_id":"","status":"failed","error_message":"execute blocked"}`))
@@ -166,6 +169,7 @@ func TestHTTPAutoFlowExecuteTaskMapsFailedRun(t *testing.T) {
 		ID:                           "task-1",
 		AutoFlowPlanID:               &planID,
 		AutoFlowApprovedRevisionHash: &approvedRevisionHash,
+		AutoFlowApprovedRevision:     &approvedRevision,
 	}, nil)
 	if err != nil {
 		t.Fatalf("ExecuteTask returned error: %v", err)

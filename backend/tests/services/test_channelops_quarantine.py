@@ -514,7 +514,7 @@ async def test_concurrent_schedule_close_commits_both_quarantines(
         assert await seed_session.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE) is None
 
     schedule_insert_barrier = asyncio.Barrier(2)
-    original_create_or_lock = channelops_quarantine_service._create_or_lock_runtime_schedule
+    original_create_or_lock = channelops_quarantine_service.get_or_create_and_lock_runtime_schedule
 
     async def coordinate_schedule_create(*args, **kwargs):
         await schedule_insert_barrier.wait()
@@ -522,7 +522,7 @@ async def test_concurrent_schedule_close_commits_both_quarantines(
 
     monkeypatch.setattr(
         channelops_quarantine_service,
-        "_create_or_lock_runtime_schedule",
+        "get_or_create_and_lock_runtime_schedule",
         coordinate_schedule_create,
     )
 

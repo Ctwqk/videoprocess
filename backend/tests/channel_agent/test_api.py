@@ -96,7 +96,9 @@ def _review_plan(*, status: str = "review_required", rights_status: str = "revie
         },
         validation_json={"valid": True, "errors": [], "warnings": [], "repairs": []},
         status=status,
+        execution_revision=1,
         approved_revision_hash="a" * 64 if status == "review_approved" else None,
+        approved_revision=1 if status == "review_approved" else None,
     )
 
 
@@ -945,6 +947,7 @@ async def test_human_review_release_approves_exact_plan_and_enqueues_execution(a
     assert task.state == "planning"
     assert task.blocked_by_guard is None
     assert plan.review_approved_at is not None
+    assert plan.approved_revision == plan.execution_revision
     evidence = task.human_review_evidence_json["pre_upload"]
     assert evidence["kind"] == "human_review"
     assert evidence["scope"] == "external_asset_pre_upload"
@@ -954,6 +957,7 @@ async def test_human_review_release_approves_exact_plan_and_enqueues_execution(a
     if persisted_token.tzinfo is None:
         persisted_token = persisted_token.replace(tzinfo=timezone.utc)
     assert datetime.fromisoformat(evidence["plan_review_approved_at"]) == persisted_token
+    assert evidence["plan_approved_revision"] == plan.approved_revision
     assert evidence["review_notes"] == "assets checked"
     queue_rows = (
         await api_session.execute(
@@ -1165,6 +1169,7 @@ async def test_manual_promotion_preserves_external_plan_review_token(api_session
                 "autoflow_plan_id": str(plan.id),
                 "plan_review_approved_at": approved_at.isoformat(),
                 "plan_approved_revision_hash": plan.approved_revision_hash,
+                "plan_approved_revision": plan.approved_revision,
             }
         },
         state="uploaded_private",
@@ -1197,6 +1202,7 @@ async def test_manual_promotion_preserves_external_plan_review_token(api_session
     assert promotion["autoflow_plan_id"] == str(plan.id)
     assert datetime.fromisoformat(promotion["plan_review_approved_at"]) == approved_at
     assert promotion["plan_approved_revision_hash"] == plan.approved_revision_hash
+    assert promotion["plan_approved_revision"] == plan.approved_revision
     assert promotion["publication_id"] == str(publication.id)
 
 

@@ -144,7 +144,7 @@ async def test_postgres_16_fresh_repair_and_mixed_writer_migrations() -> None:
         conn = await asyncpg.connect(_asyncpg_url(target_url))
         try:
             assert await conn.fetchval("SELECT version()")
-            assert await conn.fetchval("SELECT version_num FROM alembic_version") == "025_autoflow_revision_idempotency"
+            assert await conn.fetchval("SELECT version_num FROM alembic_version") == "026_autoflow_authority_fence"
             assert await conn.fetchval(
                 "SELECT column_default FROM information_schema.columns "
                 "WHERE table_name = 'production_tasks' AND column_name = 'human_review_evidence_json'"

@@ -370,6 +370,20 @@ func (h HandlerService) HandlePublishTask(ctx context.Context, item QueueItemRow
 }
 
 func (h HandlerService) HandlePromotePublication(ctx context.Context, item QueueItemRow) error {
+	if h.Store == nil {
+		return errors.New("channelops handler store is not configured")
+	}
+	if !h.Store.hasExecutionTransaction() {
+		return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
+			fencedHandler := h
+			fencedHandler.Store = fencedStore
+			return fencedHandler.handlePromotePublication(ctx, item)
+		})
+	}
+	return h.handlePromotePublication(ctx, item)
+}
+
+func (h HandlerService) handlePromotePublication(ctx context.Context, item QueueItemRow) error {
 	if h.PDS == nil {
 		return errors.New("pds client is not configured")
 	}
@@ -380,11 +394,7 @@ func (h HandlerService) HandlePromotePublication(ctx context.Context, item Queue
 	if publicationID == "" {
 		return errors.New("promote_publication payload missing publication_id")
 	}
-	publication, err := h.Store.GetPublication(ctx, publicationID)
-	if err != nil {
-		return err
-	}
-	task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+	publication, task, err := h.Store.LockPromotionOperatorScope(ctx, publicationID)
 	if err != nil {
 		return err
 	}

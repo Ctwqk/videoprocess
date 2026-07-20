@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import enum
+from typing import Any, cast
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -60,22 +64,66 @@ async def _get_or_create_runtime_schedule(
     *,
     commit: bool = True,
 ) -> RuntimeSchedule:
-    schedule = await db.get(RuntimeSchedule, service_name)
-    if schedule:
-        return schedule
-
-    schedule = RuntimeSchedule(
+    schedule, _created = await get_or_create_and_lock_runtime_schedule(
+        db,
         service_name=service_name,
-        state=default_state.value,
-        updated_by="system",
+        default_state=default_state,
     )
-    db.add(schedule)
     if not commit:
-        await db.flush()
         return schedule
     await db.commit()
     await db.refresh(schedule)
     return schedule
+
+
+async def get_or_create_and_lock_runtime_schedule(
+    db: AsyncSession,
+    *,
+    service_name: str = VIDEO_SCHEDULE_SERVICE,
+    default_state: VideoScheduleState | None = None,
+) -> tuple[RuntimeSchedule, bool]:
+    """Create if needed and lock schedule authority without committing.
+
+    Lock order: an existing Go fence owns channel first; Python then locks
+    schedule -> plan -> job. Quarantine locks channel -> schedule -> task /
+    publication / job. Starters lock schedule -> job.
+    """
+    resolved_default = default_state or default_video_schedule_state()
+    values = {
+        "service_name": service_name,
+        "state": resolved_default.value,
+        "updated_by": "system",
+    }
+    dialect_name = db.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        insert_result = cast(
+            CursorResult[Any],
+            await db.execute(
+                postgresql_insert(RuntimeSchedule)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=[RuntimeSchedule.service_name])
+            ),
+        )
+    elif dialect_name == "sqlite":
+        insert_result = cast(
+            CursorResult[Any],
+            await db.execute(
+                sqlite_insert(RuntimeSchedule)
+                .values(**values)
+                .on_conflict_do_nothing(index_elements=[RuntimeSchedule.service_name])
+            ),
+        )
+    else:
+        raise RuntimeError(f"Unsupported runtime schedule dialect: {dialect_name}")
+    schedule = (
+        await db.execute(
+            select(RuntimeSchedule)
+            .where(RuntimeSchedule.service_name == service_name)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    return schedule, insert_result.rowcount == 1
 
 
 async def get_video_schedule_record(db: AsyncSession, *, commit: bool = True) -> RuntimeSchedule:
@@ -101,7 +149,7 @@ async def set_video_schedule_state(
     *,
     updated_by: str = "system",
 ) -> RuntimeSchedule:
-    schedule = await get_video_schedule_record(db)
+    schedule, _created = await get_or_create_and_lock_runtime_schedule(db)
     schedule.state = state.value
     schedule.updated_by = updated_by
     await db.commit()

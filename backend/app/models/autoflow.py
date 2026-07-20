@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid as uuid_mod
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,8 +24,15 @@ class AutoFlowPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     rights_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     validation_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="drafted", nullable=False)
+    execution_revision: Mapped[int] = mapped_column(
+        BigInteger,
+        default=1,
+        server_default=text("1"),
+        nullable=False,
+    )
     review_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     approved_revision_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approved_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     public_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     agent_approved_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     review_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -49,6 +56,7 @@ class AutoFlowRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     publish_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     execute_idempotency_key: Mapped[str | None] = mapped_column(String(512), unique=True, nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class AutoFlowUsedClip(UUIDPrimaryKeyMixin, Base):

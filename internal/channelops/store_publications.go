@@ -234,6 +234,43 @@ func (s *Store) GetPublication(ctx context.Context, publicationID string) (Publi
 	return row, nil
 }
 
+func (s *Store) LockPromotionOperatorScope(ctx context.Context, publicationID string) (PublicationRow, ProductionTaskRow, error) {
+	discovered, err := s.GetPublication(ctx, publicationID)
+	if err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, err
+	}
+	var lockedTaskID string
+	if err := s.db().QueryRow(ctx, `
+		SELECT id
+		FROM production_tasks
+		WHERE id = $1::uuid
+		FOR UPDATE
+	`, discovered.ProductionTaskID).Scan(&lockedTaskID); err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, err
+	}
+	var lockedPublicationTaskID string
+	if err := s.db().QueryRow(ctx, `
+		SELECT production_task_id
+		FROM publication_records
+		WHERE id = $1::uuid
+		FOR UPDATE
+	`, publicationID).Scan(&lockedPublicationTaskID); err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, err
+	}
+	if lockedPublicationTaskID != lockedTaskID {
+		return PublicationRow{}, ProductionTaskRow{}, fmt.Errorf("publication %s authority changed", publicationID)
+	}
+	task, err := s.GetProductionTask(ctx, lockedTaskID)
+	if err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, err
+	}
+	publication, err := s.GetPublication(ctx, publicationID)
+	if err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, err
+	}
+	return publication, task, nil
+}
+
 func (s *Store) UpdatePublicationStatus(ctx context.Context, publicationID string, status YouTubePublicationStatus) error {
 	if err := requireUUID("publication_id", publicationID); err != nil {
 		return err

@@ -38,6 +38,9 @@ def build_pre_upload_evidence(
     approved_revision_hash = _plan_approved_revision_hash(plan)
     if approved_revision_hash is None:
         raise ValueError("AutoFlow plan has no approved execution revision hash")
+    approved_revision = _plan_approved_revision(plan)
+    if approved_revision is None or approved_revision != _plan_execution_revision(plan):
+        raise ValueError("AutoFlow plan has no approved execution revision")
     token = _datetime_token(approved_at)
     evidence: dict[str, Any] = {
         "kind": "human_review",
@@ -47,6 +50,7 @@ def build_pre_upload_evidence(
         "autoflow_plan_id": _plan_id(plan),
         "plan_review_approved_at": token,
         "plan_approved_revision_hash": approved_revision_hash,
+        "plan_approved_revision": approved_revision,
     }
     if review_notes is not None:
         evidence["review_notes"] = review_notes
@@ -79,11 +83,15 @@ def build_promotion_evidence(
         approved_revision_hash = _plan_approved_revision_hash(plan)
         if approved_revision_hash is None:
             raise ValueError("AutoFlow plan has no approved execution revision hash")
+        approved_revision = _plan_approved_revision(plan)
+        if approved_revision is None or approved_revision != _plan_execution_revision(plan):
+            raise ValueError("AutoFlow plan has no approved execution revision")
         evidence.update(
             {
                 "autoflow_plan_id": _plan_id(plan),
                 "plan_review_approved_at": _datetime_token(approved_at),
                 "plan_approved_revision_hash": approved_revision_hash,
+                "plan_approved_revision": approved_revision,
             }
         )
     if review_notes is not None:
@@ -97,11 +105,15 @@ def valid_pre_upload_evidence(task: Any, plan: Any | None) -> bool:
     task_plan_id = getattr(task, "autoflow_plan_id", None)
     approved_at = _plan_review_approved_at(plan)
     approved_revision_hash = _plan_approved_revision_hash(plan)
+    approved_revision = _plan_approved_revision(plan)
+    execution_revision = _plan_execution_revision(plan)
     plan_id = _plan_id(plan)
     if (
         task_plan_id is None
         or approved_at is None
         or approved_revision_hash is None
+        or approved_revision is None
+        or approved_revision != execution_revision
         or str(task_plan_id) != plan_id
     ):
         return False
@@ -118,6 +130,7 @@ def valid_pre_upload_evidence(task: Any, plan: Any | None) -> bool:
     return (
         _same_datetime(evidence.get("plan_review_approved_at"), approved_at)
         and evidence.get("plan_approved_revision_hash") == approved_revision_hash
+        and evidence.get("plan_approved_revision") == approved_revision
     )
 
 
@@ -156,6 +169,7 @@ def valid_promotion_evidence(
         evidence.get("autoflow_plan_id") == pre_upload.get("autoflow_plan_id")
         and evidence.get("plan_review_approved_at") == pre_upload.get("plan_review_approved_at")
         and evidence.get("plan_approved_revision_hash") == pre_upload.get("plan_approved_revision_hash")
+        and evidence.get("plan_approved_revision") == pre_upload.get("plan_approved_revision")
     )
 
 
@@ -177,6 +191,20 @@ def _plan_review_approved_at(plan: Any) -> datetime | None:
 def _plan_approved_revision_hash(plan: Any) -> str | None:
     value = getattr(plan, "approved_revision_hash", None)
     return value if isinstance(value, str) and len(value) == 64 else None
+
+
+def _plan_execution_revision(plan: Any) -> int | None:
+    return _positive_int(getattr(plan, "execution_revision", None))
+
+
+def _plan_approved_revision(plan: Any) -> int | None:
+    return _positive_int(getattr(plan, "approved_revision", None))
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
 
 
 def _plan_id(plan: Any) -> str:

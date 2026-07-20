@@ -86,8 +86,10 @@ def _review_plan(*, review_approved_at: datetime | None = None, status: str = "r
         rights_json={"status": "review_required", "reasons": [], "allowed_publish_modes": ["private_upload"]},
         validation_json={"valid": True, "errors": [], "warnings": [], "repairs": []},
         status=status,
+        execution_revision=1,
         review_approved_at=review_approved_at,
         approved_revision_hash="a" * 64 if status == "review_approved" and review_approved_at else None,
+        approved_revision=1 if status == "review_approved" and review_approved_at else None,
     )
 
 
@@ -102,6 +104,7 @@ def _pre_upload_evidence(task: ProductionTask, plan: AutoFlowPlan, *, token: dat
             "autoflow_plan_id": str(plan_id or plan.id),
             "plan_review_approved_at": resolved_token.isoformat() if resolved_token else "",
             "plan_approved_revision_hash": plan.approved_revision_hash,
+            "plan_approved_revision": plan.approved_revision,
             "review_notes": "reviewed",
         }
     }
