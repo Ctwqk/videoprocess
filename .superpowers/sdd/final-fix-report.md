@@ -367,3 +367,179 @@ Implementation commit:
   smoke URL were supplied; its contract and syntax checks passed.
 - Full-tree Ruff and mypy remain nonzero only at the recorded pre-existing
   baselines of 20 findings and 68 errors in 25 files.
+
+## Final Review 3 Consolidated Fix Wave
+
+### Status And Scope
+
+`DONE_WITH_CONCERNS`. Work remained on `codex/channelops-soak-guard` in the
+required worktree, starting from `d5313cf`. No deployment, push, soak
+activation, activation-state change, production access, YouTube interaction,
+upload, publication, or user-owned root-plan edit occurred.
+
+Implementation commit:
+
+- `85e5a63127df3e0dafcab570e0d182e641ad2f00` -
+  `fix: close final review 3 authority gaps`
+- The report-only commit is listed in the final task response because this
+  section must be written before that commit exists.
+
+### Verified Findings And Fixes
+
+- AutoFlow approval now binds to a SHA-256 hash of the canonical execution
+  revision. All direct save and patch paths compare that payload, clear human,
+  public, and agent authority on a real change, preserve authority on true
+  no-ops, and fail closed for legacy approved rows without a hash.
+- Review release and manual promotion lock channel, task, and publication in
+  quarantine order, revalidate after locking, and commit approval, evidence,
+  task state, and queue work atomically. AutoFlow approval supports a
+  flush-only internal path while public endpoint behavior remains unchanged.
+- Revision 024 retains the rolling-writer `{}` server default, repairs queue
+  ownership consistently for task, publication, account, payload-channel, and
+  legacy stored-channel alerts, and dead-letters malformed active rows.
+  Revision 025 additively adds nullable revision and execute-key fields plus a
+  nullable unique execute-key constraint.
+- Go queue claims derive authoritative ownership before channel-state
+  filtering. Valid halted/disabled work remains unclaimed; null, unresolved,
+  unsupported, or mismatched work is claimed once and terminally rejected with
+  its lease cleared and no external call or descendant.
+- Python channel alerts include literal `channel_id` in payload and queue
+  metadata. Go treats payload channel as authoritative, legacy stored-only
+  alerts as channel-bound, and only payload-less/null-metadata alerts as global.
+- The watcher uses a Bash 3.2 allowlist parser for literal state records and
+  never sources state as code. Operator regex is additive to the immutable
+  escaped `CASPERs-Mac-mini`, `colima-swarmbridged`, and `10.0.0.126` baseline.
+- Keyed AutoFlow execution reserves the unique run first, flushes pipeline,
+  job, plan, usage, and schedule state in one transaction, commits before
+  background start, and returns the existing run on replay. Go sends a stable
+  task/plan/revision key on every retry. Legacy no-key execution is preserved.
+
+### Changed Files
+
+- Migrations and schemas: `backend/alembic/versions/024_channelops_human_review_authority.py`,
+  `backend/alembic/versions/025_autoflow_revision_idempotency.py`,
+  `backend/app/models/autoflow.py`, `backend/app/schemas/autoflow.py`.
+- Python authority/runtime: `backend/app/api/channel_agent.py`,
+  `backend/app/autoflow/service.py`, `backend/app/channel_agent/alerts.py`,
+  `backend/app/channel_agent/human_review.py`,
+  `backend/app/channel_agent/service.py`, `backend/app/services/job_service.py`,
+  `backend/app/services/pipeline_service.py`,
+  `backend/app/services/schedule_service.py`.
+- Go authority/runtime: `internal/channelops/autoflow_client.go`,
+  `internal/channelops/execution_fence.go`, `internal/channelops/human_review.go`,
+  `internal/channelops/queue.go`, `internal/channelops/runner.go`,
+  `internal/channelops/store_tasks.go`, `internal/channelops/types.go`.
+- Python tests: `backend/tests/autoflow/test_autoflow_api.py`,
+  `backend/tests/autoflow/test_execute_idempotency_postgres.py`,
+  `backend/tests/channel_agent/test_api.py`,
+  `backend/tests/channel_agent/test_models_queue.py`,
+  `backend/tests/channel_agent/test_operator_quarantine_postgres.py`,
+  `backend/tests/channel_agent/test_service.py`,
+  `backend/tests/migrations/test_final_review3_postgres.py`,
+  `backend/tests/services/test_channelops_soak_guard.py`,
+  `backend/tests/services/test_youtube_upload_operations.py`.
+- Go and shell tests: `internal/channelops/autoflow_client_test.go`,
+  `internal/channelops/integration_test.go`, `internal/channelops/queue_test.go`,
+  `tests/test_channelops_soak_watch.sh`.
+- Watcher and docs: `deploy/swarm/channelops-soak-watch.sh`,
+  `deploy/four-machine-topology.md`, `docs/autoflow/architecture.md`,
+  `docs/channelops-go-live-runner.md`.
+
+### RED Evidence
+
+- Exact revision authority:
+  `cd backend && .venv/bin/python3 -m pytest tests/autoflow/test_autoflow_api.py -k 'exact_execution_revision_hash or execution_revision_changes or target_platform_and_constraint or true_noop or legacy_approved_plan_without_revision_hash' -q`
+  -> `13 failed`; approved hashes were absent, all direct mutation classes and
+  target/constraint patches preserved stale approval, and legacy hash-less
+  approval executed.
+- Rolling migration default:
+  `cd backend && .venv/bin/python3 -m pytest tests/services/test_youtube_upload_operations.py::test_alembic_upgrade_head_renders_offline_postgresql_sql -q`
+  -> `1 failed`; revision 024 rendered `DROP DEFAULT`.
+- Operator/quarantine races:
+  `CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55434/videoprocess .venv/bin/python3 -m pytest tests/channel_agent/test_operator_quarantine_postgres.py -q`
+  -> `4 failed`; release/promotion reached stale completion before expected
+  channel/task/publication serialization. Two subsequent failures identified
+  test-observation details (`SELECT ... FOR UPDATE` text and typed response)
+  before the unchanged four-race suite went green.
+- Queue and alert authority:
+  `DATABASE_URL=postgres://vp:vp_test@127.0.0.1:55434/videoprocess go test ./internal/channelops -run 'TestRunnerImmediatelyRejectsInvalidQueueAuthority|TestAlertQueueAuthorityScopesLegacyAndGlobalRows' -count=1 -v`
+  -> both test groups failed: a stored-halted mismatch stayed queued, an
+  unresolved row retried, and a legacy stored-channel alert dispatched.
+- Python alerts:
+  the focused models/service command for alert payload and PDS outage tests ->
+  `3 failed`; `channel_id` was rejected/absent and two channel outages deduped
+  into one global row.
+- Watcher parser:
+  `bash tests/test_channelops_soak_watch.sh` -> failed with
+  `state command substitution executed`.
+- Execute idempotency:
+  `CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55434/videoprocess .venv/bin/python3 -m pytest tests/autoflow/test_execute_idempotency_postgres.py -q`
+  -> `4 failed, 1 passed`; concurrent and replay calls created distinct runs,
+  failure persisted partial work, and cross-plan key reuse was accepted.
+- Go execute key:
+  the focused HTTP AutoFlow client tests -> `2 failed`; no key was sent and a
+  missing approved revision reached the network.
+- Go evidence hash:
+  the focused external-asset evidence test failed only the
+  `revision_mismatched` subtest because an external execute call was made.
+
+### GREEN Evidence
+
+- Exact revision command above -> `13 passed, 22 deselected`.
+- Offline migration test -> `1 passed`; full offline
+  `alembic upgrade head --sql` also exited 0 through revision 025.
+- Deterministic operator races -> `4 passed in 0.92s`.
+- Queue/alert focused Go tests -> all subtests passed; full
+  `internal/channelops` package later passed.
+- Python alert focused tests -> `3 passed`.
+- Watcher contract -> `PASS: channelops soak watcher contract` on
+  `GNU bash 3.2.57`, including GNU/BSD date paths.
+- Execute idempotency PostgreSQL suite -> `6 passed`, covering concurrent
+  duplicate, response-loss replay, rollback, cross-plan reuse, legacy no-key,
+  and closed-window recovery/no replay start.
+- Focused Go client/handler/evidence tests all passed, including response-loss
+  handler replay with two identical keys.
+- PostgreSQL acceptance bundle:
+  `CHANNEL_OPS_POSTGRES_TEST_URL=postgresql+asyncpg://vp:vp_test@127.0.0.1:55434/videoprocess .venv/bin/python3 -m pytest tests/migrations/test_final_review3_postgres.py tests/channel_agent/test_operator_quarantine_postgres.py tests/autoflow/test_execute_idempotency_postgres.py tests/services/test_channelops_soak_guard.py::test_postgresql_assessment_accepts_mixed_timestamp_column_contracts -q`
+  -> `12 passed in 3.28s`.
+- Full backend: `cd backend && .venv/bin/python3 -m pytest` ->
+  `641 passed, 12 skipped, 11 warnings in 65.38s`; opt-in PostgreSQL tests are
+  among the ordinary skips and passed separately above.
+- Full Go:
+  `DATABASE_URL=postgres://vp:vp_test@127.0.0.1:55434/videoprocess go test ./... -count=1`
+  -> all packages passed.
+- Deployment shell contract: `bash tests/test_vp_deploy_sync_extension.sh` ->
+  exit 0. All three required shell files pass `bash -n`.
+- Image smoke: `bash tests/test_channelops_soak_image_smoke.sh` ->
+  `SKIP: set VP_SOAK_SMOKE_IMAGE and VP_SOAK_SMOKE_DATABASE_URL`.
+- Changed-file Ruff -> `All checks passed!`. Full Ruff reports 19 existing
+  findings, improving the recorded baseline of 20 by removing an unused import
+  from a touched test. `mypy app` remains exactly 68 existing errors in 25
+  files. `git diff --check` -> exit 0.
+
+### PostgreSQL 16 Migration And Cleanup
+
+- Container: `vp-final-review-3-postgres`; ID
+  `65fa8145b8cd40a3034446e1e7c402cab5648a1623b3ede48623484c06cae342`.
+- Image: `postgres:16-alpine`; image ID
+  `sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777`;
+  server `PostgreSQL 16.14` on port `127.0.0.1:55434`.
+- Fresh migration applied revisions 001 through
+  `025_autoflow_revision_idempotency`. The isolated migration test then
+  downgraded a fresh database to `023_youtube_upload_operations`, seeded null,
+  mismatched, unresolved, payload-alert, stored-only alert, and global alert
+  rows, and upgraded through head. Null ownership repaired, malformed rows
+  dead-lettered with cleared leases, alert scope remained correct, and a legacy
+  task insert omitting `human_review_evidence_json` received `{}`.
+- The main disposable database was recreated from empty and migrated to head
+  before full Go verification. `vp-final-review-3-postgres` was force-removed
+  after verification; no test container remains.
+
+### Concerns
+
+- The opt-in real watcher-image smoke did not run because no matching image and
+  isolated smoke database URL were supplied. Its script, watcher contract, and
+  syntax checks passed.
+- Full-tree Ruff and mypy remain nonzero only for the recorded pre-existing
+  baselines: 19 Ruff findings and 68 mypy errors in 25 files. Changed-file Ruff
+  is clean and no new mypy count was introduced.
