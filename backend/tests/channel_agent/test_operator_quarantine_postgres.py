@@ -569,9 +569,9 @@ async def test_quarantine_between_initial_roots_does_not_revive_second_root(
     )
 
     starter = asyncio.create_task(job_engine.start_job(job_id))
-    await asyncio.wait_for(before_root_b_authority.wait(), timeout=5)
-    assert [payload["node_id"] for _stream, payload in redis.dispatches] == ["trim_a"]
     try:
+        await asyncio.wait_for(before_root_b_authority.wait(), timeout=5)
+        assert [payload["node_id"] for _stream, payload in redis.dispatches] == ["trim_a"]
         async with factory() as quarantine_db:
             result = await asyncio.wait_for(
                 quarantine_channelops_backlog(

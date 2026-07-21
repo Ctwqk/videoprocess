@@ -43,10 +43,59 @@ func TestCancellableTestOperationCancelsAndDrains(t *testing.T) {
 	}
 }
 
+func TestCancellableTestOperationTimeoutCancelsAndDrainsBeforeReturning(t *testing.T) {
+	observedCancellation := make(chan struct{})
+	operation := startCancellableTestOperation(t, nil, func(ctx context.Context) error {
+		<-ctx.Done()
+		close(observedCancellation)
+		return ctx.Err()
+	})
+
+	result, err := operation.waitOrCancelAndDrain(20*time.Millisecond, 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("timeout wait returned no diagnostic")
+	}
+	if !errors.Is(result, context.Canceled) {
+		t.Fatalf("operation result = %v, want context cancellation", result)
+	}
+	select {
+	case <-observedCancellation:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("blocked operation did not observe cancellation before helper returned")
+	}
+	if !operation.drained() {
+		t.Fatal("operation was not drained before timeout diagnostic")
+	}
+}
+
+func TestCancellableTestOperationTimeoutMarksFixtureCleanupIneligibleWhenUndrained(t *testing.T) {
+	release := make(chan struct{})
+	operation := startCancellableTestOperation(t, nil, func(context.Context) error {
+		<-release
+		return nil
+	})
+
+	started := time.Now()
+	_, err := operation.waitOrCancelAndDrain(30*time.Millisecond, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("undrained timeout returned no diagnostic")
+	}
+	if elapsed := time.Since(started); elapsed < 70*time.Millisecond || elapsed > 250*time.Millisecond {
+		t.Fatalf("timeout cleanup took %s, want two bounded waits", elapsed)
+	}
+	if fixtureCleanupEligible([]*cancellableTestOperation{operation}) {
+		t.Fatal("fixture cleanup remained eligible after operation failed to drain")
+	}
+
+	close(release)
+	if _, err := operation.wait(100 * time.Millisecond); err != nil {
+		t.Fatalf("drain released synthetic operation: %v", err)
+	}
+}
+
 const testOperationCleanupTimeout = 5 * time.Second
 
 type cancellableTestOperation struct {
-	ctx     context.Context
 	cancel  context.CancelFunc
 	done    chan error
 	release func()
@@ -66,7 +115,6 @@ func startCancellableTestOperation(
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	operation := &cancellableTestOperation{
-		ctx:     ctx,
 		cancel:  cancel,
 		done:    make(chan error, 1),
 		release: release,
@@ -83,6 +131,23 @@ func startCancellableTestOperation(
 func (o *cancellableTestOperation) cancelAndDrain(timeout time.Duration) (error, error) {
 	o.releaseBlocker()
 	o.cancel()
+	return o.drain(timeout)
+}
+
+func (o *cancellableTestOperation) waitOrCancelAndDrain(waitTimeout, drainTimeout time.Duration) (error, error) {
+	result, err := o.wait(waitTimeout)
+	if err == nil {
+		return result, nil
+	}
+
+	drainedResult, drainErr := o.cancelAndDrain(drainTimeout)
+	if drainErr != nil {
+		return nil, fmt.Errorf("operation did not complete within %s and did not drain within %s", waitTimeout, drainTimeout)
+	}
+	return drainedResult, fmt.Errorf("operation did not complete within %s", waitTimeout)
+}
+
+func (o *cancellableTestOperation) drain(timeout time.Duration) (error, error) {
 	result, err := o.wait(timeout)
 	if err != nil {
 		o.mu.Lock()
@@ -148,14 +213,21 @@ func (o *cancellableTestOperation) drained() bool {
 	return o.finished && !o.drainTimed
 }
 
+func fixtureCleanupEligible(operations []*cancellableTestOperation) bool {
+	for _, operation := range operations {
+		if !operation.drained() {
+			return false
+		}
+	}
+	return true
+}
+
 func registerBoundedFixtureCleanup(t *testing.T, fixture *ChannelOpsFixture, operations *[]*cancellableTestOperation) {
 	t.Helper()
 	t.Cleanup(func() {
-		for _, operation := range *operations {
-			if !operation.drained() {
-				t.Errorf("skipping fixture cleanup after an operation failed to drain")
-				return
-			}
+		if !fixtureCleanupEligible(*operations) {
+			t.Errorf("skipping fixture cleanup after an operation failed to drain")
+			return
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), testOperationCleanupTimeout)
 		defer cancel()
@@ -511,7 +583,7 @@ func TestPlanRejectFirstPreventsDirectPromotionSideEffects(t *testing.T) {
 	handleDone := make(chan error, 1)
 	go func() { handleDone <- handler.HandlePromotePublication(ctx, promote) }()
 
-	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, handleDone)
+	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, testOperationChannelProbe(handleDone))
 	if err := rejectTx.Commit(ctx); err != nil {
 		t.Fatalf("commit plan rejection: %v", err)
 	}
@@ -571,7 +643,7 @@ func TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites(t *test
 		`)
 		invalidationDone <- err
 	}()
-	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationDone)
+	waitForDatabaseLock(t, ctx, fixture, invalidationPID, testOperationChannelProbe(invalidationDone))
 
 	close(releaseYouTube)
 	if err := <-handleDone; err != nil {
@@ -647,11 +719,11 @@ func TestAutomaticOwnedPromotionRejectFirstPreventsPDSAndYouTube(t *testing.T) {
 	})
 	operations = append(operations, handleOperation)
 
-	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, handleOperation)
+	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, handleOperation.tryWait)
 	if err := rejectTx.Commit(ctx); err != nil {
 		t.Fatalf("commit plan rejection: %v", err)
 	}
-	handleErr, err := handleOperation.wait(5 * time.Second)
+	handleErr, err := handleOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -730,17 +802,17 @@ func TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites(t *testing.T) 
 		return err
 	})
 	operations = append(operations, invalidationOperation)
-	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationOperation)
+	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationOperation.tryWait)
 
 	handleOperation.releaseBlocker()
-	handleErr, err := handleOperation.wait(5 * time.Second)
+	handleErr, err := handleOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if handleErr != nil {
 		t.Fatalf("automatic promotion: %v", handleErr)
 	}
-	invalidationErr, err := invalidationOperation.wait(5 * time.Second)
+	invalidationErr, err := invalidationOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -848,7 +920,7 @@ func TestPromotionRevalidatesFencedChannelAfterTaskScopeLock(t *testing.T) {
 			if err := blocker.Commit(ctx); err != nil {
 				t.Fatalf("commit task reassignment: %v", err)
 			}
-			handleErr, err := handleOperation.wait(5 * time.Second)
+			handleErr, err := handleOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3035,7 +3107,7 @@ func waitForPlanLockOrExternalCall(
 	fixture *ChannelOpsFixture,
 	blockerPID int,
 	youtube *blockingPromotionYouTube,
-	operation any,
+	probe testOperationProbe,
 ) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -3045,7 +3117,7 @@ func waitForPlanLockOrExternalCall(
 			t.Fatal("promotion called YouTube before rejected plan authority committed")
 		default:
 		}
-		if done, err := tryTestOperationWait(operation); done {
+		if done, err := probe(); done {
 			t.Fatalf("promotion completed before waiting on plan authority: %v", err)
 		}
 		var waiting bool
@@ -3077,12 +3149,12 @@ func waitForDatabaseLock(
 	ctx context.Context,
 	fixture *ChannelOpsFixture,
 	pid int,
-	operation any,
+	probe testOperationProbe,
 ) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if done, err := tryTestOperationWait(operation); done {
+		if done, err := probe(); done {
 			t.Fatalf("database writer completed before expected lock: %v", err)
 		}
 		var waiting bool
@@ -3101,26 +3173,16 @@ func waitForDatabaseLock(
 	t.Fatal("database writer did not reach expected lock")
 }
 
-func tryTestOperationWait(operation any) (bool, error) {
-	switch operation := operation.(type) {
-	case *cancellableTestOperation:
-		return operation.tryWait()
-	case chan error:
+type testOperationProbe func() (bool, error)
+
+func testOperationChannelProbe(operation <-chan error) testOperationProbe {
+	return func() (bool, error) {
 		select {
 		case err := <-operation:
 			return true, err
 		default:
 			return false, nil
 		}
-	case <-chan error:
-		select {
-		case err := <-operation:
-			return true, err
-		default:
-			return false, nil
-		}
-	default:
-		panic(fmt.Sprintf("unsupported test operation %T", operation))
 	}
 }
 
