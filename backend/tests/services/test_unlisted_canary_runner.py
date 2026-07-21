@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import uuid
+from contextlib import contextmanager
 from datetime import timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -78,6 +80,23 @@ def test_execution_mode_rejects_ambiguous_mode(preflight, live):
         runner.execution_mode(args)
 
 
+def test_parse_args_accepts_shared_services_ssh_host(monkeypatch: pytest.MonkeyPatch):
+    runner = load_runner()
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_vp_unlisted_canary.py",
+            "--preflight-only",
+            "--shared-services-ssh-host",
+            "10.0.0.127",
+        ],
+    )
+
+    args = runner.parse_args()
+
+    assert args.shared_services_ssh_host == "10.0.0.127"
+
+
 def test_evidence_path_distinguishes_preflight_mode():
     runner = load_runner()
     args = SimpleNamespace(evidence=None)
@@ -117,6 +136,219 @@ def test_ssh_readonly_command_adds_optional_jump():
         "10.0.0.150",
         "hostname",
     ]
+
+
+def test_shared_service_endpoints_preserve_urls_and_forward_original_targets():
+    runner = load_runner()
+
+    endpoints = runner.build_shared_service_endpoints(
+        database_url=(
+            "postgresql+asyncpg://vp:p%40ss@10.0.0.150:5435/videoprocess"
+            "?application_name=vp-canary"
+        ),
+        redis_url="redis://cache:p%40ss@10.0.0.150:6380/4?health_check_interval=5",
+        youtube_manager_url="http://10.0.0.150:18999/api?source=canary",
+        local_ports=(25435, 26380, 28999),
+    )
+
+    assert endpoints.database_url == (
+        "postgresql+asyncpg://vp:p%40ss@127.0.0.1:25435/videoprocess"
+        "?application_name=vp-canary"
+    )
+    assert endpoints.redis_url == (
+        "redis://cache:p%40ss@127.0.0.1:26380/4?health_check_interval=5"
+    )
+    assert endpoints.youtube_manager_url == "http://127.0.0.1:28999/api?source=canary"
+    assert [
+        (forward.name, forward.local_port, forward.target_host, forward.target_port)
+        for forward in endpoints.forwards
+    ] == [
+        ("database", 25435, "10.0.0.150", 5435),
+        ("redis", 26380, "10.0.0.150", 6380),
+        ("youtube_manager", 28999, "10.0.0.150", 18999),
+    ]
+
+
+def test_shared_service_endpoints_use_defaults_and_omit_empty_redis():
+    runner = load_runner()
+
+    endpoints = runner.build_shared_service_endpoints(
+        database_url="postgresql://vp:secret@database/videoprocess",
+        redis_url="",
+        youtube_manager_url="http://youtube-manager/api",
+        local_ports=(15432, 18080),
+    )
+
+    assert endpoints.database_url == "postgresql://vp:secret@127.0.0.1:15432/videoprocess"
+    assert endpoints.redis_url == ""
+    assert endpoints.youtube_manager_url == "http://127.0.0.1:18080/api"
+    assert [(forward.name, forward.target_port) for forward in endpoints.forwards] == [
+        ("database", 5432),
+        ("youtube_manager", 80),
+    ]
+
+
+def test_shared_service_tunnel_command_is_forward_only_and_argument_safe():
+    runner = load_runner()
+    endpoints = runner.build_shared_service_endpoints(
+        database_url="postgresql://vp:secret@10.0.0.150:5435/videoprocess",
+        redis_url="redis://10.0.0.150:6380/0",
+        youtube_manager_url="http://10.0.0.150:18999",
+        local_ports=(25435, 26380, 28999),
+    )
+
+    assert runner.ssh_tunnel_command("10.0.0.127", endpoints.forwards) == [
+        "ssh",
+        "-N",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-L",
+        "127.0.0.1:25435:10.0.0.150:5435",
+        "-L",
+        "127.0.0.1:26380:10.0.0.150:6380",
+        "-L",
+        "127.0.0.1:28999:10.0.0.150:18999",
+        "10.0.0.127",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("redis_url", "youtube_manager_url"),
+    (
+        ("rediss://10.0.0.150:6380/0", "http://10.0.0.150:18999"),
+        ("redis://10.0.0.150:6380/0", "https://10.0.0.150:18999"),
+    ),
+)
+def test_shared_service_endpoints_reject_tls_hostname_rewrite(
+    redis_url: str,
+    youtube_manager_url: str,
+):
+    runner = load_runner()
+
+    with pytest.raises(runner.CanaryError, match="scheme is unsupported"):
+        runner.build_shared_service_endpoints(
+            database_url="postgresql://vp:secret@10.0.0.150:5435/videoprocess",
+            redis_url=redis_url,
+            youtube_manager_url=youtube_manager_url,
+            local_ports=(25435, 26380, 28999),
+        )
+
+
+@pytest.mark.parametrize(
+    "forbidden_host",
+    ("10.0.0.126", "colima-swarmbridged", "CASPERs-Mac-mini.local"),
+)
+def test_shared_service_tunnel_rejects_126_class_hosts(forbidden_host: str):
+    runner = load_runner()
+    forward = runner.TunnelForward("database", 25435, "10.0.0.150", 5435)
+
+    with pytest.raises(runner.CanaryError, match="forbidden"):
+        runner.ssh_tunnel_command(forbidden_host, (forward,))
+
+
+class FakeTunnelProcess:
+    def __init__(self, *, returncode: int | None = None, stop_on_terminate: bool = True):
+        self.returncode = returncode
+        self.stop_on_terminate = stop_on_terminate
+        self.terminated = False
+        self.killed = False
+        self.wait_calls: list[float] = []
+
+    def wait(self, timeout: float):
+        self.wait_calls.append(timeout)
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired(cmd="ssh", timeout=timeout)
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        if self.stop_on_terminate:
+            self.returncode = 0
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+def test_shared_service_tunnel_always_terminates_and_waits():
+    runner = load_runner()
+    process = FakeTunnelProcess()
+    popen_calls = []
+
+    def popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return process
+
+    with runner.open_shared_service_tunnel(
+        ssh_host="10.0.0.127",
+        database_url="postgresql://vp:secret@10.0.0.150:5435/videoprocess",
+        redis_url="redis://10.0.0.150:6380/0",
+        youtube_manager_url="http://10.0.0.150:18999",
+        local_ports=(25435, 26380, 28999),
+        popen_factory=popen,
+        startup_timeout_seconds=0.01,
+    ) as endpoints:
+        assert endpoints.database_url.startswith("postgresql://vp:secret@127.0.0.1:25435/")
+
+    assert process.terminated is True
+    assert process.killed is False
+    assert process.wait_calls == [0.01, 5.0]
+    assert len(popen_calls) == 1
+    _command, kwargs = popen_calls[0]
+    assert kwargs == {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+
+
+def test_shared_service_tunnel_startup_exit_fails_closed_without_diagnostics():
+    runner = load_runner()
+    process = FakeTunnelProcess(returncode=255)
+
+    with pytest.raises(runner.CanaryError, match="exited during startup") as raised:
+        with runner.open_shared_service_tunnel(
+            ssh_host="10.0.0.127",
+            database_url="postgresql://vp:secret@10.0.0.150:5435/videoprocess",
+            redis_url="",
+            youtube_manager_url="http://10.0.0.150:18999",
+            local_ports=(25435, 28999),
+            popen_factory=lambda *_args, **_kwargs: process,
+            startup_timeout_seconds=0.01,
+        ):
+            raise AssertionError("startup failure yielded a tunnel")
+
+    assert "secret" not in str(raised.value)
+    assert process.terminated is False
+    assert process.killed is False
+
+
+def test_shared_service_tunnel_kills_process_that_ignores_terminate():
+    runner = load_runner()
+    process = FakeTunnelProcess(stop_on_terminate=False)
+
+    with runner.open_shared_service_tunnel(
+        ssh_host="10.0.0.127",
+        database_url="postgresql://vp:secret@10.0.0.150:5435/videoprocess",
+        redis_url="",
+        youtube_manager_url="http://10.0.0.150:18999",
+        local_ports=(25435, 28999),
+        popen_factory=lambda *_args, **_kwargs: process,
+        startup_timeout_seconds=0.01,
+    ):
+        pass
+
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.wait_calls == [0.01, 5.0, 5.0]
 
 
 @pytest.mark.anyio
@@ -251,6 +483,94 @@ async def test_run_records_connection_failure_without_schedule_mutation(
     assert payload["schedule"]["final_state"] is None
     close.assert_not_awaited()
     assert disposed is True
+
+
+@pytest.mark.anyio
+async def test_run_routes_shared_services_before_database_and_records_safe_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    disposed = False
+    tunnel_exited = False
+    tunnel_arguments = {}
+    engine_urls = []
+
+    class FailingConnectionContext:
+        async def __aenter__(self):
+            raise ConnectionRefusedError("database unavailable")
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FailingEngine:
+        def connect(self):
+            return FailingConnectionContext()
+
+        async def dispose(self):
+            nonlocal disposed
+            disposed = True
+
+    @contextmanager
+    def fake_tunnel(**kwargs):
+        nonlocal tunnel_exited
+        tunnel_arguments.update(kwargs)
+        try:
+            yield runner.SharedServiceEndpoints(
+                database_url="postgresql+asyncpg://vp:secret@127.0.0.1:25435/videoprocess",
+                redis_url="redis://127.0.0.1:26380/0",
+                youtube_manager_url="http://127.0.0.1:28999",
+                forwards=(
+                    runner.TunnelForward("database", 25435, "10.0.0.150", 5435),
+                    runner.TunnelForward("redis", 26380, "10.0.0.150", 6380),
+                    runner.TunnelForward("youtube_manager", 28999, "10.0.0.150", 18999),
+                ),
+            )
+        finally:
+            tunnel_exited = True
+
+    def create_engine(url, **_kwargs):
+        engine_urls.append(url)
+        return FailingEngine()
+
+    monkeypatch.setattr(runner, "open_shared_service_tunnel", fake_tunnel)
+    monkeypatch.setattr(runner, "create_async_engine", create_engine)
+    path = tmp_path / "tunnel-connection-failure.json"
+    args = SimpleNamespace(
+        evidence=path,
+        preflight_only=True,
+        confirm_live_unlisted=False,
+        redis_url="redis://10.0.0.150:6380/0",
+        youtube_manager_url="http://10.0.0.150:18999",
+        shared_services_ssh_host="10.0.0.127",
+    )
+    database_url = "postgresql+asyncpg://vp:secret@10.0.0.150:5435/videoprocess"
+
+    with pytest.raises(ConnectionRefusedError):
+        await runner.run(args, database_url)
+
+    assert tunnel_arguments == {
+        "ssh_host": "10.0.0.127",
+        "database_url": database_url,
+        "redis_url": "redis://10.0.0.150:6380/0",
+        "youtube_manager_url": "http://10.0.0.150:18999",
+    }
+    assert engine_urls == [
+        "postgresql+asyncpg://vp:secret@127.0.0.1:25435/videoprocess"
+    ]
+    assert tunnel_exited is True
+    assert disposed is True
+    payload = json.loads(path.read_text())
+    assert payload["shared_services_tunnel"] == {
+        "enabled": True,
+        "ssh_host": "10.0.0.127",
+        "targets": ["database", "redis", "youtube_manager"],
+    }
+    serialized = json.dumps(payload)
+    assert "25435" not in serialized
+    assert "26380" not in serialized
+    assert "28999" not in serialized
+    assert "secret" not in serialized
 
 
 @pytest.fixture

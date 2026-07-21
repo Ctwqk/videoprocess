@@ -9,18 +9,22 @@ import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
-from urllib.parse import urlsplit
+from typing import Any, Awaitable, Callable, Iterator, NamedTuple, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from sqlalchemy import func, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
 
 
@@ -103,6 +107,254 @@ class CanaryInterrupted(CanaryError):
     pass
 
 
+class TunnelForward(NamedTuple):
+    name: str
+    local_port: int
+    target_host: str
+    target_port: int
+
+
+class SharedServiceEndpoints(NamedTuple):
+    database_url: str
+    redis_url: str
+    youtube_manager_url: str
+    forwards: tuple[TunnelForward, ...]
+
+
+def _valid_tcp_port(value: int, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65_535:
+        raise CanaryError(f"{label} port is invalid")
+    return value
+
+
+def _valid_tunnel_target_host(value: str, *, label: str) -> str:
+    if not value or not READINESS_NAME_PATTERN.fullmatch(value):
+        raise CanaryError(f"{label} host is invalid")
+    normalized = value.casefold().rstrip(".")
+    if (
+        normalized == "10.0.0.126"
+        or normalized == "colima-swarmbridged"
+        or normalized == "caspers-mac-mini"
+        or normalized.startswith("caspers-mac-mini.")
+    ):
+        raise CanaryError(f"{label} host is forbidden for VideoProcess")
+    return value
+
+
+def _rewrite_database_endpoint(value: str, local_port: int) -> tuple[str, str, int]:
+    try:
+        url = make_url(value)
+    except (ArgumentError, ValueError) as exc:
+        raise CanaryError("database endpoint URL is invalid") from exc
+    if not url.drivername.startswith("postgresql"):
+        raise CanaryError("database endpoint scheme is unsupported")
+    host = _valid_tunnel_target_host(url.host or "", label="database endpoint")
+    target_port = _valid_tcp_port(url.port or 5432, label="database endpoint")
+    rewritten = url.set(host="127.0.0.1", port=local_port).render_as_string(hide_password=False)
+    return rewritten, host, target_port
+
+
+def _rewrite_network_endpoint(
+    value: str,
+    *,
+    label: str,
+    allowed_schemes: set[str],
+    default_ports: dict[str, int],
+    local_port: int,
+) -> tuple[str, str, int]:
+    try:
+        parsed = urlsplit(value)
+        target_port = parsed.port or default_ports.get(parsed.scheme.casefold())
+    except ValueError as exc:
+        raise CanaryError(f"{label} endpoint URL is invalid") from exc
+    scheme = parsed.scheme.casefold()
+    if scheme not in allowed_schemes:
+        raise CanaryError(f"{label} endpoint scheme is unsupported")
+    host = _valid_tunnel_target_host(parsed.hostname or "", label=f"{label} endpoint")
+    if target_port is None:
+        raise CanaryError(f"{label} endpoint port is missing")
+    target_port = _valid_tcp_port(target_port, label=f"{label} endpoint")
+    userinfo = parsed.netloc.rsplit("@", 1)[0] + "@" if "@" in parsed.netloc else ""
+    rewritten = urlunsplit(parsed._replace(netloc=f"{userinfo}127.0.0.1:{local_port}"))
+    return rewritten, host, target_port
+
+
+def build_shared_service_endpoints(
+    *,
+    database_url: str,
+    redis_url: str,
+    youtube_manager_url: str,
+    local_ports: Sequence[int],
+) -> SharedServiceEndpoints:
+    expected_count = 3 if redis_url else 2
+    ports = tuple(local_ports)
+    if len(ports) != expected_count or len(set(ports)) != len(ports):
+        raise CanaryError("shared-service local port allocation is invalid")
+    for port in ports:
+        _valid_tcp_port(port, label="shared-service local")
+
+    port_index = 0
+    rewritten_database, database_host, database_port = _rewrite_database_endpoint(
+        database_url,
+        ports[port_index],
+    )
+    forwards = [
+        TunnelForward("database", ports[port_index], database_host, database_port)
+    ]
+    port_index += 1
+
+    rewritten_redis = redis_url
+    if redis_url:
+        rewritten_redis, redis_host, redis_port = _rewrite_network_endpoint(
+            redis_url,
+            label="redis",
+            allowed_schemes={"redis"},
+            default_ports={"redis": 6379},
+            local_port=ports[port_index],
+        )
+        forwards.append(TunnelForward("redis", ports[port_index], redis_host, redis_port))
+        port_index += 1
+
+    rewritten_manager, manager_host, manager_port = _rewrite_network_endpoint(
+        youtube_manager_url,
+        label="YouTubeManager",
+        allowed_schemes={"http"},
+        default_ports={"http": 80},
+        local_port=ports[port_index],
+    )
+    forwards.append(
+        TunnelForward("youtube_manager", ports[port_index], manager_host, manager_port)
+    )
+    return SharedServiceEndpoints(
+        database_url=rewritten_database,
+        redis_url=rewritten_redis,
+        youtube_manager_url=rewritten_manager,
+        forwards=tuple(forwards),
+    )
+
+
+def ssh_tunnel_command(ssh_host: str, forwards: Sequence[TunnelForward]) -> list[str]:
+    _valid_tunnel_target_host(ssh_host, label="shared-service SSH")
+    if not forwards:
+        raise CanaryError("shared-service SSH tunnel has no forwards")
+    command = [
+        "ssh",
+        "-N",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ExitOnForwardFailure=yes",
+    ]
+    for forward in forwards:
+        local_port = _valid_tcp_port(forward.local_port, label="shared-service local")
+        target_host = _valid_tunnel_target_host(
+            forward.target_host,
+            label=f"{forward.name} endpoint",
+        )
+        target_port = _valid_tcp_port(forward.target_port, label=f"{forward.name} endpoint")
+        command.extend(("-L", f"127.0.0.1:{local_port}:{target_host}:{target_port}"))
+    command.append(ssh_host)
+    return command
+
+
+def allocate_loopback_ports(count: int) -> tuple[int, ...]:
+    if count <= 0:
+        raise CanaryError("shared-service local port count must be positive")
+    listeners: list[socket.socket] = []
+    try:
+        for _ in range(count):
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind(("127.0.0.1", 0))
+            listeners.append(listener)
+        return tuple(int(listener.getsockname()[1]) for listener in listeners)
+    except OSError as exc:
+        raise CanaryError("shared-service local port allocation failed") from exc
+    finally:
+        for listener in listeners:
+            listener.close()
+
+
+def _stop_tunnel_process(process: Any) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5.0)
+        return
+    except subprocess.TimeoutExpired:
+        process.kill()
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired as exc:
+        raise CanaryError("shared-service SSH tunnel did not stop") from exc
+
+
+@contextmanager
+def open_shared_service_tunnel(
+    *,
+    ssh_host: str,
+    database_url: str,
+    redis_url: str,
+    youtube_manager_url: str,
+    local_ports: Sequence[int] | None = None,
+    popen_factory: Callable[..., Any] = subprocess.Popen,
+    startup_timeout_seconds: float = 1.0,
+) -> Iterator[SharedServiceEndpoints]:
+    port_count = 3 if redis_url else 2
+    endpoints = build_shared_service_endpoints(
+        database_url=database_url,
+        redis_url=redis_url,
+        youtube_manager_url=youtube_manager_url,
+        local_ports=local_ports or allocate_loopback_ports(port_count),
+    )
+    try:
+        process = popen_factory(
+            ssh_tunnel_command(ssh_host, endpoints.forwards),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CanaryError("shared-service SSH tunnel could not start") from exc
+    try:
+        try:
+            return_code = process.wait(timeout=startup_timeout_seconds)
+        except subprocess.TimeoutExpired:
+            yield endpoints
+        else:
+            raise CanaryError(
+                f"shared-service SSH tunnel exited during startup (status {return_code})"
+            )
+    finally:
+        _stop_tunnel_process(process)
+
+
+@contextmanager
+def shared_service_endpoints_for_run(
+    args: argparse.Namespace,
+    database_url: str,
+) -> Iterator[SharedServiceEndpoints]:
+    ssh_host = str(getattr(args, "shared_services_ssh_host", "") or "")
+    if not ssh_host:
+        yield SharedServiceEndpoints(
+            database_url=database_url,
+            redis_url=str(getattr(args, "redis_url", "") or ""),
+            youtube_manager_url=str(getattr(args, "youtube_manager_url", "") or ""),
+            forwards=(),
+        )
+        return
+    with open_shared_service_tunnel(
+        ssh_host=ssh_host,
+        database_url=database_url,
+        redis_url=str(getattr(args, "redis_url", "") or ""),
+        youtube_manager_url=str(getattr(args, "youtube_manager_url", "") or ""),
+    ) as endpoints:
+        yield endpoints
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -123,6 +375,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime-host", default="10.0.0.127")
     parser.add_argument("--manager-host", default="10.0.0.150")
     parser.add_argument("--manager-ssh-jump", default="")
+    parser.add_argument("--shared-services-ssh-host", default="")
     parser.add_argument("--publisher-service", default="vp-youtube-publisher-swarm")
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--timeout-seconds", type=float, default=1_200.0)
@@ -1794,51 +2047,89 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
         "schedule": {"transitions": [], "final_state": None},
     }
     atomic_write_json(path, evidence)
-    engine = create_async_engine(async_database_url(database_url), pool_pre_ping=True)
     try:
-        async with engine.connect() as connection:
-            await acquire_advisory_lock(connection)
-            db = AsyncSession(bind=connection, expire_on_commit=False)
+        with shared_service_endpoints_for_run(args, database_url) as endpoints:
+            runtime_args = argparse.Namespace(**vars(args))
+            runtime_args.redis_url = endpoints.redis_url
+            runtime_args.youtube_manager_url = endpoints.youtube_manager_url
+            if endpoints.forwards:
+                evidence["shared_services_tunnel"] = {
+                    "enabled": True,
+                    "ssh_host": runtime_args.shared_services_ssh_host,
+                    "targets": [forward.name for forward in endpoints.forwards],
+                }
+                atomic_write_json(path, evidence)
+            engine = create_async_engine(
+                async_database_url(endpoints.database_url),
+                pool_pre_ping=True,
+            )
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
+                async with engine.connect() as connection:
+                    await acquire_advisory_lock(connection)
+                    db = AsyncSession(bind=connection, expire_on_commit=False)
                     try:
-                        await execute_selected_mode(mode, args, db, client, evidence, path)
-                    except BaseException as exc:
-                        evidence["status"] = "failed"
-                        evidence["failure"] = {
-                            "type": type(exc).__name__,
-                            "message": safe_failure_message(exc),
-                            "at": utc_now().isoformat(),
-                        }
-                        graph = evidence.get("graph")
-                        if mode == MODE_LIVE and isinstance(graph, dict) and graph.get("channel_id"):
+                        async with httpx.AsyncClient(
+                            timeout=httpx.Timeout(30.0),
+                            follow_redirects=True,
+                        ) as client:
                             try:
-                                await db.rollback()
-                                evidence["failure_cleanup"] = await failure_cleanup(
+                                await execute_selected_mode(
+                                    mode,
+                                    runtime_args,
                                     db,
-                                    uuid.UUID(str(graph["channel_id"])),
+                                    client,
+                                    evidence,
+                                    path,
                                 )
-                            except Exception as cleanup_exc:
-                                evidence["failure_cleanup"] = {
-                                    "failed": True,
-                                    "type": type(cleanup_exc).__name__,
+                            except BaseException as exc:
+                                evidence["status"] = "failed"
+                                evidence["failure"] = {
+                                    "type": type(exc).__name__,
+                                    "message": safe_failure_message(exc),
+                                    "at": utc_now().isoformat(),
                                 }
-                        raise
+                                graph = evidence.get("graph")
+                                if (
+                                    mode == MODE_LIVE
+                                    and isinstance(graph, dict)
+                                    and graph.get("channel_id")
+                                ):
+                                    try:
+                                        await db.rollback()
+                                        evidence["failure_cleanup"] = await failure_cleanup(
+                                            db,
+                                            uuid.UUID(str(graph["channel_id"])),
+                                        )
+                                    except Exception as cleanup_exc:
+                                        evidence["failure_cleanup"] = {
+                                            "failed": True,
+                                            "type": type(cleanup_exc).__name__,
+                                        }
+                                raise
+                            finally:
+                                close_error: BaseException | None = None
+                                try:
+                                    await close_schedule_for_mode(
+                                        mode,
+                                        runtime_args,
+                                        client,
+                                        evidence,
+                                    )
+                                except BaseException as exc:
+                                    close_error = exc
+                                    mark_schedule_close_failure(evidence, close_error)
+                                evidence["redis_stream_pending_audit"] = await redis_pending_audit(
+                                    runtime_args.redis_url
+                                )
+                                evidence["completed_at"] = utc_now().isoformat()
+                                atomic_write_json(path, evidence)
+                                if close_error is not None:
+                                    raise CanaryError("final schedule close failed") from close_error
                     finally:
-                        close_error: BaseException | None = None
-                        try:
-                            await close_schedule_for_mode(mode, args, client, evidence)
-                        except BaseException as exc:
-                            close_error = exc
-                            mark_schedule_close_failure(evidence, close_error)
-                        evidence["redis_stream_pending_audit"] = await redis_pending_audit(args.redis_url)
-                        evidence["completed_at"] = utc_now().isoformat()
-                        atomic_write_json(path, evidence)
-                        if close_error is not None:
-                            raise CanaryError("final schedule close failed") from close_error
+                        await db.close()
+                        await release_advisory_lock(connection)
             finally:
-                await db.close()
-                await release_advisory_lock(connection)
+                await engine.dispose()
     except BaseException as exc:
         evidence["status"] = "failed"
         evidence.setdefault(
@@ -1852,8 +2143,6 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
         evidence.setdefault("completed_at", utc_now().isoformat())
         atomic_write_json(path, evidence)
         raise
-    finally:
-        await engine.dispose()
     return path
 
 
@@ -1890,6 +2179,15 @@ def main() -> int:
     if args.manager_ssh_jump and not READINESS_NAME_PATTERN.fullmatch(args.manager_ssh_jump):
         print("--manager-ssh-jump contains unsupported characters", file=sys.stderr)
         return 2
+    if args.shared_services_ssh_host:
+        try:
+            _valid_tunnel_target_host(
+                args.shared_services_ssh_host,
+                label="shared-service SSH",
+            )
+        except CanaryError as exc:
+            print(f"--shared-services-ssh-host is invalid: {exc}", file=sys.stderr)
+            return 2
     install_signal_guards()
     label = "canary preflight" if mode == MODE_PREFLIGHT else "unlisted canary"
     try:

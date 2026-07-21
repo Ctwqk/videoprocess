@@ -182,6 +182,32 @@ strictly scoped to 150 and 127. Host 126 is forbidden for VP builds, deployment,
 watcher placement, publisher placement, and automatic failover. A missing 127
 runtime fails the VP deployment closed rather than moving work to 126.
 
+## Canary Shared-Service Transport
+
+The canary operator may reach 127 directly while direct TCP routes to the 150
+Postgres, Redis, or YouTubeManager ports are unavailable. Use the runner-owned
+SSH forwarding mode instead of maintaining separate `ssh -L` processes. After
+loading `DATABASE_URL` and `REDIS_URL` from the protected deploy environment
+without printing them, the read-only command is:
+
+```bash
+PYTHONPATH=backend backend/.venv/bin/python scripts/run_vp_unlisted_canary.py \
+  --preflight-only \
+  --manager-ssh-jump 10.0.0.127 \
+  --shared-services-ssh-host 10.0.0.127
+```
+
+The runner forwards only the configured database, Redis, and YouTubeManager
+connections. It still reaches the VP API directly on 127, keeps the existing
+127-to-150 jump for Swarm checks, and removes the forwarding process on every
+exit path. Evidence records logical routing only, not ports or connection URLs.
+
+For an approved live attempt, replace `--preflight-only` with
+`--confirm-live-unlisted`. That CLI flag and the SSH transport do not constitute
+human approval: the per-attempt approval phrase above must already have been
+provided. The live path remains owned-source-only, unlisted, one-task, and
+fail-closed.
+
 ## Placement Policy
 
 - Label the 127 Swarm node with `node.labels.vp.runtime == true`.
