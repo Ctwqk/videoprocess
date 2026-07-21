@@ -1145,3 +1145,58 @@ only test harness and regression files; no production runtime code changed.
 - Full Ruff and mypy retain the documented pre-existing 17/66 baselines.
 - Existing Python deprecation warnings and frontend build/audit warnings remain.
 - Deployed-image smoke remains intentionally unrun before natural deployment.
+
+## Final Review 9 Legacy Probe Cleanup Fix Wave
+
+### Status And Scope
+
+`DONE_WITH_CONCERNS`. Work began from clean
+`fcb1994dbd992be5edf457c1b9563f65cb58b393` in the required worktree on
+`codex/channelops-soak-guard`. The focused test-only commit is
+`7a6d467` (`test: bound legacy direct promotion cleanup`). No runtime,
+production, SSH, push, deploy, activation, external-platform call, upload,
+publication, host-126 access, or root-plan edit occurred.
+
+### Test Change And Focused Evidence
+
+- Only `internal/channelops/integration_test.go` changed. The two named legacy
+  direct-promotion races now use `cancellableTestOperation`, register bounded
+  fixture cleanup before failure-capable lock waits, use bounded rollback, and
+  wait with `waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)`.
+- The direct plan-lock/durable-write test cancels and drains the handler and
+  invalidation operation before releasing its acquired connection. The real
+  PostgreSQL interleaving and all prior semantic assertions remain intact.
+- `TestCancellableTestOperationTimeoutMarksFixtureCleanupIneligibleWhenUndrained`
+  now verifies that fixture cleanup remains ineligible after the synthetic
+  operation is released and drained. This focused test passed immediately:
+  the existing helper already keeps `drainTimed` as a permanent unsafe marker,
+  so no runtime implementation change or RED failure was appropriate.
+- Helper plus both direct PostgreSQL races passed; the three automatic/channel
+  races also passed.
+
+### PostgreSQL And Verification
+
+- Disposable `postgres:16-alpine` container `vp-final-review-9-postgres`
+  ran PostgreSQL `16.14` on `127.0.0.1:55439`. An empty database migrated to
+  `026_autoflow_authority_fence (head)`.
+- Full `internal/channelops` passed. Full Go initially overlapped the
+  operator-quarantine PostgreSQL suite and an unrelated learning-window test
+  failed from shared database state; after recreating the database from empty
+  migration HEAD and running in isolation, `go test ./... -count=1` passed.
+- The two-root PostgreSQL regression passed 10 consecutive runs; the full
+  operator-quarantine file passed `6 passed, 3 warnings`; the acceptance set
+  passed `59 passed, 3 warnings`; and the backend virtualenv suite passed
+  `641 passed, 27 skipped, 11 warnings`.
+- Watcher/deploy contracts and required Bash syntax checks passed. `gofmt -l`
+  and `git diff --check` were clean. Frontend `npm install`, build, and lint
+  passed.
+- Full Ruff retains the pre-existing `17` findings and mypy the pre-existing
+  `66` errors in 24 files. System `python3` lacks pytest; the repository
+  `backend/.venv` supplied the full backend/static verification.
+- The PostgreSQL container was removed with `docker rm -f`; exact-name
+  `docker ps -a` verification confirmed it is absent.
+
+### Concerns
+
+- Existing Python deprecation warnings, frontend Lightning CSS/chunk/audit
+  warnings, and the documented Ruff/mypy baselines remain.
