@@ -51,6 +51,12 @@ const (
 	FailureDiscovery     = "discovery"
 	FailureLearning      = "learning"
 	FailureOther         = "other"
+
+	PromotionReserved   = "reserved"
+	PromotionSubmitting = "submitting"
+	PromotionConfirmed  = "confirmed"
+	PromotionFinalized  = "finalized"
+	PromotionUncertain  = "uncertain"
 )
 
 type ChannelProfileRow struct {
@@ -213,6 +219,28 @@ type PublicationRow struct {
 	QuotaUnitsEstimated   int
 	LastMetricsPolledAt   *time.Time
 	WarningsJSON          []any
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+}
+
+type PromotionOperationRow struct {
+	ID                    string
+	PublicationID         string
+	ProductionTaskID      string
+	QueueItemID           string
+	PlatformVideoID       string
+	TargetPrivacy         string
+	ScheduledAt           time.Time
+	AttemptKey            string
+	Status                string
+	Decision              PDSDecision
+	ObservedPrivacy       *string
+	ObservedPublishStatus *string
+	EvidenceJSON          map[string]any
+	ErrorMessage          *string
+	RequestAttemptedAt    *time.Time
+	ConfirmedAt           *time.Time
+	CompletedAt           *time.Time
 	CreatedAt             time.Time
 	UpdatedAt             time.Time
 }

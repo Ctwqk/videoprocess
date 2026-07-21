@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
 from app.api.channel_agent import HumanReviewRequest, promote_publication, release_human_review
@@ -35,6 +37,21 @@ from worker import main as worker_main
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
+RACE_CLEANUP_TIMEOUT_SECONDS = 5
+
+
+@dataclass(eq=False)
+class _RaceFixtureCleanupState:
+    cleanup_eligible: bool = True
+    undrained_operations: set[asyncio.Task] = field(default_factory=set)
+    engine: AsyncEngine | None = None
+
+
+_ACTIVE_RACE_FIXTURE: ContextVar[_RaceFixtureCleanupState | None] = ContextVar(
+    "active_race_fixture",
+    default=None,
+)
+_UNSAFE_RACE_FIXTURES: set[_RaceFixtureCleanupState] = set()
 
 
 pytestmark = [
@@ -90,20 +107,32 @@ def _review_plan() -> AutoFlowPlan:
 
 @pytest.fixture
 async def postgres_race_db():
+    if _UNSAFE_RACE_FIXTURES:
+        pytest.fail("refusing to truncate PostgreSQL after an undrained race operation")
+    cleanup_state = _RaceFixtureCleanupState()
+    cleanup_token = _ACTIVE_RACE_FIXTURE.set(cleanup_state)
     engine = create_async_engine(POSTGRES_URL, pool_size=8, max_overflow=0)
+    cleanup_state.engine = engine
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                "TRUNCATE channel_ops_queue_items, publication_records, production_tasks, "
-                "publishing_accounts, autoflow_runs, autoflow_plans, node_executions, jobs, "
-                "pipelines, runtime_schedules RESTART IDENTITY CASCADE"
-            )
-        )
     try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "TRUNCATE channel_ops_queue_items, publication_records, production_tasks, "
+                    "publishing_accounts, autoflow_runs, autoflow_plans, node_executions, jobs, "
+                    "pipelines, runtime_schedules RESTART IDENTITY CASCADE"
+                )
+            )
         yield engine, factory
     finally:
-        await engine.dispose()
+        try:
+            if cleanup_state.cleanup_eligible:
+                await _bounded_dispose(engine)
+                cleanup_state.engine = None
+            else:
+                _UNSAFE_RACE_FIXTURES.add(cleanup_state)
+        finally:
+            _ACTIVE_RACE_FIXTURE.reset(cleanup_token)
 
 
 async def _wait_until_lock_wait(engine, query_fragment: str, operation: asyncio.Task) -> None:
@@ -130,12 +159,148 @@ async def _wait_until_lock_wait(engine, query_fragment: str, operation: asyncio.
     pytest.fail(f"operation did not reach the expected PostgreSQL lock for {query_fragment}")
 
 
-async def _cancel_operations(blocker: AsyncSession, *operations: asyncio.Task) -> None:
-    await blocker.rollback()
+def _mark_race_fixture_cleanup_ineligible(*operations: asyncio.Task) -> None:
+    cleanup_state = _ACTIVE_RACE_FIXTURE.get()
+    if cleanup_state is None:
+        return
+    cleanup_state.cleanup_eligible = False
+    cleanup_state.undrained_operations.update(
+        operation for operation in operations if not operation.done()
+    )
+    _UNSAFE_RACE_FIXTURES.add(cleanup_state)
+
+
+async def _run_bounded_cleanup(cleanup) -> None:
+    operation = asyncio.create_task(cleanup)
+    try:
+        _done, pending = await asyncio.wait(
+            {operation},
+            timeout=RACE_CLEANUP_TIMEOUT_SECONDS,
+        )
+        if pending:
+            _mark_race_fixture_cleanup_ineligible(operation)
+            operation.cancel()
+            await asyncio.wait({operation}, timeout=RACE_CLEANUP_TIMEOUT_SECONDS)
+            raise TimeoutError("race fixture cleanup did not finish before timeout")
+        await operation
+    except asyncio.CancelledError:
+        if not operation.done():
+            _mark_race_fixture_cleanup_ineligible(operation)
+            operation.cancel()
+        raise
+    finally:
+        if operation.done():
+            await asyncio.gather(operation, return_exceptions=True)
+
+
+async def _bounded_rollback(blocker: AsyncSession) -> None:
+    if blocker.in_transaction():
+        await _run_bounded_cleanup(blocker.rollback())
+
+
+async def _bounded_close(session: AsyncSession) -> None:
+    await _run_bounded_cleanup(session.close())
+
+
+async def _bounded_dispose(engine: AsyncEngine) -> None:
+    await _run_bounded_cleanup(engine.dispose())
+
+
+async def _bounded_drain(*operations: asyncio.Task) -> None:
+    if not operations:
+        return
+    _done, pending = await asyncio.wait(operations, timeout=RACE_CLEANUP_TIMEOUT_SECONDS)
+    if pending:
+        _mark_race_fixture_cleanup_ineligible(*pending)
+        raise TimeoutError(f"{len(pending)} race operation(s) did not drain")
+    await asyncio.gather(*operations, return_exceptions=True)
+
+
+async def _cancel_and_drain(*operations: asyncio.Task) -> None:
     for operation in operations:
         if not operation.done():
             operation.cancel()
-    await asyncio.gather(*operations, return_exceptions=True)
+    await _bounded_drain(*operations)
+
+
+async def _finish_or_cancel_and_drain(*operations: asyncio.Task) -> None:
+    try:
+        await _bounded_drain(*operations)
+    except TimeoutError:
+        await _cancel_and_drain(*operations)
+        raise
+
+
+async def _cancel_operations(blocker: AsyncSession, *operations: asyncio.Task) -> None:
+    try:
+        await _bounded_rollback(blocker)
+    finally:
+        await _cancel_and_drain(*operations)
+
+
+async def test_undrained_operation_permanently_disables_fixture_cleanup(monkeypatch):
+    state = _RaceFixtureCleanupState()
+    token = _ACTIVE_RACE_FIXTURE.set(state)
+    release = asyncio.Event()
+
+    async def ignore_cancellation_until_released() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    operation = asyncio.create_task(ignore_cancellation_until_released())
+    try:
+        await asyncio.sleep(0)
+        monkeypatch.setitem(globals(), "RACE_CLEANUP_TIMEOUT_SECONDS", 0.01)
+        with pytest.raises(TimeoutError, match="did not drain"):
+            await _cancel_and_drain(operation)
+        assert state.cleanup_eligible is False
+
+        release.set()
+        await asyncio.wait_for(operation, timeout=1)
+        assert state.cleanup_eligible is False
+    finally:
+        release.set()
+        if not operation.done():
+            operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        _ACTIVE_RACE_FIXTURE.reset(token)
+        _UNSAFE_RACE_FIXTURES.discard(state)
+
+
+@pytest.mark.parametrize(
+    "helper_name",
+    ["_bounded_rollback", "_bounded_close", "_bounded_dispose"],
+)
+async def test_cleanup_timeout_permanently_disables_fixture_cleanup(monkeypatch, helper_name):
+    state = _RaceFixtureCleanupState()
+    token = _ACTIVE_RACE_FIXTURE.set(state)
+
+    class SlowCleanup:
+        def in_transaction(self) -> bool:
+            return True
+
+        async def rollback(self) -> None:
+            await asyncio.sleep(10)
+
+        async def close(self) -> None:
+            await asyncio.sleep(10)
+
+        async def dispose(self) -> None:
+            await asyncio.sleep(10)
+
+    try:
+        monkeypatch.setitem(globals(), "RACE_CLEANUP_TIMEOUT_SECONDS", 0.01)
+        helper = globals().get(helper_name)
+        assert helper is not None
+        with pytest.raises(TimeoutError):
+            await helper(SlowCleanup())
+        assert state.cleanup_eligible is False
+    finally:
+        _ACTIVE_RACE_FIXTURE.reset(token)
+        _UNSAFE_RACE_FIXTURES.discard(state)
 
 
 async def _seed_worker_authority(factory, *, node_status: NodeStatus, job_status: JobStatus):
@@ -199,7 +364,6 @@ async def test_worker_claim_cannot_revive_quarantine_first_node(postgres_race_db
     )
 
     blocker = factory()
-    claim = None
     try:
         channel = (
             await blocker.execute(
@@ -240,17 +404,15 @@ async def test_worker_claim_cannot_revive_quarantine_first_node(postgres_race_db
                 session_factory=factory,
             )
         )
-        await _wait_until_lock_wait(engine, "channel_profiles", claim)
-        await blocker.commit()
-        assert await asyncio.wait_for(claim, timeout=5) is False
+        try:
+            await _wait_until_lock_wait(engine, "channel_profiles", claim)
+            await blocker.commit()
+            assert await asyncio.wait_for(claim, timeout=5) is False
+        finally:
+            await _cancel_operations(blocker, claim)
     finally:
-        if blocker.in_transaction():
-            await blocker.rollback()
-        await blocker.close()
-        if claim is not None and not claim.done():
-            claim.cancel()
-        if claim is not None:
-            await asyncio.wait_for(asyncio.gather(claim, return_exceptions=True), timeout=5)
+        await _bounded_rollback(blocker)
+        await _bounded_close(blocker)
 
     async with factory() as db:
         stored = await db.get(NodeExecution, node_id)
@@ -366,7 +528,6 @@ async def test_quarantine_first_blocks_stale_worker_completion(postgres_race_db,
     monkeypatch.setattr(job_engine, "_dispatch_ready_nodes", record_dispatch)
 
     blocker = factory()
-    completion = None
     try:
         await _stage_worker_quarantine(
             blocker,
@@ -376,17 +537,15 @@ async def test_quarantine_first_blocks_stale_worker_completion(postgres_race_db,
             node_id=node_id,
         )
         completion = asyncio.create_task(job_engine.on_node_completed(job_id, node_id, artifact_id))
-        await _wait_until_lock_wait(engine, "", completion)
-        await blocker.commit()
-        await asyncio.wait_for(completion, timeout=5)
+        try:
+            await _wait_until_lock_wait(engine, "", completion)
+            await blocker.commit()
+            await asyncio.wait_for(completion, timeout=5)
+        finally:
+            await _cancel_operations(blocker, completion)
     finally:
-        if blocker.in_transaction():
-            await blocker.rollback()
-        await blocker.close()
-        if completion is not None and not completion.done():
-            completion.cancel()
-        if completion is not None:
-            await asyncio.wait_for(asyncio.gather(completion, return_exceptions=True), timeout=5)
+        await _bounded_rollback(blocker)
+        await _bounded_close(blocker)
 
     async with factory() as db:
         stored_job = await db.get(Job, job_id)
@@ -418,7 +577,6 @@ async def test_quarantine_first_blocks_stale_worker_retry(postgres_race_db, monk
     job_engine = JobEngine()
 
     blocker = factory()
-    failure = None
     try:
         await _stage_worker_quarantine(
             blocker,
@@ -428,17 +586,15 @@ async def test_quarantine_first_blocks_stale_worker_retry(postgres_race_db, monk
             node_id=node_id,
         )
         failure = asyncio.create_task(job_engine.on_node_failed(job_id, node_id, "late failure"))
-        await _wait_until_lock_wait(engine, "", failure)
-        await blocker.commit()
-        await asyncio.wait_for(failure, timeout=5)
+        try:
+            await _wait_until_lock_wait(engine, "", failure)
+            await blocker.commit()
+            await asyncio.wait_for(failure, timeout=5)
+        finally:
+            await _cancel_operations(blocker, failure)
     finally:
-        if blocker.in_transaction():
-            await blocker.rollback()
-        await blocker.close()
-        if failure is not None and not failure.done():
-            failure.cancel()
-        if failure is not None:
-            await asyncio.wait_for(asyncio.gather(failure, return_exceptions=True), timeout=5)
+        await _bounded_rollback(blocker)
+        await _bounded_close(blocker)
 
     async with factory() as db:
         stored_job = await db.get(Job, job_id)
@@ -447,6 +603,145 @@ async def test_quarantine_first_blocks_stale_worker_retry(postgres_race_db, monk
     assert stored_node is not None and stored_node.status == NodeStatus.CANCELLED
     assert stored_node.retry_count == 0
     assert redis_dispatches == []
+
+
+async def test_exhausted_failure_holds_authority_through_downstream_terminal_writes(
+    postgres_race_db,
+    monkeypatch,
+):
+    engine, factory = postgres_race_db
+    channel_id, task_id, job_id, node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.RUNNING,
+        job_status=JobStatus.RUNNING,
+    )
+    async with factory() as db:
+        job = await db.get(Job, job_id)
+        failed_node = await db.get(NodeExecution, node_id)
+        assert job is not None and failed_node is not None
+        failed_node.retry_count = 1
+        downstream = NodeExecution(
+            job_id=job_id,
+            node_id="downstream_1",
+            node_type="trim",
+            node_label="Downstream",
+            node_config={"start_time": 0, "end_time": 1},
+            status=NodeStatus.PENDING,
+        )
+        db.add(downstream)
+        job.pipeline_snapshot = {
+            "nodes": [
+                {
+                    "id": "trim_1",
+                    "type": "trim",
+                    "position": {"x": 0, "y": 0},
+                    "data": {"label": "Trim", "config": {"start_time": 0, "end_time": 1}},
+                },
+                {
+                    "id": "downstream_1",
+                    "type": "trim",
+                    "position": {"x": 200, "y": 0},
+                    "data": {"label": "Downstream", "config": {"start_time": 0, "end_time": 1}},
+                },
+            ],
+            "edges": [
+                {
+                    "id": "failed-to-downstream",
+                    "source": "trim_1",
+                    "target": "downstream_1",
+                    "sourceHandle": "output",
+                    "targetHandle": "input",
+                }
+            ],
+            "viewport": {"x": 0, "y": 0, "zoom": 1},
+        }
+        job.execution_plan = {
+            "topo_order": ["trim_1", "downstream_1"],
+            "dependencies": {"trim_1": [], "downstream_1": ["trim_1"]},
+        }
+        await db.commit()
+        downstream_id = downstream.id
+
+    reached_downstream_transition = asyncio.Event()
+    release_failure = asyncio.Event()
+    job_engine = JobEngine()
+    original_skip_downstream = job_engine._skip_downstream
+
+    async def pause_before_downstream_transition(db, job, failed_node_id, dep_map):
+        reached_downstream_transition.set()
+        await release_failure.wait()
+        await original_skip_downstream(db, job, failed_node_id, dep_map)
+
+    monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
+    monkeypatch.setattr(job_engine, "_skip_downstream", pause_before_downstream_transition)
+
+    async def apply_quarantine():
+        async with factory() as quarantine_db:
+            return await quarantine_channelops_backlog(
+                quarantine_db,
+                channel_id,
+                apply=True,
+                close_schedule=True,
+            )
+
+    quarantine = None
+    failure = asyncio.create_task(job_engine.on_node_failed(job_id, node_id, "terminal failure"))
+    try:
+        await asyncio.wait_for(reached_downstream_transition.wait(), timeout=5)
+        quarantine = asyncio.create_task(apply_quarantine())
+        try:
+            await _wait_until_lock_wait(engine, "channel_profiles", quarantine)
+        finally:
+            release_failure.set()
+        await _finish_or_cancel_and_drain(failure, quarantine)
+    finally:
+        release_failure.set()
+        operations = [failure]
+        if quarantine is not None:
+            operations.append(quarantine)
+        await _cancel_and_drain(*operations)
+
+    async with factory() as db:
+        task = await db.get(ProductionTask, task_id)
+        job = await db.get(Job, job_id)
+        failed_node = await db.get(NodeExecution, node_id)
+        downstream = await db.get(NodeExecution, downstream_id)
+    assert task is not None and task.state == "held"
+    assert job is not None and job.status == JobStatus.FAILED
+    assert failed_node is not None and failed_node.status == NodeStatus.FAILED
+    assert downstream is not None and downstream.status == NodeStatus.SKIPPED
+
+
+async def test_running_job_replay_redelivers_stranded_queued_root(
+    postgres_race_db,
+    monkeypatch,
+):
+    _engine, factory = postgres_race_db
+    _channel_id, _task_id, job_id, node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.QUEUED,
+        job_status=JobStatus.RUNNING,
+    )
+    dispatches: list[tuple[str, dict]] = []
+
+    class RecordingRedis:
+        async def xadd(self, stream_key, payload):
+            dispatches.append((stream_key, payload))
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
+    monkeypatch.setattr("app.orchestrator.engine._redis", lambda: RecordingRedis())
+
+    await JobEngine().start_job(job_id)
+
+    assert [payload["node_execution_id"] for _stream, payload in dispatches] == [str(node_id)]
+    async with factory() as db:
+        job = await db.get(Job, job_id)
+        node = await db.get(NodeExecution, node_id)
+    assert job is not None and job.status == JobStatus.RUNNING
+    assert node is not None and node.status == NodeStatus.QUEUED
 
 
 async def test_quarantine_between_queue_commit_and_downstream_dispatch_blocks_redis(
@@ -602,7 +897,7 @@ async def test_quarantine_between_queue_commit_and_downstream_dispatch_blocks_re
         assert result["schedule"]["final_state"] == VideoScheduleState.CLOSED.value
     finally:
         release_dispatch.set()
-    await asyncio.wait_for(dispatcher, timeout=5)
+        await _finish_or_cancel_and_drain(dispatcher)
 
     async with factory() as db:
         stored_job = await db.get(Job, job_id)
@@ -635,7 +930,6 @@ async def test_quarantine_first_blocks_youtube_submission_fence(postgres_race_db
             submissions.append("posted")
 
     blocker = factory()
-    submission = None
     try:
         await _stage_worker_quarantine(
             blocker,
@@ -645,18 +939,16 @@ async def test_quarantine_first_blocks_youtube_submission_fence(postgres_race_db
             node_id=node_id,
         )
         submission = asyncio.create_task(guarded_submission())
-        await _wait_until_lock_wait(engine, "channel_profiles", submission)
-        await blocker.commit()
-        with pytest.raises(JobExecutionAuthorityBlocked):
-            await asyncio.wait_for(submission, timeout=5)
+        try:
+            await _wait_until_lock_wait(engine, "channel_profiles", submission)
+            await blocker.commit()
+            with pytest.raises(JobExecutionAuthorityBlocked):
+                await asyncio.wait_for(submission, timeout=5)
+        finally:
+            await _cancel_operations(blocker, submission)
     finally:
-        if blocker.in_transaction():
-            await blocker.rollback()
-        await blocker.close()
-        if submission is not None and not submission.done():
-            submission.cancel()
-        if submission is not None:
-            await asyncio.wait_for(asyncio.gather(submission, return_exceptions=True), timeout=5)
+        await _bounded_rollback(blocker)
+        await _bounded_close(blocker)
 
     assert submissions == []
 
@@ -697,20 +989,21 @@ async def test_youtube_submission_fence_makes_quarantine_wait(postgres_race_db):
             )
 
     submission = asyncio.create_task(guarded_submission())
-    quarantine = None
     try:
         await asyncio.wait_for(submission_started.wait(), timeout=5)
         quarantine = asyncio.create_task(apply_quarantine())
-        await _wait_until_lock_wait(engine, "channel_profiles", quarantine)
-        assert not quarantine.done()
+        try:
+            await _wait_until_lock_wait(engine, "channel_profiles", quarantine)
+            assert not quarantine.done()
+        finally:
+            release_submission.set()
+            await _finish_or_cancel_and_drain(submission, quarantine)
     finally:
         release_submission.set()
-        await asyncio.wait_for(asyncio.gather(submission, return_exceptions=True), timeout=5)
-        if quarantine is not None:
-            await asyncio.wait_for(asyncio.gather(quarantine, return_exceptions=True), timeout=5)
+        await _cancel_and_drain(submission)
 
     assert submission.exception() is None
-    assert quarantine is not None and quarantine.exception() is None
+    assert quarantine.exception() is None
     assert submissions == ["posted"]
     async with factory() as db:
         stored_job = await db.get(Job, job_id)
@@ -811,16 +1104,18 @@ async def test_review_release_first_commits_atomically_then_quarantine_holds_it(
                 db=operator_db,
             )
         )
-        quarantine = None
         try:
             await _wait_until_lock_wait(engine, "autoflow_plans", operator)
             quarantine = asyncio.create_task(quarantine_channelops_backlog(quarantine_db, channel_id, apply=True))
-            await _wait_until_lock_wait(engine, "channel_profiles", quarantine)
-            await blocker.commit()
-            result = await operator
-            await quarantine
+            try:
+                await _wait_until_lock_wait(engine, "channel_profiles", quarantine)
+                await blocker.commit()
+                result = await operator
+                await quarantine
+            finally:
+                await _cancel_and_drain(quarantine)
         finally:
-            await _cancel_operations(blocker, operator, *(operation for operation in [quarantine] if operation))
+            await _cancel_operations(blocker, operator)
 
     assert result["state"] == "planning"
     await _assert_quarantined(factory, task_id, queue_kind="execute_task")
@@ -832,7 +1127,6 @@ async def test_quarantine_first_makes_review_release_conflict_without_enqueue(po
     async with factory() as blocker, factory() as operator_db, factory() as quarantine_db:
         await blocker.execute(select(ProductionTask).where(ProductionTask.id == task_id).with_for_update())
         quarantine = asyncio.create_task(quarantine_channelops_backlog(quarantine_db, channel_id, apply=True))
-        operator = None
         try:
             await _wait_until_lock_wait(engine, "production_tasks", quarantine)
             operator = asyncio.create_task(
@@ -842,13 +1136,16 @@ async def test_quarantine_first_makes_review_release_conflict_without_enqueue(po
                     db=operator_db,
                 )
             )
-            await _wait_until_lock_wait(engine, "channel_profiles", operator)
-            await blocker.commit()
-            await quarantine
-            with pytest.raises(HTTPException) as exc_info:
-                await operator
+            try:
+                await _wait_until_lock_wait(engine, "channel_profiles", operator)
+                await blocker.commit()
+                await quarantine
+                with pytest.raises(HTTPException) as exc_info:
+                    await operator
+            finally:
+                await _cancel_and_drain(operator)
         finally:
-            await _cancel_operations(blocker, quarantine, *(operation for operation in [operator] if operation))
+            await _cancel_operations(blocker, quarantine)
 
     assert exc_info.value.status_code == 409
     async with factory() as db:
@@ -872,16 +1169,18 @@ async def test_manual_promotion_first_commits_then_quarantine_dead_letters_it(po
                 db=operator_db,
             )
         )
-        quarantine = None
         try:
             await _wait_until_lock_wait(engine, "publication_records", operator)
             quarantine = asyncio.create_task(quarantine_channelops_backlog(quarantine_db, channel_id, apply=True))
-            await _wait_until_lock_wait(engine, "channel_profiles", quarantine)
-            await blocker.commit()
-            result = await operator
-            await quarantine
+            try:
+                await _wait_until_lock_wait(engine, "channel_profiles", quarantine)
+                await blocker.commit()
+                result = await operator
+                await quarantine
+            finally:
+                await _cancel_and_drain(quarantine)
         finally:
-            await _cancel_operations(blocker, operator, *(operation for operation in [quarantine] if operation))
+            await _cancel_operations(blocker, operator)
 
     assert result.kind == "promote_publication"
     await _assert_quarantined(factory, task_id, queue_kind="promote_publication")
@@ -893,7 +1192,6 @@ async def test_quarantine_first_makes_manual_promotion_conflict_without_evidence
     async with factory() as blocker, factory() as operator_db, factory() as quarantine_db:
         await blocker.execute(select(ProductionTask).where(ProductionTask.id == task_id).with_for_update())
         quarantine = asyncio.create_task(quarantine_channelops_backlog(quarantine_db, channel_id, apply=True))
-        operator = None
         try:
             await _wait_until_lock_wait(engine, "production_tasks", quarantine)
             operator = asyncio.create_task(
@@ -903,13 +1201,16 @@ async def test_quarantine_first_makes_manual_promotion_conflict_without_evidence
                     db=operator_db,
                 )
             )
-            await _wait_until_lock_wait(engine, "channel_profiles", operator)
-            await blocker.commit()
-            await quarantine
-            with pytest.raises(HTTPException) as exc_info:
-                await operator
+            try:
+                await _wait_until_lock_wait(engine, "channel_profiles", operator)
+                await blocker.commit()
+                await quarantine
+                with pytest.raises(HTTPException) as exc_info:
+                    await operator
+            finally:
+                await _cancel_and_drain(operator)
         finally:
-            await _cancel_operations(blocker, quarantine, *(operation for operation in [operator] if operation))
+            await _cancel_operations(blocker, quarantine)
 
     assert exc_info.value.status_code == 409
     async with factory() as db:
@@ -1011,8 +1312,8 @@ async def test_quarantine_after_running_commit_prevents_stale_initial_dispatch(
     )
 
     starter = asyncio.create_task(job_engine.start_job(job_id))
-    await asyncio.wait_for(entered_after_running_commit.wait(), timeout=5)
     try:
+        await asyncio.wait_for(entered_after_running_commit.wait(), timeout=5)
         async with factory() as quarantine_db:
             result = await quarantine_channelops_backlog(
                 quarantine_db,
@@ -1023,7 +1324,7 @@ async def test_quarantine_after_running_commit_prevents_stale_initial_dispatch(
         assert result["schedule"]["final_state"] == VideoScheduleState.CLOSED.value
     finally:
         release_starter.set()
-        await asyncio.wait_for(starter, timeout=5)
+        await _finish_or_cancel_and_drain(starter)
 
     async with factory() as db:
         stored_task = await db.get(ProductionTask, task_id)
@@ -1113,23 +1414,24 @@ async def test_initial_start_locks_channel_before_mutating_job(
     monkeypatch.setattr("app.orchestrator.engine._redis", lambda: redis)
 
     blocker = factory()
-    starter = None
     try:
         await blocker.execute(
             select(ChannelProfile).where(ChannelProfile.id == channel_id).with_for_update()
         )
         starter = asyncio.create_task(JobEngine().start_job(job_id))
-        await _wait_until_lock_wait(engine, "channel_profiles", starter)
+        try:
+            await _wait_until_lock_wait(engine, "channel_profiles", starter)
 
-        async with factory() as observer:
-            stored_job = await observer.get(Job, job_id)
-        assert stored_job is not None and stored_job.status == JobStatus.PENDING
-        assert redis.dispatches == []
+            async with factory() as observer:
+                stored_job = await observer.get(Job, job_id)
+            assert stored_job is not None and stored_job.status == JobStatus.PENDING
+            assert redis.dispatches == []
+        finally:
+            await _bounded_rollback(blocker)
+            await _finish_or_cancel_and_drain(starter)
     finally:
-        await blocker.rollback()
-        await blocker.close()
-        if starter is not None:
-            await asyncio.wait_for(asyncio.gather(starter, return_exceptions=True), timeout=5)
+        await _bounded_rollback(blocker)
+        await _bounded_close(blocker)
 
 
 async def test_quarantine_between_initial_roots_does_not_revive_second_root(
@@ -1269,7 +1571,7 @@ async def test_quarantine_between_initial_roots_does_not_revive_second_root(
         assert result["schedule"]["final_state"] == VideoScheduleState.CLOSED.value
     finally:
         release_starter.set()
-        await asyncio.wait_for(starter, timeout=5)
+        await _finish_or_cancel_and_drain(starter)
 
     async with factory() as db:
         stored_task = await db.get(ProductionTask, task_id)

@@ -20,8 +20,14 @@ from app.services.schedule_service import (
 async def start_jobs_background(job_ids: Iterable[uuid.UUID]) -> None:
     from app.orchestrator.engine import engine
 
-    for job_id in job_ids:
-        asyncio.create_task(engine.start_job(uuid.UUID(str(job_id))))
+    materialized_ids = [uuid.UUID(str(job_id)) for job_id in job_ids]
+    if materialized_ids:
+        launches = asyncio.gather(*(engine.start_job(job_id) for job_id in materialized_ids))
+        try:
+            await asyncio.shield(launches)
+        except asyncio.CancelledError:
+            await launches
+            raise
 
 
 async def start_or_defer_jobs(db: AsyncSession, jobs: Iterable[Job]) -> VideoScheduleState:

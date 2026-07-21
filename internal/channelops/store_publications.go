@@ -116,12 +116,21 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 	if publication.PublishStatus != "uploaded" && publication.PublishStatus != "held" {
 		return fmt.Errorf("publication %s is not ready for promotion", publication.ID)
 	}
-	visibility := safePromotionVisibility(targetVisibility)
-	if visibility == "" {
+	rawTargetVisibility := strings.TrimSpace(targetVisibility)
+	visibility := ""
+	if rawTargetVisibility != "" {
+		visibility = safePromotionVisibility(rawTargetVisibility)
+		if visibility == "" {
+			return fmt.Errorf(
+				"%w: target visibility must be private or unlisted",
+				ErrPromotionOperationConflict,
+			)
+		}
+	} else {
 		visibility = safePrivacy(publication.DesiredPrivacy)
-	}
-	if visibility == "" {
-		visibility = "unlisted"
+		if visibility == "" {
+			visibility = "unlisted"
+		}
 	}
 	now := s.Now().UTC()
 	if scheduledAt.IsZero() {
@@ -132,14 +141,10 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 	}
 	status := "scheduled"
 	var publicAt *time.Time
-	if visibility == "public" && !scheduledAt.After(now) {
-		status = "public"
-		publicAt = &now
-	}
 	_, err = s.db().Exec(ctx, `
 		UPDATE publication_records
 		SET desired_privacy = $2,
-		    current_privacy = CASE WHEN $3 = 'public' THEN $2 ELSE current_privacy END,
+		    current_privacy = $2,
 		    publish_status = $3,
 			    scheduled_publish_at = $4::timestamptz,
 			    public_at = COALESCE($5::timestamptz, public_at),

@@ -145,7 +145,12 @@ func (c HTTPAutoFlowClient) ExecuteTask(ctx context.Context, task ProductionTask
 		"expected_approved_revision_hash": approvedRevisionHash,
 		"expected_approved_revision":      *task.AutoFlowApprovedRevision,
 	}
-	for _, field := range []string{"production_task_id", "channelops_queue_item_id"} {
+	for _, field := range []string{
+		"production_task_id",
+		"channelops_queue_item_id",
+		"channelops_queue_locked_by",
+		"channelops_queue_locked_at",
+	} {
 		if value := strings.TrimSpace(firstString(request, field)); value != "" {
 			payloadBody[field] = value
 		}

@@ -349,98 +349,14 @@ func TestPromotePublicationUsesConfiguredMetricsDelay(t *testing.T) {
 	}
 }
 
-func TestPromotionHandleAndQuarantineSerializeOnChannelFence(t *testing.T) {
-	if testing.Short() {
-		t.Skip("integration test skipped in short mode")
-	}
-	ctx := context.Background()
-	fixture := NewChannelOpsFixture(t)
-	defer fixture.Close(ctx)
-
-	fixture.InsertChannelWithLaneAccountSeed(ctx)
-	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
-	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
-		t.Fatalf("RunTick: %v", err)
-	}
-	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
-	releaseYouTube := make(chan struct{})
-	youtube := &blockingPromotionYouTube{
-		started: make(chan struct{}, 1),
-		release: releaseYouTube,
-	}
-	handler.YouTube = youtube
-	handleDone := make(chan error, 1)
-	go func() {
-		handleDone <- handler.Handle(ctx, promote)
-	}()
-
-	select {
-	case <-youtube.started:
-	case <-time.After(2 * time.Second):
-		close(releaseYouTube)
-		t.Fatal("promotion did not reach blocking YouTube client")
-	}
-
-	lockAcquired := make(chan struct{})
-	quarantineDone := make(chan error, 1)
-	go func() {
-		tx, err := fixture.Store.Pool.Begin(ctx)
-		if err != nil {
-			quarantineDone <- err
-			return
-		}
-		defer func() { _ = tx.Rollback(ctx) }()
-		var channelID string
-		err = tx.QueryRow(ctx, `
-			SELECT id::text
-			FROM channel_profiles
-			WHERE id = $1::uuid
-			FOR UPDATE
-		`, fixture.ChannelID).Scan(&channelID)
-		if err != nil {
-			quarantineDone <- err
-			return
-		}
-		close(lockAcquired)
-		if err := applyFenceTestQuarantine(ctx, tx, fixture.ChannelID); err != nil {
-			quarantineDone <- err
-			return
-		}
-		quarantineDone <- tx.Commit(ctx)
-	}()
-
-	select {
-	case <-lockAcquired:
-		close(releaseYouTube)
-		<-handleDone
-		<-quarantineDone
-		t.Fatal("quarantine acquired the channel lock while promotion dispatch was active")
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	close(releaseYouTube)
-	if err := <-handleDone; err != nil {
-		t.Fatalf("Handle promotion: %v", err)
-	}
-	if err := <-quarantineDone; err != nil {
-		t.Fatalf("quarantine: %v", err)
-	}
-	if youtube.calls.Load() != 1 {
-		t.Fatalf("YouTube calls = %d, want 1 before quarantine", youtube.calls.Load())
-	}
-	if err := fixture.Store.MarkQueueDone(ctx, promote); err != nil {
-		t.Fatalf("stale MarkQueueDone: %v", err)
-	}
-	requireQuarantinedPromotion(t, ctx, fixture, promote, 2)
-}
-
 func TestQuarantineFirstPreventsPromotionSideEffects(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)
-	defer fixture.Close(ctx)
+	var operations []*cancellableTestOperation
+	registerBoundedFixtureCleanup(t, fixture, &operations)
 
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
@@ -460,7 +376,7 @@ func TestQuarantineFirstPreventsPromotionSideEffects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin quarantine: %v", err)
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	registerBoundedRollback(t, tx)
 	var channelID string
 	if err := tx.QueryRow(ctx, `
 		SELECT id::text
@@ -474,10 +390,10 @@ func TestQuarantineFirstPreventsPromotionSideEffects(t *testing.T) {
 		t.Fatalf("apply quarantine: %v", err)
 	}
 
-	handleDone := make(chan error, 1)
-	go func() {
-		handleDone <- handler.Handle(ctx, promote)
-	}()
+	handleOperation := startCancellableTestOperation(t, nil, func(operationCtx context.Context) error {
+		return handler.Handle(operationCtx, promote)
+	})
+	operations = append(operations, handleOperation)
 	calledBeforeCommit := false
 	select {
 	case <-youtube.started:
@@ -487,7 +403,10 @@ func TestQuarantineFirstPreventsPromotionSideEffects(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("commit quarantine: %v", err)
 	}
-	handleErr := <-handleDone
+	handleErr, waitErr := handleOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
+	if waitErr != nil {
+		t.Fatal(waitErr)
+	}
 	if calledBeforeCommit {
 		t.Fatal("promotion called YouTube while quarantine held the channel lock")
 	}
@@ -511,7 +430,8 @@ func TestPromotionAuthorityFencesReferencedChannelWithNullOrMismatchedMetadata(t
 		t.Run(metadata, func(t *testing.T) {
 			ctx := context.Background()
 			fixture := NewChannelOpsFixture(t)
-			defer fixture.Close(ctx)
+			var operations []*cancellableTestOperation
+			registerBoundedFixtureCleanup(t, fixture, &operations)
 
 			fixture.InsertChannelWithLaneAccountSeed(ctx)
 			handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
@@ -524,17 +444,16 @@ func TestPromotionAuthorityFencesReferencedChannelWithNullOrMismatchedMetadata(t
 			releaseYouTube := make(chan struct{})
 			youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
 			handler.YouTube = youtube
-			handleDone := make(chan error, 1)
-			go func() { handleDone <- handler.Handle(ctx, promote) }()
-			select {
-			case handleErr := <-handleDone:
-				close(releaseYouTube)
-				if !errors.Is(handleErr, ErrQueueAuthorityInvalid) {
-					t.Fatalf("Handle error = %v, want invalid queue authority", handleErr)
-				}
-			case <-time.After(2 * time.Second):
-				close(releaseYouTube)
-				t.Fatal("invalid promotion authority did not fail closed")
+			handleOperation := startCancellableTestOperation(t, func() { close(releaseYouTube) }, func(operationCtx context.Context) error {
+				return handler.Handle(operationCtx, promote)
+			})
+			operations = append(operations, handleOperation)
+			handleErr, waitErr := handleOperation.waitOrCancelAndDrain(2*time.Second, testOperationCleanupTimeout)
+			if waitErr != nil {
+				t.Fatalf("invalid promotion authority did not fail closed: %v", waitErr)
+			}
+			if !errors.Is(handleErr, ErrQueueAuthorityInvalid) {
+				t.Fatalf("Handle error = %v, want invalid queue authority", handleErr)
 			}
 			if youtube.calls.Load() != 0 {
 				t.Fatalf("YouTube calls = %d, want 0", youtube.calls.Load())
@@ -605,7 +524,7 @@ func TestPlanRejectFirstPreventsDirectPromotionSideEffects(t *testing.T) {
 	}
 }
 
-func TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites(t *testing.T) {
+func TestDirectPromotionRevalidatesPlanAfterExternalSubmission(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
@@ -635,37 +554,15 @@ func TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites(t *test
 		t.Fatal("direct promotion did not reach YouTube")
 	}
 
-	conn, err := fixture.Store.Pool.Acquire(ctx)
-	if err != nil {
-		t.Fatalf("acquire invalidation connection: %v", err)
+	invalidateCtx, cancelInvalidate := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelInvalidate()
+	if _, err := fixture.Store.Pool.Exec(invalidateCtx, `
+		UPDATE autoflow_plans
+		SET prompt = prompt || ' concurrent canonical patch'
+		WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
+	`); err != nil {
+		t.Fatalf("invalidate plan while manager call is active: %v", err)
 	}
-	var invalidationOperation *cancellableTestOperation
-	t.Cleanup(func() {
-		for _, operation := range []*cancellableTestOperation{invalidationOperation, handleOperation} {
-			if operation == nil {
-				continue
-			}
-			if _, err := operation.cancelAndDrain(testOperationCleanupTimeout); err != nil {
-				t.Errorf("cancel and drain operation before connection release: %v", err)
-				return
-			}
-		}
-		conn.Release()
-	})
-	var invalidationPID int
-	if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&invalidationPID); err != nil {
-		t.Fatalf("read invalidation pid: %v", err)
-	}
-	invalidationOperation = startCancellableTestOperation(t, nil, func(operationCtx context.Context) error {
-		_, err := conn.Exec(operationCtx, `
-			UPDATE autoflow_plans
-			SET prompt = prompt || ' concurrent canonical patch'
-			WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
-		`)
-		return err
-	})
-	operations = append(operations, invalidationOperation)
-	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationOperation.tryWait)
 
 	handleOperation.releaseBlocker()
 	handleErr, err := handleOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
@@ -674,13 +571,6 @@ func TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites(t *test
 	}
 	if handleErr != nil {
 		t.Fatalf("direct promotion: %v", handleErr)
-	}
-	invalidationErr, err := invalidationOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if invalidationErr != nil {
-		t.Fatalf("canonical invalidation: %v", invalidationErr)
 	}
 	if youtube.calls.Load() != 1 {
 		t.Fatalf("YouTube calls = %d, want 1", youtube.calls.Load())
@@ -696,6 +586,29 @@ func TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites(t *test
 	}
 	if approvedRevisionHash != nil || approvedRevision != nil {
 		t.Fatalf("plan authority survived canonical patch: hash=%v revision=%v", approvedRevisionHash, approvedRevision)
+	}
+	storedTask, err := fixture.Store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetProductionTask: %v", err)
+	}
+	if storedTask.State != TaskHeld || storedTask.BlockedByGuard == nil || *storedTask.BlockedByGuard != "autoflow_plan_authority_invalid" {
+		t.Fatalf("task after final authority check = %#v", storedTask)
+	}
+	publication, err := fixture.Store.GetPublication(ctx, publicationID)
+	if err != nil {
+		t.Fatalf("GetPublication: %v", err)
+	}
+	if publication.PublishStatus != "uploaded" {
+		t.Fatalf("publication status = %s, want uploaded", publication.PublishStatus)
+	}
+	var operationStatus string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status FROM publication_promotion_operations WHERE publication_id = $1::uuid
+	`, publicationID).Scan(&operationStatus); err != nil {
+		t.Fatalf("read promotion operation: %v", err)
+	}
+	if operationStatus != PromotionConfirmed {
+		t.Fatalf("operation status = %s, want %s", operationStatus, PromotionConfirmed)
 	}
 }
 
@@ -772,7 +685,7 @@ func TestAutomaticOwnedPromotionRejectFirstPreventsPDSAndYouTube(t *testing.T) {
 	}
 }
 
-func TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites(t *testing.T) {
+func TestAutomaticOwnedPromotionRevalidatesPlanAfterExternalSubmission(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
@@ -802,37 +715,15 @@ func TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites(t *testing.T) 
 		t.Fatal("automatic promotion did not reach YouTube")
 	}
 
-	conn, err := fixture.Store.Pool.Acquire(ctx)
-	if err != nil {
-		t.Fatalf("acquire invalidation connection: %v", err)
+	invalidateCtx, cancelInvalidate := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelInvalidate()
+	if _, err := fixture.Store.Pool.Exec(invalidateCtx, `
+		UPDATE autoflow_plans
+		SET prompt = prompt || ' automatic concurrent patch'
+		WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
+	`); err != nil {
+		t.Fatalf("invalidate automatic plan while manager call is active: %v", err)
 	}
-	var invalidationOperation *cancellableTestOperation
-	t.Cleanup(func() {
-		for _, operation := range []*cancellableTestOperation{invalidationOperation, handleOperation} {
-			if operation == nil {
-				continue
-			}
-			if _, err := operation.cancelAndDrain(testOperationCleanupTimeout); err != nil {
-				t.Errorf("cancel and drain operation before connection release: %v", err)
-				return
-			}
-		}
-		conn.Release()
-	})
-	var invalidationPID int
-	if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&invalidationPID); err != nil {
-		t.Fatalf("read invalidation pid: %v", err)
-	}
-	invalidationOperation = startCancellableTestOperation(t, nil, func(operationCtx context.Context) error {
-		_, err := conn.Exec(operationCtx, `
-			UPDATE autoflow_plans
-			SET prompt = prompt || ' automatic concurrent patch'
-			WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
-		`)
-		return err
-	})
-	operations = append(operations, invalidationOperation)
-	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationOperation.tryWait)
 
 	handleOperation.releaseBlocker()
 	handleErr, err := handleOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
@@ -842,13 +733,6 @@ func TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites(t *testing.T) 
 	if handleErr != nil {
 		t.Fatalf("automatic promotion: %v", handleErr)
 	}
-	invalidationErr, err := invalidationOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if invalidationErr != nil {
-		t.Fatalf("canonical invalidation: %v", invalidationErr)
-	}
 	if recorder.pds.Load() != 1 || youtube.calls.Load() != 1 {
 		t.Fatalf("automatic promotion side effects pds/youtube = %d/%d, want 1/1", recorder.pds.Load(), youtube.calls.Load())
 	}
@@ -856,8 +740,24 @@ func TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites(t *testing.T) 
 	if err != nil {
 		t.Fatalf("GetPublication: %v", err)
 	}
-	if publication.PublishStatus != "scheduled" || publication.ScheduledPublishAt == nil {
-		t.Fatalf("publication did not durably linearize before invalidation: %#v", publication)
+	if publication.PublishStatus != "uploaded" || publication.ScheduledPublishAt != nil {
+		t.Fatalf("publication finalized after plan invalidation: %#v", publication)
+	}
+	storedTask, err := fixture.Store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetProductionTask: %v", err)
+	}
+	if storedTask.State != TaskHeld || storedTask.BlockedByGuard == nil || *storedTask.BlockedByGuard != "autoflow_plan_authority_invalid" {
+		t.Fatalf("automatic task after final authority check = %#v", storedTask)
+	}
+	var operationStatus string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status FROM publication_promotion_operations WHERE publication_id = $1::uuid
+	`, firstString(promote.PayloadJSON, "publication_id")).Scan(&operationStatus); err != nil {
+		t.Fatalf("read automatic promotion operation: %v", err)
+	}
+	if operationStatus != PromotionConfirmed {
+		t.Fatalf("operation status = %s, want %s", operationStatus, PromotionConfirmed)
 	}
 }
 
@@ -1171,7 +1071,8 @@ func TestQuarantineFirstBlocksNullOrMismatchedPromotionMetadata(t *testing.T) {
 		t.Run(metadata, func(t *testing.T) {
 			ctx := context.Background()
 			fixture := NewChannelOpsFixture(t)
-			defer fixture.Close(ctx)
+			var operations []*cancellableTestOperation
+			registerBoundedFixtureCleanup(t, fixture, &operations)
 
 			fixture.InsertChannelWithLaneAccountSeed(ctx)
 			handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
@@ -1185,7 +1086,7 @@ func TestQuarantineFirstBlocksNullOrMismatchedPromotionMetadata(t *testing.T) {
 			if err != nil {
 				t.Fatalf("begin quarantine: %v", err)
 			}
-			defer func() { _ = quarantineTx.Rollback(ctx) }()
+			registerBoundedRollback(t, quarantineTx)
 			var channelID string
 			if err := quarantineTx.QueryRow(ctx, `
 				SELECT id::text FROM channel_profiles WHERE id = $1::uuid FOR UPDATE
@@ -1200,13 +1101,13 @@ func TestQuarantineFirstBlocksNullOrMismatchedPromotionMetadata(t *testing.T) {
 			close(releaseYouTube)
 			youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
 			handler.YouTube = youtube
-			handleDone := make(chan error, 1)
-			go func() { handleDone <- handler.Handle(ctx, promote) }()
-			var handleErr error
-			select {
-			case handleErr = <-handleDone:
-			case <-time.After(2 * time.Second):
-				t.Fatal("invalid promotion authority did not fail closed")
+			handleOperation := startCancellableTestOperation(t, nil, func(operationCtx context.Context) error {
+				return handler.Handle(operationCtx, promote)
+			})
+			operations = append(operations, handleOperation)
+			handleErr, waitErr := handleOperation.waitOrCancelAndDrain(2*time.Second, testOperationCleanupTimeout)
+			if waitErr != nil {
+				t.Fatalf("invalid promotion authority did not fail closed: %v", waitErr)
 			}
 			if err := quarantineTx.Commit(ctx); err != nil {
 				t.Fatalf("commit quarantine: %v", err)
@@ -1589,6 +1490,12 @@ func TestExecuteHandlerReleasesChannelFenceBeforeAutoFlow(t *testing.T) {
 			if firstString(request, "channelops_queue_item_id") != item.ID {
 				return AutoFlowExecuteObservation{}, errors.New("missing bound queue item authority")
 			}
+			if item.LockedBy == nil || firstString(request, "channelops_queue_locked_by") != *item.LockedBy {
+				return AutoFlowExecuteObservation{}, errors.New("missing bound queue lease owner")
+			}
+			if item.LockedAt == nil || firstString(request, "channelops_queue_locked_at") != item.LockedAt.UTC().Format(time.RFC3339Nano) {
+				return AutoFlowExecuteObservation{}, errors.New("missing bound queue lease timestamp")
+			}
 			return fakeAutoFlow{}.ExecuteTask(ctx, task, request)
 		},
 	}
@@ -1613,11 +1520,13 @@ func TestExecuteHandlerFinalizesFromDurableRemoteLinkAfterResponseLoss(t *testin
 	runID := "00000000-0000-0000-0000-000000000211"
 	pipelineID := "00000000-0000-0000-0000-000000000212"
 	jobID := "00000000-0000-0000-0000-000000000311"
+	executeCalls := 0
 
 	handler := baseHandler
 	handler.AutoFlow = executeHookAutoFlow{
 		fakeAutoFlow: fakeAutoFlow{},
 		execute: func(_ context.Context, _ ProductionTaskRow, _ map[string]any) (AutoFlowExecuteObservation, error) {
+			executeCalls++
 			_, err := fixture.Store.Pool.Exec(ctx, `
 				UPDATE production_tasks
 				SET autoflow_run_id = $2::uuid,
@@ -1652,6 +1561,12 @@ func TestExecuteHandlerFinalizesFromDurableRemoteLinkAfterResponseLoss(t *testin
 	}
 	if observeCount != 1 {
 		t.Fatalf("observe queue count = %d, want 1", observeCount)
+	}
+	if err := handler.HandleExecuteTask(ctx, item); err != nil {
+		t.Fatalf("HandleExecuteTask replay: %v", err)
+	}
+	if executeCalls != 2 {
+		t.Fatalf("AutoFlow execute calls = %d, want 2 so replay can recover a lost start handoff", executeCalls)
 	}
 }
 
@@ -2882,9 +2797,9 @@ func (f *recordingYouTube) AccountHealth(ctx context.Context, accountID string) 
 	return f.fakeYouTube.AccountHealth(ctx, accountID)
 }
 
-func (f *recordingYouTube) SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string) error {
+func (f *recordingYouTube) SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string, idempotencyKey string) error {
 	f.recorder.schedulePublish.Add(1)
-	return f.fakeYouTube.SchedulePublish(ctx, videoID, scheduledAt, privacy)
+	return f.fakeYouTube.SchedulePublish(ctx, videoID, scheduledAt, privacy, idempotencyKey)
 }
 
 func (f *recordingYouTube) PublicationStatus(ctx context.Context, videoID string) (YouTubePublicationStatus, error) {
@@ -2904,7 +2819,7 @@ type blockingPromotionYouTube struct {
 	calls   atomic.Int32
 }
 
-func (f *blockingPromotionYouTube) SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string) error {
+func (f *blockingPromotionYouTube) SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string, idempotencyKey string) error {
 	f.calls.Add(1)
 	select {
 	case f.started <- struct{}{}:
@@ -2914,7 +2829,7 @@ func (f *blockingPromotionYouTube) SchedulePublish(ctx context.Context, videoID 
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-f.release:
-		return f.fakeYouTube.SchedulePublish(ctx, videoID, scheduledAt, privacy)
+		return f.fakeYouTube.SchedulePublish(ctx, videoID, scheduledAt, privacy, idempotencyKey)
 	}
 }
 
@@ -2922,12 +2837,15 @@ func (fakeYouTube) AccountHealth(ctx context.Context, accountID string) (YouTube
 	return YouTubeAccountHealth{Authenticated: true, QuotaRemaining: 1000, Raw: map[string]any{"ok": true}}, nil
 }
 
-func (fakeYouTube) SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string) error {
+func (fakeYouTube) SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string, idempotencyKey string) error {
 	if strings.TrimSpace(videoID) == "" {
 		return fmt.Errorf("videoID is required")
 	}
 	if privacy != "unlisted" && privacy != "private" {
 		return fmt.Errorf("unexpected scheduled privacy %q", privacy)
+	}
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return fmt.Errorf("idempotency key is required")
 	}
 	return nil
 }

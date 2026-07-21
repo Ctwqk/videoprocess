@@ -407,6 +407,8 @@ class AutoFlowExecuteRequest(BaseModel):
     expected_approved_revision: int | None = Field(default=None, ge=1)
     production_task_id: str | None = None
     channelops_queue_item_id: str | None = None
+    channelops_queue_locked_by: str | None = Field(default=None, min_length=1, max_length=255)
+    channelops_queue_locked_at: datetime | None = None
 
 
 class AutoFlowRun(BaseModel):

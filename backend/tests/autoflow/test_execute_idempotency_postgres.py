@@ -118,7 +118,12 @@ async def _bound_execute_request(
     *,
     halted: bool = False,
     queue_status: str = "running",
+    queue_claimed: bool = True,
 ) -> tuple[uuid.UUID, uuid.UUID, AutoFlowExecuteRequest]:
+    requested_locked_by = "bound-execute-worker"
+    requested_locked_at = datetime.now(timezone.utc)
+    queue_locked_by = requested_locked_by if queue_status == "running" and queue_claimed else None
+    queue_locked_at = requested_locked_at if queue_locked_by is not None else None
     async with factory() as db:
         channel = ChannelProfile(
             name="bound execute channel",
@@ -157,6 +162,9 @@ async def _bound_execute_request(
                 "expected_approved_revision": plan.approved_revision,
             },
             status=queue_status,
+            locked_by=queue_locked_by,
+            locked_at=queue_locked_at,
+            attempt_count=1 if queue_status == "running" and queue_claimed else 0,
         )
         db.add(queue)
         await db.commit()
@@ -171,6 +179,8 @@ async def _bound_execute_request(
         expected_approved_revision=plan.approved_revision,
         production_task_id=str(task.id),
         channelops_queue_item_id=str(queue.id),
+        channelops_queue_locked_by=requested_locked_by,
+        channelops_queue_locked_at=requested_locked_at,
     )
     return task.id, queue.id, request
 
@@ -221,6 +231,11 @@ async def test_bound_execute_replay_recovers_lost_start_handoff_without_duplicat
     async def fail_first_start(job_ids):
         start_attempts.append([str(job_id) for job_id in job_ids])
         if len(start_attempts) == 1:
+            async with factory() as start_db:
+                job = await start_db.get(Job, uuid.UUID(start_attempts[0][0]))
+                assert job is not None
+                job.status = JobStatus.RUNNING
+                await start_db.commit()
             raise RuntimeError("lost start handoff")
 
     monkeypatch.setattr("app.autoflow.service.start_jobs_background", fail_first_start)
@@ -265,6 +280,48 @@ async def test_bound_execute_rejects_revoked_queue_or_channel_authority_without_
 
     async with factory() as db:
         with pytest.raises(PermissionError, match=error):
+            await service.execute(request, db)
+
+    assert await _counts(factory) == (0, 0, 0)
+    assert starts == []
+
+
+async def test_bound_execute_rejects_running_queue_without_claim_lease(
+    postgres_idempotency_db,
+):
+    _engine, factory, starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Bound execution requires a real queue lease")
+    _task_id, _queue_id, request = await _bound_execute_request(
+        factory,
+        plan,
+        queue_claimed=False,
+    )
+
+    async with factory() as db:
+        with pytest.raises(PermissionError, match="execute queue item is not claimed"):
+            await service.execute(request, db)
+
+    assert await _counts(factory) == (0, 0, 0)
+    assert starts == []
+
+
+async def test_bound_execute_rejects_stale_lease_after_queue_reclaim(
+    postgres_idempotency_db,
+):
+    _engine, factory, starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Bound execution rejects stale queue leases")
+    _task_id, queue_id, request = await _bound_execute_request(factory, plan)
+
+    async with factory() as db:
+        queue = await db.get(ChannelOpsQueueItem, queue_id)
+        assert queue is not None
+        queue.locked_by = "replacement-worker"
+        queue.locked_at = datetime.now(timezone.utc)
+        queue.attempt_count += 1
+        await db.commit()
+
+    async with factory() as db:
+        with pytest.raises(PermissionError, match="execute queue lease authority changed"):
             await service.execute(request, db)
 
     assert await _counts(factory) == (0, 0, 0)
@@ -397,6 +454,8 @@ async def test_pre_expected_authority_fingerprint_remains_replayable(postgres_id
                 "expected_approved_revision",
                 "production_task_id",
                 "channelops_queue_item_id",
+                "channelops_queue_locked_by",
+                "channelops_queue_locked_at",
             },
     )
     legacy_payload["plan_id"] = str(uuid.UUID(plan.plan_id))

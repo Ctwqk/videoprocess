@@ -29,6 +29,13 @@ type PlanResult struct {
 	EnqueueExecute bool
 }
 
+var ErrPromotionOutcomeUncertain = errors.New("promotion outcome uncertain")
+
+type promotionPreparation struct {
+	Operation PromotionOperationRow
+	Skip      bool
+}
+
 func PlanDecisionResult(decision PDSDecision) PlanResult {
 	switch decision.Verdict {
 	case "allow":
@@ -87,6 +94,9 @@ func (h HandlerService) Handle(ctx context.Context, item QueueItemRow) error {
 	if item.Kind == QueueExecuteTask {
 		return h.HandleExecuteTask(ctx, item)
 	}
+	if item.Kind == QueuePromotePublication {
+		return h.HandlePromotePublication(ctx, item)
+	}
 	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
 		fencedHandler := h
 		fencedHandler.Store = fencedStore
@@ -107,7 +117,7 @@ func (h HandlerService) dispatch(ctx context.Context, item QueueItemRow) error {
 	case QueuePublishTask:
 		return h.HandlePublishTask(ctx, item)
 	case QueuePromotePublication:
-		return h.HandlePromotePublication(ctx, item)
+		return errors.New("promote_publication requires split execution fencing")
 	case QueueReconcilePublication:
 		return h.HandleReconcilePublication(ctx, item)
 	case QueueCollectMetrics:
@@ -236,6 +246,10 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	if h.Store.hasExecutionTransaction() {
 		return errors.New("execute_task cannot call AutoFlow while a database fence is held")
 	}
+	queueLockedBy, queueLockedAt, err := runningLease(item)
+	if err != nil || strings.TrimSpace(queueLockedBy) == "" || queueLockedAt.IsZero() {
+		return fmt.Errorf("%w: execute queue item has no valid running lease", ErrQueueAuthorityInvalid)
+	}
 
 	var preparedTask ProductionTaskRow
 	shouldExecute := false
@@ -259,6 +273,8 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	request := AutoFlowRequestForTask(preparedTask)
 	request["production_task_id"] = preparedTask.ID
 	request["channelops_queue_item_id"] = item.ID
+	request["channelops_queue_locked_by"] = queueLockedBy
+	request["channelops_queue_locked_at"] = queueLockedAt.UTC().Format(time.RFC3339Nano)
 	observation, err := h.AutoFlow.ExecuteTask(ctx, preparedTask, request)
 	if err != nil {
 		return err
@@ -285,10 +301,8 @@ func (h HandlerService) prepareExecuteTask(ctx context.Context, item QueueItemRo
 	if err := validateExecuteTaskAuthority(item, task); err != nil {
 		return ProductionTaskRow{}, false, err
 	}
-	if runID, jobID, ok := ExistingExecution(task); ok {
-		return task, false, h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, runID, jobID, item.ID)
-	}
-	if task.State != TaskPlanning {
+	_, _, hasExecution := ExistingExecution(task)
+	if task.State != TaskPlanning && !hasExecution {
 		return ProductionTaskRow{}, false, fmt.Errorf("%w: producing task has no durable execution", ErrQueueAuthorityInvalid)
 	}
 	if held, err := h.holdInvalidPreUploadReview(ctx, task, "execute_task_human_review"); held {
@@ -474,48 +488,113 @@ func (h HandlerService) HandlePromotePublication(ctx context.Context, item Queue
 	if h.Store == nil {
 		return errors.New("channelops handler store is not configured")
 	}
-	if !h.Store.hasExecutionTransaction() {
-		return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
-			fencedHandler := h
-			fencedHandler.Store = fencedStore
-			return fencedHandler.handlePromotePublication(ctx, item)
-		})
-	}
-	return h.handlePromotePublication(ctx, item)
-}
-
-func (h HandlerService) handlePromotePublication(ctx context.Context, item QueueItemRow) error {
 	if h.PDS == nil {
 		return errors.New("pds client is not configured")
 	}
 	if h.YouTube == nil {
 		return errors.New("youtube client is not configured")
 	}
+	if h.Store.hasExecutionTransaction() {
+		return errors.New("promote_publication cannot hold an execution transaction across submission")
+	}
+
+	var preparation promotionPreparation
+	if err := h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
+		fencedHandler := h
+		fencedHandler.Store = fencedStore
+		prepared, err := fencedHandler.preparePromotion(ctx, item)
+		preparation = prepared
+		return err
+	}); err != nil {
+		return err
+	}
+	if preparation.Skip {
+		return nil
+	}
+	return h.executePromotionOperation(ctx, item, preparation.Operation)
+}
+
+func (h HandlerService) preparePromotion(
+	ctx context.Context,
+	item QueueItemRow,
+) (promotionPreparation, error) {
 	publicationID, _ := item.PayloadJSON["publication_id"].(string)
 	if publicationID == "" {
-		return errors.New("promote_publication payload missing publication_id")
+		return promotionPreparation{}, errors.New("promote_publication payload missing publication_id")
 	}
 	publication, task, err := h.Store.LockPromotionOperatorScope(ctx, publicationID)
 	if err != nil {
-		return err
+		return promotionPreparation{}, err
 	}
-	if task.State != TaskUploadedPrivate {
-		return nil
+	existingOperation, err := h.Store.GetPromotionOperationForPublication(ctx, publication.ID)
+	if err != nil {
+		return promotionPreparation{}, err
 	}
-	targetVisibility := safePromotionVisibility(firstString(item.PayloadJSON, "target_visibility"))
-	if targetVisibility == "" {
+	if existingOperation != nil {
+		if err := validatePromotionOperationAuthority(item, publication, task, *existingOperation); err != nil {
+			return promotionPreparation{}, err
+		}
+		if existingOperation.Status == PromotionFinalized {
+			return promotionPreparation{Operation: *existingOperation, Skip: true}, nil
+		}
+	}
+	if task.State != TaskUploadedPrivate && !taskHeldForPromotionUncertainty(task, existingOperation) {
+		return promotionPreparation{Skip: true}, nil
+	}
+	if existingOperation != nil {
+		switch existingOperation.Status {
+		case PromotionSubmitting, PromotionUncertain, PromotionConfirmed:
+			return promotionPreparation{Operation: *existingOperation}, nil
+		case PromotionReserved:
+		default:
+			return promotionPreparation{}, fmt.Errorf(
+				"%w: unknown promotion operation state %q",
+				ErrPromotionOperationConflict,
+				existingOperation.Status,
+			)
+		}
+	}
+	rawTargetVisibility := strings.TrimSpace(firstString(item.PayloadJSON, "target_visibility"))
+	targetVisibility := ""
+	if rawTargetVisibility != "" {
+		targetVisibility = safePromotionVisibility(rawTargetVisibility)
+		if targetVisibility == "" {
+			return promotionPreparation{}, fmt.Errorf(
+				"%w: target visibility must be private or unlisted",
+				ErrPromotionOperationConflict,
+			)
+		}
+	} else {
 		targetVisibility = safePromotionVisibility(publication.DesiredPrivacy)
+		if targetVisibility == "" {
+			targetVisibility = "unlisted"
+		}
 	}
-	if targetVisibility == "" {
-		targetVisibility = "unlisted"
+	scheduledAt := h.Store.Now().UTC()
+	if raw := firstString(item.PayloadJSON, "scheduled_at"); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return promotionPreparation{}, fmt.Errorf("promote_publication scheduled_at: %w", err)
+		}
+		scheduledAt = parsed.UTC()
+	}
+	if existingOperation != nil {
+		if targetVisibility != existingOperation.TargetPrivacy {
+			return promotionPreparation{}, fmt.Errorf(
+				"%w: queued target visibility does not match reserved operation",
+				ErrPromotionOperationConflict,
+			)
+		}
+		targetVisibility = existingOperation.TargetPrivacy
+		scheduledAt = existingOperation.ScheduledAt
 	}
 	if task.AutoFlowPlanID != nil {
 		valid, err := h.Store.ValidPromotionPlanAuthority(ctx, task)
 		if err != nil {
-			return err
+			return promotionPreparation{}, err
 		}
 		if !valid {
-			return h.Store.HoldTask(
+			return promotionPreparation{Skip: true}, h.Store.HoldTask(
 				ctx,
 				task.ID,
 				"autoflow_plan_authority_invalid",
@@ -525,15 +604,15 @@ func (h HandlerService) handlePromotePublication(ctx context.Context, item Queue
 		}
 	}
 	if held, err := h.holdInvalidPreUploadReview(ctx, task, "promote_publication_human_review"); held {
-		return err
+		return promotionPreparation{Skip: true}, err
 	}
 	if taskUsesExternalAssets(task) || boolValue(item.PayloadJSON["manual_review"]) {
 		valid, err := h.Store.ValidPromotionHumanReview(ctx, task, publication, targetVisibility)
 		if err != nil {
-			return err
+			return promotionPreparation{}, err
 		}
 		if !valid {
-			return h.Store.HoldTask(
+			return promotionPreparation{Skip: true}, h.Store.HoldTask(
 				ctx,
 				task.ID,
 				"human_review_evidence_invalid",
@@ -541,14 +620,6 @@ func (h HandlerService) handlePromotePublication(ctx context.Context, item Queue
 				"promote_publication_human_review",
 			)
 		}
-	}
-	scheduledAt := h.Store.Now().UTC()
-	if raw := firstString(item.PayloadJSON, "scheduled_at"); raw != "" {
-		parsed, err := time.Parse(time.RFC3339, raw)
-		if err != nil {
-			return fmt.Errorf("promote_publication scheduled_at: %w", err)
-		}
-		scheduledAt = parsed.UTC()
 	}
 	decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
 		ActorID:    publication.AccountID,
@@ -562,12 +633,12 @@ func (h HandlerService) handlePromotePublication(ctx context.Context, item Queue
 		},
 	})
 	if err != nil {
-		return err
+		return promotionPreparation{}, err
 	}
 	channelID := task.ChannelProfileID
 	if alert, ok := maybePDSOutageAlert(decision, channelID, publication.ID, "publish"); ok {
 		if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
-			return err
+			return promotionPreparation{}, err
 		}
 	}
 	if decision.Verdict != "allow" {
@@ -575,12 +646,296 @@ func (h HandlerService) handlePromotePublication(ctx context.Context, item Queue
 		if decision.Verdict == "flag" {
 			guard = "pds_flagged_for_review"
 		}
-		return h.Store.HoldTaskWithPDS(ctx, publication.ProductionTaskID, guard, decision, "promote_publication_pds")
+		return promotionPreparation{Skip: true}, h.Store.HoldTaskWithPDS(
+			ctx,
+			publication.ProductionTaskID,
+			guard,
+			decision,
+			"promote_publication_pds",
+		)
 	}
-	if err := h.YouTube.SchedulePublish(ctx, publication.PlatformContentID, scheduledAt, targetVisibility); err != nil {
+	operation, err := h.Store.ReservePromotionOperation(
+		ctx,
+		publication,
+		item.ID,
+		targetVisibility,
+		scheduledAt,
+		decision,
+	)
+	if err != nil {
+		return promotionPreparation{}, err
+	}
+	return promotionPreparation{Operation: operation}, nil
+}
+
+func validatePromotionOperationAuthority(
+	item QueueItemRow,
+	publication PublicationRow,
+	task ProductionTaskRow,
+	operation PromotionOperationRow,
+) error {
+	if operation.PublicationID != publication.ID ||
+		operation.ProductionTaskID != task.ID ||
+		operation.QueueItemID != item.ID ||
+		operation.PlatformVideoID != publication.PlatformContentID ||
+		safePromotionVisibility(operation.TargetPrivacy) != operation.TargetPrivacy ||
+		operation.ScheduledAt.IsZero() {
+		return fmt.Errorf("%w: persisted promotion authority changed", ErrPromotionOperationConflict)
+	}
+	return nil
+}
+
+func (h HandlerService) executePromotionOperation(
+	ctx context.Context,
+	item QueueItemRow,
+	operation PromotionOperationRow,
+) error {
+	for {
+		switch operation.Status {
+		case PromotionFinalized:
+			return nil
+		case PromotionConfirmed:
+			return h.finalizePromotionOperation(ctx, item, operation.ID)
+		case PromotionSubmitting, PromotionUncertain:
+			return h.reconcilePromotionOperation(ctx, item, operation, nil)
+		case PromotionReserved:
+			claimed, shouldSubmit, err := h.Store.BeginPromotionSubmission(ctx, operation.ID)
+			if err != nil {
+				return err
+			}
+			operation = claimed
+			if !shouldSubmit {
+				continue
+			}
+			submitErr := h.YouTube.SchedulePublish(
+				ctx,
+				operation.PlatformVideoID,
+				operation.ScheduledAt,
+				operation.TargetPrivacy,
+				operation.AttemptKey,
+			)
+			if submitErr != nil {
+				return h.reconcilePromotionOperation(ctx, item, operation, submitErr)
+			}
+			confirmed, err := h.Store.ConfirmPromotionOperation(
+				ctx,
+				operation.ID,
+				YouTubePublicationStatus{
+					VideoID:       operation.PlatformVideoID,
+					PublishStatus: "scheduled",
+					Privacy:       operation.TargetPrivacy,
+				},
+				map[string]any{
+					"manager_response": map[string]any{
+						"accepted": true,
+						"at":       h.Store.Now().UTC().Format(time.RFC3339Nano),
+					},
+				},
+			)
+			if err != nil {
+				return err
+			}
+			operation = confirmed
+		default:
+			return fmt.Errorf(
+				"%w: unknown promotion operation state %q",
+				ErrPromotionOperationConflict,
+				operation.Status,
+			)
+		}
+	}
+}
+
+func (h HandlerService) reconcilePromotionOperation(
+	ctx context.Context,
+	item QueueItemRow,
+	operation PromotionOperationRow,
+	submitErr error,
+) error {
+	status, statusErr := h.YouTube.PublicationStatus(ctx, operation.PlatformVideoID)
+	if statusErr == nil &&
+		observedPrivacy(status.Privacy) == operation.TargetPrivacy &&
+		!isSeverePublicationStatus(status.PublishStatus) {
+		confirmed, err := h.Store.ConfirmPromotionOperation(
+			ctx,
+			operation.ID,
+			status,
+			map[string]any{
+				"status_reconciliation": map[string]any{
+					"matched": true,
+					"at":      h.Store.Now().UTC().Format(time.RFC3339Nano),
+				},
+			},
+		)
+		if err != nil {
+			return err
+		}
+		return h.finalizePromotionOperation(ctx, item, confirmed.ID)
+	}
+
+	reason := "YouTube promotion outcome could not be confirmed"
+	if submitErr != nil {
+		reason += ": schedule request returned " + submitErr.Error()
+	}
+	if statusErr != nil {
+		reason += "; status unavailable: " + statusErr.Error()
+	} else {
+		reason += fmt.Sprintf(
+			"; observed privacy %q contradicts target %q",
+			observedPrivacy(status.Privacy),
+			operation.TargetPrivacy,
+		)
+	}
+	reason = boundedPromotionReason(reason)
+	uncertain, err := h.Store.MarkPromotionOperationUncertain(ctx, operation.ID, status, reason)
+	if err != nil {
 		return err
 	}
-	return h.Store.PromotePublication(ctx, publication.ID, targetVisibility, scheduledAt, decision, item.ID, metricsPollDelay(h.Config))
+	if uncertain.Status == PromotionConfirmed || uncertain.Status == PromotionFinalized {
+		return h.finalizePromotionOperation(ctx, item, uncertain.ID)
+	}
+	if err := h.holdUncertainPromotionOperation(ctx, item, uncertain, reason); err != nil {
+		return errors.Join(fmt.Errorf("%w: %s", ErrPromotionOutcomeUncertain, reason), err)
+	}
+	return fmt.Errorf("%w: %s", ErrPromotionOutcomeUncertain, reason)
+}
+
+func (h HandlerService) finalizePromotionOperation(
+	ctx context.Context,
+	item QueueItemRow,
+	operationID string,
+) error {
+	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
+		publicationID := firstString(item.PayloadJSON, "publication_id")
+		publication, task, err := fencedStore.LockPromotionOperatorScope(ctx, publicationID)
+		if err != nil {
+			return err
+		}
+		operation, err := fencedStore.LockPromotionOperation(ctx, operationID)
+		if err != nil {
+			return err
+		}
+		if operation.Status == PromotionFinalized {
+			return nil
+		}
+		if operation.Status != PromotionConfirmed ||
+			operation.PublicationID != publication.ID ||
+			operation.ProductionTaskID != task.ID ||
+			operation.PlatformVideoID != publication.PlatformContentID ||
+			safePromotionVisibility(operation.TargetPrivacy) != operation.TargetPrivacy ||
+			operation.ObservedPrivacy == nil ||
+			observedPrivacy(*operation.ObservedPrivacy) != operation.TargetPrivacy {
+			return fmt.Errorf("%w: finalization authority changed", ErrPromotionOperationConflict)
+		}
+		if publication.PublishStatus == "rejected" || task.State == TaskRejected {
+			return nil
+		}
+		if task.State != TaskUploadedPrivate && !taskHeldForPromotionUncertainty(task, &operation) {
+			return nil
+		}
+		if task.AutoFlowPlanID != nil {
+			valid, err := fencedStore.ValidPromotionPlanAuthority(ctx, task)
+			if err != nil {
+				return err
+			}
+			if !valid {
+				return fencedStore.HoldTask(
+					ctx,
+					task.ID,
+					"autoflow_plan_authority_invalid",
+					"Publication promotion plan authority is missing, stale, or revoked",
+					"promote_publication_plan_authority",
+				)
+			}
+		}
+		if held, err := h.withStore(fencedStore).holdInvalidPreUploadReview(
+			ctx,
+			task,
+			"promote_publication_human_review",
+		); held {
+			return err
+		}
+		if taskUsesExternalAssets(task) || boolValue(item.PayloadJSON["manual_review"]) {
+			valid, err := fencedStore.ValidPromotionHumanReview(
+				ctx,
+				task,
+				publication,
+				operation.TargetPrivacy,
+			)
+			if err != nil {
+				return err
+			}
+			if !valid {
+				return fencedStore.HoldTask(
+					ctx,
+					task.ID,
+					"human_review_evidence_invalid",
+					"Publication promotion human review evidence is missing or stale",
+					"promote_publication_human_review",
+				)
+			}
+		}
+		return fencedStore.FinalizePromotionOperation(
+			ctx,
+			operation.ID,
+			metricsPollDelay(h.Config),
+		)
+	})
+}
+
+func (h HandlerService) holdUncertainPromotionOperation(
+	ctx context.Context,
+	item QueueItemRow,
+	operation PromotionOperationRow,
+	reason string,
+) error {
+	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
+		publication, task, err := fencedStore.LockPromotionOperatorScope(
+			ctx,
+			operation.PublicationID,
+		)
+		if err != nil {
+			return err
+		}
+		locked, err := fencedStore.LockPromotionOperation(ctx, operation.ID)
+		if err != nil {
+			return err
+		}
+		if locked.Status == PromotionConfirmed || locked.Status == PromotionFinalized {
+			return nil
+		}
+		if locked.PublicationID != publication.ID || locked.ProductionTaskID != task.ID {
+			return fmt.Errorf("%w: uncertain operation authority changed", ErrPromotionOperationConflict)
+		}
+		if task.State != TaskUploadedPrivate && !taskHeldForPromotionUncertainty(task, &locked) {
+			return nil
+		}
+		return fencedStore.HoldPromotionOperationUncertain(ctx, publication, locked, reason)
+	})
+}
+
+func (h HandlerService) withStore(store *Store) HandlerService {
+	clone := h
+	clone.Store = store
+	return clone
+}
+
+func taskHeldForPromotionUncertainty(
+	task ProductionTaskRow,
+	operation *PromotionOperationRow,
+) bool {
+	return operation != nil &&
+		task.State == TaskHeld &&
+		task.BlockedByGuard != nil &&
+		*task.BlockedByGuard == "promotion_outcome_uncertain"
+}
+
+func boundedPromotionReason(reason string) string {
+	const maxLength = 1_000
+	if len(reason) <= maxLength {
+		return reason
+	}
+	return reason[:maxLength]
 }
 
 func (h HandlerService) HandleReconcilePublication(ctx context.Context, item QueueItemRow) error {

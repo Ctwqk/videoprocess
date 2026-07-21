@@ -765,6 +765,8 @@ class AutoFlowService:
                 request_fingerprint=request_fingerprint,
                 task_id=binding[0],
                 queue_item_id=binding[1],
+                queue_locked_by=binding[2],
+                queue_locked_at=binding[3],
             )
         existing = (
             await db.execute(
@@ -927,6 +929,8 @@ class AutoFlowService:
         request_fingerprint: str,
         task_id: uuid.UUID,
         queue_item_id: uuid.UUID,
+        queue_locked_by: str,
+        queue_locked_at: datetime,
     ) -> AutoFlowRun:
         if not request.execute:
             raise ValueError("ChannelOps-bound AutoFlow execution requires execute=true")
@@ -984,6 +988,8 @@ class AutoFlowService:
                 plan_id=plan_id,
                 expected_revision_hash=expected_revision_hash,
                 expected_revision=expected_revision,
+                expected_locked_by=queue_locked_by,
+                expected_locked_at=queue_locked_at,
             )
 
             plan = await self._get_plan_for_update(plan_id, db)
@@ -1026,6 +1032,7 @@ class AutoFlowService:
                     JobStatus.WAITING_WINDOW,
                     JobStatus.VALIDATING,
                     JobStatus.PLANNING,
+                    JobStatus.RUNNING,
                 }
                 await db.commit()
                 if should_start:
@@ -1394,17 +1401,34 @@ def _expected_execute_authority(request: AutoFlowExecuteRequest) -> tuple[str | 
 
 def _channelops_execute_binding(
     request: AutoFlowExecuteRequest,
-) -> tuple[uuid.UUID, uuid.UUID] | None:
+) -> tuple[uuid.UUID, uuid.UUID, str, datetime] | None:
     task_id = request.production_task_id
     queue_item_id = request.channelops_queue_item_id
-    if task_id is None and queue_item_id is None:
+    queue_locked_by = request.channelops_queue_locked_by
+    queue_locked_at = request.channelops_queue_locked_at
+    binding_values = (task_id, queue_item_id, queue_locked_by, queue_locked_at)
+    if all(value is None for value in binding_values):
         return None
-    if task_id is None or queue_item_id is None:
+    if any(value is None for value in binding_values):
         raise ValueError(
-            "ChannelOps production_task_id and channelops_queue_item_id must be provided together"
+            "ChannelOps production task, queue item, and queue lease authority must be provided together"
         )
+    assert task_id is not None
+    assert queue_item_id is not None
+    assert queue_locked_by is not None
+    assert queue_locked_at is not None
+    queue_locked_by = queue_locked_by.strip()
+    if not queue_locked_by:
+        raise ValueError("ChannelOps queue lease owner must not be blank")
+    if queue_locked_at.tzinfo is None or queue_locked_at.utcoffset() is None:
+        raise ValueError("ChannelOps queue lease timestamp must include a timezone")
     try:
-        return uuid.UUID(task_id), uuid.UUID(queue_item_id)
+        return (
+            uuid.UUID(task_id),
+            uuid.UUID(queue_item_id),
+            queue_locked_by,
+            queue_locked_at.astimezone(timezone.utc),
+        )
     except ValueError as exc:
         raise ValueError("ChannelOps execution authority ids must be valid UUIDs") from exc
 
@@ -1417,13 +1441,29 @@ def _assert_channelops_execute_queue_authority(
     plan_id: str,
     expected_revision_hash: str,
     expected_revision: int,
+    expected_locked_by: str,
+    expected_locked_at: datetime,
 ) -> None:
     if queue_item is None:
         raise PermissionError("ChannelOps execute queue item was not found")
     if queue_item.kind != "execute_task":
         raise PermissionError("ChannelOps queue item is not an execute request")
-    if queue_item.status != "running":
+    if (
+        queue_item.status != "running"
+        or not (queue_item.locked_by or "").strip()
+        or queue_item.locked_at is None
+        or queue_item.attempt_count < 1
+        or queue_item.dead_letter_at is not None
+    ):
         raise PermissionError("ChannelOps execute queue item is not claimed")
+    assert queue_item.locked_at is not None
+    stored_locked_at = queue_item.locked_at
+    if stored_locked_at.tzinfo is None or stored_locked_at.utcoffset() is None:
+        stored_locked_at = stored_locked_at.replace(tzinfo=timezone.utc)
+    else:
+        stored_locked_at = stored_locked_at.astimezone(timezone.utc)
+    if queue_item.locked_by != expected_locked_by or stored_locked_at != expected_locked_at:
+        raise PermissionError("ChannelOps execute queue lease authority changed")
     if queue_item.channel_profile_id != channel_id:
         raise PermissionError("ChannelOps execute queue channel authority changed")
     if task.state not in {"planning", "producing"}:
@@ -1438,10 +1478,10 @@ def _assert_channelops_execute_queue_authority(
         raise PermissionError("ChannelOps execute queue plan authority changed")
     if str(payload.get("expected_approved_revision_hash") or "") != expected_revision_hash:
         raise PermissionError("ChannelOps execute queue revision authority changed")
-    try:
-        queue_revision = int(payload.get("expected_approved_revision"))
-    except (TypeError, ValueError) as exc:
-        raise PermissionError("ChannelOps execute queue revision authority is invalid") from exc
+    queue_revision = _parse_channelops_revision(
+        payload.get("expected_approved_revision"),
+        error_message="ChannelOps execute queue revision authority is invalid",
+    )
     if queue_revision != expected_revision:
         raise PermissionError("ChannelOps execute queue revision authority changed")
 
@@ -1453,12 +1493,24 @@ def _assert_channelops_execute_queue_authority(
         or str(snapshot.get("expected_approved_revision_hash") or "") != expected_revision_hash
     ):
         raise PermissionError("ChannelOps production task revision authority changed")
-    try:
-        task_revision = int(snapshot.get("expected_approved_revision"))
-    except (TypeError, ValueError) as exc:
-        raise PermissionError("ChannelOps production task revision authority is invalid") from exc
+    task_revision = _parse_channelops_revision(
+        snapshot.get("expected_approved_revision"),
+        error_message="ChannelOps production task revision authority is invalid",
+    )
     if task_revision != expected_revision:
         raise PermissionError("ChannelOps production task revision authority changed")
+
+
+def _parse_channelops_revision(value: object, *, error_message: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise PermissionError(error_message)
+    try:
+        revision = int(value)
+    except ValueError as exc:
+        raise PermissionError(error_message) from exc
+    if revision < 1:
+        raise PermissionError(error_message)
+    return revision
 
 
 def _bind_channelops_execution(
@@ -1519,7 +1571,12 @@ def _assert_expected_execute_authority(
 
 
 def execute_request_fingerprint(request: AutoFlowExecuteRequest, plan_id: str) -> str:
-    excluded_fields = {"idempotency_key", "plan"}
+    excluded_fields = {
+        "idempotency_key",
+        "plan",
+        "channelops_queue_locked_by",
+        "channelops_queue_locked_at",
+    }
     if request.expected_approved_revision_hash is None:
         excluded_fields.add("expected_approved_revision_hash")
     if request.expected_approved_revision is None:

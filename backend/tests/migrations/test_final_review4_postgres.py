@@ -54,7 +54,10 @@ async def test_postgres_16_revision_trigger_rejects_025_writers_and_downgrades_c
         conn = await asyncpg.connect(_asyncpg_url(target_url))
         try:
             assert await conn.fetchval("SHOW server_version_num") >= "160000"
-            assert await conn.fetchval("SELECT version_num FROM alembic_version") == "026_autoflow_authority_fence"
+            assert (
+                await conn.fetchval("SELECT version_num FROM alembic_version")
+                == "027_publication_promotion_operations"
+            )
             columns = {
                 row["column_name"]: row["is_nullable"]
                 for row in await conn.fetch(

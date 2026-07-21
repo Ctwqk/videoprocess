@@ -513,12 +513,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionFails(t *testing.T) {
 	}
 	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{Status: "failed", ErrorMessage: "execute blocked"}}
 
-	err := handler.HandleExecuteTask(ctx, QueueItemRow{
-		ID:               "00000000-0000-0000-0000-000000000401",
-		Kind:             QueueExecuteTask,
-		ChannelProfileID: &task.ChannelProfileID,
-		PayloadJSON:      testExecuteQueuePayload(task.ID),
-	})
+	err := handler.HandleExecuteTask(ctx, testClaimedExecuteQueueItem(task, testExecuteQueuePayload(task.ID)))
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
 	}
@@ -576,11 +571,7 @@ func TestHandleExecuteTaskRejectsMissingOrMismatchedDurableAuthorityBeforeAutoFl
 			recorder := &externalCallRecorder{}
 			handler.AutoFlow = &recordingAutoFlow{recorder: recorder}
 
-			err := handler.HandleExecuteTask(ctx, QueueItemRow{
-				ID:          "00000000-0000-0000-0000-000000000401",
-				Kind:        QueueExecuteTask,
-				PayloadJSON: payload,
-			})
+			err := handler.HandleExecuteTask(ctx, testClaimedExecuteQueueItem(task, payload))
 
 			if !errors.Is(err, ErrQueueAuthorityInvalid) {
 				t.Fatalf("HandleExecuteTask error = %v, want invalid queue authority", err)
@@ -611,12 +602,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingRunID(t *testing.
 		JobID:  "00000000-0000-0000-0000-000000000301",
 	}}
 
-	err := handler.HandleExecuteTask(ctx, QueueItemRow{
-		ID:               "00000000-0000-0000-0000-000000000401",
-		Kind:             QueueExecuteTask,
-		ChannelProfileID: &task.ChannelProfileID,
-		PayloadJSON:      testExecuteQueuePayload(task.ID),
-	})
+	err := handler.HandleExecuteTask(ctx, testClaimedExecuteQueueItem(task, testExecuteQueuePayload(task.ID)))
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
 	}
@@ -642,12 +628,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingJobID(t *testing.
 		RunID:  "00000000-0000-0000-0000-000000000201",
 	}}
 
-	err := handler.HandleExecuteTask(ctx, QueueItemRow{
-		ID:               "00000000-0000-0000-0000-000000000401",
-		Kind:             QueueExecuteTask,
-		ChannelProfileID: &task.ChannelProfileID,
-		PayloadJSON:      testExecuteQueuePayload(task.ID),
-	})
+	err := handler.HandleExecuteTask(ctx, testClaimedExecuteQueueItem(task, testExecuteQueuePayload(task.ID)))
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
 	}
@@ -716,6 +697,21 @@ func testExecuteQueuePayload(taskID string) map[string]any {
 		"autoflow_plan_id":                approval.PlanID,
 		"expected_approved_revision_hash": approval.ApprovedRevisionHash,
 		"expected_approved_revision":      approval.ApprovedRevision,
+	}
+}
+
+func testClaimedExecuteQueueItem(task ProductionTaskRow, payload map[string]any) QueueItemRow {
+	lockedBy := "test-execute-worker"
+	lockedAt := mustTime("2026-07-21T20:15:16Z")
+	return QueueItemRow{
+		ID:               "00000000-0000-0000-0000-000000000401",
+		Kind:             QueueExecuteTask,
+		Status:           QueueStatusRunning,
+		AttemptCount:     1,
+		LockedBy:         &lockedBy,
+		LockedAt:         &lockedAt,
+		ChannelProfileID: &task.ChannelProfileID,
+		PayloadJSON:      payload,
 	}
 }
 

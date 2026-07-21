@@ -114,6 +114,14 @@ class JobEngine:
                 return
 
             try:
+                for node in job.node_executions:
+                    if (
+                        node.status == NodeStatus.QUEUED
+                        and node.worker_id is None
+                        and node.started_at is None
+                    ):
+                        node.status = NodeStatus.PENDING
+                        node.queued_at = None
                 job.status = JobStatus.PLANNING
                 job.started_at = datetime.utcnow()
 
@@ -567,6 +575,7 @@ class JobEngine:
                     db,
                     job_id,
                     node_execution_id=node_execution_id,
+                    lock_all_nodes=True,
                 )
                 require_active_execution_authority(
                     authority,
@@ -601,6 +610,7 @@ class JobEngine:
                     db,
                     job_id,
                     node_execution_id=node_execution_id,
+                    lock_all_nodes=True,
                 )
                 require_active_execution_authority(
                     authority,
@@ -689,15 +699,14 @@ class JobEngine:
             ne.status = NodeStatus.FAILED
             ne.error_message = error
             ne.completed_at = datetime.utcnow()
-            await db.commit()
 
             # Skip downstream nodes
             dep_map = job.execution_plan.get("dependencies", {}) if job.execution_plan else {}
             await self._skip_downstream(db, job, ne.node_id, dep_map)
 
             job.error_message = f"Node '{ne.node_label}' failed: {error}"
-            await db.commit()
-            await self._maybe_finalize_job(db, job)
+            if not await self._maybe_finalize_job(db, job):
+                await db.commit()
 
     async def _skip_downstream(
         self, db: AsyncSession, job: Job, failed_node_id: str, dep_map: dict
@@ -725,8 +734,6 @@ class JobEngine:
             if ne and ne.status == NodeStatus.PENDING:
                 ne.status = NodeStatus.SKIPPED
                 ne.completed_at = datetime.utcnow()
-
-        await db.commit()
 
     async def _mark_final_artifacts(self, db: AsyncSession, job: Job) -> None:
         """Mark output artifacts of terminal nodes as FINAL."""

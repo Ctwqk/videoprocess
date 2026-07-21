@@ -122,7 +122,24 @@ async def lock_job_execution_authority(
         raise JobExecutionAuthorityBlocked("job was not found")
 
     node = None
-    if node_execution_id is not None:
+    if lock_all_nodes:
+        nodes = list(
+            (
+                await db.execute(
+                    select(NodeExecution)
+                    .where(NodeExecution.job_id == job.id)
+                    .order_by(NodeExecution.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars().all()
+        )
+        if node_execution_id is not None:
+            node = next((item for item in nodes if item.id == node_execution_id), None)
+            if node is None:
+                raise JobExecutionAuthorityBlocked("node execution authority changed while locking")
+        await db.refresh(job, attribute_names=["node_executions"])
+    elif node_execution_id is not None:
         node = (
             await db.execute(
                 select(NodeExecution)
@@ -133,17 +150,6 @@ async def lock_job_execution_authority(
         ).scalar_one_or_none()
         if node is None or node.job_id != job.id:
             raise JobExecutionAuthorityBlocked("node execution authority changed while locking")
-    elif lock_all_nodes:
-        (
-            await db.execute(
-                select(NodeExecution)
-                .where(NodeExecution.job_id == job.id)
-                .order_by(NodeExecution.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalars().all()
-        await db.refresh(job, attribute_names=["node_executions"])
 
     return LockedJobExecutionAuthority(
         channel=channel,

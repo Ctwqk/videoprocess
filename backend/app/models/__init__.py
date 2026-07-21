@@ -13,6 +13,7 @@ from app.models.material import (
 from app.models.schedule import RuntimeSchedule
 from app.models.autoflow import AutoFlowPlan, AutoFlowRun, AutoFlowUsedClip, ContentMetric, TrendSignal
 from app.models.youtube_upload_operation import YouTubeUploadOperation
+from app.models.publication_promotion_operation import PublicationPromotionOperation
 from app.models.channel_agent import (
     AgentTickAudit,
     ChannelOpsQueueItem,
@@ -52,6 +53,7 @@ __all__ = [
     "ContentMetric",
     "TrendSignal",
     "YouTubeUploadOperation",
+    "PublicationPromotionOperation",
     "ChannelProfile",
     "TopicLane",
     "PublishingAccount",

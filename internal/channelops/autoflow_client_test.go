@@ -95,6 +95,8 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 	planID := "plan-from-task"
 	approvedRevisionHash := strings.Repeat("b", 64)
 	approvedRevision := int64(7)
+	queueLockedAt := "2026-07-21T20:15:16.123456Z"
+	queueLockedBy := "channelops-go-runner"
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -130,6 +132,12 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 		if payload["channelops_queue_item_id"] != "queue-1" {
 			t.Fatalf("channelops_queue_item_id = %#v", payload["channelops_queue_item_id"])
 		}
+		if payload["channelops_queue_locked_by"] != queueLockedBy {
+			t.Fatalf("channelops_queue_locked_by = %#v", payload["channelops_queue_locked_by"])
+		}
+		if payload["channelops_queue_locked_at"] != queueLockedAt {
+			t.Fatalf("channelops_queue_locked_at = %#v", payload["channelops_queue_locked_at"])
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"run_id":"run-1","job_id":"job-1","status":"pending"}`))
 	}))
@@ -143,8 +151,10 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 		AutoFlowApprovedRevision:     &approvedRevision,
 	}
 	request := map[string]any{
-		"production_task_id":       "task-1",
-		"channelops_queue_item_id": "queue-1",
+		"production_task_id":         "task-1",
+		"channelops_queue_item_id":   "queue-1",
+		"channelops_queue_locked_by": queueLockedBy,
+		"channelops_queue_locked_at": queueLockedAt,
 	}
 	observation, err := client.ExecuteTask(context.Background(), task, request)
 	if err != nil {

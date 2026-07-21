@@ -14,7 +14,7 @@ import (
 
 type YouTubeClient interface {
 	AccountHealth(ctx context.Context, accountID string) (YouTubeAccountHealth, error)
-	SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string) error
+	SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string, idempotencyKey string) error
 	PublicationStatus(ctx context.Context, videoID string) (YouTubePublicationStatus, error)
 	FetchMetrics(ctx context.Context, videoID string) (map[string]any, error)
 }
@@ -52,15 +52,26 @@ func (c YouTubeManagerClient) AccountHealth(ctx context.Context, accountID strin
 	}, nil
 }
 
-func (c YouTubeManagerClient) SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string) error {
+func (c YouTubeManagerClient) SchedulePublish(ctx context.Context, videoID string, scheduledAt time.Time, privacy string, idempotencyKey string) error {
 	if strings.TrimSpace(videoID) == "" {
 		return fmt.Errorf("video_id is required")
+	}
+	if safePromotionVisibility(privacy) == "" {
+		return fmt.Errorf("promotion privacy must be private or unlisted")
+	}
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return fmt.Errorf("promotion idempotency key is required")
 	}
 	payload := map[string]any{
 		"scheduled_at": scheduledAt.UTC().Format(time.RFC3339),
 		"privacy":      privacy,
 	}
-	_, err := c.postJSON(ctx, "/api/videos/"+url.PathEscape(videoID)+"/schedule", payload)
+	_, err := c.postJSONWithIdempotency(
+		ctx,
+		"/api/videos/"+url.PathEscape(videoID)+"/schedule",
+		payload,
+		idempotencyKey,
+	)
 	return err
 }
 
@@ -96,18 +107,22 @@ func (c YouTubeManagerClient) FetchMetrics(ctx context.Context, videoID string) 
 }
 
 func (c YouTubeManagerClient) getJSON(ctx context.Context, path string) (map[string]any, error) {
-	return c.doJSON(ctx, http.MethodGet, path, nil)
+	return c.doJSON(ctx, http.MethodGet, path, nil, "")
 }
 
 func (c YouTubeManagerClient) postJSON(ctx context.Context, path string, payload map[string]any) (map[string]any, error) {
+	return c.postJSONWithIdempotency(ctx, path, payload, "")
+}
+
+func (c YouTubeManagerClient) postJSONWithIdempotency(ctx context.Context, path string, payload map[string]any, idempotencyKey string) (map[string]any, error) {
 	raw, err := json.Marshal(jsonObject(payload))
 	if err != nil {
 		return nil, err
 	}
-	return c.doJSON(ctx, http.MethodPost, path, bytes.NewReader(raw))
+	return c.doJSON(ctx, http.MethodPost, path, bytes.NewReader(raw), idempotencyKey)
 }
 
-func (c YouTubeManagerClient) doJSON(ctx context.Context, method string, path string, body *bytes.Reader) (map[string]any, error) {
+func (c YouTubeManagerClient) doJSON(ctx context.Context, method string, path string, body *bytes.Reader, idempotencyKey string) (map[string]any, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
 	if baseURL == "" {
 		return nil, fmt.Errorf("YOUTUBE_MANAGER_URL is required for live ChannelOps runner mode")
@@ -122,6 +137,9 @@ func (c YouTubeManagerClient) doJSON(ctx context.Context, method string, path st
 	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
+	}
+	if strings.TrimSpace(idempotencyKey) != "" {
+		request.Header.Set("Idempotency-Key", idempotencyKey)
 	}
 	client := c.HTTPClient
 	if client == nil {
