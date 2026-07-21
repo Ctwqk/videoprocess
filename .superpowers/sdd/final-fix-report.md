@@ -991,3 +991,79 @@ eligibility stubs are used.
   is clean.
 - Per the binding brief, deployed-image smoke was not run and no deployment or
   external interaction occurred.
+
+## Final Review 7 Test Cleanup Fix Wave
+
+### Status And Scope
+
+`DONE_WITH_CONCERNS`. Work started from clean
+`a09e1f707e0bfaf4710dd0888e61cc54f1099d21` on
+`codex/channelops-soak-guard`. The focused implementation/test commit is
+`f8a8971942a7c6ab5d1f6a28f96ade2b5bb4a72b` (`test: bound channelops race cleanup`).
+The report-only commit is recorded in the final task response.
+
+No production, deployment, push, SSH, host 126 access, activation, upload,
+publication, external PDS/YouTube call, or edit to the user-owned root plan
+occurred.
+
+### TDD Evidence And Fix
+
+- RED, before the helper existed:
+  `go test ./internal/channelops -run '^TestCancellableTestOperationCancelsAndDrains$' -count=1`
+  failed to build with `undefined: startCancellableTestOperation`.
+- GREEN after the smallest helper implementation: the same command passed in
+  `0.421s`. The focused test starts a deliberately blocked operation, cancels
+  it, proves the operation observed `context.Canceled`, drains its completion,
+  and verifies completion within a 100ms test-controlled bound.
+- The three reviewed races now launch handler/database work through cancellable
+  test-operation contexts. Cleanup registration precedes every failure-capable
+  lock/wait helper; it releases the artificial YouTube gate, cancels unfinished
+  work, and drains each completion channel with a second five-second bound.
+  Fixture cleanup, transaction rollback, and channel-authority restoration use
+  fresh bounded cleanup contexts. The acquired invalidation connection is
+  released only after both relevant operations drain. An undrained operation
+  records a test error and prevents potentially unbounded fixture cleanup.
+- `test_quarantine_between_initial_roots_does_not_revive_second_root` now wraps
+  the real quarantine transaction in `asyncio.wait_for(..., timeout=5)` while
+  retaining its `finally` release and bounded starter await. No orchestrator
+  runtime behavior changed.
+
+### Verification
+
+- PostgreSQL 16 was migrated from empty to
+  `026_autoflow_authority_fence (head)` in disposable container
+  `vp-final-review-7-postgres` (ID
+  `0d70b488d90f7debeff41ff3b157894732bfa1013b2af09568904cea3b39ba90`) on
+  `127.0.0.1:55438`.
+- Focused helper plus three reviewed PostgreSQL Go tests passed in `0.669s`.
+  Full `DATABASE_URL=... go test ./internal/channelops -count=1` passed in
+  `4.957s`; full `DATABASE_URL=... go test ./... -count=1` passed.
+- The two-root Python PostgreSQL regression passed 10 consecutive runs; the
+  full operator-quarantine file passed `6 passed, 3 warnings in 1.23s`.
+  The Final Review 5/6 PostgreSQL acceptance set passed
+  `59 passed, 3 warnings in 7.68s`.
+- Full backend with the project virtualenv passed
+  `641 passed, 27 skipped, 11 warnings in 65.28s`. Changed-file Ruff passed.
+  Full Ruff and mypy remain their pre-existing baselines of 17 findings and 66
+  errors in 24 files. The system `python3` is Python 3.14 without pytest,
+  Ruff, or mypy installed; the required checks therefore used the repository
+  `backend/.venv` after recording those missing-module results.
+- `bash tests/test_channelops_soak_watch.sh`,
+  `bash tests/test_vp_deploy_sync_extension.sh`, and required Bash syntax
+  checks passed. `gofmt -l internal/channelops/integration_test.go` and
+  `git diff --check` were clean before the implementation commit.
+- The disposable PostgreSQL container was force removed and an exact-name
+  `docker ps -a` check confirmed it is absent.
+
+### Changed Paths
+
+- `internal/channelops/integration_test.go`
+- `backend/tests/channel_agent/test_operator_quarantine_postgres.py`
+
+### Concerns
+
+- Full Ruff and mypy retain only the documented pre-existing 17/66 baselines.
+- The system interpreter lacks the project test/lint/type-check tools; the
+  checked-in backend virtualenv supplied the authoritative full backend and
+  static-check runs. Deployed-image smoke remains intentionally unrun before a
+  natural deployment.
