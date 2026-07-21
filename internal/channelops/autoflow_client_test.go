@@ -124,6 +124,12 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 		if payload["expected_approved_revision"] != float64(approvedRevision) {
 			t.Fatalf("expected_approved_revision = %#v", payload["expected_approved_revision"])
 		}
+		if payload["production_task_id"] != "task-1" {
+			t.Fatalf("production_task_id = %#v", payload["production_task_id"])
+		}
+		if payload["channelops_queue_item_id"] != "queue-1" {
+			t.Fatalf("channelops_queue_item_id = %#v", payload["channelops_queue_item_id"])
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"run_id":"run-1","job_id":"job-1","status":"pending"}`))
 	}))
@@ -136,7 +142,11 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 		AutoFlowApprovedRevisionHash: &approvedRevisionHash,
 		AutoFlowApprovedRevision:     &approvedRevision,
 	}
-	observation, err := client.ExecuteTask(context.Background(), task, nil)
+	request := map[string]any{
+		"production_task_id":       "task-1",
+		"channelops_queue_item_id": "queue-1",
+	}
+	observation, err := client.ExecuteTask(context.Background(), task, request)
 	if err != nil {
 		t.Fatalf("ExecuteTask returned error: %v", err)
 	}
@@ -146,7 +156,7 @@ func TestHTTPAutoFlowExecuteTaskUsesTaskPlanID(t *testing.T) {
 	if observation.RunPayload["run_id"] != "run-1" {
 		t.Fatalf("RunPayload = %#v", observation.RunPayload)
 	}
-	replay, err := client.ExecuteTask(context.Background(), task, nil)
+	replay, err := client.ExecuteTask(context.Background(), task, request)
 	if err != nil {
 		t.Fatalf("ExecuteTask replay returned error: %v", err)
 	}

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
@@ -14,6 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.autoflow.clip_ranker import ClipRanker
 from app.autoflow.service import AutoFlowService, execute_request_fingerprint
 from app.models.autoflow import AutoFlowPlan, AutoFlowRun
+from app.models.channel_agent import ChannelOpsQueueItem, ChannelProfile, ProductionTask
 from app.models.job import Job, JobStatus
 from app.models.pipeline import Pipeline
 from app.models.schedule import RuntimeSchedule
@@ -59,7 +61,8 @@ async def postgres_idempotency_db(monkeypatch):
         await conn.execute(
             text(
                 "TRUNCATE TABLE autoflow_used_clips, autoflow_runs, node_executions, jobs, "
-                "pipelines, runtime_schedules, autoflow_plans CASCADE"
+                "pipelines, runtime_schedules, channel_ops_queue_items, production_tasks, "
+                "channel_profiles, autoflow_plans CASCADE"
             )
         )
 
@@ -76,7 +79,8 @@ async def postgres_idempotency_db(monkeypatch):
             await conn.execute(
                 text(
                     "TRUNCATE TABLE autoflow_used_clips, autoflow_runs, node_executions, jobs, "
-                    "pipelines, runtime_schedules, autoflow_plans CASCADE"
+                    "pipelines, runtime_schedules, channel_ops_queue_items, production_tasks, "
+                    "channel_profiles, autoflow_plans CASCADE"
                 )
             )
         await engine.dispose()
@@ -106,6 +110,210 @@ async def _counts(factory) -> tuple[int, int, int]:
             int((await db.scalar(select(func.count()).select_from(Pipeline))) or 0),
             int((await db.scalar(select(func.count()).select_from(Job))) or 0),
         )
+
+
+async def _bound_execute_request(
+    factory,
+    plan,
+    *,
+    halted: bool = False,
+    queue_status: str = "running",
+) -> tuple[uuid.UUID, uuid.UUID, AutoFlowExecuteRequest]:
+    async with factory() as db:
+        channel = ChannelProfile(
+            name="bound execute channel",
+            enabled=True,
+            dry_run=False,
+            halted_at=datetime.now(timezone.utc) if halted else None,
+            halt_reason="test quarantine" if halted else None,
+        )
+        db.add(channel)
+        await db.flush()
+        task = ProductionTask(
+            channel_profile_id=channel.id,
+            target_account_id=uuid.uuid4(),
+            prompt="bound execute task",
+            rationale_json={
+                "autoflow_plan_payload": {
+                    "plan_id": plan.plan_id,
+                    "expected_approved_revision_hash": plan.approved_revision_hash,
+                    "expected_approved_revision": plan.approved_revision,
+                }
+            },
+            autoflow_plan_id=uuid.UUID(plan.plan_id),
+            state="planning",
+            channel_config_snapshot_json={},
+        )
+        db.add(task)
+        await db.flush()
+        queue = ChannelOpsQueueItem(
+            kind="execute_task",
+            idempotency_key=f"execute_task:{task.id}",
+            channel_profile_id=channel.id,
+            payload_json={
+                "production_task_id": str(task.id),
+                "autoflow_plan_id": plan.plan_id,
+                "expected_approved_revision_hash": plan.approved_revision_hash,
+                "expected_approved_revision": plan.approved_revision,
+            },
+            status=queue_status,
+        )
+        db.add(queue)
+        await db.commit()
+
+    request = AutoFlowExecuteRequest(
+        plan_id=plan.plan_id,
+        idempotency_key=(
+            f"channelops-execute:{task.id}:{plan.plan_id}:"
+            f"{plan.approved_revision}:{plan.approved_revision_hash}"
+        ),
+        expected_approved_revision_hash=plan.approved_revision_hash,
+        expected_approved_revision=plan.approved_revision,
+        production_task_id=str(task.id),
+        channelops_queue_item_id=str(queue.id),
+    )
+    return task.id, queue.id, request
+
+
+async def test_bound_execute_links_task_before_start_handoff(
+    postgres_idempotency_db,
+    monkeypatch,
+):
+    _engine, factory, _starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Bound execution is linked before start")
+    task_id, _queue_id, request = await _bound_execute_request(factory, plan)
+    observed_links: list[tuple[str, str, str, str]] = []
+
+    async def assert_linked_before_start(job_ids):
+        async with factory() as db:
+            task = await db.get(ProductionTask, task_id)
+            assert task is not None
+            observed_links.append(
+                (
+                    str(task.autoflow_run_id),
+                    str(task.pipeline_id),
+                    str(task.job_id),
+                    task.state,
+                )
+            )
+            assert [str(task.job_id)] == [str(job_id) for job_id in job_ids]
+
+    monkeypatch.setattr(
+        "app.autoflow.service.start_jobs_background",
+        assert_linked_before_start,
+    )
+    async with factory() as db:
+        run = await service.execute(request, db)
+
+    assert observed_links == [(run.run_id, run.pipeline_id, run.job_id, "producing")]
+    assert await _counts(factory) == (1, 1, 1)
+
+
+async def test_bound_execute_replay_recovers_lost_start_handoff_without_duplicate_rows(
+    postgres_idempotency_db,
+    monkeypatch,
+):
+    _engine, factory, _starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Bound execution start handoff recovery")
+    task_id, _queue_id, request = await _bound_execute_request(factory, plan)
+    start_attempts: list[list[str]] = []
+
+    async def fail_first_start(job_ids):
+        start_attempts.append([str(job_id) for job_id in job_ids])
+        if len(start_attempts) == 1:
+            raise RuntimeError("lost start handoff")
+
+    monkeypatch.setattr("app.autoflow.service.start_jobs_background", fail_first_start)
+    async with factory() as first_db:
+        with pytest.raises(RuntimeError, match="lost start handoff"):
+            await service.execute(request, first_db)
+    async with factory() as replay_db:
+        replay = await service.execute(request, replay_db)
+
+    assert start_attempts == [[replay.job_id], [replay.job_id]]
+    assert await _counts(factory) == (1, 1, 1)
+    async with factory() as db:
+        task = await db.get(ProductionTask, task_id)
+        assert task is not None
+        assert str(task.autoflow_run_id) == replay.run_id
+        assert str(task.pipeline_id) == replay.pipeline_id
+        assert str(task.job_id) == replay.job_id
+        assert task.state == "producing"
+
+
+@pytest.mark.parametrize(
+    ("halted", "queue_status", "error"),
+    [
+        (True, "running", "channel execution blocked"),
+        (False, "dead_letter", "execute queue item is not claimed"),
+    ],
+)
+async def test_bound_execute_rejects_revoked_queue_or_channel_authority_without_rows(
+    postgres_idempotency_db,
+    halted,
+    queue_status,
+    error,
+):
+    _engine, factory, starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Bound execution revoked authority")
+    _task_id, _queue_id, request = await _bound_execute_request(
+        factory,
+        plan,
+        halted=halted,
+        queue_status=queue_status,
+    )
+
+    async with factory() as db:
+        with pytest.raises(PermissionError, match=error):
+            await service.execute(request, db)
+
+    assert await _counts(factory) == (0, 0, 0)
+    assert starts == []
+
+
+async def test_bound_execute_quarantine_first_commits_before_any_execution_rows(
+    postgres_idempotency_db,
+):
+    engine, factory, starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Bound execution quarantine-first race")
+    task_id, _queue_id, request = await _bound_execute_request(factory, plan)
+
+    blocker = factory()
+    execution = None
+    try:
+        task = await blocker.get(ProductionTask, task_id)
+        assert task is not None
+        channel = (
+            await blocker.execute(
+                select(ChannelProfile)
+                .where(ChannelProfile.id == task.channel_profile_id)
+                .with_for_update()
+            )
+        ).scalar_one()
+        channel.halted_at = datetime.now(timezone.utc)
+        channel.halt_reason = "quarantine wins bound execution"
+        await blocker.flush()
+
+        async def execute_after_quarantine_lock():
+            async with factory() as execute_db:
+                return await service.execute(request, execute_db)
+
+        execution = asyncio.create_task(execute_after_quarantine_lock())
+        await _wait_until_lock_wait(engine, "channel_profiles", execution)
+        await blocker.commit()
+        with pytest.raises(PermissionError, match="channel execution blocked"):
+            await asyncio.wait_for(execution, timeout=5)
+    finally:
+        if blocker.in_transaction():
+            await blocker.rollback()
+        await blocker.close()
+        if execution is not None and not execution.done():
+            execution.cancel()
+        if execution is not None:
+            await asyncio.wait_for(asyncio.gather(execution, return_exceptions=True), timeout=5)
+
+    assert await _counts(factory) == (0, 0, 0)
+    assert starts == []
 
 
 async def _wait_until_lock_wait(engine, query_fragment: str, operation: asyncio.Task) -> None:
@@ -185,9 +393,11 @@ async def test_pre_expected_authority_fingerprint_remains_replayable(postgres_id
         exclude={
             "idempotency_key",
             "plan",
-            "expected_approved_revision_hash",
-            "expected_approved_revision",
-        },
+                "expected_approved_revision_hash",
+                "expected_approved_revision",
+                "production_task_id",
+                "channelops_queue_item_id",
+            },
     )
     legacy_payload["plan_id"] = str(uuid.UUID(plan.plan_id))
     legacy_canonical = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)

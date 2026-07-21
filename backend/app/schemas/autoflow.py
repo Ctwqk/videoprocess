@@ -405,6 +405,8 @@ class AutoFlowExecuteRequest(BaseModel):
         pattern=r"^[0-9a-fA-F]{64}$",
     )
     expected_approved_revision: int | None = Field(default=None, ge=1)
+    production_task_id: str | None = None
+    channelops_queue_item_id: str | None = None
 
 
 class AutoFlowRun(BaseModel):

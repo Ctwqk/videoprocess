@@ -1555,6 +1555,106 @@ func TestExecuteHandlerRetryReusesStableApprovedRevisionKey(t *testing.T) {
 	}
 }
 
+func TestExecuteHandlerReleasesChannelFenceBeforeAutoFlow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	item := prepareQueueKind(t, ctx, fixture, baseHandler, QueueExecuteTask)
+	taskID := taskIDForQueueItem(t, ctx, fixture, item)
+	setHumanReviewEvidenceForTest(t, ctx, fixture, taskID, "valid", "", "")
+
+	handler := baseHandler
+	handler.AutoFlow = executeHookAutoFlow{
+		fakeAutoFlow: fakeAutoFlow{},
+		execute: func(_ context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error) {
+			tx, err := fixture.Store.Pool.Begin(ctx)
+			if err != nil {
+				return AutoFlowExecuteObservation{}, err
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			var lockedID string
+			if err := tx.QueryRow(ctx, `
+				SELECT id::text FROM channel_profiles WHERE id = $1::uuid FOR UPDATE NOWAIT
+			`, fixture.ChannelID).Scan(&lockedID); err != nil {
+				return AutoFlowExecuteObservation{}, fmt.Errorf("AutoFlow called while channel fence remained locked: %w", err)
+			}
+			if firstString(request, "production_task_id") != task.ID {
+				return AutoFlowExecuteObservation{}, errors.New("missing bound production task authority")
+			}
+			if firstString(request, "channelops_queue_item_id") != item.ID {
+				return AutoFlowExecuteObservation{}, errors.New("missing bound queue item authority")
+			}
+			return fakeAutoFlow{}.ExecuteTask(ctx, task, request)
+		},
+	}
+
+	if err := handler.Handle(ctx, item); err != nil {
+		t.Fatalf("Handle execute: %v", err)
+	}
+}
+
+func TestExecuteHandlerFinalizesFromDurableRemoteLinkAfterResponseLoss(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	item := prepareQueueKind(t, ctx, fixture, baseHandler, QueueExecuteTask)
+	taskID := taskIDForQueueItem(t, ctx, fixture, item)
+	setHumanReviewEvidenceForTest(t, ctx, fixture, taskID, "valid", "", "")
+	runID := "00000000-0000-0000-0000-000000000211"
+	pipelineID := "00000000-0000-0000-0000-000000000212"
+	jobID := "00000000-0000-0000-0000-000000000311"
+
+	handler := baseHandler
+	handler.AutoFlow = executeHookAutoFlow{
+		fakeAutoFlow: fakeAutoFlow{},
+		execute: func(_ context.Context, _ ProductionTaskRow, _ map[string]any) (AutoFlowExecuteObservation, error) {
+			_, err := fixture.Store.Pool.Exec(ctx, `
+				UPDATE production_tasks
+				SET autoflow_run_id = $2::uuid,
+				    pipeline_id = $3::uuid,
+				    job_id = $4::uuid,
+				    state = 'producing'
+				WHERE id = $1::uuid
+			`, taskID, runID, pipelineID, jobID)
+			if err != nil {
+				return AutoFlowExecuteObservation{}, err
+			}
+			return AutoFlowExecuteObservation{Status: "PENDING"}, nil
+		},
+	}
+
+	if err := handler.HandleExecuteTask(ctx, item); err != nil {
+		t.Fatalf("HandleExecuteTask: %v", err)
+	}
+	task, err := fixture.Store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetProductionTask: %v", err)
+	}
+	if task.State != TaskProducing || task.AutoFlowRunID == nil || *task.AutoFlowRunID != runID || task.JobID == nil || *task.JobID != jobID {
+		t.Fatalf("durable remote execution was not preserved: %#v", task)
+	}
+	var observeCount int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM channel_ops_queue_items
+		WHERE kind = 'observe_job' AND idempotency_key = $1
+	`, "observe_job:"+taskID+":"+runID+":"+jobID+":0").Scan(&observeCount); err != nil {
+		t.Fatalf("count observe queue: %v", err)
+	}
+	if observeCount != 1 {
+		t.Fatalf("observe queue count = %d, want 1", observeCount)
+	}
+}
+
 func TestPublishTaskEnqueuesQuotaLowAlert(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -2664,6 +2764,15 @@ type fakeAutoFlow struct {
 	executeObservation AutoFlowExecuteObservation
 	getJobObservation  AutoFlowJobObservation
 	getJobErr          error
+}
+
+type executeHookAutoFlow struct {
+	fakeAutoFlow
+	execute func(context.Context, ProductionTaskRow, map[string]any) (AutoFlowExecuteObservation, error)
+}
+
+func (f executeHookAutoFlow) ExecuteTask(ctx context.Context, task ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error) {
+	return f.execute(ctx, task, request)
 }
 
 type externalCallRecorder struct {

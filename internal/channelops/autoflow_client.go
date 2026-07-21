@@ -138,13 +138,19 @@ func (c HTTPAutoFlowClient) ExecuteTask(ctx context.Context, task ProductionTask
 		*task.AutoFlowApprovedRevision,
 		approvedRevisionHash,
 	)
-	payload, err := c.postJSON(ctx, "/api/v1/autoflow/execute", map[string]any{
+	payloadBody := map[string]any{
 		"plan_id":                         planID,
 		"execute":                         true,
 		"idempotency_key":                 idempotencyKey,
 		"expected_approved_revision_hash": approvedRevisionHash,
 		"expected_approved_revision":      *task.AutoFlowApprovedRevision,
-	})
+	}
+	for _, field := range []string{"production_task_id", "channelops_queue_item_id"} {
+		if value := strings.TrimSpace(firstString(request, field)); value != "" {
+			payloadBody[field] = value
+		}
+	}
+	payload, err := c.postJSON(ctx, "/api/v1/autoflow/execute", payloadBody)
 	if err != nil {
 		return AutoFlowExecuteObservation{}, err
 	}

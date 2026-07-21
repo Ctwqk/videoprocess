@@ -514,8 +514,10 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionFails(t *testing.T) {
 	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{Status: "failed", ErrorMessage: "execute blocked"}}
 
 	err := handler.HandleExecuteTask(ctx, QueueItemRow{
-		ID:          "00000000-0000-0000-0000-000000000401",
-		PayloadJSON: testExecuteQueuePayload(task.ID),
+		ID:               "00000000-0000-0000-0000-000000000401",
+		Kind:             QueueExecuteTask,
+		ChannelProfileID: &task.ChannelProfileID,
+		PayloadJSON:      testExecuteQueuePayload(task.ID),
 	})
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
@@ -610,8 +612,10 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingRunID(t *testing.
 	}}
 
 	err := handler.HandleExecuteTask(ctx, QueueItemRow{
-		ID:          "00000000-0000-0000-0000-000000000401",
-		PayloadJSON: testExecuteQueuePayload(task.ID),
+		ID:               "00000000-0000-0000-0000-000000000401",
+		Kind:             QueueExecuteTask,
+		ChannelProfileID: &task.ChannelProfileID,
+		PayloadJSON:      testExecuteQueuePayload(task.ID),
 	})
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
@@ -639,8 +643,10 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingJobID(t *testing.
 	}}
 
 	err := handler.HandleExecuteTask(ctx, QueueItemRow{
-		ID:          "00000000-0000-0000-0000-000000000401",
-		PayloadJSON: testExecuteQueuePayload(task.ID),
+		ID:               "00000000-0000-0000-0000-000000000401",
+		Kind:             QueueExecuteTask,
+		ChannelProfileID: &task.ChannelProfileID,
+		PayloadJSON:      testExecuteQueuePayload(task.ID),
 	})
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)

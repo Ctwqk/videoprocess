@@ -84,6 +84,9 @@ func (h HandlerService) Handle(ctx context.Context, item QueueItemRow) error {
 	if h.Store == nil {
 		return errors.New("channelops handler store is not configured")
 	}
+	if item.Kind == QueueExecuteTask {
+		return h.HandleExecuteTask(ctx, item)
+	}
 	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
 		fencedHandler := h
 		fencedHandler.Store = fencedStore
@@ -98,7 +101,7 @@ func (h HandlerService) dispatch(ctx context.Context, item QueueItemRow) error {
 	case QueuePlanTask:
 		return h.HandlePlanTask(ctx, item)
 	case QueueExecuteTask:
-		return h.HandleExecuteTask(ctx, item)
+		return errors.New("execute_task requires split execution fencing")
 	case QueueObserveJob:
 		return h.HandleObserveJob(ctx, item)
 	case QueuePublishTask:
@@ -227,7 +230,79 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	if h.AutoFlow == nil {
 		return errors.New("autoflow client is not configured")
 	}
+	if h.Store == nil {
+		return errors.New("channelops handler store is not configured")
+	}
+	if h.Store.hasExecutionTransaction() {
+		return errors.New("execute_task cannot call AutoFlow while a database fence is held")
+	}
+
+	var preparedTask ProductionTaskRow
+	shouldExecute := false
+	if err := h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
+		fencedHandler := h
+		fencedHandler.Store = fencedStore
+		task, execute, err := fencedHandler.prepareExecuteTask(ctx, item)
+		if err != nil {
+			return err
+		}
+		preparedTask = task
+		shouldExecute = execute
+		return nil
+	}); err != nil {
+		return err
+	}
+	if !shouldExecute {
+		return nil
+	}
+
+	request := AutoFlowRequestForTask(preparedTask)
+	request["production_task_id"] = preparedTask.ID
+	request["channelops_queue_item_id"] = item.ID
+	observation, err := h.AutoFlow.ExecuteTask(ctx, preparedTask, request)
+	if err != nil {
+		return err
+	}
+	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
+		fencedHandler := h
+		fencedHandler.Store = fencedStore
+		return fencedHandler.finalizeExecuteTask(ctx, item, observation)
+	})
+}
+
+func (h HandlerService) prepareExecuteTask(ctx context.Context, item QueueItemRow) (ProductionTaskRow, bool, error) {
 	taskID, _ := item.PayloadJSON["production_task_id"].(string)
+	if taskID == "" {
+		return ProductionTaskRow{}, false, errors.New("execute_task payload missing production_task_id")
+	}
+	task, err := h.Store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		return ProductionTaskRow{}, false, err
+	}
+	if task.State != TaskPlanning && task.State != TaskProducing {
+		return task, false, nil
+	}
+	if err := validateExecuteTaskAuthority(item, task); err != nil {
+		return ProductionTaskRow{}, false, err
+	}
+	if runID, jobID, ok := ExistingExecution(task); ok {
+		return task, false, h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, runID, jobID, item.ID)
+	}
+	if task.State != TaskPlanning {
+		return ProductionTaskRow{}, false, fmt.Errorf("%w: producing task has no durable execution", ErrQueueAuthorityInvalid)
+	}
+	if held, err := h.holdInvalidPreUploadReview(ctx, task, "execute_task_human_review"); held {
+		return ProductionTaskRow{}, false, err
+	}
+	return task, true, nil
+}
+
+func (h HandlerService) finalizeExecuteTask(
+	ctx context.Context,
+	item QueueItemRow,
+	observation AutoFlowExecuteObservation,
+) error {
+	taskID := firstString(item.PayloadJSON, "production_task_id")
 	if taskID == "" {
 		return errors.New("execute_task payload missing production_task_id")
 	}
@@ -235,21 +310,14 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	if err != nil {
 		return err
 	}
-	if task.State != TaskPlanning {
+	if task.State != TaskPlanning && task.State != TaskProducing {
 		return nil
 	}
 	if err := validateExecuteTaskAuthority(item, task); err != nil {
 		return err
 	}
-	if held, err := h.holdInvalidPreUploadReview(ctx, task, "execute_task_human_review"); held {
-		return err
-	}
 	if runID, jobID, ok := ExistingExecution(task); ok {
 		return h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, runID, jobID, item.ID)
-	}
-	observation, err := h.AutoFlow.ExecuteTask(ctx, task, AutoFlowRequestForTask(task))
-	if err != nil {
-		return err
 	}
 	if observation.Status == "failed" {
 		return h.Store.FailTask(ctx, task.ID, observation.ErrorMessage, "execute_task")

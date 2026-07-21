@@ -27,6 +27,8 @@ from app.autoflow.validation_repair import AutoFlowRepairService, AutoFlowUnrepa
 from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
 from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
 from app.models.asset import Asset
+from app.models.channel_agent import ChannelOpsQueueItem, ChannelProfile, ProductionTask
+from app.models.job import Job, JobStatus
 from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import (
     AutoFlowClipCandidate,
@@ -751,6 +753,19 @@ class AutoFlowService:
         key = _execute_idempotency_key(request)
         expected_revision_hash, expected_revision = _expected_execute_authority(request)
         request_fingerprint = execute_request_fingerprint(request, plan_id)
+        binding = _channelops_execute_binding(request)
+        if binding is not None:
+            return await self._execute_channelops_bound(
+                request,
+                db,
+                plan_id=plan_id,
+                key=key,
+                expected_revision_hash=expected_revision_hash,
+                expected_revision=expected_revision,
+                request_fingerprint=request_fingerprint,
+                task_id=binding[0],
+                queue_item_id=binding[1],
+            )
         existing = (
             await db.execute(
                 select(AutoFlowRunModel).where(AutoFlowRunModel.execute_idempotency_key == key)
@@ -898,6 +913,185 @@ class AutoFlowService:
         run = _run_from_model(reservation)
         if should_start and job_id is not None:
             await start_jobs_background([job_id])
+        return run
+
+    async def _execute_channelops_bound(
+        self,
+        request: AutoFlowExecuteRequest,
+        db: AsyncSession,
+        *,
+        plan_id: str,
+        key: str,
+        expected_revision_hash: str | None,
+        expected_revision: int | None,
+        request_fingerprint: str,
+        task_id: uuid.UUID,
+        queue_item_id: uuid.UUID,
+    ) -> AutoFlowRun:
+        if not request.execute:
+            raise ValueError("ChannelOps-bound AutoFlow execution requires execute=true")
+        if expected_revision_hash is None or expected_revision is None:
+            raise ValueError("ChannelOps-bound AutoFlow execution requires exact approved revision authority")
+
+        try:
+            discovered_task = await db.get(ProductionTask, task_id)
+            if discovered_task is None:
+                raise PermissionError("ChannelOps production task was not found")
+            channel = (
+                await db.execute(
+                    select(ChannelProfile)
+                    .where(ChannelProfile.id == discovered_task.channel_profile_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if channel is None:
+                raise PermissionError("ChannelOps task channel was not found")
+            if not channel.enabled or channel.halted_at is not None:
+                raise PermissionError("channel execution blocked")
+
+            schedule, _schedule_created = await get_or_create_and_lock_runtime_schedule(db)
+            try:
+                schedule_state = VideoScheduleState(schedule.state)
+            except ValueError:
+                schedule_state = default_video_schedule_state()
+            if schedule_state != VideoScheduleState.OPEN:
+                raise PermissionError("ChannelOps runtime schedule does not permit a new execution")
+
+            task = (
+                await db.execute(
+                    select(ProductionTask)
+                    .where(ProductionTask.id == task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if task is None or task.channel_profile_id != channel.id:
+                raise PermissionError("ChannelOps task authority changed during execution")
+
+            queue_item = (
+                await db.execute(
+                    select(ChannelOpsQueueItem)
+                    .where(ChannelOpsQueueItem.id == queue_item_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            _assert_channelops_execute_queue_authority(
+                task,
+                queue_item,
+                channel_id=channel.id,
+                plan_id=plan_id,
+                expected_revision_hash=expected_revision_hash,
+                expected_revision=expected_revision,
+            )
+
+            plan = await self._get_plan_for_update(plan_id, db)
+            if plan is None:
+                raise ValueError("AutoFlow plan not found")
+            _assert_execute_allowed(plan, request)
+            _assert_expected_execute_authority(plan, expected_revision_hash, expected_revision)
+
+            existing = (
+                await db.execute(
+                    select(AutoFlowRunModel)
+                    .where(AutoFlowRunModel.execute_idempotency_key == key)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                run = _validate_idempotent_replay(
+                    existing,
+                    plan_id,
+                    expected_revision_hash,
+                    expected_revision,
+                    request_fingerprint,
+                )
+                if existing.job_id is None:
+                    raise ValueError("ChannelOps-bound AutoFlow run has no durable job")
+                job = (
+                    await db.execute(
+                        select(Job)
+                        .where(Job.id == existing.job_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if job is None:
+                    raise ValueError("ChannelOps-bound AutoFlow job was not found")
+                job_id = _bind_channelops_execution(task, existing)
+                should_start = job.status in {
+                    JobStatus.PENDING,
+                    JobStatus.WAITING_WINDOW,
+                    JobStatus.VALIDATING,
+                    JobStatus.PLANNING,
+                }
+                await db.commit()
+                if should_start:
+                    await start_jobs_background([job_id])
+                return run
+
+            approved_revision_hash = plan.approved_revision_hash
+            reservation = AutoFlowRunModel(
+                id=uuid.uuid4(),
+                plan_id=uuid.UUID(plan.plan_id),
+                status="pending",
+                artifacts_json={},
+                publish_json={
+                    "mode": plan.request.publish_mode,
+                    "review_approved": bool(plan.review_approved_at or plan.agent_approved_by),
+                    "agent_approved_by": plan.agent_approved_by,
+                    "public_approved": bool(plan.public_approved_at),
+                    "approved_revision_hash": approved_revision_hash,
+                    "approved_revision": plan.approved_revision,
+                },
+                execute_idempotency_key=key,
+                request_fingerprint=request_fingerprint,
+            )
+            db.add(reservation)
+            await db.flush()
+
+            await self._validate_owned_input_asset(plan.request, db)
+            pipeline = await create_pipeline(
+                db,
+                PipelineCreate(
+                    name=f"AutoFlow {plan.intent.subject}",
+                    description=f"Generated from prompt: {plan.request.prompt}",
+                    definition=plan.pipeline_definition,
+                    is_template=request.save_as_template,
+                    template_tags=["autoflow", plan.template_id],
+                ),
+                commit=False,
+            )
+            job = await create_job(db, pipeline.id, commit=False)
+            reservation.pipeline_id = pipeline.id
+            reservation.job_id = job.id
+            reservation.status = str(job.status.value)
+            reservation.artifacts_json = {
+                "pipeline_id": str(pipeline.id),
+                "job_id": str(job.id),
+            }
+            plan_row = await db.get(AutoFlowPlanModel, uuid.UUID(plan.plan_id))
+            assert plan_row is not None
+            plan_row.status = "executed"
+            if plan.candidates:
+                await self.recent_usage_store.record_selected_clips(
+                    db,
+                    run_id=str(reservation.id),
+                    candidates=plan.candidates,
+                )
+            _bind_channelops_execution(task, reservation)
+            await db.commit()
+        except Exception:
+            if db.in_transaction():
+                await db.rollback()
+            raise
+
+        await db.refresh(reservation)
+        run = _run_from_model(reservation)
+        assert reservation.job_id is not None
+        await start_jobs_background([reservation.job_id])
         return run
 
     async def _validate_owned_input_asset(
@@ -1198,6 +1392,117 @@ def _expected_execute_authority(request: AutoFlowExecuteRequest) -> tuple[str | 
     return revision_hash, revision
 
 
+def _channelops_execute_binding(
+    request: AutoFlowExecuteRequest,
+) -> tuple[uuid.UUID, uuid.UUID] | None:
+    task_id = request.production_task_id
+    queue_item_id = request.channelops_queue_item_id
+    if task_id is None and queue_item_id is None:
+        return None
+    if task_id is None or queue_item_id is None:
+        raise ValueError(
+            "ChannelOps production_task_id and channelops_queue_item_id must be provided together"
+        )
+    try:
+        return uuid.UUID(task_id), uuid.UUID(queue_item_id)
+    except ValueError as exc:
+        raise ValueError("ChannelOps execution authority ids must be valid UUIDs") from exc
+
+
+def _assert_channelops_execute_queue_authority(
+    task: ProductionTask,
+    queue_item: ChannelOpsQueueItem | None,
+    *,
+    channel_id: uuid.UUID,
+    plan_id: str,
+    expected_revision_hash: str,
+    expected_revision: int,
+) -> None:
+    if queue_item is None:
+        raise PermissionError("ChannelOps execute queue item was not found")
+    if queue_item.kind != "execute_task":
+        raise PermissionError("ChannelOps queue item is not an execute request")
+    if queue_item.status != "running":
+        raise PermissionError("ChannelOps execute queue item is not claimed")
+    if queue_item.channel_profile_id != channel_id:
+        raise PermissionError("ChannelOps execute queue channel authority changed")
+    if task.state not in {"planning", "producing"}:
+        raise PermissionError("ChannelOps production task is not executable")
+    if task.autoflow_plan_id != uuid.UUID(plan_id):
+        raise PermissionError("ChannelOps production task plan authority changed")
+
+    payload = queue_item.payload_json if isinstance(queue_item.payload_json, dict) else {}
+    if str(payload.get("production_task_id") or "") != str(task.id):
+        raise PermissionError("ChannelOps execute queue task authority changed")
+    if str(payload.get("autoflow_plan_id") or "") != plan_id:
+        raise PermissionError("ChannelOps execute queue plan authority changed")
+    if str(payload.get("expected_approved_revision_hash") or "") != expected_revision_hash:
+        raise PermissionError("ChannelOps execute queue revision authority changed")
+    try:
+        queue_revision = int(payload.get("expected_approved_revision"))
+    except (TypeError, ValueError) as exc:
+        raise PermissionError("ChannelOps execute queue revision authority is invalid") from exc
+    if queue_revision != expected_revision:
+        raise PermissionError("ChannelOps execute queue revision authority changed")
+
+    rationale = task.rationale_json if isinstance(task.rationale_json, dict) else {}
+    snapshot = rationale.get("autoflow_plan_payload")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    if (
+        str(snapshot.get("plan_id") or "") != plan_id
+        or str(snapshot.get("expected_approved_revision_hash") or "") != expected_revision_hash
+    ):
+        raise PermissionError("ChannelOps production task revision authority changed")
+    try:
+        task_revision = int(snapshot.get("expected_approved_revision"))
+    except (TypeError, ValueError) as exc:
+        raise PermissionError("ChannelOps production task revision authority is invalid") from exc
+    if task_revision != expected_revision:
+        raise PermissionError("ChannelOps production task revision authority changed")
+
+
+def _bind_channelops_execution(
+    task: ProductionTask,
+    run: AutoFlowRunModel,
+) -> uuid.UUID:
+    if run.pipeline_id is None or run.job_id is None:
+        raise ValueError("ChannelOps-bound AutoFlow execution has no pipeline or job")
+    expected = {
+        "autoflow_run_id": run.id,
+        "pipeline_id": run.pipeline_id,
+        "job_id": run.job_id,
+    }
+    for field, value in expected.items():
+        current = getattr(task, field)
+        if current is not None and current != value:
+            raise PermissionError(f"ChannelOps production task has conflicting {field}")
+
+    already_bound = task.state == "producing" and all(
+        getattr(task, field) == value for field, value in expected.items()
+    )
+    if not already_bound:
+        now = datetime.now(timezone.utc)
+        history = list(task.transition_history_json or [])
+        history.append(
+            {
+                "from": task.state,
+                "to": "producing",
+                "reason": "execute_task",
+                "at": now.isoformat().replace("+00:00", "Z"),
+            }
+        )
+        task.transition_history_json = history
+        task.state = "producing"
+        task.state_updated_at = now
+        task.blocked_by_guard = None
+        task.failure_reason = None
+        task.failure_category = None
+    task.autoflow_run_id = run.id
+    task.pipeline_id = run.pipeline_id
+    task.job_id = run.job_id
+    return run.job_id
+
+
 def _assert_expected_execute_authority(
     plan: AutoFlowPlan,
     expected_revision_hash: str | None,
@@ -1219,6 +1524,10 @@ def execute_request_fingerprint(request: AutoFlowExecuteRequest, plan_id: str) -
         excluded_fields.add("expected_approved_revision_hash")
     if request.expected_approved_revision is None:
         excluded_fields.add("expected_approved_revision")
+    if request.production_task_id is None:
+        excluded_fields.add("production_task_id")
+    if request.channelops_queue_item_id is None:
+        excluded_fields.add("channelops_queue_item_id")
     payload = request.model_dump(
         mode="json",
         exclude=excluded_fields,
