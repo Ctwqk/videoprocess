@@ -458,4 +458,3 @@ exact approval phrase required for the next attempt:
 \`\`\`text
 批准第三次 unlisted canary
 \`\`\`
-
