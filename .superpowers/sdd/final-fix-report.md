@@ -1200,3 +1200,96 @@ publication, host-126 access, or root-plan edit occurred.
 
 - Existing Python deprecation warnings, frontend Lightning CSS/chunk/audit
   warnings, and the documented Ruff/mypy baselines remain.
+
+## Final Review 10 Distributed Side-Effect Closure
+
+### Status And Scope
+
+`DONE_WITH_CONCERNS`. Final Review 10 began at `4ff7f65` and produced the
+local commits `298855b` (`fix: bind autoflow execution before start`),
+`80bdcac` (`fix: serialize worker execution with quarantine`), and `52898d4`
+(`fix: close distributed channelops side effects`). No push, SSH, deployment,
+activation, production mutation, PDS write, YouTube call, upload, publication,
+host-126 access, or external canary occurred in this wave. Public publication
+remains unsupported by the new promotion operation and no canary approval was
+inferred from the user's pause instruction.
+
+### Durable Side Effects And Authority
+
+- Alembic head `027_publication_promotion_operations` adds one durable
+  operation per publication/queue attempt, with a stable attempt key and the
+  states `reserved`, `submitting`, `confirmed`, `finalized`, and `uncertain`.
+  Database and Go validation accept only `private` or `unlisted` targets.
+- Promotion execution is split into reserve, external submission/reconcile,
+  and fenced finalization phases. Retries query observed platform state before
+  repeating any manager request. Response loss, contradictory state,
+  unavailable status, and severe platform status all fail closed as
+  `uncertain`; local finalization can converge without a second manager call.
+- YouTubeManager receives the stable `Idempotency-Key` when scheduling. The
+  implementation does not assume the external manager enforces it.
+- AutoFlow execution now binds the durable run/pipeline/job to its production
+  task before launch. Go replays AutoFlow even when the durable link already
+  exists, and Python revalidates channel, schedule, task, exact plan revision,
+  queue claim, and the exact `locked_by`/`locked_at` lease under row locks.
+  Lease fields are excluded from the request fingerprint so a newly claimed
+  retry can replay the same durable operation while a stale worker is rejected.
+- Initial launch and terminal failure paths hold ordered job/node authority
+  through their terminal writes. `RUNNING` jobs with stranded, unclaimed
+  `QUEUED` nodes are idempotently redelivered. Launch handoff is awaited and
+  shielded from caller cancellation; cancellation is re-raised only after the
+  launch completes.
+- PostgreSQL race cleanup now bounds task drain, rollback, close, and engine
+  disposal. Any timeout permanently marks that fixture unsafe and prevents a
+  later disposal or `TRUNCATE` while a connection may still be owned.
+
+### TDD And Review Evidence
+
+- RED tests reproduced: stale queue lease acceptance; lost `RUNNING` start
+  handoff; stranded `QUEUED` root; non-awaited launch; rollback/close/dispose
+  timeout eligibility; missing Go lease forwarding; severe removed-platform
+  reconciliation; exhausted-failure/quarantine interleaving; and promotion
+  response-loss/finalization windows.
+- The final cancellation regression first failed because caller cancellation
+  reached the child launch (`child_cancelled` was set). After shielding, both
+  job-runtime tests passed, and the file passed 10 consecutive runs.
+- The final recovery/lease/cleanup Python set passed 10 consecutive runs. The
+  Go execute-handler/client set passed with `-count=10`. The six core durable
+  promotion regressions also passed with `-count=10`.
+- The existing reviewer reported no Critical findings, identified the lease,
+  `RUNNING` recovery, cleanup timeout, and cancellation windows, then confirmed
+  after fixes: `No Critical or Important findings.`
+
+### PostgreSQL And Full Verification
+
+- Disposable container `vp-final-review-10-postgres`
+  (`87c2e22fa249`, `postgres:16-alpine`, PostgreSQL `16.14`) ran only on
+  `127.0.0.1:55440`. Empty-database migration advanced from `001` through
+  `027_publication_promotion_operations (head)`.
+- The expanded PostgreSQL migration/authority/API/promotion acceptance bundle
+  passed `84 passed, 11 warnings in 13.68s`. An earlier invocation from the
+  repository root recorded `49 passed, 1 failed`; that failure was solely an
+  existing relative-path contract reading `alembic/...` outside the required
+  `backend/` working directory. The correctly rooted rerun passed.
+- Final backend verification passed `646 passed, 49 skipped, 8 warnings in
+  65.29s`. Changed-file Ruff passed. Full Ruff remains the exact pre-existing
+  17-finding baseline; mypy remains 66 errors in 24 files across 144 sources.
+- After dropping and recreating the database and migrating from empty to head,
+  `DATABASE_URL=... go test ./... -count=1` passed every package;
+  `internal/channelops` completed in `6.504s`.
+- `tests/test_channelops_soak_watch.sh` and
+  `tests/test_vp_deploy_sync_extension.sh` passed. Bash syntax passed for the
+  soak watcher, deploy sync extension, and image-smoke scripts. `gofmt -l`
+  returned no files, the race-task AST audit found 22 create-task sites with
+  zero missing immediate cleanup scopes, and both staged and full-branch
+  `git diff --check` passed. No frontend files changed in this wave.
+- `docker rm -f vp-final-review-10-postgres` succeeded. An exact-name
+  `docker ps -a` check confirmed the disposable container is absent.
+
+### Concerns
+
+- Full Ruff/mypy baselines and existing `datetime.utcnow()` deprecation
+  warnings remain outside this scoped closure.
+- The implementation is committed locally at `52898d4`; the following
+  docs-only commit records this report. Neither commit is pushed or deployed
+  while Codex/external actions are paused. Long-running production interaction
+  and any further unlisted canary remain pending explicit resume/approval.
