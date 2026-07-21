@@ -84,9 +84,9 @@ async def get_or_create_and_lock_runtime_schedule(
 ) -> tuple[RuntimeSchedule, bool]:
     """Create if needed and lock schedule authority without committing.
 
-    Lock order: an existing Go fence owns channel first; Python then locks
-    schedule -> plan -> job. Quarantine locks channel -> schedule -> task /
-    publication / job. Starters lock schedule -> job.
+    Lock order: an existing channel authority fence owns channel first; Python
+    then locks schedule followed by task/job-specific rows. Callers that may be
+    linked to ChannelOps must acquire the channel fence before this helper.
     """
     resolved_default = default_state or default_video_schedule_state()
     values = {

@@ -161,6 +161,11 @@ async def test_cache_miss_dispatches_redis_task(engine_cache_db_session, monkeyp
     monkeypatch.setattr("app.orchestrator.engine._redis", lambda: fake_redis)
     job, _source_ne, node_ne, _input_artifact = await _seed_job(engine_cache_db_session)
 
+    async def allow_dispatch(_self, db, job_id, node_execution_id):
+        return await db.get(Job, job_id), await db.get(NodeExecution, node_execution_id)
+
+    monkeypatch.setattr(JobEngine, "_lock_dispatch_authority", allow_dispatch)
+
     await JobEngine()._dispatch_ready_nodes(engine_cache_db_session, job, {"source_1": [], "node_1": ["source_1"]})
 
     refreshed = await engine_cache_db_session.get(NodeExecution, node_ne.id)

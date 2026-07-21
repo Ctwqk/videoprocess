@@ -138,15 +138,25 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
 
     from app.orchestrator import engine as engine_module
 
+    async def lock_authority(*args, **kwargs):
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(state="OPEN"),
+            task=None,
+            job=job,
+            node=retry_node,
+        )
+
     monkeypatch.setattr(engine_module, "async_session", lambda: fake_session)
     monkeypatch.setattr(engine_module, "_redis", lambda: fake_redis)
+    monkeypatch.setattr(engine_module, "lock_job_execution_authority", lock_authority)
 
     await JobEngine().on_node_failed(job_id, failed_node_execution_id, "boom")
 
     assert retry_node.retry_count == 1
     assert retry_node.status == NodeStatus.QUEUED
     assert retry_node.error_message is None
-    assert fake_session.commits == 1
+    assert fake_session.commits == 2
     assert fake_redis.closed
     assert len(fake_redis.added) == 1
 

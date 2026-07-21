@@ -8,9 +8,11 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import selectinload
 
 from app.api.channel_agent import HumanReviewRequest, promote_publication, release_human_review
 from app.models.autoflow import AutoFlowPlan
+from app.models.artifact import Artifact
 from app.models.channel_agent import (
     ChannelOpsQueueItem,
     ChannelProfile,
@@ -23,7 +25,13 @@ from app.models.pipeline import Pipeline
 from app.models.schedule import RuntimeSchedule
 from app.orchestrator.engine import JobEngine
 from app.services.channelops_quarantine import QUARANTINE_REASON, quarantine_channelops_backlog
+from app.services.job_execution_authority import JobExecutionAuthorityBlocked
 from app.services.schedule_service import VIDEO_SCHEDULE_SERVICE, VideoScheduleState
+from app.services.youtube_upload_operations import (
+    UploadOperationContext,
+    YouTubeUploadOperationStore,
+)
+from worker import main as worker_main
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -128,6 +136,587 @@ async def _cancel_operations(blocker: AsyncSession, *operations: asyncio.Task) -
         if not operation.done():
             operation.cancel()
     await asyncio.gather(*operations, return_exceptions=True)
+
+
+async def _seed_worker_authority(factory, *, node_status: NodeStatus, job_status: JobStatus):
+    definition = {
+        "nodes": [
+            {
+                "id": "trim_1",
+                "type": "trim",
+                "position": {"x": 0, "y": 0},
+                "data": {"label": "Trim", "config": {"start_time": 0, "end_time": 1}},
+            }
+        ],
+        "edges": [],
+        "viewport": {"x": 0, "y": 0, "zoom": 1},
+    }
+    async with factory() as db:
+        channel = ChannelProfile(name="worker authority", enabled=True, dry_run=False)
+        schedule = RuntimeSchedule(
+            service_name=VIDEO_SCHEDULE_SERVICE,
+            state=VideoScheduleState.OPEN.value,
+            updated_by="worker-authority-test",
+        )
+        pipeline = Pipeline(name="worker authority", definition=definition)
+        db.add_all([channel, schedule, pipeline])
+        await db.flush()
+        job = Job(
+            pipeline_id=pipeline.id,
+            pipeline_snapshot=definition,
+            status=job_status,
+            execution_plan={"topo_order": ["trim_1"], "dependencies": {"trim_1": []}},
+        )
+        db.add(job)
+        await db.flush()
+        node = NodeExecution(
+            job_id=job.id,
+            node_id="trim_1",
+            node_type="trim",
+            node_label="Trim",
+            node_config={"start_time": 0, "end_time": 1},
+            status=node_status,
+        )
+        task = ProductionTask(
+            channel_profile_id=channel.id,
+            target_account_id=uuid.uuid4(),
+            prompt="worker authority",
+            job_id=job.id,
+            state="producing",
+            channel_config_snapshot_json={},
+        )
+        db.add_all([node, task])
+        await db.commit()
+        return channel.id, task.id, job.id, node.id
+
+
+async def test_worker_claim_cannot_revive_quarantine_first_node(postgres_race_db):
+    engine, factory = postgres_race_db
+    channel_id, task_id, job_id, node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.QUEUED,
+        job_status=JobStatus.RUNNING,
+    )
+
+    blocker = factory()
+    claim = None
+    try:
+        channel = (
+            await blocker.execute(
+                select(ChannelProfile).where(ChannelProfile.id == channel_id).with_for_update()
+            )
+        ).scalar_one()
+        schedule = (
+            await blocker.execute(
+                select(RuntimeSchedule)
+                .where(RuntimeSchedule.service_name == VIDEO_SCHEDULE_SERVICE)
+                .with_for_update()
+            )
+        ).scalar_one()
+        task = (
+            await blocker.execute(
+                select(ProductionTask).where(ProductionTask.id == task_id).with_for_update()
+            )
+        ).scalar_one()
+        job = (await blocker.execute(select(Job).where(Job.id == job_id).with_for_update())).scalar_one()
+        node = (
+            await blocker.execute(
+                select(NodeExecution).where(NodeExecution.id == node_id).with_for_update()
+            )
+        ).scalar_one()
+        channel.halted_at = channel.created_at
+        channel.halt_reason = QUARANTINE_REASON
+        schedule.state = VideoScheduleState.CLOSED.value
+        task.state = "held"
+        task.blocked_by_guard = QUARANTINE_REASON
+        job.status = JobStatus.CANCELLED
+        node.status = NodeStatus.CANCELLED
+        await blocker.flush()
+
+        claim = asyncio.create_task(
+            worker_main._claim_node_execution(
+                str(job_id),
+                str(node_id),
+                session_factory=factory,
+            )
+        )
+        await _wait_until_lock_wait(engine, "channel_profiles", claim)
+        await blocker.commit()
+        assert await asyncio.wait_for(claim, timeout=5) is False
+    finally:
+        if blocker.in_transaction():
+            await blocker.rollback()
+        await blocker.close()
+        if claim is not None and not claim.done():
+            claim.cancel()
+        if claim is not None:
+            await asyncio.wait_for(asyncio.gather(claim, return_exceptions=True), timeout=5)
+
+    async with factory() as db:
+        stored = await db.get(NodeExecution, node_id)
+    assert stored is not None and stored.status == NodeStatus.CANCELLED
+
+
+async def test_repeated_quarantine_repairs_active_node_under_cancelled_job(postgres_race_db):
+    _engine, factory = postgres_race_db
+    channel_id, task_id, job_id, node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.RUNNING,
+        job_status=JobStatus.CANCELLED,
+    )
+    async with factory() as db:
+        channel = await db.get(ChannelProfile, channel_id)
+        task = await db.get(ProductionTask, task_id)
+        assert channel is not None and task is not None
+        channel.halted_at = channel.created_at
+        channel.halt_reason = QUARANTINE_REASON
+        task.state = "held"
+        task.blocked_by_guard = QUARANTINE_REASON
+        task.failure_reason = QUARANTINE_REASON
+        await db.commit()
+
+    async with factory() as db:
+        result = await quarantine_channelops_backlog(
+            db,
+            channel_id,
+            apply=True,
+            close_schedule=True,
+        )
+
+    assert result["changed_ids"]["job_ids"] == []
+    assert result["changed_ids"]["node_execution_ids"] == [str(node_id)]
+    async with factory() as db:
+        stored_job = await db.get(Job, job_id)
+        stored_node = await db.get(NodeExecution, node_id)
+    assert stored_job is not None and stored_job.status == JobStatus.CANCELLED
+    assert stored_node is not None and stored_node.status == NodeStatus.CANCELLED
+
+
+async def _stage_worker_quarantine(
+    blocker: AsyncSession,
+    *,
+    channel_id,
+    task_id,
+    job_id,
+    node_id,
+) -> None:
+    channel = (
+        await blocker.execute(
+            select(ChannelProfile).where(ChannelProfile.id == channel_id).with_for_update()
+        )
+    ).scalar_one()
+    schedule = (
+        await blocker.execute(
+            select(RuntimeSchedule)
+            .where(RuntimeSchedule.service_name == VIDEO_SCHEDULE_SERVICE)
+            .with_for_update()
+        )
+    ).scalar_one()
+    task = (
+        await blocker.execute(
+            select(ProductionTask).where(ProductionTask.id == task_id).with_for_update()
+        )
+    ).scalar_one()
+    job = (await blocker.execute(select(Job).where(Job.id == job_id).with_for_update())).scalar_one()
+    node = (
+        await blocker.execute(
+            select(NodeExecution).where(NodeExecution.id == node_id).with_for_update()
+        )
+    ).scalar_one()
+    channel.halted_at = channel.created_at
+    channel.halt_reason = QUARANTINE_REASON
+    schedule.state = VideoScheduleState.CLOSED.value
+    task.state = "held"
+    task.blocked_by_guard = QUARANTINE_REASON
+    task.failure_reason = QUARANTINE_REASON
+    job.status = JobStatus.CANCELLED
+    node.status = NodeStatus.CANCELLED
+    await blocker.flush()
+
+
+async def test_quarantine_first_blocks_stale_worker_completion(postgres_race_db, monkeypatch):
+    engine, factory = postgres_race_db
+    channel_id, task_id, job_id, node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.RUNNING,
+        job_status=JobStatus.RUNNING,
+    )
+    async with factory() as db:
+        artifact = Artifact(
+            job_id=job_id,
+            node_execution_id=node_id,
+            filename="completed.mp4",
+            storage_path="artifacts/completed.mp4",
+        )
+        db.add(artifact)
+        await db.commit()
+        artifact_id = artifact.id
+
+    dispatches: list[uuid.UUID] = []
+    job_engine = JobEngine()
+
+    async def no_cache(*args, **kwargs):
+        return None
+
+    async def record_dispatch(_db, job, _dep_map, **kwargs):
+        dispatches.append(job.id)
+
+    monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
+    monkeypatch.setattr(job_engine, "_write_artifact_cache_for_node", no_cache)
+    monkeypatch.setattr(job_engine, "_dispatch_ready_nodes", record_dispatch)
+
+    blocker = factory()
+    completion = None
+    try:
+        await _stage_worker_quarantine(
+            blocker,
+            channel_id=channel_id,
+            task_id=task_id,
+            job_id=job_id,
+            node_id=node_id,
+        )
+        completion = asyncio.create_task(job_engine.on_node_completed(job_id, node_id, artifact_id))
+        await _wait_until_lock_wait(engine, "", completion)
+        await blocker.commit()
+        await asyncio.wait_for(completion, timeout=5)
+    finally:
+        if blocker.in_transaction():
+            await blocker.rollback()
+        await blocker.close()
+        if completion is not None and not completion.done():
+            completion.cancel()
+        if completion is not None:
+            await asyncio.wait_for(asyncio.gather(completion, return_exceptions=True), timeout=5)
+
+    async with factory() as db:
+        stored_job = await db.get(Job, job_id)
+        stored_node = await db.get(NodeExecution, node_id)
+    assert stored_job is not None and stored_job.status == JobStatus.CANCELLED
+    assert stored_node is not None and stored_node.status == NodeStatus.CANCELLED
+    assert stored_node.output_artifact_id is None
+    assert dispatches == []
+
+
+async def test_quarantine_first_blocks_stale_worker_retry(postgres_race_db, monkeypatch):
+    engine, factory = postgres_race_db
+    channel_id, task_id, job_id, node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.RUNNING,
+        job_status=JobStatus.RUNNING,
+    )
+    redis_dispatches: list[tuple[str, dict]] = []
+
+    class RecordingRedis:
+        async def xadd(self, stream_key, payload):
+            redis_dispatches.append((stream_key, payload))
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
+    monkeypatch.setattr("app.orchestrator.engine._redis", lambda: RecordingRedis())
+    job_engine = JobEngine()
+
+    blocker = factory()
+    failure = None
+    try:
+        await _stage_worker_quarantine(
+            blocker,
+            channel_id=channel_id,
+            task_id=task_id,
+            job_id=job_id,
+            node_id=node_id,
+        )
+        failure = asyncio.create_task(job_engine.on_node_failed(job_id, node_id, "late failure"))
+        await _wait_until_lock_wait(engine, "", failure)
+        await blocker.commit()
+        await asyncio.wait_for(failure, timeout=5)
+    finally:
+        if blocker.in_transaction():
+            await blocker.rollback()
+        await blocker.close()
+        if failure is not None and not failure.done():
+            failure.cancel()
+        if failure is not None:
+            await asyncio.wait_for(asyncio.gather(failure, return_exceptions=True), timeout=5)
+
+    async with factory() as db:
+        stored_job = await db.get(Job, job_id)
+        stored_node = await db.get(NodeExecution, node_id)
+    assert stored_job is not None and stored_job.status == JobStatus.CANCELLED
+    assert stored_node is not None and stored_node.status == NodeStatus.CANCELLED
+    assert stored_node.retry_count == 0
+    assert redis_dispatches == []
+
+
+async def test_quarantine_between_queue_commit_and_downstream_dispatch_blocks_redis(
+    postgres_race_db,
+    monkeypatch,
+):
+    _engine, factory = postgres_race_db
+    definition = {
+        "nodes": [
+            {
+                "id": "source_1",
+                "type": "source",
+                "position": {"x": 0, "y": 0},
+                "data": {"label": "Source", "config": {"asset_id": str(uuid.uuid4())}},
+            },
+            {
+                "id": "trim_1",
+                "type": "trim",
+                "position": {"x": 200, "y": 0},
+                "data": {"label": "Trim", "config": {"start_time": 0, "end_time": 1}},
+            },
+        ],
+        "edges": [
+            {
+                "id": "source-to-trim",
+                "source": "source_1",
+                "target": "trim_1",
+                "sourceHandle": "output",
+                "targetHandle": "input",
+            }
+        ],
+    }
+    async with factory() as db:
+        channel = ChannelProfile(name="downstream dispatch race", enabled=True, dry_run=False)
+        schedule = RuntimeSchedule(
+            service_name=VIDEO_SCHEDULE_SERVICE,
+            state=VideoScheduleState.OPEN.value,
+            updated_by="downstream-dispatch-race-test",
+        )
+        pipeline = Pipeline(name="downstream dispatch race", description="", definition=definition)
+        db.add_all([channel, schedule, pipeline])
+        await db.flush()
+        account = PublishingAccount(
+            channel_profile_id=channel.id,
+            account_label="downstream dispatch race",
+            credential_ref="youtube/downstream-dispatch-race",
+            default_privacy="unlisted",
+        )
+        job = Job(
+            pipeline_id=pipeline.id,
+            pipeline_snapshot=definition,
+            status=JobStatus.RUNNING,
+            execution_plan={
+                "topo_order": ["source_1", "trim_1"],
+                "dependencies": {"source_1": [], "trim_1": ["source_1"]},
+            },
+            orchestrator_owner="python",
+        )
+        db.add_all([account, job])
+        await db.flush()
+        source = NodeExecution(
+            job_id=job.id,
+            node_id="source_1",
+            node_type="source",
+            node_label="Source",
+            node_config={"asset_id": str(uuid.uuid4())},
+            status=NodeStatus.SUCCEEDED,
+            progress=100,
+        )
+        downstream = NodeExecution(
+            job_id=job.id,
+            node_id="trim_1",
+            node_type="trim",
+            node_label="Trim",
+            node_config={"start_time": 0, "end_time": 1},
+            status=NodeStatus.PENDING,
+        )
+        task = ProductionTask(
+            channel_profile_id=channel.id,
+            target_account_id=account.id,
+            prompt="downstream dispatch race",
+            state="producing",
+            job_id=job.id,
+            channel_config_snapshot_json={},
+        )
+        db.add_all([source, downstream, task])
+        await db.flush()
+        artifact = Artifact(
+            job_id=job.id,
+            node_execution_id=source.id,
+            filename="source.mp4",
+            storage_path="artifacts/source.mp4",
+        )
+        db.add(artifact)
+        await db.flush()
+        source.output_artifact_id = artifact.id
+        await db.commit()
+        channel_id = channel.id
+        job_id = job.id
+        downstream_id = downstream.id
+
+    queued_before_authority = asyncio.Event()
+    release_dispatch = asyncio.Event()
+
+    class RecordingRedis:
+        def __init__(self) -> None:
+            self.dispatches: list[tuple[str, dict]] = []
+
+        async def xadd(self, stream_key: str, payload: dict) -> None:
+            self.dispatches.append((stream_key, payload))
+
+        async def aclose(self) -> None:
+            return None
+
+    async def pause_after_queue_commit(_job_id, node_id):
+        if node_id == "trim_1":
+            queued_before_authority.set()
+            await release_dispatch.wait()
+
+    redis = RecordingRedis()
+    job_engine = JobEngine()
+    monkeypatch.setattr("app.orchestrator.engine._redis", lambda: redis)
+    monkeypatch.setattr(job_engine, "_before_node_dispatch_recheck", pause_after_queue_commit)
+
+    async def dispatch_downstream() -> None:
+        async with factory() as dispatch_db:
+            stored_job = (
+                await dispatch_db.execute(
+                    select(Job)
+                    .where(Job.id == job_id)
+                    .options(selectinload(Job.node_executions))
+                )
+            ).scalar_one()
+            await job_engine._dispatch_ready_nodes(
+                dispatch_db,
+                stored_job,
+                {"source_1": [], "trim_1": ["source_1"]},
+            )
+
+    dispatcher = asyncio.create_task(dispatch_downstream())
+    try:
+        await asyncio.wait_for(queued_before_authority.wait(), timeout=5)
+        async with factory() as quarantine_db:
+            result = await asyncio.wait_for(
+                quarantine_channelops_backlog(
+                    quarantine_db,
+                    channel_id,
+                    apply=True,
+                    close_schedule=True,
+                ),
+                timeout=5,
+            )
+        assert result["schedule"]["final_state"] == VideoScheduleState.CLOSED.value
+    finally:
+        release_dispatch.set()
+    await asyncio.wait_for(dispatcher, timeout=5)
+
+    async with factory() as db:
+        stored_job = await db.get(Job, job_id)
+        stored_downstream = await db.get(NodeExecution, downstream_id)
+    assert stored_job is not None and stored_job.status == JobStatus.CANCELLED
+    assert stored_downstream is not None and stored_downstream.status == NodeStatus.CANCELLED
+    assert redis.dispatches == []
+
+
+async def test_quarantine_first_blocks_youtube_submission_fence(postgres_race_db):
+    engine, factory = postgres_race_db
+    channel_id, task_id, job_id, node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.RUNNING,
+        job_status=JobStatus.RUNNING,
+    )
+    context = UploadOperationContext(
+        job_id=job_id,
+        node_execution_id=node_id,
+        input_artifact_id=uuid.uuid4(),
+        content_sha256="a" * 64,
+        title="quarantine-first fence",
+        privacy="unlisted",
+    )
+    store = YouTubeUploadOperationStore(factory)
+    submissions: list[str] = []
+
+    async def guarded_submission() -> None:
+        async with store.submission_fence(context):
+            submissions.append("posted")
+
+    blocker = factory()
+    submission = None
+    try:
+        await _stage_worker_quarantine(
+            blocker,
+            channel_id=channel_id,
+            task_id=task_id,
+            job_id=job_id,
+            node_id=node_id,
+        )
+        submission = asyncio.create_task(guarded_submission())
+        await _wait_until_lock_wait(engine, "channel_profiles", submission)
+        await blocker.commit()
+        with pytest.raises(JobExecutionAuthorityBlocked):
+            await asyncio.wait_for(submission, timeout=5)
+    finally:
+        if blocker.in_transaction():
+            await blocker.rollback()
+        await blocker.close()
+        if submission is not None and not submission.done():
+            submission.cancel()
+        if submission is not None:
+            await asyncio.wait_for(asyncio.gather(submission, return_exceptions=True), timeout=5)
+
+    assert submissions == []
+
+
+async def test_youtube_submission_fence_makes_quarantine_wait(postgres_race_db):
+    engine, factory = postgres_race_db
+    channel_id, task_id, job_id, node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.RUNNING,
+        job_status=JobStatus.RUNNING,
+    )
+    context = UploadOperationContext(
+        job_id=job_id,
+        node_execution_id=node_id,
+        input_artifact_id=uuid.uuid4(),
+        content_sha256="b" * 64,
+        title="submission-first fence",
+        privacy="unlisted",
+    )
+    store = YouTubeUploadOperationStore(factory)
+    submission_started = asyncio.Event()
+    release_submission = asyncio.Event()
+    submissions: list[str] = []
+
+    async def guarded_submission() -> None:
+        async with store.submission_fence(context):
+            submission_started.set()
+            await release_submission.wait()
+            submissions.append("posted")
+
+    async def apply_quarantine():
+        async with factory() as db:
+            return await quarantine_channelops_backlog(
+                db,
+                channel_id,
+                apply=True,
+                close_schedule=True,
+            )
+
+    submission = asyncio.create_task(guarded_submission())
+    quarantine = None
+    try:
+        await asyncio.wait_for(submission_started.wait(), timeout=5)
+        quarantine = asyncio.create_task(apply_quarantine())
+        await _wait_until_lock_wait(engine, "channel_profiles", quarantine)
+        assert not quarantine.done()
+    finally:
+        release_submission.set()
+        await asyncio.wait_for(asyncio.gather(submission, return_exceptions=True), timeout=5)
+        if quarantine is not None:
+            await asyncio.wait_for(asyncio.gather(quarantine, return_exceptions=True), timeout=5)
+
+    assert submission.exception() is None
+    assert quarantine is not None and quarantine.exception() is None
+    assert submissions == ["posted"]
+    async with factory() as db:
+        stored_job = await db.get(Job, job_id)
+        stored_node = await db.get(NodeExecution, node_id)
+    assert stored_job is not None and stored_job.status == JobStatus.CANCELLED
+    assert stored_node is not None and stored_node.status == NodeStatus.CANCELLED
 
 
 async def _seed_review_release(factory) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
@@ -446,6 +1035,101 @@ async def test_quarantine_after_running_commit_prevents_stale_initial_dispatch(
     assert stored_node is not None and stored_node.status == NodeStatus.CANCELLED
     assert stored_schedule is not None and stored_schedule.state == VideoScheduleState.CLOSED.value
     assert redis.dispatches == []
+
+
+async def test_initial_start_locks_channel_before_mutating_job(
+    postgres_race_db,
+    monkeypatch,
+):
+    engine, factory = postgres_race_db
+    definition = {
+        "nodes": [
+            {
+                "id": "trim_1",
+                "type": "trim",
+                "position": {"x": 0, "y": 0},
+                "data": {"label": "Trim", "config": {"start_time": 0, "end_time": 1}},
+            }
+        ],
+        "edges": [],
+    }
+    async with factory() as db:
+        channel = ChannelProfile(name="initial lock order", enabled=True, dry_run=False)
+        schedule = RuntimeSchedule(
+            service_name=VIDEO_SCHEDULE_SERVICE,
+            state=VideoScheduleState.OPEN.value,
+            updated_by="initial-lock-order-test",
+        )
+        pipeline = Pipeline(name="initial lock order", description="", definition=definition)
+        db.add_all([channel, schedule, pipeline])
+        await db.flush()
+        account = PublishingAccount(
+            channel_profile_id=channel.id,
+            account_label="initial lock order",
+            credential_ref="youtube/initial-lock-order",
+            default_privacy="unlisted",
+        )
+        job = Job(
+            pipeline_id=pipeline.id,
+            pipeline_snapshot=definition,
+            status=JobStatus.PENDING,
+            orchestrator_owner="python",
+        )
+        db.add_all([account, job])
+        await db.flush()
+        node = NodeExecution(
+            job_id=job.id,
+            node_id="trim_1",
+            node_type="trim",
+            node_label="Trim",
+            node_config={"start_time": 0, "end_time": 1},
+            status=NodeStatus.PENDING,
+        )
+        task = ProductionTask(
+            channel_profile_id=channel.id,
+            target_account_id=account.id,
+            prompt="initial lock order",
+            state="producing",
+            job_id=job.id,
+            channel_config_snapshot_json={},
+        )
+        db.add_all([node, task])
+        await db.commit()
+        channel_id = channel.id
+        job_id = job.id
+
+    class RecordingRedis:
+        def __init__(self) -> None:
+            self.dispatches: list[tuple[str, dict]] = []
+
+        async def xadd(self, stream_key: str, payload: dict) -> None:
+            self.dispatches.append((stream_key, payload))
+
+        async def aclose(self) -> None:
+            return None
+
+    redis = RecordingRedis()
+    monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
+    monkeypatch.setattr("app.orchestrator.engine._redis", lambda: redis)
+
+    blocker = factory()
+    starter = None
+    try:
+        await blocker.execute(
+            select(ChannelProfile).where(ChannelProfile.id == channel_id).with_for_update()
+        )
+        starter = asyncio.create_task(JobEngine().start_job(job_id))
+        await _wait_until_lock_wait(engine, "channel_profiles", starter)
+
+        async with factory() as observer:
+            stored_job = await observer.get(Job, job_id)
+        assert stored_job is not None and stored_job.status == JobStatus.PENDING
+        assert redis.dispatches == []
+    finally:
+        await blocker.rollback()
+        await blocker.close()
+        if starter is not None:
+            await asyncio.wait_for(asyncio.gather(starter, return_exceptions=True), timeout=5)
 
 
 async def test_quarantine_between_initial_roots_does_not_revive_second_root(

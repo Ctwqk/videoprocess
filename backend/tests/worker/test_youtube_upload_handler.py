@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import stat
 import uuid
@@ -52,6 +53,8 @@ class FakeOperationStore:
         self.uncertain: list[tuple[uuid.UUID, str]] = []
         self.mark_submitted_started: asyncio.Event | None = None
         self.mark_submitted_continue: asyncio.Event | None = None
+        self.submission_fence_contexts: list[object] = []
+        self.submission_fence_active = False
 
     async def claim(self, context):
         self.claim_contexts.append(context)
@@ -59,6 +62,16 @@ class FakeOperationStore:
             self.operation.content_sha256 = context.content_sha256
         action = self._actions.pop(0)
         return UploadOperationClaim(action=action, operation=self.operation)
+
+    @contextlib.asynccontextmanager
+    async def submission_fence(self, context):
+        self.submission_fence_contexts.append(context)
+        assert not self.submission_fence_active
+        self.submission_fence_active = True
+        try:
+            yield
+        finally:
+            self.submission_fence_active = False
 
     async def mark_submitted(self, operation_id: uuid.UUID, manager_task_id: str):
         if self.mark_submitted_started is not None:
@@ -584,6 +597,38 @@ async def test_cancellation_during_preflight_prevents_upload_post(media_paths):
     assert store.submitted == []
     assert store.uncertain == []
     assert not Path(output_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_submission_fence_wraps_only_irreversible_upload_post(media_paths):
+    store = FakeOperationStore(["submit"])
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            assert not store.submission_fence_active
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            assert store.submission_fence_active
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID, "status": "pending"})
+        if request.method == "GET" and request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            assert not store.submission_fence_active
+            return httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "result": {
+                        "video_id": "video-123",
+                        "url": "https://www.youtube.com/watch?v=video-123",
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        await make_handler(store, client).execute(upload_config(), input_paths, output_path)
+
+    assert store.submission_fence_contexts == store.claim_contexts
 
 
 @pytest.mark.asyncio

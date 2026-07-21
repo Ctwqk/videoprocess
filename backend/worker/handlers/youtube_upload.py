@@ -110,15 +110,17 @@ class YouTubeUploadHandler(BaseHandler):
                 if claim.action == "submit":
                     await self._preflight_submission(claim.operation, client)
                     self._raise_if_cancelled()
-                    manager_task_id = await self._submit_upload(
-                        claim.operation,
-                        client,
-                        input_file=snapshot_path,
-                        title=title,
-                        description=description,
-                        tags=tags,
-                        privacy=privacy,
-                    )
+                    async with self._operation_store.submission_fence(context):
+                        self._raise_if_cancelled()
+                        manager_task_id = await self._submit_upload(
+                            claim.operation,
+                            client,
+                            input_file=snapshot_path,
+                            title=title,
+                            description=description,
+                            tags=tags,
+                            privacy=privacy,
+                        )
                 else:
                     resumed_manager_task_id = self._require_canonical_manager_task_id(
                         getattr(claim.operation, "manager_task_id", None)

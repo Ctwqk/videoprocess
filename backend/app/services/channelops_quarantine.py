@@ -110,7 +110,11 @@ async def quarantine_channelops_backlog(
         retained_tasks = [task for task in tasks if task.id not in changed_task_ids]
 
         linked_job_ids = {task.job_id for task in tasks if task.job_id is not None}
-        protected_job_ids = {task.job_id for task in retained_tasks if task.job_id is not None}
+        protected_job_ids = {
+            task.job_id
+            for task in retained_tasks
+            if task.job_id is not None and not _already_quarantined(task, reason)
+        }
         jobs = await _jobs_by_id(db, linked_job_ids, apply=apply)
         changed_jobs = [
             job
@@ -121,10 +125,11 @@ async def quarantine_channelops_backlog(
         retained_jobs = [job for job in jobs if job.id not in changed_job_ids]
 
         nodes = await _nodes_for_jobs(db, linked_job_ids, apply=apply)
+        repairable_job_ids = linked_job_ids - protected_job_ids
         changed_nodes = [
             node
             for node in nodes
-            if node.job_id in changed_job_ids and node.status in _NONTERMINAL_NODE_STATUSES
+            if node.job_id in repairable_job_ids and node.status in _NONTERMINAL_NODE_STATUSES
         ]
         changed_node_ids = {node.id for node in changed_nodes}
         retained_nodes = [node for node in nodes if node.id not in changed_node_ids]

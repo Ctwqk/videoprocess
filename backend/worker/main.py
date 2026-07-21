@@ -22,6 +22,11 @@ from sqlalchemy.ext.asyncio import (
 from app.config import settings
 from app.models.artifact import Artifact, ArtifactKind
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.services.job_execution_authority import (
+    JobExecutionAuthorityBlocked,
+    lock_job_execution_authority,
+    require_active_execution_authority,
+)
 from app.services.worker_admission import (
     WorkerAdmissionError,
     enforce_worker_admission_from_env,
@@ -137,6 +142,52 @@ async def _load_cancel_state(node_execution_id: str) -> CancelState:
         )
 
 
+async def _claim_node_execution(
+    job_id: str,
+    node_execution_id: str,
+    *,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> bool:
+    """Atomically claim a queued node under durable execution authority."""
+
+    try:
+        resolved_job_id = uuid.UUID(job_id)
+        resolved_node_id = uuid.UUID(node_execution_id)
+    except ValueError:
+        logger.error("Invalid worker execution ids job=%s node=%s", job_id, node_execution_id)
+        return False
+
+    factory = session_factory or get_worker_session()
+    async with factory() as db:
+        try:
+            async with db.begin():
+                authority = await lock_job_execution_authority(
+                    db,
+                    resolved_job_id,
+                    node_execution_id=resolved_node_id,
+                )
+                node = authority.node
+                assert node is not None
+                require_active_execution_authority(
+                    authority,
+                    job_statuses={JobStatus.RUNNING},
+                    node_statuses={NodeStatus.QUEUED},
+                )
+                node.status = NodeStatus.RUNNING
+                node.started_at = datetime.utcnow()
+                node.worker_id = WORKER_ID
+            return True
+        except JobExecutionAuthorityBlocked as exc:
+            await db.rollback()
+            logger.info(
+                "Skipping stale worker delivery job=%s node=%s: %s",
+                job_id,
+                node_execution_id,
+                exc,
+            )
+            return False
+
+
 async def process_task(data: dict) -> None:
     """Process a single node execution task."""
     job_id = data["job_id"]
@@ -146,6 +197,9 @@ async def process_task(data: dict) -> None:
     input_artifacts_map = json.loads(data.get("input_artifacts", "{}"))
 
     logger.info(f"Processing node {data['node_id']} (type={node_type}) for job {job_id}")
+
+    if not await _claim_node_execution(job_id, node_execution_id):
+        return
 
     # Get handler
     handler_cls = HANDLER_MAP.get(node_type)
@@ -167,25 +221,6 @@ async def process_task(data: dict) -> None:
         config["_job_id"] = job_id
         config["_node_execution_id"] = node_execution_id
         config["_input_artifact_ids"] = dict(input_artifacts_map)
-
-    # Check if cancelled before starting, then update status to RUNNING
-    cancel_state = await _load_cancel_state(node_execution_id)
-    if cancel_state.is_cancelled:
-        logger.info(
-            "Skipping node %s for job %s before start: %s",
-            data["node_id"],
-            job_id,
-            cancel_state.cancel_reason,
-        )
-        return
-
-    async with get_worker_session()() as db:
-        ne = await db.get(NodeExecution, uuid.UUID(node_execution_id))
-        if ne:
-            ne.status = NodeStatus.RUNNING
-            ne.started_at = datetime.utcnow()
-            ne.worker_id = WORKER_ID
-            await db.commit()
 
     handler: BaseHandler
     if node_type == "youtube_upload":

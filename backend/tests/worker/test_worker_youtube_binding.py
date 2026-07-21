@@ -73,9 +73,13 @@ class WorkerHarness:
         async def report_failure(_job_id: str, _node_execution_id: str, error: str) -> None:
             harness.failures.append(error)
 
+        async def claim_node(*args, **kwargs) -> bool:
+            return True
+
         monkeypatch.setattr(worker_main, "HANDLER_MAP", {"youtube_upload": object})
         monkeypatch.setattr(worker_main, "YouTubeUploadHandler", YouTubeHandler)
         monkeypatch.setattr(worker_main, "get_worker_session", lambda: process_session_factory)
+        monkeypatch.setattr(worker_main, "_claim_node_execution", claim_node)
         monkeypatch.setattr(worker_main, "_load_cancel_state", not_cancelled)
         monkeypatch.setattr(worker_main, "_report_success", report_success)
         monkeypatch.setattr(worker_main, "_report_failure", report_failure)

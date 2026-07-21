@@ -166,6 +166,9 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
     async def report_success(*args) -> None:
         return None
 
+    async def claim_node(*args, **kwargs) -> bool:
+        return True
+
     monkeypatch.setattr(
         worker_main,
         "HANDLER_MAP",
@@ -173,6 +176,7 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
     )
     monkeypatch.setattr(worker_main, "YouTubeUploadHandler", YouTubeHandler)
     monkeypatch.setattr(worker_main, "get_worker_session", lambda: process_session_factory)
+    monkeypatch.setattr(worker_main, "_claim_node_execution", claim_node)
     monkeypatch.setattr(worker_main, "_load_cancel_state", not_cancelled)
     monkeypatch.setattr(worker_main, "get_storage", lambda _backend: LocalStorage())
     monkeypatch.setattr(worker_main, "_report_success", report_success)

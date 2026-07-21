@@ -7,9 +7,7 @@ from collections import Counter
 from datetime import datetime
 
 import redis.asyncio as aioredis
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db import async_session
@@ -23,8 +21,12 @@ from app.orchestrator.dag import topological_sort, build_dependency_map
 from app.services.schedule_service import (
     VideoScheduleState,
     default_video_schedule_state,
-    get_or_create_and_lock_runtime_schedule,
     should_defer_job_start,
+)
+from app.services.job_execution_authority import (
+    JobExecutionAuthorityBlocked,
+    lock_job_execution_authority,
+    require_active_execution_authority,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,43 +109,8 @@ class JobEngine:
     async def start_job(self, job_id: uuid.UUID) -> None:
         """Start executing a job: validate, plan, and dispatch root nodes."""
         async with async_session() as db:
-            schedule, _created = await get_or_create_and_lock_runtime_schedule(db)
-            job = (
-                await db.execute(
-                    select(Job)
-                    .where(Job.id == job_id)
-                    .options(selectinload(Job.node_executions))
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            ).scalar_one_or_none()
-            if not job:
-                logger.error(f"Job {job_id} not found")
-                await db.rollback()
-                return
-            if job.status in {
-                JobStatus.SUCCEEDED,
-                JobStatus.FAILED,
-                JobStatus.CANCELLED,
-                JobStatus.PARTIALLY_FAILED,
-            }:
-                await db.rollback()
-                return
-
-            try:
-                schedule_state = VideoScheduleState(schedule.state)
-            except ValueError:
-                schedule_state = default_video_schedule_state()
-            if should_defer_job_start(job, schedule_state):
-                job.status = JobStatus.WAITING_WINDOW
-                job.error_message = None
-                job.completed_at = None
-                await db.commit()
-                logger.info(
-                    "Deferred job %s until next video window (state=%s)",
-                    job_id,
-                    schedule_state.value,
-                )
+            job = await self._lock_initial_launch_authority(db, job_id)
+            if job is None:
                 return
 
             try:
@@ -198,34 +165,39 @@ class JobEngine:
     ) -> None:
         return None
 
+    async def _before_node_dispatch_recheck(
+        self,
+        job_id: uuid.UUID,
+        node_id: str,
+    ) -> None:
+        return None
+
     async def _lock_initial_launch_authority(
         self,
         db: AsyncSession,
         job_id: uuid.UUID,
     ) -> Job | None:
-        schedule, _created = await get_or_create_and_lock_runtime_schedule(db)
-        job = (
-            await db.execute(
-                select(Job)
-                .where(Job.id == job_id)
-                .options(selectinload(Job.node_executions))
-                .with_for_update()
-                .execution_options(populate_existing=True)
+        try:
+            authority = await lock_job_execution_authority(
+                db,
+                job_id,
+                lock_all_nodes=True,
             )
-        ).scalar_one_or_none()
-        if job is None:
+        except JobExecutionAuthorityBlocked as exc:
+            await db.rollback()
+            logger.info("Blocking initial launch for job=%s: %s", job_id, exc)
+            return None
+
+        job = authority.job
+        schedule = authority.schedule
+        if authority.channel is not None and (
+            not authority.channel.enabled or authority.channel.halted_at is not None
+        ):
             await db.rollback()
             return None
-        (
-            await db.execute(
-                select(NodeExecution)
-                .where(NodeExecution.job_id == job_id)
-                .order_by(NodeExecution.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalars().all()
-        await db.refresh(job, attribute_names=["node_executions"])
+        if authority.task is not None and authority.task.state != "producing":
+            await db.rollback()
+            return None
         if job.status in {
             JobStatus.SUCCEEDED,
             JobStatus.FAILED,
@@ -253,6 +225,11 @@ class JobEngine:
             job.error_message = None
             job.completed_at = None
             await db.commit()
+            logger.info(
+                "Deferred job %s until next video window (state=%s)",
+                job_id,
+                schedule_state.value,
+            )
             return None
         return job
 
@@ -372,11 +349,11 @@ class JobEngine:
                 ]
                 await db.commit()
 
-                if guard_initial_launch:
-                    locked = await self._lock_initial_dispatch_authority(db, job.id, ne.id)
-                    if locked is None:
-                        continue
-                    job, ne = locked
+                await self._before_node_dispatch_recheck(job.id, ne.node_id)
+                locked = await self._lock_dispatch_authority(db, job.id, ne.id)
+                if locked is None:
+                    return
+                job, ne = locked
 
                 # Determine worker_type from node registry
                 registry = NodeTypeRegistry.get()
@@ -397,8 +374,7 @@ class JobEngine:
                 }
                 stream_key = TASK_STREAM.format(worker_type=worker_type)
                 await r.xadd(stream_key, task)
-                if guard_initial_launch:
-                    await db.commit()
+                await db.commit()
                 logger.info(
                     "Dispatched node %s (type=%s) to %s for job %s with preferred_hosts=%s",
                     ne.node_id, ne.node_type, stream_key, job.id, preferred_hosts,
@@ -407,23 +383,28 @@ class JobEngine:
             await r.aclose()
         await self._maybe_finalize_job(db, job)
 
-    async def _lock_initial_dispatch_authority(
+    async def _lock_dispatch_authority(
         self,
         db: AsyncSession,
         job_id: uuid.UUID,
         node_execution_id: uuid.UUID,
     ) -> tuple[Job, NodeExecution] | None:
-        job = await self._lock_initial_launch_authority(db, job_id)
-        if job is None:
-            return None
-        node = next(
-            (item for item in job.node_executions if item.id == node_execution_id),
-            None,
-        )
-        if node is None or job.status != JobStatus.RUNNING or node.status != NodeStatus.QUEUED:
+        try:
+            authority = await lock_job_execution_authority(
+                db,
+                job_id,
+                node_execution_id=node_execution_id,
+            )
+            require_active_execution_authority(
+                authority,
+                job_statuses={JobStatus.RUNNING},
+                node_statuses={NodeStatus.QUEUED},
+            )
+        except JobExecutionAuthorityBlocked:
             await db.rollback()
             return None
-        return job, node
+        assert authority.node is not None
+        return authority.job, authority.node
 
     async def _apply_cached_artifact_if_available(
         self,
@@ -546,18 +527,24 @@ class JobEngine:
     ) -> None:
         """Handle a node completion event: update status, dispatch downstream."""
         async with async_session() as db:
-            job = await db.get(Job, job_id, options=[selectinload(Job.node_executions)])
-            if not job:
+            try:
+                authority = await lock_job_execution_authority(
+                    db,
+                    job_id,
+                    node_execution_id=node_execution_id,
+                )
+                require_active_execution_authority(
+                    authority,
+                    job_statuses={JobStatus.RUNNING},
+                    node_statuses={NodeStatus.RUNNING},
+                )
+            except JobExecutionAuthorityBlocked as exc:
+                await db.rollback()
+                logger.info("Ignoring stale node completion job=%s node=%s: %s", job_id, node_execution_id, exc)
                 return
-
-            # If job was cancelled, ignore the completion event
-            if job.status == JobStatus.CANCELLED:
-                logger.info(f"Job {job_id} cancelled, ignoring node completion")
-                return
-
-            ne = next((n for n in job.node_executions if n.id == node_execution_id), None)
-            if not ne:
-                return
+            job = authority.job
+            ne = authority.node
+            assert ne is not None
 
             ne.status = NodeStatus.SUCCEEDED
             ne.output_artifact_id = output_artifact_id
@@ -575,6 +562,28 @@ class JobEngine:
                     ne.node_id,
                 )
 
+            try:
+                authority = await lock_job_execution_authority(
+                    db,
+                    job_id,
+                    node_execution_id=node_execution_id,
+                )
+                require_active_execution_authority(
+                    authority,
+                    job_statuses={JobStatus.RUNNING},
+                    node_statuses={NodeStatus.SUCCEEDED},
+                )
+            except JobExecutionAuthorityBlocked as exc:
+                await db.rollback()
+                logger.info(
+                    "Stopping post-completion dispatch job=%s node=%s: %s",
+                    job_id,
+                    node_execution_id,
+                    exc,
+                )
+                return
+            job = authority.job
+
             if await self._maybe_finalize_job(db, job):
                 return
 
@@ -587,18 +596,24 @@ class JobEngine:
     ) -> None:
         """Handle a node failure event."""
         async with async_session() as db:
-            job = await db.get(Job, job_id, options=[selectinload(Job.node_executions)])
-            if not job:
+            try:
+                authority = await lock_job_execution_authority(
+                    db,
+                    job_id,
+                    node_execution_id=node_execution_id,
+                )
+                require_active_execution_authority(
+                    authority,
+                    job_statuses={JobStatus.RUNNING},
+                    node_statuses={NodeStatus.RUNNING},
+                )
+            except JobExecutionAuthorityBlocked as exc:
+                await db.rollback()
+                logger.info("Ignoring stale node failure job=%s node=%s: %s", job_id, node_execution_id, exc)
                 return
-
-            # If job was cancelled, ignore the failure event
-            if job.status == JobStatus.CANCELLED:
-                logger.info(f"Job {job_id} cancelled, ignoring node failure")
-                return
-
-            ne = next((n for n in job.node_executions if n.id == node_execution_id), None)
-            if not ne:
-                return
+            job = authority.job
+            ne = authority.node
+            assert ne is not None
 
             # Basic retry: retry once
             if ne.retry_count < 1:
@@ -607,6 +622,30 @@ class JobEngine:
                 ne.error_message = None
                 ne.queued_at = datetime.utcnow()
                 await db.commit()
+
+                try:
+                    authority = await lock_job_execution_authority(
+                        db,
+                        job_id,
+                        node_execution_id=node_execution_id,
+                    )
+                    require_active_execution_authority(
+                        authority,
+                        job_statuses={JobStatus.RUNNING},
+                        node_statuses={NodeStatus.QUEUED},
+                    )
+                except JobExecutionAuthorityBlocked as exc:
+                    await db.rollback()
+                    logger.info(
+                        "Stopping stale node retry job=%s node=%s: %s",
+                        job_id,
+                        node_execution_id,
+                        exc,
+                    )
+                    return
+                job = authority.job
+                ne = authority.node
+                assert ne is not None
 
                 # Re-dispatch
                 r = _redis()
@@ -642,6 +681,7 @@ class JobEngine:
                     await r.xadd(stream_key, task)
                 finally:
                     await r.aclose()
+                await db.commit()
                 logger.info(f"Retrying node {ne.node_id} for job {job_id} (attempt {ne.retry_count})")
                 return
 

@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import math
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.channel_agent import ProductionTask
+from app.models.job import JobStatus, NodeStatus
 from app.models.youtube_upload_operation import YouTubeUploadOperation
+from app.services.job_execution_authority import (
+    lock_job_execution_authority,
+    require_active_execution_authority,
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,27 @@ class UploadOperationConflictError(RuntimeError):
 class YouTubeUploadOperationStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+
+    @asynccontextmanager
+    async def submission_fence(
+        self,
+        context: UploadOperationContext,
+    ) -> AsyncIterator[None]:
+        """Hold durable execution authority across the irreversible upload POST."""
+
+        async with self._session_factory() as db:
+            async with db.begin():
+                authority = await lock_job_execution_authority(
+                    db,
+                    context.job_id,
+                    node_execution_id=context.node_execution_id,
+                )
+                require_active_execution_authority(
+                    authority,
+                    job_statuses={JobStatus.RUNNING},
+                    node_statuses={NodeStatus.RUNNING},
+                )
+                yield
 
     async def claim(self, context: UploadOperationContext) -> UploadOperationClaim:
         async with self._session_factory() as db:
