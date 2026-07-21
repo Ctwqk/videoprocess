@@ -36,7 +36,7 @@
 - Valid stages: `1h`, `6h`, `24h`, `72h`, `7d`.
 - Valid statuses: `pending`, `succeeded`, `expired`.
 
-- [ ] **Step 1: Add failing ORM contract tests**
+- [x] **Step 1: Add failing ORM contract tests**
 
 Add assertions for model defaults and table constraints:
 
@@ -57,7 +57,7 @@ assert {column.name for column in PublicationMetricSchedule.__table__.columns} >
 }
 ```
 
-- [ ] **Step 2: Run the focused model test and verify RED**
+- [x] **Step 2: Run the focused model test and verify RED**
 
 Run:
 
@@ -68,7 +68,7 @@ cd backend
 
 Expected: import or attribute failure because `PublicationMetricSchedule` does not exist.
 
-- [ ] **Step 3: Add the ORM model**
+- [x] **Step 3: Add the ORM model**
 
 Use this contract:
 
@@ -91,7 +91,7 @@ columns for schedule times, JSON for `available_fields_json`, and safe Python
 defaults plus matching migration server defaults for `status`, attempts, and
 available fields.
 
-- [ ] **Step 4: Add a failing PostgreSQL migration test**
+- [x] **Step 4: Add a failing PostgreSQL migration test**
 
 The test must run upgrade to `028_channelops_metric_schedules`, assert all
 columns/checks/indexes, reject an invalid stage/status and a duplicate
@@ -106,7 +106,7 @@ WHERE idempotency_key LIKE 'collect_metrics:%:stage:%';
 Both counts must remain zero for historical rows seeded before the upgrade.
 Then run downgrade to `027_publication_promotion_operations` and upgrade again.
 
-- [ ] **Step 5: Implement migration 028 and pass focused tests**
+- [x] **Step 5: Implement migration 028 and pass focused tests**
 
 Run:
 
@@ -122,7 +122,7 @@ Expected: all selected tests pass; environments without the configured
 PostgreSQL migration fixture may skip only through the repository's existing
 fixture policy.
 
-- [ ] **Step 6: Commit schema work**
+- [x] **Step 6: Commit schema work**
 
 ```bash
 git add backend/alembic/versions/028_channelops_metric_schedules.py \

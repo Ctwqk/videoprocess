@@ -3,7 +3,19 @@ from __future__ import annotations
 import uuid as uuid_mod
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -312,6 +324,45 @@ class PublicationRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     quota_units_estimated: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_metrics_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     warnings_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+
+
+class PublicationMetricSchedule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "publication_metric_schedules"
+    __table_args__ = (
+        UniqueConstraint(
+            "publication_id",
+            "snapshot_stage",
+            name="uq_metric_schedule_publication_stage",
+        ),
+        CheckConstraint(
+            "snapshot_stage IN ('1h','6h','24h','72h','7d')",
+            name="ck_metric_schedule_stage",
+        ),
+        CheckConstraint(
+            "status IN ('pending','succeeded','expired')",
+            name="ck_metric_schedule_status",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_metric_schedule_attempt_count"),
+        CheckConstraint("due_at >= effective_start_at", name="ck_metric_schedule_due_order"),
+        CheckConstraint("grace_until >= due_at", name="ck_metric_schedule_grace_order"),
+        Index("ix_metric_schedules_status_due", "status", "due_at"),
+    )
+
+    publication_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("publication_records.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    snapshot_stage: Mapped[str] = mapped_column(String(16), nullable=False)
+    effective_start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    grace_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    available_fields_json: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class TakedownEvent(UUIDPrimaryKeyMixin, Base):

@@ -20,6 +20,7 @@ from app.models.channel_agent import (
     ManualSeed,
     MaterialUsageLedger,
     ProductionTask,
+    PublicationMetricSchedule,
     PublicationRecord,
     PublishingAccount,
     TakedownEvent,
@@ -60,6 +61,37 @@ def test_agent_tick_audit_has_channel_tick_uniqueness_constraint():
 def test_feedback_snapshot_completeness_columns_exist():
     assert "metrics_completeness_score" in FeedbackSnapshot.__table__.columns
     assert "available_fields_json" in FeedbackSnapshot.__table__.columns
+
+
+def test_publication_metric_schedule_contract():
+    table = PublicationMetricSchedule.__table__
+
+    assert {column.name for column in table.columns} >= {
+        "publication_id",
+        "snapshot_stage",
+        "effective_start_at",
+        "due_at",
+        "grace_until",
+        "status",
+        "attempt_count",
+        "last_attempt_at",
+        "completed_at",
+        "available_fields_json",
+        "last_error_code",
+    }
+    assert {constraint.name for constraint in table.constraints} >= {
+        "uq_metric_schedule_publication_stage",
+        "ck_metric_schedule_stage",
+        "ck_metric_schedule_status",
+        "ck_metric_schedule_attempt_count",
+        "ck_metric_schedule_due_order",
+        "ck_metric_schedule_grace_order",
+    }
+    assert {index.name for index in table.indexes} >= {"ix_metric_schedules_status_due"}
+    assert table.c.status.default.arg == "pending"
+    assert table.c.attempt_count.default.arg == 0
+    default_factory = table.c.available_fields_json.default.arg
+    assert default_factory.__wrapped__() == []
 
 
 def test_takedown_event_has_dedup_lookup_index():
