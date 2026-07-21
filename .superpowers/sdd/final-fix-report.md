@@ -1067,3 +1067,81 @@ occurred.
   checked-in backend virtualenv supplied the authoritative full backend and
   static-check runs. Deployed-image smoke remains intentionally unrun before a
   natural deployment.
+
+## Final Review 8 Cleanup Path Coverage Fix Wave
+
+### Status And Scope
+
+`DONE_WITH_CONCERNS`. Work started from clean
+`d1bce62661df1ed8376b90cc78dd64c74c24a560` on
+`codex/channelops-soak-guard` in the required worktree. The focused
+implementation/test commit is `ea11a6c` (`test: cover channelops timeout
+cleanup paths`). This report is committed separately.
+
+No production, SSH, deploy, push, activation, upload, publication, external
+platform call, host 126 access, or root plan edit occurred. The change touches
+only test harness and regression files; no production runtime code changed.
+
+### TDD Evidence And Cleanup Sequence
+
+- RED, before the combined helper existed:
+  `go test ./internal/channelops -run 'TestCancellableTestOperationTimeout(CancelsAndDrainsBeforeReturning|MarksFixtureCleanupIneligibleWhenUndrained)$' -count=1 -v`
+  failed to build with missing `waitOrCancelAndDrain` and
+  `fixtureCleanupEligible` symbols.
+- GREEN after the smallest helper change:
+  `go test ./internal/channelops -run 'TestCancellableTestOperation(CancelsAndDrains|TimeoutCancelsAndDrainsBeforeReturning|TimeoutMarksFixtureCleanupIneligibleWhenUndrained)$' -count=1 -v`
+  passed all three tests. The cooperative case blocks during the initial wait,
+  observes cancellation, and is drained before the timeout diagnostic returns.
+  The cancellation-ignoring case consumes both the 30ms wait and 50ms drain
+  bounds, makes fixture cleanup ineligible, then explicitly releases and drains
+  its synthetic operation so the unit test leaks nothing.
+- `waitOrCancelAndDrain` returns an ordinary operation result on normal
+  completion. On the initial timeout it releases the blocker, cancels the
+  operation, drains with the independent bound, then returns the initial-timeout
+  diagnostic. A drain timeout sets the operation's permanent unsafe state;
+  `fixtureCleanupEligible` rejects fixture cleanup after that state.
+- The three reviewed PostgreSQL races now use the combined helper for their
+  success waits, so cancellation and bounded draining occur before a timeout
+  can reach `t.Fatal`. The stored unused operation context was removed. Lock
+  waiters now accept a typed completion-probe callback: legacy completion
+  channels are explicitly adapted and cancellable operations pass `tryWait`.
+  The `any`/unsupported-type panic adapter is gone.
+- In the two-root Python regression, the `try/finally` now begins immediately
+  after starter task creation and covers the initial event wait, root-A
+  assertion, and real bounded quarantine transaction. Every exit releases the
+  starter and awaits it through `asyncio.wait_for(..., timeout=5)`, whose timeout
+  cancels and awaits the starter task.
+
+### Verification And Cleanup
+
+- PostgreSQL `16.14` ran in isolated disposable container
+  `vp-final-review-8-postgres` (`796f628b95a5e27e6a816f8a11884a065611f8edbb9d4874354e0b0dd7c31f7f`),
+  bound only to `127.0.0.1:55434`. An empty database was migrated through
+  `026_autoflow_authority_fence (head)`, then recreated from empty and migrated
+  again before final Go verification.
+- The three reviewed PostgreSQL Go races passed. Full
+  `DATABASE_URL=... go test ./internal/channelops -count=1` passed in 5.005s;
+  migration-head `DATABASE_URL=... go test ./... -count=1` passed.
+- The two-root Python PostgreSQL regression passed 10 consecutive runs. The
+  full operator-quarantine PostgreSQL file passed `6 passed, 3 warnings`; the
+  Final Review 5-7 PostgreSQL acceptance set passed `59 passed, 3 warnings`.
+- Full backend passed `641 passed, 27 skipped, 11 warnings` in 65.21s.
+  Changed-file Ruff passed. Full Ruff retains 17 pre-existing findings and
+  mypy retains 66 pre-existing errors in 24 files.
+- Watcher and deploy contracts passed; required Bash syntax checks,
+  `gofmt -l internal/channelops/integration_test.go`, and `git diff --check`
+  were clean. Frontend `npm install`, build, and lint completed. Build emitted
+  existing Lightning CSS, chunk-size, and dependency-audit warnings.
+- The disposable container was removed with `docker rm -f`, and an exact-name
+  `docker ps -a` check confirmed `vp-final-review-8-postgres` is absent.
+
+### Changed Paths
+
+- `internal/channelops/integration_test.go`
+- `backend/tests/channel_agent/test_operator_quarantine_postgres.py`
+
+### Concerns
+
+- Full Ruff and mypy retain the documented pre-existing 17/66 baselines.
+- Existing Python deprecation warnings and frontend build/audit warnings remain.
+- Deployed-image smoke remains intentionally unrun before natural deployment.
