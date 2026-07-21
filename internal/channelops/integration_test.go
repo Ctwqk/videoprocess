@@ -17,6 +17,166 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+func TestCancellableTestOperationCancelsAndDrains(t *testing.T) {
+	observedCancellation := make(chan struct{})
+	operation := startCancellableTestOperation(t, nil, func(ctx context.Context) error {
+		<-ctx.Done()
+		close(observedCancellation)
+		return ctx.Err()
+	})
+
+	started := time.Now()
+	result, err := operation.cancelAndDrain(100 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("cancel and drain: %v", err)
+	}
+	if !errors.Is(result, context.Canceled) {
+		t.Fatalf("operation result = %v, want context cancellation", result)
+	}
+	select {
+	case <-observedCancellation:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("blocked operation did not observe cancellation")
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("cancel and drain took %s, want bounded completion", elapsed)
+	}
+}
+
+const testOperationCleanupTimeout = 5 * time.Second
+
+type cancellableTestOperation struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan error
+	release func()
+
+	releaseOnce sync.Once
+	mu          sync.Mutex
+	finished    bool
+	result      error
+	drainTimed  bool
+}
+
+func startCancellableTestOperation(
+	t *testing.T,
+	release func(),
+	run func(context.Context) error,
+) *cancellableTestOperation {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	operation := &cancellableTestOperation{
+		ctx:     ctx,
+		cancel:  cancel,
+		done:    make(chan error, 1),
+		release: release,
+	}
+	t.Cleanup(func() {
+		if _, err := operation.cancelAndDrain(testOperationCleanupTimeout); err != nil {
+			t.Errorf("cancel and drain test operation: %v", err)
+		}
+	})
+	go func() { operation.done <- run(ctx) }()
+	return operation
+}
+
+func (o *cancellableTestOperation) cancelAndDrain(timeout time.Duration) (error, error) {
+	o.releaseBlocker()
+	o.cancel()
+	result, err := o.wait(timeout)
+	if err != nil {
+		o.mu.Lock()
+		o.drainTimed = true
+		o.mu.Unlock()
+	}
+	return result, err
+}
+
+func (o *cancellableTestOperation) releaseBlocker() {
+	o.releaseOnce.Do(func() {
+		if o.release != nil {
+			o.release()
+		}
+	})
+}
+
+func (o *cancellableTestOperation) tryWait() (bool, error) {
+	o.mu.Lock()
+	if o.finished {
+		result := o.result
+		o.mu.Unlock()
+		return true, result
+	}
+	o.mu.Unlock()
+
+	select {
+	case result := <-o.done:
+		o.recordResult(result)
+		return true, result
+	default:
+		return false, nil
+	}
+}
+
+func (o *cancellableTestOperation) wait(timeout time.Duration) (error, error) {
+	if done, result := o.tryWait(); done {
+		return result, nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case result := <-o.done:
+		o.recordResult(result)
+		return result, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("operation did not drain within %s", timeout)
+	}
+}
+
+func (o *cancellableTestOperation) recordResult(result error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.finished {
+		o.finished = true
+		o.result = result
+	}
+}
+
+func (o *cancellableTestOperation) drained() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.finished && !o.drainTimed
+}
+
+func registerBoundedFixtureCleanup(t *testing.T, fixture *ChannelOpsFixture, operations *[]*cancellableTestOperation) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, operation := range *operations {
+			if !operation.drained() {
+				t.Errorf("skipping fixture cleanup after an operation failed to drain")
+				return
+			}
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), testOperationCleanupTimeout)
+		defer cancel()
+		fixture.cleanup(cleanupCtx)
+		if cleanupCtx.Err() != nil {
+			t.Errorf("fixture cleanup exceeded %s: %v", testOperationCleanupTimeout, cleanupCtx.Err())
+			return
+		}
+		fixture.Store.Close()
+	})
+}
+
+func registerBoundedRollback(t *testing.T, tx pgx.Tx) {
+	t.Helper()
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), testOperationCleanupTimeout)
+		defer cancel()
+		_ = tx.Rollback(cleanupCtx)
+	})
+}
+
 func TestFakeLiveFlowReachesMeasured(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -443,7 +603,8 @@ func TestAutomaticOwnedPromotionRejectFirstPreventsPDSAndYouTube(t *testing.T) {
 	}
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)
-	defer fixture.Close(ctx)
+	var operations []*cancellableTestOperation
+	registerBoundedFixtureCleanup(t, fixture, &operations)
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
 	promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
@@ -461,7 +622,7 @@ func TestAutomaticOwnedPromotionRejectFirstPreventsPDSAndYouTube(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin plan rejection: %v", err)
 	}
-	defer rejectTx.Rollback(ctx)
+	registerBoundedRollback(t, rejectTx)
 	if _, err := rejectTx.Exec(ctx, `
 		UPDATE autoflow_plans
 		SET status = 'rejected', rejected_reason = 'automatic promotion rejection wins'
@@ -481,20 +642,21 @@ func TestAutomaticOwnedPromotionRejectFirstPreventsPDSAndYouTube(t *testing.T) {
 	handler := baseHandler
 	handler.PDS = &recordingPDS{recorder: recorder}
 	handler.YouTube = youtube
-	handleDone := make(chan error, 1)
-	go func() { handleDone <- handler.HandlePromotePublication(ctx, promote) }()
+	handleOperation := startCancellableTestOperation(t, nil, func(operationCtx context.Context) error {
+		return handler.HandlePromotePublication(operationCtx, promote)
+	})
+	operations = append(operations, handleOperation)
 
-	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, handleDone)
+	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, handleOperation)
 	if err := rejectTx.Commit(ctx); err != nil {
 		t.Fatalf("commit plan rejection: %v", err)
 	}
-	select {
-	case err := <-handleDone:
-		if err != nil {
-			t.Fatalf("automatic promotion after rejection: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for automatic promotion after rejection")
+	handleErr, err := handleOperation.wait(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handleErr != nil {
+		t.Fatalf("automatic promotion after rejection: %v", handleErr)
 	}
 	if recorder.pds.Load() != 0 || youtube.calls.Load() != 0 {
 		t.Fatalf("automatic promotion side effects pds/youtube = %d/%d, want 0/0", recorder.pds.Load(), youtube.calls.Load())
@@ -514,7 +676,8 @@ func TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites(t *testing.T) 
 	}
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)
-	defer fixture.Close(ctx)
+	var operations []*cancellableTestOperation
+	registerBoundedFixtureCleanup(t, fixture, &operations)
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
 	promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
@@ -527,67 +690,62 @@ func TestAutomaticOwnedPromotionHoldsPlanLockThroughDurableWrites(t *testing.T) 
 	handler := baseHandler
 	handler.PDS = &recordingPDS{recorder: recorder}
 	handler.YouTube = youtube
-	handleDone := make(chan error, 1)
-	go func() { handleDone <- handler.HandlePromotePublication(ctx, promote) }()
-	var releaseOnce sync.Once
-	handleFinished := false
-	defer func() {
-		releaseOnce.Do(func() { close(releaseYouTube) })
-		if handleFinished {
-			return
-		}
-		select {
-		case <-handleDone:
-		case <-time.After(5 * time.Second):
-		}
-	}()
+	handleOperation := startCancellableTestOperation(t, func() { close(releaseYouTube) }, func(operationCtx context.Context) error {
+		return handler.HandlePromotePublication(operationCtx, promote)
+	})
+	operations = append(operations, handleOperation)
 	select {
 	case <-youtube.started:
 	case <-time.After(5 * time.Second):
-		close(releaseYouTube)
 		t.Fatal("automatic promotion did not reach YouTube")
 	}
 
 	conn, err := fixture.Store.Pool.Acquire(ctx)
 	if err != nil {
-		close(releaseYouTube)
 		t.Fatalf("acquire invalidation connection: %v", err)
 	}
-	defer conn.Release()
+	var invalidationOperation *cancellableTestOperation
+	t.Cleanup(func() {
+		for _, operation := range []*cancellableTestOperation{invalidationOperation, handleOperation} {
+			if operation == nil {
+				continue
+			}
+			if _, err := operation.cancelAndDrain(testOperationCleanupTimeout); err != nil {
+				t.Errorf("cancel and drain operation before connection release: %v", err)
+				return
+			}
+		}
+		conn.Release()
+	})
 	var invalidationPID int
 	if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&invalidationPID); err != nil {
-		close(releaseYouTube)
 		t.Fatalf("read invalidation pid: %v", err)
 	}
-	invalidationDone := make(chan error, 1)
-	go func() {
-		_, err := conn.Exec(ctx, `
+	invalidationOperation = startCancellableTestOperation(t, nil, func(operationCtx context.Context) error {
+		_, err := conn.Exec(operationCtx, `
 			UPDATE autoflow_plans
 			SET prompt = prompt || ' automatic concurrent patch'
 			WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
 		`)
-		invalidationDone <- err
-	}()
-	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationDone)
+		return err
+	})
+	operations = append(operations, invalidationOperation)
+	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationOperation)
 
-	releaseOnce.Do(func() { close(releaseYouTube) })
-	var handleErr error
-	select {
-	case handleErr = <-handleDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for automatic promotion completion")
+	handleOperation.releaseBlocker()
+	handleErr, err := handleOperation.wait(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
-	handleFinished = true
 	if handleErr != nil {
 		t.Fatalf("automatic promotion: %v", handleErr)
 	}
-	select {
-	case err := <-invalidationDone:
-		if err != nil {
-			t.Fatalf("canonical invalidation: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for canonical invalidation completion")
+	invalidationErr, err := invalidationOperation.wait(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invalidationErr != nil {
+		t.Fatalf("canonical invalidation: %v", invalidationErr)
 	}
 	if recorder.pds.Load() != 1 || youtube.calls.Load() != 1 {
 		t.Fatalf("automatic promotion side effects pds/youtube = %d/%d, want 1/1", recorder.pds.Load(), youtube.calls.Load())
@@ -613,7 +771,8 @@ func TestPromotionRevalidatesFencedChannelAfterTaskScopeLock(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			fixture := NewChannelOpsFixture(t)
-			defer fixture.Close(ctx)
+			var operations []*cancellableTestOperation
+			registerBoundedFixtureCleanup(t, fixture, &operations)
 			fixture.InsertChannelWithLaneAccountSeed(ctx)
 			baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
 			promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
@@ -641,17 +800,22 @@ func TestPromotionRevalidatesFencedChannelAfterTaskScopeLock(t *testing.T) {
 				t.Fatalf("insert channel B: %v", err)
 			}
 			fixture.AdditionalChannelIDs = append(fixture.AdditionalChannelIDs, channelB)
-			defer func() {
-				_, _ = fixture.Store.Pool.Exec(ctx, `
+			t.Cleanup(func() {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), testOperationCleanupTimeout)
+				defer cancel()
+				_, err := fixture.Store.Pool.Exec(cleanupCtx, `
 					UPDATE production_tasks SET channel_profile_id = $2::uuid WHERE id = $1::uuid
 				`, taskID, fixture.ChannelID)
-			}()
+				if err != nil {
+					t.Errorf("restore task authority: %v", err)
+				}
+			})
 
 			blocker, err := fixture.Store.Pool.Begin(ctx)
 			if err != nil {
 				t.Fatalf("begin channel A blocker: %v", err)
 			}
-			defer blocker.Rollback(ctx)
+			registerBoundedRollback(t, blocker)
 			var lockedChannel string
 			if err := blocker.QueryRow(ctx, `
 				SELECT id::text FROM channel_profiles WHERE id = $1::uuid FOR UPDATE
@@ -670,8 +834,10 @@ func TestPromotionRevalidatesFencedChannelAfterTaskScopeLock(t *testing.T) {
 			handler := baseHandler
 			handler.PDS = &recordingPDS{recorder: recorder}
 			handler.YouTube = youtube
-			handleDone := make(chan error, 1)
-			go func() { handleDone <- handler.Handle(ctx, promote) }()
+			handleOperation := startCancellableTestOperation(t, nil, func(operationCtx context.Context) error {
+				return handler.Handle(operationCtx, promote)
+			})
+			operations = append(operations, handleOperation)
 			waitForChannelLockOrExternalCall(t, ctx, fixture, blockerPID, youtube)
 
 			if _, err := blocker.Exec(ctx, `
@@ -682,11 +848,9 @@ func TestPromotionRevalidatesFencedChannelAfterTaskScopeLock(t *testing.T) {
 			if err := blocker.Commit(ctx); err != nil {
 				t.Fatalf("commit task reassignment: %v", err)
 			}
-			var handleErr error
-			select {
-			case handleErr = <-handleDone:
-			case <-time.After(5 * time.Second):
-				t.Fatal("timed out waiting for reassigned promotion completion")
+			handleErr, err := handleOperation.wait(5 * time.Second)
+			if err != nil {
+				t.Fatal(err)
 			}
 			if !errors.Is(handleErr, ErrQueueAuthorityInvalid) {
 				t.Fatalf("Handle error = %v, want invalid queue authority", handleErr)
@@ -2871,7 +3035,7 @@ func waitForPlanLockOrExternalCall(
 	fixture *ChannelOpsFixture,
 	blockerPID int,
 	youtube *blockingPromotionYouTube,
-	handleDone <-chan error,
+	operation any,
 ) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -2879,9 +3043,10 @@ func waitForPlanLockOrExternalCall(
 		select {
 		case <-youtube.started:
 			t.Fatal("promotion called YouTube before rejected plan authority committed")
-		case err := <-handleDone:
-			t.Fatalf("promotion completed before waiting on plan authority: %v", err)
 		default:
+		}
+		if done, err := tryTestOperationWait(operation); done {
+			t.Fatalf("promotion completed before waiting on plan authority: %v", err)
 		}
 		var waiting bool
 		if err := fixture.Store.Pool.QueryRow(ctx, `
@@ -2912,15 +3077,13 @@ func waitForDatabaseLock(
 	ctx context.Context,
 	fixture *ChannelOpsFixture,
 	pid int,
-	operationDone <-chan error,
+	operation any,
 ) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		select {
-		case err := <-operationDone:
+		if done, err := tryTestOperationWait(operation); done {
 			t.Fatalf("database writer completed before expected lock: %v", err)
-		default:
 		}
 		var waiting bool
 		if err := fixture.Store.Pool.QueryRow(ctx, `
@@ -2936,6 +3099,29 @@ func waitForDatabaseLock(
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("database writer did not reach expected lock")
+}
+
+func tryTestOperationWait(operation any) (bool, error) {
+	switch operation := operation.(type) {
+	case *cancellableTestOperation:
+		return operation.tryWait()
+	case chan error:
+		select {
+		case err := <-operation:
+			return true, err
+		default:
+			return false, nil
+		}
+	case <-chan error:
+		select {
+		case err := <-operation:
+			return true, err
+		default:
+			return false, nil
+		}
+	default:
+		panic(fmt.Sprintf("unsupported test operation %T", operation))
+	}
 }
 
 func countQueueChildren(t *testing.T, ctx context.Context, fixture *ChannelOpsFixture, parentID string) int {

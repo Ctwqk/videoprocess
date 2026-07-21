@@ -573,11 +573,14 @@ async def test_quarantine_between_initial_roots_does_not_revive_second_root(
     assert [payload["node_id"] for _stream, payload in redis.dispatches] == ["trim_a"]
     try:
         async with factory() as quarantine_db:
-            result = await quarantine_channelops_backlog(
-                quarantine_db,
-                channel_id,
-                apply=True,
-                close_schedule=True,
+            result = await asyncio.wait_for(
+                quarantine_channelops_backlog(
+                    quarantine_db,
+                    channel_id,
+                    apply=True,
+                    close_schedule=True,
+                ),
+                timeout=5,
             )
         assert result["schedule"]["final_state"] == VideoScheduleState.CLOSED.value
     finally:
