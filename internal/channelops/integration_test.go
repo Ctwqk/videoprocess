@@ -91,6 +91,9 @@ func TestCancellableTestOperationTimeoutMarksFixtureCleanupIneligibleWhenUndrain
 	if _, err := operation.wait(100 * time.Millisecond); err != nil {
 		t.Fatalf("drain released synthetic operation: %v", err)
 	}
+	if fixtureCleanupEligible([]*cancellableTestOperation{operation}) {
+		t.Fatal("fixture cleanup became eligible after an undrained operation was released")
+	}
 }
 
 const testOperationCleanupTimeout = 5 * time.Second
@@ -549,7 +552,8 @@ func TestPlanRejectFirstPreventsDirectPromotionSideEffects(t *testing.T) {
 	}
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)
-	defer fixture.Close(ctx)
+	var operations []*cancellableTestOperation
+	registerBoundedFixtureCleanup(t, fixture, &operations)
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
 	promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
@@ -562,7 +566,7 @@ func TestPlanRejectFirstPreventsDirectPromotionSideEffects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin plan rejection: %v", err)
 	}
-	defer rejectTx.Rollback(ctx)
+	registerBoundedRollback(t, rejectTx)
 	if _, err := rejectTx.Exec(ctx, `
 		UPDATE autoflow_plans
 		SET status = 'rejected', rejected_reason = 'concurrent reviewer rejection'
@@ -580,15 +584,21 @@ func TestPlanRejectFirstPreventsDirectPromotionSideEffects(t *testing.T) {
 	youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
 	handler := baseHandler
 	handler.YouTube = youtube
-	handleDone := make(chan error, 1)
-	go func() { handleDone <- handler.HandlePromotePublication(ctx, promote) }()
+	handleOperation := startCancellableTestOperation(t, nil, func(operationCtx context.Context) error {
+		return handler.HandlePromotePublication(operationCtx, promote)
+	})
+	operations = append(operations, handleOperation)
 
-	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, testOperationChannelProbe(handleDone))
+	waitForPlanLockOrExternalCall(t, ctx, fixture, rejectPID, youtube, handleOperation.tryWait)
 	if err := rejectTx.Commit(ctx); err != nil {
 		t.Fatalf("commit plan rejection: %v", err)
 	}
-	if err := <-handleDone; err != nil {
-		t.Fatalf("direct promotion after rejection: %v", err)
+	handleErr, err := handleOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handleErr != nil {
+		t.Fatalf("direct promotion after rejection: %v", handleErr)
 	}
 	if youtube.calls.Load() != 0 {
 		t.Fatalf("YouTube calls after rejection = %d, want 0", youtube.calls.Load())
@@ -601,7 +611,8 @@ func TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites(t *test
 	}
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)
-	defer fixture.Close(ctx)
+	var operations []*cancellableTestOperation
+	registerBoundedFixtureCleanup(t, fixture, &operations)
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	baseHandler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
 	promote := prepareQueueKind(t, ctx, fixture, baseHandler, QueuePromotePublication)
@@ -614,43 +625,62 @@ func TestDirectPromotionHoldsPlanAuthorityThroughYouTubeAndDurableWrites(t *test
 	youtube := &blockingPromotionYouTube{started: make(chan struct{}, 1), release: releaseYouTube}
 	handler := baseHandler
 	handler.YouTube = youtube
-	handleDone := make(chan error, 1)
-	go func() { handleDone <- handler.HandlePromotePublication(ctx, promote) }()
+	handleOperation := startCancellableTestOperation(t, func() { close(releaseYouTube) }, func(operationCtx context.Context) error {
+		return handler.HandlePromotePublication(operationCtx, promote)
+	})
+	operations = append(operations, handleOperation)
 	select {
 	case <-youtube.started:
 	case <-time.After(5 * time.Second):
-		close(releaseYouTube)
 		t.Fatal("direct promotion did not reach YouTube")
 	}
 
 	conn, err := fixture.Store.Pool.Acquire(ctx)
 	if err != nil {
-		close(releaseYouTube)
 		t.Fatalf("acquire invalidation connection: %v", err)
 	}
-	defer conn.Release()
+	var invalidationOperation *cancellableTestOperation
+	t.Cleanup(func() {
+		for _, operation := range []*cancellableTestOperation{invalidationOperation, handleOperation} {
+			if operation == nil {
+				continue
+			}
+			if _, err := operation.cancelAndDrain(testOperationCleanupTimeout); err != nil {
+				t.Errorf("cancel and drain operation before connection release: %v", err)
+				return
+			}
+		}
+		conn.Release()
+	})
 	var invalidationPID int
 	if err := conn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&invalidationPID); err != nil {
-		close(releaseYouTube)
 		t.Fatalf("read invalidation pid: %v", err)
 	}
-	invalidationDone := make(chan error, 1)
-	go func() {
-		_, err := conn.Exec(ctx, `
+	invalidationOperation = startCancellableTestOperation(t, nil, func(operationCtx context.Context) error {
+		_, err := conn.Exec(operationCtx, `
 			UPDATE autoflow_plans
 			SET prompt = prompt || ' concurrent canonical patch'
 			WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
 		`)
-		invalidationDone <- err
-	}()
-	waitForDatabaseLock(t, ctx, fixture, invalidationPID, testOperationChannelProbe(invalidationDone))
+		return err
+	})
+	operations = append(operations, invalidationOperation)
+	waitForDatabaseLock(t, ctx, fixture, invalidationPID, invalidationOperation.tryWait)
 
-	close(releaseYouTube)
-	if err := <-handleDone; err != nil {
-		t.Fatalf("direct promotion: %v", err)
+	handleOperation.releaseBlocker()
+	handleErr, err := handleOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := <-invalidationDone; err != nil {
-		t.Fatalf("canonical invalidation: %v", err)
+	if handleErr != nil {
+		t.Fatalf("direct promotion: %v", handleErr)
+	}
+	invalidationErr, err := invalidationOperation.waitOrCancelAndDrain(5*time.Second, testOperationCleanupTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invalidationErr != nil {
+		t.Fatalf("canonical invalidation: %v", invalidationErr)
 	}
 	if youtube.calls.Load() != 1 {
 		t.Fatalf("YouTube calls = %d, want 1", youtube.calls.Load())
