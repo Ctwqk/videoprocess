@@ -350,7 +350,6 @@ vp_deploy_publisher() {
   fi
 
   http_health vp-youtube-manager "http://10.0.0.150:18999/api/auth/status" || return 1
-  docker node update --label-add vp.publisher=true "$VP_MANAGER_NODE" >/dev/null || return 1
 
   local env_key
   local env_value
@@ -433,6 +432,7 @@ vp_deploy_publisher() {
     local mount_readonly
     local desired_scratch_count=0
     local rebuild_scratch=false
+    local remove_scratch_target=false
     while IFS='|' read -r mount_type mount_source mount_target mount_readonly; do
       [[ -n "$mount_type$mount_source$mount_target$mount_readonly" ]] || continue
       if [[ -z "$mount_target" ]]; then
@@ -445,13 +445,15 @@ vp_deploy_publisher() {
         && "$mount_readonly" == false ]]; then
         desired_scratch_count=$((desired_scratch_count + 1))
         if [[ "$desired_scratch_count" -gt 1 ]]; then
-          update_args+=(--mount-rm "$mount_target")
+          remove_scratch_target=true
           rebuild_scratch=true
         fi
       else
-        update_args+=(--mount-rm "$mount_target")
         if [[ "$mount_target" == /data/storage ]]; then
+          remove_scratch_target=true
           rebuild_scratch=true
+        else
+          update_args+=(--mount-rm "$mount_target")
         fi
       fi
     done <<<"$existing_mounts"
@@ -483,6 +485,11 @@ vp_deploy_publisher() {
         update_args+=(--env-rm "$env_key")
       fi
     done <<<"$existing_env"
+    docker node update --label-add vp.publisher=true "$VP_MANAGER_NODE" >/dev/null || return 1
+    if [[ "$remove_scratch_target" == true ]]; then
+      docker service update --detach=false --no-resolve-image --update-order stop-first \
+        --replicas 0 --mount-rm /data/storage "$VP_PUBLISHER_SERVICE" >&2 || return 1
+    fi
     docker "${update_args[@]}" "${env_args[@]}" \
       --image "$image" "$VP_PUBLISHER_SERVICE" >&2 || return 1
   else
@@ -499,6 +506,7 @@ vp_deploy_publisher() {
     while IFS= read -r env_value; do
       create_env+=(--env "$env_value")
     done < <(vp_publisher_env)
+    docker node update --label-add vp.publisher=true "$VP_MANAGER_NODE" >/dev/null || return 1
     docker "${create_args[@]}" "${create_env[@]}" "$image" >&2 || return 1
   fi
   swarm_service_running "$VP_PUBLISHER_SERVICE" || return 1

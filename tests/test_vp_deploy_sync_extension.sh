@@ -223,6 +223,21 @@ docker() {
     && "$*" == *"--image $FAIL_UPDATE_IMAGE $FAIL_UPDATE_SERVICE"* ]]; then
     return 1
   fi
+  if [[ "${1:-} ${2:-}" == "service update" \
+    && "$*" == *"vp-youtube-publisher-swarm"* ]]; then
+    if [[ "$*" == *"--replicas 0"* ]]; then
+      PUBLISHER_REPLICAS=0
+    fi
+    if [[ "$*" == *"--mount-rm /data/storage"* ]]; then
+      PUBLISHER_MOUNT_MODE=scratch_removed
+    fi
+    if [[ "$*" == *"--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage"* ]]; then
+      PUBLISHER_MOUNT_MODE=desired
+    fi
+    if [[ "$*" == *"--replicas 1"* ]]; then
+      PUBLISHER_REPLICAS=1
+    fi
+  fi
   if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
     if [[ "$FAIL_NETWORK_INSPECT" == "true" ]]; then
       return 1
@@ -332,6 +347,10 @@ docker() {
               ;;
             wrong)
               echo 'volume|vp-youtube-publisher-scratch|/data/storage|true'
+              echo 'bind|credential-source|/app/cache|false'
+              echo 'bind|/tmp/publisher|/APP/OAUTH|false'
+              ;;
+            scratch_removed)
               echo 'bind|credential-source|/app/cache|false'
               echo 'bind|/tmp/publisher|/APP/OAUTH|false'
               ;;
@@ -724,6 +743,35 @@ grep -Fq -- '--env-add WORKER_CONCURRENCY=1' "$CALLS"
 grep -Fq -- '--replicas 1' "$CALLS"
 grep -Fq -- '--mount-rm /data/storage' "$CALLS"
 grep -Fq -- '--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' "$CALLS"
+publisher_mount_remove_line="$(grep -nF 'docker|service update' "$CALLS" \
+  | grep -F 'vp-youtube-publisher-swarm' \
+  | grep -F -- '--mount-rm /data/storage' \
+  | head -n 1 \
+  | cut -d: -f1)"
+publisher_mount_add_line="$(grep -nF 'docker|service update' "$CALLS" \
+  | grep -F 'vp-youtube-publisher-swarm' \
+  | grep -F -- '--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' \
+  | head -n 1 \
+  | cut -d: -f1)"
+if [[ -z "$publisher_mount_remove_line" || -z "$publisher_mount_add_line" \
+  || "$publisher_mount_remove_line" -ge "$publisher_mount_add_line" ]]; then
+  echo 'FAIL: publisher scratch replacement must remove and add the target in separate ordered updates' >&2
+  exit 1
+fi
+publisher_mount_remove_call="$(sed -n "${publisher_mount_remove_line}p" "$CALLS")"
+if ! grep -Fq -- '--replicas 0' <<<"$publisher_mount_remove_call" \
+  || grep -Fq -- '--mount-add ' <<<"$publisher_mount_remove_call" \
+  || grep -Fq -- '--image ' <<<"$publisher_mount_remove_call"; then
+  echo 'FAIL: publisher scratch removal must first stop the publisher without applying the release' >&2
+  exit 1
+fi
+publisher_mount_add_call="$(sed -n "${publisher_mount_add_line}p" "$CALLS")"
+if grep -Fq -- '--mount-rm /data/storage' <<<"$publisher_mount_add_call" \
+  || ! grep -Fq -- '--replicas 1' <<<"$publisher_mount_add_call" \
+  || ! grep -Fq -- '--image ' <<<"$publisher_mount_add_call"; then
+  echo 'FAIL: publisher release update must add scratch without removing the same target again' >&2
+  exit 1
+fi
 grep -Fq -- '--mount-rm /app/cache' "$CALLS"
 grep -Fq -- '--mount-rm /APP/OAUTH' "$CALLS"
 grep -Fq -- '--secret-rm publisher-credential-reference' "$CALLS"
@@ -868,7 +916,8 @@ if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-config-inspect-test >/d
   echo 'FAIL: publisher config inspection failure unexpectedly allowed deployment' >&2
   exit 1
 fi
-if grep -Fq 'docker|service update' "$CALLS"; then
+if grep -Fq 'docker|node update --label-add vp.publisher=true ccttww-lap' "$CALLS" \
+  || grep -Fq 'docker|service update' "$CALLS"; then
   echo 'FAIL: publisher deploy continued after config inspection failure' >&2
   exit 1
 fi
@@ -914,7 +963,8 @@ if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-network-failure-test >/
   exit 1
 fi
 grep -Fq 'docker|network inspect vp-pipeline-net --format {{.ID}}' "$CALLS"
-if grep -Fq 'docker|service update' "$CALLS"; then
+if grep -Fq 'docker|node update --label-add vp.publisher=true ccttww-lap' "$CALLS" \
+  || grep -Fq 'docker|service update' "$CALLS"; then
   echo 'FAIL: publisher deploy continued after pipeline network inspection failure' >&2
   exit 1
 fi
@@ -933,6 +983,8 @@ FAIL_PUBLISHER_CREATE=false
 : >"$CALLS"
 GPU_SERVICE_EXISTS=true
 PUBLISHER_SERVICE_EXISTS=true
+PUBLISHER_MOUNT_MODE=wrong
+PUBLISHER_REPLICAS=3
 FAIL_UPDATE_SERVICE=vp-youtube-publisher-swarm
 FAIL_UPDATE_IMAGE=vp-ffmpeg-worker-python:publisher-update-failure-test
 if deploy_vp_app_services \
@@ -946,6 +998,10 @@ if deploy_vp_app_services \
   exit 1
 fi
 grep -Fq -- '--image baseline-vp-youtube-publisher-swarm:stable vp-youtube-publisher-swarm' "$CALLS"
+if [[ "$PUBLISHER_MOUNT_MODE" != desired || "$PUBLISHER_REPLICAS" -ne 1 ]]; then
+  echo 'FAIL: publisher rollback did not recover one replica with the desired scratch mount' >&2
+  exit 1
+fi
 FAIL_UPDATE_SERVICE=
 FAIL_UPDATE_IMAGE=
 
