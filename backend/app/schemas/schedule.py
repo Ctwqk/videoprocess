@@ -8,6 +8,7 @@ from pydantic import BaseModel
 class VideoScheduleStatusResponse(BaseModel):
     service_name: str
     state: str
+    guarded_job_id: str | None = None
     waiting_jobs: int
     active_jobs: int
     queued_nodes: int

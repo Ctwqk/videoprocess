@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
+import uuid
 
 from app.models.job import JobStatus, NodeStatus
 from app.services.schedule_service import (
@@ -11,9 +12,10 @@ from app.services.schedule_service import (
 )
 
 
-def _job(*, started_at=None, status=JobStatus.PENDING, node_statuses=None):
+def _job(*, id=None, started_at=None, status=JobStatus.PENDING, node_statuses=None):
     statuses = node_statuses or [NodeStatus.PENDING]
     return SimpleNamespace(
+        id=id or uuid.uuid4(),
         started_at=started_at,
         status=status,
         node_executions=[SimpleNamespace(status=node_status) for node_status in statuses],
@@ -50,3 +52,17 @@ def test_closed_defers_everything():
         ),
         VideoScheduleState.CLOSED,
     )
+
+
+def test_open_guard_allows_only_exact_job():
+    guarded_job_id = uuid.uuid4()
+    assert not should_defer_job_start(
+        _job(id=guarded_job_id), VideoScheduleState.OPEN, guarded_job_id
+    )
+    assert should_defer_job_start(
+        _job(id=uuid.uuid4()), VideoScheduleState.OPEN, guarded_job_id
+    )
+
+
+def test_legacy_open_without_guard_remains_unrestricted():
+    assert not should_defer_job_start(_job(id=uuid.uuid4()), VideoScheduleState.OPEN)

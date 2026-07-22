@@ -54,9 +54,13 @@ def is_job_fresh_submission(job: Job) -> bool:
     return all(node.status == NodeStatus.PENDING for node in job.node_executions)
 
 
-def should_defer_job_start(job: Job, state: VideoScheduleState) -> bool:
+def should_defer_job_start(
+    job: Job,
+    state: VideoScheduleState,
+    guarded_job_id: uuid.UUID | None = None,
+) -> bool:
     if state == VideoScheduleState.OPEN:
-        return False
+        return guarded_job_id is not None and job.id != guarded_job_id
     if state == VideoScheduleState.CLOSED:
         return True
     if job.status == JobStatus.WAITING_WINDOW:
@@ -158,6 +162,7 @@ async def set_video_schedule_state(
 ) -> RuntimeSchedule:
     schedule, _created = await get_or_create_and_lock_runtime_schedule(db)
     schedule.state = state.value
+    schedule.guarded_job_id = None
     schedule.updated_by = updated_by
     await db.commit()
     await db.refresh(schedule)
@@ -281,6 +286,7 @@ async def open_video_schedule_for_job(
 
         expected_job = expected_jobs[0]
         schedule.state = VideoScheduleState.OPEN.value
+        schedule.guarded_job_id = expected_job_id
         schedule.updated_by = "internal_api_guarded"
         expected_job.status = JobStatus.PENDING
         expected_job.error_message = None
@@ -348,6 +354,7 @@ async def build_video_schedule_status(
     return VideoScheduleStatusResponse(
         service_name=schedule.service_name,
         state=schedule.state,
+        guarded_job_id=str(schedule.guarded_job_id) if schedule.guarded_job_id else None,
         waiting_jobs=waiting_jobs,
         active_jobs=active_jobs,
         queued_nodes=queued_nodes,

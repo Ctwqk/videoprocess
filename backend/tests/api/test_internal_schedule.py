@@ -98,6 +98,7 @@ async def test_legacy_schedule_open_without_expected_job_id_is_unchanged(
 
     assert response.status_code == 200
     assert response.json()["state"] == "OPEN"
+    assert response.json()["guarded_job_id"] is None
     assert response.json()["released_jobs"] == 2
     assert set(started) == {first.id, second.id}
     await session.refresh(go_job)
@@ -137,6 +138,7 @@ async def test_guarded_schedule_open_releases_and_starts_only_expected_python_jo
 
     assert response.status_code == 200
     assert response.json()["state"] == "OPEN"
+    assert response.json()["guarded_job_id"] == str(expected.id)
     assert response.json()["released_jobs"] == 1
     assert observed_committed_state == [("OPEN", JobStatus.PENDING)]
 
