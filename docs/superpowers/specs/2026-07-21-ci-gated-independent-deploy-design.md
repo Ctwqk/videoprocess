@@ -87,7 +87,8 @@ There is no environment-variable bypass for an applying production deploy.
 
 ## Failure Isolation
 
-The 150 cron has two managed commands at the same 15-minute cadence:
+The 150 cron has two managed commands at the same 15-minute cadence, offset by
+seven minutes so they do not contend for the controller lock:
 
 - `vp-app` plus `vp-feature-aggregator` from `Ctwqk/videoprocess`;
 - `vp-pds` from `Ctwqk/policy-decision-service`.

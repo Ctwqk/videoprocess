@@ -135,4 +135,13 @@ BUILD_IMAGES=0 UPDATE_SERVICES=0 \
   || fail "read-only dry run was CI-gated"
 [[ ! -s "$TRACE" ]] || fail "read-only dry run called gh"
 
+runbook="$ROOT_DIR/deploy/four-machine-topology.md"
+grep -Fq '*/15 * * * * /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --apply --project vp-app --project vp-feature-aggregator' "$runbook" \
+  || fail "runbook is missing the independent VideoProcess cron"
+grep -Fq '7-59/15 * * * * /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --apply --project vp-pds' "$runbook" \
+  || fail "runbook is missing the offset PDS cron"
+if grep -Eq '^\*/15 .+--project vp-app --project vp-feature-aggregator --project vp-pds' "$runbook"; then
+  fail "runbook still couples VideoProcess and PDS in one cron invocation"
+fi
+
 echo "VideoProcess exact-SHA deploy CI gate tests passed"

@@ -102,9 +102,11 @@ project. It is the deploy output marked by `.deploy-sync-project` and
 
 Production updates flow through GitHub and the scoped 150 deploy controller,
 then into Swarm services on 127. Normal GitHub pushes are pulled and deployed
-by the scoped 15-minute cron; do not enable the unscoped all-project deploy
-job as part of a VideoProcess release. A manual first deployment is reserved
-for exceptional migration or runbook changes, not for every commit.
+by two independent 15-minute cron entries. VideoProcess starts on the quarter
+hour and PDS is offset by seven minutes so the controller lock cannot suppress
+one repository on every run. Do not enable the unscoped all-project deploy job
+as part of a VideoProcess release. A manual first deployment is reserved for
+exceptional migration or runbook changes, not for every commit.
 
 The scoped controller deploys `vp-app` and the in-repository
 `vp-feature-aggregator` project from this repository. PDS remains an
@@ -112,12 +114,29 @@ independent repository and deploy project: a PDS change is deployed from its
 own repository through the scoped `vp-pds` project, without requiring a
 VideoProcess operations-asset rewrite.
 
-The normal scoped deployment command, for exceptional manual deployment or
-runbook work, is:
+Before any applying build, the repository deploy extension queries GitHub
+Actions for the exact 40-character commit. The latest push run of `ci.yml`
+must be `completed` with conclusion `success`; missing, pending, failed,
+cancelled, or mismatched runs fail closed. GitHub Actions has no production
+SSH credentials and does not perform deployment itself.
+
+The managed cron block is:
+
+```text
+# BEGIN VIDEOPROCESS DEPLOY
+*/15 * * * * /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --apply --project vp-app --project vp-feature-aggregator >> /home/taiwei/deploy-github-sync/logs/vp-cron.log 2>&1
+7-59/15 * * * * /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh --apply --project vp-pds >> /home/taiwei/deploy-github-sync/logs/vp-pds-cron.log 2>&1
+# END VIDEOPROCESS DEPLOY
+```
+
+For exceptional manual deployment or runbook work, invoke the two project
+groups separately so a failure in one repository does not skip the other:
 
 ```bash
 /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh \
-  --apply --project vp-app --project vp-feature-aggregator --project vp-pds
+  --apply --project vp-app --project vp-feature-aggregator
+/home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh \
+  --apply --project vp-pds
 ```
 
 ## ChannelOps Managed Soak Guard
