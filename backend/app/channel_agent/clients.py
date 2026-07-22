@@ -384,7 +384,8 @@ class YouTubeManagerClient:
         payload = await self._get("/api/auth/status")
         if payload.get("authenticated") is False:
             return 0.0
-        quota = payload.get("quota_estimate") if isinstance(payload.get("quota_estimate"), dict) else {}
+        quota_value = payload.get("quota_estimate")
+        quota = quota_value if isinstance(quota_value, dict) else {}
         limit = _positive_float(quota.get("daily_limit"), default=0.0)
         remaining = _positive_float(quota.get("estimated_units_remaining"), default=0.0)
         if limit <= 0:
@@ -444,6 +445,10 @@ class YouTubeManagerClient:
             response = await client.post(f"{self.base_url}{path}", json=json)
             response.raise_for_status()
             return _dict_response(response)
+
+
+def build_youtube_manager_client() -> YouTubeManagerClient:
+    return YouTubeManagerClient()
 
 
 class FakeMiniMaxClient:

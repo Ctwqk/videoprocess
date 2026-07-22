@@ -96,3 +96,120 @@ pre-existing `datetime.utcnow()` deprecation warnings in orchestrator tests.
 The full repository Ruff and mypy baselines remain nonzero for unrelated
 files. Task 3's focused lint and type checks are clean, and all backend tests
 pass.
+
+## Review Fix: Lazy Provider Wiring
+
+### RED
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/services/test_discovery_ingestion.py -q
+```
+
+```text
+...FF.........
+2 failed, 12 passed in 0.44s
+```
+
+The new lazy-factory tests failed because `DiscoveryIngestionService` did not
+accept `youtube_client_factory`.
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/api/test_channel_agent_discovery.py -q
+```
+
+```text
+..............FFF..........
+3 failed, 24 passed in 0.95s
+```
+
+The accepted/replay request invoked the eager factory twice, a factory
+construction failure returned 500 instead of the fixed 502, and a negative
+service counter was emitted as HTTP 200.
+
+### GREEN
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/services/test_discovery_ingestion.py -q
+```
+
+```text
+..............
+14 passed in 0.38s
+```
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/api/test_channel_agent_discovery.py -q
+```
+
+```text
+...........................
+27 passed in 0.82s
+```
+
+### Fix Evidence
+
+- `DiscoveryIngestionService` accepts either the compatible eager
+  `youtube_client` or a `youtube_client_factory`; it invokes the factory only
+  after a non-replay claim.
+- Factory exceptions mark the committed run `failed` with only
+  `provider_unavailable` and raise the existing typed provider error, which
+  the endpoint maps to `502 {"detail":"discovery_provider_error"}`.
+- All five response counters now require `ge=0`; the endpoint response-model
+  test proves a negative result cannot return HTTP 200.
+- API tests use a fresh request session, persist payload updates with a new
+  dictionary, and cover exact source/bucket/channel, missing, and non-object
+  payload mismatches before provider construction.
+- `build_youtube_manager_client()` is the single public client builder used by
+  both the runner and API; it reuses `YouTubeManagerClient` configuration
+  handling without duplicating settings logic.
+
+Focused verification:
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/api/test_channel_agent_discovery.py tests/channel_agent/test_api.py -q
+```
+
+```text
+60 passed in 1.76s
+```
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/services/test_discovery_ingestion.py tests/channel_agent/test_runner.py tests/channel_agent/test_youtube_manager_client.py -q
+```
+
+```text
+23 passed in 0.56s
+```
+
+```bash
+cd backend
+.venv/bin/python -m ruff check app/api/channel_agent.py app/channel_agent/clients.py app/channel_agent/runner.py app/schemas/channel_agent.py app/services/discovery_ingestion.py tests/api/test_channel_agent_discovery.py tests/services/test_discovery_ingestion.py tests/channel_agent/test_runner.py tests/channel_agent/test_youtube_manager_client.py
+.venv/bin/python -m mypy --follow-imports=skip app/api/channel_agent.py app/channel_agent/clients.py app/channel_agent/runner.py app/schemas/channel_agent.py app/services/discovery_ingestion.py
+```
+
+```text
+All checks passed!
+Success: no issues found in 5 source files
+```
+
+Required full-suite verification:
+
+```bash
+cd backend
+.venv/bin/python -m pytest -q
+```
+
+```text
+754 passed, 55 skipped, 8 warnings in 66.51s (0:01:06)
+```
+
+Repository-wide Ruff still reports 17 unrelated pre-existing findings. The
+repository-wide mypy baseline is now 64 unrelated findings in 23 files; the
+two former `app/channel_agent/clients.py` findings are resolved by the local
+type narrowing included with the shared-builder change.

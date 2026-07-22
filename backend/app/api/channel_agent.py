@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.autoflow.service import autoflow_service
 from app.channel_agent.clock import Clock
+from app.channel_agent.clients import build_youtube_manager_client
 from app.channel_agent.constants import (
     ACTIVE_TASK_STATES,
     QUEUE_CANCELLED,
@@ -92,12 +93,6 @@ class HumanReviewRequest(BaseModel):
     review_notes: str | None = None
 
 
-def _create_discovery_youtube_client():
-    from app.channel_agent.runner import _build_youtube_client
-
-    return _build_youtube_client()
-
-
 def _has_discovery_queue_authority(
     queue_item: ChannelOpsQueueItem,
     data: DiscoveryIngestionRequest,
@@ -140,7 +135,9 @@ async def ingest_discovery(
     if not discovery_policy.enabled:
         raise HTTPException(status_code=409, detail="discovery_policy_disabled")
 
-    service = DiscoveryIngestionService(youtube_client=_create_discovery_youtube_client())
+    service = DiscoveryIngestionService(
+        youtube_client_factory=build_youtube_manager_client,
+    )
     try:
         result = await service.ingest(
             db,

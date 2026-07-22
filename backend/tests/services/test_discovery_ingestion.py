@@ -265,6 +265,56 @@ async def test_discovery_ingestion_succeeds_and_replays_without_provider_call(
 
 
 @pytest.mark.asyncio
+async def test_discovery_ingestion_constructs_client_once_after_claim_and_replays_without_factory(
+    discovery_harness: DiscoveryHarness,
+) -> None:
+    now = datetime(2026, 7, 21, 18, 5, tzinfo=timezone.utc)
+    request, _ = await _seed_request(discovery_harness)
+    factory_calls = 0
+
+    def client_factory() -> FakeDiscoveryYouTubeClient:
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls > 1:
+            raise RuntimeError("factory must not run for a replay")
+        return FakeDiscoveryYouTubeClient([_provider_result()])
+
+    service = DiscoveryIngestionService(youtube_client_factory=client_factory)
+
+    async with discovery_harness.session_factory() as db:
+        first = await service.ingest(db, request, now)
+    async with discovery_harness.session_factory() as db:
+        replay = await service.ingest(db, request, now + timedelta(minutes=1))
+
+    assert replay == first
+    assert factory_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_discovery_ingestion_sanitizes_client_factory_failure_and_marks_run_failed(
+    discovery_harness: DiscoveryHarness,
+) -> None:
+    now = datetime(2026, 7, 21, 18, 5, tzinfo=timezone.utc)
+    request, _ = await _seed_request(discovery_harness)
+
+    def unavailable_client() -> FakeDiscoveryYouTubeClient:
+        raise RuntimeError("sensitive provider configuration")
+
+    service = DiscoveryIngestionService(youtube_client_factory=unavailable_client)
+
+    async with discovery_harness.session_factory() as db:
+        with pytest.raises(DiscoveryIngestionProviderError) as exc_info:
+            await service.ingest(db, request, now)
+
+    assert exc_info.value.error_code == "provider_unavailable"
+    assert "sensitive" not in str(exc_info.value)
+    async with discovery_harness.session_factory() as db:
+        run = (await db.execute(select(DiscoveryIngestionRun))).scalar_one()
+    assert run.status == "failed"
+    assert run.last_error_code == "provider_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_discovery_ingestion_rejects_a_recent_running_run_without_provider_call(
     discovery_harness: DiscoveryHarness,
 ) -> None:

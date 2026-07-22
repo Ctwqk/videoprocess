@@ -150,11 +150,11 @@ class DiscoveryIngestionResponse(BaseModel):
     source: Literal["youtube_search"]
     scheduler_bucket: str
     status: Literal["succeeded"]
-    query_count: int
-    created_count: int
-    refreshed_count: int
-    expired_count: int
-    quota_units_estimated: int
+    query_count: int = Field(ge=0)
+    created_count: int = Field(ge=0)
+    refreshed_count: int = Field(ge=0)
+    expired_count: int = Field(ge=0)
+    quota_units_estimated: int = Field(ge=0)
 
 
 class HealthSummary(BaseModel):

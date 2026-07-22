@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 import uuid
 
 import httpx
@@ -80,8 +82,18 @@ class DiscoveryIngestionProviderError(DiscoveryIngestionError):
 
 
 class DiscoveryIngestionService:
-    def __init__(self, *, youtube_client) -> None:
+    def __init__(
+        self,
+        *,
+        youtube_client: Any | None = None,
+        youtube_client_factory: Callable[[], Any] | None = None,
+    ) -> None:
+        if youtube_client is None and youtube_client_factory is None:
+            raise ValueError("youtube_client or youtube_client_factory is required")
+        if youtube_client is not None and youtube_client_factory is not None:
+            raise ValueError("pass either youtube_client or youtube_client_factory")
         self.youtube_client = youtube_client
+        self.youtube_client_factory = youtube_client_factory
 
     async def ingest(
         self,
@@ -103,8 +115,20 @@ class DiscoveryIngestionService:
         )
         if isinstance(claim, DiscoveryIngestionResult):
             return claim
+        try:
+            youtube_client = self._youtube_client_after_claim()
+        except Exception:
+            await db.rollback()
+            await self._mark_failed(
+                db,
+                claim=claim,
+                now=current,
+                error_code="provider_unavailable",
+                query_count=0,
+            )
+            raise DiscoveryIngestionProviderError("provider_unavailable") from None
         ingester = YouTubeTrendIngester(
-            youtube_client=self.youtube_client,
+            youtube_client=youtube_client,
             min_view_count=policy.min_view_count,
             max_results=policy.max_results_per_query,
             max_queries=policy.max_queries_per_run,
@@ -157,6 +181,11 @@ class DiscoveryIngestionService:
         result = _result_from_run(run)
         await db.commit()
         return result
+
+    def _youtube_client_after_claim(self) -> Any:
+        if self.youtube_client_factory is not None:
+            return self.youtube_client_factory()
+        return self.youtube_client
 
     async def _validated_policy(
         self,

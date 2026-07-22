@@ -5,7 +5,11 @@ import contextlib
 import logging
 
 from app.channel_agent.alerts import AlertService
-from app.channel_agent.clients import LocalAutoFlowClient, MiniMaxImageClient, YouTubeManagerClient
+from app.channel_agent.clients import (
+    LocalAutoFlowClient,
+    MiniMaxImageClient,
+    build_youtube_manager_client,
+)
 from app.channel_agent.queue import ChannelOpsQueueService
 from app.channel_agent.retention import cleanup_expired
 from app.channel_agent.scheduler import ChannelOpsScheduler
@@ -28,12 +32,6 @@ def _build_pds_client() -> PolicyDecisionClient:
     )
 
 
-def _build_youtube_client() -> YouTubeManagerClient:
-    if not settings.youtube_manager_url.strip():
-        raise RuntimeError("YOUTUBE_MANAGER_URL is required for live ChannelOps runner mode")
-    return YouTubeManagerClient(base_url=settings.youtube_manager_url)
-
-
 class ChannelAgentRunner:
     def __init__(
         self,
@@ -47,7 +45,7 @@ class ChannelAgentRunner:
         self.service = ChannelAgentService(
             queue=self.queue,
             autoflow_client=LocalAutoFlowClient(),
-            youtube_client=_build_youtube_client(),
+            youtube_client=build_youtube_manager_client(),
             minimax_client=MiniMaxImageClient(),
             pds_client=_build_pds_client(),
             pds_health_monitor_enabled=settings.pds_enabled,

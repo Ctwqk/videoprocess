@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.api.channel_agent as channel_agent_api
@@ -19,6 +20,7 @@ from app.services.discovery_ingestion import (
     DiscoveryIngestionInProgressError,
     DiscoveryIngestionPolicyError,
     DiscoveryIngestionProviderError,
+    DiscoveryIngestionResult,
 )
 
 
@@ -57,7 +59,13 @@ async def api_session():
 def _app(db_session):
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[get_db] = lambda: db_session
+    request_session_factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+
+    async def get_request_db():
+        async with request_session_factory() as request_session:
+            yield request_session
+
+    app.dependency_overrides[get_db] = get_request_db
     return app
 
 
@@ -70,7 +78,7 @@ async def _channel_and_queue(
     queue_kind: str = "ingest_discovery",
     queue_status: str = "running",
     queue_channel_id: uuid.UUID | None = None,
-    payload: dict | None = None,
+    payload: object | None = None,
 ) -> tuple[ChannelProfile, ChannelOpsQueueItem]:
     channel = ChannelProfile(
         name="Discovery API",
@@ -86,8 +94,7 @@ async def _channel_and_queue(
         idempotency_key=f"ingest_discovery:{uuid.uuid4()}",
         channel_profile_id=queue_channel_id or channel.id,
         status=queue_status,
-        payload_json=payload
-        or {
+        payload_json=payload if payload is not None else {
             "channel_id": str(channel.id),
             "source": "youtube_search",
             "scheduler_bucket": bucket,
@@ -119,7 +126,7 @@ async def test_discovery_ingest_rejects_missing_queue_before_provider_call(api_s
         calls += 1
         return object()
 
-    monkeypatch.setattr(channel_agent_api, "_create_discovery_youtube_client", fake_client, raising=False)
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", fake_client)
     request = {
         "channel_id": str(channel.id),
         "queue_item_id": str(uuid.uuid4()),
@@ -160,6 +167,13 @@ async def test_discovery_ingest_rejects_missing_queue_before_provider_call(api_s
             "same",
             {"channel_id": "request", "source": "youtube_search", "scheduler_bucket": "wrong"},
         ),
+        (
+            "ingest_discovery",
+            "running",
+            "same",
+            {"channel_id": "request", "scheduler_bucket": "2026-07-21-18"},
+        ),
+        ("ingest_discovery", "running", "same", ["not", "an", "object"]),
     ],
 )
 async def test_discovery_ingest_rejects_invalid_queue_authority_before_provider_call(
@@ -178,8 +192,8 @@ async def test_discovery_ingest_rejects_invalid_queue_authority_before_provider_
         queue_channel_id=other_channel,
         payload=payload,
     )
-    if payload and payload["channel_id"] == "request":
-        queue.payload_json["channel_id"] = str(channel.id)
+    if isinstance(payload, dict) and payload.get("channel_id") == "request":
+        queue.payload_json = {**queue.payload_json, "channel_id": str(channel.id)}
         await api_session.commit()
     calls = 0
 
@@ -188,7 +202,7 @@ async def test_discovery_ingest_rejects_invalid_queue_authority_before_provider_
         calls += 1
         return object()
 
-    monkeypatch.setattr(channel_agent_api, "_create_discovery_youtube_client", fake_client, raising=False)
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", fake_client)
 
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
         response = await client.post(DISCOVERY_PATH, json=_request(channel, queue))
@@ -221,7 +235,7 @@ async def test_discovery_ingest_rejects_missing_channel_before_provider_call(api
         calls += 1
         return object()
 
-    monkeypatch.setattr(channel_agent_api, "_create_discovery_youtube_client", fake_client, raising=False)
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", fake_client)
     request = {
         "channel_id": str(missing_channel_id),
         "queue_item_id": str(queue.id),
@@ -264,7 +278,7 @@ async def test_discovery_ingest_rejects_channel_or_policy_before_provider_call(
         calls += 1
         return object()
 
-    monkeypatch.setattr(channel_agent_api, "_create_discovery_youtube_client", fake_client, raising=False)
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", fake_client)
 
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
         response = await client.post(DISCOVERY_PATH, json=_request(channel, queue))
@@ -281,7 +295,16 @@ async def test_discovery_ingest_returns_durable_result_and_does_not_complete_que
     queue_id = str(queue.id)
     provider_calls = 0
 
-    monkeypatch.setattr(channel_agent_api, "_create_discovery_youtube_client", lambda: object(), raising=False)
+    factory_calls = 0
+
+    def fake_client():
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls > 1:
+            raise RuntimeError("factory must not run for a replay")
+        return object()
+
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", fake_client)
 
     async def fake_ingest_channel(self, db, channel_id: str, now):
         nonlocal provider_calls
@@ -316,8 +339,65 @@ async def test_discovery_ingest_returns_durable_result_and_does_not_complete_que
     assert replay.status_code == 200
     assert replay.json()["run_id"] == first.json()["run_id"]
     assert provider_calls == 1
+    assert factory_calls == 1
     await api_session.refresh(queue)
     assert queue.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_discovery_ingest_maps_client_construction_failure_to_sanitized_502(api_session, monkeypatch):
+    channel, queue = await _channel_and_queue(api_session)
+
+    def unavailable_client():
+        raise RuntimeError("sensitive provider configuration")
+
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", unavailable_client)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(api_session), raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(DISCOVERY_PATH, json=_request(channel, queue))
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "discovery_provider_error"}
+    assert "sensitive" not in response.text
+    persisted = await api_session.scalar(
+        select(DiscoveryIngestionRun).where(DiscoveryIngestionRun.queue_item_id == queue.id)
+    )
+    assert persisted is not None
+    assert persisted.status == "failed"
+    assert persisted.last_error_code == "provider_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_discovery_ingest_rejects_negative_service_counters_in_response(api_session, monkeypatch):
+    channel, queue = await _channel_and_queue(api_session)
+
+    async def negative_result(self, db, request, now):
+        return DiscoveryIngestionResult(
+            run_id=uuid.uuid4(),
+            channel_id=channel.id,
+            source="youtube_search",
+            scheduler_bucket="2026-07-21-18",
+            status="succeeded",
+            query_count=-1,
+            created_count=0,
+            refreshed_count=0,
+            expired_count=0,
+            quota_units_estimated=0,
+        )
+
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", lambda: object())
+    monkeypatch.setattr(discovery_ingestion.DiscoveryIngestionService, "ingest", negative_result)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(api_session), raise_app_exceptions=False),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(DISCOVERY_PATH, json=_request(channel, queue))
+
+    assert response.status_code == 500
 
 
 @pytest.mark.asyncio
@@ -341,7 +421,7 @@ async def test_discovery_ingest_maps_service_errors_without_provider_details(
     async def fake_ingest(self, db, request, now):
         raise error
 
-    monkeypatch.setattr(channel_agent_api, "_create_discovery_youtube_client", lambda: object(), raising=False)
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", lambda: object())
     monkeypatch.setattr(discovery_ingestion.DiscoveryIngestionService, "ingest", fake_ingest)
 
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
@@ -357,8 +437,10 @@ async def test_discovery_ingest_maps_service_errors_without_provider_details(
     "payload",
     [
         {"channel_id": "not-a-uuid", "queue_item_id": str(uuid.uuid4()), "source": "youtube_search", "scheduler_bucket": "bucket"},
+        {"channel_id": str(uuid.uuid4()), "queue_item_id": "not-a-uuid", "source": "youtube_search", "scheduler_bucket": "bucket"},
         {"channel_id": str(uuid.uuid4()), "queue_item_id": str(uuid.uuid4()), "source": "youtube", "scheduler_bucket": "bucket"},
         {"channel_id": str(uuid.uuid4()), "queue_item_id": str(uuid.uuid4()), "source": "youtube_search", "scheduler_bucket": "   "},
+        {"channel_id": str(uuid.uuid4()), "queue_item_id": str(uuid.uuid4()), "source": "youtube_search", "scheduler_bucket": "x" * 65},
         {"channel_id": str(uuid.uuid4()), "queue_item_id": str(uuid.uuid4()), "source": "youtube_search", "scheduler_bucket": "bucket", "extra": True},
     ],
 )
