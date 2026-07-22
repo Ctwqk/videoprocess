@@ -404,7 +404,9 @@ git commit -m "feat: deploy channelops soak guard automatically"
 
 Document the 150 scoped deploy controller as watcher owner, installed and state
 paths, default-disabled behavior, quarantine plus \`CLOSED\` guard action, and a
-separately approved successful unlisted canary as activation prerequisite.
+separately approved successful unlisted canary as activation prerequisite. The
+canary gate uses the 2026-07-22 atomic intake pause: success remains
+intake-paused for downstream and mature metrics; failure becomes fully halted.
 State explicitly that code deployment cannot activate or resume a channel and
 that 126 remains forbidden.
 
@@ -456,5 +458,5 @@ Do not create \`vp-soak-watch.env\` and do not run the live canary. Report the
 exact approval phrase required for the next attempt:
 
 \`\`\`text
-批准第三次 unlisted canary
+批准第四次 unlisted canary
 \`\`\`

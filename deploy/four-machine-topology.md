@@ -6,6 +6,8 @@ Status date: 2026-07-11.
 
 ## Agent Quick View
 
+- 127 is the VideoProcess app/runtime node; 150 is the GPU/publisher/control
+  node; 126 is excluded from VideoProcess placement.
 - VideoProcess application services run in Docker Swarm on the 127 Colima node.
 - User traffic enters through `http://10.0.0.127:3001`.
 - API traffic is forwarded through `http://10.0.0.127:18080`.
@@ -112,7 +114,8 @@ The scoped controller deploys `vp-app` and the in-repository
 `vp-feature-aggregator` project from this repository. PDS remains an
 independent repository and deploy project: a PDS change is deployed from its
 own repository through the scoped `vp-pds` project, without requiring a
-VideoProcess operations-asset rewrite.
+VideoProcess operations-asset rewrite. A VideoProcess push does not trigger
+the independent PDS automatic deployment.
 
 Before any applying build, the repository deploy extension queries GitHub
 Actions for the exact 40-character commit. The latest push run of `ci.yml`
@@ -176,11 +179,14 @@ may add placement exclusions, but it cannot replace the immutable
 `CASPERs-Mac-mini`, `colima-swarmbridged`, and `10.0.0.126` baseline.
 
 Creating or enabling the state file is a separate human activation action and
-requires a separately approved, successful unlisted canary. The required
-approval for the next attempt is `批准第三次 unlisted canary`. Deploying code may
-replace the watcher and its managed cron entry, but it cannot create activation
-state, activate a channel, resume a halted channel, or reopen the video
-schedule.
+requires a separately approved, successful unlisted canary. The 2026-07-12
+halt-after-selection procedure is superseded by the 2026-07-22 atomic intake
+pause: the successful canary remains intake-paused for downstream and mature
+metrics, while a failed attempt becomes fully halted. The required approval
+for the next attempt is exactly `批准第四次 unlisted canary`. Deploying code
+may replace the watcher and its managed cron entry, but it cannot create
+activation state, activate a channel, resume a halted channel, or reopen the
+video schedule.
 
 External-platform asset automatic publication remains disabled. Explicit human
 review is required before any external-platform asset upload or publication.

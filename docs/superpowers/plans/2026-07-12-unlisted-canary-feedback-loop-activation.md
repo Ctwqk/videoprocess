@@ -4,7 +4,7 @@
 
 **Goal:** Safely run one owned-material VideoProcess canary through generation, a single real unlisted YouTube upload, publication linkage, and feedback collection.
 
-**Architecture:** Route YouTube writes to a dedicated publisher stream on 150. A Postgres upload-operation ledger reserves each side effect before YouTubeManager receives media, resumes manager polling after worker restarts, replays completed receipts, and blocks ambiguous retries. Quarantine the historical soak backlog before opening the global video schedule, then create and run one halted-after-selection canary channel.
+**Architecture:** Route YouTube writes to a dedicated publisher stream on 150. A Postgres upload-operation ledger reserves each side effect before YouTubeManager receives media, resumes manager polling after worker restarts, replays completed receipts, and blocks ambiguous retries. Quarantine the historical soak backlog before opening the global video schedule, then create and run one atomic-intake-paused canary channel. The 2026-07-12 halt-after-selection procedure is superseded.
 
 **Tech Stack:** Python 3.12, FastAPI, SQLAlchemy async, Alembic, httpx, pytest, Go 1.24, pgx, Redis Streams, Docker Swarm, Bash, FFmpeg, YouTubeManager HTTP API.
 
@@ -458,8 +458,9 @@ queue rows. Assert dry-run changes nothing. Assert apply:
 Assert quarantine defaults to dry-run and requires `--apply` for mutation.
 Assert the canary runner contains schedule close in a `finally` block, uses
 `unlisted`, sets `external_asset_auto_publish=false`, limits cadence to one,
-halts after one task, and refuses to run while pre-existing runnable jobs
-remain.
+uses the atomic intake pause after exactly one task, keeps intake paused for
+downstream and mature metrics on success, fully halts on failure, and refuses
+to run while pre-existing runnable jobs remain.
 
 - [ ] **Step 3: Run and confirm failures**
 
@@ -486,9 +487,11 @@ The runner:
    timestamp metadata through its database session;
 4. creates one private-by-default channel, lane, unlisted account/format, and
    manual seed with `input_asset_id`;
-5. enables the channel, enqueues one tick, waits for one task, then halts it;
+5. enables the channel and enqueues one guarded tick whose transaction creates
+   exactly one task and atomically pauses intake;
 6. opens the schedule only after no other runnable job remains, drains after
-   the canary starts, and closes in `finally`;
+   the canary starts, and closes in `finally`; success keeps intake paused for
+   downstream and mature metrics, while failure fully halts the channel;
 7. waits for one publication, enqueues immediate promotion and metrics through
    existing APIs, and waits for one feedback snapshot;
 8. verifies manager status is processed/unlisted and writes evidence under
@@ -595,6 +598,9 @@ status processed/unlisted, feedback response, durable metrics queue work, no
 public rows, no pending publisher messages, final schedule `CLOSED`, and no VP
 tasks/consumers on 126. Restart the publisher and API services, then re-query
 the same operation/publication/video to prove persistence.
+
+The next approval is exactly `批准第四次 unlisted canary`; no earlier attempt
+phrase authorizes another run.
 
 - [ ] **Step 7: Complete branch cleanup**
 

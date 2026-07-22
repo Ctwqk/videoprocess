@@ -510,7 +510,9 @@ The latest `ci.yml` push run for the exact commit must be
   --apply --project vp-app --project vp-feature-aggregator
 ```
 
-Do not deploy or modify PDS for this VideoProcess-only increment.
+Do not deploy or modify PDS for this VideoProcess-only increment. PDS remains
+an independent repository and its automatic deployment is not triggered by a
+VideoProcess push.
 
 - [ ] **Step 5: Prove disabled production state**
 
@@ -532,7 +534,7 @@ Do not patch production discovery policy or run live mode without the exact
 per-attempt phrase:
 
 ```text
-批准第三次 unlisted canary
+批准第四次 unlisted canary
 ```
 
 After that canary succeeds, activation begins at interval 360, max queries 3,

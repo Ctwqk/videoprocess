@@ -1,6 +1,11 @@
 # Unlisted Canary Feedback Loop Activation Design
 
-Status: approved for implementation on 2026-07-12.
+Status: superseded on 2026-07-22 by the atomic intake-pause design.
+
+The 2026-07-12 `halt-after-selection` procedure described below is retained
+as historical context only. It is replaced by the 2026-07-22 atomic intake
+pause: a successful attempt remains intake-paused for downstream and mature
+metrics, while a failed attempt becomes fully halted.
 
 ## Context
 
@@ -159,11 +164,14 @@ manual seed. The account and format default to `unlisted`, external asset auto
 publish is false, maximum cadence is one per day, and the channel starts in
 dry-run mode.
 
-After all preflights pass, switch only this channel out of dry-run, enqueue one
-tick, and halt it as soon as one production task exists. With the old backlog
-quarantined, open the global video window, wait for the canary job to start,
-then drain and close the window. The ChannelOps runner continues the selected
-task through publication and metrics.
+After all preflights pass, switch only this channel out of dry-run and enqueue
+one guarded tick. The 2026-07-22 atomic intake pause must create exactly one
+production task and pause new intake in the same transaction. With the old
+backlog quarantined, open the global video window, wait for the canary job to
+start, then drain and close the window. A successful attempt keeps the channel
+intake-paused while the ChannelOps runner continues the selected task through
+publication, reconciliation, and mature metrics. A failed attempt fully halts
+the channel and its active canary work.
 
 ## Safety Rules
 
@@ -174,8 +182,9 @@ task through publication and metrics.
   publication.
 - No external-platform asset is eligible for this canary.
 - The schedule returns to `CLOSED` in a `finally` guard.
-- The canary channel is halted after task creation and remains halted after
-  completion.
+- The old halt-after-selection state is superseded by the atomic intake pause.
+- Success leaves the canary channel intake-paused for downstream and mature
+  metrics; failure applies the full halt state.
 
 ## Feedback
 
@@ -184,6 +193,8 @@ The normal promotion path enqueues durable `collect_metrics` and
 and metrics request immediately after upload to prove connectivity. The queued
 metrics item remains responsible for the age-appropriate persisted snapshot;
 the immediate probe is evidence only and is not mislabeled as a 1-hour reward.
+The intake pause remains in force so downstream reconciliation and mature
+metrics can finish without admitting another task.
 
 ## Deployment
 
@@ -220,6 +231,12 @@ Live acceptance requires:
 - no VP tasks or publisher consumers on 126;
 - both Redis worker groups at zero pending after completion;
 - final video schedule `CLOSED`.
+
+The next approval is exactly:
+
+```text
+批准第四次 unlisted canary
+```
 
 ## Rollback
 
