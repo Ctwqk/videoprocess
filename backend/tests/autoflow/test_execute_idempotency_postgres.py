@@ -112,6 +112,35 @@ async def _counts(factory) -> tuple[int, int, int]:
         )
 
 
+async def _install_guarded_job(factory, plan) -> uuid.UUID:
+    definition = plan.pipeline_definition.model_dump(mode="json")
+    async with factory() as db:
+        pipeline = Pipeline(
+            name="guard authority",
+            description="",
+            definition=definition,
+        )
+        db.add(pipeline)
+        await db.flush()
+        job = Job(
+            pipeline_id=pipeline.id,
+            pipeline_snapshot=definition,
+            status=JobStatus.RUNNING,
+            orchestrator_owner="python",
+        )
+        db.add(job)
+        await db.flush()
+        schedule = RuntimeSchedule(
+            service_name=VIDEO_SCHEDULE_SERVICE,
+            state=VideoScheduleState.OPEN.value,
+            guarded_job_id=job.id,
+            updated_by="guarded-autoflow-test",
+        )
+        db.add(schedule)
+        await db.commit()
+        return job.id
+
+
 async def _bound_execute_request(
     factory,
     plan,
@@ -254,6 +283,73 @@ async def test_bound_execute_replay_recovers_lost_start_handoff_without_duplicat
         assert str(task.pipeline_id) == replay.pipeline_id
         assert str(task.job_id) == replay.job_id
         assert task.state == "producing"
+
+
+async def test_bound_autoflow_guard_rejects_new_job_without_rows(postgres_idempotency_db):
+    _engine, factory, starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Bound execution blocked by exact guard")
+    await _install_guarded_job(factory, plan)
+    before = await _counts(factory)
+    _task_id, _queue_id, request = await _bound_execute_request(factory, plan)
+
+    async with factory() as db:
+        with pytest.raises(PermissionError, match="guarded"):
+            await service.execute(request, db)
+
+    assert await _counts(factory) == before
+    assert starts == []
+
+
+async def test_bound_autoflow_replay_resumes_only_exact_guarded_job(
+    postgres_idempotency_db,
+):
+    _engine, factory, starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Bound guarded replay")
+    _task_id, _queue_id, request = await _bound_execute_request(factory, plan)
+    async with factory() as db:
+        first = await service.execute(request, db)
+
+    async with factory() as db:
+        schedule = await db.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+        assert schedule is not None
+        schedule.guarded_job_id = uuid.UUID(first.job_id)
+        await db.commit()
+    async with factory() as db:
+        replay = await service.execute(request, db)
+
+    mismatching_job_id = await _install_additional_guarded_job(factory, plan)
+    async with factory() as db:
+        schedule = await db.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+        assert schedule is not None
+        schedule.guarded_job_id = mismatching_job_id
+        await db.commit()
+    async with factory() as db:
+        with pytest.raises(PermissionError, match="guarded"):
+            await service.execute(request, db)
+
+    assert replay.job_id == first.job_id
+    assert starts == [first.job_id, first.job_id]
+
+
+async def _install_additional_guarded_job(factory, plan) -> uuid.UUID:
+    definition = plan.pipeline_definition.model_dump(mode="json")
+    async with factory() as db:
+        pipeline = Pipeline(
+            name="mismatching guard authority",
+            description="",
+            definition=definition,
+        )
+        db.add(pipeline)
+        await db.flush()
+        job = Job(
+            pipeline_id=pipeline.id,
+            pipeline_snapshot=definition,
+            status=JobStatus.RUNNING,
+            orchestrator_owner="python",
+        )
+        db.add(job)
+        await db.commit()
+        return job.id
 
 
 @pytest.mark.parametrize(
@@ -432,6 +528,28 @@ async def test_response_loss_replay_returns_same_durable_execution(postgres_idem
     assert (first.run_id, first.pipeline_id, first.job_id) == (replay.run_id, replay.pipeline_id, replay.job_id)
     assert await _counts(factory) == (1, 1, 1)
     assert starts == [first.job_id]
+
+
+async def test_ordinary_autoflow_created_during_guard_is_parked(postgres_idempotency_db):
+    _engine, factory, starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Ordinary execution under exact guard")
+    guarded_job_id = await _install_guarded_job(factory, plan)
+
+    async with factory() as db:
+        run = await service.execute(
+            AutoFlowExecuteRequest(
+                plan_id=plan.plan_id,
+                idempotency_key=f"ordinary-guard:{plan.plan_id}",
+            ),
+            db,
+        )
+
+    assert run.job_id != str(guarded_job_id)
+    assert run.status == JobStatus.WAITING_WINDOW.value
+    assert starts == []
+    async with factory() as db:
+        job = await db.get(Job, uuid.UUID(run.job_id))
+        assert job is not None and job.status == JobStatus.WAITING_WINDOW
 
 
 async def test_pre_expected_authority_fingerprint_remains_replayable(postgres_idempotency_db):

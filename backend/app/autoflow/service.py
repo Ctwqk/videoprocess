@@ -51,6 +51,7 @@ from app.services.schedule_service import (
     default_video_schedule_state,
     get_or_create_and_lock_runtime_schedule,
     park_jobs_for_window,
+    should_defer_job_start,
 )
 
 
@@ -883,10 +884,10 @@ class AutoFlowService:
                     schedule_state = VideoScheduleState(schedule.state)
                 except ValueError:
                     schedule_state = default_video_schedule_state()
-                if schedule_state == VideoScheduleState.OPEN:
-                    should_start = True
-                else:
+                if should_defer_job_start(job, schedule_state, schedule.guarded_job_id):
                     await park_jobs_for_window(db, [job], commit=False)
+                else:
+                    should_start = True
 
                 job_id = job.id
                 reservation.pipeline_id = pipeline.id
@@ -1026,6 +1027,11 @@ class AutoFlowService:
                 ).scalar_one_or_none()
                 if job is None:
                     raise ValueError("ChannelOps-bound AutoFlow job was not found")
+                if (
+                    schedule.guarded_job_id is not None
+                    and job.id != schedule.guarded_job_id
+                ):
+                    raise PermissionError("ChannelOps job does not hold guarded schedule authority")
                 job_id = _bind_channelops_execution(task, existing)
                 should_start = job.status in {
                     JobStatus.PENDING,
@@ -1038,6 +1044,9 @@ class AutoFlowService:
                 if should_start:
                     await start_jobs_background([job_id])
                 return run
+
+            if schedule.guarded_job_id is not None:
+                raise PermissionError("ChannelOps guarded schedule does not permit a new execution")
 
             approved_revision_hash = plan.approved_revision_hash
             reservation = AutoFlowRunModel(

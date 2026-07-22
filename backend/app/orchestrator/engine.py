@@ -218,7 +218,7 @@ class JobEngine:
             schedule_state = VideoScheduleState(schedule.state)
         except ValueError:
             schedule_state = default_video_schedule_state()
-        if should_defer_job_start(job, schedule_state):
+        if should_defer_job_start(job, schedule_state, schedule.guarded_job_id):
             for node in job.node_executions:
                 if node.status in {NodeStatus.PENDING, NodeStatus.QUEUED, NodeStatus.RUNNING}:
                     node.status = NodeStatus.PENDING

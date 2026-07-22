@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
-from app.services.job_runtime import start_jobs_background
+from app.models.job import JobStatus
+from app.services import job_runtime
+from app.services.job_execution_authority import (
+    JobExecutionAuthorityBlocked,
+    LockedJobExecutionAuthority,
+    require_active_execution_authority,
+)
+from app.services.job_runtime import start_jobs_background, start_or_defer_jobs
+from app.services.schedule_service import VideoScheduleState
 
 
 @pytest.mark.asyncio
@@ -69,3 +78,59 @@ async def test_start_jobs_background_shields_launch_handoff_from_caller_cancella
         if not launch.done():
             launch.cancel()
         await asyncio.gather(launch, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_start_or_defer_partitions_exact_guard_from_mismatches(monkeypatch):
+    guarded_job = SimpleNamespace(id=uuid.uuid4(), status=JobStatus.PENDING)
+    mismatching_job = SimpleNamespace(id=uuid.uuid4(), status=JobStatus.PENDING)
+    schedule = SimpleNamespace(
+        state=VideoScheduleState.OPEN.value,
+        guarded_job_id=guarded_job.id,
+    )
+    events: list[tuple[str, list[uuid.UUID]]] = []
+
+    async def load_schedule(_db):
+        return schedule
+
+    async def park_jobs(_db, jobs):
+        materialized = list(jobs)
+        events.append(("park", [job.id for job in materialized]))
+        for job in materialized:
+            job.status = JobStatus.WAITING_WINDOW
+
+    async def start_jobs(job_ids):
+        events.append(("start", list(job_ids)))
+
+    monkeypatch.setattr(job_runtime, "get_video_schedule_record", load_schedule, raising=False)
+    monkeypatch.setattr(job_runtime, "park_jobs_for_window", park_jobs)
+    monkeypatch.setattr(job_runtime, "start_jobs_background", start_jobs)
+
+    state = await start_or_defer_jobs(object(), [guarded_job, mismatching_job])
+
+    assert state == VideoScheduleState.OPEN
+    assert mismatching_job.status == JobStatus.WAITING_WINDOW
+    assert events == [
+        ("park", [mismatching_job.id]),
+        ("start", [guarded_job.id]),
+    ]
+
+
+def test_execution_authority_rejects_guarded_mismatch_before_node_work():
+    guarded_job_id = uuid.uuid4()
+    authority = LockedJobExecutionAuthority(
+        channel=None,
+        schedule=SimpleNamespace(
+            state=VideoScheduleState.OPEN.value,
+            guarded_job_id=guarded_job_id,
+        ),
+        task=None,
+        job=SimpleNamespace(id=uuid.uuid4(), status=JobStatus.RUNNING),
+        node=None,
+    )
+
+    with pytest.raises(JobExecutionAuthorityBlocked, match="guarded"):
+        require_active_execution_authority(
+            authority,
+            job_statuses={JobStatus.RUNNING},
+        )

@@ -355,6 +355,56 @@ async def _seed_worker_authority(factory, *, node_status: NodeStatus, job_status
         return channel.id, task.id, job.id, node.id
 
 
+async def test_guarded_mismatch_is_parked_before_initial_or_node_dispatch(
+    postgres_race_db,
+    monkeypatch,
+):
+    _engine, factory = postgres_race_db
+    _channel_id, _task_id, job_id, _node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.PENDING,
+        job_status=JobStatus.PENDING,
+    )
+    async with factory() as db:
+        schedule = await db.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+        mismatching_job = await db.get(Job, job_id)
+        assert schedule is not None
+        assert mismatching_job is not None
+        guarded_job = Job(
+            pipeline_id=mismatching_job.pipeline_id,
+            pipeline_snapshot=mismatching_job.pipeline_snapshot,
+            status=JobStatus.RUNNING,
+            orchestrator_owner="python",
+        )
+        db.add(guarded_job)
+        await db.flush()
+        schedule.guarded_job_id = guarded_job.id
+        await db.commit()
+
+    redis_dispatches: list[tuple[str, dict]] = []
+
+    class RecordingRedis:
+        async def xadd(self, stream_key, payload):
+            redis_dispatches.append((stream_key, payload))
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
+    monkeypatch.setattr("app.orchestrator.engine._redis", lambda: RecordingRedis())
+
+    await JobEngine().start_job(job_id)
+
+    async with factory() as db:
+        stored_job = await db.get(Job, job_id)
+        stored_node = (
+            await db.execute(select(NodeExecution).where(NodeExecution.job_id == job_id))
+        ).scalar_one()
+    assert stored_job is not None and stored_job.status == JobStatus.WAITING_WINDOW
+    assert stored_node.status == NodeStatus.PENDING
+    assert redis_dispatches == []
+
+
 async def test_worker_claim_cannot_revive_quarantine_first_node(postgres_race_db):
     engine, factory = postgres_race_db
     channel_id, task_id, job_id, node_id = await _seed_worker_authority(

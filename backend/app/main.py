@@ -5,9 +5,6 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-
 from app.api.artifacts import router as artifacts_router
 from app.api.assets import router as assets_router
 from app.api.autoflow import router as autoflow_router
@@ -25,10 +22,11 @@ from app.orchestrator.engine import engine
 from app.orchestrator.event_listener import event_listener
 from app.services.schedule_service import (
     VideoScheduleState,
+    default_video_schedule_state,
     defer_job_until_next_window,
-    get_video_schedule_state,
-    is_job_fresh_submission,
+    get_video_schedule_record,
     load_video_jobs_for_recovery,
+    should_defer_job_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,17 +80,16 @@ async def _prepare_job_for_recovery(db, job) -> bool:
 async def _recover_stale_jobs():
     """On startup, find PENDING/RUNNING jobs and restart them."""
     async with async_session() as db:
-        schedule_state = await get_video_schedule_state(db)
+        schedule = await get_video_schedule_record(db)
+        try:
+            schedule_state = VideoScheduleState(schedule.state)
+        except ValueError:
+            schedule_state = default_video_schedule_state()
         stale_jobs = await load_video_jobs_for_recovery(db)
         jobs_to_restart: list[Job] = []
         for job in stale_jobs:
-            if schedule_state == VideoScheduleState.CLOSED:
+            if should_defer_job_start(job, schedule_state, schedule.guarded_job_id):
                 await defer_job_until_next_window(db, job)
-                continue
-
-            if schedule_state == VideoScheduleState.DRAINING and is_job_fresh_submission(job):
-                job.status = JobStatus.WAITING_WINDOW
-                await db.commit()
                 continue
 
             changed = await _prepare_job_for_recovery(db, job)

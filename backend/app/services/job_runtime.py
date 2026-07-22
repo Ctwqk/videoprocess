@@ -12,8 +12,10 @@ from app.models.job import Job
 from app.schemas.job import JobDetailResponse, JobResponse, NodeExecutionResponse
 from app.services.schedule_service import (
     VideoScheduleState,
-    get_video_schedule_state,
+    default_video_schedule_state,
+    get_video_schedule_record,
     park_jobs_for_window,
+    should_defer_job_start,
 )
 
 
@@ -35,12 +37,23 @@ async def start_or_defer_jobs(db: AsyncSession, jobs: Iterable[Job]) -> VideoSch
     if not materialized_jobs:
         return VideoScheduleState.OPEN
 
-    schedule_state = await get_video_schedule_state(db)
-    if schedule_state == VideoScheduleState.OPEN:
-        await start_jobs_background(job.id for job in materialized_jobs)
-        return schedule_state
+    schedule = await get_video_schedule_record(db)
+    try:
+        schedule_state = VideoScheduleState(schedule.state)
+    except ValueError:
+        schedule_state = default_video_schedule_state()
 
-    await park_jobs_for_window(db, materialized_jobs)
+    deferred = [
+        job
+        for job in materialized_jobs
+        if should_defer_job_start(job, schedule_state, schedule.guarded_job_id)
+    ]
+    started = [job for job in materialized_jobs if job not in deferred]
+
+    if deferred:
+        await park_jobs_for_window(db, deferred)
+    if started:
+        await start_jobs_background(job.id for job in started)
     return schedule_state
 
 
