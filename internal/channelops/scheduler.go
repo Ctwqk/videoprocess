@@ -1,7 +1,9 @@
 package channelops
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -169,10 +171,16 @@ func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]C
 	result := []ChannelProfileRow{}
 	for rows.Next() {
 		var row ChannelProfileRow
+		var contentMixJSON []byte
 		if err := rows.Scan(&row.ID, &row.Enabled, &row.DryRun, &row.HaltedAt, &row.TickIntervalMinutes,
-			&row.ConfigVersion, &row.RiskPolicyJSON, &row.CadencePolicyJSON, &row.ContentMixPolicyJSON,
+			&row.ConfigVersion, &row.RiskPolicyJSON, &row.CadencePolicyJSON, &contentMixJSON,
 			&row.DefaultAspectRatio, &row.CreatedAt, &row.UpdatedAt); err != nil {
 			return nil, err
+		}
+		decoder := json.NewDecoder(bytes.NewReader(contentMixJSON))
+		decoder.UseNumber()
+		if err := decoder.Decode(&row.ContentMixPolicyJSON); err != nil {
+			return nil, fmt.Errorf("scan channel content_mix_policy_json: %w", err)
 		}
 		result = append(result, row)
 	}

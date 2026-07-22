@@ -1,0 +1,86 @@
+[
+  {
+    "name": "defaults",
+    "policy_json": "{}",
+    "valid": true,
+    "expected": {
+      "enabled": false,
+      "interval_minutes": 360,
+      "max_queries_per_run": 3,
+      "max_results_per_query": 10,
+      "min_view_count": 1000,
+      "region_code": "US"
+    }
+  },
+  {
+    "name": "lower bounds with legacy region",
+    "policy_json": "{\"region_code\":\"CA\",\"youtube_discovery\":{\"enabled\":true,\"interval_minutes\":60,\"max_queries_per_run\":1,\"max_results_per_query\":1,\"min_view_count\":0}}",
+    "valid": true,
+    "expected": {
+      "enabled": true,
+      "interval_minutes": 60,
+      "max_queries_per_run": 1,
+      "max_results_per_query": 1,
+      "min_view_count": 0,
+      "region_code": "CA"
+    }
+  },
+  {
+    "name": "upper bounds with nested region precedence",
+    "policy_json": "{\"region_code\":\"invalid-legacy\",\"youtube_discovery\":{\"enabled\":false,\"interval_minutes\":1440,\"max_queries_per_run\":5,\"max_results_per_query\":25,\"min_view_count\":1000000000,\"region_code\":\"GB\"}}",
+    "valid": true,
+    "expected": {
+      "enabled": false,
+      "interval_minutes": 1440,
+      "max_queries_per_run": 5,
+      "max_results_per_query": 25,
+      "min_view_count": 1000000000,
+      "region_code": "GB"
+    }
+  },
+  {
+    "name": "decimal interval",
+    "policy_json": "{\"youtube_discovery\":{\"interval_minutes\":360.0}}",
+    "valid": false
+  },
+  {
+    "name": "exponent interval",
+    "policy_json": "{\"youtube_discovery\":{\"interval_minutes\":36e1}}",
+    "valid": false
+  },
+  {
+    "name": "decimal query count",
+    "policy_json": "{\"youtube_discovery\":{\"max_queries_per_run\":3.0}}",
+    "valid": false
+  },
+  {
+    "name": "exponent result count",
+    "policy_json": "{\"youtube_discovery\":{\"max_results_per_query\":1e1}}",
+    "valid": false
+  },
+  {
+    "name": "decimal view count",
+    "policy_json": "{\"youtube_discovery\":{\"min_view_count\":1000.0}}",
+    "valid": false
+  },
+  {
+    "name": "boolean has exact type",
+    "policy_json": "{\"youtube_discovery\":{\"enabled\":1}}",
+    "valid": false
+  },
+  {
+    "name": "integer has exact type",
+    "policy_json": "{\"youtube_discovery\":{\"max_results_per_query\":\"10\"}}",
+    "valid": false
+  },
+  {
+    "name": "region has exact type",
+    "policy_json": "{\"youtube_discovery\":{\"region_code\":10}}",
+    "valid": false
+  },
+  {
+    "name": "nested policy has object type",
+    "policy_json": "{\"youtube_discovery\":[]}",
+    "valid": false
+  }
+]

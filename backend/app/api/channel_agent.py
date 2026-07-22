@@ -101,6 +101,8 @@ def _has_discovery_queue_authority(
     return (
         queue_item.kind == "ingest_discovery"
         and queue_item.status == "running"
+        and bool((queue_item.locked_by or "").strip())
+        and queue_item.locked_at is not None
         and queue_item.channel_profile_id == data.channel_id
         and isinstance(payload, dict)
         and payload.get("channel_id") == str(data.channel_id)

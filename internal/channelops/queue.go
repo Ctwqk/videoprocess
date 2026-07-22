@@ -92,6 +92,12 @@ const queueAuthorityClaimPredicate = `
 		  )
 `
 
+const (
+	// Keep in sync with backend/app/services/discovery_ingestion.py RUN_STALE_AFTER.
+	discoveryLeaseStaleAfter   = 15 * time.Minute
+	discoveryLeaseRecoveryCode = "discovery_lease_recovered"
+)
+
 const claimNextQuery = queueAuthorityCTE + `
 	, picked AS (
 		SELECT q.id
@@ -250,6 +256,42 @@ func (s *Store) ClaimNext(ctx context.Context, workerID string) (*QueueItemRow, 
 		return nil, err
 	}
 	return item, nil
+}
+
+func (s *Store) recoverStaleDiscoveryLeases(ctx context.Context, now time.Time) (int64, error) {
+	current := now.UTC()
+	result, err := s.db().Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = CASE
+		        WHEN attempt_count < max_attempts THEN $3
+		        ELSE $4
+		    END,
+		    run_after = CASE
+		        WHEN attempt_count < max_attempts THEN $5
+		        ELSE run_after
+		    END,
+		    last_error = $6,
+		    dead_letter_at = CASE
+		        WHEN attempt_count < max_attempts THEN NULL
+		        ELSE $5
+		    END,
+		    locked_by = NULL,
+		    locked_at = NULL
+		WHERE kind = $1
+		  AND status = $2
+		  AND dead_letter_at IS NULL
+		  AND (
+		    locked_by IS NULL
+		    OR BTRIM(locked_by) = ''
+		    OR locked_at IS NULL
+		    OR locked_at <= $7
+		  )
+	`, QueueIngestDiscovery, QueueStatusRunning, QueueStatusQueued, QueueStatusDeadLettered,
+		current, discoveryLeaseRecoveryCode, current.Add(-discoveryLeaseStaleAfter))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 func (s *Store) ClaimNextForKinds(ctx context.Context, workerID string, kinds []string) (*QueueItemRow, error) {

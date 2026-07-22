@@ -2,8 +2,62 @@ package channelops
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+type serializedDiscoveryPolicyCase struct {
+	Name       string `json:"name"`
+	PolicyJSON string `json:"policy_json"`
+	Valid      bool   `json:"valid"`
+	Expected   struct {
+		Enabled            bool   `json:"enabled"`
+		IntervalMinutes    int    `json:"interval_minutes"`
+		MaxQueriesPerRun   int    `json:"max_queries_per_run"`
+		MaxResultsPerQuery int    `json:"max_results_per_query"`
+		MinViewCount       int    `json:"min_view_count"`
+		RegionCode         string `json:"region_code"`
+	} `json:"expected"`
+}
+
+func TestDiscoveryPolicySerializedCorpus(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "backend", "tests", "fixtures", "discovery_policy_serialized.json"))
+	if err != nil {
+		t.Fatalf("read shared discovery policy corpus: %v", err)
+	}
+	var cases []serializedDiscoveryPolicyCase
+	if err := json.Unmarshal(raw, &cases); err != nil {
+		t.Fatalf("decode shared discovery policy corpus: %v", err)
+	}
+	for _, tt := range cases {
+		t.Run(tt.Name, func(t *testing.T) {
+			contentMix := decodeDiscoveryContentMix(t, tt.PolicyJSON)
+			policy, err := DiscoveryPolicyFromContentMix(contentMix)
+			if !tt.Valid {
+				if err == nil {
+					t.Fatalf("DiscoveryPolicyFromContentMix accepted %s", tt.PolicyJSON)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DiscoveryPolicyFromContentMix: %v", err)
+			}
+			want := DiscoveryPolicy{
+				Enabled:            tt.Expected.Enabled,
+				IntervalMinutes:    tt.Expected.IntervalMinutes,
+				MaxQueriesPerRun:   tt.Expected.MaxQueriesPerRun,
+				MaxResultsPerQuery: tt.Expected.MaxResultsPerQuery,
+				MinViewCount:       tt.Expected.MinViewCount,
+				RegionCode:         tt.Expected.RegionCode,
+			}
+			if policy != want {
+				t.Fatalf("policy = %#v, want %#v", policy, want)
+			}
+		})
+	}
+}
 
 func TestDiscoveryPolicyFromContentMixDefaultsDisabled(t *testing.T) {
 	policy, err := DiscoveryPolicyFromContentMix(map[string]any{})
@@ -55,8 +109,8 @@ func TestDiscoveryPolicyFromContentMixParsesJSONBoundsAndLegacyRegion(t *testing
 			if got, ok := contentMix["youtube_discovery"].(map[string]any); ok {
 				for _, field := range []string{"interval_minutes", "max_queries_per_run", "max_results_per_query", "min_view_count"} {
 					if _, exists := got[field]; exists {
-						if _, ok := got[field].(float64); !ok {
-							t.Fatalf("decoded %s type = %T, want float64", field, got[field])
+						if _, ok := got[field].(json.Number); !ok {
+							t.Fatalf("decoded %s type = %T, want json.Number", field, got[field])
 						}
 					}
 				}
@@ -105,25 +159,27 @@ func TestDiscoveryPolicyFromContentMixRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-func TestDiscoveryPolicyFromContentMixAcceptsOnlyJSONDecodedIntegralNumbers(t *testing.T) {
+func TestDiscoveryPolicyFromContentMixAcceptsOnlyLexicallyIntegralJSONNumbers(t *testing.T) {
 	valid := map[string]any{
 		"youtube_discovery": map[string]any{
 			"enabled":               true,
-			"interval_minutes":      float64(360),
-			"max_queries_per_run":   float64(3),
-			"max_results_per_query": float64(10),
-			"min_view_count":        float64(1000),
+			"interval_minutes":      json.Number("360"),
+			"max_queries_per_run":   json.Number("3"),
+			"max_results_per_query": json.Number("10"),
+			"min_view_count":        json.Number("1000"),
 		},
 	}
 	if _, err := DiscoveryPolicyFromContentMix(valid); err != nil {
 		t.Fatalf("DiscoveryPolicyFromContentMix JSON-decoded values: %v", err)
 	}
 
-	nonJSONNumber := map[string]any{
-		"youtube_discovery": map[string]any{"interval_minutes": 360},
-	}
-	if _, err := DiscoveryPolicyFromContentMix(nonJSONNumber); err == nil {
-		t.Fatal("DiscoveryPolicyFromContentMix accepted non-JSON decoded integer")
+	for _, value := range []any{360, float64(360)} {
+		nonJSONNumber := map[string]any{
+			"youtube_discovery": map[string]any{"interval_minutes": value},
+		}
+		if _, err := DiscoveryPolicyFromContentMix(nonJSONNumber); err == nil {
+			t.Fatalf("DiscoveryPolicyFromContentMix accepted non-serialized number %T", value)
+		}
 	}
 }
 
@@ -136,7 +192,9 @@ func TestDiscoveryIdempotencyKey(t *testing.T) {
 func decodeDiscoveryContentMix(t *testing.T, raw string) map[string]any {
 	t.Helper()
 	var contentMix map[string]any
-	if err := json.Unmarshal([]byte(raw), &contentMix); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&contentMix); err != nil {
 		t.Fatalf("decode test content mix: %v", err)
 	}
 	return contentMix

@@ -40,6 +40,7 @@ POLICY = {
         "region_code": "US",
     }
 }
+LEASED_AT = datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -79,6 +80,8 @@ async def _channel_and_queue(
     queue_status: str = "running",
     queue_channel_id: uuid.UUID | None = None,
     payload: object | None = None,
+    queue_locked_by: str | None = "discovery-runner",
+    queue_locked_at: datetime | None = LEASED_AT,
 ) -> tuple[ChannelProfile, ChannelOpsQueueItem]:
     channel = ChannelProfile(
         name="Discovery API",
@@ -94,6 +97,8 @@ async def _channel_and_queue(
         idempotency_key=f"ingest_discovery:{uuid.uuid4()}",
         channel_profile_id=queue_channel_id or channel.id,
         status=queue_status,
+        locked_by=queue_locked_by,
+        locked_at=queue_locked_at,
         payload_json=payload if payload is not None else {
             "channel_id": str(channel.id),
             "source": "youtube_search",
@@ -220,6 +225,8 @@ async def test_discovery_ingest_rejects_missing_channel_before_provider_call(api
         idempotency_key=f"ingest_discovery:{uuid.uuid4()}",
         channel_profile_id=missing_channel_id,
         status="running",
+        locked_by="discovery-runner",
+        locked_at=LEASED_AT,
         payload_json={
             "channel_id": str(missing_channel_id),
             "source": "youtube_search",
@@ -249,6 +256,59 @@ async def test_discovery_ingest_rejects_missing_channel_before_provider_call(api
     assert response.status_code == 404
     assert response.json() == {"detail": "discovery_channel_not_found"}
     assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("locked_by", "locked_at"),
+    [
+        (None, LEASED_AT),
+        ("   ", LEASED_AT),
+        ("discovery-runner", None),
+    ],
+    ids=["missing-owner", "blank-owner", "missing-lock-time"],
+)
+async def test_discovery_ingest_rejects_missing_or_blank_queue_lease_before_provider(
+    api_session,
+    monkeypatch,
+    locked_by,
+    locked_at,
+):
+    channel, queue = await _channel_and_queue(
+        api_session,
+        queue_locked_by=locked_by,
+        queue_locked_at=locked_at,
+    )
+    factory_calls = 0
+    provider_calls = 0
+
+    def fake_client():
+        nonlocal factory_calls
+        factory_calls += 1
+        return object()
+
+    async def fake_ingest_channel(self, db, channel_id: str, now):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("provider must not be called without queue lease authority")
+
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", fake_client)
+    monkeypatch.setattr(
+        discovery_ingestion.YouTubeTrendIngester,
+        "ingest_channel",
+        fake_ingest_channel,
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(api_session)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(DISCOVERY_PATH, json=_request(channel, queue))
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "discovery_queue_authority_invalid"}
+    assert factory_calls == 0
+    assert provider_calls == 0
 
 
 @pytest.mark.asyncio

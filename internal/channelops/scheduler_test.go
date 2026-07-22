@@ -210,6 +210,7 @@ func TestSchedulerRunOnceDiscoveryFailClosesWithoutChangingAgentTick(t *testing.
 	}{
 		{name: "default disabled", contentMix: `{}`},
 		{name: "invalid enabled policy", contentMix: `{"youtube_discovery":{"enabled":true,"interval_minutes":59}}`},
+		{name: "decimal interval remains invalid through jsonb", contentMix: `{"youtube_discovery":{"enabled":true,"interval_minutes":360.0}}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()

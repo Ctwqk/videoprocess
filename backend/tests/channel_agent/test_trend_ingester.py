@@ -120,6 +120,50 @@ async def test_youtube_trend_ingester_orders_and_limits_lanes_and_bounds_provide
 
 
 @pytest.mark.asyncio
+async def test_youtube_trend_ingester_bounds_oversized_provider_results_before_persistence(
+    trend_session,
+):
+    now = datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc)
+    channel = ChannelProfile(name="bounded trends", language="en")
+    trend_session.add(channel)
+    await trend_session.flush()
+    trend_session.add(
+        TopicLane(
+            channel_profile_id=channel.id,
+            name="AI",
+            keywords_json=["ai"],
+        )
+    )
+    await trend_session.commit()
+    client = FakeTrendYouTubeClient(
+        [
+            {"video_id": f"video-{index}", "view_count": 2500 + index}
+            for index in range(5)
+        ]
+    )
+    ingester = YouTubeTrendIngester(
+        youtube_client=client,
+        min_view_count=100,
+        max_results=2,
+    )
+
+    result = await ingester.ingest_channel(
+        trend_session,
+        channel_id=str(channel.id),
+        now=now,
+    )
+
+    persisted = (
+        await trend_session.execute(
+            select(DiscoverySignal).order_by(DiscoverySignal.source_external_id.asc())
+        )
+    ).scalars().all()
+    assert [signal.source_external_id for signal in persisted] == ["video-0", "video-1"]
+    assert result.created_count == 2
+    assert client.requests[0]["max_results"] == 2
+
+
+@pytest.mark.asyncio
 async def test_youtube_trend_ingester_reports_create_refresh_expiry_and_preserves_converted(
     trend_session,
 ):

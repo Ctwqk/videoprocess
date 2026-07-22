@@ -78,7 +78,7 @@ class YouTubeTrendIngester:
                     raise TypeError("youtube search results must be objects")
             except Exception as exc:
                 raise TrendProviderError(exc, query_count=query_count) from exc
-            for result in results:
+            for result in results[: self.max_results]:
                 if _view_count(result) < self.min_view_count:
                     continue
                 source_external_id = _source_external_id(result)

@@ -113,6 +113,9 @@ func (r *Runner) runOnce(ctx context.Context) error {
 	if len(claimableKinds) == 0 {
 		return nil
 	}
+	if _, err := r.Store.recoverStaleDiscoveryLeases(ctx, now); err != nil {
+		return err
+	}
 	item, err := r.Store.ClaimNextForKinds(ctx, "channelops-go-runner", claimableKinds)
 	if err != nil {
 		return err

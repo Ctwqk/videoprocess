@@ -1,10 +1,38 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from dataclasses import FrozenInstanceError
+import json
+from pathlib import Path
 
 import pytest
 
 from app.channel_agent.discovery_policy import DiscoveryPolicy, DiscoveryPolicyError
+
+
+SERIALIZED_POLICY_CASES = json.loads(
+    (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "discovery_policy_serialized.json"
+    ).read_text()
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    SERIALIZED_POLICY_CASES,
+    ids=[case["name"] for case in SERIALIZED_POLICY_CASES],
+)
+def test_discovery_policy_matches_shared_serialized_corpus(case: dict[str, object]) -> None:
+    content_mix = json.loads(str(case["policy_json"]))
+
+    if not case["valid"]:
+        with pytest.raises(DiscoveryPolicyError):
+            DiscoveryPolicy.from_content_mix(content_mix)
+        return
+
+    assert asdict(DiscoveryPolicy.from_content_mix(content_mix)) == case["expected"]
 
 
 def test_discovery_policy_defaults_to_disabled() -> None:

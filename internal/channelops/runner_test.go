@@ -109,6 +109,7 @@ func TestNewRunnerHandlerServiceConfiguresDiscoveryDirectly(t *testing.T) {
 		{name: "missing base URL", mutate: func(cfg *Config) { cfg.AutoFlowBaseURL = "  " }},
 		{name: "credential base URL", mutate: func(cfg *Config) { cfg.AutoFlowBaseURL = "http://user:password@api:8080" }},
 		{name: "query base URL", mutate: func(cfg *Config) { cfg.AutoFlowBaseURL = "http://api:8080?credential=secret" }},
+		{name: "empty query base URL", mutate: func(cfg *Config) { cfg.AutoFlowBaseURL = "http://api:8080?" }},
 		{name: "invalid scheme", mutate: func(cfg *Config) { cfg.AutoFlowBaseURL = "ftp://api:8080" }},
 		{name: "invalid timeout", mutate: func(cfg *Config) { cfg.DiscoveryTimeout = 29 * time.Second }},
 		{name: "malformed timeout", loadMalformed: true},
@@ -278,6 +279,279 @@ func TestRunnerDiscoveryLeaseRaceCannotFinalizeReplacementLease(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunnerRecoversStaleDiscoveryLeaseBeforeClaim(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	queueID := enqueueDiscoveryRecoveryItem(t, ctx, fixture, 3)
+	staleLockedAt := fixture.Store.Now().Add(-15 * time.Minute)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = $2, attempt_count = 1, locked_by = 'crashed-runner', locked_at = $3
+		WHERE id = $1::uuid
+	`, queueID, QueueStatusRunning, staleLockedAt); err != nil {
+		t.Fatalf("seed stale discovery lease: %v", err)
+	}
+
+	var replacementLockedAt time.Time
+	var recoveredError *string
+	client := &recordingDiscoveryClient{ingest: func(request DiscoveryIngestRequest) (DiscoveryObservation, error) {
+		var status, lockedBy string
+		var attempts int
+		if err := fixture.Store.Pool.QueryRow(ctx, `
+			SELECT status, attempt_count, locked_by, locked_at, last_error
+			FROM channel_ops_queue_items WHERE id = $1::uuid
+		`, queueID).Scan(&status, &attempts, &lockedBy, &replacementLockedAt, &recoveredError); err != nil {
+			return DiscoveryObservation{}, err
+		}
+		if status != QueueStatusRunning || attempts != 2 || lockedBy != "channelops-go-runner" {
+			return DiscoveryObservation{}, errors.New("replacement discovery lease was not claimed")
+		}
+		return discoveryObservationForTest(request), nil
+	}}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+	runner := &Runner{Store: fixture.Store, Handlers: handler}
+
+	if err := runner.runOnce(ctx); err != nil {
+		t.Fatalf("runOnce: %v", err)
+	}
+	if !replacementLockedAt.After(staleLockedAt) {
+		t.Fatalf("replacement locked_at = %s, stale locked_at = %s", replacementLockedAt, staleLockedAt)
+	}
+	if recoveredError == nil || *recoveredError != "discovery_lease_recovered" {
+		t.Fatalf("recovery error category = %v", recoveredError)
+	}
+	var status string
+	var attempts int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count FROM channel_ops_queue_items WHERE id = $1::uuid
+	`, queueID).Scan(&status, &attempts); err != nil {
+		t.Fatalf("select recovered discovery row: %v", err)
+	}
+	if status != QueueStatusSucceeded || attempts != 2 || client.calls != 1 {
+		t.Fatalf("recovered row = status %s attempts %d calls %d", status, attempts, client.calls)
+	}
+}
+
+func TestRunnerDiscoveryRecoveryLeavesFreshAndOtherKindsRunning(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	freshID := enqueueDiscoveryRecoveryItem(t, ctx, fixture, 3)
+	otherID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind: QueueLearningRecompute, IdempotencyKey: "recovery-other-kind:" + t.Name(),
+		Payload: map[string]any{
+			"channel_id": fixture.ChannelID, "bucket": "2026-05-21-18", "window_days": []int{7, 30},
+		},
+		Priority: 180, ChannelProfileID: &fixture.ChannelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue other queue kind: %v", err)
+	}
+	freshLockedAt := fixture.Store.Now().Add(-15*time.Minute + time.Second)
+	staleLockedAt := fixture.Store.Now().Add(-time.Hour)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = $2,
+		    attempt_count = 1,
+		    locked_by = CASE WHEN id = $1::uuid THEN 'fresh-runner' ELSE 'other-runner' END,
+		    locked_at = CASE WHEN id = $1::uuid THEN $4::timestamptz ELSE $5::timestamptz END
+		WHERE id IN ($1::uuid, $3::uuid)
+	`, freshID, QueueStatusRunning, otherID, freshLockedAt, staleLockedAt); err != nil {
+		t.Fatalf("seed untouched running leases: %v", err)
+	}
+
+	client := &recordingDiscoveryClient{}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+	if err := (&Runner{Store: fixture.Store, Handlers: handler}).runOnce(ctx); err != nil {
+		t.Fatalf("runOnce: %v", err)
+	}
+	for _, tt := range []struct {
+		id       string
+		owner    string
+		lockedAt time.Time
+	}{
+		{id: freshID, owner: "fresh-runner", lockedAt: freshLockedAt},
+		{id: otherID, owner: "other-runner", lockedAt: staleLockedAt},
+	} {
+		var status, owner string
+		var lockedAt time.Time
+		var attempts int
+		if err := fixture.Store.Pool.QueryRow(ctx, `
+			SELECT status, attempt_count, locked_by, locked_at
+			FROM channel_ops_queue_items WHERE id = $1::uuid
+		`, tt.id).Scan(&status, &attempts, &owner, &lockedAt); err != nil {
+			t.Fatalf("select untouched running lease: %v", err)
+		}
+		if status != QueueStatusRunning || attempts != 1 || owner != tt.owner || !lockedAt.Equal(tt.lockedAt) {
+			t.Fatalf("running lease changed = %s/%d/%s/%s", status, attempts, owner, lockedAt)
+		}
+	}
+	if client.calls != 0 {
+		t.Fatalf("fresh discovery client calls = %d, want 0", client.calls)
+	}
+}
+
+func TestRunnerRecoversDiscoveryRowsWithMalformedLeaseOwnership(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		lockedBy *string
+		lockedAt *time.Time
+	}{
+		{name: "missing owner", lockedAt: timePointer(time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC))},
+		{name: "blank owner", lockedBy: stringPointer("   "), lockedAt: timePointer(time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC))},
+		{name: "missing timestamp", lockedBy: stringPointer("crashed-runner")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			queueID := enqueueDiscoveryRecoveryItem(t, ctx, fixture, 3)
+			if _, err := fixture.Store.Pool.Exec(ctx, `
+				UPDATE channel_ops_queue_items
+				SET status = $2, attempt_count = 1, locked_by = $3, locked_at = $4
+				WHERE id = $1::uuid
+			`, queueID, QueueStatusRunning, tt.lockedBy, tt.lockedAt); err != nil {
+				t.Fatalf("seed malformed discovery lease: %v", err)
+			}
+
+			client := &recordingDiscoveryClient{}
+			handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+			handler.Discovery = client
+			client.ingest = func(request DiscoveryIngestRequest) (DiscoveryObservation, error) {
+				return discoveryObservationForTest(request), nil
+			}
+			if err := (&Runner{Store: fixture.Store, Handlers: handler}).runOnce(ctx); err != nil {
+				t.Fatalf("runOnce: %v", err)
+			}
+			var status string
+			var attempts int
+			if err := fixture.Store.Pool.QueryRow(ctx, `
+				SELECT status, attempt_count FROM channel_ops_queue_items WHERE id = $1::uuid
+			`, queueID).Scan(&status, &attempts); err != nil {
+				t.Fatalf("select recovered malformed lease: %v", err)
+			}
+			if status != QueueStatusSucceeded || attempts != 2 || client.calls != 1 {
+				t.Fatalf("malformed recovery = status %s attempts %d calls %d", status, attempts, client.calls)
+			}
+		})
+	}
+}
+
+func TestRunnerDeadLettersExhaustedStaleDiscoveryLease(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	queueID := enqueueDiscoveryRecoveryItem(t, ctx, fixture, 3)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = $2, attempt_count = max_attempts,
+		    locked_by = 'crashed-runner', locked_at = $3
+		WHERE id = $1::uuid
+	`, queueID, QueueStatusRunning, fixture.Store.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("seed exhausted discovery lease: %v", err)
+	}
+
+	client := &recordingDiscoveryClient{}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+	if err := (&Runner{Store: fixture.Store, Handlers: handler}).runOnce(ctx); err != nil {
+		t.Fatalf("runOnce: %v", err)
+	}
+	var status string
+	var lastError *string
+	var lockedBy *string
+	var lockedAt, deadLetterAt *time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, last_error, locked_by, locked_at, dead_letter_at
+		FROM channel_ops_queue_items WHERE id = $1::uuid
+	`, queueID).Scan(&status, &lastError, &lockedBy, &lockedAt, &deadLetterAt); err != nil {
+		t.Fatalf("select exhausted discovery lease: %v", err)
+	}
+	if status != QueueStatusDeadLettered || lastError == nil || *lastError != "discovery_lease_recovered" || lockedBy != nil || lockedAt != nil || deadLetterAt == nil {
+		t.Fatalf("exhausted recovery = %s/%v/%v/%v/%v", status, lastError, lockedBy, lockedAt, deadLetterAt)
+	}
+	if client.calls != 0 {
+		t.Fatalf("exhausted discovery client calls = %d, want 0", client.calls)
+	}
+}
+
+func TestRunnerRecoveryFencesStaleDiscoveryOwnerCompletion(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	queueID := enqueueDiscoveryRecoveryItem(t, ctx, fixture, 3)
+	oldOwner := "crashed-runner"
+	oldLockedAt := fixture.Store.Now().Add(-time.Hour)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = $2, attempt_count = 1, locked_by = $3, locked_at = $4
+		WHERE id = $1::uuid
+	`, queueID, QueueStatusRunning, oldOwner, oldLockedAt); err != nil {
+		t.Fatalf("seed stale discovery owner: %v", err)
+	}
+	staleItem := QueueItemRow{
+		ID: queueID, Status: QueueStatusRunning, AttemptCount: 1, MaxAttempts: 3,
+		LockedBy: &oldOwner, LockedAt: &oldLockedAt,
+	}
+
+	var staleCompletionErr error
+	client := &recordingDiscoveryClient{ingest: func(request DiscoveryIngestRequest) (DiscoveryObservation, error) {
+		staleCompletionErr = fixture.Store.MarkQueueDone(ctx, staleItem)
+		return discoveryObservationForTest(request), nil
+	}}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+	if err := (&Runner{Store: fixture.Store, Handlers: handler}).runOnce(ctx); err != nil {
+		t.Fatalf("runOnce: %v", err)
+	}
+	if !errors.Is(staleCompletionErr, ErrQueueLeaseLost) {
+		t.Fatalf("stale completion error = %v, want ErrQueueLeaseLost", staleCompletionErr)
+	}
+	var status string
+	var attempts int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count FROM channel_ops_queue_items WHERE id = $1::uuid
+	`, queueID).Scan(&status, &attempts); err != nil {
+		t.Fatalf("select stale owner recovery: %v", err)
+	}
+	if status != QueueStatusSucceeded || attempts != 2 {
+		t.Fatalf("stale owner recovery = status %s attempts %d", status, attempts)
+	}
+}
+
+func enqueueDiscoveryRecoveryItem(t *testing.T, ctx context.Context, fixture *ChannelOpsFixture, maxAttempts int) string {
+	t.Helper()
+	channelID := fixture.ChannelID
+	bucket := "2026-05-21-18"
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind: QueueIngestDiscovery, IdempotencyKey: "discovery-recovery:" + t.Name(),
+		Payload: map[string]any{
+			"channel_id": channelID, "source": "youtube_search", "bucket": bucket, "scheduler_bucket": bucket,
+		},
+		Priority: 80, ChannelProfileID: &channelID, MaxAttempts: maxAttempts,
+	})
+	if err != nil {
+		t.Fatalf("enqueue discovery recovery item: %v", err)
+	}
+	return queueID
+}
+
+func stringPointer(value string) *string {
+	return &value
+}
+
+func timePointer(value time.Time) *time.Time {
+	return &value
 }
 
 func TestRunnerRunContinuesAfterDiscoveryLeaseLoss(t *testing.T) {

@@ -1,8 +1,9 @@
 package channelops
 
 import (
+	"encoding/json"
 	"fmt"
-	"math"
+	"strconv"
 )
 
 const discoverySourceYouTubeSearch = "youtube_search"
@@ -100,11 +101,40 @@ func discoveryInt(value map[string]any, field string, fallback, minimum, maximum
 	if !exists {
 		return fallback, nil
 	}
-	parsed, ok := raw.(float64)
-	if !ok || math.Trunc(parsed) != parsed || parsed < float64(minimum) || parsed > float64(maximum) {
+	number, ok := raw.(json.Number)
+	if !ok || !isLexicallyIntegralJSONNumber(number.String()) {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", field, minimum, maximum)
+	}
+	parsed, err := strconv.ParseInt(number.String(), 10, 64)
+	if err != nil || parsed < int64(minimum) || parsed > int64(maximum) {
 		return 0, fmt.Errorf("%s must be an integer between %d and %d", field, minimum, maximum)
 	}
 	return int(parsed), nil
+}
+
+func isLexicallyIntegralJSONNumber(value string) bool {
+	if value == "" {
+		return false
+	}
+	start := 0
+	if value[0] == '-' {
+		start = 1
+	}
+	if start == len(value) {
+		return false
+	}
+	if value[start] == '0' {
+		return start+1 == len(value)
+	}
+	if value[start] < '1' || value[start] > '9' {
+		return false
+	}
+	for index := start + 1; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func discoveryRegion(value any) (string, error) {

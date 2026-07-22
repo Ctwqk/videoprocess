@@ -151,7 +151,7 @@ func (c HTTPDiscoveryClient) timeout() time.Duration {
 
 func discoveryEndpoint(baseURL string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
 		return "", errors.New("AUTOFLOW_BASE_URL is invalid for discovery ingestion")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/") + discoveryIngestPath
