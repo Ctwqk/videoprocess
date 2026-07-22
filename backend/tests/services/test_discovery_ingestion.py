@@ -25,6 +25,7 @@ from app.models.channel_agent import (
 from app.services.discovery_ingestion import (
     DiscoveryIngestionAuthorityError,
     DiscoveryIngestionInProgressError,
+    DiscoveryIngestionPolicyError,
     DiscoveryIngestionProviderError,
     DiscoveryIngestionRequest,
     DiscoveryIngestionService,
@@ -96,16 +97,20 @@ async def _seed_request(
     lane_count: int = 1,
     content_mix_policy_json: dict[str, Any] | None = None,
 ) -> tuple[DiscoveryIngestionRequest, list[TopicLane]]:
-    policy = content_mix_policy_json or {
-        "youtube_discovery": {
-            "enabled": True,
-            "interval_minutes": 360,
-            "max_queries_per_run": 3,
-            "max_results_per_query": 10,
-            "min_view_count": 1000,
-            "region_code": "US",
+    policy = (
+        {
+            "youtube_discovery": {
+                "enabled": True,
+                "interval_minutes": 360,
+                "max_queries_per_run": 3,
+                "max_results_per_query": 10,
+                "min_view_count": 1000,
+                "region_code": "US",
+            }
         }
-    }
+        if content_mix_policy_json is None
+        else content_mix_policy_json
+    )
     async with harness.session_factory() as db:
         channel = ChannelProfile(
             name="discovery",
@@ -187,6 +192,38 @@ def _provider_result(video_id: str = "new-hot") -> list[dict[str, Any]]:
             "url": f"https://youtu.be/{video_id}",
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_mix_policy_json", "expected_code"),
+    [
+        ({}, "discovery_disabled"),
+        ({"youtube_discovery": {"enabled": 1}}, "invalid_discovery_policy"),
+    ],
+)
+async def test_discovery_ingestion_rejects_disabled_or_invalid_policy_before_provider(
+    discovery_harness: DiscoveryHarness,
+    content_mix_policy_json: dict[str, Any],
+    expected_code: str,
+) -> None:
+    now = datetime(2026, 7, 21, 18, 5, tzinfo=timezone.utc)
+    request, _ = await _seed_request(
+        discovery_harness,
+        content_mix_policy_json=content_mix_policy_json,
+    )
+    client = FakeDiscoveryYouTubeClient([])
+    service = DiscoveryIngestionService(youtube_client=client)
+
+    async with discovery_harness.session_factory() as db:
+        with pytest.raises(DiscoveryIngestionPolicyError) as exc_info:
+            await service.ingest(db, request, now)
+
+    assert str(exc_info.value) == expected_code
+    assert client.requests == []
+    async with discovery_harness.session_factory() as db:
+        runs = (await db.execute(select(DiscoveryIngestionRun))).scalars().all()
+    assert runs == []
 
 
 @pytest.mark.asyncio

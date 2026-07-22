@@ -50,6 +50,7 @@ class DiscoveryIngestionResult:
 @dataclass(frozen=True)
 class _RunClaim:
     run_id: uuid.UUID
+    generation: int
 
 
 class DiscoveryIngestionError(RuntimeError):
@@ -102,8 +103,6 @@ class DiscoveryIngestionService:
         )
         if isinstance(claim, DiscoveryIngestionResult):
             return claim
-        run_id = claim.run_id
-
         ingester = YouTubeTrendIngester(
             youtube_client=self.youtube_client,
             min_view_count=policy.min_view_count,
@@ -122,7 +121,7 @@ class DiscoveryIngestionService:
             await db.rollback()
             await self._mark_failed(
                 db,
-                run_id=run_id,
+                claim=claim,
                 now=current,
                 error_code=error_code,
                 query_count=exc.query_count,
@@ -138,17 +137,14 @@ class DiscoveryIngestionService:
             await db.rollback()
             await self._mark_failed(
                 db,
-                run_id=run_id,
+                claim=claim,
                 now=current,
                 error_code="channel_unavailable",
                 query_count=ingest_result.query_count,
             )
             raise DiscoveryIngestionAuthorityError("channel_unavailable")
 
-        run = await db.get(DiscoveryIngestionRun, run_id)
-        if run is None or run.status != "running":
-            await db.rollback()
-            raise DiscoveryIngestionConflictError("run_authority_changed")
+        run = await self._lock_owned_run(db, claim)
         run.status = "succeeded"
         run.query_count = ingest_result.query_count
         run.created_count = ingest_result.created_count
@@ -225,8 +221,9 @@ class DiscoveryIngestionService:
         try:
             await db.flush()
             run_id = run.id
+            generation = run.attempt_count
             await db.commit()
-            return _RunClaim(run_id=run_id)
+            return _RunClaim(run_id=run_id, generation=generation)
         except IntegrityError as exc:
             await db.rollback()
             existing = await self._locked_run(db, request)
@@ -275,8 +272,9 @@ class DiscoveryIngestionService:
         run.finished_at = None
         run.last_error_code = None
         run_id = run.id
+        generation = run.attempt_count
         await db.commit()
-        return _RunClaim(run_id=run_id)
+        return _RunClaim(run_id=run_id, generation=generation)
 
     @staticmethod
     async def _locked_run(
@@ -325,24 +323,12 @@ class DiscoveryIngestionService:
     async def _mark_failed(
         db: AsyncSession,
         *,
-        run_id: uuid.UUID,
+        claim: _RunClaim,
         now: datetime,
         error_code: str,
         query_count: int,
     ) -> None:
-        run = (
-            await db.execute(
-                select(DiscoveryIngestionRun)
-                .where(DiscoveryIngestionRun.id == run_id)
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if run is None:
-            await db.rollback()
-            raise DiscoveryIngestionConflictError("run_not_found")
-        if run.status != "running":
-            await db.rollback()
-            raise DiscoveryIngestionConflictError("run_authority_changed")
+        run = await DiscoveryIngestionService._lock_owned_run(db, claim)
         run.status = "failed"
         run.query_count = query_count
         run.created_count = 0
@@ -352,6 +338,28 @@ class DiscoveryIngestionService:
         run.finished_at = now
         run.last_error_code = error_code
         await db.commit()
+
+    @staticmethod
+    async def _lock_owned_run(
+        db: AsyncSession,
+        claim: _RunClaim,
+    ) -> DiscoveryIngestionRun:
+        run = (
+            await db.execute(
+                select(DiscoveryIngestionRun)
+                .where(DiscoveryIngestionRun.id == claim.run_id)
+                .where(DiscoveryIngestionRun.status == "running")
+                .where(
+                    DiscoveryIngestionRun.attempt_count == claim.generation
+                )
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if run is None:
+            await db.rollback()
+            raise DiscoveryIngestionConflictError("run_authority_changed")
+        return run
 
 
 def _normalize_request(request: DiscoveryIngestionRequest) -> DiscoveryIngestionRequest:
