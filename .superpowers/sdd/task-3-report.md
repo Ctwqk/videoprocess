@@ -1,215 +1,144 @@
-# Task 3 Report: Queue-Authority-Fenced Discovery Ingestion API
+# Task 3 Report: Enforce Guarded Authority in Go Scheduling
+
+## Scope
+
+Implemented Task 3 only in the supplied `codex/canary-intake-pause` worktree,
+starting from `994aefe1be7488620f4426e862163bb14306a8ad`. No Python, runner,
+deployment, or external-system files were changed.
+
+## Baseline
+
+Before edits:
+
+```text
+go test -count=1 ./...
+PASS (all Go packages)
+```
+
+The worktree was clean and linked to the requested branch and base.
 
 ## RED
 
+The nine required named tests were added before production changes:
+
+```text
+TestStartJobRunsExactGuardedJob
+TestStartJobParksGuardedMismatchBeforePlanningOrDispatch
+TestStartJobKeepsLegacyUnguardedOpenBehavior
+TestSetVideoScheduleStateClearsGuard
+TestOpenVideoScheduleForJobStoresExactGuard
+TestCoordinatedGuardedOpenRequiresMatchingPythonAndLocalGuard
+TestCoordinatedGuardedOpenUncertainErrorClosesPythonAndLocalAfterRequestCancellation
+TestCoordinatedGuardedOpenKnownConflictDoesNotRetryPythonClose
+TestGuardedScheduleRouteSanitizesInfrastructureError
+```
+
 Command:
 
 ```bash
-cd backend
-.venv/bin/python -m pytest tests/api/test_channel_agent_discovery.py -q
+go test -count=1 ./internal/orchestrator ./internal/httpapi ./internal/store
 ```
 
-Output:
+Observed RED, exit 1:
 
 ```text
-FFFFFFFFFFFFFFFFFF                                                       [100%]
-...
-assert {'detail': 'Not Found'} == {'detail': 'discovery_queue_item_not_found'}
-...
-18 failed in 0.65s
+internal/store/schedule_test.go:149:11: row.GuardedJobID undefined
+internal/httpapi/schedule_controller_test.go:212:59: unknown field GuardedJobID
+--- FAIL: TestStartJobParksGuardedMismatchBeforePlanningOrDispatch
+    engine_test.go:170: job status = "RUNNING"; want WAITING_WINDOW
+FAIL github.com/Ctwqk/videoprocess/internal/orchestrator
+FAIL github.com/Ctwqk/videoprocess/internal/httpapi [build failed]
+FAIL github.com/Ctwqk/videoprocess/internal/store [build failed]
 ```
 
-The route did not exist. The missing-queue assertion received FastAPI's
-`404 Not Found`, and all remaining cases failed because the endpoint was not
-registered.
+These failures matched the missing behavior: Go status did not expose the
+guard, and the orchestrator ran a mismatching job through planning instead of
+parking it.
+
+## Implementation
+
+- Added nullable `guarded_job_id` to Go schedule status reads and JSON output.
+- Generic schedule transitions clear the guard; guarded standalone open stores
+  the expected UUID in the same transaction that releases exactly that Go job.
+- Reordered and deferred store fixture cleanup so the guard is cleared before
+  deletion of its restrictively referenced job.
+- Replaced state-only orchestrator reads with `VideoScheduleAuthority`; guarded
+  mismatches park before planning or dispatch, while exact and legacy
+  unguarded `OPEN` jobs still run.
+- Coordinated guarded open calls Python first and accepts success only for exact
+  `OPEN` guards on both responses plus Python `ReleasedJobs == 1`.
+- Known Python guard conflicts close local authority only. Uncertain outcomes
+  close Python and local independently with separate five-second contexts made
+  from `context.WithoutCancel(ctx)`.
+- Guarded HTTP 500 responses log the internal error and return only
+  `{"detail":"guarded_schedule_open_failed"}`.
 
 ## GREEN
 
-Command:
+Focused command after implementation:
 
 ```bash
-cd backend
-.venv/bin/python -m pytest tests/api/test_channel_agent_discovery.py -q
+go test -count=1 ./internal/orchestrator ./internal/httpapi ./internal/store
 ```
 
-Output:
+Observed GREEN:
 
 ```text
-.....................                                                    [100%]
-21 passed in 0.62s
+ok github.com/Ctwqk/videoprocess/internal/orchestrator
+ok github.com/Ctwqk/videoprocess/internal/httpapi
+ok github.com/Ctwqk/videoprocess/internal/store
 ```
 
-## Verification
+Final required verification, run after the last edit:
 
-```text
-.venv/bin/python -m pytest tests/channel_agent/test_api.py -q
-33 passed in 1.25s
-
-.venv/bin/python -m pytest -q
-746 passed, 55 skipped, 8 warnings in 66.37s (0:01:06)
-
-.venv/bin/python -m ruff check app/api/channel_agent.py app/schemas/channel_agent.py tests/api/test_channel_agent_discovery.py
-All checks passed!
-
-.venv/bin/python -m mypy --follow-imports=skip app/api/channel_agent.py app/schemas/channel_agent.py
-Success: no issues found in 2 source files
-
+```bash
+gofmt -w <all eight changed Go files>
 git diff --check
-(no output; exit 0)
+go test -count=1 ./internal/orchestrator ./internal/httpapi ./internal/store
+go test -count=1 ./...
 ```
 
-Project-wide static checks were also run as required by `AGENTS.md`:
+Observed GREEN, exit 0:
 
 ```text
-.venv/bin/python -m ruff check .
-Found 17 errors.
-
-.venv/bin/python -m mypy app
-Found 66 errors in 24 files (checked 146 source files)
+Focused: orchestrator, httpapi, and store all passed.
+Full: all Go packages passed; command packages reported no test files.
+git diff --check: no output.
 ```
 
-Those findings are pre-existing outside Task 3. The initial scoped mypy run
-identified two literal-type mismatches in the new response construction; both
-were fixed before the final scoped check above. The full test run emitted eight
-pre-existing `datetime.utcnow()` deprecation warnings in orchestrator tests.
+## Database Test Status
+
+No isolated PostgreSQL is configured locally, so the two new integration cases
+skip unless CI sets `CHANNELOPS_REQUIRE_DATABASE=1`, as required:
+
+```text
+--- SKIP: TestSetVideoScheduleStateClearsGuard
+--- SKIP: TestOpenVideoScheduleForJobStoresExactGuard
+PASS
+```
+
+No production database, Docker, external system, or `126` environment was used.
 
 ## Self-Review
 
-- Request validation requires UUID identities, the `youtube_search` literal, a
-  nonblank bounded bucket, and forbids extra properties.
-- The endpoint reads the committed queue row and rejects missing, wrong-kind,
-  non-running, channel-mismatched, or payload-mismatched requests before it
-  creates the YouTube client.
-- Channel availability and discovery policy are independently validated before
-  provider construction. The existing runner's `_build_youtube_client()`
-  wiring is reused lazily.
-- Typed ingestion authority, policy, in-progress, and provider errors map to
-  fixed detail codes. Provider details are not returned.
-- Successful replays use the existing durable ingestion service and return the
-  same run without a second ingester call. The endpoint never changes queue
-  status, retry state, or completion ownership.
-- No download, production-task, upload, publication, promotion, public-mode,
-  scheduler, deployment, or 126 behavior was changed.
+- Verified guarded coordination never legacy-opens local authority first.
+- Verified exact UUID comparison on Python and shared local status, with Python
+  release count exactly one.
+- Verified only `ErrScheduleGuardMismatch` suppresses Python close recovery.
+- Verified each close attempt creates its own fresh bounded cleanup context and
+  the canceled-parent test records `ctx.Err() == nil` for both closes.
+- Verified guarded 500 output is stable and contains neither the injected raw
+  database URL nor an upstream response.
+- Verified generic state transitions clear guards and guarded open sets the
+  guard inside the release transaction.
+- Verified mismatch parking occurs before planning and dispatch, while exact
+  and legacy unguarded open cases proceed.
+- Verified only the eight brief-listed Go files and this required report are in
+  scope; no API was removed.
 
 ## Concerns
 
-The full repository Ruff and mypy baselines remain nonzero for unrelated
-files. Task 3's focused lint and type checks are clean, and all backend tests
-pass.
-
-## Review Fix: Lazy Provider Wiring
-
-### RED
-
-```bash
-cd backend
-.venv/bin/python -m pytest tests/services/test_discovery_ingestion.py -q
-```
-
-```text
-...FF.........
-2 failed, 12 passed in 0.44s
-```
-
-The new lazy-factory tests failed because `DiscoveryIngestionService` did not
-accept `youtube_client_factory`.
-
-```bash
-cd backend
-.venv/bin/python -m pytest tests/api/test_channel_agent_discovery.py -q
-```
-
-```text
-..............FFF..........
-3 failed, 24 passed in 0.95s
-```
-
-The accepted/replay request invoked the eager factory twice, a factory
-construction failure returned 500 instead of the fixed 502, and a negative
-service counter was emitted as HTTP 200.
-
-### GREEN
-
-```bash
-cd backend
-.venv/bin/python -m pytest tests/services/test_discovery_ingestion.py -q
-```
-
-```text
-..............
-14 passed in 0.38s
-```
-
-```bash
-cd backend
-.venv/bin/python -m pytest tests/api/test_channel_agent_discovery.py -q
-```
-
-```text
-...........................
-27 passed in 0.82s
-```
-
-### Fix Evidence
-
-- `DiscoveryIngestionService` accepts either the compatible eager
-  `youtube_client` or a `youtube_client_factory`; it invokes the factory only
-  after a non-replay claim.
-- Factory exceptions mark the committed run `failed` with only
-  `provider_unavailable` and raise the existing typed provider error, which
-  the endpoint maps to `502 {"detail":"discovery_provider_error"}`.
-- All five response counters now require `ge=0`; the endpoint response-model
-  test proves a negative result cannot return HTTP 200.
-- API tests use a fresh request session, persist payload updates with a new
-  dictionary, and cover exact source/bucket/channel, missing, and non-object
-  payload mismatches before provider construction.
-- `build_youtube_manager_client()` is the single public client builder used by
-  both the runner and API; it reuses `YouTubeManagerClient` configuration
-  handling without duplicating settings logic.
-
-Focused verification:
-
-```bash
-cd backend
-.venv/bin/python -m pytest tests/api/test_channel_agent_discovery.py tests/channel_agent/test_api.py -q
-```
-
-```text
-60 passed in 1.76s
-```
-
-```bash
-cd backend
-.venv/bin/python -m pytest tests/services/test_discovery_ingestion.py tests/channel_agent/test_runner.py tests/channel_agent/test_youtube_manager_client.py -q
-```
-
-```text
-23 passed in 0.56s
-```
-
-```bash
-cd backend
-.venv/bin/python -m ruff check app/api/channel_agent.py app/channel_agent/clients.py app/channel_agent/runner.py app/schemas/channel_agent.py app/services/discovery_ingestion.py tests/api/test_channel_agent_discovery.py tests/services/test_discovery_ingestion.py tests/channel_agent/test_runner.py tests/channel_agent/test_youtube_manager_client.py
-.venv/bin/python -m mypy --follow-imports=skip app/api/channel_agent.py app/channel_agent/clients.py app/channel_agent/runner.py app/schemas/channel_agent.py app/services/discovery_ingestion.py
-```
-
-```text
-All checks passed!
-Success: no issues found in 5 source files
-```
-
-Required full-suite verification:
-
-```bash
-cd backend
-.venv/bin/python -m pytest -q
-```
-
-```text
-754 passed, 55 skipped, 8 warnings in 66.51s (0:01:06)
-```
-
-Repository-wide Ruff still reports 17 unrelated pre-existing findings. The
-repository-wide mypy baseline is now 64 unrelated findings in 23 files; the
-two former `app/channel_agent/clients.py` findings are resolved by the local
-type narrowing included with the shared-builder change.
+The PostgreSQL-backed assertions could not execute locally because the required
+isolated database is intentionally unavailable. CI must run them with
+`CHANNELOPS_REQUIRE_DATABASE=1`; all non-database focused and repository-wide Go
+tests pass locally.

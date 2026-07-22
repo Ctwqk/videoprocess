@@ -23,7 +23,7 @@ const (
 type EngineStore interface {
 	GetJobDetail(ctx context.Context, id string) (JobView, error)
 	CreateSourceArtifact(ctx context.Context, jobID string, nodeExecutionID string, assetID string) (string, error)
-	GetVideoScheduleState(ctx context.Context) (string, error)
+	GetVideoScheduleAuthority(ctx context.Context) (VideoScheduleAuthority, error)
 	MarkGoJobPlanning(ctx context.Context, jobID string, executionPlan map[string]any) error
 	MarkGoJobRunning(ctx context.Context, jobID string) error
 	MarkGoJobWaitingWindow(ctx context.Context, jobID string) error
@@ -34,6 +34,11 @@ type EngineStore interface {
 	IncrementGoNodeRetry(ctx context.Context, jobID string, nodeExecutionID string) error
 	SkipGoDownstreamNodes(ctx context.Context, jobID string, nodeIDs []string) error
 	FinalizeGoJob(ctx context.Context, jobID string, status string, errorMessage *string, finalArtifactNodeIDs []string) error
+}
+
+type VideoScheduleAuthority struct {
+	State        string
+	GuardedJobID string
 }
 
 type Dispatcher interface {
@@ -132,11 +137,19 @@ func (e *Engine) StartJob(ctx context.Context, jobID string) (err error) {
 }
 
 func (e *Engine) shouldWaitForSchedule(ctx context.Context, job JobView) (bool, error) {
-	state, err := e.Store.GetVideoScheduleState(ctx)
+	authority, err := e.Store.GetVideoScheduleAuthority(ctx)
 	if err != nil {
 		return false, err
 	}
-	state = strings.ToUpper(strings.TrimSpace(state))
+	state := strings.ToUpper(strings.TrimSpace(authority.State))
+	if state == "OPEN" && authority.GuardedJobID != "" && job.ID != authority.GuardedJobID {
+		if job.Status != string(contracts.JobStatusWaitingWindow) {
+			if err := e.Store.MarkGoJobWaitingWindow(ctx, job.ID); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	}
 	if state != "CLOSED" && state != "DRAINING" {
 		return false, nil
 	}

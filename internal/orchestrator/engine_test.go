@@ -132,6 +132,68 @@ func TestStartJobParksFreshJobWhenScheduleDraining(t *testing.T) {
 	}
 }
 
+func TestStartJobRunsExactGuardedJob(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim")))
+	store.scheduleGuardedJobID = "job-1"
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	if err := engine.StartJob(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if store.job.Status != "RUNNING" {
+		t.Fatalf("job status = %q; want RUNNING", store.job.Status)
+	}
+	if store.waitingWindowCount != 0 {
+		t.Fatalf("waiting window count = %d; want 0", store.waitingWindowCount)
+	}
+	if store.planningPlan == nil {
+		t.Fatal("planning plan is nil; guarded job did not start")
+	}
+	if len(dispatcher.calls) != 1 {
+		t.Fatalf("dispatch calls = %d; want 1", len(dispatcher.calls))
+	}
+}
+
+func TestStartJobParksGuardedMismatchBeforePlanningOrDispatch(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim")))
+	store.scheduleGuardedJobID = "different-job"
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	if err := engine.StartJob(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if store.job.Status != "WAITING_WINDOW" {
+		t.Fatalf("job status = %q; want WAITING_WINDOW", store.job.Status)
+	}
+	if store.waitingWindowCount != 1 {
+		t.Fatalf("waiting window count = %d; want 1", store.waitingWindowCount)
+	}
+	if store.planningPlan != nil {
+		t.Fatalf("planning plan = %#v; want nil", store.planningPlan)
+	}
+	if len(dispatcher.calls) != 0 {
+		t.Fatalf("dispatch calls = %d; want 0", len(dispatcher.calls))
+	}
+}
+
+func TestStartJobKeepsLegacyUnguardedOpenBehavior(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim")))
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	if err := engine.StartJob(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if store.job.Status != "RUNNING" || store.planningPlan == nil || len(dispatcher.calls) != 1 {
+		t.Fatalf("job status=%q planning=%#v dispatch calls=%d", store.job.Status, store.planningPlan, len(dispatcher.calls))
+	}
+}
+
 func TestStartJobFailsSourceWithoutAssetID(t *testing.T) {
 	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNodeNoAsset("source-exec"), pendingNode("trim-exec", "trim"), pendingNode("encode-exec", "encode")))
 	dispatcher := &fakeDispatcher{}
@@ -457,17 +519,18 @@ func (d *fakeDispatcher) Dispatch(_ context.Context, workerType string, payload 
 }
 
 type fakeEngineStore struct {
-	job                JobView
-	planningPlan       map[string]any
-	skippedNodeIDs     []string
-	finalStatus        string
-	finalError         *string
-	finalNodeIDs       []string
-	scheduleState      string
-	waitingWindowCount int
-	queueClaim         bool
-	releaseCount       int
-	createSourceErr    error
+	job                  JobView
+	planningPlan         map[string]any
+	skippedNodeIDs       []string
+	finalStatus          string
+	finalError           *string
+	finalNodeIDs         []string
+	scheduleState        string
+	scheduleGuardedJobID string
+	waitingWindowCount   int
+	queueClaim           bool
+	releaseCount         int
+	createSourceErr      error
 }
 
 func newFakeEngineStore(job JobView) *fakeEngineStore {
@@ -501,8 +564,11 @@ func (s *fakeEngineStore) MarkGoJobRunning(_ context.Context, _ string) error {
 	return nil
 }
 
-func (s *fakeEngineStore) GetVideoScheduleState(_ context.Context) (string, error) {
-	return s.scheduleState, nil
+func (s *fakeEngineStore) GetVideoScheduleAuthority(_ context.Context) (VideoScheduleAuthority, error) {
+	return VideoScheduleAuthority{
+		State:        s.scheduleState,
+		GuardedJobID: s.scheduleGuardedJobID,
+	}, nil
 }
 
 func (s *fakeEngineStore) MarkGoJobWaitingWindow(_ context.Context, _ string) error {

@@ -15,6 +15,7 @@ var ErrVideoScheduleGuardMismatch = errors.New("video schedule guarded open mism
 type VideoScheduleStatusRow struct {
 	ServiceName  string     `json:"service_name"`
 	State        string     `json:"state"`
+	GuardedJobID *string    `json:"guarded_job_id"`
 	WaitingJobs  int        `json:"waiting_jobs"`
 	ActiveJobs   int        `json:"active_jobs"`
 	QueuedNodes  int        `json:"queued_nodes"`
@@ -33,7 +34,10 @@ func (s *Store) SetVideoScheduleState(ctx context.Context, state string) (VideoS
 		INSERT INTO runtime_schedules (service_name, state, updated_by)
 		VALUES ($1, $2, 'go_api')
 		ON CONFLICT (service_name)
-		DO UPDATE SET state = EXCLUDED.state, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+		DO UPDATE SET state = EXCLUDED.state,
+		              guarded_job_id = NULL,
+		              updated_by = EXCLUDED.updated_by,
+		              updated_at = NOW()
 	`, VideoScheduleServiceName, state); err != nil {
 		return VideoScheduleStatusRow{}, err
 	}
@@ -141,9 +145,12 @@ func (s *Store) OpenVideoScheduleForJob(
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE runtime_schedules
-		SET state = 'OPEN', updated_by = 'go_api_guarded', updated_at = NOW()
+		SET state = 'OPEN',
+		    guarded_job_id = $2::uuid,
+		    updated_by = 'go_api_guarded',
+		    updated_at = NOW()
 		WHERE service_name = $1
-	`, VideoScheduleServiceName); err != nil {
+	`, VideoScheduleServiceName, expectedJobID); err != nil {
 		return VideoScheduleStatusRow{}, err
 	}
 	tag, err := tx.Exec(ctx, `
@@ -168,10 +175,16 @@ func (s *Store) OpenVideoScheduleForJob(
 func (s *Store) getVideoScheduleStatus(ctx context.Context, releasedJobs int) (VideoScheduleStatusRow, error) {
 	var row VideoScheduleStatusRow
 	err := s.Pool.QueryRow(ctx, `
-		SELECT service_name, state, updated_at, updated_by
+		SELECT service_name, state, guarded_job_id::text, updated_at, updated_by
 		FROM runtime_schedules
 		WHERE service_name = $1
-	`, VideoScheduleServiceName).Scan(&row.ServiceName, &row.State, &row.UpdatedAt, &row.UpdatedBy)
+	`, VideoScheduleServiceName).Scan(
+		&row.ServiceName,
+		&row.State,
+		&row.GuardedJobID,
+		&row.UpdatedAt,
+		&row.UpdatedBy,
+	)
 	if err != nil {
 		return row, err
 	}

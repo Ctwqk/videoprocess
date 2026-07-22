@@ -30,12 +30,16 @@ func (a *StoreAdapter) CreateSourceArtifact(ctx context.Context, jobID string, n
 	return a.Store.CreateSourceArtifact(ctx, jobID, nodeExecutionID, assetID)
 }
 
-func (a *StoreAdapter) GetVideoScheduleState(ctx context.Context) (string, error) {
+func (a *StoreAdapter) GetVideoScheduleAuthority(ctx context.Context) (VideoScheduleAuthority, error) {
 	status, err := a.Store.GetVideoScheduleStatus(ctx)
 	if err != nil {
-		return "", err
+		return VideoScheduleAuthority{}, err
 	}
-	return status.State, nil
+	guardedJobID := ""
+	if status.GuardedJobID != nil {
+		guardedJobID = *status.GuardedJobID
+	}
+	return VideoScheduleAuthority{State: status.State, GuardedJobID: guardedJobID}, nil
 }
 
 func (a *StoreAdapter) MarkGoJobPlanning(ctx context.Context, jobID string, executionPlan map[string]any) error {

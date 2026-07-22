@@ -166,10 +166,11 @@ func (c *coordinatedScheduleController) OpenExpectedJob(
 	}
 	pythonRow, err := c.python.OpenExpectedJob(ctx, expectedJobID)
 	if err != nil {
-		closeIncomplete := c.closeAfterGuardedFailure(ctx, false)
+		closePython := !errors.Is(err, ErrScheduleGuardMismatch)
+		closeIncomplete := c.closeAfterGuardedFailure(ctx, closePython)
 		return store.VideoScheduleStatusRow{}, guardedScheduleHandoffError(err, closeIncomplete)
 	}
-	if pythonRow.State != "OPEN" || pythonRow.ReleasedJobs != 1 {
+	if !isExpectedGuardedOpen(pythonRow, expectedJobID) || pythonRow.ReleasedJobs != 1 {
 		closeIncomplete := c.closeAfterGuardedFailure(ctx, true)
 		return store.VideoScheduleStatusRow{}, guardedScheduleHandoffError(
 			errGuardedScheduleHandoff,
@@ -178,7 +179,7 @@ func (c *coordinatedScheduleController) OpenExpectedJob(
 	}
 
 	localRow, err := c.local.Status(ctx)
-	if err == nil && localRow.State == "OPEN" {
+	if err == nil && isExpectedGuardedOpen(localRow, expectedJobID) {
 		localRow.ReleasedJobs = 1
 		return localRow, nil
 	}
@@ -195,14 +196,25 @@ func (c *coordinatedScheduleController) closeAfterGuardedFailure(
 ) bool {
 	closeIncomplete := false
 	if closePython && c.python != nil {
-		if _, err := c.python.SetState(ctx, "CLOSED"); err != nil {
+		if err := closeScheduleWithFreshContext(ctx, c.python); err != nil {
 			closeIncomplete = true
 		}
 	}
-	if _, err := c.local.SetState(ctx, "CLOSED"); err != nil {
+	if err := closeScheduleWithFreshContext(ctx, c.local); err != nil {
 		closeIncomplete = true
 	}
 	return closeIncomplete
+}
+
+func isExpectedGuardedOpen(row store.VideoScheduleStatusRow, expectedJobID string) bool {
+	return row.State == "OPEN" && row.GuardedJobID != nil && *row.GuardedJobID == expectedJobID
+}
+
+func closeScheduleWithFreshContext(ctx context.Context, controller ScheduleController) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, err := controller.SetState(cleanupCtx, "CLOSED")
+	return err
 }
 
 func guardedScheduleHandoffError(cause error, closeIncomplete bool) error {

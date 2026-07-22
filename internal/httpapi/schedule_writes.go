@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -25,7 +26,8 @@ func (s *Server) openVideoSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+			slog.ErrorContext(r.Context(), "guarded schedule open failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": "guarded_schedule_open_failed"})
 			return
 		}
 		writeJSON(w, http.StatusOK, row)

@@ -199,34 +199,69 @@ func TestCoordinatedScheduleOpenAggregatesGoAndPythonReleases(t *testing.T) {
 	}
 }
 
-func TestCoordinatedGuardedOpenValidatesPythonBeforeReadingSharedLocalState(t *testing.T) {
-	events := []string{}
+func TestCoordinatedGuardedOpenRequiresMatchingPythonAndLocalGuard(t *testing.T) {
 	expectedJobID := "11111111-1111-4111-8111-111111111111"
-	local := &fakeScheduleController{
-		name:      "local",
-		events:    &events,
-		statusRow: store.VideoScheduleStatusRow{State: "OPEN", ActiveJobs: 1},
-	}
-	python := &fakeScheduleController{
-		name:        "python",
-		events:      &events,
-		guardedRows: []store.VideoScheduleStatusRow{{State: "OPEN", ReleasedJobs: 1}},
-	}
-	controller := NewCoordinatedScheduleController(local, python)
+	otherJobID := "22222222-2222-4222-8222-222222222222"
+	guard := func(value string) *string { return &value }
 
-	row, err := controller.OpenExpectedJob(context.Background(), expectedJobID)
+	t.Run("matching guards", func(t *testing.T) {
+		events := []string{}
+		local := &fakeScheduleController{
+			name:      "local",
+			events:    &events,
+			statusRow: store.VideoScheduleStatusRow{State: "OPEN", GuardedJobID: guard(expectedJobID), ActiveJobs: 1},
+		}
+		python := &fakeScheduleController{
+			name: "python", events: &events,
+			guardedRows: []store.VideoScheduleStatusRow{{
+				State: "OPEN", GuardedJobID: guard(expectedJobID), ReleasedJobs: 1,
+			}},
+		}
+		controller := NewCoordinatedScheduleController(local, python)
 
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(events, []string{"python.guarded", "local.status"}) {
-		t.Fatalf("events = %#v", events)
-	}
-	if len(local.setStates) != 0 {
-		t.Fatalf("local legacy state calls = %#v", local.setStates)
-	}
-	if row.State != "OPEN" || row.ReleasedJobs != 1 {
-		t.Fatalf("row = %#v", row)
+		row, err := controller.OpenExpectedJob(context.Background(), expectedJobID)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(events, []string{"python.guarded", "local.status"}) {
+			t.Fatalf("events = %#v", events)
+		}
+		if len(local.setStates) != 0 {
+			t.Fatalf("local legacy state calls = %#v", local.setStates)
+		}
+		if row.State != "OPEN" || row.GuardedJobID == nil || *row.GuardedJobID != expectedJobID || row.ReleasedJobs != 1 {
+			t.Fatalf("row = %#v", row)
+		}
+	})
+
+	for _, tc := range []struct {
+		name        string
+		pythonGuard string
+		localGuard  string
+	}{
+		{name: "Python mismatch", pythonGuard: otherJobID, localGuard: expectedJobID},
+		{name: "local mismatch", pythonGuard: expectedJobID, localGuard: otherJobID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			local := &fakeScheduleController{
+				statusRow: store.VideoScheduleStatusRow{State: "OPEN", GuardedJobID: guard(tc.localGuard)},
+			}
+			python := &fakeScheduleController{
+				guardedRows: []store.VideoScheduleStatusRow{{
+					State: "OPEN", GuardedJobID: guard(tc.pythonGuard), ReleasedJobs: 1,
+				}},
+			}
+			controller := NewCoordinatedScheduleController(local, python)
+
+			if _, err := controller.OpenExpectedJob(context.Background(), expectedJobID); err == nil {
+				t.Fatal("expected guarded authority mismatch")
+			}
+			if !reflect.DeepEqual(python.setStates, []string{"CLOSED"}) ||
+				!reflect.DeepEqual(local.setStates, []string{"CLOSED"}) {
+				t.Fatalf("python states = %#v local states = %#v", python.setStates, local.setStates)
+			}
+		})
 	}
 }
 
@@ -242,7 +277,7 @@ func TestCoordinatedGuardedOpenClosesWhenHandoffVerificationFails(t *testing.T) 
 	python := &fakeScheduleController{
 		name:        "python",
 		events:      &events,
-		guardedRows: []store.VideoScheduleStatusRow{{State: "OPEN", ReleasedJobs: 1}},
+		guardedRows: []store.VideoScheduleStatusRow{{State: "OPEN", GuardedJobID: &expectedJobID, ReleasedJobs: 1}},
 		setRows:     []store.VideoScheduleStatusRow{{State: "CLOSED"}},
 	}
 	controller := NewCoordinatedScheduleController(local, python)
@@ -278,7 +313,7 @@ func TestCoordinatedGuardedOpenBestEffortClosesBothWithoutLeakingResponses(t *te
 	python := &fakeScheduleController{
 		name:        "python",
 		events:      &events,
-		guardedRows: []store.VideoScheduleStatusRow{{State: "OPEN", ReleasedJobs: 1}},
+		guardedRows: []store.VideoScheduleStatusRow{{State: "OPEN", GuardedJobID: &expectedJobID, ReleasedJobs: 1}},
 		setErr:      errors.New("raw-python-close-response-secret"),
 	}
 	controller := NewCoordinatedScheduleController(local, python)
@@ -304,6 +339,78 @@ func TestCoordinatedGuardedOpenBestEffortClosesBothWithoutLeakingResponses(t *te
 		if strings.Contains(err.Error(), secret) {
 			t.Fatalf("error leaked raw response %q: %v", secret, err)
 		}
+	}
+}
+
+func TestCoordinatedGuardedOpenUncertainErrorClosesPythonAndLocalAfterRequestCancellation(t *testing.T) {
+	expectedJobID := "11111111-1111-4111-8111-111111111111"
+	local := &fakeScheduleController{}
+	python := &fakeScheduleController{guardedErr: context.Canceled}
+	controller := NewCoordinatedScheduleController(local, python)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := controller.OpenExpectedJob(ctx, expectedJobID)
+
+	if err == nil {
+		t.Fatal("expected uncertain guarded-open failure")
+	}
+	if !reflect.DeepEqual(python.setStates, []string{"CLOSED"}) ||
+		!reflect.DeepEqual(local.setStates, []string{"CLOSED"}) {
+		t.Fatalf("python states = %#v local states = %#v", python.setStates, local.setStates)
+	}
+	if !reflect.DeepEqual(python.setContextErrs, []error{nil}) {
+		t.Fatalf("python close context errors = %#v; want [nil]", python.setContextErrs)
+	}
+	if !reflect.DeepEqual(local.setContextErrs, []error{nil}) {
+		t.Fatalf("local close context errors = %#v; want [nil]", local.setContextErrs)
+	}
+}
+
+func TestCoordinatedGuardedOpenKnownConflictDoesNotRetryPythonClose(t *testing.T) {
+	expectedJobID := "11111111-1111-4111-8111-111111111111"
+	local := &fakeScheduleController{}
+	python := &fakeScheduleController{guardedErr: ErrScheduleGuardMismatch}
+	controller := NewCoordinatedScheduleController(local, python)
+
+	_, err := controller.OpenExpectedJob(context.Background(), expectedJobID)
+
+	if !errors.Is(err, ErrScheduleGuardMismatch) {
+		t.Fatalf("error = %v; want ErrScheduleGuardMismatch", err)
+	}
+	if len(python.setStates) != 0 {
+		t.Fatalf("python states = %#v; want no close retry", python.setStates)
+	}
+	if !reflect.DeepEqual(local.setStates, []string{"CLOSED"}) {
+		t.Fatalf("local states = %#v; want CLOSED", local.setStates)
+	}
+}
+
+func TestGuardedScheduleRouteSanitizesInfrastructureError(t *testing.T) {
+	const secret = "postgres://admin:password@database.internal:5432/videoprocess"
+	expectedJobID := "11111111-1111-4111-8111-111111111111"
+	controller := &fakeScheduleController{guardedErr: errors.New("dial " + secret)}
+	server := NewServerWithOptions(nil, ServerOptions{
+		AllowStubStore: true,
+		Schedule:       controller,
+	})
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/internal/schedule/video/open?expected_job_id="+expectedJobID,
+		nil,
+	)
+	rec := httptest.NewRecorder()
+
+	server.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"detail":"guarded_schedule_open_failed"}` {
+		t.Fatalf("body = %q", body)
+	}
+	if strings.Contains(rec.Body.String(), secret) {
+		t.Fatalf("response leaked infrastructure error: %s", rec.Body.String())
 	}
 }
 
@@ -350,16 +457,17 @@ func TestCoordinatedScheduleOpenFailsClosedWhenPythonDoesNotOpen(t *testing.T) {
 }
 
 type fakeScheduleController struct {
-	name          string
-	events        *[]string
-	setStates     []string
-	setRows       []store.VideoScheduleStatusRow
-	setErr        error
-	guardedJobIDs []string
-	guardedRows   []store.VideoScheduleStatusRow
-	guardedErr    error
-	statusRow     store.VideoScheduleStatusRow
-	statusErr     error
+	name           string
+	events         *[]string
+	setStates      []string
+	setRows        []store.VideoScheduleStatusRow
+	setErr         error
+	setContextErrs []error
+	guardedJobIDs  []string
+	guardedRows    []store.VideoScheduleStatusRow
+	guardedErr     error
+	statusRow      store.VideoScheduleStatusRow
+	statusErr      error
 }
 
 func (f *fakeScheduleController) Status(context.Context) (store.VideoScheduleStatusRow, error) {
@@ -369,8 +477,9 @@ func (f *fakeScheduleController) Status(context.Context) (store.VideoScheduleSta
 	return f.statusRow, f.statusErr
 }
 
-func (f *fakeScheduleController) SetState(_ context.Context, state string) (store.VideoScheduleStatusRow, error) {
+func (f *fakeScheduleController) SetState(ctx context.Context, state string) (store.VideoScheduleStatusRow, error) {
 	f.setStates = append(f.setStates, state)
+	f.setContextErrs = append(f.setContextErrs, ctx.Err())
 	if f.events != nil {
 		*f.events = append(*f.events, f.name+"."+state)
 	}
