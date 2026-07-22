@@ -137,6 +137,7 @@ async def _seed_request(
             payload_json={
                 "channel_id": str(channel.id),
                 "source": "youtube_search",
+                "bucket": "2026-07-21-18",
                 "scheduler_bucket": "2026-07-21-18",
             },
             status="running",
@@ -283,6 +284,38 @@ async def test_discovery_ingestion_revalidates_exact_queue_lease_before_provider
     async with discovery_harness.session_factory() as db:
         with pytest.raises(DiscoveryIngestionAuthorityError) as exc_info:
             await service.ingest(db, replace(request, **changes), now)
+
+    assert str(exc_info.value) == "queue_authority_changed"
+    assert client.requests == []
+    async with discovery_harness.session_factory() as db:
+        runs = (await db.execute(select(DiscoveryIngestionRun))).scalars().all()
+    assert runs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_value", [None, "wrong"])
+async def test_discovery_ingestion_rejects_noncanonical_queue_bucket_before_provider(
+    discovery_harness: DiscoveryHarness,
+    bucket_value: str | None,
+) -> None:
+    now = datetime(2026, 7, 21, 18, 5, tzinfo=timezone.utc)
+    request, _ = await _seed_request(discovery_harness)
+    async with discovery_harness.session_factory() as db:
+        queue_item = await db.get(ChannelOpsQueueItem, request.queue_item_id)
+        assert queue_item is not None
+        payload = dict(queue_item.payload_json)
+        if bucket_value is None:
+            payload.pop("bucket")
+        else:
+            payload["bucket"] = bucket_value
+        queue_item.payload_json = payload
+        await db.commit()
+
+    client = FakeDiscoveryYouTubeClient([])
+    service = DiscoveryIngestionService(youtube_client=client)
+    async with discovery_harness.session_factory() as db:
+        with pytest.raises(DiscoveryIngestionAuthorityError) as exc_info:
+            await service.ingest(db, request, now)
 
     assert str(exc_info.value) == "queue_authority_changed"
     assert client.requests == []

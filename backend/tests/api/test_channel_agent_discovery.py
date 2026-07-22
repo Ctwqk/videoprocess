@@ -104,6 +104,7 @@ async def _channel_and_queue(
         payload_json=payload if payload is not None else {
             "channel_id": str(channel.id),
             "source": "youtube_search",
+            "bucket": bucket,
             "scheduler_bucket": bucket,
         },
     )
@@ -166,25 +167,37 @@ async def test_discovery_ingest_rejects_missing_queue_before_provider_call(api_s
             "ingest_discovery",
             "running",
             "same",
-            {"channel_id": "wrong", "source": "youtube_search", "scheduler_bucket": "2026-07-21-18"},
+            {"channel_id": "wrong", "source": "youtube_search", "bucket": "2026-07-21-18", "scheduler_bucket": "2026-07-21-18"},
         ),
         (
             "ingest_discovery",
             "running",
             "same",
-            {"channel_id": "request", "source": "wrong", "scheduler_bucket": "2026-07-21-18"},
+            {"channel_id": "request", "source": "wrong", "bucket": "2026-07-21-18", "scheduler_bucket": "2026-07-21-18"},
         ),
         (
             "ingest_discovery",
             "running",
             "same",
-            {"channel_id": "request", "source": "youtube_search", "scheduler_bucket": "wrong"},
+            {"channel_id": "request", "source": "youtube_search", "bucket": "2026-07-21-18", "scheduler_bucket": "wrong"},
         ),
         (
             "ingest_discovery",
             "running",
             "same",
-            {"channel_id": "request", "scheduler_bucket": "2026-07-21-18"},
+            {"channel_id": "request", "bucket": "2026-07-21-18", "scheduler_bucket": "2026-07-21-18"},
+        ),
+        (
+            "ingest_discovery",
+            "running",
+            "same",
+            {"channel_id": "request", "source": "youtube_search", "scheduler_bucket": "2026-07-21-18"},
+        ),
+        (
+            "ingest_discovery",
+            "running",
+            "same",
+            {"channel_id": "request", "source": "youtube_search", "bucket": "wrong", "scheduler_bucket": "2026-07-21-18"},
         ),
         ("ingest_discovery", "running", "same", ["not", "an", "object"]),
     ],
@@ -239,6 +252,7 @@ async def test_discovery_ingest_rejects_missing_channel_before_provider_call(api
         payload_json={
             "channel_id": str(missing_channel_id),
             "source": "youtube_search",
+            "bucket": "2026-07-21-18",
             "scheduler_bucket": "2026-07-21-18",
         },
     )

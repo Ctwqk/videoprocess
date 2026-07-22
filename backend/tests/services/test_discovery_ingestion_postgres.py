@@ -270,6 +270,7 @@ async def _seed_request(
             payload_json={
                 "channel_id": str(channel.id),
                 "source": "youtube_search",
+                "bucket": scheduler_bucket,
                 "scheduler_bucket": scheduler_bucket,
             },
             status="running",
@@ -333,6 +334,53 @@ def _api_payload(request: DiscoveryIngestionRequest) -> dict[str, object]:
         "locked_by": request.locked_by,
         "locked_at": request.locked_at.isoformat(),
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bucket_value", [None, "wrong"])
+async def test_postgres_claim_rejects_noncanonical_queue_bucket(
+    postgres_harness: PostgresHarness,
+    bucket_value: str | None,
+) -> None:
+    request = await _seed_request(postgres_harness)
+    async with postgres_harness.session_factory() as db:
+        queue_item = await db.get(ChannelOpsQueueItem, request.queue_item_id)
+        assert queue_item is not None
+        payload = dict(queue_item.payload_json)
+        if bucket_value is None:
+            payload.pop("bucket")
+        else:
+            payload["bucket"] = bucket_value
+        queue_item.payload_json = payload
+        await db.commit()
+
+    factory_calls = 0
+
+    def provider_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return object()
+
+    service = DiscoveryIngestionService(youtube_client_factory=provider_factory)
+    async with postgres_harness.session_factory() as db:
+        with pytest.raises(DiscoveryIngestionAuthorityError) as exc_info:
+            await service.ingest(
+                db,
+                request,
+                datetime(2026, 7, 21, 18, 5, tzinfo=timezone.utc),
+            )
+
+    assert str(exc_info.value) == "queue_authority_changed"
+    assert factory_calls == 0
+    async with postgres_harness.session_factory() as db:
+        runs = (
+            await db.execute(
+                select(DiscoveryIngestionRun).where(
+                    DiscoveryIngestionRun.queue_item_id == request.queue_item_id
+                )
+            )
+        ).scalars().all()
+    assert runs == []
 
 
 @pytest.mark.asyncio

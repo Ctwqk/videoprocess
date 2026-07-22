@@ -485,6 +485,7 @@ def _same_queue_authority(
         and isinstance(payload, dict)
         and payload.get("channel_id") == str(request.channel_id)
         and payload.get("source") == request.source
+        and payload.get("bucket") == request.scheduler_bucket
         and payload.get("scheduler_bucket") == request.scheduler_bucket
     )
 

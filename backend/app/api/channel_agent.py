@@ -110,6 +110,7 @@ def _has_discovery_queue_authority(
         and isinstance(payload, dict)
         and payload.get("channel_id") == str(data.channel_id)
         and payload.get("source") == data.source
+        and payload.get("bucket") == data.scheduler_bucket
         and payload.get("scheduler_bucket") == data.scheduler_bucket
     )
 
