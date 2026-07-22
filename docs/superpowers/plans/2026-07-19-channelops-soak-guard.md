@@ -407,7 +407,8 @@ paths, default-disabled behavior, quarantine plus \`CLOSED\` guard action, and a
 separately approved successful unlisted canary as activation prerequisite. The
 canary gate uses the 2026-07-22 atomic intake pause: success remains
 intake-paused, blocking only `agent_tick` and `ingest_discovery` while existing
-downstream work and mature metrics continue; failure becomes fully halted.
+downstream work, reconciliation, and mature metrics continue; failure becomes
+fully halted.
 State explicitly that code deployment cannot activate or resume a channel and
 that 126 remains forbidden.
 
