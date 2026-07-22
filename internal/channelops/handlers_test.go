@@ -409,6 +409,179 @@ func TestAgentTickPlanDelaySecondsIsBounded(t *testing.T) {
 	}
 }
 
+func TestAgentTickOptionsRequireGuardedCanaryAuthority(t *testing.T) {
+	runID := "00000000-0000-0000-0000-00000000cafe"
+	valid, err := agentTickOptionsFromPayload(map[string]any{
+		"plan_delay_seconds":           float64(300),
+		"pause_intake_after_selection": true,
+		"canary_run_id":                runID,
+	})
+	if err != nil {
+		t.Fatalf("valid guarded options: %v", err)
+	}
+	if valid.PlanDelay != 300*time.Second || !valid.PauseIntakeAfterSelection || valid.CanaryRunID != runID {
+		t.Fatalf("valid guarded options = %#v", valid)
+	}
+
+	ordinary, err := agentTickOptionsFromPayload(map[string]any{})
+	if err != nil {
+		t.Fatalf("ordinary options: %v", err)
+	}
+	if ordinary.PlanDelay != 0 || ordinary.PauseIntakeAfterSelection || ordinary.CanaryRunID != "" {
+		t.Fatalf("ordinary options = %#v", ordinary)
+	}
+
+	for _, tt := range []struct {
+		name    string
+		payload map[string]any
+	}{
+		{name: "string flag", payload: map[string]any{"pause_intake_after_selection": "true"}},
+		{name: "numeric flag", payload: map[string]any{"pause_intake_after_selection": 1}},
+		{name: "missing run id", payload: map[string]any{"pause_intake_after_selection": true, "plan_delay_seconds": 300}},
+		{name: "invalid run id", payload: map[string]any{"pause_intake_after_selection": true, "plan_delay_seconds": 300, "canary_run_id": "invalid"}},
+		{name: "missing delay", payload: map[string]any{"pause_intake_after_selection": true, "canary_run_id": runID}},
+		{name: "zero delay", payload: map[string]any{"pause_intake_after_selection": true, "plan_delay_seconds": 0, "canary_run_id": runID}},
+		{name: "orphan run id", payload: map[string]any{"canary_run_id": runID}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := agentTickOptionsFromPayload(tt.payload); err == nil {
+				t.Fatalf("agentTickOptionsFromPayload(%#v) error = nil", tt.payload)
+			}
+		})
+	}
+}
+
+func TestHandleAgentTickAtomicallyPausesIntakeAfterOneTask(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	runID := testUUID(t, "guarded-canary-run")
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	item := QueueItemRow{
+		Kind: QueueAgentTick,
+		PayloadJSON: map[string]any{
+			"channel_id":                   fixture.ChannelID,
+			"canary_run_id":                runID,
+			"plan_delay_seconds":           float64(300),
+			"pause_intake_after_selection": true,
+		},
+	}
+
+	if err := handler.HandleAgentTick(ctx, item); err != nil {
+		t.Fatalf("HandleAgentTick: %v", err)
+	}
+
+	var taskCount, planCount int
+	var pausedAt, haltedAt *time.Time
+	var pauseReason, summaryRunID *string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM production_tasks WHERE channel_profile_id = $1::uuid
+	`, fixture.ChannelID).Scan(&taskCount); err != nil {
+		t.Fatalf("count canary tasks: %v", err)
+	}
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM channel_ops_queue_items
+		WHERE channel_profile_id = $1::uuid AND kind = 'plan_task'
+		  AND run_after = $2::timestamptz
+	`, fixture.ChannelID, fixture.Store.Now().UTC().Add(300*time.Second)).Scan(&planCount); err != nil {
+		t.Fatalf("count guarded plan rows: %v", err)
+	}
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT intake_paused_at, intake_pause_reason, halted_at
+		FROM channel_profiles WHERE id = $1::uuid
+	`, fixture.ChannelID).Scan(&pausedAt, &pauseReason, &haltedAt); err != nil {
+		t.Fatalf("select intake pause: %v", err)
+	}
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT decision_summary_json ->> 'canary_run_id'
+		FROM agent_tick_audits WHERE channel_profile_id = $1::uuid
+	`, fixture.ChannelID).Scan(&summaryRunID); err != nil {
+		t.Fatalf("select guarded tick audit: %v", err)
+	}
+	if taskCount != 1 || planCount != 1 {
+		t.Fatalf("guarded tick counts = tasks %d, plans %d; want 1, 1", taskCount, planCount)
+	}
+	if pausedAt == nil || pauseReason == nil || *pauseReason != CanaryIntakePauseReason || haltedAt != nil {
+		t.Fatalf("guarded channel state = paused %v, reason %v, halted %v", pausedAt, pauseReason, haltedAt)
+	}
+	if summaryRunID == nil || *summaryRunID != runID {
+		t.Fatalf("guarded tick canary_run_id = %v, want %s", summaryRunID, runID)
+	}
+}
+
+func TestGuardedAgentTickRollsBackUnlessExactlyOneTaskIsSelected(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		setup func(context.Context, *ChannelOpsFixture)
+	}{
+		{
+			name: "zero tasks",
+			setup: func(ctx context.Context, fixture *ChannelOpsFixture) {
+				if _, err := fixture.Store.Pool.Exec(ctx, `
+					UPDATE channel_profiles SET dry_run = TRUE WHERE id = $1::uuid
+				`, fixture.ChannelID); err != nil {
+					t.Fatalf("set dry run: %v", err)
+				}
+			},
+		},
+		{
+			name: "multiple tasks",
+			setup: func(ctx context.Context, fixture *ChannelOpsFixture) {
+				if _, err := fixture.Store.Pool.Exec(ctx, `
+					UPDATE topic_lanes SET max_posts_per_day = 2 WHERE id = $1::uuid
+				`, fixture.LaneID); err != nil {
+					t.Fatalf("raise lane budget: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			tt.setup(ctx, fixture)
+			handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+			err := handler.HandleAgentTick(ctx, QueueItemRow{
+				Kind: QueueAgentTick,
+				PayloadJSON: map[string]any{
+					"channel_id":                   fixture.ChannelID,
+					"canary_run_id":                testUUID(t, "guarded-canary-run"),
+					"plan_delay_seconds":           float64(300),
+					"pause_intake_after_selection": true,
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "exactly one task") {
+				t.Fatalf("guarded tick error = %v, want exactly-one rejection", err)
+			}
+
+			var taskCount, planCount int
+			var pausedAt *time.Time
+			if err := fixture.Store.Pool.QueryRow(ctx, `
+				SELECT count(*) FROM production_tasks WHERE channel_profile_id = $1::uuid
+			`, fixture.ChannelID).Scan(&taskCount); err != nil {
+				t.Fatalf("count rolled back tasks: %v", err)
+			}
+			if err := fixture.Store.Pool.QueryRow(ctx, `
+				SELECT count(*) FROM channel_ops_queue_items
+				WHERE channel_profile_id = $1::uuid AND kind = 'plan_task'
+			`, fixture.ChannelID).Scan(&planCount); err != nil {
+				t.Fatalf("count rolled back plans: %v", err)
+			}
+			if err := fixture.Store.Pool.QueryRow(ctx, `
+				SELECT intake_paused_at FROM channel_profiles WHERE id = $1::uuid
+			`, fixture.ChannelID).Scan(&pausedAt); err != nil {
+				t.Fatalf("select rolled back pause: %v", err)
+			}
+			if taskCount != 0 || planCount != 0 || pausedAt != nil {
+				t.Fatalf("guarded rollback = tasks %d, plans %d, paused %v", taskCount, planCount, pausedAt)
+			}
+		})
+	}
+}
+
 func TestHandleAgentTickDelaysPlanTaskForGuardedPreapproval(t *testing.T) {
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)

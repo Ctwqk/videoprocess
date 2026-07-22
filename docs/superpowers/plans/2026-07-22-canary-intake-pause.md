@@ -66,13 +66,13 @@ with pgx, pytest, shell deployment contracts, Docker Swarm.
 - Modify: `internal/channelops/store_tasks.go`
 - Modify: `internal/channelops/integration_test.go`
 
-- [ ] Add parser tests for the guarded tick payload: valid boolean/run UUID,
+- [x] Add parser tests for the guarded tick payload: valid boolean/run UUID,
   absent flag, malformed flag, missing/malformed run ID, and missing delay.
-- [ ] Add a failing integration test proving one task, its delayed plan row,
+- [x] Add a failing integration test proving one task, its delayed plan row,
   and intake pause commit together.
-- [ ] Add rollback tests for zero and multiple selected tasks.
-- [ ] Implement a small tick options value and transactional pause update.
-- [ ] Re-run focused and full ChannelOps Go tests.
+- [x] Add rollback tests for zero and multiple selected tasks.
+- [x] Implement a small tick options value and transactional pause update.
+- [x] Re-run focused and full ChannelOps Go tests.
 
 ### Task 4: Update the live canary protocol and cleanup recovery
 

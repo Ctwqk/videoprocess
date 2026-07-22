@@ -22,6 +22,7 @@ const (
 	QueueStatusSucceeded    = "succeeded"
 	QueueStatusFailed       = "failed"
 	QueueStatusDeadLettered = "dead_lettered"
+	CanaryIntakePauseReason = "operator_preapproved_live_unlisted_canary"
 
 	TaskSelected        = "selected"
 	TaskPlanning        = "planning"

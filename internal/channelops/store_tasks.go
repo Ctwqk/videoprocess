@@ -13,7 +13,7 @@ import (
 var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 func (s *Store) RunTick(ctx context.Context, channelID string, bucket string, h HandlerService) error {
-	return s.RunTickWithPlanDelay(ctx, channelID, bucket, 0, h)
+	return s.RunTickWithOptions(ctx, channelID, bucket, agentTickOptions{}, h)
 }
 
 func (s *Store) RunTickWithPlanDelay(
@@ -23,7 +23,17 @@ func (s *Store) RunTickWithPlanDelay(
 	planDelay time.Duration,
 	h HandlerService,
 ) error {
-	if planDelay < 0 || planDelay > time.Hour {
+	return s.RunTickWithOptions(ctx, channelID, bucket, agentTickOptions{PlanDelay: planDelay}, h)
+}
+
+func (s *Store) RunTickWithOptions(
+	ctx context.Context,
+	channelID string,
+	bucket string,
+	options agentTickOptions,
+	h HandlerService,
+) error {
+	if options.PlanDelay < 0 || options.PlanDelay > time.Hour {
 		return errors.New("plan delay must be from 0 through 1 hour")
 	}
 	now := s.Now().UTC()
@@ -47,6 +57,12 @@ func (s *Store) RunTickWithPlanDelay(
 		alerts = append(alerts, materialLowSupplyAlert(channelID, bucket, len(accepted), len(rejected)))
 	}
 	result := TickResult{DryRun: channel.DryRun, Accepted: accepted, Rejected: rejected}
+	if options.PauseIntakeAfterSelection && result.TasksToCreate() != 1 {
+		return fmt.Errorf(
+			"guarded agent_tick must select exactly one task; selected %d",
+			result.TasksToCreate(),
+		)
+	}
 	tx, ownsTransaction, err := s.beginOrReuse(ctx)
 	if err != nil {
 		return err
@@ -58,13 +74,18 @@ func (s *Store) RunTickWithPlanDelay(
 		}
 	}()
 
-	tickAuditID, err := s.insertTickAudit(ctx, tx, channelID, bucket, result, map[string]any{
+	tickSummary := map[string]any{
 		"bucket":          bucket,
 		"config_version":  channel.ConfigVersion,
 		"accepted_count":  len(accepted),
 		"rejected_count":  len(rejected),
 		"handler_version": "go",
-	})
+	}
+	if options.PauseIntakeAfterSelection {
+		tickSummary["canary_run_id"] = options.CanaryRunID
+		tickSummary["pause_intake_after_selection"] = true
+	}
+	tickAuditID, err := s.insertTickAudit(ctx, tx, channelID, bucket, result, tickSummary)
 	if err != nil {
 		return err
 	}
@@ -108,9 +129,14 @@ func (s *Store) RunTickWithPlanDelay(
 			IdempotencyKey:   "plan_task:" + taskID,
 			Payload:          map[string]any{"production_task_id": taskID, "channel_id": channel.ID},
 			Priority:         100,
-			RunAfter:         now.Add(planDelay),
+			RunAfter:         now.Add(options.PlanDelay),
 			ChannelProfileID: &channelProfileID,
 		}); err != nil {
+			return err
+		}
+	}
+	if options.PauseIntakeAfterSelection {
+		if err := s.pauseChannelIntake(ctx, tx, channelID, now, CanaryIntakePauseReason); err != nil {
 			return err
 		}
 	}
@@ -120,6 +146,32 @@ func (s *Store) RunTickWithPlanDelay(
 		}
 	}
 	committed = true
+	return nil
+}
+
+func (s *Store) pauseChannelIntake(
+	ctx context.Context,
+	db dbExecutor,
+	channelID string,
+	now time.Time,
+	reason string,
+) error {
+	tag, err := db.Exec(ctx, `
+		UPDATE channel_profiles
+		SET intake_paused_at = $2::timestamptz,
+		    intake_pause_reason = $3,
+		    updated_at = $2::timestamp
+		WHERE id = $1::uuid
+		  AND enabled = TRUE
+		  AND halted_at IS NULL
+		  AND intake_paused_at IS NULL
+	`, channelID, now.UTC(), reason)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: channel %s intake pause authority changed", ErrChannelExecutionBlocked, channelID)
+	}
 	return nil
 }
 

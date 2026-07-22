@@ -222,11 +222,57 @@ func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) 
 	if channelID == "" {
 		return errors.New("agent_tick payload missing channel_id")
 	}
-	planDelay, err := agentTickPlanDelay(item.PayloadJSON)
+	options, err := agentTickOptionsFromPayload(item.PayloadJSON)
 	if err != nil {
 		return err
 	}
-	return h.Store.RunTickWithPlanDelay(ctx, channelID, bucket, planDelay, h)
+	return h.Store.RunTickWithOptions(ctx, channelID, bucket, options, h)
+}
+
+type agentTickOptions struct {
+	PlanDelay                 time.Duration
+	PauseIntakeAfterSelection bool
+	CanaryRunID               string
+}
+
+func agentTickOptionsFromPayload(payload map[string]any) (agentTickOptions, error) {
+	planDelay, err := agentTickPlanDelay(payload)
+	if err != nil {
+		return agentTickOptions{}, err
+	}
+	rawPause, hasPause := payload["pause_intake_after_selection"]
+	rawRunID, hasRunID := payload["canary_run_id"]
+	if !hasPause {
+		if hasRunID {
+			return agentTickOptions{}, errors.New("agent_tick canary_run_id requires intake pause authority")
+		}
+		return agentTickOptions{PlanDelay: planDelay}, nil
+	}
+	pause, ok := rawPause.(bool)
+	if !ok {
+		return agentTickOptions{}, errors.New("agent_tick pause_intake_after_selection must be boolean")
+	}
+	if !pause {
+		if hasRunID {
+			return agentTickOptions{}, errors.New("agent_tick canary_run_id requires intake pause authority")
+		}
+		return agentTickOptions{PlanDelay: planDelay}, nil
+	}
+	if planDelay <= 0 {
+		return agentTickOptions{}, errors.New("guarded agent_tick requires a positive plan delay")
+	}
+	runID, ok := rawRunID.(string)
+	if !ok {
+		return agentTickOptions{}, errors.New("guarded agent_tick requires canary_run_id")
+	}
+	if err := requireUUID("canary_run_id", runID); err != nil {
+		return agentTickOptions{}, fmt.Errorf("guarded agent_tick: %w", err)
+	}
+	return agentTickOptions{
+		PlanDelay:                 planDelay,
+		PauseIntakeAfterSelection: true,
+		CanaryRunID:               runID,
+	}, nil
 }
 
 func agentTickPlanDelay(payload map[string]any) (time.Duration, error) {
