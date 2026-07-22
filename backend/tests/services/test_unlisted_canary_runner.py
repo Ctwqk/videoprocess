@@ -5,7 +5,7 @@ import json
 import subprocess
 import uuid
 from contextlib import contextmanager
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
@@ -900,8 +900,9 @@ async def test_execute_preflight_fails_closed_without_followup_checks(
 async def test_create_graph_is_atomic_unlisted_and_enqueues_one_tick(db: AsyncSession):
     runner = load_runner()
     asset = await add_asset(db)
+    run_id = str(uuid.uuid4())
 
-    graph = await runner.create_canary_graph(db, "run-123", str(asset.id))
+    graph = await runner.create_canary_graph(db, run_id, str(asset.id))
 
     channel = await db.get(ChannelProfile, uuid.UUID(graph["channel_id"]))
     account = await db.get(PublishingAccount, uuid.UUID(graph["account_id"]))
@@ -925,9 +926,190 @@ async def test_create_graph_is_atomic_unlisted_and_enqueues_one_tick(db: AsyncSe
     assert [(row.kind, row.status) for row in ticks] == [("agent_tick", "queued")]
     assert ticks[0].payload_json == {
         "channel_id": str(channel.id),
+        "canary_run_id": run_id,
         "plan_delay_seconds": 300,
+        "pause_intake_after_selection": True,
     }
     assert graph["agent_tick_id"] == str(ticks[0].id)
+
+
+async def add_preapproval_candidate(
+    db: AsyncSession,
+    *,
+    enabled: bool = True,
+    halted: bool = False,
+    pause_reason: str | None = "operator_preapproved_live_unlisted_canary",
+) -> tuple[ChannelProfile, ProductionTask, ChannelOpsQueueItem]:
+    channel = ChannelProfile(
+        name="canary preapproval",
+        enabled=enabled,
+        dry_run=False,
+        halted_at=datetime.now(timezone.utc) if halted else None,
+        intake_paused_at=datetime.now(timezone.utc) if pause_reason is not None else None,
+        intake_pause_reason=pause_reason,
+    )
+    db.add(channel)
+    await db.flush()
+    task = ProductionTask(
+        channel_profile_id=channel.id,
+        target_account_id=uuid.uuid4(),
+        prompt="owned canary",
+        state="selected",
+        approval_mode="manual",
+    )
+    db.add(task)
+    await db.flush()
+    plan_item = ChannelOpsQueueItem(
+        kind="plan_task",
+        idempotency_key=f"plan_task:{task.id}:canary",
+        channel_profile_id=channel.id,
+        payload_json={"production_task_id": str(task.id)},
+        run_after=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    db.add(plan_item)
+    await db.commit()
+    return channel, task, plan_item
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("pause_reason", (None, "wrong_pause_reason"))
+async def test_preapproval_rejects_missing_or_wrong_intake_pause(
+    db: AsyncSession,
+    pause_reason: str | None,
+):
+    runner = load_runner()
+    channel, task, plan_item = await add_preapproval_candidate(db, pause_reason=pause_reason)
+
+    with pytest.raises(runner.CanaryError, match="intake pause"):
+        await runner.preapprove_exactly_one_task(db, channel.id, str(uuid.uuid4()))
+
+    await db.refresh(channel)
+    await db.refresh(task)
+    await db.refresh(plan_item)
+    assert channel.halted_at is None
+    assert task.approval_mode == "manual"
+    assert plan_item.run_after > datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("enabled", "halted", "message"),
+    ((False, False, "enabled"), (True, True, "halted")),
+)
+async def test_preapproval_requires_enabled_non_halted_channel(
+    db: AsyncSession,
+    enabled: bool,
+    halted: bool,
+    message: str,
+):
+    runner = load_runner()
+    channel, task, _plan_item = await add_preapproval_candidate(
+        db,
+        enabled=enabled,
+        halted=halted,
+    )
+
+    with pytest.raises(runner.CanaryError, match=message):
+        await runner.preapprove_exactly_one_task(db, channel.id, str(uuid.uuid4()))
+
+    await db.refresh(channel)
+    await db.refresh(task)
+    assert task.approval_mode == "manual"
+    if halted:
+        assert channel.halted_at is not None
+    else:
+        assert channel.halted_at is None
+
+
+@pytest.mark.anyio
+async def test_preapproval_preserves_paused_non_halted_channel(db: AsyncSession):
+    runner = load_runner()
+    channel, task, plan_item = await add_preapproval_candidate(db)
+
+    approved, released_plan = await runner.preapprove_exactly_one_task(
+        db,
+        channel.id,
+        str(uuid.uuid4()),
+    )
+
+    await db.refresh(channel)
+    assert approved.id == task.id
+    assert released_plan.id == plan_item.id
+    assert channel.enabled is True
+    assert channel.halted_at is None
+    assert channel.intake_paused_at is not None
+    assert channel.intake_pause_reason == runner.CANARY_APPROVAL_REASON
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("side_effect", ("job", "publication"))
+async def test_preapproval_rejects_task_with_existing_side_effect(
+    db: AsyncSession,
+    side_effect: str,
+):
+    runner = load_runner()
+    channel, task, _plan_item = await add_preapproval_candidate(db)
+    if side_effect == "job":
+        job = Job(
+            pipeline_id=uuid.uuid4(),
+            pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+            status=JobStatus.PENDING,
+        )
+        db.add(job)
+        await db.flush()
+        task.job_id = job.id
+    else:
+        db.add(
+            PublicationRecord(
+                production_task_id=task.id,
+                account_id=task.target_account_id,
+                platform_content_id="canary-existing-publication",
+                desired_privacy="unlisted",
+                current_privacy="unlisted",
+                publish_status="uploaded",
+                compliance_disposition="approved",
+            )
+        )
+    await db.commit()
+
+    with pytest.raises(runner.CanaryError, match="already has a"):
+        await runner.preapprove_exactly_one_task(db, channel.id, str(uuid.uuid4()))
+
+
+@pytest.mark.anyio
+async def test_open_gate_records_paused_non_halted_channel(db: AsyncSession):
+    runner = load_runner()
+    channel, _task, _plan_item = await add_preapproval_candidate(db)
+    job = Job(
+        pipeline_id=uuid.uuid4(),
+        pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+        status=JobStatus.PENDING,
+    )
+    db.add(job)
+    await db.commit()
+
+    report = await runner.assert_open_gate(db, channel_id=channel.id, job_id=job.id)
+
+    assert report["channel_enabled"] is True
+    assert report["channel_halted"] is False
+    assert report["channel_intake_paused"] is True
+    assert report["channel_intake_pause_reason"] == runner.CANARY_APPROVAL_REASON
+
+
+@pytest.mark.anyio
+async def test_open_gate_rejects_channel_without_exact_intake_pause(db: AsyncSession):
+    runner = load_runner()
+    channel, _task, _plan_item = await add_preapproval_candidate(db, pause_reason="wrong_pause_reason")
+    job = Job(
+        pipeline_id=uuid.uuid4(),
+        pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+        status=JobStatus.PENDING,
+    )
+    db.add(job)
+    await db.commit()
+
+    with pytest.raises(runner.CanaryError, match="intake pause"):
+        await runner.assert_open_gate(db, channel_id=channel.id, job_id=job.id)
 
 
 @pytest.mark.anyio
@@ -1218,6 +1400,67 @@ async def test_failure_cleanup_uses_naive_utc_for_job_and_node_columns(db: Async
     assert task.state == "held"
     assert task.state_updated_at.tzinfo is timezone.utc
     assert queue_item.status == "dead_lettered"
+
+
+@pytest.mark.anyio
+async def test_failure_cleanup_falls_back_to_fresh_session_after_active_session_error(tmp_path: Path):
+    runner = load_runner()
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'cleanup-fallback.db'}"
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: Base.metadata.create_all(sync_connection, tables=TABLES)
+            )
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            channel = ChannelProfile(name="fallback canary", dry_run=False)
+            session.add(channel)
+            await session.flush()
+            task = ProductionTask(
+                channel_profile_id=channel.id,
+                target_account_id=uuid.uuid4(),
+                prompt="owned canary",
+                state="selected",
+            )
+            queue_item = ChannelOpsQueueItem(
+                kind="plan_task",
+                idempotency_key=f"plan_task:{task.id}:fallback",
+                channel_profile_id=channel.id,
+                payload_json={"production_task_id": str(task.id)},
+            )
+            session.add_all((task, queue_item))
+            await session.commit()
+            channel_id = channel.id
+            task_id = task.id
+            queue_item_id = queue_item.id
+
+        failed_session = SimpleNamespace(
+            rollback=AsyncMock(side_effect=RuntimeError("active session invalidated"))
+        )
+
+        report = await runner.failure_cleanup_with_fallback(
+            failed_session,
+            channel_id,
+            database_url,
+        )
+
+        assert report["active_session_error_type"] == "RuntimeError"
+        assert report["fallback_cleanup"] == {
+            "halted_channel_id": str(channel_id),
+            "held_task_ids": [str(task_id)],
+            "dead_lettered_queue_item_ids": [str(queue_item_id)],
+            "cancelled_job_ids": [],
+            "cancelled_node_execution_ids": [],
+        }
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            cleaned_channel = await session.get(ChannelProfile, channel_id)
+            cleaned_task = await session.get(ProductionTask, task_id)
+            cleaned_queue_item = await session.get(ChannelOpsQueueItem, queue_item_id)
+            assert cleaned_channel is not None and cleaned_channel.halted_at is not None
+            assert cleaned_task is not None and cleaned_task.state == "held"
+            assert cleaned_queue_item is not None and cleaned_queue_item.status == "dead_lettered"
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.anyio

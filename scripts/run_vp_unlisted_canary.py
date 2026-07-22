@@ -1022,7 +1022,9 @@ async def create_canary_graph(
             idempotency_key=f"agent_tick:{channel.id}:{utc_hour_bucket(utc_now())}",
             payload={
                 "channel_id": str(channel.id),
+                "canary_run_id": run_id,
                 "plan_delay_seconds": CANARY_PLAN_DELAY_SECONDS,
+                "pause_intake_after_selection": True,
             },
             priority=20,
             channel_profile_id=channel.id,
@@ -1077,6 +1079,15 @@ async def preapprove_exactly_one_task(
         if len(tasks) != 1:
             raise CanaryError("more than one canary task exists; refusing approval")
         task = tasks[0]
+        if task.job_id is not None:
+            raise CanaryError("canary task already has a job; refusing approval")
+        publication_ids = list(
+            await db.scalars(
+                select(PublicationRecord.id).where(PublicationRecord.production_task_id == task.id)
+            )
+        )
+        if publication_ids:
+            raise CanaryError("canary task already has a publication; refusing approval")
         plan_items = list(
             (
                 await db.execute(
@@ -1098,8 +1109,15 @@ async def preapprove_exactly_one_task(
         channel = (
             await db.execute(select(ChannelProfile).where(ChannelProfile.id == channel_id).with_for_update())
         ).scalar_one()
-        channel.halted_at = now
-        channel.halt_reason = CANARY_APPROVAL_REASON
+        if not channel.enabled:
+            raise CanaryError("canary channel is not enabled for preapproval")
+        if channel.halted_at is not None:
+            raise CanaryError("canary channel is halted; refusing approval")
+        if (
+            channel.intake_paused_at is None
+            or channel.intake_pause_reason != CANARY_APPROVAL_REASON
+        ):
+            raise CanaryError("canary intake pause is missing or has the wrong reason")
         task.approval_mode = "agent"
         task.agent_approval_evidence_json = {
             "approved_by": "operator",
@@ -1194,7 +1212,19 @@ async def assert_open_gate(
             .where(ChannelOpsQueueItem.status.in_(("queued", "running")))
         )
     )
+    channel = await db.get(ChannelProfile, channel_id)
     await db.commit()
+    if channel is None:
+        raise CanaryError("canary channel disappeared before schedule open")
+    if not channel.enabled:
+        raise CanaryError("canary channel is not enabled before schedule open")
+    if channel.halted_at is not None:
+        raise CanaryError("canary channel is halted before schedule open")
+    if (
+        channel.intake_paused_at is None
+        or channel.intake_pause_reason != CANARY_APPROVAL_REASON
+    ):
+        raise CanaryError("canary intake pause is missing or has the wrong reason before schedule open")
     if set(runnable_ids) != {job_id}:
         raise CanaryError("exactly one runnable job is required and it must be the canary")
     if report["unsafe_queue_item_ids"] or report["unsafe_task_ids"]:
@@ -1206,6 +1236,10 @@ async def assert_open_gate(
         "runnable_job_ids": sorted(str(item) for item in runnable_ids),
         "queued_youtube_node_ids": sorted(str(item) for item in publish_nodes),
         "queued_youtube_queue_item_ids": sorted(str(item) for item in publish_queue),
+        "channel_enabled": channel.enabled,
+        "channel_halted": channel.halted_at is not None,
+        "channel_intake_paused": channel.intake_paused_at is not None,
+        "channel_intake_pause_reason": channel.intake_pause_reason,
     }
 
 
@@ -1793,6 +1827,31 @@ async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, 
     }
 
 
+async def failure_cleanup_with_fallback(
+    db: AsyncSession,
+    channel_id: uuid.UUID,
+    database_url: str,
+) -> dict[str, Any]:
+    try:
+        await db.rollback()
+        return await failure_cleanup(db, channel_id)
+    except Exception as active_session_exc:
+        engine = create_async_engine(async_database_url(database_url), pool_pre_ping=True)
+        try:
+            async with engine.connect() as connection:
+                fallback_db = AsyncSession(bind=connection, expire_on_commit=False)
+                try:
+                    report = await failure_cleanup(fallback_db, channel_id)
+                finally:
+                    await fallback_db.close()
+        finally:
+            await engine.dispose()
+        return {
+            "active_session_error_type": type(active_session_exc).__name__,
+            "fallback_cleanup": sanitize(report),
+        }
+
+
 async def acquire_advisory_lock(connection: AsyncConnection) -> None:
     if connection.dialect.name != "postgresql":
         raise CanaryError("the live canary requires PostgreSQL for its advisory lock")
@@ -1884,7 +1943,7 @@ async def execute_canary(
         "approval_mode": task.approval_mode,
         "agent_approval_evidence": task.agent_approval_evidence_json,
         "plan_queue_item_id": str(plan_item.id),
-        "channel_halted_after_exactly_one_task": True,
+        "channel_intake_paused_after_exactly_one_task": True,
     }
     atomic_write_json(path, evidence)
 
@@ -2159,10 +2218,10 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
                                     and graph.get("channel_id")
                                 ):
                                     try:
-                                        await db.rollback()
-                                        evidence["failure_cleanup"] = await failure_cleanup(
+                                        evidence["failure_cleanup"] = await failure_cleanup_with_fallback(
                                             db,
                                             uuid.UUID(str(graph["channel_id"])),
+                                            endpoints.database_url,
                                         )
                                     except Exception as cleanup_exc:
                                         evidence["failure_cleanup"] = {

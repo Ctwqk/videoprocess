@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QUARANTINE="$ROOT_DIR/scripts/quarantine_channelops_backlog.py"
 CANARY="$ROOT_DIR/scripts/run_vp_unlisted_canary.py"
+PYTHON_BIN="$ROOT_DIR/backend/.venv/bin/python"
+if [[ ! -x "$PYTHON_BIN" && -x "$ROOT_DIR/../../backend/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/../../backend/.venv/bin/python"
+fi
 
 for script in "$QUARANTINE" "$CANARY"; do
   [[ -f "$script" ]] || {
@@ -38,6 +42,10 @@ grep -Fq '"source_strategy": "input_video"' "$CANARY"
 grep -Fq '"planning_mode": "template"' "$CANARY"
 grep -Fq '"max_posts_per_day": 1' "$CANARY"
 grep -Fq 'operator_preapproved_live_unlisted_canary' "$CANARY"
+grep -Fq '"canary_run_id": run_id' "$CANARY"
+grep -Fq '"pause_intake_after_selection": True' "$CANARY"
+grep -Fq '"channel_intake_paused_after_exactly_one_task": True' "$CANARY"
+grep -Fq 'failure_cleanup_with_fallback' "$CANARY"
 grep -Fq 'pre-existing runnable jobs' "$CANARY"
 grep -Fq 'unsafe ChannelOps backlog' "$CANARY"
 grep -Fq 'exactly one runnable job' "$CANARY"
@@ -118,9 +126,31 @@ live_guarded_close = any(
 )
 if not live_guarded_close:
     raise SystemExit("FAIL: schedule close must be guarded by live mode")
+
+for function_name in ("preapprove_exactly_one_task", "assert_open_gate"):
+    function = functions.get(function_name)
+    if function is None:
+        raise SystemExit(f"FAIL: missing {function_name}")
+    source = ast.unparse(function)
+    for required in (
+        "channel.enabled",
+        "channel.halted_at",
+        "channel.intake_paused_at",
+        "channel.intake_pause_reason",
+    ):
+        if required not in source:
+            raise SystemExit(f"FAIL: {function_name} must verify {required}")
+
+preapproval = functions["preapprove_exactly_one_task"]
+if any(
+    isinstance(node, ast.Assign)
+    and any(ast.unparse(target).endswith(".halted_at") for target in node.targets)
+    for node in ast.walk(preapproval)
+):
+    raise SystemExit("FAIL: preapproval must not halt the canary channel")
 PY
 
-"$ROOT_DIR/backend/.venv/bin/python" - "$CANARY" "$QUARANTINE" <<'PY'
+"$PYTHON_BIN" - "$CANARY" "$QUARANTINE" <<'PY'
 import importlib.util
 import os
 import pathlib
