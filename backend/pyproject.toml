@@ -32,9 +32,11 @@ worker = [
     "yt-dlp",
 ]
 dev = [
+    "aiosqlite",
     "pytest",
     "pytest-asyncio",
     "httpx",
+    "requests",
 ]
 
 [tool.setuptools.packages.find]
