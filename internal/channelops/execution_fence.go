@@ -120,7 +120,7 @@ func resolveQueueAuthority(ctx context.Context, db dbExecutor, item QueueItemRow
 		err = db.QueryRow(ctx, `
 			SELECT channel_profile_id FROM publishing_accounts WHERE id = $1::uuid
 		`, accountID).Scan(&channelID)
-	case QueueAgentTick, QueueLearningRecompute:
+	case QueueAgentTick, QueueLearningRecompute, QueueIngestDiscovery:
 		channelID = firstString(item.PayloadJSON, "channel_id")
 		if err := requireUUID("channel_id", channelID); err != nil {
 			return nil, queueAuthorityError(item, err)

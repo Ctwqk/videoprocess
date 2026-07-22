@@ -141,3 +141,88 @@ func TestSchedulerRunOnceEnqueuesOperationalMaintenance(t *testing.T) {
 		}
 	}
 }
+
+func TestSchedulerRunOnceSchedulesEnabledDiscoveryOncePerPolicyBucket(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	fixture.SetDiscoveryContentMix(ctx, `{"youtube_discovery":{"enabled":true}}`)
+	scheduler := Scheduler{Store: fixture.Store}
+	first := time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC)
+	second := first.Add(time.Hour)
+
+	if got, err := scheduler.RunOnce(ctx, first); err != nil || got != 1 {
+		t.Fatalf("RunOnce first = %d, %v", got, err)
+	}
+	if got, err := scheduler.RunOnce(ctx, second); err != nil || got != 1 {
+		t.Fatalf("RunOnce second = %d, %v", got, err)
+	}
+
+	bucket := SchedulerBucket(first, 360)
+	var count, priority int
+	var key, source, payloadChannel, schedulerBucket string
+	var hasBucket bool
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT count(*), min(priority), min(idempotency_key), min(payload_json ->> 'source'),
+		       min(payload_json ->> 'channel_id'), min(payload_json ->> 'scheduler_bucket'),
+		       bool_or(payload_json ? 'bucket')
+		FROM channel_ops_queue_items
+		WHERE kind = $1
+	`, QueueIngestDiscovery).Scan(&count, &priority, &key, &source, &payloadChannel, &schedulerBucket, &hasBucket); err != nil {
+		t.Fatalf("select discovery queue item: %v", err)
+	}
+	if count != 1 || priority != 80 || key != DiscoveryIdempotencyKey(fixture.ChannelID, "youtube_search", bucket) || source != "youtube_search" || payloadChannel != fixture.ChannelID || schedulerBucket != bucket || !hasBucket {
+		t.Fatalf("discovery row count/priority/key/source/channel/scheduler_bucket/has_bucket = %d/%d/%q/%q/%q/%q/%t", count, priority, key, source, payloadChannel, schedulerBucket, hasBucket)
+	}
+
+	var agentTicks int
+	if err := fixture.Store.Pool.QueryRow(ctx, `SELECT count(*) FROM channel_ops_queue_items WHERE kind = $1`, QueueAgentTick).Scan(&agentTicks); err != nil {
+		t.Fatalf("count agent ticks: %v", err)
+	}
+	if agentTicks != 2 {
+		t.Fatalf("agent tick count = %d, want 2", agentTicks)
+	}
+}
+
+func TestSchedulerRunOnceDiscoveryFailClosesWithoutChangingAgentTick(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	for _, tt := range []struct {
+		name       string
+		contentMix string
+	}{
+		{name: "default disabled", contentMix: `{}`},
+		{name: "invalid enabled policy", contentMix: `{"youtube_discovery":{"enabled":true,"interval_minutes":59}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			fixture.SetDiscoveryContentMix(ctx, tt.contentMix)
+
+			if got, err := (Scheduler{Store: fixture.Store}).RunOnce(ctx, fixture.Store.Now()); err != nil || got != 1 {
+				t.Fatalf("RunOnce = %d, %v", got, err)
+			}
+			for _, kind := range []string{QueueAgentTick, QueueIngestDiscovery} {
+				var count int
+				if err := fixture.Store.Pool.QueryRow(ctx, `SELECT count(*) FROM channel_ops_queue_items WHERE kind = $1`, kind).Scan(&count); err != nil {
+					t.Fatalf("count %s: %v", kind, err)
+				}
+				want := 0
+				if kind == QueueAgentTick {
+					want = 1
+				}
+				if count != want {
+					t.Fatalf("%s count = %d, want %d", kind, count, want)
+				}
+			}
+		})
+	}
+}

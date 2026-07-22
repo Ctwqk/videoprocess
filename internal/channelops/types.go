@@ -15,6 +15,7 @@ const (
 	QueueSendAlert            = "send_alert"
 	QueueCleanupExpired       = "cleanup_expired"
 	QueueLearningRecompute    = "learning_recompute"
+	QueueIngestDiscovery      = "ingest_discovery"
 
 	QueueStatusQueued       = "queued"
 	QueueStatusRunning      = "running"

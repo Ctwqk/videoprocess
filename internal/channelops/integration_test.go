@@ -2793,6 +2793,99 @@ func (f *ChannelOpsFixture) SetTickInterval(ctx context.Context, intervalMinutes
 	}
 }
 
+func (f *ChannelOpsFixture) SetDiscoveryContentMix(ctx context.Context, contentMix string) {
+	f.T.Helper()
+	_, err := f.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles
+		SET content_mix_policy_json = $2::json
+		WHERE id = $1::uuid
+	`, f.ChannelID, contentMix)
+	if err != nil {
+		f.T.Fatalf("set discovery content mix: %v", err)
+	}
+}
+
+func TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+
+	otherChannelID := insertAuthorityTestChannel(t, ctx, fixture, "discovery-other", false)
+	channelID := fixture.ChannelID
+	for _, tt := range []struct {
+		name          string
+		payload       map[string]any
+		storedChannel *string
+		claimable     bool
+	}{
+		{
+			name:          "matching payload is channel scoped",
+			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			storedChannel: &channelID,
+			claimable:     true,
+		},
+		{
+			name:          "missing payload channel is not global",
+			payload:       map[string]any{"source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			storedChannel: &channelID,
+			claimable:     false,
+		},
+		{
+			name:          "mismatched payload channel is not claimable",
+			payload:       map[string]any{"channel_id": otherChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			storedChannel: &channelID,
+			claimable:     false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			itemID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+				Kind:             QueueIngestDiscovery,
+				IdempotencyKey:   "ingest_discovery:authority:" + testUUID(t, tt.name),
+				Payload:          tt.payload,
+				ChannelProfileID: tt.storedChannel,
+			})
+			if err != nil {
+				t.Fatalf("enqueue discovery: %v", err)
+			}
+			item, err := fixture.Store.ClaimNextForKinds(ctx, "discovery-authority-worker", []string{QueueIngestDiscovery})
+			if err != nil {
+				t.Fatalf("claim discovery: %v", err)
+			}
+			if tt.claimable {
+				if item == nil || item.ID != itemID {
+					t.Fatalf("claimed item = %#v, want %s", item, itemID)
+				}
+			} else if item != nil {
+				t.Fatalf("claimed invalid discovery item: %#v", item)
+			}
+			dispatched := false
+			err = fixture.Store.WithQueueExecutionFence(ctx, QueueItemRow{
+				ID:               itemID,
+				Kind:             QueueIngestDiscovery,
+				PayloadJSON:      tt.payload,
+				ChannelProfileID: tt.storedChannel,
+			}, func(*Store) error {
+				dispatched = true
+				return nil
+			})
+			if tt.claimable {
+				if err != nil || !dispatched {
+					t.Fatalf("fence matching discovery item = dispatched %t, err %v", dispatched, err)
+				}
+			} else if !errors.Is(err, ErrQueueAuthorityInvalid) || dispatched {
+				t.Fatalf("fence invalid discovery item = dispatched %t, err %v", dispatched, err)
+			}
+			if _, err := fixture.Store.Pool.Exec(ctx, `DELETE FROM channel_ops_queue_items WHERE id = $1::uuid`, itemID); err != nil {
+				t.Fatalf("delete discovery item: %v", err)
+			}
+		})
+	}
+}
+
 func (f *ChannelOpsFixture) SetDryRun(ctx context.Context, dryRun bool) {
 	f.T.Helper()
 	_, err := f.Store.Pool.Exec(ctx, `

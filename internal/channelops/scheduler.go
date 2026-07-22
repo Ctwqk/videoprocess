@@ -49,6 +49,10 @@ func LearningRecomputeIdempotencyKey(channelID string, bucket string) string {
 	return fmt.Sprintf("learning_recompute:%s:%s", channelID, bucket)
 }
 
+func DiscoveryIdempotencyKey(channelID string, source string, bucket string) string {
+	return fmt.Sprintf("ingest_discovery:%s:%s:%s", channelID, source, bucket)
+}
+
 type Scheduler struct {
 	Store *Store
 }
@@ -63,6 +67,9 @@ func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 	for _, channel := range channels {
 		if !ChannelDueForTick(channel, now) {
 			continue
+		}
+		if err := s.enqueueDiscovery(ctx, channel, now); err != nil {
+			return enqueued, err
 		}
 		bucket := SchedulerBucket(now, channel.TickIntervalMinutes)
 		created, err := s.Store.InsertSchedulerRun(ctx, channel.ID, bucket)
@@ -90,6 +97,28 @@ func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 		return enqueued, err
 	}
 	return enqueued, nil
+}
+
+func (s Scheduler) enqueueDiscovery(ctx context.Context, channel ChannelProfileRow, now time.Time) error {
+	policy, err := DiscoveryPolicyFromContentMix(channel.ContentMixPolicyJSON)
+	if err != nil || !policy.Enabled {
+		return nil
+	}
+	bucket := SchedulerBucket(now, policy.IntervalMinutes)
+	channelID := channel.ID
+	_, err = s.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueIngestDiscovery,
+		IdempotencyKey: DiscoveryIdempotencyKey(channel.ID, discoverySourceYouTubeSearch, bucket),
+		Payload: map[string]any{
+			"channel_id":       channel.ID,
+			"source":           discoverySourceYouTubeSearch,
+			"bucket":           bucket,
+			"scheduler_bucket": bucket,
+		},
+		Priority:         80,
+		ChannelProfileID: &channelID,
+	})
+	return err
 }
 
 func (s Scheduler) enqueueOperationalMaintenance(ctx context.Context, channels []ChannelProfileRow, now time.Time) error {

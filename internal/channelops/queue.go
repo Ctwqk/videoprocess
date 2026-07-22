@@ -43,7 +43,7 @@ const queueAuthorityCTE = `
 				WHEN refs.kind IN ('promote_publication', 'reconcile_publication', 'collect_metrics')
 					THEN publication_task.channel_profile_id
 				WHEN refs.kind = 'account_health' THEN account.channel_profile_id
-				WHEN refs.kind IN ('agent_tick', 'learning_recompute') THEN payload_channel.id
+				WHEN refs.kind IN ('agent_tick', 'learning_recompute', 'ingest_discovery') THEN payload_channel.id
 				WHEN refs.kind = 'send_alert' THEN
 					CASE
 						WHEN refs.payload_channel_value IS NULL THEN stored_channel.id
