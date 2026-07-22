@@ -21,6 +21,7 @@ from app.channel_agent.constants import (
     TASK_SEEDED,
     TASK_UPLOADED_PRIVATE,
 )
+from app.channel_agent.discovery_policy import DiscoveryPolicy, DiscoveryPolicyError
 from app.channel_agent.queue import ChannelOpsQueueService, utc_hour_bucket
 from app.channel_agent.human_review import (
     build_pre_upload_evidence,
@@ -50,12 +51,23 @@ from app.models.channel_agent import (
 )
 from app.schemas.channel_agent import (
     ChannelProfileCreate,
+    DiscoveryIngestionRequest,
+    DiscoveryIngestionResponse,
     HealthSummary,
     LaneFormatCreate,
     ManualSeedCreate,
     PublishingAccountCreate,
     QueueItemRead,
     TopicLaneCreate,
+)
+from app.services.discovery_ingestion import (
+    DiscoveryIngestionAuthorityError,
+    DiscoveryIngestionConflictError,
+    DiscoveryIngestionInProgressError,
+    DiscoveryIngestionPolicyError,
+    DiscoveryIngestionProviderError,
+    DiscoveryIngestionRequest as DiscoveryIngestionServiceRequest,
+    DiscoveryIngestionService,
 )
 
 
@@ -78,6 +90,94 @@ class PauseRequest(BaseModel):
 class HumanReviewRequest(BaseModel):
     human_actor: str = "channel_agent_operator"
     review_notes: str | None = None
+
+
+def _create_discovery_youtube_client():
+    from app.channel_agent.runner import _build_youtube_client
+
+    return _build_youtube_client()
+
+
+def _has_discovery_queue_authority(
+    queue_item: ChannelOpsQueueItem,
+    data: DiscoveryIngestionRequest,
+) -> bool:
+    payload = queue_item.payload_json
+    return (
+        queue_item.kind == "ingest_discovery"
+        and queue_item.status == "running"
+        and queue_item.channel_profile_id == data.channel_id
+        and isinstance(payload, dict)
+        and payload.get("channel_id") == str(data.channel_id)
+        and payload.get("source") == data.source
+        and payload.get("scheduler_bucket") == data.scheduler_bucket
+    )
+
+
+@router.post(
+    "/internal/discovery/ingest",
+    response_model=DiscoveryIngestionResponse,
+)
+async def ingest_discovery(
+    data: DiscoveryIngestionRequest,
+    db: AsyncSession = Depends(get_db),
+) -> DiscoveryIngestionResponse:
+    queue_item = await db.get(ChannelOpsQueueItem, data.queue_item_id)
+    if queue_item is None:
+        raise HTTPException(status_code=404, detail="discovery_queue_item_not_found")
+    if not _has_discovery_queue_authority(queue_item, data):
+        raise HTTPException(status_code=409, detail="discovery_queue_authority_invalid")
+
+    channel = await db.get(ChannelProfile, data.channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="discovery_channel_not_found")
+    if not channel.enabled or channel.halted_at is not None:
+        raise HTTPException(status_code=409, detail="discovery_channel_unavailable")
+    try:
+        discovery_policy = DiscoveryPolicy.from_content_mix(channel.content_mix_policy_json)
+    except DiscoveryPolicyError:
+        raise HTTPException(status_code=409, detail="discovery_policy_invalid") from None
+    if not discovery_policy.enabled:
+        raise HTTPException(status_code=409, detail="discovery_policy_disabled")
+
+    service = DiscoveryIngestionService(youtube_client=_create_discovery_youtube_client())
+    try:
+        result = await service.ingest(
+            db,
+            DiscoveryIngestionServiceRequest(
+                channel_id=data.channel_id,
+                queue_item_id=data.queue_item_id,
+                source=data.source,
+                scheduler_bucket=data.scheduler_bucket,
+            ),
+            now=Clock().now(),
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="discovery_channel_not_found") from None
+    except DiscoveryIngestionInProgressError:
+        raise HTTPException(status_code=409, detail="discovery_run_in_progress") from None
+    except DiscoveryIngestionAuthorityError:
+        raise HTTPException(status_code=409, detail="discovery_authority_conflict") from None
+    except DiscoveryIngestionPolicyError:
+        raise HTTPException(status_code=409, detail="discovery_policy_conflict") from None
+    except DiscoveryIngestionConflictError:
+        raise HTTPException(status_code=409, detail="discovery_authority_conflict") from None
+    except DiscoveryIngestionProviderError:
+        raise HTTPException(status_code=502, detail="discovery_provider_error") from None
+
+    return DiscoveryIngestionResponse(
+        run_id=result.run_id,
+        channel_id=result.channel_id,
+        queue_item_id=data.queue_item_id,
+        source=data.source,
+        scheduler_bucket=result.scheduler_bucket,
+        status="succeeded",
+        query_count=result.query_count,
+        created_count=result.created_count,
+        refreshed_count=result.refreshed_count,
+        expired_count=result.expired_count,
+        quota_units_estimated=result.quota_units_estimated,
+    )
 
 
 @router.post("/channels")

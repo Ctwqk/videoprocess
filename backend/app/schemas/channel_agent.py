@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ChannelProfileCreate(BaseModel):
@@ -125,6 +125,36 @@ class QueueItemRead(BaseModel):
     payload_json: dict[str, Any]
     attempt_count: int
     last_error: str | None = None
+
+
+class DiscoveryIngestionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_id: UUID
+    queue_item_id: UUID
+    source: Literal["youtube_search"]
+    scheduler_bucket: str = Field(min_length=1, max_length=64)
+
+    @field_validator("scheduler_bucket")
+    @classmethod
+    def scheduler_bucket_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("scheduler_bucket must be nonblank")
+        return value
+
+
+class DiscoveryIngestionResponse(BaseModel):
+    run_id: UUID
+    channel_id: UUID
+    queue_item_id: UUID
+    source: Literal["youtube_search"]
+    scheduler_bucket: str
+    status: Literal["succeeded"]
+    query_count: int
+    created_count: int
+    refreshed_count: int
+    expired_count: int
+    quota_units_estimated: int
 
 
 class HealthSummary(BaseModel):
