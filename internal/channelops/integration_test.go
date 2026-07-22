@@ -1762,6 +1762,113 @@ func TestCollectMetricsRequeueUsesConfiguredDelay(t *testing.T) {
 	}
 }
 
+func TestImmediateMetricsRetryPreservesStageAndTaskState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+	publicationID := firstString(promote.PayloadJSON, "publication_id")
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = 'cancelled'
+		WHERE kind = $1
+		  AND payload_json::jsonb ? 'metric_schedule_id'
+		  AND payload_json ->> 'publication_id' = $2
+	`, QueueCollectMetrics, publicationID); err != nil {
+		t.Fatalf("cancel durable metric queues: %v", err)
+	}
+	channelID := fixture.ChannelID
+	if _, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueCollectMetrics,
+		IdempotencyKey: fmt.Sprintf("collect_metrics:%s:immediate:attempt:0", publicationID),
+		Payload: map[string]any{
+			"publication_id": publicationID,
+			"snapshot_stage": "immediate",
+		},
+		Priority:         1,
+		ChannelProfileID: &channelID,
+	}); err != nil {
+		t.Fatalf("enqueue immediate metrics: %v", err)
+	}
+
+	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	handler.YouTube = fakeNoMetricsYouTube{fakeYouTube{}}
+	handler.Config.MetricsPollMaxAttempts = 3
+	if err := handler.Handle(ctx, collect); err != nil {
+		t.Fatalf("Handle unavailable immediate metrics: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, collect); err != nil {
+		t.Fatalf("MarkQueueDone immediate metrics: %v", err)
+	}
+
+	retry := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	wantKey := fmt.Sprintf("collect_metrics:%s:stage:immediate:poll:1", publicationID)
+	if retry.IdempotencyKey != wantKey ||
+		firstString(retry.PayloadJSON, "snapshot_stage") != "immediate" ||
+		intOrDefault(retry.PayloadJSON["metrics_poll_count"], -1) != 1 {
+		t.Fatalf("immediate retry key/payload = %s/%#v", retry.IdempotencyKey, retry.PayloadJSON)
+	}
+	handler.YouTube = fakeYouTube{}
+	if err := handler.Handle(ctx, retry); err != nil {
+		t.Fatalf("Handle retried immediate metrics: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, retry); err != nil {
+		t.Fatalf("MarkQueueDone retried immediate metrics: %v", err)
+	}
+
+	var snapshotStage string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT snapshot_stage
+		FROM feedback_snapshots
+		WHERE publication_id = $1::uuid
+	`, publicationID).Scan(&snapshotStage); err != nil {
+		t.Fatalf("select immediate feedback snapshot: %v", err)
+	}
+	if snapshotStage != "immediate" {
+		t.Fatalf("retried feedback stage = %q, want immediate", snapshotStage)
+	}
+	if task := fixture.RequireSingleTask(ctx); task.State != TaskScheduled {
+		t.Fatalf("task state after retried immediate metrics = %s, want scheduled", task.State)
+	}
+
+	if _, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueCollectMetrics,
+		IdempotencyKey: fmt.Sprintf("collect_metrics:%s:immediate:exhaustion", publicationID),
+		Payload: map[string]any{
+			"publication_id": publicationID,
+			"snapshot_stage": "immediate",
+		},
+		Priority:         1,
+		ChannelProfileID: &channelID,
+	}); err != nil {
+		t.Fatalf("enqueue exhausted immediate metrics: %v", err)
+	}
+	exhausted := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	handler.YouTube = fakeNoMetricsYouTube{fakeYouTube{}}
+	handler.Config.MetricsPollMaxAttempts = 1
+	if err := handler.Handle(ctx, exhausted); err != nil {
+		t.Fatalf("Handle exhausted immediate metrics: %v", err)
+	}
+	if task := fixture.RequireSingleTask(ctx); task.State != TaskScheduled {
+		t.Fatalf("task state after exhausted immediate metrics = %s, want scheduled", task.State)
+	}
+}
+
 func TestCollectMetricsUpsertsStagedRewardSnapshot(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -2149,6 +2256,8 @@ func TestPublicationMetricsFailureCategoryPersistsAndClears(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPublication: %v", err)
 	}
+	delete(collect.PayloadJSON, "metric_schedule_id")
+	delete(collect.PayloadJSON, "snapshot_stage")
 
 	if err := fixture.Store.RequeueOrHoldMetrics(ctx, publication, collect, 1, time.Minute); err != nil {
 		t.Fatalf("RequeueOrHoldMetrics: %v", err)
@@ -2991,9 +3100,20 @@ func testUUID(t *testing.T, label string) string {
 func (f *ChannelOpsFixture) makeQueuedItemsReady(ctx context.Context) {
 	f.T.Helper()
 	_, err := f.Store.Pool.Exec(ctx, `
-		UPDATE channel_ops_queue_items
-		SET run_after = NOW()
-		WHERE channel_profile_id = $1::uuid AND status = $2
+		WITH ordered AS (
+			SELECT id,
+			       ROW_NUMBER() OVER (
+			           ORDER BY priority, run_after, created_at, id
+			       ) AS ordinal
+			FROM channel_ops_queue_items
+			WHERE channel_profile_id = $1::uuid AND status = $2
+		)
+		UPDATE channel_ops_queue_items AS q
+		SET run_after = NOW(),
+		    created_at = NOW() - INTERVAL '1 day' +
+		        (ordered.ordinal::double precision * INTERVAL '1 microsecond')
+		FROM ordered
+		WHERE q.id = ordered.id
 	`, f.ChannelID, QueueStatusQueued)
 	if err != nil {
 		f.T.Fatalf("make queued items ready: %v", err)

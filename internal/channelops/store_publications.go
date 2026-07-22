@@ -384,6 +384,11 @@ func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication Publicatio
 	now := s.Now().UTC()
 	pollCount := intOrDefault(item.PayloadJSON["metrics_poll_count"], 0)
 	nextCount := pollCount + 1
+	explicitStage := ""
+	rawStage := strings.TrimSpace(firstString(item.PayloadJSON, "snapshot_stage", "stage", "window"))
+	if stage := SnapshotStageFromPayload(item.PayloadJSON); rawStage != "" && rawStage == stage {
+		explicitStage = stage
+	}
 	if _, err := s.db().Exec(ctx, `
 		UPDATE publication_records
 			SET last_metrics_polled_at = $2::timestamptz, updated_at = $2::timestamp
@@ -392,6 +397,9 @@ func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication Publicatio
 		return err
 	}
 	if nextCount >= maxPolls {
+		if explicitStage != "" && explicitStage != "24h" {
+			return nil
+		}
 		return s.updateTaskState(ctx, publication.ProductionTaskID, TaskHeld, "metrics_unavailable", "Publication metrics were unavailable after polling", "collect_metrics", FailureMetrics, now)
 	}
 	parentID, err := optionalUUID("parent_queue_item_id", item.ID)
@@ -402,10 +410,24 @@ func (s *Store) RequeueOrHoldMetrics(ctx context.Context, publication Publicatio
 	if err != nil {
 		return err
 	}
+	payload := map[string]any{
+		"publication_id":     publication.ID,
+		"metrics_poll_count": nextCount,
+	}
+	idempotencyKey := fmt.Sprintf("collect_metrics:%s:poll:%d", publication.ID, nextCount)
+	if explicitStage != "" {
+		payload["snapshot_stage"] = explicitStage
+		idempotencyKey = fmt.Sprintf(
+			"collect_metrics:%s:stage:%s:poll:%d",
+			publication.ID,
+			explicitStage,
+			nextCount,
+		)
+	}
 	_, err = s.Enqueue(ctx, EnqueueOptions{
 		Kind:              QueueCollectMetrics,
-		IdempotencyKey:    fmt.Sprintf("collect_metrics:%s:poll:%d", publication.ID, nextCount),
-		Payload:           map[string]any{"publication_id": publication.ID, "metrics_poll_count": nextCount},
+		IdempotencyKey:    idempotencyKey,
+		Payload:           payload,
 		Priority:          90,
 		RunAfter:          now.Add(metricsDelay),
 		ChannelProfileID:  &channelProfileID,
