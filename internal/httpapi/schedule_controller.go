@@ -23,6 +23,7 @@ var (
 	ErrScheduleGuardMismatch          = errors.New("schedule guard mismatch")
 	errGuardedScheduleHandoff         = errors.New("guarded schedule handoff failed")
 	errGuardedScheduleCloseIncomplete = errors.New("guarded schedule handoff failed; best-effort close incomplete")
+	guardedScheduleCleanupTimeout     = 5 * time.Second
 )
 
 type storeScheduleController struct {
@@ -211,7 +212,7 @@ func isExpectedGuardedOpen(row store.VideoScheduleStatusRow, expectedJobID strin
 }
 
 func closeScheduleWithFreshContext(ctx context.Context, controller ScheduleController) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), guardedScheduleCleanupTimeout)
 	defer cancel()
 	_, err := controller.SetState(cleanupCtx, "CLOSED")
 	return err

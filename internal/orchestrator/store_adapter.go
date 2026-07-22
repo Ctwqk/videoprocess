@@ -46,6 +46,10 @@ func (a *StoreAdapter) MarkGoJobPlanning(ctx context.Context, jobID string, exec
 	return a.Store.MarkGoJobPlanning(ctx, jobID, executionPlan)
 }
 
+func (a *StoreAdapter) ClaimGoJobPlanning(ctx context.Context, jobID string, executionPlan map[string]any) (bool, error) {
+	return a.Store.ClaimGoJobPlanning(ctx, jobID, executionPlan)
+}
+
 func (a *StoreAdapter) MarkGoJobRunning(ctx context.Context, jobID string) error {
 	return a.Store.MarkGoJobRunning(ctx, jobID)
 }

@@ -106,6 +106,12 @@ func TestStartJobParksFreshJobWhenScheduleClosed(t *testing.T) {
 	if store.planningPlan != nil {
 		t.Fatalf("planning plan = %#v; want nil", store.planningPlan)
 	}
+	if sourceStatus := store.node("source").Status; sourceStatus != "PENDING" {
+		t.Fatalf("source status = %q; want PENDING", sourceStatus)
+	}
+	if trimStatus := store.node("trim").Status; trimStatus != "PENDING" {
+		t.Fatalf("trim status = %q; want PENDING", trimStatus)
+	}
 	if len(dispatcher.calls) != 0 {
 		t.Fatalf("dispatch calls = %d; want 0", len(dispatcher.calls))
 	}
@@ -191,6 +197,34 @@ func TestStartJobKeepsLegacyUnguardedOpenBehavior(t *testing.T) {
 
 	if store.job.Status != "RUNNING" || store.planningPlan == nil || len(dispatcher.calls) != 1 {
 		t.Fatalf("job status=%q planning=%#v dispatch calls=%d", store.job.Status, store.planningPlan, len(dispatcher.calls))
+	}
+}
+
+func TestStartJobRevalidatesAuthorityWhenPlanningClaimLosesRace(t *testing.T) {
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim")))
+	store.scheduleGuardedJobID = "job-1"
+	store.claimAllowed = false
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	if err := engine.StartJob(context.Background(), "job-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	if store.claimCount != 1 {
+		t.Fatalf("planning claim count = %d; want 1", store.claimCount)
+	}
+	if store.job.Status != "WAITING_WINDOW" {
+		t.Fatalf("job status = %q; want WAITING_WINDOW", store.job.Status)
+	}
+	if store.markPlanningCount != 0 || store.runningCount != 0 {
+		t.Fatalf("ordinary planning calls=%d running calls=%d; want 0, 0", store.markPlanningCount, store.runningCount)
+	}
+	if store.planningPlan != nil {
+		t.Fatalf("planning plan = %#v; want nil", store.planningPlan)
+	}
+	if len(dispatcher.calls) != 0 {
+		t.Fatalf("dispatch calls = %d; want 0", len(dispatcher.calls))
 	}
 }
 
@@ -527,6 +561,10 @@ type fakeEngineStore struct {
 	finalNodeIDs         []string
 	scheduleState        string
 	scheduleGuardedJobID string
+	claimAllowed         bool
+	claimCount           int
+	markPlanningCount    int
+	runningCount         int
 	waitingWindowCount   int
 	queueClaim           bool
 	releaseCount         int
@@ -534,7 +572,7 @@ type fakeEngineStore struct {
 }
 
 func newFakeEngineStore(job JobView) *fakeEngineStore {
-	return &fakeEngineStore{job: cloneJob(job), scheduleState: "OPEN", queueClaim: true}
+	return &fakeEngineStore{job: cloneJob(job), scheduleState: "OPEN", claimAllowed: true, queueClaim: true}
 }
 
 func (s *fakeEngineStore) GetJobDetail(_ context.Context, _ string) (JobView, error) {
@@ -553,13 +591,27 @@ func (s *fakeEngineStore) CreateSourceArtifact(_ context.Context, _ string, node
 }
 
 func (s *fakeEngineStore) MarkGoJobPlanning(_ context.Context, _ string, executionPlan map[string]any) error {
+	s.markPlanningCount++
 	s.job.Status = "PLANNING"
 	s.job.ExecutionPlan = executionPlan
 	s.planningPlan = executionPlan
 	return nil
 }
 
+func (s *fakeEngineStore) ClaimGoJobPlanning(_ context.Context, _ string, executionPlan map[string]any) (bool, error) {
+	s.claimCount++
+	if !s.claimAllowed {
+		s.job.Status = "WAITING_WINDOW"
+		return false, nil
+	}
+	s.job.Status = "PLANNING"
+	s.job.ExecutionPlan = executionPlan
+	s.planningPlan = executionPlan
+	return true, nil
+}
+
 func (s *fakeEngineStore) MarkGoJobRunning(_ context.Context, _ string) error {
+	s.runningCount++
 	s.job.Status = "RUNNING"
 	return nil
 }

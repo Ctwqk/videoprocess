@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/contracts"
@@ -23,6 +24,14 @@ type GoNodeExecutionInput struct {
 	NodeLabel  string
 	NodeConfig map[string]any
 }
+
+type goJobPlanningAction uint8
+
+const (
+	goJobPlanningClaim goJobPlanningAction = iota
+	goJobPlanningPark
+	goJobPlanningSkip
+)
 
 func (s *Store) CreateGoJob(ctx context.Context, in GoJobCreateInput) (JobDetailRow, error) {
 	rows, err := s.CreateGoJobs(ctx, []GoJobCreateInput{in})
@@ -118,6 +127,106 @@ func (s *Store) MarkGoJobPlanning(ctx context.Context, jobID string, executionPl
         WHERE id = $1 AND orchestrator_owner = 'go'
     `, jobID, executionPlan)
 	return guardedExecResult(tag.RowsAffected(), err)
+}
+
+func (s *Store) ClaimGoJobPlanning(
+	ctx context.Context,
+	jobID string,
+	executionPlan map[string]any,
+) (bool, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var scheduleState string
+	var guardedJobID *string
+	if err := tx.QueryRow(ctx, `
+		SELECT state, guarded_job_id::text
+		FROM runtime_schedules
+		WHERE service_name = $1
+		FOR UPDATE
+	`, VideoScheduleServiceName).Scan(&scheduleState, &guardedJobID); err != nil {
+		return false, err
+	}
+
+	var jobStatus string
+	if err := tx.QueryRow(ctx, `
+		SELECT status::text
+		FROM jobs
+		WHERE id = $1::uuid
+		  AND orchestrator_owner = 'go'
+		FOR UPDATE
+	`, jobID).Scan(&jobStatus); err != nil {
+		return false, err
+	}
+
+	guard := ""
+	if guardedJobID != nil {
+		guard = *guardedJobID
+	}
+	switch goJobPlanningActionFor(scheduleState, guard, jobID, jobStatus) {
+	case goJobPlanningSkip:
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	case goJobPlanningPark:
+		tag, err := tx.Exec(ctx, `
+			UPDATE jobs
+			SET status = 'WAITING_WINDOW',
+			    started_at = NULL,
+			    completed_at = NULL,
+			    error_message = NULL
+			WHERE id = $1::uuid
+			  AND orchestrator_owner = 'go'
+			  AND status NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'PARTIALLY_FAILED')
+		`, jobID)
+		if err := guardedExecResult(tag.RowsAffected(), err); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	default:
+		tag, err := tx.Exec(ctx, `
+			UPDATE jobs
+			SET status = 'PLANNING',
+			    execution_plan = $2,
+			    started_at = COALESCE(started_at, NOW())
+			WHERE id = $1::uuid
+			  AND orchestrator_owner = 'go'
+			  AND status NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'PARTIALLY_FAILED')
+		`, jobID, executionPlan)
+		if err := guardedExecResult(tag.RowsAffected(), err); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+}
+
+func goJobPlanningActionFor(scheduleState string, guardedJobID string, jobID string, jobStatus string) goJobPlanningAction {
+	state := strings.ToUpper(strings.TrimSpace(scheduleState))
+	status := strings.ToUpper(strings.TrimSpace(jobStatus))
+	switch status {
+	case "SUCCEEDED", "FAILED", "CANCELLED", "PARTIALLY_FAILED":
+		return goJobPlanningSkip
+	}
+	if state == "CLOSED" {
+		return goJobPlanningPark
+	}
+	if state == "DRAINING" && (status == "PENDING" || status == "WAITING_WINDOW") {
+		return goJobPlanningPark
+	}
+	if state == "OPEN" && guardedJobID != "" && guardedJobID != jobID {
+		return goJobPlanningPark
+	}
+	return goJobPlanningClaim
 }
 
 func (s *Store) MarkGoJobRunning(ctx context.Context, jobID string) error {

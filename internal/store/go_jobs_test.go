@@ -91,6 +91,7 @@ func TestGoJobStoreMethodSignatures(t *testing.T) {
 	var _ func(context.Context, []GoJobCreateInput) ([]JobDetailRow, error) = s.CreateGoJobs
 	var _ func(context.Context, string) (JobDetailRow, error) = s.LoadGoJobForUpdate
 	var _ func(context.Context, string, map[string]any) error = s.MarkGoJobPlanning
+	var _ func(context.Context, string, map[string]any) (bool, error) = s.ClaimGoJobPlanning
 	var _ func(context.Context, string) error = s.MarkGoJobRunning
 	var _ func(context.Context, string) error = s.MarkGoJobWaitingWindow
 	var _ func(context.Context, string, []string) (bool, error) = s.MarkGoNodeQueued
@@ -103,6 +104,42 @@ func TestGoJobStoreMethodSignatures(t *testing.T) {
 	var _ func(context.Context) ([]JobDetailRow, error) = s.ListRecoverableGoJobs
 	var _ func(context.Context, string, time.Time) error = s.ResetStaleGoNodes
 	var _ func(context.Context, string, string, string) (string, error) = s.CreateSourceArtifact
+}
+
+func TestGoJobPlanningActionForAuthority(t *testing.T) {
+	const jobID = "11111111-1111-4111-8111-111111111111"
+	const otherJobID = "22222222-2222-4222-8222-222222222222"
+	tests := []struct {
+		name   string
+		state  string
+		guard  string
+		status string
+		expect goJobPlanningAction
+	}{
+		{name: "closed pending parks", state: "CLOSED", status: "PENDING", expect: goJobPlanningPark},
+		{name: "closed running parks", state: "CLOSED", status: "RUNNING", expect: goJobPlanningPark},
+		{name: "draining pending parks", state: "DRAINING", status: "PENDING", expect: goJobPlanningPark},
+		{name: "draining waiting parks", state: "DRAINING", status: "WAITING_WINDOW", expect: goJobPlanningPark},
+		{name: "draining validating claims", state: "DRAINING", status: "VALIDATING", expect: goJobPlanningClaim},
+		{name: "draining planning claims", state: "DRAINING", status: "PLANNING", expect: goJobPlanningClaim},
+		{name: "draining running claims", state: "DRAINING", status: "RUNNING", expect: goJobPlanningClaim},
+		{name: "open mismatched guard parks", state: "OPEN", guard: otherJobID, status: "PENDING", expect: goJobPlanningPark},
+		{name: "open exact guard claims", state: "OPEN", guard: jobID, status: "PENDING", expect: goJobPlanningClaim},
+		{name: "open legacy guard claims", state: "OPEN", status: "PENDING", expect: goJobPlanningClaim},
+		{name: "unknown state preserves claim", state: "PAUSED", guard: otherJobID, status: "PENDING", expect: goJobPlanningClaim},
+		{name: "terminal success skips", state: "OPEN", guard: jobID, status: "SUCCEEDED", expect: goJobPlanningSkip},
+		{name: "terminal failure skips", state: "OPEN", guard: jobID, status: "FAILED", expect: goJobPlanningSkip},
+		{name: "terminal cancellation skips", state: "OPEN", guard: jobID, status: "CANCELLED", expect: goJobPlanningSkip},
+		{name: "terminal partial failure skips", state: "OPEN", guard: jobID, status: "PARTIALLY_FAILED", expect: goJobPlanningSkip},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := goJobPlanningActionFor(tt.state, tt.guard, jobID, tt.status); got != tt.expect {
+				t.Fatalf("action = %v; want %v", got, tt.expect)
+			}
+		})
+	}
 }
 
 func TestNodeExecutionRowInternalFieldsAreJSONIgnored(t *testing.T) {

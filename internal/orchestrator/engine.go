@@ -25,6 +25,7 @@ type EngineStore interface {
 	CreateSourceArtifact(ctx context.Context, jobID string, nodeExecutionID string, assetID string) (string, error)
 	GetVideoScheduleAuthority(ctx context.Context) (VideoScheduleAuthority, error)
 	MarkGoJobPlanning(ctx context.Context, jobID string, executionPlan map[string]any) error
+	ClaimGoJobPlanning(ctx context.Context, jobID string, executionPlan map[string]any) (bool, error)
 	MarkGoJobRunning(ctx context.Context, jobID string) error
 	MarkGoJobWaitingWindow(ctx context.Context, jobID string) error
 	MarkGoNodeQueued(ctx context.Context, nodeExecutionID string, inputArtifactIDs []string) (bool, error)
@@ -108,8 +109,13 @@ func (e *Engine) StartJob(ctx context.Context, jobID string) (err error) {
 		"topo_order":   TopologicalOrder(job.PipelineSnapshot),
 		"dependencies": depMap,
 	}
-	if err := e.Store.MarkGoJobPlanning(ctx, jobID, executionPlan); err != nil {
+	claimed, err := e.Store.ClaimGoJobPlanning(ctx, jobID, executionPlan)
+	if err != nil {
 		return err
+	}
+	if !claimed {
+		startResult = "waiting_window"
+		return nil
 	}
 	job.ExecutionPlan = executionPlan
 	job.Status = string(contracts.JobStatusPlanning)

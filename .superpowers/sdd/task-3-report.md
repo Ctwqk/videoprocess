@@ -142,3 +142,204 @@ The PostgreSQL-backed assertions could not execute locally because the required
 isolated database is intentionally unavailable. CI must run them with
 `CHANNELOPS_REQUIRE_DATABASE=1`; all non-database focused and repository-wide Go
 tests pass locally.
+
+## Review Fix: Atomic Planning Claim and Independent Cleanup Deadlines
+
+### Scope
+
+Addressed both Task 3 review findings without changing Python, runners,
+deployment, Docker, production databases, `126`, or external systems.
+
+### TOCTOU RED
+
+The engine race test supplied initially matching authority but configured the
+planning claim to observe a later close/mismatch and park the job.
+
+```bash
+go test -count=1 ./internal/orchestrator \
+  -run 'TestStartJobRevalidatesAuthorityWhenPlanningClaimLosesRace$' -v
+```
+
+```text
+=== RUN   TestStartJobRevalidatesAuthorityWhenPlanningClaimLosesRace
+    engine_test.go:209: planning claim count = 0; want 1
+--- FAIL: TestStartJobRevalidatesAuthorityWhenPlanningClaimLosesRace (0.00s)
+FAIL
+FAIL github.com/Ctwqk/videoprocess/internal/orchestrator
+```
+
+The store tests were also added before the claim API and decision function.
+
+```bash
+go test -count=1 ./internal/store \
+  -run 'Test(GoJobPlanningActionForAuthority|ClaimGoJobPlanningWaitsForConcurrentScheduleClose)$' -v
+```
+
+```text
+internal/store/go_jobs_test.go:94:72: s.ClaimGoJobPlanning undefined
+internal/store/go_jobs_test.go:117:10: undefined: goJobPlanningAction
+internal/store/go_jobs_test.go:119:78: undefined: goJobPlanningPark
+FAIL github.com/Ctwqk/videoprocess/internal/store [build failed]
+```
+
+### TOCTOU GREEN
+
+`ClaimGoJobPlanning` now locks the `videoprocess` schedule row first and the
+owned Go job second, then makes and commits one state/guard/status decision.
+The engine uses this claim instead of `MarkGoJobPlanning`; the legacy method
+remains available for compatibility.
+
+```bash
+go test -count=1 ./internal/orchestrator \
+  -run 'TestStartJob(RevalidatesAuthorityWhenPlanningClaimLosesRace|RunsExactGuardedJob|ParksGuardedMismatchBeforePlanningOrDispatch|KeepsLegacyUnguardedOpenBehavior)$' -v
+```
+
+```text
+--- PASS: TestStartJobRunsExactGuardedJob (0.00s)
+--- PASS: TestStartJobParksGuardedMismatchBeforePlanningOrDispatch (0.00s)
+--- PASS: TestStartJobKeepsLegacyUnguardedOpenBehavior (0.00s)
+--- PASS: TestStartJobRevalidatesAuthorityWhenPlanningClaimLosesRace (0.00s)
+PASS
+ok github.com/Ctwqk/videoprocess/internal/orchestrator
+```
+
+```bash
+go test -count=1 ./internal/store \
+  -run 'Test(GoJobPlanningActionForAuthority|ClaimGoJobPlanningWaitsForConcurrentScheduleClose)$' -v
+```
+
+```text
+--- PASS: TestGoJobPlanningActionForAuthority (0.00s)
+    --- PASS: closed_pending_parks
+    --- PASS: closed_running_parks
+    --- PASS: draining_pending_parks
+    --- PASS: draining_waiting_parks
+    --- PASS: draining_validating_claims
+    --- PASS: draining_planning_claims
+    --- PASS: draining_running_claims
+    --- PASS: open_mismatched_guard_parks
+    --- PASS: open_exact_guard_claims
+    --- PASS: open_legacy_guard_claims
+    --- PASS: unknown_state_preserves_claim
+    --- PASS: terminal_success_skips
+    --- PASS: terminal_failure_skips
+    --- PASS: terminal_cancellation_skips
+    --- PASS: terminal_partial_failure_skips
+--- SKIP: TestClaimGoJobPlanningWaitsForConcurrentScheduleClose (0.00s)
+PASS
+ok github.com/Ctwqk/videoprocess/internal/store
+```
+
+The PostgreSQL race test skips locally because
+`CHANNELOPS_REQUIRE_DATABASE=1` is not configured. Under CI it holds a
+concurrent schedule-row lock, observes the claim waiting in `pg_stat_activity`,
+commits `CLOSED`, and requires `claimed == false` with the job stored as
+`WAITING_WINDOW`.
+
+### Cleanup RED/GREEN
+
+The focused test was added before the package timeout injection:
+
+```bash
+go test -count=1 ./internal/httpapi \
+  -run 'TestCoordinatedGuardedOpenLocalCloseGetsFreshContextAfterPythonCloseTimeout$' -v
+```
+
+```text
+internal/httpapi/schedule_controller_test.go:372:21: undefined: guardedScheduleCleanupTimeout
+FAIL github.com/Ctwqk/videoprocess/internal/httpapi [build failed]
+```
+
+After adding the package-level timeout with the production default retained at
+five seconds, the separate-context implementation passed in 20 ms. To prove
+the test detects the actual regression, production was temporarily mutated to
+share one context across both closes:
+
+```text
+=== RUN   TestCoordinatedGuardedOpenLocalCloseGetsFreshContextAfterPythonCloseTimeout
+    schedule_controller_test.go:401: local close context errors = []error{context.deadlineExceededError{}}; want [nil]
+--- FAIL: TestCoordinatedGuardedOpenLocalCloseGetsFreshContextAfterPythonCloseTimeout (0.02s)
+FAIL
+FAIL github.com/Ctwqk/videoprocess/internal/httpapi
+```
+
+The shared-context mutation was then removed and the correct implementation
+was re-verified:
+
+```bash
+go test -count=1 ./internal/httpapi \
+  -run 'TestCoordinatedGuardedOpen(UncertainErrorClosesPythonAndLocalAfterRequestCancellation|LocalCloseGetsFreshContextAfterPythonCloseTimeout|KnownConflictDoesNotRetryPythonClose)$' -v
+```
+
+```text
+--- PASS: TestCoordinatedGuardedOpenUncertainErrorClosesPythonAndLocalAfterRequestCancellation (0.00s)
+--- PASS: TestCoordinatedGuardedOpenLocalCloseGetsFreshContextAfterPythonCloseTimeout (0.02s)
+--- PASS: TestCoordinatedGuardedOpenKnownConflictDoesNotRetryPythonClose (0.00s)
+PASS
+ok github.com/Ctwqk/videoprocess/internal/httpapi
+```
+
+### Required GREEN
+
+```bash
+go test -count=1 ./internal/orchestrator ./internal/httpapi ./internal/store
+```
+
+```text
+ok github.com/Ctwqk/videoprocess/internal/orchestrator
+ok github.com/Ctwqk/videoprocess/internal/httpapi
+ok github.com/Ctwqk/videoprocess/internal/store
+```
+
+```bash
+go test -count=1 ./...
+```
+
+```text
+All Go packages passed; command packages reported no test files.
+```
+
+```bash
+gofmt -w internal/orchestrator/engine.go internal/orchestrator/engine_test.go \
+  internal/orchestrator/store_adapter.go internal/store/go_jobs.go \
+  internal/store/go_jobs_test.go internal/store/schedule_test.go \
+  internal/httpapi/schedule_controller.go internal/httpapi/schedule_controller_test.go
+git diff --check
+```
+
+```text
+git diff --check produced no output (exit 0).
+```
+
+### Files
+
+- `internal/orchestrator/engine.go`
+- `internal/orchestrator/engine_test.go`
+- `internal/orchestrator/store_adapter.go`
+- `internal/store/go_jobs.go`
+- `internal/store/go_jobs_test.go`
+- `internal/store/schedule_test.go`
+- `internal/httpapi/schedule_controller.go`
+- `internal/httpapi/schedule_controller_test.go`
+- `.superpowers/sdd/task-3-report.md`
+
+### Review Self-Check
+
+- Schedule authority is locked before the owned Go job, matching guarded-open
+  lock ordering and preventing the reviewed read/plan TOCTOU.
+- `CLOSED` parks every nonterminal job; `DRAINING` parks fresh `PENDING` and
+  `WAITING_WINDOW` jobs while allowing resumed nonterminal jobs to claim.
+- `OPEN` with a non-null mismatched guard parks; exact and legacy unguarded
+  `OPEN` claim. Unknown states retain the prior claim behavior.
+- Terminal races commit and return false without changing the job. Authorized
+  claims write `PLANNING`, `execution_plan`, and `started_at` atomically.
+- A false claim stops before running, source resolution, queueing, or dispatch.
+- `MarkGoJobPlanning` and its adapter remain intact for compatibility.
+- Each cleanup close still receives a fresh context derived with
+  `context.WithoutCancel`; the production timeout remains five seconds.
+
+### Review-Fix Concerns
+
+The PostgreSQL lock-wait integration test could not run locally because no
+isolated database is configured. CI must execute it with
+`CHANNELOPS_REQUIRE_DATABASE=1`; no production or external database was used.

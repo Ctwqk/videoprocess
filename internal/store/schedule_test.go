@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -186,6 +187,106 @@ func TestOpenVideoScheduleForJobStoresExactGuard(t *testing.T) {
 	}
 	if guardedJobID == nil || *guardedJobID != jobID {
 		t.Fatalf("stored guarded job ID = %#v; want %q", guardedJobID, jobID)
+	}
+}
+
+func TestClaimGoJobPlanningWaitsForConcurrentScheduleClose(t *testing.T) {
+	ctx, st, pipelineID := newScheduleIntegrationFixture(t)
+	jobID := insertScheduleFixtureJob(t, ctx, st, pipelineID, "PENDING")
+	if _, err := st.Pool.Exec(ctx, `
+		UPDATE runtime_schedules
+		SET state = 'OPEN', guarded_job_id = $2::uuid, updated_by = 'claim_race_test'
+		WHERE service_name = $1
+	`, VideoScheduleServiceName, jobID); err != nil {
+		t.Fatalf("open guarded schedule: %v", err)
+	}
+
+	scheduleTx, err := st.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin schedule transition: %v", err)
+	}
+	defer scheduleTx.Rollback(ctx)
+	var state string
+	if err := scheduleTx.QueryRow(ctx, `
+		SELECT state
+		FROM runtime_schedules
+		WHERE service_name = $1
+		FOR UPDATE
+	`, VideoScheduleServiceName).Scan(&state); err != nil {
+		t.Fatalf("lock schedule: %v", err)
+	}
+
+	type claimResult struct {
+		claimed bool
+		err     error
+	}
+	claimDone := make(chan claimResult, 1)
+	go func() {
+		claimed, err := st.ClaimGoJobPlanning(ctx, jobID, map[string]any{"topo_order": []string{"source"}})
+		claimDone <- claimResult{claimed: claimed, err: err}
+	}()
+	waitForScheduleClaimLock(t, ctx, st)
+
+	if _, err := scheduleTx.Exec(ctx, `
+		UPDATE runtime_schedules
+		SET state = 'CLOSED', guarded_job_id = NULL, updated_by = 'claim_race_test'
+		WHERE service_name = $1
+	`, VideoScheduleServiceName); err != nil {
+		t.Fatalf("close schedule: %v", err)
+	}
+	if err := scheduleTx.Commit(ctx); err != nil {
+		t.Fatalf("commit schedule close: %v", err)
+	}
+
+	select {
+	case result := <-claimDone:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.claimed {
+			t.Fatal("planning claim succeeded after concurrent schedule close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("planning claim did not finish after schedule close committed")
+	}
+
+	var jobStatus string
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT status::text FROM jobs WHERE id = $1::uuid
+	`, jobID).Scan(&jobStatus); err != nil {
+		t.Fatalf("read job status: %v", err)
+	}
+	if jobStatus != "WAITING_WINDOW" {
+		t.Fatalf("job status = %q; want WAITING_WINDOW", jobStatus)
+	}
+}
+
+func waitForScheduleClaimLock(t *testing.T, ctx context.Context, st *Store) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var waiting bool
+		if err := st.Pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND state = 'active'
+				  AND wait_event_type = 'Lock'
+				  AND query LIKE '%runtime_schedules%'
+				  AND query LIKE '%FOR UPDATE%'
+			)
+		`).Scan(&waiting); err != nil {
+			t.Fatalf("inspect schedule lock wait: %v", err)
+		}
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("planning claim did not wait for the locked schedule row")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

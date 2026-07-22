@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/store"
 )
@@ -367,6 +368,40 @@ func TestCoordinatedGuardedOpenUncertainErrorClosesPythonAndLocalAfterRequestCan
 	}
 }
 
+func TestCoordinatedGuardedOpenLocalCloseGetsFreshContextAfterPythonCloseTimeout(t *testing.T) {
+	previousTimeout := guardedScheduleCleanupTimeout
+	guardedScheduleCleanupTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		guardedScheduleCleanupTimeout = previousTimeout
+	})
+	expectedJobID := "11111111-1111-4111-8111-111111111111"
+	local := &fakeScheduleController{}
+	python := &fakeScheduleController{
+		guardedErr:         errors.New("ambiguous Python response"),
+		waitForSetDeadline: true,
+	}
+	controller := NewCoordinatedScheduleController(local, python)
+
+	_, err := controller.OpenExpectedJob(context.Background(), expectedJobID)
+
+	if err == nil {
+		t.Fatal("expected guarded-open failure")
+	}
+	if !reflect.DeepEqual(python.setStates, []string{"CLOSED"}) ||
+		!reflect.DeepEqual(local.setStates, []string{"CLOSED"}) {
+		t.Fatalf("python states = %#v local states = %#v", python.setStates, local.setStates)
+	}
+	if !reflect.DeepEqual(python.setContextErrs, []error{nil}) {
+		t.Fatalf("python close context errors = %#v; want [nil]", python.setContextErrs)
+	}
+	if !reflect.DeepEqual(python.setDeadlineErrs, []error{context.DeadlineExceeded}) {
+		t.Fatalf("python close deadline errors = %#v; want deadline exceeded", python.setDeadlineErrs)
+	}
+	if !reflect.DeepEqual(local.setContextErrs, []error{nil}) {
+		t.Fatalf("local close context errors = %#v; want [nil]", local.setContextErrs)
+	}
+}
+
 func TestCoordinatedGuardedOpenKnownConflictDoesNotRetryPythonClose(t *testing.T) {
 	expectedJobID := "11111111-1111-4111-8111-111111111111"
 	local := &fakeScheduleController{}
@@ -457,17 +492,19 @@ func TestCoordinatedScheduleOpenFailsClosedWhenPythonDoesNotOpen(t *testing.T) {
 }
 
 type fakeScheduleController struct {
-	name           string
-	events         *[]string
-	setStates      []string
-	setRows        []store.VideoScheduleStatusRow
-	setErr         error
-	setContextErrs []error
-	guardedJobIDs  []string
-	guardedRows    []store.VideoScheduleStatusRow
-	guardedErr     error
-	statusRow      store.VideoScheduleStatusRow
-	statusErr      error
+	name               string
+	events             *[]string
+	setStates          []string
+	setRows            []store.VideoScheduleStatusRow
+	setErr             error
+	setContextErrs     []error
+	setDeadlineErrs    []error
+	waitForSetDeadline bool
+	guardedJobIDs      []string
+	guardedRows        []store.VideoScheduleStatusRow
+	guardedErr         error
+	statusRow          store.VideoScheduleStatusRow
+	statusErr          error
 }
 
 func (f *fakeScheduleController) Status(context.Context) (store.VideoScheduleStatusRow, error) {
@@ -482,6 +519,11 @@ func (f *fakeScheduleController) SetState(ctx context.Context, state string) (st
 	f.setContextErrs = append(f.setContextErrs, ctx.Err())
 	if f.events != nil {
 		*f.events = append(*f.events, f.name+"."+state)
+	}
+	if f.waitForSetDeadline {
+		<-ctx.Done()
+		f.setDeadlineErrs = append(f.setDeadlineErrs, ctx.Err())
+		return store.VideoScheduleStatusRow{}, ctx.Err()
 	}
 	if f.setErr != nil {
 		return store.VideoScheduleStatusRow{}, f.setErr
