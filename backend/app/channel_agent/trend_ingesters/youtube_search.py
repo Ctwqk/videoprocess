@@ -14,7 +14,16 @@ from app.models.channel_agent import ChannelProfile, DiscoverySignal, TopicLane
 @dataclass(frozen=True)
 class TrendIngestResult:
     created_count: int
+    refreshed_count: int
     expired_count: int
+    query_count: int
+
+
+class TrendProviderError(RuntimeError):
+    def __init__(self, cause: Exception, *, query_count: int) -> None:
+        super().__init__("youtube discovery provider failed")
+        self.cause = cause
+        self.query_count = query_count
 
 
 class YouTubeTrendIngester:
@@ -24,11 +33,15 @@ class YouTubeTrendIngester:
         youtube_client,
         min_view_count: int = 1000,
         max_results: int = 25,
+        max_queries: int = 5,
+        region_code: str | None = None,
         seed_ttl: timedelta = timedelta(days=1),
     ) -> None:
         self.youtube_client = youtube_client
         self.min_view_count = min_view_count
         self.max_results = max_results
+        self.max_queries = max_queries
+        self.region_code = region_code
         self.seed_ttl = seed_ttl
 
     async def ingest_channel(self, db: AsyncSession, *, channel_id: str, now: datetime) -> TrendIngestResult:
@@ -43,17 +56,28 @@ class YouTubeTrendIngester:
                 .where(TopicLane.channel_profile_id == channel.id)
                 .where(TopicLane.enabled.is_(True))
                 .order_by(TopicLane.weight.desc(), TopicLane.created_at.asc())
+                .limit(self.max_queries)
             )
         ).scalars().all()
         created = 0
+        refreshed = 0
+        query_count = 0
         for lane in lanes:
             query = _lane_query(lane)
-            results = await self.youtube_client.search_videos(
-                query=query,
-                published_after=current - timedelta(hours=24),
-                region_code=_region_code(channel),
-                max_results=self.max_results,
-            )
+            query_count += 1
+            try:
+                results = await self.youtube_client.search_videos(
+                    query=query,
+                    published_after=current - timedelta(hours=24),
+                    region_code=self.region_code or _region_code(channel),
+                    max_results=self.max_results,
+                )
+                if not isinstance(results, list) or any(
+                    not isinstance(result, dict) for result in results
+                ):
+                    raise TypeError("youtube search results must be objects")
+            except Exception as exc:
+                raise TrendProviderError(exc, query_count=query_count) from exc
             for result in results:
                 if _view_count(result) < self.min_view_count:
                     continue
@@ -77,6 +101,7 @@ class YouTubeTrendIngester:
                     existing.raw_json = dict(result)
                     if existing.status == "expired":
                         existing.status = "active"
+                    refreshed += 1
                     continue
                 db.add(
                     DiscoverySignal(
@@ -97,8 +122,13 @@ class YouTubeTrendIngester:
                     )
                 )
                 created += 1
-        await db.commit()
-        return TrendIngestResult(created_count=created, expired_count=expired)
+        await db.flush()
+        return TrendIngestResult(
+            created_count=created,
+            refreshed_count=refreshed,
+            expired_count=expired,
+            query_count=query_count,
+        )
 
     async def _expire_stale(self, db: AsyncSession, *, channel: ChannelProfile, now: datetime) -> int:
         signals = (
