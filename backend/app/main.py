@@ -80,24 +80,27 @@ async def _prepare_job_for_recovery(db, job) -> bool:
 async def _recover_stale_jobs():
     """On startup, find PENDING/RUNNING jobs and restart them."""
     async with async_session() as db:
-        schedule = await get_video_schedule_record(db)
+        schedule = await get_video_schedule_record(db, commit=False)
         try:
             schedule_state = VideoScheduleState(schedule.state)
         except ValueError:
             schedule_state = default_video_schedule_state()
         stale_jobs = await load_video_jobs_for_recovery(db)
         jobs_to_restart: list[Job] = []
+        jobs_to_finalize: list[Job] = []
         for job in stale_jobs:
             if should_defer_job_start(job, schedule_state, schedule.guarded_job_id):
-                await defer_job_until_next_window(db, job)
+                await defer_job_until_next_window(db, job, commit=False)
                 continue
 
             changed = await _prepare_job_for_recovery(db, job)
             if changed or job.status in (JobStatus.PENDING, JobStatus.WAITING_WINDOW):
                 jobs_to_restart.append(job)
                 continue
-            await engine._maybe_finalize_job(db, job)
+            jobs_to_finalize.append(job)
         await db.commit()
+        for job in jobs_to_finalize:
+            await engine._maybe_finalize_job(db, job)
 
     for job in jobs_to_restart:
         logger.info(f"Recovering stale job {job.id} (status={job.status.value})")

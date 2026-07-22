@@ -29,6 +29,7 @@ from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
 from app.models.asset import Asset
 from app.models.channel_agent import ChannelOpsQueueItem, ChannelProfile, ProductionTask
 from app.models.job import Job, JobStatus
+from app.models.schedule import RuntimeSchedule
 from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import (
     AutoFlowClipCandidate,
@@ -1027,12 +1028,7 @@ class AutoFlowService:
                 ).scalar_one_or_none()
                 if job is None:
                     raise ValueError("ChannelOps-bound AutoFlow job was not found")
-                if (
-                    schedule.guarded_job_id is not None
-                    and job.id != schedule.guarded_job_id
-                ):
-                    raise PermissionError("ChannelOps job does not hold guarded schedule authority")
-                job_id = _bind_channelops_execution(task, existing)
+                job_id = _bind_guarded_channelops_execution(task, existing, schedule, job)
                 should_start = job.status in {
                     JobStatus.PENDING,
                     JobStatus.WAITING_WINDOW,
@@ -1520,6 +1516,17 @@ def _parse_channelops_revision(value: object, *, error_message: str) -> int:
     if revision < 1:
         raise PermissionError(error_message)
     return revision
+
+
+def _bind_guarded_channelops_execution(
+    task: ProductionTask,
+    run: AutoFlowRunModel,
+    schedule: RuntimeSchedule,
+    job: Job,
+) -> uuid.UUID:
+    if schedule.guarded_job_id is not None and job.id != schedule.guarded_job_id:
+        raise PermissionError("ChannelOps job does not hold guarded schedule authority")
+    return _bind_channelops_execution(task, run)
 
 
 def _bind_channelops_execution(

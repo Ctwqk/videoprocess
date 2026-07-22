@@ -37,7 +37,7 @@ async def start_or_defer_jobs(db: AsyncSession, jobs: Iterable[Job]) -> VideoSch
     if not materialized_jobs:
         return VideoScheduleState.OPEN
 
-    schedule = await get_video_schedule_record(db)
+    schedule = await get_video_schedule_record(db, commit=False)
     try:
         schedule_state = VideoScheduleState(schedule.state)
     except ValueError:
@@ -51,7 +51,8 @@ async def start_or_defer_jobs(db: AsyncSession, jobs: Iterable[Job]) -> VideoSch
     started = [job for job in materialized_jobs if job not in deferred]
 
     if deferred:
-        await park_jobs_for_window(db, deferred)
+        await park_jobs_for_window(db, deferred, commit=False)
+    await db.commit()
     if started:
         await start_jobs_background(job.id for job in started)
     return schedule_state

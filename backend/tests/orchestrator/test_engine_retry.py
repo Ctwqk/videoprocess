@@ -141,7 +141,7 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
     async def lock_authority(*args, **kwargs):
         return SimpleNamespace(
             channel=None,
-            schedule=SimpleNamespace(state="OPEN"),
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=None),
             task=None,
             job=job,
             node=retry_node,

@@ -90,10 +90,21 @@ async def test_start_or_defer_partitions_exact_guard_from_mismatches(monkeypatch
     )
     events: list[tuple[str, list[uuid.UUID]]] = []
 
-    async def load_schedule(_db):
+    class RecordingSession:
+        async def commit(self):
+            events.append(("commit", []))
+
+    db = RecordingSession()
+
+    async def load_schedule(_db, *, commit=True):
+        assert _db is db
+        assert commit is False
+        events.append(("load_schedule", []))
         return schedule
 
-    async def park_jobs(_db, jobs):
+    async def park_jobs(_db, jobs, *, commit=True):
+        assert _db is db
+        assert commit is False
         materialized = list(jobs)
         events.append(("park", [job.id for job in materialized]))
         for job in materialized:
@@ -106,12 +117,14 @@ async def test_start_or_defer_partitions_exact_guard_from_mismatches(monkeypatch
     monkeypatch.setattr(job_runtime, "park_jobs_for_window", park_jobs)
     monkeypatch.setattr(job_runtime, "start_jobs_background", start_jobs)
 
-    state = await start_or_defer_jobs(object(), [guarded_job, mismatching_job])
+    state = await start_or_defer_jobs(db, [guarded_job, mismatching_job])
 
     assert state == VideoScheduleState.OPEN
     assert mismatching_job.status == JobStatus.WAITING_WINDOW
     assert events == [
+        ("load_schedule", []),
         ("park", [mismatching_job.id]),
+        ("commit", []),
         ("start", [guarded_job.id]),
     ]
 
@@ -124,6 +137,22 @@ def test_execution_authority_rejects_guarded_mismatch_before_node_work():
             state=VideoScheduleState.OPEN.value,
             guarded_job_id=guarded_job_id,
         ),
+        task=None,
+        job=SimpleNamespace(id=uuid.uuid4(), status=JobStatus.RUNNING),
+        node=None,
+    )
+
+    with pytest.raises(JobExecutionAuthorityBlocked, match="guarded"):
+        require_active_execution_authority(
+            authority,
+            job_statuses={JobStatus.RUNNING},
+        )
+
+
+def test_execution_authority_rejects_missing_guard_field():
+    authority = LockedJobExecutionAuthority(
+        channel=None,
+        schedule=SimpleNamespace(state=VideoScheduleState.OPEN.value),
         task=None,
         job=SimpleNamespace(id=uuid.uuid4(), status=JobStatus.RUNNING),
         node=None,

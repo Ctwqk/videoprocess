@@ -40,7 +40,12 @@ def require_active_execution_authority(
         raise JobExecutionAuthorityBlocked("production task is not producing")
     if authority.schedule.state != VideoScheduleState.OPEN.value:
         raise JobExecutionAuthorityBlocked("runtime schedule is not open")
-    guarded_job_id = getattr(authority.schedule, "guarded_job_id", None)
+    try:
+        guarded_job_id = authority.schedule.guarded_job_id
+    except AttributeError as exc:
+        raise JobExecutionAuthorityBlocked(
+            "runtime schedule guarded authority is unavailable"
+        ) from exc
     if guarded_job_id is not None and authority.job.id != guarded_job_id:
         raise JobExecutionAuthorityBlocked("job does not hold guarded schedule authority")
     if authority.job.status not in job_statuses:

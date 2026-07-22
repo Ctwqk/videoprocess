@@ -199,7 +199,12 @@ async def park_jobs_for_window(
     return jobs
 
 
-async def defer_job_until_next_window(db: AsyncSession, job: Job) -> Job:
+async def defer_job_until_next_window(
+    db: AsyncSession,
+    job: Job,
+    *,
+    commit: bool = True,
+) -> Job:
     for node in job.node_executions:
         if node.status in ACTIVE_NODE_STATUSES:
             node.status = NodeStatus.PENDING
@@ -213,6 +218,9 @@ async def defer_job_until_next_window(db: AsyncSession, job: Job) -> Job:
     job.status = JobStatus.WAITING_WINDOW
     job.error_message = None
     job.completed_at = None
+    if not commit:
+        await db.flush()
+        return job
     await db.commit()
     await db.refresh(job, attribute_names=["node_executions"])
     return job

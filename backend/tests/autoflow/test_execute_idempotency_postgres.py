@@ -6,12 +6,14 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.autoflow import service as autoflow_service
 from app.autoflow.clip_ranker import ClipRanker
 from app.autoflow.service import AutoFlowService, execute_request_fingerprint
 from app.models.autoflow import AutoFlowPlan, AutoFlowRun
@@ -33,7 +35,6 @@ POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
 
 pytestmark = [
     pytest.mark.asyncio,
-    pytest.mark.skipif(not POSTGRES_URL, reason="set CHANNEL_OPS_POSTGRES_TEST_URL for PostgreSQL idempotency tests"),
 ]
 
 
@@ -55,6 +56,8 @@ class StaticSelector:
 
 @pytest_asyncio.fixture
 async def postgres_idempotency_db(monkeypatch):
+    if not POSTGRES_URL:
+        pytest.skip("set CHANNEL_OPS_POSTGRES_TEST_URL for PostgreSQL idempotency tests")
     engine = create_async_engine(POSTGRES_URL, pool_size=8, max_overflow=0)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as conn:
@@ -320,15 +323,80 @@ async def test_bound_autoflow_replay_resumes_only_exact_guarded_job(
     mismatching_job_id = await _install_additional_guarded_job(factory, plan)
     async with factory() as db:
         schedule = await db.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+        task = await db.get(ProductionTask, _task_id)
         assert schedule is not None
+        assert task is not None
         schedule.guarded_job_id = mismatching_job_id
+        task.state = "planning"
+        task.autoflow_run_id = None
+        task.pipeline_id = None
+        task.job_id = None
+        task.transition_history_json = []
+        task.blocked_by_guard = "guarded-replay-sentinel"
+        task.failure_reason = "guarded-replay-sentinel"
+        task.failure_category = "guarded_replay"
         await db.commit()
+        await db.refresh(task)
+        unchanged_task_authority = (
+            task.state,
+            task.state_updated_at,
+            task.autoflow_run_id,
+            task.pipeline_id,
+            task.job_id,
+            task.transition_history_json,
+            task.blocked_by_guard,
+            task.failure_reason,
+            task.failure_category,
+        )
+    starts_before_mismatch = list(starts)
     async with factory() as db:
         with pytest.raises(PermissionError, match="guarded"):
             await service.execute(request, db)
 
     assert replay.job_id == first.job_id
-    assert starts == [first.job_id, first.job_id]
+    assert starts == starts_before_mismatch == [first.job_id, first.job_id]
+    async with factory() as db:
+        task = await db.get(ProductionTask, _task_id)
+        assert task is not None
+        assert (
+            task.state,
+            task.state_updated_at,
+            task.autoflow_run_id,
+            task.pipeline_id,
+            task.job_id,
+            task.transition_history_json,
+            task.blocked_by_guard,
+            task.failure_reason,
+            task.failure_category,
+        ) == unchanged_task_authority
+
+
+async def test_guarded_replay_rejects_before_partial_task_binding():
+    durable_job_id = uuid.uuid4()
+    task = SimpleNamespace(
+        state="planning",
+        state_updated_at=datetime(2026, 7, 22, tzinfo=timezone.utc),
+        autoflow_run_id=None,
+        pipeline_id=None,
+        job_id=None,
+        transition_history_json=[],
+        blocked_by_guard="window",
+        failure_reason="window",
+        failure_category="guard",
+    )
+    run = SimpleNamespace(
+        id=uuid.uuid4(),
+        pipeline_id=uuid.uuid4(),
+        job_id=durable_job_id,
+    )
+    schedule = SimpleNamespace(guarded_job_id=uuid.uuid4())
+    job = SimpleNamespace(id=durable_job_id)
+    unchanged = dict(vars(task))
+
+    with pytest.raises(PermissionError, match="guarded"):
+        autoflow_service._bind_guarded_channelops_execution(task, run, schedule, job)
+
+    assert vars(task) == unchanged
 
 
 async def _install_additional_guarded_job(factory, plan) -> uuid.UUID:
