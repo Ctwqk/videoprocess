@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 from sqlalchemy import event, func, select
@@ -478,7 +478,11 @@ async def test_schedule_open_mutation_requires_and_sends_exact_expected_job_id(
 
     async def request_json(*args, **kwargs):
         calls.append((args, kwargs))
-        return {"state": "OPEN", "released_jobs": 1}
+        return {
+            "state": "OPEN",
+            "released_jobs": 1,
+            "guarded_job_id": str(expected_job_id),
+        }
 
     monkeypatch.setattr(runner, "request_json", request_json)
     evidence = {"schedule": {"transitions": []}}
@@ -507,6 +511,159 @@ async def test_schedule_open_mutation_requires_and_sends_exact_expected_job_id(
             {"params": {"expected_job_id": str(expected_job_id)}},
         )
     ]
+    assert evidence["schedule"]["transitions"][-1]["guarded_job_id"] == str(
+        expected_job_id
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"state": "CLOSED", "released_jobs": 1, "guarded_job_id": None},
+        {"state": "OPEN", "released_jobs": 0, "guarded_job_id": "expected"},
+        {"state": "OPEN", "released_jobs": 2, "guarded_job_id": "expected"},
+        {"state": "OPEN", "released_jobs": "1", "guarded_job_id": "expected"},
+        {"state": "OPEN", "released_jobs": 1},
+        {"state": "OPEN", "released_jobs": 1, "guarded_job_id": None},
+        {"state": "OPEN", "released_jobs": 1, "guarded_job_id": "other"},
+    ),
+)
+async def test_schedule_open_rejects_inexact_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict,
+):
+    runner = load_runner()
+    expected_job_id = uuid.uuid4()
+    payload = {
+        key: str(expected_job_id) if value == "expected" else value
+        for key, value in payload.items()
+    }
+    monkeypatch.setattr(runner, "request_json", AsyncMock(return_value=payload))
+
+    with pytest.raises(runner.CanaryError, match="exact canary job"):
+        await runner.mutate_schedule(
+            SimpleNamespace(api_url="http://api"),
+            object(),
+            {"schedule": {"transitions": []}},
+            "open",
+            expected_job_id=expected_job_id,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"state": "OPEN", "guarded_job_id": None},
+        {"state": "DRAINING"},
+        {"state": "DRAINING", "guarded_job_id": "still-guarded"},
+    ),
+)
+async def test_schedule_drain_requires_cleared_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict,
+):
+    runner = load_runner()
+    request_json = AsyncMock(return_value=payload)
+    monkeypatch.setattr(runner, "request_json", request_json)
+
+    with pytest.raises(runner.CanaryError, match="DRAINING with no guarded job"):
+        await runner.mutate_schedule(
+            SimpleNamespace(api_url="http://api"),
+            object(),
+            {"schedule": {"transitions": []}},
+            "drain",
+        )
+
+    request_json.assert_awaited_once_with(
+        ANY,
+        "POST",
+        "http://api/internal/schedule/video/drain",
+    )
+
+
+@pytest.mark.anyio
+async def test_schedule_drain_preserves_legacy_no_param_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = load_runner()
+    request_json = AsyncMock(
+        return_value={"state": "DRAINING", "guarded_job_id": None}
+    )
+    monkeypatch.setattr(runner, "request_json", request_json)
+    evidence = {"schedule": {"transitions": []}}
+
+    payload = await runner.mutate_schedule(
+        SimpleNamespace(api_url="http://api"),
+        object(),
+        evidence,
+        "drain",
+    )
+
+    assert payload == {"state": "DRAINING", "guarded_job_id": None}
+    request_json.assert_awaited_once_with(
+        ANY,
+        "POST",
+        "http://api/internal/schedule/video/drain",
+    )
+    assert evidence["schedule"]["transitions"][-1]["guarded_job_id"] is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"state": "DRAINING", "guarded_job_id": None},
+        {"state": "CLOSED"},
+        {"state": "CLOSED", "guarded_job_id": "still-guarded"},
+    ),
+)
+async def test_schedule_close_requires_cleared_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict,
+):
+    runner = load_runner()
+    request_json = AsyncMock(return_value=payload)
+    monkeypatch.setattr(runner, "request_json", request_json)
+    evidence = {"schedule": {"transitions": [], "final_state": None}}
+
+    with pytest.raises(runner.CanaryError, match="CLOSED with no guarded job"):
+        await runner.close_schedule(
+            SimpleNamespace(api_url="http://api"),
+            object(),
+            evidence,
+        )
+
+    request_json.assert_awaited_once_with(
+        ANY,
+        "POST",
+        "http://api/internal/schedule/video/close",
+    )
+
+
+@pytest.mark.anyio
+async def test_schedule_close_preserves_legacy_no_param_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = load_runner()
+    request_json = AsyncMock(return_value={"state": "CLOSED", "guarded_job_id": None})
+    monkeypatch.setattr(runner, "request_json", request_json)
+    evidence = {"schedule": {"transitions": [], "final_state": None}}
+
+    payload = await runner.close_schedule(
+        SimpleNamespace(api_url="http://api"),
+        object(),
+        evidence,
+    )
+
+    assert payload == {"state": "CLOSED", "guarded_job_id": None}
+    assert evidence["schedule"]["final_state"] == "CLOSED"
+    request_json.assert_awaited_once_with(
+        ANY,
+        "POST",
+        "http://api/internal/schedule/video/close",
+    )
 
 
 @pytest.mark.anyio
@@ -673,7 +830,9 @@ async def test_run_preserves_failed_preflight_redis_audit_and_root_failure(
     monkeypatch.setattr(
         runner,
         "schedule_status",
-        AsyncMock(return_value={"state": "CLOSED", "active_jobs": 0}),
+        AsyncMock(
+            return_value={"state": "CLOSED", "guarded_job_id": None, "active_jobs": 0}
+        ),
     )
     monkeypatch.setattr(
         runner,
@@ -756,7 +915,7 @@ async def test_execute_preflight_reads_readiness_without_live_side_effects(
 
     async def schedule_status(*_args):
         calls.append("schedule_status")
-        return {"state": "CLOSED", "active_jobs": 0}
+        return {"state": "CLOSED", "guarded_job_id": None, "active_jobs": 0}
 
     async def deployment_readiness(*_args):
         calls.append("deployment_readiness")
@@ -879,7 +1038,9 @@ async def test_execute_preflight_fails_closed_on_unsafe_redis_audit(
     monkeypatch.setattr(
         runner,
         "schedule_status",
-        AsyncMock(return_value={"state": "CLOSED", "active_jobs": 0}),
+        AsyncMock(
+            return_value={"state": "CLOSED", "guarded_job_id": None, "active_jobs": 0}
+        ),
     )
     monkeypatch.setattr(runner, "deployment_readiness", AsyncMock(return_value={"ready": True}))
     monkeypatch.setattr(runner, "manager_readiness", AsyncMock(return_value={"authenticated": True}))
@@ -904,15 +1065,24 @@ async def test_execute_preflight_fails_closed_on_unsafe_redis_audit(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "schedule",
+    (
+        {"state": "OPEN", "guarded_job_id": None, "active_jobs": 0},
+        {"state": "CLOSED", "guarded_job_id": str(uuid.uuid4()), "active_jobs": 0},
+        {"state": "CLOSED", "active_jobs": 0},
+    ),
+)
 async def test_execute_preflight_fails_closed_without_followup_checks(
     db: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    schedule: dict,
 ):
     runner = load_runner()
 
     async def schedule_status(*_args):
-        return {"state": "OPEN", "active_jobs": 0}
+        return schedule
 
     async def forbidden(*_args, **_kwargs):
         raise AssertionError("unsafe follow-up check ran")
@@ -926,7 +1096,7 @@ async def test_execute_preflight_fails_closed_without_followup_checks(
         "schedule": {"transitions": [], "final_state": None},
     }
 
-    with pytest.raises(runner.CanaryError, match="must be CLOSED"):
+    with pytest.raises(runner.CanaryError, match="CLOSED with no guarded job"):
         await runner.execute_preflight(
             object(),
             db,
@@ -935,7 +1105,128 @@ async def test_execute_preflight_fails_closed_without_followup_checks(
             tmp_path / "preflight.json",
         )
 
-    assert evidence["schedule"]["final_state"] == "OPEN"
+    assert evidence["schedule"]["final_state"] == schedule["state"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "schedule",
+    (
+        {"state": "CLOSED", "guarded_job_id": str(uuid.uuid4())},
+        {"state": "CLOSED"},
+    ),
+)
+async def test_execute_canary_start_requires_closed_unowned_schedule(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    schedule: dict,
+):
+    runner = load_runner()
+    monkeypatch.setattr(runner, "schedule_status", AsyncMock(return_value=schedule))
+    followup = AsyncMock(side_effect=AssertionError("unsafe live startup continued"))
+    monkeypatch.setattr(runner, "active_backlog", followup)
+    evidence = {"run_id": "run", "schedule": {"transitions": []}}
+
+    with pytest.raises(runner.CanaryError, match="CLOSED with no guarded job"):
+        await runner.execute_canary(
+            SimpleNamespace(),
+            db,
+            object(),
+            evidence,
+            tmp_path / "live.json",
+        )
+
+    followup.assert_not_awaited()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "final_schedule",
+    (
+        {"state": "CLOSED", "guarded_job_id": str(uuid.uuid4())},
+        {"state": "CLOSED"},
+    ),
+)
+async def test_execute_canary_final_recheck_requires_closed_unowned_schedule(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    final_schedule: dict,
+):
+    runner = load_runner()
+    channel_id = uuid.uuid4()
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        approval_mode="agent_preapproved",
+        agent_approval_evidence_json={"reason": runner.CANARY_APPROVAL_REASON},
+        autoflow_plan_id=uuid.uuid4(),
+        autoflow_run_id=uuid.uuid4(),
+        pipeline_id=uuid.uuid4(),
+    )
+    job = SimpleNamespace(
+        id=uuid.uuid4(),
+        status=SimpleNamespace(value="waiting_window"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "schedule_status",
+        AsyncMock(
+            side_effect=(
+                {"state": "CLOSED", "guarded_job_id": None},
+                final_schedule,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "active_backlog",
+        AsyncMock(
+            return_value={
+                "runnable_job_ids": [],
+                "unsafe_queue_item_ids": [],
+                "unsafe_task_ids": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "deployment_readiness",
+        AsyncMock(return_value={"channelops_task_wait_seconds": 1}),
+    )
+    monkeypatch.setattr(runner, "manager_readiness", AsyncMock(return_value={}))
+    monkeypatch.setattr(runner, "generate_owned_video", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        runner,
+        "upload_and_attest_asset",
+        AsyncMock(return_value={"id": str(uuid.uuid4())}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "create_canary_graph",
+        AsyncMock(return_value={"channel_id": str(channel_id), "agent_tick_id": "tick"}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "wait_for_single_task_and_preapprove",
+        AsyncMock(return_value=(task, SimpleNamespace(id=uuid.uuid4()))),
+    )
+    monkeypatch.setattr(runner, "wait_for_waiting_job", AsyncMock(return_value=(task, job)))
+    monkeypatch.setattr(runner, "assert_never_public", AsyncMock())
+    open_gate = AsyncMock(side_effect=AssertionError("unsafe open gate continued"))
+    monkeypatch.setattr(runner, "assert_open_gate", open_gate)
+    evidence = {"run_id": "run", "schedule": {"transitions": []}}
+
+    with pytest.raises(runner.CanaryError, match="CLOSED with no guarded job"):
+        await runner.execute_canary(
+            SimpleNamespace(timeout_seconds=10),
+            db,
+            object(),
+            evidence,
+            tmp_path / "live.json",
+        )
+
+    open_gate.assert_not_awaited()
 
 
 @pytest.mark.anyio

@@ -715,6 +715,8 @@ def record_schedule(evidence: dict[str, Any], action: str, payload: dict[str, An
             "action": action,
             "observed_at": utc_now().isoformat(),
             "state": payload.get("state"),
+            "guarded_job_id": payload.get("guarded_job_id"),
+            "released_jobs": payload.get("released_jobs"),
             "waiting_jobs": payload.get("waiting_jobs"),
             "active_jobs": payload.get("active_jobs"),
             "queued_nodes": payload.get("queued_nodes"),
@@ -744,8 +746,12 @@ async def close_schedule(
 ) -> dict[str, Any]:
     payload = await request_json(client, "POST", f"{api_root(args.api_url)}{SCHEDULE_CLOSE_PATH}")
     record_schedule(evidence, "close", payload)
-    if payload.get("state") != "CLOSED":
-        raise CanaryError("video schedule did not close")
+    if (
+        payload.get("state") != "CLOSED"
+        or "guarded_job_id" not in payload
+        or payload["guarded_job_id"] is not None
+    ):
+        raise CanaryError("video schedule must be CLOSED with no guarded job")
     evidence.setdefault("schedule", {})["final_state"] = "CLOSED"
     return payload
 
@@ -773,6 +779,21 @@ async def mutate_schedule(
     else:
         payload = await request_json(client, "POST", f"{api_root(args.api_url)}{path}")
     record_schedule(evidence, action, payload)
+    if action == "open":
+        if (
+            payload.get("state") != "OPEN"
+            or type(payload.get("released_jobs")) is not int
+            or payload["released_jobs"] != 1
+            or "guarded_job_id" not in payload
+            or payload["guarded_job_id"] != str(expected_job_id)
+        ):
+            raise CanaryError("schedule open did not grant authority to the exact canary job")
+    elif (
+        payload.get("state") != "DRAINING"
+        or "guarded_job_id" not in payload
+        or payload["guarded_job_id"] is not None
+    ):
+        raise CanaryError("video schedule must be DRAINING with no guarded job")
     return payload
 
 
@@ -1925,8 +1946,12 @@ async def execute_preflight(
     initial_schedule = await schedule_status(args, client)
     record_schedule(evidence, "initial", initial_schedule)
     evidence["schedule"]["final_state"] = initial_schedule.get("state")
-    if initial_schedule.get("state") != "CLOSED":
-        raise CanaryError("global video schedule must be CLOSED before canary preflight")
+    if (
+        initial_schedule.get("state") != "CLOSED"
+        or "guarded_job_id" not in initial_schedule
+        or initial_schedule["guarded_job_id"] is not None
+    ):
+        raise CanaryError("global video schedule must be CLOSED with no guarded job before preflight")
 
     backlog = await active_backlog(db)
     evidence["preflight_backlog"] = backlog
@@ -1948,8 +1973,12 @@ async def execute_canary(
 ) -> None:
     initial_schedule = await schedule_status(args, client)
     record_schedule(evidence, "initial", initial_schedule)
-    if initial_schedule.get("state") != "CLOSED":
-        raise CanaryError("global video schedule must be CLOSED before canary start")
+    if (
+        initial_schedule.get("state") != "CLOSED"
+        or "guarded_job_id" not in initial_schedule
+        or initial_schedule["guarded_job_id"] is not None
+    ):
+        raise CanaryError("global video schedule must be CLOSED with no guarded job before canary start")
 
     preexisting = await active_backlog(db)
     evidence["preflight_backlog"] = preexisting
@@ -2005,8 +2034,12 @@ async def execute_canary(
 
     current_schedule = await schedule_status(args, client)
     record_schedule(evidence, "pre_open_recheck", current_schedule)
-    if current_schedule.get("state") != "CLOSED":
-        raise CanaryError("video schedule changed before final open gate")
+    if (
+        current_schedule.get("state") != "CLOSED"
+        or "guarded_job_id" not in current_schedule
+        or current_schedule["guarded_job_id"] is not None
+    ):
+        raise CanaryError("video schedule must be CLOSED with no guarded job at the final open gate")
     evidence["open_gate"] = await assert_open_gate(
         db,
         channel_id=uuid.UUID(graph["channel_id"]),
@@ -2021,14 +2054,24 @@ async def execute_canary(
         "open",
         expected_job_id=job.id,
     )
-    if opened.get("state") != "OPEN" or int(opened.get("released_jobs") or 0) != 1:
-        raise CanaryError("schedule open did not release exactly one canary job")
+    if (
+        opened.get("state") != "OPEN"
+        or type(opened.get("released_jobs")) is not int
+        or opened["released_jobs"] != 1
+        or "guarded_job_id" not in opened
+        or opened["guarded_job_id"] != str(job.id)
+    ):
+        raise CanaryError("schedule open did not grant authority to the exact canary job")
     running_job = await wait_for_running_job(db, job.id, min(args.timeout_seconds, 120.0))
     evidence["job"]["running_observed_at"] = utc_now().isoformat()
     evidence["job"]["status_when_drained"] = running_job.status.value
     drained = await mutate_schedule(args, client, evidence, "drain")
-    if drained.get("state") != "DRAINING":
-        raise CanaryError("video schedule did not enter DRAINING")
+    if (
+        drained.get("state") != "DRAINING"
+        or "guarded_job_id" not in drained
+        or drained["guarded_job_id"] is not None
+    ):
+        raise CanaryError("video schedule must be DRAINING with no guarded job")
     atomic_write_json(path, evidence)
 
     operation, publication = await wait_for_upload_and_publication(db, task.id, args.timeout_seconds)

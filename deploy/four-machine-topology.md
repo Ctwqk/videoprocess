@@ -229,6 +229,25 @@ connections. It still reaches the VP API directly on 127, keeps the existing
 127-to-150 jump for Swarm checks, and removes the forwarding process on every
 exit path. Evidence records logical routing only, not ports or connection URLs.
 
+The guarded schedule status deployment is a deployment/preflight gate. Deploy
+the Python and Go status implementations that return `guarded_job_id` before
+running preflight; a missing field fails closed. Both preflight and live startup
+require `CLOSED` and `guarded_job_id=null`, and the live runner repeats that
+check immediately before opening the schedule.
+
+The canary opens with `expected_job_id=<canary job UUID>` and accepts success
+only when the response is `OPEN`, `released_jobs=1`, and `guarded_job_id=<exact job UUID>`.
+Every recorded schedule transition includes `guarded_job_id`, so the evidence
+identifies the precise job that held open authority. After the job starts, the
+runner accepts `DRAINING` only with a null guard; every successful final
+`CLOSED` response must also report a null guard.
+
+Every generic `OPEN`, `DRAINING`, or `CLOSED` transition clears `guarded_job_id`.
+Legacy no-parameter `POST /open` callers remain supported as global, unguarded
+opens, but the canary runner never uses that compatibility path. Drain and
+close remain no-parameter requests. This authority contract neither replaces
+nor consumes the separately required fourth-attempt approval phrase.
+
 For an approved live attempt, replace `--preflight-only` with
 `--confirm-live-unlisted`. That CLI flag and the SSH transport do not constitute
 human approval: the per-attempt approval phrase above must already have been

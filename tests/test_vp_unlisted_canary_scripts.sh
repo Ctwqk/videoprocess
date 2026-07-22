@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 QUARANTINE="$ROOT_DIR/scripts/quarantine_channelops_backlog.py"
 CANARY="$ROOT_DIR/scripts/run_vp_unlisted_canary.py"
+RUNBOOK="$ROOT_DIR/deploy/four-machine-topology.md"
 PYTHON_BIN="$ROOT_DIR/backend/.venv/bin/python"
 if [[ ! -x "$PYTHON_BIN" && -x "$ROOT_DIR/../../backend/.venv/bin/python" ]]; then
   PYTHON_BIN="$ROOT_DIR/../../backend/.venv/bin/python"
@@ -12,6 +13,18 @@ fi
 for script in "$QUARANTINE" "$CANARY"; do
   [[ -f "$script" ]] || {
     echo "FAIL: missing script: $script" >&2
+    exit 1
+  }
+done
+
+for required in \
+  'deployment/preflight gate' \
+  '`CLOSED` and `guarded_job_id=null`' \
+  '`OPEN`, `released_jobs=1`, and `guarded_job_id=<exact job UUID>`' \
+  'Every generic `OPEN`, `DRAINING`, or `CLOSED` transition clears `guarded_job_id`' \
+  'Legacy no-parameter `POST /open` callers remain supported'; do
+  grep -Fq "$required" "$RUNBOOK" || {
+    echo "FAIL: canary runbook missing exact authority contract: $required" >&2
     exit 1
   }
 done
@@ -156,9 +169,26 @@ mutate_source = ast.unparse(mutate_schedule)
 for required in (
     "expected_job_id",
     "params={'expected_job_id': str(expected_job_id)}",
+    "guarded_job_id",
+    "released_jobs",
+    "exact canary job",
+    "DRAINING with no guarded job",
 ):
     if required not in mutate_source:
         raise SystemExit(f"FAIL: guarded schedule open missing {required}")
+
+record_schedule = functions.get("record_schedule")
+if record_schedule is None or "guarded_job_id" not in ast.unparse(record_schedule):
+    raise SystemExit("FAIL: schedule evidence must record guarded_job_id")
+
+for function_name in ("execute_preflight", "execute_canary"):
+    source = ast.unparse(functions[function_name])
+    if "guarded_job_id" not in source:
+        raise SystemExit(f"FAIL: {function_name} must gate on guarded_job_id")
+
+close_schedule = functions.get("close_schedule")
+if close_schedule is None or "CLOSED with no guarded job" not in ast.unparse(close_schedule):
+    raise SystemExit("FAIL: final CLOSED response must clear guarded_job_id")
 
 cleanup = functions.get("failure_cleanup")
 if cleanup is None:
