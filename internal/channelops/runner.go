@@ -80,7 +80,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := r.runOnce(ctx); err != nil {
+	if err := r.runOnce(ctx); err != nil && !errors.Is(err, ErrQueueLeaseLost) {
 		return err
 	}
 	for {
@@ -90,7 +90,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			timer.Stop()
 			return ctx.Err()
 		case <-timer.C:
-			if err := r.runOnce(ctx); err != nil {
+			if err := r.runOnce(ctx); err != nil && !errors.Is(err, ErrQueueLeaseLost) {
 				return err
 			}
 		}

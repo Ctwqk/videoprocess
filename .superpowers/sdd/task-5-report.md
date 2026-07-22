@@ -255,3 +255,79 @@ ok  github.com/Ctwqk/videoprocess/internal/channelops 6.590s
 - `gofmt -w internal/channelops/config.go internal/channelops/config_test.go internal/channelops/discovery_client.go internal/channelops/discovery_client_test.go internal/channelops/handlers.go internal/channelops/handlers_test.go internal/channelops/integration_test.go internal/channelops/queue.go internal/channelops/queue_test.go internal/channelops/runner.go internal/channelops/runner_test.go` exited 0 with no output.
 - `PATH=/opt/homebrew/bin:$PATH go vet ./internal/channelops` exited 0 with no output.
 - `git diff --check` exited 0 with no output.
+
+## Task 5 Rereview RED/GREEN Evidence
+
+Before the rereview production changes, the focused tests were run with:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55439/videoprocess_test go test ./internal/channelops -run 'TestRunnerRunContinuesAfterDiscoveryLeaseLoss|TestLoadConfigStrictDiscoveryTimeoutEnv' -count=1 -v
+```
+
+The behavioral RED was:
+
+```text
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/empty_uses_default
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/minimum
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/maximum
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/below_minimum
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/above_maximum
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/malformed
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/duration_overflow
+    config_test.go:124: Validate did not reject discovery timeout environment value
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/Atoi_overflow
+--- FAIL: TestLoadConfigStrictDiscoveryTimeoutEnv (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/empty_uses_default (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/minimum (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/maximum (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/below_minimum (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/above_maximum (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/malformed (0.00s)
+    --- FAIL: TestLoadConfigStrictDiscoveryTimeoutEnv/duration_overflow (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/Atoi_overflow (0.00s)
+=== RUN   TestRunnerRunContinuesAfterDiscoveryLeaseLoss
+=== RUN   TestRunnerRunContinuesAfterDiscoveryLeaseLoss/initial_poll
+    runner_test.go:368: Run returned after lease loss: queue lease lost
+=== RUN   TestRunnerRunContinuesAfterDiscoveryLeaseLoss/timer_poll
+    runner_test.go:368: Run returned after lease loss: queue lease lost
+--- FAIL: TestRunnerRunContinuesAfterDiscoveryLeaseLoss (1.10s)
+    --- FAIL: TestRunnerRunContinuesAfterDiscoveryLeaseLoss/initial_poll (0.05s)
+    --- FAIL: TestRunnerRunContinuesAfterDiscoveryLeaseLoss/timer_poll (1.05s)
+FAIL
+FAIL    github.com/Ctwqk/videoprocess/internal/channelops    1.403s
+FAIL
+```
+
+After adding the integer bounds check before duration conversion and treating
+only `ErrQueueLeaseLost` as a completed poll in both `Runner.Run` poll sites,
+the same command was GREEN with no `SKIP` entries:
+
+```text
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/empty_uses_default
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/minimum
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/maximum
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/below_minimum
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/above_maximum
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/malformed
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/duration_overflow
+=== RUN   TestLoadConfigStrictDiscoveryTimeoutEnv/Atoi_overflow
+--- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/empty_uses_default (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/minimum (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/maximum (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/below_minimum (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/above_maximum (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/malformed (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/duration_overflow (0.00s)
+    --- PASS: TestLoadConfigStrictDiscoveryTimeoutEnv/Atoi_overflow (0.00s)
+=== RUN   TestRunnerRunContinuesAfterDiscoveryLeaseLoss
+=== RUN   TestRunnerRunContinuesAfterDiscoveryLeaseLoss/initial_poll
+=== RUN   TestRunnerRunContinuesAfterDiscoveryLeaseLoss/timer_poll
+--- PASS: TestRunnerRunContinuesAfterDiscoveryLeaseLoss (1.32s)
+    --- PASS: TestRunnerRunContinuesAfterDiscoveryLeaseLoss/initial_poll (0.16s)
+    --- PASS: TestRunnerRunContinuesAfterDiscoveryLeaseLoss/timer_poll (1.17s)
+PASS
+ok      github.com/Ctwqk/videoprocess/internal/channelops    1.630s
+```

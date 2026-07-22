@@ -105,9 +105,11 @@ func TestLoadConfigStrictDiscoveryTimeoutEnv(t *testing.T) {
 		{name: "empty uses default", value: "", want: 120 * time.Second},
 		{name: "minimum", value: "30", want: 30 * time.Second},
 		{name: "maximum", value: "300", want: 300 * time.Second},
-		{name: "below minimum", value: "29", want: 29 * time.Second, wantError: true},
-		{name: "above maximum", value: "301", want: 301 * time.Second, wantError: true},
+		{name: "below minimum", value: "29", want: 120 * time.Second, wantError: true},
+		{name: "above maximum", value: "301", want: 120 * time.Second, wantError: true},
 		{name: "malformed", value: "not-an-integer", want: 120 * time.Second, wantError: true},
+		{name: "duration overflow", value: "36028797018964088", want: 120 * time.Second, wantError: true},
+		{name: "Atoi overflow", value: "9223372036854775808", want: 120 * time.Second, wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS", tt.value)
@@ -121,10 +123,8 @@ func TestLoadConfigStrictDiscoveryTimeoutEnv(t *testing.T) {
 				if err == nil || !strings.Contains(err.Error(), "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS") {
 					t.Fatal("Validate did not reject discovery timeout environment value")
 				}
-				if tt.name == "malformed" {
-					if _, runnerErr := NewRunner(context.Background(), cfg); runnerErr == nil || !strings.Contains(runnerErr.Error(), "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS") {
-						t.Fatal("NewRunner did not reject malformed discovery timeout")
-					}
+				if _, runnerErr := NewRunner(context.Background(), cfg); runnerErr == nil || !strings.Contains(runnerErr.Error(), "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS") {
+					t.Fatal("NewRunner did not reject discovery timeout environment value")
 				}
 				return
 			}

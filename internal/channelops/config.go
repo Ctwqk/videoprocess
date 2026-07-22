@@ -218,6 +218,9 @@ func discoveryTimeoutEnv() (time.Duration, bool) {
 	if err != nil {
 		return defaultDiscoveryTimeout, true
 	}
+	if parsed < 30 || parsed > 300 {
+		return defaultDiscoveryTimeout, true
+	}
 	return time.Duration(parsed) * time.Second, false
 }
 

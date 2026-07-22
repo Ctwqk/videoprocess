@@ -280,6 +280,108 @@ func TestRunnerDiscoveryLeaseRaceCannotFinalizeReplacementLease(t *testing.T) {
 	}
 }
 
+func TestRunnerRunContinuesAfterDiscoveryLeaseLoss(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	for _, tt := range []struct {
+		name     string
+		seedPoll bool
+	}{
+		{name: "initial poll"},
+		{name: "timer poll", seedPoll: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(context.Background())
+			fixture.InsertChannelWithLaneAccountSeed(context.Background())
+			channelID := fixture.ChannelID
+			bucket := "2026-07-21-18"
+
+			if tt.seedPoll {
+				if _, err := fixture.Store.Enqueue(context.Background(), EnqueueOptions{
+					Kind: QueueIngestDiscovery, IdempotencyKey: "discovery-runner-lease-loss-seed:" + channelID,
+					Payload: map[string]any{
+						"channel_id": channelID, "source": "youtube_search", "bucket": bucket, "scheduler_bucket": bucket,
+					},
+					Priority: 70, ChannelProfileID: &channelID,
+				}); err != nil {
+					t.Fatalf("enqueue seed: %v", err)
+				}
+			}
+			targetID, err := fixture.Store.Enqueue(context.Background(), EnqueueOptions{
+				Kind: QueueIngestDiscovery, IdempotencyKey: "discovery-runner-lease-loss-target:" + tt.name + ":" + channelID,
+				Payload: map[string]any{
+					"channel_id": channelID, "source": "youtube_search", "bucket": bucket, "scheduler_bucket": bucket,
+				},
+				Priority: 80, ChannelProfileID: &channelID,
+			})
+			if err != nil {
+				t.Fatalf("enqueue target: %v", err)
+			}
+
+			initialPollCompleted := make(chan struct{})
+			leaseReplaced := make(chan struct{}, 1)
+			calls := 0
+			client := &recordingDiscoveryClient{ingest: func(request DiscoveryIngestRequest) (DiscoveryObservation, error) {
+				calls++
+				if tt.seedPoll && calls == 1 {
+					close(initialPollCompleted)
+					return discoveryObservationForTest(request), nil
+				}
+				result, err := fixture.Store.Pool.Exec(context.Background(), `
+					UPDATE channel_ops_queue_items
+					SET locked_by = 'replacement-worker', locked_at = locked_at + INTERVAL '1 second'
+					WHERE id = $1::uuid AND status = $2
+				`, targetID, QueueStatusRunning)
+				if err != nil {
+					return DiscoveryObservation{}, err
+				}
+				if result.RowsAffected() != 1 {
+					return DiscoveryObservation{}, errors.New("target discovery lease was not running")
+				}
+				leaseReplaced <- struct{}{}
+				return discoveryObservationForTest(request), nil
+			}}
+			handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+			handler.Discovery = client
+			runner := &Runner{Config: Config{RunnerPollSeconds: 1}, Store: fixture.Store, Handlers: handler}
+			errCh := make(chan error, 1)
+			go func() { errCh <- runner.Run(ctx) }()
+
+			if tt.seedPoll {
+				select {
+				case <-initialPollCompleted:
+				case <-time.After(500 * time.Millisecond):
+					t.Fatal("initial poll did not complete before timer poll")
+				}
+			}
+			select {
+			case <-leaseReplaced:
+			case <-time.After(2 * time.Second):
+				t.Fatal("runner did not reach the discovery lease replacement")
+			}
+			select {
+			case err := <-errCh:
+				t.Fatalf("Run returned after lease loss: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			cancel()
+			select {
+			case err := <-errCh:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("Run returned %v, want context.Canceled", err)
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("Run did not return after cancellation")
+			}
+		})
+	}
+}
+
 func TestShouldRunSchedulerHonorsPollSeconds(t *testing.T) {
 	lastRun := time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC)
 
