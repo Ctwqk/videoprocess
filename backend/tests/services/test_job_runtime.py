@@ -149,6 +149,44 @@ def test_execution_authority_rejects_guarded_mismatch_before_node_work():
         )
 
 
+def test_execution_authority_allows_running_job_while_schedule_drains():
+    job_id = uuid.uuid4()
+    authority = LockedJobExecutionAuthority(
+        channel=None,
+        schedule=SimpleNamespace(
+            state=VideoScheduleState.DRAINING.value,
+            guarded_job_id=None,
+        ),
+        task=None,
+        job=SimpleNamespace(id=job_id, status=JobStatus.RUNNING),
+        node=None,
+    )
+
+    require_active_execution_authority(
+        authority,
+        job_statuses={JobStatus.RUNNING},
+    )
+
+
+def test_execution_authority_rejects_pending_job_while_schedule_drains():
+    authority = LockedJobExecutionAuthority(
+        channel=None,
+        schedule=SimpleNamespace(
+            state=VideoScheduleState.DRAINING.value,
+            guarded_job_id=None,
+        ),
+        task=None,
+        job=SimpleNamespace(id=uuid.uuid4(), status=JobStatus.PENDING),
+        node=None,
+    )
+
+    with pytest.raises(JobExecutionAuthorityBlocked):
+        require_active_execution_authority(
+            authority,
+            job_statuses={JobStatus.PENDING},
+        )
+
+
 def test_execution_authority_rejects_missing_guard_field():
     authority = LockedJobExecutionAuthority(
         channel=None,

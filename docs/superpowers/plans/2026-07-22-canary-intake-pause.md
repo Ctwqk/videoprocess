@@ -117,8 +117,9 @@ with pgx, pytest, shell deployment contracts, Docker Swarm.
   success.
 - [ ] Verify automatic deployment of VideoProcess app/aggregator services to
   127/150; do not deploy PDS and do not involve 126.
-- [ ] Require migration head 030, exact deployed SHA, expected placement,
-  schedule `CLOSED`, zero unsafe/public/upload backlog, and zero Redis pending.
+- [ ] Require migration head `031_guarded_schedule_job_authority`, exact
+  deployed SHA, expected placement, schedule `CLOSED`, zero
+  unsafe/public/upload backlog, and zero Redis pending.
 - [ ] Run a fresh read-only canary preflight and persist 0600 evidence.
 
 ### Task 7: Run the next live attempt only after fresh approval

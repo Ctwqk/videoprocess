@@ -38,7 +38,15 @@ def require_active_execution_authority(
         raise JobExecutionAuthorityBlocked("channel execution is blocked")
     if authority.task is not None and authority.task.state != "producing":
         raise JobExecutionAuthorityBlocked("production task is not producing")
-    if authority.schedule.state != VideoScheduleState.OPEN.value:
+    if (
+        authority.schedule.state == VideoScheduleState.DRAINING.value
+        and authority.job.status != JobStatus.RUNNING
+    ):
+        raise JobExecutionAuthorityBlocked("runtime schedule is draining")
+    if authority.schedule.state not in {
+        VideoScheduleState.OPEN.value,
+        VideoScheduleState.DRAINING.value,
+    }:
         raise JobExecutionAuthorityBlocked("runtime schedule is not open")
     try:
         guarded_job_id = authority.schedule.guarded_job_id

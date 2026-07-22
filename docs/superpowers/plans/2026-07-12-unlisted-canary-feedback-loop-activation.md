@@ -560,8 +560,11 @@ Observe the normal cron or run the same scoped command once:
 
 ```bash
 /home/taiwei/deploy-github-sync/bin/deploy-github-sync.sh \
-  --apply --project vp-app --project vp-feature-aggregator --project vp-pds
+  --apply --project vp-app --project vp-feature-aggregator
 ```
+
+Do not include `vp-pds` in this deployment. PDS remains an independently
+versioned repository and requires a separate, explicitly authorized operation.
 
 Require all VP services, including `vp-youtube-publisher-swarm`, to be `1/1`.
 Verify the publisher is on `ccttww-lap`, app services are on `colima-127`, and
