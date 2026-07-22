@@ -37,15 +37,17 @@ type Config struct {
 	RetentionQueueDays           int
 	RetentionAuditDays           int
 	RetentionFeedbackDays        int
+	discoveryTimeoutParseFailed  bool
 }
 
 func LoadConfig() Config {
+	discoveryTimeout, discoveryTimeoutParseFailed := discoveryTimeoutEnv()
 	return Config{
 		DatabaseURL:                  env("DATABASE_URL", "postgresql://vp:vp_secret@localhost:5435/videoprocess"),
 		YouTubeManagerURL:            env("YOUTUBE_MANAGER_URL", ""),
 		AutoFlowBaseURL:              env("AUTOFLOW_BASE_URL", "http://api:8080"),
 		AutoFlowTimeout:              time.Duration(floatEnv("AUTOFLOW_TIMEOUT_SECONDS", 10) * float64(time.Second)),
-		DiscoveryTimeout:             time.Duration(intEnv("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS", 120)) * time.Second,
+		DiscoveryTimeout:             discoveryTimeout,
 		PDSEnabled:                   boolEnv("PDS_ENABLED", false),
 		PDSBaseURL:                   env("PDS_BASE_URL", "http://pds:8080"),
 		PDSClientID:                  env("PDS_CLIENT_ID", "videoprocess-channel-agent"),
@@ -69,6 +71,7 @@ func LoadConfig() Config {
 		RetentionQueueDays:           intEnv("CHANNELOPS_RETENTION_QUEUE_DAYS", 30),
 		RetentionAuditDays:           intEnv("CHANNELOPS_RETENTION_AUDIT_DAYS", 90),
 		RetentionFeedbackDays:        intEnv("CHANNELOPS_RETENTION_FEEDBACK_DAYS", 365),
+		discoveryTimeoutParseFailed:  discoveryTimeoutParseFailed,
 	}
 }
 
@@ -85,7 +88,10 @@ func (c Config) Validate() error {
 	if c.AutoFlowTimeout <= 0 {
 		return errors.New("AUTOFLOW_TIMEOUT_SECONDS must be positive")
 	}
-	if c.DiscoveryTimeout < 30*time.Second || c.DiscoveryTimeout > 300*time.Second {
+	if c.discoveryTimeoutParseFailed {
+		return errors.New("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS must be an integer between 30 and 300")
+	}
+	if !validDiscoveryTimeout(c.DiscoveryTimeout) {
 		return errors.New("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS must be between 30 and 300")
 	}
 	if c.PDSTimeout <= 0 {
@@ -201,6 +207,22 @@ func intEnv(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func discoveryTimeoutEnv() (time.Duration, bool) {
+	value := strings.TrimSpace(os.Getenv("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS"))
+	if value == "" {
+		return defaultDiscoveryTimeout, false
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultDiscoveryTimeout, true
+	}
+	return time.Duration(parsed) * time.Second, false
+}
+
+func validDiscoveryTimeout(timeout time.Duration) bool {
+	return timeout >= 30*time.Second && timeout <= 300*time.Second
 }
 
 func floatEnv(key string, fallback float64) float64 {

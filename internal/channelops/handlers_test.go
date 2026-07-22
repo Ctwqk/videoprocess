@@ -96,28 +96,27 @@ func TestClaimableKindsIncludesDiscoveryOnlyWhenConfigured(t *testing.T) {
 
 func TestHandleIngestDiscoveryRejectsMissingIdentityBeforeClientCall(t *testing.T) {
 	request := discoveryRequestForTest()
-	storedChannel := request.ChannelID
 	tests := []struct {
 		name   string
 		mutate func(*QueueItemRow)
 	}{
+		{name: "queued status", mutate: func(item *QueueItemRow) { item.Status = QueueStatusQueued }},
+		{name: "missing locked by", mutate: func(item *QueueItemRow) { item.LockedBy = nil }},
+		{name: "blank locked by", mutate: func(item *QueueItemRow) { blank := "  "; item.LockedBy = &blank }},
+		{name: "missing locked at", mutate: func(item *QueueItemRow) { item.LockedAt = nil }},
 		{name: "queue id", mutate: func(item *QueueItemRow) { item.ID = "" }},
 		{name: "stored channel", mutate: func(item *QueueItemRow) { item.ChannelProfileID = nil }},
 		{name: "payload channel", mutate: func(item *QueueItemRow) { item.PayloadJSON["channel_id"] = "00000000-0000-0000-0000-000000000099" }},
 		{name: "source", mutate: func(item *QueueItemRow) { item.PayloadJSON["source"] = "youtube" }},
-		{name: "bucket", mutate: func(item *QueueItemRow) { item.PayloadJSON["scheduler_bucket"] = "" }},
+		{name: "missing bucket", mutate: func(item *QueueItemRow) { delete(item.PayloadJSON, "bucket") }},
+		{name: "blank bucket", mutate: func(item *QueueItemRow) { item.PayloadJSON["bucket"] = "  " }},
+		{name: "missing scheduler bucket", mutate: func(item *QueueItemRow) { delete(item.PayloadJSON, "scheduler_bucket") }},
+		{name: "mismatched bucket", mutate: func(item *QueueItemRow) { item.PayloadJSON["bucket"] = "2026-07-21-19" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &recordingDiscoveryClient{observation: discoveryObservationForTest(request)}
-			item := QueueItemRow{
-				ID:               request.QueueItemID,
-				Kind:             QueueIngestDiscovery,
-				ChannelProfileID: &storedChannel,
-				PayloadJSON: map[string]any{
-					"channel_id": request.ChannelID, "source": "youtube_search", "scheduler_bucket": request.SchedulerBucket,
-				},
-			}
+			item := discoveryQueueItemForTest(request)
 			tt.mutate(&item)
 			err := (HandlerService{Store: &Store{}, Discovery: client}).HandleIngestDiscovery(context.Background(), item)
 			if err == nil {
@@ -132,19 +131,27 @@ func TestHandleIngestDiscoveryRejectsMissingIdentityBeforeClientCall(t *testing.
 
 func TestHandleIngestDiscoveryDefensivelyRejectsClientMismatch(t *testing.T) {
 	request := discoveryRequestForTest()
-	storedChannel := request.ChannelID
 	observation := discoveryObservationForTest(request)
 	observation.SchedulerBucket = "mismatch"
 	client := &recordingDiscoveryClient{observation: observation}
-	err := (HandlerService{Store: &Store{}, Discovery: client}).HandleIngestDiscovery(context.Background(), QueueItemRow{
-		ID: request.QueueItemID, Kind: QueueIngestDiscovery, ChannelProfileID: &storedChannel,
-		PayloadJSON: map[string]any{"channel_id": request.ChannelID, "source": "youtube_search", "scheduler_bucket": request.SchedulerBucket},
-	})
+	err := (HandlerService{Store: &Store{}, Discovery: client}).HandleIngestDiscovery(
+		context.Background(), discoveryQueueItemForTest(request),
+	)
 	if err == nil || !strings.Contains(err.Error(), "scheduler_bucket mismatch") {
 		t.Fatalf("HandleIngestDiscovery error = %v", err)
 	}
 	if client.calls != 1 {
 		t.Fatalf("client calls = %d, want 1", client.calls)
+	}
+}
+
+func TestHandleIngestDiscoverySanitizesClientError(t *testing.T) {
+	client := &recordingDiscoveryClient{err: errors.New("credential=top-secret provider-title=private")}
+	err := (HandlerService{Store: &Store{}, Discovery: client}).HandleIngestDiscovery(
+		context.Background(), discoveryQueueItemForTest(discoveryRequestForTest()),
+	)
+	if !errors.Is(err, ErrDiscoveryIngestFailed) || err.Error() != "discovery ingestion failed" {
+		t.Fatal("HandleIngestDiscovery did not return the fixed discovery error")
 	}
 }
 
@@ -156,7 +163,7 @@ func TestHandleIngestDiscoveryDoesNotHoldExecutionFenceDuringClientCall(t *testi
 	channelID := fixture.ChannelID
 	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
 		Kind: QueueIngestDiscovery, IdempotencyKey: "discovery-handler-fence:" + channelID,
-		Payload:  map[string]any{"channel_id": channelID, "source": "youtube_search", "scheduler_bucket": "2026-07-21-18"},
+		Payload:  map[string]any{"channel_id": channelID, "source": "youtube_search", "bucket": "2026-07-21-18", "scheduler_bucket": "2026-07-21-18"},
 		Priority: 80, ChannelProfileID: &channelID,
 	})
 	if err != nil {
@@ -215,6 +222,20 @@ func discoveryObservationForTest(request DiscoveryIngestRequest) DiscoveryObserv
 		RunID: "00000000-0000-0000-0000-000000000003", ChannelID: request.ChannelID,
 		QueueItemID: request.QueueItemID, Source: request.Source, SchedulerBucket: request.SchedulerBucket,
 		Status: "succeeded", QueryCount: 2, CreatedCount: 3, RefreshedCount: 4, ExpiredCount: 5, QuotaUnitsEstimated: 200,
+	}
+}
+
+func discoveryQueueItemForTest(request DiscoveryIngestRequest) QueueItemRow {
+	lockedBy := "discovery-test-worker"
+	lockedAt := time.Date(2026, 7, 21, 18, 0, 0, 0, time.UTC)
+	storedChannel := request.ChannelID
+	return QueueItemRow{
+		ID: request.QueueItemID, Kind: QueueIngestDiscovery, Status: QueueStatusRunning,
+		LockedBy: &lockedBy, LockedAt: &lockedAt, ChannelProfileID: &storedChannel,
+		PayloadJSON: map[string]any{
+			"channel_id": request.ChannelID, "source": "youtube_search",
+			"bucket": request.SchedulerBucket, "scheduler_bucket": request.SchedulerBucket,
+		},
 	}
 }
 

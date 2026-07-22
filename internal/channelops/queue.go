@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -291,7 +292,7 @@ func (s *Store) MarkQueueDone(ctx context.Context, item QueueItemRow) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db().Exec(ctx, `
+	result, err := s.db().Exec(ctx, `
 		UPDATE channel_ops_queue_items
 		SET status = $2,
 		    last_error = NULL,
@@ -302,7 +303,7 @@ func (s *Store) MarkQueueDone(ctx context.Context, item QueueItemRow) error {
 		  AND locked_by = $4
 		  AND locked_at = $5
 	`, item.ID, QueueStatusSucceeded, QueueStatusRunning, lockedBy, lockedAt)
-	return err
+	return queueLeaseUpdateResult(result.RowsAffected(), err)
 }
 
 func (s *Store) MarkQueueFailedOrRetry(ctx context.Context, item QueueItemRow, message string) error {
@@ -311,7 +312,7 @@ func (s *Store) MarkQueueFailedOrRetry(ctx context.Context, item QueueItemRow, m
 		return err
 	}
 	if ShouldDeadLetter(item.AttemptCount, item.MaxAttempts) {
-		_, err := s.db().Exec(ctx, `
+		result, err := s.db().Exec(ctx, `
 			UPDATE channel_ops_queue_items
 			SET status = $2,
 			    last_error = $3,
@@ -323,10 +324,10 @@ func (s *Store) MarkQueueFailedOrRetry(ctx context.Context, item QueueItemRow, m
 			  AND locked_by = $5
 			  AND locked_at = $6
 		`, item.ID, QueueStatusDeadLettered, message, QueueStatusRunning, lockedBy, lockedAt)
-		return err
+		return queueLeaseUpdateResult(result.RowsAffected(), err)
 	}
 
-	_, err = s.db().Exec(ctx, `
+	result, err := s.db().Exec(ctx, `
 		UPDATE channel_ops_queue_items
 		SET status = $2,
 		    last_error = $3,
@@ -339,7 +340,7 @@ func (s *Store) MarkQueueFailedOrRetry(ctx context.Context, item QueueItemRow, m
 		  AND locked_at = $7
 	`, item.ID, QueueStatusQueued, message, pgInterval(RetryDelay(item.AttemptCount)),
 		QueueStatusRunning, lockedBy, lockedAt)
-	return err
+	return queueLeaseUpdateResult(result.RowsAffected(), err)
 }
 
 func (s *Store) MarkQueueRejected(ctx context.Context, item QueueItemRow, message string) error {
@@ -347,7 +348,7 @@ func (s *Store) MarkQueueRejected(ctx context.Context, item QueueItemRow, messag
 	if err != nil {
 		return err
 	}
-	_, err = s.db().Exec(ctx, `
+	result, err := s.db().Exec(ctx, `
 		UPDATE channel_ops_queue_items
 		SET status = $2,
 		    last_error = $3,
@@ -359,11 +360,23 @@ func (s *Store) MarkQueueRejected(ctx context.Context, item QueueItemRow, messag
 		  AND locked_by = $5
 		  AND locked_at = $6
 	`, item.ID, QueueStatusDeadLettered, message, QueueStatusRunning, lockedBy, lockedAt)
-	return err
+	return queueLeaseUpdateResult(result.RowsAffected(), err)
+}
+
+var ErrQueueLeaseLost = errors.New("queue lease lost")
+
+func queueLeaseUpdateResult(rowsAffected int64, err error) error {
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrQueueLeaseLost
+	}
+	return nil
 }
 
 func runningLease(item QueueItemRow) (string, time.Time, error) {
-	if item.Status != QueueStatusRunning || item.LockedBy == nil || item.LockedAt == nil {
+	if item.Status != QueueStatusRunning || item.LockedBy == nil || strings.TrimSpace(*item.LockedBy) == "" || item.LockedAt == nil {
 		return "", time.Time{}, fmt.Errorf("queue item %s has no running lease", item.ID)
 	}
 	return *item.LockedBy, *item.LockedAt, nil

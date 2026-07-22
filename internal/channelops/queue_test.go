@@ -2,6 +2,7 @@ package channelops
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -189,7 +190,7 @@ func TestClaimRejectsDisabledAndHaltedChannelsButKeepsGlobalItems(t *testing.T) 
 	}
 }
 
-func TestQueueLeasePreventsStaleSuccessAndRetryAfterDeadLetter(t *testing.T) {
+func TestQueueLeaseReportsStaleCompletionAfterDeadLetter(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
@@ -198,7 +199,7 @@ func TestQueueLeasePreventsStaleSuccessAndRetryAfterDeadLetter(t *testing.T) {
 	defer fixture.Close(ctx)
 
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
-	for _, completion := range []string{"success", "retry"} {
+	for _, completion := range []string{"success", "retry", "reject"} {
 		t.Run(completion, func(t *testing.T) {
 			channelID := fixture.ChannelID
 			_, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
@@ -230,9 +231,11 @@ func TestQueueLeasePreventsStaleSuccessAndRetryAfterDeadLetter(t *testing.T) {
 				err = fixture.Store.MarkQueueDone(ctx, *item)
 			case "retry":
 				err = fixture.Store.MarkQueueFailedOrRetry(ctx, *item, "stale runner failure")
+			case "reject":
+				err = fixture.Store.MarkQueueRejected(ctx, *item, "stale runner rejection")
 			}
-			if err != nil {
-				t.Fatalf("stale %s completion: %v", completion, err)
+			if !errors.Is(err, ErrQueueLeaseLost) || err.Error() != "queue lease lost" {
+				t.Fatalf("stale %s completion did not report queue lease loss", completion)
 			}
 
 			var status string

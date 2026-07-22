@@ -3,9 +3,11 @@ package channelops
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -107,6 +109,89 @@ func TestDiscoveryClientIngestBoundsResponseBody(t *testing.T) {
 	_, err := (HTTPDiscoveryClient{BaseURL: server.URL, Timeout: time.Second}).Ingest(context.Background(), request)
 	if err == nil || !strings.Contains(err.Error(), "response is too large") {
 		t.Fatalf("Ingest error = %v, want bounded response error", err)
+	}
+}
+
+func TestDiscoveryClientIngestEnforcesDedicatedTimeoutWithCustomClient(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		httpClient *http.Client
+	}{
+		{name: "zero client timeout", httpClient: &http.Client{}},
+		{name: "long client timeout", httpClient: &http.Client{Timeout: 5 * time.Second}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case <-r.Context().Done():
+				case <-time.After(300 * time.Millisecond):
+				}
+			}))
+			defer server.Close()
+
+			started := time.Now()
+			_, err := (HTTPDiscoveryClient{
+				BaseURL: server.URL, Timeout: 25 * time.Millisecond, HTTPClient: tt.httpClient,
+			}).Ingest(context.Background(), discoveryRequestForTest())
+			if err == nil || err.Error() != "discovery ingest request failed" {
+				t.Fatal("Ingest did not return the fixed request failure")
+			}
+			if elapsed := time.Since(started); elapsed >= 200*time.Millisecond {
+				t.Fatalf("Ingest elapsed = %s, dedicated timeout was not enforced", elapsed)
+			}
+		})
+	}
+}
+
+func TestDiscoveryClientIngestRejectsRedirectWithoutCallingTarget(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+	}{
+		{name: "temporary redirect", status: http.StatusTemporaryRedirect},
+		{name: "permanent redirect", status: http.StatusPermanentRedirect},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			request := discoveryRequestForTest()
+			var targetCalls atomic.Int32
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				targetCalls.Add(1)
+				writeDiscoveryResponse(t, w, request, nil)
+			}))
+			defer target.Close()
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL, tt.status)
+			}))
+			defer origin.Close()
+
+			_, err := (HTTPDiscoveryClient{
+				BaseURL: origin.URL,
+				Timeout: time.Second,
+				HTTPClient: &http.Client{CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+					return nil
+				}},
+			}).Ingest(context.Background(), request)
+			want := fmt.Sprintf("discovery ingest returned HTTP %d", tt.status)
+			if err == nil || err.Error() != want {
+				t.Fatal("Ingest did not reject the redirect response")
+			}
+			if targetCalls.Load() != 0 {
+				t.Fatalf("redirect target calls = %d, want 0", targetCalls.Load())
+			}
+		})
+	}
+}
+
+func TestDiscoveryClientIngestRejectsNonHTTPSchemes(t *testing.T) {
+	for _, baseURL := range []string{"ftp://example.test", "gopher://example.test"} {
+		t.Run(strings.Split(baseURL, ":")[0], func(t *testing.T) {
+			_, err := (HTTPDiscoveryClient{BaseURL: baseURL, Timeout: time.Second}).Ingest(
+				context.Background(), discoveryRequestForTest(),
+			)
+			if err == nil || err.Error() != "AUTOFLOW_BASE_URL is invalid for discovery ingestion" {
+				t.Fatal("Ingest did not reject the non-HTTP base scheme")
+			}
+		})
 	}
 }
 

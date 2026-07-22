@@ -511,8 +511,8 @@ func TestQuarantineFirstPreventsPromotionSideEffects(t *testing.T) {
 	if handleErr == nil || !strings.Contains(handleErr.Error(), "channel execution blocked") {
 		t.Fatalf("Handle error = %v, want channel execution blocked", handleErr)
 	}
-	if err := fixture.Store.MarkQueueFailedOrRetry(ctx, promote, handleErr.Error()); err != nil {
-		t.Fatalf("stale retry completion: %v", err)
+	if err := fixture.Store.MarkQueueFailedOrRetry(ctx, promote, handleErr.Error()); !errors.Is(err, ErrQueueLeaseLost) || err.Error() != "queue lease lost" {
+		t.Fatal("stale retry completion did not report queue lease loss")
 	}
 	requireQuarantinedPromotion(t, ctx, fixture, promote, 0)
 }
@@ -2826,36 +2826,36 @@ func TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel(t *testing.T) {
 	}{
 		{
 			name:          "matching payload is channel scoped",
-			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "bucket": "2026-05-21-18", "scheduler_bucket": "2026-05-21-18"},
 			storedChannel: &channelID,
 			claimable:     true,
 		},
 		{
 			name:          "missing payload channel is not global",
-			payload:       map[string]any{"source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			payload:       map[string]any{"source": "youtube_search", "bucket": "2026-05-21-18", "scheduler_bucket": "2026-05-21-18"},
 			storedChannel: &channelID,
 			claimable:     false,
 		},
 		{
 			name:          "malformed payload channel is not claimable",
-			payload:       map[string]any{"channel_id": "not-a-uuid", "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			payload:       map[string]any{"channel_id": "not-a-uuid", "source": "youtube_search", "bucket": "2026-05-21-18", "scheduler_bucket": "2026-05-21-18"},
 			storedChannel: &channelID,
 			claimable:     false,
 		},
 		{
 			name:          "mismatched payload channel is not claimable",
-			payload:       map[string]any{"channel_id": otherChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			payload:       map[string]any{"channel_id": otherChannelID, "source": "youtube_search", "bucket": "2026-05-21-18", "scheduler_bucket": "2026-05-21-18"},
 			storedChannel: &channelID,
 			claimable:     false,
 		},
 		{
 			name:      "nil stored channel is not claimable",
-			payload:   map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			payload:   map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "bucket": "2026-05-21-18", "scheduler_bucket": "2026-05-21-18"},
 			claimable: false,
 		},
 		{
 			name:          "disabled payload channel is not claimable",
-			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "bucket": "2026-05-21-18", "scheduler_bucket": "2026-05-21-18"},
 			storedChannel: &channelID,
 			claimable:     false,
 			blocked:       true,
@@ -2871,7 +2871,7 @@ func TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel(t *testing.T) {
 		},
 		{
 			name:          "halted payload channel is not claimable",
-			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "bucket": "2026-05-21-18", "scheduler_bucket": "2026-05-21-18"},
 			storedChannel: &channelID,
 			claimable:     false,
 			blocked:       true,
@@ -2888,7 +2888,7 @@ func TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel(t *testing.T) {
 		},
 		{
 			name:          "quarantined payload channel is not claimable",
-			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "bucket": "2026-05-21-18", "scheduler_bucket": "2026-05-21-18"},
 			storedChannel: &channelID,
 			claimable:     false,
 			blocked:       true,

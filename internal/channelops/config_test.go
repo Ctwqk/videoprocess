@@ -1,6 +1,8 @@
 package channelops
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -90,6 +92,46 @@ func TestValidateDiscoveryTimeoutRange(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate(%s): %v", timeout, err)
 		}
+	}
+}
+
+func TestLoadConfigStrictDiscoveryTimeoutEnv(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		value     string
+		want      time.Duration
+		wantError bool
+	}{
+		{name: "empty uses default", value: "", want: 120 * time.Second},
+		{name: "minimum", value: "30", want: 30 * time.Second},
+		{name: "maximum", value: "300", want: 300 * time.Second},
+		{name: "below minimum", value: "29", want: 29 * time.Second, wantError: true},
+		{name: "above maximum", value: "301", want: 301 * time.Second, wantError: true},
+		{name: "malformed", value: "not-an-integer", want: 120 * time.Second, wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS", tt.value)
+			t.Setenv("CHANNELOPS_LIVE_MODE", "false")
+			cfg := LoadConfig()
+			if cfg.DiscoveryTimeout != tt.want {
+				t.Fatalf("DiscoveryTimeout = %s, want %s", cfg.DiscoveryTimeout, tt.want)
+			}
+			err := cfg.Validate()
+			if tt.wantError {
+				if err == nil || !strings.Contains(err.Error(), "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS") {
+					t.Fatal("Validate did not reject discovery timeout environment value")
+				}
+				if tt.name == "malformed" {
+					if _, runnerErr := NewRunner(context.Background(), cfg); runnerErr == nil || !strings.Contains(runnerErr.Error(), "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS") {
+						t.Fatal("NewRunner did not reject malformed discovery timeout")
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
 	}
 }
 

@@ -30,7 +30,10 @@ type PlanResult struct {
 	EnqueueExecute bool
 }
 
-var ErrPromotionOutcomeUncertain = errors.New("promotion outcome uncertain")
+var (
+	ErrPromotionOutcomeUncertain = errors.New("promotion outcome uncertain")
+	ErrDiscoveryIngestFailed     = errors.New("discovery ingestion failed")
+)
 
 type promotionPreparation struct {
 	Operation PromotionOperationRow
@@ -161,38 +164,39 @@ func (h HandlerService) HandleIngestDiscovery(ctx context.Context, item QueueIte
 	}
 	observation, err := h.Discovery.Ingest(ctx, request)
 	if err != nil {
-		return err
+		return ErrDiscoveryIngestFailed
 	}
 	return validateDiscoveryObservation(request, observation)
 }
 
 func discoveryRequestFromQueueItem(item QueueItemRow) (DiscoveryIngestRequest, error) {
 	if item.Kind != QueueIngestDiscovery {
-		return DiscoveryIngestRequest{}, errors.New("discovery queue item kind is invalid")
+		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("kind is invalid")
+	}
+	if item.Status != QueueStatusRunning || item.LockedBy == nil || strings.TrimSpace(*item.LockedBy) == "" || item.LockedAt == nil {
+		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("running lease is invalid")
 	}
 	if !canonicalDiscoveryUUID(item.ID) {
-		return DiscoveryIngestRequest{}, errors.New("discovery queue item id is invalid")
+		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("id is invalid")
 	}
 	if item.ChannelProfileID == nil || !canonicalDiscoveryUUID(*item.ChannelProfileID) {
-		return DiscoveryIngestRequest{}, errors.New("discovery queue item stored channel is invalid")
+		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("stored channel is invalid")
 	}
 	payloadChannelID, ok := item.PayloadJSON["channel_id"].(string)
 	if !ok || payloadChannelID != *item.ChannelProfileID || !canonicalDiscoveryUUID(payloadChannelID) {
-		return DiscoveryIngestRequest{}, errors.New("discovery queue item channel identity is invalid")
+		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("channel identity is invalid")
 	}
 	source, ok := item.PayloadJSON["source"].(string)
 	if !ok || source != "youtube_search" {
-		return DiscoveryIngestRequest{}, errors.New("discovery queue item source is invalid")
+		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("source is invalid")
 	}
 	bucket, ok := item.PayloadJSON["scheduler_bucket"].(string)
 	if !ok || strings.TrimSpace(bucket) == "" || len(bucket) > 64 {
-		return DiscoveryIngestRequest{}, errors.New("discovery queue item scheduler_bucket is invalid")
+		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("scheduler_bucket is invalid")
 	}
-	if rawBucket, exists := item.PayloadJSON["bucket"]; exists {
-		payloadBucket, ok := rawBucket.(string)
-		if !ok || payloadBucket != bucket {
-			return DiscoveryIngestRequest{}, errors.New("discovery queue item bucket identity is invalid")
-		}
+	payloadBucket, ok := item.PayloadJSON["bucket"].(string)
+	if !ok || strings.TrimSpace(payloadBucket) == "" || payloadBucket != bucket {
+		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("bucket identity is invalid")
 	}
 	return DiscoveryIngestRequest{
 		QueueItemID:     item.ID,
@@ -200,6 +204,10 @@ func discoveryRequestFromQueueItem(item QueueItemRow) (DiscoveryIngestRequest, e
 		Source:          source,
 		SchedulerBucket: bucket,
 	}, nil
+}
+
+func discoveryQueueAuthorityError(message string) error {
+	return fmt.Errorf("%w: discovery queue item %s", ErrQueueAuthorityInvalid, message)
 }
 
 func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) error {

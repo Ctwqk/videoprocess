@@ -100,6 +100,52 @@ func TestNewRunnerHandlerServiceConfiguresAutoFlowClient(t *testing.T) {
 	}
 }
 
+func TestNewRunnerHandlerServiceConfiguresDiscoveryDirectly(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		mutate        func(*Config)
+		loadMalformed bool
+	}{
+		{name: "missing base URL", mutate: func(cfg *Config) { cfg.AutoFlowBaseURL = "  " }},
+		{name: "credential base URL", mutate: func(cfg *Config) { cfg.AutoFlowBaseURL = "http://user:password@api:8080" }},
+		{name: "query base URL", mutate: func(cfg *Config) { cfg.AutoFlowBaseURL = "http://api:8080?credential=secret" }},
+		{name: "invalid scheme", mutate: func(cfg *Config) { cfg.AutoFlowBaseURL = "ftp://api:8080" }},
+		{name: "invalid timeout", mutate: func(cfg *Config) { cfg.DiscoveryTimeout = 29 * time.Second }},
+		{name: "malformed timeout", loadMalformed: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			if tt.loadMalformed {
+				t.Setenv("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS", "not-an-integer")
+				cfg = LoadConfig()
+			}
+			cfg.LiveMode = false
+			if tt.mutate != nil {
+				tt.mutate(&cfg)
+			}
+			handler := newRunnerHandlerService(&Store{}, cfg)
+			if handler.Discovery != nil {
+				t.Fatal("Discovery client configured for invalid discovery settings")
+			}
+			if containsString(handler.ClaimableKinds(), QueueIngestDiscovery) {
+				t.Fatal("ClaimableKinds includes discovery for invalid discovery settings")
+			}
+			if err := handler.ReadinessError(); err != nil {
+				t.Fatalf("invalid optional discovery settings changed readiness: %v", err)
+			}
+		})
+	}
+}
+
+func TestNewRunnerHandlerServiceDiscoveryIgnoresUnrelatedConfigValidation(t *testing.T) {
+	cfg := validConfig()
+	cfg.DatabaseURL = ""
+	handler := newRunnerHandlerService(&Store{}, cfg)
+	if handler.Discovery == nil || !containsString(handler.ClaimableKinds(), QueueIngestDiscovery) {
+		t.Fatal("unrelated invalid config disabled valid discovery settings")
+	}
+}
+
 func TestRunnerDiscoveryQueueUsesLeaseAwareRetryAndCompletion(t *testing.T) {
 	ctx := context.Background()
 	for _, tt := range []struct {
@@ -109,8 +155,8 @@ func TestRunnerDiscoveryQueueUsesLeaseAwareRetryAndCompletion(t *testing.T) {
 		wantError  string
 	}{
 		{
-			name: "retry", client: &recordingDiscoveryClient{err: errors.New("discovery ingest request failed")},
-			wantStatus: QueueStatusQueued, wantError: "discovery ingest request failed",
+			name: "retry", client: &recordingDiscoveryClient{err: errors.New("credential=top-secret provider-title=private")},
+			wantStatus: QueueStatusQueued, wantError: "discovery ingestion failed",
 		},
 		{
 			name: "done", client: &recordingDiscoveryClient{}, wantStatus: QueueStatusSucceeded,
@@ -123,7 +169,7 @@ func TestRunnerDiscoveryQueueUsesLeaseAwareRetryAndCompletion(t *testing.T) {
 			channelID := fixture.ChannelID
 			queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
 				Kind: QueueIngestDiscovery, IdempotencyKey: "discovery-runner:" + tt.name + ":" + channelID,
-				Payload:  map[string]any{"channel_id": channelID, "source": "youtube_search", "scheduler_bucket": "2026-07-21-18"},
+				Payload:  map[string]any{"channel_id": channelID, "source": "youtube_search", "bucket": "2026-07-21-18", "scheduler_bucket": "2026-07-21-18"},
 				Priority: 80, ChannelProfileID: &channelID,
 			})
 			if err != nil {
@@ -153,7 +199,7 @@ func TestRunnerDiscoveryQueueUsesLeaseAwareRetryAndCompletion(t *testing.T) {
 				t.Fatalf("status = %q, want %q", status, tt.wantStatus)
 			}
 			if tt.wantError != "" && (lastError == nil || *lastError != tt.wantError) {
-				t.Fatalf("last_error = %v, want %q", lastError, tt.wantError)
+				t.Fatal("last_error was not the fixed discovery failure")
 			}
 			if tt.wantError == "" && lastError != nil {
 				t.Fatalf("last_error = %q, want nil", *lastError)
@@ -163,6 +209,72 @@ func TestRunnerDiscoveryQueueUsesLeaseAwareRetryAndCompletion(t *testing.T) {
 			}
 			if tt.client.calls != 1 {
 				t.Fatalf("client calls = %d, want 1", tt.client.calls)
+			}
+		})
+	}
+}
+
+func TestRunnerDiscoveryLeaseRaceCannotFinalizeReplacementLease(t *testing.T) {
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name        string
+		maxAttempts int
+		clientError bool
+	}{
+		{name: "done", maxAttempts: 3},
+		{name: "retry", maxAttempts: 3, clientError: true},
+		{name: "deadletter", maxAttempts: 1, clientError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			channelID := fixture.ChannelID
+			bucket := "2026-07-21-18"
+			queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+				Kind: QueueIngestDiscovery, IdempotencyKey: "discovery-runner-lease-race:" + tt.name + ":" + channelID,
+				Payload: map[string]any{
+					"channel_id": channelID, "source": "youtube_search", "bucket": bucket, "scheduler_bucket": bucket,
+				},
+				Priority: 80, ChannelProfileID: &channelID, MaxAttempts: tt.maxAttempts,
+			})
+			if err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+
+			client := &recordingDiscoveryClient{ingest: func(request DiscoveryIngestRequest) (DiscoveryObservation, error) {
+				if _, err := fixture.Store.Pool.Exec(ctx, `
+					UPDATE channel_ops_queue_items
+					SET locked_by = 'replacement-worker', locked_at = locked_at + INTERVAL '1 second'
+					WHERE id = $1::uuid AND status = $2
+				`, queueID, QueueStatusRunning); err != nil {
+					return DiscoveryObservation{}, err
+				}
+				if tt.clientError {
+					return DiscoveryObservation{}, errors.New("credential=top-secret provider-title=private")
+				}
+				return discoveryObservationForTest(request), nil
+			}}
+			handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+			handler.Discovery = client
+			runner := &Runner{Store: fixture.Store, Handlers: handler}
+			if err := runner.runOnce(ctx); !errors.Is(err, ErrQueueLeaseLost) || err.Error() != "queue lease lost" {
+				t.Fatal("runOnce did not return the queue lease lost sentinel")
+			}
+
+			var status string
+			var lockedBy *string
+			var lockedAt *time.Time
+			var lastError *string
+			var deadLetterAt *time.Time
+			if err := fixture.Store.Pool.QueryRow(ctx, `
+				SELECT status, locked_by, locked_at, last_error, dead_letter_at
+				FROM channel_ops_queue_items WHERE id = $1::uuid
+			`, queueID).Scan(&status, &lockedBy, &lockedAt, &lastError, &deadLetterAt); err != nil {
+				t.Fatalf("select queue: %v", err)
+			}
+			if status != QueueStatusRunning || lockedBy == nil || *lockedBy != "replacement-worker" || lockedAt == nil || lastError != nil || deadLetterAt != nil {
+				t.Fatal("stale runner changed the replacement lease")
 			}
 		})
 	}

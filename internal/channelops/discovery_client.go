@@ -78,7 +78,9 @@ func (c HTTPDiscoveryClient) Ingest(ctx context.Context, request DiscoveryIngest
 	if err != nil {
 		return DiscoveryObservation{}, errors.New("discovery ingest request could not be encoded")
 	}
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	requestCtx, cancel := context.WithTimeout(ctx, c.timeout())
+	defer cancel()
+	httpRequest, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return DiscoveryObservation{}, errors.New("discovery ingest request could not be created")
 	}
@@ -129,10 +131,15 @@ func (c HTTPDiscoveryClient) Ingest(ctx context.Context, request DiscoveryIngest
 }
 
 func (c HTTPDiscoveryClient) httpClient() *http.Client {
+	client := &http.Client{Timeout: c.timeout()}
 	if c.HTTPClient != nil {
-		return c.HTTPClient
+		clone := *c.HTTPClient
+		client = &clone
 	}
-	return &http.Client{Timeout: c.timeout()}
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return client
 }
 
 func (c HTTPDiscoveryClient) timeout() time.Duration {
@@ -144,7 +151,7 @@ func (c HTTPDiscoveryClient) timeout() time.Duration {
 
 func discoveryEndpoint(baseURL string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", errors.New("AUTOFLOW_BASE_URL is invalid for discovery ingestion")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/") + discoveryIngestPath

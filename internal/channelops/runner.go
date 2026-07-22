@@ -55,7 +55,7 @@ func newRunnerHandlerService(st *Store, cfg Config, pdsOverride ...PDSDecider) H
 	youtube := YouTubeManagerClient{BaseURL: cfg.YouTubeManagerURL, Timeout: 20 * time.Second}
 	autoflow := HTTPAutoFlowClient{BaseURL: cfg.AutoFlowBaseURL, Timeout: cfg.AutoFlowTimeout}
 	var discovery DiscoveryClient
-	if cfg.Validate() == nil {
+	if discoveryConfigValid(cfg) {
 		discovery = HTTPDiscoveryClient{
 			BaseURL:    cfg.AutoFlowBaseURL,
 			Timeout:    cfg.DiscoveryTimeout,
@@ -66,6 +66,14 @@ func newRunnerHandlerService(st *Store, cfg Config, pdsOverride ...PDSDecider) H
 		Store: st, PDS: pds, AutoFlow: autoflow, YouTube: youtube, Discovery: discovery,
 		Alerts: NewAlertSink(cfg), Config: cfg,
 	}
+}
+
+func discoveryConfigValid(cfg Config) bool {
+	if cfg.discoveryTimeoutParseFailed || !validDiscoveryTimeout(cfg.DiscoveryTimeout) {
+		return false
+	}
+	_, err := discoveryEndpoint(cfg.AutoFlowBaseURL)
+	return err == nil
 }
 
 func (r *Runner) Run(ctx context.Context) error {
