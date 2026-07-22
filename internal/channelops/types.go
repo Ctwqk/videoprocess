@@ -223,6 +223,23 @@ type PublicationRow struct {
 	UpdatedAt             time.Time
 }
 
+type MetricScheduleRow struct {
+	ID                  string
+	PublicationID       string
+	SnapshotStage       string
+	EffectiveStartAt    time.Time
+	DueAt               time.Time
+	GraceUntil          time.Time
+	Status              string
+	AttemptCount        int
+	LastAttemptAt       *time.Time
+	CompletedAt         *time.Time
+	AvailableFieldsJSON []string
+	LastErrorCode       *string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
 type PromotionOperationRow struct {
 	ID                    string
 	PublicationID         string

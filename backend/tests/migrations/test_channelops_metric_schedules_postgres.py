@@ -143,7 +143,7 @@ async def _insert_historical_publication(
         """,
         uuid.uuid4(),
         f"collect_metrics:{publication_id}:poll:0",
-        publication_id,
+        str(publication_id),
         channel_id,
     )
 

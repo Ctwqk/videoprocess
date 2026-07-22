@@ -136,9 +136,6 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 	if scheduledAt.IsZero() {
 		scheduledAt = now
 	}
-	if metricsDelay <= 0 {
-		metricsDelay = time.Hour
-	}
 	status := "scheduled"
 	var publicAt *time.Time
 	_, err = s.db().Exec(ctx, `
@@ -169,16 +166,13 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 	if err != nil {
 		return err
 	}
-	_, err = s.Enqueue(ctx, EnqueueOptions{
-		Kind:              QueueCollectMetrics,
-		IdempotencyKey:    fmt.Sprintf("collect_metrics:%s:poll:0", publication.ID),
-		Payload:           map[string]any{"publication_id": publication.ID, "metrics_poll_count": 0},
-		Priority:          90,
-		RunAfter:          scheduledAt.UTC().Add(metricsDelay),
-		ChannelProfileID:  &channelProfileID,
-		ParentQueueItemID: parentID,
-	})
-	if err != nil {
+	if err := s.EnsurePublicationMetricSchedules(
+		ctx,
+		publication.ID,
+		channelProfileID,
+		parentQueueItemID,
+		scheduledAt,
+	); err != nil {
 		return err
 	}
 	_, err = s.Enqueue(ctx, EnqueueOptions{

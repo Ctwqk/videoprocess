@@ -147,7 +147,7 @@ git commit -m "feat: persist publication metric schedules"
 - Produces: `MetricStageSpecs() []MetricStageSpec`.
 - Produces: `(*Store).EnsurePublicationMetricSchedules(ctx, publicationID, channelID, parentQueueItemID string, effectiveStart time.Time) error`.
 
-- [ ] **Step 1: Write failing stage-policy tests**
+- [x] **Step 1: Write failing stage-policy tests**
 
 Require this exact table:
 
@@ -163,7 +163,7 @@ want := []MetricStageSpec{
 
 Also assert the returned slice cannot mutate package state.
 
-- [ ] **Step 2: Run the unit test and verify RED**
+- [x] **Step 2: Run the unit test and verify RED**
 
 Run:
 
@@ -173,12 +173,12 @@ go test ./internal/channelops -run 'TestMetricStageSpecs' -count=1
 
 Expected: compile failure because the stage types/functions do not exist.
 
-- [ ] **Step 3: Implement immutable stage definitions**
+- [x] **Step 3: Implement immutable stage definitions**
 
 Return a new slice on each call. Keep timing constants in
 `metric_schedules.go`; do not make them environment-dependent in this phase.
 
-- [ ] **Step 4: Add failing promotion integration assertions**
+- [x] **Step 4: Add failing promotion integration assertions**
 
 Extend the existing successful promotion fixture to assert exactly five
 schedule rows and five queue rows. Each queue payload must contain:
@@ -196,7 +196,7 @@ Assert `run_after == due_at`, the timing table is exact, all rows share the
 confirmed `scheduled_at` as `effective_start_at`, and replaying finalization
 does not change either count.
 
-- [ ] **Step 5: Replace the single legacy automatic enqueue**
+- [x] **Step 5: Replace the single legacy automatic enqueue**
 
 Implement `EnsurePublicationMetricSchedules` with `INSERT ... ON CONFLICT DO
 NOTHING`, select the canonical row, and enqueue only pending schedules with:
@@ -211,7 +211,7 @@ Call it from `PromotePublication` after the task transition and before
 reconciliation enqueue. Remove only the automatic `poll:0` enqueue; the
 legacy handler path remains.
 
-- [ ] **Step 6: Run stage and promotion tests**
+- [x] **Step 6: Run stage and promotion tests**
 
 Run:
 
@@ -223,7 +223,7 @@ go test ./internal/channelops -run \
 Expected: exact five-stage assertions pass and existing promotion fencing is
 unchanged.
 
-- [ ] **Step 7: Commit schedule creation**
+- [x] **Step 7: Commit schedule creation**
 
 ```bash
 git add internal/channelops/metric_schedules.go \

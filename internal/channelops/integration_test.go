@@ -307,7 +307,7 @@ func TestRunLiveSmokeFreshSmokeCompletesWithDelayedQueue(t *testing.T) {
 	}
 }
 
-func TestPromotePublicationUsesConfiguredMetricsDelay(t *testing.T) {
+func TestPromotePublicationCreatesFiveMetricSchedules(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
@@ -317,13 +317,15 @@ func TestPromotePublicationUsesConfiguredMetricsDelay(t *testing.T) {
 
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
-	handler.Config.MetricsPollDelayMinutes = 7
 	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
 		t.Fatalf("RunTick: %v", err)
 	}
 	item := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
 	if err := handler.HandlePromotePublication(ctx, item); err != nil {
 		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := handler.HandlePromotePublication(ctx, item); err != nil {
+		t.Fatalf("replay HandlePromotePublication: %v", err)
 	}
 	if err := fixture.Store.MarkQueueDone(ctx, item); err != nil {
 		t.Fatalf("MarkQueueDone: %v", err)
@@ -335,17 +337,98 @@ func TestPromotePublicationUsesConfiguredMetricsDelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse scheduled_at: %v", err)
 	}
-	var runAfter time.Time
+	rows, err := fixture.Store.Pool.Query(ctx, `
+		SELECT s.id::text, s.snapshot_stage, s.effective_start_at, s.due_at,
+		       s.grace_until, s.status, q.idempotency_key, q.payload_json, q.run_after
+		FROM publication_metric_schedules AS s
+		JOIN channel_ops_queue_items AS q
+		  ON q.kind = $2
+		 AND q.payload_json ->> 'metric_schedule_id' = s.id::text
+		WHERE s.publication_id = $1::uuid
+		ORDER BY array_position(ARRAY['1h','6h','24h','72h','7d'], s.snapshot_stage)
+	`, publicationID, QueueCollectMetrics)
+	if err != nil {
+		t.Fatalf("select metric schedules: %v", err)
+	}
+	defer rows.Close()
+
+	specs := MetricStageSpecs()
+	seen := 0
+	for rows.Next() {
+		var scheduleID, stage, status, idempotencyKey string
+		var effectiveStart, dueAt, graceUntil, runAfter time.Time
+		var payloadJSON []byte
+		if err := rows.Scan(
+			&scheduleID,
+			&stage,
+			&effectiveStart,
+			&dueAt,
+			&graceUntil,
+			&status,
+			&idempotencyKey,
+			&payloadJSON,
+			&runAfter,
+		); err != nil {
+			t.Fatalf("scan metric schedule: %v", err)
+		}
+		if seen >= len(specs) {
+			t.Fatalf("unexpected extra metric stage %q", stage)
+		}
+		spec := specs[seen]
+		if stage != spec.Stage {
+			t.Fatalf("stage[%d] = %q, want %q", seen, stage, spec.Stage)
+		}
+		if status != "pending" {
+			t.Fatalf("stage %s status = %q, want pending", stage, status)
+		}
+		if !effectiveStart.Equal(scheduledAt.UTC()) {
+			t.Fatalf("stage %s effective_start_at = %s, want %s", stage, effectiveStart, scheduledAt)
+		}
+		if want := scheduledAt.UTC().Add(spec.DueAfter); !dueAt.Equal(want) {
+			t.Fatalf("stage %s due_at = %s, want %s", stage, dueAt, want)
+		}
+		if want := scheduledAt.UTC().Add(spec.GraceAfter); !graceUntil.Equal(want) {
+			t.Fatalf("stage %s grace_until = %s, want %s", stage, graceUntil, want)
+		}
+		if !runAfter.Equal(dueAt) {
+			t.Fatalf("stage %s run_after = %s, want due_at %s", stage, runAfter, dueAt)
+		}
+		wantKey := fmt.Sprintf("collect_metrics:%s:stage:%s:attempt:0", publicationID, stage)
+		if idempotencyKey != wantKey {
+			t.Fatalf("stage %s key = %q, want %q", stage, idempotencyKey, wantKey)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+			t.Fatalf("decode stage %s payload: %v", stage, err)
+		}
+		if firstString(payload, "publication_id") != publicationID ||
+			firstString(payload, "metric_schedule_id") != scheduleID ||
+			firstString(payload, "snapshot_stage") != stage ||
+			intOrDefault(payload["metrics_poll_count"], -1) != 0 {
+			t.Fatalf("stage %s payload = %#v", stage, payload)
+		}
+		seen++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate metric schedules: %v", err)
+	}
+	if seen != len(specs) {
+		t.Fatalf("metric schedule count = %d, want %d", seen, len(specs))
+	}
+	if got := fixture.CountRows(ctx, "publication_metric_schedules"); got != 5 {
+		t.Fatalf("metric schedule count after replay = %d, want 5", got)
+	}
+	var metricQueueCount int
 	if err := fixture.Store.Pool.QueryRow(ctx, `
-		SELECT run_after
+		SELECT count(*)
 		FROM channel_ops_queue_items
 		WHERE kind = $1
-		  AND idempotency_key = $2
-	`, QueueCollectMetrics, fmt.Sprintf("collect_metrics:%s:poll:0", publicationID)).Scan(&runAfter); err != nil {
-		t.Fatalf("select collect_metrics run_after: %v", err)
+		  AND payload_json ->> 'publication_id' = $2
+	`, QueueCollectMetrics, publicationID).Scan(&metricQueueCount); err != nil {
+		t.Fatalf("count metric queue rows: %v", err)
 	}
-	if want := scheduledAt.UTC().Add(7 * time.Minute); !runAfter.Equal(want) {
-		t.Fatalf("collect_metrics run_after = %s, want %s", runAfter, want)
+	if metricQueueCount != 5 {
+		t.Fatalf("metric queue count after replay = %d, want 5", metricQueueCount)
 	}
 }
 
@@ -2545,6 +2628,13 @@ func (f *ChannelOpsFixture) CountRows(ctx context.Context, table string) int {
 			SELECT count(*)
 			FROM feedback_snapshots f
 			JOIN publication_records p ON p.id = f.publication_id
+			JOIN production_tasks t ON t.id = p.production_task_id
+			WHERE t.channel_profile_id = $1::uuid
+		`,
+		"publication_metric_schedules": `
+			SELECT count(*)
+			FROM publication_metric_schedules s
+			JOIN publication_records p ON p.id = s.publication_id
 			JOIN production_tasks t ON t.id = p.production_task_id
 			WHERE t.channel_profile_id = $1::uuid
 		`,
