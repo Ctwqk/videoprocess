@@ -17,9 +17,12 @@ required_lines=(
   "go-version-file: go.mod"
   'node-version: "22"'
   "CHANNEL_OPS_POSTGRES_TEST_URL:"
+  "CHANNEL_OPS_GO_POSTGRES_TEST_URL:"
   "uv sync --frozen --extra dev"
   ".venv/bin/alembic upgrade head"
   ".venv/bin/python -m pytest"
+  'CHANNELOPS_REQUIRE_DATABASE="1"'
+  'go test -count=1 ./internal/channelops'
   "go test ./..."
   "npm run build"
   "bash tests/test_vp_deploy_sync_extension.sh"

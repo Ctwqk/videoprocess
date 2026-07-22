@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2672,6 +2673,9 @@ func NewChannelOpsFixture(t *testing.T) *ChannelOpsFixture {
 	cfg := LoadConfig()
 	store, err := OpenStore(context.Background(), cfg.DatabaseURL)
 	if err != nil {
+		if os.Getenv("CHANNELOPS_REQUIRE_DATABASE") == "1" {
+			t.Fatalf("required ChannelOps integration DATABASE_URL %q is unreachable: %v", cfg.DatabaseURL, err)
+		}
 		t.Skipf("ChannelOps integration test requires reachable DATABASE_URL %q: %v", cfg.DatabaseURL, err)
 	}
 	store.Now = func() time.Time { return time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC) }
