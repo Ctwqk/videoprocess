@@ -74,7 +74,7 @@ vp_require_github_actions_success() {
   filter='if (.workflow_runs | length) == 0 then
     ["missing", "", "", "", ""] | @tsv
   else
-    (.workflow_runs | max_by(.run_attempt // 0)) as $run |
+    (.workflow_runs | max_by([.run_number // 0, .run_attempt // 0])) as $run |
     ["found", $run.status, ($run.conclusion // ""), $run.head_sha, ($run.id | tostring)] | @tsv
   end'
   local record

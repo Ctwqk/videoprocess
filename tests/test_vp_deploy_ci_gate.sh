@@ -16,6 +16,14 @@ cat >"$TEST_ROOT/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'gh|%s\n' "$*" >>"$TRACE"
+jq_filter=""
+while [[ "$#" -gt 0 ]]; do
+  if [[ "$1" == "--jq" ]]; then
+    shift
+    jq_filter="${1:-}"
+  fi
+  shift
+done
 case "${GH_SCENARIO:-success}" in
   success)
     printf 'found\tcompleted\tsuccess\t%s\t101\n' "$SHA"
@@ -31,6 +39,13 @@ case "${GH_SCENARIO:-success}" in
     ;;
   mismatch)
     printf 'found\tcompleted\tsuccess\t%s\t104\n' "$OTHER_SHA"
+    ;;
+  latest_failed)
+    if [[ "$jq_filter" == *'.run_number'* ]]; then
+      printf 'found\tcompleted\tfailure\t%s\t106\n' "$SHA"
+    else
+      printf 'found\tcompleted\tsuccess\t%s\t105\n' "$SHA"
+    fi
     ;;
   api_error)
     exit 1
@@ -110,7 +125,7 @@ assert_gate_before_build build_vp_app_images
 assert_gate_before_build build_feature_aggregator_images
 assert_gate_before_build build_pds_images
 
-for scenario in queued failed missing mismatch api_error; do
+for scenario in queued failed missing mismatch api_error latest_failed; do
   assert_rejected_without_build "$scenario"
 done
 
