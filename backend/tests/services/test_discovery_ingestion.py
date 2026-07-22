@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -33,6 +33,7 @@ from app.services.discovery_ingestion import (
 
 
 ProviderHook = Callable[[], Awaitable[list[dict[str, Any]]]]
+LEASED_AT = datetime(2026, 7, 21, 18, 0, 0, 123456, tzinfo=timezone.utc)
 
 
 class FakeDiscoveryYouTubeClient:
@@ -139,6 +140,9 @@ async def _seed_request(
                 "scheduler_bucket": "2026-07-21-18",
             },
             status="running",
+            attempt_count=1,
+            locked_by="discovery-service-runner",
+            locked_at=LEASED_AT,
         )
         db.add(queue_item)
         await db.commit()
@@ -148,6 +152,9 @@ async def _seed_request(
                 queue_item_id=queue_item.id,
                 source="youtube_search",
                 scheduler_bucket="2026-07-21-18",
+                attempt_count=1,
+                locked_by="discovery-service-runner",
+                locked_at=LEASED_AT,
             ),
             lanes,
         )
@@ -220,6 +227,64 @@ async def test_discovery_ingestion_rejects_disabled_or_invalid_policy_before_pro
             await service.ingest(db, request, now)
 
     assert str(exc_info.value) == expected_code
+    assert client.requests == []
+    async with discovery_harness.session_factory() as db:
+        runs = (await db.execute(select(DiscoveryIngestionRun))).scalars().all()
+    assert runs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"attempt_count": 0},
+        {"locked_by": "   "},
+        {"locked_by": "x" * 256},
+        {"locked_at": datetime(2026, 7, 21, 18, 0)},
+    ],
+)
+async def test_discovery_ingestion_rejects_invalid_lease_token_before_provider(
+    discovery_harness: DiscoveryHarness,
+    changes: dict[str, Any],
+) -> None:
+    now = datetime(2026, 7, 21, 18, 5, tzinfo=timezone.utc)
+    request, _ = await _seed_request(discovery_harness)
+    client = FakeDiscoveryYouTubeClient([])
+    service = DiscoveryIngestionService(youtube_client=client)
+
+    async with discovery_harness.session_factory() as db:
+        with pytest.raises(ValueError):
+            await service.ingest(db, replace(request, **changes), now)
+
+    assert client.requests == []
+    async with discovery_harness.session_factory() as db:
+        runs = (await db.execute(select(DiscoveryIngestionRun))).scalars().all()
+    assert runs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"attempt_count": 2},
+        {"locked_by": "replacement-runner"},
+        {"locked_at": LEASED_AT + timedelta(microseconds=1)},
+    ],
+)
+async def test_discovery_ingestion_revalidates_exact_queue_lease_before_provider(
+    discovery_harness: DiscoveryHarness,
+    changes: dict[str, Any],
+) -> None:
+    now = datetime(2026, 7, 21, 18, 5, tzinfo=timezone.utc)
+    request, _ = await _seed_request(discovery_harness)
+    client = FakeDiscoveryYouTubeClient([])
+    service = DiscoveryIngestionService(youtube_client=client)
+
+    async with discovery_harness.session_factory() as db:
+        with pytest.raises(DiscoveryIngestionAuthorityError) as exc_info:
+            await service.ingest(db, replace(request, **changes), now)
+
+    assert str(exc_info.value) == "queue_authority_changed"
     assert client.requests == []
     async with discovery_harness.session_factory() as db:
         runs = (await db.execute(select(DiscoveryIngestionRun))).scalars().all()

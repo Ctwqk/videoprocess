@@ -173,7 +173,7 @@ func discoveryRequestFromQueueItem(item QueueItemRow) (DiscoveryIngestRequest, e
 	if item.Kind != QueueIngestDiscovery {
 		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("kind is invalid")
 	}
-	if item.Status != QueueStatusRunning || item.LockedBy == nil || strings.TrimSpace(*item.LockedBy) == "" || item.LockedAt == nil {
+	if item.Status != QueueStatusRunning || item.AttemptCount < 1 || item.LockedBy == nil || strings.TrimSpace(*item.LockedBy) == "" || len(*item.LockedBy) > 255 || item.LockedAt == nil || item.LockedAt.IsZero() {
 		return DiscoveryIngestRequest{}, discoveryQueueAuthorityError("running lease is invalid")
 	}
 	if !canonicalDiscoveryUUID(item.ID) {
@@ -203,6 +203,9 @@ func discoveryRequestFromQueueItem(item QueueItemRow) (DiscoveryIngestRequest, e
 		ChannelID:       payloadChannelID,
 		Source:          source,
 		SchedulerBucket: bucket,
+		AttemptCount:    item.AttemptCount,
+		LockedBy:        *item.LockedBy,
+		LockedAt:        *item.LockedAt,
 	}, nil
 }
 

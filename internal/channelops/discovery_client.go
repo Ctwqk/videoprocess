@@ -26,10 +26,13 @@ type DiscoveryClient interface {
 }
 
 type DiscoveryIngestRequest struct {
-	QueueItemID     string `json:"queue_item_id"`
-	ChannelID       string `json:"channel_id"`
-	Source          string `json:"source"`
-	SchedulerBucket string `json:"scheduler_bucket"`
+	QueueItemID     string    `json:"queue_item_id"`
+	ChannelID       string    `json:"channel_id"`
+	Source          string    `json:"source"`
+	SchedulerBucket string    `json:"scheduler_bucket"`
+	AttemptCount    int       `json:"attempt_count"`
+	LockedBy        string    `json:"locked_by"`
+	LockedAt        time.Time `json:"locked_at"`
 }
 
 type DiscoveryObservation struct {
@@ -170,6 +173,15 @@ func validateDiscoveryRequest(request DiscoveryIngestRequest) error {
 	}
 	if strings.TrimSpace(request.SchedulerBucket) == "" || len(request.SchedulerBucket) > 64 {
 		return errors.New("discovery ingest scheduler_bucket is invalid")
+	}
+	if request.AttemptCount < 1 {
+		return errors.New("discovery ingest attempt_count is invalid")
+	}
+	if strings.TrimSpace(request.LockedBy) == "" || len(request.LockedBy) > 255 {
+		return errors.New("discovery ingest locked_by is invalid")
+	}
+	if request.LockedAt.IsZero() {
+		return errors.New("discovery ingest locked_at is invalid")
 	}
 	return nil
 }

@@ -103,12 +103,21 @@ def _has_discovery_queue_authority(
         and queue_item.status == "running"
         and bool((queue_item.locked_by or "").strip())
         and queue_item.locked_at is not None
+        and queue_item.attempt_count == data.attempt_count
+        and queue_item.locked_by == data.locked_by
+        and _queue_locked_at_utc(queue_item.locked_at) == data.locked_at
         and queue_item.channel_profile_id == data.channel_id
         and isinstance(payload, dict)
         and payload.get("channel_id") == str(data.channel_id)
         and payload.get("source") == data.source
         and payload.get("scheduler_bucket") == data.scheduler_bucket
     )
+
+
+def _queue_locked_at_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 @router.post(
@@ -148,6 +157,9 @@ async def ingest_discovery(
                 queue_item_id=data.queue_item_id,
                 source=data.source,
                 scheduler_bucket=data.scheduler_bucket,
+                attempt_count=data.attempt_count,
+                locked_by=data.locked_by,
+                locked_at=data.locked_at,
             ),
             now=Clock().now(),
         )

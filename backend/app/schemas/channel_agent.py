@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
 
@@ -134,6 +134,9 @@ class DiscoveryIngestionRequest(BaseModel):
     queue_item_id: UUID
     source: Literal["youtube_search"]
     scheduler_bucket: str = Field(min_length=1, max_length=64)
+    attempt_count: int = Field(ge=1, strict=True)
+    locked_by: str = Field(min_length=1, max_length=255)
+    locked_at: datetime
 
     @field_validator("scheduler_bucket")
     @classmethod
@@ -141,6 +144,20 @@ class DiscoveryIngestionRequest(BaseModel):
         if not value.strip():
             raise ValueError("scheduler_bucket must be nonblank")
         return value
+
+    @field_validator("locked_by")
+    @classmethod
+    def locked_by_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("locked_by must be nonblank")
+        return value
+
+    @field_validator("locked_at")
+    @classmethod
+    def locked_at_must_be_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("locked_at must include a timezone")
+        return value.astimezone(timezone.utc)
 
 
 class DiscoveryIngestionResponse(BaseModel):

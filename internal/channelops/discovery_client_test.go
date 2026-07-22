@@ -33,6 +33,9 @@ func TestDiscoveryClientIngestPostsStrictRequest(t *testing.T) {
 			"channel_id":       request.ChannelID,
 			"source":           "youtube_search",
 			"scheduler_bucket": request.SchedulerBucket,
+			"attempt_count":    float64(request.AttemptCount),
+			"locked_by":        request.LockedBy,
+			"locked_at":        request.LockedAt.Format(time.RFC3339Nano),
 		}
 		if !mapsEqual(got, want) {
 			t.Fatalf("request body = %#v, want %#v", got, want)
@@ -48,6 +51,32 @@ func TestDiscoveryClientIngestPostsStrictRequest(t *testing.T) {
 	}
 	if observation.RunID != "00000000-0000-0000-0000-000000000003" {
 		t.Fatalf("RunID = %q", observation.RunID)
+	}
+}
+
+func TestDiscoveryClientIngestRejectsInvalidLeaseToken(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*DiscoveryIngestRequest)
+		wantErr string
+	}{
+		{name: "missing attempt", mutate: func(request *DiscoveryIngestRequest) { request.AttemptCount = 0 }, wantErr: "attempt_count"},
+		{name: "negative attempt", mutate: func(request *DiscoveryIngestRequest) { request.AttemptCount = -1 }, wantErr: "attempt_count"},
+		{name: "missing owner", mutate: func(request *DiscoveryIngestRequest) { request.LockedBy = "" }, wantErr: "locked_by"},
+		{name: "blank owner", mutate: func(request *DiscoveryIngestRequest) { request.LockedBy = "   " }, wantErr: "locked_by"},
+		{name: "long owner", mutate: func(request *DiscoveryIngestRequest) { request.LockedBy = strings.Repeat("x", 256) }, wantErr: "locked_by"},
+		{name: "missing timestamp", mutate: func(request *DiscoveryIngestRequest) { request.LockedAt = time.Time{} }, wantErr: "locked_at"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := discoveryRequestForTest()
+			tt.mutate(&request)
+			_, err := (HTTPDiscoveryClient{BaseURL: "https://example.test", Timeout: time.Second}).Ingest(context.Background(), request)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Ingest error = %v, want %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -201,6 +230,9 @@ func discoveryRequestForTest() DiscoveryIngestRequest {
 		ChannelID:       "00000000-0000-0000-0000-000000000002",
 		Source:          "youtube_search",
 		SchedulerBucket: "2026-07-21-18",
+		AttemptCount:    3,
+		LockedBy:        "discovery-test-worker",
+		LockedAt:        time.Date(2026, 7, 21, 18, 0, 0, 123456000, time.UTC),
 	}
 }
 

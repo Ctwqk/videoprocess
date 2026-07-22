@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -82,6 +82,7 @@ async def _channel_and_queue(
     payload: object | None = None,
     queue_locked_by: str | None = "discovery-runner",
     queue_locked_at: datetime | None = LEASED_AT,
+    queue_attempt_count: int = 1,
 ) -> tuple[ChannelProfile, ChannelOpsQueueItem]:
     channel = ChannelProfile(
         name="Discovery API",
@@ -97,6 +98,7 @@ async def _channel_and_queue(
         idempotency_key=f"ingest_discovery:{uuid.uuid4()}",
         channel_profile_id=queue_channel_id or channel.id,
         status=queue_status,
+        attempt_count=queue_attempt_count,
         locked_by=queue_locked_by,
         locked_at=queue_locked_at,
         payload_json=payload if payload is not None else {
@@ -110,12 +112,15 @@ async def _channel_and_queue(
     return channel, queue
 
 
-def _request(channel: ChannelProfile, queue: ChannelOpsQueueItem) -> dict[str, str]:
+def _request(channel: ChannelProfile, queue: ChannelOpsQueueItem) -> dict[str, object]:
     return {
         "channel_id": str(channel.id),
         "queue_item_id": str(queue.id),
         "source": "youtube_search",
         "scheduler_bucket": "2026-07-21-18",
+        "attempt_count": 1,
+        "locked_by": "discovery-runner",
+        "locked_at": LEASED_AT.isoformat(),
     }
 
 
@@ -137,6 +142,9 @@ async def test_discovery_ingest_rejects_missing_queue_before_provider_call(api_s
         "queue_item_id": str(uuid.uuid4()),
         "source": "youtube_search",
         "scheduler_bucket": "2026-07-21-18",
+        "attempt_count": 1,
+        "locked_by": "discovery-runner",
+        "locked_at": LEASED_AT.isoformat(),
     }
 
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
@@ -225,6 +233,7 @@ async def test_discovery_ingest_rejects_missing_channel_before_provider_call(api
         idempotency_key=f"ingest_discovery:{uuid.uuid4()}",
         channel_profile_id=missing_channel_id,
         status="running",
+        attempt_count=1,
         locked_by="discovery-runner",
         locked_at=LEASED_AT,
         payload_json={
@@ -248,6 +257,9 @@ async def test_discovery_ingest_rejects_missing_channel_before_provider_call(api
         "queue_item_id": str(queue.id),
         "source": "youtube_search",
         "scheduler_bucket": "2026-07-21-18",
+        "attempt_count": 1,
+        "locked_by": "discovery-runner",
+        "locked_at": LEASED_AT.isoformat(),
     }
 
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
@@ -309,6 +321,58 @@ async def test_discovery_ingest_rejects_missing_or_blank_queue_lease_before_prov
     assert response.json() == {"detail": "discovery_queue_authority_invalid"}
     assert factory_calls == 0
     assert provider_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("attempt_count", 2),
+        ("locked_by", "replacement-runner"),
+        ("locked_at", (LEASED_AT + timedelta(microseconds=1)).isoformat()),
+    ],
+)
+async def test_discovery_ingest_rejects_exact_lease_token_mismatch_before_provider(
+    api_session,
+    monkeypatch,
+    field,
+    value,
+):
+    channel, queue = await _channel_and_queue(api_session)
+    factory_calls = 0
+    provider_calls = 0
+
+    def fake_client():
+        nonlocal factory_calls
+        factory_calls += 1
+        return object()
+
+    async def fake_ingest_channel(self, db, channel_id: str, now):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("provider must not be called for a stale queue lease token")
+
+    monkeypatch.setattr(channel_agent_api, "build_youtube_manager_client", fake_client)
+    monkeypatch.setattr(
+        discovery_ingestion.YouTubeTrendIngester,
+        "ingest_channel",
+        fake_ingest_channel,
+    )
+    request = _request(channel, queue)
+    request[field] = value
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(api_session)),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(DISCOVERY_PATH, json=request)
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "discovery_queue_authority_invalid"}
+    assert factory_calls == 0
+    assert provider_calls == 0
+    runs = (await api_session.execute(select(DiscoveryIngestionRun))).scalars().all()
+    assert runs == []
 
 
 @pytest.mark.asyncio
@@ -505,7 +569,48 @@ async def test_discovery_ingest_maps_service_errors_without_provider_details(
     ],
 )
 async def test_discovery_ingest_request_schema_is_strict(api_session, payload):
+    payload = {
+        "attempt_count": 1,
+        "locked_by": "discovery-runner",
+        "locked_at": LEASED_AT.isoformat(),
+        **payload,
+    }
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
         response = await client.post(DISCOVERY_PATH, json=payload)
 
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_discovery_ingest_request_schema_rejects_invalid_lease_tokens(api_session):
+    valid = {
+        "channel_id": str(uuid.uuid4()),
+        "queue_item_id": str(uuid.uuid4()),
+        "source": "youtube_search",
+        "scheduler_bucket": "bucket",
+        "attempt_count": 1,
+        "locked_by": "discovery-runner",
+        "locked_at": LEASED_AT.isoformat(),
+    }
+    invalid = []
+    for missing in ("attempt_count", "locked_by", "locked_at"):
+        payload = dict(valid)
+        del payload[missing]
+        invalid.append(payload)
+    invalid.extend(
+        [
+            {**valid, "attempt_count": 0},
+            {**valid, "attempt_count": True},
+            {**valid, "locked_by": "   "},
+            {**valid, "locked_by": "x" * 256},
+            {**valid, "locked_at": "2026-07-21T18:00:00"},
+        ]
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_app(api_session)),
+        base_url="http://test",
+    ) as client:
+        for payload in invalid:
+            response = await client.post(DISCOVERY_PATH, json=payload)
+            assert response.status_code == 422, payload

@@ -19,7 +19,11 @@ from app.channel_agent.trend_ingesters.youtube_search import (
     TrendProviderError,
     YouTubeTrendIngester,
 )
-from app.models.channel_agent import ChannelProfile, DiscoveryIngestionRun
+from app.models.channel_agent import (
+    ChannelOpsQueueItem,
+    ChannelProfile,
+    DiscoveryIngestionRun,
+)
 
 
 SOURCE_YOUTUBE_SEARCH = "youtube_search"
@@ -33,6 +37,9 @@ class DiscoveryIngestionRequest:
     queue_item_id: uuid.UUID
     source: str
     scheduler_bucket: str
+    attempt_count: int
+    locked_by: str
+    locked_at: datetime
 
 
 @dataclass(frozen=True)
@@ -218,6 +225,7 @@ class DiscoveryIngestionService:
         policy: DiscoveryPolicy,
         now: datetime,
     ) -> _RunClaim | DiscoveryIngestionResult:
+        await self._lock_queue_authority(db, request)
         existing = await self._locked_run(db, request)
         if existing is not None:
             return await self._claim_existing(
@@ -255,6 +263,7 @@ class DiscoveryIngestionService:
             return _RunClaim(run_id=run_id, generation=generation)
         except IntegrityError as exc:
             await db.rollback()
+            await self._lock_queue_authority(db, request)
             existing = await self._locked_run(db, request)
             if existing is None:
                 raise exc
@@ -265,6 +274,23 @@ class DiscoveryIngestionService:
                 policy=policy,
                 now=now,
             )
+
+    @staticmethod
+    async def _lock_queue_authority(
+        db: AsyncSession,
+        request: DiscoveryIngestionRequest,
+    ) -> None:
+        queue_item = (
+            await db.execute(
+                select(ChannelOpsQueueItem)
+                .where(ChannelOpsQueueItem.id == request.queue_item_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if queue_item is None or not _same_queue_authority(queue_item, request):
+            await db.rollback()
+            raise DiscoveryIngestionAuthorityError("queue_authority_changed")
 
     async def _claim_existing(
         self,
@@ -402,11 +428,31 @@ def _normalize_request(request: DiscoveryIngestionRequest) -> DiscoveryIngestion
         or len(request.scheduler_bucket) > 64
     ):
         raise ValueError("scheduler_bucket must be a non-empty string of at most 64 characters")
+    if type(request.attempt_count) is not int or request.attempt_count < 1:
+        raise ValueError("attempt_count must be an integer greater than or equal to 1")
+    if (
+        type(request.locked_by) is not str
+        or not request.locked_by.strip()
+        or len(request.locked_by) > 255
+    ):
+        raise ValueError("locked_by must be a nonblank string of at most 255 characters")
+    if (
+        type(request.locked_at) is not datetime
+        or request.locked_at.tzinfo is None
+        or request.locked_at.utcoffset() is None
+    ):
+        raise ValueError("locked_at must include a timezone")
+    locked_at = request.locked_at.astimezone(timezone.utc)
+    if locked_at == datetime.min.replace(tzinfo=timezone.utc):
+        raise ValueError("locked_at must not be zero")
     return DiscoveryIngestionRequest(
         channel_id=channel_id,
         queue_item_id=queue_item_id,
         source=request.source,
         scheduler_bucket=request.scheduler_bucket,
+        attempt_count=request.attempt_count,
+        locked_by=request.locked_by,
+        locked_at=locked_at,
     )
 
 
@@ -420,6 +466,26 @@ def _same_identity(
         and run.source == request.source
         and run.scheduler_bucket == request.scheduler_bucket
         and run.query_version == QUERY_VERSION
+    )
+
+
+def _same_queue_authority(
+    queue_item: ChannelOpsQueueItem,
+    request: DiscoveryIngestionRequest,
+) -> bool:
+    payload = queue_item.payload_json
+    return (
+        queue_item.kind == "ingest_discovery"
+        and queue_item.status == "running"
+        and queue_item.channel_profile_id == request.channel_id
+        and queue_item.attempt_count == request.attempt_count
+        and queue_item.locked_by == request.locked_by
+        and queue_item.locked_at is not None
+        and _as_utc(queue_item.locked_at) == request.locked_at
+        and isinstance(payload, dict)
+        and payload.get("channel_id") == str(request.channel_id)
+        and payload.get("source") == request.source
+        and payload.get("scheduler_bucket") == request.scheduler_bucket
     )
 
 

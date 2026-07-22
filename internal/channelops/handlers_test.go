@@ -103,7 +103,10 @@ func TestHandleIngestDiscoveryRejectsMissingIdentityBeforeClientCall(t *testing.
 		{name: "queued status", mutate: func(item *QueueItemRow) { item.Status = QueueStatusQueued }},
 		{name: "missing locked by", mutate: func(item *QueueItemRow) { item.LockedBy = nil }},
 		{name: "blank locked by", mutate: func(item *QueueItemRow) { blank := "  "; item.LockedBy = &blank }},
+		{name: "long locked by", mutate: func(item *QueueItemRow) { long := strings.Repeat("x", 256); item.LockedBy = &long }},
 		{name: "missing locked at", mutate: func(item *QueueItemRow) { item.LockedAt = nil }},
+		{name: "zero locked at", mutate: func(item *QueueItemRow) { zero := time.Time{}; item.LockedAt = &zero }},
+		{name: "missing attempt", mutate: func(item *QueueItemRow) { item.AttemptCount = 0 }},
 		{name: "queue id", mutate: func(item *QueueItemRow) { item.ID = "" }},
 		{name: "stored channel", mutate: func(item *QueueItemRow) { item.ChannelProfileID = nil }},
 		{name: "payload channel", mutate: func(item *QueueItemRow) { item.PayloadJSON["channel_id"] = "00000000-0000-0000-0000-000000000099" }},
@@ -126,6 +129,23 @@ func TestHandleIngestDiscoveryRejectsMissingIdentityBeforeClientCall(t *testing.
 				t.Fatalf("client calls = %d, want 0", client.calls)
 			}
 		})
+	}
+}
+
+func TestDiscoveryRequestFromQueueItemBindsExactLeaseToken(t *testing.T) {
+	item := discoveryQueueItemForTest(discoveryRequestForTest())
+	item.AttemptCount = 7
+	lockedBy := "discovery-exact-owner"
+	lockedAt := time.Date(2026, 7, 21, 18, 0, 0, 654321000, time.UTC)
+	item.LockedBy = &lockedBy
+	item.LockedAt = &lockedAt
+
+	request, err := discoveryRequestFromQueueItem(item)
+	if err != nil {
+		t.Fatalf("discoveryRequestFromQueueItem: %v", err)
+	}
+	if request.AttemptCount != item.AttemptCount || request.LockedBy != lockedBy || request.LockedAt != lockedAt {
+		t.Fatalf("lease token = %d/%q/%s, want %d/%q/%s", request.AttemptCount, request.LockedBy, request.LockedAt, item.AttemptCount, lockedBy, lockedAt)
 	}
 }
 
@@ -226,12 +246,12 @@ func discoveryObservationForTest(request DiscoveryIngestRequest) DiscoveryObserv
 }
 
 func discoveryQueueItemForTest(request DiscoveryIngestRequest) QueueItemRow {
-	lockedBy := "discovery-test-worker"
-	lockedAt := time.Date(2026, 7, 21, 18, 0, 0, 0, time.UTC)
+	lockedBy := request.LockedBy
+	lockedAt := request.LockedAt
 	storedChannel := request.ChannelID
 	return QueueItemRow{
 		ID: request.QueueItemID, Kind: QueueIngestDiscovery, Status: QueueStatusRunning,
-		LockedBy: &lockedBy, LockedAt: &lockedAt, ChannelProfileID: &storedChannel,
+		AttemptCount: request.AttemptCount, LockedBy: &lockedBy, LockedAt: &lockedAt, ChannelProfileID: &storedChannel,
 		PayloadJSON: map[string]any{
 			"channel_id": request.ChannelID, "source": "youtube_search",
 			"bucket": request.SchedulerBucket, "scheduler_bucket": request.SchedulerBucket,
