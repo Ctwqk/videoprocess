@@ -260,38 +260,137 @@ func (s *Store) ClaimNext(ctx context.Context, workerID string) (*QueueItemRow, 
 
 func (s *Store) recoverStaleDiscoveryLeases(ctx context.Context, now time.Time) (int64, error) {
 	current := now.UTC()
-	result, err := s.db().Exec(ctx, `
-		UPDATE channel_ops_queue_items
-		SET status = CASE
-		        WHEN attempt_count < max_attempts THEN $3
-		        ELSE $4
-		    END,
-		    run_after = CASE
-		        WHEN attempt_count < max_attempts THEN $5
-		        ELSE run_after
-		    END,
-		    last_error = $6,
-		    dead_letter_at = CASE
-		        WHEN attempt_count < max_attempts THEN NULL
-		        ELSE $5
-		    END,
-		    locked_by = NULL,
-		    locked_at = NULL
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	type staleDiscoveryLease struct {
+		id           string
+		attemptCount int
+		maxAttempts  int
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT id::text, attempt_count, max_attempts
+		FROM channel_ops_queue_items
 		WHERE kind = $1
 		  AND status = $2
-		  AND dead_letter_at IS NULL
 		  AND (
 		    locked_by IS NULL
 		    OR BTRIM(locked_by) = ''
 		    OR locked_at IS NULL
-		    OR locked_at <= $7
+		    OR locked_at <= $3
 		  )
-	`, QueueIngestDiscovery, QueueStatusRunning, QueueStatusQueued, QueueStatusDeadLettered,
-		current, discoveryLeaseRecoveryCode, current.Add(-discoveryLeaseStaleAfter))
+		ORDER BY id
+		FOR UPDATE SKIP LOCKED
+	`, QueueIngestDiscovery, QueueStatusRunning, current.Add(-discoveryLeaseStaleAfter))
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected(), nil
+	leases := []staleDiscoveryLease{}
+	for rows.Next() {
+		var lease staleDiscoveryLease
+		if err := rows.Scan(&lease.id, &lease.attemptCount, &lease.maxAttempts); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		leases = append(leases, lease)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+
+	runStatuses := make(map[string]string, len(leases))
+	for _, lease := range leases {
+		var status string
+		err := tx.QueryRow(ctx, `
+			SELECT status
+			FROM discovery_ingestion_runs
+			WHERE queue_item_id = $1::uuid
+			FOR UPDATE
+		`, lease.id).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		runStatuses[lease.id] = status
+	}
+
+	var recovered int64
+	for _, lease := range leases {
+		if runStatuses[lease.id] == "succeeded" {
+			result, err := tx.Exec(ctx, `
+				UPDATE channel_ops_queue_items
+				SET status = $2,
+				    last_error = NULL,
+				    dead_letter_at = NULL,
+				    locked_by = NULL,
+				    locked_at = NULL
+				WHERE id = $1::uuid AND status = $3
+			`, lease.id, QueueStatusSucceeded, QueueStatusRunning)
+			if err := queueLeaseUpdateResult(result.RowsAffected(), err); err != nil {
+				return 0, err
+			}
+			recovered++
+			continue
+		}
+
+		if runStatuses[lease.id] == "running" {
+			result, err := tx.Exec(ctx, `
+				UPDATE discovery_ingestion_runs
+				SET status = 'failed',
+				    finished_at = $2,
+				    last_error_code = $3
+				WHERE queue_item_id = $1::uuid AND status = 'running'
+			`, lease.id, current, discoveryLeaseRecoveryCode)
+			if err != nil {
+				return 0, err
+			}
+			if result.RowsAffected() != 1 {
+				return 0, fmt.Errorf("discovery run lease lost for queue item %s", lease.id)
+			}
+		}
+
+		if lease.attemptCount < lease.maxAttempts {
+			result, err := tx.Exec(ctx, `
+				UPDATE channel_ops_queue_items
+				SET status = $2,
+				    run_after = $3,
+				    last_error = $4,
+				    dead_letter_at = NULL,
+				    locked_by = NULL,
+				    locked_at = NULL
+				WHERE id = $1::uuid AND status = $5
+			`, lease.id, QueueStatusQueued, current, discoveryLeaseRecoveryCode, QueueStatusRunning)
+			if err := queueLeaseUpdateResult(result.RowsAffected(), err); err != nil {
+				return 0, err
+			}
+		} else {
+			result, err := tx.Exec(ctx, `
+				UPDATE channel_ops_queue_items
+				SET status = $2,
+				    last_error = $3,
+				    dead_letter_at = $4,
+				    locked_by = NULL,
+				    locked_at = NULL
+				WHERE id = $1::uuid AND status = $5
+			`, lease.id, QueueStatusDeadLettered, discoveryLeaseRecoveryCode, current, QueueStatusRunning)
+			if err := queueLeaseUpdateResult(result.RowsAffected(), err); err != nil {
+				return 0, err
+			}
+		}
+		recovered++
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return recovered, nil
 }
 
 func (s *Store) ClaimNextForKinds(ctx context.Context, workerID string, kinds []string) (*QueueItemRow, error) {

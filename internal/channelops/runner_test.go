@@ -529,6 +529,176 @@ func TestRunnerRecoveryFencesStaleDiscoveryOwnerCompletion(t *testing.T) {
 	}
 }
 
+func TestRunnerRecoveryReconcilesSucceededDiscoveryRunAtMaxAttempts(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	queueID := enqueueDiscoveryRecoveryItem(t, ctx, fixture, 1)
+	staleLockedAt := fixture.Store.Now().Add(-time.Hour)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = $2,
+		    attempt_count = max_attempts,
+		    locked_by = 'lost-response-runner',
+		    locked_at = $3,
+		    last_error = 'old provider response details',
+		    dead_letter_at = $3
+		WHERE id = $1::uuid
+	`, queueID, QueueStatusRunning, staleLockedAt); err != nil {
+		t.Fatalf("seed stale max-attempt discovery lease: %v", err)
+	}
+	finishedAt := fixture.Store.Now().Add(-time.Minute)
+	runID := insertDiscoveryRecoveryRun(t, ctx, fixture, queueID, "succeeded", 1, &finishedAt)
+
+	client := &recordingDiscoveryClient{}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+	if err := (&Runner{Store: fixture.Store, Handlers: handler}).runOnce(ctx); err != nil {
+		t.Fatalf("runOnce: %v", err)
+	}
+
+	var status string
+	var attempts int
+	var lockedBy, lastError *string
+	var lockedAt, deadLetterAt *time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count, locked_by, locked_at, last_error, dead_letter_at
+		FROM channel_ops_queue_items WHERE id = $1::uuid
+	`, queueID).Scan(&status, &attempts, &lockedBy, &lockedAt, &lastError, &deadLetterAt); err != nil {
+		t.Fatalf("select reconciled queue row: %v", err)
+	}
+	if status != QueueStatusSucceeded || attempts != 1 || lockedBy != nil || lockedAt != nil || lastError != nil || deadLetterAt != nil {
+		t.Fatalf("reconciled queue = %s/%d/%v/%v/%v/%v", status, attempts, lockedBy, lockedAt, lastError, deadLetterAt)
+	}
+	if client.calls != 0 {
+		t.Fatalf("succeeded replay client calls = %d, want 0", client.calls)
+	}
+	var runStatus string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status FROM discovery_ingestion_runs WHERE id = $1::uuid
+	`, runID).Scan(&runStatus); err != nil {
+		t.Fatalf("select succeeded durable run: %v", err)
+	}
+	if runStatus != "succeeded" {
+		t.Fatalf("durable run status = %q, want succeeded", runStatus)
+	}
+}
+
+func TestRunnerRecoveryInvalidatesRunningDiscoveryGeneration(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		maxAttempts  int
+		wantQueue    string
+		wantAttempts int
+		wantClaim    bool
+	}{
+		{name: "requeue", maxAttempts: 3, wantQueue: QueueStatusSucceeded, wantAttempts: 2, wantClaim: true},
+		{name: "dead letter", maxAttempts: 1, wantQueue: QueueStatusDeadLettered, wantAttempts: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			queueID := enqueueDiscoveryRecoveryItem(t, ctx, fixture, tt.maxAttempts)
+			if _, err := fixture.Store.Pool.Exec(ctx, `
+				UPDATE channel_ops_queue_items
+				SET status = $2, attempt_count = 1,
+				    locked_by = 'old-python-owner', locked_at = $3
+				WHERE id = $1::uuid
+			`, queueID, QueueStatusRunning, fixture.Store.Now().Add(-time.Hour)); err != nil {
+				t.Fatalf("seed stale discovery queue generation: %v", err)
+			}
+			const oldGeneration = 7
+			runID := insertDiscoveryRecoveryRun(t, ctx, fixture, queueID, "running", oldGeneration, nil)
+
+			var statusBeforeLate string
+			var generationBeforeLate int
+			var finishedBeforeLate *time.Time
+			var errorBeforeLate *string
+			var lateRows int64 = -1
+			lateTerminalUpdate := func() error {
+				if err := fixture.Store.Pool.QueryRow(ctx, `
+					SELECT status, attempt_count, finished_at, last_error_code
+					FROM discovery_ingestion_runs WHERE id = $1::uuid
+				`, runID).Scan(&statusBeforeLate, &generationBeforeLate, &finishedBeforeLate, &errorBeforeLate); err != nil {
+					return err
+				}
+				result, err := fixture.Store.Pool.Exec(ctx, `
+					UPDATE discovery_ingestion_runs
+					SET status = 'succeeded', finished_at = $3, last_error_code = NULL
+					WHERE id = $1::uuid
+					  AND status = 'running'
+					  AND attempt_count = $2
+				`, runID, oldGeneration, fixture.Store.Now().Add(time.Minute))
+				if err != nil {
+					return err
+				}
+				lateRows = result.RowsAffected()
+				return nil
+			}
+
+			client := &recordingDiscoveryClient{}
+			if tt.wantClaim {
+				client.ingest = func(request DiscoveryIngestRequest) (DiscoveryObservation, error) {
+					if err := lateTerminalUpdate(); err != nil {
+						return DiscoveryObservation{}, err
+					}
+					return discoveryObservationForTest(request), nil
+				}
+			}
+			handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+			handler.Discovery = client
+			if err := (&Runner{Store: fixture.Store, Handlers: handler}).runOnce(ctx); err != nil {
+				t.Fatalf("runOnce: %v", err)
+			}
+			if !tt.wantClaim {
+				if err := lateTerminalUpdate(); err != nil {
+					t.Fatalf("late durable terminal update: %v", err)
+				}
+			}
+
+			if statusBeforeLate != "failed" || generationBeforeLate != oldGeneration || finishedBeforeLate == nil || !finishedBeforeLate.Equal(fixture.Store.Now()) || errorBeforeLate == nil || *errorBeforeLate != "discovery_lease_recovered" {
+				t.Fatalf("durable run before late update = %s/%d/%v/%v", statusBeforeLate, generationBeforeLate, finishedBeforeLate, errorBeforeLate)
+			}
+			if lateRows != 0 {
+				t.Fatalf("late generation terminal rows = %d, want 0", lateRows)
+			}
+			var runStatus string
+			if err := fixture.Store.Pool.QueryRow(ctx, `SELECT status FROM discovery_ingestion_runs WHERE id = $1::uuid`, runID).Scan(&runStatus); err != nil {
+				t.Fatalf("select invalidated durable run: %v", err)
+			}
+			if runStatus != "failed" {
+				t.Fatalf("durable run status after late update = %q, want failed", runStatus)
+			}
+
+			var queueStatus string
+			var attempts int
+			var deadLetterAt *time.Time
+			if err := fixture.Store.Pool.QueryRow(ctx, `
+				SELECT status, attempt_count, dead_letter_at
+				FROM channel_ops_queue_items WHERE id = $1::uuid
+			`, queueID).Scan(&queueStatus, &attempts, &deadLetterAt); err != nil {
+				t.Fatalf("select recovered queue generation: %v", err)
+			}
+			if queueStatus != tt.wantQueue || attempts != tt.wantAttempts {
+				t.Fatalf("queue recovery = %s/%d, want %s/%d", queueStatus, attempts, tt.wantQueue, tt.wantAttempts)
+			}
+			if (tt.wantQueue == QueueStatusDeadLettered) != (deadLetterAt != nil) {
+				t.Fatalf("queue dead_letter_at = %v for status %s", deadLetterAt, queueStatus)
+			}
+			wantCalls := 0
+			if tt.wantClaim {
+				wantCalls = 1
+			}
+			if client.calls != wantCalls {
+				t.Fatalf("discovery client calls = %d, want %d", client.calls, wantCalls)
+			}
+		})
+	}
+}
+
 func enqueueDiscoveryRecoveryItem(t *testing.T, ctx context.Context, fixture *ChannelOpsFixture, maxAttempts int) string {
 	t.Helper()
 	channelID := fixture.ChannelID
@@ -544,6 +714,35 @@ func enqueueDiscoveryRecoveryItem(t *testing.T, ctx context.Context, fixture *Ch
 		t.Fatalf("enqueue discovery recovery item: %v", err)
 	}
 	return queueID
+}
+
+func insertDiscoveryRecoveryRun(
+	t *testing.T,
+	ctx context.Context,
+	fixture *ChannelOpsFixture,
+	queueID string,
+	status string,
+	generation int,
+	finishedAt *time.Time,
+) string {
+	t.Helper()
+	var runID string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		INSERT INTO discovery_ingestion_runs (
+			id, channel_profile_id, queue_item_id, source, scheduler_bucket,
+			query_version, status, attempt_count, query_count, created_count,
+			refreshed_count, expired_count, quota_units_estimated,
+			policy_snapshot_json, started_at, finished_at, last_error_code
+		) VALUES (
+			gen_random_uuid(), $1::uuid, $2::uuid, 'youtube_search', '2026-05-21-18',
+			'youtube-lane-keyword-v1', $3, $4, 0, 0, 0, 0, 0,
+			'{}'::json, $5, $6, NULL
+		)
+		RETURNING id::text
+	`, fixture.ChannelID, queueID, status, generation, fixture.Store.Now().Add(-time.Hour), finishedAt).Scan(&runID); err != nil {
+		t.Fatalf("insert discovery recovery run: %v", err)
+	}
+	return runID
 }
 
 func stringPointer(value string) *string {
