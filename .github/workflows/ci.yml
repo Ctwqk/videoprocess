@@ -1,0 +1,169 @@
+name: VideoProcess CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: videoprocess-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend and migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CHANNEL_OPS_POSTGRES_TEST_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install backend dependencies
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/bin/python -m pip install --upgrade pip
+          backend/.venv/bin/python -m pip install -e 'backend[dev]' ruff mypy
+      - name: Record backend evidence
+        run: |
+          mkdir -p ci-evidence/backend
+          printf '%s\n' "$GITHUB_SHA" > ci-evidence/backend/commit.txt
+          (
+            cd backend
+            .venv/bin/alembic heads
+          ) | tee ci-evidence/backend/alembic-heads.txt
+      - name: Run backend tests
+        run: |
+          set -o pipefail
+          (
+            cd backend
+            .venv/bin/python -m pytest
+          ) | tee ci-evidence/backend/pytest.txt
+      - name: Run advisory backend checks
+        if: always()
+        run: |
+          set +e
+          (
+            cd backend
+            .venv/bin/python -m ruff check .
+          ) | tee ci-evidence/backend/ruff.txt
+          (
+            cd backend
+            .venv/bin/python -m mypy app
+          ) | tee ci-evidence/backend/mypy.txt
+          exit 0
+      - name: Upload backend evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: videoprocess-backend-${{ github.sha }}
+          path: ci-evidence/backend
+          if-no-files-found: error
+          retention-days: 30
+
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run Go tests
+        run: |
+          set -o pipefail
+          mkdir -p ci-evidence/go
+          printf '%s\n' "$GITHUB_SHA" > ci-evidence/go/commit.txt
+          go test ./... | tee ci-evidence/go/go-test.txt
+      - name: Upload Go evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: videoprocess-go-${{ github.sha }}
+          path: ci-evidence/go
+          if-no-files-found: error
+          retention-days: 30
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Build frontend
+        run: |
+          set -o pipefail
+          mkdir -p ../ci-evidence/frontend
+          printf '%s\n' "$GITHUB_SHA" > ../ci-evidence/frontend/commit.txt
+          npm run build | tee ../ci-evidence/frontend/build.txt
+      - name: Run advisory frontend lint
+        if: always()
+        run: |
+          set +e
+          npm run lint | tee ../ci-evidence/frontend/lint.txt
+          exit 0
+      - name: Upload frontend evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: videoprocess-frontend-${{ github.sha }}
+          path: ci-evidence/frontend
+          if-no-files-found: error
+          retention-days: 30
+
+  deploy-contracts:
+    name: Deployment contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run deployment contracts
+        run: |
+          set -o pipefail
+          mkdir -p ci-evidence/deploy
+          printf '%s\n' "$GITHUB_SHA" > ci-evidence/deploy/commit.txt
+          {
+            bash tests/test_ci_workflow_contract.sh
+            bash tests/test_vp_deploy_ci_gate.sh
+            bash tests/test_vp_deploy_sync_extension.sh
+            bash tests/test_channelops_soak_watch.sh
+            bash tests/test_vp_unlisted_canary_scripts.sh
+            bash tests/test_vp_production_smoke_script.sh
+            bash tests/test_macos_deploy_paths.sh
+            bash -n deploy/swarm/deploy-sync-extension.sh
+            bash -n deploy/swarm/channelops-soak-watch.sh
+          } | tee ci-evidence/deploy/contracts.txt
+      - name: Upload deployment evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: videoprocess-deploy-${{ github.sha }}
+          path: ci-evidence/deploy
+          if-no-files-found: error
+          retention-days: 30
