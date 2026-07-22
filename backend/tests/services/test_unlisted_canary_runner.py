@@ -1091,15 +1091,15 @@ async def test_backlog_ignores_queued_and_running_discovery_but_flags_publishing
 ):
     runner = load_runner()
     queued_discovery = ChannelOpsQueueItem(
-        kind="discovery",
-        idempotency_key="discovery:queued:2026-07-21",
+        kind="ingest_discovery",
+        idempotency_key="ingest_discovery:queued:2026-07-21",
         channel_profile_id=None,
         payload_json={},
         status="queued",
     )
     running_discovery = ChannelOpsQueueItem(
-        kind="discovery",
-        idempotency_key="discovery:running:2026-07-21",
+        kind="ingest_discovery",
+        idempotency_key="ingest_discovery:running:2026-07-21",
         channel_profile_id=None,
         payload_json={},
         status="running",

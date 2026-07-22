@@ -97,7 +97,7 @@ CONNECTION_URL_PATTERN = re.compile(
     r"(?i)(?:postgres(?:ql)?(?:\+asyncpg)?|rediss?)://[^\s'\"<>]+"
 )
 READINESS_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
-NON_PUBLISHING_MAINTENANCE_QUEUE_KINDS = {"cleanup_expired", "discovery", "ingest_discovery"}
+NON_PUBLISHING_MAINTENANCE_QUEUE_KINDS = {"cleanup_expired", "ingest_discovery"}
 
 
 class CanaryError(RuntimeError):
