@@ -188,6 +188,37 @@ def test_shared_service_endpoints_use_defaults_and_omit_empty_redis():
     ]
 
 
+def test_shared_service_endpoints_accept_legacy_postgres_scheme():
+    runner = load_runner()
+
+    endpoints = runner.build_shared_service_endpoints(
+        database_url="postgres://vp:secret@10.0.0.150:5435/videoprocess",
+        redis_url="",
+        youtube_manager_url="http://10.0.0.150:18999",
+        local_ports=(25435, 28999),
+    )
+
+    assert endpoints.database_url == "postgres://vp:secret@127.0.0.1:25435/videoprocess"
+    assert endpoints.forwards[0] == runner.TunnelForward(
+        "database",
+        25435,
+        "10.0.0.150",
+        5435,
+    )
+
+
+def test_shared_service_endpoints_reject_postgresql_lookalike_scheme():
+    runner = load_runner()
+
+    with pytest.raises(runner.CanaryError, match="scheme is unsupported"):
+        runner.build_shared_service_endpoints(
+            database_url="postgresqlx://vp:secret@10.0.0.150:5435/videoprocess",
+            redis_url="",
+            youtube_manager_url="http://10.0.0.150:18999",
+            local_ports=(25435, 28999),
+        )
+
+
 def test_shared_service_tunnel_command_is_forward_only_and_argument_safe():
     runner = load_runner()
     endpoints = runner.build_shared_service_endpoints(
@@ -573,6 +604,74 @@ async def test_run_routes_shared_services_before_database_and_records_safe_metad
     assert "secret" not in serialized
 
 
+@pytest.mark.anyio
+async def test_run_preserves_failed_preflight_redis_audit_and_root_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    audit = {
+        "available": True,
+        "streams": {
+            "vp:events": {
+                "available": False,
+                "group": "orchestrator",
+                "reason": "ConnectionError",
+            },
+            "vp:tasks:youtube_publisher": {
+                "group": "youtube_publisher-workers",
+                "pending": 0,
+            },
+        },
+    }
+    redis_audit = AsyncMock(return_value=audit)
+
+    monkeypatch.setattr(runner, "acquire_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "release_advisory_lock", AsyncMock())
+    monkeypatch.setattr(
+        runner,
+        "schedule_status",
+        AsyncMock(return_value={"state": "CLOSED", "active_jobs": 0}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "active_backlog",
+        AsyncMock(
+            return_value={
+                "runnable_job_ids": [],
+                "unsafe_queue_item_ids": [],
+                "unsafe_task_ids": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(runner, "deployment_readiness", AsyncMock(return_value={"ready": True}))
+    monkeypatch.setattr(runner, "manager_readiness", AsyncMock(return_value={"authenticated": True}))
+    monkeypatch.setattr(runner, "redis_pending_audit", redis_audit)
+    path = tmp_path / "redis-preflight-failure.json"
+    args = SimpleNamespace(
+        evidence=path,
+        preflight_only=True,
+        confirm_live_unlisted=False,
+        redis_url="redis://cache/0",
+        youtube_manager_url="",
+        shared_services_ssh_host="",
+    )
+
+    with pytest.raises(runner.CanaryError, match="Redis pending audit"):
+        await runner.run(args, "sqlite+aiosqlite:///:memory:")
+
+    payload = json.loads(path.read_text())
+    assert payload["status"] == "failed"
+    assert payload["failure"] == {
+        "type": "CanaryError",
+        "message": "Redis pending audit is unavailable for vp:events",
+        "at": payload["failure"]["at"],
+    }
+    assert payload["redis_stream_pending_audit"] == audit
+    assert payload["completed_at"]
+    redis_audit.assert_awaited_once_with("redis://cache/0")
+
+
 @pytest.fixture
 async def db():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -625,12 +724,26 @@ async def test_execute_preflight_reads_readiness_without_live_side_effects(
         calls.append("manager_readiness")
         return {"authenticated": True}
 
+    async def redis_pending_audit(_redis_url):
+        calls.append("redis_pending_audit")
+        return {
+            "available": True,
+            "streams": {
+                "vp:events": {"group": "orchestrator", "pending": 0},
+                "vp:tasks:youtube_publisher": {
+                    "group": "youtube_publisher-workers",
+                    "pending": 0,
+                },
+            },
+        }
+
     async def forbidden(*_args, **_kwargs):
         raise AssertionError("preflight invoked a live mutation")
 
     monkeypatch.setattr(runner, "schedule_status", schedule_status)
     monkeypatch.setattr(runner, "deployment_readiness", deployment_readiness)
     monkeypatch.setattr(runner, "manager_readiness", manager_readiness)
+    monkeypatch.setattr(runner, "redis_pending_audit", redis_pending_audit)
     monkeypatch.setattr(runner, "mutate_schedule", forbidden)
     monkeypatch.setattr(runner, "close_schedule", forbidden)
     monkeypatch.setattr(runner, "execute_canary", forbidden)
@@ -641,13 +754,111 @@ async def test_execute_preflight_reads_readiness_without_live_side_effects(
     }
     path = tmp_path / "preflight.json"
 
-    await runner.execute_preflight(object(), db, object(), evidence, path)
+    await runner.execute_preflight(SimpleNamespace(redis_url="redis://cache/0"), db, object(), evidence, path)
 
-    assert calls == ["schedule_status", "deployment_readiness", "manager_readiness"]
+    assert calls == [
+        "schedule_status",
+        "deployment_readiness",
+        "manager_readiness",
+        "redis_pending_audit",
+    ]
     assert evidence["status"] == "succeeded"
     assert evidence["schedule"]["final_state"] == "CLOSED"
     assert evidence["preflight_backlog"]["runnable_job_ids"] == []
+    assert evidence["redis_stream_pending_audit"]["streams"]["vp:events"]["pending"] == 0
     assert path.exists()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "audit",
+    (
+        {"available": False, "reason": "ConnectionError"},
+        {
+            "available": True,
+            "streams": {
+                "vp:events": {
+                    "available": False,
+                    "group": "orchestrator",
+                    "reason": "ConnectionError",
+                },
+                "vp:tasks:youtube_publisher": {
+                    "group": "youtube_publisher-workers",
+                    "pending": 0,
+                },
+            },
+        },
+        {
+            "available": True,
+            "streams": {
+                "vp:events": {"group": "orchestrator", "pending": 1},
+                "vp:tasks:youtube_publisher": {
+                    "group": "youtube_publisher-workers",
+                    "pending": 0,
+                },
+            },
+        },
+        {
+            "available": True,
+            "streams": {
+                "vp:events": {"group": "orchestrator", "pending": 0},
+            },
+        },
+        {
+            "available": True,
+            "streams": {
+                "vp:events": {"group": "wrong-group", "pending": 0},
+                "vp:tasks:youtube_publisher": {
+                    "group": "youtube_publisher-workers",
+                    "pending": 0,
+                },
+            },
+        },
+        {
+            "available": True,
+            "streams": {
+                "vp:events": {"group": "orchestrator", "pending": "0"},
+                "vp:tasks:youtube_publisher": {
+                    "group": "youtube_publisher-workers",
+                    "pending": 0,
+                },
+            },
+        },
+    ),
+)
+async def test_execute_preflight_fails_closed_on_unsafe_redis_audit(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    audit: dict,
+):
+    runner = load_runner()
+
+    monkeypatch.setattr(
+        runner,
+        "schedule_status",
+        AsyncMock(return_value={"state": "CLOSED", "active_jobs": 0}),
+    )
+    monkeypatch.setattr(runner, "deployment_readiness", AsyncMock(return_value={"ready": True}))
+    monkeypatch.setattr(runner, "manager_readiness", AsyncMock(return_value={"authenticated": True}))
+    monkeypatch.setattr(runner, "redis_pending_audit", AsyncMock(return_value=audit))
+    evidence = {
+        "mode": runner.MODE_PREFLIGHT,
+        "status": "running",
+        "schedule": {"transitions": [], "final_state": None},
+    }
+
+    with pytest.raises(runner.CanaryError, match="Redis pending audit"):
+        await runner.execute_preflight(
+            SimpleNamespace(redis_url="redis://cache/0"),
+            db,
+            object(),
+            evidence,
+            tmp_path / "preflight.json",
+        )
+
+    assert evidence["status"] == "running"
+    assert evidence["redis_stream_pending_audit"] == audit
 
 
 @pytest.mark.anyio

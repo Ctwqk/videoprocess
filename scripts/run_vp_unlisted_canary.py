@@ -98,6 +98,10 @@ CONNECTION_URL_PATTERN = re.compile(
 )
 READINESS_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 NON_PUBLISHING_MAINTENANCE_QUEUE_KINDS = {"cleanup_expired", "ingest_discovery"}
+REDIS_PENDING_STREAM_GROUPS = (
+    ("vp:tasks:youtube_publisher", "youtube_publisher-workers"),
+    ("vp:events", "orchestrator"),
+)
 
 
 class CanaryError(RuntimeError):
@@ -147,7 +151,7 @@ def _rewrite_database_endpoint(value: str, local_port: int) -> tuple[str, str, i
         url = make_url(value)
     except (ArgumentError, ValueError) as exc:
         raise CanaryError("database endpoint URL is invalid") from exc
-    if not url.drivername.startswith("postgresql"):
+    if url.drivername not in {"postgres", "postgresql", "postgresql+asyncpg"}:
         raise CanaryError("database endpoint scheme is unsupported")
     host = _valid_tunnel_target_host(url.host or "", label="database endpoint")
     target_port = _valid_tcp_port(url.port or 5432, label="database endpoint")
@@ -1663,10 +1667,7 @@ async def redis_pending_audit(redis_url: str) -> dict[str, Any]:
         client = aioredis.from_url(redis_url, decode_responses=True, socket_connect_timeout=3, socket_timeout=3)
         try:
             result: dict[str, Any] = {"available": True, "streams": {}}
-            for stream, group in (
-                ("vp:tasks:youtube_publisher", "youtube_publisher-workers"),
-                ("vp:events", "orchestrator"),
-            ):
+            for stream, group in REDIS_PENDING_STREAM_GROUPS:
                 try:
                     pending = await client.xpending(stream, group)
                     result["streams"][stream] = {
@@ -1680,6 +1681,24 @@ async def redis_pending_audit(redis_url: str) -> dict[str, Any]:
             await client.aclose()
     except Exception as exc:
         return {"available": False, "reason": type(exc).__name__}
+
+
+def assert_zero_redis_pending(report: dict[str, Any]) -> None:
+    streams = report.get("streams")
+    if report.get("available") is not True or not isinstance(streams, dict):
+        raise CanaryError("Redis pending audit is unavailable")
+    for stream, expected_group in REDIS_PENDING_STREAM_GROUPS:
+        row = streams.get(stream)
+        if (
+            not isinstance(row, dict)
+            or row.get("group") != expected_group
+            or row.get("available") is False
+            or type(row.get("pending")) is not int
+            or row["pending"] < 0
+        ):
+            raise CanaryError(f"Redis pending audit is unavailable for {stream}")
+        if row["pending"] != 0:
+            raise CanaryError(f"Redis pending audit found pending work for {stream}")
 
 
 async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, Any]:
@@ -1811,6 +1830,8 @@ async def execute_preflight(
     assert_no_preexisting_backlog(backlog)
     evidence["deployment"] = await deployment_readiness(args, client)
     evidence["manager"] = {"auth": await manager_readiness(args, client)}
+    evidence["redis_stream_pending_audit"] = await redis_pending_audit(args.redis_url)
+    assert_zero_redis_pending(evidence["redis_stream_pending_audit"])
     evidence["status"] = "succeeded"
     atomic_write_json(path, evidence)
 
@@ -2161,9 +2182,10 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
                                 except BaseException as exc:
                                     close_error = exc
                                     mark_schedule_close_failure(evidence, close_error)
-                                evidence["redis_stream_pending_audit"] = await redis_pending_audit(
-                                    runtime_args.redis_url
-                                )
+                                if "redis_stream_pending_audit" not in evidence:
+                                    evidence["redis_stream_pending_audit"] = await redis_pending_audit(
+                                        runtime_args.redis_url
+                                    )
                                 evidence["completed_at"] = utc_now().isoformat()
                                 atomic_write_json(path, evidence)
                                 if close_error is not None:
