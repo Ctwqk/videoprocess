@@ -361,7 +361,7 @@ git commit -m "feat: execute durable metric stage schedules"
 - Produces: learning aggregation includes only `feedback_snapshots.snapshot_stage = '24h'`.
 - Produces: canary metrics queue payload `snapshot_stage="immediate"`.
 
-- [ ] **Step 1: Add failing stage and learning tests**
+- [x] **Step 1: Add failing stage and learning tests**
 
 Require:
 
@@ -374,7 +374,7 @@ if got := SnapshotStageFromPayload(map[string]any{"snapshot_stage": "immediate"}
 Seed one publication with immediate/1h/24h/72h snapshots carrying different
 rewards and assert learning uses exactly the 24h reward once.
 
-- [ ] **Step 2: Run Go tests and verify RED**
+- [x] **Step 2: Run Go tests and verify RED**
 
 Run:
 
@@ -385,7 +385,7 @@ go test ./internal/channelops -run \
 
 Expected: immediate falls back to 24h and/or learning counts multiple stages.
 
-- [ ] **Step 3: Implement stage and learning isolation**
+- [x] **Step 3: Implement stage and learning isolation**
 
 Add `immediate` only to the feedback stage parser. Add this predicate to the
 learning query:
@@ -396,7 +396,7 @@ AND f.snapshot_stage = '24h'
 
 Do not add `immediate` to migration 028's schedule stage constraint.
 
-- [ ] **Step 4: Add failing canary payload tests**
+- [x] **Step 4: Add failing canary payload tests**
 
 Assert `enqueue_metrics_probe()` writes:
 
@@ -410,13 +410,13 @@ payload={
 and evidence continues to classify it as `age_appropriate: false` while
 listing the five durable queued stages separately.
 
-- [ ] **Step 5: Implement canary evidence updates**
+- [x] **Step 5: Implement canary evidence updates**
 
 Include `snapshot_stage` and `metric_schedule_id` in the safe pending metrics
 summary. Require the durable list to contain the five expected stages after a
 successful promotion, without exposing a title, prompt, URL, or credential.
 
-- [ ] **Step 6: Run canary and learning tests**
+- [x] **Step 6: Run canary and learning tests**
 
 Run:
 
@@ -430,7 +430,7 @@ bash tests/test_vp_unlisted_canary_scripts.sh
 
 Expected: all selected tests pass.
 
-- [ ] **Step 7: Commit semantic isolation**
+- [x] **Step 7: Commit semantic isolation**
 
 ```bash
 git add internal/channelops/metrics.go internal/channelops/metrics_test.go \

@@ -104,15 +104,23 @@ func TestHandleLearningRecomputeRunsConfiguredWindows(t *testing.T) {
 	if err := fixture.Store.MarkQueueDone(ctx, promote); err != nil {
 		t.Fatalf("MarkQueueDone promote: %v", err)
 	}
-	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
-	collect.PayloadJSON["metrics"] = map[string]any{
-		"views":                 1000,
-		"likes":                 50,
-		"comments":              10,
-		"avg_view_duration_sec": 18.0,
-	}
-	if err := handler.HandleCollectMetrics(ctx, collect); err != nil {
-		t.Fatalf("HandleCollectMetrics: %v", err)
+	for _, wantStage := range []string{"1h", "6h", "24h"} {
+		collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+		if stage := firstString(collect.PayloadJSON, "snapshot_stage"); stage != wantStage {
+			t.Fatalf("metric stage = %q, want %q", stage, wantStage)
+		}
+		collect.PayloadJSON["metrics"] = map[string]any{
+			"views":                 1000,
+			"likes":                 50,
+			"comments":              10,
+			"avg_view_duration_sec": 18.0,
+		}
+		if err := handler.HandleCollectMetrics(ctx, collect); err != nil {
+			t.Fatalf("HandleCollectMetrics %s: %v", wantStage, err)
+		}
+		if err := fixture.Store.MarkQueueDone(ctx, collect); err != nil {
+			t.Fatalf("MarkQueueDone %s metrics: %v", wantStage, err)
+		}
 	}
 
 	err := handler.HandleLearningRecompute(ctx, QueueItemRow{

@@ -48,6 +48,8 @@ grep -Fq '"/internal/schedule/video/open"' "$CANARY"
 grep -Fq 'never deletes the YouTube video' "$CANARY"
 grep -Fq 'operator_canary_failure' "$CANARY"
 grep -Fq 'CANARY_PLAN_DELAY_SECONDS = 300' "$CANARY"
+grep -Fq '"snapshot_stage": "immediate"' "$CANARY"
+grep -Fq 'EXPECTED_DURABLE_METRIC_STAGES' "$CANARY"
 grep -Fq 'mark_schedule_close_failure(evidence, close_error)' "$CANARY"
 if [[ "$(grep -Fc 'jump_host=args.manager_ssh_jump' "$CANARY")" -ne 6 ]]; then
   echo "FAIL: every manager readiness SSH call must use the configured jump" >&2

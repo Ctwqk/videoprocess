@@ -45,7 +45,7 @@ func HasRecognizedMetrics(metrics map[string]any) bool {
 func SnapshotStageFromPayload(payload map[string]any) string {
 	stage := strings.TrimSpace(firstString(payload, "snapshot_stage", "stage", "window"))
 	switch stage {
-	case "1h", "6h", "24h", "72h", "7d":
+	case "immediate", "1h", "6h", "24h", "72h", "7d":
 		return stage
 	default:
 		return "24h"

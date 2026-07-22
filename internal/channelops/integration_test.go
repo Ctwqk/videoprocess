@@ -2046,7 +2046,7 @@ func TestSuccessful24hMetricScheduleMarksTaskMeasured(t *testing.T) {
 	}
 }
 
-func TestRecomputeLearningStateForSourcesAggregatesReward(t *testing.T) {
+func TestRecomputeLearningUsesMature24hSnapshot(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
@@ -2066,15 +2066,37 @@ func TestRecomputeLearningStateForSourcesAggregatesReward(t *testing.T) {
 	if err := fixture.Store.MarkQueueDone(ctx, promote); err != nil {
 		t.Fatalf("MarkQueueDone promote: %v", err)
 	}
-	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
-	collect.PayloadJSON["metrics"] = map[string]any{
-		"views":                 1000,
-		"likes":                 50,
-		"comments":              10,
-		"avg_view_duration_sec": 18.0,
+	publicationID := firstString(promote.PayloadJSON, "publication_id")
+	publication, err := fixture.Store.GetPublication(ctx, publicationID)
+	if err != nil {
+		t.Fatalf("GetPublication: %v", err)
 	}
-	if err := handler.HandleCollectMetrics(ctx, collect); err != nil {
-		t.Fatalf("HandleCollectMetrics: %v", err)
+	for _, snapshot := range []struct {
+		stage  string
+		reward float64
+	}{
+		{stage: "immediate", reward: 0.10},
+		{stage: "1h", reward: 0.20},
+		{stage: "24h", reward: 0.80},
+		{stage: "72h", reward: 0.30},
+	} {
+		if err := fixture.Store.UpsertFeedbackSnapshot(
+			ctx,
+			publication,
+			map[string]any{"views": 100},
+			snapshot.stage,
+			0.5,
+			[]string{"views"},
+			snapshot.reward,
+			map[string]any{"test_reward": snapshot.reward},
+		); err != nil {
+			t.Fatalf("UpsertFeedbackSnapshot %s: %v", snapshot.stage, err)
+		}
+		if snapshot.stage == "immediate" {
+			if task := fixture.RequireSingleTask(ctx); task.State != TaskScheduled {
+				t.Fatalf("task state after immediate snapshot = %s, want scheduled", task.State)
+			}
+		}
 	}
 
 	if err := fixture.Store.RecomputeLearningState(ctx, fixture.ChannelID, 7); err != nil {
@@ -2095,7 +2117,8 @@ func TestRecomputeLearningStateForSourcesAggregatesReward(t *testing.T) {
 	`, fixture.ChannelID, SourceLaneSeed).Scan(&sampleCount, &avgReward, &confidence, &recommendation); err != nil {
 		t.Fatalf("select learning state: %v", err)
 	}
-	if sampleCount != 1 || avgReward <= 0 || confidence <= 0 || recommendation != "insufficient_data" {
+	if sampleCount != 1 || avgReward < 0.7999 || avgReward > 0.8001 ||
+		confidence != 0.05 || recommendation != "insufficient_data" {
 		t.Fatalf("learning sample/reward/confidence/action = %d/%f/%f/%s", sampleCount, avgReward, confidence, recommendation)
 	}
 }

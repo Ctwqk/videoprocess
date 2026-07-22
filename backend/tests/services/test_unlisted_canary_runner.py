@@ -5,7 +5,7 @@ import json
 import subprocess
 import uuid
 from contextlib import contextmanager
-from datetime import timezone
+from datetime import timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
@@ -810,8 +810,99 @@ async def test_metrics_probe_uses_api_equivalent_hour_bucket_idempotency(db: Asy
     assert first.kind == "collect_metrics"
     assert first.channel_profile_id == channel.id
     assert first.priority == 90
-    assert first.payload_json == {"publication_id": str(publication.id)}
+    assert first.payload_json == {
+        "publication_id": str(publication.id),
+        "snapshot_stage": "immediate",
+    }
     assert first.idempotency_key.startswith(f"collect_metrics:{publication.id}:")
+
+
+@pytest.mark.anyio
+async def test_pending_metrics_rows_reports_only_safe_durable_stage_authority(db: AsyncSession):
+    runner = load_runner()
+    channel, _task, publication = await add_uploaded_publication(db)
+    queue = runner.ChannelOpsQueueService()
+    expected_stages = ["1h", "6h", "24h", "72h", "7d"]
+    expected_schedule_ids = []
+
+    for offset, stage in enumerate(expected_stages, start=1):
+        schedule_id = uuid.uuid4()
+        expected_schedule_ids.append(str(schedule_id))
+        await queue.enqueue(
+            db,
+            kind="collect_metrics",
+            idempotency_key=f"collect_metrics:{publication.id}:stage:{stage}:attempt:0",
+            payload={
+                "publication_id": str(publication.id),
+                "metric_schedule_id": str(schedule_id),
+                "snapshot_stage": stage,
+                "metrics_poll_count": 0,
+                "title": "must not enter evidence",
+                "access_token": "must not enter evidence",
+            },
+            priority=90,
+            run_after=runner.utc_now() + timedelta(hours=offset),
+            channel_profile_id=channel.id,
+            commit=False,
+        )
+    await queue.enqueue(
+        db,
+        kind="collect_metrics",
+        idempotency_key=f"collect_metrics:{publication.id}:immediate",
+        payload={
+            "publication_id": str(publication.id),
+            "snapshot_stage": "immediate",
+        },
+        priority=90,
+        channel_profile_id=channel.id,
+        commit=False,
+    )
+    await db.commit()
+
+    rows = await runner.pending_metrics_rows(db, publication.id)
+
+    assert [row["snapshot_stage"] for row in rows] == expected_stages
+    assert [row["metric_schedule_id"] for row in rows] == expected_schedule_ids
+    assert all(
+        set(row)
+        == {
+            "id",
+            "status",
+            "run_after",
+            "metrics_poll_count",
+            "snapshot_stage",
+            "metric_schedule_id",
+        }
+        for row in rows
+    )
+
+
+def test_exact_durable_metric_stage_policy_rejects_missing_or_reordered_rows():
+    runner = load_runner()
+    rows = [{"snapshot_stage": stage} for stage in runner.EXPECTED_DURABLE_METRIC_STAGES]
+
+    runner.assert_exact_durable_metric_stages(rows)
+    with pytest.raises(runner.CanaryError, match="exact five-stage"):
+        runner.assert_exact_durable_metric_stages(rows[:-1])
+    with pytest.raises(runner.CanaryError, match="exact five-stage"):
+        runner.assert_exact_durable_metric_stages(list(reversed(rows)))
+
+
+@pytest.mark.anyio
+async def test_immediate_metrics_probe_requires_task_to_remain_scheduled(db: AsyncSession):
+    runner = load_runner()
+    _channel, task, _publication = await add_uploaded_publication(db)
+    task.state = "scheduled"
+    await db.commit()
+
+    assert await runner.assert_immediate_metrics_task_state(db, task.id) == "scheduled"
+
+    task = await db.get(ProductionTask, task.id)
+    assert task is not None
+    task.state = "measured"
+    await db.commit()
+    with pytest.raises(runner.CanaryError, match="prematurely changed task state"):
+        await runner.assert_immediate_metrics_task_state(db, task.id)
 
 
 def test_schedule_close_failure_marks_evidence_failed_without_overwriting_root_failure():

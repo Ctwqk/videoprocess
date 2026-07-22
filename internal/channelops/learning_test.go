@@ -21,6 +21,9 @@ func TestRewardScoreRenormalizesAvailableComponents(t *testing.T) {
 }
 
 func TestSnapshotStageFromPayload(t *testing.T) {
+	if got := SnapshotStageFromPayload(map[string]any{"snapshot_stage": "immediate"}); got != "immediate" {
+		t.Fatalf("immediate stage=%q", got)
+	}
 	if got := SnapshotStageFromPayload(map[string]any{"snapshot_stage": "6h"}); got != "6h" {
 		t.Fatalf("stage=%q", got)
 	}

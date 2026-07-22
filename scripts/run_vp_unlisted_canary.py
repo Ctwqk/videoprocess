@@ -82,6 +82,7 @@ RECOGNIZED_METRIC_KEYS = {
     "impressions",
     "virality_score",
 }
+EXPECTED_DURABLE_METRIC_STAGES = ("1h", "6h", "24h", "72h", "7d")
 SENSITIVE_KEY_PARTS = {
     "authorization",
     "cookie",
@@ -1422,7 +1423,10 @@ async def enqueue_metrics_probe(
             db,
             kind="collect_metrics",
             idempotency_key=f"collect_metrics:{publication.id}:{utc_hour_bucket(utc_now())}",
-            payload={"publication_id": str(publication.id)},
+            payload={
+                "publication_id": str(publication.id),
+                "snapshot_stage": "immediate",
+            },
             priority=90,
             channel_profile_id=task.channel_profile_id,
             commit=False,
@@ -1473,6 +1477,20 @@ async def assert_promotion_succeeded(
     }
 
 
+async def assert_immediate_metrics_task_state(
+    db: AsyncSession,
+    task_id: uuid.UUID,
+) -> str:
+    db.expire_all()
+    task = await db.get(ProductionTask, task_id)
+    await db.commit()
+    if task is None:
+        raise CanaryError("canary task disappeared after immediate metrics probe")
+    if task.state != "scheduled":
+        raise CanaryError("immediate metrics probe prematurely changed task state")
+    return task.state
+
+
 def recognized_metrics(payload: dict[str, Any]) -> dict[str, Any]:
     candidate = payload.get("metrics")
     metrics: dict[str, Any] = candidate if isinstance(candidate, dict) else payload
@@ -1510,16 +1528,36 @@ async def pending_metrics_rows(db: AsyncSession, publication_id: uuid.UUID) -> l
         )
     )
     await db.commit()
-    matching = [row for row in rows if str((row.payload_json or {}).get("publication_id")) == str(publication_id)]
-    return [
-        {
-            "id": str(row.id),
-            "status": row.status,
-            "run_after": row.run_after.isoformat(),
-            "metrics_poll_count": (row.payload_json or {}).get("metrics_poll_count"),
-        }
-        for row in matching
+    matching = [
+        row
+        for row in rows
+        if str((row.payload_json or {}).get("publication_id")) == str(publication_id)
+        and (row.payload_json or {}).get("metric_schedule_id")
     ]
+    summaries = []
+    for row in matching:
+        payload = row.payload_json or {}
+        try:
+            schedule_id = str(uuid.UUID(str(payload.get("metric_schedule_id"))))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise CanaryError("durable metrics queue contains an invalid schedule ID") from exc
+        summaries.append(
+            {
+                "id": str(row.id),
+                "status": row.status,
+                "run_after": row.run_after.isoformat(),
+                "metrics_poll_count": payload.get("metrics_poll_count"),
+                "snapshot_stage": str(payload.get("snapshot_stage") or ""),
+                "metric_schedule_id": schedule_id,
+            }
+        )
+    return summaries
+
+
+def assert_exact_durable_metric_stages(rows: Sequence[dict[str, Any]]) -> None:
+    stages = tuple(str(row.get("snapshot_stage") or "") for row in rows)
+    if stages != EXPECTED_DURABLE_METRIC_STAGES:
+        raise CanaryError("durable metrics queue does not contain the exact five-stage policy")
 
 
 async def assert_never_public(
@@ -1941,9 +1979,13 @@ async def execute_canary(
         channelops_wait,
         "immediate metrics probe",
     )
+    immediate_task_state = await assert_immediate_metrics_task_state(db, task.id)
     durable_pending = await pending_metrics_rows(db, publication.id)
+    assert_exact_durable_metric_stages(durable_pending)
     if immediate_metrics:
         snapshot = await wait_for_feedback_snapshot(db, publication.id, channelops_wait)
+        if snapshot.snapshot_stage != "immediate":
+            raise CanaryError("immediate metrics probe produced a mature feedback stage")
         evidence["feedback"] = {
             "immediate_platform_feedback": {
                 "available": True,
@@ -1970,6 +2012,7 @@ async def execute_canary(
             "feedback_snapshot": None,
             "age_appropriate_durable_metrics_queue": durable_pending,
         }
+    evidence["feedback"]["task_state_after_immediate_probe"] = immediate_task_state
 
     await assert_never_public(db, graph, task.id)
     counts = await canary_counts(db, graph, task.id)

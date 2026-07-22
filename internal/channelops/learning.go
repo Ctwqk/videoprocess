@@ -112,6 +112,7 @@ func (s *Store) RecomputeLearningStateForSources(ctx context.Context, channelID 
 		JOIN feedback_snapshots f ON f.publication_id = p.id
 		WHERE t.channel_profile_id = $1::uuid
 		  AND f.collected_at >= $2::timestamptz
+		  AND f.snapshot_stage = '24h'
 		  AND f.metrics_completeness_score >= 0.4
 		  AND f.reward_score IS NOT NULL
 		GROUP BY COALESCE(NULLIF(t.source, ''), 'unknown')
