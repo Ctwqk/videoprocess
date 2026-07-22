@@ -146,7 +146,7 @@ async def test_postgres_16_fresh_repair_and_mixed_writer_migrations() -> None:
             assert await conn.fetchval("SELECT version()")
             assert (
                 await conn.fetchval("SELECT version_num FROM alembic_version")
-                == "029_channelops_discovery_ingestion_runs"
+                == "031_guarded_schedule_job_authority"
             )
             assert await conn.fetchval(
                 "SELECT column_default FROM information_schema.columns "

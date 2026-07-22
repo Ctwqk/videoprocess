@@ -130,7 +130,7 @@ async def test_postgres_16_promotion_operation_migration_is_rolling_safe_and_rev
             assert await conn.fetchval("SHOW server_version_num") >= "160000"
             assert (
                 await conn.fetchval("SELECT version_num FROM alembic_version")
-                == "029_channelops_discovery_ingestion_runs"
+                == "031_guarded_schedule_job_authority"
             )
             constraints = {
                 row["conname"]
