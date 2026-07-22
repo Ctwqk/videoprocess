@@ -24,6 +24,8 @@ class ChannelProfileRead(ChannelProfileCreate):
     dry_run: bool
     halted_at: datetime | None = None
     halt_reason: str | None = None
+    intake_paused_at: datetime | None = None
+    intake_pause_reason: str | None = None
     config_version: int
 
 

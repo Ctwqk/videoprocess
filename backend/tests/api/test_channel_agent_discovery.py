@@ -75,6 +75,7 @@ async def _channel_and_queue(
     *,
     enabled: bool = True,
     halted: bool = False,
+    intake_paused: bool = False,
     policy: dict | None = None,
     queue_kind: str = "ingest_discovery",
     queue_status: str = "running",
@@ -88,6 +89,8 @@ async def _channel_and_queue(
         name="Discovery API",
         enabled=enabled,
         halted_at=datetime.now(timezone.utc) if halted else None,
+        intake_paused_at=datetime.now(timezone.utc) if intake_paused else None,
+        intake_pause_reason="guarded canary" if intake_paused else None,
         content_mix_policy_json=POLICY if policy is None else policy,
     )
     session.add(channel)
@@ -391,12 +394,13 @@ async def test_discovery_ingest_rejects_exact_lease_token_mismatch_before_provid
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("enabled", "halted", "policy", "status", "detail"),
+    ("enabled", "halted", "intake_paused", "policy", "status", "detail"),
     [
-        (False, False, POLICY, 409, "discovery_channel_unavailable"),
-        (True, True, POLICY, 409, "discovery_channel_unavailable"),
-        (True, False, {"youtube_discovery": {"enabled": False}}, 409, "discovery_policy_disabled"),
-        (True, False, {"youtube_discovery": {"enabled": "yes"}}, 409, "discovery_policy_invalid"),
+        (False, False, False, POLICY, 409, "discovery_channel_unavailable"),
+        (True, True, False, POLICY, 409, "discovery_channel_unavailable"),
+        (True, False, True, POLICY, 409, "discovery_channel_intake_paused"),
+        (True, False, False, {"youtube_discovery": {"enabled": False}}, 409, "discovery_policy_disabled"),
+        (True, False, False, {"youtube_discovery": {"enabled": "yes"}}, 409, "discovery_policy_invalid"),
     ],
 )
 async def test_discovery_ingest_rejects_channel_or_policy_before_provider_call(
@@ -404,11 +408,18 @@ async def test_discovery_ingest_rejects_channel_or_policy_before_provider_call(
     monkeypatch,
     enabled,
     halted,
+    intake_paused,
     policy,
     status,
     detail,
 ):
-    channel, queue = await _channel_and_queue(api_session, enabled=enabled, halted=halted, policy=policy)
+    channel, queue = await _channel_and_queue(
+        api_session,
+        enabled=enabled,
+        halted=halted,
+        intake_paused=intake_paused,
+        policy=policy,
+    )
     calls = 0
 
     def fake_client():

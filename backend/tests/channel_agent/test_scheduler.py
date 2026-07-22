@@ -28,8 +28,15 @@ async def test_scheduler_enqueues_one_tick_per_channel_bucket_and_floors_interva
     now = datetime(2026, 5, 19, 12, 5, tzinfo=timezone.utc)
     channel = ChannelProfile(name="scheduled", dry_run=True, enabled=True, tick_interval_minutes=5)
     halted = ChannelProfile(name="halted", dry_run=True, enabled=True, halted_at=now)
+    intake_paused = ChannelProfile(
+        name="intake paused",
+        dry_run=False,
+        enabled=True,
+        intake_paused_at=now,
+        intake_pause_reason="guarded canary",
+    )
     disabled = ChannelProfile(name="disabled", dry_run=True, enabled=False)
-    scheduler_session.add_all([channel, halted, disabled])
+    scheduler_session.add_all([channel, halted, intake_paused, disabled])
     await scheduler_session.commit()
 
     scheduler = ChannelOpsScheduler()
@@ -48,6 +55,26 @@ async def test_scheduler_enqueues_one_tick_per_channel_bucket_and_floors_interva
     assert item.kind == "agent_tick"
     assert item.payload_json["channel_id"] == str(channel.id)
     assert item.idempotency_key == f"agent_tick:{channel.id}:2026-05-19-12-00"
+
+
+@pytest.mark.asyncio
+async def test_intake_pause_state_is_durable_and_observable(scheduler_session):
+    paused_at = datetime(2026, 7, 22, 15, 0, tzinfo=timezone.utc)
+    channel = ChannelProfile(
+        name="guarded canary",
+        enabled=True,
+        dry_run=False,
+        intake_paused_at=paused_at,
+        intake_pause_reason="operator_preapproved_live_unlisted_canary",
+    )
+    scheduler_session.add(channel)
+    await scheduler_session.commit()
+
+    await scheduler_session.refresh(channel)
+
+    assert channel.halted_at is None
+    assert channel.intake_paused_at.replace(tzinfo=timezone.utc) == paused_at
+    assert channel.intake_pause_reason == "operator_preapproved_live_unlisted_canary"
 
 
 def test_scheduler_bucket_respects_tick_interval_minutes():

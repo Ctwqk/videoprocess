@@ -213,6 +213,32 @@ async def test_channel_agent_api_config_seed_enqueue_and_status(api_session):
 
 
 @pytest.mark.asyncio
+async def test_intake_paused_channel_is_visible_but_rejects_manual_tick(api_session):
+    paused_at = datetime(2026, 7, 22, 15, 0, tzinfo=timezone.utc)
+    channel = ChannelProfile(
+        name="Paused canary",
+        enabled=True,
+        dry_run=False,
+        intake_paused_at=paused_at,
+        intake_pause_reason="operator_preapproved_live_unlisted_canary",
+    )
+    api_session.add(channel)
+    await api_session.commit()
+
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        response = await client.get(f"/api/v1/channel-agent/channels/{channel.id}")
+        tick = await client.post(f"/api/v1/channel-agent/channels/{channel.id}/enqueue-tick")
+
+    assert response.status_code == 200
+    assert response.json()["halted_at"] is None
+    assert response.json()["intake_paused_at"] == paused_at.isoformat()
+    assert response.json()["intake_pause_reason"] == "operator_preapproved_live_unlisted_canary"
+    assert tick.status_code == 409
+    assert tick.json() == {"detail": "Channel intake is paused"}
+    assert await api_session.scalar(select(func.count()).select_from(ChannelOpsQueueItem)) == 0
+
+
+@pytest.mark.asyncio
 async def test_enqueue_metrics_returns_channel_scoped_queue_item(api_session):
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
         created_channel = await client.post(

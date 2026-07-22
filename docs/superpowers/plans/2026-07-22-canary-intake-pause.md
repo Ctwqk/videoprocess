@@ -29,14 +29,14 @@ with pgx, pytest, shell deployment contracts, Docker Swarm.
 - Modify: `backend/tests/channel_agent/test_api.py`
 - Create: `backend/tests/migrations/test_channelops_intake_pause_postgres.py`
 
-- [ ] Write failing scheduler/API/model tests proving an intake-paused channel
+- [x] Write failing scheduler/API/model tests proving an intake-paused channel
   is visible but cannot enqueue a manual tick or enter discovery ingestion.
-- [ ] Write a PostgreSQL migration test proving nullable columns, upgrade data
+- [x] Write a PostgreSQL migration test proving nullable columns, upgrade data
   preservation, and downgrade removal.
-- [ ] Run the focused tests and observe the expected missing-column failures.
-- [ ] Add migration 030, ORM/schema fields, response serialization, scheduler
+- [x] Run the focused tests and observe the expected missing-column failures.
+- [x] Add migration 030, ORM/schema fields, response serialization, scheduler
   filter, and API guards.
-- [ ] Re-run focused tests to green.
+- [x] Re-run focused tests to green.
 
 ### Task 2: Enforce intake pause in Go scheduling and queue authority
 
@@ -130,4 +130,3 @@ with pgx, pytest, shell deployment contracts, Docker Swarm.
   durable mature-metrics schedule.
 - [ ] Leave the channel intake-paused, global schedule `CLOSED`, and Redis
   pending counts at zero.
-

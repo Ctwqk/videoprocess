@@ -27,6 +27,7 @@ class ChannelOpsScheduler:
                 select(ChannelProfile)
                 .where(ChannelProfile.enabled.is_(True))
                 .where(ChannelProfile.halted_at.is_(None))
+                .where(ChannelProfile.intake_paused_at.is_(None))
                 .order_by(ChannelProfile.created_at.asc())
             )
         ).scalars().all()

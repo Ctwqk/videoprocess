@@ -38,6 +38,8 @@ class ChannelProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     dry_run: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     halted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     halt_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    intake_paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    intake_pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     config_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     tick_interval_minutes: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
 

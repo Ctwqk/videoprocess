@@ -140,6 +140,8 @@ async def ingest_discovery(
         raise HTTPException(status_code=404, detail="discovery_channel_not_found")
     if not channel.enabled or channel.halted_at is not None:
         raise HTTPException(status_code=409, detail="discovery_channel_unavailable")
+    if channel.intake_paused_at is not None:
+        raise HTTPException(status_code=409, detail="discovery_channel_intake_paused")
     try:
         discovery_policy = DiscoveryPolicy.from_content_mix(channel.content_mix_policy_json)
     except DiscoveryPolicyError:
@@ -385,7 +387,9 @@ async def create_manual_seed(channel_id: str, data: ManualSeedCreate, db: AsyncS
 
 @router.post("/channels/{channel_id}/enqueue-tick", response_model=QueueItemRead)
 async def enqueue_tick(channel_id: str, db: AsyncSession = Depends(get_db)):
-    await _require_channel(db, channel_id)
+    channel = await _require_channel(db, channel_id)
+    if channel.intake_paused_at is not None:
+        raise HTTPException(status_code=409, detail="Channel intake is paused")
     now = Clock().now()
     item = await ChannelOpsQueueService().enqueue(
         db,
@@ -1201,6 +1205,8 @@ def _channel(row: ChannelProfile) -> dict[str, Any]:
         "dry_run": row.dry_run,
         "halted_at": row.halted_at,
         "halt_reason": row.halt_reason,
+        "intake_paused_at": row.intake_paused_at,
+        "intake_pause_reason": row.intake_pause_reason,
         "config_version": row.config_version,
     }
 
