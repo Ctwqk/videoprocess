@@ -12,6 +12,7 @@ FAKE_CRONTAB_CALLS="$TEST_ROOT/crontab-calls"
 FAKE_CRONTAB_FAILURE_USED="$TEST_ROOT/crontab-failure-used"
 FAKE_WATCH_TARGET="$ROOT/bin/channelops-soak-watch.sh"
 VP_SOAK_WATCH_SOURCE="$ROOT_DIR/deploy/swarm/channelops-soak-watch.sh"
+TEST_COMMIT="0123456789abcdef0123456789abcdef01234567"
 trap 'status=$?; rm -rf "$TEST_ROOT"; exit "$status"' EXIT
 
 mkdir -p "$FAKE_BIN"
@@ -164,6 +165,11 @@ printf() {
 
 log() {
   printf 'log|%s\n' "$*" >>"$CALLS"
+}
+
+gh() {
+  printf 'gh|%s\n' "$*" >>"$CALLS"
+  printf 'found\tcompleted\tsuccess\t%s\t101\n' "$TEST_COMMIT"
 }
 
 mv() {
@@ -373,7 +379,7 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
   exit 1
 fi
 source "$EXTENSION"
-images="$(build_vp_app_images 0123456789abcdef)"
+images="$(build_vp_app_images "$TEST_COMMIT")"
 if ! deploy_vp_app_services $images >/dev/null; then
   echo 'FAIL: deploy_vp_app_services returned non-zero' >&2
   exit 1

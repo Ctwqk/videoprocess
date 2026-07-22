@@ -15,6 +15,10 @@ VP_MANAGER_NODE="${VP_MANAGER_NODE:-ccttww-lap}"
 VP_PUBLISHER_CONSTRAINT="node.labels.vp.publisher==true"
 VP_PUBLISHER_MANAGER_CONSTRAINT="node.hostname==$VP_MANAGER_NODE"
 VP_PIPELINE_NETWORK="${VP_PIPELINE_NETWORK:-vp-pipeline-net}"
+VP_APP_CI_REPOSITORY="Ctwqk/videoprocess"
+VP_APP_CI_WORKFLOW="ci.yml"
+VP_PDS_CI_REPOSITORY="Ctwqk/policy-decision-service"
+VP_PDS_CI_WORKFLOW="ci.yml"
 VP_PYTHON_WORKER_SERVICE="vp-ffmpeg-worker-gpu-swarm"
 VP_PUBLISHER_SERVICE="vp-youtube-publisher-swarm"
 VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE $VP_PUBLISHER_SERVICE"
@@ -39,6 +43,86 @@ vp_service_values() {
   local service="$1"
   local template="$2"
   docker service inspect "$service" --format "$template"
+}
+
+vp_require_github_actions_success() {
+  local repository="$1"
+  local workflow="$2"
+  local commit="$3"
+
+  if [[ "${BUILD_IMAGES:-1}" -eq 0 && "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "invalid GitHub Actions repository" >&2
+    return 1
+  fi
+  if [[ ! "$workflow" =~ ^[A-Za-z0-9_.-]+\.ya?ml$ ]]; then
+    echo "invalid GitHub Actions workflow file" >&2
+    return 1
+  fi
+  if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "invalid Git commit for GitHub Actions gate" >&2
+    return 1
+  fi
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "GitHub CLI is required for applying VideoProcess deployments" >&2
+    return 1
+  fi
+
+  local filter
+  filter='if (.workflow_runs | length) == 0 then
+    ["missing", "", "", "", ""] | @tsv
+  else
+    (.workflow_runs | max_by(.run_attempt // 0)) as $run |
+    ["found", $run.status, ($run.conclusion // ""), $run.head_sha, ($run.id | tostring)] | @tsv
+  end'
+  local record
+  if ! record="$(
+    gh api --method GET \
+      "repos/$repository/actions/workflows/$workflow/runs" \
+      -f "head_sha=$commit" \
+      -f event=push \
+      -f per_page=20 \
+      --jq "$filter"
+  )"; then
+    echo "GitHub Actions lookup failed for $repository@$commit" >&2
+    return 1
+  fi
+  if [[ -z "$record" || "$record" == *$'\n'* ]]; then
+    echo "GitHub Actions lookup returned an invalid result for $repository@$commit" >&2
+    return 1
+  fi
+
+  local marker
+  local run_status
+  local conclusion
+  local head_sha
+  local run_id
+  marker="$(awk -F '\t' '{print $1}' <<<"$record")"
+  run_status="$(awk -F '\t' '{print $2}' <<<"$record")"
+  conclusion="$(awk -F '\t' '{print $3}' <<<"$record")"
+  head_sha="$(awk -F '\t' '{print $4}' <<<"$record")"
+  run_id="$(awk -F '\t' '{print $5}' <<<"$record")"
+
+  if [[ "$marker" != found ]]; then
+    echo "no push CI run exists for $repository@$commit" >&2
+    return 1
+  fi
+  if [[ "$head_sha" != "$commit" ]]; then
+    echo "GitHub Actions head SHA mismatch for $repository@$commit" >&2
+    return 1
+  fi
+  if [[ "$run_status" != completed || "$conclusion" != success ]]; then
+    echo "GitHub Actions run is not successful for $repository@$commit: status=$run_status conclusion=${conclusion:-none}" >&2
+    return 1
+  fi
+  if [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+    echo "GitHub Actions run ID is invalid for $repository@$commit" >&2
+    return 1
+  fi
+
+  log "GitHub Actions gate passed $repository@$commit workflow=$workflow run=$run_id"
 }
 
 vp_update_runtime_service() {
@@ -134,6 +218,8 @@ vp_build_manager_image() {
 
 build_vp_app_images() {
   local commit="$1"
+  vp_require_github_actions_success \
+    "$VP_APP_CI_REPOSITORY" "$VP_APP_CI_WORKFLOW" "$commit" || return 1
   local short
   short="$(printf '%s' "$commit" | cut -c1-12)"
   local api="vp-api:deploy-$short"
@@ -158,6 +244,30 @@ build_vp_app_images() {
 
   printf '%s %s %s %s %s %s\n' \
     "$api" "$frontend" "$backend" "$channelops_runner" "$ffmpeg_go" "$python_worker"
+}
+
+build_feature_aggregator_images() {
+  local commit="$1"
+  vp_require_github_actions_success \
+    "$VP_APP_CI_REPOSITORY" "$VP_APP_CI_WORKFLOW" "$commit" || return 1
+  local tag
+  tag="$(image_tag vp-feature-aggregator "$commit")"
+  build_image_on_host "$VP_RUNTIME_HOST" \
+    /Users/wenjieliu/.deploy-build/vp-feature-aggregator \
+    deploy/Dockerfile "$tag" || return 1
+  printf '%s\n' "$tag"
+}
+
+build_pds_images() {
+  local commit="$1"
+  vp_require_github_actions_success \
+    "$VP_PDS_CI_REPOSITORY" "$VP_PDS_CI_WORKFLOW" "$commit" || return 1
+  local tag
+  tag="$(image_tag vp-pds "$commit")"
+  build_image_on_host "$VP_RUNTIME_HOST" \
+    /Users/wenjieliu/.deploy-build/policy-decision-service \
+    deploy/Dockerfile "$tag" || return 1
+  printf '%s\n' "$tag"
 }
 
 vp_resolve_gpu_mode() {
