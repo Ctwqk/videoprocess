@@ -233,7 +233,9 @@ func (s *Store) MarkGoJobRunning(ctx context.Context, jobID string) error {
 	tag, err := s.Pool.Exec(ctx, `
         UPDATE jobs
         SET status = 'RUNNING', started_at = COALESCE(started_at, NOW())
-        WHERE id = $1 AND orchestrator_owner = 'go'
+        WHERE id = $1
+          AND orchestrator_owner = 'go'
+          AND status = 'PLANNING'
     `, jobID)
 	return guardedExecResult(tag.RowsAffected(), err)
 }

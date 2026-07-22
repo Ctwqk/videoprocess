@@ -228,6 +228,33 @@ func TestStartJobRevalidatesAuthorityWhenPlanningClaimLosesRace(t *testing.T) {
 	}
 }
 
+func TestStartJobDoesNotReviveCancellationBetweenPlanningAndRunning(t *testing.T) {
+	transitionErr := errors.New("running transition requires PLANNING")
+	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNode("source-exec", "source-asset"), pendingNode("trim-exec", "trim")))
+	store.cancelAfterClaim = true
+	store.runningRejectedErr = transitionErr
+	dispatcher := &fakeDispatcher{}
+	engine := testEngine(store, dispatcher)
+
+	err := engine.StartJob(context.Background(), "job-1")
+
+	if !errors.Is(err, transitionErr) {
+		t.Fatalf("StartJob error = %v; want running transition rejection", err)
+	}
+	if store.job.Status != "CANCELLED" {
+		t.Fatalf("job status = %q; want CANCELLED", store.job.Status)
+	}
+	if sourceStatus := store.node("source").Status; sourceStatus != "PENDING" {
+		t.Fatalf("source status = %q; want PENDING", sourceStatus)
+	}
+	if trimStatus := store.node("trim").Status; trimStatus != "PENDING" {
+		t.Fatalf("trim status = %q; want PENDING", trimStatus)
+	}
+	if len(dispatcher.calls) != 0 {
+		t.Fatalf("dispatch calls = %d; want 0", len(dispatcher.calls))
+	}
+}
+
 func TestStartJobFailsSourceWithoutAssetID(t *testing.T) {
 	store := newFakeEngineStore(linearJob("PENDING", "go", sourceNodeNoAsset("source-exec"), pendingNode("trim-exec", "trim"), pendingNode("encode-exec", "encode")))
 	dispatcher := &fakeDispatcher{}
@@ -563,7 +590,9 @@ type fakeEngineStore struct {
 	scheduleGuardedJobID string
 	claimAllowed         bool
 	claimCount           int
+	cancelAfterClaim     bool
 	markPlanningCount    int
+	runningRejectedErr   error
 	runningCount         int
 	waitingWindowCount   int
 	queueClaim           bool
@@ -607,11 +636,20 @@ func (s *fakeEngineStore) ClaimGoJobPlanning(_ context.Context, _ string, execut
 	s.job.Status = "PLANNING"
 	s.job.ExecutionPlan = executionPlan
 	s.planningPlan = executionPlan
+	if s.cancelAfterClaim {
+		s.job.Status = "CANCELLED"
+	}
 	return true, nil
 }
 
 func (s *fakeEngineStore) MarkGoJobRunning(_ context.Context, _ string) error {
 	s.runningCount++
+	if s.job.Status != "PLANNING" {
+		if s.runningRejectedErr != nil {
+			return s.runningRejectedErr
+		}
+		return errors.New("running transition requires PLANNING")
+	}
 	s.job.Status = "RUNNING"
 	return nil
 }

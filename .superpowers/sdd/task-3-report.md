@@ -343,3 +343,146 @@ git diff --check produced no output (exit 0).
 The PostgreSQL lock-wait integration test could not run locally because no
 isolated database is configured. CI must execute it with
 `CHANNELOPS_REQUIRE_DATABASE=1`; no production or external database was used.
+
+## Review Fix: Cancellation-Safe Running Transition
+
+### Finding and Scope
+
+After `ClaimGoJobPlanning` committed `PLANNING`, `StartJob` separately called
+`MarkGoJobRunning`. A concurrent `CancelJob` could commit `CANCELLED` between
+those operations, and the running update previously filtered only by job ID
+and Go ownership, allowing it to revive the cancelled job. This fix is limited
+to the running transition and its engine/store regressions; no APIs or other
+job transitions changed.
+
+### RED
+
+The deterministic engine regression was added while the fake running
+transition still unconditionally wrote `RUNNING`:
+
+```bash
+go test -count=1 ./internal/orchestrator -run 'TestStartJobDoesNotReviveCancellationBetweenPlanningAndRunning$' -v
+```
+
+```text
+=== RUN   TestStartJobDoesNotReviveCancellationBetweenPlanningAndRunning
+    engine_test.go:242: StartJob error = <nil>; want running transition rejection
+--- FAIL: TestStartJobDoesNotReviveCancellationBetweenPlanningAndRunning (0.00s)
+FAIL
+FAIL github.com/Ctwqk/videoprocess/internal/orchestrator
+```
+
+The PostgreSQL regression was also added first, but no isolated local database
+is configured, so its local run skipped instead of reaching the old SQL:
+
+```bash
+go test -count=1 ./internal/store -run 'TestMarkGoJobRunningDoesNotReviveCancelledPlanningJob$' -v
+```
+
+```text
+=== RUN   TestMarkGoJobRunningDoesNotReviveCancelledPlanningJob
+    schedule_test.go:266: guarded schedule store integration requires CHANNELOPS_REQUIRE_DATABASE=1
+--- SKIP: TestMarkGoJobRunningDoesNotReviveCancelledPlanningJob (0.00s)
+PASS
+ok github.com/Ctwqk/videoprocess/internal/store
+```
+
+### Implementation
+
+- `MarkGoJobRunning` now updates only a Go-owned job whose current status is
+  exactly `PLANNING`. A concurrent cancellation or terminal transition yields
+  zero affected rows, which `guardedExecResult` maps to `pgx.ErrNoRows`.
+- The engine fake now enforces the same precondition. The regression simulates
+  cancellation immediately after a successful planning claim and verifies
+  that `StartJob` returns the transition error while the job remains
+  `CANCELLED`; source nodes, queued nodes, and the dispatcher remain untouched.
+- The PostgreSQL integration regression creates a `PLANNING` Go job, cancels
+  it, rejects the running transition with `pgx.ErrNoRows`, and verifies the
+  stored status remains `CANCELLED`.
+
+### GREEN
+
+Focused regressions:
+
+```bash
+go test -count=1 ./internal/orchestrator -run 'TestStartJobDoesNotReviveCancellationBetweenPlanningAndRunning$' -v
+go test -count=1 ./internal/store -run 'TestMarkGoJobRunningDoesNotReviveCancelledPlanningJob$' -v
+```
+
+```text
+=== RUN   TestStartJobDoesNotReviveCancellationBetweenPlanningAndRunning
+--- PASS: TestStartJobDoesNotReviveCancellationBetweenPlanningAndRunning (0.00s)
+PASS
+ok github.com/Ctwqk/videoprocess/internal/orchestrator
+=== RUN   TestMarkGoJobRunningDoesNotReviveCancelledPlanningJob
+    schedule_test.go:266: guarded schedule store integration requires CHANNELOPS_REQUIRE_DATABASE=1
+--- SKIP: TestMarkGoJobRunningDoesNotReviveCancelledPlanningJob (0.00s)
+PASS
+ok github.com/Ctwqk/videoprocess/internal/store
+```
+
+Required focused packages:
+
+```bash
+go test -count=1 ./internal/orchestrator ./internal/store
+```
+
+```text
+ok github.com/Ctwqk/videoprocess/internal/orchestrator 0.554s
+ok github.com/Ctwqk/videoprocess/internal/store 0.658s
+```
+
+Required full suite:
+
+```bash
+go test -count=1 ./...
+```
+
+```text
+? github.com/Ctwqk/videoprocess/cmd/channelops-live-smoke [no test files]
+? github.com/Ctwqk/videoprocess/cmd/channelops-runner [no test files]
+? github.com/Ctwqk/videoprocess/cmd/vp-api [no test files]
+? github.com/Ctwqk/videoprocess/cmd/vp-ffmpeg-worker [no test files]
+ok github.com/Ctwqk/videoprocess/internal/channelops 2.103s
+ok github.com/Ctwqk/videoprocess/internal/config 0.502s
+ok github.com/Ctwqk/videoprocess/internal/contracts 0.345s
+ok github.com/Ctwqk/videoprocess/internal/httpapi 0.614s
+ok github.com/Ctwqk/videoprocess/internal/orchestrator 0.703s
+ok github.com/Ctwqk/videoprocess/internal/pipeline 0.899s
+ok github.com/Ctwqk/videoprocess/internal/redisstream 1.058s
+ok github.com/Ctwqk/videoprocess/internal/storage 1.300s
+ok github.com/Ctwqk/videoprocess/internal/store 0.763s
+ok github.com/Ctwqk/videoprocess/internal/worker 5.996s
+ok github.com/Ctwqk/videoprocess/internal/worker/ffmpeg 1.913s
+ok github.com/Ctwqk/videoprocess/internal/worker/handlers 2.814s
+```
+
+Formatting and whitespace:
+
+```bash
+gofmt -w internal/store/go_jobs.go internal/orchestrator/engine_test.go internal/store/schedule_test.go
+git diff --check
+```
+
+```text
+git diff --check produced no output (exit 0).
+```
+
+### Files
+
+- `internal/store/go_jobs.go`
+- `internal/orchestrator/engine_test.go`
+- `internal/store/schedule_test.go`
+- `.superpowers/sdd/task-3-report.md`
+
+### Self-Review and Concerns
+
+- The production predicate is exactly `status = 'PLANNING'`; the API signature
+  and `guardedExecResult` behavior remain unchanged.
+- The engine already returns immediately when `MarkGoJobRunning` fails, and
+  the regression proves this occurs before source resolution, queueing, or
+  dispatch.
+- The store regression could not execute locally because
+  `CHANNELOPS_REQUIRE_DATABASE=1` is unset. CI must force it against its
+  isolated PostgreSQL fixture. No production database, Docker, port 126, or
+  external system was used.

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestOpenVideoScheduleForJobIsAtomicAndExclusive(t *testing.T) {
@@ -258,6 +259,29 @@ func TestClaimGoJobPlanningWaitsForConcurrentScheduleClose(t *testing.T) {
 	}
 	if jobStatus != "WAITING_WINDOW" {
 		t.Fatalf("job status = %q; want WAITING_WINDOW", jobStatus)
+	}
+}
+
+func TestMarkGoJobRunningDoesNotReviveCancelledPlanningJob(t *testing.T) {
+	ctx, st, pipelineID := newScheduleIntegrationFixture(t)
+	jobID := insertScheduleFixtureJob(t, ctx, st, pipelineID, "PLANNING")
+	if _, err := st.CancelJob(ctx, jobID); err != nil {
+		t.Fatalf("cancel planning job: %v", err)
+	}
+
+	err := st.MarkGoJobRunning(ctx, jobID)
+
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("MarkGoJobRunning error = %v; want pgx.ErrNoRows", err)
+	}
+	var status string
+	if err := st.Pool.QueryRow(ctx, `
+		SELECT status::text FROM jobs WHERE id = $1::uuid
+	`, jobID).Scan(&status); err != nil {
+		t.Fatalf("read cancelled job: %v", err)
+	}
+	if status != "CANCELLED" {
+		t.Fatalf("job status = %q; want CANCELLED", status)
 	}
 }
 
