@@ -13,6 +13,7 @@ type Config struct {
 	YouTubeManagerURL            string
 	AutoFlowBaseURL              string
 	AutoFlowTimeout              time.Duration
+	DiscoveryTimeout             time.Duration
 	PDSEnabled                   bool
 	PDSBaseURL                   string
 	PDSClientID                  string
@@ -44,6 +45,7 @@ func LoadConfig() Config {
 		YouTubeManagerURL:            env("YOUTUBE_MANAGER_URL", ""),
 		AutoFlowBaseURL:              env("AUTOFLOW_BASE_URL", "http://api:8080"),
 		AutoFlowTimeout:              time.Duration(floatEnv("AUTOFLOW_TIMEOUT_SECONDS", 10) * float64(time.Second)),
+		DiscoveryTimeout:             time.Duration(intEnv("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS", 120)) * time.Second,
 		PDSEnabled:                   boolEnv("PDS_ENABLED", false),
 		PDSBaseURL:                   env("PDS_BASE_URL", "http://pds:8080"),
 		PDSClientID:                  env("PDS_CLIENT_ID", "videoprocess-channel-agent"),
@@ -82,6 +84,9 @@ func (c Config) Validate() error {
 	}
 	if c.AutoFlowTimeout <= 0 {
 		return errors.New("AUTOFLOW_TIMEOUT_SECONDS must be positive")
+	}
+	if c.DiscoveryTimeout < 30*time.Second || c.DiscoveryTimeout > 300*time.Second {
+		return errors.New("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS must be between 30 and 300")
 	}
 	if c.PDSTimeout <= 0 {
 		return errors.New("PDS_TIMEOUT_SECONDS must be positive")

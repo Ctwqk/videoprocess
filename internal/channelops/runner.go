@@ -18,6 +18,9 @@ type Runner struct {
 }
 
 func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	st, err := OpenStore(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return nil, err
@@ -51,7 +54,18 @@ func newRunnerHandlerService(st *Store, cfg Config, pdsOverride ...PDSDecider) H
 	}
 	youtube := YouTubeManagerClient{BaseURL: cfg.YouTubeManagerURL, Timeout: 20 * time.Second}
 	autoflow := HTTPAutoFlowClient{BaseURL: cfg.AutoFlowBaseURL, Timeout: cfg.AutoFlowTimeout}
-	return HandlerService{Store: st, PDS: pds, AutoFlow: autoflow, YouTube: youtube, Alerts: NewAlertSink(cfg), Config: cfg}
+	var discovery DiscoveryClient
+	if cfg.Validate() == nil {
+		discovery = HTTPDiscoveryClient{
+			BaseURL:    cfg.AutoFlowBaseURL,
+			Timeout:    cfg.DiscoveryTimeout,
+			HTTPClient: &http.Client{Timeout: cfg.DiscoveryTimeout},
+		}
+	}
+	return HandlerService{
+		Store: st, PDS: pds, AutoFlow: autoflow, YouTube: youtube, Discovery: discovery,
+		Alerts: NewAlertSink(cfg), Config: cfg,
+	}
 }
 
 func (r *Runner) Run(ctx context.Context) error {

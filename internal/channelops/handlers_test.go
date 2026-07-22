@@ -75,6 +75,149 @@ func TestClaimableKindsIncludesOperationalQueueKinds(t *testing.T) {
 	}
 }
 
+func TestClaimableKindsIncludesDiscoveryOnlyWhenConfigured(t *testing.T) {
+	handler := HandlerService{
+		Store:    &Store{},
+		PDS:      fakePDS{decision: PDSDecision{Verdict: "allow"}},
+		AutoFlow: fakeAutoFlow{},
+		YouTube:  fakeYouTube{},
+	}
+	if handler.ReadinessError() != nil {
+		t.Fatalf("optional discovery changed readiness: %v", handler.ReadinessError())
+	}
+	if containsString(handler.ClaimableKinds(), QueueIngestDiscovery) {
+		t.Fatalf("ClaimableKinds = %#v, unexpectedly includes discovery", handler.ClaimableKinds())
+	}
+	handler.Discovery = &recordingDiscoveryClient{observation: discoveryObservationForTest(discoveryRequestForTest())}
+	if !containsString(handler.ClaimableKinds(), QueueIngestDiscovery) {
+		t.Fatalf("ClaimableKinds = %#v, missing discovery", handler.ClaimableKinds())
+	}
+}
+
+func TestHandleIngestDiscoveryRejectsMissingIdentityBeforeClientCall(t *testing.T) {
+	request := discoveryRequestForTest()
+	storedChannel := request.ChannelID
+	tests := []struct {
+		name   string
+		mutate func(*QueueItemRow)
+	}{
+		{name: "queue id", mutate: func(item *QueueItemRow) { item.ID = "" }},
+		{name: "stored channel", mutate: func(item *QueueItemRow) { item.ChannelProfileID = nil }},
+		{name: "payload channel", mutate: func(item *QueueItemRow) { item.PayloadJSON["channel_id"] = "00000000-0000-0000-0000-000000000099" }},
+		{name: "source", mutate: func(item *QueueItemRow) { item.PayloadJSON["source"] = "youtube" }},
+		{name: "bucket", mutate: func(item *QueueItemRow) { item.PayloadJSON["scheduler_bucket"] = "" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &recordingDiscoveryClient{observation: discoveryObservationForTest(request)}
+			item := QueueItemRow{
+				ID:               request.QueueItemID,
+				Kind:             QueueIngestDiscovery,
+				ChannelProfileID: &storedChannel,
+				PayloadJSON: map[string]any{
+					"channel_id": request.ChannelID, "source": "youtube_search", "scheduler_bucket": request.SchedulerBucket,
+				},
+			}
+			tt.mutate(&item)
+			err := (HandlerService{Store: &Store{}, Discovery: client}).HandleIngestDiscovery(context.Background(), item)
+			if err == nil {
+				t.Fatal("HandleIngestDiscovery error = nil")
+			}
+			if client.calls != 0 {
+				t.Fatalf("client calls = %d, want 0", client.calls)
+			}
+		})
+	}
+}
+
+func TestHandleIngestDiscoveryDefensivelyRejectsClientMismatch(t *testing.T) {
+	request := discoveryRequestForTest()
+	storedChannel := request.ChannelID
+	observation := discoveryObservationForTest(request)
+	observation.SchedulerBucket = "mismatch"
+	client := &recordingDiscoveryClient{observation: observation}
+	err := (HandlerService{Store: &Store{}, Discovery: client}).HandleIngestDiscovery(context.Background(), QueueItemRow{
+		ID: request.QueueItemID, Kind: QueueIngestDiscovery, ChannelProfileID: &storedChannel,
+		PayloadJSON: map[string]any{"channel_id": request.ChannelID, "source": "youtube_search", "scheduler_bucket": request.SchedulerBucket},
+	})
+	if err == nil || !strings.Contains(err.Error(), "scheduler_bucket mismatch") {
+		t.Fatalf("HandleIngestDiscovery error = %v", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("client calls = %d, want 1", client.calls)
+	}
+}
+
+func TestHandleIngestDiscoveryDoesNotHoldExecutionFenceDuringClientCall(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	channelID := fixture.ChannelID
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind: QueueIngestDiscovery, IdempotencyKey: "discovery-handler-fence:" + channelID,
+		Payload:  map[string]any{"channel_id": channelID, "source": "youtube_search", "scheduler_bucket": "2026-07-21-18"},
+		Priority: 80, ChannelProfileID: &channelID,
+	})
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	item, err := fixture.Store.ClaimNextForKinds(ctx, "discovery-fence-test", []string{QueueIngestDiscovery})
+	if err != nil || item == nil {
+		t.Fatalf("ClaimNextForKinds = %#v, %v", item, err)
+	}
+	client := &recordingDiscoveryClient{ingest: func(request DiscoveryIngestRequest) (DiscoveryObservation, error) {
+		tx, err := fixture.Store.Pool.Begin(ctx)
+		if err != nil {
+			return DiscoveryObservation{}, err
+		}
+		defer tx.Rollback(ctx)
+		var observedChannel string
+		if err := tx.QueryRow(ctx, `SELECT id::text FROM channel_profiles WHERE id = $1::uuid FOR UPDATE NOWAIT`, channelID).Scan(&observedChannel); err != nil {
+			return DiscoveryObservation{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return DiscoveryObservation{}, err
+		}
+		return discoveryObservationForTest(request), nil
+	}}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+	if err := handler.Handle(ctx, *item); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	var status string
+	if err := fixture.Store.Pool.QueryRow(ctx, `SELECT status FROM channel_ops_queue_items WHERE id = $1::uuid`, queueID).Scan(&status); err != nil {
+		t.Fatalf("select queue status: %v", err)
+	}
+	if status != QueueStatusRunning {
+		t.Fatalf("handler changed queue status to %q", status)
+	}
+}
+
+type recordingDiscoveryClient struct {
+	observation DiscoveryObservation
+	err         error
+	calls       int
+	ingest      func(DiscoveryIngestRequest) (DiscoveryObservation, error)
+}
+
+func (c *recordingDiscoveryClient) Ingest(_ context.Context, request DiscoveryIngestRequest) (DiscoveryObservation, error) {
+	c.calls++
+	if c.ingest != nil {
+		return c.ingest(request)
+	}
+	return c.observation, c.err
+}
+
+func discoveryObservationForTest(request DiscoveryIngestRequest) DiscoveryObservation {
+	return DiscoveryObservation{
+		RunID: "00000000-0000-0000-0000-000000000003", ChannelID: request.ChannelID,
+		QueueItemID: request.QueueItemID, Source: request.Source, SchedulerBucket: request.SchedulerBucket,
+		Status: "succeeded", QueryCount: 2, CreatedCount: 3, RefreshedCount: 4, ExpiredCount: 5, QuotaUnitsEstimated: 200,
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

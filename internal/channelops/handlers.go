@@ -15,12 +15,13 @@ type PDSDecider interface {
 }
 
 type HandlerService struct {
-	Store    *Store
-	PDS      PDSDecider
-	AutoFlow AutoFlowClient
-	YouTube  YouTubeClient
-	Alerts   AlertSink
-	Config   Config
+	Store     *Store
+	PDS       PDSDecider
+	AutoFlow  AutoFlowClient
+	YouTube   YouTubeClient
+	Discovery DiscoveryClient
+	Alerts    AlertSink
+	Config    Config
 }
 
 type PlanResult struct {
@@ -71,7 +72,7 @@ func (h HandlerService) ClaimableKinds() []string {
 	if !h.Ready() {
 		return []string{}
 	}
-	return []string{
+	kinds := []string{
 		QueueAgentTick,
 		QueuePlanTask,
 		QueueExecuteTask,
@@ -85,6 +86,10 @@ func (h HandlerService) ClaimableKinds() []string {
 		QueueCleanupExpired,
 		QueueLearningRecompute,
 	}
+	if h.Discovery != nil {
+		kinds = append(kinds, QueueIngestDiscovery)
+	}
+	return kinds
 }
 
 func (h HandlerService) Handle(ctx context.Context, item QueueItemRow) error {
@@ -96,6 +101,9 @@ func (h HandlerService) Handle(ctx context.Context, item QueueItemRow) error {
 	}
 	if item.Kind == QueuePromotePublication {
 		return h.HandlePromotePublication(ctx, item)
+	}
+	if item.Kind == QueueIngestDiscovery {
+		return h.HandleIngestDiscovery(ctx, item)
 	}
 	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
 		fencedHandler := h
@@ -130,9 +138,68 @@ func (h HandlerService) dispatch(ctx context.Context, item QueueItemRow) error {
 		return h.HandleCleanupExpired(ctx, item)
 	case QueueLearningRecompute:
 		return h.HandleLearningRecompute(ctx, item)
+	case QueueIngestDiscovery:
+		return errors.New("ingest_discovery requires split execution fencing")
 	default:
 		return fmt.Errorf("unknown ChannelOps queue kind: %s", item.Kind)
 	}
+}
+
+func (h HandlerService) HandleIngestDiscovery(ctx context.Context, item QueueItemRow) error {
+	if h.Store == nil {
+		return errors.New("channelops handler store is not configured")
+	}
+	if h.Store.hasExecutionTransaction() {
+		return errors.New("ingest_discovery cannot call discovery API while a database fence is held")
+	}
+	if h.Discovery == nil {
+		return errors.New("discovery client is not configured")
+	}
+	request, err := discoveryRequestFromQueueItem(item)
+	if err != nil {
+		return err
+	}
+	observation, err := h.Discovery.Ingest(ctx, request)
+	if err != nil {
+		return err
+	}
+	return validateDiscoveryObservation(request, observation)
+}
+
+func discoveryRequestFromQueueItem(item QueueItemRow) (DiscoveryIngestRequest, error) {
+	if item.Kind != QueueIngestDiscovery {
+		return DiscoveryIngestRequest{}, errors.New("discovery queue item kind is invalid")
+	}
+	if !canonicalDiscoveryUUID(item.ID) {
+		return DiscoveryIngestRequest{}, errors.New("discovery queue item id is invalid")
+	}
+	if item.ChannelProfileID == nil || !canonicalDiscoveryUUID(*item.ChannelProfileID) {
+		return DiscoveryIngestRequest{}, errors.New("discovery queue item stored channel is invalid")
+	}
+	payloadChannelID, ok := item.PayloadJSON["channel_id"].(string)
+	if !ok || payloadChannelID != *item.ChannelProfileID || !canonicalDiscoveryUUID(payloadChannelID) {
+		return DiscoveryIngestRequest{}, errors.New("discovery queue item channel identity is invalid")
+	}
+	source, ok := item.PayloadJSON["source"].(string)
+	if !ok || source != "youtube_search" {
+		return DiscoveryIngestRequest{}, errors.New("discovery queue item source is invalid")
+	}
+	bucket, ok := item.PayloadJSON["scheduler_bucket"].(string)
+	if !ok || strings.TrimSpace(bucket) == "" || len(bucket) > 64 {
+		return DiscoveryIngestRequest{}, errors.New("discovery queue item scheduler_bucket is invalid")
+	}
+	if rawBucket, exists := item.PayloadJSON["bucket"]; exists {
+		payloadBucket, ok := rawBucket.(string)
+		if !ok || payloadBucket != bucket {
+			return DiscoveryIngestRequest{}, errors.New("discovery queue item bucket identity is invalid")
+		}
+	}
+	return DiscoveryIngestRequest{
+		QueueItemID:     item.ID,
+		ChannelID:       payloadChannelID,
+		Source:          source,
+		SchedulerBucket: bucket,
+	}, nil
 }
 
 func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) error {

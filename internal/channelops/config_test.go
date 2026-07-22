@@ -11,6 +11,7 @@ func validConfig() Config {
 		YouTubeManagerURL:            "http://youtube:8899",
 		AutoFlowBaseURL:              "http://api:8080",
 		AutoFlowTimeout:              10 * time.Second,
+		DiscoveryTimeout:             120 * time.Second,
 		LiveMode:                     true,
 		PDSTimeout:                   500 * time.Millisecond,
 		RunnerPollSeconds:            5,
@@ -46,6 +47,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.AutoFlowTimeout != 10*time.Second {
 		t.Fatalf("AutoFlowTimeout = %v", cfg.AutoFlowTimeout)
 	}
+	if cfg.DiscoveryTimeout != 120*time.Second {
+		t.Fatalf("DiscoveryTimeout = %v", cfg.DiscoveryTimeout)
+	}
 	if cfg.RunnerPollSeconds != 5 {
 		t.Fatalf("RunnerPollSeconds = %v", cfg.RunnerPollSeconds)
 	}
@@ -69,6 +73,23 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.DevAllowAllPDS {
 		t.Fatal("DevAllowAllPDS default should be false")
+	}
+}
+
+func TestValidateDiscoveryTimeoutRange(t *testing.T) {
+	for _, timeout := range []time.Duration{29 * time.Second, 301 * time.Second} {
+		cfg := validConfig()
+		cfg.DiscoveryTimeout = timeout
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("Validate accepted DiscoveryTimeout %s", timeout)
+		}
+	}
+	for _, timeout := range []time.Duration{30 * time.Second, 300 * time.Second} {
+		cfg := validConfig()
+		cfg.DiscoveryTimeout = timeout
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate(%s): %v", timeout, err)
+		}
 	}
 }
 
