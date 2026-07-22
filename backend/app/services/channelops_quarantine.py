@@ -158,6 +158,7 @@ async def quarantine_channelops_backlog(
             if close_schedule:
                 assert schedule is not None
                 schedule.state = VideoScheduleState.CLOSED.value
+                schedule.guarded_job_id = None
                 schedule.updated_by = reason
                 schedule.updated_at = changed_at
 

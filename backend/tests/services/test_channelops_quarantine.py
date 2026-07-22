@@ -454,6 +454,36 @@ async def test_apply_uses_custom_reason_and_closes_schedule_atomically(quarantin
 
 
 @pytest.mark.asyncio
+async def test_close_schedule_clears_guarded_job_authority(quarantine_session):
+    rows = await _seed_graph(quarantine_session)
+    quarantine_session.add(
+        RuntimeSchedule(
+            service_name=VIDEO_SCHEDULE_SERVICE,
+            state=VideoScheduleState.OPEN.value,
+            guarded_job_id=rows["active_job"].id,
+            updated_by="guarded_open",
+            updated_at=NOW,
+        )
+    )
+    await quarantine_session.commit()
+
+    await quarantine_channelops_backlog(
+        quarantine_session,
+        rows["target"].id,
+        apply=True,
+        now=NOW,
+        reason=SOAK_REASON,
+        close_schedule=True,
+    )
+
+    quarantine_session.expire_all()
+    schedule = await quarantine_session.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+    assert schedule is not None
+    assert schedule.state == VideoScheduleState.CLOSED.value
+    assert schedule.guarded_job_id is None
+
+
+@pytest.mark.asyncio
 async def test_close_schedule_reuses_conflicting_schedule_row(quarantine_session, monkeypatch):
     rows = await _seed_graph(quarantine_session)
     quarantine_session.add(

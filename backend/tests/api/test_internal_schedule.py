@@ -106,6 +106,50 @@ async def test_legacy_schedule_open_without_expected_job_id_is_unchanged(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("path", "expected_state"),
+    (
+        ("/internal/schedule/video/open", "OPEN"),
+        ("/internal/schedule/video/drain", "DRAINING"),
+        ("/internal/schedule/video/close", "CLOSED"),
+    ),
+)
+async def test_generic_schedule_transition_clears_guarded_job_authority(
+    schedule_api,
+    path: str,
+    expected_state: str,
+):
+    session = schedule_api.seed_session
+    guarded_job = _job(status=JobStatus.SUCCEEDED)
+    session.add(guarded_job)
+    await session.flush()
+    session.add(
+        RuntimeSchedule(
+            service_name="videoprocess",
+            state="OPEN",
+            guarded_job_id=guarded_job.id,
+            updated_by="guarded_open",
+        )
+    )
+    await session.commit()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=schedule_api.app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(path)
+
+    assert response.status_code == 200
+    assert response.json()["state"] == expected_state
+    assert response.json()["guarded_job_id"] is None
+    session.expire_all()
+    schedule = await session.get(RuntimeSchedule, "videoprocess")
+    assert schedule is not None
+    assert schedule.state == expected_state
+    assert schedule.guarded_job_id is None
+
+
+@pytest.mark.anyio
 async def test_guarded_schedule_open_releases_and_starts_only_expected_python_job_after_commit(
     schedule_api,
     monkeypatch: pytest.MonkeyPatch,
