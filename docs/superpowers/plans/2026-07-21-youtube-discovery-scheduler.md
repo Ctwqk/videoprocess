@@ -16,6 +16,8 @@
 - External-platform assets require explicit human review before upload or publication.
 - Go remains the only production ChannelOps scheduler; add no Python timer or host cron.
 - Queue authority stays channel scoped and fails closed across halt/quarantine races.
+- An intake pause blocks only `agent_tick` and `ingest_discovery`; existing
+  downstream work, reconciliation, and mature metrics remain eligible.
 - Provider errors, URLs, credentials, and response bodies must not enter run audit errors.
 - Do not deploy or place VideoProcess work on host 126.
 - Every new service has focused tests and follows red-green-refactor.

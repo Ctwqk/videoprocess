@@ -166,9 +166,11 @@ dry-run mode.
 
 After all preflights pass, switch only this channel out of dry-run and enqueue
 one guarded tick. The 2026-07-22 atomic intake pause must create exactly one
-production task and pause new intake in the same transaction. With the old
-backlog quarantined, open the global video window, wait for the canary job to
-start, then drain and close the window. A successful attempt keeps the channel
+production task and pause new intake in the same transaction. The pause blocks
+only `agent_tick` and `ingest_discovery`; it does not block the selected task's
+downstream queue, reconciliation, or mature metrics. With the old backlog
+quarantined, open the global video window, wait for the canary job to start,
+then drain and close the window. A successful attempt keeps the channel
 intake-paused while the ChannelOps runner continues the selected task through
 publication, reconciliation, and mature metrics. A failed attempt fully halts
 the channel and its active canary work.

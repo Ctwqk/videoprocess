@@ -458,9 +458,10 @@ queue rows. Assert dry-run changes nothing. Assert apply:
 Assert quarantine defaults to dry-run and requires `--apply` for mutation.
 Assert the canary runner contains schedule close in a `finally` block, uses
 `unlisted`, sets `external_asset_auto_publish=false`, limits cadence to one,
-uses the atomic intake pause after exactly one task, keeps intake paused for
-downstream and mature metrics on success, fully halts on failure, and refuses
-to run while pre-existing runnable jobs remain.
+uses the atomic intake pause after exactly one task, blocks only new
+`agent_tick` and `ingest_discovery` intake, keeps all existing downstream work
+and mature metrics running on success, fully halts on failure, and refuses to
+run while pre-existing runnable jobs remain.
 
 - [ ] **Step 3: Run and confirm failures**
 

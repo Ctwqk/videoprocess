@@ -181,8 +181,9 @@ may add placement exclusions, but it cannot replace the immutable
 Creating or enabling the state file is a separate human activation action and
 requires a separately approved, successful unlisted canary. The 2026-07-12
 halt-after-selection procedure is superseded by the 2026-07-22 atomic intake
-pause: the successful canary remains intake-paused for downstream and mature
-metrics, while a failed attempt becomes fully halted. The required approval
+pause: it blocks only `agent_tick` and `ingest_discovery`, so the successful
+canary remains intake-paused while existing downstream work and mature metrics
+continue; a failed attempt becomes fully halted. The required approval
 for the next attempt is exactly `批准第四次 unlisted canary`. Deploying code
 may replace the watcher and its managed cron entry, but it cannot create
 activation state, activate a channel, resume a halted channel, or reopen the
