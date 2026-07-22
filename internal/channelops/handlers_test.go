@@ -511,6 +511,139 @@ func TestHandleAgentTickAtomicallyPausesIntakeAfterOneTask(t *testing.T) {
 	}
 }
 
+func TestDirectTickCannotCrossGuardedIntakePause(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(context.Background())
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+
+	guardedEntered := make(chan struct{}, 1)
+	releaseGuarded := make(chan struct{})
+	guardedHandler := fixture.HandlerService(PDSDecision{})
+	guardedHandler.PDS = waitingPDS{entered: guardedEntered, release: releaseGuarded}
+	channelID := fixture.ChannelID
+	queueItemID := testUUID(t, "guarded-queue-item")
+	canaryRunID := testUUID(t, "guarded-canary-run")
+	guardedDone := make(chan error, 1)
+	go func() {
+		guardedDone <- guardedHandler.Handle(ctx, QueueItemRow{
+			ID:               queueItemID,
+			Kind:             QueueAgentTick,
+			ChannelProfileID: &channelID,
+			PayloadJSON: map[string]any{
+				"channel_id":                   fixture.ChannelID,
+				"canary_run_id":                canaryRunID,
+				"plan_delay_seconds":           float64(300),
+				"pause_intake_after_selection": true,
+			},
+		})
+	}()
+
+	select {
+	case <-guardedEntered:
+	case <-ctx.Done():
+		t.Fatal("guarded tick did not reach policy evaluation")
+	}
+
+	ordinaryEntered := make(chan struct{}, 1)
+	ordinaryHandler := fixture.HandlerService(PDSDecision{})
+	ordinaryHandler.PDS = notifyingPDS{entered: ordinaryEntered}
+	ordinaryDone := make(chan error, 1)
+	go func() {
+		ordinaryDone <- fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), ordinaryHandler)
+	}()
+
+	ordinaryCrossedFence := false
+	select {
+	case <-ordinaryEntered:
+		ordinaryCrossedFence = true
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(releaseGuarded)
+
+	if err := <-guardedDone; err != nil {
+		t.Fatalf("guarded tick: %v", err)
+	}
+	ordinaryErr := <-ordinaryDone
+	if ordinaryCrossedFence {
+		t.Fatal("direct ordinary tick evaluated policy while guarded tick held the channel fence")
+	}
+	if !errors.Is(ordinaryErr, ErrChannelExecutionBlocked) {
+		t.Fatalf("direct ordinary tick error = %v, want ErrChannelExecutionBlocked", ordinaryErr)
+	}
+
+	var taskCount int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM production_tasks WHERE channel_profile_id = $1::uuid
+	`, fixture.ChannelID).Scan(&taskCount); err != nil {
+		t.Fatalf("count tasks after guarded race: %v", err)
+	}
+	if taskCount != 1 {
+		t.Fatalf("tasks after guarded race = %d, want exactly 1", taskCount)
+	}
+}
+
+func TestDirectTickHonorsHaltedChannelFence(t *testing.T) {
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles
+		SET halted_at = NOW(), halt_reason = 'direct tick fence test'
+		WHERE id = $1::uuid
+	`, fixture.ChannelID); err != nil {
+		t.Fatalf("halt channel: %v", err)
+	}
+
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler)
+	if !errors.Is(err, ErrChannelExecutionBlocked) {
+		t.Fatalf("direct halted tick error = %v, want ErrChannelExecutionBlocked", err)
+	}
+
+	var taskCount int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT count(*) FROM production_tasks WHERE channel_profile_id = $1::uuid
+	`, fixture.ChannelID).Scan(&taskCount); err != nil {
+		t.Fatalf("count halted tasks: %v", err)
+	}
+	if taskCount != 0 {
+		t.Fatalf("halted direct tick created %d tasks", taskCount)
+	}
+}
+
+type waitingPDS struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (p waitingPDS) Decide(ctx context.Context, _ PDSDecisionRequest) (PDSDecision, error) {
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-p.release:
+		return PDSDecision{Verdict: "allow", DecisionID: "allow"}, nil
+	case <-ctx.Done():
+		return PDSDecision{}, ctx.Err()
+	}
+}
+
+type notifyingPDS struct {
+	entered chan<- struct{}
+}
+
+func (p notifyingPDS) Decide(context.Context, PDSDecisionRequest) (PDSDecision, error) {
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+	return PDSDecision{Verdict: "allow", DecisionID: "allow"}, nil
+}
+
 func TestGuardedAgentTickRollsBackUnlessExactlyOneTaskIsSelected(t *testing.T) {
 	for _, tt := range []struct {
 		name  string

@@ -36,6 +36,21 @@ func (s *Store) RunTickWithOptions(
 	if options.PlanDelay < 0 || options.PlanDelay > time.Hour {
 		return errors.New("plan delay must be from 0 through 1 hour")
 	}
+	if !s.hasExecutionTransaction() {
+		return s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
+			return fencedStore.runTickWithOptions(ctx, channelID, bucket, options, h)
+		})
+	}
+	return s.runTickWithOptions(ctx, channelID, bucket, options, h)
+}
+
+func (s *Store) runTickWithOptions(
+	ctx context.Context,
+	channelID string,
+	bucket string,
+	options agentTickOptions,
+	h HandlerService,
+) error {
 	now := s.Now().UTC()
 	channel, lanes, accounts, seeds, signals, laneFormats, err := s.LoadTickInputs(ctx, channelID, now)
 	if err != nil {

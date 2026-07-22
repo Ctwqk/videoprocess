@@ -62,6 +62,15 @@ func (s *Store) WithQueueExecutionFence(ctx context.Context, item QueueItemRow, 
 }
 
 func (s *Store) WithChannelExecutionFence(ctx context.Context, channelID string, dispatch func(*Store) error) error {
+	return s.withChannelExecutionFence(ctx, channelID, false, dispatch)
+}
+
+func (s *Store) withChannelExecutionFence(
+	ctx context.Context,
+	channelID string,
+	requireOpenIntake bool,
+	dispatch func(*Store) error,
+) error {
 	if err := requireUUID("channel_profile_id", channelID); err != nil {
 		return fmt.Errorf("%w: %v", ErrChannelExecutionBlocked, err)
 	}
@@ -76,7 +85,7 @@ func (s *Store) WithChannelExecutionFence(ctx context.Context, channelID string,
 		}
 	}()
 
-	if err := lockExecutableChannel(ctx, tx, channelID, false); err != nil {
+	if err := lockExecutableChannel(ctx, tx, channelID, requireOpenIntake); err != nil {
 		return err
 	}
 	if err := dispatch(s.withExecutionDB(tx, &channelID)); err != nil {
