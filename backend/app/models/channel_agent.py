@@ -227,6 +227,62 @@ class DiscoverySignal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     converted_task_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
+class DiscoveryIngestionRun(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "discovery_ingestion_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_profile_id",
+            "source",
+            "scheduler_bucket",
+            name="uq_discovery_ingestion_run_channel_source_bucket",
+        ),
+        UniqueConstraint("queue_item_id", name="uq_discovery_ingestion_run_queue_item"),
+        CheckConstraint("source = 'youtube_search'", name="ck_discovery_ingestion_run_source"),
+        CheckConstraint(
+            "query_version = 'youtube-lane-keyword-v1'",
+            name="ck_discovery_ingestion_run_query_version",
+        ),
+        CheckConstraint(
+            "status IN ('running','succeeded','failed')",
+            name="ck_discovery_ingestion_run_status",
+        ),
+        CheckConstraint("attempt_count >= 1", name="ck_discovery_ingestion_run_attempt_count"),
+        CheckConstraint("query_count >= 0", name="ck_discovery_ingestion_run_query_count"),
+        CheckConstraint("created_count >= 0", name="ck_discovery_ingestion_run_created_count"),
+        CheckConstraint("refreshed_count >= 0", name="ck_discovery_ingestion_run_refreshed_count"),
+        CheckConstraint("expired_count >= 0", name="ck_discovery_ingestion_run_expired_count"),
+        CheckConstraint(
+            "quota_units_estimated >= 0",
+            name="ck_discovery_ingestion_run_quota_units_estimated",
+        ),
+    )
+
+    channel_profile_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("channel_profiles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    queue_item_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("channel_ops_queue_items.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source: Mapped[str] = mapped_column(String(64), default="youtube_search", nullable=False)
+    scheduler_bucket: Mapped[str] = mapped_column(String(64), nullable=False)
+    query_version: Mapped[str] = mapped_column(String(64), default="youtube-lane-keyword-v1", nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="running", nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    query_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    refreshed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    expired_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    quota_units_estimated: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    policy_snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
 class ProductionTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "production_tasks"
     __table_args__ = (Index("ix_production_tasks_channel_state", "channel_profile_id", "state"),)

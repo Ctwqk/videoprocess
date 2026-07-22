@@ -56,7 +56,7 @@ async def test_postgres_16_revision_trigger_rejects_025_writers_and_downgrades_c
             assert await conn.fetchval("SHOW server_version_num") >= "160000"
             assert (
                 await conn.fetchval("SELECT version_num FROM alembic_version")
-                == "028_channelops_metric_schedules"
+                == "029_channelops_discovery_ingestion_runs"
             )
             columns = {
                 row["column_name"]: row["is_nullable"]
