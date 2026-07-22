@@ -988,6 +988,17 @@ func (h HandlerService) HandleCollectMetrics(ctx context.Context, item QueueItem
 	if task.State == TaskHeld || task.State == TaskFailed || task.State == TaskRejected {
 		return nil
 	}
+	var schedule *MetricScheduleRow
+	if firstString(item.PayloadJSON, "metric_schedule_id") != "" {
+		lockedSchedule, err := h.Store.LockMetricScheduleForQueue(ctx, item)
+		if err != nil {
+			return err
+		}
+		if lockedSchedule.Status != MetricSchedulePending {
+			return nil
+		}
+		schedule = &lockedSchedule
+	}
 	metrics := mapFromAny(item.PayloadJSON["metrics"])
 	if !HasRecognizedMetrics(metrics) && publication.PlatformContentID != "" && h.YouTube != nil {
 		fetched, err := h.YouTube.FetchMetrics(ctx, publication.PlatformContentID)
@@ -996,11 +1007,33 @@ func (h HandlerService) HandleCollectMetrics(ctx context.Context, item QueueItem
 		}
 	}
 	if !HasRecognizedMetrics(metrics) {
+		if schedule != nil {
+			return h.Store.RequeueOrExpireMetricSchedule(
+				ctx,
+				publication,
+				*schedule,
+				item,
+				h.Config.MetricsPollMaxAttempts,
+				metricsPollDelay(h.Config),
+			)
+		}
 		return h.Store.RequeueOrHoldMetrics(ctx, publication, item, h.Config.MetricsPollMaxAttempts, metricsPollDelay(h.Config))
 	}
-	stage := SnapshotStageFromPayload(item.PayloadJSON)
 	score, fields := MetricsCompleteness(metrics)
 	reward, components := RewardScore(metrics, PublicationRewardContext{StablePublication: true})
+	if schedule != nil {
+		return h.Store.CompleteMetricSchedule(
+			ctx,
+			publication,
+			*schedule,
+			metrics,
+			score,
+			fields,
+			reward,
+			components,
+		)
+	}
+	stage := SnapshotStageFromPayload(item.PayloadJSON)
 	return h.Store.UpsertFeedbackSnapshot(ctx, publication, metrics, stage, score, fields, reward, components)
 }
 

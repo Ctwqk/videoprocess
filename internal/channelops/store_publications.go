@@ -466,6 +466,9 @@ func (s *Store) UpsertFeedbackSnapshot(ctx context.Context, publication Publicat
 	`, publication.ID, now); err != nil {
 		return err
 	}
+	if stage != "24h" {
+		return nil
+	}
 	return s.updateTaskState(ctx, publication.ProductionTaskID, TaskMeasured, "", "", "collect_metrics", "", now)
 }
 

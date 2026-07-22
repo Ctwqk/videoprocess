@@ -57,6 +57,11 @@ const (
 	PromotionConfirmed  = "confirmed"
 	PromotionFinalized  = "finalized"
 	PromotionUncertain  = "uncertain"
+
+	MetricSchedulePending   = "pending"
+	MetricScheduleSucceeded = "succeeded"
+	MetricScheduleExpired   = "expired"
+	MetricErrorUnavailable  = "metrics_unavailable"
 )
 
 type ChannelProfileRow struct {

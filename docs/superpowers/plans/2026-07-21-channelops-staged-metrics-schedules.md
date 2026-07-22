@@ -248,7 +248,7 @@ git commit -m "feat: schedule five publication metric stages"
 - Produces: `(*Store).CompleteMetricSchedule(ctx, publication, schedule, metrics, score, fields, reward, rewardComponents) error`.
 - Preserves: `RequeueOrHoldMetrics` for queue rows without `metric_schedule_id`.
 
-- [ ] **Step 1: Write failing validation and retry tests**
+- [x] **Step 1: Write failing validation and retry tests**
 
 Cover schedule/publication mismatch, stage mismatch, invalid UUID, a retry
 before grace, expiry at grace, and expiry at the configured attempt cap. A
@@ -265,7 +265,7 @@ fmt.Sprintf(
 The next `run_after` is `min(now+retryDelay, grace_until)` and schedule errors
 contain only fixed codes.
 
-- [ ] **Step 2: Run the selected tests and verify RED**
+- [x] **Step 2: Run the selected tests and verify RED**
 
 Run:
 
@@ -277,7 +277,7 @@ go test ./internal/channelops -run \
 
 Expected: compile failure for the new store methods.
 
-- [ ] **Step 3: Implement lock, retry, and expiry methods**
+- [x] **Step 3: Implement lock, retry, and expiry methods**
 
 `LockMetricScheduleForQueue` must require and parse both
 `metric_schedule_id` and `snapshot_stage`, select `FOR UPDATE`, and compare
@@ -297,7 +297,7 @@ last_error_code=metrics_unavailable
 It does not fabricate a feedback snapshot and does not hold the task merely
 because a non-primary stage expires.
 
-- [ ] **Step 4: Add failing successful-completion tests**
+- [x] **Step 4: Add failing successful-completion tests**
 
 Assert successful collection atomically:
 
@@ -308,7 +308,7 @@ Assert successful collection atomically:
 - preserves task state for `1h`, `6h`, `72h`, and `7d`;
 - replays without duplicate rows.
 
-- [ ] **Step 5: Wire the handler and completion method**
+- [x] **Step 5: Wire the handler and completion method**
 
 Branch only when `metric_schedule_id` is present:
 
@@ -324,7 +324,7 @@ when `stage == "24h"`. `CompleteMetricSchedule` calls it and updates the
 schedule in the same fenced transaction. Legacy payloads continue through
 the old requeue path.
 
-- [ ] **Step 6: Run focused and full ChannelOps tests**
+- [x] **Step 6: Run focused and full ChannelOps tests**
 
 Run:
 
@@ -335,7 +335,7 @@ go test ./internal/channelops -count=1
 
 Expected: all ChannelOps tests pass, including legacy metrics cases.
 
-- [ ] **Step 7: Commit collection state machine**
+- [x] **Step 7: Commit collection state machine**
 
 ```bash
 git add internal/channelops/metric_schedules.go \

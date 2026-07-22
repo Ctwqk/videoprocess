@@ -276,8 +276,20 @@ func TestFakeLiveFlowReachesMeasured(t *testing.T) {
 	if got := fixture.CountRows(ctx, "publication_records"); got != 1 {
 		t.Fatalf("publication count = %d", got)
 	}
-	if got := fixture.CountRows(ctx, "feedback_snapshots"); got != 1 {
-		t.Fatalf("feedback snapshot count = %d", got)
+	var feedbackCount int
+	var feedbackStages string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(string_agg(
+		           snapshot_stage,
+		           ',' ORDER BY array_position(ARRAY['1h','6h','24h','72h','7d'], snapshot_stage)
+		       ), '')
+		FROM feedback_snapshots
+	`).Scan(&feedbackCount, &feedbackStages); err != nil {
+		t.Fatalf("select feedback stages: %v", err)
+	}
+	if feedbackCount != 5 || feedbackStages != "1h,6h,24h,72h,7d" {
+		t.Fatalf("feedback snapshot count/stages = %d/%s", feedbackCount, feedbackStages)
 	}
 	if got := fixture.CountRows(ctx, "material_usage_ledger"); got == 0 {
 		t.Fatal("material ledger did not grow")
@@ -1718,17 +1730,35 @@ func TestCollectMetricsRequeueUsesConfiguredDelay(t *testing.T) {
 	}
 
 	publicationID, _ := collect.PayloadJSON["publication_id"].(string)
+	scheduleID, _ := collect.PayloadJSON["metric_schedule_id"].(string)
+	stage, _ := collect.PayloadJSON["snapshot_stage"].(string)
+	if scheduleID == "" || stage == "" {
+		t.Fatalf("collect payload lacks schedule authority: %#v", collect.PayloadJSON)
+	}
 	var runAfter time.Time
 	if err := fixture.Store.Pool.QueryRow(ctx, `
 		SELECT run_after
 		FROM channel_ops_queue_items
 		WHERE kind = $1
 		  AND idempotency_key = $2
-	`, QueueCollectMetrics, fmt.Sprintf("collect_metrics:%s:poll:1", publicationID)).Scan(&runAfter); err != nil {
+	`, QueueCollectMetrics, fmt.Sprintf("collect_metrics:%s:stage:%s:attempt:1", publicationID, stage)).Scan(&runAfter); err != nil {
 		t.Fatalf("select requeued collect_metrics run_after: %v", err)
 	}
 	if want := fixture.Store.Now().UTC().Add(11 * time.Minute); !runAfter.Equal(want) {
 		t.Fatalf("requeued collect_metrics run_after = %s, want %s", runAfter, want)
+	}
+	var status string
+	var attemptCount int
+	var lastAttemptAt *time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count, last_attempt_at
+		FROM publication_metric_schedules
+		WHERE id = $1::uuid
+	`, scheduleID).Scan(&status, &attemptCount, &lastAttemptAt); err != nil {
+		t.Fatalf("select retried metric schedule: %v", err)
+	}
+	if status != "pending" || attemptCount != 1 || lastAttemptAt == nil || !lastAttemptAt.Equal(fixture.Store.Now().UTC()) {
+		t.Fatalf("retried schedule status/attempt/last = %s/%d/%v", status, attemptCount, lastAttemptAt)
 	}
 }
 
@@ -1754,7 +1784,8 @@ func TestCollectMetricsUpsertsStagedRewardSnapshot(t *testing.T) {
 	}
 	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
 	publicationID, _ := collect.PayloadJSON["publication_id"].(string)
-	collect.PayloadJSON["snapshot_stage"] = "6h"
+	scheduleID, _ := collect.PayloadJSON["metric_schedule_id"].(string)
+	payloadStage, _ := collect.PayloadJSON["snapshot_stage"].(string)
 	collect.PayloadJSON["metrics"] = map[string]any{
 		"views":                 1000,
 		"likes":                 50,
@@ -1790,8 +1821,228 @@ func TestCollectMetricsUpsertsStagedRewardSnapshot(t *testing.T) {
 	`, publicationID).Scan(&count, &stage, &likes, &hasReward, &hasEngagement); err != nil {
 		t.Fatalf("select feedback snapshots: %v", err)
 	}
-	if count != 1 || stage != "6h" || likes != 75 || !hasReward || !hasEngagement {
+	if count != 1 || stage != "1h" || likes != 50 || !hasReward || !hasEngagement {
 		t.Fatalf("snapshot summary count/stage/likes/reward/engagement = %d/%s/%d/%v/%v", count, stage, likes, hasReward, hasEngagement)
+	}
+	var scheduleStatus string
+	var attemptCount int
+	var availableFields []byte
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count, available_fields_json
+		FROM publication_metric_schedules
+		WHERE id = $1::uuid
+	`, scheduleID).Scan(&scheduleStatus, &attemptCount, &availableFields); err != nil {
+		t.Fatalf("select completed metric schedule: %v", err)
+	}
+	if scheduleStatus != "succeeded" || attemptCount != 1 || !strings.Contains(string(availableFields), "views") {
+		t.Fatalf("completed schedule status/attempt/fields = %s/%d/%s", scheduleStatus, attemptCount, availableFields)
+	}
+	task := fixture.RequireSingleTask(ctx)
+	if task.State != TaskScheduled {
+		t.Fatalf("task state after %s snapshot = %s, want scheduled", payloadStage, task.State)
+	}
+}
+
+func TestCollectMetricsRejectsMismatchedScheduleAuthorityBeforeYouTube(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	scheduleID := firstString(collect.PayloadJSON, "metric_schedule_id")
+	collect.PayloadJSON["snapshot_stage"] = "6h"
+	recorder := &externalCallRecorder{}
+	handler.YouTube = &recordingYouTube{recorder: recorder}
+
+	err := handler.Handle(ctx, collect)
+	if !errors.Is(err, ErrQueueAuthorityInvalid) {
+		t.Fatalf("Handle mismatched schedule error = %v, want queue authority rejection", err)
+	}
+	if got := recorder.fetchMetrics.Load(); got != 0 {
+		t.Fatalf("YouTube metrics calls = %d, want zero", got)
+	}
+	var status string
+	var attemptCount int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count
+		FROM publication_metric_schedules
+		WHERE id = $1::uuid
+	`, scheduleID).Scan(&status, &attemptCount); err != nil {
+		t.Fatalf("select rejected schedule: %v", err)
+	}
+	if status != MetricSchedulePending || attemptCount != 0 {
+		t.Fatalf("rejected schedule status/attempt = %s/%d", status, attemptCount)
+	}
+}
+
+func TestMetricScheduleExpiresAtGraceWithoutHoldingNonPrimaryTask(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	scheduleID := firstString(collect.PayloadJSON, "metric_schedule_id")
+	stage := firstString(collect.PayloadJSON, "snapshot_stage")
+	if stage != "1h" {
+		t.Fatalf("first metric stage = %q, want 1h", stage)
+	}
+	var graceUntil time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT grace_until FROM publication_metric_schedules WHERE id = $1::uuid
+	`, scheduleID).Scan(&graceUntil); err != nil {
+		t.Fatalf("select grace deadline: %v", err)
+	}
+	fixture.Store.Now = func() time.Time { return graceUntil }
+	handler.YouTube = fakeNoMetricsYouTube{fakeYouTube{}}
+
+	if err := handler.Handle(ctx, collect); err != nil {
+		t.Fatalf("Handle expired metric schedule: %v", err)
+	}
+	var status, errorCode string
+	var completedAt *time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, COALESCE(last_error_code, ''), completed_at
+		FROM publication_metric_schedules
+		WHERE id = $1::uuid
+	`, scheduleID).Scan(&status, &errorCode, &completedAt); err != nil {
+		t.Fatalf("select expired schedule: %v", err)
+	}
+	if status != MetricScheduleExpired || errorCode != MetricErrorUnavailable || completedAt == nil {
+		t.Fatalf("expired schedule status/error/completed = %s/%s/%v", status, errorCode, completedAt)
+	}
+	if task := fixture.RequireSingleTask(ctx); task.State != TaskScheduled {
+		t.Fatalf("task state after non-primary expiry = %s, want scheduled", task.State)
+	}
+}
+
+func Test24hMetricScheduleExpiryHoldsTask(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+
+	for _, wantStage := range []string{"1h", "6h"} {
+		collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+		if stage := firstString(collect.PayloadJSON, "snapshot_stage"); stage != wantStage {
+			t.Fatalf("metric stage = %q, want %q", stage, wantStage)
+		}
+		collect.PayloadJSON["metrics"] = map[string]any{"views": 10, "likes": 2}
+		if err := handler.Handle(ctx, collect); err != nil {
+			t.Fatalf("Handle %s metrics: %v", wantStage, err)
+		}
+		if err := fixture.Store.MarkQueueDone(ctx, collect); err != nil {
+			t.Fatalf("MarkQueueDone %s metrics: %v", wantStage, err)
+		}
+	}
+
+	collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+	if stage := firstString(collect.PayloadJSON, "snapshot_stage"); stage != "24h" {
+		t.Fatalf("metric stage = %q, want 24h", stage)
+	}
+	scheduleID := firstString(collect.PayloadJSON, "metric_schedule_id")
+	var graceUntil time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT grace_until FROM publication_metric_schedules WHERE id = $1::uuid
+	`, scheduleID).Scan(&graceUntil); err != nil {
+		t.Fatalf("select grace deadline: %v", err)
+	}
+	fixture.Store.Now = func() time.Time { return graceUntil }
+	handler.YouTube = fakeNoMetricsYouTube{fakeYouTube{}}
+
+	if err := handler.Handle(ctx, collect); err != nil {
+		t.Fatalf("Handle expired 24h metric schedule: %v", err)
+	}
+	if task := fixture.RequireSingleTask(ctx); task.State != TaskHeld ||
+		task.BlockedByGuard == nil || *task.BlockedByGuard != MetricErrorUnavailable {
+		t.Fatalf("task state/guard after 24h expiry = %s/%v", task.State, task.BlockedByGuard)
+	}
+}
+
+func TestSuccessful24hMetricScheduleMarksTaskMeasured(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	if err := fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), handler); err != nil {
+		t.Fatalf("RunTick: %v", err)
+	}
+	promote := fixture.ProcessUntilQueueKind(ctx, handler, QueuePromotePublication)
+	if err := handler.HandlePromotePublication(ctx, promote); err != nil {
+		t.Fatalf("HandlePromotePublication: %v", err)
+	}
+	if err := fixture.Store.MarkQueueDone(ctx, promote); err != nil {
+		t.Fatalf("MarkQueueDone promote: %v", err)
+	}
+
+	for _, wantStage := range []string{"1h", "6h", "24h"} {
+		collect := fixture.ProcessUntilQueueKind(ctx, handler, QueueCollectMetrics)
+		if stage := firstString(collect.PayloadJSON, "snapshot_stage"); stage != wantStage {
+			t.Fatalf("metric stage = %q, want %q", stage, wantStage)
+		}
+		collect.PayloadJSON["metrics"] = map[string]any{"views": 10, "likes": 2}
+		if err := handler.Handle(ctx, collect); err != nil {
+			t.Fatalf("Handle %s metrics: %v", wantStage, err)
+		}
+		if err := fixture.Store.MarkQueueDone(ctx, collect); err != nil {
+			t.Fatalf("MarkQueueDone %s metrics: %v", wantStage, err)
+		}
+		wantState := TaskScheduled
+		if wantStage == "24h" {
+			wantState = TaskMeasured
+		}
+		if task := fixture.RequireSingleTask(ctx); task.State != wantState {
+			t.Fatalf("task state after %s = %s, want %s", wantStage, task.State, wantState)
+		}
 	}
 }
 

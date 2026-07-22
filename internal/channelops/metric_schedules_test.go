@@ -57,3 +57,58 @@ func TestBuildMetricSchedulePlansCreatesFiveStageSpecificQueueFacts(t *testing.T
 		}
 	}
 }
+
+func TestMetricScheduleRetryDecisionRetriesBeforeGrace(t *testing.T) {
+	now := time.Date(2026, 7, 21, 21, 0, 0, 0, time.UTC)
+	schedule := MetricScheduleRow{
+		AttemptCount: 0,
+		GraceUntil:   now.Add(2 * time.Hour),
+	}
+
+	decision := MetricScheduleRetryDecision(schedule, now, 24, time.Hour)
+	if decision.Expire {
+		t.Fatal("first unavailable attempt unexpectedly expired")
+	}
+	if decision.AttemptCount != 1 {
+		t.Fatalf("attempt count = %d, want 1", decision.AttemptCount)
+	}
+	if want := now.Add(time.Hour); !decision.RunAfter.Equal(want) {
+		t.Fatalf("run_after = %s, want %s", decision.RunAfter, want)
+	}
+}
+
+func TestMetricScheduleRetryDecisionClampsToGrace(t *testing.T) {
+	now := time.Date(2026, 7, 21, 21, 0, 0, 0, time.UTC)
+	grace := now.Add(20 * time.Minute)
+	schedule := MetricScheduleRow{AttemptCount: 4, GraceUntil: grace}
+
+	decision := MetricScheduleRetryDecision(schedule, now, 24, time.Hour)
+	if decision.Expire {
+		t.Fatal("attempt before grace unexpectedly expired")
+	}
+	if !decision.RunAfter.Equal(grace) {
+		t.Fatalf("run_after = %s, want grace %s", decision.RunAfter, grace)
+	}
+}
+
+func TestMetricScheduleRetryDecisionExpiresAtGraceOrAttemptCap(t *testing.T) {
+	now := time.Date(2026, 7, 21, 21, 0, 0, 0, time.UTC)
+
+	for name, schedule := range map[string]MetricScheduleRow{
+		"grace":       {AttemptCount: 0, GraceUntil: now},
+		"attempt cap": {AttemptCount: 2, GraceUntil: now.Add(time.Hour)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			decision := MetricScheduleRetryDecision(schedule, now, 3, time.Hour)
+			if !decision.Expire {
+				t.Fatalf("decision = %#v, want expiration", decision)
+			}
+			if decision.AttemptCount != schedule.AttemptCount+1 {
+				t.Fatalf("attempt count = %d, want %d", decision.AttemptCount, schedule.AttemptCount+1)
+			}
+			if !decision.RunAfter.IsZero() {
+				t.Fatalf("expired run_after = %s, want zero", decision.RunAfter)
+			}
+		})
+	}
+}
