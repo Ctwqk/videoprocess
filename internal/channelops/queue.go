@@ -79,11 +79,15 @@ const queueAuthorityClaimPredicate = `
 					WHERE executable_channel.id = authority.authoritative_channel_id
 					  AND executable_channel.enabled = TRUE
 					  AND executable_channel.halted_at IS NULL
+					  AND (
+						executable_channel.intake_paused_at IS NULL
+						OR q.kind NOT IN ('agent_tick', 'ingest_discovery')
+					  )
 				)
 			)
 			OR (
 				NOT authority.is_global
-				AND q.kind <> 'ingest_discovery'
+				AND q.kind NOT IN ('agent_tick', 'ingest_discovery')
 				AND (
 					authority.authoritative_channel_id IS NULL
 					OR q.channel_profile_id IS DISTINCT FROM authority.authoritative_channel_id

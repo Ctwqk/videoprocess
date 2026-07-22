@@ -2687,6 +2687,58 @@ func NewChannelOpsFixture(t *testing.T) *ChannelOpsFixture {
 	return fixture
 }
 
+func TestExecutionFenceBlocksIntakeButAllowsDownstreamWhenPaused(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles
+		SET intake_paused_at = NOW(), intake_pause_reason = 'guarded fence test'
+		WHERE id = $1::uuid
+	`, fixture.ChannelID); err != nil {
+		t.Fatalf("pause channel intake: %v", err)
+	}
+
+	channelID := fixture.ChannelID
+	intakeDispatched := false
+	err := fixture.Store.WithQueueExecutionFence(ctx, QueueItemRow{
+		ID:               testUUID(t, "paused-intake-fence"),
+		Kind:             QueueAgentTick,
+		PayloadJSON:      map[string]any{"channel_id": fixture.ChannelID},
+		ChannelProfileID: &channelID,
+	}, func(*Store) error {
+		intakeDispatched = true
+		return nil
+	})
+	if !errors.Is(err, ErrChannelExecutionBlocked) {
+		t.Fatalf("paused intake fence error = %v, want ErrChannelExecutionBlocked", err)
+	}
+	if intakeDispatched {
+		t.Fatal("paused intake crossed execution fence")
+	}
+
+	downstreamDispatched := false
+	err = fixture.Store.WithQueueExecutionFence(ctx, QueueItemRow{
+		ID:               testUUID(t, "paused-downstream-fence"),
+		Kind:             QueueAccountHealth,
+		PayloadJSON:      map[string]any{"account_id": fixture.AccountID},
+		ChannelProfileID: &channelID,
+	}, func(*Store) error {
+		downstreamDispatched = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("paused downstream fence: %v", err)
+	}
+	if !downstreamDispatched {
+		t.Fatal("paused downstream did not cross execution fence")
+	}
+}
+
 func (f *ChannelOpsFixture) Close(ctx context.Context) {
 	f.cleanup(ctx)
 	f.Store.Close()

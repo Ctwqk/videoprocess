@@ -24,6 +24,13 @@ func TestChannelDueForTick(t *testing.T) {
 	if ChannelDueForTick(channel, now) {
 		t.Fatal("halted channel should not be due")
 	}
+
+	channel.HaltedAt = nil
+	intakePaused := now.Add(-time.Minute)
+	channel.IntakePausedAt = &intakePaused
+	if ChannelDueForTick(channel, now) {
+		t.Fatal("intake-paused channel should not be due")
+	}
 }
 
 func TestTickIdempotencyKey(t *testing.T) {
@@ -82,6 +89,16 @@ func TestSchedulerRunOnceUsesIntervalAwareBuckets(t *testing.T) {
 	}
 	if got, err := scheduler.RunOnce(ctx, second); err != nil || got != 1 {
 		t.Fatalf("RunOnce second same hour = %d, %v", got, err)
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles
+		SET intake_paused_at = $2, intake_pause_reason = 'guarded scheduler test'
+		WHERE id = $1::uuid
+	`, fixture.ChannelID, second); err != nil {
+		t.Fatalf("pause channel intake: %v", err)
+	}
+	if got, err := scheduler.RunOnce(ctx, second.Add(15*time.Minute)); err != nil || got != 0 {
+		t.Fatalf("RunOnce intake paused = %d, %v; want 0, nil", got, err)
 	}
 
 	var count int

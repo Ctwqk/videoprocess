@@ -70,6 +70,7 @@ type ChannelProfileRow struct {
 	Enabled              bool
 	DryRun               bool
 	HaltedAt             *time.Time
+	IntakePausedAt       *time.Time
 	TickIntervalMinutes  int
 	ConfigVersion        int
 	RiskPolicyJSON       map[string]any
@@ -78,6 +79,10 @@ type ChannelProfileRow struct {
 	DefaultAspectRatio   string
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
+}
+
+func queueKindRequiresOpenIntake(kind string) bool {
+	return kind == QueueAgentTick || kind == QueueIngestDiscovery
 }
 
 type TopicLaneRow struct {

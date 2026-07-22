@@ -47,7 +47,7 @@ func (s *Store) WithQueueExecutionFence(ctx context.Context, item QueueItemRow, 
 				*channelID,
 			)
 		}
-		if err := lockExecutableChannel(ctx, tx, *channelID); err != nil {
+		if err := lockExecutableChannel(ctx, tx, *channelID, queueKindRequiresOpenIntake(item.Kind)); err != nil {
 			return err
 		}
 	}
@@ -76,7 +76,7 @@ func (s *Store) WithChannelExecutionFence(ctx context.Context, channelID string,
 		}
 	}()
 
-	if err := lockExecutableChannel(ctx, tx, channelID); err != nil {
+	if err := lockExecutableChannel(ctx, tx, channelID, false); err != nil {
 		return err
 	}
 	if err := dispatch(s.withExecutionDB(tx, &channelID)); err != nil {
@@ -160,15 +160,16 @@ func queueAuthorityError(item QueueItemRow, cause error) error {
 	return fmt.Errorf("%w: queue authority unresolved for %s %s: %v", ErrQueueAuthorityInvalid, item.Kind, item.ID, cause)
 }
 
-func lockExecutableChannel(ctx context.Context, db dbExecutor, channelID string) error {
+func lockExecutableChannel(ctx context.Context, db dbExecutor, channelID string, requireOpenIntake bool) error {
 	var enabled bool
 	var haltedAt *time.Time
+	var intakePausedAt *time.Time
 	err := db.QueryRow(ctx, `
-		SELECT enabled, halted_at
+		SELECT enabled, halted_at, intake_paused_at
 		FROM channel_profiles
 		WHERE id = $1::uuid
 		FOR UPDATE
-	`, channelID).Scan(&enabled, &haltedAt)
+	`, channelID).Scan(&enabled, &haltedAt, &intakePausedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w: channel %s is missing", ErrChannelExecutionBlocked, channelID)
 	}
@@ -180,6 +181,9 @@ func lockExecutableChannel(ctx context.Context, db dbExecutor, channelID string)
 	}
 	if haltedAt != nil {
 		return fmt.Errorf("%w: channel %s is halted", ErrChannelExecutionBlocked, channelID)
+	}
+	if requireOpenIntake && intakePausedAt != nil {
+		return fmt.Errorf("%w: channel %s intake is paused", ErrChannelExecutionBlocked, channelID)
 	}
 	return nil
 }

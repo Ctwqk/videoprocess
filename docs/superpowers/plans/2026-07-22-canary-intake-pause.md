@@ -49,14 +49,14 @@ with pgx, pytest, shell deployment contracts, Docker Swarm.
 - Modify: `internal/channelops/execution_fence.go`
 - Modify: `internal/channelops/integration_test.go`
 
-- [ ] Add failing tests proving intake-paused channels are not scheduled and
+- [x] Add failing tests proving intake-paused channels are not scheduled and
   cannot claim or execute `agent_tick`/`ingest_discovery`.
-- [ ] Keep tests proving `plan_task`, promotion, reconciliation, and metrics
+- [x] Keep tests proving `plan_task`, promotion, reconciliation, and metrics
   remain claimable while intake is paused.
-- [ ] Keep existing disabled/halted/global-item tests unchanged and green.
-- [ ] Implement the scheduler query, claim predicate, and transactional fence
+- [x] Keep existing disabled/halted/global-item tests unchanged and green.
+- [x] Implement the scheduler query, claim predicate, and transactional fence
   checks with one shared intake-kind definition.
-- [ ] Run `go test ./internal/channelops` to green.
+- [x] Run `go test ./internal/channelops` to green.
 
 ### Task 3: Make one-task selection and intake pause atomic
 

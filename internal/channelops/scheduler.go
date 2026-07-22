@@ -9,10 +9,14 @@ import (
 )
 
 func ChannelDueForTick(channel ChannelProfileRow, now time.Time) bool {
-	if !channel.Enabled || channel.HaltedAt != nil {
+	if !channelAvailableForExecution(channel) || channel.IntakePausedAt != nil {
 		return false
 	}
 	return true
+}
+
+func channelAvailableForExecution(channel ChannelProfileRow) bool {
+	return channel.Enabled && channel.HaltedAt == nil
 }
 
 func SchedulerBucket(now time.Time, intervalMinutes int) string {
@@ -66,7 +70,7 @@ func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 
 	enqueued := 0
 	for _, channel := range channels {
-		if !ChannelDueForTick(channel, now) {
+		if !channelAvailableForExecution(channel) {
 			continue
 		}
 		if err := s.enqueueDiscovery(ctx, channel, now); err != nil {
@@ -156,7 +160,8 @@ func (s Scheduler) enqueueOperationalMaintenance(ctx context.Context, channels [
 
 func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]ChannelProfileRow, error) {
 	rows, err := s.db().Query(ctx, `
-		SELECT id, enabled, dry_run, halted_at, tick_interval_minutes, config_version,
+		SELECT id, enabled, dry_run, halted_at, intake_paused_at,
+		       tick_interval_minutes, config_version,
 		       risk_policy_json, cadence_policy_json, content_mix_policy_json,
 		       default_aspect_ratio, created_at, updated_at
 		FROM channel_profiles
@@ -172,7 +177,7 @@ func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]C
 	for rows.Next() {
 		var row ChannelProfileRow
 		var contentMixJSON []byte
-		if err := rows.Scan(&row.ID, &row.Enabled, &row.DryRun, &row.HaltedAt, &row.TickIntervalMinutes,
+		if err := rows.Scan(&row.ID, &row.Enabled, &row.DryRun, &row.HaltedAt, &row.IntakePausedAt, &row.TickIntervalMinutes,
 			&row.ConfigVersion, &row.RiskPolicyJSON, &row.CadencePolicyJSON, &contentMixJSON,
 			&row.DefaultAspectRatio, &row.CreatedAt, &row.UpdatedAt); err != nil {
 			return nil, err

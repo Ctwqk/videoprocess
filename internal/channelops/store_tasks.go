@@ -31,6 +31,9 @@ func (s *Store) RunTickWithPlanDelay(
 	if err != nil {
 		return err
 	}
+	if channel.IntakePausedAt != nil {
+		return fmt.Errorf("%w: channel %s intake is paused", ErrChannelExecutionBlocked, channelID)
+	}
 	candidates := BuildTickCandidates(channel, lanes, accounts, seeds, signals, laneFormats, bucket)
 	alerts := []AlertPayload{}
 	evaluatedCandidates, pdsAlerts, err := evaluateTickCandidatePolicy(ctx, channel, candidates, h)

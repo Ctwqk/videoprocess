@@ -40,7 +40,8 @@ func (s *Store) GetChannelProfile(ctx context.Context, channelID string) (Channe
 	var row ChannelProfileRow
 	var riskJSON, cadenceJSON, contentMixJSON []byte
 	err := s.db().QueryRow(ctx, `
-		SELECT id, enabled, dry_run, halted_at, tick_interval_minutes, config_version,
+		SELECT id, enabled, dry_run, halted_at, intake_paused_at,
+	       tick_interval_minutes, config_version,
 	       risk_policy_json, cadence_policy_json, content_mix_policy_json,
 	       default_aspect_ratio, created_at, updated_at
 	FROM channel_profiles
@@ -50,6 +51,7 @@ func (s *Store) GetChannelProfile(ctx context.Context, channelID string) (Channe
 		&row.Enabled,
 		&row.DryRun,
 		&row.HaltedAt,
+		&row.IntakePausedAt,
 		&row.TickIntervalMinutes,
 		&row.ConfigVersion,
 		&riskJSON,

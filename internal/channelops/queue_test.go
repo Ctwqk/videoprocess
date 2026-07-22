@@ -85,6 +85,29 @@ func TestQueueStatusConstantsForSQL(t *testing.T) {
 	}
 }
 
+func TestQueueKindsThatRequireOpenIntake(t *testing.T) {
+	for _, kind := range []string{QueueAgentTick, QueueIngestDiscovery} {
+		if !queueKindRequiresOpenIntake(kind) {
+			t.Fatalf("%s should require open intake", kind)
+		}
+	}
+	for _, kind := range []string{
+		QueuePlanTask,
+		QueueExecuteTask,
+		QueueObserveJob,
+		QueuePublishTask,
+		QueuePromotePublication,
+		QueueReconcilePublication,
+		QueueCollectMetrics,
+		QueueAccountHealth,
+		QueueLearningRecompute,
+	} {
+		if queueKindRequiresOpenIntake(kind) {
+			t.Fatalf("%s should remain executable while intake is paused", kind)
+		}
+	}
+}
+
 func TestEnqueueUsesStoreDefaultMaxAttempts(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -166,6 +189,50 @@ func TestClaimRejectsDisabledAndHaltedChannelsButKeepsGlobalItems(t *testing.T) 
 	}
 	if item != nil {
 		t.Fatalf("claimed halted channel item: %#v", item)
+	}
+
+	intakeID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:             QueueAgentTick,
+		IdempotencyKey:   "agent_tick:" + fixture.ChannelID + ":intake-pause-test",
+		Payload:          map[string]any{"channel_id": fixture.ChannelID},
+		ChannelProfileID: &channelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue intake item: %v", err)
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles
+		SET enabled = TRUE,
+		    halted_at = NULL,
+		    halt_reason = NULL,
+		    intake_paused_at = NOW(),
+		    intake_pause_reason = 'guarded queue test'
+		WHERE id = $1::uuid
+	`, fixture.ChannelID); err != nil {
+		t.Fatalf("pause channel intake: %v", err)
+	}
+	item, err = fixture.Store.ClaimNextForKinds(ctx, "paused-intake-worker", []string{QueueAgentTick})
+	if err != nil {
+		t.Fatalf("claim paused intake: %v", err)
+	}
+	if item != nil {
+		t.Fatalf("claimed paused intake item: %#v", item)
+	}
+	var intakeStatus string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status FROM channel_ops_queue_items WHERE id = $1::uuid
+	`, intakeID).Scan(&intakeStatus); err != nil {
+		t.Fatalf("select paused intake item: %v", err)
+	}
+	if intakeStatus != QueueStatusQueued {
+		t.Fatalf("paused intake status = %q, want queued", intakeStatus)
+	}
+	item, err = fixture.Store.ClaimNextForKinds(ctx, "paused-downstream-worker", []string{QueueAccountHealth})
+	if err != nil {
+		t.Fatalf("claim paused downstream: %v", err)
+	}
+	if item == nil || item.Kind != QueueAccountHealth {
+		t.Fatalf("paused downstream claim = %#v, want account_health", item)
 	}
 
 	globalID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
