@@ -18,6 +18,7 @@ required_lines=(
   'node-version: "22"'
   "CHANNEL_OPS_POSTGRES_TEST_URL:"
   "uv sync --frozen --extra dev"
+  ".venv/bin/alembic upgrade head"
   ".venv/bin/python -m pytest"
   "go test ./..."
   "npm run build"
@@ -29,6 +30,9 @@ required_lines=(
 for line in "${required_lines[@]}"; do
   grep -Fq -- "$line" "$workflow" || fail "workflow is missing contract: $line"
 done
+
+grep -Fq "name: Install deployment contract dependencies" "$workflow" \
+  || fail "deployment contracts do not install the backend test environment"
 
 grep -Eq '^  (backend|go|frontend|deploy-contracts):$' "$workflow" \
   || fail "workflow has no blocking jobs"
