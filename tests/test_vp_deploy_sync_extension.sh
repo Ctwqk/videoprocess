@@ -735,6 +735,10 @@ grep -Fq -- '--env-add VP_GO_ORCHESTRATOR_ENABLED=true' "$CALLS"
 grep -Fq -- '--env-add VP_GO_ORCHESTRATOR_JOB_WRITES=true' "$CALLS"
 grep -Fq -- '--env-add VP_PYTHON_SCHEDULE_URL=http://vp-autoflow-api-swarm:8080' "$CALLS"
 grep -Fq -- '--env-add WORKER_HOST=colima-127' "$CALLS"
+if [[ "$VP_APP_SERVICES" != 'vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm vp-ffmpeg-worker-gpu-swarm vp-youtube-publisher-swarm' ]]; then
+  echo 'FAIL: discovery deployment must not add a VP service' >&2
+  exit 1
+fi
 grep -Fq -- '--env-rm YOUTUBE_CREDENTIALS_DIR' "$CALLS"
 grep -Fq 'health|vp-youtube-manager|http://10.0.0.150:18999/api/auth/status' "$CALLS"
 grep -Fq 'docker|node update --label-add vp.publisher=true ccttww-lap' "$CALLS"
@@ -1166,3 +1170,20 @@ grep -Fq -- '--constraint node.hostname==ccttww-lap' "$CALLS"
 grep -Fq -- '--network vp-pipeline-net' "$CALLS"
 grep -Fq -- '--mount type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' "$CALLS"
 grep -Fq -- '--replicas 1' "$CALLS"
+
+: >"$CALLS"
+vp_update_runtime_service vp-channel-agent-runner-swarm vp-channelops-runner-go:discovery-timeout-test start-first >/dev/null
+timeout_calls="$(grep -F -- 'CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS=120' "$CALLS" || true)"
+if [[ "$(printf '%s\n' "$timeout_calls" | sed '/^$/d' | wc -l | tr -d ' ')" -ne 1 \
+  || "$timeout_calls" != *"vp-channel-agent-runner-swarm"* ]]; then
+  echo 'FAIL: discovery timeout must be added exactly once to the Go runner' >&2
+  exit 1
+fi
+if printf '%s\n' "$timeout_calls" | grep -Eq 'vp-(youtube-publisher|ffmpeg-worker|api|frontend|autoflow-api|event-outbox-relay)-swarm'; then
+  echo 'FAIL: discovery timeout must not be added to another VP service' >&2
+  exit 1
+fi
+if grep -Fq '10.0.0.126' "$CALLS"; then
+  echo 'FAIL: discovery timeout deployment must never target 126' >&2
+  exit 1
+fi

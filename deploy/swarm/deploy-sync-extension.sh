@@ -190,6 +190,14 @@ vp_update_runtime_service() {
     fi
     service_args+=(--env-add "WORKER_HOST=$VP_RUNTIME_NODE")
   fi
+  if [[ "$service" == "vp-channel-agent-runner-swarm" ]]; then
+    if vp_service_values "$service" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
+      | awk -F= '$1 == "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS" { found=1 } END { exit found ? 0 : 1 }'; then
+      service_args+=(--env-rm CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS)
+    fi
+    service_args+=(--env-add "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS=120")
+  fi
 
   local update_args=(
     service update --detach=false --no-resolve-image --update-order "$order"

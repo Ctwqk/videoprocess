@@ -1083,3 +1083,37 @@ async def test_backlog_ignores_only_global_cleanup_maintenance(db: AsyncSession)
     report = await runner.active_backlog(db)
 
     assert report["unsafe_queue_item_ids"] == [str(unsafe.id)]
+
+
+@pytest.mark.anyio
+async def test_backlog_ignores_queued_and_running_discovery_but_flags_publishing_queue_item(
+    db: AsyncSession,
+):
+    runner = load_runner()
+    queued_discovery = ChannelOpsQueueItem(
+        kind="discovery",
+        idempotency_key="discovery:queued:2026-07-21",
+        channel_profile_id=None,
+        payload_json={},
+        status="queued",
+    )
+    running_discovery = ChannelOpsQueueItem(
+        kind="discovery",
+        idempotency_key="discovery:running:2026-07-21",
+        channel_profile_id=None,
+        payload_json={},
+        status="running",
+    )
+    publishing = ChannelOpsQueueItem(
+        kind="publish_task",
+        idempotency_key="publish_task:2026-07-21",
+        channel_profile_id=None,
+        payload_json={},
+        status="queued",
+    )
+    db.add_all((queued_discovery, running_discovery, publishing))
+    await db.commit()
+
+    report = await runner.active_backlog(db)
+
+    assert report["unsafe_queue_item_ids"] == [str(publishing.id)]

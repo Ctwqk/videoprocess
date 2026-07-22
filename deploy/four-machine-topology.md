@@ -227,6 +227,66 @@ human approval: the per-attempt approval phrase above must already have been
 provided. The live path remains owned-source-only, unlisted, one-task, and
 fail-closed.
 
+## Disabled YouTube Discovery Scheduling
+
+The Go ChannelOps runner on `10.0.0.127` owns YouTube discovery scheduling.
+Deployment sets only its `CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS=120` environment
+value; it adds no service, host cron, provider credential, publisher setting,
+or activation state. Discovery is disabled by default, and deployment does not
+enable it for any existing channel.
+
+After the approved live unlisted canary, a human may enable discovery by adding
+this bounded policy to that channel's existing `content_mix_policy_json`:
+
+```json
+{
+  "youtube_discovery": {
+    "enabled": true,
+    "interval_minutes": 360,
+    "max_queries_per_run": 3,
+    "max_results_per_query": 10,
+    "min_view_count": 1000,
+    "region_code": "US"
+  }
+}
+```
+
+The initial limits are one run every six hours, at most three lane queries per
+run, and ten results per query. Discovery records metadata and durable run
+audit rows only; it does not download assets, create `production_tasks`,
+upload, promote, or publish. Any external-platform asset remains held for
+explicit human review before upload or publication. `PUBLIC_PUBLISH_ENABLED`
+remains `false`, and public publication and promotion remain disabled.
+
+Use the protected database connection without printing it for read-only audit
+evidence; replace the psql variable with the approved channel UUID:
+
+```sql
+SELECT scheduler_bucket, status, query_count, created_count, refreshed_count,
+       expired_count, quota_units_estimated, started_at, finished_at, last_error_code
+FROM discovery_ingestion_runs
+WHERE channel_profile_id = :'channel_profile_id'
+ORDER BY started_at DESC
+LIMIT 20;
+
+SELECT id, kind, status, created_at, locked_at, dead_letter_at
+FROM channel_ops_queue_items
+WHERE channel_profile_id = :'channel_profile_id'
+  AND kind = 'ingest_discovery'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+Rollback is a separate human channel-policy action: set
+`youtube_discovery.enabled` to `false` in that channel's policy to stop new
+scheduling without deleting signals or audit rows. Quarantining or halting the
+channel also prevents claims. Keep migration 029 in place unless a separately
+reviewed schema rollback preserves required audit evidence.
+
+Discovery scheduling, runner placement, deployment, and its audit workflow
+remain confined to 127 and the 150 controller/shared infrastructure. Host 126
+is never a build, deploy, runtime, watcher, publisher, or failover target.
+
 ## Placement Policy
 
 - Label the 127 Swarm node with `node.labels.vp.runtime == true`.
