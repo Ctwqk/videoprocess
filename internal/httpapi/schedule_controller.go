@@ -3,8 +3,10 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -14,7 +16,14 @@ import (
 type ScheduleController interface {
 	Status(ctx context.Context) (store.VideoScheduleStatusRow, error)
 	SetState(ctx context.Context, state string) (store.VideoScheduleStatusRow, error)
+	OpenExpectedJob(ctx context.Context, expectedJobID string) (store.VideoScheduleStatusRow, error)
 }
+
+var (
+	ErrScheduleGuardMismatch          = errors.New("schedule guard mismatch")
+	errGuardedScheduleHandoff         = errors.New("guarded schedule handoff failed")
+	errGuardedScheduleCloseIncomplete = errors.New("guarded schedule handoff failed; best-effort close incomplete")
+)
 
 type storeScheduleController struct {
 	store *store.Store
@@ -30,6 +39,17 @@ func (c *storeScheduleController) Status(ctx context.Context) (store.VideoSchedu
 
 func (c *storeScheduleController) SetState(ctx context.Context, state string) (store.VideoScheduleStatusRow, error) {
 	return c.store.SetVideoScheduleState(ctx, state)
+}
+
+func (c *storeScheduleController) OpenExpectedJob(
+	ctx context.Context,
+	expectedJobID string,
+) (store.VideoScheduleStatusRow, error) {
+	row, err := c.store.OpenVideoScheduleForJob(ctx, expectedJobID)
+	if errors.Is(err, store.ErrVideoScheduleGuardMismatch) {
+		return store.VideoScheduleStatusRow{}, ErrScheduleGuardMismatch
+	}
+	return row, err
 }
 
 type httpScheduleController struct {
@@ -48,16 +68,32 @@ func NewHTTPScheduleController(baseURL string, client *http.Client) ScheduleCont
 }
 
 func (c *httpScheduleController) Status(ctx context.Context) (store.VideoScheduleStatusRow, error) {
-	return c.request(ctx, http.MethodGet, "status")
+	return c.request(ctx, http.MethodGet, "status", "")
 }
 
 func (c *httpScheduleController) SetState(ctx context.Context, state string) (store.VideoScheduleStatusRow, error) {
-	return c.request(ctx, http.MethodPost, strings.ToLower(state))
+	return c.request(ctx, http.MethodPost, strings.ToLower(state), "")
 }
 
-func (c *httpScheduleController) request(ctx context.Context, method string, action string) (store.VideoScheduleStatusRow, error) {
-	url := c.baseURL + "/internal/schedule/video/" + action
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+func (c *httpScheduleController) OpenExpectedJob(
+	ctx context.Context,
+	expectedJobID string,
+) (store.VideoScheduleStatusRow, error) {
+	return c.request(ctx, http.MethodPost, "open", expectedJobID)
+}
+
+func (c *httpScheduleController) request(
+	ctx context.Context,
+	method string,
+	action string,
+	expectedJobID string,
+) (store.VideoScheduleStatusRow, error) {
+	requestURL := c.baseURL + "/internal/schedule/video/" + action
+	if expectedJobID != "" {
+		query := url.Values{"expected_job_id": []string{expectedJobID}}
+		requestURL += "?" + query.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, requestURL, nil)
 	if err != nil {
 		return store.VideoScheduleStatusRow{}, err
 	}
@@ -66,6 +102,9 @@ func (c *httpScheduleController) request(ctx context.Context, method string, act
 		return store.VideoScheduleStatusRow{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		return store.VideoScheduleStatusRow{}, ErrScheduleGuardMismatch
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return store.VideoScheduleStatusRow{}, fmt.Errorf("schedule handoff returned HTTP %d", resp.StatusCode)
 	}
@@ -116,4 +155,63 @@ func (c *coordinatedScheduleController) SetState(ctx context.Context, state stri
 	}
 	row.ReleasedJobs = localRow.ReleasedJobs + pythonRow.ReleasedJobs
 	return row, nil
+}
+
+func (c *coordinatedScheduleController) OpenExpectedJob(
+	ctx context.Context,
+	expectedJobID string,
+) (store.VideoScheduleStatusRow, error) {
+	if c.python == nil {
+		return c.local.OpenExpectedJob(ctx, expectedJobID)
+	}
+	pythonRow, err := c.python.OpenExpectedJob(ctx, expectedJobID)
+	if err != nil {
+		closeIncomplete := c.closeAfterGuardedFailure(ctx, false)
+		return store.VideoScheduleStatusRow{}, guardedScheduleHandoffError(err, closeIncomplete)
+	}
+	if pythonRow.State != "OPEN" || pythonRow.ReleasedJobs != 1 {
+		closeIncomplete := c.closeAfterGuardedFailure(ctx, true)
+		return store.VideoScheduleStatusRow{}, guardedScheduleHandoffError(
+			errGuardedScheduleHandoff,
+			closeIncomplete,
+		)
+	}
+
+	localRow, err := c.local.Status(ctx)
+	if err == nil && localRow.State == "OPEN" {
+		localRow.ReleasedJobs = 1
+		return localRow, nil
+	}
+	closeIncomplete := c.closeAfterGuardedFailure(ctx, true)
+	return store.VideoScheduleStatusRow{}, guardedScheduleHandoffError(
+		errGuardedScheduleHandoff,
+		closeIncomplete,
+	)
+}
+
+func (c *coordinatedScheduleController) closeAfterGuardedFailure(
+	ctx context.Context,
+	closePython bool,
+) bool {
+	closeIncomplete := false
+	if closePython && c.python != nil {
+		if _, err := c.python.SetState(ctx, "CLOSED"); err != nil {
+			closeIncomplete = true
+		}
+	}
+	if _, err := c.local.SetState(ctx, "CLOSED"); err != nil {
+		closeIncomplete = true
+	}
+	return closeIncomplete
+}
+
+func guardedScheduleHandoffError(cause error, closeIncomplete bool) error {
+	result := errGuardedScheduleHandoff
+	if closeIncomplete {
+		result = errGuardedScheduleCloseIncomplete
+	}
+	if errors.Is(cause, ErrScheduleGuardMismatch) {
+		return fmt.Errorf("%w: %v", ErrScheduleGuardMismatch, result)
+	}
+	return result
 }

@@ -62,7 +62,7 @@ jobs:
           set -o pipefail
           DATABASE_URL="$CHANNEL_OPS_GO_POSTGRES_TEST_URL" \
             CHANNELOPS_REQUIRE_DATABASE="1" \
-            go test -count=1 ./internal/channelops \
+            go test -count=1 ./internal/channelops ./internal/store \
             | tee ci-evidence/backend/go-channelops-postgres.txt
       - name: Run backend tests
         run: |

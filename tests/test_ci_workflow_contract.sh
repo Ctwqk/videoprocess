@@ -22,7 +22,7 @@ required_lines=(
   ".venv/bin/alembic upgrade head"
   ".venv/bin/python -m pytest"
   'CHANNELOPS_REQUIRE_DATABASE="1"'
-  'go test -count=1 ./internal/channelops'
+  'go test -count=1 ./internal/channelops ./internal/store'
   "go test ./..."
   "npm run build"
   "bash tests/test_vp_deploy_sync_extension.sh"

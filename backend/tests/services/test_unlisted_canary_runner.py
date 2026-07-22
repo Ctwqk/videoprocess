@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import subprocess
@@ -11,7 +12,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.models.asset import Asset
@@ -465,6 +466,47 @@ async def test_mode_aware_dispatch_and_schedule_close(monkeypatch: pytest.Monkey
 
     canary.assert_awaited_once_with(*values)
     close.assert_awaited_once_with(values[0], values[2], values[3])
+
+
+@pytest.mark.anyio
+async def test_schedule_open_mutation_requires_and_sends_exact_expected_job_id(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = load_runner()
+    expected_job_id = uuid.uuid4()
+    calls = []
+
+    async def request_json(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"state": "OPEN", "released_jobs": 1}
+
+    monkeypatch.setattr(runner, "request_json", request_json)
+    evidence = {"schedule": {"transitions": []}}
+    client = object()
+
+    with pytest.raises(runner.CanaryError, match="expected job"):
+        await runner.mutate_schedule(
+            SimpleNamespace(api_url="http://api"),
+            client,
+            evidence,
+            "open",
+        )
+    assert calls == []
+
+    await runner.mutate_schedule(
+        SimpleNamespace(api_url="http://api"),
+        client,
+        evidence,
+        "open",
+        expected_job_id=expected_job_id,
+    )
+
+    assert calls == [
+        (
+            (client, "POST", "http://api/internal/schedule/video/open"),
+            {"params": {"expected_job_id": str(expected_job_id)}},
+        )
+    ]
 
 
 @pytest.mark.anyio
@@ -1403,6 +1445,92 @@ async def test_failure_cleanup_uses_naive_utc_for_job_and_node_columns(db: Async
 
 
 @pytest.mark.anyio
+async def test_failure_cleanup_refreshes_cross_session_job_and_node_links(tmp_path: Path):
+    runner = load_runner()
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'cleanup-refresh.db'}"
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: Base.metadata.create_all(sync_connection, tables=TABLES)
+            )
+        async with AsyncSession(engine, expire_on_commit=False) as cleanup_session:
+            cleanup_query_freshness: dict[str, bool] = {}
+
+            def record_cleanup_query(execute_state):
+                statement = str(execute_state.statement)
+                for table_name in (
+                    "channel_profiles",
+                    "production_tasks",
+                    "channel_ops_queue_items",
+                    "jobs",
+                    "node_executions",
+                ):
+                    if f"FROM {table_name}" in statement:
+                        cleanup_query_freshness[table_name] = bool(
+                            execute_state.execution_options.get("populate_existing")
+                        )
+
+            event.listen(cleanup_session.sync_session, "do_orm_execute", record_cleanup_query)
+            channel = ChannelProfile(name="stale cleanup canary", dry_run=False)
+            cleanup_session.add(channel)
+            await cleanup_session.flush()
+            task = ProductionTask(
+                channel_profile_id=channel.id,
+                target_account_id=uuid.uuid4(),
+                prompt="owned canary",
+                state="producing",
+            )
+            cleanup_session.add(task)
+            await cleanup_session.commit()
+            assert task.job_id is None
+
+            async with AsyncSession(engine, expire_on_commit=False) as writer_session:
+                job = Job(
+                    pipeline_id=uuid.uuid4(),
+                    pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+                    status=JobStatus.RUNNING,
+                )
+                writer_session.add(job)
+                await writer_session.flush()
+                node = NodeExecution(
+                    job_id=job.id,
+                    node_id="source_1",
+                    node_type="source",
+                    status=NodeStatus.RUNNING,
+                )
+                writer_task = await writer_session.get(ProductionTask, task.id)
+                assert writer_task is not None
+                writer_task.job_id = job.id
+                writer_session.add(node)
+                await writer_session.commit()
+                job_id = job.id
+                node_id = node.id
+
+            try:
+                report = await runner.failure_cleanup(cleanup_session, channel.id)
+            finally:
+                event.remove(cleanup_session.sync_session, "do_orm_execute", record_cleanup_query)
+
+        assert report["cancelled_job_ids"] == [str(job_id)]
+        assert report["cancelled_node_execution_ids"] == [str(node_id)]
+        assert cleanup_query_freshness == {
+            "channel_profiles": True,
+            "production_tasks": True,
+            "channel_ops_queue_items": True,
+            "jobs": True,
+            "node_executions": True,
+        }
+        async with AsyncSession(engine, expire_on_commit=False) as verifier:
+            cleaned_job = await verifier.get(Job, job_id)
+            cleaned_node = await verifier.get(NodeExecution, node_id)
+            assert cleaned_job is not None and cleaned_job.status == JobStatus.CANCELLED
+            assert cleaned_node is not None and cleaned_node.status == NodeStatus.CANCELLED
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_failure_cleanup_falls_back_to_fresh_session_after_active_session_error(tmp_path: Path):
     runner = load_runner()
     database_url = f"sqlite+aiosqlite:///{tmp_path / 'cleanup-fallback.db'}"
@@ -1461,6 +1589,82 @@ async def test_failure_cleanup_falls_back_to_fresh_session_after_active_session_
             assert cleaned_queue_item is not None and cleaned_queue_item.status == "dead_lettered"
     finally:
         await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_failure_cleanup_fallback_handles_cancelled_error_from_active_rollback(tmp_path: Path):
+    runner = load_runner()
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'cleanup-cancelled.db'}"
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync_connection: Base.metadata.create_all(sync_connection, tables=TABLES)
+            )
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            channel = ChannelProfile(name="cancelled cleanup canary", dry_run=False)
+            session.add(channel)
+            await session.commit()
+            channel_id = channel.id
+
+        failed_session = SimpleNamespace(
+            rollback=AsyncMock(side_effect=asyncio.CancelledError())
+        )
+
+        report = await runner.failure_cleanup_with_fallback(
+            failed_session,
+            channel_id,
+            database_url,
+        )
+
+        assert report["active_session_error_type"] == "CancelledError"
+        assert report["fallback_cleanup"]["halted_channel_id"] == str(channel_id)
+        async with AsyncSession(engine, expire_on_commit=False) as verifier:
+            cleaned_channel = await verifier.get(ChannelProfile, channel_id)
+            assert cleaned_channel is not None and cleaned_channel.halted_at is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_failure_cleanup_fallback_is_shielded_from_repeated_outer_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = load_runner()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    channel_id = uuid.uuid4()
+
+    async def controlled_cleanup(_db, cleanup_channel_id):
+        assert cleanup_channel_id == channel_id
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        cleanup_finished.set()
+        return {"halted_channel_id": str(channel_id)}
+
+    monkeypatch.setattr(runner, "failure_cleanup", controlled_cleanup)
+    failed_session = SimpleNamespace(
+        rollback=AsyncMock(side_effect=RuntimeError("active session invalidated"))
+    )
+    cleanup_task = asyncio.create_task(
+        runner.failure_cleanup_with_fallback(
+            failed_session,
+            channel_id,
+            "sqlite+aiosqlite:///:memory:",
+        )
+    )
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+    cleanup_task.cancel()
+    await asyncio.sleep(0)
+    cleanup_task.cancel()
+    allow_cleanup.set()
+    report = await asyncio.wait_for(cleanup_task, timeout=1)
+
+    assert cleanup_finished.is_set()
+    assert report["active_session_error_type"] == "RuntimeError"
+    assert report["fallback_cleanup"] == {"halted_channel_id": str(channel_id)}
 
 
 @pytest.mark.anyio

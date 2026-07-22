@@ -148,6 +148,37 @@ if any(
     for node in ast.walk(preapproval)
 ):
     raise SystemExit("FAIL: preapproval must not halt the canary channel")
+
+mutate_schedule = functions.get("mutate_schedule")
+if mutate_schedule is None:
+    raise SystemExit("FAIL: missing mutate_schedule")
+mutate_source = ast.unparse(mutate_schedule)
+for required in (
+    "expected_job_id",
+    "params={'expected_job_id': str(expected_job_id)}",
+):
+    if required not in mutate_source:
+        raise SystemExit(f"FAIL: guarded schedule open missing {required}")
+
+cleanup = functions.get("failure_cleanup")
+if cleanup is None:
+    raise SystemExit("FAIL: missing failure_cleanup")
+cleanup_source = ast.unparse(cleanup)
+if cleanup_source.count("execution_options(populate_existing=True)") < 5:
+    raise SystemExit("FAIL: every cleanup locking query must force fresh ORM state")
+
+fallback = functions.get("failure_cleanup_with_fallback")
+if fallback is None:
+    raise SystemExit("FAIL: missing failure_cleanup_with_fallback")
+fallback_source = ast.unparse(fallback)
+for required in (
+    "asyncio.create_task",
+    "asyncio.wait_for",
+    "asyncio.shield",
+    "except BaseException",
+):
+    if required not in fallback_source:
+        raise SystemExit(f"FAIL: cleanup fallback missing {required}")
 PY
 
 "$PYTHON_BIN" - "$CANARY" "$QUARANTINE" <<'PY'

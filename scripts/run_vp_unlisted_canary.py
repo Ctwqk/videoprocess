@@ -55,6 +55,7 @@ CANARY_FAILURE_REASON = "operator_canary_failure"
 CANARY_PLAN_DELAY_SECONDS = 300
 CHANNEL_OPS_RUNNER_SERVICE = "vp-channel-agent-runner-swarm"
 RUNNER_POLL_CUSHION_SECONDS = 60
+FAILURE_CLEANUP_TIMEOUT_SECONDS = 30.0
 NO_DELETE_POLICY = "This runner never deletes the YouTube video automatically."
 MODE_PREFLIGHT = "preflight_only"
 MODE_LIVE = "live_unlisted"
@@ -754,11 +755,23 @@ async def mutate_schedule(
     client: httpx.AsyncClient,
     evidence: dict[str, Any],
     action: str,
+    *,
+    expected_job_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     path = {"open": SCHEDULE_OPEN_PATH, "drain": SCHEDULE_DRAIN_PATH}.get(action)
     if path is None:
         raise CanaryError(f"unsupported schedule action: {action}")
-    payload = await request_json(client, "POST", f"{api_root(args.api_url)}{path}")
+    if action == "open":
+        if expected_job_id is None:
+            raise CanaryError("schedule open requires the exact expected job ID")
+        payload = await request_json(
+            client,
+            "POST",
+            f"{api_root(args.api_url)}{path}",
+            params={"expected_job_id": str(expected_job_id)},
+        )
+    else:
+        payload = await request_json(client, "POST", f"{api_root(args.api_url)}{path}")
     record_schedule(evidence, action, payload)
     return payload
 
@@ -1739,7 +1752,12 @@ async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, 
     now = utc_now()
     async with db.begin():
         channel = (
-            await db.execute(select(ChannelProfile).where(ChannelProfile.id == channel_id).with_for_update())
+            await db.execute(
+                select(ChannelProfile)
+                .where(ChannelProfile.id == channel_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         ).scalar_one_or_none()
         if channel is None:
             return {"channel_missing": True}
@@ -1751,6 +1769,7 @@ async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, 
                     select(ProductionTask)
                     .where(ProductionTask.channel_profile_id == channel_id)
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalars()
         )
@@ -1780,6 +1799,7 @@ async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, 
                     .where(ChannelOpsQueueItem.channel_profile_id == channel_id)
                     .where(ChannelOpsQueueItem.status.in_(("queued", "running")))
                     .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
             ).scalars()
         )
@@ -1792,7 +1812,12 @@ async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, 
         job_ids = {task.job_id for task in tasks if task.job_id is not None}
         jobs = list(
             (
-                await db.execute(select(Job).where(Job.id.in_(job_ids)).with_for_update())
+                await db.execute(
+                    select(Job)
+                    .where(Job.id.in_(job_ids))
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
             ).scalars()
         ) if job_ids else []
         cancelled_job_ids: list[str] = []
@@ -1806,7 +1831,12 @@ async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, 
             cancelled_job_ids.append(str(job.id))
         nodes = list(
             (
-                await db.execute(select(NodeExecution).where(NodeExecution.job_id.in_(job_ids)).with_for_update())
+                await db.execute(
+                    select(NodeExecution)
+                    .where(NodeExecution.job_id.in_(job_ids))
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
             ).scalars()
         ) if job_ids else []
         cancelled_node_ids: list[str] = []
@@ -1835,17 +1865,31 @@ async def failure_cleanup_with_fallback(
     try:
         await db.rollback()
         return await failure_cleanup(db, channel_id)
-    except Exception as active_session_exc:
-        engine = create_async_engine(async_database_url(database_url), pool_pre_ping=True)
-        try:
-            async with engine.connect() as connection:
-                fallback_db = AsyncSession(bind=connection, expire_on_commit=False)
-                try:
-                    report = await failure_cleanup(fallback_db, channel_id)
-                finally:
-                    await fallback_db.close()
-        finally:
-            await engine.dispose()
+    except BaseException as active_session_exc:
+        async def cleanup_with_fresh_engine() -> dict[str, Any]:
+            engine = create_async_engine(async_database_url(database_url), pool_pre_ping=True)
+            try:
+                async with engine.connect() as connection:
+                    fallback_db = AsyncSession(bind=connection, expire_on_commit=False)
+                    try:
+                        return await failure_cleanup(fallback_db, channel_id)
+                    finally:
+                        await fallback_db.close()
+            finally:
+                await engine.dispose()
+
+        cleanup_task = asyncio.create_task(
+            asyncio.wait_for(
+                cleanup_with_fresh_engine(),
+                timeout=FAILURE_CLEANUP_TIMEOUT_SECONDS,
+            )
+        )
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                continue
+        report = cleanup_task.result()
         return {
             "active_session_error_type": type(active_session_exc).__name__,
             "fallback_cleanup": sanitize(report),
@@ -1970,7 +2014,13 @@ async def execute_canary(
     )
     atomic_write_json(path, evidence)
 
-    opened = await mutate_schedule(args, client, evidence, "open")
+    opened = await mutate_schedule(
+        args,
+        client,
+        evidence,
+        "open",
+        expected_job_id=job.id,
+    )
     if opened.get("state") != "OPEN" or int(opened.get("released_jobs") or 0) != 1:
         raise CanaryError("schedule open did not release exactly one canary job")
     running_job = await wait_for_running_job(db, job.id, min(args.timeout_seconds, 120.0))
@@ -2223,7 +2273,7 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
                                             uuid.UUID(str(graph["channel_id"])),
                                             endpoints.database_url,
                                         )
-                                    except Exception as cleanup_exc:
+                                    except BaseException as cleanup_exc:
                                         evidence["failure_cleanup"] = {
                                             "failed": True,
                                             "type": type(cleanup_exc).__name__,

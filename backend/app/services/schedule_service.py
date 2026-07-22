@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import enum
+import uuid
 from typing import Any, cast
 
 from sqlalchemy import func, select
@@ -31,6 +32,12 @@ ACTIVE_JOB_STATUSES = {
     JobStatus.RUNNING,
 }
 ACTIVE_NODE_STATUSES = {NodeStatus.PENDING, NodeStatus.QUEUED, NodeStatus.RUNNING}
+GUARDED_OPEN_JOB_STATUSES = {*ACTIVE_JOB_STATUSES, JobStatus.WAITING_WINDOW}
+GUARDED_OPEN_NODE_STATUSES = {NodeStatus.QUEUED, NodeStatus.RUNNING}
+
+
+class GuardedScheduleOpenConflict(RuntimeError):
+    pass
 
 
 def default_video_schedule_state() -> VideoScheduleState:
@@ -229,6 +236,57 @@ async def release_waiting_video_jobs(db: AsyncSession) -> list[str]:
         job.completed_at = None
     await db.commit()
     return [str(job.id) for job in jobs]
+
+
+async def open_video_schedule_for_job(
+    db: AsyncSession,
+    expected_job_id: uuid.UUID,
+) -> list[uuid.UUID]:
+    async with db.begin():
+        schedule, _created = await get_or_create_and_lock_runtime_schedule(db)
+        if schedule.state != VideoScheduleState.CLOSED.value:
+            raise GuardedScheduleOpenConflict("video schedule is not closed")
+
+        jobs = list(
+            (
+                await db.execute(
+                    select(Job)
+                    .where(Job.status.in_(GUARDED_OPEN_JOB_STATUSES))
+                    .order_by(Job.id.asc())
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars()
+        )
+        active_nodes = list(
+            (
+                await db.execute(
+                    select(NodeExecution)
+                    .where(NodeExecution.status.in_(GUARDED_OPEN_NODE_STATUSES))
+                    .order_by(NodeExecution.id.asc())
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars()
+        )
+        expected_jobs = [
+            job
+            for job in jobs
+            if job.id == expected_job_id
+            and job.status == JobStatus.WAITING_WINDOW
+            and job.orchestrator_owner == "python"
+        ]
+        if len(expected_jobs) != 1 or len(jobs) != 1 or active_nodes:
+            raise GuardedScheduleOpenConflict("guarded schedule open authority mismatch")
+
+        expected_job = expected_jobs[0]
+        schedule.state = VideoScheduleState.OPEN.value
+        schedule.updated_by = "internal_api_guarded"
+        expected_job.status = JobStatus.PENDING
+        expected_job.error_message = None
+        expected_job.completed_at = None
+
+    return [expected_job_id]
 
 
 async def load_video_jobs_for_recovery(db: AsyncSession) -> list[Job]:

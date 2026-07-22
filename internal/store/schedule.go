@@ -2,10 +2,15 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const VideoScheduleServiceName = "videoprocess"
+
+var ErrVideoScheduleGuardMismatch = errors.New("video schedule guarded open mismatch")
 
 type VideoScheduleStatusRow struct {
 	ServiceName  string     `json:"service_name"`
@@ -46,6 +51,118 @@ func (s *Store) SetVideoScheduleState(ctx context.Context, state string) (VideoS
 		released = int(tag.RowsAffected())
 	}
 	return s.getVideoScheduleStatus(ctx, released)
+}
+
+func (s *Store) OpenVideoScheduleForJob(
+	ctx context.Context,
+	expectedJobID string,
+) (VideoScheduleStatusRow, error) {
+	parsedJobID, err := uuid.Parse(expectedJobID)
+	if err != nil || parsedJobID.String() != expectedJobID {
+		return VideoScheduleStatusRow{}, ErrVideoScheduleGuardMismatch
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return VideoScheduleStatusRow{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	var scheduleState string
+	if err := tx.QueryRow(ctx, `
+		SELECT state
+		FROM runtime_schedules
+		WHERE service_name = $1
+		FOR UPDATE
+	`, VideoScheduleServiceName).Scan(&scheduleState); err != nil {
+		return VideoScheduleStatusRow{}, err
+	}
+	if scheduleState != "CLOSED" {
+		return VideoScheduleStatusRow{}, ErrVideoScheduleGuardMismatch
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT id::text, status::text, orchestrator_owner
+		FROM jobs
+		WHERE status IN ('WAITING_WINDOW', 'PENDING', 'VALIDATING', 'PLANNING', 'RUNNING')
+		ORDER BY id
+		FOR UPDATE
+	`)
+	if err != nil {
+		return VideoScheduleStatusRow{}, err
+	}
+	type guardedJob struct {
+		id     string
+		status string
+		owner  string
+	}
+	jobs := make([]guardedJob, 0, 2)
+	for rows.Next() {
+		var job guardedJob
+		if err := rows.Scan(&job.id, &job.status, &job.owner); err != nil {
+			rows.Close()
+			return VideoScheduleStatusRow{}, err
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return VideoScheduleStatusRow{}, err
+	}
+	rows.Close()
+
+	nodeRows, err := tx.Query(ctx, `
+		SELECT id::text
+		FROM node_executions
+		WHERE status IN ('QUEUED', 'RUNNING')
+		ORDER BY id
+		FOR UPDATE
+	`)
+	if err != nil {
+		return VideoScheduleStatusRow{}, err
+	}
+	activeNodeCount := 0
+	for nodeRows.Next() {
+		var nodeID string
+		if err := nodeRows.Scan(&nodeID); err != nil {
+			nodeRows.Close()
+			return VideoScheduleStatusRow{}, err
+		}
+		activeNodeCount++
+	}
+	if err := nodeRows.Err(); err != nil {
+		nodeRows.Close()
+		return VideoScheduleStatusRow{}, err
+	}
+	nodeRows.Close()
+
+	if len(jobs) != 1 || jobs[0].id != expectedJobID || jobs[0].status != "WAITING_WINDOW" ||
+		jobs[0].owner != "go" || activeNodeCount != 0 {
+		return VideoScheduleStatusRow{}, ErrVideoScheduleGuardMismatch
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE runtime_schedules
+		SET state = 'OPEN', updated_by = 'go_api_guarded', updated_at = NOW()
+		WHERE service_name = $1
+	`, VideoScheduleServiceName); err != nil {
+		return VideoScheduleStatusRow{}, err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'PENDING', error_message = NULL, completed_at = NULL
+		WHERE id = $1::uuid
+		  AND status = 'WAITING_WINDOW'
+		  AND orchestrator_owner = 'go'
+	`, expectedJobID)
+	if err != nil {
+		return VideoScheduleStatusRow{}, err
+	}
+	if tag.RowsAffected() != 1 {
+		return VideoScheduleStatusRow{}, ErrVideoScheduleGuardMismatch
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return VideoScheduleStatusRow{}, err
+	}
+	return s.getVideoScheduleStatus(ctx, 1)
 }
 
 func (s *Store) getVideoScheduleStatus(ctx context.Context, releasedJobs int) (VideoScheduleStatusRow, error) {
