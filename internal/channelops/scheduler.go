@@ -141,7 +141,7 @@ func (s Scheduler) enqueueOperationalMaintenance(ctx context.Context, channels [
 	}
 	bucket := SchedulerBucket(now, 360)
 	for _, channel := range channels {
-		if !ChannelDueForTick(channel, now) {
+		if !channelAvailableForExecution(channel) {
 			continue
 		}
 		channelID := channel.ID

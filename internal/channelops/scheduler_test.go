@@ -170,6 +170,46 @@ func TestSchedulerRunOnceEnqueuesOperationalMaintenance(t *testing.T) {
 	}
 }
 
+func TestSchedulerRunOncePausedChannelSkipsIntakeButEnqueuesLearning(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	fixture.SetDiscoveryContentMix(ctx, `{"youtube_discovery":{"enabled":true}}`)
+	now := time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_profiles
+		SET intake_paused_at = $2, intake_pause_reason = 'guarded scheduler test'
+		WHERE id = $1::uuid
+	`, fixture.ChannelID, now); err != nil {
+		t.Fatalf("pause channel intake: %v", err)
+	}
+
+	if got, err := (Scheduler{Store: fixture.Store}).RunOnce(ctx, now); err != nil || got != 0 {
+		t.Fatalf("RunOnce paused = %d, %v; want 0, nil", got, err)
+	}
+
+	for kind, want := range map[string]int{
+		QueueAgentTick:         0,
+		QueueIngestDiscovery:   0,
+		QueueLearningRecompute: 1,
+	} {
+		var count int
+		if err := fixture.Store.Pool.QueryRow(ctx, `
+			SELECT count(*) FROM channel_ops_queue_items WHERE kind = $1
+		`, kind).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", kind, err)
+		}
+		if count != want {
+			t.Fatalf("%s queue count = %d, want %d", kind, count, want)
+		}
+	}
+}
+
 func TestSchedulerRunOnceSchedulesEnabledDiscoveryOncePerPolicyBucket(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")

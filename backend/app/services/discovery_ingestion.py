@@ -160,20 +160,25 @@ class DiscoveryIngestionService:
             raise DiscoveryIngestionProviderError(error_code) from exc
 
         terminal_channel = await self._lock_channel(db, normalized.channel_id)
+        terminal_error_code: str | None = None
         if (
             terminal_channel is None
             or not terminal_channel.enabled
             or terminal_channel.halted_at is not None
         ):
+            terminal_error_code = "channel_unavailable"
+        elif terminal_channel.intake_paused_at is not None:
+            terminal_error_code = "channel_intake_paused"
+        if terminal_error_code is not None:
             await db.rollback()
             await self._mark_failed(
                 db,
                 claim=claim,
                 now=current,
-                error_code="channel_unavailable",
+                error_code=terminal_error_code,
                 query_count=ingest_result.query_count,
             )
-            raise DiscoveryIngestionAuthorityError("channel_unavailable")
+            raise DiscoveryIngestionAuthorityError(terminal_error_code)
 
         run = await self._lock_owned_run(db, claim)
         run.status = "succeeded"

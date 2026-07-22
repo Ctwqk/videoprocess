@@ -100,14 +100,17 @@ clear intake pause implicitly.
 
 Manual tick enqueue and discovery ingestion reject intake-paused channels. The
 Python scheduler excludes them, preserving parity even though the Go runner is
-the only production ChannelOps owner.
+the only production ChannelOps owner. Discovery ingestion rechecks the channel
+under a terminal row lock after the external provider returns; a concurrently
+committed intake pause rolls back provider-derived signals and fails the run.
 
 ## Go Queue And Execution Fences
 
-The Go scheduler excludes intake-paused channels. The queue claim predicate
-continues to require an enabled, non-halted authoritative channel for all
-channel-scoped work, and additionally requires intake to be open for
-`agent_tick` and `ingest_discovery`.
+The Go scheduler excludes intake-paused channels from tick and discovery
+intake, while continuing to enqueue cleanup and learning recompute maintenance.
+The queue claim predicate continues to require an enabled, non-halted
+authoritative channel for all channel-scoped work, and additionally requires
+intake to be open for `agent_tick` and `ingest_discovery`.
 
 The transactional execution fence performs the same intake check for those two
 kinds. This closes the race where a second intake row is claimed before the
@@ -193,8 +196,7 @@ Automated tests cover migration shape, Python scheduler/API behavior, Go
 scheduler/claim/fence behavior, atomic one-task pause and rollback, canary
 preapproval/evidence, resilient cleanup fallback, and all existing halt tests.
 
-Deployment acceptance requires exact-SHA CI success, migration head 030,
+Deployment acceptance requires exact-SHA CI success, migration head 031,
 127/150 services at desired replicas, no VideoProcess work on 126, schedule
 `CLOSED`, zero unsafe backlog, zero Redis pending entries, and a fresh read-only
 canary preflight. A fourth live attempt requires a new exact approval phrase.
-

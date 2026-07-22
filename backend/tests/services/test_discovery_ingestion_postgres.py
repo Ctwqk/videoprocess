@@ -705,3 +705,65 @@ async def test_terminal_channel_lock_observes_separately_committed_halt(
     assert run.status == "failed"
     assert run.last_error_code == "channel_unavailable"
     assert signals == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_channel_lock_observes_separately_committed_intake_pause(
+    postgres_harness: PostgresHarness,
+) -> None:
+    now = datetime(2026, 7, 21, 18, 0, tzinfo=timezone.utc)
+    request = await _seed_request(postgres_harness)
+    provider_entered = asyncio.Event()
+    release_provider = asyncio.Event()
+    client = BlockingYouTubeClient(
+        entered=provider_entered,
+        release=release_provider,
+        video_id="paused-result",
+    )
+    task = asyncio.create_task(
+        _ingest(
+            postgres_harness,
+            DiscoveryIngestionService(youtube_client=client),
+            request,
+            now,
+        )
+    )
+    await asyncio.wait_for(provider_entered.wait(), timeout=5)
+    async with postgres_harness.session_factory() as db:
+        await db.execute(
+            update(ChannelProfile)
+            .where(ChannelProfile.id == request.channel_id)
+            .values(
+                intake_paused_at=now,
+                intake_pause_reason="guarded PostgreSQL race test",
+            )
+        )
+        await db.commit()
+    release_provider.set()
+    outcome = (
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True),
+            timeout=5,
+        )
+    )[0]
+
+    assert isinstance(outcome, DiscoveryIngestionConflictError)
+    assert str(outcome) == "channel_intake_paused"
+    async with postgres_harness.session_factory() as db:
+        run = (
+            await db.execute(
+                select(DiscoveryIngestionRun).where(
+                    DiscoveryIngestionRun.channel_profile_id == request.channel_id
+                )
+            )
+        ).scalar_one()
+        signals = (
+            await db.execute(
+                select(DiscoverySignal).where(
+                    DiscoverySignal.channel_profile_id == request.channel_id
+                )
+            )
+        ).scalars().all()
+    assert run.status == "failed"
+    assert run.last_error_code == "channel_intake_paused"
+    assert signals == []
