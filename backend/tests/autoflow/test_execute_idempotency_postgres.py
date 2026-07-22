@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.autoflow import service as autoflow_service
 from app.autoflow.clip_ranker import ClipRanker
 from app.autoflow.service import AutoFlowService, execute_request_fingerprint
-from app.models.autoflow import AutoFlowPlan, AutoFlowRun
+from app.models.autoflow import AutoFlowPlan, AutoFlowRun, AutoFlowUsedClip
 from app.models.channel_agent import ChannelOpsQueueItem, ChannelProfile, ProductionTask
 from app.models.job import Job, JobStatus
 from app.models.pipeline import Pipeline
@@ -28,7 +28,11 @@ from app.schemas.autoflow import (
     AutoFlowPlanPatch,
     AutoFlowRequest,
 )
-from app.services.schedule_service import VIDEO_SCHEDULE_SERVICE, VideoScheduleState
+from app.services.schedule_service import (
+    VIDEO_SCHEDULE_SERVICE,
+    VideoScheduleState,
+    open_video_schedule_for_job,
+)
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -86,6 +90,57 @@ async def postgres_idempotency_db(monkeypatch):
                     "channel_profiles, autoflow_plans CASCADE"
                 )
             )
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def sqlite_bound_execute_db(monkeypatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        for table in (
+            AutoFlowPlan.__table__,
+            ChannelProfile.__table__,
+            Job.__table__,
+            RuntimeSchedule.__table__,
+            AutoFlowRun.__table__,
+            AutoFlowUsedClip.__table__,
+            ProductionTask.__table__,
+            ChannelOpsQueueItem.__table__,
+        ):
+            await conn.run_sync(table.create)
+
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    starts: list[str] = []
+    created_jobs: list[SimpleNamespace] = []
+
+    async def fake_create_pipeline(_db, _request, *, commit=True):
+        return SimpleNamespace(id=uuid.uuid4())
+
+    async def fake_create_job(_db, pipeline_id, *, commit=True):
+        job = Job(
+            pipeline_id=pipeline_id,
+            pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+            status=JobStatus.PENDING,
+            orchestrator_owner="python",
+        )
+        _db.add(job)
+        await _db.flush()
+        created_jobs.append(job)
+        return job
+
+    async def fake_start_jobs_background(job_ids):
+        starts.extend(str(job_id) for job_id in job_ids)
+
+    monkeypatch.setattr("app.autoflow.service.create_pipeline", fake_create_pipeline)
+    monkeypatch.setattr("app.autoflow.service.create_job", fake_create_job)
+    monkeypatch.setattr(
+        "app.autoflow.service.start_jobs_background",
+        fake_start_jobs_background,
+        raising=False,
+    )
+    try:
+        yield factory, starts, created_jobs
+    finally:
         await engine.dispose()
 
 
@@ -249,6 +304,75 @@ async def test_bound_execute_links_task_before_start_handoff(
 
     assert observed_links == [(run.run_id, run.pipeline_id, run.job_id, "producing")]
     assert await _counts(factory) == (1, 1, 1)
+
+
+async def test_bound_execute_closed_window_creates_waiting_job_without_start(
+    sqlite_bound_execute_db,
+):
+    factory, starts, created_jobs = sqlite_bound_execute_db
+    service, plan = await _approved_plan(factory, prompt="Bound closed-window canary")
+    task_id, _queue_id, request = await _bound_execute_request(factory, plan)
+    async with factory() as db:
+        db.add(
+            RuntimeSchedule(
+                service_name=VIDEO_SCHEDULE_SERVICE,
+                state=VideoScheduleState.CLOSED.value,
+                updated_by="closed-bound-test",
+            )
+        )
+        await db.commit()
+
+    async with factory() as db:
+        run = await service.execute(request, db)
+    async with factory() as db:
+        replay = await service.execute(request, db)
+
+    assert replay.job_id == run.job_id
+    assert run.status == JobStatus.WAITING_WINDOW.value
+    assert starts == []
+    assert len(created_jobs) == 1
+    assert created_jobs[0].status == JobStatus.WAITING_WINDOW
+    async with factory() as db:
+        task = await db.get(ProductionTask, task_id)
+        assert task is not None
+        assert task.job_id == created_jobs[0].id
+        assert task.state == "producing"
+
+
+async def test_bound_execute_closed_window_parks_then_opens_exact_job(
+    postgres_idempotency_db,
+):
+    _engine, factory, starts = postgres_idempotency_db
+    service, plan = await _approved_plan(factory, prompt="Guarded canary materialization")
+    _task_id, _queue_id, request = await _bound_execute_request(factory, plan)
+    async with factory() as db:
+        db.add(
+            RuntimeSchedule(
+                service_name=VIDEO_SCHEDULE_SERVICE,
+                state=VideoScheduleState.CLOSED.value,
+                updated_by="closed-bound-postgres-test",
+            )
+        )
+        await db.commit()
+
+    async with factory() as db:
+        run = await service.execute(request, db)
+    async with factory() as db:
+        replay = await service.execute(request, db)
+    assert replay.job_id == run.job_id
+    assert run.status == JobStatus.WAITING_WINDOW.value
+    assert starts == []
+
+    job_id = uuid.UUID(run.job_id)
+    async with factory() as db:
+        assert await open_video_schedule_for_job(db, job_id) == [job_id]
+        schedule = await db.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+        job = await db.get(Job, job_id)
+        assert schedule is not None
+        assert job is not None
+        assert schedule.state == VideoScheduleState.OPEN.value
+        assert schedule.guarded_job_id == job_id
+        assert job.status == JobStatus.PENDING
 
 
 async def test_bound_execute_replay_recovers_lost_start_handoff_without_duplicate_rows(

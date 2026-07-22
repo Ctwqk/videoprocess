@@ -234,9 +234,11 @@ guard is present, and `authority.job.id` differs.
 Startup recovery loads the schedule record once, applies
 `should_defer_job_start()` to every job, and never schedules a mismatching UUID.
 Ordinary AutoFlow creation may persist a mismatch but must park it. A
-ChannelOps-bound execution holding the schedule lock must reject a new
-execution under any non-null guard; an existing idempotent job may resume only
-when `existing.job_id == schedule.guarded_job_id`.
+ChannelOps-bound execution holding the schedule lock may materialize its
+durable job while the schedule is `CLOSED` with no guard, but must park that job
+in `WAITING_WINDOW` without a start handoff. It must reject a new execution
+under any non-null guard; an existing idempotent job may resume only when
+`existing.job_id == schedule.guarded_job_id`.
 
 - [ ] **Step 4: Run focused GREEN and commit**
 
@@ -334,7 +336,9 @@ behavior.
 
 The coordinated controller accepts success only when both Python and shared
 local status report `OPEN`, `ReleasedJobs == 1`, and the same exact guarded UUID.
-For a known `ErrScheduleGuardMismatch`, close local authority only. For every
+For a known `ErrScheduleGuardMismatch`, return without cleanup: the Python-first
+request made no mutation, and the local controller observes the same durable
+schedule row, so a generic local close could erase foreign authority. For every
 transport, decode, timeout, 5xx, or ambiguous error, attempt Python and local
 close independently, each with a fresh context made by:
 
@@ -432,8 +436,9 @@ cd backend
 cd ..
 go test -count=1 ./...
 bash tests/test_vp_unlisted_canary_scripts.sh
-bash tests/test_channelops_ci_contract.sh
-bash tests/test_deploy_contract.sh
+bash tests/test_ci_workflow_contract.sh
+bash tests/test_vp_deploy_ci_gate.sh
+bash tests/test_vp_deploy_sync_extension.sh
 git diff --check
 ```
 

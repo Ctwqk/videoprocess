@@ -167,8 +167,10 @@ func (c *coordinatedScheduleController) OpenExpectedJob(
 	}
 	pythonRow, err := c.python.OpenExpectedJob(ctx, expectedJobID)
 	if err != nil {
-		closePython := !errors.Is(err, ErrScheduleGuardMismatch)
-		closeIncomplete := c.closeAfterGuardedFailure(ctx, closePython)
+		if errors.Is(err, ErrScheduleGuardMismatch) {
+			return store.VideoScheduleStatusRow{}, guardedScheduleHandoffError(err, false)
+		}
+		closeIncomplete := c.closeAfterGuardedFailure(ctx, true)
 		return store.VideoScheduleStatusRow{}, guardedScheduleHandoffError(err, closeIncomplete)
 	}
 	if !isExpectedGuardedOpen(pythonRow, expectedJobID) || pythonRow.ReleasedJobs != 1 {

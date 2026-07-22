@@ -3,6 +3,12 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -106,6 +112,41 @@ func TestGoJobStoreMethodSignatures(t *testing.T) {
 	var _ func(context.Context, string, string, string) (string, error) = s.CreateSourceArtifact
 }
 
+func TestCancelJobLocksBeforeAtomicCancellationWrites(t *testing.T) {
+	source := storeFunctionSource(t, "job_writes.go", "CancelJob")
+	requireSourceOrder(t, source,
+		"s.Pool.Begin(ctx)",
+		"tx.QueryRow(ctx",
+		"SELECT status::text",
+		"FOR UPDATE",
+		"terminalJobStatuses[status]",
+		"tx.Exec(ctx",
+		"UPDATE jobs",
+		"tx.Exec(ctx",
+		"UPDATE node_executions",
+		"tx.Commit(ctx)",
+	)
+	if strings.Contains(source, "s.Pool.Exec(ctx") {
+		t.Fatal("CancelJob writes through the pool instead of its locked transaction")
+	}
+}
+
+func TestFinalizeGoJobLocksAndStopsOnTerminalStatusBeforeArtifactPromotion(t *testing.T) {
+	source := storeFunctionSource(t, "go_jobs.go", "FinalizeGoJob")
+	requireSourceOrder(t, source,
+		"s.Pool.Begin(ctx)",
+		"tx.QueryRow(ctx",
+		"SELECT status::text",
+		"orchestrator_owner = 'go'",
+		"FOR UPDATE",
+		"terminalJobStatuses[jobStatus]",
+		"finalArtifactNodeList",
+		"UPDATE artifacts",
+		"UPDATE jobs",
+		"tx.Commit(ctx)",
+	)
+}
+
 func TestGoJobPlanningActionForAuthority(t *testing.T) {
 	const jobID = "11111111-1111-4111-8111-111111111111"
 	const otherJobID = "22222222-2222-4222-8222-222222222222"
@@ -157,5 +198,50 @@ func TestNodeExecutionRowInternalFieldsAreJSONIgnored(t *testing.T) {
 	}
 	if strings.Contains(body, "retry_count") {
 		t.Fatalf("RetryCount leaked into JSON: %s", body)
+	}
+}
+
+func storeFunctionSource(t *testing.T, filename string, functionName string) string {
+	t.Helper()
+	_, testFilename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve store test source path")
+	}
+	path := filepath.Join(filepath.Dir(testFilename), filename)
+	source, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, path, source, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	var function *ast.FuncDecl
+	for _, declaration := range parsed.Decls {
+		candidate, ok := declaration.(*ast.FuncDecl)
+		if ok && candidate.Name.Name == functionName {
+			function = candidate
+			break
+		}
+	}
+	if function == nil {
+		t.Fatalf("function %s not found in %s", functionName, path)
+	}
+	start := fileSet.Position(function.Pos()).Offset
+	end := fileSet.Position(function.End()).Offset
+	return string(source[start:end])
+}
+
+func requireSourceOrder(t *testing.T, source string, markers ...string) {
+	t.Helper()
+	offset := 0
+	for _, marker := range markers {
+		index := strings.Index(source[offset:], marker)
+		if index < 0 {
+			t.Fatalf("source does not contain %q after byte %d:\n%s", marker, offset, source)
+		}
+		offset += index + len(marker)
 	}
 }

@@ -13,25 +13,39 @@ var terminalJobStatuses = map[string]struct{}{
 }
 
 func (s *Store) CancelJob(ctx context.Context, id string) (JobDetailRow, error) {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return JobDetailRow{}, err
+	}
+	defer tx.Rollback(ctx)
+
 	var status string
-	if err := s.Pool.QueryRow(ctx, "SELECT status::text FROM jobs WHERE id = $1", id).Scan(&status); err != nil {
+	if err := tx.QueryRow(ctx, `
+		SELECT status::text
+		FROM jobs
+		WHERE id = $1
+		FOR UPDATE
+	`, id).Scan(&status); err != nil {
 		return JobDetailRow{}, err
 	}
 	if _, terminal := terminalJobStatuses[status]; !terminal {
-		if _, err := s.Pool.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			UPDATE jobs
 			SET status = 'CANCELLED', completed_at = COALESCE(completed_at, NOW())
 			WHERE id = $1
 		`, id); err != nil {
 			return JobDetailRow{}, err
 		}
-		if _, err := s.Pool.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			UPDATE node_executions
 			SET status = 'CANCELLED', completed_at = COALESCE(completed_at, NOW())
 			WHERE job_id = $1 AND status IN ('PENDING', 'QUEUED', 'RUNNING')
 		`, id); err != nil {
 			return JobDetailRow{}, err
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return JobDetailRow{}, err
 	}
 	return s.GetJobDetail(ctx, id)
 }

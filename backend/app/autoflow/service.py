@@ -961,8 +961,10 @@ class AutoFlowService:
                 schedule_state = VideoScheduleState(schedule.state)
             except ValueError:
                 schedule_state = default_video_schedule_state()
-            if schedule_state != VideoScheduleState.OPEN:
+            if schedule_state == VideoScheduleState.DRAINING:
                 raise PermissionError("ChannelOps runtime schedule does not permit a new execution")
+            if schedule_state == VideoScheduleState.CLOSED and schedule.guarded_job_id is not None:
+                raise PermissionError("ChannelOps guarded schedule is invalid while closed")
 
             task = (
                 await db.execute(
@@ -1029,7 +1031,11 @@ class AutoFlowService:
                 if job is None:
                     raise ValueError("ChannelOps-bound AutoFlow job was not found")
                 job_id = _bind_guarded_channelops_execution(task, existing, schedule, job)
-                should_start = job.status in {
+                should_start = not should_defer_job_start(
+                    job,
+                    schedule_state,
+                    schedule.guarded_job_id,
+                ) and job.status in {
                     JobStatus.PENDING,
                     JobStatus.WAITING_WINDOW,
                     JobStatus.VALIDATING,
@@ -1044,6 +1050,7 @@ class AutoFlowService:
             if schedule.guarded_job_id is not None:
                 raise PermissionError("ChannelOps guarded schedule does not permit a new execution")
 
+            should_start = False
             approved_revision_hash = plan.approved_revision_hash
             reservation = AutoFlowRunModel(
                 id=uuid.uuid4(),
@@ -1077,6 +1084,10 @@ class AutoFlowService:
                 commit=False,
             )
             job = await create_job(db, pipeline.id, commit=False)
+            if should_defer_job_start(job, schedule_state, schedule.guarded_job_id):
+                await park_jobs_for_window(db, [job], commit=False)
+            else:
+                should_start = True
             reservation.pipeline_id = pipeline.id
             reservation.job_id = job.id
             reservation.status = str(job.status.value)
@@ -1103,7 +1114,8 @@ class AutoFlowService:
         await db.refresh(reservation)
         run = _run_from_model(reservation)
         assert reservation.job_id is not None
-        await start_jobs_background([reservation.job_id])
+        if should_start:
+            await start_jobs_background([reservation.job_id])
         return run
 
     async def _validate_owned_input_asset(

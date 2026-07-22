@@ -70,7 +70,7 @@ func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 
 	enqueued := 0
 	for _, channel := range channels {
-		if !channelAvailableForExecution(channel) {
+		if !ChannelDueForTick(channel, now) {
 			continue
 		}
 		if err := s.enqueueDiscovery(ctx, channel, now); err != nil {

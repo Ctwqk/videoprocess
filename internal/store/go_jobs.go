@@ -398,17 +398,17 @@ func (s *Store) FinalizeGoJob(ctx context.Context, jobID string, status string, 
 	}
 	defer tx.Rollback(ctx)
 
-	var jobExists bool
+	var jobStatus string
 	if err := tx.QueryRow(ctx, `
-        SELECT EXISTS (
-            SELECT 1 FROM jobs
+            SELECT status::text
+            FROM jobs
             WHERE id = $1 AND orchestrator_owner = 'go'
-        )
-    `, jobID).Scan(&jobExists); err != nil {
+            FOR UPDATE
+        `, jobID).Scan(&jobStatus); err != nil {
 		return err
 	}
-	if !jobExists {
-		return pgx.ErrNoRows
+	if _, terminal := terminalJobStatuses[jobStatus]; terminal {
+		return tx.Commit(ctx)
 	}
 
 	finalNodeIDs := finalArtifactNodeList(finalArtifactNodeIDs)

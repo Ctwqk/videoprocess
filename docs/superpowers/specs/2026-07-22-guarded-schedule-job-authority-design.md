@@ -42,10 +42,18 @@ transaction. The response exposes the guarded job ID and exactly one release.
 The Go coordinated controller calls the Python guarded endpoint first and then
 verifies the local shared-database status has the same `OPEN` state and guarded
 job ID. It never invokes legacy local `OPEN` first. A known HTTP 409 means no
-Python mutation; every outcome-uncertain error best-effort closes Python and
-local authorities using a short context detached from request cancellation.
+Python mutation and returns without cleanup, because a generic close against
+the shared row could erase foreign authority. Every outcome-uncertain error
+best-effort closes Python and local authorities using a short context detached
+from request cancellation.
 External responses use stable error identifiers and never raw database or
 upstream error strings.
+
+While the schedule is `CLOSED` with no guard, a ChannelOps-bound AutoFlow
+execution may create its durable pipeline/run/job records, but the new job is
+parked in `WAITING_WINDOW` and receives no start handoff. This gives guarded
+open the exact job UUID it must authorize without opening a global execution
+window first.
 
 Legacy no-parameter `POST /open` remains compatible. It clears guarded
 authority and performs the existing all-waiting-job release.
@@ -99,6 +107,8 @@ No existing endpoint is removed.
 - Python orchestration and execution-authority tests proving a job created
   after guarded open is parked or rejected before node work.
 - Go orchestrator tests for guarded match, mismatch, and unguarded open.
+- Go cancellation and finalization serialize on the job row so a cancelled job
+  cannot be revived or have artifacts promoted by a stale finalizer.
 - PostgreSQL guarded-open/store tests run mandatorily in CI.
 - Coordinated-controller outcome-uncertain close tests use a cancelled request
   context and prove both close attempts still run without leaking errors.

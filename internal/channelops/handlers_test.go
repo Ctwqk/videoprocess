@@ -667,6 +667,19 @@ func TestGuardedAgentTickRollsBackUnlessExactlyOneTaskIsSelected(t *testing.T) {
 				`, fixture.LaneID); err != nil {
 					t.Fatalf("raise lane budget: %v", err)
 				}
+				if _, err := fixture.Store.Pool.Exec(ctx, `
+					INSERT INTO lane_format_matrix (
+						id, topic_lane_id, format_key, enabled, weight, target_duration_sec,
+						template_pool_json, default_publish_visibility, source_platforms_json,
+						created_at, updated_at
+					)
+					VALUES (
+						$1::uuid, $2::uuid, 'guarded-secondary', TRUE, 1.0, 45,
+						'["channelops-live"]'::json, 'unlisted', '[]'::json, $3, $3
+					)
+				`, testUUID(t, "guarded-secondary-format"), fixture.LaneID, fixture.Store.Now().UTC()); err != nil {
+					t.Fatalf("insert second lane format: %v", err)
+				}
 			},
 		},
 	} {

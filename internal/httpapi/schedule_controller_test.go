@@ -402,7 +402,7 @@ func TestCoordinatedGuardedOpenLocalCloseGetsFreshContextAfterPythonCloseTimeout
 	}
 }
 
-func TestCoordinatedGuardedOpenKnownConflictDoesNotRetryPythonClose(t *testing.T) {
+func TestCoordinatedGuardedOpenKnownConflictDoesNotCloseSharedSchedule(t *testing.T) {
 	expectedJobID := "11111111-1111-4111-8111-111111111111"
 	local := &fakeScheduleController{}
 	python := &fakeScheduleController{guardedErr: ErrScheduleGuardMismatch}
@@ -414,10 +414,10 @@ func TestCoordinatedGuardedOpenKnownConflictDoesNotRetryPythonClose(t *testing.T
 		t.Fatalf("error = %v; want ErrScheduleGuardMismatch", err)
 	}
 	if len(python.setStates) != 0 {
-		t.Fatalf("python states = %#v; want no close retry", python.setStates)
+		t.Fatalf("python states = %#v; want no close", python.setStates)
 	}
-	if !reflect.DeepEqual(local.setStates, []string{"CLOSED"}) {
-		t.Fatalf("local states = %#v; want CLOSED", local.setStates)
+	if len(local.setStates) != 0 {
+		t.Fatalf("local states = %#v; want no close", local.setStates)
 	}
 }
 
