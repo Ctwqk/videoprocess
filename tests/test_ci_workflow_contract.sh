@@ -17,6 +17,7 @@ required_lines=(
   "go-version-file: go.mod"
   'node-version: "22"'
   "CHANNEL_OPS_POSTGRES_TEST_URL:"
+  "uv sync --frozen --extra dev"
   ".venv/bin/python -m pytest"
   "go test ./..."
   "npm run build"
