@@ -98,11 +98,11 @@ with pgx, pytest, shell deployment contracts, Docker Swarm.
 - Modify: `docs/superpowers/plans/2026-07-21-youtube-discovery-scheduler.md`
 - Modify: `deploy/four-machine-topology.md`
 
-- [ ] Mark halt-after-selection as superseded by atomic intake pause.
-- [ ] Document that success remains intake-paused for mature metrics while
+- [x] Mark halt-after-selection as superseded by atomic intake pause.
+- [x] Document that success remains intake-paused for mature metrics while
   failure becomes fully halted.
-- [ ] Advance the per-attempt phrase to `批准第四次 unlisted canary`.
-- [ ] Preserve 127 application, 150 GPU/publisher/control, and 126 exclusion.
+- [x] Advance the per-attempt phrase to `批准第四次 unlisted canary`.
+- [x] Preserve 127 application, 150 GPU/publisher/control, and 126 exclusion.
 
 ### Task 6: Verify, review, push, and deploy
 
