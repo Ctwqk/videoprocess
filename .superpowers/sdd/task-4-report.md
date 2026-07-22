@@ -60,3 +60,97 @@ Result: both exited successfully with no output.
 ## Concerns
 
 The requested `.superpowers/sdd/task-4-brief.md` was not present in this worktree or the parent repository. This implementation followed the matching pre-approved scheduler design and the committed Task 4 implementation-plan section instead.
+
+## Review Fix Evidence
+
+The disposable PostgreSQL test database was migrated with the repository's existing
+Alembic revisions `001` through `029_channelops_discovery_ingestion_runs`:
+
+```bash
+cd backend
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:55439/videoprocess_test \
+  .venv/bin/python -m alembic -c alembic.ini upgrade head
+```
+
+### RED
+
+```text
+$ go test ./internal/channelops -run '^TestSchedulerBucketDoesNotRestartNonDivisorIntervalsAtUTCMidnight$' -count=1 -v
+=== RUN   TestSchedulerBucketDoesNotRestartNonDivisorIntervalsAtUTCMidnight
+    scheduler_test.go:62: 1000-minute bucket restarted at UTC midnight: before = "2026-07-21-16-40", after = "2026-07-22-00"
+--- FAIL: TestSchedulerBucketDoesNotRestartNonDivisorIntervalsAtUTCMidnight (0.00s)
+FAIL
+FAIL    github.com/Ctwqk/videoprocess/internal/channelops    0.351s
+FAIL
+```
+
+```text
+$ DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55439/videoprocess_test go test ./internal/channelops -run '^TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel$' -count=1 -v
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/matching_payload_is_channel_scoped
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/missing_payload_channel_is_not_global
+    integration_test.go:2926: claimed invalid discovery item: &channelops.QueueItemRow{... Status:"running" ...}
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/malformed_payload_channel_is_not_claimable
+    integration_test.go:2926: claimed invalid discovery item: &channelops.QueueItemRow{... Status:"running" ...}
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/mismatched_payload_channel_is_not_claimable
+    integration_test.go:2926: claimed invalid discovery item: &channelops.QueueItemRow{... Status:"running" ...}
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/nil_stored_channel_is_not_claimable
+    integration_test.go:2926: claimed invalid discovery item: &channelops.QueueItemRow{... Status:"running" ...}
+--- FAIL: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel (0.10s)
+FAIL
+FAIL    github.com/Ctwqk/videoprocess/internal/channelops    0.326s
+FAIL
+```
+
+### GREEN: Focused PostgreSQL Tests
+
+```text
+$ DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55439/videoprocess_test go test ./internal/channelops -run '^(TestSchedulerBucketDoesNotRestartNonDivisorIntervalsAtUTCMidnight|TestSchedulerRunOnce.*|TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel)$' -count=1 -v
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/matching_payload_is_channel_scoped
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/missing_payload_channel_is_not_global
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/malformed_payload_channel_is_not_claimable
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/mismatched_payload_channel_is_not_claimable
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/nil_stored_channel_is_not_claimable
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/disabled_payload_channel_is_not_claimable
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/halted_payload_channel_is_not_claimable
+=== RUN   TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/quarantined_payload_channel_is_not_claimable
+--- PASS: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel (0.08s)
+    --- PASS: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/matching_payload_is_channel_scoped (0.01s)
+    --- PASS: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/missing_payload_channel_is_not_global (0.00s)
+    --- PASS: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/malformed_payload_channel_is_not_claimable (0.00s)
+    --- PASS: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/mismatched_payload_channel_is_not_claimable (0.00s)
+    --- PASS: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/nil_stored_channel_is_not_claimable (0.00s)
+    --- PASS: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/disabled_payload_channel_is_not_claimable (0.00s)
+    --- PASS: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/halted_payload_channel_is_not_claimable (0.00s)
+    --- PASS: TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel/quarantined_payload_channel_is_not_claimable (0.00s)
+=== RUN   TestSchedulerBucketDoesNotRestartNonDivisorIntervalsAtUTCMidnight
+--- PASS: TestSchedulerBucketDoesNotRestartNonDivisorIntervalsAtUTCMidnight (0.00s)
+=== RUN   TestSchedulerRunOnceUsesIntervalAwareBuckets
+--- PASS: TestSchedulerRunOnceUsesIntervalAwareBuckets (0.02s)
+=== RUN   TestSchedulerRunOnceDoesNotRepeatSameFourHourBucket
+--- PASS: TestSchedulerRunOnceDoesNotRepeatSameFourHourBucket (0.02s)
+=== RUN   TestSchedulerRunOnceEnqueuesOperationalMaintenance
+--- PASS: TestSchedulerRunOnceEnqueuesOperationalMaintenance (0.02s)
+=== RUN   TestSchedulerRunOnceSchedulesEnabledDiscoveryOncePerPolicyBucket
+--- PASS: TestSchedulerRunOnceSchedulesEnabledDiscoveryOncePerPolicyBucket (0.02s)
+=== RUN   TestSchedulerRunOnceDiscoveryFailClosesWithoutChangingAgentTick
+=== RUN   TestSchedulerRunOnceDiscoveryFailClosesWithoutChangingAgentTick/default_disabled
+=== RUN   TestSchedulerRunOnceDiscoveryFailClosesWithoutChangingAgentTick/invalid_enabled_policy
+--- PASS: TestSchedulerRunOnceDiscoveryFailClosesWithoutChangingAgentTick (0.03s)
+    --- PASS: TestSchedulerRunOnceDiscoveryFailClosesWithoutChangingAgentTick/default_disabled (0.02s)
+    --- PASS: TestSchedulerRunOnceDiscoveryFailClosesWithoutChangingAgentTick/invalid_enabled_policy (0.02s)
+PASS
+ok      github.com/Ctwqk/videoprocess/internal/channelops    0.513s
+```
+
+No focused test was skipped. `RunOnce` continues to report newly scheduled
+agent ticks only; discovery is documented as maintenance and is deliberately
+excluded from that count. The full non-skipped PostgreSQL package run also
+passed:
+
+```text
+$ DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55439/videoprocess_test go test ./internal/channelops -count=1 -v
+PASS
+ok      github.com/Ctwqk/videoprocess/internal/channelops    6.247s
+```

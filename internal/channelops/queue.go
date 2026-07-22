@@ -82,6 +82,7 @@ const queueAuthorityClaimPredicate = `
 			)
 			OR (
 				NOT authority.is_global
+				AND q.kind <> 'ingest_discovery'
 				AND (
 					authority.authoritative_channel_id IS NULL
 					OR q.channel_profile_id IS DISTINCT FROM authority.authoritative_channel_id

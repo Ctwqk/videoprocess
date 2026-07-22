@@ -16,11 +16,9 @@ func ChannelDueForTick(channel ChannelProfileRow, now time.Time) bool {
 func SchedulerBucket(now time.Time, intervalMinutes int) string {
 	current := now.UTC()
 	interval := normalizedTickIntervalMinutes(intervalMinutes)
-	minutesSinceMidnight := current.Hour()*60 + current.Minute()
-	bucketStart := (minutesSinceMidnight / interval) * interval
-	bucketHour := bucketStart / 60
-	bucketMinute := bucketStart % 60
-	bucketTime := time.Date(current.Year(), current.Month(), current.Day(), bucketHour, bucketMinute, 0, 0, time.UTC)
+	intervalSeconds := int64(interval * 60)
+	bucketTime := time.Unix((current.Unix()/intervalSeconds)*intervalSeconds, 0).UTC()
+	bucketMinute := bucketTime.Minute()
 	if interval >= 60 && bucketMinute == 0 {
 		return bucketTime.Format("2006-01-02-15")
 	}
@@ -57,6 +55,7 @@ type Scheduler struct {
 	Store *Store
 }
 
+// RunOnce returns newly scheduled agent ticks; discovery and operational maintenance are intentionally excluded.
 func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 	channels, err := s.Store.ListSchedulableChannels(ctx, now)
 	if err != nil {

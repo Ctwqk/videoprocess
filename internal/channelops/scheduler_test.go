@@ -52,6 +52,17 @@ func TestSchedulerBucketMatchesPythonCadence(t *testing.T) {
 	}
 }
 
+func TestSchedulerBucketDoesNotRestartNonDivisorIntervalsAtUTCMidnight(t *testing.T) {
+	beforeMidnight := time.Date(2026, 7, 21, 23, 30, 0, 0, time.UTC)
+	afterMidnight := time.Date(2026, 7, 22, 0, 1, 0, 0, time.UTC)
+
+	beforeBucket := SchedulerBucket(beforeMidnight, 1000)
+	afterBucket := SchedulerBucket(afterMidnight, 1000)
+	if afterBucket != beforeBucket {
+		t.Fatalf("1000-minute bucket restarted at UTC midnight: before = %q, after = %q", beforeBucket, afterBucket)
+	}
+}
+
 func TestSchedulerRunOnceUsesIntervalAwareBuckets(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -170,7 +181,7 @@ func TestSchedulerRunOnceSchedulesEnabledDiscoveryOncePerPolicyBucket(t *testing
 	if err := fixture.Store.Pool.QueryRow(ctx, `
 		SELECT count(*), min(priority), min(idempotency_key), min(payload_json ->> 'source'),
 		       min(payload_json ->> 'channel_id'), min(payload_json ->> 'scheduler_bucket'),
-		       bool_or(payload_json ? 'bucket')
+		       bool_or(payload_json::jsonb ? 'bucket')
 		FROM channel_ops_queue_items
 		WHERE kind = $1
 	`, QueueIngestDiscovery).Scan(&count, &priority, &key, &source, &payloadChannel, &schedulerBucket, &hasBucket); err != nil {

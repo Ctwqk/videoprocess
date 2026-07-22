@@ -2821,6 +2821,8 @@ func TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel(t *testing.T) {
 		payload       map[string]any
 		storedChannel *string
 		claimable     bool
+		blocked       bool
+		prepare       func(t *testing.T)
 	}{
 		{
 			name:          "matching payload is channel scoped",
@@ -2835,13 +2837,77 @@ func TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel(t *testing.T) {
 			claimable:     false,
 		},
 		{
+			name:          "malformed payload channel is not claimable",
+			payload:       map[string]any{"channel_id": "not-a-uuid", "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			storedChannel: &channelID,
+			claimable:     false,
+		},
+		{
 			name:          "mismatched payload channel is not claimable",
 			payload:       map[string]any{"channel_id": otherChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
 			storedChannel: &channelID,
 			claimable:     false,
 		},
+		{
+			name:      "nil stored channel is not claimable",
+			payload:   map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			claimable: false,
+		},
+		{
+			name:          "disabled payload channel is not claimable",
+			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			storedChannel: &channelID,
+			claimable:     false,
+			blocked:       true,
+			prepare: func(t *testing.T) {
+				t.Helper()
+				if _, err := fixture.Store.Pool.Exec(ctx, `
+					UPDATE channel_profiles SET enabled = FALSE, halted_at = NULL, halt_reason = NULL
+					WHERE id = $1::uuid
+				`, fixture.ChannelID); err != nil {
+					t.Fatalf("disable discovery channel: %v", err)
+				}
+			},
+		},
+		{
+			name:          "halted payload channel is not claimable",
+			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			storedChannel: &channelID,
+			claimable:     false,
+			blocked:       true,
+			prepare: func(t *testing.T) {
+				t.Helper()
+				if _, err := fixture.Store.Pool.Exec(ctx, `
+					UPDATE channel_profiles
+					SET enabled = TRUE, halted_at = NOW(), halt_reason = 'halted discovery authority test'
+					WHERE id = $1::uuid
+				`, fixture.ChannelID); err != nil {
+					t.Fatalf("halt discovery channel: %v", err)
+				}
+			},
+		},
+		{
+			name:          "quarantined payload channel is not claimable",
+			payload:       map[string]any{"channel_id": fixture.ChannelID, "source": "youtube_search", "scheduler_bucket": "2026-05-21-18"},
+			storedChannel: &channelID,
+			claimable:     false,
+			blocked:       true,
+			prepare: func(t *testing.T) {
+				t.Helper()
+				if _, err := fixture.Store.Pool.Exec(ctx, `
+					UPDATE channel_profiles
+					SET enabled = TRUE, halted_at = NOW(), halt_reason = 'quarantined discovery authority test'
+					WHERE id = $1::uuid
+				`, fixture.ChannelID); err != nil {
+					t.Fatalf("quarantine discovery channel: %v", err)
+				}
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.prepare != nil {
+				tt.prepare(t)
+			}
 			itemID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
 				Kind:             QueueIngestDiscovery,
 				IdempotencyKey:   "ingest_discovery:authority:" + testUUID(t, tt.name),
@@ -2875,6 +2941,10 @@ func TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel(t *testing.T) {
 			if tt.claimable {
 				if err != nil || !dispatched {
 					t.Fatalf("fence matching discovery item = dispatched %t, err %v", dispatched, err)
+				}
+			} else if tt.blocked {
+				if !errors.Is(err, ErrChannelExecutionBlocked) || dispatched {
+					t.Fatalf("fence blocked discovery item = dispatched %t, err %v", dispatched, err)
 				}
 			} else if !errors.Is(err, ErrQueueAuthorityInvalid) || dispatched {
 				t.Fatalf("fence invalid discovery item = dispatched %t, err %v", dispatched, err)
