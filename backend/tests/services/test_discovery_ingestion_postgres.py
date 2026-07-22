@@ -40,7 +40,10 @@ from app.services.discovery_ingestion import (
 
 POSTGRES_URL = os.getenv(
     "DISCOVERY_INGESTION_POSTGRES_TEST_URL",
-    os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", ""),
+    os.getenv(
+        "TEST_POSTGRES_DSN",
+        os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", ""),
+    ),
 )
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
