@@ -32,7 +32,11 @@ func main() {
 	}
 	defer runner.Close()
 
-	result, err := channelops.LiveSmoke{Store: runner.Store, Handler: runner.Handlers}.Run(ctx, *channelID)
+	result, err := channelops.LiveSmoke{
+		Store:    runner.Store,
+		Handler:  runner.Handlers,
+		HolderID: cfg.RunnerID,
+	}.Run(ctx, *channelID)
 	if err != nil {
 		slog.Error("smoke failed", "error", err)
 		os.Exit(1)

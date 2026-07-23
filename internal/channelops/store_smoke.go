@@ -3,6 +3,7 @@ package channelops
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -41,16 +42,33 @@ func (s *Store) RunLiveSmoke(ctx context.Context, channelID string, handler Hand
 	if err := handler.ReadinessError(); err != nil {
 		return SmokeResult{}, err
 	}
+	configured, authority := s.leadership.snapshot()
+	if !configured || authority == nil || authority.HolderID == "" || authority.Epoch <= 0 {
+		return SmokeResult{}, ErrLeaderAuthorityUnavailable
+	}
+	workerID := fmt.Sprintf("%s:epoch:%d", authority.HolderID, authority.Epoch)
 	bucket := UTCBucket(s.Now())
 	if err := s.RunTick(ctx, channelID, bucket, handler); err != nil {
 		return SmokeResult{}, err
 	}
 	claimableKinds := handler.ClaimableKinds()
 	for i := 0; i < liveSmokeQueueLimit; i++ {
-		if err := s.advanceLiveSmokeQueue(ctx, channelID, claimableKinds); err != nil {
+		if err := s.WithLeaderExecutionFence(ctx, func(fenced *Store) error {
+			return fenced.advanceLiveSmokeQueue(ctx, channelID, claimableKinds)
+		}); err != nil {
 			return SmokeResult{}, err
 		}
-		item, err := s.claimNextLiveSmokeForChannelAndKinds(ctx, channelID, "channelops-live-smoke", claimableKinds)
+		var item *QueueItemRow
+		err := s.WithLeaderExecutionFence(ctx, func(fenced *Store) error {
+			var claimErr error
+			item, claimErr = fenced.claimNextLiveSmokeForChannelAndKinds(
+				ctx,
+				channelID,
+				workerID,
+				claimableKinds,
+			)
+			return claimErr
+		})
 		if err != nil {
 			return SmokeResult{}, err
 		}
@@ -58,14 +76,24 @@ func (s *Store) RunLiveSmoke(ctx context.Context, channelID string, handler Hand
 			break
 		}
 		if err := handler.Handle(ctx, *item); err != nil {
-			_ = s.MarkQueueFailedOrRetry(ctx, *item, err.Error())
-			return SmokeResult{}, err
+			completionErr := s.WithLeaderExecutionFence(ctx, func(fenced *Store) error {
+				return fenced.MarkQueueFailedOrRetry(ctx, *item, err.Error())
+			})
+			return SmokeResult{}, errors.Join(err, completionErr)
 		}
-		if err := s.MarkQueueDone(ctx, *item); err != nil {
+		if err := s.WithLeaderExecutionFence(ctx, func(fenced *Store) error {
+			return fenced.MarkQueueDone(ctx, *item)
+		}); err != nil {
 			return SmokeResult{}, err
 		}
 	}
-	return s.SmokeResultForChannel(ctx, channelID)
+	var result SmokeResult
+	err := s.WithLeaderExecutionFence(ctx, func(fenced *Store) error {
+		var resultErr error
+		result, resultErr = fenced.SmokeResultForChannel(ctx, channelID)
+		return resultErr
+	})
+	return result, err
 }
 
 func (s *Store) advanceLiveSmokeQueue(ctx context.Context, channelID string, kinds []string) error {

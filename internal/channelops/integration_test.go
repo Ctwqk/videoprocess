@@ -306,12 +306,20 @@ func TestRunLiveSmokeFreshSmokeCompletesWithDelayedQueue(t *testing.T) {
 	}
 	ctx := context.Background()
 	fixture := NewChannelOpsFixture(t)
-	defer fixture.Close(ctx)
+	fixture.ResetLeaderEpoch(ctx)
+	defer func() {
+		fixture.ResetLeaderEpoch(context.Background())
+		fixture.Close(context.Background())
+	}()
 
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
 
-	result, err := fixture.Store.RunLiveSmoke(ctx, fixture.ChannelID, handler)
+	result, err := (LiveSmoke{
+		Store:    fixture.Store,
+		Handler:  handler,
+		HolderID: "channelops-go@live-smoke-test:1",
+	}).Run(ctx, fixture.ChannelID)
 	if err != nil {
 		t.Fatalf("RunLiveSmoke: %v", err)
 	}

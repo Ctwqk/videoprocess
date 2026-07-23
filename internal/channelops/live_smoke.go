@@ -3,7 +3,11 @@ package channelops
 import (
 	"context"
 	"errors"
+	"strings"
+	"time"
 )
+
+var ErrLiveSmokeLeaderActive = errors.New("channelops managed leader is active")
 
 type SmokeResult struct {
 	TaskScheduled       bool
@@ -33,13 +37,43 @@ func (r SmokeResult) Validate() error {
 }
 
 type LiveSmoke struct {
-	Store   *Store
-	Handler HandlerService
+	Store    *Store
+	Handler  HandlerService
+	HolderID string
 }
 
-func (s LiveSmoke) Run(ctx context.Context, channelID string) (SmokeResult, error) {
+func (s LiveSmoke) Run(
+	ctx context.Context,
+	channelID string,
+) (result SmokeResult, runErr error) {
 	if s.Store == nil {
 		return SmokeResult{}, errors.New("channelops live smoke store is not configured")
 	}
-	return s.Store.RunLiveSmoke(ctx, channelID, s.Handler)
+	holderID := strings.TrimSpace(s.HolderID)
+	if holderID == "" {
+		return SmokeResult{}, errors.New("channelops live smoke holder id is required")
+	}
+	lease, acquired, err := s.Store.TryAcquireLeader(ctx, holderID, s.Store.Now())
+	if err != nil {
+		return SmokeResult{}, err
+	}
+	if !acquired || lease == nil {
+		return SmokeResult{}, ErrLiveSmokeLeaderActive
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		releaseErr := lease.Release(releaseCtx, s.Store.Now())
+		if releaseErr != nil {
+			runErr = errors.Join(runErr, releaseErr)
+		}
+	}()
+
+	authority := lease.Authority()
+	if authority.HolderID != holderID || authority.Epoch <= 0 {
+		return SmokeResult{}, ErrLeaderAuthorityUnavailable
+	}
+	handler := s.Handler
+	handler.Store = s.Store
+	return s.Store.RunLiveSmoke(ctx, channelID, handler)
 }
