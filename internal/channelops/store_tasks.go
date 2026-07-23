@@ -36,37 +36,139 @@ func (s *Store) RunTickWithOptions(
 	if options.PlanDelay < 0 || options.PlanDelay > time.Hour {
 		return errors.New("plan delay must be from 0 through 1 hour")
 	}
-	if !s.hasExecutionTransaction() {
+	if s.hasExecutionTransaction() {
+		return errors.New("agent_tick cannot call PDS while a database fence is held")
+	}
+	var preparation tickPreparation
+	if err := s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
+		prepared, err := fencedStore.prepareTick(ctx, channelID, bucket, options)
+		preparation = prepared
+		return err
+	}); err != nil {
+		return err
+	}
+	revalidate := func() error {
 		return s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
-			return fencedStore.runTickWithOptions(ctx, channelID, bucket, options, h)
+			current, err := fencedStore.prepareTick(ctx, channelID, bucket, options)
+			if err != nil {
+				return err
+			}
+			return preparation.validate(current)
 		})
 	}
-	return s.runTickWithOptions(ctx, channelID, bucket, options, h)
+	candidates, alerts, err := evaluateTickCandidatePolicyWithRevalidation(
+		ctx,
+		preparation.Channel,
+		preparation.Candidates,
+		h,
+		revalidate,
+	)
+	if err != nil {
+		return err
+	}
+	return s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
+		return fencedStore.finalizeTick(ctx, preparation, candidates, alerts)
+	})
 }
 
-func (s *Store) runTickWithOptions(
+type tickPreparation struct {
+	Channel     ChannelProfileRow
+	Candidates  []TickCandidate
+	TaskCount   int64
+	InputDigest string
+	ChannelID   string
+	Bucket      string
+	Options     agentTickOptions
+	Now         time.Time
+}
+
+func (p tickPreparation) validate(current tickPreparation) error {
+	if p.ChannelID != current.ChannelID || p.Bucket != current.Bucket || p.InputDigest != current.InputDigest {
+		return fmt.Errorf("%w: agent tick inputs changed", ErrHandlerSnapshotStale)
+	}
+	return nil
+}
+
+func (s *Store) prepareTick(
 	ctx context.Context,
 	channelID string,
 	bucket string,
 	options agentTickOptions,
-	h HandlerService,
-) error {
+) (tickPreparation, error) {
 	now := s.Now().UTC()
 	channel, lanes, accounts, seeds, signals, laneFormats, err := s.LoadTickInputs(ctx, channelID, now)
 	if err != nil {
-		return err
+		return tickPreparation{}, err
 	}
 	if channel.IntakePausedAt != nil {
-		return fmt.Errorf("%w: channel %s intake is paused", ErrChannelExecutionBlocked, channelID)
+		return tickPreparation{}, fmt.Errorf("%w: channel %s intake is paused", ErrChannelExecutionBlocked, channelID)
 	}
 	candidates := BuildTickCandidates(channel, lanes, accounts, seeds, signals, laneFormats, bucket)
-	alerts := []AlertPayload{}
-	evaluatedCandidates, pdsAlerts, err := evaluateTickCandidatePolicy(ctx, channel, candidates, h)
+	var taskCount int64
+	if err := s.db().QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM production_tasks
+		WHERE channel_profile_id = $1::uuid
+	`, channelID).Scan(&taskCount); err != nil {
+		return tickPreparation{}, err
+	}
+	digest, err := handlerSnapshotDigest(struct {
+		Channel     ChannelProfileRow
+		Lanes       []TopicLaneRow
+		Accounts    []PublishingAccountRow
+		Seeds       []ManualSeedRow
+		Signals     []DiscoverySignalRow
+		LaneFormats map[string][]LaneFormatRow
+		Candidates  []TickCandidate
+		TaskCount   int64
+	}{
+		Channel:     channel,
+		Lanes:       lanes,
+		Accounts:    accounts,
+		Seeds:       seeds,
+		Signals:     signals,
+		LaneFormats: laneFormats,
+		Candidates:  candidates,
+		TaskCount:   taskCount,
+	})
+	if err != nil {
+		return tickPreparation{}, err
+	}
+	return tickPreparation{
+		Channel:     channel,
+		Candidates:  candidates,
+		TaskCount:   taskCount,
+		InputDigest: digest,
+		ChannelID:   channelID,
+		Bucket:      bucket,
+		Options:     options,
+		Now:         now,
+	}, nil
+}
+
+func (s *Store) finalizeTick(
+	ctx context.Context,
+	preparation tickPreparation,
+	candidates []TickCandidate,
+	alerts []AlertPayload,
+) error {
+	current, err := s.prepareTick(
+		ctx,
+		preparation.ChannelID,
+		preparation.Bucket,
+		preparation.Options,
+	)
 	if err != nil {
 		return err
 	}
-	candidates = evaluatedCandidates
-	alerts = append(alerts, pdsAlerts...)
+	if err := preparation.validate(current); err != nil {
+		return err
+	}
+	channel := preparation.Channel
+	channelID := preparation.ChannelID
+	bucket := preparation.Bucket
+	options := preparation.Options
+	now := preparation.Now
 	accepted, rejected := acceptedRejected(candidates)
 	if len(accepted) == 0 {
 		alerts = append(alerts, materialLowSupplyAlert(channelID, bucket, len(accepted), len(rejected)))
@@ -78,16 +180,7 @@ func (s *Store) runTickWithOptions(
 			result.TasksToCreate(),
 		)
 	}
-	tx, ownsTransaction, err := s.beginOrReuse(ctx)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(ctx)
-		}
-	}()
+	db := s.db()
 
 	tickSummary := map[string]any{
 		"bucket":          bucket,
@@ -100,46 +193,40 @@ func (s *Store) runTickWithOptions(
 		tickSummary["canary_run_id"] = options.CanaryRunID
 		tickSummary["pause_intake_after_selection"] = true
 	}
-	tickAuditID, err := s.insertTickAudit(ctx, tx, channelID, bucket, result, tickSummary)
+	tickAuditID, err := s.insertTickAudit(ctx, db, channelID, bucket, result, tickSummary)
 	if err != nil {
 		return err
 	}
-	decisionAuditIDs, err := s.insertDecisionAuditEntries(ctx, tx, tickAuditID, channelID, result)
+	decisionAuditIDs, err := s.insertDecisionAuditEntries(ctx, db, tickAuditID, channelID, result)
 	if err != nil {
 		return err
 	}
 	for _, alert := range alerts {
-		if _, err := s.enqueueAlert(ctx, tx, alert, 5, ""); err != nil {
+		if _, err := s.enqueueAlert(ctx, db, alert, 5, ""); err != nil {
 			return err
 		}
 	}
 	if channel.DryRun {
-		if ownsTransaction {
-			if err := tx.Commit(ctx); err != nil {
-				return err
-			}
-		}
-		committed = true
 		return nil
 	}
 
 	for _, candidate := range accepted {
-		taskID, err := s.insertProductionTask(ctx, tx, channel, candidate, now)
+		taskID, err := s.insertProductionTask(ctx, db, channel, candidate, now)
 		if err != nil {
 			return err
 		}
 		if candidate.DiscoverySignal != nil {
-			if err := s.markDiscoverySignalConverted(ctx, tx, candidate.DiscoverySignal.ID, taskID); err != nil {
+			if err := s.markDiscoverySignalConverted(ctx, db, candidate.DiscoverySignal.ID, taskID); err != nil {
 				return err
 			}
 		}
 		if auditID := decisionAuditIDs[candidate.CandidateID]; auditID != "" {
-			if err := s.attachDecisionAuditTask(ctx, tx, auditID, taskID); err != nil {
+			if err := s.attachDecisionAuditTask(ctx, db, auditID, taskID); err != nil {
 				return err
 			}
 		}
 		channelProfileID := channel.ID
-		if _, err := s.enqueue(ctx, tx, EnqueueOptions{
+		if _, err := s.enqueue(ctx, db, EnqueueOptions{
 			Kind:             QueuePlanTask,
 			IdempotencyKey:   "plan_task:" + taskID,
 			Payload:          map[string]any{"production_task_id": taskID, "channel_id": channel.ID},
@@ -151,16 +238,10 @@ func (s *Store) runTickWithOptions(
 		}
 	}
 	if options.PauseIntakeAfterSelection {
-		if err := s.pauseChannelIntake(ctx, tx, channelID, now, CanaryIntakePauseReason); err != nil {
+		if err := s.pauseChannelIntake(ctx, db, channelID, now, CanaryIntakePauseReason); err != nil {
 			return err
 		}
 	}
-	if ownsTransaction {
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-	}
-	committed = true
 	return nil
 }
 
@@ -191,6 +272,16 @@ func (s *Store) pauseChannelIntake(
 }
 
 func evaluateTickCandidatePolicy(ctx context.Context, channel ChannelProfileRow, candidates []TickCandidate, h HandlerService) ([]TickCandidate, []AlertPayload, error) {
+	return evaluateTickCandidatePolicyWithRevalidation(ctx, channel, candidates, h, nil)
+}
+
+func evaluateTickCandidatePolicyWithRevalidation(
+	ctx context.Context,
+	channel ChannelProfileRow,
+	candidates []TickCandidate,
+	h HandlerService,
+	revalidate func() error,
+) ([]TickCandidate, []AlertPayload, error) {
 	if h.PDS == nil {
 		return candidates, nil, nil
 	}
@@ -199,6 +290,11 @@ func evaluateTickCandidatePolicy(ctx context.Context, channel ChannelProfileRow,
 		candidate := &candidates[i]
 		if candidate.Rejected || candidate.Account == nil {
 			continue
+		}
+		if revalidate != nil {
+			if err := revalidate(); err != nil {
+				return candidates, nil, err
+			}
 		}
 		decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
 			ActorID:    candidate.Account.ID,

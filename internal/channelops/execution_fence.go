@@ -20,6 +20,9 @@ func (s *Store) WithQueueExecutionFence(ctx context.Context, item QueueItemRow, 
 		if err := s.assertLeaderAuthority(ctx, tx, false); err != nil {
 			return err
 		}
+		if err := assertQueueLease(ctx, tx, item); err != nil {
+			return err
+		}
 
 		channelID, err := resolveQueueAuthority(ctx, tx, item)
 		if err != nil {
@@ -47,6 +50,33 @@ func (s *Store) WithQueueExecutionFence(ctx context.Context, item QueueItemRow, 
 		}
 		return dispatch(s.withExecutionDB(tx, channelID))
 	})
+}
+
+func assertQueueLease(ctx context.Context, db dbExecutor, item QueueItemRow) error {
+	lockedBy, lockedAt, err := runningLease(item)
+	if err != nil {
+		return errors.Join(ErrQueueLeaseLost, err)
+	}
+	var found bool
+	err = db.QueryRow(ctx, `
+		SELECT TRUE
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+		  AND status = $2
+		  AND locked_by = $3
+		  AND locked_at = $4
+		FOR UPDATE
+	`, item.ID, QueueStatusRunning, lockedBy, lockedAt).Scan(&found)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrQueueLeaseLost
+	}
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrQueueLeaseLost
+	}
+	return nil
 }
 
 func (s *Store) WithChannelExecutionFence(ctx context.Context, channelID string, dispatch func(*Store) error) error {

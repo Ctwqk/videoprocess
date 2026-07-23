@@ -36,8 +36,13 @@ var (
 )
 
 type promotionPreparation struct {
-	Operation PromotionOperationRow
-	Skip      bool
+	Operation        PromotionOperationRow
+	Scope            preparedPublicationSnapshot
+	DecisionRequest  PDSDecisionRequest
+	TargetVisibility string
+	ScheduledAt      time.Time
+	NeedsDecision    bool
+	Skip             bool
 }
 
 func PlanDecisionResult(decision PDSDecision) PlanResult {
@@ -99,20 +104,33 @@ func (h HandlerService) Handle(ctx context.Context, item QueueItemRow) error {
 	if h.Store == nil {
 		return errors.New("channelops handler store is not configured")
 	}
-	if item.Kind == QueueExecuteTask {
-		return h.HandleExecuteTask(ctx, item)
-	}
-	if item.Kind == QueuePromotePublication {
-		return h.HandlePromotePublication(ctx, item)
-	}
-	if item.Kind == QueueIngestDiscovery {
-		return h.HandleIngestDiscovery(ctx, item)
+	if networkedQueueKind(item.Kind) {
+		return h.dispatch(ctx, item)
 	}
 	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
 		fencedHandler := h
 		fencedHandler.Store = fencedStore
 		return fencedHandler.dispatch(ctx, item)
 	})
+}
+
+func networkedQueueKind(kind string) bool {
+	switch kind {
+	case QueueAgentTick,
+		QueuePlanTask,
+		QueueExecuteTask,
+		QueueObserveJob,
+		QueuePublishTask,
+		QueuePromotePublication,
+		QueueReconcilePublication,
+		QueueCollectMetrics,
+		QueueAccountHealth,
+		QueueSendAlert,
+		QueueIngestDiscovery:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h HandlerService) dispatch(ctx context.Context, item QueueItemRow) error {
@@ -122,13 +140,13 @@ func (h HandlerService) dispatch(ctx context.Context, item QueueItemRow) error {
 	case QueuePlanTask:
 		return h.HandlePlanTask(ctx, item)
 	case QueueExecuteTask:
-		return errors.New("execute_task requires split execution fencing")
+		return h.HandleExecuteTask(ctx, item)
 	case QueueObserveJob:
 		return h.HandleObserveJob(ctx, item)
 	case QueuePublishTask:
 		return h.HandlePublishTask(ctx, item)
 	case QueuePromotePublication:
-		return errors.New("promote_publication requires split execution fencing")
+		return h.HandlePromotePublication(ctx, item)
 	case QueueReconcilePublication:
 		return h.HandleReconcilePublication(ctx, item)
 	case QueueCollectMetrics:
@@ -142,18 +160,15 @@ func (h HandlerService) dispatch(ctx context.Context, item QueueItemRow) error {
 	case QueueLearningRecompute:
 		return h.HandleLearningRecompute(ctx, item)
 	case QueueIngestDiscovery:
-		return errors.New("ingest_discovery requires split execution fencing")
+		return h.HandleIngestDiscovery(ctx, item)
 	default:
 		return fmt.Errorf("unknown ChannelOps queue kind: %s", item.Kind)
 	}
 }
 
 func (h HandlerService) HandleIngestDiscovery(ctx context.Context, item QueueItemRow) error {
-	if h.Store == nil {
-		return errors.New("channelops handler store is not configured")
-	}
-	if h.Store.hasExecutionTransaction() {
-		return errors.New("ingest_discovery cannot call discovery API while a database fence is held")
+	if err := h.requireExternalPhase(QueueIngestDiscovery); err != nil {
+		return err
 	}
 	if h.Discovery == nil {
 		return errors.New("discovery client is not configured")
@@ -162,18 +177,21 @@ func (h HandlerService) HandleIngestDiscovery(ctx context.Context, item QueueIte
 	if err != nil {
 		return err
 	}
-	if h.Store.Pool != nil {
-		if err := h.Store.WithQueueExecutionFence(ctx, item, func(*Store) error {
-			return nil
-		}); err != nil {
-			return err
-		}
+	if err := h.withQueueExecutionPhase(ctx, item, func(HandlerService) error {
+		return nil
+	}); err != nil {
+		return err
 	}
 	observation, err := h.Discovery.Ingest(ctx, request)
 	if err != nil {
 		return ErrDiscoveryIngestFailed
 	}
-	return validateDiscoveryObservation(request, observation)
+	if err := validateDiscoveryObservation(request, observation); err != nil {
+		return err
+	}
+	return h.withQueueExecutionPhase(ctx, item, func(HandlerService) error {
+		return nil
+	})
 }
 
 func discoveryRequestFromQueueItem(item QueueItemRow) (DiscoveryIngestRequest, error) {
@@ -221,6 +239,9 @@ func discoveryQueueAuthorityError(message string) error {
 }
 
 func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) error {
+	if err := h.requireExternalPhase(QueueAgentTick); err != nil {
+		return err
+	}
 	channelID, _ := item.PayloadJSON["channel_id"].(string)
 	bucket := firstString(item.PayloadJSON, "bucket", "scheduler_bucket")
 	if bucket == "" {
@@ -233,7 +254,36 @@ func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) 
 	if err != nil {
 		return err
 	}
-	return h.Store.RunTickWithOptions(ctx, channelID, bucket, options, h)
+	var preparation tickPreparation
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		prepared, err := fenced.Store.prepareTick(ctx, channelID, bucket, options)
+		preparation = prepared
+		return err
+	}); err != nil {
+		return err
+	}
+	revalidate := func() error {
+		return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+			current, err := fenced.Store.prepareTick(ctx, channelID, bucket, options)
+			if err != nil {
+				return err
+			}
+			return preparation.validate(current)
+		})
+	}
+	candidates, alerts, err := evaluateTickCandidatePolicyWithRevalidation(
+		ctx,
+		preparation.Channel,
+		preparation.Candidates,
+		h,
+		revalidate,
+	)
+	if err != nil {
+		return err
+	}
+	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		return fenced.Store.finalizeTick(ctx, preparation, candidates, alerts)
+	})
 }
 
 type agentTickOptions struct {
@@ -307,6 +357,9 @@ func agentTickPlanDelay(payload map[string]any) (time.Duration, error) {
 }
 
 func (h HandlerService) HandlePlanTask(ctx context.Context, item QueueItemRow) error {
+	if err := h.requireExternalPhase(QueuePlanTask); err != nil {
+		return err
+	}
 	if h.AutoFlow == nil {
 		return errors.New("autoflow client is not configured")
 	}
@@ -314,68 +367,143 @@ func (h HandlerService) HandlePlanTask(ctx context.Context, item QueueItemRow) e
 	if taskID == "" {
 		return errors.New("plan_task payload missing production_task_id")
 	}
-	task, err := h.Store.GetProductionTask(ctx, taskID)
-	if err != nil {
-		return err
-	}
-	if task.State != TaskSelected {
-		return nil
-	}
-	observation, err := h.AutoFlow.PlanTask(ctx, task, AutoFlowRequestForTask(task))
-	if err != nil {
-		return err
-	}
-	if observation.UploadNodeCount != 1 {
-		return h.Store.HoldTaskWithPlan(ctx, task.ID, observation.PlanID, "missing_youtube_upload_node", "AutoFlow plan must contain exactly one youtube_upload node", "plan_task")
-	}
-	if task.ApprovalMode == ApprovalHuman || taskUsesExternalAssets(task) {
-		return h.Store.HoldTaskWithPlan(ctx, task.ID, observation.PlanID, "human_approval_required", "AutoFlow plan requires human approval before execution", "plan_task_human_approval")
-	}
-	if h.PDS == nil {
-		return errors.New("pds client is not configured")
-	}
-	decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
-		ActorID:    task.TargetAccountID,
-		ActionType: "plan_approval",
-		Platform:   "youtube",
-		Content:    map[string]any{"title": task.TitleSeed, "description": task.Prompt},
-		Context:    map[string]any{"production_task_id": task.ID, "autoflow_plan_id": observation.PlanID},
-	})
-	if err != nil {
-		return err
-	}
-	if alert, ok := maybePDSOutageAlert(decision, task.ChannelProfileID, task.ID, "plan_approval"); ok {
-		if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+	var prepared preparedTaskSnapshot
+	skip := false
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		task, err := fenced.Store.GetProductionTask(ctx, taskID)
+		if err != nil {
 			return err
 		}
+		if task.State != TaskSelected {
+			skip = true
+			return nil
+		}
+		prepared, err = newPreparedTaskSnapshot(task)
+		return err
+	}); err != nil {
+		return err
 	}
-	result := PlanDecisionResult(decision)
-	if !result.EnqueueExecute {
-		return h.Store.HoldTaskWithPlanAndPDS(ctx, task.ID, observation.PlanID, result.BlockedByGuard, decision, "plan_task_pds")
+	if skip {
+		return nil
 	}
-	approval, err := h.AutoFlow.ApprovePlan(ctx, observation.PlanID, map[string]any{"decision_id": decision.DecisionID, "verdict": decision.Verdict})
+	observation, err := h.AutoFlow.PlanTask(
+		ctx,
+		prepared.Task,
+		AutoFlowRequestForTask(prepared.Task),
+	)
 	if err != nil {
 		return err
 	}
-	return h.Store.MarkTaskPlanningAndEnqueueExecute(
-		ctx,
-		task.ID,
-		observation.PlanID,
-		observation.PlanPayload,
-		approval,
-		item.ID,
-	)
+	var decision PDSDecision
+	var approval AutoFlowApprovalObservation
+	if observation.UploadNodeCount == 1 &&
+		prepared.Task.ApprovalMode != ApprovalHuman &&
+		!taskUsesExternalAssets(prepared.Task) {
+		if h.PDS == nil {
+			return errors.New("pds client is not configured")
+		}
+		if err := h.revalidatePreparedTask(ctx, item, prepared); err != nil {
+			return err
+		}
+		decision, err = h.PDS.Decide(ctx, PDSDecisionRequest{
+			ActorID:    prepared.Task.TargetAccountID,
+			ActionType: "plan_approval",
+			Platform:   "youtube",
+			Content: map[string]any{
+				"title":       prepared.Task.TitleSeed,
+				"description": prepared.Task.Prompt,
+			},
+			Context: map[string]any{
+				"production_task_id": prepared.Task.ID,
+				"autoflow_plan_id":   observation.PlanID,
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if PlanDecisionResult(decision).EnqueueExecute {
+			if err := h.revalidatePreparedTask(ctx, item, prepared); err != nil {
+				return err
+			}
+			approval, err = h.AutoFlow.ApprovePlan(
+				ctx,
+				observation.PlanID,
+				map[string]any{
+					"decision_id": decision.DecisionID,
+					"verdict":     decision.Verdict,
+				},
+			)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		current, err := fenced.Store.GetProductionTask(ctx, prepared.Task.ID)
+		if err != nil {
+			return err
+		}
+		if err := prepared.validate(current); err != nil {
+			return err
+		}
+		if observation.UploadNodeCount != 1 {
+			return fenced.Store.HoldTaskWithPlan(
+				ctx,
+				current.ID,
+				observation.PlanID,
+				"missing_youtube_upload_node",
+				"AutoFlow plan must contain exactly one youtube_upload node",
+				"plan_task",
+			)
+		}
+		if current.ApprovalMode == ApprovalHuman || taskUsesExternalAssets(current) {
+			return fenced.Store.HoldTaskWithPlan(
+				ctx,
+				current.ID,
+				observation.PlanID,
+				"human_approval_required",
+				"AutoFlow plan requires human approval before execution",
+				"plan_task_human_approval",
+			)
+		}
+		if alert, ok := maybePDSOutageAlert(
+			decision,
+			current.ChannelProfileID,
+			current.ID,
+			"plan_approval",
+		); ok {
+			if _, err := fenced.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+				return err
+			}
+		}
+		result := PlanDecisionResult(decision)
+		if !result.EnqueueExecute {
+			return fenced.Store.HoldTaskWithPlanAndPDS(
+				ctx,
+				current.ID,
+				observation.PlanID,
+				result.BlockedByGuard,
+				decision,
+				"plan_task_pds",
+			)
+		}
+		return fenced.Store.MarkTaskPlanningAndEnqueueExecute(
+			ctx,
+			current.ID,
+			observation.PlanID,
+			observation.PlanPayload,
+			approval,
+			item.ID,
+		)
+	})
 }
 
 func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow) error {
+	if err := h.requireExternalPhase(QueueExecuteTask); err != nil {
+		return err
+	}
 	if h.AutoFlow == nil {
 		return errors.New("autoflow client is not configured")
-	}
-	if h.Store == nil {
-		return errors.New("channelops handler store is not configured")
-	}
-	if h.Store.hasExecutionTransaction() {
-		return errors.New("execute_task cannot call AutoFlow while a database fence is held")
 	}
 	queueLockedBy, queueLockedAt, err := runningLease(item)
 	if err != nil || strings.TrimSpace(queueLockedBy) == "" || queueLockedAt.IsZero() {
@@ -383,6 +511,7 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	}
 
 	var preparedTask ProductionTaskRow
+	var preparedSnapshot preparedTaskSnapshot
 	shouldExecute := false
 	if err := h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
 		fencedHandler := h
@@ -393,7 +522,11 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 		}
 		preparedTask = task
 		shouldExecute = execute
-		return nil
+		if !execute {
+			return nil
+		}
+		preparedSnapshot, err = newPreparedTaskSnapshot(task)
+		return err
 	}); err != nil {
 		return err
 	}
@@ -413,7 +546,7 @@ func (h HandlerService) HandleExecuteTask(ctx context.Context, item QueueItemRow
 	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
 		fencedHandler := h
 		fencedHandler.Store = fencedStore
-		return fencedHandler.finalizeExecuteTask(ctx, item, observation)
+		return fencedHandler.finalizeExecuteTask(ctx, item, preparedSnapshot, observation)
 	})
 }
 
@@ -445,6 +578,7 @@ func (h HandlerService) prepareExecuteTask(ctx context.Context, item QueueItemRo
 func (h HandlerService) finalizeExecuteTask(
 	ctx context.Context,
 	item QueueItemRow,
+	prepared preparedTaskSnapshot,
 	observation AutoFlowExecuteObservation,
 ) error {
 	taskID := firstString(item.PayloadJSON, "production_task_id")
@@ -455,11 +589,14 @@ func (h HandlerService) finalizeExecuteTask(
 	if err != nil {
 		return err
 	}
-	if task.State != TaskPlanning && task.State != TaskProducing {
-		return nil
-	}
 	if err := validateExecuteTaskAuthority(item, task); err != nil {
 		return err
+	}
+	if err := prepared.validate(task); err != nil && !validDurableExecuteHandoff(prepared, task) {
+		return err
+	}
+	if task.State != TaskPlanning && task.State != TaskProducing {
+		return nil
 	}
 	if runID, jobID, ok := ExistingExecution(task); ok {
 		return h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, runID, jobID, item.ID)
@@ -474,6 +611,22 @@ func (h HandlerService) finalizeExecuteTask(
 		return h.Store.FailTask(ctx, task.ID, "autoflow execute response missing job_id", "execute_task")
 	}
 	return h.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, observation.RunID, observation.JobID, item.ID)
+}
+
+func validDurableExecuteHandoff(prepared preparedTaskSnapshot, current ProductionTaskRow) bool {
+	if current.State != TaskProducing {
+		return false
+	}
+	if _, _, ok := ExistingExecution(current); !ok {
+		return false
+	}
+	normalized := current
+	normalized.State = prepared.Task.State
+	normalized.AutoFlowRunID = prepared.Task.AutoFlowRunID
+	normalized.JobID = prepared.Task.JobID
+	normalized.StateUpdatedAt = prepared.Task.StateUpdatedAt
+	normalized.TransitionHistoryJSON = prepared.Task.TransitionHistoryJSON
+	return prepared.validate(normalized) == nil
 }
 
 func validateExecuteTaskAuthority(item QueueItemRow, task ProductionTaskRow) error {
@@ -509,6 +662,9 @@ func ExistingExecution(task ProductionTaskRow) (string, string, bool) {
 }
 
 func (h HandlerService) HandleObserveJob(ctx context.Context, item QueueItemRow) error {
+	if err := h.requireExternalPhase(QueueObserveJob); err != nil {
+		return err
+	}
 	if h.AutoFlow == nil {
 		return errors.New("autoflow client is not configured")
 	}
@@ -524,42 +680,81 @@ func (h HandlerService) HandleObserveJob(ctx context.Context, item QueueItemRow)
 	if strings.TrimSpace(jobID) == "" {
 		return errors.New("observe_job payload missing job_id")
 	}
-	task, err := h.Store.GetProductionTask(ctx, taskID)
-	if err != nil {
+	var prepared preparedTaskSnapshot
+	skip := false
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		task, err := fenced.Store.GetProductionTask(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		if task.State != TaskProducing {
+			skip = true
+			return nil
+		}
+		if task.JobID == nil || *task.JobID == "" {
+			return fmt.Errorf("task %s has no AutoFlow job id", task.ID)
+		}
+		if task.AutoFlowRunID == nil || *task.AutoFlowRunID == "" {
+			return fmt.Errorf("task %s has no AutoFlow run id", task.ID)
+		}
+		if *task.AutoFlowRunID != runID {
+			return fmt.Errorf(
+				"observe_job payload run_id %s does not match task %s run_id %s",
+				runID,
+				task.ID,
+				*task.AutoFlowRunID,
+			)
+		}
+		if *task.JobID != jobID {
+			return fmt.Errorf(
+				"observe_job payload job_id %s does not match task %s job_id %s",
+				jobID,
+				task.ID,
+				*task.JobID,
+			)
+		}
+		prepared, err = newPreparedTaskSnapshot(task)
+		return err
+	}); err != nil {
 		return err
 	}
-	if task.State != TaskProducing {
+	if skip {
 		return nil
-	}
-	if task.JobID == nil || *task.JobID == "" {
-		return fmt.Errorf("task %s has no AutoFlow job id", task.ID)
-	}
-	if task.AutoFlowRunID == nil || *task.AutoFlowRunID == "" {
-		return fmt.Errorf("task %s has no AutoFlow run id", task.ID)
-	}
-	if *task.AutoFlowRunID != runID {
-		return fmt.Errorf("observe_job payload run_id %s does not match task %s run_id %s", runID, task.ID, *task.AutoFlowRunID)
-	}
-	if *task.JobID != jobID {
-		return fmt.Errorf("observe_job payload job_id %s does not match task %s job_id %s", jobID, task.ID, *task.JobID)
 	}
 	observation, err := h.AutoFlow.GetJob(ctx, runID, jobID)
 	if err != nil {
 		return err
 	}
-	switch observation.Status {
-	case "running", "queued", "pending":
-		return h.Store.ReenqueueObserve(ctx, task.ID, item.ID, time.Minute)
-	case "succeeded":
-		return h.Store.MarkTaskReadyToPublish(ctx, task, observation, item.ID)
-	case "failed":
-		return h.Store.FailTask(ctx, task.ID, observation.ErrorMessage, "observe_job")
-	default:
-		return h.Store.FailTask(ctx, task.ID, fmt.Sprintf("unknown AutoFlow job status: %s", observation.Status), "observe_job")
-	}
+	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		task, err := fenced.Store.GetProductionTask(ctx, prepared.Task.ID)
+		if err != nil {
+			return err
+		}
+		if err := prepared.validate(task); err != nil {
+			return err
+		}
+		switch observation.Status {
+		case "running", "queued", "pending":
+			return fenced.Store.ReenqueueObserve(ctx, task.ID, item.ID, time.Minute)
+		case "succeeded":
+			return fenced.Store.MarkTaskReadyToPublish(ctx, task, observation, item.ID)
+		case "failed":
+			return fenced.Store.FailTask(ctx, task.ID, observation.ErrorMessage, "observe_job")
+		default:
+			return fenced.Store.FailTask(
+				ctx,
+				task.ID,
+				fmt.Sprintf("unknown AutoFlow job status: %s", observation.Status),
+				"observe_job",
+			)
+		}
+	})
 }
 
 func (h HandlerService) HandlePublishTask(ctx context.Context, item QueueItemRow) error {
+	if err := h.requireExternalPhase(QueuePublishTask); err != nil {
+		return err
+	}
 	if h.PDS == nil {
 		return errors.New("pds client is not configured")
 	}
@@ -567,57 +762,108 @@ func (h HandlerService) HandlePublishTask(ctx context.Context, item QueueItemRow
 	if taskID == "" {
 		return errors.New("publish_task payload missing production_task_id")
 	}
-	task, err := h.Store.GetProductionTask(ctx, taskID)
-	if err != nil {
+	var prepared preparedTaskSnapshot
+	skip := false
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		task, err := fenced.Store.GetProductionTask(ctx, taskID)
+		if err != nil {
+			return err
+		}
+		if task.State != TaskScheduled {
+			skip = true
+			return nil
+		}
+		if held, err := fenced.holdInvalidPreUploadReview(
+			ctx,
+			task,
+			"publish_task_human_review",
+		); held {
+			skip = true
+			return err
+		}
+		prepared, err = newPreparedTaskSnapshot(task)
+		return err
+	}); err != nil {
 		return err
 	}
-	if task.State != TaskScheduled {
+	if skip {
 		return nil
 	}
-	if held, err := h.holdInvalidPreUploadReview(ctx, task, "publish_task_human_review"); held {
-		return err
-	}
+	var health *YouTubeAccountHealth
 	if h.YouTube != nil {
-		health, err := h.YouTube.AccountHealth(ctx, task.TargetAccountID)
+		observation, err := h.YouTube.AccountHealth(ctx, prepared.Task.TargetAccountID)
 		if err == nil {
-			if alert, ok := quotaLowAlert(task.ChannelProfileID, task.TargetAccountID, health.QuotaRemaining); ok {
-				if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
-					return err
-				}
-			}
+			health = &observation
+		}
+		if err := h.revalidatePreparedTask(ctx, item, prepared); err != nil {
+			return err
 		}
 	}
 	decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
-		ActorID:    task.TargetAccountID,
+		ActorID:    prepared.Task.TargetAccountID,
 		ActionType: "publish",
 		Platform:   "youtube",
-		Content:    map[string]any{"title": task.TitleSeed, "description": task.Prompt},
+		Content: map[string]any{
+			"title":       prepared.Task.TitleSeed,
+			"description": prepared.Task.Prompt,
+		},
 		Context: map[string]any{
-			"production_task_id":  task.ID,
-			"platform_content_id": uploadVideoID(task.RationaleJSON),
+			"production_task_id":  prepared.Task.ID,
+			"platform_content_id": uploadVideoID(prepared.Task.RationaleJSON),
 		},
 	})
 	if err != nil {
 		return err
 	}
-	if alert, ok := maybePDSOutageAlert(decision, task.ChannelProfileID, task.ID, "publish"); ok {
-		if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		task, err := fenced.Store.GetProductionTask(ctx, prepared.Task.ID)
+		if err != nil {
 			return err
 		}
-	}
-	if decision.Verdict != "allow" {
-		guard := "pds_blocked"
-		if decision.Verdict == "flag" {
-			guard = "pds_flagged_for_review"
+		if err := prepared.validate(task); err != nil {
+			return err
 		}
-		return h.Store.HoldTaskWithPDS(ctx, task.ID, guard, decision, "publish_task_pds")
-	}
-	return h.Store.CreateOrUpdatePublicationFromTask(ctx, task, item.ID)
+		if health != nil {
+			if alert, ok := quotaLowAlert(
+				task.ChannelProfileID,
+				task.TargetAccountID,
+				health.QuotaRemaining,
+			); ok {
+				if _, err := fenced.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+					return err
+				}
+			}
+		}
+		if alert, ok := maybePDSOutageAlert(
+			decision,
+			task.ChannelProfileID,
+			task.ID,
+			"publish",
+		); ok {
+			if _, err := fenced.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+				return err
+			}
+		}
+		if decision.Verdict != "allow" {
+			guard := "pds_blocked"
+			if decision.Verdict == "flag" {
+				guard = "pds_flagged_for_review"
+			}
+			return fenced.Store.HoldTaskWithPDS(
+				ctx,
+				task.ID,
+				guard,
+				decision,
+				"publish_task_pds",
+			)
+		}
+		return fenced.Store.CreateOrUpdatePublicationFromTask(ctx, task, item.ID)
+	})
 }
 
 func (h HandlerService) HandlePromotePublication(ctx context.Context, item QueueItemRow) error {
-	if h.Store == nil {
-		return errors.New("channelops handler store is not configured")
+	if err := h.requireExternalPhase(QueuePromotePublication); err != nil {
+		return err
 	}
 	if h.PDS == nil {
 		return errors.New("pds client is not configured")
@@ -625,15 +871,10 @@ func (h HandlerService) HandlePromotePublication(ctx context.Context, item Queue
 	if h.YouTube == nil {
 		return errors.New("youtube client is not configured")
 	}
-	if h.Store.hasExecutionTransaction() {
-		return errors.New("promote_publication cannot hold an execution transaction across submission")
-	}
 
 	var preparation promotionPreparation
-	if err := h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
-		fencedHandler := h
-		fencedHandler.Store = fencedStore
-		prepared, err := fencedHandler.preparePromotion(ctx, item)
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		prepared, err := fenced.preparePromotion(ctx, item)
 		preparation = prepared
 		return err
 	}); err != nil {
@@ -642,7 +883,23 @@ func (h HandlerService) HandlePromotePublication(ctx context.Context, item Queue
 	if preparation.Skip {
 		return nil
 	}
-	return h.executePromotionOperation(ctx, item, preparation.Operation)
+	if preparation.NeedsDecision {
+		decision, err := h.PDS.Decide(ctx, preparation.DecisionRequest)
+		if err != nil {
+			return err
+		}
+		if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+			finalized, err := fenced.finalizePromotionDecision(ctx, item, preparation, decision)
+			preparation = finalized
+			return err
+		}); err != nil {
+			return err
+		}
+		if preparation.Skip {
+			return nil
+		}
+	}
+	return h.executePromotionOperation(ctx, item, preparation)
 }
 
 func (h HandlerService) preparePromotion(
@@ -671,19 +928,6 @@ func (h HandlerService) preparePromotion(
 	}
 	if task.State != TaskUploadedPrivate && !taskHeldForPromotionUncertainty(task, existingOperation) {
 		return promotionPreparation{Skip: true}, nil
-	}
-	if existingOperation != nil {
-		switch existingOperation.Status {
-		case PromotionSubmitting, PromotionUncertain, PromotionConfirmed:
-			return promotionPreparation{Operation: *existingOperation}, nil
-		case PromotionReserved:
-		default:
-			return promotionPreparation{}, fmt.Errorf(
-				"%w: unknown promotion operation state %q",
-				ErrPromotionOperationConflict,
-				existingOperation.Status,
-			)
-		}
 	}
 	rawTargetVisibility := strings.TrimSpace(firstString(item.PayloadJSON, "target_visibility"))
 	targetVisibility := ""
@@ -719,40 +963,32 @@ func (h HandlerService) preparePromotion(
 		targetVisibility = existingOperation.TargetPrivacy
 		scheduledAt = existingOperation.ScheduledAt
 	}
-	if task.AutoFlowPlanID != nil {
-		valid, err := h.Store.ValidPromotionPlanAuthority(ctx, task)
-		if err != nil {
-			return promotionPreparation{}, err
-		}
-		if !valid {
-			return promotionPreparation{Skip: true}, h.Store.HoldTask(
-				ctx,
-				task.ID,
-				"autoflow_plan_authority_invalid",
-				"Publication promotion plan authority is missing, stale, or revoked",
-				"promote_publication_plan_authority",
+	scope, err := newPreparedPublicationSnapshot(publication, task)
+	if err != nil {
+		return promotionPreparation{}, err
+	}
+	if existingOperation != nil {
+		switch existingOperation.Status {
+		case PromotionReserved, PromotionSubmitting, PromotionUncertain, PromotionConfirmed:
+			return promotionPreparation{
+				Operation:        *existingOperation,
+				Scope:            scope,
+				TargetVisibility: targetVisibility,
+				ScheduledAt:      scheduledAt,
+			}, nil
+		default:
+			return promotionPreparation{}, fmt.Errorf(
+				"%w: unknown promotion operation state %q",
+				ErrPromotionOperationConflict,
+				existingOperation.Status,
 			)
 		}
 	}
-	if held, err := h.holdInvalidPreUploadReview(ctx, task, "promote_publication_human_review"); held {
-		return promotionPreparation{Skip: true}, err
+	held, err := h.validatePromotionSafety(ctx, item, publication, task, targetVisibility)
+	if held || err != nil {
+		return promotionPreparation{Skip: held}, err
 	}
-	if taskUsesExternalAssets(task) || boolValue(item.PayloadJSON["manual_review"]) {
-		valid, err := h.Store.ValidPromotionHumanReview(ctx, task, publication, targetVisibility)
-		if err != nil {
-			return promotionPreparation{}, err
-		}
-		if !valid {
-			return promotionPreparation{Skip: true}, h.Store.HoldTask(
-				ctx,
-				task.ID,
-				"human_review_evidence_invalid",
-				"Publication promotion human review evidence is missing or stale",
-				"promote_publication_human_review",
-			)
-		}
-	}
-	decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
+	request := PDSDecisionRequest{
 		ActorID:    publication.AccountID,
 		ActionType: "publish",
 		Platform:   publication.Platform,
@@ -762,9 +998,55 @@ func (h HandlerService) preparePromotion(
 			"production_task_id": publication.ProductionTaskID,
 			"target_visibility":  targetVisibility,
 		},
-	})
+	}
+	return promotionPreparation{
+		Scope:            scope,
+		DecisionRequest:  request,
+		TargetVisibility: targetVisibility,
+		ScheduledAt:      scheduledAt,
+		NeedsDecision:    true,
+	}, nil
+}
+
+func (h HandlerService) finalizePromotionDecision(
+	ctx context.Context,
+	item QueueItemRow,
+	prepared promotionPreparation,
+	decision PDSDecision,
+) (promotionPreparation, error) {
+	publication, task, err := h.Store.LockPromotionOperatorScope(
+		ctx,
+		prepared.Scope.Publication.ID,
+	)
 	if err != nil {
 		return promotionPreparation{}, err
+	}
+	if err := prepared.Scope.validate(publication, task); err != nil {
+		return promotionPreparation{}, err
+	}
+	existingOperation, err := h.Store.GetPromotionOperationForPublication(ctx, publication.ID)
+	if err != nil {
+		return promotionPreparation{}, err
+	}
+	if existingOperation != nil {
+		if err := validatePromotionOperationAuthority(item, publication, task, *existingOperation); err != nil {
+			return promotionPreparation{}, err
+		}
+		prepared.Operation = *existingOperation
+		prepared.NeedsDecision = false
+		prepared.Skip = existingOperation.Status == PromotionFinalized
+		return prepared, nil
+	}
+	held, err := h.validatePromotionSafety(
+		ctx,
+		item,
+		publication,
+		task,
+		prepared.TargetVisibility,
+	)
+	if held || err != nil {
+		prepared.Skip = held
+		return prepared, err
 	}
 	channelID := task.ChannelProfileID
 	if alert, ok := maybePDSOutageAlert(decision, channelID, publication.ID, "publish"); ok {
@@ -777,7 +1059,8 @@ func (h HandlerService) preparePromotion(
 		if decision.Verdict == "flag" {
 			guard = "pds_flagged_for_review"
 		}
-		return promotionPreparation{Skip: true}, h.Store.HoldTaskWithPDS(
+		prepared.Skip = true
+		return prepared, h.Store.HoldTaskWithPDS(
 			ctx,
 			publication.ProductionTaskID,
 			guard,
@@ -789,14 +1072,59 @@ func (h HandlerService) preparePromotion(
 		ctx,
 		publication,
 		item.ID,
-		targetVisibility,
-		scheduledAt,
+		prepared.TargetVisibility,
+		prepared.ScheduledAt,
 		decision,
 	)
 	if err != nil {
 		return promotionPreparation{}, err
 	}
-	return promotionPreparation{Operation: operation}, nil
+	prepared.Operation = operation
+	prepared.NeedsDecision = false
+	return prepared, nil
+}
+
+func (h HandlerService) validatePromotionSafety(
+	ctx context.Context,
+	item QueueItemRow,
+	publication PublicationRow,
+	task ProductionTaskRow,
+	targetVisibility string,
+) (bool, error) {
+	if task.AutoFlowPlanID != nil {
+		valid, err := h.Store.ValidPromotionPlanAuthority(ctx, task)
+		if err != nil {
+			return false, err
+		}
+		if !valid {
+			return true, h.Store.HoldTask(
+				ctx,
+				task.ID,
+				"autoflow_plan_authority_invalid",
+				"Publication promotion plan authority is missing, stale, or revoked",
+				"promote_publication_plan_authority",
+			)
+		}
+	}
+	if held, err := h.holdInvalidPreUploadReview(ctx, task, "promote_publication_human_review"); held {
+		return true, err
+	}
+	if taskUsesExternalAssets(task) || boolValue(item.PayloadJSON["manual_review"]) {
+		valid, err := h.Store.ValidPromotionHumanReview(ctx, task, publication, targetVisibility)
+		if err != nil {
+			return false, err
+		}
+		if !valid {
+			return true, h.Store.HoldTask(
+				ctx,
+				task.ID,
+				"human_review_evidence_invalid",
+				"Publication promotion human review evidence is missing or stale",
+				"promote_publication_human_review",
+			)
+		}
+	}
+	return false, nil
 }
 
 func validatePromotionOperationAuthority(
@@ -819,22 +1147,33 @@ func validatePromotionOperationAuthority(
 func (h HandlerService) executePromotionOperation(
 	ctx context.Context,
 	item QueueItemRow,
-	operation PromotionOperationRow,
+	prepared promotionPreparation,
 ) error {
+	operation := prepared.Operation
 	for {
 		switch operation.Status {
 		case PromotionFinalized:
 			return nil
 		case PromotionConfirmed:
-			return h.finalizePromotionOperation(ctx, item, operation.ID)
+			prepared.Operation = operation
+			return h.finalizePromotionOperation(ctx, item, prepared)
 		case PromotionSubmitting, PromotionUncertain:
-			return h.reconcilePromotionOperation(ctx, item, operation, nil)
+			prepared.Operation = operation
+			return h.reconcilePromotionOperation(ctx, item, prepared, nil)
 		case PromotionReserved:
-			claimed, shouldSubmit, err := h.Store.BeginPromotionSubmission(ctx, operation.ID)
+			claimed, shouldSubmit, skip, err := h.beginPromotionSubmission(
+				ctx,
+				item,
+				prepared,
+			)
 			if err != nil {
 				return err
 			}
+			if skip {
+				return nil
+			}
 			operation = claimed
+			prepared.Operation = operation
 			if !shouldSubmit {
 				continue
 			}
@@ -846,11 +1185,12 @@ func (h HandlerService) executePromotionOperation(
 				operation.AttemptKey,
 			)
 			if submitErr != nil {
-				return h.reconcilePromotionOperation(ctx, item, operation, submitErr)
+				return h.reconcilePromotionOperation(ctx, item, prepared, submitErr)
 			}
-			confirmed, err := h.Store.ConfirmPromotionOperation(
+			confirmed, err := h.confirmPromotionOperation(
 				ctx,
-				operation.ID,
+				item,
+				prepared,
 				YouTubePublicationStatus{
 					VideoID:       operation.PlatformVideoID,
 					PublishStatus: "scheduled",
@@ -866,7 +1206,8 @@ func (h HandlerService) executePromotionOperation(
 			if err != nil {
 				return err
 			}
-			operation = confirmed
+			prepared.Operation = confirmed
+			return h.finalizePromotionOperation(ctx, item, prepared)
 		default:
 			return fmt.Errorf(
 				"%w: unknown promotion operation state %q",
@@ -877,19 +1218,86 @@ func (h HandlerService) executePromotionOperation(
 	}
 }
 
+func (h HandlerService) beginPromotionSubmission(
+	ctx context.Context,
+	item QueueItemRow,
+	prepared promotionPreparation,
+) (PromotionOperationRow, bool, bool, error) {
+	var operation PromotionOperationRow
+	var shouldSubmit bool
+	var skip bool
+	err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		publication, task, locked, err := fenced.lockPreparedPromotionScope(ctx, item, prepared)
+		if err != nil {
+			return err
+		}
+		held, err := fenced.validatePromotionSafety(
+			ctx,
+			item,
+			publication,
+			task,
+			locked.TargetPrivacy,
+		)
+		if held || err != nil {
+			skip = held
+			return err
+		}
+		operation, shouldSubmit, err = fenced.Store.BeginPromotionSubmission(ctx, locked.ID)
+		return err
+	})
+	return operation, shouldSubmit, skip, err
+}
+
+func (h HandlerService) confirmPromotionOperation(
+	ctx context.Context,
+	item QueueItemRow,
+	prepared promotionPreparation,
+	status YouTubePublicationStatus,
+	evidence map[string]any,
+) (PromotionOperationRow, error) {
+	var confirmed PromotionOperationRow
+	err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		_, _, operation, err := fenced.lockPreparedPromotionScope(ctx, item, prepared)
+		if err != nil {
+			return err
+		}
+		confirmed, err = fenced.Store.ConfirmPromotionOperation(
+			ctx,
+			operation.ID,
+			status,
+			evidence,
+		)
+		return err
+	})
+	return confirmed, err
+}
+
 func (h HandlerService) reconcilePromotionOperation(
 	ctx context.Context,
 	item QueueItemRow,
-	operation PromotionOperationRow,
+	prepared promotionPreparation,
 	submitErr error,
 ) error {
+	var operation PromotionOperationRow
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		_, _, locked, err := fenced.lockPreparedPromotionScope(ctx, item, prepared)
+		operation = locked
+		return err
+	}); err != nil {
+		return err
+	}
+	prepared.Operation = operation
+	if operation.Status == PromotionConfirmed || operation.Status == PromotionFinalized {
+		return h.finalizePromotionOperation(ctx, item, prepared)
+	}
 	status, statusErr := h.YouTube.PublicationStatus(ctx, operation.PlatformVideoID)
 	if statusErr == nil &&
 		observedPrivacy(status.Privacy) == operation.TargetPrivacy &&
 		!isSeverePublicationStatus(status.PublishStatus) {
-		confirmed, err := h.Store.ConfirmPromotionOperation(
+		confirmed, err := h.confirmPromotionOperation(
 			ctx,
-			operation.ID,
+			item,
+			prepared,
 			status,
 			map[string]any{
 				"status_reconciliation": map[string]any{
@@ -901,7 +1309,8 @@ func (h HandlerService) reconcilePromotionOperation(
 		if err != nil {
 			return err
 		}
-		return h.finalizePromotionOperation(ctx, item, confirmed.ID)
+		prepared.Operation = confirmed
+		return h.finalizePromotionOperation(ctx, item, prepared)
 	}
 
 	reason := "YouTube promotion outcome could not be confirmed"
@@ -918,31 +1327,70 @@ func (h HandlerService) reconcilePromotionOperation(
 		)
 	}
 	reason = boundedPromotionReason(reason)
-	uncertain, err := h.Store.MarkPromotionOperationUncertain(ctx, operation.ID, status, reason)
-	if err != nil {
+	var uncertain PromotionOperationRow
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		_, _, locked, err := fenced.lockPreparedPromotionScope(ctx, item, prepared)
+		if err != nil {
+			return err
+		}
+		uncertain, err = fenced.Store.MarkPromotionOperationUncertain(
+			ctx,
+			locked.ID,
+			status,
+			reason,
+		)
+		return err
+	}); err != nil {
 		return err
 	}
+	prepared.Operation = uncertain
 	if uncertain.Status == PromotionConfirmed || uncertain.Status == PromotionFinalized {
-		return h.finalizePromotionOperation(ctx, item, uncertain.ID)
+		return h.finalizePromotionOperation(ctx, item, prepared)
 	}
-	if err := h.holdUncertainPromotionOperation(ctx, item, uncertain, reason); err != nil {
+	if err := h.holdUncertainPromotionOperation(ctx, item, prepared, reason); err != nil {
 		return errors.Join(fmt.Errorf("%w: %s", ErrPromotionOutcomeUncertain, reason), err)
 	}
 	return fmt.Errorf("%w: %s", ErrPromotionOutcomeUncertain, reason)
 }
 
+func (h HandlerService) lockPreparedPromotionScope(
+	ctx context.Context,
+	item QueueItemRow,
+	prepared promotionPreparation,
+) (PublicationRow, ProductionTaskRow, PromotionOperationRow, error) {
+	publication, task, err := h.Store.LockPromotionOperatorScope(
+		ctx,
+		prepared.Scope.Publication.ID,
+	)
+	if err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, PromotionOperationRow{}, err
+	}
+	if err := prepared.Scope.validate(publication, task); err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, PromotionOperationRow{}, err
+	}
+	operation, err := h.Store.LockPromotionOperation(ctx, prepared.Operation.ID)
+	if err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, PromotionOperationRow{}, err
+	}
+	if operation.ID != prepared.Operation.ID {
+		return PublicationRow{}, ProductionTaskRow{}, PromotionOperationRow{}, fmt.Errorf(
+			"%w: promotion operation identity changed",
+			ErrPromotionOperationConflict,
+		)
+	}
+	if err := validatePromotionOperationAuthority(item, publication, task, operation); err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, PromotionOperationRow{}, err
+	}
+	return publication, task, operation, nil
+}
+
 func (h HandlerService) finalizePromotionOperation(
 	ctx context.Context,
 	item QueueItemRow,
-	operationID string,
+	prepared promotionPreparation,
 ) error {
-	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
-		publicationID := firstString(item.PayloadJSON, "publication_id")
-		publication, task, err := fencedStore.LockPromotionOperatorScope(ctx, publicationID)
-		if err != nil {
-			return err
-		}
-		operation, err := fencedStore.LockPromotionOperation(ctx, operationID)
+	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		publication, task, operation, err := fenced.lockPreparedPromotionScope(ctx, item, prepared)
 		if err != nil {
 			return err
 		}
@@ -965,12 +1413,12 @@ func (h HandlerService) finalizePromotionOperation(
 			return nil
 		}
 		if task.AutoFlowPlanID != nil {
-			valid, err := fencedStore.ValidPromotionPlanAuthority(ctx, task)
+			valid, err := fenced.Store.ValidPromotionPlanAuthority(ctx, task)
 			if err != nil {
 				return err
 			}
 			if !valid {
-				return fencedStore.HoldTask(
+				return fenced.Store.HoldTask(
 					ctx,
 					task.ID,
 					"autoflow_plan_authority_invalid",
@@ -979,7 +1427,7 @@ func (h HandlerService) finalizePromotionOperation(
 				)
 			}
 		}
-		if held, err := h.withStore(fencedStore).holdInvalidPreUploadReview(
+		if held, err := fenced.holdInvalidPreUploadReview(
 			ctx,
 			task,
 			"promote_publication_human_review",
@@ -987,7 +1435,7 @@ func (h HandlerService) finalizePromotionOperation(
 			return err
 		}
 		if taskUsesExternalAssets(task) || boolValue(item.PayloadJSON["manual_review"]) {
-			valid, err := fencedStore.ValidPromotionHumanReview(
+			valid, err := fenced.Store.ValidPromotionHumanReview(
 				ctx,
 				task,
 				publication,
@@ -997,7 +1445,7 @@ func (h HandlerService) finalizePromotionOperation(
 				return err
 			}
 			if !valid {
-				return fencedStore.HoldTask(
+				return fenced.Store.HoldTask(
 					ctx,
 					task.ID,
 					"human_review_evidence_invalid",
@@ -1006,7 +1454,7 @@ func (h HandlerService) finalizePromotionOperation(
 				)
 			}
 		}
-		return fencedStore.FinalizePromotionOperation(
+		return fenced.Store.FinalizePromotionOperation(
 			ctx,
 			operation.ID,
 			metricsPollDelay(h.Config),
@@ -1017,18 +1465,11 @@ func (h HandlerService) finalizePromotionOperation(
 func (h HandlerService) holdUncertainPromotionOperation(
 	ctx context.Context,
 	item QueueItemRow,
-	operation PromotionOperationRow,
+	prepared promotionPreparation,
 	reason string,
 ) error {
-	return h.Store.WithQueueExecutionFence(ctx, item, func(fencedStore *Store) error {
-		publication, task, err := fencedStore.LockPromotionOperatorScope(
-			ctx,
-			operation.PublicationID,
-		)
-		if err != nil {
-			return err
-		}
-		locked, err := fencedStore.LockPromotionOperation(ctx, operation.ID)
+	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		publication, task, locked, err := fenced.lockPreparedPromotionScope(ctx, item, prepared)
 		if err != nil {
 			return err
 		}
@@ -1041,7 +1482,7 @@ func (h HandlerService) holdUncertainPromotionOperation(
 		if task.State != TaskUploadedPrivate && !taskHeldForPromotionUncertainty(task, &locked) {
 			return nil
 		}
-		return fencedStore.HoldPromotionOperationUncertain(ctx, publication, locked, reason)
+		return fenced.Store.HoldPromotionOperationUncertain(ctx, publication, locked, reason)
 	})
 }
 
@@ -1070,6 +1511,9 @@ func boundedPromotionReason(reason string) string {
 }
 
 func (h HandlerService) HandleReconcilePublication(ctx context.Context, item QueueItemRow) error {
+	if err := h.requireExternalPhase(QueueReconcilePublication); err != nil {
+		return err
+	}
 	if h.YouTube == nil {
 		return errors.New("youtube client is not configured")
 	}
@@ -1077,98 +1521,192 @@ func (h HandlerService) HandleReconcilePublication(ctx context.Context, item Que
 	if publicationID == "" {
 		return errors.New("reconcile_publication payload missing publication_id")
 	}
-	publication, err := h.Store.GetPublication(ctx, publicationID)
-	if err != nil {
-		return err
-	}
-	task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID)
-	if err != nil {
-		return err
-	}
-	if task.State == TaskHeld || task.State == TaskFailed || task.State == TaskRejected {
-		return nil
-	}
-	status, err := h.YouTube.PublicationStatus(ctx, publication.PlatformContentID)
-	if err != nil {
-		return err
-	}
-	if isSeverePublicationStatus(status.PublishStatus) {
-		if err := h.Store.MarkPublicationSevereDedup(ctx, publication, status, h.Store.Now()); err != nil {
+	var prepared preparedPublicationSnapshot
+	skip := false
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		publication, err := fenced.Store.GetPublication(ctx, publicationID)
+		if err != nil {
 			return err
 		}
-		channelID := task.ChannelProfileID
-		_, err := h.Store.EnqueueAlert(ctx, platformRejectedAlert(publication, channelID, status), 5, item.ID)
+		task, err := fenced.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+		if err != nil {
+			return err
+		}
+		if task.State == TaskHeld || task.State == TaskFailed || task.State == TaskRejected {
+			skip = true
+			return nil
+		}
+		prepared, err = newPreparedPublicationSnapshot(publication, task)
+		return err
+	}); err != nil {
 		return err
 	}
-	return h.Store.UpdatePublicationStatus(ctx, publication.ID, status)
+	if skip {
+		return nil
+	}
+	status, err := h.YouTube.PublicationStatus(ctx, prepared.Publication.PlatformContentID)
+	if err != nil {
+		return err
+	}
+	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		publication, err := fenced.Store.GetPublication(ctx, prepared.Publication.ID)
+		if err != nil {
+			return err
+		}
+		task, err := fenced.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+		if err != nil {
+			return err
+		}
+		if err := prepared.validate(publication, task); err != nil {
+			return err
+		}
+		if isSeverePublicationStatus(status.PublishStatus) {
+			if err := fenced.Store.MarkPublicationSevereDedup(
+				ctx,
+				publication,
+				status,
+				fenced.Store.Now(),
+			); err != nil {
+				return err
+			}
+			_, err := fenced.Store.EnqueueAlert(
+				ctx,
+				platformRejectedAlert(publication, task.ChannelProfileID, status),
+				5,
+				item.ID,
+			)
+			return err
+		}
+		return fenced.Store.UpdatePublicationStatus(ctx, publication.ID, status)
+	})
 }
 
 func (h HandlerService) HandleCollectMetrics(ctx context.Context, item QueueItemRow) error {
+	if err := h.requireExternalPhase(QueueCollectMetrics); err != nil {
+		return err
+	}
 	publicationID, _ := item.PayloadJSON["publication_id"].(string)
 	if publicationID == "" {
 		return errors.New("collect_metrics payload missing publication_id")
 	}
-	publication, err := h.Store.GetPublication(ctx, publicationID)
-	if err != nil {
-		return err
-	}
-	task, err := h.Store.GetProductionTask(ctx, publication.ProductionTaskID)
-	if err != nil {
-		return err
-	}
-	if task.State == TaskHeld || task.State == TaskFailed || task.State == TaskRejected {
-		return nil
-	}
-	var schedule *MetricScheduleRow
-	if firstString(item.PayloadJSON, "metric_schedule_id") != "" {
-		lockedSchedule, err := h.Store.LockMetricScheduleForQueue(ctx, item)
+	var prepared preparedMetricsSnapshot
+	skip := false
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		publication, err := fenced.Store.GetPublication(ctx, publicationID)
 		if err != nil {
 			return err
 		}
-		if lockedSchedule.Status != MetricSchedulePending {
+		task, err := fenced.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+		if err != nil {
+			return err
+		}
+		if task.State == TaskHeld || task.State == TaskFailed || task.State == TaskRejected {
+			skip = true
 			return nil
 		}
-		schedule = &lockedSchedule
+		var schedule *MetricScheduleRow
+		if firstString(item.PayloadJSON, "metric_schedule_id") != "" {
+			lockedSchedule, err := fenced.Store.LockMetricScheduleForQueue(ctx, item)
+			if err != nil {
+				return err
+			}
+			if lockedSchedule.Status != MetricSchedulePending {
+				skip = true
+				return nil
+			}
+			schedule = &lockedSchedule
+		}
+		prepared, err = newPreparedMetricsSnapshot(publication, task, schedule)
+		return err
+	}); err != nil {
+		return err
+	}
+	if skip {
+		return nil
 	}
 	metrics := mapFromAny(item.PayloadJSON["metrics"])
-	if !HasRecognizedMetrics(metrics) && publication.PlatformContentID != "" && h.YouTube != nil {
-		fetched, err := h.YouTube.FetchMetrics(ctx, publication.PlatformContentID)
+	if !HasRecognizedMetrics(metrics) &&
+		prepared.Publication.PlatformContentID != "" &&
+		h.YouTube != nil {
+		fetched, err := h.YouTube.FetchMetrics(ctx, prepared.Publication.PlatformContentID)
 		if err == nil && HasRecognizedMetrics(fetched) {
 			metrics = fetched
 		}
 	}
-	if !HasRecognizedMetrics(metrics) {
+	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		publication, err := fenced.Store.GetPublication(ctx, prepared.Publication.ID)
+		if err != nil {
+			return err
+		}
+		task, err := fenced.Store.GetProductionTask(ctx, publication.ProductionTaskID)
+		if err != nil {
+			return err
+		}
+		var schedule *MetricScheduleRow
+		if prepared.Schedule != nil {
+			lockedSchedule, err := fenced.Store.LockMetricScheduleForQueue(ctx, item)
+			if err != nil {
+				return err
+			}
+			schedule = &lockedSchedule
+		}
+		if err := prepared.validate(publication, task, schedule); err != nil {
+			return err
+		}
+		if !HasRecognizedMetrics(metrics) {
+			if schedule != nil {
+				return fenced.Store.RequeueOrExpireMetricSchedule(
+					ctx,
+					publication,
+					*schedule,
+					item,
+					fenced.Config.MetricsPollMaxAttempts,
+					metricsPollDelay(fenced.Config),
+				)
+			}
+			return fenced.Store.RequeueOrHoldMetrics(
+				ctx,
+				publication,
+				item,
+				fenced.Config.MetricsPollMaxAttempts,
+				metricsPollDelay(fenced.Config),
+			)
+		}
+		score, fields := MetricsCompleteness(metrics)
+		reward, components := RewardScore(
+			metrics,
+			PublicationRewardContext{StablePublication: true},
+		)
 		if schedule != nil {
-			return h.Store.RequeueOrExpireMetricSchedule(
+			return fenced.Store.CompleteMetricSchedule(
 				ctx,
 				publication,
 				*schedule,
-				item,
-				h.Config.MetricsPollMaxAttempts,
-				metricsPollDelay(h.Config),
+				metrics,
+				score,
+				fields,
+				reward,
+				components,
 			)
 		}
-		return h.Store.RequeueOrHoldMetrics(ctx, publication, item, h.Config.MetricsPollMaxAttempts, metricsPollDelay(h.Config))
-	}
-	score, fields := MetricsCompleteness(metrics)
-	reward, components := RewardScore(metrics, PublicationRewardContext{StablePublication: true})
-	if schedule != nil {
-		return h.Store.CompleteMetricSchedule(
+		stage := SnapshotStageFromPayload(item.PayloadJSON)
+		return fenced.Store.UpsertFeedbackSnapshot(
 			ctx,
 			publication,
-			*schedule,
 			metrics,
+			stage,
 			score,
 			fields,
 			reward,
 			components,
 		)
-	}
-	stage := SnapshotStageFromPayload(item.PayloadJSON)
-	return h.Store.UpsertFeedbackSnapshot(ctx, publication, metrics, stage, score, fields, reward, components)
+	})
 }
 
 func (h HandlerService) HandleAccountHealth(ctx context.Context, item QueueItemRow) error {
+	if err := h.requireExternalPhase(QueueAccountHealth); err != nil {
+		return err
+	}
 	if h.YouTube == nil {
 		return errors.New("youtube client is not configured")
 	}
@@ -1176,23 +1714,46 @@ func (h HandlerService) HandleAccountHealth(ctx context.Context, item QueueItemR
 	if accountID == "" {
 		return errors.New("account_health payload missing account_id")
 	}
+	var prepared preparedAccountSnapshot
+	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		account, err := fenced.Store.getPublishingAccount(ctx, accountID)
+		if err != nil {
+			return err
+		}
+		prepared, err = newPreparedAccountSnapshot(account)
+		return err
+	}); err != nil {
+		return err
+	}
 	health, err := h.YouTube.AccountHealth(ctx, accountID)
 	if err != nil {
 		return err
 	}
-	channelID := ""
-	if account, err := h.Store.getPublishingAccount(ctx, accountID); err == nil {
-		channelID = account.ChannelProfileID
-	}
-	if alert, ok := quotaLowAlert(channelID, accountID, health.QuotaRemaining); ok {
-		if _, err := h.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		account, err := fenced.Store.getPublishingAccount(ctx, prepared.Account.ID)
+		if err != nil {
 			return err
 		}
-	}
-	return h.Store.UpdateAccountHealth(ctx, accountID, health)
+		if err := prepared.validate(account); err != nil {
+			return err
+		}
+		if alert, ok := quotaLowAlert(
+			account.ChannelProfileID,
+			account.ID,
+			health.QuotaRemaining,
+		); ok {
+			if _, err := fenced.Store.EnqueueAlert(ctx, alert, 5, item.ID); err != nil {
+				return err
+			}
+		}
+		return fenced.Store.UpdateAccountHealth(ctx, account.ID, health)
+	})
 }
 
 func (h HandlerService) HandleSendAlert(ctx context.Context, item QueueItemRow) error {
+	if err := h.requireExternalPhase(QueueSendAlert); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	if h.Store != nil && h.Store.Now != nil {
 		now = h.Store.Now().UTC()
@@ -1201,11 +1762,21 @@ func (h HandlerService) HandleSendAlert(ctx context.Context, item QueueItemRow) 
 	if err != nil {
 		return err
 	}
+	if err := h.withQueueExecutionPhase(ctx, item, func(HandlerService) error {
+		return nil
+	}); err != nil {
+		return err
+	}
 	sink := h.Alerts
 	if sink == nil {
 		sink = LogAlertSink{}
 	}
-	return sink.Send(ctx, alert)
+	if err := sink.Send(ctx, alert); err != nil {
+		return err
+	}
+	return h.withQueueExecutionPhase(ctx, item, func(HandlerService) error {
+		return nil
+	})
 }
 
 func (h HandlerService) HandleCleanupExpired(ctx context.Context, item QueueItemRow) error {

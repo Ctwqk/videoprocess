@@ -509,8 +509,8 @@ func TestQuarantineFirstPreventsPromotionSideEffects(t *testing.T) {
 	if youtube.calls.Load() != 0 {
 		t.Fatalf("YouTube calls after quarantine = %d, want 0", youtube.calls.Load())
 	}
-	if handleErr == nil || !strings.Contains(handleErr.Error(), "channel execution blocked") {
-		t.Fatalf("Handle error = %v, want channel execution blocked", handleErr)
+	if !errors.Is(handleErr, ErrQueueLeaseLost) {
+		t.Fatalf("Handle error = %v, want queue lease lost", handleErr)
 	}
 	if err := fixture.Store.MarkQueueFailedOrRetry(ctx, promote, handleErr.Error()); !errors.Is(err, ErrQueueLeaseLost) || err.Error() != "queue lease lost" {
 		t.Fatal("stale retry completion did not report queue lease loss")
@@ -1231,22 +1231,32 @@ func TestGlobalCleanupAndAlertDispatchWithoutChannelMetadata(t *testing.T) {
 	sink := &recordingAlertSink{}
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
 	handler.Alerts = sink
+	cleanupKey := "cleanup_expired:global-test:" + testUUID(t, "global cleanup key")
+	alertKey := "send_alert:global-test:" + testUUID(t, "global alert key")
+	defer func() {
+		_, _ = fixture.Store.Pool.Exec(context.Background(), `
+			DELETE FROM channel_ops_queue_items
+			WHERE idempotency_key = ANY($1::text[])
+		`, []string{cleanupKey, alertKey})
+	}()
 
-	if err := handler.Handle(ctx, QueueItemRow{
-		ID:          testUUID(t, "global-cleanup"),
-		Kind:        QueueCleanupExpired,
-		PayloadJSON: map[string]any{},
-	}); err != nil {
+	cleanup := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:           QueueCleanupExpired,
+		IdempotencyKey: cleanupKey,
+		Payload:        map[string]any{},
+	})
+	if err := handler.Handle(ctx, cleanup); err != nil {
 		t.Fatalf("global cleanup: %v", err)
 	}
-	if err := handler.Handle(ctx, QueueItemRow{
-		ID:   testUUID(t, "global-alert"),
-		Kind: QueueSendAlert,
-		PayloadJSON: map[string]any{
+	alert := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:           QueueSendAlert,
+		IdempotencyKey: alertKey,
+		Payload: map[string]any{
 			"kind":    "global_test",
 			"message": "global alert",
 		},
-	}); err != nil {
+	})
+	if err := handler.Handle(ctx, alert); err != nil {
 		t.Fatalf("global alert: %v", err)
 	}
 	if len(sink.payloads) != 1 || sink.payloads[0].ChannelID != "" {
@@ -2312,12 +2322,8 @@ func TestPublicationYouTubeStatusFailureCategoryPersists(t *testing.T) {
 		t.Fatalf("GetPublication: %v", err)
 	}
 	handler.YouTube = fakeSevereStatusYouTube{fakeYouTube{}}
-
-	err = handler.HandleReconcilePublication(ctx, QueueItemRow{
-		ID:          testUUID(t, "reconcile-item"),
-		Kind:        QueueReconcilePublication,
-		PayloadJSON: map[string]any{"publication_id": publicationID},
-	})
+	reconcile := claimQueuedKindForTest(t, ctx, fixture, QueueReconcilePublication)
+	err = handler.HandleReconcilePublication(ctx, reconcile)
 	if err != nil {
 		t.Fatalf("HandleReconcilePublication: %v", err)
 	}
@@ -2709,6 +2715,18 @@ func TestExecutionFenceBlocksIntakeButAllowsDownstreamWhenPaused(t *testing.T) {
 	fixture := NewChannelOpsFixture(t)
 	defer fixture.Close(ctx)
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	intakeItem := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:             QueueAgentTick,
+		IdempotencyKey:   "agent_tick:paused-fence:" + fixture.ChannelID,
+		Payload:          map[string]any{"channel_id": fixture.ChannelID},
+		ChannelProfileID: &fixture.ChannelID,
+	})
+	downstreamItem := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:             QueueAccountHealth,
+		IdempotencyKey:   "account_health:paused-fence:" + fixture.AccountID,
+		Payload:          map[string]any{"account_id": fixture.AccountID},
+		ChannelProfileID: &fixture.ChannelID,
+	})
 	if _, err := fixture.Store.Pool.Exec(ctx, `
 		UPDATE channel_profiles
 		SET intake_paused_at = NOW(), intake_pause_reason = 'guarded fence test'
@@ -2717,14 +2735,8 @@ func TestExecutionFenceBlocksIntakeButAllowsDownstreamWhenPaused(t *testing.T) {
 		t.Fatalf("pause channel intake: %v", err)
 	}
 
-	channelID := fixture.ChannelID
 	intakeDispatched := false
-	err := fixture.Store.WithQueueExecutionFence(ctx, QueueItemRow{
-		ID:               testUUID(t, "paused-intake-fence"),
-		Kind:             QueueAgentTick,
-		PayloadJSON:      map[string]any{"channel_id": fixture.ChannelID},
-		ChannelProfileID: &channelID,
-	}, func(*Store) error {
+	err := fixture.Store.WithQueueExecutionFence(ctx, intakeItem, func(*Store) error {
 		intakeDispatched = true
 		return nil
 	})
@@ -2736,12 +2748,7 @@ func TestExecutionFenceBlocksIntakeButAllowsDownstreamWhenPaused(t *testing.T) {
 	}
 
 	downstreamDispatched := false
-	err = fixture.Store.WithQueueExecutionFence(ctx, QueueItemRow{
-		ID:               testUUID(t, "paused-downstream-fence"),
-		Kind:             QueueAccountHealth,
-		PayloadJSON:      map[string]any{"account_id": fixture.AccountID},
-		ChannelProfileID: &channelID,
-	}, func(*Store) error {
+	err = fixture.Store.WithQueueExecutionFence(ctx, downstreamItem, func(*Store) error {
 		downstreamDispatched = true
 		return nil
 	})
@@ -2994,13 +3001,33 @@ func TestDiscoveryQueueAuthorityRequiresMatchingPayloadChannel(t *testing.T) {
 			} else if item != nil {
 				t.Fatalf("claimed invalid discovery item: %#v", item)
 			}
+			var fencedItem QueueItemRow
+			if item != nil {
+				fencedItem = *item
+			} else {
+				lockedBy := "discovery-authority-forced-worker"
+				var lockedAt time.Time
+				if err := fixture.Store.Pool.QueryRow(ctx, `
+					UPDATE channel_ops_queue_items
+					SET status = $2, locked_by = $3, locked_at = NOW(), attempt_count = 1
+					WHERE id = $1::uuid
+					RETURNING locked_at
+				`, itemID, QueueStatusRunning, lockedBy).Scan(&lockedAt); err != nil {
+					t.Fatalf("force exact discovery lease: %v", err)
+				}
+				fencedItem = QueueItemRow{
+					ID:               itemID,
+					Kind:             QueueIngestDiscovery,
+					Status:           QueueStatusRunning,
+					AttemptCount:     1,
+					LockedBy:         &lockedBy,
+					LockedAt:         &lockedAt,
+					PayloadJSON:      tt.payload,
+					ChannelProfileID: tt.storedChannel,
+				}
+			}
 			dispatched := false
-			err = fixture.Store.WithQueueExecutionFence(ctx, QueueItemRow{
-				ID:               itemID,
-				Kind:             QueueIngestDiscovery,
-				PayloadJSON:      tt.payload,
-				ChannelProfileID: tt.storedChannel,
-			}, func(*Store) error {
+			err = fixture.Store.WithQueueExecutionFence(ctx, fencedItem, func(*Store) error {
 				dispatched = true
 				return nil
 			})
@@ -3275,6 +3302,20 @@ func (f *ChannelOpsFixture) CountRows(ctx context.Context, table string) int {
 }
 
 func (f *ChannelOpsFixture) cleanup(ctx context.Context) {
+	_, _ = f.Store.Pool.Exec(ctx, `
+		DELETE FROM channel_ops_queue_items
+		WHERE channel_profile_id = $1::uuid
+		   OR (payload_json ->> 'channel_id') = $1::text
+		   OR (payload_json ->> 'production_task_id') IN (
+				SELECT id::text FROM production_tasks WHERE channel_profile_id = $1::uuid
+		   )
+		   OR (payload_json ->> 'publication_id') IN (
+				SELECT publication.id::text
+				FROM publication_records AS publication
+				JOIN production_tasks AS task ON task.id = publication.production_task_id
+				WHERE task.channel_profile_id = $1::uuid
+		   )
+	`, f.ChannelID)
 	_, _ = f.Store.Pool.Exec(ctx, `
 		WITH fixture_tasks AS (
 			SELECT id FROM production_tasks WHERE channel_profile_id = $1::uuid
@@ -4027,6 +4068,48 @@ func prepareQueueKind(t *testing.T, ctx context.Context, fixture *ChannelOpsFixt
 		t.Fatalf("MarkQueueDone promotion setup: %v", err)
 	}
 	return fixture.ProcessUntilQueueKind(ctx, handler, kind)
+}
+
+func enqueueClaimedQueueItemForTest(
+	t *testing.T,
+	ctx context.Context,
+	fixture *ChannelOpsFixture,
+	options EnqueueOptions,
+) QueueItemRow {
+	t.Helper()
+	itemID, err := fixture.Store.Enqueue(ctx, options)
+	if err != nil {
+		t.Fatalf("enqueue %s test item: %v", options.Kind, err)
+	}
+	fixture.makeQueuedItemsReady(ctx)
+	item, err := fixture.Store.ClaimNextForKinds(
+		ctx,
+		"channelops-test:"+t.Name(),
+		[]string{options.Kind},
+	)
+	if err != nil || item == nil || item.ID != itemID {
+		t.Fatalf("claim %s test item = %#v, %v", options.Kind, item, err)
+	}
+	return *item
+}
+
+func claimQueuedKindForTest(
+	t *testing.T,
+	ctx context.Context,
+	fixture *ChannelOpsFixture,
+	kind string,
+) QueueItemRow {
+	t.Helper()
+	fixture.makeQueuedItemsReady(ctx)
+	item, err := fixture.Store.ClaimNextForKinds(
+		ctx,
+		"channelops-test:"+t.Name(),
+		[]string{kind},
+	)
+	if err != nil || item == nil {
+		t.Fatalf("claim queued %s test item = %#v, %v", kind, item, err)
+	}
+	return *item
 }
 
 func taskIDForQueueItem(t *testing.T, ctx context.Context, fixture *ChannelOpsFixture, item QueueItemRow) string {

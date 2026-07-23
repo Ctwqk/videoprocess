@@ -385,11 +385,7 @@ func (r *Runner) releaseClaimAfterAuthorityChange(ctx context.Context, item Queu
 		runnerClaimReleaseTimeout,
 	)
 	defer cancel()
-	err := r.Store.MarkQueueFailedOrRetry(
-		releaseCtx,
-		item,
-		"leader authority changed after queue claim",
-	)
+	err := r.Store.ReleaseQueueClaim(releaseCtx, item)
 	if errors.Is(err, ErrQueueLeaseLost) {
 		return nil
 	}

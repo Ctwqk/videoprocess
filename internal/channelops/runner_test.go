@@ -395,15 +395,32 @@ func TestRunnerRevalidatesLeadershipAfterClaimBeforeHandler(t *testing.T) {
 			var lockedBy *string
 			var lockedAt *time.Time
 			var lastError *string
+			var attemptCount int
+			var runAfter time.Time
 			if err := fixture.Store.Pool.QueryRow(ctx, `
-				SELECT status, locked_by, locked_at, last_error
-				FROM channel_ops_queue_items WHERE id = $1::uuid
-			`, queueID).Scan(&status, &lockedBy, &lockedAt, &lastError); err != nil {
+					SELECT status, locked_by, locked_at, last_error, attempt_count, run_after
+					FROM channel_ops_queue_items WHERE id = $1::uuid
+				`, queueID).Scan(
+				&status,
+				&lockedBy,
+				&lockedAt,
+				&lastError,
+				&attemptCount,
+				&runAfter,
+			); err != nil {
 				t.Fatalf("read released post-claim item: %v", err)
 			}
 			if status != QueueStatusQueued || lockedBy != nil || lockedAt != nil ||
-				lastError == nil || !strings.Contains(*lastError, "leader authority") {
-				t.Fatalf("released post-claim item = %s/%v/%v/%v", status, lockedBy, lockedAt, lastError)
+				lastError != nil || attemptCount != 0 || runAfter.After(now) {
+				t.Fatalf(
+					"released post-claim item = %s/%v/%v/%v attempt=%d run_after=%s",
+					status,
+					lockedBy,
+					lockedAt,
+					lastError,
+					attemptCount,
+					runAfter,
+				)
 			}
 		})
 	}

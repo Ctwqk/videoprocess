@@ -95,6 +95,38 @@ func TestClaimableKindsIncludesDiscoveryOnlyWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestNetworkedQueueKindsInventory(t *testing.T) {
+	networked := map[string]bool{
+		QueueAgentTick:            true,
+		QueuePlanTask:             true,
+		QueueExecuteTask:          true,
+		QueueObserveJob:           true,
+		QueuePublishTask:          true,
+		QueuePromotePublication:   true,
+		QueueReconcilePublication: true,
+		QueueCollectMetrics:       true,
+		QueueAccountHealth:        true,
+		QueueSendAlert:            true,
+		QueueIngestDiscovery:      true,
+	}
+	for _, kind := range (&HandlerService{
+		Store:     &Store{},
+		PDS:       fakePDS{},
+		AutoFlow:  fakeAutoFlow{},
+		YouTube:   fakeYouTube{},
+		Discovery: &recordingDiscoveryClient{},
+	}).ClaimableKinds() {
+		if got := networkedQueueKind(kind); got != networked[kind] {
+			t.Fatalf("networkedQueueKind(%q) = %t, want %t", kind, got, networked[kind])
+		}
+	}
+	for kind := range networked {
+		if !networkedQueueKind(kind) {
+			t.Fatalf("networked queue inventory omitted %q", kind)
+		}
+	}
+}
+
 func TestHandleIngestDiscoveryRejectsMissingIdentityBeforeClientCall(t *testing.T) {
 	request := discoveryRequestForTest()
 	tests := []struct {
@@ -406,10 +438,12 @@ func TestHandleAgentTickReadsSchedulerBucketPayload(t *testing.T) {
 
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
-	item := QueueItemRow{
-		Kind:        QueueAgentTick,
-		PayloadJSON: map[string]any{"channel_id": fixture.ChannelID, "scheduler_bucket": "2026-05-21-18-15"},
-	}
+	item := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:             QueueAgentTick,
+		IdempotencyKey:   "agent_tick:scheduler-bucket:" + fixture.ChannelID,
+		Payload:          map[string]any{"channel_id": fixture.ChannelID, "scheduler_bucket": "2026-05-21-18-15"},
+		ChannelProfileID: &fixture.ChannelID,
+	})
 
 	if err := handler.HandleAgentTick(ctx, item); err != nil {
 		t.Fatalf("HandleAgentTick: %v", err)
@@ -516,15 +550,17 @@ func TestHandleAgentTickAtomicallyPausesIntakeAfterOneTask(t *testing.T) {
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	runID := testUUID(t, "guarded-canary-run")
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
-	item := QueueItemRow{
-		Kind: QueueAgentTick,
-		PayloadJSON: map[string]any{
+	item := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:           QueueAgentTick,
+		IdempotencyKey: "agent_tick:guarded-pause:" + fixture.ChannelID,
+		Payload: map[string]any{
 			"channel_id":                   fixture.ChannelID,
 			"canary_run_id":                runID,
 			"plan_delay_seconds":           float64(300),
 			"pause_intake_after_selection": true,
 		},
-	}
+		ChannelProfileID: &fixture.ChannelID,
+	})
 
 	if err := handler.HandleAgentTick(ctx, item); err != nil {
 		t.Fatalf("HandleAgentTick: %v", err)
@@ -569,7 +605,7 @@ func TestHandleAgentTickAtomicallyPausesIntakeAfterOneTask(t *testing.T) {
 	}
 }
 
-func TestDirectTickCannotCrossGuardedIntakePause(t *testing.T) {
+func TestAgentTickExternalPolicyWaitAllowsConcurrentPrepareButRejectsStaleFinalize(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	fixture := NewChannelOpsFixture(t)
@@ -580,22 +616,21 @@ func TestDirectTickCannotCrossGuardedIntakePause(t *testing.T) {
 	releaseGuarded := make(chan struct{})
 	guardedHandler := fixture.HandlerService(PDSDecision{})
 	guardedHandler.PDS = waitingPDS{entered: guardedEntered, release: releaseGuarded}
-	channelID := fixture.ChannelID
-	queueItemID := testUUID(t, "guarded-queue-item")
 	canaryRunID := testUUID(t, "guarded-canary-run")
+	guardedItem := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:           QueueAgentTick,
+		IdempotencyKey: "agent_tick:guarded-race:" + fixture.ChannelID,
+		Payload: map[string]any{
+			"channel_id":                   fixture.ChannelID,
+			"canary_run_id":                canaryRunID,
+			"plan_delay_seconds":           float64(300),
+			"pause_intake_after_selection": true,
+		},
+		ChannelProfileID: &fixture.ChannelID,
+	})
 	guardedDone := make(chan error, 1)
 	go func() {
-		guardedDone <- guardedHandler.Handle(ctx, QueueItemRow{
-			ID:               queueItemID,
-			Kind:             QueueAgentTick,
-			ChannelProfileID: &channelID,
-			PayloadJSON: map[string]any{
-				"channel_id":                   fixture.ChannelID,
-				"canary_run_id":                canaryRunID,
-				"plan_delay_seconds":           float64(300),
-				"pause_intake_after_selection": true,
-			},
-		})
+		guardedDone <- guardedHandler.Handle(ctx, guardedItem)
 	}()
 
 	select {
@@ -612,23 +647,24 @@ func TestDirectTickCannotCrossGuardedIntakePause(t *testing.T) {
 		ordinaryDone <- fixture.Store.RunTick(ctx, fixture.ChannelID, UTCBucket(fixture.Store.Now()), ordinaryHandler)
 	}()
 
-	ordinaryCrossedFence := false
 	select {
 	case <-ordinaryEntered:
-		ordinaryCrossedFence = true
 	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ordinary tick did not prepare while guarded policy call was blocked")
+	}
+	var ordinaryErr error
+	select {
+	case ordinaryErr = <-ordinaryDone:
+	case <-ctx.Done():
+		t.Fatal("ordinary tick did not finalize while guarded policy call was blocked")
 	}
 	close(releaseGuarded)
 
-	if err := <-guardedDone; err != nil {
-		t.Fatalf("guarded tick: %v", err)
+	if ordinaryErr != nil {
+		t.Fatalf("ordinary tick: %v", ordinaryErr)
 	}
-	ordinaryErr := <-ordinaryDone
-	if ordinaryCrossedFence {
-		t.Fatal("direct ordinary tick evaluated policy while guarded tick held the channel fence")
-	}
-	if !errors.Is(ordinaryErr, ErrChannelExecutionBlocked) {
-		t.Fatalf("direct ordinary tick error = %v, want ErrChannelExecutionBlocked", ordinaryErr)
+	if guardedErr := <-guardedDone; !errors.Is(guardedErr, ErrHandlerSnapshotStale) {
+		t.Fatalf("guarded stale finalizer error = %v, want ErrHandlerSnapshotStale", guardedErr)
 	}
 
 	var taskCount int
@@ -748,15 +784,18 @@ func TestGuardedAgentTickRollsBackUnlessExactlyOneTaskIsSelected(t *testing.T) {
 			fixture.InsertChannelWithLaneAccountSeed(ctx)
 			tt.setup(ctx, fixture)
 			handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
-			err := handler.HandleAgentTick(ctx, QueueItemRow{
-				Kind: QueueAgentTick,
-				PayloadJSON: map[string]any{
+			item := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+				Kind:           QueueAgentTick,
+				IdempotencyKey: "agent_tick:guarded-cardinality:" + fixture.ChannelID,
+				Payload: map[string]any{
 					"channel_id":                   fixture.ChannelID,
 					"canary_run_id":                testUUID(t, "guarded-canary-run"),
 					"plan_delay_seconds":           float64(300),
 					"pause_intake_after_selection": true,
 				},
+				ChannelProfileID: &fixture.ChannelID,
 			})
+			err := handler.HandleAgentTick(ctx, item)
 			if err == nil || !strings.Contains(err.Error(), "exactly one task") {
 				t.Fatalf("guarded tick error = %v, want exactly-one rejection", err)
 			}
@@ -793,13 +832,15 @@ func TestHandleAgentTickDelaysPlanTaskForGuardedPreapproval(t *testing.T) {
 
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
-	item := QueueItemRow{
-		Kind: QueueAgentTick,
-		PayloadJSON: map[string]any{
+	item := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:           QueueAgentTick,
+		IdempotencyKey: "agent_tick:plan-delay:" + fixture.ChannelID,
+		Payload: map[string]any{
 			"channel_id":         fixture.ChannelID,
 			"plan_delay_seconds": float64(300),
 		},
-	}
+		ChannelProfileID: &fixture.ChannelID,
+	})
 
 	if err := handler.HandleAgentTick(ctx, item); err != nil {
 		t.Fatalf("HandleAgentTick: %v", err)
@@ -826,14 +867,16 @@ func TestHandleAgentTickPrefersBucketPayload(t *testing.T) {
 
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
-	item := QueueItemRow{
-		Kind: QueueAgentTick,
-		PayloadJSON: map[string]any{
+	item := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:           QueueAgentTick,
+		IdempotencyKey: "agent_tick:bucket-precedence:" + fixture.ChannelID,
+		Payload: map[string]any{
 			"channel_id":       fixture.ChannelID,
 			"bucket":           "2026-05-21-18-30",
 			"scheduler_bucket": "2026-05-21-18-15",
 		},
-	}
+		ChannelProfileID: &fixture.ChannelID,
+	})
 
 	if err := handler.HandleAgentTick(ctx, item); err != nil {
 		t.Fatalf("HandleAgentTick: %v", err)
@@ -1080,9 +1123,10 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionFails(t *testing.T) {
 	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
+	item := claimQueuedKindForTest(t, ctx, fixture, QueueExecuteTask)
 	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{Status: "failed", ErrorMessage: "execute blocked"}}
 
-	err := handler.HandleExecuteTask(ctx, testClaimedExecuteQueueItem(task, testExecuteQueuePayload(task.ID)))
+	err := handler.HandleExecuteTask(ctx, item)
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
 	}
@@ -1139,8 +1183,10 @@ func TestHandleExecuteTaskRejectsMissingOrMismatchedDurableAuthorityBeforeAutoFl
 			}
 			recorder := &externalCallRecorder{}
 			handler.AutoFlow = &recordingAutoFlow{recorder: recorder}
+			item := claimQueuedKindForTest(t, ctx, fixture, QueueExecuteTask)
+			item.PayloadJSON = payload
 
-			err := handler.HandleExecuteTask(ctx, testClaimedExecuteQueueItem(task, payload))
+			err := handler.HandleExecuteTask(ctx, item)
 
 			if !errors.Is(err, ErrQueueAuthorityInvalid) {
 				t.Fatalf("HandleExecuteTask error = %v, want invalid queue authority", err)
@@ -1166,12 +1212,13 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingRunID(t *testing.
 	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
+	item := claimQueuedKindForTest(t, ctx, fixture, QueueExecuteTask)
 	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{
 		Status: "running",
 		JobID:  "00000000-0000-0000-0000-000000000301",
 	}}
 
-	err := handler.HandleExecuteTask(ctx, testClaimedExecuteQueueItem(task, testExecuteQueuePayload(task.ID)))
+	err := handler.HandleExecuteTask(ctx, item)
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
 	}
@@ -1192,12 +1239,13 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingJobID(t *testing.
 	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
+	item := claimQueuedKindForTest(t, ctx, fixture, QueueExecuteTask)
 	handler.AutoFlow = fakeAutoFlow{executeObservation: AutoFlowExecuteObservation{
 		Status: "running",
 		RunID:  "00000000-0000-0000-0000-000000000201",
 	}}
 
-	err := handler.HandleExecuteTask(ctx, testClaimedExecuteQueueItem(task, testExecuteQueuePayload(task.ID)))
+	err := handler.HandleExecuteTask(ctx, item)
 	if err != nil {
 		t.Fatalf("HandleExecuteTask returned error: %v", err)
 	}

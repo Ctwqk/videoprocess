@@ -648,11 +648,20 @@ func TestLeaderExecutionFencesReuseDomainTransaction(t *testing.T) {
 	fixture.InsertChannelWithLaneAccountSeed(ctx)
 	now := time.Date(2026, 7, 23, 16, 0, 0, 0, time.UTC)
 	var lease *LeaderLease
+	queueKey := "cleanup_expired:composed-leader-fence:" + testUUID(t, "composed queue key")
 	defer func() {
 		releaseLeaderTestLease(t, ctx, lease, now.Add(time.Second))
+		_, _ = fixture.Store.Pool.Exec(context.Background(), `
+			DELETE FROM channel_ops_queue_items WHERE idempotency_key = $1
+		`, queueKey)
 		fixture.ResetLeaderEpoch(ctx)
 		fixture.Close(ctx)
 	}()
+	queueItem := enqueueClaimedQueueItemForTest(t, ctx, fixture, EnqueueOptions{
+		Kind:           QueueCleanupExpired,
+		IdempotencyKey: queueKey,
+		Payload:        map[string]any{},
+	})
 
 	lease = acquireLeaderTestLease(t, ctx, fixture.Store, "runner-composed", now)
 	err := fixture.Store.WithLeaderExecutionFence(ctx, func(leaderStore *Store) error {
@@ -661,10 +670,7 @@ func TestLeaderExecutionFencesReuseDomainTransaction(t *testing.T) {
 		}
 		leaderDB := leaderStore.executionDB
 
-		if err := leaderStore.WithQueueExecutionFence(ctx, QueueItemRow{
-			ID:   testUUID(t, "leader-queue-fence"),
-			Kind: QueueCleanupExpired,
-		}, func(queueStore *Store) error {
+		if err := leaderStore.WithQueueExecutionFence(ctx, queueItem, func(queueStore *Store) error {
 			if queueStore.executionDB != leaderDB {
 				t.Fatal("queue fence did not reuse leader transaction")
 			}

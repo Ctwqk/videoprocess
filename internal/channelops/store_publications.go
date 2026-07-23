@@ -512,16 +512,16 @@ func (s *Store) UpdateAccountHealth(ctx context.Context, accountID string, healt
 		},
 	})
 	_, err := s.db().Exec(ctx, `
-		UPDATE publishing_accounts
-		SET last_token_check_at = $2,
-		    last_token_check_status = $3,
-		    enabled = CASE WHEN $4 THEN enabled ELSE false END,
-		    platform_specific_config_json = (
-		        COALESCE(platform_specific_config_json, '{}'::json)::jsonb || $5::jsonb
-		    )::json,
-		    updated_at = $2
-		WHERE id = $1::uuid
-	`, accountID, now, status, health.Authenticated, healthJSON)
+			UPDATE publishing_accounts
+			SET last_token_check_at = $2::timestamptz,
+			    last_token_check_status = $3::text,
+			    enabled = CASE WHEN $4 THEN enabled ELSE false END,
+			    platform_specific_config_json = (
+			        COALESCE(platform_specific_config_json, '{}'::json)::jsonb || $5::jsonb
+			    )::json,
+			    updated_at = $2::timestamp
+			WHERE id = $1::uuid
+		`, accountID, now, status, health.Authenticated, healthJSON)
 	return err
 }
 

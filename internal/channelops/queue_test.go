@@ -378,3 +378,148 @@ func TestQueueLeaseReportsStaleCompletionAfterDeadLetter(t *testing.T) {
 		})
 	}
 }
+
+func TestQueueExecutionFenceRejectsReplacedLeaseBeforeDispatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	channelID := fixture.ChannelID
+	_, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:             QueueAccountHealth,
+		IdempotencyKey:   "account_health:" + fixture.AccountID + ":replaced-fence",
+		Payload:          map[string]any{"account_id": fixture.AccountID},
+		ChannelProfileID: &channelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue queue fence item: %v", err)
+	}
+	stale, err := fixture.Store.ClaimNextForKinds(ctx, "stale-fence-worker", []string{QueueAccountHealth})
+	if err != nil || stale == nil {
+		t.Fatalf("claim stale queue fence item = %#v, %v", stale, err)
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = $2, locked_by = NULL, locked_at = NULL, attempt_count = attempt_count - 1
+		WHERE id = $1::uuid
+	`, stale.ID, QueueStatusQueued); err != nil {
+		t.Fatalf("return queue fence item for replacement: %v", err)
+	}
+	replacement, err := fixture.Store.ClaimNextForKinds(ctx, "replacement-fence-worker", []string{QueueAccountHealth})
+	if err != nil || replacement == nil || replacement.ID != stale.ID {
+		t.Fatalf("claim replacement queue fence item = %#v, %v", replacement, err)
+	}
+
+	dispatched := false
+	err = fixture.Store.WithQueueExecutionFence(ctx, *stale, func(*Store) error {
+		dispatched = true
+		return nil
+	})
+
+	if !errors.Is(err, ErrQueueLeaseLost) {
+		t.Fatalf("stale queue execution fence error = %v, want ErrQueueLeaseLost", err)
+	}
+	if dispatched {
+		t.Fatal("stale queue execution fence dispatched after lease replacement")
+	}
+}
+
+func TestReleaseQueueClaimRestoresAttemptWithoutBackoffAndUsesExactLease(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	channelID := fixture.ChannelID
+	itemID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:             QueueAccountHealth,
+		IdempotencyKey:   "account_health:" + fixture.AccountID + ":authority-release",
+		Payload:          map[string]any{"account_id": fixture.AccountID},
+		ChannelProfileID: &channelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue authority-release item: %v", err)
+	}
+	claimed, err := fixture.Store.ClaimNextForKinds(ctx, "authority-release-worker", []string{QueueAccountHealth})
+	if err != nil || claimed == nil || claimed.ID != itemID {
+		t.Fatalf("claim authority-release item = %#v, %v", claimed, err)
+	}
+	originalRunAfter := claimed.RunAfter
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := fixture.Store.ReleaseQueueClaim(canceledCtx, *claimed); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled claim release error = %v, want context.Canceled", err)
+	}
+	var canceledStatus string
+	var canceledAttempt int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+	`, itemID).Scan(&canceledStatus, &canceledAttempt); err != nil {
+		t.Fatalf("read canceled claim release: %v", err)
+	}
+	if canceledStatus != QueueStatusRunning || canceledAttempt != 1 {
+		t.Fatalf("canceled claim release changed queue state to %s attempt %d", canceledStatus, canceledAttempt)
+	}
+
+	if err := fixture.Store.ReleaseQueueClaim(ctx, *claimed); err != nil {
+		t.Fatalf("release authority-change claim: %v", err)
+	}
+	var status string
+	var attempt int
+	var runAfter time.Time
+	var lockedBy *string
+	var lockedAt *time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count, run_after, locked_by, locked_at
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+	`, itemID).Scan(&status, &attempt, &runAfter, &lockedBy, &lockedAt); err != nil {
+		t.Fatalf("read released authority-change claim: %v", err)
+	}
+	if status != QueueStatusQueued || attempt != 0 || !runAfter.Equal(originalRunAfter) || lockedBy != nil || lockedAt != nil {
+		t.Fatalf(
+			"released claim state = %s attempt=%d run_after=%s locked_by=%v locked_at=%v",
+			status,
+			attempt,
+			runAfter,
+			lockedBy,
+			lockedAt,
+		)
+	}
+
+	replacement, err := fixture.Store.ClaimNextForKinds(ctx, "replacement-authority-worker", []string{QueueAccountHealth})
+	if err != nil || replacement == nil || replacement.ID != itemID {
+		t.Fatalf("claim authority replacement = %#v, %v", replacement, err)
+	}
+	if err := fixture.Store.ReleaseQueueClaim(ctx, *claimed); !errors.Is(err, ErrQueueLeaseLost) {
+		t.Fatalf("stale authority release error = %v, want ErrQueueLeaseLost", err)
+	}
+	var replacementStatus string
+	var replacementAttempt int
+	var replacementLockedBy string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count, locked_by
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+	`, itemID).Scan(&replacementStatus, &replacementAttempt, &replacementLockedBy); err != nil {
+		t.Fatalf("read replacement authority lease: %v", err)
+	}
+	if replacementStatus != QueueStatusRunning || replacementAttempt != 1 || replacementLockedBy != "replacement-authority-worker" {
+		t.Fatalf(
+			"replacement lease changed to %s attempt=%d owner=%q",
+			replacementStatus,
+			replacementAttempt,
+			replacementLockedBy,
+		)
+	}
+}

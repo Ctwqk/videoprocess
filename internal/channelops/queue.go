@@ -493,6 +493,25 @@ func (s *Store) MarkQueueFailedOrRetry(ctx context.Context, item QueueItemRow, m
 	return queueLeaseUpdateResult(result.RowsAffected(), err)
 }
 
+func (s *Store) ReleaseQueueClaim(ctx context.Context, item QueueItemRow) error {
+	lockedBy, lockedAt, err := runningLease(item)
+	if err != nil {
+		return err
+	}
+	result, err := s.db().Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = $2,
+		    attempt_count = GREATEST(attempt_count - 1, 0),
+		    locked_by = NULL,
+		    locked_at = NULL
+		WHERE id = $1::uuid
+		  AND status = $3
+		  AND locked_by = $4
+		  AND locked_at = $5
+	`, item.ID, QueueStatusQueued, QueueStatusRunning, lockedBy, lockedAt)
+	return queueLeaseUpdateResult(result.RowsAffected(), err)
+}
+
 func (s *Store) MarkQueueRejected(ctx context.Context, item QueueItemRow, message string) error {
 	lockedBy, lockedAt, err := runningLease(item)
 	if err != nil {

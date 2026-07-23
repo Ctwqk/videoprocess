@@ -167,6 +167,19 @@ func TestPromotionConfirmationMismatchDoesNotAdvanceOperation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("prepare promotion: %v", err)
 	}
+	if err := fixture.Store.WithQueueExecutionFence(ctx, promote, func(fencedStore *Store) error {
+		fencedHandler := handler.withStore(fencedStore)
+		finalized, err := fencedHandler.finalizePromotionDecision(
+			ctx,
+			promote,
+			preparation,
+			PDSDecision{Verdict: "allow", DecisionID: "allow"},
+		)
+		preparation = finalized
+		return err
+	}); err != nil {
+		t.Fatalf("finalize promotion decision: %v", err)
+	}
 	operation, shouldSubmit, err := fixture.Store.BeginPromotionSubmission(ctx, preparation.Operation.ID)
 	if err != nil || !shouldSubmit {
 		t.Fatalf("begin submission = %#v, %v, want submission authority", operation, err)
@@ -434,7 +447,7 @@ func TestPromotionUncertainStatusNeverBlindlyResubmits(t *testing.T) {
 	}
 }
 
-func TestQuarantineBetweenPromotionPhasesRetainsConfirmedEvidence(t *testing.T) {
+func TestQuarantineBetweenPromotionPhasesRejectsStaleConfirmation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
@@ -483,8 +496,8 @@ func TestQuarantineBetweenPromotionPhasesRetainsConfirmedEvidence(t *testing.T) 
 	if waitErr != nil {
 		t.Fatal(waitErr)
 	}
-	if !errors.Is(handleErr, ErrChannelExecutionBlocked) {
-		t.Fatalf("promotion after quarantine error = %v, want channel blocked", handleErr)
+	if !errors.Is(handleErr, ErrQueueLeaseLost) {
+		t.Fatalf("promotion after quarantine error = %v, want queue lease lost", handleErr)
 	}
 	if got := youtube.calls.Load(); got != 1 {
 		t.Fatalf("manager schedule calls = %d, want 1", got)
@@ -498,8 +511,8 @@ func TestQuarantineBetweenPromotionPhasesRetainsConfirmedEvidence(t *testing.T) 
 	`, publicationID).Scan(&operationStatus); err != nil {
 		t.Fatalf("read promotion evidence: %v", err)
 	}
-	if operationStatus != PromotionConfirmed {
-		t.Fatalf("operation status = %s, want %s", operationStatus, PromotionConfirmed)
+	if operationStatus != PromotionSubmitting {
+		t.Fatalf("operation status = %s, want %s", operationStatus, PromotionSubmitting)
 	}
 	publication, err := fixture.Store.GetPublication(ctx, publicationID)
 	if err != nil {
@@ -508,8 +521,8 @@ func TestQuarantineBetweenPromotionPhasesRetainsConfirmedEvidence(t *testing.T) 
 	if publication.PublishStatus != "uploaded" {
 		t.Fatalf("publication status = %s, want uploaded", publication.PublishStatus)
 	}
-	if retryErr := handler.Handle(ctx, promote); !errors.Is(retryErr, ErrChannelExecutionBlocked) {
-		t.Fatalf("retry after quarantine error = %v, want channel blocked", retryErr)
+	if retryErr := handler.Handle(ctx, promote); !errors.Is(retryErr, ErrQueueLeaseLost) {
+		t.Fatalf("retry after quarantine error = %v, want queue lease lost", retryErr)
 	}
 	if got := youtube.calls.Load(); got != 1 {
 		t.Fatalf("manager schedule calls after retry = %d, want 1", got)
