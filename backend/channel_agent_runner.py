@@ -6,7 +6,7 @@ import os
 from collections.abc import Mapping
 
 
-PRODUCTION_DEPLOY_MODES = frozenset({"shared", "production"})
+LOCAL_DEPLOY_MODES = frozenset({"local", "test"})
 
 
 def assert_python_channelops_runner_admission(
@@ -14,7 +14,7 @@ def assert_python_channelops_runner_admission(
 ) -> None:
     deploy_env = os.environ if env is None else env
     deploy_mode = deploy_env.get("DEPLOY_MODE", "").strip().lower()
-    if deploy_mode in PRODUCTION_DEPLOY_MODES:
+    if deploy_mode not in LOCAL_DEPLOY_MODES:
         raise RuntimeError("Go ChannelOps runner is the production owner")
 
 
