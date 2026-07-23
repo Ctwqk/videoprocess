@@ -2011,8 +2011,9 @@ async def execute_canary(
         evidence["run_id"],
         channelops_wait,
     )
+    task_id = task.id
     evidence["task"] = {
-        "id": str(task.id),
+        "id": str(task_id),
         "approval_mode": task.approval_mode,
         "agent_approval_evidence": task.agent_approval_evidence_json,
         "plan_queue_item_id": str(plan_item.id),
@@ -2020,17 +2021,18 @@ async def execute_canary(
     }
     atomic_write_json(path, evidence)
 
-    task, job = await wait_for_waiting_job(args, client, db, task.id, args.timeout_seconds)
+    task, job = await wait_for_waiting_job(args, client, db, task_id, args.timeout_seconds)
+    job_id = job.id
     evidence["task"].update(
         {
             "autoflow_plan_id": str(task.autoflow_plan_id),
             "autoflow_run_id": str(task.autoflow_run_id),
             "pipeline_id": str(task.pipeline_id),
-            "job_id": str(job.id),
+            "job_id": str(job_id),
         }
     )
-    evidence["job"] = {"id": str(job.id), "status_before_open": job.status.value}
-    await assert_never_public(db, graph, task.id)
+    evidence["job"] = {"id": str(job_id), "status_before_open": job.status.value}
+    await assert_never_public(db, graph, task_id)
 
     current_schedule = await schedule_status(args, client)
     record_schedule(evidence, "pre_open_recheck", current_schedule)
@@ -2043,7 +2045,7 @@ async def execute_canary(
     evidence["open_gate"] = await assert_open_gate(
         db,
         channel_id=uuid.UUID(graph["channel_id"]),
-        job_id=job.id,
+        job_id=job_id,
     )
     atomic_write_json(path, evidence)
 
@@ -2052,17 +2054,17 @@ async def execute_canary(
         client,
         evidence,
         "open",
-        expected_job_id=job.id,
+        expected_job_id=job_id,
     )
     if (
         opened.get("state") != "OPEN"
         or type(opened.get("released_jobs")) is not int
         or opened["released_jobs"] != 1
         or "guarded_job_id" not in opened
-        or opened["guarded_job_id"] != str(job.id)
+        or opened["guarded_job_id"] != str(job_id)
     ):
         raise CanaryError("schedule open did not grant authority to the exact canary job")
-    running_job = await wait_for_running_job(db, job.id, min(args.timeout_seconds, 120.0))
+    running_job = await wait_for_running_job(db, job_id, min(args.timeout_seconds, 120.0))
     evidence["job"]["running_observed_at"] = utc_now().isoformat()
     evidence["job"]["status_when_drained"] = running_job.status.value
     drained = await mutate_schedule(args, client, evidence, "drain")
@@ -2074,33 +2076,47 @@ async def execute_canary(
         raise CanaryError("video schedule must be DRAINING with no guarded job")
     atomic_write_json(path, evidence)
 
-    operation, publication = await wait_for_upload_and_publication(db, task.id, args.timeout_seconds)
-    if operation.manager_task_id is None or operation.platform_video_id is None:
+    operation, publication = await wait_for_upload_and_publication(db, task_id, args.timeout_seconds)
+    operation_id = operation.id
+    operation_status = operation.status
+    manager_task_id = operation.manager_task_id
+    video_id = operation.platform_video_id
+    operation_job_id = operation.job_id
+    node_execution_id = operation.node_execution_id
+    content_sha256 = operation.content_sha256
+    operation_privacy = operation.privacy
+    publication_id = publication.id
+    publication_platform = publication.platform
+    publication_video_id = publication.platform_content_id
+    publication_desired_privacy = publication.desired_privacy
+    publication_current_privacy = publication.current_privacy
+    publication_status = publication.publish_status
+    if manager_task_id is None or video_id is None:
         raise CanaryError("succeeded upload operation lacks manager task or video ID")
     evidence["operation"] = {
-        "id": str(operation.id),
-        "status": operation.status,
-        "manager_task_id": operation.manager_task_id,
-        "job_id": str(operation.job_id),
-        "node_execution_id": str(operation.node_execution_id),
-        "content_sha256": operation.content_sha256,
-        "privacy": operation.privacy,
+        "id": str(operation_id),
+        "status": operation_status,
+        "manager_task_id": manager_task_id,
+        "job_id": str(operation_job_id),
+        "node_execution_id": str(node_execution_id),
+        "content_sha256": content_sha256,
+        "privacy": operation_privacy,
     }
     evidence["publication"] = {
-        "id": str(publication.id),
-        "platform": publication.platform,
-        "video_id": publication.platform_content_id,
-        "desired_privacy": publication.desired_privacy,
-        "current_privacy": publication.current_privacy,
-        "publish_status": publication.publish_status,
+        "id": str(publication_id),
+        "platform": publication_platform,
+        "video_id": publication_video_id,
+        "desired_privacy": publication_desired_privacy,
+        "current_privacy": publication_current_privacy,
+        "publish_status": publication_status,
     }
-    evidence["video"] = {"id": operation.platform_video_id, "count": 1, "deletion_policy": NO_DELETE_POLICY}
+    evidence["video"] = {"id": video_id, "count": 1, "deletion_policy": NO_DELETE_POLICY}
 
     manager_task, manager_video = await wait_for_manager_ready(
         args,
         client,
-        operation.manager_task_id,
-        operation.platform_video_id,
+        manager_task_id,
+        video_id,
         min(args.timeout_seconds, 600.0),
     )
     evidence["manager"].update({"upload_task": manager_task, "video_status": manager_video})
@@ -2108,38 +2124,40 @@ async def execute_canary(
     cancelled, promotion = await replace_auto_promotion_with_immediate(
         db,
         uuid.UUID(graph["channel_id"]),
-        publication.id,
+        publication_id,
     )
     metrics_payload = await request_json(
         client,
         "GET",
-        f"{manager_root(args.youtube_manager_url)}/api/videos/{operation.platform_video_id}/metrics",
+        f"{manager_root(args.youtube_manager_url)}/api/videos/{video_id}/metrics",
     )
     immediate_metrics = recognized_metrics(metrics_payload)
-    metrics_item = await enqueue_metrics_probe(db, publication.id)
+    metrics_item = await enqueue_metrics_probe(db, publication_id)
+    promotion_id = promotion.id
+    metrics_item_id = metrics_item.id
     evidence["queue"].update(
         {
             "cancelled_auto_promotion_ids": cancelled,
-            "immediate_promotion_id": str(promotion.id),
-            "immediate_metrics_id": str(metrics_item.id),
+            "immediate_promotion_id": str(promotion_id),
+            "immediate_metrics_id": str(metrics_item_id),
         }
     )
     await wait_for_queue_success(
         db,
-        promotion.id,
+        promotion_id,
         channelops_wait,
         "immediate unlisted promotion",
     )
     evidence["publication"]["after_immediate_promotion"] = await assert_promotion_succeeded(
         db,
-        publication.id,
-        task.id,
+        publication_id,
+        task_id,
     )
     manager_task, manager_video = await wait_for_manager_ready(
         args,
         client,
-        operation.manager_task_id,
-        operation.platform_video_id,
+        manager_task_id,
+        video_id,
         min(args.timeout_seconds, 300.0),
     )
     evidence["manager"].update(
@@ -2148,15 +2166,15 @@ async def execute_canary(
 
     await wait_for_queue_success(
         db,
-        metrics_item.id,
+        metrics_item_id,
         channelops_wait,
         "immediate metrics probe",
     )
-    immediate_task_state = await assert_immediate_metrics_task_state(db, task.id)
-    durable_pending = await pending_metrics_rows(db, publication.id)
+    immediate_task_state = await assert_immediate_metrics_task_state(db, task_id)
+    durable_pending = await pending_metrics_rows(db, publication_id)
     assert_exact_durable_metric_stages(durable_pending)
     if immediate_metrics:
-        snapshot = await wait_for_feedback_snapshot(db, publication.id, channelops_wait)
+        snapshot = await wait_for_feedback_snapshot(db, publication_id, channelops_wait)
         if snapshot.snapshot_stage != "immediate":
             raise CanaryError("immediate metrics probe produced a mature feedback stage")
         evidence["feedback"] = {
@@ -2187,8 +2205,8 @@ async def execute_canary(
         }
     evidence["feedback"]["task_state_after_immediate_probe"] = immediate_task_state
 
-    await assert_never_public(db, graph, task.id)
-    counts = await canary_counts(db, graph, task.id)
+    await assert_never_public(db, graph, task_id)
+    counts = await canary_counts(db, graph, task_id)
     exact_one_keys = {
         "channels",
         "lanes",

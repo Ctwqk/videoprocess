@@ -1230,6 +1230,213 @@ async def test_execute_canary_final_recheck_requires_closed_unowned_schedule(
 
 
 @pytest.mark.anyio
+async def test_execute_canary_preserves_entity_ids_across_poll_refreshes(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    channel, task, plan_item = await add_preapproval_candidate(db)
+    job = Job(
+        pipeline_id=uuid.uuid4(),
+        pipeline_snapshot={"version": "1.0", "nodes": [], "edges": []},
+        status=JobStatus.WAITING_WINDOW,
+    )
+    publication = PublicationRecord(
+        production_task_id=task.id,
+        account_id=task.target_account_id,
+        platform_content_id="video-123",
+        desired_privacy="unlisted",
+        current_privacy="unlisted",
+        publish_status="uploaded",
+        compliance_disposition="approved",
+    )
+    promotion_item = ChannelOpsQueueItem(
+        kind="promote_publication",
+        idempotency_key=f"promote_publication:{publication.id}:immediate",
+        channel_profile_id=channel.id,
+        payload_json={"target_visibility": "unlisted"},
+    )
+    metrics_item = ChannelOpsQueueItem(
+        kind="collect_metrics",
+        idempotency_key=f"collect_metrics:{publication.id}:immediate",
+        channel_profile_id=channel.id,
+        payload_json={"snapshot_stage": "immediate"},
+    )
+    db.add_all((job, publication, promotion_item, metrics_item))
+    await db.commit()
+    task_id = task.id
+    publication_id = publication.id
+    promotion_id = promotion_item.id
+    metrics_id = metrics_item.id
+
+    closed = {"state": "CLOSED", "guarded_job_id": None}
+    monkeypatch.setattr(runner, "schedule_status", AsyncMock(side_effect=(closed, closed)))
+    monkeypatch.setattr(
+        runner,
+        "active_backlog",
+        AsyncMock(
+            return_value={
+                "runnable_job_ids": [],
+                "unsafe_queue_item_ids": [],
+                "unsafe_task_ids": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "deployment_readiness",
+        AsyncMock(return_value={"channelops_task_wait_seconds": 1}),
+    )
+    monkeypatch.setattr(runner, "manager_readiness", AsyncMock(return_value={}))
+    monkeypatch.setattr(runner, "generate_owned_video", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        runner,
+        "upload_and_attest_asset",
+        AsyncMock(return_value={"id": str(uuid.uuid4())}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "create_canary_graph",
+        AsyncMock(
+            return_value={
+                "channel_id": str(channel.id),
+                "agent_tick_id": str(uuid.uuid4()),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        runner,
+        "wait_for_single_task_and_preapprove",
+        AsyncMock(return_value=(task, plan_item)),
+    )
+    monkeypatch.setattr(runner, "wait_for_waiting_job", AsyncMock(return_value=(task, job)))
+    monkeypatch.setattr(runner, "assert_never_public", AsyncMock())
+    monkeypatch.setattr(runner, "assert_open_gate", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        runner,
+        "mutate_schedule",
+        AsyncMock(
+            side_effect=(
+                {
+                    "state": "OPEN",
+                    "guarded_job_id": str(job.id),
+                    "released_jobs": 1,
+                },
+                {"state": "DRAINING", "guarded_job_id": None},
+            )
+        ),
+    )
+
+    async def refresh_running_job(
+        session: AsyncSession,
+        job_id: uuid.UUID,
+        _timeout_seconds: float,
+    ) -> Job:
+        job.status = JobStatus.RUNNING
+        await session.commit()
+        session.expire_all()
+        refreshed = await session.get(Job, job_id)
+        assert refreshed is not None
+        return refreshed
+
+    operation = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="succeeded",
+        manager_task_id=str(uuid.uuid4()),
+        platform_video_id="video-123",
+        job_id=job.id,
+        node_execution_id=uuid.uuid4(),
+        content_sha256="a" * 64,
+        privacy="unlisted",
+    )
+
+    async def refresh_upload_and_publication(
+        session: AsyncSession,
+        observed_task_id: uuid.UUID,
+        _timeout_seconds: float,
+    ):
+        assert observed_task_id == task_id
+        refreshed = await session.get(PublicationRecord, publication_id)
+        assert refreshed is not None
+        return operation, refreshed
+
+    monkeypatch.setattr(runner, "wait_for_upload_and_publication", refresh_upload_and_publication)
+    monkeypatch.setattr(runner, "wait_for_manager_ready", AsyncMock(return_value=({}, {})))
+
+    async def refresh_promotion(
+        session: AsyncSession,
+        _channel_id: uuid.UUID,
+        _publication_id: uuid.UUID,
+    ):
+        refreshed = await session.get(ChannelOpsQueueItem, promotion_id)
+        assert refreshed is not None
+        return [], refreshed
+
+    async def refresh_metrics_item(
+        session: AsyncSession,
+        _publication_id: uuid.UUID,
+    ):
+        refreshed = await session.get(ChannelOpsQueueItem, metrics_id)
+        assert refreshed is not None
+        return refreshed
+
+    monkeypatch.setattr(runner, "replace_auto_promotion_with_immediate", refresh_promotion)
+    monkeypatch.setattr(runner, "request_json", AsyncMock(return_value={"metrics": {}}))
+    monkeypatch.setattr(runner, "enqueue_metrics_probe", refresh_metrics_item)
+    monkeypatch.setattr(
+        runner,
+        "assert_promotion_succeeded",
+        AsyncMock(
+            return_value={
+                "publish_status": "scheduled",
+                "desired_privacy": "unlisted",
+                "current_privacy": "unlisted",
+                "task_state": "scheduled",
+            }
+        ),
+    )
+
+    class QueueRefreshReached(RuntimeError):
+        pass
+
+    observed_queue_ids: list[uuid.UUID] = []
+
+    async def refresh_queue(
+        session: AsyncSession,
+        queue_id: uuid.UUID,
+        _timeout_seconds: float,
+        _description: str,
+    ):
+        observed_queue_ids.append(queue_id)
+        session.expire_all()
+        if len(observed_queue_ids) == 2:
+            raise QueueRefreshReached
+        refreshed = await session.get(ChannelOpsQueueItem, queue_id)
+        assert refreshed is not None
+        return refreshed
+
+    monkeypatch.setattr(runner, "wait_for_running_job", refresh_running_job)
+    monkeypatch.setattr(runner, "wait_for_queue_success", refresh_queue)
+    evidence = {"run_id": "run", "schedule": {"transitions": []}}
+
+    with pytest.raises(QueueRefreshReached):
+        await runner.execute_canary(
+            SimpleNamespace(
+                timeout_seconds=10,
+                youtube_manager_url="http://youtube-manager",
+            ),
+            db,
+            object(),
+            evidence,
+            tmp_path / "live.json",
+        )
+
+    assert evidence["publication"]["id"] == str(publication_id)
+    assert observed_queue_ids == [promotion_id, metrics_id]
+
+
+@pytest.mark.anyio
 async def test_create_graph_is_atomic_unlisted_and_enqueues_one_tick(db: AsyncSession):
     runner = load_runner()
     asset = await add_asset(db)
