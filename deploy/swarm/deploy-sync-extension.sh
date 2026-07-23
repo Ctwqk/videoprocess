@@ -207,6 +207,16 @@ vp_update_runtime_service() {
       "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS=120"
       --env-add
       "CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1"
+      --health-cmd
+      "wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1"
+      --health-interval
+      "10s"
+      --health-timeout
+      "3s"
+      --health-retries
+      "6"
+      --health-start-period
+      "10s"
     )
   fi
 

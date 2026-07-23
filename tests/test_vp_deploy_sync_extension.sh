@@ -459,6 +459,14 @@ if [[ "$runner_identity_update" != *'--env-rm CHANNELOPS_RUNNER_ID'* \
   echo 'FAIL: managed ChannelOps identity must replace a prior service identity' >&2
   exit 1
 fi
+if [[ "$runner_identity_update" != *'--health-cmd wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1'* \
+  || "$runner_identity_update" != *'--health-interval 10s'* \
+  || "$runner_identity_update" != *'--health-timeout 3s'* \
+  || "$runner_identity_update" != *'--health-retries 6'* \
+  || "$runner_identity_update" != *'--health-start-period 10s'* ]]; then
+  echo 'FAIL: managed ChannelOps update must replace service-level health with active readyz' >&2
+  exit 1
+fi
 
 python_worker_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
