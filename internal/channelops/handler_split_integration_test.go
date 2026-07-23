@@ -662,31 +662,23 @@ func acquireHandlerTakeoverWhileBlocked(
 	now time.Time,
 ) *LeaderLease {
 	t.Helper()
-	acquireCtx, cancel := context.WithCancel(ctx)
+	acquireCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
 	defer cancel()
-	result := make(chan leaderAcquireResult, 1)
-	go func() {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		lease, acquired, err := store.TryAcquireLeader(acquireCtx, holderID, now)
-		result <- leaderAcquireResult{lease: lease, acquired: acquired, err: err}
-	}()
-	select {
-	case acquired := <-result:
-		if acquired.err != nil || !acquired.acquired || acquired.lease == nil {
-			t.Fatalf("handler takeover = %#v", acquired)
+		if err != nil {
+			t.Fatalf("handler takeover: %v", err)
 		}
-		return acquired.lease
-	case <-time.After(750 * time.Millisecond):
-		cancel()
+		if acquired && lease != nil {
+			return lease
+		}
 		select {
-		case acquired := <-result:
-			if acquired.lease != nil {
-				_ = acquired.lease.Release(context.Background(), now.Add(time.Second))
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("timed out draining blocked replacement leader acquisition")
+		case <-ticker.C:
+		case <-acquireCtx.Done():
+			t.Fatalf("replacement leader blocked behind external handler wait: %v", acquireCtx.Err())
 		}
-		t.Fatal("replacement leader blocked behind external handler wait")
-		return nil
 	}
 }
 

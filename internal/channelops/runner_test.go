@@ -426,6 +426,134 @@ func TestRunnerRevalidatesLeadershipAfterClaimBeforeHandler(t *testing.T) {
 	}
 }
 
+func TestRunnerReleasesClaimWithoutPenaltyWhenHandlerLosesLeader(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	secondStore := openHandlerTakeoverStore(t, ctx)
+	now := fixture.Store.Now()
+	oldLease := acquireLeaderTestLease(
+		t,
+		ctx,
+		fixture.Store,
+		"channelops-go@runner-handler-old:1",
+		now,
+	)
+	var takeoverLease *LeaderLease
+	releaseExternal := make(chan struct{})
+	var releaseExternalOnce sync.Once
+	defer func() {
+		releaseExternalOnce.Do(func() { close(releaseExternal) })
+		releaseLeaderTestLease(t, context.Background(), takeoverLease, now.Add(3*time.Second))
+		_ = oldLease.Release(context.Background(), now.Add(3*time.Second))
+		fixture.ResetLeaderEpoch(context.Background())
+		secondStore.Close()
+		fixture.Close(context.Background())
+	}()
+
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueIngestDiscovery,
+		IdempotencyKey: "runner-handler-authority-loss:" + fixture.ChannelID,
+		Payload: map[string]any{
+			"channel_id":       fixture.ChannelID,
+			"source":           "youtube_search",
+			"bucket":           "2026-07-23-22",
+			"scheduler_bucket": "2026-07-23-22",
+		},
+		Priority: 80, ChannelProfileID: &fixture.ChannelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue handler authority-loss item: %v", err)
+	}
+	var originalRunAfter time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT run_after FROM channel_ops_queue_items WHERE id = $1::uuid
+	`, queueID).Scan(&originalRunAfter); err != nil {
+		t.Fatalf("read original handler authority-loss run_after: %v", err)
+	}
+
+	authority := oldLease.Authority()
+	leadership := &fakeLeadershipController{
+		authority: &authority,
+		status:    LeaderStatus{Role: LeaderRoleActive, Authority: &authority},
+	}
+	client := &blockingDiscoveryClient{
+		started: make(chan struct{}, 1),
+		release: releaseExternal,
+	}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+	runner := &Runner{
+		Config:     Config{SchedulerPollSeconds: 60},
+		Store:      fixture.Store,
+		Handlers:   handler,
+		Leadership: leadership,
+	}
+	runner.SetLastSchedulerRun(now)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.runOnce(ctx) }()
+	waitHandlerSplitSignal(t, client.started, "runner discovery ingestion")
+
+	dropLeaderTestSession(t, ctx, oldLease)
+	takeoverLease = acquireHandlerTakeoverWhileBlocked(
+		t,
+		ctx,
+		secondStore,
+		"channelops-go@runner-handler-new:1",
+		now.Add(time.Second),
+	)
+	releaseExternalOnce.Do(func() { close(releaseExternal) })
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("runOnce after handler authority loss: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for runner handler authority loss: %v", ctx.Err())
+	}
+
+	var status string
+	var attemptCount int
+	var runAfter time.Time
+	var lockedBy *string
+	var lockedAt *time.Time
+	var lastError *string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count, run_after, locked_by, locked_at, last_error
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+	`, queueID).Scan(
+		&status,
+		&attemptCount,
+		&runAfter,
+		&lockedBy,
+		&lockedAt,
+		&lastError,
+	); err != nil {
+		t.Fatalf("read released handler authority-loss item: %v", err)
+	}
+	if status != QueueStatusQueued || attemptCount != 0 ||
+		!runAfter.Equal(originalRunAfter) || lockedBy != nil ||
+		lockedAt != nil || lastError != nil {
+		t.Fatalf(
+			"handler authority-loss claim = %s attempt=%d run_after=%s locked_by=%v locked_at=%v last_error=%v",
+			status,
+			attemptCount,
+			runAfter,
+			lockedBy,
+			lockedAt,
+			lastError,
+		)
+	}
+}
+
 func TestRunnerLeadershipLossReturnsStandbyWithoutClaim(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")

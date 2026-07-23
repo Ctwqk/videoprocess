@@ -428,12 +428,21 @@ func (r *Runner) runOnce(ctx context.Context) error {
 		return r.releaseClaimAfterAuthorityChange(ctx, *item)
 	}
 	if err := r.Handlers.Handle(ctx, *item); err != nil {
-		if errors.Is(err, ErrQueueAuthorityInvalid) {
-			return r.Store.MarkQueueRejected(ctx, *item, err.Error())
+		if leaderFenceRejected(err) {
+			return r.releaseClaimAfterAuthorityChange(ctx, *item)
 		}
-		return r.Store.MarkQueueFailedOrRetry(ctx, *item, err.Error())
+		if errors.Is(err, ErrQueueAuthorityInvalid) {
+			return r.completeQueueClaimWithAuthority(ctx, *item, func(fenced *Store) error {
+				return fenced.MarkQueueRejected(ctx, *item, err.Error())
+			})
+		}
+		return r.completeQueueClaimWithAuthority(ctx, *item, func(fenced *Store) error {
+			return fenced.MarkQueueFailedOrRetry(ctx, *item, err.Error())
+		})
 	}
-	return r.Store.MarkQueueDone(ctx, *item)
+	return r.completeQueueClaimWithAuthority(ctx, *item, func(fenced *Store) error {
+		return fenced.MarkQueueDone(ctx, *item)
+	})
 }
 
 func (r *Runner) executeScheduler(
@@ -456,6 +465,18 @@ func (r *Runner) releaseClaimAfterAuthorityChange(ctx context.Context, item Queu
 	err := r.Store.ReleaseQueueClaim(releaseCtx, item)
 	if errors.Is(err, ErrQueueLeaseLost) {
 		return nil
+	}
+	return err
+}
+
+func (r *Runner) completeQueueClaimWithAuthority(
+	ctx context.Context,
+	item QueueItemRow,
+	complete func(*Store) error,
+) error {
+	err := r.Store.WithLeaderExecutionFence(ctx, complete)
+	if leaderFenceRejected(err) {
+		return r.releaseClaimAfterAuthorityChange(ctx, item)
 	}
 	return err
 }
