@@ -102,7 +102,18 @@ type LeaderLease struct {
 	conn      *pgxpool.Conn
 	state     *leaderState
 	released  bool
-	Authority LeaderAuthority
+	authority LeaderAuthority
+}
+
+type leaderLockAttempt func(context.Context, *pgxpool.Conn) (bool, error)
+
+func (l *LeaderLease) Authority() LeaderAuthority {
+	if l == nil {
+		return LeaderAuthority{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.authority
 }
 
 func (s *Store) TryAcquireLeader(
@@ -126,8 +137,8 @@ func (s *Store) TryAcquireLeader(
 		return nil, false, err
 	}
 
-	var locked bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, leaderAdvisoryLockKey).Scan(&locked); err != nil {
+	locked, err := s.attemptLeaderLock(ctx, conn)
+	if err != nil {
 		return nil, false, errors.Join(err, discardLeaderConn(conn))
 	}
 	if !locked {
@@ -172,10 +183,23 @@ func (s *Store) TryAcquireLeader(
 	lease := &LeaderLease{
 		conn:      conn,
 		state:     s.leadership,
-		Authority: authority,
+		authority: authority,
 	}
 	s.leadership.publish(authority)
 	return lease, true, nil
+}
+
+func (s *Store) attemptLeaderLock(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
+	if s.leaderLockAttempt != nil {
+		return s.leaderLockAttempt(ctx, conn)
+	}
+	return tryLeaderAdvisoryLock(ctx, conn)
+}
+
+func tryLeaderAdvisoryLock(ctx context.Context, conn *pgxpool.Conn) (bool, error) {
+	var locked bool
+	err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, leaderAdvisoryLockKey).Scan(&locked)
+	return locked, err
 }
 
 func (l *LeaderLease) Heartbeat(ctx context.Context, now time.Time) error {
@@ -188,7 +212,7 @@ func (l *LeaderLease) Heartbeat(ctx context.Context, now time.Time) error {
 		return ErrLeaderAuthorityLost
 	}
 
-	authority := l.Authority
+	authority := l.authority
 	now = now.UTC()
 	var acquiredAt time.Time
 	err := l.conn.QueryRow(ctx, `
@@ -206,8 +230,8 @@ func (l *LeaderLease) Heartbeat(ctx context.Context, now time.Time) error {
 		return errors.Join(err, releaseErr)
 	}
 
-	l.Authority.AcquiredAt = acquiredAt
-	l.Authority.HeartbeatAt = now
+	l.authority.AcquiredAt = acquiredAt
+	l.authority.HeartbeatAt = now
 	l.state.refresh(authority, acquiredAt, now)
 	return nil
 }
@@ -222,7 +246,7 @@ func (l *LeaderLease) Release(ctx context.Context, now time.Time) error {
 		return nil
 	}
 
-	authority := l.Authority
+	authority := l.authority
 	tag, updateErr := l.conn.Exec(ctx, `
 		UPDATE channelops_leader_epochs
 		SET released_at = $4

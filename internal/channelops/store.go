@@ -14,6 +14,7 @@ type Store struct {
 	Now                func() time.Time
 	DefaultMaxAttempts int
 	leadership         *leaderState
+	leaderLockAttempt  leaderLockAttempt
 	executionDB        dbExecutor
 	executionChannelID *string
 }
