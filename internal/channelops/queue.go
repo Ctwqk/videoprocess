@@ -264,11 +264,13 @@ func (s *Store) ClaimNext(ctx context.Context, workerID string) (*QueueItemRow, 
 
 func (s *Store) recoverStaleDiscoveryLeases(ctx context.Context, now time.Time) (int64, error) {
 	current := now.UTC()
-	tx, err := s.Pool.Begin(ctx)
+	tx, ownsTransaction, err := s.beginOrReuse(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	if ownsTransaction {
+		defer func() { _ = tx.Rollback(ctx) }()
+	}
 
 	type staleDiscoveryLease struct {
 		id           string
@@ -391,6 +393,9 @@ func (s *Store) recoverStaleDiscoveryLeases(ctx context.Context, now time.Time) 
 		recovered++
 	}
 
+	if !ownsTransaction {
+		return recovered, nil
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
 	}

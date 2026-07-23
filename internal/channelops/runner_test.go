@@ -3,10 +3,365 @@ package channelops
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+type fakeLeadershipController struct {
+	mu          sync.Mutex
+	authority   *LeaderAuthority
+	status      LeaderStatus
+	ensureErr   error
+	ensureCalls int
+	closeCalls  int
+	closeHook   func(context.Context, time.Time) error
+}
+
+func (f *fakeLeadershipController) EnsureActive(context.Context, time.Time) (*LeaderAuthority, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureCalls++
+	return cloneLeaderAuthorityPointer(f.authority), f.ensureErr
+}
+
+func (f *fakeLeadershipController) Status() LeaderStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	status := f.status
+	status.Authority = cloneLeaderAuthorityPointer(status.Authority)
+	return status
+}
+
+func (f *fakeLeadershipController) Close(ctx context.Context, now time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closeCalls++
+	if f.closeHook != nil {
+		return f.closeHook(ctx, now)
+	}
+	return nil
+}
+
+func TestRunnerStandbyLeadershipHasZeroSideEffects(t *testing.T) {
+	now := time.Date(2026, 7, 23, 18, 0, 0, 0, time.UTC)
+	leadership := &fakeLeadershipController{
+		status: LeaderStatus{Role: LeaderRoleStandby},
+	}
+	store := &Store{Now: func() time.Time { return now }}
+	runner := &Runner{
+		Config:     Config{SchedulerPollSeconds: 60},
+		Store:      store,
+		Scheduler:  Scheduler{Store: store},
+		Handlers:   HandlerService{Store: store},
+		Leadership: leadership,
+	}
+
+	if err := runner.runOnce(context.Background()); err != nil {
+		t.Fatalf("standby runOnce: %v", err)
+	}
+	if leadership.ensureCalls != 1 {
+		t.Fatalf("EnsureActive calls = %d, want 1", leadership.ensureCalls)
+	}
+	if !runner.LastSchedulerRun().IsZero() {
+		t.Fatalf("standby scheduler timestamp = %s, want zero", runner.LastSchedulerRun())
+	}
+}
+
+func TestRunnerLeadershipSchedulerRequiresFence(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	authority := &LeaderAuthority{
+		ServiceName: leaderServiceName,
+		HolderID:    "channelops-go@colima-127:1",
+		Epoch:       11,
+		AcquiredAt:  fixture.Store.Now(),
+		HeartbeatAt: fixture.Store.Now(),
+	}
+	runner := &Runner{
+		Config:    Config{SchedulerPollSeconds: 60},
+		Store:     fixture.Store,
+		Scheduler: Scheduler{Store: fixture.Store},
+		Leadership: &fakeLeadershipController{
+			authority: authority,
+			status:    LeaderStatus{Role: LeaderRoleActive, Authority: authority},
+		},
+	}
+
+	if err := runner.runOnce(ctx); err != nil {
+		t.Fatalf("runOnce without published leader fence: %v", err)
+	}
+
+	var schedulerRuns int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM internal_scheduler_runs
+		WHERE channel_profile_id = $1::uuid
+	`, fixture.ChannelID).Scan(&schedulerRuns); err != nil {
+		t.Fatalf("count scheduler runs: %v", err)
+	}
+	var queueItems int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM channel_ops_queue_items
+		WHERE channel_profile_id = $1::uuid
+	`, fixture.ChannelID).Scan(&queueItems); err != nil {
+		t.Fatalf("count scheduled queue items: %v", err)
+	}
+	if schedulerRuns != 0 || queueItems != 0 {
+		t.Fatalf("unfenced scheduler side effects = runs %d queue items %d", schedulerRuns, queueItems)
+	}
+}
+
+func TestRunnerLeadershipEpochClaimOwner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	now := fixture.Store.Now()
+	lease := acquireLeaderTestLease(t, ctx, fixture.Store, "channelops-go@colima-127:1", now)
+	defer func() {
+		releaseLeaderTestLease(t, ctx, lease, now.Add(time.Minute))
+		fixture.ResetLeaderEpoch(ctx)
+		fixture.Close(ctx)
+	}()
+	authority := lease.Authority()
+	if authority.Epoch <= 0 {
+		t.Fatalf("leader epoch = %d, want positive", authority.Epoch)
+	}
+
+	channelID := fixture.ChannelID
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueIngestDiscovery,
+		IdempotencyKey: "runner-leadership-epoch:" + channelID,
+		Payload: map[string]any{
+			"channel_id": channelID, "source": "youtube_search",
+			"bucket": "2026-07-23-18", "scheduler_bucket": "2026-07-23-18",
+		},
+		Priority: 80, ChannelProfileID: &channelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue epoch claim: %v", err)
+	}
+	wantOwner := fmt.Sprintf("%s:epoch:%d", authority.HolderID, authority.Epoch)
+	var claimedOwner string
+	client := &recordingDiscoveryClient{ingest: func(request DiscoveryIngestRequest) (DiscoveryObservation, error) {
+		if err := fixture.Store.Pool.QueryRow(ctx, `
+			SELECT locked_by
+			FROM channel_ops_queue_items
+			WHERE id = $1::uuid
+		`, queueID).Scan(&claimedOwner); err != nil {
+			return DiscoveryObservation{}, err
+		}
+		return discoveryObservationForTest(request), nil
+	}}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+	runner := &Runner{
+		Config:   Config{RunnerID: authority.HolderID, SchedulerPollSeconds: 60},
+		Store:    fixture.Store,
+		Handlers: handler,
+		Leadership: &fakeLeadershipController{
+			authority: &authority,
+			status:    LeaderStatus{Role: LeaderRoleActive, Authority: &authority},
+		},
+	}
+	runner.SetLastSchedulerRun(now)
+
+	if err := runner.runOnce(ctx); err != nil {
+		t.Fatalf("active epoch runOnce: %v", err)
+	}
+	if claimedOwner != wantOwner {
+		t.Fatalf("locked_by = %q, want %q", claimedOwner, wantOwner)
+	}
+}
+
+func TestRunnerLeadershipLossReturnsStandbyWithoutClaim(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	defer func() {
+		fixture.ResetLeaderEpoch(ctx)
+		fixture.Close(ctx)
+	}()
+	now := fixture.Store.Now()
+	leadership := newPostgresLeadershipController(fixture.Store, "channelops-go@colima-127:1")
+	authority, err := leadership.EnsureActive(ctx, now)
+	if err != nil || authority == nil {
+		t.Fatalf("initial EnsureActive = authority %#v, err %v", authority, err)
+	}
+
+	channelID := fixture.ChannelID
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueIngestDiscovery,
+		IdempotencyKey: "runner-leadership-loss:" + channelID,
+		Payload: map[string]any{
+			"channel_id": channelID, "source": "youtube_search",
+			"bucket": "2026-07-23-18", "scheduler_bucket": "2026-07-23-18",
+		},
+		Priority: 80, ChannelProfileID: &channelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue leadership-loss item: %v", err)
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channelops_leader_epochs
+		SET epoch = epoch + 1
+		WHERE service_name = $1
+	`, leaderServiceName); err != nil {
+		t.Fatalf("advance leader epoch: %v", err)
+	}
+	client := &recordingDiscoveryClient{}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+	runner := &Runner{
+		Config:     Config{SchedulerPollSeconds: 60},
+		Store:      fixture.Store,
+		Handlers:   handler,
+		Leadership: leadership,
+	}
+	runner.SetLastSchedulerRun(now)
+
+	if err := runner.runOnce(ctx); err != nil {
+		t.Fatalf("runOnce after authority loss: %v", err)
+	}
+	if status := leadership.Status(); status.Role != LeaderRoleStandby {
+		t.Fatalf("leader role after authority loss = %q, want standby", status.Role)
+	}
+	if client.calls != 0 {
+		t.Fatalf("handler calls after authority loss = %d, want 0", client.calls)
+	}
+	var queueStatus string
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status FROM channel_ops_queue_items WHERE id = $1::uuid
+	`, queueID).Scan(&queueStatus); err != nil {
+		t.Fatalf("read leadership-loss queue item: %v", err)
+	}
+	if queueStatus != QueueStatusQueued {
+		t.Fatalf("queue status after authority loss = %q, want queued", queueStatus)
+	}
+}
+
+func TestRunnerLeadershipClosePrecedesStoreClose(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	cfg := LoadConfig()
+	store, err := OpenStore(ctx, cfg.DatabaseURL)
+	if err != nil {
+		if os.Getenv("CHANNELOPS_REQUIRE_DATABASE") == "1" {
+			t.Fatalf("required ChannelOps integration DATABASE_URL %q is unreachable: %v", cfg.DatabaseURL, err)
+		}
+		t.Skipf("ChannelOps integration test requires reachable DATABASE_URL %q: %v", cfg.DatabaseURL, err)
+	}
+	now := time.Date(2026, 7, 23, 19, 0, 0, 0, time.UTC)
+	store.Now = func() time.Time { return now }
+	checkedOpen := false
+	leadership := &fakeLeadershipController{
+		status: LeaderStatus{Role: LeaderRoleStandby},
+		closeHook: func(closeCtx context.Context, closeNow time.Time) error {
+			if _, ok := closeCtx.Deadline(); !ok {
+				return errors.New("leadership close context has no deadline")
+			}
+			if closeCtx.Err() != nil {
+				return fmt.Errorf("leadership close context is already canceled: %w", closeCtx.Err())
+			}
+			if !closeNow.Equal(now) {
+				return fmt.Errorf("leadership close time = %s, want %s", closeNow, now)
+			}
+			if err := store.Pool.Ping(closeCtx); err != nil {
+				return fmt.Errorf("store closed before leadership: %w", err)
+			}
+			checkedOpen = true
+			return nil
+		},
+	}
+	runner := &Runner{Store: store, Leadership: leadership}
+
+	runner.Close()
+
+	if leadership.closeCalls != 1 || !checkedOpen {
+		t.Fatalf("leadership close = calls %d checked store open %t", leadership.closeCalls, checkedOpen)
+	}
+}
+
+func TestLeadershipControllerStatusAndCloseAreRaceSafe(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	defer func() {
+		fixture.ResetLeaderEpoch(ctx)
+		fixture.Close(ctx)
+	}()
+	now := fixture.Store.Now()
+	leadership := newPostgresLeadershipController(fixture.Store, "channelops-go@race:1")
+	authority, err := leadership.EnsureActive(ctx, now)
+	if err != nil || authority == nil {
+		t.Fatalf("initial EnsureActive = authority %#v, err %v", authority, err)
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan error, 9)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 100; j++ {
+				status := leadership.Status()
+				if status.Role != LeaderRoleActive && status.Role != LeaderRoleStandby && status.Role != LeaderRoleUnavailable {
+					errCh <- fmt.Errorf("invalid concurrent leader role %q", status.Role)
+					return
+				}
+				if status.Role == LeaderRoleActive && (status.Authority == nil || status.Authority.Epoch <= 0) {
+					errCh <- fmt.Errorf("invalid active status %#v", status)
+					return
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, ensureErr := leadership.EnsureActive(ctx, now.Add(time.Second))
+		if ensureErr != nil && !errors.Is(ensureErr, ErrLeaderAuthorityUnavailable) {
+			errCh <- fmt.Errorf("concurrent EnsureActive: %w", ensureErr)
+		}
+	}()
+	close(start)
+	if err := leadership.Close(ctx, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+	if status := leadership.Status(); status.Role != LeaderRoleStandby {
+		t.Fatalf("closed leader role = %q, want standby", status.Role)
+	}
+}
 
 func TestRunnerRunWaitsForCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -900,6 +1255,7 @@ func TestNewRunnerAppliesQueueMaxAttemptsConfig(t *testing.T) {
 		t.Skip("integration test skipped in short mode")
 	}
 	ctx := context.Background()
+	t.Setenv("CHANNELOPS_RUNNER_ID", "channelops-go@test:1")
 	cfg := LoadConfig()
 	cfg.LiveMode = false
 	cfg.MaxQueueAttempts = 6
@@ -912,5 +1268,11 @@ func TestNewRunnerAppliesQueueMaxAttemptsConfig(t *testing.T) {
 
 	if runner.Store.DefaultMaxAttempts != 6 {
 		t.Fatalf("DefaultMaxAttempts = %d, want 6", runner.Store.DefaultMaxAttempts)
+	}
+	if runner.Leadership == nil {
+		t.Fatal("NewRunner did not configure leadership")
+	}
+	if status := runner.Leadership.Status(); status.Role != LeaderRoleStandby {
+		t.Fatalf("new runner leader role = %q, want standby", status.Role)
 	}
 }

@@ -38,7 +38,7 @@ func main() {
 		errCh <- runner.Run(ctx)
 	}()
 
-	slog.Info("starting channelops-runner-go", "health_port", cfg.HealthPort)
+	slog.Info("starting channelops-runner-go", "health_port", cfg.HealthPort, "runner_id", cfg.RunnerID)
 	err = <-errCh
 	cancel()
 	if err != nil && !errors.Is(err, context.Canceled) {

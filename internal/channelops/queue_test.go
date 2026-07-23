@@ -3,6 +3,7 @@ package channelops
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -58,6 +59,61 @@ func TestClaimNextForKindsQueryFiltersAndOrdersLikePython(t *testing.T) {
 	}
 	if strings.Contains(claimNextForKindsQuery, "run_after ASC, created_at") {
 		t.Fatalf("claim query should not sort by run_after before created_at:\n%s", claimNextForKindsQuery)
+	}
+}
+
+func TestLeadershipRecoveryReusesFencedTransaction(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	now := fixture.Store.Now()
+	lease := acquireLeaderTestLease(t, ctx, fixture.Store, "channelops-go@recovery:1", now)
+	defer func() {
+		releaseLeaderTestLease(t, ctx, lease, now.Add(time.Minute))
+		fixture.ResetLeaderEpoch(ctx)
+		fixture.Close(ctx)
+	}()
+	queueID := enqueueDiscoveryRecoveryItem(t, ctx, fixture, 3)
+	staleLockedAt := now.Add(-time.Hour)
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET status = $2, attempt_count = 1,
+		    locked_by = 'crashed-runner', locked_at = $3
+		WHERE id = $1::uuid
+	`, queueID, QueueStatusRunning, staleLockedAt); err != nil {
+		t.Fatalf("seed stale discovery lease: %v", err)
+	}
+
+	rollback := errors.New("roll back recovery fence")
+	err := fixture.Store.WithLeaderExecutionFence(ctx, func(fencedStore *Store) error {
+		recovered, err := fencedStore.recoverStaleDiscoveryLeases(ctx, now)
+		if err != nil {
+			return err
+		}
+		if recovered != 1 {
+			return fmt.Errorf("recovered rows = %d, want 1", recovered)
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatalf("fenced recovery error = %v, want rollback sentinel", err)
+	}
+
+	var status, lockedBy string
+	var lockedAt time.Time
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT status, locked_by, locked_at
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+	`, queueID).Scan(&status, &lockedBy, &lockedAt); err != nil {
+		t.Fatalf("read rolled-back recovery row: %v", err)
+	}
+	if status != QueueStatusRunning || lockedBy != "crashed-runner" || !lockedAt.Equal(staleLockedAt) {
+		t.Fatalf("recovery escaped caller transaction = %s/%s/%s", status, lockedBy, lockedAt)
 	}
 }
 

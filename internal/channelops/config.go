@@ -3,13 +3,17 @@ package channelops
 import (
 	"errors"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
+var runnerIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.@:-]+$`)
+
 type Config struct {
 	DatabaseURL                  string
+	RunnerID                     string
 	YouTubeManagerURL            string
 	AutoFlowBaseURL              string
 	AutoFlowTimeout              time.Duration
@@ -44,6 +48,7 @@ func LoadConfig() Config {
 	discoveryTimeout, discoveryTimeoutParseFailed := discoveryTimeoutEnv()
 	return Config{
 		DatabaseURL:                  env("DATABASE_URL", "postgresql://vp:vp_secret@localhost:5435/videoprocess"),
+		RunnerID:                     env("CHANNELOPS_RUNNER_ID", ""),
 		YouTubeManagerURL:            env("YOUTUBE_MANAGER_URL", ""),
 		AutoFlowBaseURL:              env("AUTOFLOW_BASE_URL", "http://api:8080"),
 		AutoFlowTimeout:              time.Duration(floatEnv("AUTOFLOW_TIMEOUT_SECONDS", 10) * float64(time.Second)),
@@ -78,6 +83,12 @@ func LoadConfig() Config {
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.DatabaseURL) == "" {
 		return errors.New("DATABASE_URL is required")
+	}
+	if strings.TrimSpace(c.RunnerID) == "" {
+		return errors.New("CHANNELOPS_RUNNER_ID is required")
+	}
+	if !runnerIDPattern.MatchString(c.RunnerID) {
+		return errors.New("CHANNELOPS_RUNNER_ID contains unsupported characters")
 	}
 	if c.LiveMode && strings.TrimSpace(c.YouTubeManagerURL) == "" {
 		return errors.New("YOUTUBE_MANAGER_URL is required in live ChannelOps mode")

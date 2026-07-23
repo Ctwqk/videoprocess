@@ -13,10 +13,14 @@ import (
 var ErrUnhealthy = errors.New("channelops runner unhealthy")
 
 type HealthStatus struct {
-	Status           string            `json:"status"`
-	DB               string            `json:"db"`
-	LastSchedulerRun *time.Time        `json:"last_scheduler_run,omitempty"`
-	Errors           map[string]string `json:"errors,omitempty"`
+	Status            string            `json:"status"`
+	DB                string            `json:"db"`
+	LastSchedulerRun  *time.Time        `json:"last_scheduler_run,omitempty"`
+	LeaderRole        string            `json:"leader_role"`
+	LeaderEpoch       *int64            `json:"leader_epoch,omitempty"`
+	LeaderHolderID    string            `json:"leader_holder_id,omitempty"`
+	LeaderHeartbeatAt *time.Time        `json:"leader_heartbeat_at,omitempty"`
+	Errors            map[string]string `json:"errors,omitempty"`
 }
 
 func (s HealthStatus) Err() error {
@@ -60,19 +64,52 @@ func (r *Runner) HealthCheck(ctx context.Context) HealthStatus {
 }
 
 func (r *Runner) ReadyCheck(ctx context.Context) HealthStatus {
-	status := HealthStatus{Status: "ok", DB: "ok"}
+	status := HealthStatus{
+		Status:     "ok",
+		DB:         "ok",
+		LeaderRole: LeaderRoleUnavailable,
+	}
 	if r == nil || r.Store == nil || r.Store.Pool == nil {
 		status.DB = "unconfigured"
 		addHealthError(&status, "db", "store pool is not configured")
-		finalizeHealthStatus(&status)
-		return status
-	}
-	if err := r.Store.Pool.Ping(ctx); err != nil {
+	} else if err := r.Store.Pool.Ping(ctx); err != nil {
 		status.DB = "error"
 		addHealthError(&status, "db", err.Error())
 	}
+	if r != nil && r.Leadership != nil {
+		applyLeadershipHealth(&status, r.Leadership.Status())
+	}
 	finalizeHealthStatus(&status)
 	return status
+}
+
+func applyLeadershipHealth(status *HealthStatus, leadership LeaderStatus) {
+	switch leadership.Role {
+	case LeaderRoleActive:
+		status.LeaderRole = LeaderRoleActive
+		if leadership.Authority == nil {
+			addHealthError(status, "leadership", "active leader authority is unavailable")
+			return
+		}
+		epoch := leadership.Authority.Epoch
+		heartbeat := leadership.Authority.HeartbeatAt.UTC()
+		status.LeaderEpoch = &epoch
+		status.LeaderHolderID = leadership.Authority.HolderID
+		status.LeaderHeartbeatAt = &heartbeat
+	case LeaderRoleStandby:
+		status.LeaderRole = LeaderRoleStandby
+		addHealthError(status, "leadership", "leader is standby")
+	case LeaderRoleUnavailable:
+		status.LeaderRole = LeaderRoleUnavailable
+		message := ErrLeaderAuthorityUnavailable.Error()
+		if leadership.Err != nil {
+			message = leadership.Err.Error()
+		}
+		addHealthError(status, "leadership", message)
+	default:
+		status.LeaderRole = LeaderRoleUnavailable
+		addHealthError(status, "leadership", "leader status is unavailable")
+	}
 }
 
 func NewHealthHandler(checker HealthChecker) http.Handler {

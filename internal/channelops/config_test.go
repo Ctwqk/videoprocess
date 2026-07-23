@@ -10,6 +10,7 @@ import (
 func validConfig() Config {
 	return Config{
 		DatabaseURL:                  "postgresql://vp:vp@localhost:5432/vp",
+		RunnerID:                     "channelops-go@test:1",
 		YouTubeManagerURL:            "http://youtube:8899",
 		AutoFlowBaseURL:              "http://api:8080",
 		AutoFlowTimeout:              10 * time.Second,
@@ -30,6 +31,43 @@ func validConfig() Config {
 		RetentionQueueDays:           30,
 		RetentionAuditDays:           90,
 		RetentionFeedbackDays:        365,
+	}
+}
+
+func TestLoadConfigRunnerID(t *testing.T) {
+	t.Setenv("CHANNELOPS_RUNNER_ID", "channelops-go@colima-127:1")
+
+	cfg := LoadConfig()
+
+	if cfg.RunnerID != "channelops-go@colima-127:1" {
+		t.Fatalf("RunnerID = %q, want channelops-go@colima-127:1", cfg.RunnerID)
+	}
+}
+
+func TestValidateRunnerID(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		runnerID string
+		wantErr  bool
+	}{
+		{name: "supported", runnerID: "channelops-go@colima-127:1"},
+		{name: "blank", runnerID: " \t ", wantErr: true},
+		{name: "space", runnerID: "channelops go", wantErr: true},
+		{name: "slash", runnerID: "channelops-go/runner", wantErr: true},
+		{name: "unicode", runnerID: "channelops-go@runner-\u00f8ne", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.RunnerID = tt.runnerID
+
+			err := cfg.Validate()
+			if tt.wantErr && (err == nil || !strings.Contains(err.Error(), "CHANNELOPS_RUNNER_ID")) {
+				t.Fatalf("Validate() error = %v, want CHANNELOPS_RUNNER_ID validation error", err)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+		})
 	}
 }
 
@@ -114,6 +152,7 @@ func TestLoadConfigStrictDiscoveryTimeoutEnv(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS", tt.value)
 			t.Setenv("CHANNELOPS_LIVE_MODE", "false")
+			t.Setenv("CHANNELOPS_RUNNER_ID", "channelops-go@test:1")
 			cfg := LoadConfig()
 			if cfg.DiscoveryTimeout != tt.want {
 				t.Fatalf("DiscoveryTimeout = %s, want %s", cfg.DiscoveryTimeout, tt.want)

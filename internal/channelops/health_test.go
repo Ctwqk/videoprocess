@@ -29,6 +29,89 @@ func TestRunnerHealthCheckRejectsStaleSchedulerRun(t *testing.T) {
 	}
 }
 
+func TestRunnerHealthReportsActiveLeaderRoleAndEpoch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	defer fixture.Close(ctx)
+	heartbeat := time.Date(2026, 7, 23, 18, 2, 3, 0, time.UTC)
+	authority := &LeaderAuthority{
+		ServiceName: leaderServiceName,
+		HolderID:    "channelops-go@colima-127:1",
+		Epoch:       42,
+		AcquiredAt:  heartbeat.Add(-time.Minute),
+		HeartbeatAt: heartbeat,
+	}
+	runner := &Runner{
+		Store: fixture.Store,
+		Leadership: &fakeLeadershipController{
+			authority: authority,
+			status:    LeaderStatus{Role: LeaderRoleActive, Authority: authority},
+		},
+	}
+	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	recorder := httptest.NewRecorder()
+
+	NewReadyHandler(runner).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload HealthStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode active health response: %v", err)
+	}
+	if payload.LeaderRole != LeaderRoleActive ||
+		payload.LeaderEpoch == nil || *payload.LeaderEpoch != authority.Epoch ||
+		payload.LeaderHolderID != authority.HolderID ||
+		payload.LeaderHeartbeatAt == nil || !payload.LeaderHeartbeatAt.Equal(heartbeat) {
+		t.Fatalf("active leader health = %#v", payload)
+	}
+}
+
+func TestRunnerReadyRejectsStandbyAndUnavailableLeaderRoles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	for _, tt := range []struct {
+		name   string
+		status LeaderStatus
+	}{
+		{name: "standby", status: LeaderStatus{Role: LeaderRoleStandby}},
+		{name: "unavailable", status: LeaderStatus{Role: LeaderRoleUnavailable, Err: errors.New("database unavailable")}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			runner := &Runner{
+				Store:      fixture.Store,
+				Leadership: &fakeLeadershipController{status: tt.status},
+			}
+			request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+			recorder := httptest.NewRecorder()
+
+			NewReadyHandler(runner).ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status code = %d, want 503; body=%s", recorder.Code, recorder.Body.String())
+			}
+			var payload HealthStatus
+			if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode non-active health response: %v", err)
+			}
+			if payload.LeaderRole != tt.status.Role {
+				t.Fatalf("leader role = %q, want %q", payload.LeaderRole, tt.status.Role)
+			}
+			if _, ok := payload.Errors["leadership"]; !ok {
+				t.Fatalf("leadership error missing from %#v", payload)
+			}
+		})
+	}
+}
+
 func TestRunnerHealthCheckUsesThrottledSchedulerStaleness(t *testing.T) {
 	now := time.Date(2026, 6, 7, 17, 20, 0, 0, time.UTC) // 10:20 PDT
 	runner := &Runner{
