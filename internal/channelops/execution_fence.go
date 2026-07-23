@@ -16,49 +16,37 @@ var (
 )
 
 func (s *Store) WithQueueExecutionFence(ctx context.Context, item QueueItemRow, dispatch func(*Store) error) error {
-	tx, err := s.Pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(ctx)
-		}
-	}()
-
-	channelID, err := resolveQueueAuthority(ctx, tx, item)
-	if err != nil {
-		return err
-	}
-	if channelID != nil {
-		if item.ChannelProfileID == nil {
-			return fmt.Errorf(
-				"%w: stored channel is null, authoritative channel %s",
-				ErrQueueAuthorityInvalid,
-				*channelID,
-			)
-		}
-		if !strings.EqualFold(*item.ChannelProfileID, *channelID) {
-			return fmt.Errorf(
-				"%w: queue authority mismatch: stored channel %s, authoritative channel %s",
-				ErrQueueAuthorityInvalid,
-				*item.ChannelProfileID,
-				*channelID,
-			)
-		}
-		if err := lockExecutableChannel(ctx, tx, *channelID, queueKindRequiresOpenIntake(item.Kind)); err != nil {
+	return s.withExecutionTransaction(ctx, func(tx pgx.Tx) error {
+		if err := s.assertLeaderAuthority(ctx, tx, false); err != nil {
 			return err
 		}
-	}
-	if err := dispatch(s.withExecutionDB(tx, channelID)); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+
+		channelID, err := resolveQueueAuthority(ctx, tx, item)
+		if err != nil {
+			return err
+		}
+		if channelID != nil {
+			if item.ChannelProfileID == nil {
+				return fmt.Errorf(
+					"%w: stored channel is null, authoritative channel %s",
+					ErrQueueAuthorityInvalid,
+					*channelID,
+				)
+			}
+			if !strings.EqualFold(*item.ChannelProfileID, *channelID) {
+				return fmt.Errorf(
+					"%w: queue authority mismatch: stored channel %s, authoritative channel %s",
+					ErrQueueAuthorityInvalid,
+					*item.ChannelProfileID,
+					*channelID,
+				)
+			}
+			if err := lockExecutableChannel(ctx, tx, *channelID, queueKindRequiresOpenIntake(item.Kind)); err != nil {
+				return err
+			}
+		}
+		return dispatch(s.withExecutionDB(tx, channelID))
+	})
 }
 
 func (s *Store) WithChannelExecutionFence(ctx context.Context, channelID string, dispatch func(*Store) error) error {
@@ -74,28 +62,37 @@ func (s *Store) withChannelExecutionFence(
 	if err := requireUUID("channel_profile_id", channelID); err != nil {
 		return fmt.Errorf("%w: %v", ErrChannelExecutionBlocked, err)
 	}
-	tx, err := s.Pool.Begin(ctx)
+	return s.withExecutionTransaction(ctx, func(tx pgx.Tx) error {
+		if err := s.assertLeaderAuthority(ctx, tx, false); err != nil {
+			return err
+		}
+		if err := lockExecutableChannel(ctx, tx, channelID, requireOpenIntake); err != nil {
+			return err
+		}
+		return dispatch(s.withExecutionDB(tx, &channelID))
+	})
+}
+
+func (s *Store) withExecutionTransaction(
+	ctx context.Context,
+	dispatch func(pgx.Tx) error,
+) error {
+	tx, ownsTransaction, err := s.beginOrReuse(ctx)
 	if err != nil {
 		return err
 	}
-	committed := false
-	defer func() {
-		if !committed {
+	if ownsTransaction {
+		defer func() {
 			_ = tx.Rollback(ctx)
-		}
-	}()
-
-	if err := lockExecutableChannel(ctx, tx, channelID, requireOpenIntake); err != nil {
+		}()
+	}
+	if err := dispatch(tx); err != nil {
 		return err
 	}
-	if err := dispatch(s.withExecutionDB(tx, &channelID)); err != nil {
-		return err
+	if !ownsTransaction {
+		return nil
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+	return tx.Commit(ctx)
 }
 
 func resolveQueueAuthority(ctx context.Context, db dbExecutor, item QueueItemRow) (*string, error) {

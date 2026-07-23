@@ -2691,6 +2691,16 @@ func NewChannelOpsFixture(t *testing.T) *ChannelOpsFixture {
 	return fixture
 }
 
+func (f *ChannelOpsFixture) ResetLeaderEpoch(ctx context.Context) {
+	f.T.Helper()
+	if _, err := f.Store.Pool.Exec(ctx, `
+		DELETE FROM channelops_leader_epochs
+		WHERE service_name = 'channelops-go'
+	`); err != nil {
+		f.T.Fatalf("reset channelops leader epoch: %v", err)
+	}
+}
+
 func TestExecutionFenceBlocksIntakeButAllowsDownstreamWhenPaused(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
