@@ -523,3 +523,119 @@ func TestReleaseQueueClaimRestoresAttemptWithoutBackoffAndUsesExactLease(t *test
 		)
 	}
 }
+
+func TestPostClaimCleanupTreatsReplacedLeaseAsTransferred(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	for _, tt := range []struct {
+		name     string
+		complete func(context.Context, *Store, QueueItemRow) error
+	}{
+		{
+			name: "committed success",
+			complete: func(ctx context.Context, store *Store, item QueueItemRow) error {
+				canceledCtx, cancel := context.WithCancel(ctx)
+				cancel()
+				return completeCommittedQueueClaim(canceledCtx, store, item)
+			},
+		},
+		{
+			name: "interrupted release",
+			complete: func(ctx context.Context, store *Store, item QueueItemRow) error {
+				canceledCtx, cancel := context.WithCancel(ctx)
+				cancel()
+				return releaseExactQueueClaim(canceledCtx, store, item)
+			},
+		},
+		{
+			name: "business failure fallback",
+			complete: func(ctx context.Context, store *Store, item QueueItemRow) error {
+				return completeUncommittedQueueClaim(
+					ctx,
+					store,
+					item,
+					errors.New("business failure"),
+					false,
+				)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := NewChannelOpsFixture(t)
+			defer fixture.Close(ctx)
+			fixture.InsertChannelWithLaneAccountSeed(ctx)
+			itemID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+				Kind:             QueueAccountHealth,
+				IdempotencyKey:   "account_health:transferred:" + tt.name + ":" + fixture.AccountID,
+				Payload:          map[string]any{"account_id": fixture.AccountID},
+				Priority:         1,
+				ChannelProfileID: &fixture.ChannelID,
+			})
+			if err != nil {
+				t.Fatalf("enqueue transferred claim: %v", err)
+			}
+			stale, err := fixture.Store.ClaimNextForKinds(
+				ctx,
+				"stale-cleanup-worker",
+				[]string{QueueAccountHealth},
+			)
+			if err != nil || stale == nil || stale.ID != itemID {
+				t.Fatalf("claim stale cleanup item = %#v, %v", stale, err)
+			}
+			if _, err := fixture.Store.Pool.Exec(ctx, `
+				UPDATE channel_ops_queue_items
+				SET status = $2,
+				    attempt_count = GREATEST(attempt_count - 1, 0),
+				    locked_by = NULL,
+				    locked_at = NULL
+				WHERE id = $1::uuid
+			`, itemID, QueueStatusQueued); err != nil {
+				t.Fatalf("return stale cleanup item: %v", err)
+			}
+			replacement, err := fixture.Store.ClaimNextForKinds(
+				ctx,
+				"replacement-cleanup-worker",
+				[]string{QueueAccountHealth},
+			)
+			if err != nil || replacement == nil || replacement.ID != itemID {
+				t.Fatalf("claim replacement cleanup item = %#v, %v", replacement, err)
+			}
+
+			if err := tt.complete(ctx, fixture.Store, *stale); err != nil {
+				t.Fatalf("complete stale claim: %v", err)
+			}
+
+			var status string
+			var attemptCount int
+			var lockedBy string
+			var lockedAt time.Time
+			if err := fixture.Store.Pool.QueryRow(ctx, `
+				SELECT status, attempt_count, locked_by, locked_at
+				FROM channel_ops_queue_items
+				WHERE id = $1::uuid
+			`, itemID).Scan(
+				&status,
+				&attemptCount,
+				&lockedBy,
+				&lockedAt,
+			); err != nil {
+				t.Fatalf("read transferred replacement claim: %v", err)
+			}
+			if status != QueueStatusRunning ||
+				attemptCount != replacement.AttemptCount ||
+				lockedBy != *replacement.LockedBy ||
+				replacement.LockedAt == nil ||
+				!lockedAt.Equal(*replacement.LockedAt) {
+				t.Fatalf(
+					"replacement claim changed to %s attempt=%d owner=%q locked_at=%s",
+					status,
+					attemptCount,
+					lockedBy,
+					lockedAt,
+				)
+			}
+		})
+	}
+}
