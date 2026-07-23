@@ -12,6 +12,8 @@ import (
 
 var ErrUnhealthy = errors.New("channelops runner unhealthy")
 
+const runnerReadinessLeadershipTimeout = 2 * time.Second
+
 type HealthStatus struct {
 	Status            string            `json:"status"`
 	DB                string            `json:"db"`
@@ -77,10 +79,26 @@ func (r *Runner) ReadyCheck(ctx context.Context) HealthStatus {
 		addHealthError(&status, "db", err.Error())
 	}
 	if r != nil && r.Leadership != nil {
-		applyLeadershipHealth(&status, r.Leadership.Status())
+		applyLeadershipHealth(&status, r.validatedReadinessLeadership(ctx))
 	}
 	finalizeHealthStatus(&status)
 	return status
+}
+
+func (r *Runner) validatedReadinessLeadership(ctx context.Context) LeaderStatus {
+	validationCtx, cancel := context.WithTimeout(ctx, runnerReadinessLeadershipTimeout)
+	defer cancel()
+	authority, err := r.Leadership.EnsureActive(validationCtx, r.now())
+	if err != nil {
+		return LeaderStatus{Role: LeaderRoleUnavailable, Err: err}
+	}
+	if authority == nil {
+		return LeaderStatus{Role: LeaderRoleStandby}
+	}
+	return LeaderStatus{
+		Role:      LeaderRoleActive,
+		Authority: cloneLeaderAuthorityPointer(authority),
+	}
 }
 
 func applyLeadershipHealth(status *HealthStatus, leadership LeaderStatus) {

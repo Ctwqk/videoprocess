@@ -71,6 +71,77 @@ func TestRunnerHealthReportsActiveLeaderRoleAndEpoch(t *testing.T) {
 	}
 }
 
+func TestRunnerReadyRejectsDroppedDedicatedLeaderSessionWithoutStaleAuthority(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	now := fixture.Store.Now()
+	leadership := newPostgresLeadershipController(
+		fixture.Store,
+		"channelops-go@ready-drop:1",
+	).(*postgresLeadershipController)
+	defer func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
+		_ = leadership.Close(closeCtx, now.Add(2*time.Second))
+		closeCancel()
+		fixture.ResetLeaderEpoch(context.Background())
+		fixture.Close(context.Background())
+	}()
+	authority, err := leadership.EnsureActive(ctx, now)
+	if err != nil || authority == nil {
+		t.Fatalf("acquire readiness leader = %#v, %v", authority, err)
+	}
+	runner := &Runner{Store: fixture.Store, Leadership: leadership}
+
+	initialRequest := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	initialRecorder := httptest.NewRecorder()
+	NewReadyHandler(runner).ServeHTTP(initialRecorder, initialRequest)
+	if initialRecorder.Code != http.StatusOK {
+		t.Fatalf(
+			"initial readiness status = %d, want 200; body=%s",
+			initialRecorder.Code,
+			initialRecorder.Body.String(),
+		)
+	}
+
+	dropLeaderTestSession(t, ctx, leadership.lease)
+	requestCtx, requestCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer requestCancel()
+	request := httptest.NewRequest(http.MethodGet, "/readyz", nil).WithContext(requestCtx)
+	recorder := httptest.NewRecorder()
+	startedAt := time.Now()
+	NewReadyHandler(runner).ServeHTTP(recorder, request)
+	elapsed := time.Since(startedAt)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf(
+			"dropped-session readiness status = %d, want 503; body=%s",
+			recorder.Code,
+			recorder.Body.String(),
+		)
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("dropped-session readiness took %s, want less than 3s", elapsed)
+	}
+	var payload HealthStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode dropped-session health response: %v", err)
+	}
+	if payload.LeaderRole == LeaderRoleActive ||
+		payload.LeaderEpoch != nil ||
+		payload.LeaderHolderID != "" ||
+		payload.LeaderHeartbeatAt != nil {
+		t.Fatalf("dropped-session readiness leaked stale authority: %#v", payload)
+	}
+	if _, ok := payload.Errors["leadership"]; !ok {
+		t.Fatalf("dropped-session leadership error missing from %#v", payload)
+	}
+}
+
 func TestRunnerReadyRejectsStandbyAndUnavailableLeaderRoles(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
@@ -86,9 +157,13 @@ func TestRunnerReadyRejectsStandbyAndUnavailableLeaderRoles(t *testing.T) {
 			ctx := context.Background()
 			fixture := NewChannelOpsFixture(t)
 			defer fixture.Close(ctx)
+			leadership := &fakeLeadershipController{status: tt.status}
+			if tt.status.Role == LeaderRoleUnavailable {
+				leadership.ensureErr = tt.status.Err
+			}
 			runner := &Runner{
 				Store:      fixture.Store,
-				Leadership: &fakeLeadershipController{status: tt.status},
+				Leadership: leadership,
 			}
 			request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 			recorder := httptest.NewRecorder()
