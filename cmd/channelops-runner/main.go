@@ -16,7 +16,7 @@ import (
 
 type managedRunner interface {
 	Run(context.Context) error
-	Close()
+	Close() error
 	Handler() http.Handler
 }
 
@@ -28,8 +28,8 @@ func (r channelOpsManagedRunner) Run(ctx context.Context) error {
 	return r.runner.Run(ctx)
 }
 
-func (r channelOpsManagedRunner) Close() {
-	r.runner.Close()
+func (r channelOpsManagedRunner) Close() error {
+	return r.runner.Close()
 }
 
 func (r channelOpsManagedRunner) Handler() http.Handler {
@@ -88,8 +88,6 @@ func runWithDependencies(deps runDependencies) int {
 		slog.Error("create ChannelOps runner", "error", err)
 		return 1
 	}
-	defer runner.Close()
-
 	resultCh := make(chan componentResult, 2)
 	go func() {
 		resultCh <- componentResult{
@@ -105,11 +103,19 @@ func runWithDependencies(deps runDependencies) int {
 	first := <-resultCh
 	cancel()
 	second := <-resultCh
+	failed := false
 	for _, result := range []componentResult{first, second} {
 		if result.err != nil && !errors.Is(result.err, context.Canceled) {
 			slog.Error("channelops-runner-go stopped", "component", result.name, "error", result.err)
-			return 1
+			failed = true
 		}
+	}
+	if err := runner.Close(); err != nil {
+		slog.Error("channelops-runner-go close failed", "error", err)
+		failed = true
+	}
+	if failed {
+		return 1
 	}
 	slog.Info("channelops-runner-go stopped cleanly", "at", time.Now().UTC())
 	return 0

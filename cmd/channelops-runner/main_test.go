@@ -13,15 +13,15 @@ import (
 
 type fakeManagedRunner struct {
 	run   func(context.Context) error
-	close func()
+	close func() error
 }
 
 func (r *fakeManagedRunner) Run(ctx context.Context) error {
 	return r.run(ctx)
 }
 
-func (r *fakeManagedRunner) Close() {
-	r.close()
+func (r *fakeManagedRunner) Close() error {
+	return r.close()
 }
 
 func (*fakeManagedRunner) Handler() http.Handler {
@@ -36,11 +36,12 @@ func TestRunWithDependenciesClosesAfterJoiningServerOnRunnerError(t *testing.T) 
 		run: func(context.Context) error {
 			return runnerErr
 		},
-		close: func() {
+		close: func() error {
 			if !serverJoined.Load() {
 				t.Error("runner closed before HTTP server joined")
 			}
 			closed.Store(true)
+			return nil
 		},
 	}
 	deps := runDependencies{
@@ -78,11 +79,12 @@ func TestRunWithDependenciesClosesAfterJoiningRunnerOnServerError(t *testing.T) 
 			runnerJoined.Store(true)
 			return ctx.Err()
 		},
-		close: func() {
+		close: func() error {
 			if !runnerJoined.Load() {
 				t.Error("runner closed before runner goroutine joined")
 			}
 			closed.Store(true)
+			return nil
 		},
 	}
 	deps := runDependencies{
@@ -105,6 +107,42 @@ func TestRunWithDependenciesClosesAfterJoiningRunnerOnServerError(t *testing.T) 
 	}
 	if !closed.Load() {
 		t.Fatal("runner was not closed")
+	}
+}
+
+func TestRunWithDependenciesReturnsFailureWhenRunnerCloseFails(t *testing.T) {
+	closeErr := errors.New("leadership operation did not join")
+	var closed atomic.Bool
+	runner := &fakeManagedRunner{
+		run: func(context.Context) error {
+			return nil
+		},
+		close: func() error {
+			closed.Store(true)
+			return closeErr
+		},
+	}
+	deps := runDependencies{
+		loadConfig: runnerMainTestConfig,
+		signalContext: func() (context.Context, context.CancelFunc) {
+			return context.WithCancel(context.Background())
+		},
+		newRunner: func(context.Context, channelops.Config) (managedRunner, error) {
+			return runner, nil
+		},
+		runHTTPServer: func(ctx context.Context, _ string, _ http.Handler) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	code := runWithDependencies(deps)
+
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !closed.Load() {
+		t.Fatal("runner Close was not called")
 	}
 }
 

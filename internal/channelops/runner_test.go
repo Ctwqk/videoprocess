@@ -533,7 +533,9 @@ func TestRunnerLeadershipClosePrecedesStoreClose(t *testing.T) {
 	}
 	runner := &Runner{Store: store, Leadership: leadership}
 
-	runner.Close()
+	if err := runner.Close(); err != nil {
+		t.Fatalf("runner Close: %v", err)
+	}
 
 	if leadership.closeCalls != 1 || !checkedOpen {
 		t.Fatalf("leadership close = calls %d checked store open %t", leadership.closeCalls, checkedOpen)
@@ -651,7 +653,7 @@ func TestLeadershipControllerStatusReportsStandbyAfterExecutionFenceLoss(t *test
 	}
 }
 
-func TestLeadershipControllerBlockedAcquireDoesNotBlockStatusAndCloseHonorsContext(t *testing.T) {
+func TestLeadershipControllerCloseCancelsAndJoinsBlockedAcquire(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
@@ -663,15 +665,10 @@ func TestLeadershipControllerBlockedAcquireDoesNotBlockStatusAndCloseHonorsConte
 		fixture.Close(ctx)
 	}()
 	attemptStarted := make(chan struct{})
-	unblockAttempt := make(chan struct{})
 	fixture.Store.leaderLockAttempt = func(ctx context.Context, _ *pgxpool.Conn) (bool, error) {
 		close(attemptStarted)
-		select {
-		case <-unblockAttempt:
-			return false, nil
-		case <-ctx.Done():
-			return false, ctx.Err()
-		}
+		<-ctx.Done()
+		return false, ctx.Err()
 	}
 	leadership := newPostgresLeadershipController(fixture.Store, "channelops-go@blocked-acquire:1")
 	ensureDone := make(chan error, 1)
@@ -683,47 +680,47 @@ func TestLeadershipControllerBlockedAcquireDoesNotBlockStatusAndCloseHonorsConte
 
 	statusDone := make(chan LeaderStatus, 1)
 	go func() { statusDone <- leadership.Status() }()
-	closeCtx, cancel := context.WithTimeout(ctx, 25*time.Millisecond)
+	closeCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- leadership.Close(closeCtx, fixture.Store.Now()) }()
 
 	var status LeaderStatus
-	statusReturned := false
 	select {
 	case status = <-statusDone:
-		statusReturned = true
 	case <-time.After(100 * time.Millisecond):
-	}
-	var closeErr error
-	closeReturned := false
-	select {
-	case closeErr = <-closeDone:
-		closeReturned = true
-	case <-time.After(100 * time.Millisecond):
-	}
-	close(unblockAttempt)
-	if err := <-ensureDone; err != nil {
-		t.Fatalf("blocked EnsureActive: %v", err)
-	}
-	if !statusReturned {
 		t.Fatal("Status blocked behind leader acquisition")
+	}
+	startedClose := time.Now()
+	if err := leadership.Close(closeCtx, fixture.Store.Now()); err != nil {
+		t.Fatalf("cancel blocked acquisition: %v", err)
+	}
+	if elapsed := time.Since(startedClose); elapsed >= time.Second {
+		t.Fatalf("blocked acquisition Close took %s", elapsed)
+	}
+	if err := <-ensureDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked EnsureActive error = %v, want context canceled", err)
 	}
 	if status.Role != LeaderRoleStandby {
 		t.Fatalf("blocked acquisition status role = %q, want standby", status.Role)
 	}
-	if !closeReturned {
-		t.Fatal("Close ignored its context while waiting for leader acquisition")
+	secondStore, err := OpenStore(ctx, LoadConfig().DatabaseURL)
+	if err != nil {
+		t.Fatalf("open replacement store: %v", err)
 	}
-	if !errors.Is(closeErr, context.DeadlineExceeded) {
-		t.Fatalf("blocked Close error = %v, want context deadline exceeded", closeErr)
+	defer secondStore.Close()
+	replacement, acquired, err := secondStore.TryAcquireLeader(
+		ctx,
+		"channelops-go@blocked-acquire-replacement:1",
+		fixture.Store.Now().Add(time.Second),
+	)
+	if err != nil || !acquired || replacement == nil {
+		t.Fatalf("replacement after canceled acquisition = %#v, %t, %v", replacement, acquired, err)
 	}
-	if err := leadership.Close(ctx, fixture.Store.Now().Add(time.Second)); err != nil {
-		t.Fatalf("cleanup Close: %v", err)
+	if err := replacement.Release(ctx, fixture.Store.Now().Add(2*time.Second)); err != nil {
+		t.Fatalf("release replacement: %v", err)
 	}
 }
 
-func TestLeadershipControllerBlockedHeartbeatDoesNotBlockStatusAndCloseHonorsContext(t *testing.T) {
+func TestLeadershipControllerCloseCancelsAndJoinsBlockedHeartbeat(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
@@ -735,7 +732,10 @@ func TestLeadershipControllerBlockedHeartbeatDoesNotBlockStatusAndCloseHonorsCon
 		fixture.Close(ctx)
 	}()
 	now := fixture.Store.Now()
-	leadership := newPostgresLeadershipController(fixture.Store, "channelops-go@blocked-heartbeat:1")
+	leadership := newPostgresLeadershipController(
+		fixture.Store,
+		"channelops-go@blocked-heartbeat:1",
+	).(*postgresLeadershipController)
 	authority, err := leadership.EnsureActive(ctx, now)
 	if err != nil || authority == nil {
 		t.Fatalf("initial EnsureActive = %#v, %v", authority, err)
@@ -757,49 +757,145 @@ func TestLeadershipControllerBlockedHeartbeatDoesNotBlockStatusAndCloseHonorsCon
 		_, err := leadership.EnsureActive(ctx, now.Add(time.Second))
 		heartbeatDone <- err
 	}()
-	time.Sleep(25 * time.Millisecond)
+	waitForPostgresLockWait(
+		t,
+		ctx,
+		fixture.Store,
+		leadership.lease.conn.Conn().PgConn().PID(),
+		"blocked leader heartbeat",
+	)
 
 	statusDone := make(chan LeaderStatus, 1)
 	go func() { statusDone <- leadership.Status() }()
-	closeCtx, cancel := context.WithTimeout(ctx, 25*time.Millisecond)
+	closeCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- leadership.Close(closeCtx, now.Add(2*time.Second)) }()
 
 	var status LeaderStatus
-	statusReturned := false
 	select {
 	case status = <-statusDone:
-		statusReturned = true
 	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Status blocked behind leader heartbeat")
 	}
-	var closeErr error
-	closeReturned := false
-	select {
-	case closeErr = <-closeDone:
-		closeReturned = true
-	case <-time.After(100 * time.Millisecond):
+	startedClose := time.Now()
+	if err := leadership.Close(closeCtx, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("cancel blocked heartbeat: %v", err)
+	}
+	if elapsed := time.Since(startedClose); elapsed >= time.Second {
+		t.Fatalf("blocked heartbeat Close took %s", elapsed)
 	}
 	if err := blocker.Rollback(ctx); err != nil {
 		t.Fatalf("release heartbeat blocker: %v", err)
 	}
-	if err := <-heartbeatDone; err != nil {
-		t.Fatalf("blocked heartbeat: %v", err)
-	}
-	if !statusReturned {
-		t.Fatal("Status blocked behind leader heartbeat")
+	if err := <-heartbeatDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked heartbeat error = %v, want context canceled", err)
 	}
 	if status.Role != LeaderRoleActive || status.Authority == nil || status.Authority.Epoch != authority.Epoch {
 		t.Fatalf("blocked heartbeat status = %#v", status)
 	}
-	if !closeReturned {
-		t.Fatal("Close ignored its context while waiting for leader heartbeat")
+	secondStore, err := OpenStore(ctx, LoadConfig().DatabaseURL)
+	if err != nil {
+		t.Fatalf("open heartbeat replacement store: %v", err)
 	}
+	defer secondStore.Close()
+	replacement, acquired, err := secondStore.TryAcquireLeader(
+		ctx,
+		"channelops-go@blocked-heartbeat-replacement:1",
+		now.Add(3*time.Second),
+	)
+	if err != nil || !acquired || replacement == nil {
+		t.Fatalf("replacement after canceled heartbeat = %#v, %t, %v", replacement, acquired, err)
+	}
+	if err := replacement.Release(ctx, now.Add(4*time.Second)); err != nil {
+		t.Fatalf("release heartbeat replacement: %v", err)
+	}
+}
+
+func TestRunnerCloseReturnsBoundedErrorWithoutClosingStoreWhenAcquireWillNotJoin(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	defer func() {
+		fixture.ResetLeaderEpoch(ctx)
+		fixture.Close(ctx)
+	}()
+	attemptStarted := make(chan struct{})
+	unblockAttempt := make(chan struct{})
+	fixture.Store.leaderLockAttempt = func(context.Context, *pgxpool.Conn) (bool, error) {
+		close(attemptStarted)
+		<-unblockAttempt
+		return false, nil
+	}
+	leadership := newPostgresLeadershipController(
+		fixture.Store,
+		"channelops-go@stubborn-acquire:1",
+	)
+	ensureDone := make(chan error, 1)
+	go func() {
+		_, err := leadership.EnsureActive(ctx, fixture.Store.Now())
+		ensureDone <- err
+	}()
+	waitRunnerTestSignal(t, attemptStarted, "stubborn leader acquisition")
+
+	storeClosed := false
+	runner := &Runner{
+		Store:                  fixture.Store,
+		Leadership:             leadership,
+		leadershipCloseTimeout: 25 * time.Millisecond,
+		closeStore: func() {
+			storeClosed = true
+		},
+	}
+	startedClose := time.Now()
+	closeErr := runner.Close()
 	if !errors.Is(closeErr, context.DeadlineExceeded) {
-		t.Fatalf("blocked Close error = %v, want context deadline exceeded", closeErr)
+		t.Fatalf("bounded runner Close error = %v, want context deadline exceeded", closeErr)
 	}
-	if err := leadership.Close(ctx, now.Add(3*time.Second)); err != nil {
-		t.Fatalf("cleanup Close: %v", err)
+	if elapsed := time.Since(startedClose); elapsed >= 250*time.Millisecond {
+		t.Fatalf("bounded runner Close took %s", elapsed)
+	}
+	if storeClosed {
+		t.Fatal("runner closed store before stubborn leadership operation joined")
+	}
+
+	close(unblockAttempt)
+	if err := <-ensureDone; err != nil {
+		t.Fatalf("drain stubborn acquisition: %v", err)
+	}
+	if err := leadership.Close(ctx, fixture.Store.Now().Add(time.Second)); err != nil {
+		t.Fatalf("cleanup stubborn leadership: %v", err)
+	}
+}
+
+func waitForPostgresLockWait(
+	t *testing.T,
+	ctx context.Context,
+	store *Store,
+	pid uint32,
+	label string,
+) {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var waiting bool
+		err := store.Pool.QueryRow(waitCtx, `
+			SELECT COALESCE(wait_event_type = 'Lock', FALSE)
+			FROM pg_stat_activity
+			WHERE pid = $1
+		`, pid).Scan(&waiting)
+		if err == nil && waiting {
+			return
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("timed out observing %s: %v", label, err)
+		case <-ticker.C:
+		}
 	}
 }
 
