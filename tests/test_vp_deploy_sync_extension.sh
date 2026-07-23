@@ -310,6 +310,9 @@ docker() {
       *ContainerSpec.Env*)
         if [[ "$service" == "vp-api-swarm" ]]; then
           echo 'DATABASE_URL=legacy'
+        elif [[ "$service" == "vp-channel-agent-runner-swarm" ]]; then
+          echo 'CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS=30'
+          echo 'CHANNELOPS_RUNNER_ID=legacy-channelops-runner'
         elif [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" ]]; then
           echo 'WORKER_HOST=legacy'
           echo 'YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials'
@@ -374,6 +377,32 @@ if [[ ! -f "$EXTENSION" ]]; then
   echo "FAIL: missing deploy extension: $EXTENSION" >&2
   exit 1
 fi
+if ! grep -Fq 'CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1' "$EXTENSION"; then
+  echo 'FAIL: managed ChannelOps runner must use the exact 127 identity' >&2
+  exit 1
+fi
+if ! grep -Fq 'vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" stop-first' "$EXTENSION"; then
+  echo 'FAIL: managed ChannelOps runner must replace stop-first' >&2
+  exit 1
+fi
+for expected_order in \
+  'vp_update_runtime_service vp-api-swarm "$api" stop-first' \
+  'vp_update_runtime_service vp-frontend-swarm "$frontend" stop-first' \
+  'vp_update_runtime_service vp-autoflow-api-swarm "$backend" start-first' \
+  'vp_update_runtime_service vp-event-outbox-relay-swarm "$backend" start-first' \
+  'vp_update_runtime_service vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first'; do
+  if ! grep -Fq "$expected_order" "$EXTENSION"; then
+    echo "FAIL: neighboring runtime rollout order changed: $expected_order" >&2
+    exit 1
+  fi
+done
+if ! grep -Fq 'HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \' \
+  "$ROOT_DIR/backend/Dockerfile.channelops-runner-go" \
+  || ! grep -Fq 'CMD wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1' \
+  "$ROOT_DIR/backend/Dockerfile.channelops-runner-go"; then
+  echo 'FAIL: ChannelOps runner image must actively healthcheck readyz' >&2
+  exit 1
+fi
 if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credentials|--mount .*youtube_credentials' "$EXTENSION"; then
   echo 'FAIL: general production worker must not receive publication credentials' >&2
   exit 1
@@ -382,6 +411,18 @@ source "$EXTENSION"
 images="$(build_vp_app_images "$TEST_COMMIT")"
 if ! deploy_vp_app_services $images >/dev/null; then
   echo 'FAIL: deploy_vp_app_services returned non-zero' >&2
+  exit 1
+fi
+
+runner_identity_update="$(
+  grep -F 'docker|service update' "$CALLS" \
+    | grep -F -- '--image vp-channelops-runner-go:deploy-0123456789ab' \
+    | grep -F 'vp-channel-agent-runner-swarm' \
+    | head -n 1
+)"
+if [[ "$runner_identity_update" != *'--env-rm CHANNELOPS_RUNNER_ID'* \
+  || "$runner_identity_update" != *'--env-add CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1'* ]]; then
+  echo 'FAIL: managed ChannelOps identity must replace a prior service identity' >&2
   exit 1
 fi
 

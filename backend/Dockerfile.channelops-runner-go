@@ -17,4 +17,7 @@ RUN apt-get update \
 COPY --from=build /out/channelops-runner /usr/local/bin/channelops-runner
 COPY --from=build /out/channelops-live-smoke /usr/local/bin/channelops-live-smoke
 
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \
+  CMD wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1
+
 ENTRYPOINT ["channelops-runner"]

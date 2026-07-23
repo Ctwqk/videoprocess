@@ -191,12 +191,23 @@ vp_update_runtime_service() {
     service_args+=(--env-add "WORKER_HOST=$VP_RUNTIME_NODE")
   fi
   if [[ "$service" == "vp-channel-agent-runner-swarm" ]]; then
-    if vp_service_values "$service" \
-      '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
-      | awk -F= '$1 == "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS" { found=1 } END { exit found ? 0 : 1 }'; then
-      service_args+=(--env-rm CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS)
-    fi
-    service_args+=(--env-add "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS=120")
+    local channelops_env_key
+    for channelops_env_key in \
+      CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS \
+      CHANNELOPS_RUNNER_ID; do
+      if vp_service_values "$service" \
+        '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
+        | awk -F= -v key="$channelops_env_key" \
+          '$1 == key { found=1 } END { exit found ? 0 : 1 }'; then
+        service_args+=(--env-rm "$channelops_env_key")
+      fi
+    done
+    service_args+=(
+      --env-add
+      "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS=120"
+      --env-add
+      "CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1"
+    )
   fi
 
   local update_args=(
@@ -1022,7 +1033,7 @@ vp_apply_app_services() {
   vp_deploy_publisher "$python_worker" || return 1
   vp_update_runtime_service vp-autoflow-api-swarm "$backend" start-first || return 1
   vp_update_runtime_service vp-event-outbox-relay-swarm "$backend" start-first || return 1
-  vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" start-first || return 1
+  vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" stop-first || return 1
   vp_update_runtime_service vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first || return 1
 
   local service

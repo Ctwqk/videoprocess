@@ -2,12 +2,28 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+from collections.abc import Mapping
 
-from app.channel_agent.runner import ChannelAgentRunner
-from app.config import settings
+
+PRODUCTION_DEPLOY_MODES = frozenset({"shared", "production"})
+
+
+def assert_python_channelops_runner_admission(
+    env: Mapping[str, str] | None = None,
+) -> None:
+    deploy_env = os.environ if env is None else env
+    deploy_mode = deploy_env.get("DEPLOY_MODE", "").strip().lower()
+    if deploy_mode in PRODUCTION_DEPLOY_MODES:
+        raise RuntimeError("Go ChannelOps runner is the production owner")
 
 
 def main() -> None:
+    assert_python_channelops_runner_admission()
+
+    from app.channel_agent.runner import ChannelAgentRunner
+    from app.config import settings
+
     parser = argparse.ArgumentParser(description="Run ChannelOps queue worker")
     parser.add_argument("mode", choices=["once", "run"], nargs="?", default="once")
     parser.add_argument("--worker-id", default="channel-agent-runner")

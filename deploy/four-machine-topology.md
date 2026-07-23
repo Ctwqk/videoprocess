@@ -142,6 +142,35 @@ groups separately so a failure in one repository does not skip the other:
   --apply --project vp-pds
 ```
 
+## ChannelOps Leader Ownership
+
+`vp-channel-agent-runner-swarm` is the production Go ChannelOps singleton on
+127. Its managed identity is exactly `channelops-go@colima-127:1`; the deploy
+extension removes any previous `CHANNELOPS_RUNNER_ID` before applying that
+value. The legacy Python runner rejects normalized `shared` and `production`
+deploy modes before it imports runtime dependencies. It remains available only
+for explicitly selected local or test work.
+
+The runner exposes `leader_role`, `leader_epoch`, `leader_holder_id`, and
+`leader_heartbeat_at` in its health payloads. `/readyz` is ready only when the
+database and active leadership are available: an active leader has a positive
+epoch and the managed 127 holder identity, while standby and unavailable roles
+are unhealthy. `/healthz` retains its scheduler-freshness checks in addition to
+those readiness fields.
+
+Leadership epochs are monotonic. A standby runner takes over only after the
+prior lease is no longer valid, receives the next epoch, and must fence work
+with that authority. The managed singleton uses `stop-first` replacement so an
+old task is stopped before the new holder can acquire leadership; this avoids a
+rollout deadlock and overlapping production ownership.
+
+`channelops-live-smoke` is a maintenance-only command and must never run
+concurrently with managed ChannelOps. The 150 machine remains the support and
+publisher host, while 126 remains excluded from ChannelOps placement, builds,
+deployment, and failover. External-platform assets remain private or unlisted
+until explicit human review; public publication and promotion stay behind their
+existing kill switch.
+
 ## ChannelOps Managed Soak Guard
 
 The scoped deploy controller on `10.0.0.150` owns the ChannelOps soak watcher.
