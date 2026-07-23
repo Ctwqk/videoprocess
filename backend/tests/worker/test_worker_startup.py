@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -14,6 +15,155 @@ from worker import main as worker_main
 def test_worker_database_is_not_configured_at_import() -> None:
     assert worker_main.engine_db is None
     assert worker_main.worker_session is None
+
+
+@pytest.mark.asyncio
+async def test_process_task_downloads_missing_local_artifact_through_api(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    input_artifact_id = uuid.uuid4()
+    expected_content = b"cross-node-owned-video"
+    missing_local_path = tmp_path / "gpu-scratch" / "assets" / "input.mp4"
+    handled_inputs: list[bytes] = []
+    handled_paths: list[str] = []
+    requested: list[tuple[str, str]] = []
+    succeeded: list[tuple[str, str, str]] = []
+    failed: list[tuple[str, str, str]] = []
+
+    class CopyHandler:
+        async def execute(self, config, input_paths, output_path):
+            input_path = input_paths["input"]
+            handled_paths.append(input_path)
+            handled_inputs.append(Path(input_path).read_bytes())
+            Path(output_path).write_bytes(expected_content)
+            return {}
+
+        def cancel(self) -> None:
+            return None
+
+    input_artifact = SimpleNamespace(
+        id=input_artifact_id,
+        job_id=job_id,
+        media_info={"content_sha256": hashlib.sha256(expected_content).hexdigest()},
+        storage_backend="local",
+        storage_path="assets/input.mp4",
+        filename="input.mp4",
+        file_size=len(expected_content),
+    )
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, model, item_id):
+            if model is worker_main.Artifact and item_id == input_artifact_id:
+                return input_artifact
+            return None
+
+        def add(self, item) -> None:
+            return None
+
+        async def flush(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+    class LocalStorage:
+        def get_local_path(self, path: str) -> str:
+            assert path == "assets/input.mp4"
+            return str(missing_local_path)
+
+        async def read(self, path: str) -> bytes:
+            raise AssertionError(f"local artifact must use the authoritative API: {path}")
+
+    class DownloadResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def aiter_bytes(self):
+            yield expected_content[:7]
+            yield expected_content[7:]
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def stream(self, method: str, url: str):
+            requested.append((method, url))
+            return DownloadResponse()
+
+    def session_factory():
+        return FakeSession()
+
+    async def claim_node(*args, **kwargs) -> bool:
+        return True
+
+    async def report_success(job: str, node: str, artifact: str) -> None:
+        succeeded.append((job, node, artifact))
+
+    async def report_failure(job: str, node: str, error: str) -> None:
+        failed.append((job, node, error))
+
+    monkeypatch.setattr(worker_main, "HANDLER_MAP", {"smart_trim": CopyHandler})
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: session_factory)
+    monkeypatch.setattr(worker_main, "_claim_node_execution", claim_node)
+    monkeypatch.setattr(worker_main, "get_storage", lambda _backend: LocalStorage())
+    monkeypatch.setattr(worker_main, "_report_success", report_success)
+    monkeypatch.setattr(worker_main, "_report_failure", report_failure)
+    monkeypatch.setattr(
+        worker_main,
+        "httpx",
+        SimpleNamespace(AsyncClient=FakeAsyncClient),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "ARTIFACT_DOWNLOAD_BASE_URL",
+        "http://vp-api-swarm:8080/api/v1",
+        raising=False,
+    )
+    monkeypatch.setattr(worker_main.settings, "storage_backend", "local")
+    monkeypatch.setattr(worker_main.settings, "storage_local_root", str(tmp_path / "storage"))
+
+    await worker_main.process_task(
+        {
+            "job_id": str(job_id),
+            "node_execution_id": str(node_execution_id),
+            "node_id": "smart_trim_1",
+            "node_type": "smart_trim",
+            "config": json.dumps({"prompt": "owned canary"}),
+            "input_artifacts": json.dumps({"input": str(input_artifact_id)}),
+        }
+    )
+
+    assert requested == [
+        (
+            "GET",
+            f"http://vp-api-swarm:8080/api/v1/artifacts/{input_artifact_id}/download",
+        )
+    ]
+    assert handled_inputs == [expected_content]
+    assert len(succeeded) == 1
+    assert failed == []
+    assert handled_paths and not Path(handled_paths[0]).exists()
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -54,6 +56,10 @@ AFFINITY_MAX_BOUNCES = int(os.environ.get("WORKER_AFFINITY_MAX_BOUNCES", "6"))
 REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("WORKER_REDIS_CONNECT_TIMEOUT_SECONDS", "5"))
 REDIS_SOCKET_TIMEOUT_SECONDS = float(os.environ.get("WORKER_REDIS_SOCKET_TIMEOUT_SECONDS", "30"))
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get("WORKER_REDIS_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
+ARTIFACT_DOWNLOAD_BASE_URL = os.environ.get(
+    "VP_ARTIFACT_DOWNLOAD_BASE_URL",
+    "http://vp-api-swarm:8080/api/v1",
+).strip().rstrip("/")
 
 engine_db: AsyncEngine | None = None
 worker_session: async_sessionmaker[AsyncSession] | None = None
@@ -258,7 +264,10 @@ async def process_task(data: dict) -> None:
                 input_artifact_meta[port_name] = artifact.media_info or {}
                 storage = get_storage(artifact.storage_backend)
                 local_path = storage.get_local_path(artifact.storage_path)
-                if not local_path:
+                if local_path and not Path(local_path).is_file():
+                    local_path = await _download_artifact_via_api(artifact)
+                    temp_files.append(local_path)
+                elif not local_path:
                     # MinIO or remote storage: download to temp file
                     content = await storage.read(artifact.storage_path)
                     ext = Path(artifact.filename).suffix or ".mp4"
@@ -356,6 +365,61 @@ async def process_task(data: dict) -> None:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+async def _download_artifact_via_api(artifact: Artifact) -> str:
+    if not ARTIFACT_DOWNLOAD_BASE_URL:
+        raise RuntimeError(
+            f"Input artifact {artifact.id} is not present on this worker and "
+            "VP_ARTIFACT_DOWNLOAD_BASE_URL is not configured"
+        )
+
+    suffix = Path(artifact.filename).suffix or ".mp4"
+    fd, temp_path = tempfile.mkstemp(suffix=suffix, prefix="vp_input_")
+    os.close(fd)
+    downloaded_size = 0
+    digest = hashlib.sha256()
+    url = f"{ARTIFACT_DOWNLOAD_BASE_URL}/artifacts/{artifact.id}/download"
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
+            async with client.stream("GET", url) as response:
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Artifact download API returned HTTP {response.status_code} "
+                        f"for input artifact {artifact.id}"
+                    )
+                with open(temp_path, "wb") as handle:
+                    async for chunk in response.aiter_bytes():
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        downloaded_size += len(chunk)
+                        digest.update(chunk)
+
+        expected_size = artifact.file_size
+        if expected_size is not None and downloaded_size != expected_size:
+            raise RuntimeError(
+                f"Downloaded input artifact {artifact.id} size mismatch: "
+                f"expected {expected_size}, got {downloaded_size}"
+            )
+
+        media_info = artifact.media_info if isinstance(artifact.media_info, dict) else {}
+        expected_digest = str(media_info.get("content_sha256") or "").strip().lower()
+        if (
+            len(expected_digest) == 64
+            and all(char in "0123456789abcdef" for char in expected_digest)
+            and digest.hexdigest() != expected_digest
+        ):
+            raise RuntimeError(f"Downloaded input artifact {artifact.id} content hash mismatch")
+
+        return temp_path
+    except BaseException:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 async def _authoritative_youtube_upload_inputs(
