@@ -11,11 +11,13 @@ FAKE_CRONTAB="$TEST_ROOT/crontab"
 FAKE_CRONTAB_CALLS="$TEST_ROOT/crontab-calls"
 FAKE_CRONTAB_FAILURE_USED="$TEST_ROOT/crontab-failure-used"
 FAKE_WATCH_TARGET="$ROOT/bin/channelops-soak-watch.sh"
+CHANNEL_RUNNER_ENV_STATE_FILE="$TEST_ROOT/channelops-runner-env-state"
 VP_SOAK_WATCH_SOURCE="$ROOT_DIR/deploy/swarm/channelops-soak-watch.sh"
 TEST_COMMIT="0123456789abcdef0123456789abcdef01234567"
 trap 'status=$?; rm -rf "$TEST_ROOT"; exit "$status"' EXIT
 
 mkdir -p "$FAKE_BIN"
+printf 'legacy\n' >"$CHANNEL_RUNNER_ENV_STATE_FILE"
 cat >"$FAKE_BIN/crontab" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -104,6 +106,7 @@ printf 'write\n' >>"$FAKE_CRONTAB_CALLS"
 EOF
 chmod +x "$FAKE_BIN/crontab"
 export CALLS FAKE_CRONTAB FAKE_CRONTAB_CALLS FAKE_CRONTAB_FAILURE_USED FAKE_WATCH_TARGET
+export CHANNEL_RUNNER_ENV_STATE_FILE
 FAKE_CRONTAB_READ_MODE=normal
 FAKE_CRONTAB_INSTALL_MODE=normal
 FAKE_CRONTAB_ROLLBACK_FAIL=false
@@ -230,6 +233,11 @@ docker() {
     return 1
   fi
   if [[ "${1:-} ${2:-}" == "service update" \
+    && "$*" == *"vp-channel-agent-runner-swarm"* \
+    && "$*" == *"CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1"* ]]; then
+    printf 'converged\n' >"$CHANNEL_RUNNER_ENV_STATE_FILE"
+  fi
+  if [[ "${1:-} ${2:-}" == "service update" \
     && "$*" == *"vp-youtube-publisher-swarm"* ]]; then
     if [[ "$*" == *"--replicas 0"* ]]; then
       PUBLISHER_REPLICAS=0
@@ -312,7 +320,24 @@ docker() {
           echo 'DATABASE_URL=legacy'
         elif [[ "$service" == "vp-channel-agent-runner-swarm" ]]; then
           echo 'CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS=30'
-          echo 'CHANNELOPS_RUNNER_ID=legacy-channelops-runner'
+          case "$(cat "$CHANNEL_RUNNER_ENV_STATE_FILE")" in
+            absent)
+              ;;
+            legacy)
+              echo 'CHANNELOPS_RUNNER_ID=legacy-channelops-runner'
+              ;;
+            duplicate)
+              echo 'CHANNELOPS_RUNNER_ID=legacy-channelops-runner-a'
+              echo 'CHANNELOPS_RUNNER_ID=legacy-channelops-runner-b'
+              ;;
+            converged)
+              echo 'CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1'
+              ;;
+            *)
+              echo 'invalid ChannelOps runner environment state' >&2
+              return 1
+              ;;
+          esac
         elif [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" ]]; then
           echo 'WORKER_HOST=legacy'
           echo 'YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials'
@@ -401,6 +426,15 @@ if ! grep -Fq 'HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retr
   || ! grep -Fq 'CMD wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1' \
   "$ROOT_DIR/backend/Dockerfile.channelops-runner-go"; then
   echo 'FAIL: ChannelOps runner image must actively healthcheck readyz' >&2
+  exit 1
+fi
+if ! grep -Fq 'test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]' \
+  "$ROOT_DIR/docker-compose.yml" \
+  || ! grep -Fq 'interval: 10s' "$ROOT_DIR/docker-compose.yml" \
+  || ! grep -Fq 'timeout: 3s' "$ROOT_DIR/docker-compose.yml" \
+  || ! grep -Fq 'retries: 6' "$ROOT_DIR/docker-compose.yml" \
+  || ! grep -Fq 'start_period: 10s' "$ROOT_DIR/docker-compose.yml"; then
+  echo 'FAIL: Compose ChannelOps runner must healthcheck active readiness' >&2
   exit 1
 fi
 if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credentials|--mount .*youtube_credentials' "$EXTENSION"; then
@@ -1258,3 +1292,59 @@ if grep -Fq '10.0.0.126' "$CALLS"; then
   echo 'FAIL: discovery timeout deployment must never target 126' >&2
   exit 1
 fi
+
+channelops_runner_argument_pair_count() {
+  local update_call="$1"
+  local option="$2"
+  local value="$3"
+  printf '%s\n' "$update_call" | awk -v option="$option" -v value="$value" '
+    {
+      for (field = 1; field < NF; field++) {
+        if ($field == option && $(field + 1) == value) count++
+      }
+    }
+    END { print count + 0 }
+  '
+}
+
+assert_channelops_runner_identity_reconciliation() {
+  local state="$1"
+  local expected_removals="$2"
+  local update_call
+  local update_count
+  local managed_additions
+  local removals
+
+  printf '%s\n' "$state" >"$CHANNEL_RUNNER_ENV_STATE_FILE"
+  : >"$CALLS"
+  vp_update_runtime_service \
+    vp-channel-agent-runner-swarm "vp-channelops-runner-go:${state}-test" stop-first >/dev/null
+
+  update_count="$(grep -F 'docker|service update' "$CALLS" \
+    | grep -F 'vp-channel-agent-runner-swarm' \
+    | wc -l | tr -d ' ')"
+  if [[ "$update_count" -ne 1 ]]; then
+    echo "FAIL: $state ChannelOps identity update must issue exactly one service update" >&2
+    exit 1
+  fi
+  update_call="$(grep -F 'docker|service update' "$CALLS" \
+    | grep -F 'vp-channel-agent-runner-swarm')"
+  managed_additions="$(channelops_runner_argument_pair_count "$update_call" \
+    '--env-add' 'CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1')"
+  removals="$(channelops_runner_argument_pair_count "$update_call" \
+    '--env-rm' 'CHANNELOPS_RUNNER_ID')"
+  if [[ "$managed_additions" -ne 1 || "$removals" -ne "$expected_removals" ]]; then
+    echo "FAIL: $state ChannelOps identity reconciliation added=$managed_additions removed=$removals" >&2
+    exit 1
+  fi
+  if [[ "$(cat "$CHANNEL_RUNNER_ENV_STATE_FILE")" != converged ]]; then
+    echo "FAIL: $state ChannelOps identity update did not converge the fake service" >&2
+    exit 1
+  fi
+}
+
+assert_channelops_runner_identity_reconciliation absent 0
+assert_channelops_runner_identity_reconciliation legacy 1
+assert_channelops_runner_identity_reconciliation duplicate 1
+assert_channelops_runner_identity_reconciliation converged 1
+assert_channelops_runner_identity_reconciliation converged 1

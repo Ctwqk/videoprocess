@@ -68,3 +68,37 @@ else:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_shared_main_rejects_before_every_app_import() -> None:
+    script = f"""
+import builtins
+import os
+import runpy
+
+runner_path = {json.dumps(str(RUNNER_PATH))}
+os.environ["DEPLOY_MODE"] = "shared"
+original_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name == "app" or name.startswith("app."):
+        raise AssertionError(f"app import attempted: {{name}}")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+try:
+    runpy.run_path(runner_path, run_name="__main__")
+except RuntimeError as error:
+    assert {json.dumps(REJECTION_TEXT)} in str(error)
+else:
+    raise AssertionError("shared main was admitted")
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
