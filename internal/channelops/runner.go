@@ -15,7 +15,6 @@ const (
 	LeaderRoleUnavailable = "unavailable"
 
 	runnerLeadershipCloseTimeout = 5 * time.Second
-	runnerClaimReleaseTimeout    = 5 * time.Second
 )
 
 type LeaderStatus struct {
@@ -253,6 +252,7 @@ type Runner struct {
 	Leadership             LeadershipController
 	schedulerRun           func(context.Context, Scheduler, time.Time) (int, error)
 	recomputeLearning      func(context.Context, *Store, string, int) error
+	afterHandlerSuccess    func(QueueItemRow)
 	schedulerMu            sync.RWMutex
 	lastSchedulerRun       time.Time
 	leadershipCloseTimeout time.Duration
@@ -427,22 +427,26 @@ func (r *Runner) runOnce(ctx context.Context) error {
 		confirmedAuthority.Epoch != authority.Epoch {
 		return r.releaseClaimAfterAuthorityChange(ctx, *item)
 	}
-	if err := r.Handlers.Handle(ctx, *item); err != nil {
-		if leaderFenceRejected(err) {
-			return r.releaseClaimAfterAuthorityChange(ctx, *item)
+	if handlerErr := r.Handlers.Handle(ctx, *item); handlerErr != nil {
+		cleanupErr := completeUncommittedQueueClaim(
+			ctx,
+			r.Store,
+			*item,
+			handlerErr,
+			errors.Is(handlerErr, ErrQueueAuthorityInvalid),
+		)
+		if cleanupErr != nil {
+			return cleanupErr
 		}
-		if errors.Is(err, ErrQueueAuthorityInvalid) {
-			return r.completeQueueClaimWithAuthority(ctx, *item, func(fenced *Store) error {
-				return fenced.MarkQueueRejected(ctx, *item, err.Error())
-			})
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		return r.completeQueueClaimWithAuthority(ctx, *item, func(fenced *Store) error {
-			return fenced.MarkQueueFailedOrRetry(ctx, *item, err.Error())
-		})
+		return nil
 	}
-	return r.completeQueueClaimWithAuthority(ctx, *item, func(fenced *Store) error {
-		return fenced.MarkQueueDone(ctx, *item)
-	})
+	if r.afterHandlerSuccess != nil {
+		r.afterHandlerSuccess(*item)
+	}
+	return completeCommittedQueueClaim(ctx, r.Store, *item)
 }
 
 func (r *Runner) executeScheduler(
@@ -457,28 +461,7 @@ func (r *Runner) executeScheduler(
 }
 
 func (r *Runner) releaseClaimAfterAuthorityChange(ctx context.Context, item QueueItemRow) error {
-	releaseCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		runnerClaimReleaseTimeout,
-	)
-	defer cancel()
-	err := r.Store.ReleaseQueueClaim(releaseCtx, item)
-	if errors.Is(err, ErrQueueLeaseLost) {
-		return nil
-	}
-	return err
-}
-
-func (r *Runner) completeQueueClaimWithAuthority(
-	ctx context.Context,
-	item QueueItemRow,
-	complete func(*Store) error,
-) error {
-	err := r.Store.WithLeaderExecutionFence(ctx, complete)
-	if leaderFenceRejected(err) {
-		return r.releaseClaimAfterAuthorityChange(ctx, item)
-	}
-	return err
+	return releaseExactQueueClaim(ctx, r.Store, item)
 }
 
 func (r *Runner) runLegacyOnce(ctx context.Context, now time.Time) error {

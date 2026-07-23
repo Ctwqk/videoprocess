@@ -75,15 +75,17 @@ func (s *Store) RunLiveSmoke(ctx context.Context, channelID string, handler Hand
 		if item == nil {
 			break
 		}
-		if err := handler.Handle(ctx, *item); err != nil {
-			completionErr := s.WithLeaderExecutionFence(ctx, func(fenced *Store) error {
-				return fenced.MarkQueueFailedOrRetry(ctx, *item, err.Error())
-			})
-			return SmokeResult{}, errors.Join(err, completionErr)
+		if handlerErr := handler.Handle(ctx, *item); handlerErr != nil {
+			cleanupErr := completeUncommittedQueueClaim(
+				ctx,
+				s,
+				*item,
+				handlerErr,
+				errors.Is(handlerErr, ErrQueueAuthorityInvalid),
+			)
+			return SmokeResult{}, errors.Join(handlerErr, cleanupErr)
 		}
-		if err := s.WithLeaderExecutionFence(ctx, func(fenced *Store) error {
-			return fenced.MarkQueueDone(ctx, *item)
-		}); err != nil {
+		if err := completeCommittedQueueClaim(ctx, s, *item); err != nil {
 			return SmokeResult{}, err
 		}
 	}

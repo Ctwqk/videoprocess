@@ -554,6 +554,475 @@ func TestRunnerReleasesClaimWithoutPenaltyWhenHandlerLosesLeader(t *testing.T) {
 	}
 }
 
+func TestRunnerCancellationReleasesNonDiscoveryClaimWithoutPenalty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	testCtx, testCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer testCancel()
+	runCtx, cancelRun := context.WithCancel(testCtx)
+	defer cancelRun()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(testCtx)
+	fixture.InsertChannelWithLaneAccountSeed(testCtx)
+	now := fixture.Store.Now()
+	oldLease := acquireLeaderTestLease(
+		t,
+		testCtx,
+		fixture.Store,
+		"channelops-go@runner-cancel-old:1",
+		now,
+	)
+	defer func() {
+		_ = oldLease.Release(context.Background(), now.Add(3*time.Second))
+		fixture.ResetLeaderEpoch(context.Background())
+		fixture.Close(context.Background())
+	}()
+
+	queueID, err := fixture.Store.Enqueue(testCtx, EnqueueOptions{
+		Kind:             QueueAccountHealth,
+		IdempotencyKey:   "account_health:runner-cancel:" + fixture.AccountID,
+		Payload:          map[string]any{"account_id": fixture.AccountID},
+		Priority:         1,
+		ChannelProfileID: &fixture.ChannelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue runner cancellation item: %v", err)
+	}
+	originalRunAfter := queueRunAfterForTest(t, testCtx, fixture.Store, queueID)
+
+	authority := oldLease.Authority()
+	youtube := &blockingAccountHealthYouTube{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.YouTube = youtube
+	runner := &Runner{
+		Config:     Config{SchedulerPollSeconds: 60},
+		Store:      fixture.Store,
+		Handlers:   handler,
+		Leadership: &fakeLeadershipController{authority: &authority},
+	}
+	runner.SetLastSchedulerRun(now)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.runOnce(runCtx) }()
+	waitHandlerSplitSignal(t, youtube.started, "runner account health cancellation")
+	cancelRun()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runOnce cancellation error = %v, want context.Canceled", err)
+		}
+	case <-testCtx.Done():
+		t.Fatalf("wait for canceled runner: %v", testCtx.Err())
+	}
+
+	requireQueueClaimReleasedWithoutPenalty(
+		t,
+		testCtx,
+		fixture.Store,
+		queueID,
+		originalRunAfter,
+	)
+}
+
+func TestRunnerTakeoverReleasesNonDiscoveryClaimWithoutPenalty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	secondStore := openHandlerTakeoverStore(t, ctx)
+	now := fixture.Store.Now()
+	oldLease := acquireLeaderTestLease(
+		t,
+		ctx,
+		fixture.Store,
+		"channelops-go@runner-health-old:1",
+		now,
+	)
+	var takeoverLease *LeaderLease
+	releaseExternal := make(chan struct{})
+	var releaseExternalOnce sync.Once
+	defer func() {
+		releaseExternalOnce.Do(func() { close(releaseExternal) })
+		releaseLeaderTestLease(t, context.Background(), takeoverLease, now.Add(3*time.Second))
+		_ = oldLease.Release(context.Background(), now.Add(3*time.Second))
+		fixture.ResetLeaderEpoch(context.Background())
+		secondStore.Close()
+		fixture.Close(context.Background())
+	}()
+
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:             QueueAccountHealth,
+		IdempotencyKey:   "account_health:runner-takeover:" + fixture.AccountID,
+		Payload:          map[string]any{"account_id": fixture.AccountID},
+		Priority:         1,
+		ChannelProfileID: &fixture.ChannelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue runner takeover item: %v", err)
+	}
+	originalRunAfter := queueRunAfterForTest(t, ctx, fixture.Store, queueID)
+
+	authority := oldLease.Authority()
+	youtube := &blockingAccountHealthYouTube{
+		started: make(chan struct{}, 1),
+		release: releaseExternal,
+	}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.YouTube = youtube
+	runner := &Runner{
+		Config:     Config{SchedulerPollSeconds: 60},
+		Store:      fixture.Store,
+		Handlers:   handler,
+		Leadership: &fakeLeadershipController{authority: &authority},
+	}
+	runner.SetLastSchedulerRun(now)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.runOnce(ctx) }()
+	waitHandlerSplitSignal(t, youtube.started, "runner account health takeover")
+	dropLeaderTestSession(t, ctx, oldLease)
+	takeoverLease = acquireHandlerTakeoverWhileBlocked(
+		t,
+		ctx,
+		secondStore,
+		"channelops-go@runner-health-new:1",
+		now.Add(time.Second),
+	)
+	releaseExternalOnce.Do(func() { close(releaseExternal) })
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("runOnce after account health takeover: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for runner account health takeover: %v", ctx.Err())
+	}
+
+	requireQueueClaimReleasedWithoutPenalty(
+		t,
+		ctx,
+		fixture.Store,
+		queueID,
+		originalRunAfter,
+	)
+}
+
+func TestRunnerCommittedAgentTickMarksExactLeaseDoneAfterTakeover(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	secondStore := openHandlerTakeoverStore(t, ctx)
+	now := fixture.Store.Now()
+	oldLease := acquireLeaderTestLease(
+		t,
+		ctx,
+		fixture.Store,
+		"channelops-go@committed-tick-old:1",
+		now,
+	)
+	var takeoverLease *LeaderLease
+	resumeCompletion := make(chan struct{})
+	var resumeOnce sync.Once
+	defer func() {
+		resumeOnce.Do(func() { close(resumeCompletion) })
+		releaseLeaderTestLease(t, context.Background(), takeoverLease, now.Add(3*time.Second))
+		_ = oldLease.Release(context.Background(), now.Add(3*time.Second))
+		fixture.ResetLeaderEpoch(context.Background())
+		secondStore.Close()
+		fixture.Close(context.Background())
+	}()
+
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueAgentTick,
+		IdempotencyKey: "agent_tick:committed-takeover:" + fixture.ChannelID,
+		Payload: map[string]any{
+			"channel_id": fixture.ChannelID,
+			"bucket":     "2026-07-23-23",
+		},
+		Priority: 1, ChannelProfileID: &fixture.ChannelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue committed tick: %v", err)
+	}
+	authority := oldLease.Authority()
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	handlerSucceeded := make(chan struct{})
+	runner := &Runner{
+		Config:     Config{SchedulerPollSeconds: 60},
+		Store:      fixture.Store,
+		Handlers:   handler,
+		Leadership: &fakeLeadershipController{authority: &authority},
+		afterHandlerSuccess: func(item QueueItemRow) {
+			if item.ID != queueID {
+				t.Errorf("post-handler queue id = %s, want %s", item.ID, queueID)
+			}
+			close(handlerSucceeded)
+			<-resumeCompletion
+		},
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.runOnce(ctx) }()
+	waitHandlerSplitSignal(t, handlerSucceeded, "committed agent tick")
+	if tasks := countProductionTasksForChannel(t, ctx, fixture.Store, fixture.ChannelID); tasks != 1 {
+		t.Fatalf("committed agent tick task count = %d, want 1", tasks)
+	}
+
+	dropLeaderTestSession(t, ctx, oldLease)
+	takeoverLease = acquireHandlerTakeoverWhileBlocked(
+		t,
+		ctx,
+		secondStore,
+		"channelops-go@committed-tick-new:1",
+		now.Add(time.Second),
+	)
+	resumeOnce.Do(func() { close(resumeCompletion) })
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("runOnce committed tick completion: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for committed tick completion: %v", ctx.Err())
+	}
+
+	requireQueueSucceededWithNoLease(t, ctx, fixture.Store, queueID)
+	if tasks := countProductionTasksForChannel(t, ctx, fixture.Store, fixture.ChannelID); tasks != 1 {
+		t.Fatalf("post-takeover agent tick task count = %d, want 1", tasks)
+	}
+}
+
+func TestRunnerCommittedAlertMarksExactLeaseDoneWithoutReplayAfterTakeover(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	secondStore := openHandlerTakeoverStore(t, ctx)
+	now := fixture.Store.Now()
+	oldLease := acquireLeaderTestLease(
+		t,
+		ctx,
+		fixture.Store,
+		"channelops-go@committed-alert-old:1",
+		now,
+	)
+	var takeoverLease *LeaderLease
+	resumeCompletion := make(chan struct{})
+	var resumeOnce sync.Once
+	defer func() {
+		resumeOnce.Do(func() { close(resumeCompletion) })
+		releaseLeaderTestLease(t, context.Background(), takeoverLease, now.Add(3*time.Second))
+		_ = oldLease.Release(context.Background(), now.Add(3*time.Second))
+		fixture.ResetLeaderEpoch(context.Background())
+		secondStore.Close()
+		fixture.Close(context.Background())
+	}()
+
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:           QueueSendAlert,
+		IdempotencyKey: "send_alert:committed-takeover:" + fixture.ChannelID,
+		Payload: map[string]any{
+			"kind":       "test_alert",
+			"severity":   "warning",
+			"channel_id": fixture.ChannelID,
+			"message":    "committed alert takeover",
+		},
+		Priority: 1, ChannelProfileID: &fixture.ChannelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue committed alert: %v", err)
+	}
+	authority := oldLease.Authority()
+	sink := &recordingAlertSink{}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+	handler.Alerts = sink
+	handlerSucceeded := make(chan struct{})
+	runner := &Runner{
+		Config:     Config{SchedulerPollSeconds: 60},
+		Store:      fixture.Store,
+		Handlers:   handler,
+		Leadership: &fakeLeadershipController{authority: &authority},
+		afterHandlerSuccess: func(item QueueItemRow) {
+			if item.ID != queueID {
+				t.Errorf("post-handler queue id = %s, want %s", item.ID, queueID)
+			}
+			close(handlerSucceeded)
+			<-resumeCompletion
+		},
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.runOnce(ctx) }()
+	waitHandlerSplitSignal(t, handlerSucceeded, "committed alert")
+	if calls := len(sink.payloads); calls != 1 {
+		t.Fatalf("committed alert calls = %d, want 1", calls)
+	}
+
+	dropLeaderTestSession(t, ctx, oldLease)
+	takeoverLease = acquireHandlerTakeoverWhileBlocked(
+		t,
+		ctx,
+		secondStore,
+		"channelops-go@committed-alert-new:1",
+		now.Add(time.Second),
+	)
+	resumeOnce.Do(func() { close(resumeCompletion) })
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("runOnce committed alert completion: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for committed alert completion: %v", ctx.Err())
+	}
+
+	requireQueueSucceededWithNoLease(t, ctx, fixture.Store, queueID)
+	var replay *QueueItemRow
+	if err := secondStore.WithLeaderExecutionFence(ctx, func(fenced *Store) error {
+		var claimErr error
+		replay, claimErr = fenced.ClaimNextForKinds(
+			ctx,
+			handlerWorkerID(takeoverLease.Authority()),
+			[]string{QueueSendAlert},
+		)
+		return claimErr
+	}); err != nil {
+		t.Fatalf("claim committed alert replay: %v", err)
+	}
+	if replay != nil {
+		t.Fatalf("committed alert was replayable: %#v", replay)
+	}
+	if calls := len(sink.payloads); calls != 1 {
+		t.Fatalf("post-takeover alert calls = %d, want 1", calls)
+	}
+}
+
+func requireQueueSucceededWithNoLease(
+	t *testing.T,
+	ctx context.Context,
+	store *Store,
+	queueID string,
+) {
+	t.Helper()
+	var status string
+	var lockedBy *string
+	var lockedAt *time.Time
+	if err := store.Pool.QueryRow(ctx, `
+		SELECT status, locked_by, locked_at
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+	`, queueID).Scan(&status, &lockedBy, &lockedAt); err != nil {
+		t.Fatalf("read completed queue item: %v", err)
+	}
+	if status != QueueStatusSucceeded || lockedBy != nil || lockedAt != nil {
+		t.Fatalf(
+			"completed queue item = status %s locked_by=%v locked_at=%v",
+			status,
+			lockedBy,
+			lockedAt,
+		)
+	}
+}
+
+func countProductionTasksForChannel(
+	t *testing.T,
+	ctx context.Context,
+	store *Store,
+	channelID string,
+) int {
+	t.Helper()
+	var count int
+	if err := store.Pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM production_tasks
+		WHERE channel_profile_id = $1::uuid
+	`, channelID).Scan(&count); err != nil {
+		t.Fatalf("count production tasks: %v", err)
+	}
+	return count
+}
+
+func queueRunAfterForTest(
+	t *testing.T,
+	ctx context.Context,
+	store *Store,
+	queueID string,
+) time.Time {
+	t.Helper()
+	var runAfter time.Time
+	if err := store.Pool.QueryRow(ctx, `
+		SELECT run_after
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+	`, queueID).Scan(&runAfter); err != nil {
+		t.Fatalf("read queue run_after: %v", err)
+	}
+	return runAfter
+}
+
+func requireQueueClaimReleasedWithoutPenalty(
+	t *testing.T,
+	ctx context.Context,
+	store *Store,
+	queueID string,
+	wantRunAfter time.Time,
+) {
+	t.Helper()
+	var status string
+	var attemptCount int
+	var runAfter time.Time
+	var lockedBy *string
+	var lockedAt *time.Time
+	var lastError *string
+	if err := store.Pool.QueryRow(ctx, `
+		SELECT status, attempt_count, run_after, locked_by, locked_at, last_error
+		FROM channel_ops_queue_items
+		WHERE id = $1::uuid
+	`, queueID).Scan(
+		&status,
+		&attemptCount,
+		&runAfter,
+		&lockedBy,
+		&lockedAt,
+		&lastError,
+	); err != nil {
+		t.Fatalf("read released queue claim: %v", err)
+	}
+	if status != QueueStatusQueued ||
+		attemptCount != 0 ||
+		!runAfter.Equal(wantRunAfter) ||
+		lockedBy != nil ||
+		lockedAt != nil ||
+		lastError != nil {
+		t.Fatalf(
+			"released queue claim = %s attempt=%d run_after=%s locked_by=%v locked_at=%v last_error=%v",
+			status,
+			attemptCount,
+			runAfter,
+			lockedBy,
+			lockedAt,
+			lastError,
+		)
+	}
+}
+
 func TestRunnerLeadershipLossReturnsStandbyWithoutClaim(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")

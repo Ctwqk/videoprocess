@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -149,6 +150,158 @@ func TestLiveSmokeAcquiresMaintenanceEpochAndUsesFencedWorkerIdentity(t *testing
 			expectedWorkerID,
 		)
 	}
+}
+
+func TestLiveSmokeCancellationReleasesNonDiscoveryClaimWithoutPenalty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	testCtx, testCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer testCancel()
+	runCtx, cancelRun := context.WithCancel(testCtx)
+	defer cancelRun()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(testCtx)
+	fixture.InsertChannelWithLaneAccountSeed(testCtx)
+	now := fixture.Store.Now()
+	lease := acquireLeaderTestLease(
+		t,
+		testCtx,
+		fixture.Store,
+		"channelops-go@smoke-cancel-old:1",
+		now,
+	)
+	defer func() {
+		_ = lease.Release(context.Background(), now.Add(3*time.Second))
+		fixture.ResetLeaderEpoch(context.Background())
+		fixture.Close(context.Background())
+	}()
+
+	queueID, err := fixture.Store.Enqueue(testCtx, EnqueueOptions{
+		Kind:             QueueAccountHealth,
+		IdempotencyKey:   "account_health:smoke-cancel:" + fixture.AccountID,
+		Payload:          map[string]any{"account_id": fixture.AccountID},
+		Priority:         1,
+		ChannelProfileID: &fixture.ChannelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue smoke cancellation item: %v", err)
+	}
+	originalRunAfter := queueRunAfterForTest(t, testCtx, fixture.Store, queueID)
+	youtube := &blockingAccountHealthYouTube{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.YouTube = youtube
+
+	smokeDone := make(chan error, 1)
+	go func() {
+		_, runErr := fixture.Store.RunLiveSmoke(runCtx, fixture.ChannelID, handler)
+		smokeDone <- runErr
+	}()
+	waitHandlerSplitSignal(t, youtube.started, "smoke account health cancellation")
+	cancelRun()
+	select {
+	case err := <-smokeDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunLiveSmoke cancellation error = %v, want context.Canceled", err)
+		}
+	case <-testCtx.Done():
+		t.Fatalf("wait for canceled smoke: %v", testCtx.Err())
+	}
+
+	requireQueueClaimReleasedWithoutPenalty(
+		t,
+		testCtx,
+		fixture.Store,
+		queueID,
+		originalRunAfter,
+	)
+}
+
+func TestLiveSmokeTakeoverReleasesNonDiscoveryClaimWithoutPenalty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	secondStore := openHandlerTakeoverStore(t, ctx)
+	now := fixture.Store.Now()
+	oldLease := acquireLeaderTestLease(
+		t,
+		ctx,
+		fixture.Store,
+		"channelops-go@smoke-takeover-old:1",
+		now,
+	)
+	var takeoverLease *LeaderLease
+	releaseExternal := make(chan struct{})
+	var releaseExternalOnce sync.Once
+	defer func() {
+		releaseExternalOnce.Do(func() { close(releaseExternal) })
+		releaseLeaderTestLease(t, context.Background(), takeoverLease, now.Add(3*time.Second))
+		_ = oldLease.Release(context.Background(), now.Add(3*time.Second))
+		fixture.ResetLeaderEpoch(context.Background())
+		secondStore.Close()
+		fixture.Close(context.Background())
+	}()
+
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind:             QueueAccountHealth,
+		IdempotencyKey:   "account_health:smoke-takeover:" + fixture.AccountID,
+		Payload:          map[string]any{"account_id": fixture.AccountID},
+		Priority:         1,
+		ChannelProfileID: &fixture.ChannelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue smoke takeover item: %v", err)
+	}
+	originalRunAfter := queueRunAfterForTest(t, ctx, fixture.Store, queueID)
+	youtube := &blockingAccountHealthYouTube{
+		started: make(chan struct{}, 1),
+		release: releaseExternal,
+	}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.YouTube = youtube
+
+	smokeDone := make(chan error, 1)
+	go func() {
+		_, runErr := fixture.Store.RunLiveSmoke(ctx, fixture.ChannelID, handler)
+		smokeDone <- runErr
+	}()
+	waitHandlerSplitSignal(t, youtube.started, "smoke account health takeover")
+	dropLeaderTestSession(t, ctx, oldLease)
+	takeoverLease = acquireHandlerTakeoverWhileBlocked(
+		t,
+		ctx,
+		secondStore,
+		"channelops-go@smoke-takeover-new:1",
+		now.Add(time.Second),
+	)
+	releaseExternalOnce.Do(func() { close(releaseExternal) })
+	select {
+	case err := <-smokeDone:
+		if !errors.Is(err, ErrLeaderAuthorityLost) {
+			t.Fatalf(
+				"RunLiveSmoke takeover error = %v, want ErrLeaderAuthorityLost",
+				err,
+			)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for smoke takeover: %v", ctx.Err())
+	}
+
+	requireQueueClaimReleasedWithoutPenalty(
+		t,
+		ctx,
+		fixture.Store,
+		queueID,
+		originalRunAfter,
+	)
 }
 
 type smokeMutationCounts struct {
