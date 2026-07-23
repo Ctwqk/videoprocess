@@ -29,6 +29,9 @@ func completeUncommittedQueueClaim(
 	handlerErr error,
 	reject bool,
 ) error {
+	if errors.Is(handlerErr, ErrQueueLeaseLost) {
+		return nil
+	}
 	if ctx.Err() != nil || leaderFenceRejected(handlerErr) {
 		return releaseExactQueueClaim(ctx, store, item)
 	}

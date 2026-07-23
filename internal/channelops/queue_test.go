@@ -639,3 +639,16 @@ func TestPostClaimCleanupTreatsReplacedLeaseAsTransferred(t *testing.T) {
 		})
 	}
 }
+
+func TestPostClaimCleanupDoesNotTouchStoreAfterHandlerLeaseLoss(t *testing.T) {
+	err := completeUncommittedQueueClaim(
+		context.Background(),
+		nil,
+		QueueItemRow{},
+		ErrQueueLeaseLost,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("handler queue lease loss cleanup = %v, want nil", err)
+	}
+}
