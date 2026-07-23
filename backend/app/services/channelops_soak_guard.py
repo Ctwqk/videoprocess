@@ -29,6 +29,7 @@ ALLOWED_EXTERNAL_CONDITIONS = frozenset(
     {
         "forbidden_node_placement",
         "redis_group_missing",
+        "redis_consumer_identity_invalid",
         "redis_pending_exceeded",
         "service_missing",
         "service_unhealthy",

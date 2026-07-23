@@ -184,11 +184,34 @@ halt-after-selection procedure is superseded by the 2026-07-22 atomic intake
 pause: it blocks only `agent_tick` and `ingest_discovery`, so the successful
 canary remains intake-paused while existing downstream work, reconciliation,
 and mature metrics continue; a failed attempt becomes fully halted. The
-required approval for the next attempt is exactly
-`批准第四次 unlisted canary`. Deploying code
-may replace the watcher and its managed cron entry, but it cannot create
-activation state, activate a channel, resume a halted channel, or reopen the
-video schedule.
+operator must issue a fresh approval naming the next attempt immediately
+before each live canary; an approval consumed by an earlier attempt cannot be
+reused. Deploying code may replace the watcher and its managed cron entry, but
+it cannot create activation state, activate a channel, resume a halted
+channel, or reopen the video schedule.
+
+### Active Redis consumer identity
+
+When enabled, the soak watcher treats a Redis consumer as active when its
+`XINFO CONSUMERS` `idle` value is at most 120,000 milliseconds. Each managed
+stream must have exactly one active consumer matching the production topology:
+
+| Stream / group | Approved active consumer |
+| --- | --- |
+| `vp:tasks:ffmpeg` / `ffmpeg-workers` | `ffmpeg-worker@150-gpu:<positive pid>` |
+| `vp:tasks:ffmpeg_go` / `ffmpeg_go-workers` | `ffmpeg_go-worker@colima-127:<positive pid>` |
+| `vp:tasks:youtube_publisher` / `youtube_publisher-workers` | `youtube_publisher-worker@150-publisher:<positive pid>` |
+| `vp:events` / `orchestrator` | `orchestrator-api-<positive ordinal>` |
+
+Redis retains consumer records after a worker is replaced. Every record, active
+or stale, must have a non-empty string name. Records outside the active window
+are counted as history and are not checked against the active-name allowlist.
+Missing, malformed, duplicate, or unknown active consumers add only the fixed
+critical condition `redis_consumer_identity_invalid`; the watcher never deletes
+consumer records. The watcher audits the host-networked VP Redis listener with
+`redis-cli -p 6380 --raw` and does not pass or print credentials. This is an
+immediate operational ownership guard, not a replacement for future signed
+worker registration and revocation.
 
 External-platform asset automatic publication remains disabled. Explicit human
 review is required before any external-platform asset upload or publication.
@@ -246,7 +269,7 @@ Every generic `OPEN`, `DRAINING`, or `CLOSED` transition clears `guarded_job_id`
 Legacy no-parameter `POST /open` callers remain supported as global, unguarded
 opens, but the canary runner never uses that compatibility path. Drain and
 close remain no-parameter requests. This authority contract neither replaces
-nor consumes the separately required fourth-attempt approval phrase.
+nor consumes the separately required fresh approval for the next live attempt.
 
 For an approved live attempt, replace `--preflight-only` with
 `--confirm-live-unlisted`. That CLI flag and the SSH transport do not constitute

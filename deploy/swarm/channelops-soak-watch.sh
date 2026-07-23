@@ -237,55 +237,135 @@ while IFS= read -r service; do
   fi
 done <<<"$services"
 
-stream_groups='vp:tasks:ffmpeg_go|ffmpeg_go-workers
-vp:tasks:ffmpeg|ffmpeg-workers
-vp:tasks:youtube_publisher|youtube_publisher-workers
-vp:events|orchestrator'
+consumer_active_idle_ms=120000
+stream_groups='vp:tasks:ffmpeg_go|ffmpeg_go-workers|^ffmpeg_go-worker@colima-127:[1-9][0-9]*$
+vp:tasks:ffmpeg|ffmpeg-workers|^ffmpeg-worker@150-gpu:[1-9][0-9]*$
+vp:tasks:youtube_publisher|youtube_publisher-workers|^youtube_publisher-worker@150-publisher:[1-9][0-9]*$
+vp:events|orchestrator|^orchestrator-api-[1-9][0-9]*$'
 
-while IFS='|' read -r stream group; do
-  [[ -n "$stream" && -n "$group" ]] || continue
+while IFS='|' read -r stream group consumer_pattern; do
+  [[ -n "$stream" && -n "$group" && -n "$consumer_pattern" ]] || continue
   if ! group_output="$(docker exec "$redis_container" \
-    redis-cli --raw XINFO GROUPS "$stream" 2>/dev/null)"; then
+    redis-cli -p 6380 --raw XINFO GROUPS "$stream" 2>/dev/null)"; then
     log_status "stream=$stream group=$group status=missing"
     add_external_condition redis_group_missing
-    continue
+  else
+    if ! group_stats="$(printf '%s\n' "$group_output" | awk -v target="$group" '
+      $0 == "name" {
+        if (getline name <= 0) next
+        selected = (name == target)
+        next
+      }
+      selected && $0 == "pending" {
+        if (getline pending <= 0) pending = ""
+        next
+      }
+      selected && $0 == "lag" {
+        if (getline lag <= 0) lag = ""
+        found = 1
+        next
+      }
+      END {
+        if (found && pending ~ /^[0-9]+$/ && lag ~ /^[0-9]+$/) {
+          print pending "|" lag
+        } else {
+          exit 1
+        }
+      }
+    ')"; then
+      log_status "stream=$stream group=$group status=missing"
+      add_external_condition redis_group_missing
+    else
+      pending="${group_stats%%|*}"
+      lag="${group_stats#*|}"
+      if [[ "$pending" -gt 0 || "$lag" -gt 0 ]]; then
+        log_status "stream=$stream group=$group status=critical pending=$pending lag=$lag"
+        add_external_condition redis_pending_exceeded
+      else
+        log_status "stream=$stream group=$group status=healthy pending=0 lag=0"
+      fi
+    fi
   fi
 
-  if ! group_stats="$(printf '%s\n' "$group_output" | awk -v target="$group" '
-    $0 == "name" {
-      if (getline name <= 0) next
-      selected = (name == target)
-      next
-    }
-    selected && $0 == "pending" {
-      if (getline pending <= 0) pending = ""
-      next
-    }
-    selected && $0 == "lag" {
-      if (getline lag <= 0) lag = ""
-      found = 1
-      next
-    }
-    END {
-      if (found && pending ~ /^[0-9]+$/ && lag ~ /^[0-9]+$/) {
-        print pending "|" lag
-      } else {
+  if ! consumer_audit="$(docker exec "$redis_container" \
+    redis-cli -p 6380 --raw XINFO CONSUMERS "$stream" "$group" 2>/dev/null \
+    | awk -v active_idle_ms="$consumer_active_idle_ms" -v allowed_pattern="$consumer_pattern" '
+      function fail() {
+        invalid = 1
         exit 1
       }
-    }
-  ')"; then
-    log_status "stream=$stream group=$group status=missing"
-    add_external_condition redis_group_missing
+      function finalize_record() {
+        if (!record_open || !has_name || !has_pending || !has_idle) {
+          fail()
+        }
+        if (idle <= active_idle_ms) {
+          if (name !~ allowed_pattern) {
+            fail()
+          }
+          active_count++
+        } else {
+          stale_count++
+        }
+      }
+      {
+        key = $0
+        if (key == "" || getline value <= 0) {
+          fail()
+        }
+        if (key == "name") {
+          if (record_open) {
+            finalize_record()
+          }
+          if (value == "") {
+            fail()
+          }
+          record_open = 1
+          has_name = 1
+          has_pending = 0
+          has_idle = 0
+          name = value
+        } else {
+          if (!record_open) {
+            fail()
+          }
+          if (key == "pending") {
+            if (has_pending || value !~ /^[0-9]+$/) {
+              fail()
+            }
+            pending = value
+            has_pending = 1
+          } else if (key == "idle") {
+            if (has_idle || value !~ /^[0-9]+$/) {
+              fail()
+            }
+            idle = value
+            has_idle = 1
+          }
+        }
+      }
+      END {
+        if (invalid || !record_open) {
+          exit 1
+        }
+        finalize_record()
+        if (!invalid) {
+          print active_count "|" stale_count
+        }
+      }
+    ')"; then
+    log_status "stream=$stream group=$group consumers=invalid"
+    add_external_condition redis_consumer_identity_invalid
     continue
   fi
 
-  pending="${group_stats%%|*}"
-  lag="${group_stats#*|}"
-  if [[ "$pending" -gt 0 || "$lag" -gt 0 ]]; then
-    log_status "stream=$stream group=$group status=critical pending=$pending lag=$lag"
-    add_external_condition redis_pending_exceeded
+  IFS='|' read -r active_count stale_count consumer_audit_extra <<<"$consumer_audit"
+  if [[ "$active_count" != 1 ]] \
+    || [[ ! "$stale_count" =~ ^[0-9]+$ ]] \
+    || [[ -n "$consumer_audit_extra" ]]; then
+    log_status "stream=$stream group=$group consumers=invalid active_count=$active_count"
+    add_external_condition redis_consumer_identity_invalid
   else
-    log_status "stream=$stream group=$group status=healthy pending=0 lag=0"
+    log_status "stream=$stream group=$group consumers=healthy stale_count=$stale_count"
   fi
 done <<<"$stream_groups"
 

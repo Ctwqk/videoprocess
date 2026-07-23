@@ -178,8 +178,17 @@ if [[ "${1:-} ${2:-}" == "service ps" ]]; then
   exit 0
 fi
 
-if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" ]]; then
-  stream="${@: -1}"
+if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
+  && "${3:-}" == "redis-cli" ]]; then
+  if [[ "${4:-}" != "-p" || "${5:-}" != "6380" || "${6:-}" != "--raw" ]]; then
+    printf 'NOAUTH Authentication required.\n' >&2
+    exit 1
+  fi
+  if [[ "${7:-}" != "XINFO" ]]; then
+    exit 2
+  fi
+  command="${8:-}"
+  stream="${9:-}"
   case "$stream" in
     vp:tasks:ffmpeg_go) group=ffmpeg_go-workers ;;
     vp:tasks:ffmpeg) group=ffmpeg-workers ;;
@@ -187,17 +196,81 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" ]]; then
     vp:events) group=orchestrator ;;
     *) exit 1 ;;
   esac
-  if [[ "${FAKE_DOCKER_MODE:-healthy}" == "unknown_group" \
-    && "$group" == "youtube_publisher-workers" ]]; then
-    group=unexpected-workers
-  fi
-  pending=0
-  if [[ "${FAKE_DOCKER_MODE:-healthy}" == "redis_pending" \
-    && "$group" == "ffmpeg_go-workers" ]]; then
-    pending=2
-  fi
-  printf 'name\n%s\nconsumers\n1\npending\n%s\nlast-delivered-id\n0-0\nentries-read\n0\nlag\n0\n' "$group" "$pending"
-  exit 0
+  case "$command" in
+    GROUPS)
+      if [[ "${FAKE_DOCKER_MODE:-healthy}" == "unknown_group" \
+        && "$group" == "youtube_publisher-workers" ]]; then
+        group=unexpected-workers
+      fi
+      pending=0
+      if [[ "${FAKE_DOCKER_MODE:-healthy}" == "redis_pending" \
+        && "$group" == "ffmpeg_go-workers" ]]; then
+        pending=2
+      fi
+      printf 'name\n%s\nconsumers\n1\npending\n%s\nlast-delivered-id\n0-0\nentries-read\n0\nlag\n0\n' "$group" "$pending"
+      exit 0
+      ;;
+    CONSUMERS)
+      case "$stream" in
+        vp:tasks:ffmpeg_go) consumer=ffmpeg_go-worker@colima-127:1 ;;
+        vp:tasks:ffmpeg) consumer=ffmpeg-worker@150-gpu:1 ;;
+        vp:tasks:youtube_publisher) consumer=youtube_publisher-worker@150-publisher:1 ;;
+        vp:events) consumer=orchestrator-api-1 ;;
+        *) exit 1 ;;
+      esac
+      historical_consumer=historical-consumer
+      case "${FAKE_DOCKER_MODE:-healthy}" in
+        consumer_exec_failure)
+          exit 1
+          ;;
+        empty_consumer_response)
+          exit 0
+          ;;
+        unknown_consumer)
+          consumer=unmanaged-worker@126:1
+          ;;
+        near_match_consumer)
+          consumer="${consumer}|unexpected"
+          ;;
+        missing_active_consumer)
+          active_idle=120001
+          ;;
+        duplicate_active_consumer)
+          duplicate_consumer="${consumer%:*}:2"
+          ;;
+        malformed_consumer)
+          malformed_pending=true
+          ;;
+        truncated_inactive)
+          truncated_inactive=true
+          ;;
+        empty_stale_consumer_name)
+          historical_consumer=''
+          ;;
+        idle_at_active_threshold)
+          active_idle=120000
+          ;;
+      esac
+      active_idle="${active_idle:-500}"
+      if [[ "${truncated_inactive:-false}" == true ]]; then
+        printf 'name\n%s\npending\n0\nidle\n%s\ninactive\n' "$consumer" "$active_idle"
+      elif [[ "${malformed_pending:-false}" == true ]]; then
+        printf 'name\n%s\npending\ninvalid\nidle\n%s\ninactive\n%s\n' "$consumer" "$active_idle" "$active_idle"
+      else
+        printf 'name\n%s\npending\n0\nidle\n%s\ninactive\n%s\n' "$consumer" "$active_idle" "$active_idle"
+      fi
+      if [[ "${truncated_inactive:-false}" == true ]]; then
+        exit 0
+      fi
+      printf 'future-key\nfuture-value\n'
+      if [[ -n "${duplicate_consumer:-}" ]]; then
+        printf 'name\n%s\npending\n0\nidle\n500\ninactive\n500\n' "$duplicate_consumer"
+      fi
+      printf 'name\n%s\npending\n0\nidle\n120001\ninactive\n120001\n' "$historical_consumer"
+      exit 0
+      ;;
+    *) exit 1 ;;
+  esac
 fi
 
 if [[ "${1:-}" == "run" ]]; then
@@ -207,6 +280,26 @@ fi
 exit 2
 FAKE_DOCKER
 chmod +x "$FAKE_BIN/docker"
+
+assert_redis_cli_port_rejected() {
+  local label="$1"
+  shift
+  local rejected_output="$TEST_ROOT/redis-port-$label.out"
+  local rejected_exit
+  set +e
+  FAKE_DOCKER_CALLS="$CALLS" \
+    FAKE_DOCKER_ALL_CALLS="$ALL_CALLS" \
+    "$FAKE_BIN/docker" exec constructure_vp_redis "$@" >"$rejected_output" 2>&1
+  rejected_exit=$?
+  set -e
+  [[ "$rejected_exit" -ne 0 ]] || fail "$label Redis CLI port must be rejected"
+  assert_contains 'NOAUTH Authentication required.' "$rejected_output"
+}
+
+# Production Redis is host-networked on 6380. The fake models the container's
+# default-port NOAUTH response so the watcher cannot silently regress.
+assert_redis_cli_port_rejected missing-port redis-cli --raw XINFO GROUPS vp:events
+assert_redis_cli_port_rejected wrong-port redis-cli -p 6379 --raw XINFO GROUPS vp:events
 
 if [[ ! -f "$WATCHER" ]]; then
   fail "missing watcher: $WATCHER"
@@ -407,17 +500,20 @@ for pair in \
   'vp:events|orchestrator'; do
   stream="${pair%%|*}"
   group="${pair#*|}"
-  assert_contains "docker|exec|constructure_vp_redis|redis-cli|--raw|XINFO|GROUPS|$stream" "$CALLS"
+  assert_contains "docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|GROUPS|$stream" "$CALLS"
   assert_contains "stream=$stream group=$group status=healthy" "$OUTPUT"
 done
-[[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|--raw|XINFO|GROUPS|' "$CALLS")" -eq 4 ]] \
+[[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|GROUPS|' "$CALLS")" -eq 4 ]] \
   || fail "healthy run must query exactly 4 Redis streams"
+[[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|CONSUMERS|' "$CALLS")" -eq 4 ]] \
+  || fail "healthy run must query exactly 4 Redis consumer sets"
 assert_contains 'docker|run|--rm|--env|DATABASE_URL|vp-ffmpeg-worker-python:publisher-deployed|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
 assert_contains '|--channel-id|123e4567-e89b-12d3-a456-426614174000' "$CALLS"
 assert_contains '|--started-at|2026-07-19T18:30:00Z' "$CALLS"
 assert_not_contains "$SECRET_URL" "$CALLS"
 assert_not_contains "$SECRET_URL" "$OUTPUT"
 assert_not_contains '|--apply' "$CALLS"
+assert_not_contains '|--external-condition|redis_consumer_identity_invalid' "$CALLS"
 
 # Auto-hold is the sole switch that adds the mutating guard flag.
 write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:30:00Z 1 45 30 true
@@ -460,6 +556,30 @@ run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "pending Redis assessment did not run"
 assert_contains '|--external-condition|redis_pending_exceeded' "$CALLS"
 
+for consumer_mode in \
+  unknown_consumer \
+  near_match_consumer \
+  missing_active_consumer \
+  duplicate_active_consumer \
+  malformed_consumer \
+  truncated_inactive \
+  empty_stale_consumer_name \
+  empty_consumer_response \
+  consumer_exec_failure; do
+  FAKE_DOCKER_MODE="$consumer_mode"
+  run_watcher
+  [[ "$WATCHER_EXIT" -eq 0 ]] || fail "$consumer_mode Redis identity assessment did not run"
+  assert_contains '|--external-condition|redis_consumer_identity_invalid' "$CALLS"
+done
+FAKE_DOCKER_MODE=healthy
+assert_not_contains '|--external-condition|unmanaged-worker@126:1' "$ALL_CALLS"
+
+FAKE_DOCKER_MODE=idle_at_active_threshold
+run_watcher
+[[ "$WATCHER_EXIT" -eq 0 ]] || fail "120000ms active idle boundary assessment did not run"
+assert_not_contains '|--external-condition|redis_consumer_identity_invalid' "$CALLS"
+FAKE_DOCKER_MODE=healthy
+
 # A missing publisher still runs and applies the guard in the companion image.
 write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:30:00Z 1 45 30 true
 FAKE_DOCKER_MODE=healthy
@@ -493,5 +613,8 @@ for forbidden_command in upload resume enqueue schedule-open schedule_open; do
     fail "aggregate Docker calls contained prohibited action '$forbidden_command'"
   fi
 done
+if tr '|' '\n' <"$ALL_CALLS" | grep -Fiqx -- DELCONSUMER; then
+  fail 'aggregate Docker calls deleted a Redis consumer'
+fi
 
 echo 'PASS: channelops soak watcher contract'

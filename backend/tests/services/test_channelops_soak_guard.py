@@ -583,6 +583,21 @@ async def test_allowed_external_conditions_are_sorted_and_deduplicated(soak_sess
 
 
 @pytest.mark.asyncio
+async def test_redis_consumer_identity_invalid_is_an_allowed_critical_condition(soak_session):
+    rows = await _seed_graph(soak_session)
+
+    assessment = await assess_channelops_soak(
+        soak_session,
+        _policy(rows["channel"].id),
+        external_conditions=("redis_consumer_identity_invalid",),
+        now=NOW,
+    )
+
+    assert assessment.critical_codes == ("redis_consumer_identity_invalid",)
+    assert "redis_consumer_identity_invalid" in ALLOWED_EXTERNAL_CONDITIONS
+
+
+@pytest.mark.asyncio
 async def test_unknown_external_condition_is_rejected_before_database_access():
     db = AsyncMock()
 

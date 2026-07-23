@@ -63,6 +63,7 @@ SCHEDULE_STATUS_PATH = "/internal/schedule/video/status"
 SCHEDULE_OPEN_PATH = "/internal/schedule/video/open"
 SCHEDULE_DRAIN_PATH = "/internal/schedule/video/drain"
 SCHEDULE_CLOSE_PATH = "/internal/schedule/video/close"
+SCHEDULE_MUTATION_ATTEMPTED_KEY = "mutation_may_have_been_attempted"
 RUNNABLE_JOB_STATUSES = {
     JobStatus.PENDING,
     JobStatus.WAITING_WINDOW,
@@ -100,9 +101,20 @@ CONNECTION_URL_PATTERN = re.compile(
 READINESS_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 NON_PUBLISHING_MAINTENANCE_QUEUE_KINDS = {"cleanup_expired", "ingest_discovery"}
 REDIS_PENDING_STREAM_GROUPS = (
+    ("vp:tasks:ffmpeg", "ffmpeg-workers"),
+    ("vp:tasks:ffmpeg_go", "ffmpeg_go-workers"),
     ("vp:tasks:youtube_publisher", "youtube_publisher-workers"),
     ("vp:events", "orchestrator"),
 )
+REDIS_CONSUMER_ACTIVE_IDLE_MS = 120_000
+REDIS_ACTIVE_CONSUMER_PATTERNS: dict[str, re.Pattern[str]] = {
+    "vp:tasks:ffmpeg": re.compile(r"^ffmpeg-worker@150-gpu:[1-9][0-9]*$"),
+    "vp:tasks:ffmpeg_go": re.compile(r"^ffmpeg_go-worker@colima-127:[1-9][0-9]*$"),
+    "vp:tasks:youtube_publisher": re.compile(
+        r"^youtube_publisher-worker@150-publisher:[1-9][0-9]*$"
+    ),
+    "vp:events": re.compile(r"^orchestrator-api-[1-9][0-9]*$"),
+}
 
 
 class CanaryError(RuntimeError):
@@ -770,6 +782,8 @@ async def mutate_schedule(
     if action == "open":
         if expected_job_id is None:
             raise CanaryError("schedule open requires the exact expected job ID")
+    evidence.setdefault("schedule", {})[SCHEDULE_MUTATION_ATTEMPTED_KEY] = True
+    if action == "open":
         payload = await request_json(
             client,
             "POST",
@@ -1737,10 +1751,41 @@ async def redis_pending_audit(redis_url: str) -> dict[str, Any]:
             result: dict[str, Any] = {"available": True, "streams": {}}
             for stream, group in REDIS_PENDING_STREAM_GROUPS:
                 try:
-                    pending = await client.xpending(stream, group)
+                    pending_response = await client.xpending(stream, group)
+                    if not isinstance(pending_response, dict):
+                        raise TypeError("XPENDING response is not a mapping")
+                    pending = pending_response.get("pending")
+                    if type(pending) is not int or pending < 0:
+                        raise TypeError("XPENDING pending count is invalid")
+                    consumers = await client.xinfo_consumers(stream, group)
+                    if not isinstance(consumers, list):
+                        raise TypeError("XINFO CONSUMERS response is not a list")
+                    active_consumers: list[str] = []
+                    stale_consumer_count = 0
+                    for consumer in consumers:
+                        if not isinstance(consumer, dict):
+                            raise TypeError("XINFO CONSUMERS record is not a mapping")
+                        name = consumer.get("name")
+                        consumer_pending = consumer.get("pending")
+                        idle = consumer.get("idle")
+                        if (
+                            not isinstance(name, str)
+                            or not name
+                            or type(consumer_pending) is not int
+                            or consumer_pending < 0
+                            or type(idle) is not int
+                            or idle < 0
+                        ):
+                            raise TypeError("XINFO CONSUMERS record is invalid")
+                        if idle <= REDIS_CONSUMER_ACTIVE_IDLE_MS:
+                            active_consumers.append(name)
+                        else:
+                            stale_consumer_count += 1
                     result["streams"][stream] = {
                         "group": group,
-                        "pending": int(pending.get("pending", 0)),
+                        "pending": pending,
+                        "active_consumers": sorted(active_consumers),
+                        "stale_consumer_count": stale_consumer_count,
                     }
                 except Exception as exc:
                     result["streams"][stream] = {"group": group, "available": False, "reason": type(exc).__name__}
@@ -1752,6 +1797,10 @@ async def redis_pending_audit(redis_url: str) -> dict[str, Any]:
 
 
 def assert_zero_redis_pending(report: dict[str, Any]) -> None:
+    assert_redis_readiness_audit(report)
+
+
+def assert_redis_readiness_audit(report: dict[str, Any]) -> None:
     streams = report.get("streams")
     if report.get("available") is not True or not isinstance(streams, dict):
         raise CanaryError("Redis pending audit is unavailable")
@@ -1767,6 +1816,21 @@ def assert_zero_redis_pending(report: dict[str, Any]) -> None:
             raise CanaryError(f"Redis pending audit is unavailable for {stream}")
         if row["pending"] != 0:
             raise CanaryError(f"Redis pending audit found pending work for {stream}")
+        active_consumers = row.get("active_consumers")
+        stale_consumer_count = row.get("stale_consumer_count")
+        if (
+            not isinstance(active_consumers, list)
+            or any(not isinstance(name, str) for name in active_consumers)
+            or type(stale_consumer_count) is not int
+            or stale_consumer_count < 0
+        ):
+            raise CanaryError(f"Redis pending audit is unavailable for {stream}")
+        if len(active_consumers) != 1:
+            raise CanaryError(
+                f"Redis pending audit requires exactly one active consumer for {stream}"
+            )
+        if REDIS_ACTIVE_CONSUMER_PATTERNS[stream].fullmatch(active_consumers[0]) is None:
+            raise CanaryError(f"Redis consumer identity is invalid for {stream}")
 
 
 async def failure_cleanup(db: AsyncSession, channel_id: uuid.UUID) -> dict[str, Any]:
@@ -1959,7 +2023,7 @@ async def execute_preflight(
     evidence["deployment"] = await deployment_readiness(args, client)
     evidence["manager"] = {"auth": await manager_readiness(args, client)}
     evidence["redis_stream_pending_audit"] = await redis_pending_audit(args.redis_url)
-    assert_zero_redis_pending(evidence["redis_stream_pending_audit"])
+    assert_redis_readiness_audit(evidence["redis_stream_pending_audit"])
     evidence["status"] = "succeeded"
     atomic_write_json(path, evidence)
 
@@ -1985,6 +2049,9 @@ async def execute_canary(
     assert_no_preexisting_backlog(preexisting)
     evidence["deployment"] = await deployment_readiness(args, client)
     evidence["manager"] = {"auth": await manager_readiness(args, client)}
+    startup_audit = await redis_pending_audit(args.redis_url)
+    evidence["redis_stream_startup_audit"] = startup_audit
+    assert_redis_readiness_audit(startup_audit)
     atomic_write_json(path, evidence)
 
     generated_at = utc_now().isoformat()
@@ -2250,6 +2317,19 @@ async def close_schedule_for_mode(
     evidence: dict[str, Any],
 ) -> None:
     if mode == MODE_LIVE:
+        schedule = evidence.setdefault("schedule", {})
+        if schedule.get(SCHEDULE_MUTATION_ATTEMPTED_KEY) is True:
+            await close_schedule(args, client, evidence)
+            return
+        payload = await schedule_status(args, client)
+        record_schedule(evidence, "final_readonly_check", payload)
+        if (
+            payload.get("state") == "CLOSED"
+            and "guarded_job_id" in payload
+            and payload["guarded_job_id"] is None
+        ):
+            schedule["final_state"] = "CLOSED"
+            return
         await close_schedule(args, client, evidence)
 
 
@@ -2306,6 +2386,7 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
                             timeout=httpx.Timeout(30.0),
                             follow_redirects=True,
                         ) as client:
+                            execution_error: BaseException | None = None
                             try:
                                 await execute_selected_mode(
                                     mode,
@@ -2316,6 +2397,7 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
                                     path,
                                 )
                             except BaseException as exc:
+                                execution_error = exc
                                 evidence["status"] = "failed"
                                 evidence["failure"] = {
                                     "type": type(exc).__name__,
@@ -2352,14 +2434,42 @@ async def run(args: argparse.Namespace, database_url: str) -> Path:
                                 except BaseException as exc:
                                     close_error = exc
                                     mark_schedule_close_failure(evidence, close_error)
-                                if "redis_stream_pending_audit" not in evidence:
-                                    evidence["redis_stream_pending_audit"] = await redis_pending_audit(
-                                        runtime_args.redis_url
-                                    )
+                                final_audit_error: BaseException | None = None
+                                if mode == MODE_LIVE or "redis_stream_pending_audit" not in evidence:
+                                    try:
+                                        evidence["redis_stream_pending_audit"] = await redis_pending_audit(
+                                            runtime_args.redis_url
+                                        )
+                                        if mode == MODE_LIVE:
+                                            assert_redis_readiness_audit(
+                                                evidence["redis_stream_pending_audit"]
+                                            )
+                                    except BaseException as exc:
+                                        final_audit_error = exc
+                                        if "redis_stream_pending_audit" not in evidence:
+                                            evidence["redis_stream_pending_audit"] = {
+                                                "available": False,
+                                                "reason": type(exc).__name__,
+                                            }
+                                if (
+                                    final_audit_error is not None
+                                    and execution_error is None
+                                    and close_error is None
+                                ):
+                                    evidence["status"] = "failed"
+                                    evidence["failure"] = {
+                                        "type": type(final_audit_error).__name__,
+                                        "message": safe_failure_message(final_audit_error),
+                                        "at": utc_now().isoformat(),
+                                    }
                                 evidence["completed_at"] = utc_now().isoformat()
                                 atomic_write_json(path, evidence)
                                 if close_error is not None:
                                     raise CanaryError("final schedule close failed") from close_error
+                                if final_audit_error is not None and execution_error is None:
+                                    if isinstance(final_audit_error, CanaryError):
+                                        raise final_audit_error
+                                    raise CanaryError("final Redis pending audit failed") from final_audit_error
                     finally:
                         await db.close()
                         await release_advisory_lock(connection)

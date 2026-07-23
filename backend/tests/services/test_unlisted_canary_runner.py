@@ -4,12 +4,13 @@ import asyncio
 import importlib.util
 import json
 import subprocess
+import sys
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 from sqlalchemy import event, func, select
@@ -53,6 +54,791 @@ def load_runner() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def approved_redis_readiness_audit() -> dict:
+    return {
+        "available": True,
+        "streams": {
+            "vp:tasks:ffmpeg": {
+                "group": "ffmpeg-workers",
+                "pending": 0,
+                "active_consumers": ["ffmpeg-worker@150-gpu:1"],
+                "stale_consumer_count": 83,
+            },
+            "vp:tasks:ffmpeg_go": {
+                "group": "ffmpeg_go-workers",
+                "pending": 0,
+                "active_consumers": ["ffmpeg_go-worker@colima-127:1"],
+                "stale_consumer_count": 9,
+            },
+            "vp:tasks:youtube_publisher": {
+                "group": "youtube_publisher-workers",
+                "pending": 0,
+                "active_consumers": ["youtube_publisher-worker@150-publisher:1"],
+                "stale_consumer_count": 0,
+            },
+            "vp:events": {
+                "group": "orchestrator",
+                "pending": 0,
+                "active_consumers": ["orchestrator-api-1"],
+                "stale_consumer_count": 0,
+            },
+        },
+    }
+
+
+def install_fake_redis(
+    monkeypatch: pytest.MonkeyPatch,
+    client: object,
+) -> None:
+    redis_module = ModuleType("redis")
+    asyncio_module = ModuleType("redis.asyncio")
+    asyncio_module.from_url = lambda *_args, **_kwargs: client
+    redis_module.asyncio = asyncio_module
+    monkeypatch.setitem(sys.modules, "redis", redis_module)
+    monkeypatch.setitem(sys.modules, "redis.asyncio", asyncio_module)
+
+
+@pytest.mark.anyio
+async def test_redis_pending_audit_records_four_stream_active_consumer_identities(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = load_runner()
+    expected = approved_redis_readiness_audit()
+
+    class FakeRedis:
+        async def xpending(self, stream: str, _group: str):
+            return {"pending": expected["streams"][stream]["pending"]}
+
+        async def xinfo_consumers(self, stream: str, _group: str):
+            row = expected["streams"][stream]
+            return [
+                {"name": row["active_consumers"][0], "pending": 0, "idle": 500},
+                *[
+                    {
+                        "name": f"retired-{stream}-{index}",
+                        "pending": 0,
+                        "idle": 120_001,
+                    }
+                    for index in range(row["stale_consumer_count"])
+                ],
+            ]
+
+        async def aclose(self):
+            return None
+
+    install_fake_redis(monkeypatch, FakeRedis())
+
+    audit = await runner.redis_pending_audit("redis://cache/0")
+
+    assert audit == expected
+    runner.assert_redis_readiness_audit(audit)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("event_consumers", "reason"),
+    (
+        ([{"name": "orchestrator-api-1", "pending": 0, "idle": "500"}], "TypeError"),
+        (ConnectionError("Redis unavailable"), "ConnectionError"),
+    ),
+)
+async def test_redis_pending_audit_marks_malformed_or_unavailable_xinfo_consumers(
+    monkeypatch: pytest.MonkeyPatch,
+    event_consumers: object,
+    reason: str,
+):
+    runner = load_runner()
+    expected = approved_redis_readiness_audit()
+
+    class FakeRedis:
+        async def xpending(self, _stream: str, _group: str):
+            return {"pending": 0}
+
+        async def xinfo_consumers(self, stream: str, _group: str):
+            if stream == "vp:events":
+                if isinstance(event_consumers, BaseException):
+                    raise event_consumers
+                return event_consumers
+            return [
+                {
+                    "name": expected["streams"][stream]["active_consumers"][0],
+                    "pending": 0,
+                    "idle": 500,
+                }
+            ]
+
+        async def aclose(self):
+            return None
+
+    install_fake_redis(monkeypatch, FakeRedis())
+
+    audit = await runner.redis_pending_audit("redis://cache/0")
+
+    assert audit["streams"]["vp:events"] == {
+        "group": "orchestrator",
+        "available": False,
+        "reason": reason,
+    }
+    with pytest.raises(runner.CanaryError, match="unavailable for vp:events"):
+        runner.assert_redis_readiness_audit(audit)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("pending_response", "event_consumers"),
+    (
+        ([], []),
+        ({"pending": "0"}, []),
+        ({"pending": True}, []),
+        ({"pending": -1}, []),
+        ({"pending": 0}, {"name": "orchestrator-api-1", "pending": 0, "idle": 1}),
+        ({"pending": 0}, ["not-a-consumer-record"]),
+        ({"pending": 0}, [{"name": "orchestrator-api-1", "pending": True, "idle": 1}]),
+        ({"pending": 0}, [{"name": "orchestrator-api-1", "pending": -1, "idle": 1}]),
+        ({"pending": 0}, [{"name": "orchestrator-api-1", "pending": 0, "idle": True}]),
+        ({"pending": 0}, [{"name": "orchestrator-api-1", "pending": 0, "idle": -1}]),
+        ({"pending": 0}, [{"name": b"orchestrator-api-1", "pending": 0, "idle": 1}]),
+    ),
+)
+async def test_redis_pending_audit_rejects_malformed_raw_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    pending_response: object,
+    event_consumers: object,
+):
+    runner = load_runner()
+    approved = approved_redis_readiness_audit()
+
+    class FakeRedis:
+        async def xpending(self, stream: str, _group: str):
+            if stream == "vp:events":
+                return pending_response
+            return {"pending": 0}
+
+        async def xinfo_consumers(self, stream: str, _group: str):
+            if stream == "vp:events":
+                return event_consumers
+            return [
+                {
+                    "name": approved["streams"][stream]["active_consumers"][0],
+                    "pending": 0,
+                    "idle": 1,
+                }
+            ]
+
+        async def aclose(self):
+            return None
+
+    install_fake_redis(monkeypatch, FakeRedis())
+
+    audit = await runner.redis_pending_audit("redis://cache/0")
+
+    assert audit["streams"]["vp:events"] == {
+        "group": "orchestrator",
+        "available": False,
+        "reason": "TypeError",
+    }
+
+
+@pytest.mark.anyio
+async def test_redis_pending_audit_treats_idle_limit_as_active(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = load_runner()
+    approved = approved_redis_readiness_audit()
+
+    class FakeRedis:
+        async def xpending(self, _stream: str, _group: str):
+            return {"pending": 0}
+
+        async def xinfo_consumers(self, stream: str, _group: str):
+            name = approved["streams"][stream]["active_consumers"][0]
+            return [
+                {
+                    "name": name,
+                    "pending": 0,
+                    "idle": runner.REDIS_CONSUMER_ACTIVE_IDLE_MS,
+                }
+            ]
+
+        async def aclose(self):
+            return None
+
+    install_fake_redis(monkeypatch, FakeRedis())
+
+    audit = await runner.redis_pending_audit("redis://cache/0")
+
+    assert audit["streams"]["vp:events"]["active_consumers"] == ["orchestrator-api-1"]
+    assert audit["streams"]["vp:events"]["stale_consumer_count"] == 0
+    runner.assert_redis_readiness_audit(audit)
+
+
+@pytest.mark.anyio
+async def test_redis_pending_audit_rejects_empty_stale_consumer_name(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = load_runner()
+    approved = approved_redis_readiness_audit()
+
+    class FakeRedis:
+        async def xpending(self, _stream: str, _group: str):
+            return {"pending": 0}
+
+        async def xinfo_consumers(self, stream: str, _group: str):
+            name = approved["streams"][stream]["active_consumers"][0]
+            return [
+                {"name": name, "pending": 0, "idle": 1},
+                {"name": "", "pending": 0, "idle": 120_001},
+            ]
+
+        async def aclose(self):
+            return None
+
+    install_fake_redis(monkeypatch, FakeRedis())
+
+    audit = await runner.redis_pending_audit("redis://cache/0")
+
+    assert audit["streams"]["vp:events"] == {
+        "group": "orchestrator",
+        "available": False,
+        "reason": "TypeError",
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "event_consumers",
+    (
+        [{"name": "orchestrator-api-01", "pending": 0, "idle": 1}],
+        [
+            {"name": "orchestrator-api-1", "pending": 0, "idle": 1},
+            {"name": "orchestrator-api-1", "pending": 0, "idle": 1},
+        ],
+    ),
+)
+async def test_redis_pending_audit_rejects_near_match_and_duplicate_active_records(
+    monkeypatch: pytest.MonkeyPatch,
+    event_consumers: list[dict[str, object]],
+):
+    runner = load_runner()
+    approved = approved_redis_readiness_audit()
+
+    class FakeRedis:
+        async def xpending(self, _stream: str, _group: str):
+            return {"pending": 0}
+
+        async def xinfo_consumers(self, stream: str, _group: str):
+            if stream == "vp:events":
+                return event_consumers
+            return [
+                {
+                    "name": approved["streams"][stream]["active_consumers"][0],
+                    "pending": 0,
+                    "idle": 1,
+                }
+            ]
+
+        async def aclose(self):
+            return None
+
+    install_fake_redis(monkeypatch, FakeRedis())
+
+    audit = await runner.redis_pending_audit("redis://cache/0")
+
+    with pytest.raises(runner.CanaryError):
+        runner.assert_redis_readiness_audit(audit)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("action", ("open", "drain"))
+async def test_mutate_schedule_marks_possible_attempt_before_post(
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+):
+    runner = load_runner()
+    evidence = {"schedule": {"transitions": []}}
+    expected_job_id = uuid.uuid4()
+
+    async def request_json(_client, method: str, _url: str, **_kwargs):
+        assert method == "POST"
+        assert evidence["schedule"]["mutation_may_have_been_attempted"] is True
+        if action == "open":
+            return {
+                "state": "OPEN",
+                "released_jobs": 1,
+                "guarded_job_id": str(expected_job_id),
+            }
+        return {"state": "DRAINING", "guarded_job_id": None}
+
+    monkeypatch.setattr(runner, "request_json", request_json)
+
+    await runner.mutate_schedule(
+        SimpleNamespace(api_url="http://api"),
+        object(),
+        evidence,
+        action,
+        expected_job_id=expected_job_id if action == "open" else None,
+    )
+
+
+@pytest.mark.anyio
+async def test_run_live_startup_audit_failure_makes_no_schedule_post(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    startup_audit = approved_redis_readiness_audit()
+    startup_audit["streams"]["vp:events"]["active_consumers"] = ["unknown-worker"]
+    schedule_status = AsyncMock(
+        side_effect=(
+            {"state": "CLOSED", "guarded_job_id": None},
+            {"state": "CLOSED", "guarded_job_id": None},
+        )
+    )
+    close_schedule = AsyncMock()
+    mutate_schedule = AsyncMock()
+    redis_audit = AsyncMock(side_effect=(startup_audit, approved_redis_readiness_audit()))
+    monkeypatch.setattr(runner, "acquire_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "release_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "schedule_status", schedule_status)
+    monkeypatch.setattr(runner, "close_schedule", close_schedule)
+    monkeypatch.setattr(runner, "mutate_schedule", mutate_schedule)
+    monkeypatch.setattr(
+        runner,
+        "active_backlog",
+        AsyncMock(
+            return_value={
+                "runnable_job_ids": [],
+                "unsafe_queue_item_ids": [],
+                "unsafe_task_ids": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(runner, "deployment_readiness", AsyncMock(return_value={"ready": True}))
+    monkeypatch.setattr(runner, "manager_readiness", AsyncMock(return_value={"authenticated": True}))
+    monkeypatch.setattr(runner, "redis_pending_audit", redis_audit)
+    args = SimpleNamespace(
+        evidence=tmp_path / "startup-audit-failure.json",
+        preflight_only=False,
+        confirm_live_unlisted=True,
+        api_url="http://api",
+        redis_url="redis://cache/0",
+        youtube_manager_url="",
+        shared_services_ssh_host="",
+    )
+
+    with pytest.raises(runner.CanaryError, match="identity is invalid"):
+        await runner.run(args, "sqlite+aiosqlite:///:memory:")
+
+    payload = json.loads(args.evidence.read_text())
+    close_schedule.assert_not_awaited()
+    mutate_schedule.assert_not_awaited()
+    assert schedule_status.await_count == 2
+    assert payload["schedule"]["final_state"] == "CLOSED"
+    assert "mutation_may_have_been_attempted" not in payload["schedule"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("final_audit", "message"),
+    (
+        ({"available": False, "reason": "ConnectionError"}, "Redis pending audit is unavailable"),
+        (
+            {
+                **approved_redis_readiness_audit(),
+                "streams": {
+                    **approved_redis_readiness_audit()["streams"],
+                    "vp:events": {
+                        **approved_redis_readiness_audit()["streams"]["vp:events"],
+                        "pending": 1,
+                    },
+                },
+            },
+            "found pending work",
+        ),
+    ),
+)
+async def test_run_live_fails_closed_on_invalid_final_redis_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    final_audit: dict,
+    message: str,
+):
+    runner = load_runner()
+
+    async def execute_selected_mode(_mode, _args, _db, _client, evidence, _path):
+        evidence["status"] = "succeeded"
+
+    monkeypatch.setattr(runner, "acquire_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "release_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "execute_selected_mode", execute_selected_mode)
+    monkeypatch.setattr(runner, "close_schedule_for_mode", AsyncMock())
+    monkeypatch.setattr(runner, "redis_pending_audit", AsyncMock(return_value=final_audit))
+    args = SimpleNamespace(
+        evidence=tmp_path / "invalid-final-audit.json",
+        preflight_only=False,
+        confirm_live_unlisted=True,
+        redis_url="redis://cache/0",
+        youtube_manager_url="",
+        shared_services_ssh_host="",
+    )
+
+    with pytest.raises(runner.CanaryError, match=message):
+        await runner.run(args, "sqlite+aiosqlite:///:memory:")
+
+    payload = json.loads(args.evidence.read_text())
+    assert payload["status"] == "failed"
+    assert payload["redis_stream_pending_audit"] == final_audit
+
+
+@pytest.mark.anyio
+async def test_run_live_marks_invalid_final_audit_failed_before_first_final_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    writes: list[dict] = []
+    final_audit = {"available": False, "reason": "ConnectionError"}
+
+    async def execute_selected_mode(_mode, _args, _db, _client, evidence, _path):
+        evidence["status"] = "succeeded"
+
+    def capture_write(_path: Path, evidence: dict) -> None:
+        writes.append(json.loads(json.dumps(evidence)))
+
+    monkeypatch.setattr(runner, "atomic_write_json", capture_write)
+    monkeypatch.setattr(runner, "acquire_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "release_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "execute_selected_mode", execute_selected_mode)
+    monkeypatch.setattr(runner, "close_schedule_for_mode", AsyncMock())
+    monkeypatch.setattr(runner, "redis_pending_audit", AsyncMock(return_value=final_audit))
+    args = SimpleNamespace(
+        evidence=tmp_path / "final-audit-write-order.json",
+        preflight_only=False,
+        confirm_live_unlisted=True,
+        redis_url="redis://cache/0",
+        youtube_manager_url="",
+        shared_services_ssh_host="",
+    )
+
+    with pytest.raises(runner.CanaryError, match="Redis pending audit is unavailable"):
+        await runner.run(args, "sqlite+aiosqlite:///:memory:")
+
+    final_audit_writes = [
+        write for write in writes if write.get("redis_stream_pending_audit") == final_audit
+    ]
+    assert final_audit_writes
+    assert final_audit_writes[0]["status"] == "failed"
+    assert final_audit_writes[0]["failure"]["message"] == "Redis pending audit is unavailable"
+
+
+@pytest.mark.anyio
+async def test_run_live_preserves_schedule_close_failure_over_invalid_final_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    final_audit = {"available": False, "reason": "ConnectionError"}
+
+    async def execute_selected_mode(_mode, _args, _db, _client, evidence, _path):
+        evidence["status"] = "succeeded"
+
+    monkeypatch.setattr(runner, "acquire_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "release_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "execute_selected_mode", execute_selected_mode)
+    monkeypatch.setattr(
+        runner,
+        "close_schedule_for_mode",
+        AsyncMock(side_effect=RuntimeError("close transport failed")),
+    )
+    monkeypatch.setattr(runner, "redis_pending_audit", AsyncMock(return_value=final_audit))
+    args = SimpleNamespace(
+        evidence=tmp_path / "schedule-close-final-audit.json",
+        preflight_only=False,
+        confirm_live_unlisted=True,
+        redis_url="redis://cache/0",
+        youtube_manager_url="",
+        shared_services_ssh_host="",
+    )
+
+    with pytest.raises(runner.CanaryError, match="final schedule close failed"):
+        await runner.run(args, "sqlite+aiosqlite:///:memory:")
+
+    payload = json.loads(args.evidence.read_text())
+    assert payload["status"] == "failed"
+    assert payload["failure"]["message"] == "final schedule close failed"
+    assert payload["redis_stream_pending_audit"] == final_audit
+
+
+@pytest.mark.anyio
+async def test_run_live_preserves_primary_failure_when_final_audit_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    final_audit = {"available": False, "reason": "ConnectionError"}
+
+    async def execute_selected_mode(*_args):
+        raise runner.CanaryError("primary failure")
+
+    monkeypatch.setattr(runner, "acquire_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "release_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "execute_selected_mode", execute_selected_mode)
+    monkeypatch.setattr(runner, "close_schedule_for_mode", AsyncMock())
+    monkeypatch.setattr(runner, "redis_pending_audit", AsyncMock(return_value=final_audit))
+    args = SimpleNamespace(
+        evidence=tmp_path / "primary-failure-final-audit.json",
+        preflight_only=False,
+        confirm_live_unlisted=True,
+        redis_url="redis://cache/0",
+        youtube_manager_url="",
+        shared_services_ssh_host="",
+    )
+
+    with pytest.raises(runner.CanaryError, match="primary failure"):
+        await runner.run(args, "sqlite+aiosqlite:///:memory:")
+
+    payload = json.loads(args.evidence.read_text())
+    assert payload["failure"]["message"] == "primary failure"
+    assert payload["redis_stream_pending_audit"] == final_audit
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate", "message"),
+    (
+        (
+            "no active consumer",
+            lambda report: report["streams"]["vp:events"].update(active_consumers=[]),
+            "exactly one active consumer",
+        ),
+        (
+            "two active consumers",
+            lambda report: report["streams"]["vp:events"].update(
+                active_consumers=["orchestrator-api-1", "orchestrator-api-2"]
+            ),
+            "exactly one active consumer",
+        ),
+        (
+            "unknown active consumer",
+            lambda report: report["streams"]["vp:events"].update(
+                active_consumers=["orchestrator-api-0"]
+            ),
+            "identity is invalid",
+        ),
+        (
+            "malformed idle response",
+            lambda report: report["streams"]["vp:events"].update(
+                available=False,
+                reason="TypeError",
+            ),
+            "unavailable for vp:events",
+        ),
+        (
+            "unavailable XINFO CONSUMERS",
+            lambda report: report["streams"]["vp:events"].update(
+                available=False,
+                reason="ConnectionError",
+            ),
+            "unavailable for vp:events",
+        ),
+        (
+            "nonzero pending",
+            lambda report: report["streams"]["vp:events"].update(pending=1),
+            "found pending work",
+        ),
+    ),
+)
+def test_assert_redis_readiness_audit_fails_closed(
+    label: str,
+    mutate,
+    message: str,
+):
+    runner = load_runner()
+    audit = approved_redis_readiness_audit()
+    mutate(audit)
+
+    with pytest.raises(runner.CanaryError, match=message):
+        runner.assert_redis_readiness_audit(audit)
+
+
+@pytest.mark.anyio
+async def test_execute_canary_redis_identity_audit_runs_before_media_generation(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    calls: list[str] = []
+    safe_audit = approved_redis_readiness_audit()
+
+    async def schedule_status(*_args):
+        calls.append("schedule_status")
+        return {"state": "CLOSED", "guarded_job_id": None}
+
+    async def active_backlog(*_args, **_kwargs):
+        calls.append("active_backlog")
+        return {
+            "runnable_job_ids": [],
+            "unsafe_queue_item_ids": [],
+            "unsafe_task_ids": [],
+        }
+
+    async def deployment_readiness(*_args):
+        calls.append("deployment_readiness")
+        return {"channelops_task_wait_seconds": 1}
+
+    async def manager_readiness(*_args):
+        calls.append("manager_readiness")
+        return {"authenticated": True}
+
+    async def redis_pending_audit(*_args):
+        calls.append("redis_pending_audit")
+        return safe_audit
+
+    class MediaGenerationReached(RuntimeError):
+        pass
+
+    def generate_owned_video(*_args, **_kwargs):
+        calls.append("generate_owned_video")
+        raise MediaGenerationReached
+
+    monkeypatch.setattr(runner, "schedule_status", schedule_status)
+    monkeypatch.setattr(runner, "active_backlog", active_backlog)
+    monkeypatch.setattr(runner, "deployment_readiness", deployment_readiness)
+    monkeypatch.setattr(runner, "manager_readiness", manager_readiness)
+    monkeypatch.setattr(runner, "redis_pending_audit", redis_pending_audit)
+    monkeypatch.setattr(runner, "generate_owned_video", generate_owned_video)
+    evidence = {"run_id": "run", "schedule": {"transitions": []}}
+
+    with pytest.raises(MediaGenerationReached):
+        await runner.execute_canary(
+            SimpleNamespace(redis_url="redis://cache/0"),
+            db,
+            object(),
+            evidence,
+            tmp_path / "live.json",
+        )
+
+    assert calls[:5] == [
+        "schedule_status",
+        "active_backlog",
+        "deployment_readiness",
+        "manager_readiness",
+        "redis_pending_audit",
+    ]
+    assert evidence["redis_stream_startup_audit"] == safe_audit
+
+
+@pytest.mark.anyio
+async def test_execute_canary_redis_rejects_unknown_active_consumer_before_side_effects(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    calls: list[str] = []
+    unsafe_audit = approved_redis_readiness_audit()
+    unsafe_audit["streams"]["vp:events"]["active_consumers"] = ["unknown-worker"]
+
+    async def schedule_status(*_args):
+        calls.append("schedule_status")
+        return {"state": "CLOSED", "guarded_job_id": None}
+
+    async def active_backlog(*_args, **_kwargs):
+        calls.append("active_backlog")
+        return {
+            "runnable_job_ids": [],
+            "unsafe_queue_item_ids": [],
+            "unsafe_task_ids": [],
+        }
+
+    async def deployment_readiness(*_args):
+        calls.append("deployment_readiness")
+        return {"channelops_task_wait_seconds": 1}
+
+    async def manager_readiness(*_args):
+        calls.append("manager_readiness")
+        return {"authenticated": True}
+
+    async def redis_pending_audit(*_args):
+        calls.append("redis_pending_audit")
+        return unsafe_audit
+
+    generate_owned_video = Mock(side_effect=AssertionError("media generation ran"))
+    upload_and_attest_asset = AsyncMock(side_effect=AssertionError("asset upload ran"))
+    create_canary_graph = AsyncMock(side_effect=AssertionError("enqueue ran"))
+    mutate_schedule = AsyncMock(side_effect=AssertionError("schedule mutation ran"))
+    monkeypatch.setattr(runner, "schedule_status", schedule_status)
+    monkeypatch.setattr(runner, "active_backlog", active_backlog)
+    monkeypatch.setattr(runner, "deployment_readiness", deployment_readiness)
+    monkeypatch.setattr(runner, "manager_readiness", manager_readiness)
+    monkeypatch.setattr(runner, "redis_pending_audit", redis_pending_audit)
+    monkeypatch.setattr(runner, "generate_owned_video", generate_owned_video)
+    monkeypatch.setattr(runner, "upload_and_attest_asset", upload_and_attest_asset)
+    monkeypatch.setattr(runner, "create_canary_graph", create_canary_graph)
+    monkeypatch.setattr(runner, "mutate_schedule", mutate_schedule)
+    evidence = {"run_id": "run", "schedule": {"transitions": []}}
+
+    with pytest.raises(runner.CanaryError, match="identity is invalid"):
+        await runner.execute_canary(
+            SimpleNamespace(redis_url="redis://cache/0"),
+            db,
+            object(),
+            evidence,
+            tmp_path / "live.json",
+        )
+
+    assert calls == [
+        "schedule_status",
+        "active_backlog",
+        "deployment_readiness",
+        "manager_readiness",
+        "redis_pending_audit",
+    ]
+    assert evidence["redis_stream_startup_audit"] == unsafe_audit
+    generate_owned_video.assert_not_called()
+    upload_and_attest_asset.assert_not_awaited()
+    create_canary_graph.assert_not_awaited()
+    mutate_schedule.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_run_keeps_live_final_redis_audit_separate_from_startup_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    runner = load_runner()
+    startup_audit = approved_redis_readiness_audit()
+    final_audit = approved_redis_readiness_audit()
+    final_audit["streams"]["vp:events"]["stale_consumer_count"] = 1
+
+    async def execute_selected_mode(_mode, _args, _db, _client, evidence, _path):
+        evidence["redis_stream_startup_audit"] = startup_audit
+        evidence["redis_stream_pending_audit"] = {"historical": True}
+        evidence["status"] = "succeeded"
+
+    redis_audit = AsyncMock(return_value=final_audit)
+    monkeypatch.setattr(runner, "acquire_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "release_advisory_lock", AsyncMock())
+    monkeypatch.setattr(runner, "execute_selected_mode", execute_selected_mode)
+    monkeypatch.setattr(runner, "close_schedule_for_mode", AsyncMock())
+    monkeypatch.setattr(runner, "redis_pending_audit", redis_audit)
+    args = SimpleNamespace(
+        evidence=tmp_path / "live-final-audit.json",
+        preflight_only=False,
+        confirm_live_unlisted=True,
+        redis_url="redis://cache/0",
+        youtube_manager_url="",
+        shared_services_ssh_host="",
+    )
+
+    path = await runner.run(args, "sqlite+aiosqlite:///:memory:")
+
+    payload = json.loads(path.read_text())
+    assert payload["redis_stream_startup_audit"] == startup_audit
+    assert payload["redis_stream_pending_audit"] == final_audit
+    redis_audit.assert_awaited_once_with("redis://cache/0")
 
 
 @pytest.mark.parametrize(
@@ -439,9 +1225,11 @@ async def test_mode_aware_dispatch_and_schedule_close(monkeypatch: pytest.Monkey
     preflight = AsyncMock()
     canary = AsyncMock()
     close = AsyncMock()
+    final_status = AsyncMock(return_value={"state": "CLOSED", "guarded_job_id": None})
     monkeypatch.setattr(runner, "execute_preflight", preflight)
     monkeypatch.setattr(runner, "execute_canary", canary)
     monkeypatch.setattr(runner, "close_schedule", close)
+    monkeypatch.setattr(runner, "schedule_status", final_status)
     values = (object(), object(), object(), {}, Path("evidence.json"))
 
     await runner.execute_selected_mode(runner.MODE_PREFLIGHT, *values)
@@ -465,7 +1253,45 @@ async def test_mode_aware_dispatch_and_schedule_close(monkeypatch: pytest.Monkey
     )
 
     canary.assert_awaited_once_with(*values)
+    close.assert_not_awaited()
+    final_status.assert_awaited_once_with(values[0], values[2])
+    assert values[3]["schedule"]["final_state"] == "CLOSED"
+
+    values[3]["schedule"][runner.SCHEDULE_MUTATION_ATTEMPTED_KEY] = True
+    await runner.close_schedule_for_mode(
+        runner.MODE_LIVE,
+        values[0],
+        values[2],
+        values[3],
+    )
+
     close.assert_awaited_once_with(values[0], values[2], values[3])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "final_status_payload",
+    (
+        {"state": "OPEN", "guarded_job_id": None},
+        {"state": "CLOSED", "guarded_job_id": str(uuid.uuid4())},
+        {"state": "CLOSED"},
+    ),
+)
+async def test_live_finalization_closes_after_unsafe_readonly_status(
+    monkeypatch: pytest.MonkeyPatch,
+    final_status_payload: dict,
+):
+    runner = load_runner()
+    args = SimpleNamespace(api_url="http://api")
+    client = object()
+    evidence = {"schedule": {"transitions": []}}
+    close = AsyncMock()
+    monkeypatch.setattr(runner, "schedule_status", AsyncMock(return_value=final_status_payload))
+    monkeypatch.setattr(runner, "close_schedule", close)
+
+    await runner.close_schedule_for_mode(runner.MODE_LIVE, args, client, evidence)
+
+    close.assert_awaited_once_with(args, client, evidence)
 
 
 @pytest.mark.anyio
@@ -809,19 +1635,11 @@ async def test_run_preserves_failed_preflight_redis_audit_and_root_failure(
     tmp_path: Path,
 ):
     runner = load_runner()
-    audit = {
-        "available": True,
-        "streams": {
-            "vp:events": {
-                "available": False,
-                "group": "orchestrator",
-                "reason": "ConnectionError",
-            },
-            "vp:tasks:youtube_publisher": {
-                "group": "youtube_publisher-workers",
-                "pending": 0,
-            },
-        },
+    audit = approved_redis_readiness_audit()
+    audit["streams"]["vp:events"] = {
+        "available": False,
+        "group": "orchestrator",
+        "reason": "ConnectionError",
     }
     redis_audit = AsyncMock(return_value=audit)
 
@@ -927,16 +1745,7 @@ async def test_execute_preflight_reads_readiness_without_live_side_effects(
 
     async def redis_pending_audit(_redis_url):
         calls.append("redis_pending_audit")
-        return {
-            "available": True,
-            "streams": {
-                "vp:events": {"group": "orchestrator", "pending": 0},
-                "vp:tasks:youtube_publisher": {
-                    "group": "youtube_publisher-workers",
-                    "pending": 0,
-                },
-            },
-        }
+        return approved_redis_readiness_audit()
 
     async def forbidden(*_args, **_kwargs):
         raise AssertionError("preflight invoked a live mutation")
@@ -1195,6 +2004,11 @@ async def test_execute_canary_final_recheck_requires_closed_unowned_schedule(
         AsyncMock(return_value={"channelops_task_wait_seconds": 1}),
     )
     monkeypatch.setattr(runner, "manager_readiness", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        runner,
+        "redis_pending_audit",
+        AsyncMock(return_value=approved_redis_readiness_audit()),
+    )
     monkeypatch.setattr(runner, "generate_owned_video", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         runner,
@@ -1219,7 +2033,7 @@ async def test_execute_canary_final_recheck_requires_closed_unowned_schedule(
 
     with pytest.raises(runner.CanaryError, match="CLOSED with no guarded job"):
         await runner.execute_canary(
-            SimpleNamespace(timeout_seconds=10),
+            SimpleNamespace(timeout_seconds=10, redis_url="redis://cache/0"),
             db,
             object(),
             evidence,
@@ -1289,6 +2103,11 @@ async def test_execute_canary_preserves_entity_ids_across_poll_refreshes(
         AsyncMock(return_value={"channelops_task_wait_seconds": 1}),
     )
     monkeypatch.setattr(runner, "manager_readiness", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        runner,
+        "redis_pending_audit",
+        AsyncMock(return_value=approved_redis_readiness_audit()),
+    )
     monkeypatch.setattr(runner, "generate_owned_video", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         runner,
@@ -1424,6 +2243,7 @@ async def test_execute_canary_preserves_entity_ids_across_poll_refreshes(
         await runner.execute_canary(
             SimpleNamespace(
                 timeout_seconds=10,
+                redis_url="redis://cache/0",
                 youtube_manager_url="http://youtube-manager",
             ),
             db,

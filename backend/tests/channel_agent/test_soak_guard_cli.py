@@ -160,6 +160,30 @@ async def test_critical_assessment_returns_twenty_without_apply(monkeypatch, cap
 
 
 @pytest.mark.asyncio
+async def test_redis_consumer_identity_condition_is_accepted(monkeypatch, capsys):
+    read_session = object()
+    factory = _SessionFactory(read_session)
+    assess = AsyncMock(
+        return_value=SoakGuardAssessment(
+            critical_codes=("redis_consumer_identity_invalid",),
+            metrics={"channel_id": str(CHANNEL_ID), "external_condition_count": 1},
+        )
+    )
+    monkeypatch.setattr(soak_guard_cli, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(soak_guard_cli, "assess_channelops_soak", assess)
+
+    exit_code = await soak_guard_cli.run(
+        _arguments("--external-condition", "redis_consumer_identity_invalid")
+    )
+
+    assert exit_code == 20
+    assert assess.await_args.kwargs["external_conditions"] == (
+        "redis_consumer_identity_invalid",
+    )
+    assert _payload(capsys)["critical_codes"] == ["redis_consumer_identity_invalid"]
+
+
+@pytest.mark.asyncio
 async def test_apply_uses_fresh_session_and_exact_fail_closed_arguments(
     monkeypatch,
     capsys,
