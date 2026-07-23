@@ -22,6 +22,7 @@ VP_PDS_CI_WORKFLOW="ci.yml"
 VP_PYTHON_WORKER_SERVICE="vp-ffmpeg-worker-gpu-swarm"
 VP_PUBLISHER_SERVICE="vp-youtube-publisher-swarm"
 VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE $VP_PUBLISHER_SERVICE"
+VP_APP_ATTEMPTED_SERVICES=""
 
 vp_validate_deploy_config() {
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
@@ -702,6 +703,27 @@ vp_capture_app_snapshots() {
   done
 }
 
+vp_record_app_service_attempt() {
+  local service="$1"
+  case " $VP_APP_ATTEMPTED_SERVICES " in
+    *" $service "*)
+      return 0
+      ;;
+  esac
+  VP_APP_ATTEMPTED_SERVICES="${VP_APP_ATTEMPTED_SERVICES:+$VP_APP_ATTEMPTED_SERVICES }$service"
+}
+
+vp_app_service_was_attempted() {
+  local service="$1"
+  local attempted_services="$2"
+  case " $attempted_services " in
+    *" $service "*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 vp_restore_gpu_service() {
   local image="$1"
   local constraint
@@ -737,6 +759,7 @@ vp_restore_gpu_service() {
 
 vp_restore_app_snapshots() {
   local snapshots="$1"
+  local attempted_services="${2:-$VP_APP_SERVICES}"
   local service
   local image
   local gpu_was_present=false
@@ -745,6 +768,7 @@ vp_restore_app_snapshots() {
 
   while IFS='|' read -r service image; do
     [[ -n "$service" ]] || continue
+    vp_app_service_was_attempted "$service" "$attempted_services" || continue
     log "restore $service -> $image with dedicated VP placement"
     if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" ]]; then
       gpu_was_present=true
@@ -761,14 +785,16 @@ vp_restore_app_snapshots() {
     fi
   done < <(printf '%s\n' "$snapshots")
 
-  if [[ "$gpu_was_present" != true ]] \
+  if vp_app_service_was_attempted "$VP_PYTHON_WORKER_SERVICE" "$attempted_services" \
+    && [[ "$gpu_was_present" != true ]] \
     && docker service inspect "$VP_PYTHON_WORKER_SERVICE" >/dev/null 2>&1; then
     log "remove newly created $VP_PYTHON_WORKER_SERVICE"
     if ! docker service rm "$VP_PYTHON_WORKER_SERVICE" >&2; then
       status=1
     fi
   fi
-  if [[ "$publisher_was_present" != true ]]; then
+  if vp_app_service_was_attempted "$VP_PUBLISHER_SERVICE" "$attempted_services" \
+    && [[ "$publisher_was_present" != true ]]; then
     local publisher_state
     publisher_state="$(vp_publisher_service_state)" || return 1
     if [[ "$publisher_state" == exists ]]; then
@@ -1060,16 +1086,25 @@ vp_apply_app_services() {
   local ffmpeg_go="$5"
   local python_worker="$6"
 
+  VP_APP_ATTEMPTED_SERVICES=""
+  vp_record_app_service_attempt vp-api-swarm
   vp_update_runtime_service vp-api-swarm "$api" stop-first || return 1
   http_health vp-api "http://$VP_RUNTIME_HOST:18080/health" || return 1
+  vp_record_app_service_attempt vp-frontend-swarm
   vp_update_runtime_service vp-frontend-swarm "$frontend" stop-first || return 1
   http_health vp-frontend "http://$VP_RUNTIME_HOST:3001/" || return 1
+  vp_record_app_service_attempt "$VP_PYTHON_WORKER_SERVICE"
   vp_deploy_python_worker "$python_worker" || return 1
+  vp_record_app_service_attempt "$VP_PUBLISHER_SERVICE"
   vp_deploy_publisher "$python_worker" || return 1
+  vp_record_app_service_attempt vp-autoflow-api-swarm
   vp_update_runtime_service vp-autoflow-api-swarm "$backend" start-first || return 1
+  vp_record_app_service_attempt vp-event-outbox-relay-swarm
   vp_update_runtime_service vp-event-outbox-relay-swarm "$backend" start-first || return 1
   vp_require_channelops_migration_head "$python_worker" || return 1
+  vp_record_app_service_attempt vp-channel-agent-runner-swarm
   vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" stop-first || return 1
+  vp_record_app_service_attempt vp-ffmpeg-worker-go-swarm
   vp_update_runtime_service vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first || return 1
 
   local service
@@ -1092,7 +1127,7 @@ deploy_vp_app_services() {
   snapshots="$(vp_capture_app_snapshots)" || return 1
   if ! vp_apply_app_services "$@"; then
     log "VideoProcess service apply failed; restoring prior images without legacy placement"
-    if ! vp_restore_app_snapshots "$snapshots"; then
+    if ! vp_restore_app_snapshots "$snapshots" "$VP_APP_ATTEMPTED_SERVICES"; then
       echo "VideoProcess image restore did not fully converge" >&2
     fi
     return 1

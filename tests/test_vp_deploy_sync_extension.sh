@@ -553,7 +553,7 @@ cp "$CALLS" "$TEST_ROOT/successful-deploy-calls"
 for migration_gate_mode in wrong missing error; do
   : >"$CALLS"
   MIGRATION_GATE_MODE="$migration_gate_mode"
-  if vp_apply_app_services \
+  if deploy_vp_app_services \
     "vp-api:gate-$migration_gate_mode" \
     "vp-frontend:gate-$migration_gate_mode" \
     "vp-backend-api:gate-$migration_gate_mode" \
@@ -563,8 +563,9 @@ for migration_gate_mode in wrong missing error; do
     echo "FAIL: $migration_gate_mode migration gate unexpectedly succeeded" >&2
     exit 1
   fi
-  if grep -Fq 'vp-channel-agent-runner-swarm' "$CALLS"; then
-    echo "FAIL: $migration_gate_mode migration gate allowed a runner update" >&2
+  if grep -F 'docker|service update' "$CALLS" \
+    | grep -Fq 'vp-channel-agent-runner-swarm'; then
+    echo "FAIL: $migration_gate_mode migration gate mutated the runner" >&2
     exit 1
   fi
   if ! grep -Fq 'SELECT version_num FROM alembic_version' "$CALLS"; then
