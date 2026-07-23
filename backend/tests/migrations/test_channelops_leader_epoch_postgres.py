@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncpg
@@ -123,8 +124,8 @@ async def test_leader_epoch_migration_is_durable_and_restrictive() -> None:
             }
             assert primary_key_columns == {"service_name"}
 
-            acquired_at = "2026-07-23T12:00:00+00:00"
-            heartbeat_at = "2026-07-23T12:01:00+00:00"
+            acquired_at = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+            heartbeat_at = datetime(2026, 7, 23, 12, 1, tzinfo=timezone.utc)
             with pytest.raises(asyncpg.CheckViolationError):
                 await conn.execute(
                     """
