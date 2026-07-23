@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from app.models.job import JobStatus, NodeStatus
 from app.orchestrator.engine import JobEngine
 from app.schemas.pipeline import PipelineDefinition
+from app.services.job_execution_authority import NodeExecutionClaim
 
 
 class _FakeRedis:
@@ -27,6 +29,7 @@ class _FakeSession:
     def __init__(self, job) -> None:
         self.job = job
         self.commits = 0
+        self.rollbacks = 0
 
     async def __aenter__(self):
         return self
@@ -39,6 +42,9 @@ class _FakeSession:
 
     async def commit(self) -> None:
         self.commits += 1
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
 
 
 def _retry_pipeline_snapshot() -> dict:
@@ -104,6 +110,8 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
     job_id = uuid.uuid4()
     source_output_artifact_id = uuid.uuid4()
     failed_node_execution_id = uuid.uuid4()
+    started_at = datetime(2026, 7, 22, 12, 30, tzinfo=timezone.utc)
+    worker_id = "ffmpeg-worker@vp-gpu:42"
     retry_node = SimpleNamespace(
         id=failed_node_execution_id,
         node_id="trim",
@@ -114,6 +122,8 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
         retry_count=0,
         error_message="previous failure",
         queued_at=None,
+        worker_id=worker_id,
+        started_at=started_at,
     )
     source_node = SimpleNamespace(
         id=uuid.uuid4(),
@@ -151,7 +161,17 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
     monkeypatch.setattr(engine_module, "_redis", lambda: fake_redis)
     monkeypatch.setattr(engine_module, "lock_job_execution_authority", lock_authority)
 
-    await JobEngine().on_node_failed(job_id, failed_node_execution_id, "boom")
+    await JobEngine().on_node_failed(
+        job_id,
+        failed_node_execution_id,
+        "boom",
+        claim=NodeExecutionClaim(
+            job_id=job_id,
+            node_execution_id=failed_node_execution_id,
+            worker_id=worker_id,
+            started_at=started_at,
+        ),
+    )
 
     assert retry_node.retry_count == 1
     assert retry_node.status == NodeStatus.QUEUED
@@ -165,3 +185,121 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
     assert task["node_id"] == "trim"
     assert json.loads(task["input_artifacts"]) == {"input": str(source_output_artifact_id)}
     assert json.loads(task["preferred_hosts"]) == ["preferred-host"]
+
+
+@pytest.mark.asyncio
+async def test_on_node_failed_ignores_delayed_event_from_replaced_claim(monkeypatch) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    old_started_at = datetime(2026, 7, 22, 12, 30, tzinfo=timezone.utc)
+    replacement_started_at = old_started_at + timedelta(minutes=5)
+    replacement_node = SimpleNamespace(
+        id=node_execution_id,
+        node_id="trim",
+        node_type="trim",
+        node_label="Trim",
+        node_config={"start_time": "00:00:00", "duration": "1"},
+        status=NodeStatus.RUNNING,
+        retry_count=0,
+        error_message=None,
+        worker_id="ffmpeg-worker@replacement:84",
+        started_at=replacement_started_at,
+    )
+    job = SimpleNamespace(
+        id=job_id,
+        status=JobStatus.RUNNING,
+        node_executions=[replacement_node],
+        execution_plan={"dependencies": {"trim": []}},
+        pipeline_snapshot=_retry_pipeline_snapshot(),
+    )
+    fake_session = _FakeSession(job)
+    fake_redis = _FakeRedis()
+
+    from app.orchestrator import engine as engine_module
+
+    async def lock_authority(*args, **kwargs):
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=None),
+            task=None,
+            job=job,
+            node=replacement_node,
+        )
+
+    monkeypatch.setattr(engine_module, "async_session", lambda: fake_session)
+    monkeypatch.setattr(engine_module, "_redis", lambda: fake_redis)
+    monkeypatch.setattr(engine_module, "lock_job_execution_authority", lock_authority)
+
+    await JobEngine().on_node_failed(
+        job_id,
+        node_execution_id,
+        "old worker failed",
+        claim=NodeExecutionClaim(
+            job_id=job_id,
+            node_execution_id=node_execution_id,
+            worker_id="ffmpeg-worker@old:21",
+            started_at=old_started_at,
+        ),
+    )
+
+    assert replacement_node.status == NodeStatus.RUNNING
+    assert replacement_node.retry_count == 0
+    assert fake_session.commits == 0
+    assert fake_session.rollbacks == 1
+    assert fake_redis.added == []
+
+
+@pytest.mark.asyncio
+async def test_on_node_completed_ignores_delayed_event_from_replaced_claim(
+    monkeypatch,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    output_artifact_id = uuid.uuid4()
+    old_started_at = datetime(2026, 7, 22, 12, 30, tzinfo=timezone.utc)
+    replacement_node = SimpleNamespace(
+        id=node_execution_id,
+        node_id="trim",
+        status=NodeStatus.RUNNING,
+        retry_count=0,
+        output_artifact_id=None,
+        worker_id="ffmpeg-worker@replacement:84",
+        started_at=old_started_at + timedelta(minutes=5),
+    )
+    job = SimpleNamespace(
+        id=job_id,
+        status=JobStatus.RUNNING,
+        node_executions=[replacement_node],
+    )
+    fake_session = _FakeSession(job)
+
+    from app.orchestrator import engine as engine_module
+
+    async def lock_authority(*args, **kwargs):
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=None),
+            task=None,
+            job=job,
+            node=replacement_node,
+        )
+
+    monkeypatch.setattr(engine_module, "async_session", lambda: fake_session)
+    monkeypatch.setattr(engine_module, "lock_job_execution_authority", lock_authority)
+
+    await JobEngine().on_node_completed(
+        job_id,
+        node_execution_id,
+        output_artifact_id,
+        claim=NodeExecutionClaim(
+            job_id=job_id,
+            node_execution_id=node_execution_id,
+            worker_id="ffmpeg-worker@old:21",
+            started_at=old_started_at,
+        ),
+    )
+
+    assert replacement_node.status == NodeStatus.RUNNING
+    assert replacement_node.output_artifact_id is None
+    assert fake_session.commits == 0
+    assert fake_session.rollbacks == 1

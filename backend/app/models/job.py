@@ -2,7 +2,18 @@ from __future__ import annotations
 import enum
 import uuid as uuid_mod
 from datetime import datetime
-from sqlalchemy import String, Text, Integer, SmallInteger, ForeignKey, Enum, JSON, CheckConstraint, func
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, UUIDPrimaryKeyMixin
@@ -81,7 +92,10 @@ class NodeExecution(UUIDPrimaryKeyMixin, Base):
     )
     worker_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     queued_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_trace: Mapped[str | None] = mapped_column(Text, nullable=True)

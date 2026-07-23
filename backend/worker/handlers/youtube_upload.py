@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable
 
@@ -18,6 +19,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
+from app.services.job_execution_authority import NodeExecutionClaim
 from app.services.youtube_upload_operations import (
     UploadOperationContext,
     YouTubeUploadOperationStore,
@@ -87,33 +89,36 @@ class YouTubeUploadHandler(BaseHandler):
             )
             self._raise_if_cancelled()
             claim = await self._operation_store.claim(context)
+            operation = claim.operation
             self._raise_if_cancelled()
 
             if claim.action != "block":
                 await self._verify_claim_content_hash(
                     claim.action,
-                    claim.operation,
+                    operation,
                     content_sha256,
                 )
 
             if claim.action == "replay":
-                return self._copy_durable_receipt(claim.operation, snapshot_path, output_path)
+                return self._copy_durable_receipt(operation, snapshot_path, output_path)
             if claim.action == "block":
                 raise RuntimeError(
                     "youtube upload operation cannot safely be retried from "
-                    f"{getattr(claim.operation, 'status', 'unknown')} state"
+                    f"{getattr(operation, 'status', 'unknown')} state"
                 )
             if claim.action not in {"submit", "resume"}:
                 raise RuntimeError(f"unknown youtube upload operation action: {claim.action}")
 
             async with self._request_client() as client:
                 if claim.action == "submit":
-                    await self._preflight_submission(claim.operation, client)
-                    self._raise_if_cancelled()
                     async with self._operation_store.submission_fence(context):
+                        await self._preflight_submission(operation, client)
                         self._raise_if_cancelled()
+                        operation = await self._operation_store.mark_attempting(
+                            operation.id
+                        )
                         manager_task_id = await self._submit_upload(
-                            claim.operation,
+                            operation,
                             client,
                             input_file=snapshot_path,
                             title=title,
@@ -123,18 +128,18 @@ class YouTubeUploadHandler(BaseHandler):
                         )
                 else:
                     resumed_manager_task_id = self._require_canonical_manager_task_id(
-                        getattr(claim.operation, "manager_task_id", None)
+                        getattr(operation, "manager_task_id", None)
                     )
                     if resumed_manager_task_id is None:
                         await self._mark_uncertain(
-                            claim.operation,
+                            operation,
                             "submitted operation has no canonical manager task",
                         )
                         raise RuntimeError("submitted youtube upload operation has no canonical manager task id")
                     manager_task_id = resumed_manager_task_id
 
                 succeeded_operation = await self._poll_for_completion(
-                    claim.operation,
+                    operation,
                     manager_task_id,
                     client,
                 )
@@ -393,13 +398,38 @@ class YouTubeUploadHandler(BaseHandler):
         title: str,
         privacy: str,
     ) -> UploadOperationContext:
+        job_id = self._require_uuid(node_config.get("_job_id"), "_job_id")
+        node_execution_id = self._require_uuid(
+            node_config.get("_node_execution_id"),
+            "_node_execution_id",
+        )
         artifact_ids = node_config.get("_input_artifact_ids")
         if not isinstance(artifact_ids, dict) or "input" not in artifact_ids:
             raise RuntimeError("youtube upload requires _input_artifact_ids.input worker context")
+        raw_claim = node_config.get("_execution_claim")
+        if not isinstance(raw_claim, dict):
+            raise RuntimeError("youtube upload requires _execution_claim worker context")
+        worker_id = raw_claim.get("worker_id")
+        raw_started_at = raw_claim.get("started_at")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise RuntimeError("youtube upload execution claim has an invalid worker id")
+        if not isinstance(raw_started_at, str):
+            raise RuntimeError("youtube upload execution claim has an invalid start time")
+        try:
+            started_at = datetime.fromisoformat(raw_started_at)
+        except ValueError as exc:
+            raise RuntimeError("youtube upload execution claim has an invalid start time") from exc
+        if started_at.tzinfo is None:
+            raise RuntimeError("youtube upload execution claim start time must include a UTC offset")
+
         return UploadOperationContext(
-            job_id=self._require_uuid(node_config.get("_job_id"), "_job_id"),
-            node_execution_id=self._require_uuid(
-                node_config.get("_node_execution_id"), "_node_execution_id"
+            job_id=job_id,
+            node_execution_id=node_execution_id,
+            execution_claim=NodeExecutionClaim(
+                job_id=job_id,
+                node_execution_id=node_execution_id,
+                worker_id=worker_id.strip(),
+                started_at=started_at,
             ),
             input_artifact_id=self._require_uuid(artifact_ids["input"], "_input_artifact_ids.input"),
             content_sha256=content_sha256,

@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from app.services.job_execution_authority import JobExecutionAuthorityBlocked
 from app.services.youtube_upload_operations import UploadOperationClaim
+from worker.handlers import youtube_upload as youtube_upload_module
 from worker.handlers.base import CancelledError
 from worker.handlers.youtube_upload import YouTubeUploadHandler
 
@@ -47,6 +49,7 @@ class FakeOperationStore:
             "quota_estimate": 1600,
         }
         self.claim_contexts: list[object] = []
+        self.attempting: list[uuid.UUID] = []
         self.submitted: list[tuple[uuid.UUID, str]] = []
         self.succeeded: list[tuple[uuid.UUID, str, dict]] = []
         self.failed: list[tuple[uuid.UUID, str]] = []
@@ -81,6 +84,12 @@ class FakeOperationStore:
         self.submitted.append((operation_id, manager_task_id))
         self.operation.status = "submitted"
         self.operation.manager_task_id = manager_task_id
+        return self.operation
+
+    async def mark_attempting(self, operation_id: uuid.UUID):
+        assert self.submission_fence_active
+        self.attempting.append(operation_id)
+        self.operation.request_attempted_at = object()
         return self.operation
 
     async def mark_succeeded(self, operation_id: uuid.UUID, platform_video_id: str, receipt: dict):
@@ -122,6 +131,10 @@ def upload_config(**overrides) -> dict:
         "_job_id": str(JOB_ID),
         "_node_execution_id": str(NODE_EXECUTION_ID),
         "_input_artifact_ids": {"input": str(INPUT_ARTIFACT_ID)},
+        "_execution_claim": {
+            "worker_id": "gpu-worker@150:42",
+            "started_at": "2026-07-22T12:00:00+00:00",
+        },
     }
     config.update(overrides)
     return config
@@ -229,6 +242,46 @@ async def test_missing_internal_execution_context_is_rejected_before_claim_or_ht
 
     assert seen == []
     assert store.claim_contexts == []
+
+
+@pytest.mark.asyncio
+async def test_execution_claim_is_bound_into_upload_operation_context(
+    monkeypatch,
+    media_paths,
+) -> None:
+    store = FakeOperationStore(["replay"])
+    store.operation.status = "succeeded"
+    store.operation.receipt_json = dict(store.durable_receipt)
+    captured_contexts: list[dict] = []
+
+    def record_context(**kwargs):
+        captured_contexts.append(dict(kwargs))
+        return SimpleNamespace(**kwargs)
+
+    def route(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("replay must not call YouTubeManager")
+
+    monkeypatch.setattr(youtube_upload_module, "UploadOperationContext", record_context)
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        await make_handler(store, client).execute(
+            upload_config(
+                _execution_claim={
+                    "worker_id": "gpu-worker@150:42",
+                    "started_at": "2026-07-22T12:00:00+00:00",
+                }
+            ),
+            input_paths,
+            output_path,
+        )
+
+    assert len(captured_contexts) == 1
+    assert "execution_claim" in captured_contexts[0]
+    execution_claim = captured_contexts[0]["execution_claim"]
+    assert execution_claim.job_id == JOB_ID
+    assert execution_claim.node_execution_id == NODE_EXECUTION_ID
+    assert execution_claim.worker_id == "gpu-worker@150:42"
+    assert execution_claim.started_at.isoformat() == "2026-07-22T12:00:00+00:00"
 
 
 @pytest.mark.asyncio
@@ -391,6 +444,7 @@ async def test_fresh_claim_submits_then_polls_and_returns_only_durable_receipt(m
         b"owned unlisted canary media"
     ).hexdigest()
     assert store.claim_contexts[0].privacy == "unlisted"
+    assert store.attempting == [OPERATION_ID]
     assert store.submitted == [(OPERATION_ID, MANAGER_TASK_ID)]
     assert store.succeeded == [
         (
@@ -600,12 +654,12 @@ async def test_cancellation_during_preflight_prevents_upload_post(media_paths):
 
 
 @pytest.mark.asyncio
-async def test_submission_fence_wraps_only_irreversible_upload_post(media_paths):
+async def test_submission_fence_wraps_preflight_and_irreversible_post(media_paths):
     store = FakeOperationStore(["submit"])
 
     def route(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/api/auth/status":
-            assert not store.submission_fence_active
+            assert store.submission_fence_active
             return httpx.Response(200, json=auth_payload())
         if request.method == "POST" and request.url.path == "/api/upload":
             assert store.submission_fence_active
@@ -629,6 +683,39 @@ async def test_submission_fence_wraps_only_irreversible_upload_post(media_paths)
         await make_handler(store, client).execute(upload_config(), input_paths, output_path)
 
     assert store.submission_fence_contexts == store.claim_contexts
+
+
+@pytest.mark.asyncio
+async def test_rejected_submission_fence_prevents_preflight_and_state_changes(
+    media_paths,
+) -> None:
+    store = FakeOperationStore(["submit"])
+    seen: list[tuple[str, str]] = []
+
+    @contextlib.asynccontextmanager
+    async def reject_fence(_context):
+        raise JobExecutionAuthorityBlocked("node execution claim changed")
+        yield
+
+    store.submission_fence = reject_fence
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        return httpx.Response(200, json=auth_payload())
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        with pytest.raises(JobExecutionAuthorityBlocked, match="claim changed"):
+            await make_handler(store, client).execute(
+                upload_config(),
+                input_paths,
+                output_path,
+            )
+
+    assert seen == []
+    assert store.attempting == []
+    assert store.failed == []
+    assert store.uncertain == []
 
 
 @pytest.mark.asyncio

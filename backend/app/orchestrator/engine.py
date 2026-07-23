@@ -25,8 +25,10 @@ from app.services.schedule_service import (
 )
 from app.services.job_execution_authority import (
     JobExecutionAuthorityBlocked,
+    NodeExecutionClaim,
     lock_job_execution_authority,
     require_active_execution_authority,
+    require_matching_node_execution_claim,
 )
 
 logger = logging.getLogger(__name__)
@@ -531,7 +533,12 @@ class JobEngine:
         return [host for host, count in ranked if count == top_count]
 
     async def on_node_completed(
-        self, job_id: uuid.UUID, node_execution_id: uuid.UUID, output_artifact_id: uuid.UUID
+        self,
+        job_id: uuid.UUID,
+        node_execution_id: uuid.UUID,
+        output_artifact_id: uuid.UUID,
+        *,
+        claim: NodeExecutionClaim,
     ) -> None:
         """Handle a node completion event: update status, dispatch downstream."""
         async with async_session() as db:
@@ -546,6 +553,7 @@ class JobEngine:
                     job_statuses={JobStatus.RUNNING},
                     node_statuses={NodeStatus.RUNNING},
                 )
+                require_matching_node_execution_claim(authority, claim)
             except JobExecutionAuthorityBlocked as exc:
                 await db.rollback()
                 logger.info("Ignoring stale node completion job=%s node=%s: %s", job_id, node_execution_id, exc)
@@ -582,6 +590,7 @@ class JobEngine:
                     job_statuses={JobStatus.RUNNING},
                     node_statuses={NodeStatus.SUCCEEDED},
                 )
+                require_matching_node_execution_claim(authority, claim)
             except JobExecutionAuthorityBlocked as exc:
                 await db.rollback()
                 logger.info(
@@ -601,7 +610,12 @@ class JobEngine:
             await self._dispatch_ready_nodes(db, job, dep_map)
 
     async def on_node_failed(
-        self, job_id: uuid.UUID, node_execution_id: uuid.UUID, error: str
+        self,
+        job_id: uuid.UUID,
+        node_execution_id: uuid.UUID,
+        error: str,
+        *,
+        claim: NodeExecutionClaim,
     ) -> None:
         """Handle a node failure event."""
         async with async_session() as db:
@@ -617,6 +631,7 @@ class JobEngine:
                     job_statuses={JobStatus.RUNNING},
                     node_statuses={NodeStatus.RUNNING},
                 )
+                require_matching_node_execution_claim(authority, claim)
             except JobExecutionAuthorityBlocked as exc:
                 await db.rollback()
                 logger.info("Ignoring stale node failure job=%s node=%s: %s", job_id, node_execution_id, exc)
@@ -644,6 +659,7 @@ class JobEngine:
                         job_statuses={JobStatus.RUNNING},
                         node_statuses={NodeStatus.QUEUED},
                     )
+                    require_matching_node_execution_claim(authority, claim)
                 except JobExecutionAuthorityBlocked as exc:
                     await db.rollback()
                     logger.info(

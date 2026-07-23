@@ -1018,12 +1018,12 @@ vp_apply_app_services() {
   http_health vp-api "http://$VP_RUNTIME_HOST:18080/health" || return 1
   vp_update_runtime_service vp-frontend-swarm "$frontend" stop-first || return 1
   http_health vp-frontend "http://$VP_RUNTIME_HOST:3001/" || return 1
+  vp_deploy_python_worker "$python_worker" || return 1
+  vp_deploy_publisher "$python_worker" || return 1
   vp_update_runtime_service vp-autoflow-api-swarm "$backend" start-first || return 1
   vp_update_runtime_service vp-event-outbox-relay-swarm "$backend" start-first || return 1
   vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" start-first || return 1
   vp_update_runtime_service vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first || return 1
-  vp_deploy_python_worker "$python_worker" || return 1
-  vp_deploy_publisher "$python_worker" || return 1
 
   local service
   for service in $VP_APP_SERVICES; do

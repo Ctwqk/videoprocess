@@ -6,7 +6,10 @@ import os
 import subprocess
 import sys
 import uuid
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import CheckConstraint
@@ -15,8 +18,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.models.artifact import Artifact
 from app.models.channel_agent import ChannelProfile, ProductionTask, PublicationRecord
-from app.models.job import Job, NodeExecution
+from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.models.schedule import RuntimeSchedule
 from app.models.youtube_upload_operation import YouTubeUploadOperation
+from app.services import youtube_upload_operations as upload_operations
+from app.services.job_execution_authority import (
+    JobExecutionAuthorityBlocked,
+    NodeExecutionClaim,
+)
 from app.services.youtube_upload_operations import (
     UploadOperationConflictError,
     UploadOperationContext,
@@ -56,6 +65,7 @@ async def operation_session_factory(tmp_path):
             Artifact.__table__,
             ChannelProfile.__table__,
             ProductionTask.__table__,
+            RuntimeSchedule.__table__,
             YouTubeUploadOperation.__table__,
         ):
             await conn.run_sync(table.create)
@@ -70,7 +80,13 @@ async def _context_for(
     *,
     production_task: ProductionTask | None = None,
 ) -> UploadOperationContext:
-    job = Job(pipeline_id=uuid.uuid4(), pipeline_snapshot={})
+    claimed_at = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+    worker_id = "test-worker@localhost:1"
+    job = Job(
+        pipeline_id=uuid.uuid4(),
+        pipeline_snapshot={},
+        status=JobStatus.RUNNING,
+    )
     db.add(job)
     await db.flush()
 
@@ -78,6 +94,9 @@ async def _context_for(
         job_id=job.id,
         node_id=f"youtube_upload_{uuid.uuid4().hex}",
         node_type="youtube_upload",
+        status=NodeStatus.RUNNING,
+        worker_id=worker_id,
+        started_at=claimed_at,
     )
     db.add(node)
     await db.flush()
@@ -100,6 +119,7 @@ async def _context_for(
             target_account_id=uuid.uuid4(),
             prompt="Upload the owned canary video",
             job_id=job.id,
+            state="producing",
         )
         db.add(production_task)
     else:
@@ -109,11 +129,85 @@ async def _context_for(
     return UploadOperationContext(
         job_id=job.id,
         node_execution_id=node.id,
+        execution_claim=NodeExecutionClaim(
+            job_id=job.id,
+            node_execution_id=node.id,
+            worker_id=worker_id,
+            started_at=claimed_at,
+        ),
         input_artifact_id=artifact.id,
         content_sha256="a" * 64,
         title="Owned canary",
         privacy="unlisted",
     )
+
+
+@pytest.mark.asyncio
+async def test_submission_fence_rejects_reassigned_execution_claim(
+    monkeypatch,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    claimed_at = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+    context = SimpleNamespace(
+        job_id=job_id,
+        node_execution_id=node_execution_id,
+        execution_claim=SimpleNamespace(
+            job_id=job_id,
+            node_execution_id=node_execution_id,
+            worker_id="gpu-worker@150:old",
+            started_at=claimed_at,
+        ),
+    )
+    entered: list[str] = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return FakeTransaction()
+
+    def session_factory():
+        return FakeSession()
+
+    async def lock_authority(_db, locked_job_id, *, node_execution_id):
+        assert locked_job_id == job_id
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=job_id),
+            task=None,
+            job=SimpleNamespace(id=job_id, status=JobStatus.RUNNING),
+            node=SimpleNamespace(
+                id=node_execution_id,
+                status=NodeStatus.RUNNING,
+                worker_id="gpu-worker@150:replacement",
+                started_at=claimed_at + timedelta(minutes=11),
+            ),
+        )
+
+    monkeypatch.setattr(
+        upload_operations,
+        "lock_job_execution_authority",
+        lock_authority,
+    )
+    store = YouTubeUploadOperationStore(session_factory)
+
+    with pytest.raises(JobExecutionAuthorityBlocked, match="claim"):
+        async with store.submission_fence(context):
+            entered.append("posted")
+
+    assert entered == []
 
 
 @pytest.mark.asyncio
@@ -127,8 +221,12 @@ async def test_claim_reserves_once_then_resumes_and_replays(operation_session_fa
     assert claim.operation.status == "reserved"
 
     again = await store.claim(context)
-    assert again.action == "block"
+    assert again.action == "submit"
     assert again.operation.id == claim.operation.id
+
+    attempting = await store.mark_attempting(claim.operation.id)
+    assert attempting.request_attempted_at is not None
+    assert (await store.claim(context)).action == "block"
 
     submitted = await store.mark_submitted(claim.operation.id, MANAGER_TASK_ID)
     assert submitted.manager_task_id == MANAGER_TASK_ID
@@ -156,12 +254,74 @@ async def test_claim_reserves_once_then_resumes_and_replays(operation_session_fa
 
 
 @pytest.mark.asyncio
+async def test_replacement_claim_can_take_over_unattempted_reservation(
+    operation_session_factory,
+) -> None:
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+
+    reserved = await store.claim(context)
+    replacement_started_at = context.execution_claim.started_at + timedelta(minutes=1)
+    replacement_claim = replace(
+        context.execution_claim,
+        worker_id="test-worker@replacement:2",
+        started_at=replacement_started_at,
+    )
+    replacement_context = replace(context, execution_claim=replacement_claim)
+    async with operation_session_factory() as db:
+        node = await db.get(NodeExecution, context.node_execution_id)
+        assert node is not None
+        node.worker_id = replacement_claim.worker_id
+        node.started_at = replacement_started_at
+        await db.commit()
+
+    with pytest.raises(JobExecutionAuthorityBlocked, match="claim changed"):
+        await store.claim(context)
+
+    replacement = await store.claim(replacement_context)
+    assert replacement.action == "submit"
+    assert replacement.operation.id == reserved.operation.id
+
+
+@pytest.mark.asyncio
+async def test_replacement_claim_blocks_after_submission_was_attempted(
+    operation_session_factory,
+) -> None:
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+
+    reserved = await store.claim(context)
+    await store.mark_attempting(reserved.operation.id)
+    replacement_started_at = context.execution_claim.started_at + timedelta(minutes=1)
+    replacement_claim = replace(
+        context.execution_claim,
+        worker_id="test-worker@replacement:2",
+        started_at=replacement_started_at,
+    )
+    replacement_context = replace(context, execution_claim=replacement_claim)
+    async with operation_session_factory() as db:
+        node = await db.get(NodeExecution, context.node_execution_id)
+        assert node is not None
+        node.worker_id = replacement_claim.worker_id
+        node.started_at = replacement_started_at
+        await db.commit()
+
+    replacement = await store.claim(replacement_context)
+
+    assert replacement.action == "block"
+    assert replacement.operation.id == reserved.operation.id
+
+
+@pytest.mark.asyncio
 async def test_existing_reserved_uncertain_and_failed_operations_never_submit(operation_session_factory):
     store = YouTubeUploadOperationStore(operation_session_factory)
     async with operation_session_factory() as db:
         reserved_context = await _context_for(db)
 
     reserved = await store.claim(reserved_context)
+    await store.mark_attempting(reserved.operation.id)
     assert (await store.claim(reserved_context)).action == "block"
 
     await store.mark_uncertain(reserved.operation.id, "upload response was ambiguous")

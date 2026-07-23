@@ -5,6 +5,7 @@ import os
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -27,7 +28,10 @@ from app.models.pipeline import Pipeline
 from app.models.schedule import RuntimeSchedule
 from app.orchestrator.engine import JobEngine
 from app.services.channelops_quarantine import QUARANTINE_REASON, quarantine_channelops_backlog
-from app.services.job_execution_authority import JobExecutionAuthorityBlocked
+from app.services.job_execution_authority import (
+    JobExecutionAuthorityBlocked,
+    NodeExecutionClaim,
+)
 from app.services.schedule_service import VIDEO_SCHEDULE_SERVICE, VideoScheduleState
 from app.services.youtube_upload_operations import (
     UploadOperationContext,
@@ -38,6 +42,17 @@ from worker import main as worker_main
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
 RACE_CLEANUP_TIMEOUT_SECONDS = 5
+TEST_WORKER_ID = "test-worker@localhost:1"
+TEST_CLAIMED_AT = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _worker_claim(job_id: uuid.UUID, node_id: uuid.UUID) -> NodeExecutionClaim:
+    return NodeExecutionClaim(
+        job_id=job_id,
+        node_execution_id=node_id,
+        worker_id=TEST_WORKER_ID,
+        started_at=TEST_CLAIMED_AT,
+    )
 
 
 @dataclass(eq=False)
@@ -341,6 +356,8 @@ async def _seed_worker_authority(factory, *, node_status: NodeStatus, job_status
             node_label="Trim",
             node_config={"start_time": 0, "end_time": 1},
             status=node_status,
+            worker_id=TEST_WORKER_ID if node_status == NodeStatus.RUNNING else None,
+            started_at=TEST_CLAIMED_AT if node_status == NodeStatus.RUNNING else None,
         )
         task = ProductionTask(
             channel_profile_id=channel.id,
@@ -457,7 +474,7 @@ async def test_worker_claim_cannot_revive_quarantine_first_node(postgres_race_db
         try:
             await _wait_until_lock_wait(engine, "channel_profiles", claim)
             await blocker.commit()
-            assert await asyncio.wait_for(claim, timeout=5) is False
+            assert await asyncio.wait_for(claim, timeout=5) is None
         finally:
             await _cancel_operations(blocker, claim)
     finally:
@@ -467,6 +484,35 @@ async def test_worker_claim_cannot_revive_quarantine_first_node(postgres_race_db
     async with factory() as db:
         stored = await db.get(NodeExecution, node_id)
     assert stored is not None and stored.status == NodeStatus.CANCELLED
+
+
+async def test_worker_claim_round_trip_remains_current(postgres_race_db):
+    _engine, factory = postgres_race_db
+    _channel_id, _task_id, job_id, node_id = await _seed_worker_authority(
+        factory,
+        node_status=NodeStatus.QUEUED,
+        job_status=JobStatus.RUNNING,
+    )
+
+    claim = await worker_main._claim_node_execution(
+        str(job_id),
+        str(node_id),
+        session_factory=factory,
+    )
+
+    assert isinstance(claim, NodeExecutionClaim)
+    assert claim.started_at.tzinfo is not None
+    await worker_main._require_current_node_execution_claim(
+        claim,
+        session_factory=factory,
+    )
+
+    async with factory() as db:
+        stored = await db.get(NodeExecution, node_id)
+    assert stored is not None
+    assert stored.status == NodeStatus.RUNNING
+    assert stored.worker_id == claim.worker_id
+    assert stored.started_at is not None and stored.started_at.tzinfo is not None
 
 
 async def test_repeated_quarantine_repairs_active_node_under_cancelled_job(postgres_race_db):
@@ -586,7 +632,14 @@ async def test_quarantine_first_blocks_stale_worker_completion(postgres_race_db,
             job_id=job_id,
             node_id=node_id,
         )
-        completion = asyncio.create_task(job_engine.on_node_completed(job_id, node_id, artifact_id))
+        completion = asyncio.create_task(
+            job_engine.on_node_completed(
+                job_id,
+                node_id,
+                artifact_id,
+                claim=_worker_claim(job_id, node_id),
+            )
+        )
         try:
             await _wait_until_lock_wait(engine, "", completion)
             await blocker.commit()
@@ -635,7 +688,14 @@ async def test_quarantine_first_blocks_stale_worker_retry(postgres_race_db, monk
             job_id=job_id,
             node_id=node_id,
         )
-        failure = asyncio.create_task(job_engine.on_node_failed(job_id, node_id, "late failure"))
+        failure = asyncio.create_task(
+            job_engine.on_node_failed(
+                job_id,
+                node_id,
+                "late failure",
+                claim=_worker_claim(job_id, node_id),
+            )
+        )
         try:
             await _wait_until_lock_wait(engine, "", failure)
             await blocker.commit()
@@ -735,7 +795,14 @@ async def test_exhausted_failure_holds_authority_through_downstream_terminal_wri
             )
 
     quarantine = None
-    failure = asyncio.create_task(job_engine.on_node_failed(job_id, node_id, "terminal failure"))
+    failure = asyncio.create_task(
+        job_engine.on_node_failed(
+            job_id,
+            node_id,
+            "terminal failure",
+            claim=_worker_claim(job_id, node_id),
+        )
+    )
     try:
         await asyncio.wait_for(reached_downstream_transition.wait(), timeout=5)
         quarantine = asyncio.create_task(apply_quarantine())
@@ -967,6 +1034,12 @@ async def test_quarantine_first_blocks_youtube_submission_fence(postgres_race_db
     context = UploadOperationContext(
         job_id=job_id,
         node_execution_id=node_id,
+        execution_claim=NodeExecutionClaim(
+            job_id=job_id,
+            node_execution_id=node_id,
+            worker_id=TEST_WORKER_ID,
+            started_at=TEST_CLAIMED_AT,
+        ),
         input_artifact_id=uuid.uuid4(),
         content_sha256="a" * 64,
         title="quarantine-first fence",
@@ -1013,6 +1086,12 @@ async def test_youtube_submission_fence_makes_quarantine_wait(postgres_race_db):
     context = UploadOperationContext(
         job_id=job_id,
         node_execution_id=node_id,
+        execution_claim=NodeExecutionClaim(
+            job_id=job_id,
+            node_execution_id=node_id,
+            worker_id=TEST_WORKER_ID,
+            started_at=TEST_CLAIMED_AT,
+        ),
         input_artifact_id=uuid.uuid4(),
         content_sha256="b" * 64,
         title="submission-first fence",

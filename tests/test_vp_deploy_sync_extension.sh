@@ -385,6 +385,36 @@ if ! deploy_vp_app_services $images >/dev/null; then
   exit 1
 fi
 
+python_worker_update_line="$(
+  grep -nF 'docker|service update' "$CALLS" \
+    | grep -F -- '--image vp-ffmpeg-worker-python:deploy-0123456789ab' \
+    | grep -F 'vp-ffmpeg-worker-gpu-swarm' \
+    | head -1 \
+    | cut -d: -f1
+)"
+publisher_update_line="$(
+  grep -nF 'docker|service update' "$CALLS" \
+    | grep -F -- '--image vp-ffmpeg-worker-python:deploy-0123456789ab' \
+    | grep -F 'vp-youtube-publisher-swarm' \
+    | head -1 \
+    | cut -d: -f1
+)"
+python_listener_update_line="$(
+  grep -nF 'docker|service update' "$CALLS" \
+    | grep -F -- '--image vp-backend-api:deploy-0123456789ab' \
+    | grep -F 'vp-autoflow-api-swarm' \
+    | head -1 \
+    | cut -d: -f1
+)"
+if [[ -z "$python_worker_update_line" \
+  || -z "$publisher_update_line" \
+  || -z "$python_listener_update_line" \
+  || "$python_worker_update_line" -ge "$python_listener_update_line" \
+  || "$publisher_update_line" -ge "$python_listener_update_line" ]]; then
+  echo 'FAIL: claim-aware Python event producers must deploy before their listener' >&2
+  exit 1
+fi
+
 if [[ ! -x "$ROOT/bin/channelops-soak-watch.sh" ]]; then
   echo 'FAIL: successful deployment did not install an executable soak watcher' >&2
   exit 1

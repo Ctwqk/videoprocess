@@ -2,10 +2,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime
 
 import redis.asyncio as aioredis
 from app.config import settings
 from app.orchestrator.engine import engine, EVENT_STREAM
+from app.services.job_execution_authority import NodeExecutionClaim
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +17,10 @@ PEL_RECLAIM_INTERVAL = 60  # seconds
 PEL_MIN_IDLE = 30000       # ms
 REDIS_BLOCK_MILLISECONDS = 5000
 REDIS_SOCKET_TIMEOUT_SECONDS = 30.0
+
+
+class UnverifiableExecutionClaimEvent(RuntimeError):
+    """Keep a legacy event pending until deployment reconciliation."""
 
 
 def _redis() -> aioredis.Redis:
@@ -107,14 +113,78 @@ async def event_listener() -> None:
 
 async def _handle_event(data: dict) -> None:
     event_type = data.get("event")
-    job_id = uuid.UUID(data["job_id"])
-    node_execution_id = uuid.UUID(data["node_execution_id"])
+    if event_type not in {"node_completed", "node_failed"}:
+        logger.warning("Unknown event type: %s", event_type)
+        return
+
+    try:
+        job_id = uuid.UUID(data["job_id"])
+        node_execution_id = uuid.UUID(data["node_execution_id"])
+    except (KeyError, TypeError, ValueError):
+        logger.warning("Ignoring malformed %s event identifiers", event_type)
+        return
+
+    if "worker_id" not in data and "started_at" not in data:
+        raise UnverifiableExecutionClaimEvent(
+            f"{event_type} event is missing execution claim"
+        )
+
+    claim = _execution_claim_from_event(data, job_id, node_execution_id)
+    if claim is None:
+        logger.warning(
+            "Ignoring %s event without a valid execution claim job=%s node=%s",
+            event_type,
+            job_id,
+            node_execution_id,
+        )
+        return
 
     if event_type == "node_completed":
-        output_artifact_id = uuid.UUID(data["output_artifact_id"])
-        await engine.on_node_completed(job_id, node_execution_id, output_artifact_id)
-    elif event_type == "node_failed":
-        error = data.get("error", "Unknown error")
-        await engine.on_node_failed(job_id, node_execution_id, error)
+        try:
+            output_artifact_id = uuid.UUID(data["output_artifact_id"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning(
+                "Ignoring malformed node_completed artifact job=%s node=%s",
+                job_id,
+                node_execution_id,
+            )
+            return
+        await engine.on_node_completed(
+            job_id,
+            node_execution_id,
+            output_artifact_id,
+            claim=claim,
+        )
     else:
-        logger.warning(f"Unknown event type: {event_type}")
+        error = data.get("error", "Unknown error")
+        await engine.on_node_failed(
+            job_id,
+            node_execution_id,
+            error,
+            claim=claim,
+        )
+
+
+def _execution_claim_from_event(
+    data: dict,
+    job_id: uuid.UUID,
+    node_execution_id: uuid.UUID,
+) -> NodeExecutionClaim | None:
+    worker_id = data.get("worker_id")
+    started_at_raw = data.get("started_at")
+    if not isinstance(worker_id, str) or not worker_id.strip():
+        return None
+    if not isinstance(started_at_raw, str):
+        return None
+    try:
+        started_at = datetime.fromisoformat(started_at_raw)
+    except ValueError:
+        return None
+    if started_at.tzinfo is None or started_at.utcoffset() is None:
+        return None
+    return NodeExecutionClaim(
+        job_id=job_id,
+        node_execution_id=node_execution_id,
+        worker_id=worker_id.strip(),
+        started_at=started_at,
+    )

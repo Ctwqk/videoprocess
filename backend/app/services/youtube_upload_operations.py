@@ -15,8 +15,10 @@ from app.models.channel_agent import ProductionTask
 from app.models.job import JobStatus, NodeStatus
 from app.models.youtube_upload_operation import YouTubeUploadOperation
 from app.services.job_execution_authority import (
+    NodeExecutionClaim,
     lock_job_execution_authority,
     require_active_execution_authority,
+    require_matching_node_execution_claim,
 )
 
 
@@ -24,6 +26,7 @@ from app.services.job_execution_authority import (
 class UploadOperationContext:
     job_id: uuid.UUID
     node_execution_id: uuid.UUID
+    execution_claim: NodeExecutionClaim
     input_artifact_id: uuid.UUID
     content_sha256: str
     title: str
@@ -63,10 +66,36 @@ class YouTubeUploadOperationStore:
                     job_statuses={JobStatus.RUNNING},
                     node_statuses={NodeStatus.RUNNING},
                 )
+                require_matching_node_execution_claim(
+                    authority,
+                    context.execution_claim,
+                )
                 yield
 
     async def claim(self, context: UploadOperationContext) -> UploadOperationClaim:
         async with self._session_factory() as db:
+            authority = await lock_job_execution_authority(
+                db,
+                context.job_id,
+                node_execution_id=context.node_execution_id,
+            )
+            require_active_execution_authority(
+                authority,
+                job_statuses={JobStatus.RUNNING},
+                node_statuses={NodeStatus.RUNNING},
+            )
+            require_matching_node_execution_claim(
+                authority,
+                context.execution_claim,
+            )
+            existing = await self._operation_for_node(
+                db,
+                context.node_execution_id,
+                for_update=True,
+            )
+            if existing is not None:
+                return UploadOperationClaim(self._action_for(existing), existing)
+
             production_task_id = await self._production_task_id(db, context.job_id)
             operation = YouTubeUploadOperation(
                 production_task_id=production_task_id,
@@ -96,6 +125,33 @@ class YouTubeUploadOperationStore:
 
             await db.refresh(operation)
             return UploadOperationClaim("submit", operation)
+
+    async def mark_attempting(
+        self,
+        operation_id: uuid.UUID,
+    ) -> YouTubeUploadOperation:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(YouTubeUploadOperation)
+                .where(YouTubeUploadOperation.id == operation_id)
+                .where(YouTubeUploadOperation.status == "reserved")
+                .where(YouTubeUploadOperation.request_attempted_at.is_(None))
+                .values(
+                    request_attempted_at=datetime.now(timezone.utc),
+                    updated_at=func.now(),
+                )
+                .returning(YouTubeUploadOperation)
+            )
+            operation = result.scalar_one_or_none()
+            if operation is not None:
+                await db.commit()
+                return operation
+
+            await db.rollback()
+            current = await self._operation(db, operation_id)
+            raise ValueError(
+                f"cannot begin submission from {current.status} operation"
+            )
 
     async def mark_submitted(self, operation_id: uuid.UUID, manager_task_id: str) -> YouTubeUploadOperation:
         canonical_manager_task_id = self._canonical_manager_task_id(manager_task_id)
@@ -248,12 +304,15 @@ class YouTubeUploadOperationStore:
     async def _operation_for_node(
         db: AsyncSession,
         node_execution_id: uuid.UUID,
+        *,
+        for_update: bool = False,
     ) -> YouTubeUploadOperation | None:
-        result = await db.execute(
-            select(YouTubeUploadOperation).where(
-                YouTubeUploadOperation.node_execution_id == node_execution_id
-            )
+        stmt = select(YouTubeUploadOperation).where(
+            YouTubeUploadOperation.node_execution_id == node_execution_id
         )
+        if for_update:
+            stmt = stmt.with_for_update()
+        result = await db.execute(stmt)
         return result.scalar_one_or_none()
 
     @staticmethod
@@ -285,6 +344,8 @@ class YouTubeUploadOperationStore:
         manager_task_id = YouTubeUploadOperationStore._canonical_manager_task_id(
             operation.manager_task_id
         )
+        if operation.status == "reserved" and operation.request_attempted_at is None:
+            return "submit"
         if operation.status == "submitted" and manager_task_id is not None:
             return "resume"
         if operation.status == "succeeded" and manager_task_id is not None:

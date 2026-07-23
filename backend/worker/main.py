@@ -9,11 +9,12 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 import redis.asyncio as aioredis
+from redis.typing import EncodableT
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -26,13 +27,16 @@ from app.models.artifact import Artifact, ArtifactKind
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.services.job_execution_authority import (
     JobExecutionAuthorityBlocked,
+    NodeExecutionClaim,
     lock_job_execution_authority,
     require_active_execution_authority,
+    require_matching_node_execution_claim,
 )
 from app.services.worker_admission import (
     WorkerAdmissionError,
     enforce_worker_admission_from_env,
 )
+from app.storage.base import StorageBackend
 from app.storage.manager import get_storage
 from worker.handlers import HANDLER_MAP
 from worker.handlers.base import BaseHandler, CancelledError
@@ -169,7 +173,7 @@ async def _claim_node_execution(
     node_execution_id: str,
     *,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
-) -> bool:
+) -> NodeExecutionClaim | None:
     """Atomically claim a queued node under durable execution authority."""
 
     try:
@@ -177,7 +181,7 @@ async def _claim_node_execution(
         resolved_node_id = uuid.UUID(node_execution_id)
     except ValueError:
         logger.error("Invalid worker execution ids job=%s node=%s", job_id, node_execution_id)
-        return False
+        return None
 
     factory = session_factory or get_worker_session()
     async with factory() as db:
@@ -195,10 +199,17 @@ async def _claim_node_execution(
                     job_statuses={JobStatus.RUNNING},
                     node_statuses={NodeStatus.QUEUED},
                 )
+                claimed_at = datetime.now(timezone.utc)
                 node.status = NodeStatus.RUNNING
-                node.started_at = datetime.utcnow()
+                node.started_at = claimed_at
                 node.worker_id = WORKER_ID
-            return True
+                claim = NodeExecutionClaim(
+                    job_id=resolved_job_id,
+                    node_execution_id=resolved_node_id,
+                    worker_id=WORKER_ID,
+                    started_at=claimed_at,
+                )
+            return claim
         except JobExecutionAuthorityBlocked as exc:
             await db.rollback()
             logger.info(
@@ -207,7 +218,102 @@ async def _claim_node_execution(
                 node_execution_id,
                 exc,
             )
-            return False
+            return None
+
+
+async def _require_current_node_execution_claim(
+    claim: NodeExecutionClaim,
+    *,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
+    """Require the same durable node claim under execution-authority locks."""
+
+    factory = session_factory or get_worker_session()
+    async with factory() as db:
+        async with db.begin():
+            authority = await lock_job_execution_authority(
+                db,
+                claim.job_id,
+                node_execution_id=claim.node_execution_id,
+            )
+            require_active_execution_authority(
+                authority,
+                job_statuses={JobStatus.RUNNING},
+                node_statuses={NodeStatus.RUNNING},
+            )
+            require_matching_node_execution_claim(authority, claim)
+
+
+async def _persist_artifact_for_current_claim(
+    claim: NodeExecutionClaim,
+    *,
+    filename: str,
+    mime_type: str,
+    file_size: int,
+    storage_backend: str,
+    storage_path: str,
+    media_info: dict | None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> str:
+    """Persist an artifact only while its exact worker claim remains authoritative."""
+
+    factory = session_factory or get_worker_session()
+    async with factory() as db:
+        async with db.begin():
+            authority = await lock_job_execution_authority(
+                db,
+                claim.job_id,
+                node_execution_id=claim.node_execution_id,
+            )
+            require_active_execution_authority(
+                authority,
+                job_statuses={JobStatus.RUNNING},
+                node_statuses={NodeStatus.RUNNING},
+            )
+            require_matching_node_execution_claim(authority, claim)
+            artifact = Artifact(
+                job_id=claim.job_id,
+                node_execution_id=claim.node_execution_id,
+                kind=ArtifactKind.INTERMEDIATE,
+                filename=filename,
+                mime_type=mime_type,
+                file_size=file_size,
+                storage_backend=storage_backend,
+                storage_path=storage_path,
+                media_info=media_info,
+            )
+            db.add(artifact)
+            await db.flush()
+            return str(artifact.id)
+
+
+async def _report_failure_for_current_claim(
+    claim: NodeExecutionClaim,
+    job_id: str,
+    node_execution_id: str,
+    error: str,
+) -> bool:
+    try:
+        await _require_current_node_execution_claim(claim)
+    except JobExecutionAuthorityBlocked as exc:
+        logger.info(
+            "Skipping stale worker failure event job=%s node=%s: %s",
+            job_id,
+            node_execution_id,
+            exc,
+        )
+        return False
+    except Exception:
+        logger.exception(
+            "Could not verify worker claim before failure event job=%s node=%s; "
+            "leaving the task pending",
+            job_id,
+            node_execution_id,
+        )
+        raise
+
+    await _report_failure(job_id, node_execution_id, error, claim)
+    return True
 
 
 async def process_task(data: dict) -> None:
@@ -220,13 +326,19 @@ async def process_task(data: dict) -> None:
 
     logger.info(f"Processing node {data['node_id']} (type={node_type}) for job {job_id}")
 
-    if not await _claim_node_execution(job_id, node_execution_id):
+    claim = await _claim_node_execution(job_id, node_execution_id)
+    if claim is None:
         return
 
     # Get handler
     handler_cls = HANDLER_MAP.get(node_type)
     if not handler_cls:
-        await _report_failure(job_id, node_execution_id, f"No handler for node type: {node_type}")
+        await _report_failure_for_current_claim(
+            claim,
+            job_id,
+            node_execution_id,
+            f"No handler for node type: {node_type}",
+        )
         return
 
     if node_type == "youtube_upload":
@@ -238,17 +350,40 @@ async def process_task(data: dict) -> None:
                 input_artifacts_map=input_artifacts_map,
             )
         except Exception as exc:
-            await _report_failure(job_id, node_execution_id, str(exc))
+            await _report_failure_for_current_claim(
+                claim,
+                job_id,
+                node_execution_id,
+                str(exc),
+            )
             return
         config["_job_id"] = job_id
         config["_node_execution_id"] = node_execution_id
         config["_input_artifact_ids"] = dict(input_artifacts_map)
+        config["_execution_claim"] = {
+            "worker_id": claim.worker_id,
+            "started_at": _claim_started_at_utc(claim),
+        }
 
-    handler: BaseHandler
-    if node_type == "youtube_upload":
-        handler = YouTubeUploadHandler(session_factory=get_worker_session())
-    else:
-        handler = handler_cls()
+    try:
+        handler: BaseHandler
+        if node_type == "youtube_upload":
+            handler = YouTubeUploadHandler(session_factory=get_worker_session())
+        else:
+            handler = handler_cls()
+    except Exception as exc:
+        reported = await _report_failure_for_current_claim(
+            claim,
+            job_id,
+            node_execution_id,
+            str(exc),
+        )
+        if reported:
+            logger.exception(
+                "Failed to initialize handler for node %s",
+                data["node_id"],
+            )
+        return
 
     # Background task: periodically check cancel status and kill handler if needed
     cancel_check_task = None
@@ -270,6 +405,12 @@ async def process_task(data: dict) -> None:
             await asyncio.sleep(2)
 
     temp_files: list[str] = []  # track temp files for cleanup (for MinIO)
+    output_local_path: str | None = None
+    output_storage: StorageBackend | None = None
+    artifact_storage_backend: str | None = None
+    artifact_storage_path: str | None = None
+    remote_output_may_exist = False
+    artifact_persisted = False
     try:
         cancel_check_task = asyncio.create_task(_cancel_watcher())
 
@@ -278,41 +419,48 @@ async def process_task(data: dict) -> None:
         input_artifacts: list[tuple[str, InputArtifactSnapshot]] = []
         async with get_worker_session()() as db:
             for port_name, artifact_id_str in input_artifacts_map.items():
-                artifact_id = uuid.UUID(artifact_id_str)
-                artifact = await db.get(Artifact, artifact_id)
-                if not artifact:
+                input_artifact_id = uuid.UUID(artifact_id_str)
+                artifact_row = await db.get(Artifact, input_artifact_id)
+                if not artifact_row:
                     raise FileNotFoundError(f"Input artifact {artifact_id_str} not found")
-                media_info = artifact.media_info if isinstance(artifact.media_info, dict) else {}
+                media_info = (
+                    artifact_row.media_info
+                    if isinstance(artifact_row.media_info, dict)
+                    else {}
+                )
                 input_artifacts.append(
                     (
                         port_name,
                         InputArtifactSnapshot(
-                            id=artifact_id,
+                            id=input_artifact_id,
                             media_info=dict(media_info),
-                            storage_backend=artifact.storage_backend,
-                            storage_path=artifact.storage_path,
-                            filename=artifact.filename,
-                            file_size=getattr(artifact, "file_size", None),
+                            storage_backend=artifact_row.storage_backend,
+                            storage_path=artifact_row.storage_path,
+                            filename=artifact_row.filename,
+                            file_size=getattr(artifact_row, "file_size", None),
                         ),
                     )
                 )
 
         input_artifact_meta: dict[str, dict] = {}
-        for port_name, artifact in input_artifacts:
-            input_artifact_meta[port_name] = artifact.media_info
-            storage = get_storage(artifact.storage_backend)
-            local_path = storage.get_local_path(artifact.storage_path)
+        for port_name, input_artifact in input_artifacts:
+            input_artifact_meta[port_name] = input_artifact.media_info
+            storage = get_storage(input_artifact.storage_backend)
+            local_path = storage.get_local_path(input_artifact.storage_path)
             if local_path and not Path(local_path).is_file():
-                local_path = await _download_artifact_with_cancel(artifact, cancel_event)
+                local_path = await _download_artifact_with_cancel(
+                    input_artifact,
+                    cancel_event,
+                )
                 temp_files.append(local_path)
             elif not local_path:
                 # MinIO or remote storage: download to temp file
-                content = await storage.read(artifact.storage_path)
-                ext = Path(artifact.filename).suffix or ".mp4"
+                content = await storage.read(input_artifact.storage_path)
+                ext = Path(input_artifact.filename).suffix or ".mp4"
                 fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="vp_input_")
                 os.close(fd)
-                with open(tmp_path, "wb") as f:
-                    f.write(content)
+                with open(tmp_path, "wb") as input_file:
+                    input_file.write(content)
                 local_path = tmp_path
                 temp_files.append(tmp_path)
             input_paths[port_name] = local_path
@@ -323,7 +471,9 @@ async def process_task(data: dict) -> None:
 
         # Prepare output path
         output_ext = _get_output_extension(node_type, config)
-        output_filename = f"{node_execution_id}{output_ext}"
+        output_filename = (
+            f"{node_execution_id}-{_claim_generation_token(claim)}{output_ext}"
+        )
         output_storage_path = f"artifacts/{job_id}/{output_filename}"
         output_local_dir = Path(settings.storage_local_root) / "artifacts" / job_id
         output_local_dir.mkdir(parents=True, exist_ok=True)
@@ -333,9 +483,32 @@ async def process_task(data: dict) -> None:
         if cancel_event.is_set() or cancel_state.is_cancelled:
             handler.cancel()
             raise CancelledError(cancel_state.cancel_reason or "node cancelled before handler execution")
+        try:
+            await _require_current_node_execution_claim(claim)
+        except JobExecutionAuthorityBlocked as exc:
+            logger.info(
+                "Execution claim lost for node %s for job %s before handler execution: %s",
+                data["node_id"],
+                job_id,
+                exc,
+            )
+            handler.cancel()
+            raise CancelledError("node execution claim changed before handler execution") from exc
 
         # Execute handler. Some handlers return artifact metadata and storage hints.
         handler_result = await handler.execute(config, input_paths, output_local_path)
+        try:
+            await _require_current_node_execution_claim(claim)
+        except JobExecutionAuthorityBlocked as exc:
+            logger.info(
+                "Execution claim lost for node %s for job %s after handler execution: %s",
+                data["node_id"],
+                job_id,
+                exc,
+            )
+            handler.cancel()
+            Path(output_local_path).unlink(missing_ok=True)
+            raise CancelledError("node execution claim changed after handler execution") from exc
 
         # Verify output exists
         if not os.path.exists(output_local_path):
@@ -361,37 +534,48 @@ async def process_task(data: dict) -> None:
         # already persisted the exact object and returned a storage-path override.
         output_storage = get_storage(settings.storage_backend)
         if settings.storage_backend != "local" and not skip_upload:
-            with open(output_local_path, "rb") as f:
-                await output_storage.save(artifact_storage_path, f)
+            remote_output_may_exist = True
+            with open(output_local_path, "rb") as output_file:
+                await output_storage.save(artifact_storage_path, output_file)
 
-        # Create artifact record
-        async with get_worker_session()() as db:
-            artifact = Artifact(
-                job_id=uuid.UUID(job_id),
-                node_execution_id=uuid.UUID(node_execution_id),
-                kind=ArtifactKind.INTERMEDIATE,
-                filename=output_filename,
-                mime_type=_guess_mime(output_ext),
-                file_size=file_size,
-                storage_backend=artifact_storage_backend,
-                storage_path=artifact_storage_path,
-                media_info=artifact_media_info,
-            )
-            db.add(artifact)
-            await db.flush()
-            artifact_id = str(artifact.id)
-            await db.commit()
+        output_artifact_id = await _persist_artifact_for_current_claim(
+            claim,
+            filename=output_filename,
+            mime_type=_guess_mime(output_ext),
+            file_size=file_size,
+            storage_backend=artifact_storage_backend,
+            storage_path=artifact_storage_path,
+            media_info=artifact_media_info,
+        )
+        artifact_persisted = True
 
         # Report success
-        await _report_success(job_id, node_execution_id, artifact_id)
+        await _report_success(
+            job_id,
+            node_execution_id,
+            output_artifact_id,
+            claim,
+        )
         logger.info(f"Node {data['node_id']} completed successfully")
 
     except CancelledError:
         logger.info(f"Node {data['node_id']} cancelled, cleaning up")
         # Don't report failure — orchestrator already knows about the cancel
     except Exception as e:
-        logger.exception(f"Node {data['node_id']} failed")
-        await _report_failure(job_id, node_execution_id, str(e))
+        reported = await _report_failure_for_current_claim(
+            claim,
+            job_id,
+            node_execution_id,
+            str(e),
+        )
+        if reported:
+            logger.exception(f"Node {data['node_id']} failed")
+        else:
+            logger.info(
+                "Node %s stopped after losing its execution claim",
+                data["node_id"],
+            )
+            handler.cancel()
     finally:
         if cancel_check_task and not cancel_check_task.done():
             cancel_check_task.cancel()
@@ -399,6 +583,23 @@ async def process_task(data: dict) -> None:
                 await cancel_check_task
             except asyncio.CancelledError:
                 pass
+        if output_local_path and (
+            not artifact_persisted or artifact_storage_backend != "local"
+        ):
+            Path(output_local_path).unlink(missing_ok=True)
+        if (
+            not artifact_persisted
+            and remote_output_may_exist
+            and output_storage is not None
+            and artifact_storage_path is not None
+        ):
+            try:
+                await output_storage.delete(artifact_storage_path)
+            except Exception:
+                logger.exception(
+                    "Failed to clean uncommitted remote output %s",
+                    artifact_storage_path,
+                )
         # Clean up any temp files downloaded from remote storage
         for tmp in temp_files:
             try:
@@ -564,30 +765,65 @@ async def _authoritative_youtube_upload_inputs(
         return dict(node_execution.node_config), {"input": str(queued_input_artifact_id)}
 
 
-async def _report_success(job_id: str, node_execution_id: str, artifact_id: str) -> None:
+async def _report_success(
+    job_id: str,
+    node_execution_id: str,
+    artifact_id: str,
+    claim: NodeExecutionClaim,
+) -> None:
     r = _redis()
     try:
-        await r.xadd(EVENT_STREAM, {
+        payload: dict[EncodableT, EncodableT] = {
             "event": "node_completed",
             "job_id": job_id,
             "node_execution_id": node_execution_id,
             "output_artifact_id": artifact_id,
-        })
+            "worker_id": claim.worker_id,
+            "started_at": _claim_started_at_utc(claim),
+        }
+        await r.xadd(EVENT_STREAM, payload)
     finally:
         await r.aclose()
 
 
-async def _report_failure(job_id: str, node_execution_id: str, error: str) -> None:
+async def _report_failure(
+    job_id: str,
+    node_execution_id: str,
+    error: str,
+    claim: NodeExecutionClaim,
+) -> None:
     r = _redis()
     try:
-        await r.xadd(EVENT_STREAM, {
+        payload: dict[EncodableT, EncodableT] = {
             "event": "node_failed",
             "job_id": job_id,
             "node_execution_id": node_execution_id,
             "error": error[:2000],
-        })
+            "worker_id": claim.worker_id,
+            "started_at": _claim_started_at_utc(claim),
+        }
+        await r.xadd(EVENT_STREAM, payload)
     finally:
         await r.aclose()
+
+
+def _claim_generation_token(claim: NodeExecutionClaim) -> str:
+    material = "\0".join(
+        (
+            str(claim.job_id),
+            str(claim.node_execution_id),
+            claim.worker_id,
+            _claim_started_at_utc(claim),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _claim_started_at_utc(claim: NodeExecutionClaim) -> str:
+    started_at = claim.started_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    return started_at.astimezone(timezone.utc).isoformat()
 
 
 def _get_output_extension(node_type: str, config: dict) -> str:
@@ -674,16 +910,11 @@ async def _process_message(r: aioredis.Redis, msg_id: str, data: dict) -> None:
         await process_task(data)
         should_ack = True
     except Exception:
-        logger.exception(f"Unhandled error processing {msg_id}")
-        try:
-            await _report_failure(
-                data["job_id"],
-                data["node_execution_id"],
-                "Worker failed before task state could be updated. See worker logs for details.",
-            )
-            should_ack = True
-        except Exception:
-            logger.exception("Failed to report failure for %s; leaving message pending", msg_id)
+        logger.exception(
+            "Unhandled error processing %s; leaving message pending because no "
+            "durable execution claim is available",
+            msg_id,
+        )
     finally:
         heartbeat_task.cancel()
         try:

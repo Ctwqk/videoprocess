@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,16 +71,42 @@ class WorkerHarness:
         async def report_success(*args) -> None:
             return None
 
-        async def report_failure(_job_id: str, _node_execution_id: str, error: str) -> None:
+        async def report_failure(
+            _job_id: str,
+            _node_execution_id: str,
+            error: str,
+            _claim,
+        ) -> None:
             harness.failures.append(error)
 
-        async def claim_node(*args, **kwargs) -> bool:
-            return True
+        async def claim_node(*args, **kwargs):
+            return worker_main.NodeExecutionClaim(
+                job_id=harness.node_execution.job_id,
+                node_execution_id=harness.node_execution.id,
+                worker_id="test-worker@localhost:1",
+                started_at=datetime(2026, 7, 22, 12, 0, 0),
+            )
+
+        async def require_current_claim(_claim) -> None:
+            return None
+
+        async def persist_artifact(_claim, **kwargs) -> str:
+            return str(uuid.uuid4())
 
         monkeypatch.setattr(worker_main, "HANDLER_MAP", {"youtube_upload": object})
         monkeypatch.setattr(worker_main, "YouTubeUploadHandler", YouTubeHandler)
         monkeypatch.setattr(worker_main, "get_worker_session", lambda: process_session_factory)
         monkeypatch.setattr(worker_main, "_claim_node_execution", claim_node)
+        monkeypatch.setattr(
+            worker_main,
+            "_require_current_node_execution_claim",
+            require_current_claim,
+        )
+        monkeypatch.setattr(
+            worker_main,
+            "_persist_artifact_for_current_claim",
+            persist_artifact,
+        )
         monkeypatch.setattr(worker_main, "_load_cancel_state", not_cancelled)
         monkeypatch.setattr(worker_main, "_report_success", report_success)
         monkeypatch.setattr(worker_main, "_report_failure", report_failure)
@@ -106,6 +133,7 @@ def authoritative_rows(tmp_path: Path):
     input_path = tmp_path / "input.mp4"
     input_path.write_bytes(b"authoritative input")
     node_execution = SimpleNamespace(
+        id=node_execution_id,
         job_id=job_id,
         node_id="youtube_upload_1",
         node_type="youtube_upload",
@@ -150,12 +178,16 @@ async def test_youtube_task_uses_authoritative_node_config_and_validated_input(m
         {
             "title": "authoritative title",
             "privacy": "unlisted",
-            "_job_id": str(job_id),
-            "_node_execution_id": str(node_execution_id),
-            "_input_artifact_ids": {"input": str(artifact_id)},
-            "_input_artifact_meta": {"input": {}},
-        }
-    ]
+                "_job_id": str(job_id),
+                "_node_execution_id": str(node_execution_id),
+                "_input_artifact_ids": {"input": str(artifact_id)},
+                "_execution_claim": {
+                    "worker_id": "test-worker@localhost:1",
+                    "started_at": "2026-07-22T12:00:00+00:00",
+                },
+                "_input_artifact_meta": {"input": {}},
+            }
+        ]
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,30 @@ class LockedJobExecutionAuthority:
     task: ProductionTask | None
     job: Job
     node: NodeExecution | None
+
+
+@dataclass(frozen=True)
+class NodeExecutionClaim:
+    job_id: uuid.UUID
+    node_execution_id: uuid.UUID
+    worker_id: str
+    started_at: datetime
+
+
+def require_matching_node_execution_claim(
+    authority: LockedJobExecutionAuthority,
+    claim: NodeExecutionClaim,
+) -> None:
+    node = authority.node
+    if (
+        authority.job.id != claim.job_id
+        or node is None
+        or node.id != claim.node_execution_id
+        or node.worker_id != claim.worker_id
+        or not isinstance(node.started_at, datetime)
+        or _utc(node.started_at) != _utc(claim.started_at)
+    ):
+        raise JobExecutionAuthorityBlocked("node execution claim changed")
 
 
 def require_active_execution_authority(
@@ -174,3 +199,9 @@ async def lock_job_execution_authority(
         job=job,
         node=node,
     )
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
