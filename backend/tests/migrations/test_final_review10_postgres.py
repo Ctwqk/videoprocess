@@ -128,10 +128,11 @@ async def test_postgres_16_promotion_operation_migration_is_rolling_safe_and_rev
         conn = await asyncpg.connect(_asyncpg_url(target_url))
         try:
             assert await conn.fetchval("SHOW server_version_num") >= "160000"
-            assert (
-                await conn.fetchval("SELECT version_num FROM alembic_version")
-                == "031_guarded_schedule_job_authority"
-            )
+            current_heads = {
+                row["version_num"]
+                for row in await conn.fetch("SELECT version_num FROM alembic_version")
+            }
+            assert current_heads == {"032_channelops_leader_epoch"}
             constraints = {
                 row["conname"]
                 for row in await conn.fetch(
