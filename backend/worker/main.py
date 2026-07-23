@@ -60,6 +60,12 @@ ARTIFACT_DOWNLOAD_BASE_URL = os.environ.get(
     "VP_ARTIFACT_DOWNLOAD_BASE_URL",
     "http://vp-api-swarm:8080/api/v1",
 ).strip().rstrip("/")
+ARTIFACT_DOWNLOAD_MAX_BYTES = int(
+    os.environ.get("VP_ARTIFACT_DOWNLOAD_MAX_BYTES", str(10 * 1024 * 1024 * 1024))
+)
+ARTIFACT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = float(
+    os.environ.get("VP_ARTIFACT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS", "900")
+)
 
 engine_db: AsyncEngine | None = None
 worker_session: async_sessionmaker[AsyncSession] | None = None
@@ -106,6 +112,16 @@ class CancelState:
     job_status: JobStatus | None
     is_cancelled: bool
     cancel_reason: str | None
+
+
+@dataclass(frozen=True)
+class InputArtifactSnapshot:
+    id: uuid.UUID
+    media_info: dict
+    storage_backend: str
+    storage_path: str
+    filename: str
+    file_size: int | None
 
 
 async def _load_cancel_state(node_execution_id: str) -> CancelState:
@@ -236,10 +252,10 @@ async def process_task(data: dict) -> None:
 
     # Background task: periodically check cancel status and kill handler if needed
     cancel_check_task = None
+    cancel_event = asyncio.Event()
 
     async def _cancel_watcher():
         while True:
-            await asyncio.sleep(2)
             cancel_state = await _load_cancel_state(node_execution_id)
             if cancel_state.is_cancelled:
                 logger.info(
@@ -249,35 +265,57 @@ async def process_task(data: dict) -> None:
                     cancel_state.cancel_reason,
                 )
                 handler.cancel()
+                cancel_event.set()
                 return
+            await asyncio.sleep(2)
 
     temp_files: list[str] = []  # track temp files for cleanup (for MinIO)
     try:
+        cancel_check_task = asyncio.create_task(_cancel_watcher())
+
         # Resolve input artifact paths to local file paths
         input_paths: dict[str, str] = {}
+        input_artifacts: list[tuple[str, InputArtifactSnapshot]] = []
         async with get_worker_session()() as db:
-            input_artifact_meta: dict[str, dict] = {}
             for port_name, artifact_id_str in input_artifacts_map.items():
-                artifact = await db.get(Artifact, uuid.UUID(artifact_id_str))
+                artifact_id = uuid.UUID(artifact_id_str)
+                artifact = await db.get(Artifact, artifact_id)
                 if not artifact:
                     raise FileNotFoundError(f"Input artifact {artifact_id_str} not found")
-                input_artifact_meta[port_name] = artifact.media_info or {}
-                storage = get_storage(artifact.storage_backend)
-                local_path = storage.get_local_path(artifact.storage_path)
-                if local_path and not Path(local_path).is_file():
-                    local_path = await _download_artifact_via_api(artifact)
-                    temp_files.append(local_path)
-                elif not local_path:
-                    # MinIO or remote storage: download to temp file
-                    content = await storage.read(artifact.storage_path)
-                    ext = Path(artifact.filename).suffix or ".mp4"
-                    fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="vp_input_")
-                    os.close(fd)
-                    with open(tmp_path, "wb") as f:
-                        f.write(content)
-                    local_path = tmp_path
-                    temp_files.append(tmp_path)
-                input_paths[port_name] = local_path
+                media_info = artifact.media_info if isinstance(artifact.media_info, dict) else {}
+                input_artifacts.append(
+                    (
+                        port_name,
+                        InputArtifactSnapshot(
+                            id=artifact_id,
+                            media_info=dict(media_info),
+                            storage_backend=artifact.storage_backend,
+                            storage_path=artifact.storage_path,
+                            filename=artifact.filename,
+                            file_size=getattr(artifact, "file_size", None),
+                        ),
+                    )
+                )
+
+        input_artifact_meta: dict[str, dict] = {}
+        for port_name, artifact in input_artifacts:
+            input_artifact_meta[port_name] = artifact.media_info
+            storage = get_storage(artifact.storage_backend)
+            local_path = storage.get_local_path(artifact.storage_path)
+            if local_path and not Path(local_path).is_file():
+                local_path = await _download_artifact_with_cancel(artifact, cancel_event)
+                temp_files.append(local_path)
+            elif not local_path:
+                # MinIO or remote storage: download to temp file
+                content = await storage.read(artifact.storage_path)
+                ext = Path(artifact.filename).suffix or ".mp4"
+                fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix="vp_input_")
+                os.close(fd)
+                with open(tmp_path, "wb") as f:
+                    f.write(content)
+                local_path = tmp_path
+                temp_files.append(tmp_path)
+            input_paths[port_name] = local_path
 
         config["_input_artifact_meta"] = input_artifact_meta
         if node_type != "youtube_upload":
@@ -291,8 +329,10 @@ async def process_task(data: dict) -> None:
         output_local_dir.mkdir(parents=True, exist_ok=True)
         output_local_path = str(output_local_dir / output_filename)
 
-        # Start cancel watcher
-        cancel_check_task = asyncio.create_task(_cancel_watcher())
+        cancel_state = await _load_cancel_state(node_execution_id)
+        if cancel_event.is_set() or cancel_state.is_cancelled:
+            handler.cancel()
+            raise CancelledError(cancel_state.cancel_reason or "node cancelled before handler execution")
 
         # Execute handler. Some handlers return artifact metadata and storage hints.
         handler_result = await handler.execute(config, input_paths, output_local_path)
@@ -367,12 +407,62 @@ async def process_task(data: dict) -> None:
                 pass
 
 
-async def _download_artifact_via_api(artifact: Artifact) -> str:
+async def _download_artifact_with_cancel(
+    artifact: InputArtifactSnapshot,
+    cancel_event: asyncio.Event,
+) -> str:
+    download_task = asyncio.create_task(_download_artifact_via_api(artifact))
+    cancel_task = asyncio.create_task(cancel_event.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {download_task, cancel_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if cancel_task in done and cancel_event.is_set():
+            download_task.cancel()
+            completed_path = None
+            try:
+                completed_path = await download_task
+            except BaseException:
+                pass
+            if completed_path:
+                try:
+                    os.unlink(completed_path)
+                except OSError:
+                    pass
+            raise CancelledError("node cancelled during input artifact download")
+        return await download_task
+    finally:
+        for task in (download_task, cancel_task):
+            if not task.done():
+                task.cancel()
+        for task in (download_task, cancel_task):
+            try:
+                await task
+            except BaseException:
+                pass
+
+
+async def _download_artifact_via_api(artifact: Artifact | InputArtifactSnapshot) -> str:
     if not ARTIFACT_DOWNLOAD_BASE_URL:
         raise RuntimeError(
             f"Input artifact {artifact.id} is not present on this worker and "
             "VP_ARTIFACT_DOWNLOAD_BASE_URL is not configured"
         )
+    if ARTIFACT_DOWNLOAD_MAX_BYTES <= 0:
+        raise RuntimeError("VP_ARTIFACT_DOWNLOAD_MAX_BYTES must be positive")
+    if ARTIFACT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS <= 0:
+        raise RuntimeError("VP_ARTIFACT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS must be positive")
+
+    expected_size = artifact.file_size
+    if expected_size is not None and expected_size < 0:
+        raise RuntimeError(f"Input artifact {artifact.id} has an invalid negative file size")
+    if expected_size is not None and expected_size > ARTIFACT_DOWNLOAD_MAX_BYTES:
+        raise RuntimeError(
+            f"Input artifact {artifact.id} expected size {expected_size} exceeds "
+            f"the configured download limit {ARTIFACT_DOWNLOAD_MAX_BYTES}"
+        )
+    download_limit = expected_size if expected_size is not None else ARTIFACT_DOWNLOAD_MAX_BYTES
 
     suffix = Path(artifact.filename).suffix or ".mp4"
     fd, temp_path = tempfile.mkstemp(suffix=suffix, prefix="vp_input_")
@@ -382,22 +472,32 @@ async def _download_artifact_via_api(artifact: Artifact) -> str:
     url = f"{ARTIFACT_DOWNLOAD_BASE_URL}/artifacts/{artifact.id}/download"
 
     try:
-        async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
-            async with client.stream("GET", url) as response:
-                if response.status_code != 200:
-                    raise RuntimeError(
-                        f"Artifact download API returned HTTP {response.status_code} "
-                        f"for input artifact {artifact.id}"
-                    )
-                with open(temp_path, "wb") as handle:
-                    async for chunk in response.aiter_bytes():
-                        if not chunk:
-                            continue
-                        handle.write(chunk)
-                        downloaded_size += len(chunk)
-                        digest.update(chunk)
+        try:
+            async with asyncio.timeout(ARTIFACT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS):
+                timeout = httpx.Timeout(60.0, connect=10.0)
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                    async with client.stream("GET", url) as response:
+                        if response.status_code != 200:
+                            raise RuntimeError(
+                                f"Artifact download API returned HTTP {response.status_code} "
+                                f"for input artifact {artifact.id}"
+                            )
+                        with open(temp_path, "wb") as handle:
+                            async for chunk in response.aiter_bytes():
+                                if not chunk:
+                                    continue
+                                next_size = downloaded_size + len(chunk)
+                                if next_size > download_limit:
+                                    raise RuntimeError(
+                                        f"Downloaded input artifact {artifact.id} exceeds "
+                                        f"the allowed size {download_limit}"
+                                    )
+                                handle.write(chunk)
+                                downloaded_size = next_size
+                                digest.update(chunk)
+        except TimeoutError as exc:
+            raise RuntimeError(f"Input artifact {artifact.id} download timed out") from exc
 
-        expected_size = artifact.file_size
         if expected_size is not None and downloaded_size != expected_size:
             raise RuntimeError(
                 f"Downloaded input artifact {artifact.id} size mismatch: "

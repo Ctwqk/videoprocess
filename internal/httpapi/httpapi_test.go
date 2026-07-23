@@ -6,12 +6,40 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/go-chi/chi/v5"
 )
+
+type localPathOnlyStorage struct {
+	path       string
+	readCalled bool
+}
+
+func (s *localPathOnlyStorage) Read(context.Context, string) ([]byte, error) {
+	s.readCalled = true
+	return nil, errors.New("local download must not buffer through Read")
+}
+
+func (s *localPathOnlyStorage) Save(context.Context, string, []byte) error {
+	return nil
+}
+
+func (s *localPathOnlyStorage) Exists(context.Context, string) (bool, error) {
+	return true, nil
+}
+
+func (s *localPathOnlyStorage) Delete(context.Context, string) error {
+	return nil
+}
+
+func (s *localPathOnlyStorage) LocalPath(string) (string, bool) {
+	return s.path, true
+}
 
 func TestHealth(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -28,6 +56,31 @@ func TestHealth(t *testing.T) {
 	}
 	if payload["status"] != "ok" {
 		t.Fatalf("status payload = %#v", payload)
+	}
+}
+
+func TestWriteStoredObjectStreamsLocalPathWithoutBufferingStorageRead(t *testing.T) {
+	content := []byte("streamed-local-artifact")
+	path := filepath.Join(t.TempDir(), "artifact.mp4")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storage := &localPathOnlyStorage{path: path}
+	server := &Server{storage: storage}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/artifacts/id/download", nil)
+	rec := httptest.NewRecorder()
+	mimeType := "video/mp4"
+
+	server.writeStoredObject(rec, req, "artifacts/input.mp4", "input.mp4", &mimeType)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != string(content) {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+	if storage.readCalled {
+		t.Fatal("local artifact download buffered through storage.Read")
 	}
 }
 

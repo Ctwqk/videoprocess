@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -115,6 +116,28 @@ func (s *Server) deleteAsset(w http.ResponseWriter, r *http.Request) {
 func (s *Server) writeStoredObject(w http.ResponseWriter, r *http.Request, storagePath string, filename string, mimeType *string) {
 	if s.storage == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"detail": "storage unavailable"})
+		return
+	}
+	if localPath, ok := s.storage.LocalPath(storagePath); ok {
+		file, err := os.Open(localPath)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+			return
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			if err == nil {
+				err = fmt.Errorf("stored object is not a regular file")
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"detail": err.Error()})
+			return
+		}
+		if mimeType != nil && *mimeType != "" {
+			w.Header().Set("Content-Type", *mimeType)
+		}
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+		http.ServeContent(w, r, filename, info.ModTime(), file)
 		return
 	}
 	data, err := s.storage.Read(r.Context(), storagePath)
