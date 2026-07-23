@@ -39,6 +39,31 @@ vp_validate_deploy_config() {
   fi
 }
 
+vp_require_channelops_migration_head() {
+  local python_worker="$1"
+
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    log "ChannelOps migration head gate skipped because service updates are disabled"
+    return 0
+  fi
+  if [[ -z "${VP_PYTHON_WORKER_DATABASE_URL:-}" ]]; then
+    echo "ChannelOps migration head gate requires VP_PYTHON_WORKER_DATABASE_URL" >&2
+    return 1
+  fi
+
+  local check
+  check='import asyncio, os; from sqlalchemy import text; from sqlalchemy.ext.asyncio import create_async_engine; exec("async def check():\n    engine = create_async_engine(os.environ[\"DATABASE_URL\"])\n    try:\n        async with engine.connect() as connection:\n            rows = list((await connection.execute(text(\"SELECT version_num FROM alembic_version\"))).scalars())\n    except Exception:\n        raise SystemExit(1)\n    finally:\n        await engine.dispose()\n    if rows != [\"032_channelops_leader_epoch\"]:\n        raise SystemExit(1)"); asyncio.run(check())'
+  if ! DATABASE_URL="$VP_PYTHON_WORKER_DATABASE_URL" docker run --rm \
+    --network "$VP_PIPELINE_NETWORK" \
+    --env DATABASE_URL \
+    "$python_worker" \
+    python -c "$check"; then
+    echo "ChannelOps migration head gate failed; expected exactly 032_channelops_leader_epoch" >&2
+    return 1
+  fi
+  log "ChannelOps migration head verified: 032_channelops_leader_epoch"
+}
+
 vp_service_values() {
   local service="$1"
   local template="$2"
@@ -1043,6 +1068,7 @@ vp_apply_app_services() {
   vp_deploy_publisher "$python_worker" || return 1
   vp_update_runtime_service vp-autoflow-api-swarm "$backend" start-first || return 1
   vp_update_runtime_service vp-event-outbox-relay-swarm "$backend" start-first || return 1
+  vp_require_channelops_migration_head "$python_worker" || return 1
   vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" stop-first || return 1
   vp_update_runtime_service vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first || return 1
 

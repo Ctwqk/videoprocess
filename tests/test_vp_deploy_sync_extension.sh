@@ -157,6 +157,7 @@ FAIL_NETWORK_INSPECT=false
 FAIL_PUBLISHER_CREATE=false
 FAIL_MANAGED_CRON_PRINTF=false
 FAIL_SOAK_CLEANUP=false
+MIGRATION_GATE_MODE=success
 
 printf() {
   if [[ "$FAIL_MANAGED_CRON_PRINTF" == "true" \
@@ -206,6 +207,12 @@ swarm_service_running() {
 
 docker() {
   printf 'docker|%s\n' "$*" >>"$CALLS"
+  if [[ "${1:-}" == "run" \
+    && "$*" == *"--env DATABASE_URL"* \
+    && "$*" == *"SELECT version_num FROM alembic_version"* ]]; then
+    [[ "$MIGRATION_GATE_MODE" == "success" ]]
+    return
+  fi
   if [[ "${1:-}" == "run" && "$GPU_PREFLIGHT_SUCCEEDS" != "true" ]]; then
     return 1
   fi
@@ -410,6 +417,10 @@ if ! grep -Fq 'vp_update_runtime_service vp-channel-agent-runner-swarm "$channel
   echo 'FAIL: managed ChannelOps runner must replace stop-first' >&2
   exit 1
 fi
+if ! grep -Fq 'vp_require_channelops_migration_head "$python_worker"' "$EXTENSION"; then
+  echo 'FAIL: managed ChannelOps runner must be gated on the exact migration head' >&2
+  exit 1
+fi
 for expected_order in \
   'vp_update_runtime_service vp-api-swarm "$api" stop-first' \
   'vp_update_runtime_service vp-frontend-swarm "$frontend" stop-first' \
@@ -497,6 +508,72 @@ if [[ -z "$python_worker_update_line" \
   echo 'FAIL: claim-aware Python event producers must deploy before their listener' >&2
   exit 1
 fi
+
+backend_migration_update_line="$(
+  grep -nF 'docker|service update' "$CALLS" \
+    | grep -F -- '--image vp-backend-api:deploy-0123456789ab' \
+    | grep -F 'vp-event-outbox-relay-swarm' \
+    | head -1 \
+    | cut -d: -f1
+)"
+migration_gate_line="$(
+  grep -nF 'docker|run --rm' "$CALLS" \
+    | grep -F -- '--env DATABASE_URL' \
+    | grep -F 'SELECT version_num FROM alembic_version' \
+    | head -1 \
+    | cut -d: -f1
+)"
+runner_update_line="$(
+  grep -nF 'docker|service update' "$CALLS" \
+    | grep -F 'vp-channel-agent-runner-swarm' \
+    | grep -F -- '--image vp-channelops-runner-go:deploy-0123456789ab' \
+    | head -1 \
+    | cut -d: -f1
+)"
+if [[ -z "$backend_migration_update_line" \
+  || -z "$migration_gate_line" \
+  || -z "$runner_update_line" \
+  || "$backend_migration_update_line" -ge "$migration_gate_line" \
+  || "$migration_gate_line" -ge "$runner_update_line" ]]; then
+  echo 'FAIL: exact migration head gate must run after backend and before runner update' >&2
+  exit 1
+fi
+migration_gate_call="$(
+  grep -F 'docker|run --rm' "$CALLS" \
+    | grep -F -- '--env DATABASE_URL' \
+    | grep -F 'SELECT version_num FROM alembic_version' \
+    | head -1
+)"
+if [[ "$migration_gate_call" == *"$VP_PYTHON_WORKER_DATABASE_URL"* ]]; then
+  echo 'FAIL: migration gate printed the deploy database URL' >&2
+  exit 1
+fi
+
+cp "$CALLS" "$TEST_ROOT/successful-deploy-calls"
+for migration_gate_mode in wrong missing error; do
+  : >"$CALLS"
+  MIGRATION_GATE_MODE="$migration_gate_mode"
+  if vp_apply_app_services \
+    "vp-api:gate-$migration_gate_mode" \
+    "vp-frontend:gate-$migration_gate_mode" \
+    "vp-backend-api:gate-$migration_gate_mode" \
+    "vp-channelops-runner-go:gate-$migration_gate_mode" \
+    "vp-ffmpeg-worker-go:gate-$migration_gate_mode" \
+    "vp-ffmpeg-worker-python:gate-$migration_gate_mode" >/dev/null 2>&1; then
+    echo "FAIL: $migration_gate_mode migration gate unexpectedly succeeded" >&2
+    exit 1
+  fi
+  if grep -Fq 'vp-channel-agent-runner-swarm' "$CALLS"; then
+    echo "FAIL: $migration_gate_mode migration gate allowed a runner update" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'SELECT version_num FROM alembic_version' "$CALLS"; then
+    echo "FAIL: $migration_gate_mode migration gate did not query alembic_version" >&2
+    exit 1
+  fi
+done
+MIGRATION_GATE_MODE=success
+cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
 
 if [[ ! -x "$ROOT/bin/channelops-soak-watch.sh" ]]; then
   echo 'FAIL: successful deployment did not install an executable soak watcher' >&2
@@ -1160,6 +1237,22 @@ fi
 grep -Fq -- '--image baseline-vp-api-swarm:stable vp-api-swarm' "$CALLS"
 grep -Fq -- '--image baseline-vp-channel-agent-runner-swarm:stable vp-channel-agent-runner-swarm' "$CALLS"
 grep -Fq -- '--constraint-add node.labels.vp.runtime==true' "$CALLS"
+runner_rollback_call="$(
+  grep -F 'docker|service update' "$CALLS" \
+    | grep -F -- '--image baseline-vp-channel-agent-runner-swarm:stable' \
+    | grep -F 'vp-channel-agent-runner-swarm' \
+    | head -1
+)"
+if [[ "$runner_rollback_call" != *'--update-order stop-first'* \
+  || "$runner_rollback_call" != *'--env-add CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1'* \
+  || "$runner_rollback_call" != *'--health-cmd wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1'* \
+  || "$runner_rollback_call" != *'--health-interval 10s'* \
+  || "$runner_rollback_call" != *'--health-timeout 3s'* \
+  || "$runner_rollback_call" != *'--health-retries 6'* \
+  || "$runner_rollback_call" != *'--health-start-period 10s'* ]]; then
+  echo 'FAIL: runner rollback must retain stop-first, exact identity, and exact readyz health' >&2
+  exit 1
+fi
 if grep -Fq 'docker|service rollback' "$CALLS"; then
   echo 'FAIL: VP rollback must not restore the legacy service specification' >&2
   exit 1
