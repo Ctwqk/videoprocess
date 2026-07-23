@@ -164,6 +164,10 @@ func (r *Runner) handleLearningRecomputeHTTP(w http.ResponseWriter, req *http.Re
 		windowDays = parsed
 	}
 	if err := r.RecomputeLearning(req.Context(), channelID, windowDays); err != nil {
+		if leaderFenceRejected(err) {
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -174,7 +178,25 @@ func (r *Runner) RecomputeLearning(ctx context.Context, channelID string, window
 	if r == nil || r.Store == nil {
 		return errors.New("channelops runner store is not configured")
 	}
-	return r.Store.RecomputeLearningState(ctx, channelID, windowDays)
+	if r.Leadership == nil {
+		return r.Store.RecomputeLearningState(ctx, channelID, windowDays)
+	}
+	authority, err := r.Leadership.EnsureActive(ctx, r.now())
+	if err != nil {
+		if errors.Is(err, ErrLeaderAuthorityLost) {
+			return err
+		}
+		return errors.Join(ErrLeaderAuthorityUnavailable, err)
+	}
+	if authority == nil {
+		return ErrLeaderAuthorityUnavailable
+	}
+	return r.Store.WithLeaderExecutionFence(ctx, func(fencedStore *Store) error {
+		if r.recomputeLearning != nil {
+			return r.recomputeLearning(ctx, fencedStore, channelID, windowDays)
+		}
+		return fencedStore.RecomputeLearningState(ctx, channelID, windowDays)
+	})
 }
 
 func RunHTTPServer(ctx context.Context, addr string, handler http.Handler) error {

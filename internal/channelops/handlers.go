@@ -162,6 +162,13 @@ func (h HandlerService) HandleIngestDiscovery(ctx context.Context, item QueueIte
 	if err != nil {
 		return err
 	}
+	if h.Store.Pool != nil {
+		if err := h.Store.WithQueueExecutionFence(ctx, item, func(*Store) error {
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	observation, err := h.Discovery.Ingest(ctx, request)
 	if err != nil {
 		return ErrDiscoveryIngestFailed

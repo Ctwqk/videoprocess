@@ -15,6 +15,7 @@ const (
 	LeaderRoleUnavailable = "unavailable"
 
 	runnerLeadershipCloseTimeout = 5 * time.Second
+	runnerClaimReleaseTimeout    = 5 * time.Second
 )
 
 type LeaderStatus struct {
@@ -30,21 +31,24 @@ type LeadershipController interface {
 }
 
 type postgresLeadershipController struct {
-	mu       sync.Mutex
-	store    *Store
-	holderID string
-	lease    *LeaderLease
-	role     string
-	lastErr  error
-	closed   bool
+	operation chan struct{}
+	statusMu  sync.RWMutex
+	status    LeaderStatus
+	store     *Store
+	holderID  string
+	lease     *LeaderLease
+	closed    bool
 }
 
 func newPostgresLeadershipController(store *Store, holderID string) LeadershipController {
-	return &postgresLeadershipController{
-		store:    store,
-		holderID: holderID,
-		role:     LeaderRoleStandby,
+	controller := &postgresLeadershipController{
+		operation: make(chan struct{}, 1),
+		status:    LeaderStatus{Role: LeaderRoleStandby},
+		store:     store,
+		holderID:  holderID,
 	}
+	controller.operation <- struct{}{}
+	return controller
 }
 
 func (c *postgresLeadershipController) EnsureActive(
@@ -54,8 +58,10 @@ func (c *postgresLeadershipController) EnsureActive(
 	if c == nil {
 		return nil, ErrLeaderAuthorityUnavailable
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.acquireOperation(ctx); err != nil {
+		return nil, err
+	}
+	defer c.releaseOperation()
 
 	if c.closed {
 		return nil, ErrLeaderAuthorityUnavailable
@@ -64,36 +70,36 @@ func (c *postgresLeadershipController) EnsureActive(
 		if err := c.lease.Heartbeat(ctx, now); err != nil {
 			c.lease = nil
 			if errors.Is(err, ErrLeaderAuthorityLost) {
-				c.role = LeaderRoleStandby
-				c.lastErr = nil
+				c.publishStatus(LeaderStatus{Role: LeaderRoleStandby})
 				return nil, nil
 			}
-			c.role = LeaderRoleUnavailable
-			c.lastErr = err
+			c.publishStatus(LeaderStatus{Role: LeaderRoleUnavailable, Err: err})
 			return nil, err
 		}
 		authority := c.lease.Authority()
-		c.role = LeaderRoleActive
-		c.lastErr = nil
+		c.publishStatus(LeaderStatus{
+			Role:      LeaderRoleActive,
+			Authority: cloneLeaderAuthority(authority),
+		})
 		return cloneLeaderAuthority(authority), nil
 	}
 
 	lease, acquired, err := c.store.TryAcquireLeader(ctx, c.holderID, now)
 	if err != nil {
-		c.role = LeaderRoleUnavailable
-		c.lastErr = err
+		c.publishStatus(LeaderStatus{Role: LeaderRoleUnavailable, Err: err})
 		return nil, err
 	}
 	if !acquired {
-		c.role = LeaderRoleStandby
-		c.lastErr = nil
+		c.publishStatus(LeaderStatus{Role: LeaderRoleStandby})
 		return nil, nil
 	}
 
 	c.lease = lease
-	c.role = LeaderRoleActive
-	c.lastErr = nil
 	authority := lease.Authority()
+	c.publishStatus(LeaderStatus{
+		Role:      LeaderRoleActive,
+		Authority: cloneLeaderAuthority(authority),
+	})
 	return cloneLeaderAuthority(authority), nil
 }
 
@@ -104,19 +110,16 @@ func (c *postgresLeadershipController) Status() LeaderStatus {
 			Err:  ErrLeaderAuthorityUnavailable,
 		}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	status := LeaderStatus{Role: c.role, Err: c.lastErr}
-	if c.role != LeaderRoleActive || c.lease == nil {
-		return status
+	c.statusMu.RLock()
+	status := c.status
+	status.Authority = cloneLeaderAuthorityPointer(status.Authority)
+	c.statusMu.RUnlock()
+	if status.Role == LeaderRoleActive && status.Authority != nil {
+		configured, published := c.store.leadership.snapshot()
+		if !configured || !sameLeaderAuthority(published, *status.Authority) {
+			return LeaderStatus{Role: LeaderRoleStandby}
+		}
 	}
-	authority := c.lease.Authority()
-	configured, published := c.store.leadership.snapshot()
-	if !configured || !sameLeaderAuthority(published, authority) {
-		return LeaderStatus{Role: LeaderRoleStandby}
-	}
-	status.Authority = cloneLeaderAuthority(authority)
 	return status
 }
 
@@ -124,8 +127,10 @@ func (c *postgresLeadershipController) Close(ctx context.Context, now time.Time)
 	if c == nil {
 		return nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.acquireOperation(ctx); err != nil {
+		return err
+	}
+	defer c.releaseOperation()
 
 	if c.closed {
 		return nil
@@ -134,30 +139,56 @@ func (c *postgresLeadershipController) Close(ctx context.Context, now time.Time)
 	lease := c.lease
 	c.lease = nil
 	if lease == nil {
-		c.role = LeaderRoleStandby
-		c.lastErr = nil
+		c.publishStatus(LeaderStatus{Role: LeaderRoleStandby})
 		return nil
 	}
 
 	err := lease.Release(ctx, now)
 	if err == nil || errors.Is(err, ErrLeaderAuthorityLost) {
-		c.role = LeaderRoleStandby
-		c.lastErr = nil
+		c.publishStatus(LeaderStatus{Role: LeaderRoleStandby})
 		return err
 	}
-	c.role = LeaderRoleUnavailable
-	c.lastErr = err
+	c.publishStatus(LeaderStatus{Role: LeaderRoleUnavailable, Err: err})
 	return err
 }
 
+func (c *postgresLeadershipController) acquireOperation(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.operation:
+		if err := ctx.Err(); err != nil {
+			c.operation <- struct{}{}
+			return err
+		}
+		return nil
+	}
+}
+
+func (c *postgresLeadershipController) releaseOperation() {
+	c.operation <- struct{}{}
+}
+
+func (c *postgresLeadershipController) publishStatus(status LeaderStatus) {
+	status.Authority = cloneLeaderAuthorityPointer(status.Authority)
+	c.statusMu.Lock()
+	c.status = status
+	c.statusMu.Unlock()
+}
+
 type Runner struct {
-	Config           Config
-	Store            *Store
-	Scheduler        Scheduler
-	Handlers         HandlerService
-	Leadership       LeadershipController
-	schedulerMu      sync.RWMutex
-	lastSchedulerRun time.Time
+	Config            Config
+	Store             *Store
+	Scheduler         Scheduler
+	Handlers          HandlerService
+	Leadership        LeadershipController
+	schedulerRun      func(context.Context, Scheduler, time.Time) (int, error)
+	recomputeLearning func(context.Context, *Store, string, int) error
+	schedulerMu       sync.RWMutex
+	lastSchedulerRun  time.Time
 }
 
 func NewRunner(ctx context.Context, cfg Config) (*Runner, error) {
@@ -274,11 +305,14 @@ func (r *Runner) runOnce(ctx context.Context) error {
 		err := r.Store.WithLeaderExecutionFence(ctx, func(fencedStore *Store) error {
 			scheduler := r.Scheduler
 			scheduler.Store = fencedStore
-			_, err := scheduler.RunOnce(ctx, now)
+			_, err := r.executeScheduler(ctx, scheduler, now)
 			return err
 		})
 		if leaderFenceRejected(err) {
 			return nil
+		}
+		if err != nil {
+			return err
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -318,6 +352,13 @@ func (r *Runner) runOnce(ctx context.Context) error {
 	if item == nil {
 		return nil
 	}
+	confirmedAuthority, authorityErr := r.Leadership.EnsureActive(ctx, r.now())
+	if authorityErr != nil ||
+		confirmedAuthority == nil ||
+		confirmedAuthority.HolderID != authority.HolderID ||
+		confirmedAuthority.Epoch != authority.Epoch {
+		return r.releaseClaimAfterAuthorityChange(ctx, *item)
+	}
 	if err := r.Handlers.Handle(ctx, *item); err != nil {
 		if errors.Is(err, ErrQueueAuthorityInvalid) {
 			return r.Store.MarkQueueRejected(ctx, *item, err.Error())
@@ -325,6 +366,34 @@ func (r *Runner) runOnce(ctx context.Context) error {
 		return r.Store.MarkQueueFailedOrRetry(ctx, *item, err.Error())
 	}
 	return r.Store.MarkQueueDone(ctx, *item)
+}
+
+func (r *Runner) executeScheduler(
+	ctx context.Context,
+	scheduler Scheduler,
+	now time.Time,
+) (int, error) {
+	if r.schedulerRun != nil {
+		return r.schedulerRun(ctx, scheduler, now)
+	}
+	return scheduler.RunOnce(ctx, now)
+}
+
+func (r *Runner) releaseClaimAfterAuthorityChange(ctx context.Context, item QueueItemRow) error {
+	releaseCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		runnerClaimReleaseTimeout,
+	)
+	defer cancel()
+	err := r.Store.MarkQueueFailedOrRetry(
+		releaseCtx,
+		item,
+		"leader authority changed after queue claim",
+	)
+	if errors.Is(err, ErrQueueLeaseLost) {
+		return nil
+	}
+	return err
 }
 
 func (r *Runner) runLegacyOnce(ctx context.Context, now time.Time) error {

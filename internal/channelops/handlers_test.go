@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -219,6 +220,63 @@ func TestHandleIngestDiscoveryDoesNotHoldExecutionFenceDuringClientCall(t *testi
 	}
 	if status != QueueStatusRunning {
 		t.Fatalf("handler changed queue status to %q", status)
+	}
+}
+
+func TestHandleIngestDiscoveryPreflightRejectsStaleLeaderBeforeClientCall(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx := context.Background()
+	fixture := NewChannelOpsFixture(t)
+	fixture.ResetLeaderEpoch(ctx)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	now := fixture.Store.Now()
+	lease := acquireLeaderTestLease(t, ctx, fixture.Store, "channelops-go@discovery-preflight:1", now)
+	defer func() {
+		releaseLeaderTestLease(t, ctx, lease, now.Add(time.Minute))
+		fixture.ResetLeaderEpoch(ctx)
+		fixture.Close(ctx)
+	}()
+	channelID := fixture.ChannelID
+	queueID, err := fixture.Store.Enqueue(ctx, EnqueueOptions{
+		Kind: QueueIngestDiscovery, IdempotencyKey: "discovery-stale-preflight:" + channelID,
+		Payload: map[string]any{
+			"channel_id": channelID, "source": "youtube_search",
+			"bucket": "2026-07-23-22", "scheduler_bucket": "2026-07-23-22",
+		},
+		Priority: 80, ChannelProfileID: &channelID,
+	})
+	if err != nil {
+		t.Fatalf("enqueue stale discovery preflight: %v", err)
+	}
+	authority := lease.Authority()
+	item, err := fixture.Store.ClaimNextForKinds(
+		ctx,
+		fmt.Sprintf("%s:epoch:%d", authority.HolderID, authority.Epoch),
+		[]string{QueueIngestDiscovery},
+	)
+	if err != nil || item == nil || item.ID != queueID {
+		t.Fatalf("claim stale discovery preflight = %#v, %v", item, err)
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channelops_leader_epochs
+		SET epoch = epoch + 1
+		WHERE service_name = $1
+	`, leaderServiceName); err != nil {
+		t.Fatalf("advance discovery preflight epoch: %v", err)
+	}
+	client := &recordingDiscoveryClient{}
+	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
+	handler.Discovery = client
+
+	err = handler.HandleIngestDiscovery(ctx, *item)
+
+	if !errors.Is(err, ErrLeaderAuthorityLost) {
+		t.Fatalf("HandleIngestDiscovery error = %v, want ErrLeaderAuthorityLost", err)
+	}
+	if client.calls != 0 {
+		t.Fatalf("stale discovery client calls = %d, want 0", client.calls)
 	}
 }
 
