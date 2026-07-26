@@ -66,8 +66,9 @@ Each row is immutable after creation.
 - `hard_guard_config_json`: normalized safety and cadence settings.
 - `portfolio_config_json`: normalized lane/content-mix settings.
 - `exploration_config_json`: disabled configuration for this increment.
-- `code_commit_sha`: deployed code identity when available, otherwise
-  `unknown`.
+- `code_commit_sha`: exact 40-character deployed commit SHA. Local test and
+  development builders may use `development`, but a live tick must fail closed
+  if its binary was not built with an exact SHA.
 - `template_registry_version` and `prompt_bundle_version`: explicit immutable
   identifiers, initially `legacy-unversioned`.
 - `config_hash`: SHA-256 of canonical semantic policy content.
@@ -136,6 +137,12 @@ The feature as-of time is captured once per tick and reused for every candidate.
 The snapshot builder consumes only the already loaded tick inputs and candidate
 state. It performs no network or database reads.
 
+The ChannelOps image receives the exact commit as a Docker build argument and
+embeds it in the Go binary through `-ldflags -X`. The normal deploy controller
+already validates a full commit against exact-SHA CI before building; it passes
+that same value to the ChannelOps image build. Tests and local builds retain an
+explicit `development` sentinel.
+
 ## Tick Transaction
 
 The existing fenced tick transaction remains the sole writer:
@@ -177,6 +184,7 @@ authentication and deployment exposure rules remain unchanged.
   performed by migration or deployment.
 - Missing code/template/prompt identity is represented explicitly, never
   inferred from current mutable state.
+- Live ticks reject the local `development` commit sentinel.
 - Historical audit rows are not rewritten as replayable.
 
 ## Testing
@@ -202,4 +210,3 @@ resumed, or activated as part of rollout.
 
 Rollback prefers a forward fix after any new snapshot row exists. Application
 rollback is safe because old code ignores the additive tables and columns.
-

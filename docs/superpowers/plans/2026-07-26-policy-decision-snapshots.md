@@ -115,10 +115,15 @@ git commit -m "feat(channelops): add policy snapshot schema"
 - Create: `internal/channelops/policy_snapshots.go`
 - Create: `internal/channelops/policy_snapshots_test.go`
 - Modify: `internal/channelops/types.go`
+- Modify: `backend/Dockerfile.channelops-runner-go`
+- Modify: `deploy/swarm/deploy-sync-extension.sh`
+- Modify: `tests/test_vp_deploy_sync_extension.sh`
 
 **Interfaces:**
 - Produces `const CandidateFeatureSchemaVersion = "channelops-candidate-v1"`.
-- Produces `BuildBaselinePolicy(channel ChannelProfileRow) PolicyVersion`.
+- Produces build variable `BuildCommitSHA = "development"` overridden by
+  `-X github.com/Ctwqk/videoprocess/internal/channelops.BuildCommitSHA=<sha>`.
+- Produces `BuildBaselinePolicy(channel ChannelProfileRow, codeCommitSHA string) PolicyVersion`.
 - Produces `BuildCandidateSnapshots(policy PolicyVersion, candidates []TickCandidate, asOf time.Time) SnapshotSet`.
 - Produces stable `ConfigHash`, `CandidateSetHash`, `FeatureHash`, and `DecisionHash` values.
 
@@ -133,6 +138,8 @@ Cover:
 - missing lane/format/account/source IDs are represented in a missing mask;
 - timestamps and later PDS/metrics values do not affect feature hashes;
 - semantic config changes change `ConfigHash`;
+- live policy construction rejects `development`, `unknown`, abbreviated, and
+  malformed commit identities;
 - exact replay fixtures produce fixed expected hashes.
 
 - [ ] **Step 2: Run focused tests and verify RED**
@@ -149,8 +156,15 @@ Expected: compile failure because the builder is absent.
 
 Use `encoding/json` over structs and recursively normalized maps. Sort
 candidates by candidate ID before calculating the set hash. Keep the builder
-pure: no database, environment, clock, or network reads. Represent unknown
-code/template/prompt identities with explicit constants.
+pure: no database, environment, clock, or network reads. Pass the build commit
+as an argument. Represent unknown template/prompt identities with explicit
+constants.
+
+Add `ARG VP_BUILD_COMMIT_SHA=development` to the ChannelOps build stage and
+embed it through the exact `-ldflags -X` symbol above. Extend the deploy image
+builder to pass the already CI-verified 40-character commit only for the
+ChannelOps image. Its shell contract must reject a missing or malformed SHA
+before invoking Docker and must not expose repository credentials.
 
 - [ ] **Step 4: Run focused and package tests**
 
@@ -167,7 +181,10 @@ Expected: pass.
 ```bash
 git add internal/channelops/policy_snapshots.go \
   internal/channelops/policy_snapshots_test.go \
-  internal/channelops/types.go
+  internal/channelops/types.go \
+  backend/Dockerfile.channelops-runner-go \
+  deploy/swarm/deploy-sync-extension.sh \
+  tests/test_vp_deploy_sync_extension.sh
 git commit -m "feat(channelops): build deterministic policy snapshots"
 ```
 
