@@ -631,7 +631,7 @@ func TestCollectMetricsExternalWaitAllowsLeaderTakeoverAndRejectsStaleFinalize(t
 	}
 }
 
-func TestSendAlertExternalWaitAllowsLeaderTakeoverAndRejectsStaleFinalize(t *testing.T) {
+func TestSendAlertExternalSuccessRemainsCommittedAcrossLeaderTakeover(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test skipped in short mode")
 	}
@@ -668,16 +668,29 @@ func TestSendAlertExternalWaitAllowsLeaderTakeoverAndRejectsStaleFinalize(t *tes
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow"})
 	handler.Alerts = sink
 
-	harness.rejectStaleFinalizer(
-		handler,
-		sink.started,
-		func() { releaseExternalOnce.Do(func() { close(releaseExternal) }) },
-		"alert sink call",
+	handleDone := make(chan error, 1)
+	go func() { handleDone <- handler.Handle(ctx, harness.item) }()
+	waitHandlerSplitSignal(t, sink.started, "alert sink call")
+	dropLeaderTestSession(t, ctx, harness.oldLease)
+	harness.takeoverLease = acquireHandlerTakeoverWhileBlocked(
+		t,
+		ctx,
+		harness.secondStore,
 		"channelops-go@alert-split-new:1",
+		harness.now.Add(time.Second),
 	)
+	releaseExternalOnce.Do(func() { close(releaseExternal) })
+	select {
+	case err := <-handleDone:
+		if err != nil {
+			t.Fatalf("committed send_alert result after takeover: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for committed send_alert result: %v", ctx.Err())
+	}
 
 	if sink.calls.Load() != 1 {
-		t.Fatalf("stale alert sink calls = %d, want 1", sink.calls.Load())
+		t.Fatalf("committed alert sink calls = %d, want 1", sink.calls.Load())
 	}
 }
 

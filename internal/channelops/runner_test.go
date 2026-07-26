@@ -2,8 +2,11 @@ package channelops
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -824,10 +827,10 @@ func TestRunnerCommittedAlertMarksExactLeaseDoneWithoutReplayAfterTakeover(t *te
 		now,
 	)
 	var takeoverLease *LeaderLease
-	resumeCompletion := make(chan struct{})
-	var resumeOnce sync.Once
+	releaseExternal := make(chan struct{})
+	var releaseExternalOnce sync.Once
 	defer func() {
-		resumeOnce.Do(func() { close(resumeCompletion) })
+		releaseExternalOnce.Do(func() { close(releaseExternal) })
 		releaseLeaderTestLease(t, context.Background(), takeoverLease, now.Add(3*time.Second))
 		_ = oldLease.Release(context.Background(), now.Add(3*time.Second))
 		fixture.ResetLeaderEpoch(context.Background())
@@ -850,28 +853,23 @@ func TestRunnerCommittedAlertMarksExactLeaseDoneWithoutReplayAfterTakeover(t *te
 		t.Fatalf("enqueue committed alert: %v", err)
 	}
 	authority := oldLease.Authority()
-	sink := &recordingAlertSink{}
+	sink := &blockingHandlerAlertSink{
+		started: make(chan struct{}, 1),
+		release: releaseExternal,
+	}
 	handler := fixture.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
 	handler.Alerts = sink
-	handlerSucceeded := make(chan struct{})
 	runner := &Runner{
 		Config:     Config{SchedulerPollSeconds: 60},
 		Store:      fixture.Store,
 		Handlers:   handler,
 		Leadership: &fakeLeadershipController{authority: &authority},
-		afterHandlerSuccess: func(item QueueItemRow) {
-			if item.ID != queueID {
-				t.Errorf("post-handler queue id = %s, want %s", item.ID, queueID)
-			}
-			close(handlerSucceeded)
-			<-resumeCompletion
-		},
 	}
 
 	runDone := make(chan error, 1)
 	go func() { runDone <- runner.runOnce(ctx) }()
-	waitHandlerSplitSignal(t, handlerSucceeded, "committed alert")
-	if calls := len(sink.payloads); calls != 1 {
+	waitHandlerSplitSignal(t, sink.started, "committed alert sink")
+	if calls := sink.calls.Load(); calls != 1 {
 		t.Fatalf("committed alert calls = %d, want 1", calls)
 	}
 
@@ -883,7 +881,7 @@ func TestRunnerCommittedAlertMarksExactLeaseDoneWithoutReplayAfterTakeover(t *te
 		"channelops-go@committed-alert-new:1",
 		now.Add(time.Second),
 	)
-	resumeOnce.Do(func() { close(resumeCompletion) })
+	releaseExternalOnce.Do(func() { close(releaseExternal) })
 	select {
 	case err := <-runDone:
 		if err != nil {
@@ -909,8 +907,218 @@ func TestRunnerCommittedAlertMarksExactLeaseDoneWithoutReplayAfterTakeover(t *te
 	if replay != nil {
 		t.Fatalf("committed alert was replayable: %#v", replay)
 	}
-	if calls := len(sink.payloads); calls != 1 {
+	if calls := sink.calls.Load(); calls != 1 {
 		t.Fatalf("post-takeover alert calls = %d, want 1", calls)
+	}
+}
+
+func TestRunnerExecuteTakeoverReplaysOneDurableRunWithStableIdempotency(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test skipped in short mode")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	fixture := NewChannelOpsFixture(t)
+	fixture.InsertChannelWithLaneAccountSeed(ctx)
+	baseHandler := fixture.HandlerService(PDSDecision{
+		Verdict:    "allow",
+		DecisionID: "allow",
+	})
+	preparedItem := prepareQueueKind(t, ctx, fixture, baseHandler, QueueExecuteTask)
+	taskID := taskIDForQueueItem(t, ctx, fixture, preparedItem)
+	setHumanReviewEvidenceForTest(t, ctx, fixture, taskID, "valid", "", "")
+	harness := newPreparedHandlerTakeoverHarness(
+		t,
+		ctx,
+		fixture,
+		preparedItem,
+		"channelops-go@execute-handoff-old:1",
+	)
+	if err := fixture.Store.ReleaseQueueClaim(ctx, harness.item); err != nil {
+		t.Fatalf("release execute takeover setup claim: %v", err)
+	}
+	if _, err := fixture.Store.Pool.Exec(ctx, `
+		UPDATE channel_ops_queue_items
+		SET run_after = NOW() + INTERVAL '1 hour'
+		WHERE id <> $1::uuid
+		  AND status = $2
+	`, harness.item.ID, QueueStatusQueued); err != nil {
+		t.Fatalf("defer non-target execute takeover queue rows: %v", err)
+	}
+	originalRunAfter := queueRunAfterForTest(t, ctx, fixture.Store, harness.item.ID)
+
+	const (
+		runID      = "00000000-0000-0000-0000-000000000211"
+		pipelineID = "00000000-0000-0000-0000-000000000212"
+		jobID      = "00000000-0000-0000-0000-000000000311"
+	)
+	firstRunCreated := make(chan struct{})
+	releaseFirstResponse := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	defer releaseFirstOnce.Do(func() { close(releaseFirstResponse) })
+	var requestMu sync.Mutex
+	requestCount := 0
+	remoteCreateCount := 0
+	idempotencyKeys := map[string]int{}
+	serverErrors := make(chan error, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			serverErrors <- fmt.Errorf("decode AutoFlow execute request: %w", err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		idempotencyKey := firstString(payload, "idempotency_key")
+		if idempotencyKey == "" {
+			serverErrors <- errors.New("AutoFlow execute request missing idempotency key")
+			http.Error(w, "missing idempotency key", http.StatusBadRequest)
+			return
+		}
+
+		requestMu.Lock()
+		requestCount++
+		call := requestCount
+		if idempotencyKeys[idempotencyKey] == 0 {
+			remoteCreateCount++
+		}
+		idempotencyKeys[idempotencyKey]++
+		requestMu.Unlock()
+
+		if call == 1 {
+			if _, err := fixture.Store.Pool.Exec(ctx, `
+				UPDATE production_tasks
+				SET autoflow_run_id = $2::uuid,
+				    pipeline_id = $3::uuid,
+				    job_id = $4::uuid,
+				    state = 'producing'
+				WHERE id = $1::uuid
+			`, taskID, runID, pipelineID, jobID); err != nil {
+				serverErrors <- fmt.Errorf("persist durable AutoFlow handoff: %w", err)
+				http.Error(w, "durable handoff failed", http.StatusInternalServerError)
+				return
+			}
+			close(firstRunCreated)
+			select {
+			case <-releaseFirstResponse:
+			case <-r.Context().Done():
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"run_id":"00000000-0000-0000-0000-000000000211",
+			"pipeline_id":"00000000-0000-0000-0000-000000000212",
+			"job_id":"00000000-0000-0000-0000-000000000311",
+			"status":"PENDING"
+		}`))
+	}))
+	defer server.Close()
+
+	oldAuthority := harness.oldLease.Authority()
+	oldHandler := baseHandler
+	oldHandler.AutoFlow = HTTPAutoFlowClient{BaseURL: server.URL}
+	oldRunner := &Runner{
+		Config:     Config{SchedulerPollSeconds: 60},
+		Store:      fixture.Store,
+		Handlers:   oldHandler,
+		Leadership: &fakeLeadershipController{authority: &oldAuthority},
+	}
+	oldRunDone := make(chan error, 1)
+	go func() { oldRunDone <- oldRunner.runOnce(ctx) }()
+	waitHandlerSplitSignal(t, firstRunCreated, "durable AutoFlow execute handoff")
+
+	dropLeaderTestSession(t, ctx, harness.oldLease)
+	harness.takeoverLease = acquireHandlerTakeoverWhileBlocked(
+		t,
+		ctx,
+		harness.secondStore,
+		"channelops-go@execute-handoff-new:1",
+		harness.now.Add(time.Second),
+	)
+	releaseFirstOnce.Do(func() { close(releaseFirstResponse) })
+	select {
+	case err := <-oldRunDone:
+		if err != nil {
+			t.Fatalf("old execute runner after takeover: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for old execute runner: %v", ctx.Err())
+	}
+	requireQueueClaimReleasedWithoutPenalty(
+		t,
+		ctx,
+		fixture.Store,
+		harness.item.ID,
+		originalRunAfter,
+	)
+
+	newAuthority := harness.takeoverLease.Authority()
+	newHandler := oldHandler
+	newHandler.Store = harness.secondStore
+	newRunner := &Runner{
+		Config:     Config{SchedulerPollSeconds: 60},
+		Store:      harness.secondStore,
+		Handlers:   newHandler,
+		Leadership: &fakeLeadershipController{authority: &newAuthority},
+	}
+	if err := newRunner.runOnce(ctx); err != nil {
+		t.Fatalf("replacement execute runner: %v", err)
+	}
+
+	requireQueueSucceededWithNoLease(t, ctx, fixture.Store, harness.item.ID)
+	task, err := fixture.Store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("read durable execute task: %v", err)
+	}
+	if task.State != TaskProducing ||
+		task.AutoFlowRunID == nil || *task.AutoFlowRunID != runID ||
+		task.JobID == nil || *task.JobID != jobID {
+		t.Fatalf(
+			"durable execute task = state %s run %v job %v",
+			task.State,
+			task.AutoFlowRunID,
+			task.JobID,
+		)
+	}
+	var observeCount int
+	if err := fixture.Store.Pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM channel_ops_queue_items
+		WHERE parent_queue_item_id = $1::uuid
+		  AND kind = $2
+	`, harness.item.ID, QueueObserveJob).Scan(&observeCount); err != nil {
+		t.Fatalf("count durable execute observe rows: %v", err)
+	}
+	if observeCount != 1 {
+		t.Fatalf("durable execute observe rows = %d, want 1", observeCount)
+	}
+
+	requestMu.Lock()
+	gotRequestCount := requestCount
+	gotCreateCount := remoteCreateCount
+	gotKeyCount := len(idempotencyKeys)
+	var gotKeyUses int
+	for _, uses := range idempotencyKeys {
+		gotKeyUses = uses
+	}
+	requestMu.Unlock()
+	if gotRequestCount != 2 ||
+		gotCreateCount != 1 ||
+		gotKeyCount != 1 ||
+		gotKeyUses != 2 {
+		t.Fatalf(
+			"AutoFlow replay = requests %d creates %d keys %d uses %d",
+			gotRequestCount,
+			gotCreateCount,
+			gotKeyCount,
+			gotKeyUses,
+		)
+	}
+	select {
+	case err := <-serverErrors:
+		t.Fatal(err)
+	default:
 	}
 }
 

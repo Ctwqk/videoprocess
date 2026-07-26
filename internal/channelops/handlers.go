@@ -1774,9 +1774,7 @@ func (h HandlerService) HandleSendAlert(ctx context.Context, item QueueItemRow) 
 	if err := sink.Send(ctx, alert); err != nil {
 		return err
 	}
-	return h.withQueueExecutionPhase(ctx, item, func(HandlerService) error {
-		return nil
-	})
+	return nil
 }
 
 func (h HandlerService) HandleCleanupExpired(ctx context.Context, item QueueItemRow) error {
