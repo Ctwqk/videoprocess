@@ -26,6 +26,7 @@ VP_VISION_WORKER_SERVICE="vp-vision-worker-swarm"
 VP_PUBLISHER_SERVICE="vp-youtube-publisher-swarm"
 VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE $VP_VISION_WORKER_SERVICE $VP_PUBLISHER_SERVICE"
 VP_APP_ATTEMPTED_SERVICES=""
+VP_BACKEND_MIGRATION_APPLIED=false
 VP_VISION_CUTOVER_REQUIRED=false
 
 vp_validate_topology() {
@@ -71,16 +72,16 @@ vp_require_channelops_migration_head() {
   fi
 
   local check
-  check='import asyncio, os; from sqlalchemy import text; from sqlalchemy.ext.asyncio import create_async_engine; exec("async def check():\n    engine = create_async_engine(os.environ[\"DATABASE_URL\"])\n    try:\n        async with engine.connect() as connection:\n            rows = list((await connection.execute(text(\"SELECT version_num FROM alembic_version\"))).scalars())\n    except Exception:\n        raise SystemExit(1)\n    finally:\n        await engine.dispose()\n    if rows != [\"032_channelops_leader_epoch\"]:\n        raise SystemExit(1)"); asyncio.run(check())'
+  check='import asyncio, os; from sqlalchemy import text; from sqlalchemy.ext.asyncio import create_async_engine; exec("async def check():\n    engine = create_async_engine(os.environ[\"DATABASE_URL\"])\n    try:\n        async with engine.connect() as connection:\n            rows = list((await connection.execute(text(\"SELECT version_num FROM alembic_version\"))).scalars())\n    except Exception:\n        raise SystemExit(1)\n    finally:\n        await engine.dispose()\n    if rows != [\"033_legacy_worker_event_resolutions\"]:\n        raise SystemExit(1)"); asyncio.run(check())'
   if ! DATABASE_URL="$VP_PYTHON_WORKER_DATABASE_URL" docker run --rm \
     --network "$VP_PIPELINE_NETWORK" \
     --env DATABASE_URL \
     "$python_worker" \
     python -c "$check" >/dev/null; then
-    echo "ChannelOps migration head gate failed; expected exactly 032_channelops_leader_epoch" >&2
+    echo "ChannelOps migration head gate failed; expected exactly 033_legacy_worker_event_resolutions" >&2
     return 1
   fi
-  log "ChannelOps migration head verified: 032_channelops_leader_epoch"
+  log "ChannelOps migration head verified: 033_legacy_worker_event_resolutions"
 }
 
 vp_require_vision_cutover_safe() {
@@ -1170,6 +1171,10 @@ vp_restore_app_snapshots() {
       if ! vp_deploy_publisher "$image"; then
         status=1
       fi
+    elif [[ "$VP_BACKEND_MIGRATION_APPLIED" == true \
+      && ( "$service" == "vp-autoflow-api-swarm" \
+        || "$service" == "vp-event-outbox-relay-swarm" ) ]]; then
+      log "preserve $service at the migration-compatible attempted image"
     elif ! vp_update_runtime_service "$service" "$image" stop-first; then
       status=1
     fi
@@ -1485,6 +1490,7 @@ vp_apply_app_services() {
   local python_worker="$6"
 
   VP_APP_ATTEMPTED_SERVICES=""
+  VP_BACKEND_MIGRATION_APPLIED=false
   vp_record_app_service_attempt vp-api-swarm
   vp_update_runtime_service vp-api-swarm "$api" stop-first || return 1
   http_health vp-api "http://$VP_RUNTIME_HOST:18080/health" || return 1
@@ -1503,6 +1509,7 @@ vp_apply_app_services() {
   vp_deploy_publisher "$python_worker" || return 1
   vp_record_app_service_attempt vp-autoflow-api-swarm
   vp_update_runtime_service vp-autoflow-api-swarm "$backend" start-first || return 1
+  VP_BACKEND_MIGRATION_APPLIED=true
   vp_record_app_service_attempt vp-event-outbox-relay-swarm
   vp_update_runtime_service vp-event-outbox-relay-swarm "$backend" start-first || return 1
   vp_require_channelops_migration_head "$python_worker" || return 1

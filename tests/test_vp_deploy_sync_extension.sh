@@ -507,6 +507,11 @@ if ! grep -Fq 'vp_require_channelops_migration_head "$python_worker"' "$EXTENSIO
   echo 'FAIL: managed ChannelOps runner must be gated on the exact migration head' >&2
   exit 1
 fi
+if ! grep -Fq 'rows != [\"033_legacy_worker_event_resolutions\"]' "$EXTENSION" \
+  || grep -Fq '032_channelops_leader_epoch' "$EXTENSION"; then
+  echo 'FAIL: migration head gate must require exactly revision 033' >&2
+  exit 1
+fi
 for expected_order in \
   'vp_update_runtime_service vp-api-swarm "$api" stop-first' \
   'vp_update_runtime_service vp-frontend-swarm "$frontend" stop-first' \
@@ -815,6 +820,11 @@ for migration_gate_mode in wrong missing error; do
   if grep -F 'docker|service update' "$CALLS" \
     | grep -Fq 'vp-channel-agent-runner-swarm'; then
     echo "FAIL: $migration_gate_mode migration gate mutated the runner" >&2
+    exit 1
+  fi
+  if grep -F 'docker|service update' "$CALLS" \
+    | grep -Eq -- '--image baseline-vp-(autoflow-api|event-outbox-relay)-swarm:stable'; then
+    echo "FAIL: $migration_gate_mode rollback restored a pre-migration backend image" >&2
     exit 1
   fi
   if ! grep -Fq 'SELECT version_num FROM alembic_version' "$CALLS"; then
