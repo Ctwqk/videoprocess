@@ -30,6 +30,9 @@ from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.services.job_execution_authority import (
     JobExecutionAuthorityBlocked,
     NodeExecutionClaim,
+    acknowledge_worker_task_delivery,
+    authorize_worker_task_ack,
+    attest_worker_task_delivery,
     lock_job_execution_authority,
     require_active_execution_authority,
     require_matching_node_execution_claim,
@@ -95,17 +98,36 @@ engine_db: AsyncEngine | None = None
 worker_session: async_sessionmaker[AsyncSession] | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class WorkerTaskDelivery:
     redis_stream: str
     consumer_group: str
     message_id: str
+    payload_sha256: str
+    dispatch_key: uuid.UUID | None
+    attestation_id: uuid.UUID | None = None
 
 
 _current_task_delivery: ContextVar[WorkerTaskDelivery | None] = ContextVar(
     "worker_task_delivery",
     default=None,
 )
+
+
+def _canonical_task_payload_sha256(payload: dict) -> str:
+    if any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in payload.items()
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "registered worker task payload must contain strings"
+        )
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def configure_worker_database(database_url: str | None = None) -> None:
@@ -282,6 +304,25 @@ async def _claim_node_execution(
                 node.worker_id = worker_id
                 node.worker_registration_id = claim.worker_registration_id
                 node.worker_lease_epoch = claim.worker_lease_epoch
+                if worker_lease is not None:
+                    delivery = _current_task_delivery.get()
+                    if (
+                        delivery is None
+                        or not isinstance(delivery.dispatch_key, uuid.UUID)
+                    ):
+                        raise JobExecutionAuthorityBlocked(
+                            "registered worker claim has no durable task dispatch"
+                        )
+                    await db.flush()
+                    delivery.attestation_id = await attest_worker_task_delivery(
+                        db,
+                        claim,
+                        redis_stream=delivery.redis_stream,
+                        consumer_group=delivery.consumer_group,
+                        message_id=delivery.message_id,
+                        payload_sha256=delivery.payload_sha256,
+                        dispatch_key=delivery.dispatch_key,
+                    )
             return claim
         except JobExecutionAuthorityBlocked as exc:
             await db.rollback()
@@ -683,7 +724,7 @@ async def process_task(
     except CancelledError:
         logger.info(f"Node {data['node_id']} cancelled, cleaning up")
         # Don't report failure — orchestrator already knows about the cancel
-        return None
+        return claim
     except Exception as e:
         reported = await _report_failure_for_current_claim(
             claim,
@@ -983,6 +1024,19 @@ def _bind_registered_event_to_task_delivery(
     payload["task_stream"] = delivery.redis_stream
     payload["task_group"] = delivery.consumer_group
     payload["task_message_id"] = delivery.message_id
+    if (
+        len(delivery.payload_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in delivery.payload_sha256
+        )
+        or not isinstance(delivery.dispatch_key, uuid.UUID)
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "registered worker event task dispatch is invalid"
+        )
+    payload["task_payload_sha256"] = delivery.payload_sha256
+    payload["task_dispatch_key"] = str(delivery.dispatch_key)
 
 
 async def _xadd_event_for_claim(
@@ -1128,11 +1182,29 @@ async def _process_message(
     ):
         return
 
+    payload_sha256 = _canonical_task_payload_sha256(data)
+    dispatch_key_raw = data.get("dispatch_key")
+    try:
+        dispatch_key = (
+            uuid.UUID(dispatch_key_raw)
+            if isinstance(dispatch_key_raw, str)
+            else None
+        )
+    except ValueError as exc:
+        raise JobExecutionAuthorityBlocked(
+            "registered worker task dispatch key is invalid"
+        ) from exc
+    if worker_lease is not None and dispatch_key is None:
+        raise JobExecutionAuthorityBlocked(
+            "registered worker task has no durable dispatch key"
+        )
     delivery_token = _current_task_delivery.set(
         WorkerTaskDelivery(
             redis_stream=TASK_STREAM,
             consumer_group=CONSUMER_GROUP,
             message_id=msg_id,
+            payload_sha256=payload_sha256,
+            dispatch_key=dispatch_key,
         )
     )
     try:
@@ -1175,6 +1247,17 @@ async def _ack_message_for_claim(
     if claim.worker_registration_id is None:
         await redis.xack(TASK_STREAM, CONSUMER_GROUP, message_id)
         return
+    delivery = _current_task_delivery.get()
+    if (
+        delivery is None
+        or delivery.message_id != message_id
+        or not isinstance(delivery.dispatch_key, uuid.UUID)
+        or not isinstance(delivery.attestation_id, uuid.UUID)
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "worker task acknowledgement has no exact dispatch delivery"
+        )
+    live_ack_authorized = False
     try:
         async with get_worker_session()() as db:
             async with db.begin():
@@ -1185,13 +1268,12 @@ async def _ack_message_for_claim(
                 )
                 require_matching_node_execution_claim(authority, claim)
                 await require_worker_registration_lease(db, claim)
-                result = await redis.xack(
-                    TASK_STREAM,
-                    CONSUMER_GROUP,
-                    message_id,
+                await authorize_worker_task_ack(
+                    db,
+                    claim,
+                    attestation_id=delivery.attestation_id,
                 )
-                _require_task_xack_result(result)
-        return
+                live_ack_authorized = True
     except JobExecutionAuthorityBlocked:
         logger.info(
             "Live lease no longer authorizes task %s XACK; checking receipt",
@@ -1206,13 +1288,30 @@ async def _ack_message_for_claim(
                 redis_stream=TASK_STREAM,
                 consumer_group=CONSUMER_GROUP,
                 message_id=message_id,
+                payload_sha256=delivery.payload_sha256,
+                dispatch_key=delivery.dispatch_key,
             )
+            if live_ack_authorized:
+                logger.debug(
+                    "Using durable live task ACK authorization for %s",
+                    message_id,
+                )
             result = await redis.xack(
                 TASK_STREAM,
                 CONSUMER_GROUP,
                 message_id,
             )
             _require_task_xack_result(result)
+            await acknowledge_worker_task_delivery(
+                db,
+                claim,
+                attestation_id=delivery.attestation_id,
+                redis_stream=delivery.redis_stream,
+                consumer_group=delivery.consumer_group,
+                message_id=delivery.message_id,
+                payload_sha256=delivery.payload_sha256,
+                dispatch_key=delivery.dispatch_key,
+            )
 
 
 def _require_task_xack_result(result: object) -> None:

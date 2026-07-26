@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import pytest
 from minio.error import S3Error
 
@@ -143,3 +146,55 @@ def test_existing_constructor_still_creates_missing_bucket(
     )
 
     assert client.make_bucket_calls == ["videoprocess"]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_save_waits_for_background_upload_to_settle(
+    tmp_path,
+) -> None:
+    upload_started = threading.Event()
+    allow_upload_to_finish = threading.Event()
+    uploaded: list[str] = []
+    stored_objects: set[str] = set()
+    operations: list[str] = []
+
+    class SlowClient:
+        def fput_object(self, bucket, path, local_path):
+            upload_started.set()
+            assert allow_upload_to_finish.wait(timeout=5)
+            uploaded.append(path)
+            stored_objects.add(path)
+            operations.append("upload")
+
+        def remove_object(self, bucket, path):
+            stored_objects.discard(path)
+            operations.append("cleanup")
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+    backend = _backend_with_client(SlowClient())
+
+    async def save_then_cleanup(input_file):
+        try:
+            return await backend.save(
+                "staging/claim-output.mp4",
+                input_file,
+            )
+        finally:
+            await backend.delete("staging/claim-output.mp4")
+
+    with source.open("rb") as input_file:
+        save = asyncio.create_task(
+            save_then_cleanup(input_file)
+        )
+        assert await asyncio.to_thread(upload_started.wait, 2)
+        save.cancel()
+        await asyncio.sleep(0)
+        assert not save.done()
+        allow_upload_to_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await save
+
+    assert uploaded == ["staging/claim-output.mp4"]
+    assert operations == ["upload", "cleanup"]
+    assert stored_objects == set()

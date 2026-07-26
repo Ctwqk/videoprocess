@@ -42,6 +42,13 @@ class UrlDownloadHandler(BaseHandler):
         else:
             await self._download_via_ytdlp(normalized_url, fmt, output_path)
 
+        if settings.storage_backend != "local":
+            return {
+                "_skip_upload": False,
+                "cache_hit": False,
+                "source_url": normalized_url,
+            }
+
         await self._save_to_cache(cache_path, output_path)
         return {
             "_storage_path": cache_path,
@@ -84,9 +91,18 @@ class UrlDownloadHandler(BaseHandler):
 
         if self._cancelled:
             raise CancelledError("Cancelled during download")
-        if self._proc.returncode != 0:
+        exit_code = self._proc.returncode
+        if exit_code is None:
+            raise RuntimeError("download process exited without a status")
+        if exit_code != 0:
             stderr_text = stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(self._format_download_error(normalized_url, self._proc.returncode, stderr_text))
+            raise RuntimeError(
+                self._format_download_error(
+                    normalized_url,
+                    exit_code,
+                    stderr_text,
+                )
+            )
 
     async def _download_via_platform_manager(self, platform: str, normalized_url: str, fmt: str, output_path: str) -> None:
         base_url = self._platform_manager_base_url(platform)

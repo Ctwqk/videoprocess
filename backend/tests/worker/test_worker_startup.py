@@ -152,6 +152,17 @@ async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> N
         lease_secret="lease-secret",
         lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=180),
     )
+    dispatch_key = uuid.uuid4()
+    payload_sha256 = hashlib.sha256(b"canonical-task").hexdigest()
+    delivery = worker_main.WorkerTaskDelivery(
+        redis_stream="vp:tasks:vision",
+        consumer_group="vision-workers",
+        message_id="1710000000000-4",
+        payload_sha256=payload_sha256,
+        dispatch_key=dispatch_key,
+    )
+    attestation_id = uuid.uuid4()
+    attested: list[object] = []
 
     class Transaction:
         async def __aenter__(self):
@@ -170,6 +181,9 @@ async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> N
         def begin(self):
             return Transaction()
 
+        async def flush(self):
+            return None
+
     async def lock_authority(_db, locked_job_id, *, node_execution_id):
         assert locked_job_id == job_id
         return SimpleNamespace(
@@ -184,6 +198,19 @@ async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> N
         assert claim.worker_registration_id == registration_id
         assert claim.worker_lease_epoch == 12
 
+    async def attest(_db, claim, **facts):
+        assert node.status == worker_main.NodeStatus.RUNNING
+        assert node.worker_registration_id == registration_id
+        assert facts == {
+            "redis_stream": delivery.redis_stream,
+            "consumer_group": delivery.consumer_group,
+            "message_id": delivery.message_id,
+            "payload_sha256": payload_sha256,
+            "dispatch_key": dispatch_key,
+        }
+        attested.append(claim)
+        return attestation_id
+
     monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
     monkeypatch.setattr(
         worker_main,
@@ -191,19 +218,30 @@ async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> N
         require_lease,
         raising=False,
     )
-
-    claim = await worker_main._claim_node_execution(
-        str(job_id),
-        str(node_execution_id),
-        worker_lease=lease,
-        session_factory=lambda: Session(),
+    monkeypatch.setattr(
+        worker_main,
+        "attest_worker_task_delivery",
+        attest,
+        raising=False,
     )
+
+    delivery_token = worker_main._current_task_delivery.set(delivery)
+    try:
+        claim = await worker_main._claim_node_execution(
+            str(job_id),
+            str(node_execution_id),
+            worker_lease=lease,
+            session_factory=lambda: Session(),
+        )
+    finally:
+        worker_main._current_task_delivery.reset(delivery_token)
 
     assert claim is not None
     assert claim.worker_registration_id == registration_id
     assert claim.worker_lease_epoch == 12
     assert node.worker_registration_id == registration_id
     assert node.worker_lease_epoch == 12
+    assert attested == [claim]
 
 
 @pytest.mark.asyncio
@@ -285,6 +323,8 @@ async def test_event_xadd_occurs_while_exact_claim_and_lease_transaction_are_hel
                 redis_stream="vp:tasks:vision",
                 consumer_group="vision-workers",
                 message_id="1710000000000-4",
+                payload_sha256=hashlib.sha256(b"task").hexdigest(),
+                dispatch_key=uuid.uuid4(),
             )
         ),
         raising=False,
@@ -306,6 +346,10 @@ async def test_event_xadd_occurs_while_exact_claim_and_lease_transaction_are_hel
     assert events[0]["task_stream"] == "vp:tasks:vision"
     assert events[0]["task_group"] == "vision-workers"
     assert events[0]["task_message_id"] == "1710000000000-4"
+    assert events[0]["task_payload_sha256"] == hashlib.sha256(
+        b"task"
+    ).hexdigest()
+    assert uuid.UUID(events[0]["task_dispatch_key"])
 
 
 @pytest.mark.asyncio
@@ -342,6 +386,7 @@ async def test_final_xack_uses_exact_claim_fence(monkeypatch) -> None:
         {
             "job_id": str(claim.job_id),
             "node_execution_id": str(claim.node_execution_id),
+            "dispatch_key": str(uuid.uuid4()),
         },
         worker_lease=worker_lease_for(claim),
     )
@@ -355,7 +400,18 @@ async def test_final_xack_accepts_exact_claim_after_orchestrator_finalizes_node(
 ) -> None:
     claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
     lease_checked = False
+    ack_authorized = False
+    ack_authority_checked = False
+    attestation_marked = False
     acknowledgements: list[str] = []
+    delivery = worker_main.WorkerTaskDelivery(
+        redis_stream=worker_main.TASK_STREAM,
+        consumer_group=worker_main.CONSUMER_GROUP,
+        message_id="1-0",
+        payload_sha256="a" * 64,
+        dispatch_key=uuid.uuid4(),
+        attestation_id=uuid.uuid4(),
+    )
 
     class Transaction:
         async def __aenter__(self):
@@ -403,6 +459,25 @@ async def test_final_xack_accepts_exact_claim_after_orchestrator_finalizes_node(
         assert checked_claim == claim
         lease_checked = True
 
+    async def mark_ack(_db, checked_claim, **exact_delivery):
+        nonlocal attestation_marked
+        assert checked_claim == claim
+        assert exact_delivery["attestation_id"] == delivery.attestation_id
+        attestation_marked = True
+
+    async def authorize_ack(_db, checked_claim, *, attestation_id):
+        nonlocal ack_authorized
+        assert checked_claim == claim
+        assert attestation_id == delivery.attestation_id
+        ack_authorized = True
+
+    async def require_ack_authority(_db, checked_claim, **exact_delivery):
+        nonlocal ack_authority_checked
+        assert checked_claim == claim
+        assert ack_authorized
+        assert exact_delivery["dispatch_key"] == delivery.dispatch_key
+        ack_authority_checked = True
+
     monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
     monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
     monkeypatch.setattr(
@@ -410,10 +485,35 @@ async def test_final_xack_accepts_exact_claim_after_orchestrator_finalizes_node(
         "require_worker_registration_lease",
         require_lease,
     )
+    monkeypatch.setattr(
+        worker_main,
+        "acknowledge_worker_task_delivery",
+        mark_ack,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "authorize_worker_task_ack",
+        authorize_ack,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_task_ack_receipt",
+        require_ack_authority,
+        raising=False,
+    )
 
-    await worker_main._ack_message_for_claim(Redis(), "1-0", claim)
+    token = worker_main._current_task_delivery.set(delivery)
+    try:
+        await worker_main._ack_message_for_claim(Redis(), "1-0", claim)
+    finally:
+        worker_main._current_task_delivery.reset(token)
 
     assert lease_checked
+    assert ack_authorized
+    assert ack_authority_checked
+    assert attestation_marked
     assert acknowledgements == ["1-0"]
 
 
@@ -423,7 +523,16 @@ async def test_final_xack_uses_exact_applied_receipt_after_lease_loss(
 ) -> None:
     claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
     receipt_checks: list[dict[str, str]] = []
+    marked: list[dict[str, object]] = []
     acknowledgements: list[tuple[str, str, str]] = []
+    delivery = worker_main.WorkerTaskDelivery(
+        redis_stream=worker_main.TASK_STREAM,
+        consumer_group=worker_main.CONSUMER_GROUP,
+        message_id="1710000000000-4",
+        payload_sha256="b" * 64,
+        dispatch_key=uuid.uuid4(),
+        attestation_id=uuid.uuid4(),
+    )
 
     class Transaction:
         async def __aenter__(self):
@@ -473,6 +582,10 @@ async def test_final_xack_uses_exact_applied_receipt_after_lease_loss(
         assert checked_claim == claim
         receipt_checks.append(delivery)
 
+    async def mark_ack(_db, checked_claim, **exact_delivery):
+        assert checked_claim == claim
+        marked.append(exact_delivery)
+
     monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
     monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
     monkeypatch.setattr(
@@ -486,14 +599,40 @@ async def test_final_xack_uses_exact_applied_receipt_after_lease_loss(
         require_receipt,
         raising=False,
     )
+    monkeypatch.setattr(
+        worker_main,
+        "acknowledge_worker_task_delivery",
+        mark_ack,
+        raising=False,
+    )
 
-    await worker_main._ack_message_for_claim(Redis(), "1710000000000-4", claim)
+    token = worker_main._current_task_delivery.set(delivery)
+    try:
+        await worker_main._ack_message_for_claim(
+            Redis(),
+            "1710000000000-4",
+            claim,
+        )
+    finally:
+        worker_main._current_task_delivery.reset(token)
 
     assert receipt_checks == [
         {
             "redis_stream": worker_main.TASK_STREAM,
             "consumer_group": worker_main.CONSUMER_GROUP,
             "message_id": "1710000000000-4",
+            "payload_sha256": delivery.payload_sha256,
+            "dispatch_key": delivery.dispatch_key,
+        }
+    ]
+    assert marked == [
+        {
+            "attestation_id": delivery.attestation_id,
+            "redis_stream": worker_main.TASK_STREAM,
+            "consumer_group": worker_main.CONSUMER_GROUP,
+            "message_id": "1710000000000-4",
+            "payload_sha256": delivery.payload_sha256,
+            "dispatch_key": delivery.dispatch_key,
         }
     ]
     assert acknowledgements == [
@@ -512,6 +651,14 @@ async def test_final_xack_after_lease_loss_without_receipt_stays_pending(
     claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
     receipt_checks = 0
     acknowledgements: list[str] = []
+    delivery = worker_main.WorkerTaskDelivery(
+        redis_stream=worker_main.TASK_STREAM,
+        consumer_group=worker_main.CONSUMER_GROUP,
+        message_id="1710000000000-4",
+        payload_sha256="c" * 64,
+        dispatch_key=uuid.uuid4(),
+        attestation_id=uuid.uuid4(),
+    )
 
     class Transaction:
         async def __aenter__(self):
@@ -568,15 +715,19 @@ async def test_final_xack_after_lease_loss_without_receipt_stays_pending(
         raising=False,
     )
 
-    with pytest.raises(
-        worker_main.JobExecutionAuthorityBlocked,
-        match="receipt missing",
-    ):
-        await worker_main._ack_message_for_claim(
-            Redis(),
-            "1710000000000-4",
-            claim,
-        )
+    token = worker_main._current_task_delivery.set(delivery)
+    try:
+        with pytest.raises(
+            worker_main.JobExecutionAuthorityBlocked,
+            match="receipt missing",
+        ):
+            await worker_main._ack_message_for_claim(
+                Redis(),
+                "1710000000000-4",
+                claim,
+            )
+    finally:
+        worker_main._current_task_delivery.reset(token)
 
     assert receipt_checks == 1
     assert acknowledgements == []
@@ -1059,6 +1210,7 @@ async def test_process_task_cancels_cross_node_download_after_closing_database_s
     job_id = uuid.uuid4()
     node_execution_id = uuid.uuid4()
     input_artifact_id = uuid.uuid4()
+    claim = execution_claim(job_id, node_execution_id)
     missing_local_path = tmp_path / "gpu-scratch" / "assets" / "input.mp4"
     download_started = asyncio.Event()
     session_active = False
@@ -1136,7 +1288,7 @@ async def test_process_task_cancels_cross_node_download_after_closing_database_s
         return FakeSession()
 
     async def claim_node(*args, **kwargs):
-        return execution_claim(job_id, node_execution_id)
+        return claim
 
     async def load_cancel_state(_node_execution_id: str):
         await download_started.wait()
@@ -1164,7 +1316,7 @@ async def test_process_task_cancels_cross_node_download_after_closing_database_s
     monkeypatch.setattr(worker_main.httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setattr(worker_main.settings, "storage_local_root", str(tmp_path / "storage"))
 
-    await asyncio.wait_for(
+    returned_claim = await asyncio.wait_for(
         worker_main.process_task(
             {
                 "job_id": str(job_id),
@@ -1179,6 +1331,7 @@ async def test_process_task_cancels_cross_node_download_after_closing_database_s
     )
 
     assert session_state_during_stream == [False]
+    assert returned_claim == claim
     assert handler_calls == ["cancel"]
     assert succeeded == []
     assert failed == []

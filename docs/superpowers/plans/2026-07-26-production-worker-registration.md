@@ -244,6 +244,11 @@ git commit -m "feat(workers): register python consumers before redis"
 - Modify: `internal/worker/worker.go`
 - Modify: `internal/worker/consumer.go`
 - Modify: `internal/worker/consumer_test.go`
+- Modify: `internal/redisstream/streams.go`
+- Modify: `internal/redisstream/streams_test.go`
+- Modify: `internal/store/node_executions.go`
+- Modify: `internal/store/artifacts.go`
+- Modify: `internal/store/artifact_writes.go`
 - Create: `internal/store/worker_registration.go`
 - Create: `internal/store/worker_registration_test.go`
 - Modify: `internal/worker/runtime.go`
@@ -251,8 +256,9 @@ git commit -m "feat(workers): register python consumers before redis"
 - Create: `cmd/vp-ffmpeg-worker/main_test.go`
 
 **Interfaces:**
-- Produces Go `RegistrationClaims`, `RegistrationLease`, and
-  `RegistrationStore.Register/Heartbeat/Revoke`.
+- Produces Go `RegistrationClaims` and `RegistrationLease` wrappers over the
+  reviewed schema-qualified PostgreSQL functions. It must not reimplement
+  registration with direct table DML or ad hoc row locks.
 - Consumes `tests/fixtures/worker_registration/fingerprints-v1.json` and
   produces the exact same canonical fingerprints as Python.
 - Consumer `Run` accepts a registration-owned context and returns
@@ -263,9 +269,17 @@ git commit -m "feat(workers): register python consumers before redis"
 Cover token/claim checks, 180-second lease, 60-second heartbeat, concurrent
 takeover, stale epoch, expiry, revoke, fingerprint fixture parity, no Redis
 client/group/read call before registration, lease-loss consumer cancellation,
-and registration-epoch checks before artifact/event/completion/XACK writes. A
-lost epoch must produce no final write or acknowledgement. Require sanitized
-errors. In production, require a bounded mode `0400`
+and registration-epoch checks before remote object save plus artifact pointer,
+event publication, completion/failure, and XACK writes. Every registered task
+must require its orchestrator-created `dispatch_key`, canonical payload hash,
+delivered stream/group/message identity, and claim-time delivery attestation.
+The exact task proof must be copied into completion/failure events. All Redis
+`XADD`/`XACK`, including affinity bounce, must run while the same transaction
+holds the registration-shared fence. Test live ACK authorization, applied
+receipt recovery, Redis-success/DB-failure replay, and arbitrary
+stream/group/message/hash/dispatch rejection. A lost epoch with neither
+durable ACK authorization nor receipt must produce no final write or
+acknowledgement. Require sanitized errors. In production, require a bounded mode `0400`
 `WORKER_DATABASE_URL_FILE`, reject environment-only database credentials, and
 prove no secret is logged.
 
@@ -280,15 +294,24 @@ Expected: compile failure because registration types are absent.
 
 - [ ] **Step 3: Implement Go registration and lifecycle**
 
-Use pgx transactions and row locks matching the Python SQL semantics. The
-PostgreSQL tests use `CHANNEL_OPS_GO_POSTGRES_TEST_URL`. Read the
+Use pgx transactions that call the reviewed `public.vp_worker_register`,
+`public.vp_worker_heartbeat`, `public.vp_worker_release`,
+`public.vp_require_worker_lease`,
+`public.vp_attest_worker_task_delivery`,
+`public.vp_authorize_worker_task_ack`,
+`public.vp_require_worker_task_ack_receipt`, and
+`public.vp_acknowledge_worker_task_delivery` functions. Do not duplicate their
+row/advisory-lock implementation in Go. PostgreSQL tests use
+`CHANNEL_OPS_GO_POSTGRES_TEST_URL`. Read the
 database URL and admission token from separate bounded secret files and build a
 process UUID consumer ID. Preserve `DATABASE_URL` fallback only outside
 production. Open storage and
 PostgreSQL, register, start heartbeat, then construct/use Redis. Registration
 loss cancels the consumer context. Store the registration ID/epoch on node
-claim and call `vp_require_worker_lease` under durable authority before every
-final write and acknowledgement.
+claim. Hold one shared-fence transaction across remote object save and artifact
+pointer insertion, with a second database-time lease check immediately before
+the pointer. Bind node completion/failure and every task XACK to the immutable
+delivery attestation; leave PEL pending on unproven lease loss.
 
 - [ ] **Step 4: Run focused, full, and race tests**
 
@@ -311,6 +334,11 @@ git add internal/worker/registration.go \
   internal/worker/worker.go \
   internal/worker/consumer.go \
   internal/worker/consumer_test.go \
+  internal/redisstream/streams.go \
+  internal/redisstream/streams_test.go \
+  internal/store/node_executions.go \
+  internal/store/artifacts.go \
+  internal/store/artifact_writes.go \
   internal/store/worker_registration.go \
   internal/store/worker_registration_test.go \
   internal/worker/runtime.go \
@@ -326,6 +354,8 @@ git commit -m "feat(workers): register go consumer before redis"
 - Create: `backend/tests/services/test_worker_registration_operator_cli.py`
 - Create: `backend/app/services/worker_runtime_role_cli.py`
 - Create: `backend/tests/services/test_worker_runtime_role_cli.py`
+- Create: `backend/app/services/worker_control_role_cli.py`
+- Create: `backend/tests/services/test_worker_control_role_cli.py`
 - Modify: `deploy/swarm/deploy-sync-extension.sh`
 - Modify: `tests/test_vp_deploy_sync_extension.sh`
 - Modify: `backend/Dockerfile.ffmpeg-worker-go`
@@ -347,6 +377,8 @@ git commit -m "feat(workers): register go consumer before redis"
 - Produces versioned non-owner PostgreSQL login principals and database URL
   secret target `/run/secrets/vp-worker-database-url`.
 - Produces deployment registration readiness verification.
+- Produces an independent orchestrator-control database role and per-service
+  Redis ACL users; neither is inherited by a worker login principal.
 
 - [ ] **Step 1: Write failing CLI and deployment contract tests**
 
@@ -359,7 +391,11 @@ readiness before proceeding, fresh prior-image grant/principal on rollback,
 idempotent repeat deployment, and no host 126 command. Create real PostgreSQL
 test roles and prove login principals are non-superuser, own no application
 objects, cannot write grant/registration tables directly, and can execute only
-the required registration functions plus an explicit worker data-access
+the nine worker functions `vp_worker_register`, `vp_worker_heartbeat`,
+`vp_worker_release`, `vp_require_worker_lease`,
+`vp_require_worker_lease_margin`, `vp_attest_worker_task_delivery`,
+`vp_authorize_worker_task_ack`, `vp_require_worker_task_ack_receipt`, and
+`vp_acknowledge_worker_task_delivery`, plus an explicit worker data-access
 allowlist.
 The allowlist is `SELECT` on `jobs`, `node_executions`, `artifacts`,
 `channel_profiles`, `production_tasks`, `runtime_schedules`, and
@@ -369,6 +405,29 @@ The allowlist is `SELECT` on `jobs`, `node_executions`, `artifacts`,
 `alembic_version`, all direct grant/registration table access, privileged role
 membership, and ownership. Use separate deploy-migrator and deploy-read
 credentials; neither may be mounted into workers.
+Create a separate non-owner orchestrator-control role. Grant it `EXECUTE` only
+on `vp_observe_worker_lease`, `vp_observe_worker_task_delivery`, and
+`vp_resolve_worker_event_authority_for_job_deletion`; exact `SELECT`/`INSERT`
+and state-column `UPDATE` on `worker_task_dispatches`,
+`worker_task_delivery_attestations`,
+`registered_worker_event_receipts`, and
+`registered_worker_event_deliveries`; and the exact job, node execution,
+artifact, and node-artifact-cache columns exercised by a real
+`RegisteredWorkerEventReceiptService.accept_and_apply()` transaction. Deny
+worker registration functions, direct grant/registration access, protected
+table ownership, broad `UPDATE`, `DELETE`, and `TRUNCATE`. Prove observer
+success requires explicit `EXECUTE`, while `vp_require_worker_lease` still
+rejects the orchestrator principal, and takeover/revoke waits behind observer
+fences.
+Create per-service Redis users scoped to their admitted task stream/group.
+Create a separate orchestrator Redis user for the event group and admitted
+task streams. Its explicit command allowlist includes stream consume/reclaim
+and ACK operations plus `EVAL`, `GET`, `SET`, and `XADD` for the reviewed
+idempotent dispatch script and `vp:worker-task-dispatch:*` keys. Deny broad key
+patterns and arbitrary scripts. Test marker recovery across Redis-success/
+database-failure windows. The script renews a 30-day marker TTL on each retry;
+once the database row is `delivered`, it is no longer retried and the marker
+expires naturally.
 Create a versioned non-owner operator `LOGIN` principal with exact `EXECUTE`
 on the five schema-qualified operator functions and no direct table or column
 read/write privileges. Exercise pending upsert, activation, grant revocation,
@@ -387,7 +446,8 @@ automation path may invoke them.
 cd backend
 /Users/wenjieliu/videoprocess/backend/.venv/bin/python -m pytest \
   tests/services/test_worker_registration_operator_cli.py \
-  tests/services/test_worker_runtime_role_cli.py -q
+  tests/services/test_worker_runtime_role_cli.py \
+  tests/services/test_worker_control_role_cli.py -q
 cd ..
 bash tests/test_vp_deploy_sync_extension.sh
 ```
@@ -400,6 +460,11 @@ Run backend migration and verify head before updating workers. Embed the exact
 40-character commit in both worker images. Create a stable `NOLOGIN` worker
 runtime role with an explicit privilege allowlist, then create a fresh
 service/generation `LOGIN` role with a random password and no object ownership.
+Create the independent stable orchestrator-control role and the exact
+PostgreSQL/Redis grants above. Exercise a real receipt acceptance, concurrent
+duplicate alias, quarantine, dispatch reconcile, source/event ACK reconcile,
+and guarded job deletion under that role; do not substitute a table owner in
+these tests.
 Create pending grant through `public.vp_worker_grant_upsert` and credential
 state atomically with `umask 077`; create
 generation-scoped database URL and admission Swarm secrets from stdin without
@@ -442,6 +507,8 @@ git add backend/app/services/worker_registration_operator_cli.py \
   backend/tests/services/test_worker_registration_operator_cli.py \
   backend/app/services/worker_runtime_role_cli.py \
   backend/tests/services/test_worker_runtime_role_cli.py \
+  backend/app/services/worker_control_role_cli.py \
+  backend/tests/services/test_worker_control_role_cli.py \
   deploy/swarm/deploy-sync-extension.sh \
   tests/test_vp_deploy_sync_extension.sh \
   backend/Dockerfile.ffmpeg-worker-go \

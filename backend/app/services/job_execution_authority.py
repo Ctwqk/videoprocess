@@ -89,6 +89,122 @@ async def observe_worker_registration_lease(
     )
 
 
+async def attest_worker_task_delivery(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    redis_stream: str,
+    consumer_group: str,
+    message_id: str,
+    payload_sha256: str,
+    dispatch_key: uuid.UUID,
+) -> uuid.UUID:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    _validate_task_delivery_identity(
+        claim,
+        redis_stream=redis_stream,
+        consumer_group=consumer_group,
+        message_id=message_id,
+        payload_sha256=payload_sha256,
+        dispatch_key=dispatch_key,
+    )
+    result = await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_attest_worker_task_delivery(
+            :registration_id,
+            :lease_epoch,
+            :worker_id,
+            :worker_started_at,
+            :job_id,
+            :node_execution_id,
+            :redis_stream,
+            :consumer_group,
+            :message_id,
+            :payload_sha256,
+            :dispatch_key
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "worker_id": claim.worker_id,
+            "worker_started_at": claim.started_at,
+            "job_id": claim.job_id,
+            "node_execution_id": claim.node_execution_id,
+            "redis_stream": redis_stream,
+            "consumer_group": consumer_group,
+            "message_id": message_id,
+            "payload_sha256": payload_sha256,
+            "dispatch_key": dispatch_key,
+        },
+        error_message="worker task delivery cannot be attested",
+    )
+    if not isinstance(result, uuid.UUID):
+        raise JobExecutionAuthorityBlocked(
+            "worker task delivery attestation identity is invalid"
+        )
+    return result
+
+
+async def observe_worker_task_delivery(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    redis_stream: str,
+    consumer_group: str,
+    message_id: str,
+    payload_sha256: str,
+    dispatch_key: uuid.UUID,
+) -> uuid.UUID:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    _validate_task_delivery_identity(
+        claim,
+        redis_stream=redis_stream,
+        consumer_group=consumer_group,
+        message_id=message_id,
+        payload_sha256=payload_sha256,
+        dispatch_key=dispatch_key,
+    )
+    result = await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_observe_worker_task_delivery(
+            :registration_id,
+            :lease_epoch,
+            :worker_id,
+            :worker_started_at,
+            :job_id,
+            :node_execution_id,
+            :redis_stream,
+            :consumer_group,
+            :message_id,
+            :payload_sha256,
+            :dispatch_key
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "worker_id": claim.worker_id,
+            "worker_started_at": claim.started_at,
+            "job_id": claim.job_id,
+            "node_execution_id": claim.node_execution_id,
+            "redis_stream": redis_stream,
+            "consumer_group": consumer_group,
+            "message_id": message_id,
+            "payload_sha256": payload_sha256,
+            "dispatch_key": dispatch_key,
+        },
+        error_message="worker task delivery cannot be observed",
+    )
+    if not isinstance(result, uuid.UUID):
+        raise JobExecutionAuthorityBlocked(
+            "worker task delivery attestation identity is invalid"
+        )
+    return result
+
+
 async def require_worker_registration_margin(
     db: AsyncSession,
     claim: NodeExecutionClaim,
@@ -128,6 +244,8 @@ async def require_worker_task_ack_receipt(
     redis_stream: str,
     consumer_group: str,
     message_id: str,
+    payload_sha256: str,
+    dispatch_key: uuid.UUID,
 ) -> None:
     registration_id, lease_epoch = _validated_registration_claim(claim)
     if not all(
@@ -138,6 +256,14 @@ async def require_worker_task_ack_receipt(
             consumer_group,
             message_id,
         )
+    ) or (
+        not isinstance(payload_sha256, str)
+        or len(payload_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in payload_sha256
+        )
+        or not isinstance(dispatch_key, uuid.UUID)
     ):
         raise JobExecutionAuthorityBlocked(
             "worker task acknowledgement identity is invalid"
@@ -152,7 +278,9 @@ async def require_worker_task_ack_receipt(
             :worker_started_at,
             :redis_stream,
             :consumer_group,
-            :message_id
+            :message_id,
+            :payload_sha256,
+            :dispatch_key
         )
         """,
         {
@@ -163,10 +291,103 @@ async def require_worker_task_ack_receipt(
             "redis_stream": redis_stream,
             "consumer_group": consumer_group,
             "message_id": message_id,
+            "payload_sha256": payload_sha256,
+            "dispatch_key": dispatch_key,
         },
         error_message=(
             "worker task acknowledgement has no applied event receipt"
         ),
+    )
+
+
+async def acknowledge_worker_task_delivery(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    attestation_id: uuid.UUID,
+    redis_stream: str,
+    consumer_group: str,
+    message_id: str,
+    payload_sha256: str,
+    dispatch_key: uuid.UUID,
+) -> None:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    if not isinstance(attestation_id, uuid.UUID):
+        raise JobExecutionAuthorityBlocked(
+            "worker task acknowledgement attestation is invalid"
+        )
+    _validate_task_delivery_identity(
+        claim,
+        redis_stream=redis_stream,
+        consumer_group=consumer_group,
+        message_id=message_id,
+        payload_sha256=payload_sha256,
+        dispatch_key=dispatch_key,
+    )
+    await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_acknowledge_worker_task_delivery(
+            :attestation_id,
+            :registration_id,
+            :lease_epoch,
+            :worker_id,
+            :worker_started_at,
+            :redis_stream,
+            :consumer_group,
+            :message_id,
+            :payload_sha256,
+            :dispatch_key
+        )
+        """,
+        {
+            "attestation_id": attestation_id,
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "worker_id": claim.worker_id,
+            "worker_started_at": claim.started_at,
+            "redis_stream": redis_stream,
+            "consumer_group": consumer_group,
+            "message_id": message_id,
+            "payload_sha256": payload_sha256,
+            "dispatch_key": dispatch_key,
+        },
+        error_message=(
+            "worker task acknowledgement state cannot be persisted"
+        ),
+    )
+
+
+async def authorize_worker_task_ack(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    attestation_id: uuid.UUID,
+) -> None:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    if not isinstance(attestation_id, uuid.UUID):
+        raise JobExecutionAuthorityBlocked(
+            "worker task acknowledgement attestation is invalid"
+        )
+    await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_authorize_worker_task_ack(
+            :attestation_id,
+            :registration_id,
+            :lease_epoch,
+            :worker_id,
+            :worker_started_at
+        )
+        """,
+        {
+            "attestation_id": attestation_id,
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "worker_id": claim.worker_id,
+            "worker_started_at": claim.started_at,
+        },
+        error_message="worker task acknowledgement cannot be authorized",
     )
 
 
@@ -195,6 +416,35 @@ async def require_worker_registration_identity(
             "worker registration lease is no longer authoritative"
         ),
     )
+
+
+def _validate_task_delivery_identity(
+    claim: NodeExecutionClaim,
+    *,
+    redis_stream: str,
+    consumer_group: str,
+    message_id: str,
+    payload_sha256: str,
+    dispatch_key: uuid.UUID,
+) -> None:
+    if (
+        not all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                claim.worker_id,
+                redis_stream,
+                consumer_group,
+                message_id,
+            )
+        )
+        or not isinstance(payload_sha256, str)
+        or len(payload_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in payload_sha256)
+        or not isinstance(dispatch_key, uuid.UUID)
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "worker task delivery identity is invalid"
+        )
 
 
 def _validated_registration_claim(
@@ -227,9 +477,9 @@ async def _call_worker_authority_function(
     parameters: dict[str, object],
     *,
     error_message: str,
-) -> None:
+) -> object:
     try:
-        await db.scalar(text(statement), parameters)
+        return await db.scalar(text(statement), parameters)
     except Exception as exc:
         raise JobExecutionAuthorityBlocked(error_message) from exc
 

@@ -91,8 +91,11 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
     sql = completed.stdout
     assert "CREATE TABLE worker_admission_grants" in sql
     assert "CREATE TABLE worker_registrations" in sql
+    assert "CREATE TABLE worker_task_dispatches" in sql
+    assert "CREATE TABLE worker_task_delivery_attestations" in sql
     assert "CREATE TABLE registered_worker_event_receipts" in sql
-    assert "CREATE TABLE worker_event_dispatches" in sql
+    assert "CREATE TABLE registered_worker_event_deliveries" in sql
+    assert "CREATE TABLE worker_event_dispatches" not in sql
     for column in (
         "generation",
         "release_commit",
@@ -133,8 +136,13 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "vp_worker_release",
         "vp_require_worker_lease",
         "vp_observe_worker_lease",
+        "vp_attest_worker_task_delivery",
+        "vp_observe_worker_task_delivery",
+        "vp_acknowledge_worker_task_delivery",
+        "vp_authorize_worker_task_ack",
         "vp_require_worker_lease_margin",
         "vp_require_worker_task_ack_receipt",
+        "vp_resolve_worker_event_authority_for_job_deletion",
         "vp_worker_grant_upsert",
         "vp_worker_grant_activate",
         "vp_worker_grant_revoke",
@@ -145,11 +153,13 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         assert f"CREATE FUNCTION public.{function_name}" in sql
         assert f"ALTER FUNCTION public.{function_name}" not in sql
         assert f"REVOKE ALL ON FUNCTION public.{function_name}" in sql
-    assert sql.count("SECURITY DEFINER") >= 13
-    assert sql.count("SET search_path = pg_catalog") >= 13
+    assert sql.count("SECURITY DEFINER") >= 16
+    assert sql.count("SET search_path = pg_catalog") >= 16
     assert "SET search_path = pg_catalog, public" not in sql
     assert "pg_advisory_xact_lock_shared" in sql
     assert "pg_advisory_xact_lock" in sql
+    assert "ck_worker_task_delivery_attestation_ack_state" in sql
+    assert "ck_worker_task_delivery_attestation_ack_time" in sql
     register_function_sql = sql[
         sql.index("CREATE FUNCTION public.vp_worker_register") :
         sql.index("CREATE FUNCTION public.vp_worker_heartbeat")
@@ -167,6 +177,30 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "v_storage_canonical",
     ):
         assert legacy_endpoint_parser_name not in register_function_sql
+
+    downgraded = _run_alembic(
+        "postgresql+asyncpg://migration:unused@127.0.0.1:9/videoprocess",
+        "downgrade",
+        f"{TARGET_REVISION}:{PREVIOUS_REVISION}",
+        "--sql",
+    )
+    assert downgraded.returncode == 0, downgraded.stdout + downgraded.stderr
+    downgrade_sql = downgraded.stdout
+    for table_name in (
+        "registered_worker_event_deliveries",
+        "registered_worker_event_receipts",
+        "worker_task_delivery_attestations",
+        "worker_task_dispatches",
+    ):
+        assert f"DROP TABLE {table_name}" in downgrade_sql
+    for function_name in (
+        "vp_attest_worker_task_delivery",
+        "vp_observe_worker_task_delivery",
+        "vp_acknowledge_worker_task_delivery",
+        "vp_authorize_worker_task_ack",
+        "vp_resolve_worker_event_authority_for_job_deletion",
+    ):
+        assert f"DROP FUNCTION IF EXISTS public.{function_name}" in downgrade_sql
 
 
 @pytest.mark.asyncio

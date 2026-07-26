@@ -26,12 +26,17 @@ class MinioStorageBackend(StorageBackend):
         local_path = getattr(data, "name", None)
         if isinstance(local_path, str) and local_path and os.path.exists(local_path):
             size = os.path.getsize(local_path)
-            await asyncio.to_thread(self.client.fput_object, self.bucket, path, local_path)
+            await _settle_thread_operation_before_cancellation(
+                self.client.fput_object,
+                self.bucket,
+                path,
+                local_path,
+            )
             return size
 
         content = data.read()
         size = len(content)
-        await asyncio.to_thread(
+        await _settle_thread_operation_before_cancellation(
             self.client.put_object,
             self.bucket,
             path,
@@ -62,3 +67,20 @@ class MinioStorageBackend(StorageBackend):
 
     def get_local_path(self, path: str) -> str | None:
         return None  # MinIO has no local path
+
+
+async def _settle_thread_operation_before_cancellation(
+    function,
+    *args,
+):
+    operation = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                continue
+        operation.result()
+        raise

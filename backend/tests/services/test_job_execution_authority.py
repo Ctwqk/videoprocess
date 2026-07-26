@@ -9,6 +9,8 @@ import pytest
 from app.services.job_execution_authority import (
     JobExecutionAuthorityBlocked,
     NodeExecutionClaim,
+    acknowledge_worker_task_delivery,
+    authorize_worker_task_ack,
     observe_worker_registration_lease,
     require_matching_node_execution_claim,
     require_worker_registration_lease,
@@ -148,12 +150,16 @@ async def test_worker_task_ack_receipt_binds_exact_delivery_and_claim() -> None:
             calls.append((str(statement), dict(parameters)))
             return True
 
+    payload_sha256 = "a" * 64
+    dispatch_key = uuid.uuid4()
     await require_worker_task_ack_receipt(
         Session(),
         claim,
         redis_stream="vp:tasks:vision",
         consumer_group="vision-workers",
         message_id="1710000000000-7",
+        payload_sha256=payload_sha256,
+        dispatch_key=dispatch_key,
     )
 
     assert len(calls) == 1
@@ -167,4 +173,75 @@ async def test_worker_task_ack_receipt_binds_exact_delivery_and_claim() -> None:
         "redis_stream": "vp:tasks:vision",
         "consumer_group": "vision-workers",
         "message_id": "1710000000000-7",
+        "payload_sha256": payload_sha256,
+        "dispatch_key": dispatch_key,
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_task_ack_state_binds_exact_attestation_and_delivery() -> None:
+    claim = _claim()
+    calls: list[tuple[str, dict]] = []
+    attestation_id = uuid.uuid4()
+    dispatch_key = uuid.uuid4()
+
+    class Session:
+        async def scalar(self, statement, parameters):
+            calls.append((str(statement), dict(parameters)))
+            return None
+
+    await acknowledge_worker_task_delivery(
+        Session(),
+        claim,
+        attestation_id=attestation_id,
+        redis_stream="vp:tasks:vision",
+        consumer_group="vision-workers",
+        message_id="1710000000000-7",
+        payload_sha256="b" * 64,
+        dispatch_key=dispatch_key,
+    )
+
+    assert len(calls) == 1
+    statement, parameters = calls[0]
+    assert "public.vp_acknowledge_worker_task_delivery" in statement
+    assert parameters == {
+        "attestation_id": attestation_id,
+        "registration_id": claim.worker_registration_id,
+        "lease_epoch": claim.worker_lease_epoch,
+        "worker_id": claim.worker_id,
+        "worker_started_at": claim.started_at,
+        "redis_stream": "vp:tasks:vision",
+        "consumer_group": "vision-workers",
+        "message_id": "1710000000000-7",
+        "payload_sha256": "b" * 64,
+        "dispatch_key": dispatch_key,
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_task_ack_authorization_is_durable_and_exact() -> None:
+    claim = _claim()
+    calls: list[tuple[str, dict]] = []
+    attestation_id = uuid.uuid4()
+
+    class Session:
+        async def scalar(self, statement, parameters):
+            calls.append((str(statement), dict(parameters)))
+            return None
+
+    await authorize_worker_task_ack(
+        Session(),
+        claim,
+        attestation_id=attestation_id,
+    )
+
+    assert len(calls) == 1
+    statement, parameters = calls[0]
+    assert "public.vp_authorize_worker_task_ack" in statement
+    assert parameters == {
+        "attestation_id": attestation_id,
+        "registration_id": claim.worker_registration_id,
+        "lease_epoch": claim.worker_lease_epoch,
+        "worker_id": claim.worker_id,
+        "worker_started_at": claim.started_at,
     }

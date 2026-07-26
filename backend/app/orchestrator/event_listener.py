@@ -47,6 +47,17 @@ def _redis() -> aioredis.Redis:
 async def _reclaim_pending(r: aioredis.Redis) -> None:
     """Reclaim stale pending events from any consumer in the group."""
     try:
+        await _registered_event_receipts.reconcile_pending_dispatches(r)
+    except Exception:
+        logger.exception("Worker task dispatch reconciliation failed")
+    try:
+        await (
+            _registered_event_receipts
+            .reconcile_authorized_task_acknowledgements(r)
+        )
+    except Exception:
+        logger.exception("Worker task acknowledgement reconciliation failed")
+    try:
         await _registered_event_receipts.reconcile_pending_acknowledgements(r)
     except Exception:
         logger.exception("Registered event acknowledgement reconciliation failed")
@@ -176,6 +187,18 @@ async def _process_event(
         event,
         engine.apply_registered_worker_event,
     )
+    if receipt_id is None:
+        logger.error(
+            "quarantined registered worker event "
+            "stream=%s group=%s message=%s job=%s node=%s",
+            event.redis_stream,
+            event.consumer_group,
+            event.message_id,
+            event.job_id,
+            event.node_execution_id,
+        )
+        await _registered_event_receipts.acknowledge_applied(redis, event)
+        return
     await _registered_event_receipts.deliver_pending_dispatches(
         redis,
         receipt_id,

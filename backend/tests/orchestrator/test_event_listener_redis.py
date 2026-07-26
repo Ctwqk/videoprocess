@@ -264,6 +264,8 @@ async def test_registered_event_uses_receipt_handoff_before_dispatch_and_ack(
         "task_stream": "vp:tasks:vision",
         "task_group": "vision-workers",
         "task_message_id": "1710000000000-4",
+        "task_payload_sha256": "1" * 64,
+        "task_dispatch_key": str(uuid.uuid4()),
     }
     order: list[str] = []
     receipt_id = uuid.uuid4()
@@ -313,6 +315,55 @@ async def test_registered_event_uses_receipt_handoff_before_dispatch_and_ack(
 
 
 @pytest.mark.asyncio
+async def test_quarantined_registered_event_acks_only_after_durable_resolution(
+    monkeypatch,
+    caplog,
+) -> None:
+    data = {
+        "event": "node_completed",
+        "job_id": str(uuid.uuid4()),
+        "node_execution_id": str(uuid.uuid4()),
+        "output_artifact_id": str(uuid.uuid4()),
+        "worker_id": "vision-worker@127:42:instance",
+        "started_at": "2026-07-26T12:00:00+00:00",
+        "worker_registration_id": str(uuid.uuid4()),
+        "worker_lease_epoch": "17",
+        "task_stream": "vp:tasks:vision",
+        "task_group": "vision-workers",
+        "task_message_id": "1710000000000-4",
+        "task_payload_sha256": "1" * 64,
+        "task_dispatch_key": str(uuid.uuid4()),
+    }
+    calls: list[str] = []
+
+    class ReceiptService:
+        async def accept_and_apply(self, event, apply_event):
+            calls.append("quarantine")
+            return None
+
+        async def deliver_pending_dispatches(self, redis, receipt_id):
+            raise AssertionError("quarantine must not dispatch")
+
+        async def acknowledge_applied(self, redis, event):
+            calls.append("ack-event")
+
+    monkeypatch.setattr(
+        event_listener,
+        "_registered_event_receipts",
+        ReceiptService(),
+    )
+
+    await event_listener._process_event(
+        object(),
+        "1710000001000-2",
+        data,
+    )
+
+    assert calls == ["quarantine", "ack-event"]
+    assert "quarantined registered worker event" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_registered_event_receipt_failure_performs_no_redis_ack(
     monkeypatch,
 ) -> None:
@@ -328,6 +379,8 @@ async def test_registered_event_receipt_failure_performs_no_redis_ack(
         "task_stream": "vp:tasks:vision",
         "task_group": "vision-workers",
         "task_message_id": "1710000000000-4",
+        "task_payload_sha256": "2" * 64,
+        "task_dispatch_key": str(uuid.uuid4()),
     }
 
     class ReceiptService:
@@ -366,8 +419,14 @@ async def test_reclaim_reconciles_applied_receipt_acknowledgements_first(
     calls: list[str] = []
 
     class Receipts:
+        async def reconcile_pending_dispatches(self, redis):
+            calls.append("dispatch")
+
+        async def reconcile_authorized_task_acknowledgements(self, redis):
+            calls.append("task-ack")
+
         async def reconcile_pending_acknowledgements(self, redis):
-            calls.append("reconcile")
+            calls.append("ack")
 
     class Redis:
         async def xautoclaim(self, *args, **kwargs):
@@ -382,4 +441,4 @@ async def test_reclaim_reconciles_applied_receipt_acknowledgements_first(
 
     await event_listener._reclaim_pending(Redis())
 
-    assert calls == ["reconcile", "xautoclaim"]
+    assert calls == ["dispatch", "task-ack", "ack", "xautoclaim"]

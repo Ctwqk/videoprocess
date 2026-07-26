@@ -228,6 +228,54 @@ every environment, including local development. Generationless compatibility
 remains available for non-publication worker paths only; an irreversible
 external publication must not fall back to the legacy authority model.
 
+### Task delivery and event authority handoff
+
+Every registered production task has a mandatory `dispatch_key` backed by an
+orchestrator-created `worker_task_dispatches` row. The initial `QUEUED` node
+state, authoritative input artifact IDs, and dispatch row commit in one node
+authority transaction. Downstream and retry dispatches follow the same rule.
+Redis delivery is post-commit and idempotent: a Lua `GET`/`XADD`/`SET` marker
+binds the dispatch key to one Redis message ID, and an independent database
+poller retries pending dispatches even if the originating event is trimmed.
+Markers use a renewable 30-day TTL and expire after the database row is
+durably `delivered`.
+
+On claim, the worker calls `public.vp_attest_worker_task_delivery` while its
+worker-principal live lease and node authority transaction are held. The
+immutable attestation binds dispatch key, canonical task payload hash,
+stream/group/message, job/node, registration/epoch/worker/start, and source
+task ACK state. The worker role has no direct attestation DML.
+
+The independent orchestrator principal calls
+`public.vp_observe_worker_task_delivery`, not
+`public.vp_require_worker_lease`. The observer acquires the same
+registration-shared advisory transaction lock and verifies the live
+registration, admission grant, delivered dispatch, and exact attestation
+without accepting the orchestrator as the worker principal. Under that fence
+plus locked node authority, the orchestrator atomically accepts a
+`registered_worker_event_receipts` handoff and its
+`registered_worker_event_deliveries` row. Cache writes, final-artifact
+mutation, downstream/retry dispatch staging, and job finalization occur only
+after this handoff and in the same transaction.
+
+Receipts deduplicate both event identity and source-attestation identity. A new
+event ID with the same exact result aliases the applied receipt without
+reapplying. A same-attestation payload or claim mismatch creates a durable
+quarantined delivery with the actual event Redis identity and reason code; it
+may ACK only that quarantined event and never the source task. Receipt-backed
+source-task and event ACKs remain valid after lease loss. The attestation
+`pending -> authorized -> acknowledged` lifecycle also closes the live-worker
+XACK/commit window: live authority is committed before XACK, and an independent
+database poller can replay an exact authorized XACK after worker failure.
+
+Job deletion uses
+`public.vp_resolve_worker_event_authority_for_job_deletion`. It requires every
+dispatch delivered, every attestation acknowledged, every existing receipt
+applied and event-acknowledged, and every event delivery acknowledged. It does
+not require one receipt per attestation, so a safely ACKed cancelled task with
+no completion/failure event can be cleaned up. Receipt and attestation foreign
+keys are restrictive; the cleanup function deletes authority rows explicitly.
+
 ## Dependency Fingerprints
 
 Fingerprint builders parse structured URLs and endpoints, remove credentials,
@@ -278,10 +326,12 @@ same environment produces identical hashes.
 
 `node_executions` gains nullable `worker_registration_id` and
 `worker_lease_epoch`. Production task claim stores the current registration
-facts. Every artifact write, node completion/failure, event publication, and
-Redis acknowledgement rechecks that the same registration epoch is active and
-unexpired under the existing node execution authority lock. Lease loss leaves
-the delivery pending and cannot finalize a durable result.
+facts. Artifact/object writes and worker event publication require the exact
+live lease under the existing node execution authority lock. Completion and
+failure effects move to the immutable receipt handoff above; no
+completion-derived write occurs before acceptance. Lease loss before either
+the receipt handoff or a durable task-ACK authorization leaves the delivery
+pending and cannot finalize a result.
 
 Historical node rows remain nullable and are not backfilled with invented
 registrations.
@@ -325,7 +375,7 @@ deployment order becomes:
 8. revoke the replaced login principals;
 9. continue runner and remaining service convergence.
 
-A stable `NOLOGIN` role owns this explicit worker privilege allowlist:
+A stable `NOLOGIN` worker runtime role owns this explicit privilege allowlist:
 
 - `SELECT` on `jobs`, `node_executions`, `artifacts`, `channel_profiles`,
   `production_tasks`, `runtime_schedules`, and
@@ -333,7 +383,11 @@ A stable `NOLOGIN` role owns this explicit worker privilege allowlist:
 - `INSERT` on `artifacts`, `runtime_schedules`, and
   `youtube_upload_operations`;
 - `UPDATE` on `node_executions` and `youtube_upload_operations`;
-- `EXECUTE` on the four worker-registration functions.
+- `EXECUTE` only on `vp_worker_register`, `vp_worker_heartbeat`,
+  `vp_worker_release`, `vp_require_worker_lease`,
+  `vp_require_worker_lease_margin`, `vp_attest_worker_task_delivery`,
+  `vp_authorize_worker_task_ack`, `vp_require_worker_task_ack_receipt`, and
+  `vp_acknowledge_worker_task_delivery`.
 
 It receives no `DELETE`, `TRUNCATE`, DDL, sequence, `alembic_version`, grant-
 table, or registration-table privilege. Each service generation receives a
@@ -341,6 +395,18 @@ fresh `LOGIN` role that inherits only that stable role. It is never a superuser,
 never owns application objects, has no privileged role membership, and has no
 direct grant/registration table reads or writes. Deployment does not use blanket
 table grants or default privileges.
+
+A separate stable `NOLOGIN` orchestrator-control role executes only
+`vp_observe_worker_lease`, `vp_observe_worker_task_delivery`, and
+`vp_resolve_worker_event_authority_for_job_deletion`. It has exact
+`SELECT`/`INSERT` and monotonic state-column `UPDATE` privileges on
+`worker_task_dispatches`, `worker_task_delivery_attestations`,
+`registered_worker_event_receipts`, and
+`registered_worker_event_deliveries`, plus the existing least-privilege
+job/node/cache/artifact columns needed by receipt application. It receives no
+`DELETE`, protected-table ownership, worker registration functions, or direct
+grant/registration access. Event authority cleanup is available only through
+the reviewed cleanup function.
 
 Schema migration/DCL uses the protected deploy-migrator credential. Migration
 head and readiness probes use a separate deploy-read credential. Neither
@@ -368,10 +434,13 @@ Each worker service receives:
 
 Production startup rejects a worker database URL supplied only through the
 Swarm environment. The worker reads the bounded mode `0400` secret before
-opening PostgreSQL. Docker secret mounts for the database URL and admission
-token must remain immutable for the full worker process lifetime; rotation
-creates a new generation and restarts the worker instead of modifying a mounted
-secret in place. Local development may continue using `DATABASE_URL`.
+opening PostgreSQL. It reads exactly the initial descriptor size, rejects
+premature EOF or growth, and compares final descriptor identity, mode, size,
+mtime, and ctime before accepting the value. Docker secret mounts for the
+database URL and admission token must remain immutable for the full worker
+process lifetime; rotation creates a new generation and restarts the worker
+instead of modifying a mounted secret in place. Local development may continue
+using `DATABASE_URL`.
 
 The controller verifies the running service has exactly the expected secret,
 identity variables, registration row, consumer ID, image, host, capabilities,
@@ -392,11 +461,14 @@ principal cannot satisfy that separation during this rollout, the preflight repo
 complete T05 security boundary.
 
 This increment authenticates workers before Redis and continuously joins
-consumer observations to registrations. Redis ACL users scoped to each
-production namespace/stream remain a separate required T05 hardening increment.
-Until that increment is deployed, the registration guard and network placement
-are compensating controls; no unattended canary or soak is unlocked by
-registration alone.
+consumer observations to registrations. Task 4 gives each worker only its
+granted task stream/group commands and gives the orchestrator-control Redis
+principal the event-group commands plus `EVAL`, `GET`, `SET`, and `XADD` for
+`vp:worker-task-dispatch:*` markers and admitted task streams. Lua execution is
+restricted to the reviewed idempotent dispatch script. Marker TTL is renewed
+while delivery reconciliation is pending and is 30 days after the last
+attempt; the durable `delivered` row prevents redispatch after expiry. No broad
+key pattern or unrestricted scripting grant is permitted.
 
 ## Unknown Consumer Guard
 

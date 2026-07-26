@@ -1,11 +1,17 @@
 from __future__ import annotations
 import uuid
 from typing import Any
-from sqlalchemy import select, func
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.pipeline import Pipeline
+from app.models.registered_worker_event_receipt import (
+    RegisteredWorkerEventDelivery,
+    RegisteredWorkerEventReceipt,
+    WorkerTaskDeliveryAttestation,
+    WorkerTaskDispatch,
+)
 from app.schemas.pipeline import PipelineDefinition
 from app.orchestrator.dag import validate_pipeline
 from app.orchestrator.planner import compile_runtime_definition
@@ -240,6 +246,116 @@ async def delete_job(db: AsyncSession, job_id: uuid.UUID) -> bool:
     if job.status in (JobStatus.PENDING, JobStatus.PLANNING, JobStatus.RUNNING):
         raise ValueError("Only terminal jobs can be deleted")
 
+    await _resolve_worker_event_authority_for_job_deletion(db, job_id)
     await db.delete(job)
     await db.commit()
     return True
+
+
+async def _resolve_worker_event_authority_for_job_deletion(
+    db: AsyncSession,
+    job_id: uuid.UUID,
+) -> None:
+    if db.get_bind().dialect.name == "postgresql":
+        try:
+            await db.execute(
+                text(
+                    "SELECT public."
+                    "vp_resolve_worker_event_authority_for_job_deletion("
+                    ":job_id)"
+                ),
+                {"job_id": job_id},
+            )
+        except Exception as exc:
+            await db.rollback()
+            raise ValueError(
+                "Worker event authority is unresolved"
+            ) from exc
+        return
+
+    attestations = list(
+        (
+            await db.execute(
+                select(WorkerTaskDeliveryAttestation).where(
+                    WorkerTaskDeliveryAttestation.job_id == job_id
+                )
+            )
+        ).scalars()
+    )
+    attestation_ids = [attestation.id for attestation in attestations]
+    receipts = list(
+        (
+            await db.execute(
+                select(RegisteredWorkerEventReceipt).where(
+                    RegisteredWorkerEventReceipt.job_id == job_id
+                )
+            )
+        ).scalars()
+    )
+    deliveries = (
+        list(
+            (
+                await db.execute(
+                    select(RegisteredWorkerEventDelivery).where(
+                        RegisteredWorkerEventDelivery
+                        .source_task_attestation_id.in_(attestation_ids)
+                    )
+                )
+            ).scalars()
+        )
+        if attestation_ids
+        else []
+    )
+    dispatches = list(
+        (
+            await db.execute(
+                select(WorkerTaskDispatch).where(
+                    WorkerTaskDispatch.job_id == job_id
+                )
+            )
+        ).scalars()
+    )
+    if (
+        any(
+            attestation.ack_state != "acknowledged"
+            for attestation in attestations
+        )
+        or
+        any(
+            receipt.application_state != "applied"
+            or receipt.ack_state != "acknowledged"
+            for receipt in receipts
+        )
+        or any(
+            delivery.ack_state != "acknowledged"
+            for delivery in deliveries
+        )
+        or any(
+            dispatch.delivery_state != "delivered"
+            for dispatch in dispatches
+        )
+    ):
+        raise ValueError("Worker event authority is unresolved")
+
+    if attestation_ids:
+        await db.execute(
+            delete(RegisteredWorkerEventDelivery).where(
+                RegisteredWorkerEventDelivery
+                .source_task_attestation_id.in_(attestation_ids)
+            )
+        )
+    await db.execute(
+        delete(WorkerTaskDispatch).where(
+            WorkerTaskDispatch.job_id == job_id
+        )
+    )
+    await db.execute(
+        delete(RegisteredWorkerEventReceipt).where(
+            RegisteredWorkerEventReceipt.job_id == job_id
+        )
+    )
+    await db.execute(
+        delete(WorkerTaskDeliveryAttestation).where(
+            WorkerTaskDeliveryAttestation.job_id == job_id
+        )
+    )

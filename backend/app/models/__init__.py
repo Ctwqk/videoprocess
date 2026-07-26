@@ -16,7 +16,10 @@ from app.models.youtube_upload_operation import YouTubeUploadOperation
 from app.models.publication_promotion_operation import PublicationPromotionOperation
 from app.models.legacy_worker_event_resolution import LegacyWorkerEventResolution
 from app.models.registered_worker_event_receipt import (
+    RegisteredWorkerEventDelivery,
     RegisteredWorkerEventReceipt,
+    WorkerTaskDispatch,
+    WorkerTaskDeliveryAttestation,
     WorkerEventDispatch,
 )
 from app.models.worker_registration import WorkerAdmissionGrant, WorkerRegistration
@@ -63,6 +66,9 @@ __all__ = [
     "PublicationPromotionOperation",
     "LegacyWorkerEventResolution",
     "RegisteredWorkerEventReceipt",
+    "RegisteredWorkerEventDelivery",
+    "WorkerTaskDeliveryAttestation",
+    "WorkerTaskDispatch",
     "WorkerEventDispatch",
     "WorkerAdmissionGrant",
     "WorkerRegistration",

@@ -7,7 +7,6 @@ from collections import Counter
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
-from redis.typing import EncodableT
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -19,7 +18,6 @@ from app.models.artifact import Artifact, ArtifactKind
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.registered_worker_event_receipt import (
     RegisteredWorkerEventReceipt,
-    WorkerEventDispatch,
 )
 from app.node_registry.registry import NodeTypeRegistry
 from app.orchestrator.artifact_cache import IntermediateArtifactCacheService
@@ -40,7 +38,8 @@ from app.services.job_execution_authority import (
 from app.services.registered_worker_event_receipt import (
     RegisteredWorkerEvent,
     RegisteredWorkerEventError,
-    canonical_redis_payload_sha256,
+    RegisteredWorkerEventReceiptService,
+    stage_worker_task_dispatch,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,6 +48,7 @@ TASK_STREAM = "vp:tasks:{worker_type}"
 EVENT_STREAM = "vp:events"
 CONSUMER_GROUP = "orchestrator"
 CONSUMER_NAME = "orchestrator-1"
+_worker_task_dispatches = RegisteredWorkerEventReceiptService(async_session)
 
 
 def _require_receipt_entrypoint_for_registered_claim(
@@ -383,30 +383,66 @@ class JobEngine:
                         upstream_ne = ne_by_node_id.get(edge.source)
                         if upstream_ne and upstream_ne.output_artifact_id:
                             input_artifacts[edge.targetHandle] = str(upstream_ne.output_artifact_id)
-                input_artifact_objects = await self._input_artifacts_by_handle(db, input_artifacts)
-                if await self._apply_cached_artifact_if_available(db, job, ne, input_artifact_objects):
-                    continue
-
-                ne.status = NodeStatus.QUEUED
-                ne.queued_at = datetime.utcnow()
-                ne.input_artifact_ids = [
-                    uuid.UUID(aid) for aid in input_artifacts.values()
-                ]
-                await db.commit()
-
                 await self._before_node_dispatch_recheck(job.id, ne.node_id)
                 locked = await self._lock_dispatch_authority(db, job.id, ne.id)
                 if locked is None:
                     return
                 job, ne = locked
+                ne_by_node_id = {
+                    execution.node_id: execution
+                    for execution in job.node_executions
+                }
+                fresh_dep_map = (
+                    job.execution_plan.get("dependencies", {})
+                    if job.execution_plan
+                    else {}
+                )
+                deps = fresh_dep_map.get(ne.node_id, [])
+                if not all(
+                    ne_by_node_id.get(dep_id)
+                    and ne_by_node_id[dep_id].status
+                    == NodeStatus.SUCCEEDED
+                    for dep_id in deps
+                ):
+                    await db.rollback()
+                    continue
+                definition = PipelineDefinition.model_validate(
+                    job.pipeline_snapshot
+                )
+                input_artifacts = {}
+                for edge in definition.edges:
+                    if edge.target != ne.node_id:
+                        continue
+                    upstream_ne = ne_by_node_id.get(edge.source)
+                    if upstream_ne and upstream_ne.output_artifact_id:
+                        input_artifacts[edge.targetHandle] = str(
+                            upstream_ne.output_artifact_id
+                        )
+                input_artifact_objects = (
+                    await self._input_artifacts_by_handle(
+                        db,
+                        input_artifacts,
+                    )
+                )
+                if await self._apply_cached_artifact_uncommitted(
+                    db,
+                    job,
+                    ne,
+                    input_artifact_objects,
+                ):
+                    await db.commit()
+                    continue
+                preferred_hosts = self._preferred_hosts_for_node(
+                    ne_by_node_id,
+                    deps,
+                )
 
                 # Determine worker_type from node registry
                 registry = NodeTypeRegistry.get()
                 node_def = registry.get_type(ne.node_type)
                 worker_type = node_def.worker_type if node_def else "ffmpeg"
 
-                # Push task to Redis Stream
-                task: dict[EncodableT, EncodableT] = {
+                task: dict[str, str] = {
                     "job_id": str(job.id),
                     "node_execution_id": str(ne.id),
                     "node_id": ne.node_id,
@@ -418,8 +454,22 @@ class JobEngine:
                     "affinity_bounces": "0",
                 }
                 stream_key = TASK_STREAM.format(worker_type=worker_type)
-                await r.xadd(stream_key, task)
+                ne.status = NodeStatus.QUEUED
+                ne.queued_at = datetime.utcnow()
+                ne.input_artifact_ids = [
+                    uuid.UUID(aid) for aid in input_artifacts.values()
+                ]
+                await stage_worker_task_dispatch(
+                    db,
+                    origin_receipt_id=None,
+                    job_id=job.id,
+                    node_execution_id=ne.id,
+                    redis_stream=stream_key,
+                    consumer_group=f"{worker_type}-workers",
+                    payload=task,
+                )
                 await db.commit()
+                await _worker_task_dispatches.reconcile_pending_dispatches(r)
                 logger.info(
                     "Dispatched node %s (type=%s) to %s for job %s with preferred_hosts=%s",
                     ne.node_id, ne.node_type, stream_key, job.id, preferred_hosts,
@@ -443,7 +493,7 @@ class JobEngine:
             require_active_execution_authority(
                 authority,
                 job_statuses={JobStatus.RUNNING},
-                node_statuses={NodeStatus.QUEUED},
+                node_statuses={NodeStatus.PENDING},
             )
         except JobExecutionAuthorityBlocked:
             await db.rollback()
@@ -672,6 +722,7 @@ class JobEngine:
             job,
             dep_map,
         )
+        await self._apply_job_finalization(db, job)
 
     async def _apply_registered_failure(
         self,
@@ -714,6 +765,22 @@ class JobEngine:
         job: Job,
         dep_map: dict[str, list[str]],
     ) -> None:
+        while await self._stage_ready_receipt_dispatches_once(
+            db,
+            receipt,
+            job,
+            dep_map,
+        ):
+            pass
+
+    async def _stage_ready_receipt_dispatches_once(
+        self,
+        db: AsyncSession,
+        receipt: RegisteredWorkerEventReceipt,
+        job: Job,
+        dep_map: dict[str, list[str]],
+    ) -> bool:
+        progressed = False
         ne_by_node_id = {ne.node_id: ne for ne in job.node_executions}
         definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
         for node_id, deps in dep_map.items():
@@ -745,6 +812,7 @@ class JobEngine:
                 ne,
                 input_objects,
             ):
+                progressed = True
                 continue
             ne.status = NodeStatus.QUEUED
             ne.queued_at = datetime.utcnow()
@@ -762,6 +830,8 @@ class JobEngine:
                     deps,
                 ),
             )
+            progressed = True
+        return progressed
 
     async def _stage_receipt_dispatch(
         self,
@@ -793,7 +863,6 @@ class JobEngine:
         registry = NodeTypeRegistry.get()
         node_def = registry.get_type(ne.node_type)
         worker_type = node_def.worker_type if node_def else "ffmpeg"
-        dispatch_key = uuid.uuid4()
         payload = {
             "job_id": str(job.id),
             "node_execution_id": str(ne.id),
@@ -804,20 +873,16 @@ class JobEngine:
             "preferred_hosts": json.dumps(preferred_hosts),
             "affinity_enqueued_at": str(int(time.time())),
             "affinity_bounces": "0",
-            "dispatch_key": str(dispatch_key),
         }
-        db.add(
-            WorkerEventDispatch(
-                receipt_id=receipt.id,
-                dispatch_key=dispatch_key,
-                node_execution_id=ne.id,
-                redis_stream=TASK_STREAM.format(worker_type=worker_type),
-                payload_sha256=canonical_redis_payload_sha256(payload),
-                payload_json=payload,
-                delivery_state="pending",
-            )
+        await stage_worker_task_dispatch(
+            db,
+            origin_receipt_id=receipt.id,
+            job_id=job.id,
+            node_execution_id=ne.id,
+            redis_stream=TASK_STREAM.format(worker_type=worker_type),
+            consumer_group=f"{worker_type}-workers",
+            payload=payload,
         )
-        await db.flush()
 
     async def _receipt_input_artifacts(
         self,
@@ -1038,7 +1103,7 @@ class JobEngine:
                     node_def = registry.get_type(ne.node_type)
                     worker_type = node_def.worker_type if node_def else "ffmpeg"
 
-                    task: dict[EncodableT, EncodableT] = {
+                    task: dict[str, str] = {
                         "job_id": str(job.id),
                         "node_execution_id": str(ne.id),
                         "node_id": ne.node_id,

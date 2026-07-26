@@ -32,12 +32,34 @@ RELEASE_SIGNATURE = (
 )
 REQUIRE_SIGNATURE = "public.vp_require_worker_lease(uuid,bigint)"
 OBSERVER_SIGNATURE = "public.vp_observe_worker_lease(uuid,bigint)"
+ATTEST_TASK_SIGNATURE = (
+    "public.vp_attest_worker_task_delivery("
+    "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
+    "text,text,text,text,uuid)"
+)
+OBSERVE_TASK_SIGNATURE = (
+    "public.vp_observe_worker_task_delivery("
+    "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
+    "text,text,text,text,uuid)"
+)
 MARGIN_SIGNATURE = (
     "public.vp_require_worker_lease_margin(uuid,bigint,integer)"
 )
 TASK_ACK_SIGNATURE = (
     "public.vp_require_worker_task_ack_receipt("
-    "uuid,bigint,text,timestamp with time zone,text,text,text)"
+    "uuid,bigint,text,timestamp with time zone,text,text,text,text,uuid)"
+)
+TASK_ACKNOWLEDGED_SIGNATURE = (
+    "public.vp_acknowledge_worker_task_delivery("
+    "uuid,uuid,bigint,text,timestamp with time zone,"
+    "text,text,text,text,uuid)"
+)
+TASK_ACK_AUTHORIZE_SIGNATURE = (
+    "public.vp_authorize_worker_task_ack("
+    "uuid,uuid,bigint,text,timestamp with time zone)"
+)
+CLEANUP_EVENT_AUTHORITY_SIGNATURE = (
+    "public.vp_resolve_worker_event_authority_for_job_deletion(uuid)"
 )
 ENDPOINT_FINGERPRINTS_SIGNATURE = (
     "public.vp_worker_endpoint_fingerprints(jsonb)"
@@ -430,16 +452,23 @@ def upgrade() -> None:
     _create_release_function()
     _create_require_function()
     _create_observer_function()
+    _create_task_delivery_functions()
     _create_margin_function()
     _create_task_ack_function()
+    _create_event_authority_cleanup_function()
     for signature in (
         REGISTER_SIGNATURE,
         HEARTBEAT_SIGNATURE,
         RELEASE_SIGNATURE,
         REQUIRE_SIGNATURE,
         OBSERVER_SIGNATURE,
+        ATTEST_TASK_SIGNATURE,
+        OBSERVE_TASK_SIGNATURE,
         MARGIN_SIGNATURE,
         TASK_ACK_SIGNATURE,
+        TASK_ACKNOWLEDGED_SIGNATURE,
+        TASK_ACK_AUTHORIZE_SIGNATURE,
+        CLEANUP_EVENT_AUTHORITY_SIGNATURE,
         ENDPOINT_FINGERPRINTS_SIGNATURE,
         GRANT_UPSERT_SIGNATURE,
         GRANT_ACTIVATE_SIGNATURE,
@@ -452,11 +481,251 @@ def upgrade() -> None:
 
 def _create_registered_event_receipt_tables() -> None:
     op.create_table(
+        "worker_task_dispatches",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "origin_receipt_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "dispatch_key",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "job_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "node_execution_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column("redis_stream", sa.String(length=255), nullable=False),
+        sa.Column("consumer_group", sa.String(length=255), nullable=False),
+        sa.Column("payload_sha256", sa.String(length=64), nullable=False),
+        sa.Column(
+            "payload_json",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+        ),
+        sa.Column(
+            "delivery_state",
+            sa.String(length=16),
+            server_default=sa.text("'pending'"),
+            nullable=False,
+        ),
+        sa.Column("redis_message_id", sa.String(length=64), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column(
+            "delivered_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.CheckConstraint(
+            "(length(trim(redis_stream)) > 0 "
+            "AND length(trim(consumer_group)) > 0) IS TRUE",
+            name="ck_worker_task_dispatch_redis_identity",
+        ),
+        sa.CheckConstraint(
+            "(payload_sha256 ~ '^[0-9a-f]{64}$') IS TRUE",
+            name="ck_worker_task_dispatch_sha256",
+        ),
+        sa.CheckConstraint(
+            "(delivery_state IN ('pending', 'delivered')) IS TRUE",
+            name="ck_worker_task_dispatch_state",
+        ),
+        sa.CheckConstraint(
+            "((delivery_state = 'pending' "
+            "AND redis_message_id IS NULL AND delivered_at IS NULL) "
+            "OR (delivery_state = 'delivered' "
+            "AND redis_message_id IS NOT NULL "
+            "AND delivered_at IS NOT NULL)) IS TRUE",
+            name="ck_worker_task_dispatch_delivery",
+        ),
+        sa.ForeignKeyConstraint(
+            ["job_id"],
+            ["jobs.id"],
+            name="fk_worker_task_dispatches_job_id",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["node_execution_id"],
+            ["node_executions.id"],
+            name="fk_worker_task_dispatches_node_execution_id",
+            ondelete="RESTRICT",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "dispatch_key",
+            name="uq_worker_task_dispatch_key",
+        ),
+        sa.UniqueConstraint(
+            "origin_receipt_id",
+            "node_execution_id",
+            name="uq_worker_task_dispatch_receipt_node",
+        ),
+    )
+    op.create_index(
+        "ix_worker_task_dispatches_origin_receipt_id",
+        "worker_task_dispatches",
+        ["origin_receipt_id"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_worker_task_dispatches_pending",
+        "worker_task_dispatches",
+        ["delivery_state", "created_at"],
+        unique=False,
+    )
+
+    op.create_table(
+        "worker_task_delivery_attestations",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column("redis_stream", sa.String(length=255), nullable=False),
+        sa.Column("consumer_group", sa.String(length=255), nullable=False),
+        sa.Column("message_id", sa.String(length=64), nullable=False),
+        sa.Column("payload_sha256", sa.String(length=64), nullable=False),
+        sa.Column(
+            "dispatch_key",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "job_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "node_execution_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "worker_registration_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column("worker_lease_epoch", sa.BigInteger(), nullable=False),
+        sa.Column("worker_id", sa.String(length=255), nullable=False),
+        sa.Column(
+            "worker_started_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "ack_state",
+            sa.String(length=16),
+            server_default="pending",
+            nullable=False,
+        ),
+        sa.Column(
+            "acknowledged_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "attested_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "(length(trim(redis_stream)) > 0 "
+            "AND length(trim(consumer_group)) > 0 "
+            "AND length(trim(message_id)) > 0 "
+            "AND length(trim(worker_id)) > 0) IS TRUE",
+            name="ck_worker_task_delivery_attestation_identity",
+        ),
+        sa.CheckConstraint(
+            "(payload_sha256 ~ '^[0-9a-f]{64}$') IS TRUE",
+            name="ck_worker_task_delivery_attestation_sha256",
+        ),
+        sa.CheckConstraint(
+            "(worker_lease_epoch > 0) IS TRUE",
+            name="ck_worker_task_delivery_attestation_epoch",
+        ),
+        sa.CheckConstraint(
+            "(ack_state IN "
+            "('pending', 'authorized', 'acknowledged')) IS TRUE",
+            name="ck_worker_task_delivery_attestation_ack_state",
+        ),
+        sa.CheckConstraint(
+            "((ack_state IN ('pending', 'authorized') "
+            "AND acknowledged_at IS NULL) "
+            "OR (ack_state = 'acknowledged' "
+            "AND acknowledged_at IS NOT NULL)) IS TRUE",
+            name="ck_worker_task_delivery_attestation_ack_time",
+        ),
+        sa.ForeignKeyConstraint(
+            ["job_id"],
+            ["jobs.id"],
+            name="fk_worker_task_delivery_attestations_job_id",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["node_execution_id"],
+            ["node_executions.id"],
+            name="fk_worker_task_delivery_attestations_node_execution_id",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["worker_registration_id"],
+            ["worker_registrations.id"],
+            name="fk_worker_task_delivery_attestations_registration_id",
+            ondelete="RESTRICT",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "redis_stream",
+            "consumer_group",
+            "message_id",
+            name="uq_worker_task_delivery_attestation_identity",
+        ),
+        sa.UniqueConstraint(
+            "node_execution_id",
+            "worker_registration_id",
+            "worker_lease_epoch",
+            "worker_id",
+            "worker_started_at",
+            name="uq_worker_task_delivery_attestation_claim",
+        ),
+    )
+    op.create_index(
+        "ix_worker_task_delivery_attestations_registration_id",
+        "worker_task_delivery_attestations",
+        ["worker_registration_id"],
+        unique=False,
+    )
+
+    op.create_table(
         "registered_worker_event_receipts",
         sa.Column(
             "id",
             postgresql.UUID(as_uuid=True),
             server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "source_task_attestation_id",
+            postgresql.UUID(as_uuid=True),
             nullable=False,
         ),
         sa.Column("redis_stream", sa.String(length=255), nullable=False),
@@ -608,13 +877,19 @@ def _create_registered_event_receipt_tables() -> None:
             ["job_id"],
             ["jobs.id"],
             name="fk_registered_worker_event_receipts_job_id",
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
             ["node_execution_id"],
             ["node_executions.id"],
             name="fk_registered_worker_event_receipts_node_execution_id",
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["source_task_attestation_id"],
+            ["worker_task_delivery_attestations.id"],
+            name="fk_registered_worker_event_receipts_attestation_id",
+            ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
             ["worker_registration_id"],
@@ -623,6 +898,10 @@ def _create_registered_event_receipt_tables() -> None:
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "source_task_attestation_id",
+            name="uq_registered_worker_event_receipt_attestation",
+        ),
         sa.UniqueConstraint(
             "redis_stream",
             "consumer_group",
@@ -660,7 +939,7 @@ def _create_registered_event_receipt_tables() -> None:
     )
 
     op.create_table(
-        "worker_event_dispatches",
+        "registered_worker_event_deliveries",
         sa.Column(
             "id",
             postgresql.UUID(as_uuid=True),
@@ -668,97 +947,99 @@ def _create_registered_event_receipt_tables() -> None:
             nullable=False,
         ),
         sa.Column(
+            "source_task_attestation_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
             "receipt_id",
             postgresql.UUID(as_uuid=True),
-            nullable=False,
-        ),
-        sa.Column(
-            "dispatch_key",
-            postgresql.UUID(as_uuid=True),
-            nullable=False,
-        ),
-        sa.Column(
-            "node_execution_id",
-            postgresql.UUID(as_uuid=True),
-            nullable=False,
+            nullable=True,
         ),
         sa.Column("redis_stream", sa.String(length=255), nullable=False),
+        sa.Column("consumer_group", sa.String(length=255), nullable=False),
+        sa.Column("message_id", sa.String(length=64), nullable=False),
         sa.Column("payload_sha256", sa.String(length=64), nullable=False),
+        sa.Column("resolution_state", sa.String(length=16), nullable=False),
+        sa.Column("reason_code", sa.String(length=64), nullable=True),
         sa.Column(
-            "payload_json",
-            postgresql.JSONB(astext_type=sa.Text()),
-            nullable=False,
-        ),
-        sa.Column(
-            "delivery_state",
+            "ack_state",
             sa.String(length=16),
             server_default=sa.text("'pending'"),
             nullable=False,
         ),
         sa.Column(
-            "redis_message_id",
-            sa.String(length=64),
-            nullable=True,
-        ),
-        sa.Column(
-            "created_at",
+            "accepted_at",
             sa.DateTime(timezone=True),
             server_default=sa.func.now(),
             nullable=False,
         ),
         sa.Column(
-            "delivered_at",
+            "acknowledged_at",
             sa.DateTime(timezone=True),
             nullable=True,
         ),
         sa.CheckConstraint(
-            "(length(trim(redis_stream)) > 0) IS TRUE",
-            name="ck_worker_event_dispatch_stream",
+            "(length(trim(redis_stream)) > 0 "
+            "AND length(trim(consumer_group)) > 0 "
+            "AND length(trim(message_id)) > 0) IS TRUE",
+            name="ck_registered_worker_event_delivery_redis_identity",
         ),
         sa.CheckConstraint(
             "(payload_sha256 ~ '^[0-9a-f]{64}$') IS TRUE",
-            name="ck_worker_event_dispatch_sha256",
+            name="ck_registered_worker_event_delivery_sha256",
         ),
         sa.CheckConstraint(
-            "(delivery_state IN ('pending', 'delivered')) IS TRUE",
-            name="ck_worker_event_dispatch_state",
+            "((resolution_state = 'accepted' "
+            "AND receipt_id IS NOT NULL AND reason_code IS NULL) "
+            "OR (resolution_state = 'quarantined' "
+            "AND reason_code IS NOT NULL "
+            "AND length(trim(reason_code)) > 0)) IS TRUE",
+            name="ck_registered_worker_event_delivery_resolution",
         ),
         sa.CheckConstraint(
-            "((delivery_state = 'pending' "
-            "AND redis_message_id IS NULL AND delivered_at IS NULL) "
-            "OR (delivery_state = 'delivered' "
-            "AND redis_message_id IS NOT NULL "
-            "AND delivered_at IS NOT NULL)) IS TRUE",
-            name="ck_worker_event_dispatch_delivery",
+            "(ack_state IN ('pending', 'acknowledged')) IS TRUE",
+            name="ck_registered_worker_event_delivery_ack_state",
+        ),
+        sa.CheckConstraint(
+            "((ack_state = 'pending' AND acknowledged_at IS NULL) "
+            "OR (ack_state = 'acknowledged' "
+            "AND acknowledged_at IS NOT NULL)) IS TRUE",
+            name="ck_registered_worker_event_delivery_ack_time",
+        ),
+        sa.ForeignKeyConstraint(
+            ["source_task_attestation_id"],
+            ["worker_task_delivery_attestations.id"],
+            name="fk_registered_worker_event_deliveries_attestation_id",
+            ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
             ["receipt_id"],
             ["registered_worker_event_receipts.id"],
-            name="fk_worker_event_dispatches_receipt_id",
-            ondelete="CASCADE",
-        ),
-        sa.ForeignKeyConstraint(
-            ["node_execution_id"],
-            ["node_executions.id"],
-            name="fk_worker_event_dispatches_node_execution_id",
-            ondelete="CASCADE",
+            name="fk_registered_worker_event_deliveries_receipt_id",
+            ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
-            "dispatch_key",
-            name="uq_worker_event_dispatch_key",
-        ),
-        sa.UniqueConstraint(
-            "receipt_id",
-            "node_execution_id",
-            name="uq_worker_event_dispatch_receipt_node",
+            "redis_stream",
+            "consumer_group",
+            "message_id",
+            name="uq_registered_worker_event_delivery_identity",
         ),
     )
     op.create_index(
-        "ix_worker_event_dispatches_receipt_id",
-        "worker_event_dispatches",
+        "ix_registered_worker_event_deliveries_receipt_id",
+        "registered_worker_event_deliveries",
         ["receipt_id"],
         unique=False,
+    )
+    op.create_foreign_key(
+        "fk_worker_task_dispatches_origin_receipt_id",
+        "worker_task_dispatches",
+        "registered_worker_event_receipts",
+        ["origin_receipt_id"],
+        ["id"],
+        ondelete="RESTRICT",
     )
 
 
@@ -768,11 +1049,13 @@ def _create_receipt_immutability_trigger() -> None:
 CREATE FUNCTION public.vp_enforce_worker_event_receipt_immutability()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = pg_catalog
 AS $function$
 BEGIN
     IF ROW(
         NEW.id,
+        NEW.source_task_attestation_id,
         NEW.redis_stream,
         NEW.consumer_group,
         NEW.message_id,
@@ -791,6 +1074,7 @@ BEGIN
         NEW.accepted_at
     ) IS DISTINCT FROM ROW(
         OLD.id,
+        OLD.source_task_attestation_id,
         OLD.redis_stream,
         OLD.consumer_group,
         OLD.message_id,
@@ -861,6 +1145,230 @@ EXECUTE FUNCTION public.vp_enforce_worker_event_receipt_immutability()
     op.execute(
         "REVOKE ALL ON FUNCTION "
         "public.vp_enforce_worker_event_receipt_immutability() FROM PUBLIC"
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_enforce_worker_task_attestation_immutability()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+    IF ROW(
+        NEW.id,
+        NEW.redis_stream,
+        NEW.consumer_group,
+        NEW.message_id,
+        NEW.payload_sha256,
+        NEW.dispatch_key,
+        NEW.job_id,
+        NEW.node_execution_id,
+        NEW.worker_registration_id,
+        NEW.worker_lease_epoch,
+        NEW.worker_id,
+        NEW.worker_started_at,
+        NEW.attested_at
+    ) IS DISTINCT FROM ROW(
+        OLD.id,
+        OLD.redis_stream,
+        OLD.consumer_group,
+        OLD.message_id,
+        OLD.payload_sha256,
+        OLD.dispatch_key,
+        OLD.job_id,
+        OLD.node_execution_id,
+        OLD.worker_registration_id,
+        OLD.worker_lease_epoch,
+        OLD.worker_id,
+        OLD.worker_started_at,
+        OLD.attested_at
+    )
+       OR OLD.ack_state = 'acknowledged'
+       OR (
+            OLD.ack_state = 'pending'
+            AND NEW.ack_state NOT IN ('authorized', 'acknowledged')
+       )
+       OR (
+            OLD.ack_state = 'authorized'
+            AND NEW.ack_state <> 'acknowledged'
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_delivery_attestation_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    IF NEW.ack_state = 'authorized'
+       AND NOT EXISTS (
+            SELECT 1
+            FROM public.worker_registrations AS registration
+            WHERE registration.id = NEW.worker_registration_id
+              AND registration.lease_epoch = NEW.worker_lease_epoch
+              AND registration.database_principal = session_user
+              AND registration.status = 'active'
+              AND registration.lease_expires_at
+                    > pg_catalog.clock_timestamp()
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_ack_authority_missing',
+            ERRCODE = 'P0001';
+    END IF;
+    IF OLD.ack_state = 'pending'
+       AND NEW.ack_state = 'acknowledged'
+       AND NOT EXISTS (
+            SELECT 1
+            FROM public.registered_worker_event_receipts AS receipt
+            WHERE receipt.source_task_attestation_id = NEW.id
+              AND receipt.application_state = 'applied'
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_ack_authority_missing',
+            ERRCODE = 'P0001';
+    END IF;
+    RETURN NEW;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE TRIGGER trg_worker_task_attestation_immutability
+BEFORE UPDATE ON public.worker_task_delivery_attestations
+FOR EACH ROW
+EXECUTE FUNCTION public.vp_enforce_worker_task_attestation_immutability()
+"""
+    )
+    op.execute(
+        "REVOKE ALL ON FUNCTION "
+        "public.vp_enforce_worker_task_attestation_immutability() FROM PUBLIC"
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_enforce_worker_event_delivery_immutability()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+    IF ROW(
+        NEW.id,
+        NEW.source_task_attestation_id,
+        NEW.receipt_id,
+        NEW.redis_stream,
+        NEW.consumer_group,
+        NEW.message_id,
+        NEW.payload_sha256,
+        NEW.resolution_state,
+        NEW.reason_code,
+        NEW.accepted_at
+    ) IS DISTINCT FROM ROW(
+        OLD.id,
+        OLD.source_task_attestation_id,
+        OLD.receipt_id,
+        OLD.redis_stream,
+        OLD.consumer_group,
+        OLD.message_id,
+        OLD.payload_sha256,
+        OLD.resolution_state,
+        OLD.reason_code,
+        OLD.accepted_at
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'event_delivery_facts_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    IF OLD.ack_state = 'acknowledged'
+       AND ROW(NEW.ack_state, NEW.acknowledged_at)
+           IS DISTINCT FROM ROW(OLD.ack_state, OLD.acknowledged_at)
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'event_delivery_ack_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    RETURN NEW;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE TRIGGER trg_worker_event_delivery_immutability
+BEFORE UPDATE ON public.registered_worker_event_deliveries
+FOR EACH ROW
+EXECUTE FUNCTION public.vp_enforce_worker_event_delivery_immutability()
+"""
+    )
+    op.execute(
+        "REVOKE ALL ON FUNCTION "
+        "public.vp_enforce_worker_event_delivery_immutability() FROM PUBLIC"
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_enforce_worker_task_dispatch_immutability()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+    IF ROW(
+        NEW.id,
+        NEW.origin_receipt_id,
+        NEW.dispatch_key,
+        NEW.job_id,
+        NEW.node_execution_id,
+        NEW.redis_stream,
+        NEW.consumer_group,
+        NEW.payload_sha256,
+        NEW.payload_json,
+        NEW.created_at
+    ) IS DISTINCT FROM ROW(
+        OLD.id,
+        OLD.origin_receipt_id,
+        OLD.dispatch_key,
+        OLD.job_id,
+        OLD.node_execution_id,
+        OLD.redis_stream,
+        OLD.consumer_group,
+        OLD.payload_sha256,
+        OLD.payload_json,
+        OLD.created_at
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_dispatch_facts_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    IF OLD.delivery_state = 'delivered'
+       AND ROW(NEW.delivery_state, NEW.redis_message_id, NEW.delivered_at)
+           IS DISTINCT FROM ROW(
+               OLD.delivery_state,
+               OLD.redis_message_id,
+               OLD.delivered_at
+           )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_dispatch_delivery_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    RETURN NEW;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE TRIGGER trg_worker_task_dispatch_immutability
+BEFORE UPDATE ON public.worker_task_dispatches
+FOR EACH ROW
+EXECUTE FUNCTION public.vp_enforce_worker_task_dispatch_immutability()
+"""
+    )
+    op.execute(
+        "REVOKE ALL ON FUNCTION "
+        "public.vp_enforce_worker_task_dispatch_immutability() FROM PUBLIC"
     )
 
 
@@ -2131,6 +2639,300 @@ $function$
     )
 
 
+def _create_task_delivery_functions() -> None:
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_attest_worker_task_delivery(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_job_id uuid,
+    p_node_execution_id uuid,
+    p_redis_stream text,
+    p_consumer_group text,
+    p_message_id text,
+    p_payload_sha256 text,
+    p_dispatch_key uuid
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration public.worker_registrations%ROWTYPE;
+    v_attestation public.worker_task_delivery_attestations%ROWTYPE;
+    v_grant_stream text;
+    v_grant_group text;
+    v_now timestamptz;
+BEGIN
+    IF p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+       OR p_worker_id IS NULL
+       OR p_worker_started_at IS NULL
+       OR p_job_id IS NULL
+       OR p_node_execution_id IS NULL
+       OR p_redis_stream IS NULL
+       OR p_consumer_group IS NULL
+       OR p_message_id IS NULL
+       OR p_payload_sha256 !~ '^[0-9a-f]{{64}}$'
+       OR p_dispatch_key IS NULL
+       OR length(trim(p_worker_id)) = 0
+       OR length(trim(p_redis_stream)) = 0
+       OR length(trim(p_consumer_group)) = 0
+       OR length(trim(p_message_id)) = 0
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    v_now := pg_catalog.clock_timestamp();
+
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id;
+
+    IF NOT FOUND
+       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_registration.status IS DISTINCT FROM 'active'
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.database_principal IS DISTINCT FROM v_principal THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.lease_expires_at <= v_now THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_expired', ERRCODE = 'P0001';
+    END IF;
+
+    SELECT grant_row.redis_stream, grant_row.redis_group
+    INTO v_grant_stream, v_grant_group
+    FROM public.worker_admission_grants AS grant_row
+    WHERE grant_row.id = v_registration.grant_id;
+    IF NOT FOUND
+       OR v_grant_stream IS DISTINCT FROM p_redis_stream
+       OR v_grant_group IS DISTINCT FROM p_consumer_group
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_dispatch_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+
+    PERFORM 1
+    FROM public.node_executions AS node
+    WHERE node.id = p_node_execution_id
+      AND node.job_id = p_job_id
+      AND node.status::text = 'RUNNING'
+      AND node.worker_id = p_worker_id
+      AND node.started_at = p_worker_started_at
+      AND node.worker_registration_id = p_registration_id
+      AND node.worker_lease_epoch = p_lease_epoch
+    FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'node_claim_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+
+    PERFORM 1
+    FROM public.worker_task_dispatches AS dispatch
+    WHERE dispatch.dispatch_key = p_dispatch_key
+      AND dispatch.job_id = p_job_id
+      AND dispatch.node_execution_id = p_node_execution_id
+      AND dispatch.redis_stream = p_redis_stream
+      AND dispatch.consumer_group = p_consumer_group
+      AND dispatch.payload_sha256 = p_payload_sha256
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.redis_message_id = p_message_id
+    FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_dispatch_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+
+    INSERT INTO public.worker_task_delivery_attestations (
+        redis_stream,
+        consumer_group,
+        message_id,
+        payload_sha256,
+        dispatch_key,
+        job_id,
+        node_execution_id,
+        worker_registration_id,
+        worker_lease_epoch,
+        worker_id,
+        worker_started_at,
+        attested_at
+    ) VALUES (
+        p_redis_stream,
+        p_consumer_group,
+        p_message_id,
+        p_payload_sha256,
+        p_dispatch_key,
+        p_job_id,
+        p_node_execution_id,
+        p_registration_id,
+        p_lease_epoch,
+        p_worker_id,
+        p_worker_started_at,
+        v_now
+    )
+    ON CONFLICT DO NOTHING;
+
+    SELECT attestation.*
+    INTO v_attestation
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.redis_stream = p_redis_stream
+      AND attestation.consumer_group = p_consumer_group
+      AND attestation.message_id = p_message_id
+    FOR SHARE;
+
+    IF NOT FOUND
+       OR v_attestation.payload_sha256 IS DISTINCT FROM p_payload_sha256
+       OR v_attestation.dispatch_key IS DISTINCT FROM p_dispatch_key
+       OR v_attestation.job_id IS DISTINCT FROM p_job_id
+       OR v_attestation.node_execution_id
+            IS DISTINCT FROM p_node_execution_id
+       OR v_attestation.worker_registration_id
+            IS DISTINCT FROM p_registration_id
+       OR v_attestation.worker_lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_attestation.worker_id IS DISTINCT FROM p_worker_id
+       OR v_attestation.worker_started_at
+            IS DISTINCT FROM p_worker_started_at
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_delivery_attestation_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    RETURN v_attestation.id;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_observe_worker_task_delivery(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_job_id uuid,
+    p_node_execution_id uuid,
+    p_redis_stream text,
+    p_consumer_group text,
+    p_message_id text,
+    p_payload_sha256 text,
+    p_dispatch_key uuid
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_registration public.worker_registrations%ROWTYPE;
+    v_attestation_id uuid;
+    v_grant_stream text;
+    v_grant_group text;
+    v_now timestamptz;
+BEGIN
+    IF p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+       OR p_worker_id IS NULL
+       OR p_worker_started_at IS NULL
+       OR p_job_id IS NULL
+       OR p_node_execution_id IS NULL
+       OR p_redis_stream IS NULL
+       OR p_consumer_group IS NULL
+       OR p_message_id IS NULL
+       OR p_payload_sha256 !~ '^[0-9a-f]{64}$'
+       OR p_dispatch_key IS NULL
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    v_now := pg_catalog.clock_timestamp();
+
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id;
+    IF NOT FOUND
+       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_registration.status IS DISTINCT FROM 'active'
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.lease_expires_at <= v_now THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_expired', ERRCODE = 'P0001';
+    END IF;
+
+    SELECT grant_row.redis_stream, grant_row.redis_group
+    INTO v_grant_stream, v_grant_group
+    FROM public.worker_admission_grants AS grant_row
+    WHERE grant_row.id = v_registration.grant_id;
+    IF NOT FOUND
+       OR v_grant_stream IS DISTINCT FROM p_redis_stream
+       OR v_grant_group IS DISTINCT FROM p_consumer_group
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_dispatch_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+
+    SELECT attestation.id
+    INTO v_attestation_id
+    FROM public.worker_task_delivery_attestations AS attestation
+    JOIN public.worker_task_dispatches AS dispatch
+      ON dispatch.dispatch_key = attestation.dispatch_key
+    WHERE attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at
+      AND attestation.job_id = p_job_id
+      AND attestation.node_execution_id = p_node_execution_id
+      AND attestation.redis_stream = p_redis_stream
+      AND attestation.consumer_group = p_consumer_group
+      AND attestation.message_id = p_message_id
+      AND attestation.payload_sha256 = p_payload_sha256
+      AND attestation.dispatch_key = p_dispatch_key
+      AND dispatch.job_id = p_job_id
+      AND dispatch.node_execution_id = p_node_execution_id
+      AND dispatch.redis_stream = p_redis_stream
+      AND dispatch.consumer_group = p_consumer_group
+      AND dispatch.payload_sha256 = p_payload_sha256
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.redis_message_id = p_message_id
+    FOR SHARE OF attestation, dispatch;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_delivery_attestation_missing',
+            ERRCODE = 'P0001';
+    END IF;
+    RETURN v_attestation_id;
+END;
+$function$
+"""
+    )
+
+
 def _create_margin_function() -> None:
     op.execute(
         f"""
@@ -2210,7 +3012,9 @@ CREATE FUNCTION public.vp_require_worker_task_ack_receipt(
     p_worker_started_at timestamptz,
     p_redis_stream text,
     p_consumer_group text,
-    p_message_id text
+    p_message_id text,
+    p_payload_sha256 text,
+    p_dispatch_key uuid
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -2229,6 +3033,8 @@ BEGIN
        OR p_redis_stream IS NULL
        OR p_consumer_group IS NULL
        OR p_message_id IS NULL
+       OR p_payload_sha256 !~ '^[0-9a-f]{{64}}$'
+       OR p_dispatch_key IS NULL
        OR length(trim(p_worker_id)) = 0
        OR length(trim(p_redis_stream)) = 0
        OR length(trim(p_consumer_group)) = 0
@@ -2263,15 +3069,25 @@ BEGIN
     END IF;
     IF NOT EXISTS (
         SELECT 1
-        FROM public.registered_worker_event_receipts AS receipt
-        WHERE receipt.worker_registration_id = p_registration_id
-          AND receipt.worker_lease_epoch = p_lease_epoch
-          AND receipt.worker_id = p_worker_id
-          AND receipt.worker_started_at = p_worker_started_at
-          AND receipt.source_task_stream = p_redis_stream
-          AND receipt.source_task_group = p_consumer_group
-          AND receipt.source_task_message_id = p_message_id
-          AND receipt.application_state = 'applied'
+        FROM public.worker_task_delivery_attestations AS attestation
+        WHERE attestation.worker_registration_id = p_registration_id
+          AND attestation.worker_lease_epoch = p_lease_epoch
+          AND attestation.worker_id = p_worker_id
+          AND attestation.worker_started_at = p_worker_started_at
+          AND attestation.redis_stream = p_redis_stream
+          AND attestation.consumer_group = p_consumer_group
+          AND attestation.message_id = p_message_id
+          AND attestation.payload_sha256 = p_payload_sha256
+          AND attestation.dispatch_key = p_dispatch_key
+          AND (
+              attestation.ack_state = 'authorized'
+              OR EXISTS (
+                  SELECT 1
+                  FROM public.registered_worker_event_receipts AS receipt
+                  WHERE receipt.source_task_attestation_id = attestation.id
+                    AND receipt.application_state = 'applied'
+              )
+          )
     )
     THEN
         RAISE EXCEPTION USING
@@ -2282,9 +3098,299 @@ END;
 $function$
 """
     )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_authorize_worker_task_ack(
+    p_attestation_id uuid,
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration public.worker_registrations%ROWTYPE;
+    v_now timestamptz;
+BEGIN
+    IF p_attestation_id IS NULL
+       OR p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+       OR p_worker_id IS NULL
+       OR p_worker_started_at IS NULL
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    v_now := pg_catalog.clock_timestamp();
+
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id;
+    IF NOT FOUND
+       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_registration.status IS DISTINCT FROM 'active'
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.database_principal IS DISTINCT FROM v_principal THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.lease_expires_at <= v_now THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_expired', ERRCODE = 'P0001';
+    END IF;
+
+    UPDATE public.worker_task_delivery_attestations AS attestation
+    SET ack_state = 'authorized'
+    WHERE attestation.id = p_attestation_id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at
+      AND attestation.ack_state = 'pending';
+    IF NOT FOUND AND NOT EXISTS (
+        SELECT 1
+        FROM public.worker_task_delivery_attestations AS attestation
+        WHERE attestation.id = p_attestation_id
+          AND attestation.worker_registration_id = p_registration_id
+          AND attestation.worker_lease_epoch = p_lease_epoch
+          AND attestation.worker_id = p_worker_id
+          AND attestation.worker_started_at = p_worker_started_at
+          AND attestation.ack_state IN ('authorized', 'acknowledged')
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_delivery_attestation_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_acknowledge_worker_task_delivery(
+    p_attestation_id uuid,
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_redis_stream text,
+    p_consumer_group text,
+    p_message_id text,
+    p_payload_sha256 text,
+    p_dispatch_key uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration public.worker_registrations%ROWTYPE;
+    v_attestation public.worker_task_delivery_attestations%ROWTYPE;
+    v_now timestamptz;
+BEGIN
+    IF p_attestation_id IS NULL
+       OR p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+       OR p_worker_id IS NULL
+       OR p_worker_started_at IS NULL
+       OR p_redis_stream IS NULL
+       OR p_consumer_group IS NULL
+       OR p_message_id IS NULL
+       OR p_payload_sha256 !~ '^[0-9a-f]{{64}}$'
+       OR p_dispatch_key IS NULL
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    v_now := pg_catalog.clock_timestamp();
+
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id;
+    IF NOT FOUND
+       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.database_principal IS DISTINCT FROM v_principal THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+
+    SELECT attestation.*
+    INTO v_attestation
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.id = p_attestation_id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at
+      AND attestation.redis_stream = p_redis_stream
+      AND attestation.consumer_group = p_consumer_group
+      AND attestation.message_id = p_message_id
+      AND attestation.payload_sha256 = p_payload_sha256
+      AND attestation.dispatch_key = p_dispatch_key
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_delivery_attestation_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    IF NOT (
+        v_attestation.ack_state = 'authorized'
+        OR EXISTS (
+            SELECT 1
+            FROM public.registered_worker_event_receipts AS receipt
+            WHERE receipt.source_task_attestation_id = p_attestation_id
+              AND receipt.application_state = 'applied'
+        )
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_ack_authority_missing',
+            ERRCODE = 'P0001';
+    END IF;
+
+    UPDATE public.worker_task_delivery_attestations
+    SET ack_state = 'acknowledged',
+        acknowledged_at = v_now
+    WHERE id = p_attestation_id
+      AND ack_state IN ('pending', 'authorized');
+END;
+$function$
+"""
+    )
+
+
+def _create_event_authority_cleanup_function() -> None:
+    op.execute(
+        """
+CREATE FUNCTION public.vp_resolve_worker_event_authority_for_job_deletion(
+    p_job_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+    IF p_job_id IS NULL THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+
+    PERFORM 1
+    FROM public.jobs AS job
+    WHERE job.id = p_job_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM public.jobs AS job
+        WHERE job.id = p_job_id
+          AND job.status::text NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_event_authority_unresolved',
+            ERRCODE = 'P0001';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM public.worker_task_delivery_attestations AS attestation
+        WHERE attestation.job_id = p_job_id
+          AND attestation.ack_state <> 'acknowledged'
+    )
+       OR EXISTS (
+        SELECT 1
+        FROM public.registered_worker_event_receipts AS receipt
+        WHERE receipt.job_id = p_job_id
+          AND (
+              receipt.application_state <> 'applied'
+              OR receipt.ack_state <> 'acknowledged'
+          )
+    )
+       OR EXISTS (
+        SELECT 1
+        FROM public.registered_worker_event_deliveries AS delivery
+        JOIN public.worker_task_delivery_attestations AS attestation
+          ON attestation.id = delivery.source_task_attestation_id
+        WHERE attestation.job_id = p_job_id
+          AND delivery.ack_state <> 'acknowledged'
+    )
+       OR EXISTS (
+        SELECT 1
+        FROM public.worker_task_dispatches AS dispatch
+        WHERE dispatch.job_id = p_job_id
+          AND dispatch.delivery_state <> 'delivered'
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_event_authority_unresolved',
+            ERRCODE = 'P0001';
+    END IF;
+
+    DELETE FROM public.registered_worker_event_deliveries AS delivery
+    USING public.worker_task_delivery_attestations AS attestation
+    WHERE delivery.source_task_attestation_id = attestation.id
+      AND attestation.job_id = p_job_id;
+
+    DELETE FROM public.worker_task_dispatches
+    WHERE job_id = p_job_id;
+
+    DELETE FROM public.registered_worker_event_receipts
+    WHERE job_id = p_job_id;
+
+    DELETE FROM public.worker_task_delivery_attestations
+    WHERE job_id = p_job_id;
+END;
+$function$
+"""
+    )
 
 
 def downgrade() -> None:
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_worker_task_dispatch_immutability "
+        "ON public.worker_task_dispatches"
+    )
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_worker_event_delivery_immutability "
+        "ON public.registered_worker_event_deliveries"
+    )
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_worker_task_attestation_immutability "
+        "ON public.worker_task_delivery_attestations"
+    )
     op.execute(
         "DROP TRIGGER IF EXISTS trg_worker_event_receipt_immutability "
         "ON public.registered_worker_event_receipts"
@@ -2293,9 +3399,20 @@ def downgrade() -> None:
         "DROP FUNCTION IF EXISTS "
         "public.vp_enforce_worker_event_receipt_immutability()"
     )
+    for trigger_function in (
+        "public.vp_enforce_worker_task_dispatch_immutability()",
+        "public.vp_enforce_worker_event_delivery_immutability()",
+        "public.vp_enforce_worker_task_attestation_immutability()",
+    ):
+        op.execute(f"DROP FUNCTION IF EXISTS {trigger_function}")
     for signature in (
+        CLEANUP_EVENT_AUTHORITY_SIGNATURE,
+        TASK_ACK_AUTHORIZE_SIGNATURE,
+        TASK_ACKNOWLEDGED_SIGNATURE,
         TASK_ACK_SIGNATURE,
         MARGIN_SIGNATURE,
+        OBSERVE_TASK_SIGNATURE,
+        ATTEST_TASK_SIGNATURE,
         OBSERVER_SIGNATURE,
         REQUIRE_SIGNATURE,
         RELEASE_SIGNATURE,
@@ -2311,10 +3428,15 @@ def downgrade() -> None:
         op.execute(f"DROP FUNCTION IF EXISTS {signature}")
 
     op.drop_index(
-        "ix_worker_event_dispatches_receipt_id",
-        table_name="worker_event_dispatches",
+        "ix_registered_worker_event_deliveries_receipt_id",
+        table_name="registered_worker_event_deliveries",
     )
-    op.drop_table("worker_event_dispatches")
+    op.drop_table("registered_worker_event_deliveries")
+    op.drop_constraint(
+        "fk_worker_task_dispatches_origin_receipt_id",
+        "worker_task_dispatches",
+        type_="foreignkey",
+    )
     op.drop_index(
         "ix_registered_worker_event_receipts_source_task",
         table_name="registered_worker_event_receipts",
@@ -2328,6 +3450,20 @@ def downgrade() -> None:
         table_name="registered_worker_event_receipts",
     )
     op.drop_table("registered_worker_event_receipts")
+    op.drop_index(
+        "ix_worker_task_delivery_attestations_registration_id",
+        table_name="worker_task_delivery_attestations",
+    )
+    op.drop_table("worker_task_delivery_attestations")
+    op.drop_index(
+        "ix_worker_task_dispatches_pending",
+        table_name="worker_task_dispatches",
+    )
+    op.drop_index(
+        "ix_worker_task_dispatches_origin_receipt_id",
+        table_name="worker_task_dispatches",
+    )
+    op.drop_table("worker_task_dispatches")
 
     op.drop_index(
         "ix_node_executions_worker_registration_id",

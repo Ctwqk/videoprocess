@@ -17,14 +17,17 @@ from app.models.artifact import (
 )
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.registered_worker_event_receipt import (
+    RegisteredWorkerEventDelivery,
     RegisteredWorkerEventReceipt,
-    WorkerEventDispatch,
+    WorkerTaskDeliveryAttestation,
+    WorkerTaskDispatch,
 )
 from app.orchestrator.engine import JobEngine
 from app.services.job_execution_authority import NodeExecutionClaim
 from app.services.registered_worker_event_receipt import (
     RegisteredWorkerEventError,
     RegisteredWorkerEventReceiptService,
+    canonical_redis_payload_sha256,
     parse_registered_worker_event,
 )
 
@@ -41,8 +44,10 @@ async def registered_engine_factory(tmp_path):
             NodeExecution.__table__,
             Artifact.__table__,
             IntermediateArtifactCache.__table__,
+            WorkerTaskDeliveryAttestation.__table__,
             RegisteredWorkerEventReceipt.__table__,
-            WorkerEventDispatch.__table__,
+            RegisteredWorkerEventDelivery.__table__,
+            WorkerTaskDispatch.__table__,
         ):
             await connection.run_sync(table.create)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -185,6 +190,14 @@ async def _seed(factory):
         "task_stream": "vp:tasks:vision",
         "task_group": "vision-workers",
         "task_message_id": "1710000000000-4",
+        "task_payload_sha256": canonical_redis_payload_sha256(
+            {
+                "job_id": str(job_id),
+                "node_execution_id": str(trim.id),
+                "dispatch_key": str(uuid.uuid4()),
+            }
+        ),
+        "task_dispatch_key": str(uuid.uuid4()),
     }
     event = parse_registered_worker_event(
         redis_stream="vp:events",
@@ -265,14 +278,15 @@ async def test_receipt_application_atomically_writes_completion_cache_and_outbox
         assert locked_job_id == event.job_id
         return await _lock_seeded_authority(db, event)
 
-    async def observe(db, claim):
+    async def observe(db, accepted_event):
         assert db.in_transaction()
+        return uuid.uuid4()
 
     job_engine = JobEngine()
     service = RegisteredWorkerEventReceiptService(
         registered_engine_factory,
         authority_locker=lock_authority,
-        lease_observer=observe,
+        delivery_observer=observe,
     )
     receipt_id = await service.accept_and_apply(
         event,
@@ -284,7 +298,7 @@ async def test_receipt_application_atomically_writes_completion_cache_and_outbox
         encode = await db.get(NodeExecution, encode_id)
         receipt = await db.get(RegisteredWorkerEventReceipt, receipt_id)
         dispatches = list(
-            (await db.execute(select(WorkerEventDispatch))).scalars()
+            (await db.execute(select(WorkerTaskDispatch))).scalars()
         )
         cache_entries = list(
             (await db.execute(select(IntermediateArtifactCache))).scalars()
@@ -295,7 +309,7 @@ async def test_receipt_application_atomically_writes_completion_cache_and_outbox
     assert receipt is not None and receipt.application_state == "applied"
     assert len(cache_entries) == 1
     assert len(dispatches) == 1
-    assert dispatches[0].receipt_id == receipt_id
+    assert dispatches[0].origin_receipt_id == receipt_id
     assert dispatches[0].node_execution_id == encode_id
     assert dispatches[0].delivery_state == "pending"
 
@@ -311,8 +325,8 @@ async def test_receipt_application_rollback_leaves_no_completion_derived_write(
     async def lock_authority(db, locked_job_id, **kwargs):
         return await _lock_seeded_authority(db, event)
 
-    async def observe(db, claim):
-        return None
+    async def observe(db, accepted_event):
+        return uuid.uuid4()
 
     engine = JobEngine()
 
@@ -327,7 +341,7 @@ async def test_receipt_application_rollback_leaves_no_completion_derived_write(
     service = RegisteredWorkerEventReceiptService(
         registered_engine_factory,
         authority_locker=lock_authority,
-        lease_observer=observe,
+        delivery_observer=observe,
     )
     with pytest.raises(RuntimeError, match="before receipt commit"):
         await service.accept_and_apply(event, apply_then_fail)
@@ -343,7 +357,7 @@ async def test_receipt_application_rollback_leaves_no_completion_derived_write(
             ).scalars()
         )
         dispatches = list(
-            (await db.execute(select(WorkerEventDispatch))).scalars()
+            (await db.execute(select(WorkerTaskDispatch))).scalars()
         )
         cache_entries = list(
             (await db.execute(select(IntermediateArtifactCache))).scalars()
@@ -353,3 +367,66 @@ async def test_receipt_application_rollback_leaves_no_completion_derived_write(
     assert receipts == []
     assert dispatches == []
     assert cache_entries == []
+
+
+@pytest.mark.asyncio
+async def test_receipt_cache_closure_reaches_leaf_and_finalizes_same_transaction(
+    registered_engine_factory,
+) -> None:
+    trim_id, encode_id, output_artifact_id, event = await _seed(
+        registered_engine_factory
+    )
+    cached_output = Artifact(
+        id=uuid.uuid4(),
+        job_id=event.job_id,
+        node_execution_id=encode_id,
+        kind=ArtifactKind.INTERMEDIATE,
+        filename="encode-cached.mp4",
+        storage_backend="local",
+        storage_path="/tmp/encode-cached.mp4",
+    )
+    async with registered_engine_factory() as db:
+        db.add(cached_output)
+        await db.flush()
+        input_artifact = await db.get(Artifact, output_artifact_id)
+        assert input_artifact is not None
+        await JobEngine().artifact_cache.store(
+            db,
+            node_type="transcode",
+            node_config={"format": "mp4"},
+            input_artifacts={"input": input_artifact},
+            output_artifact=cached_output,
+            node_id="encode",
+            job_id=event.job_id,
+        )
+        await db.commit()
+
+    async def lock_authority(db, locked_job_id, **kwargs):
+        return await _lock_seeded_authority(db, event)
+
+    async def observe(db, accepted_event):
+        return uuid.uuid4()
+
+    service = RegisteredWorkerEventReceiptService(
+        registered_engine_factory,
+        authority_locker=lock_authority,
+        delivery_observer=observe,
+    )
+    await service.accept_and_apply(
+        event,
+        JobEngine().apply_registered_worker_event,
+    )
+
+    async with registered_engine_factory() as db:
+        job = await db.get(Job, event.job_id)
+        encode = await db.get(NodeExecution, encode_id)
+        final_artifact = await db.get(Artifact, cached_output.id)
+        dispatches = list(
+            (await db.execute(select(WorkerTaskDispatch))).scalars()
+        )
+    assert job is not None and job.status == JobStatus.SUCCEEDED
+    assert encode is not None and encode.status == NodeStatus.SUCCEEDED
+    assert encode.output_artifact_id == cached_output.id
+    assert final_artifact is not None
+    assert final_artifact.kind == ArtifactKind.FINAL
+    assert dispatches == []
