@@ -17,6 +17,37 @@
 - Do not replay or acknowledge unverifiable legacy events.
 - Do not modify or stage `vp_autonomous_production_feedback_loop_plan.md`.
 
+## Review Hardening Amendment
+
+Independent review found that the first implementation could leave persistent
+legacy Redis consumers, rely only on a mutable GPU label for placement, and
+rerun the migration gate during every future deployment. The implementation
+must therefore also:
+
+- gate on `CLOSED`/idle only when `vp_vision_worker_1` exists, the managed
+  service is absent, or Redis consumer convergence is incomplete;
+- constrain GPU and vision workers with both `node.labels.vp.gpu==true` and
+  `node.hostname==ccttww-lap`;
+- verify the vision task actually runs exactly once on `ccttww-lap`;
+- converge the vision environment, networks, secrets, configs, and mounts to
+  the explicit allowlist;
+- remove the legacy container by immutable ID after checking exact name,
+  running state, project, and service labels;
+- after retirement, atomically require zero pending entries, delete every
+  non-managed vision consumer record, and verify only the managed consumer
+  remains;
+- use a read-only Redis convergence audit so an interrupted migration remains
+  a migration on its next automatic retry;
+- require all present Python worker services to use one matching
+  `vp-ffmpeg-worker-python:deploy-<12 hex>` image before the soak guard executes
+  a service image with database access; mismatch is a hard configuration error;
+- reject any runtime/manager override away from `10.0.0.127`, `colima-127`, and
+  `ccttww-lap`, and place every runtime service with both its runtime label and
+  `node.hostname==colima-127`;
+- run the same topology gate before every application, feature-aggregator, and
+  independent PDS build or deploy entry point can perform a remote build or
+  service mutation.
+
 ---
 
 ### Task 1: Managed Vision Service Deployment
@@ -85,11 +116,14 @@ one replica, and `vp-vision-worker-scratch:/data/storage`.
 Implement `vp_retire_legacy_vision_worker()` so it:
 
 1. Returns success when `vp_vision_worker_1` is absent.
-2. Reads both Compose labels from `docker inspect`.
-3. Requires project `videoprocess` and service `vision-worker`.
-4. Calls `docker rm -f vp_vision_worker_1` only after the managed service is
-   verified running.
-5. Returns failure on missing or mismatched labels.
+2. Reads immutable ID, exact name, running state, and both Compose labels from
+   `docker inspect`.
+3. Requires name `/vp_vision_worker_1`, running `true`, project
+   `videoprocess`, and service `vision-worker`.
+4. Calls `docker rm -f <verified immutable ID>` only after the managed service
+   is verified running exactly once on `ccttww-lap`.
+5. Returns failure on missing or mismatched identity fields.
+6. Runs zero-pending vision consumer reconciliation only for the migration.
 
 - [ ] **Step 4: Run the deployment contract and verify GREEN**
 
@@ -245,7 +279,8 @@ vp_vision_worker_1      absent
 
 Confirm `vp:tasks:vision` has one active
 `vision-worker@150-vision:<pid>` consumer, no stale consumers, and zero pending
-entries after the failed-canary cleanup.
+entries after the failed-canary cleanup. Confirm later deployments skip the
+migration-only CLOSED gate after the legacy container is absent.
 
 - [ ] **Step 5: Preserve the authorization boundary**
 

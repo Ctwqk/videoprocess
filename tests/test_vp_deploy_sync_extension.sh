@@ -140,6 +140,9 @@ GPU_SERVICE_EXISTS=true
 VISION_SERVICE_EXISTS=true
 PUBLISHER_SERVICE_EXISTS=true
 LEGACY_VISION_CONTAINER_EXISTS=true
+LEGACY_VISION_CONTAINER_ID=374cabc27904a788beb221571438ed75ba6c6bc716b7c94849e0b7ca055d762e
+LEGACY_VISION_CONTAINER_NAME=/vp_vision_worker_1
+LEGACY_VISION_CONTAINER_RUNNING=true
 LEGACY_VISION_PROJECT=videoprocess
 LEGACY_VISION_SERVICE=vision-worker
 CONSTRAINT_MODE=legacy
@@ -163,6 +166,9 @@ FAIL_MANAGED_CRON_PRINTF=false
 FAIL_SOAK_CLEANUP=false
 MIGRATION_GATE_MODE=success
 VISION_CUTOVER_GATE_MODE=success
+VISION_CONSUMER_CUTOVER_MODE=success
+VISION_CONSUMER_AUDIT_MODE=converged
+VISION_TASK_NODE=ccttww-lap
 
 printf() {
   if [[ "$FAIL_MANAGED_CRON_PRINTF" == "true" \
@@ -225,6 +231,16 @@ docker() {
     [[ "$VISION_CUTOVER_GATE_MODE" == "success" ]]
     return
   fi
+  if [[ "${1:-}" == "run" \
+    && "$*" == *"python -m app.services.vision_consumer_cutover --check-only"* ]]; then
+    [[ "$VISION_CONSUMER_AUDIT_MODE" == "converged" ]]
+    return
+  fi
+  if [[ "${1:-}" == "run" \
+    && "$*" == *"python -m app.services.vision_consumer_cutover"* ]]; then
+    [[ "$VISION_CONSUMER_CUTOVER_MODE" == "success" ]]
+    return
+  fi
   if [[ "${1:-}" == "run" && "$GPU_PREFLIGHT_SUCCEEDS" != "true" ]]; then
     return 1
   fi
@@ -277,6 +293,11 @@ docker() {
       PUBLISHER_REPLICAS=1
     fi
   fi
+  if [[ "${1:-} ${2:-}" == "service ps" \
+    && "${3:-}" == "vp-vision-worker-swarm" ]]; then
+    printf '%s|Running 2 seconds ago\n' "$VISION_TASK_NODE"
+    return 0
+  fi
   if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
     if [[ "$FAIL_NETWORK_INSPECT" == "true" ]]; then
       return 1
@@ -288,7 +309,12 @@ docker() {
     if [[ "$LEGACY_VISION_CONTAINER_EXISTS" != "true" ]]; then
       return 1
     fi
-    printf '%s|%s\n' "$LEGACY_VISION_PROJECT" "$LEGACY_VISION_SERVICE"
+    printf '%s|%s|%s|%s|%s\n' \
+      "$LEGACY_VISION_CONTAINER_ID" \
+      "$LEGACY_VISION_CONTAINER_NAME" \
+      "$LEGACY_VISION_CONTAINER_RUNNING" \
+      "$LEGACY_VISION_PROJECT" \
+      "$LEGACY_VISION_SERVICE"
     return 0
   fi
   if [[ "${1:-} ${2:-}" == "container ls" && "$*" == *"vp_vision_worker_1"* ]]; then
@@ -297,7 +323,8 @@ docker() {
     fi
     return 0
   fi
-  if [[ "${1:-} ${2:-} ${3:-}" == "rm -f vp_vision_worker_1" ]]; then
+  if [[ "${1:-} ${2:-}" == "rm -f" \
+    && "${3:-}" == "$LEGACY_VISION_CONTAINER_ID" ]]; then
     LEGACY_VISION_CONTAINER_EXISTS=false
     return 0
   fi
@@ -356,6 +383,11 @@ docker() {
           esac
         elif [[ "$CONSTRAINT_MODE" == "runtime" ]]; then
           echo 'node.labels.vp.runtime==true'
+          echo 'node.hostname==colima-127'
+        elif [[ "$CONSTRAINT_MODE" == "stale-runtime" ]]; then
+          echo 'node.labels.vp.runtime==true'
+          echo 'node.hostname==CASPERs-Mac-mini'
+          echo 'node.labels.vp.legacy==true'
         else
           echo 'node.labels.role==app'
         fi
@@ -389,6 +421,9 @@ docker() {
         elif [[ "$service" == "vp-vision-worker-swarm" ]]; then
           echo 'WORKER_TYPE=legacy'
           echo 'WORKER_HOST=legacy'
+          echo 'HF_TOKEN=legacy-token'
+          echo 'PUBLIC_PUBLISH_ENABLED=true'
+          echo 'YOUTUBE_MANAGER_URL=http://legacy-youtube-manager'
         elif [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
           echo 'WORKER_HOST=legacy'
           if [[ "$PUBLISHER_ENV_MODE" == "credentials" ]]; then
@@ -403,12 +438,16 @@ docker() {
         fi
         ;;
       *ContainerSpec.Secrets*)
-        if [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
+        if [[ "$service" == "vp-vision-worker-swarm" ]]; then
+          echo vision-legacy-secret
+        elif [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
           echo publisher-credential-reference
         fi
         ;;
       *ContainerSpec.Configs*)
-        if [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
+        if [[ "$service" == "vp-vision-worker-swarm" ]]; then
+          echo vision-legacy-config
+        elif [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
           echo publisher-config-reference
         fi
         ;;
@@ -500,6 +539,48 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
   exit 1
 fi
 source "$EXTENSION"
+
+VP_RUNTIME_HOST=10.0.0.126
+if vp_validate_deploy_config >/dev/null 2>&1; then
+  echo 'FAIL: host 126 was accepted as the VP runtime host' >&2
+  exit 1
+fi
+VP_RUNTIME_HOST=10.0.0.127
+VP_RUNTIME_NODE=colima-swarmbridged
+if vp_validate_deploy_config >/dev/null 2>&1; then
+  echo 'FAIL: the 126 Swarm node was accepted as the VP runtime node' >&2
+  exit 1
+fi
+VP_RUNTIME_NODE=colima-127
+VP_MANAGER_NODE=CASPERs-Mac-mini
+if vp_validate_deploy_config >/dev/null 2>&1; then
+  echo 'FAIL: host 126 was accepted as the VP manager node' >&2
+  exit 1
+fi
+VP_MANAGER_NODE=ccttww-lap
+
+: >"$CALLS"
+VP_RUNTIME_HOST=10.0.0.126
+if build_pds_images "$TEST_COMMIT" >/dev/null 2>&1; then
+  echo 'FAIL: independent PDS build accepted host 126 topology' >&2
+  exit 1
+fi
+if grep -Fq 'build|10.0.0.126|' "$CALLS"; then
+  echo 'FAIL: independent PDS build used host 126' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+if deploy_pds_services vp-pds:forbidden-topology-test >/dev/null 2>&1; then
+  echo 'FAIL: independent PDS deployment accepted host 126 topology' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service update' "$CALLS"; then
+  echo 'FAIL: independent PDS deployment mutated services with host 126 configured' >&2
+  exit 1
+fi
+VP_RUNTIME_HOST=10.0.0.127
+
 images="$(build_vp_app_images "$TEST_COMMIT")"
 if ! deploy_output="$(deploy_vp_app_services $images)"; then
   echo 'FAIL: deploy_vp_app_services returned non-zero' >&2
@@ -590,7 +671,7 @@ if [[ -z "$python_worker_update_line" \
 fi
 
 legacy_vision_remove_line="$(
-  grep -nF 'docker|rm -f vp_vision_worker_1' "$CALLS" \
+  grep -nF "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS" \
     | head -1 \
     | cut -d: -f1
 )"
@@ -599,10 +680,18 @@ vision_running_line="$(
     | head -1 \
     | cut -d: -f1
 )"
+vision_consumer_cutover_line="$(
+  grep -nF 'python -m app.services.vision_consumer_cutover' "$CALLS" \
+    | head -1 \
+    | cut -d: -f1 \
+    || true
+)"
 if [[ -z "$legacy_vision_remove_line" \
   || -z "$vision_running_line" \
-  || "$vision_running_line" -ge "$legacy_vision_remove_line" ]]; then
-  echo 'FAIL: the exact legacy vision container must be removed after managed health' >&2
+  || -z "$vision_consumer_cutover_line" \
+  || "$vision_running_line" -ge "$legacy_vision_remove_line" \
+  || "$legacy_vision_remove_line" -ge "$vision_consumer_cutover_line" ]]; then
+  echo 'FAIL: managed health, legacy retirement, and consumer reconciliation order is unsafe' >&2
   exit 1
 fi
 
@@ -615,7 +704,7 @@ if vp_retire_legacy_vision_worker >/dev/null 2>&1; then
   echo 'FAIL: mismatched legacy vision project was removed' >&2
   exit 1
 fi
-if grep -Fq 'docker|rm -f vp_vision_worker_1' "$CALLS"; then
+if grep -Fq 'docker|rm -f ' "$CALLS"; then
   echo 'FAIL: mismatched legacy vision identity reached docker rm' >&2
   exit 1
 fi
@@ -627,7 +716,7 @@ if vp_retire_legacy_vision_worker >/dev/null 2>&1; then
   echo 'FAIL: mismatched legacy vision service was removed' >&2
   exit 1
 fi
-if grep -Fq 'docker|rm -f vp_vision_worker_1' "$CALLS"; then
+if grep -Fq 'docker|rm -f ' "$CALLS"; then
   echo 'FAIL: mismatched legacy vision service reached docker rm' >&2
   exit 1
 fi
@@ -637,10 +726,35 @@ LEGACY_VISION_CONTAINER_EXISTS=false
 LEGACY_VISION_PROJECT=videoprocess
 LEGACY_VISION_SERVICE=vision-worker
 vp_retire_legacy_vision_worker >/dev/null
-if grep -Fq 'docker|rm -f vp_vision_worker_1' "$CALLS"; then
+if grep -Fq 'docker|rm -f ' "$CALLS"; then
   echo 'FAIL: absent legacy vision container reached docker rm' >&2
   exit 1
 fi
+
+: >"$CALLS"
+LEGACY_VISION_CONTAINER_EXISTS=true
+LEGACY_VISION_CONTAINER_RUNNING=false
+if vp_retire_legacy_vision_worker >/dev/null 2>&1; then
+  echo 'FAIL: stopped legacy vision container was removed' >&2
+  exit 1
+fi
+if grep -Fq 'docker|rm -f ' "$CALLS"; then
+  echo 'FAIL: stopped legacy vision container reached docker rm' >&2
+  exit 1
+fi
+LEGACY_VISION_CONTAINER_RUNNING=true
+
+: >"$CALLS"
+LEGACY_VISION_CONTAINER_NAME=/replacement_container
+if vp_retire_legacy_vision_worker >/dev/null 2>&1; then
+  echo 'FAIL: renamed legacy vision container was removed' >&2
+  exit 1
+fi
+if grep -Fq 'docker|rm -f ' "$CALLS"; then
+  echo 'FAIL: renamed legacy vision container reached docker rm' >&2
+  exit 1
+fi
+LEGACY_VISION_CONTAINER_NAME=/vp_vision_worker_1
 LEGACY_VISION_CONTAINER_EXISTS=true
 cp "$TEST_ROOT/successful-vision-deploy-calls" "$CALLS"
 
@@ -712,17 +826,72 @@ MIGRATION_GATE_MODE=success
 cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
 
 : >"$CALLS"
+LEGACY_VISION_CONTAINER_EXISTS=true
 VISION_CUTOVER_GATE_MODE=unsafe
 if deploy_vp_app_services $images >/dev/null 2>&1; then
   echo 'FAIL: unsafe vision cutover gate unexpectedly allowed deployment' >&2
   exit 1
 fi
 if grep -Fq 'docker|service update' "$CALLS" \
-  || grep -Fq 'docker|rm -f vp_vision_worker_1' "$CALLS"; then
+  || grep -Fq 'docker|rm -f ' "$CALLS" \
+  || grep -Fq 'python -m app.services.vision_consumer_cutover' "$CALLS"; then
   echo 'FAIL: unsafe vision cutover gate mutated services or the legacy worker' >&2
   exit 1
 fi
 VISION_CUTOVER_GATE_MODE=success
+cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
+
+: >"$CALLS"
+VISION_CONSUMER_CUTOVER_MODE=failure
+if deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: failed vision consumer reconciliation unexpectedly allowed deployment' >&2
+  exit 1
+fi
+grep -Fq 'python -m app.services.vision_consumer_cutover' "$CALLS"
+VISION_CONSUMER_CUTOVER_MODE=success
+cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
+
+: >"$CALLS"
+LEGACY_VISION_CONTAINER_EXISTS=false
+VISION_SERVICE_EXISTS=true
+VISION_CUTOVER_GATE_MODE=unsafe
+VISION_CONSUMER_CUTOVER_MODE=failure
+VISION_CONSUMER_AUDIT_MODE=needs-cutover
+if deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: incomplete vision consumer cutover was misclassified as converged' >&2
+  exit 1
+fi
+grep -Fq 'python -m app.services.vision_consumer_cutover --check-only' "$CALLS"
+grep -Fq 'runtime_schedules' "$CALLS"
+
+: >"$CALLS"
+VISION_CONSUMER_AUDIT_MODE=converged
+if ! deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: converged vision deployment was blocked by the migration-only gate' >&2
+  exit 1
+fi
+if grep -Fq 'runtime_schedules' "$CALLS" \
+  || grep -F 'python -m app.services.vision_consumer_cutover' "$CALLS" \
+    | grep -Fvq -- '--check-only'; then
+  echo 'FAIL: converged vision deployment reran migration-only checks' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+VISION_SERVICE_EXISTS=false
+if deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: missing managed vision service bypassed the cutover gate' >&2
+  exit 1
+fi
+grep -Fq 'runtime_schedules' "$CALLS"
+if grep -Fq 'docker|service update' "$CALLS" \
+  || grep -Fq 'docker|service create' "$CALLS"; then
+  echo 'FAIL: missing managed vision service mutated services before the cutover gate' >&2
+  exit 1
+fi
+VISION_SERVICE_EXISTS=true
+VISION_CUTOVER_GATE_MODE=success
+VISION_CONSUMER_CUTOVER_MODE=success
 cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
 
 if [[ ! -x "$ROOT/bin/channelops-soak-watch.sh" ]]; then
@@ -1071,6 +1240,7 @@ if ! grep -Fq 'vp-youtube-publisher-swarm' "$CALLS"; then
 fi
 grep -Fq -- '--constraint-rm node.labels.role==app' "$CALLS"
 grep -Fq -- '--constraint-add node.labels.vp.runtime==true' "$CALLS"
+grep -Fq -- '--constraint-add node.hostname==colima-127' "$CALLS"
 grep -Fq -- '--env-rm DATABASE_URL' "$CALLS"
 grep -Fq -- '--env-add VP_GO_ORCHESTRATOR_ENABLED=true' "$CALLS"
 grep -Fq -- '--env-add VP_GO_ORCHESTRATOR_JOB_WRITES=true' "$CALLS"
@@ -1082,6 +1252,13 @@ if [[ "$VP_APP_SERVICES" != 'vp-api-swarm vp-frontend-swarm vp-autoflow-api-swar
 fi
 grep -Fq -- '--env-add WORKER_TYPE=vision' "$CALLS"
 grep -Fq -- '--env-add WORKER_HOST=150-vision' "$CALLS"
+grep -Fq -- '--constraint-add node.hostname==ccttww-lap' "$CALLS"
+grep -Fq -- '--env-rm HF_TOKEN' "$CALLS"
+grep -Fq -- '--env-rm PUBLIC_PUBLISH_ENABLED' "$CALLS"
+grep -Fq -- '--env-rm YOUTUBE_MANAGER_URL' "$CALLS"
+grep -Fq -- '--secret-rm vision-legacy-secret' "$CALLS"
+grep -Fq -- '--config-rm vision-legacy-config' "$CALLS"
+grep -Fq -- '--network-rm legacy-network-id' "$CALLS"
 grep -Fq -- '--mount-add type=volume,src=vp-vision-worker-scratch,dst=/data/storage' "$CALLS"
 grep -Fq -- '--env-rm YOUTUBE_CREDENTIALS_DIR' "$CALLS"
 grep -Fq 'health|vp-youtube-manager|http://10.0.0.150:18999/api/auth/status' "$CALLS"
@@ -1487,6 +1664,15 @@ fi
 PUBLISHER_CONSTRAINT_MODE=legacy
 
 : >"$CALLS"
+CONSTRAINT_MODE=stale-runtime
+vp_update_runtime_service vp-api-swarm vp-api:runtime-placement-test stop-first \
+  >/dev/null
+grep -Fq -- '--constraint-rm node.hostname==CASPERs-Mac-mini' "$CALLS"
+grep -Fq -- '--constraint-rm node.labels.vp.legacy==true' "$CALLS"
+grep -Fq -- '--constraint-add node.hostname==colima-127' "$CALLS"
+CONSTRAINT_MODE=legacy
+
+: >"$CALLS"
 PUBLISHER_CONSTRAINT_MODE=publisher
 PUBLISHER_MOUNT_MODE=missing
 vp_deploy_publisher vp-ffmpeg-worker-python:publisher-missing-scratch-test >/dev/null
@@ -1526,10 +1712,22 @@ VISION_SERVICE_EXISTS=false
 vp_deploy_vision_worker vp-ffmpeg-worker-python:vision-create-test >/dev/null
 grep -Fq 'docker|service create --detach=false --name vp-vision-worker-swarm' "$CALLS"
 grep -Fq -- '--constraint node.labels.vp.gpu==true' "$CALLS"
+grep -Fq -- '--constraint node.hostname==ccttww-lap' "$CALLS"
 grep -Fq -- '--network vp-pipeline-net' "$CALLS"
 grep -Fq -- '--mount type=volume,src=vp-vision-worker-scratch,dst=/data/storage' "$CALLS"
 grep -Fq -- '--env WORKER_TYPE=vision' "$CALLS"
 grep -Fq -- '--env WORKER_HOST=150-vision' "$CALLS"
+
+: >"$CALLS"
+VISION_SERVICE_EXISTS=true
+VISION_TASK_NODE=CASPERs-Mac-mini
+if vp_deploy_vision_worker vp-ffmpeg-worker-python:vision-forbidden-node-test \
+  >/dev/null 2>&1; then
+  echo 'FAIL: vision worker placement on 126 unexpectedly passed verification' >&2
+  exit 1
+fi
+grep -Fq 'docker|service ps vp-vision-worker-swarm' "$CALLS"
+VISION_TASK_NODE=ccttww-lap
 
 : >"$CALLS"
 PUBLISHER_SERVICE_EXISTS=false

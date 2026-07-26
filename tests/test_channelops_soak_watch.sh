@@ -141,9 +141,16 @@ if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
     desired=0
   fi
   case "$service" in
-    vp-youtube-publisher-swarm) image=vp-ffmpeg-worker-python:publisher-deployed ;;
-    vp-ffmpeg-worker-gpu-swarm) image=vp-ffmpeg-worker-python:gpu-deployed ;;
-    vp-vision-worker-swarm) image=vp-ffmpeg-worker-python:vision-deployed ;;
+    vp-youtube-publisher-swarm|vp-ffmpeg-worker-gpu-swarm|vp-vision-worker-swarm)
+      image=vp-ffmpeg-worker-python:deploy-0123456789ab
+      if [[ "${FAKE_DOCKER_MODE:-healthy}" == "vision_image_mismatch" \
+        && "$service" == "vp-vision-worker-swarm" ]]; then
+        image=vp-ffmpeg-worker-python:deploy-bbbbbbbbbbbb
+      fi
+      if [[ "${FAKE_DOCKER_MODE:-healthy}" == "untrusted_python_image" ]]; then
+        image=untrusted-worker:latest
+      fi
+      ;;
     *) image="fixture-$service:deployed" ;;
   esac
   printf '%s|%s\n' "$desired" "$image"
@@ -521,7 +528,7 @@ done
   || fail "healthy run must query exactly 5 Redis streams"
 [[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|CONSUMERS|' "$CALLS")" -eq 5 ]] \
   || fail "healthy run must query exactly 5 Redis consumer sets"
-assert_contains 'docker|run|--rm|--env|DATABASE_URL|vp-ffmpeg-worker-python:publisher-deployed|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
+assert_contains 'docker|run|--rm|--env|DATABASE_URL|vp-ffmpeg-worker-python:deploy-0123456789ab|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
 assert_contains '|--channel-id|123e4567-e89b-12d3-a456-426614174000' "$CALLS"
 assert_contains '|--started-at|2026-07-19T18:30:00Z' "$CALLS"
 assert_not_contains "$SECRET_URL" "$CALLS"
@@ -546,6 +553,19 @@ FAKE_DOCKER_MODE=zero_desired
 run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "zero-replica service assessment did not run"
 assert_contains '|--external-condition|service_unhealthy' "$CALLS"
+
+FAKE_DOCKER_MODE=vision_image_mismatch
+run_watcher
+[[ "$WATCHER_EXIT" -ne 0 ]] || fail "mismatched vision image must fail configuration"
+assert_contains 'service=vp-vision-worker-swarm image=mismatch' "$OUTPUT"
+assert_contains 'status=configuration_error reason=trusted_python_image_invalid' "$OUTPUT"
+assert_not_contains 'docker|run|--rm|--env|DATABASE_URL' "$CALLS"
+
+FAKE_DOCKER_MODE=untrusted_python_image
+run_watcher
+[[ "$WATCHER_EXIT" -ne 0 ]] || fail "untrusted Python images must fail configuration"
+assert_contains 'status=configuration_error reason=trusted_python_image_invalid' "$OUTPUT"
+assert_not_contains 'docker|run|--rm|--env|DATABASE_URL' "$CALLS"
 
 for task_state in starting preparing rejected; do
   FAKE_DOCKER_MODE="$task_state"
@@ -603,7 +623,7 @@ run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "publisher-missing guard assessment did not run"
 assert_contains '|--external-condition|service_missing' "$CALLS"
 assert_contains '|--apply' "$CALLS"
-assert_contains '|vp-ffmpeg-worker-python:gpu-deployed|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
+assert_contains '|vp-ffmpeg-worker-python:deploy-0123456789ab|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
 
 # With neither trusted Python image available, fail before claiming protection.
 FAKE_MISSING_SERVICES='vp-youtube-publisher-swarm vp-ffmpeg-worker-gpu-swarm vp-vision-worker-swarm'

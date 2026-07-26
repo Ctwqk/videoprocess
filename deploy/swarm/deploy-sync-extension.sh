@@ -10,8 +10,10 @@ fi
 VP_RUNTIME_HOST="${VP_RUNTIME_HOST:-10.0.0.127}"
 VP_RUNTIME_NODE="${VP_RUNTIME_NODE:-colima-127}"
 VP_RUNTIME_CONSTRAINT="node.labels.vp.runtime==true"
+VP_RUNTIME_NODE_CONSTRAINT="node.hostname==$VP_RUNTIME_NODE"
 VP_GPU_CONSTRAINT="node.labels.vp.gpu==true"
 VP_MANAGER_NODE="${VP_MANAGER_NODE:-ccttww-lap}"
+VP_GPU_MANAGER_CONSTRAINT="node.hostname==$VP_MANAGER_NODE"
 VP_PUBLISHER_CONSTRAINT="node.labels.vp.publisher==true"
 VP_PUBLISHER_MANAGER_CONSTRAINT="node.hostname==$VP_MANAGER_NODE"
 VP_PIPELINE_NETWORK="${VP_PIPELINE_NETWORK:-vp-pipeline-net}"
@@ -24,8 +26,23 @@ VP_VISION_WORKER_SERVICE="vp-vision-worker-swarm"
 VP_PUBLISHER_SERVICE="vp-youtube-publisher-swarm"
 VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE $VP_VISION_WORKER_SERVICE $VP_PUBLISHER_SERVICE"
 VP_APP_ATTEMPTED_SERVICES=""
+VP_VISION_CUTOVER_REQUIRED=false
+
+vp_validate_topology() {
+  if [[ "${BUILD_IMAGES:-1}" -eq 0 && "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "$VP_RUNTIME_HOST" != "10.0.0.127" ]] \
+    || [[ "$VP_RUNTIME_NODE" != "colima-127" ]] \
+    || [[ "$VP_MANAGER_NODE" != "ccttww-lap" ]]; then
+    echo "VideoProcess deployment topology must remain fixed to 127 and 150" >&2
+    return 1
+  fi
+}
 
 vp_validate_deploy_config() {
+  vp_validate_topology || return 1
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
     return 0
   fi
@@ -94,10 +111,74 @@ vp_require_vision_cutover_safe() {
   log "vision cutover gate verified: CLOSED and idle"
 }
 
+vp_vision_cutover_required() {
+  local python_worker="$1"
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    printf 'false\n'
+    return 0
+  fi
+
+  local legacy_names
+  legacy_names="$(docker container ls -a \
+    --filter 'name=^/vp_vision_worker_1$' \
+    --format '{{.Names}}')" || return 1
+  case "$legacy_names" in
+    vp_vision_worker_1)
+      printf 'true\n'
+      return 0
+      ;;
+    '')
+      ;;
+    *)
+      echo "unexpected legacy vision container list result" >&2
+      return 1
+      ;;
+  esac
+
+  if ! docker service inspect "$VP_VISION_WORKER_SERVICE" >/dev/null 2>&1; then
+    printf 'true\n'
+    return 0
+  fi
+
+  if REDIS_URL="redis://10.0.0.150:6380/0" \
+    docker run --rm \
+      --network "$VP_PIPELINE_NETWORK" \
+      --env REDIS_URL \
+      "$python_worker" \
+      python -m app.services.vision_consumer_cutover --check-only >/dev/null; then
+    printf 'false\n'
+  else
+    printf 'true\n'
+  fi
+}
+
 vp_service_values() {
   local service="$1"
   local template="$2"
   docker service inspect "$service" --format "$template"
+}
+
+vp_require_service_node() {
+  local service="$1"
+  local expected_node="$2"
+  local running_tasks
+  running_tasks="$(docker service ps "$service" \
+    --filter desired-state=running \
+    --format '{{.Node}}|{{.CurrentState}}')" || return 1
+  if ! awk -F'|' -v expected="$expected_node" '
+    NF {
+      total++
+      if ($1 == expected && $2 ~ /^Running([[:space:]]|$)/) {
+        matched++
+      }
+    }
+    END {
+      exit total == 1 && matched == 1 ? 0 : 1
+    }
+  ' <<<"$running_tasks"; then
+    echo "service $service is not running exactly once on $expected_node" >&2
+    return 1
+  fi
 }
 
 vp_require_github_actions_success() {
@@ -191,15 +272,19 @@ vp_update_runtime_service() {
 
   local constraint
   local has_runtime=false
+  local has_runtime_node=false
   local constraint_args=()
   while IFS= read -r constraint; do
     [[ -n "$constraint" ]] || continue
     case "$constraint" in
-      node.labels.role==app)
-        constraint_args+=(--constraint-rm "$constraint")
-        ;;
       "$VP_RUNTIME_CONSTRAINT")
         has_runtime=true
+        ;;
+      "$VP_RUNTIME_NODE_CONSTRAINT")
+        has_runtime_node=true
+        ;;
+      *)
+        constraint_args+=(--constraint-rm "$constraint")
         ;;
     esac
   done < <(
@@ -208,6 +293,9 @@ vp_update_runtime_service() {
   )
   if [[ "$has_runtime" != true ]]; then
     constraint_args+=(--constraint-add "$VP_RUNTIME_CONSTRAINT")
+  fi
+  if [[ "$has_runtime_node" != true ]]; then
+    constraint_args+=(--constraint-add "$VP_RUNTIME_NODE_CONSTRAINT")
   fi
 
   local service_args=()
@@ -302,6 +390,7 @@ vp_build_manager_image() {
 
 build_vp_app_images() {
   local commit="$1"
+  vp_validate_topology || return 1
   vp_require_github_actions_success \
     "$VP_APP_CI_REPOSITORY" "$VP_APP_CI_WORKFLOW" "$commit" || return 1
   local short
@@ -332,6 +421,7 @@ build_vp_app_images() {
 
 build_feature_aggregator_images() {
   local commit="$1"
+  vp_validate_topology || return 1
   vp_require_github_actions_success \
     "$VP_APP_CI_REPOSITORY" "$VP_APP_CI_WORKFLOW" "$commit" || return 1
   local tag
@@ -344,6 +434,7 @@ build_feature_aggregator_images() {
 
 build_pds_images() {
   local commit="$1"
+  vp_validate_topology || return 1
   vp_require_github_actions_success \
     "$VP_PDS_CI_REPOSITORY" "$VP_PDS_CI_WORKFLOW" "$commit" || return 1
   local tag
@@ -523,6 +614,11 @@ vp_deploy_python_worker() {
       | grep -Fxq "$VP_GPU_CONSTRAINT"; then
       update_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
     fi
+    if ! vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
+      '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}' \
+      | grep -Fxq "$VP_GPU_MANAGER_CONSTRAINT"; then
+      update_args+=(--constraint-add "$VP_GPU_MANAGER_CONSTRAINT")
+    fi
 
     local network_id
     network_id="$(docker network inspect "$VP_PIPELINE_NETWORK" --format '{{.ID}}')"
@@ -547,6 +643,7 @@ vp_deploy_python_worker() {
     local create_args=(
       service create --detach=false --name "$VP_PYTHON_WORKER_SERVICE"
       --constraint "$VP_GPU_CONSTRAINT"
+      --constraint "$VP_GPU_MANAGER_CONSTRAINT"
       --network "$VP_PIPELINE_NETWORK"
       --restart-condition any --restart-delay 5s
       --mount type=volume,src=vp-gpu-worker-scratch,dst=/data/storage
@@ -580,8 +677,10 @@ vp_deploy_vision_worker() {
   local env_key
   local env_value
   local env_args=()
+  local desired_env_keys=""
   while IFS= read -r env_value; do
     env_key="${env_value%%=*}"
+    desired_env_keys="${desired_env_keys}${desired_env_keys:+$'\n'}$env_key"
     if [[ "$vision_exists" == true ]] \
       && awk -F= -v key="$env_key" \
         '$1 == key { found=1 } END { exit found ? 0 : 1 }' <<<"$existing_env"; then
@@ -598,10 +697,13 @@ vp_deploy_vision_worker() {
     )
     local constraint
     local has_gpu=false
+    local has_manager=false
     while IFS= read -r constraint; do
       [[ -n "$constraint" ]] || continue
       if [[ "$constraint" == "$VP_GPU_CONSTRAINT" ]]; then
         has_gpu=true
+      elif [[ "$constraint" == "$VP_GPU_MANAGER_CONSTRAINT" ]]; then
+        has_manager=true
       else
         update_args+=(--constraint-rm "$constraint")
       fi
@@ -612,12 +714,26 @@ vp_deploy_vision_worker() {
     if [[ "$has_gpu" != true ]]; then
       update_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
     fi
+    if [[ "$has_manager" != true ]]; then
+      update_args+=(--constraint-add "$VP_GPU_MANAGER_CONSTRAINT")
+    fi
 
     local network_id
     network_id="$(docker network inspect "$VP_PIPELINE_NETWORK" --format '{{.ID}}')" || return 1
-    if ! vp_service_values "$VP_VISION_WORKER_SERVICE" \
-      '{{range .Spec.TaskTemplate.Networks}}{{println .Target}}{{end}}' \
-      | grep -Fxq "$network_id"; then
+    local network_target
+    local has_pipeline_network=false
+    while IFS= read -r network_target; do
+      [[ -n "$network_target" ]] || continue
+      if [[ "$network_target" == "$network_id" ]]; then
+        has_pipeline_network=true
+      else
+        update_args+=(--network-rm "$network_target")
+      fi
+    done < <(
+      vp_service_values "$VP_VISION_WORKER_SERVICE" \
+        '{{range .Spec.TaskTemplate.Networks}}{{println .Target}}{{end}}'
+    )
+    if [[ "$has_pipeline_network" != true ]]; then
       update_args+=(--network-add "$VP_PIPELINE_NETWORK")
     fi
 
@@ -677,7 +793,7 @@ vp_deploy_vision_worker() {
     )
     while IFS= read -r env_value; do
       env_key="${env_value%%=*}"
-      if vp_publisher_env_is_sensitive "$env_key"; then
+      if ! grep -Fxq "$env_key" <<<"$desired_env_keys"; then
         update_args+=(--env-rm "$env_key")
       fi
     done <<<"$existing_env"
@@ -689,6 +805,7 @@ vp_deploy_vision_worker() {
       service create --detach=false --name "$VP_VISION_WORKER_SERVICE"
       --replicas 1
       --constraint "$VP_GPU_CONSTRAINT"
+      --constraint "$VP_GPU_MANAGER_CONSTRAINT"
       --network "$VP_PIPELINE_NETWORK"
       --restart-condition any --restart-delay 5s
       --mount type=volume,src=vp-vision-worker-scratch,dst=/data/storage
@@ -699,7 +816,8 @@ vp_deploy_vision_worker() {
     done < <(vp_vision_worker_env)
     docker "${create_args[@]}" "${create_env[@]}" "$image" >&2 || return 1
   fi
-  swarm_service_running "$VP_VISION_WORKER_SERVICE"
+  swarm_service_running "$VP_VISION_WORKER_SERVICE" || return 1
+  vp_require_service_node "$VP_VISION_WORKER_SERVICE" "$VP_MANAGER_NODE"
 }
 
 vp_retire_legacy_vision_worker() {
@@ -709,10 +827,10 @@ vp_retire_legacy_vision_worker() {
   fi
 
   local container="vp_vision_worker_1"
-  local identity
-  if ! identity="$(
+  local inspected
+  if ! inspected="$(
     docker container inspect \
-      --format '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
+      --format '{{.Id}}|{{.Name}}|{{.State.Running}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
       "$container" 2>/dev/null
   )"; then
     local matching_names
@@ -725,11 +843,44 @@ vp_retire_legacy_vision_worker() {
     echo "legacy vision worker identity could not be inspected" >&2
     return 1
   fi
-  if [[ "$identity" != "videoprocess|vision-worker" ]]; then
+  local container_id
+  local container_name
+  local container_running
+  local compose_project
+  local compose_service
+  local extra
+  IFS='|' read -r \
+    container_id container_name container_running compose_project compose_service extra \
+    <<<"$inspected"
+  if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ ]] \
+    || [[ "$container_name" != "/$container" ]] \
+    || [[ "$container_running" != true ]] \
+    || [[ "$compose_project" != videoprocess ]] \
+    || [[ "$compose_service" != vision-worker ]] \
+    || [[ -n "$extra" ]]; then
     echo "refusing to remove unexpected legacy vision container identity" >&2
     return 1
   fi
-  docker rm -f "$container" >&2
+  docker rm -f "$container_id" >&2
+}
+
+vp_reconcile_vision_consumers() {
+  local python_worker="$1"
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    log "vision consumer reconciliation skipped"
+    return 0
+  fi
+
+  if ! REDIS_URL="redis://10.0.0.150:6380/0" \
+    docker run --rm \
+      --network "$VP_PIPELINE_NETWORK" \
+      --env REDIS_URL \
+      "$python_worker" \
+      python -m app.services.vision_consumer_cutover >/dev/null; then
+    echo "vision consumer reconciliation failed" >&2
+    return 1
+  fi
+  log "vision consumer reconciliation verified"
 }
 
 vp_deploy_publisher() {
@@ -954,6 +1105,7 @@ vp_restore_gpu_service() {
   local image="$1"
   local constraint
   local has_gpu=false
+  local has_manager=false
   local constraint_args=()
   while IFS= read -r constraint; do
     [[ -n "$constraint" ]] || continue
@@ -964,6 +1116,9 @@ vp_restore_gpu_service() {
       "$VP_GPU_CONSTRAINT")
         has_gpu=true
         ;;
+      "$VP_GPU_MANAGER_CONSTRAINT")
+        has_manager=true
+        ;;
     esac
   done < <(
     vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
@@ -971,6 +1126,9 @@ vp_restore_gpu_service() {
   )
   if [[ "$has_gpu" != true ]]; then
     constraint_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
+  fi
+  if [[ "$has_manager" != true ]]; then
+    constraint_args+=(--constraint-add "$VP_GPU_MANAGER_CONSTRAINT")
   fi
 
   local update_args=(
@@ -1337,7 +1495,10 @@ vp_apply_app_services() {
   vp_deploy_python_worker "$python_worker" || return 1
   vp_record_app_service_attempt "$VP_VISION_WORKER_SERVICE"
   vp_deploy_vision_worker "$python_worker" || return 1
-  vp_retire_legacy_vision_worker || return 1
+  if [[ "$VP_VISION_CUTOVER_REQUIRED" == true ]]; then
+    vp_retire_legacy_vision_worker || return 1
+    vp_reconcile_vision_consumers "$python_worker" || return 1
+  fi
   vp_record_app_service_attempt "$VP_PUBLISHER_SERVICE"
   vp_deploy_publisher "$python_worker" || return 1
   vp_record_app_service_attempt vp-autoflow-api-swarm
@@ -1359,7 +1520,18 @@ vp_apply_app_services() {
 
 deploy_vp_app_services() {
   vp_validate_deploy_config || return 1
-  vp_require_vision_cutover_safe "${6:-}" || return 1
+  VP_VISION_CUTOVER_REQUIRED="$(vp_vision_cutover_required "${6:-}")" || return 1
+  case "$VP_VISION_CUTOVER_REQUIRED" in
+    true)
+      vp_require_vision_cutover_safe "${6:-}" || return 1
+      ;;
+    false)
+      ;;
+    *)
+      echo "invalid vision cutover state" >&2
+      return 1
+      ;;
+  esac
 
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
     vp_apply_app_services "$@" || return 1
@@ -1384,6 +1556,7 @@ vp_deploy_single_runtime_service() {
   local image="$2"
   local order="$3"
 
+  vp_validate_topology || return 1
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
     vp_update_runtime_service "$service" "$image" "$order" || return 1
     swarm_service_running "$service" || return 1

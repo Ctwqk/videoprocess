@@ -116,6 +116,14 @@ one repository on every run. Do not enable the unscoped all-project deploy job
 as part of a VideoProcess release. A manual first deployment is reserved for
 exceptional migration or runbook changes, not for every commit.
 
+The deployment extension rejects topology overrides away from
+`10.0.0.127`, `colima-127`, and `ccttww-lap`. Application services use both
+`node.labels.vp.runtime==true` and `node.hostname==colima-127`; GPU, vision,
+and publisher services use their dedicated 150 labels plus
+`node.hostname==ccttww-lap`. The application, feature-aggregator, and
+independent PDS build and deploy entry points all run this topology gate before
+building an image or mutating a service.
+
 The scoped controller deploys `vp-app` and the in-repository
 `vp-feature-aggregator` project from this repository. PDS remains an
 independent repository and deploy project: a PDS change is deployed from its
@@ -249,6 +257,11 @@ The watcher audits the host-networked VP Redis listener with
 immediate operational ownership guard, not a replacement for future signed
 worker registration and revocation.
 
+The migration removes zero-pending legacy vision consumers with one atomic
+Redis script. If any pending entry appears, no consumer is deleted and the
+deployment fails closed. A read-only convergence check keeps a partially
+completed migration behind the CLOSED/idle gate on its next retry.
+
 External-platform asset automatic publication remains disabled. Explicit human
 review is required before any external-platform asset upload or publication.
 Public publication and promotion remain disabled.
@@ -378,13 +391,17 @@ is never a build, deploy, runtime, watcher, publisher, or failover target.
 - Label the 127 Swarm node with `node.labels.vp.runtime == true`.
 - Constrain normal VP services to `node.labels.vp.runtime == true`.
 - Label the 150 manager with `node.labels.vp.gpu == true` and constrain the
-  managed Python FFmpeg and vision workers to that label.
+  managed Python FFmpeg and vision workers to that label and
+  `node.hostname == ccttww-lap`.
 - Run exactly one `vp-vision-worker-swarm` replica with
   `WORKER_HOST=150-vision`; it is the sole approved active consumer for
   `vp:tasks:vision` / `vision-workers`.
 - Never restart or restore `vp_vision_worker_1`. A push-driven deployment
-  replaces it with the commit-tagged managed service and removes it only after
-  the replacement is healthy and its exact Compose identity is verified.
+  replaces it with the commit-tagged managed service and removes it by
+  immutable container ID only after the replacement is healthy on
+  `ccttww-lap` and its exact container/Compose identity is verified. The same
+  migration removes zero-pending non-managed vision consumer records and
+  verifies that only `vision-worker@150-vision:<positive pid>` remains.
 - Label only the 150 manager with `node.labels.vp.publisher == true`. Constrain
   `vp-youtube-publisher-swarm` with both that label and
   `node.hostname == ccttww-lap`; the hostname constraint prevents stale labels

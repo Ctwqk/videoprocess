@@ -25,7 +25,7 @@ The service has:
 - `WORKER_TYPE=vision`
 - `WORKER_HOST=150-vision`
 - exactly one replica
-- `node.labels.vp.gpu==true` placement
+- `node.labels.vp.gpu==true` plus `node.hostname==ccttww-lap` placement
 - the private pipeline network
 - MinIO-backed production storage with a dedicated scratch volume
 - the shared production Postgres and Redis endpoints
@@ -37,19 +37,31 @@ rollback.
 ## Deployment Order
 
 1. Build the commit-tagged Python worker image on host 150.
-2. Create or update `vp-vision-worker-swarm` stop-first.
-3. Verify the service is `1/1` and its image, placement, worker type, worker
-   host, network, and scratch mount match the desired contract.
-4. Remove only a running container named exactly `vp_vision_worker_1` when its
-   Compose labels identify project `videoprocess` and service `vision-worker`.
-5. Fail closed on an identity mismatch instead of removing an unknown
-   container.
-6. Include the managed vision service in deployment snapshots, rollback,
+2. Determine whether this is a migration: the exact legacy container exists,
+   the managed service is absent, or a read-only Redis audit does not find
+   exactly one zero-pending managed vision consumer.
+3. Only for a migration, require the schedule to be `CLOSED`, no guarded job,
+   no queued/running nodes, and zero vision pending/lag before any service
+   mutation.
+4. Create or update `vp-vision-worker-swarm` stop-first and converge to the
+   exact environment, network, secret, config, mount, and placement contract.
+5. Verify the service is `1/1` and its only running task is on `ccttww-lap`.
+6. Inspect the legacy worker's immutable container ID, exact name, running
+   state, Compose project, and Compose service; remove it by ID only when all
+   fields match.
+7. Wait for exactly one `vision-worker@150-vision:<positive pid>` consumer,
+   then atomically require every vision consumer to have zero pending entries
+   and delete all non-managed consumer records in one Redis Lua script. Verify
+   that only the managed record remains.
+8. Include the managed vision service in deployment snapshots, rollback,
    service inventory, and the installed soak watcher.
 
 The video schedule must be `CLOSED` and the vision stream must have no pending
-work before this production migration is applied. Deployment does not replay
-or acknowledge unverifiable legacy events.
+work before this production migration is applied. Once the managed service has
+converged and the legacy container is absent, later push-driven updates skip
+the migration-only gate so normal automatic deployment remains available while
+the schedule is open. Deployment does not replay or acknowledge unverifiable
+legacy events.
 
 ## Rollback
 
@@ -64,23 +76,35 @@ the current orchestrator.
 The soak watcher treats the following as required:
 
 - `vp-vision-worker-swarm` is healthy and uses the trusted Python image.
+- The GPU, vision, and publisher services use the same commit-tagged
+  `vp-ffmpeg-worker-python:deploy-<12 hex>` image. Missing consensus or an
+  untrusted tag is a configuration error before any image receives database
+  credentials.
 - `vp:tasks:vision` / `vision-workers` has exactly one active consumer matching
   `vision-worker@150-vision:<positive pid>`.
-- The vision stream has zero pending entries during a closed readiness check.
+- Every audited stream has zero stale consumers; the vision stream also has
+  zero pending entries during a closed migration check.
 - No managed service is placed on host 126.
+- Deployment configuration is fixed to runtime host `10.0.0.127`, runtime node
+  `colima-127`, and manager node `ccttww-lap`; runtime services also require
+  `node.hostname==colima-127`. The same gate runs before all application,
+  feature-aggregator, and independent PDS build and deploy entry points.
 
 The live canary preflight applies the same Redis consumer identity check before
 any future authorization can be consumed.
 
 ## Tests
 
-Shell deployment contract tests cover create, update, exact legacy-container
-identity checks, removal ordering, rollback, environment, placement, network,
-mount, service inventory, and the prohibition on host 126.
+Shell deployment contract tests cover create, update, immutable
+legacy-container identity checks, removal ordering, migration-only gating,
+rollback, exact environment/network convergence, task-node verification,
+service inventory, and the prohibition on host 126.
 
 Canary and soak watcher tests cover the required vision stream group and exact
-consumer identity. Existing backend, frontend, Go, CI, and deployment checks
-remain required.
+consumer identity. A dedicated cutover service test covers zero-pending
+consumer cleanup, a pending-arrival race against real Redis 7.4.7, and final
+convergence. Existing backend, frontend, Go, CI, and deployment checks remain
+required.
 
 ## Success Criteria
 

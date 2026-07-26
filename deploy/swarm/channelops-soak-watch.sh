@@ -188,6 +188,7 @@ vp-feature-aggregator-swarm
 vp-pds-swarm'
 external_conditions=''
 trusted_python_image=''
+trusted_python_images_valid=true
 
 while IFS= read -r service; do
   [[ -n "$service" ]] || continue
@@ -201,19 +202,17 @@ while IFS= read -r service; do
   desired_replicas="${service_details%%|*}"
   service_image="${service_details#*|}"
   case "$service" in
-    vp-ffmpeg-worker-gpu-swarm)
-      if [[ -n "$service_image" ]]; then
+    vp-ffmpeg-worker-gpu-swarm|vp-vision-worker-swarm|vp-youtube-publisher-swarm)
+      if [[ ! "$service_image" =~ ^vp-ffmpeg-worker-python:deploy-[0-9a-f]{12}$ ]]; then
+        log_status "service=$service image=untrusted"
+        add_external_condition service_unhealthy
+        trusted_python_images_valid=false
+      elif [[ -z "$trusted_python_image" ]]; then
         trusted_python_image="$service_image"
-      fi
-      ;;
-    vp-vision-worker-swarm)
-      if [[ -z "$trusted_python_image" && -n "$service_image" ]]; then
-        trusted_python_image="$service_image"
-      fi
-      ;;
-    vp-youtube-publisher-swarm)
-      if [[ -n "$service_image" ]]; then
-        trusted_python_image="$service_image"
+      elif [[ "$service_image" != "$trusted_python_image" ]]; then
+        log_status "service=$service image=mismatch"
+        add_external_condition service_unhealthy
+        trusted_python_images_valid=false
       fi
       ;;
   esac
@@ -380,6 +379,9 @@ while IFS='|' read -r stream group consumer_pattern; do
   fi
 done <<<"$stream_groups"
 
+if [[ "$trusted_python_images_valid" != true ]]; then
+  configuration_error trusted_python_image_invalid
+fi
 if [[ -z "$trusted_python_image" ]]; then
   configuration_error trusted_python_image_missing
 fi
