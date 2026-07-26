@@ -255,6 +255,20 @@ no direct node or attestation DML. The older attestation function remains
 PUBLIC-revoked for compatibility and is not part of the production worker-role
 allowlist.
 
+Before event `XADD`, the worker commits an immutable
+`worker_event_emissions` row for the source attestation. It binds the event
+stream/group, canonical payload hash and JSON, event type, job/node, and exact
+registration/epoch/worker/start claim. The idempotent Redis marker is keyed by
+the emission ID and has no TTL. A second fenced transaction records the exact
+Redis message ID. Source-task ACK authorization requires that exact
+`emitted|resolved` row and stores its ID on the attestation. The observer may
+complete a `prepared -> emitted` handoff after a Redis-success/database-failure
+window only when the observed message and payload hash match. Recovery,
+cancellation, and cleanup retain `prepared|emitted` authority. Cancellation-
+only ACK is permitted only for a delivered dispatch with no event-emission
+row; event-backed deliveries use their emission/receipt ACK path in every
+state.
+
 The independent orchestrator principal calls
 `public.vp_observe_worker_task_delivery`, not
 `public.vp_require_worker_lease`. The observer acquires the same
@@ -290,13 +304,18 @@ per attestation, so a safely ACKed cancelled task with no completion/failure
 event can be cleaned up. Cleanup and event acceptance both lock job/node first,
 then affected registrations in sorted order, then attestation/receipt/delivery
 identities. Receipt and attestation foreign keys are restrictive; the cleanup
-function deletes authority rows explicitly.
+function deletes authority rows explicitly. All event and task ACK reconcilers
+use the same order: job, sorted node IDs, sorted registration fences,
+attestation, emission, receipt, delivery, then dispatch.
 
 A registered worker that is not the preferred affinity host does not bounce,
 ACK, or mint a replacement task. It leaves the exact proven delivery pending
-for preferred-consumer reclaim; after the existing affinity age threshold, a
-consumer may process that same message. Legacy unregistered affinity behavior
-is unchanged.
+for preferred-consumer reclaim. Once the entry is at least 500 ms idle, the
+preferred registered host scans the PEL, reads that exact stream ID, verifies
+the host is still preferred and the 20-second window has not elapsed, and
+`XCLAIM`s only that ID. Non-preferred consumers perform zero `XADD`/`XACK`
+before relaxation. After 20 seconds, a consumer may process that same message.
+Legacy unregistered affinity behavior is unchanged.
 
 ## Dependency Fingerprints
 
@@ -363,10 +382,23 @@ finite retries. Registered workers upload only to claim-unique staging keys,
 hold the shared lease transaction across save and pointer insert, and recheck
 the database-clock lease after save. Cancellation shields and joins only
 within the proven operation bound; a late SDK thread can write only a staging
-object that the janitor may remove, never an authoritative final key. The
-orchestrator-owned `IntermediateArtifactCache` handles deterministic
+object that the janitor may remove, never an authoritative final key.
+`StagingObjectJanitor` scans only claim-shaped
+`staging/artifacts/{job_uuid}/{node_uuid}-{claim_token}.{ext}` keys older than
+86,400 seconds and excludes every exact `artifacts.storage_path` and durable
+`intermediate_artifact_cache.storage_path` pointer. Successful
+staging-prefixed pointers remain durable after source-job deletion. It writes
+a mode-0600 atomic status file; registered traffic readiness requires a
+successful status no older than 900 seconds.
+
+The orchestrator-owned `IntermediateArtifactCache` handles deterministic
 zero-input `url_download` reuse across jobs; the handler performs no separate
-remote cache lookup or write.
+remote cache lookup or write. External URL identity is normalized before the
+cache key. Cache rows snapshot the exact storage backend/path and artifact
+metadata, use `ON DELETE SET NULL` for the source artifact, and materialize a
+new artifact row for each consuming job. Cleanup treats the snapshot pointer
+as shared, so source-job deletion before or after a later hit cannot leave a
+dangling artifact ID or delete the shared object.
 
 ### Python workers
 
@@ -387,8 +419,12 @@ API startup recovery uses database time and the reviewed
 `public.vp_recover_registered_worker_node` function. A live registered claim is
 left untouched regardless of its wall-clock execution age. An expired or
 revoked claim with an unresolved dispatch is held without reset or competing
-dispatch. Only a resolved claim can be cleared and recovered once. A partial
-unique index permits at most one unresolved initial dispatch per node.
+dispatch. Jobs outside `RUNNING` and nodes outside `QUEUED|RUNNING` return
+`terminal` without changing any field. Only a resolved non-terminal claim can
+be cleared and recovered once; retry count is preserved explicitly while
+claim-owned timestamps, errors, input IDs, and output pointer are reset to the
+reviewed retry state. A partial unique index permits at most one unresolved
+initial dispatch per node.
 
 ### Go ffmpeg worker
 
@@ -414,24 +450,27 @@ deployment order becomes:
 8. revoke the replaced login principals;
 9. continue runner and remaining service convergence.
 
-A stable `NOLOGIN` worker runtime role owns this explicit privilege allowlist:
+A stable `NOLOGIN` worker runtime role owns only the minimum direct `SELECT`
+needed to load task inputs and returned upload-operation rows. It receives no
+direct `INSERT`, `UPDATE`, or `DELETE` on `artifacts`, `runtime_schedules`,
+`youtube_upload_operations`, `node_executions`, attestations, emissions, or
+dispatches. Schedule state is checked and locked inside
+`vp_claim_worker_node`/`vp_require_worker_node_claim`; workers have no schedule
+write surface.
 
-- `SELECT` on `jobs`, `node_executions`, `artifacts`, `channel_profiles`,
-  `production_tasks`, `runtime_schedules`, and
-  `youtube_upload_operations`;
-- `INSERT` on `artifacts`, `runtime_schedules`, and
-  `youtube_upload_operations`;
-- `EXECUTE` only on `vp_worker_register`, `vp_worker_heartbeat`,
-  `vp_worker_release`, `vp_require_worker_lease`,
-  `vp_require_worker_lease_margin`, `vp_claim_worker_node`,
-  `vp_authorize_worker_task_ack`, `vp_require_worker_task_ack_receipt`, and
-  `vp_acknowledge_worker_task_delivery`.
-
-It receives no direct `UPDATE` on `node_executions`. YouTube operation
-claim/reserve and each legal state transition use reviewed exact
-worker-principal functions with row identity, node claim, registration epoch,
-legal transition, and database-clock checks; the role receives no broad
-`UPDATE youtube_upload_operations` bypass.
+Its exact `EXECUTE` allowlist includes the registration/lease functions plus
+`vp_claim_worker_node`, `vp_require_worker_node_claim`,
+`vp_persist_worker_artifact`, `vp_prepare_worker_event_emission`,
+`vp_mark_worker_event_emitted`, `vp_authorize_worker_task_ack`,
+`vp_require_worker_task_ack_receipt`,
+`vp_acknowledge_worker_task_delivery`,
+`vp_reserve_worker_youtube_upload`, and
+`vp_transition_worker_youtube_upload`. Every function is fixed-search-path
+`SECURITY DEFINER`, rejects owner/superuser/privileged callers, validates the
+session principal against the registration, and is revoked from `PUBLIC`.
+YouTube reserve and each legal transition additionally enforce operation
+identity, node claim, registration epoch, privacy, legal transition, and
+database-clock margin. There is no broad upload-operation DML bypass.
 
 It receives no `DELETE`, `TRUNCATE`, DDL, sequence, `alembic_version`, grant-
 table, or registration-table privilege. Each service generation receives a
@@ -444,6 +483,7 @@ A separate stable `NOLOGIN` orchestrator-control role executes only the
 reviewed observer, receipt/task-ACK, cancelled-dispatch, registered-node
 recovery, and cleanup functions, including
 `vp_observe_worker_lease`, `vp_observe_worker_task_delivery`,
+`vp_observe_worker_event_emission`,
 `vp_acknowledge_proven_worker_task_dispatch`,
 `vp_authorize_cancelled_worker_task_ack`,
 `vp_require_cancelled_worker_task_ack`,
@@ -452,6 +492,7 @@ recovery, and cleanup functions, including
 `vp_resolve_worker_event_authority_for_job_deletion`. It has exact
 `SELECT`/`INSERT` and monotonic state-column `UPDATE` privileges on
 `worker_task_dispatches`, `worker_task_delivery_attestations`,
+`worker_event_emissions`,
 `registered_worker_event_receipts`, and
 `registered_worker_event_deliveries`, plus the existing least-privilege
 job/node/cache/artifact columns needed by receipt application. It receives no
@@ -462,6 +503,14 @@ the reviewed cleanup function.
 Schema migration/DCL uses the protected deploy-migrator credential. Migration
 head and readiness probes use a separate deploy-read credential. Neither
 credential is mounted into a worker.
+
+Task 4 deploys `python -m
+app.channel_agent.staging_object_janitor_cli` as the
+`vp-staging-object-janitor` one-shot service on a five-minute managed interval.
+It writes `/run/videoprocess/staging-janitor/status.json`; monitoring alerts on
+missing runs, status age above 900 seconds, or nonzero errors. Registered
+workers set `VP_REQUIRE_STAGING_JANITOR=true` and
+`VP_STAGING_JANITOR_STATUS_FILE` and remain unready until the status is fresh.
 
 A separate versioned `LOGIN` deployment operator principal owns no objects and
 has no direct grant/registration table access. It can execute only the five

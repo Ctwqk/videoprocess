@@ -709,6 +709,8 @@ async def test_ack_commit_failure_is_recovered_by_receipt_reconciliation(
     async def fail_first_commit(
         db,
         redis_client,
+        locked_attestation,
+        locked_emission,
         locked_receipt,
         locked_delivery,
     ):
@@ -717,6 +719,8 @@ async def test_ack_commit_failure_is_recovered_by_receipt_reconciliation(
         await original_ack(
             db,
             redis_client,
+            locked_attestation,
+            locked_emission,
             locked_receipt,
             locked_delivery,
         )

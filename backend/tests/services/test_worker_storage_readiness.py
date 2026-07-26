@@ -135,6 +135,7 @@ async def test_probe_round_trips_scratch_and_minio(tmp_path: Path) -> None:
             "scratch": "ready",
             "minio": "ready",
             "artifact_api": "not_required",
+            "staging_janitor": "not_required",
         },
     }
     assert fake_storage.objects == {}
@@ -335,6 +336,7 @@ async def test_artifact_api_200_is_ready_with_five_second_no_redirect_client(
         "scratch": "ready",
         "minio": "ready",
         "artifact_api": "ready",
+        "staging_janitor": "not_required",
     }
     assert len(clients) == 1
     assert clients[0].urls == ["http://vp-api-swarm:8080/health"]
@@ -502,3 +504,52 @@ async def test_artifact_api_is_not_constructed_when_not_required(tmp_path: Path)
 
     assert result["components"]["artifact_api"] == "not_required"
     assert clients == []
+
+
+async def test_required_staging_janitor_must_have_fresh_success_status(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ReadinessFailure) as failure:
+        await probe_worker_storage(
+            {
+                "STORAGE_BACKEND": "minio",
+                "STORAGE_LOCAL_ROOT": str(tmp_path),
+                "VP_REQUIRE_STAGING_JANITOR": "true",
+                "VP_STAGING_JANITOR_STATUS_FILE": str(
+                    tmp_path / "missing.json"
+                ),
+            },
+            require_artifact_api=False,
+            storage=FakeStorageBackend(),
+        )
+
+    assert failure.value.code == "staging_janitor_unavailable"
+
+
+async def test_required_staging_janitor_is_reported_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_file = tmp_path / "janitor.json"
+    status_file.write_text("{}")
+    monkeypatch.setattr(
+        worker_storage_readiness,
+        "staging_janitor_ready",
+        lambda path, *, max_age_seconds: (
+            path == status_file and max_age_seconds == 900
+        ),
+        raising=False,
+    )
+
+    result = await probe_worker_storage(
+        {
+            "STORAGE_BACKEND": "minio",
+            "STORAGE_LOCAL_ROOT": str(tmp_path),
+            "VP_REQUIRE_STAGING_JANITOR": "true",
+            "VP_STAGING_JANITOR_STATUS_FILE": str(status_file),
+        },
+        require_artifact_api=False,
+        storage=FakeStorageBackend(),
+    )
+
+    assert result["components"]["staging_janitor"] == "ready"

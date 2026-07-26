@@ -14,7 +14,11 @@ fix round 4 at 1a83c8a; final review approved; Task 1 complete
 Task 2: implementation at ce25840; review rejected (6 findings);
 fix round 1 complete at 38fc590; re-review rejected (6 findings);
 fix round 2 at 2da204b; re-review rejected (8 findings);
-fix round 3 implementation complete; re-review pending
+fix round 3/5 (8 prior findings addressed, 8 open — source-task ACK lacks
+durable event proof; restricted worker role cannot run Python row-lock path;
+terminal recovery reset; preferred affinity reclaim gap; Task 4 broad worker
+DML; ACK/cleanup lock inversion; URL cache normalization/retention; MinIO
+janitor/readiness plan gap; commits 2da204b..0c8a188)
 Task 3: pending
 Task 4: pending
 Task 5: pending

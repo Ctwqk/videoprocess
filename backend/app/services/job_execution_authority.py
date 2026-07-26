@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -221,6 +222,223 @@ async def claim_registered_worker_node(
     db.add(attestation)
     await db.flush()
     return claim, attestation.id
+
+
+async def require_registered_worker_node_claim(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+) -> None:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_require_worker_node_claim(
+            :registration_id,
+            :lease_epoch,
+            :worker_id,
+            :worker_started_at,
+            :job_id,
+            :node_execution_id
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "worker_id": claim.worker_id,
+            "worker_started_at": claim.started_at,
+            "job_id": claim.job_id,
+            "node_execution_id": claim.node_execution_id,
+        },
+        error_message="registered worker node claim is no longer authoritative",
+    )
+
+
+async def persist_registered_worker_artifact(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    filename: str,
+    mime_type: str,
+    file_size: int,
+    storage_backend: str,
+    storage_path: str,
+    media_info: dict | None,
+) -> uuid.UUID:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    result = await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_persist_worker_artifact(
+            :registration_id,
+            :lease_epoch,
+            :worker_id,
+            :worker_started_at,
+            :job_id,
+            :node_execution_id,
+            :filename,
+            :mime_type,
+            :file_size,
+            :storage_backend,
+            :storage_path,
+            CAST(:media_info AS jsonb)
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "worker_id": claim.worker_id,
+            "worker_started_at": claim.started_at,
+            "job_id": claim.job_id,
+            "node_execution_id": claim.node_execution_id,
+            "filename": filename,
+            "mime_type": mime_type,
+            "file_size": file_size,
+            "storage_backend": storage_backend,
+            "storage_path": storage_path,
+            "media_info": json.dumps(media_info),
+        },
+        error_message="registered worker artifact cannot be persisted",
+    )
+    if not isinstance(result, uuid.UUID):
+        raise JobExecutionAuthorityBlocked(
+            "registered worker artifact identity is invalid"
+        )
+    return result
+
+
+async def prepare_worker_event_emission(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    attestation_id: uuid.UUID,
+    redis_stream: str,
+    consumer_group: str,
+    payload_sha256: str,
+    payload: dict[str, str],
+    event_type: str,
+) -> uuid.UUID:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    result = await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_prepare_worker_event_emission(
+            :registration_id,
+            :lease_epoch,
+            :worker_id,
+            :worker_started_at,
+            :job_id,
+            :node_execution_id,
+            :attestation_id,
+            :redis_stream,
+            :consumer_group,
+            :payload_sha256,
+            CAST(:payload_json AS jsonb),
+            :event_type
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "worker_id": claim.worker_id,
+            "worker_started_at": claim.started_at,
+            "job_id": claim.job_id,
+            "node_execution_id": claim.node_execution_id,
+            "attestation_id": attestation_id,
+            "redis_stream": redis_stream,
+            "consumer_group": consumer_group,
+            "payload_sha256": payload_sha256,
+            "payload_json": json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "event_type": event_type,
+        },
+        error_message="worker event emission cannot be prepared",
+    )
+    if not isinstance(result, uuid.UUID):
+        raise JobExecutionAuthorityBlocked(
+            "worker event emission identity is invalid"
+        )
+    return result
+
+
+async def mark_worker_event_emitted(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    emission_id: uuid.UUID,
+    message_id: str,
+) -> None:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_mark_worker_event_emitted(
+            :emission_id,
+            :registration_id,
+            :lease_epoch,
+            :message_id
+        )
+        """,
+        {
+            "emission_id": emission_id,
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "message_id": message_id,
+        },
+        error_message="worker event emission cannot be recorded",
+    )
+
+
+async def observe_worker_event_emission(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    attestation_id: uuid.UUID,
+    redis_stream: str,
+    consumer_group: str,
+    message_id: str,
+    payload_sha256: str,
+) -> uuid.UUID:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    result = await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_observe_worker_event_emission(
+            :registration_id,
+            :lease_epoch,
+            :worker_id,
+            :worker_started_at,
+            :job_id,
+            :node_execution_id,
+            :attestation_id,
+            :redis_stream,
+            :consumer_group,
+            :message_id,
+            :payload_sha256
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "worker_id": claim.worker_id,
+            "worker_started_at": claim.started_at,
+            "job_id": claim.job_id,
+            "node_execution_id": claim.node_execution_id,
+            "attestation_id": attestation_id,
+            "redis_stream": redis_stream,
+            "consumer_group": consumer_group,
+            "message_id": message_id,
+            "payload_sha256": payload_sha256,
+        },
+        error_message="worker event emission cannot be observed",
+    )
+    if not isinstance(result, uuid.UUID):
+        raise JobExecutionAuthorityBlocked(
+            "worker event emission attestation is invalid"
+        )
+    return result
 
 
 async def recover_registered_worker_node(

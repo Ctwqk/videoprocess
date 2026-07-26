@@ -15,12 +15,14 @@ from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.registered_worker_event_receipt import (
     RegisteredWorkerEventDelivery,
     RegisteredWorkerEventReceipt,
+    WorkerEventEmission,
     WorkerTaskDispatch,
     WorkerTaskDeliveryAttestation,
 )
 from app.services.job_execution_authority import (
     NodeExecutionClaim,
     lock_job_execution_authority,
+    observe_worker_event_emission,
     observe_worker_task_delivery,
     require_active_execution_authority,
     require_matching_node_execution_claim,
@@ -515,18 +517,39 @@ class RegisteredWorkerEventReceiptService:
     ) -> None:
         async with self._session_factory() as db:
             async with db.begin():
-                delivery = await self._locked_event_delivery(db, event)
-                if delivery is None:
+                delivery_id = (
+                    await db.execute(
+                        select(RegisteredWorkerEventDelivery.id).where(
+                            RegisteredWorkerEventDelivery.redis_stream
+                            == event.redis_stream,
+                            RegisteredWorkerEventDelivery.consumer_group
+                            == event.consumer_group,
+                            RegisteredWorkerEventDelivery.message_id
+                            == event.message_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if delivery_id is None:
                     raise RegisteredWorkerEventError(
                         "registered event delivery is missing"
                     )
+                attestation, emission, receipt, delivery = (
+                    await self._lock_delivery_ack_authority(
+                        db,
+                        delivery_id,
+                    )
+                )
                 self._require_matching_event_delivery_identity(
                     delivery,
                     event,
                 )
-                receipt = None
-                if delivery.resolution_state == "accepted":
-                    receipt = await self._receipt_for_delivery(db, delivery)
+                if delivery.resolution_state != "accepted":
+                    receipt = None
+                elif receipt is None:
+                    raise RegisteredWorkerEventError(
+                        "accepted registered event delivery has no receipt"
+                    )
+                if receipt is not None:
                     self._require_matching_delivery(
                         delivery,
                         receipt,
@@ -542,6 +565,8 @@ class RegisteredWorkerEventReceiptService:
                 await self._acknowledge_locked_delivery(
                     db,
                     redis,
+                    attestation,
+                    emission,
                     receipt,
                     delivery,
                 )
@@ -622,6 +647,27 @@ class RegisteredWorkerEventReceiptService:
     ) -> None:
         async with self._session_factory() as db:
             async with db.begin():
+                identity = (
+                    await db.execute(
+                        select(
+                            WorkerTaskDeliveryAttestation.job_id,
+                            WorkerTaskDeliveryAttestation.node_execution_id,
+                            WorkerTaskDeliveryAttestation.worker_registration_id,
+                        )
+                        .where(
+                            WorkerTaskDeliveryAttestation.id
+                            == attestation_id
+                        )
+                    )
+                ).one_or_none()
+                if identity is None:
+                    return
+                await self._lock_job_node_registration(
+                    db,
+                    job_id=identity.job_id,
+                    node_execution_id=identity.node_execution_id,
+                    registration_id=identity.worker_registration_id,
+                )
                 attestation = (
                     await db.execute(
                         select(WorkerTaskDeliveryAttestation)
@@ -631,19 +677,22 @@ class RegisteredWorkerEventReceiptService:
                         )
                         .with_for_update()
                     )
-                ).scalar_one_or_none()
-                if attestation is None:
-                    return
+                ).scalar_one()
                 if attestation.ack_state == "acknowledged":
                     return
                 if attestation.ack_state != "authorized":
                     raise RegisteredWorkerEventError(
                         "worker task acknowledgement is not authorized"
                     )
-                await self._lock_registration_fence(
+                await self._lock_emission_for_attestation(
                     db,
-                    attestation.worker_registration_id,
+                    attestation.id,
                 )
+                await self._lock_receipts_and_deliveries_for_attestation(
+                    db,
+                    attestation.id,
+                )
+                await self._lock_dispatch_for_attestation(db, attestation)
                 result = await redis.xack(
                     attestation.redis_stream,
                     attestation.consumer_group,
@@ -665,22 +714,14 @@ class RegisteredWorkerEventReceiptService:
     ) -> None:
         async with self._session_factory() as db:
             async with db.begin():
-                delivery = (
-                    await db.execute(
-                        select(RegisteredWorkerEventDelivery)
-                        .where(
-                            RegisteredWorkerEventDelivery.id == delivery_id
-                        )
-                        .with_for_update()
+                attestation, emission, receipt, delivery = (
+                    await self._lock_delivery_ack_authority(
+                        db,
+                        delivery_id,
                     )
-                ).scalar_one_or_none()
-                if delivery is None:
-                    raise RegisteredWorkerEventError(
-                        "registered event delivery is missing"
-                    )
-                receipt = None
-                if delivery.resolution_state == "accepted":
-                    receipt = await self._receipt_for_delivery(db, delivery)
+                )
+                if delivery.resolution_state != "accepted":
+                    receipt = None
                 if (
                     receipt is not None
                     and receipt.application_state != "applied"
@@ -691,6 +732,8 @@ class RegisteredWorkerEventReceiptService:
                 await self._acknowledge_locked_delivery(
                     db,
                     redis,
+                    attestation,
+                    emission,
                     receipt,
                     delivery,
                 )
@@ -699,30 +742,11 @@ class RegisteredWorkerEventReceiptService:
     async def _acknowledge_locked_delivery(
         db: AsyncSession,
         redis: Any,
+        attestation: WorkerTaskDeliveryAttestation,
+        emission: WorkerEventEmission | None,
         receipt: RegisteredWorkerEventReceipt | None,
         delivery: RegisteredWorkerEventDelivery,
     ) -> None:
-        attestation = (
-            await db.execute(
-                select(WorkerTaskDeliveryAttestation)
-                .where(
-                    WorkerTaskDeliveryAttestation.id
-                    == delivery.source_task_attestation_id
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if attestation is None:
-            raise RegisteredWorkerEventError(
-                "worker task delivery attestation is missing"
-            )
-        await (
-            RegisteredWorkerEventReceiptService
-            ._lock_registration_fence(
-                db,
-                attestation.worker_registration_id,
-            )
-        )
         if receipt is not None:
             if (
                 receipt.source_task_attestation_id
@@ -783,7 +807,232 @@ class RegisteredWorkerEventReceiptService:
             ):
                 receipt.ack_state = "acknowledged"
                 receipt.acknowledged_at = acknowledged_at
+        if (
+            emission is not None
+            and emission.redis_stream == delivery.redis_stream
+            and emission.consumer_group == delivery.consumer_group
+            and emission.message_id == delivery.message_id
+            and emission.payload_sha256 == delivery.payload_sha256
+            and emission.emission_state == "emitted"
+        ):
+            emission.emission_state = "resolved"
+            emission.resolved_at = acknowledged_at
         await db.flush()
+
+    @classmethod
+    async def _lock_delivery_ack_authority(
+        cls,
+        db: AsyncSession,
+        delivery_id: uuid.UUID,
+    ) -> tuple[
+        WorkerTaskDeliveryAttestation,
+        WorkerEventEmission | None,
+        RegisteredWorkerEventReceipt | None,
+        RegisteredWorkerEventDelivery,
+    ]:
+        identity = (
+            await db.execute(
+                select(
+                    RegisteredWorkerEventDelivery.source_task_attestation_id,
+                    RegisteredWorkerEventDelivery.receipt_id,
+                    WorkerTaskDeliveryAttestation.job_id,
+                    WorkerTaskDeliveryAttestation.node_execution_id,
+                    WorkerTaskDeliveryAttestation.worker_registration_id,
+                )
+                .join(
+                    WorkerTaskDeliveryAttestation,
+                    WorkerTaskDeliveryAttestation.id
+                    == RegisteredWorkerEventDelivery.source_task_attestation_id,
+                )
+                .where(RegisteredWorkerEventDelivery.id == delivery_id)
+            )
+        ).one_or_none()
+        if identity is None:
+            raise RegisteredWorkerEventError(
+                "registered event delivery is missing"
+            )
+        await cls._lock_job_node_registration(
+            db,
+            job_id=identity.job_id,
+            node_execution_id=identity.node_execution_id,
+            registration_id=identity.worker_registration_id,
+        )
+        attestation = (
+            await db.execute(
+                select(WorkerTaskDeliveryAttestation)
+                .where(
+                    WorkerTaskDeliveryAttestation.id
+                    == identity.source_task_attestation_id
+                )
+                .with_for_update()
+            )
+        ).scalar_one()
+        emission = await cls._lock_emission_for_attestation(
+            db,
+            attestation.id,
+        )
+        receipts, deliveries = (
+            await cls._lock_receipts_and_deliveries_for_attestation(
+                db,
+                attestation.id,
+            )
+        )
+        receipt = next(
+            (
+                candidate
+                for candidate in receipts
+                if candidate.id == identity.receipt_id
+            ),
+            None,
+        )
+        if identity.receipt_id is not None and receipt is None:
+            raise RegisteredWorkerEventError(
+                "registered event receipt is missing"
+            )
+        delivery = next(
+            (
+                candidate
+                for candidate in deliveries
+                if candidate.id == delivery_id
+            ),
+            None,
+        )
+        if delivery is None:
+            raise RegisteredWorkerEventError(
+                "registered event delivery is missing"
+            )
+        await cls._lock_dispatch_for_attestation(db, attestation)
+        return attestation, emission, receipt, delivery
+
+    @classmethod
+    async def _lock_job_node_registration(
+        cls,
+        db: AsyncSession,
+        *,
+        job_id: uuid.UUID,
+        node_execution_id: uuid.UUID,
+        registration_id: uuid.UUID,
+    ) -> None:
+        job = (
+            await db.execute(
+                select(Job).where(Job.id == job_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        node = (
+            await db.execute(
+                select(NodeExecution)
+                .where(
+                    NodeExecution.id == node_execution_id,
+                    NodeExecution.job_id == job_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            (job is None or node is None)
+            and db.get_bind().dialect.name == "postgresql"
+        ):
+            raise RegisteredWorkerEventError(
+                "worker event job or node authority is missing"
+            )
+        await cls._lock_registration_fence(db, registration_id)
+
+    @staticmethod
+    async def _lock_emission_for_attestation(
+        db: AsyncSession,
+        attestation_id: uuid.UUID,
+    ) -> WorkerEventEmission | None:
+        if db.get_bind().dialect.name != "postgresql":
+            return None
+        return (
+            await db.execute(
+                select(WorkerEventEmission)
+                .where(
+                    WorkerEventEmission.source_task_attestation_id
+                    == attestation_id
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+
+    @staticmethod
+    async def _lock_receipts_and_deliveries_for_attestation(
+        db: AsyncSession,
+        attestation_id: uuid.UUID,
+    ) -> tuple[
+        list[RegisteredWorkerEventReceipt],
+        list[RegisteredWorkerEventDelivery],
+    ]:
+        receipts = list(
+            (
+                await db.execute(
+                    select(RegisteredWorkerEventReceipt)
+                    .where(
+                        RegisteredWorkerEventReceipt
+                        .source_task_attestation_id
+                        == attestation_id
+                    )
+                    .order_by(RegisteredWorkerEventReceipt.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        deliveries = list(
+            (
+                await db.execute(
+                    select(RegisteredWorkerEventDelivery)
+                    .where(
+                        RegisteredWorkerEventDelivery
+                        .source_task_attestation_id
+                        == attestation_id
+                    )
+                    .order_by(RegisteredWorkerEventDelivery.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        return receipts, deliveries
+
+    @staticmethod
+    async def _lock_dispatch_for_attestation(
+        db: AsyncSession,
+        attestation: WorkerTaskDeliveryAttestation,
+    ) -> None:
+        dispatch = (
+            await db.execute(
+                select(WorkerTaskDispatch)
+                .where(
+                    WorkerTaskDispatch.dispatch_key
+                    == attestation.dispatch_key,
+                    WorkerTaskDispatch.redis_stream
+                    == attestation.redis_stream,
+                    WorkerTaskDispatch.consumer_group
+                    == attestation.consumer_group,
+                    WorkerTaskDispatch.redis_message_id
+                    == attestation.message_id,
+                    WorkerTaskDispatch.payload_sha256
+                    == attestation.payload_sha256,
+                    WorkerTaskDispatch.job_id == attestation.job_id,
+                    WorkerTaskDispatch.node_execution_id
+                    == attestation.node_execution_id,
+                    WorkerTaskDispatch.delivery_state == "delivered",
+                    WorkerTaskDispatch.resolution_state.in_(
+                        (
+                            "unresolved",
+                            "cancel_authorized",
+                            "acknowledged",
+                        )
+                    ),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if dispatch is None:
+            if db.get_bind().dialect.name != "postgresql":
+                return
+            raise RegisteredWorkerEventError(
+                "worker task dispatch acknowledgement identity mismatch"
+            )
 
     @staticmethod
     async def _mark_proven_task_acknowledged(
@@ -1637,6 +1886,34 @@ async def _observe_registered_worker_task_delivery(
     db: AsyncSession,
     event: RegisteredWorkerEvent,
 ) -> uuid.UUID:
+    if db.get_bind().dialect.name == "postgresql":
+        attestation_id = (
+            await db.execute(
+                select(WorkerTaskDeliveryAttestation.id).where(
+                    WorkerTaskDeliveryAttestation.redis_stream
+                    == event.source_task_stream,
+                    WorkerTaskDeliveryAttestation.consumer_group
+                    == event.source_task_group,
+                    WorkerTaskDeliveryAttestation.message_id
+                    == event.source_task_message_id,
+                    WorkerTaskDeliveryAttestation.dispatch_key
+                    == event.source_task_dispatch_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if attestation_id is None:
+            raise RegisteredWorkerEventError(
+                "registered event task delivery attestation is missing"
+            )
+        return await observe_worker_event_emission(
+            db,
+            event.claim,
+            attestation_id=attestation_id,
+            redis_stream=event.redis_stream,
+            consumer_group=event.consumer_group,
+            message_id=event.message_id,
+            payload_sha256=event.payload_sha256,
+        )
     return await observe_worker_task_delivery(
         db,
         event.claim,

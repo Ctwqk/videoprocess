@@ -236,6 +236,7 @@ async def test_registered_submission_fence_uses_database_150_second_margin(
         ),
     )
     margin_checks: list[tuple[NodeExecutionClaim, int]] = []
+    claim_checks: list[NodeExecutionClaim] = []
 
     class FakeTransaction:
         async def __aenter__(self):
@@ -281,6 +282,9 @@ async def test_registered_submission_fence_uses_database_150_second_margin(
     ):
         margin_checks.append((claim, minimum_margin_seconds))
 
+    async def require_claim(_db, claim):
+        claim_checks.append(claim)
+
     async def reject_plain_lease(*args, **kwargs):
         raise AssertionError(
             "submission entry must use the database margin function"
@@ -299,12 +303,19 @@ async def test_registered_submission_fence_uses_database_150_second_margin(
     )
     monkeypatch.setattr(
         upload_operations,
+        "require_registered_worker_node_claim",
+        require_claim,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        upload_operations,
         "require_worker_registration_lease",
         reject_plain_lease,
     )
     store = YouTubeUploadOperationStore(lambda: FakeSession())
 
     async with store.submission_fence(context):
+        assert claim_checks == [context.execution_claim]
         assert margin_checks == [(context.execution_claim, 150)]
 
 

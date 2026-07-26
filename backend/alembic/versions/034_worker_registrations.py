@@ -65,6 +65,38 @@ CLAIM_WORKER_NODE_SIGNATURE = (
     "public.vp_claim_worker_node("
     "uuid,bigint,text,uuid,uuid,text,text,text,text,uuid)"
 )
+REQUIRE_WORKER_NODE_CLAIM_SIGNATURE = (
+    "public.vp_require_worker_node_claim("
+    "uuid,bigint,text,timestamp with time zone,uuid,uuid)"
+)
+PERSIST_WORKER_ARTIFACT_SIGNATURE = (
+    "public.vp_persist_worker_artifact("
+    "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
+    "text,text,bigint,text,text,jsonb)"
+)
+PREPARE_EVENT_EMISSION_SIGNATURE = (
+    "public.vp_prepare_worker_event_emission("
+    "uuid,bigint,text,timestamp with time zone,uuid,uuid,uuid,"
+    "text,text,text,jsonb,text)"
+)
+MARK_EVENT_EMITTED_SIGNATURE = (
+    "public.vp_mark_worker_event_emitted(uuid,uuid,bigint,text)"
+)
+OBSERVE_EVENT_EMISSION_SIGNATURE = (
+    "public.vp_observe_worker_event_emission("
+    "uuid,bigint,text,timestamp with time zone,uuid,uuid,uuid,"
+    "text,text,text,text)"
+)
+RESERVE_YOUTUBE_UPLOAD_SIGNATURE = (
+    "public.vp_reserve_worker_youtube_upload("
+    "uuid,bigint,text,timestamp with time zone,uuid,uuid,uuid,"
+    "text,text,text)"
+)
+TRANSITION_YOUTUBE_UPLOAD_SIGNATURE = (
+    "public.vp_transition_worker_youtube_upload("
+    "uuid,bigint,text,timestamp with time zone,uuid,text,text,"
+    "text,text,jsonb,text)"
+)
 RECOVER_REGISTERED_NODE_SIGNATURE = (
     "public.vp_recover_registered_worker_node(uuid,uuid)"
 )
@@ -463,6 +495,7 @@ def upgrade() -> None:
     )
 
     _create_registered_event_receipt_tables()
+    _upgrade_intermediate_artifact_cache()
     _create_receipt_immutability_trigger()
     _create_endpoint_fingerprints_function()
     _create_operator_functions()
@@ -473,6 +506,9 @@ def upgrade() -> None:
     _create_observer_function()
     _create_task_delivery_functions()
     _create_worker_node_claim_function()
+    _create_worker_node_authority_functions()
+    _create_worker_event_emission_functions()
+    _create_worker_youtube_upload_functions()
     _create_registered_node_recovery_function()
     _create_margin_function()
     _create_task_ack_function()
@@ -493,6 +529,13 @@ def upgrade() -> None:
         TASK_ACK_AUTHORIZE_SIGNATURE,
         PROVEN_TASK_ACKNOWLEDGE_SIGNATURE,
         CLAIM_WORKER_NODE_SIGNATURE,
+        REQUIRE_WORKER_NODE_CLAIM_SIGNATURE,
+        PERSIST_WORKER_ARTIFACT_SIGNATURE,
+        PREPARE_EVENT_EMISSION_SIGNATURE,
+        MARK_EVENT_EMITTED_SIGNATURE,
+        OBSERVE_EVENT_EMISSION_SIGNATURE,
+        RESERVE_YOUTUBE_UPLOAD_SIGNATURE,
+        TRANSITION_YOUTUBE_UPLOAD_SIGNATURE,
         RECOVER_REGISTERED_NODE_SIGNATURE,
         CANCEL_TASK_AUTHORIZE_SIGNATURE,
         CANCEL_TASK_REQUIRE_SIGNATURE,
@@ -506,6 +549,54 @@ def upgrade() -> None:
         REGISTRATION_EXPIRE_SIGNATURE,
     ):
         op.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
+
+
+def _upgrade_intermediate_artifact_cache() -> None:
+    for column in (
+        sa.Column("storage_backend", sa.String(length=50), nullable=True),
+        sa.Column("storage_path", sa.String(length=1024), nullable=True),
+        sa.Column("filename", sa.String(length=512), nullable=True),
+        sa.Column("mime_type", sa.String(length=100), nullable=True),
+        sa.Column("file_size", sa.BigInteger(), nullable=True),
+        sa.Column(
+            "media_info",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=True,
+        ),
+    ):
+        op.add_column("intermediate_artifact_cache", column)
+    op.execute(
+        """
+UPDATE public.intermediate_artifact_cache AS cache
+SET storage_backend = artifact.storage_backend,
+    storage_path = artifact.storage_path,
+    filename = artifact.filename,
+    mime_type = artifact.mime_type,
+    file_size = artifact.file_size,
+    media_info = artifact.media_info::jsonb
+FROM public.artifacts AS artifact
+WHERE artifact.id = cache.output_artifact_id
+"""
+    )
+    op.drop_constraint(
+        "intermediate_artifact_cache_output_artifact_id_fkey",
+        "intermediate_artifact_cache",
+        type_="foreignkey",
+    )
+    op.alter_column(
+        "intermediate_artifact_cache",
+        "output_artifact_id",
+        existing_type=postgresql.UUID(as_uuid=True),
+        nullable=True,
+    )
+    op.create_foreign_key(
+        "intermediate_artifact_cache_output_artifact_id_fkey",
+        "intermediate_artifact_cache",
+        "artifacts",
+        ["output_artifact_id"],
+        ["id"],
+        ondelete="SET NULL",
+    )
 
 
 def _create_registered_event_receipt_tables() -> None:
@@ -729,6 +820,11 @@ def _create_registered_event_receipt_tables() -> None:
             nullable=True,
         ),
         sa.Column(
+            "ack_event_emission_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=True,
+        ),
+        sa.Column(
             "attested_at",
             sa.DateTime(timezone=True),
             server_default=sa.func.now(),
@@ -802,6 +898,150 @@ def _create_registered_event_receipt_tables() -> None:
         unique=False,
     )
 
+    op.create_table(
+        "worker_event_emissions",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "source_task_attestation_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column("redis_stream", sa.String(length=255), nullable=False),
+        sa.Column("consumer_group", sa.String(length=255), nullable=False),
+        sa.Column("message_id", sa.String(length=64), nullable=True),
+        sa.Column("payload_sha256", sa.String(length=64), nullable=False),
+        sa.Column(
+            "payload_json",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+        ),
+        sa.Column("event_type", sa.String(length=32), nullable=False),
+        sa.Column(
+            "job_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "node_execution_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "worker_registration_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column("worker_lease_epoch", sa.BigInteger(), nullable=False),
+        sa.Column("worker_id", sa.String(length=255), nullable=False),
+        sa.Column(
+            "worker_started_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "emission_state",
+            sa.String(length=16),
+            server_default=sa.text("'prepared'"),
+            nullable=False,
+        ),
+        sa.Column(
+            "prepared_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column(
+            "emitted_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "resolved_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.CheckConstraint(
+            "(length(trim(redis_stream)) > 0 "
+            "AND length(trim(consumer_group)) > 0 "
+            "AND length(trim(worker_id)) > 0) IS TRUE",
+            name="ck_worker_event_emission_identity",
+        ),
+        sa.CheckConstraint(
+            "(payload_sha256 ~ '^[0-9a-f]{64}$') IS TRUE",
+            name="ck_worker_event_emission_sha256",
+        ),
+        sa.CheckConstraint(
+            "(event_type IN ('node_completed', 'node_failed')) IS TRUE",
+            name="ck_worker_event_emission_event_type",
+        ),
+        sa.CheckConstraint(
+            "(worker_lease_epoch > 0) IS TRUE",
+            name="ck_worker_event_emission_epoch",
+        ),
+        sa.CheckConstraint(
+            "(emission_state IN ('prepared', 'emitted', 'resolved')) IS TRUE",
+            name="ck_worker_event_emission_state",
+        ),
+        sa.CheckConstraint(
+            "((emission_state = 'prepared' "
+            "AND message_id IS NULL AND emitted_at IS NULL "
+            "AND resolved_at IS NULL) "
+            "OR (emission_state = 'emitted' "
+            "AND message_id IS NOT NULL AND emitted_at IS NOT NULL "
+            "AND resolved_at IS NULL) "
+            "OR (emission_state = 'resolved' "
+            "AND message_id IS NOT NULL AND emitted_at IS NOT NULL "
+            "AND resolved_at IS NOT NULL)) IS TRUE",
+            name="ck_worker_event_emission_times",
+        ),
+        sa.ForeignKeyConstraint(
+            ["source_task_attestation_id"],
+            ["worker_task_delivery_attestations.id"],
+            name="fk_worker_event_emissions_attestation_id",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["job_id"],
+            ["jobs.id"],
+            name="fk_worker_event_emissions_job_id",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["node_execution_id"],
+            ["node_executions.id"],
+            name="fk_worker_event_emissions_node_execution_id",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["worker_registration_id"],
+            ["worker_registrations.id"],
+            name="fk_worker_event_emissions_registration_id",
+            ondelete="RESTRICT",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "source_task_attestation_id",
+            name="uq_worker_event_emission_attestation",
+        ),
+    )
+    op.create_index(
+        "uq_worker_event_emission_redis_identity",
+        "worker_event_emissions",
+        ["redis_stream", "consumer_group", "message_id"],
+        unique=True,
+        postgresql_where=sa.text("message_id IS NOT NULL"),
+    )
+    op.create_index(
+        "ix_worker_event_emissions_job_id",
+        "worker_event_emissions",
+        ["job_id"],
+        unique=False,
+    )
     op.create_table(
         "registered_worker_event_receipts",
         sa.Column(
@@ -1286,15 +1526,25 @@ BEGIN
             ERRCODE = 'P0001';
     END IF;
     IF NEW.ack_state = 'authorized'
-       AND NOT EXISTS (
-            SELECT 1
-            FROM public.worker_registrations AS registration
-            WHERE registration.id = NEW.worker_registration_id
-              AND registration.lease_epoch = NEW.worker_lease_epoch
-              AND registration.database_principal = session_user
-              AND registration.status = 'active'
-              AND registration.lease_expires_at
-                    > pg_catalog.clock_timestamp()
+       AND (
+           NEW.ack_event_emission_id IS NULL
+           OR NOT EXISTS (
+                SELECT 1
+                FROM public.worker_registrations AS registration
+                WHERE registration.id = NEW.worker_registration_id
+                  AND registration.lease_epoch = NEW.worker_lease_epoch
+                  AND registration.database_principal = session_user
+                  AND registration.status = 'active'
+                  AND registration.lease_expires_at
+                        > pg_catalog.clock_timestamp()
+           )
+           OR NOT EXISTS (
+                SELECT 1
+                FROM public.worker_event_emissions AS emission
+                WHERE emission.id = NEW.ack_event_emission_id
+                  AND emission.source_task_attestation_id = NEW.id
+                  AND emission.emission_state IN ('emitted', 'resolved')
+           )
        )
     THEN
         RAISE EXCEPTION USING
@@ -1309,18 +1559,25 @@ BEGIN
             WHERE receipt.source_task_attestation_id = NEW.id
               AND receipt.application_state = 'applied'
        )
-       AND NOT EXISTS (
-            SELECT 1
-            FROM public.worker_task_dispatches AS dispatch
-            WHERE dispatch.dispatch_key = NEW.dispatch_key
-              AND dispatch.redis_stream = NEW.redis_stream
-              AND dispatch.consumer_group = NEW.consumer_group
-              AND dispatch.redis_message_id = NEW.message_id
-              AND dispatch.payload_sha256 = NEW.payload_sha256
-              AND dispatch.resolution_state IN (
-                  'cancel_authorized',
-                  'acknowledged'
-              )
+       AND (
+            EXISTS (
+                SELECT 1
+                FROM public.worker_event_emissions AS emission
+                WHERE emission.source_task_attestation_id = NEW.id
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM public.worker_task_dispatches AS dispatch
+                WHERE dispatch.dispatch_key = NEW.dispatch_key
+                  AND dispatch.redis_stream = NEW.redis_stream
+                  AND dispatch.consumer_group = NEW.consumer_group
+                  AND dispatch.redis_message_id = NEW.message_id
+                  AND dispatch.payload_sha256 = NEW.payload_sha256
+                  AND dispatch.resolution_state IN (
+                      'cancel_authorized',
+                      'acknowledged'
+                  )
+            )
        )
     THEN
         RAISE EXCEPTION USING
@@ -1343,6 +1600,81 @@ EXECUTE FUNCTION public.vp_enforce_worker_task_attestation_immutability()
     op.execute(
         "REVOKE ALL ON FUNCTION "
         "public.vp_enforce_worker_task_attestation_immutability() FROM PUBLIC"
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_enforce_worker_event_emission_immutability()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+    IF ROW(
+        NEW.id,
+        NEW.source_task_attestation_id,
+        NEW.redis_stream,
+        NEW.consumer_group,
+        NEW.payload_sha256,
+        NEW.payload_json,
+        NEW.event_type,
+        NEW.job_id,
+        NEW.node_execution_id,
+        NEW.worker_registration_id,
+        NEW.worker_lease_epoch,
+        NEW.worker_id,
+        NEW.worker_started_at,
+        NEW.prepared_at
+    ) IS DISTINCT FROM ROW(
+        OLD.id,
+        OLD.source_task_attestation_id,
+        OLD.redis_stream,
+        OLD.consumer_group,
+        OLD.payload_sha256,
+        OLD.payload_json,
+        OLD.event_type,
+        OLD.job_id,
+        OLD.node_execution_id,
+        OLD.worker_registration_id,
+        OLD.worker_lease_epoch,
+        OLD.worker_id,
+        OLD.worker_started_at,
+        OLD.prepared_at
+    )
+       OR (
+           OLD.emission_state = 'prepared'
+           AND NEW.emission_state NOT IN ('emitted')
+       )
+       OR (
+           OLD.emission_state = 'emitted'
+           AND (
+               NEW.emission_state NOT IN ('emitted', 'resolved')
+               OR NEW.message_id IS DISTINCT FROM OLD.message_id
+               OR NEW.emitted_at IS DISTINCT FROM OLD.emitted_at
+           )
+       )
+       OR OLD.emission_state = 'resolved'
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'event_emission_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    RETURN NEW;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE TRIGGER trg_worker_event_emission_immutability
+BEFORE UPDATE ON public.worker_event_emissions
+FOR EACH ROW
+EXECUTE FUNCTION public.vp_enforce_worker_event_emission_immutability()
+"""
+    )
+    op.execute(
+        "REVOKE ALL ON FUNCTION "
+        "public.vp_enforce_worker_event_emission_immutability() FROM PUBLIC"
     )
     op.execute(
         """
@@ -3085,6 +3417,8 @@ DECLARE
     v_grant_group text;
     v_started_at timestamptz;
     v_attestation_id uuid;
+    v_task_id uuid;
+    v_channel_id uuid;
 BEGIN
     IF p_registration_id IS NULL
        OR p_lease_epoch IS NULL
@@ -3101,6 +3435,55 @@ BEGIN
         RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
     END IF;
 {_principal_guard_sql()}
+
+    SELECT task.id, task.channel_profile_id
+    INTO v_task_id, v_channel_id
+    FROM public.production_tasks AS task
+    WHERE task.job_id = p_job_id
+    ORDER BY task.id
+    LIMIT 1;
+    IF v_task_id IS NOT NULL AND EXISTS (
+        SELECT 1
+        FROM public.production_tasks AS task
+        WHERE task.job_id = p_job_id AND task.id <> v_task_id
+    ) THEN
+        RAISE EXCEPTION USING MESSAGE = 'production_task_authority_changed', ERRCODE = 'P0001';
+    END IF;
+    IF v_channel_id IS NOT NULL THEN
+        PERFORM 1
+        FROM public.channel_profiles AS channel
+        WHERE channel.id = v_channel_id
+          AND channel.enabled
+          AND channel.halted_at IS NULL
+        FOR UPDATE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION USING MESSAGE = 'channel_authority_changed', ERRCODE = 'P0001';
+        END IF;
+    END IF;
+    PERFORM 1
+    FROM public.runtime_schedules AS schedule
+    WHERE schedule.service_name = 'videoprocess'
+      AND schedule.state IN ('OPEN', 'DRAINING')
+      AND (
+          schedule.guarded_job_id IS NULL
+          OR schedule.guarded_job_id = p_job_id
+      )
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'schedule_authority_changed', ERRCODE = 'P0001';
+    END IF;
+    IF v_task_id IS NOT NULL THEN
+        PERFORM 1
+        FROM public.production_tasks AS task
+        WHERE task.id = v_task_id
+          AND task.job_id = p_job_id
+          AND task.channel_profile_id = v_channel_id
+          AND task.state = 'producing'
+        FOR UPDATE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION USING MESSAGE = 'production_task_authority_changed', ERRCODE = 'P0001';
+        END IF;
+    END IF;
 
     PERFORM 1
     FROM public.jobs AS job
@@ -3229,6 +3612,713 @@ $function$
     )
 
 
+def _create_worker_node_authority_functions() -> None:
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_require_worker_node_claim(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_job_id uuid,
+    p_node_execution_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_task_id uuid;
+    v_channel_id uuid;
+    v_registration public.worker_registrations%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+       OR p_worker_id IS NULL
+       OR p_worker_started_at IS NULL
+       OR p_job_id IS NULL
+       OR p_node_execution_id IS NULL
+       OR length(trim(p_worker_id)) = 0
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+
+    SELECT task.id, task.channel_profile_id
+    INTO v_task_id, v_channel_id
+    FROM public.production_tasks AS task
+    WHERE task.job_id = p_job_id
+    ORDER BY task.id
+    LIMIT 1;
+    IF v_task_id IS NOT NULL AND EXISTS (
+        SELECT 1
+        FROM public.production_tasks AS task
+        WHERE task.job_id = p_job_id
+          AND task.id <> v_task_id
+    ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'production_task_authority_changed',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_channel_id IS NOT NULL THEN
+        PERFORM 1
+        FROM public.channel_profiles AS channel
+        WHERE channel.id = v_channel_id
+          AND channel.enabled
+          AND channel.halted_at IS NULL
+        FOR UPDATE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'channel_authority_changed',
+                ERRCODE = 'P0001';
+        END IF;
+    END IF;
+
+    PERFORM 1
+    FROM public.runtime_schedules AS schedule
+    WHERE schedule.service_name = 'videoprocess'
+      AND schedule.state IN ('OPEN', 'DRAINING')
+      AND (
+          schedule.guarded_job_id IS NULL
+          OR schedule.guarded_job_id = p_job_id
+      )
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'schedule_authority_changed',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_task_id IS NOT NULL THEN
+        PERFORM 1
+        FROM public.production_tasks AS task
+        WHERE task.id = v_task_id
+          AND task.job_id = p_job_id
+          AND task.channel_profile_id = v_channel_id
+          AND task.state = 'producing'
+        FOR UPDATE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'production_task_authority_changed',
+                ERRCODE = 'P0001';
+        END IF;
+    END IF;
+
+    PERFORM 1
+    FROM public.jobs AS job
+    WHERE job.id = p_job_id
+      AND job.status::text = 'RUNNING'
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'job_authority_changed',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.node_executions AS node
+    WHERE node.id = p_node_execution_id
+      AND node.job_id = p_job_id
+      AND node.status::text = 'RUNNING'
+      AND node.worker_id = p_worker_id
+      AND node.started_at = p_worker_started_at
+      AND node.worker_registration_id = p_registration_id
+      AND node.worker_lease_epoch = p_lease_epoch
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'node_claim_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id
+    FOR SHARE;
+    IF NOT FOUND
+       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_registration.status IS DISTINCT FROM 'active'
+       OR v_registration.lease_expires_at <= v_now
+       OR v_registration.database_principal IS DISTINCT FROM v_principal
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_persist_worker_artifact(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_job_id uuid,
+    p_node_execution_id uuid,
+    p_filename text,
+    p_mime_type text,
+    p_file_size bigint,
+    p_storage_backend text,
+    p_storage_path text,
+    p_media_info jsonb
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_artifact_id uuid;
+BEGIN
+    IF p_filename IS NULL
+       OR p_file_size IS NULL
+       OR p_file_size < 0
+       OR p_storage_backend IS NULL
+       OR p_storage_path IS NULL
+       OR length(trim(p_filename)) = 0
+       OR length(trim(p_storage_backend)) = 0
+       OR length(trim(p_storage_path)) = 0
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'artifact_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM public.vp_require_worker_node_claim(
+        p_registration_id,
+        p_lease_epoch,
+        p_worker_id,
+        p_worker_started_at,
+        p_job_id,
+        p_node_execution_id
+    );
+    INSERT INTO public.artifacts (
+        job_id,
+        node_execution_id,
+        kind,
+        filename,
+        mime_type,
+        file_size,
+        storage_backend,
+        storage_path,
+        media_info
+    ) VALUES (
+        p_job_id,
+        p_node_execution_id,
+        'INTERMEDIATE'::public.artifact_kind,
+        p_filename,
+        p_mime_type,
+        p_file_size,
+        p_storage_backend,
+        p_storage_path,
+        p_media_info
+    )
+    RETURNING id INTO v_artifact_id;
+    RETURN v_artifact_id;
+END;
+$function$
+"""
+    )
+
+
+def _create_worker_event_emission_functions() -> None:
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_prepare_worker_event_emission(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_job_id uuid,
+    p_node_execution_id uuid,
+    p_attestation_id uuid,
+    p_redis_stream text,
+    p_consumer_group text,
+    p_payload_sha256 text,
+    p_payload_json jsonb,
+    p_event_type text
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_emission public.worker_event_emissions%ROWTYPE;
+BEGIN
+    IF p_attestation_id IS NULL
+       OR p_redis_stream IS NULL
+       OR p_consumer_group IS NULL
+       OR p_payload_sha256 !~ '^[0-9a-f]{{64}}$'
+       OR p_payload_json IS NULL
+       OR p_event_type NOT IN ('node_completed', 'node_failed')
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM public.vp_require_worker_node_claim(
+        p_registration_id,
+        p_lease_epoch,
+        p_worker_id,
+        p_worker_started_at,
+        p_job_id,
+        p_node_execution_id
+    );
+    PERFORM 1
+    FROM public.worker_task_delivery_attestations AS attestation
+    JOIN public.worker_task_dispatches AS dispatch
+      ON dispatch.dispatch_key = attestation.dispatch_key
+    WHERE attestation.id = p_attestation_id
+      AND attestation.job_id = p_job_id
+      AND attestation.node_execution_id = p_node_execution_id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at
+      AND attestation.ack_state = 'pending'
+      AND dispatch.job_id = p_job_id
+      AND dispatch.node_execution_id = p_node_execution_id
+      AND dispatch.redis_stream = attestation.redis_stream
+      AND dispatch.consumer_group = attestation.consumer_group
+      AND dispatch.redis_message_id = attestation.message_id
+      AND dispatch.payload_sha256 = attestation.payload_sha256
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.resolution_state = 'unresolved'
+    FOR UPDATE OF attestation, dispatch;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_delivery_attestation_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    INSERT INTO public.worker_event_emissions (
+        source_task_attestation_id,
+        redis_stream,
+        consumer_group,
+        payload_sha256,
+        payload_json,
+        event_type,
+        job_id,
+        node_execution_id,
+        worker_registration_id,
+        worker_lease_epoch,
+        worker_id,
+        worker_started_at
+    ) VALUES (
+        p_attestation_id,
+        p_redis_stream,
+        p_consumer_group,
+        p_payload_sha256,
+        p_payload_json,
+        p_event_type,
+        p_job_id,
+        p_node_execution_id,
+        p_registration_id,
+        p_lease_epoch,
+        p_worker_id,
+        p_worker_started_at
+    )
+    ON CONFLICT (source_task_attestation_id) DO NOTHING;
+    SELECT emission.*
+    INTO v_emission
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.source_task_attestation_id = p_attestation_id
+    FOR UPDATE;
+    IF NOT FOUND
+       OR v_emission.redis_stream IS DISTINCT FROM p_redis_stream
+       OR v_emission.consumer_group IS DISTINCT FROM p_consumer_group
+       OR v_emission.payload_sha256 IS DISTINCT FROM p_payload_sha256
+       OR v_emission.payload_json IS DISTINCT FROM p_payload_json
+       OR v_emission.event_type IS DISTINCT FROM p_event_type
+       OR v_emission.job_id IS DISTINCT FROM p_job_id
+       OR v_emission.node_execution_id IS DISTINCT FROM p_node_execution_id
+       OR v_emission.worker_registration_id IS DISTINCT FROM p_registration_id
+       OR v_emission.worker_lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_emission.worker_id IS DISTINCT FROM p_worker_id
+       OR v_emission.worker_started_at IS DISTINCT FROM p_worker_started_at
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'event_emission_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    RETURN v_emission.id;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_mark_worker_event_emitted(
+    p_emission_id uuid,
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_message_id text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_emission public.worker_event_emissions%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_emission_id IS NULL
+       OR p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+       OR p_message_id IS NULL
+       OR length(trim(p_message_id)) = 0
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    SELECT emission.*
+    INTO v_emission
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.id = p_emission_id;
+    IF NOT FOUND
+       OR v_emission.worker_registration_id IS DISTINCT FROM p_registration_id
+       OR v_emission.worker_lease_epoch IS DISTINCT FROM p_lease_epoch
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+    PERFORM public.vp_require_worker_node_claim(
+        p_registration_id,
+        p_lease_epoch,
+        v_emission.worker_id,
+        v_emission.worker_started_at,
+        v_emission.job_id,
+        v_emission.node_execution_id
+    );
+    SELECT emission.*
+    INTO v_emission
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.id = p_emission_id
+    FOR UPDATE;
+    IF v_emission.emission_state = 'prepared' THEN
+        UPDATE public.worker_event_emissions
+        SET message_id = p_message_id,
+            emission_state = 'emitted',
+            emitted_at = v_now
+        WHERE id = p_emission_id;
+    ELSIF v_emission.message_id IS DISTINCT FROM p_message_id
+          OR v_emission.emission_state NOT IN ('emitted', 'resolved')
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_observe_worker_event_emission(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_job_id uuid,
+    p_node_execution_id uuid,
+    p_attestation_id uuid,
+    p_redis_stream text,
+    p_consumer_group text,
+    p_message_id text,
+    p_payload_sha256 text
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_emission public.worker_event_emissions%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_attestation_id IS NULL
+       OR p_message_id IS NULL
+       OR p_payload_sha256 !~ '^[0-9a-f]{64}$'
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1 FROM public.jobs AS job
+    WHERE job.id = p_job_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'job_authority_changed', ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1 FROM public.node_executions AS node
+    WHERE node.id = p_node_execution_id AND node.job_id = p_job_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'node_claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    PERFORM 1 FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id
+      AND registration.lease_epoch = p_lease_epoch
+    FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.id = p_attestation_id
+      AND attestation.job_id = p_job_id
+      AND attestation.node_execution_id = p_node_execution_id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'task_delivery_attestation_mismatch', ERRCODE = 'P0001';
+    END IF;
+    SELECT emission.*
+    INTO v_emission
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.source_task_attestation_id = p_attestation_id
+      AND emission.redis_stream = p_redis_stream
+      AND emission.consumer_group = p_consumer_group
+      AND emission.payload_sha256 = p_payload_sha256
+      AND emission.job_id = p_job_id
+      AND emission.node_execution_id = p_node_execution_id
+      AND emission.worker_registration_id = p_registration_id
+      AND emission.worker_lease_epoch = p_lease_epoch
+      AND emission.worker_id = p_worker_id
+      AND emission.worker_started_at = p_worker_started_at
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_missing', ERRCODE = 'P0001';
+    END IF;
+    IF v_emission.emission_state = 'prepared' THEN
+        UPDATE public.worker_event_emissions
+        SET message_id = p_message_id,
+            emission_state = 'emitted',
+            emitted_at = v_now
+        WHERE id = v_emission.id;
+    ELSIF v_emission.message_id IS DISTINCT FROM p_message_id THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+    RETURN p_attestation_id;
+END;
+$function$
+"""
+    )
+
+
+def _create_worker_youtube_upload_functions() -> None:
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_reserve_worker_youtube_upload(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_job_id uuid,
+    p_node_execution_id uuid,
+    p_input_artifact_id uuid,
+    p_content_sha256 text,
+    p_title text,
+    p_privacy text
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_operation_id uuid;
+    v_production_task_id uuid;
+BEGIN
+    IF p_input_artifact_id IS NULL
+       OR p_content_sha256 !~ '^[0-9a-f]{{64}}$'
+       OR p_title IS NULL
+       OR length(trim(p_title)) = 0
+       OR p_privacy NOT IN ('private', 'unlisted')
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'upload_operation_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM public.vp_require_worker_node_claim(
+        p_registration_id, p_lease_epoch, p_worker_id,
+        p_worker_started_at, p_job_id, p_node_execution_id
+    );
+    PERFORM 1
+    FROM public.node_executions AS node
+    WHERE node.id = p_node_execution_id
+      AND node.node_type = 'youtube_upload'
+      AND node.input_artifact_ids = ARRAY[p_input_artifact_id]::uuid[];
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'upload_operation_mismatch', ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.artifacts AS artifact
+    WHERE artifact.id = p_input_artifact_id
+      AND artifact.job_id = p_job_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'artifact_mismatch', ERRCODE = 'P0001';
+    END IF;
+    SELECT task.id
+    INTO v_production_task_id
+    FROM public.production_tasks AS task
+    WHERE task.job_id = p_job_id
+    ORDER BY task.id
+    LIMIT 1;
+    INSERT INTO public.youtube_upload_operations (
+        production_task_id,
+        job_id,
+        node_execution_id,
+        input_artifact_id,
+        content_sha256,
+        title,
+        privacy,
+        status,
+        receipt_json
+    ) VALUES (
+        v_production_task_id,
+        p_job_id,
+        p_node_execution_id,
+        p_input_artifact_id,
+        p_content_sha256,
+        p_title,
+        p_privacy,
+        'reserved',
+        '{{}}'::jsonb
+    )
+    ON CONFLICT (node_execution_id) DO NOTHING;
+    SELECT operation.id
+    INTO v_operation_id
+    FROM public.youtube_upload_operations AS operation
+    WHERE operation.node_execution_id = p_node_execution_id
+      AND operation.job_id = p_job_id
+      AND operation.input_artifact_id = p_input_artifact_id
+      AND operation.content_sha256 = p_content_sha256
+      AND operation.title = p_title
+      AND operation.privacy = p_privacy
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'upload_operation_mismatch', ERRCODE = 'P0001';
+    END IF;
+    RETURN v_operation_id;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_transition_worker_youtube_upload(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_operation_id uuid,
+    p_expected_status text,
+    p_transition text,
+    p_manager_task_id text,
+    p_platform_video_id text,
+    p_receipt_json jsonb,
+    p_error_message text
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_operation public.youtube_upload_operations%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+{_principal_guard_sql()}
+    SELECT operation.*
+    INTO v_operation
+    FROM public.youtube_upload_operations AS operation
+    WHERE operation.id = p_operation_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'upload_operation_mismatch', ERRCODE = 'P0001';
+    END IF;
+    PERFORM public.vp_require_worker_node_claim(
+        p_registration_id, p_lease_epoch, p_worker_id,
+        p_worker_started_at, v_operation.job_id, v_operation.node_execution_id
+    );
+    SELECT operation.*
+    INTO v_operation
+    FROM public.youtube_upload_operations AS operation
+    WHERE operation.id = p_operation_id
+    FOR UPDATE;
+    IF v_operation.status IS DISTINCT FROM p_expected_status THEN
+        RAISE EXCEPTION USING MESSAGE = 'upload_transition_mismatch', ERRCODE = 'P0001';
+    END IF;
+    IF p_transition = 'attempting'
+       AND p_expected_status = 'reserved'
+       AND v_operation.request_attempted_at IS NULL
+    THEN
+        UPDATE public.youtube_upload_operations
+        SET request_attempted_at = v_now, updated_at = v_now
+        WHERE id = p_operation_id;
+    ELSIF p_transition = 'submitted'
+          AND p_expected_status = 'reserved'
+          AND p_manager_task_id IS NOT NULL
+    THEN
+        UPDATE public.youtube_upload_operations
+        SET status = 'submitted',
+            manager_task_id = p_manager_task_id,
+            request_attempted_at = COALESCE(request_attempted_at, v_now),
+            error_message = NULL,
+            updated_at = v_now
+        WHERE id = p_operation_id;
+    ELSIF p_transition = 'succeeded'
+          AND p_expected_status = 'submitted'
+          AND p_platform_video_id IS NOT NULL
+          AND p_receipt_json IS NOT NULL
+    THEN
+        UPDATE public.youtube_upload_operations
+        SET status = 'succeeded',
+            platform_video_id = p_platform_video_id,
+            receipt_json = p_receipt_json,
+            completed_at = v_now,
+            error_message = NULL,
+            updated_at = v_now
+        WHERE id = p_operation_id;
+    ELSIF p_transition IN ('failed', 'uncertain')
+          AND p_expected_status IN ('reserved', 'submitted')
+          AND p_error_message IS NOT NULL
+    THEN
+        UPDATE public.youtube_upload_operations
+        SET status = p_transition,
+            error_message = p_error_message,
+            updated_at = v_now
+        WHERE id = p_operation_id;
+    ELSE
+        RAISE EXCEPTION USING MESSAGE = 'upload_transition_mismatch', ERRCODE = 'P0001';
+    END IF;
+    RETURN p_operation_id;
+END;
+$function$
+"""
+    )
+
+
 def _create_registered_node_recovery_function() -> None:
     op.execute(
         """
@@ -3245,12 +4335,15 @@ DECLARE
     v_registration_id uuid;
     v_lease_epoch bigint;
     v_registration public.worker_registrations%ROWTYPE;
+    v_job_status text;
+    v_node_status text;
     v_now timestamptz;
 BEGIN
     IF p_job_id IS NULL OR p_node_execution_id IS NULL THEN
         RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
     END IF;
-    PERFORM 1
+    SELECT job.status::text
+    INTO v_job_status
     FROM public.jobs AS job
     WHERE job.id = p_job_id
     FOR UPDATE;
@@ -3258,14 +4351,22 @@ BEGIN
         RAISE EXCEPTION USING MESSAGE = 'job_authority_changed', ERRCODE = 'P0001';
     END IF;
 
-    SELECT node.worker_registration_id, node.worker_lease_epoch
-    INTO v_registration_id, v_lease_epoch
+    SELECT
+        node.worker_registration_id,
+        node.worker_lease_epoch,
+        node.status::text
+    INTO v_registration_id, v_lease_epoch, v_node_status
     FROM public.node_executions AS node
     WHERE node.id = p_node_execution_id
       AND node.job_id = p_job_id
     FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION USING MESSAGE = 'node_claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+    IF v_job_status <> 'RUNNING'
+       OR v_node_status NOT IN ('QUEUED', 'RUNNING')
+    THEN
+        RETURN 'terminal';
     END IF;
     IF v_registration_id IS NULL OR v_lease_epoch IS NULL THEN
         RETURN 'not_registered';
@@ -3294,6 +4395,15 @@ BEGIN
     IF FOUND THEN
         RETURN 'held_unresolved';
     END IF;
+    PERFORM 1
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.node_execution_id = p_node_execution_id
+      AND emission.emission_state IN ('prepared', 'emitted')
+    ORDER BY emission.id
+    FOR UPDATE;
+    IF FOUND THEN
+        RETURN 'held_unresolved_event';
+    END IF;
 
     UPDATE public.node_executions AS node
     SET status = 'PENDING',
@@ -3305,7 +4415,10 @@ BEGIN
         completed_at = NULL,
         progress = 0,
         error_message = NULL,
-        input_artifact_ids = ARRAY[]::uuid[]
+        error_trace = NULL,
+        input_artifact_ids = ARRAY[]::uuid[],
+        output_artifact_id = NULL,
+        retry_count = node.retry_count
     WHERE node.id = p_node_execution_id
       AND node.job_id = p_job_id
       AND node.worker_registration_id = v_registration_id
@@ -3411,7 +4524,7 @@ AS $function$
 DECLARE
     v_principal text := session_user;
     v_privileged boolean;
-    v_registration public.worker_registrations%ROWTYPE;
+    v_attestation public.worker_task_delivery_attestations%ROWTYPE;
 BEGIN
     IF p_registration_id IS NULL
        OR p_lease_epoch IS NULL
@@ -3430,44 +4543,103 @@ BEGIN
         RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
     END IF;
 {_principal_guard_sql()}
-    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
-        pg_catalog.hashtextextended(
-            'vp-worker-registration:' || p_registration_id::text,
-            0
-        )
-    );
-
-    SELECT registration.*
-    INTO v_registration
-    FROM public.worker_registrations AS registration
-    WHERE registration.id = p_registration_id;
-
-    IF NOT FOUND
-       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
-    THEN
+    SELECT attestation.*
+    INTO v_attestation
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at
+      AND attestation.redis_stream = p_redis_stream
+      AND attestation.consumer_group = p_consumer_group
+      AND attestation.message_id = p_message_id
+      AND attestation.payload_sha256 = p_payload_sha256
+      AND attestation.dispatch_key = p_dispatch_key;
+    IF NOT FOUND THEN
         RAISE EXCEPTION USING
-            MESSAGE = 'lease_fenced',
+            MESSAGE = 'event_receipt_missing',
             ERRCODE = 'P0001';
     END IF;
-    IF v_registration.database_principal IS DISTINCT FROM v_principal THEN
+    PERFORM public.vp_require_worker_node_claim(
+        p_registration_id,
+        p_lease_epoch,
+        p_worker_id,
+        p_worker_started_at,
+        v_attestation.job_id,
+        v_attestation.node_execution_id
+    );
+
+    SELECT attestation.*
+    INTO v_attestation
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.id = v_attestation.id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at
+      AND attestation.redis_stream = p_redis_stream
+      AND attestation.consumer_group = p_consumer_group
+      AND attestation.message_id = p_message_id
+      AND attestation.payload_sha256 = p_payload_sha256
+      AND attestation.dispatch_key = p_dispatch_key
+    FOR UPDATE;
+    IF NOT FOUND THEN
         RAISE EXCEPTION USING
-            MESSAGE = 'database_principal_mismatch',
+            MESSAGE = 'event_receipt_missing',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.source_task_attestation_id = v_attestation.id
+    ORDER BY emission.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.registered_worker_event_receipts AS receipt
+    WHERE receipt.source_task_attestation_id = v_attestation.id
+    ORDER BY receipt.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.registered_worker_event_deliveries AS delivery
+    WHERE delivery.source_task_attestation_id = v_attestation.id
+    ORDER BY delivery.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.worker_task_dispatches AS dispatch
+    WHERE dispatch.dispatch_key = p_dispatch_key
+      AND dispatch.job_id = v_attestation.job_id
+      AND dispatch.node_execution_id = v_attestation.node_execution_id
+      AND dispatch.redis_stream = p_redis_stream
+      AND dispatch.consumer_group = p_consumer_group
+      AND dispatch.redis_message_id = p_message_id
+      AND dispatch.payload_sha256 = p_payload_sha256
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.resolution_state IN (
+          'unresolved',
+          'cancel_authorized',
+          'acknowledged'
+      )
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_dispatch_mismatch',
             ERRCODE = 'P0001';
     END IF;
     IF NOT EXISTS (
         SELECT 1
         FROM public.worker_task_delivery_attestations AS attestation
-        WHERE attestation.worker_registration_id = p_registration_id
-          AND attestation.worker_lease_epoch = p_lease_epoch
-          AND attestation.worker_id = p_worker_id
-          AND attestation.worker_started_at = p_worker_started_at
-          AND attestation.redis_stream = p_redis_stream
-          AND attestation.consumer_group = p_consumer_group
-          AND attestation.message_id = p_message_id
-          AND attestation.payload_sha256 = p_payload_sha256
-          AND attestation.dispatch_key = p_dispatch_key
+        WHERE attestation.id = v_attestation.id
           AND (
-              attestation.ack_state = 'authorized'
+              (
+                  attestation.ack_state = 'authorized'
+                  AND attestation.ack_event_emission_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM public.worker_event_emissions AS emission
+                      WHERE emission.id = attestation.ack_event_emission_id
+                        AND emission.source_task_attestation_id = attestation.id
+                        AND emission.emission_state IN ('emitted', 'resolved')
+                  )
+              )
               OR EXISTS (
                   SELECT 1
                   FROM public.registered_worker_event_receipts AS receipt
@@ -3503,6 +4675,8 @@ DECLARE
     v_principal text := session_user;
     v_privileged boolean;
     v_registration public.worker_registrations%ROWTYPE;
+    v_attestation public.worker_task_delivery_attestations%ROWTYPE;
+    v_emission public.worker_event_emissions%ROWTYPE;
     v_now timestamptz;
 BEGIN
     IF p_attestation_id IS NULL
@@ -3514,6 +4688,27 @@ BEGIN
         RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
     END IF;
 {_principal_guard_sql()}
+    SELECT attestation.*
+    INTO v_attestation
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.id = p_attestation_id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_delivery_attestation_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM public.vp_require_worker_node_claim(
+        p_registration_id,
+        p_lease_epoch,
+        p_worker_id,
+        p_worker_started_at,
+        v_attestation.job_id,
+        v_attestation.node_execution_id
+    );
     PERFORM pg_catalog.pg_advisory_xact_lock_shared(
         pg_catalog.hashtextextended(
             'vp-worker-registration:' || p_registration_id::text,
@@ -3541,8 +4736,69 @@ BEGIN
         RAISE EXCEPTION USING MESSAGE = 'lease_expired', ERRCODE = 'P0001';
     END IF;
 
+    SELECT attestation.*
+    INTO v_attestation
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.id = p_attestation_id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_delivery_attestation_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    SELECT emission.*
+    INTO v_emission
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.source_task_attestation_id = p_attestation_id
+      AND emission.worker_registration_id = p_registration_id
+      AND emission.worker_lease_epoch = p_lease_epoch
+      AND emission.worker_id = p_worker_id
+      AND emission.worker_started_at = p_worker_started_at
+      AND emission.emission_state IN ('emitted', 'resolved')
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'event_emission_missing',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.registered_worker_event_receipts AS receipt
+    WHERE receipt.source_task_attestation_id = p_attestation_id
+    ORDER BY receipt.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.registered_worker_event_deliveries AS delivery
+    WHERE delivery.source_task_attestation_id = p_attestation_id
+    ORDER BY delivery.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.worker_task_dispatches AS dispatch
+    WHERE dispatch.dispatch_key = v_attestation.dispatch_key
+      AND dispatch.job_id = v_attestation.job_id
+      AND dispatch.node_execution_id = v_attestation.node_execution_id
+      AND dispatch.redis_stream = v_attestation.redis_stream
+      AND dispatch.consumer_group = v_attestation.consumer_group
+      AND dispatch.redis_message_id = v_attestation.message_id
+      AND dispatch.payload_sha256 = v_attestation.payload_sha256
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.resolution_state IN (
+          'unresolved',
+          'cancel_authorized',
+          'acknowledged'
+      )
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_dispatch_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
     UPDATE public.worker_task_delivery_attestations AS attestation
-    SET ack_state = 'authorized'
+    SET ack_state = 'authorized',
+        ack_event_emission_id = v_emission.id
     WHERE attestation.id = p_attestation_id
       AND attestation.worker_registration_id = p_registration_id
       AND attestation.worker_lease_epoch = p_lease_epoch
@@ -3558,6 +4814,7 @@ BEGIN
           AND attestation.worker_id = p_worker_id
           AND attestation.worker_started_at = p_worker_started_at
           AND attestation.ack_state IN ('authorized', 'acknowledged')
+          AND attestation.ack_event_emission_id = v_emission.id
     )
     THEN
         RAISE EXCEPTION USING
@@ -3608,6 +4865,32 @@ BEGIN
         RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
     END IF;
 {_principal_guard_sql()}
+    SELECT attestation.*
+    INTO v_attestation
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.id = p_attestation_id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = p_worker_id
+      AND attestation.worker_started_at = p_worker_started_at
+      AND attestation.redis_stream = p_redis_stream
+      AND attestation.consumer_group = p_consumer_group
+      AND attestation.message_id = p_message_id
+      AND attestation.payload_sha256 = p_payload_sha256
+      AND attestation.dispatch_key = p_dispatch_key;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_delivery_attestation_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM public.vp_require_worker_node_claim(
+        p_registration_id,
+        p_lease_epoch,
+        p_worker_id,
+        p_worker_started_at,
+        v_attestation.job_id,
+        v_attestation.node_execution_id
+    );
     PERFORM pg_catalog.pg_advisory_xact_lock_shared(
         pg_catalog.hashtextextended(
             'vp-worker-registration:' || p_registration_id::text,
@@ -3650,8 +4933,54 @@ BEGIN
             MESSAGE = 'task_delivery_attestation_mismatch',
             ERRCODE = 'P0001';
     END IF;
+    PERFORM 1
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.source_task_attestation_id = p_attestation_id
+    ORDER BY emission.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.registered_worker_event_receipts AS receipt
+    WHERE receipt.source_task_attestation_id = p_attestation_id
+    ORDER BY receipt.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.registered_worker_event_deliveries AS delivery
+    WHERE delivery.source_task_attestation_id = p_attestation_id
+    ORDER BY delivery.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.worker_task_dispatches AS dispatch
+    WHERE dispatch.dispatch_key = p_dispatch_key
+      AND dispatch.job_id = v_attestation.job_id
+      AND dispatch.node_execution_id = v_attestation.node_execution_id
+      AND dispatch.redis_stream = p_redis_stream
+      AND dispatch.consumer_group = p_consumer_group
+      AND dispatch.redis_message_id = p_message_id
+      AND dispatch.payload_sha256 = p_payload_sha256
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.resolution_state IN (
+          'unresolved',
+          'cancel_authorized',
+          'acknowledged'
+      )
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'task_dispatch_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
     IF NOT (
-        v_attestation.ack_state = 'authorized'
+        (
+            v_attestation.ack_state = 'authorized'
+            AND v_attestation.ack_event_emission_id IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM public.worker_event_emissions AS emission
+                WHERE emission.id = v_attestation.ack_event_emission_id
+                  AND emission.source_task_attestation_id = p_attestation_id
+                  AND emission.emission_state IN ('emitted', 'resolved')
+            )
+        )
         OR EXISTS (
             SELECT 1
             FROM public.registered_worker_event_receipts AS receipt
@@ -3771,8 +5100,33 @@ BEGIN
             MESSAGE = 'task_delivery_attestation_mismatch',
             ERRCODE = 'P0001';
     END IF;
+    PERFORM 1
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.source_task_attestation_id = p_attestation_id
+    ORDER BY emission.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.registered_worker_event_receipts AS receipt
+    WHERE receipt.source_task_attestation_id = p_attestation_id
+    ORDER BY receipt.id
+    FOR UPDATE;
+    PERFORM 1
+    FROM public.registered_worker_event_deliveries AS delivery
+    WHERE delivery.source_task_attestation_id = p_attestation_id
+    ORDER BY delivery.id
+    FOR UPDATE;
     IF NOT (
-        v_attestation.ack_state IN ('authorized', 'acknowledged')
+        (
+            v_attestation.ack_state IN ('authorized', 'acknowledged')
+            AND v_attestation.ack_event_emission_id IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM public.worker_event_emissions AS emission
+                WHERE emission.id = v_attestation.ack_event_emission_id
+                  AND emission.source_task_attestation_id = p_attestation_id
+                  AND emission.emission_state IN ('emitted', 'resolved')
+            )
+        )
         OR EXISTS (
             SELECT 1
             FROM public.registered_worker_event_receipts AS receipt
@@ -3910,6 +5264,36 @@ BEGIN
     WHERE attestation.dispatch_key = v_dispatch_key
     ORDER BY attestation.id
     FOR UPDATE;
+    PERFORM 1
+    FROM public.worker_event_emissions AS emission
+    JOIN public.worker_task_delivery_attestations AS attestation
+      ON attestation.id = emission.source_task_attestation_id
+    WHERE attestation.dispatch_key = v_dispatch_key
+    ORDER BY emission.id
+    FOR UPDATE OF emission;
+    PERFORM 1
+    FROM public.registered_worker_event_receipts AS receipt
+    JOIN public.worker_task_delivery_attestations AS attestation
+      ON attestation.id = receipt.source_task_attestation_id
+    WHERE attestation.dispatch_key = v_dispatch_key
+    ORDER BY receipt.id
+    FOR UPDATE OF receipt;
+    PERFORM 1
+    FROM public.registered_worker_event_deliveries AS delivery
+    JOIN public.worker_task_delivery_attestations AS attestation
+      ON attestation.id = delivery.source_task_attestation_id
+    WHERE attestation.dispatch_key = v_dispatch_key
+    ORDER BY delivery.id
+    FOR UPDATE OF delivery;
+    IF EXISTS (
+        SELECT 1
+        FROM public.worker_event_emissions AS emission
+        JOIN public.worker_task_delivery_attestations AS attestation
+          ON attestation.id = emission.source_task_attestation_id
+        WHERE attestation.dispatch_key = v_dispatch_key
+    ) THEN
+        RETURN 'held_event';
+    END IF;
     SELECT dispatch.delivery_state, dispatch.resolution_state
     INTO v_state, v_resolution
     FROM public.worker_task_dispatches AS dispatch
@@ -4044,6 +5428,38 @@ BEGIN
     ORDER BY attestation.id
     FOR UPDATE;
     PERFORM 1
+    FROM public.worker_event_emissions AS emission
+    JOIN public.worker_task_delivery_attestations AS attestation
+      ON attestation.id = emission.source_task_attestation_id
+    WHERE attestation.dispatch_key = p_dispatch_key
+    ORDER BY emission.id
+    FOR UPDATE OF emission;
+    PERFORM 1
+    FROM public.registered_worker_event_receipts AS receipt
+    JOIN public.worker_task_delivery_attestations AS attestation
+      ON attestation.id = receipt.source_task_attestation_id
+    WHERE attestation.dispatch_key = p_dispatch_key
+    ORDER BY receipt.id
+    FOR UPDATE OF receipt;
+    PERFORM 1
+    FROM public.registered_worker_event_deliveries AS delivery
+    JOIN public.worker_task_delivery_attestations AS attestation
+      ON attestation.id = delivery.source_task_attestation_id
+    WHERE attestation.dispatch_key = p_dispatch_key
+    ORDER BY delivery.id
+    FOR UPDATE OF delivery;
+    IF EXISTS (
+        SELECT 1
+        FROM public.worker_event_emissions AS emission
+        JOIN public.worker_task_delivery_attestations AS attestation
+          ON attestation.id = emission.source_task_attestation_id
+        WHERE attestation.dispatch_key = p_dispatch_key
+    ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'event_emission_unresolved',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
     FROM public.worker_task_dispatches AS dispatch
     WHERE dispatch.id = p_dispatch_id
       AND dispatch.dispatch_key = p_dispatch_key
@@ -4100,6 +5516,11 @@ BEGIN
             MESSAGE = 'worker_event_authority_unresolved',
             ERRCODE = 'P0001';
     END IF;
+    PERFORM 1
+    FROM public.node_executions AS node
+    WHERE node.job_id = p_job_id
+    ORDER BY node.id
+    FOR UPDATE;
 
     FOR v_registration_id IN
         SELECT DISTINCT attestation.worker_registration_id
@@ -4125,6 +5546,11 @@ BEGIN
     ORDER BY attestation.id
     FOR UPDATE;
     PERFORM 1
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.job_id = p_job_id
+    ORDER BY emission.id
+    FOR UPDATE;
+    PERFORM 1
     FROM public.registered_worker_event_receipts AS receipt
     WHERE receipt.job_id = p_job_id
     ORDER BY receipt.id
@@ -4147,6 +5573,12 @@ BEGIN
         FROM public.worker_task_delivery_attestations AS attestation
         WHERE attestation.job_id = p_job_id
           AND attestation.ack_state <> 'acknowledged'
+    )
+       OR EXISTS (
+        SELECT 1
+        FROM public.worker_event_emissions AS emission
+        WHERE emission.job_id = p_job_id
+          AND emission.emission_state <> 'resolved'
     )
        OR EXISTS (
         SELECT 1
@@ -4194,6 +5626,9 @@ BEGIN
     DELETE FROM public.registered_worker_event_receipts
     WHERE job_id = p_job_id;
 
+    DELETE FROM public.worker_event_emissions
+    WHERE job_id = p_job_id;
+
     DELETE FROM public.worker_task_delivery_attestations
     WHERE job_id = p_job_id;
 END;
@@ -4203,6 +5638,10 @@ $function$
 
 
 def downgrade() -> None:
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_worker_event_emission_immutability "
+        "ON public.worker_event_emissions"
+    )
     op.execute(
         "DROP TRIGGER IF EXISTS trg_worker_task_dispatch_immutability "
         "ON public.worker_task_dispatches"
@@ -4227,6 +5666,7 @@ def downgrade() -> None:
         "public.vp_enforce_worker_task_dispatch_immutability()",
         "public.vp_enforce_worker_event_delivery_immutability()",
         "public.vp_enforce_worker_task_attestation_immutability()",
+        "public.vp_enforce_worker_event_emission_immutability()",
     ):
         op.execute(f"DROP FUNCTION IF EXISTS {trigger_function}")
     for signature in (
@@ -4236,6 +5676,13 @@ def downgrade() -> None:
         CANCEL_TASK_AUTHORIZE_SIGNATURE,
         PROVEN_TASK_ACKNOWLEDGE_SIGNATURE,
         RECOVER_REGISTERED_NODE_SIGNATURE,
+        TRANSITION_YOUTUBE_UPLOAD_SIGNATURE,
+        RESERVE_YOUTUBE_UPLOAD_SIGNATURE,
+        OBSERVE_EVENT_EMISSION_SIGNATURE,
+        MARK_EVENT_EMITTED_SIGNATURE,
+        PREPARE_EVENT_EMISSION_SIGNATURE,
+        PERSIST_WORKER_ARTIFACT_SIGNATURE,
+        REQUIRE_WORKER_NODE_CLAIM_SIGNATURE,
         CLAIM_WORKER_NODE_SIGNATURE,
         TASK_ACK_AUTHORIZE_SIGNATURE,
         TASK_ACKNOWLEDGED_SIGNATURE,
@@ -4281,6 +5728,15 @@ def downgrade() -> None:
     )
     op.drop_table("registered_worker_event_receipts")
     op.drop_index(
+        "ix_worker_event_emissions_job_id",
+        table_name="worker_event_emissions",
+    )
+    op.drop_index(
+        "uq_worker_event_emission_redis_identity",
+        table_name="worker_event_emissions",
+    )
+    op.drop_table("worker_event_emissions")
+    op.drop_index(
         "ix_worker_task_delivery_attestations_registration_id",
         table_name="worker_task_delivery_attestations",
     )
@@ -4298,6 +5754,7 @@ def downgrade() -> None:
         table_name="worker_task_dispatches",
     )
     op.drop_table("worker_task_dispatches")
+    _downgrade_intermediate_artifact_cache()
 
     op.drop_index(
         "ix_node_executions_worker_registration_id",
@@ -4334,3 +5791,40 @@ def downgrade() -> None:
         table_name="worker_admission_grants",
     )
     op.drop_table("worker_admission_grants")
+
+
+def _downgrade_intermediate_artifact_cache() -> None:
+    op.execute(
+        """
+DELETE FROM public.intermediate_artifact_cache
+WHERE output_artifact_id IS NULL
+"""
+    )
+    op.drop_constraint(
+        "intermediate_artifact_cache_output_artifact_id_fkey",
+        "intermediate_artifact_cache",
+        type_="foreignkey",
+    )
+    op.alter_column(
+        "intermediate_artifact_cache",
+        "output_artifact_id",
+        existing_type=postgresql.UUID(as_uuid=True),
+        nullable=False,
+    )
+    op.create_foreign_key(
+        "intermediate_artifact_cache_output_artifact_id_fkey",
+        "intermediate_artifact_cache",
+        "artifacts",
+        ["output_artifact_id"],
+        ["id"],
+        ondelete="CASCADE",
+    )
+    for column_name in (
+        "media_info",
+        "file_size",
+        "mime_type",
+        "filename",
+        "storage_path",
+        "storage_backend",
+    ):
+        op.drop_column("intermediate_artifact_cache", column_name)

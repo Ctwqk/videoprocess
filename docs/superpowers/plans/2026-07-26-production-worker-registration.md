@@ -279,7 +279,10 @@ The exact task proof must be copied into completion/failure events. All Redis
 `XADD`/`XACK` must run while the same transaction holds the
 registration-shared fence. A registered affinity defer performs zero
 `XADD`/`XACK` and leaves the exact original delivery pending until preferred
-reclaim or affinity age expiry. Test live ACK authorization, applied
+reclaim or affinity age expiry. The preferred host inspects the exact PEL
+entry and `XCLAIM`s that unchanged message during the 20-second window; add a
+real Redis integration test proving there is no replacement `XADD` or defer
+`XACK`. Test live ACK authorization, applied
 receipt recovery, Redis-success/DB-failure replay, and arbitrary
 stream/group/message/hash/dispatch rejection. A lost epoch with neither
 durable ACK authorization nor receipt must produce no final write or
@@ -367,6 +370,12 @@ git commit -m "feat(workers): register go consumer before redis"
 - Create: `backend/tests/services/test_worker_runtime_role_cli.py`
 - Create: `backend/app/services/worker_control_role_cli.py`
 - Create: `backend/tests/services/test_worker_control_role_cli.py`
+- Create: `backend/app/channel_agent/staging_object_janitor_cli.py`
+- Create: `backend/app/services/staging_object_janitor.py`
+- Create: `backend/tests/channel_agent/test_staging_object_janitor_cli.py`
+- Create: `backend/tests/services/test_staging_object_janitor.py`
+- Modify: `backend/app/services/worker_storage_readiness.py`
+- Modify: `backend/tests/services/test_worker_storage_readiness.py`
 - Modify: `deploy/swarm/deploy-sync-extension.sh`
 - Modify: `tests/test_vp_deploy_sync_extension.sh`
 - Modify: `backend/Dockerfile.ffmpeg-worker-go`
@@ -402,20 +411,23 @@ readiness before proceeding, fresh prior-image grant/principal on rollback,
 idempotent repeat deployment, and no host 126 command. Create real PostgreSQL
 test roles and prove login principals are non-superuser, own no application
 objects, cannot write grant/registration tables directly, and can execute only
-the nine worker functions `vp_worker_register`, `vp_worker_heartbeat`,
-`vp_worker_release`, `vp_require_worker_lease`,
-`vp_require_worker_lease_margin`, `vp_claim_worker_node`,
-`vp_authorize_worker_task_ack`, `vp_require_worker_task_ack_receipt`, and
-`vp_acknowledge_worker_task_delivery`, plus an explicit worker data-access
-allowlist.
-The allowlist is `SELECT` on `jobs`, `node_executions`, `artifacts`,
-`channel_profiles`, `production_tasks`, `runtime_schedules`, and
-`youtube_upload_operations`; `INSERT` on `artifacts`, `runtime_schedules`, and
-`youtube_upload_operations`. Grant no direct `UPDATE node_executions`.
-Implement and grant exact worker-principal YouTube claim/reserve and legal
-operation-transition functions with operation identity, node claim,
-registration epoch, database-clock margin, and allowed-column enforcement;
-grant no broad `UPDATE youtube_upload_operations`. Deny `DELETE`, `TRUNCATE`, DDL, sequences,
+the reviewed registration, lease, claim, artifact, event-emission, task-ACK,
+and YouTube reserve/transition functions.
+
+Grant only direct `SELECT` columns required to load task inputs and returned
+upload-operation rows. Grant no direct `INSERT`, `UPDATE`, or `DELETE` on
+`artifacts`, `runtime_schedules`, `youtube_upload_operations`,
+`node_executions`, authority tables, or dispatches. Artifact persistence uses
+`vp_persist_worker_artifact`; runtime schedule authority is read and locked
+only through `vp_claim_worker_node` and `vp_require_worker_node_claim`, and
+workers never create or mutate schedules. YouTube reserve and every legal
+operation transition use `vp_reserve_worker_youtube_upload` and
+`vp_transition_worker_youtube_upload` with exact operation/artifact/node claim,
+registration epoch, database-clock margin, privacy, and allowed-column
+enforcement. Exercise `_claim_node_execution`,
+`_persist_artifact_for_current_claim`, registered event publication/task ACK,
+and `YouTubeUploadOperationStore` through the real restricted login; deny
+direct DML in the same PostgreSQL test. Deny `DELETE`, `TRUNCATE`, DDL, sequences,
 `alembic_version`, all direct grant/registration table access, privileged role
 membership, and ownership. Use separate deploy-migrator and deploy-read
 credentials; neither may be mounted into workers.
@@ -423,6 +435,7 @@ Create a separate non-owner orchestrator-control role. Grant it `EXECUTE` only
 on the reviewed observer, proven-task ACK, cancelled-dispatch, registered-node
 recovery, and cleanup functions:
 `vp_observe_worker_lease`, `vp_observe_worker_task_delivery`,
+`vp_observe_worker_event_emission`,
 `vp_acknowledge_proven_worker_task_dispatch`,
 `vp_authorize_cancelled_worker_task_ack`,
 `vp_require_cancelled_worker_task_ack`,
@@ -440,6 +453,23 @@ table ownership, broad `UPDATE`, `DELETE`, and `TRUNCATE`. Prove observer
 success requires explicit `EXECUTE`, while `vp_require_worker_lease` still
 rejects the orchestrator principal, and takeover/revoke waits behind observer
 fences.
+
+Deploy `python -m app.channel_agent.staging_object_janitor_cli` as the
+`vp-staging-object-janitor` one-shot service on a five-minute managed interval
+using the same MinIO bucket and a read-only database principal. Its only
+deletion candidates are exact claim-shaped
+`staging/artifacts/{job_uuid}/{node_uuid}-{claim_token}.{ext}` objects older
+than 86,400 seconds. It excludes every exact `artifacts.storage_path` and
+durable `intermediate_artifact_cache.storage_path`, including successful
+staging-prefixed pointers whose source job was deleted. Write status
+atomically with mode 0600 to
+`/run/videoprocess/staging-janitor/status.json`; alert on nonzero errors,
+missing runs, or age above 900 seconds. Set
+`VP_REQUIRE_STAGING_JANITOR=true` and
+`VP_STAGING_JANITOR_STATUS_FILE` for registered workers and fail readiness
+closed until a fresh successful status exists. Tests cover old orphan deletion,
+fresh/invalid retention, exact pointer protection, status monitoring, and the
+grace bound against every operation/retry/clock-skew window.
 Create per-service Redis users scoped to their admitted task stream/group.
 Create a separate orchestrator Redis user for the event group and admitted
 task streams. Its explicit command allowlist includes stream consume/reclaim

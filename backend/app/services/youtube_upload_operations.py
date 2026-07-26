@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import uuid
 from contextlib import asynccontextmanager
@@ -8,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -21,11 +22,21 @@ from app.services.job_execution_authority import (
     lock_job_execution_authority,
     require_active_execution_authority,
     require_matching_node_execution_claim,
+    require_registered_worker_node_claim,
     require_worker_registration_lease,
     require_worker_registration_margin,
 )
 
 SUBMISSION_LEASE_MARGIN_SECONDS = 150
+
+
+def _session_is_postgresql(db: object) -> bool:
+    get_bind = getattr(db, "get_bind", None)
+    if not callable(get_bind):
+        return True
+    return getattr(getattr(get_bind(), "dialect", None), "name", None) == (
+        "postgresql"
+    )
 
 
 @dataclass(frozen=True)
@@ -68,6 +79,32 @@ class YouTubeUploadOperationStore:
 
         async with self._session_factory() as db:
             async with db.begin():
+                if (
+                    getattr(
+                        context.execution_claim,
+                        "worker_registration_id",
+                        None,
+                    )
+                    is not None
+                    and _session_is_postgresql(db)
+                ):
+                    await require_registered_worker_node_claim(
+                        db,
+                        context.execution_claim,
+                    )
+                    await require_worker_registration_margin(
+                        db,
+                        context.execution_claim,
+                        minimum_margin_seconds=(
+                            SUBMISSION_LEASE_MARGIN_SECONDS
+                        ),
+                    )
+                    token = self._active_submission_fence.set(context)
+                    try:
+                        yield
+                    finally:
+                        self._active_submission_fence.reset(token)
+                    return
                 authority = await lock_job_execution_authority(
                     db,
                     context.job_id,
@@ -82,14 +119,6 @@ class YouTubeUploadOperationStore:
                     authority,
                     context.execution_claim,
                 )
-                if context.execution_claim.worker_registration_id is not None:
-                    await require_worker_registration_margin(
-                        db,
-                        context.execution_claim,
-                        minimum_margin_seconds=(
-                            SUBMISSION_LEASE_MARGIN_SECONDS
-                        ),
-                    )
                 token = self._active_submission_fence.set(context)
                 try:
                     yield
@@ -98,6 +127,21 @@ class YouTubeUploadOperationStore:
 
     async def claim(self, context: UploadOperationContext) -> UploadOperationClaim:
         async with self._session_factory() as db:
+            if (
+                getattr(
+                    context.execution_claim,
+                    "worker_registration_id",
+                    None,
+                )
+                is not None
+                and _session_is_postgresql(db)
+            ):
+                operation = await self._reserve_registered(db, context)
+                await db.commit()
+                return UploadOperationClaim(
+                    self._action_for(operation),
+                    operation,
+                )
             authority = await lock_job_execution_authority(
                 db,
                 context.job_id,
@@ -112,7 +156,14 @@ class YouTubeUploadOperationStore:
                 authority,
                 context.execution_claim,
             )
-            if context.execution_claim.worker_registration_id is not None:
+            if (
+                getattr(
+                    context.execution_claim,
+                    "worker_registration_id",
+                    None,
+                )
+                is not None
+            ):
                 await require_worker_registration_lease(
                     db,
                     context.execution_claim,
@@ -162,6 +213,25 @@ class YouTubeUploadOperationStore:
         context: UploadOperationContext | None = None,
     ) -> YouTubeUploadOperation:
         async with self._session_factory() as db:
+            if (
+                context is not None
+                and getattr(
+                    context.execution_claim,
+                    "worker_registration_id",
+                    None,
+                )
+                is not None
+                and _session_is_postgresql(db)
+            ):
+                operation = await self._transition_registered(
+                    db,
+                    operation_id,
+                    context,
+                    expected_status="reserved",
+                    transition="attempting",
+                )
+                await db.commit()
+                return operation
             await self._require_transition_context(
                 db,
                 operation_id,
@@ -178,10 +248,10 @@ class YouTubeUploadOperationStore:
                 )
                 .returning(YouTubeUploadOperation)
             )
-            operation = result.scalar_one_or_none()
-            if operation is not None:
+            updated_operation = result.scalar_one_or_none()
+            if updated_operation is not None:
                 await db.commit()
-                return operation
+                return updated_operation
 
             await db.rollback()
             current = await self._operation(db, operation_id)
@@ -201,6 +271,26 @@ class YouTubeUploadOperationStore:
             raise ValueError("manager task id must be a canonical UUID")
 
         async with self._session_factory() as db:
+            if (
+                context is not None
+                and getattr(
+                    context.execution_claim,
+                    "worker_registration_id",
+                    None,
+                )
+                is not None
+                and _session_is_postgresql(db)
+            ):
+                operation = await self._transition_registered(
+                    db,
+                    operation_id,
+                    context,
+                    expected_status="reserved",
+                    transition="submitted",
+                    manager_task_id=canonical_manager_task_id,
+                )
+                await db.commit()
+                return operation
             await self._require_transition_context(
                 db,
                 operation_id,
@@ -219,10 +309,10 @@ class YouTubeUploadOperationStore:
                 )
                 .returning(YouTubeUploadOperation)
             )
-            operation = result.scalar_one_or_none()
-            if operation is not None:
+            updated_operation = result.scalar_one_or_none()
+            if updated_operation is not None:
                 await db.commit()
-                return operation
+                return updated_operation
 
             await db.rollback()
             current = await self._operation(db, operation_id)
@@ -245,6 +335,34 @@ class YouTubeUploadOperationStore:
             raise ValueError("platform video id is required")
 
         async with self._session_factory() as db:
+            if (
+                context is not None
+                and getattr(
+                    context.execution_claim,
+                    "worker_registration_id",
+                    None,
+                )
+                is not None
+                and _session_is_postgresql(db)
+            ):
+                operation = await self._operation(db, operation_id)
+                receipt_json = self._receipt_for(
+                    title=operation.title,
+                    privacy=operation.privacy,
+                    platform_video_id=platform_video_id,
+                    receipt=receipt,
+                )
+                operation = await self._transition_registered(
+                    db,
+                    operation_id,
+                    context,
+                    expected_status="submitted",
+                    transition="succeeded",
+                    platform_video_id=platform_video_id,
+                    receipt_json=receipt_json,
+                )
+                await db.commit()
+                return operation
             await self._require_transition_context(
                 db,
                 operation_id,
@@ -279,10 +397,10 @@ class YouTubeUploadOperationStore:
                     )
                     .returning(YouTubeUploadOperation)
                 )
-                operation = result.scalar_one_or_none()
-                if operation is not None:
+                updated_operation = result.scalar_one_or_none()
+                if updated_operation is not None:
                     await db.commit()
-                    return operation
+                    return updated_operation
             except IntegrityError:
                 await db.rollback()
                 conflicting = await self._operation_for_platform_video(db, platform_video_id)
@@ -339,6 +457,27 @@ class YouTubeUploadOperationStore:
         context: UploadOperationContext | None,
     ) -> YouTubeUploadOperation:
         async with self._session_factory() as db:
+            if (
+                context is not None
+                and getattr(
+                    context.execution_claim,
+                    "worker_registration_id",
+                    None,
+                )
+                is not None
+                and _session_is_postgresql(db)
+            ):
+                current = await self._operation(db, operation_id)
+                operation = await self._transition_registered(
+                    db,
+                    operation_id,
+                    context,
+                    expected_status=current.status,
+                    transition=status,
+                    error_message=error_message,
+                )
+                await db.commit()
+                return operation
             await self._require_transition_context(
                 db,
                 operation_id,
@@ -355,10 +494,10 @@ class YouTubeUploadOperationStore:
                 )
                 .returning(YouTubeUploadOperation)
             )
-            operation = result.scalar_one_or_none()
-            if operation is not None:
+            updated_operation = result.scalar_one_or_none()
+            if updated_operation is not None:
                 await db.commit()
-                return operation
+                return updated_operation
 
             await db.rollback()
             current = await self._operation(db, operation_id)
@@ -391,13 +530,22 @@ class YouTubeUploadOperationStore:
             raise JobExecutionAuthorityBlocked(
                 "upload operation execution context changed"
             )
+        if (
+            getattr(
+                context.execution_claim,
+                "worker_registration_id",
+                None,
+            )
+            is not None
+            and _session_is_postgresql(db)
+        ):
+            await require_registered_worker_node_claim(
+                db,
+                context.execution_claim,
+            )
+            return
         active_context = self._active_submission_fence.get()
         if active_context == context:
-            if context.execution_claim.worker_registration_id is not None:
-                await require_worker_registration_lease(
-                    db,
-                    context.execution_claim,
-                )
             return
         authority = await lock_job_execution_authority(
             db,
@@ -413,11 +561,122 @@ class YouTubeUploadOperationStore:
             authority,
             context.execution_claim,
         )
-        if context.execution_claim.worker_registration_id is not None:
-            await require_worker_registration_lease(
-                db,
-                context.execution_claim,
+    async def _reserve_registered(
+        self,
+        db: AsyncSession,
+        context: UploadOperationContext,
+    ) -> YouTubeUploadOperation:
+        claim = context.execution_claim
+        registration_id = claim.worker_registration_id
+        lease_epoch = claim.worker_lease_epoch
+        if not isinstance(registration_id, uuid.UUID) or not isinstance(
+            lease_epoch,
+            int,
+        ):
+            raise JobExecutionAuthorityBlocked(
+                "registered upload operation has no lease"
             )
+        operation_id = await db.scalar(
+            text(
+                """
+                SELECT public.vp_reserve_worker_youtube_upload(
+                    :registration_id,
+                    :lease_epoch,
+                    :worker_id,
+                    :worker_started_at,
+                    :job_id,
+                    :node_execution_id,
+                    :input_artifact_id,
+                    :content_sha256,
+                    :title,
+                    :privacy
+                )
+                """
+            ),
+            {
+                "registration_id": registration_id,
+                "lease_epoch": lease_epoch,
+                "worker_id": claim.worker_id,
+                "worker_started_at": claim.started_at,
+                "job_id": context.job_id,
+                "node_execution_id": context.node_execution_id,
+                "input_artifact_id": context.input_artifact_id,
+                "content_sha256": context.content_sha256,
+                "title": context.title,
+                "privacy": context.privacy,
+            },
+        )
+        if not isinstance(operation_id, uuid.UUID):
+            raise JobExecutionAuthorityBlocked(
+                "registered upload operation identity is invalid"
+            )
+        return await self._operation(db, operation_id)
+
+    async def _transition_registered(
+        self,
+        db: AsyncSession,
+        operation_id: uuid.UUID,
+        context: UploadOperationContext,
+        *,
+        expected_status: str,
+        transition: str,
+        manager_task_id: str | None = None,
+        platform_video_id: str | None = None,
+        receipt_json: dict[str, Any] | None = None,
+        error_message: str | None = None,
+    ) -> YouTubeUploadOperation:
+        claim = context.execution_claim
+        registration_id = claim.worker_registration_id
+        lease_epoch = claim.worker_lease_epoch
+        if not isinstance(registration_id, uuid.UUID) or not isinstance(
+            lease_epoch,
+            int,
+        ):
+            raise JobExecutionAuthorityBlocked(
+                "registered upload operation has no lease"
+            )
+        persisted_id = await db.scalar(
+            text(
+                """
+                SELECT public.vp_transition_worker_youtube_upload(
+                    :registration_id,
+                    :lease_epoch,
+                    :worker_id,
+                    :worker_started_at,
+                    :operation_id,
+                    :expected_status,
+                    :transition,
+                    :manager_task_id,
+                    :platform_video_id,
+                    CAST(:receipt_json AS jsonb),
+                    :error_message
+                )
+                """
+            ),
+            {
+                "registration_id": registration_id,
+                "lease_epoch": lease_epoch,
+                "worker_id": claim.worker_id,
+                "worker_started_at": claim.started_at,
+                "operation_id": operation_id,
+                "expected_status": expected_status,
+                "transition": transition,
+                "manager_task_id": manager_task_id,
+                "platform_video_id": platform_video_id,
+                "receipt_json": (
+                    json.dumps(receipt_json)
+                    if receipt_json is not None
+                    else None
+                ),
+                "error_message": error_message,
+            },
+        )
+        if persisted_id != operation_id:
+            raise JobExecutionAuthorityBlocked(
+                "registered upload transition identity changed"
+            )
+        db.expire_all()
+        return await self._operation(db, operation_id)
 
     @staticmethod
     async def _production_task_id(db: AsyncSession, job_id: uuid.UUID) -> uuid.UUID | None:

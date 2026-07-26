@@ -10,9 +10,11 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.storage.base import StorageBackend
+from app.services.staging_object_janitor import staging_janitor_ready
 
 
 _PROBE_PAYLOAD = b"vp-worker-storage-readiness-v1\n"
+_STAGING_JANITOR_MAX_AGE_SECONDS = 15 * 60
 
 
 class ReadinessFailure(RuntimeError):
@@ -162,11 +164,22 @@ async def probe_worker_storage(
     if require_artifact_api:
         artifact_api_status = "ready"
 
+    staging_janitor_status = "not_required"
+    if env.get("VP_REQUIRE_STAGING_JANITOR", "").strip().lower() == "true":
+        status_path = env.get("VP_STAGING_JANITOR_STATUS_FILE", "").strip()
+        if not status_path or not staging_janitor_ready(
+            Path(status_path),
+            max_age_seconds=_STAGING_JANITOR_MAX_AGE_SECONDS,
+        ):
+            raise ReadinessFailure("staging_janitor_unavailable")
+        staging_janitor_status = "ready"
+
     return {
         "status": "ready",
         "components": {
             "scratch": "ready",
             "minio": "ready",
             "artifact_api": artifact_api_status,
+            "staging_janitor": staging_janitor_status,
         },
     }

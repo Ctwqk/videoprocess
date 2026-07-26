@@ -65,6 +65,10 @@ class WorkerTaskDeliveryAttestation(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    ack_event_emission_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=True,
+    )
     attested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -113,6 +117,77 @@ class WorkerTaskDeliveryAttestation(UUIDPrimaryKeyMixin, Base):
             "AND acknowledged_at IS NOT NULL))",
             name="ck_worker_task_delivery_attestation_ack_time",
         ),
+    )
+
+
+class WorkerEventEmission(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "worker_event_emissions"
+
+    source_task_attestation_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "worker_task_delivery_attestations.id",
+            ondelete="RESTRICT",
+        ),
+        unique=True,
+        nullable=False,
+    )
+    redis_stream: Mapped[str] = mapped_column(String(255), nullable=False)
+    consumer_group: Mapped[str] = mapped_column(String(255), nullable=False)
+    message_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("jobs.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    node_execution_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("node_executions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    worker_registration_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("worker_registrations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    worker_lease_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    worker_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    worker_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    emission_state: Mapped[str] = mapped_column(
+        String(16),
+        default="prepared",
+        nullable=False,
+    )
+    prepared_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    emitted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        Index(
+            "uq_worker_event_emission_redis_identity",
+            "redis_stream",
+            "consumer_group",
+            "message_id",
+            unique=True,
+            postgresql_where=text("message_id IS NOT NULL"),
+        ),
+        Index("ix_worker_event_emissions_job_id", "job_id"),
     )
 
 

@@ -538,18 +538,24 @@ class JobEngine:
         if entry is None:
             return False
 
+        cached_artifact = await self.artifact_cache.materialize_hit(
+            db,
+            entry,
+            job_id=job.id,
+            node_execution_id=ne.id,
+        )
         ne.status = NodeStatus.SUCCEEDED
         ne.started_at = ne.started_at or datetime.utcnow()
         ne.completed_at = datetime.utcnow()
         ne.progress = 100
-        ne.output_artifact_id = entry.output_artifact_id
+        ne.output_artifact_id = cached_artifact.id
         ne.input_artifact_ids = [artifact.id for artifact in input_artifacts.values()]
         await self.artifact_cache.record_hit(db, entry)
         logger.info(
             "Reused cached artifact for job=%s node=%s artifact=%s",
             job.id,
             ne.node_id,
-            entry.output_artifact_id,
+            cached_artifact.id,
         )
         return True
 

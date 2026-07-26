@@ -847,6 +847,123 @@ async def test_registered_dispatch_is_validated_before_affinity(
 
 
 @pytest.mark.asyncio
+async def test_preferred_registered_worker_reclaims_exact_pending_affinity_message(
+    monkeypatch,
+) -> None:
+    message_id = "1710000000000-31"
+    now = int(worker_main.time.time())
+    payload = {
+        "job_id": str(uuid.uuid4()),
+        "node_execution_id": str(uuid.uuid4()),
+        "node_id": "preferred-reclaim",
+        "node_type": "vision",
+        "config": "{}",
+        "input_artifacts": "{}",
+        "dispatch_key": str(uuid.uuid4()),
+        "preferred_hosts": json.dumps(["worker-127"]),
+        "affinity_enqueued_at": str(now),
+        "affinity_bounces": "0",
+    }
+    processed: list[tuple[str, dict]] = []
+
+    class Redis:
+        async def xpending_range(self, stream, group, start, end, count):
+            assert (stream, group, start, end, count) == (
+                worker_main.TASK_STREAM,
+                worker_main.CONSUMER_GROUP,
+                "-",
+                "+",
+                50,
+            )
+            return [
+                {
+                    "message_id": message_id,
+                    "consumer": "vision-worker@worker-150:other",
+                    "time_since_delivered": 1000,
+                    "times_delivered": 1,
+                }
+            ]
+
+        async def xrange(self, stream, min, max, count):
+            assert (stream, min, max, count) == (
+                worker_main.TASK_STREAM,
+                message_id,
+                message_id,
+                1,
+            )
+            return [(message_id, payload)]
+
+        async def xclaim(
+            self,
+            stream,
+            group,
+            consumer,
+            min_idle_time,
+            message_ids,
+        ):
+            assert (stream, group, consumer, message_ids) == (
+                worker_main.TASK_STREAM,
+                worker_main.CONSUMER_GROUP,
+                worker_main.WORKER_ID,
+                [message_id],
+            )
+            assert min_idle_time <= 1000
+            return [(message_id, payload)]
+
+    lease = SimpleNamespace()
+
+    async def process(redis, claimed_id, claimed_payload, *, worker_lease):
+        assert worker_lease is lease
+        processed.append((claimed_id, claimed_payload))
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "worker-127")
+    monkeypatch.setattr(worker_main, "_process_message", process)
+
+    await worker_main._reclaim_preferred_pending(
+        Redis(),
+        worker_lease=lease,
+    )
+
+    assert processed == [(message_id, payload)]
+
+
+@pytest.mark.asyncio
+async def test_nonpreferred_registered_worker_does_not_reclaim_affinity_message(
+    monkeypatch,
+) -> None:
+    message_id = "1710000000000-32"
+    payload = {
+        "preferred_hosts": json.dumps(["worker-127"]),
+        "affinity_enqueued_at": str(int(worker_main.time.time())),
+    }
+    claimed: list[str] = []
+
+    class Redis:
+        async def xpending_range(self, *args, **kwargs):
+            return [{"message_id": message_id, "time_since_delivered": 1000}]
+
+        async def xrange(self, *args, **kwargs):
+            return [(message_id, payload)]
+
+        async def xclaim(self, *args, **kwargs):
+            claimed.append(message_id)
+            return [(message_id, payload)]
+
+    async def reject_process(*args, **kwargs):
+        raise AssertionError("non-preferred worker must not process the message")
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "worker-150")
+    monkeypatch.setattr(worker_main, "_process_message", reject_process)
+
+    await worker_main._reclaim_preferred_pending(
+        Redis(),
+        worker_lease=SimpleNamespace(),
+    )
+
+    assert claimed == []
+
+
+@pytest.mark.asyncio
 async def test_consumer_cancellation_cancels_inflight_messages_without_xack(
     monkeypatch,
 ) -> None:

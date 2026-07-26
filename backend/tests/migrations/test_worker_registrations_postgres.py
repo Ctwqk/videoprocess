@@ -93,6 +93,7 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
     assert "CREATE TABLE worker_registrations" in sql
     assert "CREATE TABLE worker_task_dispatches" in sql
     assert "CREATE TABLE worker_task_delivery_attestations" in sql
+    assert "CREATE TABLE worker_event_emissions" in sql
     assert "CREATE TABLE registered_worker_event_receipts" in sql
     assert "CREATE TABLE registered_worker_event_deliveries" in sql
     assert "CREATE TABLE worker_event_dispatches" not in sql
@@ -138,6 +139,13 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "vp_observe_worker_lease",
         "vp_attest_worker_task_delivery",
         "vp_observe_worker_task_delivery",
+        "vp_prepare_worker_event_emission",
+        "vp_mark_worker_event_emitted",
+        "vp_observe_worker_event_emission",
+        "vp_require_worker_node_claim",
+        "vp_persist_worker_artifact",
+        "vp_reserve_worker_youtube_upload",
+        "vp_transition_worker_youtube_upload",
         "vp_acknowledge_worker_task_delivery",
         "vp_authorize_worker_task_ack",
         "vp_require_worker_lease_margin",
@@ -177,6 +185,58 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "v_storage_canonical",
     ):
         assert legacy_endpoint_parser_name not in register_function_sql
+    require_task_ack_sql = sql[
+        sql.index(
+            "CREATE FUNCTION public.vp_require_worker_task_ack_receipt"
+        ) :
+        sql.index("CREATE FUNCTION public.vp_authorize_worker_task_ack")
+    ]
+    assert "public.vp_require_worker_node_claim(" in require_task_ack_sql
+    for proof_table in (
+        "worker_task_delivery_attestations",
+        "worker_event_emissions",
+        "registered_worker_event_receipts",
+        "registered_worker_event_deliveries",
+        "worker_task_dispatches",
+    ):
+        assert f"FROM public.{proof_table}" in require_task_ack_sql
+    assert require_task_ack_sql.index(
+        "public.vp_require_worker_node_claim("
+    ) < require_task_ack_sql.index("FOR UPDATE")
+    attestation_trigger_sql = sql[
+        sql.index(
+            "CREATE FUNCTION "
+            "public.vp_enforce_worker_task_attestation_immutability"
+        ) :
+        sql.index(
+            "CREATE FUNCTION "
+            "public.vp_enforce_worker_event_emission_immutability"
+        )
+    ]
+    assert "emission.emission_state IN ('prepared', 'emitted')" not in (
+        attestation_trigger_sql
+    )
+
+    cancel_ack_sql = sql[
+        sql.index(
+            "CREATE FUNCTION public.vp_authorize_cancelled_worker_task_ack"
+        ) :
+        sql.index(
+            "CREATE FUNCTION "
+            "public.vp_resolve_worker_event_authority_for_job_deletion"
+        )
+    ]
+    assert "emission.emission_state IN ('prepared', 'emitted')" not in (
+        cancel_ack_sql
+    )
+    for proof_table in (
+        "worker_task_delivery_attestations",
+        "worker_event_emissions",
+        "registered_worker_event_receipts",
+        "registered_worker_event_deliveries",
+        "worker_task_dispatches",
+    ):
+        assert f"FROM public.{proof_table}" in cancel_ack_sql
 
     downgraded = _run_alembic(
         "postgresql+asyncpg://migration:unused@127.0.0.1:9/videoprocess",
@@ -189,6 +249,7 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
     for table_name in (
         "registered_worker_event_deliveries",
         "registered_worker_event_receipts",
+        "worker_event_emissions",
         "worker_task_delivery_attestations",
         "worker_task_dispatches",
     ):

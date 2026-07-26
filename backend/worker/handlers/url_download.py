@@ -1,12 +1,12 @@
 import asyncio
 import logging
-import re
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse
 
 import httpx
 
 from app.config import settings
+from app.services.external_url_identity import normalize_external_media_url
 from worker.handlers.base import BaseHandler, CancelledError
 
 logger = logging.getLogger(__name__)
@@ -143,40 +143,7 @@ class UrlDownloadHandler(BaseHandler):
 
     @staticmethod
     def _normalize_url(url: str) -> str:
-        parsed = urlparse(url.strip())
-        host = parsed.netloc.lower()
-
-        if "youtu.be" in host:
-            video_id = parsed.path.strip("/")
-            if video_id:
-                return f"https://www.youtube.com/watch?v={video_id}"
-
-        if "youtube.com" in host:
-            query = dict(parse_qsl(parsed.query, keep_blank_values=False))
-            video_id = query.get("v", "").strip()
-            if video_id:
-                return f"https://www.youtube.com/watch?v={video_id}"
-
-        bilibili_id = UrlDownloadHandler._extract_bilibili_bvid(url)
-        if bilibili_id:
-            return f"https://www.bilibili.com/video/{bilibili_id}"
-
-        xiaohongshu_note_id = UrlDownloadHandler._extract_xiaohongshu_note_id(url)
-        if xiaohongshu_note_id:
-            return f"https://www.xiaohongshu.com/explore/{xiaohongshu_note_id}"
-
-        x_post_id, x_screen_name = UrlDownloadHandler._extract_x_post_components(url)
-        if x_post_id and x_screen_name:
-            return f"https://x.com/{x_screen_name}/status/{x_post_id}"
-
-        normalized_query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
-        cleaned = parsed._replace(
-            scheme=(parsed.scheme or "https").lower(),
-            netloc=host,
-            fragment="",
-            query=normalized_query,
-        )
-        return urlunparse(cleaned)
+        return normalize_external_media_url(url)
 
     @staticmethod
     def _detect_platform(url: str) -> str | None:
@@ -193,20 +160,26 @@ class UrlDownloadHandler(BaseHandler):
 
     @staticmethod
     def _extract_bilibili_bvid(url: str) -> str | None:
-        match = re.search(r"(BV[0-9A-Za-z]+)", url)
-        return match.group(1) if match else None
+        normalized = normalize_external_media_url(url)
+        if "/video/" not in normalized:
+            return None
+        return normalized.rsplit("/video/", 1)[1].split("/", 1)[0]
 
     @staticmethod
     def _extract_xiaohongshu_note_id(url: str) -> str | None:
-        match = re.search(r"([0-9a-f]{24})", url, flags=re.IGNORECASE)
-        return match.group(1) if match else None
+        normalized = normalize_external_media_url(url)
+        if "/explore/" not in normalized:
+            return None
+        return normalized.rsplit("/explore/", 1)[1].split("/", 1)[0]
 
     @staticmethod
     def _extract_x_post_components(url: str) -> tuple[str | None, str | None]:
-        match = re.search(r"(?:x|twitter)\.com/([^/]+)/status/(\d+)", url, flags=re.IGNORECASE)
-        if not match:
+        normalized = normalize_external_media_url(url)
+        parsed = urlparse(normalized)
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 3 or parts[1] != "status":
             return None, None
-        return match.group(2), match.group(1)
+        return parts[2], parts[0]
 
     @staticmethod
     async def _extract_error_detail(response: httpx.Response) -> str:

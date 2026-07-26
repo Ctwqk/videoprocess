@@ -34,8 +34,12 @@ from app.services.job_execution_authority import (
     authorize_worker_task_ack,
     claim_registered_worker_node,
     lock_job_execution_authority,
+    mark_worker_event_emitted,
+    persist_registered_worker_artifact,
+    prepare_worker_event_emission,
     require_active_execution_authority,
     require_matching_node_execution_claim,
+    require_registered_worker_node_claim,
     require_worker_registration_lease,
     require_worker_task_ack_receipt,
 )
@@ -78,6 +82,8 @@ PEL_MIN_IDLE = int(os.environ.get("WORKER_PEL_MIN_IDLE_MS", "900000"))
 HEARTBEAT_INTERVAL = int(os.environ.get("WORKER_HEARTBEAT_INTERVAL_SECONDS", "15"))
 AFFINITY_WAIT_SECONDS = int(os.environ.get("WORKER_AFFINITY_WAIT_SECONDS", "20"))
 AFFINITY_MAX_BOUNCES = int(os.environ.get("WORKER_AFFINITY_MAX_BOUNCES", "6"))
+AFFINITY_RECLAIM_INTERVAL_SECONDS = 1.0
+AFFINITY_RECLAIM_MIN_IDLE_MS = 500
 REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("WORKER_REDIS_CONNECT_TIMEOUT_SECONDS", "5"))
 REDIS_SOCKET_TIMEOUT_SECONDS = float(os.environ.get("WORKER_REDIS_SOCKET_TIMEOUT_SECONDS", "30"))
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get("WORKER_REDIS_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
@@ -105,12 +111,23 @@ class WorkerTaskDelivery:
     payload_sha256: str
     dispatch_key: uuid.UUID | None
     attestation_id: uuid.UUID | None = None
+    event_emission_id: uuid.UUID | None = None
 
 
 _current_task_delivery: ContextVar[WorkerTaskDelivery | None] = ContextVar(
     "worker_task_delivery",
     default=None,
 )
+
+_IDEMPOTENT_EVENT_XADD_SCRIPT = """
+local existing = redis.call('GET', KEYS[2])
+if existing then
+    return existing
+end
+local message_id = redis.call('XADD', KEYS[1], '*', unpack(ARGV, 1))
+redis.call('SET', KEYS[2], message_id)
+return message_id
+"""
 
 
 def _canonical_task_payload_sha256(payload: dict) -> str:
@@ -262,18 +279,6 @@ async def _claim_node_execution(
     async with factory() as db:
         try:
             async with db.begin():
-                authority = await lock_job_execution_authority(
-                    db,
-                    resolved_job_id,
-                    node_execution_id=resolved_node_id,
-                )
-                node = authority.node
-                assert node is not None
-                require_active_execution_authority(
-                    authority,
-                    job_statuses={JobStatus.RUNNING},
-                    node_statuses={NodeStatus.QUEUED},
-                )
                 worker_id = (
                     worker_lease.redis_consumer_id
                     if worker_lease is not None
@@ -303,20 +308,32 @@ async def _claim_node_execution(
                             dispatch_key=delivery.dispatch_key,
                         )
                     )
-                else:
-                    claimed_at = datetime.now(timezone.utc)
-                    claim = NodeExecutionClaim(
-                        job_id=resolved_job_id,
-                        node_execution_id=resolved_node_id,
-                        worker_id=worker_id,
-                        started_at=claimed_at,
-                    )
-                    node.status = NodeStatus.RUNNING
-                    node.started_at = claimed_at
-                    node.worker_id = worker_id
-                    node.worker_registration_id = None
-                    node.worker_lease_epoch = None
-                    await db.flush()
+                    return claim
+                authority = await lock_job_execution_authority(
+                    db,
+                    resolved_job_id,
+                    node_execution_id=resolved_node_id,
+                )
+                node = authority.node
+                assert node is not None
+                require_active_execution_authority(
+                    authority,
+                    job_statuses={JobStatus.RUNNING},
+                    node_statuses={NodeStatus.QUEUED},
+                )
+                claimed_at = datetime.now(timezone.utc)
+                claim = NodeExecutionClaim(
+                    job_id=resolved_job_id,
+                    node_execution_id=resolved_node_id,
+                    worker_id=worker_id,
+                    started_at=claimed_at,
+                )
+                node.status = NodeStatus.RUNNING
+                node.started_at = claimed_at
+                node.worker_id = worker_id
+                node.worker_registration_id = None
+                node.worker_lease_epoch = None
+                await db.flush()
             return claim
         except JobExecutionAuthorityBlocked as exc:
             await db.rollback()
@@ -339,6 +356,12 @@ async def _require_current_node_execution_claim(
     factory = session_factory or get_worker_session()
     async with factory() as db:
         async with db.begin():
+            if (
+                getattr(claim, "worker_registration_id", None) is not None
+                and _session_is_postgresql(db)
+            ):
+                await require_registered_worker_node_claim(db, claim)
+                return
             authority = await lock_job_execution_authority(
                 db,
                 claim.job_id,
@@ -350,7 +373,7 @@ async def _require_current_node_execution_claim(
                 node_statuses={NodeStatus.RUNNING},
             )
             require_matching_node_execution_claim(authority, claim)
-            if claim.worker_registration_id is not None:
+            if getattr(claim, "worker_registration_id", None) is not None:
                 await require_worker_registration_lease(db, claim)
 
 
@@ -371,6 +394,25 @@ async def _persist_artifact_for_current_claim(
     factory = session_factory or get_worker_session()
     async with factory() as db:
         async with db.begin():
+            if (
+                getattr(claim, "worker_registration_id", None) is not None
+                and _session_is_postgresql(db)
+            ):
+                await require_registered_worker_node_claim(db, claim)
+                if before_persist is not None:
+                    await before_persist()
+                    await require_registered_worker_node_claim(db, claim)
+                artifact_id = await persist_registered_worker_artifact(
+                    db,
+                    claim,
+                    filename=filename,
+                    mime_type=mime_type,
+                    file_size=file_size,
+                    storage_backend=storage_backend,
+                    storage_path=storage_path,
+                    media_info=media_info,
+                )
+                return str(artifact_id)
             authority = await lock_job_execution_authority(
                 db,
                 claim.job_id,
@@ -382,7 +424,7 @@ async def _persist_artifact_for_current_claim(
                 node_statuses={NodeStatus.RUNNING},
             )
             require_matching_node_execution_claim(authority, claim)
-            if claim.worker_registration_id is not None:
+            if getattr(claim, "worker_registration_id", None) is not None:
                 await require_worker_registration_lease(db, claim)
             if before_persist is not None:
                 await before_persist()
@@ -725,7 +767,7 @@ async def process_task(
     except CancelledError:
         logger.info(f"Node {data['node_id']} cancelled, cleaning up")
         # Don't report failure — orchestrator already knows about the cancel
-        return claim
+        return claim if worker_lease is None else None
     except Exception as e:
         reported = await _report_failure_for_current_claim(
             claim,
@@ -1044,25 +1086,83 @@ async def _xadd_event_for_claim(
     redis: aioredis.Redis,
     payload: dict[EncodableT, EncodableT],
     claim: NodeExecutionClaim,
-) -> None:
-    if claim.worker_registration_id is None:
+) -> uuid.UUID | None:
+    if getattr(claim, "worker_registration_id", None) is None:
         await redis.xadd(EVENT_STREAM, payload)
-        return
+        return None
+    delivery = _current_task_delivery.get()
+    if delivery is None:
+        raise JobExecutionAuthorityBlocked(
+            "registered worker event has no exact task delivery"
+        )
+    if any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in payload.items()
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "registered worker event payload is not canonical"
+        )
+    canonical_payload = dict(payload)
+    payload_sha256 = _canonical_task_payload_sha256(canonical_payload)
     async with get_worker_session()() as db:
         async with db.begin():
-            authority = await lock_job_execution_authority(
+            if not _session_is_postgresql(db):
+                authority = await lock_job_execution_authority(
+                    db,
+                    claim.job_id,
+                    node_execution_id=claim.node_execution_id,
+                )
+                require_active_execution_authority(
+                    authority,
+                    job_statuses={JobStatus.RUNNING},
+                    node_statuses={NodeStatus.RUNNING},
+                )
+                require_matching_node_execution_claim(authority, claim)
+                await require_worker_registration_lease(db, claim)
+                await redis.xadd(EVENT_STREAM, payload)
+                delivery.event_emission_id = uuid.uuid4()
+                return delivery.event_emission_id
+            if not isinstance(delivery.attestation_id, uuid.UUID):
+                raise JobExecutionAuthorityBlocked(
+                    "registered worker event has no exact task attestation"
+                )
+            emission_id = await prepare_worker_event_emission(
                 db,
-                claim.job_id,
-                node_execution_id=claim.node_execution_id,
+                claim,
+                attestation_id=delivery.attestation_id,
+                redis_stream=EVENT_STREAM,
+                consumer_group="orchestrator",
+                payload_sha256=payload_sha256,
+                payload=canonical_payload,
+                event_type=canonical_payload["event"],
             )
-            require_active_execution_authority(
-                authority,
-                job_statuses={JobStatus.RUNNING},
-                node_statuses={NodeStatus.RUNNING},
+    async with get_worker_session()() as db:
+        async with db.begin():
+            await require_registered_worker_node_claim(db, claim)
+            fields: list[str] = []
+            for key, value in sorted(canonical_payload.items()):
+                fields.extend((key, value))
+            message_id = await redis.eval(
+                _IDEMPOTENT_EVENT_XADD_SCRIPT,
+                2,
+                EVENT_STREAM,
+                f"vp:worker-event-emission:{emission_id}",
+                *fields,
             )
-            require_matching_node_execution_claim(authority, claim)
-            await require_worker_registration_lease(db, claim)
-            await redis.xadd(EVENT_STREAM, payload)
+            if isinstance(message_id, bytes):
+                message_id = message_id.decode()
+            if not isinstance(message_id, str) or not message_id.strip():
+                raise JobExecutionAuthorityBlocked(
+                    "registered worker event message identity is invalid"
+                )
+            await mark_worker_event_emitted(
+                db,
+                claim,
+                emission_id=emission_id,
+                message_id=message_id.strip(),
+            )
+    delivery.event_emission_id = emission_id
+    return emission_id
 
 
 def _claim_generation_token(claim: NodeExecutionClaim) -> str:
@@ -1147,6 +1247,88 @@ async def _reclaim_pending(
                     )
     except Exception:
         logger.exception("PEL reclaim failed")
+
+
+async def _reclaim_preferred_pending(
+    r: aioredis.Redis,
+    *,
+    worker_lease: WorkerLease,
+) -> None:
+    """Claim only exact pending messages that still prefer this worker host."""
+
+    try:
+        pending = await r.xpending_range(
+            TASK_STREAM,
+            CONSUMER_GROUP,
+            "-",
+            "+",
+            50,
+        )
+        for item in pending:
+            message_id = item.get("message_id")
+            owner = item.get("consumer")
+            idle_ms = item.get("time_since_delivered", 0)
+            if isinstance(message_id, bytes):
+                message_id = message_id.decode()
+            if isinstance(owner, bytes):
+                owner = owner.decode()
+            if (
+                not isinstance(message_id, str)
+                or not message_id
+                or owner == WORKER_ID
+                or type(idle_ms) is not int
+                or idle_ms < AFFINITY_RECLAIM_MIN_IDLE_MS
+            ):
+                continue
+            exact = await r.xrange(
+                TASK_STREAM,
+                message_id,
+                message_id,
+                1,
+            )
+            if len(exact) != 1:
+                continue
+            exact_id, payload = exact[0]
+            if isinstance(exact_id, bytes):
+                exact_id = exact_id.decode()
+            if exact_id != message_id or not isinstance(payload, dict):
+                continue
+            preferred_hosts = _parse_preferred_hosts(payload)
+            if WORKER_HOST not in preferred_hosts:
+                continue
+            try:
+                enqueued_at = int(
+                    payload.get("affinity_enqueued_at", "0") or "0"
+                )
+            except (TypeError, ValueError):
+                continue
+            age_seconds = (
+                max(0, int(time.time()) - enqueued_at)
+                if enqueued_at
+                else 0
+            )
+            if age_seconds >= AFFINITY_WAIT_SECONDS:
+                continue
+            claimed = await r.xclaim(
+                TASK_STREAM,
+                CONSUMER_GROUP,
+                WORKER_ID,
+                min_idle_time=AFFINITY_RECLAIM_MIN_IDLE_MS,
+                message_ids=[message_id],
+            )
+            for claimed_id, claimed_payload in claimed or []:
+                if isinstance(claimed_id, bytes):
+                    claimed_id = claimed_id.decode()
+                if claimed_id != message_id or not claimed_payload:
+                    continue
+                await _process_message(
+                    r,
+                    claimed_id,
+                    claimed_payload,
+                    worker_lease=worker_lease,
+                )
+    except Exception:
+        logger.exception("Preferred affinity PEL reclaim failed")
 
 
 async def _heartbeat_message(r: aioredis.Redis, msg_id: str) -> None:
@@ -1245,7 +1427,7 @@ async def _ack_message_for_claim(
     message_id: str,
     claim: NodeExecutionClaim,
 ) -> None:
-    if claim.worker_registration_id is None:
+    if getattr(claim, "worker_registration_id", None) is None:
         await redis.xack(TASK_STREAM, CONSUMER_GROUP, message_id)
         return
     delivery = _current_task_delivery.get()
@@ -1258,48 +1440,53 @@ async def _ack_message_for_claim(
         raise JobExecutionAuthorityBlocked(
             "worker task acknowledgement has no exact dispatch delivery"
         )
-    live_ack_authorized = False
-    try:
-        async with get_worker_session()() as db:
-            async with db.begin():
+    async with get_worker_session()() as db:
+        async with db.begin():
+            is_postgresql = _session_is_postgresql(db)
+            if (
+                is_postgresql
+                and not isinstance(delivery.event_emission_id, uuid.UUID)
+            ):
+                raise JobExecutionAuthorityBlocked(
+                    "worker task acknowledgement has no exact event emission"
+                )
+            if is_postgresql:
+                await require_registered_worker_node_claim(db, claim)
+            else:
                 authority = await lock_job_execution_authority(
                     db,
                     claim.job_id,
                     node_execution_id=claim.node_execution_id,
                 )
                 require_matching_node_execution_claim(authority, claim)
-                await require_worker_registration_lease(db, claim)
+                try:
+                    await require_worker_registration_lease(db, claim)
+                except JobExecutionAuthorityBlocked:
+                    pass
+                else:
+                    await authorize_worker_task_ack(
+                        db,
+                        claim,
+                        attestation_id=delivery.attestation_id,
+                    )
+            if is_postgresql:
                 await authorize_worker_task_ack(
                     db,
                     claim,
                     attestation_id=delivery.attestation_id,
                 )
-                live_ack_authorized = True
-    except JobExecutionAuthorityBlocked:
-        logger.info(
-            "Live lease no longer authorizes task %s XACK; checking receipt",
-            message_id,
-        )
-
-    async with get_worker_session()() as db:
-        async with db.begin():
             await require_worker_task_ack_receipt(
                 db,
                 claim,
-                redis_stream=TASK_STREAM,
-                consumer_group=CONSUMER_GROUP,
+                redis_stream=delivery.redis_stream,
+                consumer_group=delivery.consumer_group,
                 message_id=message_id,
                 payload_sha256=delivery.payload_sha256,
                 dispatch_key=delivery.dispatch_key,
             )
-            if live_ack_authorized:
-                logger.debug(
-                    "Using durable live task ACK authorization for %s",
-                    message_id,
-                )
             result = await redis.xack(
-                TASK_STREAM,
-                CONSUMER_GROUP,
+                delivery.redis_stream,
+                delivery.consumer_group,
                 message_id,
             )
             _require_task_xack_result(result)
@@ -1313,6 +1500,15 @@ async def _ack_message_for_claim(
                 payload_sha256=delivery.payload_sha256,
                 dispatch_key=delivery.dispatch_key,
             )
+
+
+def _session_is_postgresql(db: object) -> bool:
+    get_bind = getattr(db, "get_bind", None)
+    if not callable(get_bind):
+        return False
+    bind = get_bind()
+    dialect = getattr(bind, "dialect", None)
+    return getattr(dialect, "name", None) == "postgresql"
 
 
 def _require_task_xack_result(result: object) -> None:
@@ -1454,10 +1650,20 @@ async def _consume_registered_worker(
             worker_lease=registration.lease,
         )
         last_reclaim = asyncio.get_event_loop().time()
+        last_affinity_reclaim = 0.0
 
         while True:
             try:
                 now = asyncio.get_event_loop().time()
+                if (
+                    now - last_affinity_reclaim
+                    >= AFFINITY_RECLAIM_INTERVAL_SECONDS
+                ):
+                    await _reclaim_preferred_pending(
+                        redis,
+                        worker_lease=registration.lease,
+                    )
+                    last_affinity_reclaim = now
                 if now - last_reclaim > PEL_RECLAIM_INTERVAL:
                     await _reclaim_pending(
                         redis,

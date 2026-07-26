@@ -22,6 +22,11 @@ from app.services.registered_worker_event_receipt import (
     RegisteredWorkerEventReceiptService,
     parse_registered_worker_event,
 )
+from app.services.youtube_upload_operations import (
+    UploadOperationContext,
+    YouTubeUploadOperationStore,
+)
+from worker import main as worker_main
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -374,7 +379,7 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     INSERT INTO public.node_executions (
                         job_id, node_id, node_type, status
                     ) VALUES (
-                        $1, 'vision-atomic-claim', 'vision',
+                        $1, 'vision-atomic-claim', 'youtube_upload',
                         'QUEUED'::node_status
                     )
                     RETURNING id
@@ -472,12 +477,18 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 )
                 await admin.execute(
                     "GRANT SELECT ON public.worker_task_dispatches, "
-                    "public.worker_task_delivery_attestations "
+                    "public.worker_task_delivery_attestations, "
+                    "public.worker_event_emissions "
                     f'TO "{orchestrator_role}"'
                 )
                 await admin.execute(
                     "GRANT UPDATE (ack_state, acknowledged_at) ON "
                     "public.worker_task_delivery_attestations "
+                    f'TO "{orchestrator_role}"'
+                )
+                await admin.execute(
+                    "GRANT UPDATE (resolution_state, acknowledged_at) ON "
+                    "public.worker_task_dispatches "
                     f'TO "{orchestrator_role}"'
                 )
                 await admin.execute(
@@ -498,6 +509,15 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     "GRANT UPDATE (ack_state, acknowledged_at) ON "
                     "public.registered_worker_event_deliveries "
                     f'TO "{orchestrator_role}"'
+                )
+                await admin.execute(
+                    "GRANT UPDATE (emission_state, resolved_at) ON "
+                    "public.worker_event_emissions "
+                    f'TO "{orchestrator_role}"'
+                )
+                await admin.execute(
+                    "GRANT SELECT ON public.youtube_upload_operations "
+                    f'TO "{worker_role}"'
                 )
                 await admin.execute(
                     "GRANT EXECUTE ON FUNCTION "
@@ -532,11 +552,39 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     "uuid,bigint,text,uuid,uuid,text,text,text,text,uuid) "
                     f'TO "{worker_role}"'
                 )
+                for signature in (
+                    "vp_require_worker_node_claim("
+                    "uuid,bigint,text,timestamp with time zone,uuid,uuid)",
+                    "vp_persist_worker_artifact("
+                    "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
+                    "text,text,bigint,text,text,jsonb)",
+                    "vp_prepare_worker_event_emission("
+                    "uuid,bigint,text,timestamp with time zone,"
+                    "uuid,uuid,uuid,text,text,text,jsonb,text)",
+                    "vp_mark_worker_event_emitted(uuid,uuid,bigint,text)",
+                    "vp_reserve_worker_youtube_upload("
+                    "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
+                    "uuid,text,text,text)",
+                    "vp_transition_worker_youtube_upload("
+                    "uuid,bigint,text,timestamp with time zone,uuid,text,"
+                    "text,text,text,jsonb,text)",
+                ):
+                    await admin.execute(
+                        f"GRANT EXECUTE ON FUNCTION public.{signature} "
+                        f'TO "{worker_role}"'
+                    )
                 await admin.execute(
                     "GRANT EXECUTE ON FUNCTION "
                     "public.vp_observe_worker_task_delivery("
                     "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
                     "text,text,text,text,uuid) "
+                    f'TO "{orchestrator_role}"'
+                )
+                await admin.execute(
+                    "GRANT EXECUTE ON FUNCTION "
+                    "public.vp_observe_worker_event_emission("
+                    "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
+                    "uuid,text,text,text,text) "
                     f'TO "{orchestrator_role}"'
                 )
                 await admin.execute(
@@ -612,50 +660,235 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 "SELECT status::text FROM public.node_executions WHERE id = $1",
                 claim_node["id"],
             ) == "QUEUED"
-            claimed = await worker.fetchrow(claim_sql, *claim_args)
-            assert claimed is not None
+            worker_database_url = (
+                "postgresql+asyncpg://"
+                f"{worker_role}:{worker_password}@{suffix}"
+            )
+            worker_engine = create_async_engine(worker_database_url)
+            worker_sessions = async_sessionmaker(
+                worker_engine,
+                expire_on_commit=False,
+            )
+            atomic_delivery = worker_main.WorkerTaskDelivery(
+                redis_stream="vp:tasks:vision",
+                consumer_group="vision-workers",
+                message_id=claim_message_id,
+                payload_sha256=claim_payload_hash,
+                dispatch_key=claim_dispatch_key,
+            )
+            delivery_token = worker_main._current_task_delivery.set(
+                atomic_delivery
+            )
+            try:
+                claimed_execution = await worker_main._claim_node_execution(
+                    str(seeded["job_id"]),
+                    str(claim_node["id"]),
+                    worker_lease=SimpleNamespace(
+                        registration_id=second["registration_id"],
+                        lease_epoch=second["lease_epoch"],
+                        redis_consumer_id="vision-worker:atomic",
+                    ),
+                    session_factory=worker_sessions,
+                )
+            finally:
+                worker_main._current_task_delivery.reset(delivery_token)
+            assert claimed_execution is not None
+            claimed = {
+                "worker_started_at": claimed_execution.started_at,
+                "attestation_id": atomic_delivery.attestation_id,
+            }
             assert isinstance(claimed["worker_started_at"], datetime)
             assert isinstance(claimed["attestation_id"], uuid.UUID)
             assert await orchestrator.fetchval(
                 "SELECT status::text FROM public.node_executions WHERE id = $1",
                 claim_node["id"],
             ) == "RUNNING"
-            await worker.execute(
-                """
-                SELECT public.vp_authorize_worker_task_ack(
-                    $1, $2, $3, $4, $5
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await worker.execute(
+                    """
+                    INSERT INTO public.artifacts (
+                        job_id, node_execution_id, kind, filename,
+                        storage_backend, storage_path
+                    ) VALUES (
+                        $1, $2, 'INTERMEDIATE'::artifact_kind,
+                        'forbidden.mp4', 'minio', 'forbidden.mp4'
+                    )
+                    """,
+                    seeded["job_id"],
+                    claim_node["id"],
                 )
-                """,
-                claimed["attestation_id"],
-                second["registration_id"],
-                second["lease_epoch"],
-                "vision-worker:atomic",
-                claimed["worker_started_at"],
-            )
-            await worker.execute(
-                """
-                SELECT public.vp_acknowledge_worker_task_delivery(
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+            atomic_artifact_id = (
+                await worker_main._persist_artifact_for_current_claim(
+                    claimed_execution,
+                    filename="atomic-output.mp4",
+                    mime_type="video/mp4",
+                    file_size=128,
+                    storage_backend="minio",
+                    storage_path=(
+                        f"staging/artifacts/{seeded['job_id']}/"
+                        f"{claim_node['id']}-0123456789abcdef.mp4"
+                    ),
+                    media_info={"duration": 1.0},
+                    session_factory=worker_sessions,
                 )
-                """,
-                claimed["attestation_id"],
-                second["registration_id"],
-                second["lease_epoch"],
-                "vision-worker:atomic",
-                claimed["worker_started_at"],
-                "vp:tasks:vision",
-                "vision-workers",
-                claim_message_id,
-                claim_payload_hash,
-                claim_dispatch_key,
             )
-            assert await orchestrator.fetchval(
+            assert uuid.UUID(atomic_artifact_id)
+            admin = await asyncpg.connect(_asyncpg_url(target_url))
+            try:
+                await admin.execute(
+                    """
+                    UPDATE public.node_executions
+                    SET input_artifact_ids = ARRAY[$2]::uuid[]
+                    WHERE id = $1
+                    """,
+                    claim_node["id"],
+                    uuid.UUID(atomic_artifact_id),
+                )
+            finally:
+                await admin.close()
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await worker.execute(
+                    """
+                    INSERT INTO public.youtube_upload_operations (
+                        job_id, node_execution_id, input_artifact_id,
+                        content_sha256, title, privacy, status
+                    ) VALUES (
+                        $1, $2, $3, $4, 'forbidden', 'private', 'reserved'
+                    )
+                    """,
+                    seeded["job_id"],
+                    claim_node["id"],
+                    uuid.UUID(atomic_artifact_id),
+                    "a" * 64,
+                )
+            upload_context = UploadOperationContext(
+                job_id=seeded["job_id"],
+                node_execution_id=claim_node["id"],
+                execution_claim=claimed_execution,
+                input_artifact_id=uuid.UUID(atomic_artifact_id),
+                content_sha256="a" * 64,
+                title="Restricted role proof",
+                privacy="private",
+            )
+            upload_store = YouTubeUploadOperationStore(worker_sessions)
+            upload_claim = await upload_store.claim(upload_context)
+            assert upload_claim.action == "submit"
+            submitted_operation = await upload_store.mark_submitted(
+                upload_claim.operation.id,
+                str(uuid.uuid4()),
+                context=upload_context,
+            )
+            assert submitted_operation.status == "submitted"
+            failed_operation = await upload_store.mark_failed(
+                upload_claim.operation.id,
+                "test-only terminal transition",
+                context=upload_context,
+            )
+            assert failed_operation.status == "failed"
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="event_emission_missing",
+            ):
+                await worker.execute(
+                    """
+                    SELECT public.vp_authorize_worker_task_ack(
+                        $1, $2, $3, $4, $5
+                    )
+                    """,
+                    claimed["attestation_id"],
+                    second["registration_id"],
+                    second["lease_epoch"],
+                    "vision-worker:atomic",
+                    claimed["worker_started_at"],
+                )
+            atomic_event_payload = {
+                "event": "node_failed",
+                "job_id": str(seeded["job_id"]),
+                "node_execution_id": str(claim_node["id"]),
+                "error": "test failure",
+                "worker_id": "vision-worker:atomic",
+                "started_at": claimed["worker_started_at"].isoformat(),
+                "worker_registration_id": str(second["registration_id"]),
+                "worker_lease_epoch": str(second["lease_epoch"]),
+                "task_stream": "vp:tasks:vision",
+                "task_group": "vision-workers",
+                "task_message_id": claim_message_id,
+                "task_payload_sha256": claim_payload_hash,
+                "task_dispatch_key": str(claim_dispatch_key),
+            }
+            class AtomicRedis:
+                def __init__(self) -> None:
+                    self.xack_calls: list[tuple[str, str, str]] = []
+
+                async def eval(
+                    self,
+                    script,
+                    key_count,
+                    stream,
+                    marker,
+                    *fields,
+                ):
+                    assert script == worker_main._IDEMPOTENT_EVENT_XADD_SCRIPT
+                    assert key_count == 2
+                    assert stream == "vp:events"
+                    assert marker.startswith("vp:worker-event-emission:")
+                    assert fields
+                    return "1710000000001-0"
+
+                async def xack(self, stream, group, message_id):
+                    self.xack_calls.append((stream, group, message_id))
+                    return 1
+
+            atomic_redis = AtomicRedis()
+            previous_worker_session = worker_main.worker_session
+            worker_main.worker_session = worker_sessions
+            delivery_token = worker_main._current_task_delivery.set(
+                atomic_delivery
+            )
+            try:
+                atomic_emission_id = (
+                    await worker_main._xadd_event_for_claim(
+                        atomic_redis,
+                        atomic_event_payload,
+                        claimed_execution,
+                    )
+                )
+                assert isinstance(atomic_emission_id, uuid.UUID)
+                assert atomic_delivery.event_emission_id == atomic_emission_id
+                assert await orchestrator.fetchval(
+                    """
+                    SELECT public.vp_recover_registered_worker_node($1, $2)
+                    """,
+                    seeded["job_id"],
+                    claim_node["id"],
+                ) == "live"
+                await worker_main._ack_message_for_claim(
+                    atomic_redis,
+                    claim_message_id,
+                    claimed_execution,
+                )
+            finally:
+                worker_main._current_task_delivery.reset(delivery_token)
+                worker_main.worker_session = previous_worker_session
+                await worker_engine.dispose()
+            assert atomic_redis.xack_calls == [
+                (
+                    "vp:tasks:vision",
+                    "vision-workers",
+                    claim_message_id,
+                )
+            ]
+            await orchestrator.execute(
                 """
-                SELECT public.vp_recover_registered_worker_node($1, $2)
+                UPDATE public.worker_event_emissions
+                SET emission_state = 'resolved',
+                    resolved_at = clock_timestamp()
+                WHERE id = $1
+                  AND message_id = '1710000000001-0'
+                  AND emission_state = 'emitted'
                 """,
-                seeded["job_id"],
-                claim_node["id"],
-            ) == "live"
+                atomic_emission_id,
+            )
 
             cancel_pending_key = uuid.uuid4()
             cancel_delivered_key = uuid.uuid4()
@@ -1005,6 +1238,43 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     """,
                     attestation_id,
                 )
+            receipt_payload_hash = _sha256(
+                json.dumps(
+                    receipt_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            emission_id = await worker.fetchval(
+                """
+                SELECT public.vp_prepare_worker_event_emission(
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+                )
+                """,
+                second["registration_id"],
+                second["lease_epoch"],
+                "vision-worker:second",
+                worker_started_at,
+                seeded["job_id"],
+                seeded["id"],
+                attestation_id,
+                "vp:events",
+                "orchestrator",
+                receipt_payload_hash,
+                json.dumps(receipt_payload),
+                "node_completed",
+            )
+            await worker.execute(
+                """
+                SELECT public.vp_mark_worker_event_emitted(
+                    $1, $2, $3, $4
+                )
+                """,
+                emission_id,
+                second["registration_id"],
+                second["lease_epoch"],
+                "1710000001000-0",
+            )
             await worker.execute(
                 """
                 SELECT public.vp_authorize_worker_task_ack(
@@ -1204,16 +1474,16 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 },
             )
             try:
-                receipt_ids = await asyncio.gather(
-                    receipt_service.accept_and_apply(
+                receipt_ids = [
+                    await receipt_service.accept_and_apply(
                         first_event,
                         apply_event,
                     ),
-                    receipt_service.accept_and_apply(
+                    await receipt_service.accept_and_apply(
                         duplicate_event,
                         apply_event,
                     ),
-                )
+                ]
                 assert (
                     await receipt_service.accept_and_apply(
                         mismatched_event,
@@ -1277,6 +1547,33 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     "vp_resolve_worker_event_authority_for_job_deletion($1)",
                     seeded["job_id"],
                 )
+            terminal_node_before = await orchestrator.fetchrow(
+                """
+                SELECT status::text, retry_count, worker_id, started_at,
+                       completed_at, progress, error_message, error_trace,
+                       input_artifact_ids, output_artifact_id
+                FROM public.node_executions
+                WHERE id = $1
+                """,
+                seeded["id"],
+            )
+            assert await orchestrator.fetchval(
+                """
+                SELECT public.vp_recover_registered_worker_node($1, $2)
+                """,
+                seeded["job_id"],
+                seeded["id"],
+            ) == "terminal"
+            assert await orchestrator.fetchrow(
+                """
+                SELECT status::text, retry_count, worker_id, started_at,
+                       completed_at, progress, error_message, error_trace,
+                       input_artifact_ids, output_artifact_id
+                FROM public.node_executions
+                WHERE id = $1
+                """,
+                seeded["id"],
+            ) == terminal_node_before
 
             admin = await asyncpg.connect(_asyncpg_url(target_url))
             try:
@@ -1291,6 +1588,190 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 )
             finally:
                 await admin.close()
+            terminal_job_node_before = await orchestrator.fetchrow(
+                """
+                SELECT status::text, retry_count, worker_id, started_at,
+                       completed_at, progress, error_message, error_trace,
+                       input_artifact_ids, output_artifact_id
+                FROM public.node_executions
+                WHERE id = $1
+                """,
+                claim_node["id"],
+            )
+            assert await orchestrator.fetchval(
+                """
+                SELECT public.vp_recover_registered_worker_node($1, $2)
+                """,
+                seeded["job_id"],
+                claim_node["id"],
+            ) == "terminal"
+            assert await orchestrator.fetchrow(
+                """
+                SELECT status::text, retry_count, worker_id, started_at,
+                       completed_at, progress, error_message, error_trace,
+                       input_artifact_ids, output_artifact_id
+                FROM public.node_executions
+                WHERE id = $1
+                """,
+                claim_node["id"],
+            ) == terminal_job_node_before
+
+            task_ack_locked = asyncio.Event()
+            release_task_ack = asyncio.Event()
+
+            class BlockingTaskAckService(
+                RegisteredWorkerEventReceiptService
+            ):
+                @classmethod
+                async def _lock_job_node_registration(
+                    cls,
+                    db,
+                    *,
+                    job_id,
+                    node_execution_id,
+                    registration_id,
+                ):
+                    await super()._lock_job_node_registration(
+                        db,
+                        job_id=job_id,
+                        node_execution_id=node_execution_id,
+                        registration_id=registration_id,
+                    )
+                    task_ack_locked.set()
+                    await release_task_ack.wait()
+
+            class ConcurrencyRedis:
+                def __init__(self) -> None:
+                    self.calls: list[tuple[str, str, str]] = []
+
+                async def xack(self, stream, group, message_id):
+                    self.calls.append((stream, group, message_id))
+                    return 1
+
+            task_ack_engine = create_async_engine(
+                orchestrator_database_url
+            )
+            task_ack_service = BlockingTaskAckService(
+                async_sessionmaker(
+                    task_ack_engine,
+                    expire_on_commit=False,
+                )
+            )
+            task_ack_redis = ConcurrencyRedis()
+            cleanup_peer = await asyncpg.connect(
+                "postgresql://"
+                f"{orchestrator_role}:{orchestrator_password}@{suffix}"
+            )
+            try:
+                task_ack_task = asyncio.create_task(
+                    task_ack_service
+                    .reconcile_authorized_task_acknowledgements(
+                        task_ack_redis
+                    )
+                )
+                await asyncio.wait_for(task_ack_locked.wait(), timeout=3)
+                cleanup_task = asyncio.create_task(
+                    cleanup_peer.fetchval(
+                        "SELECT public."
+                        "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                        seeded["job_id"],
+                    )
+                )
+                done, _ = await asyncio.wait({cleanup_task}, timeout=0.25)
+                assert cleanup_task not in done
+                release_task_ack.set()
+                await asyncio.wait_for(task_ack_task, timeout=3)
+                with pytest.raises(
+                    asyncpg.RaiseError,
+                    match="worker_event_authority_unresolved",
+                ):
+                    await asyncio.wait_for(cleanup_task, timeout=3)
+            finally:
+                release_task_ack.set()
+                await task_ack_engine.dispose()
+                await cleanup_peer.close()
+            assert task_ack_redis.calls == [
+                (
+                    "vp:tasks:vision",
+                    "vision-workers",
+                    task_message_id,
+                )
+            ]
+
+            event_ack_locked = asyncio.Event()
+            release_event_ack = asyncio.Event()
+
+            class BlockingEventAckService(
+                RegisteredWorkerEventReceiptService
+            ):
+                @classmethod
+                async def _lock_job_node_registration(
+                    cls,
+                    db,
+                    *,
+                    job_id,
+                    node_execution_id,
+                    registration_id,
+                ):
+                    await super()._lock_job_node_registration(
+                        db,
+                        job_id=job_id,
+                        node_execution_id=node_execution_id,
+                        registration_id=registration_id,
+                    )
+                    event_ack_locked.set()
+                    await release_event_ack.wait()
+
+            event_ack_engine = create_async_engine(
+                orchestrator_database_url
+            )
+            event_ack_service = BlockingEventAckService(
+                async_sessionmaker(
+                    event_ack_engine,
+                    expire_on_commit=False,
+                )
+            )
+            event_ack_redis = ConcurrencyRedis()
+            cleanup_peer = await asyncpg.connect(
+                "postgresql://"
+                f"{orchestrator_role}:{orchestrator_password}@{suffix}"
+            )
+            try:
+                event_ack_task = asyncio.create_task(
+                    event_ack_service.acknowledge_applied(
+                        event_ack_redis,
+                        first_event,
+                    )
+                )
+                await asyncio.wait_for(event_ack_locked.wait(), timeout=3)
+                cleanup_task = asyncio.create_task(
+                    cleanup_peer.fetchval(
+                        "SELECT public."
+                        "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                        seeded["job_id"],
+                    )
+                )
+                done, _ = await asyncio.wait({cleanup_task}, timeout=0.25)
+                assert cleanup_task not in done
+                release_event_ack.set()
+                await asyncio.wait_for(event_ack_task, timeout=3)
+                with pytest.raises(
+                    asyncpg.RaiseError,
+                    match="worker_event_authority_unresolved",
+                ):
+                    await asyncio.wait_for(cleanup_task, timeout=3)
+            finally:
+                release_event_ack.set()
+                await event_ack_engine.dispose()
+                await cleanup_peer.close()
+            assert event_ack_redis.calls == [
+                (
+                    "vp:events",
+                    "orchestrator",
+                    first_event.message_id,
+                )
+            ]
+
             alias_locked = asyncio.Event()
             release_alias = asyncio.Event()
 
@@ -1426,7 +1907,7 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 """,
                 seeded["job_id"],
                 seeded["id"],
-            ) == "held_unresolved"
+            ) == "terminal"
 
             ack_engine = create_async_engine(orchestrator_database_url)
             ack_service = RegisteredWorkerEventReceiptService(
@@ -1461,49 +1942,51 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
             finally:
                 await ack_engine.dispose()
             assert ack_redis.calls == [
-                (
-                    "vp:tasks:vision",
-                    "vision-workers",
-                    task_message_id,
-                ),
                 ("vp:events", "orchestrator", "1710000001003-0"),
-                ("vp:events", "orchestrator", "1710000001000-0"),
                 ("vp:events", "orchestrator", "1710000001001-0"),
             ]
 
-            await worker.execute(
-                """
-                SELECT public.vp_require_worker_task_ack_receipt(
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="job_authority_changed",
+            ):
+                await worker.execute(
+                    """
+                    SELECT public.vp_require_worker_task_ack_receipt(
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9
+                    )
+                    """,
+                    second["registration_id"],
+                    second["lease_epoch"],
+                    "vision-worker:second",
+                    worker_started_at,
+                    "vp:tasks:vision",
+                    "vision-workers",
+                    task_message_id,
+                    task_payload_hash,
+                    dispatch_key,
                 )
-                """,
-                second["registration_id"],
-                second["lease_epoch"],
-                "vision-worker:second",
-                worker_started_at,
-                "vp:tasks:vision",
-                "vision-workers",
-                task_message_id,
-                task_payload_hash,
-                dispatch_key,
-            )
-            await worker.execute(
-                """
-                SELECT public.vp_acknowledge_worker_task_delivery(
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="job_authority_changed",
+            ):
+                await worker.execute(
+                    """
+                    SELECT public.vp_acknowledge_worker_task_delivery(
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                    )
+                    """,
+                    attestation_id,
+                    second["registration_id"],
+                    second["lease_epoch"],
+                    "vision-worker:second",
+                    worker_started_at,
+                    "vp:tasks:vision",
+                    "vision-workers",
+                    task_message_id,
+                    task_payload_hash,
+                    dispatch_key,
                 )
-                """,
-                attestation_id,
-                second["registration_id"],
-                second["lease_epoch"],
-                "vision-worker:second",
-                worker_started_at,
-                "vp:tasks:vision",
-                "vision-workers",
-                task_message_id,
-                task_payload_hash,
-                dispatch_key,
-            )
             assert await orchestrator.fetchval(
                 """
                 SELECT ack_state
@@ -1546,14 +2029,14 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 """,
                 seeded["job_id"],
                 seeded["id"],
-            ) == "recovered"
+            ) == "terminal"
             assert await orchestrator.fetchval(
                 """
                 SELECT public.vp_recover_registered_worker_node($1, $2)
                 """,
                 seeded["job_id"],
                 seeded["id"],
-            ) == "not_registered"
+            ) == "terminal"
             admin = await asyncpg.connect(_asyncpg_url(target_url))
             try:
                 await admin.execute(

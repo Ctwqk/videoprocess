@@ -45,9 +45,15 @@ class IntermediateArtifactCache(UUIDPrimaryKeyMixin, Base):
     node_type: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
     node_config_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     input_signature_hash: Mapped[str] = mapped_column(String(128), nullable=False)
-    output_artifact_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("artifacts.id", ondelete="CASCADE"), nullable=False
+    output_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True
     )
+    storage_backend: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    storage_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    filename: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    media_info: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     last_used_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     hit_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models.artifact import Artifact, ArtifactKind, IntermediateArtifactCache
 from app.orchestrator.artifact_cache import IntermediateArtifactCacheService
+from app.services.external_url_identity import normalize_external_media_url
 
 
 @pytest.fixture
@@ -119,6 +120,122 @@ async def test_url_download_cache_reuses_zero_input_artifact_across_jobs(
 
     assert hit is not None
     assert hit.output_artifact_id == output_artifact.id
+
+
+def test_url_download_cache_key_uses_normalized_external_url() -> None:
+    service = IntermediateArtifactCacheService()
+
+    short_url = service.cache_key(
+        "url_download",
+        {
+            "url": "https://youtu.be/abc123?utm_source=ignored",
+            "format": "best",
+        },
+        {},
+    )
+    watch_url = service.cache_key(
+        "url_download",
+        {
+            "url": "https://www.youtube.com/watch?feature=share&v=abc123",
+            "format": "best",
+        },
+        {},
+    )
+
+    assert short_url == watch_url
+
+
+def test_external_url_normalization_does_not_alias_unrelated_hosts() -> None:
+    assert normalize_external_media_url(
+        "https://notyoutube.com/watch?v=abc123"
+    ) == "https://notyoutube.com/watch?v=abc123"
+    assert normalize_external_media_url(
+        "https://example.test/video/0123456789abcdef01234567"
+    ) == "https://example.test/video/0123456789abcdef01234567"
+    assert normalize_external_media_url(
+        "https://example.test/path/BV1abc"
+    ) == "https://example.test/path/BV1abc"
+
+
+@pytest.mark.asyncio
+async def test_cache_snapshot_survives_source_artifact_deletion(
+    cache_db_session,
+) -> None:
+    service = IntermediateArtifactCacheService()
+    source = artifact(storage_path="download-cache/youtube/abc123.mp4")
+    cache_db_session.add(source)
+    await cache_db_session.flush()
+    await service.store(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://youtu.be/abc123"},
+        input_artifacts={},
+        output_artifact=source,
+        node_id="download",
+        job_id=source.job_id,
+    )
+    await cache_db_session.delete(source)
+    await cache_db_session.flush()
+
+    hit = await service.lookup(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://www.youtube.com/watch?v=abc123"},
+        input_artifacts={},
+    )
+
+    assert hit is not None
+    assert hit.storage_backend == "local"
+    assert hit.storage_path == "download-cache/youtube/abc123.mp4"
+    assert hit.output_artifact_id is None
+
+
+@pytest.mark.asyncio
+async def test_materialized_cache_hit_survives_later_source_deletion(
+    cache_db_session,
+) -> None:
+    service = IntermediateArtifactCacheService()
+    source = artifact(storage_path="staging/artifacts/source/output.mp4")
+    cache_db_session.add(source)
+    await cache_db_session.flush()
+    await service.store(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://youtu.be/abc123"},
+        input_artifacts={},
+        output_artifact=source,
+        node_id="download-source",
+        job_id=source.job_id,
+    )
+    hit = await service.lookup(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://www.youtube.com/watch?v=abc123"},
+        input_artifacts={},
+    )
+    assert hit is not None
+    consumer_job_id = uuid.uuid4()
+    materialized = await service.materialize_hit(
+        cache_db_session,
+        hit,
+        job_id=consumer_job_id,
+        node_execution_id=uuid.uuid4(),
+    )
+    await cache_db_session.delete(source)
+    await cache_db_session.flush()
+    hit = await service.lookup(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://youtu.be/abc123"},
+        input_artifacts={},
+    )
+
+    stored = await cache_db_session.get(Artifact, materialized.id)
+    assert stored is not None
+    assert hit is not None
+    assert stored.job_id == consumer_job_id
+    assert stored.storage_path == "staging/artifacts/source/output.mp4"
+    assert hit.output_artifact_id is None
 
 
 @pytest.mark.asyncio
