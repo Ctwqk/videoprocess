@@ -210,6 +210,7 @@ docker() {
   if [[ "${1:-}" == "run" \
     && "$*" == *"--env DATABASE_URL"* \
     && "$*" == *"SELECT version_num FROM alembic_version"* ]]; then
+    builtin printf 'CUDA migration gate banner\n'
     [[ "$MIGRATION_GATE_MODE" == "success" ]]
     return
   fi
@@ -454,8 +455,12 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
 fi
 source "$EXTENSION"
 images="$(build_vp_app_images "$TEST_COMMIT")"
-if ! deploy_vp_app_services $images >/dev/null; then
+if ! deploy_output="$(deploy_vp_app_services $images)"; then
   echo 'FAIL: deploy_vp_app_services returned non-zero' >&2
+  exit 1
+fi
+if [[ "$deploy_output" != "$VP_APP_SERVICES" ]]; then
+  echo 'FAIL: deploy_vp_app_services stdout must contain only the service inventory' >&2
   exit 1
 fi
 

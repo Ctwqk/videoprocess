@@ -58,7 +58,7 @@ vp_require_channelops_migration_head() {
     --network "$VP_PIPELINE_NETWORK" \
     --env DATABASE_URL \
     "$python_worker" \
-    python -c "$check"; then
+    python -c "$check" >/dev/null; then
     echo "ChannelOps migration head gate failed; expected exactly 032_channelops_leader_epoch" >&2
     return 1
   fi
