@@ -132,7 +132,7 @@ async def test_postgres_16_promotion_operation_migration_is_rolling_safe_and_rev
                 row["version_num"]
                 for row in await conn.fetch("SELECT version_num FROM alembic_version")
             }
-            assert current_heads == {"032_channelops_leader_epoch"}
+            assert current_heads == {"033_legacy_worker_event_resolutions"}
             constraints = {
                 row["conname"]
                 for row in await conn.fetch(
