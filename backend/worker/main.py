@@ -13,6 +13,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import httpx
 import redis.asyncio as aioredis
@@ -33,6 +34,8 @@ from app.services.job_execution_authority import (
     acknowledge_worker_task_delivery,
     authorize_worker_task_ack,
     claim_registered_worker_node,
+    list_prepared_worker_event_emission_ids,
+    load_prepared_worker_event_emission,
     lock_job_execution_authority,
     mark_worker_event_emitted,
     persist_registered_worker_artifact,
@@ -98,6 +101,9 @@ ARTIFACT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = float(
     os.environ.get("VP_ARTIFACT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS", "900")
 )
 REMOTE_ARTIFACT_CLEANUP_TIMEOUT_SECONDS = 15.0
+EVENT_EMISSION_SEND_ATTEMPTS = 3
+EVENT_EMISSION_RECONCILE_INTERVAL_SECONDS = 5.0
+EVENT_EMISSION_RECONCILE_LIMIT = 50
 
 engine_db: AsyncEngine | None = None
 worker_session: async_sessionmaker[AsyncSession] | None = None
@@ -1095,14 +1101,13 @@ async def _xadd_event_for_claim(
         raise JobExecutionAuthorityBlocked(
             "registered worker event has no exact task delivery"
         )
-    if any(
-        not isinstance(key, str) or not isinstance(value, str)
-        for key, value in payload.items()
-    ):
-        raise JobExecutionAuthorityBlocked(
-            "registered worker event payload is not canonical"
-        )
-    canonical_payload = dict(payload)
+    canonical_payload: dict[str, str] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise JobExecutionAuthorityBlocked(
+                "registered worker event payload is not canonical"
+            )
+        canonical_payload[key] = value
     payload_sha256 = _canonical_task_payload_sha256(canonical_payload)
     async with get_worker_session()() as db:
         async with db.begin():
@@ -1136,33 +1141,161 @@ async def _xadd_event_for_claim(
                 payload=canonical_payload,
                 event_type=canonical_payload["event"],
             )
-    async with get_worker_session()() as db:
-        async with db.begin():
-            await require_registered_worker_node_claim(db, claim)
-            fields: list[str] = []
-            for key, value in sorted(canonical_payload.items()):
-                fields.extend((key, value))
-            message_id = await redis.eval(
-                _IDEMPOTENT_EVENT_XADD_SCRIPT,
-                2,
-                EVENT_STREAM,
-                f"vp:worker-event-emission:{emission_id}",
-                *fields,
-            )
-            if isinstance(message_id, bytes):
-                message_id = message_id.decode()
-            if not isinstance(message_id, str) or not message_id.strip():
-                raise JobExecutionAuthorityBlocked(
-                    "registered worker event message identity is invalid"
-                )
-            await mark_worker_event_emitted(
-                db,
-                claim,
-                emission_id=emission_id,
-                message_id=message_id.strip(),
-            )
+    registration_id = claim.worker_registration_id
+    lease_epoch = claim.worker_lease_epoch
+    assert isinstance(registration_id, uuid.UUID)
+    assert isinstance(lease_epoch, int)
+    await _send_prepared_event_emission(
+        redis,
+        emission_id,
+        registration_id=registration_id,
+        lease_epoch=lease_epoch,
+        max_attempts=EVENT_EMISSION_SEND_ATTEMPTS,
+    )
     delivery.event_emission_id = emission_id
     return emission_id
+
+
+async def _send_prepared_event_emission(
+    redis: aioredis.Redis,
+    emission_id: uuid.UUID,
+    *,
+    registration_id: uuid.UUID,
+    lease_epoch: int,
+    max_attempts: int = EVENT_EMISSION_SEND_ATTEMPTS,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> NodeExecutionClaim:
+    if (
+        not isinstance(emission_id, uuid.UUID)
+        or not isinstance(registration_id, uuid.UUID)
+        or type(lease_epoch) is not int
+        or lease_epoch <= 0
+        or type(max_attempts) is not int
+        or not 1 <= max_attempts <= 5
+    ):
+        raise ValueError("invalid prepared event emission retry request")
+    sessions = session_factory or get_worker_session()
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            async with sessions() as db:
+                async with db.begin():
+                    emission = await load_prepared_worker_event_emission(
+                        db,
+                        emission_id,
+                        registration_id=registration_id,
+                        lease_epoch=lease_epoch,
+                    )
+                    if (
+                        emission.redis_stream != EVENT_STREAM
+                        or emission.consumer_group != "orchestrator"
+                        or emission.payload.get("event")
+                        != emission.event_type
+                        or _canonical_task_payload_sha256(
+                            emission.payload
+                        )
+                        != emission.payload_sha256
+                    ):
+                        raise JobExecutionAuthorityBlocked(
+                            "prepared worker event payload is invalid"
+                        )
+                    fields: list[str] = []
+                    for key, value in sorted(
+                        emission.payload.items()
+                    ):
+                        fields.extend((key, value))
+                    message_id = await cast(
+                        Awaitable[object],
+                        redis.eval(
+                            _IDEMPOTENT_EVENT_XADD_SCRIPT,
+                            2,
+                            emission.redis_stream,
+                            (
+                                "vp:worker-event-emission:"
+                                f"{emission.id}"
+                            ),
+                            *fields,
+                        ),
+                    )
+                    if isinstance(message_id, bytes):
+                        message_id = message_id.decode()
+                    if (
+                        not isinstance(message_id, str)
+                        or not message_id.strip()
+                    ):
+                        raise JobExecutionAuthorityBlocked(
+                            "registered worker event message identity "
+                            "is invalid"
+                        )
+                    await mark_worker_event_emitted(
+                        db,
+                        emission.claim,
+                        emission_id=emission.id,
+                        message_id=message_id.strip(),
+                    )
+            return emission.claim
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < max_attempts:
+                await asyncio.sleep(min(0.25 * (2**attempt), 1.0))
+    assert last_error is not None
+    raise last_error
+
+
+async def _reconcile_prepared_worker_event_emissions(
+    redis: aioredis.Redis,
+    worker_lease: WorkerLease,
+    *,
+    limit: int = EVENT_EMISSION_RECONCILE_LIMIT,
+) -> int:
+    async with get_worker_session()() as db:
+        async with db.begin():
+            emission_ids = (
+                await list_prepared_worker_event_emission_ids(
+                    db,
+                    registration_id=worker_lease.registration_id,
+                    lease_epoch=worker_lease.lease_epoch,
+                    limit=limit,
+                )
+            )
+    emitted = 0
+    for emission_id in emission_ids:
+        try:
+            await _send_prepared_event_emission(
+                redis,
+                emission_id,
+                registration_id=worker_lease.registration_id,
+                lease_epoch=worker_lease.lease_epoch,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Prepared worker event replay deferred emission=%s",
+                emission_id,
+            )
+        else:
+            emitted += 1
+    return emitted
+
+
+async def _prepared_event_reconciler_loop(
+    redis: aioredis.Redis,
+    worker_lease: WorkerLease,
+) -> None:
+    while True:
+        try:
+            await _reconcile_prepared_worker_event_emissions(
+                redis,
+                worker_lease,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Prepared worker event reconciliation deferred")
+        await asyncio.sleep(EVENT_EMISSION_RECONCILE_INTERVAL_SECONDS)
 
 
 def _claim_generation_token(claim: NodeExecutionClaim) -> str:
@@ -1253,6 +1386,9 @@ async def _reclaim_preferred_pending(
     r: aioredis.Redis,
     *,
     worker_lease: WorkerLease,
+    message_scheduler: (
+        Callable[[str, dict], Awaitable[None]] | None
+    ) = None,
 ) -> None:
     """Claim only exact pending messages that still prefer this worker host."""
 
@@ -1321,12 +1457,18 @@ async def _reclaim_preferred_pending(
                     claimed_id = claimed_id.decode()
                 if claimed_id != message_id or not claimed_payload:
                     continue
-                await _process_message(
-                    r,
-                    claimed_id,
-                    claimed_payload,
-                    worker_lease=worker_lease,
-                )
+                if message_scheduler is not None:
+                    await message_scheduler(
+                        claimed_id,
+                        claimed_payload,
+                    )
+                else:
+                    await _process_message(
+                        r,
+                        claimed_id,
+                        claimed_payload,
+                        worker_lease=worker_lease,
+                    )
     except Exception:
         logger.exception("Preferred affinity PEL reclaim failed")
 
@@ -1626,6 +1768,7 @@ async def _consume_registered_worker(
     WORKER_HOST = registration.worker_host
     WORKER_ID = registration.redis_consumer_id
     message_tasks: set[asyncio.Task[None]] = set()
+    emission_reconciler_task: asyncio.Task[None] | None = None
     try:
         try:
             await redis.xgroup_create(
@@ -1640,10 +1783,40 @@ async def _consume_registered_worker(
 
         concurrency = int(os.environ.get("WORKER_CONCURRENCY", "2"))
         semaphore = asyncio.Semaphore(concurrency)
+
+        async def schedule_message(
+            message_id: str,
+            data: dict,
+        ) -> None:
+            await semaphore.acquire()
+
+            async def run_message() -> None:
+                try:
+                    await _process_message(
+                        redis,
+                        message_id,
+                        data,
+                        worker_lease=registration.lease,
+                        lease_refresher=registration.heartbeat_now,
+                    )
+                finally:
+                    semaphore.release()
+
+            task = asyncio.create_task(run_message())
+            message_tasks.add(task)
+            task.add_done_callback(message_tasks.discard)
+
         logger.info(
             "Worker %s started (concurrency=%s)",
             registration.redis_consumer_id,
             concurrency,
+        )
+        emission_reconciler_task = asyncio.create_task(
+            _prepared_event_reconciler_loop(
+                redis,
+                registration.lease,
+            ),
+            name="worker-event-emission-reconciler",
         )
         await _reclaim_pending(
             redis,
@@ -1662,6 +1835,7 @@ async def _consume_registered_worker(
                     await _reclaim_preferred_pending(
                         redis,
                         worker_lease=registration.lease,
+                        message_scheduler=schedule_message,
                     )
                     last_affinity_reclaim = now
                 if now - last_reclaim > PEL_RECLAIM_INTERVAL:
@@ -1680,28 +1854,7 @@ async def _consume_registered_worker(
                 )
                 for _stream_name, entries in messages or []:
                     for message_id, data in entries:
-                        await semaphore.acquire()
-
-                        async def run_message(
-                            mid: str = message_id,
-                            payload: dict = data,
-                        ) -> None:
-                            try:
-                                await _process_message(
-                                    redis,
-                                    mid,
-                                    payload,
-                                    worker_lease=registration.lease,
-                                    lease_refresher=(
-                                        registration.heartbeat_now
-                                    ),
-                                )
-                            finally:
-                                semaphore.release()
-
-                        task = asyncio.create_task(run_message())
-                        message_tasks.add(task)
-                        task.add_done_callback(message_tasks.discard)
+                        await schedule_message(message_id, data)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1710,6 +1863,12 @@ async def _consume_registered_worker(
                 )
                 await asyncio.sleep(2)
     finally:
+        if emission_reconciler_task is not None:
+            emission_reconciler_task.cancel()
+            await asyncio.gather(
+                emission_reconciler_task,
+                return_exceptions=True,
+            )
         for task in message_tasks:
             task.cancel()
         if message_tasks:

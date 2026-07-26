@@ -43,6 +43,18 @@ class NodeExecutionClaim:
     worker_lease_epoch: int | None = None
 
 
+@dataclass(frozen=True)
+class PreparedWorkerEventEmission:
+    id: uuid.UUID
+    source_task_attestation_id: uuid.UUID
+    claim: NodeExecutionClaim
+    redis_stream: str
+    consumer_group: str
+    payload_sha256: str
+    payload: dict[str, str]
+    event_type: str
+
+
 async def claim_registered_worker_node(
     db: AsyncSession,
     *,
@@ -391,6 +403,137 @@ async def mark_worker_event_emitted(
     )
 
 
+async def list_prepared_worker_event_emission_ids(
+    db: AsyncSession,
+    *,
+    registration_id: uuid.UUID | None,
+    lease_epoch: int | None,
+    limit: int,
+) -> list[uuid.UUID]:
+    registration_id, lease_epoch = _validated_registration_identity(
+        registration_id,
+        lease_epoch,
+    )
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    try:
+        result = await db.execute(
+            text(
+                """
+                SELECT emission_id
+                FROM public.vp_list_worker_prepared_event_emissions(
+                    :registration_id,
+                    :lease_epoch,
+                    :limit
+                )
+                """
+            ),
+            {
+                "registration_id": registration_id,
+                "lease_epoch": lease_epoch,
+                "limit": limit,
+            },
+        )
+    except Exception as exc:
+        raise JobExecutionAuthorityBlocked(
+            "prepared worker event emissions cannot be listed"
+        ) from exc
+    emission_ids = list(result.scalars())
+    if any(not isinstance(emission_id, uuid.UUID) for emission_id in emission_ids):
+        raise JobExecutionAuthorityBlocked(
+            "prepared worker event emission identity is invalid"
+        )
+    return emission_ids
+
+
+async def load_prepared_worker_event_emission(
+    db: AsyncSession,
+    emission_id: uuid.UUID,
+    *,
+    registration_id: uuid.UUID | None,
+    lease_epoch: int | None,
+) -> PreparedWorkerEventEmission:
+    registration_id, lease_epoch = _validated_registration_identity(
+        registration_id,
+        lease_epoch,
+    )
+    if not isinstance(emission_id, uuid.UUID):
+        raise JobExecutionAuthorityBlocked(
+            "prepared worker event emission identity is invalid"
+        )
+    try:
+        result = await db.execute(
+            text(
+                """
+                SELECT *
+                FROM public.vp_load_worker_prepared_event_emission(
+                    :emission_id,
+                    :registration_id,
+                    :lease_epoch
+                )
+                """
+            ),
+            {
+                "emission_id": emission_id,
+                "registration_id": registration_id,
+                "lease_epoch": lease_epoch,
+            },
+        )
+        row = result.mappings().one_or_none()
+    except Exception as exc:
+        raise JobExecutionAuthorityBlocked(
+            "prepared worker event emission cannot be loaded"
+        ) from exc
+    if row is None:
+        raise JobExecutionAuthorityBlocked(
+            "prepared worker event emission is unavailable"
+        )
+    payload = row["payload_json"]
+    if (
+        row["emission_id"] != emission_id
+        or not isinstance(row["source_task_attestation_id"], uuid.UUID)
+        or not isinstance(row["job_id"], uuid.UUID)
+        or not isinstance(row["node_execution_id"], uuid.UUID)
+        or not isinstance(row["worker_id"], str)
+        or not row["worker_id"].strip()
+        or not isinstance(row["worker_started_at"], datetime)
+        or not isinstance(row["redis_stream"], str)
+        or not row["redis_stream"].strip()
+        or not isinstance(row["consumer_group"], str)
+        or not row["consumer_group"].strip()
+        or not isinstance(row["payload_sha256"], str)
+        or not isinstance(payload, dict)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in payload.items()
+        )
+        or row["event_type"] not in {"node_completed", "node_failed"}
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "prepared worker event emission payload is invalid"
+        )
+    claim = NodeExecutionClaim(
+        job_id=row["job_id"],
+        node_execution_id=row["node_execution_id"],
+        worker_id=row["worker_id"],
+        started_at=row["worker_started_at"],
+        worker_registration_id=registration_id,
+        worker_lease_epoch=lease_epoch,
+    )
+    return PreparedWorkerEventEmission(
+        id=emission_id,
+        source_task_attestation_id=row[
+            "source_task_attestation_id"
+        ],
+        claim=claim,
+        redis_stream=row["redis_stream"],
+        consumer_group=row["consumer_group"],
+        payload_sha256=row["payload_sha256"],
+        payload=dict(payload),
+        event_type=row["event_type"],
+    )
+
+
 async def observe_worker_event_emission(
     db: AsyncSession,
     claim: NodeExecutionClaim,
@@ -466,6 +609,8 @@ async def recover_registered_worker_node(
         if outcome not in {
             "live",
             "held_unresolved",
+            "held_unresolved_event",
+            "terminal",
             "recovered",
             "not_registered",
         }:

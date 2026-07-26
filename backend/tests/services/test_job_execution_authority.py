@@ -13,6 +13,7 @@ from app.services.job_execution_authority import (
     authorize_worker_task_ack,
     claim_registered_worker_node,
     observe_worker_registration_lease,
+    recover_registered_worker_node,
     require_matching_node_execution_claim,
     require_worker_registration_lease,
     require_worker_registration_margin,
@@ -293,3 +294,44 @@ async def test_worker_task_ack_authorization_is_durable_and_exact() -> None:
         "worker_id": claim.worker_id,
         "worker_started_at": claim.started_at,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    ("terminal", "held_unresolved_event"),
+)
+async def test_registered_recovery_accepts_state_preserving_outcomes(
+    outcome: str,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+
+    class Bind:
+        class Dialect:
+            name = "postgresql"
+
+        dialect = Dialect()
+
+    class Session:
+        def get_bind(self):
+            return Bind()
+
+        async def scalar(self, statement, parameters):
+            assert "public.vp_recover_registered_worker_node" in str(
+                statement
+            )
+            assert parameters == {
+                "job_id": job_id,
+                "node_execution_id": node_execution_id,
+            }
+            return outcome
+
+    assert (
+        await recover_registered_worker_node(
+            Session(),
+            job_id,
+            node_execution_id,
+        )
+        == outcome
+    )

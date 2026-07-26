@@ -372,8 +372,11 @@ git commit -m "feat(workers): register go consumer before redis"
 - Create: `backend/tests/services/test_worker_control_role_cli.py`
 - Create: `backend/app/channel_agent/staging_object_janitor_cli.py`
 - Create: `backend/app/services/staging_object_janitor.py`
+- Create: `backend/app/services/staging_janitor_status.py`
 - Create: `backend/tests/channel_agent/test_staging_object_janitor_cli.py`
 - Create: `backend/tests/services/test_staging_object_janitor.py`
+- Create: `backend/tests/services/test_staging_janitor_status.py`
+- Modify: `backend/alembic/versions/034_worker_registrations.py`
 - Modify: `backend/app/services/worker_storage_readiness.py`
 - Modify: `backend/tests/services/test_worker_storage_readiness.py`
 - Modify: `deploy/swarm/deploy-sync-extension.sh`
@@ -431,6 +434,11 @@ direct DML in the same PostgreSQL test. Deny `DELETE`, `TRUNCATE`, DDL, sequence
 `alembic_version`, all direct grant/registration table access, privileged role
 membership, and ownership. Use separate deploy-migrator and deploy-read
 credentials; neither may be mounted into workers.
+The worker-role function allowlist includes
+`vp_prepare_worker_event_emission`, `vp_mark_worker_event_emitted`,
+`vp_list_worker_prepared_event_emissions`, and
+`vp_load_worker_prepared_event_emission`; it includes no direct event-emission
+table DML.
 Create a separate non-owner orchestrator-control role. Grant it `EXECUTE` only
 on the reviewed observer, proven-task ACK, cancelled-dispatch, registered-node
 recovery, and cleanup functions:
@@ -454,36 +462,104 @@ success requires explicit `EXECUTE`, while `vp_require_worker_lease` still
 rejects the orchestrator principal, and takeover/revoke waits behind observer
 fences.
 
-Deploy `python -m app.channel_agent.staging_object_janitor_cli` as the
-`vp-staging-object-janitor` one-shot service on a five-minute managed interval
-using the same MinIO bucket and a read-only database principal. Its only
-deletion candidates are exact claim-shaped
+Create a stable non-owner staging-janitor role with direct `SELECT` on only
+`artifacts.storage_path` and `intermediate_artifact_cache.storage_path`, plus
+`EXECUTE` on `vp_begin_staging_janitor_run` and
+`vp_finish_staging_janitor_run`. Give each worker runtime role `EXECUTE` on
+`vp_staging_janitor_readiness` only; neither role receives direct access to
+`staging_janitor_status`. The janitor reads its versioned role URL only from
+the mode-0400
+`/run/secrets/vp-staging-janitor-database-url`; reject `DATABASE_URL`.
+
+In `deploy/swarm/deploy-sync-extension.sh`, install
+`$DEPLOY_GITHUB_SYNC_ROOT/bin/vp-staging-object-janitor-run.sh` mode 0700 and
+replace only the marked `# BEGIN/END VIDEOPROCESS STAGING JANITOR` crontab
+block on host 150. Its exact schedule is `*/5 * * * *`, with output appended
+to `$DEPLOY_GITHUB_SYNC_ROOT/logs/vp-staging-object-janitor.log`. Each tick
+leaves a still-running fixed-name `vp-staging-object-janitor` job alone,
+removes a terminal prior job, waits for removal, and creates exactly one
+Swarm `replicated-job` with one replica, restart condition `none`, constraint
+`node.hostname==ccttww-lap`, the existing pipeline network, the current
+reviewed worker image, and only its janitor database/MinIO secrets. The
+command is
+`python -m app.channel_agent.staging_object_janitor_cli`; its non-secret
+runner ID is exactly `ccttww-lap`. The deploy test uses fake
+`docker`/`crontab` commands to prove dry-run zero mutation, one exact marked
+block, fixed placement on 150, no host 126 reference, preservation of
+unrelated cron, terminal-job replacement, and running-job overlap skip.
+
+The database functions are the final cross-controller overlap fence:
+`vp_begin_staging_janitor_run` serializes begin, returns
+`started|overlap|recovered_stale`, and permits stale takeover only after 600
+seconds; `vp_finish_staging_janitor_run` accepts only the exact run ID and
+canonical result. The singleton database status is the transport visible to
+workers on both 127 and 150. A successful result is ready for 900 seconds;
+missing success, a newer error, a success older than 900 seconds, or an active
+run older than 600 seconds is unready and alerting. Every registered worker
+sets `VP_REQUIRE_STAGING_JANITOR=true`; its readiness CLI uses its own
+mode-0400 worker database URL and calls
+`vp_staging_janitor_readiness(900,600)`. It never reads a cross-container
+file. Keep the atomically written mode-0600
+`/run/videoprocess/staging-janitor/status.json` on a host-150-only named
+evidence volume, but do not use it as readiness authority.
+
+The janitor's only deletion candidates are exact claim-shaped
 `staging/artifacts/{job_uuid}/{node_uuid}-{claim_token}.{ext}` objects older
 than 86,400 seconds. It excludes every exact `artifacts.storage_path` and
 durable `intermediate_artifact_cache.storage_path`, including successful
-staging-prefixed pointers whose source job was deleted. Write status
-atomically with mode 0600 to
-`/run/videoprocess/staging-janitor/status.json`; alert on nonzero errors,
-missing runs, or age above 900 seconds. Set
-`VP_REQUIRE_STAGING_JANITOR=true` and
-`VP_STAGING_JANITOR_STATUS_FILE` for registered workers and fail readiness
-closed until a fresh successful status exists. Tests cover old orphan deletion,
-fresh/invalid retention, exact pointer protection, status monitoring, and the
-grace bound against every operation/retry/clock-skew window.
-Create per-service Redis users scoped to their admitted task stream/group.
+staging-prefixed pointers whose source job was deleted. Tests cover old orphan
+deletion, fresh/invalid retention, exact pointer protection, local evidence
+mode, durable status transitions, restricted cross-role visibility, scheduler
+overlap, monitoring, and the grace bound against every
+operation/retry/clock-skew window.
+
+Create one Redis ACL user per worker service. Its base selector is exactly
+`(+ping +xgroup|create +xreadgroup +xpending +xrange +xclaim +xautoclaim +xack ~vp:tasks:<that-service-type>)`.
+Add three event-emission selectors:
+`(+eval ~vp:events ~vp:worker-event-emission:*)`,
+`(+get +set ~vp:worker-event-emission:*)`, and
+`(+xadd ~vp:events)`. This gives the worker's reviewed two-key Lua invocation
+and its nested commands the exact event stream/marker access they require
+without granting `XADD` to any task stream. Do not grant any
+`~vp:tasks:<other-type>`, `~*`, `+@all`, key deletion, expiry, script loading,
+or administrative command. Test every worker user against its own task
+stream, every other worker task stream, `vp:events`, its exact marker prefix,
+unrelated keys, and an unlisted command.
+
 Create a separate orchestrator Redis user for the event group and admitted
 task streams. Its explicit command allowlist includes stream consume/reclaim
 and ACK operations plus `EVAL`, `GET`, `SET`, and `XADD` for the reviewed
 idempotent dispatch script and `vp:worker-task-dispatch:*` keys. Deny broad key
-patterns and arbitrary scripts. Test marker recovery across Redis-success/
-database-failure windows. Require Redis `noeviction`, durable persistence, and
-restart readiness before admitting registered traffic. Mark the database row
-`attempting` before `EVAL`; the Lua marker has no TTL while a row can be
-pending, attempting, or uncertain. A missing marker after an attempt moves the
-row to `uncertain`, emits a hold/alert, and performs zero `XADD`. An explicit
-janitor may delete a marker only after exact database proof that the dispatch
-is delivered and resolved. Test concurrent reconcilers and operator repair;
-never allow expiry or eviction to mint a replacement stream message.
+patterns and arbitrary scripts.
+
+For worker event emission, commit the canonical payload and exact emission ID
+before Redis. The sender and five-second reconciler use
+`vp_list_worker_prepared_event_emissions` and
+`vp_load_worker_prepared_event_emission`, re-prove the same live
+registration/epoch, delivery attestation, dispatch, and node claim on every
+finite send attempt, and run the marker Lua atomically. A definite pre-command
+failure leaves `prepared` for replay. Redis success followed by database-mark
+failure reuses the non-expiring marker and returns the original message ID;
+it never performs a second `XADD`. Lease loss, cancellation, startup recovery,
+and job cleanup preserve unresolved prepared authority. The observer may mark
+an exact matching delivered event emitted; otherwise operator repair holds it.
+
+Require Redis `noeviction`, durable AOF persistence, and restart readiness
+before admitting registered traffic. Readiness rejects an unavailable,
+loading, replica-unready, non-persistent, or wrong-eviction Redis instance and
+holds all prepared event/dispatch replay until the check passes. Dispatch rows
+enter `attempting` before `EVAL`; a missing marker after an uncertain dispatch
+attempt moves the row to `uncertain`, alerts, and performs zero `XADD`.
+Neither `vp:worker-task-dispatch:*` nor
+`vp:worker-event-emission:*` has a TTL. The marker janitor uses a separate
+non-worker ACL user with only exact marker read/delete access and may delete an
+event marker only after database proof that the emission is `resolved`, its
+source attestation is acknowledged, and the source dispatch is resolved; it
+may delete a dispatch marker only after that exact dispatch is delivered and
+resolved. Test definite pre-XADD replay, Redis-success/database-failure
+replay, concurrent reconcilers, restart readiness, missing-marker uncertainty,
+operator repair, and cleanup. Never allow expiry, eviction, or marker cleanup
+to mint a replacement stream message.
 Create a versioned non-owner operator `LOGIN` principal with exact `EXECUTE`
 on the five schema-qualified operator functions and no direct table or column
 read/write privileges. Exercise pending upsert, activation, grant revocation,

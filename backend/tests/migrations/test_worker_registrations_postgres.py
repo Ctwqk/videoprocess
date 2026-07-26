@@ -96,6 +96,7 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
     assert "CREATE TABLE worker_event_emissions" in sql
     assert "CREATE TABLE registered_worker_event_receipts" in sql
     assert "CREATE TABLE registered_worker_event_deliveries" in sql
+    assert "CREATE TABLE staging_janitor_status" in sql
     assert "CREATE TABLE worker_event_dispatches" not in sql
     for column in (
         "generation",
@@ -141,6 +142,8 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "vp_observe_worker_task_delivery",
         "vp_prepare_worker_event_emission",
         "vp_mark_worker_event_emitted",
+        "vp_list_worker_prepared_event_emissions",
+        "vp_load_worker_prepared_event_emission",
         "vp_observe_worker_event_emission",
         "vp_require_worker_node_claim",
         "vp_persist_worker_artifact",
@@ -157,6 +160,9 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "vp_worker_registration_revoke",
         "vp_worker_registration_expire",
         "vp_worker_endpoint_fingerprints",
+        "vp_begin_staging_janitor_run",
+        "vp_finish_staging_janitor_run",
+        "vp_staging_janitor_readiness",
     ):
         assert f"CREATE FUNCTION public.{function_name}" in sql
         assert f"ALTER FUNCTION public.{function_name}" not in sql
@@ -252,6 +258,7 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "worker_event_emissions",
         "worker_task_delivery_attestations",
         "worker_task_dispatches",
+        "staging_janitor_status",
     ):
         assert f"DROP TABLE {table_name}" in downgrade_sql
     for function_name in (
@@ -260,8 +267,200 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "vp_acknowledge_worker_task_delivery",
         "vp_authorize_worker_task_ack",
         "vp_resolve_worker_event_authority_for_job_deletion",
+        "vp_begin_staging_janitor_run",
+        "vp_finish_staging_janitor_run",
+        "vp_staging_janitor_readiness",
     ):
         assert f"DROP FUNCTION IF EXISTS public.{function_name}" in downgrade_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_staging_janitor_status_is_cross_role_and_overlap_safe() -> None:
+    database = f"vp_staging_janitor_{uuid.uuid4().hex}"
+    janitor_role = f"vp_janitor_{uuid.uuid4().hex[:16]}"
+    worker_role = f"vp_ready_{uuid.uuid4().hex[:16]}"
+    janitor_password = uuid.uuid4().hex
+    worker_password = uuid.uuid4().hex
+    admin_url = _database_url("postgres")
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+        await admin.execute(
+            f'CREATE ROLE "{janitor_role}" LOGIN PASSWORD '
+            f"'{janitor_password}'"
+        )
+        await admin.execute(
+            f'CREATE ROLE "{worker_role}" LOGIN PASSWORD '
+            f"'{worker_password}'"
+        )
+    finally:
+        await admin.close()
+
+    target_url = _database_url(database)
+    try:
+        migrated = _run_alembic(target_url, "upgrade", "head")
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        admin = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            assert await admin.fetchval("SHOW server_version_num") >= "160000"
+            for signature in (
+                "vp_begin_staging_janitor_run(uuid,text,integer)",
+                "vp_finish_staging_janitor_run(uuid,jsonb,boolean)",
+            ):
+                await admin.execute(
+                    f"GRANT EXECUTE ON FUNCTION public.{signature} "
+                    f'TO "{janitor_role}"'
+                )
+            await admin.execute(
+                "GRANT EXECUTE ON FUNCTION "
+                "public.vp_staging_janitor_readiness(integer,integer) "
+                f'TO "{worker_role}"'
+            )
+        finally:
+            await admin.close()
+
+        suffix = target_url.split("@", 1)[1]
+        janitor = await asyncpg.connect(
+            f"postgresql://{janitor_role}:{janitor_password}@{suffix}"
+        )
+        janitor_peer = await asyncpg.connect(
+            f"postgresql://{janitor_role}:{janitor_password}@{suffix}"
+        )
+        worker = await asyncpg.connect(
+            f"postgresql://{worker_role}:{worker_password}@{suffix}"
+        )
+        try:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await janitor.fetch("SELECT * FROM staging_janitor_status")
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await worker.fetch("SELECT * FROM staging_janitor_status")
+
+            readiness_sql = (
+                "SELECT public.vp_staging_janitor_readiness(900, 600)"
+            )
+            assert await worker.fetchval(readiness_sql) == "missing"
+
+            run_id = uuid.uuid4()
+            assert await janitor.fetchval(
+                """
+                SELECT public.vp_begin_staging_janitor_run(
+                    $1, 'ccttww-lap', 600
+                )
+                """,
+                run_id,
+            ) == "started"
+            assert await janitor_peer.fetchval(
+                """
+                SELECT public.vp_begin_staging_janitor_run(
+                    $1, 'ccttww-lap', 600
+                )
+                """,
+                uuid.uuid4(),
+            ) == "overlap"
+            assert await worker.fetchval(readiness_sql) == "missing"
+
+            successful_result = {
+                "schema_version": 1,
+                "grace_seconds": 86400,
+                "scanned": 3,
+                "deleted": 1,
+                "protected": 1,
+                "too_young": 1,
+                "invalid": 0,
+                "errors": 0,
+            }
+            assert await janitor.fetchval(
+                """
+                SELECT public.vp_finish_staging_janitor_run(
+                    $1, $2::jsonb, true
+                )
+                """,
+                run_id,
+                json.dumps(successful_result),
+            )
+            assert await worker.fetchval(readiness_sql) == "ready"
+
+            failed_run_id = uuid.uuid4()
+            assert await janitor.fetchval(
+                """
+                SELECT public.vp_begin_staging_janitor_run(
+                    $1, 'ccttww-lap', 600
+                )
+                """,
+                failed_run_id,
+            ) == "started"
+            failed_result = dict(successful_result, errors=1)
+            assert not await janitor.fetchval(
+                """
+                SELECT public.vp_finish_staging_janitor_run(
+                    $1, $2::jsonb, false
+                )
+                """,
+                failed_run_id,
+                json.dumps(failed_result),
+            )
+            assert await worker.fetchval(readiness_sql) == "latest_error"
+
+            stale_run_id = uuid.uuid4()
+            assert await janitor.fetchval(
+                """
+                SELECT public.vp_begin_staging_janitor_run(
+                    $1, 'ccttww-lap', 600
+                )
+                """,
+                stale_run_id,
+            ) == "started"
+            admin = await asyncpg.connect(_asyncpg_url(target_url))
+            try:
+                await admin.execute(
+                    """
+                    UPDATE public.staging_janitor_status
+                    SET active_started_at =
+                        clock_timestamp() - interval '601 seconds'
+                    WHERE singleton
+                    """
+                )
+            finally:
+                await admin.close()
+            assert await worker.fetchval(readiness_sql) == "active_stale"
+
+            recovered_run_id = uuid.uuid4()
+            assert await janitor_peer.fetchval(
+                """
+                SELECT public.vp_begin_staging_janitor_run(
+                    $1, 'ccttww-lap', 600
+                )
+                """,
+                recovered_run_id,
+            ) == "recovered_stale"
+            assert await janitor_peer.fetchval(
+                """
+                SELECT public.vp_finish_staging_janitor_run(
+                    $1, $2::jsonb, true
+                )
+                """,
+                recovered_run_id,
+                json.dumps(successful_result),
+            )
+            assert await worker.fetchval(readiness_sql) == "ready"
+        finally:
+            await janitor.close()
+            await janitor_peer.close()
+            await worker.close()
+    finally:
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            await admin.execute(f'DROP ROLE IF EXISTS "{janitor_role}"')
+            await admin.execute(f'DROP ROLE IF EXISTS "{worker_role}"')
+        finally:
+            await admin.close()
 
 
 @pytest.mark.asyncio

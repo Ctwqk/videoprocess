@@ -78,7 +78,9 @@ def _run_alembic(database_url: str) -> subprocess.CompletedProcess[str]:
     not POSTGRES_URL,
     reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
 )
-async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke() -> None:
+async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     database = f"vp_worker_observer_{uuid.uuid4().hex}"
     worker_role = f"vp_worker_{uuid.uuid4().hex[:16]}"
     operator_role = f"vp_operator_{uuid.uuid4().hex[:16]}"
@@ -146,6 +148,7 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
             worker_functions = (
                 "vp_worker_register(text,bigint,text,text,uuid,integer,text,"
                 "jsonb,text,text,text,text,jsonb,text,text,text,text,text)",
+                "vp_worker_heartbeat(uuid,text,uuid,bigint,text)",
                 "vp_require_worker_lease(uuid,bigint)",
                 "vp_require_worker_lease_margin(uuid,bigint,integer)",
             )
@@ -562,6 +565,10 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     "uuid,bigint,text,timestamp with time zone,"
                     "uuid,uuid,uuid,text,text,text,jsonb,text)",
                     "vp_mark_worker_event_emitted(uuid,uuid,bigint,text)",
+                    "vp_list_worker_prepared_event_emissions("
+                    "uuid,bigint,integer)",
+                    "vp_load_worker_prepared_event_emission("
+                    "uuid,uuid,bigint)",
                     "vp_reserve_worker_youtube_upload("
                     "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
                     "uuid,text,text,text)",
@@ -773,12 +780,53 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
             upload_store = YouTubeUploadOperationStore(worker_sessions)
             upload_claim = await upload_store.claim(upload_context)
             assert upload_claim.action == "submit"
-            submitted_operation = await upload_store.mark_submitted(
-                upload_claim.operation.id,
-                str(uuid.uuid4()),
-                context=upload_context,
+            manager_task_id = str(uuid.uuid4())
+            simulated_posts: list[uuid.UUID] = []
+
+            async def run_restricted_submission():
+                async with upload_store.submission_fence(upload_context):
+                    attempting = await upload_store.mark_attempting(
+                        upload_claim.operation.id,
+                        context=upload_context,
+                    )
+                    assert attempting.request_attempted_at is not None
+                    assert await worker.fetchval(
+                        """
+                        SELECT request_attempted_at IS NOT NULL
+                        FROM public.youtube_upload_operations
+                        WHERE id = $1
+                        """,
+                        upload_claim.operation.id,
+                    )
+                    simulated_posts.append(upload_claim.operation.id)
+                    renewed_until = await asyncio.wait_for(
+                        worker_peer.fetchval(
+                            """
+                            SELECT public.vp_worker_heartbeat(
+                                $1, $2, $3, $4, $5
+                            )
+                            """,
+                            second["registration_id"],
+                            "observer-service",
+                            second_args[4],
+                            second["lease_epoch"],
+                            second_args[17],
+                        ),
+                        timeout=1,
+                    )
+                    assert isinstance(renewed_until, datetime)
+                    return await upload_store.mark_submitted(
+                        upload_claim.operation.id,
+                        manager_task_id,
+                        context=upload_context,
+                    )
+
+            submitted_operation = await asyncio.wait_for(
+                run_restricted_submission(),
+                timeout=3,
             )
             assert submitted_operation.status == "submitted"
+            assert simulated_posts == [upload_claim.operation.id]
             failed_operation = await upload_store.mark_failed(
                 upload_claim.operation.id,
                 "test-only terminal transition",
@@ -819,6 +867,12 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
             class AtomicRedis:
                 def __init__(self) -> None:
                     self.xack_calls: list[tuple[str, str, str]] = []
+                    self.eval_calls = 0
+                    self.fail_before_xadd = True
+                    self.markers: dict[str, str] = {}
+                    self.stream_entries: list[
+                        tuple[str, tuple[str, ...]]
+                    ] = []
 
                 async def eval(
                     self,
@@ -833,7 +887,20 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     assert stream == "vp:events"
                     assert marker.startswith("vp:worker-event-emission:")
                     assert fields
-                    return "1710000000001-0"
+                    self.eval_calls += 1
+                    if self.fail_before_xadd:
+                        raise ConnectionError(
+                            "definite failure before Redis EVAL"
+                        )
+                    existing = self.markers.get(marker)
+                    if existing is not None:
+                        return existing
+                    message_id = "1710000000001-0"
+                    self.markers[marker] = message_id
+                    self.stream_entries.append(
+                        (message_id, tuple(fields))
+                    )
+                    return message_id
 
                 async def xack(self, stream, group, message_id):
                     self.xack_calls.append((stream, group, message_id))
@@ -846,15 +913,87 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 atomic_delivery
             )
             try:
-                atomic_emission_id = (
+                with pytest.raises(
+                    ConnectionError,
+                    match="definite failure",
+                ):
                     await worker_main._xadd_event_for_claim(
                         atomic_redis,
                         atomic_event_payload,
                         claimed_execution,
                     )
+                assert atomic_redis.eval_calls == 3
+                atomic_emission_id = await orchestrator.fetchval(
+                    """
+                    SELECT id
+                    FROM public.worker_event_emissions
+                    WHERE source_task_attestation_id = $1
+                      AND emission_state = 'prepared'
+                      AND message_id IS NULL
+                    """,
+                    claimed["attestation_id"],
                 )
                 assert isinstance(atomic_emission_id, uuid.UUID)
-                assert atomic_delivery.event_emission_id == atomic_emission_id
+                assert atomic_redis.stream_entries == []
+
+                original_mark_emitted = (
+                    worker_main.mark_worker_event_emitted
+                )
+
+                async def crash_before_database_mark(*args, **kwargs):
+                    raise RuntimeError(
+                        "simulated crash before database mark"
+                    )
+
+                monkeypatch.setattr(
+                    worker_main,
+                    "mark_worker_event_emitted",
+                    crash_before_database_mark,
+                )
+                atomic_redis.fail_before_xadd = False
+                with pytest.raises(
+                    RuntimeError,
+                    match="simulated crash",
+                ):
+                    await worker_main._send_prepared_event_emission(
+                        atomic_redis,
+                        atomic_emission_id,
+                        registration_id=second["registration_id"],
+                        lease_epoch=second["lease_epoch"],
+                        max_attempts=3,
+                    )
+                assert len(atomic_redis.stream_entries) == 1
+                assert atomic_redis.eval_calls == 6
+
+                monkeypatch.setattr(
+                    worker_main,
+                    "mark_worker_event_emitted",
+                    original_mark_emitted,
+                )
+                reconciled = await (
+                    worker_main
+                    ._reconcile_prepared_worker_event_emissions(
+                        atomic_redis,
+                        SimpleNamespace(
+                            registration_id=second["registration_id"],
+                            lease_epoch=second["lease_epoch"],
+                        ),
+                        limit=10,
+                    )
+                )
+                assert reconciled == 1
+                assert len(atomic_redis.stream_entries) == 1
+                assert atomic_redis.eval_calls == 7
+                assert await orchestrator.fetchval(
+                    """
+                    SELECT emission_state
+                    FROM public.worker_event_emissions
+                    WHERE id = $1
+                      AND message_id = '1710000000001-0'
+                    """,
+                    atomic_emission_id,
+                ) == "emitted"
+                atomic_delivery.event_emission_id = atomic_emission_id
                 assert await orchestrator.fetchval(
                     """
                     SELECT public.vp_recover_registered_worker_node($1, $2)

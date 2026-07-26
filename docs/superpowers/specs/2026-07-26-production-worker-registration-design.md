@@ -259,9 +259,16 @@ Before event `XADD`, the worker commits an immutable
 `worker_event_emissions` row for the source attestation. It binds the event
 stream/group, canonical payload hash and JSON, event type, job/node, and exact
 registration/epoch/worker/start claim. The idempotent Redis marker is keyed by
-the emission ID and has no TTL. A second fenced transaction records the exact
-Redis message ID. Source-task ACK authorization requires that exact
-`emitted|resolved` row and stores its ID on the attestation. The observer may
+the emission ID and has no TTL. A finite sender and five-second reconciler
+load only the current registration's prepared rows through
+`vp_list_worker_prepared_event_emissions` and
+`vp_load_worker_prepared_event_emission`; every attempt re-proves the exact
+live claim, attestation, and dispatch before using the stored canonical
+payload. A definite pre-command Redis failure remains prepared and is replayed.
+If Redis succeeds before the database mark, the atomic marker returns the same
+message ID on replay and prevents another `XADD`. A second fenced transaction
+records that exact Redis message ID. Source-task ACK authorization requires
+that exact `emitted|resolved` row and stores its ID on the attestation. The observer may
 complete a `prepared -> emitted` handoff after a Redis-success/database-failure
 window only when the observed message and payload hash match. Recovery,
 cancellation, and cleanup retain `prepared|emitted` authority. Cancellation-
@@ -461,7 +468,10 @@ write surface.
 Its exact `EXECUTE` allowlist includes the registration/lease functions plus
 `vp_claim_worker_node`, `vp_require_worker_node_claim`,
 `vp_persist_worker_artifact`, `vp_prepare_worker_event_emission`,
-`vp_mark_worker_event_emitted`, `vp_authorize_worker_task_ack`,
+`vp_mark_worker_event_emitted`,
+`vp_list_worker_prepared_event_emissions`,
+`vp_load_worker_prepared_event_emission`,
+`vp_authorize_worker_task_ack`,
 `vp_require_worker_task_ack_receipt`,
 `vp_acknowledge_worker_task_delivery`,
 `vp_reserve_worker_youtube_upload`, and
@@ -504,13 +514,28 @@ Schema migration/DCL uses the protected deploy-migrator credential. Migration
 head and readiness probes use a separate deploy-read credential. Neither
 credential is mounted into a worker.
 
-Task 4 deploys `python -m
-app.channel_agent.staging_object_janitor_cli` as the
-`vp-staging-object-janitor` one-shot service on a five-minute managed interval.
-It writes `/run/videoprocess/staging-janitor/status.json`; monitoring alerts on
-missing runs, status age above 900 seconds, or nonzero errors. Registered
-workers set `VP_REQUIRE_STAGING_JANITOR=true` and
-`VP_STAGING_JANITOR_STATUS_FILE` and remain unready until the status is fresh.
+Task 4 makes host 150 the sole scheduler owner. Its deploy extension installs
+a mode-0700 `vp-staging-object-janitor-run.sh` and exactly one marked `*/5`
+cron block. Each tick converges the fixed-name
+`vp-staging-object-janitor` Swarm replicated job to one replica, restart
+condition `none`, and `node.hostname==ccttww-lap`; a running prior job is left
+alone and a terminal prior job is removed before recreation. Host 126 is
+forbidden. The command is
+`python -m app.channel_agent.staging_object_janitor_cli`, and its dedicated
+non-owner database URL is read only from the mode-0400
+`/run/secrets/vp-staging-janitor-database-url`.
+
+The janitor's SECURITY DEFINER begin/finish functions own one durable singleton
+status row and serialize concurrent schedulers. Begin returns
+`started|overlap|recovered_stale`, with stale takeover after 600 seconds.
+Finish accepts only the exact active run and canonical result. The database
+status, not a container-local file, is visible to worker readiness on both
+hosts 127 and 150. `vp_staging_janitor_readiness(900,600)` reports `ready`,
+`missing`, `stale_success`, `latest_error`, or `active_stale`; every status
+other than `ready` fails worker readiness and alerts. Workers receive only
+EXECUTE on this function and use their existing mode-0400 database secret.
+The mode-0600 local JSON remains host-150 evidence on a named volume but has no
+readiness authority.
 
 A separate versioned `LOGIN` deployment operator principal owns no objects and
 has no direct grant/registration table access. It can execute only the five
@@ -561,18 +586,28 @@ principal cannot satisfy that separation during this rollout, the preflight repo
 complete T05 security boundary.
 
 This increment authenticates workers before Redis and continuously joins
-consumer observations to registrations. Task 4 gives each worker only its
-granted task stream/group commands and gives the orchestrator-control Redis
-principal the event-group commands plus `EVAL`, `GET`, `SET`, and `XADD` for
-`vp:worker-task-dispatch:*` markers and admitted task streams. Lua execution is
-restricted to the reviewed idempotent dispatch script. Dispatch markers do not
-expire while a row is pending, attempting, or uncertain. Redis runs with
-`noeviction`, persistence, restart-readiness validation, and alerts for
-attempting/uncertain rows. An explicit janitor may delete only a marker whose
-exact database dispatch is delivered and resolved. A missing marker after an
-attempt causes a database hold and zero `XADD`; it never silently creates a
-replacement message. No broad key pattern or unrestricted scripting grant is
-permitted.
+consumer observations to registrations. Task 4 gives each worker the exact
+base ACL selector
+`(+ping +xgroup|create +xreadgroup +xpending +xrange +xclaim +xautoclaim +xack ~vp:tasks:<that-service-type>)`
+and the event selectors
+`(+eval ~vp:events ~vp:worker-event-emission:*)`,
+`(+get +set ~vp:worker-event-emission:*)`, and
+`(+xadd ~vp:events)`. Cross-worker task streams, `~*`, `+@all`, expiry,
+deletion, script loading, and administration remain denied. The
+orchestrator-control Redis principal separately receives event-group commands
+and exact dispatch-marker access.
+
+Event and dispatch markers do not expire while database authority exists.
+Redis runs with `noeviction`, durable AOF persistence, restart-readiness
+validation, and alerts for prepared/attempting/uncertain rows. Prepared event
+replay always reloads the stored canonical payload under the same live
+registration/claim proof; the marker closes Redis-success/database-failure
+replay without duplicate `XADD`. Missing-marker uncertainty is held for
+operator repair when Redis persistence cannot be proven. A separate janitor
+ACL may delete an event marker only after the exact emission is resolved, its
+source attestation is acknowledged, and its source dispatch is resolved; a
+dispatch marker additionally requires that exact dispatch to be delivered and
+resolved. No worker has marker deletion access.
 
 ## Unknown Consumer Guard
 

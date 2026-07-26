@@ -19,6 +19,15 @@ durable event proof; restricted worker role cannot run Python row-lock path;
 terminal recovery reset; preferred affinity reclaim gap; Task 4 broad worker
 DML; ACK/cleanup lock inversion; URL cache normalization/retention; MinIO
 janitor/readiness plan gap; commits 2da204b..0c8a188)
+Task 2: fix round 4/5 (6 prior findings addressed, 6 open — registered YouTube
+double-session self-lock; janitor readiness lacks cross-host transport and
+recurring scheduler; prepared event lacks no-XADD replay; Python rejects
+terminal/held_unresolved_event recovery outcomes; worker Redis ACL omits event
+emission marker/script access; end-to-end restricted-role YouTube path remains
+unproven; commit e1c5f0f)
+Task 2: minor (deferred): preferred affinity reclaim processes the reclaimed
+task inline, reducing consumer-loop fairness while claim fencing preserves
+authority safety.
 Task 3: pending
 Task 4: pending
 Task 5: pending

@@ -56,6 +56,14 @@ class UploadOperationClaim:
     operation: YouTubeUploadOperation
 
 
+@dataclass
+class _SubmissionFenceState:
+    context: UploadOperationContext
+    db: AsyncSession
+    phase: str = "initial"
+    operation_id: uuid.UUID | None = None
+
+
 class UploadOperationConflictError(RuntimeError):
     pass
 
@@ -64,7 +72,7 @@ class YouTubeUploadOperationStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
         self._active_submission_fence: ContextVar[
-            UploadOperationContext | None
+            _SubmissionFenceState | None
         ] = ContextVar(
             f"youtube-upload-submission-fence-{id(self)}",
             default=None,
@@ -78,33 +86,35 @@ class YouTubeUploadOperationStore:
         """Hold durable execution authority across the irreversible upload POST."""
 
         async with self._session_factory() as db:
-            async with db.begin():
-                if (
-                    getattr(
-                        context.execution_claim,
-                        "worker_registration_id",
-                        None,
-                    )
-                    is not None
-                    and _session_is_postgresql(db)
-                ):
-                    await require_registered_worker_node_claim(
+            if (
+                getattr(
+                    context.execution_claim,
+                    "worker_registration_id",
+                    None,
+                )
+                is not None
+                and _session_is_postgresql(db)
+            ):
+                await db.begin()
+                try:
+                    await self._require_registered_submission_authority(
                         db,
-                        context.execution_claim,
+                        context,
                     )
-                    await require_worker_registration_margin(
-                        db,
-                        context.execution_claim,
-                        minimum_margin_seconds=(
-                            SUBMISSION_LEASE_MARGIN_SECONDS
-                        ),
+                    state = _SubmissionFenceState(
+                        context=context,
+                        db=db,
                     )
-                    token = self._active_submission_fence.set(context)
+                    token = self._active_submission_fence.set(state)
                     try:
                         yield
                     finally:
                         self._active_submission_fence.reset(token)
-                    return
+                finally:
+                    if db.in_transaction():
+                        await db.rollback()
+                return
+            async with db.begin():
                 authority = await lock_job_execution_authority(
                     db,
                     context.job_id,
@@ -119,7 +129,8 @@ class YouTubeUploadOperationStore:
                     authority,
                     context.execution_claim,
                 )
-                token = self._active_submission_fence.set(context)
+                state = _SubmissionFenceState(context=context, db=db)
+                token = self._active_submission_fence.set(state)
                 try:
                     yield
                 finally:
@@ -212,6 +223,16 @@ class YouTubeUploadOperationStore:
         *,
         context: UploadOperationContext | None = None,
     ) -> YouTubeUploadOperation:
+        active_fence = self._registered_submission_fence(
+            context,
+            operation_id,
+            phases={"initial"},
+        )
+        if active_fence is not None:
+            return await self._mark_attempting_in_fence(
+                active_fence,
+                operation_id,
+            )
         async with self._session_factory() as db:
             if (
                 context is not None
@@ -269,6 +290,30 @@ class YouTubeUploadOperationStore:
         canonical_manager_task_id = self._canonical_manager_task_id(manager_task_id)
         if canonical_manager_task_id is None:
             raise ValueError("manager task id must be a canonical UUID")
+
+        active_fence = self._registered_submission_fence(
+            context,
+            operation_id,
+            phases={"post_fenced"},
+        )
+        if active_fence is not None:
+            try:
+                operation = await self._transition_registered(
+                    active_fence.db,
+                    operation_id,
+                    active_fence.context,
+                    expected_status="reserved",
+                    transition="submitted",
+                    manager_task_id=canonical_manager_task_id,
+                )
+                await active_fence.db.commit()
+            except BaseException:
+                if active_fence.db.in_transaction():
+                    await active_fence.db.rollback()
+                active_fence.phase = "attempted_unfenced"
+                raise
+            active_fence.phase = "submitted"
+            return operation
 
         async with self._session_factory() as db:
             if (
@@ -456,6 +501,34 @@ class YouTubeUploadOperationStore:
         *,
         context: UploadOperationContext | None,
     ) -> YouTubeUploadOperation:
+        active_fence = self._registered_submission_fence(
+            context,
+            operation_id,
+            phases={"initial", "post_fenced"},
+        )
+        if active_fence is not None:
+            current = await self._operation(
+                active_fence.db,
+                operation_id,
+            )
+            try:
+                operation = await self._transition_registered(
+                    active_fence.db,
+                    operation_id,
+                    active_fence.context,
+                    expected_status=current.status,
+                    transition=status,
+                    error_message=error_message,
+                )
+                await active_fence.db.commit()
+            except BaseException:
+                if active_fence.db.in_transaction():
+                    await active_fence.db.rollback()
+                active_fence.phase = "attempted_unfenced"
+                raise
+            active_fence.phase = status
+            return operation
+
         async with self._session_factory() as db:
             if (
                 context is not None
@@ -544,8 +617,11 @@ class YouTubeUploadOperationStore:
                 context.execution_claim,
             )
             return
-        active_context = self._active_submission_fence.get()
-        if active_context == context:
+        active_fence = self._active_submission_fence.get()
+        if (
+            active_fence is not None
+            and active_fence.context == context
+        ):
             return
         authority = await lock_job_execution_authority(
             db,
@@ -561,6 +637,92 @@ class YouTubeUploadOperationStore:
             authority,
             context.execution_claim,
         )
+
+    async def _mark_attempting_in_fence(
+        self,
+        fence: _SubmissionFenceState,
+        operation_id: uuid.UUID,
+    ) -> YouTubeUploadOperation:
+        fence.operation_id = operation_id
+        try:
+            await self._transition_registered(
+                fence.db,
+                operation_id,
+                fence.context,
+                expected_status="reserved",
+                transition="attempting",
+            )
+            await fence.db.commit()
+        except BaseException:
+            if fence.db.in_transaction():
+                await fence.db.rollback()
+            fence.phase = "failed"
+            raise
+
+        try:
+            await fence.db.begin()
+            await self._require_registered_submission_authority(
+                fence.db,
+                fence.context,
+            )
+            operation = await self._transition_registered(
+                fence.db,
+                operation_id,
+                fence.context,
+                expected_status="reserved",
+                transition="fence",
+            )
+        except BaseException:
+            if fence.db.in_transaction():
+                await fence.db.rollback()
+            fence.phase = "attempted_unfenced"
+            raise
+
+        fence.phase = "post_fenced"
+        return operation
+
+    async def _require_registered_submission_authority(
+        self,
+        db: AsyncSession,
+        context: UploadOperationContext,
+    ) -> None:
+        await require_registered_worker_node_claim(
+            db,
+            context.execution_claim,
+        )
+        await require_worker_registration_margin(
+            db,
+            context.execution_claim,
+            minimum_margin_seconds=SUBMISSION_LEASE_MARGIN_SECONDS,
+        )
+
+    def _registered_submission_fence(
+        self,
+        context: UploadOperationContext | None,
+        operation_id: uuid.UUID,
+        *,
+        phases: set[str],
+    ) -> _SubmissionFenceState | None:
+        active = self._active_submission_fence.get()
+        if (
+            context is None
+            or active is None
+            or active.context != context
+            or active.phase not in phases
+            or (
+                active.operation_id is not None
+                and active.operation_id != operation_id
+            )
+            or getattr(
+                context.execution_claim,
+                "worker_registration_id",
+                None,
+            )
+            is None
+        ):
+            return None
+        return active
+
     async def _reserve_registered(
         self,
         db: AsyncSession,

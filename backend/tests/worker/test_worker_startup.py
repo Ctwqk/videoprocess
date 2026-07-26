@@ -928,6 +928,57 @@ async def test_preferred_registered_worker_reclaims_exact_pending_affinity_messa
 
 
 @pytest.mark.asyncio
+async def test_preferred_reclaim_hands_message_to_consumer_scheduler(
+    monkeypatch,
+) -> None:
+    message_id = "1710000000000-33"
+    payload = {
+        "preferred_hosts": json.dumps(["worker-127"]),
+        "affinity_enqueued_at": str(int(worker_main.time.time())),
+    }
+    scheduled: list[tuple[str, dict]] = []
+
+    class Redis:
+        async def xpending_range(self, *args, **kwargs):
+            return [
+                {
+                    "message_id": message_id,
+                    "consumer": "vision-worker@worker-150:other",
+                    "time_since_delivered": 1000,
+                }
+            ]
+
+        async def xrange(self, *args, **kwargs):
+            return [(message_id, payload)]
+
+        async def xclaim(self, *args, **kwargs):
+            return [(message_id, payload)]
+
+    async def schedule(claimed_id, claimed_payload):
+        scheduled.append((claimed_id, claimed_payload))
+
+    async def reject_inline_processing(*args, **kwargs):
+        raise AssertionError(
+            "preferred reclaim must use the consumer scheduler"
+        )
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "worker-127")
+    monkeypatch.setattr(
+        worker_main,
+        "_process_message",
+        reject_inline_processing,
+    )
+
+    await worker_main._reclaim_preferred_pending(
+        Redis(),
+        worker_lease=SimpleNamespace(),
+        message_scheduler=schedule,
+    )
+
+    assert scheduled == [(message_id, payload)]
+
+
+@pytest.mark.asyncio
 async def test_nonpreferred_registered_worker_does_not_reclaim_affinity_message(
     monkeypatch,
 ) -> None:

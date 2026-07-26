@@ -238,22 +238,24 @@ async def test_registered_submission_fence_uses_database_150_second_margin(
     margin_checks: list[tuple[NodeExecutionClaim, int]] = []
     claim_checks: list[NodeExecutionClaim] = []
 
-    class FakeTransaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return False
-
     class FakeSession:
+        def __init__(self):
+            self.active = False
+
         async def __aenter__(self):
             return self
 
         async def __aexit__(self, exc_type, exc, traceback):
             return False
 
-        def begin(self):
-            return FakeTransaction()
+        async def begin(self):
+            self.active = True
+
+        def in_transaction(self):
+            return self.active
+
+        async def rollback(self):
+            self.active = False
 
     async def lock_authority(_db, locked_job_id, *, node_execution_id):
         return SimpleNamespace(

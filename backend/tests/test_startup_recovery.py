@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -93,6 +94,9 @@ async def test_registered_startup_recovery_holds_expired_unresolved_claim(
     monkeypatch,
 ) -> None:
     job, node = _registered_stale_job()
+    node.started_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    job.started_at = node.started_at
+    job.submitted_at = node.started_at
     original = dict(vars(node))
 
     async def recover(_db, job_id, node_execution_id):
@@ -108,6 +112,41 @@ async def test_registered_startup_recovery_holds_expired_unresolved_claim(
     assert await main._prepare_job_for_recovery(object(), job) is False
     assert vars(node) == original
     assert job.status == JobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    ("terminal", "held_unresolved_event"),
+)
+async def test_registered_startup_recovery_preserves_new_terminal_outcomes(
+    monkeypatch,
+    caplog,
+    outcome,
+) -> None:
+    caplog.set_level(logging.INFO, logger=main.__name__)
+    job, node = _registered_stale_job()
+    node.started_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    job.started_at = node.started_at
+    job.submitted_at = node.started_at
+    original = dict(vars(node))
+
+    async def recover(_db, job_id, node_execution_id):
+        assert job_id == job.id
+        assert node_execution_id == node.id
+        return outcome
+
+    monkeypatch.setattr(
+        main,
+        "recover_registered_worker_node",
+        recover,
+        raising=False,
+    )
+
+    assert await main._prepare_job_for_recovery(object(), job) is False
+    assert vars(node) == original
+    assert job.status == JobStatus.RUNNING
+    assert outcome in caplog.text
 
 
 @pytest.mark.asyncio

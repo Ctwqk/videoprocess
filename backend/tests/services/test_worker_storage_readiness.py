@@ -515,9 +515,6 @@ async def test_required_staging_janitor_must_have_fresh_success_status(
                 "STORAGE_BACKEND": "minio",
                 "STORAGE_LOCAL_ROOT": str(tmp_path),
                 "VP_REQUIRE_STAGING_JANITOR": "true",
-                "VP_STAGING_JANITOR_STATUS_FILE": str(
-                    tmp_path / "missing.json"
-                ),
             },
             require_artifact_api=False,
             storage=FakeStorageBackend(),
@@ -528,28 +525,53 @@ async def test_required_staging_janitor_must_have_fresh_success_status(
 
 async def test_required_staging_janitor_is_reported_ready(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    status_file = tmp_path / "janitor.json"
-    status_file.write_text("{}")
-    monkeypatch.setattr(
-        worker_storage_readiness,
-        "staging_janitor_ready",
-        lambda path, *, max_age_seconds: (
-            path == status_file and max_age_seconds == 900
-        ),
-        raising=False,
-    )
+    calls: list[tuple[int, int]] = []
+
+    async def database_status(
+        *,
+        max_age_seconds: int,
+        stale_run_seconds: int,
+    ) -> str:
+        calls.append((max_age_seconds, stale_run_seconds))
+        return "ready"
 
     result = await probe_worker_storage(
         {
             "STORAGE_BACKEND": "minio",
             "STORAGE_LOCAL_ROOT": str(tmp_path),
             "VP_REQUIRE_STAGING_JANITOR": "true",
-            "VP_STAGING_JANITOR_STATUS_FILE": str(status_file),
         },
         require_artifact_api=False,
         storage=FakeStorageBackend(),
+        staging_janitor_probe=database_status,
     )
 
+    assert calls == [(900, 600)]
     assert result["components"]["staging_janitor"] == "ready"
+
+
+@pytest.mark.parametrize(
+    "database_status",
+    ("missing", "stale_success", "latest_error", "active_stale"),
+)
+async def test_required_staging_janitor_rejects_database_failure_states(
+    tmp_path: Path,
+    database_status: str,
+) -> None:
+    async def status_probe(**kwargs) -> str:
+        return database_status
+
+    with pytest.raises(ReadinessFailure) as failure:
+        await probe_worker_storage(
+            {
+                "STORAGE_BACKEND": "minio",
+                "STORAGE_LOCAL_ROOT": str(tmp_path),
+                "VP_REQUIRE_STAGING_JANITOR": "true",
+            },
+            require_artifact_api=False,
+            storage=FakeStorageBackend(),
+            staging_janitor_probe=status_probe,
+        )
+
+    assert failure.value.code == "staging_janitor_unavailable"

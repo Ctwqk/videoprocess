@@ -82,6 +82,12 @@ PREPARE_EVENT_EMISSION_SIGNATURE = (
 MARK_EVENT_EMITTED_SIGNATURE = (
     "public.vp_mark_worker_event_emitted(uuid,uuid,bigint,text)"
 )
+LIST_PREPARED_EVENT_EMISSIONS_SIGNATURE = (
+    "public.vp_list_worker_prepared_event_emissions(uuid,bigint,integer)"
+)
+LOAD_PREPARED_EVENT_EMISSION_SIGNATURE = (
+    "public.vp_load_worker_prepared_event_emission(uuid,uuid,bigint)"
+)
 OBSERVE_EVENT_EMISSION_SIGNATURE = (
     "public.vp_observe_worker_event_emission("
     "uuid,bigint,text,timestamp with time zone,uuid,uuid,uuid,"
@@ -130,6 +136,15 @@ REGISTRATION_REVOKE_SIGNATURE = (
 )
 REGISTRATION_EXPIRE_SIGNATURE = (
     "public.vp_worker_registration_expire(text,uuid)"
+)
+BEGIN_STAGING_JANITOR_SIGNATURE = (
+    "public.vp_begin_staging_janitor_run(uuid,text,integer)"
+)
+FINISH_STAGING_JANITOR_SIGNATURE = (
+    "public.vp_finish_staging_janitor_run(uuid,jsonb,boolean)"
+)
+STAGING_JANITOR_READINESS_SIGNATURE = (
+    "public.vp_staging_janitor_readiness(integer,integer)"
 )
 
 
@@ -495,6 +510,7 @@ def upgrade() -> None:
     )
 
     _create_registered_event_receipt_tables()
+    _create_staging_janitor_status()
     _upgrade_intermediate_artifact_cache()
     _create_receipt_immutability_trigger()
     _create_endpoint_fingerprints_function()
@@ -533,6 +549,8 @@ def upgrade() -> None:
         PERSIST_WORKER_ARTIFACT_SIGNATURE,
         PREPARE_EVENT_EMISSION_SIGNATURE,
         MARK_EVENT_EMITTED_SIGNATURE,
+        LIST_PREPARED_EVENT_EMISSIONS_SIGNATURE,
+        LOAD_PREPARED_EVENT_EMISSION_SIGNATURE,
         OBSERVE_EVENT_EMISSION_SIGNATURE,
         RESERVE_YOUTUBE_UPLOAD_SIGNATURE,
         TRANSITION_YOUTUBE_UPLOAD_SIGNATURE,
@@ -547,8 +565,340 @@ def upgrade() -> None:
         GRANT_REVOKE_SIGNATURE,
         REGISTRATION_REVOKE_SIGNATURE,
         REGISTRATION_EXPIRE_SIGNATURE,
+        BEGIN_STAGING_JANITOR_SIGNATURE,
+        FINISH_STAGING_JANITOR_SIGNATURE,
+        STAGING_JANITOR_READINESS_SIGNATURE,
     ):
         op.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
+
+
+def _create_staging_janitor_status() -> None:
+    op.create_table(
+        "staging_janitor_status",
+        sa.Column(
+            "singleton",
+            sa.Boolean(),
+            server_default=sa.true(),
+            nullable=False,
+        ),
+        sa.Column(
+            "active_run_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "active_runner_id",
+            sa.String(length=255),
+            nullable=True,
+        ),
+        sa.Column(
+            "active_started_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "last_finished_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "last_success_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "last_failure_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "last_result_json",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column(
+            "consecutive_failures",
+            sa.Integer(),
+            server_default=sa.text("0"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "singleton",
+            name="ck_staging_janitor_status_singleton",
+        ),
+        sa.CheckConstraint(
+            "((active_run_id IS NULL "
+            "AND active_runner_id IS NULL "
+            "AND active_started_at IS NULL) "
+            "OR (active_run_id IS NOT NULL "
+            "AND active_runner_id IS NOT NULL "
+            "AND active_started_at IS NOT NULL)) IS TRUE",
+            name="ck_staging_janitor_status_active_run",
+        ),
+        sa.CheckConstraint(
+            "(active_runner_id IS NULL "
+            "OR length(trim(active_runner_id)) > 0) IS TRUE",
+            name="ck_staging_janitor_status_runner",
+        ),
+        sa.CheckConstraint(
+            "consecutive_failures >= 0",
+            name="ck_staging_janitor_status_failures",
+        ),
+        sa.PrimaryKeyConstraint("singleton"),
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_begin_staging_janitor_run(
+    p_run_id uuid,
+    p_runner_id text,
+    p_stale_run_seconds integer
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_status public.staging_janitor_status%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+    v_recovered boolean := false;
+BEGIN
+    IF p_run_id IS NULL
+       OR p_runner_id IS NULL
+       OR length(trim(p_runner_id)) = 0
+       OR length(p_runner_id) > 255
+       OR p_runner_id IS DISTINCT FROM trim(p_runner_id)
+       OR p_stale_run_seconds IS NULL
+       OR p_stale_run_seconds < 300
+       OR p_stale_run_seconds > 3600
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'janitor_status_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-staging-object-janitor',
+            0
+        )
+    );
+    INSERT INTO public.staging_janitor_status (singleton)
+    VALUES (true)
+    ON CONFLICT (singleton) DO NOTHING;
+    SELECT status.*
+    INTO v_status
+    FROM public.staging_janitor_status AS status
+    WHERE status.singleton
+    FOR UPDATE;
+
+    IF v_status.active_run_id IS NOT NULL
+       AND v_status.active_started_at
+           > v_now - pg_catalog.make_interval(
+               secs => p_stale_run_seconds
+           )
+    THEN
+        RETURN 'overlap';
+    END IF;
+    IF v_status.active_run_id IS NOT NULL THEN
+        v_recovered := true;
+    END IF;
+    UPDATE public.staging_janitor_status
+    SET active_run_id = p_run_id,
+        active_runner_id = p_runner_id,
+        active_started_at = v_now,
+        last_failure_at = CASE
+            WHEN v_recovered THEN v_now
+            ELSE last_failure_at
+        END,
+        consecutive_failures = CASE
+            WHEN v_recovered THEN consecutive_failures + 1
+            ELSE consecutive_failures
+        END,
+        updated_at = v_now
+    WHERE singleton;
+    IF v_recovered THEN
+        RETURN 'recovered_stale';
+    END IF;
+    RETURN 'started';
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_finish_staging_janitor_run(
+    p_run_id uuid,
+    p_result_json jsonb,
+    p_succeeded boolean
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_status public.staging_janitor_status%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+    v_effective_success boolean;
+BEGIN
+    IF p_run_id IS NULL
+       OR p_result_json IS NULL
+       OR p_succeeded IS NULL
+       OR pg_catalog.jsonb_typeof(p_result_json) IS DISTINCT FROM 'object'
+       OR NOT p_result_json ?& ARRAY[
+           'schema_version', 'grace_seconds', 'scanned', 'deleted',
+           'protected', 'too_young', 'invalid', 'errors'
+       ]
+       OR (
+           SELECT count(*)
+           FROM pg_catalog.jsonb_object_keys(p_result_json)
+       ) <> 8
+       OR p_result_json->>'schema_version' <> '1'
+       OR p_result_json->>'grace_seconds' <> '86400'
+       OR COALESCE(
+           p_result_json->>'scanned' !~ '^[0-9]+$',
+           true
+       )
+       OR COALESCE(
+           p_result_json->>'deleted' !~ '^[0-9]+$',
+           true
+       )
+       OR COALESCE(
+           p_result_json->>'protected' !~ '^[0-9]+$',
+           true
+       )
+       OR COALESCE(
+           p_result_json->>'too_young' !~ '^[0-9]+$',
+           true
+       )
+       OR COALESCE(
+           p_result_json->>'invalid' !~ '^[0-9]+$',
+           true
+       )
+       OR COALESCE(
+           p_result_json->>'errors' !~ '^[0-9]+$',
+           true
+       )
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'janitor_status_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    SELECT status.*
+    INTO v_status
+    FROM public.staging_janitor_status AS status
+    WHERE status.singleton
+    FOR UPDATE;
+    IF NOT FOUND
+       OR v_status.active_run_id IS DISTINCT FROM p_run_id
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'janitor_run_mismatch', ERRCODE = 'P0001';
+    END IF;
+
+    v_effective_success := (
+        p_succeeded
+        AND (p_result_json->>'errors')::integer = 0
+    );
+    UPDATE public.staging_janitor_status
+    SET active_run_id = NULL,
+        active_runner_id = NULL,
+        active_started_at = NULL,
+        last_finished_at = v_now,
+        last_success_at = CASE
+            WHEN v_effective_success THEN v_now
+            ELSE last_success_at
+        END,
+        last_failure_at = CASE
+            WHEN v_effective_success THEN last_failure_at
+            ELSE v_now
+        END,
+        last_result_json = p_result_json,
+        consecutive_failures = CASE
+            WHEN v_effective_success THEN 0
+            ELSE consecutive_failures + 1
+        END,
+        updated_at = v_now
+    WHERE singleton;
+    RETURN v_effective_success;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_staging_janitor_readiness(
+    p_max_age_seconds integer,
+    p_stale_run_seconds integer
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_status public.staging_janitor_status%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_max_age_seconds IS NULL
+       OR p_max_age_seconds < 300
+       OR p_max_age_seconds > 3600
+       OR p_stale_run_seconds IS NULL
+       OR p_stale_run_seconds < 300
+       OR p_stale_run_seconds > 3600
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'janitor_status_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    SELECT status.*
+    INTO v_status
+    FROM public.staging_janitor_status AS status
+    WHERE status.singleton;
+    IF FOUND
+       AND v_status.active_run_id IS NOT NULL
+       AND v_status.active_started_at
+           <= v_now - pg_catalog.make_interval(
+               secs => p_stale_run_seconds
+           )
+    THEN
+        RETURN 'active_stale';
+    END IF;
+    IF NOT FOUND OR v_status.last_success_at IS NULL THEN
+        RETURN 'missing';
+    END IF;
+    IF v_status.last_failure_at IS NOT NULL
+       AND v_status.last_failure_at > v_status.last_success_at
+    THEN
+        RETURN 'latest_error';
+    END IF;
+    IF v_status.last_success_at
+       < v_now - pg_catalog.make_interval(
+           secs => p_max_age_seconds
+       )
+    THEN
+        RETURN 'stale_success';
+    END IF;
+    IF v_status.last_result_json->>'schema_version' <> '1'
+       OR v_status.last_result_json->>'grace_seconds' <> '86400'
+       OR v_status.last_result_json->>'errors' <> '0'
+    THEN
+        RETURN 'latest_error';
+    END IF;
+    RETURN 'ready';
+END;
+$function$
+"""
+    )
 
 
 def _upgrade_intermediate_artifact_cache() -> None:
@@ -3742,8 +4092,7 @@ BEGIN
     SELECT registration.*
     INTO v_registration
     FROM public.worker_registrations AS registration
-    WHERE registration.id = p_registration_id
-    FOR SHARE;
+    WHERE registration.id = p_registration_id;
     IF NOT FOUND
        OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
        OR v_registration.status IS DISTINCT FROM 'active'
@@ -4024,6 +4373,210 @@ $function$
 """
     )
     op.execute(
+        f"""
+CREATE FUNCTION public.vp_list_worker_prepared_event_emissions(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_limit integer
+)
+RETURNS TABLE(emission_id uuid)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration public.worker_registrations%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+       OR p_limit IS NULL
+       OR p_limit < 1
+       OR p_limit > 100
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id;
+    IF NOT FOUND
+       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_registration.status IS DISTINCT FROM 'active'
+       OR v_registration.lease_expires_at <= v_now
+       OR v_registration.database_principal IS DISTINCT FROM v_principal
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+
+    RETURN QUERY
+    SELECT emission.id
+    FROM public.worker_event_emissions AS emission
+    JOIN public.jobs AS job
+      ON job.id = emission.job_id
+    JOIN public.node_executions AS node
+      ON node.id = emission.node_execution_id
+     AND node.job_id = emission.job_id
+    JOIN public.worker_task_delivery_attestations AS attestation
+      ON attestation.id = emission.source_task_attestation_id
+    JOIN public.worker_task_dispatches AS dispatch
+      ON dispatch.dispatch_key = attestation.dispatch_key
+    WHERE emission.worker_registration_id = p_registration_id
+      AND emission.worker_lease_epoch = p_lease_epoch
+      AND emission.emission_state = 'prepared'
+      AND emission.message_id IS NULL
+      AND job.status::text = 'RUNNING'
+      AND node.status::text = 'RUNNING'
+      AND node.worker_registration_id = p_registration_id
+      AND node.worker_lease_epoch = p_lease_epoch
+      AND node.worker_id = emission.worker_id
+      AND node.started_at = emission.worker_started_at
+      AND attestation.job_id = emission.job_id
+      AND attestation.node_execution_id = emission.node_execution_id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = emission.worker_id
+      AND attestation.worker_started_at = emission.worker_started_at
+      AND attestation.ack_state = 'pending'
+      AND dispatch.job_id = emission.job_id
+      AND dispatch.node_execution_id = emission.node_execution_id
+      AND dispatch.redis_stream = attestation.redis_stream
+      AND dispatch.consumer_group = attestation.consumer_group
+      AND dispatch.redis_message_id = attestation.message_id
+      AND dispatch.payload_sha256 = attestation.payload_sha256
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.resolution_state = 'unresolved'
+    ORDER BY emission.prepared_at, emission.id
+    LIMIT p_limit;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_load_worker_prepared_event_emission(
+    p_emission_id uuid,
+    p_registration_id uuid,
+    p_lease_epoch bigint
+)
+RETURNS TABLE(
+    emission_id uuid,
+    source_task_attestation_id uuid,
+    job_id uuid,
+    node_execution_id uuid,
+    worker_id text,
+    worker_started_at timestamptz,
+    redis_stream text,
+    consumer_group text,
+    payload_sha256 text,
+    payload_json jsonb,
+    event_type text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_emission public.worker_event_emissions%ROWTYPE;
+BEGIN
+    IF p_emission_id IS NULL
+       OR p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    SELECT emission.*
+    INTO v_emission
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.id = p_emission_id;
+    IF NOT FOUND
+       OR v_emission.worker_registration_id IS DISTINCT FROM p_registration_id
+       OR v_emission.worker_lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_emission.emission_state IS DISTINCT FROM 'prepared'
+       OR v_emission.message_id IS NOT NULL
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+
+    PERFORM public.vp_require_worker_node_claim(
+        p_registration_id,
+        p_lease_epoch,
+        v_emission.worker_id,
+        v_emission.worker_started_at,
+        v_emission.job_id,
+        v_emission.node_execution_id
+    );
+    PERFORM 1
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.id = v_emission.source_task_attestation_id
+      AND attestation.job_id = v_emission.job_id
+      AND attestation.node_execution_id = v_emission.node_execution_id
+      AND attestation.worker_registration_id = p_registration_id
+      AND attestation.worker_lease_epoch = p_lease_epoch
+      AND attestation.worker_id = v_emission.worker_id
+      AND attestation.worker_started_at = v_emission.worker_started_at
+      AND attestation.ack_state = 'pending'
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'task_delivery_attestation_mismatch', ERRCODE = 'P0001';
+    END IF;
+    SELECT emission.*
+    INTO v_emission
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.id = p_emission_id
+      AND emission.emission_state = 'prepared'
+      AND emission.message_id IS NULL
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'event_emission_mismatch', ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.worker_task_dispatches AS dispatch
+    JOIN public.worker_task_delivery_attestations AS attestation
+      ON attestation.dispatch_key = dispatch.dispatch_key
+    WHERE attestation.id = v_emission.source_task_attestation_id
+      AND dispatch.job_id = v_emission.job_id
+      AND dispatch.node_execution_id = v_emission.node_execution_id
+      AND dispatch.redis_stream = attestation.redis_stream
+      AND dispatch.consumer_group = attestation.consumer_group
+      AND dispatch.redis_message_id = attestation.message_id
+      AND dispatch.payload_sha256 = attestation.payload_sha256
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.resolution_state = 'unresolved'
+    FOR UPDATE OF dispatch;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'task_dispatch_mismatch', ERRCODE = 'P0001';
+    END IF;
+
+    RETURN QUERY SELECT
+        v_emission.id,
+        v_emission.source_task_attestation_id,
+        v_emission.job_id,
+        v_emission.node_execution_id,
+        v_emission.worker_id::text,
+        v_emission.worker_started_at,
+        v_emission.redis_stream::text,
+        v_emission.consumer_group::text,
+        v_emission.payload_sha256::text,
+        v_emission.payload_json,
+        v_emission.event_type::text;
+END;
+$function$
+"""
+    )
+    op.execute(
         """
 CREATE FUNCTION public.vp_observe_worker_event_emission(
     p_registration_id uuid,
@@ -4276,6 +4829,16 @@ BEGIN
         UPDATE public.youtube_upload_operations
         SET request_attempted_at = v_now, updated_at = v_now
         WHERE id = p_operation_id;
+    ELSIF p_transition = 'fence'
+          AND p_expected_status = 'reserved'
+          AND v_operation.request_attempted_at IS NOT NULL
+          AND v_operation.manager_task_id IS NULL
+          AND p_manager_task_id IS NULL
+          AND p_platform_video_id IS NULL
+          AND p_receipt_json IS NULL
+          AND p_error_message IS NULL
+    THEN
+        NULL;
     ELSIF p_transition = 'submitted'
           AND p_expected_status = 'reserved'
           AND p_manager_task_id IS NOT NULL
@@ -5670,6 +6233,9 @@ def downgrade() -> None:
     ):
         op.execute(f"DROP FUNCTION IF EXISTS {trigger_function}")
     for signature in (
+        STAGING_JANITOR_READINESS_SIGNATURE,
+        FINISH_STAGING_JANITOR_SIGNATURE,
+        BEGIN_STAGING_JANITOR_SIGNATURE,
         CLEANUP_EVENT_AUTHORITY_SIGNATURE,
         CANCEL_TASK_ACKNOWLEDGE_SIGNATURE,
         CANCEL_TASK_REQUIRE_SIGNATURE,
@@ -5679,6 +6245,8 @@ def downgrade() -> None:
         TRANSITION_YOUTUBE_UPLOAD_SIGNATURE,
         RESERVE_YOUTUBE_UPLOAD_SIGNATURE,
         OBSERVE_EVENT_EMISSION_SIGNATURE,
+        LOAD_PREPARED_EVENT_EMISSION_SIGNATURE,
+        LIST_PREPARED_EVENT_EMISSIONS_SIGNATURE,
         MARK_EVENT_EMITTED_SIGNATURE,
         PREPARE_EVENT_EMISSION_SIGNATURE,
         PERSIST_WORKER_ARTIFACT_SIGNATURE,
@@ -5704,6 +6272,7 @@ def downgrade() -> None:
     ):
         op.execute(f"DROP FUNCTION IF EXISTS {signature}")
 
+    op.drop_table("staging_janitor_status")
     op.drop_index(
         "ix_registered_worker_event_deliveries_receipt_id",
         table_name="registered_worker_event_deliveries",
