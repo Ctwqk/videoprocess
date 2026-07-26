@@ -137,7 +137,11 @@ VP_PYTHON_WORKER_DATABASE_URL=postgresql+asyncpg://test:test@10.0.0.150:5435/vid
 VP_MINIO_ACCESS_KEY=test-access
 VP_MINIO_SECRET_KEY=test-secret
 GPU_SERVICE_EXISTS=true
+VISION_SERVICE_EXISTS=true
 PUBLISHER_SERVICE_EXISTS=true
+LEGACY_VISION_CONTAINER_EXISTS=true
+LEGACY_VISION_PROJECT=videoprocess
+LEGACY_VISION_SERVICE=vision-worker
 CONSTRAINT_MODE=legacy
 PUBLISHER_CONSTRAINT_MODE=legacy
 PUBLISHER_NETWORK_MODE=legacy
@@ -158,6 +162,7 @@ FAIL_PUBLISHER_CREATE=false
 FAIL_MANAGED_CRON_PRINTF=false
 FAIL_SOAK_CLEANUP=false
 MIGRATION_GATE_MODE=success
+VISION_CUTOVER_GATE_MODE=success
 
 printf() {
   if [[ "$FAIL_MANAGED_CRON_PRINTF" == "true" \
@@ -214,6 +219,12 @@ docker() {
     [[ "$MIGRATION_GATE_MODE" == "success" ]]
     return
   fi
+  if [[ "${1:-}" == "run" \
+    && "$*" == *"runtime_schedules"* \
+    && "$*" == *"vp:tasks:vision"* ]]; then
+    [[ "$VISION_CUTOVER_GATE_MODE" == "success" ]]
+    return
+  fi
   if [[ "${1:-}" == "run" && "$GPU_PREFLIGHT_SUCCEEDS" != "true" ]]; then
     return 1
   fi
@@ -223,6 +234,9 @@ docker() {
   if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-ffmpeg-worker-gpu-swarm"* ]]; then
     GPU_SERVICE_EXISTS=true
   fi
+  if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-vision-worker-swarm"* ]]; then
+    VISION_SERVICE_EXISTS=true
+  fi
   if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-youtube-publisher-swarm"* ]]; then
     PUBLISHER_SERVICE_EXISTS=true
     if [[ "$FAIL_PUBLISHER_CREATE" == "true" ]]; then
@@ -231,6 +245,9 @@ docker() {
   fi
   if [[ "${1:-} ${2:-} ${3:-}" == "service rm vp-ffmpeg-worker-gpu-swarm" ]]; then
     GPU_SERVICE_EXISTS=false
+  fi
+  if [[ "${1:-} ${2:-} ${3:-}" == "service rm vp-vision-worker-swarm" ]]; then
+    VISION_SERVICE_EXISTS=false
   fi
   if [[ "${1:-} ${2:-} ${3:-}" == "service rm vp-youtube-publisher-swarm" ]]; then
     PUBLISHER_SERVICE_EXISTS=false
@@ -267,6 +284,23 @@ docker() {
     echo vp-pipeline-network-id
     return 0
   fi
+  if [[ "${1:-} ${2:-}" == "container inspect" && "$*" == *"vp_vision_worker_1"* ]]; then
+    if [[ "$LEGACY_VISION_CONTAINER_EXISTS" != "true" ]]; then
+      return 1
+    fi
+    printf '%s|%s\n' "$LEGACY_VISION_PROJECT" "$LEGACY_VISION_SERVICE"
+    return 0
+  fi
+  if [[ "${1:-} ${2:-}" == "container ls" && "$*" == *"vp_vision_worker_1"* ]]; then
+    if [[ "$LEGACY_VISION_CONTAINER_EXISTS" == "true" ]]; then
+      printf 'vp_vision_worker_1\n'
+    fi
+    return 0
+  fi
+  if [[ "${1:-} ${2:-} ${3:-}" == "rm -f vp_vision_worker_1" ]]; then
+    LEGACY_VISION_CONTAINER_EXISTS=false
+    return 0
+  fi
   if [[ "${1:-} ${2:-}" == "service ls" && "$*" == *"--filter name=vp-youtube-publisher-swarm"* ]]; then
     if [[ "$PUBLISHER_LIST_FAILURE" == "true" ]]; then
       return 1
@@ -279,6 +313,9 @@ docker() {
   if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
     local service="${3:-}"
     if [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" && "$GPU_SERVICE_EXISTS" != "true" ]]; then
+      return 1
+    fi
+    if [[ "$service" == "vp-vision-worker-swarm" && "$VISION_SERVICE_EXISTS" != "true" ]]; then
       return 1
     fi
     if [[ "$service" == "vp-youtube-publisher-swarm" && "$PUBLISHER_SERVICE_EXISTS" != "true" ]]; then
@@ -349,6 +386,9 @@ docker() {
         elif [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" ]]; then
           echo 'WORKER_HOST=legacy'
           echo 'YOUTUBE_CREDENTIALS_DIR=/app/youtube_credentials'
+        elif [[ "$service" == "vp-vision-worker-swarm" ]]; then
+          echo 'WORKER_TYPE=legacy'
+          echo 'WORKER_HOST=legacy'
         elif [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
           echo 'WORKER_HOST=legacy'
           if [[ "$PUBLISHER_ENV_MODE" == "credentials" ]]; then
@@ -382,6 +422,8 @@ docker() {
       *ContainerSpec.Mounts*)
         if [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" ]]; then
           echo /app/youtube_credentials
+        elif [[ "$service" == "vp-vision-worker-swarm" ]]; then
+          echo ''
         elif [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
           case "$PUBLISHER_MOUNT_MODE" in
             desired)
@@ -416,6 +458,10 @@ if ! grep -Fq 'CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1' "$EXTENSION"; th
 fi
 if ! grep -Fq 'vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" stop-first' "$EXTENSION"; then
   echo 'FAIL: managed ChannelOps runner must replace stop-first' >&2
+  exit 1
+fi
+if ! grep -Fq 'VP_VISION_WORKER_SERVICE="vp-vision-worker-swarm"' "$EXTENSION"; then
+  echo 'FAIL: deployment must define the managed vision worker service' >&2
   exit 1
 fi
 if ! grep -Fq 'vp_require_channelops_migration_head "$python_worker"' "$EXTENSION"; then
@@ -464,6 +510,26 @@ if [[ "$deploy_output" != "$VP_APP_SERVICES" ]]; then
   exit 1
 fi
 
+vision_cutover_gate_line="$(
+  grep -nF 'docker|run --rm' "$CALLS" \
+    | grep -F 'runtime_schedules' \
+    | grep -F 'vp:tasks:vision' \
+    | head -1 \
+    | cut -d: -f1 \
+    || true
+)"
+first_service_update_line="$(
+  grep -nF 'docker|service update' "$CALLS" \
+    | head -1 \
+    | cut -d: -f1
+)"
+if [[ -z "$vision_cutover_gate_line" \
+  || -z "$first_service_update_line" \
+  || "$vision_cutover_gate_line" -ge "$first_service_update_line" ]]; then
+  echo 'FAIL: CLOSED vision cutover gate must precede every service update' >&2
+  exit 1
+fi
+
 runner_identity_update="$(
   grep -F 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-channelops-runner-go:deploy-0123456789ab' \
@@ -491,6 +557,13 @@ python_worker_update_line="$(
     | head -1 \
     | cut -d: -f1
 )"
+vision_worker_update_line="$(
+  grep -nF 'docker|service update' "$CALLS" \
+    | grep -F -- '--image vp-ffmpeg-worker-python:deploy-0123456789ab' \
+    | grep -F 'vp-vision-worker-swarm' \
+    | head -1 \
+    | cut -d: -f1
+)"
 publisher_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-ffmpeg-worker-python:deploy-0123456789ab' \
@@ -506,13 +579,70 @@ python_listener_update_line="$(
     | cut -d: -f1
 )"
 if [[ -z "$python_worker_update_line" \
+  || -z "$vision_worker_update_line" \
   || -z "$publisher_update_line" \
   || -z "$python_listener_update_line" \
   || "$python_worker_update_line" -ge "$python_listener_update_line" \
+  || "$vision_worker_update_line" -ge "$python_listener_update_line" \
   || "$publisher_update_line" -ge "$python_listener_update_line" ]]; then
   echo 'FAIL: claim-aware Python event producers must deploy before their listener' >&2
   exit 1
 fi
+
+legacy_vision_remove_line="$(
+  grep -nF 'docker|rm -f vp_vision_worker_1' "$CALLS" \
+    | head -1 \
+    | cut -d: -f1
+)"
+vision_running_line="$(
+  grep -nF 'running|vp-vision-worker-swarm' "$CALLS" \
+    | head -1 \
+    | cut -d: -f1
+)"
+if [[ -z "$legacy_vision_remove_line" \
+  || -z "$vision_running_line" \
+  || "$vision_running_line" -ge "$legacy_vision_remove_line" ]]; then
+  echo 'FAIL: the exact legacy vision container must be removed after managed health' >&2
+  exit 1
+fi
+
+cp "$CALLS" "$TEST_ROOT/successful-vision-deploy-calls"
+: >"$CALLS"
+LEGACY_VISION_CONTAINER_EXISTS=true
+LEGACY_VISION_PROJECT=unexpected-project
+LEGACY_VISION_SERVICE=vision-worker
+if vp_retire_legacy_vision_worker >/dev/null 2>&1; then
+  echo 'FAIL: mismatched legacy vision project was removed' >&2
+  exit 1
+fi
+if grep -Fq 'docker|rm -f vp_vision_worker_1' "$CALLS"; then
+  echo 'FAIL: mismatched legacy vision identity reached docker rm' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+LEGACY_VISION_PROJECT=videoprocess
+LEGACY_VISION_SERVICE=unexpected-service
+if vp_retire_legacy_vision_worker >/dev/null 2>&1; then
+  echo 'FAIL: mismatched legacy vision service was removed' >&2
+  exit 1
+fi
+if grep -Fq 'docker|rm -f vp_vision_worker_1' "$CALLS"; then
+  echo 'FAIL: mismatched legacy vision service reached docker rm' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+LEGACY_VISION_CONTAINER_EXISTS=false
+LEGACY_VISION_PROJECT=videoprocess
+LEGACY_VISION_SERVICE=vision-worker
+vp_retire_legacy_vision_worker >/dev/null
+if grep -Fq 'docker|rm -f vp_vision_worker_1' "$CALLS"; then
+  echo 'FAIL: absent legacy vision container reached docker rm' >&2
+  exit 1
+fi
+LEGACY_VISION_CONTAINER_EXISTS=true
+cp "$TEST_ROOT/successful-vision-deploy-calls" "$CALLS"
 
 backend_migration_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
@@ -579,6 +709,20 @@ for migration_gate_mode in wrong missing error; do
   fi
 done
 MIGRATION_GATE_MODE=success
+cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
+
+: >"$CALLS"
+VISION_CUTOVER_GATE_MODE=unsafe
+if deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: unsafe vision cutover gate unexpectedly allowed deployment' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service update' "$CALLS" \
+  || grep -Fq 'docker|rm -f vp_vision_worker_1' "$CALLS"; then
+  echo 'FAIL: unsafe vision cutover gate mutated services or the legacy worker' >&2
+  exit 1
+fi
+VISION_CUTOVER_GATE_MODE=success
 cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
 
 if [[ ! -x "$ROOT/bin/channelops-soak-watch.sh" ]]; then
@@ -920,6 +1064,7 @@ grep -Fq 'health|vp-frontend|http://10.0.0.127:3001/' "$CALLS"
 grep -Fq 'vp-autoflow-api-swarm' "$CALLS"
 grep -Fq 'vp-ffmpeg-worker-go-swarm' "$CALLS"
 grep -Fq 'vp-ffmpeg-worker-gpu-swarm' "$CALLS"
+grep -Fq 'vp-vision-worker-swarm' "$CALLS"
 if ! grep -Fq 'vp-youtube-publisher-swarm' "$CALLS"; then
   echo 'FAIL: deployment must include the dedicated YouTube publisher' >&2
   exit 1
@@ -931,10 +1076,13 @@ grep -Fq -- '--env-add VP_GO_ORCHESTRATOR_ENABLED=true' "$CALLS"
 grep -Fq -- '--env-add VP_GO_ORCHESTRATOR_JOB_WRITES=true' "$CALLS"
 grep -Fq -- '--env-add VP_PYTHON_SCHEDULE_URL=http://vp-autoflow-api-swarm:8080' "$CALLS"
 grep -Fq -- '--env-add WORKER_HOST=colima-127' "$CALLS"
-if [[ "$VP_APP_SERVICES" != 'vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm vp-ffmpeg-worker-gpu-swarm vp-youtube-publisher-swarm' ]]; then
+if [[ "$VP_APP_SERVICES" != 'vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm vp-ffmpeg-worker-gpu-swarm vp-vision-worker-swarm vp-youtube-publisher-swarm' ]]; then
   echo 'FAIL: discovery deployment must not add a VP service' >&2
   exit 1
 fi
+grep -Fq -- '--env-add WORKER_TYPE=vision' "$CALLS"
+grep -Fq -- '--env-add WORKER_HOST=150-vision' "$CALLS"
+grep -Fq -- '--mount-add type=volume,src=vp-vision-worker-scratch,dst=/data/storage' "$CALLS"
 grep -Fq -- '--env-rm YOUTUBE_CREDENTIALS_DIR' "$CALLS"
 grep -Fq 'health|vp-youtube-manager|http://10.0.0.150:18999/api/auth/status' "$CALLS"
 grep -Fq 'docker|node update --label-add vp.publisher=true ccttww-lap' "$CALLS"
@@ -1372,6 +1520,16 @@ if grep -Fq '10.0.0.126' "$CALLS"; then
   echo 'FAIL: 126 must not be in VP deploy calls' >&2
   exit 1
 fi
+
+: >"$CALLS"
+VISION_SERVICE_EXISTS=false
+vp_deploy_vision_worker vp-ffmpeg-worker-python:vision-create-test >/dev/null
+grep -Fq 'docker|service create --detach=false --name vp-vision-worker-swarm' "$CALLS"
+grep -Fq -- '--constraint node.labels.vp.gpu==true' "$CALLS"
+grep -Fq -- '--network vp-pipeline-net' "$CALLS"
+grep -Fq -- '--mount type=volume,src=vp-vision-worker-scratch,dst=/data/storage' "$CALLS"
+grep -Fq -- '--env WORKER_TYPE=vision' "$CALLS"
+grep -Fq -- '--env WORKER_HOST=150-vision' "$CALLS"
 
 : >"$CALLS"
 PUBLISHER_SERVICE_EXISTS=false

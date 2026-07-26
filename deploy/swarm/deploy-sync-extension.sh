@@ -20,8 +20,9 @@ VP_APP_CI_WORKFLOW="ci.yml"
 VP_PDS_CI_REPOSITORY="Ctwqk/policy-decision-service"
 VP_PDS_CI_WORKFLOW="ci.yml"
 VP_PYTHON_WORKER_SERVICE="vp-ffmpeg-worker-gpu-swarm"
+VP_VISION_WORKER_SERVICE="vp-vision-worker-swarm"
 VP_PUBLISHER_SERVICE="vp-youtube-publisher-swarm"
-VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE $VP_PUBLISHER_SERVICE"
+VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE $VP_VISION_WORKER_SERVICE $VP_PUBLISHER_SERVICE"
 VP_APP_ATTEMPTED_SERVICES=""
 
 vp_validate_deploy_config() {
@@ -63,6 +64,34 @@ vp_require_channelops_migration_head() {
     return 1
   fi
   log "ChannelOps migration head verified: 032_channelops_leader_epoch"
+}
+
+vp_require_vision_cutover_safe() {
+  local python_worker="$1"
+
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    log "vision cutover gate skipped because service updates are disabled"
+    return 0
+  fi
+  if [[ -z "${VP_PYTHON_WORKER_DATABASE_URL:-}" ]]; then
+    echo "vision cutover gate requires VP_PYTHON_WORKER_DATABASE_URL" >&2
+    return 1
+  fi
+
+  local check
+  check='import asyncio, os; from sqlalchemy import text; from sqlalchemy.ext.asyncio import create_async_engine; import redis.asyncio as redis; exec("async def check():\n    engine = create_async_engine(os.environ[\"DATABASE_URL\"])\n    client = redis.from_url(os.environ[\"REDIS_URL\"], decode_responses=True)\n    try:\n        async with engine.connect() as connection:\n            schedule = (await connection.execute(text(\"SELECT state, guarded_job_id FROM runtime_schedules WHERE service_name = '\''videoprocess'\''\"))).one_or_none()\n            active_nodes = int((await connection.execute(text(\"SELECT count(*) FROM node_executions WHERE status::text IN ('\''QUEUED'\'', '\''RUNNING'\'')\"))).scalar_one())\n        if schedule is None or schedule.state != \"CLOSED\" or schedule.guarded_job_id is not None or active_nodes != 0:\n            raise SystemExit(1)\n        pending = await client.xpending(\"vp:tasks:vision\", \"vision-workers\")\n        groups = await client.xinfo_groups(\"vp:tasks:vision\")\n        group = next((row for row in groups if row.get(\"name\") == \"vision-workers\"), None)\n        if not isinstance(pending, dict) or pending.get(\"pending\") != 0 or group is None or group.get(\"lag\") != 0:\n            raise SystemExit(1)\n    except Exception:\n        raise SystemExit(1)\n    finally:\n        await client.aclose()\n        await engine.dispose()"); asyncio.run(check())'
+  if ! DATABASE_URL="$VP_PYTHON_WORKER_DATABASE_URL" \
+    REDIS_URL="redis://10.0.0.150:6380/0" \
+    docker run --rm \
+      --network "$VP_PIPELINE_NETWORK" \
+      --env DATABASE_URL \
+      --env REDIS_URL \
+      "$python_worker" \
+      python -c "$check" >/dev/null; then
+    echo "vision cutover gate failed; require CLOSED schedule and idle vision work" >&2
+    return 1
+  fi
+  log "vision cutover gate verified: CLOSED and idle"
 }
 
 vp_service_values() {
@@ -371,6 +400,30 @@ vp_python_worker_env() {
     "NVIDIA_DRIVER_CAPABILITIES=compute,video,utility"
 }
 
+vp_vision_worker_env() {
+  local db_url="$VP_PYTHON_WORKER_DATABASE_URL"
+  local minio_access="$VP_MINIO_ACCESS_KEY"
+  local minio_secret="$VP_MINIO_SECRET_KEY"
+  printf '%s\n' \
+    "DEPLOY_MODE=shared" \
+    "DATABASE_URL=$db_url" \
+    "REDIS_URL=redis://10.0.0.150:6380/0" \
+    "STORAGE_BACKEND=minio" \
+    "STORAGE_LOCAL_ROOT=/data/storage" \
+    "MINIO_ENDPOINT=10.0.0.150:9000" \
+    "MINIO_ACCESS_KEY=$minio_access" \
+    "MINIO_SECRET_KEY=$minio_secret" \
+    "MINIO_BUCKET=videoprocess" \
+    "WORKER_TYPE=vision" \
+    "WORKER_HOST=150-vision" \
+    "WORKER_CONCURRENCY=${VP_VISION_WORKER_CONCURRENCY:-1}" \
+    "VP_ARTIFACT_DOWNLOAD_BASE_URL=http://vp-api-swarm:8080/api/v1" \
+    "VISION_EMBEDDING_URL=${VP_VISION_EMBEDDING_URL:-}" \
+    "VIDEO_USE_GPU=false" \
+    "VIDEO_GPU_FALLBACK_TO_CPU=true" \
+    "VIDEO_WHISPER_DEVICE=cpu"
+}
+
 vp_publisher_env() {
   local db_url="$VP_PYTHON_WORKER_DATABASE_URL"
   local minio_access="$VP_MINIO_ACCESS_KEY"
@@ -505,6 +558,178 @@ vp_deploy_python_worker() {
     docker "${create_args[@]}" "${create_env[@]}" "$image" >&2
   fi
   swarm_service_running "$VP_PYTHON_WORKER_SERVICE"
+}
+
+vp_deploy_vision_worker() {
+  local image="$1"
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    log "service update skipped $VP_VISION_WORKER_SERVICE $image"
+    return 0
+  fi
+
+  docker node update --label-add vp.gpu=true "$VP_MANAGER_NODE" >/dev/null || return 1
+
+  local vision_exists=false
+  local existing_env=""
+  if docker service inspect "$VP_VISION_WORKER_SERVICE" >/dev/null 2>&1; then
+    vision_exists=true
+    existing_env="$(vp_service_values "$VP_VISION_WORKER_SERVICE" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}')" || return 1
+  fi
+
+  local env_key
+  local env_value
+  local env_args=()
+  while IFS= read -r env_value; do
+    env_key="${env_value%%=*}"
+    if [[ "$vision_exists" == true ]] \
+      && awk -F= -v key="$env_key" \
+        '$1 == key { found=1 } END { exit found ? 0 : 1 }' <<<"$existing_env"; then
+      env_args+=(--env-rm "$env_key")
+    fi
+    if [[ "$vision_exists" == true ]]; then
+      env_args+=(--env-add "$env_value")
+    fi
+  done < <(vp_vision_worker_env)
+
+  if [[ "$vision_exists" == true ]]; then
+    local update_args=(
+      service update --detach=false --no-resolve-image --update-order stop-first --replicas 1
+    )
+    local constraint
+    local has_gpu=false
+    while IFS= read -r constraint; do
+      [[ -n "$constraint" ]] || continue
+      if [[ "$constraint" == "$VP_GPU_CONSTRAINT" ]]; then
+        has_gpu=true
+      else
+        update_args+=(--constraint-rm "$constraint")
+      fi
+    done < <(
+      vp_service_values "$VP_VISION_WORKER_SERVICE" \
+        '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
+    )
+    if [[ "$has_gpu" != true ]]; then
+      update_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
+    fi
+
+    local network_id
+    network_id="$(docker network inspect "$VP_PIPELINE_NETWORK" --format '{{.ID}}')" || return 1
+    if ! vp_service_values "$VP_VISION_WORKER_SERVICE" \
+      '{{range .Spec.TaskTemplate.Networks}}{{println .Target}}{{end}}' \
+      | grep -Fxq "$network_id"; then
+      update_args+=(--network-add "$VP_PIPELINE_NETWORK")
+    fi
+
+    local existing_mounts
+    existing_mounts="$(vp_service_values "$VP_VISION_WORKER_SERVICE" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{printf "%s|%s|%s|%t\n" .Type .Source .Target .ReadOnly}}{{end}}')" || return 1
+    local mount_type
+    local mount_source
+    local mount_target
+    local mount_readonly
+    local desired_scratch_count=0
+    local remove_scratch_target=false
+    while IFS='|' read -r mount_type mount_source mount_target mount_readonly; do
+      [[ -n "$mount_type$mount_source$mount_target$mount_readonly" ]] || continue
+      if [[ -z "$mount_target" ]]; then
+        echo "vision worker mount has no target" >&2
+        return 1
+      fi
+      if [[ "$mount_type" == volume \
+        && "$mount_source" == "vp-vision-worker-scratch" \
+        && "$mount_target" == /data/storage \
+        && "$mount_readonly" == false ]]; then
+        desired_scratch_count=$((desired_scratch_count + 1))
+        if [[ "$desired_scratch_count" -gt 1 ]]; then
+          remove_scratch_target=true
+        fi
+      elif [[ "$mount_target" == /data/storage ]]; then
+        remove_scratch_target=true
+      else
+        update_args+=(--mount-rm "$mount_target")
+      fi
+    done <<<"$existing_mounts"
+    if [[ "$remove_scratch_target" == true ]]; then
+      docker service update --detach=false --no-resolve-image --update-order stop-first \
+        --replicas 0 --mount-rm /data/storage "$VP_VISION_WORKER_SERVICE" >&2 || return 1
+      desired_scratch_count=0
+    fi
+    if [[ "$desired_scratch_count" -ne 1 ]]; then
+      update_args+=(--mount-add type=volume,src=vp-vision-worker-scratch,dst=/data/storage)
+    fi
+
+    local existing_secret
+    while IFS= read -r existing_secret; do
+      [[ -n "$existing_secret" ]] || continue
+      update_args+=(--secret-rm "$existing_secret")
+    done < <(
+      vp_service_values "$VP_VISION_WORKER_SERVICE" \
+        '{{range .Spec.TaskTemplate.ContainerSpec.Secrets}}{{println .SecretName}}{{end}}'
+    )
+    local existing_config
+    while IFS= read -r existing_config; do
+      [[ -n "$existing_config" ]] || continue
+      update_args+=(--config-rm "$existing_config")
+    done < <(
+      vp_service_values "$VP_VISION_WORKER_SERVICE" \
+        '{{range .Spec.TaskTemplate.ContainerSpec.Configs}}{{println .ConfigName}}{{end}}'
+    )
+    while IFS= read -r env_value; do
+      env_key="${env_value%%=*}"
+      if vp_publisher_env_is_sensitive "$env_key"; then
+        update_args+=(--env-rm "$env_key")
+      fi
+    done <<<"$existing_env"
+
+    docker "${update_args[@]}" "${env_args[@]}" \
+      --image "$image" "$VP_VISION_WORKER_SERVICE" >&2 || return 1
+  else
+    local create_args=(
+      service create --detach=false --name "$VP_VISION_WORKER_SERVICE"
+      --replicas 1
+      --constraint "$VP_GPU_CONSTRAINT"
+      --network "$VP_PIPELINE_NETWORK"
+      --restart-condition any --restart-delay 5s
+      --mount type=volume,src=vp-vision-worker-scratch,dst=/data/storage
+    )
+    local create_env=()
+    while IFS= read -r env_value; do
+      create_env+=(--env "$env_value")
+    done < <(vp_vision_worker_env)
+    docker "${create_args[@]}" "${create_env[@]}" "$image" >&2 || return 1
+  fi
+  swarm_service_running "$VP_VISION_WORKER_SERVICE"
+}
+
+vp_retire_legacy_vision_worker() {
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    log "legacy vision worker retirement skipped"
+    return 0
+  fi
+
+  local container="vp_vision_worker_1"
+  local identity
+  if ! identity="$(
+    docker container inspect \
+      --format '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}' \
+      "$container" 2>/dev/null
+  )"; then
+    local matching_names
+    matching_names="$(docker container ls -a \
+      --filter "name=^/$container$" \
+      --format '{{.Names}}')" || return 1
+    if [[ -z "$matching_names" ]]; then
+      return 0
+    fi
+    echo "legacy vision worker identity could not be inspected" >&2
+    return 1
+  fi
+  if [[ "$identity" != "videoprocess|vision-worker" ]]; then
+    echo "refusing to remove unexpected legacy vision container identity" >&2
+    return 1
+  fi
+  docker rm -f "$container" >&2
 }
 
 vp_deploy_publisher() {
@@ -688,7 +913,8 @@ vp_capture_app_snapshots() {
         continue
       fi
     elif ! docker service inspect "$service" >/dev/null 2>&1; then
-      if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" ]]; then
+      if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" \
+        || "$service" == "$VP_VISION_WORKER_SERVICE" ]]; then
         continue
       fi
       echo "missing required VideoProcess service: $service" >&2
@@ -763,6 +989,7 @@ vp_restore_app_snapshots() {
   local service
   local image
   local gpu_was_present=false
+  local vision_was_present=false
   local publisher_was_present=false
   local status=0
 
@@ -773,6 +1000,11 @@ vp_restore_app_snapshots() {
     if [[ "$service" == "$VP_PYTHON_WORKER_SERVICE" ]]; then
       gpu_was_present=true
       if ! vp_restore_gpu_service "$image"; then
+        status=1
+      fi
+    elif [[ "$service" == "$VP_VISION_WORKER_SERVICE" ]]; then
+      vision_was_present=true
+      if ! vp_deploy_vision_worker "$image"; then
         status=1
       fi
     elif [[ "$service" == "$VP_PUBLISHER_SERVICE" ]]; then
@@ -790,6 +1022,14 @@ vp_restore_app_snapshots() {
     && docker service inspect "$VP_PYTHON_WORKER_SERVICE" >/dev/null 2>&1; then
     log "remove newly created $VP_PYTHON_WORKER_SERVICE"
     if ! docker service rm "$VP_PYTHON_WORKER_SERVICE" >&2; then
+      status=1
+    fi
+  fi
+  if vp_app_service_was_attempted "$VP_VISION_WORKER_SERVICE" "$attempted_services" \
+    && [[ "$vision_was_present" != true ]] \
+    && docker service inspect "$VP_VISION_WORKER_SERVICE" >/dev/null 2>&1; then
+    log "remove newly created $VP_VISION_WORKER_SERVICE"
+    if ! docker service rm "$VP_VISION_WORKER_SERVICE" >&2; then
       status=1
     fi
   fi
@@ -1095,6 +1335,9 @@ vp_apply_app_services() {
   http_health vp-frontend "http://$VP_RUNTIME_HOST:3001/" || return 1
   vp_record_app_service_attempt "$VP_PYTHON_WORKER_SERVICE"
   vp_deploy_python_worker "$python_worker" || return 1
+  vp_record_app_service_attempt "$VP_VISION_WORKER_SERVICE"
+  vp_deploy_vision_worker "$python_worker" || return 1
+  vp_retire_legacy_vision_worker || return 1
   vp_record_app_service_attempt "$VP_PUBLISHER_SERVICE"
   vp_deploy_publisher "$python_worker" || return 1
   vp_record_app_service_attempt vp-autoflow-api-swarm
@@ -1116,6 +1359,7 @@ vp_apply_app_services() {
 
 deploy_vp_app_services() {
   vp_validate_deploy_config || return 1
+  vp_require_vision_cutover_safe "${6:-}" || return 1
 
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
     vp_apply_app_services "$@" || return 1
