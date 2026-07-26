@@ -175,12 +175,58 @@ cancelled and left pending without acknowledgement.
 Graceful shutdown performs a bounded best-effort revoke. A failed shutdown
 revoke cannot keep the process alive; the lease expires naturally.
 
+## Lease Advisory-Lock Protocol
+
+Lease fencing uses transaction-scoped PostgreSQL advisory locks, not row-lock
+side effects. Keys are derived with `hashtextextended` from distinct
+`vp-worker-service:` and `vp-worker-registration:` namespaces. A hash collision
+may over-serialize unrelated workers but cannot weaken fencing.
+
+The global acquisition order is:
+
+1. service-scoped exclusive lock, when an operation needs one;
+2. registration-scoped exclusive locks in ascending registration UUID order;
+3. grant or registration row locks and mutations.
+
+No code may acquire a service lock after a registration lock.
+`vp_worker_register` takes the service-exclusive lock, then the prior active
+registration-exclusive lock before takeover. `vp_worker_release` takes the
+registration-exclusive lock before mutation. Grant activation/revocation and
+operator registration revocation must follow the same order.
+
+`vp_require_worker_lease` and `vp_worker_heartbeat` take a
+registration-scoped shared transaction lock. Require then reads and validates
+without `FOR UPDATE`; heartbeat remains compatible with a held require fence.
+Takeover and release wait for all shared fences to end. Each function computes
+database time only after all advisory-lock waits complete.
+
+Task 2 holds the require function's shared transaction lock through the
+irreversible YouTube POST and the durable `submitted` transition, including
+the manager task ID. The existing `request_attempted_at` uncertain-operation
+fence remains mandatory. Immediately before entering that transaction, the
+worker obtains a fresh heartbeat and requires at least 150 seconds of lease
+margin. The irreversible POST is bounded to 120 seconds and the durable
+submission transition to 15 seconds. The normal 60-second heartbeat continues
+under the compatible shared lock; heartbeat-loss cancellation aborts the
+request context, preserves uncertain state, and performs no acknowledgement.
+
 ## Dependency Fingerprints
 
 Fingerprint builders parse structured URLs and endpoints, remove credentials,
 normalize scheme/host/port/database or bucket identity, then hash canonical
 JSON. They reject malformed or local production endpoints using the existing
-admission rules.
+admission rules. Registration accepts only the exact nested schemas below,
+rejects extra or secret-bearing fields, recomputes each canonical SHA-256 in
+both Python and PostgreSQL, and compares it with the supplied fingerprint.
+Database identity deliberately excludes the login principal and credentials,
+so versioned runtime principals do not change the admitted database endpoint.
+
+The public lease service is PostgreSQL-only by default. A non-PostgreSQL ORM
+path requires an explicit test-only opt-in plus an injected principal resolver;
+it is used for deterministic unit tests and never claims production locking or
+security parity. Its validation and stable error contract match PostgreSQL,
+while live PostgreSQL 16 tests remain authoritative for concurrency, role, and
+stored-function behavior.
 
 - database: driver family, host, port, database name;
 - Redis: scheme, host, port, database index;

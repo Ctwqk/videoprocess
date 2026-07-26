@@ -64,12 +64,15 @@
 Cover all schema fields and checks from the design, unique service grants,
 unique token hashes, one active registration per service, exact claim
 validation including `session_user`/grant principal binding, rejection of
-superusers/table owners/direct registration-table writers, token hashing, no
-raw secret persistence, 180-second expiry,
+superusers/table owners/direct or assumable-role registration-table writers,
+NULL fail-closed behavior, NULL-safe CHECK behavior, canonical endpoint/
+fingerprint binding, token hashing, no raw secret persistence, 180-second expiry,
 60-second renewal semantics, separate lease-secret hashing, concurrent
 takeover, stale epoch heartbeat, expiry, revoke, nullable historical
 `node_executions` registration fields, and cross-language canonical fingerprint
-fixtures.
+fixtures. Live PostgreSQL tests hold a require fence and prove heartbeat stays
+available while takeover/release wait, and prove database time is read after
+advisory-lock waits.
 The shared fixture defines database, Redis, MinIO, and not-applicable inputs
 with their exact canonical JSON and SHA-256 results.
 
@@ -86,16 +89,20 @@ Expected: fail because revision 034 and the service do not exist.
 
 - [ ] **Step 3: Implement additive schema and lease service**
 
-Use `SELECT ... FOR UPDATE` on the service grant. Compare token hashes with
-`hmac.compare_digest`. Normalize capabilities by sorting and rejecting empty,
-duplicate, or unsupported values. A grant records generation, pending/active/
-revoked state, full commit, exact image, exact database principal, stream/group,
-and endpoint bindings.
-On register, revoke the previous active service/slot row, advance
-`max(lease_epoch)+1`, and insert the replacement in one transaction. Heartbeat
-updates only the exact active registration/instance/epoch/lease-secret before
-expiry. Revoke is idempotent. SQL functions are `SECURITY DEFINER`, set a fixed
-`search_path`, use database time and `session_user`, reject privileged callers,
+Compare token hashes with `hmac.compare_digest`. Normalize capabilities by
+sorting and rejecting empty, duplicate, or unsupported values. A grant records
+generation, pending/active/revoked state, full commit, exact image, exact
+database principal, stream/group, and canonical endpoint bindings whose
+fingerprints are recomputed before admission.
+Use the design's global advisory-lock order: service-exclusive, then
+registration-exclusive locks in ascending UUID order, then row locks/mutation.
+Register serializes on the service lock and takes the prior registration's
+exclusive lock before takeover. Require and heartbeat take the compatible
+registration-shared transaction lock; require performs no row lock. Release
+takes the registration-exclusive lock and is idempotent. All database time is
+computed after lock waits. SQL functions are schema-qualified
+`SECURITY DEFINER`, set `search_path` to `pg_catalog`, use `session_user`,
+fail closed on NULL, reject direct/column/assumable-role privileged callers,
 and revoke public execution.
 
 - [ ] **Step 4: Run focused tests and PostgreSQL migration checks**
@@ -126,9 +133,13 @@ git commit -m "feat(workers): add durable registration leases"
 - Modify: `backend/worker/main.py`
 - Modify: `backend/app/services/worker_admission.py`
 - Modify: `backend/app/services/job_execution_authority.py`
+- Modify: `backend/app/services/youtube_upload_operations.py`
+- Modify: `backend/worker/handlers/youtube_upload.py`
 - Modify: `backend/tests/worker/test_worker_startup.py`
 - Modify: `backend/tests/worker/test_worker_admission.py`
 - Modify: `backend/tests/services/test_job_execution_authority.py`
+- Modify: `backend/tests/services/test_youtube_upload_operations.py`
+- Modify: `backend/tests/worker/test_youtube_upload_handler.py`
 - Create: `backend/tests/worker/test_worker_registration_lifecycle.py`
 
 **Interfaces:**
@@ -148,6 +159,13 @@ sanitized logs, and vision workers requiring the same MinIO identity checks as
 other artifact consumers. Claim a node with registration ID/epoch, then revoke
 or supersede the lease and assert artifact, YouTube submission, completion,
 failure, event, and acknowledgement paths cannot commit.
+For YouTube submission, prove `vp_require_worker_lease` is called inside the
+existing durable authority transaction and its registration-shared advisory
+lock remains held through the irreversible POST and committed `submitted`
+transition. Prove heartbeat remains available while release/takeover wait,
+lease-loss cancellation preserves `request_attempted_at` uncertainty, and the
+120-second POST / 15-second transition bounds plus 150-second fresh-lease
+margin are enforced.
 Production tests require `WORKER_DATABASE_URL_FILE`, reject environment-only
 `DATABASE_URL`, enforce bounded mode `0400` secret reads, and prove no database
 credential appears in logs.
@@ -177,6 +195,13 @@ message tasks and leave their deliveries pending. Store registration ID/epoch
 when claiming the node and require the same live lease inside existing durable
 execution-authority locks before all final writes. Revoke with a fresh bounded
 context in `finally`.
+Immediately heartbeat before entering the YouTube submission fence and reject
+less than 150 seconds of remaining lease margin. Inside
+`YouTubeUploadOperationStore.submission_fence`, call
+`public.vp_require_worker_lease` on the same transaction before yielding; keep
+that transaction open across the POST and `mark_submitted` commit. Bound the
+irreversible POST to 120 seconds and the durable transition to 15 seconds while
+the normal heartbeat continues under the compatible shared advisory lock.
 
 - [ ] **Step 4: Run focused and full Python worker tests**
 
@@ -198,9 +223,13 @@ git add backend/worker/registration.py \
   backend/worker/main.py \
   backend/app/services/worker_admission.py \
   backend/app/services/job_execution_authority.py \
+  backend/app/services/youtube_upload_operations.py \
+  backend/worker/handlers/youtube_upload.py \
   backend/tests/worker/test_worker_startup.py \
   backend/tests/worker/test_worker_admission.py \
   backend/tests/services/test_job_execution_authority.py \
+  backend/tests/services/test_youtube_upload_operations.py \
+  backend/tests/worker/test_youtube_upload_handler.py \
   backend/tests/worker/test_worker_registration_lifecycle.py
 git commit -m "feat(workers): register python consumers before redis"
 ```

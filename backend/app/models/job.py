@@ -126,8 +126,11 @@ class NodeExecution(UUIDPrimaryKeyMixin, Base):
     __table_args__ = (
         CheckConstraint("progress >= 0 AND progress <= 100", name="ck_progress_range"),
         CheckConstraint(
-            "(worker_registration_id IS NULL AND worker_lease_epoch IS NULL) "
-            "OR (worker_registration_id IS NOT NULL AND worker_lease_epoch > 0)",
+            "((worker_registration_id IS NULL "
+            "AND worker_lease_epoch IS NULL) "
+            "OR (worker_registration_id IS NOT NULL "
+            "AND worker_lease_epoch IS NOT NULL "
+            "AND worker_lease_epoch > 0)) IS TRUE",
             name="ck_node_execution_worker_lease_binding",
         ),
     )

@@ -91,58 +91,59 @@ class WorkerAdmissionGrant(UUIDPrimaryKeyMixin, Base):
             name="uq_worker_admission_grants_token_sha256",
         ),
         CheckConstraint(
-            "length(trim(service_name)) > 0",
+            "(length(trim(service_name)) > 0) IS TRUE",
             name="ck_worker_admission_grant_service_nonempty",
         ),
         CheckConstraint(
-            "generation > 0",
+            "(generation > 0) IS TRUE",
             name="ck_worker_admission_grant_generation_positive",
         ),
         CheckConstraint(
-            "length(trim(worker_type)) > 0",
+            "(length(trim(worker_type)) > 0) IS TRUE",
             name="ck_worker_admission_grant_worker_type_nonempty",
         ),
         CheckConstraint(
-            "length(trim(worker_host)) > 0",
+            "(length(trim(worker_host)) > 0) IS TRUE",
             name="ck_worker_admission_grant_worker_host_nonempty",
         ),
         CheckConstraint(
-            "length(release_commit) = 40 "
-            "AND lower(release_commit) = release_commit",
+            "(length(release_commit) = 40 "
+            "AND lower(release_commit) = release_commit) IS TRUE",
             name="ck_worker_admission_grant_release_commit",
         ),
         CheckConstraint(
-            "length(trim(image_identity)) > 0",
+            "(length(trim(image_identity)) > 0) IS TRUE",
             name="ck_worker_admission_grant_image_identity",
         ),
         CheckConstraint(
-            "length(trim(database_principal)) > 0",
+            "(length(trim(database_principal)) > 0) IS TRUE",
             name="ck_worker_admission_grant_database_principal",
         ),
         CheckConstraint(
-            "length(trim(redis_stream)) > 0",
+            "(length(trim(redis_stream)) > 0) IS TRUE",
             name="ck_worker_admission_grant_redis_stream",
         ),
         CheckConstraint(
-            "length(trim(redis_group)) > 0",
+            "(length(trim(redis_group)) > 0) IS TRUE",
             name="ck_worker_admission_grant_redis_group",
         ),
         CheckConstraint(
-            "length(token_sha256) = 64 "
-            "AND lower(token_sha256) = token_sha256",
+            "(length(token_sha256) = 64 "
+            "AND lower(token_sha256) = token_sha256) IS TRUE",
             name="ck_worker_admission_grant_token_sha256",
         ),
         CheckConstraint(
-            "state IN ('pending', 'active', 'revoked')",
+            "(state IN ('pending', 'active', 'revoked')) IS TRUE",
             name="ck_worker_admission_grant_state",
         ),
         CheckConstraint(
-            "(state = 'pending' AND activated_at IS NULL "
+            "((state = 'pending' AND activated_at IS NULL "
             "AND revoked_at IS NULL AND revoke_reason IS NULL) "
             "OR (state = 'active' AND activated_at IS NOT NULL "
             "AND revoked_at IS NULL AND revoke_reason IS NULL) "
             "OR (state = 'revoked' AND revoked_at IS NOT NULL "
-            "AND length(trim(revoke_reason)) > 0)",
+            "AND revoke_reason IS NOT NULL "
+            "AND length(trim(revoke_reason)) > 0)) IS TRUE",
             name="ck_worker_admission_grant_lifecycle",
         ),
         Index(
@@ -243,79 +244,81 @@ class WorkerRegistration(UUIDPrimaryKeyMixin, Base):
             name="uq_worker_registrations_service_epoch",
         ),
         CheckConstraint(
-            "length(trim(service_name)) > 0",
+            "(length(trim(service_name)) > 0) IS TRUE",
             name="ck_worker_registration_service_nonempty",
         ),
         CheckConstraint(
-            "length(trim(worker_type)) > 0",
+            "(length(trim(worker_type)) > 0) IS TRUE",
             name="ck_worker_registration_worker_type_nonempty",
         ),
         CheckConstraint(
-            "length(trim(worker_host)) > 0",
+            "(length(trim(worker_host)) > 0) IS TRUE",
             name="ck_worker_registration_worker_host_nonempty",
         ),
         CheckConstraint(
-            "worker_slot > 0",
+            "(worker_slot > 0) IS TRUE",
             name="ck_worker_registration_slot_positive",
         ),
         CheckConstraint(
-            "length(trim(redis_consumer_id)) > 0",
+            "(length(trim(redis_consumer_id)) > 0) IS TRUE",
             name="ck_worker_registration_consumer_nonempty",
         ),
         CheckConstraint(
-            "length(trim(image_identity)) > 0",
+            "(length(trim(image_identity)) > 0) IS TRUE",
             name="ck_worker_registration_image_identity",
         ),
         CheckConstraint(
-            "length(trim(database_principal)) > 0",
+            "(length(trim(database_principal)) > 0) IS TRUE",
             name="ck_worker_registration_database_principal",
         ),
         CheckConstraint(
-            "length(database_fingerprint) = 64 "
-            "AND lower(database_fingerprint) = database_fingerprint",
+            "(length(database_fingerprint) = 64 "
+            "AND lower(database_fingerprint) = database_fingerprint) IS TRUE",
             name="ck_worker_registration_database_fingerprint",
         ),
         CheckConstraint(
-            "length(redis_fingerprint) = 64 "
-            "AND lower(redis_fingerprint) = redis_fingerprint",
+            "(length(redis_fingerprint) = 64 "
+            "AND lower(redis_fingerprint) = redis_fingerprint) IS TRUE",
             name="ck_worker_registration_redis_fingerprint",
         ),
         CheckConstraint(
-            "length(storage_fingerprint) = 64 "
-            "AND lower(storage_fingerprint) = storage_fingerprint",
+            "(length(storage_fingerprint) = 64 "
+            "AND lower(storage_fingerprint) = storage_fingerprint) IS TRUE",
             name="ck_worker_registration_storage_fingerprint",
         ),
         CheckConstraint(
-            "lease_epoch > 0",
+            "(lease_epoch > 0) IS TRUE",
             name="ck_worker_registration_epoch_positive",
         ),
         CheckConstraint(
-            "length(lease_secret_sha256) = 64 "
-            "AND lower(lease_secret_sha256) = lease_secret_sha256",
+            "(length(lease_secret_sha256) = 64 "
+            "AND lower(lease_secret_sha256) = lease_secret_sha256) IS TRUE",
             name="ck_worker_registration_lease_secret_sha256",
         ),
         CheckConstraint(
-            "status IN ('active', 'revoked', 'expired')",
+            "(status IN ('active', 'revoked', 'expired')) IS TRUE",
             name="ck_worker_registration_status",
         ),
         CheckConstraint(
-            "heartbeat_at >= registered_at",
+            "(heartbeat_at >= registered_at) IS TRUE",
             name="ck_worker_registration_heartbeat_order",
         ),
         CheckConstraint(
-            "lease_expires_at > heartbeat_at",
+            "(lease_expires_at > heartbeat_at) IS TRUE",
             name="ck_worker_registration_expiry_order",
         ),
         CheckConstraint(
-            "(status = 'revoked' AND revoked_at IS NOT NULL "
+            "((status = 'revoked' AND revoked_at IS NOT NULL "
+            "AND revoke_reason IS NOT NULL "
             "AND length(trim(revoke_reason)) > 0) "
             "OR (status IN ('active', 'expired') "
-            "AND revoked_at IS NULL AND revoke_reason IS NULL)",
+            "AND revoked_at IS NULL AND revoke_reason IS NULL)) IS TRUE",
             name="ck_worker_registration_revocation_state",
         ),
         CheckConstraint(
-            "superseded_by IS NULL "
-            "OR (status = 'revoked' AND superseded_by <> id)",
+            "(superseded_by IS NULL "
+            "OR (status = 'revoked' AND superseded_by IS NOT NULL "
+            "AND superseded_by <> id)) IS TRUE",
             name="ck_worker_registration_supersession",
         ),
         Index("ix_worker_registrations_grant_id", "grant_id"),

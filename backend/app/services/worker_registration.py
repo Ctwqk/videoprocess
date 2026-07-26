@@ -7,7 +7,7 @@ import re
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address
 from urllib.parse import unquote, urlsplit
@@ -88,7 +88,7 @@ class WorkerLease:
     worker_slot: int
     redis_consumer_id: str
     lease_epoch: int
-    lease_secret: str
+    lease_secret: str = field(repr=False)
     lease_expires_at: datetime
     heartbeat_interval_seconds: int = HEARTBEAT_INTERVAL_SECONDS
 
@@ -115,6 +115,8 @@ class _NormalizedClaims:
 
 
 class WorkerRegistrationService:
+    """PostgreSQL lease service with an explicit unit-test-only ORM fallback."""
+
     def __init__(
         self,
         session_factory: async_sessionmaker[AsyncSession],
@@ -122,7 +124,15 @@ class WorkerRegistrationService:
         clock: Callable[[], datetime] | None = None,
         lease_secret_factory: Callable[[], str] | None = None,
         database_principal_resolver: DatabasePrincipalResolver | None = None,
+        allow_non_postgres_test_backend: bool = False,
     ) -> None:
+        if (
+            allow_non_postgres_test_backend
+            and database_principal_resolver is None
+        ):
+            raise ValueError(
+                "non-PostgreSQL test backend requires a principal resolver"
+            )
         self._session_factory = session_factory
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lease_secret_factory = (
@@ -130,6 +140,9 @@ class WorkerRegistrationService:
         )
         self._database_principal_resolver = (
             database_principal_resolver or _session_user
+        )
+        self._allow_non_postgres_test_backend = (
+            allow_non_postgres_test_backend
         )
 
     async def register(
@@ -154,13 +167,17 @@ class WorkerRegistrationService:
                     lease_secret,
                     lease_secret_sha256,
                 )
-            return await self._orm_register(
-                db,
-                normalized,
-                token_sha256,
-                lease_secret,
-                lease_secret_sha256,
-            )
+            self._require_test_backend()
+            try:
+                return await self._orm_register(
+                    db,
+                    normalized,
+                    token_sha256,
+                    lease_secret,
+                    lease_secret_sha256,
+                )
+            except DBAPIError as error:
+                raise _registration_error(error) from None
 
     async def heartbeat(self, lease: WorkerLease) -> WorkerLease:
         lease_secret_sha256 = _secret_sha256(
@@ -175,11 +192,15 @@ class WorkerRegistrationService:
                     lease_secret_sha256,
                 )
                 return _renewed_lease(lease, expires_at)
-            return await self._orm_heartbeat(
-                db,
-                lease,
-                lease_secret_sha256,
-            )
+            self._require_test_backend()
+            try:
+                return await self._orm_heartbeat(
+                    db,
+                    lease,
+                    lease_secret_sha256,
+                )
+            except DBAPIError as error:
+                raise _registration_error(error) from None
 
     async def revoke(
         self,
@@ -187,9 +208,9 @@ class WorkerRegistrationService:
         *,
         reason: str = "shutdown",
     ) -> None:
-        normalized_reason = reason.strip()
-        if not normalized_reason or len(normalized_reason) > 255:
-            raise ValueError("revoke reason is invalid")
+        normalized_reason = _exact_nonempty(reason, 255)
+        if normalized_reason is None:
+            raise WorkerRegistrationError("claim_mismatch")
         lease_secret_sha256 = _secret_sha256(
             lease.lease_secret,
             "lease_fenced",
@@ -203,11 +224,21 @@ class WorkerRegistrationService:
                     normalized_reason,
                 )
                 return
-            await self._orm_revoke(
-                db,
-                lease,
-                lease_secret_sha256,
-                normalized_reason,
+            self._require_test_backend()
+            try:
+                await self._orm_revoke(
+                    db,
+                    lease,
+                    lease_secret_sha256,
+                    normalized_reason,
+                )
+            except DBAPIError as error:
+                raise _registration_error(error) from None
+
+    def _require_test_backend(self) -> None:
+        if not self._allow_non_postgres_test_backend:
+            raise WorkerRegistrationError(
+                "database_principal_privileged"
             )
 
     async def _postgres_register(
@@ -221,7 +252,7 @@ class WorkerRegistrationService:
         statement = text(
             """
             SELECT *
-            FROM vp_worker_register(
+            FROM public.vp_worker_register(
                 :service_name,
                 :generation,
                 :worker_type,
@@ -284,7 +315,7 @@ class WorkerRegistrationService:
                 expires_at = await db.scalar(
                     text(
                         """
-                        SELECT vp_worker_heartbeat(
+                        SELECT public.vp_worker_heartbeat(
                             :registration_id,
                             :service_name,
                             :worker_instance_id,
@@ -316,7 +347,7 @@ class WorkerRegistrationService:
                 await db.scalar(
                     text(
                         """
-                        SELECT vp_worker_release(
+                        SELECT public.vp_worker_release(
                             :registration_id,
                             :service_name,
                             :worker_instance_id,
@@ -452,6 +483,16 @@ class WorkerRegistrationService:
         expired = False
         async with db.begin():
             registration = await _locked_registration(db, lease)
+            principal = _valid_principal(
+                await self._database_principal_resolver(db)
+            )
+            if not hmac.compare_digest(
+                registration.database_principal,
+                principal,
+            ):
+                raise WorkerRegistrationError(
+                    "database_principal_mismatch"
+                )
             if registration.status != "active":
                 raise WorkerRegistrationError("lease_fenced")
             if not hmac.compare_digest(
@@ -460,7 +501,6 @@ class WorkerRegistrationService:
             ):
                 raise WorkerRegistrationError("lease_fenced")
             if _utc(registration.lease_expires_at) <= now:
-                registration.status = "expired"
                 expired = True
             else:
                 registration.heartbeat_at = now
@@ -488,6 +528,16 @@ class WorkerRegistrationService:
         now = _utc(self._clock())
         async with db.begin():
             registration = await _locked_registration(db, lease)
+            principal = _valid_principal(
+                await self._database_principal_resolver(db)
+            )
+            if not hmac.compare_digest(
+                registration.database_principal,
+                principal,
+            ):
+                raise WorkerRegistrationError(
+                    "database_principal_mismatch"
+                )
             if not hmac.compare_digest(
                 registration.lease_secret_sha256,
                 lease_secret_sha256,
@@ -540,21 +590,46 @@ def _normalize_claims(
     if any(value is None for value in values.values()):
         raise WorkerRegistrationError("claim_mismatch")
     capabilities = _normalize_capabilities(claims.capabilities)
-    if _COMMIT_PATTERN.fullmatch(claims.release_commit) is None:
+    if (
+        not isinstance(claims.release_commit, str)
+        or _COMMIT_PATTERN.fullmatch(claims.release_commit) is None
+    ):
         raise WorkerRegistrationError("claim_mismatch")
-    if _IMAGE_PATTERN.fullmatch(claims.image_identity) is None:
+    if (
+        not isinstance(claims.image_identity, str)
+        or _IMAGE_PATTERN.fullmatch(claims.image_identity) is None
+    ):
         raise WorkerRegistrationError("claim_mismatch")
     fingerprints = (
         claims.database_fingerprint,
         claims.redis_fingerprint,
         claims.storage_fingerprint,
     )
-    if any(_SHA256_PATTERN.fullmatch(value) is None for value in fingerprints):
+    if any(
+        not isinstance(value, str)
+        or _SHA256_PATTERN.fullmatch(value) is None
+        for value in fingerprints
+    ):
         raise WorkerRegistrationError("claim_mismatch")
-    endpoint_bindings, endpoint_bindings_json = _normalized_json_object(
+    (
+        endpoint_bindings,
+        endpoint_bindings_json,
+        expected_fingerprints,
+    ) = _normalized_endpoint_bindings(
         claims.endpoint_bindings
     )
-    if set(endpoint_bindings) != {"database", "redis", "storage"}:
+    supplied_fingerprints = {
+        "database": claims.database_fingerprint,
+        "redis": claims.redis_fingerprint,
+        "storage": claims.storage_fingerprint,
+    }
+    if any(
+        not hmac.compare_digest(
+            supplied_fingerprints[name],
+            expected_fingerprints[name],
+        )
+        for name in expected_fingerprints
+    ):
         raise WorkerRegistrationError("claim_mismatch")
     return _NormalizedClaims(
         service_name=values["service_name"] or "",
@@ -599,7 +674,7 @@ def _require_matching_claims(
         grant_capabilities = _normalize_capabilities(
             grant.capabilities_json
         )
-        grant_endpoints, _ = _normalized_json_object(
+        grant_endpoints, _, _ = _normalized_endpoint_bindings(
             grant.endpoint_bindings_json
         )
     except WorkerRegistrationError:
@@ -734,6 +809,124 @@ def _normalized_json_object(
     if not isinstance(normalized, dict):
         raise WorkerRegistrationError("claim_mismatch")
     return normalized, canonical
+
+
+def _normalized_endpoint_bindings(
+    value: Mapping[str, object],
+) -> tuple[dict[str, object], str, dict[str, str]]:
+    normalized, _ = _normalized_json_object(value)
+    if set(normalized) != {"database", "redis", "storage"}:
+        raise WorkerRegistrationError("claim_mismatch")
+    database = _validated_database_binding(normalized["database"])
+    redis = _validated_redis_binding(normalized["redis"])
+    storage = _validated_storage_binding(normalized["storage"])
+    endpoint_bindings: dict[str, object] = {
+        "database": database,
+        "redis": redis,
+        "storage": storage,
+    }
+    canonical_dependencies = {
+        "database": _canonical_json(database),
+        "redis": _canonical_json(redis),
+        "storage": _canonical_json(storage),
+    }
+    fingerprints = {
+        name: hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        for name, identity in canonical_dependencies.items()
+    }
+    return endpoint_bindings, _canonical_json(endpoint_bindings), fingerprints
+
+
+def _validated_database_binding(value: object) -> dict[str, object]:
+    binding = _exact_mapping(
+        value,
+        {"database", "driver", "host", "port"},
+    )
+    database = _dependency_name(binding["database"])
+    host = _dependency_host(binding["host"])
+    port = _dependency_port(binding["port"])
+    if binding["driver"] != "postgresql":
+        raise WorkerRegistrationError("claim_mismatch")
+    return {
+        "database": database,
+        "driver": "postgresql",
+        "host": host,
+        "port": port,
+    }
+
+
+def _validated_redis_binding(value: object) -> dict[str, object]:
+    binding = _exact_mapping(
+        value,
+        {"database", "host", "port", "scheme"},
+    )
+    database = binding["database"]
+    if type(database) is not int or database < 0:
+        raise WorkerRegistrationError("claim_mismatch")
+    scheme = binding["scheme"]
+    if scheme not in {"redis", "rediss"}:
+        raise WorkerRegistrationError("claim_mismatch")
+    return {
+        "database": database,
+        "host": _dependency_host(binding["host"]),
+        "port": _dependency_port(binding["port"]),
+        "scheme": scheme,
+    }
+
+
+def _validated_storage_binding(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise WorkerRegistrationError("claim_mismatch")
+    if dict(value) == {"backend": "not_applicable"}:
+        return {"backend": "not_applicable"}
+    binding = _exact_mapping(
+        value,
+        {"backend", "bucket", "host", "port"},
+    )
+    if binding["backend"] != "minio":
+        raise WorkerRegistrationError("claim_mismatch")
+    return {
+        "backend": "minio",
+        "bucket": _dependency_name(binding["bucket"]),
+        "host": _dependency_host(binding["host"]),
+        "port": _dependency_port(binding["port"]),
+    }
+
+
+def _exact_mapping(
+    value: object,
+    keys: set[str],
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise WorkerRegistrationError("claim_mismatch")
+    normalized = dict(value)
+    if set(normalized) != keys:
+        raise WorkerRegistrationError("claim_mismatch")
+    return normalized
+
+
+def _dependency_name(value: object) -> str:
+    name = _exact_nonempty(value, 255)
+    if name is None or "/" in name:
+        raise WorkerRegistrationError("claim_mismatch")
+    return name
+
+
+def _dependency_host(value: object) -> str:
+    host = _exact_nonempty(value, 255)
+    if (
+        host is None
+        or host != _normalized_host(host)
+        or _is_local_host(host)
+    ):
+        raise WorkerRegistrationError("claim_mismatch")
+    return host
+
+
+def _dependency_port(value: object) -> int:
+    if type(value) is not int or not 1 <= value <= 65535:
+        raise WorkerRegistrationError("claim_mismatch")
+    return value
 
 
 def _database_identity(env: Mapping[str, str]) -> dict[str, object]:

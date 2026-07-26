@@ -45,26 +45,15 @@ FINGERPRINT_FIXTURE = (
     REPO_ROOT / "tests/fixtures/worker_registration/fingerprints-v1.json"
 )
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
+FINGERPRINT_CASES = json.loads(FINGERPRINT_FIXTURE.read_text())["cases"]
+MINIO_FINGERPRINT_CASE = next(
+    case for case in FINGERPRINT_CASES if case["name"] == "minio"
+)
 ENDPOINT_BINDINGS = {
-    "database": {
-        "database": "videoprocess",
-        "driver": "postgresql",
-        "host": "vp-postgres-swarm",
-        "port": 5432,
-    },
-    "redis": {
-        "database": 3,
-        "host": "vp-redis-swarm",
-        "port": 6379,
-        "scheme": "redis",
-    },
-    "storage": {
-        "backend": "minio",
-        "bucket": "videoprocess",
-        "host": "vp-minio-swarm",
-        "port": 9000,
-    },
+    name: json.loads(canonical)
+    for name, canonical in MINIO_FINGERPRINT_CASE["canonical"].items()
 }
+ENDPOINT_FINGERPRINTS = MINIO_FINGERPRINT_CASE["sha256"]
 
 
 class MutableClock:
@@ -161,9 +150,9 @@ def _claims(**changes: object) -> WorkerRegistrationClaims:
         "redis_stream": "vp:tasks:ffmpeg_go",
         "redis_group": "ffmpeg_go-workers",
         "endpoint_bindings": ENDPOINT_BINDINGS,
-        "database_fingerprint": "a" * 64,
-        "redis_fingerprint": "b" * 64,
-        "storage_fingerprint": "c" * 64,
+        "database_fingerprint": ENDPOINT_FINGERPRINTS["database"],
+        "redis_fingerprint": ENDPOINT_FINGERPRINTS["redis"],
+        "storage_fingerprint": ENDPOINT_FINGERPRINTS["storage"],
     }
     values.update(changes)
     return WorkerRegistrationClaims(**values)
@@ -178,6 +167,7 @@ def _service(session_factory, clock: MutableClock) -> WorkerRegistrationService:
         clock=clock,
         lease_secret_factory=lambda: LEASE_SECRET,
         database_principal_resolver=principal_resolver,
+        allow_non_postgres_test_backend=True,
     )
 
 
@@ -291,6 +281,24 @@ def test_models_expose_generation_grant_registration_and_node_binding_fields() -
     assert "database_principal" not in {
         field.name for field in fields(WorkerRegistrationClaims)
     }
+    task_one_checks = [
+        constraint
+        for table in (
+            WorkerAdmissionGrant.__table__,
+            WorkerRegistration.__table__,
+        )
+        for constraint in table.constraints
+        if constraint.name and constraint.name.startswith("ck_worker_")
+    ]
+    node_binding_check = next(
+        constraint
+        for constraint in NodeExecution.__table__.constraints
+        if constraint.name == "ck_node_execution_worker_lease_binding"
+    )
+    assert all(
+        "IS TRUE" in str(constraint.sqltext).upper()
+        for constraint in (*task_one_checks, node_binding_check)
+    )
 
 
 @pytest.mark.parametrize(
@@ -376,6 +384,7 @@ async def test_register_binds_database_session_principal_without_caller_claim(
         clock=MutableClock(),
         lease_secret_factory=lambda: LEASE_SECRET,
         database_principal_resolver=wrong_principal,
+        allow_non_postgres_test_backend=True,
     )
 
     await _assert_error(
@@ -408,6 +417,7 @@ async def test_register_returns_independent_lease_secret_and_persists_only_hashe
     assert lease.heartbeat_interval_seconds == 60
     assert lease.lease_secret == LEASE_SECRET
     assert lease.lease_secret != ADMISSION_TOKEN
+    assert LEASE_SECRET not in repr(lease)
     rows = await _rows(registration_store)
     assert len(rows) == 1
     assert rows[0].capabilities_json == ["media_cpu", "media_gpu"]
@@ -516,7 +526,7 @@ async def test_different_fixed_slot_replaces_the_single_active_service_lease(
     assert rows[0].superseded_by == rows[1].id
 
 
-async def test_expired_lease_cannot_be_renewed_and_is_marked_expired(
+async def test_expired_lease_cannot_be_renewed_and_remains_a_past_active_row(
     registration_store,
 ) -> None:
     await _grant(registration_store)
@@ -528,7 +538,8 @@ async def test_expired_lease_cannot_be_renewed_and_is_marked_expired(
     await _assert_error("lease_expired", service.heartbeat(lease))
 
     row = (await _rows(registration_store))[0]
-    assert row.status == "expired"
+    assert row.status == "active"
+    assert row.lease_expires_at.replace(tzinfo=timezone.utc) < clock.current
 
 
 async def test_revoke_uses_lease_secret_is_idempotent_and_fences_heartbeat(
@@ -570,6 +581,148 @@ def test_dependency_fingerprints_match_cross_language_fixture() -> None:
             for key, secret in case["env"].items()
             if "SECRET" in key or key.endswith("_URL")
         )
+
+
+@pytest.mark.parametrize(
+    "endpoint_bindings",
+    [
+        {**ENDPOINT_BINDINGS, "password": "secret"},
+        {
+            **ENDPOINT_BINDINGS,
+            "database": {
+                **ENDPOINT_BINDINGS["database"],
+                "user": DATABASE_PRINCIPAL,
+            },
+        },
+        {
+            **ENDPOINT_BINDINGS,
+            "redis": {
+                **ENDPOINT_BINDINGS["redis"],
+                "password": "secret",
+            },
+        },
+        {
+            **ENDPOINT_BINDINGS,
+            "storage": {
+                **ENDPOINT_BINDINGS["storage"],
+                "access_key": "secret",
+            },
+        },
+    ],
+)
+async def test_register_rejects_secret_bearing_or_extra_endpoint_fields(
+    registration_store,
+    endpoint_bindings: dict[str, object],
+) -> None:
+    await _grant(registration_store)
+    service = _service(registration_store, MutableClock())
+
+    await _assert_error(
+        "claim_mismatch",
+        service.register(
+            _claims(endpoint_bindings=endpoint_bindings),
+            ADMISSION_TOKEN,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "fingerprint"),
+    [
+        ("database_fingerprint", "0" * 64),
+        ("redis_fingerprint", "1" * 64),
+        ("storage_fingerprint", "2" * 64),
+    ],
+)
+async def test_register_cryptographically_binds_fingerprints_to_endpoints(
+    registration_store,
+    field_name: str,
+    fingerprint: str,
+) -> None:
+    await _grant(registration_store)
+    service = _service(registration_store, MutableClock())
+
+    await _assert_error(
+        "claim_mismatch",
+        service.register(
+            _claims(**{field_name: fingerprint}),
+            ADMISSION_TOKEN,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [field.name for field in fields(WorkerRegistrationClaims)],
+)
+async def test_register_returns_stable_error_for_every_null_claim(
+    registration_store,
+    field_name: str,
+) -> None:
+    await _grant(registration_store)
+    service = _service(registration_store, MutableClock())
+
+    await _assert_error(
+        "claim_mismatch",
+        service.register(
+            replace(_claims(), **{field_name: None}),
+            ADMISSION_TOKEN,
+        ),
+    )
+
+
+async def test_non_postgres_service_is_fail_closed_without_explicit_test_opt_in(
+    registration_store,
+) -> None:
+    await _grant(registration_store)
+    service = WorkerRegistrationService(registration_store)
+
+    await _assert_error(
+        "database_principal_privileged",
+        service.register(_claims(), ADMISSION_TOKEN),
+    )
+
+
+async def test_test_fallback_rechecks_principal_on_heartbeat_and_revoke(
+    registration_store,
+) -> None:
+    await _grant(registration_store)
+    principal = DATABASE_PRINCIPAL
+
+    async def principal_resolver(_db) -> str:
+        return principal
+
+    service = WorkerRegistrationService(
+        registration_store,
+        clock=MutableClock(),
+        lease_secret_factory=lambda: LEASE_SECRET,
+        database_principal_resolver=principal_resolver,
+        allow_non_postgres_test_backend=True,
+    )
+    lease = await service.register(_claims(), ADMISSION_TOKEN)
+    principal = "vp_worker_runtime_wrong_generation"
+
+    await _assert_error(
+        "database_principal_mismatch",
+        service.heartbeat(lease),
+    )
+    await _assert_error(
+        "database_principal_mismatch",
+        service.revoke(lease),
+    )
+
+
+async def test_revoke_null_reason_returns_stable_claim_error(
+    registration_store,
+) -> None:
+    await _grant(registration_store)
+    service = _service(registration_store, MutableClock())
+    lease = await service.register(_claims(), ADMISSION_TOKEN)
+
+    await _assert_error(
+        "claim_mismatch",
+        service.revoke(lease, reason=None),
+    )
 
 
 @pytest.mark.parametrize(
@@ -615,6 +768,7 @@ def _asyncpg_url(url: str) -> str:
 async def test_concurrent_registration_serializes_takeover_by_service_slot() -> None:
     database = f"vp_worker_registration_service_{uuid.uuid4().hex}"
     role_name = f"vp_worker_runtime_{uuid.uuid4().hex[:16]}"
+    runtime_schema = f"vp_worker_runtime_schema_{uuid.uuid4().hex[:12]}"
     admin_url = _database_url("postgres")
     admin = await asyncpg.connect(_asyncpg_url(admin_url))
     try:
@@ -644,14 +798,23 @@ async def test_concurrent_registration_serializes_takeover_by_service_slot() -> 
             )
             await admin.execute(
                 f'GRANT EXECUTE ON FUNCTION '
-                f'vp_worker_register(text,bigint,text,text,uuid,integer,text,'
+                f'public.vp_worker_register('
+                f'text,bigint,text,text,uuid,integer,text,'
                 f'jsonb,text,text,text,text,jsonb,text,text,text,text,text) '
                 f'TO "{role_name}"'
             )
             await admin.execute(
                 f'GRANT EXECUTE ON FUNCTION '
-                f'vp_worker_heartbeat(uuid,text,uuid,bigint,text) '
+                f'public.vp_worker_heartbeat(uuid,text,uuid,bigint,text) '
                 f'TO "{role_name}"'
+            )
+            await admin.execute(
+                f'CREATE SCHEMA "{runtime_schema}" '
+                f'AUTHORIZATION "{role_name}"'
+            )
+            await admin.execute(
+                f'ALTER ROLE "{role_name}" IN DATABASE "{database}" '
+                f'SET search_path = "{runtime_schema}", pg_catalog'
             )
             await admin.execute(
                 "UPDATE worker_admission_grants "
