@@ -182,6 +182,7 @@ vp-event-outbox-relay-swarm
 vp-channel-agent-runner-swarm
 vp-ffmpeg-worker-go-swarm
 vp-ffmpeg-worker-gpu-swarm
+vp-vision-worker-swarm
 vp-youtube-publisher-swarm
 vp-feature-aggregator-swarm
 vp-pds-swarm'
@@ -202,6 +203,11 @@ while IFS= read -r service; do
   case "$service" in
     vp-ffmpeg-worker-gpu-swarm)
       if [[ -n "$service_image" ]]; then
+        trusted_python_image="$service_image"
+      fi
+      ;;
+    vp-vision-worker-swarm)
+      if [[ -z "$trusted_python_image" && -n "$service_image" ]]; then
         trusted_python_image="$service_image"
       fi
       ;;
@@ -240,6 +246,7 @@ done <<<"$services"
 consumer_active_idle_ms=120000
 stream_groups='vp:tasks:ffmpeg_go|ffmpeg_go-workers|^ffmpeg_go-worker@colima-127:[1-9][0-9]*$
 vp:tasks:ffmpeg|ffmpeg-workers|^ffmpeg-worker@150-gpu:[1-9][0-9]*$
+vp:tasks:vision|vision-workers|^vision-worker@150-vision:[1-9][0-9]*$
 vp:tasks:youtube_publisher|youtube_publisher-workers|^youtube_publisher-worker@150-publisher:[1-9][0-9]*$
 vp:events|orchestrator|^orchestrator-api-[1-9][0-9]*$'
 
@@ -290,6 +297,10 @@ while IFS='|' read -r stream group consumer_pattern; do
   if ! consumer_audit="$(docker exec "$redis_container" \
     redis-cli -p 6380 --raw XINFO CONSUMERS "$stream" "$group" 2>/dev/null \
     | awk -v active_idle_ms="$consumer_active_idle_ms" -v allowed_pattern="$consumer_pattern" '
+      BEGIN {
+        active_count = 0
+        stale_count = 0
+      }
       function fail() {
         invalid = 1
         exit 1
@@ -360,9 +371,9 @@ while IFS='|' read -r stream group consumer_pattern; do
 
   IFS='|' read -r active_count stale_count consumer_audit_extra <<<"$consumer_audit"
   if [[ "$active_count" != 1 ]] \
-    || [[ ! "$stale_count" =~ ^[0-9]+$ ]] \
+    || [[ "$stale_count" != 0 ]] \
     || [[ -n "$consumer_audit_extra" ]]; then
-    log_status "stream=$stream group=$group consumers=invalid active_count=$active_count"
+    log_status "stream=$stream group=$group consumers=invalid active_count=$active_count stale_count=$stale_count"
     add_external_condition redis_consumer_identity_invalid
   else
     log_status "stream=$stream group=$group consumers=healthy stale_count=$stale_count"

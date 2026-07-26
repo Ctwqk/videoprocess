@@ -64,13 +64,19 @@ def approved_redis_readiness_audit() -> dict:
                 "group": "ffmpeg-workers",
                 "pending": 0,
                 "active_consumers": ["ffmpeg-worker@150-gpu:1"],
-                "stale_consumer_count": 83,
+                "stale_consumer_count": 0,
             },
             "vp:tasks:ffmpeg_go": {
                 "group": "ffmpeg_go-workers",
                 "pending": 0,
                 "active_consumers": ["ffmpeg_go-worker@colima-127:1"],
-                "stale_consumer_count": 9,
+                "stale_consumer_count": 0,
+            },
+            "vp:tasks:vision": {
+                "group": "vision-workers",
+                "pending": 0,
+                "active_consumers": ["vision-worker@150-vision:1"],
+                "stale_consumer_count": 0,
             },
             "vp:tasks:youtube_publisher": {
                 "group": "youtube_publisher-workers",
@@ -101,7 +107,7 @@ def install_fake_redis(
 
 
 @pytest.mark.anyio
-async def test_redis_pending_audit_records_four_stream_active_consumer_identities(
+async def test_redis_pending_audit_records_five_stream_active_consumer_identities(
     monkeypatch: pytest.MonkeyPatch,
 ):
     runner = load_runner()
@@ -134,6 +140,32 @@ async def test_redis_pending_audit_records_four_stream_active_consumer_identitie
 
     assert audit == expected
     runner.assert_redis_readiness_audit(audit)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda audit: audit["streams"].pop("vp:tasks:vision"),
+        lambda audit: audit["streams"]["vp:tasks:vision"].update(pending=1),
+        lambda audit: audit["streams"]["vp:tasks:vision"].update(
+            active_consumers=["vision-worker@vp-vision-worker:1"]
+        ),
+        lambda audit: audit["streams"]["vp:tasks:vision"].update(
+            active_consumers=[
+                "vision-worker@150-vision:1",
+                "vision-worker@150-vision:2",
+            ]
+        ),
+        lambda audit: audit["streams"]["vp:tasks:vision"].update(stale_consumer_count=1),
+    ),
+)
+def test_redis_readiness_rejects_unmanaged_or_unsettled_vision_consumer(mutation):
+    runner = load_runner()
+    audit = approved_redis_readiness_audit()
+    mutation(audit)
+
+    with pytest.raises(runner.CanaryError):
+        runner.assert_redis_readiness_audit(audit)
 
 
 @pytest.mark.anyio
@@ -811,7 +843,7 @@ async def test_run_keeps_live_final_redis_audit_separate_from_startup_audit(
     runner = load_runner()
     startup_audit = approved_redis_readiness_audit()
     final_audit = approved_redis_readiness_audit()
-    final_audit["streams"]["vp:events"]["stale_consumer_count"] = 1
+    final_audit["streams"]["vp:events"]["active_consumers"] = ["orchestrator-api-2"]
 
     async def execute_selected_mode(_mode, _args, _db, _client, evidence, _path):
         evidence["redis_stream_startup_audit"] = startup_audit

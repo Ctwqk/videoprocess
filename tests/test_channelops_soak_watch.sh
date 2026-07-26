@@ -143,6 +143,7 @@ if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
   case "$service" in
     vp-youtube-publisher-swarm) image=vp-ffmpeg-worker-python:publisher-deployed ;;
     vp-ffmpeg-worker-gpu-swarm) image=vp-ffmpeg-worker-python:gpu-deployed ;;
+    vp-vision-worker-swarm) image=vp-ffmpeg-worker-python:vision-deployed ;;
     *) image="fixture-$service:deployed" ;;
   esac
   printf '%s|%s\n' "$desired" "$image"
@@ -192,6 +193,7 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
   case "$stream" in
     vp:tasks:ffmpeg_go) group=ffmpeg_go-workers ;;
     vp:tasks:ffmpeg) group=ffmpeg-workers ;;
+    vp:tasks:vision) group=vision-workers ;;
     vp:tasks:youtube_publisher) group=youtube_publisher-workers ;;
     vp:events) group=orchestrator ;;
     *) exit 1 ;;
@@ -214,6 +216,7 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
       case "$stream" in
         vp:tasks:ffmpeg_go) consumer=ffmpeg_go-worker@colima-127:1 ;;
         vp:tasks:ffmpeg) consumer=ffmpeg-worker@150-gpu:1 ;;
+        vp:tasks:vision) consumer=vision-worker@150-vision:1 ;;
         vp:tasks:youtube_publisher) consumer=youtube_publisher-worker@150-publisher:1 ;;
         vp:events) consumer=orchestrator-api-1 ;;
         *) exit 1 ;;
@@ -252,6 +255,13 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
           ;;
       esac
       active_idle="${active_idle:-500}"
+      emit_stale_consumer="${emit_stale_consumer:-false}"
+      if [[ "${FAKE_DOCKER_MODE:-healthy}" == "stale_consumer" ]]; then
+        emit_stale_consumer=true
+      fi
+      if [[ "${FAKE_DOCKER_MODE:-healthy}" == "empty_stale_consumer_name" ]]; then
+        emit_stale_consumer=true
+      fi
       if [[ "${truncated_inactive:-false}" == true ]]; then
         printf 'name\n%s\npending\n0\nidle\n%s\ninactive\n' "$consumer" "$active_idle"
       elif [[ "${malformed_pending:-false}" == true ]]; then
@@ -266,7 +276,9 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
       if [[ -n "${duplicate_consumer:-}" ]]; then
         printf 'name\n%s\npending\n0\nidle\n500\ninactive\n500\n' "$duplicate_consumer"
       fi
-      printf 'name\n%s\npending\n0\nidle\n120001\ninactive\n120001\n' "$historical_consumer"
+      if [[ "$emit_stale_consumer" == true ]]; then
+        printf 'name\n%s\npending\n0\nidle\n120001\ninactive\n120001\n' "$historical_consumer"
+      fi
       exit 0
       ;;
     *) exit 1 ;;
@@ -475,10 +487,10 @@ FAKE_MISSING_SERVICES=
 FAKE_CLI_EXIT=0
 run_watcher
 [[ "$WATCHER_EXIT" -eq 0 ]] || fail "healthy watcher run failed"
-[[ "$(grep -Fc 'docker|service|inspect|' "$CALLS")" -eq 10 ]] \
-  || fail "healthy run must inspect exactly 10 services"
-[[ "$(grep -Fc 'docker|service|ps|' "$CALLS")" -eq 10 ]] \
-  || fail "healthy run must query exactly 10 service task sets"
+[[ "$(grep -Fc 'docker|service|inspect|' "$CALLS")" -eq 11 ]] \
+  || fail "healthy run must inspect exactly 11 services"
+[[ "$(grep -Fc 'docker|service|ps|' "$CALLS")" -eq 11 ]] \
+  || fail "healthy run must query exactly 11 service task sets"
 for service in \
   vp-api-swarm \
   vp-frontend-swarm \
@@ -487,6 +499,7 @@ for service in \
   vp-channel-agent-runner-swarm \
   vp-ffmpeg-worker-go-swarm \
   vp-ffmpeg-worker-gpu-swarm \
+  vp-vision-worker-swarm \
   vp-youtube-publisher-swarm \
   vp-feature-aggregator-swarm \
   vp-pds-swarm; do
@@ -496,6 +509,7 @@ done
 for pair in \
   'vp:tasks:ffmpeg_go|ffmpeg_go-workers' \
   'vp:tasks:ffmpeg|ffmpeg-workers' \
+  'vp:tasks:vision|vision-workers' \
   'vp:tasks:youtube_publisher|youtube_publisher-workers' \
   'vp:events|orchestrator'; do
   stream="${pair%%|*}"
@@ -503,10 +517,10 @@ for pair in \
   assert_contains "docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|GROUPS|$stream" "$CALLS"
   assert_contains "stream=$stream group=$group status=healthy" "$OUTPUT"
 done
-[[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|GROUPS|' "$CALLS")" -eq 4 ]] \
-  || fail "healthy run must query exactly 4 Redis streams"
-[[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|CONSUMERS|' "$CALLS")" -eq 4 ]] \
-  || fail "healthy run must query exactly 4 Redis consumer sets"
+[[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|GROUPS|' "$CALLS")" -eq 5 ]] \
+  || fail "healthy run must query exactly 5 Redis streams"
+[[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|CONSUMERS|' "$CALLS")" -eq 5 ]] \
+  || fail "healthy run must query exactly 5 Redis consumer sets"
 assert_contains 'docker|run|--rm|--env|DATABASE_URL|vp-ffmpeg-worker-python:publisher-deployed|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
 assert_contains '|--channel-id|123e4567-e89b-12d3-a456-426614174000' "$CALLS"
 assert_contains '|--started-at|2026-07-19T18:30:00Z' "$CALLS"
@@ -561,6 +575,7 @@ for consumer_mode in \
   near_match_consumer \
   missing_active_consumer \
   duplicate_active_consumer \
+  stale_consumer \
   malformed_consumer \
   truncated_inactive \
   empty_stale_consumer_name \
@@ -591,7 +606,7 @@ assert_contains '|--apply' "$CALLS"
 assert_contains '|vp-ffmpeg-worker-python:gpu-deployed|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
 
 # With neither trusted Python image available, fail before claiming protection.
-FAKE_MISSING_SERVICES='vp-youtube-publisher-swarm vp-ffmpeg-worker-gpu-swarm'
+FAKE_MISSING_SERVICES='vp-youtube-publisher-swarm vp-ffmpeg-worker-gpu-swarm vp-vision-worker-swarm'
 run_watcher
 [[ "$WATCHER_EXIT" -ne 0 ]] || fail "missing trusted Python images must fail"
 assert_contains 'status=configuration_error reason=trusted_python_image_missing' "$OUTPUT"

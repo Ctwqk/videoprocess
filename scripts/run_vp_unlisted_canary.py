@@ -103,6 +103,7 @@ NON_PUBLISHING_MAINTENANCE_QUEUE_KINDS = {"cleanup_expired", "ingest_discovery"}
 REDIS_PENDING_STREAM_GROUPS = (
     ("vp:tasks:ffmpeg", "ffmpeg-workers"),
     ("vp:tasks:ffmpeg_go", "ffmpeg_go-workers"),
+    ("vp:tasks:vision", "vision-workers"),
     ("vp:tasks:youtube_publisher", "youtube_publisher-workers"),
     ("vp:events", "orchestrator"),
 )
@@ -110,6 +111,7 @@ REDIS_CONSUMER_ACTIVE_IDLE_MS = 120_000
 REDIS_ACTIVE_CONSUMER_PATTERNS: dict[str, re.Pattern[str]] = {
     "vp:tasks:ffmpeg": re.compile(r"^ffmpeg-worker@150-gpu:[1-9][0-9]*$"),
     "vp:tasks:ffmpeg_go": re.compile(r"^ffmpeg_go-worker@colima-127:[1-9][0-9]*$"),
+    "vp:tasks:vision": re.compile(r"^vision-worker@150-vision:[1-9][0-9]*$"),
     "vp:tasks:youtube_publisher": re.compile(
         r"^youtube_publisher-worker@150-publisher:[1-9][0-9]*$"
     ),
@@ -1829,6 +1831,8 @@ def assert_redis_readiness_audit(report: dict[str, Any]) -> None:
             raise CanaryError(
                 f"Redis pending audit requires exactly one active consumer for {stream}"
             )
+        if stale_consumer_count != 0:
+            raise CanaryError(f"Redis pending audit found stale consumers for {stream}")
         if REDIS_ACTIVE_CONSUMER_PATTERNS[stream].fullmatch(active_consumers[0]) is None:
             raise CanaryError(f"Redis consumer identity is invalid for {stream}")
 
