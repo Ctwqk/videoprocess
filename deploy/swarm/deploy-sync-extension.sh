@@ -182,6 +182,38 @@ vp_require_service_node() {
   fi
 }
 
+vp_gpu_constraint_update_args() {
+  local existing_constraints="$1"
+  local gpu_count=0
+  local manager_count=0
+  local constraint
+  while IFS= read -r constraint; do
+    [[ -n "$constraint" ]] || continue
+    case "$constraint" in
+      "$VP_GPU_CONSTRAINT")
+        gpu_count=$((gpu_count + 1))
+        ;;
+      "$VP_GPU_MANAGER_CONSTRAINT")
+        manager_count=$((manager_count + 1))
+        ;;
+      *)
+        printf '%s\n%s\n' --constraint-rm "$constraint"
+        ;;
+    esac
+  done <<<"$existing_constraints"
+
+  if [[ "$gpu_count" -gt 1 || "$manager_count" -gt 1 ]]; then
+    echo "GPU worker has duplicate approved placement constraints" >&2
+    return 1
+  fi
+  if [[ "$gpu_count" -eq 0 ]]; then
+    printf '%s\n%s\n' --constraint-add "$VP_GPU_CONSTRAINT"
+  fi
+  if [[ "$manager_count" -eq 0 ]]; then
+    printf '%s\n%s\n' --constraint-add "$VP_GPU_MANAGER_CONSTRAINT"
+  fi
+}
+
 vp_require_managed_worker_storage_ready() {
   local service="$1"
   local require_artifact_api="${2:-false}"
@@ -628,16 +660,18 @@ vp_deploy_python_worker() {
       service update --detach=false --no-resolve-image --update-order stop-first
       --image "$image"
     )
+    local existing_constraints
+    existing_constraints="$(
+      vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
+        '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
+    )" || return 1
+    local constraint_args
+    constraint_args="$(vp_gpu_constraint_update_args "$existing_constraints")" || return 1
     local constraint
     while IFS= read -r constraint; do
       [[ -n "$constraint" ]] || continue
-      update_args+=(--constraint-rm "$constraint")
-    done < <(
-      vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
-        '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
-    )
-    update_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
-    update_args+=(--constraint-add "$VP_GPU_MANAGER_CONSTRAINT")
+      update_args+=("$constraint")
+    done <<<"$constraint_args"
 
     local network_id
     network_id="$(docker network inspect "$VP_PIPELINE_NETWORK" --format '{{.ID}}')"
@@ -1127,17 +1161,19 @@ vp_app_service_was_attempted() {
 
 vp_restore_gpu_service() {
   local image="$1"
+  local existing_constraints
+  existing_constraints="$(
+    vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
+      '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
+  )" || return 1
+  local constraint_output
+  constraint_output="$(vp_gpu_constraint_update_args "$existing_constraints")" || return 1
   local constraint
   local constraint_args=()
   while IFS= read -r constraint; do
     [[ -n "$constraint" ]] || continue
-    constraint_args+=(--constraint-rm "$constraint")
-  done < <(
-    vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
-      '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
-  )
-  constraint_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
-  constraint_args+=(--constraint-add "$VP_GPU_MANAGER_CONSTRAINT")
+    constraint_args+=("$constraint")
+  done <<<"$constraint_output"
 
   local update_args=(
     service update --detach=false --no-resolve-image --update-order stop-first

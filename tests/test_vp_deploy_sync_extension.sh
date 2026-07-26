@@ -154,6 +154,7 @@ PUBLISHER_REPLICAS=3
 PUBLISHER_LIST_FAILURE=false
 PUBLISHER_LIST_NAME=
 FAIL_PUBLISHER_INSPECT_FORMAT=
+FAIL_GPU_CONSTRAINT_INSPECT=false
 GPU_PREFLIGHT_SUCCEEDS=true
 FAIL_UPDATE_SERVICE=
 FAIL_UPDATE_IMAGE=
@@ -464,7 +465,10 @@ docker() {
         fi
         ;;
       *Placement.Constraints*)
-        if [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
+        if [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" \
+          && "$FAIL_GPU_CONSTRAINT_INSPECT" == "true" ]]; then
+          return 1
+        elif [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
           case "$PUBLISHER_CONSTRAINT_MODE" in
             publisher)
               echo 'node.labels.vp.publisher==true'
@@ -496,6 +500,10 @@ docker() {
           echo 'node.labels.role==app'
           echo 'node.hostname==CASPERs-Mac-mini'
           echo 'node.hostname==colima-swarmbridged'
+        elif [[ "$CONSTRAINT_MODE" == "gpu-duplicate" ]]; then
+          echo 'node.labels.vp.gpu==true'
+          echo 'node.labels.vp.gpu==true'
+          echo 'node.hostname==ccttww-lap'
         else
           echo 'node.labels.role==app'
         fi
@@ -1147,8 +1155,6 @@ assert_gpu_constraints_normalized() {
   local update_call="$1"
   local constraint
   for constraint in \
-    'node.labels.vp.gpu==true' \
-    'node.hostname==ccttww-lap' \
     'node.labels.vp.runtime==true' \
     'node.labels.vp.legacy==true' \
     'node.labels.role==app' \
@@ -1162,8 +1168,9 @@ assert_gpu_constraints_normalized() {
   for constraint in \
     'node.labels.vp.gpu==true' \
     'node.hostname==ccttww-lap'; do
-    if [[ "$(grep -oF -- "--constraint-add $constraint" <<<"$update_call" | wc -l | tr -d ' ')" -ne 1 ]]; then
-      echo "FAIL: GPU placement did not add approved constraint exactly once: $constraint" >&2
+    if [[ "$update_call" == *"--constraint-rm $constraint"* \
+      || "$update_call" == *"--constraint-add $constraint"* ]]; then
+      echo "FAIL: GPU placement rewrote an already exact approved constraint: $constraint" >&2
       exit 1
     fi
   done
@@ -1193,6 +1200,50 @@ if [[ -z "$gpu_normalized_update" ]]; then
 fi
 assert_gpu_constraints_normalized "$gpu_normalized_update"
 assert_rollback_targets_are_safe
+
+: >"$CALLS"
+CONSTRAINT_MODE=gpu-duplicate
+if vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-duplicate-constraint \
+  >/dev/null 2>&1; then
+  echo 'FAIL: duplicate approved GPU constraints unexpectedly passed' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service update' "$CALLS" \
+  || grep -Fq "running|$VP_PYTHON_WORKER_SERVICE" "$CALLS" \
+  || grep -Fq "$gpu_readiness_probe" "$CALLS"; then
+  echo 'FAIL: duplicate approved GPU constraints reached a service write or readiness' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+CONSTRAINT_MODE=gpu-stale
+FAIL_GPU_CONSTRAINT_INSPECT=true
+if vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-constraint-inspect-failure \
+  >/dev/null 2>&1; then
+  echo 'FAIL: GPU constraint inspect failure unexpectedly passed deployment' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service update' "$CALLS" \
+  || grep -Fq "running|$VP_PYTHON_WORKER_SERVICE" "$CALLS" \
+  || grep -Fq "$gpu_readiness_probe" "$CALLS"; then
+  echo 'FAIL: GPU constraint inspect failure reached a service write or readiness' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+if vp_restore_gpu_service baseline-vp-ffmpeg-worker-gpu-swarm:inspect-failure \
+  >/dev/null 2>&1; then
+  echo 'FAIL: GPU rollback constraint inspect failure unexpectedly passed' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service update' "$CALLS" \
+  || grep -Fq "running|$VP_PYTHON_WORKER_SERVICE" "$CALLS" \
+  || grep -Fq "$gpu_readiness_probe" "$CALLS"; then
+  echo 'FAIL: GPU rollback inspect failure reached a service write or readiness' >&2
+  exit 1
+fi
+FAIL_GPU_CONSTRAINT_INSPECT=false
+CONSTRAINT_MODE=gpu-stale
 
 : >"$CALLS"
 rm -f "$WORKER_READINESS_FAILURE_USED"
