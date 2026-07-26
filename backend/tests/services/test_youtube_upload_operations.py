@@ -216,6 +216,99 @@ async def test_submission_fence_rejects_reassigned_execution_claim(
 
 
 @pytest.mark.asyncio
+async def test_registered_submission_fence_uses_database_150_second_margin(
+    monkeypatch,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    registration_id = uuid.uuid4()
+    claimed_at = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+    context = SimpleNamespace(
+        job_id=job_id,
+        node_execution_id=node_execution_id,
+        execution_claim=NodeExecutionClaim(
+            job_id=job_id,
+            node_execution_id=node_execution_id,
+            worker_id="gpu-worker@150:registered",
+            started_at=claimed_at,
+            worker_registration_id=registration_id,
+            worker_lease_epoch=19,
+        ),
+    )
+    margin_checks: list[tuple[NodeExecutionClaim, int]] = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return FakeTransaction()
+
+    async def lock_authority(_db, locked_job_id, *, node_execution_id):
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(
+                state="OPEN",
+                guarded_job_id=job_id,
+            ),
+            task=None,
+            job=SimpleNamespace(id=job_id, status=JobStatus.RUNNING),
+            node=SimpleNamespace(
+                id=node_execution_id,
+                status=NodeStatus.RUNNING,
+                worker_id=context.execution_claim.worker_id,
+                started_at=claimed_at,
+                worker_registration_id=registration_id,
+                worker_lease_epoch=19,
+            ),
+        )
+
+    async def require_margin(
+        _db,
+        claim,
+        *,
+        minimum_margin_seconds,
+    ):
+        margin_checks.append((claim, minimum_margin_seconds))
+
+    async def reject_plain_lease(*args, **kwargs):
+        raise AssertionError(
+            "submission entry must use the database margin function"
+        )
+
+    monkeypatch.setattr(
+        upload_operations,
+        "lock_job_execution_authority",
+        lock_authority,
+    )
+    monkeypatch.setattr(
+        upload_operations,
+        "require_worker_registration_margin",
+        require_margin,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        upload_operations,
+        "require_worker_registration_lease",
+        reject_plain_lease,
+    )
+    store = YouTubeUploadOperationStore(lambda: FakeSession())
+
+    async with store.submission_fence(context):
+        assert margin_checks == [(context.execution_claim, 150)]
+
+
+@pytest.mark.asyncio
 async def test_registered_operation_transitions_require_context_and_lease_fence(
     monkeypatch,
     operation_session_factory,

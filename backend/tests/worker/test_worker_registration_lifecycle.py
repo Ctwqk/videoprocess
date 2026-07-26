@@ -122,6 +122,52 @@ def test_secret_reader_handles_short_regular_file_reads(
     )
 
 
+@pytest.mark.parametrize(
+    ("mutation", "replacement"),
+    [
+        ("truncate", b"XYZ"),
+        ("overwrite", b"UVWXYZ"),
+        ("grow", b"abcdef-extra"),
+    ],
+)
+def test_secret_reader_rejects_in_place_mutation_during_read(
+    monkeypatch,
+    tmp_path: Path,
+    mutation: str,
+    replacement: bytes,
+) -> None:
+    secret = tmp_path / "secret"
+    _write_secret(secret, "abcdef")
+    original_read = os.read
+    first_read = True
+
+    def mutate_after_first_read(descriptor: int, maximum: int) -> bytes:
+        nonlocal first_read
+        chunk = original_read(
+            descriptor,
+            min(maximum, 3) if first_read else maximum,
+        )
+        if first_read:
+            first_read = False
+            secret.chmod(0o600)
+            if mutation == "grow":
+                with secret.open("ab") as handle:
+                    handle.write(replacement[6:])
+            else:
+                secret.write_bytes(replacement)
+            secret.chmod(0o400)
+        return chunk
+
+    monkeypatch.setattr(
+        secret_config.os,
+        "read",
+        mutate_after_first_read,
+    )
+
+    with pytest.raises(WorkerSecretError, match="changed"):
+        read_mode_0400_secret(secret, label="worker secret")
+
+
 @pytest.mark.parametrize("mode", (0o000, 0o440, 0o600, 0o644))
 def test_secret_reader_rejects_any_mode_other_than_0400(
     tmp_path: Path,
@@ -258,6 +304,41 @@ async def test_lifecycle_registers_then_initially_heartbeats_before_start_return
 
     await lifecycle.close()
     assert events[-1] == "revoke:shutdown"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_refresh_does_not_use_worker_clock_for_margin_authority() -> None:
+    registered = _lease()
+    short_database_lease = WorkerLease(
+        **{
+            **registered.__dict__,
+            "lease_expires_at": (
+                datetime.now(timezone.utc) + timedelta(seconds=120)
+            ),
+        }
+    )
+
+    class Service:
+        async def register(self, claims, token):
+            return registered
+
+        async def heartbeat(self, lease):
+            return short_database_lease
+
+        async def revoke(self, lease, *, reason):
+            return None
+
+    lifecycle = PythonWorkerRegistration(
+        Service(),
+        _claims(),
+        "admission-token",
+    )
+    await lifecycle.start()
+
+    renewed = await lifecycle.heartbeat_now(minimum_margin_seconds=150)
+
+    assert renewed == short_database_lease
+    await lifecycle.close()
 
 
 @pytest.mark.asyncio

@@ -91,6 +91,8 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
     sql = completed.stdout
     assert "CREATE TABLE worker_admission_grants" in sql
     assert "CREATE TABLE worker_registrations" in sql
+    assert "CREATE TABLE registered_worker_event_receipts" in sql
+    assert "CREATE TABLE worker_event_dispatches" in sql
     for column in (
         "generation",
         "release_commit",
@@ -130,6 +132,9 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "vp_worker_heartbeat",
         "vp_worker_release",
         "vp_require_worker_lease",
+        "vp_observe_worker_lease",
+        "vp_require_worker_lease_margin",
+        "vp_require_worker_task_ack_receipt",
         "vp_worker_grant_upsert",
         "vp_worker_grant_activate",
         "vp_worker_grant_revoke",
@@ -140,8 +145,8 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         assert f"CREATE FUNCTION public.{function_name}" in sql
         assert f"ALTER FUNCTION public.{function_name}" not in sql
         assert f"REVOKE ALL ON FUNCTION public.{function_name}" in sql
-    assert sql.count("SECURITY DEFINER") >= 10
-    assert sql.count("SET search_path = pg_catalog") >= 10
+    assert sql.count("SECURITY DEFINER") >= 13
+    assert sql.count("SET search_path = pg_catalog") >= 13
     assert "SET search_path = pg_catalog, public" not in sql
     assert "pg_advisory_xact_lock_shared" in sql
     assert "pg_advisory_xact_lock" in sql

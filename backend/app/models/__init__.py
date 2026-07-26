@@ -15,6 +15,10 @@ from app.models.autoflow import AutoFlowPlan, AutoFlowRun, AutoFlowUsedClip, Con
 from app.models.youtube_upload_operation import YouTubeUploadOperation
 from app.models.publication_promotion_operation import PublicationPromotionOperation
 from app.models.legacy_worker_event_resolution import LegacyWorkerEventResolution
+from app.models.registered_worker_event_receipt import (
+    RegisteredWorkerEventReceipt,
+    WorkerEventDispatch,
+)
 from app.models.worker_registration import WorkerAdmissionGrant, WorkerRegistration
 from app.models.channel_agent import (
     AgentTickAudit,
@@ -58,6 +62,8 @@ __all__ = [
     "YouTubeUploadOperation",
     "PublicationPromotionOperation",
     "LegacyWorkerEventResolution",
+    "RegisteredWorkerEventReceipt",
+    "WorkerEventDispatch",
     "WorkerAdmissionGrant",
     "WorkerRegistration",
     "ChannelProfile",

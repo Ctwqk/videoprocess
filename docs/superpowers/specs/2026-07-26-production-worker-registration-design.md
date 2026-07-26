@@ -223,6 +223,11 @@ submission transition to 15 seconds. The normal 60-second heartbeat continues
 under the compatible shared lock; heartbeat-loss cancellation aborts the
 request context, preserves uncertain state, and performs no acknowledgement.
 
+YouTube execution intentionally requires a durable registered-worker claim in
+every environment, including local development. Generationless compatibility
+remains available for non-publication worker paths only; an irreversible
+external publication must not fall back to the legacy authority model.
+
 ## Dependency Fingerprints
 
 Fingerprint builders parse structured URLs and endpoints, remove credentials,
@@ -363,7 +368,10 @@ Each worker service receives:
 
 Production startup rejects a worker database URL supplied only through the
 Swarm environment. The worker reads the bounded mode `0400` secret before
-opening PostgreSQL. Local development may continue using `DATABASE_URL`.
+opening PostgreSQL. Docker secret mounts for the database URL and admission
+token must remain immutable for the full worker process lifetime; rotation
+creates a new generation and restarts the worker instead of modifying a mounted
+secret in place. Local development may continue using `DATABASE_URL`.
 
 The controller verifies the running service has exactly the expected secret,
 identity variables, registration row, consumer ID, image, host, capabilities,

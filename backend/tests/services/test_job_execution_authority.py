@@ -9,8 +9,11 @@ import pytest
 from app.services.job_execution_authority import (
     JobExecutionAuthorityBlocked,
     NodeExecutionClaim,
+    observe_worker_registration_lease,
     require_matching_node_execution_claim,
     require_worker_registration_lease,
+    require_worker_registration_margin,
+    require_worker_task_ack_receipt,
 )
 
 
@@ -84,3 +87,84 @@ async def test_worker_lease_fence_rejects_generationless_claim_without_query() -
 
     with pytest.raises(JobExecutionAuthorityBlocked, match="registration lease"):
         await require_worker_registration_lease(Session(), claim)
+
+
+@pytest.mark.asyncio
+async def test_control_plane_observer_uses_separate_schema_qualified_function() -> None:
+    claim = _claim()
+    calls: list[tuple[str, dict]] = []
+
+    class Session:
+        async def scalar(self, statement, parameters):
+            calls.append((str(statement), dict(parameters)))
+            return True
+
+    await observe_worker_registration_lease(Session(), claim)
+
+    assert len(calls) == 1
+    statement, parameters = calls[0]
+    assert "public.vp_observe_worker_lease" in statement
+    assert "public.vp_require_worker_lease" not in statement
+    assert parameters == {
+        "registration_id": claim.worker_registration_id,
+        "lease_epoch": claim.worker_lease_epoch,
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_submission_margin_uses_database_authoritative_function() -> None:
+    claim = _claim()
+    calls: list[tuple[str, dict]] = []
+
+    class Session:
+        async def scalar(self, statement, parameters):
+            calls.append((str(statement), dict(parameters)))
+            return True
+
+    await require_worker_registration_margin(
+        Session(),
+        claim,
+        minimum_margin_seconds=150,
+    )
+
+    assert len(calls) == 1
+    statement, parameters = calls[0]
+    assert "public.vp_require_worker_lease_margin" in statement
+    assert "clock_timestamp" not in statement
+    assert parameters == {
+        "registration_id": claim.worker_registration_id,
+        "lease_epoch": claim.worker_lease_epoch,
+        "minimum_margin_seconds": 150,
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_task_ack_receipt_binds_exact_delivery_and_claim() -> None:
+    claim = _claim()
+    calls: list[tuple[str, dict]] = []
+
+    class Session:
+        async def scalar(self, statement, parameters):
+            calls.append((str(statement), dict(parameters)))
+            return True
+
+    await require_worker_task_ack_receipt(
+        Session(),
+        claim,
+        redis_stream="vp:tasks:vision",
+        consumer_group="vision-workers",
+        message_id="1710000000000-7",
+    )
+
+    assert len(calls) == 1
+    statement, parameters = calls[0]
+    assert "public.vp_require_worker_task_ack_receipt" in statement
+    assert parameters == {
+        "registration_id": claim.worker_registration_id,
+        "lease_epoch": claim.worker_lease_epoch,
+        "worker_id": claim.worker_id,
+        "worker_started_at": claim.started_at,
+        "redis_stream": "vp:tasks:vision",
+        "consumer_group": "vision-workers",
+        "message_id": "1710000000000-7",
+    }

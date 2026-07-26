@@ -9,6 +9,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +35,7 @@ from app.services.job_execution_authority import (
     require_matching_node_execution_claim,
     require_worker_registration_identity,
     require_worker_registration_lease,
+    require_worker_task_ack_receipt,
 )
 from app.services.worker_admission import (
     WorkerAdmissionError,
@@ -87,9 +89,23 @@ ARTIFACT_DOWNLOAD_MAX_BYTES = int(
 ARTIFACT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = float(
     os.environ.get("VP_ARTIFACT_DOWNLOAD_TOTAL_TIMEOUT_SECONDS", "900")
 )
+REMOTE_ARTIFACT_CLEANUP_TIMEOUT_SECONDS = 15.0
 
 engine_db: AsyncEngine | None = None
 worker_session: async_sessionmaker[AsyncSession] | None = None
+
+
+@dataclass(frozen=True)
+class WorkerTaskDelivery:
+    redis_stream: str
+    consumer_group: str
+    message_id: str
+
+
+_current_task_delivery: ContextVar[WorkerTaskDelivery | None] = ContextVar(
+    "worker_task_delivery",
+    default=None,
+)
 
 
 def configure_worker_database(database_url: str | None = None) -> None:
@@ -312,6 +328,7 @@ async def _persist_artifact_for_current_claim(
     storage_backend: str,
     storage_path: str,
     media_info: dict | None,
+    before_persist: Callable[[], Awaitable[None]] | None = None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> str:
     """Persist an artifact only while its exact worker claim remains authoritative."""
@@ -332,6 +349,10 @@ async def _persist_artifact_for_current_claim(
             require_matching_node_execution_claim(authority, claim)
             if claim.worker_registration_id is not None:
                 await require_worker_registration_lease(db, claim)
+            if before_persist is not None:
+                await before_persist()
+                if claim.worker_registration_id is not None:
+                    await require_worker_registration_lease(db, claim)
             artifact = Artifact(
                 job_id=claim.job_id,
                 node_execution_id=claim.node_execution_id,
@@ -615,20 +636,38 @@ async def process_task(
         # If using remote storage (MinIO), upload the output file unless the handler
         # already persisted the exact object and returned a storage-path override.
         output_storage = get_storage(settings.storage_backend)
+        save_remote_output: Callable[[], Awaitable[None]] | None = None
         if settings.storage_backend != "local" and not skip_upload:
-            remote_output_may_exist = True
-            with open(output_local_path, "rb") as output_file:
-                await output_storage.save(artifact_storage_path, output_file)
+            async def save_remote_output() -> None:
+                nonlocal remote_output_may_exist
+                remote_output_may_exist = True
+                with open(output_local_path, "rb") as output_file:
+                    await output_storage.save(
+                        artifact_storage_path,
+                        output_file,
+                    )
 
-        output_artifact_id = await _persist_artifact_for_current_claim(
-            claim,
-            filename=output_filename,
-            mime_type=_guess_mime(output_ext),
-            file_size=file_size,
-            storage_backend=artifact_storage_backend,
-            storage_path=artifact_storage_path,
-            media_info=artifact_media_info,
-        )
+        if save_remote_output is None:
+            output_artifact_id = await _persist_artifact_for_current_claim(
+                claim,
+                filename=output_filename,
+                mime_type=_guess_mime(output_ext),
+                file_size=file_size,
+                storage_backend=artifact_storage_backend,
+                storage_path=artifact_storage_path,
+                media_info=artifact_media_info,
+            )
+        else:
+            output_artifact_id = await _persist_artifact_for_current_claim(
+                claim,
+                filename=output_filename,
+                mime_type=_guess_mime(output_ext),
+                file_size=file_size,
+                storage_backend=artifact_storage_backend,
+                storage_path=artifact_storage_path,
+                media_info=artifact_media_info,
+                before_persist=save_remote_output,
+            )
         artifact_persisted = True
 
         # Report success
@@ -678,19 +717,35 @@ async def process_task(
             and output_storage is not None
             and artifact_storage_path is not None
         ):
-            try:
-                await output_storage.delete(artifact_storage_path)
-            except Exception:
-                logger.exception(
-                    "Failed to clean uncommitted remote output %s",
-                    artifact_storage_path,
-                )
+            await _cleanup_uncommitted_remote_output(
+                output_storage,
+                artifact_storage_path,
+            )
         # Clean up any temp files downloaded from remote storage
         for tmp in temp_files:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+async def _cleanup_uncommitted_remote_output(
+    storage: StorageBackend,
+    storage_path: str,
+) -> None:
+    try:
+        async with asyncio.timeout(REMOTE_ARTIFACT_CLEANUP_TIMEOUT_SECONDS):
+            await storage.delete(storage_path)
+    except TimeoutError:
+        logger.error(
+            "Timed out cleaning uncommitted remote output %s",
+            storage_path,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to clean uncommitted remote output %s",
+            storage_path,
+        )
 
 
 async def _download_artifact_with_cancel(
@@ -871,7 +926,8 @@ async def _report_success(
                 claim.worker_registration_id
             )
             assert claim.worker_lease_epoch is not None
-            payload["worker_lease_epoch"] = claim.worker_lease_epoch
+            payload["worker_lease_epoch"] = str(claim.worker_lease_epoch)
+            _bind_registered_event_to_task_delivery(payload)
         await _xadd_event_for_claim(r, payload, claim)
     finally:
         await r.aclose()
@@ -898,10 +954,35 @@ async def _report_failure(
                 claim.worker_registration_id
             )
             assert claim.worker_lease_epoch is not None
-            payload["worker_lease_epoch"] = claim.worker_lease_epoch
+            payload["worker_lease_epoch"] = str(claim.worker_lease_epoch)
+            _bind_registered_event_to_task_delivery(payload)
         await _xadd_event_for_claim(r, payload, claim)
     finally:
         await r.aclose()
+
+
+def _bind_registered_event_to_task_delivery(
+    payload: dict[EncodableT, EncodableT],
+) -> None:
+    delivery = _current_task_delivery.get()
+    if delivery is None:
+        raise JobExecutionAuthorityBlocked(
+            "registered worker event has no task delivery"
+        )
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (
+            delivery.redis_stream,
+            delivery.consumer_group,
+            delivery.message_id,
+        )
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "registered worker event task delivery is invalid"
+        )
+    payload["task_stream"] = delivery.redis_stream
+    payload["task_group"] = delivery.consumer_group
+    payload["task_message_id"] = delivery.message_id
 
 
 async def _xadd_event_for_claim(
@@ -1047,33 +1128,43 @@ async def _process_message(
     ):
         return
 
-    heartbeat_task = asyncio.create_task(_heartbeat_message(r, msg_id))
-    claim: NodeExecutionClaim | None = None
-    try:
-        if worker_lease is None:
-            claim = await process_task(data)
-        elif lease_refresher is not None:
-            claim = await process_task(
-                data,
-                worker_lease=worker_lease,
-                lease_refresher=lease_refresher,
-            )
-        else:
-            claim = await process_task(data, worker_lease=worker_lease)
-    except Exception:
-        logger.exception(
-            "Unhandled error processing %s; leaving message pending because no "
-            "durable execution claim is available",
-            msg_id,
+    delivery_token = _current_task_delivery.set(
+        WorkerTaskDelivery(
+            redis_stream=TASK_STREAM,
+            consumer_group=CONSUMER_GROUP,
+            message_id=msg_id,
         )
-    finally:
-        heartbeat_task.cancel()
+    )
+    try:
+        heartbeat_task = asyncio.create_task(_heartbeat_message(r, msg_id))
+        claim: NodeExecutionClaim | None = None
         try:
-            await heartbeat_task
-        except asyncio.CancelledError:
-            pass
-        if claim is not None:
-            await _ack_message_for_claim(r, msg_id, claim)
+            if worker_lease is None:
+                claim = await process_task(data)
+            elif lease_refresher is not None:
+                claim = await process_task(
+                    data,
+                    worker_lease=worker_lease,
+                    lease_refresher=lease_refresher,
+                )
+            else:
+                claim = await process_task(data, worker_lease=worker_lease)
+        except Exception:
+            logger.exception(
+                "Unhandled error processing %s; leaving message pending because no "
+                "durable execution claim is available",
+                msg_id,
+            )
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            if claim is not None:
+                await _ack_message_for_claim(r, msg_id, claim)
+    finally:
+        _current_task_delivery.reset(delivery_token)
 
 
 async def _ack_message_for_claim(
@@ -1084,16 +1175,49 @@ async def _ack_message_for_claim(
     if claim.worker_registration_id is None:
         await redis.xack(TASK_STREAM, CONSUMER_GROUP, message_id)
         return
+    try:
+        async with get_worker_session()() as db:
+            async with db.begin():
+                authority = await lock_job_execution_authority(
+                    db,
+                    claim.job_id,
+                    node_execution_id=claim.node_execution_id,
+                )
+                require_matching_node_execution_claim(authority, claim)
+                await require_worker_registration_lease(db, claim)
+                result = await redis.xack(
+                    TASK_STREAM,
+                    CONSUMER_GROUP,
+                    message_id,
+                )
+                _require_task_xack_result(result)
+        return
+    except JobExecutionAuthorityBlocked:
+        logger.info(
+            "Live lease no longer authorizes task %s XACK; checking receipt",
+            message_id,
+        )
+
     async with get_worker_session()() as db:
         async with db.begin():
-            authority = await lock_job_execution_authority(
+            await require_worker_task_ack_receipt(
                 db,
-                claim.job_id,
-                node_execution_id=claim.node_execution_id,
+                claim,
+                redis_stream=TASK_STREAM,
+                consumer_group=CONSUMER_GROUP,
+                message_id=message_id,
             )
-            require_matching_node_execution_claim(authority, claim)
-            await require_worker_registration_lease(db, claim)
-            await redis.xack(TASK_STREAM, CONSUMER_GROUP, message_id)
+            result = await redis.xack(
+                TASK_STREAM,
+                CONSUMER_GROUP,
+                message_id,
+            )
+            _require_task_xack_result(result)
+
+
+def _require_task_xack_result(result: object) -> None:
+    if type(result) is not int or result not in {0, 1}:
+        raise RuntimeError("Redis worker task acknowledgement result is invalid")
 
 
 def _parse_preferred_hosts(data: dict) -> list[str]:
@@ -1294,40 +1418,59 @@ async def _consume_registered_worker(
 
 async def main() -> None:
     """Main worker loop: consume tasks from Redis Stream."""
-    global WORKER_ID
+    global WORKER_ID, engine_db, worker_session
+    previous_worker_id = WORKER_ID
+    previous_engine_db = engine_db
+    previous_worker_session = worker_session
     env = dict(os.environ)
+    registration: PythonWorkerRegistration | None = None
+    redis: aioredis.Redis | None = None
     try:
-        enforce_worker_admission_from_env()
-        database_url = load_worker_database_url(env)
-        configure_worker_database(database_url)
-        admission_token = load_worker_admission_token(env)
-        registration = await _start_worker_registration(
-            env,
-            database_url,
-            admission_token,
-        )
-    except (
-        WorkerAdmissionError,
-        WorkerSecretError,
-        WorkerRegistrationError,
-        ValueError,
-    ) as exc:
-        logger.critical("Worker admission denied: %s", exc)
-        raise SystemExit(2) from exc
+        try:
+            enforce_worker_admission_from_env()
+            database_url = load_worker_database_url(env)
+            configure_worker_database(database_url)
+            admission_token = load_worker_admission_token(env)
+            registration = await _start_worker_registration(
+                env,
+                database_url,
+                admission_token,
+            )
+        except (
+            WorkerAdmissionError,
+            WorkerSecretError,
+            WorkerRegistrationError,
+            ValueError,
+        ) as exc:
+            logger.critical("Worker admission denied: %s", exc)
+            raise SystemExit(2) from exc
 
-    try:
         WORKER_ID = registration.redis_consumer_id
-        r = _redis()
+        redis = _redis()
         await _run_until_registration_loss(
             registration,
-            _consume_registered_worker(r, registration),
+            _consume_registered_worker(redis, registration),
         )
     finally:
-        if "r" in locals():
-            await r.aclose()
-        await registration.close()
-        if engine_db is not None:
-            await engine_db.dispose()
+        try:
+            if redis is not None:
+                await redis.aclose()
+        finally:
+            try:
+                if registration is not None:
+                    await registration.close()
+            finally:
+                current_engine_db = engine_db
+                try:
+                    if (
+                        current_engine_db is not None
+                        and current_engine_db is not previous_engine_db
+                    ):
+                        await current_engine_db.dispose()
+                finally:
+                    WORKER_ID = previous_worker_id
+                    engine_db = previous_engine_db
+                    worker_session = previous_worker_session
 
 
 if __name__ == "__main__":

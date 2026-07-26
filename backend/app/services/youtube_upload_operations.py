@@ -22,7 +22,10 @@ from app.services.job_execution_authority import (
     require_active_execution_authority,
     require_matching_node_execution_claim,
     require_worker_registration_lease,
+    require_worker_registration_margin,
 )
+
+SUBMISSION_LEASE_MARGIN_SECONDS = 150
 
 
 @dataclass(frozen=True)
@@ -80,9 +83,12 @@ class YouTubeUploadOperationStore:
                     context.execution_claim,
                 )
                 if context.execution_claim.worker_registration_id is not None:
-                    await require_worker_registration_lease(
+                    await require_worker_registration_margin(
                         db,
                         context.execution_claim,
+                        minimum_margin_seconds=(
+                            SUBMISSION_LEASE_MARGIN_SECONDS
+                        ),
                     )
                 token = self._active_submission_fence.set(context)
                 try:

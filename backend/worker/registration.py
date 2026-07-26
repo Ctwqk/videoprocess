@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timezone
 from typing import Protocol
 
 from app.services import worker_registration as registration_contract
@@ -156,6 +155,8 @@ class PythonWorkerRegistration:
         *,
         minimum_margin_seconds: float = 0,
     ) -> WorkerLease:
+        """Refresh the lease; PostgreSQL fences enforce any required margin."""
+        _ = minimum_margin_seconds
         async with self._heartbeat_lock:
             if self._lease is None:
                 raise RuntimeError("worker registration has not started")
@@ -170,14 +171,6 @@ class PythonWorkerRegistration:
                 loss = WorkerRegistrationError("lease_fenced")
                 self._mark_lost(loss)
                 raise loss from exc
-            margin = (
-                _utc(renewed.lease_expires_at)
-                - datetime.now(timezone.utc)
-            ).total_seconds()
-            if margin < minimum_margin_seconds:
-                loss = WorkerRegistrationError("lease_expired")
-                self._mark_lost(loss)
-                raise loss
             self._lease = renewed
             return renewed
 
@@ -241,9 +234,3 @@ def _positive_integer(env: Mapping[str, str], key: str) -> int:
     if not value.isdigit() or int(value) <= 0:
         raise WorkerRegistrationError("claim_mismatch")
     return int(value)
-
-
-def _utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)

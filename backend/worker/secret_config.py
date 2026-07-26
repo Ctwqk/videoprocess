@@ -46,20 +46,31 @@ def read_mode_0400_secret(
             raise WorkerSecretError(f"{label} changed while being opened")
         if metadata.st_size > maximum_bytes:
             raise WorkerSecretError(f"{label} is too large")
+        expected_size = metadata.st_size
         chunks: list[bytes] = []
         length = 0
-        while length <= maximum_bytes:
-            chunk = os.read(
-                descriptor,
-                maximum_bytes + 1 - length,
-            )
+        while length < expected_size:
+            chunk = os.read(descriptor, expected_size - length)
             if not chunk:
-                break
+                raise WorkerSecretError(f"{label} changed while being read")
             chunks.append(chunk)
             length += len(chunk)
+        if os.read(descriptor, 1):
+            raise WorkerSecretError(f"{label} changed while being read")
+
+        final_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(final_metadata.st_mode)
+            or final_metadata.st_dev != metadata.st_dev
+            or final_metadata.st_ino != metadata.st_ino
+            or stat.S_IMODE(final_metadata.st_mode)
+            != stat.S_IMODE(metadata.st_mode)
+            or final_metadata.st_size != metadata.st_size
+            or final_metadata.st_mtime_ns != metadata.st_mtime_ns
+            or final_metadata.st_ctime_ns != metadata.st_ctime_ns
+        ):
+            raise WorkerSecretError(f"{label} changed while being read")
         value = b"".join(chunks)
-        if len(value) > maximum_bytes:
-            raise WorkerSecretError(f"{label} is too large")
     finally:
         os.close(descriptor)
     try:

@@ -68,11 +68,148 @@ async def require_worker_registration_lease(
     )
 
 
+async def observe_worker_registration_lease(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+) -> None:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_observe_worker_lease(
+            :registration_id,
+            :lease_epoch
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+        },
+        error_message="worker registration lease cannot be observed",
+    )
+
+
+async def require_worker_registration_margin(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    minimum_margin_seconds: int,
+) -> None:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    if (
+        type(minimum_margin_seconds) is not int
+        or minimum_margin_seconds <= 0
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "worker registration lease margin is invalid"
+        )
+    await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_require_worker_lease_margin(
+            :registration_id,
+            :lease_epoch,
+            :minimum_margin_seconds
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "minimum_margin_seconds": minimum_margin_seconds,
+        },
+        error_message="worker registration lease margin is insufficient",
+    )
+
+
+async def require_worker_task_ack_receipt(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+    *,
+    redis_stream: str,
+    consumer_group: str,
+    message_id: str,
+) -> None:
+    registration_id, lease_epoch = _validated_registration_claim(claim)
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (
+            claim.worker_id,
+            redis_stream,
+            consumer_group,
+            message_id,
+        )
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "worker task acknowledgement identity is invalid"
+        )
+    await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_require_worker_task_ack_receipt(
+            :registration_id,
+            :lease_epoch,
+            :worker_id,
+            :worker_started_at,
+            :redis_stream,
+            :consumer_group,
+            :message_id
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+            "worker_id": claim.worker_id,
+            "worker_started_at": claim.started_at,
+            "redis_stream": redis_stream,
+            "consumer_group": consumer_group,
+            "message_id": message_id,
+        },
+        error_message=(
+            "worker task acknowledgement has no applied event receipt"
+        ),
+    )
+
+
 async def require_worker_registration_identity(
     db: AsyncSession,
     registration_id: uuid.UUID | None,
     lease_epoch: int | None,
 ) -> None:
+    registration_id, lease_epoch = _validated_registration_identity(
+        registration_id,
+        lease_epoch,
+    )
+    await _call_worker_authority_function(
+        db,
+        """
+        SELECT public.vp_require_worker_lease(
+            :registration_id,
+            :lease_epoch
+        )
+        """,
+        {
+            "registration_id": registration_id,
+            "lease_epoch": lease_epoch,
+        },
+        error_message=(
+            "worker registration lease is no longer authoritative"
+        ),
+    )
+
+
+def _validated_registration_claim(
+    claim: NodeExecutionClaim,
+) -> tuple[uuid.UUID, int]:
+    return _validated_registration_identity(
+        claim.worker_registration_id,
+        claim.worker_lease_epoch,
+    )
+
+
+def _validated_registration_identity(
+    registration_id: uuid.UUID | None,
+    lease_epoch: int | None,
+) -> tuple[uuid.UUID, int]:
     if (
         not isinstance(registration_id, uuid.UUID)
         or type(lease_epoch) is not int
@@ -81,25 +218,20 @@ async def require_worker_registration_identity(
         raise JobExecutionAuthorityBlocked(
             "node execution has no durable worker registration lease"
         )
+    return registration_id, lease_epoch
+
+
+async def _call_worker_authority_function(
+    db: AsyncSession,
+    statement: str,
+    parameters: dict[str, object],
+    *,
+    error_message: str,
+) -> None:
     try:
-        await db.scalar(
-            text(
-                """
-                SELECT public.vp_require_worker_lease(
-                    :registration_id,
-                    :lease_epoch
-                )
-                """
-            ),
-            {
-                "registration_id": registration_id,
-                "lease_epoch": lease_epoch,
-            },
-        )
+        await db.scalar(text(statement), parameters)
     except Exception as exc:
-        raise JobExecutionAuthorityBlocked(
-            "worker registration lease is no longer authoritative"
-        ) from exc
+        raise JobExecutionAuthorityBlocked(error_message) from exc
 
 
 def require_active_execution_authority(

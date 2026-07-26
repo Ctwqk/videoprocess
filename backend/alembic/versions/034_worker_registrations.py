@@ -31,6 +31,14 @@ RELEASE_SIGNATURE = (
     "public.vp_worker_release(uuid,text,uuid,bigint,text,text)"
 )
 REQUIRE_SIGNATURE = "public.vp_require_worker_lease(uuid,bigint)"
+OBSERVER_SIGNATURE = "public.vp_observe_worker_lease(uuid,bigint)"
+MARGIN_SIGNATURE = (
+    "public.vp_require_worker_lease_margin(uuid,bigint,integer)"
+)
+TASK_ACK_SIGNATURE = (
+    "public.vp_require_worker_task_ack_receipt("
+    "uuid,bigint,text,timestamp with time zone,text,text,text)"
+)
 ENDPOINT_FINGERPRINTS_SIGNATURE = (
     "public.vp_worker_endpoint_fingerprints(jsonb)"
 )
@@ -413,17 +421,25 @@ def upgrade() -> None:
         unique=False,
     )
 
+    _create_registered_event_receipt_tables()
+    _create_receipt_immutability_trigger()
     _create_endpoint_fingerprints_function()
     _create_operator_functions()
     _create_register_function()
     _create_heartbeat_function()
     _create_release_function()
     _create_require_function()
+    _create_observer_function()
+    _create_margin_function()
+    _create_task_ack_function()
     for signature in (
         REGISTER_SIGNATURE,
         HEARTBEAT_SIGNATURE,
         RELEASE_SIGNATURE,
         REQUIRE_SIGNATURE,
+        OBSERVER_SIGNATURE,
+        MARGIN_SIGNATURE,
+        TASK_ACK_SIGNATURE,
         ENDPOINT_FINGERPRINTS_SIGNATURE,
         GRANT_UPSERT_SIGNATURE,
         GRANT_ACTIVATE_SIGNATURE,
@@ -432,6 +448,420 @@ def upgrade() -> None:
         REGISTRATION_EXPIRE_SIGNATURE,
     ):
         op.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
+
+
+def _create_registered_event_receipt_tables() -> None:
+    op.create_table(
+        "registered_worker_event_receipts",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column("redis_stream", sa.String(length=255), nullable=False),
+        sa.Column("consumer_group", sa.String(length=255), nullable=False),
+        sa.Column("message_id", sa.String(length=64), nullable=False),
+        sa.Column("payload_sha256", sa.String(length=64), nullable=False),
+        sa.Column(
+            "payload_json",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+        ),
+        sa.Column("event_type", sa.String(length=32), nullable=False),
+        sa.Column(
+            "job_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "node_execution_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "worker_registration_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column("worker_lease_epoch", sa.BigInteger(), nullable=False),
+        sa.Column("worker_id", sa.String(length=255), nullable=False),
+        sa.Column(
+            "worker_started_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "source_task_stream",
+            sa.String(length=255),
+            nullable=False,
+        ),
+        sa.Column(
+            "source_task_group",
+            sa.String(length=255),
+            nullable=False,
+        ),
+        sa.Column(
+            "source_task_message_id",
+            sa.String(length=64),
+            nullable=False,
+        ),
+        sa.Column(
+            "application_state",
+            sa.String(length=16),
+            server_default=sa.text("'accepted'"),
+            nullable=False,
+        ),
+        sa.Column(
+            "ack_state",
+            sa.String(length=16),
+            server_default=sa.text("'pending'"),
+            nullable=False,
+        ),
+        sa.Column(
+            "source_task_ack_state",
+            sa.String(length=16),
+            server_default=sa.text("'pending'"),
+            nullable=False,
+        ),
+        sa.Column(
+            "accepted_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column(
+            "applied_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "acknowledged_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "source_task_acknowledged_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.CheckConstraint(
+            "(length(trim(redis_stream)) > 0 "
+            "AND length(trim(consumer_group)) > 0 "
+            "AND length(trim(message_id)) > 0) IS TRUE",
+            name="ck_registered_worker_event_receipt_redis_identity",
+        ),
+        sa.CheckConstraint(
+            "(payload_sha256 ~ '^[0-9a-f]{64}$') IS TRUE",
+            name="ck_registered_worker_event_receipt_sha256",
+        ),
+        sa.CheckConstraint(
+            "(event_type IN ('node_completed', 'node_failed')) IS TRUE",
+            name="ck_registered_worker_event_receipt_event_type",
+        ),
+        sa.CheckConstraint(
+            "(worker_lease_epoch > 0) IS TRUE",
+            name="ck_registered_worker_event_receipt_epoch",
+        ),
+        sa.CheckConstraint(
+            "(length(trim(worker_id)) > 0 "
+            "AND length(trim(source_task_stream)) > 0 "
+            "AND length(trim(source_task_group)) > 0 "
+            "AND length(trim(source_task_message_id)) > 0) IS TRUE",
+            name="ck_registered_worker_event_receipt_claim_identity",
+        ),
+        sa.CheckConstraint(
+            "(application_state IN ('accepted', 'applied')) IS TRUE",
+            name="ck_registered_worker_event_receipt_application_state",
+        ),
+        sa.CheckConstraint(
+            "(ack_state IN ('pending', 'acknowledged')) IS TRUE",
+            name="ck_registered_worker_event_receipt_ack_state",
+        ),
+        sa.CheckConstraint(
+            "(source_task_ack_state IN "
+            "('pending', 'acknowledged')) IS TRUE",
+            name="ck_registered_worker_event_receipt_task_ack_state",
+        ),
+        sa.CheckConstraint(
+            "((application_state = 'accepted' AND applied_at IS NULL) "
+            "OR (application_state = 'applied' "
+            "AND applied_at IS NOT NULL)) IS TRUE",
+            name="ck_registered_worker_event_receipt_application_time",
+        ),
+        sa.CheckConstraint(
+            "((ack_state = 'pending' AND acknowledged_at IS NULL) "
+            "OR (ack_state = 'acknowledged' "
+            "AND application_state = 'applied' "
+            "AND acknowledged_at IS NOT NULL)) IS TRUE",
+            name="ck_registered_worker_event_receipt_ack_time",
+        ),
+        sa.CheckConstraint(
+            "((source_task_ack_state = 'pending' "
+            "AND source_task_acknowledged_at IS NULL) "
+            "OR (source_task_ack_state = 'acknowledged' "
+            "AND application_state = 'applied' "
+            "AND source_task_acknowledged_at IS NOT NULL)) IS TRUE",
+            name="ck_registered_worker_event_receipt_task_ack_time",
+        ),
+        sa.ForeignKeyConstraint(
+            ["job_id"],
+            ["jobs.id"],
+            name="fk_registered_worker_event_receipts_job_id",
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["node_execution_id"],
+            ["node_executions.id"],
+            name="fk_registered_worker_event_receipts_node_execution_id",
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["worker_registration_id"],
+            ["worker_registrations.id"],
+            name="fk_registered_worker_event_receipts_registration_id",
+            ondelete="RESTRICT",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "redis_stream",
+            "consumer_group",
+            "message_id",
+            name="uq_registered_worker_event_receipt_identity",
+        ),
+        sa.UniqueConstraint(
+            "source_task_stream",
+            "source_task_group",
+            "source_task_message_id",
+            name="uq_registered_worker_event_receipt_source_task",
+        ),
+    )
+    op.create_index(
+        "ix_registered_worker_event_receipts_node_execution_id",
+        "registered_worker_event_receipts",
+        ["node_execution_id"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_registered_worker_event_receipts_worker_registration_id",
+        "registered_worker_event_receipts",
+        ["worker_registration_id"],
+        unique=False,
+    )
+    op.create_index(
+        "ix_registered_worker_event_receipts_source_task",
+        "registered_worker_event_receipts",
+        [
+            "source_task_stream",
+            "source_task_group",
+            "source_task_message_id",
+        ],
+        unique=False,
+    )
+
+    op.create_table(
+        "worker_event_dispatches",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "receipt_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "dispatch_key",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "node_execution_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column("redis_stream", sa.String(length=255), nullable=False),
+        sa.Column("payload_sha256", sa.String(length=64), nullable=False),
+        sa.Column(
+            "payload_json",
+            postgresql.JSONB(astext_type=sa.Text()),
+            nullable=False,
+        ),
+        sa.Column(
+            "delivery_state",
+            sa.String(length=16),
+            server_default=sa.text("'pending'"),
+            nullable=False,
+        ),
+        sa.Column(
+            "redis_message_id",
+            sa.String(length=64),
+            nullable=True,
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column(
+            "delivered_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.CheckConstraint(
+            "(length(trim(redis_stream)) > 0) IS TRUE",
+            name="ck_worker_event_dispatch_stream",
+        ),
+        sa.CheckConstraint(
+            "(payload_sha256 ~ '^[0-9a-f]{64}$') IS TRUE",
+            name="ck_worker_event_dispatch_sha256",
+        ),
+        sa.CheckConstraint(
+            "(delivery_state IN ('pending', 'delivered')) IS TRUE",
+            name="ck_worker_event_dispatch_state",
+        ),
+        sa.CheckConstraint(
+            "((delivery_state = 'pending' "
+            "AND redis_message_id IS NULL AND delivered_at IS NULL) "
+            "OR (delivery_state = 'delivered' "
+            "AND redis_message_id IS NOT NULL "
+            "AND delivered_at IS NOT NULL)) IS TRUE",
+            name="ck_worker_event_dispatch_delivery",
+        ),
+        sa.ForeignKeyConstraint(
+            ["receipt_id"],
+            ["registered_worker_event_receipts.id"],
+            name="fk_worker_event_dispatches_receipt_id",
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["node_execution_id"],
+            ["node_executions.id"],
+            name="fk_worker_event_dispatches_node_execution_id",
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "dispatch_key",
+            name="uq_worker_event_dispatch_key",
+        ),
+        sa.UniqueConstraint(
+            "receipt_id",
+            "node_execution_id",
+            name="uq_worker_event_dispatch_receipt_node",
+        ),
+    )
+    op.create_index(
+        "ix_worker_event_dispatches_receipt_id",
+        "worker_event_dispatches",
+        ["receipt_id"],
+        unique=False,
+    )
+
+
+def _create_receipt_immutability_trigger() -> None:
+    op.execute(
+        """
+CREATE FUNCTION public.vp_enforce_worker_event_receipt_immutability()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+    IF ROW(
+        NEW.id,
+        NEW.redis_stream,
+        NEW.consumer_group,
+        NEW.message_id,
+        NEW.payload_sha256,
+        NEW.payload_json,
+        NEW.event_type,
+        NEW.job_id,
+        NEW.node_execution_id,
+        NEW.worker_registration_id,
+        NEW.worker_lease_epoch,
+        NEW.worker_id,
+        NEW.worker_started_at,
+        NEW.source_task_stream,
+        NEW.source_task_group,
+        NEW.source_task_message_id,
+        NEW.accepted_at
+    ) IS DISTINCT FROM ROW(
+        OLD.id,
+        OLD.redis_stream,
+        OLD.consumer_group,
+        OLD.message_id,
+        OLD.payload_sha256,
+        OLD.payload_json,
+        OLD.event_type,
+        OLD.job_id,
+        OLD.node_execution_id,
+        OLD.worker_registration_id,
+        OLD.worker_lease_epoch,
+        OLD.worker_id,
+        OLD.worker_started_at,
+        OLD.source_task_stream,
+        OLD.source_task_group,
+        OLD.source_task_message_id,
+        OLD.accepted_at
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'receipt_facts_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    IF OLD.application_state = 'applied'
+       AND (
+           NEW.application_state IS DISTINCT FROM OLD.application_state
+           OR NEW.applied_at IS DISTINCT FROM OLD.applied_at
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'receipt_application_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    IF OLD.ack_state = 'acknowledged'
+       AND (
+           NEW.ack_state IS DISTINCT FROM OLD.ack_state
+           OR NEW.acknowledged_at IS DISTINCT FROM OLD.acknowledged_at
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'receipt_ack_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    IF OLD.source_task_ack_state = 'acknowledged'
+       AND (
+           NEW.source_task_ack_state
+               IS DISTINCT FROM OLD.source_task_ack_state
+           OR NEW.source_task_acknowledged_at
+               IS DISTINCT FROM OLD.source_task_acknowledged_at
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'receipt_task_ack_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    RETURN NEW;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE TRIGGER trg_worker_event_receipt_immutability
+BEFORE UPDATE ON public.registered_worker_event_receipts
+FOR EACH ROW
+EXECUTE FUNCTION public.vp_enforce_worker_event_receipt_immutability()
+"""
+    )
+    op.execute(
+        "REVOKE ALL ON FUNCTION "
+        "public.vp_enforce_worker_event_receipt_immutability() FROM PUBLIC"
+    )
 
 
 def _create_endpoint_fingerprints_function() -> None:
@@ -1650,8 +2080,223 @@ $function$
     )
 
 
+def _create_observer_function() -> None:
+    op.execute(
+        """
+CREATE FUNCTION public.vp_observe_worker_lease(
+    p_registration_id uuid,
+    p_lease_epoch bigint
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_registration public.worker_registrations%ROWTYPE;
+    v_now timestamptz;
+BEGIN
+    IF p_registration_id IS NULL OR p_lease_epoch IS NULL THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    v_now := pg_catalog.clock_timestamp();
+
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id;
+
+    IF NOT FOUND
+       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_registration.status IS DISTINCT FROM 'active'
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'lease_fenced',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.lease_expires_at <= v_now THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'lease_expired',
+            ERRCODE = 'P0001';
+    END IF;
+END;
+$function$
+"""
+    )
+
+
+def _create_margin_function() -> None:
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_require_worker_lease_margin(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_minimum_margin_seconds integer
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration public.worker_registrations%ROWTYPE;
+    v_now timestamptz;
+BEGIN
+    IF p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+       OR p_minimum_margin_seconds IS NULL
+       OR p_minimum_margin_seconds <= 0
+       OR p_minimum_margin_seconds > 3600
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    v_now := pg_catalog.clock_timestamp();
+
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id;
+
+    IF NOT FOUND
+       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
+       OR v_registration.status IS DISTINCT FROM 'active'
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'lease_fenced',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.database_principal IS DISTINCT FROM v_principal THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.lease_expires_at
+       < v_now + pg_catalog.make_interval(
+            secs => p_minimum_margin_seconds
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'lease_margin_insufficient',
+            ERRCODE = 'P0001';
+    END IF;
+END;
+$function$
+"""
+    )
+
+
+def _create_task_ack_function() -> None:
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_require_worker_task_ack_receipt(
+    p_registration_id uuid,
+    p_lease_epoch bigint,
+    p_worker_id text,
+    p_worker_started_at timestamptz,
+    p_redis_stream text,
+    p_consumer_group text,
+    p_message_id text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration public.worker_registrations%ROWTYPE;
+BEGIN
+    IF p_registration_id IS NULL
+       OR p_lease_epoch IS NULL
+       OR p_worker_id IS NULL
+       OR p_worker_started_at IS NULL
+       OR p_redis_stream IS NULL
+       OR p_consumer_group IS NULL
+       OR p_message_id IS NULL
+       OR length(trim(p_worker_id)) = 0
+       OR length(trim(p_redis_stream)) = 0
+       OR length(trim(p_consumer_group)) = 0
+       OR length(trim(p_message_id)) = 0
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id;
+
+    IF NOT FOUND
+       OR v_registration.lease_epoch IS DISTINCT FROM p_lease_epoch
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'lease_fenced',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.database_principal IS DISTINCT FROM v_principal THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM public.registered_worker_event_receipts AS receipt
+        WHERE receipt.worker_registration_id = p_registration_id
+          AND receipt.worker_lease_epoch = p_lease_epoch
+          AND receipt.worker_id = p_worker_id
+          AND receipt.worker_started_at = p_worker_started_at
+          AND receipt.source_task_stream = p_redis_stream
+          AND receipt.source_task_group = p_consumer_group
+          AND receipt.source_task_message_id = p_message_id
+          AND receipt.application_state = 'applied'
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'event_receipt_missing',
+            ERRCODE = 'P0001';
+    END IF;
+END;
+$function$
+"""
+    )
+
+
 def downgrade() -> None:
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_worker_event_receipt_immutability "
+        "ON public.registered_worker_event_receipts"
+    )
+    op.execute(
+        "DROP FUNCTION IF EXISTS "
+        "public.vp_enforce_worker_event_receipt_immutability()"
+    )
     for signature in (
+        TASK_ACK_SIGNATURE,
+        MARGIN_SIGNATURE,
+        OBSERVER_SIGNATURE,
         REQUIRE_SIGNATURE,
         RELEASE_SIGNATURE,
         HEARTBEAT_SIGNATURE,
@@ -1664,6 +2309,25 @@ def downgrade() -> None:
         ENDPOINT_FINGERPRINTS_SIGNATURE,
     ):
         op.execute(f"DROP FUNCTION IF EXISTS {signature}")
+
+    op.drop_index(
+        "ix_worker_event_dispatches_receipt_id",
+        table_name="worker_event_dispatches",
+    )
+    op.drop_table("worker_event_dispatches")
+    op.drop_index(
+        "ix_registered_worker_event_receipts_source_task",
+        table_name="registered_worker_event_receipts",
+    )
+    op.drop_index(
+        "ix_registered_worker_event_receipts_worker_registration_id",
+        table_name="registered_worker_event_receipts",
+    )
+    op.drop_index(
+        "ix_registered_worker_event_receipts_node_execution_id",
+        table_name="registered_worker_event_receipts",
+    )
+    op.drop_table("registered_worker_event_receipts")
 
     op.drop_index(
         "ix_node_executions_worker_registration_id",
