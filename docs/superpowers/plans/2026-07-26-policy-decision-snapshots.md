@@ -40,7 +40,9 @@ Require all columns, foreign keys, checks, and unique indexes from the design.
 Create a legacy tick fixture before applying revision 034 and assert the
 forward migration sets only that row to `legacy_unreplayable`. Assert policy
 status, activation mode, rollout range, replay status, and snapshot decision
-checks reject unsupported values.
+checks reject unsupported values. Against PostgreSQL 16, assert update and
+delete attempts on each immutable table fail while revision downgrade can
+remove its own immutability triggers and objects.
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
@@ -58,7 +60,7 @@ Expected: fail because revision 034 and model classes do not exist.
 - [ ] **Step 3: Implement revision 034 and ORM models**
 
 Use additive tables/columns. Make `decision_policy_versions` and
-`candidate_feature_snapshots` append-only by application contract. Add:
+`candidate_feature_snapshots` append-only with PostgreSQL trigger guards. Add:
 
 ```text
 decision_policy_versions:
@@ -71,12 +73,17 @@ policy_activation_history:
   check mode in off/shadow/canary/active
   check rollout_percentage between 0 and 100
   effective_to must be null or after effective_from
+  update/delete trigger raises immutable_policy_fact
 
 candidate_feature_snapshots:
   unique(tick_audit_id, candidate_id, feature_schema_version)
   foreign keys to tick and policy
   required feature_as_of, candidate_set_hash, feature_hash, and JSON facts
+  update/delete trigger raises immutable_policy_fact
 ```
+
+Apply the same trigger function to `decision_policy_versions`. Drop all three
+triggers before dropping the shared function during downgrade.
 
 Extend audits with nullable foreign keys and hash/score/rank/decision fields.
 Set existing ticks to `legacy_unreplayable`; leave existing decisions'
@@ -197,6 +204,8 @@ git commit -m "feat(channelops): build deterministic policy snapshots"
 - Modify: `internal/channelops/store_tick.go`
 - Modify: `internal/channelops/store_tick_test.go`
 - Modify: `internal/channelops/integration_test.go`
+- Modify: `internal/channelops/cleanup.go`
+- Modify: `internal/channelops/cleanup_test.go`
 
 **Interfaces:**
 - Consumes `PolicyVersion` and `SnapshotSet` from Task 2.
@@ -218,6 +227,8 @@ Require:
 - selected IDs, rejected IDs, task count, dry-run behavior, and task payloads
   match the pre-change fixture;
 - transaction failure leaves no policy, snapshot, decision, or task partials.
+- retention cleanup still deletes expired legacy ticks but preserves every
+  `snapshot_complete` tick and its candidate snapshots.
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
@@ -233,7 +244,8 @@ Resolve the policy with insert-on-conflict followed by exact content/hash
 verification. Insert the tick audit as pending, persist all candidate
 snapshots, insert linked decision rows, create the unchanged tasks, and mark
 the tick complete in the same fenced transaction. Enforce snapshot cardinality
-before commit.
+before commit. Restrict audit cleanup to `legacy_unreplayable` rows so immutable
+replay facts are retained.
 
 - [ ] **Step 4: Run focused, full, and race tests**
 
@@ -253,7 +265,9 @@ git add internal/channelops/store_policy_snapshots.go \
   internal/channelops/store_tasks.go \
   internal/channelops/store_tick.go \
   internal/channelops/store_tick_test.go \
-  internal/channelops/integration_test.go
+  internal/channelops/integration_test.go \
+  internal/channelops/cleanup.go \
+  internal/channelops/cleanup_test.go
 git commit -m "feat(channelops): persist complete decision snapshots"
 ```
 

@@ -76,7 +76,9 @@ Each row is immutable after creation.
 - `created_at`: immutable creation time.
 
 `(policy_key, version)` is unique. Reusing a version with different semantic
-content fails closed. No application update or delete path is provided.
+content fails closed. PostgreSQL rejects updates and deletes after insertion;
+retirement is represented by a newer policy/activation fact rather than
+rewriting the old row.
 
 ### `policy_activation_history`
 
@@ -91,8 +93,9 @@ this increment.
 - previous activation;
 - request ID, actor, reason, rollback reason, and feature-flag snapshot.
 
-Rows are append-only. No mutation API is introduced now. Read APIs may return
-an empty history and effective mode `off`.
+Rows are append-only and PostgreSQL rejects updates and deletes. No mutation API
+is introduced now. Read APIs may return an empty history and effective mode
+`off`.
 
 ### `candidate_feature_snapshots`
 
@@ -110,6 +113,7 @@ tick.
 - candidate-set hash and per-feature hash.
 
 `(tick_audit_id, candidate_id, feature_schema_version)` is unique.
+PostgreSQL rejects updates and deletes after insertion.
 
 ### Existing audit extensions
 
@@ -124,6 +128,11 @@ computed remain nullable or neutral; they must not be fabricated.
 Existing rows are backfilled with `replay_status=legacy_unreplayable`. New rows
 are `snapshot_complete` only after all candidate snapshots and decision links
 are persisted in the same transaction.
+
+The existing audit cleanup keeps its current retention behavior for legacy
+unreplayable ticks, but it must not delete `snapshot_complete` ticks or their
+candidate facts. Policy, activation, and replayable decision evidence is
+retained permanently in this phase.
 
 ## Deterministic Encoding
 
