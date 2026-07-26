@@ -28,6 +28,14 @@ unproven; commit e1c5f0f)
 Task 2: minor (deferred): preferred affinity reclaim processes the reclaimed
 task inline, reducing consumer-loop fairness while claim fencing preserves
 authority safety.
+Task 2: fix round 5/5 (6 findings addressed, 1 open — Task 4 still lacks a
+concrete Redis event-marker continuity readiness executable, exact
+database-proof/principal marker janitor, recurring schedule, and conservative
+operator repair command; commit 69d65cb)
+Task 2: BLOCKED — the remaining Redis event-marker lifecycle finding is real
+and load-bearing for Task 3/Task 4. The five-round breaker has tripped; do not
+dispatch more fixes or build downstream worker/deployment work on this
+incomplete idempotency protocol without explicit human direction.
 Task 3: pending
 Task 4: pending
 Task 5: pending
