@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,6 +20,12 @@ READY_RESULT = {
         "artifact_api": "not_required",
     },
 }
+READY_STDOUT = (
+    '{"components":{"artifact_api":"not_required","minio":"ready",'
+    '"scratch":"ready"},"status":"ready"}\n'
+)
+MINIO_FAILURE_STDOUT = '{"code":"minio_unavailable","status":"failed"}\n'
+INVALID_ARGUMENTS_STDOUT = '{"code":"invalid_arguments","status":"failed"}\n'
 
 
 def _payload(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
@@ -38,7 +46,9 @@ async def test_run_emits_ready_payload_by_default(
     assert await cli.run([]) == 0
 
     probe.assert_awaited_once_with(os.environ, require_artifact_api=False)
-    assert _payload(capsys) == READY_RESULT
+    captured = capsys.readouterr()
+    assert captured.out == READY_STDOUT
+    assert captured.err == ""
 
 
 @pytest.mark.asyncio
@@ -73,10 +83,28 @@ async def test_run_sanitizes_readiness_failure(
 
     assert await cli.run([]) == 3
 
-    assert _payload(capsys) == {
-        "status": "failed",
-        "code": "minio_unavailable",
-    }
+    captured = capsys.readouterr()
+    assert captured.out == MINIO_FAILURE_STDOUT
+    assert captured.err == ""
+
+
+@pytest.mark.asyncio
+async def test_run_rejects_unknown_sensitive_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sensitive_url = "https://user:password@example.test/private"
+    probe = AsyncMock()
+    monkeypatch.setattr(cli, "probe_worker_storage", probe)
+
+    assert await cli.run(["--unsupported", sensitive_url]) == 3
+
+    captured = capsys.readouterr()
+    assert captured.out == INVALID_ARGUMENTS_STDOUT
+    assert captured.err == ""
+    assert sensitive_url not in captured.out + captured.err
+    assert "password" not in captured.out + captured.err
+    probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -98,3 +126,26 @@ async def test_run_sanitizes_unexpected_exception(
     assert captured.err == ""
     assert url not in captured.out + captured.err
     assert "password" not in captured.out + captured.err
+
+
+def test_module_rejects_unknown_sensitive_arguments_without_leaking() -> None:
+    sensitive_url = "https://user:password@example.test/private"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.channel_agent.worker_storage_readiness_cli",
+            "--unsupported",
+            sensitive_url,
+        ],
+        cwd="/Users/wenjieliu/videoprocess/backend",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 3
+    assert result.stdout == INVALID_ARGUMENTS_STDOUT
+    assert result.stderr == ""
+    assert sensitive_url not in result.stdout + result.stderr
+    assert "password" not in result.stdout + result.stderr
