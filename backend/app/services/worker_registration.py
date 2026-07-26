@@ -47,6 +47,14 @@ _COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _IMAGE_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._/-]*:deploy-[0-9a-f]{12}$"
 )
+_DEPENDENCY_NAME_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$",
+    re.ASCII,
+)
+_DNS_LABEL_PATTERN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+    re.ASCII,
+)
 _LOCAL_HOSTS = frozenset(
     {"", "localhost", "127.0.0.1", "0.0.0.0", "::1"}
 )
@@ -861,7 +869,10 @@ def _validated_redis_binding(value: object) -> dict[str, object]:
         {"database", "host", "port", "scheme"},
     )
     database = binding["database"]
-    if type(database) is not int or database < 0:
+    if (
+        type(database) is not int
+        or not 0 <= database <= 2147483647
+    ):
         raise WorkerRegistrationError("claim_mismatch")
     scheme = binding["scheme"]
     if scheme not in {"redis", "rediss"}:
@@ -907,17 +918,20 @@ def _exact_mapping(
 
 def _dependency_name(value: object) -> str:
     name = _exact_nonempty(value, 255)
-    if name is None or "/" in name:
+    if (
+        name is None
+        or _DEPENDENCY_NAME_PATTERN.fullmatch(name) is None
+    ):
         raise WorkerRegistrationError("claim_mismatch")
     return name
 
 
 def _dependency_host(value: object) -> str:
-    host = _exact_nonempty(value, 255)
+    host = _exact_nonempty(value, 253)
     if (
         host is None
         or host != _normalized_host(host)
-        or _is_local_host(host)
+        or not _is_valid_dependency_host(host)
     ):
         raise WorkerRegistrationError("claim_mismatch")
     return host
@@ -942,9 +956,10 @@ def _database_identity(env: Mapping[str, str]) -> dict[str, object]:
     if (
         driver not in {"postgres", "postgresql"}
         or not host
-        or _is_local_host(host)
-        or not database
-        or "/" in database
+        or not _is_valid_dependency_host(host)
+        or _DEPENDENCY_NAME_PATTERN.fullmatch(database) is None
+        or port is not None
+        and not 1 <= port <= 65535
     ):
         raise ValueError("invalid database dependency")
     return {
@@ -968,8 +983,11 @@ def _redis_identity(env: Mapping[str, str]) -> dict[str, object]:
     if (
         scheme not in {"redis", "rediss"}
         or not host
-        or _is_local_host(host)
+        or not _is_valid_dependency_host(host)
+        or port is not None
+        and not 1 <= port <= 65535
         or (path and (not path.isdigit() or "/" in path))
+        or int(path or "0") > 2147483647
     ):
         raise ValueError("invalid Redis dependency")
     return {
@@ -999,13 +1017,15 @@ def _storage_identity(env: Mapping[str, str]) -> dict[str, object]:
     if (
         parsed.scheme not in {"http", "https"}
         or not host
-        or _is_local_host(host)
+        or not _is_valid_dependency_host(host)
+        or port is not None
+        and not 1 <= port <= 65535
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
-        or not bucket
+        or _DEPENDENCY_NAME_PATTERN.fullmatch(bucket) is None
     ):
         raise ValueError("invalid storage dependency")
     return {
@@ -1040,14 +1060,33 @@ def _normalized_host(host: str | None) -> str:
     return (host or "").strip("[]").lower().removesuffix(".")
 
 
-def _is_local_host(host: str) -> bool:
-    if host in _LOCAL_HOSTS:
-        return True
-    try:
-        address = ip_address(host)
-    except ValueError:
+def _is_valid_dependency_host(host: str) -> bool:
+    if (
+        not host
+        or len(host) > 253
+        or not host.isascii()
+        or host != host.lower()
+        or host.endswith(".")
+        or ":" in host
+    ):
         return False
-    return address.is_loopback or address.is_unspecified
+    if host.replace(".", "").isdigit():
+        try:
+            address = ip_address(host)
+        except ValueError:
+            return False
+        return (
+            address.version == 4
+            and str(address) == host
+            and not address.is_loopback
+            and not address.is_unspecified
+        )
+    if host in _LOCAL_HOSTS:
+        return False
+    return all(
+        _DNS_LABEL_PATTERN.fullmatch(label) is not None
+        for label in host.split(".")
+    )
 
 
 def _utc(value: datetime) -> datetime:

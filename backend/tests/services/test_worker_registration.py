@@ -46,6 +46,9 @@ FINGERPRINT_FIXTURE = (
 )
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
 FINGERPRINT_CASES = json.loads(FINGERPRINT_FIXTURE.read_text())["cases"]
+ENDPOINT_VALIDATION_CASES = json.loads(FINGERPRINT_FIXTURE.read_text())[
+    "endpoint_validation_cases"
+]
 MINIO_FINGERPRINT_CASE = next(
     case for case in FINGERPRINT_CASES if case["name"] == "minio"
 )
@@ -581,6 +584,59 @@ def test_dependency_fingerprints_match_cross_language_fixture() -> None:
             for key, secret in case["env"].items()
             if "SECRET" in key or key.endswith("_URL")
         )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ENDPOINT_VALIDATION_CASES,
+    ids=lambda case: case["name"],
+)
+async def test_endpoint_canonicalization_matches_shared_fixture(
+    registration_store,
+    case: dict[str, object],
+) -> None:
+    bindings = json.loads(json.dumps(ENDPOINT_BINDINGS))
+    if "bindings" in case:
+        bindings = case["bindings"]
+    elif "replace" in case:
+        dependency, field_name, value = case["replace"]
+        bindings[dependency][field_name] = value
+    elif "extra" in case:
+        dependency, field_name, value = case["extra"]
+        bindings[dependency][field_name] = value
+
+    await _grant(
+        registration_store,
+        endpoint_bindings=bindings,
+    )
+    service = _service(registration_store, MutableClock())
+    fingerprints = case.get("sha256")
+    if fingerprints is None:
+        fingerprints = {
+            name: hashlib.sha256(
+                json.dumps(
+                    identity,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            for name, identity in bindings.items()
+        }
+    registration = service.register(
+        _claims(
+            endpoint_bindings=bindings,
+            database_fingerprint=fingerprints["database"],
+            redis_fingerprint=fingerprints["redis"],
+            storage_fingerprint=fingerprints["storage"],
+        ),
+        ADMISSION_TOKEN,
+    )
+    if case["accepted"]:
+        lease = await registration
+        assert lease.lease_epoch == 1
+    else:
+        await _assert_error("claim_mismatch", registration)
 
 
 @pytest.mark.parametrize(

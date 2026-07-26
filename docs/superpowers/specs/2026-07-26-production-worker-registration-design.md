@@ -194,6 +194,19 @@ registration-exclusive lock before takeover. `vp_worker_release` takes the
 registration-exclusive lock before mutation. Grant activation/revocation and
 operator registration revocation must follow the same order.
 
+Routine grant and registration lifecycle changes use only the schema-qualified
+`public.vp_worker_grant_upsert`, `public.vp_worker_grant_activate`,
+`public.vp_worker_grant_revoke`, `public.vp_worker_registration_revoke`, and
+`public.vp_worker_registration_expire` functions. Each is `SECURITY DEFINER`
+with `search_path=pg_catalog`, has no `PUBLIC` execution, takes the
+service-exclusive lock and every affected registration-exclusive lock before
+row locks or mutation, and returns only sanitized identifiers or booleans.
+The versioned deployment operator principal receives exact `EXECUTE` grants on
+these functions and no direct grant/registration table privilege. Automation,
+including replacement-generation rollback, principal retirement, and expiry
+cleanup, must use this surface. Table-owner writes are a manual, audited
+break-glass procedure only and are never available to deployment automation.
+
 `vp_require_worker_lease` and `vp_worker_heartbeat` take a
 registration-scoped shared transaction lock. Require then reads and validates
 without `FOR UPDATE`; heartbeat remains compatible with a held require fence.
@@ -282,8 +295,9 @@ deployment order becomes:
 3. verify migration head;
 4. create a versioned non-owner PostgreSQL login principal for each worker
    service and mount its database URL as a Docker secret;
-5. issue pending generation-scoped grants and admission Docker secrets;
-6. activate exact grants through the new Python grant CLI;
+5. issue pending generation-scoped grants and admission Docker secrets through
+   the restricted operator function surface;
+6. activate exact grants through the new Python operator CLI;
 7. update and verify the managed workers;
 8. revoke the replaced login principals;
 9. continue runner and remaining service convergence.
@@ -308,6 +322,13 @@ table grants or default privileges.
 Schema migration/DCL uses the protected deploy-migrator credential. Migration
 head and readiness probes use a separate deploy-read credential. Neither
 credential is mounted into a worker.
+
+A separate versioned `LOGIN` deployment operator principal owns no objects and
+has no direct grant/registration table access. It can execute only the five
+worker operator functions required for grant and registration lifecycle
+mutations. Replacement runtime-role revocation occurs only after the operator
+surface has fenced and revoked the replaced grant/registration; role DCL never
+substitutes for that durable mutation.
 
 Each worker service receives:
 

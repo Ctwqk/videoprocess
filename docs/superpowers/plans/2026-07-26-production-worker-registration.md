@@ -322,8 +322,8 @@ git commit -m "feat(workers): register go consumer before redis"
 ### Task 4: Provision Grants And Secrets During Deployment
 
 **Files:**
-- Create: `backend/app/services/worker_registration_grant_cli.py`
-- Create: `backend/tests/services/test_worker_registration_grant_cli.py`
+- Create: `backend/app/services/worker_registration_operator_cli.py`
+- Create: `backend/tests/services/test_worker_registration_operator_cli.py`
 - Create: `backend/app/services/worker_runtime_role_cli.py`
 - Create: `backend/tests/services/test_worker_runtime_role_cli.py`
 - Modify: `deploy/swarm/deploy-sync-extension.sh`
@@ -332,8 +332,14 @@ git commit -m "feat(workers): register go consumer before redis"
 - Modify: `backend/Dockerfile.worker`
 
 **Interfaces:**
-- Produces `python -m app.services.worker_registration_grant_cli upsert`.
+- Produces
+  `python -m app.services.worker_registration_operator_cli upsert|activate|revoke-grant|revoke-registration|expire-registration`.
 - Produces `python -m app.services.worker_runtime_role_cli provision|revoke`.
+- Uses only `public.vp_worker_grant_upsert`,
+  `public.vp_worker_grant_activate`, `public.vp_worker_grant_revoke`,
+  `public.vp_worker_registration_revoke`, and
+  `public.vp_worker_registration_expire` for routine protected-table
+  mutations.
 - Produces service credential state below
   `$DEPLOY_GITHUB_SYNC_ROOT/state/vp-worker-admission/`.
 - Produces service secret target
@@ -363,13 +369,24 @@ The allowlist is `SELECT` on `jobs`, `node_executions`, `artifacts`,
 `alembic_version`, all direct grant/registration table access, privileged role
 membership, and ownership. Use separate deploy-migrator and deploy-read
 credentials; neither may be mounted into workers.
+Create a versioned non-owner operator `LOGIN` principal with exact `EXECUTE`
+on the five schema-qualified operator functions and no direct table or column
+read/write privileges. Exercise pending upsert, activation, grant revocation,
+operator registration revocation, and expiry through that principal. For each
+mutation, hold `public.vp_require_worker_lease` open in another transaction and
+prove the CLI waits until the shared fence ends. Prove replacement-generation
+and rollback role retirement waits for fenced grant/registration revocation
+before role DCL, emits only stable sanitized errors, and never returns or logs
+token hashes, lease hashes, admission tokens, or database passwords. Direct
+table-owner writes are documented and tested as manual break-glass only; no
+automation path may invoke them.
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
 ```bash
 cd backend
 /Users/wenjieliu/videoprocess/backend/.venv/bin/python -m pytest \
-  tests/services/test_worker_registration_grant_cli.py \
+  tests/services/test_worker_registration_operator_cli.py \
   tests/services/test_worker_runtime_role_cli.py -q
 cd ..
 bash tests/test_vp_deploy_sync_extension.sh
@@ -383,17 +400,23 @@ Run backend migration and verify head before updating workers. Embed the exact
 40-character commit in both worker images. Create a stable `NOLOGIN` worker
 runtime role with an explicit privilege allowlist, then create a fresh
 service/generation `LOGIN` role with a random password and no object ownership.
-Create pending grant and credential state atomically with `umask 077`; create
+Create pending grant through `public.vp_worker_grant_upsert` and credential
+state atomically with `umask 077`; create
 generation-scoped database URL and admission Swarm secrets from stdin without
 echoing them. Mount only that service's secrets with mode `0400` and inject
 `WORKER_SERVICE_NAME`, `WORKER_RELEASE_COMMIT`, `WORKER_IMAGE_IDENTITY`,
 `WORKER_CAPABILITIES`, `WORKER_REDIS_STREAM`, `WORKER_REDIS_GROUP`, and
 the two secret file paths. Remove `DATABASE_URL` from the production service
-environment. Activate the hashed grant through the Python worker image. After
-service convergence, query registration readiness through a sanitized CLI and
-revoke the replaced login role. On failure, issue and activate a fresh
-prior-image generation with a fresh database principal before entering the
-existing rollback path; never reuse failed credentials.
+environment. Activate the hashed grant through
+`public.vp_worker_grant_activate`. After service convergence, query
+registration readiness through a sanitized CLI, fence and revoke the replaced
+grant/registration through the operator surface, and only then revoke the
+replaced login role. Expiry cleanup uses
+`public.vp_worker_registration_expire`. On failure, issue and activate a fresh
+prior-image generation with a fresh database principal through the same
+surface before entering the existing rollback path; never reuse failed
+credentials. The operator principal has exact function execution and no direct
+protected-table writes; table-owner mutation is break-glass only.
 Keep migration `034` additive during image rollback; downgrade is permitted
 only after all registration-aware clients have been removed.
 
@@ -402,7 +425,7 @@ only after all registration-aware clients have been removed.
 ```bash
 cd backend
 /Users/wenjieliu/videoprocess/backend/.venv/bin/python -m pytest \
-  tests/services/test_worker_registration_grant_cli.py \
+  tests/services/test_worker_registration_operator_cli.py \
   tests/services/test_worker_runtime_role_cli.py -q
 cd ..
 bash tests/test_vp_deploy_sync_extension.sh
@@ -415,8 +438,8 @@ Expected: pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add backend/app/services/worker_registration_grant_cli.py \
-  backend/tests/services/test_worker_registration_grant_cli.py \
+git add backend/app/services/worker_registration_operator_cli.py \
+  backend/tests/services/test_worker_registration_operator_cli.py \
   backend/app/services/worker_runtime_role_cli.py \
   backend/tests/services/test_worker_runtime_role_cli.py \
   deploy/swarm/deploy-sync-extension.sh \

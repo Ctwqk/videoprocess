@@ -41,5 +41,123 @@
         "storage": "3eb7b57334f3074c4d4b4602bb9133ddbcac4a70072c8fe5a5f7e7287f74047b"
       }
     }
+  ],
+  "endpoint_validation_cases": [
+    {
+      "name": "ascii_ipv4_and_numeric_edges",
+      "accepted": true,
+      "bindings": {
+        "database": {
+          "database": "db_1",
+          "driver": "postgresql",
+          "host": "10.20.30.40",
+          "port": 1
+        },
+        "redis": {
+          "database": 2147483647,
+          "host": "redis-1.example.com",
+          "port": 65535,
+          "scheme": "rediss"
+        },
+        "storage": {
+          "backend": "not_applicable"
+        }
+      },
+      "canonical": {
+        "database": "{\"database\":\"db_1\",\"driver\":\"postgresql\",\"host\":\"10.20.30.40\",\"port\":1}",
+        "redis": "{\"database\":2147483647,\"host\":\"redis-1.example.com\",\"port\":65535,\"scheme\":\"rediss\"}",
+        "storage": "{\"backend\":\"not_applicable\"}"
+      },
+      "sha256": {
+        "database": "ebc69317bc9f03377ceae84b460621f4f46753f3e1597b852f1047b8dc18b655",
+        "redis": "caa48853e8cc71c9cfca9c02668ee9c2f5ea805702ecf969214fd226d11f8b0d",
+        "storage": "3eb7b57334f3074c4d4b4602bb9133ddbcac4a70072c8fe5a5f7e7287f74047b"
+      }
+    },
+    {
+      "name": "unicode_database",
+      "accepted": false,
+      "replace": ["database", "database", "video_unicode_\u00e9"]
+    },
+    {
+      "name": "unicode_host",
+      "accepted": false,
+      "replace": ["database", "host", "d\u00e9pendance.example"]
+    },
+    {
+      "name": "ipv6_host",
+      "accepted": false,
+      "replace": ["redis", "host", "2001:db8::1"]
+    },
+    {
+      "name": "uppercase_host",
+      "accepted": false,
+      "replace": ["database", "host", "VP-POSTGRES-SWARM"]
+    },
+    {
+      "name": "trailing_dot_host",
+      "accepted": false,
+      "replace": ["database", "host", "vp-postgres-swarm."]
+    },
+    {
+      "name": "invalid_ipv4",
+      "accepted": false,
+      "replace": ["database", "host", "999.20.30.40"]
+    },
+    {
+      "name": "boolean_port",
+      "accepted": false,
+      "replace": ["database", "port", true]
+    },
+    {
+      "name": "float_port",
+      "accepted": false,
+      "replace": ["database", "port", 5432.0]
+    },
+    {
+      "name": "port_zero",
+      "accepted": false,
+      "replace": ["database", "port", 0]
+    },
+    {
+      "name": "port_too_large",
+      "accepted": false,
+      "replace": ["database", "port", 65536]
+    },
+    {
+      "name": "boolean_redis_database",
+      "accepted": false,
+      "replace": ["redis", "database", false]
+    },
+    {
+      "name": "float_redis_database",
+      "accepted": false,
+      "replace": ["redis", "database", 3.0]
+    },
+    {
+      "name": "negative_redis_database",
+      "accepted": false,
+      "replace": ["redis", "database", -1]
+    },
+    {
+      "name": "redis_database_too_large",
+      "accepted": false,
+      "replace": ["redis", "database", 2147483648]
+    },
+    {
+      "name": "dependency_name_space",
+      "accepted": false,
+      "replace": ["database", "database", "video process"]
+    },
+    {
+      "name": "dependency_name_secret_separator",
+      "accepted": false,
+      "replace": ["storage", "backend", "password"]
+    },
+    {
+      "name": "extra_field",
+      "accepted": false,
+      "extra": ["redis", "password", "must-not-be-admitted"]
+    }
   ]
 }

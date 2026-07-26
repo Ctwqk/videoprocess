@@ -24,6 +24,9 @@ TARGET_REVISION = "034_worker_registrations"
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 IMAGE_IDENTITY = "vp-ffmpeg-worker-go:deploy-0123456789ab"
 FINGERPRINT_CASES = json.loads(FINGERPRINT_FIXTURE.read_text())["cases"]
+ENDPOINT_VALIDATION_CASES = json.loads(FINGERPRINT_FIXTURE.read_text())[
+    "endpoint_validation_cases"
+]
 NOT_APPLICABLE_FINGERPRINT_CASE = next(
     case for case in FINGERPRINT_CASES
     if case["name"] == "not_applicable"
@@ -61,6 +64,16 @@ def _asyncpg_url(url: str) -> str:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _endpoint_validation_bindings(case: dict[str, object]) -> dict[str, object]:
+    if "bindings" in case:
+        return case["bindings"]
+    bindings = json.loads(json.dumps(ENDPOINT_BINDINGS))
+    operation = case.get("replace") or case.get("extra")
+    dependency, field_name, value = operation
+    bindings[dependency][field_name] = value
+    return bindings
 
 
 def test_worker_registration_migration_emits_complete_additive_schema_and_functions() -> None:
@@ -114,15 +127,38 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "vp_worker_heartbeat",
         "vp_worker_release",
         "vp_require_worker_lease",
+        "vp_worker_grant_upsert",
+        "vp_worker_grant_activate",
+        "vp_worker_grant_revoke",
+        "vp_worker_registration_revoke",
+        "vp_worker_registration_expire",
+        "vp_worker_endpoint_fingerprints",
     ):
         assert f"CREATE FUNCTION public.{function_name}" in sql
         assert f"ALTER FUNCTION public.{function_name}" not in sql
         assert f"REVOKE ALL ON FUNCTION public.{function_name}" in sql
-    assert sql.count("SECURITY DEFINER") >= 4
-    assert sql.count("SET search_path = pg_catalog") >= 4
+    assert sql.count("SECURITY DEFINER") >= 10
+    assert sql.count("SET search_path = pg_catalog") >= 10
     assert "SET search_path = pg_catalog, public" not in sql
     assert "pg_advisory_xact_lock_shared" in sql
     assert "pg_advisory_xact_lock" in sql
+    register_function_sql = sql[
+        sql.index("CREATE FUNCTION public.vp_worker_register") :
+        sql.index("CREATE FUNCTION public.vp_worker_heartbeat")
+    ]
+    assert register_function_sql.count("p_worker_slot integer") == 1
+    assert register_function_sql.count(
+        "public.vp_worker_endpoint_fingerprints"
+    ) == 1
+    for legacy_endpoint_parser_name in (
+        "v_database_binding",
+        "v_redis_binding",
+        "v_storage_binding",
+        "v_database_canonical",
+        "v_redis_canonical",
+        "v_storage_canonical",
+    ):
+        assert legacy_endpoint_parser_name not in register_function_sql
 
 
 @pytest.mark.asyncio
@@ -139,11 +175,13 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
     bridge_role = f"vp_worker_bridge_{uuid.uuid4().hex[:16]}"
     writer_role = f"vp_worker_writer_{uuid.uuid4().hex[:16]}"
     owner_role = f"vp_worker_owner_{uuid.uuid4().hex[:16]}"
+    operator_role = f"vp_worker_operator_{uuid.uuid4().hex[:16]}"
     runtime_password = uuid.uuid4().hex
     mismatch_password = uuid.uuid4().hex
     direct_password = uuid.uuid4().hex
     set_role_password = uuid.uuid4().hex
     owner_password = uuid.uuid4().hex
+    operator_password = uuid.uuid4().hex
     admin_url = _database_url("postgres")
     admin = await asyncpg.connect(_asyncpg_url(admin_url))
     try:
@@ -169,6 +207,10 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
         await admin.execute(
             f'CREATE ROLE "{owner_role}" LOGIN PASSWORD '
             f"'{owner_password}'"
+        )
+        await admin.execute(
+            f'CREATE ROLE "{operator_role}" LOGIN PASSWORD '
+            f"'{operator_password}'"
         )
     finally:
         await admin.close()
@@ -306,6 +348,12 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                     "vp_worker_heartbeat",
                     "vp_worker_release",
                     "vp_require_worker_lease",
+                    "vp_worker_grant_upsert",
+                    "vp_worker_grant_activate",
+                    "vp_worker_grant_revoke",
+                    "vp_worker_registration_revoke",
+                    "vp_worker_registration_expire",
+                    "vp_worker_endpoint_fingerprints",
                 ],
             )
             assert {row["proname"] for row in functions} == {
@@ -313,6 +361,12 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 "vp_worker_heartbeat",
                 "vp_worker_release",
                 "vp_require_worker_lease",
+                "vp_worker_grant_upsert",
+                "vp_worker_grant_activate",
+                "vp_worker_grant_revoke",
+                "vp_worker_registration_revoke",
+                "vp_worker_registration_expire",
+                "vp_worker_endpoint_fingerprints",
             }
             assert all(row["prosecdef"] for row in functions)
             assert all(
@@ -320,12 +374,48 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 for row in functions
             )
             assert not any(row["public_execute"] for row in functions)
+            for case in ENDPOINT_VALIDATION_CASES:
+                bindings = _endpoint_validation_bindings(case)
+                if case["accepted"]:
+                    fingerprints = await connection.fetchrow(
+                        """
+                        SELECT *
+                        FROM public.vp_worker_endpoint_fingerprints($1::jsonb)
+                        """,
+                        json.dumps(bindings),
+                    )
+                    assert {
+                        name: fingerprints[f"{name}_fingerprint"]
+                        for name in ("database", "redis", "storage")
+                    } == case["sha256"]
+                else:
+                    with pytest.raises(
+                        asyncpg.RaiseError,
+                        match="claim_mismatch",
+                    ):
+                        await connection.fetchrow(
+                            """
+                            SELECT *
+                            FROM public.vp_worker_endpoint_fingerprints(
+                                $1::jsonb
+                            )
+                            """,
+                            json.dumps(bindings),
+                        )
             function_signatures = (
                 "vp_worker_register(text,bigint,text,text,uuid,integer,text,"
                 "jsonb,text,text,text,text,jsonb,text,text,text,text,text)",
                 "vp_worker_heartbeat(uuid,text,uuid,bigint,text)",
                 "vp_worker_release(uuid,text,uuid,bigint,text,text)",
                 "vp_require_worker_lease(uuid,bigint)",
+            )
+            operator_function_signatures = (
+                "vp_worker_grant_upsert(text,bigint,text,text,jsonb,text,text,"
+                "text,text,text,jsonb,text,text)",
+                "vp_worker_grant_activate(text,bigint)",
+                "vp_worker_grant_revoke(text,bigint,text)",
+                "vp_worker_registration_revoke(text,uuid,text)",
+                "vp_worker_registration_expire(text,uuid)",
             )
             for role_name in (
                 runtime_role,
@@ -339,6 +429,11 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                         f'GRANT EXECUTE ON FUNCTION public.{signature} '
                         f'TO "{role_name}"'
                     )
+            for signature in operator_function_signatures:
+                await connection.execute(
+                    f'GRANT EXECUTE ON FUNCTION public.{signature} '
+                    f'TO "{operator_role}"'
+                )
             await connection.execute(
                 f'ALTER TABLE worker_admission_grants OWNER TO "{owner_role}"'
             )
@@ -437,11 +532,16 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 f"postgresql://{owner_role}:{owner_password}"
                 f"@{target_url.split('@', 1)[1]}"
             )
+            operator_url = (
+                f"postgresql://{operator_role}:{operator_password}"
+                f"@{target_url.split('@', 1)[1]}"
+            )
             runtime_connection = await asyncpg.connect(runtime_url)
             mismatch_connection = await asyncpg.connect(mismatch_url)
             direct_connection = await asyncpg.connect(direct_url)
             set_role_connection = await asyncpg.connect(set_role_url)
             owner_connection = await asyncpg.connect(owner_url)
+            operator_connection = await asyncpg.connect(operator_url)
             register_sql = """
                 SELECT * FROM public.vp_worker_register(
                     $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10,
@@ -506,6 +606,79 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                         register_sql,
                         *register_args,
                     )
+                for mutation in (
+                    "SELECT * FROM public.worker_admission_grants",
+                    "INSERT INTO public.worker_admission_grants DEFAULT VALUES",
+                    "UPDATE public.worker_admission_grants SET state = 'revoked'",
+                    "DELETE FROM public.worker_admission_grants",
+                    "TRUNCATE public.worker_admission_grants",
+                    "SELECT * FROM public.worker_registrations",
+                    "INSERT INTO public.worker_registrations DEFAULT VALUES",
+                    "UPDATE public.worker_registrations SET status = 'revoked'",
+                    "DELETE FROM public.worker_registrations",
+                    "TRUNCATE public.worker_registrations",
+                ):
+                    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                        await operator_connection.execute(mutation)
+                null_safe_operator_calls = (
+                    (
+                        """
+                        SELECT public.vp_worker_grant_upsert(
+                            $1, $2, $3, $4, $5::jsonb, $6, $7, $8,
+                            $9, $10, $11::jsonb, $12, $13
+                        )
+                        """,
+                        (
+                            "null-service",
+                            1,
+                            "ffmpeg_go",
+                            "colima-127",
+                            '["media_cpu"]',
+                            RELEASE_COMMIT,
+                            IMAGE_IDENTITY,
+                            runtime_role,
+                            "vp:tasks:ffmpeg_go",
+                            "ffmpeg_go-workers",
+                            json.dumps(ENDPOINT_BINDINGS),
+                            _sha256("null-test-token"),
+                            "migration-test",
+                        ),
+                    ),
+                    (
+                        "SELECT public.vp_worker_grant_activate($1, $2)",
+                        ("null-service", 1),
+                    ),
+                    (
+                        "SELECT public.vp_worker_grant_revoke($1, $2, $3)",
+                        ("null-service", 1, "operator-stop"),
+                    ),
+                    (
+                        """
+                        SELECT public.vp_worker_registration_revoke(
+                            $1, $2, $3
+                        )
+                        """,
+                        ("null-service", uuid.uuid4(), "operator-stop"),
+                    ),
+                    (
+                        """
+                        SELECT public.vp_worker_registration_expire($1, $2)
+                        """,
+                        ("null-service", uuid.uuid4()),
+                    ),
+                )
+                for operator_sql, operator_args in null_safe_operator_calls:
+                    for index in range(len(operator_args)):
+                        null_args = list(operator_args)
+                        null_args[index] = None
+                        with pytest.raises(
+                            asyncpg.RaiseError,
+                            match="claim_mismatch",
+                        ):
+                            await operator_connection.fetchval(
+                                operator_sql,
+                                *null_args,
+                            )
                 for table_name in (
                     "worker_admission_grants",
                     "worker_registrations",
@@ -695,6 +868,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 await direct_connection.close()
                 await set_role_connection.close()
                 await owner_connection.close()
+                await operator_connection.close()
             assert first["grant_id"] == grant_id
             assert first["lease_epoch"] == 1
             assert 179 <= (
@@ -1081,14 +1255,311 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 register_sql,
                 *fourth_args,
             )
+            operator_mutation_connection = await asyncpg.connect(operator_url)
+            order_fence_connection = await asyncpg.connect(runtime_url)
+            order_takeover_connection = await asyncpg.connect(runtime_url)
+            order_transaction = order_fence_connection.transaction()
+            order_committed = False
+            takeover_task: asyncio.Task[object] | None = None
+            upsert_task: asyncio.Task[object] | None = None
+            fifth_args = list(register_args)
+            fifth_args[4] = uuid.uuid4()
+            fifth_args[5] = 5
+            fifth_args[6] = "consumer-five"
+            fifth_args[17] = _sha256("lease-five")
+            upsert_args = (
+                "service-a",
+                8,
+                "ffmpeg_go",
+                "colima-127",
+                '["media_cpu"]',
+                RELEASE_COMMIT,
+                IMAGE_IDENTITY,
+                runtime_role,
+                "vp:tasks:ffmpeg_go",
+                "ffmpeg_go-workers",
+                json.dumps(ENDPOINT_BINDINGS),
+                _sha256("admission-token-eight"),
+                "migration-test",
+            )
+            try:
+                await order_transaction.start()
+                await order_fence_connection.execute(
+                    "SELECT public.vp_require_worker_lease($1, $2)",
+                    fourth["registration_id"],
+                    4,
+                )
+                takeover_task = asyncio.create_task(
+                    order_takeover_connection.fetchrow(
+                        register_sql,
+                        *fifth_args,
+                    )
+                )
+                takeover_done, _ = await asyncio.wait(
+                    {takeover_task},
+                    timeout=0.25,
+                )
+                assert takeover_task not in takeover_done
+
+                grant_probe = connection.transaction()
+                await grant_probe.start()
+                try:
+                    assert await connection.fetchval(
+                        """
+                        SELECT id
+                        FROM public.worker_admission_grants
+                        WHERE service_name = 'service-a'
+                          AND generation = 7
+                        FOR UPDATE NOWAIT
+                        """
+                    ) == grant_id
+                finally:
+                    await grant_probe.rollback()
+
+                upsert_task = asyncio.create_task(
+                    operator_mutation_connection.fetchval(
+                        """
+                        SELECT public.vp_worker_grant_upsert(
+                            $1, $2, $3, $4, $5::jsonb, $6, $7, $8,
+                            $9, $10, $11::jsonb, $12, $13
+                        )
+                        """,
+                        *upsert_args,
+                    )
+                )
+                upsert_done, _ = await asyncio.wait(
+                    {upsert_task},
+                    timeout=0.25,
+                )
+                assert upsert_task not in upsert_done, (
+                    "grant upsert crossed a held shared lease fence"
+                )
+                await order_transaction.commit()
+                order_committed = True
+                fifth = await asyncio.wait_for(takeover_task, timeout=3)
+                pending_grant_id = await asyncio.wait_for(
+                    upsert_task,
+                    timeout=3,
+                )
+            finally:
+                if not order_committed:
+                    await order_transaction.rollback()
+                for task in (takeover_task, upsert_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *(
+                        task
+                        for task in (takeover_task, upsert_task)
+                        if task is not None
+                    ),
+                    return_exceptions=True,
+                )
+                await order_fence_connection.close()
+                await order_takeover_connection.close()
+
+            assert fifth["lease_epoch"] == 5
+            assert pending_grant_id is not None
+
+            async def assert_operator_waits_for_fence(
+                sql: str,
+                *args: object,
+            ) -> object:
+                fence = await asyncpg.connect(runtime_url)
+                operator = await asyncpg.connect(operator_url)
+                transaction = fence.transaction()
+                task: asyncio.Task[object] | None = None
+                committed = False
+                try:
+                    await transaction.start()
+                    await fence.execute(
+                        "SELECT public.vp_require_worker_lease($1, $2)",
+                        fifth["registration_id"],
+                        5,
+                    )
+                    task = asyncio.create_task(operator.fetchval(sql, *args))
+                    done, _ = await asyncio.wait({task}, timeout=0.25)
+                    assert task not in done, (
+                        "operator mutation crossed a held shared lease fence"
+                    )
+                    await transaction.commit()
+                    committed = True
+                    return await asyncio.wait_for(task, timeout=3)
+                finally:
+                    if not committed:
+                        await transaction.rollback()
+                    if task is not None and not task.done():
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    await fence.close()
+                    await operator.close()
+
+            assert (
+                await assert_operator_waits_for_fence(
+                    "SELECT public.vp_worker_grant_activate($1, $2)",
+                    "service-a",
+                    8,
+                )
+                == pending_grant_id
+            )
+            assert await assert_operator_waits_for_fence(
+                "SELECT public.vp_worker_grant_revoke($1, $2, $3)",
+                "service-a",
+                8,
+                "replacement-retired",
+            )
+            assert await assert_operator_waits_for_fence(
+                "SELECT public.vp_worker_registration_revoke($1, $2, $3)",
+                "service-a",
+                fifth["registration_id"],
+                "operator-stop",
+            )
+
+            generation_nine_token_hash = _sha256("admission-token-nine")
+            generation_nine_id = await operator_mutation_connection.fetchval(
+                """
+                SELECT public.vp_worker_grant_upsert(
+                    $1, $2, $3, $4, $5::jsonb, $6, $7, $8,
+                    $9, $10, $11::jsonb, $12, $13
+                )
+                """,
+                "service-a",
+                9,
+                "ffmpeg_go",
+                "colima-127",
+                '["media_cpu"]',
+                RELEASE_COMMIT,
+                IMAGE_IDENTITY,
+                runtime_role,
+                "vp:tasks:ffmpeg_go",
+                "ffmpeg_go-workers",
+                json.dumps(ENDPOINT_BINDINGS),
+                generation_nine_token_hash,
+                "migration-test",
+            )
+            assert (
+                await operator_mutation_connection.fetchval(
+                    "SELECT public.vp_worker_grant_activate($1, $2)",
+                    "service-a",
+                    9,
+                )
+                == generation_nine_id
+            )
+            expiry_args = list(register_args)
+            expiry_args[1] = 9
+            expiry_args[4] = uuid.uuid4()
+            expiry_args[5] = 6
+            expiry_args[6] = "consumer-six"
+            expiry_args[16] = generation_nine_token_hash
+            expiry_args[17] = _sha256("lease-six")
+            expiry_registration = await runtime_connection.fetchrow(
+                register_sql,
+                *expiry_args,
+            )
             await connection.execute(
                 """
                 UPDATE worker_registrations
-                SET lease_expires_at = clock_timestamp()
+                SET lease_expires_at =
+                        clock_timestamp() + INTERVAL '0.5 seconds'
+                WHERE id = $1
+                """,
+                expiry_registration["registration_id"],
+            )
+            expiry_fence = await asyncpg.connect(runtime_url)
+            expiry_operator = await asyncpg.connect(operator_url)
+            expiry_transaction = expiry_fence.transaction()
+            expiry_task: asyncio.Task[object] | None = None
+            expiry_committed = False
+            try:
+                await expiry_transaction.start()
+                await expiry_fence.execute(
+                    "SELECT public.vp_require_worker_lease($1, $2)",
+                    expiry_registration["registration_id"],
+                    6,
+                )
+                await asyncio.sleep(0.6)
+                expiry_task = asyncio.create_task(
+                    expiry_operator.fetchval(
+                        """
+                        SELECT public.vp_worker_registration_expire($1, $2)
+                        """,
+                        "service-a",
+                        expiry_registration["registration_id"],
+                    )
+                )
+                expiry_done, _ = await asyncio.wait(
+                    {expiry_task},
+                    timeout=0.25,
+                )
+                assert expiry_task not in expiry_done, (
+                    "expiry mutation crossed a held shared lease fence"
+                )
+                await expiry_transaction.commit()
+                expiry_committed = True
+                assert await asyncio.wait_for(expiry_task, timeout=3)
+            finally:
+                if not expiry_committed:
+                    await expiry_transaction.rollback()
+                if expiry_task is not None and not expiry_task.done():
+                    expiry_task.cancel()
+                    await asyncio.gather(
+                        expiry_task,
+                        return_exceptions=True,
+                    )
+                await expiry_fence.close()
+                await expiry_operator.close()
+                await operator_mutation_connection.close()
+
+            time_wait_operator = await asyncpg.connect(operator_url)
+            generation_ten_token_hash = _sha256("admission-token-ten")
+            try:
+                await time_wait_operator.fetchval(
+                    """
+                    SELECT public.vp_worker_grant_upsert(
+                        $1, $2, $3, $4, $5::jsonb, $6, $7, $8,
+                        $9, $10, $11::jsonb, $12, $13
+                    )
+                    """,
+                    "service-a",
+                    10,
+                    "ffmpeg_go",
+                    "colima-127",
+                    '["media_cpu"]',
+                    RELEASE_COMMIT,
+                    IMAGE_IDENTITY,
+                    runtime_role,
+                    "vp:tasks:ffmpeg_go",
+                    "ffmpeg_go-workers",
+                    json.dumps(ENDPOINT_BINDINGS),
+                    generation_ten_token_hash,
+                    "migration-test",
+                )
+                await time_wait_operator.fetchval(
+                    "SELECT public.vp_worker_grant_activate($1, $2)",
+                    "service-a",
+                    10,
+                )
+            finally:
+                await time_wait_operator.close()
+            time_wait_args = list(register_args)
+            time_wait_args[1] = 10
+            time_wait_args[4] = uuid.uuid4()
+            time_wait_args[5] = 7
+            time_wait_args[6] = "consumer-seven"
+            time_wait_args[16] = generation_ten_token_hash
+            time_wait_args[17] = _sha256("lease-seven")
+            time_wait_registration = await runtime_connection.fetchrow(
+                register_sql,
+                *time_wait_args,
+            )
+            await connection.execute(
+                """
+                UPDATE public.worker_registrations
+                SET lease_expires_at = pg_catalog.clock_timestamp()
                     + INTERVAL '0.5 seconds'
                 WHERE id = $1
                 """,
-                fourth["registration_id"],
+                time_wait_registration["registration_id"],
             )
             expiry_lock = connection.transaction()
             await expiry_lock.start()
@@ -1105,13 +1576,13 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                         )
                     )
                     """,
-                    fourth["registration_id"],
+                    time_wait_registration["registration_id"],
                 )
                 expiry_require_task = asyncio.create_task(
                     expiry_require_connection.execute(
                         "SELECT public.vp_require_worker_lease($1, $2)",
-                        fourth["registration_id"],
-                        4,
+                        time_wait_registration["registration_id"],
+                        7,
                     )
                 )
                 expiry_done, _ = await asyncio.wait(
@@ -1195,5 +1666,6 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             await admin.execute(f'DROP ROLE IF EXISTS "{bridge_role}"')
             await admin.execute(f'DROP ROLE IF EXISTS "{writer_role}"')
             await admin.execute(f'DROP ROLE IF EXISTS "{owner_role}"')
+            await admin.execute(f'DROP ROLE IF EXISTS "{operator_role}"')
         finally:
             await admin.close()

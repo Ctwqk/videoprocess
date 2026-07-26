@@ -31,6 +31,25 @@ RELEASE_SIGNATURE = (
     "public.vp_worker_release(uuid,text,uuid,bigint,text,text)"
 )
 REQUIRE_SIGNATURE = "public.vp_require_worker_lease(uuid,bigint)"
+ENDPOINT_FINGERPRINTS_SIGNATURE = (
+    "public.vp_worker_endpoint_fingerprints(jsonb)"
+)
+GRANT_UPSERT_SIGNATURE = (
+    "public.vp_worker_grant_upsert(text,bigint,text,text,jsonb,text,text,text,"
+    "text,text,jsonb,text,text)"
+)
+GRANT_ACTIVATE_SIGNATURE = (
+    "public.vp_worker_grant_activate(text,bigint)"
+)
+GRANT_REVOKE_SIGNATURE = (
+    "public.vp_worker_grant_revoke(text,bigint,text)"
+)
+REGISTRATION_REVOKE_SIGNATURE = (
+    "public.vp_worker_registration_revoke(text,uuid,text)"
+)
+REGISTRATION_EXPIRE_SIGNATURE = (
+    "public.vp_worker_registration_expire(text,uuid)"
+)
 
 
 def upgrade() -> None:
@@ -394,6 +413,8 @@ def upgrade() -> None:
         unique=False,
     )
 
+    _create_endpoint_fingerprints_function()
+    _create_operator_functions()
     _create_register_function()
     _create_heartbeat_function()
     _create_release_function()
@@ -403,8 +424,663 @@ def upgrade() -> None:
         HEARTBEAT_SIGNATURE,
         RELEASE_SIGNATURE,
         REQUIRE_SIGNATURE,
+        ENDPOINT_FINGERPRINTS_SIGNATURE,
+        GRANT_UPSERT_SIGNATURE,
+        GRANT_ACTIVATE_SIGNATURE,
+        GRANT_REVOKE_SIGNATURE,
+        REGISTRATION_REVOKE_SIGNATURE,
+        REGISTRATION_EXPIRE_SIGNATURE,
     ):
         op.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
+
+
+def _create_endpoint_fingerprints_function() -> None:
+    op.execute(
+        r"""
+CREATE FUNCTION public.vp_worker_endpoint_fingerprints(
+    p_endpoint_bindings_json jsonb
+)
+RETURNS TABLE(
+    database_fingerprint text,
+    redis_fingerprint text,
+    storage_fingerprint text
+)
+LANGUAGE plpgsql
+IMMUTABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_database_binding jsonb;
+    v_redis_binding jsonb;
+    v_storage_binding jsonb;
+    v_database_host text;
+    v_redis_host text;
+    v_storage_host text;
+    v_database_canonical text;
+    v_redis_canonical text;
+    v_storage_canonical text;
+    v_dns_pattern text :=
+        '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+        '(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$';
+    v_ipv4_pattern text :=
+        '^((0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}'
+        '(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])$';
+BEGIN
+    IF p_endpoint_bindings_json IS NULL
+       OR pg_catalog.jsonb_typeof(p_endpoint_bindings_json)
+          IS DISTINCT FROM 'object'
+       OR (
+           SELECT pg_catalog.count(*)
+           FROM pg_catalog.jsonb_object_keys(p_endpoint_bindings_json)
+       ) <> 3
+       OR NOT (
+           p_endpoint_bindings_json
+           ?& ARRAY['database', 'redis', 'storage']
+       )
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+
+    v_database_binding := p_endpoint_bindings_json -> 'database';
+    v_redis_binding := p_endpoint_bindings_json -> 'redis';
+    v_storage_binding := p_endpoint_bindings_json -> 'storage';
+    v_database_host := v_database_binding ->> 'host';
+    v_redis_host := v_redis_binding ->> 'host';
+    v_storage_host := v_storage_binding ->> 'host';
+
+    IF pg_catalog.jsonb_typeof(v_database_binding)
+           IS DISTINCT FROM 'object'
+       OR (
+           SELECT pg_catalog.count(*)
+           FROM pg_catalog.jsonb_object_keys(v_database_binding)
+       ) <> 4
+       OR NOT (
+           v_database_binding
+           ?& ARRAY['database', 'driver', 'host', 'port']
+       )
+       OR pg_catalog.jsonb_typeof(v_database_binding -> 'database')
+          IS DISTINCT FROM 'string'
+       OR pg_catalog.jsonb_typeof(v_database_binding -> 'driver')
+          IS DISTINCT FROM 'string'
+       OR pg_catalog.jsonb_typeof(v_database_binding -> 'host')
+          IS DISTINCT FROM 'string'
+       OR pg_catalog.jsonb_typeof(v_database_binding -> 'port')
+          IS DISTINCT FROM 'number'
+       OR v_database_binding ->> 'driver' IS DISTINCT FROM 'postgresql'
+       OR v_database_binding ->> 'database'
+          !~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$'
+       OR pg_catalog.length(v_database_host) NOT BETWEEN 1 AND 253
+       OR v_database_host IS DISTINCT FROM pg_catalog.lower(v_database_host)
+       OR v_database_host !~ v_dns_pattern
+       OR (
+           v_database_host ~ '^[0-9.]+$'
+           AND v_database_host !~ v_ipv4_pattern
+       )
+       OR v_database_host = 'localhost'
+       OR v_database_host ~ '^127\.'
+       OR v_database_host = '0.0.0.0'
+       OR v_database_binding ->> 'port'
+          !~ '^(0|[1-9][0-9]*)$'
+       OR (v_database_binding ->> 'port')::numeric
+          NOT BETWEEN 1 AND 65535
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+
+    IF pg_catalog.jsonb_typeof(v_redis_binding)
+           IS DISTINCT FROM 'object'
+       OR (
+           SELECT pg_catalog.count(*)
+           FROM pg_catalog.jsonb_object_keys(v_redis_binding)
+       ) <> 4
+       OR NOT (
+           v_redis_binding ?& ARRAY['database', 'host', 'port', 'scheme']
+       )
+       OR pg_catalog.jsonb_typeof(v_redis_binding -> 'database')
+          IS DISTINCT FROM 'number'
+       OR pg_catalog.jsonb_typeof(v_redis_binding -> 'host')
+          IS DISTINCT FROM 'string'
+       OR pg_catalog.jsonb_typeof(v_redis_binding -> 'port')
+          IS DISTINCT FROM 'number'
+       OR pg_catalog.jsonb_typeof(v_redis_binding -> 'scheme')
+          IS DISTINCT FROM 'string'
+       OR v_redis_binding ->> 'scheme' NOT IN ('redis', 'rediss')
+       OR pg_catalog.length(v_redis_host) NOT BETWEEN 1 AND 253
+       OR v_redis_host IS DISTINCT FROM pg_catalog.lower(v_redis_host)
+       OR v_redis_host !~ v_dns_pattern
+       OR (
+           v_redis_host ~ '^[0-9.]+$'
+           AND v_redis_host !~ v_ipv4_pattern
+       )
+       OR v_redis_host = 'localhost'
+       OR v_redis_host ~ '^127\.'
+       OR v_redis_host = '0.0.0.0'
+       OR v_redis_binding ->> 'port' !~ '^(0|[1-9][0-9]*)$'
+       OR v_redis_binding ->> 'database' !~ '^(0|[1-9][0-9]*)$'
+       OR (v_redis_binding ->> 'port')::numeric
+          NOT BETWEEN 1 AND 65535
+       OR (v_redis_binding ->> 'database')::numeric
+          NOT BETWEEN 0 AND 2147483647
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+
+    IF pg_catalog.jsonb_typeof(v_storage_binding)
+           IS DISTINCT FROM 'object'
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+    IF v_storage_binding = '{"backend":"not_applicable"}'::jsonb THEN
+        v_storage_canonical := '{"backend":"not_applicable"}';
+    ELSIF (
+           SELECT pg_catalog.count(*)
+           FROM pg_catalog.jsonb_object_keys(v_storage_binding)
+       ) = 4
+       AND v_storage_binding ?& ARRAY['backend', 'bucket', 'host', 'port']
+       AND pg_catalog.jsonb_typeof(v_storage_binding -> 'backend') = 'string'
+       AND pg_catalog.jsonb_typeof(v_storage_binding -> 'bucket') = 'string'
+       AND pg_catalog.jsonb_typeof(v_storage_binding -> 'host') = 'string'
+       AND pg_catalog.jsonb_typeof(v_storage_binding -> 'port') = 'number'
+       AND v_storage_binding ->> 'backend' = 'minio'
+       AND v_storage_binding ->> 'bucket'
+           ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$'
+       AND pg_catalog.length(v_storage_host) BETWEEN 1 AND 253
+       AND v_storage_host = pg_catalog.lower(v_storage_host)
+       AND v_storage_host ~ v_dns_pattern
+       AND (
+           v_storage_host !~ '^[0-9.]+$'
+           OR v_storage_host ~ v_ipv4_pattern
+       )
+       AND v_storage_host <> 'localhost'
+       AND v_storage_host !~ '^127\.'
+       AND v_storage_host <> '0.0.0.0'
+       AND v_storage_binding ->> 'port' ~ '^(0|[1-9][0-9]*)$'
+       AND (v_storage_binding ->> 'port')::numeric BETWEEN 1 AND 65535
+    THEN
+        v_storage_canonical := pg_catalog.format(
+            '{"backend":"minio","bucket":%s,"host":%s,"port":%s}',
+            pg_catalog.to_jsonb(v_storage_binding ->> 'bucket')::text,
+            pg_catalog.to_jsonb(v_storage_host)::text,
+            ((v_storage_binding ->> 'port')::bigint)::text
+        );
+    ELSE
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+
+    v_database_canonical := pg_catalog.format(
+        '{"database":%s,"driver":"postgresql","host":%s,"port":%s}',
+        pg_catalog.to_jsonb(v_database_binding ->> 'database')::text,
+        pg_catalog.to_jsonb(v_database_host)::text,
+        ((v_database_binding ->> 'port')::bigint)::text
+    );
+    v_redis_canonical := pg_catalog.format(
+        '{"database":%s,"host":%s,"port":%s,"scheme":%s}',
+        ((v_redis_binding ->> 'database')::bigint)::text,
+        pg_catalog.to_jsonb(v_redis_host)::text,
+        ((v_redis_binding ->> 'port')::bigint)::text,
+        pg_catalog.to_jsonb(v_redis_binding ->> 'scheme')::text
+    );
+    RETURN QUERY SELECT
+        pg_catalog.encode(
+            pg_catalog.sha256(
+                pg_catalog.convert_to(v_database_canonical, 'UTF8')
+            ),
+            'hex'
+        ),
+        pg_catalog.encode(
+            pg_catalog.sha256(
+                pg_catalog.convert_to(v_redis_canonical, 'UTF8')
+            ),
+            'hex'
+        ),
+        pg_catalog.encode(
+            pg_catalog.sha256(
+                pg_catalog.convert_to(v_storage_canonical, 'UTF8')
+            ),
+            'hex'
+        );
+END;
+$function$
+"""
+    )
+
+
+def _operator_active_registration_lock_sql() -> str:
+    return """
+    -- Global order: service-exclusive, registration-exclusive, then rows.
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-service:' || p_service_name,
+            0
+        )
+    );
+    SELECT registration.id
+    INTO v_registration_id
+    FROM public.worker_registrations AS registration
+    WHERE registration.service_name = p_service_name
+      AND registration.status = 'active';
+    IF v_registration_id IS NOT NULL THEN
+        PERFORM pg_catalog.pg_advisory_xact_lock(
+            pg_catalog.hashtextextended(
+                'vp-worker-registration:' || v_registration_id::text,
+                0
+            )
+        );
+    END IF;
+    SELECT registration.id
+    INTO v_locked_registration_id
+    FROM public.worker_registrations AS registration
+    WHERE registration.service_name = p_service_name
+      AND registration.status = 'active'
+    FOR UPDATE;
+    IF v_locked_registration_id IS DISTINCT FROM v_registration_id THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+"""
+
+
+def _create_operator_functions() -> None:
+    op.execute(
+        """
+CREATE FUNCTION public.vp_worker_grant_upsert(
+    p_service_name text,
+    p_generation bigint,
+    p_worker_type text,
+    p_worker_host text,
+    p_capabilities_json jsonb,
+    p_release_commit text,
+    p_image_identity text,
+    p_database_principal text,
+    p_redis_stream text,
+    p_redis_group text,
+    p_endpoint_bindings_json jsonb,
+    p_token_sha256 text,
+    p_issued_by text
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration_id uuid;
+    v_locked_registration_id uuid;
+    v_existing_state text;
+    v_grant_id uuid;
+    v_now timestamptz;
+BEGIN
+    IF p_service_name IS NULL
+       OR p_generation IS NULL
+       OR p_worker_type IS NULL
+       OR p_worker_host IS NULL
+       OR p_capabilities_json IS NULL
+       OR p_release_commit IS NULL
+       OR p_image_identity IS NULL
+       OR p_database_principal IS NULL
+       OR p_redis_stream IS NULL
+       OR p_redis_group IS NULL
+       OR p_endpoint_bindings_json IS NULL
+       OR p_token_sha256 IS NULL
+       OR p_issued_by IS NULL
+       OR pg_catalog.length(p_service_name) NOT BETWEEN 1 AND 255
+       OR p_service_name IS DISTINCT FROM pg_catalog.btrim(p_service_name)
+       OR p_generation <= 0
+       OR pg_catalog.length(p_worker_type) NOT BETWEEN 1 AND 64
+       OR p_worker_type IS DISTINCT FROM pg_catalog.btrim(p_worker_type)
+       OR pg_catalog.length(p_worker_host) NOT BETWEEN 1 AND 255
+       OR p_worker_host IS DISTINCT FROM pg_catalog.btrim(p_worker_host)
+       OR pg_catalog.jsonb_typeof(p_capabilities_json)
+          IS DISTINCT FROM 'array'
+       OR pg_catalog.jsonb_array_length(p_capabilities_json) = 0
+       OR p_release_commit !~ '^[0-9a-f]{40}$'
+       OR p_image_identity !~ (
+           '^[A-Za-z0-9][-A-Za-z0-9._/]*'
+           || pg_catalog.chr(58)
+           || 'deploy-[0-9a-f]{12}$'
+       )
+       OR p_database_principal
+          !~ '^[A-Za-z_][A-Za-z0-9_]{0,62}$'
+       OR pg_catalog.length(p_redis_stream) NOT BETWEEN 1 AND 255
+       OR p_redis_stream IS DISTINCT FROM pg_catalog.btrim(p_redis_stream)
+       OR pg_catalog.length(p_redis_group) NOT BETWEEN 1 AND 255
+       OR p_redis_group IS DISTINCT FROM pg_catalog.btrim(p_redis_group)
+       OR p_token_sha256 !~ '^[0-9a-f]{64}$'
+       OR pg_catalog.length(p_issued_by) NOT BETWEEN 1 AND 255
+       OR p_issued_by IS DISTINCT FROM pg_catalog.btrim(p_issued_by)
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.vp_worker_endpoint_fingerprints(
+        p_endpoint_bindings_json
+    );
+""" + _principal_guard_sql() + _operator_active_registration_lock_sql() + """
+    SELECT grant_row.state
+    INTO v_existing_state
+    FROM public.worker_admission_grants AS grant_row
+    WHERE grant_row.service_name = p_service_name
+      AND grant_row.generation = p_generation
+    FOR UPDATE;
+    IF FOUND AND v_existing_state IS DISTINCT FROM 'pending' THEN
+        RAISE EXCEPTION USING MESSAGE = 'grant_disabled', ERRCODE = 'P0001';
+    END IF;
+    v_now := pg_catalog.clock_timestamp();
+    BEGIN
+        INSERT INTO public.worker_admission_grants (
+            service_name,
+            generation,
+            worker_type,
+            worker_host,
+            capabilities_json,
+            release_commit,
+            image_identity,
+            database_principal,
+            redis_stream,
+            redis_group,
+            endpoint_bindings_json,
+            token_sha256,
+            state,
+            issued_at,
+            issued_by,
+            created_at,
+            updated_at
+        ) VALUES (
+            p_service_name,
+            p_generation,
+            p_worker_type,
+            p_worker_host,
+            p_capabilities_json,
+            p_release_commit,
+            p_image_identity,
+            p_database_principal,
+            p_redis_stream,
+            p_redis_group,
+            p_endpoint_bindings_json,
+            p_token_sha256,
+            'pending',
+            v_now,
+            p_issued_by,
+            v_now,
+            v_now
+        )
+        ON CONFLICT (service_name, generation) DO UPDATE
+        SET worker_type = EXCLUDED.worker_type,
+            worker_host = EXCLUDED.worker_host,
+            capabilities_json = EXCLUDED.capabilities_json,
+            release_commit = EXCLUDED.release_commit,
+            image_identity = EXCLUDED.image_identity,
+            database_principal = EXCLUDED.database_principal,
+            redis_stream = EXCLUDED.redis_stream,
+            redis_group = EXCLUDED.redis_group,
+            endpoint_bindings_json = EXCLUDED.endpoint_bindings_json,
+            token_sha256 = EXCLUDED.token_sha256,
+            issued_at = EXCLUDED.issued_at,
+            issued_by = EXCLUDED.issued_by,
+            updated_at = v_now
+        RETURNING id INTO v_grant_id;
+    EXCEPTION
+        WHEN unique_violation THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'claim_mismatch',
+                ERRCODE = 'P0001';
+    END;
+    RETURN v_grant_id;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_worker_grant_activate(
+    p_service_name text,
+    p_generation bigint
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration_id uuid;
+    v_locked_registration_id uuid;
+    v_grant public.worker_admission_grants%ROWTYPE;
+    v_now timestamptz;
+BEGIN
+    IF p_service_name IS NULL OR p_generation IS NULL OR p_generation <= 0
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+""" + _principal_guard_sql() + _operator_active_registration_lock_sql() + """
+    SELECT grant_row.*
+    INTO v_grant
+    FROM public.worker_admission_grants AS grant_row
+    WHERE grant_row.service_name = p_service_name
+      AND grant_row.generation = p_generation
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'grant_missing', ERRCODE = 'P0001';
+    END IF;
+    IF v_grant.state = 'active' THEN
+        RETURN v_grant.id;
+    END IF;
+    IF v_grant.state IS DISTINCT FROM 'pending' THEN
+        RAISE EXCEPTION USING MESSAGE = 'grant_disabled', ERRCODE = 'P0001';
+    END IF;
+    PERFORM grant_row.id
+    FROM public.worker_admission_grants AS grant_row
+    WHERE grant_row.service_name = p_service_name
+      AND grant_row.state = 'active'
+    ORDER BY grant_row.id
+    FOR UPDATE;
+    v_now := pg_catalog.clock_timestamp();
+    UPDATE public.worker_admission_grants AS grant_row
+    SET state = 'revoked',
+        revoked_at = v_now,
+        revoke_reason = 'superseded',
+        updated_at = v_now
+    WHERE grant_row.service_name = p_service_name
+      AND grant_row.state = 'active';
+    UPDATE public.worker_admission_grants AS grant_row
+    SET state = 'active',
+        activated_at = v_now,
+        updated_at = v_now
+    WHERE grant_row.id = v_grant.id;
+    RETURN v_grant.id;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_worker_grant_revoke(
+    p_service_name text,
+    p_generation bigint,
+    p_reason text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration_id uuid;
+    v_locked_registration_id uuid;
+    v_grant public.worker_admission_grants%ROWTYPE;
+    v_now timestamptz;
+BEGIN
+    IF p_service_name IS NULL
+       OR p_generation IS NULL
+       OR p_reason IS NULL
+       OR p_generation <= 0
+       OR pg_catalog.length(p_reason) NOT BETWEEN 1 AND 255
+       OR p_reason IS DISTINCT FROM pg_catalog.btrim(p_reason)
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+""" + _principal_guard_sql() + _operator_active_registration_lock_sql() + """
+    SELECT grant_row.*
+    INTO v_grant
+    FROM public.worker_admission_grants AS grant_row
+    WHERE grant_row.service_name = p_service_name
+      AND grant_row.generation = p_generation
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING MESSAGE = 'grant_missing', ERRCODE = 'P0001';
+    END IF;
+    IF v_grant.state = 'revoked' THEN
+        RETURN TRUE;
+    END IF;
+    v_now := pg_catalog.clock_timestamp();
+    UPDATE public.worker_admission_grants AS grant_row
+    SET state = 'revoked',
+        revoked_at = v_now,
+        revoke_reason = p_reason,
+        updated_at = v_now
+    WHERE grant_row.id = v_grant.id;
+    IF v_registration_id IS NOT NULL THEN
+        UPDATE public.worker_registrations AS registration
+        SET status = 'revoked',
+            revoked_at = v_now,
+            revoke_reason = p_reason
+        WHERE registration.id = v_registration_id
+          AND registration.grant_id = v_grant.id
+          AND registration.status = 'active';
+    END IF;
+    RETURN TRUE;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_worker_registration_revoke(
+    p_service_name text,
+    p_registration_id uuid,
+    p_reason text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration public.worker_registrations%ROWTYPE;
+    v_now timestamptz;
+BEGIN
+    IF p_service_name IS NULL
+       OR p_registration_id IS NULL
+       OR p_reason IS NULL
+       OR pg_catalog.length(p_reason) NOT BETWEEN 1 AND 255
+       OR p_reason IS DISTINCT FROM pg_catalog.btrim(p_reason)
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+""" + _principal_guard_sql() + """
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-service:' || p_service_name,
+            0
+        )
+    );
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id
+    FOR UPDATE;
+    IF NOT FOUND
+       OR v_registration.service_name IS DISTINCT FROM p_service_name
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.status IN ('revoked', 'expired') THEN
+        RETURN TRUE;
+    END IF;
+    v_now := pg_catalog.clock_timestamp();
+    UPDATE public.worker_registrations AS registration
+    SET status = 'revoked',
+        revoked_at = v_now,
+        revoke_reason = p_reason
+    WHERE registration.id = p_registration_id;
+    RETURN TRUE;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_worker_registration_expire(
+    p_service_name text,
+    p_registration_id uuid
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_registration public.worker_registrations%ROWTYPE;
+    v_now timestamptz;
+BEGIN
+    IF p_service_name IS NULL OR p_registration_id IS NULL THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+""" + _principal_guard_sql() + """
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-service:' || p_service_name,
+            0
+        )
+    );
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:' || p_registration_id::text,
+            0
+        )
+    );
+    v_now := pg_catalog.clock_timestamp();
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = p_registration_id
+    FOR UPDATE;
+    IF NOT FOUND
+       OR v_registration.service_name IS DISTINCT FROM p_service_name
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+    IF v_registration.status = 'expired' THEN
+        RETURN TRUE;
+    END IF;
+    IF v_registration.status IS DISTINCT FROM 'active'
+       OR v_registration.lease_expires_at > v_now
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+    UPDATE public.worker_registrations AS registration
+    SET status = 'expired'
+    WHERE registration.id = p_registration_id;
+    RETURN TRUE;
+END;
+$function$
+"""
+    )
 
 
 def _create_register_function() -> None:
@@ -446,15 +1122,13 @@ DECLARE
     v_grant public.worker_admission_grants%ROWTYPE;
     v_registration_id uuid := gen_random_uuid();
     v_superseded_id uuid;
+    v_locked_superseded_id uuid;
     v_epoch bigint;
     v_now timestamptz;
     v_expires_at timestamptz;
-    v_database_binding jsonb;
-    v_redis_binding jsonb;
-    v_storage_binding jsonb;
-    v_database_canonical text;
-    v_redis_canonical text;
-    v_storage_canonical text;
+    v_expected_database_fingerprint text;
+    v_expected_redis_fingerprint text;
+    v_expected_storage_fingerprint text;
 BEGIN
     IF p_token_sha256 IS NULL THEN
         RAISE EXCEPTION USING MESSAGE = 'token_invalid', ERRCODE = 'P0001';
@@ -488,6 +1162,29 @@ BEGIN
             0
         )
     );
+
+    SELECT old_registration.id
+    INTO v_superseded_id
+    FROM public.worker_registrations AS old_registration
+    WHERE old_registration.service_name = p_service_name
+      AND old_registration.status = 'active';
+    IF v_superseded_id IS NOT NULL THEN
+        PERFORM pg_catalog.pg_advisory_xact_lock(
+            pg_catalog.hashtextextended(
+                'vp-worker-registration:' || v_superseded_id::text,
+                0
+            )
+        );
+    END IF;
+    SELECT old_registration.id
+    INTO v_locked_superseded_id
+    FROM public.worker_registrations AS old_registration
+    WHERE old_registration.service_name = p_service_name
+      AND old_registration.status = 'active'
+    FOR UPDATE;
+    IF v_locked_superseded_id IS DISTINCT FROM v_superseded_id THEN
+        RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
 
     SELECT grant_row.*
     INTO v_grant
@@ -547,209 +1244,25 @@ BEGIN
             ERRCODE = 'P0001';
     END IF;
 
-    IF pg_catalog.jsonb_typeof(p_endpoint_bindings_json)
-           IS DISTINCT FROM 'object'
-       OR (
-           SELECT pg_catalog.count(*)
-           FROM pg_catalog.jsonb_object_keys(
-               p_endpoint_bindings_json
-           )
-       ) <> 3
-       OR NOT (
-           p_endpoint_bindings_json
-           ?& ARRAY['database', 'redis', 'storage']
-       )
-    THEN
-        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
-    END IF;
-    v_database_binding := p_endpoint_bindings_json -> 'database';
-    v_redis_binding := p_endpoint_bindings_json -> 'redis';
-    v_storage_binding := p_endpoint_bindings_json -> 'storage';
-
-    IF pg_catalog.jsonb_typeof(v_database_binding)
-           IS DISTINCT FROM 'object'
-       OR (
-           SELECT pg_catalog.count(*)
-           FROM pg_catalog.jsonb_object_keys(v_database_binding)
-       ) <> 4
-       OR NOT (
-           v_database_binding
-           ?& ARRAY['database', 'driver', 'host', 'port']
-       )
-       OR pg_catalog.jsonb_typeof(v_database_binding -> 'database')
-          IS DISTINCT FROM 'string'
-       OR pg_catalog.jsonb_typeof(v_database_binding -> 'driver')
-          IS DISTINCT FROM 'string'
-       OR pg_catalog.jsonb_typeof(v_database_binding -> 'host')
-          IS DISTINCT FROM 'string'
-       OR pg_catalog.jsonb_typeof(v_database_binding -> 'port')
-          IS DISTINCT FROM 'number'
-       OR v_database_binding ->> 'driver' IS DISTINCT FROM 'postgresql'
-       OR v_database_binding ->> 'database' IS NULL
-       OR v_database_binding ->> 'database'
-          IS DISTINCT FROM pg_catalog.btrim(
-              v_database_binding ->> 'database'
-          )
-       OR pg_catalog.length(v_database_binding ->> 'database') = 0
-       OR pg_catalog.length(v_database_binding ->> 'database') > 255
-       OR pg_catalog.strpos(
-           v_database_binding ->> 'database',
-           '/'
-       ) > 0
-       OR v_database_binding ->> 'host' IS NULL
-       OR v_database_binding ->> 'host'
-          IS DISTINCT FROM pg_catalog.lower(
-              v_database_binding ->> 'host'
-          )
-       OR v_database_binding ->> 'host'
-          !~ '^[a-z0-9][a-z0-9.-]*$'
-       OR pg_catalog.right(v_database_binding ->> 'host', 1) IN ('.', '-')
-       OR v_database_binding ->> 'host' IN (
-           'localhost', '127.0.0.1', '0.0.0.0'
-       )
-       OR v_database_binding ->> 'port' !~ '^[0-9]+$'
-    THEN
-        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
-    END IF;
-    IF (v_database_binding ->> 'port')::numeric NOT BETWEEN 1 AND 65535 THEN
-        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
-    END IF;
-
-    IF pg_catalog.jsonb_typeof(v_redis_binding)
-           IS DISTINCT FROM 'object'
-       OR (
-           SELECT pg_catalog.count(*)
-           FROM pg_catalog.jsonb_object_keys(v_redis_binding)
-       ) <> 4
-       OR NOT (
-           v_redis_binding ?& ARRAY['database', 'host', 'port', 'scheme']
-       )
-       OR pg_catalog.jsonb_typeof(v_redis_binding -> 'database')
-          IS DISTINCT FROM 'number'
-       OR pg_catalog.jsonb_typeof(v_redis_binding -> 'host')
-          IS DISTINCT FROM 'string'
-       OR pg_catalog.jsonb_typeof(v_redis_binding -> 'port')
-          IS DISTINCT FROM 'number'
-       OR pg_catalog.jsonb_typeof(v_redis_binding -> 'scheme')
-          IS DISTINCT FROM 'string'
-       OR v_redis_binding ->> 'scheme' NOT IN ('redis', 'rediss')
-       OR v_redis_binding ->> 'host' IS NULL
-       OR v_redis_binding ->> 'host'
-          IS DISTINCT FROM pg_catalog.lower(v_redis_binding ->> 'host')
-       OR v_redis_binding ->> 'host' !~ '^[a-z0-9][a-z0-9.-]*$'
-       OR pg_catalog.right(v_redis_binding ->> 'host', 1) IN ('.', '-')
-       OR v_redis_binding ->> 'host' IN (
-           'localhost', '127.0.0.1', '0.0.0.0'
-       )
-       OR v_redis_binding ->> 'port' !~ '^[0-9]+$'
-       OR v_redis_binding ->> 'database' !~ '^[0-9]+$'
-    THEN
-        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
-    END IF;
-    IF (v_redis_binding ->> 'port')::numeric NOT BETWEEN 1 AND 65535
-       OR (v_redis_binding ->> 'database')::numeric
-          NOT BETWEEN 0 AND 2147483647
+    SELECT fingerprints.database_fingerprint,
+           fingerprints.redis_fingerprint,
+           fingerprints.storage_fingerprint
+    INTO v_expected_database_fingerprint,
+         v_expected_redis_fingerprint,
+         v_expected_storage_fingerprint
+    FROM public.vp_worker_endpoint_fingerprints(
+        p_endpoint_bindings_json
+    ) AS fingerprints;
+    IF v_expected_database_fingerprint
+           IS DISTINCT FROM p_database_fingerprint
+       OR v_expected_redis_fingerprint
+           IS DISTINCT FROM p_redis_fingerprint
+       OR v_expected_storage_fingerprint
+           IS DISTINCT FROM p_storage_fingerprint
     THEN
         RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
     END IF;
 
-    IF pg_catalog.jsonb_typeof(v_storage_binding)
-           IS DISTINCT FROM 'object'
-    THEN
-        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
-    END IF;
-    IF v_storage_binding = '{"backend":"not_applicable"}'::jsonb THEN
-        v_storage_canonical := '{"backend":"not_applicable"}';
-    ELSIF (
-           SELECT pg_catalog.count(*)
-           FROM pg_catalog.jsonb_object_keys(v_storage_binding)
-       ) = 4
-       AND v_storage_binding ?& ARRAY['backend', 'bucket', 'host', 'port']
-       AND pg_catalog.jsonb_typeof(v_storage_binding -> 'backend') = 'string'
-       AND pg_catalog.jsonb_typeof(v_storage_binding -> 'bucket') = 'string'
-       AND pg_catalog.jsonb_typeof(v_storage_binding -> 'host') = 'string'
-       AND pg_catalog.jsonb_typeof(v_storage_binding -> 'port') = 'number'
-       AND v_storage_binding ->> 'backend' = 'minio'
-       AND v_storage_binding ->> 'bucket' IS NOT NULL
-       AND v_storage_binding ->> 'bucket'
-           = pg_catalog.btrim(v_storage_binding ->> 'bucket')
-       AND pg_catalog.length(v_storage_binding ->> 'bucket')
-           BETWEEN 1 AND 255
-       AND pg_catalog.strpos(
-           v_storage_binding ->> 'bucket',
-           '/'
-       ) = 0
-       AND v_storage_binding ->> 'host' IS NOT NULL
-       AND v_storage_binding ->> 'host'
-           = pg_catalog.lower(v_storage_binding ->> 'host')
-       AND v_storage_binding ->> 'host'
-           ~ '^[a-z0-9][a-z0-9.-]*$'
-       AND pg_catalog.right(v_storage_binding ->> 'host', 1)
-           NOT IN ('.', '-')
-       AND v_storage_binding ->> 'host'
-           NOT IN ('localhost', '127.0.0.1', '0.0.0.0')
-       AND v_storage_binding ->> 'port' ~ '^[0-9]+$'
-       AND (v_storage_binding ->> 'port')::numeric BETWEEN 1 AND 65535
-    THEN
-        v_storage_canonical := pg_catalog.format(
-            '{"backend":"minio","bucket":%s,"host":%s,"port":%s}',
-            pg_catalog.to_jsonb(v_storage_binding ->> 'bucket')::text,
-            pg_catalog.to_jsonb(v_storage_binding ->> 'host')::text,
-            ((v_storage_binding ->> 'port')::bigint)::text
-        );
-    ELSE
-        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
-    END IF;
-
-    v_database_canonical := pg_catalog.format(
-        '{"database":%s,"driver":"postgresql","host":%s,"port":%s}',
-        pg_catalog.to_jsonb(v_database_binding ->> 'database')::text,
-        pg_catalog.to_jsonb(v_database_binding ->> 'host')::text,
-        ((v_database_binding ->> 'port')::bigint)::text
-    );
-    v_redis_canonical := pg_catalog.format(
-        '{"database":%s,"host":%s,"port":%s,"scheme":%s}',
-        ((v_redis_binding ->> 'database')::bigint)::text,
-        pg_catalog.to_jsonb(v_redis_binding ->> 'host')::text,
-        ((v_redis_binding ->> 'port')::bigint)::text,
-        pg_catalog.to_jsonb(v_redis_binding ->> 'scheme')::text
-    );
-    IF pg_catalog.encode(
-           pg_catalog.sha256(
-               pg_catalog.convert_to(v_database_canonical, 'UTF8')
-           ),
-           'hex'
-       ) IS DISTINCT FROM p_database_fingerprint
-       OR pg_catalog.encode(
-           pg_catalog.sha256(
-               pg_catalog.convert_to(v_redis_canonical, 'UTF8')
-           ),
-           'hex'
-       ) IS DISTINCT FROM p_redis_fingerprint
-       OR pg_catalog.encode(
-           pg_catalog.sha256(
-               pg_catalog.convert_to(v_storage_canonical, 'UTF8')
-           ),
-           'hex'
-       ) IS DISTINCT FROM p_storage_fingerprint
-    THEN
-        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
-    END IF;
-
-    SELECT old_registration.id
-    INTO v_superseded_id
-    FROM public.worker_registrations AS old_registration
-    WHERE old_registration.service_name = p_service_name
-      AND old_registration.status = 'active';
-
-    IF v_superseded_id IS NOT NULL THEN
-        PERFORM pg_catalog.pg_advisory_xact_lock(
-            pg_catalog.hashtextextended(
-                'vp-worker-registration:' || v_superseded_id::text,
-                0
-            )
-        );
-    END IF;
     v_now := pg_catalog.clock_timestamp();
 
     UPDATE public.worker_registrations AS old_registration
@@ -1120,6 +1633,12 @@ def downgrade() -> None:
         RELEASE_SIGNATURE,
         HEARTBEAT_SIGNATURE,
         REGISTER_SIGNATURE,
+        REGISTRATION_EXPIRE_SIGNATURE,
+        REGISTRATION_REVOKE_SIGNATURE,
+        GRANT_REVOKE_SIGNATURE,
+        GRANT_ACTIVATE_SIGNATURE,
+        GRANT_UPSERT_SIGNATURE,
+        ENDPOINT_FINGERPRINTS_SIGNATURE,
     ):
         op.execute(f"DROP FUNCTION IF EXISTS {signature}")
 
