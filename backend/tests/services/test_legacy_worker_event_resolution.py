@@ -115,18 +115,21 @@ async def seed_terminal_event(
     guarded_job: bool = False,
 ) -> tuple[dict[str, str], str]:
     channel = ChannelProfile(
+        id=uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
         name="fifth canary",
         enabled=True,
         dry_run=False,
         halted_at=NOW if channel_halted else None,
     )
     job = Job(
+        id=uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
         pipeline_id=uuid.uuid4(),
         pipeline_snapshot={"nodes": [], "edges": []},
         status=job_status,
         completed_at=NOW if job_status == JobStatus.CANCELLED else None,
     )
     node = NodeExecution(
+        id=uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
         job=job,
         node_id="smart_trim_1",
         node_type="smart_trim",
@@ -137,8 +140,9 @@ async def seed_terminal_event(
     db.add_all([channel, job, node])
     await db.flush()
     task = ProductionTask(
+        id=uuid.UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
         channel_profile_id=channel.id,
-        target_account_id=uuid.uuid4(),
+        target_account_id=uuid.UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
         prompt="fifth canary",
         state=task_state,
         job_id=job.id,
