@@ -21,6 +21,10 @@ VP_APP_CI_REPOSITORY="Ctwqk/videoprocess"
 VP_APP_CI_WORKFLOW="ci.yml"
 VP_PDS_CI_REPOSITORY="Ctwqk/policy-decision-service"
 VP_PDS_CI_WORKFLOW="ci.yml"
+VP_PDS_SERVICE="vp-pds-swarm"
+VP_PDS_HTTP_ADDR=":8080"
+VP_PDS_HEALTH_TEST='["CMD","/usr/local/bin/pds","probe","--url","http://127.0.0.1:8080/readyz","--timeout","2s"]'
+VP_SERVICE_UPDATE_NOT_ATTEMPTED=2
 VP_PYTHON_WORKER_SERVICE="vp-ffmpeg-worker-gpu-swarm"
 VP_VISION_WORKER_SERVICE="vp-vision-worker-swarm"
 VP_PUBLISHER_SERVICE="vp-youtube-publisher-swarm"
@@ -359,6 +363,14 @@ vp_update_runtime_service() {
   local has_runtime=false
   local has_runtime_node=false
   local constraint_args=()
+  local existing_constraints
+  if ! existing_constraints="$(
+    vp_service_values "$service" \
+      '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
+  )"; then
+    echo "service constraint inspection failed: $service" >&2
+    return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
+  fi
   while IFS= read -r constraint; do
     [[ -n "$constraint" ]] || continue
     case "$constraint" in
@@ -372,10 +384,7 @@ vp_update_runtime_service() {
         constraint_args+=(--constraint-rm "$constraint")
         ;;
     esac
-  done < <(
-    vp_service_values "$service" \
-      '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
-  )
+  done <<<"$existing_constraints"
   if [[ "$has_runtime" != true ]]; then
     constraint_args+=(--constraint-add "$VP_RUNTIME_CONSTRAINT")
   fi
@@ -447,6 +456,27 @@ vp_update_runtime_service() {
       "10s"
     )
   fi
+  if [[ "$service" == "$VP_PDS_SERVICE" ]]; then
+    if vp_service_values "$service" \
+      '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' \
+      | awk -F= '$1 == "PDS_HTTP_ADDR" { found=1 } END { exit found ? 0 : 1 }'; then
+      service_args+=(--env-rm PDS_HTTP_ADDR)
+    fi
+    service_args+=(
+      --env-add
+      "PDS_HTTP_ADDR=$VP_PDS_HTTP_ADDR"
+      --health-cmd
+      ""
+      --health-interval
+      "10s"
+      --health-timeout
+      "3s"
+      --health-retries
+      "6"
+      --health-start-period
+      "10s"
+    )
+  fi
 
   local update_args=(
     service update --detach=false --no-resolve-image --update-order "$order"
@@ -458,7 +488,7 @@ vp_update_runtime_service() {
     update_args+=("${service_args[@]}")
   fi
   update_args+=(--image "$image" "$service")
-  docker "${update_args[@]}" >&2
+  docker "${update_args[@]}" >&2 || return 1
 }
 
 vp_build_manager_image() {
@@ -1172,6 +1202,35 @@ vp_record_app_service_attempt() {
   VP_APP_ATTEMPTED_SERVICES="${VP_APP_ATTEMPTED_SERVICES:+$VP_APP_ATTEMPTED_SERVICES }$service"
 }
 
+vp_remove_app_service_attempt() {
+  local service="$1"
+  local attempted_service
+  local remaining_services=""
+  for attempted_service in $VP_APP_ATTEMPTED_SERVICES; do
+    [[ "$attempted_service" == "$service" ]] && continue
+    remaining_services="${remaining_services:+$remaining_services }$attempted_service"
+  done
+  VP_APP_ATTEMPTED_SERVICES="$remaining_services"
+}
+
+vp_update_app_runtime_service() {
+  local service="$1"
+  local image="$2"
+  local order="$3"
+  local update_status=0
+
+  vp_record_app_service_attempt "$service"
+  if vp_update_runtime_service "$service" "$image" "$order"; then
+    return 0
+  else
+    update_status=$?
+  fi
+  if [[ "$update_status" -eq "$VP_SERVICE_UPDATE_NOT_ATTEMPTED" ]]; then
+    vp_remove_app_service_attempt "$service"
+  fi
+  return 1
+}
+
 vp_app_service_was_attempted() {
   local service="$1"
   local attempted_services="$2"
@@ -1214,7 +1273,7 @@ vp_restore_gpu_service() {
 
 vp_restore_app_snapshots() {
   local snapshots="$1"
-  local attempted_services="${2:-$VP_APP_SERVICES}"
+  local attempted_services="${2-$VP_APP_SERVICES}"
   local service
   local image
   local gpu_was_present=false
@@ -1561,11 +1620,9 @@ vp_apply_app_services() {
 
   VP_APP_ATTEMPTED_SERVICES=""
   VP_BACKEND_MIGRATION_APPLIED=false
-  vp_record_app_service_attempt vp-api-swarm
-  vp_update_runtime_service vp-api-swarm "$api" stop-first || return 1
+  vp_update_app_runtime_service vp-api-swarm "$api" stop-first || return 1
   http_health vp-api "http://$VP_RUNTIME_HOST:18080/health" || return 1
-  vp_record_app_service_attempt vp-frontend-swarm
-  vp_update_runtime_service vp-frontend-swarm "$frontend" stop-first || return 1
+  vp_update_app_runtime_service vp-frontend-swarm "$frontend" stop-first || return 1
   http_health vp-frontend "http://$VP_RUNTIME_HOST:3001/" || return 1
   vp_record_app_service_attempt "$VP_PYTHON_WORKER_SERVICE"
   vp_deploy_python_worker "$python_worker" || return 1
@@ -1577,16 +1634,14 @@ vp_apply_app_services() {
   fi
   vp_record_app_service_attempt "$VP_PUBLISHER_SERVICE"
   vp_deploy_publisher "$python_worker" || return 1
-  vp_record_app_service_attempt vp-autoflow-api-swarm
-  vp_update_runtime_service vp-autoflow-api-swarm "$backend" start-first || return 1
+  vp_update_app_runtime_service vp-autoflow-api-swarm "$backend" start-first || return 1
   VP_BACKEND_MIGRATION_APPLIED=true
-  vp_record_app_service_attempt vp-event-outbox-relay-swarm
-  vp_update_runtime_service vp-event-outbox-relay-swarm "$backend" start-first || return 1
+  vp_update_app_runtime_service vp-event-outbox-relay-swarm "$backend" start-first || return 1
   vp_require_channelops_migration_head "$python_worker" || return 1
-  vp_record_app_service_attempt vp-channel-agent-runner-swarm
-  vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" stop-first || return 1
-  vp_record_app_service_attempt vp-ffmpeg-worker-go-swarm
-  vp_update_runtime_service vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first || return 1
+  vp_update_app_runtime_service \
+    vp-channel-agent-runner-swarm "$channelops_runner" stop-first || return 1
+  vp_update_app_runtime_service \
+    vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first || return 1
 
   local service
   for service in $VP_APP_SERVICES; do
@@ -1649,10 +1704,17 @@ vp_deploy_single_runtime_service() {
     return 1
   fi
 
-  if vp_update_runtime_service "$service" "$image" "$order" \
-    && swarm_service_running "$service"; then
-    printf '%s\n' "$service"
-    return 0
+  local candidate_update_status=0
+  if vp_update_runtime_service "$service" "$image" "$order"; then
+    if swarm_service_running "$service"; then
+      printf '%s\n' "$service"
+      return 0
+    fi
+  else
+    candidate_update_status=$?
+    if [[ "$candidate_update_status" -eq "$VP_SERVICE_UPDATE_NOT_ATTEMPTED" ]]; then
+      return 1
+    fi
   fi
 
   log "restore $service -> $baseline_image with dedicated VP placement"
@@ -1667,6 +1729,208 @@ deploy_feature_aggregator_services() {
     vp-feature-aggregator-swarm "$1" start-first
 }
 
+vp_pds_container_snapshot() {
+  remote_sh "$VP_RUNTIME_HOST" /bin/sh -s -- "$VP_PDS_SERVICE" <<'REMOTE'
+set -eu
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+export PATH
+
+service="${1:-}"
+if [ "$service" != "vp-pds-swarm" ]; then
+  exit 10
+fi
+
+container_ids="$(
+  docker container ls \
+    --filter "label=com.docker.swarm.service.name=$service" \
+    --filter status=running \
+    --format '{{.ID}}' \
+    2>/dev/null
+)" || exit 11
+container_count="$(
+  printf '%s\n' "$container_ids" | awk 'NF { count++ } END { print count+0 }'
+)" || exit 11
+if [ "$container_count" -ne 1 ]; then
+  printf 'pending|container_set\n'
+  exit 0
+fi
+case "$container_ids" in
+  ''|*[!0-9a-f]*)
+    exit 12
+    ;;
+esac
+container_id_length="${#container_ids}"
+if [ "$container_id_length" -lt 12 ] || [ "$container_id_length" -gt 64 ]; then
+  exit 12
+fi
+
+container_data="$(
+  docker container inspect \
+    --format '{{.Config.Image}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}|{{if .Config.Healthcheck}}{{json .Config.Healthcheck.Test}}|{{.Config.Healthcheck.Interval}}|{{.Config.Healthcheck.Timeout}}|{{.Config.Healthcheck.StartPeriod}}|{{.Config.Healthcheck.Retries}}{{else}}none|0s|0s|0s|0{{end}}{{println}}{{range .Config.Env}}{{println .}}{{end}}' \
+    "$container_ids" \
+    2>/dev/null
+)" || {
+  printf 'pending|container_set\n'
+  exit 0
+}
+container_snapshot="$(printf '%s\n' "$container_data" | sed -n '1p')"
+container_env="$(printf '%s\n' "$container_data" | sed -n '2,$p')"
+http_addr="$(
+  printf '%s\n' "$container_env" \
+    | awk -F= '$1 == "PDS_HTTP_ADDR" { count++; value=substr($0, index($0, "=") + 1) } END { if (count == 1) print value; else exit 1 }'
+)" || exit 14
+if [ "$http_addr" != ":8080" ]; then
+  exit 15
+fi
+case "$container_snapshot" in
+  *'|'*)
+    image="${container_snapshot%%|*}"
+    health_fields="${container_snapshot#*|}"
+    ;;
+  *)
+    exit 16
+    ;;
+esac
+printf '%s|:8080|%s\n' "$image" "$health_fields"
+REMOTE
+}
+
+vp_require_pds_ready() {
+  local expected_image="$1"
+
+  vp_validate_topology || return 1
+  swarm_service_running "$VP_PDS_SERVICE" || return 1
+  vp_require_service_node "$VP_PDS_SERVICE" "$VP_RUNTIME_NODE" || return 1
+
+  local attempt
+  local snapshot
+  local actual_image
+  local actual_http_addr
+  local health
+  local health_test
+  local health_interval
+  local health_timeout
+  local health_start_period
+  local health_retries
+  local extra
+  for ((attempt = 1; attempt <= 18; attempt++)); do
+    if ! snapshot="$(vp_pds_container_snapshot 2>/dev/null)"; then
+      echo "PDS container inspection failed: $VP_PDS_SERVICE" >&2
+      return 1
+    fi
+    if [[ "$snapshot" == "pending|container_set" ]]; then
+      if [[ "$attempt" -lt 18 ]]; then
+        sleep 5 || {
+          echo "PDS readiness wait failed: $VP_PDS_SERVICE" >&2
+          return 1
+        }
+        continue
+      fi
+      break
+    fi
+    if [[ -z "$snapshot" || "$snapshot" == *$'\n'* ]]; then
+      echo "PDS container inspection returned invalid data: $VP_PDS_SERVICE" >&2
+      return 1
+    fi
+
+    IFS='|' read -r \
+      actual_image \
+      actual_http_addr \
+      health \
+      health_test \
+      health_interval \
+      health_timeout \
+      health_start_period \
+      health_retries \
+      extra <<<"$snapshot"
+    if [[ -n "$extra" \
+      || -z "$actual_image" \
+      || -z "$actual_http_addr" \
+      || -z "$health" \
+      || -z "$health_test" \
+      || -z "$health_interval" \
+      || -z "$health_timeout" \
+      || -z "$health_start_period" \
+      || -z "$health_retries" ]]; then
+      echo "PDS container inspection returned invalid data: $VP_PDS_SERVICE" >&2
+      return 1
+    fi
+    if [[ "$actual_image" != "$expected_image" \
+      || "$actual_http_addr" != "$VP_PDS_HTTP_ADDR" \
+      || "$health_test" != "$VP_PDS_HEALTH_TEST" \
+      || "$health_interval" != "10s" \
+      || "$health_timeout" != "3s" \
+      || "$health_start_period" != "10s" \
+      || "$health_retries" != "6" ]]; then
+      echo "PDS container contract mismatch: $VP_PDS_SERVICE" >&2
+      return 1
+    fi
+    case "$health" in
+      healthy)
+        log "PDS readiness passed: $VP_PDS_SERVICE"
+        return 0
+        ;;
+      starting)
+        if [[ "$attempt" -lt 18 ]]; then
+          sleep 5 || {
+            echo "PDS readiness wait failed: $VP_PDS_SERVICE" >&2
+            return 1
+          }
+          continue
+        fi
+        ;;
+      *)
+        echo "PDS container is not healthy: $VP_PDS_SERVICE" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  echo "PDS readiness deadline exceeded: $VP_PDS_SERVICE" >&2
+  return 1
+}
+
 deploy_pds_services() {
-  vp_deploy_single_runtime_service vp-pds-swarm "$1" start-first
+  local image="$1"
+
+  vp_validate_topology || return 1
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    vp_update_runtime_service "$VP_PDS_SERVICE" "$image" start-first || return 1
+    swarm_service_running "$VP_PDS_SERVICE" || return 1
+    printf '%s\n' "$VP_PDS_SERVICE"
+    return 0
+  fi
+
+  local baseline_image
+  baseline_image="$(
+    vp_service_values "$VP_PDS_SERVICE" \
+      '{{.Spec.TaskTemplate.ContainerSpec.Image}}'
+  )" || return 1
+  if [[ -z "$baseline_image" ]]; then
+    echo "missing current image for VideoProcess service: $VP_PDS_SERVICE" >&2
+    return 1
+  fi
+
+  local candidate_update_status=0
+  if vp_update_runtime_service "$VP_PDS_SERVICE" "$image" start-first; then
+    if vp_require_pds_ready "$image"; then
+      printf '%s\n' "$VP_PDS_SERVICE"
+      return 0
+    fi
+  else
+    candidate_update_status=$?
+    if [[ "$candidate_update_status" -eq "$VP_SERVICE_UPDATE_NOT_ATTEMPTED" ]]; then
+      return 1
+    fi
+  fi
+
+  log "restore $VP_PDS_SERVICE -> $baseline_image with dedicated VP placement"
+  if ! vp_update_runtime_service "$VP_PDS_SERVICE" "$baseline_image" stop-first; then
+    echo "PDS image restore did not converge" >&2
+    return 1
+  fi
+  if ! vp_require_pds_ready "$baseline_image"; then
+    echo "PDS image restore did not become ready" >&2
+  fi
+  return 1
 }

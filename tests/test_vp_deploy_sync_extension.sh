@@ -158,6 +158,7 @@ FAIL_GPU_CONSTRAINT_INSPECT=false
 GPU_PREFLIGHT_SUCCEEDS=true
 FAIL_UPDATE_SERVICE=
 FAIL_UPDATE_IMAGE=
+FAIL_UPDATE_EXIT=1
 FAIL_GPU_CREATE=false
 FAIL_RUNNING_SERVICE=
 FAIL_HEALTH_CHECK=
@@ -173,9 +174,24 @@ VISION_CONSUMER_AUDIT_MODE=converged
 GPU_TASK_NODE=ccttww-lap
 VISION_TASK_NODE=ccttww-lap
 PUBLISHER_TASK_NODE=ccttww-lap
+PDS_TASK_NODE=colima-127
 GPU_TASK_STATE='Running 2 seconds ago'
 VISION_TASK_STATE='Running 2 seconds ago'
 PUBLISHER_TASK_STATE='Running 2 seconds ago'
+PDS_TASK_STATE='Running 2 seconds ago'
+PDS_CURRENT_IMAGE=baseline-vp-pds-swarm:stable
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=healthy
+PDS_READINESS_CALLS_FILE="$TEST_ROOT/pds-readiness-calls"
+PDS_CONSTRAINT_INSPECT_MODE=normal
+PDS_CONSTRAINT_INSPECT_CALLS_FILE="$TEST_ROOT/pds-constraint-inspect-calls"
+RUNTIME_CONSTRAINT_INSPECT_SERVICE=
+RUNTIME_CONSTRAINT_INSPECT_MODE=normal
+RUNTIME_CONSTRAINT_INSPECT_CALLS_FILE="$TEST_ROOT/runtime-constraint-inspect-calls"
+PDS_EXPECTED_TEST='["CMD","/usr/local/bin/pds","probe","--url","http://127.0.0.1:8080/readyz","--timeout","2s"]'
+PDS_REMOTE_SCRIPT="$TEST_ROOT/pds-container-snapshot.sh"
+PDS_REMOTE_BIN="$TEST_ROOT/pds-remote-bin"
+FAIL_PDS_READINESS_SLEEP=false
 WORKER_READINESS_CONTAINER_MODE=normal
 FAIL_WORKER_READINESS_SERVICE=
 WORKER_READINESS_EXEC_MODE=normal
@@ -187,6 +203,85 @@ WORKER_READINESS_CONTAINER_CALLS="$TEST_ROOT/worker-readiness-container-calls"
 GPU_READINESS_CONTAINER_ID=1111111111111111111111111111111111111111111111111111111111111111
 VISION_READINESS_CONTAINER_ID=2222222222222222222222222222222222222222222222222222222222222222
 PUBLISHER_READINESS_CONTAINER_ID=3333333333333333333333333333333333333333333333333333333333333333
+
+mkdir -p "$PDS_REMOTE_BIN"
+cat >"$PDS_REMOTE_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${PDS_REMOTE_DOCKER_MODE:-healthy}"
+if [[ "${1:-} ${2:-}" == "container ls" ]]; then
+  [[ "$*" == *'label=com.docker.swarm.service.name=vp-pds-swarm'* \
+    && "$*" == *'--filter status=running'* \
+    && "$*" == *'--format {{.ID}}'* ]] || exit 80
+  case "$mode" in
+    list-error)
+      exit 81
+      ;;
+    missing)
+      ;;
+    duplicate)
+      printf '%064d\n%064d\n' 1 2
+      ;;
+    bad-id)
+      printf 'not-a-container-id\n'
+      ;;
+    *)
+      printf '%064d\n' 1
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "${1:-} ${2:-}" == "container inspect" ]]; then
+  [[ "${3:-}" == "--format" \
+    && "${4:-}" == *'.Config.Image'* \
+    && "${4:-}" == *'.Config.Env'* \
+    && "${4:-}" == *'.Config.Healthcheck'* ]] || exit 82
+  if [[ "$mode" == "inspect-error" ]]; then
+    exit 83
+  fi
+  if [[ "$mode" == "no-health" ]]; then
+    printf 'vp-pds:test|none|none|0s|0s|0s|0\n'
+  else
+    printf '%s\n' \
+      'vp-pds:test|healthy|["CMD","/usr/local/bin/pds","probe","--url","http://127.0.0.1:8080/readyz","--timeout","2s"]|10s|3s|10s|6'
+  fi
+  case "$mode" in
+    env-missing)
+      ;;
+    env-duplicate)
+      printf 'PDS_HTTP_ADDR=:8080\nPDS_HTTP_ADDR=:8080\n'
+      ;;
+    wrong-http)
+      printf 'PDS_HTTP_ADDR=:9099\n'
+      ;;
+    *)
+      printf 'PDS_HTTP_ADDR=:8080\n'
+      ;;
+  esac
+  exit 0
+fi
+
+exit 84
+EOF
+chmod +x "$PDS_REMOTE_BIN/docker"
+awk -v fake_path="$PDS_REMOTE_BIN:/usr/bin:/bin" '
+  /^vp_pds_container_snapshot\(\) \{/ { in_function=1; next }
+  in_function && /<<'\''REMOTE'\''/ { capture=1; next }
+  capture && /^REMOTE$/ { exit }
+  capture {
+    if ($0 ~ /^PATH=/) {
+      print "PATH=" fake_path
+    } else {
+      print
+    }
+  }
+' "$EXTENSION" >"$PDS_REMOTE_SCRIPT"
+if ! grep -Fq 'container_data=' "$PDS_REMOTE_SCRIPT"; then
+  echo 'FAIL: PDS remote snapshot script extraction failed' >&2
+  exit 1
+fi
 
 printf() {
   if [[ "$FAIL_MANAGED_CRON_PRINTF" == "true" \
@@ -222,7 +317,8 @@ rm() {
 
 sleep() {
   printf 'sleep|%s\n' "$*" >>"$CALLS"
-  [[ "$FAIL_WORKER_READINESS_SLEEP" != "true" ]]
+  [[ "$FAIL_WORKER_READINESS_SLEEP" != "true" \
+    && "$FAIL_PDS_READINESS_SLEEP" != "true" ]]
 }
 
 awk() {
@@ -245,6 +341,103 @@ http_health() {
 swarm_service_running() {
   printf 'running|%s\n' "$1" >>"$CALLS"
   [[ "$1" != "$FAIL_RUNNING_SERVICE" ]]
+}
+
+remote_sh() {
+  printf 'remote|%s' "$1" >>"$CALLS"
+  shift
+  printf '|%s' "$@" >>"$CALLS"
+  printf '\n' >>"$CALLS"
+  command cat >/dev/null
+
+  [[ "${1:-}" == "/bin/sh" \
+    && "${2:-}" == "-s" \
+    && "${3:-}" == "--" \
+    && "${4:-}" == "vp-pds-swarm" ]] || return 1
+
+  local readiness_call=0
+  if [[ -f "$PDS_READINESS_CALLS_FILE" ]]; then
+    readiness_call="$(<"$PDS_READINESS_CALLS_FILE")"
+  fi
+  readiness_call=$((readiness_call + 1))
+  printf '%s\n' "$readiness_call" >"$PDS_READINESS_CALLS_FILE"
+
+  local image="$PDS_CURRENT_IMAGE"
+  local http_addr="$PDS_CURRENT_HTTP_ADDR"
+  local health=healthy
+  local test="$PDS_EXPECTED_TEST"
+  local interval=10s
+  local timeout=3s
+  local start_period=10s
+  local retries=6
+  case "$PDS_READINESS_MODE" in
+    healthy)
+      ;;
+    starting-then-healthy)
+      if [[ "$readiness_call" -lt 3 ]]; then
+        health=starting
+      fi
+      ;;
+    always-starting)
+      health=starting
+      ;;
+    missing|duplicate)
+      printf 'pending|container_set\n'
+      return 0
+      ;;
+    container-set-then-healthy)
+      if [[ "$readiness_call" -lt 3 ]]; then
+        printf 'pending|container_set\n'
+        return 0
+      fi
+      ;;
+    wrong-image)
+      image=vp-pds:unexpected
+      ;;
+    wrong-http-addr)
+      http_addr=:9099
+      ;;
+    wrong-command)
+      test='["CMD-SHELL","curl http://sentinel-secret"]'
+      ;;
+    wrong-timing)
+      interval=30s
+      ;;
+    unhealthy)
+      health=unhealthy
+      ;;
+    new-unhealthy-rollback-healthy)
+      if [[ "$image" != "baseline-vp-pds-swarm:stable" ]]; then
+        health=unhealthy
+      fi
+      ;;
+    new-unhealthy-rollback-no-health)
+      if [[ "$image" == "baseline-vp-pds-swarm:stable" ]]; then
+        health=none
+        test=none
+        interval=0s
+        timeout=0s
+        start_period=0s
+        retries=0
+      else
+        health=unhealthy
+      fi
+      ;;
+    remote-error)
+      printf 'daemon=tcp://sentinel-secret container=aaaaaaaaaaaaaaaa\n' >&2
+      return 11
+      ;;
+    malformed)
+      printf 'not-a-valid-snapshot\n'
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$image" "$http_addr" "$health" "$test" \
+    "$interval" "$timeout" "$start_period" "$retries"
 }
 
 docker() {
@@ -312,7 +505,22 @@ docker() {
     && -n "$FAIL_UPDATE_SERVICE" \
     && "$*" == *"--image $FAIL_UPDATE_IMAGE"* \
     && "$*" == *"$FAIL_UPDATE_SERVICE"* ]]; then
-    return 1
+    return "$FAIL_UPDATE_EXIT"
+  fi
+  if [[ "${1:-} ${2:-}" == "service update" \
+    && "$*" == *"vp-pds-swarm"* ]]; then
+    local previous=""
+    local argument
+    for argument in "$@"; do
+      if [[ "$previous" == "--image" ]]; then
+        PDS_CURRENT_IMAGE="$argument"
+        break
+      fi
+      previous="$argument"
+    done
+    if [[ "$*" == *"--env-add PDS_HTTP_ADDR=:8080"* ]]; then
+      PDS_CURRENT_HTTP_ADDR=:8080
+    fi
   fi
   if [[ "${1:-} ${2:-}" == "service update" \
     && "$*" == *"vp-channel-agent-runner-swarm"* \
@@ -351,6 +559,9 @@ docker() {
         ;;
       vp-youtube-publisher-swarm)
         printf '%s|%s\n' "$PUBLISHER_TASK_NODE" "$PUBLISHER_TASK_STATE"
+        ;;
+      vp-pds-swarm)
+        printf '%s|%s\n' "$PDS_TASK_NODE" "$PDS_TASK_STATE"
         ;;
       *)
         return 1
@@ -493,7 +704,11 @@ docker() {
     fi
     case "$*" in
       *ContainerSpec.Image*)
-        echo "baseline-$service:stable"
+        if [[ "$service" == "vp-pds-swarm" ]]; then
+          echo "$PDS_CURRENT_IMAGE"
+        else
+          echo "baseline-$service:stable"
+        fi
         ;;
       *Spec.Mode.Replicated.Replicas*)
         if [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
@@ -501,9 +716,65 @@ docker() {
         fi
         ;;
       *Placement.Constraints*)
-        if [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" \
+        if [[ -n "$RUNTIME_CONSTRAINT_INSPECT_SERVICE" \
+          && "$service" == "$RUNTIME_CONSTRAINT_INSPECT_SERVICE" ]]; then
+          local runtime_constraint_inspect_call=0
+          if [[ -f "$RUNTIME_CONSTRAINT_INSPECT_CALLS_FILE" ]]; then
+            runtime_constraint_inspect_call="$(<"$RUNTIME_CONSTRAINT_INSPECT_CALLS_FILE")"
+          fi
+          runtime_constraint_inspect_call=$((runtime_constraint_inspect_call + 1))
+          printf '%s\n' "$runtime_constraint_inspect_call" \
+            >"$RUNTIME_CONSTRAINT_INSPECT_CALLS_FILE"
+          case "$RUNTIME_CONSTRAINT_INSPECT_MODE" in
+            fail-first)
+              if [[ "$runtime_constraint_inspect_call" -eq 1 ]]; then
+                return 1
+              fi
+              ;;
+            *)
+              return 1
+              ;;
+          esac
+          echo 'node.labels.role==app'
+        elif [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" \
           && "$FAIL_GPU_CONSTRAINT_INSPECT" == "true" ]]; then
           return 1
+        elif [[ "$service" == "vp-pds-swarm" ]]; then
+          local pds_constraint_inspect_call=0
+          if [[ -f "$PDS_CONSTRAINT_INSPECT_CALLS_FILE" ]]; then
+            pds_constraint_inspect_call="$(<"$PDS_CONSTRAINT_INSPECT_CALLS_FILE")"
+          fi
+          pds_constraint_inspect_call=$((pds_constraint_inspect_call + 1))
+          printf '%s\n' "$pds_constraint_inspect_call" >"$PDS_CONSTRAINT_INSPECT_CALLS_FILE"
+          case "$PDS_CONSTRAINT_INSPECT_MODE" in
+            normal)
+              ;;
+            fail-always)
+              return 1
+              ;;
+            fail-first)
+              if [[ "$pds_constraint_inspect_call" -eq 1 ]]; then
+                return 1
+              fi
+              ;;
+            fail-second)
+              if [[ "$pds_constraint_inspect_call" -eq 2 ]]; then
+                return 1
+              fi
+              ;;
+            *)
+              return 1
+              ;;
+          esac
+          if [[ "$CONSTRAINT_MODE" == "runtime" ]]; then
+            echo 'node.labels.vp.runtime==true'
+            echo 'node.hostname==colima-127'
+          elif [[ "$CONSTRAINT_MODE" == "pds-stale" ]]; then
+            echo 'node.hostname==CASPERs-Mac-mini'
+            echo 'node.labels.vp.legacy==true'
+          else
+            echo 'node.labels.role==app'
+          fi
         elif [[ "$service" == "vp-youtube-publisher-swarm" ]]; then
           case "$PUBLISHER_CONSTRAINT_MODE" in
             publisher)
@@ -587,6 +858,8 @@ docker() {
             echo 'GOOGLE_CLIENT_SECRETS_FILE=fixture-file'
             echo 'YOUTUBE_REFRESH_TOKEN=fixture-token'
           fi
+        elif [[ "$service" == "vp-pds-swarm" ]]; then
+          echo 'PDS_HTTP_ADDR=:9099'
         fi
         ;;
       *ContainerSpec.Secrets*)
@@ -647,7 +920,8 @@ if ! grep -Fq 'CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1' "$EXTENSION"; th
   echo 'FAIL: managed ChannelOps runner must use the exact 127 identity' >&2
   exit 1
 fi
-if ! grep -Fq 'vp_update_runtime_service vp-channel-agent-runner-swarm "$channelops_runner" stop-first' "$EXTENSION"; then
+if ! grep -Fq 'vp_update_app_runtime_service \' "$EXTENSION" \
+  || ! grep -Fq 'vp-channel-agent-runner-swarm "$channelops_runner" stop-first' "$EXTENSION"; then
   echo 'FAIL: managed ChannelOps runner must replace stop-first' >&2
   exit 1
 fi
@@ -665,11 +939,11 @@ if ! grep -Fq 'rows != [\"033_legacy_worker_event_resolutions\"]' "$EXTENSION" \
   exit 1
 fi
 for expected_order in \
-  'vp_update_runtime_service vp-api-swarm "$api" stop-first' \
-  'vp_update_runtime_service vp-frontend-swarm "$frontend" stop-first' \
-  'vp_update_runtime_service vp-autoflow-api-swarm "$backend" start-first' \
-  'vp_update_runtime_service vp-event-outbox-relay-swarm "$backend" start-first' \
-  'vp_update_runtime_service vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first'; do
+  'vp_update_app_runtime_service vp-api-swarm "$api" stop-first' \
+  'vp_update_app_runtime_service vp-frontend-swarm "$frontend" stop-first' \
+  'vp_update_app_runtime_service vp-autoflow-api-swarm "$backend" start-first' \
+  'vp_update_app_runtime_service vp-event-outbox-relay-swarm "$backend" start-first' \
+  'vp-ffmpeg-worker-go-swarm "$ffmpeg_go" stop-first'; do
   if ! grep -Fq "$expected_order" "$EXTENSION"; then
     echo "FAIL: neighboring runtime rollout order changed: $expected_order" >&2
     exit 1
@@ -2578,11 +2852,269 @@ PUBLISHER_CONSTRAINT_MODE=legacy
 PUBLISHER_MOUNT_MODE=wrong
 PUBLISHER_ENV_MODE=credentials
 
+remote_script_output="$(
+  PDS_REMOTE_DOCKER_MODE=healthy \
+    /bin/sh "$PDS_REMOTE_SCRIPT" vp-pds-swarm
+)"
+if [[ "$remote_script_output" \
+  != "vp-pds:test|:8080|healthy|$PDS_EXPECTED_TEST|10s|3s|10s|6" ]]; then
+  echo 'FAIL: real PDS remote script did not produce the healthy snapshot contract' >&2
+  exit 1
+fi
+for pds_remote_pending_mode in missing duplicate inspect-error; do
+  remote_script_output="$(
+    PDS_REMOTE_DOCKER_MODE="$pds_remote_pending_mode" \
+      /bin/sh "$PDS_REMOTE_SCRIPT" vp-pds-swarm
+  )"
+  if [[ "$remote_script_output" != "pending|container_set" ]]; then
+    echo "FAIL: real PDS remote script did not sanitize $pds_remote_pending_mode as pending" >&2
+    exit 1
+  fi
+done
+for pds_remote_failure_mode in list-error bad-id env-missing env-duplicate wrong-http; do
+  if remote_script_output="$(
+    PDS_REMOTE_DOCKER_MODE="$pds_remote_failure_mode" \
+      /bin/sh "$PDS_REMOTE_SCRIPT" vp-pds-swarm 2>/dev/null
+  )"; then
+    echo "FAIL: real PDS remote script accepted $pds_remote_failure_mode" >&2
+    exit 1
+  fi
+  if [[ -n "$remote_script_output" ]]; then
+    echo "FAIL: real PDS remote script exposed output for $pds_remote_failure_mode" >&2
+    exit 1
+  fi
+done
+remote_script_output="$(
+  PDS_REMOTE_DOCKER_MODE=no-health \
+    /bin/sh "$PDS_REMOTE_SCRIPT" vp-pds-swarm
+)"
+if [[ "$remote_script_output" != "vp-pds:test|:8080|none|none|0s|0s|0s|0" ]]; then
+  echo 'FAIL: real PDS remote script did not sanitize an absent health config' >&2
+  exit 1
+fi
+
 : >"$CALLS"
-GPU_SERVICE_EXISTS=true
-FAIL_UPDATE_SERVICE=vp-pds-swarm
-FAIL_UPDATE_IMAGE=vp-pds:rollback-test
+CONSTRAINT_MODE=pds-stale
+PDS_CURRENT_IMAGE=baseline-vp-pds-swarm:stable
+PDS_CURRENT_HTTP_ADDR=:9099
+PDS_READINESS_MODE=starting-then-healthy
+rm -f "$PDS_READINESS_CALLS_FILE"
+if ! pds_output="$(deploy_pds_services vp-pds:health-gated-test)"; then
+  echo 'FAIL: healthy PDS deployment did not converge' >&2
+  exit 1
+fi
+if [[ "$pds_output" != "vp-pds-swarm" ]]; then
+  echo 'FAIL: PDS deployment stdout must contain only the service name' >&2
+  exit 1
+fi
+pds_update="$(
+  grep -F 'docker|service update' "$CALLS" \
+    | grep -F -- '--image vp-pds:health-gated-test vp-pds-swarm' \
+    | head -n 1
+)"
+for expected_pds_update_arg in \
+  '--constraint-rm node.hostname==CASPERs-Mac-mini' \
+  '--constraint-rm node.labels.vp.legacy==true' \
+  '--constraint-add node.labels.vp.runtime==true' \
+  '--constraint-add node.hostname==colima-127' \
+  '--env-rm PDS_HTTP_ADDR' \
+  '--env-add PDS_HTTP_ADDR=:8080' \
+  '--health-cmd  --health-interval 10s' \
+  '--health-timeout 3s' \
+  '--health-retries 6' \
+  '--health-start-period 10s'; do
+  if [[ "$pds_update" != *"$expected_pds_update_arg"* ]]; then
+    echo "FAIL: PDS update is missing $expected_pds_update_arg" >&2
+    exit 1
+  fi
+done
+grep -Fq 'docker|service ps vp-pds-swarm --filter desired-state=running --format {{.Node}}|{{.CurrentState}}' "$CALLS"
+if [[ "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 3 \
+  || "$(grep -Fc 'sleep|5' "$CALLS")" -ne 2 ]]; then
+  echo 'FAIL: PDS starting state did not use bounded readiness retries' >&2
+  exit 1
+fi
+pds_node_line="$(grep -nF 'docker|service ps vp-pds-swarm' "$CALLS" | head -n 1 | cut -d: -f1)"
+pds_remote_line="$(grep -nF 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS" | head -n 1 | cut -d: -f1)"
+if [[ -z "$pds_node_line" || -z "$pds_remote_line" || "$pds_node_line" -ge "$pds_remote_line" ]]; then
+  echo 'FAIL: PDS node verification must precede remote container health' >&2
+  exit 1
+fi
+if grep -Eq '10\.0\.0\.126|CASPERs-Mac-mini|colima-swarmbridged|test-access|test-secret|sentinel-secret|aaaaaaaaaaaaaaaa' \
+  <<<"$(grep -F 'remote|' "$CALLS")"; then
+  echo 'FAIL: PDS remote readiness exposed a forbidden host, container ID, or secret' >&2
+  exit 1
+fi
+CONSTRAINT_MODE=legacy
+
+for pds_failure_mode in \
+  wrong-image wrong-http-addr wrong-command wrong-timing unhealthy remote-error malformed; do
+  : >"$CALLS"
+  PDS_CURRENT_IMAGE=vp-pds:readiness-failure-test
+  PDS_CURRENT_HTTP_ADDR=:8080
+  PDS_READINESS_MODE="$pds_failure_mode"
+  rm -f "$PDS_READINESS_CALLS_FILE"
+  if vp_require_pds_ready "$PDS_CURRENT_IMAGE" >/dev/null 2>&1; then
+    echo "FAIL: PDS readiness accepted mode $pds_failure_mode" >&2
+    exit 1
+  fi
+  if [[ "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 1 ]]; then
+    echo "FAIL: terminal PDS readiness mode $pds_failure_mode was retried" >&2
+    exit 1
+  fi
+done
+
+: >"$CALLS"
+PDS_CURRENT_IMAGE=vp-pds:remote-error-test
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=remote-error
+rm -f "$PDS_READINESS_CALLS_FILE"
+if vp_require_pds_ready "$PDS_CURRENT_IMAGE" \
+  >/dev/null 2>"$TEST_ROOT/pds-remote-error.err"; then
+  echo 'FAIL: PDS remote inspection error unexpectedly passed' >&2
+  exit 1
+fi
+if [[ "$(<"$TEST_ROOT/pds-remote-error.err")" \
+  != "PDS container inspection failed: vp-pds-swarm" ]]; then
+  echo 'FAIL: PDS remote inspection error was not service-only' >&2
+  exit 1
+fi
+if grep -Eq 'sentinel-secret|aaaaaaaaaaaaaaaa|tcp://' "$TEST_ROOT/pds-remote-error.err"; then
+  echo 'FAIL: PDS remote inspection error exposed remote details' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+PDS_CURRENT_IMAGE=vp-pds:container-transition-test
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=container-set-then-healthy
+rm -f "$PDS_READINESS_CALLS_FILE"
+if ! vp_require_pds_ready "$PDS_CURRENT_IMAGE" >/dev/null; then
+  echo 'FAIL: transient PDS container-set transition did not converge' >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 3 \
+  || "$(grep -Fc 'sleep|5' "$CALLS")" -ne 2 ]]; then
+  echo 'FAIL: transient PDS container-set transition was not retried safely' >&2
+  exit 1
+fi
+
+for pds_container_set_mode in missing duplicate; do
+  : >"$CALLS"
+  PDS_CURRENT_IMAGE=vp-pds:container-set-timeout-test
+  PDS_CURRENT_HTTP_ADDR=:8080
+  PDS_READINESS_MODE="$pds_container_set_mode"
+  rm -f "$PDS_READINESS_CALLS_FILE"
+  if vp_require_pds_ready "$PDS_CURRENT_IMAGE" >/dev/null 2>&1; then
+    echo "FAIL: persistent PDS $pds_container_set_mode container set passed readiness" >&2
+    exit 1
+  fi
+  if [[ "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 18 \
+    || "$(grep -Fc 'sleep|5' "$CALLS")" -ne 17 ]]; then
+    echo "FAIL: persistent PDS $pds_container_set_mode container set was not bounded" >&2
+    exit 1
+  fi
+done
+
+: >"$CALLS"
+PDS_CURRENT_IMAGE=vp-pds:starting-timeout-test
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=always-starting
+rm -f "$PDS_READINESS_CALLS_FILE"
+if vp_require_pds_ready "$PDS_CURRENT_IMAGE" >/dev/null 2>&1; then
+  echo 'FAIL: indefinitely starting PDS container passed readiness' >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 18 \
+  || "$(grep -Fc 'sleep|5' "$CALLS")" -ne 17 ]]; then
+  echo 'FAIL: PDS readiness retry deadline is not exactly bounded' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+PDS_CURRENT_IMAGE=baseline-vp-pds-swarm:stable
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=new-unhealthy-rollback-healthy
+rm -f "$PDS_READINESS_CALLS_FILE"
 if deploy_pds_services vp-pds:rollback-test >/dev/null 2>&1; then
+  echo 'FAIL: unhealthy PDS update unexpectedly succeeded after rollback' >&2
+  exit 1
+fi
+candidate_pds_update="$(
+  grep -F 'docker|service update' "$CALLS" \
+    | grep -F -- '--update-order start-first' \
+    | grep -F -- '--image vp-pds:rollback-test vp-pds-swarm' \
+    | head -n 1
+)"
+rollback_pds_update="$(
+  grep -F 'docker|service update' "$CALLS" \
+    | grep -F -- '--update-order stop-first' \
+    | grep -F -- '--image baseline-vp-pds-swarm:stable vp-pds-swarm' \
+    | head -n 1
+)"
+if [[ "$candidate_pds_update" != *'--health-cmd  --health-interval 10s'* \
+  || "$rollback_pds_update" != *'--health-cmd  --health-interval 10s'* ]]; then
+  echo 'FAIL: PDS candidate and rollback must retain the health contract' >&2
+  exit 1
+fi
+grep -Fq -- '--image baseline-vp-pds-swarm:stable vp-pds-swarm' "$CALLS"
+if [[ "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 2 ]]; then
+  echo 'FAIL: PDS rollback did not verify both candidate and baseline readiness' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+PDS_CURRENT_IMAGE=baseline-vp-pds-swarm:stable
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=new-unhealthy-rollback-no-health
+rm -f "$PDS_READINESS_CALLS_FILE"
+if deploy_pds_services vp-pds:rollback-readiness-failure-test >/dev/null 2>&1; then
+  echo 'FAIL: PDS rollback readiness failure unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -Fq -- '--image baseline-vp-pds-swarm:stable vp-pds-swarm' "$CALLS"
+
+: >"$CALLS"
+FAIL_UPDATE_SERVICE=vp-pds-swarm
+FAIL_UPDATE_IMAGE=baseline-vp-pds-swarm:stable
+PDS_CURRENT_IMAGE=baseline-vp-pds-swarm:stable
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=unhealthy
+rm -f "$PDS_READINESS_CALLS_FILE"
+if deploy_pds_services vp-pds:rollback-update-failure-test >/dev/null 2>&1; then
+  echo 'FAIL: PDS rollback update failure unexpectedly succeeded' >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 1 ]]; then
+  echo 'FAIL: PDS readiness ran after rollback update failed' >&2
+  exit 1
+fi
+FAIL_UPDATE_SERVICE=
+FAIL_UPDATE_IMAGE=
+
+: >"$CALLS"
+PDS_TASK_NODE=CASPERs-Mac-mini
+PDS_CURRENT_IMAGE=vp-pds:forbidden-node-test
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=healthy
+rm -f "$PDS_READINESS_CALLS_FILE"
+if vp_require_pds_ready "$PDS_CURRENT_IMAGE" >/dev/null 2>&1; then
+  echo 'FAIL: PDS task on host 126 passed readiness' >&2
+  exit 1
+fi
+if grep -Fq 'remote|' "$CALLS"; then
+  echo 'FAIL: PDS readiness contacted 127 after node verification failed' >&2
+  exit 1
+fi
+PDS_TASK_NODE=colima-127
+
+: >"$CALLS"
+FAIL_UPDATE_SERVICE=vp-pds-swarm
+FAIL_UPDATE_IMAGE=vp-pds:update-failure-test
+PDS_CURRENT_IMAGE=baseline-vp-pds-swarm:stable
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=healthy
+if deploy_pds_services vp-pds:update-failure-test >/dev/null 2>&1; then
   echo 'FAIL: injected PDS update failure unexpectedly succeeded' >&2
   exit 1
 fi
@@ -2590,6 +3122,105 @@ grep -Fq -- '--image baseline-vp-pds-swarm:stable vp-pds-swarm' "$CALLS"
 grep -Fq -- '--constraint-add node.labels.vp.runtime==true' "$CALLS"
 FAIL_UPDATE_SERVICE=
 FAIL_UPDATE_IMAGE=
+
+: >"$CALLS"
+PDS_CONSTRAINT_INSPECT_MODE=fail-first
+rm -f "$PDS_CONSTRAINT_INSPECT_CALLS_FILE"
+PDS_CURRENT_IMAGE=baseline-vp-pds-swarm:stable
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=healthy
+if deploy_pds_services vp-pds:constraint-inspect-failure-test >/dev/null 2>&1; then
+  echo 'FAIL: PDS candidate constraint inspect failure unexpectedly succeeded' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service update' "$CALLS"; then
+  echo 'FAIL: PDS candidate constraint inspect failure mutated Swarm' >&2
+  exit 1
+fi
+PDS_CONSTRAINT_INSPECT_MODE=normal
+
+: >"$CALLS"
+PDS_CONSTRAINT_INSPECT_MODE=fail-second
+rm -f "$PDS_CONSTRAINT_INSPECT_CALLS_FILE"
+PDS_CURRENT_IMAGE=baseline-vp-pds-swarm:stable
+PDS_CURRENT_HTTP_ADDR=:8080
+PDS_READINESS_MODE=unhealthy
+if deploy_pds_services vp-pds:rollback-constraint-inspect-failure-test \
+  >/dev/null 2>&1; then
+  echo 'FAIL: PDS rollback constraint inspect failure unexpectedly succeeded' >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'docker|service update' "$CALLS")" -ne 1 \
+  || "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 1 ]]; then
+  echo 'FAIL: PDS rollback constraint inspect failure wrote after the failed inspect' >&2
+  exit 1
+fi
+PDS_CONSTRAINT_INSPECT_MODE=normal
+rm -f "$PDS_CONSTRAINT_INSPECT_CALLS_FILE"
+
+: >"$CALLS"
+RUNTIME_CONSTRAINT_INSPECT_SERVICE=vp-feature-aggregator-swarm
+RUNTIME_CONSTRAINT_INSPECT_MODE=fail-first
+rm -f "$RUNTIME_CONSTRAINT_INSPECT_CALLS_FILE"
+if deploy_feature_aggregator_services vp-feature-aggregator:preflight-failure-test \
+  >/dev/null 2>&1; then
+  echo 'FAIL: feature aggregator preflight failure unexpectedly succeeded' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service update' "$CALLS"; then
+  echo 'FAIL: feature aggregator preflight failure mutated Swarm' >&2
+  exit 1
+fi
+RUNTIME_CONSTRAINT_INSPECT_SERVICE=
+RUNTIME_CONSTRAINT_INSPECT_MODE=normal
+
+: >"$CALLS"
+FAIL_UPDATE_SERVICE=vp-feature-aggregator-swarm
+FAIL_UPDATE_IMAGE=vp-feature-aggregator:docker-exit-two-test
+FAIL_UPDATE_EXIT=2
+if deploy_feature_aggregator_services "$FAIL_UPDATE_IMAGE" >/dev/null 2>&1; then
+  echo 'FAIL: feature aggregator Docker exit 2 unexpectedly succeeded' >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'docker|service update' "$CALLS")" -ne 2 ]]; then
+  echo 'FAIL: feature aggregator Docker exit 2 did not trigger one rollback' >&2
+  exit 1
+fi
+candidate_feature_update_line="$(
+  grep -nF -- "--image $FAIL_UPDATE_IMAGE vp-feature-aggregator-swarm" "$CALLS" \
+    | cut -d: -f1
+)"
+rollback_feature_update_line="$(
+  grep -nF -- \
+    '--image baseline-vp-feature-aggregator-swarm:stable vp-feature-aggregator-swarm' \
+    "$CALLS" \
+    | cut -d: -f1
+)"
+if [[ -z "$candidate_feature_update_line" \
+  || -z "$rollback_feature_update_line" \
+  || "$candidate_feature_update_line" -ge "$rollback_feature_update_line" ]]; then
+  echo 'FAIL: feature aggregator rollback did not follow the failed candidate' >&2
+  exit 1
+fi
+FAIL_UPDATE_SERVICE=
+FAIL_UPDATE_IMAGE=
+FAIL_UPDATE_EXIT=1
+
+: >"$CALLS"
+RUNTIME_CONSTRAINT_INSPECT_SERVICE=vp-api-swarm
+RUNTIME_CONSTRAINT_INSPECT_MODE=fail-first
+rm -f "$RUNTIME_CONSTRAINT_INSPECT_CALLS_FILE"
+if deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: app preflight failure unexpectedly succeeded' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service update' "$CALLS"; then
+  echo 'FAIL: app preflight failure mutated Swarm' >&2
+  exit 1
+fi
+RUNTIME_CONSTRAINT_INSPECT_SERVICE=
+RUNTIME_CONSTRAINT_INSPECT_MODE=normal
+rm -f "$RUNTIME_CONSTRAINT_INSPECT_CALLS_FILE"
 
 GPU_SERVICE_EXISTS=false
 vp_deploy_python_worker vp-ffmpeg-worker-python:deploy-create-test >/dev/null
