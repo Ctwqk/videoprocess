@@ -10,7 +10,6 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.storage.base import StorageBackend
-from app.storage.manager import get_storage
 
 
 _PROBE_PAYLOAD = b"vp-worker-storage-readiness-v1\n"
@@ -101,10 +100,15 @@ async def probe_worker_storage(
         raise scratch_failure
 
     minio_setup_failure: ReadinessFailure | None = None
-    try:
-        minio = storage or get_storage("minio", create_bucket=False)
-    except Exception:
-        minio_setup_failure = ReadinessFailure("minio_unavailable")
+    if storage is None:
+        from app.storage.manager import get_storage
+
+        try:
+            minio = get_storage("minio", create_bucket=False)
+        except Exception:
+            minio_setup_failure = ReadinessFailure("minio_unavailable")
+    else:
+        minio = storage
     if minio_setup_failure is not None:
         raise minio_setup_failure
 
@@ -144,7 +148,9 @@ async def probe_worker_storage(
             )
             client_factory = http_client_factory or httpx.AsyncClient
             async with client_factory(
-                timeout=httpx.Timeout(5.0), follow_redirects=False
+                timeout=httpx.Timeout(5.0),
+                follow_redirects=False,
+                trust_env=False,
             ) as client:
                 response = await client.get(health_url)
                 if response.status_code != 200:

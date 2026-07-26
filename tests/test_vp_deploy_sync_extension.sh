@@ -488,6 +488,14 @@ docker() {
           echo 'node.labels.vp.runtime==true'
           echo 'node.hostname==CASPERs-Mac-mini'
           echo 'node.labels.vp.legacy==true'
+        elif [[ "$CONSTRAINT_MODE" == "gpu-stale" ]]; then
+          echo 'node.labels.vp.gpu==true'
+          echo 'node.hostname==ccttww-lap'
+          echo 'node.labels.vp.runtime==true'
+          echo 'node.labels.vp.legacy==true'
+          echo 'node.labels.role==app'
+          echo 'node.hostname==CASPERs-Mac-mini'
+          echo 'node.hostname==colima-swarmbridged'
         else
           echo 'node.labels.role==app'
         fi
@@ -1090,6 +1098,139 @@ assert_worker_gate_sequence_after() {
     exit 1
   fi
 }
+
+: >"$CALLS"
+GPU_SERVICE_EXISTS=true
+VISION_SERVICE_EXISTS=true
+PUBLISHER_SERVICE_EXISTS=true
+LEGACY_VISION_CONTAINER_EXISTS=true
+FAIL_NODE_UPDATE=true
+gpu_node_failure_contract_failed=false
+if deploy_worker_review_fixture gpu-node-label-write-failure \
+  >"$TEST_ROOT/gpu-node-label-write-failure.out" 2>&1; then
+  echo 'FAIL: failed GPU node label update unexpectedly allowed deployment' >&2
+  exit 1
+fi
+gpu_node_update_line="$(
+  grep -nF 'docker|node update --label-add vp.gpu=true ccttww-lap' "$CALLS" \
+    | head -1 \
+    | cut -d: -f1
+)"
+gpu_node_rollback_line="$(
+  grep -nF 'log|VideoProcess service apply failed; restoring prior images without legacy placement' "$CALLS" \
+    | head -1 \
+    | cut -d: -f1
+)"
+if [[ -z "$gpu_node_update_line" || -z "$gpu_node_rollback_line" \
+  || "$gpu_node_update_line" -ge "$gpu_node_rollback_line" ]]; then
+  echo 'FAIL: GPU node label failure did not enter the outer rollback transaction' >&2
+  exit 1
+fi
+if sed -n "$((gpu_node_update_line + 1)),$((gpu_node_rollback_line - 1))p" "$CALLS" \
+  | grep -Eq "docker\\|service (create|update).*${VP_PYTHON_WORKER_SERVICE}|docker\\|service ps ${VP_PYTHON_WORKER_SERVICE}|docker\\|container ls --filter label=com.docker.swarm.service.name=${VP_PYTHON_WORKER_SERVICE}|docker\\|exec\\|${GPU_READINESS_CONTAINER_ID}"; then
+  gpu_node_failure_contract_failed=true
+fi
+gpu_node_baseline_line="$(
+  grep -nF -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS" \
+    | tail -1 \
+    | cut -d: -f1
+)"
+if [[ -z "$gpu_node_baseline_line" || "$gpu_node_rollback_line" -ge "$gpu_node_baseline_line" ]]; then
+  echo 'FAIL: GPU node label failure did not explicitly restore the baseline' >&2
+  exit 1
+fi
+assert_worker_gate_sequence_after \
+  "$VP_PYTHON_WORKER_SERVICE" "$gpu_readiness_probe" "$gpu_node_baseline_line"
+FAIL_NODE_UPDATE=false
+
+assert_gpu_constraints_normalized() {
+  local update_call="$1"
+  local constraint
+  for constraint in \
+    'node.labels.vp.gpu==true' \
+    'node.hostname==ccttww-lap' \
+    'node.labels.vp.runtime==true' \
+    'node.labels.vp.legacy==true' \
+    'node.labels.role==app' \
+    'node.hostname==CASPERs-Mac-mini' \
+    'node.hostname==colima-swarmbridged'; do
+    if [[ "$update_call" != *"--constraint-rm $constraint"* ]]; then
+      echo "FAIL: GPU placement did not remove existing constraint: $constraint" >&2
+      exit 1
+    fi
+  done
+  for constraint in \
+    'node.labels.vp.gpu==true' \
+    'node.hostname==ccttww-lap'; do
+    if [[ "$(grep -oF -- "--constraint-add $constraint" <<<"$update_call" | wc -l | tr -d ' ')" -ne 1 ]]; then
+      echo "FAIL: GPU placement did not add approved constraint exactly once: $constraint" >&2
+      exit 1
+    fi
+  done
+  if [[ "$update_call" == *'--constraint-add node.labels.vp.runtime==true'* \
+    || "$update_call" == *'--constraint-add node.labels.vp.legacy==true'* \
+    || "$update_call" == *'--constraint-add node.labels.role==app'* \
+    || "$update_call" == *'--constraint-add node.hostname==CASPERs-Mac-mini'* \
+    || "$update_call" == *'--constraint-add node.hostname==colima-swarmbridged'* ]]; then
+    echo 'FAIL: GPU placement added a forbidden or stale constraint' >&2
+    exit 1
+  fi
+}
+
+: >"$CALLS"
+CONSTRAINT_MODE=gpu-stale
+vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-placement-normalization \
+  >/dev/null
+gpu_normalized_update="$(
+  grep -F 'docker|service update' "$CALLS" \
+    | grep -F -- '--image vp-ffmpeg-worker-python:gpu-placement-normalization' \
+    | grep -F "$VP_PYTHON_WORKER_SERVICE" \
+    | head -1
+)"
+if [[ -z "$gpu_normalized_update" ]]; then
+  echo 'FAIL: normal GPU placement fixture did not issue a service update' >&2
+  exit 1
+fi
+assert_gpu_constraints_normalized "$gpu_normalized_update"
+assert_rollback_targets_are_safe
+
+: >"$CALLS"
+rm -f "$WORKER_READINESS_FAILURE_USED"
+WORKER_READINESS_EXEC_MODE=fail-first
+WORKER_READINESS_FAIL_SERVICE="$VP_PYTHON_WORKER_SERVICE"
+if deploy_worker_review_fixture gpu-placement-rollback \
+  >"$TEST_ROOT/gpu-placement-rollback.out" 2>&1; then
+  echo 'FAIL: GPU rollback fixture unexpectedly succeeded after first readiness failure' >&2
+  exit 1
+fi
+gpu_constraint_baseline_line="$(
+  grep -nF -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS" \
+    | tail -1 \
+    | cut -d: -f1
+)"
+gpu_constraint_baseline_update="$(
+  grep -F 'docker|service update' "$CALLS" \
+    | grep -F -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable' \
+    | grep -F "$VP_PYTHON_WORKER_SERVICE" \
+    | tail -1
+)"
+if [[ -z "$gpu_constraint_baseline_line" || -z "$gpu_constraint_baseline_update" ]]; then
+  echo 'FAIL: GPU placement rollback did not issue the baseline update' >&2
+  exit 1
+fi
+assert_gpu_constraints_normalized "$gpu_constraint_baseline_update"
+assert_worker_gate_sequence_after \
+  "$VP_PYTHON_WORKER_SERVICE" "$gpu_readiness_probe" "$gpu_constraint_baseline_line"
+assert_rollback_targets_are_safe
+WORKER_READINESS_EXEC_MODE=normal
+WORKER_READINESS_FAIL_SERVICE=
+rm -f "$WORKER_READINESS_FAILURE_USED"
+CONSTRAINT_MODE=legacy
+
+if [[ "$gpu_node_failure_contract_failed" == true ]]; then
+  echo 'FAIL: GPU node label failure reached a GPU write, placement, or readiness gate' >&2
+  exit 1
+fi
 
 : >"$CALLS"
 GPU_SERVICE_EXISTS=true

@@ -265,7 +265,7 @@ async def test_readiness_requests_minio_without_bucket_creation(
         return fake_storage
 
     monkeypatch.setattr(
-        worker_storage_readiness, "get_storage", get_storage_without_creation
+        "app.storage.manager.get_storage", get_storage_without_creation
     )
 
     result = await probe_worker_storage(
@@ -295,7 +295,7 @@ async def test_minio_bucket_setup_failure_is_unavailable_without_creation(
         raise bucket_error
 
     monkeypatch.setattr(
-        worker_storage_readiness, "get_storage", get_storage_without_creation
+        "app.storage.manager.get_storage", get_storage_without_creation
     )
 
     with pytest.raises(ReadinessFailure) as failure:
@@ -339,6 +339,7 @@ async def test_artifact_api_200_is_ready_with_five_second_no_redirect_client(
     assert len(clients) == 1
     assert clients[0].urls == ["http://vp-api-swarm:8080/health"]
     assert clients[0].kwargs["follow_redirects"] is False
+    assert clients[0].kwargs["trust_env"] is False
     timeout = clients[0].kwargs["timeout"]
     assert isinstance(timeout, httpx.Timeout)
     assert timeout.connect == 5.0

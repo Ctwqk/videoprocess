@@ -148,3 +148,32 @@ def test_module_rejects_unknown_sensitive_arguments_without_leaking() -> None:
     assert result.stderr == ""
     assert sensitive_url not in result.stdout + result.stderr
     assert "password" not in result.stdout + result.stderr
+
+
+def test_module_sanitizes_invalid_typed_environment_without_leaking(
+    tmp_path: Path,
+) -> None:
+    sensitive_sentinel = "sensitive-api-port-sentinel"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.channel_agent.worker_storage_readiness_cli",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env={
+            **os.environ,
+            "API_PORT": sensitive_sentinel,
+            "STORAGE_BACKEND": "minio",
+            "STORAGE_LOCAL_ROOT": str(tmp_path),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 3
+    assert result.stdout == UNEXPECTED_FAILURE_STDOUT
+    assert result.stderr == ""
+    assert sensitive_sentinel not in result.stdout + result.stderr
+    assert "Traceback" not in result.stdout + result.stderr

@@ -607,7 +607,7 @@ vp_deploy_python_worker() {
 
   local gpu_mode
   gpu_mode="$(vp_resolve_gpu_mode "$image")" || return 1
-  docker node update --label-add vp.gpu=true "$VP_MANAGER_NODE" >/dev/null
+  docker node update --label-add vp.gpu=true "$VP_MANAGER_NODE" >/dev/null || return 1
 
   local env_key
   local env_value
@@ -631,23 +631,13 @@ vp_deploy_python_worker() {
     local constraint
     while IFS= read -r constraint; do
       [[ -n "$constraint" ]] || continue
-      if [[ "$constraint" == "node.labels.role==app" ]]; then
-        update_args+=(--constraint-rm "$constraint")
-      fi
+      update_args+=(--constraint-rm "$constraint")
     done < <(
       vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
         '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
     )
-    if ! vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
-      '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}' \
-      | grep -Fxq "$VP_GPU_CONSTRAINT"; then
-      update_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
-    fi
-    if ! vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
-      '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}' \
-      | grep -Fxq "$VP_GPU_MANAGER_CONSTRAINT"; then
-      update_args+=(--constraint-add "$VP_GPU_MANAGER_CONSTRAINT")
-    fi
+    update_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
+    update_args+=(--constraint-add "$VP_GPU_MANAGER_CONSTRAINT")
 
     local network_id
     network_id="$(docker network inspect "$VP_PIPELINE_NETWORK" --format '{{.ID}}')"
@@ -1138,32 +1128,16 @@ vp_app_service_was_attempted() {
 vp_restore_gpu_service() {
   local image="$1"
   local constraint
-  local has_gpu=false
-  local has_manager=false
   local constraint_args=()
   while IFS= read -r constraint; do
     [[ -n "$constraint" ]] || continue
-    case "$constraint" in
-      node.labels.role==app)
-        constraint_args+=(--constraint-rm "$constraint")
-        ;;
-      "$VP_GPU_CONSTRAINT")
-        has_gpu=true
-        ;;
-      "$VP_GPU_MANAGER_CONSTRAINT")
-        has_manager=true
-        ;;
-    esac
+    constraint_args+=(--constraint-rm "$constraint")
   done < <(
     vp_service_values "$VP_PYTHON_WORKER_SERVICE" \
       '{{range .Spec.TaskTemplate.Placement.Constraints}}{{println .}}{{end}}'
   )
-  if [[ "$has_gpu" != true ]]; then
-    constraint_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
-  fi
-  if [[ "$has_manager" != true ]]; then
-    constraint_args+=(--constraint-add "$VP_GPU_MANAGER_CONSTRAINT")
-  fi
+  constraint_args+=(--constraint-add "$VP_GPU_CONSTRAINT")
+  constraint_args+=(--constraint-add "$VP_GPU_MANAGER_CONSTRAINT")
 
   local update_args=(
     service update --detach=false --no-resolve-image --update-order stop-first
