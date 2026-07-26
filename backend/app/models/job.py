@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    BigInteger,
     Integer,
     SmallInteger,
     String,
@@ -106,9 +107,27 @@ class NodeExecution(UUIDPrimaryKeyMixin, Base):
     output_artifact_id: Mapped[uuid_mod.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
+    worker_registration_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "worker_registrations.id",
+            name="fk_node_executions_worker_registration_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    worker_lease_epoch: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+    )
 
     job: Mapped["Job"] = relationship(back_populates="node_executions")
 
     __table_args__ = (
         CheckConstraint("progress >= 0 AND progress <= 100", name="ck_progress_range"),
+        CheckConstraint(
+            "(worker_registration_id IS NULL AND worker_lease_epoch IS NULL) "
+            "OR (worker_registration_id IS NOT NULL AND worker_lease_epoch > 0)",
+            name="ck_node_execution_worker_lease_binding",
+        ),
     )

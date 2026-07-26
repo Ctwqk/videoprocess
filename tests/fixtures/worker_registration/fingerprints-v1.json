@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "minio",
+      "env": {
+        "DATABASE_URL": "postgresql+asyncpg://vp_user:database-secret@VP-POSTGRES-SWARM.:5432/videoprocess?ssl=require",
+        "REDIS_URL": "redis://:redis-secret@VP-REDIS-SWARM.:6379/3",
+        "STORAGE_BACKEND": "minio",
+        "MINIO_ENDPOINT": "http://VP-MINIO-SWARM.:9000",
+        "MINIO_ACCESS_KEY": "minio-access-secret",
+        "MINIO_SECRET_KEY": "minio-secret-secret",
+        "MINIO_BUCKET": "videoprocess"
+      },
+      "canonical": {
+        "database": "{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432}",
+        "redis": "{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"}",
+        "storage": "{\"backend\":\"minio\",\"bucket\":\"videoprocess\",\"host\":\"vp-minio-swarm\",\"port\":9000}"
+      },
+      "sha256": {
+        "database": "213594f6755c82f6a465356940d7f88a44dd61576c257a8f1cc97fec5868056a",
+        "redis": "ae93742ccecb53789e86a2b730a465024e63b390f9227fb998072fba1f3acec8",
+        "storage": "7eedeec75ba6a13297d87f97f3b3a4bddf7befe1d86d67b8e0e35e0ef9792a54"
+      }
+    },
+    {
+      "name": "not_applicable",
+      "env": {
+        "DATABASE_URL": "postgresql://vp_user:other-database-secret@vp-postgres-swarm/videoprocess",
+        "REDIS_URL": "redis://vp-redis-swarm/3",
+        "STORAGE_BACKEND": "not_applicable"
+      },
+      "canonical": {
+        "database": "{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432}",
+        "redis": "{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"}",
+        "storage": "{\"backend\":\"not_applicable\"}"
+      },
+      "sha256": {
+        "database": "213594f6755c82f6a465356940d7f88a44dd61576c257a8f1cc97fec5868056a",
+        "redis": "ae93742ccecb53789e86a2b730a465024e63b390f9227fb998072fba1f3acec8",
+        "storage": "3eb7b57334f3074c4d4b4602bb9133ddbcac4a70072c8fe5a5f7e7287f74047b"
+      }
+    }
+  ]
+}
