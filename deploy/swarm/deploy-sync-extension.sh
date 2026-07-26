@@ -667,7 +667,7 @@ vp_deploy_python_worker() {
       update_args+=(--env-rm YOUTUBE_CREDENTIALS_DIR)
     fi
     docker "${update_args[@]}" "${env_args[@]}" \
-      "$VP_PYTHON_WORKER_SERVICE" >&2
+      "$VP_PYTHON_WORKER_SERVICE" >&2 || return 1
   else
     local create_args=(
       service create --detach=false --name "$VP_PYTHON_WORKER_SERVICE"
@@ -681,7 +681,7 @@ vp_deploy_python_worker() {
     while IFS= read -r env_value; do
       create_env+=(--env "$env_value")
     done < <(vp_python_worker_env "$gpu_mode")
-    docker "${create_args[@]}" "${create_env[@]}" "$image" >&2
+    docker "${create_args[@]}" "${create_env[@]}" "$image" >&2 || return 1
   fi
   swarm_service_running "$VP_PYTHON_WORKER_SERVICE" || return 1
   vp_require_service_node "$VP_PYTHON_WORKER_SERVICE" "$VP_MANAGER_NODE" || return 1

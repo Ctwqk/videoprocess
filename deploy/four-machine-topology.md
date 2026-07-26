@@ -127,8 +127,9 @@ building an image or mutating a service.
 After every managed Python worker update, the deploy controller requires one
 local running Swarm task on `ccttww-lap` to pass scratch-volume and MinIO
 round trips. The vision worker also verifies artifact API reachability. A
-readiness failure rejects the release before legacy vision retirement, canary
-activation, or soak-watch activation.
+readiness failure rejects the release before canary or soak-watch activation.
+Only vision readiness is required before legacy vision retirement; a publisher
+readiness failure can occur after that retirement and still rejects the release.
 
 The scoped controller deploys `vp-app` and the in-repository
 `vp-feature-aggregator` project from this repository. PDS remains an

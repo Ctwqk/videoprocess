@@ -157,6 +157,7 @@ FAIL_PUBLISHER_INSPECT_FORMAT=
 GPU_PREFLIGHT_SUCCEEDS=true
 FAIL_UPDATE_SERVICE=
 FAIL_UPDATE_IMAGE=
+FAIL_GPU_CREATE=false
 FAIL_RUNNING_SERVICE=
 FAIL_HEALTH_CHECK=
 FAIL_NODE_UPDATE=false
@@ -171,8 +172,14 @@ VISION_CONSUMER_AUDIT_MODE=converged
 GPU_TASK_NODE=ccttww-lap
 VISION_TASK_NODE=ccttww-lap
 PUBLISHER_TASK_NODE=ccttww-lap
+GPU_TASK_STATE='Running 2 seconds ago'
+VISION_TASK_STATE='Running 2 seconds ago'
+PUBLISHER_TASK_STATE='Running 2 seconds ago'
 WORKER_READINESS_CONTAINER_MODE=normal
 FAIL_WORKER_READINESS_SERVICE=
+WORKER_READINESS_EXEC_MODE=normal
+WORKER_READINESS_FAIL_SERVICE=
+WORKER_READINESS_FAILURE_USED="$TEST_ROOT/worker-readiness-failure-used"
 GPU_READINESS_CONTAINER_ID=1111111111111111111111111111111111111111111111111111111111111111
 VISION_READINESS_CONTAINER_ID=2222222222222222222222222222222222222222222222222222222222222222
 PUBLISHER_READINESS_CONTAINER_ID=3333333333333333333333333333333333333333333333333333333333333333
@@ -262,6 +269,9 @@ docker() {
   fi
   if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-ffmpeg-worker-gpu-swarm"* ]]; then
     GPU_SERVICE_EXISTS=true
+    if [[ "$FAIL_GPU_CREATE" == "true" ]]; then
+      return 1
+    fi
   fi
   if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-vision-worker-swarm"* ]]; then
     VISION_SERVICE_EXISTS=true
@@ -283,7 +293,8 @@ docker() {
   fi
   if [[ "${1:-} ${2:-}" == "service update" \
     && -n "$FAIL_UPDATE_SERVICE" \
-    && "$*" == *"--image $FAIL_UPDATE_IMAGE $FAIL_UPDATE_SERVICE"* ]]; then
+    && "$*" == *"--image $FAIL_UPDATE_IMAGE"* \
+    && "$*" == *"$FAIL_UPDATE_SERVICE"* ]]; then
     return 1
   fi
   if [[ "${1:-} ${2:-}" == "service update" \
@@ -307,15 +318,22 @@ docker() {
     fi
   fi
   if [[ "${1:-} ${2:-}" == "service ps" ]]; then
+    if [[ "$#" -ne 7 \
+      || "${4:-}" != "--filter" \
+      || "${5:-}" != "desired-state=running" \
+      || "${6:-}" != "--format" \
+      || "${7:-}" != '{{.Node}}|{{.CurrentState}}' ]]; then
+      return 1
+    fi
     case "${3:-}" in
       vp-ffmpeg-worker-gpu-swarm)
-        printf '%s|Running 2 seconds ago\n' "$GPU_TASK_NODE"
+        printf '%s|%s\n' "$GPU_TASK_NODE" "$GPU_TASK_STATE"
         ;;
       vp-vision-worker-swarm)
-        printf '%s|Running 2 seconds ago\n' "$VISION_TASK_NODE"
+        printf '%s|%s\n' "$VISION_TASK_NODE" "$VISION_TASK_STATE"
         ;;
       vp-youtube-publisher-swarm)
-        printf '%s|Running 2 seconds ago\n' "$PUBLISHER_TASK_NODE"
+        printf '%s|%s\n' "$PUBLISHER_TASK_NODE" "$PUBLISHER_TASK_STATE"
         ;;
       *)
         return 1
@@ -371,6 +389,12 @@ docker() {
       "$PUBLISHER_READINESS_CONTAINER_ID") readiness_service="$VP_PUBLISHER_SERVICE" ;;
       *) return 1 ;;
     esac
+    if [[ "$WORKER_READINESS_EXEC_MODE" == "fail-first" \
+      && "$readiness_service" == "$WORKER_READINESS_FAIL_SERVICE" \
+      && ! -e "$WORKER_READINESS_FAILURE_USED" ]]; then
+      : >"$WORKER_READINESS_FAILURE_USED"
+      return 1
+    fi
     [[ "$readiness_service" != "$FAIL_WORKER_READINESS_SERVICE" ]]
     return
   fi
@@ -811,6 +835,115 @@ fi
 
 cp "$CALLS" "$TEST_ROOT/successful-vision-deploy-calls"
 
+worker_service_ps_call() {
+  local service="$1"
+  printf 'docker|service ps %s --filter desired-state=running --format {{.Node}}|{{.CurrentState}}\n' \
+    "$service"
+}
+
+assert_managed_worker_gate_sequence() {
+  local service="$1"
+  local readiness_probe="$2"
+  local running_line
+  local placement_line
+  local container_line
+  local exec_line
+  running_line="$(grep -nF "running|$service" "$CALLS" | head -1 | cut -d: -f1)"
+  placement_line="$(grep -nF "$(worker_service_ps_call "$service")" "$CALLS" | head -1 | cut -d: -f1)"
+  container_line="$(grep -nF "docker|container ls --filter label=com.docker.swarm.service.name=$service" "$CALLS" | head -1 | cut -d: -f1)"
+  exec_line="$(grep -nF "$readiness_probe" "$CALLS" | head -1 | cut -d: -f1)"
+  if [[ -z "$running_line" || -z "$placement_line" || -z "$container_line" || -z "$exec_line" \
+    || "$running_line" -ge "$placement_line" \
+    || "$placement_line" -ge "$container_line" \
+    || "$container_line" -ge "$exec_line" ]]; then
+    echo "FAIL: $service readiness gates are not running -> exact placement -> local task -> exec" >&2
+    exit 1
+  fi
+}
+
+assert_managed_worker_gate_sequence "$VP_PYTHON_WORKER_SERVICE" "$gpu_readiness_probe"
+assert_managed_worker_gate_sequence "$VP_VISION_WORKER_SERVICE" "$vision_readiness_probe"
+assert_managed_worker_gate_sequence "$VP_PUBLISHER_SERVICE" "$publisher_readiness_probe"
+
+if docker service ps "$VP_PYTHON_WORKER_SERVICE" \
+  --filter desired-state=running \
+  --format '{{.Node}}' >/dev/null 2>&1; then
+  echo 'FAIL: service ps fake accepted an incomplete placement format' >&2
+  exit 1
+fi
+
+deploy_managed_worker_for_gate_test() {
+  local service="$1"
+  case "$service" in
+    "$VP_PYTHON_WORKER_SERVICE")
+      vp_deploy_python_worker vp-ffmpeg-worker-python:placement-gate-test
+      ;;
+    "$VP_VISION_WORKER_SERVICE")
+      vp_deploy_vision_worker vp-ffmpeg-worker-python:placement-gate-test
+      ;;
+    "$VP_PUBLISHER_SERVICE")
+      vp_deploy_publisher vp-ffmpeg-worker-python:placement-gate-test
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+set_managed_worker_task() {
+  local service="$1"
+  local node="$2"
+  local state="$3"
+  case "$service" in
+    "$VP_PYTHON_WORKER_SERVICE")
+      GPU_TASK_NODE="$node"
+      GPU_TASK_STATE="$state"
+      ;;
+    "$VP_VISION_WORKER_SERVICE")
+      VISION_TASK_NODE="$node"
+      VISION_TASK_STATE="$state"
+      ;;
+    "$VP_PUBLISHER_SERVICE")
+      PUBLISHER_TASK_NODE="$node"
+      PUBLISHER_TASK_STATE="$state"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+assert_bad_worker_task_rejected_before_readiness() {
+  local service="$1"
+  local node="$2"
+  local state="$3"
+  : >"$CALLS"
+  set_managed_worker_task "$service" "$node" "$state"
+  if deploy_managed_worker_for_gate_test "$service" >/dev/null 2>&1; then
+    echo "FAIL: $service accepted task $node|$state" >&2
+    exit 1
+  fi
+  if ! grep -Fqx "$(worker_service_ps_call "$service")" "$CALLS" \
+    || grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$service" "$CALLS" \
+    || grep -Fq 'docker|exec|' "$CALLS"; then
+    echo "FAIL: $service task $node|$state reached readiness after placement failure" >&2
+    exit 1
+  fi
+  set_managed_worker_task "$service" ccttww-lap 'Running 2 seconds ago'
+}
+
+for worker_service in \
+  "$VP_PYTHON_WORKER_SERVICE" \
+  "$VP_VISION_WORKER_SERVICE" \
+  "$VP_PUBLISHER_SERVICE"; do
+  for forbidden_node in 10.0.0.126 CASPERs-Mac-mini colima-swarmbridged; do
+    assert_bad_worker_task_rejected_before_readiness \
+      "$worker_service" "$forbidden_node" 'Running 2 seconds ago'
+  done
+  assert_bad_worker_task_rejected_before_readiness \
+    "$worker_service" ccttww-lap 'Shutdown 2 seconds ago'
+done
+
 assert_readiness_failure_calls_are_safe() {
   local readiness_calls
   readiness_calls="$(grep -E '^(docker\|(container ls|exec)|log\|managed worker storage readiness)' "$CALLS" || true)"
@@ -906,6 +1039,164 @@ if ! grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=
   echo 'FAIL: invalid artifact API readiness mode did not fail before probe execution' >&2
   exit 1
 fi
+
+deploy_worker_review_fixture() {
+  local name="$1"
+  deploy_vp_app_services \
+    "vp-api:worker-review-$name" \
+    "vp-frontend:worker-review-$name" \
+    "vp-backend-api:worker-review-$name" \
+    "vp-channelops-runner-go:worker-review-$name" \
+    "vp-ffmpeg-worker-go:worker-review-$name" \
+    "vp-ffmpeg-worker-python:worker-review-$name"
+}
+
+assert_rollback_targets_are_safe() {
+  local placement_calls
+  placement_calls="$(grep -E '^docker\|(node update|service (create|update))' "$CALLS" || true)"
+  if grep -Eq -- '--constraint(-add)? node\.hostname==(10\.0\.0\.126|CASPERs-Mac-mini|colima-swarmbridged)( |$)' \
+    <<<"$placement_calls" \
+    || grep -Eq 'docker\|node update.*(10\.0\.0\.126|CASPERs-Mac-mini|colima-swarmbridged)( |$)' \
+      <<<"$placement_calls"; then
+    echo 'FAIL: rollback used a forbidden execution or placement target' >&2
+    exit 1
+  fi
+}
+
+: >"$CALLS"
+GPU_SERVICE_EXISTS=true
+VISION_SERVICE_EXISTS=true
+PUBLISHER_SERVICE_EXISTS=true
+LEGACY_VISION_CONTAINER_EXISTS=true
+FAIL_UPDATE_SERVICE="$VP_PYTHON_WORKER_SERVICE"
+FAIL_UPDATE_IMAGE=vp-ffmpeg-worker-python:worker-review-gpu-update-write-failure
+if deploy_worker_review_fixture gpu-update-write-failure >"$TEST_ROOT/gpu-update-write-failure.out" 2>&1; then
+  echo 'FAIL: failed GPU update was masked by an old healthy task' >&2
+  exit 1
+fi
+gpu_failed_update_call="$(grep -F 'docker|service update' "$CALLS" \
+  | grep -F -- '--image vp-ffmpeg-worker-python:worker-review-gpu-update-write-failure' \
+  | grep -F "$VP_PYTHON_WORKER_SERVICE" \
+  | head -1)"
+if [[ -z "$gpu_failed_update_call" ]]; then
+  echo 'FAIL: GPU update failure fixture did not issue the attempted image update' >&2
+  exit 1
+fi
+grep -Fq 'log|VideoProcess service apply failed; restoring prior images without legacy placement' "$CALLS"
+grep -Fq -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS"
+if grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PYTHON_WORKER_SERVICE" "$CALLS" \
+  || grep -Fq "$gpu_readiness_probe" "$CALLS"; then
+  echo 'FAIL: failed GPU update reached readiness before rollback' >&2
+  exit 1
+fi
+assert_rollback_targets_are_safe
+FAIL_UPDATE_SERVICE=
+FAIL_UPDATE_IMAGE=
+
+: >"$CALLS"
+GPU_SERVICE_EXISTS=false
+VISION_SERVICE_EXISTS=true
+PUBLISHER_SERVICE_EXISTS=true
+LEGACY_VISION_CONTAINER_EXISTS=true
+FAIL_GPU_CREATE=true
+if deploy_worker_review_fixture gpu-create-write-failure >"$TEST_ROOT/gpu-create-write-failure.out" 2>&1; then
+  echo 'FAIL: failed GPU create was masked by a healthy task' >&2
+  exit 1
+fi
+grep -Fq 'docker|service create --detach=false --name vp-ffmpeg-worker-gpu-swarm' "$CALLS"
+grep -Fq 'log|VideoProcess service apply failed; restoring prior images without legacy placement' "$CALLS"
+grep -Fq 'docker|service rm vp-ffmpeg-worker-gpu-swarm' "$CALLS"
+if grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PYTHON_WORKER_SERVICE" "$CALLS" \
+  || grep -Fq "$gpu_readiness_probe" "$CALLS"; then
+  echo 'FAIL: failed GPU create reached readiness before rollback' >&2
+  exit 1
+fi
+assert_rollback_targets_are_safe
+FAIL_GPU_CREATE=false
+GPU_SERVICE_EXISTS=true
+
+assert_rollback_readiness_recovered() {
+  local service="$1"
+  local readiness_probe="$2"
+  local output="$3"
+  local baseline_line
+  local restore_exec_line
+  baseline_line="$(grep -nF -- "--image baseline-$service:stable $service" "$CALLS" | tail -1 | cut -d: -f1)"
+  restore_exec_line="$(grep -nF "$readiness_probe" "$CALLS" | tail -1 | cut -d: -f1)"
+  if [[ "$(grep -F "$readiness_probe" "$CALLS" | wc -l | tr -d ' ')" -lt 2 \
+    || -z "$baseline_line" \
+    || -z "$restore_exec_line" \
+    || "$baseline_line" -ge "$restore_exec_line" \
+    || -s "$output" && "$(cat "$output")" == *'VideoProcess image restore did not fully converge'* ]]; then
+    echo "FAIL: $service rollback did not restore baseline readiness" >&2
+    exit 1
+  fi
+}
+
+for rollback_service in "$VP_VISION_WORKER_SERVICE" "$VP_PUBLISHER_SERVICE"; do
+  : >"$CALLS"
+  rm -f "$WORKER_READINESS_FAILURE_USED"
+  GPU_SERVICE_EXISTS=true
+  VISION_SERVICE_EXISTS=true
+  PUBLISHER_SERVICE_EXISTS=true
+  LEGACY_VISION_CONTAINER_EXISTS=true
+  WORKER_READINESS_EXEC_MODE=fail-first
+  WORKER_READINESS_FAIL_SERVICE="$rollback_service"
+  rollback_output="$TEST_ROOT/${rollback_service}-first-readiness-failure.out"
+  if deploy_worker_review_fixture "${rollback_service}-first-readiness-failure" >"$rollback_output" 2>&1; then
+    echo "FAIL: $rollback_service first readiness failure unexpectedly succeeded" >&2
+    exit 1
+  fi
+  case "$rollback_service" in
+    "$VP_VISION_WORKER_SERVICE")
+      assert_rollback_readiness_recovered "$rollback_service" "$vision_readiness_probe" "$rollback_output"
+      ;;
+    "$VP_PUBLISHER_SERVICE")
+      assert_rollback_readiness_recovered "$rollback_service" "$publisher_readiness_probe" "$rollback_output"
+      ;;
+  esac
+  assert_rollback_targets_are_safe
+done
+WORKER_READINESS_EXEC_MODE=normal
+WORKER_READINESS_FAIL_SERVICE=
+rm -f "$WORKER_READINESS_FAILURE_USED"
+
+: >"$CALLS"
+GPU_SERVICE_EXISTS=true
+VISION_SERVICE_EXISTS=true
+PUBLISHER_SERVICE_EXISTS=true
+LEGACY_VISION_CONTAINER_EXISTS=true
+FAIL_WORKER_READINESS_SERVICE="$VP_PYTHON_WORKER_SERVICE"
+if deploy_worker_review_fixture gpu-persistent-readiness-failure \
+  >"$TEST_ROOT/gpu-persistent-readiness-failure.out" 2>&1; then
+  echo 'FAIL: persistent GPU readiness failure unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -Fq -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS"
+if grep -Fq 'VideoProcess image restore did not fully converge' \
+  "$TEST_ROOT/gpu-persistent-readiness-failure.out"; then
+  echo 'FAIL: GPU baseline restore was reported as non-convergent' >&2
+  exit 1
+fi
+assert_rollback_targets_are_safe
+FAIL_WORKER_READINESS_SERVICE=
+
+: >"$CALLS"
+GPU_SERVICE_EXISTS=true
+VISION_SERVICE_EXISTS=true
+PUBLISHER_SERVICE_EXISTS=true
+LEGACY_VISION_CONTAINER_EXISTS=true
+FAIL_WORKER_READINESS_SERVICE="$VP_VISION_WORKER_SERVICE"
+if deploy_worker_review_fixture vision-persistent-readiness-failure \
+  >"$TEST_ROOT/vision-persistent-readiness-failure.out" 2>&1; then
+  echo 'FAIL: persistent vision readiness failure unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -Fq -- '--image baseline-vp-vision-worker-swarm:stable vp-vision-worker-swarm' "$CALLS"
+grep -Fq 'VideoProcess image restore did not fully converge' \
+  "$TEST_ROOT/vision-persistent-readiness-failure.out"
+assert_rollback_targets_are_safe
+FAIL_WORKER_READINESS_SERVICE=
 : >"$CALLS"
 LEGACY_VISION_CONTAINER_EXISTS=true
 LEGACY_VISION_PROJECT=unexpected-project
