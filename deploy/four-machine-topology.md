@@ -2,7 +2,7 @@
 
 This file is the fast-entry summary for agents working in `VideoProcess`.
 
-Status date: 2026-07-11.
+Status date: 2026-07-25.
 
 ## Agent Quick View
 
@@ -13,9 +13,9 @@ Status date: 2026-07-11.
 - API traffic is forwarded through `http://10.0.0.127:18080`.
 - Shared Postgres, Redis, MinIO, Qdrant, Redpanda, embedding, dashboard, and
   IBKR infrastructure stay on `10.0.0.150`.
-- The managed Python FFmpeg worker, YouTubeManager, and dedicated YouTube
-  publisher run on 150; normal VP application services and the Go FFmpeg worker
-  run on 127.
+- The managed Python FFmpeg worker, managed vision worker, YouTubeManager, and
+  dedicated YouTube publisher run on 150; normal VP application services and
+  the Go FFmpeg worker run on 127.
 - 126 is not a VideoProcess automatic failover target. It remains the
   ForWin/news node during normal VP builds, deploys, and runtime placement.
 - The deployment directory on 127 is not the source-of-truth git workspace.
@@ -61,10 +61,16 @@ Host forwards:
 - Qdrant `10.0.0.150:6333/6334`
 - Redpanda host bridge `10.0.0.150:19092`, overlay `redpanda:9092`
 - Embedding gateway `http://10.0.0.150:8080`
-- Managed Python FFmpeg worker (CPU fallback until Swarm GPU allocation is configured)
+- `vp-ffmpeg-worker-gpu-swarm` (CPU fallback until Swarm GPU allocation is
+  configured)
+- `vp-vision-worker-swarm`, the only production `vp:tasks:vision` consumer
 - YouTubeManager and `vp-youtube-publisher-swarm` for the dedicated unlisted
   publication stream
 - Browser/account infrastructure that remains 150-local
+
+After convergence, the legacy Compose container `vp_vision_worker_1` must be
+absent. It uses an incompatible artifact and execution-claim contract and is
+not a standby or rollback target.
 
 ## Entry Points And Ports
 
@@ -85,7 +91,7 @@ Browser
   -> 10.0.0.127:3001 VP frontend
   -> 10.0.0.127:18080 API
   -> 150 shared Postgres / Redis / MinIO / Qdrant / Redpanda
-  -> 127 Swarm workers
+  -> 127 and 150 managed Swarm workers
   -> artifact output back to 150 MinIO
   -> API status/result back to browser
 ```
@@ -229,15 +235,16 @@ stream must have exactly one active consumer matching the production topology:
 | --- | --- |
 | `vp:tasks:ffmpeg` / `ffmpeg-workers` | `ffmpeg-worker@150-gpu:<positive pid>` |
 | `vp:tasks:ffmpeg_go` / `ffmpeg_go-workers` | `ffmpeg_go-worker@colima-127:<positive pid>` |
+| `vp:tasks:vision` / `vision-workers` | `vision-worker@150-vision:<positive pid>` |
 | `vp:tasks:youtube_publisher` / `youtube_publisher-workers` | `youtube_publisher-worker@150-publisher:<positive pid>` |
 | `vp:events` / `orchestrator` | `orchestrator-api-<positive ordinal>` |
 
 Redis retains consumer records after a worker is replaced. Every record, active
-or stale, must have a non-empty string name. Records outside the active window
-are counted as history and are not checked against the active-name allowlist.
-Missing, malformed, duplicate, or unknown active consumers add only the fixed
-critical condition `redis_consumer_identity_invalid`; the watcher never deletes
-consumer records. The watcher audits the host-networked VP Redis listener with
+or stale, must have a non-empty string name. Readiness requires zero stale
+consumer records for every managed stream. Missing, stale, malformed,
+duplicate, or unknown active consumers add only the fixed critical condition
+`redis_consumer_identity_invalid`; the watcher never deletes consumer records.
+The watcher audits the host-networked VP Redis listener with
 `redis-cli -p 6380 --raw` and does not pass or print credentials. This is an
 immediate operational ownership guard, not a replacement for future signed
 worker registration and revocation.
@@ -371,7 +378,13 @@ is never a build, deploy, runtime, watcher, publisher, or failover target.
 - Label the 127 Swarm node with `node.labels.vp.runtime == true`.
 - Constrain normal VP services to `node.labels.vp.runtime == true`.
 - Label the 150 manager with `node.labels.vp.gpu == true` and constrain the
-  managed Python worker to that label.
+  managed Python FFmpeg and vision workers to that label.
+- Run exactly one `vp-vision-worker-swarm` replica with
+  `WORKER_HOST=150-vision`; it is the sole approved active consumer for
+  `vp:tasks:vision` / `vision-workers`.
+- Never restart or restore `vp_vision_worker_1`. A push-driven deployment
+  replaces it with the commit-tagged managed service and removes it only after
+  the replacement is healthy and its exact Compose identity is verified.
 - Label only the 150 manager with `node.labels.vp.publisher == true`. Constrain
   `vp-youtube-publisher-swarm` with both that label and
   `node.hostname == ccttww-lap`; the hostname constraint prevents stale labels
@@ -393,7 +406,7 @@ is never a build, deploy, runtime, watcher, publisher, or failover target.
 | --- | --- | --- |
 | Frontend page/proxy issue | `frontend/` | `vp-frontend-swarm` |
 | API or job orchestration issue | `cmd/vp-api/`, `internal/orchestrator/`, and `backend/app/` | `vp-api-swarm` and sometimes `vp-autoflow-api-swarm` |
-| Worker/node execution issue | `backend/worker/` and node handlers | `vp-channel-agent-runner-swarm` and sometimes API |
+| Worker/node execution issue | `backend/worker/` and node handlers | `vp-channel-agent-runner-swarm`, `vp-ffmpeg-worker-gpu-swarm`, `vp-vision-worker-swarm`, and sometimes API |
 | PDS integration | VP event/outbox code plus `Ctwqk/policy-decision-service` | `vp-pds-swarm`, `vp-event-outbox-relay-swarm` |
 | Feature aggregation | VP event schema plus `services/vp-feature-aggregator` | `vp-feature-aggregator-swarm` |
 | Browser/platform upload issue | VP platform/browser manager code and 150 browser infra | service-specific; check credentials and browser state |
@@ -401,7 +414,8 @@ is never a build, deploy, runtime, watcher, publisher, or failover target.
 ## Failure Domains
 
 - `10.0.0.150` down: shared data stores, Redpanda, embedding, dashboard, and
-  artifact storage are unavailable; VP API/workers lose dependencies.
+  artifact storage are unavailable; the managed GPU, vision, and publisher
+  workers stop, and VP API/workers lose dependencies.
 - `10.0.0.127` down: VP frontend/API/workers and PDS/aggregator are unavailable.
 - `10.0.0.126` down: ForWin/news capacity drops, but VP should not lose core
   execution unless a workflow explicitly calls news services.
