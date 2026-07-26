@@ -1063,6 +1063,34 @@ assert_rollback_targets_are_safe() {
   fi
 }
 
+first_call_line_after() {
+  local after_line="$1"
+  local needle="$2"
+  grep -nF "$needle" "$CALLS" \
+    | awk -F: -v after_line="$after_line" '$1 > after_line { print $1; exit }'
+}
+
+assert_worker_gate_sequence_after() {
+  local service="$1"
+  local readiness_probe="$2"
+  local after_line="$3"
+  local running_line
+  local placement_line
+  local container_line
+  local exec_line
+  running_line="$(first_call_line_after "$after_line" "running|$service")"
+  placement_line="$(first_call_line_after "$after_line" "$(worker_service_ps_call "$service")")"
+  container_line="$(first_call_line_after "$after_line" "docker|container ls --filter label=com.docker.swarm.service.name=$service")"
+  exec_line="$(first_call_line_after "$after_line" "$readiness_probe")"
+  if [[ -z "$running_line" || -z "$placement_line" || -z "$container_line" || -z "$exec_line" \
+    || "$running_line" -ge "$placement_line" \
+    || "$placement_line" -ge "$container_line" \
+    || "$container_line" -ge "$exec_line" ]]; then
+    echo "FAIL: $service baseline restore did not run the complete readiness gate chain" >&2
+    exit 1
+  fi
+}
+
 : >"$CALLS"
 GPU_SERVICE_EXISTS=true
 VISION_SERVICE_EXISTS=true
@@ -1082,11 +1110,22 @@ if [[ -z "$gpu_failed_update_call" ]]; then
   echo 'FAIL: GPU update failure fixture did not issue the attempted image update' >&2
   exit 1
 fi
+gpu_attempt_line="$(grep -nF "$gpu_failed_update_call" "$CALLS" | head -1 | cut -d: -f1)"
 grep -Fq 'log|VideoProcess service apply failed; restoring prior images without legacy placement' "$CALLS"
-grep -Fq -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS"
-if grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PYTHON_WORKER_SERVICE" "$CALLS" \
-  || grep -Fq "$gpu_readiness_probe" "$CALLS"; then
-  echo 'FAIL: failed GPU update reached readiness before rollback' >&2
+gpu_baseline_line="$(grep -nF -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS" | tail -1 | cut -d: -f1)"
+if [[ -z "$gpu_attempt_line" || -z "$gpu_baseline_line" || "$gpu_attempt_line" -ge "$gpu_baseline_line" ]]; then
+  echo 'FAIL: GPU update rollback did not attempt the exact baseline image after the failed write' >&2
+  exit 1
+fi
+if grep -nF "$gpu_readiness_probe" "$CALLS" \
+  | awk -F: -v attempt_line="$gpu_attempt_line" -v baseline_line="$gpu_baseline_line" \
+    '$1 > attempt_line && $1 < baseline_line { found=1 } END { exit found ? 0 : 1 }'; then
+  echo 'FAIL: failed GPU update reached readiness before baseline rollback' >&2
+  exit 1
+fi
+assert_worker_gate_sequence_after "$VP_PYTHON_WORKER_SERVICE" "$gpu_readiness_probe" "$gpu_baseline_line"
+if grep -Fq 'VideoProcess image restore did not fully converge' "$TEST_ROOT/gpu-update-write-failure.out"; then
+  echo 'FAIL: successful GPU baseline readiness was reported as non-convergent' >&2
   exit 1
 fi
 assert_rollback_targets_are_safe
@@ -1120,20 +1159,23 @@ assert_rollback_readiness_recovered() {
   local readiness_probe="$2"
   local output="$3"
   local baseline_line
-  local restore_exec_line
   baseline_line="$(grep -nF -- "--image baseline-$service:stable $service" "$CALLS" | tail -1 | cut -d: -f1)"
-  restore_exec_line="$(grep -nF "$readiness_probe" "$CALLS" | tail -1 | cut -d: -f1)"
   if [[ "$(grep -F "$readiness_probe" "$CALLS" | wc -l | tr -d ' ')" -lt 2 \
-    || -z "$baseline_line" \
-    || -z "$restore_exec_line" \
-    || "$baseline_line" -ge "$restore_exec_line" \
-    || -s "$output" && "$(cat "$output")" == *'VideoProcess image restore did not fully converge'* ]]; then
+    || -z "$baseline_line" ]]; then
     echo "FAIL: $service rollback did not restore baseline readiness" >&2
     exit 1
   fi
+  if grep -Fq 'VideoProcess image restore did not fully converge' "$output"; then
+    echo "FAIL: $service rollback reported non-convergence after baseline readiness passed" >&2
+    exit 1
+  fi
+  assert_worker_gate_sequence_after "$service" "$readiness_probe" "$baseline_line"
 }
 
-for rollback_service in "$VP_VISION_WORKER_SERVICE" "$VP_PUBLISHER_SERVICE"; do
+for rollback_service in \
+  "$VP_PYTHON_WORKER_SERVICE" \
+  "$VP_VISION_WORKER_SERVICE" \
+  "$VP_PUBLISHER_SERVICE"; do
   : >"$CALLS"
   rm -f "$WORKER_READINESS_FAILURE_USED"
   GPU_SERVICE_EXISTS=true
@@ -1148,6 +1190,9 @@ for rollback_service in "$VP_VISION_WORKER_SERVICE" "$VP_PUBLISHER_SERVICE"; do
     exit 1
   fi
   case "$rollback_service" in
+    "$VP_PYTHON_WORKER_SERVICE")
+      assert_rollback_readiness_recovered "$rollback_service" "$gpu_readiness_probe" "$rollback_output"
+      ;;
     "$VP_VISION_WORKER_SERVICE")
       assert_rollback_readiness_recovered "$rollback_service" "$vision_readiness_probe" "$rollback_output"
       ;;
@@ -1161,41 +1206,36 @@ WORKER_READINESS_EXEC_MODE=normal
 WORKER_READINESS_FAIL_SERVICE=
 rm -f "$WORKER_READINESS_FAILURE_USED"
 
-: >"$CALLS"
-GPU_SERVICE_EXISTS=true
-VISION_SERVICE_EXISTS=true
-PUBLISHER_SERVICE_EXISTS=true
-LEGACY_VISION_CONTAINER_EXISTS=true
-FAIL_WORKER_READINESS_SERVICE="$VP_PYTHON_WORKER_SERVICE"
-if deploy_worker_review_fixture gpu-persistent-readiness-failure \
-  >"$TEST_ROOT/gpu-persistent-readiness-failure.out" 2>&1; then
-  echo 'FAIL: persistent GPU readiness failure unexpectedly succeeded' >&2
-  exit 1
-fi
-grep -Fq -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS"
-if grep -Fq 'VideoProcess image restore did not fully converge' \
-  "$TEST_ROOT/gpu-persistent-readiness-failure.out"; then
-  echo 'FAIL: GPU baseline restore was reported as non-convergent' >&2
-  exit 1
-fi
-assert_rollback_targets_are_safe
-FAIL_WORKER_READINESS_SERVICE=
-
-: >"$CALLS"
-GPU_SERVICE_EXISTS=true
-VISION_SERVICE_EXISTS=true
-PUBLISHER_SERVICE_EXISTS=true
-LEGACY_VISION_CONTAINER_EXISTS=true
-FAIL_WORKER_READINESS_SERVICE="$VP_VISION_WORKER_SERVICE"
-if deploy_worker_review_fixture vision-persistent-readiness-failure \
-  >"$TEST_ROOT/vision-persistent-readiness-failure.out" 2>&1; then
-  echo 'FAIL: persistent vision readiness failure unexpectedly succeeded' >&2
-  exit 1
-fi
-grep -Fq -- '--image baseline-vp-vision-worker-swarm:stable vp-vision-worker-swarm' "$CALLS"
-grep -Fq 'VideoProcess image restore did not fully converge' \
-  "$TEST_ROOT/vision-persistent-readiness-failure.out"
-assert_rollback_targets_are_safe
+for rollback_service in \
+  "$VP_PYTHON_WORKER_SERVICE" \
+  "$VP_VISION_WORKER_SERVICE" \
+  "$VP_PUBLISHER_SERVICE"; do
+  : >"$CALLS"
+  GPU_SERVICE_EXISTS=true
+  VISION_SERVICE_EXISTS=true
+  PUBLISHER_SERVICE_EXISTS=true
+  LEGACY_VISION_CONTAINER_EXISTS=true
+  FAIL_WORKER_READINESS_SERVICE="$rollback_service"
+  rollback_output="$TEST_ROOT/${rollback_service}-persistent-readiness-failure.out"
+  if deploy_worker_review_fixture "${rollback_service}-persistent-readiness-failure" >"$rollback_output" 2>&1; then
+    echo "FAIL: persistent $rollback_service readiness failure unexpectedly succeeded" >&2
+    exit 1
+  fi
+  case "$rollback_service" in
+    "$VP_PYTHON_WORKER_SERVICE") readiness_probe="$gpu_readiness_probe" ;;
+    "$VP_VISION_WORKER_SERVICE") readiness_probe="$vision_readiness_probe" ;;
+    "$VP_PUBLISHER_SERVICE") readiness_probe="$publisher_readiness_probe" ;;
+  esac
+  baseline_line="$(grep -nF -- "--image baseline-$rollback_service:stable $rollback_service" "$CALLS" | tail -1 | cut -d: -f1)"
+  if [[ -z "$baseline_line" \
+    || "$(grep -F "$readiness_probe" "$CALLS" | wc -l | tr -d ' ')" -lt 2 ]]; then
+    echo "FAIL: persistent $rollback_service failure did not attempt and verify baseline restore" >&2
+    exit 1
+  fi
+  assert_worker_gate_sequence_after "$rollback_service" "$readiness_probe" "$baseline_line"
+  grep -Fq 'VideoProcess image restore did not fully converge' "$rollback_output"
+  assert_rollback_targets_are_safe
+done
 FAIL_WORKER_READINESS_SERVICE=
 : >"$CALLS"
 LEGACY_VISION_CONTAINER_EXISTS=true

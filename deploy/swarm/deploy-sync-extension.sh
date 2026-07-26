@@ -1172,7 +1172,10 @@ vp_restore_gpu_service() {
     update_args+=("${constraint_args[@]}")
   fi
   update_args+=(--image "$image" "$VP_PYTHON_WORKER_SERVICE")
-  docker "${update_args[@]}" >&2
+  docker "${update_args[@]}" >&2 || return 1
+  swarm_service_running "$VP_PYTHON_WORKER_SERVICE" || return 1
+  vp_require_service_node "$VP_PYTHON_WORKER_SERVICE" "$VP_MANAGER_NODE" || return 1
+  vp_require_managed_worker_storage_ready "$VP_PYTHON_WORKER_SERVICE" false
 }
 
 vp_restore_app_snapshots() {
