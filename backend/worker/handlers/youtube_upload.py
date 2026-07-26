@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -30,6 +30,9 @@ from worker.handlers.base import BaseHandler, CancelledError
 UPLOAD_INSERT_COST = 1_600
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_TIMEOUT_SECONDS = 600.0
+UPLOAD_POST_TIMEOUT_SECONDS = 120.0
+SUBMITTED_TRANSITION_TIMEOUT_SECONDS = 15.0
+SUBMISSION_LEASE_MARGIN_SECONDS = 150.0
 DEFINITE_UPLOAD_REJECTION_STATUSES = frozenset({400, 401, 403, 404, 413, 415, 422})
 
 
@@ -45,6 +48,7 @@ class YouTubeUploadHandler(BaseHandler):
         base_url: str | None = None,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        lease_refresher: Callable[..., Awaitable[Any]] | None = None,
     ) -> None:
         super().__init__()
         if operation_store is None:
@@ -58,6 +62,7 @@ class YouTubeUploadHandler(BaseHandler):
         self._base_url = str(resolved_base_url).rstrip("/")
         self._poll_interval_seconds = float(poll_interval_seconds)
         self._timeout_seconds = float(timeout_seconds)
+        self._lease_refresher = lease_refresher
         if not self._base_url:
             raise ValueError("YOUTUBE_MANAGER_URL is required for youtube uploads")
         if not math.isfinite(self._poll_interval_seconds) or self._poll_interval_seconds < 0:
@@ -97,6 +102,7 @@ class YouTubeUploadHandler(BaseHandler):
                     claim.action,
                     operation,
                     content_sha256,
+                    context,
                 )
 
             if claim.action == "replay":
@@ -111,15 +117,30 @@ class YouTubeUploadHandler(BaseHandler):
 
             async with self._request_client() as client:
                 if claim.action == "submit":
+                    if self._lease_refresher is None:
+                        raise RuntimeError(
+                            "youtube upload requires a worker lease refresher"
+                        )
+                    await self._lease_refresher(
+                        minimum_margin_seconds=(
+                            SUBMISSION_LEASE_MARGIN_SECONDS
+                        )
+                    )
                     async with self._operation_store.submission_fence(context):
-                        await self._preflight_submission(operation, client)
+                        await self._preflight_submission(
+                            operation,
+                            client,
+                            context,
+                        )
                         self._raise_if_cancelled()
                         operation = await self._operation_store.mark_attempting(
-                            operation.id
+                            operation.id,
+                            context=context,
                         )
                         manager_task_id = await self._submit_upload(
                             operation,
                             client,
+                            context=context,
                             input_file=snapshot_path,
                             title=title,
                             description=description,
@@ -134,6 +155,7 @@ class YouTubeUploadHandler(BaseHandler):
                         await self._mark_uncertain(
                             operation,
                             "submitted operation has no canonical manager task",
+                            context,
                         )
                         raise RuntimeError("submitted youtube upload operation has no canonical manager task id")
                     manager_task_id = resumed_manager_task_id
@@ -142,6 +164,7 @@ class YouTubeUploadHandler(BaseHandler):
                     operation,
                     manager_task_id,
                     client,
+                    context,
                 )
 
             self._raise_if_cancelled()
@@ -157,7 +180,12 @@ class YouTubeUploadHandler(BaseHandler):
         async with httpx.AsyncClient(timeout=httpx.Timeout(self._timeout_seconds)) as client:
             yield client
 
-    async def _preflight_submission(self, operation: Any, client: httpx.AsyncClient) -> None:
+    async def _preflight_submission(
+        self,
+        operation: Any,
+        client: httpx.AsyncClient,
+        context: UploadOperationContext,
+    ) -> None:
         try:
             response = await self._await_request(client.get(f"{self._base_url}/api/auth/status"))
         except asyncio.CancelledError:
@@ -166,6 +194,7 @@ class YouTubeUploadHandler(BaseHandler):
             await self._operation_store.mark_failed(
                 operation.id,
                 "YouTubeManager authentication or quota preflight failed",
+                context=context,
             )
             raise RuntimeError("YouTubeManager authentication or quota preflight failed") from exc
         except (KeyboardInterrupt, SystemExit):
@@ -180,6 +209,7 @@ class YouTubeUploadHandler(BaseHandler):
             await self._operation_store.mark_failed(
                 operation.id,
                 "YouTubeManager authentication or quota preflight failed",
+                context=context,
             )
             if isinstance(exc, RuntimeError):
                 raise
@@ -190,6 +220,7 @@ class YouTubeUploadHandler(BaseHandler):
         operation: Any,
         client: httpx.AsyncClient,
         *,
+        context: UploadOperationContext,
         input_file: str,
         title: str,
         description: str,
@@ -216,31 +247,56 @@ class YouTubeUploadHandler(BaseHandler):
                                 self._mime_type(input_file),
                             )
                         },
-                    )
+                    ),
+                    timeout_seconds=min(
+                        self._timeout_seconds,
+                        UPLOAD_POST_TIMEOUT_SECONDS,
+                    ),
                 )
         except asyncio.CancelledError:
-            await self._mark_uncertain(operation, "YouTubeManager upload submission was cancelled")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager upload submission was cancelled",
+                context,
+            )
             raise
         except Exception as exc:
-            await self._mark_uncertain(operation, "YouTubeManager upload submission outcome is uncertain")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager upload submission outcome is uncertain",
+                context,
+            )
             raise RuntimeError("YouTubeManager upload submission outcome is uncertain") from exc
         except (KeyboardInterrupt, SystemExit):
-            await self._mark_uncertain(operation, "YouTubeManager upload submission was interrupted")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager upload submission was interrupted",
+                context,
+            )
             raise
 
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if self._cancelled:
-                await self._mark_uncertain(operation, "YouTubeManager upload submission was cancelled")
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload submission was cancelled",
+                    context,
+                )
                 raise CancelledError("youtube upload cancelled after submission") from exc
             if exc.response.status_code in DEFINITE_UPLOAD_REJECTION_STATUSES:
                 await self._operation_store.mark_failed(
                     operation.id,
                     f"YouTubeManager rejected upload request with HTTP {exc.response.status_code}",
+                    context=context,
                 )
                 raise RuntimeError("YouTubeManager rejected the upload request") from exc
-            await self._mark_uncertain(operation, "YouTubeManager upload submission outcome is uncertain")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager upload submission outcome is uncertain",
+                context,
+            )
             raise RuntimeError("YouTubeManager upload submission outcome is uncertain") from exc
 
         try:
@@ -248,17 +304,29 @@ class YouTubeUploadHandler(BaseHandler):
             manager_task_id = self._require_canonical_manager_task_id(payload.get("task_id"))
             if manager_task_id is None:
                 raise RuntimeError("YouTubeManager upload submission returned no canonical task id")
-            await self._persist_manager_task(operation, manager_task_id)
+            await self._persist_manager_task(
+                operation,
+                manager_task_id,
+                context,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self._mark_uncertain(operation, "YouTubeManager upload submission outcome is uncertain")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager upload submission outcome is uncertain",
+                context,
+            )
             if isinstance(exc, RuntimeError):
                 raise
             raise RuntimeError("YouTubeManager upload submission outcome is uncertain") from exc
 
         if self._cancelled:
-            await self._mark_uncertain(operation, "YouTubeManager upload submission was cancelled")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager upload submission was cancelled",
+                context,
+            )
             raise CancelledError("youtube upload cancelled after submission")
         return manager_task_id
 
@@ -267,101 +335,212 @@ class YouTubeUploadHandler(BaseHandler):
         operation: Any,
         manager_task_id: str,
         client: httpx.AsyncClient,
+        context: UploadOperationContext,
     ) -> Any:
         deadline = time.monotonic() + self._timeout_seconds
         while True:
             if self._cancelled:
-                await self._mark_uncertain(operation, "YouTubeManager upload polling was cancelled")
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload polling was cancelled",
+                    context,
+                )
                 raise CancelledError("youtube upload cancelled during polling")
             try:
                 response = await self._await_request(
                     client.get(f"{self._base_url}/api/status/{manager_task_id}")
                 )
             except asyncio.CancelledError:
-                await self._mark_uncertain(operation, "YouTubeManager upload polling was cancelled")
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload polling was cancelled",
+                    context,
+                )
                 raise
             except Exception as exc:
-                await self._mark_uncertain(operation, "YouTubeManager upload status is uncertain")
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload status is uncertain",
+                    context,
+                )
                 raise RuntimeError("YouTubeManager upload status is uncertain") from exc
             except (KeyboardInterrupt, SystemExit):
-                await self._mark_uncertain(operation, "YouTubeManager upload polling was interrupted")
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload polling was interrupted",
+                    context,
+                )
                 raise
 
             if self._cancelled:
-                await self._mark_uncertain(operation, "YouTubeManager upload polling was cancelled")
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload polling was cancelled",
+                    context,
+                )
                 raise CancelledError("youtube upload cancelled during polling")
             try:
                 response.raise_for_status()
                 payload = self._object_json(response, "YouTubeManager upload status")
                 status = payload.get("status")
             except Exception as exc:
-                await self._mark_uncertain(operation, "YouTubeManager upload status is uncertain")
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload status is uncertain",
+                    context,
+                )
                 raise RuntimeError("YouTubeManager upload status is uncertain") from exc
 
             if status == "completed":
-                return await self._record_completion(operation, payload)
+                return await self._record_completion(
+                    operation,
+                    payload,
+                    context,
+                )
             if status == "failed":
                 error_message = payload.get("error")
                 message = error_message.strip() if isinstance(error_message, str) else "manager reported failure"
-                await self._operation_store.mark_failed(operation.id, message[:1_000])
+                await self._operation_store.mark_failed(
+                    operation.id,
+                    message[:1_000],
+                    context=context,
+                )
                 raise RuntimeError(f"YouTubeManager upload failed: {message}")
             if status not in {"pending", "uploading"}:
-                await self._mark_uncertain(operation, "YouTubeManager returned an unknown upload status")
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager returned an unknown upload status",
+                    context,
+                )
                 raise RuntimeError("YouTubeManager returned an unknown upload status")
             if time.monotonic() >= deadline:
-                await self._mark_uncertain(operation, "YouTubeManager upload polling timed out")
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload polling timed out",
+                    context,
+                )
                 raise RuntimeError("YouTubeManager upload polling timed out")
             await asyncio.sleep(self._poll_interval_seconds)
 
-    async def _record_completion(self, operation: Any, payload: dict[str, Any]) -> Any:
+    async def _record_completion(
+        self,
+        operation: Any,
+        payload: dict[str, Any],
+        context: UploadOperationContext,
+    ) -> Any:
         result = payload.get("result")
         if not isinstance(result, dict):
-            await self._mark_uncertain(operation, "YouTubeManager completed upload has no result object")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager completed upload has no result object",
+                context,
+            )
             raise RuntimeError("YouTubeManager completed upload has no result object")
         video_id = result.get("video_id")
         url = result.get("url")
         if not isinstance(video_id, str) or not video_id.strip() or not isinstance(url, str):
-            await self._mark_uncertain(operation, "YouTubeManager completed upload has invalid result fields")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager completed upload has invalid result fields",
+                context,
+            )
             raise RuntimeError("YouTubeManager completed upload has invalid result fields")
         platform_video_id = video_id.strip()
         if url != f"https://www.youtube.com/watch?v={platform_video_id}":
-            await self._mark_uncertain(operation, "YouTubeManager completed upload has invalid result fields")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager completed upload has invalid result fields",
+                context,
+            )
             raise RuntimeError("YouTubeManager completed upload has invalid result fields")
         try:
-            return await self._operation_store.mark_succeeded(operation.id, platform_video_id, result)
+            return await self._operation_store.mark_succeeded(
+                operation.id,
+                platform_video_id,
+                result,
+                context=context,
+            )
         except Exception as exc:
-            await self._mark_uncertain(operation, "YouTubeManager completion could not be recorded durably")
+            await self._mark_uncertain(
+                operation,
+                "YouTubeManager completion could not be recorded durably",
+                context,
+            )
             raise RuntimeError("YouTubeManager completion could not be recorded durably") from exc
 
-    async def _await_request(self, request: Awaitable[httpx.Response]) -> httpx.Response:
-        async with asyncio.timeout(self._timeout_seconds):
+    async def _await_request(
+        self,
+        request: Awaitable[httpx.Response],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> httpx.Response:
+        async with asyncio.timeout(
+            self._timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        ):
             return await request
 
-    async def _persist_manager_task(self, operation: Any, manager_task_id: str) -> None:
+    async def _persist_manager_task(
+        self,
+        operation: Any,
+        manager_task_id: str,
+        context: UploadOperationContext,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SUBMITTED_TRANSITION_TIMEOUT_SECONDS
         transition = asyncio.create_task(
-            self._operation_store.mark_submitted(operation.id, manager_task_id)
+            self._operation_store.mark_submitted(
+                operation.id,
+                manager_task_id,
+                context=context,
+            )
         )
         try:
-            await asyncio.shield(transition)
+            async with asyncio.timeout(
+                SUBMITTED_TRANSITION_TIMEOUT_SECONDS
+            ):
+                await asyncio.shield(transition)
         except asyncio.CancelledError:
             try:
-                await asyncio.shield(transition)
+                remaining = max(0.0, deadline - loop.time())
+                async with asyncio.timeout(remaining):
+                    await asyncio.shield(transition)
             except Exception:
-                pass
+                transition.cancel()
+                await asyncio.gather(
+                    transition,
+                    return_exceptions=True,
+                )
             await self._mark_uncertain(
                 operation,
                 "YouTubeManager upload submission was cancelled after manager task creation",
+                context,
             )
             raise
+        except TimeoutError:
+            transition.cancel()
+            await asyncio.gather(transition, return_exceptions=True)
+            raise
 
-    async def _mark_uncertain(self, operation: Any, message: str) -> None:
-        await self._operation_store.mark_uncertain(operation.id, message)
+    async def _mark_uncertain(
+        self,
+        operation: Any,
+        message: str,
+        context: UploadOperationContext,
+    ) -> None:
+        await self._operation_store.mark_uncertain(
+            operation.id,
+            message,
+            context=context,
+        )
 
     async def _verify_claim_content_hash(
         self,
         action: str,
         operation: Any,
         snapshot_sha256: str,
+        context: UploadOperationContext,
     ) -> None:
         expected_sha256 = getattr(operation, "content_sha256", None)
         matches = isinstance(expected_sha256, str) and hmac.compare_digest(
@@ -374,6 +553,7 @@ class YouTubeUploadHandler(BaseHandler):
             await self._mark_uncertain(
                 operation,
                 "youtube upload snapshot content hash does not match the claimed operation",
+                context,
             )
         raise RuntimeError("youtube upload snapshot content hash does not match the claimed operation")
 
@@ -411,6 +591,8 @@ class YouTubeUploadHandler(BaseHandler):
             raise RuntimeError("youtube upload requires _execution_claim worker context")
         worker_id = raw_claim.get("worker_id")
         raw_started_at = raw_claim.get("started_at")
+        raw_registration_id = raw_claim.get("worker_registration_id")
+        raw_lease_epoch = raw_claim.get("worker_lease_epoch")
         if not isinstance(worker_id, str) or not worker_id.strip():
             raise RuntimeError("youtube upload execution claim has an invalid worker id")
         if not isinstance(raw_started_at, str):
@@ -421,6 +603,17 @@ class YouTubeUploadHandler(BaseHandler):
             raise RuntimeError("youtube upload execution claim has an invalid start time") from exc
         if started_at.tzinfo is None:
             raise RuntimeError("youtube upload execution claim start time must include a UTC offset")
+        registration_id = self._require_uuid(
+            raw_registration_id,
+            "_execution_claim.worker_registration_id",
+        )
+        if (
+            type(raw_lease_epoch) is not int
+            or raw_lease_epoch <= 0
+        ):
+            raise RuntimeError(
+                "youtube upload execution claim has an invalid lease epoch"
+            )
 
         return UploadOperationContext(
             job_id=job_id,
@@ -430,6 +623,8 @@ class YouTubeUploadHandler(BaseHandler):
                 node_execution_id=node_execution_id,
                 worker_id=worker_id.strip(),
                 started_at=started_at,
+                worker_registration_id=registration_id,
+                worker_lease_epoch=raw_lease_epoch,
             ),
             input_artifact_id=self._require_uuid(artifact_ids["input"], "_input_artifact_ids.input"),
             content_sha256=content_sha256,

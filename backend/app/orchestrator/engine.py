@@ -7,6 +7,7 @@ from collections import Counter
 from datetime import datetime
 
 import redis.asyncio as aioredis
+from redis.typing import EncodableT
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -29,6 +30,7 @@ from app.services.job_execution_authority import (
     lock_job_execution_authority,
     require_active_execution_authority,
     require_matching_node_execution_claim,
+    require_worker_registration_lease,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,14 @@ TASK_STREAM = "vp:tasks:{worker_type}"
 EVENT_STREAM = "vp:events"
 CONSUMER_GROUP = "orchestrator"
 CONSUMER_NAME = "orchestrator-1"
+
+
+async def _require_registered_worker_lease(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+) -> None:
+    if claim.worker_registration_id is not None:
+        await require_worker_registration_lease(db, claim)
 
 
 def _extract_worker_host(worker_id: str | None) -> str | None:
@@ -371,7 +381,7 @@ class JobEngine:
                 worker_type = node_def.worker_type if node_def else "ffmpeg"
 
                 # Push task to Redis Stream
-                task = {
+                task: dict[EncodableT, EncodableT] = {
                     "job_id": str(job.id),
                     "node_execution_id": str(ne.id),
                     "node_id": ne.node_id,
@@ -554,6 +564,7 @@ class JobEngine:
                     node_statuses={NodeStatus.RUNNING},
                 )
                 require_matching_node_execution_claim(authority, claim)
+                await _require_registered_worker_lease(db, claim)
             except JobExecutionAuthorityBlocked as exc:
                 await db.rollback()
                 logger.info("Ignoring stale node completion job=%s node=%s: %s", job_id, node_execution_id, exc)
@@ -591,6 +602,7 @@ class JobEngine:
                     node_statuses={NodeStatus.SUCCEEDED},
                 )
                 require_matching_node_execution_claim(authority, claim)
+                await _require_registered_worker_lease(db, claim)
             except JobExecutionAuthorityBlocked as exc:
                 await db.rollback()
                 logger.info(
@@ -632,6 +644,7 @@ class JobEngine:
                     node_statuses={NodeStatus.RUNNING},
                 )
                 require_matching_node_execution_claim(authority, claim)
+                await _require_registered_worker_lease(db, claim)
             except JobExecutionAuthorityBlocked as exc:
                 await db.rollback()
                 logger.info("Ignoring stale node failure job=%s node=%s: %s", job_id, node_execution_id, exc)
@@ -660,6 +673,7 @@ class JobEngine:
                         node_statuses={NodeStatus.QUEUED},
                     )
                     require_matching_node_execution_claim(authority, claim)
+                    await _require_registered_worker_lease(db, claim)
                 except JobExecutionAuthorityBlocked as exc:
                     await db.rollback()
                     logger.info(
@@ -692,7 +706,7 @@ class JobEngine:
                     node_def = registry.get_type(ne.node_type)
                     worker_type = node_def.worker_type if node_def else "ffmpeg"
 
-                    task = {
+                    task: dict[EncodableT, EncodableT] = {
                         "job_id": str(job.id),
                         "node_execution_id": str(ne.id),
                         "node_id": ne.node_id,

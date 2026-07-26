@@ -112,6 +112,7 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
     failed_node_execution_id = uuid.uuid4()
     started_at = datetime(2026, 7, 22, 12, 30, tzinfo=timezone.utc)
     worker_id = "ffmpeg-worker@vp-gpu:42"
+    registration_id = uuid.uuid4()
     retry_node = SimpleNamespace(
         id=failed_node_execution_id,
         node_id="trim",
@@ -124,6 +125,8 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
         queued_at=None,
         worker_id=worker_id,
         started_at=started_at,
+        worker_registration_id=registration_id,
+        worker_lease_epoch=21,
     )
     source_node = SimpleNamespace(
         id=uuid.uuid4(),
@@ -157,9 +160,20 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
             node=retry_node,
         )
 
+    lease_checks: list[NodeExecutionClaim] = []
+
+    async def require_lease(_db, claim):
+        lease_checks.append(claim)
+
     monkeypatch.setattr(engine_module, "async_session", lambda: fake_session)
     monkeypatch.setattr(engine_module, "_redis", lambda: fake_redis)
     monkeypatch.setattr(engine_module, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        engine_module,
+        "require_worker_registration_lease",
+        require_lease,
+        raising=False,
+    )
 
     await JobEngine().on_node_failed(
         job_id,
@@ -170,6 +184,8 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
             node_execution_id=failed_node_execution_id,
             worker_id=worker_id,
             started_at=started_at,
+            worker_registration_id=registration_id,
+            worker_lease_epoch=21,
         ),
     )
 
@@ -178,6 +194,7 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
     assert retry_node.error_message is None
     assert fake_session.commits == 2
     assert fake_redis.closed
+    assert len(lease_checks) == 2
     assert len(fake_redis.added) == 1
 
     stream_key, task = fake_redis.added[0]

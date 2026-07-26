@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "0.0.0.0", "::1"}
 PRODUCTION_DEPLOY_MODES = {"shared", "production"}
 MINIO_SETTINGS = ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET")
-MINIO_WORKER_TYPES = {"ffmpeg", "youtube_publisher"}
+MINIO_WORKER_TYPES = {"ffmpeg", "vision", "youtube_publisher"}
 
 
 class WorkerAdmissionError(RuntimeError):
@@ -64,6 +64,15 @@ def enforce_worker_admission_from_env(env: Mapping[str, str] | None = None) -> N
     decision = validate_worker_admission(os.environ if env is None else env)
     if not decision.allowed:
         raise WorkerAdmissionError("; ".join(decision.reasons))
+
+
+def is_production_worker_env(env: Mapping[str, str]) -> bool:
+    deploy_mode = _env_value(env, "DEPLOY_MODE", "shared").lower()
+    redis_url = _env_value(env, "REDIS_URL", "redis://localhost:6379/0")
+    return _is_production_queue_consumer(
+        deploy_mode=deploy_mode,
+        redis_url=redis_url,
+    )
 
 
 def _env_value(env: Mapping[str, str], key: str, default: str) -> str:

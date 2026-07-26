@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
@@ -12,13 +13,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.channel_agent import ProductionTask
-from app.models.job import JobStatus, NodeStatus
+from app.models.job import JobStatus, NodeExecution, NodeStatus
 from app.models.youtube_upload_operation import YouTubeUploadOperation
 from app.services.job_execution_authority import (
+    JobExecutionAuthorityBlocked,
     NodeExecutionClaim,
     lock_job_execution_authority,
     require_active_execution_authority,
     require_matching_node_execution_claim,
+    require_worker_registration_lease,
 )
 
 
@@ -46,6 +49,12 @@ class UploadOperationConflictError(RuntimeError):
 class YouTubeUploadOperationStore:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+        self._active_submission_fence: ContextVar[
+            UploadOperationContext | None
+        ] = ContextVar(
+            f"youtube-upload-submission-fence-{id(self)}",
+            default=None,
+        )
 
     @asynccontextmanager
     async def submission_fence(
@@ -70,7 +79,16 @@ class YouTubeUploadOperationStore:
                     authority,
                     context.execution_claim,
                 )
-                yield
+                if context.execution_claim.worker_registration_id is not None:
+                    await require_worker_registration_lease(
+                        db,
+                        context.execution_claim,
+                    )
+                token = self._active_submission_fence.set(context)
+                try:
+                    yield
+                finally:
+                    self._active_submission_fence.reset(token)
 
     async def claim(self, context: UploadOperationContext) -> UploadOperationClaim:
         async with self._session_factory() as db:
@@ -88,6 +106,11 @@ class YouTubeUploadOperationStore:
                 authority,
                 context.execution_claim,
             )
+            if context.execution_claim.worker_registration_id is not None:
+                await require_worker_registration_lease(
+                    db,
+                    context.execution_claim,
+                )
             existing = await self._operation_for_node(
                 db,
                 context.node_execution_id,
@@ -129,8 +152,15 @@ class YouTubeUploadOperationStore:
     async def mark_attempting(
         self,
         operation_id: uuid.UUID,
+        *,
+        context: UploadOperationContext | None = None,
     ) -> YouTubeUploadOperation:
         async with self._session_factory() as db:
+            await self._require_transition_context(
+                db,
+                operation_id,
+                context,
+            )
             result = await db.execute(
                 update(YouTubeUploadOperation)
                 .where(YouTubeUploadOperation.id == operation_id)
@@ -153,12 +183,23 @@ class YouTubeUploadOperationStore:
                 f"cannot begin submission from {current.status} operation"
             )
 
-    async def mark_submitted(self, operation_id: uuid.UUID, manager_task_id: str) -> YouTubeUploadOperation:
+    async def mark_submitted(
+        self,
+        operation_id: uuid.UUID,
+        manager_task_id: str,
+        *,
+        context: UploadOperationContext | None = None,
+    ) -> YouTubeUploadOperation:
         canonical_manager_task_id = self._canonical_manager_task_id(manager_task_id)
         if canonical_manager_task_id is None:
             raise ValueError("manager task id must be a canonical UUID")
 
         async with self._session_factory() as db:
+            await self._require_transition_context(
+                db,
+                operation_id,
+                context,
+            )
             result = await db.execute(
                 update(YouTubeUploadOperation)
                 .where(YouTubeUploadOperation.id == operation_id)
@@ -191,11 +232,18 @@ class YouTubeUploadOperationStore:
         operation_id: uuid.UUID,
         platform_video_id: str,
         receipt: dict[str, Any],
+        *,
+        context: UploadOperationContext | None = None,
     ) -> YouTubeUploadOperation:
         if not self._is_nonblank_string(platform_video_id):
             raise ValueError("platform video id is required")
 
         async with self._session_factory() as db:
+            await self._require_transition_context(
+                db,
+                operation_id,
+                context,
+            )
             metadata_result = await db.execute(
                 select(YouTubeUploadOperation.title, YouTubeUploadOperation.privacy).where(
                     YouTubeUploadOperation.id == operation_id
@@ -248,19 +296,48 @@ class YouTubeUploadOperationStore:
                 )
             raise ValueError(f"cannot mark {current.status} operation succeeded")
 
-    async def mark_uncertain(self, operation_id: uuid.UUID, error_message: str) -> YouTubeUploadOperation:
-        return await self._mark_terminal(operation_id, "uncertain", error_message)
+    async def mark_uncertain(
+        self,
+        operation_id: uuid.UUID,
+        error_message: str,
+        *,
+        context: UploadOperationContext | None = None,
+    ) -> YouTubeUploadOperation:
+        return await self._mark_terminal(
+            operation_id,
+            "uncertain",
+            error_message,
+            context=context,
+        )
 
-    async def mark_failed(self, operation_id: uuid.UUID, error_message: str) -> YouTubeUploadOperation:
-        return await self._mark_terminal(operation_id, "failed", error_message)
+    async def mark_failed(
+        self,
+        operation_id: uuid.UUID,
+        error_message: str,
+        *,
+        context: UploadOperationContext | None = None,
+    ) -> YouTubeUploadOperation:
+        return await self._mark_terminal(
+            operation_id,
+            "failed",
+            error_message,
+            context=context,
+        )
 
     async def _mark_terminal(
         self,
         operation_id: uuid.UUID,
         status: str,
         error_message: str,
+        *,
+        context: UploadOperationContext | None,
     ) -> YouTubeUploadOperation:
         async with self._session_factory() as db:
+            await self._require_transition_context(
+                db,
+                operation_id,
+                context,
+            )
             result = await db.execute(
                 update(YouTubeUploadOperation)
                 .where(YouTubeUploadOperation.id == operation_id)
@@ -282,6 +359,59 @@ class YouTubeUploadOperationStore:
             if current.status == status:
                 return current
             raise ValueError(f"cannot mark {current.status} operation {status}")
+
+    async def _require_transition_context(
+        self,
+        db: AsyncSession,
+        operation_id: uuid.UUID,
+        context: UploadOperationContext | None,
+    ) -> None:
+        operation = await self._operation(db, operation_id)
+        if context is None:
+            registration_id = await db.scalar(
+                select(NodeExecution.worker_registration_id).where(
+                    NodeExecution.id == operation.node_execution_id
+                )
+            )
+            if registration_id is not None:
+                raise JobExecutionAuthorityBlocked(
+                    "registered upload operation requires execution context"
+                )
+            return
+        if (
+            operation.job_id != context.job_id
+            or operation.node_execution_id != context.node_execution_id
+        ):
+            raise JobExecutionAuthorityBlocked(
+                "upload operation execution context changed"
+            )
+        active_context = self._active_submission_fence.get()
+        if active_context == context:
+            if context.execution_claim.worker_registration_id is not None:
+                await require_worker_registration_lease(
+                    db,
+                    context.execution_claim,
+                )
+            return
+        authority = await lock_job_execution_authority(
+            db,
+            context.job_id,
+            node_execution_id=context.node_execution_id,
+        )
+        require_active_execution_authority(
+            authority,
+            job_statuses={JobStatus.RUNNING},
+            node_statuses={NodeStatus.RUNNING},
+        )
+        require_matching_node_execution_claim(
+            authority,
+            context.execution_claim,
+        )
+        if context.execution_claim.worker_registration_id is not None:
+            await require_worker_registration_lease(
+                db,
+                context.execution_claim,
+            )
 
     @staticmethod
     async def _production_task_id(db: AsyncSession, job_id: uuid.UUID) -> uuid.UUID | None:

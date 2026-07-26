@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -33,6 +33,8 @@ class NodeExecutionClaim:
     node_execution_id: uuid.UUID
     worker_id: str
     started_at: datetime
+    worker_registration_id: uuid.UUID | None = None
+    worker_lease_epoch: int | None = None
 
 
 def require_matching_node_execution_claim(
@@ -47,8 +49,57 @@ def require_matching_node_execution_claim(
         or node.worker_id != claim.worker_id
         or not isinstance(node.started_at, datetime)
         or _utc(node.started_at) != _utc(claim.started_at)
+        or getattr(node, "worker_registration_id", None)
+        != claim.worker_registration_id
+        or getattr(node, "worker_lease_epoch", None)
+        != claim.worker_lease_epoch
     ):
         raise JobExecutionAuthorityBlocked("node execution claim changed")
+
+
+async def require_worker_registration_lease(
+    db: AsyncSession,
+    claim: NodeExecutionClaim,
+) -> None:
+    await require_worker_registration_identity(
+        db,
+        claim.worker_registration_id,
+        claim.worker_lease_epoch,
+    )
+
+
+async def require_worker_registration_identity(
+    db: AsyncSession,
+    registration_id: uuid.UUID | None,
+    lease_epoch: int | None,
+) -> None:
+    if (
+        not isinstance(registration_id, uuid.UUID)
+        or type(lease_epoch) is not int
+        or lease_epoch <= 0
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "node execution has no durable worker registration lease"
+        )
+    try:
+        await db.scalar(
+            text(
+                """
+                SELECT public.vp_require_worker_lease(
+                    :registration_id,
+                    :lease_epoch
+                )
+                """
+            ),
+            {
+                "registration_id": registration_id,
+                "lease_epoch": lease_epoch,
+            },
+        )
+    except Exception as exc:
+        raise JobExecutionAuthorityBlocked(
+            "worker registration lease is no longer authoritative"
+        ) from exc
 
 
 def require_active_execution_authority(

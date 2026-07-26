@@ -24,7 +24,12 @@ class WorkerHarness:
         harness = self
 
         class YouTubeHandler:
-            def __init__(self, *, session_factory) -> None:
+            def __init__(
+                self,
+                *,
+                session_factory,
+                lease_refresher=None,
+            ) -> None:
                 harness.created.append(session_factory)
 
             async def execute(self, config, input_paths, output_path):

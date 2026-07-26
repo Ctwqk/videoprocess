@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.services.worker_admission import WorkerAdmissionError
+from app.services.worker_registration import WorkerLease, WorkerRegistrationError
 from worker import main as worker_main
 
 
@@ -24,6 +25,36 @@ def execution_claim(
         node_execution_id=node_execution_id,
         worker_id="test-worker@localhost:1",
         started_at=datetime(2026, 7, 22, 12, 0, 0),
+    )
+
+
+def registered_execution_claim(
+    job_id: uuid.UUID,
+    node_execution_id: uuid.UUID,
+) -> worker_main.NodeExecutionClaim:
+    return worker_main.NodeExecutionClaim(
+        job_id=job_id,
+        node_execution_id=node_execution_id,
+        worker_id="test-worker@localhost:1",
+        started_at=datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc),
+        worker_registration_id=uuid.uuid4(),
+        worker_lease_epoch=9,
+    )
+
+
+def worker_lease_for(claim: worker_main.NodeExecutionClaim) -> WorkerLease:
+    assert claim.worker_registration_id is not None
+    assert claim.worker_lease_epoch is not None
+    return WorkerLease(
+        registration_id=claim.worker_registration_id,
+        grant_id=uuid.uuid4(),
+        service_name="vp-ffmpeg-worker-gpu-swarm",
+        worker_instance_id=uuid.uuid4(),
+        worker_slot=1,
+        redis_consumer_id=claim.worker_id,
+        lease_epoch=claim.worker_lease_epoch,
+        lease_secret="lease-secret",
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=180),
     )
 
 
@@ -95,6 +126,454 @@ async def test_worker_events_include_canonical_execution_claim(monkeypatch) -> N
         ),
     ]
     assert close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    registration_id = uuid.uuid4()
+    node = SimpleNamespace(
+        id=node_execution_id,
+        status=worker_main.NodeStatus.QUEUED,
+        started_at=None,
+        worker_id=None,
+        worker_registration_id=None,
+        worker_lease_epoch=None,
+    )
+    lease = WorkerLease(
+        registration_id=registration_id,
+        grant_id=uuid.uuid4(),
+        service_name="vp-vision-worker-swarm",
+        worker_instance_id=uuid.uuid4(),
+        worker_slot=1,
+        redis_consumer_id="vision-worker@127:1:instance",
+        lease_epoch=12,
+        lease_secret="lease-secret",
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=180),
+    )
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+    async def lock_authority(_db, locked_job_id, *, node_execution_id):
+        assert locked_job_id == job_id
+        return SimpleNamespace(
+            job=SimpleNamespace(id=job_id, status=worker_main.JobStatus.RUNNING),
+            node=node,
+            channel=None,
+            task=None,
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=job_id),
+        )
+
+    async def require_lease(_db, claim):
+        assert claim.worker_registration_id == registration_id
+        assert claim.worker_lease_epoch == 12
+
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_lease",
+        require_lease,
+        raising=False,
+    )
+
+    claim = await worker_main._claim_node_execution(
+        str(job_id),
+        str(node_execution_id),
+        worker_lease=lease,
+        session_factory=lambda: Session(),
+    )
+
+    assert claim is not None
+    assert claim.worker_registration_id == registration_id
+    assert claim.worker_lease_epoch == 12
+    assert node.worker_registration_id == registration_id
+    assert node.worker_lease_epoch == 12
+
+
+@pytest.mark.asyncio
+async def test_event_xadd_occurs_while_exact_claim_and_lease_transaction_are_held(
+    monkeypatch,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    claim = registered_execution_claim(job_id, node_execution_id)
+    transaction_active = False
+    lease_checked = False
+    events: list[dict] = []
+
+    class Transaction:
+        async def __aenter__(self):
+            nonlocal transaction_active
+            transaction_active = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            nonlocal transaction_active
+            transaction_active = False
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+    class Redis:
+        async def xadd(self, stream, payload):
+            assert transaction_active
+            assert lease_checked
+            events.append(dict(payload))
+
+        async def aclose(self):
+            return None
+
+    async def lock_authority(_db, locked_job_id, *, node_execution_id):
+        return SimpleNamespace(
+            job=SimpleNamespace(id=job_id, status=worker_main.JobStatus.RUNNING),
+            node=SimpleNamespace(
+                id=node_execution_id,
+                status=worker_main.NodeStatus.RUNNING,
+                worker_id=claim.worker_id,
+                started_at=claim.started_at,
+                worker_registration_id=claim.worker_registration_id,
+                worker_lease_epoch=claim.worker_lease_epoch,
+            ),
+            channel=None,
+            task=None,
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=job_id),
+        )
+
+    async def require_lease(_db, checked_claim):
+        nonlocal lease_checked
+        assert transaction_active
+        assert checked_claim == claim
+        lease_checked = True
+
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_lease",
+        require_lease,
+        raising=False,
+    )
+    monkeypatch.setattr(worker_main, "_redis", lambda: Redis())
+
+    await worker_main._report_success(
+        str(job_id),
+        str(node_execution_id),
+        str(uuid.uuid4()),
+        claim,
+    )
+
+    assert len(events) == 1
+    assert events[0]["worker_registration_id"] == str(
+        claim.worker_registration_id
+    )
+    assert events[0]["worker_lease_epoch"] == claim.worker_lease_epoch
+
+
+@pytest.mark.asyncio
+async def test_final_xack_uses_exact_claim_fence(monkeypatch) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    acknowledgements: list[tuple[object, str, object]] = []
+
+    class Redis:
+        async def xack(self, *args):
+            raise AssertionError("raw XACK must not bypass the database fence")
+
+    async def process(_data, *, worker_lease=None):
+        return claim
+
+    async def heartbeat(_redis, _message_id):
+        await asyncio.Event().wait()
+
+    async def ack(redis, message_id, handled_claim):
+        acknowledgements.append((redis, message_id, handled_claim))
+
+    monkeypatch.setattr(worker_main, "process_task", process)
+    monkeypatch.setattr(worker_main, "_heartbeat_message", heartbeat)
+    monkeypatch.setattr(
+        worker_main,
+        "_ack_message_for_claim",
+        ack,
+        raising=False,
+    )
+
+    redis = Redis()
+    await worker_main._process_message(
+        redis,
+        "1-0",
+        {
+            "job_id": str(claim.job_id),
+            "node_execution_id": str(claim.node_execution_id),
+        },
+        worker_lease=worker_lease_for(claim),
+    )
+
+    assert acknowledgements == [(redis, "1-0", claim)]
+
+
+@pytest.mark.asyncio
+async def test_final_xack_accepts_exact_claim_after_orchestrator_finalizes_node(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease_checked = False
+    acknowledgements: list[str] = []
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+    class Redis:
+        async def xack(self, stream, group, message_id):
+            acknowledgements.append(message_id)
+
+    async def lock_authority(_db, job_id, *, node_execution_id):
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(state="CLOSED", guarded_job_id=None),
+            task=None,
+            job=SimpleNamespace(
+                id=claim.job_id,
+                status=worker_main.JobStatus.SUCCEEDED,
+            ),
+            node=SimpleNamespace(
+                id=claim.node_execution_id,
+                status=worker_main.NodeStatus.SUCCEEDED,
+                worker_id=claim.worker_id,
+                started_at=claim.started_at,
+                worker_registration_id=claim.worker_registration_id,
+                worker_lease_epoch=claim.worker_lease_epoch,
+            ),
+        )
+
+    async def require_lease(_db, checked_claim):
+        nonlocal lease_checked
+        assert checked_claim == claim
+        lease_checked = True
+
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_lease",
+        require_lease,
+    )
+
+    await worker_main._ack_message_for_claim(Redis(), "1-0", claim)
+
+    assert lease_checked
+    assert acknowledgements == ["1-0"]
+
+
+@pytest.mark.asyncio
+async def test_registration_loss_cancels_consumer_and_propagates_stable_error() -> None:
+    consumer_cancelled = asyncio.Event()
+    loss = WorkerRegistrationError("lease_fenced")
+
+    class Registration:
+        async def wait_lost(self):
+            await asyncio.sleep(0)
+            return loss
+
+    async def consume():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            consumer_cancelled.set()
+
+    with pytest.raises(WorkerRegistrationError) as exc:
+        await worker_main._run_until_registration_loss(
+            Registration(),
+            consume(),
+        )
+
+    assert exc.value.code == "lease_fenced"
+    assert consumer_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_affinity_bounce_xadd_and_xack_share_registration_fence(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    transaction_active = False
+    lease_checked = False
+    redis_calls: list[str] = []
+
+    class Transaction:
+        async def __aenter__(self):
+            nonlocal transaction_active
+            transaction_active = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            nonlocal transaction_active
+            transaction_active = False
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+    class Redis:
+        async def xadd(self, stream, payload):
+            assert transaction_active and lease_checked
+            redis_calls.append("xadd")
+
+        async def xack(self, stream, group, message_id):
+            assert transaction_active and lease_checked
+            redis_calls.append("xack")
+
+    async def require_identity(_db, registration_id, lease_epoch):
+        nonlocal lease_checked
+        assert transaction_active
+        assert registration_id == lease.registration_id
+        assert lease_epoch == lease.lease_epoch
+        lease_checked = True
+
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_identity",
+        require_identity,
+        raising=False,
+    )
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "127")
+
+    deferred = await worker_main._maybe_defer_for_affinity(
+        Redis(),
+        "1-0",
+        {
+            "preferred_hosts": json.dumps(["150"]),
+            "affinity_enqueued_at": str(int(worker_main.time.time())),
+            "affinity_bounces": "0",
+        },
+        worker_lease=lease,
+    )
+
+    assert deferred is True
+    assert redis_calls == ["xadd", "xack"]
+
+
+@pytest.mark.asyncio
+async def test_consumer_cancellation_cancels_inflight_messages_without_xack(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    message_started = asyncio.Event()
+    message_cancelled = asyncio.Event()
+    reads = 0
+
+    class Registration:
+        def __init__(self, current_lease):
+            self.lease = current_lease
+            self.redis_consumer_id = current_lease.redis_consumer_id
+            self.redis_stream = "vp:tasks:admitted-vision"
+            self.redis_group = "admitted-vision-workers"
+            self.worker_host = "127"
+
+        async def heartbeat_now(self, *, minimum_margin_seconds: float = 0):
+            return self.lease
+
+    class Redis:
+        async def xgroup_create(self, stream, group, *args, **kwargs):
+            assert stream == "vp:tasks:admitted-vision"
+            assert group == "admitted-vision-workers"
+            return None
+
+        async def xreadgroup(self, group, consumer, streams, **kwargs):
+            nonlocal reads
+            assert group == "admitted-vision-workers"
+            assert streams == {"vp:tasks:admitted-vision": ">"}
+            reads += 1
+            if reads == 1:
+                return [
+                    (
+                        worker_main.TASK_STREAM,
+                        [
+                            (
+                                "1-0",
+                                {
+                                    "job_id": str(claim.job_id),
+                                    "node_execution_id": str(
+                                        claim.node_execution_id
+                                    ),
+                                },
+                            )
+                        ],
+                    )
+                ]
+            await asyncio.Event().wait()
+
+        async def xack(self, *args):
+            raise AssertionError("lease-loss cancellation must leave the PEL pending")
+
+    async def process_message(*args, **kwargs):
+        message_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            message_cancelled.set()
+
+    async def no_reclaim(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(worker_main, "_process_message", process_message)
+    monkeypatch.setattr(worker_main, "_reclaim_pending", no_reclaim)
+
+    consumer = asyncio.create_task(
+        worker_main._consume_registered_worker(Redis(), Registration(lease))
+    )
+    await asyncio.wait_for(message_started.wait(), timeout=0.2)
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert message_cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -1129,13 +1608,42 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
     monkeypatch.setattr(
         worker_main,
         "enforce_worker_admission_from_env",
-        lambda: events.append("admission"),
+        lambda env=None: events.append("admission"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda env: events.append("database-secret") or "postgresql+asyncpg://worker@db/vp",
         raising=False,
     )
     monkeypatch.setattr(
         worker_main,
         "configure_worker_database",
-        lambda: events.append("database"),
+        lambda database_url=None: events.append("database"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda env: events.append("token-secret") or "token",
+        raising=False,
+    )
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@127:1:instance"
+
+        async def close(self):
+            events.append("revoke")
+
+    async def register(env, database_url, admission_token):
+        events.append("registration")
+        return Registration()
+
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        register,
         raising=False,
     )
 
@@ -1148,7 +1656,69 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
     with pytest.raises(StopStartup):
         await worker_main.main()
 
-    assert events == ["admission", "database", "redis"]
+    assert events == [
+        "admission",
+        "database-secret",
+        "database",
+        "token-secret",
+        "registration",
+        "redis",
+        "revoke",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_denied_durable_registration_performs_zero_redis_calls(
+    monkeypatch,
+    caplog,
+) -> None:
+    touched: list[str] = []
+    credential = "postgresql+asyncpg://runtime:never-log-me@vp-postgres/vp"
+
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda env=None: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda env: credential,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda database_url=None: touched.append("database"),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda env: "admission-token",
+        raising=False,
+    )
+
+    async def deny_registration(env, database_url, admission_token):
+        raise worker_main.WorkerRegistrationError("token_invalid")
+
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        deny_registration,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_redis",
+        lambda: touched.append("redis"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        await worker_main.main()
+
+    assert exc.value.code == 2
+    assert touched == ["database"]
+    assert credential not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1281,11 +1851,13 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
     input_path = tmp_path / "input.mp4"
     input_path.write_bytes(b"input")
     created: list[tuple[str, object | None]] = []
+    lease_refreshers: list[object | None] = []
     executed_configs: list[dict] = []
 
     class YouTubeHandler:
-        def __init__(self, *, session_factory):
+        def __init__(self, *, session_factory, lease_refresher=None):
             created.append(("youtube", session_factory))
+            lease_refreshers.append(lease_refresher)
 
         async def execute(self, config, input_paths, output_path):
             executed_configs.append(dict(config))
@@ -1360,8 +1932,13 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
     async def report_success(*args) -> None:
         return None
 
+    claim = registered_execution_claim(job_id, node_execution_id)
+
     async def claim_node(*args, **kwargs):
-        return execution_claim(job_id, node_execution_id)
+        return claim
+
+    async def refresh_worker_lease(*, minimum_margin_seconds: float):
+        return None
 
     async def require_current_claim(_claim) -> None:
         return None
@@ -1401,21 +1978,30 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
         "config": json.dumps({"title": "Canary"}),
         "input_artifacts": json.dumps({"input": str(input_artifact_id)}),
     }
-    await worker_main.process_task(data)
+    await worker_main.process_task(
+        data,
+        worker_lease=worker_lease_for(claim),
+        lease_refresher=refresh_worker_lease,
+    )
 
     await worker_main.process_task({**data, "node_id": "source_1", "node_type": "source"})
 
     assert created == [("youtube", process_session_factory), ("other", None)]
+    assert lease_refreshers == [refresh_worker_lease]
     assert executed_configs == [
         {
             "title": "Canary",
             "_job_id": str(job_id),
             "_node_execution_id": str(node_execution_id),
             "_input_artifact_ids": {"input": str(input_artifact_id)},
-            "_execution_claim": {
-                "worker_id": "test-worker@localhost:1",
-                "started_at": "2026-07-22T12:00:00+00:00",
-            },
+                "_execution_claim": {
+                    "worker_id": "test-worker@localhost:1",
+                    "started_at": "2026-07-22T12:00:00+00:00",
+                    "worker_registration_id": str(
+                        claim.worker_registration_id
+                    ),
+                    "worker_lease_epoch": claim.worker_lease_epoch,
+                },
             "_input_artifact_meta": {"input": {}},
         }
     ]

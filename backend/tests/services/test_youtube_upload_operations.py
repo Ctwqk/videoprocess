@@ -79,6 +79,7 @@ async def _context_for(
     db: AsyncSession,
     *,
     production_task: ProductionTask | None = None,
+    registered: bool = False,
 ) -> UploadOperationContext:
     claimed_at = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
     worker_id = "test-worker@localhost:1"
@@ -97,6 +98,8 @@ async def _context_for(
         status=NodeStatus.RUNNING,
         worker_id=worker_id,
         started_at=claimed_at,
+        worker_registration_id=uuid.uuid4() if registered else None,
+        worker_lease_epoch=11 if registered else None,
     )
     db.add(node)
     await db.flush()
@@ -134,6 +137,8 @@ async def _context_for(
             node_execution_id=node.id,
             worker_id=worker_id,
             started_at=claimed_at,
+            worker_registration_id=node.worker_registration_id,
+            worker_lease_epoch=node.worker_lease_epoch,
         ),
         input_artifact_id=artifact.id,
         content_sha256="a" * 64,
@@ -208,6 +213,80 @@ async def test_submission_fence_rejects_reassigned_execution_claim(
             entered.append("posted")
 
     assert entered == []
+
+
+@pytest.mark.asyncio
+async def test_registered_operation_transitions_require_context_and_lease_fence(
+    monkeypatch,
+    operation_session_factory,
+) -> None:
+    lease_checks: list[NodeExecutionClaim] = []
+
+    async def require_lease(_db, claim):
+        lease_checks.append(claim)
+
+    monkeypatch.setattr(
+        upload_operations,
+        "require_worker_registration_lease",
+        require_lease,
+        raising=False,
+    )
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db, registered=True)
+
+    claimed = await store.claim(context)
+    with pytest.raises(JobExecutionAuthorityBlocked, match="context"):
+        await store.mark_attempting(claimed.operation.id)
+
+    attempting = await store.mark_attempting(
+        claimed.operation.id,
+        context=context,
+    )
+    submitted = await store.mark_submitted(
+        attempting.id,
+        MANAGER_TASK_ID,
+        context=context,
+    )
+    succeeded = await store.mark_succeeded(
+        submitted.id,
+        "abcdefghijk",
+        {"video_id": "abcdefghijk"},
+        context=context,
+    )
+    async with operation_session_factory() as db:
+        failed_context = await _context_for(db, registered=True)
+    failed_claim = await store.claim(failed_context)
+    failed = await store.mark_failed(
+        failed_claim.operation.id,
+        "manager rejected upload",
+        context=failed_context,
+    )
+    async with operation_session_factory() as db:
+        uncertain_context = await _context_for(db, registered=True)
+    uncertain_claim = await store.claim(uncertain_context)
+    await store.mark_attempting(
+        uncertain_claim.operation.id,
+        context=uncertain_context,
+    )
+    uncertain = await store.mark_uncertain(
+        uncertain_claim.operation.id,
+        "submission outcome is unknown",
+        context=uncertain_context,
+    )
+
+    assert succeeded.status == "succeeded"
+    assert failed.status == "failed"
+    assert uncertain.status == "uncertain"
+    checked_ids = {
+        check.worker_registration_id
+        for check in lease_checks
+    }
+    assert checked_ids == {
+        context.execution_claim.worker_registration_id,
+        failed_context.execution_claim.worker_registration_id,
+        uncertain_context.execution_claim.worker_registration_id,
+    }
 
 
 @pytest.mark.asyncio

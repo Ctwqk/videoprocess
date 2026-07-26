@@ -225,6 +225,22 @@ def test_remote_ffmpeg_worker_with_minio_and_explicit_host_is_allowed() -> None:
     assert decision.reasons == ()
 
 
+def test_production_vision_worker_requires_same_minio_identity_as_ffmpeg() -> None:
+    decision = validate_worker_admission(
+        {
+            "DEPLOY_MODE": "production",
+            "REDIS_URL": "redis://10.0.0.150:6380/0",
+            "WORKER_TYPE": "vision",
+            "WORKER_HOST": "127-vision",
+            "STORAGE_BACKEND": "local",
+        }
+    )
+
+    assert decision.allowed is False
+    assert "production vision workers require STORAGE_BACKEND=minio" in decision.reasons
+    assert "production vision workers require MINIO_ENDPOINT" in decision.reasons
+
+
 @pytest.mark.parametrize(
     "missing_key",
     ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET"),

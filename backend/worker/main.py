@@ -8,6 +8,7 @@ import socket
 import tempfile
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,16 +32,32 @@ from app.services.job_execution_authority import (
     lock_job_execution_authority,
     require_active_execution_authority,
     require_matching_node_execution_claim,
+    require_worker_registration_identity,
+    require_worker_registration_lease,
 )
 from app.services.worker_admission import (
     WorkerAdmissionError,
     enforce_worker_admission_from_env,
+)
+from app.services.worker_registration import (
+    WorkerLease,
+    WorkerRegistrationError,
+    WorkerRegistrationService,
 )
 from app.storage.base import StorageBackend
 from app.storage.manager import get_storage
 from worker.handlers import HANDLER_MAP
 from worker.handlers.base import BaseHandler, CancelledError
 from worker.handlers.youtube_upload import YouTubeUploadHandler
+from worker.registration import (
+    PythonWorkerRegistration,
+    build_worker_registration_claims,
+)
+from worker.secret_config import (
+    WorkerSecretError,
+    load_worker_admission_token,
+    load_worker_database_url,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("worker")
@@ -75,7 +92,7 @@ engine_db: AsyncEngine | None = None
 worker_session: async_sessionmaker[AsyncSession] | None = None
 
 
-def configure_worker_database() -> None:
+def configure_worker_database(database_url: str | None = None) -> None:
     """Initialize worker DB state only after startup admission succeeds."""
     global engine_db, worker_session
     if engine_db is not None and worker_session is not None:
@@ -84,7 +101,7 @@ def configure_worker_database() -> None:
     # Remote workers can hold idle DB connections long enough for the
     # server/network to close them, so proactively ping and recycle.
     engine_db = create_async_engine(
-        settings.database_url,
+        database_url or settings.database_url,
         echo=False,
         pool_pre_ping=True,
         pool_recycle=300,
@@ -107,6 +124,26 @@ def _redis() -> aioredis.Redis:
         socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
         health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
     )
+
+
+async def _start_worker_registration(
+    env: dict[str, str],
+    database_url: str,
+    admission_token: str,
+) -> PythonWorkerRegistration:
+    instance_id = uuid.uuid4()
+    claims = build_worker_registration_claims(
+        env,
+        database_url=database_url,
+        worker_instance_id=instance_id,
+    )
+    lifecycle = PythonWorkerRegistration(
+        WorkerRegistrationService(get_worker_session()),
+        claims,
+        admission_token,
+    )
+    await lifecycle.start()
+    return lifecycle
 
 
 @dataclass(frozen=True)
@@ -172,6 +209,7 @@ async def _claim_node_execution(
     job_id: str,
     node_execution_id: str,
     *,
+    worker_lease: WorkerLease | None = None,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> NodeExecutionClaim | None:
     """Atomically claim a queued node under durable execution authority."""
@@ -200,15 +238,34 @@ async def _claim_node_execution(
                     node_statuses={NodeStatus.QUEUED},
                 )
                 claimed_at = datetime.now(timezone.utc)
-                node.status = NodeStatus.RUNNING
-                node.started_at = claimed_at
-                node.worker_id = WORKER_ID
+                worker_id = (
+                    worker_lease.redis_consumer_id
+                    if worker_lease is not None
+                    else WORKER_ID
+                )
                 claim = NodeExecutionClaim(
                     job_id=resolved_job_id,
                     node_execution_id=resolved_node_id,
-                    worker_id=WORKER_ID,
+                    worker_id=worker_id,
                     started_at=claimed_at,
+                    worker_registration_id=(
+                        worker_lease.registration_id
+                        if worker_lease is not None
+                        else None
+                    ),
+                    worker_lease_epoch=(
+                        worker_lease.lease_epoch
+                        if worker_lease is not None
+                        else None
+                    ),
                 )
+                if worker_lease is not None:
+                    await require_worker_registration_lease(db, claim)
+                node.status = NodeStatus.RUNNING
+                node.started_at = claimed_at
+                node.worker_id = worker_id
+                node.worker_registration_id = claim.worker_registration_id
+                node.worker_lease_epoch = claim.worker_lease_epoch
             return claim
         except JobExecutionAuthorityBlocked as exc:
             await db.rollback()
@@ -242,6 +299,8 @@ async def _require_current_node_execution_claim(
                 node_statuses={NodeStatus.RUNNING},
             )
             require_matching_node_execution_claim(authority, claim)
+            if claim.worker_registration_id is not None:
+                await require_worker_registration_lease(db, claim)
 
 
 async def _persist_artifact_for_current_claim(
@@ -271,6 +330,8 @@ async def _persist_artifact_for_current_claim(
                 node_statuses={NodeStatus.RUNNING},
             )
             require_matching_node_execution_claim(authority, claim)
+            if claim.worker_registration_id is not None:
+                await require_worker_registration_lease(db, claim)
             artifact = Artifact(
                 job_id=claim.job_id,
                 node_execution_id=claim.node_execution_id,
@@ -295,6 +356,7 @@ async def _report_failure_for_current_claim(
 ) -> bool:
     try:
         await _require_current_node_execution_claim(claim)
+        await _report_failure(job_id, node_execution_id, error, claim)
     except JobExecutionAuthorityBlocked as exc:
         logger.info(
             "Skipping stale worker failure event job=%s node=%s: %s",
@@ -312,11 +374,15 @@ async def _report_failure_for_current_claim(
         )
         raise
 
-    await _report_failure(job_id, node_execution_id, error, claim)
     return True
 
 
-async def process_task(data: dict) -> None:
+async def process_task(
+    data: dict,
+    *,
+    worker_lease: WorkerLease | None = None,
+    lease_refresher: Callable[..., Awaitable[object]] | None = None,
+) -> NodeExecutionClaim | None:
     """Process a single node execution task."""
     job_id = data["job_id"]
     node_execution_id = data["node_execution_id"]
@@ -326,20 +392,24 @@ async def process_task(data: dict) -> None:
 
     logger.info(f"Processing node {data['node_id']} (type={node_type}) for job {job_id}")
 
-    claim = await _claim_node_execution(job_id, node_execution_id)
+    claim = await _claim_node_execution(
+        job_id,
+        node_execution_id,
+        worker_lease=worker_lease,
+    )
     if claim is None:
-        return
+        return None
 
     # Get handler
     handler_cls = HANDLER_MAP.get(node_type)
     if not handler_cls:
-        await _report_failure_for_current_claim(
+        reported = await _report_failure_for_current_claim(
             claim,
             job_id,
             node_execution_id,
             f"No handler for node type: {node_type}",
         )
-        return
+        return claim if reported else None
 
     if node_type == "youtube_upload":
         try:
@@ -350,13 +420,13 @@ async def process_task(data: dict) -> None:
                 input_artifacts_map=input_artifacts_map,
             )
         except Exception as exc:
-            await _report_failure_for_current_claim(
+            reported = await _report_failure_for_current_claim(
                 claim,
                 job_id,
                 node_execution_id,
                 str(exc),
             )
-            return
+            return claim if reported else None
         config["_job_id"] = job_id
         config["_node_execution_id"] = node_execution_id
         config["_input_artifact_ids"] = dict(input_artifacts_map)
@@ -364,11 +434,23 @@ async def process_task(data: dict) -> None:
             "worker_id": claim.worker_id,
             "started_at": _claim_started_at_utc(claim),
         }
+        if claim.worker_registration_id is not None:
+            config["_execution_claim"].update(
+                {
+                    "worker_registration_id": str(
+                        claim.worker_registration_id
+                    ),
+                    "worker_lease_epoch": claim.worker_lease_epoch,
+                }
+            )
 
     try:
         handler: BaseHandler
         if node_type == "youtube_upload":
-            handler = YouTubeUploadHandler(session_factory=get_worker_session())
+            handler = YouTubeUploadHandler(
+                session_factory=get_worker_session(),
+                lease_refresher=lease_refresher,
+            )
         else:
             handler = handler_cls()
     except Exception as exc:
@@ -383,7 +465,7 @@ async def process_task(data: dict) -> None:
                 "Failed to initialize handler for node %s",
                 data["node_id"],
             )
-        return
+        return claim if reported else None
 
     # Background task: periodically check cancel status and kill handler if needed
     cancel_check_task = None
@@ -557,10 +639,12 @@ async def process_task(data: dict) -> None:
             claim,
         )
         logger.info(f"Node {data['node_id']} completed successfully")
+        return claim
 
     except CancelledError:
         logger.info(f"Node {data['node_id']} cancelled, cleaning up")
         # Don't report failure — orchestrator already knows about the cancel
+        return None
     except Exception as e:
         reported = await _report_failure_for_current_claim(
             claim,
@@ -576,6 +660,7 @@ async def process_task(data: dict) -> None:
                 data["node_id"],
             )
             handler.cancel()
+        return claim if reported else None
     finally:
         if cancel_check_task and not cancel_check_task.done():
             cancel_check_task.cancel()
@@ -781,7 +866,13 @@ async def _report_success(
             "worker_id": claim.worker_id,
             "started_at": _claim_started_at_utc(claim),
         }
-        await r.xadd(EVENT_STREAM, payload)
+        if claim.worker_registration_id is not None:
+            payload["worker_registration_id"] = str(
+                claim.worker_registration_id
+            )
+            assert claim.worker_lease_epoch is not None
+            payload["worker_lease_epoch"] = claim.worker_lease_epoch
+        await _xadd_event_for_claim(r, payload, claim)
     finally:
         await r.aclose()
 
@@ -802,9 +893,40 @@ async def _report_failure(
             "worker_id": claim.worker_id,
             "started_at": _claim_started_at_utc(claim),
         }
-        await r.xadd(EVENT_STREAM, payload)
+        if claim.worker_registration_id is not None:
+            payload["worker_registration_id"] = str(
+                claim.worker_registration_id
+            )
+            assert claim.worker_lease_epoch is not None
+            payload["worker_lease_epoch"] = claim.worker_lease_epoch
+        await _xadd_event_for_claim(r, payload, claim)
     finally:
         await r.aclose()
+
+
+async def _xadd_event_for_claim(
+    redis: aioredis.Redis,
+    payload: dict[EncodableT, EncodableT],
+    claim: NodeExecutionClaim,
+) -> None:
+    if claim.worker_registration_id is None:
+        await redis.xadd(EVENT_STREAM, payload)
+        return
+    async with get_worker_session()() as db:
+        async with db.begin():
+            authority = await lock_job_execution_authority(
+                db,
+                claim.job_id,
+                node_execution_id=claim.node_execution_id,
+            )
+            require_active_execution_authority(
+                authority,
+                job_statuses={JobStatus.RUNNING},
+                node_statuses={NodeStatus.RUNNING},
+            )
+            require_matching_node_execution_claim(authority, claim)
+            await require_worker_registration_lease(db, claim)
+            await redis.xadd(EVENT_STREAM, payload)
 
 
 def _claim_generation_token(claim: NodeExecutionClaim) -> str:
@@ -864,7 +986,11 @@ def _resolve_artifact_storage(*, output_local_path: str, output_storage_path: st
     return storage_backend, output_storage_path
 
 
-async def _reclaim_pending(r: aioredis.Redis) -> None:
+async def _reclaim_pending(
+    r: aioredis.Redis,
+    *,
+    worker_lease: WorkerLease | None = None,
+) -> None:
     """Reclaim stale pending messages from any consumer in the group."""
     try:
         claimed = await r.xautoclaim(
@@ -877,7 +1003,12 @@ async def _reclaim_pending(r: aioredis.Redis) -> None:
             for msg_id, data in claimed[1]:
                 if data:
                     logger.info(f"Reclaimed pending task {msg_id}")
-                    await _process_message(r, msg_id, data)
+                    await _process_message(
+                        r,
+                        msg_id,
+                        data,
+                        worker_lease=worker_lease,
+                    )
     except Exception:
         logger.exception("PEL reclaim failed")
 
@@ -900,15 +1031,35 @@ async def _heartbeat_message(r: aioredis.Redis, msg_id: str) -> None:
             logger.exception("Heartbeat failed for task %s", msg_id)
 
 
-async def _process_message(r: aioredis.Redis, msg_id: str, data: dict) -> None:
-    if await _maybe_defer_for_affinity(r, msg_id, data):
+async def _process_message(
+    r: aioredis.Redis,
+    msg_id: str,
+    data: dict,
+    *,
+    worker_lease: WorkerLease | None = None,
+    lease_refresher: Callable[..., Awaitable[object]] | None = None,
+) -> None:
+    if await _maybe_defer_for_affinity(
+        r,
+        msg_id,
+        data,
+        worker_lease=worker_lease,
+    ):
         return
 
     heartbeat_task = asyncio.create_task(_heartbeat_message(r, msg_id))
-    should_ack = False
+    claim: NodeExecutionClaim | None = None
     try:
-        await process_task(data)
-        should_ack = True
+        if worker_lease is None:
+            claim = await process_task(data)
+        elif lease_refresher is not None:
+            claim = await process_task(
+                data,
+                worker_lease=worker_lease,
+                lease_refresher=lease_refresher,
+            )
+        else:
+            claim = await process_task(data, worker_lease=worker_lease)
     except Exception:
         logger.exception(
             "Unhandled error processing %s; leaving message pending because no "
@@ -921,8 +1072,28 @@ async def _process_message(r: aioredis.Redis, msg_id: str, data: dict) -> None:
             await heartbeat_task
         except asyncio.CancelledError:
             pass
-        if should_ack:
-            await r.xack(TASK_STREAM, CONSUMER_GROUP, msg_id)
+        if claim is not None:
+            await _ack_message_for_claim(r, msg_id, claim)
+
+
+async def _ack_message_for_claim(
+    redis: aioredis.Redis,
+    message_id: str,
+    claim: NodeExecutionClaim,
+) -> None:
+    if claim.worker_registration_id is None:
+        await redis.xack(TASK_STREAM, CONSUMER_GROUP, message_id)
+        return
+    async with get_worker_session()() as db:
+        async with db.begin():
+            authority = await lock_job_execution_authority(
+                db,
+                claim.job_id,
+                node_execution_id=claim.node_execution_id,
+            )
+            require_matching_node_execution_claim(authority, claim)
+            await require_worker_registration_lease(db, claim)
+            await redis.xack(TASK_STREAM, CONSUMER_GROUP, message_id)
 
 
 def _parse_preferred_hosts(data: dict) -> list[str]:
@@ -940,7 +1111,13 @@ def _parse_preferred_hosts(data: dict) -> list[str]:
     return [str(item).strip() for item in parsed if str(item).strip()]
 
 
-async def _maybe_defer_for_affinity(r: aioredis.Redis, msg_id: str, data: dict) -> bool:
+async def _maybe_defer_for_affinity(
+    r: aioredis.Redis,
+    msg_id: str,
+    data: dict,
+    *,
+    worker_lease: WorkerLease | None = None,
+) -> bool:
     preferred_hosts = _parse_preferred_hosts(data)
     if not preferred_hosts or WORKER_HOST in preferred_hosts:
         return False
@@ -968,8 +1145,19 @@ async def _maybe_defer_for_affinity(r: aioredis.Redis, msg_id: str, data: dict) 
     bounced["affinity_bounces"] = str(bounces + 1)
     if not bounced.get("affinity_enqueued_at"):
         bounced["affinity_enqueued_at"] = str(now)
-    await r.xadd(TASK_STREAM, bounced)
-    await r.xack(TASK_STREAM, CONSUMER_GROUP, msg_id)
+    if worker_lease is None:
+        await r.xadd(TASK_STREAM, bounced)
+        await r.xack(TASK_STREAM, CONSUMER_GROUP, msg_id)
+    else:
+        async with get_worker_session()() as db:
+            async with db.begin():
+                await require_worker_registration_identity(
+                    db,
+                    worker_lease.registration_id,
+                    worker_lease.lease_epoch,
+                )
+                await r.xadd(TASK_STREAM, bounced)
+                await r.xack(TASK_STREAM, CONSUMER_GROUP, msg_id)
     logger.info(
         "Deferred task %s on host %s for affinity (preferred=%s, age=%ss, bounce=%s)",
         msg_id, WORKER_HOST, preferred_hosts, age_seconds, bounces + 1,
@@ -977,73 +1165,167 @@ async def _maybe_defer_for_affinity(r: aioredis.Redis, msg_id: str, data: dict) 
     return True
 
 
-async def main() -> None:
-    """Main worker loop: consume tasks from Redis Stream."""
+async def _run_until_registration_loss(
+    registration: PythonWorkerRegistration,
+    consumer: Awaitable[None],
+) -> None:
+    consumer_task = asyncio.ensure_future(consumer)
+    loss_task = asyncio.create_task(registration.wait_lost())
     try:
-        enforce_worker_admission_from_env()
-    except WorkerAdmissionError as exc:
-        logger.critical("Worker admission denied: %s", exc)
-        raise SystemExit(2) from exc
+        done, _ = await asyncio.wait(
+            {consumer_task, loss_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if loss_task in done:
+            raise loss_task.result()
+        await consumer_task
+    finally:
+        for task in (consumer_task, loss_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(
+            consumer_task,
+            loss_task,
+            return_exceptions=True,
+        )
 
-    configure_worker_database()
-    r = _redis()
 
-    # Create consumer group
+async def _consume_registered_worker(
+    redis: aioredis.Redis,
+    registration: PythonWorkerRegistration,
+) -> None:
+    global TASK_STREAM, CONSUMER_GROUP, WORKER_HOST, WORKER_ID
+    previous_binding = (
+        TASK_STREAM,
+        CONSUMER_GROUP,
+        WORKER_HOST,
+        WORKER_ID,
+    )
+    TASK_STREAM = registration.redis_stream
+    CONSUMER_GROUP = registration.redis_group
+    WORKER_HOST = registration.worker_host
+    WORKER_ID = registration.redis_consumer_id
+    message_tasks: set[asyncio.Task[None]] = set()
     try:
-        await r.xgroup_create(TASK_STREAM, CONSUMER_GROUP, id="0", mkstream=True)
-    except aioredis.ResponseError as e:
-        if "BUSYGROUP" not in str(e):
-            raise
+        try:
+            await redis.xgroup_create(
+                TASK_STREAM,
+                CONSUMER_GROUP,
+                id="0",
+                mkstream=True,
+            )
+        except aioredis.ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
 
-    concurrency = int(os.environ.get("WORKER_CONCURRENCY", "2"))
-    semaphore = asyncio.Semaphore(concurrency)
+        concurrency = int(os.environ.get("WORKER_CONCURRENCY", "2"))
+        semaphore = asyncio.Semaphore(concurrency)
+        logger.info(
+            "Worker %s started (concurrency=%s)",
+            registration.redis_consumer_id,
+            concurrency,
+        )
+        await _reclaim_pending(
+            redis,
+            worker_lease=registration.lease,
+        )
+        last_reclaim = asyncio.get_event_loop().time()
 
-    logger.info(f"Worker {WORKER_ID} started (concurrency={concurrency})")
-
-    # Initial PEL recovery on startup
-    await _reclaim_pending(r)
-
-    last_reclaim = asyncio.get_event_loop().time()
-
-    try:
         while True:
             try:
-                # Periodic PEL reclaim
                 now = asyncio.get_event_loop().time()
                 if now - last_reclaim > PEL_RECLAIM_INTERVAL:
-                    await _reclaim_pending(r)
+                    await _reclaim_pending(
+                        redis,
+                        worker_lease=registration.lease,
+                    )
                     last_reclaim = now
 
-                messages = await r.xreadgroup(
+                messages = await redis.xreadgroup(
                     CONSUMER_GROUP,
-                    WORKER_ID,
+                    registration.redis_consumer_id,
                     {TASK_STREAM: ">"},
                     count=1,
                     block=5000,
                 )
-
-                if not messages:
-                    continue
-
-                for stream_name, entries in messages:
-                    for msg_id, data in entries:
+                for _stream_name, entries in messages or []:
+                    for message_id, data in entries:
                         await semaphore.acquire()
 
-                        async def _run(mid=msg_id, d=data):
+                        async def run_message(
+                            mid: str = message_id,
+                            payload: dict = data,
+                        ) -> None:
                             try:
-                                await _process_message(r, mid, d)
+                                await _process_message(
+                                    redis,
+                                    mid,
+                                    payload,
+                                    worker_lease=registration.lease,
+                                    lease_refresher=(
+                                        registration.heartbeat_now
+                                    ),
+                                )
                             finally:
                                 semaphore.release()
 
-                        asyncio.create_task(_run())
-
+                        task = asyncio.create_task(run_message())
+                        message_tasks.add(task)
+                        task.add_done_callback(message_tasks.discard)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Worker loop error, reconnecting in 2s")
+                logger.exception(
+                    "Worker loop error, reconnecting in 2s"
+                )
                 await asyncio.sleep(2)
     finally:
-        await r.aclose()
+        for task in message_tasks:
+            task.cancel()
+        if message_tasks:
+            await asyncio.gather(*message_tasks, return_exceptions=True)
+        (
+            TASK_STREAM,
+            CONSUMER_GROUP,
+            WORKER_HOST,
+            WORKER_ID,
+        ) = previous_binding
+
+
+async def main() -> None:
+    """Main worker loop: consume tasks from Redis Stream."""
+    global WORKER_ID
+    env = dict(os.environ)
+    try:
+        enforce_worker_admission_from_env()
+        database_url = load_worker_database_url(env)
+        configure_worker_database(database_url)
+        admission_token = load_worker_admission_token(env)
+        registration = await _start_worker_registration(
+            env,
+            database_url,
+            admission_token,
+        )
+    except (
+        WorkerAdmissionError,
+        WorkerSecretError,
+        WorkerRegistrationError,
+        ValueError,
+    ) as exc:
+        logger.critical("Worker admission denied: %s", exc)
+        raise SystemExit(2) from exc
+
+    try:
+        WORKER_ID = registration.redis_consumer_id
+        r = _redis()
+        await _run_until_registration_loss(
+            registration,
+            _consume_registered_worker(r, registration),
+        )
+    finally:
+        if "r" in locals():
+            await r.aclose()
+        await registration.close()
         if engine_db is not None:
             await engine_db.dispose()
 

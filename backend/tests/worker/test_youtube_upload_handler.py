@@ -76,7 +76,14 @@ class FakeOperationStore:
         finally:
             self.submission_fence_active = False
 
-    async def mark_submitted(self, operation_id: uuid.UUID, manager_task_id: str):
+    async def mark_submitted(
+        self,
+        operation_id: uuid.UUID,
+        manager_task_id: str,
+        *,
+        context=None,
+    ):
+        assert context in self.claim_contexts
         if self.mark_submitted_started is not None:
             self.mark_submitted_started.set()
             assert self.mark_submitted_continue is not None
@@ -86,24 +93,47 @@ class FakeOperationStore:
         self.operation.manager_task_id = manager_task_id
         return self.operation
 
-    async def mark_attempting(self, operation_id: uuid.UUID):
+    async def mark_attempting(self, operation_id: uuid.UUID, *, context=None):
         assert self.submission_fence_active
+        assert context in self.claim_contexts
         self.attempting.append(operation_id)
         self.operation.request_attempted_at = object()
         return self.operation
 
-    async def mark_succeeded(self, operation_id: uuid.UUID, platform_video_id: str, receipt: dict):
+    async def mark_succeeded(
+        self,
+        operation_id: uuid.UUID,
+        platform_video_id: str,
+        receipt: dict,
+        *,
+        context=None,
+    ):
+        assert context in self.claim_contexts
         self.succeeded.append((operation_id, platform_video_id, receipt))
         self.operation.status = "succeeded"
         self.operation.receipt_json = dict(self.durable_receipt)
         return self.operation
 
-    async def mark_failed(self, operation_id: uuid.UUID, error_message: str):
+    async def mark_failed(
+        self,
+        operation_id: uuid.UUID,
+        error_message: str,
+        *,
+        context=None,
+    ):
+        assert context in self.claim_contexts
         self.failed.append((operation_id, error_message))
         self.operation.status = "failed"
         return self.operation
 
-    async def mark_uncertain(self, operation_id: uuid.UUID, error_message: str):
+    async def mark_uncertain(
+        self,
+        operation_id: uuid.UUID,
+        error_message: str,
+        *,
+        context=None,
+    ):
+        assert context in self.claim_contexts
         self.uncertain.append((operation_id, error_message))
         self.operation.status = "uncertain"
         return self.operation
@@ -134,6 +164,8 @@ def upload_config(**overrides) -> dict:
         "_execution_claim": {
             "worker_id": "gpu-worker@150:42",
             "started_at": "2026-07-22T12:00:00+00:00",
+            "worker_registration_id": "00000000-0000-0000-0000-000000000106",
+            "worker_lease_epoch": 7,
         },
     }
     config.update(overrides)
@@ -155,6 +187,10 @@ def auth_payload(*, quota: dict | None = None, authenticated: bool = True) -> di
 
 
 def make_handler(store: FakeOperationStore, client: httpx.AsyncClient, **overrides) -> YouTubeUploadHandler:
+    async def refresh_worker_lease(*, minimum_margin_seconds: float):
+        assert minimum_margin_seconds == 150
+
+    overrides.setdefault("lease_refresher", refresh_worker_lease)
     return YouTubeUploadHandler(
         store,
         client=client,
@@ -162,6 +198,169 @@ def make_handler(store: FakeOperationStore, client: httpx.AsyncClient, **overrid
         poll_interval_seconds=0,
         **overrides,
     )
+
+
+@pytest.mark.asyncio
+async def test_fresh_150_second_lease_is_required_before_submission_fence(
+    media_paths,
+) -> None:
+    store = FakeOperationStore(["submit"])
+    events: list[str] = []
+    original_fence = store.submission_fence
+
+    async def refresh_worker_lease(*, minimum_margin_seconds: float):
+        assert minimum_margin_seconds == 150
+        events.append("refresh")
+
+    @contextlib.asynccontextmanager
+    async def ordered_fence(context):
+        assert events == ["refresh"]
+        events.append("fence")
+        async with original_fence(context):
+            yield
+
+    store.submission_fence = ordered_fence
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "result": {
+                        "video_id": "video-123",
+                        "url": "https://www.youtube.com/watch?v=video-123",
+                    },
+                },
+            )
+        raise AssertionError("unexpected request")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(route)
+    ) as client:
+        await make_handler(
+            store,
+            client,
+            lease_refresher=refresh_worker_lease,
+        ).execute(upload_config(), input_paths, output_path)
+
+    assert events == ["refresh", "fence"]
+
+
+@pytest.mark.asyncio
+async def test_upload_post_and_submitted_transition_use_fixed_time_bounds(
+    monkeypatch,
+    media_paths,
+) -> None:
+    store = FakeOperationStore(["submit"])
+    timeout_values: list[float] = []
+    original_timeout = asyncio.timeout
+
+    def recording_timeout(delay):
+        timeout_values.append(delay)
+        return original_timeout(delay)
+
+    monkeypatch.setattr(youtube_upload_module.asyncio, "timeout", recording_timeout)
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST" and request.url.path == "/api/upload":
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+        return httpx.Response(
+            200,
+            json={
+                "status": "completed",
+                "result": {
+                    "video_id": "video-123",
+                    "url": "https://www.youtube.com/watch?v=video-123",
+                },
+            },
+        )
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(route)
+    ) as client:
+        await make_handler(store, client).execute(
+            upload_config(),
+            input_paths,
+            output_path,
+        )
+
+    assert 120 in timeout_values
+    assert 15 in timeout_values
+
+
+@pytest.mark.asyncio
+async def test_lease_refresh_denial_prevents_preflight_attempt_and_post(
+    media_paths,
+) -> None:
+    store = FakeOperationStore(["submit"])
+    seen: list[httpx.Request] = []
+
+    async def deny_refresh(*, minimum_margin_seconds: float):
+        raise JobExecutionAuthorityBlocked("worker lease margin is insufficient")
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        raise AssertionError("denied lease refresh must prevent manager calls")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(route)
+    ) as client:
+        with pytest.raises(JobExecutionAuthorityBlocked, match="margin"):
+            await make_handler(
+                store,
+                client,
+                lease_refresher=deny_refresh,
+            ).execute(upload_config(), input_paths, output_path)
+
+    assert seen == []
+    assert store.attempting == []
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_after_post_attempt_keeps_durable_uncertainty_fence(
+    media_paths,
+) -> None:
+    store = FakeOperationStore(["submit"])
+
+    async def reject_uncertain(
+        operation_id,
+        error_message,
+        *,
+        context=None,
+    ):
+        raise JobExecutionAuthorityBlocked("worker lease was fenced")
+
+    store.mark_uncertain = reject_uncertain
+
+    def route(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=auth_payload())
+        raise httpx.ReadError("connection outcome is unknown")
+
+    input_paths, output_path = media_paths
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(route)
+    ) as client:
+        with pytest.raises(JobExecutionAuthorityBlocked, match="fenced"):
+            await make_handler(store, client).execute(
+                upload_config(),
+                input_paths,
+                output_path,
+            )
+
+    assert store.attempting == [OPERATION_ID]
+    assert store.operation.request_attempted_at is not None
+    assert not Path(output_path).exists()
 
 
 @pytest.mark.asyncio
@@ -266,10 +465,14 @@ async def test_execution_claim_is_bound_into_upload_operation_context(
     async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
         await make_handler(store, client).execute(
             upload_config(
-                _execution_claim={
-                    "worker_id": "gpu-worker@150:42",
-                    "started_at": "2026-07-22T12:00:00+00:00",
-                }
+                    _execution_claim={
+                        "worker_id": "gpu-worker@150:42",
+                        "started_at": "2026-07-22T12:00:00+00:00",
+                        "worker_registration_id": (
+                            "00000000-0000-0000-0000-000000000106"
+                        ),
+                        "worker_lease_epoch": 7,
+                    }
             ),
             input_paths,
             output_path,
