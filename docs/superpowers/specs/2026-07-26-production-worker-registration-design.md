@@ -234,6 +234,14 @@ both Python and PostgreSQL, and compares it with the supplied fingerprint.
 Database identity deliberately excludes the login principal and credentials,
 so versioned runtime principals do not change the admitted database endpoint.
 
+Endpoint ports and the Redis database index use semantic JSON-number parity,
+not lexical integer spelling. Python and PostgreSQL accept finite JSON numeric
+values only when they are mathematically integral and within the field's
+range, then normalize them to an integer before canonical JSON serialization
+and SHA-256. Thus `1`, `1.0`, and `1e0` have one canonical identity. Booleans,
+non-integral numbers, NaN/infinity mapping values, invalid negatives, and
+out-of-range values are rejected.
+
 The public lease service is PostgreSQL-only by default. A non-PostgreSQL ORM
 path requires an explicit test-only opt-in plus an injected principal resolver;
 it is used for deterministic unit tests and never claims production locking or

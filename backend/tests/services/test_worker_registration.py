@@ -595,7 +595,10 @@ async def test_endpoint_canonicalization_matches_shared_fixture(
     registration_store,
     case: dict[str, object],
 ) -> None:
-    bindings = json.loads(json.dumps(ENDPOINT_BINDINGS))
+    if "bindings_json" in case:
+        bindings = json.loads(case["bindings_json"])
+    else:
+        bindings = json.loads(json.dumps(ENDPOINT_BINDINGS))
     if "bindings" in case:
         bindings = case["bindings"]
     elif "replace" in case:
@@ -635,6 +638,11 @@ async def test_endpoint_canonicalization_matches_shared_fixture(
     if case["accepted"]:
         lease = await registration
         assert lease.lease_epoch == 1
+        for dependency, canonical in case["canonical"].items():
+            assert (
+                hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                == case["sha256"][dependency]
+            )
     else:
         await _assert_error("claim_mismatch", registration)
 

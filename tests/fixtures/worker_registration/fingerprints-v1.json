@@ -105,14 +105,64 @@
       "replace": ["database", "host", "999.20.30.40"]
     },
     {
+      "name": "integral_exponent_database_port",
+      "accepted": true,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":1e0},\"redis\":{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}",
+      "canonical": {
+        "database": "{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":1}",
+        "redis": "{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"}",
+        "storage": "{\"backend\":\"not_applicable\"}"
+      },
+      "sha256": {
+        "database": "7680c413f5406ccdb79df159a005073d29e67489c1395a23df388b9a47e16baa",
+        "redis": "ae93742ccecb53789e86a2b730a465024e63b390f9227fb998072fba1f3acec8",
+        "storage": "3eb7b57334f3074c4d4b4602bb9133ddbcac4a70072c8fe5a5f7e7287f74047b"
+      }
+    },
+    {
+      "name": "integral_exponent_redis_port",
+      "accepted": true,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432},\"redis\":{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":1e3,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}",
+      "canonical": {
+        "database": "{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432}",
+        "redis": "{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":1000,\"scheme\":\"redis\"}",
+        "storage": "{\"backend\":\"not_applicable\"}"
+      },
+      "sha256": {
+        "database": "213594f6755c82f6a465356940d7f88a44dd61576c257a8f1cc97fec5868056a",
+        "redis": "b721fb677fa3d1c2b08698eb7614e08fab68328bf5857cc52f52ca0cd755e8bd",
+        "storage": "3eb7b57334f3074c4d4b4602bb9133ddbcac4a70072c8fe5a5f7e7287f74047b"
+      }
+    },
+    {
       "name": "boolean_port",
       "accepted": false,
       "replace": ["database", "port", true]
     },
     {
-      "name": "float_port",
+      "name": "integral_decimal_port",
+      "accepted": true,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432.0},\"redis\":{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}",
+      "canonical": {
+        "database": "{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432}",
+        "redis": "{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"}",
+        "storage": "{\"backend\":\"not_applicable\"}"
+      },
+      "sha256": {
+        "database": "213594f6755c82f6a465356940d7f88a44dd61576c257a8f1cc97fec5868056a",
+        "redis": "ae93742ccecb53789e86a2b730a465024e63b390f9227fb998072fba1f3acec8",
+        "storage": "3eb7b57334f3074c4d4b4602bb9133ddbcac4a70072c8fe5a5f7e7287f74047b"
+      }
+    },
+    {
+      "name": "nonintegral_decimal_port",
       "accepted": false,
-      "replace": ["database", "port", 5432.0]
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432.5},\"redis\":{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}"
+    },
+    {
+      "name": "nonintegral_exponent_port",
+      "accepted": false,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":1e-1},\"redis\":{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}"
     },
     {
       "name": "port_zero",
@@ -130,9 +180,34 @@
       "replace": ["redis", "database", false]
     },
     {
-      "name": "float_redis_database",
-      "accepted": false,
-      "replace": ["redis", "database", 3.0]
+      "name": "integral_exponent_zero_redis_database",
+      "accepted": true,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432},\"redis\":{\"database\":0e4,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}",
+      "canonical": {
+        "database": "{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432}",
+        "redis": "{\"database\":0,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"}",
+        "storage": "{\"backend\":\"not_applicable\"}"
+      },
+      "sha256": {
+        "database": "213594f6755c82f6a465356940d7f88a44dd61576c257a8f1cc97fec5868056a",
+        "redis": "acad51ef1739c3fc6d0370de053252687c9a4e06de45cd24cca62c455777a1ad",
+        "storage": "3eb7b57334f3074c4d4b4602bb9133ddbcac4a70072c8fe5a5f7e7287f74047b"
+      }
+    },
+    {
+      "name": "integral_decimal_redis_database",
+      "accepted": true,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432},\"redis\":{\"database\":3.0,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}",
+      "canonical": {
+        "database": "{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432}",
+        "redis": "{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"}",
+        "storage": "{\"backend\":\"not_applicable\"}"
+      },
+      "sha256": {
+        "database": "213594f6755c82f6a465356940d7f88a44dd61576c257a8f1cc97fec5868056a",
+        "redis": "ae93742ccecb53789e86a2b730a465024e63b390f9227fb998072fba1f3acec8",
+        "storage": "3eb7b57334f3074c4d4b4602bb9133ddbcac4a70072c8fe5a5f7e7287f74047b"
+      }
     },
     {
       "name": "negative_redis_database",
@@ -143,6 +218,18 @@
       "name": "redis_database_too_large",
       "accepted": false,
       "replace": ["redis", "database", 2147483648]
+    },
+    {
+      "name": "nan_port",
+      "accepted": false,
+      "invalid_json": true,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":NaN},\"redis\":{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}"
+    },
+    {
+      "name": "infinity_redis_database",
+      "accepted": false,
+      "invalid_json": true,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432},\"redis\":{\"database\":Infinity,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}"
     },
     {
       "name": "dependency_name_space",

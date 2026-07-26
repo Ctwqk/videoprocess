@@ -66,14 +66,17 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _endpoint_validation_bindings(case: dict[str, object]) -> dict[str, object]:
+def _endpoint_validation_payload(case: dict[str, object]) -> str:
+    if "bindings_json" in case:
+        return case["bindings_json"]
     if "bindings" in case:
-        return case["bindings"]
-    bindings = json.loads(json.dumps(ENDPOINT_BINDINGS))
-    operation = case.get("replace") or case.get("extra")
-    dependency, field_name, value = operation
-    bindings[dependency][field_name] = value
-    return bindings
+        bindings = case["bindings"]
+    else:
+        bindings = json.loads(json.dumps(ENDPOINT_BINDINGS))
+        operation = case.get("replace") or case.get("extra")
+        dependency, field_name, value = operation
+        bindings[dependency][field_name] = value
+    return json.dumps(bindings)
 
 
 def test_worker_registration_migration_emits_complete_additive_schema_and_functions() -> None:
@@ -375,24 +378,31 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             )
             assert not any(row["public_execute"] for row in functions)
             for case in ENDPOINT_VALIDATION_CASES:
-                bindings = _endpoint_validation_bindings(case)
+                bindings_json = _endpoint_validation_payload(case)
                 if case["accepted"]:
                     fingerprints = await connection.fetchrow(
                         """
                         SELECT *
                         FROM public.vp_worker_endpoint_fingerprints($1::jsonb)
                         """,
-                        json.dumps(bindings),
+                        bindings_json,
                     )
                     assert {
                         name: fingerprints[f"{name}_fingerprint"]
                         for name in ("database", "redis", "storage")
                     } == case["sha256"]
                 else:
-                    with pytest.raises(
-                        asyncpg.RaiseError,
-                        match="claim_mismatch",
-                    ):
+                    error_type = (
+                        asyncpg.InvalidTextRepresentationError
+                        if case.get("invalid_json")
+                        else asyncpg.RaiseError
+                    )
+                    error_match = (
+                        "invalid input syntax for type json"
+                        if case.get("invalid_json")
+                        else "claim_mismatch"
+                    )
+                    with pytest.raises(error_type, match=error_match):
                         await connection.fetchrow(
                             """
                             SELECT *
@@ -400,7 +410,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                                 $1::jsonb
                             )
                             """,
-                            json.dumps(bindings),
+                            bindings_json,
                         )
             function_signatures = (
                 "vp_worker_register(text,bigint,text,text,uuid,integer,text,"

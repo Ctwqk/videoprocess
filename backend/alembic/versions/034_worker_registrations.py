@@ -520,8 +520,13 @@ BEGIN
        OR v_database_host = 'localhost'
        OR v_database_host ~ '^127\.'
        OR v_database_host = '0.0.0.0'
-       OR v_database_binding ->> 'port'
-          !~ '^(0|[1-9][0-9]*)$'
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+    IF (v_database_binding ->> 'port')::numeric
+           IS DISTINCT FROM pg_catalog.trunc(
+               (v_database_binding ->> 'port')::numeric
+           )
        OR (v_database_binding ->> 'port')::numeric
           NOT BETWEEN 1 AND 65535
     THEN
@@ -556,8 +561,17 @@ BEGIN
        OR v_redis_host = 'localhost'
        OR v_redis_host ~ '^127\.'
        OR v_redis_host = '0.0.0.0'
-       OR v_redis_binding ->> 'port' !~ '^(0|[1-9][0-9]*)$'
-       OR v_redis_binding ->> 'database' !~ '^(0|[1-9][0-9]*)$'
+    THEN
+        RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
+    END IF;
+    IF (v_redis_binding ->> 'port')::numeric
+           IS DISTINCT FROM pg_catalog.trunc(
+               (v_redis_binding ->> 'port')::numeric
+           )
+       OR (v_redis_binding ->> 'database')::numeric
+           IS DISTINCT FROM pg_catalog.trunc(
+               (v_redis_binding ->> 'database')::numeric
+           )
        OR (v_redis_binding ->> 'port')::numeric
           NOT BETWEEN 1 AND 65535
        OR (v_redis_binding ->> 'database')::numeric
@@ -595,14 +609,23 @@ BEGIN
        AND v_storage_host <> 'localhost'
        AND v_storage_host !~ '^127\.'
        AND v_storage_host <> '0.0.0.0'
-       AND v_storage_binding ->> 'port' ~ '^(0|[1-9][0-9]*)$'
-       AND (v_storage_binding ->> 'port')::numeric BETWEEN 1 AND 65535
     THEN
+        IF (v_storage_binding ->> 'port')::numeric
+               IS DISTINCT FROM pg_catalog.trunc(
+                   (v_storage_binding ->> 'port')::numeric
+               )
+           OR (v_storage_binding ->> 'port')::numeric
+              NOT BETWEEN 1 AND 65535
+        THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'claim_mismatch',
+                ERRCODE = 'P0001';
+        END IF;
         v_storage_canonical := pg_catalog.format(
             '{"backend":"minio","bucket":%s,"host":%s,"port":%s}',
             pg_catalog.to_jsonb(v_storage_binding ->> 'bucket')::text,
             pg_catalog.to_jsonb(v_storage_host)::text,
-            ((v_storage_binding ->> 'port')::bigint)::text
+            ((v_storage_binding ->> 'port')::numeric::bigint)::text
         );
     ELSE
         RAISE EXCEPTION USING MESSAGE = 'claim_mismatch', ERRCODE = 'P0001';
@@ -612,13 +635,13 @@ BEGIN
         '{"database":%s,"driver":"postgresql","host":%s,"port":%s}',
         pg_catalog.to_jsonb(v_database_binding ->> 'database')::text,
         pg_catalog.to_jsonb(v_database_host)::text,
-        ((v_database_binding ->> 'port')::bigint)::text
+        ((v_database_binding ->> 'port')::numeric::bigint)::text
     );
     v_redis_canonical := pg_catalog.format(
         '{"database":%s,"host":%s,"port":%s,"scheme":%s}',
-        ((v_redis_binding ->> 'database')::bigint)::text,
+        ((v_redis_binding ->> 'database')::numeric::bigint)::text,
         pg_catalog.to_jsonb(v_redis_host)::text,
-        ((v_redis_binding ->> 'port')::bigint)::text,
+        ((v_redis_binding ->> 'port')::numeric::bigint)::text,
         pg_catalog.to_jsonb(v_redis_binding ->> 'scheme')::text
     );
     RETURN QUERY SELECT

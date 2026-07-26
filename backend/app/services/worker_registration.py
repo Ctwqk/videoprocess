@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import secrets
 import uuid
@@ -868,12 +869,11 @@ def _validated_redis_binding(value: object) -> dict[str, object]:
         value,
         {"database", "host", "port", "scheme"},
     )
-    database = binding["database"]
-    if (
-        type(database) is not int
-        or not 0 <= database <= 2147483647
-    ):
-        raise WorkerRegistrationError("claim_mismatch")
+    database = _integral_json_number(
+        binding["database"],
+        minimum=0,
+        maximum=2147483647,
+    )
     scheme = binding["scheme"]
     if scheme not in {"redis", "rediss"}:
         raise WorkerRegistrationError("claim_mismatch")
@@ -938,9 +938,24 @@ def _dependency_host(value: object) -> str:
 
 
 def _dependency_port(value: object) -> int:
-    if type(value) is not int or not 1 <= value <= 65535:
+    return _integral_json_number(value, minimum=1, maximum=65535)
+
+
+def _integral_json_number(
+    value: object,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if type(value) is int:
+        normalized = value
+    elif type(value) is float and math.isfinite(value) and value.is_integer():
+        normalized = int(value)
+    else:
         raise WorkerRegistrationError("claim_mismatch")
-    return value
+    if not minimum <= normalized <= maximum:
+        raise WorkerRegistrationError("claim_mismatch")
+    return normalized
 
 
 def _database_identity(env: Mapping[str, str]) -> dict[str, object]:
