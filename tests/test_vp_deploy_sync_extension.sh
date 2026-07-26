@@ -180,7 +180,10 @@ WORKER_READINESS_CONTAINER_MODE=normal
 FAIL_WORKER_READINESS_SERVICE=
 WORKER_READINESS_EXEC_MODE=normal
 WORKER_READINESS_FAIL_SERVICE=
+FAIL_WORKER_READINESS_COUNT=false
+FAIL_WORKER_READINESS_SLEEP=false
 WORKER_READINESS_FAILURE_USED="$TEST_ROOT/worker-readiness-failure-used"
+WORKER_READINESS_CONTAINER_CALLS="$TEST_ROOT/worker-readiness-container-calls"
 GPU_READINESS_CONTAINER_ID=1111111111111111111111111111111111111111111111111111111111111111
 VISION_READINESS_CONTAINER_ID=2222222222222222222222222222222222222222222222222222222222222222
 PUBLISHER_READINESS_CONTAINER_ID=3333333333333333333333333333333333333333333333333333333333333333
@@ -215,6 +218,19 @@ rm() {
     return 1
   fi
   command rm "$@"
+}
+
+sleep() {
+  printf 'sleep|%s\n' "$*" >>"$CALLS"
+  [[ "$FAIL_WORKER_READINESS_SLEEP" != "true" ]]
+}
+
+awk() {
+  if [[ "$FAIL_WORKER_READINESS_COUNT" == "true" \
+    && "${1:-}" == 'NF { count++ } END { print count+0 }' ]]; then
+    return 1
+  fi
+  command awk "$@"
 }
 
 build_image_on_host() {
@@ -376,6 +392,23 @@ docker() {
       duplicate)
         printf '%s\n%s\n' "$readiness_container_id" "${readiness_container_id}duplicate"
         ;;
+      transition)
+        local readiness_container_call=0
+        if [[ -f "$WORKER_READINESS_CONTAINER_CALLS" ]]; then
+          readiness_container_call="$(<"$WORKER_READINESS_CONTAINER_CALLS")"
+        fi
+        readiness_container_call=$((readiness_container_call + 1))
+        printf '%s\n' "$readiness_container_call" >"$WORKER_READINESS_CONTAINER_CALLS"
+        if [[ "$readiness_container_call" -lt 3 ]]; then
+          printf '%s\n%s\n' "$readiness_container_id" "${readiness_container_id}duplicate"
+        else
+          printf '%s\n' "$readiness_container_id"
+        fi
+        ;;
+      error)
+        printf 'daemon=tcp://test-secret container=%s\n' "$readiness_container_id" >&2
+        return 1
+        ;;
       *)
         return 1
         ;;
@@ -396,7 +429,10 @@ docker() {
       : >"$WORKER_READINESS_FAILURE_USED"
       return 1
     fi
-    [[ "$readiness_service" != "$FAIL_WORKER_READINESS_SERVICE" ]]
+    if [[ "$readiness_service" == "$FAIL_WORKER_READINESS_SERVICE" ]]; then
+      printf 'No such container: %s test-secret\n' "${2:-}" >&2
+      return 1
+    fi
     return
   fi
   if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
@@ -960,6 +996,33 @@ for worker_service in \
     "$worker_service" ccttww-lap 'Shutdown 2 seconds ago'
 done
 
+: >"$CALLS"
+rm -f "$WORKER_READINESS_CONTAINER_CALLS"
+WORKER_READINESS_CONTAINER_MODE=transition
+if ! vp_require_managed_worker_storage_ready "$VP_PUBLISHER_SERVICE" false; then
+  echo 'FAIL: publisher readiness did not wait for the local task set to converge' >&2
+  exit 1
+fi
+if [[ "$(grep -Fc "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PUBLISHER_SERVICE" "$CALLS")" -ne 3 \
+  || "$(grep -Fc 'sleep|1' "$CALLS")" -ne 2 \
+  || "$(grep -Fc "$publisher_readiness_probe" "$CALLS")" -ne 1 ]]; then
+  echo 'FAIL: publisher readiness convergence did not poll twice before one probe execution' >&2
+  exit 1
+fi
+third_publisher_container_line="$(
+  grep -nF "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PUBLISHER_SERVICE" "$CALLS" \
+    | sed -n '3p' \
+    | cut -d: -f1
+)"
+publisher_exec_line="$(grep -nF "$publisher_readiness_probe" "$CALLS" | cut -d: -f1)"
+if [[ -z "$third_publisher_container_line" \
+  || -z "$publisher_exec_line" \
+  || "$third_publisher_container_line" -ge "$publisher_exec_line" ]]; then
+  echo 'FAIL: publisher readiness probe ran before the local task set converged' >&2
+  exit 1
+fi
+WORKER_READINESS_CONTAINER_MODE=normal
+
 assert_readiness_failure_calls_are_safe() {
   local readiness_calls
   readiness_calls="$(grep -E '^(docker\|(container ls|exec)|log\|managed worker storage readiness)' "$CALLS" || true)"
@@ -969,6 +1032,98 @@ assert_readiness_failure_calls_are_safe() {
     exit 1
   fi
 }
+
+assert_persistent_readiness_container_set_rejected() {
+  local mode="$1"
+  : >"$CALLS"
+  WORKER_READINESS_CONTAINER_MODE="$mode"
+  if vp_require_managed_worker_storage_ready "$VP_PUBLISHER_SERVICE" false \
+    2>"$TEST_ROOT/readiness-${mode}.err"; then
+    echo "FAIL: persistent $mode readiness container set unexpectedly succeeded" >&2
+    exit 1
+  fi
+  if [[ "$(grep -Fc "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PUBLISHER_SERVICE" "$CALLS")" -ne 10 \
+    || "$(grep -Fc 'sleep|1' "$CALLS")" -ne 9 \
+    || "$(grep -Fc 'docker|exec|' "$CALLS")" -ne 0 ]]; then
+    echo "FAIL: persistent $mode readiness container set did not stop at the bounded limit" >&2
+    exit 1
+  fi
+}
+
+assert_persistent_readiness_container_set_rejected missing
+assert_persistent_readiness_container_set_rejected duplicate
+
+: >"$CALLS"
+WORKER_READINESS_CONTAINER_MODE=error
+if vp_require_managed_worker_storage_ready "$VP_PUBLISHER_SERVICE" false \
+  2>"$TEST_ROOT/readiness-list-error.err"; then
+  echo 'FAIL: readiness container discovery error unexpectedly succeeded' >&2
+  exit 1
+fi
+if [[ "$(grep -Fc "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PUBLISHER_SERVICE" "$CALLS")" -ne 1 \
+  || "$(grep -Fc 'sleep|' "$CALLS")" -ne 0 \
+  || "$(grep -Fc 'docker|exec|' "$CALLS")" -ne 0 \
+  || ! "$(cat "$TEST_ROOT/readiness-list-error.err")" =~ ^managed\ worker\ container\ discovery\ failed:\ $VP_PUBLISHER_SERVICE$ ]]; then
+  echo 'FAIL: readiness container discovery error did not fail immediately with a service-only message' >&2
+  exit 1
+fi
+if grep -Eq 'test-secret|111111|222222|333333|tcp://' "$TEST_ROOT/readiness-list-error.err"; then
+  echo 'FAIL: readiness container discovery error exposed sensitive Docker output' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+WORKER_READINESS_CONTAINER_MODE=normal
+FAIL_WORKER_READINESS_COUNT=true
+if vp_require_managed_worker_storage_ready "$VP_PUBLISHER_SERVICE" false \
+  2>"$TEST_ROOT/readiness-count-error.err"; then
+  echo 'FAIL: readiness container count error unexpectedly succeeded' >&2
+  exit 1
+fi
+FAIL_WORKER_READINESS_COUNT=false
+if [[ "$(grep -Fc "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PUBLISHER_SERVICE" "$CALLS")" -ne 1 \
+  || "$(grep -Fc 'sleep|' "$CALLS")" -ne 0 \
+  || "$(grep -Fc 'docker|exec|' "$CALLS")" -ne 0 ]]; then
+  echo 'FAIL: readiness container count error did not fail immediately' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+WORKER_READINESS_CONTAINER_MODE=missing
+FAIL_WORKER_READINESS_SLEEP=true
+if vp_require_managed_worker_storage_ready "$VP_PUBLISHER_SERVICE" false \
+  2>"$TEST_ROOT/readiness-sleep-error.err"; then
+  echo 'FAIL: readiness convergence sleep error unexpectedly succeeded' >&2
+  exit 1
+fi
+FAIL_WORKER_READINESS_SLEEP=false
+if [[ "$(grep -Fc "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PUBLISHER_SERVICE" "$CALLS")" -ne 1 \
+  || "$(grep -Fc 'sleep|1' "$CALLS")" -ne 1 \
+  || "$(grep -Fc 'docker|exec|' "$CALLS")" -ne 0 ]]; then
+  echo 'FAIL: readiness convergence sleep error did not fail immediately' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+WORKER_READINESS_CONTAINER_MODE=normal
+FAIL_WORKER_READINESS_SERVICE="$VP_PUBLISHER_SERVICE"
+if vp_require_managed_worker_storage_ready "$VP_PUBLISHER_SERVICE" false \
+  2>"$TEST_ROOT/readiness-exec-error.err"; then
+  echo 'FAIL: readiness execution error unexpectedly succeeded' >&2
+  exit 1
+fi
+FAIL_WORKER_READINESS_SERVICE=
+if [[ "$(grep -Fc "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PUBLISHER_SERVICE" "$CALLS")" -ne 1 \
+  || "$(grep -Fc 'sleep|' "$CALLS")" -ne 0 \
+  || "$(grep -Fc "$publisher_readiness_probe" "$CALLS")" -ne 1 \
+  || ! "$(cat "$TEST_ROOT/readiness-exec-error.err")" =~ ^managed\ worker\ storage\ readiness\ failed:\ $VP_PUBLISHER_SERVICE$ ]]; then
+  echo 'FAIL: readiness execution error did not fail once with a service-only message' >&2
+  exit 1
+fi
+if grep -Eq 'test-secret|111111|222222|333333|No such container' "$TEST_ROOT/readiness-exec-error.err"; then
+  echo 'FAIL: readiness execution error exposed sensitive Docker output' >&2
+  exit 1
+fi
 
 assert_deploy_rejected_by_readiness() {
   local name="$1"

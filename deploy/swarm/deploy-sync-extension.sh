@@ -218,13 +218,37 @@ vp_require_managed_worker_storage_ready() {
   local service="$1"
   local require_artifact_api="${2:-false}"
   local containers
-  containers="$(
-    docker container ls \
-      --filter "label=com.docker.swarm.service.name=$service" \
-      --filter status=running \
-      --format '{{.ID}}'
-  )" || return 1
-  if [[ "$(printf '%s\n' "$containers" | awk 'NF { count++ } END { print count+0 }')" -ne 1 ]]; then
+  local container_count=0
+  local attempt
+  for ((attempt = 1; attempt <= 10; attempt++)); do
+    if ! containers="$(
+      docker container ls \
+        --filter "label=com.docker.swarm.service.name=$service" \
+        --filter status=running \
+        --format '{{.ID}}' \
+        2>/dev/null
+    )"; then
+      echo "managed worker container discovery failed: $service" >&2
+      return 1
+    fi
+    if ! container_count="$(
+      printf '%s\n' "$containers" \
+        | awk 'NF { count++ } END { print count+0 }' 2>/dev/null
+    )"; then
+      echo "managed worker container count failed: $service" >&2
+      return 1
+    fi
+    if [[ "$container_count" -eq 1 ]]; then
+      break
+    fi
+    if [[ "$attempt" -lt 10 ]]; then
+      if ! sleep 1; then
+        echo "managed worker readiness wait failed: $service" >&2
+        return 1
+      fi
+    fi
+  done
+  if [[ "$container_count" -ne 1 ]]; then
     echo "managed worker storage readiness requires exactly one local running task: $service" >&2
     return 1
   fi
@@ -235,7 +259,7 @@ vp_require_managed_worker_storage_ready() {
     echo "invalid managed worker artifact API readiness mode" >&2
     return 1
   fi
-  if ! docker exec "$containers" "${args[@]}" >/dev/null; then
+  if ! docker exec "$containers" "${args[@]}" >/dev/null 2>&1; then
     echo "managed worker storage readiness failed: $service" >&2
     return 1
   fi
