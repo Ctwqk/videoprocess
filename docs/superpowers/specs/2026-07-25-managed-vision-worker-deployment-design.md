@@ -61,7 +61,10 @@ work before this production migration is applied. Once the managed service has
 converged and the legacy container is absent, later push-driven updates skip
 the migration-only gate so normal automatic deployment remains available while
 the schedule is open. Deployment does not replay or acknowledge unverifiable
-legacy events.
+legacy events. A separate operator maintenance path may ACK an exact legacy
+event set only after durable payload-hash archival and locked terminal-state
+verification, as specified by
+`2026-07-25-legacy-worker-event-resolution-design.md`.
 
 ## Rollback
 
