@@ -47,6 +47,10 @@ def _redis() -> aioredis.Redis:
 async def _reclaim_pending(r: aioredis.Redis) -> None:
     """Reclaim stale pending events from any consumer in the group."""
     try:
+        await _registered_event_receipts.reconcile_cancelled_dispatches(r)
+    except Exception:
+        logger.exception("Cancelled worker task reconciliation failed")
+    try:
         await _registered_event_receipts.reconcile_pending_dispatches(r)
     except Exception:
         logger.exception("Worker task dispatch reconciliation failed")

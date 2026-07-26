@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import CheckConstraint, UniqueConstraint
+from sqlalchemy import CheckConstraint, Index, UniqueConstraint
 
 from app.models.registered_worker_event_receipt import (
     RegisteredWorkerEventDelivery,
@@ -141,7 +141,12 @@ def test_worker_task_dispatch_schema_covers_initial_and_receipt_tasks() -> None:
         "payload_sha256",
         "payload_json",
         "delivery_state",
+        "delivery_attempted_at",
+        "delivery_error",
         "redis_message_id",
+        "resolution_state",
+        "acknowledged_at",
+        "cancelled_at",
         "created_at",
         "delivered_at",
     } <= set(table.columns.keys())
@@ -153,3 +158,30 @@ def test_worker_task_dispatch_schema_covers_initial_and_receipt_tasks() -> None:
     }
     assert ("dispatch_key",) in unique_columns
     assert ("origin_receipt_id", "node_execution_id") in unique_columns
+    unresolved_initial_indexes = [
+        index
+        for index in table.indexes
+        if isinstance(index, Index)
+        and index.name == "uq_worker_task_dispatch_unresolved_initial_node"
+    ]
+    assert len(unresolved_initial_indexes) == 1
+    assert unresolved_initial_indexes[0].unique is True
+    assert (
+        "origin_receipt_id IS NULL"
+        in str(
+            unresolved_initial_indexes[0].dialect_options["postgresql"][
+                "where"
+            ]
+        )
+    )
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert "('pending', 'attempting', 'delivered', 'uncertain', 'cancelled')" in (
+        checks["ck_worker_task_dispatch_state"]
+    )
+    assert "('unresolved', 'cancel_authorized', 'acknowledged', 'cancelled')" in (
+        checks["ck_worker_task_dispatch_resolution_state"]
+    )

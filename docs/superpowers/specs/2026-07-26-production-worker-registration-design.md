@@ -237,14 +237,23 @@ authority transaction. Downstream and retry dispatches follow the same rule.
 Redis delivery is post-commit and idempotent: a Lua `GET`/`XADD`/`SET` marker
 binds the dispatch key to one Redis message ID, and an independent database
 poller retries pending dispatches even if the originating event is trimmed.
-Markers use a renewable 30-day TTL and expire after the database row is
-durably `delivered`.
+Delivery has a durable `pending -> attempting -> delivered|uncertain` state
+machine. The marker has no TTL while the database can be pending or uncertain.
+If an attempting row has no marker, reconciliation moves it to `uncertain`,
+performs zero `XADD`, and requires explicit operator repair. A janitor may
+remove a marker only after database proof that the exact dispatch is delivered
+and resolved. Redis must use `noeviction`, durable persistence, and readiness
+checks before registered traffic is admitted.
 
-On claim, the worker calls `public.vp_attest_worker_task_delivery` while its
-worker-principal live lease and node authority transaction are held. The
-immutable attestation binds dispatch key, canonical task payload hash,
-stream/group/message, job/node, registration/epoch/worker/start, and source
-task ACK state. The worker role has no direct attestation DML.
+On claim, the worker calls `public.vp_claim_worker_node`. Under the live
+worker-principal shared lease fence it atomically changes the exact queued node
+to running and inserts the immutable delivery attestation for the exact
+orchestrator-created delivered dispatch. The attestation binds dispatch key,
+canonical task payload hash, stream/group/message, job/node,
+registration/epoch/worker/start, and source task ACK state. The worker role has
+no direct node or attestation DML. The older attestation function remains
+PUBLIC-revoked for compatibility and is not part of the production worker-role
+allowlist.
 
 The independent orchestrator principal calls
 `public.vp_observe_worker_task_delivery`, not
@@ -270,11 +279,24 @@ database poller can replay an exact authorized XACK after worker failure.
 
 Job deletion uses
 `public.vp_resolve_worker_event_authority_for_job_deletion`. It requires every
-dispatch delivered, every attestation acknowledged, every existing receipt
-applied and event-acknowledged, and every event delivery acknowledged. It does
-not require one receipt per attestation, so a safely ACKed cancelled task with
-no completion/failure event can be cleaned up. Receipt and attestation foreign
-keys are restrictive; the cleanup function deletes authority rows explicitly.
+dispatch to be either exact-acknowledged or undelivered-cancelled, every
+attestation acknowledged, every existing receipt applied and
+event-acknowledged, and every event delivery acknowledged. Cancellation uses
+control-plane exact functions: an undelivered dispatch becomes cancelled
+without `XADD`; a delivered task is durably authorized, exact-XACKed, and then
+acknowledged. This includes cancellation before worker claim and the
+Redis-success/database-failure replay window. It does not require one receipt
+per attestation, so a safely ACKed cancelled task with no completion/failure
+event can be cleaned up. Cleanup and event acceptance both lock job/node first,
+then affected registrations in sorted order, then attestation/receipt/delivery
+identities. Receipt and attestation foreign keys are restrictive; the cleanup
+function deletes authority rows explicitly.
+
+A registered worker that is not the preferred affinity host does not bounce,
+ACK, or mint a replacement task. It leaves the exact proven delivery pending
+for preferred-consumer reclaim; after the existing affinity age threshold, a
+consumer may process that same message. Legacy unregistered affinity behavior
+is unchanged.
 
 ## Dependency Fingerprints
 
@@ -336,6 +358,16 @@ pending and cannot finalize a result.
 Historical node rows remain nullable and are not backfilled with invented
 registrations.
 
+Remote artifact saves use finite MinIO connect/read/operation deadlines and
+finite retries. Registered workers upload only to claim-unique staging keys,
+hold the shared lease transaction across save and pointer insert, and recheck
+the database-clock lease after save. Cancellation shields and joins only
+within the proven operation bound; a late SDK thread can write only a staging
+object that the janitor may remove, never an authoritative final key. The
+orchestrator-owned `IntermediateArtifactCache` handles deterministic
+zero-input `url_download` reuse across jobs; the handler performs no separate
+remote cache lookup or write.
+
 ### Python workers
 
 Worker identity becomes process-unique rather than PID-only. Startup order is:
@@ -350,6 +382,13 @@ Worker identity becomes process-unique rather than PID-only. Startup order is:
 The heartbeat cancellation signal controls the consume loop and all spawned
 message tasks. The YouTube submission fence and every durable completion path
 also require the exact registration epoch.
+
+API startup recovery uses database time and the reviewed
+`public.vp_recover_registered_worker_node` function. A live registered claim is
+left untouched regardless of its wall-clock execution age. An expired or
+revoked claim with an unresolved dispatch is held without reset or competing
+dispatch. Only a resolved claim can be cleared and recovered once. A partial
+unique index permits at most one unresolved initial dispatch per node.
 
 ### Go ffmpeg worker
 
@@ -382,12 +421,17 @@ A stable `NOLOGIN` worker runtime role owns this explicit privilege allowlist:
   `youtube_upload_operations`;
 - `INSERT` on `artifacts`, `runtime_schedules`, and
   `youtube_upload_operations`;
-- `UPDATE` on `node_executions` and `youtube_upload_operations`;
 - `EXECUTE` only on `vp_worker_register`, `vp_worker_heartbeat`,
   `vp_worker_release`, `vp_require_worker_lease`,
-  `vp_require_worker_lease_margin`, `vp_attest_worker_task_delivery`,
+  `vp_require_worker_lease_margin`, `vp_claim_worker_node`,
   `vp_authorize_worker_task_ack`, `vp_require_worker_task_ack_receipt`, and
   `vp_acknowledge_worker_task_delivery`.
+
+It receives no direct `UPDATE` on `node_executions`. YouTube operation
+claim/reserve and each legal state transition use reviewed exact
+worker-principal functions with row identity, node claim, registration epoch,
+legal transition, and database-clock checks; the role receives no broad
+`UPDATE youtube_upload_operations` bypass.
 
 It receives no `DELETE`, `TRUNCATE`, DDL, sequence, `alembic_version`, grant-
 table, or registration-table privilege. Each service generation receives a
@@ -396,8 +440,15 @@ never owns application objects, has no privileged role membership, and has no
 direct grant/registration table reads or writes. Deployment does not use blanket
 table grants or default privileges.
 
-A separate stable `NOLOGIN` orchestrator-control role executes only
-`vp_observe_worker_lease`, `vp_observe_worker_task_delivery`, and
+A separate stable `NOLOGIN` orchestrator-control role executes only the
+reviewed observer, receipt/task-ACK, cancelled-dispatch, registered-node
+recovery, and cleanup functions, including
+`vp_observe_worker_lease`, `vp_observe_worker_task_delivery`,
+`vp_acknowledge_proven_worker_task_dispatch`,
+`vp_authorize_cancelled_worker_task_ack`,
+`vp_require_cancelled_worker_task_ack`,
+`vp_acknowledge_cancelled_worker_task`,
+`vp_recover_registered_worker_node`, and
 `vp_resolve_worker_event_authority_for_job_deletion`. It has exact
 `SELECT`/`INSERT` and monotonic state-column `UPDATE` privileges on
 `worker_task_dispatches`, `worker_task_delivery_attestations`,
@@ -465,10 +516,14 @@ consumer observations to registrations. Task 4 gives each worker only its
 granted task stream/group commands and gives the orchestrator-control Redis
 principal the event-group commands plus `EVAL`, `GET`, `SET`, and `XADD` for
 `vp:worker-task-dispatch:*` markers and admitted task streams. Lua execution is
-restricted to the reviewed idempotent dispatch script. Marker TTL is renewed
-while delivery reconciliation is pending and is 30 days after the last
-attempt; the durable `delivered` row prevents redispatch after expiry. No broad
-key pattern or unrestricted scripting grant is permitted.
+restricted to the reviewed idempotent dispatch script. Dispatch markers do not
+expire while a row is pending, attempting, or uncertain. Redis runs with
+`noeviction`, persistence, restart-readiness validation, and alerts for
+attempting/uncertain rows. An explicit janitor may delete only a marker whose
+exact database dispatch is delivered and resolved. A missing marker after an
+attempt causes a database hold and zero `XADD`; it never silently creates a
+replacement message. No broad key pattern or unrestricted scripting grant is
+permitted.
 
 ## Unknown Consumer Guard
 

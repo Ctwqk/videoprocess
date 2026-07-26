@@ -1,16 +1,12 @@
 import asyncio
-import hashlib
 import logging
-import os
 import re
-import shutil
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
 from app.config import settings
-from app.storage.manager import get_storage
 from worker.handlers.base import BaseHandler, CancelledError
 
 logger = logging.getLogger(__name__)
@@ -24,17 +20,6 @@ class UrlDownloadHandler(BaseHandler):
 
         normalized_url = self._normalize_url(url)
         fmt = node_config.get("format", "best")
-        cache_path = self._cache_storage_path(normalized_url, fmt, output_path)
-        if await self._restore_from_cache(cache_path, output_path):
-            logger.info("URL download cache hit for %s (%s)", normalized_url, fmt)
-            return {
-                "_storage_path": cache_path,
-                "_skip_upload": True,
-                "cache_hit": True,
-                "source_url": normalized_url,
-            }
-
-        logger.info("URL download cache miss for %s (%s)", normalized_url, fmt)
 
         platform = self._detect_platform(normalized_url)
         if platform in {"xiaohongshu", "bilibili", "x"}:
@@ -42,18 +27,7 @@ class UrlDownloadHandler(BaseHandler):
         else:
             await self._download_via_ytdlp(normalized_url, fmt, output_path)
 
-        if settings.storage_backend != "local":
-            return {
-                "_skip_upload": False,
-                "cache_hit": False,
-                "source_url": normalized_url,
-            }
-
-        await self._save_to_cache(cache_path, output_path)
         return {
-            "_storage_path": cache_path,
-            "_skip_upload": True,
-            "cache_hit": False,
             "source_url": normalized_url,
         }
 
@@ -168,12 +142,6 @@ class UrlDownloadHandler(BaseHandler):
         return settings.platform_browser_manager_url.rstrip("/")
 
     @staticmethod
-    def _cache_storage_path(url: str, fmt: str, output_path: str) -> str:
-        cache_key = hashlib.sha256(f"{url}\n{fmt}".encode("utf-8")).hexdigest()
-        suffix = Path(output_path).suffix or ".mp4"
-        return f"download-cache/{cache_key}{suffix}"
-
-    @staticmethod
     def _normalize_url(url: str) -> str:
         parsed = urlparse(url.strip())
         host = parsed.netloc.lower()
@@ -209,29 +177,6 @@ class UrlDownloadHandler(BaseHandler):
             query=normalized_query,
         )
         return urlunparse(cleaned)
-
-    async def _restore_from_cache(self, cache_path: str, output_path: str) -> bool:
-        storage = get_storage(settings.storage_backend)
-        if not await storage.exists(cache_path):
-            return False
-
-        local_cached_path = storage.get_local_path(cache_path)
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        if local_cached_path and os.path.exists(local_cached_path):
-            shutil.copy2(local_cached_path, output_path)
-            return True
-
-        content = await storage.read(cache_path)
-        with open(output_path, "wb") as f:
-            f.write(content)
-        return True
-
-    async def _save_to_cache(self, cache_path: str, output_path: str) -> None:
-        storage = get_storage(settings.storage_backend)
-        if await storage.exists(cache_path):
-            return
-        with open(output_path, "rb") as f:
-            await storage.save(cache_path, f)
 
     @staticmethod
     def _detect_platform(url: str) -> str | None:

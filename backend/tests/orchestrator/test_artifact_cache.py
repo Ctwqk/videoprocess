@@ -70,6 +70,55 @@ def test_cache_eligibility_uses_allowlist_inputs_and_disable_flag():
     assert service.is_cache_eligible("youtube_upload", {}, ["input"]) is False
     assert service.is_cache_eligible("trim", {"disable_cache": True}, ["input"]) is False
     assert service.is_cache_eligible("trim", {"duration": 5}, []) is False
+    assert service.is_cache_eligible(
+        "url_download",
+        {"url": "https://example.test/video", "format": "best"},
+        [],
+    ) is True
+    assert service.is_cache_eligible(
+        "url_download",
+        {
+            "url": "https://example.test/video",
+            "format": "best",
+            "disable_cache": True,
+        },
+        [],
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_url_download_cache_reuses_zero_input_artifact_across_jobs(
+    cache_db_session,
+) -> None:
+    service = IntermediateArtifactCacheService()
+    output_artifact = artifact(storage_path="artifacts/job-1/download.mp4")
+    cache_db_session.add(output_artifact)
+    await cache_db_session.commit()
+    config = {
+        "url": "https://example.test/video?b=2&a=1",
+        "format": "1080p",
+    }
+
+    await service.store(
+        cache_db_session,
+        node_type="url_download",
+        node_config=config,
+        input_artifacts={},
+        output_artifact=output_artifact,
+        node_id="download-1",
+        job_id=uuid.uuid4(),
+    )
+    await cache_db_session.commit()
+
+    hit = await service.lookup(
+        cache_db_session,
+        node_type="url_download",
+        node_config=config,
+        input_artifacts={},
+    )
+
+    assert hit is not None
+    assert hit.output_artifact_id == output_artifact.id
 
 
 @pytest.mark.asyncio

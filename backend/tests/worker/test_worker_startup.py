@@ -162,7 +162,7 @@ async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> N
         dispatch_key=dispatch_key,
     )
     attestation_id = uuid.uuid4()
-    attested: list[object] = []
+    claims: list[dict[str, object]] = []
 
     class Transaction:
         async def __aenter__(self):
@@ -194,34 +194,38 @@ async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> N
             schedule=SimpleNamespace(state="OPEN", guarded_job_id=job_id),
         )
 
-    async def require_lease(_db, claim):
-        assert claim.worker_registration_id == registration_id
-        assert claim.worker_lease_epoch == 12
+    claimed_at = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 
-    async def attest(_db, claim, **facts):
-        assert node.status == worker_main.NodeStatus.RUNNING
-        assert node.worker_registration_id == registration_id
+    async def claim_registered(_db, **facts):
+        assert node.status == worker_main.NodeStatus.QUEUED
+        assert node.worker_registration_id is None
         assert facts == {
+            "job_id": job_id,
+            "node_execution_id": node_execution_id,
+            "registration_id": registration_id,
+            "lease_epoch": 12,
+            "worker_id": lease.redis_consumer_id,
             "redis_stream": delivery.redis_stream,
             "consumer_group": delivery.consumer_group,
             "message_id": delivery.message_id,
             "payload_sha256": payload_sha256,
             "dispatch_key": dispatch_key,
         }
-        attested.append(claim)
-        return attestation_id
+        claims.append(facts)
+        return worker_main.NodeExecutionClaim(
+            job_id=job_id,
+            node_execution_id=node_execution_id,
+            worker_id=lease.redis_consumer_id,
+            started_at=claimed_at,
+            worker_registration_id=registration_id,
+            worker_lease_epoch=12,
+        ), attestation_id
 
     monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
     monkeypatch.setattr(
         worker_main,
-        "require_worker_registration_lease",
-        require_lease,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        worker_main,
-        "attest_worker_task_delivery",
-        attest,
+        "claim_registered_worker_node",
+        claim_registered,
         raising=False,
     )
 
@@ -237,11 +241,14 @@ async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> N
         worker_main._current_task_delivery.reset(delivery_token)
 
     assert claim is not None
+    assert claim.started_at == claimed_at
     assert claim.worker_registration_id == registration_id
     assert claim.worker_lease_epoch == 12
-    assert node.worker_registration_id == registration_id
-    assert node.worker_lease_epoch == 12
-    assert attested == [claim]
+    assert node.status == worker_main.NodeStatus.QUEUED
+    assert node.worker_registration_id is None
+    assert node.worker_lease_epoch is None
+    assert claims
+    assert delivery.attestation_id == attestation_id
 
 
 @pytest.mark.asyncio
@@ -760,74 +767,83 @@ async def test_registration_loss_cancels_consumer_and_propagates_stable_error() 
 
 
 @pytest.mark.asyncio
-async def test_affinity_bounce_xadd_and_xack_share_registration_fence(
+async def test_registered_affinity_defer_leaves_exact_delivery_pending(
     monkeypatch,
 ) -> None:
     claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
     lease = worker_lease_for(claim)
-    transaction_active = False
-    lease_checked = False
     redis_calls: list[str] = []
-
-    class Transaction:
-        async def __aenter__(self):
-            nonlocal transaction_active
-            transaction_active = True
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            nonlocal transaction_active
-            transaction_active = False
-            return False
-
-    class Session:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return False
-
-        def begin(self):
-            return Transaction()
 
     class Redis:
         async def xadd(self, stream, payload):
-            assert transaction_active and lease_checked
             redis_calls.append("xadd")
 
         async def xack(self, stream, group, message_id):
-            assert transaction_active and lease_checked
             redis_calls.append("xack")
 
-    async def require_identity(_db, registration_id, lease_epoch):
-        nonlocal lease_checked
-        assert transaction_active
-        assert registration_id == lease.registration_id
-        assert lease_epoch == lease.lease_epoch
-        lease_checked = True
-
-    monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
-    monkeypatch.setattr(
-        worker_main,
-        "require_worker_registration_identity",
-        require_identity,
-        raising=False,
-    )
     monkeypatch.setattr(worker_main, "WORKER_HOST", "127")
-
+    now = int(worker_main.time.time())
+    payload = {
+        "job_id": str(claim.job_id),
+        "node_execution_id": str(claim.node_execution_id),
+        "dispatch_key": str(uuid.uuid4()),
+        "preferred_hosts": json.dumps(["150"]),
+        "affinity_enqueued_at": str(now),
+        "affinity_bounces": "0",
+    }
+    original = dict(payload)
     deferred = await worker_main._maybe_defer_for_affinity(
         Redis(),
         "1-0",
-        {
-            "preferred_hosts": json.dumps(["150"]),
-            "affinity_enqueued_at": str(int(worker_main.time.time())),
-            "affinity_bounces": "0",
-        },
+        payload,
         worker_lease=lease,
     )
 
     assert deferred is True
-    assert redis_calls == ["xadd", "xack"]
+    assert redis_calls == []
+    assert payload == original
+    assert worker_main._canonical_task_payload_sha256(payload) == (
+        worker_main._canonical_task_payload_sha256(original)
+    )
+
+    monkeypatch.setattr(
+        worker_main.time,
+        "time",
+        lambda: now + worker_main.AFFINITY_WAIT_SECONDS,
+    )
+    assert await worker_main._maybe_defer_for_affinity(
+        Redis(),
+        "1-0",
+        payload,
+        worker_lease=lease,
+    ) is False
+    assert redis_calls == []
+
+
+@pytest.mark.asyncio
+async def test_registered_dispatch_is_validated_before_affinity(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "127")
+
+    with pytest.raises(
+        worker_main.JobExecutionAuthorityBlocked,
+        match="dispatch key is invalid",
+    ):
+        await worker_main._process_message(
+            object(),
+            "1-0",
+            {
+                "job_id": str(claim.job_id),
+                "node_execution_id": str(claim.node_execution_id),
+                "dispatch_key": "not-a-uuid",
+                "preferred_hosts": json.dumps(["150"]),
+                "affinity_enqueued_at": str(int(worker_main.time.time())),
+            },
+            worker_lease=lease,
+        )
 
 
 @pytest.mark.asyncio
@@ -1926,7 +1942,7 @@ async def test_lease_expiry_after_remote_save_cleans_generation_output(
     )
 
     expected_storage_path = (
-        f"artifacts/{job_id}/{Path(output_paths[0]).name}"
+        f"staging/artifacts/{job_id}/{Path(output_paths[0]).name}"
     )
     assert saved == [(expected_storage_path, b"generation output")]
     assert deleted == [expected_storage_path]

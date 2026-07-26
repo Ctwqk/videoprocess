@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import main
-from app.models.job import JobStatus
+from app.models.job import JobStatus, NodeStatus
 from app.services.schedule_service import VideoScheduleState
 
 
@@ -34,6 +34,113 @@ def _job(*, status=JobStatus.PENDING, started_at=None, node_statuses=()):
         started_at=started_at,
         node_executions=[SimpleNamespace(status=node_status) for node_status in node_statuses],
     )
+
+
+def _registered_stale_job() -> tuple[SimpleNamespace, SimpleNamespace]:
+    registration_id = uuid.uuid4()
+    node = SimpleNamespace(
+        id=uuid.uuid4(),
+        node_id="vision-1",
+        status=NodeStatus.RUNNING,
+        worker_id="vision-worker@127:1",
+        worker_registration_id=registration_id,
+        worker_lease_epoch=11,
+        queued_at=None,
+        started_at=datetime(2026, 7, 26, tzinfo=timezone.utc),
+        completed_at=None,
+        progress=25,
+        error_message=None,
+        input_artifact_ids=[uuid.uuid4()],
+    )
+    job = SimpleNamespace(
+        id=uuid.uuid4(),
+        status=JobStatus.RUNNING,
+        started_at=node.started_at,
+        submitted_at=node.started_at,
+        completed_at=None,
+        error_message=None,
+        node_executions=[node],
+    )
+    return job, node
+
+
+@pytest.mark.asyncio
+async def test_registered_startup_recovery_keeps_live_old_claim(
+    monkeypatch,
+) -> None:
+    job, node = _registered_stale_job()
+    original = dict(vars(node))
+
+    async def recover(_db, job_id, node_execution_id):
+        assert job_id == job.id
+        assert node_execution_id == node.id
+        return "live"
+
+    monkeypatch.setattr(
+        main,
+        "recover_registered_worker_node",
+        recover,
+        raising=False,
+    )
+
+    assert await main._prepare_job_for_recovery(object(), job) is False
+    assert vars(node) == original
+    assert job.status == JobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_registered_startup_recovery_holds_expired_unresolved_claim(
+    monkeypatch,
+) -> None:
+    job, node = _registered_stale_job()
+    original = dict(vars(node))
+
+    async def recover(_db, job_id, node_execution_id):
+        return "held_unresolved"
+
+    monkeypatch.setattr(
+        main,
+        "recover_registered_worker_node",
+        recover,
+        raising=False,
+    )
+
+    assert await main._prepare_job_for_recovery(object(), job) is False
+    assert vars(node) == original
+    assert job.status == JobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_registered_startup_recovery_resets_resolved_expired_once(
+    monkeypatch,
+) -> None:
+    job, node = _registered_stale_job()
+    calls = 0
+
+    async def recover(_db, job_id, node_execution_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            node.status = NodeStatus.PENDING
+            node.worker_id = None
+            node.worker_registration_id = None
+            node.worker_lease_epoch = None
+            node.started_at = None
+            node.progress = 0
+            return "recovered"
+        return "not_registered"
+
+    monkeypatch.setattr(
+        main,
+        "recover_registered_worker_node",
+        recover,
+        raising=False,
+    )
+
+    assert await main._prepare_job_for_recovery(object(), job) is True
+    assert node.status == NodeStatus.PENDING
+    assert node.worker_registration_id is None
+    assert job.status == JobStatus.PENDING
 
 
 @pytest.mark.asyncio

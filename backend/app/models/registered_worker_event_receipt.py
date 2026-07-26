@@ -9,10 +9,12 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     String,
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -400,8 +402,29 @@ class WorkerTaskDispatch(UUIDPrimaryKeyMixin, Base):
         nullable=False,
         default="pending",
     )
+    delivery_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    delivery_error: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
     redis_message_id: Mapped[str | None] = mapped_column(
         String(64),
+        nullable=True,
+    )
+    resolution_state: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+        default="unresolved",
+    )
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -435,16 +458,53 @@ class WorkerTaskDispatch(UUIDPrimaryKeyMixin, Base):
             name="ck_worker_task_dispatch_sha256",
         ),
         CheckConstraint(
-            "delivery_state IN ('pending', 'delivered')",
+            "delivery_state IN "
+            "('pending', 'attempting', 'delivered', 'uncertain', 'cancelled')",
             name="ck_worker_task_dispatch_state",
         ),
         CheckConstraint(
             "((delivery_state = 'pending' "
+            "AND delivery_attempted_at IS NULL "
+            "AND redis_message_id IS NULL AND delivered_at IS NULL) "
+            "OR (delivery_state IN ('attempting', 'uncertain') "
+            "AND delivery_attempted_at IS NOT NULL "
             "AND redis_message_id IS NULL AND delivered_at IS NULL) "
             "OR (delivery_state = 'delivered' "
+            "AND delivery_attempted_at IS NOT NULL "
             "AND redis_message_id IS NOT NULL "
-            "AND delivered_at IS NOT NULL))",
+            "AND delivered_at IS NOT NULL) "
+            "OR (delivery_state = 'cancelled' "
+            "AND redis_message_id IS NULL AND delivered_at IS NULL))",
             name="ck_worker_task_dispatch_delivery",
+        ),
+        CheckConstraint(
+            "resolution_state IN "
+            "('unresolved', 'cancel_authorized', 'acknowledged', 'cancelled')",
+            name="ck_worker_task_dispatch_resolution_state",
+        ),
+        CheckConstraint(
+            "((resolution_state IN ('unresolved', 'cancel_authorized') "
+            "AND acknowledged_at IS NULL AND cancelled_at IS NULL) "
+            "OR (resolution_state = 'acknowledged' "
+            "AND acknowledged_at IS NOT NULL AND cancelled_at IS NULL) "
+            "OR (resolution_state = 'cancelled' "
+            "AND acknowledged_at IS NULL AND cancelled_at IS NOT NULL))",
+            name="ck_worker_task_dispatch_resolution_time",
+        ),
+        Index(
+            "uq_worker_task_dispatch_unresolved_initial_node",
+            "node_execution_id",
+            unique=True,
+            postgresql_where=text(
+                "origin_receipt_id IS NULL "
+                "AND resolution_state IN "
+                "('unresolved', 'cancel_authorized')"
+            ),
+            sqlite_where=text(
+                "origin_receipt_id IS NULL "
+                "AND resolution_state IN "
+                "('unresolved', 'cancel_authorized')"
+            ),
         ),
     )
 

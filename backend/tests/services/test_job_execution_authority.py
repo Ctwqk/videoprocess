@@ -11,6 +11,7 @@ from app.services.job_execution_authority import (
     NodeExecutionClaim,
     acknowledge_worker_task_delivery,
     authorize_worker_task_ack,
+    claim_registered_worker_node,
     observe_worker_registration_lease,
     require_matching_node_execution_claim,
     require_worker_registration_lease,
@@ -41,6 +42,53 @@ def _authority(claim: NodeExecutionClaim):
             worker_lease_epoch=claim.worker_lease_epoch,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_registered_claim_uses_schema_qualified_atomic_function() -> None:
+    claim = _claim()
+    dispatch_key = uuid.uuid4()
+    attestation_id = uuid.uuid4()
+    calls: list[tuple[str, dict]] = []
+
+    class Result:
+        def one_or_none(self):
+            return (claim.started_at, attestation_id)
+
+    class Bind:
+        class Dialect:
+            name = "postgresql"
+
+        dialect = Dialect()
+
+    class Session:
+        def get_bind(self):
+            return Bind()
+
+        async def execute(self, statement, parameters):
+            calls.append((str(statement), dict(parameters)))
+            return Result()
+
+    actual_claim, actual_attestation_id = await claim_registered_worker_node(
+        Session(),
+        job_id=claim.job_id,
+        node_execution_id=claim.node_execution_id,
+        registration_id=claim.worker_registration_id,
+        lease_epoch=claim.worker_lease_epoch,
+        worker_id=claim.worker_id,
+        redis_stream="vp:tasks:vision",
+        consumer_group="vision-workers",
+        message_id="1-0",
+        payload_sha256="a" * 64,
+        dispatch_key=dispatch_key,
+    )
+
+    assert actual_claim == claim
+    assert actual_attestation_id == attestation_id
+    assert len(calls) == 1
+    statement, parameters = calls[0]
+    assert "public.vp_claim_worker_node" in statement
+    assert parameters["dispatch_key"] == dispatch_key
 
 
 def test_matching_node_claim_requires_registration_id_and_epoch() -> None:

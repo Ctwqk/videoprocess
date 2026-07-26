@@ -5,13 +5,13 @@ import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models.job import JobStatus, NodeStatus
+from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.registered_worker_event_receipt import (
     RegisteredWorkerEventDelivery,
     RegisteredWorkerEventReceipt,
@@ -30,14 +30,13 @@ from app.services.job_execution_authority import (
 _IDEMPOTENT_XADD_SCRIPT = """
 local existing = redis.call('GET', KEYS[2])
 if existing then
-    redis.call('SET', KEYS[2], existing, 'EX', ARGV[1])
     return existing
 end
-local message_id = redis.call('XADD', KEYS[1], '*', unpack(ARGV, 2))
-redis.call('SET', KEYS[2], message_id, 'EX', ARGV[1])
+local message_id = redis.call('XADD', KEYS[1], '*', unpack(ARGV, 1))
+redis.call('SET', KEYS[2], message_id)
 return message_id
 """
-_DISPATCH_MARKER_TTL_SECONDS = 30 * 24 * 60 * 60
+_DISPATCH_ATTEMPT_RECOVERY_SECONDS = 60
 
 
 class RegisteredWorkerEventError(RuntimeError):
@@ -247,6 +246,23 @@ async def stage_worker_task_dispatch(
             "worker task dispatch Redis identity is invalid"
         )
     dispatch_key = uuid.uuid4()
+    if origin_receipt_id is None:
+        existing_initial = (
+            await db.execute(
+                select(WorkerTaskDispatch.id).where(
+                    WorkerTaskDispatch.node_execution_id
+                    == node_execution_id,
+                    WorkerTaskDispatch.origin_receipt_id.is_(None),
+                    WorkerTaskDispatch.resolution_state.in_(
+                        ("unresolved", "cancel_authorized")
+                    ),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_initial is not None:
+            raise RegisteredWorkerEventError(
+                "node already has an unresolved initial dispatch"
+            )
     dispatched_payload = {
         **dict(payload),
         "dispatch_key": str(dispatch_key),
@@ -284,10 +300,23 @@ class RegisteredWorkerEventReceiptService:
                 event,
             )
         ),
+        dispatch_attempt_recovery_seconds: int = (
+            _DISPATCH_ATTEMPT_RECOVERY_SECONDS
+        ),
     ) -> None:
+        if (
+            type(dispatch_attempt_recovery_seconds) is not int
+            or dispatch_attempt_recovery_seconds < 0
+        ):
+            raise ValueError(
+                "dispatch attempt recovery seconds must be non-negative"
+            )
         self._session_factory = session_factory
         self._authority_locker = authority_locker
         self._delivery_observer = delivery_observer
+        self._dispatch_attempt_recovery_seconds = (
+            dispatch_attempt_recovery_seconds
+        )
 
     async def accept_and_apply(
         self,
@@ -299,6 +328,32 @@ class RegisteredWorkerEventReceiptService:
     ) -> uuid.UUID | None:
         async with self._session_factory() as db:
             async with db.begin():
+                authority = await self._authority_locker(
+                    db,
+                    event.job_id,
+                    node_execution_id=event.node_execution_id,
+                    lock_all_nodes=True,
+                )
+                registration_id = event.claim.worker_registration_id
+                if not isinstance(registration_id, uuid.UUID):
+                    raise RegisteredWorkerEventError(
+                        "registered event worker registration is invalid"
+                    )
+                await self._lock_registration_fence(
+                    db,
+                    registration_id,
+                )
+                attestation = await self._locked_task_attestation(db, event)
+                observed_attestation_id: uuid.UUID | None = None
+                if attestation is None:
+                    observed_attestation_id = await self._delivery_observer(
+                        db,
+                        event,
+                    )
+                    attestation_id = observed_attestation_id
+                else:
+                    attestation_id = attestation.id
+                await self._lock_attestation_identity(db, attestation_id)
                 await self._lock_event_identity(db, event)
                 existing_delivery = await self._locked_event_delivery(
                     db,
@@ -326,17 +381,6 @@ class RegisteredWorkerEventReceiptService:
                         )
                     return delivery_receipt.id
 
-                attestation = await self._locked_task_attestation(db, event)
-                observed_attestation_id: uuid.UUID | None = None
-                if attestation is None:
-                    observed_attestation_id = await self._delivery_observer(
-                        db,
-                        event,
-                    )
-                    attestation_id = observed_attestation_id
-                else:
-                    attestation_id = attestation.id
-                await self._lock_attestation_identity(db, attestation_id)
                 if attestation is not None:
                     mismatch_reason = self._attestation_mismatch_reason(
                         attestation,
@@ -399,12 +443,6 @@ class RegisteredWorkerEventReceiptService:
                     raise RegisteredWorkerEventError(
                         "registered event task delivery attestation mismatch"
                     )
-                authority = await self._authority_locker(
-                    db,
-                    event.job_id,
-                    node_execution_id=event.node_execution_id,
-                    lock_all_nodes=True,
-                )
                 require_active_execution_authority(
                     authority,
                     job_statuses={JobStatus.RUNNING},
@@ -612,8 +650,12 @@ class RegisteredWorkerEventReceiptService:
                     attestation.message_id,
                 )
                 self._require_xack_result(result, label="worker task")
-                attestation.ack_state = "acknowledged"
-                attestation.acknowledged_at = datetime.now(timezone.utc)
+                acknowledged_at = datetime.now(timezone.utc)
+                await self._mark_proven_task_acknowledged(
+                    db,
+                    attestation,
+                    acknowledged_at,
+                )
                 await db.flush()
 
     async def _acknowledge_delivery_id(
@@ -712,14 +754,21 @@ class RegisteredWorkerEventReceiptService:
             )
 
         acknowledged_at = datetime.now(timezone.utc)
+        task_acknowledged_at = attestation.acknowledged_at
         if receipt is not None and attestation.ack_state != "acknowledged":
-            attestation.ack_state = "acknowledged"
-            attestation.acknowledged_at = acknowledged_at
+            task_acknowledged_at = await (
+                RegisteredWorkerEventReceiptService
+                ._mark_proven_task_acknowledged(
+                    db,
+                    attestation,
+                    acknowledged_at,
+                )
+            )
         if receipt is not None:
             receipt.source_task_ack_state = "acknowledged"
             receipt.source_task_acknowledged_at = (
-                attestation.acknowledged_at
-                if attestation.acknowledged_at is not None
+                task_acknowledged_at
+                if task_acknowledged_at is not None
                 else acknowledged_at
             )
         if delivery.ack_state != "acknowledged":
@@ -737,6 +786,63 @@ class RegisteredWorkerEventReceiptService:
         await db.flush()
 
     @staticmethod
+    async def _mark_proven_task_acknowledged(
+        db: AsyncSession,
+        attestation: WorkerTaskDeliveryAttestation,
+        acknowledged_at: datetime,
+    ) -> datetime:
+        if db.get_bind().dialect.name == "postgresql":
+            result = await db.execute(
+                text(
+                    "SELECT public."
+                    "vp_acknowledge_proven_worker_task_dispatch("
+                    ":attestation_id)"
+                ),
+                {"attestation_id": attestation.id},
+            )
+            persisted_at = result.scalar_one()
+            if not isinstance(persisted_at, datetime):
+                raise RegisteredWorkerEventError(
+                    "worker task acknowledgement timestamp is invalid"
+                )
+            return persisted_at
+        attestation.ack_state = "acknowledged"
+        attestation.acknowledged_at = acknowledged_at
+        dispatch = (
+            await db.execute(
+                select(WorkerTaskDispatch)
+                .where(
+                    WorkerTaskDispatch.dispatch_key
+                    == attestation.dispatch_key,
+                    WorkerTaskDispatch.redis_stream
+                    == attestation.redis_stream,
+                    WorkerTaskDispatch.consumer_group
+                    == attestation.consumer_group,
+                    WorkerTaskDispatch.redis_message_id
+                    == attestation.message_id,
+                    WorkerTaskDispatch.payload_sha256
+                    == attestation.payload_sha256,
+                    WorkerTaskDispatch.job_id == attestation.job_id,
+                    WorkerTaskDispatch.node_execution_id
+                    == attestation.node_execution_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if dispatch is None or dispatch.delivery_state != "delivered":
+            raise RegisteredWorkerEventError(
+                "worker task dispatch acknowledgement identity mismatch"
+            )
+        if dispatch.resolution_state == "cancelled":
+            raise RegisteredWorkerEventError(
+                "cancelled-undelivered dispatch cannot be acknowledged"
+            )
+        if dispatch.resolution_state != "acknowledged":
+            dispatch.resolution_state = "acknowledged"
+            dispatch.acknowledged_at = acknowledged_at
+        return acknowledged_at
+
+    @staticmethod
     def _require_xack_result(result: object, *, label: str) -> None:
         if type(result) is not int or result not in {0, 1}:
             raise RegisteredWorkerEventError(
@@ -752,28 +858,15 @@ class RegisteredWorkerEventReceiptService:
     ) -> None:
         if type(limit) is not int or limit <= 0:
             raise ValueError("limit must be positive")
-        async with self._session_factory() as db:
-            statement = (
-                select(WorkerTaskDispatch)
-                .where(WorkerTaskDispatch.delivery_state == "pending")
-                .order_by(WorkerTaskDispatch.created_at)
-                .limit(limit)
-            )
-            if receipt_id is not None:
-                receipt = await db.get(
-                    RegisteredWorkerEventReceipt,
-                    receipt_id,
-                )
-                if receipt is None or receipt.application_state != "applied":
-                    raise RegisteredWorkerEventError(
-                        "dispatch has no applied event receipt"
-                    )
-                statement = statement.where(
-                    WorkerTaskDispatch.origin_receipt_id == receipt_id
-                )
-            dispatches = list(
-                (await db.execute(statement)).scalars()
-            )
+        await self._recover_stale_dispatch_attempts(
+            redis,
+            receipt_id=receipt_id,
+            limit=limit,
+        )
+        dispatches = await self._begin_dispatch_attempts(
+            receipt_id=receipt_id,
+            limit=limit,
+        )
 
         for dispatch in dispatches:
             payload = self._validated_dispatch_payload(dispatch)
@@ -786,7 +879,6 @@ class RegisteredWorkerEventReceiptService:
                 2,
                 dispatch.redis_stream,
                 marker,
-                _DISPATCH_MARKER_TTL_SECONDS,
                 *fields,
             )
             if isinstance(message_id, bytes):
@@ -800,6 +892,90 @@ class RegisteredWorkerEventReceiptService:
                 message_id.strip(),
             )
 
+    async def _begin_dispatch_attempts(
+        self,
+        *,
+        receipt_id: uuid.UUID | None,
+        limit: int,
+    ) -> list[WorkerTaskDispatch]:
+        async with self._session_factory() as db:
+            async with db.begin():
+                if receipt_id is not None:
+                    receipt = await db.get(
+                        RegisteredWorkerEventReceipt,
+                        receipt_id,
+                    )
+                    if (
+                        receipt is None
+                        or receipt.application_state != "applied"
+                    ):
+                        raise RegisteredWorkerEventError(
+                            "dispatch has no applied event receipt"
+                        )
+                statement = (
+                    select(WorkerTaskDispatch)
+                    .where(WorkerTaskDispatch.delivery_state == "pending")
+                    .order_by(WorkerTaskDispatch.created_at)
+                    .limit(limit)
+                    .with_for_update(skip_locked=True)
+                )
+                if receipt_id is not None:
+                    statement = statement.where(
+                        WorkerTaskDispatch.origin_receipt_id == receipt_id
+                    )
+                dispatches = list(
+                    (await db.execute(statement)).scalars()
+                )
+                attempted_at = datetime.now(timezone.utc)
+                for dispatch in dispatches:
+                    dispatch.delivery_state = "attempting"
+                    dispatch.delivery_attempted_at = attempted_at
+                    dispatch.delivery_error = None
+                await db.flush()
+                return dispatches
+
+    async def _recover_stale_dispatch_attempts(
+        self,
+        redis: Any,
+        *,
+        receipt_id: uuid.UUID | None,
+        limit: int,
+    ) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=self._dispatch_attempt_recovery_seconds
+        )
+        async with self._session_factory() as db:
+            statement = (
+                select(WorkerTaskDispatch)
+                .where(
+                    WorkerTaskDispatch.delivery_state == "attempting",
+                    WorkerTaskDispatch.delivery_attempted_at <= cutoff,
+                )
+                .order_by(WorkerTaskDispatch.delivery_attempted_at)
+                .limit(limit)
+            )
+            if receipt_id is not None:
+                statement = statement.where(
+                    WorkerTaskDispatch.origin_receipt_id == receipt_id
+                )
+            attempts = list((await db.execute(statement)).scalars())
+
+        for dispatch in attempts:
+            marker = f"vp:worker-task-dispatch:{dispatch.dispatch_key}"
+            message_id = await redis.get(marker)
+            if isinstance(message_id, bytes):
+                message_id = message_id.decode()
+            if isinstance(message_id, str) and message_id.strip():
+                await self._mark_dispatch_delivered(
+                    dispatch.id,
+                    message_id.strip(),
+                )
+                continue
+            await self._mark_dispatch_uncertain(
+                dispatch.id,
+                "dispatch_marker_missing_after_attempt",
+            )
+
     async def reconcile_pending_dispatches(
         self,
         redis: Any,
@@ -807,6 +983,284 @@ class RegisteredWorkerEventReceiptService:
         limit: int = 100,
     ) -> None:
         await self.deliver_pending_dispatches(redis, limit=limit)
+
+    async def reconcile_cancelled_dispatches(
+        self,
+        redis: Any,
+        *,
+        limit: int = 100,
+    ) -> None:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be positive")
+        await self._recover_stale_dispatch_attempts(
+            redis,
+            receipt_id=None,
+            limit=limit,
+        )
+        await self._cancel_pending_dispatches(limit=limit)
+        dispatch_ids = await self._authorize_cancelled_dispatches(
+            limit=limit,
+        )
+        for dispatch_id in dispatch_ids:
+            await self._acknowledge_cancelled_dispatch(redis, dispatch_id)
+
+    async def _cancel_pending_dispatches(self, *, limit: int) -> None:
+        async with self._session_factory() as db:
+            async with db.begin():
+                is_postgresql = (
+                    db.get_bind().dialect.name == "postgresql"
+                )
+                statement = (
+                    select(WorkerTaskDispatch)
+                    .join(
+                        Job,
+                        Job.id == WorkerTaskDispatch.job_id,
+                    )
+                    .join(
+                        NodeExecution,
+                        NodeExecution.id
+                        == WorkerTaskDispatch.node_execution_id,
+                    )
+                    .where(
+                        WorkerTaskDispatch.delivery_state == "pending",
+                        WorkerTaskDispatch.resolution_state
+                        == "unresolved",
+                        Job.status == JobStatus.CANCELLED,
+                        NodeExecution.status == NodeStatus.CANCELLED,
+                    )
+                    .order_by(WorkerTaskDispatch.created_at)
+                    .limit(limit)
+                )
+                if not is_postgresql:
+                    statement = statement.with_for_update(
+                        skip_locked=True
+                    )
+                dispatches = list(
+                    (await db.execute(statement)).scalars()
+                )
+                if is_postgresql:
+                    for dispatch in dispatches:
+                        await db.execute(
+                            text(
+                                "SELECT public."
+                                "vp_authorize_cancelled_worker_task_ack("
+                                ":dispatch_id)"
+                            ),
+                            {"dispatch_id": dispatch.id},
+                        )
+                    return
+                cancelled_at = datetime.now(timezone.utc)
+                for dispatch in dispatches:
+                    dispatch.delivery_state = "cancelled"
+                    dispatch.resolution_state = "cancelled"
+                    dispatch.cancelled_at = cancelled_at
+                await db.flush()
+
+    async def _authorize_cancelled_dispatches(
+        self,
+        *,
+        limit: int,
+    ) -> list[uuid.UUID]:
+        async with self._session_factory() as db:
+            async with db.begin():
+                is_postgresql = (
+                    db.get_bind().dialect.name == "postgresql"
+                )
+                statement = (
+                    select(WorkerTaskDispatch)
+                    .join(
+                        Job,
+                        Job.id == WorkerTaskDispatch.job_id,
+                    )
+                    .join(
+                        NodeExecution,
+                        NodeExecution.id
+                        == WorkerTaskDispatch.node_execution_id,
+                    )
+                    .where(
+                        WorkerTaskDispatch.delivery_state == "delivered",
+                        WorkerTaskDispatch.resolution_state.in_(
+                            ("unresolved", "cancel_authorized")
+                        ),
+                        Job.status == JobStatus.CANCELLED,
+                        NodeExecution.status == NodeStatus.CANCELLED,
+                    )
+                    .order_by(WorkerTaskDispatch.created_at)
+                    .limit(limit)
+                )
+                if not is_postgresql:
+                    statement = statement.with_for_update(
+                        skip_locked=True
+                    )
+                dispatches = list(
+                    (await db.execute(statement)).scalars()
+                )
+                if is_postgresql:
+                    authorized_ids: list[uuid.UUID] = []
+                    for dispatch in dispatches:
+                        state = (
+                            await db.execute(
+                                text(
+                                    "SELECT public."
+                                    "vp_authorize_cancelled_worker_task_ack("
+                                    ":dispatch_id)"
+                                ),
+                                {"dispatch_id": dispatch.id},
+                            )
+                        ).scalar_one()
+                        if state == "cancel_authorized":
+                            authorized_ids.append(dispatch.id)
+                    return authorized_ids
+                for dispatch in dispatches:
+                    if dispatch.resolution_state == "unresolved":
+                        dispatch.resolution_state = "cancel_authorized"
+                await db.flush()
+                return [dispatch.id for dispatch in dispatches]
+
+    async def _acknowledge_cancelled_dispatch(
+        self,
+        redis: Any,
+        dispatch_id: uuid.UUID,
+    ) -> None:
+        async with self._session_factory() as db:
+            async with db.begin():
+                is_postgresql = (
+                    db.get_bind().dialect.name == "postgresql"
+                )
+                statement = select(WorkerTaskDispatch).where(
+                    WorkerTaskDispatch.id == dispatch_id
+                )
+                if not is_postgresql:
+                    statement = statement.with_for_update()
+                dispatch = (
+                    await db.execute(statement)
+                ).scalar_one_or_none()
+                if dispatch is None:
+                    return
+                if dispatch.resolution_state == "acknowledged":
+                    return
+                if (
+                    dispatch.delivery_state != "delivered"
+                    or dispatch.resolution_state != "cancel_authorized"
+                    or dispatch.redis_message_id is None
+                ):
+                    raise RegisteredWorkerEventError(
+                        "cancelled worker task acknowledgement is not authorized"
+                    )
+                if is_postgresql:
+                    identity = {
+                        "dispatch_id": dispatch.id,
+                        "redis_stream": dispatch.redis_stream,
+                        "consumer_group": dispatch.consumer_group,
+                        "message_id": dispatch.redis_message_id,
+                        "payload_sha256": dispatch.payload_sha256,
+                        "dispatch_key": dispatch.dispatch_key,
+                    }
+                    function_arguments = (
+                        ":dispatch_id, :redis_stream, :consumer_group, "
+                        ":message_id, :payload_sha256, :dispatch_key"
+                    )
+                    await db.execute(
+                        text(
+                            "SELECT public."
+                            "vp_require_cancelled_worker_task_ack("
+                            f"{function_arguments})"
+                        ),
+                        identity,
+                    )
+                    result = await redis.xack(
+                        dispatch.redis_stream,
+                        dispatch.consumer_group,
+                        dispatch.redis_message_id,
+                    )
+                    self._require_xack_result(
+                        result,
+                        label="cancelled worker task",
+                    )
+                    await db.execute(
+                        text(
+                            "SELECT public."
+                            "vp_acknowledge_cancelled_worker_task("
+                            f"{function_arguments})"
+                        ),
+                        identity,
+                    )
+                    return
+                job = (
+                    await db.execute(
+                        select(Job)
+                        .where(Job.id == dispatch.job_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                node = (
+                    await db.execute(
+                        select(NodeExecution)
+                        .where(
+                            NodeExecution.id
+                            == dispatch.node_execution_id
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    job is None
+                    or node is None
+                    or job.status != JobStatus.CANCELLED
+                    or node.status != NodeStatus.CANCELLED
+                ):
+                    raise RegisteredWorkerEventError(
+                        "worker task cancellation authority changed"
+                    )
+                attestations = list(
+                    (
+                        await db.execute(
+                            select(WorkerTaskDeliveryAttestation)
+                            .where(
+                                WorkerTaskDeliveryAttestation.dispatch_key
+                                == dispatch.dispatch_key
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+                for registration_id in sorted(
+                    {
+                        attestation.worker_registration_id
+                        for attestation in attestations
+                    },
+                    key=str,
+                ):
+                    await self._lock_registration_fence(
+                        db,
+                        registration_id,
+                    )
+                result = await redis.xack(
+                    dispatch.redis_stream,
+                    dispatch.consumer_group,
+                    dispatch.redis_message_id,
+                )
+                self._require_xack_result(result, label="cancelled worker task")
+                await self._mark_cancelled_dispatch_acknowledged(
+                    db,
+                    dispatch,
+                    attestations,
+                )
+
+    @staticmethod
+    async def _mark_cancelled_dispatch_acknowledged(
+        db: AsyncSession,
+        dispatch: WorkerTaskDispatch,
+        attestations: list[WorkerTaskDeliveryAttestation],
+    ) -> None:
+        acknowledged_at = datetime.now(timezone.utc)
+        dispatch.resolution_state = "acknowledged"
+        dispatch.acknowledged_at = acknowledged_at
+        for attestation in attestations:
+            if attestation.ack_state != "acknowledged":
+                attestation.ack_state = "acknowledged"
+                attestation.acknowledged_at = acknowledged_at
+        await db.flush()
 
     async def _mark_dispatch_delivered(
         self,
@@ -832,9 +1286,41 @@ class RegisteredWorkerEventReceiptService:
                             "worker task dispatch message mismatch"
                         )
                     return
+                if dispatch.delivery_state != "attempting":
+                    raise RegisteredWorkerEventError(
+                        "worker task dispatch is not attempting delivery"
+                    )
                 dispatch.delivery_state = "delivered"
                 dispatch.redis_message_id = message_id
                 dispatch.delivered_at = datetime.now(timezone.utc)
+                await db.flush()
+
+    async def _mark_dispatch_uncertain(
+        self,
+        dispatch_id: uuid.UUID,
+        reason: str,
+    ) -> None:
+        async with self._session_factory() as db:
+            async with db.begin():
+                dispatch = (
+                    await db.execute(
+                        select(WorkerTaskDispatch)
+                        .where(WorkerTaskDispatch.id == dispatch_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if dispatch is None:
+                    raise RegisteredWorkerEventError(
+                        "worker task dispatch is missing"
+                    )
+                if dispatch.delivery_state == "delivered":
+                    return
+                if dispatch.delivery_state != "attempting":
+                    raise RegisteredWorkerEventError(
+                        "worker task dispatch is not attempting delivery"
+                    )
+                dispatch.delivery_state = "uncertain"
+                dispatch.delivery_error = reason
                 await db.flush()
 
     @staticmethod

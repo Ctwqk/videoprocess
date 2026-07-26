@@ -25,6 +25,14 @@ def get_storage(
             bucket=settings.minio_bucket,
             secure=settings.minio_secure,
             create_bucket=create_bucket,
+            connect_timeout_seconds=(
+                settings.minio_connect_timeout_seconds
+            ),
+            read_timeout_seconds=settings.minio_read_timeout_seconds,
+            max_retries=settings.minio_max_retries,
+            operation_timeout_seconds=(
+                settings.minio_operation_timeout_seconds
+            ),
         )
     else:
         backend = LocalStorageBackend(root=settings.storage_local_root)

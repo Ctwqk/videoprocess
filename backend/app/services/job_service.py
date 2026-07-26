@@ -331,7 +331,13 @@ async def _resolve_worker_event_authority_for_job_deletion(
             for delivery in deliveries
         )
         or any(
-            dispatch.delivery_state != "delivered"
+            not (
+                dispatch.resolution_state == "acknowledged"
+                or (
+                    dispatch.delivery_state == "cancelled"
+                    and dispatch.resolution_state == "cancelled"
+                )
+            )
             for dispatch in dispatches
         )
     ):

@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "videoprocess"
     minio_secure: bool = False
+    minio_connect_timeout_seconds: float = 5.0
+    minio_read_timeout_seconds: float = 120.0
+    minio_max_retries: int = 2
+    minio_operation_timeout_seconds: float = 180.0
 
     # API
     api_host: str = "0.0.0.0"

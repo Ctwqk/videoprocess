@@ -32,11 +32,10 @@ from app.services.job_execution_authority import (
     NodeExecutionClaim,
     acknowledge_worker_task_delivery,
     authorize_worker_task_ack,
-    attest_worker_task_delivery,
+    claim_registered_worker_node,
     lock_job_execution_authority,
     require_active_execution_authority,
     require_matching_node_execution_claim,
-    require_worker_registration_identity,
     require_worker_registration_lease,
     require_worker_task_ack_receipt,
 )
@@ -275,35 +274,11 @@ async def _claim_node_execution(
                     job_statuses={JobStatus.RUNNING},
                     node_statuses={NodeStatus.QUEUED},
                 )
-                claimed_at = datetime.now(timezone.utc)
                 worker_id = (
                     worker_lease.redis_consumer_id
                     if worker_lease is not None
                     else WORKER_ID
                 )
-                claim = NodeExecutionClaim(
-                    job_id=resolved_job_id,
-                    node_execution_id=resolved_node_id,
-                    worker_id=worker_id,
-                    started_at=claimed_at,
-                    worker_registration_id=(
-                        worker_lease.registration_id
-                        if worker_lease is not None
-                        else None
-                    ),
-                    worker_lease_epoch=(
-                        worker_lease.lease_epoch
-                        if worker_lease is not None
-                        else None
-                    ),
-                )
-                if worker_lease is not None:
-                    await require_worker_registration_lease(db, claim)
-                node.status = NodeStatus.RUNNING
-                node.started_at = claimed_at
-                node.worker_id = worker_id
-                node.worker_registration_id = claim.worker_registration_id
-                node.worker_lease_epoch = claim.worker_lease_epoch
                 if worker_lease is not None:
                     delivery = _current_task_delivery.get()
                     if (
@@ -313,16 +288,35 @@ async def _claim_node_execution(
                         raise JobExecutionAuthorityBlocked(
                             "registered worker claim has no durable task dispatch"
                         )
-                    await db.flush()
-                    delivery.attestation_id = await attest_worker_task_delivery(
-                        db,
-                        claim,
-                        redis_stream=delivery.redis_stream,
-                        consumer_group=delivery.consumer_group,
-                        message_id=delivery.message_id,
-                        payload_sha256=delivery.payload_sha256,
-                        dispatch_key=delivery.dispatch_key,
+                    claim, delivery.attestation_id = (
+                        await claim_registered_worker_node(
+                            db,
+                            job_id=resolved_job_id,
+                            node_execution_id=resolved_node_id,
+                            registration_id=worker_lease.registration_id,
+                            lease_epoch=worker_lease.lease_epoch,
+                            worker_id=worker_id,
+                            redis_stream=delivery.redis_stream,
+                            consumer_group=delivery.consumer_group,
+                            message_id=delivery.message_id,
+                            payload_sha256=delivery.payload_sha256,
+                            dispatch_key=delivery.dispatch_key,
+                        )
                     )
+                else:
+                    claimed_at = datetime.now(timezone.utc)
+                    claim = NodeExecutionClaim(
+                        job_id=resolved_job_id,
+                        node_execution_id=resolved_node_id,
+                        worker_id=worker_id,
+                        started_at=claimed_at,
+                    )
+                    node.status = NodeStatus.RUNNING
+                    node.started_at = claimed_at
+                    node.worker_id = worker_id
+                    node.worker_registration_id = None
+                    node.worker_lease_epoch = None
+                    await db.flush()
             return claim
         except JobExecutionAuthorityBlocked as exc:
             await db.rollback()
@@ -618,7 +612,14 @@ async def process_task(
         output_filename = (
             f"{node_execution_id}-{_claim_generation_token(claim)}{output_ext}"
         )
-        output_storage_path = f"artifacts/{job_id}/{output_filename}"
+        storage_prefix = (
+            "artifacts"
+            if settings.storage_backend == "local"
+            else "staging/artifacts"
+        )
+        output_storage_path = (
+            f"{storage_prefix}/{job_id}/{output_filename}"
+        )
         output_local_dir = Path(settings.storage_local_root) / "artifacts" / job_id
         output_local_dir.mkdir(parents=True, exist_ok=True)
         output_local_path = str(output_local_dir / output_filename)
@@ -1174,14 +1175,6 @@ async def _process_message(
     worker_lease: WorkerLease | None = None,
     lease_refresher: Callable[..., Awaitable[object]] | None = None,
 ) -> None:
-    if await _maybe_defer_for_affinity(
-        r,
-        msg_id,
-        data,
-        worker_lease=worker_lease,
-    ):
-        return
-
     payload_sha256 = _canonical_task_payload_sha256(data)
     dispatch_key_raw = data.get("dispatch_key")
     try:
@@ -1198,6 +1191,14 @@ async def _process_message(
         raise JobExecutionAuthorityBlocked(
             "registered worker task has no durable dispatch key"
         )
+    if await _maybe_defer_for_affinity(
+        r,
+        msg_id,
+        data,
+        worker_lease=worker_lease,
+    ):
+        return
+
     delivery_token = _current_task_delivery.set(
         WorkerTaskDelivery(
             redis_stream=TASK_STREAM,
@@ -1364,23 +1365,23 @@ async def _maybe_defer_for_affinity(
         )
         return False
 
+    if worker_lease is not None:
+        logger.info(
+            "Leaving registered task %s pending for preferred host "
+            "(current=%s preferred=%s age=%ss)",
+            msg_id,
+            WORKER_HOST,
+            preferred_hosts,
+            age_seconds,
+        )
+        return True
+
     bounced = dict(data)
     bounced["affinity_bounces"] = str(bounces + 1)
     if not bounced.get("affinity_enqueued_at"):
         bounced["affinity_enqueued_at"] = str(now)
-    if worker_lease is None:
-        await r.xadd(TASK_STREAM, bounced)
-        await r.xack(TASK_STREAM, CONSUMER_GROUP, msg_id)
-    else:
-        async with get_worker_session()() as db:
-            async with db.begin():
-                await require_worker_registration_identity(
-                    db,
-                    worker_lease.registration_id,
-                    worker_lease.lease_epoch,
-                )
-                await r.xadd(TASK_STREAM, bounced)
-                await r.xack(TASK_STREAM, CONSUMER_GROUP, msg_id)
+    await r.xadd(TASK_STREAM, bounced)
+    await r.xack(TASK_STREAM, CONSUMER_GROUP, msg_id)
     logger.info(
         "Deferred task %s on host %s for affinity (preferred=%s, age=%ss, bounce=%s)",
         msg_id, WORKER_HOST, preferred_hosts, age_seconds, bounces + 1,

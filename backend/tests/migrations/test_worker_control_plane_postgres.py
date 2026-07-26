@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import uuid
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -313,6 +314,9 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
             task_message_id = "1710000000000-4"
             task_payload_hash = _sha256("canonical-worker-task")
             dispatch_key = uuid.uuid4()
+            claim_dispatch_key = uuid.uuid4()
+            claim_message_id = "1710000000000-5"
+            claim_payload_hash = _sha256("atomic-claim-task")
             with pytest.raises(asyncpg.InsufficientPrivilegeError):
                 await worker.execute(
                     """
@@ -365,6 +369,45 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     second["lease_epoch"],
                 )
                 assert seeded is not None
+                claim_node = await admin.fetchrow(
+                    """
+                    INSERT INTO public.node_executions (
+                        job_id, node_id, node_type, status
+                    ) VALUES (
+                        $1, 'vision-atomic-claim', 'vision',
+                        'QUEUED'::node_status
+                    )
+                    RETURNING id
+                    """,
+                    seeded["job_id"],
+                )
+                assert claim_node is not None
+                await admin.execute(
+                    """
+                    INSERT INTO public.worker_task_dispatches (
+                        dispatch_key, job_id, node_execution_id,
+                        redis_stream, consumer_group, payload_sha256,
+                        payload_json, delivery_state, redis_message_id,
+                        delivery_attempted_at, delivered_at
+                    ) VALUES (
+                        $1, $2, $3, 'vp:tasks:vision', 'vision-workers',
+                        $4, $5::jsonb, 'delivered', $6,
+                        clock_timestamp(), clock_timestamp()
+                    )
+                    """,
+                    claim_dispatch_key,
+                    seeded["job_id"],
+                    claim_node["id"],
+                    claim_payload_hash,
+                    json.dumps(
+                        {
+                            "dispatch_key": str(claim_dispatch_key),
+                            "job_id": str(seeded["job_id"]),
+                            "node_execution_id": str(claim_node["id"]),
+                        }
+                    ),
+                    claim_message_id,
+                )
                 source_task_payload = {
                     "job_id": str(seeded["job_id"]),
                     "node_execution_id": str(seeded["id"]),
@@ -387,11 +430,11 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                         dispatch_key, job_id, node_execution_id,
                         redis_stream, consumer_group, payload_sha256,
                         payload_json, delivery_state, redis_message_id,
-                        delivered_at
+                        delivery_attempted_at, delivered_at
                     ) VALUES (
                         $1, $2, $3, 'vp:tasks:vision', 'vision-workers',
                         $4, $5::jsonb, 'delivered', $6,
-                        clock_timestamp()
+                        clock_timestamp(), clock_timestamp()
                     )
                     """,
                     dispatch_key,
@@ -485,9 +528,20 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 )
                 await admin.execute(
                     "GRANT EXECUTE ON FUNCTION "
+                    "public.vp_claim_worker_node("
+                    "uuid,bigint,text,uuid,uuid,text,text,text,text,uuid) "
+                    f'TO "{worker_role}"'
+                )
+                await admin.execute(
+                    "GRANT EXECUTE ON FUNCTION "
                     "public.vp_observe_worker_task_delivery("
                     "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
                     "text,text,text,text,uuid) "
+                    f'TO "{orchestrator_role}"'
+                )
+                await admin.execute(
+                    "GRANT EXECUTE ON FUNCTION "
+                    "public.vp_acknowledge_proven_worker_task_dispatch(uuid) "
                     f'TO "{orchestrator_role}"'
                 )
                 await admin.execute(
@@ -496,8 +550,423 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     "uuid) "
                     f'TO "{orchestrator_role}"'
                 )
+                await admin.execute(
+                    "GRANT EXECUTE ON FUNCTION "
+                    "public.vp_recover_registered_worker_node(uuid,uuid) "
+                    f'TO "{orchestrator_role}"'
+                )
+                for signature in (
+                    "vp_authorize_cancelled_worker_task_ack(uuid)",
+                    "vp_require_cancelled_worker_task_ack("
+                    "uuid,text,text,text,text,uuid)",
+                    "vp_acknowledge_cancelled_worker_task("
+                    "uuid,text,text,text,text,uuid)",
+                ):
+                    await admin.execute(
+                        f"GRANT EXECUTE ON FUNCTION public.{signature} "
+                        f'TO "{orchestrator_role}"'
+                    )
+                await admin.execute(
+                    "GRANT SELECT ON public.jobs "
+                    f'TO "{orchestrator_role}"'
+                )
+                await admin.execute(
+                    "GRANT UPDATE (status) ON public.jobs "
+                    f'TO "{orchestrator_role}"'
+                )
             finally:
                 await admin.close()
+
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await worker.execute(
+                    """
+                    UPDATE public.node_executions
+                    SET status = 'RUNNING'::node_status
+                    WHERE id = $1
+                    """,
+                    claim_node["id"],
+                )
+            claim_sql = """
+                SELECT *
+                FROM public.vp_claim_worker_node(
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                )
+            """
+            claim_args = (
+                second["registration_id"],
+                second["lease_epoch"],
+                "vision-worker:atomic",
+                seeded["job_id"],
+                claim_node["id"],
+                "vp:tasks:vision",
+                "vision-workers",
+                claim_message_id,
+                claim_payload_hash,
+                claim_dispatch_key,
+            )
+            wrong_claim_args = list(claim_args)
+            wrong_claim_args[7] = "1710000000000-999"
+            with pytest.raises(asyncpg.RaiseError, match="task_dispatch_mismatch"):
+                await worker.fetchrow(claim_sql, *wrong_claim_args)
+            assert await orchestrator.fetchval(
+                "SELECT status::text FROM public.node_executions WHERE id = $1",
+                claim_node["id"],
+            ) == "QUEUED"
+            claimed = await worker.fetchrow(claim_sql, *claim_args)
+            assert claimed is not None
+            assert isinstance(claimed["worker_started_at"], datetime)
+            assert isinstance(claimed["attestation_id"], uuid.UUID)
+            assert await orchestrator.fetchval(
+                "SELECT status::text FROM public.node_executions WHERE id = $1",
+                claim_node["id"],
+            ) == "RUNNING"
+            await worker.execute(
+                """
+                SELECT public.vp_authorize_worker_task_ack(
+                    $1, $2, $3, $4, $5
+                )
+                """,
+                claimed["attestation_id"],
+                second["registration_id"],
+                second["lease_epoch"],
+                "vision-worker:atomic",
+                claimed["worker_started_at"],
+            )
+            await worker.execute(
+                """
+                SELECT public.vp_acknowledge_worker_task_delivery(
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                )
+                """,
+                claimed["attestation_id"],
+                second["registration_id"],
+                second["lease_epoch"],
+                "vision-worker:atomic",
+                claimed["worker_started_at"],
+                "vp:tasks:vision",
+                "vision-workers",
+                claim_message_id,
+                claim_payload_hash,
+                claim_dispatch_key,
+            )
+            assert await orchestrator.fetchval(
+                """
+                SELECT public.vp_recover_registered_worker_node($1, $2)
+                """,
+                seeded["job_id"],
+                claim_node["id"],
+            ) == "live"
+
+            cancel_pending_key = uuid.uuid4()
+            cancel_delivered_key = uuid.uuid4()
+            cancel_message_id = "1710000000000-6"
+            cancel_payload_hash = _sha256("cancelled-delivered-task")
+            admin = await asyncpg.connect(_asyncpg_url(target_url))
+            try:
+                cancelled_job = await admin.fetchrow(
+                    """
+                    WITH pipeline AS (
+                        INSERT INTO public.pipelines (name, definition)
+                        VALUES ('cancel-reconcile-test', '{}'::json)
+                        RETURNING id
+                    )
+                    INSERT INTO public.jobs (
+                        pipeline_id, pipeline_snapshot, status
+                    )
+                    SELECT id, '{}'::json, 'CANCELLED'::job_status
+                    FROM pipeline
+                    RETURNING id
+                    """
+                )
+                assert cancelled_job is not None
+                cancel_pending_node = await admin.fetchval(
+                    """
+                    INSERT INTO public.node_executions (
+                        job_id, node_id, node_type, status
+                    ) VALUES (
+                        $1, 'cancel-pending', 'vision',
+                        'CANCELLED'::node_status
+                    )
+                    RETURNING id
+                    """,
+                    cancelled_job["id"],
+                )
+                cancel_delivered_node = await admin.fetchval(
+                    """
+                    INSERT INTO public.node_executions (
+                        job_id, node_id, node_type, status
+                    ) VALUES (
+                        $1, 'cancel-delivered', 'vision',
+                        'CANCELLED'::node_status
+                    )
+                    RETURNING id
+                    """,
+                    cancelled_job["id"],
+                )
+                await admin.execute(
+                    """
+                    INSERT INTO public.worker_task_dispatches (
+                        dispatch_key, job_id, node_execution_id,
+                        redis_stream, consumer_group, payload_sha256,
+                        payload_json, delivery_state
+                    ) VALUES (
+                        $1, $2, $3, 'vp:tasks:vision', 'vision-workers',
+                        $4, $5::jsonb, 'pending'
+                    )
+                    """,
+                    cancel_pending_key,
+                    cancelled_job["id"],
+                    cancel_pending_node,
+                    _sha256("cancelled-pending-task"),
+                    json.dumps({"dispatch_key": str(cancel_pending_key)}),
+                )
+                await admin.execute(
+                    """
+                    INSERT INTO public.worker_task_dispatches (
+                        dispatch_key, job_id, node_execution_id,
+                        redis_stream, consumer_group, payload_sha256,
+                        payload_json, delivery_state, redis_message_id,
+                        delivery_attempted_at, delivered_at
+                    ) VALUES (
+                        $1, $2, $3, 'vp:tasks:vision', 'vision-workers',
+                        $4, $5::jsonb, 'delivered', $6,
+                        clock_timestamp(), clock_timestamp()
+                    )
+                    """,
+                    cancel_delivered_key,
+                    cancelled_job["id"],
+                    cancel_delivered_node,
+                    cancel_payload_hash,
+                    json.dumps({"dispatch_key": str(cancel_delivered_key)}),
+                    cancel_message_id,
+                )
+            finally:
+                await admin.close()
+
+            cancel_engine = create_async_engine(
+                "postgresql+asyncpg://"
+                f"{orchestrator_role}:{orchestrator_password}@{suffix}"
+            )
+            cancel_service = RegisteredWorkerEventReceiptService(
+                async_sessionmaker(cancel_engine, expire_on_commit=False)
+            )
+
+            class CancelRedis:
+                def __init__(self) -> None:
+                    self.calls: list[tuple[str, str, str]] = []
+
+                async def get(self, key):
+                    return None
+
+                async def xack(self, stream, group, message_id):
+                    self.calls.append((stream, group, message_id))
+                    return 1
+
+            cancel_redis = CancelRedis()
+            try:
+                await cancel_service.reconcile_cancelled_dispatches(
+                    cancel_redis
+                )
+            finally:
+                await cancel_engine.dispose()
+            assert cancel_redis.calls == [
+                (
+                    "vp:tasks:vision",
+                    "vision-workers",
+                    cancel_message_id,
+                )
+            ]
+            cancel_states = await orchestrator.fetch(
+                """
+                SELECT dispatch_key, delivery_state, resolution_state
+                FROM public.worker_task_dispatches
+                WHERE job_id = $1
+                ORDER BY dispatch_key
+                """,
+                cancelled_job["id"],
+            )
+            state_by_key = {
+                row["dispatch_key"]: (
+                    row["delivery_state"],
+                    row["resolution_state"],
+                )
+                for row in cancel_states
+            }
+            assert state_by_key == {
+                cancel_pending_key: ("cancelled", "cancelled"),
+                cancel_delivered_key: ("delivered", "acknowledged"),
+            }
+
+            concurrent_cancel_key = uuid.uuid4()
+            concurrent_cancel_message_id = "1710000000000-7"
+            concurrent_cancel_hash = _sha256("concurrent-cancel-task")
+            admin = await asyncpg.connect(_asyncpg_url(target_url))
+            try:
+                concurrent_cancel_job = await admin.fetchrow(
+                    """
+                    WITH pipeline AS (
+                        INSERT INTO public.pipelines (name, definition)
+                        VALUES ('concurrent-cancel-test', '{}'::json)
+                        RETURNING id
+                    ),
+                    job AS (
+                        INSERT INTO public.jobs (
+                            pipeline_id, pipeline_snapshot, status
+                        )
+                        SELECT id, '{}'::json, 'CANCELLED'::job_status
+                        FROM pipeline
+                        RETURNING id
+                    )
+                    INSERT INTO public.node_executions (
+                        job_id, node_id, node_type, status
+                    )
+                    SELECT
+                        id, 'cancel-concurrent', 'vision',
+                        'CANCELLED'::node_status
+                    FROM job
+                    RETURNING id, job_id
+                    """
+                )
+                assert concurrent_cancel_job is not None
+                await admin.execute(
+                    """
+                    INSERT INTO public.worker_task_dispatches (
+                        dispatch_key, job_id, node_execution_id,
+                        redis_stream, consumer_group, payload_sha256,
+                        payload_json, delivery_state, redis_message_id,
+                        delivery_attempted_at, delivered_at
+                    ) VALUES (
+                        $1, $2, $3, 'vp:tasks:vision', 'vision-workers',
+                        $4, $5::jsonb, 'delivered', $6,
+                        clock_timestamp(), clock_timestamp()
+                    )
+                    """,
+                    concurrent_cancel_key,
+                    concurrent_cancel_job["job_id"],
+                    concurrent_cancel_job["id"],
+                    concurrent_cancel_hash,
+                    json.dumps(
+                        {"dispatch_key": str(concurrent_cancel_key)}
+                    ),
+                    concurrent_cancel_message_id,
+                )
+                await admin.execute(
+                    """
+                    INSERT INTO public.worker_task_delivery_attestations (
+                        redis_stream, consumer_group, message_id,
+                        payload_sha256, dispatch_key, job_id,
+                        node_execution_id, worker_registration_id,
+                        worker_lease_epoch, worker_id, worker_started_at
+                    ) VALUES (
+                        'vp:tasks:vision', 'vision-workers', $1, $2, $3,
+                        $4, $5, $6, $7, 'vision-worker:cancel',
+                        clock_timestamp()
+                    )
+                    """,
+                    concurrent_cancel_message_id,
+                    concurrent_cancel_hash,
+                    concurrent_cancel_key,
+                    concurrent_cancel_job["job_id"],
+                    concurrent_cancel_job["id"],
+                    second["registration_id"],
+                    second["lease_epoch"],
+                )
+            finally:
+                await admin.close()
+
+            fence_holder = await asyncpg.connect(_asyncpg_url(target_url))
+            cleanup_peer = await asyncpg.connect(
+                "postgresql://"
+                f"{orchestrator_role}:{orchestrator_password}@{suffix}"
+            )
+            fence_tx = fence_holder.transaction()
+            await fence_tx.start()
+            await fence_holder.execute(
+                """
+                SELECT pg_catalog.pg_advisory_xact_lock(
+                    pg_catalog.hashtextextended(
+                        'vp-worker-registration:' || $1::text,
+                        0
+                    )
+                )
+                """,
+                str(second["registration_id"]),
+            )
+            lock_cancel_engine = create_async_engine(
+                "postgresql+asyncpg://"
+                f"{orchestrator_role}:{orchestrator_password}@{suffix}"
+            )
+            lock_cancel_service = RegisteredWorkerEventReceiptService(
+                async_sessionmaker(
+                    lock_cancel_engine,
+                    expire_on_commit=False,
+                )
+            )
+            lock_cancel_redis = CancelRedis()
+            try:
+                cleanup_task = asyncio.create_task(
+                    cleanup_peer.fetchval(
+                        "SELECT public."
+                        "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                        concurrent_cancel_job["job_id"],
+                    )
+                )
+                for _ in range(40):
+                    waiting = await fence_holder.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_stat_activity
+                            WHERE datname = current_database()
+                              AND wait_event = 'advisory'
+                              AND query LIKE
+                                  '%vp_resolve_worker_event_authority%'
+                        )
+                        """
+                    )
+                    if waiting:
+                        break
+                    await asyncio.sleep(0.025)
+                assert waiting is True
+                cancel_task = asyncio.create_task(
+                    lock_cancel_service.reconcile_cancelled_dispatches(
+                        lock_cancel_redis
+                    )
+                )
+                done, _ = await asyncio.wait(
+                    {cleanup_task, cancel_task},
+                    timeout=0.25,
+                )
+                assert not done
+                await fence_tx.commit()
+                with pytest.raises(
+                    asyncpg.RaiseError,
+                    match="worker_event_authority_unresolved",
+                ):
+                    await asyncio.wait_for(cleanup_task, timeout=3)
+                await asyncio.wait_for(cancel_task, timeout=3)
+            finally:
+                if not fence_holder.is_closed():
+                    with suppress(asyncpg.InterfaceError):
+                        await fence_tx.rollback()
+                await lock_cancel_engine.dispose()
+                await cleanup_peer.close()
+                await fence_holder.close()
+            assert lock_cancel_redis.calls == [
+                (
+                    "vp:tasks:vision",
+                    "vision-workers",
+                    concurrent_cancel_message_id,
+                )
+            ]
+            assert await orchestrator.fetchval(
+                """
+                SELECT resolution_state
+                FROM public.worker_task_dispatches
+                WHERE dispatch_key = $1
+                """,
+                concurrent_cancel_key,
+            ) == "acknowledged"
 
             attest_sql = """
                 SELECT public.vp_attest_worker_task_delivery(
@@ -663,7 +1132,7 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                         {"node_execution_id": node_execution_id},
                     )
                 ).mappings().one()
-                assert locked_node["status"] == "RUNNING"
+                assert locked_node["status"] in {"RUNNING", "SUCCEEDED"}
                 assert (
                     locked_node["worker_registration_id"]
                     == second["registration_id"]
@@ -681,7 +1150,7 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     ),
                     node=SimpleNamespace(
                         id=node_execution_id,
-                        status=NodeStatus.RUNNING,
+                        status=NodeStatus(locked_node["status"]),
                         worker_id=locked_node["worker_id"],
                         started_at=locked_node["started_at"],
                         worker_registration_id=locked_node[
@@ -811,6 +1280,90 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
 
             admin = await asyncpg.connect(_asyncpg_url(target_url))
             try:
+                await admin.execute(
+                    """
+                    UPDATE public.jobs
+                    SET status = 'SUCCEEDED'::job_status,
+                        completed_at = clock_timestamp()
+                    WHERE id = $1
+                    """,
+                    seeded["job_id"],
+                )
+            finally:
+                await admin.close()
+            alias_locked = asyncio.Event()
+            release_alias = asyncio.Event()
+
+            async def blocking_alias_authority(
+                db,
+                job_id,
+                *,
+                node_execution_id,
+                lock_all_nodes,
+            ):
+                await db.execute(
+                    text(
+                        """
+                        SELECT id
+                        FROM public.jobs
+                        WHERE id = :job_id
+                        FOR UPDATE
+                        """
+                    ),
+                    {"job_id": job_id},
+                )
+                alias_locked.set()
+                await release_alias.wait()
+                return await lock_authority(
+                    db,
+                    job_id,
+                    node_execution_id=node_execution_id,
+                    lock_all_nodes=lock_all_nodes,
+                )
+
+            alias_event = parse_registered_worker_event(
+                redis_stream="vp:events",
+                consumer_group="orchestrator",
+                message_id="1710000001003-0",
+                payload=receipt_payload,
+            )
+            alias_engine = create_async_engine(orchestrator_database_url)
+            alias_service = RegisteredWorkerEventReceiptService(
+                async_sessionmaker(alias_engine, expire_on_commit=False),
+                authority_locker=blocking_alias_authority,
+            )
+            cleanup_peer = await asyncpg.connect(
+                "postgresql://"
+                f"{orchestrator_role}:{orchestrator_password}@{suffix}"
+            )
+            try:
+                alias_task = asyncio.create_task(
+                    alias_service.accept_and_apply(alias_event, apply_event)
+                )
+                await asyncio.wait_for(alias_locked.wait(), timeout=3)
+                cleanup_task = asyncio.create_task(
+                    cleanup_peer.fetchval(
+                        "SELECT public."
+                        "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                        seeded["job_id"],
+                    )
+                )
+                done, _ = await asyncio.wait({cleanup_task}, timeout=0.25)
+                assert cleanup_task not in done
+                release_alias.set()
+                assert await asyncio.wait_for(alias_task, timeout=3) == receipt_id
+                with pytest.raises(
+                    asyncpg.RaiseError,
+                    match="worker_event_authority_unresolved",
+                ):
+                    await asyncio.wait_for(cleanup_task, timeout=3)
+            finally:
+                release_alias.set()
+                await alias_engine.dispose()
+                await cleanup_peer.close()
+
+            admin = await asyncpg.connect(_asyncpg_url(target_url))
+            try:
                 tamper = admin.transaction()
                 await tamper.start()
                 try:
@@ -867,6 +1420,13 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
             assert revoke not in done
             await observer_tx.commit()
             assert await asyncio.wait_for(revoke, timeout=3) is True
+            assert await orchestrator.fetchval(
+                """
+                SELECT public.vp_recover_registered_worker_node($1, $2)
+                """,
+                seeded["job_id"],
+                seeded["id"],
+            ) == "held_unresolved"
 
             ack_engine = create_async_engine(orchestrator_database_url)
             ack_service = RegisteredWorkerEventReceiptService(
@@ -888,6 +1448,10 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
             try:
                 await ack_service.acknowledge_applied(
                     ack_redis,
+                    alias_event,
+                )
+                await ack_service.acknowledge_applied(
+                    ack_redis,
                     first_event,
                 )
                 await ack_service.acknowledge_applied(
@@ -902,6 +1466,7 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     "vision-workers",
                     task_message_id,
                 ),
+                ("vp:events", "orchestrator", "1710000001003-0"),
                 ("vp:events", "orchestrator", "1710000001000-0"),
                 ("vp:events", "orchestrator", "1710000001001-0"),
             ]
@@ -947,6 +1512,14 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 """,
                 attestation_id,
             ) == "acknowledged"
+            assert await orchestrator.fetchval(
+                """
+                SELECT resolution_state
+                FROM public.worker_task_dispatches
+                WHERE dispatch_key = $1
+                """,
+                dispatch_key,
+            ) == "acknowledged"
             with pytest.raises(
                 asyncpg.RaiseError,
                 match="event_receipt_missing",
@@ -967,6 +1540,20 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     task_payload_hash,
                     dispatch_key,
                 )
+            assert await orchestrator.fetchval(
+                """
+                SELECT public.vp_recover_registered_worker_node($1, $2)
+                """,
+                seeded["job_id"],
+                seeded["id"],
+            ) == "recovered"
+            assert await orchestrator.fetchval(
+                """
+                SELECT public.vp_recover_registered_worker_node($1, $2)
+                """,
+                seeded["job_id"],
+                seeded["id"],
+            ) == "not_registered"
             admin = await asyncpg.connect(_asyncpg_url(target_url))
             try:
                 await admin.execute(

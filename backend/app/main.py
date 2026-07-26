@@ -20,6 +20,9 @@ from app.db import async_session
 from app.models.job import Job, JobStatus, NodeStatus
 from app.orchestrator.engine import engine
 from app.orchestrator.event_listener import event_listener
+from app.services.job_execution_authority import (
+    recover_registered_worker_node,
+)
 from app.services.schedule_service import (
     VideoScheduleState,
     default_video_schedule_state,
@@ -53,6 +56,24 @@ async def _prepare_job_for_recovery(db, job) -> bool:
 
         reference_time = _ensure_utc(node.started_at or node.queued_at or job.started_at or job.submitted_at)
         if not reference_time or (now - reference_time) < STALE_NODE_RECOVERY_THRESHOLD:
+            continue
+
+        if getattr(node, "worker_registration_id", None) is not None:
+            recovery_outcome = await recover_registered_worker_node(
+                db,
+                job.id,
+                node.id,
+            )
+            if recovery_outcome != "recovered":
+                logger.info(
+                    "Startup recovery left registered node %s for job %s "
+                    "unchanged (%s)",
+                    node.node_id,
+                    job.id,
+                    recovery_outcome,
+                )
+                continue
+            changed = True
             continue
 
         logger.warning(

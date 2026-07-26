@@ -525,8 +525,6 @@ class JobEngine:
         ne: NodeExecution,
         input_artifacts: dict[str, Artifact],
     ) -> bool:
-        if not input_artifacts:
-            return False
         try:
             entry = await self.artifact_cache.lookup(
                 db,

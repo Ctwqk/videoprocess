@@ -52,6 +52,7 @@ async def _seed_authority(
     receipt_id = uuid.uuid4()
     delivery_id = uuid.uuid4()
     dispatch_id = uuid.uuid4()
+    dispatch_key = uuid.uuid4()
     now = datetime.now(timezone.utc)
     async with factory() as db:
         db.add(
@@ -77,20 +78,27 @@ async def _seed_authority(
             WorkerTaskDispatch(
                 id=dispatch_id,
                 origin_receipt_id=None,
-                dispatch_key=uuid.uuid4(),
+                dispatch_key=dispatch_key,
                 job_id=job_id,
                 node_execution_id=node_execution_id,
                 redis_stream="vp:tasks:vision",
                 consumer_group="vision-workers",
                 payload_sha256="1" * 64,
-                payload_json={"dispatch_key": str(uuid.uuid4())},
+                payload_json={"dispatch_key": str(dispatch_key)},
                 delivery_state=(
                     "delivered" if dispatch_delivered else "pending"
                 ),
                 redis_message_id=(
                     "1710000000000-4" if dispatch_delivered else None
                 ),
+                delivery_attempted_at=now if dispatch_delivered else None,
                 delivered_at=now if dispatch_delivered else None,
+                resolution_state=(
+                    "acknowledged"
+                    if source_acknowledged
+                    else "unresolved"
+                ),
+                acknowledged_at=now if source_acknowledged else None,
             )
         )
         db.add(
@@ -100,7 +108,7 @@ async def _seed_authority(
                 consumer_group="vision-workers",
                 message_id="1710000000000-4",
                 payload_sha256="1" * 64,
-                dispatch_key=uuid.uuid4(),
+                dispatch_key=dispatch_key,
                 job_id=job_id,
                 node_execution_id=node_execution_id,
                 worker_registration_id=registration_id,
@@ -260,8 +268,11 @@ async def test_delete_cancelled_claim_with_acknowledged_task_needs_no_receipt(
                 payload_sha256="3" * 64,
                 payload_json={"dispatch_key": str(dispatch_key)},
                 delivery_state="delivered",
+                delivery_attempted_at=now,
                 redis_message_id="1710000002000-0",
                 delivered_at=now,
+                resolution_state="acknowledged",
+                acknowledged_at=now,
             )
         )
         db.add(
@@ -294,3 +305,55 @@ async def test_delete_cancelled_claim_with_acknowledged_task_needs_no_receipt(
             )
             is None
         )
+
+
+@pytest.mark.asyncio
+async def test_delete_rejects_delivered_dispatch_without_exact_ack(
+    deletion_factory,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    dispatch_key = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    async with deletion_factory() as db:
+        db.add(
+            Job(
+                id=job_id,
+                pipeline_id=uuid.uuid4(),
+                pipeline_snapshot={"nodes": [], "edges": []},
+                status=JobStatus.CANCELLED,
+            )
+        )
+        db.add(
+            NodeExecution(
+                id=node_execution_id,
+                job_id=job_id,
+                node_id="vision-1",
+                node_type="vision",
+                node_label="Vision",
+                node_config={},
+                status=NodeStatus.CANCELLED,
+            )
+        )
+        db.add(
+            WorkerTaskDispatch(
+                dispatch_key=dispatch_key,
+                job_id=job_id,
+                node_execution_id=node_execution_id,
+                redis_stream="vp:tasks:vision",
+                consumer_group="vision-workers",
+                payload_sha256="4" * 64,
+                payload_json={"dispatch_key": str(dispatch_key)},
+                delivery_state="delivered",
+                delivery_attempted_at=now,
+                redis_message_id="1710000003000-0",
+                delivered_at=now,
+                resolution_state="unresolved",
+            )
+        )
+        await db.commit()
+
+    async with deletion_factory() as db:
+        with pytest.raises(ValueError, match="authority.*unresolved"):
+            await delete_job(db, job_id)
+        assert await db.get(Job, job_id) is not None

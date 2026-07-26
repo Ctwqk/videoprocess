@@ -27,6 +27,7 @@ DETERMINISTIC_NODE_TYPES = {
     "watermark",
     "concat_timeline",
     "concat_vertical_timeline",
+    "url_download",
 }
 TRANSIENT_CONFIG_KEYS = {
     "disable_cache",
@@ -46,6 +47,12 @@ class IntermediateArtifactCacheService:
             return False
         if _truthy(node_config.get("disable_cache")):
             return False
+        if node_type == "url_download":
+            return (
+                isinstance(node_config.get("url"), str)
+                and bool(node_config["url"].strip())
+                and not bool(list(input_handles))
+            )
         return bool(list(input_handles))
 
     def cache_key(

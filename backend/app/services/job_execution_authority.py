@@ -4,13 +4,18 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.channel_agent import ChannelProfile, ProductionTask
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.models.registered_worker_event_receipt import (
+    WorkerTaskDeliveryAttestation,
+    WorkerTaskDispatch,
+)
 from app.models.schedule import RuntimeSchedule
+from app.models.worker_registration import WorkerRegistration
 from app.services.schedule_service import VideoScheduleState, get_or_create_and_lock_runtime_schedule
 
 
@@ -35,6 +40,290 @@ class NodeExecutionClaim:
     started_at: datetime
     worker_registration_id: uuid.UUID | None = None
     worker_lease_epoch: int | None = None
+
+
+async def claim_registered_worker_node(
+    db: AsyncSession,
+    *,
+    job_id: uuid.UUID,
+    node_execution_id: uuid.UUID,
+    registration_id: uuid.UUID | None,
+    lease_epoch: int | None,
+    worker_id: str,
+    redis_stream: str,
+    consumer_group: str,
+    message_id: str,
+    payload_sha256: str,
+    dispatch_key: uuid.UUID,
+) -> tuple[NodeExecutionClaim, uuid.UUID]:
+    """Atomically claim a node and attest its exact delivered task."""
+
+    registration_id, lease_epoch = _validated_registration_identity(
+        registration_id,
+        lease_epoch,
+    )
+    if (
+        not isinstance(job_id, uuid.UUID)
+        or not isinstance(node_execution_id, uuid.UUID)
+        or not isinstance(dispatch_key, uuid.UUID)
+        or not all(
+            isinstance(value, str) and value.strip()
+            for value in (
+                worker_id,
+                redis_stream,
+                consumer_group,
+                message_id,
+            )
+        )
+        or len(payload_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in payload_sha256
+        )
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "registered worker node claim identity is invalid"
+        )
+
+    if db.get_bind().dialect.name == "postgresql":
+        result = await db.execute(
+            text(
+                """
+                SELECT worker_started_at, attestation_id
+                FROM public.vp_claim_worker_node(
+                    :registration_id,
+                    :lease_epoch,
+                    :worker_id,
+                    :job_id,
+                    :node_execution_id,
+                    :redis_stream,
+                    :consumer_group,
+                    :message_id,
+                    :payload_sha256,
+                    :dispatch_key
+                )
+                """
+            ),
+            {
+                "registration_id": registration_id,
+                "lease_epoch": lease_epoch,
+                "worker_id": worker_id,
+                "job_id": job_id,
+                "node_execution_id": node_execution_id,
+                "redis_stream": redis_stream,
+                "consumer_group": consumer_group,
+                "message_id": message_id,
+                "payload_sha256": payload_sha256,
+                "dispatch_key": dispatch_key,
+            },
+        )
+        row = result.one_or_none()
+        if (
+            row is None
+            or not isinstance(row[0], datetime)
+            or not isinstance(row[1], uuid.UUID)
+        ):
+            raise JobExecutionAuthorityBlocked(
+                "registered worker node claim result is invalid"
+            )
+        claim = NodeExecutionClaim(
+            job_id=job_id,
+            node_execution_id=node_execution_id,
+            worker_id=worker_id,
+            started_at=row[0],
+            worker_registration_id=registration_id,
+            worker_lease_epoch=lease_epoch,
+        )
+        return claim, row[1]
+
+    job = (
+        await db.execute(
+            select(Job).where(Job.id == job_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    node = (
+        await db.execute(
+            select(NodeExecution)
+            .where(
+                NodeExecution.id == node_execution_id,
+                NodeExecution.job_id == job_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    registration = (
+        await db.execute(
+            select(WorkerRegistration)
+            .where(WorkerRegistration.id == registration_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    database_now = await db.scalar(select(func.current_timestamp()))
+    dispatch = (
+        await db.execute(
+            select(WorkerTaskDispatch)
+            .where(
+                WorkerTaskDispatch.dispatch_key == dispatch_key,
+                WorkerTaskDispatch.job_id == job_id,
+                WorkerTaskDispatch.node_execution_id == node_execution_id,
+                WorkerTaskDispatch.redis_stream == redis_stream,
+                WorkerTaskDispatch.consumer_group == consumer_group,
+                WorkerTaskDispatch.redis_message_id == message_id,
+                WorkerTaskDispatch.payload_sha256 == payload_sha256,
+                WorkerTaskDispatch.delivery_state == "delivered",
+                WorkerTaskDispatch.resolution_state == "unresolved",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        job is None
+        or node is None
+        or registration is None
+        or not isinstance(database_now, datetime)
+        or job.status != JobStatus.RUNNING
+        or node.status != NodeStatus.QUEUED
+        or registration.lease_epoch != lease_epoch
+        or registration.status != "active"
+        or _utc(registration.lease_expires_at) <= _utc(database_now)
+        or dispatch is None
+    ):
+        raise JobExecutionAuthorityBlocked(
+            "registered worker node claim is no longer authoritative"
+        )
+    claim = NodeExecutionClaim(
+        job_id=job_id,
+        node_execution_id=node_execution_id,
+        worker_id=worker_id,
+        started_at=database_now,
+        worker_registration_id=registration_id,
+        worker_lease_epoch=lease_epoch,
+    )
+    node.status = NodeStatus.RUNNING
+    node.started_at = database_now
+    node.worker_id = worker_id
+    node.worker_registration_id = registration_id
+    node.worker_lease_epoch = lease_epoch
+    attestation = WorkerTaskDeliveryAttestation(
+        redis_stream=redis_stream,
+        consumer_group=consumer_group,
+        message_id=message_id,
+        payload_sha256=payload_sha256,
+        dispatch_key=dispatch_key,
+        job_id=job_id,
+        node_execution_id=node_execution_id,
+        worker_registration_id=registration_id,
+        worker_lease_epoch=lease_epoch,
+        worker_id=worker_id,
+        worker_started_at=database_now,
+        attested_at=database_now,
+    )
+    db.add(attestation)
+    await db.flush()
+    return claim, attestation.id
+
+
+async def recover_registered_worker_node(
+    db: AsyncSession,
+    job_id: uuid.UUID,
+    node_execution_id: uuid.UUID,
+) -> str:
+    """Recover only an expired resolved registered claim under DB authority."""
+
+    if db.get_bind().dialect.name == "postgresql":
+        outcome = await _call_worker_authority_function(
+            db,
+            """
+            SELECT public.vp_recover_registered_worker_node(
+                :job_id,
+                :node_execution_id
+            )
+            """,
+            {
+                "job_id": job_id,
+                "node_execution_id": node_execution_id,
+            },
+            error_message="registered worker node recovery failed",
+        )
+        if outcome not in {
+            "live",
+            "held_unresolved",
+            "recovered",
+            "not_registered",
+        }:
+            raise JobExecutionAuthorityBlocked(
+                "registered worker node recovery result is invalid"
+            )
+        return outcome
+
+    job = (
+        await db.execute(
+            select(Job).where(Job.id == job_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    node = (
+        await db.execute(
+            select(NodeExecution)
+            .where(
+                NodeExecution.id == node_execution_id,
+                NodeExecution.job_id == job_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if job is None or node is None:
+        raise JobExecutionAuthorityBlocked(
+            "registered worker recovery authority is missing"
+        )
+    registration_id = node.worker_registration_id
+    lease_epoch = node.worker_lease_epoch
+    if registration_id is None or lease_epoch is None:
+        return "not_registered"
+    registration = (
+        await db.execute(
+            select(WorkerRegistration)
+            .where(WorkerRegistration.id == registration_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    database_now = await db.scalar(select(func.current_timestamp()))
+    if not isinstance(database_now, datetime):
+        raise JobExecutionAuthorityBlocked(
+            "database recovery clock is unavailable"
+        )
+    if (
+        registration is not None
+        and registration.lease_epoch == lease_epoch
+        and registration.status == "active"
+        and _utc(registration.lease_expires_at) > _utc(database_now)
+    ):
+        return "live"
+    unresolved_dispatch = (
+        await db.execute(
+            select(WorkerTaskDispatch.id)
+            .where(
+                WorkerTaskDispatch.node_execution_id == node.id,
+                WorkerTaskDispatch.resolution_state.in_(
+                    ("unresolved", "cancel_authorized")
+                ),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if unresolved_dispatch is not None:
+        return "held_unresolved"
+    node.status = NodeStatus.PENDING
+    node.worker_id = None
+    node.worker_registration_id = None
+    node.worker_lease_epoch = None
+    node.queued_at = None
+    node.started_at = None
+    node.completed_at = None
+    node.progress = 0
+    node.error_message = None
+    node.input_artifact_ids = []
+    await db.flush()
+    return "recovered"
 
 
 def require_matching_node_execution_claim(

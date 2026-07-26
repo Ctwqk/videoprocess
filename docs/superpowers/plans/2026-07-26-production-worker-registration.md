@@ -247,6 +247,8 @@ git commit -m "feat(workers): register python consumers before redis"
 - Modify: `internal/redisstream/streams.go`
 - Modify: `internal/redisstream/streams_test.go`
 - Modify: `internal/store/node_executions.go`
+- Create: `internal/store/worker_task_dispatches.go`
+- Create: `internal/store/worker_task_dispatches_test.go`
 - Modify: `internal/store/artifacts.go`
 - Modify: `internal/store/artifact_writes.go`
 - Create: `internal/store/worker_registration.go`
@@ -274,8 +276,10 @@ event publication, completion/failure, and XACK writes. Every registered task
 must require its orchestrator-created `dispatch_key`, canonical payload hash,
 delivered stream/group/message identity, and claim-time delivery attestation.
 The exact task proof must be copied into completion/failure events. All Redis
-`XADD`/`XACK`, including affinity bounce, must run while the same transaction
-holds the registration-shared fence. Test live ACK authorization, applied
+`XADD`/`XACK` must run while the same transaction holds the
+registration-shared fence. A registered affinity defer performs zero
+`XADD`/`XACK` and leaves the exact original delivery pending until preferred
+reclaim or affinity age expiry. Test live ACK authorization, applied
 receipt recovery, Redis-success/DB-failure replay, and arbitrary
 stream/group/message/hash/dispatch rejection. A lost epoch with neither
 durable ACK authorization nor receipt must produce no final write or
@@ -297,7 +301,7 @@ Expected: compile failure because registration types are absent.
 Use pgx transactions that call the reviewed `public.vp_worker_register`,
 `public.vp_worker_heartbeat`, `public.vp_worker_release`,
 `public.vp_require_worker_lease`,
-`public.vp_attest_worker_task_delivery`,
+`public.vp_claim_worker_node`,
 `public.vp_authorize_worker_task_ack`,
 `public.vp_require_worker_task_ack_receipt`, and
 `public.vp_acknowledge_worker_task_delivery` functions. Do not duplicate their
@@ -308,9 +312,14 @@ process UUID consumer ID. Preserve `DATABASE_URL` fallback only outside
 production. Open storage and
 PostgreSQL, register, start heartbeat, then construct/use Redis. Registration
 loss cancels the consumer context. Store the registration ID/epoch on node
-claim. Hold one shared-fence transaction across remote object save and artifact
+claim through the atomic claim-and-attest function; do not directly update
+`node_executions` or insert attestations. Implement initial/downstream/retry
+dispatch reads and exact fields in `internal/store/worker_task_dispatches.go`.
+Hold one shared-fence transaction across remote object save and artifact
 pointer insertion, with a second database-time lease check immediately before
-the pointer. Bind node completion/failure and every task XACK to the immutable
+the pointer. Use finite MinIO deadlines/retries and claim-unique staging keys;
+shutdown must not wait on an unbounded Go or SDK call, and a staging janitor
+owns abandoned objects. Bind node completion/failure and every task XACK to the immutable
 delivery attestation; leave PEL pending on unproven lease loss.
 
 - [ ] **Step 4: Run focused, full, and race tests**
@@ -337,6 +346,8 @@ git add internal/worker/registration.go \
   internal/redisstream/streams.go \
   internal/redisstream/streams_test.go \
   internal/store/node_executions.go \
+  internal/store/worker_task_dispatches.go \
+  internal/store/worker_task_dispatches_test.go \
   internal/store/artifacts.go \
   internal/store/artifact_writes.go \
   internal/store/worker_registration.go \
@@ -393,22 +404,32 @@ test roles and prove login principals are non-superuser, own no application
 objects, cannot write grant/registration tables directly, and can execute only
 the nine worker functions `vp_worker_register`, `vp_worker_heartbeat`,
 `vp_worker_release`, `vp_require_worker_lease`,
-`vp_require_worker_lease_margin`, `vp_attest_worker_task_delivery`,
+`vp_require_worker_lease_margin`, `vp_claim_worker_node`,
 `vp_authorize_worker_task_ack`, `vp_require_worker_task_ack_receipt`, and
 `vp_acknowledge_worker_task_delivery`, plus an explicit worker data-access
 allowlist.
 The allowlist is `SELECT` on `jobs`, `node_executions`, `artifacts`,
 `channel_profiles`, `production_tasks`, `runtime_schedules`, and
 `youtube_upload_operations`; `INSERT` on `artifacts`, `runtime_schedules`, and
-`youtube_upload_operations`; and `UPDATE` on `node_executions` and
-`youtube_upload_operations`. Deny `DELETE`, `TRUNCATE`, DDL, sequences,
+`youtube_upload_operations`. Grant no direct `UPDATE node_executions`.
+Implement and grant exact worker-principal YouTube claim/reserve and legal
+operation-transition functions with operation identity, node claim,
+registration epoch, database-clock margin, and allowed-column enforcement;
+grant no broad `UPDATE youtube_upload_operations`. Deny `DELETE`, `TRUNCATE`, DDL, sequences,
 `alembic_version`, all direct grant/registration table access, privileged role
 membership, and ownership. Use separate deploy-migrator and deploy-read
 credentials; neither may be mounted into workers.
 Create a separate non-owner orchestrator-control role. Grant it `EXECUTE` only
-on `vp_observe_worker_lease`, `vp_observe_worker_task_delivery`, and
-`vp_resolve_worker_event_authority_for_job_deletion`; exact `SELECT`/`INSERT`
-and state-column `UPDATE` on `worker_task_dispatches`,
+on the reviewed observer, proven-task ACK, cancelled-dispatch, registered-node
+recovery, and cleanup functions:
+`vp_observe_worker_lease`, `vp_observe_worker_task_delivery`,
+`vp_acknowledge_proven_worker_task_dispatch`,
+`vp_authorize_cancelled_worker_task_ack`,
+`vp_require_cancelled_worker_task_ack`,
+`vp_acknowledge_cancelled_worker_task`,
+`vp_recover_registered_worker_node`, and
+`vp_resolve_worker_event_authority_for_job_deletion`. Grant exact
+`SELECT`/`INSERT` and state-column `UPDATE` on `worker_task_dispatches`,
 `worker_task_delivery_attestations`,
 `registered_worker_event_receipts`, and
 `registered_worker_event_deliveries`; and the exact job, node execution,
@@ -425,9 +446,14 @@ task streams. Its explicit command allowlist includes stream consume/reclaim
 and ACK operations plus `EVAL`, `GET`, `SET`, and `XADD` for the reviewed
 idempotent dispatch script and `vp:worker-task-dispatch:*` keys. Deny broad key
 patterns and arbitrary scripts. Test marker recovery across Redis-success/
-database-failure windows. The script renews a 30-day marker TTL on each retry;
-once the database row is `delivered`, it is no longer retried and the marker
-expires naturally.
+database-failure windows. Require Redis `noeviction`, durable persistence, and
+restart readiness before admitting registered traffic. Mark the database row
+`attempting` before `EVAL`; the Lua marker has no TTL while a row can be
+pending, attempting, or uncertain. A missing marker after an attempt moves the
+row to `uncertain`, emits a hold/alert, and performs zero `XADD`. An explicit
+janitor may delete a marker only after exact database proof that the dispatch
+is delivered and resolved. Test concurrent reconcilers and operator repair;
+never allow expiry or eviction to mint a replacement stream message.
 Create a versioned non-owner operator `LOGIN` principal with exact `EXECUTE`
 on the five schema-qualified operator functions and no direct table or column
 read/write privileges. Exercise pending upsert, activation, grant revocation,
@@ -463,8 +489,9 @@ service/generation `LOGIN` role with a random password and no object ownership.
 Create the independent stable orchestrator-control role and the exact
 PostgreSQL/Redis grants above. Exercise a real receipt acceptance, concurrent
 duplicate alias, quarantine, dispatch reconcile, source/event ACK reconcile,
-and guarded job deletion under that role; do not substitute a table owner in
-these tests.
+cancel-before-delivery, cancel-after-delivery-before-claim, cleanup-versus-
+cancel lock contention, registration-aware startup recovery, and guarded job
+deletion under that role; do not substitute a table owner in these tests.
 Create pending grant through `public.vp_worker_grant_upsert` and credential
 state atomically with `umask 077`; create
 generation-scoped database URL and admission Swarm secrets from stdin without
