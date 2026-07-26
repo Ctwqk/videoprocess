@@ -59,15 +59,15 @@ def upgrade() -> None:
         ),
         sa.Column("acknowledged_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
-            "length(btrim(redis_stream)) > 0",
+            "length(trim(redis_stream)) > 0",
             name="ck_legacy_worker_event_resolution_stream_nonempty",
         ),
         sa.CheckConstraint(
-            "length(btrim(consumer_group)) > 0",
+            "length(trim(consumer_group)) > 0",
             name="ck_legacy_worker_event_resolution_group_nonempty",
         ),
         sa.CheckConstraint(
-            "length(btrim(message_id)) > 0",
+            "length(trim(message_id)) > 0",
             name="ck_legacy_worker_event_resolution_message_nonempty",
         ),
         sa.CheckConstraint(
@@ -87,7 +87,7 @@ def upgrade() -> None:
             name="ck_legacy_worker_event_resolution_reason",
         ),
         sa.CheckConstraint(
-            "length(btrim(operator_id)) > 0",
+            "length(trim(operator_id)) > 0",
             name="ck_legacy_worker_event_resolution_operator_nonempty",
         ),
         sa.CheckConstraint(

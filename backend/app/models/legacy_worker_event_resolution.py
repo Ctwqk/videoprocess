@@ -51,15 +51,15 @@ class LegacyWorkerEventResolution(UUIDPrimaryKeyMixin, Base):
             name="uq_legacy_worker_event_resolution_identity",
         ),
         CheckConstraint(
-            "length(btrim(redis_stream)) > 0",
+            "length(trim(redis_stream)) > 0",
             name="ck_legacy_worker_event_resolution_stream_nonempty",
         ),
         CheckConstraint(
-            "length(btrim(consumer_group)) > 0",
+            "length(trim(consumer_group)) > 0",
             name="ck_legacy_worker_event_resolution_group_nonempty",
         ),
         CheckConstraint(
-            "length(btrim(message_id)) > 0",
+            "length(trim(message_id)) > 0",
             name="ck_legacy_worker_event_resolution_message_nonempty",
         ),
         CheckConstraint(
@@ -75,7 +75,7 @@ class LegacyWorkerEventResolution(UUIDPrimaryKeyMixin, Base):
             name="ck_legacy_worker_event_resolution_reason",
         ),
         CheckConstraint(
-            "length(btrim(operator_id)) > 0",
+            "length(trim(operator_id)) > 0",
             name="ck_legacy_worker_event_resolution_operator_nonempty",
         ),
         CheckConstraint(
