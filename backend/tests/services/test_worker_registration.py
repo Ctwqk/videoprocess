@@ -7,7 +7,9 @@ import os
 import subprocess
 import sys
 import uuid
+from copy import deepcopy
 from dataclasses import fields, replace
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,6 +29,7 @@ from app.services.worker_registration import (
     WorkerRegistrationClaims,
     WorkerRegistrationError,
     WorkerRegistrationService,
+    _normalized_endpoint_bindings,
     dependency_fingerprints,
 )
 
@@ -57,6 +60,10 @@ ENDPOINT_BINDINGS = {
     for name, canonical in MINIO_FINGERPRINT_CASE["canonical"].items()
 }
 ENDPOINT_FINGERPRINTS = MINIO_FINGERPRINT_CASE["sha256"]
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"invalid JSON numeric constant: {value}")
 
 
 class MutableClock:
@@ -596,11 +603,23 @@ async def test_endpoint_canonicalization_matches_shared_fixture(
     case: dict[str, object],
 ) -> None:
     if "bindings_json" in case:
-        bindings = json.loads(case["bindings_json"])
+        if case.get("invalid_json"):
+            with pytest.raises(ValueError, match="invalid JSON numeric"):
+                json.loads(
+                    case["bindings_json"],
+                    parse_float=Decimal,
+                    parse_constant=_reject_json_constant,
+                )
+            return
+        bindings = json.loads(
+            case["bindings_json"],
+            parse_float=Decimal,
+            parse_constant=_reject_json_constant,
+        )
     else:
-        bindings = json.loads(json.dumps(ENDPOINT_BINDINGS))
+        bindings = deepcopy(ENDPOINT_BINDINGS)
     if "bindings" in case:
-        bindings = case["bindings"]
+        bindings = deepcopy(case["bindings"])
     elif "replace" in case:
         dependency, field_name, value = case["replace"]
         bindings[dependency][field_name] = value
@@ -608,24 +627,28 @@ async def test_endpoint_canonicalization_matches_shared_fixture(
         dependency, field_name, value = case["extra"]
         bindings[dependency][field_name] = value
 
+    if case["accepted"]:
+        normalized, _, fingerprints = _normalized_endpoint_bindings(bindings)
+        expected_bindings = {
+            name: json.loads(canonical)
+            for name, canonical in case["canonical"].items()
+        }
+        assert normalized == expected_bindings
+        assert fingerprints == case["sha256"]
+    else:
+        with pytest.raises(
+            WorkerRegistrationError,
+            match="claim_mismatch",
+        ):
+            _normalized_endpoint_bindings(bindings)
+        expected_bindings = ENDPOINT_BINDINGS
+        fingerprints = ENDPOINT_FINGERPRINTS
+
     await _grant(
         registration_store,
-        endpoint_bindings=bindings,
+        endpoint_bindings=expected_bindings,
     )
     service = _service(registration_store, MutableClock())
-    fingerprints = case.get("sha256")
-    if fingerprints is None:
-        fingerprints = {
-            name: hashlib.sha256(
-                json.dumps(
-                    identity,
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ).encode("utf-8")
-            ).hexdigest()
-            for name, identity in bindings.items()
-        }
     registration = service.register(
         _claims(
             endpoint_bindings=bindings,
@@ -645,6 +668,42 @@ async def test_endpoint_canonicalization_matches_shared_fixture(
             )
     else:
         await _assert_error("claim_mismatch", registration)
+
+
+@pytest.mark.parametrize(
+    "binary_float",
+    [
+        1.0,
+        float("5432.0000000000001"),
+    ],
+    ids=["integral", "precision-rounded"],
+)
+def test_endpoint_bindings_reject_every_binary_float(
+    binary_float: float,
+) -> None:
+    bindings = deepcopy(ENDPOINT_BINDINGS)
+    bindings["database"]["port"] = binary_float
+
+    with pytest.raises(WorkerRegistrationError, match="claim_mismatch"):
+        _normalized_endpoint_bindings(bindings)
+
+
+@pytest.mark.parametrize(
+    "nonfinite",
+    [
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+    ],
+)
+def test_endpoint_bindings_reject_nonfinite_decimal(
+    nonfinite: Decimal,
+) -> None:
+    bindings = deepcopy(ENDPOINT_BINDINGS)
+    bindings["redis"]["database"] = nonfinite
+
+    with pytest.raises(WorkerRegistrationError, match="claim_mismatch"):
+        _normalized_endpoint_bindings(bindings)
 
 
 @pytest.mark.parametrize(

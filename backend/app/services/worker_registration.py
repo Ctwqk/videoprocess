@@ -3,12 +3,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import math
 import re
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address
 from urllib.parse import unquote, urlsplit
@@ -805,25 +805,12 @@ def _registration_error(error: DBAPIError) -> WorkerRegistrationError:
     return WorkerRegistrationError("lease_fenced")
 
 
-def _normalized_json_object(
-    value: Mapping[str, object],
-) -> tuple[dict[str, object], str]:
-    if not isinstance(value, Mapping):
-        raise WorkerRegistrationError("claim_mismatch")
-    try:
-        canonical = _canonical_json(dict(value))
-        normalized = json.loads(canonical)
-    except (TypeError, ValueError) as error:
-        raise WorkerRegistrationError("claim_mismatch") from error
-    if not isinstance(normalized, dict):
-        raise WorkerRegistrationError("claim_mismatch")
-    return normalized, canonical
-
-
 def _normalized_endpoint_bindings(
     value: Mapping[str, object],
 ) -> tuple[dict[str, object], str, dict[str, str]]:
-    normalized, _ = _normalized_json_object(value)
+    if not isinstance(value, Mapping):
+        raise WorkerRegistrationError("claim_mismatch")
+    normalized = dict(value)
     if set(normalized) != {"database", "redis", "storage"}:
         raise WorkerRegistrationError("claim_mismatch")
     database = _validated_database_binding(normalized["database"])
@@ -949,7 +936,12 @@ def _integral_json_number(
 ) -> int:
     if type(value) is int:
         normalized = value
-    elif type(value) is float and math.isfinite(value) and value.is_integer():
+    elif (
+        isinstance(value, Decimal)
+        and value.is_finite()
+        and value == value.to_integral_value()
+        and minimum <= value <= maximum
+    ):
         normalized = int(value)
     else:
         raise WorkerRegistrationError("claim_mismatch")

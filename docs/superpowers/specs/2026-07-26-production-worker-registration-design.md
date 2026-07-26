@@ -235,12 +235,22 @@ Database identity deliberately excludes the login principal and credentials,
 so versioned runtime principals do not change the admitted database endpoint.
 
 Endpoint ports and the Redis database index use semantic JSON-number parity,
-not lexical integer spelling. Python and PostgreSQL accept finite JSON numeric
-values only when they are mathematically integral and within the field's
-range, then normalize them to an integer before canonical JSON serialization
-and SHA-256. Thus `1`, `1.0`, and `1e0` have one canonical identity. Booleans,
-non-integral numbers, NaN/infinity mapping values, invalid negatives, and
-out-of-range values are rejected.
+not lexical integer spelling. PostgreSQL accepts exact `jsonb` numeric values;
+Python accepts exact `int` values (but not booleans) and finite `Decimal`
+values. Both paths require the mathematical value to be integral and within
+the field's range, then normalize it to an integer before canonical JSON
+serialization and SHA-256. Thus exact `1`, `1.0`, and `1e0` inputs have one
+canonical identity. Python rejects every binary `float`, because its original
+JSON precision cannot be recovered. Booleans, non-integral numbers,
+NaN/infinity mapping values, invalid negatives, and out-of-range values are
+rejected.
+
+Any JSON trust boundary that feeds registration claims must preserve decimal
+and exponent tokens with `json.loads(..., parse_float=Decimal)` and reject
+non-standard numeric constants. Ordinary `json.loads` is not an acceptable
+security boundary for these claims because it creates binary floats. Normal
+production endpoint bindings are derived from environment configuration and
+already use exact integer ports and database indexes.
 
 The public lease service is PostgreSQL-only by default. A non-PostgreSQL ORM
 path requires an explicit test-only opt-in plus an injected principal resolver;

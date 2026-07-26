@@ -165,6 +165,11 @@
       "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":1e-1},\"redis\":{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}"
     },
     {
+      "name": "precision_nonintegral_port",
+      "accepted": false,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":1.0000000000000000000000000000000000001},\"redis\":{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}"
+    },
+    {
       "name": "port_zero",
       "accepted": false,
       "replace": ["database", "port", 0]
@@ -173,6 +178,11 @@
       "name": "port_too_large",
       "accepted": false,
       "replace": ["database", "port", 65536]
+    },
+    {
+      "name": "decimal_port_too_large",
+      "accepted": false,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":65536.0},\"redis\":{\"database\":3,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}"
     },
     {
       "name": "boolean_redis_database",
@@ -215,9 +225,19 @@
       "replace": ["redis", "database", -1]
     },
     {
+      "name": "decimal_negative_redis_database",
+      "accepted": false,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432},\"redis\":{\"database\":-1e0,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}"
+    },
+    {
       "name": "redis_database_too_large",
       "accepted": false,
       "replace": ["redis", "database", 2147483648]
+    },
+    {
+      "name": "decimal_redis_database_too_large",
+      "accepted": false,
+      "bindings_json": "{\"database\":{\"database\":\"videoprocess\",\"driver\":\"postgresql\",\"host\":\"vp-postgres-swarm\",\"port\":5432},\"redis\":{\"database\":2147483648.0,\"host\":\"vp-redis-swarm\",\"port\":6379,\"scheme\":\"redis\"},\"storage\":{\"backend\":\"not_applicable\"}}"
     },
     {
       "name": "nan_port",
