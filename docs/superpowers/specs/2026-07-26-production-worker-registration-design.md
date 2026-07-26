@@ -35,7 +35,7 @@ its first Redis command.
 
 Both the Go and Python workers already require PostgreSQL before processing a
 task. Each worker reads a service-specific Docker secret, registers directly
-in PostgreSQL, and renews a 45-second lease every 15 seconds. A registration
+in PostgreSQL, and renews a 180-second lease every 60 seconds. A registration
 epoch fences a replaced process.
 
 This adds no new always-on service and lets registration remain available
@@ -56,26 +56,28 @@ revocation. It is insufficient by itself.
 
 ## Identity And Credentials
 
-The deploy controller owns one persistent 256-bit random credential per
-managed worker service. Credentials live only in:
+The deploy controller issues one 256-bit random credential per managed worker
+service and release generation. Credentials live only in:
 
-- a mode `0600` state file below
+- a mode `0600` transactional state file below
   `$DEPLOY_GITHUB_SYNC_ROOT/state/vp-worker-admission/` on host 150;
-- a service-scoped Docker secret mounted at
+- a generation-scoped Docker secret mounted at
   `/run/secrets/vp-worker-admission-token`.
 
 Credentials are never placed in service environment variables, command
 arguments, logs, evidence, or database rows. PostgreSQL stores only SHA-256
 hashes.
 
-The deployment writes one active grant per service. A grant binds:
+The deployment writes one active grant per service generation. A grant binds:
 
 - exact Swarm service name;
+- exact 40-character release commit and deploy image;
 - worker type;
 - expected host identity;
 - required capabilities;
+- exact Redis stream/group and canonical non-secret endpoint bindings;
 - token hash;
-- enabled/revoked state.
+- pending/active/revoked state and issuer timestamps.
 
 The only production capability sets in this increment are:
 
@@ -84,21 +86,25 @@ The only production capability sets in this increment are:
 - `vp-vision-worker-swarm`: `vision_gpu`;
 - `vp-youtube-publisher-swarm`: `youtube_publisher`.
 
-The image is recorded by each registration from an exact deploy-injected image
-identity. The runtime watcher independently compares it with the actual Swarm
-service image. This preserves rollback while still detecting a false image
-claim.
+The runtime watcher independently compares the copied grant/image facts with
+the actual Swarm service image. Rollback receives a fresh generation and token
+bound to the prior image.
 
 ## Data Model
 
 ### `worker_admission_grants`
 
 - `id`: UUID primary key.
-- `service_name`: unique managed Swarm service.
+- `service_name` and monotonically increasing `generation`.
 - `worker_type`, `worker_host`: expected identity.
 - `capabilities_json`: sorted unique capability strings.
+- `release_commit`: exact 40-character Git commit.
+- `image_identity`: exact deploy image tag.
+- `redis_stream` and `redis_group`.
+- `endpoint_bindings_json`: canonical non-secret dependency identities.
 - `token_sha256`: unique 64-character lowercase hash.
-- `enabled`: admission switch.
+- `state`: `pending`, `active`, or `revoked`.
+- `issued_at`, `issued_by`, `activated_at`.
 - `revoked_at`, `revoke_reason`.
 - `created_at`, `updated_at`.
 
@@ -109,19 +115,20 @@ tokens never enter PostgreSQL.
 
 - `id`: UUID primary key.
 - `grant_id` and copied service/type/host/capability facts.
-- `worker_instance_id`: process-unique UUID.
+- `worker_instance_id`: process-unique UUID and fixed Swarm slot.
 - `redis_consumer_id`: exact consumer name used by Redis.
 - `image_identity`: exact `name:deploy-<12 hex>` image.
 - `database_fingerprint`, `redis_fingerprint`, `storage_fingerprint`: SHA-256
   hashes of canonical non-secret dependency identities.
 - `lease_epoch`: monotonically increasing per service.
+- `lease_secret_sha256`: registration-specific heartbeat credential.
 - `status`: `active`, `revoked`, or `expired`.
 - `registered_at`, `heartbeat_at`, `lease_expires_at`.
-- `revoked_at`, `revoke_reason`.
+- `revoked_at`, `revoke_reason`, `superseded_by`.
 
-Only one active registration per service is allowed. Registering a replacement
-locks the grant, revokes any prior active registration, advances the epoch, and
-inserts the replacement atomically.
+Only one active registration per service and slot is allowed. Registering a
+replacement grant generation locks the service, revokes any prior active
+registration, advances the epoch, and inserts the replacement atomically.
 
 No endpoint URL, database password, Redis password, MinIO credential, token,
 prompt, media metadata, or task payload is stored.
@@ -132,9 +139,9 @@ The shared semantic request contains:
 
 - service name, worker type, host, instance UUID, consumer ID;
 - exact sorted capabilities;
-- image identity;
+- release commit, image identity, Redis stream/group, and endpoint bindings;
 - three dependency fingerprints;
-- requested lease duration fixed at 45 seconds.
+- requested lease duration fixed at 180 seconds.
 
 Registration:
 
@@ -142,15 +149,18 @@ Registration:
 2. reads a bounded token file with restrictive permissions;
 3. opens PostgreSQL;
 4. locks and validates the matching grant and token hash;
-5. validates exact service/type/host/capability claims;
+5. validates exact service/type/host/capability/image/release/stream/group and
+   endpoint claims;
 6. revokes the old active service registration;
 7. inserts a new epoch and returns its ID and expiry.
 
 Any failure exits before Redis client construction, consumer-group creation,
 PEL reclaim, `XREADGROUP`, or event publication.
 
-Heartbeat runs every 15 seconds and extends the lease to 45 seconds only when
-registration ID, service, instance ID, epoch, status, and token still match.
+Registration returns a separate random lease secret whose hash is stored.
+Heartbeat runs every 60 seconds and extends the lease to 180 seconds only when
+registration ID, service, instance ID, epoch, status, and lease secret still
+match.
 Failure, revocation, or expiry cancels the worker context. In-flight work is
 cancelled and left pending without acknowledgement.
 
@@ -174,6 +184,18 @@ same environment produces identical hashes.
 
 ## Worker Lifecycle
 
+### Durable execution binding
+
+`node_executions` gains nullable `worker_registration_id` and
+`worker_lease_epoch`. Production task claim stores the current registration
+facts. Every artifact write, node completion/failure, event publication, and
+Redis acknowledgement rechecks that the same registration epoch is active and
+unexpired under the existing node execution authority lock. Lease loss leaves
+the delivery pending and cannot finalize a durable result.
+
+Historical node rows remain nullable and are not backfilled with invented
+registrations.
+
 ### Python workers
 
 Worker identity becomes process-unique rather than PID-only. Startup order is:
@@ -181,18 +203,20 @@ Worker identity becomes process-unique rather than PID-only. Startup order is:
 1. static admission;
 2. database configuration;
 3. durable registration;
-4. lease heartbeat task;
+4. 60-second lease heartbeat task;
 5. Redis client creation and group join;
 6. PEL recovery and consume loop.
 
 The heartbeat cancellation signal controls the consume loop and all spawned
-message tasks.
+message tasks. The YouTube submission fence and every durable completion path
+also require the exact registration epoch.
 
 ### Go ffmpeg worker
 
 The Go worker opens PostgreSQL and storage, creates its durable registration,
 starts heartbeat, and only then constructs or uses the Redis client. The
-registration context is the parent of the consumer context.
+registration context is the parent of the consumer context and the registration
+epoch is part of every durable node authority check.
 
 ## Deployment
 
@@ -202,16 +226,19 @@ deployment order becomes:
 1. API/frontend;
 2. backend migration service;
 3. verify migration head;
-4. ensure service credential state and Docker secrets;
-5. upsert exact grants through the new Python grant CLI;
+4. issue pending generation-scoped grants and Docker secrets;
+5. activate exact grants through the new Python grant CLI;
 6. update and verify the managed workers;
 7. continue runner and remaining service convergence.
 
 Each worker service receives:
 
 - `WORKER_SERVICE_NAME`;
+- `WORKER_RELEASE_COMMIT`;
 - `WORKER_IMAGE_IDENTITY`;
 - `WORKER_CAPABILITIES`;
+- `WORKER_REDIS_STREAM`;
+- `WORKER_REDIS_GROUP`;
 - `WORKER_ADMISSION_TOKEN_FILE`;
 - the service-scoped Docker secret.
 
@@ -223,9 +250,26 @@ deployment rollback path.
 Credential state is created only on host 150. Host 126 is never used for state,
 secret creation, grant writes, worker placement, readiness, or rollback.
 
+## Security Boundary And Follow-Up
+
+The stored functions are `SECURITY DEFINER`, set a fixed `search_path`, and
+revoke execution from `PUBLIC`. Production deployment must grant execution only
+to the worker runtime principal and keep direct table writes unavailable to that
+principal. If the existing shared database credential cannot satisfy that
+separation during this rollout, the preflight reports
+`worker_database_role_not_isolated` and this increment is not considered the
+complete T05 security boundary.
+
+This increment authenticates workers before Redis and continuously joins
+consumer observations to registrations. Redis ACL users scoped to each
+production namespace/stream remain a separate required T05 hardening increment.
+Until that increment is deployed, the registration guard and network placement
+are compensating controls; no unattended canary or soak is unlocked by
+registration alone.
+
 ## Unknown Consumer Guard
 
-The repository-owned watcher runs every five minutes. A registration guard
+The repository-owned watcher runs every minute. A registration guard
 queries each required Redis stream/group and compares every consumer name with
 an unexpired active registration and the actual expected service facts supplied
 by the Swarm watcher.
@@ -247,14 +291,16 @@ changes publication privacy.
 An absent worker with no Redis consumer is reported by existing service health
 checks and does not by itself trigger this global database mutation. A process
 that loses its lease exits; its remaining Redis consumer record becomes
-unknown and is caught within one watcher interval.
+unknown and is caught within one watcher interval. The five-minute requirement
+therefore has four minutes of detection margin.
 
 ## Failure Handling
 
 - missing/unsafe token file: worker exits before Redis;
 - missing, disabled, revoked, or mismatched grant: worker exits before Redis;
 - database outage at startup: worker exits before Redis;
-- heartbeat database outage: worker cancels and exits without ack;
+- heartbeat database outage: worker cancels and exits without durable write or
+  ack;
 - replacement registration: stale epoch heartbeat fails;
 - deployment grant/secret failure: service update is not attempted;
 - readiness mismatch: existing deployment rollback runs;
@@ -264,13 +310,15 @@ unknown and is caught within one watcher interval.
 
 ## Testing
 
-- PostgreSQL 16 migration, constraints, active-service uniqueness, and
-  concurrent takeover;
+- PostgreSQL 16 migration, constraints, active-service uniqueness, stored
+  registration functions, and concurrent takeover;
 - token hashing and no-secret persistence/logging;
 - exact claim validation and endpoint fingerprint fixtures in Python and Go;
 - Python startup ordering, heartbeat cancellation, revoke, and no Redis calls
   on denial;
 - vision storage admission and fingerprint requirements;
+- node claim/final-write/upload/event/XACK fencing against a lost registration
+  epoch;
 - Go startup ordering, heartbeat cancellation, epoch takeover, and no Redis
   calls on denial;
 - in-flight work is not acknowledged after lease loss;
@@ -278,15 +326,17 @@ unknown and is caught within one watcher interval.
   rollback, and 126 exclusion;
 - watcher unknown/expired/mismatched/duplicate consumer auto-hold and healthy
   no-write behavior;
-- five-minute managed cron contract;
+- one-minute managed cron and five-minute detection-SLO contract;
 - full backend, Go, race, frontend, deployment, canary preflight, and soak
   guard checks.
 
 ## Rollout
 
-The deployment first migrates and provisions grants while old workers continue
-under the existing safety controls. It then updates one worker service at a
-time and requires a healthy registration before proceeding.
+The deployment first migrates and issues pending grants while old workers
+continue under the existing safety controls. It then activates and updates one
+worker service at a time and requires a healthy registration before proceeding.
+Rollback issues a fresh generation and secret bound to the prior image; it
+never reactivates an old token.
 
 Before another canary, a read-only production audit must show:
 
