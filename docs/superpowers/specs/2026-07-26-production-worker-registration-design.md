@@ -72,6 +72,7 @@ The deployment writes one active grant per service generation. A grant binds:
 
 - exact Swarm service name;
 - exact 40-character release commit and deploy image;
+- exact versioned non-owner PostgreSQL login principal;
 - worker type;
 - expected host identity;
 - required capabilities;
@@ -100,6 +101,8 @@ bound to the prior image.
 - `capabilities_json`: sorted unique capability strings.
 - `release_commit`: exact 40-character Git commit.
 - `image_identity`: exact deploy image tag.
+- `database_principal`: exact PostgreSQL `session_user` expected for this
+  service generation.
 - `redis_stream` and `redis_group`.
 - `endpoint_bindings_json`: canonical non-secret dependency identities.
 - `token_sha256`: unique 64-character lowercase hash.
@@ -115,6 +118,8 @@ tokens never enter PostgreSQL.
 
 - `id`: UUID primary key.
 - `grant_id` and copied service/type/host/capability facts.
+- `database_principal`: PostgreSQL `session_user` observed by the registration
+  function.
 - `worker_instance_id`: process-unique UUID and fixed Swarm slot.
 - `redis_consumer_id`: exact consumer name used by Redis.
 - `image_identity`: exact `name:deploy-<12 hex>` image.
@@ -138,6 +143,7 @@ prompt, media metadata, or task payload is stored.
 The shared semantic request contains:
 
 - service name, worker type, host, instance UUID, consumer ID;
+- database principal observed from PostgreSQL `session_user`;
 - exact sorted capabilities;
 - release commit, image identity, Redis stream/group, and endpoint bindings;
 - three dependency fingerprints;
@@ -149,10 +155,12 @@ Registration:
 2. reads a bounded token file with restrictive permissions;
 3. opens PostgreSQL;
 4. locks and validates the matching grant and token hash;
-5. validates exact service/type/host/capability/image/release/stream/group and
-   endpoint claims;
-6. revokes the old active service registration;
-7. inserts a new epoch and returns its ID and expiry.
+5. rejects a superuser, table owner, or principal with direct write privileges
+   on the grant/registration tables;
+6. validates exact database principal, service/type/host/capability/image/
+   release/stream/group and endpoint claims;
+7. revokes the old active service registration;
+8. inserts a new epoch and returns its ID and expiry.
 
 Any failure exits before Redis client construction, consumer-group creation,
 PEL reclaim, `XREADGROUP`, or event publication.
@@ -226,10 +234,34 @@ deployment order becomes:
 1. API/frontend;
 2. backend migration service;
 3. verify migration head;
-4. issue pending generation-scoped grants and Docker secrets;
-5. activate exact grants through the new Python grant CLI;
-6. update and verify the managed workers;
-7. continue runner and remaining service convergence.
+4. create a versioned non-owner PostgreSQL login principal for each worker
+   service and mount its database URL as a Docker secret;
+5. issue pending generation-scoped grants and admission Docker secrets;
+6. activate exact grants through the new Python grant CLI;
+7. update and verify the managed workers;
+8. revoke the replaced login principals;
+9. continue runner and remaining service convergence.
+
+A stable `NOLOGIN` role owns this explicit worker privilege allowlist:
+
+- `SELECT` on `jobs`, `node_executions`, `artifacts`, `channel_profiles`,
+  `production_tasks`, `runtime_schedules`, and
+  `youtube_upload_operations`;
+- `INSERT` on `artifacts`, `runtime_schedules`, and
+  `youtube_upload_operations`;
+- `UPDATE` on `node_executions` and `youtube_upload_operations`;
+- `EXECUTE` on the four worker-registration functions.
+
+It receives no `DELETE`, `TRUNCATE`, DDL, sequence, `alembic_version`, grant-
+table, or registration-table privilege. Each service generation receives a
+fresh `LOGIN` role that inherits only that stable role. It is never a superuser,
+never owns application objects, has no privileged role membership, and has no
+direct grant/registration table reads or writes. Deployment does not use blanket
+table grants or default privileges.
+
+Schema migration/DCL uses the protected deploy-migrator credential. Migration
+head and readiness probes use a separate deploy-read credential. Neither
+credential is mounted into a worker.
 
 Each worker service receives:
 
@@ -239,8 +271,14 @@ Each worker service receives:
 - `WORKER_CAPABILITIES`;
 - `WORKER_REDIS_STREAM`;
 - `WORKER_REDIS_GROUP`;
+- `WORKER_DATABASE_URL_FILE`;
 - `WORKER_ADMISSION_TOKEN_FILE`;
+- a versioned service/generation database URL secret;
 - the service-scoped Docker secret.
+
+Production startup rejects a worker database URL supplied only through the
+Swarm environment. The worker reads the bounded mode `0400` secret before
+opening PostgreSQL. Local development may continue using `DATABASE_URL`.
 
 The controller verifies the running service has exactly the expected secret,
 identity variables, registration row, consumer ID, image, host, capabilities,
@@ -252,11 +290,11 @@ secret creation, grant writes, worker placement, readiness, or rollback.
 
 ## Security Boundary And Follow-Up
 
-The stored functions are `SECURITY DEFINER`, set a fixed `search_path`, and
-revoke execution from `PUBLIC`. Production deployment must grant execution only
-to the worker runtime principal and keep direct table writes unavailable to that
-principal. If the existing shared database credential cannot satisfy that
-separation during this rollout, the preflight reports
+The stored functions are `SECURITY DEFINER`, set a fixed `search_path`, use
+`session_user` for principal checks, and revoke execution from `PUBLIC`.
+Production deployment grants execution only to the stable worker runtime role
+and keeps direct registration-table writes unavailable to it. If the versioned
+principal cannot satisfy that separation during this rollout, the preflight reports
 `worker_database_role_not_isolated` and this increment is not considered the
 complete T05 security boundary.
 
@@ -313,6 +351,8 @@ therefore has four minutes of detection margin.
 - PostgreSQL 16 migration, constraints, active-service uniqueness, stored
   registration functions, and concurrent takeover;
 - token hashing and no-secret persistence/logging;
+- versioned non-owner database principals, secret-file-only production startup,
+  principal/grant binding, and direct registration-table denial;
 - exact claim validation and endpoint fingerprint fixtures in Python and Go;
 - Python startup ordering, heartbeat cancellation, revoke, and no Redis calls
   on denial;
@@ -336,7 +376,8 @@ The deployment first migrates and issues pending grants while old workers
 continue under the existing safety controls. It then activates and updates one
 worker service at a time and requires a healthy registration before proceeding.
 Rollback issues a fresh generation and secret bound to the prior image; it
-never reactivates an old token.
+never reactivates an old token. It also creates a fresh database login principal
+instead of reusing a prior generation's credential.
 
 Before another canary, a read-only production audit must show:
 
