@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -26,6 +27,7 @@ READY_STDOUT = (
 )
 MINIO_FAILURE_STDOUT = '{"code":"minio_unavailable","status":"failed"}\n'
 INVALID_ARGUMENTS_STDOUT = '{"code":"invalid_arguments","status":"failed"}\n'
+UNEXPECTED_FAILURE_STDOUT = '{"code":"unexpected_failure","status":"failed"}\n'
 
 
 def _payload(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
@@ -119,10 +121,7 @@ async def test_run_sanitizes_unexpected_exception(
     assert await cli.run([]) == 3
 
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {
-        "status": "failed",
-        "code": "unexpected_failure",
-    }
+    assert captured.out == UNEXPECTED_FAILURE_STDOUT
     assert captured.err == ""
     assert url not in captured.out + captured.err
     assert "password" not in captured.out + captured.err
@@ -138,7 +137,7 @@ def test_module_rejects_unknown_sensitive_arguments_without_leaking() -> None:
             "--unsupported",
             sensitive_url,
         ],
-        cwd="/Users/wenjieliu/videoprocess/backend",
+        cwd=Path(__file__).resolve().parents[2],
         check=False,
         capture_output=True,
         text=True,
