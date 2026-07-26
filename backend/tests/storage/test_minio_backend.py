@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import pytest
+from minio.error import S3Error
+
+from app.storage.minio_backend import MinioStorageBackend
+
+
+def _backend_with_client(client: object) -> MinioStorageBackend:
+    backend = object.__new__(MinioStorageBackend)
+    backend.client = client
+    backend.bucket = "videoprocess"
+    return backend
+
+
+def _s3_error(code: str) -> S3Error:
+    return S3Error(
+        response=object(),
+        code=code,
+        message="storage failure",
+        resource="health/deploy-readiness/probe",
+        request_id="request-id",
+        host_id="host-id",
+    )
+
+
+@pytest.mark.asyncio
+async def test_exists_returns_false_for_definitive_missing_object() -> None:
+    class MissingObjectClient:
+        def stat_object(self, bucket: str, path: str) -> None:
+            raise _s3_error("NoSuchKey")
+
+    backend = _backend_with_client(MissingObjectClient())
+
+    assert await backend.exists("health/deploy-readiness/probe") is False
+
+
+@pytest.mark.asyncio
+async def test_exists_propagates_transport_errors() -> None:
+    class FailingClient:
+        def stat_object(self, bucket: str, path: str) -> None:
+            raise OSError("network failure")
+
+    backend = _backend_with_client(FailingClient())
+
+    with pytest.raises(OSError, match="network failure"):
+        await backend.exists("health/deploy-readiness/probe")
+
+
+@pytest.mark.asyncio
+async def test_exists_propagates_non_missing_s3_errors() -> None:
+    class UnauthorizedClient:
+        def stat_object(self, bucket: str, path: str) -> None:
+            raise _s3_error("AccessDenied")
+
+    backend = _backend_with_client(UnauthorizedClient())
+
+    with pytest.raises(S3Error):
+        await backend.exists("health/deploy-readiness/probe")
+
+
+def test_missing_bucket_does_not_create_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    import minio
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.make_bucket_calls: list[str] = []
+
+        def bucket_exists(self, bucket: str) -> bool:
+            return False
+
+        def make_bucket(self, bucket: str) -> None:
+            self.make_bucket_calls.append(bucket)
+
+    client = FakeClient()
+    monkeypatch.setattr(minio, "Minio", lambda *args, **kwargs: client)
+
+    with pytest.raises(RuntimeError):
+        MinioStorageBackend(
+            endpoint="minio:9000",
+            access_key="access",
+            secret_key="secret",
+            bucket="videoprocess",
+            create_bucket=False,
+        )
+
+    assert client.make_bucket_calls == []
+
+
+def test_bucket_check_uncertainty_does_not_create_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minio
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.make_bucket_calls: list[str] = []
+
+        def bucket_exists(self, bucket: str) -> bool:
+            raise OSError("bucket check uncertain")
+
+        def make_bucket(self, bucket: str) -> None:
+            self.make_bucket_calls.append(bucket)
+
+    client = FakeClient()
+    monkeypatch.setattr(minio, "Minio", lambda *args, **kwargs: client)
+
+    with pytest.raises(OSError, match="bucket check uncertain"):
+        MinioStorageBackend(
+            endpoint="minio:9000",
+            access_key="access",
+            secret_key="secret",
+            bucket="videoprocess",
+            create_bucket=False,
+        )
+
+    assert client.make_bucket_calls == []
+
+
+def test_existing_constructor_still_creates_missing_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import minio
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.make_bucket_calls: list[str] = []
+
+        def bucket_exists(self, bucket: str) -> bool:
+            return False
+
+        def make_bucket(self, bucket: str) -> None:
+            self.make_bucket_calls.append(bucket)
+
+    client = FakeClient()
+    monkeypatch.setattr(minio, "Minio", lambda *args, **kwargs: client)
+
+    MinioStorageBackend(
+        endpoint="minio:9000",
+        access_key="access",
+        secret_key="secret",
+        bucket="videoprocess",
+    )
+
+    assert client.make_bucket_calls == ["videoprocess"]

@@ -25,6 +25,7 @@ class FakeStorageBackend(StorageBackend):
         self.save_error: Exception | None = None
         self.read_error: Exception | None = None
         self.delete_error: Exception | None = None
+        self.exists_error: Exception | None = None
         self.read_content: bytes | None = None
         self.keep_after_delete = False
 
@@ -54,6 +55,8 @@ class FakeStorageBackend(StorageBackend):
 
     async def exists(self, path: str) -> bool:
         self.exists_paths.append(path)
+        if self.exists_error is not None:
+            raise self.exists_error
         return path in self.objects
 
     def get_local_path(self, path: str) -> str | None:
@@ -163,6 +166,7 @@ async def test_scratch_mismatch_raises_stable_code_and_cleans_up(
         ("save_error", "minio_unavailable"),
         ("read_error", "minio_unavailable"),
         ("delete_error", "cleanup_failed"),
+        ("exists_error", "cleanup_failed"),
     ],
 )
 async def test_minio_operation_failure_has_stable_code_and_attempts_cleanup(
@@ -250,6 +254,63 @@ async def test_empty_storage_root_is_configuration_invalid() -> None:
     assert failure.value.code == "configuration_invalid"
 
 
+async def test_readiness_requests_minio_without_bucket_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_storage = FakeStorageBackend()
+    calls: list[tuple[str, bool]] = []
+
+    def get_storage_without_creation(name: str, *, create_bucket: bool) -> FakeStorageBackend:
+        calls.append((name, create_bucket))
+        return fake_storage
+
+    monkeypatch.setattr(
+        worker_storage_readiness, "get_storage", get_storage_without_creation
+    )
+
+    result = await probe_worker_storage(
+        {
+            "STORAGE_BACKEND": "minio",
+            "STORAGE_LOCAL_ROOT": str(tmp_path),
+        },
+        require_artifact_api=False,
+    )
+
+    assert result["status"] == "ready"
+    assert calls == [("minio", False)]
+
+
+@pytest.mark.parametrize(
+    "bucket_error", [RuntimeError("bucket missing"), OSError("bucket check uncertain")]
+)
+async def test_minio_bucket_setup_failure_is_unavailable_without_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bucket_error: Exception,
+) -> None:
+    calls: list[tuple[str, bool]] = []
+
+    def get_storage_without_creation(name: str, *, create_bucket: bool) -> FakeStorageBackend:
+        calls.append((name, create_bucket))
+        raise bucket_error
+
+    monkeypatch.setattr(
+        worker_storage_readiness, "get_storage", get_storage_without_creation
+    )
+
+    with pytest.raises(ReadinessFailure) as failure:
+        await probe_worker_storage(
+            {
+                "STORAGE_BACKEND": "minio",
+                "STORAGE_LOCAL_ROOT": str(tmp_path),
+            },
+            require_artifact_api=False,
+        )
+
+    assert failure.value.code == "minio_unavailable"
+    assert calls == [("minio", False)]
+
+
 def test_artifact_api_health_url_removes_api_prefix() -> None:
     assert (
         artifact_api_health_url("http://vp-api-swarm:8080/api/v1")
@@ -316,7 +377,23 @@ async def test_artifact_api_timeout_is_api_unavailable(tmp_path: Path) -> None:
     assert len(clients) == 1
 
 
-@pytest.mark.parametrize("base_url", ["not-a-url", "ftp://vp-api:8080/api/v1"])
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "not-a-url",
+        "ftp://vp-api:8080/api/v1",
+        "https://vp-api-swarm:8080/api/v1",
+        "http://api.example:8080/api/v1",
+        "http://10.0.0.126:8080/api/v1",
+        "http://CASPERs-Mac-mini:8080/api/v1",
+        "http://colima-swarmbridged:8080/api/v1",
+        "http://user:pass@vp-api-swarm:8080/api/v1",
+        "http://vp-api-swarm:9000/api/v1",
+        "http://vp-api-swarm:8080/api/v1?token=secret",
+        "http://vp-api-swarm:8080/api/v1#fragment",
+        "http://vp-api-swarm:8080/not-api-v1",
+    ],
+)
 async def test_invalid_artifact_api_base_url_is_api_unavailable(
     tmp_path: Path, base_url: str
 ) -> None:
@@ -332,6 +409,84 @@ async def test_invalid_artifact_api_base_url_is_api_unavailable(
 
     assert failure.value.code == "api_unavailable"
     assert clients == []
+
+
+async def test_scratch_failure_does_not_expose_exception_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def read_failed(path: Path) -> bytes:
+        raise OSError("scratch secret")
+
+    monkeypatch.setattr(worker_storage_readiness, "_read_scratch_probe", read_failed)
+
+    with pytest.raises(ReadinessFailure) as failure:
+        await probe_worker_storage(
+            {
+                "STORAGE_BACKEND": "minio",
+                "STORAGE_LOCAL_ROOT": str(tmp_path),
+            },
+            require_artifact_api=False,
+            storage=FakeStorageBackend(),
+        )
+
+    assert failure.value.code == "scratch_unavailable"
+    assert failure.value.__cause__ is None
+    assert failure.value.__context__ is None
+
+
+async def test_minio_failure_does_not_expose_exception_chain(tmp_path: Path) -> None:
+    fake_storage = FakeStorageBackend()
+    fake_storage.save_error = OSError("minio secret")
+
+    with pytest.raises(ReadinessFailure) as failure:
+        await probe_worker_storage(
+            {
+                "STORAGE_BACKEND": "minio",
+                "STORAGE_LOCAL_ROOT": str(tmp_path),
+            },
+            require_artifact_api=False,
+            storage=fake_storage,
+        )
+
+    assert failure.value.code == "minio_unavailable"
+    assert failure.value.__cause__ is None
+    assert failure.value.__context__ is None
+
+
+async def test_cleanup_failure_does_not_expose_exception_chain(tmp_path: Path) -> None:
+    fake_storage = FakeStorageBackend()
+    fake_storage.exists_error = OSError("cleanup secret")
+
+    with pytest.raises(ReadinessFailure) as failure:
+        await probe_worker_storage(
+            {
+                "STORAGE_BACKEND": "minio",
+                "STORAGE_LOCAL_ROOT": str(tmp_path),
+            },
+            require_artifact_api=False,
+            storage=fake_storage,
+        )
+
+    assert failure.value.code == "cleanup_failed"
+    assert failure.value.__cause__ is None
+    assert failure.value.__context__ is None
+
+
+async def test_api_failure_does_not_expose_exception_chain(tmp_path: Path) -> None:
+    clients, factory = _client_factory(error=httpx.ReadTimeout("api secret"))
+
+    with pytest.raises(ReadinessFailure) as failure:
+        await probe_worker_storage(
+            _api_env(tmp_path, "http://vp-api-swarm:8080/api/v1"),
+            require_artifact_api=True,
+            storage=FakeStorageBackend(),
+            http_client_factory=factory,
+        )
+
+    assert failure.value.code == "api_unavailable"
+    assert clients
+    assert failure.value.__cause__ is None
+    assert failure.value.__context__ is None
 
 
 async def test_artifact_api_is_not_constructed_when_not_required(tmp_path: Path) -> None:

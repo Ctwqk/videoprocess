@@ -7,7 +7,9 @@ from app.storage.local import LocalStorageBackend
 _backends: dict[str, StorageBackend] = {}
 
 
-def get_storage(backend_name: str | None = None) -> StorageBackend:
+def get_storage(
+    backend_name: str | None = None, *, create_bucket: bool = True
+) -> StorageBackend:
     selected = (backend_name or settings.storage_backend or "local").strip().lower()
     backend = _backends.get(selected)
     if backend is not None:
@@ -22,6 +24,7 @@ def get_storage(backend_name: str | None = None) -> StorageBackend:
             secret_key=settings.minio_secret_key,
             bucket=settings.minio_bucket,
             secure=settings.minio_secure,
+            create_bucket=create_bucket,
         )
     else:
         backend = LocalStorageBackend(root=settings.storage_local_root)

@@ -4,17 +4,22 @@ import io
 import os
 from typing import BinaryIO
 
+from minio.error import S3Error
+
 from app.storage.base import StorageBackend
 
 
 class MinioStorageBackend(StorageBackend):
     def __init__(self, endpoint: str, access_key: str, secret_key: str,
-                 bucket: str, secure: bool = False) -> None:
+                 bucket: str, secure: bool = False,
+                 create_bucket: bool = True) -> None:
         from minio import Minio
         self.client = Minio(endpoint, access_key=access_key,
                            secret_key=secret_key, secure=secure)
         self.bucket = bucket
         if not self.client.bucket_exists(bucket):
+            if not create_bucket:
+                raise RuntimeError("MinIO bucket is missing")
             self.client.make_bucket(bucket)
 
     async def save(self, path: str, data: BinaryIO) -> int:
@@ -50,8 +55,10 @@ class MinioStorageBackend(StorageBackend):
         try:
             await asyncio.to_thread(self.client.stat_object, self.bucket, path)
             return True
-        except Exception:
-            return False
+        except S3Error as exc:
+            if exc.code in {"NoSuchKey", "NoSuchObject"}:
+                return False
+            raise
 
     def get_local_path(self, path: str) -> str | None:
         return None  # MinIO has no local path
