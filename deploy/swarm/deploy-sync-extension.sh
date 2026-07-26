@@ -182,6 +182,34 @@ vp_require_service_node() {
   fi
 }
 
+vp_require_managed_worker_storage_ready() {
+  local service="$1"
+  local require_artifact_api="${2:-false}"
+  local containers
+  containers="$(
+    docker container ls \
+      --filter "label=com.docker.swarm.service.name=$service" \
+      --filter status=running \
+      --format '{{.ID}}'
+  )" || return 1
+  if [[ "$(printf '%s\n' "$containers" | awk 'NF { count++ } END { print count+0 }')" -ne 1 ]]; then
+    echo "managed worker storage readiness requires exactly one local running task: $service" >&2
+    return 1
+  fi
+  local args=(python -m app.channel_agent.worker_storage_readiness_cli)
+  if [[ "$require_artifact_api" == true ]]; then
+    args+=(--require-artifact-api)
+  elif [[ "$require_artifact_api" != false ]]; then
+    echo "invalid managed worker artifact API readiness mode" >&2
+    return 1
+  fi
+  if ! docker exec "$containers" "${args[@]}" >/dev/null; then
+    echo "managed worker storage readiness failed: $service" >&2
+    return 1
+  fi
+  log "managed worker storage readiness passed: $service"
+}
+
 vp_require_github_actions_success() {
   local repository="$1"
   local workflow="$2"
@@ -655,7 +683,9 @@ vp_deploy_python_worker() {
     done < <(vp_python_worker_env "$gpu_mode")
     docker "${create_args[@]}" "${create_env[@]}" "$image" >&2
   fi
-  swarm_service_running "$VP_PYTHON_WORKER_SERVICE"
+  swarm_service_running "$VP_PYTHON_WORKER_SERVICE" || return 1
+  vp_require_service_node "$VP_PYTHON_WORKER_SERVICE" "$VP_MANAGER_NODE" || return 1
+  vp_require_managed_worker_storage_ready "$VP_PYTHON_WORKER_SERVICE" false
 }
 
 vp_deploy_vision_worker() {
@@ -818,7 +848,8 @@ vp_deploy_vision_worker() {
     docker "${create_args[@]}" "${create_env[@]}" "$image" >&2 || return 1
   fi
   swarm_service_running "$VP_VISION_WORKER_SERVICE" || return 1
-  vp_require_service_node "$VP_VISION_WORKER_SERVICE" "$VP_MANAGER_NODE"
+  vp_require_service_node "$VP_VISION_WORKER_SERVICE" "$VP_MANAGER_NODE" || return 1
+  vp_require_managed_worker_storage_ready "$VP_VISION_WORKER_SERVICE" true
 }
 
 vp_retire_legacy_vision_worker() {
@@ -1052,6 +1083,8 @@ vp_deploy_publisher() {
     docker "${create_args[@]}" "${create_env[@]}" "$image" >&2 || return 1
   fi
   swarm_service_running "$VP_PUBLISHER_SERVICE" || return 1
+  vp_require_service_node "$VP_PUBLISHER_SERVICE" "$VP_MANAGER_NODE" || return 1
+  vp_require_managed_worker_storage_ready "$VP_PUBLISHER_SERVICE" false
 }
 
 vp_capture_app_snapshots() {

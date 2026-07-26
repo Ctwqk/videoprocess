@@ -168,7 +168,14 @@ MIGRATION_GATE_MODE=success
 VISION_CUTOVER_GATE_MODE=success
 VISION_CONSUMER_CUTOVER_MODE=success
 VISION_CONSUMER_AUDIT_MODE=converged
+GPU_TASK_NODE=ccttww-lap
 VISION_TASK_NODE=ccttww-lap
+PUBLISHER_TASK_NODE=ccttww-lap
+WORKER_READINESS_CONTAINER_MODE=normal
+FAIL_WORKER_READINESS_SERVICE=
+GPU_READINESS_CONTAINER_ID=1111111111111111111111111111111111111111111111111111111111111111
+VISION_READINESS_CONTAINER_ID=2222222222222222222222222222222222222222222222222222222222222222
+PUBLISHER_READINESS_CONTAINER_ID=3333333333333333333333333333333333333333333333333333333333333333
 
 printf() {
   if [[ "$FAIL_MANAGED_CRON_PRINTF" == "true" \
@@ -217,7 +224,13 @@ swarm_service_running() {
 }
 
 docker() {
-  printf 'docker|%s\n' "$*" >>"$CALLS"
+  if [[ "${1:-}" == "exec" ]]; then
+    printf 'docker'
+    printf '|%s' "$@"
+    printf '\n'
+  else
+    printf 'docker|%s\n' "$*"
+  fi >>"$CALLS"
   if [[ "${1:-}" == "run" \
     && "$*" == *"--env DATABASE_URL"* \
     && "$*" == *"SELECT version_num FROM alembic_version"* ]]; then
@@ -293,10 +306,73 @@ docker() {
       PUBLISHER_REPLICAS=1
     fi
   fi
-  if [[ "${1:-} ${2:-}" == "service ps" \
-    && "${3:-}" == "vp-vision-worker-swarm" ]]; then
-    printf '%s|Running 2 seconds ago\n' "$VISION_TASK_NODE"
+  if [[ "${1:-} ${2:-}" == "service ps" ]]; then
+    case "${3:-}" in
+      vp-ffmpeg-worker-gpu-swarm)
+        printf '%s|Running 2 seconds ago\n' "$GPU_TASK_NODE"
+        ;;
+      vp-vision-worker-swarm)
+        printf '%s|Running 2 seconds ago\n' "$VISION_TASK_NODE"
+        ;;
+      vp-youtube-publisher-swarm)
+        printf '%s|Running 2 seconds ago\n' "$PUBLISHER_TASK_NODE"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
     return 0
+  fi
+  if [[ "${1:-} ${2:-}" == "container ls" \
+    && "$*" == *'--filter label=com.docker.swarm.service.name='* ]]; then
+    if [[ "$*" != *'--filter status=running'* \
+      || "$*" != *'--format {{.ID}}'* ]]; then
+      return 1
+    fi
+    local readiness_service
+    local readiness_container_id
+    case "$*" in
+      *"label=com.docker.swarm.service.name=$VP_PYTHON_WORKER_SERVICE"*)
+        readiness_service="$VP_PYTHON_WORKER_SERVICE"
+        readiness_container_id="$GPU_READINESS_CONTAINER_ID"
+        ;;
+      *"label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE"*)
+        readiness_service="$VP_VISION_WORKER_SERVICE"
+        readiness_container_id="$VISION_READINESS_CONTAINER_ID"
+        ;;
+      *"label=com.docker.swarm.service.name=$VP_PUBLISHER_SERVICE"*)
+        readiness_service="$VP_PUBLISHER_SERVICE"
+        readiness_container_id="$PUBLISHER_READINESS_CONTAINER_ID"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    case "$WORKER_READINESS_CONTAINER_MODE" in
+      normal)
+        printf '%s\n' "$readiness_container_id"
+        ;;
+      missing)
+        ;;
+      duplicate)
+        printf '%s\n%s\n' "$readiness_container_id" "${readiness_container_id}duplicate"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    return 0
+  fi
+  if [[ "${1:-}" == "exec" \
+    && "${3:-} ${4:-} ${5:-}" == "python -m app.channel_agent.worker_storage_readiness_cli" ]]; then
+    case "${2:-}" in
+      "$GPU_READINESS_CONTAINER_ID") readiness_service="$VP_PYTHON_WORKER_SERVICE" ;;
+      "$VISION_READINESS_CONTAINER_ID") readiness_service="$VP_VISION_WORKER_SERVICE" ;;
+      "$PUBLISHER_READINESS_CONTAINER_ID") readiness_service="$VP_PUBLISHER_SERVICE" ;;
+      *) return 1 ;;
+    esac
+    [[ "$readiness_service" != "$FAIL_WORKER_READINESS_SERVICE" ]]
+    return
   fi
   if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
     if [[ "$FAIL_NETWORK_INSPECT" == "true" ]]; then
@@ -596,6 +672,32 @@ if [[ "$deploy_output" != "$VP_APP_SERVICES" ]]; then
   exit 1
 fi
 
+gpu_readiness_probe="docker|exec|$GPU_READINESS_CONTAINER_ID|python|-m|app.channel_agent.worker_storage_readiness_cli"
+vision_readiness_probe="docker|exec|$VISION_READINESS_CONTAINER_ID|python|-m|app.channel_agent.worker_storage_readiness_cli|--require-artifact-api"
+publisher_readiness_probe="docker|exec|$PUBLISHER_READINESS_CONTAINER_ID|python|-m|app.channel_agent.worker_storage_readiness_cli"
+for expected_readiness_call in \
+  "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PYTHON_WORKER_SERVICE --filter status=running --format {{.ID}}" \
+  "docker|container ls --filter label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE --filter status=running --format {{.ID}}" \
+  "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PUBLISHER_SERVICE --filter status=running --format {{.ID}}" \
+  "$gpu_readiness_probe" \
+  "$vision_readiness_probe" \
+  "$publisher_readiness_probe"; do
+  if ! grep -Fqx "$expected_readiness_call" "$CALLS"; then
+    echo "FAIL: missing managed worker storage readiness call: $expected_readiness_call" >&2
+    exit 1
+  fi
+done
+readiness_exec_calls="$(grep -F 'docker|exec|' "$CALLS" || true)"
+if [[ "$(printf '%s\n' "$readiness_exec_calls" | sed '/^$/d' | wc -l | tr -d ' ')" -ne 3 ]]; then
+  echo 'FAIL: managed worker storage readiness must execute exactly once per worker' >&2
+  exit 1
+fi
+if grep -Eq '10\.0\.0\.126|CASPERs-Mac-mini|colima-swarmbridged|test-access|test-secret|postgres(ql)?://' \
+  <<<"$readiness_exec_calls"; then
+  echo 'FAIL: managed worker storage readiness calls exposed a forbidden target or secret' >&2
+  exit 1
+fi
+
 vision_cutover_gate_line="$(
   grep -nF 'docker|run --rm' "$CALLS" \
     | grep -F 'runtime_schedules' \
@@ -685,6 +787,11 @@ vision_running_line="$(
     | head -1 \
     | cut -d: -f1
 )"
+vision_readiness_probe_line="$(
+  grep -nF "$vision_readiness_probe" "$CALLS" \
+    | head -1 \
+    | cut -d: -f1
+)"
 vision_consumer_cutover_line="$(
   grep -nF 'python -m app.services.vision_consumer_cutover' "$CALLS" \
     | head -1 \
@@ -693,14 +800,112 @@ vision_consumer_cutover_line="$(
 )"
 if [[ -z "$legacy_vision_remove_line" \
   || -z "$vision_running_line" \
+  || -z "$vision_readiness_probe_line" \
   || -z "$vision_consumer_cutover_line" \
   || "$vision_running_line" -ge "$legacy_vision_remove_line" \
+  || "$vision_readiness_probe_line" -ge "$legacy_vision_remove_line" \
   || "$legacy_vision_remove_line" -ge "$vision_consumer_cutover_line" ]]; then
-  echo 'FAIL: managed health, legacy retirement, and consumer reconciliation order is unsafe' >&2
+  echo 'FAIL: managed health/readiness, legacy retirement, and consumer reconciliation order is unsafe' >&2
   exit 1
 fi
 
 cp "$CALLS" "$TEST_ROOT/successful-vision-deploy-calls"
+
+assert_readiness_failure_calls_are_safe() {
+  local readiness_calls
+  readiness_calls="$(grep -E '^(docker\|(container ls|exec)|log\|managed worker storage readiness)' "$CALLS" || true)"
+  if grep -Eq '10\.0\.0\.126|CASPERs-Mac-mini|colima-swarmbridged|test-access|test-secret|postgres(ql)?://' \
+    <<<"$readiness_calls"; then
+    echo 'FAIL: readiness failure calls exposed a forbidden target or secret' >&2
+    exit 1
+  fi
+}
+
+assert_deploy_rejected_by_readiness() {
+  local name="$1"
+  : >"$CALLS"
+  GPU_SERVICE_EXISTS=true
+  VISION_SERVICE_EXISTS=true
+  PUBLISHER_SERVICE_EXISTS=true
+  LEGACY_VISION_CONTAINER_EXISTS=true
+  if deploy_vp_app_services \
+    "vp-api:worker-readiness-$name" \
+    "vp-frontend:worker-readiness-$name" \
+    "vp-backend-api:worker-readiness-$name" \
+    "vp-channelops-runner-go:worker-readiness-$name" \
+    "vp-ffmpeg-worker-go:worker-readiness-$name" \
+    "vp-ffmpeg-worker-python:worker-readiness-$name" >/dev/null 2>&1; then
+    echo "FAIL: $name worker storage readiness failure unexpectedly allowed deployment" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'log|VideoProcess service apply failed; restoring prior images without legacy placement' "$CALLS"; then
+    echo "FAIL: $name readiness failure did not trigger the existing deployment rollback" >&2
+    exit 1
+  fi
+  assert_readiness_failure_calls_are_safe
+}
+
+WORKER_READINESS_CONTAINER_MODE=missing
+FAIL_WORKER_READINESS_SERVICE=
+assert_deploy_rejected_by_readiness missing-container
+if grep -Fq 'docker|exec|' "$CALLS" \
+  || grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE" "$CALLS" \
+  || grep -Fq "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS"; then
+  echo 'FAIL: missing readiness container advanced past the GPU deployment gate' >&2
+  exit 1
+fi
+
+WORKER_READINESS_CONTAINER_MODE=duplicate
+assert_deploy_rejected_by_readiness duplicate-container
+if grep -Fq 'docker|exec|' "$CALLS" \
+  || grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE" "$CALLS" \
+  || grep -Fq "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS"; then
+  echo 'FAIL: duplicate readiness containers advanced past the GPU deployment gate' >&2
+  exit 1
+fi
+
+WORKER_READINESS_CONTAINER_MODE=normal
+for failed_readiness_service in \
+  "$VP_PYTHON_WORKER_SERVICE" \
+  "$VP_VISION_WORKER_SERVICE" \
+  "$VP_PUBLISHER_SERVICE"; do
+  FAIL_WORKER_READINESS_SERVICE="$failed_readiness_service"
+  assert_deploy_rejected_by_readiness "exec-${failed_readiness_service}"
+  case "$failed_readiness_service" in
+    "$VP_PYTHON_WORKER_SERVICE")
+      if grep -Fq "$vision_readiness_probe" "$CALLS" \
+        || grep -Fq "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS"; then
+        echo 'FAIL: GPU readiness execution failure advanced to vision retirement' >&2
+        exit 1
+      fi
+      ;;
+    "$VP_VISION_WORKER_SERVICE")
+      if grep -Fq "$publisher_readiness_probe" "$CALLS" \
+        || grep -Fq "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS"; then
+        echo 'FAIL: vision readiness execution failure advanced to retirement or publisher' >&2
+        exit 1
+      fi
+      ;;
+    "$VP_PUBLISHER_SERVICE")
+      if grep -Fq -- '--image vp-backend-api:worker-readiness-' "$CALLS"; then
+        echo 'FAIL: publisher readiness execution failure advanced to later managed services' >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+FAIL_WORKER_READINESS_SERVICE=
+
+: >"$CALLS"
+if vp_require_managed_worker_storage_ready "$VP_PYTHON_WORKER_SERVICE" invalid >/dev/null 2>&1; then
+  echo 'FAIL: invalid artifact API readiness mode unexpectedly succeeded' >&2
+  exit 1
+fi
+if ! grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PYTHON_WORKER_SERVICE" "$CALLS" \
+  || grep -Fq 'docker|exec|' "$CALLS"; then
+  echo 'FAIL: invalid artifact API readiness mode did not fail before probe execution' >&2
+  exit 1
+fi
 : >"$CALLS"
 LEGACY_VISION_CONTAINER_EXISTS=true
 LEGACY_VISION_PROJECT=unexpected-project

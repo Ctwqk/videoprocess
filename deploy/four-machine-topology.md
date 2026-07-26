@@ -124,6 +124,12 @@ and publisher services use their dedicated 150 labels plus
 independent PDS build and deploy entry points all run this topology gate before
 building an image or mutating a service.
 
+After every managed Python worker update, the deploy controller requires one
+local running Swarm task on `ccttww-lap` to pass scratch-volume and MinIO
+round trips. The vision worker also verifies artifact API reachability. A
+readiness failure rejects the release before legacy vision retirement, canary
+activation, or soak-watch activation.
+
 The scoped controller deploys `vp-app` and the in-repository
 `vp-feature-aggregator` project from this repository. PDS remains an
 independent repository and deploy project: a PDS change is deployed from its
