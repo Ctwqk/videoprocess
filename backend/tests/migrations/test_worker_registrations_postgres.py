@@ -13,6 +13,8 @@ from pathlib import Path
 import asyncpg
 import pytest
 from sqlalchemy import CheckConstraint, Index, UniqueConstraint
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -54,6 +56,31 @@ def _run_alembic(
         capture_output=True,
         check=False,
     )
+
+
+def _emitted_check_expression(sql: str, constraint_name: str) -> str:
+    marker = f"CONSTRAINT {constraint_name} CHECK ("
+    marker_index = sql.index(marker)
+    expression_start = marker_index + len(marker)
+    depth = 1
+    in_quote = False
+    index = expression_start
+    while index < len(sql):
+        character = sql[index]
+        if character == "'":
+            if in_quote and index + 1 < len(sql) and sql[index + 1] == "'":
+                index += 2
+                continue
+            in_quote = not in_quote
+        elif not in_quote:
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    return " ".join(sql[expression_start:index].split())
+        index += 1
+    raise AssertionError(f"unterminated CHECK constraint: {constraint_name}")
 
 
 def _database_url(database: str) -> str:
@@ -430,40 +457,28 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
         continuity_model.__table__.c.checked_count.server_default.arg.text
         == "0"
     )
-    continuity_checks = {
-        constraint.name: str(constraint.sqltext)
-        for constraint in continuity_model.__table__.constraints
-        if isinstance(constraint, CheckConstraint)
-    }
-    assert continuity_checks["ck_worker_redis_continuity_result"] == (
-        "((state = 'running' "
-        "AND reason_code = 'continuity_check_running' "
-        "AND redis_run_id IS NULL "
-        "AND checked_count = 0 "
-        "AND finished_at IS NULL) "
-        "OR (state = 'ready' "
-        "AND reason_code = 'ready' "
-        "AND length(trim(redis_run_id)) > 0 "
-        "AND expected_count = checked_count "
-        "AND finished_at IS NOT NULL) "
-        "OR (state = 'error' AND finished_at IS NOT NULL)) IS TRUE"
-    )
-    expectation_checks = {
-        constraint.name: str(constraint.sqltext)
-        for constraint in expectation_model.__table__.constraints
-        if isinstance(constraint, CheckConstraint)
-    }
-    assert expectation_checks[
-        "ck_worker_redis_continuity_expectation_observation"
-    ] == (
-        "((observed_message_id IS NULL "
-        "AND observed_payload_sha256 IS NULL "
-        "AND observed_by IS NULL AND observed_at IS NULL) "
-        "OR (length(trim(observed_message_id)) > 0 "
-        "AND observed_payload_sha256 ~ '^[0-9a-f]{64}$' "
-        "AND length(trim(observed_by)) > 0 "
-        "AND observed_at IS NOT NULL)) IS TRUE"
-    )
+    for model, constraint_name in (
+        (
+            continuity_model,
+            "ck_worker_redis_continuity_result",
+        ),
+        (
+            expectation_model,
+            "ck_worker_redis_continuity_expectation_observation",
+        ),
+    ):
+        orm_sql = str(
+            CreateTable(model.__table__).compile(
+                dialect=postgresql.dialect()
+            )
+        )
+        assert _emitted_check_expression(
+            sql,
+            constraint_name,
+        ) == _emitted_check_expression(
+            orm_sql,
+            constraint_name,
+        )
     assert {
         index.name
         for index in expectation_model.__table__.indexes

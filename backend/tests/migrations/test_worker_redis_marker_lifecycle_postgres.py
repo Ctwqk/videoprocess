@@ -1045,6 +1045,124 @@ async def test_postgres_16_observed_promotion_blocked_across_continuity_expiry_f
     not POSTGRES_URL,
     reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
 )
+async def test_postgres_16_observed_promotion_waiting_on_expectation_rechecks_expiry(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    prepared = await _seed_authority(
+        admin,
+        resolved=False,
+        prepared=True,
+    )
+    readiness = await _connect_control(marker_database, "readiness")
+    repair = await _connect_control(marker_database, "repair")
+    holder_transaction = None
+    promotion_task = None
+    try:
+        async with asyncio.timeout(15):
+            run_id = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                run_id,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                run_id,
+                prepared["emission_id"],
+                prepared["emission_message_id"],
+                prepared["emission_hash"],
+            )
+            lease_expires_at = await admin.fetchval(
+                """
+                UPDATE public.worker_redis_continuity_status
+                SET started_at =
+                        captured.now - interval '299 seconds',
+                    lease_expires_at =
+                        captured.now + interval '1 second'
+                FROM (SELECT clock_timestamp() AS now) AS captured
+                WHERE singleton
+                RETURNING lease_expires_at
+                """
+            )
+
+            holder_transaction = admin.transaction()
+            await holder_transaction.start()
+            assert await admin.fetchval(
+                """
+                SELECT true
+                FROM public.worker_redis_continuity_expectations
+                WHERE run_id = $1
+                  AND marker_kind = 'event_emission'
+                  AND source_id = $2
+                FOR UPDATE
+                """,
+                run_id,
+                prepared["emission_id"],
+            )
+            backend_pid = await repair.fetchval(
+                "SELECT pg_catalog.pg_backend_pid()"
+            )
+            promotion_task = asyncio.create_task(
+                repair.execute(
+                    """
+                    SELECT public.vp_promote_observed_worker_event_emission(
+                        $1, $2, $3
+                    )
+                    """,
+                    prepared["emission_id"],
+                    prepared["emission_message_id"],
+                    prepared["emission_hash"],
+                )
+            )
+            await _wait_until_backend_is_lock_blocked(admin, backend_pid)
+            sleep_seconds = max(
+                (
+                    lease_expires_at - datetime.now(timezone.utc)
+                ).total_seconds()
+                + 0.1,
+                0.1,
+            )
+            await asyncio.sleep(sleep_seconds)
+            await holder_transaction.commit()
+            holder_transaction = None
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_repair_observation_missing",
+            ):
+                await promotion_task
+            assert await admin.fetchval(
+                """
+                SELECT emission_state = 'prepared' AND message_id IS NULL
+                FROM public.worker_event_emissions
+                WHERE id = $1
+                """,
+                prepared["emission_id"],
+            )
+    finally:
+        if (
+            holder_transaction is not None
+            and admin.is_in_transaction()
+        ):
+            await holder_transaction.rollback()
+        if promotion_task is not None and not promotion_task.done():
+            promotion_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await promotion_task
+        await repair.close()
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
 async def test_postgres_16_restore_authorization_rejects_cleanup_covered_sources(
     marker_database,
 ) -> None:
@@ -1168,21 +1286,17 @@ async def test_postgres_16_cleanup_finalization_invalidates_restore_authorizatio
                 "vp_begin_worker_redis_continuity_check($1, 300)",
                 run_id,
             ) == "begun"
-            with pytest.raises(
-                asyncpg.RaiseError,
-                match="marker_observation_not_authorized",
-            ):
-                await readiness.execute(
-                    """
-                    SELECT public.vp_record_worker_redis_marker_observation(
-                        $1, 'event_emission', $2, $3, $4
-                    )
-                    """,
-                    run_id,
-                    resolved["emission_id"],
-                    resolved["emission_message_id"],
-                    resolved["emission_hash"],
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
                 )
+                """,
+                run_id,
+                resolved["emission_id"],
+                resolved["emission_message_id"],
+                resolved["emission_hash"],
+            )
             assert await admin.fetchval(
                 """
                 SELECT count(*)
@@ -1191,6 +1305,23 @@ async def test_postgres_16_cleanup_finalization_invalidates_restore_authorizatio
                 """,
                 resolved["emission_id"],
             ) == 0
+            cleanup = await admin.fetchrow(
+                """
+                SELECT authorization_state, claimed_by_run_id,
+                       claim_expires_at, finished_at, result_code
+                FROM public.worker_redis_marker_cleanup_authorizations
+                WHERE marker_kind = 'event_emission'
+                  AND source_id = $1
+                """,
+                resolved["emission_id"],
+            )
+            assert dict(cleanup) == {
+                "authorization_state": "pending",
+                "claimed_by_run_id": None,
+                "claim_expires_at": None,
+                "finished_at": None,
+                "result_code": None,
+            }
             observation = await admin.fetchrow(
                 """
                 SELECT observed_message_id, observed_payload_sha256,
@@ -1203,14 +1334,239 @@ async def test_postgres_16_cleanup_finalization_invalidates_restore_authorizatio
                 run_id,
                 resolved["emission_id"],
             )
-            assert dict(observation) == {
-                "observed_message_id": None,
-                "observed_payload_sha256": None,
-                "observed_by": None,
-                "observed_at": None,
-            }
+            assert observation["observed_message_id"] == resolved[
+                "emission_message_id"
+            ]
+            assert observation["observed_payload_sha256"] == resolved[
+                "emission_hash"
+            ]
+            assert observation["observed_by"] == marker_database[
+                "generation_roles"
+            ]["readiness"]
+            assert observation["observed_at"] is not None
     finally:
         await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_late_cached_restore_is_requeued_for_janitor_cleanup(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    resolved = await _seed_authority(admin, resolved=True)
+    suffix = marker_database["target_url"].split("@", 1)[1]
+    orchestrator_role = f"vp_late_restore_{uuid.uuid4().hex[:16]}"
+    orchestrator_password = uuid.uuid4().hex
+    await admin.execute(
+        f'CREATE ROLE "{ORCHESTRATOR_CONTROL_ROLE}" NOLOGIN NOINHERIT'
+    )
+    await admin.execute(
+        f'CREATE ROLE "{orchestrator_role}" LOGIN INHERIT '
+        f"PASSWORD '{orchestrator_password}'"
+    )
+    marker_database["extra_roles"].extend(
+        [ORCHESTRATOR_CONTROL_ROLE, orchestrator_role]
+    )
+    await admin.execute(
+        f'GRANT "{ORCHESTRATOR_CONTROL_ROLE}" TO "{orchestrator_role}"'
+    )
+    await admin.execute(
+        "GRANT EXECUTE ON FUNCTION public."
+        "vp_resolve_worker_event_authority_for_job_deletion(uuid) "
+        f'TO "{ORCHESTRATOR_CONTROL_ROLE}"'
+    )
+    orchestrator = await asyncpg.connect(
+        "postgresql://"
+        f"{orchestrator_role}:{orchestrator_password}@{suffix}"
+    )
+    repair = await _connect_control(marker_database, "repair")
+    janitor = await _connect_control(marker_database, "janitor")
+    readiness = await _connect_control(marker_database, "readiness")
+    try:
+        async with asyncio.timeout(15):
+            cached_evidence = await repair.fetchrow(
+                """
+                SELECT *
+                FROM public.vp_load_worker_redis_marker_repair(
+                    'authorize_restore_marker', $1
+                )
+                """,
+                resolved["emission_id"],
+            )
+            assert cached_evidence is not None
+            assert "payload_json" not in cached_evidence.keys()
+
+            await orchestrator.execute(
+                "SELECT public."
+                "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                resolved["job_id"],
+            )
+            first_janitor_run = uuid.uuid4()
+            claims = await janitor.fetch(
+                """
+                SELECT *
+                FROM public.vp_claim_worker_redis_marker_cleanup(
+                    $1, 10, 300
+                )
+                """,
+                first_janitor_run,
+            )
+            assert len(claims) == 2
+            for claim in claims:
+                assert await janitor.fetchval(
+                    """
+                    SELECT public.vp_finish_worker_redis_marker_cleanup(
+                        $1, $2, 'absent', 'marker_absent'
+                    )
+                    """,
+                    claim["id"],
+                    first_janitor_run,
+                )
+
+            continuity_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                continuity_run,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                continuity_run,
+                cached_evidence["source_id"],
+                cached_evidence["expected_message_id"],
+                cached_evidence["payload_sha256"],
+            )
+            expected_count = await admin.fetchval(
+                """
+                SELECT expected_count
+                FROM public.worker_redis_continuity_status
+                WHERE singleton
+                """
+            )
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_result_invalid",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_continuity_check(
+                        $1, 'ready', 'ready', 'redis-run', $2, $2
+                    )
+                    """,
+                    continuity_run,
+                    expected_count,
+                )
+            assert not await readiness.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_continuity_check(
+                    $1, 'error', 'late_cleanup_pending', NULL, $2, $2
+                )
+                """,
+                continuity_run,
+                expected_count,
+            )
+
+            restarted_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                restarted_run,
+            ) == "begun"
+            assert not await admin.fetchval(
+                """
+                SELECT absence_allowed
+                FROM public.worker_redis_continuity_expectations
+                WHERE run_id = $1
+                  AND marker_kind = 'event_emission'
+                  AND source_id = $2
+                """,
+                restarted_run,
+                resolved["emission_id"],
+            )
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                restarted_run,
+                cached_evidence["source_id"],
+                cached_evidence["expected_message_id"],
+                cached_evidence["payload_sha256"],
+            )
+            restarted_expected_count = await admin.fetchval(
+                """
+                SELECT expected_count
+                FROM public.worker_redis_continuity_status
+                WHERE singleton
+                """
+            )
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_result_invalid",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_continuity_check(
+                        $1, 'ready', 'ready', 'redis-restart', $2, $2
+                    )
+                    """,
+                    restarted_run,
+                    restarted_expected_count,
+                )
+
+            second_janitor_run = uuid.uuid4()
+            reclaimed = await janitor.fetch(
+                """
+                SELECT *
+                FROM public.vp_claim_worker_redis_marker_cleanup(
+                    $1, 10, 300
+                )
+                """,
+                second_janitor_run,
+            )
+            assert len(reclaimed) == 1
+            assert reclaimed[0]["source_id"] == resolved["emission_id"]
+            assert await janitor.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_marker_cleanup(
+                    $1, $2, 'deleted', 'late_marker_deleted'
+                )
+                """,
+                reclaimed[0]["id"],
+                second_janitor_run,
+            )
+            assert await admin.fetchval(
+                """
+                SELECT authorization_state = 'deleted'
+                FROM public.worker_redis_marker_cleanup_authorizations
+                WHERE marker_kind = 'event_emission'
+                  AND source_id = $1
+                """,
+                resolved["emission_id"],
+            )
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1 AND result_code = 'restored'
+                """,
+                resolved["emission_id"],
+            ) == 0
+    finally:
+        await readiness.close()
+        await janitor.close()
+        await repair.close()
+        await orchestrator.close()
 
 
 @pytest.mark.asyncio

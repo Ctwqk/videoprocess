@@ -972,6 +972,14 @@ BEGIN
             AND NEW.claimed_by_run_id = OLD.claimed_by_run_id
             AND NEW.claim_expires_at = OLD.claim_expires_at
         )
+        OR (
+            OLD.authorization_state IN ('deleted', 'absent')
+            AND NEW.authorization_state = 'pending'
+            AND NEW.claimed_by_run_id IS NULL
+            AND NEW.claim_expires_at IS NULL
+            AND NEW.finished_at IS NULL
+            AND NEW.result_code IS NULL
+        )
     )
     THEN
         RAISE EXCEPTION USING
@@ -7181,6 +7189,26 @@ BEGIN
             MESSAGE = 'worker_redis_continuity_result_invalid',
             ERRCODE = 'P0001';
     END IF;
+    IF p_result = 'ready'
+       AND EXISTS (
+            SELECT 1
+            FROM public.worker_redis_continuity_expectations AS expectation
+            JOIN public.worker_redis_marker_cleanup_authorizations AS cleanup
+              ON cleanup.marker_kind = expectation.marker_kind
+             AND cleanup.source_id = expectation.source_id
+             AND cleanup.marker_key = expectation.marker_key
+             AND cleanup.redis_stream = expectation.redis_stream
+             AND cleanup.expected_message_id =
+                    expectation.expected_message_id
+             AND cleanup.payload_sha256 = expectation.payload_sha256
+            WHERE expectation.run_id = p_run_id
+              AND expectation.observed_message_id IS NOT NULL
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_result_invalid',
+            ERRCODE = 'P0001';
+    END IF;
     IF p_result = 'ready' AND v_status.lease_expires_at <= v_now THEN
         RAISE EXCEPTION USING
             MESSAGE = 'worker_redis_continuity_run_expired',
@@ -7218,8 +7246,11 @@ DECLARE
     v_privileged boolean;
     v_expected_role oid;
     v_source_exists boolean;
+    v_cleanup_exists boolean;
     v_status public.worker_redis_continuity_status%ROWTYPE;
     v_expectation public.worker_redis_continuity_expectations%ROWTYPE;
+    v_cleanup
+        public.worker_redis_marker_cleanup_authorizations%ROWTYPE;
     v_authorization public.worker_redis_marker_repair_audits%ROWTYPE;
     v_now timestamptz;
 BEGIN
@@ -7248,35 +7279,17 @@ BEGIN
         FOR SHARE;
     END IF;
     v_source_exists := FOUND;
-    IF NOT v_source_exists
-       OR EXISTS (
-            SELECT 1
-            FROM public.worker_redis_marker_cleanup_authorizations AS cleanup
-            WHERE cleanup.marker_kind = p_marker_kind
-              AND cleanup.source_id = p_source_id
-       )
-    THEN
-        RAISE EXCEPTION USING
-            MESSAGE = 'marker_observation_not_authorized',
-            ERRCODE = 'P0001';
-    END IF;
     SELECT status.*
     INTO v_status
     FROM public.worker_redis_continuity_status AS status
     WHERE status.singleton
     FOR SHARE;
-    v_now := pg_catalog.clock_timestamp();
     IF NOT FOUND
        OR v_status.run_id IS DISTINCT FROM p_run_id
        OR v_status.state <> 'running'
     THEN
         RAISE EXCEPTION USING
             MESSAGE = 'worker_redis_continuity_run_mismatch',
-            ERRCODE = 'P0001';
-    END IF;
-    IF v_status.lease_expires_at <= v_now THEN
-        RAISE EXCEPTION USING
-            MESSAGE = 'worker_redis_continuity_run_expired',
             ERRCODE = 'P0001';
     END IF;
     SELECT expectation.*
@@ -7286,8 +7299,25 @@ BEGIN
       AND expectation.marker_kind = p_marker_kind
       AND expectation.source_id = p_source_id
     FOR UPDATE;
-    IF NOT FOUND
-       OR v_expectation.payload_sha256
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_observation_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    SELECT cleanup.*
+    INTO v_cleanup
+    FROM public.worker_redis_marker_cleanup_authorizations AS cleanup
+    WHERE cleanup.marker_kind = p_marker_kind
+      AND cleanup.source_id = p_source_id
+    FOR UPDATE;
+    v_cleanup_exists := FOUND;
+    v_now := pg_catalog.clock_timestamp();
+    IF v_status.lease_expires_at <= v_now THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_run_expired',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_expectation.payload_sha256
             IS DISTINCT FROM p_payload_sha256
        OR (
             v_expectation.expected_message_id IS NOT NULL
@@ -7297,6 +7327,54 @@ BEGIN
     THEN
         RAISE EXCEPTION USING
             MESSAGE = 'marker_observation_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_cleanup_exists THEN
+        IF v_cleanup.marker_key IS DISTINCT FROM v_expectation.marker_key
+           OR v_cleanup.redis_stream
+                IS DISTINCT FROM v_expectation.redis_stream
+           OR v_cleanup.expected_message_id
+                IS DISTINCT FROM v_expectation.expected_message_id
+           OR v_cleanup.payload_sha256
+                IS DISTINCT FROM v_expectation.payload_sha256
+           OR v_cleanup.authorization_state = 'conflict'
+        THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'marker_observation_not_authorized',
+                ERRCODE = 'P0001';
+        END IF;
+        IF v_expectation.observed_message_id IS NULL THEN
+            UPDATE public.worker_redis_continuity_expectations
+            SET observed_message_id = p_message_id,
+                observed_payload_sha256 = p_payload_sha256,
+                observed_by = v_principal,
+                observed_at = v_now
+            WHERE run_id = p_run_id
+              AND marker_key = v_expectation.marker_key;
+        ELSIF v_expectation.observed_message_id
+                    IS DISTINCT FROM p_message_id
+              OR v_expectation.observed_payload_sha256
+                    IS DISTINCT FROM p_payload_sha256
+              OR v_expectation.observed_by IS DISTINCT FROM v_principal
+        THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'marker_observation_mismatch',
+                ERRCODE = 'P0001';
+        END IF;
+        IF v_cleanup.authorization_state IN ('deleted', 'absent') THEN
+            UPDATE public.worker_redis_marker_cleanup_authorizations
+            SET authorization_state = 'pending',
+                claimed_by_run_id = NULL,
+                claim_expires_at = NULL,
+                finished_at = NULL,
+                result_code = NULL
+            WHERE id = v_cleanup.id;
+        END IF;
+        RETURN true;
+    END IF;
+    IF NOT v_source_exists THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_observation_not_authorized',
             ERRCODE = 'P0001';
     END IF;
     IF v_expectation.expected_message_id IS NULL THEN
@@ -7809,6 +7887,7 @@ DECLARE
     v_registration public.worker_registrations%ROWTYPE;
     v_status public.worker_redis_continuity_status%ROWTYPE;
     v_observation public.worker_redis_continuity_expectations%ROWTYPE;
+    v_observation_exists boolean;
     v_now timestamptz;
 BEGIN
     IF p_emission_id IS NULL
@@ -7930,8 +8009,7 @@ BEGIN
     FROM public.worker_redis_continuity_status AS status
     WHERE status.singleton
     FOR SHARE;
-    v_now := pg_catalog.clock_timestamp();
-    IF NOT FOUND OR v_status.lease_expires_at <= v_now THEN
+    IF NOT FOUND THEN
         RAISE EXCEPTION USING
             MESSAGE = 'marker_repair_observation_missing',
             ERRCODE = 'P0001';
@@ -7946,11 +8024,15 @@ BEGIN
       AND expectation.expected_message_id IS NULL
       AND expectation.observed_message_id = p_message_id
       AND expectation.observed_payload_sha256 = p_payload_sha256
-      AND expectation.observed_at
-            > v_now - interval '300 seconds'
-      AND expectation.observed_at <= v_status.lease_expires_at
     FOR SHARE OF expectation;
-    IF NOT FOUND THEN
+    v_observation_exists := FOUND;
+    v_now := pg_catalog.clock_timestamp();
+    IF NOT v_observation_exists
+       OR v_status.lease_expires_at <= v_now
+       OR v_observation.observed_at
+            <= v_now - interval '300 seconds'
+       OR v_observation.observed_at > v_status.lease_expires_at
+    THEN
         RAISE EXCEPTION USING
             MESSAGE = 'marker_repair_observation_missing',
             ERRCODE = 'P0001';
