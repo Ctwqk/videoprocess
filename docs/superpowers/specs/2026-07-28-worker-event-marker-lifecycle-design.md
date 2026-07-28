@@ -90,26 +90,37 @@ Rollback removes both the authorizations and the attempted cleanup.
 All functions are fixed-search-path `SECURITY DEFINER`, revoke `PUBLIC`, use
 `session_user`, and reject owners, superusers, and unexpected principals.
 
-- `vp_list_worker_redis_marker_expectations(cursor, limit)` returns current
+- `vp_list_worker_redis_marker_expectations(text, integer)` returns current
   event/dispatch marker expectations plus cleanup authorizations in stable
   order. It includes exact marker key, expected message ID, stream, payload
   hash, source state, and whether absence is allowed.
-- `vp_begin_worker_redis_continuity_check(run_id, max_run_seconds)` and
-  `vp_finish_worker_redis_continuity_check(...)` serialize checks and record a
-  singleton result visible to both worker hosts.
-- `vp_require_worker_redis_continuity(max_age_seconds)` returns only `ready`
+- `vp_begin_worker_redis_continuity_check(uuid, integer)` and
+  `vp_finish_worker_redis_continuity_check(uuid, text, text, text, bigint,
+  bigint)` serialize checks and record a singleton result visible to both
+  worker hosts.
+- `vp_require_worker_redis_continuity(integer)` returns only `ready`
   for the latest successful check no older than 90 seconds.
-- `vp_claim_worker_redis_marker_cleanup(run_id, limit, lease_seconds)` leases
+- `vp_claim_worker_redis_marker_cleanup(uuid, integer, integer)` leases
   only `pending` authorizations for 300 seconds.
-- `vp_finish_worker_redis_marker_cleanup(...)` accepts only the exact claimed
-  row and records `deleted`, `absent`, or `conflict`.
-- `vp_promote_observed_worker_event_emission(...)` changes `prepared` to
-  `emitted` only for the exact stored payload hash and observed Redis message
-  ID under the operator-control principal.
+- `vp_finish_worker_redis_marker_cleanup(uuid, uuid, text, text)` accepts only
+  the exact claimed row and records `deleted`, `absent`, or `conflict`.
+- `vp_load_worker_redis_marker_repair(text, uuid)` returns exact repair
+  evidence without direct table access.
+- `vp_promote_observed_worker_event_emission(uuid, text, text)` changes
+  `prepared` to `emitted` only for the exact stored payload hash and observed
+  Redis message ID under the operator-control principal.
 
 Workers receive only `EXECUTE` on
 `vp_require_worker_redis_continuity(90)`. Readiness, janitor, and repair
 principals receive only their named functions and no direct table access.
+
+`python -m app.services.worker_marker_control_role_cli provision|revoke`
+creates three stable NOLOGIN roles plus independent generation-scoped LOGIN
+roles. It reads the owner database URL only from a bounded mode-0400 file,
+writes three independent generation database URL files atomically with mode
+`0400`, and never prints credentials. Deployment creates Swarm secrets from
+those files through stdin. Rollback provisions and proves a fresh prior-image
+generation before revoking the failed roles and secrets.
 
 ### Continuity Readiness
 
