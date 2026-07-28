@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import hashlib
 import json
 import os
 import re
 import secrets
 import stat
-import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +32,8 @@ ROLE_FUNCTIONS = {
         "vp_begin_worker_redis_continuity_check(uuid,integer)",
         "vp_finish_worker_redis_continuity_check("
         "uuid,text,text,text,bigint,bigint)",
+        "vp_record_worker_redis_marker_observation("
+        "uuid,text,uuid,text,text)",
     ),
     "janitor": (
         "vp_claim_worker_redis_marker_cleanup(uuid,integer,integer)",
@@ -45,6 +47,7 @@ ROLE_FUNCTIONS = {
 MARKER_TABLES = (
     "worker_redis_marker_cleanup_authorizations",
     "worker_redis_continuity_status",
+    "worker_redis_continuity_expectations",
     "worker_redis_marker_repair_audits",
 )
 CREDENTIAL_FILENAMES = {
@@ -194,6 +197,10 @@ def _load_owner_database_url() -> str:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         descriptor = os.open(path, flags)
         try:
@@ -202,6 +209,9 @@ def _load_owner_database_url() -> str:
                 opened_stat.st_dev != file_stat.st_dev
                 or opened_stat.st_ino != file_stat.st_ino
                 or not stat.S_ISREG(opened_stat.st_mode)
+                or stat.S_IMODE(opened_stat.st_mode) != 0o400
+                or opened_stat.st_size < 1
+                or opened_stat.st_size > MAX_OWNER_URL_BYTES
             ):
                 raise MarkerControlOwnerURLFileError(
                     "owner URL file changed"
@@ -282,23 +292,28 @@ async def _provision(
                 )
         roles_created = True
 
-        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        generation_dir.mkdir(mode=0o700)
-        os.chmod(generation_dir, 0o700)
-        for purpose, path in paths.items():
+        role_urls = {}
+        for purpose in paths:
             role_url = _role_database_url(
                 owner_url,
                 names.versioned[purpose],
                 passwords[purpose],
             )
-            _atomic_write_secret(path, f"{role_url}\n")
-        _fsync_directory(generation_dir)
+            role_urls[purpose] = role_url
+        _write_generation_credentials(
+            state_dir,
+            generation,
+            role_urls,
+        )
     except BaseException:
-        _remove_generation_credentials(state_dir, generation)
+        try:
+            _remove_generation_credentials(state_dir, generation)
+        except MarkerControlRoleError:
+            pass
         if roles_created:
             try:
                 await _revoke_roles(connection, names)
-            except (asyncpg.PostgresError, OSError):
+            except (asyncpg.PostgresError, OSError, MarkerControlRoleError):
                 pass
         raise
     finally:
@@ -526,25 +541,117 @@ def _asyncpg_url(database_url: str) -> str:
     )
 
 
-def _atomic_write_secret(path: Path, value: str) -> None:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        dir=path.parent,
-    )
-    temporary_path = Path(temporary_name)
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _write_generation_credentials(
+    state_dir: Path,
+    generation: str,
+    role_urls: Mapping[str, str],
+) -> None:
+    role_names_for_generation(generation)
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
+        state_descriptor = os.open(state_dir, _directory_open_flags())
+    except OSError as exc:
+        raise MarkerControlRoleError("state directory invalid") from exc
+    try:
+        state_stat = os.fstat(state_descriptor)
+        if not stat.S_ISDIR(state_stat.st_mode):
+            raise MarkerControlRoleError("state directory invalid")
+        os.fchmod(state_descriptor, 0o700)
+        try:
+            os.mkdir(
+                generation,
+                mode=0o700,
+                dir_fd=state_descriptor,
+            )
+        except OSError as exc:
+            raise MarkerControlRoleError(
+                "generation directory invalid"
+            ) from exc
+        try:
+            generation_descriptor = os.open(
+                generation,
+                _directory_open_flags(),
+                dir_fd=state_descriptor,
+            )
+        except OSError as exc:
+            raise MarkerControlRoleError(
+                "generation directory invalid"
+            ) from exc
+        try:
+            generation_stat = os.fstat(generation_descriptor)
+            if not stat.S_ISDIR(generation_stat.st_mode):
+                raise MarkerControlRoleError(
+                    "generation directory invalid"
+                )
+            os.fchmod(generation_descriptor, 0o700)
+            for purpose, filename in CREDENTIAL_FILENAMES.items():
+                role_url = role_urls.get(purpose)
+                if not isinstance(role_url, str) or not role_url:
+                    raise MarkerControlRoleError(
+                        "generation credentials incomplete"
+                    )
+                _atomic_write_secret(
+                    generation_descriptor,
+                    filename,
+                    f"{role_url}\n",
+                )
+            os.fsync(generation_descriptor)
+            os.fsync(state_descriptor)
+        finally:
+            os.close(generation_descriptor)
+    finally:
+        os.close(state_descriptor)
+
+
+def _atomic_write_secret(
+    directory_descriptor: int,
+    filename: str,
+    value: str,
+) -> None:
+    temporary_name = f".{filename}.{secrets.token_hex(12)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            0o400,
+            dir_fd=directory_descriptor,
+        )
         os.fchmod(descriptor, 0o400)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
             handle.write(value)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
+        os.rename(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
     except BaseException:
-        try:
+        if descriptor >= 0:
             os.close(descriptor)
-        except OSError:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_descriptor)
+        except FileNotFoundError:
             pass
-        temporary_path.unlink(missing_ok=True)
         raise
 
 
@@ -552,25 +659,70 @@ def _remove_generation_credentials(
     state_dir: Path,
     generation: str,
 ) -> None:
-    generation_dir = state_dir / generation
-    for path in credential_paths(state_dir, generation).values():
-        path.unlink(missing_ok=True)
-    if generation_dir.is_dir():
-        for path in generation_dir.iterdir():
-            if path.name.startswith(".worker-marker-"):
-                path.unlink(missing_ok=True)
-        try:
-            generation_dir.rmdir()
-        except OSError:
-            pass
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    role_names_for_generation(generation)
     try:
-        os.fsync(descriptor)
+        state_descriptor = os.open(state_dir, _directory_open_flags())
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise MarkerControlRoleError("state directory invalid") from exc
+    try:
+        try:
+            generation_descriptor = os.open(
+                generation,
+                _directory_open_flags(),
+                dir_fd=state_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise MarkerControlRoleError(
+                "generation directory invalid"
+            ) from exc
+        try:
+            generation_stat = os.fstat(generation_descriptor)
+            if not stat.S_ISDIR(generation_stat.st_mode):
+                raise MarkerControlRoleError(
+                    "generation directory invalid"
+                )
+            for filename in CREDENTIAL_FILENAMES.values():
+                try:
+                    os.unlink(filename, dir_fd=generation_descriptor)
+                except FileNotFoundError:
+                    pass
+            temporary_prefixes = tuple(
+                f".{filename}."
+                for filename in CREDENTIAL_FILENAMES.values()
+            )
+            for filename in os.listdir(generation_descriptor):
+                if filename.startswith(temporary_prefixes):
+                    os.unlink(filename, dir_fd=generation_descriptor)
+            os.fsync(generation_descriptor)
+            path_stat = os.stat(
+                generation,
+                dir_fd=state_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                path_stat.st_dev != generation_stat.st_dev
+                or path_stat.st_ino != generation_stat.st_ino
+                or not stat.S_ISDIR(path_stat.st_mode)
+            ):
+                raise MarkerControlRoleError(
+                    "generation directory changed"
+                )
+        finally:
+            os.close(generation_descriptor)
+        try:
+            os.rmdir(generation, dir_fd=state_descriptor)
+        except OSError as exc:
+            if exc.errno not in {errno.ENOTEMPTY, errno.EEXIST}:
+                raise MarkerControlRoleError(
+                    "generation directory removal failed"
+                ) from exc
+        os.fsync(state_descriptor)
     finally:
-        os.close(descriptor)
+        os.close(state_descriptor)
 
 
 def _quote_identifier(identifier: str) -> str:

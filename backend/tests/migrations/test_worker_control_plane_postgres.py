@@ -33,6 +33,7 @@ POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_COMMIT = "0123456789abcdef0123456789abcdef01234567"
 IMAGE_IDENTITY = "vp-python-worker:deploy-0123456789ab"
+ORCHESTRATOR_CONTROL_ROLE = "vp_orchestrator_control_runtime"
 ENDPOINT_BINDINGS = {
     "database": {
         "database": "videoprocess",
@@ -103,6 +104,13 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
         await admin.execute(
             f'CREATE ROLE "{orchestrator_role}" LOGIN PASSWORD '
             f"'{orchestrator_password}'"
+        )
+        await admin.execute(
+            f'CREATE ROLE "{ORCHESTRATOR_CONTROL_ROLE}" NOLOGIN NOINHERIT'
+        )
+        await admin.execute(
+            f'GRANT "{ORCHESTRATOR_CONTROL_ROLE}" '
+            f'TO "{orchestrator_role}"'
         )
     finally:
         await admin.close()
@@ -603,7 +611,7 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                     "GRANT EXECUTE ON FUNCTION "
                     "public.vp_resolve_worker_event_authority_for_job_deletion("
                     "uuid) "
-                    f'TO "{orchestrator_role}"'
+                    f'TO "{ORCHESTRATOR_CONTROL_ROLE}"'
                 )
                 await admin.execute(
                     "GRANT EXECUTE ON FUNCTION "
@@ -2292,6 +2300,9 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
             await admin.execute(f'DROP ROLE IF EXISTS "{operator_role}"')
             await admin.execute(
                 f'DROP ROLE IF EXISTS "{orchestrator_role}"'
+            )
+            await admin.execute(
+                f'DROP ROLE IF EXISTS "{ORCHESTRATOR_CONTROL_ROLE}"'
             )
         finally:
             await admin.close()

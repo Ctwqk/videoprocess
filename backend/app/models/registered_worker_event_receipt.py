@@ -604,6 +604,7 @@ class WorkerRedisMarkerCleanupAuthorization(UUIDPrimaryKeyMixin, Base):
         String(16),
         nullable=False,
         default="pending",
+        server_default=text("'pending'"),
     )
     authorized_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -648,8 +649,7 @@ class WorkerRedisMarkerCleanupAuthorization(UUIDPrimaryKeyMixin, Base):
             name="ck_worker_redis_marker_cleanup_identity",
         ),
         CheckConstraint(
-            "length(payload_sha256) = 64 "
-            "AND lower(payload_sha256) = payload_sha256",
+            "payload_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_worker_redis_marker_cleanup_sha256",
         ),
         CheckConstraint(
@@ -671,6 +671,12 @@ class WorkerRedisMarkerCleanupAuthorization(UUIDPrimaryKeyMixin, Base):
             "AND finished_at IS NOT NULL AND result_code IS NOT NULL))",
             name="ck_worker_redis_marker_cleanup_claim",
         ),
+        Index(
+            "ix_worker_redis_marker_cleanup_claim",
+            "authorization_state",
+            "authorized_at",
+            "id",
+        ),
     )
 
 
@@ -681,6 +687,7 @@ class WorkerRedisContinuityStatus(Base):
         Boolean,
         primary_key=True,
         default=True,
+        server_default=text("true"),
     )
     run_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -696,13 +703,19 @@ class WorkerRedisContinuityStatus(Base):
         BigInteger,
         nullable=False,
         default=0,
+        server_default=text("0"),
     )
     checked_count: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,
         default=0,
+        server_default=text("0"),
     )
     started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    lease_expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
     )
@@ -724,14 +737,16 @@ class WorkerRedisContinuityStatus(Base):
             "length(trim(reason_code)) > 0 "
             "AND expected_count >= 0 "
             "AND checked_count >= 0 "
-            "AND checked_count <= expected_count",
+            "AND checked_count <= expected_count "
+            "AND lease_expires_at = "
+            "started_at + interval '300 seconds'",
             name="ck_worker_redis_continuity_counts",
         ),
         CheckConstraint(
             "((state = 'running' "
             "AND reason_code = 'continuity_check_running' "
             "AND redis_run_id IS NULL "
-            "AND expected_count = 0 AND checked_count = 0 "
+            "AND checked_count = 0 "
             "AND finished_at IS NULL) "
             "OR (state = 'ready' "
             "AND reason_code = 'ready' "
@@ -740,6 +755,91 @@ class WorkerRedisContinuityStatus(Base):
             "AND finished_at IS NOT NULL) "
             "OR (state = 'error' AND finished_at IS NOT NULL))",
             name="ck_worker_redis_continuity_result",
+        ),
+    )
+
+
+class WorkerRedisContinuityExpectation(Base):
+    __tablename__ = "worker_redis_continuity_expectations"
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+    )
+    marker_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    marker_key: Mapped[str] = mapped_column(
+        String(255),
+        primary_key=True,
+    )
+    redis_stream: Mapped[str] = mapped_column(String(255), nullable=False)
+    expected_message_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_state: Mapped[str] = mapped_column(String(64), nullable=False)
+    absence_allowed: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
+    observed_message_id: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    observed_payload_sha256: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    observed_by: Mapped[str | None] = mapped_column(
+        String(63),
+        nullable=True,
+    )
+    observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "marker_kind",
+            "source_id",
+            name="uq_worker_redis_continuity_expectation_source",
+        ),
+        CheckConstraint(
+            "marker_kind IN ('event_emission', 'task_dispatch')",
+            name="ck_worker_redis_continuity_expectation_kind",
+        ),
+        CheckConstraint(
+            "length(trim(marker_key)) > 0 "
+            "AND length(trim(redis_stream)) > 0 "
+            "AND length(trim(source_state)) > 0",
+            name="ck_worker_redis_continuity_expectation_identity",
+        ),
+        CheckConstraint(
+            "payload_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_worker_redis_continuity_expectation_sha256",
+        ),
+        CheckConstraint(
+            "((observed_message_id IS NULL "
+            "AND observed_payload_sha256 IS NULL "
+            "AND observed_by IS NULL AND observed_at IS NULL) "
+            "OR (length(trim(observed_message_id)) > 0 "
+            "AND observed_payload_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND length(trim(observed_by)) > 0 "
+            "AND observed_at IS NOT NULL))",
+            name="ck_worker_redis_continuity_expectation_observation",
+        ),
+        Index(
+            "ix_worker_redis_continuity_expectation_page",
+            "run_id",
+            "marker_key",
         ),
     )
 
@@ -766,7 +866,7 @@ class WorkerRedisMarkerRepairAudit(UUIDPrimaryKeyMixin, Base):
             name="ck_worker_redis_marker_repair_action",
         ),
         CheckConstraint(
-            "result_code IN ('restored', 'promoted')",
+            "result_code IN ('authorized', 'restored', 'promoted')",
             name="ck_worker_redis_marker_repair_result",
         ),
         CheckConstraint(

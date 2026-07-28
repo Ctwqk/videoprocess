@@ -12,7 +12,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import CheckConstraint, Index, UniqueConstraint
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -289,6 +289,7 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
     for table_name in (
         "worker_redis_marker_cleanup_authorizations",
         "worker_redis_continuity_status",
+        "worker_redis_continuity_expectations",
         "worker_redis_marker_repair_audits",
     ):
         assert f"CREATE TABLE {table_name}" in sql
@@ -317,6 +318,8 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
         "vp_begin_worker_redis_continuity_check(uuid,integer)",
         "vp_finish_worker_redis_continuity_check("
         "uuid,text,text,text,bigint,bigint)",
+        "vp_record_worker_redis_marker_observation("
+        "uuid,text,uuid,text,text)",
         "vp_require_worker_redis_continuity(integer)",
         "vp_claim_worker_redis_marker_cleanup(uuid,integer,integer)",
         "vp_finish_worker_redis_marker_cleanup(uuid,uuid,text,text)",
@@ -342,9 +345,15 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
         None,
     )
     continuity_model = getattr(models, "WorkerRedisContinuityStatus", None)
+    expectation_model = getattr(
+        models,
+        "WorkerRedisContinuityExpectation",
+        None,
+    )
     repair_model = getattr(models, "WorkerRedisMarkerRepairAudit", None)
     assert cleanup_model is not None
     assert continuity_model is not None
+    assert expectation_model is not None
     assert repair_model is not None
     expected_proof_columns = {
         "marker_kind",
@@ -365,6 +374,23 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
     }
     assert ("marker_kind", "source_id") in unique_columns
     assert ("marker_key",) in unique_columns
+    cleanup_checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in cleanup_model.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert cleanup_checks["ck_worker_redis_marker_cleanup_sha256"] == (
+        "payload_sha256 ~ '^[0-9a-f]{64}$'"
+    )
+    assert {
+        index.name
+        for index in cleanup_model.__table__.indexes
+        if isinstance(index, Index)
+    } >= {"ix_worker_redis_marker_cleanup_claim"}
+    assert (
+        cleanup_model.__table__.c.authorization_state.server_default.arg.text
+        == "'pending'"
+    )
     assert {
         "singleton",
         "run_id",
@@ -374,8 +400,41 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
         "expected_count",
         "checked_count",
         "started_at",
+        "lease_expires_at",
         "finished_at",
     } <= set(continuity_model.__table__.columns.keys())
+    assert {
+        "run_id",
+        "marker_kind",
+        "source_id",
+        "marker_key",
+        "redis_stream",
+        "expected_message_id",
+        "payload_sha256",
+        "source_state",
+        "absence_allowed",
+        "observed_message_id",
+        "observed_payload_sha256",
+        "observed_by",
+        "observed_at",
+    } <= set(expectation_model.__table__.columns.keys())
+    assert (
+        continuity_model.__table__.c.singleton.server_default.arg.text
+        == "true"
+    )
+    assert (
+        continuity_model.__table__.c.expected_count.server_default.arg.text
+        == "0"
+    )
+    assert (
+        continuity_model.__table__.c.checked_count.server_default.arg.text
+        == "0"
+    )
+    assert {
+        index.name
+        for index in expectation_model.__table__.indexes
+        if isinstance(index, Index)
+    } >= {"ix_worker_redis_continuity_expectation_page"}
     assert {
         "source_id",
         "action",
@@ -383,6 +442,18 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
         "principal",
         "created_at",
     } <= set(repair_model.__table__.columns.keys())
+    list_function_sql = sql.split(
+        "CREATE FUNCTION public.vp_list_worker_redis_marker_expectations",
+        1,
+    )[1].split("AS $function$", 1)[1].split("$function$", 1)[0]
+    repair_function_sql = sql.split(
+        "CREATE FUNCTION public.vp_load_worker_redis_marker_repair",
+        1,
+    )[1].split("AS $function$", 1)[1].split("$function$", 1)[0]
+    assert "payload_json" not in list_function_sql
+    assert "payload_json" not in repair_function_sql
+    assert "LIMIT 100" in repair_function_sql
+    assert "restore_marker_applied" not in repair_function_sql
 
     downgraded = _run_alembic(
         "postgresql+asyncpg://migration:unused@127.0.0.1:9/videoprocess",
@@ -397,6 +468,7 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
         for table_name in (
             "worker_redis_marker_cleanup_authorizations",
             "worker_redis_continuity_status",
+            "worker_redis_continuity_expectations",
             "worker_redis_marker_repair_audits",
         )
     )

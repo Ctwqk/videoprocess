@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -142,3 +144,62 @@ def test_credential_paths_are_generation_scoped_and_independent(
         ),
     }
     assert len(set(paths.values())) == 3
+
+
+def test_owner_url_file_mode_is_revalidated_after_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    owner_url_file = tmp_path / "owner-database-url"
+    owner_url_file.write_text(
+        "postgresql://postgres:postgres@127.0.0.1/videoprocess\n",
+        encoding="utf-8",
+    )
+    owner_url_file.chmod(0o400)
+    monkeypatch.setenv(
+        "WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE",
+        str(owner_url_file),
+    )
+    real_open = os.open
+
+    def change_mode_then_open(path, flags, *args, **kwargs):
+        if Path(path) == owner_url_file:
+            owner_url_file.chmod(0o600)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "open", change_mode_then_open)
+
+    with pytest.raises(module.MarkerControlOwnerURLFileError):
+        module._load_owner_database_url()
+
+
+def test_generation_cleanup_rejects_symlink_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir(mode=0o700)
+    generation = "release-1"
+    (state_dir / generation).symlink_to(
+        outside_dir,
+        target_is_directory=True,
+    )
+    protected_files = []
+    for filename in module.CREDENTIAL_FILENAMES.values():
+        path = outside_dir / filename
+        path.write_text("must-survive\n", encoding="utf-8")
+        protected_files.append(path)
+    temporary = outside_dir / ".worker-marker-repair-database-url.swap"
+    temporary.write_text("must-survive\n", encoding="utf-8")
+    protected_files.append(temporary)
+
+    with pytest.raises(module.MarkerControlRoleError):
+        module._remove_generation_credentials(state_dir, generation)
+
+    assert all(
+        path.read_text(encoding="utf-8") == "must-survive\n"
+        for path in protected_files
+    )
