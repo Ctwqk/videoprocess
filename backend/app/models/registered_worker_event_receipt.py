@@ -753,7 +753,7 @@ class WorkerRedisContinuityStatus(Base):
             "AND length(trim(redis_run_id)) > 0 "
             "AND expected_count = checked_count "
             "AND finished_at IS NOT NULL) "
-            "OR (state = 'error' AND finished_at IS NOT NULL))",
+            "OR (state = 'error' AND finished_at IS NOT NULL)) IS TRUE",
             name="ck_worker_redis_continuity_result",
         ),
     )
@@ -833,7 +833,7 @@ class WorkerRedisContinuityExpectation(Base):
             "OR (length(trim(observed_message_id)) > 0 "
             "AND observed_payload_sha256 ~ '^[0-9a-f]{64}$' "
             "AND length(trim(observed_by)) > 0 "
-            "AND observed_at IS NOT NULL))",
+            "AND observed_at IS NOT NULL)) IS TRUE",
             name="ck_worker_redis_continuity_expectation_observation",
         ),
         Index(

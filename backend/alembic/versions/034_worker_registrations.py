@@ -7217,6 +7217,7 @@ DECLARE
     v_principal text := session_user;
     v_privileged boolean;
     v_expected_role oid;
+    v_source_exists boolean;
     v_status public.worker_redis_continuity_status%ROWTYPE;
     v_expectation public.worker_redis_continuity_expectations%ROWTYPE;
     v_authorization public.worker_redis_marker_repair_audits%ROWTYPE;
@@ -7235,6 +7236,30 @@ BEGIN
             ERRCODE = 'P0001';
     END IF;
 {_marker_control_principal_guard_sql("vp_marker_readiness_runtime")}
+    IF p_marker_kind = 'event_emission' THEN
+        PERFORM 1
+        FROM public.worker_event_emissions AS emission
+        WHERE emission.id = p_source_id
+        FOR SHARE;
+    ELSE
+        PERFORM 1
+        FROM public.worker_task_dispatches AS dispatch
+        WHERE dispatch.id = p_source_id
+        FOR SHARE;
+    END IF;
+    v_source_exists := FOUND;
+    IF NOT v_source_exists
+       OR EXISTS (
+            SELECT 1
+            FROM public.worker_redis_marker_cleanup_authorizations AS cleanup
+            WHERE cleanup.marker_kind = p_marker_kind
+              AND cleanup.source_id = p_source_id
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_observation_not_authorized',
+            ERRCODE = 'P0001';
+    END IF;
     SELECT status.*
     INTO v_status
     FROM public.worker_redis_continuity_status AS status
@@ -7568,6 +7593,7 @@ DECLARE
     v_principal text := session_user;
     v_privileged boolean;
     v_expected_role oid;
+    v_source_exists boolean;
 BEGIN
     IF p_action NOT IN (
         'audit',
@@ -7667,6 +7693,30 @@ BEGIN
         ORDER BY candidate.marker_key, candidate.priority, candidate.source_id
         LIMIT 100;
     ELSE
+        PERFORM 1
+        FROM public.worker_event_emissions AS emission
+        WHERE emission.id = p_source_id
+        FOR SHARE;
+        v_source_exists := FOUND;
+        IF NOT v_source_exists THEN
+            PERFORM 1
+            FROM public.worker_task_dispatches AS dispatch
+            WHERE dispatch.id = p_source_id
+            FOR SHARE;
+            v_source_exists := FOUND;
+        END IF;
+        IF NOT v_source_exists
+           OR EXISTS (
+                SELECT 1
+                FROM public.worker_redis_marker_cleanup_authorizations
+                    AS cleanup
+                WHERE cleanup.source_id = p_source_id
+           )
+        THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'marker_repair_evidence_missing',
+                ERRCODE = 'P0001';
+        END IF;
         RETURN QUERY
         WITH candidates AS (
             SELECT
@@ -7702,19 +7752,6 @@ BEGIN
             FROM public.worker_task_dispatches AS dispatch
             WHERE dispatch.id = p_source_id
               AND dispatch.redis_message_id IS NOT NULL
-            UNION ALL
-            SELECT
-                3,
-                cleanup.marker_kind::text,
-                cleanup.source_id,
-                cleanup.marker_key::text,
-                cleanup.redis_stream::text,
-                cleanup.expected_message_id::text,
-                cleanup.payload_sha256::text,
-                cleanup.authorization_state::text
-            FROM public.worker_redis_marker_cleanup_authorizations
-                AS cleanup
-            WHERE cleanup.source_id = p_source_id
         )
         SELECT
             candidate.marker_kind,
@@ -7770,6 +7807,7 @@ DECLARE
     v_expected_role oid;
     v_emission public.worker_event_emissions%ROWTYPE;
     v_registration public.worker_registrations%ROWTYPE;
+    v_status public.worker_redis_continuity_status%ROWTYPE;
     v_observation public.worker_redis_continuity_expectations%ROWTYPE;
     v_now timestamptz;
 BEGIN
@@ -7887,22 +7925,30 @@ BEGIN
             MESSAGE = 'marker_repair_proof_mismatch',
             ERRCODE = 'P0001';
     END IF;
+    SELECT status.*
+    INTO v_status
+    FROM public.worker_redis_continuity_status AS status
+    WHERE status.singleton
+    FOR SHARE;
     v_now := pg_catalog.clock_timestamp();
+    IF NOT FOUND OR v_status.lease_expires_at <= v_now THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_observation_missing',
+            ERRCODE = 'P0001';
+    END IF;
     SELECT expectation.*
     INTO v_observation
     FROM public.worker_redis_continuity_expectations AS expectation
-    JOIN public.worker_redis_continuity_status AS status
-      ON status.run_id = expectation.run_id
-     AND status.singleton
     WHERE expectation.marker_kind = 'event_emission'
       AND expectation.source_id = p_emission_id
+      AND expectation.run_id = v_status.run_id
       AND expectation.source_state = 'prepared'
       AND expectation.expected_message_id IS NULL
       AND expectation.observed_message_id = p_message_id
       AND expectation.observed_payload_sha256 = p_payload_sha256
       AND expectation.observed_at
             > v_now - interval '300 seconds'
-      AND expectation.observed_at <= status.lease_expires_at
+      AND expectation.observed_at <= v_status.lease_expires_at
     FOR SHARE OF expectation;
     IF NOT FOUND THEN
         RAISE EXCEPTION USING

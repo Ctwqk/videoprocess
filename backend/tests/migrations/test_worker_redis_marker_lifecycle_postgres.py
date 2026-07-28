@@ -928,6 +928,296 @@ async def test_postgres_16_repair_promotion_requires_readiness_observation(
     not POSTGRES_URL,
     reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
 )
+async def test_postgres_16_observed_promotion_blocked_across_continuity_expiry_fails_closed(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    prepared = await _seed_authority(
+        admin,
+        resolved=False,
+        prepared=True,
+    )
+    readiness = await _connect_control(marker_database, "readiness")
+    repair = await _connect_control(marker_database, "repair")
+    lock_transaction = None
+    promotion_task = None
+    try:
+        async with asyncio.timeout(15):
+            run_id = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                run_id,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                run_id,
+                prepared["emission_id"],
+                prepared["emission_message_id"],
+                prepared["emission_hash"],
+            )
+
+            lock_transaction = admin.transaction()
+            await lock_transaction.start()
+            lease_expires_at = await admin.fetchval(
+                """
+                UPDATE public.worker_redis_continuity_status
+                SET started_at =
+                        captured.now - interval '299 seconds',
+                    lease_expires_at =
+                        captured.now + interval '1 second'
+                FROM (SELECT clock_timestamp() AS now) AS captured
+                WHERE singleton
+                RETURNING lease_expires_at
+                """
+            )
+            backend_pid = await repair.fetchval(
+                "SELECT pg_catalog.pg_backend_pid()"
+            )
+            promotion_task = asyncio.create_task(
+                repair.execute(
+                    """
+                    SELECT public.vp_promote_observed_worker_event_emission(
+                        $1, $2, $3
+                    )
+                    """,
+                    prepared["emission_id"],
+                    prepared["emission_message_id"],
+                    prepared["emission_hash"],
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not promotion_task.done()
+            await _wait_until_backend_is_lock_blocked(admin, backend_pid)
+            sleep_seconds = max(
+                (
+                    lease_expires_at - datetime.now(timezone.utc)
+                ).total_seconds()
+                + 0.1,
+                0.1,
+            )
+            await asyncio.sleep(sleep_seconds)
+            await lock_transaction.commit()
+            lock_transaction = None
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_repair_observation_missing",
+            ):
+                await promotion_task
+            emission = await admin.fetchrow(
+                """
+                SELECT emission_state, message_id
+                FROM public.worker_event_emissions
+                WHERE id = $1
+                """,
+                prepared["emission_id"],
+            )
+            assert dict(emission) == {
+                "emission_state": "prepared",
+                "message_id": None,
+            }
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1
+                """,
+                prepared["emission_id"],
+            ) == 0
+    finally:
+        if lock_transaction is not None and admin.is_in_transaction():
+            await lock_transaction.rollback()
+        if promotion_task is not None and not promotion_task.done():
+            promotion_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await promotion_task
+        await repair.close()
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_restore_authorization_rejects_cleanup_covered_sources(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    resolved = await _seed_authority(admin, resolved=True)
+    covered_sources = (
+        (
+            "event_emission",
+            resolved["emission_id"],
+            f"vp:worker-event-emission:{resolved['emission_id']}",
+            resolved["emission_stream"],
+            resolved["emission_message_id"],
+            resolved["emission_hash"],
+            "deleted",
+        ),
+        (
+            "task_dispatch",
+            resolved["dispatch_id"],
+            f"vp:worker-task-dispatch:{resolved['dispatch_key']}",
+            resolved["dispatch_stream"],
+            resolved["dispatch_message_id"],
+            resolved["dispatch_hash"],
+            "absent",
+        ),
+    )
+    await admin.executemany(
+        """
+        INSERT INTO public.worker_redis_marker_cleanup_authorizations (
+            marker_kind, source_id, marker_key, redis_stream,
+            expected_message_id, payload_sha256, authorization_state,
+            claimed_by_run_id, claim_expires_at, finished_at, result_code
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8,
+            clock_timestamp() + interval '300 seconds',
+            clock_timestamp(), 'cleanup_final'
+        )
+        """,
+        [
+            (*covered_source, uuid.uuid4())
+            for covered_source in covered_sources
+        ],
+    )
+    repair = await _connect_control(marker_database, "repair")
+    try:
+        async with asyncio.timeout(15):
+            for action in ("restore_marker", "authorize_restore_marker"):
+                for covered_source in covered_sources:
+                    with pytest.raises(
+                        asyncpg.RaiseError,
+                        match="marker_repair_evidence_missing",
+                    ):
+                        await repair.fetch(
+                            """
+                            SELECT *
+                            FROM public.vp_load_worker_redis_marker_repair(
+                                $1, $2
+                            )
+                            """,
+                            action,
+                            covered_source[1],
+                        )
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = ANY($1::uuid[])
+                """,
+                [source[1] for source in covered_sources],
+            ) == 0
+    finally:
+        await repair.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_cleanup_finalization_invalidates_restore_authorization(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    resolved = await _seed_authority(admin, resolved=True)
+    repair_principal = marker_database["generation_roles"]["repair"]
+    await admin.execute(
+        """
+        INSERT INTO public.worker_redis_marker_repair_audits (
+            source_id, action, result_code, principal
+        ) VALUES ($1, 'restore_marker', 'authorized', $2)
+        """,
+        resolved["emission_id"],
+        repair_principal,
+    )
+    await admin.execute(
+        """
+        INSERT INTO public.worker_redis_marker_cleanup_authorizations (
+            marker_kind, source_id, marker_key, redis_stream,
+            expected_message_id, payload_sha256, authorization_state,
+            claimed_by_run_id, claim_expires_at, finished_at, result_code
+        ) VALUES (
+            'event_emission', $1, $2, $3, $4, $5, 'deleted', $6,
+            clock_timestamp() + interval '300 seconds',
+            clock_timestamp(), 'cleanup_deleted'
+        )
+        """,
+        resolved["emission_id"],
+        f"vp:worker-event-emission:{resolved['emission_id']}",
+        resolved["emission_stream"],
+        resolved["emission_message_id"],
+        resolved["emission_hash"],
+        uuid.uuid4(),
+    )
+    readiness = await _connect_control(marker_database, "readiness")
+    try:
+        async with asyncio.timeout(15):
+            run_id = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                run_id,
+            ) == "begun"
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_observation_not_authorized",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_record_worker_redis_marker_observation(
+                        $1, 'event_emission', $2, $3, $4
+                    )
+                    """,
+                    run_id,
+                    resolved["emission_id"],
+                    resolved["emission_message_id"],
+                    resolved["emission_hash"],
+                )
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1 AND result_code = 'restored'
+                """,
+                resolved["emission_id"],
+            ) == 0
+            observation = await admin.fetchrow(
+                """
+                SELECT observed_message_id, observed_payload_sha256,
+                       observed_by, observed_at
+                FROM public.worker_redis_continuity_expectations
+                WHERE run_id = $1
+                  AND marker_kind = 'event_emission'
+                  AND source_id = $2
+                """,
+                run_id,
+                resolved["emission_id"],
+            )
+            assert dict(observation) == {
+                "observed_message_id": None,
+                "observed_payload_sha256": None,
+                "observed_by": None,
+                "observed_at": None,
+            }
+    finally:
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
 async def test_postgres_16_restore_success_requires_independent_observation(
     marker_database,
 ) -> None:

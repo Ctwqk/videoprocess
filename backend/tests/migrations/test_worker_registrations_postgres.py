@@ -430,6 +430,40 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
         continuity_model.__table__.c.checked_count.server_default.arg.text
         == "0"
     )
+    continuity_checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in continuity_model.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert continuity_checks["ck_worker_redis_continuity_result"] == (
+        "((state = 'running' "
+        "AND reason_code = 'continuity_check_running' "
+        "AND redis_run_id IS NULL "
+        "AND checked_count = 0 "
+        "AND finished_at IS NULL) "
+        "OR (state = 'ready' "
+        "AND reason_code = 'ready' "
+        "AND length(trim(redis_run_id)) > 0 "
+        "AND expected_count = checked_count "
+        "AND finished_at IS NOT NULL) "
+        "OR (state = 'error' AND finished_at IS NOT NULL)) IS TRUE"
+    )
+    expectation_checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in expectation_model.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert expectation_checks[
+        "ck_worker_redis_continuity_expectation_observation"
+    ] == (
+        "((observed_message_id IS NULL "
+        "AND observed_payload_sha256 IS NULL "
+        "AND observed_by IS NULL AND observed_at IS NULL) "
+        "OR (length(trim(observed_message_id)) > 0 "
+        "AND observed_payload_sha256 ~ '^[0-9a-f]{64}$' "
+        "AND length(trim(observed_by)) > 0 "
+        "AND observed_at IS NOT NULL)) IS TRUE"
+    )
     assert {
         index.name
         for index in expectation_model.__table__.indexes
