@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     JSON,
     BigInteger,
     CheckConstraint,
@@ -580,6 +581,197 @@ class WorkerTaskDispatch(UUIDPrimaryKeyMixin, Base):
                 "AND resolution_state IN "
                 "('unresolved', 'cancel_authorized')"
             ),
+        ),
+    )
+
+
+class WorkerRedisMarkerCleanupAuthorization(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "worker_redis_marker_cleanup_authorizations"
+
+    marker_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    marker_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    redis_stream: Mapped[str] = mapped_column(String(255), nullable=False)
+    expected_message_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    authorization_state: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="pending",
+    )
+    authorized_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    claimed_by_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=True,
+    )
+    claim_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    result_code: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "marker_kind",
+            "source_id",
+            name="uq_worker_redis_marker_cleanup_source",
+        ),
+        UniqueConstraint(
+            "marker_key",
+            name="uq_worker_redis_marker_cleanup_key",
+        ),
+        CheckConstraint(
+            "marker_kind IN ('event_emission', 'task_dispatch')",
+            name="ck_worker_redis_marker_cleanup_kind",
+        ),
+        CheckConstraint(
+            "length(trim(marker_key)) > 0 "
+            "AND length(trim(redis_stream)) > 0 "
+            "AND length(trim(expected_message_id)) > 0",
+            name="ck_worker_redis_marker_cleanup_identity",
+        ),
+        CheckConstraint(
+            "length(payload_sha256) = 64 "
+            "AND lower(payload_sha256) = payload_sha256",
+            name="ck_worker_redis_marker_cleanup_sha256",
+        ),
+        CheckConstraint(
+            "authorization_state IN "
+            "('pending', 'claimed', 'deleted', 'absent', 'conflict')",
+            name="ck_worker_redis_marker_cleanup_state",
+        ),
+        CheckConstraint(
+            "((authorization_state = 'pending' "
+            "AND claimed_by_run_id IS NULL AND claim_expires_at IS NULL "
+            "AND finished_at IS NULL AND result_code IS NULL) "
+            "OR (authorization_state = 'claimed' "
+            "AND claimed_by_run_id IS NOT NULL "
+            "AND claim_expires_at IS NOT NULL "
+            "AND finished_at IS NULL AND result_code IS NULL) "
+            "OR (authorization_state IN ('deleted', 'absent', 'conflict') "
+            "AND claimed_by_run_id IS NOT NULL "
+            "AND claim_expires_at IS NOT NULL "
+            "AND finished_at IS NOT NULL AND result_code IS NOT NULL))",
+            name="ck_worker_redis_marker_cleanup_claim",
+        ),
+    )
+
+
+class WorkerRedisContinuityStatus(Base):
+    __tablename__ = "worker_redis_continuity_status"
+
+    singleton: Mapped[bool] = mapped_column(
+        Boolean,
+        primary_key=True,
+        default=True,
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    redis_run_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    expected_count: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+    )
+    checked_count: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "(singleton) IS TRUE",
+            name="ck_worker_redis_continuity_singleton",
+        ),
+        CheckConstraint(
+            "state IN ('running', 'ready', 'error')",
+            name="ck_worker_redis_continuity_state",
+        ),
+        CheckConstraint(
+            "length(trim(reason_code)) > 0 "
+            "AND expected_count >= 0 "
+            "AND checked_count >= 0 "
+            "AND checked_count <= expected_count",
+            name="ck_worker_redis_continuity_counts",
+        ),
+        CheckConstraint(
+            "((state = 'running' "
+            "AND reason_code = 'continuity_check_running' "
+            "AND redis_run_id IS NULL "
+            "AND expected_count = 0 AND checked_count = 0 "
+            "AND finished_at IS NULL) "
+            "OR (state = 'ready' "
+            "AND reason_code = 'ready' "
+            "AND length(trim(redis_run_id)) > 0 "
+            "AND expected_count = checked_count "
+            "AND finished_at IS NOT NULL) "
+            "OR (state = 'error' AND finished_at IS NOT NULL))",
+            name="ck_worker_redis_continuity_result",
+        ),
+    )
+
+
+class WorkerRedisMarkerRepairAudit(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "worker_redis_marker_repair_audits"
+
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    result_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    principal: Mapped[str] = mapped_column(String(63), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('restore_marker', 'promote_prepared')",
+            name="ck_worker_redis_marker_repair_action",
+        ),
+        CheckConstraint(
+            "result_code IN ('restored', 'promoted')",
+            name="ck_worker_redis_marker_repair_result",
+        ),
+        CheckConstraint(
+            "length(trim(principal)) > 0",
+            name="ck_worker_redis_marker_repair_principal",
         ),
     )
 

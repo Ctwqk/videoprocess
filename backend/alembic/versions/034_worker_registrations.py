@@ -146,6 +146,31 @@ FINISH_STAGING_JANITOR_SIGNATURE = (
 STAGING_JANITOR_READINESS_SIGNATURE = (
     "public.vp_staging_janitor_readiness(integer,integer)"
 )
+LIST_REDIS_MARKER_EXPECTATIONS_SIGNATURE = (
+    "public.vp_list_worker_redis_marker_expectations(text,integer)"
+)
+BEGIN_REDIS_CONTINUITY_SIGNATURE = (
+    "public.vp_begin_worker_redis_continuity_check(uuid,integer)"
+)
+FINISH_REDIS_CONTINUITY_SIGNATURE = (
+    "public.vp_finish_worker_redis_continuity_check("
+    "uuid,text,text,text,bigint,bigint)"
+)
+REQUIRE_REDIS_CONTINUITY_SIGNATURE = (
+    "public.vp_require_worker_redis_continuity(integer)"
+)
+CLAIM_REDIS_MARKER_CLEANUP_SIGNATURE = (
+    "public.vp_claim_worker_redis_marker_cleanup(uuid,integer,integer)"
+)
+FINISH_REDIS_MARKER_CLEANUP_SIGNATURE = (
+    "public.vp_finish_worker_redis_marker_cleanup(uuid,uuid,text,text)"
+)
+LOAD_REDIS_MARKER_REPAIR_SIGNATURE = (
+    "public.vp_load_worker_redis_marker_repair(text,uuid)"
+)
+PROMOTE_OBSERVED_EVENT_EMISSION_SIGNATURE = (
+    "public.vp_promote_observed_worker_event_emission(uuid,text,text)"
+)
 
 
 def upgrade() -> None:
@@ -510,6 +535,7 @@ def upgrade() -> None:
     )
 
     _create_registered_event_receipt_tables()
+    _create_worker_redis_marker_tables()
     _create_staging_janitor_status()
     _upgrade_intermediate_artifact_cache()
     _create_receipt_immutability_trigger()
@@ -531,6 +557,7 @@ def upgrade() -> None:
     _create_proven_task_acknowledge_function()
     _create_cancelled_task_functions()
     _create_event_authority_cleanup_function()
+    _create_worker_redis_marker_functions()
     for signature in (
         REGISTER_SIGNATURE,
         HEARTBEAT_SIGNATURE,
@@ -570,6 +597,341 @@ def upgrade() -> None:
         STAGING_JANITOR_READINESS_SIGNATURE,
     ):
         op.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
+
+
+def _create_worker_redis_marker_tables() -> None:
+    op.create_table(
+        "worker_redis_marker_cleanup_authorizations",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column("marker_kind", sa.String(length=32), nullable=False),
+        sa.Column(
+            "source_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column("marker_key", sa.String(length=255), nullable=False),
+        sa.Column("redis_stream", sa.String(length=255), nullable=False),
+        sa.Column(
+            "expected_message_id",
+            sa.String(length=64),
+            nullable=False,
+        ),
+        sa.Column("payload_sha256", sa.String(length=64), nullable=False),
+        sa.Column(
+            "authorization_state",
+            sa.String(length=16),
+            server_default=sa.text("'pending'"),
+            nullable=False,
+        ),
+        sa.Column(
+            "authorized_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column(
+            "claimed_by_run_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "claim_expires_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column(
+            "finished_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.Column("result_code", sa.String(length=64), nullable=True),
+        sa.CheckConstraint(
+            "(marker_kind IN ('event_emission', 'task_dispatch')) IS TRUE",
+            name="ck_worker_redis_marker_cleanup_kind",
+        ),
+        sa.CheckConstraint(
+            "(length(trim(marker_key)) > 0 "
+            "AND length(trim(redis_stream)) > 0 "
+            "AND length(trim(expected_message_id)) > 0) IS TRUE",
+            name="ck_worker_redis_marker_cleanup_identity",
+        ),
+        sa.CheckConstraint(
+            "(payload_sha256 ~ '^[0-9a-f]{64}$') IS TRUE",
+            name="ck_worker_redis_marker_cleanup_sha256",
+        ),
+        sa.CheckConstraint(
+            "(authorization_state IN "
+            "('pending', 'claimed', 'deleted', 'absent', 'conflict')) "
+            "IS TRUE",
+            name="ck_worker_redis_marker_cleanup_state",
+        ),
+        sa.CheckConstraint(
+            "((authorization_state = 'pending' "
+            "AND claimed_by_run_id IS NULL AND claim_expires_at IS NULL "
+            "AND finished_at IS NULL AND result_code IS NULL) "
+            "OR (authorization_state = 'claimed' "
+            "AND claimed_by_run_id IS NOT NULL "
+            "AND claim_expires_at IS NOT NULL "
+            "AND finished_at IS NULL AND result_code IS NULL) "
+            "OR (authorization_state IN "
+            "('deleted', 'absent', 'conflict') "
+            "AND claimed_by_run_id IS NOT NULL "
+            "AND claim_expires_at IS NOT NULL "
+            "AND finished_at IS NOT NULL "
+            "AND result_code IS NOT NULL)) IS TRUE",
+            name="ck_worker_redis_marker_cleanup_claim",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "marker_kind",
+            "source_id",
+            name="uq_worker_redis_marker_cleanup_source",
+        ),
+        sa.UniqueConstraint(
+            "marker_key",
+            name="uq_worker_redis_marker_cleanup_key",
+        ),
+    )
+    op.create_index(
+        "ix_worker_redis_marker_cleanup_claim",
+        "worker_redis_marker_cleanup_authorizations",
+        ["authorization_state", "authorized_at", "id"],
+        unique=False,
+    )
+
+    op.create_table(
+        "worker_redis_continuity_status",
+        sa.Column(
+            "singleton",
+            sa.Boolean(),
+            server_default=sa.true(),
+            nullable=False,
+        ),
+        sa.Column(
+            "run_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column("state", sa.String(length=16), nullable=False),
+        sa.Column("reason_code", sa.String(length=64), nullable=False),
+        sa.Column("redis_run_id", sa.String(length=255), nullable=True),
+        sa.Column(
+            "expected_count",
+            sa.BigInteger(),
+            server_default=sa.text("0"),
+            nullable=False,
+        ),
+        sa.Column(
+            "checked_count",
+            sa.BigInteger(),
+            server_default=sa.text("0"),
+            nullable=False,
+        ),
+        sa.Column(
+            "started_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+        ),
+        sa.Column(
+            "finished_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+        sa.CheckConstraint(
+            "(singleton) IS TRUE",
+            name="ck_worker_redis_continuity_singleton",
+        ),
+        sa.CheckConstraint(
+            "(state IN ('running', 'ready', 'error')) IS TRUE",
+            name="ck_worker_redis_continuity_state",
+        ),
+        sa.CheckConstraint(
+            "(length(trim(reason_code)) > 0 "
+            "AND expected_count >= 0 "
+            "AND checked_count >= 0 "
+            "AND checked_count <= expected_count) IS TRUE",
+            name="ck_worker_redis_continuity_counts",
+        ),
+        sa.CheckConstraint(
+            "((state = 'running' "
+            "AND reason_code = 'continuity_check_running' "
+            "AND redis_run_id IS NULL "
+            "AND expected_count = 0 AND checked_count = 0 "
+            "AND finished_at IS NULL) "
+            "OR (state = 'ready' "
+            "AND reason_code = 'ready' "
+            "AND length(trim(redis_run_id)) > 0 "
+            "AND expected_count = checked_count "
+            "AND finished_at IS NOT NULL) "
+            "OR (state = 'error' "
+            "AND finished_at IS NOT NULL)) IS TRUE",
+            name="ck_worker_redis_continuity_result",
+        ),
+        sa.PrimaryKeyConstraint("singleton"),
+    )
+
+    op.create_table(
+        "worker_redis_marker_repair_audits",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "source_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=False,
+        ),
+        sa.Column("action", sa.String(length=32), nullable=False),
+        sa.Column("result_code", sa.String(length=64), nullable=False),
+        sa.Column("principal", sa.String(length=63), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "(action IN ('restore_marker', 'promote_prepared')) IS TRUE",
+            name="ck_worker_redis_marker_repair_action",
+        ),
+        sa.CheckConstraint(
+            "(result_code IN ('restored', 'promoted')) IS TRUE",
+            name="ck_worker_redis_marker_repair_result",
+        ),
+        sa.CheckConstraint(
+            "(length(trim(principal)) > 0) IS TRUE",
+            name="ck_worker_redis_marker_repair_principal",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    for table_name in (
+        "worker_redis_marker_cleanup_authorizations",
+        "worker_redis_continuity_status",
+        "worker_redis_marker_repair_audits",
+    ):
+        op.execute(f"REVOKE ALL ON TABLE public.{table_name} FROM PUBLIC")
+
+    op.execute(
+        """
+CREATE FUNCTION public.vp_enforce_worker_redis_marker_cleanup_immutability()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_cleanup_proof_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    IF ROW(
+        NEW.id,
+        NEW.marker_kind,
+        NEW.source_id,
+        NEW.marker_key,
+        NEW.redis_stream,
+        NEW.expected_message_id,
+        NEW.payload_sha256,
+        NEW.authorized_at
+    ) IS DISTINCT FROM ROW(
+        OLD.id,
+        OLD.marker_kind,
+        OLD.source_id,
+        OLD.marker_key,
+        OLD.redis_stream,
+        OLD.expected_message_id,
+        OLD.payload_sha256,
+        OLD.authorized_at
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_cleanup_proof_immutable',
+            ERRCODE = 'P0001';
+    END IF;
+    IF NOT (
+        (
+            OLD.authorization_state = 'pending'
+            AND NEW.authorization_state = 'claimed'
+        )
+        OR (
+            OLD.authorization_state = 'claimed'
+            AND NEW.authorization_state = 'claimed'
+            AND (
+                OLD.claimed_by_run_id = NEW.claimed_by_run_id
+                OR OLD.claim_expires_at <= pg_catalog.clock_timestamp()
+            )
+        )
+        OR (
+            OLD.authorization_state = 'claimed'
+            AND NEW.authorization_state IN ('deleted', 'absent', 'conflict')
+            AND NEW.claimed_by_run_id = OLD.claimed_by_run_id
+            AND NEW.claim_expires_at = OLD.claim_expires_at
+        )
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_cleanup_state_transition_invalid',
+            ERRCODE = 'P0001';
+    END IF;
+    RETURN NEW;
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE TRIGGER trg_worker_redis_marker_cleanup_immutability
+BEFORE UPDATE OR DELETE
+ON public.worker_redis_marker_cleanup_authorizations
+FOR EACH ROW
+EXECUTE FUNCTION
+    public.vp_enforce_worker_redis_marker_cleanup_immutability()
+"""
+    )
+    op.execute(
+        "REVOKE ALL ON FUNCTION "
+        "public.vp_enforce_worker_redis_marker_cleanup_immutability() "
+        "FROM PUBLIC"
+    )
+    op.execute(
+        """
+CREATE FUNCTION public.vp_enforce_worker_redis_marker_repair_audit_append_only()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+    RAISE EXCEPTION USING
+        MESSAGE = 'marker_repair_audit_append_only',
+        ERRCODE = 'P0001';
+END;
+$function$
+"""
+    )
+    op.execute(
+        """
+CREATE TRIGGER trg_worker_redis_marker_repair_audit_append_only
+BEFORE UPDATE OR DELETE
+ON public.worker_redis_marker_repair_audits
+FOR EACH ROW
+EXECUTE FUNCTION
+    public.vp_enforce_worker_redis_marker_repair_audit_append_only()
+"""
+    )
+    op.execute(
+        "REVOKE ALL ON FUNCTION "
+        "public.vp_enforce_worker_redis_marker_repair_audit_append_only() "
+        "FROM PUBLIC"
+    )
 
 
 def _create_staging_janitor_status() -> None:
@@ -3130,7 +3492,10 @@ def _principal_guard_sql() -> str:
             WHERE namespace.nspname = 'public'
               AND relation.relname IN (
                   'worker_admission_grants',
-                  'worker_registrations'
+                  'worker_registrations',
+                  'worker_redis_marker_cleanup_authorizations',
+                  'worker_redis_continuity_status',
+                  'worker_redis_marker_repair_audits'
               )
               AND relation.relowner = role.oid
            )
@@ -3144,6 +3509,21 @@ def _principal_guard_sql() -> str:
                'public.worker_registrations',
                'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
            )
+           OR pg_catalog.has_table_privilege(
+               role.oid,
+               'public.worker_redis_marker_cleanup_authorizations',
+               'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+           )
+           OR pg_catalog.has_table_privilege(
+               role.oid,
+               'public.worker_redis_continuity_status',
+               'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+           )
+           OR pg_catalog.has_table_privilege(
+               role.oid,
+               'public.worker_redis_marker_repair_audits',
+               'SELECT,INSERT,UPDATE,DELETE,TRUNCATE'
+           )
            OR pg_catalog.has_any_column_privilege(
                role.oid,
                'public.worker_admission_grants',
@@ -3152,6 +3532,21 @@ def _principal_guard_sql() -> str:
            OR pg_catalog.has_any_column_privilege(
                role.oid,
                'public.worker_registrations',
+               'SELECT,INSERT,UPDATE,REFERENCES'
+           )
+           OR pg_catalog.has_any_column_privilege(
+               role.oid,
+               'public.worker_redis_marker_cleanup_authorizations',
+               'SELECT,INSERT,UPDATE,REFERENCES'
+           )
+           OR pg_catalog.has_any_column_privilege(
+               role.oid,
+               'public.worker_redis_continuity_status',
+               'SELECT,INSERT,UPDATE,REFERENCES'
+           )
+           OR pg_catalog.has_any_column_privilege(
+               role.oid,
+               'public.worker_redis_marker_repair_audits',
                'SELECT,INSERT,UPDATE,REFERENCES'
            )
     )
@@ -3164,6 +3559,29 @@ def _principal_guard_sql() -> str:
             ERRCODE = 'P0001';
     END IF;
 """
+
+
+def _marker_control_principal_guard_sql(expected_role: str) -> str:
+    return (
+        _principal_guard_sql()
+        + f"""
+    v_expected_role := pg_catalog.to_regrole('{expected_role}');
+    IF v_expected_role IS NULL
+       OR NOT COALESCE(
+            pg_catalog.pg_has_role(
+                v_principal,
+                v_expected_role,
+                'MEMBER'
+            ),
+            false
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_control_principal_unauthorized',
+            ERRCODE = 'P0001';
+    END IF;
+"""
+    )
 
 
 def _create_heartbeat_function() -> None:
@@ -6178,6 +6596,131 @@ BEGIN
             ERRCODE = 'P0001';
     END IF;
 
+    -- Cleanup authorization is always last in the global authority order.
+    PERFORM 1
+    FROM public.worker_redis_marker_cleanup_authorizations AS cleanup
+    WHERE (
+        cleanup.marker_kind = 'event_emission'
+        AND cleanup.source_id IN (
+            SELECT emission.id
+            FROM public.worker_event_emissions AS emission
+            WHERE emission.job_id = p_job_id
+        )
+    )
+       OR (
+        cleanup.marker_kind = 'task_dispatch'
+        AND cleanup.source_id IN (
+            SELECT dispatch.id
+            FROM public.worker_task_dispatches AS dispatch
+            WHERE dispatch.job_id = p_job_id
+              AND dispatch.delivery_state = 'delivered'
+              AND dispatch.resolution_state = 'acknowledged'
+        )
+    )
+    ORDER BY cleanup.marker_key
+    FOR UPDATE;
+
+    INSERT INTO public.worker_redis_marker_cleanup_authorizations (
+        marker_kind,
+        source_id,
+        marker_key,
+        redis_stream,
+        expected_message_id,
+        payload_sha256,
+        authorization_state,
+        authorized_at
+    )
+    SELECT
+        'event_emission',
+        emission.id,
+        'vp:worker-event-emission:' || emission.id::text,
+        emission.redis_stream,
+        emission.message_id,
+        emission.payload_sha256,
+        'pending',
+        pg_catalog.clock_timestamp()
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.job_id = p_job_id
+      AND emission.emission_state = 'resolved'
+    ORDER BY 'vp:worker-event-emission:' || emission.id::text
+    ON CONFLICT DO NOTHING;
+
+    INSERT INTO public.worker_redis_marker_cleanup_authorizations (
+        marker_kind,
+        source_id,
+        marker_key,
+        redis_stream,
+        expected_message_id,
+        payload_sha256,
+        authorization_state,
+        authorized_at
+    )
+    SELECT
+        'task_dispatch',
+        dispatch.id,
+        'vp:worker-task-dispatch:' || dispatch.dispatch_key::text,
+        dispatch.redis_stream,
+        dispatch.redis_message_id,
+        dispatch.payload_sha256,
+        'pending',
+        pg_catalog.clock_timestamp()
+    FROM public.worker_task_dispatches AS dispatch
+    WHERE dispatch.job_id = p_job_id
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.resolution_state = 'acknowledged'
+    ORDER BY 'vp:worker-task-dispatch:' || dispatch.dispatch_key::text
+    ON CONFLICT DO NOTHING;
+
+    IF EXISTS (
+        SELECT 1
+        FROM public.worker_event_emissions AS emission
+        LEFT JOIN public.worker_redis_marker_cleanup_authorizations
+            AS cleanup
+          ON cleanup.marker_kind = 'event_emission'
+         AND cleanup.source_id = emission.id
+        WHERE emission.job_id = p_job_id
+          AND (
+              cleanup.id IS NULL
+              OR cleanup.marker_key IS DISTINCT FROM
+                    'vp:worker-event-emission:' || emission.id::text
+              OR cleanup.redis_stream
+                    IS DISTINCT FROM emission.redis_stream
+              OR cleanup.expected_message_id
+                    IS DISTINCT FROM emission.message_id
+              OR cleanup.payload_sha256
+                    IS DISTINCT FROM emission.payload_sha256
+              OR cleanup.authorized_at IS NULL
+          )
+    )
+       OR EXISTS (
+        SELECT 1
+        FROM public.worker_task_dispatches AS dispatch
+        LEFT JOIN public.worker_redis_marker_cleanup_authorizations
+            AS cleanup
+          ON cleanup.marker_kind = 'task_dispatch'
+         AND cleanup.source_id = dispatch.id
+        WHERE dispatch.job_id = p_job_id
+          AND dispatch.delivery_state = 'delivered'
+          AND dispatch.resolution_state = 'acknowledged'
+          AND (
+              cleanup.id IS NULL
+              OR cleanup.marker_key IS DISTINCT FROM
+                    'vp:worker-task-dispatch:' || dispatch.dispatch_key::text
+              OR cleanup.redis_stream
+                    IS DISTINCT FROM dispatch.redis_stream
+              OR cleanup.expected_message_id
+                    IS DISTINCT FROM dispatch.redis_message_id
+              OR cleanup.payload_sha256
+                    IS DISTINCT FROM dispatch.payload_sha256
+              OR cleanup.authorized_at IS NULL
+          )
+    )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_cleanup_proof_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+
     DELETE FROM public.registered_worker_event_deliveries AS delivery
     USING public.worker_task_delivery_attestations AS attestation
     WHERE delivery.source_task_attestation_id = attestation.id
@@ -6200,7 +6743,830 @@ $function$
     )
 
 
+def _create_worker_redis_marker_functions() -> None:
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_list_worker_redis_marker_expectations(
+    p_after_key text,
+    p_limit integer
+)
+RETURNS TABLE(
+    marker_kind text,
+    source_id uuid,
+    marker_key text,
+    redis_stream text,
+    expected_message_id text,
+    payload_sha256 text,
+    payload_json jsonb,
+    source_state text,
+    absence_allowed boolean
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_expected_role oid;
+BEGIN
+    IF p_after_key IS NULL
+       OR p_limit IS NULL
+       OR p_limit < 1
+       OR p_limit > 500
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_expectation_request_invalid',
+            ERRCODE = 'P0001';
+    END IF;
+{_marker_control_principal_guard_sql("vp_marker_readiness_runtime")}
+    RETURN QUERY
+    WITH expectations AS (
+        SELECT
+            'event_emission'::text AS marker_kind,
+            emission.id AS source_id,
+            (
+                'vp:worker-event-emission:' || emission.id::text
+            )::text AS marker_key,
+            emission.redis_stream::text AS redis_stream,
+            emission.message_id::text AS expected_message_id,
+            emission.payload_sha256::text AS payload_sha256,
+            emission.payload_json AS payload_json,
+            emission.emission_state::text AS source_state,
+            (
+                emission.emission_state = 'prepared'
+                AND emission.message_id IS NULL
+            ) AS absence_allowed
+        FROM public.worker_event_emissions AS emission
+        UNION ALL
+        SELECT
+            'task_dispatch'::text,
+            dispatch.id,
+            (
+                'vp:worker-task-dispatch:'
+                || dispatch.dispatch_key::text
+            )::text,
+            dispatch.redis_stream::text,
+            dispatch.redis_message_id::text,
+            dispatch.payload_sha256::text,
+            dispatch.payload_json,
+            (
+                'delivery:' || dispatch.delivery_state
+                || '/resolution:' || dispatch.resolution_state
+            )::text,
+            (
+                dispatch.redis_message_id IS NULL
+                AND dispatch.delivery_state IN ('pending', 'cancelled')
+            )
+        FROM public.worker_task_dispatches AS dispatch
+        UNION ALL
+        SELECT
+            cleanup.marker_kind::text,
+            cleanup.source_id,
+            cleanup.marker_key::text,
+            cleanup.redis_stream::text,
+            cleanup.expected_message_id::text,
+            cleanup.payload_sha256::text,
+            NULL::jsonb,
+            cleanup.authorization_state::text,
+            (
+                cleanup.authorization_state IN ('deleted', 'absent')
+            )
+        FROM public.worker_redis_marker_cleanup_authorizations
+            AS cleanup
+    )
+    SELECT
+        expectation.marker_kind,
+        expectation.source_id,
+        expectation.marker_key,
+        expectation.redis_stream,
+        expectation.expected_message_id,
+        expectation.payload_sha256,
+        expectation.payload_json,
+        expectation.source_state,
+        expectation.absence_allowed
+    FROM expectations AS expectation
+    WHERE expectation.marker_key > p_after_key
+    ORDER BY expectation.marker_key
+    LIMIT p_limit;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_begin_worker_redis_continuity_check(
+    p_run_id uuid,
+    p_stale_run_seconds integer
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_expected_role oid;
+    v_status public.worker_redis_continuity_status%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_run_id IS NULL
+       OR p_stale_run_seconds IS NULL
+       OR p_stale_run_seconds < 300
+       OR p_stale_run_seconds > 3600
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_request_invalid',
+            ERRCODE = 'P0001';
+    END IF;
+{_marker_control_principal_guard_sql("vp_marker_readiness_runtime")}
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-redis-continuity',
+            0
+        )
+    );
+    SELECT status.*
+    INTO v_status
+    FROM public.worker_redis_continuity_status AS status
+    WHERE status.singleton
+    FOR UPDATE;
+    IF FOUND
+       AND v_status.state = 'running'
+       AND v_status.started_at
+            > v_now - pg_catalog.make_interval(
+                secs => p_stale_run_seconds
+            )
+    THEN
+        RETURN 'overlap';
+    END IF;
+    INSERT INTO public.worker_redis_continuity_status (
+        singleton,
+        run_id,
+        state,
+        reason_code,
+        redis_run_id,
+        expected_count,
+        checked_count,
+        started_at,
+        finished_at
+    ) VALUES (
+        true,
+        p_run_id,
+        'running',
+        'continuity_check_running',
+        NULL,
+        0,
+        0,
+        v_now,
+        NULL
+    )
+    ON CONFLICT (singleton) DO UPDATE
+    SET run_id = EXCLUDED.run_id,
+        state = EXCLUDED.state,
+        reason_code = EXCLUDED.reason_code,
+        redis_run_id = EXCLUDED.redis_run_id,
+        expected_count = EXCLUDED.expected_count,
+        checked_count = EXCLUDED.checked_count,
+        started_at = EXCLUDED.started_at,
+        finished_at = EXCLUDED.finished_at;
+    RETURN 'begun';
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_finish_worker_redis_continuity_check(
+    p_run_id uuid,
+    p_result text,
+    p_reason_code text,
+    p_redis_run_id text,
+    p_expected_count bigint,
+    p_checked_count bigint
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_expected_role oid;
+    v_status public.worker_redis_continuity_status%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_run_id IS NULL
+       OR p_result NOT IN ('ready', 'error')
+       OR p_reason_code IS NULL
+       OR p_reason_code !~ '^[a-z][a-z0-9_]{{0,63}}$'
+       OR p_expected_count IS NULL
+       OR p_expected_count < 0
+       OR p_checked_count IS NULL
+       OR p_checked_count < 0
+       OR p_checked_count > p_expected_count
+       OR (
+            p_result = 'ready'
+            AND (
+                p_reason_code <> 'ready'
+                OR p_redis_run_id IS NULL
+                OR length(p_redis_run_id) NOT BETWEEN 1 AND 255
+                OR p_redis_run_id IS DISTINCT FROM trim(p_redis_run_id)
+                OR p_checked_count <> p_expected_count
+            )
+       )
+       OR (
+            p_result = 'error'
+            AND p_reason_code = 'ready'
+       )
+       OR (
+            p_redis_run_id IS NOT NULL
+            AND (
+                length(p_redis_run_id) NOT BETWEEN 1 AND 255
+                OR p_redis_run_id IS DISTINCT FROM trim(p_redis_run_id)
+            )
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_result_invalid',
+            ERRCODE = 'P0001';
+    END IF;
+{_marker_control_principal_guard_sql("vp_marker_readiness_runtime")}
+    SELECT status.*
+    INTO v_status
+    FROM public.worker_redis_continuity_status AS status
+    WHERE status.singleton
+    FOR UPDATE;
+    IF NOT FOUND
+       OR v_status.run_id IS DISTINCT FROM p_run_id
+       OR v_status.state <> 'running'
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_run_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    UPDATE public.worker_redis_continuity_status
+    SET state = p_result,
+        reason_code = p_reason_code,
+        redis_run_id = p_redis_run_id,
+        expected_count = p_expected_count,
+        checked_count = p_checked_count,
+        finished_at = v_now
+    WHERE singleton;
+    RETURN p_result = 'ready';
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_require_worker_redis_continuity(
+    p_max_age_seconds integer
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_status public.worker_redis_continuity_status%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_max_age_seconds IS NULL
+       OR p_max_age_seconds < 1
+       OR p_max_age_seconds > 300
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_request_invalid',
+            ERRCODE = 'P0001';
+    END IF;
+{_principal_guard_sql()}
+    SELECT status.*
+    INTO v_status
+    FROM public.worker_redis_continuity_status AS status
+    WHERE status.singleton;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_missing',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_status.state = 'running' THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_running',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_status.state <> 'ready' THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_error',
+            ERRCODE = 'P0001';
+    END IF;
+    IF v_status.finished_at IS NULL
+       OR v_status.finished_at
+            < v_now - pg_catalog.make_interval(
+                secs => p_max_age_seconds
+            )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_redis_continuity_stale',
+            ERRCODE = 'P0001';
+    END IF;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_claim_worker_redis_marker_cleanup(
+    p_run_id uuid,
+    p_limit integer,
+    p_lease_seconds integer
+)
+RETURNS TABLE(
+    id uuid,
+    marker_kind text,
+    source_id uuid,
+    marker_key text,
+    redis_stream text,
+    expected_message_id text,
+    payload_sha256 text,
+    claim_expires_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_expected_role oid;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_run_id IS NULL
+       OR p_limit IS NULL
+       OR p_limit < 1
+       OR p_limit > 100
+       OR p_lease_seconds IS DISTINCT FROM 300
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_cleanup_claim_invalid',
+            ERRCODE = 'P0001';
+    END IF;
+{_marker_control_principal_guard_sql("vp_marker_janitor_runtime")}
+    RETURN QUERY
+    WITH candidates AS (
+        SELECT cleanup.id
+        FROM public.worker_redis_marker_cleanup_authorizations
+            AS cleanup
+        WHERE cleanup.authorization_state = 'pending'
+           OR (
+                cleanup.authorization_state = 'claimed'
+                AND (
+                    cleanup.claimed_by_run_id = p_run_id
+                    OR cleanup.claim_expires_at <= v_now
+                )
+           )
+        ORDER BY cleanup.authorized_at, cleanup.id
+        FOR UPDATE SKIP LOCKED
+        LIMIT p_limit
+    ),
+    claimed AS (
+        UPDATE public.worker_redis_marker_cleanup_authorizations
+            AS cleanup
+        SET authorization_state = 'claimed',
+            claimed_by_run_id = p_run_id,
+            claim_expires_at = v_now
+                + pg_catalog.make_interval(secs => p_lease_seconds),
+            finished_at = NULL,
+            result_code = NULL
+        FROM candidates
+        WHERE cleanup.id = candidates.id
+        RETURNING cleanup.*
+    )
+    SELECT
+        claimed.id,
+        claimed.marker_kind::text,
+        claimed.source_id,
+        claimed.marker_key::text,
+        claimed.redis_stream::text,
+        claimed.expected_message_id::text,
+        claimed.payload_sha256::text,
+        claimed.claim_expires_at
+    FROM claimed
+    ORDER BY claimed.authorized_at, claimed.id;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_finish_worker_redis_marker_cleanup(
+    p_authorization_id uuid,
+    p_run_id uuid,
+    p_result text,
+    p_result_code text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_expected_role oid;
+    v_authorization
+        public.worker_redis_marker_cleanup_authorizations%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_authorization_id IS NULL
+       OR p_run_id IS NULL
+       OR p_result NOT IN ('deleted', 'absent', 'conflict')
+       OR p_result_code IS NULL
+       OR p_result_code !~ '^[a-z][a-z0-9_]{{0,63}}$'
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_cleanup_result_invalid',
+            ERRCODE = 'P0001';
+    END IF;
+{_marker_control_principal_guard_sql("vp_marker_janitor_runtime")}
+    SELECT cleanup.*
+    INTO v_authorization
+    FROM public.worker_redis_marker_cleanup_authorizations
+        AS cleanup
+    WHERE cleanup.id = p_authorization_id
+    FOR UPDATE;
+    IF NOT FOUND
+       OR v_authorization.authorization_state <> 'claimed'
+       OR v_authorization.claimed_by_run_id IS DISTINCT FROM p_run_id
+       OR v_authorization.claim_expires_at <= v_now
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_cleanup_claim_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    UPDATE public.worker_redis_marker_cleanup_authorizations
+    SET authorization_state = p_result,
+        finished_at = v_now,
+        result_code = p_result_code
+    WHERE id = p_authorization_id;
+    RETURN true;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_load_worker_redis_marker_repair(
+    p_action text,
+    p_source_id uuid
+)
+RETURNS TABLE(
+    marker_kind text,
+    source_id uuid,
+    marker_key text,
+    redis_stream text,
+    expected_message_id text,
+    payload_sha256 text,
+    payload_json jsonb,
+    source_state text,
+    worker_registration_id uuid
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_expected_role oid;
+BEGIN
+    IF p_action NOT IN (
+        'audit',
+        'restore_marker',
+        'restore_marker_applied',
+        'promote_prepared'
+    )
+       OR (p_action <> 'audit' AND p_source_id IS NULL)
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_request_invalid',
+            ERRCODE = 'P0001';
+    END IF;
+{_marker_control_principal_guard_sql("vp_marker_repair_runtime")}
+    IF p_action = 'promote_prepared' THEN
+        RETURN QUERY
+        SELECT
+            'event_emission'::text,
+            emission.id,
+            (
+                'vp:worker-event-emission:' || emission.id::text
+            )::text,
+            emission.redis_stream::text,
+            emission.message_id::text,
+            emission.payload_sha256::text,
+            emission.payload_json,
+            emission.emission_state::text,
+            emission.worker_registration_id
+        FROM public.worker_event_emissions AS emission
+        WHERE emission.id = p_source_id
+          AND emission.emission_state = 'prepared';
+    ELSE
+        RETURN QUERY
+        WITH candidates AS (
+            SELECT
+                1 AS priority,
+                'event_emission'::text AS marker_kind,
+                emission.id AS source_id,
+                (
+                    'vp:worker-event-emission:' || emission.id::text
+                )::text AS marker_key,
+                emission.redis_stream::text AS redis_stream,
+                emission.message_id::text AS expected_message_id,
+                emission.payload_sha256::text AS payload_sha256,
+                emission.payload_json AS payload_json,
+                emission.emission_state::text AS source_state,
+                emission.worker_registration_id AS worker_registration_id
+            FROM public.worker_event_emissions AS emission
+            WHERE (
+                emission.id = p_source_id
+                OR (p_action = 'audit' AND p_source_id IS NULL)
+            )
+              AND (
+                emission.message_id IS NOT NULL
+                OR p_action = 'audit'
+              )
+            UNION ALL
+            SELECT
+                2,
+                'task_dispatch'::text,
+                dispatch.id,
+                (
+                    'vp:worker-task-dispatch:'
+                    || dispatch.dispatch_key::text
+                )::text,
+                dispatch.redis_stream::text,
+                dispatch.redis_message_id::text,
+                dispatch.payload_sha256::text,
+                dispatch.payload_json,
+                (
+                    'delivery:' || dispatch.delivery_state
+                    || '/resolution:' || dispatch.resolution_state
+                )::text,
+                NULL::uuid
+            FROM public.worker_task_dispatches AS dispatch
+            WHERE (
+                dispatch.id = p_source_id
+                OR (p_action = 'audit' AND p_source_id IS NULL)
+            )
+              AND (
+                dispatch.redis_message_id IS NOT NULL
+                OR p_action = 'audit'
+              )
+            UNION ALL
+            SELECT
+                3,
+                cleanup.marker_kind::text,
+                cleanup.source_id,
+                cleanup.marker_key::text,
+                cleanup.redis_stream::text,
+                cleanup.expected_message_id::text,
+                cleanup.payload_sha256::text,
+                NULL::jsonb,
+                cleanup.authorization_state::text,
+                NULL::uuid
+            FROM public.worker_redis_marker_cleanup_authorizations
+                AS cleanup
+            WHERE p_action = 'audit'
+              AND (
+                cleanup.source_id = p_source_id
+                OR p_source_id IS NULL
+              )
+        )
+        SELECT
+            candidate.marker_kind,
+            candidate.source_id,
+            candidate.marker_key,
+            candidate.redis_stream,
+            candidate.expected_message_id,
+            candidate.payload_sha256,
+            candidate.payload_json,
+            candidate.source_state,
+            candidate.worker_registration_id
+        FROM candidates AS candidate
+        ORDER BY candidate.priority
+        LIMIT CASE WHEN p_action = 'audit' THEN 2147483647 ELSE 1 END;
+    END IF;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_evidence_missing',
+            ERRCODE = 'P0001';
+    END IF;
+    IF p_action = 'restore_marker_applied' THEN
+        INSERT INTO public.worker_redis_marker_repair_audits (
+            source_id,
+            action,
+            result_code,
+            principal,
+            created_at
+        ) VALUES (
+            p_source_id,
+            'restore_marker',
+            'restored',
+            v_principal,
+            pg_catalog.clock_timestamp()
+        );
+    END IF;
+END;
+$function$
+"""
+    )
+    op.execute(
+        f"""
+CREATE FUNCTION public.vp_promote_observed_worker_event_emission(
+    p_emission_id uuid,
+    p_message_id text,
+    p_payload_sha256 text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_principal text := session_user;
+    v_privileged boolean;
+    v_expected_role oid;
+    v_emission public.worker_event_emissions%ROWTYPE;
+    v_registration public.worker_registrations%ROWTYPE;
+    v_now timestamptz := pg_catalog.clock_timestamp();
+BEGIN
+    IF p_emission_id IS NULL
+       OR p_message_id IS NULL
+       OR length(p_message_id) NOT BETWEEN 3 AND 64
+       OR p_message_id !~ '^[0-9]+-[0-9]+$'
+       OR p_payload_sha256 !~ '^[0-9a-f]{{64}}$'
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_proof_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+{_marker_control_principal_guard_sql("vp_marker_repair_runtime")}
+    SELECT emission.*
+    INTO v_emission
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.id = p_emission_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_evidence_missing',
+            ERRCODE = 'P0001';
+    END IF;
+
+    PERFORM 1
+    FROM public.jobs AS job
+    WHERE job.id = v_emission.job_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_proof_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.node_executions AS node
+    WHERE node.id = v_emission.node_execution_id
+      AND node.job_id = v_emission.job_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_proof_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock_shared(
+        pg_catalog.hashtextextended(
+            'vp-worker-registration:'
+            || v_emission.worker_registration_id::text,
+            0
+        )
+    );
+    SELECT registration.*
+    INTO v_registration
+    FROM public.worker_registrations AS registration
+    WHERE registration.id = v_emission.worker_registration_id
+      AND registration.lease_epoch = v_emission.worker_lease_epoch
+      AND registration.status IN ('active', 'expired')
+    FOR SHARE;
+    IF NOT FOUND
+       OR EXISTS (
+            SELECT 1
+            FROM public.worker_registrations AS replacement
+            WHERE replacement.service_name = v_registration.service_name
+              AND replacement.id <> v_registration.id
+              AND replacement.lease_epoch > v_registration.lease_epoch
+       )
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_registration_replaced',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.worker_task_delivery_attestations AS attestation
+    WHERE attestation.id = v_emission.source_task_attestation_id
+      AND attestation.job_id = v_emission.job_id
+      AND attestation.node_execution_id = v_emission.node_execution_id
+      AND attestation.worker_registration_id =
+            v_emission.worker_registration_id
+      AND attestation.worker_lease_epoch = v_emission.worker_lease_epoch
+      AND attestation.ack_state = 'acknowledged'
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_proof_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    SELECT emission.*
+    INTO v_emission
+    FROM public.worker_event_emissions AS emission
+    WHERE emission.id = p_emission_id
+    FOR UPDATE;
+    IF v_emission.emission_state <> 'prepared'
+       OR v_emission.message_id IS NOT NULL
+       OR v_emission.payload_sha256 IS DISTINCT FROM p_payload_sha256
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_proof_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    PERFORM 1
+    FROM public.worker_task_delivery_attestations AS attestation
+    JOIN public.worker_task_dispatches AS dispatch
+      ON dispatch.dispatch_key = attestation.dispatch_key
+    WHERE attestation.id = v_emission.source_task_attestation_id
+      AND dispatch.job_id = v_emission.job_id
+      AND dispatch.node_execution_id = v_emission.node_execution_id
+      AND dispatch.redis_stream = attestation.redis_stream
+      AND dispatch.consumer_group = attestation.consumer_group
+      AND dispatch.redis_message_id = attestation.message_id
+      AND dispatch.payload_sha256 = attestation.payload_sha256
+      AND dispatch.delivery_state = 'delivered'
+      AND dispatch.resolution_state = 'acknowledged'
+    FOR UPDATE OF dispatch;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'marker_repair_proof_mismatch',
+            ERRCODE = 'P0001';
+    END IF;
+    UPDATE public.worker_event_emissions
+    SET message_id = p_message_id,
+        emission_state = 'emitted',
+        emitted_at = v_now
+    WHERE id = p_emission_id;
+    INSERT INTO public.worker_redis_marker_repair_audits (
+        source_id,
+        action,
+        result_code,
+        principal,
+        created_at
+    ) VALUES (
+        p_emission_id,
+        'promote_prepared',
+        'promoted',
+        v_principal,
+        v_now
+    );
+    RETURN true;
+END;
+$function$
+"""
+    )
+    for signature in (
+        LIST_REDIS_MARKER_EXPECTATIONS_SIGNATURE,
+        BEGIN_REDIS_CONTINUITY_SIGNATURE,
+        FINISH_REDIS_CONTINUITY_SIGNATURE,
+        REQUIRE_REDIS_CONTINUITY_SIGNATURE,
+        CLAIM_REDIS_MARKER_CLEANUP_SIGNATURE,
+        FINISH_REDIS_MARKER_CLEANUP_SIGNATURE,
+        LOAD_REDIS_MARKER_REPAIR_SIGNATURE,
+        PROMOTE_OBSERVED_EVENT_EMISSION_SIGNATURE,
+    ):
+        op.execute(
+            f"REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC"
+        )
+
+
 def downgrade() -> None:
+    op.execute(
+        "DROP TRIGGER IF EXISTS "
+        "trg_worker_redis_marker_repair_audit_append_only "
+        "ON public.worker_redis_marker_repair_audits"
+    )
+    op.execute(
+        "DROP TRIGGER IF EXISTS "
+        "trg_worker_redis_marker_cleanup_immutability "
+        "ON public.worker_redis_marker_cleanup_authorizations"
+    )
     op.execute(
         "DROP TRIGGER IF EXISTS trg_worker_event_emission_immutability "
         "ON public.worker_event_emissions"
@@ -6226,6 +7592,9 @@ def downgrade() -> None:
         "public.vp_enforce_worker_event_receipt_immutability()"
     )
     for trigger_function in (
+        "public."
+        "vp_enforce_worker_redis_marker_repair_audit_append_only()",
+        "public.vp_enforce_worker_redis_marker_cleanup_immutability()",
         "public.vp_enforce_worker_task_dispatch_immutability()",
         "public.vp_enforce_worker_event_delivery_immutability()",
         "public.vp_enforce_worker_task_attestation_immutability()",
@@ -6233,6 +7602,14 @@ def downgrade() -> None:
     ):
         op.execute(f"DROP FUNCTION IF EXISTS {trigger_function}")
     for signature in (
+        PROMOTE_OBSERVED_EVENT_EMISSION_SIGNATURE,
+        LOAD_REDIS_MARKER_REPAIR_SIGNATURE,
+        FINISH_REDIS_MARKER_CLEANUP_SIGNATURE,
+        CLAIM_REDIS_MARKER_CLEANUP_SIGNATURE,
+        REQUIRE_REDIS_CONTINUITY_SIGNATURE,
+        FINISH_REDIS_CONTINUITY_SIGNATURE,
+        BEGIN_REDIS_CONTINUITY_SIGNATURE,
+        LIST_REDIS_MARKER_EXPECTATIONS_SIGNATURE,
         STAGING_JANITOR_READINESS_SIGNATURE,
         FINISH_STAGING_JANITOR_SIGNATURE,
         BEGIN_STAGING_JANITOR_SIGNATURE,
@@ -6272,6 +7649,13 @@ def downgrade() -> None:
     ):
         op.execute(f"DROP FUNCTION IF EXISTS {signature}")
 
+    op.drop_table("worker_redis_marker_repair_audits")
+    op.drop_table("worker_redis_continuity_status")
+    op.drop_index(
+        "ix_worker_redis_marker_cleanup_claim",
+        table_name="worker_redis_marker_cleanup_authorizations",
+    )
+    op.drop_table("worker_redis_marker_cleanup_authorizations")
     op.drop_table("staging_janitor_status")
     op.drop_index(
         "ix_registered_worker_event_deliveries_receipt_id",

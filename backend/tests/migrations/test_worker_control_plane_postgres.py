@@ -2189,6 +2189,25 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 )
             finally:
                 await admin.close()
+            event_marker_proof = await orchestrator.fetchrow(
+                """
+                SELECT id, redis_stream, message_id, payload_sha256
+                FROM public.worker_event_emissions
+                WHERE id = $1
+                """,
+                atomic_emission_id,
+            )
+            dispatch_marker_proof = await orchestrator.fetchrow(
+                """
+                SELECT id, dispatch_key, redis_stream, redis_message_id,
+                       payload_sha256
+                FROM public.worker_task_dispatches
+                WHERE dispatch_key = $1
+                """,
+                claim_dispatch_key,
+            )
+            assert event_marker_proof is not None
+            assert dispatch_marker_proof is not None
             await orchestrator.execute(
                 "SELECT public."
                 "vp_resolve_worker_event_authority_for_job_deletion($1)",
@@ -2210,6 +2229,54 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                 """,
                 seeded["job_id"],
             ) == 0
+            admin = await asyncpg.connect(_asyncpg_url(target_url))
+            try:
+                marker_tombstones = await admin.fetch(
+                    """
+                    SELECT marker_kind, source_id, marker_key, redis_stream,
+                           expected_message_id, payload_sha256,
+                           authorization_state
+                    FROM public.worker_redis_marker_cleanup_authorizations
+                    WHERE source_id = ANY($1::uuid[])
+                    ORDER BY marker_kind
+                    """,
+                    [
+                        event_marker_proof["id"],
+                        dispatch_marker_proof["id"],
+                    ],
+                )
+            finally:
+                await admin.close()
+            assert [dict(row) for row in marker_tombstones] == [
+                {
+                    "marker_kind": "event_emission",
+                    "source_id": event_marker_proof["id"],
+                    "marker_key": (
+                        "vp:worker-event-emission:"
+                        f"{event_marker_proof['id']}"
+                    ),
+                    "redis_stream": event_marker_proof["redis_stream"],
+                    "expected_message_id": event_marker_proof["message_id"],
+                    "payload_sha256": event_marker_proof["payload_sha256"],
+                    "authorization_state": "pending",
+                },
+                {
+                    "marker_kind": "task_dispatch",
+                    "source_id": dispatch_marker_proof["id"],
+                    "marker_key": (
+                        "vp:worker-task-dispatch:"
+                        f"{dispatch_marker_proof['dispatch_key']}"
+                    ),
+                    "redis_stream": dispatch_marker_proof["redis_stream"],
+                    "expected_message_id": (
+                        dispatch_marker_proof["redis_message_id"]
+                    ),
+                    "payload_sha256": dispatch_marker_proof[
+                        "payload_sha256"
+                    ],
+                    "authorization_state": "pending",
+                },
+            ]
         finally:
             await worker.close()
             await worker_peer.close()

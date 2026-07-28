@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+from sqlalchemy import UniqueConstraint
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -272,6 +274,150 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
         "vp_staging_janitor_readiness",
     ):
         assert f"DROP FUNCTION IF EXISTS public.{function_name}" in downgrade_sql
+
+
+def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
+    completed = _run_alembic(
+        "postgresql+asyncpg://migration:unused@127.0.0.1:9/videoprocess",
+        "upgrade",
+        f"{PREVIOUS_REVISION}:{TARGET_REVISION}",
+        "--sql",
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    sql = completed.stdout
+    for table_name in (
+        "worker_redis_marker_cleanup_authorizations",
+        "worker_redis_continuity_status",
+        "worker_redis_marker_repair_audits",
+    ):
+        assert f"CREATE TABLE {table_name}" in sql
+        assert f"REVOKE ALL ON TABLE public.{table_name} FROM PUBLIC" in sql
+    for constraint_name in (
+        "uq_worker_redis_marker_cleanup_source",
+        "uq_worker_redis_marker_cleanup_key",
+        "ck_worker_redis_marker_cleanup_kind",
+        "ck_worker_redis_marker_cleanup_state",
+        "ck_worker_redis_marker_cleanup_claim",
+        "ck_worker_redis_continuity_singleton",
+        "ck_worker_redis_continuity_state",
+        "ck_worker_redis_continuity_result",
+        "ck_worker_redis_marker_repair_action",
+        "ck_worker_redis_marker_repair_result",
+    ):
+        assert constraint_name in sql
+    for trigger_name in (
+        "trg_worker_redis_marker_cleanup_immutability",
+        "trg_worker_redis_marker_repair_audit_append_only",
+    ):
+        assert f"CREATE TRIGGER {trigger_name}" in sql
+
+    signatures = (
+        "vp_list_worker_redis_marker_expectations(text,integer)",
+        "vp_begin_worker_redis_continuity_check(uuid,integer)",
+        "vp_finish_worker_redis_continuity_check("
+        "uuid,text,text,text,bigint,bigint)",
+        "vp_require_worker_redis_continuity(integer)",
+        "vp_claim_worker_redis_marker_cleanup(uuid,integer,integer)",
+        "vp_finish_worker_redis_marker_cleanup(uuid,uuid,text,text)",
+        "vp_load_worker_redis_marker_repair(text,uuid)",
+        "vp_promote_observed_worker_event_emission(uuid,text,text)",
+    )
+    for signature in signatures:
+        function_name = signature.split("(", 1)[0]
+        assert f"CREATE FUNCTION public.{function_name}" in sql
+        assert (
+            f"REVOKE EXECUTE ON FUNCTION public.{signature} FROM PUBLIC"
+            in sql
+        )
+    assert sql.count("SET search_path = pg_catalog") >= 24
+    assert "SET search_path = pg_catalog, public" not in sql
+
+    models = importlib.import_module(
+        "app.models.registered_worker_event_receipt"
+    )
+    cleanup_model = getattr(
+        models,
+        "WorkerRedisMarkerCleanupAuthorization",
+        None,
+    )
+    continuity_model = getattr(models, "WorkerRedisContinuityStatus", None)
+    repair_model = getattr(models, "WorkerRedisMarkerRepairAudit", None)
+    assert cleanup_model is not None
+    assert continuity_model is not None
+    assert repair_model is not None
+    expected_proof_columns = {
+        "marker_kind",
+        "source_id",
+        "marker_key",
+        "redis_stream",
+        "expected_message_id",
+        "payload_sha256",
+        "authorized_at",
+    }
+    assert expected_proof_columns <= set(
+        cleanup_model.__table__.columns.keys()
+    )
+    unique_columns = {
+        tuple(column.name for column in constraint.columns)
+        for constraint in cleanup_model.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert ("marker_kind", "source_id") in unique_columns
+    assert ("marker_key",) in unique_columns
+    assert {
+        "singleton",
+        "run_id",
+        "state",
+        "reason_code",
+        "redis_run_id",
+        "expected_count",
+        "checked_count",
+        "started_at",
+        "finished_at",
+    } <= set(continuity_model.__table__.columns.keys())
+    assert {
+        "source_id",
+        "action",
+        "result_code",
+        "principal",
+        "created_at",
+    } <= set(repair_model.__table__.columns.keys())
+
+    downgraded = _run_alembic(
+        "postgresql+asyncpg://migration:unused@127.0.0.1:9/videoprocess",
+        "downgrade",
+        f"{TARGET_REVISION}:{PREVIOUS_REVISION}",
+        "--sql",
+    )
+    assert downgraded.returncode == 0, downgraded.stdout + downgraded.stderr
+    downgrade_sql = downgraded.stdout
+    first_table_drop = min(
+        downgrade_sql.index(f"DROP TABLE {table_name}")
+        for table_name in (
+            "worker_redis_marker_cleanup_authorizations",
+            "worker_redis_continuity_status",
+            "worker_redis_marker_repair_audits",
+        )
+    )
+    for signature in signatures:
+        function_name = signature.split("(", 1)[0]
+        drop_index = downgrade_sql.index(
+            f"DROP FUNCTION IF EXISTS public.{function_name}"
+        )
+        assert drop_index < first_table_drop
+    assert downgrade_sql.index(
+        "DROP TRIGGER IF EXISTS "
+        "trg_worker_redis_marker_cleanup_immutability"
+    ) < downgrade_sql.index(
+        "DROP TABLE worker_redis_marker_cleanup_authorizations"
+    )
+    assert downgrade_sql.index(
+        "DROP TRIGGER IF EXISTS "
+        "trg_worker_redis_marker_repair_audit_append_only"
+    ) < downgrade_sql.index(
+        "DROP TABLE worker_redis_marker_repair_audits"
+    )
 
 
 @pytest.mark.asyncio
