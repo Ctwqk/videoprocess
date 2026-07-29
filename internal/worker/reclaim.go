@@ -13,10 +13,7 @@ func (c *Consumer) ReclaimPending(ctx context.Context) (int, error) {
 		c.publishRegistrationLoss(err)
 		return 0, err
 	}
-	for _, msg := range messages {
-		c.handleMessage(ctx, msg)
-	}
-	return len(messages), nil
+	return c.handlePublicReclaimResults(ctx, messages, nil)
 }
 
 func (c *Consumer) claimPending(

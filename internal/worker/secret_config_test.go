@@ -1,11 +1,14 @@
 package worker
 
 import (
+	"context"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -339,6 +342,137 @@ func TestRegistrationRedisOptionsKeepSafeDefaultsConstructible(t *testing.T) {
 	client := redis.NewClient(options)
 	if err := client.Close(); err != nil {
 		t.Fatalf("close unconnected Redis client: %v", err)
+	}
+}
+
+func TestRegistrationRedisOptionsRejectUnsafeConnectionLifetimeArithmetic(
+	t *testing.T,
+) {
+	for _, redisURL := range []string{
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_idle_time=-2ns",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_lifetime=-1ns",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_lifetime=1s&conn_max_lifetime_jitter=-1ns",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_lifetime=9223372036854775807ns&conn_max_lifetime_jitter=9223372036854775807ns",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_lifetime=4611686018427387904ns&conn_max_lifetime_jitter=4611686018427387904ns",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_lifetime=9223372036854775807ns&conn_max_lifetime_jitter=2ns",
+	} {
+		t.Run(redisURL, func(t *testing.T) {
+			options, err := ParseWorkerRedisOptions(redisURL)
+			if err == nil {
+				client := redis.NewClient(options)
+				_ = client.Close()
+				t.Fatal("unsafe Redis connection lifetime was accepted")
+			}
+			if err.Error() != "worker Redis configuration is invalid" {
+				t.Fatalf("connection lifetime error = %q; want generic Redis error", err)
+			}
+		})
+	}
+}
+
+func TestRegistrationRedisOptionsKeepSafeConnectionLifetimeBounds(
+	t *testing.T,
+) {
+	for _, redisURL := range []string{
+		"redis://worker:synthetic@127.0.0.1:6379/14",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_idle_time=-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_lifetime=0s&conn_max_lifetime_jitter=0s",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_lifetime=2ns&conn_max_lifetime_jitter=9223372036854775807ns",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_lifetime=9223372036854775807ns&conn_max_lifetime_jitter=1ns",
+		"redis://worker:synthetic@127.0.0.1:6379/14?conn_max_lifetime=4611686018427387905ns&conn_max_lifetime_jitter=4611686018427387903ns",
+	} {
+		t.Run(redisURL, func(t *testing.T) {
+			options, err := ParseWorkerRedisOptions(redisURL)
+			if err != nil {
+				t.Fatalf("ParseWorkerRedisOptions: %v", err)
+			}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("validated connection lifetime panicked: %v", recovered)
+				}
+			}()
+			client := redis.NewClient(options)
+			if err := client.Close(); err != nil {
+				t.Fatalf("close unconnected Redis client: %v", err)
+			}
+		})
+	}
+}
+
+func TestRegistrationRedisConnectionLifetimeBoundsWithRealRedis(t *testing.T) {
+	rawURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"))
+	if rawURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_REDIS_TEST_URL for Redis 7.4 worker integration tests")
+	}
+	withLifetimeQuery := func(values map[string]string) string {
+		t.Helper()
+		parsed, err := url.Parse(rawURL)
+		if err != nil {
+			t.Fatalf("parse Redis integration URL: %v", err)
+		}
+		query := parsed.Query()
+		for key, value := range values {
+			query.Set(key, value)
+		}
+		parsed.RawQuery = query.Encode()
+		return parsed.String()
+	}
+	unsafeURL := withLifetimeQuery(map[string]string{
+		"conn_max_lifetime":        "9223372036854775807ns",
+		"conn_max_lifetime_jitter": "9223372036854775807ns",
+	})
+	if options, err := ParseWorkerRedisOptions(unsafeURL); err == nil {
+		client := redis.NewClient(options)
+		probeContext, cancelProbe := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		pingErr := client.Ping(probeContext).Err()
+		cancelProbe()
+		_ = client.Close()
+		t.Fatalf(
+			"queuedNewConn panic configuration was accepted; Ping error = %v",
+			pingErr,
+		)
+	}
+
+	safeQueries := []map[string]string{
+		{"conn_max_idle_time": "-1"},
+		{
+			"conn_max_lifetime":        "9223372036854775807ns",
+			"conn_max_lifetime_jitter": "1ns",
+		},
+		{
+			"conn_max_lifetime":        "4611686018427387905ns",
+			"conn_max_lifetime_jitter": "4611686018427387903ns",
+		},
+		{
+			"conn_max_lifetime":        "2ns",
+			"conn_max_lifetime_jitter": "9223372036854775807ns",
+		},
+	}
+	for index, query := range safeQueries {
+		t.Run(strconv.Itoa(index), func(t *testing.T) {
+			options, err := ParseWorkerRedisOptions(withLifetimeQuery(query))
+			if err != nil {
+				t.Fatalf("parse safe Redis lifetime boundary: %v", err)
+			}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("safe Redis lifetime boundary panicked: %v", recovered)
+				}
+			}()
+			client := redis.NewClient(options)
+			t.Cleanup(func() { _ = client.Close() })
+			probeContext, cancelProbe := context.WithTimeout(
+				context.Background(),
+				5*time.Second,
+			)
+			defer cancelProbe()
+			if err := client.Ping(probeContext).Err(); err != nil {
+				t.Fatalf("Ping safe Redis lifetime boundary: %v", err)
+			}
+		})
 	}
 }
 

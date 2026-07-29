@@ -539,13 +539,57 @@ func (c *Consumer) shouldDeferRegisteredForAffinity(
 
 func (c *Consumer) ReclaimPreferredPending(ctx context.Context) (int, error) {
 	messages, err := c.claimPreferredPending(ctx)
+	return c.handlePublicReclaimResults(ctx, messages, err)
+}
+
+func (c *Consumer) handlePublicReclaimResults(
+	ctx context.Context,
+	messages []redis.XMessage,
+	resultErr error,
+) (int, error) {
+	var handoffErr error
 	for _, message := range messages {
-		c.handleMessage(ctx, message)
+		accepted, err := c.acceptPublicReclaim(ctx)
+		if err != nil {
+			c.publishRegistrationLoss(err)
+		}
+		if accepted {
+			c.handleMessage(ctx, message)
+		}
+		if err != nil {
+			handoffErr = err
+			break
+		}
 	}
-	if err != nil {
-		c.publishRegistrationLoss(err)
+	if resultErr != nil {
+		c.publishRegistrationLoss(resultErr)
 	}
-	return len(messages), err
+	if handoffErr == nil {
+		return len(messages), resultErr
+	}
+	if resultErr != nil {
+		return len(messages), errors.Join(resultErr, handoffErr)
+	}
+	return len(messages), handoffErr
+}
+
+func (c *Consumer) acceptPublicReclaim(ctx context.Context) (bool, error) {
+	if c.Registration == nil {
+		return true, nil
+	}
+	accepted := false
+	err := c.withRegistrationFence(
+		ctx,
+		func(context.Context) error {
+			if !c.Registration.handoffIfActive(func() {
+				accepted = true
+			}) {
+				return ErrRegistrationLost
+			}
+			return nil
+		},
+	)
+	return accepted, err
 }
 
 func (c *Consumer) claimPreferredPending(

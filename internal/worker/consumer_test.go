@@ -37,6 +37,7 @@ type fakeHandler struct {
 
 type countingHandler struct {
 	node  string
+	err   error
 	calls atomic.Int32
 }
 
@@ -49,6 +50,9 @@ func (h *countingHandler) Execute(
 	TaskMessage,
 ) (NodeResult, error) {
 	h.calls.Add(1)
+	if h.err != nil {
+		return NodeResult{}, h.err
+	}
 	return NodeResult{OutputArtifactID: "artifact-1"}, nil
 }
 
@@ -388,6 +392,15 @@ type registeredDispatchGapStore struct {
 	paused             atomic.Bool
 }
 
+type registeredPublicReclaimGapStore struct {
+	*registeredTaskStoreStub
+	fenceStore *store.Store
+	pauseAfter int32
+	fenceCalls atomic.Int32
+	paused     chan struct{}
+	release    <-chan struct{}
+}
+
 func (s *registeredDispatchGapStore) WithWorkerRegistrationFence(
 	ctx context.Context,
 	lease store.WorkerRegistrationLease,
@@ -403,6 +416,25 @@ func (s *registeredDispatchGapStore) WithWorkerRegistrationFence(
 	close(s.readFenceCommitted)
 	select {
 	case <-s.releaseFenceReturn:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+func (s *registeredPublicReclaimGapStore) WithWorkerRegistrationFence(
+	ctx context.Context,
+	lease store.WorkerRegistrationLease,
+	callback store.WorkerRegistrationFenceCallback,
+) error {
+	call := s.fenceCalls.Add(1)
+	err := s.fenceStore.WithWorkerRegistrationFence(ctx, lease, callback)
+	if err != nil || call != s.pauseAfter {
+		return err
+	}
+	close(s.paused)
+	select {
+	case <-s.release:
 		return nil
 	case <-ctx.Done():
 		return context.Cause(ctx)
@@ -2474,6 +2506,309 @@ func TestConsumerRegistrationFenceRejectsDispatchAfterTakeoverProof(
 			pending,
 			err,
 		)
+	}
+}
+
+func TestRegistrationPublicReclaimHandoffOrdersLossBeforeExecution(
+	t *testing.T,
+) {
+	for _, reclaim := range []string{"pending", "preferred"} {
+		for _, loss := range []string{"takeover", "local"} {
+			t.Run(reclaim+"/"+loss, func(t *testing.T) {
+				runPublicReclaimHandoffCase(t, reclaim, loss, false)
+			})
+		}
+	}
+}
+
+func TestRegistrationPublicReclaimAcceptedBeforeTakeoverRunsOnce(
+	t *testing.T,
+) {
+	for _, reclaim := range []string{"pending", "preferred"} {
+		t.Run(reclaim, func(t *testing.T) {
+			runPublicReclaimHandoffCase(t, reclaim, "takeover", true)
+		})
+	}
+}
+
+func runPublicReclaimHandoffCase(
+	t *testing.T,
+	reclaim string,
+	loss string,
+	acceptBeforeLoss bool,
+) {
+	t.Helper()
+	rawRedisURL := strings.TrimSpace(
+		os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"),
+	)
+	if rawRedisURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_REDIS_TEST_URL for Redis 7.4 worker integration tests")
+	}
+	client := newRealWorkerRedisClient(t)
+	fixture := newWorkerIntakePostgresFixture(t, rawRedisURL)
+	lease, err := fixture.worker.RegisterWorker(
+		fixture.ctx,
+		fixture.claims,
+		fixture.token,
+	)
+	if err != nil {
+		t.Fatalf("register public reclaim worker: %v", err)
+	}
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := Config{
+		WorkerType:        fixture.claims.WorkerType,
+		WorkerID:          lease.RedisConsumerID,
+		WorkerHost:        fixture.claims.WorkerHost,
+		RedisStream:       fixture.claims.RedisStream,
+		RedisGroup:        fixture.claims.RedisGroup,
+		PELMinIdle:        time.Millisecond,
+		HeartbeatInterval: time.Hour,
+	}
+	eventStream := cfg.RedisStream + ":events"
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupContext, cfg.RedisStream, eventStream).Err()
+	})
+	reclaimContext, cancelReclaim := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancelReclaim()
+	if err := client.XGroupCreateMkStream(
+		reclaimContext,
+		cfg.RedisStream,
+		cfg.RedisGroup,
+		"0",
+	).Err(); err != nil {
+		t.Fatalf("create public reclaim group: %v", err)
+	}
+	payload := registeredLossTestPayload()
+	payload["event_stream"] = eventStream
+	if reclaim == "preferred" {
+		payload["preferred_hosts"] = `["host127"]`
+		payload["affinity_enqueued_at"] = time.Now().UTC().
+			Format(time.RFC3339Nano)
+	}
+	messageID, err := client.XAdd(
+		reclaimContext,
+		&redis.XAddArgs{
+			Stream: cfg.RedisStream,
+			Values: payload,
+		},
+	).Result()
+	if err != nil {
+		t.Fatalf("add public reclaim delivery: %v", err)
+	}
+	before, err := client.XRangeN(
+		reclaimContext,
+		cfg.RedisStream,
+		messageID,
+		messageID,
+		1,
+	).Result()
+	if err != nil || len(before) != 1 {
+		t.Fatalf("read exact public reclaim delivery: messages=%#v err=%v", before, err)
+	}
+	wrongConsumer := "ffmpeg_go-worker@host150:1:" + uuid.NewString()
+	delivered, err := client.XReadGroup(
+		reclaimContext,
+		&redis.XReadGroupArgs{
+			Group:    cfg.RedisGroup,
+			Consumer: wrongConsumer,
+			Streams:  []string{cfg.RedisStream, ">"},
+			Count:    1,
+		},
+	).Result()
+	if err != nil ||
+		len(delivered) != 1 ||
+		len(delivered[0].Messages) != 1 ||
+		delivered[0].Messages[0].ID != messageID {
+		t.Fatalf("deliver public reclaim message: streams=%#v err=%v", delivered, err)
+	}
+	if reclaim == "preferred" {
+		time.Sleep(600 * time.Millisecond)
+	} else {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	releaseFence := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseFence) })
+	}
+	defer release()
+	taskStore := &registeredPublicReclaimGapStore{
+		registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+		fenceStore:              fixture.worker,
+		pauseAfter:              1,
+		paused:                  make(chan struct{}),
+		release:                 releaseFence,
+	}
+	if acceptBeforeLoss {
+		taskStore.pauseAfter = 2
+	}
+	handler := &countingHandler{node: "trim"}
+	if acceptBeforeLoss {
+		handler.err = ErrConfirmedCancellation
+	}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		handler,
+	)
+	type reclaimResult struct {
+		count int
+		err   error
+	}
+	reclaimDone := make(chan reclaimResult, 1)
+	go func() {
+		var count int
+		var reclaimErr error
+		if reclaim == "preferred" {
+			count, reclaimErr = consumer.ReclaimPreferredPending(reclaimContext)
+		} else {
+			count, reclaimErr = consumer.ReclaimPending(reclaimContext)
+		}
+		reclaimDone <- reclaimResult{count: count, err: reclaimErr}
+	}()
+	select {
+	case <-taskStore.paused:
+	case result := <-reclaimDone:
+		release()
+		t.Fatalf(
+			"public reclaim returned before forced handoff gap: result=%#v fences=%d claims=%d handlers=%d",
+			result,
+			taskStore.fenceCalls.Load(),
+			taskStore.claimCalls,
+			handler.calls.Load(),
+		)
+	case <-time.After(3 * time.Second):
+		release()
+		t.Fatalf(
+			"public reclaim did not reach forced handoff gap: fences=%d claims=%d handlers=%d",
+			taskStore.fenceCalls.Load(),
+			taskStore.claimCalls,
+			handler.calls.Load(),
+		)
+	}
+
+	switch loss {
+	case "local":
+		registration.MarkLost()
+	case "takeover":
+		takeoverClaims := fixture.claims
+		takeoverClaims.WorkerInstanceID = uuid.New()
+		takeoverClaims.RedisConsumerID = fmt.Sprintf(
+			"%s-worker@%s:%d:%s",
+			takeoverClaims.WorkerType,
+			takeoverClaims.WorkerHost,
+			takeoverClaims.WorkerSlot,
+			takeoverClaims.WorkerInstanceID,
+		)
+		if _, err := fixture.worker.RegisterWorker(
+			fixture.ctx,
+			takeoverClaims,
+			fixture.token,
+		); err != nil {
+			release()
+			t.Fatalf("complete public reclaim takeover proof: %v", err)
+		}
+	default:
+		release()
+		t.Fatalf("unknown public reclaim loss %q", loss)
+	}
+	release()
+
+	var result reclaimResult
+	select {
+	case result = <-reclaimDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("public reclaim did not return after the handoff gap")
+	}
+	if result.count != 1 {
+		t.Fatalf("public reclaim count = %d; want exact claimed count 1", result.count)
+	}
+	if acceptBeforeLoss {
+		if result.err != nil {
+			t.Fatalf("accepted public reclaim error = %v; want nil", result.err)
+		}
+		if taskStore.claimCalls != 1 {
+			t.Fatalf("accepted public reclaim claims = %d; want 1", taskStore.claimCalls)
+		}
+		if calls := handler.calls.Load(); calls != 1 {
+			t.Fatalf("accepted public reclaim handler calls = %d; want 1", calls)
+		}
+	} else {
+		if !errors.Is(result.err, ErrRegistrationLost) {
+			t.Fatalf(
+				"post-loss public reclaim error = %v; want ErrRegistrationLost",
+				result.err,
+			)
+		}
+		if taskStore.claimCalls != 0 {
+			t.Fatalf("post-loss public reclaim claims = %d; want 0", taskStore.claimCalls)
+		}
+		if calls := handler.calls.Load(); calls != 0 {
+			t.Fatalf("post-loss public reclaim handler calls = %d; want 0", calls)
+		}
+		if cause := context.Cause(registration.Context()); cause != ErrRegistrationLost {
+			t.Fatalf(
+				"public reclaim registration cause = %v; want exact ErrRegistrationLost",
+				cause,
+			)
+		}
+	}
+	if taskStore.ackCalls != 0 {
+		t.Fatalf("public reclaim acknowledgement calls = %d; want 0", taskStore.ackCalls)
+	}
+	after, err := client.XRangeN(
+		context.Background(),
+		cfg.RedisStream,
+		messageID,
+		messageID,
+		1,
+	).Result()
+	if err != nil ||
+		len(after) != 1 ||
+		after[0].ID != before[0].ID ||
+		!reflect.DeepEqual(after[0].Values, before[0].Values) {
+		t.Fatalf(
+			"public reclaim changed exact delivery: before=%#v after=%#v err=%v",
+			before,
+			after,
+			err,
+		)
+	}
+	pending, err := client.XPendingExt(
+		context.Background(),
+		&redis.XPendingExtArgs{
+			Stream: cfg.RedisStream,
+			Group:  cfg.RedisGroup,
+			Start:  messageID,
+			End:    messageID,
+			Count:  1,
+		},
+	).Result()
+	if err != nil ||
+		len(pending) != 1 ||
+		pending[0].Consumer != cfg.WorkerID {
+		t.Fatalf(
+			"public reclaim exact PEL entry = %#v, err=%v; want current owner",
+			pending,
+			err,
+		)
+	}
+	if length, err := client.XLen(
+		context.Background(),
+		cfg.RedisStream,
+	).Result(); err != nil || length != 1 {
+		t.Fatalf("public reclaim stream length = %d, err=%v; want 1", length, err)
 	}
 }
 

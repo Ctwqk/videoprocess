@@ -636,6 +636,85 @@ func TestRegistrationPostgres16CloseContextGatesRacingDirectAcquire(
 	}
 }
 
+func TestRegistrationPostgres16OwnedPoolRejectsAcquireAllIdle(
+	t *testing.T,
+) {
+	t.Run("before close", func(t *testing.T) {
+		worker := newPoolLifecycleTestStore(t, nil)
+		idle := worker.Pool.AcquireAllIdle(context.Background())
+		for _, connection := range idle {
+			connection.Release()
+		}
+		if len(idle) != 0 {
+			t.Fatalf(
+				"owned Pool.AcquireAllIdle returned %d untracked connections before close; want 0",
+				len(idle),
+			)
+		}
+	})
+
+	t.Run("during close", func(t *testing.T) {
+		worker := newPoolLifecycleTestStore(t, nil)
+		held, err := worker.Pool.Acquire(context.Background())
+		if err != nil {
+			t.Fatalf("acquire tracked close holder: %v", err)
+		}
+		idleSeed, err := worker.Pool.Acquire(context.Background())
+		if err != nil {
+			held.Release()
+			t.Fatalf("acquire idle seed: %v", err)
+		}
+		idleSeed.Release()
+		idleDeadline := time.Now().Add(time.Second)
+		for worker.Pool.Stat().IdleConns() == 0 &&
+			time.Now().Before(idleDeadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if worker.Pool.Stat().IdleConns() == 0 {
+			held.Release()
+			t.Fatal("released seed connection did not become idle")
+		}
+
+		closeContext, cancelClose := context.WithTimeout(
+			context.Background(),
+			100*time.Millisecond,
+		)
+		defer cancelClose()
+		closeDone := make(chan error, 1)
+		go func() {
+			closeDone <- worker.CloseContext(closeContext)
+		}()
+		waitForPoolGateClosing(t, worker.closeGate)
+		idle := worker.Pool.AcquireAllIdle(context.Background())
+		held.Release()
+		if len(idle) != 0 {
+			<-closeContext.Done()
+			for _, connection := range idle {
+				connection.Release()
+			}
+			var closeErr error
+			select {
+			case closeErr = <-closeDone:
+			case <-time.After(time.Second):
+				t.Fatal("CloseContext did not converge after untracked holders released")
+			}
+			t.Fatalf(
+				"owned Pool.AcquireAllIdle returned %d connections after close began and held CloseContext past its deadline; eventual error=%v",
+				len(idle),
+				closeErr,
+			)
+		}
+		select {
+		case closeErr := <-closeDone:
+			if closeErr != nil {
+				t.Fatalf("CloseContext after tracked release: %v", closeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("CloseContext did not converge after tracked release")
+		}
+	})
+}
+
 func TestRegistrationPostgres16CloseContextWaitsForAcquireBeforePrepare(
 	t *testing.T,
 ) {
@@ -820,6 +899,41 @@ func TestRegistrationPostgres16ExternalStoreCloseFailsWithoutMutation(
 			backendPID,
 			reusedPID,
 		)
+	}
+}
+
+func TestRegistrationPostgres16ExternalStoreCloseClosesSynchronously(
+	t *testing.T,
+) {
+	testURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_POSTGRES_TEST_URL"))
+	if testURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_POSTGRES_TEST_URL for PostgreSQL 16 worker integration tests")
+	}
+	pool, err := pgxpool.New(context.Background(), testURL)
+	if err != nil {
+		t.Fatalf("open external Close pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	probeContext, cancelProbe := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	if err := pool.Ping(probeContext); err != nil {
+		cancelProbe()
+		t.Fatalf("ping external Close pool: %v", err)
+	}
+	cancelProbe()
+
+	external := &Store{Pool: pool}
+	external.Close()
+
+	closedContext, cancelClosed := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	defer cancelClosed()
+	if err := pool.Ping(closedContext); err == nil {
+		t.Fatal("external Store.Close left the caller-supplied pool open")
 	}
 }
 
@@ -1056,7 +1170,33 @@ func newPoolLifecycleTestStore(
 	if err := pool.Ping(pingContext); err != nil {
 		t.Fatalf("ping pool lifecycle test pool: %v", err)
 	}
-	return &Store{Pool: pool, closeGate: gate}
+	return &Store{
+		Pool:      &ownedStorePool{Pool: pool},
+		closeGate: gate,
+	}
+}
+
+func waitForPoolGateClosing(t *testing.T, gate *poolAcquisitionGate) {
+	t.Helper()
+	waitContext, cancelWait := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	defer cancelWait()
+	for {
+		gate.mu.Lock()
+		closing := gate.closing
+		changed := gate.changed
+		gate.mu.Unlock()
+		if closing {
+			return
+		}
+		select {
+		case <-changed:
+		case <-waitContext.Done():
+			t.Fatal("pool acquisition gate did not begin closing")
+		}
+	}
 }
 
 func newWorkerPostgresFixture(t *testing.T) *workerPostgresFixture {

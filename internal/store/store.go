@@ -9,15 +9,38 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/multitracer"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+type StorePool interface {
+	Acquire(context.Context) (*pgxpool.Conn, error)
+	AcquireAllIdle(context.Context) []*pgxpool.Conn
+	Begin(context.Context) (pgx.Tx, error)
+	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+	Close()
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Ping(context.Context) error
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Reset()
+	Stat() *pgxpool.Stat
+}
 
 // Store wraps a pgx pool and exposes the query methods the Go API needs.
 // Field/column names mirror `backend/app/models/*.py` exactly so JSON
 // produced from these rows matches the Python FastAPI response shapes.
 type Store struct {
-	Pool      *pgxpool.Pool
+	Pool      StorePool
 	closeGate *poolAcquisitionGate
+}
+
+type ownedStorePool struct {
+	*pgxpool.Pool
+}
+
+func (p *ownedStorePool) AcquireAllIdle(context.Context) []*pgxpool.Conn {
+	return nil
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
@@ -35,15 +58,23 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Store{Pool: pool, closeGate: closeGate}, nil
+	return &Store{
+		Pool:      &ownedStorePool{Pool: pool},
+		closeGate: closeGate,
+	}, nil
 }
 
-// Close closes pools created by Open. A Store wrapping an external pool leaves
-// that pool with its owner; CloseContext reports ErrStorePoolNotOwned.
+// Close synchronously closes the configured pool. CloseContext only owns the
+// bounded lifecycle for pools created by Open.
 func (s *Store) Close() {
-	if s != nil && s.Pool != nil {
-		_ = s.CloseContext(context.Background())
+	if s == nil || s.Pool == nil {
+		return
 	}
+	if s.closeGate == nil {
+		s.Pool.Close()
+		return
+	}
+	_ = s.CloseContext(context.Background())
 }
 
 func (s *Store) CloseContext(ctx context.Context) error {
@@ -187,7 +218,7 @@ func (g *poolAcquisitionGate) reopen() {
 
 func (g *poolAcquisitionGate) wait(
 	ctx context.Context,
-	pool *pgxpool.Pool,
+	pool StorePool,
 ) bool {
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -199,8 +200,22 @@ func ParseWorkerRedisOptions(rawRedisURL string) (*redis.Options, error) {
 	if rawRedisURL == "" {
 		rawRedisURL = "redis://localhost:6379/0"
 	}
+	durationQuery, durationsValid := parseWorkerRedisConnectionDurationQuery(
+		rawRedisURL,
+	)
 	options, err := redis.ParseURL(rawRedisURL)
-	if err != nil || !validWorkerRedisOptions(options) {
+	if err == nil && durationsValid {
+		if durationQuery.lifetimeSet {
+			options.ConnMaxLifetime = durationQuery.lifetime
+		}
+		if durationQuery.jitterSet {
+			options.ConnMaxLifetimeJitter = durationQuery.jitter
+			if options.ConnMaxLifetimeJitter > options.ConnMaxLifetime {
+				options.ConnMaxLifetimeJitter = options.ConnMaxLifetime
+			}
+		}
+	}
+	if err != nil || !durationsValid || !validWorkerRedisOptions(options) {
 		return nil, &WorkerSecretError{
 			message: "worker Redis configuration is invalid",
 		}
@@ -217,6 +232,7 @@ func validWorkerRedisOptions(options *redis.Options) bool {
 		options.MaxRetries == int(^uint(0)>>1) ||
 		!validWorkerRedisRetryBackoff(options.MinRetryBackoff) ||
 		!validWorkerRedisRetryBackoff(options.MaxRetryBackoff) ||
+		!validWorkerRedisConnectionDurations(options) ||
 		options.PoolSize < 0 ||
 		options.MinIdleConns < 0 ||
 		options.MaxIdleConns < 0 ||
@@ -258,6 +274,112 @@ func validWorkerRedisOptions(options *redis.Options) bool {
 
 func validWorkerRedisRetryBackoff(backoff time.Duration) bool {
 	return backoff == -1 || backoff >= 0
+}
+
+type workerRedisConnectionDurationQuery struct {
+	lifetimeSet bool
+	lifetime    time.Duration
+	jitterSet   bool
+	jitter      time.Duration
+}
+
+func parseWorkerRedisConnectionDurationQuery(
+	rawRedisURL string,
+) (workerRedisConnectionDurationQuery, bool) {
+	parsed, err := url.Parse(rawRedisURL)
+	if err != nil {
+		return workerRedisConnectionDurationQuery{}, false
+	}
+	query := parsed.Query()
+	if value, ok := workerRedisDurationQueryValue(
+		query,
+		"conn_max_idle_time",
+		"idle_timeout",
+	); ok {
+		idle, valid := parseWorkerRedisURLDuration(value)
+		if !valid || idle < 0 && idle != -time.Nanosecond {
+			return workerRedisConnectionDurationQuery{}, false
+		}
+	}
+	result := workerRedisConnectionDurationQuery{}
+	if value, ok := workerRedisDurationQueryValue(
+		query,
+		"conn_max_lifetime",
+		"max_conn_age",
+	); ok {
+		lifetime, valid := parseWorkerRedisURLDuration(value)
+		if !valid || lifetime < 0 {
+			return workerRedisConnectionDurationQuery{}, false
+		}
+		result.lifetimeSet = true
+		result.lifetime = lifetime
+	}
+	if value, ok := workerRedisDurationQueryValue(
+		query,
+		"conn_max_lifetime_jitter",
+		"",
+	); ok {
+		jitter, valid := parseWorkerRedisURLDuration(value)
+		if !valid || jitter < 0 {
+			return workerRedisConnectionDurationQuery{}, false
+		}
+		result.jitterSet = true
+		result.jitter = jitter
+	}
+	return result, true
+}
+
+func workerRedisDurationQueryValue(
+	query url.Values,
+	name string,
+	legacyName string,
+) (string, bool) {
+	values := query[name]
+	if len(values) == 0 && legacyName != "" {
+		values = query[legacyName]
+	}
+	if len(values) == 0 || values[len(values)-1] == "" {
+		return "", false
+	}
+	return values[len(values)-1], true
+}
+
+func parseWorkerRedisURLDuration(value string) (time.Duration, bool) {
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return time.Duration(seconds), true
+		}
+		const maxDuration = time.Duration(1<<63 - 1)
+		if int64(seconds) > int64(maxDuration/time.Second) {
+			return 0, false
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	duration, err := time.ParseDuration(value)
+	return duration, err == nil
+}
+
+func validWorkerRedisConnectionDurations(options *redis.Options) bool {
+	if options == nil ||
+		options.ConnMaxIdleTime < 0 &&
+			options.ConnMaxIdleTime != -time.Nanosecond ||
+		options.ConnMaxLifetime < 0 ||
+		options.ConnMaxLifetimeJitter < 0 {
+		return false
+	}
+	effectiveJitter := options.ConnMaxLifetimeJitter
+	if effectiveJitter > options.ConnMaxLifetime {
+		effectiveJitter = options.ConnMaxLifetime
+	}
+	if effectiveJitter <= 0 || options.ConnMaxLifetime <= 0 {
+		return true
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	if effectiveJitter > maxDuration/2 {
+		return false
+	}
+	maxPositiveOffset := effectiveJitter - time.Nanosecond
+	return options.ConnMaxLifetime <= maxDuration-maxPositiveOffset
 }
 
 func workerAllowsEnvironmentSecretFallback(
