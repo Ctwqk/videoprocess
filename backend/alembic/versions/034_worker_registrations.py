@@ -696,11 +696,26 @@ BEGIN
               ON namespace.oid = defaults.defaclnamespace
             WHERE defaults.defaclnamespace = 0
                OR namespace.nspname = 'public'
+            UNION
+            SELECT role.oid
+            FROM pg_catalog.pg_roles AS role
+            WHERE pg_catalog.has_database_privilege(
+                      role.oid,
+                      pg_catalog.current_database(),
+                      'CREATE'
+                  )
+               OR pg_catalog.has_schema_privilege(
+                      role.oid,
+                      'public',
+                      'CREATE'
+                  )
         )
         SELECT owner.rolname
         FROM relevant_owner_oids
         JOIN pg_catalog.pg_roles AS owner
           ON owner.oid = relevant_owner_oids.oid
+        WHERE owner.rolname = current_user
+           OR owner.rolname !~ '^pg_'
         ORDER BY owner.rolname
     LOOP
         FOREACH v_object_kind IN ARRAY ARRAY[

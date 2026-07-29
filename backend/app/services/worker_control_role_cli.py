@@ -18,6 +18,7 @@ import asyncpg  # type: ignore[import-untyped]
 from app.services.worker_role_cli_common import (
     WorkerRoleCommonError,
     acquire_role_lifecycle_lock,
+    acquire_stable_role_authority_locks,
     asyncpg_url,
     create_login_role,
     drop_login_roles,
@@ -618,6 +619,10 @@ async def _provision(
     created = False
     fresh = False
     try:
+        await acquire_stable_role_authority_locks(
+            connection,
+            tuple(names.stable.values()),
+        )
         await acquire_role_lifecycle_lock(
             connection,
             f"control:{generation}",
@@ -975,6 +980,10 @@ async def _revoke(
 ) -> None:
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     try:
+        await acquire_stable_role_authority_locks(
+            connection,
+            tuple(names.stable.values()),
+        )
         await acquire_role_lifecycle_lock(
             connection,
             f"control:{generation}",

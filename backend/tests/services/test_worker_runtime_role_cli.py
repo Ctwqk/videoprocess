@@ -459,7 +459,7 @@ async def test_runtime_cli_fails_safely_when_authority_lock_fails(
     monkeypatch.setattr(runtime_cli.asyncpg, "connect", fake_connect)
     monkeypatch.setattr(
         runtime_cli,
-        "acquire_worker_service_authority_lock",
+        "acquire_stable_role_authority_locks",
         fail_lock,
     )
     monkeypatch.setenv(runtime_cli.OWNER_URL_FILE_ENV, str(owner))

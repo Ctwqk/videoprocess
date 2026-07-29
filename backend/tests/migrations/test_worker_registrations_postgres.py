@@ -368,6 +368,9 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
     )
     assert "DO $public_default_acl$" in sql
     assert "defaults.defaclnamespace = 0" in sql
+    assert "pg_catalog.has_database_privilege(" in sql
+    assert "pg_catalog.has_schema_privilege(" in sql
+    assert "owner.rolname !~ '^pg_'" in sql
     assert (
         "'ALTER DEFAULT PRIVILEGES FOR ROLE %I '"
         in sql

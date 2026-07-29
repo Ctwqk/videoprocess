@@ -17,6 +17,7 @@ import asyncpg  # type: ignore[import-untyped]
 
 from app.services.worker_role_cli_common import (
     WorkerRoleCommonError,
+    acquire_stable_role_authority_locks,
     acquire_worker_service_authority_lock,
     asyncpg_url,
     create_login_role,
@@ -181,6 +182,11 @@ class RuntimeRoleNames:
 class RuntimeGenerationCredentials:
     database_url: str
     admission_token: str
+
+
+@dataclass(frozen=True)
+class RuntimeGrantAuthority:
+    state: str
 
 
 def role_names_for_generation(
@@ -366,6 +372,10 @@ async def _provision(
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     created = False
     try:
+        await acquire_stable_role_authority_locks(
+            connection,
+            (names.stable,),
+        )
         await acquire_worker_service_authority_lock(
             connection,
             service_name,
@@ -387,6 +397,34 @@ async def _provision(
             )
         )
         if all(state_presence.values()):
+            try:
+                authority_token = read_secure_file(
+                    paths["admission_token"],
+                    required_mode=0o400,
+                ).strip()
+            except WorkerRoleCommonError as exc:
+                raise RuntimeRoleError("generation state invalid") from exc
+            if not authority_token:
+                raise RuntimeRoleError("generation state invalid")
+            authority = await _classify_generation_authority(
+                connection,
+                service_name,
+                generation,
+                names,
+                authority_token,
+            )
+            if authority.state == "revoked":
+                await _retire_local_generation(
+                    connection,
+                    state_dir,
+                    service_name,
+                    generation,
+                    names,
+                )
+                raise RuntimeRoleError("generation authority revoked")
+            if authority.state == "mismatch":
+                await _deauthorize_generation(connection, names)
+                raise RuntimeRoleError("generation authority mismatch")
             credentials = await _validate_existing_generation(
                 connection,
                 owner_url,
@@ -404,7 +442,6 @@ async def _provision(
                 credentials,
             )
             return
-        recovered_admission_token: str | None = None
         if any(state_presence.values()) or role_exists:
             reconstructed = await _reconstruct_generation_state(
                 connection,
@@ -425,21 +462,19 @@ async def _provision(
                     reconstructed,
                 )
                 return
-            recovered_admission_token = (
-                await _recover_interrupted_generation(
-                    connection,
-                    state_dir,
-                    service_name,
-                    generation,
-                    paths,
-                    names,
-                )
-            )
+            await _deauthorize_generation(connection, names)
+            raise RuntimeRoleError("interrupted generation unauthorized")
+
+        if await _generation_has_any_authority(
+            connection,
+            service_name,
+            generation,
+            names,
+        ):
+            raise RuntimeRoleError("fresh generation authority conflict")
 
         database_password = secrets.token_urlsafe(32)
-        admission_token = (
-            recovered_admission_token or secrets.token_urlsafe(32)
-        )
+        admission_token = secrets.token_urlsafe(32)
         authorized_members = await _authorized_runtime_members(
             connection,
             owner_url,
@@ -511,46 +546,115 @@ async def _provision(
         await connection.close()
 
 
-async def _recover_interrupted_generation(
+async def _classify_generation_authority(
     connection: asyncpg.Connection,
-    state_dir: Path,
     service_name: str,
     generation: int,
-    paths: Mapping[str, Path],
     names: RuntimeRoleNames,
-) -> str | None:
-    if await connection.fetchval(
+    admission_token: str,
+) -> RuntimeGrantAuthority:
+    rows = await connection.fetch(
+        """
+        SELECT
+            grant_record.service_name,
+            grant_record.generation,
+            grant_record.database_principal,
+            grant_record.token_sha256,
+            grant_record.state,
+            grant_record.revoked_at
+        FROM public.worker_admission_grants AS grant_record
+        WHERE (
+            grant_record.service_name = $1
+            AND grant_record.generation = $2
+        )
+           OR grant_record.database_principal = $3
+        ORDER BY grant_record.id
+        """,
+        service_name,
+        generation,
+        names.versioned,
+    )
+    if not rows:
+        return RuntimeGrantAuthority(state="none")
+    if len(rows) != 1:
+        return RuntimeGrantAuthority(state="mismatch")
+    row = rows[0]
+    identity_matches = (
+        row["service_name"] == service_name
+        and row["generation"] == generation
+        and row["database_principal"] == names.versioned
+    )
+    if not identity_matches:
+        return RuntimeGrantAuthority(state="mismatch")
+    if row["state"] == "revoked":
+        return RuntimeGrantAuthority(state="revoked")
+    token_sha256 = hashlib.sha256(
+        admission_token.encode("utf-8")
+    ).hexdigest()
+    if (
+        row["token_sha256"] != token_sha256
+        or row["revoked_at"] is not None
+        or row["state"] not in {"pending", "active"}
+    ):
+        return RuntimeGrantAuthority(state="mismatch")
+    return RuntimeGrantAuthority(state=row["state"])
+
+
+async def _generation_has_any_authority(
+    connection: asyncpg.Connection,
+    service_name: str,
+    generation: int,
+    names: RuntimeRoleNames,
+) -> bool:
+    return bool(
+        await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM public.worker_admission_grants AS grant_record
+                WHERE (
+                    grant_record.service_name = $1
+                    AND grant_record.generation = $2
+                )
+                   OR grant_record.database_principal = $3
+            )
+            """,
+            service_name,
+            generation,
+            names.versioned,
+        )
+    )
+
+
+async def _deauthorize_generation(
+    connection: asyncpg.Connection,
+    names: RuntimeRoleNames,
+) -> None:
+    if not await connection.fetchval(
         """
         SELECT EXISTS (
             SELECT 1
-            FROM public.worker_admission_grants AS grant_record
-            WHERE grant_record.database_principal = $1
-            UNION ALL
-            SELECT 1
-            FROM public.worker_registrations AS registration
-            JOIN public.worker_admission_grants AS grant_record
-              ON grant_record.id = registration.grant_id
-            WHERE grant_record.database_principal = $1
+            FROM pg_catalog.pg_roles
+            WHERE rolname = $1
         )
         """,
         names.versioned,
     ):
-        raise RuntimeRoleError("interrupted generation is durable")
-    admission_token: str | None = None
-    if paths["admission_token"].exists():
-        try:
-            admission_token = read_secure_file(
-                paths["admission_token"],
-                required_mode=0o400,
-            ).strip()
-        except WorkerRoleCommonError as exc:
-            raise RuntimeRoleError(
-                "interrupted generation credential invalid"
-            ) from exc
-        if not admission_token:
-            raise RuntimeRoleError(
-                "interrupted generation credential invalid"
-            )
+        return
+    async with connection.transaction():
+        await connection.execute(
+            f"REVOKE {quote_identifier(names.stable)} "
+            f"FROM {quote_identifier(names.versioned)}"
+        )
+
+
+async def _retire_local_generation(
+    connection: asyncpg.Connection,
+    state_dir: Path,
+    service_name: str,
+    generation: int,
+    names: RuntimeRoleNames,
+) -> None:
     async with connection.transaction():
         await drop_login_roles(connection, (names.versioned,))
     try:
@@ -561,9 +665,8 @@ async def _recover_interrupted_generation(
         )
     except WorkerRoleCommonError as exc:
         raise RuntimeRoleError(
-            "interrupted generation cleanup failed"
+            "revoked generation cleanup failed"
         ) from exc
-    return admission_token
 
 
 async def _set_runtime_privileges(
@@ -689,37 +792,25 @@ async def _reconstruct_generation_state(
         database_url,
         names.versioned,
     )
-    token_sha256 = hashlib.sha256(
-        admission_token.encode("utf-8")
-    ).hexdigest()
-    if await connection.fetchval(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM public.worker_admission_grants AS grant_record
-            WHERE (
-                (
-                    grant_record.service_name = $1
-                    AND grant_record.generation = $2
-                )
-                OR grant_record.database_principal = $3
-            )
-              AND (
-                  grant_record.service_name IS DISTINCT FROM $1
-                  OR grant_record.generation IS DISTINCT FROM $2
-                  OR grant_record.database_principal IS DISTINCT FROM $3
-                  OR grant_record.token_sha256 IS DISTINCT FROM $4
-              )
-        )
-        """,
+    authority = await _classify_generation_authority(
+        connection,
         service_name,
         generation,
-        names.versioned,
-        token_sha256,
-    ):
-        raise RuntimeRoleError(
-            "interrupted generation authority mismatch"
+        names,
+        admission_token,
+    )
+    if authority.state == "revoked":
+        await _retire_local_generation(
+            connection,
+            state_dir,
+            service_name,
+            generation,
+            names,
         )
+        raise RuntimeRoleError("generation authority revoked")
+    if authority.state not in {"pending", "active"}:
+        await _deauthorize_generation(connection, names)
+        raise RuntimeRoleError("interrupted generation unauthorized")
     write_generation_state(
         state_dir,
         service_name,
@@ -776,52 +867,74 @@ async def _authorized_runtime_members(
     state_dir: Path,
     service_name: str,
 ) -> set[str]:
-    service_dir = state_dir / service_name
-    if not state_dir.exists() or not service_dir.exists():
+    if not SERVICE_PATTERN.fullmatch(service_name):
+        raise RuntimeRoleError("generation service invalid")
+    if not state_dir.exists():
         return set()
     _require_private_state_directory(state_dir)
-    _require_private_state_directory(service_dir)
     authorized: set[str] = set()
-    with os.scandir(service_dir) as entries:
-        generation_names = sorted(
+    with os.scandir(state_dir) as entries:
+        service_names = sorted(
             entry.name
             for entry in entries
             if entry.is_dir(follow_symlinks=False)
         )
-    for generation_name in generation_names:
-        if (
-            not generation_name.isascii()
-            or not generation_name.isdigit()
-            or generation_name.startswith("0")
-        ):
+    for managed_service_name in service_names:
+        if not SERVICE_PATTERN.fullmatch(managed_service_name):
             continue
-        generation = int(generation_name)
-        if generation > MAX_GENERATION:
-            continue
-        generation_dir = service_dir / generation_name
-        try:
-            _require_private_state_directory(generation_dir)
-            names = role_names_for_generation(service_name, generation)
-            await _validate_existing_generation(
-                connection,
-                owner_url,
-                service_name,
-                generation,
-                credential_paths(
-                    state_dir,
-                    service_name,
-                    generation,
-                ),
-                names,
+        service_dir = state_dir / managed_service_name
+        _require_private_state_directory(service_dir)
+        with os.scandir(service_dir) as entries:
+            generation_names = sorted(
+                entry.name
+                for entry in entries
+                if entry.is_dir(follow_symlinks=False)
             )
-        except (
-            asyncpg.PostgresError,
-            OSError,
-            RuntimeRoleError,
-            WorkerRoleCommonError,
-        ):
-            continue
-        authorized.add(names.versioned)
+        for generation_name in generation_names:
+            if (
+                not generation_name.isascii()
+                or not generation_name.isdigit()
+                or generation_name.startswith("0")
+            ):
+                continue
+            generation = int(generation_name)
+            if generation > MAX_GENERATION:
+                continue
+            generation_dir = service_dir / generation_name
+            try:
+                _require_private_state_directory(generation_dir)
+                names = role_names_for_generation(
+                    managed_service_name,
+                    generation,
+                )
+                credentials = await _validate_existing_generation(
+                    connection,
+                    owner_url,
+                    managed_service_name,
+                    generation,
+                    credential_paths(
+                        state_dir,
+                        managed_service_name,
+                        generation,
+                    ),
+                    names,
+                )
+                authority = await _classify_generation_authority(
+                    connection,
+                    managed_service_name,
+                    generation,
+                    names,
+                    credentials.admission_token,
+                )
+            except (
+                asyncpg.PostgresError,
+                OSError,
+                RuntimeRoleError,
+                WorkerRoleCommonError,
+            ):
+                continue
+            if authority.state in {"none", "pending", "active"}:
+                authorized.add(names.versioned)
     return authorized
 
 
@@ -847,6 +960,10 @@ async def _revoke(
 ) -> None:
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     try:
+        await acquire_stable_role_authority_locks(
+            connection,
+            (names.stable,),
+        )
         await acquire_worker_service_authority_lock(
             connection,
             service_name,

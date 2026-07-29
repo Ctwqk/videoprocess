@@ -114,6 +114,29 @@ async def acquire_role_lifecycle_lock(
     )
 
 
+async def acquire_stable_role_authority_locks(
+    connection: asyncpg.Connection,
+    role_names: Sequence[str],
+) -> None:
+    # Global order: sorted stable roles, service/generation, registrations, rows.
+    ordered_role_names = sorted(set(role_names))
+    if not ordered_role_names or len(ordered_role_names) != len(role_names):
+        raise WorkerRoleCommonError("stable role lock scope invalid")
+    for role_name in ordered_role_names:
+        quote_identifier(role_name)
+        await connection.execute(
+            """
+            SELECT pg_catalog.pg_advisory_lock(
+                pg_catalog.hashtextextended(
+                    'vp-worker-stable-role:' || $1,
+                    0
+                )
+            )
+            """,
+            role_name,
+        )
+
+
 async def acquire_worker_service_authority_lock(
     connection: asyncpg.Connection,
     service_name: str,
@@ -716,11 +739,26 @@ async def _converge_public_privileges(
               ON namespace.oid = defaults.defaclnamespace
             WHERE defaults.defaclnamespace = 0
                OR namespace.nspname = 'public'
+            UNION
+            SELECT role.oid
+            FROM pg_catalog.pg_roles AS role
+            WHERE pg_catalog.has_database_privilege(
+                      role.oid,
+                      pg_catalog.current_database(),
+                      'CREATE'
+                  )
+               OR pg_catalog.has_schema_privilege(
+                      role.oid,
+                      'public',
+                      'CREATE'
+                  )
         )
         SELECT owner.rolname AS owner_name
         FROM relevant_owner_oids
         JOIN pg_catalog.pg_roles AS owner
           ON owner.oid = relevant_owner_oids.oid
+        WHERE owner.rolname = current_user
+           OR owner.rolname !~ '^pg_'
         ORDER BY owner.rolname
         """
     )
@@ -815,6 +853,23 @@ async def drop_login_roles(
     connection: asyncpg.Connection,
     role_names: Sequence[str],
 ) -> None:
+    for role_name in role_names:
+        if not await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_roles
+                WHERE rolname = $1
+            )
+            """,
+            role_name,
+        ):
+            continue
+        if await _role_owns_objects(connection, role_name):
+            raise WorkerRoleCommonError("database login role owns objects")
+        await connection.execute(
+            f"ALTER ROLE {quote_identifier(role_name)} NOLOGIN"
+        )
     await connection.execute(
         """
         SELECT pg_catalog.pg_terminate_backend(activity.pid)
@@ -853,6 +908,9 @@ async def drop_login_roles(
                 f"REVOKE {quote_identifier(membership['rolname'])} "
                 f"FROM {quote_identifier(role_name)}"
             )
+        await connection.execute(
+            f"DROP OWNED BY {quote_identifier(role_name)}"
+        )
         await connection.execute(
             f"DROP ROLE {quote_identifier(role_name)}"
         )
