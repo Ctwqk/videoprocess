@@ -114,6 +114,29 @@ async def acquire_role_lifecycle_lock(
     )
 
 
+async def acquire_worker_service_authority_lock(
+    connection: asyncpg.Connection,
+    service_name: str,
+) -> None:
+    if (
+        not service_name
+        or "\x00" in service_name
+        or len(service_name.encode("utf-8")) > 255
+    ):
+        raise WorkerRoleCommonError("worker service scope invalid")
+    await connection.execute(
+        """
+        SELECT pg_catalog.pg_advisory_lock(
+            pg_catalog.hashtextextended(
+                'vp-worker-service:' || $1,
+                0
+            )
+        )
+        """,
+        service_name,
+    )
+
+
 async def ensure_stable_role(
     connection: asyncpg.Connection,
     role_name: str,
@@ -183,9 +206,6 @@ async def ensure_stable_role(
         connection,
         role_name,
         authorized_members=authorized_members,
-        managed_member_comment=(
-            f"{MANAGED_LOGIN_COMMENT_PREFIX}{role_name}"
-        ),
     )
 
 
@@ -238,7 +258,6 @@ async def harden_existing_login_role(
         connection,
         role_name,
         authorized_members=(),
-        managed_member_comment=None,
     )
 
     await connection.execute(
@@ -560,16 +579,10 @@ async def _converge_reverse_memberships(
     granted_role: str,
     *,
     authorized_members: Sequence[str],
-    managed_member_comment: str | None,
 ) -> None:
     rows = await connection.fetch(
         """
-        SELECT
-            member.rolname,
-            pg_catalog.shobj_description(
-                member.oid,
-                'pg_authid'
-            ) AS managed_comment
+        SELECT member.rolname
         FROM pg_catalog.pg_auth_members AS membership
         JOIN pg_catalog.pg_roles AS member
           ON member.oid = membership.member
@@ -582,18 +595,11 @@ async def _converge_reverse_memberships(
     explicitly_authorized = set(authorized_members)
     for row in rows:
         member_name = row["rolname"]
-        is_authorized = (
-            member_name in explicitly_authorized
-            or (
-                managed_member_comment is not None
-                and row["managed_comment"] == managed_member_comment
-            )
-        )
         await connection.execute(
             f"REVOKE {quote_identifier(granted_role)} "
             f"FROM {quote_identifier(member_name)}"
         )
-        if is_authorized:
+        if member_name in explicitly_authorized:
             await connection.execute(
                 f"GRANT {quote_identifier(granted_role)} "
                 f"TO {quote_identifier(member_name)}"
@@ -675,52 +681,76 @@ async def _converge_public_privileges(
         await connection.execute(
             f"REVOKE EXECUTE ON FUNCTION {routine['signature']} FROM PUBLIC"
         )
-    await connection.execute(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
-        "REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC"
-    )
-    await connection.execute(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
-        "REVOKE ALL PRIVILEGES ON SEQUENCES FROM PUBLIC"
-    )
-    await connection.execute(
-        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
-        "REVOKE ALL PRIVILEGES ON FUNCTIONS FROM PUBLIC"
-    )
-    public_defaults = await connection.fetch(
+    relevant_owners = await connection.fetch(
         """
-        SELECT DISTINCT
-            owner.rolname AS owner_name,
-            defaults.defaclobjtype::text AS object_type
-        FROM pg_catalog.pg_default_acl AS defaults
-        JOIN pg_catalog.pg_roles AS owner
-          ON owner.oid = defaults.defaclrole
-        JOIN pg_catalog.pg_namespace AS namespace
-          ON namespace.oid = defaults.defaclnamespace
-        CROSS JOIN LATERAL pg_catalog.aclexplode(
-            defaults.defaclacl
-        ) AS privilege
-        WHERE namespace.nspname = 'public'
-          AND privilege.grantee = 0
-        """
-    )
-    object_kinds = {
-        "r": "TABLES",
-        "S": "SEQUENCES",
-        "f": "FUNCTIONS",
-    }
-    for default_acl in public_defaults:
-        object_kind = object_kinds.get(default_acl["object_type"])
-        if object_kind is None:
-            raise WorkerRoleCommonError(
-                "unsupported public default privilege"
-            )
-        await connection.execute(
-            "ALTER DEFAULT PRIVILEGES FOR ROLE "
-            f"{quote_identifier(default_acl['owner_name'])} "
-            "IN SCHEMA public REVOKE ALL PRIVILEGES "
-            f"ON {object_kind} FROM PUBLIC"
+        WITH relevant_owner_oids AS (
+            SELECT role.oid
+            FROM pg_catalog.pg_roles AS role
+            WHERE role.rolname = current_user
+            UNION
+            SELECT relation.relowner
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+            UNION
+            SELECT routine.proowner
+            FROM pg_catalog.pg_proc AS routine
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = routine.pronamespace
+            WHERE namespace.nspname = 'public'
+            UNION
+            SELECT type_record.typowner
+            FROM pg_catalog.pg_type AS type_record
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = type_record.typnamespace
+            WHERE namespace.nspname = 'public'
+            UNION
+            SELECT namespace.nspowner
+            FROM pg_catalog.pg_namespace AS namespace
+            WHERE namespace.nspname = 'public'
+            UNION
+            SELECT defaults.defaclrole
+            FROM pg_catalog.pg_default_acl AS defaults
+            LEFT JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = defaults.defaclnamespace
+            WHERE defaults.defaclnamespace = 0
+               OR namespace.nspname = 'public'
         )
+        SELECT owner.rolname AS owner_name
+        FROM relevant_owner_oids
+        JOIN pg_catalog.pg_roles AS owner
+          ON owner.oid = relevant_owner_oids.oid
+        ORDER BY owner.rolname
+        """
+    )
+    for owner in relevant_owners:
+        owner_clause = (
+            "ALTER DEFAULT PRIVILEGES FOR ROLE "
+            f"{quote_identifier(owner['owner_name'])}"
+        )
+        for object_kind in (
+            "TABLES",
+            "SEQUENCES",
+            "FUNCTIONS",
+            "TYPES",
+            "SCHEMAS",
+        ):
+            await connection.execute(
+                f"{owner_clause} REVOKE ALL PRIVILEGES "
+                f"ON {object_kind} FROM PUBLIC"
+            )
+        for object_kind in (
+            "TABLES",
+            "SEQUENCES",
+            "FUNCTIONS",
+            "TYPES",
+        ):
+            await connection.execute(
+                f"{owner_clause} IN SCHEMA public "
+                "REVOKE ALL PRIVILEGES "
+                f"ON {object_kind} FROM PUBLIC"
+            )
 
 
 async def _converge_function_execute_grantees(

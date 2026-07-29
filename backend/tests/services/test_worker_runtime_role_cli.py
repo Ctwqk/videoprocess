@@ -429,7 +429,7 @@ async def test_runtime_cli_sanitizes_shared_role_helper_failures(
     }
 
 
-async def test_runtime_cli_fails_safely_when_lifecycle_lock_fails(
+async def test_runtime_cli_fails_safely_when_authority_lock_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -459,7 +459,7 @@ async def test_runtime_cli_fails_safely_when_lifecycle_lock_fails(
     monkeypatch.setattr(runtime_cli.asyncpg, "connect", fake_connect)
     monkeypatch.setattr(
         runtime_cli,
-        "acquire_role_lifecycle_lock",
+        "acquire_worker_service_authority_lock",
         fail_lock,
     )
     monkeypatch.setenv(runtime_cli.OWNER_URL_FILE_ENV, str(owner))

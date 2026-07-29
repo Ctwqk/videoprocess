@@ -620,6 +620,26 @@ $database_acl$
     )
     op.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
     op.execute(
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC"
+    )
+    op.execute(
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON SEQUENCES FROM PUBLIC"
+    )
+    op.execute(
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON FUNCTIONS FROM PUBLIC"
+    )
+    op.execute(
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON TYPES FROM PUBLIC"
+    )
+    op.execute(
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON SCHEMAS FROM PUBLIC"
+    )
+    op.execute(
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
         "REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC"
     )
@@ -630,6 +650,93 @@ $database_acl$
     op.execute(
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
         "REVOKE ALL PRIVILEGES ON FUNCTIONS FROM PUBLIC"
+    )
+    op.execute(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON TYPES FROM PUBLIC"
+    )
+    op.execute(
+        """
+DO $public_default_acl$
+DECLARE
+    v_owner_name text;
+    v_object_kind text;
+BEGIN
+    FOR v_owner_name IN
+        WITH relevant_owner_oids AS (
+            SELECT role.oid
+            FROM pg_catalog.pg_roles AS role
+            WHERE role.rolname = current_user
+            UNION
+            SELECT relation.relowner
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'public'
+            UNION
+            SELECT routine.proowner
+            FROM pg_catalog.pg_proc AS routine
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = routine.pronamespace
+            WHERE namespace.nspname = 'public'
+            UNION
+            SELECT type_record.typowner
+            FROM pg_catalog.pg_type AS type_record
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = type_record.typnamespace
+            WHERE namespace.nspname = 'public'
+            UNION
+            SELECT namespace.nspowner
+            FROM pg_catalog.pg_namespace AS namespace
+            WHERE namespace.nspname = 'public'
+            UNION
+            SELECT defaults.defaclrole
+            FROM pg_catalog.pg_default_acl AS defaults
+            LEFT JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = defaults.defaclnamespace
+            WHERE defaults.defaclnamespace = 0
+               OR namespace.nspname = 'public'
+        )
+        SELECT owner.rolname
+        FROM relevant_owner_oids
+        JOIN pg_catalog.pg_roles AS owner
+          ON owner.oid = relevant_owner_oids.oid
+        ORDER BY owner.rolname
+    LOOP
+        FOREACH v_object_kind IN ARRAY ARRAY[
+            'TABLES',
+            'SEQUENCES',
+            'FUNCTIONS',
+            'TYPES',
+            'SCHEMAS'
+        ]
+        LOOP
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I '
+                'REVOKE ALL PRIVILEGES ON %s FROM PUBLIC',
+                v_owner_name,
+                v_object_kind
+            );
+        END LOOP;
+        FOREACH v_object_kind IN ARRAY ARRAY[
+            'TABLES',
+            'SEQUENCES',
+            'FUNCTIONS',
+            'TYPES'
+        ]
+        LOOP
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I '
+                'IN SCHEMA public '
+                'REVOKE ALL PRIVILEGES ON %s FROM PUBLIC',
+                v_owner_name,
+                v_object_kind
+            );
+        END LOOP;
+    END LOOP;
+END
+$public_default_acl$
+"""
     )
 
 

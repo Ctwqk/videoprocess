@@ -286,6 +286,9 @@ def test_worker_registration_migration_emits_complete_additive_schema_and_functi
     )
     assert downgraded.returncode == 0, downgraded.stdout + downgraded.stderr
     downgrade_sql = downgraded.stdout
+    assert "ALTER DEFAULT PRIVILEGES" not in downgrade_sql
+    assert "GRANT CREATE ON SCHEMA public TO PUBLIC" not in downgrade_sql
+    assert "GRANT CREATE, TEMPORARY ON DATABASE" not in downgrade_sql
     for table_name in (
         "registered_worker_event_deliveries",
         "registered_worker_event_receipts",
@@ -324,6 +327,31 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
     )
     assert "REVOKE CREATE ON SCHEMA public FROM PUBLIC" in sql
     assert (
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC"
+        in sql
+    )
+    assert (
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON SEQUENCES FROM PUBLIC"
+        in sql
+    )
+    assert (
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON FUNCTIONS FROM PUBLIC"
+        in sql
+    )
+    assert (
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON TYPES FROM PUBLIC"
+        in sql
+    )
+    assert (
+        "ALTER DEFAULT PRIVILEGES "
+        "REVOKE ALL PRIVILEGES ON SCHEMAS FROM PUBLIC"
+        in sql
+    )
+    assert (
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
         "REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC"
         in sql
@@ -336,6 +364,16 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
     assert (
         "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
         "REVOKE ALL PRIVILEGES ON FUNCTIONS FROM PUBLIC"
+        in sql
+    )
+    assert "DO $public_default_acl$" in sql
+    assert "defaults.defaclnamespace = 0" in sql
+    assert (
+        "'ALTER DEFAULT PRIVILEGES FOR ROLE %I '"
+        in sql
+    )
+    assert (
+        "'REVOKE ALL PRIVILEGES ON %s FROM PUBLIC'"
         in sql
     )
     for table_name in (

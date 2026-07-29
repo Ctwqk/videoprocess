@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import re
 import secrets
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -653,14 +655,24 @@ async def _provision(
                 paths,
                 names,
             )
+            authorized_members = await _authorized_control_members(
+                connection,
+                owner_url,
+                state_dir,
+            )
             async with connection.transaction():
                 for purpose, stable_role in names.stable.items():
                     await ensure_stable_role(
                         connection,
                         stable_role,
                         setting_prefix="worker_control",
-                        authorized_members=(
-                            names.versioned[purpose],
+                        authorized_members=tuple(
+                            sorted(
+                                {
+                                    *authorized_members[purpose],
+                                    names.versioned[purpose],
+                                }
+                            )
                         ),
                     )
                 for purpose, versioned_role in names.versioned.items():
@@ -684,13 +696,25 @@ async def _provision(
         }
         if len(set(passwords.values())) != len(passwords):
             raise ControlRoleError("credential generation failed")
+        authorized_members = await _authorized_control_members(
+            connection,
+            owner_url,
+            state_dir,
+        )
         async with connection.transaction():
             for purpose, stable_role in names.stable.items():
                 await ensure_stable_role(
                     connection,
                     stable_role,
                     setting_prefix="worker_control",
-                    authorized_members=(names.versioned[purpose],),
+                    authorized_members=tuple(
+                        sorted(
+                            {
+                                *authorized_members[purpose],
+                                names.versioned[purpose],
+                            }
+                        )
+                    ),
                 )
             await _set_control_privileges(connection, names)
             for purpose, versioned_role in names.versioned.items():
@@ -884,6 +908,63 @@ async def _validate_existing_generation(
         )
         role_urls[purpose] = database_url
     return role_urls
+
+
+async def _authorized_control_members(
+    connection: asyncpg.Connection,
+    owner_url: str,
+    state_dir: Path,
+) -> dict[str, set[str]]:
+    authorized: dict[str, set[str]] = {
+        purpose: set() for purpose in STABLE_ROLES
+    }
+    if not state_dir.exists():
+        return authorized
+    _require_private_state_directory(state_dir)
+    with os.scandir(state_dir) as entries:
+        generation_names = sorted(
+            entry.name
+            for entry in entries
+            if entry.is_dir(follow_symlinks=False)
+        )
+    for generation in generation_names:
+        if not GENERATION_PATTERN.fullmatch(generation):
+            continue
+        generation_dir = state_dir / generation
+        try:
+            _require_private_state_directory(generation_dir)
+            names = role_names_for_generation(generation)
+            await _validate_existing_generation(
+                connection,
+                owner_url,
+                credential_paths(state_dir, generation),
+                names,
+            )
+        except (
+            asyncpg.PostgresError,
+            OSError,
+            ControlRoleError,
+            WorkerRoleCommonError,
+        ):
+            continue
+        for purpose, role_name in names.versioned.items():
+            authorized[purpose].add(role_name)
+    return authorized
+
+
+def _require_private_state_directory(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ControlRoleError(
+            "control state directory invalid"
+        ) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise ControlRoleError("control state directory invalid")
 
 
 async def _revoke(
