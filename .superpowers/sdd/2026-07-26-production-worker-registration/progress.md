@@ -79,6 +79,13 @@ bypass the second authority/local-loss handoff fence; Redis connection
 lifetime/jitter scalars can still panic after database admission; external
 `Store.Close` silently no-ops and direct `AcquireAllIdle` bypasses the pool
 gate/statistics; commits b176ee4..2cf4494)
+Task 3: fix round 5/5 (3 addressed, 0 open — public reclaim helpers now use
+the second authority/local-loss handoff fence; unsafe Redis lifetime/jitter
+values fail before database admission; external/owned pool close and
+`AcquireAllIdle` behavior is explicit and fenced; commits 2cf4494..57be21b)
+Task 3: complete — implementation 0fe94a0 plus fix rounds 1-5 passed an
+independent final re-review with zero open Critical or Important findings.
+The three deferred Minors above remain non-load-bearing follow-up items.
 Task 4: pending
 Task 5: pending
 Task 6: pending
