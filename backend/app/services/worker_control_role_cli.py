@@ -17,6 +17,7 @@ import asyncpg  # type: ignore[import-untyped]
 
 from app.services.worker_role_cli_common import (
     WorkerRoleCommonError,
+    acquire_database_acl_dcl_lock,
     acquire_role_lifecycle_lock,
     acquire_stable_role_authority_locks,
     asyncpg_url,
@@ -25,9 +26,9 @@ from app.services.worker_role_cli_common import (
     ensure_stable_role,
     grant_columns,
     grant_functions,
-    harden_existing_login_role,
     load_database_url_file,
     quote_identifier,
+    quarantine_login_roles,
     read_secure_file,
     remove_secure_files,
     reset_public_privileges,
@@ -619,6 +620,7 @@ async def _provision(
     created = False
     fresh = False
     try:
+        await acquire_database_acl_dcl_lock(connection)
         await acquire_stable_role_authority_locks(
             connection,
             tuple(names.stable.values()),
@@ -642,24 +644,42 @@ async def _provision(
             )
         )
         fresh = not any(state_presence.values()) and existing_role_count == 0
-        if (
+        if not fresh and (
             not all(state_presence.values())
-            and (any(state_presence.values()) or existing_role_count > 0)
+            or existing_role_count != len(names.versioned)
         ):
-            await _recover_interrupted_generation(
+            await _quarantine_control_generation(
                 connection,
+                owner_url,
                 state_dir,
                 generation,
                 names,
             )
-            fresh = True
+            raise ControlRoleError("control generation state incomplete")
         if not fresh:
-            role_urls = await _validate_existing_generation(
-                connection,
-                owner_url,
-                paths,
-                names,
-            )
+            try:
+                role_urls = await _validate_existing_generation(
+                    connection,
+                    owner_url,
+                    paths,
+                    names,
+                )
+            except (
+                asyncpg.PostgresError,
+                OSError,
+                ControlRoleError,
+                WorkerRoleCommonError,
+            ) as exc:
+                await _quarantine_control_generation(
+                    connection,
+                    owner_url,
+                    state_dir,
+                    generation,
+                    names,
+                )
+                raise ControlRoleError(
+                    "control generation state invalid"
+                ) from exc
             authorized_members = await _authorized_control_members(
                 connection,
                 owner_url,
@@ -679,12 +699,6 @@ async def _provision(
                                 }
                             )
                         ),
-                    )
-                for purpose, versioned_role in names.versioned.items():
-                    await harden_existing_login_role(
-                        connection,
-                        versioned_role,
-                        names.stable[purpose],
                     )
                 await _set_control_privileges(connection, names)
             for purpose, database_url in role_urls.items():
@@ -756,22 +770,17 @@ async def _provision(
             role_urls,
         )
     except BaseException:
-        if fresh:
+        if created:
             try:
+                await drop_login_roles(
+                    connection,
+                    tuple(names.versioned.values()),
+                )
                 remove_secure_files(
                     state_dir,
                     (generation,),
                     tuple(CREDENTIAL_FILENAMES.values()),
                 )
-            except WorkerRoleCommonError:
-                pass
-        if created:
-            try:
-                async with connection.transaction():
-                    await drop_login_roles(
-                        connection,
-                        tuple(names.versioned.values()),
-                    )
             except (asyncpg.PostgresError, OSError, WorkerRoleCommonError):
                 pass
         raise
@@ -779,27 +788,33 @@ async def _provision(
         await connection.close()
 
 
-async def _recover_interrupted_generation(
+async def _quarantine_control_generation(
     connection: asyncpg.Connection,
+    owner_url: str,
     state_dir: Path,
     generation: str,
     names: ControlRoleNames,
 ) -> None:
+    await quarantine_login_roles(
+        connection,
+        tuple(names.versioned.values()),
+    )
+    authorized_members = await _authorized_control_members(
+        connection,
+        owner_url,
+        state_dir,
+        excluded_generation=generation,
+    )
     async with connection.transaction():
-        await drop_login_roles(
-            connection,
-            tuple(names.versioned.values()),
-        )
-    try:
-        remove_secure_files(
-            state_dir,
-            (generation,),
-            tuple(CREDENTIAL_FILENAMES.values()),
-        )
-    except WorkerRoleCommonError as exc:
-        raise ControlRoleError(
-            "interrupted control generation cleanup failed"
-        ) from exc
+        for purpose, stable_role in names.stable.items():
+            await ensure_stable_role(
+                connection,
+                stable_role,
+                setting_prefix="worker_control",
+                authorized_members=tuple(
+                    sorted(authorized_members[purpose])
+                ),
+            )
 
 
 async def _set_control_privileges(
@@ -919,6 +934,8 @@ async def _authorized_control_members(
     connection: asyncpg.Connection,
     owner_url: str,
     state_dir: Path,
+    *,
+    excluded_generation: str | None = None,
 ) -> dict[str, set[str]]:
     authorized: dict[str, set[str]] = {
         purpose: set() for purpose in STABLE_ROLES
@@ -935,10 +952,12 @@ async def _authorized_control_members(
     for generation in generation_names:
         if not GENERATION_PATTERN.fullmatch(generation):
             continue
+        if generation == excluded_generation:
+            continue
         generation_dir = state_dir / generation
+        names = role_names_for_generation(generation)
         try:
             _require_private_state_directory(generation_dir)
-            names = role_names_for_generation(generation)
             await _validate_existing_generation(
                 connection,
                 owner_url,
@@ -951,6 +970,10 @@ async def _authorized_control_members(
             ControlRoleError,
             WorkerRoleCommonError,
         ):
+            await quarantine_login_roles(
+                connection,
+                tuple(names.versioned.values()),
+            )
             continue
         for purpose, role_name in names.versioned.items():
             authorized[purpose].add(role_name)
@@ -980,6 +1003,7 @@ async def _revoke(
 ) -> None:
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     try:
+        await acquire_database_acl_dcl_lock(connection)
         await acquire_stable_role_authority_locks(
             connection,
             tuple(names.stable.values()),
@@ -988,17 +1012,31 @@ async def _revoke(
             connection,
             f"control:{generation}",
         )
-        async with connection.transaction():
-            await drop_login_roles(
-                connection,
-                tuple(names.versioned.values()),
-            )
+        await drop_login_roles(
+            connection,
+            tuple(names.versioned.values()),
+        )
         remove_secure_files(
             state_dir,
             (generation,),
             tuple(CREDENTIAL_FILENAMES.values()),
         )
-    except WorkerRoleCommonError as exc:
+        authorized_members = await _authorized_control_members(
+            connection,
+            owner_url,
+            state_dir,
+        )
+        async with connection.transaction():
+            for purpose, stable_role in names.stable.items():
+                await ensure_stable_role(
+                    connection,
+                    stable_role,
+                    setting_prefix="worker_control",
+                    authorized_members=tuple(
+                        sorted(authorized_members[purpose])
+                    ),
+                )
+    except (asyncpg.PostgresError, WorkerRoleCommonError) as exc:
         raise ControlRoleError("control credential removal failed") from exc
     finally:
         await connection.close()

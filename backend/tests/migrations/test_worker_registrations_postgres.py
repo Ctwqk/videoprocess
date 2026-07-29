@@ -1059,6 +1059,27 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 "vp_worker_registration_revoke(text,uuid,text)",
                 "vp_worker_registration_expire(text,uuid)",
             )
+            await connection.execute(
+                """
+                DO $block$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_roles
+                        WHERE rolname = 'vp_worker_runtime'
+                    ) THEN
+                        CREATE ROLE vp_worker_runtime
+                            NOLOGIN NOINHERIT NOSUPERUSER
+                            NOCREATEDB NOCREATEROLE
+                            NOREPLICATION NOBYPASSRLS;
+                    END IF;
+                END
+                $block$
+                """
+            )
+            await connection.execute(
+                f'GRANT vp_worker_runtime TO "{runtime_role}"'
+            )
             for role_name in (
                 runtime_role,
                 mismatch_role,
@@ -2050,6 +2071,15 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 8,
                 "replacement-retired",
             )
+            await connection.execute(
+                f'ALTER ROLE "{runtime_role}" LOGIN'
+            )
+            await connection.execute(
+                f'GRANT vp_worker_runtime TO "{runtime_role}"'
+            )
+            if not runtime_connection.is_closed():
+                await runtime_connection.close()
+            runtime_connection = await asyncpg.connect(runtime_url)
             assert await assert_operator_waits_for_fence(
                 "SELECT public.vp_worker_registration_revoke($1, $2, $3)",
                 "service-a",
@@ -2306,6 +2336,17 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             await admin.execute(
                 f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
             )
+            if await admin.fetchval(
+                """
+                SELECT
+                    pg_catalog.to_regrole('vp_worker_runtime') IS NOT NULL
+                    AND pg_catalog.to_regrole($1) IS NOT NULL
+                """,
+                runtime_role,
+            ):
+                await admin.execute(
+                    f'REVOKE vp_worker_runtime FROM "{runtime_role}"'
+                )
             await admin.execute(f'DROP ROLE IF EXISTS "{runtime_role}"')
             await admin.execute(f'DROP ROLE IF EXISTS "{mismatch_role}"')
             await admin.execute(f'DROP ROLE IF EXISTS "{direct_role}"')
@@ -2314,5 +2355,6 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             await admin.execute(f'DROP ROLE IF EXISTS "{writer_role}"')
             await admin.execute(f'DROP ROLE IF EXISTS "{owner_role}"')
             await admin.execute(f'DROP ROLE IF EXISTS "{operator_role}"')
+            await admin.execute("DROP ROLE IF EXISTS vp_worker_runtime")
         finally:
             await admin.close()

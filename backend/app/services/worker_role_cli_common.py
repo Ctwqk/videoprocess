@@ -16,6 +16,7 @@ from sqlalchemy.engine import URL, make_url
 
 MAX_DATABASE_URL_BYTES = 4096
 MANAGED_LOGIN_COMMENT_PREFIX = "videoprocess-worker-role:v1:"
+DATABASE_ACL_DCL_LOCK_SCOPE = "vp-worker-database-acl-dcl"
 
 
 class WorkerRoleCommonError(RuntimeError):
@@ -114,11 +115,25 @@ async def acquire_role_lifecycle_lock(
     )
 
 
+async def acquire_database_acl_dcl_lock(
+    connection: asyncpg.Connection,
+) -> None:
+    # Global order: database DCL, stable roles, services, generation, rows.
+    await connection.execute(
+        """
+        SELECT pg_catalog.pg_advisory_lock(
+            pg_catalog.hashtextextended($1, 0)
+        )
+        """,
+        DATABASE_ACL_DCL_LOCK_SCOPE,
+    )
+
+
 async def acquire_stable_role_authority_locks(
     connection: asyncpg.Connection,
     role_names: Sequence[str],
 ) -> None:
-    # Global order: sorted stable roles, service/generation, registrations, rows.
+    # The caller already owns the database DCL lock.
     ordered_role_names = sorted(set(role_names))
     if not ordered_role_names or len(ordered_role_names) != len(role_names):
         raise WorkerRoleCommonError("stable role lock scope invalid")
@@ -230,6 +245,22 @@ async def ensure_stable_role(
         role_name,
         authorized_members=authorized_members,
     )
+    for authorized_member in sorted(set(authorized_members)):
+        if await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_roles
+                WHERE rolname = $1
+            )
+            """,
+            authorized_member,
+        ):
+            await harden_existing_login_role(
+                connection,
+                authorized_member,
+                role_name,
+            )
 
 
 async def harden_existing_login_role(
@@ -260,27 +291,10 @@ async def harden_existing_login_role(
     )
     await connection.execute(f"ALTER ROLE {quoted_role} RESET ALL")
     await _revoke_database_ddl(connection, role_name)
-    memberships = await connection.fetch(
-        """
-        SELECT granted.rolname
-        FROM pg_catalog.pg_auth_members AS membership
-        JOIN pg_catalog.pg_roles AS member
-          ON member.oid = membership.member
-        JOIN pg_catalog.pg_roles AS granted
-          ON granted.oid = membership.roleid
-        WHERE member.rolname = $1
-        """,
-        role_name,
-    )
-    for membership in memberships:
-        await connection.execute(
-            f"REVOKE {quote_identifier(membership['rolname'])} "
-            f"FROM {quoted_role}"
-        )
-    await _converge_reverse_memberships(
+    await _converge_login_role_memberships(
         connection,
         role_name,
-        authorized_members=(),
+        stable_role=stable_role,
     )
 
     await connection.execute(
@@ -328,9 +342,6 @@ async def harden_existing_login_role(
             f"ON TABLE public.{quote_identifier(privilege['relname'])} "
             f"FROM {quoted_role}"
         )
-    await connection.execute(
-        f"GRANT {quote_identifier(stable_role)} TO {quoted_role}"
-    )
     await mark_managed_login_role(connection, role_name, stable_role)
 
 
@@ -555,7 +566,7 @@ async def _role_owns_objects(
                 FROM pg_catalog.pg_roles AS role
                 WHERE role.rolname = $1
             )
-            -- DROP OWNED may clear default-ACL metadata, never owned objects.
+            -- Default ACL metadata is role-scoped, not a business object.
             SELECT EXISTS (
                 SELECT 1
                 FROM pg_catalog.pg_shdepend AS dependency
@@ -603,6 +614,61 @@ async def _converge_reverse_memberships(
                 f"GRANT {quote_identifier(granted_role)} "
                 f"TO {quote_identifier(member_name)}"
             )
+
+
+async def _converge_login_role_memberships(
+    connection: asyncpg.Connection,
+    role_name: str,
+    *,
+    stable_role: str,
+) -> None:
+    if role_name == stable_role:
+        raise WorkerRoleCommonError("database role membership invalid")
+    rows = await connection.fetch(
+        """
+        SELECT
+            granted.rolname AS granted_role,
+            member.rolname AS member_role
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        WHERE member.rolname = $1 OR granted.rolname = $1
+        ORDER BY granted.rolname, member.rolname
+        """,
+        role_name,
+    )
+    for row in rows:
+        if (
+            row["member_role"] == role_name
+            and row["granted_role"] == stable_role
+        ):
+            continue
+        await connection.execute(
+            f"REVOKE {quote_identifier(row['granted_role'])} "
+            f"FROM {quote_identifier(row['member_role'])}"
+        )
+    if not await connection.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_auth_members AS membership
+            JOIN pg_catalog.pg_roles AS granted
+              ON granted.oid = membership.roleid
+            JOIN pg_catalog.pg_roles AS member
+              ON member.oid = membership.member
+            WHERE granted.rolname = $1
+              AND member.rolname = $2
+        )
+        """,
+        stable_role,
+        role_name,
+    ):
+        await connection.execute(
+            f"GRANT {quote_identifier(stable_role)} "
+            f"TO {quote_identifier(role_name)}"
+        )
 
 
 async def _converge_public_privileges(
@@ -680,6 +746,32 @@ async def _converge_public_privileges(
         await connection.execute(
             f"REVOKE EXECUTE ON FUNCTION {routine['signature']} FROM PUBLIC"
         )
+    managed_login_roles = await connection.fetch(
+        """
+        SELECT DISTINCT member.rolname
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        WHERE granted.rolname IN (
+            'vp_worker_runtime',
+            'vp_worker_operator_runtime',
+            'vp_orchestrator_control_runtime',
+            'vp_staging_janitor_runtime'
+        )
+        ORDER BY member.rolname
+        """
+    )
+    for managed_login in managed_login_roles:
+        await _revoke_database_ddl(
+            connection,
+            managed_login["rolname"],
+        )
+        await connection.execute(
+            "REVOKE CREATE ON SCHEMA public FROM "
+            f"{quote_identifier(managed_login['rolname'])}"
+        )
     relevant_owners = await connection.fetch(
         """
         WITH relevant_owner_oids AS (
@@ -734,7 +826,22 @@ async def _converge_public_privileges(
         JOIN pg_catalog.pg_roles AS owner
           ON owner.oid = relevant_owner_oids.oid
         WHERE owner.rolname = current_user
-           OR owner.rolname !~ '^pg_'
+           OR (
+               owner.rolname !~ '^pg_'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM pg_catalog.pg_auth_members AS membership
+                   JOIN pg_catalog.pg_roles AS stable
+                     ON stable.oid = membership.roleid
+                   WHERE membership.member = owner.oid
+                     AND stable.rolname IN (
+                         'vp_worker_runtime',
+                         'vp_worker_operator_runtime',
+                         'vp_orchestrator_control_runtime',
+                         'vp_staging_janitor_runtime'
+                     )
+               )
+           )
         ORDER BY owner.rolname
         """
     )
@@ -829,23 +936,88 @@ async def drop_login_roles(
     connection: asyncpg.Connection,
     role_names: Sequence[str],
 ) -> None:
-    for role_name in role_names:
-        if not await connection.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_roles
-                WHERE rolname = $1
-            )
-            """,
-            role_name,
-        ):
-            continue
-        if await _role_owns_objects(connection, role_name):
-            raise WorkerRoleCommonError("database login role owns objects")
-        await connection.execute(
-            f"ALTER ROLE {quote_identifier(role_name)} NOLOGIN"
+    if connection.is_in_transaction():
+        raise WorkerRoleCommonError(
+            "database role retirement transaction invalid"
         )
+    ordered_roles = tuple(sorted(set(role_names)))
+    if not ordered_roles or len(ordered_roles) != len(role_names):
+        raise WorkerRoleCommonError("database role retirement invalid")
+    for role_name in ordered_roles:
+        quote_identifier(role_name)
+    await quarantine_login_roles(connection, ordered_roles)
+    async with connection.transaction():
+        for role_name in ordered_roles:
+            if await connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_roles
+                    WHERE rolname = $1
+                )
+                """,
+                role_name,
+            ):
+                await connection.execute(
+                    f"DROP ROLE {quote_identifier(role_name)}"
+                )
+
+
+async def quarantine_login_roles(
+    connection: asyncpg.Connection,
+    role_names: Sequence[str],
+) -> None:
+    if connection.is_in_transaction():
+        raise WorkerRoleCommonError(
+            "database role quarantine transaction invalid"
+        )
+    ordered_roles = tuple(sorted(set(role_names)))
+    if not ordered_roles or len(ordered_roles) != len(role_names):
+        raise WorkerRoleCommonError("database role quarantine invalid")
+    for role_name in ordered_roles:
+        quote_identifier(role_name)
+
+    existing_roles = {
+        row["rolname"]
+        for row in await connection.fetch(
+            """
+            SELECT rolname
+            FROM pg_catalog.pg_roles
+            WHERE rolname = ANY($1::text[])
+            """,
+            list(ordered_roles),
+        )
+    }
+    if not existing_roles:
+        return
+    async with connection.transaction():
+        for role_name in ordered_roles:
+            if role_name in existing_roles:
+                await connection.execute(
+                    f"ALTER ROLE {quote_identifier(role_name)} NOLOGIN"
+                )
+        memberships = await connection.fetch(
+            """
+            SELECT
+                granted.rolname AS granted_role,
+                member.rolname AS member_role
+            FROM pg_catalog.pg_auth_members AS membership
+            JOIN pg_catalog.pg_roles AS granted
+              ON granted.oid = membership.roleid
+            JOIN pg_catalog.pg_roles AS member
+              ON member.oid = membership.member
+            WHERE granted.rolname = ANY($1::text[])
+               OR member.rolname = ANY($1::text[])
+            ORDER BY granted.rolname, member.rolname
+            """,
+            list(ordered_roles),
+        )
+        for membership in memberships:
+            await connection.execute(
+                f"REVOKE "
+                f"{quote_identifier(membership['granted_role'])} "
+                f"FROM {quote_identifier(membership['member_role'])}"
+            )
     await connection.execute(
         """
         SELECT pg_catalog.pg_terminate_backend(activity.pid)
@@ -853,43 +1025,8 @@ async def drop_login_roles(
         WHERE activity.usename = ANY($1::text[])
           AND activity.pid <> pg_catalog.pg_backend_pid()
         """,
-        list(role_names),
+        list(ordered_roles),
     )
-    for role_name in role_names:
-        if not await connection.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_roles
-                WHERE rolname = $1
-            )
-            """,
-            role_name,
-        ):
-            continue
-        memberships = await connection.fetch(
-            """
-            SELECT granted.rolname
-            FROM pg_catalog.pg_auth_members AS membership
-            JOIN pg_catalog.pg_roles AS member
-              ON member.oid = membership.member
-            JOIN pg_catalog.pg_roles AS granted
-              ON granted.oid = membership.roleid
-            WHERE member.rolname = $1
-            """,
-            role_name,
-        )
-        for membership in memberships:
-            await connection.execute(
-                f"REVOKE {quote_identifier(membership['rolname'])} "
-                f"FROM {quote_identifier(role_name)}"
-            )
-        await connection.execute(
-            f"DROP OWNED BY {quote_identifier(role_name)}"
-        )
-        await connection.execute(
-            f"DROP ROLE {quote_identifier(role_name)}"
-        )
 
 
 def write_secure_files(

@@ -260,6 +260,70 @@ async def _explicit_column_grants(
     }
 
 
+async def _role_membership_edges(
+    connection: asyncpg.Connection,
+    role_name: str,
+) -> set[tuple[str, str]]:
+    rows = await connection.fetch(
+        """
+        SELECT granted.rolname AS granted_role, member.rolname AS member_role
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        WHERE granted.rolname = $1 OR member.rolname = $1
+        """,
+        role_name,
+    )
+    return {
+        (row["granted_role"], row["member_role"])
+        for row in rows
+    }
+
+
+async def _drop_test_roles(
+    connection: asyncpg.Connection,
+    role_names: tuple[str, ...],
+) -> None:
+    existing = {
+        row["rolname"]
+        for row in await connection.fetch(
+            """
+            SELECT rolname
+            FROM pg_catalog.pg_roles
+            WHERE rolname = ANY($1::text[])
+            """,
+            list(role_names),
+        )
+    }
+    memberships = await connection.fetch(
+        """
+        SELECT granted.rolname AS granted_role, member.rolname AS member_role
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        WHERE granted.rolname = ANY($1::text[])
+           OR member.rolname = ANY($1::text[])
+        """,
+        list(role_names),
+    )
+    for membership in memberships:
+        await connection.execute(
+            f"REVOKE "
+            f"{role_common.quote_identifier(membership['granted_role'])} "
+            f"FROM "
+            f"{role_common.quote_identifier(membership['member_role'])}"
+        )
+    for role_name in reversed(role_names):
+        if role_name in existing:
+            await connection.execute(
+                f"DROP ROLE {role_common.quote_identifier(role_name)}"
+            )
+
+
 def _pipeline_snapshot() -> dict[str, object]:
     return {
         "nodes": [
@@ -2036,6 +2100,195 @@ async def test_real_role_clis_enforce_exact_cross_role_boundaries(
                 await admin.execute(
                     f'DROP ROLE IF EXISTS "{role_name}"'
                 )
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_invalid_control_generations_quarantine_every_principal(
+    tmp_path: Path,
+) -> None:
+    database = f"vp_control_quarantine_{uuid.uuid4().hex[:16]}"
+    generations = (
+        f"wrong-password-{uuid.uuid4().hex[:8]}",
+        f"wrong-endpoint-{uuid.uuid4().hex[:8]}",
+        f"wrong-mode-{uuid.uuid4().hex[:8]}",
+        f"partial-{uuid.uuid4().hex[:8]}",
+    )
+    names = tuple(
+        control_cli.role_names_for_generation(generation)
+        for generation in generations
+    )
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    control_state = tmp_path / "control-state"
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    original_urls: list[dict[str, str]] = []
+    old_operator: asyncpg.Connection | None = None
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        for generation, control_names in zip(
+            generations,
+            names,
+            strict=True,
+        ):
+            await control_cli._provision(
+                target_url,
+                generation,
+                control_state,
+                control_names,
+            )
+            original_urls.append(
+                {
+                    purpose: path.read_text().strip()
+                    for purpose, path in control_cli.credential_paths(
+                        control_state,
+                        generation,
+                    ).items()
+                }
+            )
+
+        old_operator = await asyncpg.connect(
+            _asyncpg_url(original_urls[0]["operator"])
+        )
+        paths = tuple(
+            control_cli.credential_paths(control_state, generation)
+            for generation in generations
+        )
+        wrong_password = make_url(
+            paths[0]["operator"].read_text().strip()
+        ).set(password="task4a-round5-wrong-password")
+        _write_secret(
+            paths[0]["operator"],
+            wrong_password.render_as_string(hide_password=False),
+            0o400,
+        )
+        wrong_endpoint = make_url(
+            paths[1]["orchestrator"].read_text().strip()
+        ).set(host="127.0.0.2")
+        _write_secret(
+            paths[1]["orchestrator"],
+            wrong_endpoint.render_as_string(hide_password=False),
+            0o400,
+        )
+        paths[2]["staging_janitor"].chmod(0o600)
+        paths[3]["orchestrator"].unlink()
+        forensic_snapshots = tuple(
+            {
+                purpose: (
+                    None
+                    if not path.exists()
+                    else (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                )
+                for purpose, path in generation_paths.items()
+            }
+            for generation_paths in paths
+        )
+
+        for generation, control_names, generation_paths, snapshot in zip(
+            generations,
+            names,
+            paths,
+            forensic_snapshots,
+            strict=True,
+        ):
+            with pytest.raises(
+                (
+                    asyncpg.PostgresError,
+                    OSError,
+                    control_cli.ControlRoleError,
+                    role_common.WorkerRoleCommonError,
+                )
+            ):
+                await control_cli._provision(
+                    target_url,
+                    generation,
+                    control_state,
+                    control_names,
+                )
+            assert {
+                purpose: (
+                    None
+                    if not path.exists()
+                    else (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                )
+                for purpose, path in generation_paths.items()
+            } == snapshot
+
+            owner = await asyncpg.connect(_asyncpg_url(target_url))
+            try:
+                for versioned_role in control_names.versioned.values():
+                    role = await owner.fetchrow(
+                        """
+                        SELECT rolcanlogin
+                        FROM pg_catalog.pg_roles
+                        WHERE rolname = $1
+                        """,
+                        versioned_role,
+                    )
+                    assert role is not None
+                    assert not role["rolcanlogin"]
+                    assert not await _role_membership_edges(
+                        owner,
+                        versioned_role,
+                    )
+            finally:
+                await owner.close()
+
+            for role_url in original_urls[
+                generations.index(generation)
+            ].values():
+                with pytest.raises(asyncpg.PostgresError):
+                    await asyncpg.connect(_asyncpg_url(role_url))
+
+        assert old_operator is not None
+        with pytest.raises(
+            (
+                asyncpg.PostgresError,
+                asyncpg.InterfaceError,
+                ConnectionError,
+            )
+        ):
+            await old_operator.fetchval(
+                "SELECT public.vp_worker_grant_activate($1, $2)",
+                "task4a-round5-old-operator",
+                1,
+            )
+    finally:
+        if old_operator is not None and not old_operator.is_closed():
+            await old_operator.close()
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            await _drop_test_roles(
+                admin,
+                (
+                    *(
+                        versioned
+                        for control_names in names
+                        for versioned in control_names.versioned.values()
+                    ),
+                    *names[0].stable.values(),
+                ),
+            )
         finally:
             await admin.close()
 
@@ -4385,5 +4638,959 @@ async def test_invalid_generation_quarantine_serializes_with_revoke(
                 *control_names.stable.values(),
             ):
                 await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_role_graph_converges_and_operator_revoke_isolates_multihop(
+    tmp_path: Path,
+) -> None:
+    database = f"vp_role_graph_{uuid.uuid4().hex[:20]}"
+    service_name = f"task4a-graph-{uuid.uuid4().hex[:8]}"
+    generation = int(uuid.uuid4().hex[:12], 16)
+    control_generation = f"graph-{uuid.uuid4().hex[:12]}"
+    runtime_names = runtime_cli.role_names_for_generation(
+        service_name,
+        generation,
+    )
+    control_names = control_cli.role_names_for_generation(
+        control_generation
+    )
+    role_pairs = (
+        (
+            "runtime",
+            runtime_names.versioned,
+            runtime_names.stable,
+        ),
+        *(
+            (
+                purpose,
+                control_names.versioned[purpose],
+                control_names.stable[purpose],
+            )
+            for purpose in control_names.versioned
+        ),
+    )
+    bridges = {
+        purpose: f"vp_t4a_bridge_{index}_{uuid.uuid4().hex[:8]}"
+        for index, (purpose, _versioned, _stable) in enumerate(role_pairs)
+    }
+    outsiders = {
+        purpose: f"vp_t4a_outsider_{index}_{uuid.uuid4().hex[:8]}"
+        for index, (purpose, _versioned, _stable) in enumerate(role_pairs)
+    }
+    set_role_session: asyncpg.Connection | None = None
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    runtime_state = tmp_path / "runtime-state"
+    control_state = tmp_path / "control-state"
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        await runtime_cli._provision(
+            target_url,
+            service_name,
+            generation,
+            runtime_state,
+            runtime_names,
+        )
+        await control_cli._provision(
+            target_url,
+            control_generation,
+            control_state,
+            control_names,
+        )
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            for purpose, versioned_role, stable_role in role_pairs:
+                bridge = bridges[purpose]
+                outsider = outsiders[purpose]
+                await owner.execute(
+                    f"CREATE ROLE {role_common.quote_identifier(bridge)} "
+                    "NOLOGIN"
+                )
+                await owner.execute(
+                    f"CREATE ROLE {role_common.quote_identifier(outsider)} "
+                    "LOGIN"
+                )
+                await owner.execute(
+                    f"REVOKE {role_common.quote_identifier(stable_role)} "
+                    f"FROM {role_common.quote_identifier(versioned_role)}"
+                )
+                await owner.execute(
+                    f"GRANT {role_common.quote_identifier(stable_role)} "
+                    f"TO {role_common.quote_identifier(bridge)}"
+                )
+                await owner.execute(
+                    f"GRANT {role_common.quote_identifier(bridge)} "
+                    f"TO {role_common.quote_identifier(versioned_role)}"
+                )
+                await owner.execute(
+                    f"GRANT {role_common.quote_identifier(versioned_role)} "
+                    f"TO {role_common.quote_identifier(outsider)}"
+                )
+                assert await owner.fetchval(
+                    "SELECT pg_catalog.pg_has_role($1, $2, 'USAGE')",
+                    outsider,
+                    stable_role,
+                )
+        finally:
+            await owner.close()
+
+        await runtime_cli._provision(
+            target_url,
+            service_name,
+            generation,
+            runtime_state,
+            runtime_names,
+        )
+        await control_cli._provision(
+            target_url,
+            control_generation,
+            control_state,
+            control_names,
+        )
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            for purpose, versioned_role, stable_role in role_pairs:
+                assert await _role_membership_edges(
+                    owner,
+                    versioned_role,
+                ) == {(stable_role, versioned_role)}
+                assert not await owner.fetchval(
+                    "SELECT pg_catalog.pg_has_role($1, $2, 'USAGE')",
+                    outsiders[purpose],
+                    stable_role,
+                )
+                assert not await owner.fetchval(
+                    "SELECT pg_catalog.pg_has_role($1, $2, 'USAGE')",
+                    bridges[purpose],
+                    stable_role,
+                )
+                direct_members = {
+                    row["member_role"]
+                    for row in await owner.fetch(
+                        """
+                        SELECT member.rolname AS member_role
+                        FROM pg_catalog.pg_auth_members AS membership
+                        JOIN pg_catalog.pg_roles AS granted
+                          ON granted.oid = membership.roleid
+                        JOIN pg_catalog.pg_roles AS member
+                          ON member.oid = membership.member
+                        WHERE granted.rolname = $1
+                        """,
+                        stable_role,
+                    )
+                }
+                assert direct_members == {versioned_role}
+        finally:
+            await owner.close()
+
+        runtime_paths = runtime_cli.credential_paths(
+            runtime_state,
+            service_name,
+            generation,
+        )
+        token = runtime_paths["admission_token"].read_text().strip()
+        operator_url = control_cli.credential_paths(
+            control_state,
+            control_generation,
+        )["operator"].read_text().strip()
+        operator = await asyncpg.connect(_asyncpg_url(operator_url))
+        try:
+            await _upsert_worker_grant(
+                operator,
+                service_name=service_name,
+                generation=generation,
+                database_principal=runtime_names.versioned,
+                admission_token=token,
+            )
+            await operator.fetchval(
+                "SELECT public.vp_worker_grant_activate($1, $2)",
+                service_name,
+                generation,
+            )
+        finally:
+            await operator.close()
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            bridge = bridges["runtime"]
+            outsider = outsiders["runtime"]
+            await owner.execute(
+                f"REVOKE {role_common.quote_identifier(runtime_names.stable)} "
+                f"FROM "
+                f"{role_common.quote_identifier(runtime_names.versioned)}"
+            )
+            await owner.execute(
+                f"GRANT {role_common.quote_identifier(runtime_names.stable)} "
+                f"TO {role_common.quote_identifier(bridge)}"
+            )
+            await owner.execute(
+                f"GRANT {role_common.quote_identifier(bridge)} TO "
+                f"{role_common.quote_identifier(runtime_names.versioned)}"
+            )
+            await owner.execute(
+                f"GRANT "
+                f"{role_common.quote_identifier(runtime_names.versioned)} "
+                f"TO {role_common.quote_identifier(outsider)}"
+            )
+        finally:
+            await owner.close()
+
+        set_role_session = await asyncpg.connect(
+            _asyncpg_url(
+                runtime_paths["database_url"].read_text().strip()
+            )
+        )
+        await set_role_session.execute(
+            f"SET ROLE "
+            f"{role_common.quote_identifier(runtime_names.stable)}"
+        )
+        operator = await asyncpg.connect(_asyncpg_url(operator_url))
+        try:
+            await operator.fetchval(
+                "SELECT public.vp_worker_grant_revoke($1, $2, $3)",
+                service_name,
+                generation,
+                "task4a-round5-role-graph",
+            )
+        finally:
+            await operator.close()
+        with pytest.raises(
+            (
+                asyncpg.PostgresError,
+                asyncpg.InterfaceError,
+                ConnectionError,
+            )
+        ):
+            await set_role_session.fetchval("SELECT current_user")
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            runtime_role = await owner.fetchrow(
+                """
+                SELECT rolcanlogin
+                FROM pg_catalog.pg_roles
+                WHERE rolname = $1
+                """,
+                runtime_names.versioned,
+            )
+            assert runtime_role is not None
+            assert not runtime_role["rolcanlogin"]
+            assert not await _role_membership_edges(
+                owner,
+                runtime_names.versioned,
+            )
+            assert not await owner.fetchval(
+                "SELECT pg_catalog.pg_has_role($1, $2, 'USAGE')",
+                outsiders["runtime"],
+                runtime_names.stable,
+            )
+            assert not await owner.fetchval(
+                "SELECT pg_catalog.pg_has_role($1, $2, 'USAGE')",
+                bridges["runtime"],
+                runtime_names.stable,
+            )
+        finally:
+            await owner.close()
+    finally:
+        if set_role_session is not None and not set_role_session.is_closed():
+            await set_role_session.close()
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            await _drop_test_roles(
+                admin,
+                (
+                    *(bridges.values()),
+                    *(outsiders.values()),
+                    runtime_names.versioned,
+                    *control_names.versioned.values(),
+                    runtime_names.stable,
+                    *control_names.stable.values(),
+                ),
+            )
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_overlap_provision_hardens_every_authorized_generation(
+    tmp_path: Path,
+) -> None:
+    database = f"vp_role_overlap_harden_{uuid.uuid4().hex[:16]}"
+    service_name = f"task4a-harden-{uuid.uuid4().hex[:8]}"
+    generations = (
+        int(uuid.uuid4().hex[:12], 16),
+        int(uuid.uuid4().hex[:12], 16),
+    )
+    runtime_names = tuple(
+        runtime_cli.role_names_for_generation(service_name, generation)
+        for generation in generations
+    )
+    control_generations = (
+        f"harden-a-{uuid.uuid4().hex[:8]}",
+        f"harden-b-{uuid.uuid4().hex[:8]}",
+    )
+    control_names = tuple(
+        control_cli.role_names_for_generation(generation)
+        for generation in control_generations
+    )
+    old_generation_roles = (
+        runtime_names[0].versioned,
+        *control_names[0].versioned.values(),
+    )
+    intended_stable_roles = {
+        runtime_names[0].versioned: runtime_names[0].stable,
+        **{
+            control_names[0].versioned[purpose]:
+            control_names[0].stable[purpose]
+            for purpose in control_names[0].versioned
+        },
+    }
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    runtime_state = tmp_path / "runtime-state"
+    control_state = tmp_path / "control-state"
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        await runtime_cli._provision(
+            target_url,
+            service_name,
+            generations[0],
+            runtime_state,
+            runtime_names[0],
+        )
+        await control_cli._provision(
+            target_url,
+            control_generations[0],
+            control_state,
+            control_names[0],
+        )
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            for role_name in old_generation_roles:
+                quoted_role = role_common.quote_identifier(role_name)
+                await owner.execute(
+                    f"ALTER ROLE {quoted_role} SUPERUSER CREATEDB "
+                    "CREATEROLE REPLICATION BYPASSRLS"
+                )
+                await owner.execute(
+                    "GRANT SELECT ON TABLE public.worker_admission_grants "
+                    f"TO {quoted_role}"
+                )
+        finally:
+            await owner.close()
+
+        await runtime_cli._provision(
+            target_url,
+            service_name,
+            generations[1],
+            runtime_state,
+            runtime_names[1],
+        )
+        await control_cli._provision(
+            target_url,
+            control_generations[1],
+            control_state,
+            control_names[1],
+        )
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            for role_name in old_generation_roles:
+                role = await owner.fetchrow(
+                    """
+                    SELECT
+                        rolcanlogin,
+                        rolinherit,
+                        rolsuper,
+                        rolcreatedb,
+                        rolcreaterole,
+                        rolreplication,
+                        rolbypassrls
+                    FROM pg_catalog.pg_roles
+                    WHERE rolname = $1
+                    """,
+                    role_name,
+                )
+                assert role is not None
+                assert dict(role) == {
+                    "rolcanlogin": True,
+                    "rolinherit": True,
+                    "rolsuper": False,
+                    "rolcreatedb": False,
+                    "rolcreaterole": False,
+                    "rolreplication": False,
+                    "rolbypassrls": False,
+                }
+                assert await _role_membership_edges(
+                    owner,
+                    role_name,
+                ) == {(intended_stable_roles[role_name], role_name)}
+                assert not await owner.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_class AS relation
+                        CROSS JOIN LATERAL pg_catalog.aclexplode(
+                            relation.relacl
+                        ) AS privilege
+                        JOIN pg_catalog.pg_roles AS grantee
+                          ON grantee.oid = privilege.grantee
+                        JOIN pg_catalog.pg_namespace AS namespace
+                          ON namespace.oid = relation.relnamespace
+                        WHERE namespace.nspname = 'public'
+                          AND relation.relname = 'worker_admission_grants'
+                          AND grantee.rolname = $1
+                          AND privilege.privilege_type = 'SELECT'
+                    )
+                    """,
+                    role_name,
+                )
+        finally:
+            await owner.close()
+    finally:
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            await _drop_test_roles(
+                admin,
+                (
+                    *(names.versioned for names in runtime_names),
+                    *(
+                        role
+                        for names in control_names
+                        for role in names.versioned.values()
+                    ),
+                    runtime_names[0].stable,
+                    *control_names[0].stable.values(),
+                ),
+            )
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_role_retirement_never_deletes_concurrently_owned_objects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database = f"vp_role_retire_race_{uuid.uuid4().hex[:16]}"
+    service_name = f"task4a-retire-{uuid.uuid4().hex[:8]}"
+    generation = int(uuid.uuid4().hex[:12], 16)
+    names = runtime_cli.role_names_for_generation(
+        service_name,
+        generation,
+    )
+    collation_name = f"task4a_race_collation_{uuid.uuid4().hex[:10]}"
+    configuration_name = f"task4a_race_config_{uuid.uuid4().hex[:10]}"
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    runtime_state = tmp_path / "runtime-state"
+    pause_entered = asyncio.Event()
+    pause_release = asyncio.Event()
+    paused = False
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    real_owner_probe = role_common._role_owns_objects
+    real_quarantine = getattr(
+        role_common,
+        "quarantine_login_roles",
+        None,
+    )
+
+    async def pause_once() -> None:
+        nonlocal paused
+        if paused:
+            return
+        paused = True
+        pause_entered.set()
+        await asyncio.wait_for(pause_release.wait(), timeout=10)
+
+    async def paused_owner_probe(
+        connection: asyncpg.Connection,
+        role_name: str,
+    ) -> bool:
+        result = await real_owner_probe(connection, role_name)
+        if role_name == names.versioned and not result:
+            await pause_once()
+        return result
+
+    async def paused_quarantine(
+        connection: asyncpg.Connection,
+        role_names: tuple[str, ...],
+    ) -> None:
+        if real_quarantine is None:
+            return
+        await real_quarantine(connection, role_names)
+        if names.versioned in role_names:
+            await pause_once()
+
+    monkeypatch.setattr(
+        role_common,
+        "_role_owns_objects",
+        paused_owner_probe,
+    )
+    monkeypatch.setattr(
+        role_common,
+        "quarantine_login_roles",
+        paused_quarantine,
+        raising=False,
+    )
+
+    retire_task: asyncio.Task[None] | None = None
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        await runtime_cli._provision(
+            target_url,
+            service_name,
+            generation,
+            runtime_state,
+            names,
+        )
+        paths = runtime_cli.credential_paths(
+            runtime_state,
+            service_name,
+            generation,
+        )
+        forensic_snapshot = {
+            purpose: (
+                path.read_bytes(),
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for purpose, path in paths.items()
+        }
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            await owner.execute(
+                f'CREATE COLLATION public."{collation_name}" '
+                'FROM pg_catalog."C"'
+            )
+            await owner.execute(
+                "CREATE TEXT SEARCH CONFIGURATION "
+                f'public."{configuration_name}" '
+                "(COPY = pg_catalog.simple)"
+            )
+        finally:
+            await owner.close()
+
+        retire_task = asyncio.create_task(
+            runtime_cli._revoke(
+                target_url,
+                service_name,
+                generation,
+                runtime_state,
+                names,
+            )
+        )
+        await asyncio.wait_for(pause_entered.wait(), timeout=10)
+        concurrent_owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            await concurrent_owner.execute(
+                f'ALTER COLLATION public."{collation_name}" '
+                f'OWNER TO {role_common.quote_identifier(names.versioned)}'
+            )
+            await concurrent_owner.execute(
+                "ALTER TEXT SEARCH CONFIGURATION "
+                f'public."{configuration_name}" OWNER TO '
+                f"{role_common.quote_identifier(names.versioned)}"
+            )
+        finally:
+            await concurrent_owner.close()
+        pause_release.set()
+        result = await asyncio.gather(
+            retire_task,
+            return_exceptions=True,
+        )
+        assert isinstance(
+            result[0],
+            (asyncpg.PostgresError, runtime_cli.RuntimeRoleError),
+        )
+        owner_file = tmp_path / "owner-url"
+        _write_secret(owner_file, target_url, 0o400)
+        monkeypatch.setenv(
+            runtime_cli.OWNER_URL_FILE_ENV,
+            str(owner_file),
+        )
+        assert await runtime_cli.run(
+            [
+                "revoke",
+                "--service-name",
+                service_name,
+                "--generation",
+                str(generation),
+                "--state-dir",
+                str(runtime_state),
+            ]
+        ) == 4
+        assert json.loads(capsys.readouterr().out) == {
+            "code": "worker_runtime_role_operation_failed",
+            "status": "error",
+        }
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            assert await owner.fetchval(
+                "SELECT pg_catalog.to_regcollation($1) IS NOT NULL",
+                f"public.{collation_name}",
+            )
+            assert await owner.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_ts_config AS configuration
+                    JOIN pg_catalog.pg_namespace AS namespace
+                      ON namespace.oid = configuration.cfgnamespace
+                    WHERE namespace.nspname = 'public'
+                      AND configuration.cfgname = $1
+                )
+                """,
+                configuration_name,
+            )
+            role = await owner.fetchrow(
+                """
+                SELECT rolcanlogin
+                FROM pg_catalog.pg_roles
+                WHERE rolname = $1
+                """,
+                names.versioned,
+            )
+            assert role is not None
+            assert not role["rolcanlogin"]
+            assert not await _role_membership_edges(
+                owner,
+                names.versioned,
+            )
+        finally:
+            await owner.close()
+        assert {
+            purpose: (
+                path.read_bytes(),
+                stat.S_IMODE(path.stat().st_mode),
+            )
+            for purpose, path in paths.items()
+        } == forensic_snapshot
+        assert "DROP OWNED" not in Path(
+            role_common.__file__
+        ).read_text(encoding="utf-8")
+    finally:
+        pause_release.set()
+        if retire_task is not None and not retire_task.done():
+            retire_task.cancel()
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            await _drop_test_roles(
+                admin,
+                (names.versioned, names.stable),
+            )
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_runtime_and_control_share_database_dcl_lock_and_stress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = f"vp_dcl_lock_{uuid.uuid4().hex[:20]}"
+    runtime_services = tuple(
+        f"task4a-dcl-{index}-{uuid.uuid4().hex[:6]}"
+        for index in range(4)
+    )
+    runtime_generations = tuple(
+        int(uuid.uuid4().hex[:12], 16)
+        for _service_name in runtime_services
+    )
+    runtime_names = tuple(
+        runtime_cli.role_names_for_generation(service_name, generation)
+        for service_name, generation in zip(
+            runtime_services,
+            runtime_generations,
+            strict=True,
+        )
+    )
+    control_generations = tuple(
+        f"dcl-{index}-{uuid.uuid4().hex[:8]}"
+        for index in range(3)
+    )
+    control_names = tuple(
+        control_cli.role_names_for_generation(generation)
+        for generation in control_generations
+    )
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    runtime_state = tmp_path / "runtime-state"
+    control_state = tmp_path / "control-state"
+    runtime_stable_entered = asyncio.Event()
+    runtime_stable_release = asyncio.Event()
+    control_stable_entered = asyncio.Event()
+    paused = False
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    real_runtime_stable = runtime_cli.ensure_stable_role
+    real_control_stable = control_cli.ensure_stable_role
+
+    async def paused_runtime_stable(
+        connection: asyncpg.Connection,
+        role_name: str,
+        *,
+        setting_prefix: str,
+        authorized_members: tuple[str, ...],
+    ) -> None:
+        nonlocal paused
+        if not paused:
+            paused = True
+            runtime_stable_entered.set()
+            await asyncio.wait_for(
+                runtime_stable_release.wait(),
+                timeout=10,
+            )
+        await real_runtime_stable(
+            connection,
+            role_name,
+            setting_prefix=setting_prefix,
+            authorized_members=authorized_members,
+        )
+
+    async def observed_control_stable(
+        connection: asyncpg.Connection,
+        role_name: str,
+        *,
+        setting_prefix: str,
+        authorized_members: tuple[str, ...],
+    ) -> None:
+        control_stable_entered.set()
+        await real_control_stable(
+            connection,
+            role_name,
+            setting_prefix=setting_prefix,
+            authorized_members=authorized_members,
+        )
+
+    monkeypatch.setattr(
+        runtime_cli,
+        "ensure_stable_role",
+        paused_runtime_stable,
+    )
+    monkeypatch.setattr(
+        control_cli,
+        "ensure_stable_role",
+        observed_control_stable,
+    )
+
+    first_runtime: asyncio.Task[None] | None = None
+    first_control: asyncio.Task[None] | None = None
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        first_runtime = asyncio.create_task(
+            runtime_cli._provision(
+                target_url,
+                runtime_services[0],
+                runtime_generations[0],
+                runtime_state,
+                runtime_names[0],
+            )
+        )
+        await asyncio.wait_for(runtime_stable_entered.wait(), timeout=10)
+        first_control = asyncio.create_task(
+            control_cli._provision(
+                target_url,
+                control_generations[0],
+                control_state,
+                control_names[0],
+            )
+        )
+        control_crossed_shared_boundary = False
+        try:
+            await asyncio.wait_for(
+                control_stable_entered.wait(),
+                timeout=0.4,
+            )
+            control_crossed_shared_boundary = True
+        except TimeoutError:
+            pass
+        runtime_stable_release.set()
+        first_results = await asyncio.wait_for(
+            asyncio.gather(
+                first_runtime,
+                first_control,
+                return_exceptions=True,
+            ),
+            timeout=20,
+        )
+        assert not control_crossed_shared_boundary
+        assert not any(
+            isinstance(result, BaseException)
+            for result in first_results
+        )
+
+        monkeypatch.setattr(
+            runtime_cli,
+            "ensure_stable_role",
+            real_runtime_stable,
+        )
+        monkeypatch.setattr(
+            control_cli,
+            "ensure_stable_role",
+            real_control_stable,
+        )
+        for _round in range(3):
+            provision_results = await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        runtime_cli._provision(
+                            target_url,
+                            service_name,
+                            generation,
+                            runtime_state,
+                            names,
+                        )
+                        for service_name, generation, names in zip(
+                            runtime_services,
+                            runtime_generations,
+                            runtime_names,
+                            strict=True,
+                        )
+                    ),
+                    *(
+                        control_cli._provision(
+                            target_url,
+                            generation,
+                            control_state,
+                            names,
+                        )
+                        for generation, names in zip(
+                            control_generations,
+                            control_names,
+                            strict=True,
+                        )
+                    ),
+                    return_exceptions=True,
+                ),
+                timeout=60,
+            )
+            assert not any(
+                isinstance(result, BaseException)
+                for result in provision_results
+            )
+
+        revoke_results = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    runtime_cli._revoke(
+                        target_url,
+                        service_name,
+                        generation,
+                        runtime_state,
+                        names,
+                    )
+                    for service_name, generation, names in zip(
+                        runtime_services,
+                        runtime_generations,
+                        runtime_names,
+                        strict=True,
+                    )
+                ),
+                *(
+                    control_cli._revoke(
+                        target_url,
+                        generation,
+                        control_state,
+                        names,
+                    )
+                    for generation, names in zip(
+                        control_generations,
+                        control_names,
+                        strict=True,
+                    )
+                ),
+                return_exceptions=True,
+            ),
+            timeout=60,
+        )
+        assert not any(
+            isinstance(result, BaseException)
+            for result in revoke_results
+        )
+    finally:
+        runtime_stable_release.set()
+        for task in (first_runtime, first_control):
+            if task is not None and not task.done():
+                task.cancel()
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            await _drop_test_roles(
+                admin,
+                (
+                    *(names.versioned for names in runtime_names),
+                    *(
+                        versioned
+                        for names in control_names
+                        for versioned in names.versioned.values()
+                    ),
+                    runtime_names[0].stable,
+                    *control_names[0].stable.values(),
+                ),
+            )
         finally:
             await admin.close()

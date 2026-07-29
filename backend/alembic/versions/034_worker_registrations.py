@@ -3032,7 +3032,13 @@ $function$
 
 def _operator_active_registration_lock_sql() -> str:
     return """
-    -- Global order: service-exclusive, registration-exclusive, then rows.
+    -- Global order: database DCL, service-exclusive, registration, rows.
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-database-acl-dcl',
+            0
+        )
+    );
     PERFORM pg_catalog.pg_advisory_xact_lock(
         pg_catalog.hashtextextended(
             'vp-worker-service:' || p_service_name,
@@ -3060,6 +3066,167 @@ def _operator_active_registration_lock_sql() -> str:
     FOR UPDATE;
     IF v_locked_registration_id IS DISTINCT FROM v_registration_id THEN
         RAISE EXCEPTION USING MESSAGE = 'lease_fenced', ERRCODE = 'P0001';
+    END IF;
+"""
+
+
+def _operator_quarantine_principal_sql(principal: str) -> str:
+    return f"""
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_roles AS role
+        WHERE role.rolname = {principal}
+    ) THEN
+        EXECUTE pg_catalog.format(
+            'ALTER ROLE %I NOLOGIN',
+            {principal}
+        );
+        FOR v_membership IN
+            SELECT
+                granted.rolname AS granted_role,
+                member.rolname AS member_role
+            FROM pg_catalog.pg_auth_members AS membership
+            JOIN pg_catalog.pg_roles AS granted
+              ON granted.oid = membership.roleid
+            JOIN pg_catalog.pg_roles AS member
+              ON member.oid = membership.member
+            WHERE granted.rolname = {principal}
+               OR member.rolname = {principal}
+            ORDER BY granted.rolname, member.rolname
+        LOOP
+            EXECUTE pg_catalog.format(
+                'REVOKE %I FROM %I',
+                v_membership.granted_role,
+                v_membership.member_role
+            );
+        END LOOP;
+        PERFORM pg_catalog.pg_terminate_backend(activity.pid)
+        FROM pg_catalog.pg_stat_activity AS activity
+        WHERE activity.usename = {principal}
+          AND activity.pid <> pg_catalog.pg_backend_pid();
+    END IF;
+"""
+
+
+def _operator_runtime_role_graph_sql() -> str:
+    return """
+    FOR v_membership IN
+        SELECT
+            granted.rolname AS granted_role,
+            member.rolname AS member_role
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        WHERE member.rolname = 'vp_worker_runtime'
+        ORDER BY granted.rolname, member.rolname
+    LOOP
+        EXECUTE pg_catalog.format(
+            'REVOKE %I FROM %I',
+            v_membership.granted_role,
+            v_membership.member_role
+        );
+    END LOOP;
+
+    FOR v_membership IN
+        SELECT
+            granted.rolname AS granted_role,
+            member.rolname AS member_role
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        WHERE granted.rolname = 'vp_worker_runtime'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM public.worker_admission_grants AS grant_record
+              WHERE grant_record.database_principal = member.rolname
+                AND grant_record.state IN ('pending', 'active')
+                AND grant_record.revoked_at IS NULL
+          )
+        ORDER BY granted.rolname, member.rolname
+    LOOP
+        EXECUTE pg_catalog.format(
+            'REVOKE %I FROM %I',
+            v_membership.granted_role,
+            v_membership.member_role
+        );
+    END LOOP;
+
+    FOR v_valid_principal IN
+        SELECT DISTINCT grant_record.database_principal
+        FROM public.worker_admission_grants AS grant_record
+        JOIN pg_catalog.pg_roles AS role
+          ON role.rolname = grant_record.database_principal
+        WHERE grant_record.state IN ('pending', 'active')
+          AND grant_record.revoked_at IS NULL
+        ORDER BY grant_record.database_principal
+    LOOP
+        FOR v_membership IN
+            SELECT
+                granted.rolname AS granted_role,
+                member.rolname AS member_role
+            FROM pg_catalog.pg_auth_members AS membership
+            JOIN pg_catalog.pg_roles AS granted
+              ON granted.oid = membership.roleid
+            JOIN pg_catalog.pg_roles AS member
+              ON member.oid = membership.member
+            WHERE granted.rolname = v_valid_principal
+               OR (
+                   member.rolname = v_valid_principal
+                   AND granted.rolname <> 'vp_worker_runtime'
+               )
+            ORDER BY granted.rolname, member.rolname
+        LOOP
+            EXECUTE pg_catalog.format(
+                'REVOKE %I FROM %I',
+                v_membership.granted_role,
+                v_membership.member_role
+            );
+        END LOOP;
+    END LOOP;
+"""
+
+
+def _operator_require_runtime_principal_sql(principal: str) -> str:
+    return f"""
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_roles AS role
+        JOIN pg_catalog.pg_auth_members AS membership
+          ON membership.member = role.oid
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        WHERE role.rolname = {principal}
+          AND role.rolcanlogin
+          AND role.rolinherit
+          AND NOT role.rolsuper
+          AND NOT role.rolcreatedb
+          AND NOT role.rolcreaterole
+          AND NOT role.rolreplication
+          AND NOT role.rolbypassrls
+          AND granted.rolname = 'vp_worker_runtime'
+    ) OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        WHERE (
+            granted.rolname = {principal}
+            OR member.rolname = {principal}
+        )
+          AND NOT (
+              granted.rolname = 'vp_worker_runtime'
+              AND member.rolname = {principal}
+          )
+    ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'worker_role_not_isolated',
+            ERRCODE = 'P0001';
     END IF;
 """
 
@@ -3234,6 +3401,8 @@ DECLARE
     v_locked_registration_id uuid;
     v_grant public.worker_admission_grants%ROWTYPE;
     v_revoked_principal text;
+    v_valid_principal text;
+    v_membership record;
     v_now timestamptz;
 BEGIN
     IF p_service_name IS NULL OR p_generation IS NULL OR p_generation <= 0
@@ -3251,6 +3420,26 @@ BEGIN
         RAISE EXCEPTION USING MESSAGE = 'grant_missing', ERRCODE = 'P0001';
     END IF;
     IF v_grant.state = 'active' THEN
+        FOR v_revoked_principal IN
+            SELECT DISTINCT grant_row.database_principal
+            FROM public.worker_admission_grants AS grant_row
+            WHERE grant_row.service_name = p_service_name
+              AND grant_row.state = 'revoked'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM public.worker_admission_grants AS retained_grant
+                  WHERE retained_grant.database_principal
+                        = grant_row.database_principal
+                    AND retained_grant.state IN ('pending', 'active')
+                    AND retained_grant.revoked_at IS NULL
+              )
+            ORDER BY grant_row.database_principal
+        LOOP
+""" + _operator_quarantine_principal_sql("v_revoked_principal") + """
+        END LOOP;
+""" + _operator_runtime_role_graph_sql() + _operator_require_runtime_principal_sql(
+            "v_grant.database_principal"
+        ) + """
         RETURN v_grant.id;
     END IF;
     IF v_grant.state IS DISTINCT FROM 'pending' THEN
@@ -3280,25 +3469,21 @@ BEGIN
         FROM public.worker_admission_grants AS grant_row
         WHERE grant_row.service_name = p_service_name
           AND grant_row.state = 'revoked'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM public.worker_admission_grants AS retained_grant
+              WHERE retained_grant.database_principal
+                    = grant_row.database_principal
+                AND retained_grant.state IN ('pending', 'active')
+                AND retained_grant.revoked_at IS NULL
+          )
         ORDER BY grant_row.database_principal
     LOOP
-        IF EXISTS (
-            SELECT 1
-            FROM pg_catalog.pg_auth_members AS membership
-            JOIN pg_catalog.pg_roles AS granted
-              ON granted.oid = membership.roleid
-            JOIN pg_catalog.pg_roles AS member
-              ON member.oid = membership.member
-            WHERE granted.rolname = 'vp_worker_runtime'
-              AND member.rolname = v_revoked_principal
-        ) THEN
-            EXECUTE pg_catalog.format(
-                'REVOKE %I FROM %I',
-                'vp_worker_runtime',
-                v_revoked_principal
-            );
-        END IF;
+""" + _operator_quarantine_principal_sql("v_revoked_principal") + """
     END LOOP;
+""" + _operator_runtime_role_graph_sql() + _operator_require_runtime_principal_sql(
+            "v_grant.database_principal"
+        ) + """
     RETURN v_grant.id;
 END;
 $function$
@@ -3322,6 +3507,8 @@ DECLARE
     v_registration_id uuid;
     v_locked_registration_id uuid;
     v_grant public.worker_admission_grants%ROWTYPE;
+    v_valid_principal text;
+    v_membership record;
     v_now timestamptz;
 BEGIN
     IF p_service_name IS NULL
@@ -3361,22 +3548,9 @@ BEGIN
               AND registration.status = 'active';
         END IF;
     END IF;
-    IF EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_auth_members AS membership
-        JOIN pg_catalog.pg_roles AS granted
-          ON granted.oid = membership.roleid
-        JOIN pg_catalog.pg_roles AS member
-          ON member.oid = membership.member
-        WHERE granted.rolname = 'vp_worker_runtime'
-          AND member.rolname = v_grant.database_principal
-    ) THEN
-        EXECUTE pg_catalog.format(
-            'REVOKE %I FROM %I',
-            'vp_worker_runtime',
-            v_grant.database_principal
-        );
-    END IF;
+""" + _operator_quarantine_principal_sql(
+            "v_grant.database_principal"
+        ) + _operator_runtime_role_graph_sql() + """
     RETURN TRUE;
 END;
 $function$

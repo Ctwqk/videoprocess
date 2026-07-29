@@ -17,6 +17,7 @@ import asyncpg  # type: ignore[import-untyped]
 
 from app.services.worker_role_cli_common import (
     WorkerRoleCommonError,
+    acquire_database_acl_dcl_lock,
     acquire_role_lifecycle_lock,
     acquire_stable_role_authority_locks,
     acquire_worker_service_authority_lock,
@@ -26,9 +27,9 @@ from app.services.worker_role_cli_common import (
     ensure_stable_role,
     grant_columns,
     grant_functions,
-    harden_existing_login_role,
     load_database_url_file,
     quote_identifier,
+    quarantine_login_roles,
     read_secure_file,
     remove_secure_files,
     reset_public_privileges,
@@ -373,6 +374,7 @@ async def _provision(
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     created = False
     try:
+        await acquire_database_acl_dcl_lock(connection)
         await acquire_stable_role_authority_locks(
             connection,
             (names.stable,),
@@ -422,6 +424,13 @@ async def _provision(
                 WorkerRoleCommonError,
             ) as exc:
                 await _deauthorize_generation(connection, names)
+                await _converge_members_after_quarantine(
+                    connection,
+                    owner_url,
+                    state_dir,
+                    service_name,
+                    names,
+                )
                 raise RuntimeRoleError("generation state invalid") from exc
             authority = await _classify_generation_authority(
                 connection,
@@ -438,9 +447,23 @@ async def _provision(
                     generation,
                     names,
                 )
+                await _converge_members_after_quarantine(
+                    connection,
+                    owner_url,
+                    state_dir,
+                    service_name,
+                    names,
+                )
                 raise RuntimeRoleError("generation authority revoked")
             if authority.state == "mismatch":
                 await _deauthorize_generation(connection, names)
+                await _converge_members_after_quarantine(
+                    connection,
+                    owner_url,
+                    state_dir,
+                    service_name,
+                    names,
+                )
                 raise RuntimeRoleError("generation authority mismatch")
             await _converge_existing_generation(
                 connection,
@@ -472,6 +495,13 @@ async def _provision(
                 )
                 return
             await _deauthorize_generation(connection, names)
+            await _converge_members_after_quarantine(
+                connection,
+                owner_url,
+                state_dir,
+                service_name,
+                names,
+            )
             raise RuntimeRoleError("interrupted generation unauthorized")
 
         if await _generation_has_any_authority(
@@ -535,19 +565,15 @@ async def _provision(
     except BaseException:
         if created:
             try:
+                await drop_login_roles(
+                    connection,
+                    (names.versioned,),
+                )
                 remove_secure_files(
                     state_dir,
                     (service_name, str(generation)),
                     tuple(STATE_FILENAMES.values()),
                 )
-            except WorkerRoleCommonError:
-                pass
-            try:
-                async with connection.transaction():
-                    await drop_login_roles(
-                        connection,
-                        (names.versioned,),
-                    )
             except (asyncpg.PostgresError, OSError, WorkerRoleCommonError):
                 pass
         raise
@@ -639,51 +665,32 @@ async def _deauthorize_generation(
     connection: asyncpg.Connection,
     names: RuntimeRoleNames,
 ) -> None:
-    if not await connection.fetchval(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM pg_catalog.pg_roles
-            WHERE rolname = $1
-        )
-        """,
-        names.versioned,
-    ):
-        return
-    async with connection.transaction():
-        quoted_versioned = quote_identifier(names.versioned)
-        await connection.execute(
-            f"ALTER ROLE {quoted_versioned} NOLOGIN"
-        )
-        if await connection.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_auth_members AS membership
-                JOIN pg_catalog.pg_roles AS granted
-                  ON granted.oid = membership.roleid
-                JOIN pg_catalog.pg_roles AS member
-                  ON member.oid = membership.member
-                WHERE granted.rolname = $1
-                  AND member.rolname = $2
-            )
-            """,
-            names.stable,
-            names.versioned,
-        ):
-            await connection.execute(
-                f"REVOKE {quote_identifier(names.stable)} "
-                f"FROM {quoted_versioned}"
-            )
-    await connection.execute(
-        """
-        SELECT pg_catalog.pg_terminate_backend(activity.pid)
-        FROM pg_catalog.pg_stat_activity AS activity
-        WHERE activity.usename = $1
-          AND activity.pid <> pg_catalog.pg_backend_pid()
-        """,
-        names.versioned,
+    await quarantine_login_roles(
+        connection,
+        (names.versioned,),
     )
+
+
+async def _converge_members_after_quarantine(
+    connection: asyncpg.Connection,
+    owner_url: str,
+    state_dir: Path,
+    service_name: str,
+    names: RuntimeRoleNames,
+) -> None:
+    authorized_members = await _authorized_runtime_members(
+        connection,
+        owner_url,
+        state_dir,
+        service_name,
+    )
+    async with connection.transaction():
+        await ensure_stable_role(
+            connection,
+            names.stable,
+            setting_prefix="worker_runtime",
+            authorized_members=tuple(sorted(authorized_members)),
+        )
 
 
 async def _retire_local_generation(
@@ -693,8 +700,12 @@ async def _retire_local_generation(
     generation: int,
     names: RuntimeRoleNames,
 ) -> None:
-    async with connection.transaction():
+    try:
         await drop_login_roles(connection, (names.versioned,))
+    except (asyncpg.PostgresError, WorkerRoleCommonError) as exc:
+        raise RuntimeRoleError(
+            "revoked generation cleanup failed"
+        ) from exc
     try:
         remove_secure_files(
             state_dir,
@@ -825,11 +836,6 @@ async def _reconstruct_generation_state(
         names.versioned,
     ):
         return None
-    await verify_role_database_url(
-        owner_url,
-        database_url,
-        names.versioned,
-    )
     authority = await _classify_generation_authority(
         connection,
         service_name,
@@ -845,10 +851,46 @@ async def _reconstruct_generation_state(
             generation,
             names,
         )
+        await _converge_members_after_quarantine(
+            connection,
+            owner_url,
+            state_dir,
+            service_name,
+            names,
+        )
         raise RuntimeRoleError("generation authority revoked")
     if authority.state not in {"pending", "active"}:
         await _deauthorize_generation(connection, names)
+        await _converge_members_after_quarantine(
+            connection,
+            owner_url,
+            state_dir,
+            service_name,
+            names,
+        )
         raise RuntimeRoleError("interrupted generation unauthorized")
+    try:
+        await verify_role_database_url(
+            owner_url,
+            database_url,
+            names.versioned,
+        )
+    except (
+        asyncpg.PostgresError,
+        OSError,
+        WorkerRoleCommonError,
+    ) as exc:
+        await _deauthorize_generation(connection, names)
+        await _converge_members_after_quarantine(
+            connection,
+            owner_url,
+            state_dir,
+            service_name,
+            names,
+        )
+        raise RuntimeRoleError(
+            "interrupted generation credential invalid"
+        ) from exc
     write_generation_state(
         state_dir,
         service_name,
@@ -885,11 +927,6 @@ async def _converge_existing_generation(
             authorized_members=tuple(
                 sorted({*authorized_members, names.versioned})
             ),
-        )
-        await harden_existing_login_role(
-            connection,
-            names.versioned,
-            names.stable,
         )
         await _set_runtime_privileges(connection, names.stable)
     await verify_role_database_url(
@@ -1021,6 +1058,7 @@ async def _revoke(
 ) -> None:
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     try:
+        await acquire_database_acl_dcl_lock(connection)
         await acquire_stable_role_authority_locks(
             connection,
             (names.stable,),
@@ -1055,13 +1093,20 @@ async def _revoke(
                 names.versioned,
             ):
                 raise RuntimeRoleError("worker role is still admitted")
-            await drop_login_roles(connection, (names.versioned,))
+        await drop_login_roles(connection, (names.versioned,))
         remove_secure_files(
             state_dir,
             (service_name, str(generation)),
             tuple(STATE_FILENAMES.values()),
         )
-    except WorkerRoleCommonError as exc:
+        await _converge_members_after_quarantine(
+            connection,
+            owner_url,
+            state_dir,
+            service_name,
+            names,
+        )
+    except (asyncpg.PostgresError, WorkerRoleCommonError) as exc:
         raise RuntimeRoleError("generation state removal failed") from exc
     finally:
         await connection.close()
