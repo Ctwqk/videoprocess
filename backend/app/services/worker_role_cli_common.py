@@ -8,6 +8,7 @@ import os
 import secrets
 import stat
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import asyncpg  # type: ignore[import-untyped]
@@ -21,6 +22,70 @@ DATABASE_ACL_DCL_LOCK_SCOPE = "vp-worker-database-acl-dcl"
 
 class WorkerRoleCommonError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class PrivateDirectorySnapshot:
+    path: Path
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    mode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+def capture_private_directory(path: Path) -> PrivateDirectorySnapshot:
+    if not path.is_absolute():
+        raise WorkerRoleCommonError("state directory invalid")
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o700
+            or before.st_uid != os.geteuid()
+        ):
+            raise WorkerRoleCommonError("state directory invalid")
+        descriptor = os.open(path, _directory_open_flags())
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or not stat.S_ISDIR(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or opened.st_uid != os.geteuid()
+            or opened.st_uid != before.st_uid
+            or opened.st_gid != before.st_gid
+            or opened.st_size != before.st_size
+            or opened.st_mtime_ns != before.st_mtime_ns
+            or opened.st_ctime_ns != before.st_ctime_ns
+        ):
+            raise WorkerRoleCommonError("state directory changed")
+        return PrivateDirectorySnapshot(
+            path=path,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            uid=opened.st_uid,
+            gid=opened.st_gid,
+            mode=stat.S_IMODE(opened.st_mode),
+            size=opened.st_size,
+            mtime_ns=opened.st_mtime_ns,
+            ctime_ns=opened.st_ctime_ns,
+        )
+    except OSError as exc:
+        raise WorkerRoleCommonError("state directory invalid") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def verify_private_directory(snapshot: PrivateDirectorySnapshot) -> None:
+    current = capture_private_directory(snapshot.path)
+    if current != snapshot:
+        raise WorkerRoleCommonError("state directory changed")
 
 
 def load_database_url_file(
@@ -223,23 +288,6 @@ async def ensure_stable_role(
         f"ALTER ROLE {quote_identifier(role_name)} RESET ALL"
     )
     await _revoke_database_ddl(connection, role_name)
-    memberships = await connection.fetch(
-        """
-        SELECT granted.rolname
-        FROM pg_catalog.pg_auth_members AS membership
-        JOIN pg_catalog.pg_roles AS member
-          ON member.oid = membership.member
-        JOIN pg_catalog.pg_roles AS granted
-          ON granted.oid = membership.roleid
-        WHERE member.rolname = $1
-        """,
-        role_name,
-    )
-    for membership in memberships:
-        await connection.execute(
-            f"REVOKE {quote_identifier(membership['rolname'])} "
-            f"FROM {quote_identifier(role_name)}"
-        )
     await _converge_reverse_memberships(
         connection,
         role_name,
@@ -398,6 +446,11 @@ async def create_login_role(
     )
     if stable_role is not None:
         await mark_managed_login_role(connection, role_name, stable_role)
+        await _grant_canonical_role_membership(
+            connection,
+            stable_role,
+            role_name,
+        )
 
 
 async def mark_managed_login_role(
@@ -590,30 +643,14 @@ async def _converge_reverse_memberships(
     *,
     authorized_members: Sequence[str],
 ) -> None:
-    rows = await connection.fetch(
-        """
-        SELECT member.rolname
-        FROM pg_catalog.pg_auth_members AS membership
-        JOIN pg_catalog.pg_roles AS member
-          ON member.oid = membership.member
-        JOIN pg_catalog.pg_roles AS granted
-          ON granted.oid = membership.roleid
-        WHERE granted.rolname = $1
-        """,
+    managed_roles = {
         granted_role,
+        *authorized_members,
+    }
+    await revoke_role_membership_authority(
+        connection,
+        tuple(sorted(managed_roles)),
     )
-    explicitly_authorized = set(authorized_members)
-    for row in rows:
-        member_name = row["rolname"]
-        await connection.execute(
-            f"REVOKE {quote_identifier(granted_role)} "
-            f"FROM {quote_identifier(member_name)}"
-        )
-        if member_name in explicitly_authorized:
-            await connection.execute(
-                f"GRANT {quote_identifier(granted_role)} "
-                f"TO {quote_identifier(member_name)}"
-            )
 
 
 async def _converge_login_role_memberships(
@@ -624,50 +661,126 @@ async def _converge_login_role_memberships(
 ) -> None:
     if role_name == stable_role:
         raise WorkerRoleCommonError("database role membership invalid")
-    rows = await connection.fetch(
-        """
-        SELECT
-            granted.rolname AS granted_role,
-            member.rolname AS member_role
-        FROM pg_catalog.pg_auth_members AS membership
-        JOIN pg_catalog.pg_roles AS granted
-          ON granted.oid = membership.roleid
-        JOIN pg_catalog.pg_roles AS member
-          ON member.oid = membership.member
-        WHERE member.rolname = $1 OR granted.rolname = $1
-        ORDER BY granted.rolname, member.rolname
-        """,
+    await revoke_role_membership_authority(connection, (role_name,))
+    await _grant_canonical_role_membership(
+        connection,
+        stable_role,
         role_name,
     )
-    for row in rows:
-        if (
-            row["member_role"] == role_name
-            and row["granted_role"] == stable_role
-        ):
-            continue
-        await connection.execute(
-            f"REVOKE {quote_identifier(row['granted_role'])} "
-            f"FROM {quote_identifier(row['member_role'])}"
-        )
-    if not await connection.fetchval(
-        """
-        SELECT EXISTS (
-            SELECT 1
+
+
+async def revoke_role_membership_authority(
+    connection: asyncpg.Connection,
+    role_names: Sequence[str],
+) -> None:
+    ordered_roles = tuple(sorted(set(role_names)))
+    if not ordered_roles or len(ordered_roles) != len(role_names):
+        raise WorkerRoleCommonError("database role membership invalid")
+    for role_name in ordered_roles:
+        quote_identifier(role_name)
+
+    while True:
+        membership = await connection.fetchrow(
+            """
+            SELECT
+                membership.oid AS membership_oid,
+                granted.rolname AS granted_role,
+                member.rolname AS member_role,
+                grantor.rolname AS grantor_role
             FROM pg_catalog.pg_auth_members AS membership
             JOIN pg_catalog.pg_roles AS granted
               ON granted.oid = membership.roleid
             JOIN pg_catalog.pg_roles AS member
               ON member.oid = membership.member
-            WHERE granted.rolname = $1
-              AND member.rolname = $2
+            JOIN pg_catalog.pg_roles AS grantor
+              ON grantor.oid = membership.grantor
+            WHERE granted.rolname = ANY($1::text[])
+               OR member.rolname = ANY($1::text[])
+               OR grantor.rolname = ANY($1::text[])
+            ORDER BY
+                (grantor.rolname = ANY($1::text[])) DESC,
+                granted.rolname,
+                member.rolname,
+                grantor.rolname,
+                membership.oid
+            LIMIT 1
+            """,
+            list(ordered_roles),
         )
-        """,
-        stable_role,
-        role_name,
+        if membership is None:
+            return
+        await connection.execute(
+            f"REVOKE "
+            f"{quote_identifier(membership['granted_role'])} "
+            f"FROM {quote_identifier(membership['member_role'])} "
+            f"GRANTED BY {quote_identifier(membership['grantor_role'])} "
+            "CASCADE"
+        )
+        if await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_auth_members
+                WHERE oid = $1
+            )
+            """,
+            membership["membership_oid"],
+        ):
+            raise WorkerRoleCommonError(
+                "database role membership convergence failed"
+            )
+
+
+async def _grant_canonical_role_membership(
+    connection: asyncpg.Connection,
+    granted_role: str,
+    member_role: str,
+) -> None:
+    quoted_granted = quote_identifier(granted_role)
+    quoted_member = quote_identifier(member_role)
+    for option, value in (
+        ("ADMIN", "FALSE"),
+        ("INHERIT", "TRUE"),
+        ("SET", "TRUE"),
     ):
         await connection.execute(
-            f"GRANT {quote_identifier(stable_role)} "
-            f"TO {quote_identifier(role_name)}"
+            f"GRANT {quoted_granted} TO {quoted_member} "
+            f"WITH {option} {value} GRANTED BY CURRENT_USER"
+        )
+    canonical = await connection.fetchrow(
+        """
+        SELECT
+            pg_catalog.count(*) AS edge_count,
+            pg_catalog.bool_and(NOT membership.admin_option)
+                AS admin_is_canonical,
+            pg_catalog.bool_and(membership.inherit_option)
+                AS inherit_is_canonical,
+            pg_catalog.bool_and(membership.set_option)
+                AS set_is_canonical,
+            pg_catalog.bool_and(grantor.rolname = current_user)
+                AS grantor_is_canonical
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        JOIN pg_catalog.pg_roles AS grantor
+          ON grantor.oid = membership.grantor
+        WHERE granted.rolname = $1
+          AND member.rolname = $2
+        """,
+        granted_role,
+        member_role,
+    )
+    if canonical is None or dict(canonical) != {
+        "edge_count": 1,
+        "admin_is_canonical": True,
+        "inherit_is_canonical": True,
+        "set_is_canonical": True,
+        "grantor_is_canonical": True,
+    }:
+        raise WorkerRoleCommonError(
+            "database role membership convergence failed"
         )
 
 
@@ -996,28 +1109,10 @@ async def quarantine_login_roles(
                 await connection.execute(
                     f"ALTER ROLE {quote_identifier(role_name)} NOLOGIN"
                 )
-        memberships = await connection.fetch(
-            """
-            SELECT
-                granted.rolname AS granted_role,
-                member.rolname AS member_role
-            FROM pg_catalog.pg_auth_members AS membership
-            JOIN pg_catalog.pg_roles AS granted
-              ON granted.oid = membership.roleid
-            JOIN pg_catalog.pg_roles AS member
-              ON member.oid = membership.member
-            WHERE granted.rolname = ANY($1::text[])
-               OR member.rolname = ANY($1::text[])
-            ORDER BY granted.rolname, member.rolname
-            """,
-            list(ordered_roles),
+        await revoke_role_membership_authority(
+            connection,
+            ordered_roles,
         )
-        for membership in memberships:
-            await connection.execute(
-                f"REVOKE "
-                f"{quote_identifier(membership['granted_role'])} "
-                f"FROM {quote_identifier(membership['member_role'])}"
-            )
     await connection.execute(
         """
         SELECT pg_catalog.pg_terminate_backend(activity.pid)

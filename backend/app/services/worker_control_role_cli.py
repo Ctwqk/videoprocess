@@ -7,7 +7,6 @@ import json
 import os
 import re
 import secrets
-import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,11 +15,13 @@ from typing import Never
 import asyncpg  # type: ignore[import-untyped]
 
 from app.services.worker_role_cli_common import (
+    PrivateDirectorySnapshot,
     WorkerRoleCommonError,
     acquire_database_acl_dcl_lock,
     acquire_role_lifecycle_lock,
     acquire_stable_role_authority_locks,
     asyncpg_url,
+    capture_private_directory,
     create_login_role,
     drop_login_roles,
     ensure_stable_role,
@@ -34,6 +35,7 @@ from app.services.worker_role_cli_common import (
     reset_public_privileges,
     role_database_url,
     verify_role_database_url,
+    verify_private_directory,
     write_secure_files,
 )
 
@@ -480,6 +482,10 @@ class ControlRoleArgumentError(ControlRoleError):
     pass
 
 
+class ControlStateTreeError(ControlRoleError):
+    pass
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> Never:
         raise ControlRoleArgumentError(message)
@@ -629,6 +635,19 @@ async def _provision(
             connection,
             f"control:{generation}",
         )
+        try:
+            tree_snapshots = _control_generation_tree_snapshots(
+                state_dir,
+                generation,
+            )
+        except ControlStateTreeError as exc:
+            await quarantine_login_roles(
+                connection,
+                tuple(names.versioned.values()),
+            )
+            raise ControlRoleError(
+                "control state directory invalid"
+            ) from exc
         state_presence = {
             purpose: path.exists()
             for purpose, path in paths.items()
@@ -664,27 +683,43 @@ async def _provision(
                     paths,
                     names,
                 )
+                _verify_directory_snapshots(tree_snapshots)
             except (
                 asyncpg.PostgresError,
                 OSError,
                 ControlRoleError,
                 WorkerRoleCommonError,
             ) as exc:
-                await _quarantine_control_generation(
-                    connection,
-                    owner_url,
-                    state_dir,
-                    generation,
-                    names,
-                )
+                if isinstance(exc, ControlStateTreeError):
+                    await quarantine_login_roles(
+                        connection,
+                        tuple(names.versioned.values()),
+                    )
+                else:
+                    await _quarantine_control_generation(
+                        connection,
+                        owner_url,
+                        state_dir,
+                        generation,
+                        names,
+                    )
                 raise ControlRoleError(
                     "control generation state invalid"
                 ) from exc
-            authorized_members = await _authorized_control_members(
-                connection,
-                owner_url,
-                state_dir,
-            )
+            try:
+                authorized_members = await _authorized_control_members(
+                    connection,
+                    owner_url,
+                    state_dir,
+                )
+            except ControlStateTreeError as exc:
+                await quarantine_login_roles(
+                    connection,
+                    tuple(names.versioned.values()),
+                )
+                raise ControlRoleError(
+                    "control state directory invalid"
+                ) from exc
             async with connection.transaction():
                 for purpose, stable_role in names.stable.items():
                     await ensure_stable_role(
@@ -744,11 +779,6 @@ async def _provision(
                     setting_prefix="worker_control",
                     stable_role=names.stable[purpose],
                 )
-                await connection.execute(
-                    f"GRANT "
-                    f"{quote_identifier(names.stable[purpose])} "
-                    f"TO {quote_identifier(versioned_role)}"
-                )
         created = True
         role_urls = {
             purpose: role_database_url(
@@ -799,12 +829,15 @@ async def _quarantine_control_generation(
         connection,
         tuple(names.versioned.values()),
     )
-    authorized_members = await _authorized_control_members(
-        connection,
-        owner_url,
-        state_dir,
-        excluded_generation=generation,
-    )
+    try:
+        authorized_members = await _authorized_control_members(
+            connection,
+            owner_url,
+            state_dir,
+            excluded_generation=generation,
+        )
+    except ControlStateTreeError:
+        return
     async with connection.transaction():
         for purpose, stable_role in names.stable.items():
             await ensure_stable_role(
@@ -940,15 +973,16 @@ async def _authorized_control_members(
     authorized: dict[str, set[str]] = {
         purpose: set() for purpose in STABLE_ROLES
     }
-    if not state_dir.exists():
+    root_snapshot = _capture_optional_private_directory(state_dir)
+    if root_snapshot is None:
         return authorized
-    _require_private_state_directory(state_dir)
     with os.scandir(state_dir) as entries:
         generation_names = sorted(
             entry.name
             for entry in entries
             if entry.is_dir(follow_symlinks=False)
         )
+    _verify_directory_snapshot(root_snapshot)
     for generation in generation_names:
         if not GENERATION_PATTERN.fullmatch(generation):
             continue
@@ -957,12 +991,17 @@ async def _authorized_control_members(
         generation_dir = state_dir / generation
         names = role_names_for_generation(generation)
         try:
-            _require_private_state_directory(generation_dir)
+            generation_snapshot = _capture_required_private_directory(
+                generation_dir
+            )
             await _validate_existing_generation(
                 connection,
                 owner_url,
                 credential_paths(state_dir, generation),
                 names,
+            )
+            _verify_directory_snapshots(
+                (root_snapshot, generation_snapshot)
             )
         except (
             asyncpg.PostgresError,
@@ -977,22 +1016,70 @@ async def _authorized_control_members(
             continue
         for purpose, role_name in names.versioned.items():
             authorized[purpose].add(role_name)
+    _verify_directory_snapshot(root_snapshot)
     return authorized
 
 
-def _require_private_state_directory(path: Path) -> None:
+def _capture_optional_private_directory(
+    path: Path,
+) -> PrivateDirectorySnapshot | None:
     try:
-        metadata = path.lstat()
+        path.lstat()
+    except FileNotFoundError:
+        return None
     except OSError as exc:
-        raise ControlRoleError(
+        raise ControlStateTreeError(
             "control state directory invalid"
         ) from exc
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-        or metadata.st_uid != os.geteuid()
-    ):
-        raise ControlRoleError("control state directory invalid")
+    return _capture_required_private_directory(path)
+
+
+def _capture_required_private_directory(
+    path: Path,
+) -> PrivateDirectorySnapshot:
+    try:
+        return capture_private_directory(path)
+    except WorkerRoleCommonError as exc:
+        raise ControlStateTreeError(
+            "control state directory invalid"
+        ) from exc
+
+
+def _verify_directory_snapshot(snapshot: PrivateDirectorySnapshot) -> None:
+    try:
+        verify_private_directory(snapshot)
+    except WorkerRoleCommonError as exc:
+        raise ControlStateTreeError(
+            "control state directory invalid"
+        ) from exc
+
+
+def _verify_directory_snapshots(
+    snapshots: Sequence[PrivateDirectorySnapshot],
+) -> None:
+    for snapshot in snapshots:
+        _verify_directory_snapshot(snapshot)
+
+
+def _control_generation_tree_snapshots(
+    state_dir: Path,
+    generation: str,
+) -> tuple[PrivateDirectorySnapshot, ...]:
+    root_snapshot = _capture_optional_private_directory(state_dir)
+    if root_snapshot is None:
+        return ()
+    snapshots = [root_snapshot]
+    generation_snapshot = _capture_optional_private_directory(
+        state_dir / generation
+    )
+    if generation_snapshot is not None:
+        snapshots.append(generation_snapshot)
+    _verify_directory_snapshots(snapshots)
+    return tuple(snapshots)
+
+
+def _require_private_state_directory(path: Path) -> None:
+    _capture_required_private_directory(path)
 
 
 async def _revoke(
@@ -1012,6 +1099,20 @@ async def _revoke(
             connection,
             f"control:{generation}",
         )
+        try:
+            tree_snapshots = _control_generation_tree_snapshots(
+                state_dir,
+                generation,
+            )
+        except ControlStateTreeError as exc:
+            await quarantine_login_roles(
+                connection,
+                tuple(names.versioned.values()),
+            )
+            raise ControlRoleError(
+                "control state directory invalid"
+            ) from exc
+        _verify_directory_snapshots(tree_snapshots)
         await drop_login_roles(
             connection,
             tuple(names.versioned.values()),

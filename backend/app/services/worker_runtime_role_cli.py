@@ -7,7 +7,6 @@ import json
 import os
 import re
 import secrets
-import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,25 +15,27 @@ from typing import Never
 import asyncpg  # type: ignore[import-untyped]
 
 from app.services.worker_role_cli_common import (
+    PrivateDirectorySnapshot,
     WorkerRoleCommonError,
     acquire_database_acl_dcl_lock,
     acquire_role_lifecycle_lock,
     acquire_stable_role_authority_locks,
     acquire_worker_service_authority_lock,
     asyncpg_url,
+    capture_private_directory,
     create_login_role,
     drop_login_roles,
     ensure_stable_role,
     grant_columns,
     grant_functions,
     load_database_url_file,
-    quote_identifier,
     quarantine_login_roles,
     read_secure_file,
     remove_secure_files,
     reset_public_privileges,
     role_database_url,
     verify_role_database_url,
+    verify_private_directory,
     write_secure_files,
 )
 
@@ -166,6 +167,10 @@ class RuntimeRoleArgumentError(RuntimeRoleError):
 
 
 class RuntimeRoleOwnerURLError(RuntimeRoleError):
+    pass
+
+
+class RuntimeStateTreeError(RuntimeRoleError):
     pass
 
 
@@ -379,10 +384,20 @@ async def _provision(
             connection,
             (names.stable,),
         )
-        for managed_service_name in _managed_runtime_service_names(
-            state_dir,
-            service_name,
-        ):
+        initial_root_snapshot: PrivateDirectorySnapshot | None = None
+        state_tree_error: RuntimeStateTreeError | None = None
+        try:
+            initial_root_snapshot = _capture_optional_private_directory(
+                state_dir
+            )
+            managed_service_names = _managed_runtime_service_names(
+                state_dir,
+                service_name,
+            )
+        except RuntimeStateTreeError as exc:
+            state_tree_error = exc
+            managed_service_names = (service_name,)
+        for managed_service_name in managed_service_names:
             await acquire_worker_service_authority_lock(
                 connection,
                 managed_service_name,
@@ -391,6 +406,22 @@ async def _provision(
             connection,
             f"runtime:{service_name}:{generation}",
         )
+        if state_tree_error is not None:
+            await _deauthorize_generation(connection, names)
+            raise RuntimeRoleError("generation state directory invalid") from (
+                state_tree_error
+            )
+        try:
+            if initial_root_snapshot is not None:
+                _verify_directory_snapshot(initial_root_snapshot)
+            tree_snapshots = _runtime_generation_tree_snapshots(
+                state_dir,
+                service_name,
+                generation,
+            )
+        except RuntimeStateTreeError as exc:
+            await _deauthorize_generation(connection, names)
+            raise RuntimeRoleError("generation state directory invalid") from exc
         state_presence = {
             purpose: path.exists()
             for purpose, path in paths.items()
@@ -417,6 +448,7 @@ async def _provision(
                     paths,
                     names,
                 )
+                _verify_directory_snapshots(tree_snapshots)
             except (
                 asyncpg.PostgresError,
                 OSError,
@@ -424,13 +456,14 @@ async def _provision(
                 WorkerRoleCommonError,
             ) as exc:
                 await _deauthorize_generation(connection, names)
-                await _converge_members_after_quarantine(
-                    connection,
-                    owner_url,
-                    state_dir,
-                    service_name,
-                    names,
-                )
+                if not isinstance(exc, RuntimeStateTreeError):
+                    await _converge_members_after_quarantine(
+                        connection,
+                        owner_url,
+                        state_dir,
+                        service_name,
+                        names,
+                    )
                 raise RuntimeRoleError("generation state invalid") from exc
             authority = await _classify_generation_authority(
                 connection,
@@ -465,14 +498,20 @@ async def _provision(
                     names,
                 )
                 raise RuntimeRoleError("generation authority mismatch")
-            await _converge_existing_generation(
-                connection,
-                owner_url,
-                state_dir,
-                service_name,
-                names,
-                credentials,
-            )
+            try:
+                await _converge_existing_generation(
+                    connection,
+                    owner_url,
+                    state_dir,
+                    service_name,
+                    names,
+                    credentials,
+                )
+            except RuntimeStateTreeError as exc:
+                await _deauthorize_generation(connection, names)
+                raise RuntimeRoleError(
+                    "generation state directory invalid"
+                ) from exc
             return
         if any(state_presence.values()) or role_exists:
             reconstructed = await _reconstruct_generation_state(
@@ -538,10 +577,6 @@ async def _provision(
                 database_password,
                 setting_prefix="worker_runtime",
                 stable_role=names.stable,
-            )
-            await connection.execute(
-                f"GRANT {quote_identifier(names.stable)} "
-                f"TO {quote_identifier(names.versioned)}"
             )
         created = True
         database_url = role_database_url(
@@ -678,12 +713,15 @@ async def _converge_members_after_quarantine(
     service_name: str,
     names: RuntimeRoleNames,
 ) -> None:
-    authorized_members = await _authorized_runtime_members(
-        connection,
-        owner_url,
-        state_dir,
-        service_name,
-    )
+    try:
+        authorized_members = await _authorized_runtime_members(
+            connection,
+            owner_url,
+            state_dir,
+            service_name,
+        )
+    except RuntimeStateTreeError:
+        return
     async with connection.transaction():
         await ensure_stable_role(
             connection,
@@ -944,9 +982,9 @@ async def _authorized_runtime_members(
 ) -> set[str]:
     if not SERVICE_PATTERN.fullmatch(service_name):
         raise RuntimeRoleError("generation service invalid")
-    if not state_dir.exists():
+    root_snapshot = _capture_optional_private_directory(state_dir)
+    if root_snapshot is None:
         return set()
-    _require_private_state_directory(state_dir)
     authorized: set[str] = set()
     with os.scandir(state_dir) as entries:
         service_names = sorted(
@@ -954,17 +992,19 @@ async def _authorized_runtime_members(
             for entry in entries
             if entry.is_dir(follow_symlinks=False)
         )
+    _verify_directory_snapshot(root_snapshot)
     for managed_service_name in service_names:
         if not SERVICE_PATTERN.fullmatch(managed_service_name):
             continue
         service_dir = state_dir / managed_service_name
-        _require_private_state_directory(service_dir)
+        service_snapshot = _capture_required_private_directory(service_dir)
         with os.scandir(service_dir) as entries:
             generation_names = sorted(
                 entry.name
                 for entry in entries
                 if entry.is_dir(follow_symlinks=False)
             )
+        _verify_directory_snapshot(service_snapshot)
         for generation_name in generation_names:
             if (
                 not generation_name.isascii()
@@ -981,7 +1021,9 @@ async def _authorized_runtime_members(
                 generation,
             )
             try:
-                _require_private_state_directory(generation_dir)
+                generation_snapshot = _capture_required_private_directory(
+                    generation_dir
+                )
                 credentials = await _validate_existing_generation(
                     connection,
                     owner_url,
@@ -1001,6 +1043,13 @@ async def _authorized_runtime_members(
                     names,
                     credentials.admission_token,
                 )
+                _verify_directory_snapshots(
+                    (
+                        root_snapshot,
+                        service_snapshot,
+                        generation_snapshot,
+                    )
+                )
             except (
                 asyncpg.PostgresError,
                 OSError,
@@ -1013,6 +1062,7 @@ async def _authorized_runtime_members(
                 authorized.add(names.versioned)
             else:
                 await _deauthorize_generation(connection, names)
+    _verify_directory_snapshot(root_snapshot)
     return authorized
 
 
@@ -1023,9 +1073,9 @@ def _managed_runtime_service_names(
     if not SERVICE_PATTERN.fullmatch(current_service_name):
         raise RuntimeRoleError("generation service invalid")
     service_names = {current_service_name}
-    if not state_dir.exists():
+    root_snapshot = _capture_optional_private_directory(state_dir)
+    if root_snapshot is None:
         return tuple(service_names)
-    _require_private_state_directory(state_dir)
     with os.scandir(state_dir) as entries:
         service_names.update(
             entry.name
@@ -1033,20 +1083,77 @@ def _managed_runtime_service_names(
             if entry.is_dir(follow_symlinks=False)
             and SERVICE_PATTERN.fullmatch(entry.name)
         )
+    _verify_directory_snapshot(root_snapshot)
     return tuple(sorted(service_names))
 
 
-def _require_private_state_directory(path: Path) -> None:
+def _capture_optional_private_directory(
+    path: Path,
+) -> PrivateDirectorySnapshot | None:
     try:
-        metadata = path.lstat()
+        path.lstat()
+    except FileNotFoundError:
+        return None
     except OSError as exc:
-        raise RuntimeRoleError("generation state directory invalid") from exc
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-        or metadata.st_uid != os.geteuid()
-    ):
-        raise RuntimeRoleError("generation state directory invalid")
+        raise RuntimeStateTreeError(
+            "generation state directory invalid"
+        ) from exc
+    return _capture_required_private_directory(path)
+
+
+def _capture_required_private_directory(
+    path: Path,
+) -> PrivateDirectorySnapshot:
+    try:
+        return capture_private_directory(path)
+    except WorkerRoleCommonError as exc:
+        raise RuntimeStateTreeError(
+            "generation state directory invalid"
+        ) from exc
+
+
+def _verify_directory_snapshot(snapshot: PrivateDirectorySnapshot) -> None:
+    try:
+        verify_private_directory(snapshot)
+    except WorkerRoleCommonError as exc:
+        raise RuntimeStateTreeError(
+            "generation state directory invalid"
+        ) from exc
+
+
+def _verify_directory_snapshots(
+    snapshots: Sequence[PrivateDirectorySnapshot],
+) -> None:
+    for snapshot in snapshots:
+        _verify_directory_snapshot(snapshot)
+
+
+def _runtime_generation_tree_snapshots(
+    state_dir: Path,
+    service_name: str,
+    generation: int,
+) -> tuple[PrivateDirectorySnapshot, ...]:
+    root_snapshot = _capture_optional_private_directory(state_dir)
+    if root_snapshot is None:
+        return ()
+    snapshots = [root_snapshot]
+    service_snapshot = _capture_optional_private_directory(
+        state_dir / service_name
+    )
+    if service_snapshot is None:
+        return tuple(snapshots)
+    snapshots.append(service_snapshot)
+    generation_snapshot = _capture_optional_private_directory(
+        state_dir / service_name / str(generation)
+    )
+    if generation_snapshot is not None:
+        snapshots.append(generation_snapshot)
+    _verify_directory_snapshots(snapshots)
+    return tuple(snapshots)
+
+
+def _require_private_state_directory(path: Path) -> None:
+    _capture_required_private_directory(path)
 
 
 async def _revoke(
@@ -1071,6 +1178,15 @@ async def _revoke(
             connection,
             f"runtime:{service_name}:{generation}",
         )
+        try:
+            tree_snapshots = _runtime_generation_tree_snapshots(
+                state_dir,
+                service_name,
+                generation,
+            )
+        except RuntimeStateTreeError as exc:
+            await _deauthorize_generation(connection, names)
+            raise RuntimeRoleError("generation state directory invalid") from exc
         async with connection.transaction():
             if await connection.fetchval(
                 """
@@ -1093,6 +1209,7 @@ async def _revoke(
                 names.versioned,
             ):
                 raise RuntimeRoleError("worker role is still admitted")
+        _verify_directory_snapshots(tree_snapshots)
         await drop_login_roles(connection, (names.versioned,))
         remove_secure_files(
             state_dir,
