@@ -66,6 +66,14 @@ accept a new PEL delivery after owned loss; later-page failure can discard an
 already-XCLAIMed target; parser-accepted invalid Redis ranges pass the
 pre-database gate; `CloseContext` has a zero-count-to-Close acquisition race;
 commits 791e552..a0fa9ea)
+Task 3: fix round 3/5 (0 addressed, 4 open — read cancellation still permits
+post-proof PEL intake and has a dispatch/cause TOCTOU; visitor-phase failure
+can discard an earlier successful XCLAIM; retry scalars still bypass the
+pre-database Redis gate; pool tracking starts after underlying acquisition and
+does not cover nil-gate Store construction or Hijack; commits
+a0fa9ea..b176ee4)
+Task 3: minor (deferred): the PostgreSQL pool lifecycle goroutine-count
+assertion was flaky in 4 of 26 focused re-review runs.
 Task 4: pending
 Task 5: pending
 Task 6: pending
