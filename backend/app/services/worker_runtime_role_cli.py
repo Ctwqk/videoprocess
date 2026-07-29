@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Never
 
 import asyncpg  # type: ignore[import-untyped]
-from sqlalchemy.engine import make_url
 
 from app.services.worker_role_cli_common import (
     WorkerRoleCommonError,
+    acquire_role_lifecycle_lock,
     asyncpg_url,
     create_login_role,
     drop_login_roles,
@@ -29,6 +29,7 @@ from app.services.worker_role_cli_common import (
     remove_secure_files,
     reset_public_privileges,
     role_database_url,
+    verify_role_database_url,
     write_secure_files,
 )
 
@@ -357,9 +358,30 @@ async def _provision(
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     created = False
     try:
-        if any(path.exists() for path in paths.values()):
+        await acquire_role_lifecycle_lock(
+            connection,
+            f"runtime:{service_name}:{generation}",
+        )
+        state_presence = {
+            purpose: path.exists()
+            for purpose, path in paths.items()
+        }
+        role_exists = bool(
+            await connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_roles
+                    WHERE rolname = $1
+                )
+                """,
+                names.versioned,
+            )
+        )
+        if all(state_presence.values()):
             await _validate_existing_generation(
                 connection,
+                owner_url,
                 service_name,
                 generation,
                 paths,
@@ -370,6 +392,7 @@ async def _provision(
                     connection,
                     names.stable,
                     setting_prefix="worker_runtime",
+                    authorized_members=(names.versioned,),
                 )
                 await harden_existing_login_role(
                     connection,
@@ -377,7 +400,24 @@ async def _provision(
                     names.stable,
                 )
                 await _set_runtime_privileges(connection, names.stable)
+            database_url = read_secure_file(
+                paths["database_url"],
+                required_mode=0o400,
+            ).strip()
+            await verify_role_database_url(
+                owner_url,
+                database_url,
+                names.versioned,
+            )
             return
+        if any(state_presence.values()) or role_exists:
+            await _recover_interrupted_generation(
+                connection,
+                state_dir,
+                service_name,
+                generation,
+                names,
+            )
 
         database_password = secrets.token_urlsafe(32)
         admission_token = secrets.token_urlsafe(32)
@@ -386,6 +426,7 @@ async def _provision(
                 connection,
                 names.stable,
                 setting_prefix="worker_runtime",
+                authorized_members=(names.versioned,),
             )
             await _set_runtime_privileges(connection, names.stable)
             await create_login_role(
@@ -393,22 +434,29 @@ async def _provision(
                 names.versioned,
                 database_password,
                 setting_prefix="worker_runtime",
+                stable_role=names.stable,
             )
             await connection.execute(
                 f"GRANT {quote_identifier(names.stable)} "
                 f"TO {quote_identifier(names.versioned)}"
             )
         created = True
+        database_url = role_database_url(
+            owner_url,
+            names.versioned,
+            database_password,
+        )
+        await verify_role_database_url(
+            owner_url,
+            database_url,
+            names.versioned,
+        )
         write_generation_state(
             state_dir,
             service_name,
             generation,
             names,
-            database_url=role_database_url(
-                owner_url,
-                names.versioned,
-                database_password,
-            ),
+            database_url=database_url,
             admission_token=admission_token,
         )
     except BaseException:
@@ -434,6 +482,44 @@ async def _provision(
         await connection.close()
 
 
+async def _recover_interrupted_generation(
+    connection: asyncpg.Connection,
+    state_dir: Path,
+    service_name: str,
+    generation: int,
+    names: RuntimeRoleNames,
+) -> None:
+    if await connection.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM public.worker_admission_grants AS grant_record
+            WHERE grant_record.database_principal = $1
+            UNION ALL
+            SELECT 1
+            FROM public.worker_registrations AS registration
+            JOIN public.worker_admission_grants AS grant_record
+              ON grant_record.id = registration.grant_id
+            WHERE grant_record.database_principal = $1
+        )
+        """,
+        names.versioned,
+    ):
+        raise RuntimeRoleError("interrupted generation is durable")
+    async with connection.transaction():
+        await drop_login_roles(connection, (names.versioned,))
+    try:
+        remove_secure_files(
+            state_dir,
+            (service_name, str(generation)),
+            tuple(STATE_FILENAMES.values()),
+        )
+    except WorkerRoleCommonError as exc:
+        raise RuntimeRoleError(
+            "interrupted generation cleanup failed"
+        ) from exc
+
+
 async def _set_runtime_privileges(
     connection: asyncpg.Connection,
     role_name: str,
@@ -452,6 +538,7 @@ async def _set_runtime_privileges(
 
 async def _validate_existing_generation(
     connection: asyncpg.Connection,
+    owner_url: str,
     service_name: str,
     generation: int,
     paths: Mapping[str, Path],
@@ -471,7 +558,6 @@ async def _validate_existing_generation(
             paths["admission_token"],
             required_mode=0o400,
         ).strip()
-        parsed_url = make_url(database_url)
     except (WorkerRoleCommonError, ValueError, TypeError) as exc:
         raise RuntimeRoleError("generation state invalid") from exc
     expected = {
@@ -485,7 +571,6 @@ async def _validate_existing_generation(
     }
     if (
         state != expected
-        or parsed_url.username != names.versioned
         or not admission_token
         or not await connection.fetchval(
             """
@@ -499,6 +584,11 @@ async def _validate_existing_generation(
         )
     ):
         raise RuntimeRoleError("generation state invalid")
+    await verify_role_database_url(
+        owner_url,
+        database_url,
+        names.versioned,
+    )
 
 
 async def _revoke(
@@ -510,6 +600,10 @@ async def _revoke(
 ) -> None:
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     try:
+        await acquire_role_lifecycle_lock(
+            connection,
+            f"runtime:{service_name}:{generation}",
+        )
         async with connection.transaction():
             await connection.execute(
                 """
@@ -544,9 +638,6 @@ async def _revoke(
             ):
                 raise RuntimeRoleError("worker role is still admitted")
             await drop_login_roles(connection, (names.versioned,))
-    finally:
-        await connection.close()
-    try:
         remove_secure_files(
             state_dir,
             (service_name, str(generation)),
@@ -554,6 +645,8 @@ async def _revoke(
         )
     except WorkerRoleCommonError as exc:
         raise RuntimeRoleError("generation state removal failed") from exc
+    finally:
+        await connection.close()
 
 
 def _emit(status: str, code: str, **fields: object) -> None:

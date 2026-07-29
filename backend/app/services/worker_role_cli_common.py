@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
 import errno
+import hashlib
+import hmac
 import os
 import secrets
 import stat
@@ -8,10 +11,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import asyncpg  # type: ignore[import-untyped]
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 
 
 MAX_DATABASE_URL_BYTES = 4096
+MANAGED_LOGIN_COMMENT_PREFIX = "videoprocess-worker-role:v1:"
 
 
 class WorkerRoleCommonError(RuntimeError):
@@ -29,45 +33,13 @@ def load_database_url_file(
     path = Path(raw_path)
     if not path.is_absolute():
         raise WorkerRoleCommonError("database URL file invalid")
-    try:
-        before = path.lstat()
-    except OSError as exc:
-        raise WorkerRoleCommonError("database URL file invalid") from exc
-    if (
-        not stat.S_ISREG(before.st_mode)
-        or stat.S_IMODE(before.st_mode) != required_mode
-        or before.st_size < 1
-        or before.st_size > MAX_DATABASE_URL_BYTES
-    ):
-        raise WorkerRoleCommonError("database URL file invalid")
-
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
-    try:
-        descriptor = os.open(path, flags)
-        try:
-            opened = os.fstat(descriptor)
-            if (
-                opened.st_dev != before.st_dev
-                or opened.st_ino != before.st_ino
-                or not stat.S_ISREG(opened.st_mode)
-                or stat.S_IMODE(opened.st_mode) != required_mode
-                or opened.st_size < 1
-                or opened.st_size > MAX_DATABASE_URL_BYTES
-            ):
-                raise WorkerRoleCommonError(
-                    "database URL file changed"
-                )
-            raw = os.read(descriptor, MAX_DATABASE_URL_BYTES + 1)
-        finally:
-            os.close(descriptor)
-    except OSError as exc:
-        raise WorkerRoleCommonError("database URL file invalid") from exc
+    raw = _read_bounded_secure_file(
+        path,
+        required_mode=required_mode,
+        maximum_bytes=MAX_DATABASE_URL_BYTES,
+        invalid_message="database URL file invalid",
+        changed_message="database URL file changed",
+    )
 
     try:
         decoded = raw.decode("utf-8")
@@ -123,11 +95,31 @@ def quote_identifier(identifier: str) -> str:
     return f'"{identifier.replace(chr(34), chr(34) * 2)}"'
 
 
+async def acquire_role_lifecycle_lock(
+    connection: asyncpg.Connection,
+    scope: str,
+) -> None:
+    if not scope or "\x00" in scope or len(scope.encode("utf-8")) > 512:
+        raise WorkerRoleCommonError("role lifecycle scope invalid")
+    await connection.execute(
+        """
+        SELECT pg_catalog.pg_advisory_lock(
+            pg_catalog.hashtextextended(
+                'vp-worker-role-lifecycle:' || $1,
+                0
+            )
+        )
+        """,
+        scope,
+    )
+
+
 async def ensure_stable_role(
     connection: asyncpg.Connection,
     role_name: str,
     *,
     setting_prefix: str,
+    authorized_members: Sequence[str],
 ) -> None:
     setting_name = f"vp.{setting_prefix}.role_name"
     await connection.execute(
@@ -187,6 +179,14 @@ async def ensure_stable_role(
             f"REVOKE {quote_identifier(membership['rolname'])} "
             f"FROM {quote_identifier(role_name)}"
         )
+    await _converge_reverse_memberships(
+        connection,
+        role_name,
+        authorized_members=authorized_members,
+        managed_member_comment=(
+            f"{MANAGED_LOGIN_COMMENT_PREFIX}{role_name}"
+        ),
+    )
 
 
 async def harden_existing_login_role(
@@ -212,7 +212,8 @@ async def harden_existing_login_role(
     await connection.execute(
         f"ALTER ROLE {quoted_role} "
         "LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
-        "NOREPLICATION NOBYPASSRLS"
+        "NOREPLICATION NOBYPASSRLS "
+        "CONNECTION LIMIT -1 VALID UNTIL 'infinity'"
     )
     await connection.execute(f"ALTER ROLE {quoted_role} RESET ALL")
     await _revoke_database_ddl(connection, role_name)
@@ -233,6 +234,12 @@ async def harden_existing_login_role(
             f"REVOKE {quote_identifier(membership['rolname'])} "
             f"FROM {quoted_role}"
         )
+    await _converge_reverse_memberships(
+        connection,
+        role_name,
+        authorized_members=(),
+        managed_member_comment=None,
+    )
 
     await connection.execute(
         f"REVOKE ALL ON SCHEMA public FROM {quoted_role}"
@@ -282,6 +289,7 @@ async def harden_existing_login_role(
     await connection.execute(
         f"GRANT {quote_identifier(stable_role)} TO {quoted_role}"
     )
+    await mark_managed_login_role(connection, role_name, stable_role)
 
 
 async def create_login_role(
@@ -290,16 +298,18 @@ async def create_login_role(
     password: str,
     *,
     setting_prefix: str,
+    stable_role: str | None = None,
 ) -> None:
     role_setting = f"vp.{setting_prefix}.role_name"
-    password_setting = f"vp.{setting_prefix}.password"
+    verifier_setting = f"vp.{setting_prefix}.password_verifier"
+    password_verifier = _scram_sha_256_verifier(password)
     await connection.execute(
         "SELECT pg_catalog.set_config($1, $2, true), "
         "pg_catalog.set_config($3, $4, true)",
         role_setting,
         role_name,
-        password_setting,
-        password,
+        verifier_setting,
+        password_verifier,
     )
     await connection.execute(
         f"""
@@ -308,8 +318,8 @@ async def create_login_role(
             v_role_name text := pg_catalog.current_setting(
                 '{role_setting}'
             );
-            v_password text := pg_catalog.current_setting(
-                '{password_setting}'
+            v_password_verifier text := pg_catalog.current_setting(
+                '{verifier_setting}'
             );
         BEGIN
             IF EXISTS (
@@ -324,13 +334,112 @@ async def create_login_role(
             EXECUTE pg_catalog.format(
                 'CREATE ROLE %I LOGIN INHERIT NOSUPERUSER '
                 'NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS '
-                'PASSWORD %L',
+                'CONNECTION LIMIT -1 VALID UNTIL %L PASSWORD %L',
                 v_role_name,
-                v_password
+                'infinity',
+                v_password_verifier
             );
         END
         $block$
         """
+    )
+    if stable_role is not None:
+        await mark_managed_login_role(connection, role_name, stable_role)
+
+
+async def mark_managed_login_role(
+    connection: asyncpg.Connection,
+    role_name: str,
+    stable_role: str,
+) -> None:
+    marker = f"{MANAGED_LOGIN_COMMENT_PREFIX}{stable_role}"
+    quoted_marker = f"'{marker.replace(chr(39), chr(39) * 2)}'"
+    await connection.execute(
+        f"COMMENT ON ROLE {quote_identifier(role_name)} IS {quoted_marker}"
+    )
+
+
+def _scram_sha_256_verifier(password: str) -> str:
+    if not password or "\x00" in password:
+        raise WorkerRoleCommonError("database password invalid")
+    salt = secrets.token_bytes(16)
+    iterations = 4096
+    salted_password = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
+    client_key = hmac.new(
+        salted_password,
+        b"Client Key",
+        hashlib.sha256,
+    ).digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    server_key = hmac.new(
+        salted_password,
+        b"Server Key",
+        hashlib.sha256,
+    ).digest()
+    encoded_salt = base64.b64encode(salt).decode("ascii")
+    encoded_stored_key = base64.b64encode(stored_key).decode("ascii")
+    encoded_server_key = base64.b64encode(server_key).decode("ascii")
+    return (
+        f"SCRAM-SHA-256${iterations}:{encoded_salt}"
+        f"${encoded_stored_key}:{encoded_server_key}"
+    )
+
+
+async def verify_role_database_url(
+    owner_url: str,
+    role_url: str,
+    expected_role: str,
+) -> None:
+    try:
+        owner = make_url(owner_url)
+        candidate = make_url(role_url)
+    except Exception as exc:
+        raise WorkerRoleCommonError("database role URL invalid") from exc
+    if (
+        candidate.username != expected_role
+        or candidate.password is None
+        or _database_endpoint(candidate) != _database_endpoint(owner)
+    ):
+        raise WorkerRoleCommonError("database role URL invalid")
+
+    connection = await asyncpg.connect(asyncpg_url(role_url))
+    try:
+        identity = await connection.fetchrow(
+            """
+            SELECT
+                session_user AS session_user,
+                current_user AS current_user,
+                pg_catalog.current_database() AS database_name
+            """
+        )
+        if (
+            identity is None
+            or identity["session_user"] != expected_role
+            or identity["current_user"] != expected_role
+            or identity["database_name"] != owner.database
+        ):
+            raise WorkerRoleCommonError("database role identity invalid")
+    finally:
+        await connection.close()
+
+
+def _database_endpoint(url: URL) -> tuple[object, ...]:
+    return (
+        url.drivername.split("+", 1)[0],
+        url.host,
+        url.port,
+        url.database,
+        tuple(
+            sorted(
+                (key, tuple(values))
+                for key, values in url.normalized_query.items()
+            )
+        ),
     )
 
 
@@ -338,6 +447,7 @@ async def reset_public_privileges(
     connection: asyncpg.Connection,
     role_name: str,
 ) -> None:
+    await _converge_public_privileges(connection)
     quoted = quote_identifier(role_name)
     await connection.execute(
         f"REVOKE ALL ON SCHEMA public FROM {quoted}"
@@ -364,6 +474,11 @@ async def grant_functions(
 ) -> None:
     quoted = quote_identifier(role_name)
     for signature in signatures:
+        await _converge_function_execute_grantees(
+            connection,
+            signature,
+            authorized_role=role_name,
+        )
         await connection.execute(
             f"GRANT EXECUTE ON FUNCTION public.{signature} TO {quoted}"
         )
@@ -438,6 +553,216 @@ async def _role_owns_objects(
             role_name,
         )
     )
+
+
+async def _converge_reverse_memberships(
+    connection: asyncpg.Connection,
+    granted_role: str,
+    *,
+    authorized_members: Sequence[str],
+    managed_member_comment: str | None,
+) -> None:
+    rows = await connection.fetch(
+        """
+        SELECT
+            member.rolname,
+            pg_catalog.shobj_description(
+                member.oid,
+                'pg_authid'
+            ) AS managed_comment
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        WHERE granted.rolname = $1
+        """,
+        granted_role,
+    )
+    explicitly_authorized = set(authorized_members)
+    for row in rows:
+        member_name = row["rolname"]
+        is_authorized = (
+            member_name in explicitly_authorized
+            or (
+                managed_member_comment is not None
+                and row["managed_comment"] == managed_member_comment
+            )
+        )
+        await connection.execute(
+            f"REVOKE {quote_identifier(granted_role)} "
+            f"FROM {quote_identifier(member_name)}"
+        )
+        if is_authorized:
+            await connection.execute(
+                f"GRANT {quote_identifier(granted_role)} "
+                f"TO {quote_identifier(member_name)}"
+            )
+
+
+async def _converge_public_privileges(
+    connection: asyncpg.Connection,
+) -> None:
+    database_name = await connection.fetchval(
+        "SELECT pg_catalog.current_database()"
+    )
+    if not isinstance(database_name, str):
+        raise WorkerRoleCommonError("database identity invalid")
+    await connection.execute(
+        f"REVOKE CREATE, TEMPORARY ON DATABASE "
+        f"{quote_identifier(database_name)} FROM PUBLIC"
+    )
+    await connection.execute(
+        "REVOKE CREATE ON SCHEMA public FROM PUBLIC"
+    )
+    await connection.execute(
+        "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM PUBLIC"
+    )
+    await connection.execute(
+        "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC"
+    )
+    public_columns = await connection.fetch(
+        """
+        SELECT
+            relation.relname,
+            attribute.attname,
+            privilege.privilege_type
+        FROM pg_catalog.pg_class AS relation
+        JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        JOIN pg_catalog.pg_attribute AS attribute
+          ON attribute.attrelid = relation.oid
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            attribute.attacl
+        ) AS privilege
+        WHERE namespace.nspname = 'public'
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+          AND privilege.grantee = 0
+        """
+    )
+    for privilege in public_columns:
+        await connection.execute(
+            f"REVOKE {privilege['privilege_type']} "
+            f"({quote_identifier(privilege['attname'])}) "
+            f"ON TABLE public.{quote_identifier(privilege['relname'])} "
+            "FROM PUBLIC"
+        )
+    public_security_definers = await connection.fetch(
+        """
+        SELECT pg_catalog.format(
+            '%I.%I(%s)',
+            namespace.nspname,
+            routine.proname,
+            pg_catalog.pg_get_function_identity_arguments(routine.oid)
+        ) AS signature
+        FROM pg_catalog.pg_proc AS routine
+        JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = routine.pronamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(
+                routine.proacl,
+                pg_catalog.acldefault('f', routine.proowner)
+            )
+        ) AS privilege
+        WHERE namespace.nspname = 'public'
+          AND routine.prosecdef
+          AND privilege.grantee = 0
+          AND privilege.privilege_type = 'EXECUTE'
+        """
+    )
+    for routine in public_security_definers:
+        await connection.execute(
+            f"REVOKE EXECUTE ON FUNCTION {routine['signature']} FROM PUBLIC"
+        )
+    await connection.execute(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC"
+    )
+    await connection.execute(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON SEQUENCES FROM PUBLIC"
+    )
+    await connection.execute(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON FUNCTIONS FROM PUBLIC"
+    )
+    public_defaults = await connection.fetch(
+        """
+        SELECT DISTINCT
+            owner.rolname AS owner_name,
+            defaults.defaclobjtype::text AS object_type
+        FROM pg_catalog.pg_default_acl AS defaults
+        JOIN pg_catalog.pg_roles AS owner
+          ON owner.oid = defaults.defaclrole
+        JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = defaults.defaclnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            defaults.defaclacl
+        ) AS privilege
+        WHERE namespace.nspname = 'public'
+          AND privilege.grantee = 0
+        """
+    )
+    object_kinds = {
+        "r": "TABLES",
+        "S": "SEQUENCES",
+        "f": "FUNCTIONS",
+    }
+    for default_acl in public_defaults:
+        object_kind = object_kinds.get(default_acl["object_type"])
+        if object_kind is None:
+            raise WorkerRoleCommonError(
+                "unsupported public default privilege"
+            )
+        await connection.execute(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE "
+            f"{quote_identifier(default_acl['owner_name'])} "
+            "IN SCHEMA public REVOKE ALL PRIVILEGES "
+            f"ON {object_kind} FROM PUBLIC"
+        )
+
+
+async def _converge_function_execute_grantees(
+    connection: asyncpg.Connection,
+    signature: str,
+    *,
+    authorized_role: str,
+) -> None:
+    grantees = await connection.fetch(
+        """
+        SELECT
+            privilege.grantee,
+            grantee.rolname
+        FROM pg_catalog.pg_proc AS routine
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            COALESCE(
+                routine.proacl,
+                pg_catalog.acldefault('f', routine.proowner)
+            )
+        ) AS privilege
+        LEFT JOIN pg_catalog.pg_roles AS grantee
+          ON grantee.oid = privilege.grantee
+        WHERE routine.oid = pg_catalog.to_regprocedure($1)
+          AND privilege.privilege_type = 'EXECUTE'
+          AND privilege.grantee <> routine.proowner
+          AND (
+              privilege.grantee = 0
+              OR grantee.rolname <> $2
+          )
+        """,
+        f"public.{signature}",
+        authorized_role,
+    )
+    for grantee in grantees:
+        target = (
+            "PUBLIC"
+            if grantee["grantee"] == 0
+            else quote_identifier(grantee["rolname"])
+        )
+        await connection.execute(
+            f"REVOKE EXECUTE ON FUNCTION public.{signature} FROM {target}"
+        )
 
 
 async def _revoke_database_ddl(
@@ -641,17 +966,38 @@ def remove_secure_files(
 def read_secure_file(path: Path, *, required_mode: int) -> str:
     if required_mode not in {0o400, 0o600}:
         raise WorkerRoleCommonError("state file mode invalid")
+    raw = _read_bounded_secure_file(
+        path,
+        required_mode=required_mode,
+        maximum_bytes=MAX_DATABASE_URL_BYTES * 4,
+        invalid_message="state file invalid",
+        changed_message="state file changed",
+    )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise WorkerRoleCommonError("state file invalid") from exc
+
+
+def _read_bounded_secure_file(
+    path: Path,
+    *,
+    required_mode: int,
+    maximum_bytes: int,
+    invalid_message: str,
+    changed_message: str,
+) -> bytes:
     try:
         before = path.lstat()
     except OSError as exc:
-        raise WorkerRoleCommonError("state file invalid") from exc
+        raise WorkerRoleCommonError(invalid_message) from exc
     if (
         not stat.S_ISREG(before.st_mode)
         or stat.S_IMODE(before.st_mode) != required_mode
         or before.st_size < 1
-        or before.st_size > MAX_DATABASE_URL_BYTES * 4
+        or before.st_size > maximum_bytes
     ):
-        raise WorkerRoleCommonError("state file invalid")
+        raise WorkerRoleCommonError(invalid_message)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -669,32 +1015,45 @@ def read_secure_file(path: Path, *, required_mode: int) -> str:
             or not stat.S_ISREG(opened.st_mode)
             or stat.S_IMODE(opened.st_mode) != required_mode
             or opened.st_size < 1
-            or opened.st_size > MAX_DATABASE_URL_BYTES * 4
+            or opened.st_size > maximum_bytes
+            or opened.st_uid != before.st_uid
+            or opened.st_gid != before.st_gid
+            or opened.st_size != before.st_size
+            or opened.st_mtime_ns != before.st_mtime_ns
+            or opened.st_ctime_ns != before.st_ctime_ns
         ):
-            raise WorkerRoleCommonError("state file changed")
-        raw = os.read(descriptor, MAX_DATABASE_URL_BYTES * 4 + 1)
+            raise WorkerRoleCommonError(changed_message)
+        chunks: list[bytes] = []
+        length = 0
+        while length < opened.st_size:
+            chunk = os.read(descriptor, opened.st_size - length)
+            if not chunk:
+                raise WorkerRoleCommonError(changed_message)
+            chunks.append(chunk)
+            length += len(chunk)
+        if os.read(descriptor, 1):
+            raise WorkerRoleCommonError(changed_message)
         final = os.fstat(descriptor)
         if (
             final.st_dev != opened.st_dev
             or final.st_ino != opened.st_ino
-            or final.st_mode != opened.st_mode
+            or not stat.S_ISREG(final.st_mode)
+            or stat.S_IMODE(final.st_mode)
+            != stat.S_IMODE(opened.st_mode)
+            or final.st_uid != opened.st_uid
+            or final.st_gid != opened.st_gid
             or final.st_size != opened.st_size
             or final.st_mtime_ns != opened.st_mtime_ns
             or final.st_ctime_ns != opened.st_ctime_ns
-            or len(raw) != opened.st_size
         ):
-            raise WorkerRoleCommonError("state file changed")
+            raise WorkerRoleCommonError(changed_message)
+        raw = b"".join(chunks)
     except OSError as exc:
-        raise WorkerRoleCommonError("state file invalid") from exc
+        raise WorkerRoleCommonError(invalid_message) from exc
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if len(raw) > MAX_DATABASE_URL_BYTES * 4:
-        raise WorkerRoleCommonError("state file invalid")
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise WorkerRoleCommonError("state file invalid") from exc
+    return raw
 
 
 def _directory_open_flags() -> int:

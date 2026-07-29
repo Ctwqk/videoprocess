@@ -48,10 +48,15 @@ def _run_alembic(
     database_url: str,
     *args: str,
 ) -> subprocess.CompletedProcess[str]:
+    alembic_url = database_url.replace(
+        "postgresql://",
+        "postgresql+asyncpg://",
+        1,
+    )
     return subprocess.run(
         [sys.executable, "-m", "alembic", *args],
         cwd=BACKEND_ROOT,
-        env={**os.environ, "DATABASE_URL": database_url},
+        env={**os.environ, "DATABASE_URL": alembic_url},
         text=True,
         capture_output=True,
         check=False,
@@ -313,6 +318,26 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     sql = completed.stdout
+    assert (
+        "'REVOKE CREATE, TEMPORARY ON DATABASE %I FROM PUBLIC'"
+        in sql
+    )
+    assert "REVOKE CREATE ON SCHEMA public FROM PUBLIC" in sql
+    assert (
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC"
+        in sql
+    )
+    assert (
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON SEQUENCES FROM PUBLIC"
+        in sql
+    )
+    assert (
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON FUNCTIONS FROM PUBLIC"
+        in sql
+    )
     for table_name in (
         "worker_redis_marker_cleanup_authorizations",
         "worker_redis_continuity_status",

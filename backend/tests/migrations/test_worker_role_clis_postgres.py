@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.orchestrator.engine import JobEngine
 from app.services import worker_control_role_cli as control_cli
 from app.services import worker_registration_operator_cli as operator_cli
+from app.services import worker_role_cli_common as role_common
 from app.services import worker_runtime_role_cli as runtime_cli
 from app.services.registered_worker_event_receipt import (
     RegisteredWorkerEventReceiptService,
@@ -68,6 +70,8 @@ def _run_alembic(database_url: str) -> subprocess.CompletedProcess[str]:
 
 
 def _write_secret(path: Path, value: str, mode: int) -> None:
+    if path.exists():
+        path.chmod(0o600)
     path.write_text(f"{value}\n", encoding="utf-8")
     path.chmod(mode)
 
@@ -228,6 +232,9 @@ async def test_real_role_clis_enforce_exact_cross_role_boundaries(
     service_name = "vp-ffmpeg-worker-go-swarm"
     worker_generation = int(uuid.uuid4().hex[:12], 16)
     control_generation = f"t-{uuid.uuid4().hex[:20]}"
+    rogue_principal = f"vp_task4a_rogue_{uuid.uuid4().hex[:16]}"
+    leak_caller = f"vp_task4a_leak_{uuid.uuid4().hex[:16]}"
+    leak_target = f"vp_task4a_target_{uuid.uuid4().hex[:16]}"
     runtime_names = runtime_cli.role_names_for_generation(
         service_name,
         worker_generation,
@@ -352,6 +359,130 @@ async def test_real_role_clis_enforce_exact_cross_role_boundaries(
         }
         drift_owner = await asyncpg.connect(_asyncpg_url(target_url))
         try:
+            sentinel_password = "TASK4A-REVIEW-SENTINEL-PASSWORD"
+            await drift_owner.execute(
+                f'CREATE ROLE "{leak_caller}" LOGIN PASSWORD '
+                "'task4a-caller-password'"
+            )
+            leak_url = make_url(target_url).set(
+                username=leak_caller,
+                password="task4a-caller-password",
+            ).render_as_string(hide_password=False)
+            leak_connection = await asyncpg.connect(_asyncpg_url(leak_url))
+            try:
+                with pytest.raises(
+                    asyncpg.InsufficientPrivilegeError
+                ) as caught:
+                    async with leak_connection.transaction():
+                        await role_common.create_login_role(
+                            leak_connection,
+                            leak_target,
+                            sentinel_password,
+                            setting_prefix="task4a_leak_probe",
+                        )
+                diagnostics = "\n".join(
+                    str(value)
+                    for value in (
+                        caught.value,
+                        caught.value.detail,
+                        caught.value.hint,
+                        caught.value.context,
+                        getattr(caught.value, "query", None),
+                    )
+                    if value is not None
+                )
+                assert sentinel_password not in diagnostics
+            finally:
+                await leak_connection.close()
+
+            await drift_owner.execute(
+                f'ALTER ROLE "{runtime_names.versioned}" '
+                "CONNECTION LIMIT 0"
+            )
+            assert await runtime_cli.run(
+                [
+                    "provision",
+                    "--service-name",
+                    service_name,
+                    "--generation",
+                    str(worker_generation),
+                    "--state-dir",
+                    str(runtime_state),
+                ]
+            ) == 4
+            capsys.readouterr()
+            await drift_owner.execute(
+                f'ALTER ROLE "{runtime_names.versioned}" '
+                "CONNECTION LIMIT -1"
+            )
+            await drift_owner.execute(
+                f'ALTER ROLE "{runtime_names.versioned}" '
+                "VALID UNTIL '2000-01-01 00:00:00+00'"
+            )
+            assert await runtime_cli.run(
+                [
+                    "provision",
+                    "--service-name",
+                    service_name,
+                    "--generation",
+                    str(worker_generation),
+                    "--state-dir",
+                    str(runtime_state),
+                ]
+            ) == 4
+            capsys.readouterr()
+            await drift_owner.execute(
+                f'ALTER ROLE "{runtime_names.versioned}" '
+                "VALID UNTIL 'infinity'"
+            )
+
+            parsed_runtime_url = make_url(runtime_url)
+            wrong_password_url = parsed_runtime_url.set(
+                password="wrong-task4a-password"
+            ).render_as_string(hide_password=False)
+            _write_secret(
+                runtime_paths["database_url"],
+                wrong_password_url,
+                0o400,
+            )
+            assert await runtime_cli.run(
+                [
+                    "provision",
+                    "--service-name",
+                    service_name,
+                    "--generation",
+                    str(worker_generation),
+                    "--state-dir",
+                    str(runtime_state),
+                ]
+            ) == 4
+            capsys.readouterr()
+            wrong_endpoint_url = parsed_runtime_url.set(
+                host="localhost"
+            ).render_as_string(hide_password=False)
+            _write_secret(
+                runtime_paths["database_url"],
+                wrong_endpoint_url,
+                0o400,
+            )
+            assert await runtime_cli.run(
+                [
+                    "provision",
+                    "--service-name",
+                    service_name,
+                    "--generation",
+                    str(worker_generation),
+                    "--state-dir",
+                    str(runtime_state),
+                ]
+            ) == 4
+            capsys.readouterr()
+            _write_secret(
+                runtime_paths["database_url"],
+                runtime_url,
+                0o400,
+            )
+
             await drift_owner.execute(
                 f'ALTER ROLE "{runtime_names.stable}" '
                 "LOGIN INHERIT SUPERUSER CREATEDB CREATEROLE "
@@ -403,6 +534,58 @@ async def test_real_role_clis_enforce_exact_cross_role_boundaries(
                 f'GRANT CREATE, TEMPORARY ON DATABASE "{database}" '
                 f'TO "{orchestrator_login}"'
             )
+            await drift_owner.execute(
+                f'ALTER ROLE "{runtime_names.versioned}" '
+                "CONNECTION LIMIT 3 VALID UNTIL '2099-01-01 00:00:00+00'"
+            )
+            await drift_owner.execute(
+                f'CREATE ROLE "{rogue_principal}" LOGIN PASSWORD '
+                "'task4a-rogue-password'"
+            )
+            await drift_owner.execute(
+                "GRANT UPDATE (kind) ON TABLE public.artifacts TO PUBLIC"
+            )
+            await drift_owner.execute(
+                "GRANT SELECT ON TABLE public.worker_registrations TO PUBLIC"
+            )
+            await drift_owner.execute(
+                "CREATE SEQUENCE public.task4a_public_sequence"
+            )
+            await drift_owner.execute(
+                "GRANT USAGE ON SEQUENCE "
+                "public.task4a_public_sequence TO PUBLIC"
+            )
+            await drift_owner.execute(
+                "GRANT CREATE ON SCHEMA public TO PUBLIC"
+            )
+            await drift_owner.execute(
+                f'GRANT CREATE, TEMPORARY ON DATABASE "{database}" TO PUBLIC'
+            )
+            await drift_owner.execute(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+                "GRANT SELECT ON TABLES TO PUBLIC"
+            )
+            await drift_owner.execute(
+                f'ALTER DEFAULT PRIVILEGES FOR ROLE "{rogue_principal}" '
+                "IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC"
+            )
+            await drift_owner.execute(
+                "GRANT EXECUTE ON FUNCTION "
+                "public.vp_worker_grant_activate(text,bigint) TO PUBLIC"
+            )
+            await drift_owner.execute(
+                "GRANT EXECUTE ON FUNCTION "
+                "public.vp_worker_grant_activate(text,bigint) "
+                f'TO "{rogue_principal}"'
+            )
+            await drift_owner.execute(
+                f'GRANT "{runtime_names.versioned}" '
+                f'TO "{rogue_principal}"'
+            )
+            await drift_owner.execute(
+                f'GRANT "{control_names.stable["operator"]}" '
+                f'TO "{rogue_principal}"'
+            )
         finally:
             await drift_owner.close()
 
@@ -435,6 +618,98 @@ async def test_real_role_clis_enforce_exact_cross_role_boundaries(
             purpose: path.read_bytes()
             for purpose, path in control_paths.items()
         } == original_control_state
+
+        converged_owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            converged_attributes = await converged_owner.fetchrow(
+                """
+                SELECT
+                    rolconnlimit,
+                    rolvaliduntil = 'infinity'::timestamptz
+                        AS validity_unbounded
+                FROM pg_catalog.pg_roles
+                WHERE rolname = $1
+                """,
+                runtime_names.versioned,
+            )
+            assert converged_attributes is not None
+            assert converged_attributes["rolconnlimit"] == -1
+            assert converged_attributes["validity_unbounded"]
+            assert not await converged_owner.fetchval(
+                "SELECT has_column_privilege("
+                "$1, 'public.artifacts', 'kind', 'UPDATE')",
+                rogue_principal,
+            )
+            assert not await converged_owner.fetchval(
+                "SELECT has_table_privilege("
+                "$1, 'public.worker_registrations', 'SELECT')",
+                rogue_principal,
+            )
+            assert not await converged_owner.fetchval(
+                "SELECT has_sequence_privilege("
+                "$1, 'public.task4a_public_sequence', 'USAGE')",
+                rogue_principal,
+            )
+            assert not await converged_owner.fetchval(
+                "SELECT has_schema_privilege($1, 'public', 'CREATE')",
+                rogue_principal,
+            )
+            assert not await converged_owner.fetchval(
+                "SELECT has_database_privilege("
+                "$1, current_database(), 'CREATE')",
+                rogue_principal,
+            )
+            assert not await converged_owner.fetchval(
+                "SELECT has_database_privilege("
+                "$1, current_database(), 'TEMPORARY')",
+                rogue_principal,
+            )
+            assert not await converged_owner.fetchval(
+                """
+                SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')
+                """,
+                rogue_principal,
+                runtime_names.versioned,
+            )
+            assert not await converged_owner.fetchval(
+                """
+                SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')
+                """,
+                rogue_principal,
+                control_names.stable["operator"],
+            )
+            assert not await converged_owner.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_default_acl AS defaults
+                    CROSS JOIN LATERAL pg_catalog.aclexplode(
+                        defaults.defaclacl
+                    ) AS privilege
+                    JOIN pg_catalog.pg_namespace AS namespace
+                      ON namespace.oid = defaults.defaclnamespace
+                    WHERE namespace.nspname = 'public'
+                      AND privilege.grantee = 0
+                )
+                """
+            )
+        finally:
+            await converged_owner.close()
+
+        rogue_url = make_url(target_url).set(
+            username=rogue_principal,
+            password="task4a-rogue-password",
+        ).render_as_string(hide_password=False)
+        rogue = await asyncpg.connect(_asyncpg_url(rogue_url))
+        try:
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await rogue.fetchval(
+                    "SELECT public.vp_worker_grant_activate($1, $2)",
+                    service_name,
+                    worker_generation,
+                )
+        finally:
+            await rogue.close()
 
         request = {
             "version": 1,
@@ -1506,6 +1781,9 @@ async def test_real_role_clis_enforce_exact_cross_role_boundaries(
                 f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
             )
             for role_name in (
+                rogue_principal,
+                leak_target,
+                leak_caller,
                 runtime_names.versioned,
                 *control_names.versioned.values(),
                 runtime_names.stable,
@@ -1514,5 +1792,266 @@ async def test_real_role_clis_enforce_exact_cross_role_boundaries(
                 await admin.execute(
                     f'DROP ROLE IF EXISTS "{role_name}"'
                 )
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_role_lifecycle_serializes_database_and_state_race_orders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = f"vp_worker_role_races_{uuid.uuid4().hex[:20]}"
+    service_name = f"task4a-race-{uuid.uuid4().hex[:10]}"
+    worker_generation = int(uuid.uuid4().hex[:12], 16)
+    control_generation = f"race-{uuid.uuid4().hex[:16]}"
+    runtime_names = runtime_cli.role_names_for_generation(
+        service_name,
+        worker_generation,
+    )
+    control_names = control_cli.role_names_for_generation(
+        control_generation
+    )
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    runtime_state = tmp_path / "runtime-state"
+    control_state = tmp_path / "control-state"
+    publish_release = threading.Event()
+    removal_release = threading.Event()
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+
+        publish_entered = threading.Event()
+        real_runtime_write = runtime_cli.write_generation_state
+
+        def paused_runtime_write(*args: object, **kwargs: object) -> None:
+            publish_entered.set()
+            if not publish_release.wait(timeout=10):
+                raise AssertionError("runtime state publish was not released")
+            real_runtime_write(*args, **kwargs)
+
+        monkeypatch.setattr(
+            runtime_cli,
+            "write_generation_state",
+            paused_runtime_write,
+        )
+        provision_first = asyncio.create_task(
+            asyncio.to_thread(
+                lambda: asyncio.run(
+                    runtime_cli._provision(
+                        target_url,
+                        service_name,
+                        worker_generation,
+                        runtime_state,
+                        runtime_names,
+                    )
+                )
+            )
+        )
+        assert await asyncio.to_thread(publish_entered.wait, 10)
+        revoke_second = asyncio.create_task(
+            runtime_cli._revoke(
+                target_url,
+                service_name,
+                worker_generation,
+                runtime_state,
+                runtime_names,
+            )
+        )
+        await asyncio.sleep(0.2)
+        revoke_waited_for_publish = not revoke_second.done()
+        publish_release.set()
+        runtime_results = await asyncio.gather(
+            provision_first,
+            revoke_second,
+            return_exceptions=True,
+        )
+        assert revoke_waited_for_publish
+        assert not any(
+            isinstance(result, BaseException)
+            for result in runtime_results
+        )
+        runtime_owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            assert not await runtime_owner.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $1
+                )
+                """,
+                runtime_names.versioned,
+            )
+        finally:
+            await runtime_owner.close()
+        assert not any(
+            path.exists()
+            for path in runtime_cli.credential_paths(
+                runtime_state,
+                service_name,
+                worker_generation,
+            ).values()
+        )
+
+        monkeypatch.setattr(
+            runtime_cli,
+            "write_generation_state",
+            real_runtime_write,
+        )
+        orphan_owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            async with orphan_owner.transaction():
+                await role_common.create_login_role(
+                    orphan_owner,
+                    runtime_names.versioned,
+                    "interrupted-task4a-password",
+                    setting_prefix="task4a_interrupted",
+                    stable_role=runtime_names.stable,
+                )
+                await orphan_owner.execute(
+                    f'GRANT "{runtime_names.stable}" '
+                    f'TO "{runtime_names.versioned}"'
+                )
+        finally:
+            await orphan_owner.close()
+        partial_paths = runtime_cli.credential_paths(
+            runtime_state,
+            service_name,
+            worker_generation,
+        )
+        role_common.write_secure_files(
+            runtime_state,
+            (service_name, str(worker_generation)),
+            {
+                runtime_cli.STATE_FILENAMES["database_url"]: (
+                    "postgresql://interrupted:state@invalid/partial\n"
+                )
+            },
+            file_mode=0o400,
+        )
+        await runtime_cli._provision(
+            target_url,
+            service_name,
+            worker_generation,
+            runtime_state,
+            runtime_names,
+        )
+        assert all(path.exists() for path in partial_paths.values())
+        recovered_url = partial_paths["database_url"].read_text().strip()
+        recovered = await asyncpg.connect(_asyncpg_url(recovered_url))
+        try:
+            assert await recovered.fetchval(
+                "SELECT session_user"
+            ) == runtime_names.versioned
+        finally:
+            await recovered.close()
+        await runtime_cli._revoke(
+            target_url,
+            service_name,
+            worker_generation,
+            runtime_state,
+            runtime_names,
+        )
+
+        await control_cli._provision(
+            target_url,
+            control_generation,
+            control_state,
+            control_names,
+        )
+        removal_entered = threading.Event()
+        real_control_remove = control_cli.remove_secure_files
+
+        def paused_control_remove(*args: object, **kwargs: object) -> None:
+            removal_entered.set()
+            if not removal_release.wait(timeout=10):
+                raise AssertionError("control state removal was not released")
+            real_control_remove(*args, **kwargs)
+
+        monkeypatch.setattr(
+            control_cli,
+            "remove_secure_files",
+            paused_control_remove,
+        )
+        revoke_first = asyncio.create_task(
+            asyncio.to_thread(
+                lambda: asyncio.run(
+                    control_cli._revoke(
+                        target_url,
+                        control_generation,
+                        control_state,
+                        control_names,
+                    )
+                )
+            )
+        )
+        assert await asyncio.to_thread(removal_entered.wait, 10)
+        provision_second = asyncio.create_task(
+            control_cli._provision(
+                target_url,
+                control_generation,
+                control_state,
+                control_names,
+            )
+        )
+        await asyncio.sleep(0.2)
+        provision_waited_for_removal = not provision_second.done()
+        removal_release.set()
+        control_results = await asyncio.gather(
+            revoke_first,
+            provision_second,
+            return_exceptions=True,
+        )
+        assert provision_waited_for_removal
+        assert not any(
+            isinstance(result, BaseException)
+            for result in control_results
+        )
+        control_owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            assert await control_owner.fetchval(
+                """
+                SELECT pg_catalog.count(*) = $2
+                FROM pg_catalog.pg_roles
+                WHERE rolname = ANY($1::text[])
+                """,
+                list(control_names.versioned.values()),
+                len(control_names.versioned),
+            )
+        finally:
+            await control_owner.close()
+        assert all(
+            path.exists()
+            for path in control_cli.credential_paths(
+                control_state,
+                control_generation,
+            ).values()
+        )
+    finally:
+        publish_release.set()
+        removal_release.set()
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            for role_name in (
+                runtime_names.versioned,
+                *control_names.versioned.values(),
+                runtime_names.stable,
+                *control_names.stable.values(),
+            ):
+                await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
         finally:
             await admin.close()

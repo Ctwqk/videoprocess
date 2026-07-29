@@ -179,7 +179,7 @@ ORCHESTRATOR_CONTROL_ROLE = "vp_orchestrator_control_runtime"
 
 
 def upgrade() -> None:
-    _revoke_public_database_temporary()
+    _converge_public_security_defaults()
     op.create_table(
         "worker_admission_grants",
         sa.Column(
@@ -605,18 +605,31 @@ def upgrade() -> None:
         op.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
 
 
-def _revoke_public_database_temporary() -> None:
+def _converge_public_security_defaults() -> None:
     op.execute(
         """
 DO $database_acl$
 BEGIN
     EXECUTE pg_catalog.format(
-        'REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC',
+        'REVOKE CREATE, TEMPORARY ON DATABASE %I FROM PUBLIC',
         pg_catalog.current_database()
     );
 END
 $database_acl$
 """
+    )
+    op.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+    op.execute(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC"
+    )
+    op.execute(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON SEQUENCES FROM PUBLIC"
+    )
+    op.execute(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public "
+        "REVOKE ALL PRIVILEGES ON FUNCTIONS FROM PUBLIC"
     )
 
 

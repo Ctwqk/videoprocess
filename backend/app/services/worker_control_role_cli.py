@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Never
 
 import asyncpg  # type: ignore[import-untyped]
-from sqlalchemy.engine import make_url
 
 from app.services.worker_role_cli_common import (
     WorkerRoleCommonError,
+    acquire_role_lifecycle_lock,
     asyncpg_url,
     create_login_role,
     drop_login_roles,
@@ -29,6 +29,7 @@ from app.services.worker_role_cli_common import (
     remove_secure_files,
     reset_public_privileges,
     role_database_url,
+    verify_role_database_url,
     write_secure_files,
 )
 
@@ -613,20 +614,54 @@ async def _provision(
     paths = credential_paths(state_dir, generation)
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     created = False
-    fresh = not any(path.exists() for path in paths.values())
+    fresh = False
     try:
-        if not fresh:
-            await _validate_existing_generation(
+        await acquire_role_lifecycle_lock(
+            connection,
+            f"control:{generation}",
+        )
+        state_presence = {
+            purpose: path.exists()
+            for purpose, path in paths.items()
+        }
+        existing_role_count = int(
+            await connection.fetchval(
+                """
+                SELECT pg_catalog.count(*)
+                FROM pg_catalog.pg_roles
+                WHERE rolname = ANY($1::text[])
+                """,
+                list(names.versioned.values()),
+            )
+        )
+        fresh = not any(state_presence.values()) and existing_role_count == 0
+        if (
+            not all(state_presence.values())
+            and (any(state_presence.values()) or existing_role_count > 0)
+        ):
+            await _recover_interrupted_generation(
                 connection,
+                state_dir,
+                generation,
+                names,
+            )
+            fresh = True
+        if not fresh:
+            role_urls = await _validate_existing_generation(
+                connection,
+                owner_url,
                 paths,
                 names,
             )
             async with connection.transaction():
-                for stable_role in names.stable.values():
+                for purpose, stable_role in names.stable.items():
                     await ensure_stable_role(
                         connection,
                         stable_role,
                         setting_prefix="worker_control",
+                        authorized_members=(
+                            names.versioned[purpose],
+                        ),
                     )
                 for purpose, versioned_role in names.versioned.items():
                     await harden_existing_login_role(
@@ -635,6 +670,12 @@ async def _provision(
                         names.stable[purpose],
                     )
                 await _set_control_privileges(connection, names)
+            for purpose, database_url in role_urls.items():
+                await verify_role_database_url(
+                    owner_url,
+                    database_url,
+                    names.versioned[purpose],
+                )
             return
 
         passwords = {
@@ -644,11 +685,12 @@ async def _provision(
         if len(set(passwords.values())) != len(passwords):
             raise ControlRoleError("credential generation failed")
         async with connection.transaction():
-            for stable_role in names.stable.values():
+            for purpose, stable_role in names.stable.items():
                 await ensure_stable_role(
                     connection,
                     stable_role,
                     setting_prefix="worker_control",
+                    authorized_members=(names.versioned[purpose],),
                 )
             await _set_control_privileges(connection, names)
             for purpose, versioned_role in names.versioned.items():
@@ -657,6 +699,7 @@ async def _provision(
                     versioned_role,
                     passwords[purpose],
                     setting_prefix="worker_control",
+                    stable_role=names.stable[purpose],
                 )
                 await connection.execute(
                     f"GRANT "
@@ -664,17 +707,24 @@ async def _provision(
                     f"TO {quote_identifier(versioned_role)}"
                 )
         created = True
+        role_urls = {
+            purpose: role_database_url(
+                owner_url,
+                names.versioned[purpose],
+                passwords[purpose],
+            )
+            for purpose in STABLE_ROLES
+        }
+        for purpose, database_url in role_urls.items():
+            await verify_role_database_url(
+                owner_url,
+                database_url,
+                names.versioned[purpose],
+            )
         write_generation_credentials(
             state_dir,
             generation,
-            {
-                purpose: role_database_url(
-                    owner_url,
-                    names.versioned[purpose],
-                    passwords[purpose],
-                )
-                for purpose in STABLE_ROLES
-            },
+            role_urls,
         )
     except BaseException:
         if fresh:
@@ -698,6 +748,29 @@ async def _provision(
         raise
     finally:
         await connection.close()
+
+
+async def _recover_interrupted_generation(
+    connection: asyncpg.Connection,
+    state_dir: Path,
+    generation: str,
+    names: ControlRoleNames,
+) -> None:
+    async with connection.transaction():
+        await drop_login_roles(
+            connection,
+            tuple(names.versioned.values()),
+        )
+    try:
+        remove_secure_files(
+            state_dir,
+            (generation,),
+            tuple(CREDENTIAL_FILENAMES.values()),
+        )
+    except WorkerRoleCommonError as exc:
+        raise ControlRoleError(
+            "interrupted control generation cleanup failed"
+        ) from exc
 
 
 async def _set_control_privileges(
@@ -774,25 +847,25 @@ async def _set_control_privileges(
 
 async def _validate_existing_generation(
     connection: asyncpg.Connection,
+    owner_url: str,
     paths: Mapping[str, Path],
     names: ControlRoleNames,
-) -> None:
+) -> dict[str, str]:
     if not all(path.exists() for path in paths.values()):
         raise ControlRoleError("control credentials incomplete")
+    role_urls: dict[str, str] = {}
     for purpose, path in paths.items():
         try:
             database_url = read_secure_file(
                 path,
                 required_mode=0o400,
             ).strip()
-            principal = make_url(database_url).username
         except (WorkerRoleCommonError, ValueError, TypeError) as exc:
             raise ControlRoleError(
                 "control credentials invalid"
             ) from exc
         if (
-            principal != names.versioned[purpose]
-            or not await connection.fetchval(
+            not await connection.fetchval(
                 """
                 SELECT EXISTS (
                     SELECT 1
@@ -804,6 +877,13 @@ async def _validate_existing_generation(
             )
         ):
             raise ControlRoleError("control credentials invalid")
+        await verify_role_database_url(
+            owner_url,
+            database_url,
+            names.versioned[purpose],
+        )
+        role_urls[purpose] = database_url
+    return role_urls
 
 
 async def _revoke(
@@ -814,14 +894,15 @@ async def _revoke(
 ) -> None:
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     try:
+        await acquire_role_lifecycle_lock(
+            connection,
+            f"control:{generation}",
+        )
         async with connection.transaction():
             await drop_login_roles(
                 connection,
                 tuple(names.versioned.values()),
             )
-    finally:
-        await connection.close()
-    try:
         remove_secure_files(
             state_dir,
             (generation,),
@@ -829,6 +910,8 @@ async def _revoke(
         )
     except WorkerRoleCommonError as exc:
         raise ControlRoleError("control credential removal failed") from exc
+    finally:
+        await connection.close()
 
 
 def _emit(status: str, code: str, **fields: object) -> None:

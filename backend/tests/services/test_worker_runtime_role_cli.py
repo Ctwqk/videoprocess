@@ -100,6 +100,131 @@ def test_secure_state_reader_revalidates_mode_after_open(
         role_common.read_secure_file(secret, required_mode=0o400)
 
 
+def test_owner_url_reader_rejects_premature_eof_after_valid_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner_url = tmp_path / "owner-url"
+    valid_prefix = (
+        b"postgresql://owner:secret@127.0.0.1:55439/"
+        b"videoprocess_test\n"
+    )
+    owner_url.write_bytes(valid_prefix + b"must-not-be-ignored\n")
+    owner_url.chmod(0o400)
+    real_read = role_common.os.read
+    reads = 0
+
+    def premature_eof(descriptor: int, size: int) -> bytes:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return real_read(descriptor, len(valid_prefix))
+        return b""
+
+    monkeypatch.setattr(role_common.os, "read", premature_eof)
+    monkeypatch.setenv("TASK4A_OWNER_URL_FILE", str(owner_url))
+
+    with pytest.raises(
+        role_common.WorkerRoleCommonError,
+        match="database URL file changed",
+    ):
+        role_common.load_database_url_file("TASK4A_OWNER_URL_FILE")
+
+
+def test_owner_url_reader_rejects_in_place_mutation_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner_url = tmp_path / "owner-url"
+    owner_url.write_text(
+        "postgresql://owner:secret@127.0.0.1:55439/"
+        "videoprocess_test\n",
+        encoding="utf-8",
+    )
+    owner_url.chmod(0o400)
+    real_read = role_common.os.read
+    mutated = False
+
+    def mutate_during_read(descriptor: int, size: int) -> bytes:
+        nonlocal mutated
+        chunk = real_read(descriptor, size)
+        if not mutated:
+            mutated = True
+            metadata = owner_url.stat()
+            os.utime(
+                owner_url,
+                ns=(
+                    metadata.st_atime_ns,
+                    metadata.st_mtime_ns + 1_000_000_000,
+                ),
+            )
+        return chunk
+
+    monkeypatch.setattr(role_common.os, "read", mutate_during_read)
+    monkeypatch.setenv("TASK4A_OWNER_URL_FILE", str(owner_url))
+
+    with pytest.raises(
+        role_common.WorkerRoleCommonError,
+        match="database URL file changed",
+    ):
+        role_common.load_database_url_file("TASK4A_OWNER_URL_FILE")
+
+
+def test_secure_state_reader_accepts_bounded_partial_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = tmp_path / "secret"
+    secret.write_text("sensitive\n", encoding="utf-8")
+    secret.chmod(0o400)
+    real_read = role_common.os.read
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        return real_read(descriptor, min(size, 2))
+
+    monkeypatch.setattr(role_common.os, "read", bounded_read)
+
+    assert (
+        role_common.read_secure_file(secret, required_mode=0o400)
+        == "sensitive\n"
+    )
+
+
+def test_owner_url_reader_rejects_growth_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner_url = tmp_path / "owner-url"
+    owner_url.write_text(
+        "postgresql://owner:secret@127.0.0.1:55439/"
+        "videoprocess_test\n",
+        encoding="utf-8",
+    )
+    owner_url.chmod(0o400)
+    real_read = role_common.os.read
+    grown = False
+
+    def grow_during_read(descriptor: int, size: int) -> bytes:
+        nonlocal grown
+        chunk = real_read(descriptor, size)
+        if not grown:
+            grown = True
+            owner_url.chmod(0o600)
+            with owner_url.open("ab") as handle:
+                handle.write(b"x")
+            owner_url.chmod(0o400)
+        return chunk
+
+    monkeypatch.setattr(role_common.os, "read", grow_during_read)
+    monkeypatch.setenv("TASK4A_OWNER_URL_FILE", str(owner_url))
+
+    with pytest.raises(
+        role_common.WorkerRoleCommonError,
+        match="database URL file changed",
+    ):
+        role_common.load_database_url_file("TASK4A_OWNER_URL_FILE")
+
+
 def test_worker_function_allowlist_is_exact() -> None:
     assert set(runtime_cli.WORKER_FUNCTIONS) == {
         "vp_worker_register(text,bigint,text,text,uuid,integer,text,jsonb,"
@@ -296,6 +421,63 @@ async def test_runtime_cli_sanitizes_shared_role_helper_failures(
     )
 
     assert result == 4
+    output = capsys.readouterr().out
+    assert "database-secret" not in output
+    assert json.loads(output) == {
+        "code": "worker_runtime_role_operation_failed",
+        "status": "error",
+    }
+
+
+async def test_runtime_cli_fails_safely_when_lifecycle_lock_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    owner = tmp_path / "owner-url"
+    owner.write_text(
+        "postgresql://owner:database-secret@"
+        "127.0.0.1:5432/videoprocess\n"
+    )
+    owner.chmod(0o400)
+    closed = False
+
+    class FakeConnection:
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    async def fake_connect(url: str) -> FakeConnection:
+        assert "database-secret" in url
+        return FakeConnection()
+
+    async def fail_lock(*arguments: object) -> None:
+        raise role_common.WorkerRoleCommonError(
+            "lock failed with database-secret"
+        )
+
+    monkeypatch.setattr(runtime_cli.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(
+        runtime_cli,
+        "acquire_role_lifecycle_lock",
+        fail_lock,
+    )
+    monkeypatch.setenv(runtime_cli.OWNER_URL_FILE_ENV, str(owner))
+
+    result = await runtime_cli.run(
+        [
+            "provision",
+            "--service-name",
+            "vp-ffmpeg-worker-go-swarm",
+            "--generation",
+            "41",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ]
+    )
+
+    assert result == 4
+    assert closed
     output = capsys.readouterr().out
     assert "database-secret" not in output
     assert json.loads(output) == {
