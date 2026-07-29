@@ -100,13 +100,23 @@ fail without quarantining the still-login-capable principals).
 Task 4A: BLOCKED — the five-round breaker has tripped with two load-bearing
 role-isolation findings. Do not dispatch a sixth fix or build production
 deployment on this role boundary without explicit human direction.
+Task 4A breaker continuation: fix round 6 at 7b9a477 closed delegated
+PostgreSQL 16 membership and initial invalid-root quarantine findings;
+re-review rejected with two new Important findings.
+Task 4A breaker continuation: fix round 7 at 28bb206 pinned authority
+directories across DCL and bound each live database principal to one
+service/generation. A fresh independent review passed with zero Critical,
+Important, or Minor findings: 70 focused and 330 cumulative PostgreSQL 16
+tests passed without skips, repeated directory/principal and concurrency
+probes passed five rounds, all 62 descriptors closed, and no disposable
+database or role remained. Task 4A and its breaker are RESOLVED.
 Task 4B/4C recovery: the terminated broad Task 4 agent returned unstaged
 worker-secret/startup, Docker, staging-janitor, and deploy-transaction changes.
 They remain preserved and uncommitted; focused checks exposed an old
 mode-0600 versus mode-0400 deployment-CLI contract and a marker freshness
 fixture that does not isolate the new admission/janitor prerequisites.
-Task 4: blocked on Task 4A; no production deployment is authorized by these
-partial changes.
+Task 4: in progress on the preserved Task 4B/4C changes; no production
+deployment is authorized by these partial changes.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
