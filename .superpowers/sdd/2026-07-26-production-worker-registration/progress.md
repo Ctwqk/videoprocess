@@ -46,7 +46,21 @@ on a native `flock` operational failure, invalidate any prior same-generation
 readiness status so an independent `status` call cannot reuse it for the
 remaining 90-second freshness window. The direct deploy transaction already
 fails before `status`, so this does not reopen the Task 2 breaker.
-Task 3: pending
+Task 3: implementation at 0fe94a0; review rejected (6 Important — invalid
+Redis ACL identity reaches client construction; store-proven registration loss
+does not stop reads; PEL scan truncates after 50; registered affinity bounce
+escapes the 20-second window; unknown modes permit environment credentials;
+reclaimed/artifact work bypasses bounded shutdown; 1 Minor).
+Task 3: minor (deferred): immediate-heartbeat startup failure leaves the
+heartbeat completion channel open, so a direct `Close` may wait five seconds.
+Task 3: fix round 1/5 (1 addressed, 6 open — protected callbacks can outlive
+shared-fence rollback; one no-handler finalization path does not publish loss;
+PEL pagination follows an unbounded moving tail; registered affinity duration
+is still configurable; pre-database Redis validation differs from go-redis;
+pool/callback/file shutdown abandons goroutines and resources; commits
+0fe94a0..791e552)
+Task 3: minor (deferred): exported `MarkLost` is zero-value safe but not
+nil-receiver safe.
 Task 4: pending
 Task 5: pending
 Task 6: pending
