@@ -153,6 +153,10 @@ func (r *Registration) WaitLost(ctx context.Context) error {
 	}
 }
 
+func (r *Registration) MarkLost() {
+	r.markLost()
+}
+
 func (r *Registration) Close(
 	_ context.Context,
 	reason string,
@@ -227,7 +231,9 @@ func (r *Registration) markLost() {
 		if cancel != nil {
 			cancel(ErrRegistrationLost)
 		}
-		close(r.lost)
+		if r.lost != nil {
+			close(r.lost)
+		}
 	})
 }
 

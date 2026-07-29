@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path"
@@ -33,6 +34,10 @@ type RegisteredArtifactStore interface {
 		store.CreateArtifactInput,
 		store.WorkerArtifactSaver,
 	) (string, error)
+}
+
+type WorkerArtifactStreamSaver interface {
+	SaveStream(context.Context, string, io.Reader, int64) error
 }
 
 type RuntimeEnv struct {
@@ -153,7 +158,24 @@ func (h MediaTaskHandler) Execute(ctx context.Context, task TaskMessage) (NodeRe
 			return NodeResult{}, err
 		}
 	}
-	info, err := os.Stat(outputLocalPath)
+	persistContext := ctx
+	cancelPersist := func() {}
+	if task.WorkerClaim != nil {
+		persistContext, cancelPersist = context.WithTimeout(
+			ctx,
+			h.storageOperationTimeout(),
+		)
+	}
+	defer cancelPersist()
+	var info os.FileInfo
+	if task.WorkerClaim == nil {
+		info, err = os.Stat(outputLocalPath)
+	} else {
+		info, err = regularWorkerOutputInfo(
+			persistContext,
+			outputLocalPath,
+		)
+	}
 	if err != nil {
 		return NodeResult{}, fmt.Errorf("handler did not produce output: %w", err)
 	}
@@ -190,7 +212,7 @@ func (h MediaTaskHandler) Execute(ctx context.Context, task TaskMessage) (NodeRe
 			artifactInput.StoragePath = outputLocalPath
 		}
 		artifactID, err = registeredStore.PersistWorkerArtifact(
-			ctx,
+			persistContext,
 			*task.WorkerClaim,
 			artifactInput,
 			func(saveContext context.Context) error {
@@ -201,6 +223,7 @@ func (h MediaTaskHandler) Execute(ctx context.Context, task TaskMessage) (NodeRe
 					saveContext,
 					outputLocalPath,
 					outputStoragePath,
+					info.Size(),
 				)
 			},
 		)
@@ -223,13 +246,14 @@ func (h MediaTaskHandler) saveRemoteOutputWithRetry(
 	ctx context.Context,
 	outputLocalPath string,
 	outputStoragePath string,
+	outputSize int64,
 ) error {
 	if h.env.Storage == nil {
 		return errors.New("remote storage backend is not configured")
 	}
-	data, err := os.ReadFile(outputLocalPath)
-	if err != nil {
-		return fmt.Errorf("read output for upload: %w", err)
+	streamSaver, ok := h.env.Storage.(WorkerArtifactStreamSaver)
+	if !ok {
+		return errors.New("remote storage backend does not support streaming")
 	}
 	attempts := h.env.StorageSaveAttempts
 	if attempts <= 0 {
@@ -238,19 +262,24 @@ func (h MediaTaskHandler) saveRemoteOutputWithRetry(
 	if attempts > 5 {
 		attempts = 5
 	}
-	timeout := h.env.StorageOperationTimeout
-	if timeout <= 0 {
-		timeout = 10 * time.Second
-	}
 	var lastErr error
 	for attempt := 0; attempt < attempts; attempt++ {
-		saveContext, cancel := context.WithTimeout(ctx, timeout)
-		lastErr = h.env.Storage.Save(
-			saveContext,
-			outputStoragePath,
-			data,
+		source, err := openWorkerOutputStream(
+			ctx,
+			outputLocalPath,
+			outputSize,
 		)
-		cancel()
+		if err != nil {
+			return fmt.Errorf("open output for upload: %w", err)
+		}
+		lastErr = saveWorkerOutputStream(
+			ctx,
+			streamSaver,
+			outputStoragePath,
+			source,
+			outputSize,
+		)
+		_ = source.Close()
 		if lastErr == nil {
 			return nil
 		}
@@ -267,6 +296,110 @@ func (h MediaTaskHandler) saveRemoteOutputWithRetry(
 		}
 	}
 	return fmt.Errorf("save output artifact: %w", lastErr)
+}
+
+func (h MediaTaskHandler) storageOperationTimeout() time.Duration {
+	if h.env.StorageOperationTimeout > 0 {
+		return h.env.StorageOperationTimeout
+	}
+	return 10 * time.Second
+}
+
+type workerOutputInfoResult struct {
+	info os.FileInfo
+	err  error
+}
+
+func regularWorkerOutputInfo(
+	ctx context.Context,
+	outputLocalPath string,
+) (os.FileInfo, error) {
+	result := make(chan workerOutputInfoResult, 1)
+	go func() {
+		info, err := os.Lstat(outputLocalPath)
+		result <- workerOutputInfoResult{info: info, err: err}
+	}()
+	select {
+	case completed := <-result:
+		if completed.err != nil {
+			return nil, completed.err
+		}
+		if !completed.info.Mode().IsRegular() {
+			return nil, errors.New("worker output is not a regular file")
+		}
+		return completed.info, nil
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	}
+}
+
+type workerOutputOpenResult struct {
+	file *os.File
+	err  error
+}
+
+func openWorkerOutputStream(
+	ctx context.Context,
+	outputLocalPath string,
+	expectedSize int64,
+) (*os.File, error) {
+	result := make(chan workerOutputOpenResult, 1)
+	go func() {
+		file, err := os.OpenFile(outputLocalPath, os.O_RDONLY, 0)
+		if err == nil {
+			info, statErr := file.Stat()
+			switch {
+			case statErr != nil:
+				err = statErr
+			case !info.Mode().IsRegular():
+				err = errors.New("worker output is not a regular file")
+			case info.Size() != expectedSize:
+				err = errors.New("worker output changed before upload")
+			}
+			if err != nil {
+				_ = file.Close()
+				file = nil
+			}
+		}
+		result <- workerOutputOpenResult{file: file, err: err}
+	}()
+	select {
+	case completed := <-result:
+		return completed.file, completed.err
+	case <-ctx.Done():
+		go func() {
+			completed := <-result
+			if completed.file != nil {
+				_ = completed.file.Close()
+			}
+		}()
+		return nil, context.Cause(ctx)
+	}
+}
+
+func saveWorkerOutputStream(
+	ctx context.Context,
+	saver WorkerArtifactStreamSaver,
+	outputStoragePath string,
+	source *os.File,
+	outputSize int64,
+) error {
+	result := make(chan error, 1)
+	go func() {
+		result <- saver.SaveStream(
+			ctx,
+			outputStoragePath,
+			source,
+			outputSize,
+		)
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		_ = source.Close()
+		return context.Cause(ctx)
+	}
 }
 
 func workerClaimGeneration(claim store.WorkerNodeClaim) string {

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -800,6 +801,182 @@ func TestRegistrationPostgres16ArtifactSaveAndPointerHoldSharedFence(
 	}
 	if count != 1 {
 		t.Fatalf("fenced artifact pointers = %d; want 1", count)
+	}
+}
+
+func TestRegistrationPostgres16CancelledCallbacksReleaseSharedFence(
+	t *testing.T,
+) {
+	for _, operation := range []string{
+		"event XADD",
+		"task XACK",
+		"artifact save",
+	} {
+		t.Run(operation, func(t *testing.T) {
+			pgFixture := newWorkerPostgresFixture(t)
+			redisClient := newWorkerRedisIntegrationClient(t)
+			task := newRegisteredTaskFixture(t, pgFixture, redisClient)
+			claim, err := pgFixture.worker.ClaimWorkerNode(
+				task.pg.ctx,
+				task.lease,
+				task.jobID,
+				task.nodeID,
+				task.proof,
+			)
+			if err != nil {
+				t.Fatalf("ClaimWorkerNode: %v", err)
+			}
+			var emissionID uuid.UUID
+			if operation != "artifact save" {
+				emissionID, err = pgFixture.worker.PrepareWorkerEvent(
+					task.pg.ctx,
+					claim,
+					task.eventStream,
+					"orchestrator",
+					CompletedWorkerEventValues(
+						claim,
+						task.proof,
+						uuid.NewString(),
+					),
+				)
+				if err != nil {
+					t.Fatalf("PrepareWorkerEvent: %v", err)
+				}
+			}
+			if operation == "task XACK" {
+				marker := "vp:worker-event-emission:" + emissionID.String()
+				t.Cleanup(func() {
+					_ = redisClient.Del(
+						context.Background(),
+						marker,
+					).Err()
+				})
+				if _, err := pgFixture.worker.PublishPreparedWorkerEvent(
+					task.pg.ctx,
+					task.lease,
+					emissionID,
+					realEventPublisher(redisClient),
+				); err != nil {
+					t.Fatalf("publish event before bounded XACK: %v", err)
+				}
+			}
+
+			callbackStarted := make(chan struct{})
+			releaseCallback := make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() {
+				releaseOnce.Do(func() { close(releaseCallback) })
+			}
+			t.Cleanup(release)
+			operationContext, cancelOperation := context.WithTimeout(
+				context.Background(),
+				300*time.Millisecond,
+			)
+			defer cancelOperation()
+			operationDone := make(chan error, 1)
+			go func() {
+				switch operation {
+				case "event XADD":
+					_, operationErr := pgFixture.worker.
+						PublishPreparedWorkerEvent(
+							operationContext,
+							task.lease,
+							emissionID,
+							func(
+								context.Context,
+								string,
+								string,
+								map[string]string,
+							) (string, error) {
+								close(callbackStarted)
+								<-releaseCallback
+								return "1-0", nil
+							},
+						)
+					operationDone <- operationErr
+				case "task XACK":
+					operationDone <- pgFixture.worker.
+						AcknowledgeWorkerTask(
+							operationContext,
+							claim,
+							func(
+								context.Context,
+								string,
+								string,
+								string,
+							) (int64, error) {
+								close(callbackStarted)
+								<-releaseCallback
+								return 1, nil
+							},
+						)
+				case "artifact save":
+					_, operationErr := pgFixture.worker.
+						PersistWorkerArtifact(
+							operationContext,
+							claim,
+							CreateArtifactInput{
+								JobID:           task.jobID.String(),
+								NodeExecutionID: task.nodeID.String(),
+								Kind:            "INTERMEDIATE",
+								Filename:        "bounded.mp4",
+								MimeType:        "video/mp4",
+								FileSize:        32 << 20,
+								StorageBackend:  "minio",
+								StoragePath: "staging/test/" +
+									uuid.NewString() + ".mp4",
+								MediaInfo: map[string]any{},
+							},
+							func(context.Context) error {
+								close(callbackStarted)
+								<-releaseCallback
+								return nil
+							},
+						)
+					operationDone <- operationErr
+				}
+			}()
+			waitForTestSignal(t, callbackStarted, operation+" callback")
+			takeoverDone := startWorkerTakeover(pgFixture, 2)
+			assertTakeoverBlocked(t, takeoverDone, operation)
+
+			select {
+			case operationErr := <-operationDone:
+				if operationErr == nil {
+					release()
+					t.Fatalf("%s succeeded after callback deadline", operation)
+				}
+			case <-time.After(time.Second):
+				release()
+				select {
+				case <-operationDone:
+				case <-time.After(5 * time.Second):
+				}
+				select {
+				case <-takeoverDone:
+				case <-time.After(5 * time.Second):
+				}
+				t.Fatalf("%s ignored callback deadline", operation)
+			}
+			select {
+			case takeoverErr := <-takeoverDone:
+				if takeoverErr != nil {
+					release()
+					t.Fatalf(
+						"%s takeover after rollback: %v",
+						operation,
+						takeoverErr,
+					)
+				}
+			case <-time.After(time.Second):
+				release()
+				t.Fatalf(
+					"%s shared fence remained held after bounded return",
+					operation,
+				)
+			}
+			release()
+		})
 	}
 }
 

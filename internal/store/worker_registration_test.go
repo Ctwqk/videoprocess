@@ -334,6 +334,32 @@ func TestRegistrationPostgres16ContinuityGateUsesDatabaseClock(t *testing.T) {
 	}
 }
 
+func TestRegistrationPostgres16CloseContextIsBoundedWithHeldConnection(
+	t *testing.T,
+) {
+	fixture := newWorkerPostgresFixture(t)
+	connection, err := fixture.worker.Pool.Acquire(fixture.ctx)
+	if err != nil {
+		t.Fatalf("acquire worker pool connection: %v", err)
+	}
+	closeContext, cancelClose := context.WithTimeout(
+		context.Background(),
+		75*time.Millisecond,
+	)
+	defer cancelClose()
+	started := time.Now()
+	err = fixture.worker.CloseContext(closeContext)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		connection.Release()
+		t.Fatalf("CloseContext error = %v; want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		connection.Release()
+		t.Fatalf("CloseContext returned after %s; want bounded close", elapsed)
+	}
+	connection.Release()
+}
+
 func newWorkerPostgresFixture(t *testing.T) *workerPostgresFixture {
 	t.Helper()
 	testURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_POSTGRES_TEST_URL"))

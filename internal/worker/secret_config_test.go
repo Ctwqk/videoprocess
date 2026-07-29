@@ -119,6 +119,88 @@ func TestRegistrationMissingDeployModeFailsClosedToSecretFiles(t *testing.T) {
 	}
 }
 
+func TestRegistrationEnvironmentFallbackRequiresExplicitValidDevelopmentMode(
+	t *testing.T,
+) {
+	for _, testCase := range []struct {
+		name       string
+		deployMode *string
+		redisURL   string
+	}{
+		{
+			name:       "misspelled production mode",
+			deployMode: workerSecretStringPointer("prodution"),
+			redisURL:   "redis://127.0.0.1:6379/14",
+		},
+		{
+			name:       "unknown mode",
+			deployMode: workerSecretStringPointer("sandbox"),
+			redisURL:   "redis://127.0.0.1:6379/14",
+		},
+		{
+			name:       "local mode malformed endpoint",
+			deployMode: workerSecretStringPointer("local"),
+			redisURL:   "redis://[::1",
+		},
+		{
+			name:       "test mode malformed endpoint",
+			deployMode: workerSecretStringPointer("test"),
+			redisURL:   "://malformed",
+		},
+		{
+			name:       "missing mode",
+			deployMode: nil,
+			redisURL:   "redis://127.0.0.1:6379/14",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			env := map[string]string{
+				"REDIS_URL": testCase.redisURL,
+				"DATABASE_URL": "postgresql://unsafe:" +
+					"database-environment-secret@127.0.0.1/videoprocess",
+				"WORKER_ADMISSION_TOKEN": "admission-environment-secret",
+			}
+			if testCase.deployMode != nil {
+				env["DEPLOY_MODE"] = *testCase.deployMode
+			}
+			_, err := LoadWorkerSecrets(env)
+			if err == nil {
+				t.Fatal("unsafe environment credential fallback was accepted")
+			}
+			for _, secret := range []string{
+				"database-environment-secret",
+				"admission-environment-secret",
+			} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("secret error exposed credential %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestRegistrationExplicitDevelopmentAndTestModesAllowLocalFallback(
+	t *testing.T,
+) {
+	for _, mode := range []string{"local", "development", "test"} {
+		t.Run(mode, func(t *testing.T) {
+			secrets, err := LoadWorkerSecrets(map[string]string{
+				"DEPLOY_MODE":            mode,
+				"REDIS_URL":              "redis://127.0.0.1:6379/14",
+				"DATABASE_URL":           "postgresql://dev:dev@127.0.0.1/videoprocess",
+				"WORKER_ADMISSION_TOKEN": "development-token",
+			})
+			if err != nil {
+				t.Fatalf("LoadWorkerSecrets: %v", err)
+			}
+			if secrets.DatabaseURL == "" ||
+				secrets.AdmissionToken != "development-token" {
+				t.Fatalf("development secrets = %#v", secrets)
+			}
+		})
+	}
+}
+
 func writeWorkerSecret(t *testing.T, name string, value string, mode os.FileMode) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)
@@ -129,4 +211,8 @@ func writeWorkerSecret(t *testing.T, name string, value string, mode os.FileMode
 		t.Fatalf("chmod secret: %v", err)
 	}
 	return path
+}
+
+func workerSecretStringPointer(value string) *string {
+	return &value
 }

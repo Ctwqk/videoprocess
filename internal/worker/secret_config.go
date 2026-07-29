@@ -112,11 +112,14 @@ func isExactMode0400(mode os.FileMode) bool {
 }
 
 func LoadWorkerSecrets(env map[string]string) (SecretConfig, error) {
-	production := isProductionWorkerEnv(env)
+	allowEnvironmentFallback, err := workerAllowsEnvironmentSecretFallback(env)
+	if err != nil {
+		return SecretConfig{}, err
+	}
+	production := !allowEnvironmentFallback
 	databasePath := strings.TrimSpace(env["WORKER_DATABASE_URL_FILE"])
 	databaseEnvironment := strings.TrimSpace(env["DATABASE_URL"])
 	var databaseURL string
-	var err error
 	if production {
 		if databaseEnvironment != "" {
 			return SecretConfig{}, &WorkerSecretError{
@@ -182,33 +185,46 @@ func LoadWorkerSecrets(env map[string]string) (SecretConfig, error) {
 	}, nil
 }
 
-func isProductionWorkerEnv(env map[string]string) bool {
+func workerAllowsEnvironmentSecretFallback(
+	env map[string]string,
+) (bool, error) {
 	deployMode := strings.ToLower(strings.TrimSpace(env["DEPLOY_MODE"]))
 	if deployMode == "" {
-		deployMode = "shared"
+		return false, nil
 	}
 	switch deployMode {
 	case "shared", "production":
-		return true
+		return false, nil
+	case "local", "development", "test":
+	default:
+		return false, &WorkerSecretError{
+			message: "worker deploy mode is invalid",
+		}
 	}
 	rawRedisURL := strings.TrimSpace(env["REDIS_URL"])
 	if rawRedisURL == "" {
 		rawRedisURL = "redis://localhost:6379/0"
 	}
 	parsed, err := url.Parse(rawRedisURL)
-	if err != nil {
-		return false
+	if err != nil ||
+		parsed.Opaque != "" ||
+		parsed.Host == "" ||
+		parsed.Fragment != "" ||
+		parsed.Scheme != "redis" && parsed.Scheme != "rediss" {
+		return false, &WorkerSecretError{
+			message: "worker Redis configuration is invalid",
+		}
 	}
 	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
 	if host == "" ||
 		host == "localhost" ||
 		host == "0.0.0.0" ||
 		host == "::1" {
-		return false
+		return true, nil
 	}
 	address := net.ParseIP(host)
 	if address != nil {
-		return !address.IsLoopback() && !address.IsUnspecified()
+		return address.IsLoopback() || address.IsUnspecified(), nil
 	}
-	return true
+	return false, nil
 }

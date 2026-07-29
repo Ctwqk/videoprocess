@@ -314,6 +314,74 @@ func TestRegistrationStartsWithHeartbeatAndLossCancelsOwnedContext(t *testing.T)
 	}
 }
 
+func TestRegistrationMarkLostPublishesStoreProvenLossAtomically(t *testing.T) {
+	instanceID := uuid.New()
+	claims, err := BuildRegistrationClaims(
+		registrationTestEnv(),
+		"postgresql://runtime:secret@vp-postgres:5432/videoprocess",
+		instanceID,
+	)
+	if err != nil {
+		t.Fatalf("BuildRegistrationClaims: %v", err)
+	}
+	service := &registrationStoreStub{
+		lease: RegistrationLease{
+			RegistrationID:   uuid.New(),
+			GrantID:          uuid.New(),
+			ServiceName:      claims.ServiceName,
+			WorkerInstanceID: instanceID,
+			WorkerSlot:       claims.WorkerSlot,
+			RedisConsumerID:  claims.RedisConsumerID,
+			LeaseEpoch:       8,
+			LeaseSecret:      "lease-secret",
+			LeaseExpiresAt: time.Now().UTC().
+				Add(RegistrationLeaseDuration),
+		},
+	}
+	registration := NewRegistration(service, claims, "admission-token")
+	registration.closeTimeout = 100 * time.Millisecond
+	if _, err := registration.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer registration.Close(context.Background(), "shutdown")
+
+	var wait sync.WaitGroup
+	for index := 0; index < 32; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			registration.MarkLost()
+		}()
+	}
+	wait.Wait()
+
+	select {
+	case <-registration.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("store-proven loss did not cancel registration context")
+	}
+	if !errors.Is(
+		context.Cause(registration.Context()),
+		ErrRegistrationLost,
+	) {
+		t.Fatalf(
+			"registration context cause = %v; want ErrRegistrationLost",
+			context.Cause(registration.Context()),
+		)
+	}
+	if err := registration.WaitLost(
+		context.Background(),
+	); !errors.Is(err, ErrRegistrationLost) {
+		t.Fatalf("WaitLost = %v; want ErrRegistrationLost", err)
+	}
+}
+
+func TestRegistrationMarkLostIsSafeForZeroValue(t *testing.T) {
+	registration := &Registration{}
+	registration.MarkLost()
+	registration.MarkLost()
+}
+
 func registrationTestEnv() map[string]string {
 	return map[string]string{
 		"WORKER_SERVICE_NAME":         "vp-ffmpeg-go-worker-swarm",

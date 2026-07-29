@@ -78,8 +78,9 @@ func (s *startupDatabaseStub) RequireWorkerRedisContinuity(
 	return s.continuityErr
 }
 
-func (s *startupDatabaseStub) Close() {
+func (s *startupDatabaseStub) CloseContext(context.Context) error {
 	*s.calls = append(*s.calls, "close_database")
+	return nil
 }
 
 func TestWorkerStartupRegistersAndChecksContinuityBeforeRedis(t *testing.T) {
@@ -246,6 +247,163 @@ func TestWorkerStartupRegistrationLossAfterContinuityConstructsNoRedis(
 	}
 }
 
+func TestWorkerStartupRejectsInvalidExpectedRedisIdentityBeforeConstruction(
+	t *testing.T,
+) {
+	for _, testCase := range []struct {
+		name     string
+		redisURL string
+	}{
+		{
+			name:     "missing username",
+			redisURL: "redis://vp-redis:6379/3",
+		},
+		{
+			name:     "default username",
+			redisURL: "redis://default:redis-secret@vp-redis:6379/3",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			calls := []string{}
+			database := &startupDatabaseStub{calls: &calls}
+			redisConstructions := 0
+			redisCommands := 0
+			env := workerStartupTestEnv()
+			env["REDIS_URL"] = testCase.redisURL
+			err := runWorker(
+				context.Background(),
+				env,
+				startupDependencies{
+					loadSecrets: func(map[string]string) (worker.SecretConfig, error) {
+						return worker.SecretConfig{
+							DatabaseURL:    "postgresql://runtime:test@vp-postgres/videoprocess",
+							AdmissionToken: "redacted",
+						}, nil
+					},
+					openDatabase: func(
+						context.Context,
+						string,
+					) (startupDatabase, error) {
+						return database, nil
+					},
+					openStorage: func(
+						context.Context,
+						worker.Config,
+					) (storage.Backend, error) {
+						return nil, nil
+					},
+					newRedis: func(*redis.Options) *redis.Client {
+						redisConstructions++
+						return redis.NewClient(
+							&redis.Options{Addr: "127.0.0.1:1"},
+						)
+					},
+					requireRedisIdentity: func(
+						context.Context,
+						*redis.Client,
+						*redis.Options,
+					) error {
+						redisCommands++
+						return nil
+					},
+				},
+			)
+			if err == nil ||
+				!strings.Contains(err.Error(), "worker_redis_identity_unready") {
+				t.Fatalf("runWorker error = %v; want local identity rejection", err)
+			}
+			if redisConstructions != 0 || redisCommands != 0 {
+				t.Fatalf(
+					"Redis constructor/commands = %d/%d; want 0/0",
+					redisConstructions,
+					redisCommands,
+				)
+			}
+			if !containsStartupCall(calls, "release") ||
+				!containsStartupCall(calls, "close_database") {
+				t.Fatalf(
+					"startup calls = %#v; want release and database close",
+					calls,
+				)
+			}
+		})
+	}
+}
+
+func TestWorkerStartupRejectsUnsafeEnvironmentFallbackBeforeDatabaseOpen(
+	t *testing.T,
+) {
+	for _, testCase := range []struct {
+		name       string
+		deployMode *string
+		redisURL   string
+	}{
+		{
+			name:       "misspelled mode with local Redis",
+			deployMode: stringPointer("prodution"),
+			redisURL:   "redis://127.0.0.1:6379/14",
+		},
+		{
+			name:       "explicit local mode with malformed Redis",
+			deployMode: stringPointer("local"),
+			redisURL:   "redis://[::1",
+		},
+		{
+			name:       "unknown mode with malformed Redis",
+			deployMode: stringPointer("sandbox"),
+			redisURL:   "redis://[::1",
+		},
+		{
+			name:       "missing mode with local Redis",
+			deployMode: nil,
+			redisURL:   "redis://127.0.0.1:6379/14",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			env := workerStartupTestEnv()
+			if testCase.deployMode == nil {
+				delete(env, "DEPLOY_MODE")
+			} else {
+				env["DEPLOY_MODE"] = *testCase.deployMode
+			}
+			env["REDIS_URL"] = testCase.redisURL
+			env["DATABASE_URL"] =
+				"postgresql://unsafe-environment:database-secret@localhost/videoprocess"
+			env["WORKER_ADMISSION_TOKEN"] = "unsafe-admission-secret"
+			delete(env, "WORKER_DATABASE_URL_FILE")
+			delete(env, "WORKER_ADMISSION_TOKEN_FILE")
+			databaseOpens := 0
+			err := runWorker(
+				context.Background(),
+				env,
+				startupDependencies{
+					openDatabase: func(
+						context.Context,
+						string,
+					) (startupDatabase, error) {
+						databaseOpens++
+						return nil, errors.New("must not open database")
+					},
+				},
+			)
+			if err == nil {
+				t.Fatal("unsafe environment credential fallback was accepted")
+			}
+			if databaseOpens != 0 {
+				t.Fatalf("database opens = %d; want 0", databaseOpens)
+			}
+			for _, secret := range []string{
+				"database-secret",
+				"unsafe-admission-secret",
+			} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("startup error exposed credential %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
 func TestWorkerStartupValidatesExactRedisACLIdentity(t *testing.T) {
 	rawURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"))
 	if rawURL == "" {
@@ -346,4 +504,8 @@ func containsStartupCall(calls []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func stringPointer(value string) *string {
+	return &value
 }

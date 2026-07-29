@@ -147,22 +147,28 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 		return err
 	}
-	if _, err := c.reclaimPending(ctx); err != nil {
-		c.log.Warn("initial pending reclaim failed", "error", err)
-	}
-	if _, err := c.ReclaimPreferredPending(ctx); err != nil {
-		c.log.Warn("initial preferred pending reclaim failed", "error", err)
-	}
-	if err := c.ReconcilePreparedWorkerEvents(ctx); err != nil {
-		c.log.Warn("initial prepared event reconciliation deferred", "error", err)
-	}
-	stream := c.taskStream()
 	concurrency := c.cfg.Concurrency
 	if concurrency <= 0 {
 		concurrency = 2
 	}
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
+	executions := newConsumerExecutions(c, ctx, concurrency)
+	if messages, err := c.claimPending(ctx); err != nil {
+		c.log.Warn("initial pending reclaim failed", "error", err)
+	} else {
+		executions.dispatch(messages)
+	}
+	if messages, err := c.claimPreferredPending(ctx); err != nil {
+		c.log.Warn("initial preferred pending reclaim failed", "error", err)
+	} else {
+		executions.dispatch(messages)
+	}
+	if err := c.ReconcilePreparedWorkerEvents(ctx); err != nil {
+		if c.publishRegistrationLoss(err) {
+			return c.waitForActive(ctx, &executions.wg)
+		}
+		c.log.Warn("initial prepared event reconciliation deferred", "error", err)
+	}
+	stream := c.taskStream()
 	reclaimTicker := time.NewTicker(c.reclaimInterval())
 	defer reclaimTicker.Stop()
 	affinityTicker := time.NewTicker(time.Second)
@@ -172,23 +178,30 @@ func (c *Consumer) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return c.waitForActive(ctx, &wg)
+			return c.waitForActive(ctx, &executions.wg)
 		case <-reclaimTicker.C:
-			if _, err := c.reclaimPending(ctx); err != nil {
+			if messages, err := c.claimPending(ctx); err != nil {
 				c.log.Warn("periodic pending reclaim failed", "error", err)
+			} else {
+				executions.dispatch(messages)
 			}
 			continue
 		case <-affinityTicker.C:
-			if _, err := c.ReclaimPreferredPending(ctx); err != nil {
+			if messages, err := c.claimPreferredPending(ctx); err != nil {
 				c.log.Warn("preferred pending reclaim failed", "error", err)
+			} else {
+				executions.dispatch(messages)
 			}
 			continue
 		case <-eventTicker.C:
 			if err := c.ReconcilePreparedWorkerEvents(ctx); err != nil {
+				if c.publishRegistrationLoss(err) {
+					return c.waitForActive(ctx, &executions.wg)
+				}
 				c.log.Warn("prepared event reconciliation deferred", "error", err)
 			}
 			continue
-		case sem <- struct{}{}:
+		case executions.sem <- struct{}{}:
 		}
 		res, err := c.Redis.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    c.ConsumerGroup,
@@ -198,9 +211,9 @@ func (c *Consumer) Run(ctx context.Context) error {
 			Count:    1,
 		}).Result()
 		if err != nil {
-			<-sem
+			<-executions.sem
 			if errors.Is(err, context.Canceled) {
-				return c.waitForActive(ctx, &wg)
+				return c.waitForActive(ctx, &executions.wg)
 			}
 			if errors.Is(err, redis.Nil) {
 				continue
@@ -213,18 +226,52 @@ func (c *Consumer) Run(ctx context.Context) error {
 		for _, stream := range res {
 			for _, msg := range stream.Messages {
 				dispatched = true
-				wg.Add(1)
-				go func(m redis.XMessage) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					c.handleMessage(ctx, m)
-				}(msg)
+				executions.startReserved(msg)
 			}
 		}
 		if !dispatched {
-			<-sem
+			<-executions.sem
 		}
 	}
+}
+
+type consumerExecutions struct {
+	consumer *Consumer
+	ctx      context.Context
+	sem      chan struct{}
+	wg       sync.WaitGroup
+}
+
+func newConsumerExecutions(
+	consumer *Consumer,
+	ctx context.Context,
+	concurrency int,
+) *consumerExecutions {
+	return &consumerExecutions{
+		consumer: consumer,
+		ctx:      ctx,
+		sem:      make(chan struct{}, concurrency),
+	}
+}
+
+func (executions *consumerExecutions) dispatch(messages []redis.XMessage) {
+	for _, message := range messages {
+		select {
+		case executions.sem <- struct{}{}:
+			executions.startReserved(message)
+		case <-executions.ctx.Done():
+			return
+		}
+	}
+}
+
+func (executions *consumerExecutions) startReserved(message redis.XMessage) {
+	executions.wg.Add(1)
+	go func() {
+		defer executions.wg.Done()
+		defer func() { <-executions.sem }()
+		executions.consumer.handleMessage(executions.ctx, message)
+	}()
 }
 
 func (c *Consumer) taskStream() string {
@@ -234,39 +281,6 @@ func (c *Consumer) taskStream() string {
 		}
 	}
 	return redisstream.TaskStream(c.WorkerType)
-}
-
-func (c *Consumer) reclaimPending(ctx context.Context) (int, error) {
-	if c.Registration == nil {
-		return c.ReclaimPending(ctx)
-	}
-	minimumIdle := c.cfg.PELMinIdle
-	if minimumIdle <= 0 {
-		minimumIdle = 15 * time.Minute
-	}
-	messages, _, err := c.Redis.XAutoClaim(
-		ctx,
-		&redis.XAutoClaimArgs{
-			Stream:   c.taskStream(),
-			Group:    c.ConsumerGroup,
-			Consumer: c.WorkerID,
-			MinIdle:  minimumIdle,
-			Start:    "0-0",
-			Count:    100,
-		},
-	).Result()
-	if err != nil {
-		return 0, err
-	}
-	if len(messages) > 0 {
-		workerPendingReclaimsTotal.WithLabelValues(c.WorkerType).Add(
-			float64(len(messages)),
-		)
-	}
-	for _, message := range messages {
-		c.handleMessage(ctx, message)
-	}
-	return len(messages), nil
 }
 
 func (c *Consumer) startTaskHeartbeat(
@@ -333,13 +347,6 @@ func (c *Consumer) shouldDeferRegisteredForAffinity(
 			return false
 		}
 	}
-	maximumBounces := c.cfg.AffinityMaxBounces
-	if maximumBounces <= 0 {
-		maximumBounces = 6
-	}
-	if parseIntDefault(task.AffinityBounces, 0) >= maximumBounces {
-		return false
-	}
 	return c.affinityWindowActive(task, now)
 }
 
@@ -361,16 +368,7 @@ func (c *Consumer) claimPreferredPending(
 		return nil, nil
 	}
 	const minimumIdle = 500 * time.Millisecond
-	pending, err := c.Redis.XPendingExt(
-		ctx,
-		&redis.XPendingExtArgs{
-			Stream: c.taskStream(),
-			Group:  c.ConsumerGroup,
-			Start:  "-",
-			End:    "+",
-			Count:  50,
-		},
-	).Result()
+	pending, err := c.registeredPendingEntries(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -430,6 +428,39 @@ func (c *Consumer) claimPreferredPending(
 		}
 	}
 	return claimed, nil
+}
+
+func (c *Consumer) registeredPendingEntries(
+	ctx context.Context,
+) ([]redis.XPendingExt, error) {
+	const pageSize = int64(50)
+	start := "-"
+	pending := make([]redis.XPendingExt, 0, pageSize)
+	for {
+		page, err := c.Redis.XPendingExt(
+			ctx,
+			&redis.XPendingExtArgs{
+				Stream: c.taskStream(),
+				Group:  c.ConsumerGroup,
+				Start:  start,
+				End:    "+",
+				Count:  pageSize,
+			},
+		).Result()
+		if err != nil {
+			return nil, err
+		}
+		pending = append(pending, page...)
+		if len(page) < int(pageSize) {
+			return pending, nil
+		}
+		lastID := page[len(page)-1].ID
+		nextStart := "(" + lastID
+		if lastID == "" || nextStart == start {
+			return nil, errors.New("registered pending pagination is invalid")
+		}
+		start = nextStart
+	}
 }
 
 func (c *Consumer) taskPrefersCurrentHost(task TaskMessage) bool {
@@ -672,6 +703,7 @@ func (c *Consumer) handleRegisteredMessage(
 		proof,
 	)
 	if err != nil {
+		c.publishRegistrationLoss(err)
 		c.log.Warn("registered task claim rejected", "msg_id", msg.ID)
 		return
 	}
@@ -717,6 +749,9 @@ func (c *Consumer) handleRegisteredMessage(
 			),
 			task.EventStream,
 		)
+	case errors.Is(handlerErr, ErrRegistrationLost):
+		c.publishRegistrationLoss(handlerErr)
+		return
 	case errors.Is(handlerErr, ErrConfirmedCancellation),
 		errors.Is(handlerErr, context.Canceled):
 		return
@@ -729,6 +764,7 @@ func (c *Consumer) handleRegisteredMessage(
 		)
 	}
 	if err != nil {
+		c.publishRegistrationLoss(err)
 		c.log.Warn("registered task finalization deferred", "msg_id", msg.ID)
 	}
 }
@@ -790,6 +826,9 @@ func (c *Consumer) publishPreparedWorkerEventWithRetry(
 		if err == nil {
 			return claim, nil
 		}
+		if c.publishRegistrationLoss(err) {
+			return store.WorkerNodeClaim{}, ErrRegistrationLost
+		}
 		lastErr = err
 		if !waitRegisteredRetry(ctx, attempt) {
 			break
@@ -825,6 +864,9 @@ func (c *Consumer) acknowledgeRegisteredTaskWithRetry(
 		if err == nil {
 			return nil
 		}
+		if c.publishRegistrationLoss(err) {
+			return ErrRegistrationLost
+		}
 		lastErr = err
 		if !waitRegisteredRetry(ctx, attempt) {
 			break
@@ -843,6 +885,7 @@ func (c *Consumer) ReconcilePreparedWorkerEvents(ctx context.Context) error {
 		100,
 	)
 	if err != nil {
+		c.publishRegistrationLoss(err)
 		return err
 	}
 	var lastErr error
@@ -852,10 +895,21 @@ func (c *Consumer) ReconcilePreparedWorkerEvents(ctx context.Context) error {
 			err = c.acknowledgeRegisteredTaskWithRetry(ctx, claim)
 		}
 		if err != nil {
+			if c.publishRegistrationLoss(err) {
+				return ErrRegistrationLost
+			}
 			lastErr = err
 		}
 	}
 	return lastErr
+}
+
+func (c *Consumer) publishRegistrationLoss(err error) bool {
+	if c.Registration == nil || !errors.Is(err, ErrRegistrationLost) {
+		return false
+	}
+	c.Registration.MarkLost()
+	return true
 }
 
 func waitRegisteredRetry(ctx context.Context, attempt int) bool {

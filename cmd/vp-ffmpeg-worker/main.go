@@ -43,7 +43,7 @@ func main() {
 type startupDatabase interface {
 	worker.RegistrationStore
 	RequireWorkerRedisContinuity(context.Context, int) error
-	Close()
+	CloseContext(context.Context) error
 }
 
 type startupDependencies struct {
@@ -114,7 +114,16 @@ func runWorker(
 	if err != nil {
 		return errors.New("worker database unavailable")
 	}
-	defer database.Close()
+	defer func() {
+		closeContext, cancelClose := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cancelClose()
+		if closeErr := database.CloseContext(closeContext); closeErr != nil {
+			slog.Warn("worker database close deadline exceeded")
+		}
+	}()
 
 	instanceID := uuid.New()
 	claims, err := worker.BuildRegistrationClaims(
@@ -165,6 +174,9 @@ func runWorker(
 	options, err := redis.ParseURL(cfg.RedisURL)
 	if err != nil {
 		return errors.New("worker Redis configuration is invalid")
+	}
+	if err := requireExpectedWorkerRedisIdentity(options); err != nil {
+		return err
 	}
 	client := dependencies.newRedis(options)
 	if client == nil {
@@ -225,12 +237,23 @@ func requireWorkerRedisIdentity(
 	client *redis.Client,
 	options *redis.Options,
 ) error {
-	expected := strings.TrimSpace(options.Username)
-	if expected == "" || expected == "default" {
-		return errors.New("worker_redis_identity_unready")
+	if err := requireExpectedWorkerRedisIdentity(options); err != nil {
+		return err
 	}
+	expected := strings.TrimSpace(options.Username)
 	observed, err := client.ACLWhoAmI(ctx).Result()
 	if err != nil || observed != expected {
+		return errors.New("worker_redis_identity_unready")
+	}
+	return nil
+}
+
+func requireExpectedWorkerRedisIdentity(options *redis.Options) error {
+	if options == nil {
+		return errors.New("worker_redis_identity_unready")
+	}
+	expected := strings.TrimSpace(options.Username)
+	if expected == "" || expected == "default" {
 		return errors.New("worker_redis_identity_unready")
 	}
 	return nil

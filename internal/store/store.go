@@ -34,6 +34,23 @@ func (s *Store) Close() {
 	}
 }
 
+func (s *Store) CloseContext(ctx context.Context) error {
+	if s == nil || s.Pool == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		s.Pool.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
 func (s *Store) Ping(ctx context.Context) error {
 	if s == nil || s.Pool == nil {
 		return pgx.ErrNoRows
