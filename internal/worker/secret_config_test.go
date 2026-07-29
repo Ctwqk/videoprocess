@@ -3,6 +3,7 @@ package worker
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -253,6 +254,11 @@ func TestRegistrationRedisOptionsEnforceContextCancellation(t *testing.T) {
 func TestRegistrationRedisOptionsRejectUnsafeConstructorRanges(t *testing.T) {
 	for _, redisURL := range []string{
 		"redis://worker:synthetic@127.0.0.1:6379/-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?max_retries=-2",
+		"redis://worker:synthetic@127.0.0.1:6379/14?max_retries=" +
+			strconv.Itoa(int(^uint(0)>>1)),
+		"redis://worker:synthetic@127.0.0.1:6379/14?min_retry_backoff=-2ms",
+		"redis://worker:synthetic@127.0.0.1:6379/14?max_retry_backoff=-2ms",
 		"redis://worker:synthetic@127.0.0.1:6379/14?pool_size=-1",
 		"redis://worker:synthetic@127.0.0.1:6379/14?min_idle_conns=-1",
 		"redis://worker:synthetic@127.0.0.1:6379/14?max_idle_conns=-1",
@@ -284,6 +290,35 @@ func TestRegistrationRedisOptionsRejectUnsafeConstructorRanges(t *testing.T) {
 				if strings.Contains(err.Error(), credential) {
 					t.Fatalf("Redis validation exposed credential %q: %v", credential, err)
 				}
+			}
+		})
+	}
+}
+
+func TestRegistrationRedisOptionsKeepRetrySentinelsAndValuesConstructible(
+	t *testing.T,
+) {
+	for _, redisURL := range []string{
+		"redis://worker:synthetic@127.0.0.1:6379/14?max_retries=-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?max_retries=0",
+		"redis://worker:synthetic@127.0.0.1:6379/14?max_retries=3",
+		"redis://worker:synthetic@127.0.0.1:6379/14?min_retry_backoff=-1&max_retry_backoff=-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?min_retry_backoff=0&max_retry_backoff=0",
+		"redis://worker:synthetic@127.0.0.1:6379/14?min_retry_backoff=2ms&max_retry_backoff=8ms",
+	} {
+		t.Run(redisURL, func(t *testing.T) {
+			options, err := ParseWorkerRedisOptions(redisURL)
+			if err != nil {
+				t.Fatalf("ParseWorkerRedisOptions: %v", err)
+			}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("validated retry options panicked: %v", recovered)
+				}
+			}()
+			client := redis.NewClient(options)
+			if err := client.Close(); err != nil {
+				t.Fatalf("close unconnected Redis client: %v", err)
 			}
 		})
 	}

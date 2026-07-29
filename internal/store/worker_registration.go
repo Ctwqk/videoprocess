@@ -74,6 +74,8 @@ type WorkerRegistrationLease struct {
 	LeaseExpiresAt   time.Time
 }
 
+type WorkerRegistrationFenceCallback func(context.Context) error
+
 func (s *Store) RegisterWorker(
 	ctx context.Context,
 	claims WorkerRegistrationClaims,
@@ -269,6 +271,39 @@ func (s *Store) RequireWorkerLease(
 		leaseEpoch,
 	); err != nil {
 		return sanitizeWorkerRegistrationError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return sanitizeWorkerRegistrationError(err)
+	}
+	return nil
+}
+
+func (s *Store) WithWorkerRegistrationFence(
+	ctx context.Context,
+	lease WorkerRegistrationLease,
+	callback WorkerRegistrationFenceCallback,
+) error {
+	if s == nil || s.Pool == nil || callback == nil {
+		return &WorkerRegistrationError{Code: "lease_fenced"}
+	}
+	tx, err := s.Pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return sanitizeWorkerRegistrationError(err)
+	}
+	defer rollbackWorkerTransaction(tx)
+	if _, err := tx.Exec(
+		ctx,
+		`SELECT public.vp_require_worker_lease($1, $2)`,
+		lease.RegistrationID,
+		lease.LeaseEpoch,
+	); err != nil {
+		return sanitizeWorkerRegistrationError(err)
+	}
+	if err := callback(ctx); err != nil {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return sanitizeWorkerRegistrationError(err)

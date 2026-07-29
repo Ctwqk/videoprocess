@@ -10,6 +10,7 @@ import (
 func (c *Consumer) ReclaimPending(ctx context.Context) (int, error) {
 	messages, err := c.claimPending(ctx)
 	if err != nil {
+		c.publishRegistrationLoss(err)
 		return 0, err
 	}
 	for _, msg := range messages {
@@ -26,14 +27,25 @@ func (c *Consumer) claimPending(
 		minIdle = 15 * time.Minute
 	}
 	stream := c.taskStream()
-	messages, _, err := c.Redis.XAutoClaim(ctx, &redis.XAutoClaimArgs{
-		Stream:   stream,
-		Group:    c.ConsumerGroup,
-		Consumer: c.WorkerID,
-		MinIdle:  minIdle,
-		Start:    "0-0",
-		Count:    100,
-	}).Result()
+	var messages []redis.XMessage
+	err := c.withRegistrationFence(
+		ctx,
+		func(fenceContext context.Context) error {
+			var claimErr error
+			messages, _, claimErr = c.Redis.XAutoClaim(
+				fenceContext,
+				&redis.XAutoClaimArgs{
+					Stream:   stream,
+					Group:    c.ConsumerGroup,
+					Consumer: c.WorkerID,
+					MinIdle:  minIdle,
+					Start:    "0-0",
+					Count:    100,
+				},
+			).Result()
+			return claimErr
+		},
+	)
 	if err != nil {
 		return nil, err
 	}

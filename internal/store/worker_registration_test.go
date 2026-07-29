@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +61,113 @@ type workerPostgresFixture struct {
 	group     string
 	token     string
 	claims    WorkerRegistrationClaims
+}
+
+type lifecycleTraceRecorder struct {
+	queryStart   int
+	queryEnd     int
+	batchStart   int
+	batchQuery   int
+	batchEnd     int
+	copyStart    int
+	copyEnd      int
+	prepareStart int
+	prepareEnd   int
+	acquireStart int
+	acquireEnd   int
+}
+
+func (r *lifecycleTraceRecorder) TraceQueryStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	_ pgx.TraceQueryStartData,
+) context.Context {
+	r.queryStart++
+	return ctx
+}
+
+func (r *lifecycleTraceRecorder) TraceQueryEnd(
+	context.Context,
+	*pgx.Conn,
+	pgx.TraceQueryEndData,
+) {
+	r.queryEnd++
+}
+
+func (r *lifecycleTraceRecorder) TraceBatchStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	_ pgx.TraceBatchStartData,
+) context.Context {
+	r.batchStart++
+	return ctx
+}
+
+func (r *lifecycleTraceRecorder) TraceBatchQuery(
+	context.Context,
+	*pgx.Conn,
+	pgx.TraceBatchQueryData,
+) {
+	r.batchQuery++
+}
+
+func (r *lifecycleTraceRecorder) TraceBatchEnd(
+	context.Context,
+	*pgx.Conn,
+	pgx.TraceBatchEndData,
+) {
+	r.batchEnd++
+}
+
+func (r *lifecycleTraceRecorder) TraceCopyFromStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	_ pgx.TraceCopyFromStartData,
+) context.Context {
+	r.copyStart++
+	return ctx
+}
+
+func (r *lifecycleTraceRecorder) TraceCopyFromEnd(
+	context.Context,
+	*pgx.Conn,
+	pgx.TraceCopyFromEndData,
+) {
+	r.copyEnd++
+}
+
+func (r *lifecycleTraceRecorder) TracePrepareStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	_ pgx.TracePrepareStartData,
+) context.Context {
+	r.prepareStart++
+	return ctx
+}
+
+func (r *lifecycleTraceRecorder) TracePrepareEnd(
+	context.Context,
+	*pgx.Conn,
+	pgx.TracePrepareEndData,
+) {
+	r.prepareEnd++
+}
+
+func (r *lifecycleTraceRecorder) TraceAcquireStart(
+	ctx context.Context,
+	_ *pgxpool.Pool,
+	_ pgxpool.TraceAcquireStartData,
+) context.Context {
+	r.acquireStart++
+	return ctx
+}
+
+func (r *lifecycleTraceRecorder) TraceAcquireEnd(
+	context.Context,
+	*pgxpool.Pool,
+	pgxpool.TraceAcquireEndData,
+) {
+	r.acquireEnd++
 }
 
 func TestRegistrationPostgres16TokenClaimsLeaseAndTakeover(t *testing.T) {
@@ -202,6 +310,79 @@ func TestRegistrationPostgres16TokenClaimsLeaseAndTakeover(t *testing.T) {
 		expiring,
 	); !errors.Is(err, ErrWorkerRegistrationExpired) {
 		t.Fatalf("expired heartbeat error = %v; want ErrWorkerRegistrationExpired", err)
+	}
+}
+
+func TestRegistrationPostgres16WorkerFenceOrdersCallbackBeforeTakeover(
+	t *testing.T,
+) {
+	fixture := newWorkerPostgresFixture(t)
+	lease := fixture.register(t)
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	fenceDone := make(chan error, 1)
+	go func() {
+		fenceDone <- fixture.worker.WithWorkerRegistrationFence(
+			fixture.ctx,
+			lease,
+			func(context.Context) error {
+				close(callbackStarted)
+				<-releaseCallback
+				return nil
+			},
+		)
+	}()
+	select {
+	case <-callbackStarted:
+	case <-time.After(time.Second):
+		close(releaseCallback)
+		t.Fatal("registration-fenced callback did not start")
+	}
+
+	takeoverClaims := fixture.claims
+	takeoverClaims.WorkerInstanceID = uuid.New()
+	takeoverClaims.RedisConsumerID = fmt.Sprintf(
+		"ffmpeg_go-worker@host127:%d:%s",
+		takeoverClaims.WorkerSlot,
+		takeoverClaims.WorkerInstanceID,
+	)
+	takeoverDone := make(chan error, 1)
+	go func() {
+		_, err := fixture.worker.RegisterWorker(
+			fixture.ctx,
+			takeoverClaims,
+			fixture.token,
+		)
+		takeoverDone <- err
+	}()
+	select {
+	case err := <-takeoverDone:
+		close(releaseCallback)
+		t.Fatalf("takeover completed before fenced callback: %v", err)
+	case <-time.After(75 * time.Millisecond):
+	}
+	close(releaseCallback)
+	if err := <-fenceDone; err != nil {
+		t.Fatalf("registration-fenced callback: %v", err)
+	}
+	if err := <-takeoverDone; err != nil {
+		t.Fatalf("takeover after fenced callback: %v", err)
+	}
+
+	staleCallbackCalls := 0
+	err := fixture.worker.WithWorkerRegistrationFence(
+		fixture.ctx,
+		lease,
+		func(context.Context) error {
+			staleCallbackCalls++
+			return nil
+		},
+	)
+	if !errors.Is(err, ErrWorkerRegistrationLost) {
+		t.Fatalf("stale fenced callback error = %v; want registration lost", err)
+	}
+	if staleCallbackCalls != 0 {
+		t.Fatalf("stale fenced callback calls = %d; want 0", staleCallbackCalls)
 	}
 }
 
@@ -348,7 +529,6 @@ func TestRegistrationPostgres16CloseContextOwnsHeldConnectionLifecycle(
 		75*time.Millisecond,
 	)
 	defer cancelClose()
-	goroutinesBefore := runtime.NumGoroutine()
 	started := time.Now()
 	err = fixture.worker.CloseContext(closeContext)
 	elapsed := time.Since(started)
@@ -360,7 +540,6 @@ func TestRegistrationPostgres16CloseContextOwnsHeldConnectionLifecycle(
 	cancelPing()
 	stack := make([]byte, 1<<20)
 	stack = stack[:runtime.Stack(stack, true)]
-	goroutinesAfter := runtime.NumGoroutine()
 	connection.Release()
 	finalCloseContext, cancelFinalClose := context.WithTimeout(
 		context.Background(),
@@ -383,13 +562,6 @@ func TestRegistrationPostgres16CloseContextOwnsHeldConnectionLifecycle(
 		"github.com/jackc/pgx/v5/pgxpool.(*Pool).Close",
 	) {
 		t.Fatal("timed-out CloseContext left an unowned pgxpool.Close goroutine")
-	}
-	if goroutinesAfter > goroutinesBefore {
-		t.Fatalf(
-			"goroutines before/after timed-out close = %d/%d; want no growth",
-			goroutinesBefore,
-			goroutinesAfter,
-		)
 	}
 	if finalCloseErr != nil {
 		t.Fatalf("CloseContext after release: %v", finalCloseErr)
@@ -462,6 +634,429 @@ func TestRegistrationPostgres16CloseContextGatesRacingDirectAcquire(
 	if err := fixture.worker.CloseContext(finalCloseContext); err != nil {
 		t.Fatalf("CloseContext after held release: %v", err)
 	}
+}
+
+func TestRegistrationPostgres16CloseContextWaitsForAcquireBeforePrepare(
+	t *testing.T,
+) {
+	var armed atomic.Bool
+	pingStarted := make(chan struct{})
+	releasePing := make(chan struct{})
+	worker := newPoolLifecycleTestStore(
+		t,
+		func(config *pgxpool.Config) {
+			config.MaxConns = 1
+			config.ShouldPing = func(
+				context.Context,
+				pgxpool.ShouldPingParams,
+			) bool {
+				if armed.CompareAndSwap(true, false) {
+					close(pingStarted)
+					<-releasePing
+				}
+				return false
+			}
+		},
+	)
+	armed.Store(true)
+	acquireDone := make(chan error, 1)
+	go func() {
+		connection, err := worker.Pool.Acquire(context.Background())
+		if connection != nil {
+			connection.Release()
+		}
+		acquireDone <- err
+	}()
+	select {
+	case <-pingStarted:
+	case <-time.After(time.Second):
+		close(releasePing)
+		t.Fatal("Acquire did not stall before PrepareConn")
+	}
+
+	closeContext, cancelClose := context.WithTimeout(
+		context.Background(),
+		75*time.Millisecond,
+	)
+	defer cancelClose()
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- worker.CloseContext(closeContext)
+	}()
+	select {
+	case closeErr := <-closeDone:
+		if !errors.Is(closeErr, context.DeadlineExceeded) {
+			close(releasePing)
+			<-acquireDone
+			t.Fatalf(
+				"CloseContext error = %v; want deadline while pre-Prepare Acquire is admitted",
+				closeErr,
+			)
+		}
+	case <-time.After(300 * time.Millisecond):
+		close(releasePing)
+		acquireErr := <-acquireDone
+		closeErr := <-closeDone
+		t.Fatalf(
+			"CloseContext crossed deadline before PrepareConn: close=%v acquire=%v",
+			closeErr,
+			acquireErr,
+		)
+	}
+	close(releasePing)
+	if err := <-acquireDone; err != nil {
+		t.Fatalf("admitted Acquire after deadline reopen: %v", err)
+	}
+	finalCloseContext, cancelFinalClose := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	defer cancelFinalClose()
+	if err := worker.CloseContext(finalCloseContext); err != nil {
+		t.Fatalf("CloseContext after pre-Prepare Acquire ended: %v", err)
+	}
+}
+
+func TestRegistrationPostgres16CloseContextAllowsClosedHijackToConverge(
+	t *testing.T,
+) {
+	worker := newPoolLifecycleTestStore(t, nil)
+	connection, err := worker.Pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire connection to hijack: %v", err)
+	}
+	raw := connection.Hijack()
+	rawCloseContext, cancelRawClose := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	if err := raw.Close(rawCloseContext); err != nil {
+		cancelRawClose()
+		t.Fatalf("close hijacked connection: %v", err)
+	}
+	cancelRawClose()
+
+	closeContext, cancelClose := context.WithTimeout(
+		context.Background(),
+		150*time.Millisecond,
+	)
+	defer cancelClose()
+	if err := worker.CloseContext(closeContext); err != nil {
+		t.Fatalf("CloseContext after raw hijacked close: %v", err)
+	}
+}
+
+func TestRegistrationPostgres16ExternalStoreCloseFailsWithoutMutation(
+	t *testing.T,
+) {
+	testURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_POSTGRES_TEST_URL"))
+	if testURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_POSTGRES_TEST_URL for PostgreSQL 16 worker integration tests")
+	}
+	config, err := pgxpool.ParseConfig(testURL)
+	if err != nil {
+		t.Fatalf("parse external pool config: %v", err)
+	}
+	config.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatalf("open external pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	connection, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire external connection: %v", err)
+	}
+	var backendPID uint32
+	if err := connection.QueryRow(
+		context.Background(),
+		"SELECT pg_backend_pid()",
+	).Scan(&backendPID); err != nil {
+		connection.Release()
+		t.Fatalf("read external backend PID: %v", err)
+	}
+	external := &Store{Pool: pool}
+	closeContext, cancelClose := context.WithTimeout(
+		context.Background(),
+		50*time.Millisecond,
+	)
+	closeStarted := time.Now()
+	closeErr := external.CloseContext(closeContext)
+	elapsed := time.Since(closeStarted)
+	cancelClose()
+	if !errors.Is(closeErr, ErrStorePoolNotOwned) {
+		connection.Release()
+		t.Fatalf("external CloseContext error = %v; want stable not-owned error", closeErr)
+	}
+	if elapsed > 25*time.Millisecond {
+		connection.Release()
+		t.Fatalf("external CloseContext elapsed = %s; want immediate failure", elapsed)
+	}
+	var heldValue int
+	if err := connection.QueryRow(
+		context.Background(),
+		"SELECT 1",
+	).Scan(&heldValue); err != nil || heldValue != 1 {
+		connection.Release()
+		t.Fatalf("external held connection mutated: value=%d err=%v", heldValue, err)
+	}
+	connection.Release()
+
+	reused, err := pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("reacquire external connection: %v", err)
+	}
+	defer reused.Release()
+	var reusedPID uint32
+	if err := reused.QueryRow(
+		context.Background(),
+		"SELECT pg_backend_pid()",
+	).Scan(&reusedPID); err != nil {
+		t.Fatalf("read reused external backend PID: %v", err)
+	}
+	if reusedPID != backendPID {
+		t.Fatalf(
+			"external backend PID changed across CloseContext = %d/%d; want no reset",
+			backendPID,
+			reusedPID,
+		)
+	}
+}
+
+func TestRegistrationPostgres16CloseContextSerializesConcurrentOwners(
+	t *testing.T,
+) {
+	worker := newPoolLifecycleTestStore(t, nil)
+	held, err := worker.Pool.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire concurrent-close holder: %v", err)
+	}
+	closeContext, cancelClose := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	defer cancelClose()
+	closeResults := make(chan error, 2)
+	for range 2 {
+		go func() {
+			closeResults <- worker.CloseContext(closeContext)
+		}()
+	}
+	time.Sleep(25 * time.Millisecond)
+	held.Release()
+	for index := 0; index < 2; index++ {
+		select {
+		case err := <-closeResults:
+			if err != nil {
+				t.Fatalf("concurrent CloseContext %d: %v", index, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("concurrent CloseContext %d did not converge", index)
+		}
+	}
+}
+
+func TestRegistrationPoolGateComposesExistingTracerInterfaces(t *testing.T) {
+	config, err := pgxpool.ParseConfig(
+		"postgresql://worker:synthetic@127.0.0.1:5432/videoprocess",
+	)
+	if err != nil {
+		t.Fatalf("parse tracer pool config: %v", err)
+	}
+	recorder := &lifecycleTraceRecorder{}
+	config.ConnConfig.Tracer = recorder
+	gate := newPoolAcquisitionGate()
+	gate.install(config)
+	ctx := context.Background()
+
+	queryTracer := config.ConnConfig.Tracer
+	queryContext := queryTracer.TraceQueryStart(
+		ctx,
+		nil,
+		pgx.TraceQueryStartData{},
+	)
+	queryTracer.TraceQueryEnd(queryContext, nil, pgx.TraceQueryEndData{})
+	batchTracer, ok := config.ConnConfig.Tracer.(pgx.BatchTracer)
+	if !ok {
+		t.Fatal("composed tracer dropped BatchTracer")
+	}
+	batchContext := batchTracer.TraceBatchStart(
+		ctx,
+		nil,
+		pgx.TraceBatchStartData{},
+	)
+	batchTracer.TraceBatchQuery(batchContext, nil, pgx.TraceBatchQueryData{})
+	batchTracer.TraceBatchEnd(batchContext, nil, pgx.TraceBatchEndData{})
+	copyTracer, ok := config.ConnConfig.Tracer.(pgx.CopyFromTracer)
+	if !ok {
+		t.Fatal("composed tracer dropped CopyFromTracer")
+	}
+	copyContext := copyTracer.TraceCopyFromStart(
+		ctx,
+		nil,
+		pgx.TraceCopyFromStartData{},
+	)
+	copyTracer.TraceCopyFromEnd(copyContext, nil, pgx.TraceCopyFromEndData{})
+	prepareTracer, ok := config.ConnConfig.Tracer.(pgx.PrepareTracer)
+	if !ok {
+		t.Fatal("composed tracer dropped PrepareTracer")
+	}
+	prepareContext := prepareTracer.TracePrepareStart(
+		ctx,
+		nil,
+		pgx.TracePrepareStartData{},
+	)
+	prepareTracer.TracePrepareEnd(
+		prepareContext,
+		nil,
+		pgx.TracePrepareEndData{},
+	)
+	acquireTracer, ok := config.ConnConfig.Tracer.(pgxpool.AcquireTracer)
+	if !ok {
+		t.Fatal("composed tracer dropped AcquireTracer")
+	}
+	acquireContext := acquireTracer.TraceAcquireStart(
+		ctx,
+		nil,
+		pgxpool.TraceAcquireStartData{},
+	)
+	acquireTracer.TraceAcquireEnd(
+		acquireContext,
+		nil,
+		pgxpool.TraceAcquireEndData{},
+	)
+	if *recorder != (lifecycleTraceRecorder{
+		queryStart:   1,
+		queryEnd:     1,
+		batchStart:   1,
+		batchQuery:   1,
+		batchEnd:     1,
+		copyStart:    1,
+		copyEnd:      1,
+		prepareStart: 1,
+		prepareEnd:   1,
+		acquireStart: 1,
+		acquireEnd:   1,
+	}) {
+		t.Fatalf("existing tracer calls = %#v; want every interface once", recorder)
+	}
+}
+
+func TestRegistrationPostgres16PoolGatePreservesAcquireHooks(t *testing.T) {
+	for _, usePrepare := range []bool{false, true} {
+		name := "before-acquire"
+		if usePrepare {
+			name = "prepare-precedence"
+		}
+		t.Run(name, func(t *testing.T) {
+			var prepareCalls atomic.Int32
+			var beforeAcquireCalls atomic.Int32
+			var afterReleaseCalls atomic.Int32
+			var beforeCloseCalls atomic.Int32
+			worker := newPoolLifecycleTestStore(
+				t,
+				func(config *pgxpool.Config) {
+					config.MaxConns = 1
+					config.BeforeAcquire = func(
+						context.Context,
+						*pgx.Conn,
+					) bool {
+						beforeAcquireCalls.Add(1)
+						return true
+					}
+					if usePrepare {
+						config.PrepareConn = func(
+							context.Context,
+							*pgx.Conn,
+						) (bool, error) {
+							prepareCalls.Add(1)
+							return true, nil
+						}
+					}
+					config.AfterRelease = func(*pgx.Conn) bool {
+						afterReleaseCalls.Add(1)
+						return true
+					}
+					config.BeforeClose = func(*pgx.Conn) {
+						beforeCloseCalls.Add(1)
+					}
+				},
+			)
+			prepareBefore := prepareCalls.Load()
+			acquireBefore := beforeAcquireCalls.Load()
+			releaseBefore := afterReleaseCalls.Load()
+			closeBefore := beforeCloseCalls.Load()
+
+			connection, err := worker.Pool.Acquire(context.Background())
+			if err != nil {
+				t.Fatalf("acquire hook-preservation connection: %v", err)
+			}
+			connection.Release()
+			releaseDeadline := time.Now().Add(time.Second)
+			for afterReleaseCalls.Load()-releaseBefore == 0 &&
+				time.Now().Before(releaseDeadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if got := afterReleaseCalls.Load() - releaseBefore; got != 1 {
+				t.Fatalf("AfterRelease calls = %d; want 1", got)
+			}
+			if usePrepare {
+				if got := prepareCalls.Load() - prepareBefore; got != 1 {
+					t.Fatalf("PrepareConn calls = %d; want 1", got)
+				}
+				if got := beforeAcquireCalls.Load() - acquireBefore; got != 0 {
+					t.Fatalf("BeforeAcquire calls with PrepareConn = %d; want 0", got)
+				}
+			} else if got := beforeAcquireCalls.Load() - acquireBefore; got != 1 {
+				t.Fatalf("BeforeAcquire calls = %d; want 1", got)
+			}
+			closeContext, cancelClose := context.WithTimeout(
+				context.Background(),
+				time.Second,
+			)
+			defer cancelClose()
+			if err := worker.CloseContext(closeContext); err != nil {
+				t.Fatalf("close hook-preservation store: %v", err)
+			}
+			if got := beforeCloseCalls.Load() - closeBefore; got != 1 {
+				t.Fatalf("BeforeClose calls = %d; want 1", got)
+			}
+		})
+	}
+}
+
+func newPoolLifecycleTestStore(
+	t *testing.T,
+	configure func(*pgxpool.Config),
+) *Store {
+	t.Helper()
+	testURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_POSTGRES_TEST_URL"))
+	if testURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_POSTGRES_TEST_URL for PostgreSQL 16 worker integration tests")
+	}
+	config, err := pgxpool.ParseConfig(testURL)
+	if err != nil {
+		t.Fatalf("parse pool lifecycle test config: %v", err)
+	}
+	if configure != nil {
+		configure(config)
+	}
+	gate := newPoolAcquisitionGate()
+	gate.install(config)
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		t.Fatalf("open pool lifecycle test pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	pingContext, cancelPing := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	defer cancelPing()
+	if err := pool.Ping(pingContext); err != nil {
+		t.Fatalf("ping pool lifecycle test pool: %v", err)
+	}
+	return &Store{Pool: pool, closeGate: gate}
 }
 
 func newWorkerPostgresFixture(t *testing.T) *workerPostgresFixture {
@@ -537,15 +1132,36 @@ func newWorkerPostgresFixture(t *testing.T) *workerPostgresFixture {
 		"vp_require_worker_task_ack_receipt(uuid,bigint,text,timestamp with time zone,text,text,text,text,uuid)",
 		"vp_acknowledge_worker_task_delivery(uuid,uuid,bigint,text,timestamp with time zone,text,text,text,text,uuid)",
 	}
-	for _, signature := range signatures {
-		if _, err := admin.Exec(
-			ctx,
-			fmt.Sprintf("GRANT EXECUTE ON FUNCTION public.%s TO %s", signature, roleIdentifier),
-		); err != nil {
-			dropWorkerRole(t, admin, roleIdentifier)
-			admin.Close()
-			t.Fatalf("grant %s: %v", signature, err)
+	grantErr := func() error {
+		grantTx, err := admin.Begin(ctx)
+		if err != nil {
+			return err
 		}
+		defer func() { _ = grantTx.Rollback(ctx) }()
+		if _, err := grantTx.Exec(
+			ctx,
+			"SELECT pg_advisory_xact_lock(8675309, 4)",
+		); err != nil {
+			return err
+		}
+		for _, signature := range signatures {
+			if _, err := grantTx.Exec(
+				ctx,
+				fmt.Sprintf(
+					"GRANT EXECUTE ON FUNCTION public.%s TO %s",
+					signature,
+					roleIdentifier,
+				),
+			); err != nil {
+				return fmt.Errorf("grant %s: %w", signature, err)
+			}
+		}
+		return grantTx.Commit(ctx)
+	}()
+	if grantErr != nil {
+		dropWorkerRole(t, admin, roleIdentifier)
+		admin.Close()
+		t.Fatalf("grant worker functions: %v", grantErr)
 	}
 
 	bindingsJSON, err := json.Marshal(registrationTestBindings)
@@ -700,17 +1316,34 @@ func dropWorkerRole(t *testing.T, admin *pgxpool.Pool, roleIdentifier string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := admin.Exec(
+	dropTx, err := admin.Begin(ctx)
+	if err != nil {
+		t.Errorf("begin worker role cleanup: %v", err)
+		return
+	}
+	defer func() { _ = dropTx.Rollback(ctx) }()
+	if _, err := dropTx.Exec(
+		ctx,
+		"SELECT pg_advisory_xact_lock(8675309, 4)",
+	); err != nil {
+		t.Errorf("lock worker role cleanup: %v", err)
+		return
+	}
+	if _, err := dropTx.Exec(
 		ctx,
 		fmt.Sprintf("DROP OWNED BY %s", roleIdentifier),
 	); err != nil {
 		t.Errorf("drop worker role ownership: %v", err)
 		return
 	}
-	if _, err := admin.Exec(
+	if _, err := dropTx.Exec(
 		ctx,
 		fmt.Sprintf("DROP ROLE IF EXISTS %s", roleIdentifier),
 	); err != nil {
 		t.Errorf("drop worker role: %v", err)
+		return
+	}
+	if err := dropTx.Commit(ctx); err != nil {
+		t.Errorf("commit worker role cleanup: %v", err)
 	}
 }

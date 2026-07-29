@@ -36,6 +36,11 @@ type NodeResult struct {
 }
 
 type RegisteredTaskStore interface {
+	WithWorkerRegistrationFence(
+		context.Context,
+		store.WorkerRegistrationLease,
+		store.WorkerRegistrationFenceCallback,
+	) error
 	ClaimWorkerNode(
 		context.Context,
 		store.WorkerRegistrationLease,
@@ -166,14 +171,20 @@ func (c *Consumer) Run(ctx context.Context) error {
 		defer unregister()
 	}
 	if messages, err := c.claimPending(ctx); err != nil {
+		if c.publishRegistrationLoss(err) {
+			return c.waitForActive(ctx, &executions.wg)
+		}
 		c.log.Warn("initial pending reclaim failed", "error", err)
 	} else {
 		executions.dispatch(messages)
 	}
-	if messages, err := c.claimPreferredPending(ctx); err != nil {
+	messages, err := c.claimPreferredPending(ctx)
+	executions.dispatch(messages)
+	if err != nil {
+		if c.publishRegistrationLoss(err) {
+			return c.waitForActive(ctx, &executions.wg)
+		}
 		c.log.Warn("initial preferred pending reclaim failed", "error", err)
-	} else {
-		executions.dispatch(messages)
 	}
 	if err := c.ReconcilePreparedWorkerEvents(ctx); err != nil {
 		if c.publishRegistrationLoss(err) {
@@ -189,21 +200,30 @@ func (c *Consumer) Run(ctx context.Context) error {
 	eventTicker := time.NewTicker(5 * time.Second)
 	defer eventTicker.Stop()
 	for {
+		if ctx.Err() != nil {
+			return c.waitForActive(ctx, &executions.wg)
+		}
 		select {
 		case <-ctx.Done():
 			return c.waitForActive(ctx, &executions.wg)
 		case <-reclaimTicker.C:
 			if messages, err := c.claimPending(ctx); err != nil {
+				if c.publishRegistrationLoss(err) {
+					return c.waitForActive(ctx, &executions.wg)
+				}
 				c.log.Warn("periodic pending reclaim failed", "error", err)
 			} else {
 				executions.dispatch(messages)
 			}
 			continue
 		case <-affinityTicker.C:
-			if messages, err := c.claimPreferredPending(ctx); err != nil {
+			messages, err := c.claimPreferredPending(ctx)
+			executions.dispatch(messages)
+			if err != nil {
+				if c.publishRegistrationLoss(err) {
+					return c.waitForActive(ctx, &executions.wg)
+				}
 				c.log.Warn("preferred pending reclaim failed", "error", err)
-			} else {
-				executions.dispatch(messages)
 			}
 			continue
 		case <-eventTicker.C:
@@ -233,16 +253,33 @@ func (c *Consumer) Run(ctx context.Context) error {
 				return c.waitForActive(ctx, &executions.wg)
 			}
 		}
-		res, err := c.Redis.XReadGroup(readContext, &redis.XReadGroupArgs{
-			Group:    c.ConsumerGroup,
-			Consumer: c.WorkerID,
-			Streams:  []string{stream, ">"},
-			Block:    blockTimeout,
-			Count:    1,
-		}).Result()
+		var res []redis.XStream
+		err := c.withRegistrationFence(
+			readContext,
+			func(fenceContext context.Context) error {
+				var readErr error
+				res, readErr = c.Redis.XReadGroup(
+					fenceContext,
+					&redis.XReadGroupArgs{
+						Group:    c.ConsumerGroup,
+						Consumer: c.WorkerID,
+						Streams:  []string{stream, ">"},
+						Block:    blockTimeout,
+						Count:    1,
+					},
+				).Result()
+				return readErr
+			},
+		)
 		finishRead()
 		if err != nil {
 			<-executions.sem
+			if c.publishRegistrationLoss(err) {
+				return c.waitForActive(ctx, &executions.wg)
+			}
+			if ctx.Err() != nil {
+				return c.waitForActive(ctx, &executions.wg)
+			}
 			if reads != nil && reads.stopped() {
 				return c.waitForActive(ctx, &executions.wg)
 			}
@@ -269,8 +306,13 @@ func (c *Consumer) Run(ctx context.Context) error {
 					}
 					return c.waitForActive(ctx, &executions.wg)
 				}
+				if !executions.startReserved(msg) {
+					if !dispatched {
+						<-executions.sem
+					}
+					return c.waitForActive(ctx, &executions.wg)
+				}
 				dispatched = true
-				executions.startReserved(msg)
 			}
 		}
 		if !dispatched {
@@ -357,20 +399,57 @@ func (executions *consumerExecutions) dispatch(messages []redis.XMessage) {
 	for _, message := range messages {
 		select {
 		case executions.sem <- struct{}{}:
-			executions.startReserved(message)
+			if !executions.startReserved(message) {
+				<-executions.sem
+				return
+			}
 		case <-executions.ctx.Done():
 			return
 		}
 	}
 }
 
-func (executions *consumerExecutions) startReserved(message redis.XMessage) {
-	executions.wg.Add(1)
-	go func() {
-		defer executions.wg.Done()
-		defer func() { <-executions.sem }()
-		executions.consumer.handleMessage(executions.ctx, message)
-	}()
+func (executions *consumerExecutions) startReserved(
+	message redis.XMessage,
+) bool {
+	accepted := false
+	start := func() {
+		accepted = true
+		executions.wg.Add(1)
+		go func() {
+			defer executions.wg.Done()
+			defer func() { <-executions.sem }()
+			executions.consumer.handleMessage(executions.ctx, message)
+		}()
+	}
+	if executions.consumer.Registration != nil {
+		if executions.ctx.Err() != nil {
+			return false
+		}
+		// Intake can commit just before takeover. Fence the handoff too, so
+		// PostgreSQL orders takeover after an accepted goroutine start.
+		err := executions.consumer.withRegistrationFence(
+			executions.ctx,
+			func(context.Context) error {
+				if !executions.consumer.Registration.handoffIfActive(start) {
+					return ErrRegistrationLost
+				}
+				return nil
+			},
+		)
+		if err != nil {
+			if executions.ctx.Err() == nil ||
+				errors.Is(
+					context.Cause(executions.ctx),
+					ErrRegistrationLost,
+				) {
+				executions.consumer.publishRegistrationLoss(err)
+			}
+		}
+		return accepted
+	}
+	start()
+	return true
 }
 
 func (c *Consumer) taskStream() string {
@@ -403,16 +482,25 @@ func (c *Consumer) startTaskHeartbeat(
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := c.Redis.XClaim(
+				err := c.withRegistrationFence(
 					ctx,
-					&redis.XClaimArgs{
-						Stream:   c.taskStream(),
-						Group:    c.ConsumerGroup,
-						Consumer: c.WorkerID,
-						MinIdle:  0,
-						Messages: []string{messageID},
+					func(fenceContext context.Context) error {
+						return c.Redis.XClaim(
+							fenceContext,
+							&redis.XClaimArgs{
+								Stream:   c.taskStream(),
+								Group:    c.ConsumerGroup,
+								Consumer: c.WorkerID,
+								MinIdle:  0,
+								Messages: []string{messageID},
+							},
+						).Err()
 					},
-				).Err(); err != nil && err != redis.Nil {
+				)
+				if err != nil && !errors.Is(err, redis.Nil) {
+					if c.publishRegistrationLoss(err) {
+						return
+					}
 					c.log.Warn(
 						"worker heartbeat failed",
 						"msg_id",
@@ -451,13 +539,13 @@ func (c *Consumer) shouldDeferRegisteredForAffinity(
 
 func (c *Consumer) ReclaimPreferredPending(ctx context.Context) (int, error) {
 	messages, err := c.claimPreferredPending(ctx)
-	if err != nil {
-		return 0, err
-	}
 	for _, message := range messages {
 		c.handleMessage(ctx, message)
 	}
-	return len(messages), nil
+	if err != nil {
+		c.publishRegistrationLoss(err)
+	}
+	return len(messages), err
 }
 
 func (c *Consumer) claimPreferredPending(
@@ -469,66 +557,89 @@ func (c *Consumer) claimPreferredPending(
 	const minimumIdle = 500 * time.Millisecond
 	claimed := make([]redis.XMessage, 0)
 	now := time.Now().UTC()
-	err := c.visitRegisteredPendingEntries(
+	err := c.withRegistrationFence(
 		ctx,
-		func(entry redis.XPendingExt) error {
-			if entry.ID == "" || entry.Idle < minimumIdle {
-				return nil
-			}
-			exact, err := c.Redis.XRangeN(
-				ctx,
-				c.taskStream(),
-				entry.ID,
-				entry.ID,
-				1,
-			).Result()
-			if err != nil {
-				return err
-			}
-			if len(exact) != 1 || exact[0].ID != entry.ID {
-				return nil
-			}
-			task, err := decodeTask(exact[0].Values)
-			if err != nil {
-				return nil
-			}
-			if entry.Consumer == c.WorkerID {
-				if len(task.PreferredHosts) == 0 ||
-					c.registeredMessageIsProcessing(entry.ID) ||
-					registeredAffinityWindowActive(task, now) {
+		func(fenceContext context.Context) error {
+			return c.visitRegisteredPendingEntries(
+				fenceContext,
+				func(entry redis.XPendingExt) error {
+					if entry.ID == "" || entry.Idle < minimumIdle {
+						return nil
+					}
+					exact, err := c.Redis.XRangeN(
+						fenceContext,
+						c.taskStream(),
+						entry.ID,
+						entry.ID,
+						1,
+					).Result()
+					if err != nil {
+						return err
+					}
+					if len(exact) != 1 || exact[0].ID != entry.ID {
+						return nil
+					}
+					task, err := decodeTask(exact[0].Values)
+					if err != nil {
+						return nil
+					}
+					if entry.Consumer == c.WorkerID {
+						if len(task.PreferredHosts) == 0 ||
+							c.registeredMessageIsProcessing(entry.ID) ||
+							registeredAffinityWindowActive(task, now) {
+							return nil
+						}
+						claimed = append(claimed, exact[0])
+						return nil
+					}
+					if !c.taskPrefersCurrentHost(task) ||
+						!registeredAffinityWindowActive(task, now) {
+						return nil
+					}
+					messages, err := c.Redis.XClaim(
+						fenceContext,
+						&redis.XClaimArgs{
+							Stream:   c.taskStream(),
+							Group:    c.ConsumerGroup,
+							Consumer: c.WorkerID,
+							MinIdle:  minimumIdle,
+							Messages: []string{entry.ID},
+						},
+					).Result()
+					if err != nil && err != redis.Nil {
+						return err
+					}
+					for _, message := range messages {
+						if message.ID == entry.ID {
+							claimed = append(claimed, message)
+						}
+					}
 					return nil
-				}
-				claimed = append(claimed, exact[0])
-				return nil
-			}
-			if !c.taskPrefersCurrentHost(task) ||
-				!registeredAffinityWindowActive(task, now) {
-				return nil
-			}
-			messages, err := c.Redis.XClaim(
-				ctx,
-				&redis.XClaimArgs{
-					Stream:   c.taskStream(),
-					Group:    c.ConsumerGroup,
-					Consumer: c.WorkerID,
-					MinIdle:  minimumIdle,
-					Messages: []string{entry.ID},
 				},
-			).Result()
-			if err != nil && err != redis.Nil {
-				return err
-			}
-			for _, message := range messages {
-				if message.ID == entry.ID {
-					claimed = append(claimed, message)
-				}
-			}
-			return nil
-		})
+			)
+		},
+	)
 	if err != nil {
-		return nil, err
+		return claimed, err
 	}
 	return claimed, nil
+}
+
+func (c *Consumer) withRegistrationFence(
+	ctx context.Context,
+	callback store.WorkerRegistrationFenceCallback,
+) error {
+	if c.Registration == nil {
+		return callback(ctx)
+	}
+	if c.taskStore == nil {
+		return ErrRegistrationLost
+	}
+	return c.taskStore.WithWorkerRegistrationFence(
+		ctx,
+		c.Registration.Lease(),
+		callback,
+	)
 }
 
 func (c *Consumer) visitRegisteredPendingEntries(

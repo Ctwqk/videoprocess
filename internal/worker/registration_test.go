@@ -376,6 +376,55 @@ func TestRegistrationMarkLostPublishesStoreProvenLossAtomically(t *testing.T) {
 	}
 }
 
+func TestRegistrationMarkLostInstallsExactCauseBeforeWaitingForGuard(
+	t *testing.T,
+) {
+	ownedContext, cancelOwned := context.WithCancelCause(context.Background())
+	registration := &Registration{
+		ownedContext: ownedContext,
+		cancelOwned:  cancelOwned,
+		lost:         make(chan struct{}),
+	}
+	guardStarted := make(chan struct{})
+	releaseGuard := make(chan struct{})
+	_, registered := registration.registerLossGuard(func() {
+		close(guardStarted)
+		<-releaseGuard
+	})
+	if !registered {
+		t.Fatal("loss guard was not registered")
+	}
+	markDone := make(chan struct{})
+	go func() {
+		registration.MarkLost()
+		close(markDone)
+	}()
+	select {
+	case <-guardStarted:
+	case <-time.After(time.Second):
+		close(releaseGuard)
+		t.Fatal("loss guard did not start")
+	}
+	if !errors.Is(
+		context.Cause(registration.Context()),
+		ErrRegistrationLost,
+	) {
+		cause := context.Cause(registration.Context())
+		close(releaseGuard)
+		<-markDone
+		t.Fatalf(
+			"registration cause while guard waits = %v; want ErrRegistrationLost",
+			cause,
+		)
+	}
+	close(releaseGuard)
+	select {
+	case <-markDone:
+	case <-time.After(time.Second):
+		t.Fatal("MarkLost did not finish after guard release")
+	}
+}
+
 func TestRegistrationMarkLostIsSafeForZeroValue(t *testing.T) {
 	registration := &Registration{}
 	registration.MarkLost()

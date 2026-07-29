@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/multitracer"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -37,6 +38,8 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 	return &Store{Pool: pool, closeGate: closeGate}, nil
 }
 
+// Close closes pools created by Open. A Store wrapping an external pool leaves
+// that pool with its owner; CloseContext reports ErrStorePoolNotOwned.
 func (s *Store) Close() {
 	if s != nil && s.Pool != nil {
 		_ = s.CloseContext(context.Background())
@@ -48,14 +51,14 @@ func (s *Store) CloseContext(ctx context.Context) error {
 		return nil
 	}
 	if s.closeGate == nil {
-		return s.closeContextWithoutGate(ctx)
+		return ErrStorePoolNotOwned
 	}
 	if !s.closeGate.ownClose(ctx) {
 		return context.Cause(ctx)
 	}
 	defer s.closeGate.releaseClose()
 	s.closeGate.beginClose()
-	if !s.closeGate.wait(ctx) {
+	if !s.closeGate.wait(ctx, s.Pool) {
 		s.Pool.Reset()
 		s.closeGate.reopen()
 		return context.Cause(ctx)
@@ -64,36 +67,28 @@ func (s *Store) CloseContext(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) closeContextWithoutGate(ctx context.Context) error {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if s.Pool.Stat().AcquiredConns() == 0 {
-			s.Pool.Close()
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			s.Pool.Reset()
-			return context.Cause(ctx)
-		case <-ticker.C:
-		}
-	}
-}
-
-var errStorePoolClosing = errors.New("store PostgreSQL pool is closing")
+var (
+	errStorePoolClosing  = errors.New("store PostgreSQL pool is closing")
+	ErrStorePoolNotOwned = errors.New("store PostgreSQL pool lifecycle is not owned")
+)
 
 type poolAcquisitionGate struct {
 	mu         sync.Mutex
 	closing    bool
-	active     map[*pgx.Conn]struct{}
+	inFlight   int
 	changed    chan struct{}
 	closeOwner chan struct{}
 }
 
+type poolAcquireAdmission struct {
+	gate *poolAcquisitionGate
+	once sync.Once
+}
+
+type poolAcquireAdmissionContextKey struct{}
+
 func newPoolAcquisitionGate() *poolAcquisitionGate {
 	return &poolAcquisitionGate{
-		active:     make(map[*pgx.Conn]struct{}),
 		changed:    make(chan struct{}),
 		closeOwner: make(chan struct{}, 1),
 	}
@@ -113,66 +108,66 @@ func (g *poolAcquisitionGate) releaseClose() {
 }
 
 func (g *poolAcquisitionGate) install(config *pgxpool.Config) {
-	previousPrepare := config.PrepareConn
-	previousBeforeAcquire := config.BeforeAcquire
-	previousAfterRelease := config.AfterRelease
-	previousBeforeClose := config.BeforeClose
-	config.BeforeAcquire = nil
-	config.PrepareConn = func(
-		ctx context.Context,
-		connection *pgx.Conn,
-	) (bool, error) {
-		if !g.acquire(connection) {
-			return true, errStorePoolClosing
-		}
-		if previousPrepare != nil {
-			ok, err := previousPrepare(ctx, connection)
-			if !ok || err != nil {
-				g.release(connection)
-			}
-			return ok, err
-		}
-		if previousBeforeAcquire != nil &&
-			!previousBeforeAcquire(ctx, connection) {
-			g.release(connection)
-			return false, nil
-		}
-		return true, nil
-	}
-	config.AfterRelease = func(connection *pgx.Conn) bool {
-		keep := true
-		if previousAfterRelease != nil {
-			keep = previousAfterRelease(connection)
-		}
-		g.release(connection)
-		return keep
-	}
-	config.BeforeClose = func(connection *pgx.Conn) {
-		if previousBeforeClose != nil {
-			previousBeforeClose(connection)
-		}
-		g.release(connection)
-	}
-}
-
-func (g *poolAcquisitionGate) acquire(connection *pgx.Conn) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.closing {
-		return false
-	}
-	g.active[connection] = struct{}{}
-	g.signalLocked()
-	return true
-}
-
-func (g *poolAcquisitionGate) release(connection *pgx.Conn) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if _, exists := g.active[connection]; !exists {
+	if config.ConnConfig.Tracer == nil {
+		config.ConnConfig.Tracer = g
 		return
 	}
-	delete(g.active, connection)
+	config.ConnConfig.Tracer = multitracer.New(config.ConnConfig.Tracer, g)
+}
+
+func (g *poolAcquisitionGate) TraceQueryStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	_ pgx.TraceQueryStartData,
+) context.Context {
+	return ctx
+}
+
+func (g *poolAcquisitionGate) TraceQueryEnd(
+	context.Context,
+	*pgx.Conn,
+	pgx.TraceQueryEndData,
+) {
+}
+
+func (g *poolAcquisitionGate) TraceAcquireStart(
+	ctx context.Context,
+	_ *pgxpool.Pool,
+	_ pgxpool.TraceAcquireStartData,
+) context.Context {
+	g.mu.Lock()
+	if g.closing {
+		g.mu.Unlock()
+		closedContext, cancel := context.WithCancelCause(ctx)
+		cancel(errStorePoolClosing)
+		return closedContext
+	}
+	g.inFlight++
+	g.signalLocked()
+	g.mu.Unlock()
+	return context.WithValue(
+		ctx,
+		poolAcquireAdmissionContextKey{},
+		&poolAcquireAdmission{gate: g},
+	)
+}
+
+func (g *poolAcquisitionGate) TraceAcquireEnd(
+	ctx context.Context,
+	_ *pgxpool.Pool,
+	_ pgxpool.TraceAcquireEndData,
+) {
+	admission, ok := ctx.Value(poolAcquireAdmissionContextKey{}).(*poolAcquireAdmission)
+	if !ok || admission == nil || admission.gate != g {
+		return
+	}
+	admission.once.Do(g.endAcquire)
+}
+
+func (g *poolAcquisitionGate) endAcquire() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.inFlight--
 	g.signalLocked()
 }
 
@@ -190,19 +185,25 @@ func (g *poolAcquisitionGate) reopen() {
 	g.mu.Unlock()
 }
 
-func (g *poolAcquisitionGate) wait(ctx context.Context) bool {
+func (g *poolAcquisitionGate) wait(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+) bool {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		g.mu.Lock()
-		if len(g.active) == 0 {
-			g.mu.Unlock()
-			return true
-		}
+		inFlight := g.inFlight
 		changed := g.changed
 		g.mu.Unlock()
+		if inFlight == 0 && pool.Stat().AcquiredConns() == 0 {
+			return true
+		}
 		select {
 		case <-ctx.Done():
 			return false
 		case <-changed:
+		case <-ticker.C:
 		}
 	}
 }

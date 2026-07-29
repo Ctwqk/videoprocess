@@ -179,6 +179,22 @@ func (r *Registration) registerLossGuard(guard func()) (func(), bool) {
 	}, true
 }
 
+func (r *Registration) handoffIfActive(start func()) bool {
+	if r == nil || start == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed ||
+		r.lossPublished ||
+		r.ownedContext == nil ||
+		r.ownedContext.Err() != nil {
+		return false
+	}
+	start()
+	return true
+}
+
 func (r *Registration) Close(
 	_ context.Context,
 	reason string,
@@ -254,15 +270,15 @@ func (r *Registration) markLost() {
 		for _, guard := range r.lossGuards {
 			guards = append(guards, guard)
 		}
-		r.mu.Unlock()
-		for _, guard := range guards {
-			guard()
-		}
 		if cancel != nil {
 			cancel(ErrRegistrationLost)
 		}
 		if r.lost != nil {
 			close(r.lost)
+		}
+		r.mu.Unlock()
+		for _, guard := range guards {
+			guard()
 		}
 	})
 }

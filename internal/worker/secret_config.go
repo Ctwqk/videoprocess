@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/redis/go-redis/v9"
@@ -212,6 +213,10 @@ func validWorkerRedisOptions(options *redis.Options) bool {
 	if options == nil ||
 		options.Network != "tcp" ||
 		options.DB < 0 ||
+		options.MaxRetries < -1 ||
+		options.MaxRetries == int(^uint(0)>>1) ||
+		!validWorkerRedisRetryBackoff(options.MinRetryBackoff) ||
+		!validWorkerRedisRetryBackoff(options.MaxRetryBackoff) ||
 		options.PoolSize < 0 ||
 		options.MinIdleConns < 0 ||
 		options.MaxIdleConns < 0 ||
@@ -249,6 +254,10 @@ func validWorkerRedisOptions(options *redis.Options) bool {
 		return false
 	}
 	return !strings.Contains(host, ":") || net.ParseIP(host) != nil
+}
+
+func validWorkerRedisRetryBackoff(backoff time.Duration) bool {
+	return backoff == -1 || backoff >= 0
 }
 
 func workerAllowsEnvironmentSecretFallback(

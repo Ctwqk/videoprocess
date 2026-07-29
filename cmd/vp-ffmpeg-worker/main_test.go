@@ -535,6 +535,68 @@ func TestWorkerStartupRejectsUnsafeRedisRangesInEveryModeBeforeDatabaseOpen(
 	}
 }
 
+func TestWorkerStartupRejectsUnsafeRedisRetriesInEveryModeBeforeDatabaseOpen(
+	t *testing.T,
+) {
+	databasePath := writeStartupSecret(
+		t,
+		"database-url",
+		"postgresql://runtime:synthetic-password@vp-postgres/videoprocess",
+	)
+	tokenPath := writeStartupSecret(
+		t,
+		"admission-token",
+		"synthetic-admission-secret",
+	)
+	for _, mode := range []string{
+		"local",
+		"development",
+		"test",
+		"shared",
+		"production",
+	} {
+		for _, redisQuery := range []string{
+			"max_retries=-2",
+			"min_retry_backoff=-2ms",
+			"max_retry_backoff=-2ms",
+		} {
+			t.Run(mode+" "+redisQuery, func(t *testing.T) {
+				env := workerStartupTestEnv()
+				env["DEPLOY_MODE"] = mode
+				env["REDIS_URL"] = "redis://worker:synthetic@127.0.0.1:6379/14?" +
+					redisQuery
+				env["WORKER_DATABASE_URL_FILE"] = databasePath
+				env["WORKER_ADMISSION_TOKEN_FILE"] = tokenPath
+				delete(env, "DATABASE_URL")
+				delete(env, "WORKER_ADMISSION_TOKEN")
+				databaseOpens := 0
+				err := runWorker(
+					context.Background(),
+					env,
+					startupDependencies{
+						openDatabase: func(
+							context.Context,
+							string,
+						) (startupDatabase, error) {
+							databaseOpens++
+							return nil, errors.New("database open must not run")
+						},
+					},
+				)
+				if err == nil {
+					t.Fatal("unsafe Redis retry configuration was accepted")
+				}
+				if databaseOpens != 0 {
+					t.Fatalf("database opens = %d; want 0", databaseOpens)
+				}
+				if err.Error() != "worker Redis configuration is invalid" {
+					t.Fatalf("startup error = %q; want generic Redis error", err)
+				}
+			})
+		}
+	}
+}
+
 func TestWorkerStartupValidatesExactRedisACLIdentity(t *testing.T) {
 	rawURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"))
 	if rawURL == "" {
