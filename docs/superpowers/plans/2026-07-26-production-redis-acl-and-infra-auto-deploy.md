@@ -280,7 +280,10 @@ the exact configured image identity. Kernel-released nonblocking locks prevent
 overlap. Before removing a fixed-name job, the launcher requires the exact
 labels, generation, image, mode, one-completion shape, restart policy, network,
 placement, two mode-specific secrets, environment, command, and exactly one
-terminal task. The marked cron entries are:
+terminal task. Every readiness attempt unlinks the prior ready status while
+holding the readiness lock. Failed, rejected, nonterminal, timed-out,
+inspection, and log failures cannot reuse it; a completed unready result may
+write only new sanitized unready evidence. The marked cron entries are:
 
 ```text
 * * * * * .../worker-redis-marker-control.sh readiness
@@ -302,6 +305,11 @@ Redis construction, followed by `ACL WHOAMI` before `XGROUP`.
 Missing/stale/error/overlap all release registration and emit only
 `worker_redis_continuity_unready`.
 
+The prior control config persists its exact readiness and janitor Redis secret
+names as part of prior-generation job identity. Staged constructure-runtime
+secret rotation validates and removes prior jobs with those old names, while
+candidate and fresh rollback jobs use the current runtime-state names.
+
 A terminal never-ready candidate first restores or deactivates only the managed
 launcher/config/cron state, removes and proves absent only exact
 candidate-identity jobs, then revokes roles and deletes database secrets and
@@ -312,7 +320,11 @@ the candidate managed state is restored before the rollback generation is
 retired in the same order. A ready rollback is proven before candidate or
 superseded credentials are revoked. Independent VP, PDS, feature, schedule,
 and channel cron remain unchanged. Host 126 IPs, aliases, and placement remain
-hard failures.
+hard failures. Managed-state backups are discarded only after verified restore
+and converged cleanup or successful forward/rollback commit. Deactivation,
+generation-name, failed rollback readiness, install-verification, and
+restore-verification failures retain their exact backup under the control root
+for operator recovery.
 
 The repair matrix is deliberately non-generative:
 

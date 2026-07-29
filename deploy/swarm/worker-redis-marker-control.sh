@@ -277,6 +277,13 @@ write_status() {
   mv -f "$temporary" "$target"
 }
 
+invalidate_readiness_status() {
+  if ! rm -f "$STATE_DIR/readiness.status"; then
+    emit "mode=readiness" "code=status_invalidation_failed"
+    return 3
+  fi
+}
+
 finish_readiness() {
   local line="$1"
   if [[ ! "$line" =~ ^\{\"checked_count\":([0-9]+),\"code\":\"([a-z0-9_]+)\",\"expected_count\":([0-9]+),\"status\":\"(ok|failed)\"\}$ ]]; then
@@ -537,6 +544,7 @@ chmod 0700 "$STATE_DIR"
 case "$MODE" in
   readiness)
     acquire_mode_lock readiness || exit 0
+    invalidate_readiness_status || exit 3
     launch_job \
       readiness \
       "$READINESS_JOB" \

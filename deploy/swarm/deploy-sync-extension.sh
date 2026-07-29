@@ -39,6 +39,8 @@ VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION=""
 VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE=""
 VP_WORKER_REDIS_MARKER_PRIOR_GENERATION=""
 VP_WORKER_REDIS_MARKER_PRIOR_IMAGE=""
+VP_WORKER_REDIS_MARKER_PRIOR_READINESS_REDIS_SECRET=""
+VP_WORKER_REDIS_MARKER_PRIOR_JANITOR_REDIS_SECRET=""
 VP_WORKER_REDIS_MARKER_MANAGED_STATE=""
 VP_WORKER_REDIS_MARKER_CANDIDATE_READY=false
 
@@ -1856,6 +1858,8 @@ vp_worker_redis_marker_expected_job_identity() {
   local image="$1"
   local generation="$2"
   local mode="$3"
+  local readiness_redis_secret="${4:-$VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET}"
+  local janitor_redis_secret="${5:-$VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET}"
   local database_secret
   local redis_secret
   local module
@@ -1865,7 +1869,7 @@ vp_worker_redis_marker_expected_job_identity() {
       database_secret="$(
         vp_worker_redis_marker_database_secret_name readiness "$generation"
       )" || return 1
-      redis_secret="$VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET"
+      redis_secret="$readiness_redis_secret"
       module="app.channel_agent.worker_redis_marker_readiness_cli"
       command="check"
       ;;
@@ -1873,7 +1877,7 @@ vp_worker_redis_marker_expected_job_identity() {
       database_secret="$(
         vp_worker_redis_marker_database_secret_name janitor "$generation"
       )" || return 1
-      redis_secret="$VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET"
+      redis_secret="$janitor_redis_secret"
       module="app.channel_agent.worker_redis_marker_janitor_cli"
       command="run"
       ;;
@@ -1904,6 +1908,8 @@ vp_worker_redis_marker_job_identity() {
 vp_worker_redis_marker_remove_generation_jobs() {
   local image="$1"
   local generation="$2"
+  local readiness_redis_secret="${3:-$VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET}"
+  local janitor_redis_secret="${4:-$VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET}"
   [[ -n "$image" && -n "$generation" ]] || return 0
   local name
   local mode
@@ -1924,7 +1930,8 @@ vp_worker_redis_marker_remove_generation_jobs() {
     fi
     expected_identity="$(
       vp_worker_redis_marker_expected_job_identity \
-        "$image" "$generation" "$mode"
+        "$image" "$generation" "$mode" \
+        "$readiness_redis_secret" "$janitor_redis_secret"
     )" || return 1
     actual_identity="$(vp_worker_redis_marker_job_identity "$name")" || return 1
     if [[ "$actual_identity" != "$expected_identity" ]]; then
@@ -1983,9 +1990,12 @@ vp_worker_redis_marker_retire_generation() {
   local image="$1"
   local generation="$2"
   local control_root="$3"
+  local readiness_redis_secret="${4:-$VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET}"
+  local janitor_redis_secret="${5:-$VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET}"
   [[ -n "$image" && -n "$generation" ]] || return 0
   vp_worker_redis_marker_remove_generation_jobs \
-    "$image" "$generation" || return 1
+    "$image" "$generation" \
+    "$readiness_redis_secret" "$janitor_redis_secret" || return 1
   vp_worker_redis_marker_revoke_roles \
     "$image" "$generation" "$control_root" || return 1
   local purpose
@@ -2004,6 +2014,8 @@ vp_worker_redis_marker_read_prior_config() {
   local path="$1"
   VP_WORKER_REDIS_MARKER_PRIOR_GENERATION=""
   VP_WORKER_REDIS_MARKER_PRIOR_IMAGE=""
+  VP_WORKER_REDIS_MARKER_PRIOR_READINESS_REDIS_SECRET=""
+  VP_WORKER_REDIS_MARKER_PRIOR_JANITOR_REDIS_SECRET=""
   [[ -e "$path" ]] || return 0
   if [[ ! -f "$path" || -L "$path" \
     || "$(vp_worker_redis_marker_file_mode "$path")" != 600 ]]; then
@@ -2075,6 +2087,8 @@ vp_worker_redis_marker_read_prior_config() {
   fi
   VP_WORKER_REDIS_MARKER_PRIOR_GENERATION="$generation"
   VP_WORKER_REDIS_MARKER_PRIOR_IMAGE="$image"
+  VP_WORKER_REDIS_MARKER_PRIOR_READINESS_REDIS_SECRET="$readiness_redis_secret"
+  VP_WORKER_REDIS_MARKER_PRIOR_JANITOR_REDIS_SECRET="$janitor_redis_secret"
 }
 
 vp_worker_redis_marker_render_config() {
@@ -2462,21 +2476,25 @@ vp_prepare_worker_redis_marker_controls() {
     "$control_root/control.conf" || return 1
   vp_worker_redis_marker_capture_managed_state "$control_root" || return 1
   if ! vp_worker_redis_marker_deactivate_managed_cron; then
-    vp_worker_redis_marker_discard_managed_state || true
+    if ! vp_worker_redis_marker_restore_managed_state; then
+      echo "worker Redis marker managed-state restore did not verify" >&2
+    fi
     return 1
   fi
   if ! vp_worker_redis_marker_remove_generation_jobs \
     "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" \
-    "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION"; then
-    vp_worker_redis_marker_restore_managed_state || true
-    vp_worker_redis_marker_discard_managed_state || true
+    "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_READINESS_REDIS_SECRET" \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_JANITOR_REDIS_SECRET"; then
+    if ! vp_worker_redis_marker_restore_managed_state; then
+      echo "worker Redis marker managed-state restore did not verify" >&2
+    fi
     return 1
   fi
 
   local generation
   if ! generation="$(vp_worker_redis_marker_new_generation "$image")"; then
     vp_worker_redis_marker_restore_managed_state || return 1
-    vp_worker_redis_marker_discard_managed_state || return 1
     return 1
   fi
   VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION="$generation"
@@ -2525,7 +2543,6 @@ vp_restore_worker_redis_marker_controls() {
       "$VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE" \
       "$VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION"; then
     vp_worker_redis_marker_restore_managed_state "$candidate_state" || true
-    rm -rf "$candidate_state"
     return 1
   fi
   local rollback_generation
@@ -2534,7 +2551,6 @@ vp_restore_worker_redis_marker_controls() {
       "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE"
   )" || {
     vp_worker_redis_marker_restore_managed_state "$candidate_state" || true
-    rm -rf "$candidate_state"
     return 1
   }
   if ! vp_worker_redis_marker_provision_generation \
@@ -2554,7 +2570,6 @@ vp_restore_worker_redis_marker_controls() {
         "$control_root"; then
       echo "worker Redis marker failed rollback cleanup did not converge" >&2
     fi
-    rm -rf "$candidate_state"
     return 1
   fi
   vp_worker_redis_marker_retire_generation \
@@ -2564,7 +2579,9 @@ vp_restore_worker_redis_marker_controls() {
   vp_worker_redis_marker_retire_generation \
     "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" \
     "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \
-    "$control_root" || return 1
+    "$control_root" \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_READINESS_REDIS_SECRET" \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_JANITOR_REDIS_SECRET" || return 1
   rm -rf "$candidate_state" || return 1
   vp_worker_redis_marker_discard_managed_state || return 1
   VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
@@ -2582,7 +2599,9 @@ vp_commit_worker_redis_marker_controls() {
   vp_worker_redis_marker_retire_generation \
     "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" \
     "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \
-    "$control_root" || return 1
+    "$control_root" \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_READINESS_REDIS_SECRET" \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_JANITOR_REDIS_SECRET" || return 1
   vp_worker_redis_marker_discard_managed_state || return 1
   VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
   VP_WORKER_REDIS_MARKER_CANDIDATE_READY=false

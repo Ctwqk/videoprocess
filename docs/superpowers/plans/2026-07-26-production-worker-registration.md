@@ -97,7 +97,11 @@ only for an explicit operator command. The launcher uses a kernel-released
 nonblocking lock and preserves the configured image without registry
 resolution. It removes a fixed-name service only after exact
 labels/mode/generation/image/network/placement/restart/secrets/environment/
-command validation and proof of exactly one terminal task.
+command validation and proof of exactly one terminal task. Under the
+readiness lock, every new attempt first unlinks the prior ready status.
+Failed, rejected, nonterminal, timed-out, inspection, or log failures therefore
+leave no reusable ready record; a parsed unready result may retain only a new
+sanitized unready record.
 
 VideoProcess accepts a mode-`0400` constructure-runtime state file only when
 its `GENERATION` equals the exact 40-character
@@ -111,7 +115,10 @@ before every registered Python worker mutation when the attestation, secrets,
 fresh database status, or ACL identity is absent. One readiness run establishes
 the status record; an exact generation-matching status no older than 90 seconds
 is required again immediately before ffmpeg, vision, publisher, and their
-rollback snapshot mutations.
+rollback snapshot mutations. During staged constructure-runtime secret
+rotation, the prior config's exact readiness and janitor Redis secret names
+remain part of the prior job identity; candidates and fresh rollback
+generations use the current runtime-state names.
 
 A terminal never-ready generation is deactivated by restoring the captured
 managed launcher/config/cron state, then its exact jobs are removed and proved
@@ -122,7 +129,11 @@ reviewed Python image. If rollback readiness fails, candidate managed state is
 restored before the failed rollback generation is cleaned in the same order.
 A ready rollback is proven before failed or superseded credentials are
 revoked. Passwords are never reused, and independent VP, PDS, feature,
-schedule, and channel cron entries are not altered.
+schedule, and channel cron entries are not altered. Managed-state snapshots
+are discarded only after a verified restore with converged cleanup or a
+successful forward/rollback commit. Deactivation, generation-name, failed
+rollback readiness, install-verification, and restore-verification failures
+retain the exact snapshot under the control root for operator recovery.
 
 The only automated mutation matrix is conservative:
 

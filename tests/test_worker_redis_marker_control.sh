@@ -11,6 +11,7 @@ SERVICE_DIR="$TEST_ROOT/services"
 SECRET_DIR="$TEST_ROOT/secrets"
 CONTROL_EVENTS="$TEST_ROOT/control-events"
 FAKE_CRONTAB="$TEST_ROOT/crontab"
+FAKE_CRONTAB_WRITE_COUNT="$TEST_ROOT/crontab-write-count"
 CONFIG_FILE="$TEST_ROOT/control.conf"
 STATE_DIR="$TEST_ROOT/state"
 LOCK_DIR="$TEST_ROOT/locks"
@@ -29,6 +30,7 @@ bash -n "$EXTENSION"
 mkdir -p "$FAKE_BIN" "$SERVICE_DIR" "$SECRET_DIR" "$STATE_DIR" "$LOCK_DIR"
 : >"$DOCKER_CALLS"
 : >"$CONTROL_EVENTS"
+printf '0\n' >"$FAKE_CRONTAB_WRITE_COUNT"
 
 cat >"$FAKE_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -172,13 +174,22 @@ fi
 if [[ "${1:-} ${2:-}" == "service logs" ]]; then
   case "${4:-}" in
     vp-worker-redis-marker-readiness-job)
-      if [[ "${FAKE_READINESS_RESULT:-ready}" == ready ]]; then
-        printf '%s\n' \
-          '{"checked_count":7,"code":"ready","expected_count":7,"status":"ok"}'
-      else
-        printf '%s\n' \
-          '{"checked_count":0,"code":"database_unready","expected_count":7,"status":"failed"}'
-      fi
+      case "${FAKE_READINESS_RESULT:-ready}" in
+        ready)
+          printf '%s\n' \
+            '{"checked_count":7,"code":"ready","expected_count":7,"status":"ok"}'
+          ;;
+        failed)
+          printf '%s\n' \
+            '{"checked_count":0,"code":"database_unready","expected_count":7,"status":"failed"}'
+          ;;
+        malformed)
+          printf '%s\n' 'not-json'
+          ;;
+        unavailable)
+          exit 3
+          ;;
+      esac
       ;;
     vp-worker-redis-marker-janitor-job)
       printf '%s\n' \
@@ -287,7 +298,13 @@ fi
 if [[ "${FAKE_FAIL_CRONTAB_INSTALL:-false}" == true ]]; then
   exit 1
 fi
+write_count="$(cat "$FAKE_CRONTAB_WRITE_COUNT")"
+write_count="$((write_count + 1))"
+printf '%s\n' "$write_count" >"$FAKE_CRONTAB_WRITE_COUNT"
 cp "$1" "$FAKE_CRONTAB"
+if [[ "$write_count" == "${FAKE_CORRUPT_CRONTAB_ON_WRITE:-__none__}" ]]; then
+  printf '# injected verification mismatch\n' >>"$FAKE_CRONTAB"
+fi
 printf 'cron|install\n' >>"$CONTROL_EVENTS"
 EOF
 chmod +x "$FAKE_BIN/crontab"
@@ -304,6 +321,7 @@ EOF
 chmod 0600 "$CONFIG_FILE"
 
 export DOCKER_CALLS SERVICE_DIR SECRET_DIR CONTROL_EVENTS FAKE_CRONTAB
+export FAKE_CRONTAB_WRITE_COUNT
 export PATH="$FAKE_BIN:$PATH"
 export VP_WORKER_REDIS_MARKER_CONFIG_FILE="$CONFIG_FILE"
 export VP_WORKER_REDIS_MARKER_STATE_DIR="$STATE_DIR"
@@ -371,6 +389,75 @@ assert_control_job \
 [[ -f "$STATE_DIR/readiness.status" ]] \
   || fail "readiness did not persist sanitized status"
 
+set_service_state vp-worker-redis-marker-readiness-job Complete
+FAKE_READINESS_TASK_STATE=Failed
+export FAKE_READINESS_TASK_STATE
+if failed_readiness_output="$("$LAUNCHER" readiness)"; then
+  fail "Swarm Failed readiness task unexpectedly succeeded"
+else
+  failed_readiness_exit=$?
+fi
+[[ "$failed_readiness_exit" -eq 3 \
+  && "$failed_readiness_output" == "mode=readiness code=job_failed" ]] \
+  || fail "Swarm Failed readiness task did not use the stable failure result"
+[[ ! -e "$STATE_DIR/readiness.status" ]] \
+  || fail "failed readiness attempt retained a reusable prior ready status"
+if "$LAUNCHER" status >"$TEST_ROOT/failed-readiness-status.out" 2>&1; then
+  fail "status reused readiness from before a newer failed task"
+fi
+grep -Fq 'code=readiness_status_missing' \
+  "$TEST_ROOT/failed-readiness-status.out" \
+  || fail "failed readiness attempt did not invalidate prior ready status"
+unset FAKE_READINESS_TASK_STATE
+set_service_state vp-worker-redis-marker-readiness-job Complete
+"$LAUNCHER" readiness >/dev/null \
+  || fail "readiness did not recover after a failed Swarm task"
+
+for failure_case in rejected timeout malformed-log unavailable-log failed-result; do
+  unset FAKE_READINESS_TASK_STATE
+  FAKE_READINESS_RESULT=ready
+  export FAKE_READINESS_RESULT
+  set_service_state vp-worker-redis-marker-readiness-job Complete
+  "$LAUNCHER" readiness >/dev/null \
+    || fail "$failure_case fixture did not establish prior readiness"
+  set_service_state vp-worker-redis-marker-readiness-job Complete
+  case "$failure_case" in
+    rejected)
+      FAKE_READINESS_TASK_STATE=Rejected
+      ;;
+    timeout)
+      FAKE_READINESS_TASK_STATE=Running
+      ;;
+    malformed-log)
+      FAKE_READINESS_RESULT=malformed
+      ;;
+    unavailable-log)
+      FAKE_READINESS_RESULT=unavailable
+      ;;
+    failed-result)
+      FAKE_READINESS_RESULT=failed
+      ;;
+  esac
+  export FAKE_READINESS_RESULT
+  if [[ -n "${FAKE_READINESS_TASK_STATE:-}" ]]; then
+    export FAKE_READINESS_TASK_STATE
+  fi
+  if "$LAUNCHER" readiness \
+    >"$TEST_ROOT/$failure_case-readiness.out" 2>&1; then
+    fail "$failure_case readiness attempt unexpectedly succeeded"
+  fi
+  if "$LAUNCHER" status \
+    >"$TEST_ROOT/$failure_case-status.out" 2>&1; then
+    fail "$failure_case readiness attempt reused a prior ready status"
+  fi
+done
+unset FAKE_READINESS_TASK_STATE
+FAKE_READINESS_RESULT=ready
+export FAKE_READINESS_RESULT
+set_service_state vp-worker-redis-marker-readiness-job Complete
+"$LAUNCHER" readiness >/dev/null \
+  || fail "readiness did not recover after the failure matrix"
+
 : >"$DOCKER_CALLS"
 janitor_output="$("$LAUNCHER" janitor)"
 assert_control_job \
@@ -392,6 +479,9 @@ running_output="$("$LAUNCHER" readiness)"
   || fail "running readiness job was not a clean skip"
 if grep -Eq 'service\|(create|rm)' "$DOCKER_CALLS"; then
   fail "running readiness job was created or removed"
+fi
+if "$LAUNCHER" status >"$TEST_ROOT/running-readiness-status.out" 2>&1; then
+  fail "overlapping nonterminal readiness job reused prior ready status"
 fi
 
 : >"$DOCKER_CALLS"
@@ -593,23 +683,57 @@ if vp_worker_redis_marker_read_prior_config "$BAD_ACTIVE_CONFIG"; then
   fail "active control config accepted missing network and secret bindings"
 fi
 
-set_service_state vp-worker-redis-marker-readiness-job Complete
-FAKE_SERVICE_GENERATION=m-0123456789ab-1780000000-9999
+RETIREMENT_IMAGE=vp-ffmpeg-worker-python:retirement-identity
+RETIREMENT_GENERATION=m-retirement-1780000000-9999
+VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET=vp-marker-readiness-redis-retirement
+VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET=vp-marker-janitor-redis-retirement
+RETIREMENT_JOB=vp-worker-redis-marker-readiness-job
+printf '%s\n' Complete >"$SERVICE_DIR/$RETIREMENT_JOB.state"
+vp_worker_redis_marker_expected_job_identity \
+  "$RETIREMENT_IMAGE" "$RETIREMENT_GENERATION" readiness \
+  >"$SERVICE_DIR/$RETIREMENT_JOB.identity"
 FAKE_EMPTY_SERVICE_PS=true
-export FAKE_SERVICE_GENERATION FAKE_EMPTY_SERVICE_PS
-if vp_worker_redis_marker_generation_jobs_stopped \
-  "$FAKE_SERVICE_GENERATION" 2>/dev/null; then
+export FAKE_EMPTY_SERVICE_PS
+: >"$DOCKER_CALLS"
+if vp_worker_redis_marker_remove_generation_jobs \
+  "$RETIREMENT_IMAGE" "$RETIREMENT_GENERATION" 2>/dev/null; then
   fail "generation retirement accepted an empty Swarm task set"
 fi
-unset FAKE_SERVICE_GENERATION FAKE_EMPTY_SERVICE_PS
-set_service_state vp-worker-redis-marker-readiness-job Complete
-FAKE_SERVICE_GENERATION=INVALID
-export FAKE_SERVICE_GENERATION
-if vp_worker_redis_marker_generation_jobs_stopped \
-  m-0123456789ab-1780000000-9999 2>/dev/null; then
+unset FAKE_EMPTY_SERVICE_PS
+if grep -Fq "docker|service|rm|$RETIREMENT_JOB" "$DOCKER_CALLS"; then
+  fail "generation retirement removed a job with an empty Swarm task set"
+fi
+
+sed 's/^2|readiness|/0||/' \
+  "$SERVICE_DIR/$RETIREMENT_JOB.identity" \
+  >"$TEST_ROOT/unlabeled-retirement-identity"
+mv "$TEST_ROOT/unlabeled-retirement-identity" \
+  "$SERVICE_DIR/$RETIREMENT_JOB.identity"
+: >"$DOCKER_CALLS"
+if vp_worker_redis_marker_remove_generation_jobs \
+  "$RETIREMENT_IMAGE" "$RETIREMENT_GENERATION" 2>/dev/null; then
   fail "generation retirement accepted an unlabeled fixed-name job"
 fi
-unset FAKE_SERVICE_GENERATION
+if grep -Fq "docker|service|rm|$RETIREMENT_JOB" "$DOCKER_CALLS"; then
+  fail "generation retirement removed an unlabeled fixed-name job"
+fi
+
+vp_worker_redis_marker_expected_job_identity \
+  vp-ffmpeg-worker-python:wrong-image \
+  "$RETIREMENT_GENERATION" \
+  readiness \
+  >"$SERVICE_DIR/$RETIREMENT_JOB.identity"
+: >"$DOCKER_CALLS"
+if vp_worker_redis_marker_remove_generation_jobs \
+  "$RETIREMENT_IMAGE" "$RETIREMENT_GENERATION" 2>/dev/null; then
+  fail "generation retirement accepted a wrong fixed-name job identity"
+fi
+if grep -Fq "docker|service|rm|$RETIREMENT_JOB" "$DOCKER_CALLS"; then
+  fail "generation retirement removed a wrong fixed-name job identity"
+fi
+rm -f \
+  "$SERVICE_DIR/$RETIREMENT_JOB.state" \
+  "$SERVICE_DIR/$RETIREMENT_JOB.identity"
 
 RUNTIME_GENERATION="abcdef0123456789abcdef0123456789abcdef01"
 RUNTIME_STATE="$TEST_ROOT/runtime-state"
@@ -619,6 +743,9 @@ write_runtime_state() {
   local aof_enabled="$3"
   local aof_status="$4"
   local policy="$5"
+  local readiness_secret="${6:-vp-marker-readiness-redis-runtime-abcdef012345}"
+  local janitor_secret="${7:-vp-marker-janitor-redis-runtime-abcdef012345}"
+  local repair_secret="${8:-vp-marker-repair-redis-runtime-abcdef012345}"
   if [[ -e "$RUNTIME_STATE" ]]; then
     chmod 0600 "$RUNTIME_STATE"
   fi
@@ -629,9 +756,9 @@ AOF_ENABLED=$aof_enabled
 AOF_STATUS=$aof_status
 MAXMEMORY_POLICY=$policy
 NETWORK=vp-pipeline-net
-READINESS_REDIS_SECRET=vp-marker-readiness-redis-runtime-abcdef012345
-JANITOR_REDIS_SECRET=vp-marker-janitor-redis-runtime-abcdef012345
-REPAIR_REDIS_SECRET=vp-marker-repair-redis-runtime-abcdef012345
+READINESS_REDIS_SECRET=$readiness_secret
+JANITOR_REDIS_SECRET=$janitor_secret
+REPAIR_REDIS_SECRET=$repair_secret
 EOF
   chmod 0400 "$RUNTIME_STATE"
 }
@@ -697,6 +824,21 @@ vp_install_worker_redis_marker_control \
   "$CRON_GENERATION" \
   "$CRON_CONTROL_ROOT" \
   || fail "worker marker launcher and cron were not installed"
+rm -f \
+  "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.state" \
+  "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+vp_run_worker_redis_marker_readiness "$CRON_CONTROL_ROOT" \
+  || fail "worker gate fixture did not establish readiness"
+FAKE_READINESS_TASK_STATE=Failed
+export FAKE_READINESS_TASK_STATE
+if vp_run_worker_redis_marker_readiness "$CRON_CONTROL_ROOT" \
+  >"$TEST_ROOT/worker-gate-failed-readiness.out" 2>&1; then
+  fail "worker gate fixture accepted a newer failed readiness task"
+fi
+unset FAKE_READINESS_TASK_STATE
+if vp_require_worker_redis_marker_status; then
+  fail "registered-worker gate reused readiness from before a newer failed task"
+fi
 for independent_cron in \
   '*/2 * * * * /srv/deploy/bin/deploy-github-sync.sh videoprocess' \
   '*/3 * * * * /srv/deploy/bin/deploy-github-sync.sh policy-decision-service' \
@@ -793,15 +935,35 @@ reset_marker_transaction_fixture() {
 EOF
   : >"$DOCKER_CALLS"
   : >"$CONTROL_EVENTS"
+  printf '0\n' >"$FAKE_CRONTAB_WRITE_COUNT"
   VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
   VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION=""
   VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE=""
   VP_WORKER_REDIS_MARKER_PRIOR_GENERATION=""
   VP_WORKER_REDIS_MARKER_PRIOR_IMAGE=""
+  VP_WORKER_REDIS_MARKER_MANAGED_STATE=""
   unset FAKE_FAIL_ROLE_REVOKE FAKE_FAIL_SECRET_CREATE
   unset FAKE_FAIL_SECRET_REMOVE FAKE_READINESS_TASK_STATE
+  unset FAKE_FAIL_CRONTAB_INSTALL FAKE_CORRUPT_CRONTAB_ON_WRITE
   FAKE_READINESS_RESULT=ready
   export FAKE_READINESS_RESULT
+}
+
+managed_backup_matches() {
+  local control_root="$1"
+  local expected_launcher="$2"
+  local expected_config="$3"
+  local expected_crontab="$4"
+  local state
+  for state in "$control_root"/.managed-state.*; do
+    [[ -d "$state" ]] || continue
+    if cmp -s "$expected_launcher" "$state/launcher" \
+      && cmp -s "$expected_config" "$state/control.conf" \
+      && cmp -s "$expected_crontab" "$state/crontab"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 event_line() {
@@ -947,13 +1109,52 @@ cmp -s "$TEST_ROOT/generation-failure-crontab" "$FAKE_CRONTAB" \
 cmp -s "$TEST_ROOT/generation-failure-control.conf" \
   "$GENERATION_FAILURE_CONTROL_ROOT/control.conf" \
   || fail "generation-name failure did not preserve active config"
-if compgen -G "$GENERATION_FAILURE_CONTROL_ROOT/.managed-state.*" >/dev/null; then
-  fail "generation-name failure retained managed-state backup"
-fi
+managed_backup_matches \
+  "$GENERATION_FAILURE_CONTROL_ROOT" \
+  "$ROOT/bin/worker-redis-marker-control.sh" \
+  "$TEST_ROOT/generation-failure-control.conf" \
+  "$TEST_ROOT/generation-failure-crontab" \
+  || fail "generation-name failure did not retain its exact managed-state backup"
 eval "$(
   declare -f vp_worker_redis_marker_new_generation_real \
     | sed '1s/vp_worker_redis_marker_new_generation_real/vp_worker_redis_marker_new_generation/'
 )"
+
+reset_marker_transaction_fixture deactivation-failure
+DEACTIVATION_CONTROL_ROOT="$ROOT/state/worker-redis-marker-control"
+mkdir -p "$DEACTIVATION_CONTROL_ROOT"
+DEACTIVATION_PRIOR=m-deactivation-prior-1780000000-0001
+DEACTIVATION_IMAGE=vp-ffmpeg-worker-python:deactivation-prior
+vp_require_worker_redis_runtime_state >/dev/null \
+  || fail "deactivation failure fixture runtime state was not ready"
+vp_worker_redis_marker_provision_generation \
+  "$DEACTIVATION_IMAGE" \
+  "$DEACTIVATION_PRIOR" \
+  "$DEACTIVATION_CONTROL_ROOT" \
+  || fail "deactivation failure prior generation was not provisioned"
+vp_install_worker_redis_marker_control \
+  "$DEACTIVATION_IMAGE" \
+  "$DEACTIVATION_PRIOR" \
+  "$DEACTIVATION_CONTROL_ROOT" \
+  || fail "deactivation failure prior controls were not installed"
+cp "$ROOT/bin/worker-redis-marker-control.sh" \
+  "$TEST_ROOT/deactivation-failure-launcher"
+cp "$DEACTIVATION_CONTROL_ROOT/control.conf" \
+  "$TEST_ROOT/deactivation-failure-control.conf"
+cp "$FAKE_CRONTAB" "$TEST_ROOT/deactivation-failure-crontab"
+FAKE_FAIL_CRONTAB_INSTALL=true
+export FAKE_FAIL_CRONTAB_INSTALL
+if vp_prepare_worker_redis_marker_controls \
+  vp-ffmpeg-worker-python:deactivation-failure >/dev/null 2>&1; then
+  fail "managed-cron deactivation failure unexpectedly prepared controls"
+fi
+unset FAKE_FAIL_CRONTAB_INSTALL
+managed_backup_matches \
+  "$DEACTIVATION_CONTROL_ROOT" \
+  "$TEST_ROOT/deactivation-failure-launcher" \
+  "$TEST_ROOT/deactivation-failure-control.conf" \
+  "$TEST_ROOT/deactivation-failure-crontab" \
+  || fail "deactivation failure discarded its exact managed-state backup"
 
 reset_marker_transaction_fixture failed-rollback
 ROLLBACK_CONTROL_ROOT="$ROOT/state/worker-redis-marker-control"
@@ -1020,6 +1221,67 @@ if [[ -z "$ROLLBACK_CRON_RESTORE_LINE" || -z "$ROLLBACK_JOB_REMOVE_LINE" \
   || "$ROLLBACK_ROLE_REVOKE_LINE" -ge "$ROLLBACK_SECRET_REMOVE_LINE" ]]; then
   fail "failed rollback cleanup order was not cron/config -> job -> role -> secret"
 fi
+managed_backup_matches \
+  "$ROLLBACK_CONTROL_ROOT" \
+  "$ROOT/bin/worker-redis-marker-control.sh" \
+  "$TEST_ROOT/candidate-control.conf" \
+  "$TEST_ROOT/candidate-crontab" \
+  || fail "failed rollback readiness discarded the exact candidate backup"
+
+prepare_rollback_backup_fixture() {
+  local name="$1"
+  reset_marker_transaction_fixture "$name"
+  ROLLBACK_FAILURE_CONTROL_ROOT="$ROOT/state/worker-redis-marker-control"
+  mkdir -p "$ROLLBACK_FAILURE_CONTROL_ROOT"
+  local prior_generation="m-$name-prior-1780000000-0001"
+  local prior_image="vp-ffmpeg-worker-python:$name-prior"
+  vp_require_worker_redis_runtime_state >/dev/null \
+    || fail "$name fixture runtime state was not ready"
+  vp_worker_redis_marker_provision_generation \
+    "$prior_image" "$prior_generation" "$ROLLBACK_FAILURE_CONTROL_ROOT" \
+    || fail "$name prior generation was not provisioned"
+  vp_install_worker_redis_marker_control \
+    "$prior_image" "$prior_generation" "$ROLLBACK_FAILURE_CONTROL_ROOT" \
+    || fail "$name prior controls were not installed"
+  vp_prepare_worker_redis_marker_controls \
+    "vp-ffmpeg-worker-python:$name-candidate" >/dev/null \
+    || fail "$name candidate did not prepare"
+  cp "$ROOT/bin/worker-redis-marker-control.sh" \
+    "$TEST_ROOT/$name-candidate-launcher"
+  cp "$ROLLBACK_FAILURE_CONTROL_ROOT/control.conf" \
+    "$TEST_ROOT/$name-candidate-control.conf"
+  cp "$FAKE_CRONTAB" "$TEST_ROOT/$name-candidate-crontab"
+  printf '0\n' >"$FAKE_CRONTAB_WRITE_COUNT"
+}
+
+prepare_rollback_backup_fixture rollback-install-verify
+FAKE_CORRUPT_CRONTAB_ON_WRITE=2
+export FAKE_CORRUPT_CRONTAB_ON_WRITE
+if vp_restore_worker_redis_marker_controls >/dev/null 2>&1; then
+  fail "rollback install verification mismatch unexpectedly restored"
+fi
+unset FAKE_CORRUPT_CRONTAB_ON_WRITE
+managed_backup_matches \
+  "$ROLLBACK_FAILURE_CONTROL_ROOT" \
+  "$TEST_ROOT/rollback-install-verify-candidate-launcher" \
+  "$TEST_ROOT/rollback-install-verify-candidate-control.conf" \
+  "$TEST_ROOT/rollback-install-verify-candidate-crontab" \
+  || fail "rollback install verification failure discarded candidate backup"
+
+prepare_rollback_backup_fixture rollback-restore-verify
+FAKE_READINESS_TASK_STATE=Failed
+FAKE_CORRUPT_CRONTAB_ON_WRITE=4
+export FAKE_READINESS_TASK_STATE FAKE_CORRUPT_CRONTAB_ON_WRITE
+if vp_restore_worker_redis_marker_controls >/dev/null 2>&1; then
+  fail "rollback restore verification mismatch unexpectedly restored"
+fi
+unset FAKE_READINESS_TASK_STATE FAKE_CORRUPT_CRONTAB_ON_WRITE
+managed_backup_matches \
+  "$ROLLBACK_FAILURE_CONTROL_ROOT" \
+  "$TEST_ROOT/rollback-restore-verify-candidate-launcher" \
+  "$TEST_ROOT/rollback-restore-verify-candidate-control.conf" \
+  "$TEST_ROOT/rollback-restore-verify-candidate-crontab" \
+  || fail "rollback restore verification failure discarded candidate backup"
 
 reset_marker_transaction_fixture commit
 COMMIT_CONTROL_ROOT="$ROOT/state/worker-redis-marker-control"
@@ -1048,6 +1310,90 @@ vp_commit_worker_redis_marker_controls \
   || fail "commit removed candidate database credential files"
 if compgen -G "$COMMIT_CONTROL_ROOT/.managed-state.*" >/dev/null; then
   fail "commit retained a stale managed-state backup"
+fi
+
+reset_marker_transaction_fixture rotated-runtime-secrets
+ROTATION_CONTROL_ROOT="$ROOT/state/worker-redis-marker-control"
+mkdir -p "$ROTATION_CONTROL_ROOT"
+ROTATION_PRIOR_GENERATION=m-rotation-prior-1780000000-0001
+ROTATION_PRIOR_IMAGE=vp-ffmpeg-worker-python:rotation-prior
+ROTATION_OLD_READINESS_SECRET=vp-marker-readiness-redis-runtime-old123456789
+ROTATION_OLD_JANITOR_SECRET=vp-marker-janitor-redis-runtime-old123456789
+ROTATION_NEW_READINESS_SECRET=vp-marker-readiness-redis-runtime-new123456789
+ROTATION_NEW_JANITOR_SECRET=vp-marker-janitor-redis-runtime-new123456789
+ROTATION_NEW_REPAIR_SECRET=vp-marker-repair-redis-runtime-new123456789
+write_runtime_state \
+  "$RUNTIME_GENERATION" \
+  vp-marker-acl-v1 \
+  yes \
+  ok \
+  noeviction \
+  "$ROTATION_NEW_READINESS_SECRET" \
+  "$ROTATION_NEW_JANITOR_SECRET" \
+  "$ROTATION_NEW_REPAIR_SECRET"
+vp_require_worker_redis_runtime_state >/dev/null \
+  || fail "rotation fixture current runtime state was not ready"
+VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET="$ROTATION_OLD_READINESS_SECRET"
+VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET="$ROTATION_OLD_JANITOR_SECRET"
+vp_worker_redis_marker_provision_generation \
+  "$ROTATION_PRIOR_IMAGE" \
+  "$ROTATION_PRIOR_GENERATION" \
+  "$ROTATION_CONTROL_ROOT" \
+  || fail "rotation fixture prior generation was not provisioned"
+vp_install_worker_redis_marker_control \
+  "$ROTATION_PRIOR_IMAGE" \
+  "$ROTATION_PRIOR_GENERATION" \
+  "$ROTATION_CONTROL_ROOT" \
+  || fail "rotation fixture prior controls were not installed"
+rm -f \
+  "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.state" \
+  "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity" \
+  "$SERVICE_DIR/vp-worker-redis-marker-janitor-job.state" \
+  "$SERVICE_DIR/vp-worker-redis-marker-janitor-job.identity"
+vp_run_worker_redis_marker_readiness "$ROTATION_CONTROL_ROOT" \
+  || fail "rotation fixture prior readiness job did not complete"
+VP_WORKER_REDIS_MARKER_CONFIG_FILE="$ROTATION_CONTROL_ROOT/control.conf" \
+VP_WORKER_REDIS_MARKER_STATE_DIR="$ROTATION_CONTROL_ROOT/status" \
+VP_WORKER_REDIS_MARKER_LOCK_DIR="$ROTATION_CONTROL_ROOT/locks" \
+  "$ROOT/bin/worker-redis-marker-control.sh" janitor >/dev/null \
+  || fail "rotation fixture prior janitor job did not complete"
+: >"$CONTROL_EVENTS"
+if ! vp_prepare_worker_redis_marker_controls \
+  vp-ffmpeg-worker-python:rotation-candidate >/dev/null 2>&1; then
+  fail "staged runtime secret rotation could not safely retire prior jobs"
+fi
+[[ "$VP_WORKER_REDIS_MARKER_PRIOR_READINESS_REDIS_SECRET" \
+    == "$ROTATION_OLD_READINESS_SECRET" \
+  && "$VP_WORKER_REDIS_MARKER_PRIOR_JANITOR_REDIS_SECRET" \
+    == "$ROTATION_OLD_JANITOR_SECRET" ]] \
+  || fail "prior generation did not retain its exact Redis secret identities"
+ROTATION_CANDIDATE_IDENTITY="$(
+  cat "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+)"
+[[ "$ROTATION_CANDIDATE_IDENTITY" \
+    == *"$ROTATION_NEW_READINESS_SECRET:worker-marker-redis-url:256"* \
+  && "$ROTATION_CANDIDATE_IDENTITY" != *"$ROTATION_OLD_READINESS_SECRET"* ]] \
+  || fail "rotation candidate did not use the current readiness Redis secret"
+vp_commit_worker_redis_marker_controls \
+  || fail "staged runtime secret rotation did not commit"
+ROTATION_PRIOR_JOB_REMOVE_LINE="$(
+  event_line \
+    "job|remove|vp-worker-redis-marker-janitor-job|$ROTATION_PRIOR_GENERATION"
+)"
+ROTATION_PRIOR_ROLE_REVOKE_LINE="$(
+  event_line "role|revoke|$ROTATION_PRIOR_GENERATION"
+)"
+ROTATION_PRIOR_SECRET_REMOVE_LINE="$(
+  event_line \
+    "secret|remove|vp-wrm-readiness-db-$ROTATION_PRIOR_GENERATION"
+)"
+if [[ -z "$ROTATION_PRIOR_JOB_REMOVE_LINE" \
+  || -z "$ROTATION_PRIOR_ROLE_REVOKE_LINE" \
+  || -z "$ROTATION_PRIOR_SECRET_REMOVE_LINE" \
+  || "$ROTATION_PRIOR_JOB_REMOVE_LINE" -ge "$ROTATION_PRIOR_ROLE_REVOKE_LINE" \
+  || "$ROTATION_PRIOR_ROLE_REVOKE_LINE" \
+    -ge "$ROTATION_PRIOR_SECRET_REMOVE_LINE" ]]; then
+  fail "rotated prior generation did not retire job -> role -> secret"
 fi
 
 reset_marker_transaction_fixture stale-after-ffmpeg

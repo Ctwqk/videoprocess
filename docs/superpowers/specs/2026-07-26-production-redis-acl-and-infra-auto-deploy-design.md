@@ -195,7 +195,10 @@ are kernel-released after process death. Jobs use the exact configured image
 without registry resolution. Destructive fixed-name removal requires exact
 labels, mode, generation, image, one-completion shape, restart policy, network,
 placement, mode-specific secrets, environment, command, and exactly one
-terminal task. Cron contains one marked block:
+terminal task. Each readiness attempt first unlinks the prior ready status
+under the readiness lock. Failed, rejected, nonterminal, timed-out, inspection,
+or log failures cannot reuse it; a completed unready result may retain only
+new sanitized unready evidence. Cron contains one marked block:
 
 ```text
 * * * * * .../worker-redis-marker-control.sh readiness
@@ -220,6 +223,11 @@ opens PostgreSQL, registers, calls
 overlapping/running continuity all release registration, construct no Redis
 client, and expose only `worker_redis_continuity_unready`.
 
+The prior config's exact readiness and janitor Redis secret names are retained
+as prior-generation job identity during staged constructure-runtime rotation.
+Prior jobs validate and retire against those old identities; candidates and
+fresh rollback generations use current runtime-state identities.
+
 A terminal never-ready candidate is deactivated by restoring the prior managed
 launcher/config/cron state, its exact jobs are removed and proved absent, and
 only then are its roles, database secrets, and credential files removed. With
@@ -229,7 +237,11 @@ passwords. If it is unready, candidate managed state is restored before the
 failed rollback generation is cleaned in the same order. A ready rollback is
 proven before failed and superseded roles and secrets are revoked. The Go image
 remains Go-only; its registration/continuity work stays in the subsequent
-worker-registration Task 3.
+worker-registration Task 3. Managed-state backups are removed only after
+verified restore and converged cleanup or successful forward/rollback commit.
+Deactivation, generation-name, failed rollback readiness, install-verification,
+and restore-verification failures retain the exact backup under the control
+root for operator recovery.
 
 ### Conservative Repair Matrix
 

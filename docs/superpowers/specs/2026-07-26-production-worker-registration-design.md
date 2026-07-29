@@ -667,7 +667,11 @@ release when the process dies. Jobs preserve the configured image identity.
 A running fixed-name job is skipped; removal additionally requires exact
 labels, mode, generation, image, one-completion shape, restart policy, network,
 placement, mode-specific secrets, environment, command, and exactly one
-terminal task. The marked cron block is exactly:
+terminal task. Before each readiness attempt, the launcher unlinks the prior
+ready status under the readiness lock. Failed, rejected, nonterminal,
+timed-out, inspection, and log failures leave it unusable; a parsed unready
+result may replace it only with sanitized unready evidence. The marked cron
+block is exactly:
 
 ```text
 * * * * * .../worker-redis-marker-control.sh readiness
@@ -687,6 +691,9 @@ state file whose exact 40-character generation matches
 `MAXMEMORY_POLICY=noeviction`, and `NETWORK=vp-pipeline-net`, with three
 distinct existing Redis Swarm secrets. VideoProcess fails closed rather than
 generating ACL credentials, identities, AOF, or eviction configuration.
+Prior control config retains its exact readiness and janitor Redis secret names
+for prior-generation identity validation during staged rotation. Candidate and
+fresh rollback jobs use the current constructure-runtime state names.
 
 Candidate deployment provisions marker-control database roles first, creates
 the three versioned database secrets through stdin, installs the launcher and
@@ -703,7 +710,11 @@ uses the prior reviewed Python image but creates new passwords and a fresh
 generation. If fresh rollback readiness fails, candidate managed state is
 restored before the failed rollback generation is retired in the same safe
 order. A ready rollback is proven before failed or superseded roles and secrets
-are revoked.
+are revoked. Managed-state snapshots are removed only after verified restore
+and converged cleanup or successful forward/rollback commit. Deactivation,
+generation-name, failed rollback readiness, install-verification, and
+restore-verification failures retain the exact snapshot under the control root
+for operator recovery.
 
 ### Conservative Repair Matrix
 
