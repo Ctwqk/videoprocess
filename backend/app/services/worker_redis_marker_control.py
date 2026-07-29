@@ -271,14 +271,17 @@ async def check_worker_redis_continuity(
             checked_count,
         )
     except Exception:
-        return _continuity_error(
+        finished = False
+    if finished is not True:
+        await _finish_continuity_safely(
+            db,
             run_id,
+            "error",
             "continuity_finish_failed",
+            redis_run_id,
             expected_count,
             checked_count,
-            redis_run_id,
         )
-    if finished is not True:
         return _continuity_error(
             run_id,
             "continuity_finish_failed",

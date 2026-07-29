@@ -172,6 +172,45 @@ class _StatefulDatabase(_Database):
         return await super().execute(statement, params)
 
 
+class _ReadyFinishDatabase(_StatefulDatabase):
+    def __init__(
+        self,
+        *,
+        ready_finish_behavior: str,
+        pages: list[list[dict[str, object]]],
+    ) -> None:
+        super().__init__(pages=pages)
+        self.ready_finish_behavior = ready_finish_behavior
+        self.ready_failure_used = False
+
+    async def scalar(self, statement: object, params: dict[str, object]):
+        query = str(statement)
+        if "vp_finish_worker_redis_continuity_check" not in query:
+            return await super().scalar(statement, params)
+
+        self.calls.append((query, params))
+        if params["result"] == "error":
+            if self.continuity_state != "running":
+                raise RuntimeError("worker_redis_continuity_run_mismatch")
+            self.continuity_state = "error"
+            return False
+        if params["result"] != "ready":
+            raise AssertionError(params)
+        if self.ready_failure_used:
+            self.continuity_state = "ready"
+            return True
+
+        self.ready_failure_used = True
+        if self.ready_finish_behavior == "raise_before_commit":
+            raise RuntimeError("database detail must not escape")
+        if self.ready_finish_behavior == "reject":
+            return False
+        if self.ready_finish_behavior == "raise_after_commit":
+            self.continuity_state = "ready"
+            raise RuntimeError("database detail must not escape")
+        raise AssertionError(self.ready_finish_behavior)
+
+
 class _Redis:
     def __init__(self, *, condition: str = "ok") -> None:
         self.condition = condition
@@ -426,6 +465,107 @@ async def test_continuity_classifies_observation_database_failure() -> None:
         if "vp_finish_worker_redis_continuity_check" in query
     )
     assert finish_params["reason_code"] == "marker_observation_database_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ready_finish_behavior",
+    ["raise_before_commit", "reject"],
+)
+async def test_continuity_ready_failure_finalizes_error_before_next_run(
+    ready_finish_behavior: str,
+) -> None:
+    expectation = _expectation()
+    database = _ReadyFinishDatabase(
+        ready_finish_behavior=ready_finish_behavior,
+        pages=[[_expectation_row(expectation)], []],
+    )
+
+    first_result = await control.check_worker_redis_continuity(
+        database,
+        _Redis(),
+        "vp-marker-readiness",
+    )
+
+    assert first_result.state == "error"
+    assert first_result.reason_code == "continuity_finish_failed"
+    assert "database detail must not escape" not in repr(first_result)
+    assert database.continuity_state == "error"
+    error_finishes = [
+        params
+        for query, params in database.calls
+        if (
+            "vp_finish_worker_redis_continuity_check" in query
+            and params["result"] == "error"
+        )
+    ]
+    assert error_finishes == [
+        {
+            "run_id": first_result.run_id,
+            "result": "error",
+            "reason_code": "continuity_finish_failed",
+            "redis_run_id": "redis-run",
+            "expected_count": 1,
+            "checked_count": 1,
+        }
+    ]
+
+    second_result = await control.check_worker_redis_continuity(
+        database,
+        _Redis(),
+        "vp-marker-readiness",
+    )
+
+    assert second_result.state == "ready"
+    assert second_result.reason_code == "ready"
+
+
+@pytest.mark.asyncio
+async def test_continuity_post_commit_ready_exception_does_not_overwrite_ready(
+) -> None:
+    expectation = _expectation()
+    database = _ReadyFinishDatabase(
+        ready_finish_behavior="raise_after_commit",
+        pages=[[_expectation_row(expectation)], []],
+    )
+
+    first_result = await control.check_worker_redis_continuity(
+        database,
+        _Redis(),
+        "vp-marker-readiness",
+    )
+
+    assert first_result.state == "error"
+    assert first_result.reason_code == "continuity_finish_failed"
+    assert "database detail must not escape" not in repr(first_result)
+    assert database.continuity_state == "ready"
+    error_finishes = [
+        params
+        for query, params in database.calls
+        if (
+            "vp_finish_worker_redis_continuity_check" in query
+            and params["result"] == "error"
+        )
+    ]
+    assert error_finishes == [
+        {
+            "run_id": first_result.run_id,
+            "result": "error",
+            "reason_code": "continuity_finish_failed",
+            "redis_run_id": "redis-run",
+            "expected_count": 1,
+            "checked_count": 1,
+        }
+    ]
+
+    second_result = await control.check_worker_redis_continuity(
+        database,
+        _Redis(),
+        "vp-marker-readiness",
+    )
+
+    assert second_result.state == "ready"
+    assert second_result.reason_code == "ready"
 
 
 @pytest.mark.asyncio
