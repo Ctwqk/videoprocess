@@ -171,7 +171,7 @@ func runWorker(
 		return err
 	}
 
-	options, err := redis.ParseURL(cfg.RedisURL)
+	options, err := worker.ParseWorkerRedisOptions(cfg.RedisURL)
 	if err != nil {
 		return errors.New("worker Redis configuration is invalid")
 	}

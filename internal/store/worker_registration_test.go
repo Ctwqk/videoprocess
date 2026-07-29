@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -334,7 +335,7 @@ func TestRegistrationPostgres16ContinuityGateUsesDatabaseClock(t *testing.T) {
 	}
 }
 
-func TestRegistrationPostgres16CloseContextIsBoundedWithHeldConnection(
+func TestRegistrationPostgres16CloseContextOwnsHeldConnectionLifecycle(
 	t *testing.T,
 ) {
 	fixture := newWorkerPostgresFixture(t)
@@ -347,17 +348,52 @@ func TestRegistrationPostgres16CloseContextIsBoundedWithHeldConnection(
 		75*time.Millisecond,
 	)
 	defer cancelClose()
+	goroutinesBefore := runtime.NumGoroutine()
 	started := time.Now()
 	err = fixture.worker.CloseContext(closeContext)
+	elapsed := time.Since(started)
+	pingContext, cancelPing := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	pingErr := fixture.worker.Ping(pingContext)
+	cancelPing()
+	stack := make([]byte, 1<<20)
+	stack = stack[:runtime.Stack(stack, true)]
+	goroutinesAfter := runtime.NumGoroutine()
+	connection.Release()
+	finalCloseContext, cancelFinalClose := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	defer cancelFinalClose()
+	finalCloseErr := fixture.worker.CloseContext(finalCloseContext)
+
 	if !errors.Is(err, context.DeadlineExceeded) {
-		connection.Release()
-		t.Fatalf("CloseContext error = %v; want deadline exceeded", err)
+		t.Fatalf("CloseContext error = %v; want stable deadline exceeded", err)
 	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		connection.Release()
+	if elapsed > 500*time.Millisecond {
 		t.Fatalf("CloseContext returned after %s; want bounded close", elapsed)
 	}
-	connection.Release()
+	if pingErr != nil {
+		t.Fatalf("pool was closed by timed-out CloseContext: %v", pingErr)
+	}
+	if strings.Contains(
+		string(stack),
+		"github.com/jackc/pgx/v5/pgxpool.(*Pool).Close",
+	) {
+		t.Fatal("timed-out CloseContext left an unowned pgxpool.Close goroutine")
+	}
+	if goroutinesAfter > goroutinesBefore {
+		t.Fatalf(
+			"goroutines before/after timed-out close = %d/%d; want no growth",
+			goroutinesBefore,
+			goroutinesAfter,
+		)
+	}
+	if finalCloseErr != nil {
+		t.Fatalf("CloseContext after release: %v", finalCloseErr)
+	}
 }
 
 func newWorkerPostgresFixture(t *testing.T) *workerPostgresFixture {

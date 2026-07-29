@@ -305,37 +305,24 @@ func (h MediaTaskHandler) storageOperationTimeout() time.Duration {
 	return 10 * time.Second
 }
 
-type workerOutputInfoResult struct {
-	info os.FileInfo
-	err  error
-}
-
 func regularWorkerOutputInfo(
 	ctx context.Context,
 	outputLocalPath string,
 ) (os.FileInfo, error) {
-	result := make(chan workerOutputInfoResult, 1)
-	go func() {
-		info, err := os.Lstat(outputLocalPath)
-		result <- workerOutputInfoResult{info: info, err: err}
-	}()
-	select {
-	case completed := <-result:
-		if completed.err != nil {
-			return nil, completed.err
-		}
-		if !completed.info.Mode().IsRegular() {
-			return nil, errors.New("worker output is not a regular file")
-		}
-		return completed.info, nil
-	case <-ctx.Done():
+	if ctx.Err() != nil {
 		return nil, context.Cause(ctx)
 	}
-}
-
-type workerOutputOpenResult struct {
-	file *os.File
-	err  error
+	info, err := os.Lstat(outputLocalPath)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("worker output is not a regular file")
+	}
+	if ctx.Err() != nil {
+		return nil, context.Cause(ctx)
+	}
+	return info, nil
 }
 
 func openWorkerOutputStream(
@@ -343,38 +330,28 @@ func openWorkerOutputStream(
 	outputLocalPath string,
 	expectedSize int64,
 ) (*os.File, error) {
-	result := make(chan workerOutputOpenResult, 1)
-	go func() {
-		file, err := os.OpenFile(outputLocalPath, os.O_RDONLY, 0)
-		if err == nil {
-			info, statErr := file.Stat()
-			switch {
-			case statErr != nil:
-				err = statErr
-			case !info.Mode().IsRegular():
-				err = errors.New("worker output is not a regular file")
-			case info.Size() != expectedSize:
-				err = errors.New("worker output changed before upload")
-			}
-			if err != nil {
-				_ = file.Close()
-				file = nil
-			}
-		}
-		result <- workerOutputOpenResult{file: file, err: err}
-	}()
-	select {
-	case completed := <-result:
-		return completed.file, completed.err
-	case <-ctx.Done():
-		go func() {
-			completed := <-result
-			if completed.file != nil {
-				_ = completed.file.Close()
-			}
-		}()
+	if ctx.Err() != nil {
 		return nil, context.Cause(ctx)
 	}
+	file, err := os.OpenFile(outputLocalPath, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	switch {
+	case err != nil:
+	case !info.Mode().IsRegular():
+		err = errors.New("worker output is not a regular file")
+	case info.Size() != expectedSize:
+		err = errors.New("worker output changed before upload")
+	case ctx.Err() != nil:
+		err = context.Cause(ctx)
+	}
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
 }
 
 func saveWorkerOutputStream(
@@ -384,22 +361,22 @@ func saveWorkerOutputStream(
 	source *os.File,
 	outputSize int64,
 ) error {
-	result := make(chan error, 1)
-	go func() {
-		result <- saver.SaveStream(
-			ctx,
-			outputStoragePath,
-			source,
-			outputSize,
-		)
-	}()
-	select {
-	case err := <-result:
-		return err
-	case <-ctx.Done():
-		_ = source.Close()
+	if ctx.Err() != nil {
 		return context.Cause(ctx)
 	}
+	err := saver.SaveStream(
+		ctx,
+		outputStoragePath,
+		source,
+		outputSize,
+	)
+	if err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	return nil
 }
 
 func workerClaimGeneration(claim store.WorkerNodeClaim) string {

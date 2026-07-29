@@ -38,16 +38,19 @@ func (s *Store) CloseContext(ctx context.Context) error {
 	if s == nil || s.Pool == nil {
 		return nil
 	}
-	done := make(chan struct{})
-	go func() {
-		s.Pool.Close()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return context.Cause(ctx)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.Pool.Stat().AcquiredConns() == 0 {
+			s.Pool.Close()
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			s.Pool.Reset()
+			return context.Cause(ctx)
+		case <-ticker.C:
+		}
 	}
 }
 

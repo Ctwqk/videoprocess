@@ -18,6 +18,8 @@ import (
 
 var ErrConfirmedCancellation = errors.New("confirmed cancellation")
 
+const registeredAffinityWait = 20 * time.Second
+
 // Handler executes a single node's media transform. Each implementation is
 // responsible for resolving input/output paths via the Storage backend and
 // returning either nil on success or an error. Returning a wrapped
@@ -347,7 +349,7 @@ func (c *Consumer) shouldDeferRegisteredForAffinity(
 			return false
 		}
 	}
-	return c.affinityWindowActive(task, now)
+	return registeredAffinityWindowActive(task, now)
 }
 
 func (c *Consumer) ReclaimPreferredPending(ctx context.Context) (int, error) {
@@ -368,99 +370,123 @@ func (c *Consumer) claimPreferredPending(
 		return nil, nil
 	}
 	const minimumIdle = 500 * time.Millisecond
-	pending, err := c.registeredPendingEntries(ctx)
-	if err != nil {
-		return nil, err
-	}
 	claimed := make([]redis.XMessage, 0)
 	now := time.Now().UTC()
-	for _, entry := range pending {
-		if entry.ID == "" || entry.Idle < minimumIdle {
-			continue
-		}
-		exact, err := c.Redis.XRangeN(
-			ctx,
-			c.taskStream(),
-			entry.ID,
-			entry.ID,
-			1,
-		).Result()
-		if err != nil {
-			return nil, err
-		}
-		if len(exact) != 1 || exact[0].ID != entry.ID {
-			continue
-		}
-		task, err := decodeTask(exact[0].Values)
-		if err != nil {
-			continue
-		}
-		if entry.Consumer == c.WorkerID {
-			if len(task.PreferredHosts) == 0 ||
-				c.registeredMessageIsProcessing(entry.ID) ||
-				c.affinityWindowActive(task, now) {
-				continue
+	err := c.visitRegisteredPendingEntries(
+		ctx,
+		func(entry redis.XPendingExt) error {
+			if entry.ID == "" || entry.Idle < minimumIdle {
+				return nil
 			}
-			claimed = append(claimed, exact[0])
-			continue
-		}
-		if !c.taskPrefersCurrentHost(task) ||
-			!c.affinityWindowActive(task, now) {
-			continue
-		}
-		messages, err := c.Redis.XClaim(
-			ctx,
-			&redis.XClaimArgs{
-				Stream:   c.taskStream(),
-				Group:    c.ConsumerGroup,
-				Consumer: c.WorkerID,
-				MinIdle:  minimumIdle,
-				Messages: []string{entry.ID},
-			},
-		).Result()
-		if err != nil && err != redis.Nil {
-			return nil, err
-		}
-		for _, message := range messages {
-			if message.ID == entry.ID {
-				claimed = append(claimed, message)
+			exact, err := c.Redis.XRangeN(
+				ctx,
+				c.taskStream(),
+				entry.ID,
+				entry.ID,
+				1,
+			).Result()
+			if err != nil {
+				return err
 			}
-		}
+			if len(exact) != 1 || exact[0].ID != entry.ID {
+				return nil
+			}
+			task, err := decodeTask(exact[0].Values)
+			if err != nil {
+				return nil
+			}
+			if entry.Consumer == c.WorkerID {
+				if len(task.PreferredHosts) == 0 ||
+					c.registeredMessageIsProcessing(entry.ID) ||
+					registeredAffinityWindowActive(task, now) {
+					return nil
+				}
+				claimed = append(claimed, exact[0])
+				return nil
+			}
+			if !c.taskPrefersCurrentHost(task) ||
+				!registeredAffinityWindowActive(task, now) {
+				return nil
+			}
+			messages, err := c.Redis.XClaim(
+				ctx,
+				&redis.XClaimArgs{
+					Stream:   c.taskStream(),
+					Group:    c.ConsumerGroup,
+					Consumer: c.WorkerID,
+					MinIdle:  minimumIdle,
+					Messages: []string{entry.ID},
+				},
+			).Result()
+			if err != nil && err != redis.Nil {
+				return err
+			}
+			for _, message := range messages {
+				if message.ID == entry.ID {
+					claimed = append(claimed, message)
+				}
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, err
 	}
 	return claimed, nil
 }
 
-func (c *Consumer) registeredPendingEntries(
+func (c *Consumer) visitRegisteredPendingEntries(
 	ctx context.Context,
-) ([]redis.XPendingExt, error) {
+	visit func(redis.XPendingExt) error,
+) error {
 	const pageSize = int64(50)
+	snapshot, err := c.Redis.XPending(
+		ctx,
+		c.taskStream(),
+		c.ConsumerGroup,
+	).Result()
+	if err != nil {
+		return err
+	}
+	if snapshot.Count == 0 || snapshot.Higher == "" {
+		return nil
+	}
 	start := "-"
-	pending := make([]redis.XPendingExt, 0, pageSize)
-	for {
+	remaining := snapshot.Count
+	for remaining > 0 {
+		count := min(pageSize, remaining)
 		page, err := c.Redis.XPendingExt(
 			ctx,
 			&redis.XPendingExtArgs{
 				Stream: c.taskStream(),
 				Group:  c.ConsumerGroup,
 				Start:  start,
-				End:    "+",
-				Count:  pageSize,
+				End:    snapshot.Higher,
+				Count:  count,
 			},
 		).Result()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		pending = append(pending, page...)
-		if len(page) < int(pageSize) {
-			return pending, nil
+		if len(page) == 0 {
+			return nil
+		}
+		for _, entry := range page {
+			if err := visit(entry); err != nil {
+				return err
+			}
 		}
 		lastID := page[len(page)-1].ID
+		remaining -= int64(len(page))
+		if lastID == snapshot.Higher || len(page) < int(count) {
+			return nil
+		}
 		nextStart := "(" + lastID
 		if lastID == "" || nextStart == start {
-			return nil, errors.New("registered pending pagination is invalid")
+			return errors.New("registered pending pagination is invalid")
 		}
 		start = nextStart
 	}
+	return nil
 }
 
 func (c *Consumer) taskPrefersCurrentHost(task TaskMessage) bool {
@@ -476,17 +502,13 @@ func (c *Consumer) taskPrefersCurrentHost(task TaskMessage) bool {
 	return false
 }
 
-func (c *Consumer) affinityWindowActive(
+func registeredAffinityWindowActive(
 	task TaskMessage,
 	now time.Time,
 ) bool {
 	enqueuedAt := parseAffinityTime(task.AffinityEnqueuedAt, now)
-	wait := c.cfg.AffinityWait
-	if wait <= 0 {
-		wait = 20 * time.Second
-	}
 	age := now.Sub(enqueuedAt)
-	return age < wait
+	return age < registeredAffinityWait
 }
 
 func registeredWorkerHost(workerID string) string {
@@ -720,11 +742,16 @@ func (c *Consumer) handleRegisteredMessage(
 			),
 			task.EventStream,
 		); err != nil {
+			c.publishRegistrationLoss(err)
 			c.log.Warn("registered task failure deferred", "msg_id", msg.ID)
 		}
 		return
 	}
 	result, handlerErr := handler.Execute(taskContext, task)
+	if errors.Is(context.Cause(taskContext), ErrRegistrationLost) {
+		c.publishRegistrationLoss(ErrRegistrationLost)
+		return
+	}
 	switch {
 	case handlerErr == nil &&
 		strings.TrimSpace(result.OutputArtifactID) != "":

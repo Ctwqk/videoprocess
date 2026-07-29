@@ -320,29 +320,6 @@ func rollbackWorkerTransaction(tx pgx.Tx) {
 	_ = tx.Rollback(ctx)
 }
 
-type workerCallbackResult[T any] struct {
-	value T
-	err   error
-}
-
-func runWorkerCallback[T any](
-	ctx context.Context,
-	callback func() (T, error),
-) (T, error) {
-	result := make(chan workerCallbackResult[T], 1)
-	go func() {
-		value, err := callback()
-		result <- workerCallbackResult[T]{value: value, err: err}
-	}()
-	select {
-	case completed := <-result:
-		return completed.value, completed.err
-	case <-ctx.Done():
-		var zero T
-		return zero, context.Cause(ctx)
-	}
-}
-
 func sanitizeWorkerRegistrationError(err error) error {
 	if err == nil {
 		return nil

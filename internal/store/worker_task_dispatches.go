@@ -233,14 +233,12 @@ func (s *Store) PublishPreparedWorkerEvent(
 		return empty, err
 	}
 	marker := "vp:worker-event-emission:" + emission.ID.String()
-	messageID, err := runWorkerCallback(ctx, func() (string, error) {
-		return publish(
-			ctx,
-			emission.RedisStream,
-			marker,
-			copyStringMap(emission.Values),
-		)
-	})
+	messageID, err := publish(
+		ctx,
+		emission.RedisStream,
+		marker,
+		copyStringMap(emission.Values),
+	)
 	if err != nil {
 		if ctx.Err() != nil {
 			return empty, context.Cause(ctx)
@@ -357,14 +355,12 @@ func (s *Store) AcknowledgeWorkerTask(
 	); err != nil {
 		return err
 	}
-	result, err := runWorkerCallback(ctx, func() (int64, error) {
-		return acknowledge(
-			ctx,
-			claim.Delivery.RedisStream,
-			claim.Delivery.ConsumerGroup,
-			claim.Delivery.MessageID,
-		)
-	})
+	result, err := acknowledge(
+		ctx,
+		claim.Delivery.RedisStream,
+		claim.Delivery.ConsumerGroup,
+		claim.Delivery.MessageID,
+	)
 	if err != nil {
 		if ctx.Err() != nil {
 			return context.Cause(ctx)
@@ -410,14 +406,12 @@ func (s *Store) AcknowledgeWorkerTaskFromReceipt(
 	if err := requireWorkerTaskAckReceipt(ctx, tx, claim); err != nil {
 		return err
 	}
-	result, err := runWorkerCallback(ctx, func() (int64, error) {
-		return acknowledge(
-			ctx,
-			claim.Delivery.RedisStream,
-			claim.Delivery.ConsumerGroup,
-			claim.Delivery.MessageID,
-		)
-	})
+	result, err := acknowledge(
+		ctx,
+		claim.Delivery.RedisStream,
+		claim.Delivery.ConsumerGroup,
+		claim.Delivery.MessageID,
+	)
 	if err != nil {
 		if ctx.Err() != nil {
 			return context.Cause(ctx)

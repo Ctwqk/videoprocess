@@ -4,11 +4,11 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sys/unix"
 )
 
@@ -112,7 +112,14 @@ func isExactMode0400(mode os.FileMode) bool {
 }
 
 func LoadWorkerSecrets(env map[string]string) (SecretConfig, error) {
-	allowEnvironmentFallback, err := workerAllowsEnvironmentSecretFallback(env)
+	redisOptions, err := ParseWorkerRedisOptions(env["REDIS_URL"])
+	if err != nil {
+		return SecretConfig{}, err
+	}
+	allowEnvironmentFallback, err := workerAllowsEnvironmentSecretFallback(
+		env,
+		redisOptions,
+	)
 	if err != nil {
 		return SecretConfig{}, err
 	}
@@ -185,8 +192,28 @@ func LoadWorkerSecrets(env map[string]string) (SecretConfig, error) {
 	}, nil
 }
 
+func ParseWorkerRedisOptions(rawRedisURL string) (*redis.Options, error) {
+	rawRedisURL = strings.TrimSpace(rawRedisURL)
+	if rawRedisURL == "" {
+		rawRedisURL = "redis://localhost:6379/0"
+	}
+	options, err := redis.ParseURL(rawRedisURL)
+	if err != nil ||
+		options.Network != "tcp" ||
+		options.DialTimeout < 0 ||
+		options.ReadTimeout < 0 ||
+		options.WriteTimeout < 0 ||
+		options.PoolTimeout < 0 {
+		return nil, &WorkerSecretError{
+			message: "worker Redis configuration is invalid",
+		}
+	}
+	return options, nil
+}
+
 func workerAllowsEnvironmentSecretFallback(
 	env map[string]string,
+	redisOptions *redis.Options,
 ) (bool, error) {
 	deployMode := strings.ToLower(strings.TrimSpace(env["DEPLOY_MODE"]))
 	if deployMode == "" {
@@ -201,21 +228,13 @@ func workerAllowsEnvironmentSecretFallback(
 			message: "worker deploy mode is invalid",
 		}
 	}
-	rawRedisURL := strings.TrimSpace(env["REDIS_URL"])
-	if rawRedisURL == "" {
-		rawRedisURL = "redis://localhost:6379/0"
-	}
-	parsed, err := url.Parse(rawRedisURL)
-	if err != nil ||
-		parsed.Opaque != "" ||
-		parsed.Host == "" ||
-		parsed.Fragment != "" ||
-		parsed.Scheme != "redis" && parsed.Scheme != "rediss" {
+	host, _, err := net.SplitHostPort(redisOptions.Addr)
+	if err != nil {
 		return false, &WorkerSecretError{
 			message: "worker Redis configuration is invalid",
 		}
 	}
-	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	if host == "" ||
 		host == "localhost" ||
 		host == "0.0.0.0" ||

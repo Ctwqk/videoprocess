@@ -201,6 +201,41 @@ func TestRegistrationExplicitDevelopmentAndTestModesAllowLocalFallback(
 	}
 }
 
+func TestRegistrationRedisValidationUsesStartupParserSemantics(t *testing.T) {
+	for _, redisURL := range []string{
+		"redis://worker:synthetic@127.0.0.1:6379/not-a-db",
+		"redis://worker:synthetic@127.0.0.1:6379/14?unknown_option=1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?dial_timeout=0",
+		"redis://worker:synthetic@127.0.0.1:6379/14?read_timeout=0",
+		"redis://worker:synthetic@127.0.0.1:6379/14?write_timeout=0",
+		"redis://worker:synthetic@127.0.0.1:6379/14?pool_timeout=0",
+	} {
+		t.Run(redisURL, func(t *testing.T) {
+			_, err := LoadWorkerSecrets(map[string]string{
+				"DEPLOY_MODE":            "development",
+				"REDIS_URL":              redisURL,
+				"DATABASE_URL":           "postgresql://dev:synthetic@127.0.0.1/videoprocess",
+				"WORKER_ADMISSION_TOKEN": "synthetic-admission",
+			})
+			if err == nil {
+				t.Fatal("go-redis-invalid endpoint accepted environment credentials")
+			}
+			for _, credential := range []string{
+				"synthetic-admission",
+				"postgresql://dev:synthetic",
+			} {
+				if strings.Contains(err.Error(), credential) {
+					t.Fatalf(
+						"Redis validation exposed credential %q: %v",
+						credential,
+						err,
+					)
+				}
+			}
+		})
+	}
+}
+
 func writeWorkerSecret(t *testing.T, name string, value string, mode os.FileMode) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), name)

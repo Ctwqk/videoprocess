@@ -62,9 +62,7 @@ func (s *Store) PersistWorkerArtifact(
 	if err := requireWorkerNodeClaimTx(ctx, tx, claim); err != nil {
 		return "", err
 	}
-	_, err = runWorkerCallback(ctx, func() (struct{}, error) {
-		return struct{}{}, save(ctx)
-	})
+	err = save(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", context.Cause(ctx)

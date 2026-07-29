@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -358,6 +359,18 @@ func TestWorkerStartupRejectsUnsafeEnvironmentFallbackBeforeDatabaseOpen(
 			deployMode: nil,
 			redisURL:   "redis://127.0.0.1:6379/14",
 		},
+		{
+			name:       "development mode with nonnumeric database path",
+			deployMode: stringPointer("development"),
+			redisURL: "redis://worker:synthetic@127.0.0.1:6379/" +
+				"not-a-db",
+		},
+		{
+			name:       "test mode with unknown Redis query option",
+			deployMode: stringPointer("test"),
+			redisURL: "redis://worker:synthetic@127.0.0.1:6379/14" +
+				"?unknown_option=1",
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			env := workerStartupTestEnv()
@@ -401,6 +414,55 @@ func TestWorkerStartupRejectsUnsafeEnvironmentFallbackBeforeDatabaseOpen(
 				}
 			}
 		})
+	}
+}
+
+func TestWorkerStartupRejectsMalformedProductionRedisBeforeDatabaseOpen(
+	t *testing.T,
+) {
+	databasePath := writeStartupSecret(
+		t,
+		"database-url",
+		"postgresql://runtime:synthetic@vp-postgres/videoprocess",
+	)
+	tokenPath := writeStartupSecret(
+		t,
+		"admission-token",
+		"synthetic-admission",
+	)
+	env := workerStartupTestEnv()
+	env["REDIS_URL"] = "redis://[::1"
+	env["WORKER_DATABASE_URL_FILE"] = databasePath
+	env["WORKER_ADMISSION_TOKEN_FILE"] = tokenPath
+	databaseOpens := 0
+	err := runWorker(
+		context.Background(),
+		env,
+		startupDependencies{
+			openDatabase: func(
+				context.Context,
+				string,
+			) (startupDatabase, error) {
+				databaseOpens++
+				return nil, errors.New("database open must not run")
+			},
+		},
+	)
+	if err == nil {
+		t.Fatal("malformed production Redis endpoint was accepted")
+	}
+	if databaseOpens != 0 {
+		t.Fatalf("database opens = %d; want 0", databaseOpens)
+	}
+	for _, credential := range []string{
+		"synthetic-admission",
+		"postgresql://runtime:synthetic",
+		databasePath,
+		tokenPath,
+	} {
+		if strings.Contains(err.Error(), credential) {
+			t.Fatalf("startup error exposed credential %q: %v", credential, err)
+		}
 	}
 }
 
@@ -508,4 +570,16 @@ func containsStartupCall(calls []string, want string) bool {
 
 func stringPointer(value string) *string {
 	return &value
+}
+
+func writeStartupSecret(t *testing.T, name string, value string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(value), 0o400); err != nil {
+		t.Fatalf("write startup secret: %v", err)
+	}
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatalf("chmod startup secret: %v", err)
+	}
+	return path
 }

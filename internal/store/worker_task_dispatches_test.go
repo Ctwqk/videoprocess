@@ -804,7 +804,7 @@ func TestRegistrationPostgres16ArtifactSaveAndPointerHoldSharedFence(
 	}
 }
 
-func TestRegistrationPostgres16CancelledCallbacksReleaseSharedFence(
+func TestRegistrationPostgres16ProtectedCallbacksKeepFenceUntilCompletion(
 	t *testing.T,
 ) {
 	for _, operation := range []string{
@@ -862,6 +862,7 @@ func TestRegistrationPostgres16CancelledCallbacksReleaseSharedFence(
 			}
 
 			callbackStarted := make(chan struct{})
+			sideEffectDone := make(chan struct{})
 			releaseCallback := make(chan struct{})
 			var releaseOnce sync.Once
 			release := func() {
@@ -883,14 +884,22 @@ func TestRegistrationPostgres16CancelledCallbacksReleaseSharedFence(
 							task.lease,
 							emissionID,
 							func(
-								context.Context,
-								string,
-								string,
-								map[string]string,
+								_ context.Context,
+								stream string,
+								_ string,
+								values map[string]string,
 							) (string, error) {
 								close(callbackStarted)
 								<-releaseCallback
-								return "1-0", nil
+								messageID, publishErr := redisClient.XAdd(
+									context.Background(),
+									&redis.XAddArgs{
+										Stream: stream,
+										Values: stringMapToAny(values),
+									},
+								).Result()
+								close(sideEffectDone)
+								return messageID, publishErr
 							},
 						)
 					operationDone <- operationErr
@@ -900,17 +909,25 @@ func TestRegistrationPostgres16CancelledCallbacksReleaseSharedFence(
 							operationContext,
 							claim,
 							func(
-								context.Context,
-								string,
-								string,
-								string,
+								_ context.Context,
+								stream string,
+								group string,
+								messageID string,
 							) (int64, error) {
 								close(callbackStarted)
 								<-releaseCallback
-								return 1, nil
+								result, acknowledgeErr := redisClient.XAck(
+									context.Background(),
+									stream,
+									group,
+									messageID,
+								).Result()
+								close(sideEffectDone)
+								return result, acknowledgeErr
 							},
 						)
 				case "artifact save":
+					sideEffectPath := t.TempDir() + "/late-object"
 					_, operationErr := pgFixture.worker.
 						PersistWorkerArtifact(
 							operationContext,
@@ -930,7 +947,13 @@ func TestRegistrationPostgres16CancelledCallbacksReleaseSharedFence(
 							func(context.Context) error {
 								close(callbackStarted)
 								<-releaseCallback
-								return nil
+								saveErr := os.WriteFile(
+									sideEffectPath,
+									[]byte("saved"),
+									0o600,
+								)
+								close(sideEffectDone)
+								return saveErr
 							},
 						)
 					operationDone <- operationErr
@@ -942,40 +965,35 @@ func TestRegistrationPostgres16CancelledCallbacksReleaseSharedFence(
 
 			select {
 			case operationErr := <-operationDone:
-				if operationErr == nil {
-					release()
-					t.Fatalf("%s succeeded after callback deadline", operation)
-				}
-			case <-time.After(time.Second):
-				release()
-				select {
-				case <-operationDone:
-				case <-time.After(5 * time.Second):
-				}
-				select {
-				case <-takeoverDone:
-				case <-time.After(5 * time.Second):
-				}
-				t.Fatalf("%s ignored callback deadline", operation)
-			}
-			select {
-			case takeoverErr := <-takeoverDone:
-				if takeoverErr != nil {
-					release()
-					t.Fatalf(
-						"%s takeover after rollback: %v",
-						operation,
-						takeoverErr,
-					)
-				}
-			case <-time.After(time.Second):
 				release()
 				t.Fatalf(
-					"%s shared fence remained held after bounded return",
+					"%s returned before protected callback ended: %v",
 					operation,
+					operationErr,
 				)
+			case takeoverErr := <-takeoverDone:
+				release()
+				t.Fatalf(
+					"%s takeover completed before callback ended: %v",
+					operation,
+					takeoverErr,
+				)
+			case <-time.After(250 * time.Millisecond):
 			}
 			release()
+			waitForTestSignal(t, sideEffectDone, operation+" side effect")
+			select {
+			case operationErr := <-operationDone:
+				if operationErr == nil {
+					t.Fatalf(
+						"%s committed after operation deadline",
+						operation,
+					)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s did not return after callback completion", operation)
+			}
+			waitForTestResult(t, takeoverDone, operation+" takeover")
 		})
 	}
 }
