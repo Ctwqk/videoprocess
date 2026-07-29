@@ -7259,6 +7259,7 @@ DECLARE
     v_cleanup
         public.worker_redis_marker_cleanup_authorizations%ROWTYPE;
     v_authorization public.worker_redis_marker_repair_audits%ROWTYPE;
+    v_restore_authorized boolean := false;
     v_now timestamptz;
 BEGIN
     IF p_run_id IS NULL
@@ -7402,21 +7403,17 @@ BEGIN
           AND audit.result_code = 'authorized'
           AND audit.created_at
                 > v_now - interval '300 seconds'
+          AND NOT EXISTS (
+                SELECT 1
+                FROM public.worker_redis_marker_repair_audits AS completed
+                WHERE completed.source_id = p_source_id
+                  AND completed.action = 'restore_marker'
+                  AND completed.result_code = 'restored'
+                  AND completed.created_at >= audit.created_at
+          )
         ORDER BY audit.created_at DESC, audit.id DESC
         LIMIT 1;
-        IF NOT FOUND OR EXISTS (
-            SELECT 1
-            FROM public.worker_redis_marker_repair_audits AS completed
-            WHERE completed.source_id = p_source_id
-              AND completed.action = 'restore_marker'
-              AND completed.result_code = 'restored'
-              AND completed.created_at >= v_authorization.created_at
-        )
-        THEN
-            RAISE EXCEPTION USING
-                MESSAGE = 'marker_observation_not_authorized',
-                ERRCODE = 'P0001';
-        END IF;
+        v_restore_authorized := FOUND;
     END IF;
     IF v_expectation.observed_message_id IS NULL THEN
         UPDATE public.worker_redis_continuity_expectations
@@ -7436,7 +7433,7 @@ BEGIN
             MESSAGE = 'marker_observation_mismatch',
             ERRCODE = 'P0001';
     END IF;
-    IF v_expectation.expected_message_id IS NOT NULL THEN
+    IF v_restore_authorized THEN
         INSERT INTO public.worker_redis_marker_repair_audits (
             source_id,
             action,

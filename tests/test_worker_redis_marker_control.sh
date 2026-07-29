@@ -555,6 +555,38 @@ wait "$LOCK_HOLDER_PID" 2>/dev/null || true
 grep -Fq 'docker|service|create' "$DOCKER_CALLS" \
   || fail "launcher did not proceed after kernel lock holder crash"
 
+cat >"$FAKE_BIN/flock" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$FAKE_FLOCK_CALLS"
+exit "${FAKE_FLOCK_STATUS:?}"
+EOF
+chmod +x "$FAKE_BIN/flock"
+FAKE_FLOCK_CALLS="$TEST_ROOT/flock-calls"
+export FAKE_FLOCK_CALLS
+: >"$FAKE_FLOCK_CALLS"
+: >"$DOCKER_CALLS"
+fake_contention_output="$(
+  FAKE_FLOCK_STATUS=75 "$LAUNCHER" readiness
+)"
+[[ "$fake_contention_output" == "mode=readiness code=lock_busy" ]] \
+  || fail "native flock contention was not a clean skip"
+[[ ! -s "$DOCKER_CALLS" ]] \
+  || fail "native flock contention reached Docker"
+
+: >"$DOCKER_CALLS"
+if FAKE_FLOCK_STATUS=69 "$LAUNCHER" readiness \
+  >"$TEST_ROOT/flock-operational-error.out" 2>&1; then
+  fail "native flock operational failure was accepted as contention"
+fi
+grep -Fxq \
+  'mode=readiness code=lock_unavailable' \
+  "$TEST_ROOT/flock-operational-error.out" \
+  || fail "native flock operational failure lacked a stable reason code"
+[[ ! -s "$DOCKER_CALLS" ]] \
+  || fail "native flock operational failure reached Docker"
+rm -f "$FAKE_BIN/flock"
+
 : >"$DOCKER_CALLS"
 rm -f "$STATE_DIR/readiness.status" "$STATE_DIR/janitor.status"
 VP_WORKER_REDIS_MARKER_DRY_RUN=1 "$LAUNCHER" readiness \

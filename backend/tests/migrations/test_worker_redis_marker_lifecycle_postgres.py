@@ -136,8 +136,17 @@ async def _seed_authority(
     receipt_id = uuid.uuid4()
     task_message_id = f"1710000000000-{int(identity[:4], 16)}"
     event_message_id = f"1710000000001-{int(identity[4:8], 16)}"
-    task_hash = _sha256(f"task-{identity}")
-    event_hash = _sha256(f"event-{identity}")
+    task_payload = {"dispatch_key": str(dispatch_key)}
+    event_payload = {
+        "event": "node_completed",
+        "job_id": str(job_id),
+    }
+    task_hash = _sha256(
+        json.dumps(task_payload, sort_keys=True, separators=(",", ":"))
+    )
+    event_hash = _sha256(
+        json.dumps(event_payload, sort_keys=True, separators=(",", ":"))
+    )
     worker_started_at = datetime(
         2026,
         7,
@@ -251,7 +260,7 @@ async def _seed_authority(
         job_id,
         node_id,
         task_hash,
-        json.dumps({"dispatch_key": str(dispatch_key)}),
+        json.dumps(task_payload),
         task_message_id,
         "acknowledged" if source_acknowledged else "unresolved",
     )
@@ -305,7 +314,7 @@ async def _seed_authority(
         emission_state,
         event_message_id,
         event_hash,
-        json.dumps({"event": "node_completed", "job_id": str(job_id)}),
+        json.dumps(event_payload),
         job_id,
         node_id,
         registration_id,
@@ -336,7 +345,7 @@ async def _seed_authority(
             attestation_id,
             event_message_id,
             event_hash,
-            json.dumps({"event": "node_completed", "job_id": str(job_id)}),
+            json.dumps(event_payload),
             job_id,
             node_id,
             registration_id,
@@ -389,10 +398,12 @@ async def _seed_authority(
         "dispatch_stream": "vp:tasks:vision",
         "dispatch_message_id": task_message_id,
         "dispatch_hash": task_hash,
+        "dispatch_payload": task_payload,
         "emission_id": emission_id,
         "emission_stream": "vp:events",
         "emission_message_id": event_message_id,
         "emission_hash": event_hash,
+        "emission_payload": event_payload,
     }
 
 

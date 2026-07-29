@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 
+import asyncpg
 import pytest
 import redis.asyncio as aioredis
 from redis.exceptions import NoPermissionError
@@ -23,6 +24,9 @@ from app.services import worker_redis_marker_control as control
 from tests.migrations.test_worker_redis_marker_lifecycle_postgres import (
     POSTGRES_URL as MARKER_POSTGRES_URL,
 )
+from tests.migrations.test_worker_redis_marker_lifecycle_postgres import (
+    _seed_authority,
+)
 
 
 pytest_plugins = (
@@ -32,6 +36,21 @@ pytest_plugins = (
 
 REDIS_URL = os.environ.get("WORKER_REDIS_MARKER_TEST_URL", "")
 CONTAINER = "videoprocess-marker-redis74"
+REVIEWED_TASK_STREAMS = (
+    "vp:tasks:ffmpeg",
+    "vp:tasks:ffmpeg_go",
+    "vp:tasks:vision",
+    "vp:tasks:youtube_publisher",
+)
+MARKER_KEY_SELECTORS = (
+    "~vp:worker-event-emission:*",
+    "~vp:worker-task-dispatch:*",
+)
+READINESS_REPAIR_KEY_SELECTORS = (
+    *MARKER_KEY_SELECTORS,
+    "~vp:events",
+    *(f"~{stream}" for stream in REVIEWED_TASK_STREAMS),
+)
 
 
 def _payload_hash(fields: dict[str, str]) -> str:
@@ -372,6 +391,7 @@ async def test_real_postgres_and_redis_concurrent_janitor_is_restart_safe(
         redis_user,
         redis_password,
         ["+select", "+eval", "+get", "+del"],
+        key_selectors=MARKER_KEY_SELECTORS,
     )
     janitor_redis = aioredis.from_url(
         _acl_url(redis_user, redis_password),
@@ -490,6 +510,178 @@ async def test_real_postgres_and_redis_concurrent_janitor_is_restart_safe(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not REDIS_URL or not MARKER_POSTGRES_URL,
+    reason=(
+        "set WORKER_REDIS_MARKER_TEST_URL and "
+        "CHANNEL_OPS_POSTGRES_TEST_URL for combined integration tests"
+    ),
+)
+async def test_real_postgres_and_redis_active_markers_complete_readiness(
+    marker_database,
+    redis_client: aioredis.Redis,
+) -> None:
+    admin = marker_database["admin"]
+    credential_urls = marker_database["credential_urls"]
+    generation_roles = marker_database["generation_roles"]
+    assert isinstance(credential_urls, dict)
+    assert isinstance(generation_roles, dict)
+    authority = await _seed_authority(admin, resolved=False)
+
+    await redis_client.xadd(
+        authority["emission_stream"],
+        authority["emission_payload"],
+        id=authority["emission_message_id"],
+    )
+    await redis_client.xadd(
+        authority["dispatch_stream"],
+        authority["dispatch_payload"],
+        id=authority["dispatch_message_id"],
+    )
+    await redis_client.set(
+        f"vp:worker-event-emission:{authority['emission_id']}",
+        authority["emission_message_id"],
+    )
+    await redis_client.set(
+        f"vp:worker-task-dispatch:{authority['dispatch_key']}",
+        authority["dispatch_message_id"],
+    )
+
+    engine = create_async_engine(
+        str(credential_urls["readiness"]),
+        pool_pre_ping=True,
+    )
+    session_factory = async_sessionmaker(
+        engine,
+        expire_on_commit=False,
+    )
+    readiness = session_factory()
+    repair = await asyncpg.connect(
+        str(credential_urls["repair"]).replace(
+            "postgresql+asyncpg://",
+            "postgresql://",
+            1,
+        )
+    )
+    try:
+        ordinary = await control.check_worker_redis_continuity(
+            readiness,
+            redis_client,
+            "default",
+        )
+        assert (ordinary.state, ordinary.reason_code) == ("ready", "ready")
+        assert ordinary.expected_count == 2
+        assert ordinary.checked_count == 2
+
+        status = await admin.fetchrow(
+            """
+            SELECT run_id, state, reason_code, expected_count, checked_count
+            FROM public.worker_redis_continuity_status
+            WHERE singleton
+            """
+        )
+        assert dict(status) == {
+            "run_id": ordinary.run_id,
+            "state": "ready",
+            "reason_code": "ready",
+            "expected_count": 2,
+            "checked_count": 2,
+        }
+        observations = await admin.fetch(
+            """
+            SELECT marker_kind, source_id, observed_message_id,
+                   observed_payload_sha256, observed_by,
+                   observed_at IS NOT NULL AS was_observed
+            FROM public.worker_redis_continuity_expectations
+            WHERE run_id = $1
+            ORDER BY marker_kind
+            """,
+            ordinary.run_id,
+        )
+        assert [dict(row) for row in observations] == [
+            {
+                "marker_kind": "event_emission",
+                "source_id": authority["emission_id"],
+                "observed_message_id": authority["emission_message_id"],
+                "observed_payload_sha256": authority["emission_hash"],
+                "observed_by": generation_roles["readiness"],
+                "was_observed": True,
+            },
+            {
+                "marker_kind": "task_dispatch",
+                "source_id": authority["dispatch_id"],
+                "observed_message_id": authority["dispatch_message_id"],
+                "observed_payload_sha256": authority["dispatch_hash"],
+                "observed_by": generation_roles["readiness"],
+                "was_observed": True,
+            },
+        ]
+        assert await admin.fetchval(
+            """
+            SELECT count(*)
+            FROM public.worker_redis_marker_repair_audits
+            WHERE source_id = ANY($1::uuid[])
+              AND result_code = 'restored'
+            """,
+            [authority["emission_id"], authority["dispatch_id"]],
+        ) == 0
+
+        await repair.fetchrow(
+            """
+            SELECT *
+            FROM public.vp_load_worker_redis_marker_repair(
+                'authorize_restore_marker', $1
+            )
+            """,
+            authority["emission_id"],
+        )
+        assert await admin.fetchval(
+            """
+            SELECT count(*)
+            FROM public.worker_redis_marker_repair_audits
+            WHERE source_id = $1
+              AND action = 'restore_marker'
+              AND result_code = 'restored'
+            """,
+            authority["emission_id"],
+        ) == 0
+
+        repaired = await control.check_worker_redis_continuity(
+            readiness,
+            redis_client,
+            "default",
+        )
+        assert repaired.state == "ready"
+        assert repaired.expected_count == 2
+        assert repaired.checked_count == 2
+        audits = await admin.fetch(
+            """
+            SELECT action, result_code, principal
+            FROM public.worker_redis_marker_repair_audits
+            WHERE source_id = $1
+            ORDER BY created_at, id
+            """,
+            authority["emission_id"],
+        )
+        assert [dict(row) for row in audits] == [
+            {
+                "action": "restore_marker",
+                "result_code": "authorized",
+                "principal": generation_roles["repair"],
+            },
+            {
+                "action": "restore_marker",
+                "result_code": "restored",
+                "principal": generation_roles["repair"],
+            },
+        ]
+    finally:
+        await repair.close()
+        await readiness.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_aof_restart_preserves_marker_and_missing_marker_fails() -> None:
     if not REDIS_URL:
         pytest.skip("set WORKER_REDIS_MARKER_TEST_URL for Redis integration tests")
@@ -524,7 +716,14 @@ async def test_aof_restart_preserves_marker_and_missing_marker_fails() -> None:
             pass
 
 
-async def _set_acl_user(client: aioredis.Redis, name: str, password: str, commands: list[str]) -> None:
+async def _set_acl_user(
+    client: aioredis.Redis,
+    name: str,
+    password: str,
+    commands: list[str],
+    *,
+    key_selectors: tuple[str, ...],
+) -> None:
     await client.execute_command(
         "ACL",
         "SETUSER",
@@ -532,9 +731,7 @@ async def _set_acl_user(client: aioredis.Redis, name: str, password: str, comman
         "reset",
         "on",
         f">{password}",
-        "~vp:worker-event-emission:*",
-        "~vp:worker-task-dispatch:*",
-        "~vp:events",
+        *key_selectors,
         "-@all",
         *commands,
     )
@@ -560,6 +757,7 @@ async def test_restore_service_uses_real_redis_proof_and_set_nx(
         user,
         password,
         ["+select", "+eval", "+get", "+set", "+xrange"],
+        key_selectors=READINESS_REPAIR_KEY_SELECTORS,
     )
     repair_redis = aioredis.from_url(
         _acl_url(user, password),
@@ -646,6 +844,7 @@ async def test_promote_service_uses_real_redis_exact_xrange_and_hash(
         user,
         password,
         ["+select", "+eval", "+get", "+set", "+xrange"],
+        key_selectors=READINESS_REPAIR_KEY_SELECTORS,
     )
     repair_redis = aioredis.from_url(
         _acl_url(user, password),
@@ -732,13 +931,103 @@ async def test_promote_service_uses_real_redis_exact_xrange_and_hash(
 
 
 @pytest.mark.asyncio
+async def test_readiness_acl_allows_only_reviewed_task_streams(
+    redis_client: aioredis.Redis,
+) -> None:
+    suffix = uuid.uuid4().hex
+    user = f"vp-marker-test-readiness-{suffix}"
+    password = uuid.uuid4().hex
+    await _set_acl_user(
+        redis_client,
+        user,
+        password,
+        [
+            "+select",
+            "+ping",
+            "+acl|whoami",
+            "+info",
+            "+config|get",
+            "+get",
+            "+xrange",
+        ],
+        key_selectors=READINESS_REPAIR_KEY_SELECTORS,
+    )
+    readiness_redis = aioredis.from_url(
+        _acl_url(user, password),
+        decode_responses=True,
+    )
+    allowed_entries = {}
+    for index, stream in enumerate(REVIEWED_TASK_STREAMS):
+        payload = {"dispatch_key": f"reviewed-{index}"}
+        message_id = await redis_client.xadd(
+            stream,
+            payload,
+            id=f"1710000001000-{index}",
+        )
+        allowed_entries[stream] = (message_id, payload)
+    denied_entries = {}
+    for index, stream in enumerate(
+        ("vp:tasks:ffmpeg_shadow", "vp:tasks:planner")
+    ):
+        message_id = await redis_client.xadd(
+            stream,
+            {"dispatch_key": f"unreviewed-{index}"},
+            id=f"1710000002000-{index}",
+        )
+        denied_entries[stream] = message_id
+    try:
+        for stream, (message_id, payload) in allowed_entries.items():
+            assert await readiness_redis.xrange(
+                stream,
+                message_id,
+                message_id,
+            ) == [(message_id, payload)]
+        for stream, message_id in denied_entries.items():
+            with pytest.raises(NoPermissionError):
+                await readiness_redis.xrange(
+                    stream,
+                    message_id,
+                    message_id,
+                )
+    finally:
+        await readiness_redis.aclose()
+        await redis_client.execute_command("ACL", "DELUSER", user)
+
+
+@pytest.mark.asyncio
 async def test_marker_acl_users_deny_each_others_mutation_surfaces(redis_client: aioredis.Redis) -> None:
     suffix = uuid.uuid4().hex
     users = {purpose: f"vp-marker-test-{purpose}-{suffix}" for purpose in ("readiness", "janitor", "repair")}
     passwords = {purpose: uuid.uuid4().hex for purpose in users}
-    await _set_acl_user(redis_client, users["readiness"], passwords["readiness"], ["+select", "+ping", "+acl|whoami", "+info", "+config|get", "+get", "+xrange"])
-    await _set_acl_user(redis_client, users["janitor"], passwords["janitor"], ["+select", "+eval", "+get", "+del"])
-    await _set_acl_user(redis_client, users["repair"], passwords["repair"], ["+select", "+eval", "+get", "+set", "+xrange"])
+    await _set_acl_user(
+        redis_client,
+        users["readiness"],
+        passwords["readiness"],
+        [
+            "+select",
+            "+ping",
+            "+acl|whoami",
+            "+info",
+            "+config|get",
+            "+get",
+            "+xrange",
+        ],
+        key_selectors=READINESS_REPAIR_KEY_SELECTORS,
+    )
+    await _set_acl_user(
+        redis_client,
+        users["janitor"],
+        passwords["janitor"],
+        ["+select", "+eval", "+get", "+del"],
+        key_selectors=MARKER_KEY_SELECTORS,
+    )
+    await _set_acl_user(
+        redis_client,
+        users["repair"],
+        passwords["repair"],
+        ["+select", "+eval", "+get", "+set", "+xrange"],
+        key_selectors=READINESS_REPAIR_KEY_SELECTORS,
+    )
     clients = {
         purpose: aioredis.from_url(
             _acl_url(users[purpose], passwords[purpose]),

@@ -115,7 +115,10 @@ load_config() {
 
 acquire_mode_lock() {
   local mode="$1"
-  mkdir -p "$LOCK_DIR"
+  if ! mkdir -p "$LOCK_DIR"; then
+    emit "mode=$mode" "code=lock_unavailable"
+    return 3
+  fi
   MODE_LOCK="$LOCK_DIR/$mode.lock"
   local held="${VP_WORKER_REDIS_MARKER_LOCK_HELD:-}"
   if [[ "$held" =~ ^(readiness|janitor):([0-9]+)$ \
@@ -124,12 +127,22 @@ acquire_mode_lock() {
     return 0
   fi
   if command -v flock >/dev/null 2>&1; then
-    exec 9>>"$MODE_LOCK"
-    if ! flock -n 9; then
-      emit "mode=$mode" "code=lock_busy"
-      return 1
+    if ! exec 9>>"$MODE_LOCK"; then
+      emit "mode=$mode" "code=lock_unavailable"
+      return 3
     fi
-    return 0
+    local flock_status
+    if flock -n -E 75 9; then
+      return 0
+    else
+      flock_status="$?"
+    fi
+    if [[ "$flock_status" -eq 75 ]]; then
+      emit "mode=$mode" "code=lock_busy"
+      return 75
+    fi
+    emit "mode=$mode" "code=lock_unavailable"
+    return 3
   fi
   if command -v python3 >/dev/null 2>&1; then
     exec python3 - "$MODE_LOCK" "$0" "$mode" <<'PY'
@@ -543,7 +556,13 @@ chmod 0700 "$STATE_DIR"
 
 case "$MODE" in
   readiness)
-    acquire_mode_lock readiness || exit 0
+    if acquire_mode_lock readiness; then
+      :
+    else
+      lock_status="$?"
+      [[ "$lock_status" -eq 75 ]] && exit 0
+      exit "$lock_status"
+    fi
     invalidate_readiness_status || exit 3
     launch_job \
       readiness \
@@ -554,7 +573,13 @@ case "$MODE" in
       check
     ;;
   janitor)
-    acquire_mode_lock janitor || exit 0
+    if acquire_mode_lock janitor; then
+      :
+    else
+      lock_status="$?"
+      [[ "$lock_status" -eq 75 ]] && exit 0
+      exit "$lock_status"
+    fi
     launch_job \
       janitor \
       "$JANITOR_JOB" \
