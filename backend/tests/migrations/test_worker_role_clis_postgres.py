@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -6653,6 +6654,702 @@ async def test_state_root_replacement_and_revoke_race_fail_closed(
                     race_names.versioned,
                     *control_names.versioned.values(),
                     replacement_names.stable,
+                    *control_names.stable.values(),
+                ),
+            )
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_authority_directories_stay_pinned_through_role_dcl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = f"vp_role_pins_{uuid.uuid4().hex[:20]}"
+    runtime_services = tuple(
+        f"task4a-pin-{index}-{uuid.uuid4().hex[:6]}"
+        for index in range(2)
+    )
+    runtime_generations = tuple(
+        int(uuid.uuid4().hex[:12], 16)
+        for _service_name in runtime_services
+    )
+    runtime_names = tuple(
+        runtime_cli.role_names_for_generation(service_name, generation)
+        for service_name, generation in zip(
+            runtime_services,
+            runtime_generations,
+            strict=True,
+        )
+    )
+    control_generations = (
+        f"pin-before-{uuid.uuid4().hex[:8]}",
+        f"pin-after-{uuid.uuid4().hex[:8]}",
+    )
+    control_names = tuple(
+        control_cli.role_names_for_generation(generation)
+        for generation in control_generations
+    )
+    runtime_state = tmp_path / "runtime-state"
+    control_state = tmp_path / "control-state"
+    runtime_evidence = tmp_path / "runtime-service-evidence"
+    control_evidence = tmp_path / "control-generation-evidence"
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    live_sessions: list[asyncpg.Connection] = []
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    async def assert_quarantined(role_names: tuple[str, ...]) -> None:
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            for role_name in role_names:
+                role = await owner.fetchrow(
+                    """
+                    SELECT rolcanlogin
+                    FROM pg_catalog.pg_roles
+                    WHERE rolname = $1
+                    """,
+                    role_name,
+                )
+                assert role is not None
+                assert not role["rolcanlogin"]
+                assert not await _role_membership_rows(
+                    owner,
+                    (role_name,),
+                )
+        finally:
+            await owner.close()
+
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        for service_name, generation, names in zip(
+            runtime_services,
+            runtime_generations,
+            runtime_names,
+            strict=True,
+        ):
+            await runtime_cli._provision(
+                target_url,
+                service_name,
+                generation,
+                runtime_state,
+                names,
+            )
+        for generation, names in zip(
+            control_generations,
+            control_names,
+            strict=True,
+        ):
+            await control_cli._provision(
+                target_url,
+                generation,
+                control_state,
+                names,
+            )
+
+        runtime_paths = tuple(
+            runtime_cli.credential_paths(
+                runtime_state,
+                service_name,
+                generation,
+            )
+            for service_name, generation in zip(
+                runtime_services,
+                runtime_generations,
+                strict=True,
+            )
+        )
+        control_paths = tuple(
+            control_cli.credential_paths(control_state, generation)
+            for generation in control_generations
+        )
+        runtime_bytes = tuple(
+            {
+                purpose: path.read_bytes()
+                for purpose, path in paths.items()
+            }
+            for paths in runtime_paths
+        )
+        control_bytes = tuple(
+            {
+                purpose: path.read_bytes()
+                for purpose, path in paths.items()
+            }
+            for paths in control_paths
+        )
+
+        runtime_before_session = await asyncpg.connect(
+            _asyncpg_url(
+                runtime_paths[0]["database_url"].read_text().strip()
+            )
+        )
+        live_sessions.append(runtime_before_session)
+        runtime_before_mutated = False
+
+        def runtime_before_dcl_hook(phase: str) -> None:
+            nonlocal runtime_before_mutated
+            if phase == "before_dcl" and not runtime_before_mutated:
+                runtime_before_mutated = True
+                runtime_state.chmod(0o755)
+
+        with monkeypatch.context() as local_patch:
+            local_patch.setattr(
+                runtime_cli,
+                "_state_tree_test_hook",
+                runtime_before_dcl_hook,
+                raising=False,
+            )
+            with pytest.raises(
+                runtime_cli.RuntimeRoleError,
+                match="generation state directory invalid",
+            ):
+                await runtime_cli._provision(
+                    target_url,
+                    runtime_services[0],
+                    runtime_generations[0],
+                    runtime_state,
+                    runtime_names[0],
+                )
+        assert runtime_before_mutated
+        runtime_state.chmod(0o700)
+        await assert_quarantined((runtime_names[0].versioned,))
+        with pytest.raises(
+            (
+                asyncpg.PostgresError,
+                asyncpg.InterfaceError,
+                ConnectionError,
+            )
+        ):
+            await runtime_before_session.fetchval("SELECT current_user")
+        assert {
+            purpose: path.read_bytes()
+            for purpose, path in runtime_paths[0].items()
+        } == runtime_bytes[0]
+
+        runtime_after_session = await asyncpg.connect(
+            _asyncpg_url(
+                runtime_paths[1]["database_url"].read_text().strip()
+            )
+        )
+        live_sessions.append(runtime_after_session)
+        runtime_after_mutated = False
+        runtime_service_dir = runtime_state / runtime_services[1]
+
+        def runtime_after_dcl_hook(phase: str) -> None:
+            nonlocal runtime_after_mutated
+            if phase == "after_dcl" and not runtime_after_mutated:
+                runtime_after_mutated = True
+                runtime_service_dir.rename(runtime_evidence)
+                shutil.copytree(runtime_evidence, runtime_service_dir)
+
+        with monkeypatch.context() as local_patch:
+            local_patch.setattr(
+                runtime_cli,
+                "_state_tree_test_hook",
+                runtime_after_dcl_hook,
+                raising=False,
+            )
+            with pytest.raises(
+                runtime_cli.RuntimeRoleError,
+                match="generation state directory invalid",
+            ):
+                await runtime_cli._provision(
+                    target_url,
+                    runtime_services[1],
+                    runtime_generations[1],
+                    runtime_state,
+                    runtime_names[1],
+                )
+        assert runtime_after_mutated
+        await assert_quarantined((runtime_names[1].versioned,))
+        with pytest.raises(
+            (
+                asyncpg.PostgresError,
+                asyncpg.InterfaceError,
+                ConnectionError,
+            )
+        ):
+            await runtime_after_session.fetchval("SELECT current_user")
+        evidence_paths = runtime_cli.credential_paths(
+            runtime_evidence.parent,
+            runtime_evidence.name,
+            runtime_generations[1],
+        )
+        assert {
+            purpose: path.read_bytes()
+            for purpose, path in runtime_paths[1].items()
+        } == runtime_bytes[1]
+        assert {
+            purpose: path.read_bytes()
+            for purpose, path in evidence_paths.items()
+        } == runtime_bytes[1]
+
+        control_before_sessions = [
+            await asyncpg.connect(
+                _asyncpg_url(path.read_text().strip())
+            )
+            for path in control_paths[0].values()
+        ]
+        live_sessions.extend(control_before_sessions)
+        control_before_mutated = False
+
+        def control_before_dcl_hook(phase: str) -> None:
+            nonlocal control_before_mutated
+            if phase == "before_dcl" and not control_before_mutated:
+                control_before_mutated = True
+                control_state.chmod(0o755)
+
+        with monkeypatch.context() as local_patch:
+            local_patch.setattr(
+                control_cli,
+                "_state_tree_test_hook",
+                control_before_dcl_hook,
+                raising=False,
+            )
+            with pytest.raises(
+                control_cli.ControlRoleError,
+                match="control state directory invalid",
+            ):
+                await control_cli._provision(
+                    target_url,
+                    control_generations[0],
+                    control_state,
+                    control_names[0],
+                )
+        assert control_before_mutated
+        control_state.chmod(0o700)
+        await assert_quarantined(
+            tuple(control_names[0].versioned.values())
+        )
+        for session in control_before_sessions:
+            with pytest.raises(
+                (
+                    asyncpg.PostgresError,
+                    asyncpg.InterfaceError,
+                    ConnectionError,
+                )
+            ):
+                await session.fetchval("SELECT current_user")
+        assert {
+            purpose: path.read_bytes()
+            for purpose, path in control_paths[0].items()
+        } == control_bytes[0]
+
+        control_after_sessions = [
+            await asyncpg.connect(
+                _asyncpg_url(path.read_text().strip())
+            )
+            for path in control_paths[1].values()
+        ]
+        live_sessions.extend(control_after_sessions)
+        control_after_mutated = False
+        control_generation_dir = control_state / control_generations[1]
+
+        def control_after_dcl_hook(phase: str) -> None:
+            nonlocal control_after_mutated
+            if phase == "after_dcl" and not control_after_mutated:
+                control_after_mutated = True
+                control_generation_dir.rename(control_evidence)
+                shutil.copytree(control_evidence, control_generation_dir)
+
+        with monkeypatch.context() as local_patch:
+            local_patch.setattr(
+                control_cli,
+                "_state_tree_test_hook",
+                control_after_dcl_hook,
+                raising=False,
+            )
+            with pytest.raises(
+                control_cli.ControlRoleError,
+                match="control state directory invalid",
+            ):
+                await control_cli._provision(
+                    target_url,
+                    control_generations[1],
+                    control_state,
+                    control_names[1],
+                )
+        assert control_after_mutated
+        await assert_quarantined(
+            tuple(control_names[1].versioned.values())
+        )
+        for session in control_after_sessions:
+            with pytest.raises(
+                (
+                    asyncpg.PostgresError,
+                    asyncpg.InterfaceError,
+                    ConnectionError,
+                )
+            ):
+                await session.fetchval("SELECT current_user")
+        assert {
+            purpose: path.read_bytes()
+            for purpose, path in control_paths[1].items()
+        } == control_bytes[1]
+        evidence_control_paths = {
+            purpose: control_evidence / path.name
+            for purpose, path in control_paths[1].items()
+        }
+        assert {
+            purpose: path.read_bytes()
+            for purpose, path in evidence_control_paths.items()
+        } == control_bytes[1]
+    finally:
+        for session in live_sessions:
+            if not session.is_closed():
+                await session.close()
+        for path in (runtime_state, control_state):
+            if path.exists() and not path.is_symlink():
+                path.chmod(0o700)
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            await _drop_test_roles(
+                admin,
+                (
+                    *(names.versioned for names in runtime_names),
+                    *(
+                        role_name
+                        for names in control_names
+                        for role_name in names.versioned.values()
+                    ),
+                    runtime_names[0].stable,
+                    *control_names[0].stable.values(),
+                ),
+            )
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_worker_principal_has_one_permanent_grant_binding(
+    tmp_path: Path,
+) -> None:
+    database = f"vp_principal_binding_{uuid.uuid4().hex[:16]}"
+    labels = ("bound", "concurrent", "mismatch", "victim", "survivor")
+    services = {
+        label: f"task4a-principal-{label}-{uuid.uuid4().hex[:6]}"
+        for label in labels
+    }
+    generations = {
+        label: int(uuid.uuid4().hex[:12], 16)
+        for label in labels
+    }
+    names = {
+        label: runtime_cli.role_names_for_generation(
+            services[label],
+            generations[label],
+        )
+        for label in labels
+    }
+    control_generation = f"principal-{uuid.uuid4().hex[:10]}"
+    control_names = control_cli.role_names_for_generation(control_generation)
+    runtime_state = tmp_path / "runtime-state"
+    control_state = tmp_path / "control-state"
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        await control_cli._provision(
+            target_url,
+            control_generation,
+            control_state,
+            control_names,
+        )
+        operator_url = control_cli.credential_paths(
+            control_state,
+            control_generation,
+        )["operator"].read_text().strip()
+        tokens: dict[str, str] = {}
+        role_urls: dict[str, str] = {}
+        for label in labels:
+            await runtime_cli._provision(
+                target_url,
+                services[label],
+                generations[label],
+                runtime_state,
+                names[label],
+            )
+            paths = runtime_cli.credential_paths(
+                runtime_state,
+                services[label],
+                generations[label],
+            )
+            tokens[label] = paths["admission_token"].read_text().strip()
+            role_urls[label] = paths["database_url"].read_text().strip()
+
+        operator = await asyncpg.connect(_asyncpg_url(operator_url))
+        try:
+            await _upsert_worker_grant(
+                operator,
+                service_name=services["bound"],
+                generation=generations["bound"],
+                database_principal=names["bound"].versioned,
+                admission_token=tokens["bound"],
+            )
+            await operator.fetchval(
+                "SELECT public.vp_worker_grant_activate($1, $2)",
+                services["bound"],
+                generations["bound"],
+            )
+            with pytest.raises(
+                asyncpg.PostgresError,
+                match="database_principal_conflict",
+            ):
+                await _upsert_worker_grant(
+                    operator,
+                    service_name=f"{services['bound']}-other",
+                    generation=generations["bound"] + 1,
+                    database_principal=names["bound"].versioned,
+                    admission_token=secrets.token_urlsafe(32),
+                )
+            with pytest.raises(
+                asyncpg.PostgresError,
+                match="database_principal_conflict",
+            ):
+                await _upsert_worker_grant(
+                    operator,
+                    service_name=services["bound"],
+                    generation=generations["bound"] + 2,
+                    database_principal=names["bound"].versioned,
+                    admission_token=secrets.token_urlsafe(32),
+                )
+            assert await operator.fetchval(
+                "SELECT public.vp_worker_grant_revoke($1, $2, $3)",
+                services["bound"],
+                generations["bound"],
+                "round7-historical-binding",
+            )
+            with pytest.raises(
+                asyncpg.PostgresError,
+                match="database_principal_conflict",
+            ):
+                await _upsert_worker_grant(
+                    operator,
+                    service_name=f"{services['bound']}-historical",
+                    generation=generations["bound"] + 3,
+                    database_principal=names["bound"].versioned,
+                    admission_token=secrets.token_urlsafe(32),
+                )
+        finally:
+            await operator.close()
+
+        async def concurrent_upsert(
+            service_name: str,
+            generation: int,
+        ) -> object:
+            connection = await asyncpg.connect(_asyncpg_url(operator_url))
+            try:
+                return await _upsert_worker_grant(
+                    connection,
+                    service_name=service_name,
+                    generation=generation,
+                    database_principal=names["concurrent"].versioned,
+                    admission_token=secrets.token_urlsafe(32),
+                )
+            except BaseException as exc:
+                return exc
+            finally:
+                await connection.close()
+
+        concurrent_results = await asyncio.wait_for(
+            asyncio.gather(
+                concurrent_upsert(
+                    f"{services['concurrent']}-a",
+                    generations["concurrent"],
+                ),
+                concurrent_upsert(
+                    f"{services['concurrent']}-b",
+                    generations["concurrent"] + 1,
+                ),
+            ),
+            timeout=20,
+        )
+        assert sum(
+            isinstance(result, uuid.UUID)
+            for result in concurrent_results
+        ) == 1
+        conflicts = [
+            result
+            for result in concurrent_results
+            if isinstance(result, BaseException)
+        ]
+        assert len(conflicts) == 1
+        assert "database_principal_conflict" in str(conflicts[0])
+        assert "duplicate key" not in str(conflicts[0]).lower()
+
+        operator = await asyncpg.connect(_asyncpg_url(operator_url))
+        try:
+            await _upsert_worker_grant(
+                operator,
+                service_name=services["mismatch"],
+                generation=generations["mismatch"],
+                database_principal=names["mismatch"].versioned,
+                admission_token=tokens["mismatch"],
+            )
+        finally:
+            await operator.close()
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            await owner.execute(
+                """
+                UPDATE public.worker_admission_grants
+                SET database_principal = $1
+                WHERE service_name = $2 AND generation = $3
+                """,
+                names["mismatch"].versioned,
+                services["bound"],
+                generations["bound"],
+            )
+            index_definition = await owner.fetchval(
+                """
+                SELECT indexdef
+                FROM pg_catalog.pg_indexes
+                WHERE schemaname = 'public'
+                  AND indexname =
+                      'uq_worker_admission_grants_live_database_principal'
+                """
+            )
+            assert index_definition is not None
+            assert "UNIQUE INDEX" in index_definition
+            assert "database_principal" in index_definition
+            assert "pending" in index_definition
+            assert "active" in index_definition
+        finally:
+            await owner.close()
+        operator = await asyncpg.connect(_asyncpg_url(operator_url))
+        try:
+            with pytest.raises(
+                asyncpg.PostgresError,
+                match="database_principal_conflict",
+            ):
+                await operator.fetchval(
+                    "SELECT public.vp_worker_grant_activate($1, $2)",
+                    services["mismatch"],
+                    generations["mismatch"],
+                )
+            with pytest.raises(
+                asyncpg.PostgresError,
+                match="database_principal_conflict",
+            ):
+                await _upsert_worker_grant(
+                    operator,
+                    service_name=services["victim"],
+                    generation=generations["victim"],
+                    database_principal=names["victim"].versioned,
+                    admission_token=tokens["victim"],
+                )
+
+            owner = await asyncpg.connect(_asyncpg_url(target_url))
+            try:
+                await owner.execute(
+                    """
+                    UPDATE public.worker_admission_grants
+                    SET database_principal = $1
+                    WHERE service_name = $2 AND generation = $3
+                    """,
+                    names["bound"].versioned,
+                    services["bound"],
+                    generations["bound"],
+                )
+            finally:
+                await owner.close()
+
+            for label in ("victim", "survivor"):
+                await _upsert_worker_grant(
+                    operator,
+                    service_name=services[label],
+                    generation=generations[label],
+                    database_principal=names[label].versioned,
+                    admission_token=tokens[label],
+                )
+                await operator.fetchval(
+                    "SELECT public.vp_worker_grant_activate($1, $2)",
+                    services[label],
+                    generations[label],
+                )
+            assert await operator.fetchval(
+                "SELECT public.vp_worker_grant_revoke($1, $2, $3)",
+                services["victim"],
+                generations["victim"],
+                "round7-revoke-isolation",
+            )
+        finally:
+            await operator.close()
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            assert await owner.fetchval(
+                """
+                SELECT state = 'active' AND revoked_at IS NULL
+                FROM public.worker_admission_grants
+                WHERE service_name = $1 AND generation = $2
+                """,
+                services["survivor"],
+                generations["survivor"],
+            )
+            assert await owner.fetchval(
+                """
+                SELECT rolcanlogin
+                FROM pg_catalog.pg_roles
+                WHERE rolname = $1
+                """,
+                names["survivor"].versioned,
+            )
+            assert await owner.fetchval(
+                "SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')",
+                names["survivor"].versioned,
+                names["survivor"].stable,
+            )
+        finally:
+            await owner.close()
+        survivor = await asyncpg.connect(
+            _asyncpg_url(role_urls["survivor"])
+        )
+        try:
+            assert (
+                await survivor.fetchval("SELECT session_user")
+                == names["survivor"].versioned
+            )
+        finally:
+            await survivor.close()
+    finally:
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            await _drop_test_roles(
+                admin,
+                (
+                    *(role_names.versioned for role_names in names.values()),
+                    *control_names.versioned.values(),
+                    names["bound"].stable,
                     *control_names.stable.values(),
                 ),
             )

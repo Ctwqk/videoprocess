@@ -15,6 +15,7 @@ from typing import Never
 import asyncpg  # type: ignore[import-untyped]
 
 from app.services.worker_role_cli_common import (
+    PinnedPrivateDirectory,
     PrivateDirectorySnapshot,
     WorkerRoleCommonError,
     acquire_database_acl_dcl_lock,
@@ -22,12 +23,14 @@ from app.services.worker_role_cli_common import (
     acquire_stable_role_authority_locks,
     asyncpg_url,
     capture_private_directory,
+    close_pinned_private_directories,
     create_login_role,
     drop_login_roles,
     ensure_stable_role,
     grant_columns,
     grant_functions,
     load_database_url_file,
+    pin_private_directory,
     quote_identifier,
     quarantine_login_roles,
     read_secure_file,
@@ -36,6 +39,7 @@ from app.services.worker_role_cli_common import (
     role_database_url,
     verify_role_database_url,
     verify_private_directory,
+    verify_pinned_private_directory,
     write_secure_files,
 )
 
@@ -497,6 +501,16 @@ class ControlRoleNames:
     versioned: Mapping[str, str]
 
 
+class PinnedControlMembers(dict[str, set[str]]):
+    def __init__(
+        self,
+        members: Mapping[str, set[str]],
+        pins: Sequence[PinnedPrivateDirectory],
+    ) -> None:
+        super().__init__(members)
+        self.pins = tuple(pins)
+
+
 def role_names_for_generation(generation: str) -> ControlRoleNames:
     if (
         not isinstance(generation, str)
@@ -625,6 +639,7 @@ async def _provision(
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     created = False
     fresh = False
+    operation_pins: list[PinnedPrivateDirectory] = []
     try:
         await acquire_database_acl_dcl_lock(connection)
         await acquire_stable_role_authority_locks(
@@ -636,10 +651,11 @@ async def _provision(
             f"control:{generation}",
         )
         try:
-            tree_snapshots = _control_generation_tree_snapshots(
+            tree_pins = _control_generation_tree_pins(
                 state_dir,
                 generation,
             )
+            operation_pins.extend(tree_pins)
         except ControlStateTreeError as exc:
             await quarantine_login_roles(
                 connection,
@@ -683,14 +699,22 @@ async def _provision(
                     paths,
                     names,
                 )
-                _verify_directory_snapshots(tree_snapshots)
+                _verify_pinned_directories(operation_pins)
             except (
                 asyncpg.PostgresError,
                 OSError,
                 ControlRoleError,
                 WorkerRoleCommonError,
             ) as exc:
-                if isinstance(exc, ControlStateTreeError):
+                tree_error: ControlStateTreeError | None = None
+                try:
+                    _verify_pinned_directories(operation_pins)
+                except ControlStateTreeError as detected_tree_error:
+                    tree_error = detected_tree_error
+                if tree_error is not None or isinstance(
+                    exc,
+                    ControlStateTreeError,
+                ):
                     await quarantine_login_roles(
                         connection,
                         tuple(names.versioned.values()),
@@ -705,7 +729,7 @@ async def _provision(
                     )
                 raise ControlRoleError(
                     "control generation state invalid"
-                ) from exc
+                ) from (tree_error or exc)
             try:
                 authorized_members = await _authorized_control_members(
                     connection,
@@ -720,7 +744,82 @@ async def _provision(
                 raise ControlRoleError(
                     "control state directory invalid"
                 ) from exc
+            member_pins = tuple(getattr(authorized_members, "pins", ()))
+            authority_pins = (*operation_pins, *member_pins)
+            try:
+                _state_tree_test_hook("before_dcl")
+                _verify_pinned_directories(authority_pins)
+                try:
+                    async with connection.transaction():
+                        _verify_pinned_directories(authority_pins)
+                        for purpose, stable_role in names.stable.items():
+                            await ensure_stable_role(
+                                connection,
+                                stable_role,
+                                setting_prefix="worker_control",
+                                authorized_members=tuple(
+                                    sorted(
+                                        {
+                                            *authorized_members[purpose],
+                                            names.versioned[purpose],
+                                        }
+                                    )
+                                ),
+                            )
+                        await _set_control_privileges(connection, names)
+                        _state_tree_test_hook("after_dcl")
+                        _verify_pinned_directories(authority_pins)
+                except BaseException as exc:
+                    try:
+                        _verify_pinned_directories(authority_pins)
+                    except ControlStateTreeError as tree_exc:
+                        raise tree_exc from exc
+                    raise
+                _verify_pinned_directories(authority_pins)
+                for purpose, database_url in role_urls.items():
+                    try:
+                        await verify_role_database_url(
+                            owner_url,
+                            database_url,
+                            names.versioned[purpose],
+                        )
+                    except BaseException as exc:
+                        try:
+                            _verify_pinned_directories(authority_pins)
+                        except ControlStateTreeError as tree_exc:
+                            raise tree_exc from exc
+                        raise
+                    _verify_pinned_directories(authority_pins)
+            except ControlStateTreeError as exc:
+                await quarantine_login_roles(
+                    connection,
+                    tuple(names.versioned.values()),
+                )
+                raise ControlRoleError(
+                    "control state directory invalid"
+                ) from exc
+            finally:
+                close_pinned_private_directories(member_pins)
+            return
+
+        passwords = {
+            purpose: secrets.token_urlsafe(32)
+            for purpose in STABLE_ROLES
+        }
+        if len(set(passwords.values())) != len(passwords):
+            raise ControlRoleError("credential generation failed")
+        authorized_members = await _authorized_control_members(
+            connection,
+            owner_url,
+            state_dir,
+        )
+        member_pins = tuple(getattr(authorized_members, "pins", ()))
+        authority_pins = (*operation_pins, *member_pins)
+        try:
+            _state_tree_test_hook("before_dcl")
+            _verify_pinned_directories(authority_pins)
             async with connection.transaction():
+                _verify_pinned_directories(authority_pins)
                 for purpose, stable_role in names.stable.items():
                     await ensure_stable_role(
                         connection,
@@ -736,64 +835,35 @@ async def _provision(
                         ),
                     )
                 await _set_control_privileges(connection, names)
+                for purpose, versioned_role in names.versioned.items():
+                    await create_login_role(
+                        connection,
+                        versioned_role,
+                        passwords[purpose],
+                        setting_prefix="worker_control",
+                        stable_role=names.stable[purpose],
+                    )
+                _state_tree_test_hook("after_dcl")
+                _verify_pinned_directories(authority_pins)
+            created = True
+            role_urls = {
+                purpose: role_database_url(
+                    owner_url,
+                    names.versioned[purpose],
+                    passwords[purpose],
+                )
+                for purpose in STABLE_ROLES
+            }
+            _verify_pinned_directories(authority_pins)
             for purpose, database_url in role_urls.items():
                 await verify_role_database_url(
                     owner_url,
                     database_url,
                     names.versioned[purpose],
                 )
-            return
-
-        passwords = {
-            purpose: secrets.token_urlsafe(32)
-            for purpose in STABLE_ROLES
-        }
-        if len(set(passwords.values())) != len(passwords):
-            raise ControlRoleError("credential generation failed")
-        authorized_members = await _authorized_control_members(
-            connection,
-            owner_url,
-            state_dir,
-        )
-        async with connection.transaction():
-            for purpose, stable_role in names.stable.items():
-                await ensure_stable_role(
-                    connection,
-                    stable_role,
-                    setting_prefix="worker_control",
-                    authorized_members=tuple(
-                        sorted(
-                            {
-                                *authorized_members[purpose],
-                                names.versioned[purpose],
-                            }
-                        )
-                    ),
-                )
-            await _set_control_privileges(connection, names)
-            for purpose, versioned_role in names.versioned.items():
-                await create_login_role(
-                    connection,
-                    versioned_role,
-                    passwords[purpose],
-                    setting_prefix="worker_control",
-                    stable_role=names.stable[purpose],
-                )
-        created = True
-        role_urls = {
-            purpose: role_database_url(
-                owner_url,
-                names.versioned[purpose],
-                passwords[purpose],
-            )
-            for purpose in STABLE_ROLES
-        }
-        for purpose, database_url in role_urls.items():
-            await verify_role_database_url(
-                owner_url,
-                database_url,
-                names.versioned[purpose],
-            )
+                _verify_pinned_directories(authority_pins)
+        finally:
+            close_pinned_private_directories(member_pins)
         write_generation_credentials(
             state_dir,
             generation,
@@ -815,6 +885,7 @@ async def _provision(
                 pass
         raise
     finally:
+        close_pinned_private_directories(operation_pins)
         await connection.close()
 
 
@@ -838,16 +909,23 @@ async def _quarantine_control_generation(
         )
     except ControlStateTreeError:
         return
-    async with connection.transaction():
-        for purpose, stable_role in names.stable.items():
-            await ensure_stable_role(
-                connection,
-                stable_role,
-                setting_prefix="worker_control",
-                authorized_members=tuple(
-                    sorted(authorized_members[purpose])
-                ),
-            )
+    member_pins = tuple(getattr(authorized_members, "pins", ()))
+    try:
+        _verify_pinned_directories(member_pins)
+        async with connection.transaction():
+            _verify_pinned_directories(member_pins)
+            for purpose, stable_role in names.stable.items():
+                await ensure_stable_role(
+                    connection,
+                    stable_role,
+                    setting_prefix="worker_control",
+                    authorized_members=tuple(
+                        sorted(authorized_members[purpose])
+                    ),
+                )
+            _verify_pinned_directories(member_pins)
+    finally:
+        close_pinned_private_directories(member_pins)
 
 
 async def _set_control_privileges(
@@ -969,20 +1047,47 @@ async def _authorized_control_members(
     state_dir: Path,
     *,
     excluded_generation: str | None = None,
-) -> dict[str, set[str]]:
+) -> PinnedControlMembers:
+    pins: list[PinnedPrivateDirectory] = []
+    try:
+        return await _scan_authorized_control_members(
+            connection,
+            owner_url,
+            state_dir,
+            pins,
+            excluded_generation=excluded_generation,
+        )
+    except BaseException:
+        close_pinned_private_directories(pins)
+        raise
+
+
+async def _scan_authorized_control_members(
+    connection: asyncpg.Connection,
+    owner_url: str,
+    state_dir: Path,
+    pins: list[PinnedPrivateDirectory],
+    *,
+    excluded_generation: str | None = None,
+) -> PinnedControlMembers:
     authorized: dict[str, set[str]] = {
         purpose: set() for purpose in STABLE_ROLES
     }
-    root_snapshot = _capture_optional_private_directory(state_dir)
-    if root_snapshot is None:
-        return authorized
-    with os.scandir(state_dir) as entries:
-        generation_names = sorted(
-            entry.name
-            for entry in entries
-            if entry.is_dir(follow_symlinks=False)
-        )
-    _verify_directory_snapshot(root_snapshot)
+    root_pin = _pin_optional_private_directory(state_dir)
+    if root_pin is None:
+        return PinnedControlMembers(authorized, ())
+    pins.append(root_pin)
+    try:
+        with os.scandir(state_dir) as entries:
+            generation_names = sorted(
+                entry.name
+                for entry in entries
+                if entry.is_dir(follow_symlinks=False)
+            )
+        _verify_pinned_directories(pins)
+    except BaseException:
+        close_pinned_private_directories(pins)
+        raise
     for generation in generation_names:
         if not GENERATION_PATTERN.fullmatch(generation):
             continue
@@ -990,8 +1095,9 @@ async def _authorized_control_members(
             continue
         generation_dir = state_dir / generation
         names = role_names_for_generation(generation)
+        generation_pin: PinnedPrivateDirectory | None = None
         try:
-            generation_snapshot = _capture_required_private_directory(
+            generation_pin = _pin_required_private_directory(
                 generation_dir
             )
             await _validate_existing_generation(
@@ -1000,24 +1106,34 @@ async def _authorized_control_members(
                 credential_paths(state_dir, generation),
                 names,
             )
-            _verify_directory_snapshots(
-                (root_snapshot, generation_snapshot)
-            )
+            verify_pinned_private_directory(generation_pin)
+            _verify_pinned_directories(pins)
         except (
             asyncpg.PostgresError,
             OSError,
             ControlRoleError,
             WorkerRoleCommonError,
         ):
-            await quarantine_login_roles(
-                connection,
-                tuple(names.versioned.values()),
-            )
+            if generation_pin is not None:
+                generation_pin.close()
+            try:
+                await quarantine_login_roles(
+                    connection,
+                    tuple(names.versioned.values()),
+                )
+            except BaseException:
+                close_pinned_private_directories(pins)
+                raise
             continue
+        pins.append(generation_pin)
         for purpose, role_name in names.versioned.items():
             authorized[purpose].add(role_name)
-    _verify_directory_snapshot(root_snapshot)
-    return authorized
+    try:
+        _verify_pinned_directories(pins)
+    except BaseException:
+        close_pinned_private_directories(pins)
+        raise
+    return PinnedControlMembers(authorized, pins)
 
 
 def _capture_optional_private_directory(
@@ -1032,6 +1148,31 @@ def _capture_optional_private_directory(
             "control state directory invalid"
         ) from exc
     return _capture_required_private_directory(path)
+
+
+def _pin_optional_private_directory(
+    path: Path,
+) -> PinnedPrivateDirectory | None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ControlStateTreeError(
+            "control state directory invalid"
+        ) from exc
+    return _pin_required_private_directory(path)
+
+
+def _pin_required_private_directory(
+    path: Path,
+) -> PinnedPrivateDirectory:
+    try:
+        return pin_private_directory(path)
+    except WorkerRoleCommonError as exc:
+        raise ControlStateTreeError(
+            "control state directory invalid"
+        ) from exc
 
 
 def _capture_required_private_directory(
@@ -1054,28 +1195,42 @@ def _verify_directory_snapshot(snapshot: PrivateDirectorySnapshot) -> None:
         ) from exc
 
 
-def _verify_directory_snapshots(
-    snapshots: Sequence[PrivateDirectorySnapshot],
+def _verify_pinned_directories(
+    pins: Sequence[PinnedPrivateDirectory],
 ) -> None:
-    for snapshot in snapshots:
-        _verify_directory_snapshot(snapshot)
+    for pin in pins:
+        try:
+            verify_pinned_private_directory(pin)
+        except WorkerRoleCommonError as exc:
+            raise ControlStateTreeError(
+                "control state directory invalid"
+            ) from exc
 
 
-def _control_generation_tree_snapshots(
+def _state_tree_test_hook(phase: str) -> None:
+    del phase
+
+
+def _control_generation_tree_pins(
     state_dir: Path,
     generation: str,
-) -> tuple[PrivateDirectorySnapshot, ...]:
-    root_snapshot = _capture_optional_private_directory(state_dir)
-    if root_snapshot is None:
-        return ()
-    snapshots = [root_snapshot]
-    generation_snapshot = _capture_optional_private_directory(
-        state_dir / generation
-    )
-    if generation_snapshot is not None:
-        snapshots.append(generation_snapshot)
-    _verify_directory_snapshots(snapshots)
-    return tuple(snapshots)
+) -> tuple[PinnedPrivateDirectory, ...]:
+    pins: list[PinnedPrivateDirectory] = []
+    try:
+        root_pin = _pin_optional_private_directory(state_dir)
+        if root_pin is None:
+            return ()
+        pins.append(root_pin)
+        generation_pin = _pin_optional_private_directory(
+            state_dir / generation
+        )
+        if generation_pin is not None:
+            pins.append(generation_pin)
+        _verify_pinned_directories(pins)
+        return tuple(pins)
+    except BaseException:
+        close_pinned_private_directories(pins)
+        raise
 
 
 def _require_private_state_directory(path: Path) -> None:
@@ -1089,6 +1244,7 @@ async def _revoke(
     names: ControlRoleNames,
 ) -> None:
     connection = await asyncpg.connect(asyncpg_url(owner_url))
+    operation_pins: list[PinnedPrivateDirectory] = []
     try:
         await acquire_database_acl_dcl_lock(connection)
         await acquire_stable_role_authority_locks(
@@ -1100,10 +1256,11 @@ async def _revoke(
             f"control:{generation}",
         )
         try:
-            tree_snapshots = _control_generation_tree_snapshots(
+            tree_pins = _control_generation_tree_pins(
                 state_dir,
                 generation,
             )
+            operation_pins.extend(tree_pins)
         except ControlStateTreeError as exc:
             await quarantine_login_roles(
                 connection,
@@ -1112,11 +1269,15 @@ async def _revoke(
             raise ControlRoleError(
                 "control state directory invalid"
             ) from exc
-        _verify_directory_snapshots(tree_snapshots)
         await drop_login_roles(
             connection,
             tuple(names.versioned.values()),
+            state_guard=lambda: _verify_pinned_directories(
+                operation_pins
+            ),
         )
+        close_pinned_private_directories(operation_pins)
+        operation_pins.clear()
         remove_secure_files(
             state_dir,
             (generation,),
@@ -1127,19 +1288,27 @@ async def _revoke(
             owner_url,
             state_dir,
         )
-        async with connection.transaction():
-            for purpose, stable_role in names.stable.items():
-                await ensure_stable_role(
-                    connection,
-                    stable_role,
-                    setting_prefix="worker_control",
-                    authorized_members=tuple(
-                        sorted(authorized_members[purpose])
-                    ),
-                )
+        member_pins = tuple(getattr(authorized_members, "pins", ()))
+        try:
+            _verify_pinned_directories(member_pins)
+            async with connection.transaction():
+                _verify_pinned_directories(member_pins)
+                for purpose, stable_role in names.stable.items():
+                    await ensure_stable_role(
+                        connection,
+                        stable_role,
+                        setting_prefix="worker_control",
+                        authorized_members=tuple(
+                            sorted(authorized_members[purpose])
+                        ),
+                    )
+                _verify_pinned_directories(member_pins)
+        finally:
+            close_pinned_private_directories(member_pins)
     except (asyncpg.PostgresError, WorkerRoleCommonError) as exc:
         raise ControlRoleError("control credential removal failed") from exc
     finally:
+        close_pinned_private_directories(operation_pins)
         await connection.close()
 
 

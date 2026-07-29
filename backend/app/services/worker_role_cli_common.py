@@ -7,7 +7,7 @@ import hmac
 import os
 import secrets
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +35,94 @@ class PrivateDirectorySnapshot:
     size: int
     mtime_ns: int
     ctime_ns: int
+
+
+@dataclass
+class PinnedPrivateDirectory:
+    path: Path
+    descriptor: int
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    mode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+
+def pin_private_directory(path: Path) -> PinnedPrivateDirectory:
+    if not path.is_absolute():
+        raise WorkerRoleCommonError("state directory invalid")
+    descriptor = -1
+    try:
+        before = path.lstat()
+        _require_private_directory_stat(before)
+        descriptor = os.open(path, _directory_open_flags())
+        opened = os.fstat(descriptor)
+        _require_private_directory_stat(opened)
+        if not _same_directory_stat(before, opened):
+            raise WorkerRoleCommonError("state directory changed")
+        return PinnedPrivateDirectory(
+            path=path,
+            descriptor=descriptor,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            uid=opened.st_uid,
+            gid=opened.st_gid,
+            mode=stat.S_IMODE(opened.st_mode),
+            size=opened.st_size,
+            mtime_ns=opened.st_mtime_ns,
+            ctime_ns=opened.st_ctime_ns,
+        )
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise WorkerRoleCommonError("state directory invalid") from exc
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def verify_pinned_private_directory(pin: PinnedPrivateDirectory) -> None:
+    if pin.descriptor < 0:
+        raise WorkerRoleCommonError("state directory changed")
+    probe = -1
+    try:
+        opened = os.fstat(pin.descriptor)
+        _require_private_directory_stat(opened)
+        if not _stat_matches_pin(opened, pin):
+            raise WorkerRoleCommonError("state directory changed")
+        before = pin.path.lstat()
+        _require_private_directory_stat(before)
+        if not _stat_matches_pin(before, pin):
+            raise WorkerRoleCommonError("state directory changed")
+        probe = os.open(pin.path, _directory_open_flags())
+        current = os.fstat(probe)
+        _require_private_directory_stat(current)
+        if (
+            not _same_directory_stat(before, current)
+            or not _stat_matches_pin(current, pin)
+        ):
+            raise WorkerRoleCommonError("state directory changed")
+    except OSError as exc:
+        raise WorkerRoleCommonError("state directory changed") from exc
+    finally:
+        if probe >= 0:
+            os.close(probe)
+
+
+def close_pinned_private_directories(
+    pins: Sequence[PinnedPrivateDirectory],
+) -> None:
+    for pin in reversed(pins):
+        pin.close()
 
 
 def capture_private_directory(path: Path) -> PrivateDirectorySnapshot:
@@ -86,6 +174,47 @@ def verify_private_directory(snapshot: PrivateDirectorySnapshot) -> None:
     current = capture_private_directory(snapshot.path)
     if current != snapshot:
         raise WorkerRoleCommonError("state directory changed")
+
+
+def _require_private_directory_stat(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise WorkerRoleCommonError("state directory invalid")
+
+
+def _same_directory_stat(
+    left: os.stat_result,
+    right: os.stat_result,
+) -> bool:
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_uid == right.st_uid
+        and left.st_gid == right.st_gid
+        and stat.S_IMODE(left.st_mode) == stat.S_IMODE(right.st_mode)
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
+def _stat_matches_pin(
+    metadata: os.stat_result,
+    pin: PinnedPrivateDirectory,
+) -> bool:
+    return (
+        metadata.st_dev == pin.device
+        and metadata.st_ino == pin.inode
+        and metadata.st_uid == pin.uid
+        and metadata.st_gid == pin.gid
+        and stat.S_IMODE(metadata.st_mode) == pin.mode
+        and metadata.st_size == pin.size
+        and metadata.st_mtime_ns == pin.mtime_ns
+        and metadata.st_ctime_ns == pin.ctime_ns
+    )
 
 
 def load_database_url_file(
@@ -1048,6 +1177,8 @@ async def _revoke_database_ddl(
 async def drop_login_roles(
     connection: asyncpg.Connection,
     role_names: Sequence[str],
+    *,
+    state_guard: Callable[[], None] | None = None,
 ) -> None:
     if connection.is_in_transaction():
         raise WorkerRoleCommonError(
@@ -1058,22 +1189,38 @@ async def drop_login_roles(
         raise WorkerRoleCommonError("database role retirement invalid")
     for role_name in ordered_roles:
         quote_identifier(role_name)
-    await quarantine_login_roles(connection, ordered_roles)
-    async with connection.transaction():
-        for role_name in ordered_roles:
-            if await connection.fetchval(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM pg_catalog.pg_roles
-                    WHERE rolname = $1
-                )
-                """,
-                role_name,
-            ):
-                await connection.execute(
-                    f"DROP ROLE {quote_identifier(role_name)}"
-                )
+    if state_guard is not None:
+        state_guard()
+    try:
+        await quarantine_login_roles(connection, ordered_roles)
+        if state_guard is not None:
+            state_guard()
+        async with connection.transaction():
+            if state_guard is not None:
+                state_guard()
+            for role_name in ordered_roles:
+                if await connection.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_roles
+                        WHERE rolname = $1
+                    )
+                    """,
+                    role_name,
+                ):
+                    await connection.execute(
+                        f"DROP ROLE {quote_identifier(role_name)}"
+                    )
+            if state_guard is not None:
+                state_guard()
+    except BaseException as exc:
+        if state_guard is not None:
+            try:
+                state_guard()
+            except BaseException as guard_exc:
+                raise guard_exc from exc
+        raise
 
 
 async def quarantine_login_roles(

@@ -804,6 +804,10 @@ async def test_postgres_16_staging_janitor_status_is_cross_role_and_overlap_safe
 async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() -> None:
     database = f"vp_worker_registration_migration_{uuid.uuid4().hex}"
     runtime_role = f"vp_worker_runtime_{uuid.uuid4().hex[:16]}"
+    replacement_roles = tuple(
+        f"vp_worker_generation_{index}_{uuid.uuid4().hex[:10]}"
+        for index in (8, 9, 10)
+    )
     mismatch_role = f"vp_worker_mismatch_{uuid.uuid4().hex[:16]}"
     direct_role = f"vp_worker_direct_{uuid.uuid4().hex[:16]}"
     set_role_login = f"vp_worker_member_{uuid.uuid4().hex[:16]}"
@@ -812,6 +816,9 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
     owner_role = f"vp_worker_owner_{uuid.uuid4().hex[:16]}"
     operator_role = f"vp_worker_operator_{uuid.uuid4().hex[:16]}"
     runtime_password = uuid.uuid4().hex
+    replacement_passwords = tuple(
+        uuid.uuid4().hex for _role in replacement_roles
+    )
     mismatch_password = uuid.uuid4().hex
     direct_password = uuid.uuid4().hex
     set_role_password = uuid.uuid4().hex
@@ -825,6 +832,15 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             f'CREATE ROLE "{runtime_role}" LOGIN PASSWORD '
             f"'{runtime_password}'"
         )
+        for role_name, password in zip(
+            replacement_roles,
+            replacement_passwords,
+            strict=True,
+        ):
+            await admin.execute(
+                f'CREATE ROLE "{role_name}" LOGIN PASSWORD '
+                f"'{password}'"
+            )
         await admin.execute(
             f'CREATE ROLE "{mismatch_role}" LOGIN PASSWORD '
             f"'{mismatch_password}'"
@@ -1082,6 +1098,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             )
             for role_name in (
                 runtime_role,
+                *replacement_roles,
                 mismatch_role,
                 direct_role,
                 set_role_login,
@@ -1178,6 +1195,15 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             runtime_url = (
                 f"postgresql://{runtime_role}:{runtime_password}"
                 f"@{target_url.split('@', 1)[1]}"
+            )
+            replacement_urls = tuple(
+                f"postgresql://{role_name}:{password}"
+                f"@{target_url.split('@', 1)[1]}"
+                for role_name, password in zip(
+                    replacement_roles,
+                    replacement_passwords,
+                    strict=True,
+                )
             )
             mismatch_url = (
                 f"postgresql://{mismatch_role}:{mismatch_password}"
@@ -1938,7 +1964,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 '["media_cpu"]',
                 RELEASE_COMMIT,
                 IMAGE_IDENTITY,
-                runtime_role,
+                replacement_roles[0],
                 "vp:tasks:ffmpeg_go",
                 "ffmpeg_go-workers",
                 json.dumps(ENDPOINT_BINDINGS),
@@ -2065,6 +2091,12 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 )
                 == pending_grant_id
             )
+            await connection.execute(
+                f'ALTER ROLE "{runtime_role}" LOGIN'
+            )
+            await connection.execute(
+                f'GRANT vp_worker_runtime TO "{runtime_role}"'
+            )
             assert await assert_operator_waits_for_fence(
                 "SELECT public.vp_worker_grant_revoke($1, $2, $3)",
                 "service-a",
@@ -2086,6 +2118,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 fifth["registration_id"],
                 "operator-stop",
             )
+            await runtime_connection.close()
 
             generation_nine_token_hash = _sha256("admission-token-nine")
             generation_nine_id = await operator_mutation_connection.fetchval(
@@ -2102,7 +2135,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 '["media_cpu"]',
                 RELEASE_COMMIT,
                 IMAGE_IDENTITY,
-                runtime_role,
+                replacement_roles[1],
                 "vp:tasks:ffmpeg_go",
                 "ffmpeg_go-workers",
                 json.dumps(ENDPOINT_BINDINGS),
@@ -2117,6 +2150,9 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 )
                 == generation_nine_id
             )
+            generation_nine_connection = await asyncpg.connect(
+                replacement_urls[1]
+            )
             expiry_args = list(register_args)
             expiry_args[1] = 9
             expiry_args[4] = uuid.uuid4()
@@ -2124,7 +2160,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             expiry_args[6] = "consumer-six"
             expiry_args[16] = generation_nine_token_hash
             expiry_args[17] = _sha256("lease-six")
-            expiry_registration = await runtime_connection.fetchrow(
+            expiry_registration = await generation_nine_connection.fetchrow(
                 register_sql,
                 *expiry_args,
             )
@@ -2137,7 +2173,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 """,
                 expiry_registration["registration_id"],
             )
-            expiry_fence = await asyncpg.connect(runtime_url)
+            expiry_fence = await asyncpg.connect(replacement_urls[1])
             expiry_operator = await asyncpg.connect(operator_url)
             expiry_transaction = expiry_fence.transaction()
             expiry_task: asyncio.Task[object] | None = None
@@ -2181,6 +2217,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 await expiry_fence.close()
                 await expiry_operator.close()
                 await operator_mutation_connection.close()
+            await generation_nine_connection.close()
 
             time_wait_operator = await asyncpg.connect(operator_url)
             generation_ten_token_hash = _sha256("admission-token-ten")
@@ -2199,7 +2236,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                     '["media_cpu"]',
                     RELEASE_COMMIT,
                     IMAGE_IDENTITY,
-                    runtime_role,
+                    replacement_roles[2],
                     "vp:tasks:ffmpeg_go",
                     "ffmpeg_go-workers",
                     json.dumps(ENDPOINT_BINDINGS),
@@ -2213,6 +2250,9 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 )
             finally:
                 await time_wait_operator.close()
+            generation_ten_connection = await asyncpg.connect(
+                replacement_urls[2]
+            )
             time_wait_args = list(register_args)
             time_wait_args[1] = 10
             time_wait_args[4] = uuid.uuid4()
@@ -2220,7 +2260,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             time_wait_args[6] = "consumer-seven"
             time_wait_args[16] = generation_ten_token_hash
             time_wait_args[17] = _sha256("lease-seven")
-            time_wait_registration = await runtime_connection.fetchrow(
+            time_wait_registration = await generation_ten_connection.fetchrow(
                 register_sql,
                 *time_wait_args,
             )
@@ -2236,7 +2276,9 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             expiry_lock = connection.transaction()
             await expiry_lock.start()
             expiry_lock_committed = False
-            expiry_require_connection = await asyncpg.connect(runtime_url)
+            expiry_require_connection = await asyncpg.connect(
+                replacement_urls[2]
+            )
             expiry_require_task: asyncio.Task[object] | None = None
             try:
                 await connection.execute(
@@ -2288,12 +2330,12 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 await expiry_require_connection.close()
 
             with pytest.raises(asyncpg.RaiseError, match="lease_fenced"):
-                await runtime_connection.execute(
+                await generation_ten_connection.execute(
                     "SELECT public.vp_require_worker_lease($1, $2)",
                     third["registration_id"],
                     3,
                 )
-            await runtime_connection.close()
+            await generation_ten_connection.close()
         finally:
             await connection.close()
 
@@ -2336,18 +2378,21 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
             await admin.execute(
                 f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
             )
-            if await admin.fetchval(
-                """
-                SELECT
-                    pg_catalog.to_regrole('vp_worker_runtime') IS NOT NULL
-                    AND pg_catalog.to_regrole($1) IS NOT NULL
-                """,
-                runtime_role,
-            ):
+            for role_name in (runtime_role, *replacement_roles):
+                if await admin.fetchval(
+                    """
+                    SELECT
+                        pg_catalog.to_regrole('vp_worker_runtime') IS NOT NULL
+                        AND pg_catalog.to_regrole($1) IS NOT NULL
+                    """,
+                    role_name,
+                ):
+                    await admin.execute(
+                        f'REVOKE vp_worker_runtime FROM "{role_name}"'
+                    )
                 await admin.execute(
-                    f'REVOKE vp_worker_runtime FROM "{runtime_role}"'
+                    f'DROP ROLE IF EXISTS "{role_name}"'
                 )
-            await admin.execute(f'DROP ROLE IF EXISTS "{runtime_role}"')
             await admin.execute(f'DROP ROLE IF EXISTS "{mismatch_role}"')
             await admin.execute(f'DROP ROLE IF EXISTS "{direct_role}"')
             await admin.execute(f'DROP ROLE IF EXISTS "{set_role_login}"')

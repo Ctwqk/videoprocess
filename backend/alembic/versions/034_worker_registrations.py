@@ -321,6 +321,13 @@ def upgrade() -> None:
         unique=True,
         postgresql_where=sa.text("state = 'active'"),
     )
+    op.create_index(
+        "uq_worker_admission_grants_live_database_principal",
+        "worker_admission_grants",
+        ["database_principal"],
+        unique=True,
+        postgresql_where=sa.text("state IN ('pending', 'active')"),
+    )
 
     op.create_table(
         "worker_registrations",
@@ -3039,6 +3046,16 @@ def _operator_active_registration_lock_sql() -> str:
             0
         )
     );
+    IF EXISTS (
+        SELECT 1
+        FROM public.worker_admission_grants AS grant_record
+        GROUP BY grant_record.database_principal
+        HAVING pg_catalog.count(*) > 1
+    ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_conflict',
+            ERRCODE = 'P0001';
+    END IF;
     PERFORM pg_catalog.pg_advisory_xact_lock(
         pg_catalog.hashtextextended(
             'vp-worker-service:' || p_service_name,
@@ -3294,6 +3311,8 @@ DECLARE
     v_registration_id uuid;
     v_locked_registration_id uuid;
     v_existing_state text;
+    v_existing_principal text;
+    v_constraint_name text;
     v_grant_id uuid;
     v_now timestamptz;
 BEGIN
@@ -3343,14 +3362,40 @@ BEGIN
         p_endpoint_bindings_json
     );
 """ + _principal_guard_sql() + _operator_active_registration_lock_sql() + """
-    SELECT grant_row.state
-    INTO v_existing_state
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-database-principal:' || p_database_principal,
+            0
+        )
+    );
+    SELECT grant_row.state, grant_row.database_principal
+    INTO v_existing_state, v_existing_principal
     FROM public.worker_admission_grants AS grant_row
     WHERE grant_row.service_name = p_service_name
       AND grant_row.generation = p_generation
     FOR UPDATE;
+    IF FOUND
+       AND v_existing_principal IS DISTINCT FROM p_database_principal
+    THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_conflict',
+            ERRCODE = 'P0001';
+    END IF;
     IF FOUND AND v_existing_state IS DISTINCT FROM 'pending' THEN
         RAISE EXCEPTION USING MESSAGE = 'grant_disabled', ERRCODE = 'P0001';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM public.worker_admission_grants AS grant_row
+        WHERE grant_row.database_principal = p_database_principal
+          AND (
+              grant_row.service_name IS DISTINCT FROM p_service_name
+              OR grant_row.generation IS DISTINCT FROM p_generation
+          )
+    ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_conflict',
+            ERRCODE = 'P0001';
     END IF;
     v_now := pg_catalog.clock_timestamp();
     BEGIN
@@ -3408,8 +3453,16 @@ BEGIN
         RETURNING id INTO v_grant_id;
     EXCEPTION
         WHEN unique_violation THEN
-            RAISE EXCEPTION USING
-                MESSAGE = 'claim_mismatch',
+            GET STACKED DIAGNOSTICS
+                v_constraint_name = CONSTRAINT_NAME;
+            IF v_constraint_name =
+               'uq_worker_admission_grants_live_database_principal'
+            THEN
+                RAISE EXCEPTION USING
+                    MESSAGE = 'database_principal_conflict',
+                    ERRCODE = 'P0001';
+            END IF;
+            RAISE EXCEPTION USING MESSAGE = 'claim_mismatch',
                 ERRCODE = 'P0001';
     END;
     RETURN v_grant_id;
@@ -3452,6 +3505,23 @@ BEGIN
     FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION USING MESSAGE = 'grant_missing', ERRCODE = 'P0001';
+    END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-database-principal:'
+            || v_grant.database_principal,
+            0
+        )
+    );
+    IF EXISTS (
+        SELECT 1
+        FROM public.worker_admission_grants AS grant_row
+        WHERE grant_row.database_principal = v_grant.database_principal
+          AND grant_row.id <> v_grant.id
+    ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_conflict',
+            ERRCODE = 'P0001';
     END IF;
     IF v_grant.state = 'active' THEN
         FOR v_revoked_principal IN
@@ -3563,6 +3633,23 @@ BEGIN
     FOR UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION USING MESSAGE = 'grant_missing', ERRCODE = 'P0001';
+    END IF;
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'vp-worker-database-principal:'
+            || v_grant.database_principal,
+            0
+        )
+    );
+    IF EXISTS (
+        SELECT 1
+        FROM public.worker_admission_grants AS grant_row
+        WHERE grant_row.database_principal = v_grant.database_principal
+          AND grant_row.id <> v_grant.id
+    ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'database_principal_conflict',
+            ERRCODE = 'P0001';
     END IF;
     IF v_grant.state IS DISTINCT FROM 'revoked' THEN
         v_now := pg_catalog.clock_timestamp();
@@ -8668,6 +8755,10 @@ def downgrade() -> None:
         table_name="worker_registrations",
     )
     op.drop_table("worker_registrations")
+    op.drop_index(
+        "uq_worker_admission_grants_live_database_principal",
+        table_name="worker_admission_grants",
+    )
     op.drop_index(
         "uq_worker_admission_grants_active_service",
         table_name="worker_admission_grants",

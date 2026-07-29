@@ -15,6 +15,7 @@ from typing import Never
 import asyncpg  # type: ignore[import-untyped]
 
 from app.services.worker_role_cli_common import (
+    PinnedPrivateDirectory,
     PrivateDirectorySnapshot,
     WorkerRoleCommonError,
     acquire_database_acl_dcl_lock,
@@ -23,12 +24,14 @@ from app.services.worker_role_cli_common import (
     acquire_worker_service_authority_lock,
     asyncpg_url,
     capture_private_directory,
+    close_pinned_private_directories,
     create_login_role,
     drop_login_roles,
     ensure_stable_role,
     grant_columns,
     grant_functions,
     load_database_url_file,
+    pin_private_directory,
     quarantine_login_roles,
     read_secure_file,
     remove_secure_files,
@@ -36,6 +39,7 @@ from app.services.worker_role_cli_common import (
     role_database_url,
     verify_role_database_url,
     verify_private_directory,
+    verify_pinned_private_directory,
     write_secure_files,
 )
 
@@ -194,6 +198,16 @@ class RuntimeGenerationCredentials:
 @dataclass(frozen=True)
 class RuntimeGrantAuthority:
     state: str
+
+
+class PinnedRuntimeMembers(set[str]):
+    def __init__(
+        self,
+        members: set[str],
+        pins: Sequence[PinnedPrivateDirectory],
+    ) -> None:
+        super().__init__(members)
+        self.pins = tuple(pins)
 
 
 def role_names_for_generation(
@@ -378,6 +392,7 @@ async def _provision(
     paths = credential_paths(state_dir, service_name, generation)
     connection = await asyncpg.connect(asyncpg_url(owner_url))
     created = False
+    operation_pins: list[PinnedPrivateDirectory] = []
     try:
         await acquire_database_acl_dcl_lock(connection)
         await acquire_stable_role_authority_locks(
@@ -414,11 +429,12 @@ async def _provision(
         try:
             if initial_root_snapshot is not None:
                 _verify_directory_snapshot(initial_root_snapshot)
-            tree_snapshots = _runtime_generation_tree_snapshots(
+            tree_pins = _runtime_generation_tree_pins(
                 state_dir,
                 service_name,
                 generation,
             )
+            operation_pins.extend(tree_pins)
         except RuntimeStateTreeError as exc:
             await _deauthorize_generation(connection, names)
             raise RuntimeRoleError("generation state directory invalid") from exc
@@ -448,15 +464,23 @@ async def _provision(
                     paths,
                     names,
                 )
-                _verify_directory_snapshots(tree_snapshots)
+                _verify_pinned_directories(operation_pins)
             except (
                 asyncpg.PostgresError,
                 OSError,
                 RuntimeRoleError,
                 WorkerRoleCommonError,
             ) as exc:
+                tree_error: RuntimeStateTreeError | None = None
+                try:
+                    _verify_pinned_directories(operation_pins)
+                except RuntimeStateTreeError as detected_tree_error:
+                    tree_error = detected_tree_error
                 await _deauthorize_generation(connection, names)
-                if not isinstance(exc, RuntimeStateTreeError):
+                if tree_error is None and not isinstance(
+                    exc,
+                    RuntimeStateTreeError,
+                ):
                     await _converge_members_after_quarantine(
                         connection,
                         owner_url,
@@ -464,6 +488,10 @@ async def _provision(
                         service_name,
                         names,
                     )
+                if tree_error is not None:
+                    raise RuntimeRoleError(
+                        "generation state directory invalid"
+                    ) from tree_error
                 raise RuntimeRoleError("generation state invalid") from exc
             authority = await _classify_generation_authority(
                 connection,
@@ -506,6 +534,7 @@ async def _provision(
                     service_name,
                     names,
                     credentials,
+                    operation_pins,
                 )
             except RuntimeStateTreeError as exc:
                 await _deauthorize_generation(connection, names)
@@ -524,6 +553,15 @@ async def _provision(
                 names,
             )
             if reconstructed is not None:
+                close_pinned_private_directories(operation_pins)
+                operation_pins.clear()
+                operation_pins.extend(
+                    _runtime_generation_tree_pins(
+                        state_dir,
+                        service_name,
+                        generation,
+                    )
+                )
                 await _converge_existing_generation(
                     connection,
                     owner_url,
@@ -531,6 +569,7 @@ async def _provision(
                     service_name,
                     names,
                     reconstructed,
+                    operation_pins,
                 )
                 return
             await _deauthorize_generation(connection, names)
@@ -559,36 +598,48 @@ async def _provision(
             state_dir,
             service_name,
         )
-        async with connection.transaction():
-            await ensure_stable_role(
-                connection,
-                names.stable,
-                setting_prefix="worker_runtime",
-                authorized_members=tuple(
-                    sorted(
-                        {*authorized_members, names.versioned}
-                    )
-                ),
-            )
-            await _set_runtime_privileges(connection, names.stable)
-            await create_login_role(
-                connection,
+        member_pins = tuple(getattr(authorized_members, "pins", ()))
+        authority_pins = (*operation_pins, *member_pins)
+        try:
+            _state_tree_test_hook("before_dcl")
+            _verify_pinned_directories(authority_pins)
+            async with connection.transaction():
+                _verify_pinned_directories(authority_pins)
+                await ensure_stable_role(
+                    connection,
+                    names.stable,
+                    setting_prefix="worker_runtime",
+                    authorized_members=tuple(
+                        sorted(
+                            {*authorized_members, names.versioned}
+                        )
+                    ),
+                )
+                await _set_runtime_privileges(connection, names.stable)
+                await create_login_role(
+                    connection,
+                    names.versioned,
+                    database_password,
+                    setting_prefix="worker_runtime",
+                    stable_role=names.stable,
+                )
+                _state_tree_test_hook("after_dcl")
+                _verify_pinned_directories(authority_pins)
+            created = True
+            database_url = role_database_url(
+                owner_url,
                 names.versioned,
                 database_password,
-                setting_prefix="worker_runtime",
-                stable_role=names.stable,
             )
-        created = True
-        database_url = role_database_url(
-            owner_url,
-            names.versioned,
-            database_password,
-        )
-        await verify_role_database_url(
-            owner_url,
-            database_url,
-            names.versioned,
-        )
+            _verify_pinned_directories(authority_pins)
+            await verify_role_database_url(
+                owner_url,
+                database_url,
+                names.versioned,
+            )
+            _verify_pinned_directories(authority_pins)
+        finally:
+            close_pinned_private_directories(member_pins)
         write_generation_state(
             state_dir,
             service_name,
@@ -613,6 +664,7 @@ async def _provision(
                 pass
         raise
     finally:
+        close_pinned_private_directories(operation_pins)
         await connection.close()
 
 
@@ -722,13 +774,20 @@ async def _converge_members_after_quarantine(
         )
     except RuntimeStateTreeError:
         return
-    async with connection.transaction():
-        await ensure_stable_role(
-            connection,
-            names.stable,
-            setting_prefix="worker_runtime",
-            authorized_members=tuple(sorted(authorized_members)),
-        )
+    member_pins = tuple(getattr(authorized_members, "pins", ()))
+    try:
+        _verify_pinned_directories(member_pins)
+        async with connection.transaction():
+            _verify_pinned_directories(member_pins)
+            await ensure_stable_role(
+                connection,
+                names.stable,
+                setting_prefix="worker_runtime",
+                authorized_members=tuple(sorted(authorized_members)),
+            )
+            _verify_pinned_directories(member_pins)
+    finally:
+        close_pinned_private_directories(member_pins)
 
 
 async def _retire_local_generation(
@@ -950,6 +1009,7 @@ async def _converge_existing_generation(
     service_name: str,
     names: RuntimeRoleNames,
     credentials: RuntimeGenerationCredentials,
+    operation_pins: Sequence[PinnedPrivateDirectory],
 ) -> None:
     authorized_members = await _authorized_runtime_members(
         connection,
@@ -957,21 +1017,47 @@ async def _converge_existing_generation(
         state_dir,
         service_name,
     )
-    async with connection.transaction():
-        await ensure_stable_role(
-            connection,
-            names.stable,
-            setting_prefix="worker_runtime",
-            authorized_members=tuple(
-                sorted({*authorized_members, names.versioned})
-            ),
-        )
-        await _set_runtime_privileges(connection, names.stable)
-    await verify_role_database_url(
-        owner_url,
-        credentials.database_url,
-        names.versioned,
-    )
+    member_pins = tuple(getattr(authorized_members, "pins", ()))
+    authority_pins = (*operation_pins, *member_pins)
+    try:
+        _state_tree_test_hook("before_dcl")
+        _verify_pinned_directories(authority_pins)
+        try:
+            async with connection.transaction():
+                _verify_pinned_directories(authority_pins)
+                await ensure_stable_role(
+                    connection,
+                    names.stable,
+                    setting_prefix="worker_runtime",
+                    authorized_members=tuple(
+                        sorted({*authorized_members, names.versioned})
+                    ),
+                )
+                await _set_runtime_privileges(connection, names.stable)
+                _state_tree_test_hook("after_dcl")
+                _verify_pinned_directories(authority_pins)
+        except BaseException as exc:
+            try:
+                _verify_pinned_directories(authority_pins)
+            except RuntimeStateTreeError as tree_exc:
+                raise tree_exc from exc
+            raise
+        _verify_pinned_directories(authority_pins)
+        try:
+            await verify_role_database_url(
+                owner_url,
+                credentials.database_url,
+                names.versioned,
+            )
+        except BaseException as exc:
+            try:
+                _verify_pinned_directories(authority_pins)
+            except RuntimeStateTreeError as tree_exc:
+                raise tree_exc from exc
+            raise
+        _verify_pinned_directories(authority_pins)
+    finally:
+        close_pinned_private_directories(member_pins)
 
 
 async def _authorized_runtime_members(
@@ -979,32 +1065,63 @@ async def _authorized_runtime_members(
     owner_url: str,
     state_dir: Path,
     service_name: str,
-) -> set[str]:
+) -> PinnedRuntimeMembers:
+    pins: list[PinnedPrivateDirectory] = []
+    try:
+        return await _scan_authorized_runtime_members(
+            connection,
+            owner_url,
+            state_dir,
+            service_name,
+            pins,
+        )
+    except BaseException:
+        close_pinned_private_directories(pins)
+        raise
+
+
+async def _scan_authorized_runtime_members(
+    connection: asyncpg.Connection,
+    owner_url: str,
+    state_dir: Path,
+    service_name: str,
+    pins: list[PinnedPrivateDirectory],
+) -> PinnedRuntimeMembers:
     if not SERVICE_PATTERN.fullmatch(service_name):
         raise RuntimeRoleError("generation service invalid")
-    root_snapshot = _capture_optional_private_directory(state_dir)
-    if root_snapshot is None:
-        return set()
+    root_pin = _pin_optional_private_directory(state_dir)
+    if root_pin is None:
+        return PinnedRuntimeMembers(set(), ())
+    pins.append(root_pin)
     authorized: set[str] = set()
-    with os.scandir(state_dir) as entries:
-        service_names = sorted(
-            entry.name
-            for entry in entries
-            if entry.is_dir(follow_symlinks=False)
-        )
-    _verify_directory_snapshot(root_snapshot)
-    for managed_service_name in service_names:
-        if not SERVICE_PATTERN.fullmatch(managed_service_name):
-            continue
-        service_dir = state_dir / managed_service_name
-        service_snapshot = _capture_required_private_directory(service_dir)
-        with os.scandir(service_dir) as entries:
-            generation_names = sorted(
+    try:
+        with os.scandir(state_dir) as entries:
+            service_names = sorted(
                 entry.name
                 for entry in entries
                 if entry.is_dir(follow_symlinks=False)
             )
-        _verify_directory_snapshot(service_snapshot)
+        _verify_pinned_directories(pins)
+    except BaseException:
+        close_pinned_private_directories(pins)
+        raise
+    for managed_service_name in service_names:
+        if not SERVICE_PATTERN.fullmatch(managed_service_name):
+            continue
+        service_dir = state_dir / managed_service_name
+        try:
+            service_pin = _pin_required_private_directory(service_dir)
+            pins.append(service_pin)
+            with os.scandir(service_dir) as entries:
+                generation_names = sorted(
+                    entry.name
+                    for entry in entries
+                    if entry.is_dir(follow_symlinks=False)
+                )
+            _verify_pinned_directories(pins)
+        except BaseException:
+            close_pinned_private_directories(pins)
+            raise
         for generation_name in generation_names:
             if (
                 not generation_name.isascii()
@@ -1020,8 +1137,9 @@ async def _authorized_runtime_members(
                 managed_service_name,
                 generation,
             )
+            generation_pin: PinnedPrivateDirectory | None = None
             try:
-                generation_snapshot = _capture_required_private_directory(
+                generation_pin = _pin_required_private_directory(
                     generation_dir
                 )
                 credentials = await _validate_existing_generation(
@@ -1043,27 +1161,37 @@ async def _authorized_runtime_members(
                     names,
                     credentials.admission_token,
                 )
-                _verify_directory_snapshots(
-                    (
-                        root_snapshot,
-                        service_snapshot,
-                        generation_snapshot,
-                    )
-                )
+                verify_pinned_private_directory(generation_pin)
+                _verify_pinned_directories(pins)
             except (
                 asyncpg.PostgresError,
                 OSError,
                 RuntimeRoleError,
                 WorkerRoleCommonError,
             ):
-                await _deauthorize_generation(connection, names)
+                if generation_pin is not None:
+                    generation_pin.close()
+                try:
+                    await _deauthorize_generation(connection, names)
+                except BaseException:
+                    close_pinned_private_directories(pins)
+                    raise
                 continue
+            pins.append(generation_pin)
             if authority.state in {"none", "pending", "active"}:
                 authorized.add(names.versioned)
             else:
-                await _deauthorize_generation(connection, names)
-    _verify_directory_snapshot(root_snapshot)
-    return authorized
+                try:
+                    await _deauthorize_generation(connection, names)
+                except BaseException:
+                    close_pinned_private_directories(pins)
+                    raise
+    try:
+        _verify_pinned_directories(pins)
+    except BaseException:
+        close_pinned_private_directories(pins)
+        raise
+    return PinnedRuntimeMembers(authorized, pins)
 
 
 def _managed_runtime_service_names(
@@ -1101,6 +1229,31 @@ def _capture_optional_private_directory(
     return _capture_required_private_directory(path)
 
 
+def _pin_optional_private_directory(
+    path: Path,
+) -> PinnedPrivateDirectory | None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeStateTreeError(
+            "generation state directory invalid"
+        ) from exc
+    return _pin_required_private_directory(path)
+
+
+def _pin_required_private_directory(
+    path: Path,
+) -> PinnedPrivateDirectory:
+    try:
+        return pin_private_directory(path)
+    except WorkerRoleCommonError as exc:
+        raise RuntimeStateTreeError(
+            "generation state directory invalid"
+        ) from exc
+
+
 def _capture_required_private_directory(
     path: Path,
 ) -> PrivateDirectorySnapshot:
@@ -1121,35 +1274,50 @@ def _verify_directory_snapshot(snapshot: PrivateDirectorySnapshot) -> None:
         ) from exc
 
 
-def _verify_directory_snapshots(
-    snapshots: Sequence[PrivateDirectorySnapshot],
+def _verify_pinned_directories(
+    pins: Sequence[PinnedPrivateDirectory],
 ) -> None:
-    for snapshot in snapshots:
-        _verify_directory_snapshot(snapshot)
+    for pin in pins:
+        try:
+            verify_pinned_private_directory(pin)
+        except WorkerRoleCommonError as exc:
+            raise RuntimeStateTreeError(
+                "generation state directory invalid"
+            ) from exc
 
 
-def _runtime_generation_tree_snapshots(
+def _state_tree_test_hook(phase: str) -> None:
+    del phase
+
+
+def _runtime_generation_tree_pins(
     state_dir: Path,
     service_name: str,
     generation: int,
-) -> tuple[PrivateDirectorySnapshot, ...]:
-    root_snapshot = _capture_optional_private_directory(state_dir)
-    if root_snapshot is None:
-        return ()
-    snapshots = [root_snapshot]
-    service_snapshot = _capture_optional_private_directory(
-        state_dir / service_name
-    )
-    if service_snapshot is None:
-        return tuple(snapshots)
-    snapshots.append(service_snapshot)
-    generation_snapshot = _capture_optional_private_directory(
-        state_dir / service_name / str(generation)
-    )
-    if generation_snapshot is not None:
-        snapshots.append(generation_snapshot)
-    _verify_directory_snapshots(snapshots)
-    return tuple(snapshots)
+) -> tuple[PinnedPrivateDirectory, ...]:
+    pins: list[PinnedPrivateDirectory] = []
+    try:
+        root_pin = _pin_optional_private_directory(state_dir)
+        if root_pin is None:
+            return ()
+        pins.append(root_pin)
+        service_pin = _pin_optional_private_directory(
+            state_dir / service_name
+        )
+        if service_pin is None:
+            _verify_pinned_directories(pins)
+            return tuple(pins)
+        pins.append(service_pin)
+        generation_pin = _pin_optional_private_directory(
+            state_dir / service_name / str(generation)
+        )
+        if generation_pin is not None:
+            pins.append(generation_pin)
+        _verify_pinned_directories(pins)
+        return tuple(pins)
+    except BaseException:
+        close_pinned_private_directories(pins)
+        raise
 
 
 def _require_private_state_directory(path: Path) -> None:
@@ -1164,6 +1332,7 @@ async def _revoke(
     names: RuntimeRoleNames,
 ) -> None:
     connection = await asyncpg.connect(asyncpg_url(owner_url))
+    operation_pins: list[PinnedPrivateDirectory] = []
     try:
         await acquire_database_acl_dcl_lock(connection)
         await acquire_stable_role_authority_locks(
@@ -1179,15 +1348,17 @@ async def _revoke(
             f"runtime:{service_name}:{generation}",
         )
         try:
-            tree_snapshots = _runtime_generation_tree_snapshots(
+            tree_pins = _runtime_generation_tree_pins(
                 state_dir,
                 service_name,
                 generation,
             )
+            operation_pins.extend(tree_pins)
         except RuntimeStateTreeError as exc:
             await _deauthorize_generation(connection, names)
             raise RuntimeRoleError("generation state directory invalid") from exc
         async with connection.transaction():
+            _verify_pinned_directories(operation_pins)
             if await connection.fetchval(
                 """
                 SELECT
@@ -1209,8 +1380,16 @@ async def _revoke(
                 names.versioned,
             ):
                 raise RuntimeRoleError("worker role is still admitted")
-        _verify_directory_snapshots(tree_snapshots)
-        await drop_login_roles(connection, (names.versioned,))
+            _verify_pinned_directories(operation_pins)
+        await drop_login_roles(
+            connection,
+            (names.versioned,),
+            state_guard=lambda: _verify_pinned_directories(
+                operation_pins
+            ),
+        )
+        close_pinned_private_directories(operation_pins)
+        operation_pins.clear()
         remove_secure_files(
             state_dir,
             (service_name, str(generation)),
@@ -1226,6 +1405,7 @@ async def _revoke(
     except (asyncpg.PostgresError, WorkerRoleCommonError) as exc:
         raise RuntimeRoleError("generation state removal failed") from exc
     finally:
+        close_pinned_private_directories(operation_pins)
         await connection.close()
 
 
