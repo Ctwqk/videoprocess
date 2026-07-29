@@ -36,6 +36,16 @@ Task 2: BLOCKED — the remaining Redis event-marker lifecycle finding is real
 and load-bearing for Task 3/Task 4. The five-round breaker has tripped; do not
 dispatch more fixes or build downstream worker/deployment work on this
 incomplete idempotency protocol without explicit human direction.
+Task 2 breaker recheck: RESOLVED — the explicitly authorized worker
+event-marker lifecycle increment (352f3ba..d4975bb) now supplies the concrete
+PostgreSQL/Redis readiness, janitor, repair, scheduler, role, and deployment
+gate. Its sole final fix passed a scoped independent review with zero Critical
+or Important findings; the mandatory breaker is closed and Task 3 may resume.
+Task 2 follow-up (non-blocking for Task 3, required before production rollout):
+on a native `flock` operational failure, invalidate any prior same-generation
+readiness status so an independent `status` call cannot reuse it for the
+remaining 90-second freshness window. The direct deploy transaction already
+fails before `status`, so this does not reopen the Task 2 breaker.
 Task 3: pending
 Task 4: pending
 Task 5: pending
