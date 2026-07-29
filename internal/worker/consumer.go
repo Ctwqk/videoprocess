@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/redisstream"
+	"github.com/Ctwqk/videoprocess/internal/store"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -29,6 +31,39 @@ type NodeResult struct {
 	OutputArtifactID string
 }
 
+type RegisteredTaskStore interface {
+	ClaimWorkerNode(
+		context.Context,
+		store.WorkerRegistrationLease,
+		uuid.UUID,
+		uuid.UUID,
+		store.WorkerTaskDeliveryProof,
+	) (store.WorkerNodeClaim, error)
+	PrepareWorkerEvent(
+		context.Context,
+		store.WorkerNodeClaim,
+		string,
+		string,
+		map[string]string,
+	) (uuid.UUID, error)
+	PublishPreparedWorkerEvent(
+		context.Context,
+		store.WorkerRegistrationLease,
+		uuid.UUID,
+		store.WorkerEventPublisher,
+	) (store.WorkerNodeClaim, error)
+	ListPreparedWorkerEventIDs(
+		context.Context,
+		store.WorkerRegistrationLease,
+		int,
+	) ([]uuid.UUID, error)
+	AcknowledgeWorkerTask(
+		context.Context,
+		store.WorkerNodeClaim,
+		store.WorkerTaskAcknowledger,
+	) error
+}
+
 // Consumer drives the Redis Streams loop for one Go worker instance. The
 // design mirrors the Python worker minus the heartbeat/PEL-reclaim helpers,
 // which can be added in a follow-up alongside cancellation listeners.
@@ -38,9 +73,13 @@ type Consumer struct {
 	WorkerID      string
 	ConsumerGroup string
 	BlockTimeout  time.Duration
+	Registration  *Registration
 	cfg           Config
+	taskStore     RegisteredTaskStore
 	handlers      map[string]Handler
 	log           *slog.Logger
+	processingMu  sync.Mutex
+	processing    map[string]struct{}
 }
 
 // NewConsumer wires a consumer with sensible defaults and the handler set
@@ -51,23 +90,41 @@ func NewConsumer(client *redis.Client, cfg Config, handlers ...Handler) *Consume
 	for _, h := range handlers {
 		registry[h.NodeType()] = h
 	}
+	group := strings.TrimSpace(cfg.RedisGroup)
+	if group == "" {
+		group = cfg.WorkerType + "-workers"
+	}
 	return &Consumer{
 		Redis:         client,
 		WorkerType:    cfg.WorkerType,
 		WorkerID:      cfg.WorkerID,
-		ConsumerGroup: cfg.WorkerType + "-workers",
+		ConsumerGroup: group,
 		BlockTimeout:  5 * time.Second,
 		cfg:           cfg,
 		handlers:      registry,
 		log:           slog.With("worker_id", cfg.WorkerID, "worker_type", cfg.WorkerType),
+		processing:    make(map[string]struct{}),
 	}
+}
+
+func NewRegisteredConsumer(
+	client *redis.Client,
+	cfg Config,
+	taskStore RegisteredTaskStore,
+	registration *Registration,
+	handlers ...Handler,
+) *Consumer {
+	consumer := NewConsumer(client, cfg, handlers...)
+	consumer.taskStore = taskStore
+	consumer.Registration = registration
+	return consumer
 }
 
 // EnsureGroup creates the consumer group if it does not yet exist. The
 // `MKSTREAM` flag mirrors the Python implementation: a freshly booted system
 // can start its workers before any task has ever been enqueued.
 func (c *Consumer) EnsureGroup(ctx context.Context) error {
-	stream := redisstream.TaskStream(c.WorkerType)
+	stream := c.taskStream()
 	if err := c.Redis.XGroupCreateMkStream(ctx, stream, c.ConsumerGroup, "$").Err(); err != nil {
 		if !strings.Contains(err.Error(), "BUSYGROUP") {
 			return fmt.Errorf("create consumer group %s: %w", c.ConsumerGroup, err)
@@ -81,13 +138,25 @@ func (c *Consumer) EnsureGroup(ctx context.Context) error {
 // one task to keep the loop deterministic for tests; production tuning of
 // batch size is a follow-up.
 func (c *Consumer) Run(ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), ErrRegistrationLost) {
+		return ErrRegistrationLost
+	}
 	if err := c.EnsureGroup(ctx); err != nil {
+		if errors.Is(context.Cause(ctx), ErrRegistrationLost) {
+			return ErrRegistrationLost
+		}
 		return err
 	}
-	if _, err := c.ReclaimPending(ctx); err != nil {
+	if _, err := c.reclaimPending(ctx); err != nil {
 		c.log.Warn("initial pending reclaim failed", "error", err)
 	}
-	stream := redisstream.TaskStream(c.WorkerType)
+	if _, err := c.ReclaimPreferredPending(ctx); err != nil {
+		c.log.Warn("initial preferred pending reclaim failed", "error", err)
+	}
+	if err := c.ReconcilePreparedWorkerEvents(ctx); err != nil {
+		c.log.Warn("initial prepared event reconciliation deferred", "error", err)
+	}
+	stream := c.taskStream()
 	concurrency := c.cfg.Concurrency
 	if concurrency <= 0 {
 		concurrency = 2
@@ -96,13 +165,27 @@ func (c *Consumer) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	reclaimTicker := time.NewTicker(c.reclaimInterval())
 	defer reclaimTicker.Stop()
+	affinityTicker := time.NewTicker(time.Second)
+	defer affinityTicker.Stop()
+	eventTicker := time.NewTicker(5 * time.Second)
+	defer eventTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return c.waitForActive(ctx, &wg)
 		case <-reclaimTicker.C:
-			if _, err := c.ReclaimPending(ctx); err != nil {
+			if _, err := c.reclaimPending(ctx); err != nil {
 				c.log.Warn("periodic pending reclaim failed", "error", err)
+			}
+			continue
+		case <-affinityTicker.C:
+			if _, err := c.ReclaimPreferredPending(ctx); err != nil {
+				c.log.Warn("preferred pending reclaim failed", "error", err)
+			}
+			continue
+		case <-eventTicker.C:
+			if err := c.ReconcilePreparedWorkerEvents(ctx); err != nil {
+				c.log.Warn("prepared event reconciliation deferred", "error", err)
 			}
 			continue
 		case sem <- struct{}{}:
@@ -144,6 +227,272 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 }
 
+func (c *Consumer) taskStream() string {
+	if c.Registration != nil {
+		if stream := strings.TrimSpace(c.cfg.RedisStream); stream != "" {
+			return stream
+		}
+	}
+	return redisstream.TaskStream(c.WorkerType)
+}
+
+func (c *Consumer) reclaimPending(ctx context.Context) (int, error) {
+	if c.Registration == nil {
+		return c.ReclaimPending(ctx)
+	}
+	minimumIdle := c.cfg.PELMinIdle
+	if minimumIdle <= 0 {
+		minimumIdle = 15 * time.Minute
+	}
+	messages, _, err := c.Redis.XAutoClaim(
+		ctx,
+		&redis.XAutoClaimArgs{
+			Stream:   c.taskStream(),
+			Group:    c.ConsumerGroup,
+			Consumer: c.WorkerID,
+			MinIdle:  minimumIdle,
+			Start:    "0-0",
+			Count:    100,
+		},
+	).Result()
+	if err != nil {
+		return 0, err
+	}
+	if len(messages) > 0 {
+		workerPendingReclaimsTotal.WithLabelValues(c.WorkerType).Add(
+			float64(len(messages)),
+		)
+	}
+	for _, message := range messages {
+		c.handleMessage(ctx, message)
+	}
+	return len(messages), nil
+}
+
+func (c *Consumer) startTaskHeartbeat(
+	ctx context.Context,
+	messageID string,
+) <-chan struct{} {
+	if c.Registration == nil {
+		return c.StartHeartbeat(ctx, messageID)
+	}
+	done := make(chan struct{})
+	interval := c.cfg.HeartbeatInterval
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := c.Redis.XClaim(
+					ctx,
+					&redis.XClaimArgs{
+						Stream:   c.taskStream(),
+						Group:    c.ConsumerGroup,
+						Consumer: c.WorkerID,
+						MinIdle:  0,
+						Messages: []string{messageID},
+					},
+				).Err(); err != nil && err != redis.Nil {
+					c.log.Warn(
+						"worker heartbeat failed",
+						"msg_id",
+						messageID,
+						"error",
+						err,
+					)
+					workerHeartbeatFailuresTotal.WithLabelValues(
+						c.WorkerType,
+					).Inc()
+				}
+			}
+		}
+	}()
+	return done
+}
+
+func (c *Consumer) shouldDeferRegisteredForAffinity(
+	task TaskMessage,
+	now time.Time,
+) bool {
+	if len(task.PreferredHosts) == 0 {
+		return false
+	}
+	host := strings.TrimSpace(c.cfg.WorkerHost)
+	if host == "" {
+		host = registeredWorkerHost(c.WorkerID)
+	}
+	for _, preferred := range task.PreferredHosts {
+		if strings.EqualFold(strings.TrimSpace(preferred), host) {
+			return false
+		}
+	}
+	maximumBounces := c.cfg.AffinityMaxBounces
+	if maximumBounces <= 0 {
+		maximumBounces = 6
+	}
+	if parseIntDefault(task.AffinityBounces, 0) >= maximumBounces {
+		return false
+	}
+	return c.affinityWindowActive(task, now)
+}
+
+func (c *Consumer) ReclaimPreferredPending(ctx context.Context) (int, error) {
+	messages, err := c.claimPreferredPending(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, message := range messages {
+		c.handleMessage(ctx, message)
+	}
+	return len(messages), nil
+}
+
+func (c *Consumer) claimPreferredPending(
+	ctx context.Context,
+) ([]redis.XMessage, error) {
+	if c.Registration == nil {
+		return nil, nil
+	}
+	const minimumIdle = 500 * time.Millisecond
+	pending, err := c.Redis.XPendingExt(
+		ctx,
+		&redis.XPendingExtArgs{
+			Stream: c.taskStream(),
+			Group:  c.ConsumerGroup,
+			Start:  "-",
+			End:    "+",
+			Count:  50,
+		},
+	).Result()
+	if err != nil {
+		return nil, err
+	}
+	claimed := make([]redis.XMessage, 0)
+	now := time.Now().UTC()
+	for _, entry := range pending {
+		if entry.ID == "" || entry.Idle < minimumIdle {
+			continue
+		}
+		exact, err := c.Redis.XRangeN(
+			ctx,
+			c.taskStream(),
+			entry.ID,
+			entry.ID,
+			1,
+		).Result()
+		if err != nil {
+			return nil, err
+		}
+		if len(exact) != 1 || exact[0].ID != entry.ID {
+			continue
+		}
+		task, err := decodeTask(exact[0].Values)
+		if err != nil {
+			continue
+		}
+		if entry.Consumer == c.WorkerID {
+			if len(task.PreferredHosts) == 0 ||
+				c.registeredMessageIsProcessing(entry.ID) ||
+				c.affinityWindowActive(task, now) {
+				continue
+			}
+			claimed = append(claimed, exact[0])
+			continue
+		}
+		if !c.taskPrefersCurrentHost(task) ||
+			!c.affinityWindowActive(task, now) {
+			continue
+		}
+		messages, err := c.Redis.XClaim(
+			ctx,
+			&redis.XClaimArgs{
+				Stream:   c.taskStream(),
+				Group:    c.ConsumerGroup,
+				Consumer: c.WorkerID,
+				MinIdle:  minimumIdle,
+				Messages: []string{entry.ID},
+			},
+		).Result()
+		if err != nil && err != redis.Nil {
+			return nil, err
+		}
+		for _, message := range messages {
+			if message.ID == entry.ID {
+				claimed = append(claimed, message)
+			}
+		}
+	}
+	return claimed, nil
+}
+
+func (c *Consumer) taskPrefersCurrentHost(task TaskMessage) bool {
+	host := strings.TrimSpace(c.cfg.WorkerHost)
+	if host == "" {
+		host = registeredWorkerHost(c.WorkerID)
+	}
+	for _, preferred := range task.PreferredHosts {
+		if strings.EqualFold(strings.TrimSpace(preferred), host) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Consumer) affinityWindowActive(
+	task TaskMessage,
+	now time.Time,
+) bool {
+	enqueuedAt := parseAffinityTime(task.AffinityEnqueuedAt, now)
+	wait := c.cfg.AffinityWait
+	if wait <= 0 {
+		wait = 20 * time.Second
+	}
+	age := now.Sub(enqueuedAt)
+	return age < wait
+}
+
+func registeredWorkerHost(workerID string) string {
+	_, suffix, found := strings.Cut(workerID, "@")
+	if !found {
+		return workerID
+	}
+	host, _, found := strings.Cut(suffix, ":")
+	if found {
+		return host
+	}
+	return suffix
+}
+
+func (c *Consumer) beginRegisteredMessage(messageID string) bool {
+	c.processingMu.Lock()
+	defer c.processingMu.Unlock()
+	if _, exists := c.processing[messageID]; exists {
+		return false
+	}
+	c.processing[messageID] = struct{}{}
+	return true
+}
+
+func (c *Consumer) endRegisteredMessage(messageID string) {
+	c.processingMu.Lock()
+	delete(c.processing, messageID)
+	c.processingMu.Unlock()
+}
+
+func (c *Consumer) registeredMessageIsProcessing(messageID string) bool {
+	c.processingMu.Lock()
+	defer c.processingMu.Unlock()
+	_, exists := c.processing[messageID]
+	return exists
+}
+
 func (c *Consumer) reclaimInterval() time.Duration {
 	if c.cfg.PELReclaimInterval > 0 {
 		return c.cfg.PELReclaimInterval
@@ -165,14 +514,25 @@ func (c *Consumer) waitForActive(ctx context.Context, wg *sync.WaitGroup) error 
 	defer timer.Stop()
 	select {
 	case <-done:
-		return ctx.Err()
+		return consumerContextError(ctx)
 	case <-timer.C:
 		c.log.Warn("worker shutdown grace period expired")
-		return ctx.Err()
+		return consumerContextError(ctx)
 	}
 }
 
+func consumerContextError(ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), ErrRegistrationLost) {
+		return ErrRegistrationLost
+	}
+	return ctx.Err()
+}
+
 func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
+	if c.Registration != nil {
+		c.handleRegisteredMessage(ctx, msg)
+		return
+	}
 	started := time.Now()
 	task, err := decodeTask(msg.Values)
 	if err != nil {
@@ -243,8 +603,292 @@ func (c *Consumer) handleMessage(ctx context.Context, msg redis.XMessage) {
 	}
 }
 
+func (c *Consumer) handleRegisteredMessage(
+	ctx context.Context,
+	msg redis.XMessage,
+) {
+	if !c.beginRegisteredMessage(msg.ID) {
+		return
+	}
+	defer c.endRegisteredMessage(msg.ID)
+	if c.taskStore == nil {
+		c.log.Error("registered task store is unavailable", "msg_id", msg.ID)
+		return
+	}
+	rawPayload, err := redisStringPayload(msg.Values)
+	if err != nil {
+		c.log.Error("invalid registered task payload", "msg_id", msg.ID)
+		return
+	}
+	payloadHash, err := store.CanonicalRedisPayloadSHA256(rawPayload)
+	if err != nil {
+		c.log.Error("invalid registered task hash", "msg_id", msg.ID)
+		return
+	}
+	task, err := decodeTask(msg.Values)
+	if err != nil {
+		c.log.Error("invalid registered task payload", "msg_id", msg.ID)
+		return
+	}
+	dispatchKey, err := uuid.Parse(task.DispatchKey)
+	if err != nil ||
+		dispatchKey == uuid.Nil ||
+		task.DispatchKey != dispatchKey.String() {
+		c.log.Error("invalid registered task dispatch", "msg_id", msg.ID)
+		return
+	}
+	if c.shouldDeferRegisteredForAffinity(task, time.Now().UTC()) {
+		// The orchestrator-created delivery remains unchanged in the PEL.
+		return
+	}
+	jobID, jobErr := uuid.Parse(task.JobID)
+	nodeExecutionID, nodeErr := uuid.Parse(task.NodeExecutionID)
+	if jobErr != nil ||
+		nodeErr != nil ||
+		jobID == uuid.Nil ||
+		nodeExecutionID == uuid.Nil {
+		c.log.Error("invalid registered task identity", "msg_id", msg.ID)
+		return
+	}
+	proof := store.WorkerTaskDeliveryProof{
+		RedisStream:   c.taskStream(),
+		ConsumerGroup: c.ConsumerGroup,
+		MessageID:     msg.ID,
+		PayloadSHA256: payloadHash,
+		DispatchKey:   dispatchKey,
+	}
+
+	taskContext, taskCancel := context.WithCancel(ctx)
+	heartbeatDone := c.startTaskHeartbeat(taskContext, msg.ID)
+	defer func() {
+		taskCancel()
+		<-heartbeatDone
+	}()
+	claim, err := c.taskStore.ClaimWorkerNode(
+		taskContext,
+		c.Registration.Lease(),
+		jobID,
+		nodeExecutionID,
+		proof,
+	)
+	if err != nil {
+		c.log.Warn("registered task claim rejected", "msg_id", msg.ID)
+		return
+	}
+	task.WorkerClaim = &claim
+	handler, ok := c.handlers[task.NodeType]
+	if !ok {
+		if err := c.finishRegisteredTask(
+			taskContext,
+			claim,
+			store.FailedWorkerEventValues(
+				claim,
+				proof,
+				fmt.Sprintf("no handler for node_type %q", task.NodeType),
+			),
+			task.EventStream,
+		); err != nil {
+			c.log.Warn("registered task failure deferred", "msg_id", msg.ID)
+		}
+		return
+	}
+	result, handlerErr := handler.Execute(taskContext, task)
+	switch {
+	case handlerErr == nil &&
+		strings.TrimSpace(result.OutputArtifactID) != "":
+		err = c.finishRegisteredTask(
+			taskContext,
+			claim,
+			store.CompletedWorkerEventValues(
+				claim,
+				proof,
+				result.OutputArtifactID,
+			),
+			task.EventStream,
+		)
+	case handlerErr == nil:
+		err = c.finishRegisteredTask(
+			taskContext,
+			claim,
+			store.FailedWorkerEventValues(
+				claim,
+				proof,
+				"handler succeeded without output_artifact_id",
+			),
+			task.EventStream,
+		)
+	case errors.Is(handlerErr, ErrConfirmedCancellation),
+		errors.Is(handlerErr, context.Canceled):
+		return
+	default:
+		err = c.finishRegisteredTask(
+			taskContext,
+			claim,
+			store.FailedWorkerEventValues(claim, proof, handlerErr.Error()),
+			task.EventStream,
+		)
+	}
+	if err != nil {
+		c.log.Warn("registered task finalization deferred", "msg_id", msg.ID)
+	}
+}
+
+func (c *Consumer) finishRegisteredTask(
+	ctx context.Context,
+	claim store.WorkerNodeClaim,
+	values map[string]string,
+	eventStream string,
+) error {
+	if strings.TrimSpace(eventStream) == "" {
+		eventStream = redisstream.EventStream
+	}
+	emissionID, err := c.taskStore.PrepareWorkerEvent(
+		ctx,
+		claim,
+		eventStream,
+		"orchestrator",
+		values,
+	)
+	if err != nil {
+		return err
+	}
+	publishedClaim, err := c.publishPreparedWorkerEventWithRetry(
+		ctx,
+		emissionID,
+	)
+	if err != nil {
+		return err
+	}
+	return c.acknowledgeRegisteredTaskWithRetry(ctx, publishedClaim)
+}
+
+func (c *Consumer) publishPreparedWorkerEventWithRetry(
+	ctx context.Context,
+	emissionID uuid.UUID,
+) (store.WorkerNodeClaim, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		claim, err := c.taskStore.PublishPreparedWorkerEvent(
+			ctx,
+			c.Registration.Lease(),
+			emissionID,
+			func(
+				callbackContext context.Context,
+				stream string,
+				marker string,
+				values map[string]string,
+			) (string, error) {
+				return redisstream.PublishIdempotentWorkerEvent(
+					callbackContext,
+					c.Redis,
+					stream,
+					marker,
+					values,
+				)
+			},
+		)
+		if err == nil {
+			return claim, nil
+		}
+		lastErr = err
+		if !waitRegisteredRetry(ctx, attempt) {
+			break
+		}
+	}
+	return store.WorkerNodeClaim{}, lastErr
+}
+
+func (c *Consumer) acknowledgeRegisteredTaskWithRetry(
+	ctx context.Context,
+	claim store.WorkerNodeClaim,
+) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		err := c.taskStore.AcknowledgeWorkerTask(
+			ctx,
+			claim,
+			func(
+				callbackContext context.Context,
+				stream string,
+				group string,
+				messageID string,
+			) (int64, error) {
+				return redisstream.AcknowledgeWorkerTask(
+					callbackContext,
+					c.Redis,
+					stream,
+					group,
+					messageID,
+				)
+			},
+		)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !waitRegisteredRetry(ctx, attempt) {
+			break
+		}
+	}
+	return lastErr
+}
+
+func (c *Consumer) ReconcilePreparedWorkerEvents(ctx context.Context) error {
+	if c.Registration == nil || c.taskStore == nil {
+		return nil
+	}
+	emissionIDs, err := c.taskStore.ListPreparedWorkerEventIDs(
+		ctx,
+		c.Registration.Lease(),
+		100,
+	)
+	if err != nil {
+		return err
+	}
+	var lastErr error
+	for _, emissionID := range emissionIDs {
+		claim, err := c.publishPreparedWorkerEventWithRetry(ctx, emissionID)
+		if err == nil {
+			err = c.acknowledgeRegisteredTaskWithRetry(ctx, claim)
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+func waitRegisteredRetry(ctx context.Context, attempt int) bool {
+	if attempt >= 2 {
+		return false
+	}
+	timer := time.NewTimer(time.Duration(25*(1<<attempt)) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func redisStringPayload(values map[string]any) (map[string]string, error) {
+	payload := make(map[string]string, len(values))
+	for key, value := range values {
+		text, ok := value.(string)
+		if !ok || strings.TrimSpace(key) == "" {
+			return nil, errors.New("registered task payload is invalid")
+		}
+		payload[key] = text
+	}
+	if len(payload) == 0 {
+		return nil, errors.New("registered task payload is invalid")
+	}
+	return payload, nil
+}
+
 func (c *Consumer) ack(ctx context.Context, msgID string) {
-	stream := redisstream.TaskStream(c.WorkerType)
+	stream := c.taskStream()
 	if err := c.Redis.XAck(ctx, stream, c.ConsumerGroup, msgID).Err(); err != nil {
 		c.log.Warn("xack failed", "msg_id", msgID, "error", err)
 	}
@@ -283,6 +927,7 @@ func decodeTask(values map[string]any) (TaskMessage, error) {
 		NodeType:           get("node_type"),
 		EventStream:        get("event_stream"),
 		OrchestratorOwner:  get("orchestrator_owner"),
+		DispatchKey:        get("dispatch_key"),
 		AffinityEnqueuedAt: get("affinity_enqueued_at"),
 		AffinityBounces:    get("affinity_bounces"),
 	}
@@ -324,7 +969,7 @@ func encodeTask(task TaskMessage) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
+	values := map[string]any{
 		"job_id":               task.JobID,
 		"node_execution_id":    task.NodeExecutionID,
 		"node_id":              task.NodeID,
@@ -336,5 +981,9 @@ func encodeTask(task TaskMessage) (map[string]any, error) {
 		"preferred_hosts":      string(preferredHosts),
 		"affinity_enqueued_at": task.AffinityEnqueuedAt,
 		"affinity_bounces":     task.AffinityBounces,
-	}, nil
+	}
+	if task.DispatchKey != "" {
+		values["dispatch_key"] = task.DispatchKey
+	}
+	return values, nil
 }

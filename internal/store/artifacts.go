@@ -32,6 +32,8 @@ type CreateArtifactInput struct {
 	MediaInfo       any
 }
 
+type WorkerArtifactSaver func(context.Context) error
+
 func (s *Store) GetArtifact(ctx context.Context, id string) (ArtifactRow, error) {
 	var row ArtifactRow
 	var uuid [16]byte
