@@ -17,6 +17,7 @@ import asyncpg  # type: ignore[import-untyped]
 
 from app.services.worker_role_cli_common import (
     WorkerRoleCommonError,
+    acquire_role_lifecycle_lock,
     acquire_stable_role_authority_locks,
     acquire_worker_service_authority_lock,
     asyncpg_url,
@@ -376,9 +377,17 @@ async def _provision(
             connection,
             (names.stable,),
         )
-        await acquire_worker_service_authority_lock(
-            connection,
+        for managed_service_name in _managed_runtime_service_names(
+            state_dir,
             service_name,
+        ):
+            await acquire_worker_service_authority_lock(
+                connection,
+                managed_service_name,
+            )
+        await acquire_role_lifecycle_lock(
+            connection,
+            f"runtime:{service_name}:{generation}",
         )
         state_presence = {
             purpose: path.exists()
@@ -398,20 +407,28 @@ async def _provision(
         )
         if all(state_presence.values()):
             try:
-                authority_token = read_secure_file(
-                    paths["admission_token"],
-                    required_mode=0o400,
-                ).strip()
-            except WorkerRoleCommonError as exc:
+                credentials = await _validate_existing_generation(
+                    connection,
+                    owner_url,
+                    service_name,
+                    generation,
+                    paths,
+                    names,
+                )
+            except (
+                asyncpg.PostgresError,
+                OSError,
+                RuntimeRoleError,
+                WorkerRoleCommonError,
+            ) as exc:
+                await _deauthorize_generation(connection, names)
                 raise RuntimeRoleError("generation state invalid") from exc
-            if not authority_token:
-                raise RuntimeRoleError("generation state invalid")
             authority = await _classify_generation_authority(
                 connection,
                 service_name,
                 generation,
                 names,
-                authority_token,
+                credentials.admission_token,
             )
             if authority.state == "revoked":
                 await _retire_local_generation(
@@ -425,14 +442,6 @@ async def _provision(
             if authority.state == "mismatch":
                 await _deauthorize_generation(connection, names)
                 raise RuntimeRoleError("generation authority mismatch")
-            credentials = await _validate_existing_generation(
-                connection,
-                owner_url,
-                service_name,
-                generation,
-                paths,
-                names,
-            )
             await _converge_existing_generation(
                 connection,
                 owner_url,
@@ -642,10 +651,39 @@ async def _deauthorize_generation(
     ):
         return
     async with connection.transaction():
+        quoted_versioned = quote_identifier(names.versioned)
         await connection.execute(
-            f"REVOKE {quote_identifier(names.stable)} "
-            f"FROM {quote_identifier(names.versioned)}"
+            f"ALTER ROLE {quoted_versioned} NOLOGIN"
         )
+        if await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_auth_members AS membership
+                JOIN pg_catalog.pg_roles AS granted
+                  ON granted.oid = membership.roleid
+                JOIN pg_catalog.pg_roles AS member
+                  ON member.oid = membership.member
+                WHERE granted.rolname = $1
+                  AND member.rolname = $2
+            )
+            """,
+            names.stable,
+            names.versioned,
+        ):
+            await connection.execute(
+                f"REVOKE {quote_identifier(names.stable)} "
+                f"FROM {quoted_versioned}"
+            )
+    await connection.execute(
+        """
+        SELECT pg_catalog.pg_terminate_backend(activity.pid)
+        FROM pg_catalog.pg_stat_activity AS activity
+        WHERE activity.usename = $1
+          AND activity.pid <> pg_catalog.pg_backend_pid()
+        """,
+        names.versioned,
+    )
 
 
 async def _retire_local_generation(
@@ -901,12 +939,12 @@ async def _authorized_runtime_members(
             if generation > MAX_GENERATION:
                 continue
             generation_dir = service_dir / generation_name
+            names = role_names_for_generation(
+                managed_service_name,
+                generation,
+            )
             try:
                 _require_private_state_directory(generation_dir)
-                names = role_names_for_generation(
-                    managed_service_name,
-                    generation,
-                )
                 credentials = await _validate_existing_generation(
                     connection,
                     owner_url,
@@ -932,10 +970,33 @@ async def _authorized_runtime_members(
                 RuntimeRoleError,
                 WorkerRoleCommonError,
             ):
+                await _deauthorize_generation(connection, names)
                 continue
             if authority.state in {"none", "pending", "active"}:
                 authorized.add(names.versioned)
+            else:
+                await _deauthorize_generation(connection, names)
     return authorized
+
+
+def _managed_runtime_service_names(
+    state_dir: Path,
+    current_service_name: str,
+) -> tuple[str, ...]:
+    if not SERVICE_PATTERN.fullmatch(current_service_name):
+        raise RuntimeRoleError("generation service invalid")
+    service_names = {current_service_name}
+    if not state_dir.exists():
+        return tuple(service_names)
+    _require_private_state_directory(state_dir)
+    with os.scandir(state_dir) as entries:
+        service_names.update(
+            entry.name
+            for entry in entries
+            if entry.is_dir(follow_symlinks=False)
+            and SERVICE_PATTERN.fullmatch(entry.name)
+        )
+    return tuple(sorted(service_names))
 
 
 def _require_private_state_directory(path: Path) -> None:
@@ -967,6 +1028,10 @@ async def _revoke(
         await acquire_worker_service_authority_lock(
             connection,
             service_name,
+        )
+        await acquire_role_lifecycle_lock(
+            connection,
+            f"runtime:{service_name}:{generation}",
         )
         async with connection.transaction():
             if await connection.fetchval(

@@ -3233,6 +3233,7 @@ DECLARE
     v_registration_id uuid;
     v_locked_registration_id uuid;
     v_grant public.worker_admission_grants%ROWTYPE;
+    v_revoked_principal text;
     v_now timestamptz;
 BEGIN
     IF p_service_name IS NULL OR p_generation IS NULL OR p_generation <= 0
@@ -3274,6 +3275,30 @@ BEGIN
         activated_at = v_now,
         updated_at = v_now
     WHERE grant_row.id = v_grant.id;
+    FOR v_revoked_principal IN
+        SELECT DISTINCT grant_row.database_principal
+        FROM public.worker_admission_grants AS grant_row
+        WHERE grant_row.service_name = p_service_name
+          AND grant_row.state = 'revoked'
+        ORDER BY grant_row.database_principal
+    LOOP
+        IF EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_auth_members AS membership
+            JOIN pg_catalog.pg_roles AS granted
+              ON granted.oid = membership.roleid
+            JOIN pg_catalog.pg_roles AS member
+              ON member.oid = membership.member
+            WHERE granted.rolname = 'vp_worker_runtime'
+              AND member.rolname = v_revoked_principal
+        ) THEN
+            EXECUTE pg_catalog.format(
+                'REVOKE %I FROM %I',
+                'vp_worker_runtime',
+                v_revoked_principal
+            );
+        END IF;
+    END LOOP;
     RETURN v_grant.id;
 END;
 $function$
@@ -3318,24 +3343,39 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION USING MESSAGE = 'grant_missing', ERRCODE = 'P0001';
     END IF;
-    IF v_grant.state = 'revoked' THEN
-        RETURN TRUE;
-    END IF;
-    v_now := pg_catalog.clock_timestamp();
-    UPDATE public.worker_admission_grants AS grant_row
-    SET state = 'revoked',
-        revoked_at = v_now,
-        revoke_reason = p_reason,
-        updated_at = v_now
-    WHERE grant_row.id = v_grant.id;
-    IF v_registration_id IS NOT NULL THEN
-        UPDATE public.worker_registrations AS registration
-        SET status = 'revoked',
+    IF v_grant.state IS DISTINCT FROM 'revoked' THEN
+        v_now := pg_catalog.clock_timestamp();
+        UPDATE public.worker_admission_grants AS grant_row
+        SET state = 'revoked',
             revoked_at = v_now,
-            revoke_reason = p_reason
-        WHERE registration.id = v_registration_id
-          AND registration.grant_id = v_grant.id
-          AND registration.status = 'active';
+            revoke_reason = p_reason,
+            updated_at = v_now
+        WHERE grant_row.id = v_grant.id;
+        IF v_registration_id IS NOT NULL THEN
+            UPDATE public.worker_registrations AS registration
+            SET status = 'revoked',
+                revoked_at = v_now,
+                revoke_reason = p_reason
+            WHERE registration.id = v_registration_id
+              AND registration.grant_id = v_grant.id
+              AND registration.status = 'active';
+        END IF;
+    END IF;
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        WHERE granted.rolname = 'vp_worker_runtime'
+          AND member.rolname = v_grant.database_principal
+    ) THEN
+        EXECUTE pg_catalog.format(
+            'REVOKE %I FROM %I',
+            'vp_worker_runtime',
+            v_grant.database_principal
+        );
     END IF;
     RETURN TRUE;
 END;

@@ -550,46 +550,22 @@ async def _role_owns_objects(
     return bool(
         await connection.fetchval(
             """
+            WITH target_role AS (
+                SELECT role.oid
+                FROM pg_catalog.pg_roles AS role
+                WHERE role.rolname = $1
+            )
+            -- DROP OWNED may clear default-ACL metadata, never owned objects.
             SELECT EXISTS (
                 SELECT 1
-                FROM pg_catalog.pg_class AS object
-                WHERE object.relowner = (
-                    SELECT oid
-                    FROM pg_catalog.pg_roles
-                    WHERE rolname = $1
-                )
-                UNION ALL
-                SELECT 1
-                FROM pg_catalog.pg_proc AS object
-                WHERE object.proowner = (
-                    SELECT oid
-                    FROM pg_catalog.pg_roles
-                    WHERE rolname = $1
-                )
-                UNION ALL
-                SELECT 1
-                FROM pg_catalog.pg_type AS object
-                WHERE object.typowner = (
-                    SELECT oid
-                    FROM pg_catalog.pg_roles
-                    WHERE rolname = $1
-                )
-                UNION ALL
-                SELECT 1
-                FROM pg_catalog.pg_namespace AS object
-                WHERE object.nspowner = (
-                    SELECT oid
-                    FROM pg_catalog.pg_roles
-                    WHERE rolname = $1
-                )
-                UNION ALL
-                SELECT 1
-                FROM pg_catalog.pg_database AS object
-                WHERE object.datdba = (
-                    SELECT oid
-                    FROM pg_catalog.pg_roles
-                    WHERE rolname = $1
-                )
+                FROM pg_catalog.pg_shdepend AS dependency
+                JOIN target_role
+                  ON target_role.oid = dependency.refobjid
+                WHERE dependency.refclassid
+                      = 'pg_catalog.pg_authid'::pg_catalog.regclass
+                  AND dependency.deptype = 'o'
+                  AND dependency.classid
+                      <> 'pg_catalog.pg_default_acl'::pg_catalog.regclass
             )
             """,
             role_name,

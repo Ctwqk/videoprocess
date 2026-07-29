@@ -3522,3 +3522,868 @@ async def test_default_acl_convergence_includes_objectless_effective_creators(
                 await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
         finally:
             await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_runtime_authority_snapshot_fences_every_managed_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = f"vp_worker_snapshot_{uuid.uuid4().hex[:18]}"
+    services = tuple(
+        f"task4a-snapshot-{index}-{uuid.uuid4().hex[:6]}"
+        for index in range(6)
+    )
+    generations = tuple(
+        int(uuid.uuid4().hex[:12], 16) for _service in services
+    )
+    names = tuple(
+        runtime_cli.role_names_for_generation(service_name, generation)
+        for service_name, generation in zip(
+            services,
+            generations,
+            strict=True,
+        )
+    )
+    replacement_generation = int(uuid.uuid4().hex[:12], 16)
+    replacement_names = runtime_cli.role_names_for_generation(
+        services[1],
+        replacement_generation,
+    )
+    control_generation = f"snapshot-{uuid.uuid4().hex[:12]}"
+    control_names = control_cli.role_names_for_generation(
+        control_generation
+    )
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    runtime_state = tmp_path / "runtime-state"
+    control_state = tmp_path / "control-state"
+    scan_ready = asyncio.Event()
+    scan_release = asyncio.Event()
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    scan_task: asyncio.Task[None] | None = None
+    revoke_task: asyncio.Task[object] | None = None
+    activate_task: asyncio.Task[object] | None = None
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        await control_cli._provision(
+            target_url,
+            control_generation,
+            control_state,
+            control_names,
+        )
+        operator_url = control_cli.credential_paths(
+            control_state,
+            control_generation,
+        )["operator"].read_text().strip()
+
+        operator = await asyncpg.connect(_asyncpg_url(operator_url))
+        try:
+            for (
+                service_name,
+                generation,
+                runtime_names,
+            ) in zip(services, generations, names, strict=True):
+                await runtime_cli._provision(
+                    target_url,
+                    service_name,
+                    generation,
+                    runtime_state,
+                    runtime_names,
+                )
+                token = runtime_cli.credential_paths(
+                    runtime_state,
+                    service_name,
+                    generation,
+                )["admission_token"].read_text().strip()
+                await _upsert_worker_grant(
+                    operator,
+                    service_name=service_name,
+                    generation=generation,
+                    database_principal=runtime_names.versioned,
+                    admission_token=token,
+                )
+                await operator.fetchval(
+                    "SELECT public.vp_worker_grant_activate($1, $2)",
+                    service_name,
+                    generation,
+                )
+            await runtime_cli._provision(
+                target_url,
+                services[1],
+                replacement_generation,
+                runtime_state,
+                replacement_names,
+            )
+            replacement_token = runtime_cli.credential_paths(
+                runtime_state,
+                services[1],
+                replacement_generation,
+            )["admission_token"].read_text().strip()
+            await _upsert_worker_grant(
+                operator,
+                service_name=services[1],
+                generation=replacement_generation,
+                database_principal=replacement_names.versioned,
+                admission_token=replacement_token,
+            )
+        finally:
+            await operator.close()
+
+        acquired_services: list[str] = []
+        real_acquire_service_lock = (
+            runtime_cli.acquire_worker_service_authority_lock
+        )
+
+        async def recording_service_lock(
+            connection: asyncpg.Connection,
+            service_name: str,
+        ) -> None:
+            acquired_services.append(service_name)
+            await real_acquire_service_lock(connection, service_name)
+
+        real_authorized_members = runtime_cli._authorized_runtime_members
+
+        async def paused_authorized_members(
+            connection: asyncpg.Connection,
+            owner_url: str,
+            state_dir: Path,
+            service_name: str,
+        ) -> set[str]:
+            result = await real_authorized_members(
+                connection,
+                owner_url,
+                state_dir,
+                service_name,
+            )
+            scan_ready.set()
+            await scan_release.wait()
+            return result
+
+        monkeypatch.setattr(
+            runtime_cli,
+            "acquire_worker_service_authority_lock",
+            recording_service_lock,
+        )
+        monkeypatch.setattr(
+            runtime_cli,
+            "_authorized_runtime_members",
+            paused_authorized_members,
+        )
+        scan_task = asyncio.create_task(
+            runtime_cli._provision(
+                target_url,
+                services[2],
+                generations[2],
+                runtime_state,
+                names[2],
+            )
+        )
+        await asyncio.wait_for(scan_ready.wait(), timeout=10)
+
+        async def revoke_victim() -> object:
+            connection = await asyncpg.connect(_asyncpg_url(operator_url))
+            try:
+                return await connection.fetchval(
+                    "SELECT public.vp_worker_grant_revoke($1, $2, $3)",
+                    services[0],
+                    generations[0],
+                    "round4-snapshot-race",
+                )
+            finally:
+                await connection.close()
+
+        async def activate_pending() -> object:
+            connection = await asyncpg.connect(_asyncpg_url(operator_url))
+            try:
+                return await connection.fetchval(
+                    "SELECT public.vp_worker_grant_activate($1, $2)",
+                    services[1],
+                    replacement_generation,
+                )
+            finally:
+                await connection.close()
+
+        revoke_task = asyncio.create_task(revoke_victim())
+        activate_task = asyncio.create_task(activate_pending())
+        await asyncio.sleep(0.2)
+        mutations_waited_for_snapshot = (
+            not revoke_task.done() and not activate_task.done()
+        )
+        scan_release.set()
+        await asyncio.wait_for(scan_task, timeout=10)
+        await asyncio.wait_for(
+            asyncio.gather(revoke_task, activate_task),
+            timeout=10,
+        )
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            grant_states = {
+                (row["service_name"], row["generation"]): row["state"]
+                for row in await owner.fetch(
+                    """
+                    SELECT service_name, generation, state
+                    FROM public.worker_admission_grants
+                    WHERE (
+                        service_name = $1
+                        AND generation = $2
+                    )
+                       OR service_name = $3
+                    """,
+                    services[0],
+                    generations[0],
+                    services[1],
+                )
+            }
+            assert grant_states == {
+                (services[0], generations[0]): "revoked",
+                (services[1], generations[1]): "revoked",
+                (services[1], replacement_generation): "active",
+            }
+            assert not await owner.fetchval(
+                "SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')",
+                names[0].versioned,
+                names[0].stable,
+            )
+            assert not await owner.fetchval(
+                "SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')",
+                names[1].versioned,
+                names[1].stable,
+            )
+            assert await owner.fetchval(
+                "SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')",
+                replacement_names.versioned,
+                replacement_names.stable,
+            )
+        finally:
+            await owner.close()
+
+        assert acquired_services == sorted(services)
+        assert mutations_waited_for_snapshot
+        for service_name, generation in zip(
+            services,
+            generations,
+            strict=True,
+        ):
+            assert all(
+                path.exists()
+                for path in runtime_cli.credential_paths(
+                    runtime_state,
+                    service_name,
+                    generation,
+                ).values()
+            )
+        assert all(
+            path.exists()
+            for path in runtime_cli.credential_paths(
+                runtime_state,
+                services[1],
+                replacement_generation,
+            ).values()
+        )
+    finally:
+        scan_release.set()
+        for task in (scan_task, revoke_task, activate_task):
+            if task is not None and not task.done():
+                task.cancel()
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            for role_name in (
+                *(runtime_names.versioned for runtime_names in names),
+                replacement_names.versioned,
+                *control_names.versioned.values(),
+                names[0].stable,
+                *control_names.stable.values(),
+            ):
+                await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_runtime_revoke_preserves_every_owned_catalog_object(
+    tmp_path: Path,
+) -> None:
+    database = f"vp_worker_owned_{uuid.uuid4().hex[:20]}"
+    service_name = f"task4a-owned-{uuid.uuid4().hex[:8]}"
+    generation = int(uuid.uuid4().hex[:12], 16)
+    names = runtime_cli.role_names_for_generation(
+        service_name,
+        generation,
+    )
+    collation_name = f"task4a_collation_{uuid.uuid4().hex[:12]}"
+    configuration_name = f"task4a_config_{uuid.uuid4().hex[:12]}"
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    runtime_state = tmp_path / "runtime-state"
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        await runtime_cli._provision(
+            target_url,
+            service_name,
+            generation,
+            runtime_state,
+            names,
+        )
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            await owner.execute(
+                f'CREATE COLLATION public."{collation_name}" '
+                'FROM pg_catalog."C"'
+            )
+            await owner.execute(
+                "CREATE TEXT SEARCH CONFIGURATION "
+                f'public."{configuration_name}" '
+                "(COPY = pg_catalog.simple)"
+            )
+            await owner.execute(
+                f'ALTER COLLATION public."{collation_name}" '
+                f'OWNER TO "{names.versioned}"'
+            )
+            await owner.execute(
+                "ALTER TEXT SEARCH CONFIGURATION "
+                f'public."{configuration_name}" '
+                f'OWNER TO "{names.versioned}"'
+            )
+        finally:
+            await owner.close()
+
+        with pytest.raises(
+            runtime_cli.RuntimeRoleError,
+            match="generation state removal failed",
+        ):
+            await runtime_cli._revoke(
+                target_url,
+                service_name,
+                generation,
+                runtime_state,
+                names,
+            )
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            assert await owner.fetchval(
+                "SELECT pg_catalog.to_regcollation($1) IS NOT NULL",
+                f"public.{collation_name}",
+            )
+            assert await owner.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_ts_config AS configuration
+                    JOIN pg_catalog.pg_namespace AS namespace
+                      ON namespace.oid = configuration.cfgnamespace
+                    WHERE namespace.nspname = 'public'
+                      AND configuration.cfgname = $1
+                )
+                """,
+                configuration_name,
+            )
+            assert await owner.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_roles
+                    WHERE rolname = $1
+                )
+                """,
+                names.versioned,
+            )
+            await owner.execute(
+                "DROP TEXT SEARCH CONFIGURATION "
+                f'public."{configuration_name}"'
+            )
+            await owner.execute(
+                f'DROP COLLATION public."{collation_name}"'
+            )
+        finally:
+            await owner.close()
+
+        await runtime_cli._revoke(
+            target_url,
+            service_name,
+            generation,
+            runtime_state,
+            names,
+        )
+        await runtime_cli._revoke(
+            target_url,
+            service_name,
+            generation,
+            runtime_state,
+            names,
+        )
+        assert not any(
+            path.exists()
+            for path in runtime_cli.credential_paths(
+                runtime_state,
+                service_name,
+                generation,
+            ).values()
+        )
+    finally:
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            for role_name in (names.versioned, names.stable):
+                await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_invalid_complete_runtime_generations_are_quarantined(
+    tmp_path: Path,
+) -> None:
+    database = f"vp_worker_quarantine_{uuid.uuid4().hex[:16]}"
+    service_name = f"task4a-quarantine-{uuid.uuid4().hex[:8]}"
+    generations = tuple(
+        int(uuid.uuid4().hex[:12], 16) for _index in range(3)
+    )
+    names = tuple(
+        runtime_cli.role_names_for_generation(service_name, generation)
+        for generation in generations
+    )
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    runtime_state = tmp_path / "runtime-state"
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        for generation, runtime_names in zip(
+            generations,
+            names,
+            strict=True,
+        ):
+            await runtime_cli._provision(
+                target_url,
+                service_name,
+                generation,
+                runtime_state,
+                runtime_names,
+            )
+
+        paths_by_generation = tuple(
+            runtime_cli.credential_paths(
+                runtime_state,
+                service_name,
+                generation,
+            )
+            for generation in generations
+        )
+        first_url = make_url(
+            paths_by_generation[0]["database_url"].read_text().strip()
+        )
+        _write_secret(
+            paths_by_generation[0]["database_url"],
+            first_url.set(
+                password="round4-deliberately-wrong-password"
+            ).render_as_string(hide_password=False),
+            0o400,
+        )
+        _write_secret(
+            paths_by_generation[1]["state"],
+            "{not-valid-json",
+            0o600,
+        )
+        third_url = make_url(
+            paths_by_generation[2]["database_url"].read_text().strip()
+        )
+        _write_secret(
+            paths_by_generation[2]["database_url"],
+            third_url.set(host="127.0.0.2").render_as_string(
+                hide_password=False
+            ),
+            0o400,
+        )
+        forensic_snapshots = tuple(
+            {
+                purpose: (
+                    path.read_bytes(),
+                    stat.S_IMODE(path.stat().st_mode),
+                )
+                for purpose, path in paths.items()
+            }
+            for paths in paths_by_generation
+        )
+
+        for generation, runtime_names, paths, snapshot in zip(
+            generations,
+            names,
+            paths_by_generation,
+            forensic_snapshots,
+            strict=True,
+        ):
+            with pytest.raises(runtime_cli.RuntimeRoleError):
+                await runtime_cli._provision(
+                    target_url,
+                    service_name,
+                    generation,
+                    runtime_state,
+                    runtime_names,
+                )
+            assert {
+                purpose: (
+                    path.read_bytes(),
+                    stat.S_IMODE(path.stat().st_mode),
+                )
+                for purpose, path in paths.items()
+            } == snapshot
+
+            owner = await asyncpg.connect(_asyncpg_url(target_url))
+            try:
+                role = await owner.fetchrow(
+                    """
+                    SELECT rolcanlogin
+                    FROM pg_catalog.pg_roles
+                    WHERE rolname = $1
+                    """,
+                    runtime_names.versioned,
+                )
+                assert role is not None
+                assert not role["rolcanlogin"]
+                assert not await owner.fetchval(
+                    "SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')",
+                    runtime_names.versioned,
+                    runtime_names.stable,
+                )
+            finally:
+                await owner.close()
+    finally:
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            for role_name in (
+                *(runtime_names.versioned for runtime_names in names),
+                names[0].stable,
+            ):
+                await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live role tests",
+)
+async def test_invalid_generation_quarantine_serializes_with_revoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = f"vp_worker_quarantine_race_{uuid.uuid4().hex[:12]}"
+    services = (
+        f"task4a-quarantine-first-{uuid.uuid4().hex[:6]}",
+        f"task4a-revoke-first-{uuid.uuid4().hex[:6]}",
+    )
+    generations = tuple(
+        int(uuid.uuid4().hex[:12], 16) for _service in services
+    )
+    names = tuple(
+        runtime_cli.role_names_for_generation(service_name, generation)
+        for service_name, generation in zip(
+            services,
+            generations,
+            strict=True,
+        )
+    )
+    control_generation = f"quarantine-race-{uuid.uuid4().hex[:8]}"
+    control_names = control_cli.role_names_for_generation(
+        control_generation
+    )
+    admin_url = _database_url("postgres")
+    target_url = _database_url(database)
+    runtime_state = tmp_path / "runtime-state"
+    control_state = tmp_path / "control-state"
+    read_entered = threading.Event()
+    read_release = threading.Event()
+    revoke_transaction: asyncpg.Transaction | None = None
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await admin.close()
+
+    try:
+        migrated = _run_alembic(_alembic_url(target_url))
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+        await control_cli._provision(
+            target_url,
+            control_generation,
+            control_state,
+            control_names,
+        )
+        operator_url = control_cli.credential_paths(
+            control_state,
+            control_generation,
+        )["operator"].read_text().strip()
+        operator = await asyncpg.connect(_asyncpg_url(operator_url))
+        try:
+            for service_name, generation, runtime_names in zip(
+                services,
+                generations,
+                names,
+                strict=True,
+            ):
+                await runtime_cli._provision(
+                    target_url,
+                    service_name,
+                    generation,
+                    runtime_state,
+                    runtime_names,
+                )
+                token = runtime_cli.credential_paths(
+                    runtime_state,
+                    service_name,
+                    generation,
+                )["admission_token"].read_text().strip()
+                await _upsert_worker_grant(
+                    operator,
+                    service_name=service_name,
+                    generation=generation,
+                    database_principal=runtime_names.versioned,
+                    admission_token=token,
+                )
+                await operator.fetchval(
+                    "SELECT public.vp_worker_grant_activate($1, $2)",
+                    service_name,
+                    generation,
+                )
+        finally:
+            await operator.close()
+
+        paths = tuple(
+            runtime_cli.credential_paths(
+                runtime_state,
+                service_name,
+                generation,
+            )
+            for service_name, generation in zip(
+                services,
+                generations,
+                strict=True,
+            )
+        )
+        for generation_paths in paths:
+            _write_secret(
+                generation_paths["state"],
+                "{corrupted-for-round4",
+                0o600,
+            )
+        forensic_snapshots = tuple(
+            {
+                purpose: (
+                    path.read_bytes(),
+                    stat.S_IMODE(path.stat().st_mode),
+                )
+                for purpose, path in generation_paths.items()
+            }
+            for generation_paths in paths
+        )
+
+        real_read_secure_file = runtime_cli.read_secure_file
+        paused_once = False
+
+        def paused_state_read(
+            path: Path,
+            *,
+            required_mode: int,
+        ) -> str:
+            nonlocal paused_once
+            value = real_read_secure_file(
+                path,
+                required_mode=required_mode,
+            )
+            if path == paths[0]["state"] and not paused_once:
+                paused_once = True
+                read_entered.set()
+                if not read_release.wait(timeout=10):
+                    raise AssertionError(
+                        "invalid generation read was not released"
+                    )
+            return value
+
+        monkeypatch.setattr(
+            runtime_cli,
+            "read_secure_file",
+            paused_state_read,
+        )
+        quarantine_first = asyncio.create_task(
+            asyncio.to_thread(
+                lambda: asyncio.run(
+                    runtime_cli._provision(
+                        target_url,
+                        services[0],
+                        generations[0],
+                        runtime_state,
+                        names[0],
+                    )
+                )
+            )
+        )
+        assert await asyncio.to_thread(read_entered.wait, 10)
+
+        async def revoke_generation(index: int, reason: str) -> object:
+            connection = await asyncpg.connect(_asyncpg_url(operator_url))
+            try:
+                return await connection.fetchval(
+                    "SELECT public.vp_worker_grant_revoke($1, $2, $3)",
+                    services[index],
+                    generations[index],
+                    reason,
+                )
+            finally:
+                await connection.close()
+
+        revoke_second = asyncio.create_task(
+            revoke_generation(0, "round4-quarantine-first")
+        )
+        await asyncio.sleep(0.2)
+        assert not revoke_second.done()
+        read_release.set()
+        quarantine_result = await asyncio.gather(
+            quarantine_first,
+            return_exceptions=True,
+        )
+        assert isinstance(
+            quarantine_result[0],
+            runtime_cli.RuntimeRoleError,
+        )
+        await asyncio.wait_for(revoke_second, timeout=10)
+
+        monkeypatch.setattr(
+            runtime_cli,
+            "read_secure_file",
+            real_read_secure_file,
+        )
+        operator = await asyncpg.connect(_asyncpg_url(operator_url))
+        try:
+            revoke_transaction = operator.transaction()
+            await revoke_transaction.start()
+            await operator.fetchval(
+                "SELECT public.vp_worker_grant_revoke($1, $2, $3)",
+                services[1],
+                generations[1],
+                "round4-revoke-first",
+            )
+            revoke_first = asyncio.create_task(
+                runtime_cli._provision(
+                    target_url,
+                    services[1],
+                    generations[1],
+                    runtime_state,
+                    names[1],
+                )
+            )
+            await asyncio.sleep(0.2)
+            assert not revoke_first.done()
+            await revoke_transaction.commit()
+            revoke_transaction = None
+            revoke_first_result = await asyncio.gather(
+                revoke_first,
+                return_exceptions=True,
+            )
+            assert isinstance(
+                revoke_first_result[0],
+                runtime_cli.RuntimeRoleError,
+            )
+        finally:
+            if revoke_transaction is not None:
+                await revoke_transaction.rollback()
+            await operator.close()
+
+        owner = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            for index, runtime_names in enumerate(names):
+                role = await owner.fetchrow(
+                    """
+                    SELECT rolcanlogin
+                    FROM pg_catalog.pg_roles
+                    WHERE rolname = $1
+                    """,
+                    runtime_names.versioned,
+                )
+                assert role is not None
+                assert not role["rolcanlogin"]
+                assert not await owner.fetchval(
+                    "SELECT pg_catalog.pg_has_role($1, $2, 'MEMBER')",
+                    runtime_names.versioned,
+                    runtime_names.stable,
+                )
+                assert await owner.fetchval(
+                    """
+                    SELECT state = 'revoked'
+                    FROM public.worker_admission_grants
+                    WHERE service_name = $1 AND generation = $2
+                    """,
+                    services[index],
+                    generations[index],
+                )
+                assert {
+                    purpose: (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for purpose, path in paths[index].items()
+                } == forensic_snapshots[index]
+        finally:
+            await owner.close()
+    finally:
+        read_release.set()
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            for role_name in (
+                *(runtime_names.versioned for runtime_names in names),
+                *control_names.versioned.values(),
+                names[0].stable,
+                *control_names.stable.values(),
+            ):
+                await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
+        finally:
+            await admin.close()
