@@ -396,6 +396,74 @@ func TestRegistrationPostgres16CloseContextOwnsHeldConnectionLifecycle(
 	}
 }
 
+func TestRegistrationPostgres16CloseContextGatesRacingDirectAcquire(
+	t *testing.T,
+) {
+	fixture := newWorkerPostgresFixture(t)
+	held, err := fixture.worker.Pool.Acquire(fixture.ctx)
+	if err != nil {
+		t.Fatalf("acquire existing worker connection: %v", err)
+	}
+	defer held.Release()
+	closeContext, cancelClose := context.WithTimeout(
+		context.Background(),
+		125*time.Millisecond,
+	)
+	defer cancelClose()
+	closeDone := make(chan error, 1)
+	closeStarted := time.Now()
+	go func() {
+		closeDone <- fixture.worker.CloseContext(closeContext)
+	}()
+	time.Sleep(25 * time.Millisecond)
+
+	acquireContext, cancelAcquire := context.WithTimeout(
+		context.Background(),
+		50*time.Millisecond,
+	)
+	racing, acquireErr := fixture.worker.Pool.Acquire(acquireContext)
+	cancelAcquire()
+	if racing != nil {
+		defer racing.Release()
+	}
+	if acquireErr == nil {
+		t.Fatal("direct Pool.Acquire passed while CloseContext gate was closed")
+	}
+	select {
+	case closeErr := <-closeDone:
+		if !errors.Is(closeErr, context.DeadlineExceeded) {
+			t.Fatalf(
+				"CloseContext error = %v; want stable deadline exceeded",
+				closeErr,
+			)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("CloseContext exceeded its deadline with a racing Acquire")
+	}
+	if elapsed := time.Since(closeStarted); elapsed > 500*time.Millisecond {
+		t.Fatalf("CloseContext returned after %s; want bounded close", elapsed)
+	}
+
+	pingContext, cancelPing := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	pingErr := fixture.worker.Ping(pingContext)
+	cancelPing()
+	if pingErr != nil {
+		t.Fatalf("deadline path did not reopen acquisition gate: %v", pingErr)
+	}
+	held.Release()
+	finalCloseContext, cancelFinalClose := context.WithTimeout(
+		context.Background(),
+		time.Second,
+	)
+	defer cancelFinalClose()
+	if err := fixture.worker.CloseContext(finalCloseContext); err != nil {
+		t.Fatalf("CloseContext after held release: %v", err)
+	}
+}
+
 func newWorkerPostgresFixture(t *testing.T) *workerPostgresFixture {
 	t.Helper()
 	testURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_POSTGRES_TEST_URL"))

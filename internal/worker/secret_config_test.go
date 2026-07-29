@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func TestRegistrationProductionSecretsRequireBoundedMode0400Files(t *testing.T) {
@@ -233,6 +235,75 @@ func TestRegistrationRedisValidationUsesStartupParserSemantics(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRegistrationRedisOptionsEnforceContextCancellation(t *testing.T) {
+	options, err := ParseWorkerRedisOptions(
+		"redis://worker:synthetic@127.0.0.1:6379/14",
+	)
+	if err != nil {
+		t.Fatalf("ParseWorkerRedisOptions: %v", err)
+	}
+	if !options.ContextTimeoutEnabled {
+		t.Fatal("ContextTimeoutEnabled = false; want registration-owned cancellation")
+	}
+}
+
+func TestRegistrationRedisOptionsRejectUnsafeConstructorRanges(t *testing.T) {
+	for _, redisURL := range []string{
+		"redis://worker:synthetic@127.0.0.1:6379/-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?pool_size=-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?min_idle_conns=-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?max_idle_conns=-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?max_active_conns=-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?max_concurrent_dials=-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?protocol=-1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?protocol=1",
+		"redis://worker:synthetic@127.0.0.1:6379/14?protocol=4",
+		"redis://worker:synthetic@127.0.0.1:70000/14",
+		"redis://worker:synthetic@127.0.0.1:notaport/14",
+	} {
+		t.Run(redisURL, func(t *testing.T) {
+			options, err := ParseWorkerRedisOptions(redisURL)
+			if err == nil {
+				panicked := false
+				func() {
+					defer func() {
+						panicked = recover() != nil
+					}()
+					client := redis.NewClient(options)
+					_ = client.Close()
+				}()
+				t.Fatalf(
+					"unsafe Redis options accepted (constructor panic=%t)",
+					panicked,
+				)
+			}
+			for _, credential := range []string{"synthetic"} {
+				if strings.Contains(err.Error(), credential) {
+					t.Fatalf("Redis validation exposed credential %q: %v", credential, err)
+				}
+			}
+		})
+	}
+}
+
+func TestRegistrationRedisOptionsKeepSafeDefaultsConstructible(t *testing.T) {
+	options, err := ParseWorkerRedisOptions(
+		"redis://worker:synthetic@127.0.0.1:6379/14",
+	)
+	if err != nil {
+		t.Fatalf("ParseWorkerRedisOptions: %v", err)
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("validated default options panicked: %v", recovered)
+		}
+	}()
+	client := redis.NewClient(options)
+	if err := client.Close(); err != nil {
+		t.Fatalf("close unconnected Redis client: %v", err)
 	}
 }
 

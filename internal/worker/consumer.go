@@ -19,6 +19,8 @@ import (
 var ErrConfirmedCancellation = errors.New("confirmed cancellation")
 
 const registeredAffinityWait = 20 * time.Second
+const registeredReadBlockLimit = 200 * time.Millisecond
+const registeredReadDeadlineMargin = 100 * time.Millisecond
 
 // Handler executes a single node's media transform. Each implementation is
 // responsible for resolving input/output paths via the Storage backend and
@@ -154,6 +156,15 @@ func (c *Consumer) Run(ctx context.Context) error {
 		concurrency = 2
 	}
 	executions := newConsumerExecutions(c, ctx, concurrency)
+	var reads *registeredReadFence
+	if c.Registration != nil {
+		reads = &registeredReadFence{}
+		unregister, registered := c.Registration.registerLossGuard(reads.stop)
+		if !registered {
+			return ErrRegistrationLost
+		}
+		defer unregister()
+	}
 	if messages, err := c.claimPending(ctx); err != nil {
 		c.log.Warn("initial pending reclaim failed", "error", err)
 	} else {
@@ -205,15 +216,36 @@ func (c *Consumer) Run(ctx context.Context) error {
 			continue
 		case executions.sem <- struct{}{}:
 		}
-		res, err := c.Redis.XReadGroup(ctx, &redis.XReadGroupArgs{
+		readContext := ctx
+		finishRead := func() {}
+		blockTimeout := c.BlockTimeout
+		if reads != nil {
+			if blockTimeout <= 0 || blockTimeout > registeredReadBlockLimit {
+				blockTimeout = registeredReadBlockLimit
+			}
+			var ready bool
+			readContext, finishRead, ready = reads.begin(
+				ctx,
+				blockTimeout+registeredReadDeadlineMargin,
+			)
+			if !ready {
+				<-executions.sem
+				return c.waitForActive(ctx, &executions.wg)
+			}
+		}
+		res, err := c.Redis.XReadGroup(readContext, &redis.XReadGroupArgs{
 			Group:    c.ConsumerGroup,
 			Consumer: c.WorkerID,
 			Streams:  []string{stream, ">"},
-			Block:    c.BlockTimeout,
+			Block:    blockTimeout,
 			Count:    1,
 		}).Result()
+		finishRead()
 		if err != nil {
 			<-executions.sem
+			if reads != nil && reads.stopped() {
+				return c.waitForActive(ctx, &executions.wg)
+			}
 			if errors.Is(err, context.Canceled) {
 				return c.waitForActive(ctx, &executions.wg)
 			}
@@ -224,9 +256,19 @@ func (c *Consumer) Run(ctx context.Context) error {
 			time.Sleep(time.Second)
 			continue
 		}
+		if ctx.Err() != nil || reads != nil && reads.stopped() {
+			<-executions.sem
+			return c.waitForActive(ctx, &executions.wg)
+		}
 		dispatched := false
 		for _, stream := range res {
 			for _, msg := range stream.Messages {
+				if ctx.Err() != nil || reads != nil && reads.stopped() {
+					if !dispatched {
+						<-executions.sem
+					}
+					return c.waitForActive(ctx, &executions.wg)
+				}
 				dispatched = true
 				executions.startReserved(msg)
 			}
@@ -235,6 +277,61 @@ func (c *Consumer) Run(ctx context.Context) error {
 			<-executions.sem
 		}
 	}
+}
+
+type registeredReadFence struct {
+	mu          sync.Mutex
+	stoppedFlag bool
+	cancel      context.CancelFunc
+	done        chan struct{}
+}
+
+func (f *registeredReadFence) begin(
+	parent context.Context,
+	timeout time.Duration,
+) (context.Context, func(), bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stoppedFlag {
+		return parent, func() {}, false
+	}
+	readContext, cancel := context.WithTimeout(parent, timeout)
+	done := make(chan struct{})
+	f.cancel = cancel
+	f.done = done
+	var once sync.Once
+	return readContext, func() {
+		once.Do(func() {
+			cancel()
+			f.mu.Lock()
+			if f.done == done {
+				f.cancel = nil
+				f.done = nil
+			}
+			close(done)
+			f.mu.Unlock()
+		})
+	}, true
+}
+
+func (f *registeredReadFence) stop() {
+	f.mu.Lock()
+	f.stoppedFlag = true
+	cancel := f.cancel
+	done := f.done
+	f.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func (f *registeredReadFence) stopped() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.stoppedFlag
 }
 
 type consumerExecutions struct {
@@ -450,6 +547,7 @@ func (c *Consumer) visitRegisteredPendingEntries(
 	if snapshot.Count == 0 || snapshot.Higher == "" {
 		return nil
 	}
+	entries := make([]redis.XPendingExt, 0)
 	start := "-"
 	remaining := snapshot.Count
 	for remaining > 0 {
@@ -468,23 +566,24 @@ func (c *Consumer) visitRegisteredPendingEntries(
 			return err
 		}
 		if len(page) == 0 {
-			return nil
+			break
 		}
-		for _, entry := range page {
-			if err := visit(entry); err != nil {
-				return err
-			}
-		}
+		entries = append(entries, page...)
 		lastID := page[len(page)-1].ID
 		remaining -= int64(len(page))
 		if lastID == snapshot.Higher || len(page) < int(count) {
-			return nil
+			break
 		}
 		nextStart := "(" + lastID
 		if lastID == "" || nextStart == start {
 			return errors.New("registered pending pagination is invalid")
 		}
 		start = nextStart
+	}
+	for _, entry := range entries {
+		if err := visit(entry); err != nil {
+			return err
+		}
 	}
 	return nil
 }

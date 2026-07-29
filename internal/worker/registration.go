@@ -72,6 +72,9 @@ type Registration struct {
 	heartbeatDone     chan struct{}
 	lost              chan struct{}
 	lostOnce          sync.Once
+	lossPublished     bool
+	lossGuardSequence uint64
+	lossGuards        map[uint64]func()
 	heartbeatInterval time.Duration
 	closeTimeout      time.Duration
 }
@@ -157,6 +160,25 @@ func (r *Registration) MarkLost() {
 	r.markLost()
 }
 
+func (r *Registration) registerLossGuard(guard func()) (func(), bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lossPublished {
+		return func() {}, false
+	}
+	if r.lossGuards == nil {
+		r.lossGuards = make(map[uint64]func())
+	}
+	r.lossGuardSequence++
+	guardID := r.lossGuardSequence
+	r.lossGuards[guardID] = guard
+	return func() {
+		r.mu.Lock()
+		delete(r.lossGuards, guardID)
+		r.mu.Unlock()
+	}, true
+}
+
 func (r *Registration) Close(
 	_ context.Context,
 	reason string,
@@ -225,9 +247,17 @@ func (r *Registration) heartbeatLoop(ctx context.Context) {
 
 func (r *Registration) markLost() {
 	r.lostOnce.Do(func() {
-		r.mu.RLock()
+		r.mu.Lock()
+		r.lossPublished = true
 		cancel := r.cancelOwned
-		r.mu.RUnlock()
+		guards := make([]func(), 0, len(r.lossGuards))
+		for _, guard := range r.lossGuards {
+			guards = append(guards, guard)
+		}
+		r.mu.Unlock()
+		for _, guard := range guards {
+			guard()
+		}
 		if cancel != nil {
 			cancel(ErrRegistrationLost)
 		}

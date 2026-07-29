@@ -30,6 +30,23 @@ type fakeHandler struct {
 	seen []TaskMessage
 }
 
+type countingHandler struct {
+	node  string
+	calls atomic.Int32
+}
+
+func (h *countingHandler) NodeType() string {
+	return h.node
+}
+
+func (h *countingHandler) Execute(
+	context.Context,
+	TaskMessage,
+) (NodeResult, error) {
+	h.calls.Add(1)
+	return NodeResult{OutputArtifactID: "artifact-1"}, nil
+}
+
 func (f *fakeHandler) NodeType() string { return f.node }
 func (f *fakeHandler) Execute(ctx context.Context, task TaskMessage) (NodeResult, error) {
 	f.seen = append(f.seen, task)
@@ -119,6 +136,101 @@ type growingPendingTailHook struct {
 	pages  atomic.Int32
 	mu     sync.Mutex
 	err    error
+}
+
+type pendingPageFailureHook struct {
+	extendedPages atomic.Int32
+	xclaims       atomic.Int32
+	failed        atomic.Bool
+}
+
+func (h *pendingPageFailureHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *pendingPageFailureHook) ProcessHook(
+	next redis.ProcessHook,
+) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xclaim" {
+			h.xclaims.Add(1)
+		}
+		if cmd.Name() == "xpending" &&
+			len(cmd.Args()) > 3 &&
+			h.extendedPages.Add(1) == 2 &&
+			h.failed.CompareAndSwap(false, true) {
+			return errors.New("forced later XPENDING page failure")
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *pendingPageFailureHook) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+type registrationReadRaceHook struct {
+	secondReadStarted chan struct{}
+	lateMessage       *redis.XMessage
+	reads             atomic.Int32
+}
+
+func (h *registrationReadRaceHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *registrationReadRaceHook) ProcessHook(
+	next redis.ProcessHook,
+) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() != "xreadgroup" || h.reads.Add(1) != 2 {
+			return next(ctx, cmd)
+		}
+		close(h.secondReadStarted)
+		if h.lateMessage == nil {
+			return next(ctx, cmd)
+		}
+		<-ctx.Done()
+		read, ok := cmd.(*redis.XStreamSliceCmd)
+		if !ok {
+			return errors.New("unexpected XREADGROUP command type")
+		}
+		read.SetVal([]redis.XStream{{
+			Stream:   "late-registration-loss",
+			Messages: []redis.XMessage{*h.lateMessage},
+		}})
+		return nil
+	}
+}
+
+func (h *registrationReadRaceHook) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+type blockingReadLossStore struct {
+	*registeredTaskStoreStub
+	secondReadStarted <-chan struct{}
+	claimCalls        atomic.Int32
+}
+
+func (s *blockingReadLossStore) ClaimWorkerNode(
+	ctx context.Context,
+	_ store.WorkerRegistrationLease,
+	_ uuid.UUID,
+	_ uuid.UUID,
+	_ store.WorkerTaskDeliveryProof,
+) (store.WorkerNodeClaim, error) {
+	s.claimCalls.Add(1)
+	select {
+	case <-s.secondReadStarted:
+		return store.WorkerNodeClaim{}, store.ErrWorkerRegistrationLost
+	case <-ctx.Done():
+		return store.WorkerNodeClaim{}, context.Cause(ctx)
+	}
 }
 
 func (h *growingPendingTailHook) DialHook(next redis.DialHook) redis.DialHook {
@@ -1244,6 +1356,199 @@ func TestConsumerConcurrentRegistrationLossBeatsHandlerFailure(
 	}
 	if taskStore.claimCalls != 1 {
 		t.Fatalf("claim calls after concurrent loss = %d; want 1", taskStore.claimCalls)
+	}
+}
+
+func TestConsumerRegistrationLossRejectsSuccessfulLateRead(t *testing.T) {
+	client, _ := newRedis(t)
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := registrationLossTestConfig(lease)
+	cfg.Concurrency = 2
+	secondReadStarted := make(chan struct{})
+	hook := &registrationReadRaceHook{
+		secondReadStarted: secondReadStarted,
+		lateMessage: &redis.XMessage{
+			ID:     "9999999999999-0",
+			Values: registeredLossTestPayload(),
+		},
+	}
+	client.AddHook(hook)
+	taskStore := &blockingReadLossStore{
+		registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+		secondReadStarted:       secondReadStarted,
+	}
+	handler := &countingHandler{node: "trim"}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		handler,
+	)
+	consumer.BlockTimeout = 5 * time.Second
+	withGroup(t, consumer)
+	if _, err := client.XAdd(
+		context.Background(),
+		&redis.XAddArgs{
+			Stream: cfg.RedisStream,
+			Values: registeredLossTestPayload(),
+		},
+	).Result(); err != nil {
+		t.Fatalf("add initial loss task: %v", err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- consumer.Run(registration.Context()) }()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrRegistrationLost) {
+			t.Fatalf("Run error = %v; want ErrRegistrationLost", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after successful read returned behind loss")
+	}
+	if calls := taskStore.claimCalls.Load(); calls != 1 {
+		t.Fatalf("claim calls after late successful read = %d; want 1", calls)
+	}
+	if calls := handler.calls.Load(); calls != 0 {
+		t.Fatalf("handler calls after late successful read = %d; want 0", calls)
+	}
+}
+
+func TestConsumerRegistrationLossCancelsBlockingRedisReadBeforeNewPEL(
+	t *testing.T,
+) {
+	rawURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"))
+	if rawURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_REDIS_TEST_URL for Redis 7.4 worker integration tests")
+	}
+	options, err := ParseWorkerRedisOptions(rawURL)
+	if err != nil {
+		t.Fatalf("parse worker Redis options: %v", err)
+	}
+	if !options.ContextTimeoutEnabled {
+		t.Fatal("ContextTimeoutEnabled = false; want registration-owned cancellation")
+	}
+	client := redis.NewClient(options)
+	t.Cleanup(func() { _ = client.Close() })
+	probeContext, cancelProbe := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancelProbe()
+	if err := client.Ping(probeContext).Err(); err != nil {
+		t.Fatalf("ping Redis integration server: %v", err)
+	}
+
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := registrationLossTestConfig(lease)
+	cfg.Concurrency = 2
+	cfg.ShutdownGracePeriod = time.Second
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupContext, cfg.RedisStream).Err()
+	})
+	secondReadStarted := make(chan struct{})
+	client.AddHook(&registrationReadRaceHook{
+		secondReadStarted: secondReadStarted,
+	})
+	taskStore := &blockingReadLossStore{
+		registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+		secondReadStarted:       secondReadStarted,
+	}
+	handler := &countingHandler{node: "trim"}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		handler,
+	)
+	consumer.BlockTimeout = 30 * time.Second
+	withGroup(t, consumer)
+	if _, err := client.XAdd(
+		context.Background(),
+		&redis.XAddArgs{
+			Stream: cfg.RedisStream,
+			Values: registeredLossTestPayload(),
+		},
+	).Result(); err != nil {
+		t.Fatalf("add initial registered delivery: %v", err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- consumer.Run(registration.Context()) }()
+	select {
+	case <-registration.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("registration loss was not published")
+	}
+	lateID, err := client.XAdd(
+		context.Background(),
+		&redis.XAddArgs{
+			Stream: cfg.RedisStream,
+			Values: registeredLossTestPayload(),
+		},
+	).Result()
+	if err != nil {
+		t.Fatalf("add delivery after registration loss: %v", err)
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrRegistrationLost) {
+			t.Fatalf("Run error = %v; want ErrRegistrationLost", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not promptly cancel blocking XREADGROUP")
+	}
+	pending, err := client.XPending(
+		context.Background(),
+		cfg.RedisStream,
+		cfg.RedisGroup,
+	).Result()
+	if err != nil {
+		t.Fatalf("read pending after blocking-read cancellation: %v", err)
+	}
+	if pending.Count != 1 {
+		t.Fatalf("pending deliveries after loss = %d; want 1", pending.Count)
+	}
+	latePending, err := client.XPendingExt(
+		context.Background(),
+		&redis.XPendingExtArgs{
+			Stream: cfg.RedisStream,
+			Group:  cfg.RedisGroup,
+			Start:  lateID,
+			End:    lateID,
+			Count:  1,
+		},
+	).Result()
+	if err != nil {
+		t.Fatalf("inspect late delivery PEL state: %v", err)
+	}
+	if len(latePending) != 0 {
+		t.Fatalf("delivery enqueued after loss entered PEL: %#v", latePending)
+	}
+	if calls := taskStore.claimCalls.Load(); calls != 1 {
+		t.Fatalf("claim calls after loss = %d; want 1", calls)
+	}
+	if calls := handler.calls.Load(); calls != 0 {
+		t.Fatalf("handler calls after loss = %d; want 0", calls)
+	}
+	exact, err := client.XRangeN(
+		context.Background(),
+		cfg.RedisStream,
+		lateID,
+		lateID,
+		1,
+	).Result()
+	if err != nil || len(exact) != 1 {
+		t.Fatalf("late undelivered stream entry = %#v, err=%v", exact, err)
 	}
 }
 
@@ -2706,6 +3011,131 @@ func TestRegistrationAffinityScanUsesFiniteInitialPendingSnapshot(
 	}
 	if pages != 2 {
 		t.Fatalf("XPENDING extended pages = %d; want finite initial 2", pages)
+	}
+}
+
+func TestRegistrationAffinitySnapshotHasNoPartialClaimOnLaterPageError(
+	t *testing.T,
+) {
+	client := newRealWorkerRedisClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	stream := "vp:test:affinity-page-error:" + suffix
+	group := "vp-test-affinity-page-error-" + suffix
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupContext, stream).Err()
+	})
+	if err := client.XGroupCreateMkStream(ctx, stream, group, "0").Err(); err != nil {
+		t.Fatalf("create page-error affinity group: %v", err)
+	}
+
+	targetPayload := registeredLossTestPayload()
+	targetPayload["preferred_hosts"] = `["host127"]`
+	targetPayload["affinity_enqueued_at"] = time.Now().UTC().
+		Format(time.RFC3339Nano)
+	targetID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		Values: targetPayload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add early-page affinity target: %v", err)
+	}
+	for index := 0; index < 55; index++ {
+		if _, err := client.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream,
+			Values: map[string]any{
+				"preferred_hosts": "[]",
+				"config":          "{}",
+				"input_artifacts": "{}",
+				"filler":          index,
+			},
+		}).Result(); err != nil {
+			t.Fatalf("add page-error filler %d: %v", index, err)
+		}
+	}
+	wrongConsumer := "ffmpeg_go-worker@host150:1:" + uuid.NewString()
+	delivered, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: wrongConsumer,
+		Streams:  []string{stream, ">"},
+		Count:    56,
+	}).Result()
+	if err != nil ||
+		len(delivered) != 1 ||
+		len(delivered[0].Messages) != 56 {
+		t.Fatalf("deliver page-error snapshot: streams=%#v err=%v", delivered, err)
+	}
+	time.Sleep(600 * time.Millisecond)
+
+	hook := &pendingPageFailureHook{}
+	client.AddHook(hook)
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	taskStore := &registeredTaskStoreStub{lease: lease}
+	handler := &countingHandler{node: "trim"}
+	preferred := NewRegisteredConsumer(
+		client,
+		Config{
+			WorkerType:  "ffmpeg_go",
+			WorkerID:    lease.RedisConsumerID,
+			WorkerHost:  "host127",
+			RedisStream: stream,
+			RedisGroup:  group,
+		},
+		taskStore,
+		registration,
+		handler,
+	)
+
+	claimed, err := preferred.claimPreferredPending(ctx)
+	if err == nil || !strings.Contains(err.Error(), "forced later XPENDING") {
+		t.Fatalf("first scan error = %v; want forced later-page failure", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("first scan claims = %#v; want none on snapshot failure", claimed)
+	}
+	if claims := hook.xclaims.Load(); claims != 0 {
+		t.Fatalf("partial XCLAIM calls before snapshot completion = %d; want 0", claims)
+	}
+
+	handled, err := preferred.ReclaimPreferredPending(ctx)
+	if err != nil {
+		t.Fatalf("healthy preferred scan: %v", err)
+	}
+	if handled != 1 {
+		t.Fatalf("healthy preferred dispatches = %d; want 1", handled)
+	}
+	if calls := handler.calls.Load(); calls != 1 {
+		t.Fatalf("handler calls after healthy scan = %d; want 1", calls)
+	}
+	if taskStore.claimCalls != 1 || taskStore.ackCalls != 1 {
+		t.Fatalf(
+			"claim/ack calls after healthy scan = %d/%d; want 1/1",
+			taskStore.claimCalls,
+			taskStore.ackCalls,
+		)
+	}
+	if claims := hook.xclaims.Load(); claims != 1 {
+		t.Fatalf("total XCLAIM calls = %d; want exact target claim only", claims)
+	}
+	pending, err := client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: stream,
+		Group:  group,
+		Start:  targetID,
+		End:    targetID,
+		Count:  1,
+	}).Result()
+	if err != nil {
+		t.Fatalf("inspect target PEL after healthy dispatch: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("target remains pending after healthy dispatch: %#v", pending)
 	}
 }
 

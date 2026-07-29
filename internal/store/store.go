@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"errors"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,11 +15,18 @@ import (
 // Field/column names mirror `backend/app/models/*.py` exactly so JSON
 // produced from these rows matches the Python FastAPI response shapes.
 type Store struct {
-	Pool *pgxpool.Pool
+	Pool      *pgxpool.Pool
+	closeGate *poolAcquisitionGate
 }
 
 func Open(ctx context.Context, databaseURL string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	closeGate := newPoolAcquisitionGate()
+	closeGate.install(config)
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, err
 	}
@@ -25,12 +34,12 @@ func Open(ctx context.Context, databaseURL string) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Store{Pool: pool}, nil
+	return &Store{Pool: pool, closeGate: closeGate}, nil
 }
 
 func (s *Store) Close() {
 	if s != nil && s.Pool != nil {
-		s.Pool.Close()
+		_ = s.CloseContext(context.Background())
 	}
 }
 
@@ -38,6 +47,24 @@ func (s *Store) CloseContext(ctx context.Context) error {
 	if s == nil || s.Pool == nil {
 		return nil
 	}
+	if s.closeGate == nil {
+		return s.closeContextWithoutGate(ctx)
+	}
+	if !s.closeGate.ownClose(ctx) {
+		return context.Cause(ctx)
+	}
+	defer s.closeGate.releaseClose()
+	s.closeGate.beginClose()
+	if !s.closeGate.wait(ctx) {
+		s.Pool.Reset()
+		s.closeGate.reopen()
+		return context.Cause(ctx)
+	}
+	s.Pool.Close()
+	return nil
+}
+
+func (s *Store) closeContextWithoutGate(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -52,6 +79,137 @@ func (s *Store) CloseContext(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+var errStorePoolClosing = errors.New("store PostgreSQL pool is closing")
+
+type poolAcquisitionGate struct {
+	mu         sync.Mutex
+	closing    bool
+	active     map[*pgx.Conn]struct{}
+	changed    chan struct{}
+	closeOwner chan struct{}
+}
+
+func newPoolAcquisitionGate() *poolAcquisitionGate {
+	return &poolAcquisitionGate{
+		active:     make(map[*pgx.Conn]struct{}),
+		changed:    make(chan struct{}),
+		closeOwner: make(chan struct{}, 1),
+	}
+}
+
+func (g *poolAcquisitionGate) ownClose(ctx context.Context) bool {
+	select {
+	case g.closeOwner <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (g *poolAcquisitionGate) releaseClose() {
+	<-g.closeOwner
+}
+
+func (g *poolAcquisitionGate) install(config *pgxpool.Config) {
+	previousPrepare := config.PrepareConn
+	previousBeforeAcquire := config.BeforeAcquire
+	previousAfterRelease := config.AfterRelease
+	previousBeforeClose := config.BeforeClose
+	config.BeforeAcquire = nil
+	config.PrepareConn = func(
+		ctx context.Context,
+		connection *pgx.Conn,
+	) (bool, error) {
+		if !g.acquire(connection) {
+			return true, errStorePoolClosing
+		}
+		if previousPrepare != nil {
+			ok, err := previousPrepare(ctx, connection)
+			if !ok || err != nil {
+				g.release(connection)
+			}
+			return ok, err
+		}
+		if previousBeforeAcquire != nil &&
+			!previousBeforeAcquire(ctx, connection) {
+			g.release(connection)
+			return false, nil
+		}
+		return true, nil
+	}
+	config.AfterRelease = func(connection *pgx.Conn) bool {
+		keep := true
+		if previousAfterRelease != nil {
+			keep = previousAfterRelease(connection)
+		}
+		g.release(connection)
+		return keep
+	}
+	config.BeforeClose = func(connection *pgx.Conn) {
+		if previousBeforeClose != nil {
+			previousBeforeClose(connection)
+		}
+		g.release(connection)
+	}
+}
+
+func (g *poolAcquisitionGate) acquire(connection *pgx.Conn) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closing {
+		return false
+	}
+	g.active[connection] = struct{}{}
+	g.signalLocked()
+	return true
+}
+
+func (g *poolAcquisitionGate) release(connection *pgx.Conn) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, exists := g.active[connection]; !exists {
+		return
+	}
+	delete(g.active, connection)
+	g.signalLocked()
+}
+
+func (g *poolAcquisitionGate) beginClose() {
+	g.mu.Lock()
+	g.closing = true
+	g.signalLocked()
+	g.mu.Unlock()
+}
+
+func (g *poolAcquisitionGate) reopen() {
+	g.mu.Lock()
+	g.closing = false
+	g.signalLocked()
+	g.mu.Unlock()
+}
+
+func (g *poolAcquisitionGate) wait(ctx context.Context) bool {
+	for {
+		g.mu.Lock()
+		if len(g.active) == 0 {
+			g.mu.Unlock()
+			return true
+		}
+		changed := g.changed
+		g.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-changed:
+		}
+	}
+}
+
+func (g *poolAcquisitionGate) signalLocked() {
+	close(g.changed)
+	g.changed = make(chan struct{})
 }
 
 func (s *Store) Ping(ctx context.Context) error {

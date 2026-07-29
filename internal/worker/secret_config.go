@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -198,17 +199,56 @@ func ParseWorkerRedisOptions(rawRedisURL string) (*redis.Options, error) {
 		rawRedisURL = "redis://localhost:6379/0"
 	}
 	options, err := redis.ParseURL(rawRedisURL)
-	if err != nil ||
-		options.Network != "tcp" ||
-		options.DialTimeout < 0 ||
-		options.ReadTimeout < 0 ||
-		options.WriteTimeout < 0 ||
-		options.PoolTimeout < 0 {
+	if err != nil || !validWorkerRedisOptions(options) {
 		return nil, &WorkerSecretError{
 			message: "worker Redis configuration is invalid",
 		}
 	}
+	options.ContextTimeoutEnabled = true
 	return options, nil
+}
+
+func validWorkerRedisOptions(options *redis.Options) bool {
+	if options == nil ||
+		options.Network != "tcp" ||
+		options.DB < 0 ||
+		options.PoolSize < 0 ||
+		options.MinIdleConns < 0 ||
+		options.MaxIdleConns < 0 ||
+		options.MaxActiveConns < 0 ||
+		options.MaxConcurrentDials < 0 ||
+		options.DialTimeout < 0 ||
+		options.ReadTimeout < 0 ||
+		options.WriteTimeout < 0 ||
+		options.PoolTimeout < 0 {
+		return false
+	}
+	if options.Protocol != 0 &&
+		options.Protocol != 2 &&
+		options.Protocol != 3 {
+		return false
+	}
+	const maxRedisPoolCount = int64(1<<31 - 1)
+	for _, count := range []int{
+		options.PoolSize,
+		options.MinIdleConns,
+		options.MaxIdleConns,
+		options.MaxActiveConns,
+		options.MaxConcurrentDials,
+	} {
+		if int64(count) > maxRedisPoolCount {
+			return false
+		}
+	}
+	host, portText, err := net.SplitHostPort(options.Addr)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return false
+	}
+	return !strings.Contains(host, ":") || net.ParseIP(host) != nil
 }
 
 func workerAllowsEnvironmentSecretFallback(

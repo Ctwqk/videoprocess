@@ -466,6 +466,75 @@ func TestWorkerStartupRejectsMalformedProductionRedisBeforeDatabaseOpen(
 	}
 }
 
+func TestWorkerStartupRejectsUnsafeRedisRangesInEveryModeBeforeDatabaseOpen(
+	t *testing.T,
+) {
+	databasePath := writeStartupSecret(
+		t,
+		"database-url",
+		"postgresql://runtime:synthetic-password@vp-postgres/videoprocess",
+	)
+	tokenPath := writeStartupSecret(
+		t,
+		"admission-token",
+		"synthetic-admission-secret",
+	)
+	testCases := []struct {
+		mode     string
+		redisURL string
+	}{
+		{"local", "redis://worker:synthetic@127.0.0.1:6379/-1"},
+		{"development", "redis://worker:synthetic@127.0.0.1:6379/14?pool_size=-1"},
+		{"test", "redis://worker:synthetic@127.0.0.1:6379/14?min_idle_conns=-1"},
+		{"shared", "redis://worker:synthetic@127.0.0.1:6379/14?max_idle_conns=-1"},
+		{"production", "redis://worker:synthetic@127.0.0.1:6379/14?max_active_conns=-1"},
+		{"local", "redis://worker:synthetic@127.0.0.1:6379/14?max_concurrent_dials=-1"},
+		{"development", "redis://worker:synthetic@127.0.0.1:6379/14?protocol=4"},
+		{"production", "redis://worker:synthetic@127.0.0.1:70000/14"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.mode+" "+testCase.redisURL, func(t *testing.T) {
+			env := workerStartupTestEnv()
+			env["DEPLOY_MODE"] = testCase.mode
+			env["REDIS_URL"] = testCase.redisURL
+			env["WORKER_DATABASE_URL_FILE"] = databasePath
+			env["WORKER_ADMISSION_TOKEN_FILE"] = tokenPath
+			delete(env, "DATABASE_URL")
+			delete(env, "WORKER_ADMISSION_TOKEN")
+			databaseOpens := 0
+			err := runWorker(
+				context.Background(),
+				env,
+				startupDependencies{
+					openDatabase: func(
+						context.Context,
+						string,
+					) (startupDatabase, error) {
+						databaseOpens++
+						return nil, errors.New("database open must not run")
+					},
+				},
+			)
+			if err == nil {
+				t.Fatal("unsafe Redis scalar configuration was accepted")
+			}
+			if databaseOpens != 0 {
+				t.Fatalf("database opens = %d; want 0", databaseOpens)
+			}
+			for _, credential := range []string{
+				"synthetic-password",
+				"synthetic-admission-secret",
+				databasePath,
+				tokenPath,
+			} {
+				if strings.Contains(err.Error(), credential) {
+					t.Fatalf("startup error exposed credential %q: %v", credential, err)
+				}
+			}
+		})
+	}
+}
+
 func TestWorkerStartupValidatesExactRedisACLIdentity(t *testing.T) {
 	rawURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"))
 	if rawURL == "" {
