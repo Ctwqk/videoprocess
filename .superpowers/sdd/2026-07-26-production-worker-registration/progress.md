@@ -74,6 +74,11 @@ does not cover nil-gate Store construction or Hijack; commits
 a0fa9ea..b176ee4)
 Task 3: minor (deferred): the PostgreSQL pool lifecycle goroutine-count
 assertion was flaky in 4 of 26 focused re-review runs.
+Task 3: fix round 4/5 (1 addressed, 3 open — public registered reclaim helpers
+bypass the second authority/local-loss handoff fence; Redis connection
+lifetime/jitter scalars can still panic after database admission; external
+`Store.Close` silently no-ops and direct `AcquireAllIdle` bypasses the pool
+gate/statistics; commits b176ee4..2cf4494)
 Task 4: pending
 Task 5: pending
 Task 6: pending
