@@ -117,11 +117,45 @@ acquire_mode_lock() {
   local mode="$1"
   mkdir -p "$LOCK_DIR"
   MODE_LOCK="$LOCK_DIR/$mode.lock"
-  if ! mkdir "$MODE_LOCK" 2>/dev/null; then
-    emit "mode=$mode" "code=lock_busy"
-    return 1
+  local held="${VP_WORKER_REDIS_MARKER_LOCK_HELD:-}"
+  if [[ "$held" =~ ^(readiness|janitor):([0-9]+)$ \
+    && "${BASH_REMATCH[1]}" == "$mode" \
+    && -e "/dev/fd/${BASH_REMATCH[2]}" ]]; then
+    return 0
   fi
-  trap 'rmdir "$MODE_LOCK" 2>/dev/null || true' EXIT HUP INT TERM
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>>"$MODE_LOCK"
+    if ! flock -n 9; then
+      emit "mode=$mode" "code=lock_busy"
+      return 1
+    fi
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    exec python3 - "$MODE_LOCK" "$0" "$mode" <<'PY'
+import fcntl
+import os
+import sys
+
+lock_path, launcher, mode = sys.argv[1:]
+try:
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print(f"mode={mode} code=lock_busy")
+    raise SystemExit(0)
+except OSError:
+    print(f"mode={mode} code=lock_unavailable")
+    raise SystemExit(3)
+
+os.set_inheritable(lock_fd, True)
+environment = os.environ.copy()
+environment["VP_WORKER_REDIS_MARKER_LOCK_HELD"] = f"{mode}:{lock_fd}"
+os.execve(launcher, [launcher, mode], environment)
+PY
+  fi
+  emit "mode=$mode" "code=lock_unavailable"
+  return 3
 }
 
 service_state() {
@@ -142,11 +176,69 @@ service_state() {
   printf '%s\n' "${states%% *}"
 }
 
+expected_service_identity() {
+  local mode="$1"
+  local database_secret
+  local redis_secret
+  local module
+  local command
+  case "$mode" in
+    readiness)
+      database_secret="$READINESS_DATABASE_SECRET"
+      redis_secret="$READINESS_REDIS_SECRET"
+      module="app.channel_agent.worker_redis_marker_readiness_cli"
+      command="check"
+      ;;
+    janitor)
+      database_secret="$JANITOR_DATABASE_SECRET"
+      redis_secret="$JANITOR_REDIS_SECRET"
+      module="app.channel_agent.worker_redis_marker_janitor_cli"
+      command="run"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  local network_id
+  network_id="$(
+    docker network inspect "$NETWORK" --format '{{.ID}}' 2>/dev/null
+  )" || return 1
+  [[ "$network_id" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+  printf '%s\n' \
+    "2|$mode|$GENERATION|$IMAGE|replicated-job|1|1|none|node.hostname==$CONTROL_NODE|$network_id|$database_secret:worker-marker-database-url:256,$redis_secret:worker-marker-redis-url:256|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url,WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url|python,-m,$module,$command"
+}
+
+service_identity() {
+  local name="$1"
+  local identity
+  identity="$(
+    docker service inspect "$name" --format \
+      '{{len .Spec.Labels}}|{{index .Spec.Labels "vp.worker-redis-marker.mode"}}|{{index .Spec.Labels "vp.worker-redis-marker.generation"}}|{{.Spec.TaskTemplate.ContainerSpec.Image}}|{{if .Spec.Mode.ReplicatedJob}}replicated-job{{else}}other{{end}}|{{.Spec.Mode.ReplicatedJob.TotalCompletions}}|{{.Spec.Mode.ReplicatedJob.MaxConcurrent}}|{{.Spec.TaskTemplate.RestartPolicy.Condition}}|{{range .Spec.TaskTemplate.Placement.Constraints}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.Networks}}{{printf "%s," .Target}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Secrets}}{{printf "%s:%s:%d," .SecretName .File.Name .File.Mode}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Args}}{{printf "%s," .}}{{end}}' \
+      2>/dev/null
+  )" || return 1
+  identity="${identity//,|/|}"
+  printf '%s\n' "${identity%,}"
+}
+
 remove_completed_job() {
   local mode="$1"
   local name="$2"
   if ! docker service inspect "$name" >/dev/null 2>&1; then
     return 0
+  fi
+  local expected_identity
+  local actual_identity
+  expected_identity="$(expected_service_identity "$mode")" || {
+    emit "mode=$mode" "code=job_inspection_failed"
+    return 3
+  }
+  actual_identity="$(service_identity "$name")" || {
+    emit "mode=$mode" "code=job_inspection_failed"
+    return 3
+  }
+  if [[ "$actual_identity" != "$expected_identity" ]]; then
+    emit "mode=$mode" "code=job_identity_invalid"
+    return 3
   fi
   local state
   state="$(service_state "$name")" || {
@@ -256,6 +348,7 @@ launch_job() {
 
   if ! docker service create \
     --detach=true \
+    --no-resolve-image \
     --name "$name" \
     --mode replicated-job \
     --replicas 1 \
@@ -322,24 +415,55 @@ launch_job() {
   esac
 }
 
-read_status_value() {
+load_readiness_status() {
   local path="$1"
-  local key="$2"
-  awk -F= -v expected="$key" '
-    $1 == expected {
-      if (found || NF != 2) {
-        exit 2
+  local parsed
+  parsed="$(
+    awk -F= '
+      BEGIN {
+        allowed["GENERATION"]=1
+        allowed["RECORDED_AT"]=1
+        allowed["CODE"]=1
+        allowed["CHECKED_COUNT"]=1
+        allowed["EXPECTED_COUNT"]=1
       }
-      value=$2
-      found=1
-    }
-    END {
-      if (!found) {
-        exit 1
+      {
+        if (NF != 2 || $1 == "" || $2 == "" || $0 ~ /\r/ ||
+          !($1 in allowed) || seen[$1]++) {
+          invalid=1
+          exit
+        }
+        value[$1]=$2
       }
-      print value
-    }
-  ' "$path"
+      END {
+        if (invalid) {
+          exit 1
+        }
+        for (key in allowed) {
+          if (!(key in value)) {
+            exit 1
+          }
+        }
+        printf "%s|%s|%s|%s|%s\n",
+          value["GENERATION"],
+          value["RECORDED_AT"],
+          value["CODE"],
+          value["CHECKED_COUNT"],
+          value["EXPECTED_COUNT"]
+      }
+    ' "$path"
+  )" || return 1
+  IFS='|' read -r \
+    STATUS_GENERATION \
+    STATUS_RECORDED_AT \
+    STATUS_CODE \
+    STATUS_CHECKED_COUNT \
+    STATUS_EXPECTED_COUNT <<<"$parsed"
+  [[ "$STATUS_GENERATION" =~ ^[a-z0-9][a-z0-9-]{0,62}$ \
+    && "$STATUS_RECORDED_AT" =~ ^[0-9]+$ \
+    && "$STATUS_CODE" =~ ^[a-z0-9_]+$ \
+    && "$STATUS_CHECKED_COUNT" =~ ^[0-9]+$ \
+    && "$STATUS_EXPECTED_COUNT" =~ ^[0-9]+$ ]]
 }
 
 print_sanitized_status() {
@@ -349,55 +473,32 @@ print_sanitized_status() {
     emit "mode=status" "code=readiness_status_missing"
     return 3
   fi
-  local generation
-  local recorded_at
-  local code
-  local checked_count
-  local expected_count
-  generation="$(read_status_value "$readiness_path" GENERATION)" || {
+  if ! load_readiness_status "$readiness_path"; then
     emit "mode=status" "code=readiness_status_invalid"
     return 3
-  }
-  recorded_at="$(read_status_value "$readiness_path" RECORDED_AT)" || {
-    emit "mode=status" "code=readiness_status_invalid"
-    return 3
-  }
-  code="$(read_status_value "$readiness_path" CODE)" || {
-    emit "mode=status" "code=readiness_status_invalid"
-    return 3
-  }
-  checked_count="$(read_status_value "$readiness_path" CHECKED_COUNT)" || {
-    emit "mode=status" "code=readiness_status_invalid"
-    return 3
-  }
-  expected_count="$(read_status_value "$readiness_path" EXPECTED_COUNT)" || {
-    emit "mode=status" "code=readiness_status_invalid"
-    return 3
-  }
-  if [[ "$generation" != "$GENERATION" \
-    || ! "$recorded_at" =~ ^[0-9]+$ \
-    || ! "$checked_count" =~ ^[0-9]+$ \
-    || ! "$expected_count" =~ ^[0-9]+$ ]]; then
+  fi
+  if [[ "$STATUS_GENERATION" != "$GENERATION" ]]; then
     emit "mode=status" "code=readiness_status_invalid"
     return 3
   fi
   local now
   now="$(date +%s)"
-  if [[ "$recorded_at" -gt "$now" \
-    || $((now - recorded_at)) -gt "$READINESS_MAX_AGE_SECONDS" ]]; then
+  if [[ "$STATUS_RECORDED_AT" -gt "$now" \
+    || $((now - STATUS_RECORDED_AT)) -gt "$READINESS_MAX_AGE_SECONDS" ]]; then
     emit "mode=status" "code=readiness_status_stale"
     return 3
   fi
-  if [[ "$code" != ready || "$checked_count" -ne "$expected_count" ]]; then
+  if [[ "$STATUS_CODE" != ready \
+    || "$STATUS_CHECKED_COUNT" -ne "$STATUS_EXPECTED_COUNT" ]]; then
     emit "mode=status" "code=readiness_status_unready"
     return 3
   fi
   emit \
     "mode=status" \
     "code=ready" \
-    "generation=$generation" \
-    "checked_count=$checked_count" \
-    "expected_count=$expected_count"
+    "generation=$STATUS_GENERATION" \
+    "checked_count=$STATUS_CHECKED_COUNT" \
+    "expected_count=$STATUS_EXPECTED_COUNT"
 }
 
 if [[ "$#" -ne 1 ]]; then

@@ -93,7 +93,11 @@ cron entries are `* * * * * ... readiness` and
 `*/5 * * * * ... janitor`. Repair is never scheduled. Each job mounts only
 its own generation database secret and constructure-runtime Redis secret at
 mode `0400`; the independently versioned repair database secret is retained
-only for an explicit operator command.
+only for an explicit operator command. The launcher uses a kernel-released
+nonblocking lock and preserves the configured image without registry
+resolution. It removes a fixed-name service only after exact
+labels/mode/generation/image/network/placement/restart/secrets/environment/
+command validation and proof of exactly one terminal task.
 
 VideoProcess accepts a mode-`0400` constructure-runtime state file only when
 its `GENERATION` equals the exact 40-character
@@ -103,15 +107,22 @@ its `GENERATION` equals the exact 40-character
 readiness/janitor/repair Redis Swarm secrets all exist. The independent
 constructure-runtime plan owns those Redis users, credentials, AOF, and
 eviction settings. VideoProcess creates no fallback Redis ACL state and fails
-before every registered Python worker update when the attestation, secrets,
-fresh database status, or ACL identity is absent.
+before every registered Python worker mutation when the attestation, secrets,
+fresh database status, or ACL identity is absent. One readiness run establishes
+the status record; an exact generation-matching status no older than 90 seconds
+is required again immediately before ffmpeg, vision, publisher, and their
+rollback snapshot mutations.
 
-Rollback provisions fresh database roles and secrets against the prior
-reviewed Python image, installs that fresh generation, and proves one
-readiness job plus `status` before it revokes the failed and superseded roles
-or secrets. Failed-generation passwords are never reused. This transaction
-does not alter the independent VP, PDS, feature, schedule, or channel cron
-entries.
+A terminal never-ready generation is deactivated by restoring the captured
+managed launcher/config/cron state, then its exact jobs are removed and proved
+absent, then its database roles, secrets, and credential files are retired.
+First-ever failure restores prior absence. A nonterminal job blocks role
+revocation. Rollback provisions fresh roles and secrets against the prior
+reviewed Python image. If rollback readiness fails, candidate managed state is
+restored before the failed rollback generation is cleaned in the same order.
+A ready rollback is proven before failed or superseded credentials are
+revoked. Passwords are never reused, and independent VP, PDS, feature,
+schedule, and channel cron entries are not altered.
 
 The only automated mutation matrix is conservative:
 

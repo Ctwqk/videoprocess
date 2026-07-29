@@ -268,14 +268,19 @@ REPAIR_REDIS_SECRET=<existing repair secret>
 `VP_WORKER_REDIS_RUNTIME_GENERATION` must equal `GENERATION`, and all three
 secret names must be distinct and inspectable. Missing identity, generation,
 AOF health, `noeviction`, secret, or fresh database continuity fails before
-registered Python worker update. VideoProcess does not synthesize any of this
-runtime state.
+each registered Python worker mutation. VideoProcess does not synthesize any of
+this runtime state.
 
 `deploy/swarm/worker-redis-marker-control.sh` exposes only `readiness`,
 `janitor`, and `status`. Its fixed one-replica, restart-`none` jobs are
 `vp-worker-redis-marker-readiness-job` and
-`vp-worker-redis-marker-janitor-job`, both in `replicated-job` mode, attached to `vp-pipeline-net` and placed
-at `node.hostname==ccttww-lap`. The marked cron entries are:
+`vp-worker-redis-marker-janitor-job`, both in `replicated-job` mode, attached
+to `vp-pipeline-net` and placed at `node.hostname==ccttww-lap`. Jobs preserve
+the exact configured image identity. Kernel-released nonblocking locks prevent
+overlap. Before removing a fixed-name job, the launcher requires the exact
+labels, generation, image, mode, one-completion shape, restart policy, network,
+placement, two mode-specific secrets, environment, command, and exactly one
+terminal task. The marked cron entries are:
 
 ```text
 * * * * * .../worker-redis-marker-control.sh readiness
@@ -288,17 +293,26 @@ for explicit operator use but is mounted into neither job. Database URL
 secrets are created through stdin; credentials never enter argv, environment,
 logs, status, or cron.
 
-Deployment runs one readiness job and requires a fresh generation-matching
-`status` before any registered Python worker update. Registered Python startup
-then calls `public.vp_require_worker_redis_continuity(90)` after registration
-and before Redis construction, followed by `ACL WHOAMI` before `XGROUP`.
+Deployment runs one readiness job, then parses one exact status record and
+requires a fresh generation-matching `status` immediately before the ffmpeg,
+vision, and publisher mutations and before corresponding rollback snapshot
+mutations. Registered Python startup then calls
+`public.vp_require_worker_redis_continuity(90)` after registration and before
+Redis construction, followed by `ACL WHOAMI` before `XGROUP`.
 Missing/stale/error/overlap all release registration and emit only
 `worker_redis_continuity_unready`.
 
-Rollback provisions fresh prior-image database roles and passwords, creates
-fresh secrets, and proves readiness before revoking failed or superseded
-generations. It does not alter independent VP, PDS, feature, schedule, or
-channel cron. Host 126 IPs, aliases, and placement remain hard failures.
+A terminal never-ready candidate first restores or deactivates only the managed
+launcher/config/cron state, removes and proves absent only exact
+candidate-identity jobs, then revokes roles and deletes database secrets and
+credential files. A first-ever failure restores prior absence. A nonterminal
+job blocks revocation and cleanup convergence. Rollback provisions fresh
+prior-image roles, passwords, and secrets; if that fresh rollback is unready,
+the candidate managed state is restored before the rollback generation is
+retired in the same order. A ready rollback is proven before candidate or
+superseded credentials are revoked. Independent VP, PDS, feature, schedule,
+and channel cron remain unchanged. Host 126 IPs, aliases, and placement remain
+hard failures.
 
 The repair matrix is deliberately non-generative:
 

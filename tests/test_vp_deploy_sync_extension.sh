@@ -969,37 +969,63 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
   echo 'FAIL: general production worker must not receive publication credentials' >&2
   exit 1
 fi
-if ! grep -Fq \
-  'vp_prepare_worker_redis_marker_controls "$python_worker"' \
-  "$EXTENSION"; then
-  echo 'FAIL: registered Python worker updates require marker continuity readiness' >&2
-  exit 1
-fi
-marker_gate_line="$(
-  grep -nF 'vp_prepare_worker_redis_marker_controls "$python_worker"' \
-    "$EXTENSION" | head -1 | cut -d: -f1
-)"
-python_worker_update_line="$(
-  grep -nF 'vp_deploy_python_worker "$python_worker"' \
-    "$EXTENSION" | head -1 | cut -d: -f1
-)"
-if [[ -z "$marker_gate_line" || -z "$python_worker_update_line" \
-  || "$marker_gate_line" -ge "$python_worker_update_line" ]]; then
-  echo 'FAIL: marker continuity readiness must run before registered Python worker updates' >&2
-  exit 1
-fi
 source "$EXTENSION"
 
-vp_prepare_worker_redis_marker_controls() {
-  printf 'marker-control|prepare|%s\n' "$1" >>"$CALLS"
+vp_require_worker_redis_runtime_state() {
+  VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET=marker-readiness-runtime
+  VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET=marker-janitor-runtime
+  VP_WORKER_REDIS_MARKER_REPAIR_REDIS_SECRET=marker-repair-runtime
 }
 
-vp_restore_worker_redis_marker_controls() {
-  printf 'marker-control|restore\n' >>"$CALLS"
+vp_worker_redis_marker_owner_file() {
+  printf '/dev/null\n'
 }
 
-vp_commit_worker_redis_marker_controls() {
-  printf 'marker-control|commit\n' >>"$CALLS"
+vp_worker_redis_marker_read_prior_config() {
+  VP_WORKER_REDIS_MARKER_PRIOR_GENERATION=marker-test-prior
+  VP_WORKER_REDIS_MARKER_PRIOR_IMAGE=vp-ffmpeg-worker-python:marker-test-prior
+}
+
+vp_worker_redis_marker_capture_managed_state() {
+  VP_WORKER_REDIS_MARKER_MANAGED_STATE="$1/.test-managed-$RANDOM"
+  mkdir -p "$VP_WORKER_REDIS_MARKER_MANAGED_STATE"
+}
+
+vp_worker_redis_marker_deactivate_managed_cron() {
+  :
+}
+
+vp_worker_redis_marker_restore_managed_state() {
+  :
+}
+
+vp_worker_redis_marker_remove_generation_jobs() {
+  printf 'marker-control|jobs-absent|%s|%s\n' "$1" "$2" >>"$CALLS"
+}
+
+vp_worker_redis_marker_provision_generation() {
+  printf 'marker-control|provision|%s|%s\n' "$1" "$2" >>"$CALLS"
+}
+
+vp_install_worker_redis_marker_control() {
+  printf 'marker-control|install|%s|%s\n' "$1" "$2" >>"$CALLS"
+}
+
+vp_run_worker_redis_marker_readiness() {
+  printf 'marker-control|readiness\n' >>"$CALLS"
+}
+
+vp_require_worker_redis_marker_status() {
+  printf 'marker-control|status\n' >>"$CALLS"
+}
+
+vp_worker_redis_marker_retire_generation() {
+  printf 'marker-control|retire|%s|%s\n' "$1" "$2" >>"$CALLS"
+}
+
+vp_worker_redis_marker_discard_managed_state() {
+  rm -rf "$VP_WORKER_REDIS_MARKER_MANAGED_STATE"
+  VP_WORKER_REDIS_MARKER_MANAGED_STATE=""
 }
 
 VP_RUNTIME_HOST=10.0.0.126

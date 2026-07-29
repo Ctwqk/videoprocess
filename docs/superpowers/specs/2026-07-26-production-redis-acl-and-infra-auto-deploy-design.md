@@ -191,7 +191,11 @@ On host 150, `deploy/swarm/worker-redis-marker-control.sh` exposes only
 `vp-worker-redis-marker-readiness-job` and
 `vp-worker-redis-marker-janitor-job`, `replicated-job` mode, one replica, restart condition `none`,
 `vp-pipeline-net`, and `node.hostname==ccttww-lap`. Nonblocking mode locks
-prevent overlap. Cron contains one marked block:
+are kernel-released after process death. Jobs use the exact configured image
+without registry resolution. Destructive fixed-name removal requires exact
+labels, mode, generation, image, one-completion shape, restart policy, network,
+placement, mode-specific secrets, environment, command, and exactly one
+terminal task. Cron contains one marked block:
 
 ```text
 * * * * * .../worker-redis-marker-control.sh readiness
@@ -206,18 +210,26 @@ environment, cron, status, or logs.
 
 The VP deploy transaction provisions database roles first, installs the
 launcher and marked cron without changing the independent VP/PDS/feature or
-schedule/channel entries, runs one readiness job, and requires fresh matching
-`status` before any registered Python worker update. Registered Python startup
-then opens PostgreSQL, registers, calls
+schedule/channel entries, and runs one readiness job. It parses the complete
+status file once with an exact field allowlist, then requires fresh matching
+`status` immediately before each ffmpeg, vision, and publisher mutation and
+before matching rollback snapshot mutations. Registered Python startup then
+opens PostgreSQL, registers, calls
 `public.vp_require_worker_redis_continuity(90)`, constructs Redis, proves
 `ACL WHOAMI`, and only then creates its group. Missing, stale, error, and
 overlapping/running continuity all release registration, construct no Redis
 client, and expose only `worker_redis_continuity_unready`.
 
-Rollback creates a new prior-image role generation and new passwords, proves
-that generation ready, and only then revokes failed and superseded roles and
-secrets. The Go image remains Go-only; its registration/continuity work stays
-in the subsequent worker-registration Task 3.
+A terminal never-ready candidate is deactivated by restoring the prior managed
+launcher/config/cron state, its exact jobs are removed and proved absent, and
+only then are its roles, database secrets, and credential files removed. With
+no prior generation this restores prior absence. A nonterminal task blocks
+revocation. Rollback creates a new prior-image role generation and new
+passwords. If it is unready, candidate managed state is restored before the
+failed rollback generation is cleaned in the same order. A ready rollback is
+proven before failed and superseded roles and secrets are revoked. The Go image
+remains Go-only; its registration/continuity work stays in the subsequent
+worker-registration Task 3.
 
 ### Conservative Repair Matrix
 

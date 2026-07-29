@@ -662,9 +662,12 @@ worker-registration Task 3.
 `vp-worker-redis-marker-readiness-job` and
 `vp-worker-redis-marker-janitor-job` in `replicated-job` mode with one replica, restart condition
 `none`, network `vp-pipeline-net`, and
-`node.hostname==ccttww-lap`. Mode-specific nonblocking locks prevent overlap;
-a running fixed-name job is skipped, and only that mode's terminal job can be
-removed. The marked cron block is exactly:
+`node.hostname==ccttww-lap`. Mode-specific kernel locks are nonblocking and
+release when the process dies. Jobs preserve the configured image identity.
+A running fixed-name job is skipped; removal additionally requires exact
+labels, mode, generation, image, one-completion shape, restart policy, network,
+placement, mode-specific secrets, environment, command, and exactly one
+terminal task. The marked cron block is exactly:
 
 ```text
 * * * * * .../worker-redis-marker-control.sh readiness
@@ -688,10 +691,19 @@ generating ACL credentials, identities, AOF, or eviction configuration.
 Candidate deployment provisions marker-control database roles first, creates
 the three versioned database secrets through stdin, installs the launcher and
 cron without changing VP/PDS/feature/schedule/channel cron, and proves one
-fresh readiness run before updating any registered Python worker. Rollback
+fresh readiness run. The exact status file is parsed once, and fresh matching
+status is required immediately before each ffmpeg, vision, and publisher
+mutation and each applicable rollback snapshot mutation.
+
+A terminal never-ready candidate first restores or deactivates the captured
+managed launcher/config/cron state, then removes and proves absent its exact
+jobs, then revokes roles and deletes secrets and credential files. First-ever
+failure restores prior absence; a nonterminal task blocks revocation. Rollback
 uses the prior reviewed Python image but creates new passwords and a fresh
-generation. It proves readiness before revoking either failed or superseded
-roles and secrets.
+generation. If fresh rollback readiness fails, candidate managed state is
+restored before the failed rollback generation is retired in the same safe
+order. A ready rollback is proven before failed or superseded roles and secrets
+are revoked.
 
 ### Conservative Repair Matrix
 
