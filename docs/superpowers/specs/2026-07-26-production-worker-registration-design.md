@@ -609,6 +609,109 @@ source attestation is acknowledged, and its source dispatch is resolved; a
 dispatch marker additionally requires that exact dispatch to be delivered and
 resolved. No worker has marker deletion access.
 
+## Executable Marker Continuity Boundary
+
+Migration `034_worker_registrations` is the database authority for marker
+continuity. Its executable functions are
+`vp_list_worker_redis_marker_expectations`,
+`vp_begin_worker_redis_continuity_check`,
+`vp_finish_worker_redis_continuity_check`,
+`vp_record_worker_redis_marker_observation`,
+`vp_claim_worker_redis_marker_cleanup`,
+`vp_finish_worker_redis_marker_cleanup`,
+`vp_load_worker_redis_marker_repair`,
+`vp_promote_observed_worker_event_emission`, and
+`vp_require_worker_redis_continuity`. Public execution is revoked. The stable
+NOLOGIN roles are `vp_marker_readiness_runtime`,
+`vp_marker_janitor_runtime`, and `vp_marker_repair_runtime`; each deployment
+gets a distinct LOGIN role through:
+
+```text
+python -m app.services.worker_marker_control_role_cli provision --generation <generation> --state-dir /control-state
+python -m app.services.worker_marker_control_role_cli revoke --generation <generation> --state-dir /control-state
+```
+
+The reviewed Python worker image contains the control service and these
+operator surfaces:
+
+```text
+python -m app.channel_agent.worker_redis_marker_readiness_cli check
+python -m app.channel_agent.worker_redis_marker_janitor_cli run
+python -m app.services.worker_redis_marker_repair_cli audit
+python -m app.services.worker_redis_marker_repair_cli restore-marker --source-id <uuid> --apply
+python -m app.services.worker_redis_marker_repair_cli promote-prepared --emission-id <uuid> --apply
+```
+
+Registered Python startup loads bounded database and admission secret files,
+opens PostgreSQL, registers, calls
+`public.vp_require_worker_redis_continuity(90)`, constructs Redis, proves the
+configured named user with `ACL WHOAMI`, and only then creates its group and
+starts reconciliation/consumption. Missing, stale, error, and
+overlapping/running continuity all release registration, log only
+`worker_redis_continuity_unready`, and construct no Redis client. The legacy
+unregistered development behavior is unchanged.
+
+The Go worker receives no Python runtime or partial registration change in
+this increment. Its registration and database continuity call remain original
+worker-registration Task 3.
+
+### Host-150 Control Jobs
+
+`deploy/swarm/worker-redis-marker-control.sh` exposes only `readiness`,
+`janitor`, and `status`. It launches
+`vp-worker-redis-marker-readiness-job` and
+`vp-worker-redis-marker-janitor-job` in `replicated-job` mode with one replica, restart condition
+`none`, network `vp-pipeline-net`, and
+`node.hostname==ccttww-lap`. Mode-specific nonblocking locks prevent overlap;
+a running fixed-name job is skipped, and only that mode's terminal job can be
+removed. The marked cron block is exactly:
+
+```text
+* * * * * .../worker-redis-marker-control.sh readiness
+*/5 * * * * .../worker-redis-marker-control.sh janitor
+```
+
+Repair has no launcher or cron mode. Readiness mounts only its readiness
+database/Redis secrets; janitor mounts only its janitor database/Redis
+secrets. Every mount is mode `0400`. Deployment also versions a repair
+database secret for explicit operator use, but neither scheduled job mounts
+it.
+
+The independent constructure-runtime controller must provide a mode-`0400`
+state file whose exact 40-character generation matches
+`VP_WORKER_REDIS_RUNTIME_GENERATION` and whose values are
+`ACL_IDENTITY=vp-marker-acl-v1`, `AOF_ENABLED=yes`, `AOF_STATUS=ok`,
+`MAXMEMORY_POLICY=noeviction`, and `NETWORK=vp-pipeline-net`, with three
+distinct existing Redis Swarm secrets. VideoProcess fails closed rather than
+generating ACL credentials, identities, AOF, or eviction configuration.
+
+Candidate deployment provisions marker-control database roles first, creates
+the three versioned database secrets through stdin, installs the launcher and
+cron without changing VP/PDS/feature/schedule/channel cron, and proves one
+fresh readiness run before updating any registered Python worker. Rollback
+uses the prior reviewed Python image but creates new passwords and a fresh
+generation. It proves readiness before revoking either failed or superseded
+roles and secrets.
+
+### Conservative Repair Matrix
+
+| Observed evidence | Result |
+| --- | --- |
+| exact marker, exact stream entry, canonical hash match | readiness may record the observation |
+| exact cleanup authorization and exact marker value | janitor atomically compare-deletes the marker |
+| cleanup marker absent | janitor records `absent` |
+| marker conflict | delete nothing; readiness remains unready |
+| absent marker plus exact stored message ID and exact `XRANGE` hash | operator-only `restore-marker --apply` may use `SET NX` |
+| prepared event plus exact marker/stream/hash | operator-only `promote-prepared --apply` may update PostgreSQL |
+| missing stream entry, hash mismatch, unknown identity, loading/AOF/eviction failure, or incomplete evidence | no mutation; hold for operator |
+
+No automated or operator repair command performs `XADD`, changes an existing
+marker value, manufactures a stream entry, acknowledges work, resumes a
+channel, opens a schedule, retries an upload, or publishes an asset.
+`backend/tests/worker/test_worker_startup.py`,
+`tests/test_worker_redis_marker_control.sh`, and
+`tests/test_vp_deploy_sync_extension.sh` enforce this boundary.
+
 ## Unknown Consumer Guard
 
 The repository-owned watcher runs every minute. A registration guard

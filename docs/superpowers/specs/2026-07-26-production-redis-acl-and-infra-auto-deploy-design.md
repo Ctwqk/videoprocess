@@ -129,6 +129,113 @@ Database numbers remain compatibility routing, not a security boundary: Redis
 ACL key patterns are the enforced boundary. `SELECT` is allowed only where a
 client library needs it, and tests prove that cross-prefix access is denied.
 
+## Worker Marker Continuity Runtime
+
+Worker marker continuity is an executable prerequisite to the client cutover,
+not a prose-only audit. Migration `034_worker_registrations` provides
+`vp_list_worker_redis_marker_expectations`,
+`vp_begin_worker_redis_continuity_check`,
+`vp_finish_worker_redis_continuity_check`,
+`vp_record_worker_redis_marker_observation`,
+`vp_claim_worker_redis_marker_cleanup`,
+`vp_finish_worker_redis_marker_cleanup`,
+`vp_load_worker_redis_marker_repair`,
+`vp_promote_observed_worker_event_emission`, and
+`vp_require_worker_redis_continuity`. They revoke public execution and bind
+the stable NOLOGIN roles `vp_marker_readiness_runtime`,
+`vp_marker_janitor_runtime`, and `vp_marker_repair_runtime`.
+
+VideoProcess provisions and revokes generation-scoped LOGIN roles only through:
+
+```text
+python -m app.services.worker_marker_control_role_cli provision --generation <generation> --state-dir /control-state
+python -m app.services.worker_marker_control_role_cli revoke --generation <generation> --state-dir /control-state
+```
+
+The reviewed Python worker/control image supplies:
+
+```text
+python -m app.channel_agent.worker_redis_marker_readiness_cli check
+python -m app.channel_agent.worker_redis_marker_janitor_cli run
+python -m app.services.worker_redis_marker_repair_cli audit
+python -m app.services.worker_redis_marker_repair_cli restore-marker --source-id <uuid> --apply
+python -m app.services.worker_redis_marker_repair_cli promote-prepared --emission-id <uuid> --apply
+```
+
+The runtime repository creates three independent ACL users:
+
+- `vp-marker-readiness` receives `PING`, `ACL WHOAMI`, read-only `INFO server`,
+  `INFO persistence`, `CONFIG GET maxmemory-policy`, `GET`, and `XRANGE` only
+  for `vp:worker-event-emission:*`, `vp:worker-task-dispatch:*`, `vp:events`,
+  and reviewed `vp:tasks:<worker_type>` streams;
+- `vp-marker-janitor` receives `EVAL`, `GET`, and `DEL` only for the two marker
+  prefixes;
+- `vp-marker-repair` receives `EVAL`, `GET`, `SET`, and `XRANGE` only for the
+  marker prefixes and reviewed streams.
+
+All three explicitly deny `XADD`, `XACK`, expiration, trimming, `FLUSH*`,
+`SCRIPT LOAD`, `+@all`, `~*`, task consumption, and cross-namespace keys.
+
+Constructure-runtime publishes a mode-`0400` non-secret state file containing
+an exact 40-character `GENERATION`, `ACL_IDENTITY=vp-marker-acl-v1`,
+`AOF_ENABLED=yes`, `AOF_STATUS=ok`,
+`MAXMEMORY_POLICY=noeviction`, `NETWORK=vp-pipeline-net`, and distinct existing
+readiness, janitor, and repair Redis Swarm secret names.
+`VP_WORKER_REDIS_RUNTIME_GENERATION` must match exactly. Constructure-runtime
+alone owns generation of the Redis ACL secrets, user definitions, AOF, and
+eviction settings. VideoProcess refuses registered traffic when any field or
+secret is absent; it has no fallback generator.
+
+On host 150, `deploy/swarm/worker-redis-marker-control.sh` exposes only
+`readiness`, `janitor`, and `status`. It uses fixed services
+`vp-worker-redis-marker-readiness-job` and
+`vp-worker-redis-marker-janitor-job`, `replicated-job` mode, one replica, restart condition `none`,
+`vp-pipeline-net`, and `node.hostname==ccttww-lap`. Nonblocking mode locks
+prevent overlap. Cron contains one marked block:
+
+```text
+* * * * * .../worker-redis-marker-control.sh readiness
+*/5 * * * * .../worker-redis-marker-control.sh janitor
+```
+
+Repair is not scheduled. Readiness and janitor each receive only their own
+database and Redis secret mounts at mode `0400`. The repair database secret is
+versioned for explicit operator execution and mounted into neither job.
+Database secrets are streamed to Swarm through stdin and never appear in argv,
+environment, cron, status, or logs.
+
+The VP deploy transaction provisions database roles first, installs the
+launcher and marked cron without changing the independent VP/PDS/feature or
+schedule/channel entries, runs one readiness job, and requires fresh matching
+`status` before any registered Python worker update. Registered Python startup
+then opens PostgreSQL, registers, calls
+`public.vp_require_worker_redis_continuity(90)`, constructs Redis, proves
+`ACL WHOAMI`, and only then creates its group. Missing, stale, error, and
+overlapping/running continuity all release registration, construct no Redis
+client, and expose only `worker_redis_continuity_unready`.
+
+Rollback creates a new prior-image role generation and new passwords, proves
+that generation ready, and only then revokes failed and superseded roles and
+secrets. The Go image remains Go-only; its registration/continuity work stays
+in the subsequent worker-registration Task 3.
+
+### Conservative Repair Matrix
+
+| Evidence | Action |
+| --- | --- |
+| exact marker, exact stream entry, canonical payload hash | readiness records observation |
+| exact cleanup authorization and marker value | janitor compare-deletes |
+| cleanup marker absent | janitor records `absent` |
+| absent marker, exact stored message ID, exact `XRANGE` hash | explicit operator may `restore-marker --apply` with `SET NX` |
+| prepared event, exact marker/stream/hash | explicit operator may `promote-prepared --apply` in PostgreSQL |
+| marker conflict, missing stream entry, payload mismatch, wrong ACL identity, loading/AOF/eviction failure | hold; no mutation |
+
+There is no automatic repair, `XADD`, stream synthesis, acknowledgement,
+schedule/channel change, upload retry, or publication action. The contract is
+enforced by `backend/tests/worker/test_worker_startup.py`,
+`tests/test_worker_redis_marker_control.sh`, and
+`tests/test_vp_deploy_sync_extension.sh`.
+
 ## Two-Phase Cutover
 
 ### Phase A: provision without enforcement
@@ -199,4 +306,3 @@ T05 Redis hardening is complete only when:
 - `default` is off and unauthenticated access fails;
 - restart/rollback tests and production evidence pass;
 - worker durable registration and unknown-consumer auto-hold are also deployed.
-

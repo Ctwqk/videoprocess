@@ -969,7 +969,38 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
   echo 'FAIL: general production worker must not receive publication credentials' >&2
   exit 1
 fi
+if ! grep -Fq \
+  'vp_prepare_worker_redis_marker_controls "$python_worker"' \
+  "$EXTENSION"; then
+  echo 'FAIL: registered Python worker updates require marker continuity readiness' >&2
+  exit 1
+fi
+marker_gate_line="$(
+  grep -nF 'vp_prepare_worker_redis_marker_controls "$python_worker"' \
+    "$EXTENSION" | head -1 | cut -d: -f1
+)"
+python_worker_update_line="$(
+  grep -nF 'vp_deploy_python_worker "$python_worker"' \
+    "$EXTENSION" | head -1 | cut -d: -f1
+)"
+if [[ -z "$marker_gate_line" || -z "$python_worker_update_line" \
+  || "$marker_gate_line" -ge "$python_worker_update_line" ]]; then
+  echo 'FAIL: marker continuity readiness must run before registered Python worker updates' >&2
+  exit 1
+fi
 source "$EXTENSION"
+
+vp_prepare_worker_redis_marker_controls() {
+  printf 'marker-control|prepare|%s\n' "$1" >>"$CALLS"
+}
+
+vp_restore_worker_redis_marker_controls() {
+  printf 'marker-control|restore\n' >>"$CALLS"
+}
+
+vp_commit_worker_redis_marker_controls() {
+  printf 'marker-control|commit\n' >>"$CALLS"
+}
 
 VP_RUNTIME_HOST=10.0.0.126
 if vp_validate_deploy_config >/dev/null 2>&1; then

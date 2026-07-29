@@ -29,9 +29,16 @@ VP_PYTHON_WORKER_SERVICE="vp-ffmpeg-worker-gpu-swarm"
 VP_VISION_WORKER_SERVICE="vp-vision-worker-swarm"
 VP_PUBLISHER_SERVICE="vp-youtube-publisher-swarm"
 VP_APP_SERVICES="vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm vp-event-outbox-relay-swarm vp-channel-agent-runner-swarm vp-ffmpeg-worker-go-swarm $VP_PYTHON_WORKER_SERVICE $VP_VISION_WORKER_SERVICE $VP_PUBLISHER_SERVICE"
+VP_WORKER_REDIS_RUNTIME_ACL_IDENTITY="vp-marker-acl-v1"
+VP_WORKER_REDIS_MARKER_CONTROL_SOURCE="${VP_WORKER_REDIS_MARKER_CONTROL_SOURCE:-$REPO_ROOT/videoprocess/deploy/swarm/worker-redis-marker-control.sh}"
 VP_APP_ATTEMPTED_SERVICES=""
 VP_BACKEND_MIGRATION_APPLIED=false
 VP_VISION_CUTOVER_REQUIRED=false
+VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
+VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION=""
+VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE=""
+VP_WORKER_REDIS_MARKER_PRIOR_GENERATION=""
+VP_WORKER_REDIS_MARKER_PRIOR_IMAGE=""
 
 vp_validate_topology() {
   if [[ "${BUILD_IMAGES:-1}" -eq 0 && "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
@@ -1610,6 +1617,675 @@ vp_install_soak_watch() {
   )
 }
 
+vp_worker_redis_marker_file_mode() {
+  local path="$1"
+  local mode
+  if mode="$(stat -f '%Lp' "$path" 2>/dev/null)"; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  stat -c '%a' "$path" 2>/dev/null
+}
+
+vp_worker_redis_marker_reject_126() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    *10.0.0.126*|*caspers-mac-mini*|*colima-swarmbridged*|*colima-126*|*hostname==126*)
+      return 1
+      ;;
+  esac
+}
+
+vp_require_worker_redis_runtime_state() {
+  local state_file="${VP_WORKER_REDIS_RUNTIME_STATE_FILE:-}"
+  local expected_generation="${VP_WORKER_REDIS_RUNTIME_GENERATION:-}"
+  if [[ ! "$state_file" = /* || ! -f "$state_file" || -L "$state_file" \
+    || "$(vp_worker_redis_marker_file_mode "$state_file")" != 400 \
+    || ! "$expected_generation" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "worker Redis runtime state is absent or invalid" >&2
+    return 1
+  fi
+
+  local generation=""
+  local acl_identity=""
+  local aof_enabled=""
+  local aof_status=""
+  local maxmemory_policy=""
+  local network=""
+  local readiness_secret=""
+  local janitor_secret=""
+  local repair_secret=""
+  local key
+  local value
+  while IFS='=' read -r key value; do
+    if [[ -z "$key" || -z "$value" || "$value" == *$'\r'* ]]; then
+      echo "worker Redis runtime state is invalid" >&2
+      return 1
+    fi
+    case "$key" in
+      GENERATION)
+        [[ -z "$generation" ]] || return 1
+        generation="$value"
+        ;;
+      ACL_IDENTITY)
+        [[ -z "$acl_identity" ]] || return 1
+        acl_identity="$value"
+        ;;
+      AOF_ENABLED)
+        [[ -z "$aof_enabled" ]] || return 1
+        aof_enabled="$value"
+        ;;
+      AOF_STATUS)
+        [[ -z "$aof_status" ]] || return 1
+        aof_status="$value"
+        ;;
+      MAXMEMORY_POLICY)
+        [[ -z "$maxmemory_policy" ]] || return 1
+        maxmemory_policy="$value"
+        ;;
+      NETWORK)
+        [[ -z "$network" ]] || return 1
+        network="$value"
+        ;;
+      READINESS_REDIS_SECRET)
+        [[ -z "$readiness_secret" ]] || return 1
+        readiness_secret="$value"
+        ;;
+      JANITOR_REDIS_SECRET)
+        [[ -z "$janitor_secret" ]] || return 1
+        janitor_secret="$value"
+        ;;
+      REPAIR_REDIS_SECRET)
+        [[ -z "$repair_secret" ]] || return 1
+        repair_secret="$value"
+        ;;
+      *)
+        echo "worker Redis runtime state contains an unknown field" >&2
+        return 1
+        ;;
+    esac
+  done <"$state_file"
+
+  if [[ "$generation" != "$expected_generation" \
+    || "$acl_identity" != "$VP_WORKER_REDIS_RUNTIME_ACL_IDENTITY" \
+    || "$aof_enabled" != yes \
+    || "$aof_status" != ok \
+    || "$maxmemory_policy" != noeviction \
+    || "$network" != "$VP_PIPELINE_NETWORK" ]]; then
+    echo "worker Redis runtime identity or persistence state is unready" >&2
+    return 1
+  fi
+  if ! vp_worker_redis_marker_reject_126 \
+    "$generation $network $readiness_secret $janitor_secret $repair_secret"; then
+    echo "worker Redis runtime state contains forbidden topology" >&2
+    return 1
+  fi
+
+  local secret
+  for secret in "$readiness_secret" "$janitor_secret" "$repair_secret"; do
+    if [[ ! "$secret" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] \
+      || ! docker secret inspect "$secret" >/dev/null 2>&1; then
+      echo "worker Redis runtime secret is absent" >&2
+      return 1
+    fi
+  done
+  if [[ "$readiness_secret" == "$janitor_secret" \
+    || "$readiness_secret" == "$repair_secret" \
+    || "$janitor_secret" == "$repair_secret" ]]; then
+    echo "worker Redis runtime secrets are not independent" >&2
+    return 1
+  fi
+
+  VP_WORKER_REDIS_MARKER_RUNTIME_GENERATION="$generation"
+  VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET="$readiness_secret"
+  VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET="$janitor_secret"
+  VP_WORKER_REDIS_MARKER_REPAIR_REDIS_SECRET="$repair_secret"
+}
+
+vp_worker_redis_marker_control_root() {
+  local sync_root="${ROOT:-}"
+  if [[ -z "$sync_root" || ! "$sync_root" = /* ]]; then
+    return 1
+  fi
+  printf '%s\n' "$sync_root/state/worker-redis-marker-control"
+}
+
+vp_worker_redis_marker_new_generation() {
+  local image="$1"
+  local digest
+  digest="$(printf '%s' "$image" | shasum -a 256 | cut -c1-12)" || return 1
+  local epoch
+  epoch="$(date +%s)" || return 1
+  printf 'm-%s-%s-%04d\n' "$digest" "$epoch" "$((RANDOM % 10000))"
+}
+
+vp_worker_redis_marker_owner_file() {
+  local path="${VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE:-}"
+  if [[ ! "$path" = /* || ! -f "$path" || -L "$path" \
+    || "$(vp_worker_redis_marker_file_mode "$path")" != 400 ]]; then
+    echo "worker marker owner database URL file is absent or invalid" >&2
+    return 1
+  fi
+  printf '%s\n' "$path"
+}
+
+vp_worker_redis_marker_database_secret_name() {
+  local purpose="$1"
+  local generation="$2"
+  printf 'vp-wrm-%s-db-%s\n' "$purpose" "$generation"
+}
+
+vp_worker_redis_marker_provision_roles() {
+  local image="$1"
+  local generation="$2"
+  local control_root="$3"
+  local owner_file
+  owner_file="$(vp_worker_redis_marker_owner_file)" || return 1
+  local role_state="$control_root/roles"
+  mkdir -p "$role_state" || return 1
+  chmod 0700 "$role_state" || return 1
+
+  docker run --rm \
+    --network "$VP_PIPELINE_NETWORK" \
+    --mount "type=bind,src=$owner_file,dst=/run/secrets/worker-marker-owner-database-url,readonly" \
+    --mount "type=bind,src=$role_state,dst=/control-state" \
+    --env WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE=/run/secrets/worker-marker-owner-database-url \
+    "$image" \
+    python -m app.services.worker_marker_control_role_cli \
+      provision \
+      --generation "$generation" \
+      --state-dir /control-state >/dev/null
+}
+
+vp_worker_redis_marker_revoke_roles() {
+  local image="$1"
+  local generation="$2"
+  local control_root="$3"
+  local owner_file
+  owner_file="$(vp_worker_redis_marker_owner_file)" || return 1
+
+  docker run --rm \
+    --network "$VP_PIPELINE_NETWORK" \
+    --mount "type=bind,src=$owner_file,dst=/run/secrets/worker-marker-owner-database-url,readonly" \
+    --mount "type=bind,src=$control_root/roles,dst=/control-state" \
+    --env WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE=/run/secrets/worker-marker-owner-database-url \
+    "$image" \
+    python -m app.services.worker_marker_control_role_cli \
+      revoke \
+      --generation "$generation" \
+      --state-dir /control-state >/dev/null
+}
+
+vp_worker_redis_marker_create_database_secrets() {
+  local generation="$1"
+  local control_root="$2"
+  local purpose
+  local secret_name
+  local credential_file
+  VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS=""
+  for purpose in readiness janitor repair; do
+    secret_name="$(
+      vp_worker_redis_marker_database_secret_name "$purpose" "$generation"
+    )" || return 1
+    credential_file="$control_root/roles/$generation/worker-marker-$purpose-database-url"
+    if [[ ! -f "$credential_file" || -L "$credential_file" \
+      || "$(vp_worker_redis_marker_file_mode "$credential_file")" != 400 ]] \
+      || docker secret inspect "$secret_name" >/dev/null 2>&1; then
+      echo "worker marker database credential is absent, invalid, or reused" >&2
+      return 1
+    fi
+    if ! docker secret create "$secret_name" - \
+      <"$credential_file" >/dev/null; then
+      echo "worker marker database secret creation failed" >&2
+      return 1
+    fi
+    VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS="${VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS:+$VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS }$secret_name"
+  done
+}
+
+vp_worker_redis_marker_generation_jobs_stopped() {
+  local generation="$1"
+  local name
+  local service_generation
+  local states
+  for name in \
+    vp-worker-redis-marker-readiness-job \
+    vp-worker-redis-marker-janitor-job; do
+    if ! docker service inspect "$name" >/dev/null 2>&1; then
+      continue
+    fi
+    service_generation="$(
+      docker service inspect "$name" \
+        --format '{{index .Spec.Labels "vp.worker-redis-marker.generation"}}'
+    )" || return 1
+    if [[ ! "$service_generation" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
+      echo "worker marker fixed-name job has no valid generation" >&2
+      return 1
+    fi
+    [[ "$service_generation" == "$generation" ]] || continue
+    states="$(
+      docker service ps "$name" --no-trunc \
+        --format '{{.CurrentState}}'
+    )" || return 1
+    if ! printf '%s\n' "$states" | awk '
+      NF {
+        count++
+        if ($1 !~ /^(Complete|Failed|Rejected|Shutdown|Orphaned|Remove)$/) {
+          invalid=1
+        }
+      }
+      END { exit count == 1 && !invalid ? 0 : 1 }
+    '; then
+      echo "worker marker generation still has a running job" >&2
+      return 1
+    fi
+  done
+}
+
+vp_worker_redis_marker_retire_generation() {
+  local image="$1"
+  local generation="$2"
+  local control_root="$3"
+  [[ -n "$image" && -n "$generation" ]] || return 0
+  vp_worker_redis_marker_generation_jobs_stopped "$generation" || return 1
+  vp_worker_redis_marker_revoke_roles \
+    "$image" "$generation" "$control_root" || return 1
+  local purpose
+  local secret_name
+  for purpose in readiness janitor repair; do
+    secret_name="$(
+      vp_worker_redis_marker_database_secret_name "$purpose" "$generation"
+    )" || return 1
+    if docker secret inspect "$secret_name" >/dev/null 2>&1; then
+      docker secret rm "$secret_name" >/dev/null || return 1
+    fi
+  done
+}
+
+vp_worker_redis_marker_read_prior_config() {
+  local path="$1"
+  VP_WORKER_REDIS_MARKER_PRIOR_GENERATION=""
+  VP_WORKER_REDIS_MARKER_PRIOR_IMAGE=""
+  [[ -e "$path" ]] || return 0
+  if [[ ! -f "$path" || -L "$path" \
+    || "$(vp_worker_redis_marker_file_mode "$path")" != 600 ]]; then
+    echo "worker marker active configuration is invalid" >&2
+    return 1
+  fi
+  local key
+  local value
+  local generation=""
+  local image=""
+  local network=""
+  local readiness_database_secret=""
+  local readiness_redis_secret=""
+  local janitor_database_secret=""
+  local janitor_redis_secret=""
+  while IFS='=' read -r key value; do
+    [[ -n "$key" && -n "$value" && "$value" != *$'\r'* ]] || return 1
+    case "$key" in
+      GENERATION)
+        [[ -z "$generation" ]] || return 1
+        generation="$value"
+        ;;
+      IMAGE)
+        [[ -z "$image" ]] || return 1
+        image="$value"
+        ;;
+      NETWORK)
+        [[ -z "$network" ]] || return 1
+        network="$value"
+        ;;
+      READINESS_DATABASE_SECRET)
+        [[ -z "$readiness_database_secret" ]] || return 1
+        readiness_database_secret="$value"
+        ;;
+      READINESS_REDIS_SECRET)
+        [[ -z "$readiness_redis_secret" ]] || return 1
+        readiness_redis_secret="$value"
+        ;;
+      JANITOR_DATABASE_SECRET)
+        [[ -z "$janitor_database_secret" ]] || return 1
+        janitor_database_secret="$value"
+        ;;
+      JANITOR_REDIS_SECRET)
+        [[ -z "$janitor_redis_secret" ]] || return 1
+        janitor_redis_secret="$value"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done <"$path"
+  if [[ ! "$generation" =~ ^[a-z0-9][a-z0-9-]{0,62}$ \
+    || ! "$image" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ \
+    || "$network" != "$VP_PIPELINE_NETWORK" \
+    || "$readiness_database_secret" \
+      != "$(vp_worker_redis_marker_database_secret_name readiness "$generation")" \
+    || "$janitor_database_secret" \
+      != "$(vp_worker_redis_marker_database_secret_name janitor "$generation")" \
+    || ! "$readiness_redis_secret" \
+      =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ \
+    || ! "$janitor_redis_secret" \
+      =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ \
+    || "$readiness_redis_secret" == "$janitor_redis_secret" ]]; then
+    return 1
+  fi
+  if ! vp_worker_redis_marker_reject_126 \
+    "$generation $image $network $readiness_database_secret $readiness_redis_secret $janitor_database_secret $janitor_redis_secret"; then
+    return 1
+  fi
+  VP_WORKER_REDIS_MARKER_PRIOR_GENERATION="$generation"
+  VP_WORKER_REDIS_MARKER_PRIOR_IMAGE="$image"
+}
+
+vp_worker_redis_marker_render_config() {
+  local path="$1"
+  local image="$2"
+  local generation="$3"
+  local readiness_database_secret
+  local janitor_database_secret
+  readiness_database_secret="$(
+    vp_worker_redis_marker_database_secret_name readiness "$generation"
+  )" || return 1
+  janitor_database_secret="$(
+    vp_worker_redis_marker_database_secret_name janitor "$generation"
+  )" || return 1
+
+  {
+    printf 'GENERATION=%s\n' "$generation"
+    printf 'IMAGE=%s\n' "$image"
+    printf 'NETWORK=%s\n' "$VP_PIPELINE_NETWORK"
+    printf 'READINESS_DATABASE_SECRET=%s\n' "$readiness_database_secret"
+    printf 'READINESS_REDIS_SECRET=%s\n' \
+      "$VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET"
+    printf 'JANITOR_DATABASE_SECRET=%s\n' "$janitor_database_secret"
+    printf 'JANITOR_REDIS_SECRET=%s\n' \
+      "$VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET"
+  } >"$path"
+  chmod 0600 "$path"
+}
+
+vp_worker_redis_marker_is_no_crontab_error() {
+  awk 'NR == 1 && /^no crontab for .+$/ { matched=1; next }
+    { matched=0; exit }
+    END { exit matched ? 0 : 1 }' "$1"
+}
+
+vp_worker_redis_marker_read_cron() {
+  local output="$1"
+  local error_output="$2"
+  VP_WORKER_REDIS_MARKER_CRON_ABSENT=false
+  if LC_ALL=C crontab -l >"$output" 2>"$error_output"; then
+    return 0
+  fi
+  if vp_worker_redis_marker_is_no_crontab_error "$error_output"; then
+    : >"$output"
+    VP_WORKER_REDIS_MARKER_CRON_ABSENT=true
+    return 0
+  fi
+  cat "$error_output" >&2
+  return 1
+}
+
+vp_install_worker_redis_marker_control() {
+  local image="$1"
+  local generation="$2"
+  local control_root="$3"
+  local sync_root="${ROOT:-}"
+  local source="$VP_WORKER_REDIS_MARKER_CONTROL_SOURCE"
+  if [[ -z "$sync_root" || ! "$sync_root" = /* \
+    || ! -r "$source" || ! -x "$source" ]] \
+    || ! bash -n "$source"; then
+    echo "worker Redis marker launcher source is invalid" >&2
+    return 1
+  fi
+
+  local bin_dir="$sync_root/bin"
+  local log_dir="$sync_root/logs"
+  local target="$bin_dir/worker-redis-marker-control.sh"
+  local config="$control_root/control.conf"
+  local state_dir="$control_root/status"
+  local lock_dir="$control_root/locks"
+  local cron_begin="# BEGIN VIDEOPROCESS WORKER REDIS MARKER CONTROL"
+  local cron_end="# END VIDEOPROCESS WORKER REDIS MARKER CONTROL"
+  local readiness_cron="* * * * * VP_WORKER_REDIS_MARKER_CONFIG_FILE=$config VP_WORKER_REDIS_MARKER_STATE_DIR=$state_dir VP_WORKER_REDIS_MARKER_LOCK_DIR=$lock_dir $target readiness >> $log_dir/worker-redis-marker-readiness.log 2>&1"
+  local janitor_cron="*/5 * * * * VP_WORKER_REDIS_MARKER_CONFIG_FILE=$config VP_WORKER_REDIS_MARKER_STATE_DIR=$state_dir VP_WORKER_REDIS_MARKER_LOCK_DIR=$lock_dir $target janitor >> $log_dir/worker-redis-marker-janitor.log 2>&1"
+  local transaction
+  transaction="$(mktemp -d "${TMPDIR:-/tmp}/vp-worker-marker-control.XXXXXX")" \
+    || return 1
+  local status=1
+  local prior_cron="$transaction/prior-cron"
+  local next_cron="$transaction/next-cron"
+  local verify_cron="$transaction/verify-cron"
+  local read_error="$transaction/read-error"
+  local prior_target=false
+  local prior_config=false
+  local prior_cron_absent=false
+  local cron_read=false
+  local cron_may_have_changed=false
+
+  if [[ -e "$target" ]]; then
+    prior_target=true
+    if ! cp -p "$target" "$transaction/prior-launcher"; then
+      rm -rf "$transaction"
+      echo "worker Redis marker launcher backup failed" >&2
+      return 1
+    fi
+  fi
+  if [[ -e "$config" ]]; then
+    prior_config=true
+    if ! cp -p "$config" "$transaction/prior-config"; then
+      rm -rf "$transaction"
+      echo "worker Redis marker config backup failed" >&2
+      return 1
+    fi
+  fi
+
+  if vp_worker_redis_marker_read_cron "$prior_cron" "$read_error"; then
+    cron_read=true
+    prior_cron_absent="$VP_WORKER_REDIS_MARKER_CRON_ABSENT"
+  fi
+  if [[ "$cron_read" == true ]] \
+    && awk -v begin="$cron_begin" -v end="$cron_end" \
+      -v target="$target" -v source="$source" '
+      BEGIN { managed=0; invalid=0 }
+      $0 == begin {
+        if (managed) {
+          invalid=1
+          exit
+        }
+        managed=1
+        next
+      }
+      $0 == end {
+        if (!managed) {
+          invalid=1
+          exit
+        }
+        managed=0
+        next
+      }
+      managed { next }
+      $1 !~ /^#/ && ($6 == target || $6 == source) { next }
+      $1 !~ /^#/ && NF >= 9 && ($9 == target || $9 == source) { next }
+      { print }
+      END { if (managed || invalid) exit 1 }
+    ' "$prior_cron" >"$next_cron" \
+    && printf '%s\n%s\n%s\n%s\n' \
+      "$cron_begin" "$readiness_cron" "$janitor_cron" "$cron_end" \
+      >>"$next_cron" \
+    && mkdir -p "$bin_dir" "$log_dir" "$control_root" "$state_dir" "$lock_dir" \
+    && chmod 0700 "$control_root" "$state_dir" "$lock_dir" \
+    && install -m 0755 "$source" "$transaction/launcher" \
+    && vp_worker_redis_marker_render_config \
+      "$transaction/control.conf" "$image" "$generation"; then
+    if mv -f "$transaction/launcher" "$target" \
+      && mv -f "$transaction/control.conf" "$config"; then
+      cron_may_have_changed=true
+    fi
+    if [[ "$cron_may_have_changed" == true ]] \
+      && LC_ALL=C crontab "$next_cron" \
+      && vp_worker_redis_marker_read_cron \
+        "$verify_cron" "$transaction/verify-error" \
+      && cmp -s "$next_cron" "$verify_cron" \
+      && cmp -s "$source" "$target" \
+      && [[ "$(vp_worker_redis_marker_file_mode "$target")" == 755 ]] \
+      && [[ "$(vp_worker_redis_marker_file_mode "$config")" == 600 ]]; then
+      status=0
+    fi
+  fi
+
+  if [[ "$status" -ne 0 ]]; then
+    if [[ "$prior_target" == true ]]; then
+      cp -p "$transaction/prior-launcher" "$target" || true
+    else
+      rm -f "$target" || true
+    fi
+    if [[ "$prior_config" == true ]]; then
+      cp -p "$transaction/prior-config" "$config" || true
+    else
+      rm -f "$config" || true
+    fi
+    if [[ "$cron_may_have_changed" == true ]]; then
+      if [[ "$prior_cron_absent" == true ]]; then
+        LC_ALL=C crontab -r >/dev/null 2>&1 || true
+      else
+        LC_ALL=C crontab "$prior_cron" >/dev/null 2>&1 || true
+      fi
+    fi
+    echo "worker Redis marker launcher install failed" >&2
+  fi
+  rm -rf "$transaction"
+  return "$status"
+}
+
+vp_run_worker_redis_marker_readiness() {
+  local control_root="$1"
+  local launcher="${ROOT}/bin/worker-redis-marker-control.sh"
+  local config="$control_root/control.conf"
+  local state_dir="$control_root/status"
+  local lock_dir="$control_root/locks"
+  VP_WORKER_REDIS_MARKER_CONFIG_FILE="$config" \
+  VP_WORKER_REDIS_MARKER_STATE_DIR="$state_dir" \
+  VP_WORKER_REDIS_MARKER_LOCK_DIR="$lock_dir" \
+    "$launcher" readiness >/dev/null \
+    || return 1
+  VP_WORKER_REDIS_MARKER_CONFIG_FILE="$config" \
+  VP_WORKER_REDIS_MARKER_STATE_DIR="$state_dir" \
+  VP_WORKER_REDIS_MARKER_LOCK_DIR="$lock_dir" \
+    "$launcher" status >/dev/null
+}
+
+vp_worker_redis_marker_provision_generation() {
+  local image="$1"
+  local generation="$2"
+  local control_root="$3"
+  vp_worker_redis_marker_provision_roles \
+    "$image" "$generation" "$control_root" || return 1
+  if ! vp_worker_redis_marker_create_database_secrets \
+    "$generation" "$control_root"; then
+    local secret
+    for secret in ${VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS:-}; do
+      docker secret rm "$secret" >/dev/null 2>&1 || true
+    done
+    vp_worker_redis_marker_revoke_roles \
+      "$image" "$generation" "$control_root" || true
+    return 1
+  fi
+}
+
+vp_prepare_worker_redis_marker_controls() {
+  local image="$1"
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    log "worker Redis marker control preparation skipped"
+    return 0
+  fi
+  vp_validate_topology || return 1
+  vp_require_worker_redis_runtime_state || return 1
+  vp_worker_redis_marker_owner_file >/dev/null || return 1
+
+  local control_root
+  control_root="$(vp_worker_redis_marker_control_root)" || return 1
+  mkdir -p "$control_root" || return 1
+  chmod 0700 "$control_root" || return 1
+  vp_worker_redis_marker_read_prior_config \
+    "$control_root/control.conf" || return 1
+
+  local generation
+  generation="$(vp_worker_redis_marker_new_generation "$image")" || return 1
+  VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION="$generation"
+  VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE="$image"
+  VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=true
+
+  if ! vp_worker_redis_marker_provision_generation \
+    "$image" "$generation" "$control_root" \
+    || ! vp_install_worker_redis_marker_control \
+      "$image" "$generation" "$control_root" \
+    || ! vp_run_worker_redis_marker_readiness "$control_root"; then
+    echo "worker Redis marker candidate readiness failed" >&2
+    if ! vp_restore_worker_redis_marker_controls; then
+      echo "worker Redis marker prior generation could not be proven ready" >&2
+    fi
+    return 1
+  fi
+}
+
+vp_restore_worker_redis_marker_controls() {
+  if [[ "$VP_WORKER_REDIS_MARKER_CONTROL_PREPARED" != true ]]; then
+    return 0
+  fi
+  if [[ -z "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \
+    || -z "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" ]]; then
+    echo "worker Redis marker rollback has no prior generation" >&2
+    return 1
+  fi
+  local control_root
+  control_root="$(vp_worker_redis_marker_control_root)" || return 1
+  local rollback_generation
+  rollback_generation="$(
+    vp_worker_redis_marker_new_generation \
+      "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE"
+  )" || return 1
+  if ! vp_worker_redis_marker_provision_generation \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" \
+    "$rollback_generation" \
+    "$control_root" \
+    || ! vp_install_worker_redis_marker_control \
+      "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" \
+      "$rollback_generation" \
+      "$control_root" \
+    || ! vp_run_worker_redis_marker_readiness "$control_root"; then
+    echo "worker Redis marker rollback readiness failed" >&2
+    return 1
+  fi
+  vp_worker_redis_marker_retire_generation \
+    "$VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE" \
+    "$VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION" \
+    "$control_root" || return 1
+  vp_worker_redis_marker_retire_generation \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \
+    "$control_root" || return 1
+  VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
+  VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION="$rollback_generation"
+  VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE="$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE"
+}
+
+vp_commit_worker_redis_marker_controls() {
+  if [[ "$VP_WORKER_REDIS_MARKER_CONTROL_PREPARED" != true ]]; then
+    return 0
+  fi
+  local control_root
+  control_root="$(vp_worker_redis_marker_control_root)" || return 1
+  vp_worker_redis_marker_retire_generation \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" \
+    "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \
+    "$control_root" || return 1
+  VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
+}
+
 vp_apply_app_services() {
   local api="$1"
   local frontend="$2"
@@ -1624,6 +2300,7 @@ vp_apply_app_services() {
   http_health vp-api "http://$VP_RUNTIME_HOST:18080/health" || return 1
   vp_update_app_runtime_service vp-frontend-swarm "$frontend" stop-first || return 1
   http_health vp-frontend "http://$VP_RUNTIME_HOST:3001/" || return 1
+  vp_prepare_worker_redis_marker_controls "$python_worker" || return 1
   vp_record_app_service_attempt "$VP_PYTHON_WORKER_SERVICE"
   vp_deploy_python_worker "$python_worker" || return 1
   vp_record_app_service_attempt "$VP_VISION_WORKER_SERVICE"
@@ -1648,6 +2325,7 @@ vp_apply_app_services() {
     swarm_service_running "$service" || return 1
   done
   vp_install_soak_watch || return 1
+  vp_commit_worker_redis_marker_controls || return 1
 }
 
 deploy_vp_app_services() {
@@ -1674,6 +2352,9 @@ deploy_vp_app_services() {
   local snapshots
   snapshots="$(vp_capture_app_snapshots)" || return 1
   if ! vp_apply_app_services "$@"; then
+    if ! vp_restore_worker_redis_marker_controls; then
+      echo "worker Redis marker control restore did not converge" >&2
+    fi
     log "VideoProcess service apply failed; restoring prior images without legacy placement"
     if ! vp_restore_app_snapshots "$snapshots" "$VP_APP_ATTEMPTED_SERVICES"; then
       echo "VideoProcess image restore did not fully converge" >&2

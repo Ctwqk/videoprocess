@@ -2410,6 +2410,16 @@ async def test_main_restores_process_globals_for_repeated_in_process_runs(
         "_start_worker_registration",
         start_registration,
     )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lambda: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_identity",
+        lambda _redis: asyncio.sleep(0),
+    )
     monkeypatch.setattr(worker_main, "_redis", Redis)
     monkeypatch.setattr(worker_main, "_consume_registered_worker", consume)
     monkeypatch.setattr(
@@ -2425,6 +2435,227 @@ async def test_main_restores_process_globals_for_repeated_in_process_runs(
     assert worker_main.engine_db is None
     assert worker_main.worker_session is None
     assert disposed == ["engine"]
+
+
+@pytest.mark.asyncio
+async def test_registered_worker_requires_continuity_and_acl_identity_before_group(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    close_reasons: list[str] = []
+
+    class StopStartup(RuntimeError):
+        pass
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@150-gpu:1:registered"
+        redis_stream = "vp:tasks:ffmpeg"
+        redis_group = "ffmpeg-workers"
+        worker_host = "150-gpu"
+        lease = SimpleNamespace()
+
+        async def close(self, *, reason: str = "shutdown"):
+            close_reasons.append(reason)
+
+    class Redis:
+        connection_pool = SimpleNamespace(
+            connection_kwargs={"username": "vp-worker-ffmpeg"}
+        )
+
+        async def acl_whoami(self):
+            calls.append("redis_whoami")
+            return "vp-worker-ffmpeg"
+
+        async def xgroup_create(self, *_args, **_kwargs):
+            calls.append("redis_group_create")
+            raise StopStartup
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env: "postgresql+asyncpg://worker@db/vp",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: calls.append("database_open"),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env: "token",
+    )
+
+    async def register(*_args):
+        calls.append("registration_complete")
+        return Registration()
+
+    async def require_continuity():
+        calls.append("continuity_ready")
+
+    def construct_redis():
+        calls.append("redis_constructed")
+        return Redis()
+
+    async def run_consumer(_registration, consumer):
+        await consumer
+
+    async def no_reclaim(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(worker_main, "_start_worker_registration", register)
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        require_continuity,
+        raising=False,
+    )
+    monkeypatch.setattr(worker_main, "_redis", construct_redis)
+    monkeypatch.setattr(
+        worker_main,
+        "_run_until_registration_loss",
+        run_consumer,
+    )
+    monkeypatch.setattr(worker_main, "_reclaim_pending", no_reclaim)
+
+    with pytest.raises(StopStartup):
+        await worker_main.main()
+
+    assert calls == [
+        "database_open",
+        "registration_complete",
+        "continuity_ready",
+        "redis_constructed",
+        "redis_whoami",
+        "redis_group_create",
+    ]
+    assert close_reasons == ["shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_worker_continuity_gate_calls_database_function_with_90_seconds(
+    monkeypatch,
+) -> None:
+    statements: list[tuple[str, dict[str, int]]] = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def execute(self, statement, parameters):
+            statements.append((str(statement), dict(parameters)))
+
+    monkeypatch.setattr(
+        worker_main,
+        "get_worker_session",
+        lambda: lambda: Session(),
+    )
+
+    await worker_main._require_worker_redis_continuity()
+
+    assert len(statements) == 1
+    assert "public.vp_require_worker_redis_continuity" in statements[0][0]
+    assert statements[0][1] == {"max_age_seconds": 90}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "database_reason",
+    [
+        "worker_redis_continuity_missing",
+        "worker_redis_continuity_stale",
+        "worker_redis_continuity_error",
+        "worker_redis_continuity_running",
+    ],
+)
+async def test_unready_continuity_revokes_registration_before_any_redis(
+    monkeypatch,
+    caplog,
+    database_reason: str,
+) -> None:
+    redis_constructions = 0
+    close_reasons: list[str] = []
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@150-gpu:1:registered"
+
+        def __init__(self):
+            self.closed = False
+
+        async def close(self, *, reason: str = "shutdown"):
+            if self.closed:
+                return
+            self.closed = True
+            close_reasons.append(reason)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def execute(self, _statement, _parameters):
+            raise RuntimeError(f"{database_reason}: sensitive database detail")
+
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env: "postgresql+asyncpg://worker@db/vp",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env: "token",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        lambda *_args: asyncio.sleep(0, result=Registration()),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "get_worker_session",
+        lambda: lambda: Session(),
+    )
+
+    def construct_redis():
+        nonlocal redis_constructions
+        redis_constructions += 1
+        raise AssertionError("unready continuity constructed Redis")
+
+    monkeypatch.setattr(worker_main, "_redis", construct_redis)
+
+    with pytest.raises(SystemExit) as exc:
+        await worker_main.main()
+
+    assert exc.value.code == 2
+    assert redis_constructions == 0
+    assert close_reasons == ["worker_redis_continuity_unready"]
+    assert caplog.text.count("worker_redis_continuity_unready") == 1
+    assert database_reason not in caplog.text
+    assert "sensitive database detail" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -2475,6 +2706,12 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
         register,
         raising=False,
     )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lambda: asyncio.sleep(0, result=events.append("continuity")),
+        raising=False,
+    )
 
     def stop_at_redis() -> None:
         events.append("redis")
@@ -2491,6 +2728,7 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
         "database",
         "token-secret",
         "registration",
+        "continuity",
         "redis",
         "revoke",
     ]

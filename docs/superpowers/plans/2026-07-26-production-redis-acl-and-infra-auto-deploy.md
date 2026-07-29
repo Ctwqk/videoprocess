@@ -207,6 +207,115 @@ bash tests/test_channelops_soak_watch.sh
 git diff --check
 ```
 
+### Task 5A: Executable Worker Marker Continuity Controls
+
+**Repository:** `videoprocess`, consuming constructure-runtime state
+
+Migration `034_worker_registrations` owns
+`vp_list_worker_redis_marker_expectations`,
+`vp_begin_worker_redis_continuity_check`,
+`vp_finish_worker_redis_continuity_check`,
+`vp_record_worker_redis_marker_observation`,
+`vp_claim_worker_redis_marker_cleanup`,
+`vp_finish_worker_redis_marker_cleanup`,
+`vp_load_worker_redis_marker_repair`,
+`vp_promote_observed_worker_event_emission`, and
+`vp_require_worker_redis_continuity`. Their stable NOLOGIN principals are
+`vp_marker_readiness_runtime`, `vp_marker_janitor_runtime`, and
+`vp_marker_repair_runtime`.
+
+The exact executable commands are:
+
+```text
+python -m app.services.worker_marker_control_role_cli provision --generation <generation> --state-dir /control-state
+python -m app.services.worker_marker_control_role_cli revoke --generation <generation> --state-dir /control-state
+python -m app.channel_agent.worker_redis_marker_readiness_cli check
+python -m app.channel_agent.worker_redis_marker_janitor_cli run
+python -m app.services.worker_redis_marker_repair_cli audit
+python -m app.services.worker_redis_marker_repair_cli restore-marker --source-id <uuid> --apply
+python -m app.services.worker_redis_marker_repair_cli promote-prepared --emission-id <uuid> --apply
+```
+
+The independent runtime ACL rollout creates these exact users:
+
+- `vp-marker-readiness`: `PING`, `ACL WHOAMI`, read-only `INFO server`,
+  `INFO persistence`, `CONFIG GET maxmemory-policy`, `GET`, and `XRANGE` on
+  `vp:worker-event-emission:*`, `vp:worker-task-dispatch:*`, `vp:events`, and
+  the reviewed `vp:tasks:<worker_type>` streams;
+- `vp-marker-janitor`: `EVAL`, `GET`, and `DEL` only on
+  `vp:worker-event-emission:*` and `vp:worker-task-dispatch:*`;
+- `vp-marker-repair`: `EVAL`, `GET`, `SET`, and `XRANGE` only on those marker
+  prefixes and reviewed streams.
+
+All three deny `XADD`, `XACK`, expiration, trimming, `FLUSH*`, `SCRIPT LOAD`,
+`+@all`, `~*`, task consumption, and cross-namespace keys.
+Constructure-runtime owns their credential files and Swarm secrets plus Redis
+AOF/noeviction configuration. VideoProcess accepts only a mode-`0400`
+runtime-state file with:
+
+```text
+GENERATION=<exact 40-character constructure-runtime commit>
+ACL_IDENTITY=vp-marker-acl-v1
+AOF_ENABLED=yes
+AOF_STATUS=ok
+MAXMEMORY_POLICY=noeviction
+NETWORK=vp-pipeline-net
+READINESS_REDIS_SECRET=<existing readiness secret>
+JANITOR_REDIS_SECRET=<existing janitor secret>
+REPAIR_REDIS_SECRET=<existing repair secret>
+```
+
+`VP_WORKER_REDIS_RUNTIME_GENERATION` must equal `GENERATION`, and all three
+secret names must be distinct and inspectable. Missing identity, generation,
+AOF health, `noeviction`, secret, or fresh database continuity fails before
+registered Python worker update. VideoProcess does not synthesize any of this
+runtime state.
+
+`deploy/swarm/worker-redis-marker-control.sh` exposes only `readiness`,
+`janitor`, and `status`. Its fixed one-replica, restart-`none` jobs are
+`vp-worker-redis-marker-readiness-job` and
+`vp-worker-redis-marker-janitor-job`, both in `replicated-job` mode, attached to `vp-pipeline-net` and placed
+at `node.hostname==ccttww-lap`. The marked cron entries are:
+
+```text
+* * * * * .../worker-redis-marker-control.sh readiness
+*/5 * * * * .../worker-redis-marker-control.sh janitor
+```
+
+Repair is never scheduled. Each scheduled job mounts only its own database and
+Redis secrets at mode `0400`. A versioned repair database secret is created
+for explicit operator use but is mounted into neither job. Database URL
+secrets are created through stdin; credentials never enter argv, environment,
+logs, status, or cron.
+
+Deployment runs one readiness job and requires a fresh generation-matching
+`status` before any registered Python worker update. Registered Python startup
+then calls `public.vp_require_worker_redis_continuity(90)` after registration
+and before Redis construction, followed by `ACL WHOAMI` before `XGROUP`.
+Missing/stale/error/overlap all release registration and emit only
+`worker_redis_continuity_unready`.
+
+Rollback provisions fresh prior-image database roles and passwords, creates
+fresh secrets, and proves readiness before revoking failed or superseded
+generations. It does not alter independent VP, PDS, feature, schedule, or
+channel cron. Host 126 IPs, aliases, and placement remain hard failures.
+
+The repair matrix is deliberately non-generative:
+
+| Evidence | Permitted action |
+| --- | --- |
+| exact active marker and exact stream/hash | record ready |
+| exact cleanup authorization and value | compare-and-`DEL` |
+| cleanup marker absent | record `absent` |
+| exact stored message ID plus absent marker plus exact `XRANGE` hash | operator `restore-marker --apply` may `SET NX` |
+| prepared event plus exact marker/stream/hash | operator `promote-prepared --apply` may update PostgreSQL |
+| conflict, missing stream entry, hash mismatch, unknown identity, or persistence/eviction failure | no mutation; hold |
+
+No row authorizes `XADD`; missing stream entries are never recreated.
+Verification is executable in `backend/tests/worker/test_worker_startup.py`,
+`tests/test_worker_redis_marker_control.sh`, and
+`tests/test_vp_deploy_sync_extension.sh`.
+
 ### Task 6: Deploy And Verify Phase A
 
 **Repositories:** all three
@@ -238,4 +347,3 @@ git diff --check
 - Record exact repository/deployed commits and sanitized evidence.
 - Keep schedule and channels closed after success. Operation resume and any
   canary remain separate explicit actions.
-

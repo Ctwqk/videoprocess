@@ -25,4 +25,6 @@ RUN pip install ".[worker]" \
 COPY app /app/app
 COPY worker /app/worker
 
+RUN python -c "import importlib; [importlib.import_module(name) for name in ('app.channel_agent.worker_redis_marker_readiness_cli','app.channel_agent.worker_redis_marker_janitor_cli','app.services.worker_redis_marker_repair_cli','app.services.worker_marker_control_role_cli','app.services.worker_redis_marker_control')]"
+
 CMD ["python", "-m", "worker.main"]

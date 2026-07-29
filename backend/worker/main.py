@@ -18,6 +18,7 @@ from typing import cast
 import httpx
 import redis.asyncio as aioredis
 from redis.typing import EncodableT
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -104,6 +105,7 @@ REMOTE_ARTIFACT_CLEANUP_TIMEOUT_SECONDS = 15.0
 EVENT_EMISSION_SEND_ATTEMPTS = 3
 EVENT_EMISSION_RECONCILE_INTERVAL_SECONDS = 5.0
 EVENT_EMISSION_RECONCILE_LIMIT = 50
+WORKER_REDIS_CONTINUITY_MAX_AGE_SECONDS = 90
 
 engine_db: AsyncEngine | None = None
 worker_session: async_sessionmaker[AsyncSession] | None = None
@@ -204,6 +206,50 @@ async def _start_worker_registration(
     )
     await lifecycle.start()
     return lifecycle
+
+
+async def _require_worker_redis_continuity() -> None:
+    try:
+        async with get_worker_session()() as db:
+            await db.execute(
+                text(
+                    "SELECT public.vp_require_worker_redis_continuity("
+                    ":max_age_seconds)"
+                ),
+                {
+                    "max_age_seconds": (
+                        WORKER_REDIS_CONTINUITY_MAX_AGE_SECONDS
+                    )
+                },
+            )
+    except Exception:
+        raise WorkerRegistrationError(
+            "worker_redis_continuity_unready"
+        ) from None
+
+
+async def _require_worker_redis_identity(redis: aioredis.Redis) -> None:
+    connection_pool = getattr(redis, "connection_pool", None)
+    connection_kwargs = getattr(
+        connection_pool,
+        "connection_kwargs",
+        {},
+    )
+    expected_user = connection_kwargs.get("username")
+    if (
+        not isinstance(expected_user, str)
+        or not expected_user
+        or expected_user == "default"
+    ):
+        raise WorkerRegistrationError("worker_redis_identity_unready")
+    try:
+        observed_user = await redis.acl_whoami()
+    except Exception:
+        raise WorkerRegistrationError(
+            "worker_redis_identity_unready"
+        ) from None
+    if observed_user != expected_user:
+        raise WorkerRegistrationError("worker_redis_identity_unready")
 
 
 @dataclass(frozen=True)
@@ -1901,6 +1947,13 @@ async def main() -> None:
                 database_url,
                 admission_token,
             )
+            try:
+                await _require_worker_redis_continuity()
+            except WorkerRegistrationError:
+                await registration.close(
+                    reason="worker_redis_continuity_unready"
+                )
+                raise
         except (
             WorkerAdmissionError,
             WorkerSecretError,
@@ -1912,6 +1965,11 @@ async def main() -> None:
 
         WORKER_ID = registration.redis_consumer_id
         redis = _redis()
+        try:
+            await _require_worker_redis_identity(redis)
+        except WorkerRegistrationError as exc:
+            logger.critical("Worker admission denied: %s", exc)
+            raise SystemExit(2) from exc
         await _run_until_registration_loss(
             registration,
             _consume_registered_worker(redis, registration),

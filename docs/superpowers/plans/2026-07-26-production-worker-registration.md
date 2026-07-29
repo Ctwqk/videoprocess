@@ -33,6 +33,104 @@
 - Per-stream Redis ACL users are a separate required T05 hardening increment;
   this plan must not be used to claim that all of T05 is complete.
 
+## Executable Redis Marker Continuity Gate
+
+The worker event-marker lifecycle increment supplies a mandatory gate for
+registered Python workers. Migration `034_worker_registrations` owns these
+fixed-search-path, `SECURITY DEFINER` functions:
+
+- `vp_list_worker_redis_marker_expectations(text, integer)`;
+- `vp_begin_worker_redis_continuity_check(uuid, integer)`;
+- `vp_finish_worker_redis_continuity_check(uuid, text, text, text, bigint,
+  bigint)`;
+- `vp_record_worker_redis_marker_observation(uuid, text, uuid, text, text)`;
+- `vp_claim_worker_redis_marker_cleanup(uuid, integer, integer)`;
+- `vp_finish_worker_redis_marker_cleanup(uuid, uuid, text, text)`;
+- `vp_load_worker_redis_marker_repair(text, uuid)`;
+- `vp_promote_observed_worker_event_emission(uuid, text, text)`; and
+- `vp_require_worker_redis_continuity(integer)`.
+
+The stable NOLOGIN roles are `vp_marker_readiness_runtime`,
+`vp_marker_janitor_runtime`, and `vp_marker_repair_runtime`.
+`python -m app.services.worker_marker_control_role_cli provision
+--generation <generation> --state-dir /control-state` creates independent
+generation LOGIN roles and mode-`0400` database URL files; `revoke` removes
+that generation after its jobs stop.
+
+Registered Python startup is exactly:
+
+```text
+load bounded database/admission secret files
+open PostgreSQL
+register and start heartbeat
+SELECT public.vp_require_worker_redis_continuity(90)
+construct Redis
+ACL WHOAMI and reject missing/default/mismatched identity
+XGROUP CREATE and start the event reconciler/consumer
+```
+
+Missing, stale, `error`, and overlapping/running Task 2 continuity states all
+become the single logged reason `worker_redis_continuity_unready`; startup
+releases the registration and performs zero Redis construction. The legacy
+unregistered development path is unchanged. Go worker registration and its
+continuity call remain original worker-registration Task 3 and are not
+partially implemented here; `backend/Dockerfile.ffmpeg-worker-go` therefore
+has no Python control runtime.
+
+Host 150 executes only:
+
+```text
+deploy/swarm/worker-redis-marker-control.sh readiness
+deploy/swarm/worker-redis-marker-control.sh janitor
+deploy/swarm/worker-redis-marker-control.sh status
+```
+
+Readiness and janitor use fixed one-replica `replicated-job` Swarm jobs
+`vp-worker-redis-marker-readiness-job` and
+`vp-worker-redis-marker-janitor-job`, restart condition `none`, network
+`vp-pipeline-net`, and placement `node.hostname==ccttww-lap`. Their marked
+cron entries are `* * * * * ... readiness` and
+`*/5 * * * * ... janitor`. Repair is never scheduled. Each job mounts only
+its own generation database secret and constructure-runtime Redis secret at
+mode `0400`; the independently versioned repair database secret is retained
+only for an explicit operator command.
+
+VideoProcess accepts a mode-`0400` constructure-runtime state file only when
+its `GENERATION` equals the exact 40-character
+`VP_WORKER_REDIS_RUNTIME_GENERATION`, `ACL_IDENTITY=vp-marker-acl-v1`,
+`AOF_ENABLED=yes`, `AOF_STATUS=ok`,
+`MAXMEMORY_POLICY=noeviction`, `NETWORK=vp-pipeline-net`, and three distinct
+readiness/janitor/repair Redis Swarm secrets all exist. The independent
+constructure-runtime plan owns those Redis users, credentials, AOF, and
+eviction settings. VideoProcess creates no fallback Redis ACL state and fails
+before every registered Python worker update when the attestation, secrets,
+fresh database status, or ACL identity is absent.
+
+Rollback provisions fresh database roles and secrets against the prior
+reviewed Python image, installs that fresh generation, and proves one
+readiness job plus `status` before it revokes the failed and superseded roles
+or secrets. Failed-generation passwords are never reused. This transaction
+does not alter the independent VP, PDS, feature, schedule, or channel cron
+entries.
+
+The only automated mutation matrix is conservative:
+
+| Evidence | Automated action |
+| --- | --- |
+| exact active marker, exact stream entry, matching payload hash | record readiness observation |
+| cleanup authorization and exact marker value | janitor compare-and-`DEL` |
+| cleanup marker absent | record `absent` |
+| marker mismatch, missing stream entry, payload mismatch, wrong identity, AOF/loading/eviction failure | hold unready; mutate nothing |
+| prepared event without an exact observed stream entry | hold for operator; mutate nothing |
+| absent marker with exact stored message ID and exact `XRANGE` hash | operator may run `restore-marker --source-id <uuid> --apply`, which uses `SET NX` only |
+| prepared event with exact marker/stream/hash proof | operator may run `promote-prepared --emission-id <uuid> --apply`, which changes PostgreSQL state only |
+
+Neither launcher, readiness, janitor, nor repair performs `XADD`; missing
+stream entries are never synthesized. The executable contracts are covered by
+`backend/tests/worker/test_worker_startup.py`,
+`tests/test_worker_redis_marker_control.sh`, and
+`tests/test_vp_deploy_sync_extension.sh`.
+
 ---
 
 ### Task 1: Add Registration Schema And Python Lease Service
