@@ -86,7 +86,27 @@ values fail before database admission; external/owned pool close and
 Task 3: complete — implementation 0fe94a0 plus fix rounds 1-5 passed an
 independent final re-review with zero open Critical or Important findings.
 The three deferred Minors above remain non-load-bearing follow-up items.
-Task 4: pending
+Task 4A: PostgreSQL admission-role implementation at 87dd5bd; independent
+review rejected (4 Important, 1 Minor).
+Task 4A: fix round 1/5 at 95b04e9; re-review rejected (3 Important).
+Task 4A: fix round 2/5 at 66ce85c; re-review rejected (3 Important).
+Task 4A: fix round 3/5 at de3aaeb; re-review rejected (3 Important).
+Task 4A: fix round 4/5 at b0c3f1e; fresh re-review rejected (4 Important).
+Task 4A: fix round 5/5 at 904f746; final fresh re-review rejected (2
+Important — PostgreSQL 16 ADMIN OPTION/delegated stable-role grants are not
+included in isolation and can keep an active grant after routine revoke
+rolls back; complete credentials under an invalid runtime/control state root
+fail without quarantining the still-login-capable principals).
+Task 4A: BLOCKED — the five-round breaker has tripped with two load-bearing
+role-isolation findings. Do not dispatch a sixth fix or build production
+deployment on this role boundary without explicit human direction.
+Task 4B/4C recovery: the terminated broad Task 4 agent returned unstaged
+worker-secret/startup, Docker, staging-janitor, and deploy-transaction changes.
+They remain preserved and uncommitted; focused checks exposed an old
+mode-0600 versus mode-0400 deployment-CLI contract and a marker freshness
+fixture that does not isolate the new admission/janitor prerequisites.
+Task 4: blocked on Task 4A; no production deployment is authorized by these
+partial changes.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
