@@ -61,6 +61,11 @@ pool/callback/file shutdown abandons goroutines and resources; commits
 0fe94a0..791e552)
 Task 3: minor (deferred): exported `MarkLost` is zero-value safe but not
 nil-receiver safe.
+Task 3: fix round 2/5 (3 addressed, 4 open — a spare in-flight XREADGROUP can
+accept a new PEL delivery after owned loss; later-page failure can discard an
+already-XCLAIMed target; parser-accepted invalid Redis ranges pass the
+pre-database gate; `CloseContext` has a zero-count-to-Close acquisition race;
+commits 791e552..a0fa9ea)
 Task 4: pending
 Task 5: pending
 Task 6: pending
