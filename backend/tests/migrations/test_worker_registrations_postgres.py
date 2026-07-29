@@ -2206,6 +2206,11 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
         connection = await asyncpg.connect(_asyncpg_url(target_url))
         try:
             assert not await connection.fetchval(
+                "SELECT has_database_privilege("
+                "$1, current_database(), 'TEMPORARY')",
+                runtime_role,
+            )
+            assert not await connection.fetchval(
                 "SELECT to_regclass('public.worker_registrations') IS NOT NULL"
             )
             assert not await connection.fetchval(

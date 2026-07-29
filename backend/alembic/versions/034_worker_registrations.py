@@ -179,6 +179,7 @@ ORCHESTRATOR_CONTROL_ROLE = "vp_orchestrator_control_runtime"
 
 
 def upgrade() -> None:
+    _revoke_public_database_temporary()
     op.create_table(
         "worker_admission_grants",
         sa.Column(
@@ -602,6 +603,21 @@ def upgrade() -> None:
         STAGING_JANITOR_READINESS_SIGNATURE,
     ):
         op.execute(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC")
+
+
+def _revoke_public_database_temporary() -> None:
+    op.execute(
+        """
+DO $database_acl$
+BEGIN
+    EXECUTE pg_catalog.format(
+        'REVOKE TEMPORARY ON DATABASE %I FROM PUBLIC',
+        pg_catalog.current_database()
+    );
+END
+$database_acl$
+"""
+    )
 
 
 def _create_worker_redis_marker_tables() -> None:
