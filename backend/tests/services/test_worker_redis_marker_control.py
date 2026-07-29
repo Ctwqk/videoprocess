@@ -135,6 +135,43 @@ class _Database:
         raise AssertionError(query)
 
 
+class _StatefulDatabase(_Database):
+    def __init__(
+        self,
+        *,
+        pages: list[list[dict[str, object]]] | None = None,
+        load_failures: int = 0,
+    ) -> None:
+        super().__init__(pages=pages)
+        self.load_failures = load_failures
+        self.continuity_state = "missing"
+
+    async def scalar(self, statement: object, params: dict[str, object]):
+        query = str(statement)
+        if "vp_begin_worker_redis_continuity_check" in query:
+            self.calls.append((query, params))
+            if self.continuity_state == "running":
+                return "overlap"
+            self.continuity_state = "running"
+            return "begun"
+        if "vp_finish_worker_redis_continuity_check" in query:
+            self.calls.append((query, params))
+            self.continuity_state = str(params["result"])
+            return True
+        return await super().scalar(statement, params)
+
+    async def execute(self, statement: object, params: dict[str, object]):
+        query = str(statement)
+        if (
+            "vp_list_worker_redis_marker_expectations" in query
+            and self.load_failures
+        ):
+            self.calls.append((query, params))
+            self.load_failures -= 1
+            raise RuntimeError("database detail must not escape")
+        return await super().execute(statement, params)
+
+
 class _Redis:
     def __init__(self, *, condition: str = "ok") -> None:
         self.condition = condition
@@ -282,23 +319,113 @@ async def test_continuity_records_the_exact_marker_value_it_hashed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_continuity_rejects_non_increasing_expectation_page() -> None:
-    expectation = _expectation()
-    database = _Database(
+@pytest.mark.parametrize(
+    "next_marker_key",
+    [
+        "vp:worker-event-emission:00000000-0000-0000-0000-000000000002",
+        "vp:worker-event-emission:00000000-0000-0000-0000-000000000001",
+    ],
+)
+async def test_continuity_finalizes_repeated_or_non_increasing_pages_immediately(
+    next_marker_key: str,
+) -> None:
+    expectation = _expectation(
+        marker_key=(
+            "vp:worker-event-emission:"
+            "00000000-0000-0000-0000-000000000002"
+        )
+    )
+    next_expectation = _expectation(marker_key=next_marker_key)
+    database = _StatefulDatabase(
         pages=[
             [_expectation_row(expectation)],
-            [_expectation_row(expectation)],
+            [_expectation_row(next_expectation)],
         ]
     )
-    result = await control.check_worker_redis_continuity(
+    first_result = await control.check_worker_redis_continuity(
+        database,
+        _Redis(),
+        "vp-marker-readiness",
+        page_size=1,
+    )
+    second_result = await control.check_worker_redis_continuity(
         database,
         _Redis(),
         "vp-marker-readiness",
         page_size=1,
     )
 
+    assert first_result.state == "error"
+    assert first_result.reason_code == "expectation_page_incomplete"
+    assert database.continuity_state == "ready"
+    assert second_result.state == "ready"
+    finish_params = [
+        params
+        for query, params in database.calls
+        if "vp_finish_worker_redis_continuity_check" in query
+    ]
+    assert finish_params[0]["result"] == "error"
+    assert finish_params[0]["reason_code"] == "expectation_page_incomplete"
+    assert finish_params[0]["expected_count"] == 0
+    assert finish_params[0]["checked_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_continuity_finalizes_expectation_load_failure_immediately() -> None:
+    database = _StatefulDatabase(load_failures=1)
+
+    first_result = await control.check_worker_redis_continuity(
+        database,
+        _Redis(),
+        "vp-marker-readiness",
+    )
+    second_result = await control.check_worker_redis_continuity(
+        database,
+        _Redis(),
+        "vp-marker-readiness",
+    )
+
+    assert first_result.state == "error"
+    assert first_result.reason_code == "expectation_page_incomplete"
+    assert database.continuity_state == "ready"
+    assert second_result.state == "ready"
+    assert "database detail must not escape" not in repr(first_result)
+
+
+@pytest.mark.asyncio
+async def test_continuity_classifies_observation_database_failure() -> None:
+    expectation = _expectation()
+
+    class ObservationFailureDatabase(_Database):
+        async def scalar(
+            self,
+            statement: object,
+            params: dict[str, object],
+        ):
+            query = str(statement)
+            if "vp_record_worker_redis_marker_observation" in query:
+                self.calls.append((query, params))
+                raise RuntimeError("database detail must not escape")
+            return await super().scalar(statement, params)
+
+    database = ObservationFailureDatabase(
+        pages=[[_expectation_row(expectation)], []]
+    )
+    result = await control.check_worker_redis_continuity(
+        database,
+        _Redis(),
+        "vp-marker-readiness",
+    )
+
     assert result.state == "error"
-    assert result.reason_code == "expectation_page_incomplete"
+    assert result.reason_code == "marker_observation_database_error"
+    assert "database detail must not escape" not in repr(result)
+    finish_params = next(
+        params
+        for query, params in database.calls
+        if "vp_finish_worker_redis_continuity_check" in query
+    )
+    assert finish_params["reason_code"] == "marker_observation_database_error"
 
 
 @pytest.mark.asyncio

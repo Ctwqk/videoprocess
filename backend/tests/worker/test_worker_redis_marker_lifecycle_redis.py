@@ -6,15 +6,28 @@ import json
 import os
 import subprocess
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 
 import pytest
 import redis.asyncio as aioredis
 from redis.exceptions import NoPermissionError
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.services import worker_redis_marker_control as control
+from tests.migrations.test_worker_redis_marker_lifecycle_postgres import (
+    POSTGRES_URL as MARKER_POSTGRES_URL,
+)
+
+
+pytest_plugins = (
+    "tests.migrations.test_worker_redis_marker_lifecycle_postgres",
+)
 
 
 REDIS_URL = os.environ.get("WORKER_REDIS_MARKER_TEST_URL", "")
@@ -53,6 +66,20 @@ def _authorization_row(
         "redis_stream": authorization.redis_stream,
         "expected_message_id": authorization.expected_message_id,
         "payload_sha256": authorization.payload_sha256,
+    }
+
+
+def _evidence_row(
+    evidence: control.MarkerRepairEvidence,
+) -> dict[str, object]:
+    return {
+        "marker_kind": evidence.marker_kind,
+        "source_id": evidence.source_id,
+        "marker_key": evidence.marker_key,
+        "redis_stream": evidence.redis_stream,
+        "expected_message_id": evidence.expected_message_id,
+        "payload_sha256": evidence.payload_sha256,
+        "source_state": evidence.source_state,
     }
 
 
@@ -118,6 +145,46 @@ class _JanitorDatabase:
         if "vp_finish_worker_redis_marker_cleanup" not in str(statement):
             raise AssertionError(str(statement))
         self.finished.append(params)
+        return True
+
+
+class _RepairDatabase:
+    def __init__(
+        self,
+        evidence: control.MarkerRepairEvidence,
+        *,
+        authorize_hook: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        self.evidence = evidence
+        self.authorize_hook = authorize_hook
+        self.actions: list[str] = []
+        self.promotions: list[dict[str, object]] = []
+
+    @asynccontextmanager
+    async def begin(self):
+        yield self
+
+    async def execute(
+        self,
+        statement: object,
+        params: dict[str, object],
+    ):
+        if "vp_load_worker_redis_marker_repair" not in str(statement):
+            raise AssertionError(str(statement))
+        action = str(params["action"])
+        self.actions.append(action)
+        if action == "authorize_restore_marker" and self.authorize_hook:
+            await self.authorize_hook()
+        return _Result([_evidence_row(self.evidence)])
+
+    async def scalar(
+        self,
+        statement: object,
+        params: dict[str, object],
+    ):
+        if "vp_promote_observed_worker_event_emission" not in str(statement):
+            raise AssertionError(str(statement))
+        self.promotions.append(params)
         return True
 
 
@@ -250,6 +317,178 @@ def _restart_local_redis() -> None:
     )
 
 
+async def _connect_restarted_redis() -> aioredis.Redis:
+    client = aioredis.from_url(REDIS_URL, decode_responses=True)
+    for _ in range(100):
+        try:
+            if await client.ping():
+                return client
+        except Exception:
+            await asyncio.sleep(0.05)
+    await client.aclose()
+    pytest.fail("local Redis did not become ready after restart")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not REDIS_URL or not MARKER_POSTGRES_URL,
+    reason=(
+        "set WORKER_REDIS_MARKER_TEST_URL and "
+        "CHANNEL_OPS_POSTGRES_TEST_URL for combined integration tests"
+    ),
+)
+async def test_real_postgres_and_redis_concurrent_janitor_is_restart_safe(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    credential_urls = marker_database["credential_urls"]
+    assert isinstance(credential_urls, dict)
+    authorization_id = uuid.uuid4()
+    marker_key = f"vp:worker-event-emission:{uuid.uuid4()}"
+    expected_message_id = "1710000000000-0"
+    await admin.execute(
+        """
+        INSERT INTO public.worker_redis_marker_cleanup_authorizations (
+            id, marker_kind, source_id, marker_key, redis_stream,
+            expected_message_id, payload_sha256
+        ) VALUES (
+            $1, 'event_emission', $2, $3, 'vp:events', $4, $5
+        )
+        """,
+        authorization_id,
+        uuid.uuid4(),
+        marker_key,
+        expected_message_id,
+        "a" * 64,
+    )
+
+    redis_admin = aioredis.from_url(REDIS_URL, decode_responses=True)
+    await redis_admin.flushdb()
+    suffix = uuid.uuid4().hex
+    redis_user = f"vp-marker-test-janitor-{suffix}"
+    redis_password = uuid.uuid4().hex
+    await _set_acl_user(
+        redis_admin,
+        redis_user,
+        redis_password,
+        ["+select", "+eval", "+get", "+del"],
+    )
+    janitor_redis = aioredis.from_url(
+        _acl_url(redis_user, redis_password),
+        decode_responses=True,
+    )
+    await redis_admin.set(marker_key, expected_message_id)
+    acl_deleted = False
+
+    engine = create_async_engine(
+        str(credential_urls["janitor"]),
+        pool_pre_ping=True,
+    )
+    session_factory = async_sessionmaker(
+        engine,
+        expire_on_commit=False,
+    )
+    first_session = session_factory()
+    second_session = session_factory()
+    assert isinstance(first_session, AsyncSession)
+    assert isinstance(second_session, AsyncSession)
+    try:
+        outcomes = await asyncio.gather(
+            control.run_worker_redis_marker_janitor(
+                first_session,
+                janitor_redis,
+                uuid.uuid4(),
+            ),
+            control.run_worker_redis_marker_janitor(
+                second_session,
+                janitor_redis,
+                uuid.uuid4(),
+            ),
+        )
+        assert sum(outcome["claimed"] for outcome in outcomes) == 1
+        assert sum(outcome["deleted"] for outcome in outcomes) == 1
+        assert sum(outcome["absent"] for outcome in outcomes) == 0
+        assert sum(outcome["conflict"] for outcome in outcomes) == 0
+        assert await redis_admin.get(marker_key) is None
+
+        terminal = await admin.fetchrow(
+            """
+            SELECT authorization_state, result_code,
+                   claimed_by_run_id IS NOT NULL AS was_claimed,
+                   finished_at IS NOT NULL AS was_finished
+            FROM public.worker_redis_marker_cleanup_authorizations
+            WHERE id = $1
+            """,
+            authorization_id,
+        )
+        assert dict(terminal) == {
+            "authorization_state": "deleted",
+            "result_code": "marker_deleted",
+            "was_claimed": True,
+            "was_finished": True,
+        }
+
+        await redis_admin.execute_command("WAITAOF", 1, 0, 1000)
+        await janitor_redis.aclose()
+        await redis_admin.aclose()
+        _restart_local_redis()
+        restarted_redis = await _connect_restarted_redis()
+        try:
+            assert await restarted_redis.get(marker_key) is None
+            assert await control.run_worker_redis_marker_janitor(
+                first_session,
+                restarted_redis,
+                uuid.uuid4(),
+            ) == {
+                "claimed": 0,
+                "deleted": 0,
+                "absent": 0,
+                "conflict": 0,
+            }
+            assert await admin.fetchval(
+                """
+                SELECT authorization_state = 'deleted'
+                   AND result_code = 'marker_deleted'
+                   AND finished_at IS NOT NULL
+                FROM public.worker_redis_marker_cleanup_authorizations
+                WHERE id = $1
+                """,
+                authorization_id,
+            )
+        finally:
+            await restarted_redis.flushdb()
+            await restarted_redis.execute_command(
+                "ACL",
+                "DELUSER",
+                redis_user,
+            )
+            acl_deleted = True
+            await restarted_redis.aclose()
+    finally:
+        await first_session.close()
+        await second_session.close()
+        await engine.dispose()
+        try:
+            await janitor_redis.aclose()
+        except Exception:
+            pass
+        try:
+            await redis_admin.aclose()
+        except Exception:
+            pass
+        if not acl_deleted:
+            cleanup_redis = await _connect_restarted_redis()
+            try:
+                await cleanup_redis.flushdb()
+                await cleanup_redis.execute_command(
+                    "ACL",
+                    "DELUSER",
+                    redis_user,
+                )
+            finally:
+                await cleanup_redis.aclose()
+
+
 @pytest.mark.asyncio
 async def test_aof_restart_preserves_marker_and_missing_marker_fails() -> None:
     if not REDIS_URL:
@@ -301,6 +540,197 @@ async def _set_acl_user(client: aioredis.Redis, name: str, password: str, comman
     )
 
 
+def _acl_url(name: str, password: str) -> str:
+    return REDIS_URL.replace(
+        "redis://",
+        f"redis://{quote(name)}:{quote(password)}@",
+        1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_restore_service_uses_real_redis_proof_and_set_nx(
+    redis_client: aioredis.Redis,
+) -> None:
+    suffix = uuid.uuid4().hex
+    user = f"vp-marker-test-repair-{suffix}"
+    password = uuid.uuid4().hex
+    await _set_acl_user(
+        redis_client,
+        user,
+        password,
+        ["+select", "+eval", "+get", "+set", "+xrange"],
+    )
+    repair_redis = aioredis.from_url(
+        _acl_url(user, password),
+        decode_responses=True,
+    )
+    evidence = control.MarkerRepairEvidence(
+        marker_kind="event_emission",
+        source_id=uuid.uuid4(),
+        marker_key=f"vp:worker-event-emission:{uuid.uuid4()}",
+        redis_stream="vp:events",
+        expected_message_id="1710000000000-0",
+        payload_sha256=_payload_hash({"event": "node_completed"}),
+        source_state="emitted",
+    )
+    await redis_client.xadd(
+        evidence.redis_stream,
+        {"event": "node_completed"},
+        id=evidence.expected_message_id,
+    )
+    try:
+        dry_run_database = _RepairDatabase(evidence)
+        assert await control.restore_worker_redis_marker(
+            dry_run_database,
+            repair_redis,
+            evidence.source_id,
+            apply=False,
+        ) == "dry_run_ready"
+        assert await redis_client.get(evidence.marker_key) is None
+        assert dry_run_database.actions == ["restore_marker"]
+
+        apply_database = _RepairDatabase(evidence)
+        assert await control.restore_worker_redis_marker(
+            apply_database,
+            repair_redis,
+            evidence.source_id,
+            apply=True,
+        ) == "restore_applied"
+        assert await redis_client.get(
+            evidence.marker_key
+        ) == evidence.expected_message_id
+        assert apply_database.actions == [
+            "restore_marker",
+            "authorize_restore_marker",
+        ]
+
+        await redis_client.delete(evidence.marker_key)
+        conflicting_message_id = "1710000000001-0"
+
+        async def insert_conflict_after_authorization() -> None:
+            await redis_client.set(
+                evidence.marker_key,
+                conflicting_message_id,
+            )
+
+        conflict_database = _RepairDatabase(
+            evidence,
+            authorize_hook=insert_conflict_after_authorization,
+        )
+        assert await control.restore_worker_redis_marker(
+            conflict_database,
+            repair_redis,
+            evidence.source_id,
+            apply=True,
+        ) == "marker_conflict"
+        assert await redis_client.get(
+            evidence.marker_key
+        ) == conflicting_message_id
+        with pytest.raises(NoPermissionError):
+            await repair_redis.delete(evidence.marker_key)
+    finally:
+        await repair_redis.aclose()
+        await redis_client.execute_command("ACL", "DELUSER", user)
+
+
+@pytest.mark.asyncio
+async def test_promote_service_uses_real_redis_exact_xrange_and_hash(
+    redis_client: aioredis.Redis,
+) -> None:
+    suffix = uuid.uuid4().hex
+    user = f"vp-marker-test-repair-{suffix}"
+    password = uuid.uuid4().hex
+    await _set_acl_user(
+        redis_client,
+        user,
+        password,
+        ["+select", "+eval", "+get", "+set", "+xrange"],
+    )
+    repair_redis = aioredis.from_url(
+        _acl_url(user, password),
+        decode_responses=True,
+    )
+    evidence = control.MarkerRepairEvidence(
+        marker_kind="event_emission",
+        source_id=uuid.uuid4(),
+        marker_key=f"vp:worker-event-emission:{uuid.uuid4()}",
+        redis_stream="vp:events",
+        expected_message_id=None,
+        payload_sha256=_payload_hash({"event": "node_completed"}),
+        source_state="prepared",
+    )
+    message_id = await redis_client.xadd(
+        evidence.redis_stream,
+        {"event": "node_completed"},
+        id="1710000000000-0",
+    )
+    await repair_redis.set(evidence.marker_key, message_id)
+    try:
+        database = _RepairDatabase(evidence)
+        assert await control.promote_prepared_worker_event(
+            database,
+            repair_redis,
+            evidence.source_id,
+            apply=False,
+        ) == "dry_run_ready"
+        assert database.promotions == []
+        assert await redis_client.get(evidence.marker_key) == message_id
+
+        assert await control.promote_prepared_worker_event(
+            database,
+            repair_redis,
+            evidence.source_id,
+            apply=True,
+        ) == "promotion_applied"
+        assert database.promotions == [
+            {
+                "emission_id": evidence.source_id,
+                "message_id": message_id,
+                "payload_sha256": evidence.payload_sha256,
+            }
+        ]
+
+        wrong_evidence = control.MarkerRepairEvidence(
+            marker_kind="event_emission",
+            source_id=uuid.uuid4(),
+            marker_key=f"vp:worker-event-emission:{uuid.uuid4()}",
+            redis_stream=evidence.redis_stream,
+            expected_message_id=None,
+            payload_sha256=evidence.payload_sha256,
+            source_state="prepared",
+        )
+        wrong_message_id = await redis_client.xadd(
+            wrong_evidence.redis_stream,
+            {"event": "node_failed"},
+            id="1710000000001-0",
+        )
+        await repair_redis.set(
+            wrong_evidence.marker_key,
+            wrong_message_id,
+        )
+        wrong_database = _RepairDatabase(wrong_evidence)
+        with pytest.raises(
+            control.MarkerControlError,
+            match="event_payload_mismatch",
+        ):
+            await control.promote_prepared_worker_event(
+                wrong_database,
+                repair_redis,
+                wrong_evidence.source_id,
+                apply=True,
+            )
+        assert wrong_database.promotions == []
+        with pytest.raises(NoPermissionError):
+            await repair_redis.xadd(
+                wrong_evidence.redis_stream,
+                {"event": "forbidden"},
+            )
+    finally:
+        await repair_redis.aclose()
+        await redis_client.execute_command("ACL", "DELUSER", user)
+
+
 @pytest.mark.asyncio
 async def test_marker_acl_users_deny_each_others_mutation_surfaces(redis_client: aioredis.Redis) -> None:
     suffix = uuid.uuid4().hex
@@ -311,7 +741,7 @@ async def test_marker_acl_users_deny_each_others_mutation_surfaces(redis_client:
     await _set_acl_user(redis_client, users["repair"], passwords["repair"], ["+select", "+eval", "+get", "+set", "+xrange"])
     clients = {
         purpose: aioredis.from_url(
-            REDIS_URL.replace("redis://", f"redis://{quote(users[purpose])}:{quote(passwords[purpose])}@"),
+            _acl_url(users[purpose], passwords[purpose]),
             decode_responses=True,
         )
         for purpose in users

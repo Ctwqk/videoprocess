@@ -187,8 +187,26 @@ async def check_worker_redis_continuity(
     try:
         expectations = await _load_expectations(db, page_size)
     except MarkerControlError as exc:
+        await _finish_continuity_safely(
+            db,
+            run_id,
+            "error",
+            exc.code,
+            None,
+            0,
+            0,
+        )
         return _continuity_error(run_id, exc.code, 0, 0)
     except Exception:
+        await _finish_continuity_safely(
+            db,
+            run_id,
+            "error",
+            "expectation_page_incomplete",
+            None,
+            0,
+            0,
+        )
         return _continuity_error(run_id, "expectation_page_incomplete", 0, 0)
 
     expected_count = len(expectations)
@@ -538,25 +556,30 @@ async def _record_observation(
     expectation: MarkerExpectation,
     message_id: str,
 ) -> None:
-    recorded = await _database_scalar(
-        db,
-        """
-        SELECT public.vp_record_worker_redis_marker_observation(
-            :run_id,
-            :marker_kind,
-            :source_id,
-            :message_id,
-            :payload_sha256
+    try:
+        recorded = await _database_scalar(
+            db,
+            """
+            SELECT public.vp_record_worker_redis_marker_observation(
+                :run_id,
+                :marker_kind,
+                :source_id,
+                :message_id,
+                :payload_sha256
+            )
+            """,
+            {
+                "run_id": run_id,
+                "marker_kind": expectation.marker_kind,
+                "source_id": expectation.source_id,
+                "message_id": message_id,
+                "payload_sha256": expectation.payload_sha256,
+            },
         )
-        """,
-        {
-            "run_id": run_id,
-            "marker_kind": expectation.marker_kind,
-            "source_id": expectation.source_id,
-            "message_id": message_id,
-            "payload_sha256": expectation.payload_sha256,
-        },
-    )
+    except Exception as exc:
+        raise MarkerControlError(
+            "marker_observation_database_error"
+        ) from exc
     if recorded is not True:
         raise MarkerControlError("marker_observation_rejected")
 

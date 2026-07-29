@@ -625,6 +625,80 @@ async def test_postgres_16_expectation_pages_are_snapshot_stable_and_payload_min
     not POSTGRES_URL,
     reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
 )
+async def test_postgres_16_error_finish_uses_locked_snapshot_count(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    await _seed_authority(admin, resolved=True)
+    readiness = await _connect_control(marker_database, "readiness")
+    try:
+        async with asyncio.timeout(15):
+            failed_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                failed_run,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_continuity_check(
+                    $1, 'error', 'expectation_page_incomplete',
+                    NULL, 0, 0
+                )
+                """,
+                failed_run,
+            ) is False
+            status = await admin.fetchrow(
+                """
+                SELECT state, reason_code, expected_count, checked_count
+                FROM public.worker_redis_continuity_status
+                WHERE singleton
+                """
+            )
+            assert dict(status) == {
+                "state": "error",
+                "reason_code": "expectation_page_incomplete",
+                "expected_count": 2,
+                "checked_count": 0,
+            }
+
+            next_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                next_run,
+            ) == "begun"
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_result_invalid",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_continuity_check(
+                        $1, 'ready', 'ready', 'redis-run', 0, 0
+                    )
+                    """,
+                    next_run,
+                )
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_continuity_check(
+                    $1, 'error', 'expectation_page_incomplete',
+                    NULL, 0, 0
+                )
+                """,
+                next_run,
+            ) is False
+    finally:
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
 async def test_postgres_16_expired_continuity_run_cannot_finish_ready(
     marker_database,
 ) -> None:

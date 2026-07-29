@@ -7142,7 +7142,6 @@ BEGIN
        OR p_expected_count < 0
        OR p_checked_count IS NULL
        OR p_checked_count < 0
-       OR p_checked_count > p_expected_count
        OR (
             p_result = 'ready'
             AND (
@@ -7184,7 +7183,15 @@ BEGIN
             ERRCODE = 'P0001';
     END IF;
     v_now := pg_catalog.clock_timestamp();
-    IF p_expected_count IS DISTINCT FROM v_status.expected_count THEN
+    IF (
+            p_result = 'ready'
+            AND p_expected_count IS DISTINCT FROM v_status.expected_count
+       )
+       OR (
+            p_result = 'error'
+            AND p_checked_count > v_status.expected_count
+       )
+    THEN
         RAISE EXCEPTION USING
             MESSAGE = 'worker_redis_continuity_result_invalid',
             ERRCODE = 'P0001';
@@ -7218,7 +7225,7 @@ BEGIN
     SET state = p_result,
         reason_code = p_reason_code,
         redis_run_id = p_redis_run_id,
-        expected_count = p_expected_count,
+        expected_count = v_status.expected_count,
         checked_count = p_checked_count,
         finished_at = v_now
     WHERE singleton;
