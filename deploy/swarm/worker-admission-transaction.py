@@ -34,6 +34,7 @@ DATABASE_PURPOSES = (
 )
 PHASES = {
     "PREPARING",
+    "ABORTING",
     "FORWARD_APPLYING",
     "FORWARD_VERIFIED",
     "WORKERS_PROMOTED",
@@ -53,6 +54,7 @@ PHASES = {
 }
 PROMOTION_BY_PHASE = {
     "PREPARING": (False, False, False),
+    "ABORTING": (False, False, False),
     "FORWARD_APPLYING": (False, False, False),
     "FORWARD_VERIFIED": (False, False, False),
     "WORKERS_PROMOTED": (True, False, False),
@@ -71,7 +73,8 @@ PROMOTION_BY_PHASE = {
     "DONE": (True, True, True),
 }
 LEGAL_TRANSITIONS = {
-    "PREPARING": {"FORWARD_APPLYING", "ROLLBACK_PREPARING"},
+    "PREPARING": {"ABORTING", "FORWARD_APPLYING", "ROLLBACK_PREPARING"},
+    "ABORTING": {"DONE"},
     "FORWARD_APPLYING": {"FORWARD_VERIFIED", "ROLLBACK_PREPARING"},
     "FORWARD_VERIFIED": {"WORKERS_PROMOTED", "ROLLBACK_PREPARING"},
     "WORKERS_PROMOTED": {"MARKER_PROMOTED"},
@@ -99,6 +102,7 @@ LEGAL_TRANSITIONS = {
     "DONE": set(),
 }
 INTENT_PHASES = {
+    "REMOVE_PREPARED_SECRET": ("ABORTING", "ABORTING"),
     "PROMOTE_WORKERS": ("FORWARD_VERIFIED", "WORKERS_PROMOTED"),
     "PROMOTE_MARKER": ("WORKERS_PROMOTED", "MARKER_PROMOTED"),
     "PROMOTE_CONTROL": ("MARKER_PROMOTED", "CONTROL_PROMOTED"),
@@ -117,6 +121,7 @@ INTENT_PHASES = {
 }
 REPLAY_ACTIONS = {
     "PREPARING": "RESUME_PREPARING",
+    "ABORTING": "ABORT_PREPARED_SECRETS",
     "FORWARD_APPLYING": "RECONCILE_FORWARD",
     "FORWARD_VERIFIED": "VERIFY_FORWARD",
     "WORKERS_PROMOTED": "PROMOTE_MARKER",
@@ -157,6 +162,7 @@ TOP_LEVEL_FIELDS = {
     "janitor",
     "last_error",
     "operation",
+    "abort",
 }
 IDENTITY_FIELDS = {
     "kind",
@@ -524,6 +530,55 @@ def _validate_secret_refs(value: object, *, exact_count: int | None = None) -> N
         identities.add(identity)
 
 
+def _validate_abort_authority(value: object) -> dict[str, str]:
+    authority = _require_exact_fields(
+        value,
+        {"kind", "service", "generation"},
+    )
+    if authority["kind"] not in {"control", "runtime"}:
+        raise TransactionError
+    _require_string(
+        authority["service"],
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}",
+    )
+    _require_string(
+        authority["generation"],
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
+    )
+    if (
+        authority["kind"] == "control"
+        and authority["service"] != "vp-worker-control"
+    ) or (
+        authority["kind"] == "runtime"
+        and authority["service"] == "vp-worker-control"
+    ):
+        raise TransactionError
+    return authority
+
+
+def _validate_abort(value: object) -> dict[str, Any]:
+    abort = _require_exact_fields(value, {"reason", "authorities"})
+    _require_string(
+        abort["reason"],
+        r"[a-z][a-z0-9_]{0,63}",
+        maximum=64,
+    )
+    if not isinstance(abort["authorities"], list):
+        raise TransactionError
+    identities: set[tuple[str, str, str]] = set()
+    for value in abort["authorities"]:
+        authority = _validate_abort_authority(value)
+        identity = (
+            authority["kind"],
+            authority["service"],
+            authority["generation"],
+        )
+        if identity in identities:
+            raise TransactionError
+        identities.add(identity)
+    return abort
+
+
 def _validate_control_identity(value: object) -> None:
     control = _require_exact_fields(
         value,
@@ -734,7 +789,13 @@ def _validate_document(value: object) -> dict[str, Any]:
     _require_integer(document["revision"])
     if document["phase"] not in PHASES:
         raise TransactionError
-    if document["outcome"] not in {None, "succeeded", "rolled_back", "manual"}:
+    if document["outcome"] not in {
+        None,
+        "succeeded",
+        "rolled_back",
+        "manual",
+        "aborted",
+    }:
         raise TransactionError
     if (document["phase"] == "DONE") != (document["outcome"] is not None):
         raise TransactionError
@@ -831,11 +892,14 @@ def _validate_document(value: object) -> dict[str, Any]:
     )
     if any(not isinstance(promotion[key], bool) for key in promotion):
         raise TransactionError
+    expected_promotion = PROMOTION_BY_PHASE[document["phase"]]
+    if document["phase"] == "DONE" and document["outcome"] == "aborted":
+        expected_promotion = (False, False, False)
     if (
         promotion["workers"],
         promotion["marker"],
         promotion["control"],
-    ) != PROMOTION_BY_PHASE[document["phase"]]:
+    ) != expected_promotion:
         raise TransactionError
 
     retirements = document["pending_retirements"]
@@ -885,6 +949,17 @@ def _validate_document(value: object) -> dict[str, Any]:
         if last_error["phase"] not in PHASES:
             raise TransactionError
 
+    abort = document["abort"]
+    if abort is None:
+        if document["phase"] == "ABORTING" or document["outcome"] == "aborted":
+            raise TransactionError
+    else:
+        _validate_abort(abort)
+        if document["phase"] != "ABORTING" and not (
+            document["phase"] == "DONE" and document["outcome"] == "aborted"
+        ):
+            raise TransactionError
+
     if document["operation"] is not None:
         operation = _require_exact_fields(
             document["operation"],
@@ -900,7 +975,23 @@ def _validate_document(value: object) -> dict[str, Any]:
         current_phase, target_phase = INTENT_PHASES[operation["kind"]]
         if document["phase"] != current_phase or operation["target_phase"] != target_phase:
             raise TransactionError
-        _validate_identity(operation["identity"])
+        identity = _validate_identity(operation["identity"])
+        if operation["kind"] == "REMOVE_PREPARED_SECRET":
+            matches = [
+                reference
+                for reference in document["prepared_secrets"]
+                if (
+                    reference["docker_secret_id"] == identity["docker_id"]
+                    and reference["name"] == identity["name"]
+                    and reference["service"] == identity["service"]
+                    and reference["generation"] == identity["generation"]
+                    and reference["purpose"] == identity["purpose"]
+                    and identity["kind"] == "secret"
+                    and identity["spec_digest"] is None
+                )
+            ]
+            if len(matches) != 1:
+                raise TransactionError
     return document
 
 
@@ -1277,6 +1368,7 @@ def _new_document(
         "janitor": {"service": None},
         "last_error": None,
         "operation": None,
+        "abort": None,
     }
 
 
@@ -1581,7 +1673,17 @@ def _set_phase(document: dict[str, Any], target_phase: str, outcome: str | None)
             raise TransactionError
         document["promotion"]["control"] = True
     elif target_phase == "DONE":
-        if (
+        if outcome == "aborted":
+            if (
+                current_phase != "ABORTING"
+                or document["prepared_secrets"]
+                or document["abort"] is None
+                or document["abort"]["authorities"]
+                or any(document["promotion"].values())
+                or document["pending_retirements"]
+            ):
+                raise TransactionError
+        elif (
             document["pending_retirements"]
             or not all(document["promotion"].values())
             or outcome not in {"succeeded", "rolled_back", "manual"}
@@ -1627,6 +1729,250 @@ def _update_document(
         os.close(transactions_descriptor)
         os.close(root_descriptor)
     return document
+
+
+def _secret_reference_identity(reference: dict[str, str]) -> dict[str, Any]:
+    identity = {
+        "kind": "secret",
+        "docker_id": reference["docker_secret_id"],
+        "name": reference["name"],
+        "service": reference["service"],
+        "generation": reference["generation"],
+        "purpose": reference["purpose"],
+        "spec_digest": None,
+    }
+    return _validate_identity(identity)
+
+
+def begin_abort(arguments: list[str]) -> None:
+    if len(arguments) != 4:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, reason = arguments
+    _require_string(reason, r"[a-z][a-z0-9_]{0,63}", maximum=64)
+
+    def updater(document: dict[str, Any]) -> None:
+        if (
+            document["phase"] != "PREPARING"
+            or document["operation"] is not None
+            or document["abort"] is not None
+        ):
+            raise TransactionError
+        authorities: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for reference in document["prepared_secrets"]:
+            kind = (
+                "control"
+                if reference["service"] == "vp-worker-control"
+                else "runtime"
+            )
+            identity = (
+                kind,
+                reference["service"],
+                reference["generation"],
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            authorities.append(
+                {
+                    "kind": kind,
+                    "service": reference["service"],
+                    "generation": reference["generation"],
+                }
+            )
+        document["abort"] = {
+            "reason": reason,
+            "authorities": authorities,
+        }
+        document["last_error"] = {
+            "code": reason,
+            "phase": document["phase"],
+        }
+        _set_phase(document, "ABORTING", None)
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def list_abort(arguments: list[str]) -> None:
+    if len(arguments) != 2:
+        raise TransactionError
+    raw_root, raw_lock_descriptor = arguments
+    _require_writer_lock(raw_root, raw_lock_descriptor)
+    _root, root_descriptor, transactions_descriptor = _open_transactions(
+        raw_root,
+        create=False,
+    )
+    try:
+        document, _active_identity = _read_active_from_descriptor(
+            transactions_descriptor,
+            allow_missing=False,
+        )
+        if (
+            document is None
+            or document["phase"] != "ABORTING"
+            or document["abort"] is None
+        ):
+            raise TransactionError
+        state = {
+            "phase": document["phase"],
+            "revision": document["revision"],
+            "reason": document["abort"]["reason"],
+            "operation": document["operation"],
+            "prepared_secrets": list(reversed(document["prepared_secrets"])),
+            "authorities": list(reversed(document["abort"]["authorities"])),
+        }
+    finally:
+        os.close(transactions_descriptor)
+        os.close(root_descriptor)
+    _print_json(state)
+
+
+def intent_prepared_secret_removal(arguments: list[str]) -> None:
+    if len(arguments) != 4:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, docker_secret_id = arguments
+    _require_string(
+        docker_secret_id,
+        r"[a-z0-9]{20,64}",
+        maximum=64,
+    )
+
+    def updater(document: dict[str, Any]) -> None:
+        if document["phase"] != "ABORTING" or document["operation"] is not None:
+            raise TransactionError
+        matches = [
+            reference
+            for reference in document["prepared_secrets"]
+            if reference["docker_secret_id"] == docker_secret_id
+        ]
+        if len(matches) != 1:
+            raise TransactionError
+        document["operation"] = {
+            "operation_id": f"operation-{secrets.token_hex(16)}",
+            "kind": "REMOVE_PREPARED_SECRET",
+            "target_phase": "ABORTING",
+            "identity": _secret_reference_identity(matches[0]),
+        }
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def complete_prepared_secret_removal(arguments: list[str]) -> None:
+    if len(arguments) != 4:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, operation_id = arguments
+
+    def updater(document: dict[str, Any]) -> None:
+        operation = document["operation"]
+        if (
+            document["phase"] != "ABORTING"
+            or operation is None
+            or operation["operation_id"] != operation_id
+            or operation["kind"] != "REMOVE_PREPARED_SECRET"
+        ):
+            raise TransactionError
+        identity = operation["identity"]
+        matches = [
+            reference
+            for reference in document["prepared_secrets"]
+            if (
+                reference["docker_secret_id"] == identity["docker_id"]
+                and reference["name"] == identity["name"]
+                and reference["service"] == identity["service"]
+                and reference["generation"] == identity["generation"]
+                and reference["purpose"] == identity["purpose"]
+            )
+        ]
+        if len(matches) != 1:
+            raise TransactionError
+        document["prepared_secrets"] = [
+            reference
+            for reference in document["prepared_secrets"]
+            if reference != matches[0]
+        ]
+        document["operation"] = None
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def complete_abort_authority(arguments: list[str]) -> None:
+    if len(arguments) != 6:
+        raise TransactionError
+    (
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        kind,
+        service,
+        generation,
+    ) = arguments
+    authority = _validate_abort_authority(
+        {
+            "kind": kind,
+            "service": service,
+            "generation": generation,
+        }
+    )
+
+    def updater(document: dict[str, Any]) -> None:
+        if (
+            document["phase"] != "ABORTING"
+            or document["operation"] is not None
+            or document["prepared_secrets"]
+            or document["abort"] is None
+        ):
+            raise TransactionError
+        matches = [
+            existing
+            for existing in document["abort"]["authorities"]
+            if existing == authority
+        ]
+        if len(matches) != 1:
+            raise TransactionError
+        document["abort"]["authorities"] = [
+            existing
+            for existing in document["abort"]["authorities"]
+            if existing != authority
+        ]
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def finish_abort(arguments: list[str]) -> None:
+    if len(arguments) != 3:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision = arguments
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        lambda value: _set_phase(value, "DONE", "aborted"),
+    )
+    _print_json(document)
 
 
 def transition(arguments: list[str]) -> None:
@@ -1706,7 +2052,7 @@ def intent(arguments: list[str]) -> None:
     if len(arguments) != 5:
         raise TransactionError
     raw_root, raw_lock_descriptor, raw_revision, kind, identity_path = arguments
-    if kind not in INTENT_PHASES:
+    if kind not in INTENT_PHASES or kind == "REMOVE_PREPARED_SECRET":
         raise TransactionError
     identity = _load_identity_file(identity_path)
 
@@ -1737,7 +2083,11 @@ def complete_intent(arguments: list[str]) -> None:
 
     def updater(document: dict[str, Any]) -> None:
         operation = document["operation"]
-        if operation is None or operation["operation_id"] != operation_id:
+        if (
+            operation is None
+            or operation["operation_id"] != operation_id
+            or operation["kind"] == "REMOVE_PREPARED_SECRET"
+        ):
             raise TransactionError
         document["operation"] = None
         _set_phase(document, operation["target_phase"], None)
@@ -1918,6 +2268,24 @@ def main(arguments: list[str]) -> int:
         return 0
     if arguments and arguments[0] == "lookup-prepared-secret":
         lookup_prepared_secret(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "begin-abort":
+        begin_abort(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "list-abort":
+        list_abort(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "intent-prepared-secret-removal":
+        intent_prepared_secret_removal(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "complete-prepared-secret-removal":
+        complete_prepared_secret_removal(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "complete-abort-authority":
+        complete_abort_authority(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "finish-abort":
+        finish_abort(arguments[1:])
         return 0
     if arguments and arguments[0] == "transition":
         transition(arguments[1:])

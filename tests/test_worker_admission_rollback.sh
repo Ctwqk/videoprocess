@@ -452,6 +452,202 @@ PY
   fi
 )
 
+(
+  transaction_helper="$ROOT_DIR/deploy/swarm/worker-admission-transaction.py"
+  transaction_root="$TEST_ROOT/abort-core/state/vp-worker-admission"
+  mkdir -p "$transaction_root"
+  chmod 0700 "$transaction_root"
+  transaction_cli() {
+    python3 "$transaction_helper" "$@"
+  }
+
+  lock_path="$(transaction_cli lock-prepare "$transaction_root")"
+  exec 18<>"$lock_path"
+  transaction_cli lock-acquire "$transaction_root" 18 >/dev/null
+  credentials=()
+  principals=(
+    vp_deploy_migrator
+    vp_deploy_read
+    vp_control_role_owner
+    vp_runtime_role_owner
+  )
+  for index in 0 1 2 3; do
+    credential="$TEST_ROOT/abort-core/credential-$index"
+    printf 'postgresql://abort-%s:credential@database/videoprocess\n' "$index" \
+      >"$credential"
+    chmod 0400 "$credential"
+    credentials+=("$credential")
+  done
+  credential_records="$(
+    transaction_cli validate-credentials \
+      "${credentials[0]}" "${principals[0]}" \
+      "${credentials[1]}" "${principals[1]}" \
+      "${credentials[2]}" "${principals[2]}" \
+      "${credentials[3]}" "${principals[3]}"
+  )"
+  commit=1123456789abcdef0123456789abcdef01234567
+  backend_image="vp-backend:deploy-${commit:0:12}"
+  go_image="vp-ffmpeg-worker-go:deploy-${commit:0:12}"
+  transaction_cli begin \
+    "$transaction_root" 18 \
+    "$commit" "$backend_image" "$go_image" "$commit" \
+    legacy_no_control <<<"$credential_records" >/dev/null
+
+  control_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  worker_database_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  worker_admission_id=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  transaction_cli record-prepared-secret \
+    "$transaction_root" 18 \
+    vp-wc-operator-c-1123456789abcdef0123 "$control_id" \
+    vp-worker-control c-1123456789abcdef0123 operator >/dev/null
+  transaction_cli record-prepared-secret \
+    "$transaction_root" 18 \
+    vp-wr-ffmpeg-go-db-901 "$worker_database_id" \
+    vp-ffmpeg-worker-go-swarm 901 database >/dev/null
+  transaction_cli record-prepared-secret \
+    "$transaction_root" 18 \
+    vp-wr-ffmpeg-go-admission-901 "$worker_admission_id" \
+    vp-ffmpeg-worker-go-swarm 901 admission >/dev/null
+
+  transaction_cli begin-abort \
+    "$transaction_root" 18 3 preparing_failed >/dev/null
+  abort_state="$TEST_ROOT/abort-core/list.json"
+  transaction_cli list-abort "$transaction_root" 18 >"$abort_state"
+  python3 - \
+    "$abort_state" "$control_id" "$worker_database_id" "$worker_admission_id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    state = json.load(handle)
+if (
+    state["phase"] != "ABORTING"
+    or state["revision"] != 4
+    or state["operation"] is not None
+    or [
+        item["docker_secret_id"]
+        for item in state["prepared_secrets"]
+    ] != [sys.argv[4], sys.argv[3], sys.argv[2]]
+    or state["authorities"] != [
+        {
+            "generation": "901",
+            "kind": "runtime",
+            "service": "vp-ffmpeg-worker-go-swarm",
+        },
+        {
+            "generation": "c-1123456789abcdef0123",
+            "kind": "control",
+            "service": "vp-worker-control",
+        },
+    ]
+):
+    raise SystemExit("abort state is not deterministic")
+PY
+  if transaction_cli begin \
+    "$transaction_root" 18 \
+    "$commit" "$backend_image" "$go_image" replacement \
+    legacy_no_control <<<"$credential_records" >/dev/null 2>&1; then
+    echo 'FAIL: ABORTING transaction allowed a new candidate' >&2
+    exit 1
+  fi
+
+  intent="$(
+    transaction_cli intent-prepared-secret-removal \
+      "$transaction_root" 18 4 "$worker_admission_id"
+  )"
+  operation_id="$(
+    python3 -c \
+      'import json,sys; print(json.load(sys.stdin)["operation"]["operation_id"])' \
+      <<<"$intent"
+  )"
+  transaction_cli replay-plan "$transaction_root" \
+    >"$TEST_ROOT/abort-core/replay.json"
+  python3 - "$TEST_ROOT/abort-core/replay.json" "$worker_admission_id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    plan = json.load(handle)
+if (
+    plan["phase"] != "ABORTING"
+    or plan["next_action"] != "VERIFY_REMOVE_PREPARED_SECRET"
+    or plan["pending_operation"]["identity"]["docker_id"] != sys.argv[2]
+    or plan["allow_new_candidate"]
+    or plan["allow_stale_cleanup"]
+):
+    raise SystemExit("prepared-secret removal intent is not replayable")
+PY
+  before_wrong_complete="$(shasum -a 256 \
+    "$transaction_root/transactions/active.json")"
+  if transaction_cli complete-prepared-secret-removal \
+    "$transaction_root" 18 5 operation-00000000000000000000000000000000 \
+    >/dev/null 2>&1; then
+    echo 'FAIL: abort core accepted the wrong operation identity' >&2
+    exit 1
+  fi
+  [[ "$(shasum -a 256 "$transaction_root/transactions/active.json")" \
+    == "$before_wrong_complete" ]]
+  transaction_cli complete-prepared-secret-removal \
+    "$transaction_root" 18 5 "$operation_id" >/dev/null
+
+  revision=6
+  for secret_id in "$worker_database_id" "$control_id"; do
+    intent="$(
+      transaction_cli intent-prepared-secret-removal \
+        "$transaction_root" 18 "$revision" "$secret_id"
+    )"
+    operation_id="$(
+      python3 -c \
+        'import json,sys; print(json.load(sys.stdin)["operation"]["operation_id"])' \
+        <<<"$intent"
+    )"
+    revision=$((revision + 1))
+    transaction_cli complete-prepared-secret-removal \
+      "$transaction_root" 18 "$revision" "$operation_id" >/dev/null
+    revision=$((revision + 1))
+  done
+
+  transaction_cli complete-abort-authority \
+    "$transaction_root" 18 10 runtime \
+    vp-ffmpeg-worker-go-swarm 901 >/dev/null
+  transaction_cli complete-abort-authority \
+    "$transaction_root" 18 11 control \
+    vp-worker-control c-1123456789abcdef0123 >/dev/null
+  transaction_cli finish-abort "$transaction_root" 18 12 >/dev/null
+  if transaction_cli begin \
+    "$transaction_root" 18 \
+    "$commit" "$backend_image" "$go_image" replacement \
+    legacy_no_control <<<"$credential_records" >/dev/null 2>&1; then
+    echo 'FAIL: unarchived DONE transaction allowed a new candidate' >&2
+    exit 1
+  fi
+  done_path="$(transaction_cli archive "$transaction_root" 18 13)"
+  [[ -f "$done_path" && ! -e "$transaction_root/transactions/active.json" ]]
+  python3 - "$done_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+if (
+    document["phase"] != "DONE"
+    or document["outcome"] != "aborted"
+    or document["prepared_secrets"]
+    or document["operation"] is not None
+    or document["abort"] != {
+        "authorities": [],
+        "reason": "preparing_failed",
+    }
+):
+    raise SystemExit("aborted DONE evidence is incomplete")
+PY
+  transaction_cli begin \
+    "$transaction_root" 18 \
+    "$commit" "$backend_image" "$go_image" replacement \
+    legacy_no_control <<<"$credential_records" >/dev/null
+  exec 18>&-
+)
+
 CALLS="$TEST_ROOT/calls"
 GENERATION_SEQUENCE="$TEST_ROOT/generation-sequence"
 printf '700\n' >"$GENERATION_SEQUENCE"

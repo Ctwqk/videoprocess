@@ -683,6 +683,57 @@ done
 )
 
 (
+  probe_root="$TEST_ROOT/one-shot-pre-handler-term"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  docker_entered="$probe_root/docker-entered"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  signal_target_pid="$(
+    exec sh -c 'printf "%s\n" "$PPID"'
+  )"
+
+  docker() {
+    : >"$docker_entered"
+    cat >/dev/null
+  }
+
+  set -T
+  trap '
+    if [[ "$BASH_COMMAND" == "local launched_child_pid=\"\"" \
+      && "$VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED" != true ]]; then
+      trap - DEBUG
+      builtin kill -TERM "$signal_target_pid"
+    fi
+  ' DEBUG
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image - - /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1
+  operation_status=$?
+  set -e
+  trap - DEBUG
+  set +T
+
+  if [[ "$operation_status" -ne 143 ]]; then
+    echo "FAIL: pre-handler TERM returned $operation_status instead of 143" >&2
+    exit 1
+  fi
+  if [[ -e "$docker_entered" ]]; then
+    echo 'FAIL: pre-handler TERM continued into Docker' >&2
+    exit 1
+  fi
+  if compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null \
+    || compgen -G "$admission_root/one-shot-operations/op.*" >/dev/null; then
+    echo 'FAIL: pre-handler TERM retained one-shot identity state' >&2
+    exit 1
+  fi
+)
+
+(
   probe_root="$TEST_ROOT/one-shot-post-spawn-term"
   ROOT="$probe_root/sync"
   REPO_ROOT="$probe_root/repos"
@@ -815,6 +866,66 @@ for signal_case in HUP:129 INT:130 TERM:143; do
 )
 done
 
+for signal_case in HUP:129 INT:130 TERM:143; do
+(
+  signal_name="${signal_case%%:*}"
+  expected_status="${signal_case##*:}"
+  probe_root="$TEST_ROOT/outer-validation-signal-$signal_name"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  prepare_entered="$probe_root/prepare-entered"
+  mutation_entered="$probe_root/mutation-entered"
+  caller_trap_ran="$probe_root/caller-trap-ran"
+  mkdir -p "$admission_root"
+  chmod 0700 "$admission_root"
+  signal_target_pid="$(
+    exec sh -c 'printf "%s\n" "$PPID"'
+  )"
+
+  vp_validate_deploy_config() {
+    builtin kill "-$signal_name" "$signal_target_pid"
+    return 0
+  }
+  vp_worker_admission_prepare_transaction() {
+    : >"$prepare_entered"
+    return 0
+  }
+  _vp_deploy_vp_app_services_locked() {
+    : >"$mutation_entered"
+    return 0
+  }
+
+  trap 'printf "caller\n" >"$caller_trap_ran"' HUP
+  trap 'printf "caller\n" >"$caller_trap_ran"' INT
+  trap 'printf "caller\n" >"$caller_trap_ran"' TERM
+  caller_hup_trap="$(trap -p HUP)"
+  caller_int_trap="$(trap -p INT)"
+  caller_term_trap="$(trap -p TERM)"
+
+  set +e
+  deploy_vp_app_services a b synthetic-image d e f \
+    >/dev/null 2>&1
+  deploy_status=$?
+  set -e
+  if [[ "$deploy_status" -ne "$expected_status" ]]; then
+    echo "FAIL: validation $signal_name returned $deploy_status instead of $expected_status" >&2
+    exit 1
+  fi
+  if [[ -e "$prepare_entered" || -e "$mutation_entered" ]]; then
+    echo "FAIL: validation $signal_name continued after first signal" >&2
+    exit 1
+  fi
+  if [[ -e "$caller_trap_ran" \
+    || "$(trap -p HUP)" != "$caller_hup_trap" \
+    || "$(trap -p INT)" != "$caller_int_trap" \
+    || "$(trap -p TERM)" != "$caller_term_trap" ]]; then
+    echo "FAIL: validation $signal_name did not preserve caller traps" >&2
+    exit 1
+  fi
+)
+done
+
 VP_WORKER_ADMISSION_COMMIT=0123456789abcdef0123456789abcdef01234567
 VP_WORKER_FFMPEG_GO_GENERATION=101
 VP_WORKER_FFMPEG_GENERATION=102
@@ -927,6 +1038,8 @@ assert_worker_contract \
   RETIREMENT_OPERATOR_CALLS="$TEST_ROOT/retirement-response-operator-calls"
   : >"$RETIREMENT_OPERATOR_CALLS"
   VP_WORKER_ADMISSION_CONTROL_IMAGE=synthetic-control-image
+  retirement_response_root="$(vp_worker_admission_root)"
+  vp_worker_admission_lock_acquire "$retirement_response_root"
 
   vp_require_pipeline_network_identity() {
     VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
@@ -946,11 +1059,10 @@ assert_worker_contract \
 
   RETIREMENT_RESPONSE_SERVICE=vp-vision-worker-swarm
   set +e
-  mismatch_output="$(
-    vp_worker_admission_retirement_ids \
-      "$expected_service" "$expected_generation"
-  )"
+  vp_worker_admission_retirement_ids \
+    "$expected_service" "$expected_generation"
   mismatch_status=$?
+  mismatch_output="$VP_WORKER_ADMISSION_RETIREMENT_IDS"
   set -e
   if [[ "$mismatch_status" -eq 0 || -n "$mismatch_output" ]]; then
     echo 'FAIL: retirement response accepted a mismatched service' >&2
@@ -960,11 +1072,10 @@ assert_worker_contract \
   RETIREMENT_RESPONSE_SERVICE="$expected_service"
   RETIREMENT_RESPONSE_GENERATION=999
   set +e
-  mismatch_output="$(
-    vp_worker_admission_retirement_ids \
-      "$expected_service" "$expected_generation"
-  )"
+  vp_worker_admission_retirement_ids \
+    "$expected_service" "$expected_generation"
   mismatch_status=$?
+  mismatch_output="$VP_WORKER_ADMISSION_RETIREMENT_IDS"
   set -e
   if [[ "$mismatch_status" -eq 0 || -n "$mismatch_output" ]]; then
     echo 'FAIL: retirement response accepted a mismatched generation' >&2
@@ -973,11 +1084,11 @@ assert_worker_contract \
   [[ ! -s "$RETIREMENT_OPERATOR_CALLS" ]]
 
   RETIREMENT_RESPONSE_GENERATION="$expected_generation"
-  exact_output="$(
-    vp_worker_admission_retirement_ids \
-      "$expected_service" "$expected_generation"
-  )"
+  vp_worker_admission_retirement_ids \
+    "$expected_service" "$expected_generation"
+  exact_output="$VP_WORKER_ADMISSION_RETIREMENT_IDS"
   [[ "$exact_output" == "$retirement_uuid" ]]
+  vp_worker_admission_lock_release
 )
 
 (
@@ -1262,6 +1373,111 @@ assert_worker_contract \
     "$RETIREMENT_HYDRATION_CALLS")" -eq 1 ]]
 )
 
+(
+  probe_root="$TEST_ROOT/outer-lock-real-retirement"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  retirement_service=vp-ffmpeg-worker-go-swarm
+  retirement_generation=821
+  retirement_database_name=stale-db-821
+  retirement_admission_name=stale-admission-821
+  retirement_database_id=7123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  retirement_admission_id=8123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  retirement_uuid=01234567-89ab-4def-8123-456789abcdef
+  retirement_journal="$admission_root/retirements/legacy.records"
+  retirement_calls="$probe_root/calls"
+  read_file="$probe_root/deploy-read"
+  owner_file="$probe_root/runtime-owner"
+  VP_WORKER_CONTROL_GENERATION=c-0123456789abcdef0123
+  operator_file="$admission_root/control/$VP_WORKER_CONTROL_GENERATION/worker-registration-operator-database-url"
+  VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="$read_file"
+  VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="$owner_file"
+  VP_WORKER_ADMISSION_CONTROL_IMAGE=synthetic-control-image
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
+  mkdir -p \
+    "$admission_root/control/$VP_WORKER_CONTROL_GENERATION"
+  chmod 0700 \
+    "$admission_root" \
+    "$admission_root/control" \
+    "$admission_root/control/$VP_WORKER_CONTROL_GENERATION"
+  printf '%s\n' synthetic-read >"$read_file"
+  printf '%s\n' synthetic-owner >"$owner_file"
+  printf '%s\n' synthetic-operator >"$operator_file"
+  chmod 0400 "$read_file" "$owner_file" "$operator_file"
+  : >"$retirement_calls"
+
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$retirement_calls"
+    if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
+      printf '%s\n' 'network-id|vp-pipeline-net|overlay|swarm'
+      return 0
+    fi
+    if [[ "${1:-} ${2:-}" == "secret inspect" ]]; then
+      case "${3:-}" in
+        "$retirement_database_name"|"$retirement_database_id")
+          printf '%s|%s|%s|%s|%s\n' \
+            "$retirement_database_id" "$retirement_database_name" \
+            "$retirement_service" "$retirement_generation" database
+          return 0
+          ;;
+        "$retirement_admission_name"|"$retirement_admission_id")
+          printf '%s|%s|%s|%s|%s\n' \
+            "$retirement_admission_id" "$retirement_admission_name" \
+            "$retirement_service" "$retirement_generation" admission
+          return 0
+          ;;
+      esac
+      return 1
+    fi
+    if [[ "${1:-} ${2:-}" == "secret rm" ]]; then
+      return 0
+    fi
+    if [[ "${1:-}" == run ]]; then
+      cat >/dev/null
+      case "$*" in
+        *"worker_deployment_cli generation-state"*)
+          printf '{"code":"worker_deployment_generation_state","generation":821,"grant_state":"active","service_name":"vp-ffmpeg-worker-go-swarm","status":"ok"}\n'
+          ;;
+        *"worker_deployment_cli retirement-candidates"*)
+          printf '{"code":"worker_deployment_retirement_candidates","generation":821,"registration_ids":["%s"],"service_name":"vp-ffmpeg-worker-go-swarm","status":"ok"}\n' \
+            "$retirement_uuid"
+          ;;
+        *"worker_registration_operator_cli revoke-registration"*|\
+        *"worker_registration_operator_cli revoke-grant"*|\
+        *"worker_runtime_role_cli revoke"*)
+          :
+          ;;
+        *)
+          return 96
+          ;;
+      esac
+      return 0
+    fi
+    return 97
+  }
+
+  vp_worker_admission_write_retirement_journal \
+    "$retirement_journal" \
+    "$retirement_service|$retirement_generation|$retirement_database_name|$retirement_admission_name"
+  vp_worker_admission_lock_acquire "$admission_root"
+  if ! vp_worker_admission_process_retirement_journals "$admission_root"; then
+    echo 'FAIL: outer-lock retirement command substitution was rejected' >&2
+    exit 1
+  fi
+  [[ ! -e "$retirement_journal" ]]
+  grep -Fq 'worker_deployment_cli generation-state' "$retirement_calls"
+  grep -Fq 'worker_deployment_cli retirement-candidates' "$retirement_calls"
+  grep -Fq \
+    "worker_registration_operator_cli revoke-registration --service-name $retirement_service --registration-id $retirement_uuid --reason replaced" \
+    "$retirement_calls"
+  grep -Fq "secret rm $retirement_database_id" "$retirement_calls"
+  grep -Fq "secret rm $retirement_admission_id" "$retirement_calls"
+  [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == true \
+    && "$VP_WORKER_ADMISSION_LOCK_DEPTH" -eq 1 ]]
+  vp_worker_admission_lock_release
+)
+
 DOCKER_SECRET_PAYLOAD="$TEST_ROOT/docker-secret-payload"
 DOCKER_SECRET_CREATED="$TEST_ROOT/docker-secret-created"
 DOCKER_SECRET_ID=2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
@@ -1478,6 +1694,336 @@ if ids != {sys.argv[2], sys.argv[3]}:
 PY
   VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
   vp_worker_admission_lock_release
+)
+
+(
+  abort_root="$TEST_ROOT/partial-secret-abort"
+  mkdir -p "$abort_root"
+  abort_commit=2123456789abcdef0123456789abcdef01234567
+  abort_control_generation=c-${abort_commit:0:20}
+  abort_worker_generation=901
+  abort_control_image="vp-ffmpeg-worker-python:deploy-${abort_commit:0:12}"
+  abort_backend_image="vp-backend:deploy-${abort_commit:0:12}"
+  abort_go_image="vp-ffmpeg-worker-go:deploy-${abort_commit:0:12}"
+  abort_calls=""
+  abort_secret_state=""
+  abort_active=""
+  abort_mismatch_id=""
+  abort_mismatch_kind=""
+  abort_crash_id=""
+  abort_crash_once=""
+  abort_mounted_secret_id=""
+
+  abort_secret_id() {
+    printf '%064x\n' "$1"
+  }
+
+  begin_abort_fixture() {
+    local fixture_name="$1"
+    local fixture_root="$abort_root/$fixture_name"
+    ROOT="$fixture_root/sync"
+    REPO_ROOT="$fixture_root/repos"
+    local admission_root="$ROOT/state/vp-worker-admission"
+    abort_calls="$fixture_root/calls"
+    abort_secret_state="$fixture_root/secrets"
+    abort_active="$admission_root/transactions/active.json"
+    abort_mismatch_id=""
+    abort_mismatch_kind=""
+    abort_crash_id=""
+    abort_crash_once="$fixture_root/crash-once"
+    abort_mounted_secret_id=""
+    mkdir -p "$admission_root" "$abort_secret_state"
+    chmod 0700 "$admission_root" "$abort_secret_state"
+    : >"$abort_calls"
+    rm -f "$abort_crash_once"
+
+    local credentials=()
+    local principals=(
+      vp_deploy_migrator
+      vp_deploy_read
+      vp_control_role_owner
+      vp_runtime_role_owner
+    )
+    local index
+    for index in 0 1 2 3; do
+      local credential="$fixture_root/credential-$index"
+      printf 'postgresql://abort-%s:credential@database/videoprocess\n' \
+        "$index" >"$credential"
+      chmod 0400 "$credential"
+      credentials+=("$credential")
+    done
+    local credential_records
+    credential_records="$(
+      python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+        validate-credentials \
+        "${credentials[0]}" "${principals[0]}" \
+        "${credentials[1]}" "${principals[1]}" \
+        "${credentials[2]}" "${principals[2]}" \
+        "${credentials[3]}" "${principals[3]}"
+    )"
+    vp_worker_admission_lock_acquire "$admission_root"
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin \
+      "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      "$abort_commit" "$abort_backend_image" "$abort_go_image" \
+      "$abort_commit" legacy_no_control \
+      <<<"$credential_records" >/dev/null
+    VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+    VP_WORKER_ADMISSION_CONTROL_IMAGE="$abort_control_image"
+    VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE="$abort_commit"
+  }
+
+  record_abort_secret() {
+    local name="$1"
+    local secret_id="$2"
+    local service="$3"
+    local generation="$4"
+    local purpose="$5"
+    printf '%s|%s|%s|%s|%s\n' \
+      "$secret_id" "$name" "$service" "$generation" "$purpose" \
+      >"$abort_secret_state/$secret_id"
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      record-prepared-secret \
+      "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+      "$VP_WORKER_ADMISSION_LOCK_FD" \
+      "$name" "$secret_id" "$service" "$generation" "$purpose" \
+      >/dev/null
+  }
+
+  docker() {
+    if [[ "${1:-} ${2:-}" == "service ls" ]]; then
+      printf 'service-ls\n' >>"$abort_calls"
+      if [[ -n "$abort_mounted_secret_id" ]]; then
+        printf 'dddddddddddddddddddddddd\n'
+      fi
+      return 0
+    fi
+    if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
+      printf 'service-inspect|%s\n' "${3:-}" >>"$abort_calls"
+      [[ -n "$abort_mounted_secret_id" ]] \
+        && printf '%s\n' "$abort_mounted_secret_id"
+      return 0
+    fi
+    if [[ "${1:-} ${2:-}" == "secret inspect" ]]; then
+      local reference="${3:-}"
+      printf 'inspect|%s\n' "$reference" >>"$abort_calls"
+      local state="$abort_secret_state/$reference"
+      [[ -f "$state" ]] || return 1
+      local secret_id
+      local name
+      local service
+      local generation
+      local purpose
+      IFS='|' read -r \
+        secret_id name service generation purpose <"$state"
+      if [[ "$reference" == "$abort_mismatch_id" ]]; then
+        case "$abort_mismatch_kind" in
+          id) secret_id="$(abort_secret_id 999)" ;;
+          label) purpose=replacement ;;
+          *) return 1 ;;
+        esac
+      fi
+      printf '%s|%s|%s|%s|%s\n' \
+        "$secret_id" "$name" "$service" "$generation" "$purpose"
+      return 0
+    fi
+    if [[ "${1:-} ${2:-}" == "secret ls" ]]; then
+      local filter="${4:-}"
+      local secret_id="${filter#id=}"
+      printf 'secret-ls|%s\n' "$secret_id" >>"$abort_calls"
+      [[ -f "$abort_secret_state/$secret_id" ]] \
+        && printf '%s\n' "$secret_id"
+      return 0
+    fi
+    if [[ "${1:-} ${2:-}" == "secret rm" ]]; then
+      local secret_id="${3:-}"
+      printf 'rm|%s\n' "$secret_id" >>"$abort_calls"
+      [[ -f "$abort_secret_state/$secret_id" ]] || return 1
+      rm -f "$abort_secret_state/$secret_id"
+      if [[ "$secret_id" == "$abort_crash_id" \
+        && ! -e "$abort_crash_once" ]]; then
+        : >"$abort_crash_once"
+        return 99
+      fi
+      return 0
+    fi
+    return 98
+  }
+
+  vp_worker_control_revoke_authority() {
+    printf 'authority|control|%s|%s\n' "$2" "$3" >>"$abort_calls"
+  }
+  vp_worker_admission_revoke_generation_authority() {
+    printf 'authority|runtime|%s|%s\n' "$1" "$2" >>"$abort_calls"
+  }
+
+  control_purposes=(
+    operator
+    orchestrator
+    staging-janitor
+    staging-minio-access
+    staging-minio-secret
+    worker-minio-access
+    worker-minio-secret
+  )
+  for prefix in 1 2 3 4 5 6 7; do
+    begin_abort_fixture "control-prefix-$prefix"
+    expected_removals=""
+    for index in $(seq 1 "$prefix"); do
+      secret_id="$(abort_secret_id "$index")"
+      purpose="${control_purposes[$((index - 1))]}"
+      name="vp-control-$purpose-$abort_control_generation"
+      record_abort_secret \
+        "$name" "$secret_id" \
+        vp-worker-control "$abort_control_generation" "$purpose"
+      expected_removals="rm|$secret_id${expected_removals:+$'\n'$expected_removals}"
+    done
+    if ! vp_worker_admission_abort_preparing_transaction preparing_failed; then
+      echo "FAIL: control partial-secret prefix $prefix did not abort" >&2
+      exit 1
+    fi
+    actual_removals="$(awk -F'|' '$1 == "rm" { print }' "$abort_calls")"
+    if [[ "$actual_removals" != "$expected_removals" ]]; then
+      echo "FAIL: control partial-secret prefix $prefix cleanup order drifted" >&2
+      exit 1
+    fi
+    if [[ "$(grep -Fc 'service-ls' "$abort_calls")" -ne "$prefix" ]] \
+      || ! awk -F'|' '
+        $1 == "rm" && (previous != "inspect|" $2) { exit 1 }
+        { previous = $0 }
+      ' "$abort_calls"; then
+      echo "FAIL: control prefix $prefix skipped unused/final-inspect proof" >&2
+      exit 1
+    fi
+    grep -Fxq \
+      "authority|control|$abort_control_generation|$VP_WORKER_ADMISSION_LOCK_ROOT" \
+      "$abort_calls"
+    [[ ! -e "$abort_active" ]]
+    vp_worker_admission_lock_release
+  done
+
+  for prefix in 1 2; do
+    begin_abort_fixture "worker-prefix-$prefix"
+    database_id="$(abort_secret_id 101)"
+    admission_id="$(abort_secret_id 102)"
+    record_abort_secret \
+      vp-worker-database "$database_id" \
+      vp-ffmpeg-worker-go-swarm "$abort_worker_generation" database
+    if [[ "$prefix" -eq 2 ]]; then
+      record_abort_secret \
+        vp-worker-admission "$admission_id" \
+        vp-ffmpeg-worker-go-swarm "$abort_worker_generation" admission
+    fi
+    if ! vp_worker_admission_abort_preparing_transaction preparing_failed; then
+      echo "FAIL: worker partial-secret prefix $prefix did not abort" >&2
+      exit 1
+    fi
+    [[ "$(grep -Fc \
+      "authority|runtime|vp-ffmpeg-worker-go-swarm|$abort_worker_generation" \
+      "$abort_calls")" -eq 1 ]]
+    if grep -Eq '^rm\|vp-' "$abort_calls"; then
+      echo "FAIL: worker partial-secret abort removed by name" >&2
+      exit 1
+    fi
+    [[ ! -e "$abort_active" ]]
+    vp_worker_admission_lock_release
+  done
+
+  begin_abort_fixture mid-cleanup-crash
+  database_id="$(abort_secret_id 201)"
+  admission_id="$(abort_secret_id 202)"
+  record_abort_secret \
+    vp-worker-database "$database_id" \
+    vp-ffmpeg-worker-go-swarm "$abort_worker_generation" database
+  record_abort_secret \
+    vp-worker-admission "$admission_id" \
+    vp-ffmpeg-worker-go-swarm "$abort_worker_generation" admission
+  abort_crash_id="$admission_id"
+  if vp_worker_admission_abort_preparing_transaction preparing_failed \
+    >/dev/null 2>&1; then
+    echo 'FAIL: partial-secret crash fixture unexpectedly completed' >&2
+    exit 1
+  fi
+  [[ -e "$abort_active" \
+    && "$(grep -Fc "rm|$admission_id" "$abort_calls")" -eq 1 ]]
+  abort_crash_id=""
+  vp_worker_admission_abort_preparing_transaction preparing_failed
+  [[ "$(grep -Fc "rm|$admission_id" "$abort_calls")" -eq 1 \
+    && "$(grep -Fc "rm|$database_id" "$abort_calls")" -eq 1 \
+    && "$(grep -Fc "secret-ls|$admission_id" "$abort_calls")" -eq 1 \
+    && ! -e "$abort_active" ]]
+  vp_worker_admission_lock_release
+
+  for mismatch_kind in id label; do
+    begin_abort_fixture "replacement-$mismatch_kind-mismatch"
+    mismatch_id="$(abort_secret_id 301)"
+    record_abort_secret \
+      vp-worker-database "$mismatch_id" \
+      vp-ffmpeg-worker-go-swarm "$abort_worker_generation" database
+    abort_mismatch_id="$mismatch_id"
+    abort_mismatch_kind="$mismatch_kind"
+    if vp_worker_admission_abort_preparing_transaction preparing_failed \
+      >/dev/null 2>&1; then
+      echo "FAIL: replacement secret $mismatch_kind mismatch was removed" >&2
+      exit 1
+    fi
+    [[ -e "$abort_active" && "$(grep -c '^rm|' "$abort_calls")" -eq 0 ]]
+    vp_worker_admission_lock_release
+  done
+
+  begin_abort_fixture mounted-secret
+  mounted_id="$(abort_secret_id 401)"
+  record_abort_secret \
+    vp-worker-database "$mounted_id" \
+    vp-ffmpeg-worker-go-swarm "$abort_worker_generation" database
+  abort_mounted_secret_id="$mounted_id"
+  if vp_worker_admission_abort_preparing_transaction preparing_failed \
+    >/dev/null 2>&1; then
+    echo 'FAIL: mounted prepared secret was removed' >&2
+    exit 1
+  fi
+  [[ -e "$abort_active" && "$(grep -c '^rm|' "$abort_calls")" -eq 0 ]]
+  vp_worker_admission_lock_release
+)
+
+(
+  restore_root="$TEST_ROOT/preparing-restore-abort"
+  ROOT="$restore_root/sync"
+  REPO_ROOT="$restore_root/repos"
+  mkdir -p "$ROOT/state/vp-worker-admission"
+  restore_calls="$restore_root/calls"
+  : >"$restore_calls"
+  VP_WORKER_ADMISSION_PREPARED=false
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+  VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE=partial-candidate
+  VP_WORKER_ROLLBACK_FAILED_CANDIDATE_NAMESPACE=""
+  vp_restore_app_snapshots() {
+    printf 'snapshots|%s|%s\n' "$2" "$3" >>"$restore_calls"
+  }
+  vp_worker_admission_abort_preparing_transaction() {
+    printf 'abort|%s\n' "$1" >>"$restore_calls"
+    VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
+  }
+  vp_worker_admission_retire_records() {
+    printf 'legacy-retire\n' >>"$restore_calls"
+  }
+  vp_worker_admission_discard_namespace() {
+    printf 'legacy-discard\n' >>"$restore_calls"
+  }
+  vp_worker_control_cleanup_candidate() {
+    printf 'legacy-control-cleanup\n' >>"$restore_calls"
+  }
+
+  vp_restore_worker_admission_transaction \
+    synthetic-snapshots synthetic-service "" true
+  if [[ "$(sed -n '1p' "$restore_calls")" \
+      != 'snapshots|synthetic-service|false' \
+    || "$(sed -n '2p' "$restore_calls")" \
+      != 'abort|preparing_failed' \
+    || "$(wc -l <"$restore_calls" | tr -d ' ')" -ne 2 ]]; then
+    echo 'FAIL: permanent PREPARING restore did not select durable abort' >&2
+    exit 1
+  fi
+  [[ "$VP_WORKER_ADMISSION_ROLLBACK_CONVERGED" == true ]]
 )
 
 (
@@ -2069,10 +2615,10 @@ CLEANUP_CALLS="$TEST_ROOT/cleanup-calls"
 : >"$CLEANUP_CALLS"
 CLEANUP_GRANT_STATE=active
 vp_worker_admission_generation_state() {
-  printf '%s\n' "$CLEANUP_GRANT_STATE"
+  VP_WORKER_ADMISSION_GENERATION_STATE="$CLEANUP_GRANT_STATE"
 }
 vp_worker_admission_retirement_ids() {
-  :
+  VP_WORKER_ADMISSION_RETIREMENT_IDS=""
 }
 vp_worker_admission_operator() {
   printf 'operator|%s\n' "$*" >>"$CLEANUP_CALLS"

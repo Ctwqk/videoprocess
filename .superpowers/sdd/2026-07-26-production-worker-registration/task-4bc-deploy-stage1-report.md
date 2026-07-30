@@ -775,3 +775,232 @@ Stage 2 reconciliation requirement.
 
 No SSH, push, deploy, remote access, YouTube/canary operation, or real Swarm
 service/secret mutation was performed.
+
+## Fix Round 2
+
+Start HEAD: `1c375147ee8ef8748644dd3321602425cb92dcd8`.
+
+### Open Important 1: Legitimate Lock-Owner Calls
+
+Root cause:
+
+The inherited-child guard correctly rejected a different `BASHPID`, but
+production retirement called generation-state, retirement-ID, and v1
+hydration helpers through command substitutions. Those subshells inherited fd
+19 and the lock globals but were not the owner shell, so their nested
+`vp_run_python_worker_container` calls failed before retirement could run.
+
+RED command and output:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: outer-lock retirement command substitution was rejected
+```
+
+Shared fix:
+
+- Generation-state and retirement-ID one-shots now execute directly in the
+  lock-owning shell.
+- Their stdout goes to a caller-owned regular mode-`0600` file under the
+  admission root. An fd-identity-bound parser accepts only canonical,
+  exact-schema JSON and publishes sanitized globals; stderr never joins the
+  payload.
+- Retirement and v1 hydration callers consume explicit globals instead of
+  invoking mutating helpers in `$(...)`.
+- The production outer-lock fixture exercises real v1 hydration through
+  generation-state, retirement candidates, authority revoke, and immutable-ID
+  removal. The hostile inherited-background-child fixture remains unchanged
+  and still proves zero Docker/record/sentinel mutation.
+
+GREEN command and output:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+worker admission deployment contract tests passed
+```
+
+### Open Important 2: Signal Stop Semantics
+
+Root cause:
+
+The wrapper initially installed the full handler, later cleared pending state,
+and only then installed the pending launch handler. A signal in that interval
+could clean the operation, return to normal control flow, and still launch
+Docker. The outer deploy trap recorded a signal but did not gate later phases,
+so a validation function that caught a signal and returned zero could continue
+into preparation and mutation.
+
+RED commands and outputs:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: pre-handler TERM continued into Docker
+
+Focused baseline outer continuation:
+deploy_status=143
+calls=validate-before-signal,validate-after-signal,prepare-after-signal,mutation-after-signal
+```
+
+Shared fix:
+
+- The one-shot wrapper installs a first-signal pending handler before
+  admission-root preparation or lock acquisition.
+- Once descriptor-bound operation identity exists, it switches once to the
+  full handler. Before child PID publication the full handler only records
+  pending state; after publication it forwards the first signal, waits for the
+  exact child, and performs identity-bound cleanup.
+- A common `vp_worker_admission_raise_if_signaled` gate runs before operation
+  preparation, immediately before launch, after wait, and at outer validation,
+  transaction-preparation, and mutation boundaries.
+- Signal state is not reset between full and pending modes. Canonical
+  HUP/INT/TERM statuses remain in outer shared state even when nested callers
+  use `|| return 1`.
+- Caller traps remain installed only outside the wrapper and are restored after
+  lock/operation cleanup.
+
+GREEN command and output:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+worker admission deployment contract tests passed
+```
+
+The GREEN suite covers pre-launch TERM with zero Docker, post-spawn forwarding,
+exact record/sentinel cleanup, nested control-role calls, caller-trap
+preservation, and validation-internal HUP/INT/TERM returning canonical
+129/130/143 without entering preparation or mutation.
+
+### Open Important 3: Partial-Secret Abort
+
+Root cause:
+
+`prepared_secrets` supported record and exact-ID resume, but PREPARING had no
+durable abort phase, operation-before-delete intent, per-secret record
+completion, authority cleanup queue, or aborted DONE archive. Permanent
+preparation failure therefore retained active state forever; the
+`preserve_incomplete=true` restore branch explicitly skipped cleanup.
+
+RED commands and outputs:
+
+```text
+$ bash tests/test_worker_admission_rollback.sh
+exit 1 (begin-abort/list/intent/remove-record/finish-abort CLI absent)
+
+$ bash tests/test_worker_admission_deploy.sh
+tests/test_worker_admission_deploy.sh: line 1874:
+  vp_worker_admission_abort_preparing_transaction: command not found
+FAIL: control partial-secret prefix 1 did not abort
+
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: permanent PREPARING restore did not select durable abort
+```
+
+Shared fix:
+
+- The strict transaction schema adds `ABORTING`, `DONE` outcome `aborted`, and
+  durable abort evidence containing the failure reason and unique provisioned
+  control/runtime authority identities.
+- `begin-abort`, `list-abort`, `intent-prepared-secret-removal`,
+  `complete-prepared-secret-removal`, `complete-abort-authority`, and
+  `finish-abort` all require the shared writer lock, expected revision, common
+  relational validator, and atomic active-journal rewrite.
+- Prepared secrets are selected in reverse creation order. Before each removal,
+  all service IDs are enumerated and their exact mounted SecretIDs checked.
+  The final exact ID/name/service/generation/purpose inspect is immediately
+  followed by `docker secret rm <immutable-ID>`.
+- A successful rm atomically removes its prepared-secret record. If the
+  process dies after rm but before record completion, the persisted operation
+  permits replay to prove exact-ID absence via manager listing and complete
+  the record without a second rm.
+- Existing-but-mismatched ID or labels, mounted references, inspect/list
+  failures, and rm failures retain active evidence and perform no guessed
+  name removal.
+- After all secret records are gone, durable authority entries are revoked in
+  reverse order through the shared control/runtime revoke primitives. Only an
+  empty secret list, empty authority list, and no pending operation may enter
+  `DONE(aborted)` and archive `active.json`.
+- The permanent PREPARING restore path now invokes this abort even when
+  candidate capture is incomplete. Same-commit PREPARING remains resumable;
+  same-commit ABORTING or unarchived aborted DONE is completed before any new
+  transaction begins.
+- One-shot execution no longer clears the original four captured credential
+  records; begin/verify-preparing continue to consume the same records.
+
+GREEN commands and outputs:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+worker admission deployment contract tests passed
+
+$ bash tests/test_worker_admission_rollback.sh
+worker admission rollback transaction tests passed
+```
+
+Behavior coverage includes every control prefix 1 through 7, each worker prefix
+1 through 2, reverse deterministic removal, service-unused proof, adjacent
+inspect/rm, an rm-before-journal crash and replay with no duplicate rm,
+immutable-ID mismatch, exact-label mismatch, mounted-secret fail closed,
+authority completion, active release, and rejection of a new transaction until
+aborted DONE has been archived.
+
+### Round 2 Files
+
+- `deploy/swarm/deploy-sync-extension.sh`
+- `deploy/swarm/worker-admission-transaction.py`
+- `tests/test_worker_admission_deploy.sh`
+- `tests/test_worker_admission_rollback.sh`
+- `.superpowers/sdd/2026-07-26-production-worker-registration/task-4bc-deploy-stage1-report.md`
+
+No marker-control product code, janitor product code, janitor-install recovery,
+vision cutover, backend worker, Go, Dockerfile, CI, Task 4A, or frontend file
+changed in this round.
+
+### Round 2 Verification
+
+```text
+bash tests/test_worker_admission_deploy.sh
+  PASS: worker admission deployment contract tests passed
+bash tests/test_worker_admission_rollback.sh
+  PASS: worker admission rollback transaction tests passed
+bash tests/test_staging_object_janitor_run.sh
+  PASS: staging object janitor launcher tests passed
+bash tests/test_vp_deploy_sync_extension.sh
+  PASS: exit 0, no stdout
+bash tests/test_staging_object_janitor_install.sh
+  PASS: staging object janitor installer tests passed
+bash tests/test_worker_redis_marker_control.sh
+  PASS: worker Redis marker control tests passed
+python3 -m py_compile deploy/swarm/worker-admission-transaction.py
+  PASS
+backend/.venv/bin/ruff check deploy/swarm/worker-admission-transaction.py
+  PASS: All checks passed!
+backend/.venv/bin/mypy deploy/swarm/worker-admission-transaction.py
+  PASS: Success: no issues found in 1 source file
+```
+
+```text
+bash -n deploy/swarm/deploy-sync-extension.sh
+bash -n tests/test_worker_admission_deploy.sh
+bash -n tests/test_worker_admission_rollback.sh
+  PASS
+destructive inventory
+  PASS: one new secret-rm site; it follows service-ID unused proof and an
+        exact immutable-ID/name/service/generation/purpose inspect
+production one-shot command-substitution inventory
+  PASS: no vp_run_python_worker_container call remains inside $(...)
+changed-path allowlist
+  PASS: exactly the five Round 2 files listed above
+generated artifact check
+  PASS: no __pycache__ or .pyc remains
+git diff --check
+  PASS
+```
+
+### Round 2 Unfinished Boundary
+
+This round closes only the three Stage 1 review findings. It does not wire
+production forward/rollback phase advancement, service reconciliation,
+cutover, marker mutation boundaries, first-deploy/failed-rollback
+orchestration, or janitor install recovery. It does not claim I-3 end-to-end
+closure. No SSH, push, deploy, remote access, YouTube/canary operation, or real
+Swarm service/secret mutation was performed.
