@@ -25,6 +25,121 @@ fail() {
   exit 1
 }
 
+validate_holder() {
+  local reference="$1"
+  local holder_json
+  holder_json="$(docker container inspect "$reference" --format '{{json .}}')" \
+    || return 1
+  HOLDER_JSON="$holder_json" \
+    EXPECTED_HOLDER_NAME="$holder_name" \
+    EXPECTED_GENERATION="$generation" \
+    EXPECTED_IMAGE="$image" \
+    EXPECTED_IMAGE_ID="$image_id" \
+    EXPECTED_EVIDENCE_VOLUME="$evidence_volume" \
+    EXPECTED_VOLUME_IDENTITY="$volume_identity" \
+    python3 - <<'PY'
+import json
+import os
+import re
+import sys
+
+try:
+    holder = json.loads(os.environ["HOLDER_JSON"])
+    config = holder["Config"]
+    host = holder["HostConfig"]
+    state = holder["State"]
+    holder_id = holder["Id"]
+    labels = config.get("Labels") or {}
+    managed_labels = {
+        key: value
+        for key, value in labels.items()
+        if key.startswith("vp.videoprocess.")
+    }
+    expected_labels = {
+        "vp.videoprocess.holder":
+            "staging-object-janitor-evidence",
+        "vp.videoprocess.generation":
+            os.environ["EXPECTED_GENERATION"],
+        "vp.videoprocess.transaction":
+            "staging-object-janitor:"
+            + os.environ["EXPECTED_GENERATION"],
+        "vp.videoprocess.volume":
+            os.environ["EXPECTED_EVIDENCE_VOLUME"],
+        "vp.videoprocess.volume-identity":
+            os.environ["EXPECTED_VOLUME_IDENTITY"],
+        "vp.videoprocess.image-id":
+            os.environ["EXPECTED_IMAGE_ID"],
+    }
+    mounts = holder.get("Mounts", [])
+    mount = mounts[0] if len(mounts) == 1 else {}
+    restart = host.get("RestartPolicy") or {}
+    tmpfs = host.get("Tmpfs") or {}
+    tmp_options = set(filter(None, tmpfs.get("/tmp", "").split(",")))
+    cap_add = host.get("CapAdd") or []
+    cap_drop = host.get("CapDrop") or []
+    security_opt = set(host.get("SecurityOpt") or [])
+    status = state["Status"]
+    exit_code = state.get("ExitCode", 0)
+    valid = (
+        re.fullmatch(r"[0-9a-f]{64}", holder_id) is not None
+        and holder.get("Name") == "/" + os.environ["EXPECTED_HOLDER_NAME"]
+        and holder.get("Image") == os.environ["EXPECTED_IMAGE_ID"]
+        and config.get("Image") == os.environ["EXPECTED_IMAGE"]
+        and config.get("User") == "0:0"
+        and config.get("Entrypoint") in (None, [])
+        and config.get("Cmd")
+        == [
+            "/opt/venv/bin/python",
+            "-I",
+            "-m",
+            "app.channel_agent.staging_object_janitor_cli",
+            "prepare-evidence",
+        ]
+        and managed_labels == expected_labels
+        and host.get("AutoRemove") is False
+        and host.get("ReadonlyRootfs") is True
+        and host.get("NetworkMode") == "none"
+        and host.get("Privileged", False) is False
+        and host.get("Binds") in (None, [])
+        and restart.get("Name") == "no"
+        and restart.get("MaximumRetryCount", 0) == 0
+        and cap_drop == ["ALL"]
+        and len(cap_add) == 3
+        and set(cap_add)
+        == {"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER"}
+        and security_opt
+        in (
+            {"no-new-privileges"},
+            {"no-new-privileges:true"},
+        )
+        and set(tmpfs) == {"/tmp"}
+        and tmp_options
+        == {"rw", "nosuid", "nodev", "noexec", "mode=1777"}
+        and mount.get("Type") == "volume"
+        and mount.get("Name") == os.environ["EXPECTED_EVIDENCE_VOLUME"]
+        and mount.get("Destination")
+        == "/run/videoprocess/staging-janitor"
+        and mount.get("Driver") == "local"
+        and mount.get("RW") is True
+        and isinstance(mount.get("Source"), str)
+        and mount["Source"].startswith("/")
+        and status in {"created", "running", "exited"}
+        and isinstance(exit_code, int)
+    )
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    valid = False
+if not valid:
+    sys.exit(1)
+print(f"{holder_id}|{status}|{exit_code}")
+PY
+}
+
+if [[ "${VP_STAGING_JANITOR_LIBRARY_ONLY:-0}" == 1 ]]; then
+  [[ "${BASH_SOURCE[0]}" != "$0" ]] \
+    || fail "library-only mode must be sourced"
+  return 0
+fi
+
 [[ "$CONFIG_FILE" = /* && -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] \
   || fail "configuration is absent"
 [[ "$(file_mode "$CONFIG_FILE")" == 600 ]] \
@@ -385,115 +500,6 @@ image_id="$(docker image inspect "$image" --format '{{.Id}}')" \
 [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]] \
   || fail "holder image identity is invalid"
 
-validate_holder() {
-  local reference="$1"
-  local holder_json
-  holder_json="$(docker container inspect "$reference" --format '{{json .}}')" \
-    || return 1
-  HOLDER_JSON="$holder_json" \
-    EXPECTED_HOLDER_NAME="$holder_name" \
-    EXPECTED_GENERATION="$generation" \
-    EXPECTED_IMAGE="$image" \
-    EXPECTED_IMAGE_ID="$image_id" \
-    EXPECTED_EVIDENCE_VOLUME="$evidence_volume" \
-    EXPECTED_VOLUME_IDENTITY="$volume_identity" \
-    python3 - <<'PY'
-import json
-import os
-import re
-import sys
-
-try:
-    holder = json.loads(os.environ["HOLDER_JSON"])
-    config = holder["Config"]
-    host = holder["HostConfig"]
-    state = holder["State"]
-    holder_id = holder["Id"]
-    labels = config.get("Labels") or {}
-    managed_labels = {
-        key: value
-        for key, value in labels.items()
-        if key.startswith("vp.videoprocess.")
-    }
-    expected_labels = {
-        "vp.videoprocess.holder":
-            "staging-object-janitor-evidence",
-        "vp.videoprocess.generation":
-            os.environ["EXPECTED_GENERATION"],
-        "vp.videoprocess.transaction":
-            "staging-object-janitor:"
-            + os.environ["EXPECTED_GENERATION"],
-        "vp.videoprocess.volume":
-            os.environ["EXPECTED_EVIDENCE_VOLUME"],
-        "vp.videoprocess.volume-identity":
-            os.environ["EXPECTED_VOLUME_IDENTITY"],
-        "vp.videoprocess.image-id":
-            os.environ["EXPECTED_IMAGE_ID"],
-    }
-    mounts = holder.get("Mounts", [])
-    mount = mounts[0] if len(mounts) == 1 else {}
-    restart = host.get("RestartPolicy") or {}
-    tmpfs = host.get("Tmpfs") or {}
-    tmp_options = set(filter(None, tmpfs.get("/tmp", "").split(",")))
-    cap_add = host.get("CapAdd") or []
-    cap_drop = host.get("CapDrop") or []
-    security_opt = set(host.get("SecurityOpt") or [])
-    status = state["Status"]
-    exit_code = state.get("ExitCode", 0)
-    valid = (
-        re.fullmatch(r"[0-9a-f]{64}", holder_id) is not None
-        and holder.get("Name") == "/" + os.environ["EXPECTED_HOLDER_NAME"]
-        and holder.get("Image") == os.environ["EXPECTED_IMAGE_ID"]
-        and config.get("Image") == os.environ["EXPECTED_IMAGE"]
-        and config.get("User") == "0:0"
-        and config.get("Entrypoint") in (None, [])
-        and config.get("Cmd")
-        == [
-            "/opt/venv/bin/python",
-            "-I",
-            "-m",
-            "app.channel_agent.staging_object_janitor_cli",
-            "prepare-evidence",
-        ]
-        and managed_labels == expected_labels
-        and host.get("AutoRemove") is False
-        and host.get("ReadonlyRootfs") is True
-        and host.get("NetworkMode") == "none"
-        and host.get("Privileged", False) is False
-        and host.get("Binds") in (None, [])
-        and restart.get("Name") == "no"
-        and restart.get("MaximumRetryCount", 0) == 0
-        and cap_drop == ["ALL"]
-        and len(cap_add) == 3
-        and set(cap_add)
-        == {"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER"}
-        and security_opt
-        in (
-            {"no-new-privileges"},
-            {"no-new-privileges:true"},
-        )
-        and set(tmpfs) == {"/tmp"}
-        and tmp_options
-        == {"rw", "nosuid", "nodev", "noexec", "mode=1777"}
-        and mount.get("Type") == "volume"
-        and mount.get("Name") == os.environ["EXPECTED_EVIDENCE_VOLUME"]
-        and mount.get("Destination")
-        == "/run/videoprocess/staging-janitor"
-        and mount.get("Driver") == "local"
-        and mount.get("RW") is True
-        and isinstance(mount.get("Source"), str)
-        and mount["Source"].startswith("/")
-        and status in {"created", "running", "exited"}
-        and isinstance(exit_code, int)
-    )
-except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-    valid = False
-if not valid:
-    sys.exit(1)
-print(f"{holder_id}|{status}|{exit_code}")
-PY
-}
-
 holder_details=""
 if docker container inspect "$holder_name" >/dev/null 2>&1; then
   holder_details="$(validate_holder "$holder_name")" \
@@ -519,6 +525,7 @@ else
       --security-opt no-new-privileges \
       --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
       --mount "type=volume,src=$evidence_volume,dst=/run/videoprocess/staging-janitor" \
+      --entrypoint "" \
       "$image" \
       /opt/venv/bin/python -I -m \
       app.channel_agent.staging_object_janitor_cli prepare-evidence

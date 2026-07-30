@@ -232,6 +232,7 @@ if [[ "${1:-} ${2:-}" == "secret rm" ]]; then
   exit
 fi
 if [[ "${1:-}" == run ]]; then
+  cat >/dev/null
   control_state=""
   operation=""
   generation=""

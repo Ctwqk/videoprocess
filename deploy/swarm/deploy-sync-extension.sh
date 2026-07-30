@@ -296,10 +296,12 @@ vp_worker_service_secret_specs() {
 
 vp_python_worker_host_guard() {
   python3 - "$@" <<'PY'
+import json
 import os
 import re
 import secrets
 import stat
+import struct
 import sys
 from pathlib import Path
 
@@ -502,355 +504,910 @@ def scan_tree(
             fail()
 
 
-def ensure_run_root(
-    parent_path: Path,
-    name: str,
+def prepare_controlled_directory(
+    anchor_raw: str,
+    target_raw: str,
     uid: int,
     gid: int,
 ) -> None:
-    if name != "vp-worker-admission":
-        fail()
-    before = parent_path.lstat()
     if (
-        not stat.S_ISDIR(before.st_mode)
-        or before.st_uid != uid
-        or before.st_gid != gid
-        or stat.S_IMODE(before.st_mode) & 0o022
+        not anchor_raw.startswith("/")
+        or anchor_raw == "/"
+        or len(anchor_raw) > 4096
+        or os.path.normpath(anchor_raw) != anchor_raw
+        or any(character in anchor_raw for character in "\n\r\t")
     ):
         fail()
-    parent = os.open(parent_path, directory_flags())
-    try:
-        opened = os.fstat(parent)
-        if identity(before) != identity(opened):
-            fail()
-        try:
-            os.mkdir(name, mode=0o700, dir_fd=parent)
-        except FileExistsError:
-            pass
-        child = os.open(name, directory_flags(), dir_fd=parent)
-        try:
-            child_metadata = os.fstat(child)
-            require_directory(child_metadata, uid, gid)
-            child_path = parent_path / name
-            if identity(child_metadata) != identity(child_path.lstat()):
-                fail()
-        finally:
-            os.close(child)
-        os.fsync(parent)
-        current_parent = os.fstat(parent)
-        current_path = parent_path.lstat()
-        if (
-            not stat.S_ISDIR(current_parent.st_mode)
-            or current_parent.st_uid != uid
-            or current_parent.st_gid != gid
-            or stat.S_IMODE(current_parent.st_mode) & 0o022
-            or identity(current_parent)[:5] != identity(current_path)[:5]
-            or identity(opened)[:5] != identity(current_parent)[:5]
-        ):
-            fail()
-        print(parent_path / name)
-    finally:
-        os.close(parent)
+    anchor_components = [
+        component
+        for component in anchor_raw.split("/")
+        if component
+    ]
+    if any(component in {".", ".."} for component in anchor_components):
+        fail()
 
-
-def create_run_dir(root: Path, uid: int, gid: int) -> None:
-    root_descriptor, root_metadata = open_exact_directory(root, uid, gid)
-    try:
-        name = "one-shot-runs"
+    lexical_anchor_raw = anchor_raw
+    lexical_anchor = Path(anchor_raw)
+    lexical_current = Path("/")
+    caller_owned_ancestor = False
+    for index, component in enumerate(anchor_components):
+        lexical_current /= component
         try:
-            os.mkdir(name, mode=0o700, dir_fd=root_descriptor)
-        except FileExistsError:
-            pass
-        parent = os.open(name, directory_flags(), dir_fd=root_descriptor)
-        try:
-            parent_metadata = os.fstat(parent)
-            require_directory(parent_metadata, uid, gid)
-            parent_path = root / name
-            if identity(parent_metadata) != identity(parent_path.lstat()):
+            lexical_metadata = lexical_current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(lexical_metadata.st_mode):
+            parent_metadata = lexical_current.parent.stat()
+            if (
+                index == len(anchor_components) - 1
+                or caller_owned_ancestor
+                or lexical_metadata.st_uid != 0
+                or parent_metadata.st_uid != 0
+                or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+            ):
                 fail()
-            for _attempt in range(32):
-                run_name = f"run.{secrets.token_hex(16)}"
-                try:
-                    os.mkdir(run_name, mode=0o700, dir_fd=parent)
-                except FileExistsError:
-                    continue
-                run_metadata = os.stat(
-                    run_name,
-                    dir_fd=parent,
+        elif not stat.S_ISDIR(lexical_metadata.st_mode):
+            fail()
+        elif uid != 0 and lexical_metadata.st_uid == uid:
+            caller_owned_ancestor = True
+    try:
+        anchor_path = lexical_anchor.resolve(strict=False)
+    except (OSError, RuntimeError):
+        fail()
+    anchor_raw = str(anchor_path)
+    if (
+        not anchor_raw.startswith("/")
+        or anchor_raw == "/"
+        or os.path.normpath(anchor_raw) != anchor_raw
+    ):
+        fail()
+    anchor_components = [
+        component
+        for component in anchor_raw.split("/")
+        if component
+    ]
+    if target_raw.startswith(lexical_anchor_raw + "/"):
+        relative = target_raw[len(lexical_anchor_raw) + 1 :]
+    elif target_raw.startswith(anchor_raw + "/"):
+        relative = target_raw[len(anchor_raw) + 1 :]
+    else:
+        fail()
+    if (
+        not relative
+        or len(relative) > 1024
+        or relative.startswith("/")
+        or relative.endswith("/")
+    ):
+        fail()
+    components = relative.split("/")
+    if any(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", component)
+        is None
+        for component in components
+    ):
+        fail()
+
+    current = os.open("/", directory_flags())
+    try:
+        for component in anchor_components:
+            created = False
+            try:
+                metadata = os.stat(
+                    component,
+                    dir_fd=current,
                     follow_symlinks=False,
                 )
-                require_directory(run_metadata, uid, gid)
-                os.fsync(parent)
-                if identity(root_metadata)[:4] != identity(root.lstat())[:4]:
-                    os.rmdir(run_name, dir_fd=parent)
+            except FileNotFoundError:
+                parent = os.fstat(current)
+                if (
+                    not stat.S_ISDIR(parent.st_mode)
+                    or parent.st_uid != uid
+                    or parent.st_gid != gid
+                    or stat.S_IMODE(parent.st_mode) & 0o022
+                ):
                     fail()
-                print(parent_path / run_name)
-                return
+                os.mkdir(component, mode=0o700, dir_fd=current)
+                os.fsync(current)
+                metadata = os.stat(
+                    component,
+                    dir_fd=current,
+                    follow_symlinks=False,
+                )
+                created = True
+            if not stat.S_ISDIR(metadata.st_mode):
+                fail()
+            child = os.open(
+                component,
+                directory_flags(),
+                dir_fd=current,
+            )
+            try:
+                opened = os.fstat(child)
+                if identity(metadata) != identity(opened):
+                    fail()
+                if created:
+                    require_directory(opened, uid, gid)
+                after = os.stat(
+                    component,
+                    dir_fd=current,
+                    follow_symlinks=False,
+                )
+                if identity(opened) != identity(after):
+                    fail()
+            except Exception:
+                os.close(child)
+                raise
+            os.close(current)
+            current = child
+
+        opened_anchor = os.fstat(current)
+        if (
+            not stat.S_ISDIR(opened_anchor.st_mode)
+            or opened_anchor.st_uid != uid
+            or opened_anchor.st_gid != gid
+            or stat.S_IMODE(opened_anchor.st_mode) & 0o022
+        ):
             fail()
-        finally:
-            os.close(parent)
+        for index, component in enumerate(components):
+            created = False
+            try:
+                metadata = os.stat(
+                    component,
+                    dir_fd=current,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                os.mkdir(component, mode=0o700, dir_fd=current)
+                os.fsync(current)
+                metadata = os.stat(
+                    component,
+                    dir_fd=current,
+                    follow_symlinks=False,
+                )
+                created = True
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != uid
+                or metadata.st_gid != gid
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                fail()
+            child = os.open(
+                component,
+                directory_flags(),
+                dir_fd=current,
+            )
+            try:
+                opened = os.fstat(child)
+                if identity(metadata) != identity(opened):
+                    fail()
+                if index == len(components) - 1:
+                    os.fchmod(child, 0o700)
+                    os.fsync(child)
+                    opened = os.fstat(child)
+                    require_directory(opened, uid, gid)
+                elif created:
+                    require_directory(opened, uid, gid)
+                after = os.stat(
+                    component,
+                    dir_fd=current,
+                    follow_symlinks=False,
+                )
+                if identity(opened) != identity(after):
+                    fail()
+            except Exception:
+                os.close(child)
+                raise
+            os.close(current)
+            current = child
+
+        current_anchor = anchor_path.lstat()
+        if (
+            identity(opened_anchor)[:5]
+            != identity(current_anchor)[:5]
+        ):
+            fail()
+        target = anchor_path.joinpath(*components)
+        target_metadata = os.fstat(current)
+        require_directory(target_metadata, uid, gid)
+        print(
+            f"{target}|"
+            + ",".join(str(value) for value in identity(target_metadata))
+        )
     finally:
-        os.close(root_descriptor)
+        os.close(current)
 
 
-def stage_file(
-    source: Path,
-    destination: Path,
+def write_all(descriptor: int, payload: bytes | bytearray) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written < 1:
+            fail()
+        view = view[written:]
+
+
+def read_limited(descriptor: int, limit: int) -> bytes:
+    payload = bytearray()
+    while True:
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            return bytes(payload)
+        payload.extend(chunk)
+        if len(payload) > limit:
+            fail()
+
+
+def metadata_record(metadata: os.stat_result) -> str:
+    return ",".join(str(value) for value in identity(metadata))
+
+
+def capture_file_record(
+    path: Path,
     uid: int,
     gid: int,
     mode: int,
 ) -> None:
-    source_descriptor, source_metadata = capture_file(
-        source,
-        uid,
-        gid,
-        mode,
-    )
-    destination_parent = exact_path(str(destination.parent))
-    parent_descriptor, _parent_metadata = open_exact_directory(
-        destination_parent,
-        uid,
-        gid,
-    )
-    created = False
+    descriptor, metadata = capture_file(path, uid, gid, mode)
     try:
-        payload = bytearray()
-        while True:
-            chunk = os.read(source_descriptor, 65536)
-            if not chunk:
-                break
-            payload.extend(chunk)
-            if len(payload) > 1048576:
-                fail()
-        if identity(source_metadata) != identity(os.fstat(source_descriptor)):
+        if identity(metadata) != identity(path.lstat()):
             fail()
-        if identity(source_metadata) != identity(source.lstat()):
-            fail()
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_CLOEXEC
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        output = os.open(
-            destination.name,
-            flags,
-            mode,
-            dir_fd=parent_descriptor,
-        )
-        created = True
-        try:
-            view = memoryview(payload)
-            while view:
-                written = os.write(output, view)
-                if written < 1:
-                    fail()
-                view = view[written:]
-            os.fchmod(output, mode)
-            os.fsync(output)
-            require_file(os.fstat(output), uid, gid, mode)
-        finally:
-            os.close(output)
-        os.fsync(parent_descriptor)
-        if identity(source_metadata) != identity(source.lstat()):
-            fail()
-        print(",".join(str(value) for value in identity(source_metadata)))
-    except Exception:
-        if created:
-            try:
-                os.unlink(destination.name, dir_fd=parent_descriptor)
-            except OSError:
-                pass
-        raise
-    finally:
-        os.close(parent_descriptor)
-        os.close(source_descriptor)
-
-
-def prepare_directory(
-    path: Path,
-    uid: int,
-    gid: int,
-    sentinel_name: str,
-    marker: str,
-) -> None:
-    if not re.fullmatch(r"\.vp-python-worker-bind-[0-9a-f]{32}", sentinel_name):
-        fail()
-    if (
-        not marker
-        or len(marker) > 512
-        or "\n" in marker
-        or "\r" in marker
-        or "|" in marker
-    ):
-        fail()
-    descriptor, metadata = open_exact_directory(path, uid, gid)
-    created = False
-    try:
-        scan_tree(descriptor, metadata.st_dev, uid, gid)
-        output = os.open(
-            sentinel_name,
-            (
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | os.O_CLOEXEC
-                | getattr(os, "O_NOFOLLOW", 0)
-            ),
-            0o400,
-            dir_fd=descriptor,
-        )
-        created = True
-        try:
-            encoded = marker.encode("ascii")
-            if os.write(output, encoded) != len(encoded):
-                fail()
-            os.fchmod(output, 0o400)
-            os.fsync(output)
-            require_file(os.fstat(output), uid, gid, 0o400)
-        finally:
-            os.close(output)
-        os.fsync(descriptor)
-        current = path.lstat()
-        require_directory(current, uid, gid)
-        if (
-            current.st_dev != metadata.st_dev
-            or current.st_ino != metadata.st_ino
-        ):
-            fail()
-        print(f"{metadata.st_dev},{metadata.st_ino}")
-    except Exception:
-        if created:
-            try:
-                os.unlink(sentinel_name, dir_fd=descriptor)
-            except OSError:
-                pass
-        raise
+        print(metadata_record(metadata))
     finally:
         os.close(descriptor)
 
 
-def finalize_directory(
-    path: Path,
+def stream_payloads(
     uid: int,
     gid: int,
-    sentinel_name: str,
-    marker: str,
-    record: str,
+    arguments: list[str],
 ) -> None:
-    descriptor, metadata = open_exact_directory(path, uid, gid)
-    try:
-        if record != f"{metadata.st_dev},{metadata.st_ino}":
+    if not arguments or len(arguments) % 3 or len(arguments) > 6:
+        fail()
+    payloads: list[bytes] = []
+    for index in range(0, len(arguments), 3):
+        path = exact_path(arguments[index])
+        mode = int(arguments[index + 1], 8)
+        record = arguments[index + 2]
+        if mode not in {0o400, 0o600}:
             fail()
-        scan_tree(descriptor, metadata.st_dev, uid, gid)
+        descriptor, metadata = capture_file(path, uid, gid, mode)
+        try:
+            if metadata_record(metadata) != record:
+                fail()
+            payload = read_limited(descriptor, 1048576)
+            if identity(metadata) != identity(os.fstat(descriptor)):
+                fail()
+            if identity(metadata) != identity(path.lstat()):
+                fail()
+            payloads.append(payload)
+        finally:
+            os.close(descriptor)
+    output = sys.stdout.buffer
+    output.write(b"VPW1")
+    output.write(bytes([len(payloads)]))
+    for payload in payloads:
+        output.write(struct.pack(">Q", len(payload)))
+        output.write(payload)
+    output.flush()
+
+
+def remove_legacy_sentinels(
+    descriptor: int,
+    uid: int,
+    gid: int,
+) -> None:
+    for name in sorted(os.listdir(descriptor)):
+        matched = re.fullmatch(
+            r"\.vp-python-worker-bind-([0-9a-f]{32})",
+            name,
+        )
+        if matched is None:
+            continue
+        metadata = os.stat(
+            name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        require_file(metadata, uid, gid, 0o400)
         sentinel = os.open(
-            sentinel_name,
+            name,
             file_flags(),
             dir_fd=descriptor,
         )
         try:
-            sentinel_metadata = os.fstat(sentinel)
-            require_file(sentinel_metadata, uid, gid, 0o400)
-            payload = os.read(sentinel, 1024)
-            if payload != marker.encode("ascii") or os.read(sentinel, 1):
+            opened = os.fstat(sentinel)
+            require_file(opened, uid, gid, 0o400)
+            if identity(metadata) != identity(opened):
                 fail()
-            path_metadata = os.stat(
-                sentinel_name,
-                dir_fd=descriptor,
-                follow_symlinks=False,
-            )
-            if identity(path_metadata) != identity(sentinel_metadata):
+            payload = read_limited(sentinel, 1024)
+            expected = (
+                f"vp-python-worker-bind-v1:{matched.group(1)}:"
+                f"{uid}:{gid}"
+            ).encode("ascii")
+            if payload != expected:
                 fail()
         finally:
             os.close(sentinel)
-        os.unlink(sentinel_name, dir_fd=descriptor)
+        os.unlink(name, dir_fd=descriptor)
         os.fsync(descriptor)
-        current = path.lstat()
-        require_directory(current, uid, gid)
-        if (
-            current.st_dev != metadata.st_dev
-            or current.st_ino != metadata.st_ino
-        ):
-            fail()
-    finally:
-        os.close(descriptor)
 
 
-def cleanup_run_dir(path: Path, uid: int, gid: int) -> None:
-    if not re.fullmatch(r"run\.[0-9a-f]{32}", path.name):
-        fail()
-    parent_path = exact_path(str(path.parent))
-    if parent_path.name != "one-shot-runs":
-        fail()
-    parent, _parent_metadata = open_exact_directory(parent_path, uid, gid)
+def operation_root(
+    admission_descriptor: int,
+    uid: int,
+    gid: int,
+) -> int:
+    name = "one-shot-operations"
     try:
-        child = os.open(path.name, directory_flags(), dir_fd=parent)
-        try:
-            child_metadata = os.fstat(child)
-            require_directory(child_metadata, uid, gid)
-            if identity(child_metadata) != identity(path.lstat()):
-                fail()
-            for name in os.listdir(child):
-                if not re.fullmatch(
-                    r"(bootstrap-secret|bind-file-[0-9]+)",
-                    name,
-                ):
-                    fail()
-                metadata = os.stat(
-                    name,
-                    dir_fd=child,
-                    follow_symlinks=False,
-                )
-                mode = stat.S_IMODE(metadata.st_mode)
-                if mode not in {0o400, 0o600}:
-                    fail()
-                require_file(metadata, uid, gid, mode)
-                os.unlink(name, dir_fd=child)
-            os.fsync(child)
-        finally:
-            os.close(child)
-        current = os.stat(
-            path.name,
-            dir_fd=parent,
+        os.mkdir(name, mode=0o700, dir_fd=admission_descriptor)
+        os.fsync(admission_descriptor)
+    except FileExistsError:
+        pass
+    metadata = os.stat(
+        name,
+        dir_fd=admission_descriptor,
+        follow_symlinks=False,
+    )
+    require_directory(metadata, uid, gid)
+    descriptor = os.open(
+        name,
+        directory_flags(),
+        dir_fd=admission_descriptor,
+    )
+    opened = os.fstat(descriptor)
+    require_directory(opened, uid, gid)
+    if identity(metadata) != identity(opened):
+        os.close(descriptor)
+        fail()
+    return descriptor
+
+
+def reconcile_legacy_runs(
+    admission_descriptor: int,
+    uid: int,
+    gid: int,
+) -> None:
+    name = "one-shot-runs"
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=admission_descriptor,
             follow_symlinks=False,
         )
+    except FileNotFoundError:
+        return
+    require_directory(metadata, uid, gid)
+    runs = os.open(
+        name,
+        directory_flags(),
+        dir_fd=admission_descriptor,
+    )
+    try:
+        if identity(metadata) != identity(os.fstat(runs)):
+            fail()
+        for run_name in sorted(os.listdir(runs)):
+            if re.fullmatch(r"run\.[0-9a-f]{32}", run_name) is None:
+                fail()
+            run_metadata = os.stat(
+                run_name,
+                dir_fd=runs,
+                follow_symlinks=False,
+            )
+            require_directory(run_metadata, uid, gid)
+            run = os.open(
+                run_name,
+                directory_flags(),
+                dir_fd=runs,
+            )
+            try:
+                if identity(run_metadata) != identity(os.fstat(run)):
+                    fail()
+                for entry in sorted(os.listdir(run)):
+                    if re.fullmatch(
+                        r"(bootstrap-secret|bind-file-[0-9]+)",
+                        entry,
+                    ) is None:
+                        fail()
+                    entry_metadata = os.stat(
+                        entry,
+                        dir_fd=run,
+                        follow_symlinks=False,
+                    )
+                    mode = stat.S_IMODE(entry_metadata.st_mode)
+                    if mode not in {0o400, 0o600}:
+                        fail()
+                    require_file(entry_metadata, uid, gid, mode)
+                    os.unlink(entry, dir_fd=run)
+                os.fsync(run)
+            finally:
+                os.close(run)
+            os.rmdir(run_name, dir_fd=runs)
+            os.fsync(runs)
+        if os.listdir(runs):
+            fail()
+    finally:
+        os.close(runs)
+    os.rmdir(name, dir_fd=admission_descriptor)
+    os.fsync(admission_descriptor)
+
+
+def parse_operation(
+    payload: bytes,
+    expected_name: str,
+    uid: int,
+    gid: int,
+) -> dict[str, object]:
+    try:
+        operation = json.loads(payload)
         if (
-            current.st_dev != child_metadata.st_dev
-            or current.st_ino != child_metadata.st_ino
+            not isinstance(operation, dict)
+            or set(operation)
+            != {"bindings", "gid", "operation_id", "uid", "version"}
+            or operation["version"] != 1
+            or operation["operation_id"] != expected_name
+            or operation["uid"] != uid
+            or operation["gid"] != gid
+            or not isinstance(operation["bindings"], list)
+            or not 1 <= len(operation["bindings"]) <= 3
         ):
             fail()
-        os.rmdir(path.name, dir_fd=parent)
-        os.fsync(parent)
+        seen_paths: set[str] = set()
+        seen_targets: set[str] = set()
+        for binding in operation["bindings"]:
+            if (
+                not isinstance(binding, dict)
+                or set(binding)
+                != {
+                    "device",
+                    "inode",
+                    "marker",
+                    "path",
+                    "sentinel",
+                    "target",
+                }
+                or not isinstance(binding["device"], int)
+                or binding["device"] < 0
+                or not isinstance(binding["inode"], int)
+                or binding["inode"] < 1
+                or binding["target"]
+                not in {"/control-state", "/runtime-state", "/requests"}
+                or not isinstance(binding["path"], str)
+            ):
+                fail()
+            exact_path(binding["path"])
+            sentinel_match = re.fullmatch(
+                r"\.vp-python-worker-bind-([0-9a-f]{32})",
+                binding["sentinel"],
+            )
+            if sentinel_match is None:
+                fail()
+            expected_marker = (
+                f"vp-python-worker-bind-v2:{expected_name}:"
+                f"{sentinel_match.group(1)}:{uid}:{gid}:"
+                f"{binding['target']}"
+            )
+            if binding["marker"] != expected_marker:
+                fail()
+            if (
+                binding["path"] in seen_paths
+                or binding["target"] in seen_targets
+            ):
+                fail()
+            seen_paths.add(binding["path"])
+            seen_targets.add(binding["target"])
+        return operation
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        fail()
+
+
+def read_operation(
+    operation_descriptor: int,
+    operation_name: str,
+    uid: int,
+    gid: int,
+) -> dict[str, object]:
+    entries = sorted(os.listdir(operation_descriptor))
+    if entries != ["operation.json"]:
+        fail()
+    metadata = os.stat(
+        "operation.json",
+        dir_fd=operation_descriptor,
+        follow_symlinks=False,
+    )
+    require_file(metadata, uid, gid, 0o600)
+    descriptor = os.open(
+        "operation.json",
+        file_flags(),
+        dir_fd=operation_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        require_file(opened, uid, gid, 0o600)
+        if identity(metadata) != identity(opened):
+            fail()
+        payload = read_limited(descriptor, 65536)
     finally:
-        os.close(parent)
+        os.close(descriptor)
+    return parse_operation(payload, operation_name, uid, gid)
+
+
+def cleanup_operation(
+    operations: int,
+    operation_name: str,
+    uid: int,
+    gid: int,
+    require_sentinels: bool,
+) -> None:
+    if re.fullmatch(r"op\.[0-9a-f]{32}", operation_name) is None:
+        fail()
+    metadata = os.stat(
+        operation_name,
+        dir_fd=operations,
+        follow_symlinks=False,
+    )
+    require_directory(metadata, uid, gid)
+    operation_descriptor = os.open(
+        operation_name,
+        directory_flags(),
+        dir_fd=operations,
+    )
+    try:
+        opened = os.fstat(operation_descriptor)
+        require_directory(opened, uid, gid)
+        if identity(metadata) != identity(opened):
+            fail()
+        try:
+            operation = read_operation(
+                operation_descriptor,
+                operation_name,
+                uid,
+                gid,
+            )
+        except Exception:
+            entries = sorted(os.listdir(operation_descriptor))
+            if entries == []:
+                pass
+            elif entries == ["operation.json"]:
+                record = os.stat(
+                    "operation.json",
+                    dir_fd=operation_descriptor,
+                    follow_symlinks=False,
+                )
+                require_file(record, uid, gid, 0o600)
+                os.unlink("operation.json", dir_fd=operation_descriptor)
+                os.fsync(operation_descriptor)
+            else:
+                raise
+            operation = None
+        if operation is not None:
+            for binding in operation["bindings"]:
+                path = exact_path(binding["path"])
+                descriptor, path_metadata = open_exact_directory(
+                    path,
+                    uid,
+                    gid,
+                )
+                try:
+                    if (
+                        path_metadata.st_dev != binding["device"]
+                        or path_metadata.st_ino != binding["inode"]
+                    ):
+                        fail()
+                    scan_tree(
+                        descriptor,
+                        path_metadata.st_dev,
+                        uid,
+                        gid,
+                    )
+                    try:
+                        sentinel_metadata = os.stat(
+                            binding["sentinel"],
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        if require_sentinels:
+                            fail()
+                        continue
+                    require_file(
+                        sentinel_metadata,
+                        uid,
+                        gid,
+                        0o400,
+                    )
+                    sentinel = os.open(
+                        binding["sentinel"],
+                        file_flags(),
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        opened_sentinel = os.fstat(sentinel)
+                        require_file(
+                            opened_sentinel,
+                            uid,
+                            gid,
+                            0o400,
+                        )
+                        if identity(sentinel_metadata) != identity(
+                            opened_sentinel
+                        ):
+                            fail()
+                        sentinel_payload = read_limited(sentinel, 1024)
+                        expected = binding["marker"].encode("ascii")
+                        if require_sentinels:
+                            if sentinel_payload != expected:
+                                fail()
+                        elif not expected.startswith(sentinel_payload):
+                            fail()
+                    finally:
+                        os.close(sentinel)
+                    os.unlink(
+                        binding["sentinel"],
+                        dir_fd=descriptor,
+                    )
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            os.unlink("operation.json", dir_fd=operation_descriptor)
+            os.fsync(operation_descriptor)
+    finally:
+        os.close(operation_descriptor)
+    os.rmdir(operation_name, dir_fd=operations)
+    os.fsync(operations)
+
+
+def reconcile_operations(
+    admission_path: Path,
+    uid: int,
+    gid: int,
+) -> tuple[int, int]:
+    admission, _metadata = open_exact_directory(
+        admission_path,
+        uid,
+        gid,
+    )
+    try:
+        reconcile_legacy_runs(admission, uid, gid)
+        operations = operation_root(admission, uid, gid)
+    except Exception:
+        os.close(admission)
+        raise
+    for operation_name in sorted(os.listdir(operations)):
+        cleanup_operation(
+            operations,
+            operation_name,
+            uid,
+            gid,
+            False,
+        )
+    return admission, operations
+
+
+def prepare_operation(
+    admission_path: Path,
+    uid: int,
+    gid: int,
+    arguments: list[str],
+) -> None:
+    if len(arguments) % 2 or len(arguments) > 6:
+        fail()
+    admission, operations = reconcile_operations(
+        admission_path,
+        uid,
+        gid,
+    )
+    binding_descriptors: list[int] = []
+    try:
+        bindings: list[dict[str, object]] = []
+        seen_targets: set[str] = set()
+        seen_paths: set[str] = set()
+        for index in range(0, len(arguments), 2):
+            path = exact_path(arguments[index])
+            target = arguments[index + 1]
+            if (
+                target
+                not in {"/control-state", "/runtime-state", "/requests"}
+                or str(path) in seen_paths
+                or target in seen_targets
+            ):
+                fail()
+            descriptor, metadata = open_exact_directory(path, uid, gid)
+            try:
+                remove_legacy_sentinels(descriptor, uid, gid)
+                scan_tree(descriptor, metadata.st_dev, uid, gid)
+            except Exception:
+                os.close(descriptor)
+                raise
+            binding_descriptors.append(descriptor)
+            seen_paths.add(str(path))
+            seen_targets.add(target)
+            bindings.append(
+                {
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "path": str(path),
+                    "target": target,
+                }
+            )
+        if not bindings:
+            print("-")
+            return
+
+        operation_name = f"op.{secrets.token_hex(16)}"
+        os.mkdir(operation_name, mode=0o700, dir_fd=operations)
+        operation_descriptor = os.open(
+            operation_name,
+            directory_flags(),
+            dir_fd=operations,
+        )
+        try:
+            require_directory(
+                os.fstat(operation_descriptor),
+                uid,
+                gid,
+            )
+            for binding in bindings:
+                token = secrets.token_hex(16)
+                binding["sentinel"] = (
+                    f".vp-python-worker-bind-{token}"
+                )
+                binding["marker"] = (
+                    f"vp-python-worker-bind-v2:{operation_name}:"
+                    f"{token}:{uid}:{gid}:{binding['target']}"
+                )
+            operation = {
+                "bindings": bindings,
+                "gid": gid,
+                "operation_id": operation_name,
+                "uid": uid,
+                "version": 1,
+            }
+            encoded = json.dumps(
+                operation,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            record = os.open(
+                "operation.json",
+                (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | getattr(os, "O_NOFOLLOW", 0)
+                ),
+                0o600,
+                dir_fd=operation_descriptor,
+            )
+            try:
+                write_all(record, encoded)
+                os.fchmod(record, 0o600)
+                os.fsync(record)
+                require_file(os.fstat(record), uid, gid, 0o600)
+            finally:
+                os.close(record)
+            os.fsync(operation_descriptor)
+            os.fsync(operations)
+
+            for binding, descriptor in zip(
+                bindings,
+                binding_descriptors,
+                strict=True,
+            ):
+                sentinel = os.open(
+                    binding["sentinel"],
+                    (
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_CLOEXEC
+                        | getattr(os, "O_NOFOLLOW", 0)
+                    ),
+                    0o400,
+                    dir_fd=descriptor,
+                )
+                try:
+                    write_all(
+                        sentinel,
+                        binding["marker"].encode("ascii"),
+                    )
+                    os.fchmod(sentinel, 0o400)
+                    os.fsync(sentinel)
+                    require_file(
+                        os.fstat(sentinel),
+                        uid,
+                        gid,
+                        0o400,
+                    )
+                finally:
+                    os.close(sentinel)
+                os.fsync(descriptor)
+        finally:
+            os.close(operation_descriptor)
+        print(operation_name)
+        for binding in bindings:
+            print(
+                f"{binding['target']}|{binding['sentinel']}|"
+                f"{binding['marker']}"
+            )
+    finally:
+        for descriptor in binding_descriptors:
+            os.close(descriptor)
+        os.close(operations)
+        os.close(admission)
+
+
+def finish_operation(
+    admission_path: Path,
+    operation_name: str,
+    uid: int,
+    gid: int,
+) -> None:
+    admission, _metadata = open_exact_directory(
+        admission_path,
+        uid,
+        gid,
+    )
+    try:
+        operations = operation_root(admission, uid, gid)
+        try:
+            cleanup_operation(
+                operations,
+                operation_name,
+                uid,
+                gid,
+                True,
+            )
+        finally:
+            os.close(operations)
+    finally:
+        os.close(admission)
 
 
 try:
     action = sys.argv[1]
-    if action == "create-run-dir" and len(sys.argv) == 5:
-        create_run_dir(
-            exact_path(sys.argv[2]),
-            numeric(sys.argv[3]),
-            numeric(sys.argv[4]),
-        )
-    elif action == "ensure-run-root" and len(sys.argv) == 6:
-        ensure_run_root(
-            exact_path(sys.argv[2]),
+    if action == "prepare-controlled-directory" and len(sys.argv) == 6:
+        prepare_controlled_directory(
+            sys.argv[2],
             sys.argv[3],
             numeric(sys.argv[4]),
             numeric(sys.argv[5]),
         )
-    elif action == "stage-file" and len(sys.argv) == 7:
-        mode = int(sys.argv[6], 8)
+    elif action == "capture-file-record" and len(sys.argv) == 6:
+        mode = int(sys.argv[5], 8)
         if mode not in {0o400, 0o600}:
             fail()
-        stage_file(
+        capture_file_record(
             exact_path(sys.argv[2]),
-            Path(sys.argv[3]),
+            numeric(sys.argv[3]),
+            numeric(sys.argv[4]),
+            mode,
+        )
+    elif action == "stream-payloads" and len(sys.argv) >= 7:
+        stream_payloads(
+            numeric(sys.argv[2]),
+            numeric(sys.argv[3]),
+            sys.argv[4:],
+        )
+    elif action == "prepare-operation" and len(sys.argv) >= 5:
+        prepare_operation(
+            exact_path(sys.argv[2]),
+            numeric(sys.argv[3]),
+            numeric(sys.argv[4]),
+            sys.argv[5:],
+        )
+    elif action == "finish-operation" and len(sys.argv) == 6:
+        finish_operation(
+            exact_path(sys.argv[2]),
+            sys.argv[3],
             numeric(sys.argv[4]),
             numeric(sys.argv[5]),
-            mode,
         )
     elif action == "verify-file" and len(sys.argv) == 7:
         mode = int(sys.argv[5], 8)
@@ -863,34 +1420,35 @@ try:
             mode,
             sys.argv[6],
         )
-    elif action == "prepare-directory" and len(sys.argv) == 8:
-        prepare_directory(
-            exact_path(sys.argv[2]),
-            numeric(sys.argv[3]),
-            numeric(sys.argv[4]),
-            sys.argv[5],
-            sys.argv[6],
-        )
-    elif action == "finalize-directory" and len(sys.argv) == 9:
-        finalize_directory(
-            exact_path(sys.argv[2]),
-            numeric(sys.argv[3]),
-            numeric(sys.argv[4]),
-            sys.argv[5],
-            sys.argv[6],
-            sys.argv[7],
-        )
-    elif action == "cleanup-run-dir" and len(sys.argv) == 5:
-        cleanup_run_dir(
-            exact_path(sys.argv[2]),
-            numeric(sys.argv[3]),
-            numeric(sys.argv[4]),
-        )
     else:
         fail()
 except Exception:
     sys.exit(1)
 PY
+}
+
+vp_python_worker_prepare_controlled_directory() {
+  local target="$1"
+  [[ -n "${ROOT:-}" && "$ROOT" = /* && "$target" = /* ]] \
+    || return 1
+  local caller_uid
+  local caller_gid
+  caller_uid="$(id -u)" || return 1
+  caller_gid="$(id -g)" || return 1
+  [[ "$caller_uid" =~ ^[0-9]+$ && "$caller_gid" =~ ^[0-9]+$ ]] \
+    || return 1
+  local result
+  result="$(
+    vp_python_worker_host_guard \
+      prepare-controlled-directory \
+      "$ROOT" "$target" "$caller_uid" "$caller_gid"
+  )" || return 1
+  local path="${result%%|*}"
+  local record="${result#*|}"
+  [[ "$path" = /* && "$record" != "$result" \
+    && "$record" =~ ^[0-9]+,[0-9]+,[0-9]+,[0-9]+,448,[0-9]+,[0-9]+,[0-9]+,[0-9]+$ ]] \
+    || return 1
+  printf '%s\n' "$path"
 }
 
 vp_run_python_worker_container() {
@@ -930,7 +1488,14 @@ vp_run_python_worker_container() {
   local bind_sources=()
   local bind_targets=()
   local bind_readonly=()
-  local bind_file_modes=()
+  local payload_sources=()
+  local payload_targets=()
+  local payload_modes=()
+  if [[ -n "$secret_source" ]]; then
+    payload_sources+=("$secret_source")
+    payload_targets+=("/run/secrets/$secret_target")
+    payload_modes+=(0400)
+  fi
   local seen_targets="|"
   while [[ "$#" -gt 0 && "$1" != -- ]]; do
     case "$1" in
@@ -960,7 +1525,6 @@ vp_run_python_worker_container() {
         local readonly_suffix="${BASH_REMATCH[3]}"
         [[ "$bind_source" = /* && "$seen_targets" != *"|$bind_target|"* ]] \
           || return 1
-        local file_mode=""
         case "$bind_target" in
           /control-state|/runtime-state|/requests)
             if [[ ",$prepare_dirs," == *",$bind_target,"* ]]; then
@@ -968,19 +1532,20 @@ vp_run_python_worker_container() {
             else
               [[ "$readonly_suffix" == ,readonly ]] || return 1
             fi
+            bind_sources+=("$bind_source")
+            bind_targets+=("$bind_target")
+            bind_readonly+=("$readonly_suffix")
             ;;
           /run/control/upsert.json)
             [[ "$readonly_suffix" == ,readonly ]] || return 1
-            file_mode=0600
+            payload_sources+=("$bind_source")
+            payload_targets+=("$bind_target")
+            payload_modes+=(0600)
             ;;
           *)
             return 1
             ;;
         esac
-        bind_sources+=("$bind_source")
-        bind_targets+=("$bind_target")
-        bind_readonly+=("$readonly_suffix")
-        bind_file_modes+=("$file_mode")
         seen_targets+="$bind_target|"
         shift 2
         ;;
@@ -998,185 +1563,264 @@ vp_run_python_worker_container() {
     [[ "$seen_targets" == *"|$required_path|"* ]] || return 1
   done
 
-  local guard_names=()
-  local guard_markers=()
-  local guard_records=()
-  local guard_indices=""
-  local prepared_guard_indices=""
-  local bind_manifest=""
-  local run_dir=""
   local admission_root
-  local staged_secret=""
-  local secret_record=""
-  local staged_sources=()
-  local staged_records=()
-  local needs_run_dir=false
+  admission_root="$(vp_worker_admission_root)" || return 1
+  admission_root="$(
+    vp_python_worker_prepare_controlled_directory "$admission_root"
+  )" || return 1
+
+  local payload_records=()
+  local stream_arguments=()
   local index
-  [[ -n "$secret_source" ]] && needs_run_dir=true
-  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
-    [[ -n "${bind_file_modes[$index]}" ]] && needs_run_dir=true
-  done
-  if [[ "$needs_run_dir" == true ]]; then
-    admission_root="$(vp_worker_admission_root)" || return 1
-    local admission_parent="${admission_root%/*}"
-    local admission_name="${admission_root##*/}"
-    admission_root="$(
+  for ((index = 0; index < ${#payload_sources[@]}; index++)); do
+    local payload_record
+    payload_record="$(
       vp_python_worker_host_guard \
-        ensure-run-root "$admission_parent" "$admission_name" \
-        "$caller_uid" "$caller_gid"
-    )" || return 1
-    run_dir="$(
-      vp_python_worker_host_guard \
-        create-run-dir "$admission_root" "$caller_uid" "$caller_gid"
-    )" || return 1
-  fi
-  if [[ -n "$secret_source" ]]; then
-    staged_secret="$run_dir/bootstrap-secret"
-    secret_record="$(
-      vp_python_worker_host_guard \
-        stage-file "$secret_source" "$staged_secret" \
-        "$caller_uid" "$caller_gid" 0400
-    )" || {
-      vp_python_worker_host_guard \
-        cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" \
-        >/dev/null 2>&1 || true
-      return 1
-    }
-  fi
-
-  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
-    [[ -n "${bind_file_modes[$index]}" ]] || continue
-    local staged_record
-    staged_record="$(
-      vp_python_worker_host_guard \
-        stage-file "${bind_sources[$index]}" "$run_dir/bind-file-$index" \
-        "$caller_uid" "$caller_gid" "${bind_file_modes[$index]}"
-    )" || {
-      vp_python_worker_host_guard \
-        cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" \
-        >/dev/null 2>&1 || true
-      return 1
-    }
-    staged_sources[$index]="${bind_sources[$index]}"
-    staged_records[$index]="$staged_record"
-  done
-
-  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
-    [[ -z "${bind_file_modes[$index]}" ]] || continue
-    local token
-    token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')" \
-      || {
-        if [[ -n "$run_dir" ]]; then
-          vp_python_worker_host_guard \
-            cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" \
-            >/dev/null 2>&1 || true
-        fi
-        return 1
-      }
-    guard_names[$index]=".vp-python-worker-bind-$token"
-    guard_markers[$index]="vp-python-worker-bind-v1:$token:$caller_uid:$caller_gid"
-    guard_indices+=" $index"
-  done
-
-  for index in $guard_indices; do
-    local guard_record
-    if ! guard_record="$(
-      vp_python_worker_host_guard \
-        prepare-directory \
-        "${bind_sources[$index]}" \
+        capture-file-record \
+        "${payload_sources[$index]}" \
         "$caller_uid" \
         "$caller_gid" \
-        "${guard_names[$index]}" \
-        "${guard_markers[$index]}" \
-        "${bind_targets[$index]}"
-    )"; then
-      local cleanup_index
-      for cleanup_index in $prepared_guard_indices; do
-        vp_python_worker_host_guard \
-          finalize-directory \
-          "${bind_sources[$cleanup_index]}" \
-          "$caller_uid" \
-          "$caller_gid" \
-          "${guard_names[$cleanup_index]}" \
-          "${guard_markers[$cleanup_index]}" \
-          "${guard_records[$cleanup_index]}" \
-          "${bind_targets[$cleanup_index]}" >/dev/null 2>&1 || true
-      done
-      if [[ -n "$run_dir" ]]; then
-        vp_python_worker_host_guard \
-          cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" \
-          >/dev/null 2>&1 || true
-      fi
-      return 1
+        "${payload_modes[$index]}"
+    )" || return 1
+    payload_records[$index]="$payload_record"
+    stream_arguments+=(
+      "${payload_sources[$index]}"
+      "${payload_modes[$index]}"
+      "$payload_record"
+    )
+  done
+
+  local operation_arguments=()
+  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
+    operation_arguments+=(
+      "${bind_sources[$index]}"
+      "${bind_targets[$index]}"
+    )
+  done
+  local operation_output
+  if (( ${#operation_arguments[@]} > 0 )); then
+    operation_output="$(
+      vp_python_worker_host_guard \
+        prepare-operation "$admission_root" "$caller_uid" "$caller_gid" \
+        "${operation_arguments[@]}"
+    )" || return 1
+  else
+    operation_output="$(
+      vp_python_worker_host_guard \
+        prepare-operation "$admission_root" "$caller_uid" "$caller_gid"
+    )" || return 1
+  fi
+  local operation_name="$operation_output"
+  local bind_manifest=""
+  if [[ "$operation_output" == *$'\n'* ]]; then
+    operation_name="${operation_output%%$'\n'*}"
+    bind_manifest="${operation_output#*$'\n'}"
+  fi
+  if [[ "$operation_name" == - ]]; then
+    [[ -z "$bind_manifest" && ${#bind_sources[@]} -eq 0 ]] || return 1
+  elif [[ ! "$operation_name" =~ ^op\.[0-9a-f]{32}$ \
+    || -z "$bind_manifest" \
+    || ${#bind_sources[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  local payload_manifest=""
+  local needs_control_tmpfs=false
+  for ((index = 0; index < ${#payload_targets[@]}; index++)); do
+    payload_manifest+="${payload_manifest:+;}${payload_targets[$index]}:${payload_modes[$index]}"
+    if [[ "${payload_targets[$index]}" == /run/control/upsert.json ]]; then
+      needs_control_tmpfs=true
     fi
-    guard_records[$index]="$guard_record"
-    prepared_guard_indices+=" $index"
-    bind_manifest+="${bind_manifest:+$'\n'}${bind_targets[$index]}|${guard_names[$index]}|${guard_markers[$index]}"
   done
 
   local run_args=(
     run
     --rm
-    --user "$caller_uid:$caller_gid"
+    --user 0:0
     --read-only
     --cap-drop ALL
+    --cap-add CHOWN
+    --cap-add SETPCAP
+    --cap-add SETGID
+    --cap-add SETUID
     --security-opt no-new-privileges
     --tmpfs
     "/tmp:rw,nosuid,nodev,noexec,size=16777216,mode=1777"
     --tmpfs
-    "/run/secrets:rw,nosuid,nodev,noexec,size=65536,mode=0700,uid=$caller_uid,gid=$caller_gid"
+    "/run/secrets:rw,nosuid,nodev,noexec,size=65536,mode=0700,uid=0,gid=0"
+    --entrypoint
+    /bin/bash
   )
+  if [[ "$needs_control_tmpfs" == true ]]; then
+    run_args+=(
+      --tmpfs
+      "/run/control:rw,nosuid,nodev,noexec,size=1048576,mode=0700,uid=0,gid=0"
+    )
+  fi
+  if (( ${#payload_sources[@]} > 0 )); then
+    run_args+=(--interactive)
+  fi
   if (( ${#passthrough_args[@]} > 0 )); then
     run_args+=("${passthrough_args[@]}")
   fi
-  if [[ -n "$staged_secret" ]]; then
-    run_args+=(
-      --mount
-      "type=bind,src=$staged_secret,dst=/run/videoprocess-bootstrap-secret,readonly"
-    )
-  fi
   for ((index = 0; index < ${#bind_sources[@]}; index++)); do
-    local effective_source="${bind_sources[$index]}"
-    if [[ -n "${bind_file_modes[$index]}" ]]; then
-      effective_source="$run_dir/bind-file-$index"
-    fi
     run_args+=(
       --mount
-      "type=bind,src=$effective_source,dst=${bind_targets[$index]}${bind_readonly[$index]}"
+      "type=bind,src=${bind_sources[$index]},dst=${bind_targets[$index]}${bind_readonly[$index]}"
     )
   done
 
   local docker_status=0
-  docker "${run_args[@]}" \
+  local docker_command=(
+    docker
+    "${run_args[@]}"
     --env "VP_PYTHON_WORKER_SECRET_TARGET=$secret_target" \
     --env "VP_PYTHON_WORKER_CALLER_UID=$caller_uid" \
     --env "VP_PYTHON_WORKER_CALLER_GID=$caller_gid" \
+    --env "VP_PYTHON_WORKER_STDIN_TARGETS=$payload_manifest" \
     --env "VP_PYTHON_WORKER_BIND_SENTINELS=$bind_manifest" \
-    "$image" \
-    /bin/bash -ceu '
+    "$image"
+    -ceu
+    '
       runtime_uid="${VP_PYTHON_WORKER_CALLER_UID:?}"
       runtime_gid="${VP_PYTHON_WORKER_CALLER_GID:?}"
       [[ "$runtime_uid" =~ ^[0-9]+$ && "$runtime_gid" =~ ^[0-9]+$ ]]
-      [[ "$(id -u)" == "$runtime_uid" && "$(id -g)" == "$runtime_gid" ]]
+      [[ "$(id -u)" == 0 && "$(id -g)" == 0 ]]
       umask 077
       export HOME=/tmp/vp-python-worker-home
       mkdir -p "$HOME"
       chmod 0700 "$HOME"
+      chown "$runtime_uid:$runtime_gid" "$HOME"
 
-      secret_target="${VP_PYTHON_WORKER_SECRET_TARGET:-}"
-      if [[ -n "$secret_target" ]]; then
-        [[ "$secret_target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
-        [[ -f /run/videoprocess-bootstrap-secret \
-          && ! -L /run/videoprocess-bootstrap-secret ]]
-        [[ "$(stat -c "%a:%h" /run/videoprocess-bootstrap-secret)" \
-          == "400:1" ]]
-        [[ -r /run/videoprocess-bootstrap-secret ]]
-        install \
-          -m 0400 \
-          /run/videoprocess-bootstrap-secret \
-          "/run/secrets/$secret_target"
-        [[ "$(stat -c "%u:%g:%a:%h" "/run/secrets/$secret_target")" \
-          == "$runtime_uid:$runtime_gid:400:1" ]]
+      payload_manifest="${VP_PYTHON_WORKER_STDIN_TARGETS:-}"
+      if [[ -n "$payload_manifest" ]]; then
+        /opt/venv/bin/python -I -c '"'"'
+import os
+import stat
+import struct
+import sys
+
+uid = int(sys.argv[1])
+gid = int(sys.argv[2])
+raw_manifest = sys.argv[3]
+specs = []
+seen = set()
+for raw_spec in raw_manifest.split(";"):
+    target, separator, raw_mode = raw_spec.rpartition(":")
+    if not separator or target in seen:
+        raise RuntimeError("invalid payload manifest")
+    mode = int(raw_mode, 8)
+    if (
+        target.startswith("/run/secrets/")
+        and target.count("/") == 3
+        and mode == 0o400
+    ):
+        name = target.rsplit("/", 1)[1]
+        if (
+            not name
+            or len(name) > 128
+            or any(
+                character
+                not in (
+                    "abcdefghijklmnopqrstuvwxyz"
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    "0123456789._-"
+                )
+                for character in name
+            )
+        ):
+            raise RuntimeError("invalid secret target")
+    elif target == "/run/control/upsert.json" and mode == 0o600:
+        pass
+    else:
+        raise RuntimeError("invalid payload target")
+    seen.add(target)
+    specs.append((target, mode))
+
+stream = sys.stdin.buffer
+
+
+def read_exact(length):
+    payload = bytearray()
+    while len(payload) < length:
+        chunk = stream.read(length - len(payload))
+        if not chunk:
+            raise RuntimeError("truncated payload stream")
+        payload.extend(chunk)
+    return bytes(payload)
+
+
+if read_exact(4) != b"VPW1":
+    raise RuntimeError("invalid payload stream")
+count = read_exact(1)[0]
+if count != len(specs):
+    raise RuntimeError("payload count mismatch")
+
+created = []
+parents = set()
+try:
+    for target, mode in specs:
+        length = struct.unpack(">Q", read_exact(8))[0]
+        if length > 1048576:
+            raise RuntimeError("payload too large")
+        parent = os.path.dirname(target)
+        parent_metadata = os.lstat(parent)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != 0
+            or parent_metadata.st_gid != 0
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        ):
+            raise RuntimeError("payload tmpfs is invalid")
+        descriptor = os.open(
+            target,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        created.append(target)
+        try:
+            remaining = length
+            while remaining:
+                chunk = read_exact(min(remaining, 65536))
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written < 1:
+                        raise RuntimeError("payload write failed")
+                    view = view[written:]
+                remaining -= len(chunk)
+            os.fchmod(descriptor, mode)
+            os.fchown(descriptor, uid, gid)
+            os.fsync(descriptor)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != uid
+                or metadata.st_gid != gid
+                or stat.S_IMODE(metadata.st_mode) != mode
+                or metadata.st_nlink != 1
+            ):
+                raise RuntimeError("payload identity mismatch")
+        finally:
+            os.close(descriptor)
+        parents.add(parent)
+    if stream.read(1):
+        raise RuntimeError("trailing payload data")
+    for parent in parents:
+        os.chmod(parent, 0o700)
+        os.chown(parent, uid, gid)
+except Exception:
+    for target in reversed(created):
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+    raise
+'"'"' "$runtime_uid" "$runtime_gid" "$payload_manifest"
       fi
 
       while IFS="|" read -r path sentinel marker extra; do
@@ -1191,8 +1835,11 @@ vp_run_python_worker_container() {
         [[ -d "$path" && ! -L "$path" ]]
         [[ "$(stat -c "%a" "$path")" == 700 ]]
         [[ -f "$path/$sentinel" && ! -L "$path/$sentinel" ]]
-        [[ "$(stat -c "%u:%g:%a:%h" "$path/$sentinel")" \
-          == "$runtime_uid:$runtime_gid:400:1" ]]
+        sentinel_identity="$(
+          stat -c "%u:%g:%a:%h" "$path/$sentinel"
+        )"
+        [[ "$sentinel_identity" == "$runtime_uid:$runtime_gid:400:1" \
+          || "$sentinel_identity" == 0:0:400:1 ]]
         [[ "$(<"$path/$sentinel")" == "$marker" ]]
       done <<<"${VP_PYTHON_WORKER_BIND_SENTINELS:-}"
 
@@ -1200,43 +1847,48 @@ vp_run_python_worker_container() {
         VP_PYTHON_WORKER_SECRET_TARGET \
         VP_PYTHON_WORKER_CALLER_UID \
         VP_PYTHON_WORKER_CALLER_GID \
+        VP_PYTHON_WORKER_STDIN_TARGETS \
         VP_PYTHON_WORKER_BIND_SENTINELS
-      exec "$@"
-    ' vp-python-worker-bootstrap "${command[@]}" \
-    || docker_status=$?
+      exec /usr/bin/setpriv \
+        --reuid="$runtime_uid" \
+        --regid="$runtime_gid" \
+        --clear-groups \
+        --inh-caps=-all \
+        --ambient-caps=-all \
+        --bounding-set=-all \
+        --no-new-privs \
+        -- "$@"
+    '
+    vp-python-worker-bootstrap
+    "${command[@]}"
+  )
+  if (( ${#payload_sources[@]} > 0 )); then
+    set -o pipefail
+    vp_python_worker_host_guard \
+      stream-payloads "$caller_uid" "$caller_gid" \
+      "${stream_arguments[@]}" \
+      | "${docker_command[@]}" \
+      || docker_status=$?
+  else
+    "${docker_command[@]}" </dev/null || docker_status=$?
+  fi
 
   local validation_status=0
-  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
-    if [[ -z "${bind_file_modes[$index]}" ]]; then
-      vp_python_worker_host_guard \
-        finalize-directory \
-        "${bind_sources[$index]}" \
-        "$caller_uid" \
-        "$caller_gid" \
-        "${guard_names[$index]}" \
-        "${guard_markers[$index]}" \
-        "${guard_records[$index]}" \
-        "${bind_targets[$index]}" >/dev/null \
-        || validation_status=1
-    elif [[ -n "${staged_sources[$index]:-}" ]]; then
-      vp_python_worker_host_guard \
-        verify-file \
-        "${staged_sources[$index]}" \
-        "$caller_uid" \
-        "$caller_gid" \
-        "${bind_file_modes[$index]}" \
-        "${staged_records[$index]}" >/dev/null \
-        || validation_status=1
-    fi
+  for ((index = 0; index < ${#payload_sources[@]}; index++)); do
+    vp_python_worker_host_guard \
+      verify-file \
+      "${payload_sources[$index]}" \
+      "$caller_uid" \
+      "$caller_gid" \
+      "${payload_modes[$index]}" \
+      "${payload_records[$index]}" >/dev/null \
+      || validation_status=1
   done
-  if [[ -n "$secret_source" ]]; then
+  if [[ "$operation_name" != - ]]; then
     vp_python_worker_host_guard \
-      verify-file "$secret_source" "$caller_uid" "$caller_gid" 0400 \
-      "$secret_record" >/dev/null || validation_status=1
-  fi
-  if [[ -n "$run_dir" ]]; then
-    vp_python_worker_host_guard \
-      cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" >/dev/null \
+      finish-operation \
+      "$admission_root" "$operation_name" \
+      "$caller_uid" "$caller_gid" >/dev/null \
       || validation_status=1
   fi
   [[ "$docker_status" -eq 0 && "$validation_status" -eq 0 ]]
@@ -1724,9 +2376,10 @@ vp_worker_admission_prepare_control_roles() {
       "worker control-role owner database URL file"
   )" || return 1
   local generation="c-${commit:0:20}"
-  local state="$root/control"
-  mkdir -p "$state" || return 1
-  chmod 0700 "$state" || return 1
+  local state
+  state="$(
+    vp_python_worker_prepare_controlled_directory "$root/control"
+  )" || return 1
   VP_WORKER_CONTROL_GENERATION="$generation"
   VP_WORKER_OPERATOR_DATABASE_SECRET="vp-wc-operator-$generation"
   VP_WORKER_ORCHESTRATOR_DATABASE_SECRET="vp-wc-orchestrator-$generation"
@@ -1799,6 +2452,15 @@ vp_worker_admission_prepare_service() {
   [[ "$namespace" =~ ^[a-z0-9][a-z0-9-]{0,127}$ ]] || return 1
   local kind
   kind="$(vp_worker_admission_kind "$service")" || return 1
+  local runtime_state
+  runtime_state="$(
+    vp_python_worker_prepare_controlled_directory "$root/runtime"
+  )" || return 1
+  local request_root
+  request_root="$(
+    vp_python_worker_prepare_controlled_directory \
+      "$root/requests/$service"
+  )" || return 1
   local candidate_dir="$root/candidates/$namespace"
   local candidate="$candidate_dir/$kind.conf"
   local generation=""
@@ -1826,9 +2488,6 @@ vp_worker_admission_prepare_service() {
       "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker runtime-role owner database URL file"
   )" || return 1
-  local runtime_state="$root/runtime"
-  mkdir -p "$runtime_state" || return 1
-  chmod 0700 "$runtime_state" || return 1
   vp_run_python_worker_container \
     "$control_image" \
     "$owner_file" \
@@ -1854,10 +2513,7 @@ vp_worker_admission_prepare_service() {
     "$service" "$generation" "$database_secret" "$admission_secret" \
     || return 1
 
-  local request_root="$root/requests/$service"
   local request_file="$request_root/$generation/upsert.json"
-  mkdir -p "$request_root" || return 1
-  chmod 0700 "$request_root" || return 1
   vp_run_python_worker_container \
     "$control_image" \
     - \
@@ -1913,8 +2569,9 @@ vp_prepare_worker_admission() {
   fi
   local root
   root="$(vp_worker_admission_root)" || return 1
-  mkdir -p "$root" || return 1
-  chmod 0700 "$root" || return 1
+  root="$(
+    vp_python_worker_prepare_controlled_directory "$root"
+  )" || return 1
   VP_WORKER_ADMISSION_COMMIT="$commit"
   VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE="$commit"
   VP_WORKER_ADMISSION_CONTROL_IMAGE="$control_image"
@@ -2472,6 +3129,10 @@ vp_worker_admission_retire_generation() {
   local admission_secret="$4"
   local root="$5"
   vp_require_pipeline_network_identity || return 1
+  local runtime_state
+  runtime_state="$(
+    vp_python_worker_prepare_controlled_directory "$root/runtime"
+  )" || return 1
   local operator_file="$root/control/$VP_WORKER_CONTROL_GENERATION/worker-registration-operator-database-url"
   local grant_state
   grant_state="$(
@@ -2506,15 +3167,13 @@ vp_worker_admission_retire_generation() {
       "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker runtime-role owner database URL file"
   )" || return 1
-  mkdir -p "$root/runtime" || return 1
-  chmod 0700 "$root/runtime" || return 1
   vp_run_python_worker_container \
     "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
     "$owner_file" \
     worker-runtime-owner-database-url \
     /runtime-state \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$root/runtime,dst=/runtime-state" \
+    --mount "type=bind,src=$runtime_state,dst=/runtime-state" \
     --env WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE=/run/secrets/worker-runtime-owner-database-url \
     -- \
     python -m app.services.worker_runtime_role_cli \
@@ -2771,6 +3430,10 @@ vp_worker_control_retire_generation() {
   [[ "$generation" =~ ^c-[0-9a-f]{20}$ \
     && "$image" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*:deploy-[0-9a-f]{12}$ \
     && "${generation#c-}" == "${image##*:deploy-}"* ]] || return 1
+  local control_state
+  control_state="$(
+    vp_python_worker_prepare_controlled_directory "$root/control"
+  )" || return 1
   vp_worker_control_generation_unused \
     "$generation" "$allow_missing_services" || return 1
   local secret_name
@@ -2786,15 +3449,13 @@ vp_worker_control_retire_generation() {
       "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker control-role owner database URL file"
   )" || return 1
-  mkdir -p "$root/control" || return 1
-  chmod 0700 "$root/control" || return 1
   vp_run_python_worker_container \
     "$image" \
     "$owner_file" \
     worker-control-owner-database-url \
     /control-state \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$root/control,dst=/control-state" \
+    --mount "type=bind,src=$control_state,dst=/control-state" \
     --env WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE=/run/secrets/worker-control-owner-database-url \
     -- \
     python -m app.services.worker_control_role_cli \
@@ -5380,9 +6041,10 @@ vp_worker_redis_marker_provision_roles() {
   local control_root="$3"
   local owner_file
   owner_file="$(vp_worker_redis_marker_owner_file)" || return 1
-  local role_state="$control_root/roles"
-  mkdir -p "$role_state" || return 1
-  chmod 0700 "$role_state" || return 1
+  local role_state
+  role_state="$(
+    vp_python_worker_prepare_controlled_directory "$control_root/roles"
+  )" || return 1
 
   vp_run_python_worker_container \
     "$image" \
@@ -5405,8 +6067,10 @@ vp_worker_redis_marker_revoke_roles() {
   local control_root="$3"
   local owner_file
   owner_file="$(vp_worker_redis_marker_owner_file)" || return 1
-  mkdir -p "$control_root/roles" || return 1
-  chmod 0700 "$control_root/roles" || return 1
+  local role_state
+  role_state="$(
+    vp_python_worker_prepare_controlled_directory "$control_root/roles"
+  )" || return 1
 
   vp_run_python_worker_container \
     "$image" \
@@ -5414,7 +6078,7 @@ vp_worker_redis_marker_revoke_roles() {
     worker-marker-owner-database-url \
     /control-state \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$control_root/roles,dst=/control-state" \
+    --mount "type=bind,src=$role_state,dst=/control-state" \
     --env WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE=/run/secrets/worker-marker-owner-database-url \
     -- \
     python -m app.services.worker_marker_control_role_cli \
@@ -6070,8 +6734,11 @@ vp_prepare_worker_redis_marker_controls() {
 
   local control_root
   control_root="$(vp_worker_redis_marker_control_root)" || return 1
-  mkdir -p "$control_root" || return 1
-  chmod 0700 "$control_root" || return 1
+  control_root="$(
+    vp_python_worker_prepare_controlled_directory "$control_root"
+  )" || return 1
+  vp_python_worker_prepare_controlled_directory \
+    "$control_root/roles" >/dev/null || return 1
   vp_worker_redis_marker_read_prior_config \
     "$control_root/control.conf" || return 1
   vp_worker_redis_marker_capture_managed_state "$control_root" || return 1
@@ -6134,6 +6801,11 @@ vp_restore_worker_redis_marker_controls() {
   fi
   local control_root
   control_root="$(vp_worker_redis_marker_control_root)" || return 1
+  control_root="$(
+    vp_python_worker_prepare_controlled_directory "$control_root"
+  )" || return 1
+  vp_python_worker_prepare_controlled_directory \
+    "$control_root/roles" >/dev/null || return 1
   local original_state="$VP_WORKER_REDIS_MARKER_MANAGED_STATE"
   vp_worker_redis_marker_capture_managed_state "$control_root" || return 1
   local candidate_state="$VP_WORKER_REDIS_MARKER_MANAGED_STATE"
@@ -6196,6 +6868,11 @@ vp_commit_worker_redis_marker_controls() {
   fi
   local control_root
   control_root="$(vp_worker_redis_marker_control_root)" || return 1
+  control_root="$(
+    vp_python_worker_prepare_controlled_directory "$control_root"
+  )" || return 1
+  vp_python_worker_prepare_controlled_directory \
+    "$control_root/roles" >/dev/null || return 1
   vp_worker_redis_marker_retire_generation \
     "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" \
     "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \

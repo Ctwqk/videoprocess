@@ -214,6 +214,15 @@ PY
 fi
 if [[ "${1:-} ${2:-}" == "container create" ]]; then
   [[ ! -f "$HOLDER_STATE" ]]
+  previous=""
+  entrypoint_cleared=0
+  for argument in "$@"; do
+    if [[ "$previous" == "--entrypoint" && -z "$argument" ]]; then
+      entrypoint_cleared=1
+    fi
+    previous="$argument"
+  done
+  [[ "$entrypoint_cleared" == 1 ]]
   if [[ "${FAIL_HOLDER_CREATE:-0}" == 1 ]]; then
     exit 41
   fi
@@ -833,9 +842,12 @@ if grep -Eq 'docker\|(run|container create|service create|volume rm)' "$CALLS"; 
 fi
 
 if [[ -n "${VP_STAGING_JANITOR_REAL_DOCKER_IMAGE:-}" ]]; then
-  suffix="round4-$$-$RANDOM"
+  suffix="round5-$$-$RANDOM"
+  real_generation="c-$(
+    printf '%s' "$suffix" | shasum -a 256 | cut -c1-20
+  )"
   REAL_VOLUME="vp-staging-janitor-pin-$suffix"
-  REAL_HOLDER="vp-staging-janitor-holder-$suffix"
+  REAL_HOLDER="vp-staging-janitor-evidence-holder-$real_generation"
   test_label="vp.videoprocess.test-holder-pin=$suffix"
   "$REAL_DOCKER" volume create \
     --driver local \
@@ -843,8 +855,28 @@ if [[ -n "${VP_STAGING_JANITOR_REAL_DOCKER_IMAGE:-}" ]]; then
     "$REAL_VOLUME" >/dev/null
   identity_before="$(
     "$REAL_DOCKER" volume inspect "$REAL_VOLUME" --format '{{json .}}' \
-      | python3 -c \
-        'import hashlib,json,sys; print(hashlib.sha256(json.dumps(json.load(sys.stdin),sort_keys=True,separators=(",",":")).encode()).hexdigest())'
+      | python3 -c '
+import hashlib
+import json
+import sys
+
+volume = json.load(sys.stdin)
+identity = {
+    "CreatedAt": volume["CreatedAt"],
+    "Driver": volume["Driver"],
+    "Labels": volume.get("Labels"),
+    "Mountpoint": volume["Mountpoint"],
+    "Name": volume["Name"],
+    "Options": volume.get("Options"),
+    "Scope": volume["Scope"],
+}
+encoded = json.dumps(
+    identity,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode()
+print(hashlib.sha256(encoded).hexdigest())
+'
   )"
   real_image_id="$(
     "$REAL_DOCKER" image inspect \
@@ -854,12 +886,11 @@ if [[ -n "${VP_STAGING_JANITOR_REAL_DOCKER_IMAGE:-}" ]]; then
   "$REAL_DOCKER" container create \
     --name "$REAL_HOLDER" \
     --label vp.videoprocess.holder=staging-object-janitor-evidence \
-    --label vp.videoprocess.generation=c-0123456789abcdef0123 \
-    --label vp.videoprocess.transaction=staging-object-janitor:c-0123456789abcdef0123 \
+    --label "vp.videoprocess.generation=$real_generation" \
+    --label "vp.videoprocess.transaction=staging-object-janitor:$real_generation" \
     --label "vp.videoprocess.volume=$REAL_VOLUME" \
     --label "vp.videoprocess.volume-identity=$identity_before" \
     --label "vp.videoprocess.image-id=$real_image_id" \
-    --label "$test_label" \
     --user 0:0 \
     --read-only \
     --network none \
@@ -871,72 +902,48 @@ if [[ -n "${VP_STAGING_JANITOR_REAL_DOCKER_IMAGE:-}" ]]; then
     --security-opt no-new-privileges \
     --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
     --mount "type=volume,src=$REAL_VOLUME,dst=/run/videoprocess/staging-janitor" \
+    --entrypoint "" \
     "$VP_STAGING_JANITOR_REAL_DOCKER_IMAGE" \
     /opt/venv/bin/python -I -m \
     app.channel_agent.staging_object_janitor_cli prepare-evidence >/dev/null
-  "$REAL_DOCKER" container start --attach "$REAL_HOLDER" >/dev/null
-  "$REAL_DOCKER" container inspect "$REAL_HOLDER" --format '{{json .}}' \
-    | EXPECTED_REAL_HOLDER="/$REAL_HOLDER" \
-      EXPECTED_REAL_IMAGE="$VP_STAGING_JANITOR_REAL_DOCKER_IMAGE" \
-      EXPECTED_REAL_IMAGE_ID="$real_image_id" \
-      EXPECTED_REAL_VOLUME="$REAL_VOLUME" \
-      python3 -c '
-import json
-import os
-import sys
+  validate_real_holder() {
+    (
+      docker() {
+        "$REAL_DOCKER" "$@"
+      }
+      VP_STAGING_JANITOR_LIBRARY_ONLY=1
+      VP_STAGING_JANITOR_CONFIG_FILE="$TEST_ROOT/library-only-must-not-read-config"
+      source "$LAUNCHER"
+      holder_name="$REAL_HOLDER"
+      generation="$real_generation"
+      image="$VP_STAGING_JANITOR_REAL_DOCKER_IMAGE"
+      image_id="$real_image_id"
+      evidence_volume="$REAL_VOLUME"
+      volume_identity="$identity_before"
+      validate_holder "$REAL_HOLDER"
+    )
+  }
+  if ! holder_details="$(validate_real_holder)"; then
+    echo 'FAIL: production validator rejected the created real holder' >&2
+    exit 1
+  fi
+  [[ "$holder_details" =~ ^[0-9a-f]{64}\|created\|0$ ]] \
+    || {
+      echo 'FAIL: production validator returned invalid created state' >&2
+      exit 1
+    }
 
-holder = json.load(sys.stdin)
-host = holder["HostConfig"]
-mounts = holder["Mounts"]
-labels = holder["Config"]["Labels"]
-assert holder["Name"] == os.environ["EXPECTED_REAL_HOLDER"]
-assert holder["Image"] == os.environ["EXPECTED_REAL_IMAGE_ID"]
-assert holder["Config"]["Image"] == os.environ["EXPECTED_REAL_IMAGE"]
-assert holder["Config"]["User"] == "0:0"
-assert holder["Config"]["Cmd"] == [
-    "/opt/venv/bin/python",
-    "-I",
-    "-m",
-    "app.channel_agent.staging_object_janitor_cli",
-    "prepare-evidence",
-]
-assert host["ReadonlyRootfs"] is True
-assert host["AutoRemove"] is False
-assert host["NetworkMode"] == "none"
-assert host["RestartPolicy"]["Name"] == "no"
-assert host["RestartPolicy"]["MaximumRetryCount"] == 0
-assert host["Binds"] is None
-assert host["CapDrop"] == ["ALL"]
-assert set(host["CapAdd"]) == {
-    "CAP_CHOWN",
-    "CAP_DAC_OVERRIDE",
-    "CAP_FOWNER",
-}, host["CapAdd"]
-assert set(host["SecurityOpt"]) in (
-    {"no-new-privileges"},
-    {"no-new-privileges:true"},
-)
-assert set(host["Tmpfs"]) == {"/tmp"}
-assert set(host["Tmpfs"]["/tmp"].split(",")) == {
-    "rw",
-    "nosuid",
-    "nodev",
-    "noexec",
-    "mode=1777",
-}
-assert labels["vp.videoprocess.image-id"] == os.environ["EXPECTED_REAL_IMAGE_ID"]
-assert labels["vp.videoprocess.transaction"] == (
-    "staging-object-janitor:c-0123456789abcdef0123"
-)
-assert labels["vp.videoprocess.volume"] == os.environ["EXPECTED_REAL_VOLUME"]
-assert len(mounts) == 1
-assert mounts[0]["Type"] == "volume"
-assert mounts[0]["Name"] == os.environ["EXPECTED_REAL_VOLUME"]
-assert mounts[0]["Destination"] == "/run/videoprocess/staging-janitor"
-assert mounts[0]["RW"] is True
-assert holder["State"]["Status"] == "exited"
-assert holder["State"]["ExitCode"] == 0
-'
+  "$REAL_DOCKER" container start --attach "$REAL_HOLDER" >/dev/null
+  holder_details="$(validate_real_holder)" \
+    || {
+      echo 'FAIL: production validator rejected the prepared real holder' >&2
+      exit 1
+    }
+  [[ "$holder_details" =~ ^[0-9a-f]{64}\|exited\|0$ ]] \
+    || {
+      echo 'FAIL: production validator returned invalid prepared state' >&2
+      exit 1
+    }
 
   set +e
   "$REAL_DOCKER" volume rm "$REAL_VOLUME" \
@@ -977,8 +984,28 @@ assert holder["State"]["ExitCode"] == 0
   fi
   identity_after="$(
     "$REAL_DOCKER" volume inspect "$REAL_VOLUME" --format '{{json .}}' \
-      | python3 -c \
-        'import hashlib,json,sys; print(hashlib.sha256(json.dumps(json.load(sys.stdin),sort_keys=True,separators=(",",":")).encode()).hexdigest())'
+      | python3 -c '
+import hashlib
+import json
+import sys
+
+volume = json.load(sys.stdin)
+identity = {
+    "CreatedAt": volume["CreatedAt"],
+    "Driver": volume["Driver"],
+    "Labels": volume.get("Labels"),
+    "Mountpoint": volume["Mountpoint"],
+    "Name": volume["Name"],
+    "Options": volume.get("Options"),
+    "Scope": volume["Scope"],
+}
+encoded = json.dumps(
+    identity,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode()
+print(hashlib.sha256(encoded).hexdigest())
+'
   )"
   if [[ "$identity_after" != "$identity_before" ]]; then
     echo 'FAIL: same-name create replaced pinned real Docker volume' >&2

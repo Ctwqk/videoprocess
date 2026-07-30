@@ -135,6 +135,223 @@ fi
   fi
 )
 
+(
+  probe_root="$TEST_ROOT/sentinel-tamper"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  secret="$probe_root/secret"
+  printf '%s\n' 'sentinel-tamper-credential' >"$secret"
+  chmod 0400 "$secret"
+
+  docker() {
+    cat >/dev/null
+    local sentinel
+    sentinel="$(compgen -G "$bind_source/.vp-python-worker-bind-*" | head -1)"
+    [[ -n "$sentinel" ]]
+    chmod 0600 "$sentinel"
+    : >"$sentinel"
+    chmod 0400 "$sentinel"
+  }
+
+  if vp_run_python_worker_container \
+    synthetic-image "$secret" synthetic-secret /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1; then
+    echo 'FAIL: completed one-shot accepted a truncated bind sentinel' >&2
+    exit 1
+  fi
+)
+
+(
+  probe_root="$TEST_ROOT/prepare-service-symlink"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  mkdir -p "$admission_root"
+  chmod 0700 "$admission_root"
+  unrelated="$probe_root/unrelated"
+  mkdir -p "$unrelated"
+  chmod 0755 "$unrelated"
+  printf '%s\n' 'prepare-preserve' >"$unrelated/preserve"
+  chmod 0600 "$unrelated/preserve"
+  ln -s "$unrelated" "$admission_root/runtime"
+
+  runtime_owner="$probe_root/runtime-owner"
+  printf '%s\n' 'prepare-owner-credential' >"$runtime_owner"
+  chmod 0400 "$runtime_owner"
+  VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="$runtime_owner"
+  VP_WORKER_ADMISSION_CANDIDATE_SERVICES=""
+  PREPARE_DOCKER_CALLS="$probe_root/docker-calls"
+  : >"$PREPARE_DOCKER_CALLS"
+
+  vp_require_pipeline_network_identity() {
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  vp_worker_admission_read_manifest() {
+    VP_WORKER_MANIFEST_COMMIT="$commit"
+    VP_WORKER_MANIFEST_IMAGE="$image"
+    VP_WORKER_MANIFEST_GENERATION=901
+    VP_WORKER_MANIFEST_DATABASE_SECRET=prepare-db-901
+    VP_WORKER_MANIFEST_ADMISSION_SECRET=prepare-admission-901
+  }
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$PREPARE_DOCKER_CALLS"
+  }
+
+  if vp_worker_admission_prepare_service \
+    vp-ffmpeg-worker-go-swarm \
+    vp-ffmpeg-worker-go:deploy-0123456789ab \
+    vp-ffmpeg-worker-python:deploy-0123456789ab \
+    0123456789abcdef0123456789abcdef01234567 \
+    "$admission_root" \
+    0123456789abcdef0123456789abcdef01234567 \
+    >/dev/null 2>&1; then
+    echo 'FAIL: prepare_service accepted a symlinked runtime source' >&2
+    exit 1
+  fi
+  if [[ "$(vp_worker_redis_marker_file_mode "$unrelated")" != 755 \
+    || "$(<"$unrelated/preserve")" != prepare-preserve ]]; then
+    echo 'FAIL: prepare_service mutated a symlink target before guard' >&2
+    exit 1
+  fi
+  if [[ -s "$PREPARE_DOCKER_CALLS" ]]; then
+    echo 'FAIL: prepare_service symlink source reached Docker' >&2
+    exit 1
+  fi
+)
+
+(
+  probe_root="$TEST_ROOT/marker-revoke-symlink"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  control_root="$ROOT/state/worker-redis-marker-control"
+  mkdir -p "$admission_root" "$control_root"
+  chmod 0700 "$admission_root" "$control_root"
+  unrelated="$probe_root/unrelated"
+  mkdir -p "$unrelated"
+  chmod 0755 "$unrelated"
+  printf '%s\n' 'revoke-preserve' >"$unrelated/preserve"
+  chmod 0600 "$unrelated/preserve"
+  ln -s "$unrelated" "$control_root/roles"
+
+  marker_owner="$probe_root/marker-owner"
+  printf '%s\n' 'marker-owner-credential' >"$marker_owner"
+  chmod 0400 "$marker_owner"
+  VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE="$marker_owner"
+  MARKER_REVOKE_DOCKER_CALLS="$probe_root/docker-calls"
+  : >"$MARKER_REVOKE_DOCKER_CALLS"
+
+  vp_require_pipeline_network_identity() {
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$MARKER_REVOKE_DOCKER_CALLS"
+  }
+
+  if vp_worker_redis_marker_revoke_roles \
+    vp-ffmpeg-worker-python:deploy-0123456789ab \
+    m-symlink-revoke-1780000000-0001 \
+    "$control_root" >/dev/null 2>&1; then
+    echo 'FAIL: marker revoke accepted a symlinked role source' >&2
+    exit 1
+  fi
+  if [[ "$(vp_worker_redis_marker_file_mode "$unrelated")" != 755 \
+    || "$(<"$unrelated/preserve")" != revoke-preserve ]]; then
+    echo 'FAIL: marker revoke mutated a symlink target before guard' >&2
+    exit 1
+  fi
+  if [[ -s "$MARKER_REVOKE_DOCKER_CALLS" ]]; then
+    echo 'FAIL: marker revoke symlink source reached Docker' >&2
+    exit 1
+  fi
+)
+
+(
+  probe_root="$TEST_ROOT/one-shot-sigterm"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  secret="$probe_root/secret"
+  printf '%s\n' 'term-probe-credential' >"$secret"
+  chmod 0400 "$secret"
+  entered="$probe_root/docker-entered"
+
+  docker() {
+    local owner_pid="$PPID"
+    : >"$entered"
+    while kill -0 "$owner_pid" >/dev/null 2>&1; do
+      sleep 0.05
+    done
+  }
+
+  set +e
+  (
+    vp_run_python_worker_container \
+      synthetic-image "$secret" synthetic-secret /runtime-state \
+      --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+      -- /bin/true
+  ) >/dev/null 2>&1 &
+  operation_pid=$!
+  set -e
+  for _attempt in $(seq 1 100); do
+    [[ -e "$entered" ]] && break
+    sleep 0.05
+  done
+  if [[ ! -e "$entered" ]]; then
+    kill -KILL "$operation_pid" >/dev/null 2>&1 || true
+    wait "$operation_pid" >/dev/null 2>&1 || true
+    echo 'FAIL: SIGTERM probe did not enter Docker' >&2
+    exit 1
+  fi
+  kill -TERM "$operation_pid"
+  set +e
+  wait "$operation_pid" >/dev/null 2>&1
+  operation_status=$?
+  set -e
+  if [[ "$operation_status" -ne 143 ]]; then
+    echo "FAIL: SIGTERM probe exited $operation_status instead of 143" >&2
+    exit 1
+  fi
+  if grep -R -Fq 'term-probe-credential' "$ROOT" 2>/dev/null; then
+    echo 'FAIL: SIGTERM retained credential material in host state' >&2
+    exit 1
+  fi
+
+  for sentinel in "$bind_source"/.vp-python-worker-bind-*; do
+    [[ -e "$sentinel" ]] || continue
+    if [[ ! -d "$admission_root/one-shot-operations" ]] \
+      || ! grep -R -Fq -- "${sentinel##*/}" \
+        "$admission_root/one-shot-operations" 2>/dev/null; then
+      echo 'FAIL: SIGTERM retained an unmanaged bind sentinel' >&2
+      exit 1
+    fi
+  done
+
+  docker() {
+    :
+  }
+  vp_run_python_worker_container \
+    synthetic-image - - /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null
+  if compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null; then
+    echo 'FAIL: startup reconciliation retained a bind sentinel' >&2
+    exit 1
+  fi
+  if compgen -G "$admission_root/one-shot-operations/op.*" >/dev/null; then
+    echo 'FAIL: startup reconciliation retained an operation record' >&2
+    exit 1
+  fi
+)
+
 VP_WORKER_ADMISSION_COMMIT=0123456789abcdef0123456789abcdef01234567
 VP_WORKER_FFMPEG_GO_GENERATION=101
 VP_WORKER_FFMPEG_GENERATION=102
@@ -341,6 +558,7 @@ docker() {
   fi
   if [[ "${1:-}" == run \
     && "$*" == *"worker_deployment_cli readiness"* ]]; then
+    cat >/dev/null
     local attempts
     attempts="$(<"$READINESS_ATTEMPTS")"
     attempts=$((attempts + 1))
@@ -708,6 +926,7 @@ printf '%s\n' 'synthetic-runtime-owner' >"$TEST_ROOT/runtime-owner"
 chmod 0400 "$TEST_ROOT/runtime-owner"
 docker() {
   if [[ "${1:-}" == run ]]; then
+    cat >/dev/null
     printf 'runtime-role|%s\n' "$*" >>"$CLEANUP_CALLS"
     return 0
   fi

@@ -164,6 +164,14 @@ assert os.getegid() == expected_gid
 assert metadata.st_uid == expected_uid
 assert metadata.st_gid == expected_gid
 assert stat.S_IMODE(metadata.st_mode) == 0o400
+process_status = {}
+for line in Path("/proc/self/status").read_text().splitlines():
+    key, separator, value = line.partition(":")
+    if separator:
+        process_status[key] = value.strip()
+assert int(process_status["CapEff"], 16) == 0
+assert int(process_status["CapBnd"], 16) == 0
+assert process_status["NoNewPrivs"] == "1"
 assert read_mode_0400_secret(
     path,
     label="worker deploy-read database URL",
@@ -319,10 +327,19 @@ run_simulated_controller() {
 
       docker() {
         local joined=" $* "
-        [[ "$joined" == *" --user $SIMULATED_UID:$SIMULATED_GID "* ]]
+        [[ "$joined" == *" --user 0:0 "* ]]
         [[ "$joined" == *" --read-only "* ]]
         [[ "$joined" == *" --cap-drop ALL "* ]]
+        [[ "$joined" == *" --cap-add CHOWN "* ]]
+        [[ "$joined" == *" --cap-add SETPCAP "* ]]
+        [[ "$joined" == *" --cap-add SETGID "* ]]
+        [[ "$joined" == *" --cap-add SETUID "* ]]
+        [[ "$joined" == *" --interactive "* ]]
+        [[ "$joined" == *" --entrypoint /bin/bash "* ]]
+        [[ "$joined" == *" --bounding-set=-all "* ]]
         [[ "$joined" != *" chown -R "* ]]
+        [[ "$joined" != *" simulated-secret "* ]]
+        [[ "$joined" != *" bootstrap-secret "* ]]
         local argument
         local state_source=""
         for argument in "$@"; do
@@ -335,6 +352,10 @@ run_simulated_controller() {
         done
         [[ -n "$state_source" ]]
         compgen -G "$state_source/.vp-python-worker-bind-*" >/dev/null
+        /opt/venv/bin/python -I -c \
+          "import sys; payload = sys.stdin.buffer.read(); \
+assert payload.startswith(b\"VPW1\"); \
+assert b\"simulated-secret\" in payload"
         mkdir -p "$state_source/controller-output"
         chmod 0700 "$state_source/controller-output"
         printf "%s\n" "simulated-controller" \
@@ -363,6 +384,11 @@ run_simulated_controller() {
       [[ "$(stat -c "%u:%g:%a" \
         "$state/controller-output/read-back")" \
         == "$SIMULATED_UID:$SIMULATED_GID:600" ]]
+      if grep -R -Fq simulated-secret \
+        "$ROOT/state/vp-worker-admission" 2>/dev/null; then
+        echo "FAIL: simulated controller retained a host credential copy" >&2
+        exit 1
+      fi
       if printf "%s\n" forged \
         >/usr/local/share/videoprocess/worker-build-commit 2>/dev/null; then
         echo "FAIL: simulated root controller rewrote image identity" >&2
