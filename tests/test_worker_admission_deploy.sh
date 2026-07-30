@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTENSION="$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 TEST_ROOT="$(mktemp -d)"
+TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
 trap 'status=$?; rm -rf "$TEST_ROOT"; exit "$status"' EXIT
 
 REPO_ROOT="$TEST_ROOT/repos"
@@ -13,6 +14,126 @@ log() {
   :
 }
 source "$EXTENSION"
+mkdir -p "$(vp_worker_admission_root)"
+chmod 0700 "$(vp_worker_admission_root)"
+
+if grep -Eq 'chown[[:space:]]+-R' "$EXTENSION"; then
+  echo 'FAIL: Python worker one-shot recursively chowns caller state' >&2
+  exit 1
+fi
+
+(
+  helper_root="$TEST_ROOT/helper-bind-guards"
+  ROOT="$helper_root/sync"
+  REPO_ROOT="$helper_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  mkdir -p "$admission_root"
+  chmod 0700 "$admission_root"
+  secret="$helper_root/secret"
+  printf '%s\n' 'guard-secret' >"$secret"
+  chmod 0400 "$secret"
+  unrelated="$helper_root/unrelated"
+  mkdir -p "$unrelated"
+  chmod 0700 "$unrelated"
+  printf '%s\n' 'preserve' >"$unrelated/preserve"
+  chmod 0600 "$unrelated/preserve"
+
+  DOCKER_GUARD_CALLS="$helper_root/docker-calls"
+  : >"$DOCKER_GUARD_CALLS"
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$DOCKER_GUARD_CALLS"
+  }
+
+  symlink_source="$helper_root/symlink-state"
+  ln -s "$unrelated" "$symlink_source"
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image "$secret" synthetic-secret /runtime-state \
+    --mount "type=bind,src=$symlink_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1
+  symlink_status=$?
+  set -e
+  if [[ "$symlink_status" -eq 0 ]]; then
+    echo 'FAIL: symlink bind source was accepted' >&2
+    exit 1
+  fi
+  if [[ "$(<"$unrelated/preserve")" != preserve ]]; then
+    echo 'FAIL: symlink rejection changed unrelated content' >&2
+    exit 1
+  fi
+  if [[ -s "$DOCKER_GUARD_CALLS" ]]; then
+    echo 'FAIL: symlink bind source reached Docker' >&2
+    exit 1
+  fi
+  if compgen -G "$admission_root/one-shot-runs/run.*" >/dev/null; then
+    echo 'FAIL: symlink rejection retained staged one-shot state' >&2
+    exit 1
+  fi
+
+  first_guard_source="$helper_root/first-guard-state"
+  mkdir -p "$first_guard_source"
+  chmod 0700 "$first_guard_source"
+  if vp_run_python_worker_container \
+    synthetic-image "$secret" synthetic-secret /runtime-state,/requests \
+    --mount "type=bind,src=$first_guard_source,dst=/runtime-state" \
+    --mount "type=bind,src=$symlink_source,dst=/requests" \
+    -- /bin/true >/dev/null 2>&1; then
+    echo 'FAIL: partially guarded bind set was accepted' >&2
+    exit 1
+  fi
+  if compgen -G "$first_guard_source/.vp-python-worker-bind-*" \
+    >/dev/null; then
+    echo 'FAIL: partial bind validation retained an earlier sentinel' >&2
+    exit 1
+  fi
+  if compgen -G "$admission_root/one-shot-runs/run.*" >/dev/null; then
+    echo 'FAIL: partial bind validation retained staged one-shot state' >&2
+    exit 1
+  fi
+  if [[ -s "$DOCKER_GUARD_CALLS" ]]; then
+    echo 'FAIL: partially guarded bind set reached Docker' >&2
+    exit 1
+  fi
+
+  hardlink_source="$helper_root/hardlink-state"
+  mkdir -p "$hardlink_source"
+  chmod 0700 "$hardlink_source"
+  printf '%s\n' 'linked' >"$hardlink_source/state"
+  chmod 0600 "$hardlink_source/state"
+  ln "$hardlink_source/state" "$helper_root/state-hardlink"
+  if vp_run_python_worker_container \
+    synthetic-image "$secret" synthetic-secret /runtime-state \
+    --mount "type=bind,src=$hardlink_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1; then
+    echo 'FAIL: hardlink-bearing bind source was accepted' >&2
+    exit 1
+  fi
+  [[ "$(<"$helper_root/state-hardlink")" == linked ]]
+  [[ ! -s "$DOCKER_GUARD_CALLS" ]]
+
+  race_source="$helper_root/race-state"
+  displaced_source="$helper_root/race-state-displaced"
+  mkdir -p "$race_source"
+  chmod 0700 "$race_source"
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$DOCKER_GUARD_CALLS"
+    mv "$race_source" "$displaced_source"
+    ln -s "$unrelated" "$race_source"
+  }
+  if vp_run_python_worker_container \
+    synthetic-image "$secret" synthetic-secret /runtime-state \
+    --mount "type=bind,src=$race_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1; then
+    echo 'FAIL: bind source replacement was accepted' >&2
+    exit 1
+  fi
+  [[ -L "$race_source" ]]
+  [[ "$(<"$unrelated/preserve")" == preserve ]]
+  if compgen -G "$unrelated/.vp-python-worker-bind-*" >/dev/null; then
+    echo 'FAIL: bind replacement cleanup touched unrelated target' >&2
+    exit 1
+  fi
+)
 
 VP_WORKER_ADMISSION_COMMIT=0123456789abcdef0123456789abcdef01234567
 VP_WORKER_FFMPEG_GO_GENERATION=101

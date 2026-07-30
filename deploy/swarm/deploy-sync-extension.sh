@@ -294,6 +294,605 @@ vp_worker_service_secret_specs() {
     "source=$VP_WORKER_MINIO_SECRET_SECRET,target=vp-worker-minio-secret-key,uid=10001,gid=10001,mode=0400"
 }
 
+vp_python_worker_host_guard() {
+  python3 - "$@" <<'PY'
+import os
+import re
+import secrets
+import stat
+import sys
+from pathlib import Path
+
+
+def fail() -> None:
+    raise RuntimeError("python worker host bind validation failed")
+
+
+def numeric(value: str) -> int:
+    if not value.isascii() or not value.isdigit():
+        fail()
+    parsed = int(value)
+    if parsed < 0 or parsed > 2**31 - 1:
+        fail()
+    return parsed
+
+
+def exact_path(raw: str) -> Path:
+    path = Path(raw)
+    if (
+        not path.is_absolute()
+        or "\n" in raw
+        or "\r" in raw
+        or "\t" in raw
+        or str(path.resolve(strict=True)) != raw
+    ):
+        fail()
+    return path
+
+
+def identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def file_flags() -> int:
+    return os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+
+
+def require_directory(
+    metadata: os.stat_result,
+    uid: int,
+    gid: int,
+) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail()
+
+
+def require_file(
+    metadata: os.stat_result,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != uid
+        or metadata.st_gid != gid
+        or stat.S_IMODE(metadata.st_mode) != mode
+        or metadata.st_nlink != 1
+    ):
+        fail()
+
+
+def open_exact_directory(
+    path: Path,
+    uid: int,
+    gid: int,
+) -> tuple[int, os.stat_result]:
+    before = path.lstat()
+    require_directory(before, uid, gid)
+    descriptor = os.open(path, directory_flags())
+    try:
+        opened = os.fstat(descriptor)
+        require_directory(opened, uid, gid)
+        if identity(before) != identity(opened):
+            fail()
+        after = path.lstat()
+        if identity(opened) != identity(after):
+            fail()
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor, opened
+
+
+def capture_file(
+    path: Path,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> tuple[int, os.stat_result]:
+    before = path.lstat()
+    require_file(before, uid, gid, mode)
+    descriptor = os.open(path, file_flags())
+    try:
+        opened = os.fstat(descriptor)
+        require_file(opened, uid, gid, mode)
+        if identity(before) != identity(opened):
+            fail()
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor, opened
+
+
+def verify_file_record(
+    path: Path,
+    uid: int,
+    gid: int,
+    mode: int,
+    record: str,
+) -> None:
+    descriptor, opened = capture_file(path, uid, gid, mode)
+    try:
+        if record != ",".join(str(value) for value in identity(opened)):
+            fail()
+        after = path.lstat()
+        if identity(opened) != identity(after):
+            fail()
+    finally:
+        os.close(descriptor)
+
+
+def scan_tree(
+    descriptor: int,
+    root_device: int,
+    uid: int,
+    gid: int,
+) -> None:
+    for name in sorted(os.listdir(descriptor)):
+        metadata = os.stat(
+            name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        if metadata.st_dev != root_device:
+            fail()
+        if stat.S_ISDIR(metadata.st_mode):
+            require_directory(metadata, uid, gid)
+            child = os.open(name, directory_flags(), dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                require_directory(opened, uid, gid)
+                if identity(metadata) != identity(opened):
+                    fail()
+                scan_tree(child, root_device, uid, gid)
+                after = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if identity(opened) != identity(after):
+                    fail()
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(metadata.st_mode):
+            mode = stat.S_IMODE(metadata.st_mode)
+            if mode not in {0o400, 0o600}:
+                fail()
+            child = os.open(name, file_flags(), dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                require_file(opened, uid, gid, mode)
+                if identity(metadata) != identity(opened):
+                    fail()
+                after = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if identity(opened) != identity(after):
+                    fail()
+            finally:
+                os.close(child)
+        else:
+            fail()
+
+
+def ensure_run_root(
+    parent_path: Path,
+    name: str,
+    uid: int,
+    gid: int,
+) -> None:
+    if name != "vp-worker-admission":
+        fail()
+    before = parent_path.lstat()
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or before.st_uid != uid
+        or before.st_gid != gid
+        or stat.S_IMODE(before.st_mode) & 0o022
+    ):
+        fail()
+    parent = os.open(parent_path, directory_flags())
+    try:
+        opened = os.fstat(parent)
+        if identity(before) != identity(opened):
+            fail()
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        child = os.open(name, directory_flags(), dir_fd=parent)
+        try:
+            child_metadata = os.fstat(child)
+            require_directory(child_metadata, uid, gid)
+            child_path = parent_path / name
+            if identity(child_metadata) != identity(child_path.lstat()):
+                fail()
+        finally:
+            os.close(child)
+        os.fsync(parent)
+        current_parent = os.fstat(parent)
+        current_path = parent_path.lstat()
+        if (
+            not stat.S_ISDIR(current_parent.st_mode)
+            or current_parent.st_uid != uid
+            or current_parent.st_gid != gid
+            or stat.S_IMODE(current_parent.st_mode) & 0o022
+            or identity(current_parent)[:5] != identity(current_path)[:5]
+            or identity(opened)[:5] != identity(current_parent)[:5]
+        ):
+            fail()
+        print(parent_path / name)
+    finally:
+        os.close(parent)
+
+
+def create_run_dir(root: Path, uid: int, gid: int) -> None:
+    root_descriptor, root_metadata = open_exact_directory(root, uid, gid)
+    try:
+        name = "one-shot-runs"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=root_descriptor)
+        except FileExistsError:
+            pass
+        parent = os.open(name, directory_flags(), dir_fd=root_descriptor)
+        try:
+            parent_metadata = os.fstat(parent)
+            require_directory(parent_metadata, uid, gid)
+            parent_path = root / name
+            if identity(parent_metadata) != identity(parent_path.lstat()):
+                fail()
+            for _attempt in range(32):
+                run_name = f"run.{secrets.token_hex(16)}"
+                try:
+                    os.mkdir(run_name, mode=0o700, dir_fd=parent)
+                except FileExistsError:
+                    continue
+                run_metadata = os.stat(
+                    run_name,
+                    dir_fd=parent,
+                    follow_symlinks=False,
+                )
+                require_directory(run_metadata, uid, gid)
+                os.fsync(parent)
+                if identity(root_metadata)[:4] != identity(root.lstat())[:4]:
+                    os.rmdir(run_name, dir_fd=parent)
+                    fail()
+                print(parent_path / run_name)
+                return
+            fail()
+        finally:
+            os.close(parent)
+    finally:
+        os.close(root_descriptor)
+
+
+def stage_file(
+    source: Path,
+    destination: Path,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> None:
+    source_descriptor, source_metadata = capture_file(
+        source,
+        uid,
+        gid,
+        mode,
+    )
+    destination_parent = exact_path(str(destination.parent))
+    parent_descriptor, _parent_metadata = open_exact_directory(
+        destination_parent,
+        uid,
+        gid,
+    )
+    created = False
+    try:
+        payload = bytearray()
+        while True:
+            chunk = os.read(source_descriptor, 65536)
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > 1048576:
+                fail()
+        if identity(source_metadata) != identity(os.fstat(source_descriptor)):
+            fail()
+        if identity(source_metadata) != identity(source.lstat()):
+            fail()
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        output = os.open(
+            destination.name,
+            flags,
+            mode,
+            dir_fd=parent_descriptor,
+        )
+        created = True
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(output, view)
+                if written < 1:
+                    fail()
+                view = view[written:]
+            os.fchmod(output, mode)
+            os.fsync(output)
+            require_file(os.fstat(output), uid, gid, mode)
+        finally:
+            os.close(output)
+        os.fsync(parent_descriptor)
+        if identity(source_metadata) != identity(source.lstat()):
+            fail()
+        print(",".join(str(value) for value in identity(source_metadata)))
+    except Exception:
+        if created:
+            try:
+                os.unlink(destination.name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(parent_descriptor)
+        os.close(source_descriptor)
+
+
+def prepare_directory(
+    path: Path,
+    uid: int,
+    gid: int,
+    sentinel_name: str,
+    marker: str,
+) -> None:
+    if not re.fullmatch(r"\.vp-python-worker-bind-[0-9a-f]{32}", sentinel_name):
+        fail()
+    if (
+        not marker
+        or len(marker) > 512
+        or "\n" in marker
+        or "\r" in marker
+        or "|" in marker
+    ):
+        fail()
+    descriptor, metadata = open_exact_directory(path, uid, gid)
+    created = False
+    try:
+        scan_tree(descriptor, metadata.st_dev, uid, gid)
+        output = os.open(
+            sentinel_name,
+            (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0)
+            ),
+            0o400,
+            dir_fd=descriptor,
+        )
+        created = True
+        try:
+            encoded = marker.encode("ascii")
+            if os.write(output, encoded) != len(encoded):
+                fail()
+            os.fchmod(output, 0o400)
+            os.fsync(output)
+            require_file(os.fstat(output), uid, gid, 0o400)
+        finally:
+            os.close(output)
+        os.fsync(descriptor)
+        current = path.lstat()
+        require_directory(current, uid, gid)
+        if (
+            current.st_dev != metadata.st_dev
+            or current.st_ino != metadata.st_ino
+        ):
+            fail()
+        print(f"{metadata.st_dev},{metadata.st_ino}")
+    except Exception:
+        if created:
+            try:
+                os.unlink(sentinel_name, dir_fd=descriptor)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(descriptor)
+
+
+def finalize_directory(
+    path: Path,
+    uid: int,
+    gid: int,
+    sentinel_name: str,
+    marker: str,
+    record: str,
+) -> None:
+    descriptor, metadata = open_exact_directory(path, uid, gid)
+    try:
+        if record != f"{metadata.st_dev},{metadata.st_ino}":
+            fail()
+        scan_tree(descriptor, metadata.st_dev, uid, gid)
+        sentinel = os.open(
+            sentinel_name,
+            file_flags(),
+            dir_fd=descriptor,
+        )
+        try:
+            sentinel_metadata = os.fstat(sentinel)
+            require_file(sentinel_metadata, uid, gid, 0o400)
+            payload = os.read(sentinel, 1024)
+            if payload != marker.encode("ascii") or os.read(sentinel, 1):
+                fail()
+            path_metadata = os.stat(
+                sentinel_name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if identity(path_metadata) != identity(sentinel_metadata):
+                fail()
+        finally:
+            os.close(sentinel)
+        os.unlink(sentinel_name, dir_fd=descriptor)
+        os.fsync(descriptor)
+        current = path.lstat()
+        require_directory(current, uid, gid)
+        if (
+            current.st_dev != metadata.st_dev
+            or current.st_ino != metadata.st_ino
+        ):
+            fail()
+    finally:
+        os.close(descriptor)
+
+
+def cleanup_run_dir(path: Path, uid: int, gid: int) -> None:
+    if not re.fullmatch(r"run\.[0-9a-f]{32}", path.name):
+        fail()
+    parent_path = exact_path(str(path.parent))
+    if parent_path.name != "one-shot-runs":
+        fail()
+    parent, _parent_metadata = open_exact_directory(parent_path, uid, gid)
+    try:
+        child = os.open(path.name, directory_flags(), dir_fd=parent)
+        try:
+            child_metadata = os.fstat(child)
+            require_directory(child_metadata, uid, gid)
+            if identity(child_metadata) != identity(path.lstat()):
+                fail()
+            for name in os.listdir(child):
+                if not re.fullmatch(
+                    r"(bootstrap-secret|bind-file-[0-9]+)",
+                    name,
+                ):
+                    fail()
+                metadata = os.stat(
+                    name,
+                    dir_fd=child,
+                    follow_symlinks=False,
+                )
+                mode = stat.S_IMODE(metadata.st_mode)
+                if mode not in {0o400, 0o600}:
+                    fail()
+                require_file(metadata, uid, gid, mode)
+                os.unlink(name, dir_fd=child)
+            os.fsync(child)
+        finally:
+            os.close(child)
+        current = os.stat(
+            path.name,
+            dir_fd=parent,
+            follow_symlinks=False,
+        )
+        if (
+            current.st_dev != child_metadata.st_dev
+            or current.st_ino != child_metadata.st_ino
+        ):
+            fail()
+        os.rmdir(path.name, dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+try:
+    action = sys.argv[1]
+    if action == "create-run-dir" and len(sys.argv) == 5:
+        create_run_dir(
+            exact_path(sys.argv[2]),
+            numeric(sys.argv[3]),
+            numeric(sys.argv[4]),
+        )
+    elif action == "ensure-run-root" and len(sys.argv) == 6:
+        ensure_run_root(
+            exact_path(sys.argv[2]),
+            sys.argv[3],
+            numeric(sys.argv[4]),
+            numeric(sys.argv[5]),
+        )
+    elif action == "stage-file" and len(sys.argv) == 7:
+        mode = int(sys.argv[6], 8)
+        if mode not in {0o400, 0o600}:
+            fail()
+        stage_file(
+            exact_path(sys.argv[2]),
+            Path(sys.argv[3]),
+            numeric(sys.argv[4]),
+            numeric(sys.argv[5]),
+            mode,
+        )
+    elif action == "verify-file" and len(sys.argv) == 7:
+        mode = int(sys.argv[5], 8)
+        if mode not in {0o400, 0o600}:
+            fail()
+        verify_file_record(
+            exact_path(sys.argv[2]),
+            numeric(sys.argv[3]),
+            numeric(sys.argv[4]),
+            mode,
+            sys.argv[6],
+        )
+    elif action == "prepare-directory" and len(sys.argv) == 8:
+        prepare_directory(
+            exact_path(sys.argv[2]),
+            numeric(sys.argv[3]),
+            numeric(sys.argv[4]),
+            sys.argv[5],
+            sys.argv[6],
+        )
+    elif action == "finalize-directory" and len(sys.argv) == 9:
+        finalize_directory(
+            exact_path(sys.argv[2]),
+            numeric(sys.argv[3]),
+            numeric(sys.argv[4]),
+            sys.argv[5],
+            sys.argv[6],
+            sys.argv[7],
+        )
+    elif action == "cleanup-run-dir" and len(sys.argv) == 5:
+        cleanup_run_dir(
+            exact_path(sys.argv[2]),
+            numeric(sys.argv[3]),
+            numeric(sys.argv[4]),
+        )
+    else:
+        fail()
+except Exception:
+    sys.exit(1)
+PY
+}
+
 vp_run_python_worker_container() {
   local image="$1"
   local secret_source="$2"
@@ -302,12 +901,16 @@ vp_run_python_worker_container() {
   shift 4
 
   [[ "$image" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ ]] || return 1
+  local caller_uid
+  local caller_gid
+  caller_uid="$(id -u)" || return 1
+  caller_gid="$(id -g)" || return 1
+  [[ "$caller_uid" =~ ^[0-9]+$ && "$caller_gid" =~ ^[0-9]+$ ]] \
+    || return 1
   if [[ "$secret_source" == - && "$secret_target" == - ]]; then
     secret_source=""
     secret_target=""
-  elif [[ "$secret_source" != /* || ! -f "$secret_source" \
-    || -L "$secret_source" \
-    || "$(vp_worker_redis_marker_file_mode "$secret_source")" != 400 \
+  elif [[ "$secret_source" != /* \
     || ! "$secret_target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
     return 1
   fi
@@ -323,77 +926,320 @@ vp_run_python_worker_container() {
       ;;
   esac
 
-  local docker_args=()
+  local passthrough_args=()
+  local bind_sources=()
+  local bind_targets=()
+  local bind_readonly=()
+  local bind_file_modes=()
+  local seen_targets="|"
   while [[ "$#" -gt 0 && "$1" != -- ]]; do
-    docker_args+=("$1")
-    shift
+    case "$1" in
+      --network)
+        [[ "$#" -ge 2 \
+          && "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]] \
+          || return 1
+        passthrough_args+=("$1" "$2")
+        shift 2
+        ;;
+      --env)
+        [[ "$#" -ge 2 \
+          && "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ \
+          && "$2" != *$'\n'* && "$2" != *$'\r'* \
+          && "$2" != VP_PYTHON_WORKER_* ]] || return 1
+        passthrough_args+=("$1" "$2")
+        shift 2
+        ;;
+      --mount)
+        [[ "$#" -ge 2 ]] || return 1
+        local mount_spec="$2"
+        if [[ ! "$mount_spec" =~ ^type=bind,src=([^,]+),dst=([^,]+)(,readonly)?$ ]]; then
+          return 1
+        fi
+        local bind_source="${BASH_REMATCH[1]}"
+        local bind_target="${BASH_REMATCH[2]}"
+        local readonly_suffix="${BASH_REMATCH[3]}"
+        [[ "$bind_source" = /* && "$seen_targets" != *"|$bind_target|"* ]] \
+          || return 1
+        local file_mode=""
+        case "$bind_target" in
+          /control-state|/runtime-state|/requests)
+            if [[ ",$prepare_dirs," == *",$bind_target,"* ]]; then
+              [[ -z "$readonly_suffix" ]] || return 1
+            else
+              [[ "$readonly_suffix" == ,readonly ]] || return 1
+            fi
+            ;;
+          /run/control/upsert.json)
+            [[ "$readonly_suffix" == ,readonly ]] || return 1
+            file_mode=0600
+            ;;
+          *)
+            return 1
+            ;;
+        esac
+        bind_sources+=("$bind_source")
+        bind_targets+=("$bind_target")
+        bind_readonly+=("$readonly_suffix")
+        bind_file_modes+=("$file_mode")
+        seen_targets+="$bind_target|"
+        shift 2
+        ;;
+      *)
+        return 1
+        ;;
+    esac
   done
   [[ "$#" -gt 1 && "$1" == -- ]] || return 1
   shift
   local command=("$@")
+  local required_path
+  local required_paths="${prepare_dirs//,/ }"
+  for required_path in $required_paths; do
+    [[ "$seen_targets" == *"|$required_path|"* ]] || return 1
+  done
 
-  local run_args=(run --rm --user 0:0)
+  local guard_names=()
+  local guard_markers=()
+  local guard_records=()
+  local guard_indices=""
+  local prepared_guard_indices=""
+  local bind_manifest=""
+  local run_dir=""
+  local admission_root
+  local staged_secret=""
+  local secret_record=""
+  local staged_sources=()
+  local staged_records=()
+  local needs_run_dir=false
+  local index
+  [[ -n "$secret_source" ]] && needs_run_dir=true
+  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
+    [[ -n "${bind_file_modes[$index]}" ]] && needs_run_dir=true
+  done
+  if [[ "$needs_run_dir" == true ]]; then
+    admission_root="$(vp_worker_admission_root)" || return 1
+    local admission_parent="${admission_root%/*}"
+    local admission_name="${admission_root##*/}"
+    admission_root="$(
+      vp_python_worker_host_guard \
+        ensure-run-root "$admission_parent" "$admission_name" \
+        "$caller_uid" "$caller_gid"
+    )" || return 1
+    run_dir="$(
+      vp_python_worker_host_guard \
+        create-run-dir "$admission_root" "$caller_uid" "$caller_gid"
+    )" || return 1
+  fi
   if [[ -n "$secret_source" ]]; then
+    staged_secret="$run_dir/bootstrap-secret"
+    secret_record="$(
+      vp_python_worker_host_guard \
+        stage-file "$secret_source" "$staged_secret" \
+        "$caller_uid" "$caller_gid" 0400
+    )" || {
+      vp_python_worker_host_guard \
+        cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" \
+        >/dev/null 2>&1 || true
+      return 1
+    }
+  fi
+
+  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
+    [[ -n "${bind_file_modes[$index]}" ]] || continue
+    local staged_record
+    staged_record="$(
+      vp_python_worker_host_guard \
+        stage-file "${bind_sources[$index]}" "$run_dir/bind-file-$index" \
+        "$caller_uid" "$caller_gid" "${bind_file_modes[$index]}"
+    )" || {
+      vp_python_worker_host_guard \
+        cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" \
+        >/dev/null 2>&1 || true
+      return 1
+    }
+    staged_sources[$index]="${bind_sources[$index]}"
+    staged_records[$index]="$staged_record"
+  done
+
+  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
+    [[ -z "${bind_file_modes[$index]}" ]] || continue
+    local token
+    token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')" \
+      || {
+        if [[ -n "$run_dir" ]]; then
+          vp_python_worker_host_guard \
+            cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" \
+            >/dev/null 2>&1 || true
+        fi
+        return 1
+      }
+    guard_names[$index]=".vp-python-worker-bind-$token"
+    guard_markers[$index]="vp-python-worker-bind-v1:$token:$caller_uid:$caller_gid"
+    guard_indices+=" $index"
+  done
+
+  for index in $guard_indices; do
+    local guard_record
+    if ! guard_record="$(
+      vp_python_worker_host_guard \
+        prepare-directory \
+        "${bind_sources[$index]}" \
+        "$caller_uid" \
+        "$caller_gid" \
+        "${guard_names[$index]}" \
+        "${guard_markers[$index]}" \
+        "${bind_targets[$index]}"
+    )"; then
+      local cleanup_index
+      for cleanup_index in $prepared_guard_indices; do
+        vp_python_worker_host_guard \
+          finalize-directory \
+          "${bind_sources[$cleanup_index]}" \
+          "$caller_uid" \
+          "$caller_gid" \
+          "${guard_names[$cleanup_index]}" \
+          "${guard_markers[$cleanup_index]}" \
+          "${guard_records[$cleanup_index]}" \
+          "${bind_targets[$cleanup_index]}" >/dev/null 2>&1 || true
+      done
+      if [[ -n "$run_dir" ]]; then
+        vp_python_worker_host_guard \
+          cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" \
+          >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
+    guard_records[$index]="$guard_record"
+    prepared_guard_indices+=" $index"
+    bind_manifest+="${bind_manifest:+$'\n'}${bind_targets[$index]}|${guard_names[$index]}|${guard_markers[$index]}"
+  done
+
+  local run_args=(
+    run
+    --rm
+    --user "$caller_uid:$caller_gid"
+    --read-only
+    --cap-drop ALL
+    --security-opt no-new-privileges
+    --tmpfs
+    "/tmp:rw,nosuid,nodev,noexec,size=16777216,mode=1777"
+    --tmpfs
+    "/run/secrets:rw,nosuid,nodev,noexec,size=65536,mode=0700,uid=$caller_uid,gid=$caller_gid"
+  )
+  if (( ${#passthrough_args[@]} > 0 )); then
+    run_args+=("${passthrough_args[@]}")
+  fi
+  if [[ -n "$staged_secret" ]]; then
     run_args+=(
       --mount
-      "type=bind,src=$secret_source,dst=/run/videoprocess-bootstrap-secret,readonly"
-      --mount
-      "type=tmpfs,dst=/run/secrets,tmpfs-size=65536,tmpfs-mode=0700"
+      "type=bind,src=$staged_secret,dst=/run/videoprocess-bootstrap-secret,readonly"
     )
   fi
-  if (( ${#docker_args[@]} > 0 )); then
-    run_args+=("${docker_args[@]}")
-  fi
+  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
+    local effective_source="${bind_sources[$index]}"
+    if [[ -n "${bind_file_modes[$index]}" ]]; then
+      effective_source="$run_dir/bind-file-$index"
+    fi
+    run_args+=(
+      --mount
+      "type=bind,src=$effective_source,dst=${bind_targets[$index]}${bind_readonly[$index]}"
+    )
+  done
 
+  local docker_status=0
   docker "${run_args[@]}" \
     --env "VP_PYTHON_WORKER_SECRET_TARGET=$secret_target" \
-    --env "VP_PYTHON_WORKER_PREPARE_DIRS=$prepare_dirs" \
+    --env "VP_PYTHON_WORKER_CALLER_UID=$caller_uid" \
+    --env "VP_PYTHON_WORKER_CALLER_GID=$caller_gid" \
+    --env "VP_PYTHON_WORKER_BIND_SENTINELS=$bind_manifest" \
     "$image" \
     /bin/bash -ceu '
-      runtime_uid=10001
-      runtime_gid=10001
+      runtime_uid="${VP_PYTHON_WORKER_CALLER_UID:?}"
+      runtime_gid="${VP_PYTHON_WORKER_CALLER_GID:?}"
+      [[ "$runtime_uid" =~ ^[0-9]+$ && "$runtime_gid" =~ ^[0-9]+$ ]]
+      [[ "$(id -u)" == "$runtime_uid" && "$(id -g)" == "$runtime_gid" ]]
+      umask 077
+      export HOME=/tmp/vp-python-worker-home
+      mkdir -p "$HOME"
+      chmod 0700 "$HOME"
+
       secret_target="${VP_PYTHON_WORKER_SECRET_TARGET:-}"
       if [[ -n "$secret_target" ]]; then
         [[ "$secret_target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
         [[ -f /run/videoprocess-bootstrap-secret \
           && ! -L /run/videoprocess-bootstrap-secret ]]
-        [[ "$(stat -c "%a" /run/videoprocess-bootstrap-secret)" == 400 ]]
-        chown "$runtime_uid:$runtime_gid" /run/secrets
-        chmod 0700 /run/secrets
+        [[ "$(stat -c "%a:%h" /run/videoprocess-bootstrap-secret)" \
+          == "400:1" ]]
+        [[ -r /run/videoprocess-bootstrap-secret ]]
         install \
-          -o "$runtime_uid" \
-          -g "$runtime_gid" \
           -m 0400 \
           /run/videoprocess-bootstrap-secret \
           "/run/secrets/$secret_target"
-        [[ "$(stat -c "%u:%g:%a" "/run/secrets/$secret_target")" \
-          == "$runtime_uid:$runtime_gid:400" ]]
+        [[ "$(stat -c "%u:%g:%a:%h" "/run/secrets/$secret_target")" \
+          == "$runtime_uid:$runtime_gid:400:1" ]]
       fi
 
-      IFS=, read -r -a prepare_paths \
-        <<<"${VP_PYTHON_WORKER_PREPARE_DIRS:-}"
-      for path in "${prepare_paths[@]}"; do
-        [[ -n "$path" ]] || continue
+      while IFS="|" read -r path sentinel marker extra; do
+        [[ -n "$path" || -n "$sentinel" || -n "$marker" || -n "$extra" ]] \
+          || continue
+        [[ -z "$extra" ]]
         case "$path" in
           /control-state|/runtime-state|/requests) ;;
           *) exit 1 ;;
         esac
+        [[ "$sentinel" =~ ^\.vp-python-worker-bind-[0-9a-f]{32}$ ]]
         [[ -d "$path" && ! -L "$path" ]]
-        if find "$path" -xdev -type l -print -quit | grep -q .; then
-          exit 1
-        fi
-        chown -R "$runtime_uid:$runtime_gid" "$path"
-        chmod 0700 "$path"
-      done
+        [[ "$(stat -c "%a" "$path")" == 700 ]]
+        [[ -f "$path/$sentinel" && ! -L "$path/$sentinel" ]]
+        [[ "$(stat -c "%u:%g:%a:%h" "$path/$sentinel")" \
+          == "$runtime_uid:$runtime_gid:400:1" ]]
+        [[ "$(<"$path/$sentinel")" == "$marker" ]]
+      done <<<"${VP_PYTHON_WORKER_BIND_SENTINELS:-}"
 
-      export HOME=/home/videoprocess-worker
-      exec /usr/bin/setpriv \
-        --reuid="$runtime_uid" \
-        --regid="$runtime_gid" \
-        --clear-groups \
-        --no-new-privs \
-        -- "$@"
-    ' vp-python-worker-bootstrap "${command[@]}"
+      unset \
+        VP_PYTHON_WORKER_SECRET_TARGET \
+        VP_PYTHON_WORKER_CALLER_UID \
+        VP_PYTHON_WORKER_CALLER_GID \
+        VP_PYTHON_WORKER_BIND_SENTINELS
+      exec "$@"
+    ' vp-python-worker-bootstrap "${command[@]}" \
+    || docker_status=$?
+
+  local validation_status=0
+  for ((index = 0; index < ${#bind_sources[@]}; index++)); do
+    if [[ -z "${bind_file_modes[$index]}" ]]; then
+      vp_python_worker_host_guard \
+        finalize-directory \
+        "${bind_sources[$index]}" \
+        "$caller_uid" \
+        "$caller_gid" \
+        "${guard_names[$index]}" \
+        "${guard_markers[$index]}" \
+        "${guard_records[$index]}" \
+        "${bind_targets[$index]}" >/dev/null \
+        || validation_status=1
+    elif [[ -n "${staged_sources[$index]:-}" ]]; then
+      vp_python_worker_host_guard \
+        verify-file \
+        "${staged_sources[$index]}" \
+        "$caller_uid" \
+        "$caller_gid" \
+        "${bind_file_modes[$index]}" \
+        "${staged_records[$index]}" >/dev/null \
+        || validation_status=1
+    fi
+  done
+  if [[ -n "$secret_source" ]]; then
+    vp_python_worker_host_guard \
+      verify-file "$secret_source" "$caller_uid" "$caller_gid" 0400 \
+      "$secret_record" >/dev/null || validation_status=1
+  fi
+  if [[ -n "$run_dir" ]]; then
+    vp_python_worker_host_guard \
+      cleanup-run-dir "$run_dir" "$caller_uid" "$caller_gid" >/dev/null \
+      || validation_status=1
+  fi
+  [[ "$docker_status" -eq 0 && "$validation_status" -eq 0 ]]
 }
 
 vp_worker_admission_root() {
@@ -1660,6 +2506,8 @@ vp_worker_admission_retire_generation() {
       "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker runtime-role owner database URL file"
   )" || return 1
+  mkdir -p "$root/runtime" || return 1
+  chmod 0700 "$root/runtime" || return 1
   vp_run_python_worker_container \
     "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
     "$owner_file" \
@@ -1938,6 +2786,8 @@ vp_worker_control_retire_generation() {
       "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker control-role owner database URL file"
   )" || return 1
+  mkdir -p "$root/control" || return 1
+  chmod 0700 "$root/control" || return 1
   vp_run_python_worker_container \
     "$image" \
     "$owner_file" \
@@ -4555,6 +5405,8 @@ vp_worker_redis_marker_revoke_roles() {
   local control_root="$3"
   local owner_file
   owner_file="$(vp_worker_redis_marker_owner_file)" || return 1
+  mkdir -p "$control_root/roles" || return 1
+  chmod 0700 "$control_root/roles" || return 1
 
   vp_run_python_worker_container \
     "$image" \

@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCHER="$ROOT_DIR/deploy/swarm/worker-redis-marker-control.sh"
 EXTENSION="$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 TEST_ROOT="$(mktemp -d)"
+TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
 FAKE_BIN="$TEST_ROOT/bin"
 DOCKER_CALLS="$TEST_ROOT/docker-calls"
 SERVICE_DIR="$TEST_ROOT/services"
@@ -260,6 +261,7 @@ if [[ "${1:-}" == run ]]; then
   printf 'role|%s|%s\n' "$operation" "$generation" >>"$CONTROL_EVENTS"
   if [[ "$operation" == provision ]]; then
     mkdir -p "$control_state/$generation"
+    chmod 0700 "$control_state/$generation"
     for purpose in readiness janitor repair; do
       printf 'credential-%s-%s\n' "$purpose" "$generation" \
         >"$control_state/$generation/worker-marker-$purpose-database-url"
@@ -1050,16 +1052,22 @@ event_line() {
 reset_marker_transaction_fixture first-ever-unready
 FAKE_READINESS_RESULT=failed
 export FAKE_READINESS_RESULT
+FIRST_FAILURE_LOG="$TEST_ROOT/first-ever-unready.log"
 if vp_prepare_worker_redis_marker_controls \
-  vp-ffmpeg-worker-python:first-ever-unready >/dev/null 2>&1; then
+  vp-ffmpeg-worker-python:first-ever-unready \
+  >"$TEST_ROOT/first-ever-unready.out" 2>"$FIRST_FAILURE_LOG"; then
   fail "first-ever unready marker candidate unexpectedly prepared"
 fi
 FIRST_GENERATION="$(
   awk -F'|' '$1 == "role" && $2 == "provision" { print $3; exit }' \
     "$CONTROL_EVENTS"
 )"
-[[ -n "$FIRST_GENERATION" ]] \
-  || fail "first-ever failure did not provision a candidate generation"
+if [[ -z "$FIRST_GENERATION" ]]; then
+  cat "$FIRST_FAILURE_LOG" >&2
+  cat "$CONTROL_EVENTS" >&2
+  cat "$DOCKER_CALLS" >&2
+  fail "first-ever failure did not provision a candidate generation"
+fi
 FIRST_CONTROL_ROOT="$ROOT/state/worker-redis-marker-control"
 [[ ! -e "$FIRST_CONTROL_ROOT/control.conf" \
   && ! -e "$ROOT/bin/worker-redis-marker-control.sh" ]] \

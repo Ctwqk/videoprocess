@@ -133,6 +133,11 @@ REPO_ROOT="$ROOT_DIR"
 ROOT="$TEST_ROOT/sync"
 export REPO_ROOT ROOT
 source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
+caller_uid="$(id -u)"
+caller_gid="$(id -g)"
+admission_root="$ROOT/state/vp-worker-admission"
+mkdir -p "$admission_root"
+chmod 0700 "$admission_root"
 
 if ! loader_output="$(
   vp_run_python_worker_container \
@@ -140,6 +145,8 @@ if ! loader_output="$(
     "$bind_secret" \
     worker-deploy-read-database-url \
     - \
+    --env "EXPECTED_CALLER_UID=$caller_uid" \
+    --env "EXPECTED_CALLER_GID=$caller_gid" \
     -- \
     /opt/venv/bin/python -I -c '
 import os
@@ -150,26 +157,224 @@ from worker.secret_config import read_mode_0400_secret
 
 path = Path("/run/secrets/worker-deploy-read-database-url")
 metadata = path.lstat()
-assert os.geteuid() == 10001
-assert os.getegid() == 10001
-assert metadata.st_uid == 10001
-assert metadata.st_gid == 10001
+expected_uid = int(os.environ["EXPECTED_CALLER_UID"])
+expected_gid = int(os.environ["EXPECTED_CALLER_GID"])
+assert os.geteuid() == expected_uid
+assert os.getegid() == expected_gid
+assert metadata.st_uid == expected_uid
+assert metadata.st_gid == expected_gid
 assert stat.S_IMODE(metadata.st_mode) == 0o400
 assert read_mode_0400_secret(
     path,
     label="worker deploy-read database URL",
 ) == "synthetic-bind-secret"
-print("python-worker-bind-secret passed uid=10001 gid=10001 mode=0400")
+try:
+    Path(
+        "/usr/local/share/videoprocess/worker-build-commit"
+    ).write_text("f" * 40)
+except OSError:
+    pass
+else:
+    raise AssertionError("read-only one-shot rewrote build identity")
+print(
+    "python-worker-bind-secret passed "
+    f"uid={expected_uid} gid={expected_gid} mode=0400"
+)
 '
 )"; then
   echo "FAIL: exact Python worker image could not read the transported secret" >&2
   exit 1
 fi
-if [[ "$loader_output" != *"python-worker-bind-secret passed uid=10001 gid=10001 mode=0400"* ]]; then
+if [[ "$loader_output" != *"python-worker-bind-secret passed uid=$caller_uid gid=$caller_gid mode=0400"* ]]; then
   echo "FAIL: exact Python worker image did not execute the real secret loader" >&2
   exit 1
 fi
 printf '%s\n' "$loader_output"
+
+runtime_state="$admission_root/exact-caller-runtime"
+request_state="$admission_root/exact-caller-requests"
+mkdir -p "$runtime_state" "$request_state"
+chmod 0700 "$runtime_state" "$request_state"
+if ! provision_output="$(
+  vp_run_python_worker_container \
+    "$image" \
+    "$bind_secret" \
+    worker-runtime-owner-database-url \
+    /runtime-state \
+    --mount "type=bind,src=$runtime_state,dst=/runtime-state" \
+    --env "EXPECTED_CALLER_UID=$caller_uid" \
+    --env "EXPECTED_CALLER_GID=$caller_gid" \
+    -- \
+    /opt/venv/bin/python -I -c '
+import os
+from pathlib import Path
+
+root = Path("/runtime-state/vp-test-service/701")
+root.mkdir(mode=0o700, parents=True)
+credential = root / "worker-database-url"
+credential.write_text("caller-owned-credential\n")
+credential.chmod(0o400)
+state = root / "generation-state.json"
+state.write_text("{}\n")
+state.chmod(0o600)
+assert os.geteuid() == int(os.environ["EXPECTED_CALLER_UID"])
+assert os.getegid() == int(os.environ["EXPECTED_CALLER_GID"])
+print("python-worker-caller-provision passed")
+'
+)"; then
+  echo "FAIL: exact-image caller provision failed" >&2
+  exit 1
+fi
+[[ "$provision_output" == *"python-worker-caller-provision passed"* ]]
+credential_file="$runtime_state/vp-test-service/701/worker-database-url"
+[[ "$(<"$credential_file")" == caller-owned-credential ]]
+[[ "$(stat -f '%u' "$credential_file")" == "$caller_uid" ]]
+[[ "$(stat -f '%g' "$credential_file")" == "$caller_gid" ]]
+[[ "$(stat -f '%Lp' "$credential_file")" == 400 ]]
+
+if ! render_output="$(
+  vp_run_python_worker_container \
+    "$image" \
+    - \
+    - \
+    /requests \
+    --mount "type=bind,src=$runtime_state,dst=/runtime-state,readonly" \
+    --mount "type=bind,src=$request_state,dst=/requests" \
+    -- \
+    /opt/venv/bin/python -I -c '
+from pathlib import Path
+
+credential = Path(
+    "/runtime-state/vp-test-service/701/worker-database-url"
+).read_text()
+assert credential == "caller-owned-credential\n"
+request_dir = Path("/requests/701")
+request_dir.mkdir(mode=0o700)
+request = request_dir / "upsert.json"
+request.write_text("{\"generation\":701}\n")
+request.chmod(0o600)
+print("python-worker-caller-render passed")
+'
+)"; then
+  echo "FAIL: exact-image caller render failed" >&2
+  exit 1
+fi
+[[ "$render_output" == *"python-worker-caller-render passed"* ]]
+request_file="$request_state/701/upsert.json"
+[[ "$(<"$request_file")" == '{"generation":701}' ]]
+[[ "$(stat -f '%u' "$request_file")" == "$caller_uid" ]]
+[[ "$(stat -f '%g' "$request_file")" == "$caller_gid" ]]
+[[ "$(stat -f '%Lp' "$request_file")" == 600 ]]
+
+if ! revoke_output="$(
+  vp_run_python_worker_container \
+    "$image" \
+    "$bind_secret" \
+    worker-runtime-owner-database-url \
+    /runtime-state \
+    --mount "type=bind,src=$runtime_state,dst=/runtime-state" \
+    -- \
+    /opt/venv/bin/python -I -c '
+from pathlib import Path
+
+generation = Path("/runtime-state/vp-test-service/701")
+for filename in ("worker-database-url", "generation-state.json"):
+    (generation / filename).unlink()
+generation.rmdir()
+generation.parent.rmdir()
+print("python-worker-caller-revoke passed")
+'
+)"; then
+  echo "FAIL: exact-image caller revoke reuse failed" >&2
+  exit 1
+fi
+[[ "$revoke_output" == *"python-worker-caller-revoke passed"* ]]
+[[ -d "$runtime_state" && -r "$runtime_state" && -w "$runtime_state" ]]
+if [[ -e "$runtime_state/vp-test-service" ]]; then
+  echo "FAIL: caller revoke did not remove its operation state" >&2
+  exit 1
+fi
+printf '%s\n' "$provision_output" "$render_output" "$revoke_output"
+
+run_simulated_controller() {
+  local simulated_uid="$1"
+  local simulated_gid="$2"
+  docker run --rm \
+    --user "$simulated_uid:$simulated_gid" \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16777216,mode=1777 \
+    --mount \
+    "type=bind,src=$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh,dst=/test/deploy-sync-extension.sh,readonly" \
+    --env "SIMULATED_UID=$simulated_uid" \
+    --env "SIMULATED_GID=$simulated_gid" \
+    "$image" \
+    /bin/bash -ceu '
+      ROOT=/tmp/sync
+      REPO_ROOT=/tmp/repos
+      mkdir -p "$ROOT/state/vp-worker-admission"
+      chmod 0700 "$ROOT/state/vp-worker-admission"
+      source /test/deploy-sync-extension.sh
+
+      docker() {
+        local joined=" $* "
+        [[ "$joined" == *" --user $SIMULATED_UID:$SIMULATED_GID "* ]]
+        [[ "$joined" == *" --read-only "* ]]
+        [[ "$joined" == *" --cap-drop ALL "* ]]
+        [[ "$joined" != *" chown -R "* ]]
+        local argument
+        local state_source=""
+        for argument in "$@"; do
+          case "$argument" in
+            type=bind,src=*,dst=/runtime-state)
+              state_source="${argument#type=bind,src=}"
+              state_source="${state_source%,dst=/runtime-state}"
+              ;;
+          esac
+        done
+        [[ -n "$state_source" ]]
+        compgen -G "$state_source/.vp-python-worker-bind-*" >/dev/null
+        mkdir -p "$state_source/controller-output"
+        chmod 0700 "$state_source/controller-output"
+        printf "%s\n" "simulated-controller" \
+          >"$state_source/controller-output/read-back"
+        chmod 0600 "$state_source/controller-output/read-back"
+      }
+
+      secret="$ROOT/controller-secret"
+      state="$ROOT/controller-state"
+      printf "%s\n" "simulated-secret" >"$secret"
+      chmod 0400 "$secret"
+      mkdir -p "$state"
+      chmod 0700 "$state"
+      vp_run_python_worker_container \
+        synthetic-image \
+        "$secret" \
+        simulated-secret \
+        /runtime-state \
+        --mount "type=bind,src=$state,dst=/runtime-state" \
+        -- \
+        /bin/true
+      [[ "$(<"$state/controller-output/read-back")" \
+        == simulated-controller ]]
+      [[ "$(stat -c "%u:%g:%a" "$state")" \
+        == "$SIMULATED_UID:$SIMULATED_GID:700" ]]
+      [[ "$(stat -c "%u:%g:%a" \
+        "$state/controller-output/read-back")" \
+        == "$SIMULATED_UID:$SIMULATED_GID:600" ]]
+      if printf "%s\n" forged \
+        >/usr/local/share/videoprocess/worker-build-commit 2>/dev/null; then
+        echo "FAIL: simulated root controller rewrote image identity" >&2
+        exit 1
+      fi
+      printf "python-worker-simulated-controller passed uid=%s gid=%s\n" \
+        "$SIMULATED_UID" "$SIMULATED_GID"
+    '
+}
+
+run_simulated_controller 1000 1000
+run_simulated_controller 0 0
 
 if ! fresh_evidence_output="$(
   docker run --rm \

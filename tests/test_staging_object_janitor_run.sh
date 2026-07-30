@@ -4,7 +4,22 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCHER="$ROOT_DIR/deploy/swarm/staging-object-janitor-run.sh"
 TEST_ROOT="$(mktemp -d)"
-trap 'status=$?; rm -rf "$TEST_ROOT"; exit "$status"' EXIT
+REAL_DOCKER="$(command -v docker)"
+REAL_HOLDER=""
+REAL_VOLUME=""
+
+cleanup() {
+  local status=$?
+  if [[ -n "$REAL_HOLDER" ]]; then
+    "$REAL_DOCKER" container rm -f "$REAL_HOLDER" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$REAL_VOLUME" ]]; then
+    "$REAL_DOCKER" volume rm "$REAL_VOLUME" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$TEST_ROOT"
+  exit "$status"
+}
+trap cleanup EXIT
 
 FAKE_BIN="$TEST_ROOT/bin"
 CALLS="$TEST_ROOT/calls"
@@ -12,8 +27,27 @@ SERVICE_STATE="$TEST_ROOT/service-state"
 TASK_STATE_FILE="$TEST_ROOT/task-state"
 SPEC_FILE="$TEST_ROOT/spec.json"
 VOLUME_STATE="$TEST_ROOT/volume-state"
+VOLUME_JSON_FILE="$TEST_ROOT/volume.json"
+HOLDER_STATE="$TEST_ROOT/holder-state"
+HOLDER_ID="$(printf 'a%.0s' {1..64})"
+SERVICE_ID="s1234567890abcdefghijklmn"
+TASK_ID="t1234567890abcdefghijklmn"
+TASK_CONTAINER_ID="$(printf 'b%.0s' {1..64})"
+IMAGE_ID="sha256:$(printf 'c%.0s' {1..64})"
 mkdir -p "$FAKE_BIN"
-export CALLS SERVICE_STATE TASK_STATE_FILE SPEC_FILE VOLUME_STATE
+export \
+  CALLS \
+  SERVICE_STATE \
+  TASK_STATE_FILE \
+  SPEC_FILE \
+  VOLUME_STATE \
+  VOLUME_JSON_FILE \
+  HOLDER_STATE \
+  HOLDER_ID \
+  SERVICE_ID \
+  TASK_ID \
+  TASK_CONTAINER_ID \
+  IMAGE_ID
 
 cat >"$FAKE_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -24,14 +58,19 @@ if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
   printf 'vp-pipeline-network-id|vp-pipeline-net|overlay|swarm\n'
   exit 0
 fi
+if [[ "${1:-} ${2:-}" == "image inspect" ]]; then
+  printf '%s\n' "$IMAGE_ID"
+  exit 0
+fi
 if [[ "${1:-} ${2:-}" == "volume inspect" ]]; then
   [[ -f "$VOLUME_STATE" ]] || exit 1
-  volume_name=vp-staging-janitor-evidence
   if [[ "${FAIL_VOLUME_IDENTITY:-0}" == 1 ]]; then
-    volume_name=unexpected-evidence-volume
+    sed \
+      's/"Name": "vp-staging-janitor-evidence"/"Name": "unexpected-evidence-volume"/' \
+      "$VOLUME_JSON_FILE"
+  else
+    cat "$VOLUME_JSON_FILE"
   fi
-  printf '{"Name":"%s","Driver":"local","Scope":"local","Options":null,"Labels":{"vp.videoprocess.volume":"staging-object-janitor-evidence"}}\n' \
-    "$volume_name"
   exit 0
 fi
 if [[ "${1:-} ${2:-}" == "volume create" ]]; then
@@ -39,23 +78,221 @@ if [[ "${1:-} ${2:-}" == "volume create" ]]; then
   printf '%s\n' "${*: -1}"
   exit 0
 fi
+if [[ "${1:-} ${2:-}" == "container inspect" ]]; then
+  reference="${3:-}"
+  if [[ "$reference" == "$TASK_CONTAINER_ID" ]]; then
+    [[ -f "$SERVICE_STATE" ]] || exit 1
+    python3 - <<'PY'
+import json
+import os
+
+print(
+    json.dumps(
+        {
+            "Id": os.environ["TASK_CONTAINER_ID"],
+            "Config": {
+                "Labels": {
+                    "com.docker.swarm.service.id": os.environ["SERVICE_ID"],
+                    "com.docker.swarm.task.id": os.environ["TASK_ID"],
+                    "com.docker.swarm.service.name": (
+                        "vp-staging-object-janitor"
+                    ),
+                }
+            },
+            "Mounts": [
+                {
+                    "Type": "volume",
+                    "Name": "vp-staging-janitor-evidence",
+                    "Source": (
+                        "/var/lib/docker/volumes/"
+                        "vp-staging-janitor-evidence/_data"
+                    ),
+                    "Destination": (
+                        "/run/videoprocess/staging-janitor"
+                    ),
+                    "Driver": "local",
+                    "Mode": "z",
+                    "RW": True,
+                }
+            ],
+            "State": {"Status": "running"},
+        },
+        separators=(",", ":"),
+    )
+)
+PY
+    exit 0
+  fi
+  [[ "$reference" == "$HOLDER_ID" \
+    || "$reference" == "$EXPECTED_HOLDER_NAME" ]] || exit 1
+  [[ -f "$HOLDER_STATE" ]] || exit 1
+  python3 - <<'PY'
+import json
+import os
+
+status, raw_exit = open(
+    os.environ["HOLDER_STATE"],
+    encoding="utf-8",
+).read().strip().split("|", 1)
+generation = os.environ["EXPECTED_GENERATION"]
+if os.environ.get("HOLDER_LABEL_MISMATCH") == "1":
+    generation = "c-ffffffffffffffffffff"
+labels = {
+    "vp.videoprocess.holder": "staging-object-janitor-evidence",
+    "vp.videoprocess.generation": generation,
+    "vp.videoprocess.transaction": (
+        "staging-object-janitor:" + generation
+    ),
+    "vp.videoprocess.volume": "vp-staging-janitor-evidence",
+    "vp.videoprocess.volume-identity": os.environ["VOLUME_IDENTITY"],
+    "vp.videoprocess.image-id": os.environ["IMAGE_ID"],
+}
+print(
+    json.dumps(
+        {
+            "Id": os.environ["HOLDER_ID"],
+            "Name": "/" + os.environ["EXPECTED_HOLDER_NAME"],
+            "Image": os.environ["IMAGE_ID"],
+            "Config": {
+                "Image": os.environ["EXPECTED_IMAGE"],
+                "User": "0:0",
+                "Labels": {
+                    "org.opencontainers.image.revision": "test",
+                    **labels,
+                },
+                "Cmd": [
+                    "/opt/venv/bin/python",
+                    "-I",
+                    "-m",
+                    "app.channel_agent.staging_object_janitor_cli",
+                    "prepare-evidence",
+                ],
+            },
+            "HostConfig": {
+                "AutoRemove": False,
+                "ReadonlyRootfs": True,
+                "NetworkMode": "none",
+                "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+                "CapDrop": ["ALL"],
+                "CapAdd": [
+                    "CAP_CHOWN",
+                    "CAP_DAC_OVERRIDE",
+                    "CAP_FOWNER",
+                ],
+                "SecurityOpt": ["no-new-privileges"],
+                "Tmpfs": {
+                    "/tmp": "rw,nosuid,nodev,noexec,mode=1777"
+                },
+            },
+            "Mounts": [
+                {
+                    "Type": "volume",
+                    "Name": "vp-staging-janitor-evidence",
+                    "Source": (
+                        "/var/lib/docker/volumes/"
+                        "vp-staging-janitor-evidence/_data"
+                    ),
+                    "Destination": (
+                        "/run/videoprocess/staging-janitor"
+                    ),
+                    "Driver": "local",
+                    "Mode": "z",
+                    "RW": True,
+                }
+            ],
+            "State": {
+                "Status": status,
+                "Running": status == "running",
+                "ExitCode": int(raw_exit),
+            },
+        },
+        separators=(",", ":"),
+    )
+)
+PY
+  exit 0
+fi
+if [[ "${1:-} ${2:-}" == "container create" ]]; then
+  [[ ! -f "$HOLDER_STATE" ]]
+  if [[ "${FAIL_HOLDER_CREATE:-0}" == 1 ]]; then
+    exit 41
+  fi
+  printf 'created|0\n' >"$HOLDER_STATE"
+  printf '%s\n' "$HOLDER_ID"
+  exit 0
+fi
+if [[ "${1:-} ${2:-}" == "container start" ]]; then
+  [[ "${3:-}" == "--attach" && "${4:-}" == "$HOLDER_ID" ]]
+  if [[ "${FAIL_EVIDENCE_PREPARE:-0}" == 1 ]]; then
+    printf 'exited|3\n' >"$HOLDER_STATE"
+    exit 3
+  fi
+  printf 'exited|0\n' >"$HOLDER_STATE"
+  printf '{"action":"prepare-evidence","status":"ok"}\n'
+  exit 0
+fi
+if [[ "${1:-} ${2:-}" == "container wait" ]]; then
+  [[ "${3:-}" == "$HOLDER_ID" ]]
+  printf 'exited|0\n' >"$HOLDER_STATE"
+  printf '0\n'
+  exit 0
+fi
+if [[ "${1:-} ${2:-}" == "container rm" ]]; then
+  [[ "${3:-}" == "$HOLDER_ID" ]]
+  if [[ "${FAIL_HOLDER_RELEASE:-0}" == 1 ]]; then
+    exit 42
+  fi
+  rm -f "$HOLDER_STATE"
+  exit 0
+fi
+if [[ "${1:-} ${2:-}" == "container ls" ]]; then
+  if [[ -f "$SERVICE_STATE" \
+    && "${FAIL_TASK_ACQUISITION:-0}" != 1 ]]; then
+    printf '%s\n' "$TASK_CONTAINER_ID"
+  fi
+  exit 0
+fi
 if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
   [[ -f "$SERVICE_STATE" ]] || exit 1
-  if [[ "$*" == *'{{json .Spec}}'* ]]; then
+  if [[ "$*" == *'{{json .}}'* ]]; then
+    SERVICE_SPEC_JSON="$(<"$SPEC_FILE")" python3 - <<'PY'
+import json
+import os
+
+print(
+    json.dumps(
+        {
+            "ID": os.environ["SERVICE_ID"],
+            "Spec": json.loads(os.environ["SERVICE_SPEC_JSON"]),
+        },
+        separators=(",", ":"),
+    )
+)
+PY
+  elif [[ "$*" == *'{{json .Spec}}'* ]]; then
     cat "$SPEC_FILE"
   fi
   exit 0
 fi
 if [[ "${1:-} ${2:-}" == "service ps" ]]; then
+  if [[ "$*" == *'{{.ID}}|'* ]]; then
+    printf '%s|' "$TASK_ID"
+  fi
   cat "$TASK_STATE_FILE"
   exit 0
 fi
 if [[ "${1:-} ${2:-}" == "service rm" ]]; then
+  [[ "${3:-}" == "$SERVICE_ID" ]]
   rm -f "$SERVICE_STATE"
   exit 0
 fi
 if [[ "${1:-} ${2:-}" == "service create" ]]; then
+  if [[ "${FAIL_SERVICE_CREATE:-0}" == 1 ]]; then
+    exit 43
+  fi
   : >"$SERVICE_STATE"
+  printf 'Running|Running 1 second ago\n' >"$TASK_STATE_FILE"
+  printf '%s\n' "$SERVICE_ID"
   exit 0
 fi
 if [[ "${1:-}" == run ]]; then
@@ -65,6 +302,11 @@ fi
 exit 90
 EOF
 chmod +x "$FAKE_BIN/docker"
+cat >"$FAKE_BIN/sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$FAKE_BIN/sleep"
 PATH="$FAKE_BIN:$PATH"
 export PATH
 
@@ -74,6 +316,7 @@ database_secret=vp-staging-db-test
 minio_access_secret=vp-staging-minio-access-test
 minio_secret_secret=vp-staging-minio-secret-test
 evidence_volume=vp-staging-janitor-evidence
+holder_name="vp-staging-janitor-evidence-holder-$generation"
 config="$TEST_ROOT/janitor.conf"
 cat >"$config" <<EOF
 VERSION=2
@@ -89,9 +332,56 @@ MANAGER_NODE=ccttww-lap
 EOF
 chmod 0600 "$config"
 export VP_STAGING_JANITOR_CONFIG_FILE="$config"
+cat >"$VOLUME_JSON_FILE" <<EOF
+{
+  "CreatedAt": "2026-07-29T12:00:00Z",
+  "Driver": "local",
+  "Labels": {
+    "vp.videoprocess.volume": "staging-object-janitor-evidence"
+  },
+  "Mountpoint": "/var/lib/docker/volumes/$evidence_volume/_data",
+  "Name": "$evidence_volume",
+  "Options": null,
+  "Scope": "local"
+}
+EOF
+VOLUME_IDENTITY="$(
+  python3 - "$VOLUME_JSON_FILE" <<'PY'
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    volume = json.load(handle)
+identity = {
+    "CreatedAt": volume["CreatedAt"],
+    "Driver": volume["Driver"],
+    "Labels": volume["Labels"],
+    "Mountpoint": volume["Mountpoint"],
+    "Name": volume["Name"],
+    "Options": volume["Options"],
+    "Scope": volume["Scope"],
+}
+encoded = json.dumps(
+    identity,
+    sort_keys=True,
+    separators=(",", ":"),
+).encode()
+print(hashlib.sha256(encoded).hexdigest())
+PY
+)"
+EXPECTED_HOLDER_NAME="$holder_name"
+EXPECTED_GENERATION="$generation"
+EXPECTED_IMAGE="$image"
+export \
+  VOLUME_IDENTITY \
+  EXPECTED_HOLDER_NAME \
+  EXPECTED_GENERATION \
+  EXPECTED_IMAGE
 
 cat >"$SPEC_FILE" <<EOF
 {
+  "Name": "vp-staging-object-janitor",
   "Labels": {
     "vp.videoprocess.job": "staging-object-janitor",
     "vp.videoprocess.generation": "$generation"
@@ -134,15 +424,87 @@ cat >"$SPEC_FILE" <<EOF
 }
 EOF
 cp "$SPEC_FILE" "$TEST_ROOT/valid-spec.json"
+printf 'Running|Running 1 second ago\n' >"$TASK_STATE_FILE"
 
 bash "$LAUNCHER"
 grep -Fq \
   'docker|volume create --driver local --label vp.videoprocess.volume=staging-object-janitor-evidence vp-staging-janitor-evidence' \
   "$CALLS"
+if ! grep -Fq -- \
+  "docker|container create --name $holder_name" \
+  "$CALLS"; then
+  echo 'FAIL: evidence preparation did not create a transaction-owned holder' >&2
+  exit 1
+fi
 grep -Fq -- \
-  "docker|run --rm --user 0:0 --mount type=volume,src=$evidence_volume,dst=/run/videoprocess/staging-janitor $image /opt/venv/bin/python -I -m app.channel_agent.staging_object_janitor_cli prepare-evidence" \
+  "--label vp.videoprocess.holder=staging-object-janitor-evidence" \
+  "$CALLS"
+grep -Fq -- \
+  "--label vp.videoprocess.generation=$generation" \
+  "$CALLS"
+grep -Fq -- \
+  "--label vp.videoprocess.transaction=staging-object-janitor:$generation" \
+  "$CALLS"
+grep -Fq -- \
+  "--label vp.videoprocess.volume-identity=$VOLUME_IDENTITY" \
+  "$CALLS"
+grep -Fq -- '--read-only --network none --restart no' "$CALLS"
+grep -Fq -- '--cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER' \
+  "$CALLS"
+grep -Fq \
+  "docker|container start --attach $HOLDER_ID" \
   "$CALLS"
 grep -Fq 'docker|service create' "$CALLS"
+grep -Fq \
+  "docker|service inspect $SERVICE_ID --format {{json .}}" \
+  "$CALLS"
+grep -Fq \
+  "docker|service ps $SERVICE_ID --no-trunc --format {{.ID}}|{{.DesiredState}}|{{.CurrentState}}" \
+  "$CALLS"
+grep -Fq \
+  "docker|container ls --all --no-trunc --filter label=com.docker.swarm.service.id=$SERVICE_ID --filter label=com.docker.swarm.task.id=$TASK_ID --format {{.ID}}" \
+  "$CALLS"
+grep -Fq \
+  "docker|container inspect $TASK_CONTAINER_ID --format {{json .}}" \
+  "$CALLS"
+grep -Fq \
+  "docker|container rm $HOLDER_ID" \
+  "$CALLS"
+if grep -Fq 'docker|run --rm' "$CALLS"; then
+  echo 'FAIL: evidence preparation escaped the transaction holder' >&2
+  exit 1
+fi
+holder_create_line="$(
+  grep -nF "docker|container create --name $holder_name" "$CALLS" \
+    | head -1 | cut -d: -f1
+)"
+holder_start_line="$(
+  grep -nF "docker|container start --attach $HOLDER_ID" "$CALLS" \
+    | head -1 | cut -d: -f1
+)"
+service_create_line="$(
+  grep -nF 'docker|service create' "$CALLS" | head -1 | cut -d: -f1
+)"
+service_inspect_line="$(
+  grep -nF "docker|service inspect $SERVICE_ID --format {{json .}}" \
+    "$CALLS" | head -1 | cut -d: -f1
+)"
+task_inspect_line="$(
+  grep -nF "docker|container inspect $TASK_CONTAINER_ID --format {{json .}}" \
+    "$CALLS" | head -1 | cut -d: -f1
+)"
+holder_release_line="$(
+  grep -nF "docker|container rm $HOLDER_ID" "$CALLS" \
+    | head -1 | cut -d: -f1
+)"
+if [[ "$holder_create_line" -ge "$holder_start_line" \
+  || "$holder_start_line" -ge "$service_create_line" \
+  || "$service_create_line" -ge "$service_inspect_line" \
+  || "$service_inspect_line" -ge "$task_inspect_line" \
+  || "$task_inspect_line" -ge "$holder_release_line" ]]; then
+  echo 'FAIL: evidence holder did not span prepare through task acquisition' >&2
+  exit 1
+fi
 grep -Fq -- '--user 10001:10001' "$CALLS"
 grep -Fq -- '--mode replicated-job --replicas 1 --max-concurrent 1' "$CALLS"
 grep -Fq -- '--constraint node.hostname==ccttww-lap' "$CALLS"
@@ -225,13 +587,14 @@ fi
 : >"$CALLS"
 printf 'Shutdown|Complete 2 seconds ago\n' >"$TASK_STATE_FILE"
 bash "$LAUNCHER"
-grep -Fq 'docker|service rm vp-staging-object-janitor' "$CALLS"
+grep -Fq "docker|service rm $SERVICE_ID" "$CALLS"
 grep -Fq 'docker|service create' "$CALLS"
+grep -Fq "docker|container rm $HOLDER_ID" "$CALLS"
 
 : >"$CALLS"
 printf 'Shutdown|Complete 2 seconds ago\n' >"$TASK_STATE_FILE"
 bash "$LAUNCHER" retire
-grep -Fq 'docker|service rm vp-staging-object-janitor' "$CALLS"
+grep -Fq "docker|service rm $SERVICE_ID" "$CALLS"
 if grep -Fq 'docker|service create' "$CALLS"; then
   echo 'FAIL: terminal staging janitor retirement recreated the job' >&2
   exit 1
@@ -283,6 +646,8 @@ if grep -Fq 'docker|service rm' "$CALLS"; then
   exit 1
 fi
 
+rm -f "$SERVICE_STATE"
+cp "$TEST_ROOT/valid-spec.json" "$SPEC_FILE"
 bad_config="$TEST_ROOT/bad-generation.conf"
 sed 's/^GENERATION=.*/GENERATION=c-ffffffffffffffffffff/' \
   "$config" >"$bad_config"
@@ -325,6 +690,8 @@ if grep -Eq 'docker\|(volume|run|service create)' "$CALLS"; then
 fi
 
 rm -f "$SERVICE_STATE"
+rm -f "$HOLDER_STATE"
+cp "$TEST_ROOT/valid-spec.json" "$SPEC_FILE"
 : >"$CALLS"
 if FAIL_EVIDENCE_PREPARE=1 bash "$LAUNCHER" >/dev/null 2>&1; then
   echo 'FAIL: failed evidence preparation was accepted' >&2
@@ -334,16 +701,294 @@ if grep -Fq 'docker|service create' "$CALLS"; then
   echo 'FAIL: failed evidence preparation created the janitor service' >&2
   exit 1
 fi
+if [[ ! -f "$HOLDER_STATE" || ! -f "$VOLUME_STATE" ]]; then
+  echo 'FAIL: failed evidence preparation did not retain holder and evidence' >&2
+  exit 1
+fi
+if grep -Eq 'docker\|(container rm|volume rm)' "$CALLS"; then
+  echo 'FAIL: failed evidence preparation released its pin or evidence' >&2
+  exit 1
+fi
 
+: >"$CALLS"
+bash "$LAUNCHER"
+if grep -Fq 'docker|container create' "$CALLS"; then
+  echo 'FAIL: evidence preparation retry replaced the exact stale holder' >&2
+  exit 1
+fi
+grep -Fq "docker|container start --attach $HOLDER_ID" "$CALLS"
+grep -Fq 'docker|service create' "$CALLS"
+grep -Fq "docker|container inspect $TASK_CONTAINER_ID --format {{json .}}" \
+  "$CALLS"
+grep -Fq "docker|container rm $HOLDER_ID" "$CALLS"
+
+rm -f "$SERVICE_STATE" "$HOLDER_STATE"
+: >"$CALLS"
+if FAIL_SERVICE_CREATE=1 bash "$LAUNCHER" >/dev/null 2>&1; then
+  echo 'FAIL: failed service creation was accepted' >&2
+  exit 1
+fi
+if [[ ! -f "$HOLDER_STATE" || ! -f "$VOLUME_STATE" ]]; then
+  echo 'FAIL: failed service creation did not retain holder and evidence' >&2
+  exit 1
+fi
+if grep -Eq 'docker\|(container rm|volume rm)' "$CALLS"; then
+  echo 'FAIL: failed service creation released its pin or evidence' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+bash "$LAUNCHER"
+if grep -Fq 'docker|container create' "$CALLS"; then
+  echo 'FAIL: service creation retry replaced the exact stale holder' >&2
+  exit 1
+fi
+grep -Fq 'docker|service create' "$CALLS"
+grep -Fq "docker|container rm $HOLDER_ID" "$CALLS"
+
+rm -f "$SERVICE_STATE" "$HOLDER_STATE"
+: >"$CALLS"
+if FAIL_TASK_ACQUISITION=1 bash "$LAUNCHER" >/dev/null 2>&1; then
+  echo 'FAIL: missing service task volume acquisition was accepted' >&2
+  exit 1
+fi
+if [[ ! -f "$SERVICE_STATE" || ! -f "$HOLDER_STATE" \
+  || ! -f "$VOLUME_STATE" ]]; then
+  echo 'FAIL: task acquisition failure did not retain service holder state' >&2
+  exit 1
+fi
+if grep -Eq 'docker\|(container rm|volume rm)' "$CALLS"; then
+  echo 'FAIL: task acquisition failure released its pin or evidence' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+bash "$LAUNCHER"
+if grep -Fq 'docker|service create' "$CALLS"; then
+  echo 'FAIL: task acquisition retry replaced the existing service' >&2
+  exit 1
+fi
+grep -Fq "docker|service inspect $SERVICE_ID --format {{json .}}" "$CALLS"
+grep -Fq "docker|container inspect $TASK_CONTAINER_ID --format {{json .}}" \
+  "$CALLS"
+grep -Fq "docker|container rm $HOLDER_ID" "$CALLS"
+
+rm -f "$SERVICE_STATE" "$HOLDER_STATE"
+: >"$CALLS"
+if FAIL_HOLDER_RELEASE=1 bash "$LAUNCHER" >/dev/null 2>&1; then
+  echo 'FAIL: failed holder release was accepted' >&2
+  exit 1
+fi
+if [[ ! -f "$SERVICE_STATE" || ! -f "$HOLDER_STATE" ]]; then
+  echo 'FAIL: failed holder release discarded retry state' >&2
+  exit 1
+fi
+: >"$CALLS"
+bash "$LAUNCHER"
+if grep -Eq 'docker\|(service create|container create)' "$CALLS"; then
+  echo 'FAIL: holder release retry replaced acquired service state' >&2
+  exit 1
+fi
+grep -Fq "docker|container rm $HOLDER_ID" "$CALLS"
+
+rm -f "$SERVICE_STATE"
+printf 'created|0\n' >"$HOLDER_STATE"
+: >"$CALLS"
+if HOLDER_LABEL_MISMATCH=1 bash "$LAUNCHER" >/dev/null 2>&1; then
+  echo 'FAIL: mismatched stale holder was accepted' >&2
+  exit 1
+fi
+if [[ ! -f "$HOLDER_STATE" || ! -f "$VOLUME_STATE" ]]; then
+  echo 'FAIL: mismatched stale holder or evidence was removed' >&2
+  exit 1
+fi
+if grep -Eq 'docker\|(container rm|container create|service create|volume rm)' \
+  "$CALLS"; then
+  echo 'FAIL: mismatched stale holder caused Docker mutation' >&2
+  exit 1
+fi
+
+rm -f "$SERVICE_STATE"
+printf 'running|0\n' >"$HOLDER_STATE"
+: >"$CALLS"
+bash "$LAUNCHER"
+if grep -Eq 'docker\|(container create|container start)' "$CALLS"; then
+  echo 'FAIL: running stale holder was replaced or restarted' >&2
+  exit 1
+fi
+grep -Fq "docker|container wait $HOLDER_ID" "$CALLS"
+grep -Fq 'docker|service create' "$CALLS"
+grep -Fq "docker|container rm $HOLDER_ID" "$CALLS"
+
+rm -f "$SERVICE_STATE"
+rm -f "$HOLDER_STATE"
 : >"$CALLS"
 if FAIL_VOLUME_IDENTITY=1 bash "$LAUNCHER" >/dev/null 2>&1; then
   echo 'FAIL: mismatched evidence volume identity was accepted' >&2
   exit 1
 fi
-if grep -Fq 'docker|run' "$CALLS" \
-  || grep -Fq 'docker|service create' "$CALLS"; then
+if grep -Eq 'docker\|(run|container create|service create|volume rm)' "$CALLS"; then
   echo 'FAIL: mismatched evidence volume was prepared or launched' >&2
   exit 1
+fi
+
+if [[ -n "${VP_STAGING_JANITOR_REAL_DOCKER_IMAGE:-}" ]]; then
+  suffix="round4-$$-$RANDOM"
+  REAL_VOLUME="vp-staging-janitor-pin-$suffix"
+  REAL_HOLDER="vp-staging-janitor-holder-$suffix"
+  test_label="vp.videoprocess.test-holder-pin=$suffix"
+  "$REAL_DOCKER" volume create \
+    --driver local \
+    --label "$test_label" \
+    "$REAL_VOLUME" >/dev/null
+  identity_before="$(
+    "$REAL_DOCKER" volume inspect "$REAL_VOLUME" --format '{{json .}}' \
+      | python3 -c \
+        'import hashlib,json,sys; print(hashlib.sha256(json.dumps(json.load(sys.stdin),sort_keys=True,separators=(",",":")).encode()).hexdigest())'
+  )"
+  real_image_id="$(
+    "$REAL_DOCKER" image inspect \
+      "$VP_STAGING_JANITOR_REAL_DOCKER_IMAGE" \
+      --format '{{.Id}}'
+  )"
+  "$REAL_DOCKER" container create \
+    --name "$REAL_HOLDER" \
+    --label vp.videoprocess.holder=staging-object-janitor-evidence \
+    --label vp.videoprocess.generation=c-0123456789abcdef0123 \
+    --label vp.videoprocess.transaction=staging-object-janitor:c-0123456789abcdef0123 \
+    --label "vp.videoprocess.volume=$REAL_VOLUME" \
+    --label "vp.videoprocess.volume-identity=$identity_before" \
+    --label "vp.videoprocess.image-id=$real_image_id" \
+    --label "$test_label" \
+    --user 0:0 \
+    --read-only \
+    --network none \
+    --restart no \
+    --cap-drop ALL \
+    --cap-add CHOWN \
+    --cap-add DAC_OVERRIDE \
+    --cap-add FOWNER \
+    --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
+    --mount "type=volume,src=$REAL_VOLUME,dst=/run/videoprocess/staging-janitor" \
+    "$VP_STAGING_JANITOR_REAL_DOCKER_IMAGE" \
+    /opt/venv/bin/python -I -m \
+    app.channel_agent.staging_object_janitor_cli prepare-evidence >/dev/null
+  "$REAL_DOCKER" container start --attach "$REAL_HOLDER" >/dev/null
+  "$REAL_DOCKER" container inspect "$REAL_HOLDER" --format '{{json .}}' \
+    | EXPECTED_REAL_HOLDER="/$REAL_HOLDER" \
+      EXPECTED_REAL_IMAGE="$VP_STAGING_JANITOR_REAL_DOCKER_IMAGE" \
+      EXPECTED_REAL_IMAGE_ID="$real_image_id" \
+      EXPECTED_REAL_VOLUME="$REAL_VOLUME" \
+      python3 -c '
+import json
+import os
+import sys
+
+holder = json.load(sys.stdin)
+host = holder["HostConfig"]
+mounts = holder["Mounts"]
+labels = holder["Config"]["Labels"]
+assert holder["Name"] == os.environ["EXPECTED_REAL_HOLDER"]
+assert holder["Image"] == os.environ["EXPECTED_REAL_IMAGE_ID"]
+assert holder["Config"]["Image"] == os.environ["EXPECTED_REAL_IMAGE"]
+assert holder["Config"]["User"] == "0:0"
+assert holder["Config"]["Cmd"] == [
+    "/opt/venv/bin/python",
+    "-I",
+    "-m",
+    "app.channel_agent.staging_object_janitor_cli",
+    "prepare-evidence",
+]
+assert host["ReadonlyRootfs"] is True
+assert host["AutoRemove"] is False
+assert host["NetworkMode"] == "none"
+assert host["RestartPolicy"]["Name"] == "no"
+assert host["RestartPolicy"]["MaximumRetryCount"] == 0
+assert host["Binds"] is None
+assert host["CapDrop"] == ["ALL"]
+assert set(host["CapAdd"]) == {
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FOWNER",
+}, host["CapAdd"]
+assert set(host["SecurityOpt"]) in (
+    {"no-new-privileges"},
+    {"no-new-privileges:true"},
+)
+assert set(host["Tmpfs"]) == {"/tmp"}
+assert set(host["Tmpfs"]["/tmp"].split(",")) == {
+    "rw",
+    "nosuid",
+    "nodev",
+    "noexec",
+    "mode=1777",
+}
+assert labels["vp.videoprocess.image-id"] == os.environ["EXPECTED_REAL_IMAGE_ID"]
+assert labels["vp.videoprocess.transaction"] == (
+    "staging-object-janitor:c-0123456789abcdef0123"
+)
+assert labels["vp.videoprocess.volume"] == os.environ["EXPECTED_REAL_VOLUME"]
+assert len(mounts) == 1
+assert mounts[0]["Type"] == "volume"
+assert mounts[0]["Name"] == os.environ["EXPECTED_REAL_VOLUME"]
+assert mounts[0]["Destination"] == "/run/videoprocess/staging-janitor"
+assert mounts[0]["RW"] is True
+assert holder["State"]["Status"] == "exited"
+assert holder["State"]["ExitCode"] == 0
+'
+
+  set +e
+  "$REAL_DOCKER" volume rm "$REAL_VOLUME" \
+    >"$TEST_ROOT/real-volume-rm.out" 2>&1 &
+  volume_rm_pid=$!
+  "$REAL_DOCKER" volume prune --force --filter "label=$test_label" \
+    >"$TEST_ROOT/real-volume-prune.out" 2>&1 &
+  volume_prune_pid=$!
+  (
+    "$REAL_DOCKER" volume rm "$REAL_VOLUME" \
+      && "$REAL_DOCKER" volume create "$REAL_VOLUME"
+  ) >"$TEST_ROOT/real-volume-replace.out" 2>&1 &
+  volume_replace_pid=$!
+  "$REAL_DOCKER" volume create "$REAL_VOLUME" \
+    >"$TEST_ROOT/real-volume-create.out" 2>&1 &
+  volume_create_pid=$!
+  wait "$volume_rm_pid"
+  volume_rm_status=$?
+  wait "$volume_prune_pid"
+  volume_prune_status=$?
+  wait "$volume_replace_pid"
+  volume_replace_status=$?
+  wait "$volume_create_pid"
+  volume_create_status=$?
+  set -e
+
+  if [[ "$volume_rm_status" -eq 0 ]]; then
+    echo 'FAIL: pinned real Docker volume was removed' >&2
+    exit 1
+  fi
+  if [[ "$volume_replace_status" -eq 0 ]]; then
+    echo 'FAIL: pinned real Docker volume was replaced' >&2
+    exit 1
+  fi
+  if [[ "$volume_prune_status" -ne 0 || "$volume_create_status" -ne 0 ]]; then
+    echo 'FAIL: real Docker pin concurrency probes did not complete' >&2
+    exit 1
+  fi
+  identity_after="$(
+    "$REAL_DOCKER" volume inspect "$REAL_VOLUME" --format '{{json .}}' \
+      | python3 -c \
+        'import hashlib,json,sys; print(hashlib.sha256(json.dumps(json.load(sys.stdin),sort_keys=True,separators=(",",":")).encode()).hexdigest())'
+  )"
+  if [[ "$identity_after" != "$identity_before" ]]; then
+    echo 'FAIL: same-name create replaced pinned real Docker volume' >&2
+    exit 1
+  fi
+  "$REAL_DOCKER" container rm "$REAL_HOLDER" >/dev/null
+  REAL_HOLDER=""
+  "$REAL_DOCKER" volume rm "$REAL_VOLUME" >/dev/null
+  REAL_VOLUME=""
+  echo "real Docker holder pin/replacement tests passed"
 fi
 
 echo "staging object janitor launcher tests passed"
