@@ -138,6 +138,10 @@ VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="$TEST_ROOT/deploy-migrator-url"
 VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="$TEST_ROOT/deploy-read-url"
 VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE="$TEST_ROOT/control-role-owner-url"
 VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="$TEST_ROOT/runtime-role-owner-url"
+VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL=vp_deploy_migrator
+VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL=vp_deploy_read
+VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL=vp_control_role_owner
+VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL=vp_runtime_role_owner
 for credential_file in \
   "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" \
   "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE" \
@@ -1250,6 +1254,359 @@ vp_worker_redis_marker_retire_generation() {
 vp_worker_redis_marker_discard_managed_state() {
   rm -rf "$VP_WORKER_REDIS_MARKER_MANAGED_STATE"
   VP_WORKER_REDIS_MARKER_MANAGED_STATE=""
+}
+
+(
+  identity_root="$TEST_ROOT/database-identity-contract"
+  mkdir -p "$identity_root"
+  principal_image=vp-backend-api:deploy-0123456789ab
+  identity_calls="$identity_root/calls"
+  : >"$identity_calls"
+  PROBE_DUPLICATE_PURPOSE=""
+  PROBE_FAILURE_PURPOSE=""
+  PROBE_FAILURE_SENTINEL='postgresql://probe-user:probe-password@database/videoprocess'
+
+  vp_require_pipeline_network_identity() {
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  database_identity_purpose() {
+    case "$1" in
+      "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE")
+        printf 'deploy_migrator\n'
+        ;;
+      "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE")
+        printf 'deploy_read\n'
+        ;;
+      "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE")
+        printf 'control_role_owner\n'
+        ;;
+      "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE")
+        printf 'runtime_role_owner\n'
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  }
+  database_identity_expected_principal() {
+    case "$1" in
+      deploy_migrator)
+        printf '%s\n' "$VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL"
+        ;;
+      deploy_read)
+        printf '%s\n' "$VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL"
+        ;;
+      control_role_owner)
+        printf '%s\n' "$VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL"
+        ;;
+      runtime_role_owner)
+        printf '%s\n' "$VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  }
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$identity_calls"
+    if [[ "${1:-}" != run \
+      || "$*" != *"VP_DATABASE_IDENTITY_URL_FILE=/run/secrets/vp-database-identity-url"* ]]; then
+      return 97
+    fi
+    local source=""
+    local argument
+    for argument in "$@"; do
+      case "$argument" in
+        type=bind,src=*,dst=/run/secrets/vp-database-identity-url,readonly)
+          source="${argument#type=bind,src=}"
+          source="${source%,dst=/run/secrets/vp-database-identity-url,readonly}"
+          ;;
+      esac
+    done
+    local purpose
+    purpose="$(database_identity_purpose "$source")" || return 96
+    if [[ "$purpose" == "$PROBE_FAILURE_PURPOSE" ]]; then
+      printf '%s\n' "$PROBE_FAILURE_SENTINEL" >&2
+      return 1
+    fi
+    local principal
+    principal="$(database_identity_expected_principal "$purpose")" || return 95
+    if [[ "$purpose" == "$PROBE_DUPLICATE_PURPOSE" ]]; then
+      principal="$VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL"
+    fi
+    printf '{"current_user":"%s","session_user":"%s"}\n' \
+      "$principal" "$principal"
+  }
+  assert_no_identity_mutation() {
+    if grep -Eq \
+      'docker\\|(secret (create|rm)|service (create|update|rm))|worker_deployment_cli migrate|worker_runtime_role_cli|worker_control_role_cli' \
+      "$identity_calls"; then
+      echo 'FAIL: database identity rejection reached a worker mutation' >&2
+      exit 1
+    fi
+  }
+  prepare_distinct_identity_files() {
+    local fixture="$identity_root/$1"
+    mkdir -p "$fixture"
+    VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="$fixture/deploy-migrator"
+    VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="$fixture/deploy-read"
+    VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE="$fixture/control-role-owner"
+    VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="$fixture/runtime-role-owner"
+    local path
+    for path in \
+      "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" \
+      "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE" \
+      "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE" \
+      "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE"; do
+      printf 'postgresql://fixture:credential@database/videoprocess\n' >"$path"
+      chmod 0400 "$path"
+    done
+  }
+
+  prepare_distinct_identity_files same-path
+  VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE=\
+"$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE"
+  VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE=\
+"$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE"
+  VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE=\
+"$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE"
+  if vp_validate_deploy_config "$principal_image" >/dev/null 2>&1; then
+    echo 'FAIL: four database purposes accepted one pathname' >&2
+    exit 1
+  fi
+  assert_no_identity_mutation
+
+  : >"$identity_calls"
+  prepare_distinct_identity_files hardlink
+  rm "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+  ln \
+    "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" \
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+  if vp_validate_deploy_config "$principal_image" >/dev/null 2>&1; then
+    echo 'FAIL: database purposes accepted a shared inode' >&2
+    exit 1
+  fi
+  assert_no_identity_mutation
+
+  : >"$identity_calls"
+  alias_fixture="$identity_root/parent-alias"
+  mkdir -p "$alias_fixture/real"
+  ln -s "$alias_fixture/real" "$alias_fixture/alias"
+  VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="$alias_fixture/real/shared"
+  VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="$alias_fixture/alias/shared"
+  VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE="$alias_fixture/control"
+  VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="$alias_fixture/runtime"
+  for path in \
+    "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" \
+    "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE" \
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE"; do
+    printf 'postgresql://fixture:credential@database/videoprocess\n' >"$path"
+    chmod 0400 "$path"
+  done
+  if vp_validate_deploy_config "$principal_image" >/dev/null 2>&1; then
+    echo 'FAIL: database purposes accepted one canonical parent-alias path' >&2
+    exit 1
+  fi
+  assert_no_identity_mutation
+
+  : >"$identity_calls"
+  prepare_distinct_identity_files principal-mismatch
+  PROBE_DUPLICATE_PURPOSE=runtime_role_owner
+  if vp_validate_deploy_config "$principal_image" >/dev/null 2>&1; then
+    echo 'FAIL: database purpose accepted the wrong session principal' >&2
+    exit 1
+  fi
+  assert_no_identity_mutation
+
+  : >"$identity_calls"
+  PROBE_DUPLICATE_PURPOSE=""
+  PROBE_FAILURE_PURPOSE=deploy_read
+  set +e
+  principal_error="$(
+    vp_validate_deploy_config "$principal_image" 2>&1
+  )"
+  principal_status=$?
+  set -e
+  if [[ "$principal_status" -eq 0 \
+    || "$principal_error" != *database_principal_probe_failed* \
+    || "$principal_error" == *"$PROBE_FAILURE_SENTINEL"* ]]; then
+    echo 'FAIL: principal probe failure was not sanitized' >&2
+    exit 1
+  fi
+  assert_no_identity_mutation
+
+  : >"$identity_calls"
+  PROBE_FAILURE_PURPOSE=""
+  vp_validate_deploy_config "$principal_image"
+  if [[ "$(
+      grep -Fc \
+        'VP_DATABASE_IDENTITY_URL_FILE=/run/secrets/vp-database-identity-url' \
+        "$identity_calls"
+    )" -ne 4 ]]; then
+    echo 'FAIL: database identity validation did not probe four purposes' >&2
+    exit 1
+  fi
+  if grep -Fq 'postgresql://' "$identity_calls"; then
+    echo 'FAIL: database principal probe exposed a credential in argv or env' >&2
+    exit 1
+  fi
+
+  transaction_root="$identity_root/drift/state/vp-worker-admission"
+  mkdir -p "$transaction_root"
+  chmod 0700 "$transaction_root"
+  vp_worker_admission_lock_acquire "$transaction_root"
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin \
+    "$transaction_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    0123456789abcdef0123456789abcdef01234567 \
+    "$principal_image" \
+    vp-ffmpeg-worker-go:deploy-0123456789ab \
+    0123456789abcdef0123456789abcdef01234567 \
+    legacy_no_control \
+    "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" \
+    "$VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL" \
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE" \
+    "$VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL" \
+    "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE" \
+    "$VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL" \
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE" \
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL" \
+    >/dev/null
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+  mv \
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE" \
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE.displaced"
+  printf 'postgresql://replacement:credential@database/videoprocess\n' \
+    >"$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+  chmod 0400 "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+  : >"$identity_calls"
+  if ! declare -F vp_worker_admission_database_credential_file \
+      >/dev/null; then
+    echo 'FAIL: bind-time database identity verifier is unavailable' >&2
+    exit 1
+  fi
+  if vp_worker_admission_database_credential_file \
+    deploy_read \
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE" \
+    'worker deploy-read database URL file' >/dev/null 2>&1; then
+    echo 'FAIL: bind-time database identity drift was accepted' >&2
+    exit 1
+  fi
+  [[ ! -s "$identity_calls" ]]
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
+  vp_worker_admission_lock_release
+)
+
+(
+  ROOT="$TEST_ROOT/transaction-preparation/sync"
+  REPO_ROOT="$TEST_ROOT/transaction-preparation/repos"
+  UPDATE_SERVICES=1
+  transaction_root="$ROOT/state/vp-worker-admission"
+  mkdir -p "$transaction_root"
+  chmod 0700 "$transaction_root"
+  transaction_calls="$TEST_ROOT/transaction-preparation/calls"
+  : >"$transaction_calls"
+  transaction_commit=0123456789abcdef0123456789abcdef01234567
+  backend_image="vp-backend-api:deploy-${transaction_commit:0:12}"
+  go_image="vp-ffmpeg-worker-go:deploy-${transaction_commit:0:12}"
+  control_image="vp-ffmpeg-worker-python:deploy-${transaction_commit:0:12}"
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$transaction_calls"
+    if [[ "${1:-} ${2:-}" == "image inspect" ]]; then
+      printf '%s\n' "$transaction_commit"
+      return 0
+    fi
+    return 97
+  }
+  VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL=vp_deploy_migrator
+  VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL=vp_deploy_read
+  VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL=vp_control_role_owner
+  VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL=vp_runtime_role_owner
+  VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE=\
+"$TEST_ROOT/transaction-preparation/deploy-migrator"
+  VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE=\
+"$TEST_ROOT/transaction-preparation/deploy-read"
+  VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE=\
+"$TEST_ROOT/transaction-preparation/control-owner"
+  VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE=\
+"$TEST_ROOT/transaction-preparation/runtime-owner"
+  for credential in \
+    "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" \
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE" \
+    "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE" \
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE"; do
+    printf 'postgresql://identity:credential@database/videoprocess\n' \
+      >"$credential"
+    chmod 0400 "$credential"
+  done
+
+  vp_worker_admission_lock_acquire "$transaction_root"
+  vp_worker_admission_prepare_transaction \
+    "$backend_image" "$go_image" "$control_image"
+  active="$transaction_root/transactions/active.json"
+  [[ -f "$active" && ! -L "$active" ]]
+  python3 - "$active" "$transaction_commit" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    transaction = json.load(handle)
+if (
+    transaction["phase"] != "PREPARING"
+    or transaction["forward"]["namespace"] != sys.argv[2]
+):
+    raise SystemExit("PREPARING transaction was not connected")
+PY
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
+    "$transaction_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    0 FORWARD_APPLYING >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
+    "$transaction_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    1 FORWARD_VERIFIED >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
+    "$transaction_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    2 WORKERS_PROMOTED >/dev/null
+  : >"$transaction_calls"
+  if vp_worker_admission_prepare_transaction \
+    "$backend_image" "$go_image" "$control_image" >/dev/null 2>&1; then
+    echo 'FAIL: stage-1 replay minted through WORKERS_PROMOTED' >&2
+    exit 1
+  fi
+  if [[ -s "$transaction_calls" ]]; then
+    echo 'FAIL: WORKERS_PROMOTED replay touched Docker before stage 2' >&2
+    exit 1
+  fi
+  vp_worker_admission_lock_release
+)
+
+(
+  ROOT="$TEST_ROOT/deploy-lock-lifetime/sync"
+  REPO_ROOT="$TEST_ROOT/deploy-lock-lifetime/repos"
+  mkdir -p "$ROOT"
+  lock_observations="$TEST_ROOT/deploy-lock-lifetime/observations"
+  : >"$lock_observations"
+  vp_validate_deploy_config() {
+    vp_worker_admission_lock_assert
+    printf 'validate|locked\n' >>"$lock_observations"
+  }
+  vp_worker_admission_prepare_transaction() {
+    vp_worker_admission_lock_assert
+    printf 'reconcile|locked\n' >>"$lock_observations"
+  }
+  _vp_deploy_vp_app_services_locked() {
+    vp_worker_admission_lock_assert
+    printf 'return|locked\n' >>"$lock_observations"
+  }
+  deploy_vp_app_services a b c d e f >/dev/null
+  [[ "$(<"$lock_observations")" == $'validate|locked\nreconcile|locked\nreturn|locked' ]]
+  [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == false ]]
+)
+
+vp_probe_worker_database_principal() {
+  printf 'database-principal|%s|%s\n' "$1" "$3" >>"$CALLS"
+}
+
+vp_worker_admission_prepare_transaction() {
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
 }
 
 VP_RUNTIME_HOST=10.0.0.126

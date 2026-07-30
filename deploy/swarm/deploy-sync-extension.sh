@@ -7,6 +7,22 @@ fi
 
 : "${REPO_ROOT:?REPO_ROOT must be set by deploy-github-sync.sh}"
 
+VP_WORKER_ADMISSION_TRANSACTION_HELPER="$(
+  cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P
+)/worker-admission-transaction.py"
+VP_WORKER_ADMISSION_LOCK_FD=19
+VP_WORKER_ADMISSION_LOCK_HELD=false
+VP_WORKER_ADMISSION_LOCK_DEPTH=0
+VP_WORKER_ADMISSION_LOCK_ROOT=""
+VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
+VP_PYTHON_WORKER_ACTIVE_CHILD_PID=""
+VP_PYTHON_WORKER_ACTIVE_OPERATION_NAME="-"
+VP_PYTHON_WORKER_ACTIVE_OPERATION_ROOT=""
+VP_PYTHON_WORKER_ACTIVE_OPERATION_UID=""
+VP_PYTHON_WORKER_ACTIVE_OPERATION_GID=""
+VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED=true
+VP_PYTHON_WORKER_SIGNAL_STATUS=0
+
 VP_RUNTIME_HOST="${VP_RUNTIME_HOST:-10.0.0.127}"
 VP_RUNTIME_NODE="${VP_RUNTIME_NODE:-colima-127}"
 VP_RUNTIME_CONSTRAINT="node.labels.vp.runtime==true"
@@ -131,7 +147,171 @@ vp_require_pipeline_network_identity() {
   VP_PIPELINE_NETWORK_ID="$network_id"
 }
 
+vp_validate_worker_database_identities() {
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    validate-credentials \
+    "${VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE:-}" \
+    "${VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL:-}" \
+    "${VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE:-}" \
+    "${VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL:-}" \
+    "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
+    "${VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL:-}" \
+    "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
+    "${VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL:-}" \
+    >/dev/null 2>&1 || {
+      echo "worker database credential identity validation failed" >&2
+      return 1
+    }
+}
+
+vp_probe_worker_database_principal() {
+  local image="$1"
+  local credential_file="$2"
+  local expected_principal="$3"
+  local principal_pattern='^[A-Za-z_][A-Za-z0-9_.$@-]{0,127}$'
+  [[ "$image" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ \
+    && "$credential_file" = /* \
+    && "$expected_principal" =~ $principal_pattern ]] || {
+    echo "database_principal_probe_failed" >&2
+    return 1
+  }
+  local caller_uid
+  local caller_gid
+  caller_uid="$(id -u)" || return 1
+  caller_gid="$(id -g)" || return 1
+  local probe_output
+  probe_output="$(
+    docker run --rm \
+      --user "$caller_uid:$caller_gid" \
+      --read-only \
+      --cap-drop ALL \
+      --security-opt no-new-privileges \
+      --network "$VP_PIPELINE_NETWORK_ID" \
+      --mount "type=bind,src=$credential_file,dst=/run/secrets/vp-database-identity-url,readonly" \
+      --env VP_DATABASE_IDENTITY_URL_FILE=/run/secrets/vp-database-identity-url \
+      "$image" \
+      python3 -I -c '
+import asyncio
+import json
+import os
+import stat
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+
+async def probe() -> None:
+    descriptor = -1
+    engine = None
+    try:
+        path = os.environ.get("VP_DATABASE_IDENTITY_URL_FILE", "")
+        if path != "/run/secrets/vp-database-identity-url":
+            raise RuntimeError
+        before = os.lstat(path)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o400
+        ):
+            raise RuntimeError
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o400
+            or (before.st_dev, before.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise RuntimeError
+        payload = os.read(descriptor, 65537)
+        if not payload or len(payload) > 65536:
+            raise RuntimeError
+        database_url = payload.decode("utf-8").strip()
+        if not database_url:
+            raise RuntimeError
+        engine = create_async_engine(database_url)
+        async with engine.connect() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        "SELECT session_user::text, "
+                        "current_user::text"
+                    )
+                )
+            ).one()
+        print(
+            json.dumps(
+                {
+                    "current_user": row[1],
+                    "session_user": row[0],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    except Exception:
+        raise SystemExit(1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if engine is not None:
+            await engine.dispose()
+
+
+asyncio.run(probe())
+' 2>/dev/null
+  )" || {
+    echo "database_principal_probe_failed" >&2
+    return 1
+  }
+  if ! printf '%s\n' "$probe_output" \
+    | python3 -I -c '
+import json
+import re
+import sys
+
+expected = sys.argv[1]
+raw = sys.stdin.buffer.read()
+try:
+    pairs = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=lambda value: (
+            dict(value)
+            if len(value) == len(dict(value))
+            else (_ for _ in ()).throw(ValueError())
+        ),
+    )
+    canonical = (
+        json.dumps(pairs, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    if (
+        raw != canonical
+        or set(pairs) != {"current_user", "session_user"}
+        or not all(isinstance(value, str) for value in pairs.values())
+        or any(
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.$@-]{0,127}", value)
+            is None
+            for value in pairs.values()
+        )
+        or pairs["current_user"] != expected
+        or pairs["session_user"] != expected
+    ):
+        raise ValueError
+except Exception:
+    raise SystemExit(1)
+' "$expected_principal" >/dev/null 2>&1; then
+    echo "database_principal_probe_failed" >&2
+    return 1
+  fi
+}
+
 vp_validate_deploy_config() {
+  local principal_probe_image="${1:-}"
   vp_validate_topology || return 1
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
     return 0
@@ -143,22 +323,40 @@ vp_validate_deploy_config() {
   [[ -n "${VP_PYTHON_WORKER_DATABASE_URL:-}" ]] || missing="$missing VP_PYTHON_WORKER_DATABASE_URL"
   [[ -n "${VP_MINIO_ACCESS_KEY:-}" ]] || missing="$missing VP_MINIO_ACCESS_KEY"
   [[ -n "${VP_MINIO_SECRET_KEY:-}" ]] || missing="$missing VP_MINIO_SECRET_KEY"
+  [[ -n "${VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL:-}" ]] \
+    || missing="$missing VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL"
+  [[ -n "${VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL:-}" ]] \
+    || missing="$missing VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL"
+  [[ -n "${VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL:-}" ]] \
+    || missing="$missing VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL"
+  [[ -n "${VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL:-}" ]] \
+    || missing="$missing VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL"
   if [[ -n "$missing" ]]; then
     echo "missing required VideoProcess deploy settings:$missing" >&2
     return 1
   fi
-  vp_worker_admission_required_file \
-    "${VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE:-}" \
-    "worker deploy-migrator database URL file" >/dev/null || return 1
-  vp_worker_admission_required_file \
-    "${VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE:-}" \
-    "worker deploy-read database URL file" >/dev/null || return 1
-  vp_worker_admission_required_file \
-    "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
-    "worker control-role owner database URL file" >/dev/null || return 1
-  vp_worker_admission_required_file \
-    "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
-    "worker runtime-role owner database URL file" >/dev/null || return 1
+  if [[ ! "$principal_probe_image" \
+      =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ ]]; then
+    echo "database_principal_probe_failed" >&2
+    return 1
+  fi
+  vp_validate_worker_database_identities || return 1
+  vp_probe_worker_database_principal \
+    "$principal_probe_image" \
+    "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" \
+    "$VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL" || return 1
+  vp_probe_worker_database_principal \
+    "$principal_probe_image" \
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE" \
+    "$VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL" || return 1
+  vp_probe_worker_database_principal \
+    "$principal_probe_image" \
+    "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE" \
+    "$VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL" || return 1
+  vp_probe_worker_database_principal \
+    "$principal_probe_image" \
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE" \
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL" || return 1
 }
 
 vp_worker_service_contract() {
@@ -1451,7 +1649,118 @@ vp_python_worker_prepare_controlled_directory() {
   printf '%s\n' "$path"
 }
 
-vp_run_python_worker_container() {
+vp_worker_admission_lock_assert() {
+  [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == true \
+    && "$VP_WORKER_ADMISSION_LOCK_DEPTH" =~ ^[1-9][0-9]*$ \
+    && "$VP_WORKER_ADMISSION_LOCK_ROOT" = /* \
+    && "$VP_WORKER_ADMISSION_LOCK_FD" -eq 19 ]] || return 1
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    lock-acquire \
+    "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+    "$VP_WORKER_ADMISSION_LOCK_FD" >/dev/null 2>&1
+}
+
+vp_worker_admission_lock_acquire() {
+  local admission_root="$1"
+  [[ "$admission_root" = /* \
+    && -f "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    && ! -L "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" ]] || return 1
+
+  if [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == true ]]; then
+    [[ "$VP_WORKER_ADMISSION_LOCK_ROOT" == "$admission_root" ]] \
+      || return 1
+    vp_worker_admission_lock_assert || return 1
+    VP_WORKER_ADMISSION_LOCK_DEPTH=$((VP_WORKER_ADMISSION_LOCK_DEPTH + 1))
+    return 0
+  fi
+  [[ "$VP_WORKER_ADMISSION_LOCK_DEPTH" -eq 0 \
+    && -z "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+    && "$VP_WORKER_ADMISSION_LOCK_FD" -eq 19 ]] || return 1
+  if [[ -e /dev/fd/19 ]]; then
+    echo "worker admission transaction lock descriptor is unavailable" >&2
+    return 1
+  fi
+
+  local lock_path
+  lock_path="$(
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      lock-prepare "$admission_root" 2>/dev/null
+  )" || return 1
+  [[ "$lock_path" == "$admission_root/transaction.lock" \
+    && -f "$lock_path" && ! -L "$lock_path" \
+    && "$(vp_worker_redis_marker_file_mode "$lock_path")" == 600 ]] \
+    || return 1
+  exec 19<>"$lock_path" || return 1
+  VP_WORKER_ADMISSION_LOCK_ROOT="$admission_root"
+  if ! python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    lock-acquire "$admission_root" 19 >/dev/null 2>&1; then
+    exec 19>&-
+    VP_WORKER_ADMISSION_LOCK_ROOT=""
+    return 1
+  fi
+  VP_WORKER_ADMISSION_LOCK_HELD=true
+  VP_WORKER_ADMISSION_LOCK_DEPTH=1
+}
+
+vp_worker_admission_lock_release() {
+  [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == true \
+    && "$VP_WORKER_ADMISSION_LOCK_DEPTH" =~ ^[1-9][0-9]*$ ]] \
+    || return 1
+  if [[ "$VP_WORKER_ADMISSION_LOCK_DEPTH" -gt 1 ]]; then
+    VP_WORKER_ADMISSION_LOCK_DEPTH=$((VP_WORKER_ADMISSION_LOCK_DEPTH - 1))
+    return 0
+  fi
+  local status=0
+  vp_worker_admission_lock_assert || status=1
+  exec 19>&- || status=1
+  VP_WORKER_ADMISSION_LOCK_HELD=false
+  VP_WORKER_ADMISSION_LOCK_DEPTH=0
+  VP_WORKER_ADMISSION_LOCK_ROOT=""
+  return "$status"
+}
+
+vp_python_worker_signal_handler() {
+  local signal_status="$1"
+  local signal_name="$2"
+  if [[ "$VP_PYTHON_WORKER_SIGNAL_STATUS" -eq 0 ]]; then
+    VP_PYTHON_WORKER_SIGNAL_STATUS="$signal_status"
+  fi
+  if [[ "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID" =~ ^[1-9][0-9]*$ ]]; then
+    kill "-$signal_name" "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID" \
+      >/dev/null 2>&1 || true
+    wait "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID" >/dev/null 2>&1 || true
+    VP_PYTHON_WORKER_ACTIVE_CHILD_PID=""
+  fi
+  if [[ "$VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED" != true \
+    && "$VP_PYTHON_WORKER_ACTIVE_OPERATION_NAME" \
+      =~ ^op\.[0-9a-f]{32}$ \
+    && "$VP_PYTHON_WORKER_ACTIVE_OPERATION_ROOT" = /* \
+    && "$VP_PYTHON_WORKER_ACTIVE_OPERATION_UID" =~ ^[0-9]+$ \
+    && "$VP_PYTHON_WORKER_ACTIVE_OPERATION_GID" =~ ^[0-9]+$ ]]; then
+    if vp_worker_admission_lock_assert \
+      && vp_python_worker_host_guard \
+        finish-operation \
+        "$VP_PYTHON_WORKER_ACTIVE_OPERATION_ROOT" \
+        "$VP_PYTHON_WORKER_ACTIVE_OPERATION_NAME" \
+        "$VP_PYTHON_WORKER_ACTIVE_OPERATION_UID" \
+        "$VP_PYTHON_WORKER_ACTIVE_OPERATION_GID" >/dev/null 2>&1; then
+      VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED=true
+      VP_PYTHON_WORKER_ACTIVE_OPERATION_NAME="-"
+    fi
+  fi
+}
+
+vp_python_worker_restore_trap() {
+  local saved_trap="$1"
+  local signal_name="$2"
+  if [[ -n "$saved_trap" ]]; then
+    eval "$saved_trap"
+  else
+    trap - "$signal_name"
+  fi
+}
+
+_vp_run_python_worker_container_locked() {
   local image="$1"
   local secret_source="$2"
   local secret_target="$3"
@@ -1622,6 +1931,15 @@ vp_run_python_worker_container() {
     || -z "$bind_manifest" \
     || ${#bind_sources[@]} -eq 0 ]]; then
     return 1
+  fi
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_NAME="$operation_name"
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_ROOT="$admission_root"
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_UID="$caller_uid"
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_GID="$caller_gid"
+  if [[ "$operation_name" == - ]]; then
+    VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED=true
+  else
+    VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED=false
   fi
 
   local payload_manifest=""
@@ -1862,16 +2180,31 @@ except Exception:
     vp-python-worker-bootstrap
     "${command[@]}"
   )
+  vp_worker_admission_lock_assert || return 1
+  local caller_pipefail=false
   if (( ${#payload_sources[@]} > 0 )); then
+    if set -o | awk '$1 == "pipefail" && $2 == "on" { found=1 }
+      END { exit found ? 0 : 1 }'; then
+      caller_pipefail=true
+    fi
     set -o pipefail
     vp_python_worker_host_guard \
       stream-payloads "$caller_uid" "$caller_gid" \
       "${stream_arguments[@]}" \
-      | "${docker_command[@]}" \
-      || docker_status=$?
+      | "${docker_command[@]}" &
   else
-    "${docker_command[@]}" </dev/null || docker_status=$?
+    "${docker_command[@]}" </dev/null &
   fi
+  VP_PYTHON_WORKER_ACTIVE_CHILD_PID=$!
+  if wait "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID"; then
+    docker_status=0
+  else
+    docker_status=$?
+  fi
+  if [[ "$caller_pipefail" != true ]]; then
+    set +o pipefail
+  fi
+  VP_PYTHON_WORKER_ACTIVE_CHILD_PID=""
 
   local validation_status=0
   for ((index = 0; index < ${#payload_sources[@]}; index++)); do
@@ -1884,21 +2217,88 @@ except Exception:
       "${payload_records[$index]}" >/dev/null \
       || validation_status=1
   done
-  if [[ "$operation_name" != - ]]; then
-    vp_python_worker_host_guard \
-      finish-operation \
-      "$admission_root" "$operation_name" \
-      "$caller_uid" "$caller_gid" >/dev/null \
-      || validation_status=1
+  if [[ "$operation_name" != - \
+    && "$VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED" != true ]]; then
+    if vp_worker_admission_lock_assert \
+      && vp_python_worker_host_guard \
+        finish-operation \
+        "$admission_root" "$operation_name" \
+        "$caller_uid" "$caller_gid" >/dev/null; then
+      VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED=true
+      VP_PYTHON_WORKER_ACTIVE_OPERATION_NAME="-"
+    else
+      validation_status=1
+    fi
   fi
   [[ "$docker_status" -eq 0 && "$validation_status" -eq 0 ]]
 }
 
+vp_run_python_worker_container() {
+  local admission_root
+  admission_root="$(vp_worker_admission_root)" || return 1
+  admission_root="$(
+    vp_python_worker_prepare_controlled_directory "$admission_root"
+  )" || return 1
+  vp_worker_admission_lock_acquire "$admission_root" || return 1
+
+  local caller_hup_trap
+  local caller_int_trap
+  local caller_term_trap
+  caller_hup_trap="$(trap -p HUP)"
+  caller_int_trap="$(trap -p INT)"
+  caller_term_trap="$(trap -p TERM)"
+  VP_PYTHON_WORKER_ACTIVE_CHILD_PID=""
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_NAME="-"
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_ROOT=""
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_UID=""
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_GID=""
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED=true
+  VP_PYTHON_WORKER_SIGNAL_STATUS=0
+  trap 'vp_python_worker_signal_handler 129 HUP' HUP
+  trap 'vp_python_worker_signal_handler 130 INT' INT
+  trap 'vp_python_worker_signal_handler 143 TERM' TERM
+
+  local operation_status=0
+  if _vp_run_python_worker_container_locked "$@"; then
+    operation_status=0
+  else
+    operation_status=$?
+  fi
+  if [[ "$VP_PYTHON_WORKER_SIGNAL_STATUS" -ne 0 \
+    && "$VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED" != true ]]; then
+    vp_python_worker_signal_handler \
+      "$VP_PYTHON_WORKER_SIGNAL_STATUS" TERM
+  fi
+
+  vp_python_worker_restore_trap "$caller_hup_trap" HUP
+  vp_python_worker_restore_trap "$caller_int_trap" INT
+  vp_python_worker_restore_trap "$caller_term_trap" TERM
+  local release_status=0
+  vp_worker_admission_lock_release || release_status=1
+  local signal_status="$VP_PYTHON_WORKER_SIGNAL_STATUS"
+  VP_PYTHON_WORKER_ACTIVE_CHILD_PID=""
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_NAME="-"
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_ROOT=""
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_UID=""
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_GID=""
+  VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED=true
+  VP_PYTHON_WORKER_SIGNAL_STATUS=0
+
+  if [[ "$signal_status" -ne 0 ]]; then
+    return "$signal_status"
+  fi
+  [[ "$operation_status" -eq 0 && "$release_status" -eq 0 ]]
+}
+
 vp_worker_admission_root() {
-  if [[ -z "${ROOT:-}" || ! "$ROOT" = /* ]]; then
+  local sync_root="${DEPLOY_GITHUB_SYNC_ROOT:-${ROOT:-}}"
+  if [[ -z "$sync_root" || ! "$sync_root" = /* \
+    || ( -n "${DEPLOY_GITHUB_SYNC_ROOT:-}" \
+      && -n "${ROOT:-}" \
+      && "$DEPLOY_GITHUB_SYNC_ROOT" != "$ROOT" ) ]]; then
     return 1
   fi
-  printf '%s\n' "$ROOT/state/vp-worker-admission"
+  printf '%s\n' "$sync_root/state/vp-worker-admission"
 }
 
 vp_worker_admission_required_file() {
@@ -1908,6 +2308,37 @@ vp_worker_admission_required_file() {
     || "$(vp_worker_redis_marker_file_mode "$path")" != 400 ]]; then
     echo "$label is absent or invalid" >&2
     return 1
+  fi
+  printf '%s\n' "$path"
+}
+
+vp_worker_admission_database_credential_file() {
+  local purpose="$1"
+  local path="$2"
+  local label="$3"
+  case "$purpose" in
+    deploy_migrator|deploy_read|control_role_owner|runtime_role_owner)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  path="$(
+    vp_worker_admission_required_file "$path" "$label"
+  )" || return 1
+  if [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == true \
+    && "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true ]]; then
+    path="$(
+      python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+        verify-credential \
+        "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+        "$VP_WORKER_ADMISSION_LOCK_FD" \
+        "$purpose" \
+        "$path" 2>/dev/null
+    )" || {
+      echo "worker database credential identity drifted" >&2
+      return 1
+    }
   fi
   printf '%s\n' "$path"
 }
@@ -1980,6 +2411,15 @@ vp_worker_admission_write_manifest() {
   local generation="$5"
   local database_secret="$6"
   local admission_secret="$7"
+  local database_secret_id="${8:-}"
+  local admission_secret_id="${9:-}"
+  local version=1
+  if [[ -n "$database_secret_id" || -n "$admission_secret_id" ]]; then
+    [[ "$database_secret_id" =~ ^[a-z0-9]{20,64}$ \
+      && "$admission_secret_id" =~ ^[a-z0-9]{20,64}$ \
+      && "$database_secret_id" != "$admission_secret_id" ]] || return 1
+    version=2
+  fi
   local directory
   directory="$(dirname "$path")" || return 1
   mkdir -p "$directory" || return 1
@@ -1991,13 +2431,16 @@ vp_worker_admission_write_manifest() {
     return 1
   }
   if ! printf '%s\n' \
-    "VERSION=1" \
+    "VERSION=$version" \
     "SERVICE=$service" \
     "COMMIT=$commit" \
     "IMAGE=$image" \
     "GENERATION=$generation" \
     "DATABASE_SECRET=$database_secret" \
-    "ADMISSION_SECRET=$admission_secret" >"$temporary" \
+    "ADMISSION_SECRET=$admission_secret" \
+    ${database_secret_id:+"DATABASE_SECRET_ID=$database_secret_id"} \
+    ${admission_secret_id:+"ADMISSION_SECRET_ID=$admission_secret_id"} \
+    >"$temporary" \
     || ! mv -f "$temporary" "$path"; then
     rm -f "$temporary"
     return 1
@@ -2019,6 +2462,8 @@ vp_worker_admission_read_manifest() {
   VP_WORKER_MANIFEST_GENERATION=""
   VP_WORKER_MANIFEST_DATABASE_SECRET=""
   VP_WORKER_MANIFEST_ADMISSION_SECRET=""
+  VP_WORKER_MANIFEST_DATABASE_SECRET_ID=""
+  VP_WORKER_MANIFEST_ADMISSION_SECRET_ID=""
   local key
   local value
   while IFS='=' read -r key value; do
@@ -2040,16 +2485,130 @@ vp_worker_admission_read_manifest() {
       ADMISSION_SECRET)
         [[ -z "$VP_WORKER_MANIFEST_ADMISSION_SECRET" ]] || return 1
         VP_WORKER_MANIFEST_ADMISSION_SECRET="$value" ;;
+      DATABASE_SECRET_ID)
+        [[ -z "$VP_WORKER_MANIFEST_DATABASE_SECRET_ID" ]] || return 1
+        VP_WORKER_MANIFEST_DATABASE_SECRET_ID="$value" ;;
+      ADMISSION_SECRET_ID)
+        [[ -z "$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID" ]] || return 1
+        VP_WORKER_MANIFEST_ADMISSION_SECRET_ID="$value" ;;
       *) return 1 ;;
     esac
   done <"$path"
-  [[ "$VP_WORKER_MANIFEST_VERSION" == 1 \
+  [[ "$VP_WORKER_MANIFEST_VERSION" =~ ^[12]$ \
     && "$VP_WORKER_MANIFEST_SERVICE" == "$expected_service" \
     && "$VP_WORKER_MANIFEST_COMMIT" =~ ^[0-9a-f]{40}$ \
     && "$VP_WORKER_MANIFEST_IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*:deploy-[0-9a-f]{12}$ \
     && "$VP_WORKER_MANIFEST_GENERATION" =~ ^[1-9][0-9]*$ \
     && "$VP_WORKER_MANIFEST_DATABASE_SECRET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ \
-    && "$VP_WORKER_MANIFEST_ADMISSION_SECRET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+    && "$VP_WORKER_MANIFEST_ADMISSION_SECRET" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ \
+    && ( "$VP_WORKER_MANIFEST_VERSION" == 1 \
+      && -z "$VP_WORKER_MANIFEST_DATABASE_SECRET_ID" \
+      && -z "$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID" \
+      || "$VP_WORKER_MANIFEST_VERSION" == 2 \
+      && "$VP_WORKER_MANIFEST_DATABASE_SECRET_ID" =~ ^[a-z0-9]{20,64}$ \
+      && "$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID" =~ ^[a-z0-9]{20,64}$ \
+      && "$VP_WORKER_MANIFEST_DATABASE_SECRET_ID" \
+        != "$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID" ) ]]
+}
+
+vp_managed_secret_id() {
+  local reference="$1"
+  local expected_name="$2"
+  local expected_service="$3"
+  local expected_generation="$4"
+  local expected_purpose="$5"
+  [[ "$reference" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$ \
+    && "$expected_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$ \
+    && "$expected_service" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$ \
+    && "$expected_generation" \
+      =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ \
+    && "$expected_purpose" =~ ^[a-z][a-z0-9-]{0,63}$ ]] \
+    || return 1
+  local identity
+  identity="$(
+    docker secret inspect "$reference" \
+      --format '{{.ID}}|{{.Spec.Name}}|{{index .Spec.Labels "vp.service"}}|{{index .Spec.Labels "vp.generation"}}|{{index .Spec.Labels "vp.purpose"}}'
+  )" || return 1
+  [[ -n "$identity" && "$identity" != *$'\n'* ]] || return 1
+  local secret_id
+  local name
+  local service
+  local generation
+  local purpose
+  local extra
+  IFS='|' read -r \
+    secret_id name service generation purpose extra \
+    <<<"$identity"
+  [[ -z "$extra" \
+    && "$secret_id" =~ ^[a-z0-9]{20,64}$ \
+    && "$name" == "$expected_name" \
+    && "$service" == "$expected_service" \
+    && "$generation" == "$expected_generation" \
+    && "$purpose" == "$expected_purpose" ]] || return 1
+  printf '%s\n' "$secret_id"
+}
+
+vp_remove_managed_secret() {
+  local secret_id="$1"
+  local expected_name="$2"
+  local expected_service="$3"
+  local expected_generation="$4"
+  local expected_purpose="$5"
+  [[ "$secret_id" =~ ^[a-z0-9]{20,64}$ ]] || return 1
+  local inspected_id
+  inspected_id="$(
+    vp_managed_secret_id \
+      "$secret_id" \
+      "$expected_name" \
+      "$expected_service" \
+      "$expected_generation" \
+      "$expected_purpose"
+  )" || return 1
+  [[ "$inspected_id" == "$secret_id" ]] || return 1
+  docker secret rm "$secret_id" >/dev/null
+}
+
+vp_worker_admission_require_v2_manifest() {
+  local path="$1"
+  local service="$2"
+  vp_worker_admission_read_manifest "$path" "$service" || return 1
+  if [[ "$VP_WORKER_MANIFEST_VERSION" == 2 ]]; then
+    return 0
+  fi
+  local database_secret_id
+  database_secret_id="$(
+    vp_managed_secret_id \
+      "$VP_WORKER_MANIFEST_DATABASE_SECRET" \
+      "$VP_WORKER_MANIFEST_DATABASE_SECRET" \
+      "$service" "$VP_WORKER_MANIFEST_GENERATION" database
+  )" || {
+    echo "worker v1 manifest requires manual secret identity evidence" >&2
+    return 1
+  }
+  local admission_secret_id
+  admission_secret_id="$(
+    vp_managed_secret_id \
+      "$VP_WORKER_MANIFEST_ADMISSION_SECRET" \
+      "$VP_WORKER_MANIFEST_ADMISSION_SECRET" \
+      "$service" "$VP_WORKER_MANIFEST_GENERATION" admission
+  )" || {
+    echo "worker v1 manifest requires manual secret identity evidence" >&2
+    return 1
+  }
+  vp_worker_admission_write_manifest \
+    "$path" \
+    "$service" \
+    "$VP_WORKER_MANIFEST_COMMIT" \
+    "$VP_WORKER_MANIFEST_IMAGE" \
+    "$VP_WORKER_MANIFEST_GENERATION" \
+    "$VP_WORKER_MANIFEST_DATABASE_SECRET" \
+    "$VP_WORKER_MANIFEST_ADMISSION_SECRET" \
+    "$database_secret_id" \
+    "$admission_secret_id" || return 1
+  vp_worker_admission_read_manifest "$path" "$service" || return 1
+  [[ "$VP_WORKER_MANIFEST_VERSION" == 2 \
+    && "$VP_WORKER_MANIFEST_DATABASE_SECRET_ID" == "$database_secret_id" \
+    && "$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID" == "$admission_secret_id" ]]
 }
 
 vp_worker_admission_create_secret() {
@@ -2065,24 +2624,33 @@ vp_worker_admission_create_secret() {
     echo "worker credential file is absent or invalid" >&2
     return 1
   fi
-  local expected="$service|$generation|$purpose"
-  if docker secret inspect "$secret_name" >/dev/null 2>&1; then
-    local actual
-    actual="$(
-      docker secret inspect "$secret_name" \
-        --format '{{index .Spec.Labels "vp.service"}}|{{index .Spec.Labels "vp.generation"}}|{{index .Spec.Labels "vp.purpose"}}'
-    )" || return 1
-    [[ "$actual" == "$expected" ]] || {
-      echo "worker secret identity mismatch" >&2
-      return 1
-    }
+  VP_WORKER_CREATED_SECRET_ID=""
+  local existing_id
+  if existing_id="$(
+    vp_managed_secret_id \
+      "$secret_name" "$secret_name" \
+      "$service" "$generation" "$purpose" 2>/dev/null
+  )"; then
+    VP_WORKER_CREATED_SECRET_ID="$existing_id"
     return 0
   fi
-  docker secret create \
-    --label "vp.service=$service" \
-    --label "vp.generation=$generation" \
-    --label "vp.purpose=$purpose" \
-    "$secret_name" - <"$credential_file" >/dev/null
+  local created_id
+  created_id="$(
+    docker secret create \
+      --label "vp.service=$service" \
+      --label "vp.generation=$generation" \
+      --label "vp.purpose=$purpose" \
+      "$secret_name" - <"$credential_file"
+  )" || return 1
+  [[ "$created_id" =~ ^[a-z0-9]{20,64}$ ]] || return 1
+  local inspected_id
+  inspected_id="$(
+    vp_managed_secret_id \
+      "$created_id" "$secret_name" \
+      "$service" "$generation" "$purpose"
+  )" || return 1
+  [[ "$inspected_id" == "$created_id" ]] || return 1
+  VP_WORKER_CREATED_SECRET_ID="$created_id"
 }
 
 vp_worker_admission_write_secret_file() {
@@ -2152,10 +2720,43 @@ vp_worker_control_secret_names() {
     "vp-wc-worker-minio-secret-$generation"
 }
 
+vp_worker_control_secret_refs() {
+  local generation="$1"
+  [[ "$generation" =~ ^c-[0-9a-f]{20}$ ]] || return 1
+  printf '%s|%s\n' \
+    "vp-wc-operator-$generation" operator \
+    "vp-wc-orchestrator-$generation" orchestrator \
+    "vp-wc-staging-$generation" staging-janitor \
+    "vp-wc-minio-access-$generation" staging-minio-access \
+    "vp-wc-minio-secret-$generation" staging-minio-secret \
+    "vp-wc-worker-minio-access-$generation" worker-minio-access \
+    "vp-wc-worker-minio-secret-$generation" worker-minio-secret
+}
+
 vp_worker_control_write_manifest() {
   local path="$1"
   local generation="$2"
   local image="$3"
+  local operator_secret_id="${4:-}"
+  local orchestrator_secret_id="${5:-}"
+  local staging_secret_id="${6:-}"
+  local staging_minio_access_secret_id="${7:-}"
+  local staging_minio_secret_secret_id="${8:-}"
+  local worker_minio_access_secret_id="${9:-}"
+  local worker_minio_secret_secret_id="${10:-}"
+  local manifest_version=1
+  local provided_ids="$operator_secret_id $orchestrator_secret_id $staging_secret_id $staging_minio_access_secret_id $staging_minio_secret_secret_id $worker_minio_access_secret_id $worker_minio_secret_secret_id"
+  if [[ -n "${provided_ids// }" ]]; then
+    local candidate_id
+    local seen_ids=""
+    for candidate_id in $provided_ids; do
+      [[ "$candidate_id" =~ ^[a-z0-9]{20,64}$ \
+        && " $seen_ids " != *" $candidate_id "* ]] || return 1
+      seen_ids="${seen_ids:+$seen_ids }$candidate_id"
+    done
+    [[ "$(wc -w <<<"$provided_ids" | tr -d ' ')" -eq 7 ]] || return 1
+    manifest_version=2
+  fi
   vp_worker_control_secret_names "$generation" >/dev/null || return 1
   local operator_secret="vp-wc-operator-$generation"
   local orchestrator_secret="vp-wc-orchestrator-$generation"
@@ -2175,7 +2776,7 @@ vp_worker_control_write_manifest() {
     || return 1
   if ! chmod 0600 "$temporary" \
     || ! printf '%s\n' \
-      "VERSION=1" \
+      "VERSION=$manifest_version" \
       "GENERATION=$generation" \
       "IMAGE=$image" \
       "OPERATOR_DATABASE_SECRET=$operator_secret" \
@@ -2185,6 +2786,13 @@ vp_worker_control_write_manifest() {
       "STAGING_MINIO_SECRET_SECRET=$staging_minio_secret_secret" \
       "WORKER_MINIO_ACCESS_SECRET=$worker_minio_access_secret" \
       "WORKER_MINIO_SECRET_SECRET=$worker_minio_secret_secret" \
+      ${operator_secret_id:+"OPERATOR_DATABASE_SECRET_ID=$operator_secret_id"} \
+      ${orchestrator_secret_id:+"ORCHESTRATOR_DATABASE_SECRET_ID=$orchestrator_secret_id"} \
+      ${staging_secret_id:+"STAGING_DATABASE_SECRET_ID=$staging_secret_id"} \
+      ${staging_minio_access_secret_id:+"STAGING_MINIO_ACCESS_SECRET_ID=$staging_minio_access_secret_id"} \
+      ${staging_minio_secret_secret_id:+"STAGING_MINIO_SECRET_SECRET_ID=$staging_minio_secret_secret_id"} \
+      ${worker_minio_access_secret_id:+"WORKER_MINIO_ACCESS_SECRET_ID=$worker_minio_access_secret_id"} \
+      ${worker_minio_secret_secret_id:+"WORKER_MINIO_SECRET_SECRET_ID=$worker_minio_secret_secret_id"} \
       >"$temporary" \
     || ! mv -f "$temporary" "$path"; then
     rm -f "$temporary"
@@ -2209,6 +2817,13 @@ vp_worker_control_read_manifest() {
   VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_SECRET_SECRET=""
   VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_ACCESS_SECRET=""
   VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET=""
+  VP_WORKER_CONTROL_MANIFEST_OPERATOR_DATABASE_SECRET_ID=""
+  VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET_ID=""
+  VP_WORKER_CONTROL_MANIFEST_STAGING_DATABASE_SECRET_ID=""
+  VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_ACCESS_SECRET_ID=""
+  VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_SECRET_SECRET_ID=""
+  VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_ACCESS_SECRET_ID=""
+  VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET_ID=""
   local key
   local value
   while IFS='=' read -r key value; do
@@ -2262,6 +2877,41 @@ vp_worker_control_read_manifest() {
           || return 1
         VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET="$value"
         ;;
+      OPERATOR_DATABASE_SECRET_ID)
+        [[ -z "$VP_WORKER_CONTROL_MANIFEST_OPERATOR_DATABASE_SECRET_ID" ]] \
+          || return 1
+        VP_WORKER_CONTROL_MANIFEST_OPERATOR_DATABASE_SECRET_ID="$value"
+        ;;
+      ORCHESTRATOR_DATABASE_SECRET_ID)
+        [[ -z "$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET_ID" ]] \
+          || return 1
+        VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET_ID="$value"
+        ;;
+      STAGING_DATABASE_SECRET_ID)
+        [[ -z "$VP_WORKER_CONTROL_MANIFEST_STAGING_DATABASE_SECRET_ID" ]] \
+          || return 1
+        VP_WORKER_CONTROL_MANIFEST_STAGING_DATABASE_SECRET_ID="$value"
+        ;;
+      STAGING_MINIO_ACCESS_SECRET_ID)
+        [[ -z "$VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_ACCESS_SECRET_ID" ]] \
+          || return 1
+        VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_ACCESS_SECRET_ID="$value"
+        ;;
+      STAGING_MINIO_SECRET_SECRET_ID)
+        [[ -z "$VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_SECRET_SECRET_ID" ]] \
+          || return 1
+        VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_SECRET_SECRET_ID="$value"
+        ;;
+      WORKER_MINIO_ACCESS_SECRET_ID)
+        [[ -z "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_ACCESS_SECRET_ID" ]] \
+          || return 1
+        VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_ACCESS_SECRET_ID="$value"
+        ;;
+      WORKER_MINIO_SECRET_SECRET_ID)
+        [[ -z "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET_ID" ]] \
+          || return 1
+        VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET_ID="$value"
+        ;;
       *)
         return 1
         ;;
@@ -2283,12 +2933,102 @@ vp_worker_control_read_manifest() {
       "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_ACCESS_SECRET" \
       "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET"
   )"
-  [[ "$VP_WORKER_CONTROL_MANIFEST_VERSION" == 1 \
+  local identity_values="$VP_WORKER_CONTROL_MANIFEST_OPERATOR_DATABASE_SECRET_ID $VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET_ID $VP_WORKER_CONTROL_MANIFEST_STAGING_DATABASE_SECRET_ID $VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_ACCESS_SECRET_ID $VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_SECRET_SECRET_ID $VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_ACCESS_SECRET_ID $VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET_ID"
+  local identity_count=0
+  local identity_value
+  local seen_identity_values=""
+  for identity_value in $identity_values; do
+    [[ "$identity_value" =~ ^[a-z0-9]{20,64}$ \
+      && " $seen_identity_values " != *" $identity_value "* ]] \
+      || return 1
+    seen_identity_values="${seen_identity_values:+$seen_identity_values }$identity_value"
+    identity_count=$((identity_count + 1))
+  done
+  [[ "$VP_WORKER_CONTROL_MANIFEST_VERSION" =~ ^[12]$ \
     && "$VP_WORKER_CONTROL_MANIFEST_IMAGE" \
       =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*:deploy-[0-9a-f]{12}$ \
     && "${VP_WORKER_CONTROL_MANIFEST_GENERATION#c-}" \
       == "${VP_WORKER_CONTROL_MANIFEST_IMAGE##*:deploy-}"* \
-    && "$actual" == "$expected" ]]
+    && "$actual" == "$expected" \
+    && ( "$VP_WORKER_CONTROL_MANIFEST_VERSION" == 1 \
+      && "$identity_count" -eq 0 \
+      || "$VP_WORKER_CONTROL_MANIFEST_VERSION" == 2 \
+      && "$identity_count" -eq 7 ) ]]
+}
+
+vp_worker_control_manifest_secret_refs() {
+  [[ "$VP_WORKER_CONTROL_MANIFEST_VERSION" == 2 ]] || return 1
+  printf '%s|%s|%s\n' \
+    "$VP_WORKER_CONTROL_MANIFEST_OPERATOR_DATABASE_SECRET" \
+    "$VP_WORKER_CONTROL_MANIFEST_OPERATOR_DATABASE_SECRET_ID" \
+    operator \
+    "$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET" \
+    "$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET_ID" \
+    orchestrator \
+    "$VP_WORKER_CONTROL_MANIFEST_STAGING_DATABASE_SECRET" \
+    "$VP_WORKER_CONTROL_MANIFEST_STAGING_DATABASE_SECRET_ID" \
+    staging-janitor \
+    "$VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_ACCESS_SECRET" \
+    "$VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_ACCESS_SECRET_ID" \
+    staging-minio-access \
+    "$VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_SECRET_SECRET" \
+    "$VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_SECRET_SECRET_ID" \
+    staging-minio-secret \
+    "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_ACCESS_SECRET" \
+    "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_ACCESS_SECRET_ID" \
+    worker-minio-access \
+    "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET" \
+    "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET_ID" \
+    worker-minio-secret
+}
+
+vp_worker_control_require_v2_manifest() {
+  local path="$1"
+  vp_worker_control_read_manifest "$path" || return 1
+  if [[ "$VP_WORKER_CONTROL_MANIFEST_VERSION" == 2 ]]; then
+    return 0
+  fi
+  local generation="$VP_WORKER_CONTROL_MANIFEST_GENERATION"
+  local image="$VP_WORKER_CONTROL_MANIFEST_IMAGE"
+  local ids=()
+  local secret_name
+  local purpose
+  while IFS='|' read -r secret_name purpose; do
+    [[ -n "$secret_name" && -n "$purpose" ]] || return 1
+    local secret_id
+    secret_id="$(
+      vp_managed_secret_id \
+        "$secret_name" "$secret_name" \
+        vp-worker-control "$generation" "$purpose"
+    )" || {
+      echo "worker control v1 manifest requires manual secret identity evidence" >&2
+      return 1
+    }
+    ids+=("$secret_id")
+  done < <(vp_worker_control_secret_refs "$generation")
+  [[ "${#ids[@]}" -eq 7 ]] || return 1
+  vp_worker_control_write_manifest \
+    "$path" "$generation" "$image" "${ids[@]}" || return 1
+  vp_worker_control_read_manifest "$path" || return 1
+  [[ "$VP_WORKER_CONTROL_MANIFEST_VERSION" == 2 ]]
+}
+
+vp_worker_control_find_v2_manifest() {
+  local root="$1"
+  local generation="$2"
+  local candidate
+  for candidate in \
+    "$root/control-retirements/$generation.conf" \
+    "$root/control-candidates/$generation.conf" \
+    "$root/control-current.conf"; do
+    [[ -e "$candidate" ]] || continue
+    vp_worker_control_require_v2_manifest "$candidate" || return 1
+    if [[ "$VP_WORKER_CONTROL_MANIFEST_GENERATION" == "$generation" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
 }
 
 vp_worker_control_schedule_retirement() {
@@ -2299,13 +3039,23 @@ vp_worker_control_schedule_retirement() {
   local directory="$root/control-retirements"
   local journal="$directory/$generation.conf"
   if [[ -e "$journal" ]]; then
-    vp_worker_control_read_manifest "$journal" || return 1
+    vp_worker_control_require_v2_manifest "$journal" || return 1
     [[ "$VP_WORKER_CONTROL_MANIFEST_GENERATION" == "$generation" \
       && "$VP_WORKER_CONTROL_MANIFEST_IMAGE" == "$image" ]]
     return
   fi
+  vp_worker_control_find_v2_manifest \
+    "$root" "$generation" >/dev/null || return 1
+  [[ "$VP_WORKER_CONTROL_MANIFEST_IMAGE" == "$image" ]] || return 1
   vp_worker_control_write_manifest \
-    "$journal" "$generation" "$image"
+    "$journal" "$generation" "$image" \
+    "$VP_WORKER_CONTROL_MANIFEST_OPERATOR_DATABASE_SECRET_ID" \
+    "$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET_ID" \
+    "$VP_WORKER_CONTROL_MANIFEST_STAGING_DATABASE_SECRET_ID" \
+    "$VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_ACCESS_SECRET_ID" \
+    "$VP_WORKER_CONTROL_MANIFEST_STAGING_MINIO_SECRET_SECRET_ID" \
+    "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_ACCESS_SECRET_ID" \
+    "$VP_WORKER_CONTROL_MANIFEST_WORKER_MINIO_SECRET_SECRET_ID"
 }
 
 vp_worker_control_process_retirements() {
@@ -2349,7 +3099,7 @@ vp_worker_control_capture_prior() {
   VP_WORKER_CONTROL_PRIOR_WORKER_MINIO_SECRET_SECRET=""
   local current="$root/control-current.conf"
   [[ -e "$current" ]] || return 0
-  vp_worker_control_read_manifest "$current" || {
+  vp_worker_control_require_v2_manifest "$current" || {
     echo "worker control current manifest is invalid" >&2
     return 1
   }
@@ -2371,7 +3121,8 @@ vp_worker_admission_prepare_control_roles() {
   vp_require_pipeline_network_identity || return 1
   local owner_file
   owner_file="$(
-    vp_worker_admission_required_file \
+    vp_worker_admission_database_credential_file \
+      control_role_owner \
       "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker control-role owner database URL file"
   )" || return 1
@@ -2405,18 +3156,28 @@ vp_worker_admission_prepare_control_roles() {
       provision --generation "$generation" \
       --state-dir /control-state >/dev/null || return 1
 
+  local operator_secret_id
+  local orchestrator_secret_id
+  local staging_secret_id
+  local staging_minio_access_secret_id
+  local staging_minio_secret_secret_id
+  local worker_minio_access_secret_id
+  local worker_minio_secret_secret_id
   vp_worker_admission_create_secret \
     "$VP_WORKER_OPERATOR_DATABASE_SECRET" \
     "$state/$generation/worker-registration-operator-database-url" \
     vp-worker-control "$generation" operator || return 1
+  operator_secret_id="$VP_WORKER_CREATED_SECRET_ID"
   vp_worker_admission_create_secret \
     "$VP_WORKER_ORCHESTRATOR_DATABASE_SECRET" \
     "$state/$generation/worker-orchestrator-database-url" \
     vp-worker-control "$generation" orchestrator || return 1
+  orchestrator_secret_id="$VP_WORKER_CREATED_SECRET_ID"
   vp_worker_admission_create_secret \
     "$VP_STAGING_JANITOR_DATABASE_SECRET" \
     "$state/$generation/vp-staging-janitor-database-url" \
     vp-worker-control "$generation" staging-janitor || return 1
+  staging_secret_id="$VP_WORKER_CREATED_SECRET_ID"
   local minio_access_file="$state/$generation/vp-staging-janitor-minio-access-key"
   local minio_secret_file="$state/$generation/vp-staging-janitor-minio-secret-key"
   vp_worker_admission_write_secret_file \
@@ -2427,18 +3188,32 @@ vp_worker_admission_prepare_control_roles() {
     "$VP_STAGING_JANITOR_MINIO_ACCESS_SECRET" \
     "$minio_access_file" vp-worker-control "$generation" \
     staging-minio-access || return 1
+  staging_minio_access_secret_id="$VP_WORKER_CREATED_SECRET_ID"
   vp_worker_admission_create_secret \
     "$VP_STAGING_JANITOR_MINIO_SECRET_SECRET" \
     "$minio_secret_file" vp-worker-control "$generation" \
     staging-minio-secret || return 1
+  staging_minio_secret_secret_id="$VP_WORKER_CREATED_SECRET_ID"
   vp_worker_admission_create_secret \
     "$VP_WORKER_MINIO_ACCESS_SECRET" \
     "$minio_access_file" vp-worker-control "$generation" \
     worker-minio-access || return 1
+  worker_minio_access_secret_id="$VP_WORKER_CREATED_SECRET_ID"
   vp_worker_admission_create_secret \
     "$VP_WORKER_MINIO_SECRET_SECRET" \
     "$minio_secret_file" vp-worker-control "$generation" \
     worker-minio-secret || return 1
+  worker_minio_secret_secret_id="$VP_WORKER_CREATED_SECRET_ID"
+  vp_worker_control_write_manifest \
+    "$root/control-candidates/$generation.conf" \
+    "$generation" "$image" \
+    "$operator_secret_id" \
+    "$orchestrator_secret_id" \
+    "$staging_secret_id" \
+    "$staging_minio_access_secret_id" \
+    "$staging_minio_secret_secret_id" \
+    "$worker_minio_access_secret_id" \
+    "$worker_minio_secret_secret_id" || return 1
 }
 
 vp_worker_admission_prepare_service() {
@@ -2466,13 +3241,20 @@ vp_worker_admission_prepare_service() {
   local generation=""
   local database_secret=""
   local admission_secret=""
+  local database_secret_id=""
+  local admission_secret_id=""
   if vp_worker_admission_read_manifest "$candidate" "$service" \
     && [[ "$VP_WORKER_MANIFEST_COMMIT" == "$commit" \
       && "$VP_WORKER_MANIFEST_IMAGE" == "$image" ]]; then
+    vp_worker_admission_require_v2_manifest \
+      "$candidate" "$service" || return 1
     generation="$VP_WORKER_MANIFEST_GENERATION"
     database_secret="$VP_WORKER_MANIFEST_DATABASE_SECRET"
     admission_secret="$VP_WORKER_MANIFEST_ADMISSION_SECRET"
+    database_secret_id="$VP_WORKER_MANIFEST_DATABASE_SECRET_ID"
+    admission_secret_id="$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID"
   else
+    [[ ! -e "$candidate" ]] || return 1
     generation="$(vp_worker_admission_new_generation)" || return 1
     database_secret="vp-wr-$kind-db-$generation"
     admission_secret="vp-wr-$kind-admission-$generation"
@@ -2484,7 +3266,8 @@ vp_worker_admission_prepare_service() {
 
   local owner_file
   owner_file="$(
-    vp_worker_admission_required_file \
+    vp_worker_admission_database_credential_file \
+      runtime_role_owner \
       "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker runtime-role owner database URL file"
   )" || return 1
@@ -2506,9 +3289,21 @@ vp_worker_admission_prepare_service() {
   vp_worker_admission_create_secret \
     "$database_secret" "$credential_dir/worker-database-url" \
     "$service" "$generation" database || return 1
+  [[ -z "$database_secret_id" \
+    || "$database_secret_id" == "$VP_WORKER_CREATED_SECRET_ID" ]] \
+    || return 1
+  database_secret_id="$VP_WORKER_CREATED_SECRET_ID"
   vp_worker_admission_create_secret \
     "$admission_secret" "$credential_dir/worker-admission-token" \
     "$service" "$generation" admission || return 1
+  [[ -z "$admission_secret_id" \
+    || "$admission_secret_id" == "$VP_WORKER_CREATED_SECRET_ID" ]] \
+    || return 1
+  admission_secret_id="$VP_WORKER_CREATED_SECRET_ID"
+  vp_worker_admission_write_manifest \
+    "$candidate" "$service" "$commit" "$image" "$generation" \
+    "$database_secret" "$admission_secret" \
+    "$database_secret_id" "$admission_secret_id" || return 1
   vp_worker_admission_set_candidate \
     "$service" "$generation" "$database_secret" "$admission_secret" \
     || return 1
@@ -2543,6 +3338,147 @@ vp_worker_admission_prepare_service() {
     upsert --request-file "$request_file"
 }
 
+vp_worker_admission_prepare_transaction() {
+  local backend_image="$1"
+  local ffmpeg_go_image="$2"
+  local control_image="$3"
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
+    return 0
+  fi
+  vp_worker_admission_lock_assert || return 1
+  local root="$VP_WORKER_ADMISSION_LOCK_ROOT"
+  [[ "$root" == "$(vp_worker_admission_root)" ]] || return 1
+
+  local replay_plan
+  replay_plan="$(
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      replay-plan "$root" 2>/dev/null
+  )" || return 1
+  local replay_fields
+  replay_fields="$(
+    printf '%s\n' "$replay_plan" \
+      | python3 -I -c '
+import json
+import sys
+
+try:
+    plan = json.load(sys.stdin)
+    if set(plan) != {
+        "active",
+        "allow_new_candidate",
+        "allow_stale_cleanup",
+        "namespace",
+        "next_action",
+        "pending_operation",
+        "phase",
+        "retirements",
+        "revision",
+        "transaction_id",
+    }:
+        raise ValueError
+    if plan["active"]:
+        if (
+            plan["allow_new_candidate"]
+            or plan["allow_stale_cleanup"]
+            or not isinstance(plan["phase"], str)
+            or not isinstance(plan["namespace"], str)
+        ):
+            raise ValueError
+        print(
+            "active|"
+            + plan["phase"]
+            + "|"
+            + plan["namespace"]
+        )
+    else:
+        if (
+            not plan["allow_new_candidate"]
+            or not plan["allow_stale_cleanup"]
+        ):
+            raise ValueError
+        print("absent|-|-")
+except Exception:
+    raise SystemExit(1)
+'
+  )" || return 1
+  local active_state
+  local active_phase
+  local active_namespace
+  local extra
+  IFS='|' read -r \
+    active_state active_phase active_namespace extra \
+    <<<"$replay_fields"
+  [[ -z "$extra" ]] || return 1
+  case "$active_state|$active_phase" in
+    absent\|-) ;;
+    active\|PREPARING) ;;
+    active\|*)
+      echo \
+        "worker admission transaction requires stage-2 reconciliation: $active_phase" \
+        >&2
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  local commit
+  commit="$(
+    docker image inspect "$control_image" \
+      --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+  )" || return 1
+  if [[ ! "$commit" =~ ^[0-9a-f]{40}$ \
+    || "$control_image" != *":deploy-${commit:0:12}" \
+    || "$ffmpeg_go_image" != *":deploy-${commit:0:12}" ]]; then
+    echo "worker image commit identity is invalid" >&2
+    return 1
+  fi
+
+  local transaction_arguments=(
+    "$root"
+    "$VP_WORKER_ADMISSION_LOCK_FD"
+    "$commit"
+    "$backend_image"
+    "$ffmpeg_go_image"
+  )
+  local credential_arguments=(
+    "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE"
+    "$VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL"
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+    "$VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL"
+    "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE"
+    "$VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL"
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE"
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL"
+  )
+  if [[ "$active_state" == active ]]; then
+    [[ "$active_namespace" == "$commit" ]] || return 1
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      verify-preparing \
+      "${transaction_arguments[@]}" \
+      "${credential_arguments[@]}" >/dev/null 2>&1 || return 1
+  else
+    local baseline_kind=legacy_no_control
+    if [[ -e "$root/control-current.conf" ]]; then
+      [[ -f "$root/control-current.conf" \
+        && ! -L "$root/control-current.conf" ]] || return 1
+      baseline_kind=managed
+    fi
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      begin \
+      "${transaction_arguments[@]}" \
+      "$commit" \
+      "$baseline_kind" \
+      "${credential_arguments[@]}" >/dev/null 2>&1 || return 1
+  fi
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+  VP_WORKER_ADMISSION_COMMIT="$commit"
+  VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE="$commit"
+  VP_WORKER_ADMISSION_CONTROL_IMAGE="$control_image"
+}
+
 vp_prepare_worker_admission() {
   local control_image="$1"
   local ffmpeg_go_image="$2"
@@ -2575,8 +3511,9 @@ vp_prepare_worker_admission() {
   VP_WORKER_ADMISSION_COMMIT="$commit"
   VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE="$commit"
   VP_WORKER_ADMISSION_CONTROL_IMAGE="$control_image"
+  [[ "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true \
+    && "$VP_WORKER_ADMISSION_LOCK_HELD" == true ]] || return 1
   vp_worker_control_capture_prior "$root" || return 1
-  vp_worker_control_cleanup_stale_candidates "$root" || return 1
   vp_worker_admission_prepare_control_roles \
     "$control_image" "$commit" "$root" || return 1
   vp_worker_admission_prepare_service \
@@ -2613,7 +3550,8 @@ vp_worker_admission_select_candidate() {
   local kind
   kind="$(vp_worker_admission_kind "$service")" || return 1
   local candidate="$root/candidates/$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE/$kind.conf"
-  vp_worker_admission_read_manifest "$candidate" "$service" || return 1
+  vp_worker_admission_require_v2_manifest \
+    "$candidate" "$service" || return 1
   if [[ "$VP_WORKER_MANIFEST_IMAGE" \
       != *":deploy-${VP_WORKER_MANIFEST_COMMIT:0:12}" ]]; then
     return 1
@@ -2639,12 +3577,15 @@ vp_worker_admission_candidate_records() {
     local kind
     kind="$(vp_worker_admission_kind "$service")" || return 1
     local candidate="$root/candidates/$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE/$kind.conf"
-    vp_worker_admission_read_manifest "$candidate" "$service" || return 1
-    printf '%s|%s|%s|%s\n' \
+    vp_worker_admission_require_v2_manifest \
+      "$candidate" "$service" || return 1
+    printf '%s|%s|%s|%s|%s|%s\n' \
       "$service" \
       "$VP_WORKER_MANIFEST_GENERATION" \
       "$VP_WORKER_MANIFEST_DATABASE_SECRET" \
-      "$VP_WORKER_MANIFEST_ADMISSION_SECRET"
+      "$VP_WORKER_MANIFEST_DATABASE_SECRET_ID" \
+      "$VP_WORKER_MANIFEST_ADMISSION_SECRET" \
+      "$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID"
   done
 }
 
@@ -2979,7 +3920,8 @@ vp_require_worker_deployment_ready() {
   vp_require_worker_service_descriptor "$service" || return 1
   local read_file
   read_file="$(
-    vp_worker_admission_required_file \
+    vp_worker_admission_database_credential_file \
+      deploy_read \
       "${VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE:-}" \
       "worker deploy-read database URL file"
   )" || return 1
@@ -3016,7 +3958,8 @@ vp_worker_admission_generation_state() {
   vp_require_pipeline_network_identity || return 1
   local read_file
   read_file="$(
-    vp_worker_admission_required_file \
+    vp_worker_admission_database_credential_file \
+      deploy_read \
       "${VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE:-}" \
       "worker deploy-read database URL file"
   )" || return 1
@@ -3067,10 +4010,13 @@ except (TypeError, ValueError, json.JSONDecodeError):
 vp_worker_admission_retirement_ids() {
   local service="$1"
   local generation="$2"
+  vp_worker_admission_kind "$service" >/dev/null || return 1
+  [[ "$generation" =~ ^[1-9][0-9]*$ ]] || return 1
   vp_require_pipeline_network_identity || return 1
   local read_file
   read_file="$(
-    vp_worker_admission_required_file \
+    vp_worker_admission_database_credential_file \
+      deploy_read \
       "${VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE:-}" \
       "worker deploy-read database URL file"
   )" || return 1
@@ -3089,13 +4035,16 @@ vp_worker_admission_retirement_ids() {
         --service-name "$service" \
         --generation "$generation"
   )" || return 1
-  RETIREMENT_PAYLOAD="$payload" python3 - <<'PY'
+  RETIREMENT_PAYLOAD="$payload" python3 - \
+    "$service" "$generation" <<'PY'
 import json
 import os
 import sys
 import uuid
 
 try:
+    expected_service = sys.argv[1]
+    expected_generation = int(sys.argv[2])
     payload = json.loads(os.environ["RETIREMENT_PAYLOAD"])
     if set(payload) != {
         "code",
@@ -3109,13 +4058,19 @@ try:
         payload["status"] != "ok"
         or payload["code"]
         != "worker_deployment_retirement_candidates"
+        or payload["service_name"] != expected_service
+        or isinstance(payload["generation"], bool)
+        or payload["generation"] != expected_generation
         or not isinstance(payload["registration_ids"], list)
     ):
         raise ValueError
+    registration_ids = []
     for value in payload["registration_ids"]:
         parsed = uuid.UUID(value)
         if str(parsed) != value:
             raise ValueError
+        registration_ids.append(value)
+    for value in registration_ids:
         print(value)
 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     sys.exit(1)
@@ -3126,8 +4081,10 @@ vp_worker_admission_retire_generation() {
   local service="$1"
   local generation="$2"
   local database_secret="$3"
-  local admission_secret="$4"
-  local root="$5"
+  local database_secret_id="$4"
+  local admission_secret="$5"
+  local admission_secret_id="$6"
+  local root="$7"
   vp_require_pipeline_network_identity || return 1
   local runtime_state
   runtime_state="$(
@@ -3163,7 +4120,8 @@ vp_worker_admission_retire_generation() {
 
   local owner_file
   owner_file="$(
-    vp_worker_admission_required_file \
+    vp_worker_admission_database_credential_file \
+      runtime_role_owner \
       "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker runtime-role owner database URL file"
   )" || return 1
@@ -3180,12 +4138,12 @@ vp_worker_admission_retire_generation() {
       revoke --service-name "$service" \
       --generation "$generation" \
       --state-dir /runtime-state >/dev/null || return 1
-  if docker secret inspect "$database_secret" >/dev/null 2>&1; then
-    docker secret rm "$database_secret" >/dev/null || return 1
-  fi
-  if docker secret inspect "$admission_secret" >/dev/null 2>&1; then
-    docker secret rm "$admission_secret" >/dev/null || return 1
-  fi
+  vp_remove_managed_secret \
+    "$database_secret_id" "$database_secret" \
+    "$service" "$generation" database || return 1
+  vp_remove_managed_secret \
+    "$admission_secret_id" "$admission_secret" \
+    "$service" "$generation" admission || return 1
 }
 
 vp_worker_admission_retire_records() {
@@ -3196,16 +4154,23 @@ vp_worker_admission_retire_records() {
   local service
   local generation
   local database_secret
+  local database_secret_id
   local admission_secret
+  local admission_secret_id
   local extra
   while IFS='|' read -r \
-    service generation database_secret admission_secret extra; do
+    service generation database_secret database_secret_id \
+    admission_secret admission_secret_id extra; do
     [[ -n "$service" || -n "$generation" || -n "$database_secret" \
-      || -n "$admission_secret" || -n "$extra" ]] || continue
+      || -n "$database_secret_id" || -n "$admission_secret" \
+      || -n "$admission_secret_id" || -n "$extra" ]] || continue
     if [[ -n "$extra" \
       || ! "$generation" =~ ^[1-9][0-9]*$ \
       || ! "$database_secret" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ \
-      || ! "$admission_secret" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] \
+      || ! "$database_secret_id" =~ ^[a-z0-9]{20,64}$ \
+      || ! "$admission_secret" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ \
+      || ! "$admission_secret_id" =~ ^[a-z0-9]{20,64}$ \
+      || "$database_secret_id" == "$admission_secret_id" ]] \
       || ! vp_worker_admission_kind "$service" >/dev/null; then
       return 1
     fi
@@ -3214,7 +4179,9 @@ vp_worker_admission_retire_records() {
     esac
     seen="${seen:+$seen }$service:$generation"
     vp_worker_admission_retire_generation \
-      "$service" "$generation" "$database_secret" "$admission_secret" \
+      "$service" "$generation" \
+      "$database_secret" "$database_secret_id" \
+      "$admission_secret" "$admission_secret_id" \
       "$root" || return 1
   done <<<"$records"
 }
@@ -3279,11 +4246,14 @@ vp_worker_admission_process_retirement_journals() {
     local service
     local generation
     local database_secret
+    local database_secret_id
     local admission_secret
+    local admission_secret_id
     local extra
     while IFS='|' read -r \
-      service generation database_secret admission_secret extra; do
-      [[ -n "$service$generation$database_secret$admission_secret$extra" ]] \
+      service generation database_secret database_secret_id \
+      admission_secret admission_secret_id extra; do
+      [[ -n "$service$generation$database_secret$database_secret_id$admission_secret$admission_secret_id$extra" ]] \
         || continue
       local kind
       kind="$(vp_worker_admission_kind "$service")" || return 1
@@ -3319,25 +4289,32 @@ vp_commit_worker_admission() {
     local kind
     kind="$(vp_worker_admission_kind "$service")" || return 1
     local candidate="$root/candidates/$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE/$kind.conf"
-    vp_worker_admission_read_manifest "$candidate" "$service" || return 1
+    vp_worker_admission_require_v2_manifest \
+      "$candidate" "$service" || return 1
     local candidate_generation="$VP_WORKER_MANIFEST_GENERATION"
 
     local current="$root/current/$kind.conf"
     local prior_generation=""
     local prior_database_secret=""
+    local prior_database_secret_id=""
     local prior_admission_secret=""
-    if vp_worker_admission_read_manifest "$current" "$service"; then
+    local prior_admission_secret_id=""
+    if [[ -e "$current" ]]; then
+      vp_worker_admission_require_v2_manifest \
+        "$current" "$service" || {
+        echo "worker admission current manifest is invalid" >&2
+        return 1
+      }
       prior_generation="$VP_WORKER_MANIFEST_GENERATION"
       prior_database_secret="$VP_WORKER_MANIFEST_DATABASE_SECRET"
+      prior_database_secret_id="$VP_WORKER_MANIFEST_DATABASE_SECRET_ID"
       prior_admission_secret="$VP_WORKER_MANIFEST_ADMISSION_SECRET"
-    elif [[ -e "$current" ]]; then
-      echo "worker admission current manifest is invalid" >&2
-      return 1
+      prior_admission_secret_id="$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID"
     fi
 
     if [[ -n "$prior_generation" \
       && "$prior_generation" != "$candidate_generation" ]]; then
-      retirement_records="${retirement_records:+$retirement_records$'\n'}$service|$prior_generation|$prior_database_secret|$prior_admission_secret"
+      retirement_records="${retirement_records:+$retirement_records$'\n'}$service|$prior_generation|$prior_database_secret|$prior_database_secret_id|$prior_admission_secret|$prior_admission_secret_id"
     fi
   done
   vp_worker_admission_write_retirement_journal \
@@ -3347,17 +4324,21 @@ vp_commit_worker_admission() {
     local kind
     kind="$(vp_worker_admission_kind "$service")" || return 1
     local candidate="$root/candidates/$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE/$kind.conf"
-    vp_worker_admission_read_manifest "$candidate" "$service" || return 1
+    vp_worker_admission_require_v2_manifest \
+      "$candidate" "$service" || return 1
     local candidate_commit="$VP_WORKER_MANIFEST_COMMIT"
     local candidate_image="$VP_WORKER_MANIFEST_IMAGE"
     local candidate_generation="$VP_WORKER_MANIFEST_GENERATION"
     local candidate_database_secret="$VP_WORKER_MANIFEST_DATABASE_SECRET"
+    local candidate_database_secret_id="$VP_WORKER_MANIFEST_DATABASE_SECRET_ID"
     local candidate_admission_secret="$VP_WORKER_MANIFEST_ADMISSION_SECRET"
+    local candidate_admission_secret_id="$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID"
     local current="$root/current/$kind.conf"
     vp_worker_admission_write_manifest \
       "$current" "$service" "$candidate_commit" \
       "$candidate_image" "$candidate_generation" \
       "$candidate_database_secret" "$candidate_admission_secret" \
+      "$candidate_database_secret_id" "$candidate_admission_secret_id" \
       || return 1
   done
   vp_worker_admission_process_retirement_journals "$root" || return 1
@@ -3436,16 +4417,15 @@ vp_worker_control_retire_generation() {
   )" || return 1
   vp_worker_control_generation_unused \
     "$generation" "$allow_missing_services" || return 1
-  local secret_name
-  while IFS= read -r secret_name; do
-    [[ -n "$secret_name" ]] || continue
-    if docker secret inspect "$secret_name" >/dev/null 2>&1; then
-      docker secret rm "$secret_name" >/dev/null || return 1
-    fi
-  done < <(vp_worker_control_secret_names "$generation")
+  vp_worker_control_find_v2_manifest \
+    "$root" "$generation" >/dev/null || return 1
+  [[ "$VP_WORKER_CONTROL_MANIFEST_IMAGE" == "$image" ]] || return 1
+  local secret_refs
+  secret_refs="$(vp_worker_control_manifest_secret_refs)" || return 1
   local owner_file
   owner_file="$(
-    vp_worker_admission_required_file \
+    vp_worker_admission_database_credential_file \
+      control_role_owner \
       "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker control-role owner database URL file"
   )" || return 1
@@ -3461,6 +4441,16 @@ vp_worker_control_retire_generation() {
     python -m app.services.worker_control_role_cli \
       revoke --generation "$generation" \
       --state-dir /control-state >/dev/null || return 1
+  local secret_name
+  local secret_id
+  local secret_purpose
+  while IFS='|' read -r secret_name secret_id secret_purpose; do
+    [[ -n "$secret_name" && -n "$secret_id" && -n "$secret_purpose" ]] \
+      || return 1
+    vp_remove_managed_secret \
+      "$secret_id" "$secret_name" \
+      vp-worker-control "$generation" "$secret_purpose" || return 1
+  done <<<"$secret_refs"
   rm -f "$root/control-candidates/$generation.conf"
 }
 
@@ -3925,7 +4915,8 @@ vp_run_worker_registration_migration() {
   vp_require_pipeline_network_identity || return 1
   local migrator_file
   migrator_file="$(
-    vp_worker_admission_required_file \
+    vp_worker_admission_database_credential_file \
+      deploy_migrator \
       "${VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE:-}" \
       "worker deploy-migrator database URL file"
   )" || return 1
@@ -3951,7 +4942,8 @@ vp_require_channelops_migration_head() {
   vp_require_pipeline_network_identity || return 1
   local read_file
   read_file="$(
-    vp_worker_admission_required_file \
+    vp_worker_admission_database_credential_file \
+      deploy_read \
       "${VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE:-}" \
       "worker deploy-read database URL file"
   )" || return 1
@@ -5464,12 +6456,15 @@ vp_worker_admission_stale_rollback_records() {
       kind="$(vp_worker_admission_kind "$service")" || return 1
       local manifest="$directory/$kind.conf"
       [[ -e "$manifest" ]] || continue
-      vp_worker_admission_read_manifest "$manifest" "$service" || return 1
-      printf '%s|%s|%s|%s\n' \
+      vp_worker_admission_require_v2_manifest \
+        "$manifest" "$service" || return 1
+      printf '%s|%s|%s|%s|%s|%s\n' \
         "$service" \
         "$VP_WORKER_MANIFEST_GENERATION" \
         "$VP_WORKER_MANIFEST_DATABASE_SECRET" \
-        "$VP_WORKER_MANIFEST_ADMISSION_SECRET"
+        "$VP_WORKER_MANIFEST_DATABASE_SECRET_ID" \
+        "$VP_WORKER_MANIFEST_ADMISSION_SECRET" \
+        "$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID"
     done
   done < <(
     find "$root/candidates" -mindepth 1 -maxdepth 1 \
@@ -6087,6 +7082,183 @@ vp_worker_redis_marker_revoke_roles() {
       --state-dir /control-state >/dev/null
 }
 
+vp_worker_redis_marker_write_secret_manifest() {
+  local control_root="$1"
+  local generation="$2"
+  local readiness_id="$3"
+  local janitor_id="$4"
+  local repair_id="$5"
+  [[ "$control_root" = /* \
+    && "$generation" =~ ^[a-z0-9][a-z0-9-]{0,62}$ \
+    && "$readiness_id" =~ ^[a-z0-9]{20,64}$ \
+    && "$janitor_id" =~ ^[a-z0-9]{20,64}$ \
+    && "$repair_id" =~ ^[a-z0-9]{20,64}$ \
+    && "$readiness_id" != "$janitor_id" \
+    && "$readiness_id" != "$repair_id" \
+    && "$janitor_id" != "$repair_id" ]] || return 1
+  local directory="$control_root/secret-manifests"
+  mkdir -p "$directory" || return 1
+  chmod 0700 "$directory" || return 1
+  local path="$directory/$generation.conf"
+  local temporary
+  temporary="$(mktemp "$directory/.marker-secrets.XXXXXX")" || return 1
+  if ! chmod 0600 "$temporary" \
+    || ! printf '%s\n' \
+      "VERSION=2" \
+      "GENERATION=$generation" \
+      "READINESS_SECRET=$(vp_worker_redis_marker_database_secret_name readiness "$generation")" \
+      "READINESS_SECRET_ID=$readiness_id" \
+      "JANITOR_SECRET=$(vp_worker_redis_marker_database_secret_name janitor "$generation")" \
+      "JANITOR_SECRET_ID=$janitor_id" \
+      "REPAIR_SECRET=$(vp_worker_redis_marker_database_secret_name repair "$generation")" \
+      "REPAIR_SECRET_ID=$repair_id" \
+      >"$temporary" \
+    || ! mv -f "$temporary" "$path"; then
+    rm -f "$temporary"
+    return 1
+  fi
+  [[ -f "$path" && ! -L "$path" \
+    && "$(vp_worker_redis_marker_file_mode "$path")" == 600 ]]
+}
+
+vp_worker_redis_marker_write_manual_secret_evidence() {
+  local control_root="$1"
+  local generation="$2"
+  local purpose="$3"
+  local secret_name="$4"
+  [[ "$control_root" = /* \
+    && "$generation" =~ ^[a-z0-9][a-z0-9-]{0,62}$ \
+    && "$purpose" =~ ^(readiness|janitor|repair)$ \
+    && "$secret_name" \
+      == "$(vp_worker_redis_marker_database_secret_name \
+        "$purpose" "$generation")" ]] || return 1
+  local directory="$control_root/legacy-unretirable-secrets"
+  mkdir -p "$directory" || return 1
+  chmod 0700 "$directory" || return 1
+  local path="$directory/$generation-$purpose.conf"
+  if [[ -e "$path" ]]; then
+    [[ -f "$path" && ! -L "$path" \
+      && "$(vp_worker_redis_marker_file_mode "$path")" == 600 ]] \
+      || return 1
+    return 0
+  fi
+  local temporary
+  temporary="$(mktemp "$directory/.legacy-secret.XXXXXX")" || return 1
+  if ! chmod 0600 "$temporary" \
+    || ! printf '%s\n' \
+      "VERSION=1" \
+      "STATUS=legacy_unretirable" \
+      "SERVICE=worker-redis-marker-control" \
+      "GENERATION=$generation" \
+      "PURPOSE=$purpose-database" \
+      "SECRET_NAME=$secret_name" \
+      >"$temporary" \
+    || ! mv -f "$temporary" "$path"; then
+    rm -f "$temporary"
+    return 1
+  fi
+}
+
+vp_worker_redis_marker_require_secret_manifest() {
+  local control_root="$1"
+  local generation="$2"
+  [[ "$control_root" = /* \
+    && "$generation" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || return 1
+  local path="$control_root/secret-manifests/$generation.conf"
+  if [[ ! -e "$path" ]]; then
+    local hydrated_ids=()
+    local purpose
+    for purpose in readiness janitor repair; do
+      local secret_name
+      secret_name="$(
+        vp_worker_redis_marker_database_secret_name \
+          "$purpose" "$generation"
+      )" || return 1
+      local secret_id
+      secret_id="$(
+        vp_managed_secret_id \
+          "$secret_name" "$secret_name" \
+          worker-redis-marker-control "$generation" "$purpose-database"
+      )" || {
+        vp_worker_redis_marker_write_manual_secret_evidence \
+          "$control_root" "$generation" "$purpose" "$secret_name" \
+          || return 1
+        return 1
+      }
+      hydrated_ids+=("$secret_id")
+    done
+    vp_worker_redis_marker_write_secret_manifest \
+      "$control_root" "$generation" "${hydrated_ids[@]}" || return 1
+  fi
+  if [[ ! -f "$path" || -L "$path" \
+    || "$(vp_worker_redis_marker_file_mode "$path")" != 600 ]]; then
+    return 1
+  fi
+  local version=""
+  local manifest_generation=""
+  local readiness_name=""
+  local readiness_id=""
+  local janitor_name=""
+  local janitor_id=""
+  local repair_name=""
+  local repair_id=""
+  local key
+  local value
+  while IFS='=' read -r key value; do
+    [[ -n "$key" && -n "$value" && "$value" != *$'\r'* ]] \
+      || return 1
+    case "$key" in
+      VERSION) [[ -z "$version" ]] || return 1; version="$value" ;;
+      GENERATION)
+        [[ -z "$manifest_generation" ]] || return 1
+        manifest_generation="$value"
+        ;;
+      READINESS_SECRET)
+        [[ -z "$readiness_name" ]] || return 1
+        readiness_name="$value"
+        ;;
+      READINESS_SECRET_ID)
+        [[ -z "$readiness_id" ]] || return 1
+        readiness_id="$value"
+        ;;
+      JANITOR_SECRET)
+        [[ -z "$janitor_name" ]] || return 1
+        janitor_name="$value"
+        ;;
+      JANITOR_SECRET_ID)
+        [[ -z "$janitor_id" ]] || return 1
+        janitor_id="$value"
+        ;;
+      REPAIR_SECRET)
+        [[ -z "$repair_name" ]] || return 1
+        repair_name="$value"
+        ;;
+      REPAIR_SECRET_ID)
+        [[ -z "$repair_id" ]] || return 1
+        repair_id="$value"
+        ;;
+      *) return 1 ;;
+    esac
+  done <"$path"
+  [[ "$version" == 2 \
+    && "$manifest_generation" == "$generation" \
+    && "$readiness_name" \
+      == "$(vp_worker_redis_marker_database_secret_name readiness "$generation")" \
+    && "$janitor_name" \
+      == "$(vp_worker_redis_marker_database_secret_name janitor "$generation")" \
+    && "$repair_name" \
+      == "$(vp_worker_redis_marker_database_secret_name repair "$generation")" \
+    && "$readiness_id" =~ ^[a-z0-9]{20,64}$ \
+    && "$janitor_id" =~ ^[a-z0-9]{20,64}$ \
+    && "$repair_id" =~ ^[a-z0-9]{20,64}$ \
+    && "$readiness_id" != "$janitor_id" \
+    && "$readiness_id" != "$repair_id" \
+    && "$janitor_id" != "$repair_id" ]] || return 1
+  VP_WORKER_REDIS_MARKER_READINESS_DATABASE_SECRET_ID="$readiness_id"
+  VP_WORKER_REDIS_MARKER_JANITOR_DATABASE_SECRET_ID="$janitor_id"
+  VP_WORKER_REDIS_MARKER_REPAIR_DATABASE_SECRET_ID="$repair_id"
+}
+
 vp_worker_redis_marker_create_database_secrets() {
   local generation="$1"
   local control_root="$2"
@@ -6094,24 +7266,39 @@ vp_worker_redis_marker_create_database_secrets() {
   local secret_name
   local credential_file
   VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS=""
+  VP_WORKER_REDIS_MARKER_READINESS_DATABASE_SECRET_ID=""
+  VP_WORKER_REDIS_MARKER_JANITOR_DATABASE_SECRET_ID=""
+  VP_WORKER_REDIS_MARKER_REPAIR_DATABASE_SECRET_ID=""
   for purpose in readiness janitor repair; do
     secret_name="$(
       vp_worker_redis_marker_database_secret_name "$purpose" "$generation"
     )" || return 1
     credential_file="$control_root/roles/$generation/worker-marker-$purpose-database-url"
-    if [[ ! -f "$credential_file" || -L "$credential_file" \
-      || "$(vp_worker_redis_marker_file_mode "$credential_file")" != 400 ]] \
-      || docker secret inspect "$secret_name" >/dev/null 2>&1; then
-      echo "worker marker database credential is absent, invalid, or reused" >&2
-      return 1
-    fi
-    if ! docker secret create "$secret_name" - \
-      <"$credential_file" >/dev/null; then
+    if ! vp_worker_admission_create_secret \
+      "$secret_name" "$credential_file" \
+      worker-redis-marker-control "$generation" \
+      "$purpose-database"; then
       echo "worker marker database secret creation failed" >&2
       return 1
     fi
-    VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS="${VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS:+$VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS }$secret_name"
+    VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS="${VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS:+$VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS$'\n'}$secret_name|$VP_WORKER_CREATED_SECRET_ID|$purpose-database"
+    case "$purpose" in
+      readiness)
+        VP_WORKER_REDIS_MARKER_READINESS_DATABASE_SECRET_ID="$VP_WORKER_CREATED_SECRET_ID"
+        ;;
+      janitor)
+        VP_WORKER_REDIS_MARKER_JANITOR_DATABASE_SECRET_ID="$VP_WORKER_CREATED_SECRET_ID"
+        ;;
+      repair)
+        VP_WORKER_REDIS_MARKER_REPAIR_DATABASE_SECRET_ID="$VP_WORKER_CREATED_SECRET_ID"
+        ;;
+    esac
   done
+  vp_worker_redis_marker_write_secret_manifest \
+    "$control_root" "$generation" \
+    "$VP_WORKER_REDIS_MARKER_READINESS_DATABASE_SECRET_ID" \
+    "$VP_WORKER_REDIS_MARKER_JANITOR_DATABASE_SECRET_ID" \
+    "$VP_WORKER_REDIS_MARKER_REPAIR_DATABASE_SECRET_ID"
 }
 
 vp_worker_redis_marker_expected_job_identity() {
@@ -6249,6 +7436,8 @@ vp_worker_redis_marker_retire_generation() {
   local readiness_redis_secret="${4:-$VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET}"
   local janitor_redis_secret="${5:-$VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET}"
   [[ -n "$image" && -n "$generation" ]] || return 0
+  vp_worker_redis_marker_require_secret_manifest \
+    "$control_root" "$generation" || return 1
   vp_worker_redis_marker_remove_generation_jobs \
     "$image" "$generation" \
     "$readiness_redis_secret" "$janitor_redis_secret" || return 1
@@ -6260,9 +7449,22 @@ vp_worker_redis_marker_retire_generation() {
     secret_name="$(
       vp_worker_redis_marker_database_secret_name "$purpose" "$generation"
     )" || return 1
-    if docker secret inspect "$secret_name" >/dev/null 2>&1; then
-      docker secret rm "$secret_name" >/dev/null || return 1
-    fi
+    local secret_id
+    case "$purpose" in
+      readiness)
+        secret_id="$VP_WORKER_REDIS_MARKER_READINESS_DATABASE_SECRET_ID"
+        ;;
+      janitor)
+        secret_id="$VP_WORKER_REDIS_MARKER_JANITOR_DATABASE_SECRET_ID"
+        ;;
+      repair)
+        secret_id="$VP_WORKER_REDIS_MARKER_REPAIR_DATABASE_SECRET_ID"
+        ;;
+    esac
+    vp_remove_managed_secret \
+      "$secret_id" "$secret_name" \
+      worker-redis-marker-control "$generation" "$purpose-database" \
+      || return 1
   done
 }
 
@@ -6713,10 +7915,16 @@ vp_worker_redis_marker_provision_generation() {
     "$generation" "$control_root"; then
     vp_worker_redis_marker_revoke_roles \
       "$image" "$generation" "$control_root" || return 1
-    local secret
-    for secret in ${VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS:-}; do
-      docker secret rm "$secret" >/dev/null || return 1
-    done
+    local secret_name
+    local secret_id
+    local secret_purpose
+    while IFS='|' read -r secret_name secret_id secret_purpose; do
+      [[ -n "$secret_name$secret_id$secret_purpose" ]] || continue
+      vp_remove_managed_secret \
+        "$secret_id" "$secret_name" \
+        worker-redis-marker-control "$generation" "$secret_purpose" \
+        || return 1
+    done <<<"${VP_WORKER_REDIS_MARKER_CREATED_DATABASE_SECRETS:-}"
     return 1
   fi
 }
@@ -6961,8 +8169,7 @@ vp_apply_app_services() {
   vp_commit_worker_control_generation || return 1
 }
 
-deploy_vp_app_services() {
-  vp_validate_deploy_config || return 1
+_vp_deploy_vp_app_services_locked() {
   VP_VISION_CUTOVER_REQUIRED="$(vp_vision_cutover_required "${6:-}")" || return 1
   case "$VP_VISION_CUTOVER_REQUIRED" in
     true)
@@ -7008,6 +8215,50 @@ deploy_vp_app_services() {
     return 1
   fi
   printf '%s\n' "$VP_APP_SERVICES"
+}
+
+deploy_vp_app_services() {
+  local admission_root
+  admission_root="$(vp_worker_admission_root)" || return 1
+  admission_root="$(
+    vp_python_worker_prepare_controlled_directory "$admission_root"
+  )" || return 1
+  vp_worker_admission_lock_acquire "$admission_root" || return 1
+
+  local caller_hup_trap
+  local caller_int_trap
+  local caller_term_trap
+  caller_hup_trap="$(trap -p HUP)"
+  caller_int_trap="$(trap -p INT)"
+  caller_term_trap="$(trap -p TERM)"
+  local deploy_signal_status=0
+  trap 'deploy_signal_status=129' HUP
+  trap 'deploy_signal_status=130' INT
+  trap 'deploy_signal_status=143' TERM
+
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
+  local deploy_status=0
+  if ! vp_validate_deploy_config "${3:-}"; then
+    deploy_status=1
+  elif ! vp_worker_admission_prepare_transaction \
+    "${3:-}" "${5:-}" "${6:-}"; then
+    deploy_status=1
+  elif _vp_deploy_vp_app_services_locked "$@"; then
+    deploy_status=0
+  else
+    deploy_status=$?
+  fi
+
+  vp_python_worker_restore_trap "$caller_hup_trap" HUP
+  vp_python_worker_restore_trap "$caller_int_trap" INT
+  vp_python_worker_restore_trap "$caller_term_trap" TERM
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
+  local release_status=0
+  vp_worker_admission_lock_release || release_status=1
+  if [[ "$deploy_signal_status" -ne 0 ]]; then
+    return "$deploy_signal_status"
+  fi
+  [[ "$deploy_status" -eq 0 && "$release_status" -eq 0 ]]
 }
 
 vp_deploy_single_runtime_service() {

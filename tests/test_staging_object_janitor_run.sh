@@ -31,6 +31,8 @@ VOLUME_JSON_FILE="$TEST_ROOT/volume.json"
 HOLDER_STATE="$TEST_ROOT/holder-state"
 HOLDER_ID="$(printf 'a%.0s' {1..64})"
 SERVICE_ID="s1234567890abcdefghijklmn"
+REPLACEMENT_SERVICE_ID="s9876543210zyxwvutsrqponm"
+SERVICE_INSPECT_COUNT_FILE="$TEST_ROOT/service-inspect-count"
 TASK_ID="t1234567890abcdefghijklmn"
 TASK_CONTAINER_ID="$(printf 'b%.0s' {1..64})"
 IMAGE_ID="sha256:$(printf 'c%.0s' {1..64})"
@@ -45,6 +47,8 @@ export \
   HOLDER_STATE \
   HOLDER_ID \
   SERVICE_ID \
+  REPLACEMENT_SERVICE_ID \
+  SERVICE_INSPECT_COUNT_FILE \
   TASK_ID \
   TASK_CONTAINER_ID \
   IMAGE_ID
@@ -264,6 +268,18 @@ fi
 if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
   [[ -f "$SERVICE_STATE" ]] || exit 1
   if [[ "$*" == *'{{json .}}'* ]]; then
+    inspect_count=0
+    if [[ -f "$SERVICE_INSPECT_COUNT_FILE" ]]; then
+      inspect_count="$(<"$SERVICE_INSPECT_COUNT_FILE")"
+    fi
+    inspect_count=$((inspect_count + 1))
+    printf '%s\n' "$inspect_count" >"$SERVICE_INSPECT_COUNT_FILE"
+    rendered_service_id="$SERVICE_ID"
+    if [[ "${SERVICE_REPLACE_ON_FINAL_INSPECT:-0}" == 1 \
+      && "$inspect_count" -ge 2 ]]; then
+      rendered_service_id="$REPLACEMENT_SERVICE_ID"
+    fi
+    export rendered_service_id
     SERVICE_SPEC_JSON="$(<"$SPEC_FILE")" python3 - <<'PY'
 import json
 import os
@@ -271,7 +287,7 @@ import os
 print(
     json.dumps(
         {
-            "ID": os.environ["SERVICE_ID"],
+            "ID": os.environ["rendered_service_id"],
             "Spec": json.loads(os.environ["SERVICE_SPEC_JSON"]),
         },
         separators=(",", ":"),
@@ -585,7 +601,25 @@ if grep -Fq 'docker|service rm' "$CALLS" \
   exit 1
 fi
 
+: >"$SERVICE_STATE"
+cp "$TEST_ROOT/valid-spec.json" "$SPEC_FILE"
+printf 'Shutdown|Complete 2 seconds ago\n' >"$TASK_STATE_FILE"
 : >"$CALLS"
+rm -f "$SERVICE_INSPECT_COUNT_FILE"
+if SERVICE_REPLACE_ON_FINAL_INSPECT=1 \
+  bash "$LAUNCHER" retire >/dev/null 2>&1; then
+  echo 'FAIL: replacement-name race retired the original service' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service rm' "$CALLS" \
+  || [[ ! -f "$SERVICE_STATE" ]]; then
+  echo 'FAIL: replacement-name race removed a service' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+rm -f "$SERVICE_INSPECT_COUNT_FILE"
+printf 'Running|Running 3 seconds ago\n' >"$TASK_STATE_FILE"
 bash "$LAUNCHER"
 if grep -Fq 'docker|service rm' "$CALLS" \
   || grep -Fq 'docker|service create' "$CALLS"; then
@@ -594,6 +628,7 @@ if grep -Fq 'docker|service rm' "$CALLS" \
 fi
 
 : >"$CALLS"
+rm -f "$SERVICE_INSPECT_COUNT_FILE"
 printf 'Shutdown|Complete 2 seconds ago\n' >"$TASK_STATE_FILE"
 bash "$LAUNCHER"
 grep -Fq "docker|service rm $SERVICE_ID" "$CALLS"
@@ -601,6 +636,7 @@ grep -Fq 'docker|service create' "$CALLS"
 grep -Fq "docker|container rm $HOLDER_ID" "$CALLS"
 
 : >"$CALLS"
+rm -f "$SERVICE_INSPECT_COUNT_FILE"
 printf 'Shutdown|Complete 2 seconds ago\n' >"$TASK_STATE_FILE"
 bash "$LAUNCHER" retire
 grep -Fq "docker|service rm $SERVICE_ID" "$CALLS"

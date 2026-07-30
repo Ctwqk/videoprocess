@@ -272,6 +272,196 @@ fi
 )
 
 (
+  probe_root="$TEST_ROOT/one-shot-lock-symlink"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  unrelated_lock="$probe_root/unrelated-lock"
+  docker_entered="$probe_root/docker-entered"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  printf 'preserve\n' >"$unrelated_lock"
+  chmod 0600 "$unrelated_lock"
+  ln -s "$unrelated_lock" "$admission_root/transaction.lock"
+  docker() {
+    : >"$docker_entered"
+  }
+  if vp_run_python_worker_container \
+    synthetic-image - - /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1; then
+    echo 'FAIL: symlink transaction lock was accepted' >&2
+    exit 1
+  fi
+  [[ -L "$admission_root/transaction.lock" ]]
+  [[ "$(<"$unrelated_lock")" == preserve ]]
+  if [[ -e "$docker_entered" ]] \
+    || compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null \
+    || compgen -G "$admission_root/one-shot-operations/op.*" >/dev/null; then
+    echo 'FAIL: symlink transaction lock reached one-shot mutation' >&2
+    exit 1
+  fi
+)
+
+for signal_case in HUP:129 INT:130; do
+(
+  signal_name="${signal_case%%:*}"
+  expected_status="${signal_case##*:}"
+  probe_root="$TEST_ROOT/one-shot-caller-$signal_name"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  secret="$probe_root/secret"
+  printf '%s\n' 'caller-signal-credential' >"$secret"
+  chmod 0400 "$secret"
+  caller_trap_ran="$probe_root/caller-trap-ran"
+  signal_target_pid="$(sh -c 'printf "%s\n" "$PPID"')"
+  export signal_target_pid
+
+  docker() {
+    cat >/dev/null
+    kill "-$signal_name" "$signal_target_pid"
+    return "$expected_status"
+  }
+  trap 'printf "caller\n" >"$caller_trap_ran"' HUP
+  trap 'printf "caller\n" >"$caller_trap_ran"' INT
+  trap 'printf "caller\n" >"$caller_trap_ran"' TERM
+  caller_hup_trap="$(trap -p HUP)"
+  caller_int_trap="$(trap -p INT)"
+  caller_term_trap="$(trap -p TERM)"
+
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image "$secret" synthetic-secret /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1
+  operation_status=$?
+  set -e
+  if [[ "$operation_status" -ne "$expected_status" ]]; then
+    echo "FAIL: $signal_name returned $operation_status instead of $expected_status" >&2
+    exit 1
+  fi
+  if [[ -e "$caller_trap_ran" \
+    || "$(trap -p HUP)" != "$caller_hup_trap" \
+    || "$(trap -p INT)" != "$caller_int_trap" \
+    || "$(trap -p TERM)" != "$caller_term_trap" ]]; then
+    echo "FAIL: $signal_name did not preserve caller traps" >&2
+    exit 1
+  fi
+  if compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null \
+    || compgen -G "$admission_root/one-shot-operations/op.*" >/dev/null; then
+    echo "FAIL: $signal_name retained one-shot state" >&2
+    exit 1
+  fi
+)
+done
+
+(
+  probe_root="$TEST_ROOT/one-shot-overlap"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  first_entered="$probe_root/first-docker-entered"
+  first_side_effect="$probe_root/first-side-effect"
+  release_first="$probe_root/release-first"
+  second_docker_entered="$probe_root/second-docker-entered"
+
+  docker() {
+    if mkdir "$probe_root/docker-owner" 2>/dev/null; then
+      : >"$first_entered"
+      : >"$first_side_effect"
+      while [[ ! -e "$release_first" ]]; do
+        sleep 0.05
+      done
+      return 0
+    fi
+    : >"$second_docker_entered"
+    return 0
+  }
+
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image - - /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1 &
+  first_pid=$!
+  set -e
+  for _attempt in $(seq 1 100); do
+    [[ -e "$first_entered" ]] && break
+    sleep 0.05
+  done
+  if [[ ! -e "$first_entered" ]]; then
+    : >"$release_first"
+    wait "$first_pid" >/dev/null 2>&1 || true
+    echo 'FAIL: overlap probe did not enter the first Docker operation' >&2
+    exit 1
+  fi
+
+  first_record="$(
+    find "$admission_root/one-shot-operations" -type d -name 'op.*' \
+      -print -quit 2>/dev/null || true
+  )"
+  first_sentinel="$(
+    find "$bind_source" -type f -name '.vp-python-worker-bind-*' \
+      -print -quit 2>/dev/null || true
+  )"
+  if [[ -z "$first_record" || -z "$first_sentinel" ]]; then
+    : >"$release_first"
+    wait "$first_pid" >/dev/null 2>&1 || true
+    echo 'FAIL: overlap fixture did not observe the first live operation' >&2
+    exit 1
+  fi
+
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image - - /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1
+  second_status=$?
+  set -e
+  first_record_survived=0
+  first_sentinel_survived=0
+  [[ -f "$first_record/operation.json" ]] && first_record_survived=1
+  [[ -f "$first_sentinel" ]] && first_sentinel_survived=1
+
+  : >"$release_first"
+  set +e
+  wait "$first_pid" >/dev/null 2>&1
+  first_status=$?
+  set -e
+
+  if [[ "$second_status" -eq 0 ]]; then
+    echo 'FAIL: overlapping one-shot invocation did not fail or serialize' >&2
+    exit 1
+  fi
+  if [[ -e "$second_docker_entered" ]]; then
+    echo 'FAIL: overlapping one-shot invocation reached Docker' >&2
+    exit 1
+  fi
+  if [[ "$first_record_survived" -ne 1 \
+    || "$first_sentinel_survived" -ne 1 ]]; then
+    echo 'FAIL: overlapping invocation removed the first live operation' >&2
+    exit 1
+  fi
+  if [[ ! -e "$first_side_effect" || "$first_status" -ne 0 ]]; then
+    echo 'FAIL: successful first side effect was reported as failed' >&2
+    exit 1
+  fi
+  if compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null \
+    || compgen -G "$admission_root/one-shot-operations/op.*" >/dev/null; then
+    echo 'FAIL: overlap probe retained completed operation state' >&2
+    exit 1
+  fi
+)
+
+(
   probe_root="$TEST_ROOT/one-shot-sigterm"
   ROOT="$probe_root/sync"
   REPO_ROOT="$probe_root/repos"
@@ -283,11 +473,12 @@ fi
   printf '%s\n' 'term-probe-credential' >"$secret"
   chmod 0400 "$secret"
   entered="$probe_root/docker-entered"
+  docker_terminated="$probe_root/docker-terminated"
 
   docker() {
-    local owner_pid="$PPID"
+    trap ': >"$docker_terminated"; exit 143' TERM
     : >"$entered"
-    while kill -0 "$owner_pid" >/dev/null 2>&1; do
+    while true; do
       sleep 0.05
     done
   }
@@ -311,6 +502,15 @@ fi
     echo 'FAIL: SIGTERM probe did not enter Docker' >&2
     exit 1
   fi
+  lock_path="$admission_root/transaction.lock"
+  if [[ ! -f "$lock_path" || -L "$lock_path" \
+    || "$(vp_worker_redis_marker_file_mode "$lock_path")" != 600 ]]; then
+    kill -TERM "$operation_pid" >/dev/null 2>&1 || true
+    wait "$operation_pid" >/dev/null 2>&1 || true
+    echo 'FAIL: one-shot did not hold the exact regular mode-0600 transaction lock' >&2
+    exit 1
+  fi
+
   kill -TERM "$operation_pid"
   set +e
   wait "$operation_pid" >/dev/null 2>&1
@@ -320,34 +520,71 @@ fi
     echo "FAIL: SIGTERM probe exited $operation_status instead of 143" >&2
     exit 1
   fi
+  if [[ ! -e "$docker_terminated" ]]; then
+    echo 'FAIL: SIGTERM did not reach the exact Docker boundary' >&2
+    exit 1
+  fi
   if grep -R -Fq 'term-probe-credential' "$ROOT" 2>/dev/null; then
     echo 'FAIL: SIGTERM retained credential material in host state' >&2
     exit 1
   fi
-
-  for sentinel in "$bind_source"/.vp-python-worker-bind-*; do
-    [[ -e "$sentinel" ]] || continue
-    if [[ ! -d "$admission_root/one-shot-operations" ]] \
-      || ! grep -R -Fq -- "${sentinel##*/}" \
-        "$admission_root/one-shot-operations" 2>/dev/null; then
-      echo 'FAIL: SIGTERM retained an unmanaged bind sentinel' >&2
-      exit 1
-    fi
-  done
-
-  docker() {
-    :
-  }
-  vp_run_python_worker_container \
-    synthetic-image - - /runtime-state \
-    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
-    -- /bin/true >/dev/null
   if compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null; then
-    echo 'FAIL: startup reconciliation retained a bind sentinel' >&2
+    echo 'FAIL: SIGTERM retained a bind sentinel after returning' >&2
     exit 1
   fi
   if compgen -G "$admission_root/one-shot-operations/op.*" >/dev/null; then
-    echo 'FAIL: startup reconciliation retained an operation record' >&2
+    echo 'FAIL: SIGTERM retained an operation record after returning' >&2
+    exit 1
+  fi
+)
+
+(
+  probe_root="$TEST_ROOT/one-shot-caller-trap"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  secret="$probe_root/secret"
+  printf '%s\n' 'caller-trap-credential' >"$secret"
+  chmod 0400 "$secret"
+  caller_trap_ran="$probe_root/caller-trap-ran"
+  signal_target_pid="$(sh -c 'printf "%s\n" "$PPID"')"
+  export signal_target_pid
+
+  docker() {
+    cat >/dev/null
+    kill -TERM "$signal_target_pid"
+    return 143
+  }
+
+  trap 'printf "caller\n" >"$caller_trap_ran"' HUP
+  trap 'printf "caller\n" >"$caller_trap_ran"' INT
+  trap 'printf "caller\n" >"$caller_trap_ran"' TERM
+  caller_hup_trap="$(trap -p HUP)"
+  caller_int_trap="$(trap -p INT)"
+  caller_term_trap="$(trap -p TERM)"
+
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image "$secret" synthetic-secret /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1
+  operation_status=$?
+  set -e
+  if [[ "$operation_status" -ne 143 ]]; then
+    echo "FAIL: caller-trap TERM returned $operation_status instead of 143" >&2
+    exit 1
+  fi
+  if [[ -e "$caller_trap_ran" ]]; then
+    echo 'FAIL: one-shot TERM invoked the caller trap before restoring it' >&2
+    exit 1
+  fi
+  if [[ "$(trap -p HUP)" != "$caller_hup_trap" \
+    || "$(trap -p INT)" != "$caller_int_trap" \
+    || "$(trap -p TERM)" != "$caller_term_trap" ]]; then
+    echo 'FAIL: one-shot signal handling did not restore caller traps' >&2
     exit 1
   fi
 )
@@ -455,13 +692,244 @@ assert_worker_contract \
   vp:tasks:youtube_publisher youtube_publisher-workers \
   publisher-db-secret publisher-admission-secret publisher-redis-secret
 
+(
+  expected_service=vp-ffmpeg-worker-go-swarm
+  expected_generation=901
+  retirement_uuid=01234567-89ab-4def-8123-456789abcdef
+  RETIREMENT_RESPONSE_SERVICE="$expected_service"
+  RETIREMENT_RESPONSE_GENERATION="$expected_generation"
+  RETIREMENT_OPERATOR_CALLS="$TEST_ROOT/retirement-response-operator-calls"
+  : >"$RETIREMENT_OPERATOR_CALLS"
+  VP_WORKER_ADMISSION_CONTROL_IMAGE=synthetic-control-image
+
+  vp_require_pipeline_network_identity() {
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  vp_worker_admission_database_credential_file() {
+    printf '%s\n' "$TEST_ROOT/retirement-response-read"
+  }
+  vp_run_python_worker_container() {
+    printf '{"code":"worker_deployment_retirement_candidates","generation":%s,"registration_ids":["%s"],"service_name":"%s","status":"ok"}\n' \
+      "$RETIREMENT_RESPONSE_GENERATION" \
+      "$retirement_uuid" \
+      "$RETIREMENT_RESPONSE_SERVICE"
+  }
+  vp_worker_admission_operator() {
+    printf 'operator|%s\n' "$*" >>"$RETIREMENT_OPERATOR_CALLS"
+  }
+
+  RETIREMENT_RESPONSE_SERVICE=vp-vision-worker-swarm
+  set +e
+  mismatch_output="$(
+    vp_worker_admission_retirement_ids \
+      "$expected_service" "$expected_generation"
+  )"
+  mismatch_status=$?
+  set -e
+  if [[ "$mismatch_status" -eq 0 || -n "$mismatch_output" ]]; then
+    echo 'FAIL: retirement response accepted a mismatched service' >&2
+    exit 1
+  fi
+
+  RETIREMENT_RESPONSE_SERVICE="$expected_service"
+  RETIREMENT_RESPONSE_GENERATION=999
+  set +e
+  mismatch_output="$(
+    vp_worker_admission_retirement_ids \
+      "$expected_service" "$expected_generation"
+  )"
+  mismatch_status=$?
+  set -e
+  if [[ "$mismatch_status" -eq 0 || -n "$mismatch_output" ]]; then
+    echo 'FAIL: retirement response accepted a mismatched generation' >&2
+    exit 1
+  fi
+  [[ ! -s "$RETIREMENT_OPERATOR_CALLS" ]]
+
+  RETIREMENT_RESPONSE_GENERATION="$expected_generation"
+  exact_output="$(
+    vp_worker_admission_retirement_ids \
+      "$expected_service" "$expected_generation"
+  )"
+  [[ "$exact_output" == "$retirement_uuid" ]]
+)
+
+(
+  immutable_calls="$TEST_ROOT/immutable-secret-calls"
+  : >"$immutable_calls"
+  old_id=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  replacement_id=1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  expected_name=vp-worker-secret-901
+  expected_service=vp-ffmpeg-worker-go-swarm
+  expected_generation=901
+  expected_purpose=database
+  SECRET_INSPECT_MODE=match
+
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$immutable_calls"
+    if [[ "${1:-} ${2:-}" == "secret inspect" ]]; then
+      case "$SECRET_INSPECT_MODE|${3:-}" in
+        "match|$old_id")
+          printf '%s|%s|%s|%s|%s\n' \
+            "$old_id" "$expected_name" "$expected_service" \
+            "$expected_generation" "$expected_purpose"
+          return 0
+          ;;
+        "mismatch|$old_id")
+          printf '%s|%s|%s|%s|%s\n' \
+            "$old_id" "$expected_name" unrelated-service \
+            "$expected_generation" "$expected_purpose"
+          return 0
+          ;;
+        "replacement|$old_id")
+          return 1
+          ;;
+        "replacement|$expected_name")
+          printf '%s|%s|%s|%s|%s\n' \
+            "$replacement_id" "$expected_name" "$expected_service" \
+            "$expected_generation" "$expected_purpose"
+          return 0
+          ;;
+      esac
+      return 1
+    fi
+    if [[ "${1:-} ${2:-}" == "secret rm" ]]; then
+      return 0
+    fi
+    return 97
+  }
+
+  if ! vp_remove_managed_secret \
+    "$old_id" "$expected_name" "$expected_service" \
+    "$expected_generation" "$expected_purpose" >/dev/null 2>&1; then
+    echo 'FAIL: immutable managed-secret removal helper is unavailable' >&2
+    exit 1
+  fi
+  if [[ "$(<"$immutable_calls")" != \
+      $'docker|secret inspect '"$old_id"$' --format {{.ID}}|{{.Spec.Name}}|{{index .Spec.Labels "vp.service"}}|{{index .Spec.Labels "vp.generation"}}|{{index .Spec.Labels "vp.purpose"}}\n''docker|secret rm '"$old_id" ]]; then
+    echo 'FAIL: managed-secret removal was not adjacent inspect-ID then rm-ID' >&2
+    exit 1
+  fi
+
+  : >"$immutable_calls"
+  SECRET_INSPECT_MODE=mismatch
+  if vp_remove_managed_secret \
+    "$old_id" "$expected_name" "$expected_service" \
+    "$expected_generation" "$expected_purpose" >/dev/null 2>&1; then
+    echo 'FAIL: managed-secret removal accepted wrong labels' >&2
+    exit 1
+  fi
+  if grep -Fq 'docker|secret rm' "$immutable_calls"; then
+    echo 'FAIL: wrong-label secret reached destructive removal' >&2
+    exit 1
+  fi
+
+  : >"$immutable_calls"
+  SECRET_INSPECT_MODE=replacement
+  if vp_remove_managed_secret \
+    "$old_id" "$expected_name" "$expected_service" \
+    "$expected_generation" "$expected_purpose" >/dev/null 2>&1; then
+    echo 'FAIL: missing immutable secret ID was treated as replacement' >&2
+    exit 1
+  fi
+  if grep -Fq 'docker|secret rm' "$immutable_calls" \
+    || grep -Fq "docker|secret inspect $expected_name" "$immutable_calls"; then
+    echo 'FAIL: name reuse caused replacement lookup or removal' >&2
+    exit 1
+  fi
+)
+
+(
+  hydration_root="$TEST_ROOT/worker-v1-hydration"
+  hydration_manifest="$hydration_root/ffmpeg-go.conf"
+  hydration_service=vp-ffmpeg-worker-go-swarm
+  hydration_generation=901
+  hydration_commit=0123456789abcdef0123456789abcdef01234567
+  hydration_image=vp-ffmpeg-worker-go:deploy-0123456789ab
+  hydration_database_name=vp-worker-db-901
+  hydration_admission_name=vp-worker-admission-901
+  hydration_database_id=3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  hydration_admission_id=4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  HYDRATION_LABEL_MODE=match
+
+  vp_worker_admission_write_manifest \
+    "$hydration_manifest" \
+    "$hydration_service" \
+    "$hydration_commit" \
+    "$hydration_image" \
+    "$hydration_generation" \
+    "$hydration_database_name" \
+    "$hydration_admission_name"
+  docker() {
+    [[ "${1:-} ${2:-}" == "secret inspect" ]] || return 97
+    case "${3:-}" in
+      "$hydration_database_name")
+        printf '%s|%s|%s|%s|%s\n' \
+          "$hydration_database_id" "$hydration_database_name" \
+          "$hydration_service" "$hydration_generation" database
+        ;;
+      "$hydration_admission_name")
+        local purpose=admission
+        if [[ "$HYDRATION_LABEL_MODE" == mismatch ]]; then
+          purpose=database
+        fi
+        printf '%s|%s|%s|%s|%s\n' \
+          "$hydration_admission_id" "$hydration_admission_name" \
+          "$hydration_service" "$hydration_generation" "$purpose"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  }
+  vp_worker_admission_require_v2_manifest \
+    "$hydration_manifest" "$hydration_service"
+  vp_worker_admission_read_manifest \
+    "$hydration_manifest" "$hydration_service"
+  [[ "$VP_WORKER_MANIFEST_VERSION" == 2 \
+    && "$VP_WORKER_MANIFEST_DATABASE_SECRET_ID" \
+      == "$hydration_database_id" \
+    && "$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID" \
+      == "$hydration_admission_id" ]]
+
+  mismatch_manifest="$hydration_root/mismatch.conf"
+  vp_worker_admission_write_manifest \
+    "$mismatch_manifest" \
+    "$hydration_service" \
+    "$hydration_commit" \
+    "$hydration_image" \
+    "$hydration_generation" \
+    "$hydration_database_name" \
+    "$hydration_admission_name"
+  HYDRATION_LABEL_MODE=mismatch
+  if vp_worker_admission_require_v2_manifest \
+    "$mismatch_manifest" "$hydration_service" >/dev/null 2>&1; then
+    echo 'FAIL: v1 manifest hydrated a wrong-purpose secret' >&2
+    exit 1
+  fi
+  grep -Fxq 'VERSION=1' "$mismatch_manifest"
+  if grep -Fq '_SECRET_ID=' "$mismatch_manifest"; then
+    echo 'FAIL: failed v1 hydration rewrote immutable identity evidence' >&2
+    exit 1
+  fi
+)
+
 DOCKER_SECRET_PAYLOAD="$TEST_ROOT/docker-secret-payload"
+DOCKER_SECRET_CREATED="$TEST_ROOT/docker-secret-created"
+DOCKER_SECRET_ID=2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 docker() {
   if [[ "${1:-} ${2:-}" == "secret inspect" ]]; then
+    if [[ -e "$DOCKER_SECRET_CREATED" ]]; then
+      printf '%s|%s|%s|%s|%s\n' \
+        "$DOCKER_SECRET_ID" test-secret test-service 105 database
+      return 0
+    fi
     return 1
   fi
   if [[ "${1:-} ${2:-}" == "secret create" ]]; then
     cat >"$DOCKER_SECRET_PAYLOAD"
+    : >"$DOCKER_SECRET_CREATED"
+    printf '%s\n' "$DOCKER_SECRET_ID"
     return 0
   fi
   return 90
@@ -816,6 +1284,15 @@ vp_worker_control_cleanup_stale_candidates "$stale_control_root"
 control_retirement_root="$TEST_ROOT/control-retirement"
 control_retirement_generation=c-11111111111111111111
 control_retirement_image=vp-ffmpeg-worker-python:deploy-111111111111
+control_retirement_ids=()
+for identity_index in 1 2 3 4 5 6 7; do
+  control_retirement_ids+=("$(printf '%064d' "$identity_index")")
+done
+vp_worker_control_write_manifest \
+  "$control_retirement_root/control-candidates/$control_retirement_generation.conf" \
+  "$control_retirement_generation" \
+  "$control_retirement_image" \
+  "${control_retirement_ids[@]}"
 vp_worker_control_schedule_retirement \
   "$control_retirement_root" \
   "$control_retirement_image" \
@@ -854,7 +1331,7 @@ vp_worker_control_process_retirements \
 
 worker_retirement_root="$TEST_ROOT/worker-retirement"
 worker_retirement_journal="$worker_retirement_root/retirements/stale-commit.records"
-worker_retirement_records='vp-ffmpeg-worker-go-swarm|811|stale-db-811|stale-admission-811'
+worker_retirement_records="vp-ffmpeg-worker-go-swarm|811|stale-db-811|$(printf '%064d' 811)|stale-admission-811|$(printf '%064d' 1811)"
 vp_worker_admission_write_retirement_journal \
   "$worker_retirement_journal" "$worker_retirement_records"
 [[ "$(vp_worker_redis_marker_file_mode "$worker_retirement_journal")" == 600 ]]
@@ -903,9 +1380,12 @@ if vp_worker_admission_prepare_service \
 fi
 [[ "$VP_WORKER_ADMISSION_CANDIDATE_SERVICES" == \
   vp-ffmpeg-worker-go-swarm ]]
-partial_records="$(vp_worker_admission_candidate_records)"
-[[ "$partial_records" == \
-  'vp-ffmpeg-worker-go-swarm|901|vp-wr-ffmpeg-go-db-901|vp-wr-ffmpeg-go-admission-901' ]]
+if vp_worker_admission_candidate_records >/dev/null 2>&1; then
+  echo 'FAIL: name-only partial state was emitted as v2 retirement evidence' >&2
+  exit 1
+fi
+grep -Fxq 'VERSION=1' \
+  "$partial_root/candidates/partial-generation/ffmpeg-go.conf"
 
 CLEANUP_CALLS="$TEST_ROOT/cleanup-calls"
 : >"$CLEANUP_CALLS"
@@ -935,10 +1415,16 @@ docker() {
   fi
   return 90
 }
+partial_database_id="$(printf '%064d' 901)"
+partial_admission_id="$(printf '%064d' 1901)"
+vp_remove_managed_secret() {
+  printf 'secret-rm|%s|%s|%s|%s|%s\n' "$@" >>"$CLEANUP_CALLS"
+}
 VP_WORKER_CONTROL_GENERATION=c-0123456789abcdef0123
 vp_worker_admission_retire_generation \
   vp-ffmpeg-worker-go-swarm 901 \
-  vp-wr-ffmpeg-go-db-901 vp-wr-ffmpeg-go-admission-901 \
+  vp-wr-ffmpeg-go-db-901 "$partial_database_id" \
+  vp-wr-ffmpeg-go-admission-901 "$partial_admission_id" \
   "$partial_root"
 grep -Fq \
   'revoke-grant --service-name vp-ffmpeg-worker-go-swarm --generation 901 --reason replaced' \
@@ -947,7 +1433,8 @@ CLEANUP_GRANT_STATE=absent
 : >"$CLEANUP_CALLS"
 vp_worker_admission_retire_generation \
   vp-ffmpeg-worker-go-swarm 901 \
-  vp-wr-ffmpeg-go-db-901 vp-wr-ffmpeg-go-admission-901 \
+  vp-wr-ffmpeg-go-db-901 "$partial_database_id" \
+  vp-wr-ffmpeg-go-admission-901 "$partial_admission_id" \
   "$partial_root"
 if grep -Fq 'operator|' "$CLEANUP_CALLS"; then
   echo 'FAIL: absent partial grant was sent to the operator' >&2

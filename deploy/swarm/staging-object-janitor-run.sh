@@ -401,6 +401,11 @@ if docker service inspect "$JOB_NAME" >/dev/null 2>&1; then
       service_running=1
       ;;
     Shutdown\|Complete*|Shutdown\|Failed*|Shutdown\|Rejected*|Shutdown\|Shutdown*)
+      final_service_id="$(
+        validate_existing_job "$JOB_NAME"
+      )" || fail "terminal job final identity mismatch"
+      [[ "$final_service_id" == "$service_id" ]] \
+        || fail "fixed-name service was replaced"
       docker service rm "$service_id" >/dev/null \
         || fail "terminal job removal failed"
       for ((attempt = 1; attempt <= 20; attempt++)); do
