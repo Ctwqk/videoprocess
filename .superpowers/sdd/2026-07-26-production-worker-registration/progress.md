@@ -117,6 +117,21 @@ mode-0600 versus mode-0400 deployment-CLI contract and a marker freshness
 fixture that does not isolate the new admission/janitor prerequisites.
 Task 4: in progress on the preserved Task 4B/4C changes; no production
 deployment is authorized by these partial changes.
+Task 4B/4C: recovered implementation committed at 0c634ae; dual independent
+review rejected it with 0 Critical, 17 Important, and 2 Minor findings.
+Worker Track A has 7 Important findings (effective endpoint identity,
+file-backed Redis production classification, post-loss Redis I/O, mutable
+Python build commit, cross-generation MinIO cache, pre-validation Go database
+I/O, and skipped/red real Go integration) plus 2 Minors (local storage MinIO
+requirement and Go secret-reader ctime/race coverage).
+Deploy Track B has 10 Important findings (first-deploy rollback, failed
+rollback compensation, crash replay, credential identity separation,
+constructure-runtime Redis secret use, secret-retirement identity,
+per-mutation marker freshness, janitor service TOCTOU, durable janitor-install
+rollback, and retirement-response binding).
+Task 4B/4C: fix round 1/5 in progress, beginning with Worker Track A; fifth
+unlisted canary authorization remains unused and no production mutation is
+allowed before both tracks pass review.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
