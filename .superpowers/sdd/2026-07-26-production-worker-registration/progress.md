@@ -153,6 +153,20 @@ does not cancel and drain registration-owned guarded tasks.
 Task 4B/4C Worker Track A: fix round 3/5 in progress; integration scope is
 expanded only to Python secret ownership and janitor evidence-volume
 migration, and later Deploy Track B work must preserve this contract.
+Task 4B/4C Worker Track A: fix round 3/5 at 9141cc9 addressed the Swarm
+secret UID/GID contract but left the evidence-volume identity open and
+introduced 2 Important findings: the root bootstrap recursively chowns
+caller bind trees, breaking non-root controller read-back and allowing
+source substitution, while the prepared named volume is unpinned between
+prepare and service creation.
+Task 4B/4C Worker Track A: minor (deferred): the exact-image secret gate does
+not itself assert a root-owned source file, though an independent root-source
+probe passed.
+Task 4B/4C Worker Track A: fix round 4/5 in progress with a fresh implementer.
+The architectural correction is to run control one-shots as the caller UID/GID
+on a read-only root filesystem with narrow operation-owned output directories,
+never recursively chown caller state, and to pin the janitor volume with a
+transaction-owned holder container through service/task acquisition.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
