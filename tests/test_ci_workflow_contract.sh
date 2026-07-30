@@ -27,6 +27,11 @@ required_lines=(
   "npm run build"
   "bash tests/test_vp_deploy_sync_extension.sh"
   "bash tests/test_vp_deploy_ci_gate.sh"
+  "bash tests/test_worker_admission_deploy.sh"
+  "bash tests/test_worker_admission_rollback.sh"
+  "bash tests/test_staging_object_janitor_install.sh"
+  "bash tests/test_staging_object_janitor_run.sh"
+  "bash tests/test_worker_redis_marker_control.sh"
   "actions/upload-artifact@v7"
 )
 

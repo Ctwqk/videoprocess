@@ -18,6 +18,8 @@ from worker.secret_config import (
     WorkerSecretError,
     load_worker_admission_token,
     load_worker_database_url,
+    load_worker_minio_credentials,
+    load_worker_redis_url,
     read_mode_0400_secret,
 )
 from worker import secret_config
@@ -234,10 +236,99 @@ def test_nonproduction_database_url_fallback_and_production_token_file(
     )
 
 
+def test_production_admission_token_rejects_environment_value(
+    tmp_path: Path,
+) -> None:
+    token_secret = tmp_path / "admission-token"
+    _write_secret(token_secret, "admission-token")
+
+    with pytest.raises(WorkerSecretError, match="WORKER_ADMISSION_TOKEN"):
+        load_worker_admission_token(
+            {
+                "DEPLOY_MODE": "production",
+                "WORKER_ADMISSION_TOKEN_FILE": str(token_secret),
+                "WORKER_ADMISSION_TOKEN": "environment-token",
+            }
+        )
+
+
+def test_production_minio_credentials_require_independent_mode_0400_files(
+    tmp_path: Path,
+) -> None:
+    access_secret = tmp_path / "minio-access"
+    password_secret = tmp_path / "minio-password"
+    _write_secret(access_secret, "minio-access")
+    _write_secret(password_secret, "minio-password")
+    production = {
+        "DEPLOY_MODE": "production",
+        "WORKER_MINIO_ACCESS_KEY_FILE": str(access_secret),
+        "WORKER_MINIO_SECRET_KEY_FILE": str(password_secret),
+    }
+
+    assert load_worker_minio_credentials(production) == (
+        "minio-access",
+        "minio-password",
+    )
+    with pytest.raises(WorkerSecretError, match="MINIO_ACCESS_KEY"):
+        load_worker_minio_credentials(
+            {
+                **production,
+                "MINIO_ACCESS_KEY": "environment-access",
+            }
+        )
+    with pytest.raises(WorkerSecretError, match="independent"):
+        load_worker_minio_credentials(
+            {
+                **production,
+                "WORKER_MINIO_SECRET_KEY_FILE": str(access_secret),
+            }
+        )
+
+
+def test_production_redis_url_requires_mode_0400_file(
+    tmp_path: Path,
+) -> None:
+    redis_secret = tmp_path / "redis-url"
+    _write_secret(
+        redis_secret,
+        "redis://vp-vision-worker:redis-secret@vp-redis:6379/0",
+    )
+    production = {
+        "DEPLOY_MODE": "production",
+        "WORKER_REDIS_URL_FILE": str(redis_secret),
+    }
+
+    assert (
+        load_worker_redis_url(production)
+        == "redis://vp-vision-worker:redis-secret@vp-redis:6379/0"
+    )
+    with pytest.raises(WorkerSecretError, match="REDIS_URL"):
+        load_worker_redis_url(
+            {
+                **production,
+                "REDIS_URL": "redis://leaked:secret@vp-redis:6379/0",
+            }
+        )
+    with pytest.raises(WorkerSecretError, match="WORKER_REDIS_URL_FILE"):
+        load_worker_redis_url({"DEPLOY_MODE": "shared"})
+
+
+def test_nonproduction_redis_url_allows_explicit_environment_fallback() -> None:
+    assert (
+        load_worker_redis_url(
+            {
+                "DEPLOY_MODE": "local",
+                "REDIS_URL": "redis://127.0.0.1:6379/14",
+            }
+        )
+        == "redis://127.0.0.1:6379/14"
+    )
+
+
 def test_registration_claim_builder_uses_one_instance_in_consumer_and_exact_integers() -> None:
     instance_id = uuid.uuid4()
-    claims = build_worker_registration_claims(
-        {
+    env = {
+            "DEPLOY_MODE": "shared",
             "WORKER_SERVICE_NAME": "vp-vision-worker-swarm",
             "WORKER_ADMISSION_GENERATION": "4",
             "WORKER_SLOT": "1",
@@ -245,17 +336,20 @@ def test_registration_claim_builder_uses_one_instance_in_consumer_and_exact_inte
             "WORKER_HOST": "127",
             "WORKER_CAPABILITIES": "vision_gpu",
             "WORKER_RELEASE_COMMIT": "0123456789abcdef0123456789abcdef01234567",
+            "VP_BUILD_COMMIT": "0123456789abcdef0123456789abcdef01234567",
             "WORKER_IMAGE_IDENTITY": "vp-vision-worker:deploy-0123456789ab",
             "WORKER_REDIS_STREAM": "vp:tasks:vision",
             "WORKER_REDIS_GROUP": "vision-workers",
-            "REDIS_URL": "redis://vp-redis:6379/2",
             "STORAGE_BACKEND": "minio",
             "MINIO_ENDPOINT": "vp-minio:9000",
             "MINIO_BUCKET": "videoprocess",
-        },
+        }
+    claims = build_worker_registration_claims(
+        env,
         database_url=(
             "postgresql+asyncpg://runtime:secret@vp-postgres:5432/videoprocess"
         ),
+        redis_url="redis://vp-worker:secret@vp-redis:6379/2",
         worker_instance_id=instance_id,
     )
 
@@ -265,6 +359,22 @@ def test_registration_claim_builder_uses_one_instance_in_consumer_and_exact_inte
     assert type(claims.endpoint_bindings["redis"]["port"]) is int
     assert type(claims.endpoint_bindings["redis"]["database"]) is int
     assert type(claims.endpoint_bindings["storage"]["port"]) is int
+
+    for invalid_build_commit in (
+        "",
+        "1123456789abcdef0123456789abcdef01234567",
+        "not-a-commit",
+    ):
+        with pytest.raises(WorkerRegistrationError, match="claim_mismatch"):
+            build_worker_registration_claims(
+                {**env, "VP_BUILD_COMMIT": invalid_build_commit},
+                database_url=(
+                    "postgresql+asyncpg://runtime:secret@"
+                    "vp-postgres:5432/videoprocess"
+                ),
+                redis_url="redis://vp-worker:secret@vp-redis:6379/2",
+                worker_instance_id=instance_id,
+            )
 
 
 @pytest.mark.asyncio

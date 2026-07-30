@@ -301,6 +301,20 @@ func BuildRegistrationClaims(
 	databaseURL string,
 	instanceID uuid.UUID,
 ) (RegistrationClaims, error) {
+	return BuildRegistrationClaimsWithRedis(
+		env,
+		databaseURL,
+		env["REDIS_URL"],
+		instanceID,
+	)
+}
+
+func BuildRegistrationClaimsWithRedis(
+	env map[string]string,
+	databaseURL string,
+	redisURL string,
+	instanceID uuid.UUID,
+) (RegistrationClaims, error) {
 	if instanceID == uuid.Nil {
 		return RegistrationClaims{}, &store.WorkerRegistrationError{
 			Code: "claim_mismatch",
@@ -334,6 +348,17 @@ func BuildRegistrationClaims(
 	if err != nil {
 		return RegistrationClaims{}, err
 	}
+	embeddedCommit := strings.TrimSpace(env["VP_BUILD_COMMIT"])
+	deployMode := strings.ToLower(strings.TrimSpace(env["DEPLOY_MODE"]))
+	production := deployMode == "" ||
+		deployMode == "shared" ||
+		deployMode == "production"
+	if (production && embeddedCommit == "") ||
+		(embeddedCommit != "" &&
+			(!buildCommitPattern.MatchString(embeddedCommit) ||
+				embeddedCommit != releaseCommit)) {
+		return RegistrationClaims{}, claimMismatch()
+	}
 	imageIdentity, err := requiredClaim(env, "WORKER_IMAGE_IDENTITY")
 	if err != nil {
 		return RegistrationClaims{}, err
@@ -363,7 +388,11 @@ func BuildRegistrationClaims(
 			Code: "claim_mismatch",
 		}
 	}
-	bindings, err := BuildEndpointBindings(env, databaseURL)
+	bindings, err := BuildEndpointBindingsWithRedis(
+		env,
+		databaseURL,
+		redisURL,
+	)
 	if err != nil {
 		return RegistrationClaims{}, err
 	}
@@ -391,11 +420,23 @@ func BuildEndpointBindings(
 	env map[string]string,
 	databaseURL string,
 ) (EndpointBindings, error) {
+	return BuildEndpointBindingsWithRedis(
+		env,
+		databaseURL,
+		env["REDIS_URL"],
+	)
+}
+
+func BuildEndpointBindingsWithRedis(
+	env map[string]string,
+	databaseURL string,
+	redisURL string,
+) (EndpointBindings, error) {
 	database, err := databaseEndpointIdentity(databaseURL)
 	if err != nil {
 		return EndpointBindings{}, err
 	}
-	redisIdentity, err := redisEndpointIdentity(env["REDIS_URL"])
+	redisIdentity, err := redisEndpointIdentity(redisURL)
 	if err != nil {
 		return EndpointBindings{}, err
 	}
@@ -740,6 +781,7 @@ func endpointPort(parsed *url.URL, fallback int) (int, error) {
 var dependencyNamePattern = regexp.MustCompile(
 	`^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`,
 )
+var buildCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var dnsLabelPattern = regexp.MustCompile(
 	`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`,
 )

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/google/uuid"
 )
 
@@ -99,9 +100,10 @@ func TestRegistrationFingerprintFixtureParity(t *testing.T) {
 	}
 	for _, testCase := range fixture.Cases {
 		t.Run(testCase.Name, func(t *testing.T) {
-			bindings, err := BuildEndpointBindings(
+			bindings, err := BuildEndpointBindingsWithRedis(
 				testCase.Env,
 				testCase.Env["DATABASE_URL"],
+				testCase.Env["REDIS_URL"],
 			)
 			if err != nil {
 				t.Fatalf("BuildEndpointBindings: %v", err)
@@ -221,7 +223,12 @@ func TestRegistrationEndpointValidationFixtureParity(t *testing.T) {
 
 func TestRegistrationClaimsUseProcessInstanceInConsumerIdentity(t *testing.T) {
 	instanceID := uuid.New()
-	claims, err := BuildRegistrationClaims(registrationTestEnv(), "postgresql://runtime:secret@vp-postgres:5432/videoprocess", instanceID)
+	claims, err := BuildRegistrationClaimsWithRedis(
+		registrationTestEnv(),
+		"postgresql://runtime:secret@vp-postgres:5432/videoprocess",
+		"redis://go-worker:secret@vp-redis:6379/3",
+		instanceID,
+	)
 	if err != nil {
 		t.Fatalf("BuildRegistrationClaims: %v", err)
 	}
@@ -241,9 +248,10 @@ func TestRegistrationClaimsRejectSignedPositiveIntegers(t *testing.T) {
 		t.Run(key, func(t *testing.T) {
 			env := registrationTestEnv()
 			env[key] = "+1"
-			if _, err := BuildRegistrationClaims(
+			if _, err := BuildRegistrationClaimsWithRedis(
 				env,
 				"postgresql://runtime:secret@vp-postgres:5432/videoprocess",
+				"redis://go-worker:secret@vp-redis:6379/3",
 				uuid.New(),
 			); err == nil {
 				t.Fatalf("BuildRegistrationClaims accepted signed %s", key)
@@ -254,7 +262,12 @@ func TestRegistrationClaimsRejectSignedPositiveIntegers(t *testing.T) {
 
 func TestRegistrationStartsWithHeartbeatAndLossCancelsOwnedContext(t *testing.T) {
 	instanceID := uuid.New()
-	claims, err := BuildRegistrationClaims(registrationTestEnv(), "postgresql://runtime:secret@vp-postgres:5432/videoprocess", instanceID)
+	claims, err := BuildRegistrationClaimsWithRedis(
+		registrationTestEnv(),
+		"postgresql://runtime:secret@vp-postgres:5432/videoprocess",
+		"redis://go-worker:secret@vp-redis:6379/3",
+		instanceID,
+	)
 	if err != nil {
 		t.Fatalf("BuildRegistrationClaims: %v", err)
 	}
@@ -316,9 +329,10 @@ func TestRegistrationStartsWithHeartbeatAndLossCancelsOwnedContext(t *testing.T)
 
 func TestRegistrationMarkLostPublishesStoreProvenLossAtomically(t *testing.T) {
 	instanceID := uuid.New()
-	claims, err := BuildRegistrationClaims(
+	claims, err := BuildRegistrationClaimsWithRedis(
 		registrationTestEnv(),
 		"postgresql://runtime:secret@vp-postgres:5432/videoprocess",
+		"redis://go-worker:secret@vp-redis:6379/3",
 		instanceID,
 	)
 	if err != nil {
@@ -433,6 +447,7 @@ func TestRegistrationMarkLostIsSafeForZeroValue(t *testing.T) {
 
 func registrationTestEnv() map[string]string {
 	return map[string]string{
+		"DEPLOY_MODE":                 "production",
 		"WORKER_SERVICE_NAME":         "vp-ffmpeg-go-worker-swarm",
 		"WORKER_ADMISSION_GENERATION": "4",
 		"WORKER_SLOT":                 "1",
@@ -440,6 +455,7 @@ func registrationTestEnv() map[string]string {
 		"WORKER_HOST":                 "host127",
 		"WORKER_CAPABILITIES":         "media_cpu",
 		"WORKER_RELEASE_COMMIT":       "0123456789abcdef0123456789abcdef01234567",
+		"VP_BUILD_COMMIT":             "0123456789abcdef0123456789abcdef01234567",
 		"WORKER_IMAGE_IDENTITY":       "vp-ffmpeg-go-worker:deploy-0123456789ab",
 		"WORKER_REDIS_STREAM":         "vp:tasks:ffmpeg_go",
 		"WORKER_REDIS_GROUP":          "ffmpeg_go-workers",
@@ -447,6 +463,34 @@ func registrationTestEnv() map[string]string {
 		"STORAGE_BACKEND":             "minio",
 		"MINIO_ENDPOINT":              "vp-minio:9000",
 		"MINIO_BUCKET":                "videoprocess",
+	}
+}
+
+func TestBuildRegistrationClaimsRequiresMatchingEmbeddedCommitInProduction(
+	t *testing.T,
+) {
+	for _, embeddedCommit := range []string{
+		"",
+		"1123456789abcdef0123456789abcdef01234567",
+		"not-a-commit",
+	} {
+		env := registrationTestEnv()
+		env["VP_BUILD_COMMIT"] = embeddedCommit
+		_, err := BuildRegistrationClaimsWithRedis(
+			env,
+			"postgresql://runtime:secret@vp-postgres/videoprocess",
+			"redis://go-worker:secret@vp-redis:6379/3",
+			uuid.New(),
+		)
+		var registrationError *store.WorkerRegistrationError
+		if !errors.As(err, &registrationError) ||
+			registrationError.Code != "claim_mismatch" {
+			t.Fatalf(
+				"embedded commit %q error = %v; want claim_mismatch",
+				embeddedCommit,
+				err,
+			)
+		}
 	}
 }
 

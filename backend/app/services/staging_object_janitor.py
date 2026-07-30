@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import re
+import stat
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -134,20 +136,46 @@ class StagingObjectJanitor:
             "grace_seconds": self._grace_seconds,
             **result,
         }
-        self._status_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._status_file.with_suffix(
-            f"{self._status_file.suffix}.tmp"
+        parent = self._status_file.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(parent, 0o700, follow_symlinks=False)
+        parent_metadata = parent.lstat()
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+            or parent_metadata.st_uid != os.geteuid()
+        ):
+            raise RuntimeError("janitor evidence directory is invalid")
+        _require_replaceable_status_file(self._status_file)
+
+        directory_descriptor = os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
         )
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            0o600,
-        )
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True)
-            handle.write("\n")
-        os.replace(temporary, self._status_file)
+        temporary_path: str | None = None
+        try:
+            descriptor, temporary_path = tempfile.mkstemp(
+                dir=parent,
+                prefix=f".{self._status_file.name}.",
+                suffix=".tmp",
+            )
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            _require_replaceable_status_file(self._status_file)
+            os.replace(temporary_path, self._status_file)
+            temporary_path = None
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
 
 
 def staging_janitor_ready(
@@ -177,3 +205,16 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _require_replaceable_status_file(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise RuntimeError("janitor evidence file is invalid")

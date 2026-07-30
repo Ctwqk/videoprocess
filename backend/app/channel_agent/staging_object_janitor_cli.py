@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.config import settings
 from app.services.staging_janitor_status import StagingJanitorStatusStore
 from app.services.staging_object_janitor import (
     STAGING_GRACE_SECONDS,
@@ -73,6 +74,7 @@ async def run(argv: Sequence[str] | None = None) -> int:
         if begin_outcome == "overlap":
             _emit({"status": "overlap_skipped"})
             return 0
+        _load_minio_credentials(os.environ)
         storage = get_storage("minio", create_bucket=False)
         if not isinstance(storage, MinioStorageBackend):
             raise RuntimeError("MinIO storage backend is unavailable")
@@ -163,6 +165,39 @@ def _database_resources(
     return engine, async_sessionmaker(
         engine,
         expire_on_commit=False,
+    )
+
+
+def _load_minio_credentials(env: Mapping[str, str]) -> None:
+    if (
+        str(env.get("MINIO_ACCESS_KEY", "")).strip()
+        or str(env.get("MINIO_SECRET_KEY", "")).strip()
+    ):
+        raise RuntimeError(
+            "staging janitor MinIO credentials must not be supplied "
+            "in environment"
+        )
+    access_path = str(
+        env.get("VP_STAGING_JANITOR_MINIO_ACCESS_KEY_FILE", "")
+    ).strip()
+    secret_path = str(
+        env.get("VP_STAGING_JANITOR_MINIO_SECRET_KEY_FILE", "")
+    ).strip()
+    if (
+        not access_path.startswith("/")
+        or not secret_path.startswith("/")
+        or access_path == secret_path
+    ):
+        raise RuntimeError(
+            "staging janitor MinIO credential files are required"
+        )
+    settings.minio_access_key = read_mode_0400_secret(
+        access_path,
+        label="staging janitor MinIO access key",
+    )
+    settings.minio_secret_key = read_mode_0400_secret(
+        secret_path,
+        label="staging janitor MinIO secret key",
     )
 
 

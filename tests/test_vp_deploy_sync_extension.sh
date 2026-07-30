@@ -134,6 +134,20 @@ UPDATE_SERVICES=1
 HEALTH_CHECKS=1
 VP_API_DATABASE_URL_GO=postgres://test:test@10.0.0.150:5435/videoprocess
 VP_PYTHON_WORKER_DATABASE_URL=postgresql+asyncpg://test:test@10.0.0.150:5435/videoprocess
+VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="$TEST_ROOT/deploy-migrator-url"
+VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="$TEST_ROOT/deploy-read-url"
+VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE="$TEST_ROOT/control-role-owner-url"
+VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="$TEST_ROOT/runtime-role-owner-url"
+for credential_file in \
+  "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" \
+  "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE" \
+  "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE" \
+  "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE"; do
+  printf '%s\n' \
+    'postgresql+asyncpg://test:test@10.0.0.150:5435/videoprocess' \
+    >"$credential_file"
+  chmod 0400 "$credential_file"
+done
 VP_MINIO_ACCESS_KEY=test-access
 VP_MINIO_SECRET_KEY=test-secret
 GPU_SERVICE_EXISTS=true
@@ -168,6 +182,7 @@ FAIL_PUBLISHER_CREATE=false
 FAIL_MANAGED_CRON_PRINTF=false
 FAIL_SOAK_CLEANUP=false
 MIGRATION_GATE_MODE=success
+MIGRATION_RUN_MODE=success
 VISION_CUTOVER_GATE_MODE=success
 VISION_CONSUMER_CUTOVER_MODE=success
 VISION_CONSUMER_AUDIT_MODE=converged
@@ -344,11 +359,26 @@ swarm_service_running() {
 }
 
 remote_sh() {
+  local host="$1"
   printf 'remote|%s' "$1" >>"$CALLS"
   shift
   printf '|%s' "$@" >>"$CALLS"
   printf '\n' >>"$CALLS"
-  command cat >/dev/null
+  local remote_script
+  remote_script="$(command cat)"
+
+  if [[ "$host" == "$VP_RUNTIME_HOST" \
+    && "${1:-}" == "/bin/sh" \
+    && "${2:-}" == "-s" \
+    && "${3:-}" == "--" \
+    && "${4:-}" == "/Users/wenjieliu/VideoProcess-app" \
+    && "${5:-}" == "backend/Dockerfile.ffmpeg-worker-go" \
+    && "${6:-}" == "vp-ffmpeg-worker-go:deploy-0123456789ab" \
+    && "${7:-}" == "$TEST_COMMIT" ]]; then
+    grep -Fq -- '--build-arg "VP_BUILD_COMMIT=$build_commit"' \
+      <<<"$remote_script"
+    return
+  fi
 
   [[ "${1:-}" == "/bin/sh" \
     && "${2:-}" == "-s" \
@@ -449,9 +479,12 @@ docker() {
     printf 'docker|%s\n' "$*"
   fi >>"$CALLS"
   if [[ "${1:-}" == "run" \
-    && "$*" == *"--env DATABASE_URL"* \
-    && "$*" == *"SELECT version_num FROM alembic_version"* ]]; then
-    builtin printf 'CUDA migration gate banner\n'
+    && "$*" == *"python -m app.services.worker_deployment_cli migrate"* ]]; then
+    [[ "$MIGRATION_RUN_MODE" == "success" ]]
+    return
+  fi
+  if [[ "${1:-}" == "run" \
+    && "$*" == *"python -m app.services.worker_deployment_cli verify-head"* ]]; then
     [[ "$MIGRATION_GATE_MODE" == "success" ]]
     return
   fi
@@ -650,7 +683,7 @@ docker() {
     if [[ "$FAIL_NETWORK_INSPECT" == "true" ]]; then
       return 1
     fi
-    echo vp-pipeline-network-id
+    echo 'vp-pipeline-network-id|vp-pipeline-net|overlay|swarm'
     return 0
   fi
   if [[ "${1:-} ${2:-}" == "container inspect" && "$*" == *"vp_vision_worker_1"* ]]; then
@@ -929,13 +962,47 @@ if ! grep -Fq 'VP_VISION_WORKER_SERVICE="vp-vision-worker-swarm"' "$EXTENSION"; 
   echo 'FAIL: deployment must define the managed vision worker service' >&2
   exit 1
 fi
-if ! grep -Fq 'vp_require_channelops_migration_head "$python_worker"' "$EXTENSION"; then
+for worker_dockerfile in \
+  "$ROOT_DIR/backend/Dockerfile.worker" \
+  "$ROOT_DIR/backend/Dockerfile.ffmpeg-worker-go"; do
+  if ! grep -Fq 'ARG VP_BUILD_COMMIT' "$worker_dockerfile" \
+    || ! grep -Fq 'org.opencontainers.image.revision=$VP_BUILD_COMMIT' \
+      "$worker_dockerfile"; then
+    echo "FAIL: worker image does not embed the reviewed build commit: $worker_dockerfile" >&2
+    exit 1
+  fi
+done
+if ! grep -Fq 'VP_WORKER_REDIS_FFMPEG_GO_SECRET' "$EXTENSION" \
+  || ! grep -Fq 'VP_WORKER_REDIS_FFMPEG_SECRET' "$EXTENSION" \
+  || ! grep -Fq 'VP_WORKER_REDIS_VISION_SECRET' "$EXTENSION" \
+  || ! grep -Fq 'VP_WORKER_REDIS_YOUTUBE_PUBLISHER_SECRET' "$EXTENSION"; then
+  echo 'FAIL: deployment does not consume all runtime-published worker Redis secrets' >&2
+  exit 1
+fi
+if grep -Eq '"(DATABASE_URL|REDIS_URL)=\\$|REDIS_URL=redis://10\\.0\\.0\\.150:6380' \
+  "$EXTENSION"; then
+  echo 'FAIL: registered worker URLs remain exposed in service environment' >&2
+  exit 1
+fi
+if ! grep -Fq 'vp_run_worker_registration_migration "$backend"' "$EXTENSION" \
+  || ! grep -Fq 'vp_require_channelops_migration_head "$backend"' "$EXTENSION"; then
   echo 'FAIL: managed ChannelOps runner must be gated on the exact migration head' >&2
   exit 1
 fi
-if ! grep -Fq 'rows != [\"033_legacy_worker_event_resolutions\"]' "$EXTENSION" \
-  || grep -Fq '032_channelops_leader_epoch' "$EXTENSION"; then
-  echo 'FAIL: migration head gate must require exactly revision 033' >&2
+if ! grep -Fq 'worker_deployment_cli migrate' "$EXTENSION" \
+  || ! grep -Fq 'worker_deployment_cli verify-head' "$EXTENSION"; then
+  echo 'FAIL: migration must use the protected file-only deployment CLIs' >&2
+  exit 1
+fi
+migration_contract="$(
+  sed -n \
+    -e '/^vp_run_worker_registration_migration()/,/^}/p' \
+    -e '/^vp_require_channelops_migration_head()/,/^}/p' \
+    "$EXTENSION"
+)"
+if grep -Eq -- '--env DATABASE_URL|VP_PYTHON_WORKER_DATABASE_URL' \
+  <<<"$migration_contract"; then
+  echo 'FAIL: migration contract retains a raw database credential path' >&2
   exit 1
 fi
 for expected_order in \
@@ -971,7 +1038,164 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
 fi
 source "$EXTENSION"
 
+runtime_state="$TEST_ROOT/worker-redis-runtime.state"
+builtin printf '%s\n' \
+  "GENERATION=$TEST_COMMIT" \
+  "ACL_IDENTITY=vp-marker-acl-v1" \
+  "AOF_ENABLED=yes" \
+  "AOF_STATUS=ok" \
+  "MAXMEMORY_POLICY=noeviction" \
+  "NETWORK=vp-pipeline-net" \
+  "CONTROL_REDIS_SECRET=vp-control-redis-$TEST_COMMIT" \
+  "FFMPEG_GO_REDIS_SECRET=vp-ffmpeg-go-redis-$TEST_COMMIT" \
+  "FFMPEG_REDIS_SECRET=vp-ffmpeg-redis-$TEST_COMMIT" \
+  "VISION_REDIS_SECRET=vp-vision-redis-$TEST_COMMIT" \
+  "YOUTUBE_PUBLISHER_REDIS_SECRET=vp-youtube-redis-$TEST_COMMIT" \
+  "WATCHER_REDIS_SECRET=vp-watcher-redis-$TEST_COMMIT" \
+  "READINESS_REDIS_SECRET=vp-marker-readiness-$TEST_COMMIT" \
+  "JANITOR_REDIS_SECRET=vp-marker-janitor-$TEST_COMMIT" \
+  "REPAIR_REDIS_SECRET=vp-marker-repair-$TEST_COMMIT" \
+  >"$runtime_state"
+chmod 0400 "$runtime_state"
+VP_WORKER_REDIS_RUNTIME_STATE_FILE="$runtime_state"
+VP_WORKER_REDIS_RUNTIME_GENERATION="$TEST_COMMIT"
+vp_require_worker_redis_runtime_state
+for loaded_secret in \
+  "$VP_WORKER_REDIS_CONTROL_SECRET" \
+  "$VP_WORKER_REDIS_FFMPEG_GO_SECRET" \
+  "$VP_WORKER_REDIS_FFMPEG_SECRET" \
+  "$VP_WORKER_REDIS_VISION_SECRET" \
+  "$VP_WORKER_REDIS_YOUTUBE_PUBLISHER_SECRET" \
+  "$VP_WORKER_REDIS_WATCHER_SECRET"; do
+  if [[ -z "$loaded_secret" ]]; then
+    echo 'FAIL: worker Redis runtime state did not publish every client secret' >&2
+    exit 1
+  fi
+done
+
+VP_WORKER_ADMISSION_PREPARED=true
+VP_WORKER_ADMISSION_COMMIT="$TEST_COMMIT"
+VP_WORKER_ADMISSION_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-0123456789ab
+
+vp_worker_service_registration_env() {
+  local service="$1"
+  local image="$2"
+  local worker_type=""
+  local worker_host=""
+  local capabilities=""
+  local stream=""
+  local group=""
+  case "$service" in
+    vp-ffmpeg-worker-go-swarm)
+      worker_type=ffmpeg_go
+      worker_host=colima-127
+      capabilities=media_cpu
+      stream=vp:tasks:ffmpeg_go
+      group=ffmpeg_go-workers
+      ;;
+    vp-ffmpeg-worker-gpu-swarm)
+      worker_type=ffmpeg
+      worker_host=150-gpu
+      capabilities=media_gpu
+      stream=vp:tasks:ffmpeg
+      group=ffmpeg-workers
+      ;;
+    vp-vision-worker-swarm)
+      worker_type=vision
+      worker_host=150-vision
+      capabilities=vision_gpu
+      stream=vp:tasks:vision
+      group=vision-workers
+      ;;
+    vp-youtube-publisher-swarm)
+      worker_type=youtube_publisher
+      worker_host=150-publisher
+      capabilities=youtube_publisher
+      stream=vp:tasks:youtube_publisher
+      group=youtube_publisher-workers
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  builtin printf '%s\n' \
+    DEPLOY_MODE=production \
+    "WORKER_SERVICE_NAME=$service" \
+    WORKER_ADMISSION_GENERATION=101 \
+    WORKER_SLOT=1 \
+    "WORKER_TYPE=$worker_type" \
+    "WORKER_HOST=$worker_host" \
+    "WORKER_CAPABILITIES=$capabilities" \
+    "WORKER_RELEASE_COMMIT=$TEST_COMMIT" \
+    "WORKER_IMAGE_IDENTITY=$image" \
+    "WORKER_REDIS_STREAM=$stream" \
+    "WORKER_REDIS_GROUP=$group" \
+    WORKER_DATABASE_URL_FILE=/run/secrets/vp-worker-database-url \
+    WORKER_ADMISSION_TOKEN_FILE=/run/secrets/vp-worker-admission-token \
+    WORKER_REDIS_URL_FILE=/run/secrets/vp-worker-redis-url \
+    WORKER_MINIO_ACCESS_KEY_FILE=/run/secrets/vp-worker-minio-access-key \
+    WORKER_MINIO_SECRET_KEY_FILE=/run/secrets/vp-worker-minio-secret-key \
+    VP_REQUIRE_STAGING_JANITOR=true
+}
+
+vp_worker_service_secret_specs() {
+  builtin printf '%s\n' \
+    source=test-worker-db,target=vp-worker-database-url,mode=0400 \
+    source=test-worker-admission,target=vp-worker-admission-token,mode=0400 \
+    source=test-worker-redis,target=vp-worker-redis-url,mode=0400 \
+    source=test-worker-minio-access,target=vp-worker-minio-access-key,mode=0400 \
+    source=test-worker-minio-secret,target=vp-worker-minio-secret-key,mode=0400
+}
+
+vp_prepare_worker_admission() {
+  VP_WORKER_ADMISSION_PREPARED=true
+  printf 'worker-admission|prepare|%s|%s\n' "$1" "$2" >>"$CALLS"
+}
+
+vp_activate_worker_admission() {
+  printf 'worker-admission|activate|%s\n' "$1" >>"$CALLS"
+}
+
+vp_require_worker_deployment_ready() {
+  printf 'worker-admission|ready|%s\n' "$1" >>"$CALLS"
+}
+
+vp_install_staging_object_janitor() {
+  printf 'staging-janitor|install|%s\n' "$1" >>"$CALLS"
+}
+
+vp_run_staging_object_janitor_once() {
+  printf 'staging-janitor|run\n' >>"$CALLS"
+}
+
+vp_commit_worker_admission() {
+  printf 'worker-admission|commit\n' >>"$CALLS"
+}
+
+vp_commit_worker_redis_marker_controls() {
+  VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
+  printf 'worker-marker|commit\n' >>"$CALLS"
+}
+
+vp_commit_worker_control_generation() {
+  printf 'worker-control|commit\n' >>"$CALLS"
+}
+
+vp_finalize_worker_control_rollback() {
+  printf 'worker-control|rollback-finalize\n' >>"$CALLS"
+}
+
+vp_restore_worker_admission_transaction() {
+  vp_restore_app_snapshots "$1" "$2"
+}
+
 vp_require_worker_redis_runtime_state() {
+  VP_WORKER_REDIS_CONTROL_SECRET=control-runtime
+  VP_WORKER_REDIS_FFMPEG_GO_SECRET=ffmpeg-go-runtime
+  VP_WORKER_REDIS_FFMPEG_SECRET=ffmpeg-runtime
+  VP_WORKER_REDIS_VISION_SECRET=vision-runtime
+  VP_WORKER_REDIS_YOUTUBE_PUBLISHER_SECRET=youtube-runtime
+  VP_WORKER_REDIS_WATCHER_SECRET=watcher-runtime
   VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET=marker-readiness-runtime
   VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET=marker-janitor-runtime
   VP_WORKER_REDIS_MARKER_REPAIR_REDIS_SECRET=marker-repair-runtime
@@ -1078,6 +1302,23 @@ if [[ "$deploy_output" != "$VP_APP_SERVICES" ]]; then
   echo 'FAIL: deploy_vp_app_services stdout must contain only the service inventory' >&2
   exit 1
 fi
+worker_admission_commit_line="$(
+  grep -nF 'worker-admission|commit' "$CALLS" | head -1 | cut -d: -f1
+)"
+worker_marker_commit_line="$(
+  grep -nF 'worker-marker|commit' "$CALLS" | head -1 | cut -d: -f1
+)"
+worker_control_commit_line="$(
+  grep -nF 'worker-control|commit' "$CALLS" | head -1 | cut -d: -f1
+)"
+if [[ -z "$worker_admission_commit_line" \
+  || -z "$worker_marker_commit_line" \
+  || -z "$worker_control_commit_line" \
+  || "$worker_admission_commit_line" -ge "$worker_marker_commit_line" \
+  || "$worker_marker_commit_line" -ge "$worker_control_commit_line" ]]; then
+  echo 'FAIL: control generation retired before worker/marker commit' >&2
+  exit 1
+fi
 
 gpu_readiness_probe="docker|exec|$GPU_READINESS_CONTAINER_ID|python|-m|app.channel_agent.worker_storage_readiness_cli"
 vision_readiness_probe="docker|exec|$VISION_READINESS_CONTAINER_ID|python|-m|app.channel_agent.worker_storage_readiness_cli|--require-artifact-api"
@@ -1177,10 +1418,10 @@ if [[ -z "$python_worker_update_line" \
   || -z "$vision_worker_update_line" \
   || -z "$publisher_update_line" \
   || -z "$python_listener_update_line" \
-  || "$python_worker_update_line" -ge "$python_listener_update_line" \
-  || "$vision_worker_update_line" -ge "$python_listener_update_line" \
-  || "$publisher_update_line" -ge "$python_listener_update_line" ]]; then
-  echo 'FAIL: claim-aware Python event producers must deploy before their listener' >&2
+  || "$python_listener_update_line" -ge "$python_worker_update_line" \
+  || "$python_listener_update_line" -ge "$vision_worker_update_line" \
+  || "$python_listener_update_line" -ge "$publisher_update_line" ]]; then
+  echo 'FAIL: migration-capable backend must deploy before registered workers' >&2
   exit 1
 fi
 
@@ -1473,7 +1714,7 @@ assert_deploy_rejected_by_readiness() {
     echo "FAIL: $name worker storage readiness failure unexpectedly allowed deployment" >&2
     exit 1
   fi
-  if ! grep -Fq 'log|VideoProcess service apply failed; restoring prior images without legacy placement' "$CALLS"; then
+  if ! grep -Fq 'log|VideoProcess service apply failed; restoring prior images with fresh admission' "$CALLS"; then
     echo "FAIL: $name readiness failure did not trigger the existing deployment rollback" >&2
     exit 1
   fi
@@ -1522,7 +1763,9 @@ for failed_readiness_service in \
       fi
       ;;
     "$VP_PUBLISHER_SERVICE")
-      if grep -Fq -- '--image vp-backend-api:worker-readiness-' "$CALLS"; then
+      if grep -Eq \
+        'docker\\|service update.*vp-(event-outbox-relay|channel-agent-runner)-swarm' \
+        "$CALLS"; then
         echo 'FAIL: publisher readiness execution failure advanced to later managed services' >&2
         exit 1
       fi
@@ -1611,7 +1854,7 @@ gpu_node_update_line="$(
     | cut -d: -f1
 )"
 gpu_node_rollback_line="$(
-  grep -nF 'log|VideoProcess service apply failed; restoring prior images without legacy placement' "$CALLS" \
+  grep -nF 'log|VideoProcess service apply failed; restoring prior images with fresh admission' "$CALLS" \
     | head -1 \
     | cut -d: -f1
 )"
@@ -1789,7 +2032,7 @@ if [[ -z "$gpu_failed_update_call" ]]; then
   exit 1
 fi
 gpu_attempt_line="$(grep -nF "$gpu_failed_update_call" "$CALLS" | head -1 | cut -d: -f1)"
-grep -Fq 'log|VideoProcess service apply failed; restoring prior images without legacy placement' "$CALLS"
+grep -Fq 'log|VideoProcess service apply failed; restoring prior images with fresh admission' "$CALLS"
 gpu_baseline_line="$(grep -nF -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS" | tail -1 | cut -d: -f1)"
 if [[ -z "$gpu_attempt_line" || -z "$gpu_baseline_line" || "$gpu_attempt_line" -ge "$gpu_baseline_line" ]]; then
   echo 'FAIL: GPU update rollback did not attempt the exact baseline image after the failed write' >&2
@@ -1821,7 +2064,7 @@ if deploy_worker_review_fixture gpu-create-write-failure >"$TEST_ROOT/gpu-create
   exit 1
 fi
 grep -Fq 'docker|service create --detach=false --name vp-ffmpeg-worker-gpu-swarm' "$CALLS"
-grep -Fq 'log|VideoProcess service apply failed; restoring prior images without legacy placement' "$CALLS"
+grep -Fq 'log|VideoProcess service apply failed; restoring prior images with fresh admission' "$CALLS"
 grep -Fq 'docker|service rm vp-ffmpeg-worker-gpu-swarm' "$CALLS"
 if grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PYTHON_WORKER_SERVICE" "$CALLS" \
   || grep -Fq "$gpu_readiness_probe" "$CALLS"; then
@@ -1977,17 +2220,22 @@ LEGACY_VISION_CONTAINER_NAME=/vp_vision_worker_1
 LEGACY_VISION_CONTAINER_EXISTS=true
 cp "$TEST_ROOT/successful-vision-deploy-calls" "$CALLS"
 
+migration_run_line="$(
+  grep -nF 'docker|run --rm' "$CALLS" \
+    | grep -F 'python -m app.services.worker_deployment_cli migrate' \
+    | head -1 \
+    | cut -d: -f1
+)"
 backend_migration_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-backend-api:deploy-0123456789ab' \
-    | grep -F 'vp-event-outbox-relay-swarm' \
+    | grep -F 'vp-autoflow-api-swarm' \
     | head -1 \
     | cut -d: -f1
 )"
 migration_gate_line="$(
   grep -nF 'docker|run --rm' "$CALLS" \
-    | grep -F -- '--env DATABASE_URL' \
-    | grep -F 'SELECT version_num FROM alembic_version' \
+    | grep -F 'python -m app.services.worker_deployment_cli verify-head' \
     | head -1 \
     | cut -d: -f1
 )"
@@ -1998,22 +2246,41 @@ runner_update_line="$(
     | head -1 \
     | cut -d: -f1
 )"
-if [[ -z "$backend_migration_update_line" \
+if [[ -z "$migration_run_line" \
+  || -z "$backend_migration_update_line" \
   || -z "$migration_gate_line" \
   || -z "$runner_update_line" \
-  || "$backend_migration_update_line" -ge "$migration_gate_line" \
+  || "$migration_run_line" -ge "$migration_gate_line" \
+  || "$migration_gate_line" -ge "$backend_migration_update_line" \
   || "$migration_gate_line" -ge "$runner_update_line" ]]; then
-  echo 'FAIL: exact migration head gate must run after backend and before runner update' >&2
+  echo 'FAIL: migration and exact head gate must precede backend/runner updates' >&2
   exit 1
 fi
 migration_gate_call="$(
   grep -F 'docker|run --rm' "$CALLS" \
-    | grep -F -- '--env DATABASE_URL' \
-    | grep -F 'SELECT version_num FROM alembic_version' \
+    | grep -F 'python -m app.services.worker_deployment_cli verify-head' \
     | head -1
 )"
-if [[ "$migration_gate_call" == *"$VP_PYTHON_WORKER_DATABASE_URL"* ]]; then
-  echo 'FAIL: migration gate printed the deploy database URL' >&2
+migration_run_call="$(
+  grep -F 'docker|run --rm' "$CALLS" \
+    | grep -F 'python -m app.services.worker_deployment_cli migrate' \
+    | head -1
+)"
+if [[ "$migration_run_call" != \
+    *"--mount type=bind,src=$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE,dst=/run/secrets/worker-deploy-migrator-database-url,readonly"* \
+  || "$migration_run_call" != \
+    *"--env WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE=/run/secrets/worker-deploy-migrator-database-url"* \
+  || "$migration_gate_call" != \
+    *"--mount type=bind,src=$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE,dst=/run/secrets/worker-deploy-read-database-url,readonly"* \
+  || "$migration_gate_call" != \
+    *"--env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url"* \
+  || "$migration_run_call$migration_gate_call" == *'postgresql://'* \
+  || "$migration_run_call$migration_gate_call" == *'redis://'* \
+  || "$migration_run_call$migration_gate_call" == \
+    *'WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE'* \
+  || "$migration_run_call$migration_gate_call" == \
+    *'WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE'* ]]; then
+  echo 'FAIL: migration/read gate did not use isolated secret-file mounts' >&2
   exit 1
 fi
 
@@ -2041,12 +2308,35 @@ for migration_gate_mode in wrong missing error; do
     echo "FAIL: $migration_gate_mode rollback restored a pre-migration backend image" >&2
     exit 1
   fi
-  if ! grep -Fq 'SELECT version_num FROM alembic_version' "$CALLS"; then
-    echo "FAIL: $migration_gate_mode migration gate did not query alembic_version" >&2
+  if ! grep -Fq \
+    'python -m app.services.worker_deployment_cli verify-head' "$CALLS"; then
+    echo "FAIL: $migration_gate_mode migration gate did not run the verifier" >&2
     exit 1
   fi
 done
 MIGRATION_GATE_MODE=success
+cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
+
+: >"$CALLS"
+MIGRATION_RUN_MODE=failure
+if deploy_vp_app_services \
+  vp-api:migration-failure \
+  vp-frontend:migration-failure \
+  vp-backend-api:migration-failure \
+  vp-channelops-runner-go:migration-failure \
+  vp-ffmpeg-worker-go:migration-failure \
+  vp-ffmpeg-worker-python:migration-failure >/dev/null 2>&1; then
+  echo 'FAIL: failed protected migration unexpectedly succeeded' >&2
+  exit 1
+fi
+if grep -Fq \
+  'python -m app.services.worker_deployment_cli verify-head' "$CALLS" \
+  || grep -F 'docker|service update' "$CALLS" \
+    | grep -Eq ' vp-autoflow-api-swarm$'; then
+  echo 'FAIL: failed migration reached head verification or backend update' >&2
+  exit 1
+fi
+MIGRATION_RUN_MODE=success
 cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
 
 : >"$CALLS"
@@ -2444,8 +2734,16 @@ if [[ "$cron_writes_after" -ne "$cron_writes_before" ]]; then
   exit 1
 fi
 
-grep -Fq 'build|10.0.0.127|/Users/wenjieliu/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go|vp-ffmpeg-worker-go:deploy-0123456789ab' "$CALLS"
-grep -Fq 'docker|build -f /home/taiwei/deploy-github-sync/repos/videoprocess/backend/Dockerfile.worker -t vp-ffmpeg-worker-python:deploy-0123456789ab /home/taiwei/deploy-github-sync/repos/videoprocess/backend' "$CALLS"
+grep -Fq \
+  "remote|10.0.0.127|/bin/sh|-s|--|/Users/wenjieliu/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go|vp-ffmpeg-worker-go:deploy-0123456789ab|$TEST_COMMIT" \
+  "$CALLS"
+if grep -Fq \
+  'build|10.0.0.127|/Users/wenjieliu/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go' \
+  "$CALLS"; then
+  echo 'FAIL: versioned Go worker used the four-argument build helper' >&2
+  exit 1
+fi
+grep -Fq 'docker|build --build-arg VP_BUILD_COMMIT=0123456789abcdef0123456789abcdef01234567 -f /home/taiwei/deploy-github-sync/repos/videoprocess/backend/Dockerfile.worker -t vp-ffmpeg-worker-python:deploy-0123456789ab /home/taiwei/deploy-github-sync/repos/videoprocess/backend' "$CALLS"
 if grep -Fq 'build|10.0.0.150|' "$CALLS"; then
   echo 'FAIL: manager-local images must use the manager Docker CLI directly' >&2
   exit 1
@@ -2543,7 +2841,16 @@ for publisher_env in \
     exit 1
   fi
 done
-grep -Fq -- '--env-add MINIO_SECRET_KEY=' "$CALLS"
+if grep -Eq -- '--env-add MINIO_(ACCESS|SECRET)_KEY=' "$CALLS"; then
+  echo 'FAIL: worker deployment retained MinIO credentials in service env' >&2
+  exit 1
+fi
+grep -Fq -- \
+  '--secret-add source=test-worker-minio-access,target=vp-worker-minio-access-key,mode=0400' \
+  "$CALLS"
+grep -Fq -- \
+  '--secret-add source=test-worker-minio-secret,target=vp-worker-minio-secret-key,mode=0400' \
+  "$CALLS"
 
 publisher_calls="$(grep -F 'vp-youtube-publisher-swarm' "$CALLS" || true)"
 if printf '%s\n' "$publisher_calls" | grep -Eq -- 'YOUTUBE_(OAUTH|CLIENT|CREDENTIALS|TOKEN|REFRESH)_[A-Z_]*='; then
@@ -2603,7 +2910,7 @@ grep -Fq -- '--image vp-ffmpeg-worker-python:publisher-repeat-test vp-youtube-pu
 grep -Fq -- '--replicas 1' "$CALLS"
 if grep -Fq -- '--constraint-add node.labels.vp.publisher==true' "$CALLS" \
   || grep -Fq -- '--constraint-add node.hostname==ccttww-lap' "$CALLS" \
-  || grep -Fq -- '--network-add vp-pipeline-net' "$CALLS" \
+  || grep -Fq -- '--network-add vp-pipeline-network-id' "$CALLS" \
   || grep -Fq -- '--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' "$CALLS" \
   || grep -Fq -- '--mount-rm ' "$CALLS"; then
   echo 'FAIL: repeat publisher update must not change the exact desired mount set' >&2
@@ -2717,7 +3024,9 @@ if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-network-failure-test >/
   echo 'FAIL: publisher deploy must return non-zero when network inspection fails' >&2
   exit 1
 fi
-grep -Fq 'docker|network inspect vp-pipeline-net --format {{.ID}}' "$CALLS"
+grep -Fq \
+  'docker|network inspect vp-pipeline-net --format {{.ID}}|{{.Name}}|{{.Driver}}|{{.Scope}}' \
+  "$CALLS"
 if grep -Fq 'docker|node update --label-add vp.publisher=true ccttww-lap' "$CALLS" \
   || grep -Fq 'docker|service update' "$CALLS"; then
   echo 'FAIL: publisher deploy continued after pipeline network inspection failure' >&2
@@ -3294,7 +3603,7 @@ vp_deploy_vision_worker vp-ffmpeg-worker-python:vision-create-test >/dev/null
 grep -Fq 'docker|service create --detach=false --name vp-vision-worker-swarm' "$CALLS"
 grep -Fq -- '--constraint node.labels.vp.gpu==true' "$CALLS"
 grep -Fq -- '--constraint node.hostname==ccttww-lap' "$CALLS"
-grep -Fq -- '--network vp-pipeline-net' "$CALLS"
+grep -Fq -- '--network vp-pipeline-network-id' "$CALLS"
 grep -Fq -- '--mount type=volume,src=vp-vision-worker-scratch,dst=/data/storage' "$CALLS"
 grep -Fq -- '--env WORKER_TYPE=vision' "$CALLS"
 grep -Fq -- '--env WORKER_HOST=150-vision' "$CALLS"
@@ -3316,7 +3625,7 @@ vp_deploy_publisher vp-ffmpeg-worker-python:publisher-create-test >/dev/null
 grep -Fq 'docker|service create --detach=false --name vp-youtube-publisher-swarm' "$CALLS"
 grep -Fq -- '--constraint node.labels.vp.publisher==true' "$CALLS"
 grep -Fq -- '--constraint node.hostname==ccttww-lap' "$CALLS"
-grep -Fq -- '--network vp-pipeline-net' "$CALLS"
+grep -Fq -- '--network vp-pipeline-network-id' "$CALLS"
 grep -Fq -- '--mount type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' "$CALLS"
 grep -Fq -- '--replicas 1' "$CALLS"
 

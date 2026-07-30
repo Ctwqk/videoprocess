@@ -45,7 +45,7 @@ printf '|%s' "$@" >>"$DOCKER_CALLS"
 printf '\n' >>"$DOCKER_CALLS"
 
 if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
-  printf 'vp-pipeline-network-id\n'
+  printf 'vp-pipeline-network-id|vp-pipeline-net|overlay|swarm\n'
   exit
 fi
 if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
@@ -313,6 +313,7 @@ cat >"$CONFIG_FILE" <<'EOF'
 GENERATION=release-0123456789ab
 IMAGE=vp-ffmpeg-worker-python:deploy-0123456789ab
 NETWORK=vp-pipeline-net
+NETWORK_ID=vp-pipeline-network-id
 READINESS_DATABASE_SECRET=vp-worker-marker-readiness-db-release-0123456789ab
 READINESS_REDIS_SECRET=vp-marker-readiness-redis-runtime-abcdef012345
 JANITOR_DATABASE_SECRET=vp-worker-marker-janitor-db-release-0123456789ab
@@ -350,7 +351,7 @@ assert_control_job() {
     || fail "$mode did not preserve the exact reviewed image identity"
   [[ "$create" == *"|--constraint|node.hostname==ccttww-lap|"* ]] \
     || fail "$mode did not use exact host-150 placement"
-  [[ "$create" == *"|--network|vp-pipeline-net|"* ]] \
+  [[ "$create" == *"|--network|vp-pipeline-network-id|"* ]] \
     || fail "$mode did not use the reviewed network"
   [[ "$create" == *"|--secret|source=$database_secret,target=worker-marker-database-url,mode=0400|"* ]] \
     || fail "$mode did not mount its own database secret at mode 0400"
@@ -575,6 +576,16 @@ fake_contention_output="$(
   || fail "native flock contention reached Docker"
 
 : >"$DOCKER_CALLS"
+{
+  printf 'GENERATION=release-0123456789ab\n'
+  printf 'RECORDED_AT=%s\n' "$(date +%s)"
+  printf 'CODE=ready\n'
+  printf 'CHECKED_COUNT=7\n'
+  printf 'EXPECTED_COUNT=7\n'
+} >"$STATE_DIR/readiness.status"
+chmod 0600 "$STATE_DIR/readiness.status"
+[[ "$("$LAUNCHER" status)" == *"code=ready"* ]] \
+  || fail "flock regression setup did not create fresh readiness"
 if FAKE_FLOCK_STATUS=69 "$LAUNCHER" readiness \
   >"$TEST_ROOT/flock-operational-error.out" 2>&1; then
   fail "native flock operational failure was accepted as contention"
@@ -585,6 +596,12 @@ grep -Fxq \
   || fail "native flock operational failure lacked a stable reason code"
 [[ ! -s "$DOCKER_CALLS" ]] \
   || fail "native flock operational failure reached Docker"
+if "$LAUNCHER" status >"$TEST_ROOT/flock-stale-status.out" 2>&1; then
+  fail "native flock operational failure left reusable readiness"
+fi
+grep -Fq 'code=readiness_status_missing' \
+  "$TEST_ROOT/flock-stale-status.out" \
+  || fail "native flock operational failure did not invalidate readiness"
 rm -f "$FAKE_BIN/flock"
 
 : >"$DOCKER_CALLS"
@@ -788,6 +805,12 @@ AOF_ENABLED=$aof_enabled
 AOF_STATUS=$aof_status
 MAXMEMORY_POLICY=$policy
 NETWORK=vp-pipeline-net
+CONTROL_REDIS_SECRET=vp-control-redis-runtime-abcdef012345
+FFMPEG_GO_REDIS_SECRET=vp-ffmpeg-go-redis-runtime-abcdef012345
+FFMPEG_REDIS_SECRET=vp-ffmpeg-redis-runtime-abcdef012345
+VISION_REDIS_SECRET=vp-vision-redis-runtime-abcdef012345
+YOUTUBE_PUBLISHER_REDIS_SECRET=vp-youtube-redis-runtime-abcdef012345
+WATCHER_REDIS_SECRET=vp-watcher-redis-runtime-abcdef012345
 READINESS_REDIS_SECRET=$readiness_secret
 JANITOR_REDIS_SECRET=$janitor_secret
 REPAIR_REDIS_SECRET=$repair_secret
@@ -1483,6 +1506,27 @@ vp_reconcile_vision_consumers() {
   :
 }
 vp_require_channelops_migration_head() {
+  :
+}
+vp_run_worker_registration_migration() {
+  :
+}
+vp_prepare_worker_admission() {
+  :
+}
+vp_install_staging_object_janitor() {
+  :
+}
+vp_run_staging_object_janitor_once() {
+  :
+}
+vp_activate_worker_admission() {
+  :
+}
+vp_require_worker_deployment_ready() {
+  :
+}
+vp_commit_worker_admission() {
   :
 }
 vp_install_soak_watch() {

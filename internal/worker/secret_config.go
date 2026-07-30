@@ -20,6 +20,9 @@ const MaxWorkerSecretBytes = 4096
 type SecretConfig struct {
 	DatabaseURL    string
 	AdmissionToken string
+	RedisURL       string
+	MinIOAccessKey string
+	MinIOSecretKey string
 }
 
 type WorkerSecretError struct {
@@ -115,7 +118,52 @@ func isExactMode0400(mode os.FileMode) bool {
 }
 
 func LoadWorkerSecrets(env map[string]string) (SecretConfig, error) {
-	redisOptions, err := ParseWorkerRedisOptions(env["REDIS_URL"])
+	deployMode := strings.ToLower(strings.TrimSpace(env["DEPLOY_MODE"]))
+	switch deployMode {
+	case "", "shared", "production", "local", "development", "test":
+	default:
+		return SecretConfig{}, &WorkerSecretError{
+			message: "worker deploy mode is invalid",
+		}
+	}
+	preliminaryProduction := deployMode == "" ||
+		deployMode == "shared" ||
+		deployMode == "production"
+	redisPath := strings.TrimSpace(env["WORKER_REDIS_URL_FILE"])
+	redisEnvironment := strings.TrimSpace(env["REDIS_URL"])
+	var redisURL string
+	var err error
+	if preliminaryProduction {
+		if redisEnvironment != "" {
+			return SecretConfig{}, &WorkerSecretError{
+				message: "production workers must not receive REDIS_URL through the environment",
+			}
+		}
+		if redisPath == "" {
+			return SecretConfig{}, &WorkerSecretError{
+				message: "production workers require WORKER_REDIS_URL_FILE",
+			}
+		}
+		redisURL, err = ReadMode0400Secret(
+			redisPath,
+			"worker Redis URL",
+		)
+	} else if redisPath != "" {
+		redisURL, err = ReadMode0400Secret(
+			redisPath,
+			"worker Redis URL",
+		)
+	} else if redisEnvironment != "" {
+		redisURL = redisEnvironment
+	} else {
+		return SecretConfig{}, &WorkerSecretError{
+			message: "worker Redis URL is not configured",
+		}
+	}
+	if err != nil {
+		return SecretConfig{}, err
+	}
+	redisOptions, err := ParseWorkerRedisOptions(redisURL)
 	if err != nil {
 		return SecretConfig{}, err
 	}
@@ -127,6 +175,16 @@ func LoadWorkerSecrets(env map[string]string) (SecretConfig, error) {
 		return SecretConfig{}, err
 	}
 	production := !allowEnvironmentFallback
+	if production && redisEnvironment != "" {
+		return SecretConfig{}, &WorkerSecretError{
+			message: "production workers must not receive REDIS_URL through the environment",
+		}
+	}
+	if production && redisPath == "" {
+		return SecretConfig{}, &WorkerSecretError{
+			message: "production workers require WORKER_REDIS_URL_FILE",
+		}
+	}
 	databasePath := strings.TrimSpace(env["WORKER_DATABASE_URL_FILE"])
 	databaseEnvironment := strings.TrimSpace(env["DATABASE_URL"])
 	var databaseURL string
@@ -189,9 +247,70 @@ func LoadWorkerSecrets(env map[string]string) (SecretConfig, error) {
 	if err != nil {
 		return SecretConfig{}, err
 	}
+	minioAccessPath := strings.TrimSpace(env["WORKER_MINIO_ACCESS_KEY_FILE"])
+	minioSecretPath := strings.TrimSpace(env["WORKER_MINIO_SECRET_KEY_FILE"])
+	minioAccessEnvironment := strings.TrimSpace(env["MINIO_ACCESS_KEY"])
+	minioSecretEnvironment := strings.TrimSpace(env["MINIO_SECRET_KEY"])
+	if !production &&
+		strings.ToLower(strings.TrimSpace(env["STORAGE_BACKEND"])) != "minio" &&
+		minioAccessPath == "" &&
+		minioSecretPath == "" &&
+		minioAccessEnvironment == "" &&
+		minioSecretEnvironment == "" {
+		return SecretConfig{
+			DatabaseURL:    databaseURL,
+			AdmissionToken: admissionToken,
+			RedisURL:       redisURL,
+		}, nil
+	}
+	if production &&
+		(minioAccessEnvironment != "" || minioSecretEnvironment != "") {
+		return SecretConfig{}, &WorkerSecretError{
+			message: "production workers must not receive MINIO_ACCESS_KEY or MINIO_SECRET_KEY through the environment",
+		}
+	}
+	var minioAccessKey string
+	var minioSecretKey string
+	if minioAccessPath != "" || minioSecretPath != "" {
+		if minioAccessPath == "" ||
+			minioSecretPath == "" ||
+			minioAccessPath == minioSecretPath {
+			return SecretConfig{}, &WorkerSecretError{
+				message: "worker MinIO credentials require independent secret files",
+			}
+		}
+		minioAccessKey, err = ReadMode0400Secret(
+			minioAccessPath,
+			"worker MinIO access key",
+		)
+		if err == nil {
+			minioSecretKey, err = ReadMode0400Secret(
+				minioSecretPath,
+				"worker MinIO secret key",
+			)
+		}
+	} else if production {
+		return SecretConfig{}, &WorkerSecretError{
+			message: "production workers require WORKER_MINIO_ACCESS_KEY_FILE and WORKER_MINIO_SECRET_KEY_FILE",
+		}
+	} else {
+		minioAccessKey = minioAccessEnvironment
+		minioSecretKey = minioSecretEnvironment
+		if minioAccessKey == "" || minioSecretKey == "" {
+			return SecretConfig{}, &WorkerSecretError{
+				message: "worker MinIO credentials are not configured",
+			}
+		}
+	}
+	if err != nil {
+		return SecretConfig{}, err
+	}
 	return SecretConfig{
 		DatabaseURL:    databaseURL,
 		AdmissionToken: admissionToken,
+		RedisURL:       redisURL,
+		MinIOAccessKey: minioAccessKey,
+		MinIOSecretKey: minioSecretKey,
 	}, nil
 }
 

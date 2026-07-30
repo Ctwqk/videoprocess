@@ -23,15 +23,19 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+var buildCommit = "unversioned"
+
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	cfg := worker.LoadConfig()
 	stopMetrics := startMetricsServer(ctx, cfg.MetricsAddr)
 	defer stopMetrics()
+	env := workerEnvironment()
+	env["VP_BUILD_COMMIT"] = buildCommit
 	if err := runWorker(
 		ctx,
-		workerEnvironment(),
+		env,
 		startupDependencies{},
 	); err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("vp-ffmpeg-worker-go stopped", "error", err)
@@ -104,6 +108,9 @@ func runWorker(
 		return err
 	}
 	cfg := worker.LoadConfigFromEnv(env)
+	cfg.RedisURL = secrets.RedisURL
+	cfg.MinIOAccessKey = secrets.MinIOAccessKey
+	cfg.MinIOSecretKey = secrets.MinIOSecretKey
 
 	openContext, openCancel := context.WithTimeout(ctx, 10*time.Second)
 	database, err := dependencies.openDatabase(
@@ -126,9 +133,10 @@ func runWorker(
 	}()
 
 	instanceID := uuid.New()
-	claims, err := worker.BuildRegistrationClaims(
+	claims, err := worker.BuildRegistrationClaimsWithRedis(
 		env,
 		secrets.DatabaseURL,
+		secrets.RedisURL,
 		instanceID,
 	)
 	if err != nil {

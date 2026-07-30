@@ -1,14 +1,22 @@
 FROM golang:1.25-bookworm AS build
 
+ARG VP_BUILD_COMMIT
+RUN printf '%s\n' "$VP_BUILD_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vp-ffmpeg-worker-go ./cmd/vp-ffmpeg-worker
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w -X main.buildCommit=$VP_BUILD_COMMIT" \
+    -o /out/vp-ffmpeg-worker-go ./cmd/vp-ffmpeg-worker
 
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
+ARG VP_BUILD_COMMIT
+RUN printf '%s\n' "$VP_BUILD_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+LABEL org.opencontainers.image.revision=$VP_BUILD_COMMIT
+ENV VP_BUILD_COMMIT=$VP_BUILD_COMMIT
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \

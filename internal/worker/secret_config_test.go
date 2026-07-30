@@ -16,11 +16,16 @@ import (
 func TestRegistrationProductionSecretsRequireBoundedMode0400Files(t *testing.T) {
 	databasePath := writeWorkerSecret(t, "database-url", "postgresql://runtime:database-secret@vp-postgres/videoprocess\n", 0o400)
 	tokenPath := writeWorkerSecret(t, "admission-token", "admission-secret\n", 0o400)
+	redisPath := writeWorkerSecret(t, "redis-url", "redis://go-worker:redis-secret@vp-redis/3\n", 0o400)
+	minioAccessPath := writeWorkerSecret(t, "minio-access", "minio-access\n", 0o400)
+	minioSecretPath := writeWorkerSecret(t, "minio-secret", "minio-password\n", 0o400)
 	env := map[string]string{
-		"DEPLOY_MODE":                 "production",
-		"REDIS_URL":                   "redis://go-worker:redis-secret@vp-redis/3",
-		"WORKER_DATABASE_URL_FILE":    databasePath,
-		"WORKER_ADMISSION_TOKEN_FILE": tokenPath,
+		"DEPLOY_MODE":                  "production",
+		"WORKER_DATABASE_URL_FILE":     databasePath,
+		"WORKER_ADMISSION_TOKEN_FILE":  tokenPath,
+		"WORKER_REDIS_URL_FILE":        redisPath,
+		"WORKER_MINIO_ACCESS_KEY_FILE": minioAccessPath,
+		"WORKER_MINIO_SECRET_KEY_FILE": minioSecretPath,
 	}
 
 	secrets, err := LoadWorkerSecrets(env)
@@ -32,6 +37,13 @@ func TestRegistrationProductionSecretsRequireBoundedMode0400Files(t *testing.T) 
 	}
 	if secrets.AdmissionToken != "admission-secret" {
 		t.Fatalf("admission token was not read exactly from the secret file")
+	}
+	if secrets.RedisURL != "redis://go-worker:redis-secret@vp-redis/3" {
+		t.Fatalf("Redis URL was not read exactly from the secret file")
+	}
+	if secrets.MinIOAccessKey != "minio-access" ||
+		secrets.MinIOSecretKey != "minio-password" {
+		t.Fatalf("MinIO credentials were not read exactly from secret files")
 	}
 
 	env["DATABASE_URL"] = "postgresql://leaked:environment-secret@db/videoprocess"
@@ -60,6 +72,40 @@ func TestRegistrationProductionSecretsRequireBoundedMode0400Files(t *testing.T) 
 	}
 	if strings.Contains(err.Error(), "environment-admission-secret") {
 		t.Fatalf("admission environment error exposed secret material: %v", err)
+	}
+
+	delete(env, "WORKER_ADMISSION_TOKEN")
+	env["REDIS_URL"] = "redis://go-worker:environment-secret@vp-redis/3"
+	_, err = LoadWorkerSecrets(env)
+	if err == nil || !strings.Contains(err.Error(), "REDIS_URL") {
+		t.Fatalf("production environment Redis credential error = %v", err)
+	}
+	if strings.Contains(err.Error(), "environment-secret") {
+		t.Fatalf("Redis environment error exposed secret material: %v", err)
+	}
+
+	delete(env, "REDIS_URL")
+	env["MINIO_ACCESS_KEY"] = "environment-minio-secret"
+	_, err = LoadWorkerSecrets(env)
+	if err == nil || !strings.Contains(err.Error(), "MINIO_ACCESS_KEY") {
+		t.Fatalf("production environment MinIO credential error = %v", err)
+	}
+	if strings.Contains(err.Error(), "environment-minio-secret") {
+		t.Fatalf("MinIO environment error exposed secret material: %v", err)
+	}
+}
+
+func TestRegistrationProductionRedisEnvironmentIsRejectedBeforeFileRead(t *testing.T) {
+	_, err := LoadWorkerSecrets(map[string]string{
+		"DEPLOY_MODE":           "production",
+		"WORKER_REDIS_URL_FILE": filepath.Join(t.TempDir(), "missing-redis-url"),
+		"REDIS_URL":             "redis://go-worker:environment-secret@vp-redis/3",
+	})
+	if err == nil || !strings.Contains(err.Error(), "REDIS_URL") {
+		t.Fatalf("production environment Redis credential error = %v", err)
+	}
+	if strings.Contains(err.Error(), "environment-secret") {
+		t.Fatalf("Redis environment error exposed secret material: %v", err)
 	}
 }
 
@@ -120,7 +166,7 @@ func TestRegistrationMissingDeployModeFailsClosedToSecretFiles(t *testing.T) {
 		"WORKER_ADMISSION_TOKEN": "development-token",
 	})
 	if err == nil ||
-		!strings.Contains(err.Error(), "DATABASE_URL") {
+		!strings.Contains(err.Error(), "REDIS_URL") {
 		t.Fatalf("missing-mode production error = %v", err)
 	}
 }

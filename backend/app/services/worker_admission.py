@@ -9,7 +9,11 @@ from urllib.parse import urlparse
 
 LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "0.0.0.0", "::1"}
 PRODUCTION_DEPLOY_MODES = {"shared", "production"}
-MINIO_SETTINGS = ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET")
+MINIO_SETTINGS = ("MINIO_ENDPOINT", "MINIO_BUCKET")
+MINIO_CREDENTIAL_FILES = (
+    "WORKER_MINIO_ACCESS_KEY_FILE",
+    "WORKER_MINIO_SECRET_KEY_FILE",
+)
 MINIO_WORKER_TYPES = {"ffmpeg", "vision", "youtube_publisher"}
 
 
@@ -92,6 +96,20 @@ def _append_minio_reasons(
     for key in MINIO_SETTINGS:
         if not _env_value(env, key, ""):
             reasons.append(f"{worker_label} require {key}")
+    for key in ("MINIO_ACCESS_KEY", "MINIO_SECRET_KEY"):
+        if _env_value(env, key, ""):
+            reasons.append(f"{worker_label} must not set {key}")
+    for key in MINIO_CREDENTIAL_FILES:
+        if not _env_value(env, key, ""):
+            reasons.append(f"{worker_label} require {key}")
+    if (
+        _env_value(env, MINIO_CREDENTIAL_FILES[0], "")
+        == _env_value(env, MINIO_CREDENTIAL_FILES[1], "")
+        != ""
+    ):
+        reasons.append(
+            f"{worker_label} require independent MinIO credential files"
+        )
 
     minio_endpoint = _env_value(env, "MINIO_ENDPOINT", "")
     if minio_endpoint and _is_local_host(_host_from_endpoint(minio_endpoint)):

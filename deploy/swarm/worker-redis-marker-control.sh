@@ -52,6 +52,7 @@ load_config() {
   GENERATION=""
   IMAGE=""
   NETWORK=""
+  NETWORK_ID=""
   READINESS_DATABASE_SECRET=""
   READINESS_REDIS_SECRET=""
   JANITOR_DATABASE_SECRET=""
@@ -75,6 +76,10 @@ load_config() {
       NETWORK)
         [[ -z "$NETWORK" ]] || return 1
         NETWORK="$value"
+        ;;
+      NETWORK_ID)
+        [[ -z "$NETWORK_ID" ]] || return 1
+        NETWORK_ID="$value"
         ;;
       READINESS_DATABASE_SECRET)
         [[ -z "$READINESS_DATABASE_SECRET" ]] || return 1
@@ -100,7 +105,8 @@ load_config() {
 
   [[ "$GENERATION" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || return 1
   [[ "$IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ ]] || return 1
-  [[ "$NETWORK" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] || return 1
+  [[ "$NETWORK" == vp-pipeline-net \
+    && "$NETWORK_ID" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
   local secret
   for secret in \
     "$READINESS_DATABASE_SECRET" \
@@ -110,7 +116,7 @@ load_config() {
     [[ "$secret" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
   done
   reject_forbidden_topology \
-    "$GENERATION $IMAGE $NETWORK $READINESS_DATABASE_SECRET $READINESS_REDIS_SECRET $JANITOR_DATABASE_SECRET $JANITOR_REDIS_SECRET"
+    "$GENERATION $IMAGE $NETWORK $NETWORK_ID $READINESS_DATABASE_SECRET $READINESS_REDIS_SECRET $JANITOR_DATABASE_SECRET $JANITOR_REDIS_SECRET"
 }
 
 acquire_mode_lock() {
@@ -212,13 +218,15 @@ expected_service_identity() {
       return 1
       ;;
   esac
-  local network_id
-  network_id="$(
-    docker network inspect "$NETWORK" --format '{{.ID}}' 2>/dev/null
+  local network_identity
+  network_identity="$(
+    docker network inspect "$NETWORK" \
+      --format '{{.ID}}|{{.Name}}|{{.Driver}}|{{.Scope}}' 2>/dev/null
   )" || return 1
-  [[ "$network_id" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+  [[ "$network_identity" == "$NETWORK_ID|$NETWORK|overlay|swarm" ]] \
+    || return 1
   printf '%s\n' \
-    "2|$mode|$GENERATION|$IMAGE|replicated-job|1|1|none|node.hostname==$CONTROL_NODE|$network_id|$database_secret:worker-marker-database-url:256,$redis_secret:worker-marker-redis-url:256|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url,WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url|python,-m,$module,$command"
+    "2|$mode|$GENERATION|$IMAGE|replicated-job|1|1|none|node.hostname==$CONTROL_NODE|$NETWORK_ID|$database_secret:worker-marker-database-url:256,$redis_secret:worker-marker-redis-url:256|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url,WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url|python,-m,$module,$command"
 }
 
 service_identity() {
@@ -374,7 +382,7 @@ launch_job() {
     --replicas 1 \
     --restart-condition none \
     --constraint "node.hostname==$CONTROL_NODE" \
-    --network "$NETWORK" \
+    --network "$NETWORK_ID" \
     --label "vp.worker-redis-marker.mode=$mode" \
     --label "vp.worker-redis-marker.generation=$GENERATION" \
     --secret "source=$database_secret,target=worker-marker-database-url,mode=0400" \
@@ -561,6 +569,7 @@ case "$MODE" in
     else
       lock_status="$?"
       [[ "$lock_status" -eq 75 ]] && exit 0
+      invalidate_readiness_status || exit 3
       exit "$lock_status"
     fi
     invalidate_readiness_status || exit 3

@@ -147,6 +147,41 @@ async def test_janitor_deletes_only_old_unreferenced_claim_staging_objects(
         STAGING_GRACE_SECONDS
     )
     assert stat.S_IMODE(status_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(status_file.parent.stat().st_mode) == 0o700
+
+
+def test_status_evidence_does_not_follow_predictable_temporary_symlink(
+    tmp_path,
+) -> None:
+    status_file = tmp_path / "evidence" / "status.json"
+    status_file.parent.mkdir()
+    victim = tmp_path / "victim"
+    victim.write_text("do-not-touch\n")
+    predictable_temporary = status_file.with_suffix(".json.tmp")
+    predictable_temporary.symlink_to(victim)
+    janitor = StagingObjectJanitor(
+        object(),
+        client=object(),
+        bucket="videoprocess",
+        status_file=status_file,
+    )
+
+    janitor._write_status(
+        datetime(2026, 7, 26, 12, tzinfo=timezone.utc),
+        {
+            "scanned": 0,
+            "deleted": 0,
+            "protected": 0,
+            "too_young": 0,
+            "invalid": 0,
+            "errors": 0,
+        },
+    )
+
+    assert victim.read_text() == "do-not-touch\n"
+    assert predictable_temporary.is_symlink()
+    assert stat.S_IMODE(status_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(status_file.parent.stat().st_mode) == 0o700
 
 
 def test_staging_grace_exceeds_all_operation_retry_and_clock_skew_windows() -> None:

@@ -1,5 +1,9 @@
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
+ARG VP_BUILD_COMMIT
+RUN printf '%s\n' "$VP_BUILD_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+LABEL org.opencontainers.image.revision=$VP_BUILD_COMMIT
+ENV VP_BUILD_COMMIT=$VP_BUILD_COMMIT
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DEBIAN_FRONTEND=noninteractive
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -25,6 +29,17 @@ RUN pip install ".[worker]" \
 COPY app /app/app
 COPY worker /app/worker
 
-RUN python -c "import importlib; [importlib.import_module(name) for name in ('app.channel_agent.worker_redis_marker_readiness_cli','app.channel_agent.worker_redis_marker_janitor_cli','app.services.worker_redis_marker_repair_cli','app.services.worker_marker_control_role_cli','app.services.worker_redis_marker_control')]"
+RUN python -c "import importlib; [importlib.import_module(name) for name in ( \
+    'app.channel_agent.staging_object_janitor_cli', \
+    'app.channel_agent.worker_redis_marker_janitor_cli', \
+    'app.channel_agent.worker_redis_marker_readiness_cli', \
+    'app.services.worker_control_role_cli', \
+    'app.services.worker_deployment_cli', \
+    'app.services.worker_marker_control_role_cli', \
+    'app.services.worker_redis_marker_control', \
+    'app.services.worker_redis_marker_repair_cli', \
+    'app.services.worker_registration_operator_cli', \
+    'app.services.worker_runtime_role_cli' \
+)]"
 
 CMD ["python", "-m", "worker.main"]

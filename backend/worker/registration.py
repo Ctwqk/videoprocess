@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from collections.abc import Mapping
 from typing import Protocol
@@ -35,6 +36,7 @@ def build_worker_registration_claims(
     env: Mapping[str, str],
     *,
     database_url: str,
+    redis_url: str,
     worker_instance_id: uuid.UUID,
 ) -> WorkerRegistrationClaims:
     service_name = _required(env, "WORKER_SERVICE_NAME")
@@ -56,6 +58,7 @@ def build_worker_registration_claims(
     )
     fingerprint_env = dict(env)
     fingerprint_env["DATABASE_URL"] = database_url
+    fingerprint_env["REDIS_URL"] = redis_url
     endpoint_bindings: dict[str, object] = {
         "database": registration_contract._database_identity(fingerprint_env),
         "redis": registration_contract._redis_identity(fingerprint_env),
@@ -64,6 +67,19 @@ def build_worker_registration_claims(
     normalized, _, fingerprints = (
         registration_contract._normalized_endpoint_bindings(endpoint_bindings)
     )
+    release_commit = _required(env, "WORKER_RELEASE_COMMIT")
+    embedded_commit = str(env.get("VP_BUILD_COMMIT", "")).strip()
+    deploy_mode = str(env.get("DEPLOY_MODE", "shared")).strip().lower()
+    if (
+        deploy_mode in {"", "shared", "production"}
+        and not embedded_commit
+    ):
+        raise WorkerRegistrationError("claim_mismatch")
+    if embedded_commit and (
+        re.fullmatch(r"[0-9a-f]{40}", embedded_commit) is None
+        or embedded_commit != release_commit
+    ):
+        raise WorkerRegistrationError("claim_mismatch")
     return WorkerRegistrationClaims(
         service_name=service_name,
         generation=generation,
@@ -73,7 +89,7 @@ def build_worker_registration_claims(
         worker_slot=worker_slot,
         redis_consumer_id=consumer_id,
         capabilities=capabilities,
-        release_commit=_required(env, "WORKER_RELEASE_COMMIT"),
+        release_commit=release_commit,
         image_identity=_required(env, "WORKER_IMAGE_IDENTITY"),
         redis_stream=redis_stream,
         redis_group=redis_group,

@@ -16,6 +16,15 @@ from app.services.worker_registration import WorkerLease, WorkerRegistrationErro
 from worker import main as worker_main
 
 
+@pytest.fixture(autouse=True)
+def _worker_redis_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_redis_url",
+        lambda _env: "redis://vp-worker:test-secret@vp-redis:6379/0",
+    )
+
+
 def execution_claim(
     job_id: uuid.UUID,
     node_execution_id: uuid.UUID,
@@ -2391,8 +2400,13 @@ async def test_main_restores_process_globals_for_repeated_in_process_runs(
     monkeypatch.setattr(worker_main, "worker_session", None)
     monkeypatch.setattr(
         worker_main,
+        "load_worker_minio_credentials",
+        lambda _env: ("worker-minio-access", "worker-minio-secret"),
+    )
+    monkeypatch.setattr(
+        worker_main,
         "enforce_worker_admission_from_env",
-        lambda: None,
+        lambda _env=None: None,
     )
     monkeypatch.setattr(
         worker_main,
@@ -2475,8 +2489,13 @@ async def test_registered_worker_requires_continuity_and_acl_identity_before_gro
 
     monkeypatch.setattr(
         worker_main,
+        "load_worker_minio_credentials",
+        lambda _env: ("worker-minio-access", "worker-minio-secret"),
+    )
+    monkeypatch.setattr(
+        worker_main,
         "enforce_worker_admission_from_env",
-        lambda: None,
+        lambda _env=None: None,
     )
     monkeypatch.setattr(
         worker_main,
@@ -2611,8 +2630,13 @@ async def test_unready_continuity_revokes_registration_before_any_redis(
 
     monkeypatch.setattr(
         worker_main,
+        "load_worker_minio_credentials",
+        lambda _env: ("worker-minio-access", "worker-minio-secret"),
+    )
+    monkeypatch.setattr(
+        worker_main,
         "enforce_worker_admission_from_env",
-        lambda: None,
+        lambda _env=None: None,
     )
     monkeypatch.setattr(
         worker_main,
@@ -2667,6 +2691,13 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
 
     monkeypatch.setattr(
         worker_main,
+        "load_worker_minio_credentials",
+        lambda env: events.append("minio-secrets")
+        or ("worker-minio-access", "worker-minio-secret"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
         "enforce_worker_admission_from_env",
         lambda env=None: events.append("admission"),
         raising=False,
@@ -2675,6 +2706,13 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
         worker_main,
         "load_worker_database_url",
         lambda env: events.append("database-secret") or "postgresql+asyncpg://worker@db/vp",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_redis_url",
+        lambda env: events.append("redis-secret")
+        or "redis://vp-worker:test-secret@vp-redis:6379/0",
         raising=False,
     )
     monkeypatch.setattr(
@@ -2696,7 +2734,9 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
         async def close(self):
             events.append("revoke")
 
-    async def register(env, database_url, admission_token):
+    async def register(env, database_url, redis_url, admission_token):
+        assert "REDIS_URL" not in env
+        assert redis_url == "redis://vp-worker:test-secret@vp-redis:6379/0"
         events.append("registration")
         return Registration()
 
@@ -2723,7 +2763,9 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
         await worker_main.main()
 
     assert events == [
+        "minio-secrets",
         "admission",
+        "redis-secret",
         "database-secret",
         "database",
         "token-secret",
@@ -2742,6 +2784,12 @@ async def test_denied_durable_registration_performs_zero_redis_calls(
     touched: list[str] = []
     credential = "postgresql+asyncpg://runtime:never-log-me@vp-postgres/vp"
 
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        lambda _env: ("worker-minio-access", "worker-minio-secret"),
+        raising=False,
+    )
     monkeypatch.setattr(
         worker_main,
         "enforce_worker_admission_from_env",
@@ -2765,7 +2813,12 @@ async def test_denied_durable_registration_performs_zero_redis_calls(
         raising=False,
     )
 
-    async def deny_registration(env, database_url, admission_token):
+    async def deny_registration(
+        env,
+        database_url,
+        redis_url,
+        admission_token,
+    ):
         raise worker_main.WorkerRegistrationError("token_invalid")
 
     monkeypatch.setattr(

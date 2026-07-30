@@ -17,8 +17,7 @@ def _publisher_env() -> dict[str, str]:
         "WORKER_HOST": "150-publisher",
         "STORAGE_BACKEND": "minio",
         "MINIO_ENDPOINT": "10.0.0.150:9000",
-        "MINIO_ACCESS_KEY": "x",
-        "MINIO_SECRET_KEY": "y",
+        **_minio_credential_files(),
         "MINIO_BUCKET": "videoprocess",
         "YOUTUBE_MANAGER_URL": "http://10.0.0.150:18999",
         "YOUTUBE_PUBLISH_ENABLED": "true",
@@ -26,8 +25,35 @@ def _publisher_env() -> dict[str, str]:
     }
 
 
+def _minio_credential_files() -> dict[str, str]:
+    return {
+        "WORKER_MINIO_ACCESS_KEY_FILE": "/run/secrets/minio-access",
+        "WORKER_MINIO_SECRET_KEY_FILE": "/run/secrets/minio-secret",
+    }
+
+
 def test_production_youtube_publisher_is_admitted_with_explicit_contract() -> None:
     assert validate_worker_admission(_publisher_env()).allowed
+
+
+def test_production_worker_rejects_minio_credentials_in_environment() -> None:
+    env = _publisher_env()
+    env.pop("WORKER_MINIO_ACCESS_KEY_FILE")
+    env.pop("WORKER_MINIO_SECRET_KEY_FILE")
+    env["MINIO_ACCESS_KEY"] = "environment-access"
+    env["MINIO_SECRET_KEY"] = "environment-secret"
+
+    decision = validate_worker_admission(env)
+
+    assert decision.allowed is False
+    assert (
+        "production youtube_publisher workers must not set MINIO_ACCESS_KEY"
+        in decision.reasons
+    )
+    assert (
+        "production youtube_publisher workers must not set MINIO_SECRET_KEY"
+        in decision.reasons
+    )
 
 
 def test_production_youtube_publisher_rejects_local_manager_url() -> None:
@@ -69,7 +95,12 @@ def test_production_youtube_publisher_rejects_ipv6_loopback_or_unspecified_manag
 
 @pytest.mark.parametrize(
     "missing_key",
-    ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET"),
+    (
+        "MINIO_ENDPOINT",
+        "WORKER_MINIO_ACCESS_KEY_FILE",
+        "WORKER_MINIO_SECRET_KEY_FILE",
+        "MINIO_BUCKET",
+    ),
 )
 def test_production_youtube_publisher_requires_each_minio_setting(missing_key: str) -> None:
     env = _publisher_env()
@@ -151,8 +182,7 @@ def test_remote_ffmpeg_worker_rejects_localhost_minio_endpoint() -> None:
             "WORKER_HOST": "150-gpu",
             "STORAGE_BACKEND": "minio",
             "MINIO_ENDPOINT": "localhost:9000",
-            "MINIO_ACCESS_KEY": "minioadmin",
-            "MINIO_SECRET_KEY": "minioadmin",
+            **_minio_credential_files(),
             "MINIO_BUCKET": "videoprocess",
         }
     )
@@ -170,8 +200,7 @@ def test_remote_ffmpeg_worker_rejects_root_qualified_localhost_minio_endpoint() 
             "WORKER_HOST": "150-gpu",
             "STORAGE_BACKEND": "minio",
             "MINIO_ENDPOINT": "localhost.:9000",
-            "MINIO_ACCESS_KEY": "minioadmin",
-            "MINIO_SECRET_KEY": "minioadmin",
+            **_minio_credential_files(),
             "MINIO_BUCKET": "videoprocess",
         }
     )
@@ -196,8 +225,7 @@ def test_remote_ffmpeg_worker_rejects_ipv6_loopback_or_unspecified_minio_endpoin
             "WORKER_HOST": "150-gpu",
             "STORAGE_BACKEND": "minio",
             "MINIO_ENDPOINT": endpoint,
-            "MINIO_ACCESS_KEY": "minioadmin",
-            "MINIO_SECRET_KEY": "minioadmin",
+            **_minio_credential_files(),
             "MINIO_BUCKET": "videoprocess",
         }
     )
@@ -215,8 +243,7 @@ def test_remote_ffmpeg_worker_with_minio_and_explicit_host_is_allowed() -> None:
             "WORKER_HOST": "150-gpu",
             "STORAGE_BACKEND": "minio",
             "MINIO_ENDPOINT": "10.0.0.150:9000",
-            "MINIO_ACCESS_KEY": "minioadmin",
-            "MINIO_SECRET_KEY": "minioadmin",
+            **_minio_credential_files(),
             "MINIO_BUCKET": "videoprocess",
         }
     )
@@ -243,7 +270,12 @@ def test_production_vision_worker_requires_same_minio_identity_as_ffmpeg() -> No
 
 @pytest.mark.parametrize(
     "missing_key",
-    ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_BUCKET"),
+    (
+        "MINIO_ENDPOINT",
+        "WORKER_MINIO_ACCESS_KEY_FILE",
+        "WORKER_MINIO_SECRET_KEY_FILE",
+        "MINIO_BUCKET",
+    ),
 )
 def test_remote_ffmpeg_worker_requires_each_minio_setting(missing_key: str) -> None:
     env = {
@@ -253,8 +285,7 @@ def test_remote_ffmpeg_worker_requires_each_minio_setting(missing_key: str) -> N
         "WORKER_HOST": "150-gpu",
         "STORAGE_BACKEND": "minio",
         "MINIO_ENDPOINT": "10.0.0.150:9000",
-        "MINIO_ACCESS_KEY": "minioadmin",
-        "MINIO_SECRET_KEY": "minioadmin",
+        **_minio_credential_files(),
         "MINIO_BUCKET": "videoprocess",
     }
     env.pop(missing_key)
@@ -278,8 +309,7 @@ def test_remote_ffmpeg_worker_rejects_all_local_minio_hosts(endpoint: str) -> No
             "WORKER_HOST": "150-gpu",
             "STORAGE_BACKEND": "minio",
             "MINIO_ENDPOINT": endpoint,
-            "MINIO_ACCESS_KEY": "minioadmin",
-            "MINIO_SECRET_KEY": "minioadmin",
+            **_minio_credential_files(),
             "MINIO_BUCKET": "videoprocess",
         }
     )
@@ -299,8 +329,7 @@ def test_production_mode_requires_explicit_worker_host_even_with_local_redis(
             "WORKER_TYPE": "ffmpeg",
             "STORAGE_BACKEND": "minio",
             "MINIO_ENDPOINT": "10.0.0.150:9000",
-            "MINIO_ACCESS_KEY": "minioadmin",
-            "MINIO_SECRET_KEY": "minioadmin",
+            **_minio_credential_files(),
             "MINIO_BUCKET": "videoprocess",
         }
     )

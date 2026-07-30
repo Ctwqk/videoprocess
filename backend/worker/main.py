@@ -69,6 +69,8 @@ from worker.secret_config import (
     WorkerSecretError,
     load_worker_admission_token,
     load_worker_database_url,
+    load_worker_minio_credentials,
+    load_worker_redis_url,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -191,12 +193,14 @@ def _redis() -> aioredis.Redis:
 async def _start_worker_registration(
     env: dict[str, str],
     database_url: str,
+    redis_url: str,
     admission_token: str,
 ) -> PythonWorkerRegistration:
     instance_id = uuid.uuid4()
     claims = build_worker_registration_claims(
         env,
         database_url=database_url,
+        redis_url=redis_url,
         worker_instance_id=instance_id,
     )
     lifecycle = PythonWorkerRegistration(
@@ -1933,18 +1937,29 @@ async def main() -> None:
     previous_worker_id = WORKER_ID
     previous_engine_db = engine_db
     previous_worker_session = worker_session
+    previous_redis_url = settings.redis_url
+    previous_minio_access_key = settings.minio_access_key
+    previous_minio_secret_key = settings.minio_secret_key
     env = dict(os.environ)
     registration: PythonWorkerRegistration | None = None
     redis: aioredis.Redis | None = None
     try:
         try:
-            enforce_worker_admission_from_env()
+            minio_access_key, minio_secret_key = (
+                load_worker_minio_credentials(env)
+            )
+            settings.minio_access_key = minio_access_key
+            settings.minio_secret_key = minio_secret_key
+            enforce_worker_admission_from_env(env)
+            redis_url = load_worker_redis_url(env)
+            settings.redis_url = redis_url
             database_url = load_worker_database_url(env)
             configure_worker_database(database_url)
             admission_token = load_worker_admission_token(env)
             registration = await _start_worker_registration(
                 env,
                 database_url,
+                redis_url,
                 admission_token,
             )
             try:
@@ -1994,6 +2009,9 @@ async def main() -> None:
                     WORKER_ID = previous_worker_id
                     engine_db = previous_engine_db
                     worker_session = previous_worker_session
+                    settings.redis_url = previous_redis_url
+                    settings.minio_access_key = previous_minio_access_key
+                    settings.minio_secret_key = previous_minio_secret_key
 
 
 if __name__ == "__main__":

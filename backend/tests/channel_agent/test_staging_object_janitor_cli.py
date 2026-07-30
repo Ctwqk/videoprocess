@@ -26,6 +26,12 @@ def _install_database_resources(
         lambda env: (engine, session_factory),
         raising=False,
     )
+    monkeypatch.setattr(
+        cli,
+        "_load_minio_credentials",
+        lambda env: None,
+        raising=False,
+    )
     return engine, session_factory
 
 
@@ -284,5 +290,52 @@ def test_database_resources_require_mode_0400_role_secret(
                 "VP_STAGING_JANITOR_DATABASE_URL_FILE": (
                     "/run/secrets/vp-staging-janitor-database-url"
                 ),
+            }
+        )
+
+
+def test_minio_credentials_require_independent_mode_0400_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads: list[tuple[str, str]] = []
+
+    def read_secret(path, *, label):
+        reads.append((path, label))
+        return {
+            "staging janitor MinIO access key": "access-secret",
+            "staging janitor MinIO secret key": "password-secret",
+        }[label]
+
+    monkeypatch.setattr(cli, "read_mode_0400_secret", read_secret)
+    cli._load_minio_credentials(
+        {
+            "VP_STAGING_JANITOR_MINIO_ACCESS_KEY_FILE": (
+                "/run/secrets/vp-staging-janitor-minio-access-key"
+            ),
+            "VP_STAGING_JANITOR_MINIO_SECRET_KEY_FILE": (
+                "/run/secrets/vp-staging-janitor-minio-secret-key"
+            ),
+        }
+    )
+
+    assert cli.settings.minio_access_key == "access-secret"
+    assert cli.settings.minio_secret_key == "password-secret"
+    assert reads == [
+        (
+            "/run/secrets/vp-staging-janitor-minio-access-key",
+            "staging janitor MinIO access key",
+        ),
+        (
+            "/run/secrets/vp-staging-janitor-minio-secret-key",
+            "staging janitor MinIO secret key",
+        ),
+    ]
+
+    with pytest.raises(RuntimeError):
+        cli._load_minio_credentials(
+            {
+                "MINIO_ACCESS_KEY": "environment-secret",
+                "VP_STAGING_JANITOR_MINIO_ACCESS_KEY_FILE": "/run/a",
+                "VP_STAGING_JANITOR_MINIO_SECRET_KEY_FILE": "/run/b",
             }
         )

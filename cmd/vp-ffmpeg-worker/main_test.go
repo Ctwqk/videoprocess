@@ -91,10 +91,9 @@ func TestWorkerStartupRegistersAndChecksContinuityBeforeRedis(t *testing.T) {
 	deps := startupDependencies{
 		loadSecrets: func(map[string]string) (worker.SecretConfig, error) {
 			calls = append(calls, "secrets")
-			return worker.SecretConfig{
-				DatabaseURL:    "postgresql://runtime:test@vp-postgres/videoprocess",
-				AdmissionToken: "redacted",
-			}, nil
+			return workerStartupTestSecrets(
+				"redis://go-worker:redis-secret@vp-redis:6379/3",
+			), nil
 		},
 		openDatabase: func(context.Context, string) (startupDatabase, error) {
 			calls = append(calls, "open_database")
@@ -168,10 +167,9 @@ func TestWorkerStartupUncertainRegistrationOrContinuityConstructsNoRedis(t *test
 			redisConstructions := 0
 			deps := startupDependencies{
 				loadSecrets: func(map[string]string) (worker.SecretConfig, error) {
-					return worker.SecretConfig{
-						DatabaseURL:    "postgresql://runtime:test@vp-postgres/videoprocess",
-						AdmissionToken: "redacted",
-					}, nil
+					return workerStartupTestSecrets(
+						"redis://go-worker:redis-secret@vp-redis:6379/3",
+					), nil
 				},
 				openDatabase: func(context.Context, string) (startupDatabase, error) {
 					return database, nil
@@ -218,10 +216,9 @@ func TestWorkerStartupRegistrationLossAfterContinuityConstructsNoRedis(
 	redisConstructions := 0
 	deps := startupDependencies{
 		loadSecrets: func(map[string]string) (worker.SecretConfig, error) {
-			return worker.SecretConfig{
-				DatabaseURL:    "postgresql://runtime:test@vp-postgres/videoprocess",
-				AdmissionToken: "redacted",
-			}, nil
+			return workerStartupTestSecrets(
+				"redis://go-worker:redis-secret@vp-redis:6379/3",
+			), nil
 		},
 		openDatabase: func(context.Context, string) (startupDatabase, error) {
 			return database, nil
@@ -276,10 +273,7 @@ func TestWorkerStartupRejectsInvalidExpectedRedisIdentityBeforeConstruction(
 				env,
 				startupDependencies{
 					loadSecrets: func(map[string]string) (worker.SecretConfig, error) {
-						return worker.SecretConfig{
-							DatabaseURL:    "postgresql://runtime:test@vp-postgres/videoprocess",
-							AdmissionToken: "redacted",
-						}, nil
+						return workerStartupTestSecrets(testCase.redisURL), nil
 					},
 					openDatabase: func(
 						context.Context,
@@ -431,7 +425,7 @@ func TestWorkerStartupRejectsMalformedProductionRedisBeforeDatabaseOpen(
 		"synthetic-admission",
 	)
 	env := workerStartupTestEnv()
-	env["REDIS_URL"] = "redis://[::1"
+	setStartupRedisCredential(t, env, "production", "redis://[::1")
 	env["WORKER_DATABASE_URL_FILE"] = databasePath
 	env["WORKER_ADMISSION_TOKEN_FILE"] = tokenPath
 	databaseOpens := 0
@@ -496,7 +490,12 @@ func TestWorkerStartupRejectsUnsafeRedisRangesInEveryModeBeforeDatabaseOpen(
 		t.Run(testCase.mode+" "+testCase.redisURL, func(t *testing.T) {
 			env := workerStartupTestEnv()
 			env["DEPLOY_MODE"] = testCase.mode
-			env["REDIS_URL"] = testCase.redisURL
+			setStartupRedisCredential(
+				t,
+				env,
+				testCase.mode,
+				testCase.redisURL,
+			)
 			env["WORKER_DATABASE_URL_FILE"] = databasePath
 			env["WORKER_ADMISSION_TOKEN_FILE"] = tokenPath
 			delete(env, "DATABASE_URL")
@@ -563,8 +562,13 @@ func TestWorkerStartupRejectsUnsafeRedisRetriesInEveryModeBeforeDatabaseOpen(
 			t.Run(mode+" "+redisQuery, func(t *testing.T) {
 				env := workerStartupTestEnv()
 				env["DEPLOY_MODE"] = mode
-				env["REDIS_URL"] = "redis://worker:synthetic@127.0.0.1:6379/14?" +
-					redisQuery
+				setStartupRedisCredential(
+					t,
+					env,
+					mode,
+					"redis://worker:synthetic@127.0.0.1:6379/14?"+
+						redisQuery,
+				)
 				env["WORKER_DATABASE_URL_FILE"] = databasePath
 				env["WORKER_ADMISSION_TOKEN_FILE"] = tokenPath
 				delete(env, "DATABASE_URL")
@@ -626,8 +630,13 @@ func TestWorkerStartupRejectsUnsafeRedisConnectionLifetimesInEveryModeBeforeData
 			t.Run(mode+" "+redisQuery, func(t *testing.T) {
 				env := workerStartupTestEnv()
 				env["DEPLOY_MODE"] = mode
-				env["REDIS_URL"] = "redis://worker:synthetic@127.0.0.1:6379/14?" +
-					redisQuery
+				setStartupRedisCredential(
+					t,
+					env,
+					mode,
+					"redis://worker:synthetic@127.0.0.1:6379/14?"+
+						redisQuery,
+				)
 				env["WORKER_DATABASE_URL_FILE"] = databasePath
 				env["WORKER_ADMISSION_TOKEN_FILE"] = tokenPath
 				delete(env, "DATABASE_URL")
@@ -743,13 +752,23 @@ func workerStartupTestEnv() map[string]string {
 		"WORKER_HOST":                 "host127",
 		"WORKER_CAPABILITIES":         "media_cpu",
 		"WORKER_RELEASE_COMMIT":       "0123456789abcdef0123456789abcdef01234567",
+		"VP_BUILD_COMMIT":             "0123456789abcdef0123456789abcdef01234567",
 		"WORKER_IMAGE_IDENTITY":       "vp-ffmpeg-go-worker:deploy-0123456789ab",
 		"WORKER_REDIS_STREAM":         "vp:tasks:ffmpeg_go",
 		"WORKER_REDIS_GROUP":          "ffmpeg_go-workers",
-		"REDIS_URL":                   "redis://go-worker:redis-secret@vp-redis:6379/3",
 		"STORAGE_BACKEND":             "minio",
 		"MINIO_ENDPOINT":              "vp-minio:9000",
 		"MINIO_BUCKET":                "videoprocess",
+	}
+}
+
+func workerStartupTestSecrets(redisURL string) worker.SecretConfig {
+	return worker.SecretConfig{
+		DatabaseURL:    "postgresql://runtime:test@vp-postgres/videoprocess",
+		AdmissionToken: "redacted",
+		RedisURL:       redisURL,
+		MinIOAccessKey: "synthetic-minio-access",
+		MinIOSecretKey: "synthetic-minio-secret",
 	}
 }
 
@@ -776,4 +795,25 @@ func writeStartupSecret(t *testing.T, name string, value string) string {
 		t.Fatalf("chmod startup secret: %v", err)
 	}
 	return path
+}
+
+func setStartupRedisCredential(
+	t *testing.T,
+	env map[string]string,
+	mode string,
+	redisURL string,
+) {
+	t.Helper()
+	switch mode {
+	case "", "shared", "production":
+		env["WORKER_REDIS_URL_FILE"] = writeStartupSecret(
+			t,
+			"redis-url",
+			redisURL,
+		)
+		delete(env, "REDIS_URL")
+	default:
+		env["REDIS_URL"] = redisURL
+		delete(env, "WORKER_REDIS_URL_FILE")
+	}
 }
