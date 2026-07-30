@@ -202,6 +202,15 @@ retirement relations are under-validated; historical four-field worker
 retirement journals have no strict v1-to-v2 hydration path.
 Task 4B/4C Deploy Track B stage 1: fix round 1/5 in progress; stage 2 remains
 blocked and no production mutation is authorized.
+Task 4B/4C Deploy Track B stage 1: fix round 1/5 at a90290b addressed
+credential-record binding, relational transaction validation, and strict v1
+retirement hydration. Three Important findings remain: legitimate production
+retirement queries still call one-shots from command-substitution children and
+are blocked by the outer lock; a signal can arrive before the pending handler
+and still allow Docker/later outer mutation; partial secret prefixes resume
+without reminting but have no deterministic exact-ID abort cleanup.
+Task 4B/4C Deploy Track B stage 1: fix round 2/5 in progress; stage 2 remains
+blocked.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
