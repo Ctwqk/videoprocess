@@ -50,6 +50,13 @@ source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
     chmod 0400 "$credential"
     credentials+=("$credential")
   done
+  credential_records="$(
+    transaction_cli validate-credentials \
+      "${credentials[0]}" "${principals[0]}" \
+      "${credentials[1]}" "${principals[1]}" \
+      "${credentials[2]}" "${principals[2]}" \
+      "${credentials[3]}" "${principals[3]}"
+  )"
 
   commit=0123456789abcdef0123456789abcdef01234567
   backend_image="vp-backend:deploy-${commit:0:12}"
@@ -59,10 +66,7 @@ source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
     "$transaction_root" 18 \
     "$commit" "$backend_image" "$go_image" "$namespace" \
     legacy_no_control \
-    "${credentials[0]}" "${principals[0]}" \
-    "${credentials[1]}" "${principals[1]}" \
-    "${credentials[2]}" "${principals[2]}" \
-    "${credentials[3]}" "${principals[3]}" \
+    <<<"$credential_records" \
     >"$TEST_ROOT/durable-core/begin.json"; then
     echo 'FAIL: durable transaction PREPARING begin is unavailable' >&2
     exit 1
@@ -120,6 +124,8 @@ principals = {
 }
 if len(identities) != 4 or len(paths) != 4 or len(principals) != 4:
     raise SystemExit("database identities are not pairwise distinct")
+if any(entry["mode"] != 0o400 for entry in credentials.values()):
+    raise SystemExit("database credential mode was not captured")
 tx_dir = root / "transactions" / document["transaction_id"]
 metadata = tx_dir.lstat()
 if (
@@ -238,10 +244,7 @@ PY
     "$transaction_root" 18 \
     "$commit" "$backend_image" "$go_image" replacement-namespace \
     legacy_no_control \
-    "${credentials[0]}" "${principals[0]}" \
-    "${credentials[1]}" "${principals[1]}" \
-    "${credentials[2]}" "${principals[2]}" \
-    "${credentials[3]}" "${principals[3]}" \
+    <<<"$credential_records" \
     >/dev/null 2>&1; then
     echo 'FAIL: active transaction allowed a new candidate namespace' >&2
     exit 1
@@ -367,6 +370,84 @@ PY
   chmod 0600 "$strict_root/transactions/active.json"
   if transaction_cli replay-plan "$strict_root" >/dev/null 2>&1; then
     echo 'FAIL: transaction reader accepted a duplicate service identity' >&2
+    exit 1
+  fi
+
+  relational_failures=0
+  for relational_case in \
+    preparing-all-promoted \
+    skipped-marker-promotion \
+    rollback-promotion-contradiction \
+    duplicate-logical-retirement; do
+    python3 - \
+      "$TEST_ROOT/durable-core/begin.json" \
+      "$strict_root/transactions/active.json" \
+      "$relational_case" <<'PY'
+import json
+import pathlib
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+case = sys.argv[3]
+if case == "preparing-all-promoted":
+    document["promotion"] = {
+        "control": True,
+        "marker": True,
+        "workers": True,
+    }
+elif case == "skipped-marker-promotion":
+    document["phase"] = "MARKER_PROMOTED"
+    document["promotion"] = {
+        "control": False,
+        "marker": False,
+        "workers": True,
+    }
+elif case == "rollback-promotion-contradiction":
+    document["phase"] = "ROLLBACK_PREPARING"
+    document["promotion"] = {
+        "control": False,
+        "marker": False,
+        "workers": True,
+    }
+elif case == "duplicate-logical-retirement":
+    document["phase"] = "FORWARD_APPLYING"
+    identity = {
+        "docker_id": "1" * 64,
+        "generation": "901",
+        "kind": "secret",
+        "name": "vp-worker-candidate",
+        "purpose": "database",
+        "service": "vp-ffmpeg-worker-go-swarm",
+        "spec_digest": None,
+    }
+    replacement = identity.copy()
+    replacement["docker_id"] = "2" * 64
+    document["pending_retirements"] = [
+        {
+            "identity": identity,
+            "retirement_id": "retirement-" + "1" * 32,
+        },
+        {
+            "identity": replacement,
+            "retirement_id": "retirement-" + "2" * 32,
+        },
+    ]
+else:
+    raise SystemExit("unknown relational schema case")
+pathlib.Path(sys.argv[2]).write_text(
+    json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+    chmod 0600 "$strict_root/transactions/active.json"
+    if transaction_cli replay-plan "$strict_root" >/dev/null 2>&1; then
+      printf 'RED: relational schema accepted %s\n' "$relational_case" >&2
+      relational_failures=$((relational_failures + 1))
+    fi
+  done
+  if [[ "$relational_failures" -ne 0 ]]; then
+    echo "FAIL: relational schema accepted $relational_failures contradictions" >&2
     exit 1
   fi
 )

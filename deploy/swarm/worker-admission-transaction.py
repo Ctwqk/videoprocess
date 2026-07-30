@@ -51,6 +51,25 @@ PHASES = {
     "CANDIDATE_RESTORED",
     "DONE",
 }
+PROMOTION_BY_PHASE = {
+    "PREPARING": (False, False, False),
+    "FORWARD_APPLYING": (False, False, False),
+    "FORWARD_VERIFIED": (False, False, False),
+    "WORKERS_PROMOTED": (True, False, False),
+    "MARKER_PROMOTED": (True, True, False),
+    "CONTROL_PROMOTED": (True, True, True),
+    "RETIRING": (True, True, True),
+    "ROLLBACK_PREPARING": (False, False, False),
+    "ROLLBACK_APPLYING": (False, False, False),
+    "ROLLBACK_VERIFIED": (False, False, False),
+    "ROLLBACK_WORKERS_PROMOTED": (True, False, False),
+    "ROLLBACK_MARKER_PROMOTED": (True, True, False),
+    "ROLLBACK_CONTROL_PROMOTED": (True, True, True),
+    "CANDIDATE_RESTORE_REQUIRED": (False, False, False),
+    "CANDIDATE_RESTORING": (False, False, False),
+    "CANDIDATE_RESTORED": (False, False, False),
+    "DONE": (True, True, True),
+}
 LEGAL_TRANSITIONS = {
     "PREPARING": {"FORWARD_APPLYING", "ROLLBACK_PREPARING"},
     "FORWARD_APPLYING": {"FORWARD_VERIFIED", "ROLLBACK_PREPARING"},
@@ -128,6 +147,7 @@ TOP_LEVEL_FIELDS = {
     "created_at",
     "database_credentials",
     "runtime_redis",
+    "prepared_secrets",
     "baseline",
     "failed_forward",
     "forward",
@@ -389,7 +409,7 @@ def _read_limited(descriptor: int) -> bytes:
     return payload
 
 
-def _validate_database_credentials(value: object) -> None:
+def _validate_database_credentials(value: object) -> dict[str, Any]:
     credentials = _require_exact_fields(value, set(DATABASE_PURPOSES))
     paths: set[str] = set()
     identities: set[tuple[int, int]] = set()
@@ -401,12 +421,15 @@ def _validate_database_credentials(value: object) -> None:
                 "canonical_path",
                 "device",
                 "inode",
+                "mode",
                 "expected_principal",
             },
         )
         path = _require_string(entry["canonical_path"], r"/[^\r\n]{0,4094}", maximum=4095)
         device = _require_integer(entry["device"])
         inode = _require_integer(entry["inode"], 1)
+        if entry["mode"] != CREDENTIAL_MODE:
+            raise TransactionError
         principal = _require_string(
             entry["expected_principal"],
             r"[A-Za-z_][A-Za-z0-9_.$@-]{0,127}",
@@ -417,6 +440,7 @@ def _validate_database_credentials(value: object) -> None:
         paths.add(path)
         identities.add((device, inode))
         principals.add(principal)
+    return credentials
 
 
 def _validate_secret_ref(value: object) -> None:
@@ -759,6 +783,8 @@ def _validate_document(value: object) -> dict[str, Any]:
         runtime_secret_names.add(entry["secret_name"])
         runtime_secret_ids.add(entry["docker_secret_id"])
 
+    _validate_secret_refs(document["prepared_secrets"])
+
     baseline = _require_exact_fields(
         document["baseline"],
         {"kind", "control", "services"},
@@ -805,9 +831,11 @@ def _validate_document(value: object) -> dict[str, Any]:
     )
     if any(not isinstance(promotion[key], bool) for key in promotion):
         raise TransactionError
-    if promotion["control"] and not promotion["marker"]:
-        raise TransactionError
-    if promotion["marker"] and not promotion["workers"]:
+    if (
+        promotion["workers"],
+        promotion["marker"],
+        promotion["control"],
+    ) != PROMOTION_BY_PHASE[document["phase"]]:
         raise TransactionError
 
     retirements = document["pending_retirements"]
@@ -815,6 +843,7 @@ def _validate_document(value: object) -> dict[str, Any]:
         raise TransactionError
     retirement_ids: set[str] = set()
     docker_ids: set[str] = set()
+    logical_keys: set[tuple[str, str, str, str, str]] = set()
     for item in retirements:
         retirement = _require_exact_fields(
             item,
@@ -827,11 +856,19 @@ def _validate_document(value: object) -> dict[str, Any]:
         )
         identity = _validate_identity(retirement["identity"])
         docker_id = identity["docker_id"]
+        logical_key = (
+            identity["service"],
+            identity["generation"],
+            identity["kind"],
+            identity["purpose"],
+            identity["name"],
+        )
         if retirement_id in retirement_ids or (
             docker_id is not None and docker_id in docker_ids
-        ):
+        ) or logical_key in logical_keys:
             raise TransactionError
         retirement_ids.add(retirement_id)
+        logical_keys.add(logical_key)
         if docker_id is not None:
             docker_ids.add(docker_id)
 
@@ -1037,6 +1074,7 @@ def _capture_credential(raw_path: str, expected_principal: str) -> dict[str, Any
         "canonical_path": str(canonical),
         "device": metadata.st_dev,
         "inode": metadata.st_ino,
+        "mode": stat.S_IMODE(metadata.st_mode),
         "expected_principal": principal,
     }
 
@@ -1051,6 +1089,28 @@ def _capture_credentials(arguments: list[str]) -> dict[str, dict[str, Any]]:
             arguments[index * 2 + 1],
         )
     _validate_database_credentials(credentials)
+    return credentials
+
+
+def _read_captured_credentials() -> dict[str, Any]:
+    payload = sys.stdin.buffer.read(MAX_DOCUMENT_BYTES + 1)
+    if len(payload) > MAX_DOCUMENT_BYTES:
+        raise TransactionError
+    return _validate_database_credentials(_decode_canonical(payload))
+
+
+def _verify_captured_credentials(
+    credentials: dict[str, Any],
+) -> dict[str, Any]:
+    _validate_database_credentials(credentials)
+    for purpose in DATABASE_PURPOSES:
+        expected = credentials[purpose]
+        captured = _capture_credential(
+            expected["canonical_path"],
+            expected["expected_principal"],
+        )
+        if captured != expected:
+            raise TransactionError
     return credentials
 
 
@@ -1100,7 +1160,7 @@ def prepare_lock(raw_root: str) -> None:
     print(root / LOCK_NAME)
 
 
-def acquire_lock(raw_root: str, raw_descriptor: str) -> None:
+def acquire_lock(raw_root: str, raw_descriptor: str) -> str:
     _root, root_descriptor = _open_admission_root(raw_root)
     try:
         try:
@@ -1131,6 +1191,7 @@ def acquire_lock(raw_root: str, raw_descriptor: str) -> None:
         _require_lock(verified)
         if _identity(opened) != _identity(verified):
             raise TransactionError
+        return f"{opened.st_dev}:{opened.st_ino}"
     finally:
         os.close(root_descriptor)
 
@@ -1188,6 +1249,7 @@ def _new_document(
         "created_at": created_at,
         "database_credentials": credentials,
         "runtime_redis": {},
+        "prepared_secrets": [],
         "baseline": {
             "kind": baseline_kind,
             "control": None,
@@ -1219,7 +1281,7 @@ def _new_document(
 
 
 def begin(arguments: list[str]) -> None:
-    if len(arguments) != 15:
+    if len(arguments) != 7:
         raise TransactionError
     (
         raw_root,
@@ -1229,10 +1291,11 @@ def begin(arguments: list[str]) -> None:
         target_go_image,
         namespace,
         baseline_kind,
-        *credential_arguments,
     ) = arguments
     _require_writer_lock(raw_root, raw_lock_descriptor)
-    credentials = _capture_credentials(credential_arguments)
+    credentials = _verify_captured_credentials(
+        _read_captured_credentials()
+    )
     document = _new_document(
         target_commit=target_commit,
         target_backend_image=target_backend_image,
@@ -1280,7 +1343,7 @@ def begin(arguments: list[str]) -> None:
 
 
 def verify_preparing(arguments: list[str]) -> None:
-    if len(arguments) != 13:
+    if len(arguments) != 5:
         raise TransactionError
     (
         raw_root,
@@ -1288,10 +1351,11 @@ def verify_preparing(arguments: list[str]) -> None:
         target_commit,
         target_backend_image,
         target_go_image,
-        *credential_arguments,
     ) = arguments
     _require_writer_lock(raw_root, raw_lock_descriptor)
-    credentials = _capture_credentials(credential_arguments)
+    credentials = _verify_captured_credentials(
+        _read_captured_credentials()
+    )
     _root, root_descriptor, transactions_descriptor = _open_transactions(
         raw_root,
         create=False,
@@ -1319,6 +1383,20 @@ def verify_preparing(arguments: list[str]) -> None:
 def validate_credentials(arguments: list[str]) -> None:
     credentials = _capture_credentials(arguments)
     _print_json(credentials)
+
+
+def verify_credential_record(arguments: list[str]) -> None:
+    if len(arguments) != 3:
+        raise TransactionError
+    purpose, raw_path, expected_principal = arguments
+    if purpose not in DATABASE_PURPOSES:
+        raise TransactionError
+    credentials = _read_captured_credentials()
+    expected = credentials[purpose]
+    captured = _capture_credential(raw_path, expected_principal)
+    if captured != expected:
+        raise TransactionError
+    print(expected["canonical_path"])
 
 
 def verify_credential(arguments: list[str]) -> None:
@@ -1350,6 +1428,124 @@ def verify_credential(arguments: list[str]) -> None:
         os.close(transactions_descriptor)
         os.close(root_descriptor)
     print(captured["canonical_path"])
+
+
+def _prepared_secret_reference(arguments: list[str]) -> dict[str, str]:
+    if len(arguments) != 5:
+        raise TransactionError
+    name, docker_secret_id, service, generation, purpose = arguments
+    reference = {
+        "name": name,
+        "docker_secret_id": docker_secret_id,
+        "service": service,
+        "generation": generation,
+        "purpose": purpose,
+    }
+    _validate_secret_ref(reference)
+    return reference
+
+
+def record_prepared_secret(arguments: list[str]) -> None:
+    if len(arguments) != 7:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, *reference_arguments = arguments
+    reference = _prepared_secret_reference(reference_arguments)
+
+    def updater(document: dict[str, Any]) -> None:
+        if document["phase"] != "PREPARING":
+            raise TransactionError
+        logical_key = (
+            reference["name"],
+            reference["service"],
+            reference["generation"],
+            reference["purpose"],
+        )
+        for existing in document["prepared_secrets"]:
+            existing_key = (
+                existing["name"],
+                existing["service"],
+                existing["generation"],
+                existing["purpose"],
+            )
+            if existing == reference:
+                return
+            if (
+                existing["name"] == reference["name"]
+                or existing["docker_secret_id"]
+                == reference["docker_secret_id"]
+                or existing_key == logical_key
+            ):
+                raise TransactionError
+        document["prepared_secrets"].append(reference)
+
+    _require_writer_lock(raw_root, raw_lock_descriptor)
+    _root, root_descriptor, transactions_descriptor = _open_transactions(
+        raw_root,
+        create=False,
+    )
+    try:
+        document, _active_identity = _read_active_from_descriptor(
+            transactions_descriptor,
+            allow_missing=False,
+        )
+        if document is None:
+            raise TransactionError
+        revision = document["revision"]
+    finally:
+        os.close(transactions_descriptor)
+        os.close(root_descriptor)
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        str(revision),
+        updater,
+    )
+    _print_json(document)
+
+
+def lookup_prepared_secret(arguments: list[str]) -> None:
+    if len(arguments) != 6:
+        raise TransactionError
+    (
+        raw_root,
+        raw_lock_descriptor,
+        name,
+        service,
+        generation,
+        purpose,
+    ) = arguments
+    _require_string(name, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
+    _require_string(service, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
+    _require_string(generation, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+    _require_string(purpose, r"[a-z][a-z0-9_-]{0,63}", maximum=64)
+    _require_writer_lock(raw_root, raw_lock_descriptor)
+    _root, root_descriptor, transactions_descriptor = _open_transactions(
+        raw_root,
+        create=False,
+    )
+    try:
+        document, _active_identity = _read_active_from_descriptor(
+            transactions_descriptor,
+            allow_missing=False,
+        )
+        if document is None or document["phase"] != "PREPARING":
+            raise TransactionError
+        matches = [
+            reference
+            for reference in document["prepared_secrets"]
+            if (
+                reference["name"] == name
+                and reference["service"] == service
+                and reference["generation"] == generation
+                and reference["purpose"] == purpose
+            )
+        ]
+        if len(matches) > 1:
+            raise TransactionError
+    finally:
+        os.close(transactions_descriptor)
+        os.close(root_descriptor)
+    print(matches[0]["docker_secret_id"] if matches else "-")
 
 
 def _set_phase(document: dict[str, Any], target_phase: str, outcome: str | None) -> None:
@@ -1699,6 +1895,9 @@ def main(arguments: list[str]) -> int:
     if len(arguments) == 3 and arguments[0] == "lock-acquire":
         acquire_lock(arguments[1], arguments[2])
         return 0
+    if len(arguments) == 3 and arguments[0] == "lock-token":
+        print(acquire_lock(arguments[1], arguments[2]))
+        return 0
     if arguments and arguments[0] == "begin":
         begin(arguments[1:])
         return 0
@@ -1708,8 +1907,17 @@ def main(arguments: list[str]) -> int:
     if arguments and arguments[0] == "validate-credentials":
         validate_credentials(arguments[1:])
         return 0
+    if arguments and arguments[0] == "verify-credential-record":
+        verify_credential_record(arguments[1:])
+        return 0
     if arguments and arguments[0] == "verify-credential":
         verify_credential(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-prepared-secret":
+        record_prepared_secret(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "lookup-prepared-secret":
+        lookup_prepared_secret(arguments[1:])
         return 0
     if arguments and arguments[0] == "transition":
         transition(arguments[1:])

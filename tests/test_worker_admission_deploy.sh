@@ -319,7 +319,9 @@ for signal_case in HUP:129 INT:130; do
   printf '%s\n' 'caller-signal-credential' >"$secret"
   chmod 0400 "$secret"
   caller_trap_ran="$probe_root/caller-trap-ran"
-  signal_target_pid="$(sh -c 'printf "%s\n" "$PPID"')"
+  signal_target_pid="$(
+    exec sh -c 'printf "%s\n" "$PPID"'
+  )"
   export signal_target_pid
 
   docker() {
@@ -462,6 +464,95 @@ done
 )
 
 (
+  probe_root="$TEST_ROOT/outer-lock-inherited-overlap"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  nested_status_file="$probe_root/nested-status"
+  second_docker_entered="$probe_root/second-docker-entered"
+  first_identity_survived="$probe_root/first-identity-survived"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+
+  vp_validate_deploy_config() {
+    vp_worker_admission_lock_assert
+  }
+  vp_worker_admission_prepare_transaction() {
+    vp_worker_admission_lock_assert
+    VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+  }
+  _vp_deploy_vp_app_services_locked() {
+    vp_worker_admission_lock_assert
+    vp_run_python_worker_container \
+      synthetic-image - - /runtime-state \
+      --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+      -- /bin/true
+    [[ "$VP_WORKER_ADMISSION_LOCK_DEPTH" -eq 1 ]]
+  }
+  docker() {
+    if [[ "${VP_INHERITED_LOCK_PROBE_NESTED:-false}" == true ]]; then
+      : >"$second_docker_entered"
+      return 0
+    fi
+    local first_record
+    local first_sentinel
+    first_record="$(
+      find "$admission_root/one-shot-operations" \
+        -type d -name 'op.*' -print -quit 2>/dev/null || true
+    )"
+    first_sentinel="$(
+      find "$bind_source" \
+        -type f -name '.vp-python-worker-bind-*' \
+        -print -quit 2>/dev/null || true
+    )"
+    [[ -n "$first_record" && -n "$first_sentinel" ]] || return 91
+    export VP_INHERITED_LOCK_PROBE_NESTED=true
+    set +e
+    vp_run_python_worker_container \
+      synthetic-image - - /runtime-state \
+      --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+      -- /bin/true >/dev/null 2>&1
+    local nested_status=$?
+    set -e
+    printf '%s\n' "$nested_status" >"$nested_status_file"
+    if [[ -f "$first_record/operation.json" \
+      && -f "$first_sentinel" ]]; then
+      : >"$first_identity_survived"
+    fi
+    return 0
+  }
+
+  set +e
+  deploy_vp_app_services a b synthetic-image d e f \
+    >/dev/null 2>&1
+  outer_status=$?
+  set -e
+  if [[ ! -f "$nested_status_file" \
+    || "$(<"$nested_status_file")" -eq 0 ]]; then
+    echo 'FAIL: inherited child was accepted as the outer lock owner' >&2
+    exit 1
+  fi
+  if [[ -e "$second_docker_entered" ]]; then
+    echo 'FAIL: inherited child reached a second Docker mutation' >&2
+    exit 1
+  fi
+  if [[ ! -e "$first_identity_survived" ]]; then
+    echo 'FAIL: inherited child reconciled the first live operation' >&2
+    exit 1
+  fi
+  if [[ "$outer_status" -ne 0 ]]; then
+    echo 'FAIL: inherited overlap misreported the first operation' >&2
+    exit 1
+  fi
+  if [[ "$VP_WORKER_ADMISSION_LOCK_HELD" != false \
+    || "$VP_WORKER_ADMISSION_LOCK_DEPTH" -ne 0 ]]; then
+    echo 'FAIL: outer deploy did not release its transaction lock' >&2
+    exit 1
+  fi
+)
+
+(
   probe_root="$TEST_ROOT/one-shot-sigterm"
   ROOT="$probe_root/sync"
   REPO_ROOT="$probe_root/repos"
@@ -550,7 +641,9 @@ done
   printf '%s\n' 'caller-trap-credential' >"$secret"
   chmod 0400 "$secret"
   caller_trap_ran="$probe_root/caller-trap-ran"
-  signal_target_pid="$(sh -c 'printf "%s\n" "$PPID"')"
+  signal_target_pid="$(
+    exec sh -c 'printf "%s\n" "$PPID"'
+  )"
   export signal_target_pid
 
   docker() {
@@ -588,6 +681,139 @@ done
     exit 1
   fi
 )
+
+(
+  probe_root="$TEST_ROOT/one-shot-post-spawn-term"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  secret="$probe_root/secret"
+  signal_forwarded="$probe_root/signal-forwarded"
+  signal_timed_out="$probe_root/signal-timed-out"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  printf '%s\n' 'post-spawn-credential' >"$secret"
+  chmod 0400 "$secret"
+  signal_target_pid="$(
+    exec sh -c 'printf "%s\n" "$PPID"'
+  )"
+  kill() {
+    if [[ "${1:-}" == -TERM \
+      && "${2:-}" != "$signal_target_pid" ]]; then
+      : >"$signal_forwarded"
+    fi
+    builtin kill "$@"
+  }
+
+  docker() {
+    trap 'exit 143' TERM
+    for _attempt in $(seq 1 40); do
+      sleep 0.05
+    done
+    : >"$signal_timed_out"
+    return 97
+  }
+
+  set -T
+  trap '
+    if [[ "$BASH_COMMAND" == "VP_PYTHON_WORKER_ACTIVE_CHILD_PID=\$!" ]]; then
+      trap - DEBUG
+      builtin kill -TERM "$signal_target_pid"
+    fi
+  ' DEBUG
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image "$secret" synthetic-secret /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1
+  operation_status=$?
+  set -e
+  trap - DEBUG
+  set +T
+  if [[ "$operation_status" -ne 143 ]]; then
+    echo "FAIL: post-spawn TERM returned $operation_status instead of 143" >&2
+    exit 1
+  fi
+  if [[ ! -e "$signal_forwarded" || -e "$signal_timed_out" ]]; then
+    echo 'FAIL: post-spawn TERM was not forwarded after PID publication' >&2
+    exit 1
+  fi
+  if compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null \
+    || compgen -G "$admission_root/one-shot-operations/op.*" >/dev/null; then
+    echo 'FAIL: post-spawn TERM retained one-shot identity state' >&2
+    exit 1
+  fi
+)
+
+for signal_case in HUP:129 INT:130 TERM:143; do
+(
+  signal_name="${signal_case%%:*}"
+  expected_status="${signal_case##*:}"
+  probe_root="$TEST_ROOT/outer-deploy-signal-$signal_name"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/control-state"
+  caller_trap_ran="$probe_root/caller-trap-ran"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  signal_target_pid="$(
+    exec sh -c 'printf "%s\n" "$PPID"'
+  )"
+  export signal_target_pid
+
+  docker() {
+    kill "-$signal_name" "$signal_target_pid"
+    return "$expected_status"
+  }
+  vp_validate_deploy_config() {
+    vp_worker_admission_lock_assert
+  }
+  vp_worker_admission_prepare_transaction() {
+    vp_worker_admission_lock_assert
+    VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+  }
+  vp_worker_admission_prepare_control_roles() {
+    vp_run_python_worker_container \
+      synthetic-image - - /control-state \
+      --mount "type=bind,src=$bind_source,dst=/control-state" \
+      -- /bin/true >/dev/null || return 1
+  }
+  _vp_deploy_vp_app_services_locked() {
+    vp_worker_admission_prepare_control_roles || return 1
+  }
+
+  trap 'printf "caller\n" >"$caller_trap_ran"' HUP
+  trap 'printf "caller\n" >"$caller_trap_ran"' INT
+  trap 'printf "caller\n" >"$caller_trap_ran"' TERM
+  caller_hup_trap="$(trap -p HUP)"
+  caller_int_trap="$(trap -p INT)"
+  caller_term_trap="$(trap -p TERM)"
+
+  set +e
+  deploy_vp_app_services a b synthetic-image d e f \
+    >/dev/null 2>&1
+  deploy_status=$?
+  set -e
+  if [[ "$deploy_status" -ne "$expected_status" ]]; then
+    echo "FAIL: outer $signal_name returned $deploy_status instead of $expected_status" >&2
+    exit 1
+  fi
+  if [[ -e "$caller_trap_ran" \
+    || "$(trap -p HUP)" != "$caller_hup_trap" \
+    || "$(trap -p INT)" != "$caller_int_trap" \
+    || "$(trap -p TERM)" != "$caller_term_trap" ]]; then
+    echo "FAIL: outer $signal_name did not preserve caller traps" >&2
+    exit 1
+  fi
+  if compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null \
+    || compgen -G "$admission_root/one-shot-operations/op.*" >/dev/null; then
+    echo "FAIL: outer $signal_name retained nested control-role state" >&2
+    exit 1
+  fi
+)
+done
 
 VP_WORKER_ADMISSION_COMMIT=0123456789abcdef0123456789abcdef01234567
 VP_WORKER_FFMPEG_GO_GENERATION=101
@@ -914,6 +1140,128 @@ assert_worker_contract \
   fi
 )
 
+(
+  retirement_service=vp-ffmpeg-worker-go-swarm
+  retirement_generation=811
+  retirement_database_name=stale-db-811
+  retirement_admission_name=stale-admission-811
+  retirement_database_id=5123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  retirement_admission_id=6123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  RETIREMENT_HYDRATION_MODE=match
+  RETIREMENT_HYDRATION_CALLS="$TEST_ROOT/v1-retirement-hydration-calls"
+  RETIREMENT_HYDRATION_JOURNAL=""
+  : >"$RETIREMENT_HYDRATION_CALLS"
+
+  docker() {
+    printf '%s|%s|%s\n' \
+      "${1:-}" "${2:-}" "${3:-}" >>"$RETIREMENT_HYDRATION_CALLS"
+    if [[ "${1:-} ${2:-}" == "secret inspect" ]]; then
+      case "${3:-}" in
+        "$retirement_database_name")
+          local service="$retirement_service"
+          local generation="$retirement_generation"
+          if [[ "$RETIREMENT_HYDRATION_MODE" == wrong-label ]]; then
+            service=unrelated-service
+          elif [[ "$RETIREMENT_HYDRATION_MODE" == replacement ]]; then
+            generation=999
+          fi
+          printf '%s|%s|%s|%s|%s\n' \
+            "$retirement_database_id" "$retirement_database_name" \
+            "$service" "$generation" database
+          ;;
+        "$retirement_admission_name")
+          local admission_id="$retirement_admission_id"
+          if [[ "$RETIREMENT_HYDRATION_MODE" == duplicate-id ]]; then
+            admission_id="$retirement_database_id"
+          fi
+          printf '%s|%s|%s|%s|%s\n' \
+            "$admission_id" "$retirement_admission_name" \
+            "$retirement_service" "$retirement_generation" admission
+          ;;
+        "$retirement_database_id")
+          printf '%s|%s|%s|%s|%s\n' \
+            "$retirement_database_id" "$retirement_database_name" \
+            "$retirement_service" "$retirement_generation" database
+          ;;
+        "$retirement_admission_id")
+          printf '%s|%s|%s|%s|%s\n' \
+            "$retirement_admission_id" "$retirement_admission_name" \
+            "$retirement_service" "$retirement_generation" admission
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      return 0
+    fi
+    [[ "${1:-} ${2:-}" == "secret rm" ]] || return 97
+  }
+  vp_worker_admission_retire_generation() {
+    local expected_records="$retirement_service|$retirement_generation|$retirement_database_name|$retirement_database_id|$retirement_admission_name|$retirement_admission_id"
+    [[ -f "$RETIREMENT_HYDRATION_JOURNAL" \
+      && "$(<"$RETIREMENT_HYDRATION_JOURNAL")" == "$expected_records" ]] \
+      || return 1
+    vp_remove_managed_secret \
+      "$4" "$3" "$1" "$2" database || return 1
+    vp_remove_managed_secret \
+      "$6" "$5" "$1" "$2" admission
+  }
+
+  for RETIREMENT_HYDRATION_MODE in \
+    wrong-label replacement duplicate-id; do
+    failure_root="$TEST_ROOT/v1-retirement-$RETIREMENT_HYDRATION_MODE"
+    failure_journal="$failure_root/retirements/legacy.records"
+    legacy_record="$retirement_service|$retirement_generation|$retirement_database_name|$retirement_admission_name"
+    vp_worker_admission_write_retirement_journal \
+      "$failure_journal" "$legacy_record"
+    before_failure_journal="$(shasum -a 256 "$failure_journal")"
+    : >"$RETIREMENT_HYDRATION_CALLS"
+    RETIREMENT_HYDRATION_JOURNAL="$failure_journal"
+    if vp_worker_admission_process_retirement_journals \
+      "$failure_root" >/dev/null 2>&1; then
+      echo "FAIL: v1 retirement accepted $RETIREMENT_HYDRATION_MODE identity" >&2
+      exit 1
+    fi
+    [[ "$(shasum -a 256 "$failure_journal")" == \
+      "$before_failure_journal" ]]
+    if grep -Fq 'secret|rm|' "$RETIREMENT_HYDRATION_CALLS"; then
+      echo 'FAIL: invalid v1 retirement reached secret removal' >&2
+      exit 1
+    fi
+    [[ "$(grep -Fc "secret|inspect|$retirement_database_name" \
+      "$RETIREMENT_HYDRATION_CALLS")" -eq 1 ]]
+    if [[ "$RETIREMENT_HYDRATION_MODE" == duplicate-id ]]; then
+      [[ "$(grep -Fc "secret|inspect|$retirement_admission_name" \
+        "$RETIREMENT_HYDRATION_CALLS")" -eq 1 ]]
+    else
+      [[ "$(grep -Fc "secret|inspect|$retirement_admission_name" \
+        "$RETIREMENT_HYDRATION_CALLS")" -eq 0 ]]
+    fi
+  done
+
+  valid_root="$TEST_ROOT/v1-retirement-valid"
+  valid_journal="$valid_root/retirements/legacy.records"
+  legacy_record="$retirement_service|$retirement_generation|$retirement_database_name|$retirement_admission_name"
+  vp_worker_admission_write_retirement_journal \
+    "$valid_journal" "$legacy_record"
+  RETIREMENT_HYDRATION_MODE=match
+  RETIREMENT_HYDRATION_JOURNAL="$valid_journal"
+  : >"$RETIREMENT_HYDRATION_CALLS"
+  if ! vp_worker_admission_process_retirement_journals "$valid_root"; then
+    echo 'FAIL: valid v1 retirement journal did not recover' >&2
+    exit 1
+  fi
+  [[ ! -e "$valid_journal" ]]
+  [[ "$(grep -Fc "secret|inspect|$retirement_database_name" \
+    "$RETIREMENT_HYDRATION_CALLS")" -eq 1 ]]
+  [[ "$(grep -Fc "secret|inspect|$retirement_admission_name" \
+    "$RETIREMENT_HYDRATION_CALLS")" -eq 1 ]]
+  [[ "$(grep -Fc "secret|rm|$retirement_database_id" \
+    "$RETIREMENT_HYDRATION_CALLS")" -eq 1 ]]
+  [[ "$(grep -Fc "secret|rm|$retirement_admission_id" \
+    "$RETIREMENT_HYDRATION_CALLS")" -eq 1 ]]
+)
+
 DOCKER_SECRET_PAYLOAD="$TEST_ROOT/docker-secret-payload"
 DOCKER_SECRET_CREATED="$TEST_ROOT/docker-secret-created"
 DOCKER_SECRET_ID=2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
@@ -948,6 +1296,236 @@ chmod 0400 "$credential_file"
 vp_worker_admission_create_secret \
   test-secret "$credential_file" test-service 105 database
 grep -Fxq "credential-material" "$DOCKER_SECRET_PAYLOAD"
+
+(
+  partial_root="$TEST_ROOT/partial-secret-journal"
+  ROOT="$partial_root/sync"
+  REPO_ROOT="$partial_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  secret_state="$partial_root/secrets"
+  secret_calls="$partial_root/secret-calls"
+  fail_second="$partial_root/fail-second"
+  mkdir -p "$admission_root" "$secret_state"
+  chmod 0700 "$admission_root"
+  : >"$secret_calls"
+  : >"$fail_second"
+
+  partial_credentials=()
+  partial_principals=(
+    vp_deploy_migrator
+    vp_deploy_read
+    vp_control_role_owner
+    vp_runtime_role_owner
+  )
+  for purpose in \
+    deploy-migrator deploy-read control-owner runtime-owner; do
+    credential="$partial_root/$purpose"
+    printf 'postgresql://identity:credential@database/videoprocess\n' \
+      >"$credential"
+    chmod 0400 "$credential"
+    partial_credentials+=("$credential")
+  done
+  credential_records="$(
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      validate-credentials \
+      "${partial_credentials[0]}" "${partial_principals[0]}" \
+      "${partial_credentials[1]}" "${partial_principals[1]}" \
+      "${partial_credentials[2]}" "${partial_principals[2]}" \
+      "${partial_credentials[3]}" "${partial_principals[3]}"
+  )"
+  vp_worker_admission_lock_acquire "$admission_root"
+  partial_commit=0123456789abcdef0123456789abcdef01234567
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "$partial_commit" \
+    vp-backend:deploy-0123456789ab \
+    vp-ffmpeg-worker-go:deploy-0123456789ab \
+    "$partial_commit" legacy_no_control \
+    <<<"$credential_records" >/dev/null
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+
+  first_secret=vp-wr-ffmpeg-go-db-901
+  first_secret_id=1111111111111111111111111111111111111111111111111111111111111111
+  second_secret=vp-wr-ffmpeg-go-admission-901
+  second_secret_id=2222222222222222222222222222222222222222222222222222222222222222
+  first_payload="$partial_root/first-payload"
+  second_payload="$partial_root/second-payload"
+  printf 'first-secret-material\n' >"$first_payload"
+  printf 'second-secret-material\n' >"$second_payload"
+  chmod 0400 "$first_payload" "$second_payload"
+
+  docker() {
+    if [[ "${1:-} ${2:-}" == "secret inspect" ]]; then
+      local reference="${3:-}"
+      printf 'inspect|%s\n' "$reference" >>"$secret_calls"
+      local state
+      for state in "$secret_state"/*; do
+        [[ -f "$state" ]] || continue
+        local saved_id
+        local saved_name
+        local saved_service
+        local saved_generation
+        local saved_purpose
+        IFS='|' read -r \
+          saved_id saved_name saved_service \
+          saved_generation saved_purpose <"$state"
+        if [[ "$reference" == "$saved_id" \
+          || "$reference" == "$saved_name" ]]; then
+          printf '%s|%s|%s|%s|%s\n' \
+            "$saved_id" "$saved_name" "$saved_service" \
+            "$saved_generation" "$saved_purpose"
+          return 0
+        fi
+      done
+      return 1
+    fi
+    if [[ "${1:-} ${2:-}" == "secret create" ]]; then
+      shift 2
+      local service=""
+      local generation=""
+      local purpose=""
+      while [[ "$#" -gt 0 && "$1" == --label ]]; do
+        case "$2" in
+          vp.service=*) service="${2#*=}" ;;
+          vp.generation=*) generation="${2#*=}" ;;
+          vp.purpose=*) purpose="${2#*=}" ;;
+          *) return 1 ;;
+        esac
+        shift 2
+      done
+      [[ "$#" -eq 2 && "$2" == - \
+        && -n "$service" && -n "$generation" && -n "$purpose" ]] \
+        || return 1
+      local name="$1"
+      cat >/dev/null
+      printf 'create|%s\n' "$name" >>"$secret_calls"
+      if [[ "$name" == "$second_secret" && -e "$fail_second" ]]; then
+        return 1
+      fi
+      local secret_id="$first_secret_id"
+      if [[ "$name" == "$second_secret" ]]; then
+        secret_id="$second_secret_id"
+      fi
+      printf '%s|%s|%s|%s|%s\n' \
+        "$secret_id" "$name" "$service" "$generation" "$purpose" \
+        >"$secret_state/$name"
+      printf '%s\n' "$secret_id"
+      return 0
+    fi
+    return 97
+  }
+
+  vp_worker_admission_create_secret \
+    "$first_secret" "$first_payload" \
+    vp-ffmpeg-worker-go-swarm 901 database
+  if vp_worker_admission_create_secret \
+    "$second_secret" "$second_payload" \
+    vp-ffmpeg-worker-go-swarm 901 admission \
+    >/dev/null 2>&1; then
+    echo 'FAIL: partial secret fixture did not fail its second create' >&2
+    exit 1
+  fi
+  active="$admission_root/transactions/active.json"
+  if ! python3 - "$active" "$first_secret" "$first_secret_id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    transaction = json.load(handle)
+if transaction["prepared_secrets"] != [
+    {
+        "docker_secret_id": sys.argv[3],
+        "generation": "901",
+        "name": sys.argv[2],
+        "purpose": "database",
+        "service": "vp-ffmpeg-worker-go-swarm",
+    }
+]:
+    raise SystemExit(1)
+PY
+  then
+    echo 'FAIL: first immutable secret ID was not durably journaled' >&2
+    exit 1
+  fi
+
+  : >"$secret_calls"
+  vp_worker_admission_create_secret \
+    "$first_secret" "$first_payload" \
+    vp-ffmpeg-worker-go-swarm 901 database
+  grep -Fxq "inspect|$first_secret_id" "$secret_calls"
+  if grep -Fxq "inspect|$first_secret" "$secret_calls" \
+    || grep -Fxq "create|$first_secret" "$secret_calls"; then
+    echo 'FAIL: partial secret resume guessed by name or minted again' >&2
+    exit 1
+  fi
+
+  rm -f "$fail_second"
+  vp_worker_admission_create_secret \
+    "$second_secret" "$second_payload" \
+    vp-ffmpeg-worker-go-swarm 901 admission
+  python3 - "$active" "$first_secret_id" "$second_secret_id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    transaction = json.load(handle)
+ids = {
+    secret["docker_secret_id"]
+    for secret in transaction["prepared_secrets"]
+}
+if ids != {sys.argv[2], sys.argv[3]}:
+    raise SystemExit("partial secret prefix did not resume")
+PY
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
+  vp_worker_admission_lock_release
+)
+
+(
+  rollback_calls="$TEST_ROOT/partial-capture-rollback-calls"
+  : >"$rollback_calls"
+  VP_WORKER_ADMISSION_CANDIDATE_SERVICES=vp-ffmpeg-worker-go-swarm
+  VP_APP_ATTEMPTED_SERVICES=vp-ffmpeg-worker-go-swarm
+  vp_vision_cutover_required() {
+    printf 'false\n'
+  }
+  vp_capture_app_snapshots() {
+    printf 'vp-ffmpeg-worker-go-swarm|baseline-image\n'
+  }
+  vp_apply_app_services() {
+    return 1
+  }
+  vp_worker_admission_candidate_records() {
+    return 1
+  }
+  vp_restore_worker_admission_transaction() {
+    printf 'restore|%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-}" \
+      >>"$rollback_calls"
+  }
+  vp_restore_worker_redis_marker_controls() {
+    printf 'marker-restore\n' >>"$rollback_calls"
+  }
+  vp_finalize_worker_control_rollback() {
+    printf 'control-finalize\n' >>"$rollback_calls"
+  }
+
+  if _vp_deploy_vp_app_services_locked a b c d e f \
+    >/dev/null 2>&1; then
+    echo 'FAIL: partial capture fixture unexpectedly deployed' >&2
+    exit 1
+  fi
+  if ! grep -Fq 'restore|' "$rollback_calls"; then
+    echo 'FAIL: candidate capture failure short-circuited rollback' >&2
+    exit 1
+  fi
+  if ! grep -Eq '\|true$' "$rollback_calls"; then
+    echo 'FAIL: incomplete candidate rollback was not evidence-preserving' >&2
+    exit 1
+  fi
+  if grep -Eq '^(marker-restore|control-finalize)$' "$rollback_calls"; then
+    echo 'FAIL: incomplete candidate evidence reached final retirement' >&2
+    exit 1
+  fi
+)
 
 generated_credential="$TEST_ROOT/generated-credential"
 vp_worker_admission_write_secret_file \
@@ -1386,6 +1964,106 @@ if vp_worker_admission_candidate_records >/dev/null 2>&1; then
 fi
 grep -Fxq 'VERSION=1' \
   "$partial_root/candidates/partial-generation/ffmpeg-go.conf"
+
+(
+  resume_root="$partial_root"
+  resume_namespace=resume-generation
+  resume_service=vp-ffmpeg-worker-go-swarm
+  resume_image=vp-ffmpeg-worker-go:deploy-0123456789ab
+  resume_control_image=vp-ffmpeg-worker-python:deploy-0123456789ab
+  resume_generation=902
+  resume_candidate="$resume_root/candidates/$resume_namespace/ffmpeg-go.conf"
+  resume_database_secret=vp-wr-ffmpeg-go-db-902
+  resume_admission_secret=vp-wr-ffmpeg-go-admission-902
+  resume_calls="$TEST_ROOT/worker-partial-resume-calls"
+  : >"$resume_calls"
+  vp_worker_admission_write_manifest \
+    "$resume_candidate" "$resume_service" \
+    "$VP_WORKER_ADMISSION_COMMIT" "$resume_image" "$resume_generation" \
+    "$resume_database_secret" "$resume_admission_secret"
+
+  vp_require_pipeline_network_identity() {
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  vp_worker_admission_database_credential_file() {
+    printf '%s\n' "$TEST_ROOT/runtime-owner"
+  }
+  vp_run_python_worker_container() {
+    printf 'container|%s\n' "$*" >>"$resume_calls"
+  }
+  vp_worker_admission_require_v2_manifest() {
+    printf 'name-hydration\n' >>"$resume_calls"
+    return 1
+  }
+  vp_worker_admission_create_secret() {
+    printf 'secret|%s|%s\n' "$1" "$5" >>"$resume_calls"
+    if [[ "$5" == database ]]; then
+      VP_WORKER_CREATED_SECRET_ID="$(printf '%064d' 902)"
+    else
+      VP_WORKER_CREATED_SECRET_ID="$(printf '%064d' 1902)"
+    fi
+  }
+  vp_worker_admission_operator() {
+    :
+  }
+
+  if ! vp_worker_admission_prepare_service \
+    "$resume_service" "$resume_image" "$resume_control_image" \
+    "$VP_WORKER_ADMISSION_COMMIT" "$resume_root" "$resume_namespace"; then
+    echo 'FAIL: worker partial manifest did not resume through durable IDs' >&2
+    exit 1
+  fi
+  if grep -Fxq name-hydration "$resume_calls"; then
+    echo 'FAIL: worker partial resume hydrated its secret by name' >&2
+    exit 1
+  fi
+  vp_worker_admission_read_manifest "$resume_candidate" "$resume_service"
+  [[ "$VP_WORKER_MANIFEST_VERSION" == 2 ]]
+  [[ "$VP_WORKER_MANIFEST_DATABASE_SECRET_ID" == "$(printf '%064d' 902)" ]]
+  [[ "$VP_WORKER_MANIFEST_ADMISSION_SECRET_ID" == "$(printf '%064d' 1902)" ]]
+)
+
+(
+  control_resume_root="$partial_root"
+  control_resume_commit=abcdef0123456789abcdef0123456789abcdef01
+  control_resume_generation="c-${control_resume_commit:0:20}"
+  control_resume_image=vp-ffmpeg-worker-python:deploy-abcdef012345
+  control_resume_candidate="$control_resume_root/control-candidates/$control_resume_generation.conf"
+  control_resume_ids=()
+  for control_resume_index in 1 2 3 4 5 6 7; do
+    control_resume_ids+=("$(printf '%064d' "$control_resume_index")")
+  done
+  vp_worker_control_write_manifest \
+    "$control_resume_candidate" "$control_resume_generation" \
+    "$control_resume_image" "${control_resume_ids[@]}"
+
+  vp_require_pipeline_network_identity() {
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  vp_worker_admission_database_credential_file() {
+    printf '%s\n' "$TEST_ROOT/control-owner"
+  }
+  vp_run_python_worker_container() {
+    :
+  }
+  vp_worker_admission_create_secret() {
+    return 1
+  }
+
+  if vp_worker_admission_prepare_control_roles \
+    "$control_resume_image" "$control_resume_commit" \
+    "$control_resume_root"; then
+    echo 'FAIL: control partial resume fixture unexpectedly completed' >&2
+    exit 1
+  fi
+  vp_worker_control_read_manifest "$control_resume_candidate"
+  if [[ "$VP_WORKER_CONTROL_MANIFEST_VERSION" != 2 \
+    || "$VP_WORKER_CONTROL_MANIFEST_OPERATOR_DATABASE_SECRET_ID" \
+      != "${control_resume_ids[0]}" ]]; then
+    echo 'FAIL: control retry downgraded durable candidate identity' >&2
+    exit 1
+  fi
+)
 
 CLEANUP_CALLS="$TEST_ROOT/cleanup-calls"
 : >"$CLEANUP_CALLS"
