@@ -132,6 +132,16 @@ rollback, and retirement-response binding).
 Task 4B/4C: fix round 1/5 in progress, beginning with Worker Track A; fifth
 unlisted canary authorization remains unused and no production mutation is
 allowed before both tracks pass review.
+Task 4B/4C Worker Track A: fix round 1/5 at 4d1f212; independent review
+addressed 6 of the original 9 findings but left 4 Important findings open:
+the provisioned `postgresql+asyncpg` Go URL is fingerprint-normalized but
+passed unnormalized to pgx, pgx multi-host fallbacks are omitted from the
+fingerprint, Python ACL WHOAMI is not itself registration-owned, and the
+Python identity artifact remains root-writable in the actual image.
+Task 4B/4C Worker Track A: minor (deferred): the new ctime helper lacks a
+definition for Unix targets other than Linux/Darwin, regressing FreeBSD
+cross-compilation.
+Task 4B/4C Worker Track A: fix round 2/5 in progress; review base is 4d1f212.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
