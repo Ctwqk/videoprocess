@@ -41,6 +41,43 @@ service_path() {
   printf '%s/%s.%s\n' "$SERVICE_DIR" "$1" "$2"
 }
 
+secret_path() {
+  local reference="$1"
+  if [[ -f "$SECRET_DIR/$reference" ]]; then
+    printf '%s\n' "$SECRET_DIR/$reference"
+    return 0
+  fi
+  local candidate
+  for candidate in "$SECRET_DIR"/*; do
+    [[ -f "$candidate" ]] || continue
+    if SECRET_REFERENCE="$reference" python3 - "$candidate" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    secret = json.load(handle)
+raise SystemExit(0 if secret.get("ID") == os.environ["SECRET_REFERENCE"] else 1)
+PY
+    then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+secret_name() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    secret = json.load(handle)
+print(secret["Spec"]["Name"])
+PY
+}
+
 printf 'docker' >>"$DOCKER_CALLS"
 printf '|%s' "$@" >>"$DOCKER_CALLS"
 printf '\n' >>"$DOCKER_CALLS"
@@ -206,29 +243,123 @@ if [[ "${1:-} ${2:-}" == "secret inspect" ]]; then
   if [[ "${3:-}" == "${FAKE_MISSING_SECRET:-__none__}" ]]; then
     exit 1
   fi
-  if [[ "${3:-}" == vp-wrm-* ]]; then
-    [[ -f "$SECRET_DIR/${3:-}" ]]
+  secret_file=""
+  if secret_file="$(secret_path "${3:-}")"; then
+    resolved_name="$(secret_name "$secret_file")"
+    if [[ "$resolved_name" == "${FAKE_MISSING_SECRET:-__none__}" ]]; then
+      exit 1
+    fi
+    if [[ "$*" == *"--format"* ]]; then
+      python3 - "$secret_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    secret = json.load(handle)
+labels = secret["Spec"]["Labels"]
+print(
+    "|".join(
+        (
+            secret["ID"],
+            secret["Spec"]["Name"],
+            labels["vp.service"],
+            labels["vp.generation"],
+            labels["vp.purpose"],
+        )
+    )
+)
+PY
+    else
+      cat "$secret_file"
+    fi
     exit
+  fi
+  if [[ "${3:-}" == vp-wrm-* || "${3:-}" =~ ^[0-9a-f]{32}$ ]]; then
+    exit 1
   fi
   exit 0
 fi
 if [[ "${1:-} ${2:-}" == "secret create" ]]; then
+  shift 2
+  secret_service=""
+  secret_generation=""
+  secret_purpose=""
+  while [[ "$#" -gt 0 && "$1" == --label ]]; do
+    [[ "$#" -ge 2 ]]
+    case "$2" in
+      vp.service=*)
+        [[ -z "$secret_service" ]]
+        secret_service="${2#*=}"
+        ;;
+      vp.generation=*)
+        [[ -z "$secret_generation" ]]
+        secret_generation="${2#*=}"
+        ;;
+      vp.purpose=*)
+        [[ -z "$secret_purpose" ]]
+        secret_purpose="${2#*=}"
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    shift 2
+  done
+  [[ "$#" -eq 2 && "$2" == - \
+    && -n "$secret_service" \
+    && -n "$secret_generation" \
+    && -n "$secret_purpose" ]]
+  secret_name="$1"
   payload="$(cat)"
   [[ -n "$payload" ]]
-  printf 'stdin-bytes|%s|%s\n' "${3:-}" "${#payload}" >>"$DOCKER_CALLS"
-  if [[ "${3:-}" == "${FAKE_FAIL_SECRET_CREATE:-__none__}" ]]; then
+  printf 'stdin-bytes|%s|%s\n' "$secret_name" "${#payload}" >>"$DOCKER_CALLS"
+  if [[ "$secret_name" == "${FAKE_FAIL_SECRET_CREATE:-__none__}" ]]; then
     exit 1
   fi
-  : >"$SECRET_DIR/${3:-}"
-  printf 'secret|create|%s\n' "${3:-}" >>"$CONTROL_EVENTS"
+  [[ ! -e "$SECRET_DIR/$secret_name" ]]
+  secret_id="$(
+    python3 -c 'import secrets; print(secrets.token_hex(16))'
+  )"
+  SECRET_ID="$secret_id" \
+  SECRET_NAME="$secret_name" \
+  SECRET_SERVICE="$secret_service" \
+  SECRET_GENERATION="$secret_generation" \
+  SECRET_PURPOSE="$secret_purpose" \
+    python3 - "$SECRET_DIR/$secret_name" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+secret = {
+    "ID": os.environ["SECRET_ID"],
+    "Spec": {
+        "Labels": {
+            "vp.generation": os.environ["SECRET_GENERATION"],
+            "vp.purpose": os.environ["SECRET_PURPOSE"],
+            "vp.service": os.environ["SECRET_SERVICE"],
+        },
+        "Name": os.environ["SECRET_NAME"],
+    },
+}
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps(secret, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+  printf 'secret|create|%s\n' "$secret_name" >>"$CONTROL_EVENTS"
+  printf '%s\n' "$secret_id"
   exit
 fi
 if [[ "${1:-} ${2:-}" == "secret rm" ]]; then
-  if [[ "${3:-}" == "${FAKE_FAIL_SECRET_REMOVE:-__none__}" ]]; then
+  secret_file="$(secret_path "${3:-}")" || exit 1
+  resolved_name="$(secret_name "$secret_file")"
+  if [[ "${3:-}" == "${FAKE_FAIL_SECRET_REMOVE:-__none__}" \
+    || "$resolved_name" == "${FAKE_FAIL_SECRET_REMOVE:-__none__}" ]]; then
     exit 1
   fi
-  rm -f "$SECRET_DIR/${3:-}"
-  printf 'secret|remove|%s\n' "${3:-}" >>"$CONTROL_EVENTS"
+  rm -f "$secret_file"
+  printf 'secret|remove|%s\n' "$resolved_name" >>"$CONTROL_EVENTS"
   exit
 fi
 if [[ "${1:-}" == run ]]; then
@@ -986,13 +1117,122 @@ vp_worker_redis_marker_create_database_secrets \
   || fail "database secrets were not supplied through stdin"
 for purpose in readiness janitor repair; do
   grep -Fq \
-    "docker|secret|create|vp-wrm-$purpose-db-$CONTROL_GENERATION|-" \
+    "docker|secret|create|--label|vp.service=worker-redis-marker-control|--label|vp.generation=$CONTROL_GENERATION|--label|vp.purpose=$purpose-database|vp-wrm-$purpose-db-$CONTROL_GENERATION|-" \
     "$DOCKER_CALLS" \
-    || fail "$purpose database secret was not generation-scoped"
+    || fail "$purpose database secret did not use exact identity labels"
   if grep -Fq "credential-$purpose" "$DOCKER_CALLS"; then
     fail "$purpose database credential was printed"
   fi
 done
+MARKER_SECRET_IDS="$(
+  python3 - "$SECRET_DIR" "$CONTROL_GENERATION" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+generation = sys.argv[2]
+identities = []
+for purpose in ("readiness", "janitor", "repair"):
+    name = f"vp-wrm-{purpose}-db-{generation}"
+    with (root / name).open(encoding="utf-8") as handle:
+        secret = json.load(handle)
+    if set(secret) != {"ID", "Spec"}:
+        raise SystemExit("unexpected secret inspect fields")
+    if set(secret["Spec"]) != {"Labels", "Name"}:
+        raise SystemExit("unexpected secret spec fields")
+    if secret["Spec"]["Name"] != name:
+        raise SystemExit("secret name identity mismatch")
+    if secret["Spec"]["Labels"] != {
+        "vp.generation": generation,
+        "vp.purpose": f"{purpose}-database",
+        "vp.service": "worker-redis-marker-control",
+    }:
+        raise SystemExit("secret labels identity mismatch")
+    if re.fullmatch(r"[0-9a-f]{32}", secret["ID"]) is None:
+        raise SystemExit("secret ID is not immutable Docker shape")
+    identities.append(secret["ID"])
+if len(set(identities)) != 3:
+    raise SystemExit("marker secret IDs are not distinct")
+print("|".join(identities))
+PY
+)" || fail "fake Docker did not persist exact marker secret identities"
+IFS='|' read -r \
+  READINESS_SECRET_ID JANITOR_SECRET_ID REPAIR_SECRET_ID \
+  <<<"$MARKER_SECRET_IDS"
+
+READINESS_SECRET_NAME="vp-wrm-readiness-db-$CONTROL_GENERATION"
+cp "$SECRET_DIR/$READINESS_SECRET_NAME" \
+  "$TEST_ROOT/readiness-secret-identity.json"
+python3 - "$SECRET_DIR/$READINESS_SECRET_NAME" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+secret = json.loads(path.read_text(encoding="utf-8"))
+secret["Spec"]["Labels"]["vp.purpose"] = "wrong-database"
+path.write_text(
+    json.dumps(secret, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+: >"$DOCKER_CALLS"
+if vp_remove_managed_secret \
+  "$READINESS_SECRET_ID" "$READINESS_SECRET_NAME" \
+  worker-redis-marker-control "$CONTROL_GENERATION" \
+  readiness-database >/dev/null 2>&1; then
+  fail "marker secret removal accepted a mismatched purpose label"
+fi
+[[ -f "$SECRET_DIR/$READINESS_SECRET_NAME" ]] \
+  || fail "label mismatch removed marker secret evidence"
+if grep -Fq 'docker|secret|rm|' "$DOCKER_CALLS"; then
+  fail "label mismatch reached marker secret removal"
+fi
+cp "$TEST_ROOT/readiness-secret-identity.json" \
+  "$SECRET_DIR/$READINESS_SECRET_NAME"
+
+MISMATCH_SECRET_ID=ffffffffffffffffffffffffffffffff
+if [[ "$MISMATCH_SECRET_ID" == "$READINESS_SECRET_ID" ]]; then
+  MISMATCH_SECRET_ID=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+fi
+MISMATCH_SECRET_ID="$MISMATCH_SECRET_ID" \
+  python3 - "$SECRET_DIR/$READINESS_SECRET_NAME" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+secret = json.loads(path.read_text(encoding="utf-8"))
+secret["ID"] = os.environ["MISMATCH_SECRET_ID"]
+path.write_text(
+    json.dumps(secret, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+: >"$DOCKER_CALLS"
+if vp_remove_managed_secret \
+  "$READINESS_SECRET_ID" "$READINESS_SECRET_NAME" \
+  worker-redis-marker-control "$CONTROL_GENERATION" \
+  readiness-database >/dev/null 2>&1; then
+  fail "marker secret removal accepted an immutable ID mismatch"
+fi
+[[ -f "$SECRET_DIR/$READINESS_SECRET_NAME" ]] \
+  || fail "ID mismatch removed marker secret evidence"
+if grep -Fq 'docker|secret|rm|' "$DOCKER_CALLS"; then
+  fail "ID mismatch reached marker secret removal"
+fi
+cp "$TEST_ROOT/readiness-secret-identity.json" \
+  "$SECRET_DIR/$READINESS_SECRET_NAME"
+[[ "$(
+  vp_managed_secret_id \
+    "$READINESS_SECRET_ID" "$READINESS_SECRET_NAME" \
+    worker-redis-marker-control "$CONTROL_GENERATION" \
+    readiness-database
+)" == "$READINESS_SECRET_ID" ]] \
+  || fail "exact marker secret identity did not recover after mismatch probes"
 
 OWNER_DATABASE_FILE="$TEST_ROOT/owner-database-url"
 printf 'owner-database-credential\n' >"$OWNER_DATABASE_FILE"

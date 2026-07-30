@@ -18,12 +18,9 @@ and closes the Worker Track A I-R5-1 implementation breaker. It does not claim
 that I-3 is closed end to end because forward/rollback phase advancement and
 full crash reconciliation are explicitly reserved for Stage 2/3.
 
-One required legacy shell contract remains red:
-`tests/test_worker_redis_marker_control.sh`. Its fake Docker implementation
-creates a name-only marker secret, returns no Docker secret ID, and returns no
-ID/name/label identity from `docker secret inspect`. The Stage 1 production
-path now correctly fails closed instead of fabricating an immutable ID. That
-test file is outside this stage's write allowlist.
+The marker-control fixture drift found during the initial Stage 1 verification
+was corrected in a test-only follow-up. All required Stage 1 shell contracts
+now pass.
 
 No SSH, push, deploy, canary, YouTube/publication, remote access, or production
 operation was performed. No real Swarm service or secret mutation was
@@ -386,13 +383,64 @@ Fresh check record before report completion:
 | `bash tests/test_staging_object_janitor_run.sh` | PASS |
 | `bash tests/test_vp_deploy_sync_extension.sh` | PASS |
 | `bash tests/test_staging_object_janitor_install.sh` | PASS |
-| `bash tests/test_worker_redis_marker_control.sh` | FAIL, legacy fake has no immutable secret identity |
+| `bash tests/test_worker_redis_marker_control.sh` | PASS after test-only immutable identity fixture follow-up |
 | destructive secret inventory | PASS, one ID-bound helper call |
 | `git diff --check` | PASS |
 | changed-path allowlist | PASS |
 
 The system Python environment does not contain the `ruff` module; the
 repository's backend virtual environment was used and passed.
+
+## Marker Fixture Follow-up
+
+### Preserved RED
+
+The coordinator and the initial Stage 1 verification both reproduced:
+
+```text
+worker marker database secret creation failed
+FAIL: generation-scoped database secrets were not created
+```
+
+### Root cause
+
+The fake Docker treated argument three of `docker secret create` as the secret
+name. The production command now supplies three `--label` pairs before the
+name, so the fake created a name-only empty file, returned no immutable ID on
+stdout, and returned no `.ID`, `.Spec.Name`, or `.Spec.Labels` identity from
+`docker secret inspect`.
+
+### Test-only fix
+
+- The fake parses the real `docker secret create` option/name/source shape.
+- It persists a JSON object with exact Docker API fields:
+  `ID`, `Spec.Name`, and `Spec.Labels`.
+- The labels must be exact `vp.service`, `vp.generation`, and `vp.purpose`
+  values supplied by production.
+- Create returns a stable, distinct 32-hex immutable ID on stdout.
+- Inspect resolves either name or immutable ID and renders the exact formatted
+  identity requested by `vp_managed_secret_id`.
+- Remove accepts immutable ID, resolves the saved name for existing lifecycle
+  assertions, and deletes only that exact fake object.
+- Existing marker readiness, rollback, rotation, partial cleanup, and
+  freshness assertions remain unchanged and blocking.
+- New adversarial probes tamper the purpose label and immutable ID separately.
+  Both return nonzero, retain the secret evidence, and make zero
+  `docker secret rm` calls. Restoring the exact JSON identity makes strict
+  inspection succeed again.
+
+No production file was changed in this follow-up.
+
+### GREEN
+
+```text
+worker Redis marker control tests passed
+```
+
+### Files
+
+- `tests/test_worker_redis_marker_control.sh`
+- `.superpowers/sdd/2026-07-26-production-worker-registration/task-4bc-deploy-stage1-report.md`
 
 ## Unfinished Boundaries
 
