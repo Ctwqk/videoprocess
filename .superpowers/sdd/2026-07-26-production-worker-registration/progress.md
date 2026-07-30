@@ -142,6 +142,17 @@ Task 4B/4C Worker Track A: minor (deferred): the new ctime helper lacks a
 definition for Unix targets other than Linux/Darwin, regressing FreeBSD
 cross-compilation.
 Task 4B/4C Worker Track A: fix round 2/5 in progress; review base is 4d1f212.
+Task 4B/4C Worker Track A: fix round 2/5 at 2a5b699 addressed all 4
+round-one Important findings, but scoped review found 2 new Important
+deployment-contract regressions: Python services/jobs still mount Swarm
+secrets as root:root mode 0400 despite the image now running as UID/GID 10001,
+and the staging-janitor evidence volume is not migrated from root ownership
+before the non-root job writes status.
+Task 4B/4C Worker Track A: minor (deferred): direct registration `close()`
+does not cancel and drain registration-owned guarded tasks.
+Task 4B/4C Worker Track A: fix round 3/5 in progress; integration scope is
+expanded only to Python secret ownership and janitor evidence-volume
+migration, and later Deploy Track B work must preserve this contract.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
