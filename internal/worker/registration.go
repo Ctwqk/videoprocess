@@ -21,6 +21,7 @@ import (
 
 	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -661,31 +662,31 @@ func exactJSONInteger(value any, minimum int64, maximum int64) (int64, bool) {
 }
 
 func databaseEndpointIdentity(raw string) (map[string]any, error) {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
+	raw = strings.TrimSpace(raw)
+	schemeEnd := strings.Index(raw, "://")
+	if schemeEnd < 1 {
 		return nil, claimMismatch()
 	}
-	driver := strings.ToLower(strings.SplitN(parsed.Scheme, "+", 2)[0])
+	driver := strings.ToLower(strings.SplitN(raw[:schemeEnd], "+", 2)[0])
 	if driver != "postgres" && driver != "postgresql" {
 		return nil, claimMismatch()
 	}
-	host, err := normalizedDependencyHost(parsed.Hostname())
+	config, err := pgx.ParseConfig(driver + raw[schemeEnd:])
+	if err != nil {
+		return nil, claimMismatch()
+	}
+	host, err := normalizedDependencyHost(config.Host)
 	if err != nil {
 		return nil, err
 	}
-	port, err := endpointPort(parsed, 5432)
-	if err != nil {
-		return nil, err
-	}
-	database, err := url.PathUnescape(strings.TrimPrefix(parsed.EscapedPath(), "/"))
-	if err != nil || !validDependencyName(database) {
+	if config.Port == 0 || !validDependencyName(config.Database) {
 		return nil, claimMismatch()
 	}
 	return map[string]any{
-		"database": database,
+		"database": config.Database,
 		"driver":   "postgresql",
 		"host":     host,
-		"port":     port,
+		"port":     int(config.Port),
 	}, nil
 }
 
@@ -694,27 +695,25 @@ func redisEndpointIdentity(raw string) (map[string]any, error) {
 	if err != nil || (parsed.Scheme != "redis" && parsed.Scheme != "rediss") {
 		return nil, claimMismatch()
 	}
-	host, err := normalizedDependencyHost(parsed.Hostname())
+	options, err := ParseWorkerRedisOptions(raw)
 	if err != nil {
-		return nil, err
-	}
-	port, err := endpointPort(parsed, 6379)
-	if err != nil {
-		return nil, err
-	}
-	path := strings.TrimPrefix(parsed.EscapedPath(), "/")
-	if strings.Contains(path, "/") {
 		return nil, claimMismatch()
 	}
-	database := int64(0)
-	if path != "" {
-		database, err = strconv.ParseInt(path, 10, 32)
-		if err != nil || database < 0 {
-			return nil, claimMismatch()
-		}
+	hostValue, portValue, err := net.SplitHostPort(options.Addr)
+	if err != nil {
+		return nil, claimMismatch()
+	}
+	host, err := normalizedDependencyHost(hostValue)
+	if err != nil {
+		return nil, err
+	}
+	port, err := strconv.Atoi(portValue)
+	if err != nil || port < 1 || port > 65535 ||
+		options.DB < 0 || options.DB > 2147483647 {
+		return nil, claimMismatch()
 	}
 	return map[string]any{
-		"database": int(database),
+		"database": options.DB,
 		"host":     host,
 		"port":     port,
 		"scheme":   parsed.Scheme,

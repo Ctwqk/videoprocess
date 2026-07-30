@@ -111,6 +111,16 @@ func runWorker(
 	cfg.RedisURL = secrets.RedisURL
 	cfg.MinIOAccessKey = secrets.MinIOAccessKey
 	cfg.MinIOSecretKey = secrets.MinIOSecretKey
+	instanceID := uuid.New()
+	claims, err := worker.BuildRegistrationClaimsWithRedis(
+		env,
+		secrets.DatabaseURL,
+		secrets.RedisURL,
+		instanceID,
+	)
+	if err != nil {
+		return err
+	}
 
 	openContext, openCancel := context.WithTimeout(ctx, 10*time.Second)
 	database, err := dependencies.openDatabase(
@@ -132,16 +142,6 @@ func runWorker(
 		}
 	}()
 
-	instanceID := uuid.New()
-	claims, err := worker.BuildRegistrationClaimsWithRedis(
-		env,
-		secrets.DatabaseURL,
-		secrets.RedisURL,
-		instanceID,
-	)
-	if err != nil {
-		return err
-	}
 	registration := worker.NewRegistration(
 		database,
 		claims,

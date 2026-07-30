@@ -29,6 +29,11 @@ type WorkerSecretError struct {
 	message string
 }
 
+type secretChangeTime struct {
+	seconds     int64
+	nanoseconds int64
+}
+
 func (e *WorkerSecretError) Error() string {
 	if e == nil || e.message == "" {
 		return "worker secret configuration is invalid"
@@ -37,6 +42,14 @@ func (e *WorkerSecretError) Error() string {
 }
 
 func ReadMode0400Secret(path string, label string) (string, error) {
+	return readMode0400Secret(path, label, nil)
+}
+
+func readMode0400Secret(
+	path string,
+	label string,
+	beforeFinalIdentityCheck func() error,
+) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", &WorkerSecretError{message: label + " could not be opened"}
 	}
@@ -70,32 +83,42 @@ func ReadMode0400Secret(path string, label string) (string, error) {
 	defer file.Close()
 
 	opened, err := file.Stat()
-	if err != nil ||
-		!opened.Mode().IsRegular() ||
+	if err != nil {
+		return "", &WorkerSecretError{message: label + " changed while being opened"}
+	}
+	beforeChangeTime, beforeChangeTimeOK := secretFileChangeTime(before)
+	openedChangeTime, openedChangeTimeOK := secretFileChangeTime(opened)
+	if !opened.Mode().IsRegular() ||
 		!isExactMode0400(opened.Mode()) ||
+		!beforeChangeTimeOK ||
+		!openedChangeTimeOK ||
+		beforeChangeTime != openedChangeTime ||
 		!os.SameFile(before, opened) {
 		return "", &WorkerSecretError{message: label + " changed while being opened"}
 	}
 	if opened.Size() < 0 || opened.Size() > MaxWorkerSecretBytes {
 		return "", &WorkerSecretError{message: label + " is too large"}
 	}
-	raw := make([]byte, opened.Size())
-	if len(raw) > 0 {
-		if _, err := io.ReadFull(file, raw); err != nil {
+	raw, err := readExactSecret(file, opened.Size())
+	if err != nil {
+		return "", &WorkerSecretError{message: label + " changed while being read"}
+	}
+	if beforeFinalIdentityCheck != nil {
+		if err := beforeFinalIdentityCheck(); err != nil {
 			return "", &WorkerSecretError{message: label + " changed while being read"}
 		}
 	}
-	extra := make([]byte, 1)
-	if count, readErr := file.Read(extra); count != 0 ||
-		readErr != nil && !errors.Is(readErr, io.EOF) {
+	after, err := file.Stat()
+	if err != nil {
 		return "", &WorkerSecretError{message: label + " changed while being read"}
 	}
-	after, err := file.Stat()
-	if err != nil ||
-		!after.Mode().IsRegular() ||
+	afterChangeTime, afterChangeTimeOK := secretFileChangeTime(after)
+	if !after.Mode().IsRegular() ||
 		!isExactMode0400(after.Mode()) ||
 		after.Size() != opened.Size() ||
 		!after.ModTime().Equal(opened.ModTime()) ||
+		!afterChangeTimeOK ||
+		afterChangeTime != openedChangeTime ||
 		!os.SameFile(opened, after) {
 		return "", &WorkerSecretError{message: label + " changed while being read"}
 	}
@@ -110,6 +133,21 @@ func ReadMode0400Secret(path string, label string) (string, error) {
 		return "", &WorkerSecretError{message: label + " is empty or invalid"}
 	}
 	return value, nil
+}
+
+func readExactSecret(reader io.Reader, expectedSize int64) ([]byte, error) {
+	raw := make([]byte, expectedSize)
+	if len(raw) > 0 {
+		if _, err := io.ReadFull(reader, raw); err != nil {
+			return nil, err
+		}
+	}
+	extra := make([]byte, 1)
+	if count, err := reader.Read(extra); count != 0 ||
+		err != nil && !errors.Is(err, io.EOF) {
+		return nil, errors.New("secret changed while being read")
+	}
+	return raw, nil
 }
 
 func isExactMode0400(mode os.FileMode) bool {

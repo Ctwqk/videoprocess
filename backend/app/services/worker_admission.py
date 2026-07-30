@@ -27,13 +27,24 @@ class WorkerAdmissionDecision:
     reasons: tuple[str, ...] = ()
 
 
-def validate_worker_admission(env: Mapping[str, str]) -> WorkerAdmissionDecision:
+def validate_worker_admission(
+    env: Mapping[str, str],
+    *,
+    redis_url: str | None = None,
+) -> WorkerAdmissionDecision:
     deploy_mode = _env_value(env, "DEPLOY_MODE", "shared").lower()
-    redis_url = _env_value(env, "REDIS_URL", "redis://localhost:6379/0")
+    effective_redis_url = (
+        redis_url.strip()
+        if redis_url is not None
+        else _env_value(env, "REDIS_URL", "redis://localhost:6379/0")
+    )
     worker_type = _env_value(env, "WORKER_TYPE", "ffmpeg").lower()
     storage_backend = _env_value(env, "STORAGE_BACKEND", "local").lower()
 
-    if not _is_production_queue_consumer(deploy_mode=deploy_mode, redis_url=redis_url):
+    if not _is_production_queue_consumer(
+        deploy_mode=deploy_mode,
+        redis_url=effective_redis_url,
+    ):
         return WorkerAdmissionDecision(allowed=True)
 
     reasons: list[str] = []
@@ -64,18 +75,33 @@ def validate_worker_admission(env: Mapping[str, str]) -> WorkerAdmissionDecision
     return WorkerAdmissionDecision(allowed=not reasons, reasons=tuple(reasons))
 
 
-def enforce_worker_admission_from_env(env: Mapping[str, str] | None = None) -> None:
-    decision = validate_worker_admission(os.environ if env is None else env)
+def enforce_worker_admission_from_env(
+    env: Mapping[str, str] | None = None,
+    *,
+    redis_url: str | None = None,
+) -> None:
+    decision = validate_worker_admission(
+        os.environ if env is None else env,
+        redis_url=redis_url,
+    )
     if not decision.allowed:
         raise WorkerAdmissionError("; ".join(decision.reasons))
 
 
-def is_production_worker_env(env: Mapping[str, str]) -> bool:
+def is_production_worker_env(
+    env: Mapping[str, str],
+    *,
+    redis_url: str | None = None,
+) -> bool:
     deploy_mode = _env_value(env, "DEPLOY_MODE", "shared").lower()
-    redis_url = _env_value(env, "REDIS_URL", "redis://localhost:6379/0")
+    effective_redis_url = (
+        redis_url.strip()
+        if redis_url is not None
+        else _env_value(env, "REDIS_URL", "redis://localhost:6379/0")
+    )
     return _is_production_queue_consumer(
         deploy_mode=deploy_mode,
-        redis_url=redis_url,
+        redis_url=effective_redis_url,
     )
 
 

@@ -380,6 +380,17 @@ for worker_cli in \
     exit 1
   fi
 done
+python_worker_dockerfile="$ROOT_DIR/backend/Dockerfile.worker"
+if ! grep -Fq '/app/worker/_build_identity.py' \
+  "$python_worker_dockerfile"; then
+  echo 'FAIL: Python worker image does not bind commit into its runtime artifact' >&2
+  exit 1
+fi
+if grep -Eq '^ENV[[:space:]]+VP_BUILD_COMMIT=' \
+  "$python_worker_dockerfile"; then
+  echo 'FAIL: Python worker image exposes a runtime-overridable build commit' >&2
+  exit 1
+fi
 
 control_manifest="$TEST_ROOT/control-current.conf"
 vp_worker_control_write_manifest \

@@ -13,6 +13,7 @@ from app.services.worker_registration import (
     WorkerRegistrationClaims,
     WorkerRegistrationError,
 )
+from worker import registration as worker_registration
 from worker.registration import PythonWorkerRegistration, build_worker_registration_claims
 from worker.secret_config import (
     WorkerSecretError,
@@ -325,8 +326,30 @@ def test_nonproduction_redis_url_allows_explicit_environment_fallback() -> None:
     )
 
 
-def test_registration_claim_builder_uses_one_instance_in_consumer_and_exact_integers() -> None:
+def test_file_backed_remote_redis_rejects_environment_redis_fallback(
+    tmp_path: Path,
+) -> None:
+    redis_secret = tmp_path / "redis-url"
+    _write_secret(
+        redis_secret,
+        "redis://vp-worker:secret@vp-redis:6379/7",
+    )
+
+    with pytest.raises(WorkerSecretError, match="REDIS_URL"):
+        load_worker_redis_url(
+            {
+                "DEPLOY_MODE": "development",
+                "WORKER_REDIS_URL_FILE": str(redis_secret),
+                "REDIS_URL": "redis://127.0.0.1:6379/14",
+            }
+        )
+
+
+def test_registration_claim_builder_uses_one_instance_in_consumer_and_exact_integers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     instance_id = uuid.uuid4()
+    release_commit = "0123456789abcdef0123456789abcdef01234567"
     env = {
             "DEPLOY_MODE": "shared",
             "WORKER_SERVICE_NAME": "vp-vision-worker-swarm",
@@ -335,8 +358,7 @@ def test_registration_claim_builder_uses_one_instance_in_consumer_and_exact_inte
             "WORKER_TYPE": "vision",
             "WORKER_HOST": "127",
             "WORKER_CAPABILITIES": "vision_gpu",
-            "WORKER_RELEASE_COMMIT": "0123456789abcdef0123456789abcdef01234567",
-            "VP_BUILD_COMMIT": "0123456789abcdef0123456789abcdef01234567",
+            "WORKER_RELEASE_COMMIT": release_commit,
             "WORKER_IMAGE_IDENTITY": "vp-vision-worker:deploy-0123456789ab",
             "WORKER_REDIS_STREAM": "vp:tasks:vision",
             "WORKER_REDIS_GROUP": "vision-workers",
@@ -344,6 +366,11 @@ def test_registration_claim_builder_uses_one_instance_in_consumer_and_exact_inte
             "MINIO_ENDPOINT": "vp-minio:9000",
             "MINIO_BUCKET": "videoprocess",
         }
+    monkeypatch.setattr(
+        worker_registration,
+        "EMBEDDED_BUILD_COMMIT",
+        release_commit,
+    )
     claims = build_worker_registration_claims(
         env,
         database_url=(
@@ -365,9 +392,14 @@ def test_registration_claim_builder_uses_one_instance_in_consumer_and_exact_inte
         "1123456789abcdef0123456789abcdef01234567",
         "not-a-commit",
     ):
+        monkeypatch.setattr(
+            worker_registration,
+            "EMBEDDED_BUILD_COMMIT",
+            invalid_build_commit,
+        )
         with pytest.raises(WorkerRegistrationError, match="claim_mismatch"):
             build_worker_registration_claims(
-                {**env, "VP_BUILD_COMMIT": invalid_build_commit},
+                env,
                 database_url=(
                     "postgresql+asyncpg://runtime:secret@"
                     "vp-postgres:5432/videoprocess"
@@ -375,6 +407,127 @@ def test_registration_claim_builder_uses_one_instance_in_consumer_and_exact_inte
                 redis_url="redis://vp-worker:secret@vp-redis:6379/2",
                 worker_instance_id=instance_id,
             )
+
+
+def test_remote_effective_redis_requires_embedded_commit_in_development_mode() -> None:
+    env = {
+        "DEPLOY_MODE": "development",
+        "WORKER_SERVICE_NAME": "vp-vision-worker-swarm",
+        "WORKER_ADMISSION_GENERATION": "4",
+        "WORKER_SLOT": "1",
+        "WORKER_TYPE": "vision",
+        "WORKER_HOST": "127",
+        "WORKER_CAPABILITIES": "vision_gpu",
+        "WORKER_RELEASE_COMMIT": (
+            "0123456789abcdef0123456789abcdef01234567"
+        ),
+        "WORKER_IMAGE_IDENTITY": (
+            "vp-vision-worker:deploy-0123456789ab"
+        ),
+        "WORKER_REDIS_STREAM": "vp:tasks:vision",
+        "WORKER_REDIS_GROUP": "vision-workers",
+        "STORAGE_BACKEND": "minio",
+        "MINIO_ENDPOINT": "vp-minio:9000",
+        "MINIO_BUCKET": "videoprocess",
+    }
+
+    with pytest.raises(WorkerRegistrationError, match="claim_mismatch"):
+        build_worker_registration_claims(
+            env,
+            database_url=(
+                "postgresql+asyncpg://runtime:secret@"
+                "vp-postgres:5432/videoprocess"
+            ),
+            redis_url=(
+                "redis://vp-worker:secret@vp-redis:6379/7"
+            ),
+            worker_instance_id=uuid.uuid4(),
+        )
+
+
+def test_registration_claim_uses_artifact_commit_not_runtime_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_commit = "0123456789abcdef0123456789abcdef01234567"
+    env = {
+        "DEPLOY_MODE": "production",
+        "WORKER_SERVICE_NAME": "vp-vision-worker-swarm",
+        "WORKER_ADMISSION_GENERATION": "4",
+        "WORKER_SLOT": "1",
+        "WORKER_TYPE": "vision",
+        "WORKER_HOST": "127",
+        "WORKER_CAPABILITIES": "vision_gpu",
+        "WORKER_RELEASE_COMMIT": release_commit,
+        "VP_BUILD_COMMIT": "1" * 40,
+        "WORKER_IMAGE_IDENTITY": (
+            "vp-vision-worker:deploy-0123456789ab"
+        ),
+        "WORKER_REDIS_STREAM": "vp:tasks:vision",
+        "WORKER_REDIS_GROUP": "vision-workers",
+        "STORAGE_BACKEND": "minio",
+        "MINIO_ENDPOINT": "vp-minio:9000",
+        "MINIO_BUCKET": "videoprocess",
+    }
+    monkeypatch.setattr(
+        worker_registration,
+        "EMBEDDED_BUILD_COMMIT",
+        release_commit,
+        raising=False,
+    )
+
+    claims = build_worker_registration_claims(
+        env,
+        database_url=(
+            "postgresql+asyncpg://runtime:secret@"
+            "vp-postgres:5432/videoprocess"
+        ),
+        redis_url="redis://vp-worker:secret@vp-redis:6379/7",
+        worker_instance_id=uuid.uuid4(),
+    )
+
+    assert claims.release_commit == release_commit
+
+
+def test_runtime_environment_cannot_mask_wrong_artifact_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_commit = "0123456789abcdef0123456789abcdef01234567"
+    env = {
+        "DEPLOY_MODE": "production",
+        "WORKER_SERVICE_NAME": "vp-vision-worker-swarm",
+        "WORKER_ADMISSION_GENERATION": "4",
+        "WORKER_SLOT": "1",
+        "WORKER_TYPE": "vision",
+        "WORKER_HOST": "127",
+        "WORKER_CAPABILITIES": "vision_gpu",
+        "WORKER_RELEASE_COMMIT": release_commit,
+        "VP_BUILD_COMMIT": release_commit,
+        "WORKER_IMAGE_IDENTITY": (
+            "vp-vision-worker:deploy-0123456789ab"
+        ),
+        "WORKER_REDIS_STREAM": "vp:tasks:vision",
+        "WORKER_REDIS_GROUP": "vision-workers",
+        "STORAGE_BACKEND": "minio",
+        "MINIO_ENDPOINT": "vp-minio:9000",
+        "MINIO_BUCKET": "videoprocess",
+    }
+    monkeypatch.setattr(
+        worker_registration,
+        "EMBEDDED_BUILD_COMMIT",
+        "1" * 40,
+        raising=False,
+    )
+
+    with pytest.raises(WorkerRegistrationError, match="claim_mismatch"):
+        build_worker_registration_claims(
+            env,
+            database_url=(
+                "postgresql+asyncpg://runtime:secret@"
+                "vp-postgres:5432/videoprocess"
+            ),
+            redis_url="redis://vp-worker:secret@vp-redis:6379/7",
+            worker_instance_id=uuid.uuid4(),
+        )
 
 
 @pytest.mark.asyncio
@@ -414,6 +567,33 @@ async def test_lifecycle_registers_then_initially_heartbeats_before_start_return
 
     await lifecycle.close()
     assert events[-1] == "revoke:shutdown"
+
+
+@pytest.mark.asyncio
+async def test_registration_loss_synchronously_cancels_guarded_consumer() -> None:
+    lifecycle = PythonWorkerRegistration(
+        object(),
+        _claims(),
+        "admission-token",
+    )
+    started = asyncio.Event()
+    continued_after_loss: list[bool] = []
+
+    async def consumer() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+            continued_after_loss.append(True)
+        finally:
+            continued_after_loss.append(False)
+
+    task = lifecycle.create_guarded_task(consumer())
+    await started.wait()
+    lifecycle._mark_lost(WorkerRegistrationError("lease_fenced"))
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert task.cancelled()
+    assert continued_after_loss == [False]
 
 
 @pytest.mark.asyncio

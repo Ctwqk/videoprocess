@@ -1,20 +1,25 @@
 from __future__ import annotations
+
+import hashlib
+
 from app.config import settings
 from app.storage.base import StorageBackend
 from app.storage.local import LocalStorageBackend
 
 
-_backends: dict[str, StorageBackend] = {}
+_backends: dict[str, tuple[tuple[object, ...], StorageBackend]] = {}
 
 
 def get_storage(
     backend_name: str | None = None, *, create_bucket: bool = True
 ) -> StorageBackend:
     selected = (backend_name or settings.storage_backend or "local").strip().lower()
-    backend = _backends.get(selected)
-    if backend is not None:
-        return backend
+    identity = _backend_identity(selected, create_bucket=create_bucket)
+    cached = _backends.get(selected)
+    if cached is not None and cached[0] == identity:
+        return cached[1]
 
+    backend: StorageBackend
     if selected == "minio":
         from app.storage.minio_backend import MinioStorageBackend
 
@@ -37,5 +42,27 @@ def get_storage(
     else:
         backend = LocalStorageBackend(root=settings.storage_local_root)
 
-    _backends[selected] = backend
+    _backends[selected] = (identity, backend)
     return backend
+
+
+def _backend_identity(
+    selected: str,
+    *,
+    create_bucket: bool,
+) -> tuple[object, ...]:
+    if selected != "minio":
+        return ("local", settings.storage_local_root)
+    return (
+        "minio",
+        settings.minio_endpoint,
+        hashlib.sha256(settings.minio_access_key.encode()).digest(),
+        hashlib.sha256(settings.minio_secret_key.encode()).digest(),
+        settings.minio_bucket,
+        settings.minio_secure,
+        create_bucket,
+        settings.minio_connect_timeout_seconds,
+        settings.minio_read_timeout_seconds,
+        settings.minio_max_retries,
+        settings.minio_operation_timeout_seconds,
+    )

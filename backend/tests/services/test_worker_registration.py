@@ -29,7 +29,9 @@ from app.services.worker_registration import (
     WorkerRegistrationClaims,
     WorkerRegistrationError,
     WorkerRegistrationService,
+    _database_identity,
     _normalized_endpoint_bindings,
+    _redis_identity,
     dependency_fingerprints,
 )
 
@@ -591,6 +593,35 @@ def test_dependency_fingerprints_match_cross_language_fixture() -> None:
             for key, secret in case["env"].items()
             if "SECRET" in key or key.endswith("_URL")
         )
+
+
+def test_dependency_identities_use_effective_client_query_targets() -> None:
+    assert _database_identity(
+        {
+            "DATABASE_URL": (
+                "postgresql+asyncpg://worker:redacted@"
+                "db-claimed:5432/claimed"
+                "?host=db-actual&port=5544&database=actual"
+            )
+        }
+    ) == {
+        "database": "actual",
+        "driver": "postgresql",
+        "host": "db-actual",
+        "port": 5544,
+    }
+    assert _redis_identity(
+        {
+            "REDIS_URL": (
+                "redis://worker:redacted@redis-claimed:6379/0?db=7"
+            )
+        }
+    ) == {
+        "database": 7,
+        "host": "redis-claimed",
+        "port": 6379,
+        "scheme": "redis",
+    }
 
 
 @pytest.mark.parametrize(

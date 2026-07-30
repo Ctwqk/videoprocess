@@ -22,7 +22,6 @@ from app.services.staging_object_janitor import (
     STAGING_GRACE_SECONDS,
     StagingObjectJanitor,
 )
-from app.storage.manager import get_storage
 from app.storage.minio_backend import MinioStorageBackend
 from worker.secret_config import read_mode_0400_secret
 
@@ -74,10 +73,25 @@ async def run(argv: Sequence[str] | None = None) -> int:
         if begin_outcome == "overlap":
             _emit({"status": "overlap_skipped"})
             return 0
-        _load_minio_credentials(os.environ)
-        storage = get_storage("minio", create_bucket=False)
-        if not isinstance(storage, MinioStorageBackend):
-            raise RuntimeError("MinIO storage backend is unavailable")
+        minio_access_key, minio_secret_key = _load_minio_credentials(
+            os.environ
+        )
+        storage = MinioStorageBackend(
+            endpoint=settings.minio_endpoint,
+            access_key=minio_access_key,
+            secret_key=minio_secret_key,
+            bucket=settings.minio_bucket,
+            secure=settings.minio_secure,
+            create_bucket=False,
+            connect_timeout_seconds=(
+                settings.minio_connect_timeout_seconds
+            ),
+            read_timeout_seconds=settings.minio_read_timeout_seconds,
+            max_retries=settings.minio_max_retries,
+            operation_timeout_seconds=(
+                settings.minio_operation_timeout_seconds
+            ),
+        )
         result = await StagingObjectJanitor(
             session_factory,
             client=storage.client,
@@ -168,7 +182,9 @@ def _database_resources(
     )
 
 
-def _load_minio_credentials(env: Mapping[str, str]) -> None:
+def _load_minio_credentials(
+    env: Mapping[str, str],
+) -> tuple[str, str]:
     if (
         str(env.get("MINIO_ACCESS_KEY", "")).strip()
         or str(env.get("MINIO_SECRET_KEY", "")).strip()
@@ -191,14 +207,15 @@ def _load_minio_credentials(env: Mapping[str, str]) -> None:
         raise RuntimeError(
             "staging janitor MinIO credential files are required"
         )
-    settings.minio_access_key = read_mode_0400_secret(
+    access_key = read_mode_0400_secret(
         access_path,
         label="staging janitor MinIO access key",
     )
-    settings.minio_secret_key = read_mode_0400_secret(
+    secret_key = read_mode_0400_secret(
         secret_path,
         label="staging janitor MinIO secret key",
     )
+    return access_key, secret_key
 
 
 def _emit(payload: dict[str, object]) -> None:

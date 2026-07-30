@@ -148,6 +148,42 @@ func TestWorkerStartupRegistersAndChecksContinuityBeforeRedis(t *testing.T) {
 	}
 }
 
+func TestWorkerStartupValidatesStaticClaimsBeforeDatabaseOpen(
+	t *testing.T,
+) {
+	calls := []string{}
+	database := &startupDatabaseStub{calls: &calls}
+	databaseOpens := 0
+	env := workerStartupTestEnv()
+	env["VP_BUILD_COMMIT"] = "1111111111111111111111111111111111111111"
+
+	err := runWorker(
+		context.Background(),
+		env,
+		startupDependencies{
+			loadSecrets: func(map[string]string) (worker.SecretConfig, error) {
+				return workerStartupTestSecrets(
+					"redis://go-worker:redis-secret@vp-redis:6379/3",
+				), nil
+			},
+			openDatabase: func(
+				context.Context,
+				string,
+			) (startupDatabase, error) {
+				databaseOpens++
+				return database, nil
+			},
+		},
+	)
+
+	if err == nil || !strings.Contains(err.Error(), "claim_mismatch") {
+		t.Fatalf("runWorker error = %v; want claim_mismatch", err)
+	}
+	if databaseOpens != 0 {
+		t.Fatalf("database opens = %d; want 0", databaseOpens)
+	}
+}
+
 func TestWorkerStartupUncertainRegistrationOrContinuityConstructsNoRedis(t *testing.T) {
 	for _, testCase := range []struct {
 		name          string

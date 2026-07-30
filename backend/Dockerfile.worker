@@ -3,7 +3,6 @@ FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 ARG VP_BUILD_COMMIT
 RUN printf '%s\n' "$VP_BUILD_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
 LABEL org.opencontainers.image.revision=$VP_BUILD_COMMIT
-ENV VP_BUILD_COMMIT=$VP_BUILD_COMMIT
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DEBIAN_FRONTEND=noninteractive
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -28,6 +27,9 @@ RUN pip install ".[worker]" \
 
 COPY app /app/app
 COPY worker /app/worker
+RUN printf 'BUILD_COMMIT = "%s"\n' "$VP_BUILD_COMMIT" \
+    > /app/worker/_build_identity.py \
+    && chmod 0444 /app/worker/_build_identity.py
 
 RUN python -c "import importlib; [importlib.import_module(name) for name in ( \
     'app.channel_agent.staging_object_janitor_cli', \

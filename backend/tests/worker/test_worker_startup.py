@@ -14,6 +14,9 @@ import pytest
 from app.services.worker_admission import WorkerAdmissionError
 from app.services.worker_registration import WorkerLease, WorkerRegistrationError
 from worker import main as worker_main
+from worker.secret_config import (
+    load_worker_redis_url as load_real_worker_redis_url,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -755,6 +758,9 @@ async def test_registration_loss_cancels_consumer_and_propagates_stable_error() 
     loss = WorkerRegistrationError("lease_fenced")
 
     class Registration:
+        def create_guarded_task(self, awaitable):
+            return asyncio.ensure_future(awaitable)
+
         async def wait_lost(self):
             await asyncio.sleep(0)
             return loss
@@ -1040,6 +1046,9 @@ async def test_consumer_cancellation_cancels_inflight_messages_without_xack(
             self.redis_stream = "vp:tasks:admitted-vision"
             self.redis_group = "admitted-vision-workers"
             self.worker_host = "127"
+
+        def raise_if_lost(self) -> None:
+            return None
 
         async def heartbeat_now(self, *, minimum_margin_seconds: float = 0):
             return self.lease
@@ -2373,6 +2382,9 @@ async def test_main_restores_process_globals_for_repeated_in_process_runs(
     class Registration:
         redis_consumer_id = "ffmpeg-worker@127:2:registered"
 
+        def raise_if_lost(self) -> None:
+            return None
+
         async def close(self):
             return None
 
@@ -2401,23 +2413,26 @@ async def test_main_restores_process_globals_for_repeated_in_process_runs(
     monkeypatch.setattr(
         worker_main,
         "load_worker_minio_credentials",
-        lambda _env: ("worker-minio-access", "worker-minio-secret"),
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
     )
     monkeypatch.setattr(
         worker_main,
         "enforce_worker_admission_from_env",
-        lambda _env=None: None,
+        lambda _env=None, **_kwargs: None,
     )
     monkeypatch.setattr(
         worker_main,
         "load_worker_database_url",
-        lambda _env: "postgresql+asyncpg://worker@db/vp",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
     )
     monkeypatch.setattr(worker_main, "configure_worker_database", configure)
     monkeypatch.setattr(
         worker_main,
         "load_worker_admission_token",
-        lambda _env: "token",
+        lambda _env, **_kwargs: "token",
     )
     monkeypatch.setattr(
         worker_main,
@@ -2468,6 +2483,9 @@ async def test_registered_worker_requires_continuity_and_acl_identity_before_gro
         worker_host = "150-gpu"
         lease = SimpleNamespace()
 
+        def raise_if_lost(self) -> None:
+            return None
+
         async def close(self, *, reason: str = "shutdown"):
             close_reasons.append(reason)
 
@@ -2490,17 +2508,20 @@ async def test_registered_worker_requires_continuity_and_acl_identity_before_gro
     monkeypatch.setattr(
         worker_main,
         "load_worker_minio_credentials",
-        lambda _env: ("worker-minio-access", "worker-minio-secret"),
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
     )
     monkeypatch.setattr(
         worker_main,
         "enforce_worker_admission_from_env",
-        lambda _env=None: None,
+        lambda _env=None, **_kwargs: None,
     )
     monkeypatch.setattr(
         worker_main,
         "load_worker_database_url",
-        lambda _env: "postgresql+asyncpg://worker@db/vp",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
     )
     monkeypatch.setattr(
         worker_main,
@@ -2510,7 +2531,7 @@ async def test_registered_worker_requires_continuity_and_acl_identity_before_gro
     monkeypatch.setattr(
         worker_main,
         "load_worker_admission_token",
-        lambda _env: "token",
+        lambda _env, **_kwargs: "token",
     )
 
     async def register(*_args):
@@ -2557,6 +2578,104 @@ async def test_registered_worker_requires_continuity_and_acl_identity_before_gro
         "redis_group_create",
     ]
     assert close_reasons == ["shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_registration_lost_during_continuity_performs_zero_redis_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_commands: list[str] = []
+    registration_loss = WorkerRegistrationError("lease_fenced")
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@150-gpu:1:registered"
+        redis_stream = "vp:tasks:ffmpeg"
+        redis_group = "ffmpeg-workers"
+        worker_host = "150-gpu"
+        lease = SimpleNamespace()
+
+        def __init__(self) -> None:
+            self.lost = False
+
+        def raise_if_lost(self) -> None:
+            if self.lost:
+                raise registration_loss
+
+        async def wait_lost(self) -> WorkerRegistrationError:
+            return registration_loss
+
+        async def close(self, *, reason: str = "shutdown") -> None:
+            return None
+
+    class Redis:
+        connection_pool = SimpleNamespace(
+            connection_kwargs={"username": "vp-worker-ffmpeg"}
+        )
+
+        async def acl_whoami(self) -> str:
+            redis_commands.append("acl_whoami")
+            return "vp-worker-ffmpeg"
+
+        async def aclose(self) -> None:
+            return None
+
+    registration = Registration()
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda _env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env, **_kwargs: "token",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        lambda *_args: asyncio.sleep(0, result=registration),
+    )
+
+    async def lose_during_continuity() -> None:
+        registration.lost = True
+
+    async def consume(*_args) -> None:
+        redis_commands.append("consumer")
+
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lose_during_continuity,
+    )
+    monkeypatch.setattr(worker_main, "_redis", Redis)
+    monkeypatch.setattr(
+        worker_main,
+        "_consume_registered_worker",
+        consume,
+    )
+
+    with pytest.raises(WorkerRegistrationError, match="lease_fenced"):
+        await worker_main.main()
+
+    assert redis_commands == []
 
 
 @pytest.mark.asyncio
@@ -2631,17 +2750,20 @@ async def test_unready_continuity_revokes_registration_before_any_redis(
     monkeypatch.setattr(
         worker_main,
         "load_worker_minio_credentials",
-        lambda _env: ("worker-minio-access", "worker-minio-secret"),
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
     )
     monkeypatch.setattr(
         worker_main,
         "enforce_worker_admission_from_env",
-        lambda _env=None: None,
+        lambda _env=None, **_kwargs: None,
     )
     monkeypatch.setattr(
         worker_main,
         "load_worker_database_url",
-        lambda _env: "postgresql+asyncpg://worker@db/vp",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
     )
     monkeypatch.setattr(
         worker_main,
@@ -2651,7 +2773,7 @@ async def test_unready_continuity_revokes_registration_before_any_redis(
     monkeypatch.setattr(
         worker_main,
         "load_worker_admission_token",
-        lambda _env: "token",
+        lambda _env, **_kwargs: "token",
     )
     monkeypatch.setattr(
         worker_main,
@@ -2685,6 +2807,7 @@ async def test_unready_continuity_revokes_registration_before_any_redis(
 @pytest.mark.asyncio
 async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> None:
     events: list[str] = []
+    monkeypatch.setenv("STORAGE_BACKEND", "minio")
 
     class StopStartup(RuntimeError):
         pass
@@ -2692,20 +2815,21 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
     monkeypatch.setattr(
         worker_main,
         "load_worker_minio_credentials",
-        lambda env: events.append("minio-secrets")
+        lambda env, **_kwargs: events.append("minio-secrets")
         or ("worker-minio-access", "worker-minio-secret"),
         raising=False,
     )
     monkeypatch.setattr(
         worker_main,
         "enforce_worker_admission_from_env",
-        lambda env=None: events.append("admission"),
+        lambda env=None, **_kwargs: events.append("admission"),
         raising=False,
     )
     monkeypatch.setattr(
         worker_main,
         "load_worker_database_url",
-        lambda env: events.append("database-secret") or "postgresql+asyncpg://worker@db/vp",
+        lambda env, **_kwargs: events.append("database-secret")
+        or "postgresql+asyncpg://worker@db/vp",
         raising=False,
     )
     monkeypatch.setattr(
@@ -2724,12 +2848,15 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
     monkeypatch.setattr(
         worker_main,
         "load_worker_admission_token",
-        lambda env: events.append("token-secret") or "token",
+        lambda env, **_kwargs: events.append("token-secret") or "token",
         raising=False,
     )
 
     class Registration:
         redis_consumer_id = "ffmpeg-worker@127:1:instance"
+
+        def raise_if_lost(self) -> None:
+            return None
 
         async def close(self):
             events.append("revoke")
@@ -2763,9 +2890,9 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
         await worker_main.main()
 
     assert events == [
-        "minio-secrets",
-        "admission",
         "redis-secret",
+        "admission",
+        "minio-secrets",
         "database-secret",
         "database",
         "token-secret",
@@ -2774,6 +2901,149 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
         "redis",
         "revoke",
     ]
+
+
+@pytest.mark.asyncio
+async def test_file_backed_remote_redis_reclassifies_before_database_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis_secret = tmp_path / "redis-url"
+    redis_secret.write_text(
+        "redis://vp-worker:redis-secret@vp-redis:6379/7",
+        encoding="utf-8",
+    )
+    redis_secret.chmod(0o400)
+    env = {
+        "DEPLOY_MODE": "development",
+        "WORKER_REDIS_URL_FILE": str(redis_secret),
+        "DATABASE_URL": (
+            "postgresql+asyncpg://runtime:environment-secret@"
+            "vp-postgres/videoprocess"
+        ),
+        "WORKER_ADMISSION_TOKEN": "environment-admission-token",
+        "MINIO_ACCESS_KEY": "environment-minio-access",
+        "MINIO_SECRET_KEY": "environment-minio-secret",
+        "WORKER_TYPE": "ffmpeg",
+        "WORKER_HOST": "150-gpu",
+        "STORAGE_BACKEND": "minio",
+        "MINIO_ENDPOINT": "vp-minio:9000",
+        "MINIO_BUCKET": "videoprocess",
+    }
+    touched: list[str] = []
+
+    class DatabaseReached(RuntimeError):
+        pass
+
+    def configure_database(_database_url: str) -> None:
+        touched.append("database")
+        raise DatabaseReached
+
+    monkeypatch.setattr(worker_main.os, "environ", env)
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_redis_url",
+        load_real_worker_redis_url,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        configure_database,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_redis",
+        lambda: touched.append("redis"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        await worker_main.main()
+
+    assert exc.value.code == 2
+    assert touched == []
+
+
+@pytest.mark.asyncio
+async def test_local_storage_development_does_not_load_minio_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StopAtRedis(RuntimeError):
+        pass
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@localhost:1:registered"
+
+        def raise_if_lost(self) -> None:
+            return None
+
+        async def close(self, *, reason: str = "shutdown") -> None:
+            return None
+
+    minio_loads = 0
+
+    def load_minio(*_args, **_kwargs):
+        nonlocal minio_loads
+        minio_loads += 1
+        raise AssertionError("local storage must not load MinIO credentials")
+
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_redis_url",
+        lambda _env: "redis://127.0.0.1:6379/14",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda _env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        load_minio,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env, **_kwargs: "sqlite+aiosqlite:///worker.db",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env, **_kwargs: "development-token",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        lambda *_args: asyncio.sleep(0, result=Registration()),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lambda: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_redis",
+        lambda: (_ for _ in ()).throw(StopAtRedis),
+    )
+    monkeypatch.setattr(
+        worker_main.os,
+        "environ",
+        {
+            "DEPLOY_MODE": "development",
+            "STORAGE_BACKEND": "local",
+        },
+    )
+
+    with pytest.raises(StopAtRedis):
+        await worker_main.main()
+
+    assert minio_loads == 0
 
 
 @pytest.mark.asyncio
@@ -2787,18 +3057,21 @@ async def test_denied_durable_registration_performs_zero_redis_calls(
     monkeypatch.setattr(
         worker_main,
         "load_worker_minio_credentials",
-        lambda _env: ("worker-minio-access", "worker-minio-secret"),
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
         raising=False,
     )
     monkeypatch.setattr(
         worker_main,
         "enforce_worker_admission_from_env",
-        lambda env=None: None,
+        lambda env=None, **_kwargs: None,
     )
     monkeypatch.setattr(
         worker_main,
         "load_worker_database_url",
-        lambda env: credential,
+        lambda env, **_kwargs: credential,
         raising=False,
     )
     monkeypatch.setattr(
@@ -2809,7 +3082,7 @@ async def test_denied_durable_registration_performs_zero_redis_calls(
     monkeypatch.setattr(
         worker_main,
         "load_worker_admission_token",
-        lambda env: "admission-token",
+        lambda env, **_kwargs: "admission-token",
         raising=False,
     )
 
@@ -2936,7 +3209,7 @@ async def test_handler_constructor_failure_reports_for_exact_claim(monkeypatch) 
 async def test_denied_worker_stops_before_database_or_redis(monkeypatch) -> None:
     touched: list[str] = []
 
-    def deny_worker() -> None:
+    def deny_worker(*_args, **_kwargs) -> None:
         raise WorkerAdmissionError("unsafe worker configuration")
 
     monkeypatch.setattr(

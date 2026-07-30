@@ -3,16 +3,18 @@ from __future__ import annotations
 import asyncio
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from typing import Protocol
 
 from app.services import worker_registration as registration_contract
+from app.services.worker_admission import is_production_worker_env
 from app.services.worker_registration import (
     WorkerLease,
     WorkerRegistrationClaims,
     WorkerRegistrationError,
     WorkerRegistrationService,
 )
+from worker._build_identity import BUILD_COMMIT as EMBEDDED_BUILD_COMMIT
 
 
 class _RegistrationService(Protocol):
@@ -68,12 +70,8 @@ def build_worker_registration_claims(
         registration_contract._normalized_endpoint_bindings(endpoint_bindings)
     )
     release_commit = _required(env, "WORKER_RELEASE_COMMIT")
-    embedded_commit = str(env.get("VP_BUILD_COMMIT", "")).strip()
-    deploy_mode = str(env.get("DEPLOY_MODE", "shared")).strip().lower()
-    if (
-        deploy_mode in {"", "shared", "production"}
-        and not embedded_commit
-    ):
+    embedded_commit = EMBEDDED_BUILD_COMMIT.strip()
+    if is_production_worker_env(env, redis_url=redis_url) and not embedded_commit:
         raise WorkerRegistrationError("claim_mismatch")
     if embedded_commit and (
         re.fullmatch(r"[0-9a-f]{40}", embedded_commit) is None
@@ -119,6 +117,7 @@ class PythonWorkerRegistration:
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._lost = asyncio.Event()
         self._loss: WorkerRegistrationError | None = None
+        self._guarded_tasks: set[asyncio.Task[None]] = set()
         self._heartbeat_lock = asyncio.Lock()
         self._closed = False
 
@@ -195,6 +194,26 @@ class PythonWorkerRegistration:
         assert self._loss is not None
         return self._loss
 
+    def raise_if_lost(self) -> None:
+        if self._loss is not None:
+            raise self._loss
+
+    def create_guarded_task(
+        self,
+        awaitable: Awaitable[None],
+    ) -> asyncio.Task[None]:
+        try:
+            self.raise_if_lost()
+        except BaseException:
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise
+        task = asyncio.ensure_future(awaitable)
+        self._guarded_tasks.add(task)
+        task.add_done_callback(self._guarded_tasks.discard)
+        return task
+
     async def close(self, *, reason: str = "shutdown") -> None:
         if self._closed:
             return
@@ -236,6 +255,8 @@ class PythonWorkerRegistration:
         if self._loss is None:
             self._loss = error
             self._lost.set()
+            for task in tuple(self._guarded_tasks):
+                task.cancel()
 
 
 def _required(env: Mapping[str, str], key: str) -> str:

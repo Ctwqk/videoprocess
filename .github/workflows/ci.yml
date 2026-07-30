@@ -40,6 +40,7 @@ jobs:
     env:
       CHANNEL_OPS_POSTGRES_TEST_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
       CHANNEL_OPS_GO_POSTGRES_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      CHANNEL_OPS_GO_REDIS_TEST_URL: redis://127.0.0.1:6379/14
       VISION_CUTOVER_REDIS_TEST_URL: redis://127.0.0.1:6379/0
     steps:
       - uses: actions/checkout@v6
@@ -74,6 +75,15 @@ jobs:
             CHANNELOPS_REQUIRE_DATABASE="1" \
             go test -count=1 ./internal/channelops ./internal/store \
             | tee ci-evidence/backend/go-channelops-postgres.txt
+      - name: Run Go worker registration fence integration tests
+        run: |
+          set -o pipefail
+          output="ci-evidence/backend/go-worker-registration.txt"
+          go test -count=1 -v ./internal/worker | tee "$output"
+          if grep -Eq '^[[:space:]]*--- SKIP:' "$output"; then
+            echo "Go worker registration integration tests skipped" >&2
+            exit 1
+          fi
       - name: Run backend tests
         run: |
           set -o pipefail

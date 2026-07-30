@@ -5111,6 +5111,7 @@ func newWorkerIntakePostgresFixture(
 	claimRedisURL.Host = net.JoinHostPort("vp-redis", redisPort)
 	claims, err := BuildRegistrationClaims(
 		map[string]string{
+			"DEPLOY_MODE":                 "production",
 			"WORKER_SERVICE_NAME":         serviceName,
 			"WORKER_ADMISSION_GENERATION": "1",
 			"WORKER_SLOT":                 "1",
@@ -5118,6 +5119,7 @@ func newWorkerIntakePostgresFixture(
 			"WORKER_HOST":                 "host127",
 			"WORKER_CAPABILITIES":         "media_cpu",
 			"WORKER_RELEASE_COMMIT":       "0123456789abcdef0123456789abcdef01234567",
+			"VP_BUILD_COMMIT":             "0123456789abcdef0123456789abcdef01234567",
 			"WORKER_IMAGE_IDENTITY":       "vp-ffmpeg-go-worker:deploy-0123456789ab",
 			"WORKER_REDIS_STREAM":         stream,
 			"WORKER_REDIS_GROUP":          group,

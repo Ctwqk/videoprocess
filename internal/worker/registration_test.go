@@ -128,6 +128,26 @@ func TestRegistrationFingerprintFixtureParity(t *testing.T) {
 	}
 }
 
+func TestEndpointBindingsUseEffectiveClientQueryTargets(t *testing.T) {
+	bindings, err := BuildEndpointBindingsWithRedis(
+		map[string]string{"STORAGE_BACKEND": "not_applicable"},
+		"postgresql://worker:redacted@db-claimed:5432/claimed"+
+			"?host=db-actual&port=5544&database=actual",
+		"redis://worker:redacted@redis-claimed:6379/0?db=7",
+	)
+	if err != nil {
+		t.Fatalf("BuildEndpointBindingsWithRedis: %v", err)
+	}
+	if got := bindings.Canonical["database"]; got !=
+		`{"database":"actual","driver":"postgresql","host":"db-actual","port":5544}` {
+		t.Fatalf("database identity = %s; want effective client target", got)
+	}
+	if got := bindings.Canonical["redis"]; got !=
+		`{"database":7,"host":"redis-claimed","port":6379,"scheme":"redis"}` {
+		t.Fatalf("Redis identity = %s; want effective client target", got)
+	}
+}
+
 func TestRegistrationEndpointValidationFixtureParity(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(
 		"..", "..", "tests", "fixtures", "worker_registration", "fingerprints-v1.json",

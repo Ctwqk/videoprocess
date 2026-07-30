@@ -1781,7 +1781,7 @@ async def _run_until_registration_loss(
     registration: PythonWorkerRegistration,
     consumer: Awaitable[None],
 ) -> None:
-    consumer_task = asyncio.ensure_future(consumer)
+    consumer_task = registration.create_guarded_task(consumer)
     loss_task = asyncio.create_task(registration.wait_lost())
     try:
         done, _ = await asyncio.wait(
@@ -1820,6 +1820,7 @@ async def _consume_registered_worker(
     message_tasks: set[asyncio.Task[None]] = set()
     emission_reconciler_task: asyncio.Task[None] | None = None
     try:
+        registration.raise_if_lost()
         try:
             await redis.xgroup_create(
                 TASK_STREAM,
@@ -1945,17 +1946,35 @@ async def main() -> None:
     redis: aioredis.Redis | None = None
     try:
         try:
-            minio_access_key, minio_secret_key = (
-                load_worker_minio_credentials(env)
-            )
-            settings.minio_access_key = minio_access_key
-            settings.minio_secret_key = minio_secret_key
-            enforce_worker_admission_from_env(env)
             redis_url = load_worker_redis_url(env)
+            enforce_worker_admission_from_env(
+                env,
+                redis_url=redis_url,
+            )
+            if (
+                str(env.get("STORAGE_BACKEND", "local"))
+                .strip()
+                .lower()
+                == "minio"
+            ):
+                minio_access_key, minio_secret_key = (
+                    load_worker_minio_credentials(
+                        env,
+                        redis_url=redis_url,
+                    )
+                )
+                settings.minio_access_key = minio_access_key
+                settings.minio_secret_key = minio_secret_key
             settings.redis_url = redis_url
-            database_url = load_worker_database_url(env)
+            database_url = load_worker_database_url(
+                env,
+                redis_url=redis_url,
+            )
             configure_worker_database(database_url)
-            admission_token = load_worker_admission_token(env)
+            admission_token = load_worker_admission_token(
+                env,
+                redis_url=redis_url,
+            )
             registration = await _start_worker_registration(
                 env,
                 database_url,
@@ -1978,13 +1997,16 @@ async def main() -> None:
             logger.critical("Worker admission denied: %s", exc)
             raise SystemExit(2) from exc
 
+        registration.raise_if_lost()
         WORKER_ID = registration.redis_consumer_id
         redis = _redis()
+        registration.raise_if_lost()
         try:
             await _require_worker_redis_identity(redis)
         except WorkerRegistrationError as exc:
             logger.critical("Worker admission denied: %s", exc)
             raise SystemExit(2) from exc
+        registration.raise_if_lost()
         await _run_until_registration_loss(
             registration,
             _consume_registered_worker(redis, registration),

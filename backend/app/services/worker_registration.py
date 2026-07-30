@@ -11,10 +11,13 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
+from redis.asyncio.connection import parse_url as parse_redis_url
 from sqlalchemy import func, select, text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError, DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.worker_registration import (
@@ -952,56 +955,91 @@ def _integral_json_number(
 
 def _database_identity(env: Mapping[str, str]) -> dict[str, object]:
     raw_url = str(env.get("DATABASE_URL", "")).strip()
-    parsed = urlsplit(raw_url)
-    driver = parsed.scheme.split("+", 1)[0].lower()
-    host = _normalized_host(parsed.hostname)
+    identity, _ = _database_connection_identity(raw_url)
+    return identity
+
+
+def _database_connection_identity(
+    raw_url: str,
+) -> tuple[dict[str, object], str]:
     try:
-        port = parsed.port
-    except ValueError as error:
+        parsed = make_url(raw_url)
+        driver = parsed.drivername.split("+", 1)[0].lower()
+        _, connection_options = PGDialect_asyncpg().create_connect_args(
+            parsed
+        )
+        raw_host = connection_options.get("host")
+        raw_port = connection_options.get("port", 5432)
+        raw_database = connection_options.get("database")
+        raw_principal = connection_options.get("user")
+    except (ArgumentError, TypeError, ValueError) as error:
         raise ValueError("invalid database dependency") from error
-    database = unquote(parsed.path.removeprefix("/"))
+    if any(
+        isinstance(value, (list, tuple))
+        for value in (raw_host, raw_port, raw_database, raw_principal)
+    ):
+        raise ValueError("invalid database dependency")
+    host = _normalized_host(
+        raw_host if isinstance(raw_host, str) else None
+    )
+    database = (
+        raw_database if isinstance(raw_database, str) else ""
+    )
+    principal = (
+        raw_principal if isinstance(raw_principal, str) else ""
+    )
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid database dependency") from error
     if (
         driver not in {"postgres", "postgresql"}
         or not host
         or not _is_valid_dependency_host(host)
         or _DEPENDENCY_NAME_PATTERN.fullmatch(database) is None
-        or port is not None
-        and not 1 <= port <= 65535
+        or not 1 <= port <= 65535
     ):
         raise ValueError("invalid database dependency")
-    return {
-        "driver": "postgresql",
-        "host": host,
-        "port": port or 5432,
-        "database": database,
-    }
+    return (
+        {
+            "driver": "postgresql",
+            "host": host,
+            "port": port,
+            "database": database,
+        },
+        principal,
+    )
 
 
 def _redis_identity(env: Mapping[str, str]) -> dict[str, object]:
     raw_url = str(env.get("REDIS_URL", "")).strip()
     parsed = urlsplit(raw_url)
     scheme = parsed.scheme.lower()
-    host = _normalized_host(parsed.hostname)
     try:
-        port = parsed.port
-    except ValueError as error:
+        connection_options = parse_redis_url(raw_url)
+        raw_host = connection_options.get("host")
+        raw_port = connection_options.get("port", 6379)
+        database = connection_options.get("db", 0)
+        port = int(raw_port)
+    except (TypeError, ValueError) as error:
         raise ValueError("invalid Redis dependency") from error
-    path = parsed.path.removeprefix("/")
+    host = _normalized_host(
+        raw_host if isinstance(raw_host, str) else None
+    )
     if (
         scheme not in {"redis", "rediss"}
         or not host
         or not _is_valid_dependency_host(host)
-        or port is not None
-        and not 1 <= port <= 65535
-        or (path and (not path.isdigit() or "/" in path))
-        or int(path or "0") > 2147483647
+        or not 1 <= port <= 65535
+        or type(database) is not int
+        or not 0 <= database <= 2147483647
     ):
         raise ValueError("invalid Redis dependency")
     return {
         "scheme": scheme,
         "host": host,
-        "port": port or 6379,
-        "database": int(path or "0"),
+        "port": port,
+        "database": database,
     }
 
 

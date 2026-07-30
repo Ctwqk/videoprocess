@@ -131,7 +131,8 @@ async def test_render_request_uses_versioned_state_and_canonical_topology(
         role_names,
         database_url=(
             f"postgresql+asyncpg://{role_names.versioned}:secret@"
-            "vp-postgres:5435/videoprocess"
+            "db-claimed:5435/claimed"
+            "?host=vp-postgres&port=5544&database=videoprocess"
         ),
         admission_token="admission-secret",
     )
@@ -193,7 +194,7 @@ async def test_render_request_uses_versioned_state_and_canonical_topology(
             "database": {
                 "driver": "postgresql",
                 "host": "vp-postgres",
-                "port": 5435,
+                "port": 5544,
                 "database": "videoprocess",
             },
             "redis": {

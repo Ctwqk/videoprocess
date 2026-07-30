@@ -144,6 +144,93 @@ func TestRegistrationSecretReaderRejectsWrongModeOversizeAndSymlink(t *testing.T
 	}
 }
 
+type shortSecretReader struct {
+	reader *strings.Reader
+}
+
+func (r *shortSecretReader) Read(buffer []byte) (int, error) {
+	if len(buffer) > 2 {
+		buffer = buffer[:2]
+	}
+	return r.reader.Read(buffer)
+}
+
+func TestRegistrationSecretReaderHandlesShortReads(t *testing.T) {
+	raw, err := readExactSecret(
+		&shortSecretReader{reader: strings.NewReader("complete-secret")},
+		int64(len("complete-secret")),
+	)
+	if err != nil {
+		t.Fatalf("readExactSecret: %v", err)
+	}
+	if got := string(raw); got != "complete-secret" {
+		t.Fatalf("short-read secret = %q; want complete-secret", got)
+	}
+}
+
+func TestRegistrationSecretReaderRejectsGrowthDuringFinalIdentityCheck(
+	t *testing.T,
+) {
+	path := writeWorkerSecret(t, "growing-secret", "secret", 0o400)
+	_, err := readMode0400Secret(
+		path,
+		"worker secret",
+		func() error {
+			if chmodErr := os.Chmod(path, 0o600); chmodErr != nil {
+				return chmodErr
+			}
+			handle, openErr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			if openErr != nil {
+				return openErr
+			}
+			_, writeErr := handle.WriteString("-growth")
+			closeErr := handle.Close()
+			if chmodErr := os.Chmod(path, 0o400); chmodErr != nil {
+				return chmodErr
+			}
+			if writeErr != nil {
+				return writeErr
+			}
+			return closeErr
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "changed while being read") {
+		t.Fatalf("growth mutation error = %v; want changed-while-read", err)
+	}
+}
+
+func TestRegistrationSecretReaderRejectsSameIdentityMutationWithRestoredMtime(
+	t *testing.T,
+) {
+	path := writeWorkerSecret(t, "mutating-secret", "abcdef", 0o400)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat secret before mutation: %v", err)
+	}
+	_, err = readMode0400Secret(
+		path,
+		"worker secret",
+		func() error {
+			if chmodErr := os.Chmod(path, 0o600); chmodErr != nil {
+				return chmodErr
+			}
+			if writeErr := os.WriteFile(path, []byte("UVWXYZ"), 0o600); writeErr != nil {
+				return writeErr
+			}
+			if chmodErr := os.Chmod(path, 0o400); chmodErr != nil {
+				return chmodErr
+			}
+			return os.Chtimes(path, before.ModTime(), before.ModTime())
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "changed while being read") {
+		t.Fatalf(
+			"same-identity mutation error = %v; want changed-while-read",
+			err,
+		)
+	}
+}
+
 func TestRegistrationNonProductionSecretsAllowExplicitFallbacks(t *testing.T) {
 	secrets, err := LoadWorkerSecrets(map[string]string{
 		"DEPLOY_MODE":            "local",

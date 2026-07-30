@@ -85,8 +85,12 @@ def read_mode_0400_secret(
     return decoded
 
 
-def load_worker_database_url(env: Mapping[str, str]) -> str:
-    if is_production_worker_env(env):
+def load_worker_database_url(
+    env: Mapping[str, str],
+    *,
+    redis_url: str | None = None,
+) -> str:
+    if is_production_worker_env(env, redis_url=redis_url):
         if str(env.get("DATABASE_URL", "")).strip():
             raise WorkerSecretError(
                 "production workers must not receive DATABASE_URL through the environment"
@@ -107,8 +111,12 @@ def load_worker_database_url(env: Mapping[str, str]) -> str:
     return database_url
 
 
-def load_worker_admission_token(env: Mapping[str, str]) -> str:
-    production = is_production_worker_env(env)
+def load_worker_admission_token(
+    env: Mapping[str, str],
+    *,
+    redis_url: str | None = None,
+) -> str:
+    production = is_production_worker_env(env, redis_url=redis_url)
     environment_token = str(env.get("WORKER_ADMISSION_TOKEN", "")).strip()
     if production and environment_token:
         raise WorkerSecretError(
@@ -129,8 +137,10 @@ def load_worker_admission_token(env: Mapping[str, str]) -> str:
 
 def load_worker_minio_credentials(
     env: Mapping[str, str],
+    *,
+    redis_url: str | None = None,
 ) -> tuple[str, str]:
-    production = is_production_worker_env(env)
+    production = is_production_worker_env(env, redis_url=redis_url)
     environment_access = str(env.get("MINIO_ACCESS_KEY", "")).strip()
     environment_secret = str(env.get("MINIO_SECRET_KEY", "")).strip()
     if production and (environment_access or environment_secret):
@@ -171,10 +181,10 @@ def load_worker_minio_credentials(
 
 
 def load_worker_redis_url(env: Mapping[str, str]) -> str:
-    production = is_production_worker_env(env)
+    preliminary_production = is_production_worker_env(env)
     environment_url = str(env.get("REDIS_URL", "")).strip()
     path = str(env.get("WORKER_REDIS_URL_FILE", "")).strip()
-    if production:
+    if preliminary_production:
         if environment_url:
             raise WorkerSecretError(
                 "production workers must not receive REDIS_URL through the environment"
@@ -196,6 +206,16 @@ def load_worker_redis_url(env: Mapping[str, str]) -> str:
         redis_url = environment_url
     else:
         raise WorkerSecretError("worker Redis URL is not configured")
+
+    production = is_production_worker_env(env, redis_url=redis_url)
+    if production and environment_url:
+        raise WorkerSecretError(
+            "production workers must not receive REDIS_URL through the environment"
+        )
+    if production and not path:
+        raise WorkerSecretError(
+            "production workers require WORKER_REDIS_URL_FILE"
+        )
 
     try:
         parsed = urlparse(redis_url)

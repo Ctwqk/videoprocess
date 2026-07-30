@@ -29,7 +29,7 @@ def _install_database_resources(
     monkeypatch.setattr(
         cli,
         "_load_minio_credentials",
-        lambda env: None,
+        lambda env: ("janitor-access", "janitor-secret"),
         raising=False,
     )
     return engine, session_factory
@@ -86,16 +86,14 @@ async def test_cli_runs_exact_janitor_and_reports_counts(
             }
 
     storage = SimpleNamespace(client=object(), bucket="videoprocess")
-    monkeypatch.setattr(
-        cli,
-        "get_storage",
-        lambda name, *, create_bucket: (
-            storage
-            if (name, create_bucket) == ("minio", False)
-            else None
-        ),
-    )
-    monkeypatch.setattr(cli, "MinioStorageBackend", SimpleNamespace)
+
+    def construct_storage(**kwargs):
+        assert kwargs["access_key"] == "janitor-access"
+        assert kwargs["secret_key"] == "janitor-secret"
+        assert kwargs["create_bucket"] is False
+        return storage
+
+    monkeypatch.setattr(cli, "MinioStorageBackend", construct_storage)
     monkeypatch.setattr(cli, "StagingObjectJanitor", Janitor)
     monkeypatch.setattr(
         cli,
@@ -160,7 +158,7 @@ async def test_cli_fails_closed_without_leaking_error(
     def fail(*args, **kwargs):
         raise RuntimeError("secret")
 
-    monkeypatch.setattr(cli, "get_storage", fail)
+    monkeypatch.setattr(cli, "MinioStorageBackend", fail)
     monkeypatch.setattr(
         cli,
         "StagingJanitorStatusStore",
@@ -209,7 +207,7 @@ async def test_cli_skips_overlapping_run_without_constructing_storage(
     def unexpected_storage(*args, **kwargs):
         raise AssertionError("overlap must not construct MinIO")
 
-    monkeypatch.setattr(cli, "get_storage", unexpected_storage)
+    monkeypatch.setattr(cli, "MinioStorageBackend", unexpected_storage)
     monkeypatch.setattr(
         cli,
         "StagingJanitorStatusStore",
@@ -298,6 +296,16 @@ def test_minio_credentials_require_independent_mode_0400_secrets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     reads: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        cli.settings,
+        "minio_access_key",
+        "process-access",
+    )
+    monkeypatch.setattr(
+        cli.settings,
+        "minio_secret_key",
+        "process-secret",
+    )
 
     def read_secret(path, *, label):
         reads.append((path, label))
@@ -307,7 +315,7 @@ def test_minio_credentials_require_independent_mode_0400_secrets(
         }[label]
 
     monkeypatch.setattr(cli, "read_mode_0400_secret", read_secret)
-    cli._load_minio_credentials(
+    credentials = cli._load_minio_credentials(
         {
             "VP_STAGING_JANITOR_MINIO_ACCESS_KEY_FILE": (
                 "/run/secrets/vp-staging-janitor-minio-access-key"
@@ -318,8 +326,9 @@ def test_minio_credentials_require_independent_mode_0400_secrets(
         }
     )
 
-    assert cli.settings.minio_access_key == "access-secret"
-    assert cli.settings.minio_secret_key == "password-secret"
+    assert credentials == ("access-secret", "password-secret")
+    assert cli.settings.minio_access_key == "process-access"
+    assert cli.settings.minio_secret_key == "process-secret"
     assert reads == [
         (
             "/run/secrets/vp-staging-janitor-minio-access-key",

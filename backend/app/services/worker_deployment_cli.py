@@ -14,8 +14,8 @@ from typing import Never
 import asyncpg  # type: ignore[import-untyped]
 from alembic import command
 from alembic.config import Config
-from sqlalchemy.engine import make_url
 
+from app.services import worker_registration as registration_contract
 from app.services import worker_registration_operator_cli as operator_cli
 from app.services import worker_runtime_role_cli as runtime_cli
 from app.services.worker_role_cli_common import (
@@ -411,11 +411,11 @@ def _render_request(
     }
     if state != expected_state:
         raise WorkerDeploymentError("runtime state invalid")
-    parsed_database = make_url(database_url)
+    database_binding, database_principal = (
+        registration_contract._database_connection_identity(database_url)
+    )
     if (
-        parsed_database.username != names.versioned
-        or parsed_database.host is None
-        or parsed_database.database is None
+        database_principal != names.versioned
     ):
         raise WorkerDeploymentError("runtime database identity invalid")
 
@@ -432,12 +432,7 @@ def _render_request(
         "redis_stream": topology["redis_stream"],
         "redis_group": topology["redis_group"],
         "endpoint_bindings": {
-            "database": {
-                "driver": "postgresql",
-                "host": parsed_database.host,
-                "port": parsed_database.port or 5432,
-                "database": parsed_database.database,
-            },
+            "database": database_binding,
             "redis": {
                 "scheme": "redis",
                 "host": args.redis_host,
