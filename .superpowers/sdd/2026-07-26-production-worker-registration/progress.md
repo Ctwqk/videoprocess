@@ -179,6 +179,19 @@ descriptor-relative no-follow creation owns every prospective bind path;
 database credentials stream over container stdin into tmpfs instead of being
 copied below durable admission state; holder creation explicitly clears and
 then production-validates the inherited image entrypoint.
+Task 4B/4C Worker Track A: fix round 5/5 at a0579d6 addressed bind-source
+pre-mutation and the real CUDA holder path, and removed durable credential
+copies, but final review left 1 Important finding open: one-shot operation
+records have no exclusive/liveness owner, normal signals leave sentinel state,
+and an overlapping invocation can delete a live operation and turn a
+successful control mutation into a false failure.
+Task 4B/4C Worker Track A: BLOCKED at the five-round breaker — I-R5-1 is real
+and load-bearing; do not declare Track A complete or deploy this range.
+Task 4B/4C breaker continuation: the user's standing instruction to continue
+past protocol blocks and pre-approval of implementation plans authorizes
+routing I-R5-1 into Deploy Track B substage 1. It shares the already-designed
+exclusive `transaction.lock` and dead-owner-only reconciliation mechanism;
+that substage must close I-R5-1 before any forward/rollback mutation work.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
