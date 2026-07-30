@@ -220,6 +220,14 @@ authority provisioned before the first secret is not durably represented, so
 an empty-secret abort can archive without revoke evidence.
 Task 4B/4C Deploy Track B stage 1: fix round 3/5 in progress; stage 2 remains
 blocked.
+Task 4B/4C Deploy Track B stage 1: fix round 3/5 at 1d13211 addressed all
+four prior findings but introduced two Important cross-process continuity
+gaps: a pre-release FIFO supervisor inherits both the FIFO write side and
+transaction lock, so parent SIGKILL leaves an orphan that blocks replay; and
+the authority WAL changes required schema-1 fields without a version bump,
+migration, or stable quarantine for older PREPARING/ABORTING journals.
+Task 4B/4C Deploy Track B stage 1: fix round 4/5 in progress with a fresh
+implementer; stage 2 remains blocked.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
