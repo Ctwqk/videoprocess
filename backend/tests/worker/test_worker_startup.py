@@ -14,6 +14,7 @@ import pytest
 from app.services.worker_admission import WorkerAdmissionError
 from app.services.worker_registration import WorkerLease, WorkerRegistrationError
 from worker import main as worker_main
+from worker.registration import PythonWorkerRegistration
 from worker.secret_config import (
     load_worker_redis_url as load_real_worker_redis_url,
 )
@@ -2447,7 +2448,7 @@ async def test_main_restores_process_globals_for_repeated_in_process_runs(
     monkeypatch.setattr(
         worker_main,
         "_require_worker_redis_identity",
-        lambda _redis: asyncio.sleep(0),
+        lambda _redis, _registration: asyncio.sleep(0),
     )
     monkeypatch.setattr(worker_main, "_redis", Redis)
     monkeypatch.setattr(worker_main, "_consume_registered_worker", consume)
@@ -2485,6 +2486,9 @@ async def test_registered_worker_requires_continuity_and_acl_identity_before_gro
 
         def raise_if_lost(self) -> None:
             return None
+
+        def create_guarded_task(self, awaitable):
+            return asyncio.create_task(awaitable)
 
         async def close(self, *, reason: str = "shutdown"):
             close_reasons.append(reason)
@@ -2675,6 +2679,87 @@ async def test_registration_lost_during_continuity_performs_zero_redis_io(
     with pytest.raises(WorkerRegistrationError, match="lease_fenced"):
         await worker_main.main()
 
+    assert redis_commands == []
+
+
+@pytest.mark.asyncio
+async def test_registration_loss_cancels_acl_handshake_before_command_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_commands: list[str] = []
+    send_boundary = asyncio.Event()
+    allow_send = asyncio.Event()
+    registration_loss = WorkerRegistrationError("lease_fenced")
+    registration = PythonWorkerRegistration(
+        object(),
+        SimpleNamespace(),
+        "admission-token",
+    )
+    registration._lease = SimpleNamespace(  # noqa: SLF001
+        redis_consumer_id="ffmpeg-worker@150-gpu:1:registered"
+    )
+
+    class Redis:
+        connection_pool = SimpleNamespace(
+            connection_kwargs={"username": "vp-worker-ffmpeg"}
+        )
+
+        async def acl_whoami(self) -> str:
+            send_boundary.set()
+            await allow_send.wait()
+            redis_commands.append("acl_whoami")
+            return "vp-worker-ffmpeg"
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda _env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env, **_kwargs: "token",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        lambda *_args: asyncio.sleep(0, result=registration),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lambda: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(worker_main, "_redis", Redis)
+
+    run = asyncio.create_task(worker_main.main())
+    await asyncio.wait_for(send_boundary.wait(), timeout=1)
+    registration._mark_lost(registration_loss)  # noqa: SLF001
+    allow_send.set()
+
+    with pytest.raises(WorkerRegistrationError, match="lease_fenced"):
+        await asyncio.wait_for(run, timeout=1)
     assert redis_commands == []
 
 

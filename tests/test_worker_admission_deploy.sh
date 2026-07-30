@@ -381,14 +381,35 @@ for worker_cli in \
   fi
 done
 python_worker_dockerfile="$ROOT_DIR/backend/Dockerfile.worker"
-if ! grep -Fq '/app/worker/_build_identity.py' \
+if ! grep -Fq '/usr/local/share/videoprocess/worker-build-commit' \
   "$python_worker_dockerfile"; then
-  echo 'FAIL: Python worker image does not bind commit into its runtime artifact' >&2
+  echo 'FAIL: Python worker image does not use a fixed build identity artifact' >&2
+  exit 1
+fi
+if ! grep -Fq 'USER videoprocess-worker' \
+  "$python_worker_dockerfile"; then
+  echo 'FAIL: Python worker image does not use its dedicated runtime user' >&2
+  exit 1
+fi
+if ! grep -Fq '["/opt/venv/bin/python", "-I", "-m", "worker.main"]' \
+  "$python_worker_dockerfile"; then
+  echo 'FAIL: Python worker entrypoint does not reject import path injection' >&2
+  exit 1
+fi
+if grep -Fq '/app/worker/_build_identity.py' \
+  "$python_worker_dockerfile"; then
+  echo 'FAIL: Python worker still uses an import-shadowable identity module' >&2
   exit 1
 fi
 if grep -Eq '^ENV[[:space:]]+VP_BUILD_COMMIT=' \
   "$python_worker_dockerfile"; then
   echo 'FAIL: Python worker image exposes a runtime-overridable build commit' >&2
+  exit 1
+fi
+python_worker_image_test="$ROOT_DIR/tests/test_python_worker_image_identity.sh"
+if [[ ! -x "$python_worker_image_test" ]] \
+  || ! bash -n "$python_worker_image_test"; then
+  echo 'FAIL: Python worker image behavior probe is missing or invalid' >&2
   exit 1
 fi
 

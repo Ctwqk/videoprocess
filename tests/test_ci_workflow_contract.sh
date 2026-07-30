@@ -25,7 +25,7 @@ required_lines=(
   'CHANNELOPS_REQUIRE_DATABASE="1"'
   'go test -count=1 ./internal/channelops ./internal/store'
   "name: Run Go worker registration fence integration tests"
-  "go test -count=1 -v ./internal/worker"
+  "go test -count=1 -v ./internal/worker ./cmd/vp-ffmpeg-worker"
   "Go worker registration integration tests skipped"
   "go test ./..."
   "npm run build"

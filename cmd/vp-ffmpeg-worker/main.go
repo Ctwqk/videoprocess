@@ -111,10 +111,16 @@ func runWorker(
 	cfg.RedisURL = secrets.RedisURL
 	cfg.MinIOAccessKey = secrets.MinIOAccessKey
 	cfg.MinIOSecretKey = secrets.MinIOSecretKey
+	effectiveDatabaseDSN, err := worker.EffectiveWorkerDatabaseDSN(
+		secrets.DatabaseURL,
+	)
+	if err != nil {
+		return err
+	}
 	instanceID := uuid.New()
 	claims, err := worker.BuildRegistrationClaimsWithRedis(
 		env,
-		secrets.DatabaseURL,
+		effectiveDatabaseDSN,
 		secrets.RedisURL,
 		instanceID,
 	)
@@ -125,7 +131,7 @@ func runWorker(
 	openContext, openCancel := context.WithTimeout(ctx, 10*time.Second)
 	database, err := dependencies.openDatabase(
 		openContext,
-		secrets.DatabaseURL,
+		effectiveDatabaseDSN,
 	)
 	openCancel()
 	if err != nil {

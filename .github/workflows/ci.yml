@@ -79,7 +79,7 @@ jobs:
         run: |
           set -o pipefail
           output="ci-evidence/backend/go-worker-registration.txt"
-          go test -count=1 -v ./internal/worker | tee "$output"
+          go test -count=1 -v ./internal/worker ./cmd/vp-ffmpeg-worker | tee "$output"
           if grep -Eq '^[[:space:]]*--- SKIP:' "$output"; then
             echo "Go worker registration integration tests skipped" >&2
             exit 1

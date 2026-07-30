@@ -2,15 +2,21 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"net"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/storage"
+	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/Ctwqk/videoprocess/internal/worker"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -181,6 +187,278 @@ func TestWorkerStartupValidatesStaticClaimsBeforeDatabaseOpen(
 	}
 	if databaseOpens != 0 {
 		t.Fatalf("database opens = %d; want 0", databaseOpens)
+	}
+}
+
+func TestWorkerStartupUsesEffectivePgxDSNForClaimsAndDatabaseOpen(
+	t *testing.T,
+) {
+	calls := []string{}
+	registrationFailure := errors.New("stop after database open")
+	database := &startupDatabaseStub{
+		calls:       &calls,
+		registerErr: registrationFailure,
+	}
+	secrets := workerStartupTestSecrets(
+		"redis://go-worker:redis-secret@vp-redis:6379/3",
+	)
+	secrets.DatabaseURL =
+		"postgresql+asyncpg://runtime:test@vp-postgres:5432/videoprocess" +
+			"?application_name=vp-worker"
+	var openedDatabaseURL string
+
+	err := runWorker(
+		context.Background(),
+		workerStartupTestEnv(),
+		startupDependencies{
+			loadSecrets: func(map[string]string) (worker.SecretConfig, error) {
+				return secrets, nil
+			},
+			openDatabase: func(
+				_ context.Context,
+				databaseURL string,
+			) (startupDatabase, error) {
+				openedDatabaseURL = databaseURL
+				return database, nil
+			},
+		},
+	)
+
+	if !errors.Is(err, registrationFailure) {
+		t.Fatalf("runWorker error = %v; want registration failure", err)
+	}
+	wantDatabaseURL :=
+		"postgresql://runtime:test@vp-postgres:5432/videoprocess" +
+			"?application_name=vp-worker"
+	if openedDatabaseURL != wantDatabaseURL {
+		t.Fatalf(
+			"database open URL = %q; want effective pgx URL %q",
+			openedDatabaseURL,
+			wantDatabaseURL,
+		)
+	}
+	wantBindings, err := worker.BuildEndpointBindingsWithRedis(
+		workerStartupTestEnv(),
+		openedDatabaseURL,
+		secrets.RedisURL,
+	)
+	if err != nil {
+		t.Fatalf("build expected endpoint bindings: %v", err)
+	}
+	if database.claims.DatabaseFingerprint !=
+		wantBindings.Fingerprints["database"] {
+		t.Fatalf(
+			"claim database fingerprint = %q; want %q from opened URL",
+			database.claims.DatabaseFingerprint,
+			wantBindings.Fingerprints["database"],
+		)
+	}
+}
+
+func TestWorkerStartupOpensRuntimeRoleAsyncpgURLAgainstPostgres16(
+	t *testing.T,
+) {
+	adminURL := strings.TrimSpace(
+		os.Getenv("CHANNEL_OPS_GO_POSTGRES_TEST_URL"),
+	)
+	if adminURL == "" {
+		t.Skip(
+			"set CHANNEL_OPS_GO_POSTGRES_TEST_URL for PostgreSQL 16 startup integration",
+		)
+	}
+	parsedAdminURL, err := url.Parse(adminURL)
+	if err != nil {
+		t.Fatalf("parse PostgreSQL integration URL: %v", err)
+	}
+	roleName := parsedAdminURL.User.Username()
+	rolePassword, hasPassword := parsedAdminURL.User.Password()
+	if roleName == "" || !hasPassword {
+		t.Fatal("PostgreSQL integration URL must include user and password")
+	}
+	port := parsedAdminURL.Port()
+	if port == "" {
+		port = "5432"
+	}
+	integrationHost := "vp-postgres.integration"
+	parsedAdminURL.Scheme = "postgresql+asyncpg"
+	parsedAdminURL.Host = net.JoinHostPort(integrationHost, port)
+	query := parsedAdminURL.Query()
+	query.Set("sslmode", "disable")
+	parsedAdminURL.RawQuery = query.Encode()
+	installLoopbackDNSResolver(t)
+	runtimeRoleURL := generateRuntimeRoleDatabaseURL(
+		t,
+		parsedAdminURL.String(),
+		roleName,
+		rolePassword,
+	)
+	if !strings.HasPrefix(runtimeRoleURL, "postgresql+asyncpg://") {
+		t.Fatalf(
+			"runtime-role URL scheme = %q; want postgresql+asyncpg",
+			runtimeRoleURL,
+		)
+	}
+
+	calls := []string{}
+	registrationFailure := errors.New("stop after real database open")
+	database := &startupDatabaseStub{
+		calls:       &calls,
+		registerErr: registrationFailure,
+	}
+	secrets := workerStartupTestSecrets(
+		"redis://go-worker:redis-secret@vp-redis:6379/3",
+	)
+	secrets.DatabaseURL = runtimeRoleURL
+	var openedDatabaseURL string
+	var serverVersion int
+	err = runWorker(
+		context.Background(),
+		workerStartupTestEnv(),
+		startupDependencies{
+			loadSecrets: func(map[string]string) (worker.SecretConfig, error) {
+				return secrets, nil
+			},
+			openDatabase: func(
+				ctx context.Context,
+				databaseURL string,
+			) (startupDatabase, error) {
+				openedDatabaseURL = databaseURL
+				opened, openErr := store.Open(ctx, databaseURL)
+				if openErr != nil {
+					return nil, openErr
+				}
+				defer opened.Close()
+				var rawVersion string
+				if queryErr := opened.Pool.QueryRow(
+					ctx,
+					"SHOW server_version_num",
+				).Scan(&rawVersion); queryErr != nil {
+					return nil, queryErr
+				}
+				serverVersion, openErr = strconv.Atoi(rawVersion)
+				if openErr != nil {
+					return nil, openErr
+				}
+				return database, nil
+			},
+		},
+	)
+
+	if !errors.Is(err, registrationFailure) {
+		t.Fatalf("runWorker error = %v; want registration failure", err)
+	}
+	wantDatabaseURL := strings.Replace(
+		runtimeRoleURL,
+		"postgresql+asyncpg://",
+		"postgresql://",
+		1,
+	)
+	if openedDatabaseURL != wantDatabaseURL {
+		t.Fatalf(
+			"store.Open URL = %q; want effective runtime-role URL %q",
+			openedDatabaseURL,
+			wantDatabaseURL,
+		)
+	}
+	if serverVersion < 160000 {
+		t.Fatalf("PostgreSQL version = %d; require 160000 or newer", serverVersion)
+	}
+	wantBindings, err := worker.BuildEndpointBindingsWithRedis(
+		workerStartupTestEnv(),
+		openedDatabaseURL,
+		secrets.RedisURL,
+	)
+	if err != nil {
+		t.Fatalf("build expected endpoint bindings: %v", err)
+	}
+	if database.claims.DatabaseFingerprint !=
+		wantBindings.Fingerprints["database"] {
+		t.Fatalf(
+			"claim database fingerprint = %q; want %q from store.Open URL",
+			database.claims.DatabaseFingerprint,
+			wantBindings.Fingerprints["database"],
+		)
+	}
+}
+
+func TestWorkerStartupRejectsPostgresEndpointIndirectionBeforeDatabaseOpen(
+	t *testing.T,
+) {
+	serviceFile := filepath.Join(t.TempDir(), "pg_service.conf")
+	if err := os.WriteFile(
+		serviceFile,
+		[]byte(
+			"[redirected]\n"+
+				"host=vp-postgres-fallback\n"+
+				"port=5432\n"+
+				"dbname=videoprocess\n",
+		),
+		0o600,
+	); err != nil {
+		t.Fatalf("write PostgreSQL service file: %v", err)
+	}
+	testCases := []struct {
+		name        string
+		databaseURL string
+		configure   func(*testing.T)
+	}{
+		{
+			name: "multi-host fallback",
+			databaseURL: "postgresql://runtime:test@" +
+				"vp-postgres:5432,vp-postgres-fallback:5432/videoprocess",
+		},
+		{
+			name: "service file query",
+			databaseURL: "postgresql://runtime:test@" +
+				"vp-postgres:5432/videoprocess?service=redirected&servicefile=" +
+				url.QueryEscape(serviceFile),
+		},
+		{
+			name:        "ambient host fallback",
+			databaseURL: "postgresql://runtime:test@/videoprocess",
+			configure: func(t *testing.T) {
+				t.Setenv("PGHOST", "vp-postgres-fallback")
+				t.Setenv("PGPORT", "5432")
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if testCase.configure != nil {
+				testCase.configure(t)
+			}
+			secrets := workerStartupTestSecrets(
+				"redis://go-worker:redis-secret@vp-redis:6379/3",
+			)
+			secrets.DatabaseURL = testCase.databaseURL
+			databaseOpens := 0
+
+			err := runWorker(
+				context.Background(),
+				workerStartupTestEnv(),
+				startupDependencies{
+					loadSecrets: func(
+						map[string]string,
+					) (worker.SecretConfig, error) {
+						return secrets, nil
+					},
+					openDatabase: func(
+						context.Context,
+						string,
+					) (startupDatabase, error) {
+						databaseOpens++
+						return nil, errors.New("database open must not run")
+					},
+				},
+			)
+
+			if err == nil || !strings.Contains(err.Error(), "claim_mismatch") {
+				t.Fatalf("runWorker error = %v; want claim_mismatch", err)
+			}
+			if databaseOpens != 0 {
+				t.Fatalf("database opens = %d; want 0", databaseOpens)
+			}
+		})
 	}
 }
 
@@ -852,4 +1130,131 @@ func setStartupRedisCredential(
 		env["REDIS_URL"] = redisURL
 		delete(env, "WORKER_REDIS_URL_FILE")
 	}
+}
+
+func generateRuntimeRoleDatabaseURL(
+	t *testing.T,
+	ownerURL string,
+	roleName string,
+	rolePassword string,
+) string {
+	t.Helper()
+	backendDirectory, err := filepath.Abs(filepath.Join("..", "..", "backend"))
+	if err != nil {
+		t.Fatalf("resolve backend directory: %v", err)
+	}
+	python := filepath.Join(backendDirectory, ".venv", "bin", "python")
+	if _, err := os.Stat(python); err != nil {
+		t.Fatalf("runtime-role Python is unavailable: %v", err)
+	}
+	command := exec.Command(
+		python,
+		"-c",
+		"import os\n"+
+			"from app.services.worker_role_cli_common import role_database_url\n"+
+			"print(role_database_url(os.environ['OWNER_URL'], "+
+			"os.environ['ROLE_NAME'], os.environ['ROLE_PASSWORD']))\n",
+	)
+	command.Dir = backendDirectory
+	command.Env = append(
+		os.Environ(),
+		"OWNER_URL="+ownerURL,
+		"ROLE_NAME="+roleName,
+		"ROLE_PASSWORD="+rolePassword,
+	)
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("generate runtime-role database URL: %v", err)
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func installLoopbackDNSResolver(t *testing.T) {
+	t.Helper()
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for integration DNS: %v", err)
+	}
+	go func() {
+		buffer := make([]byte, 1500)
+		for {
+			count, address, readErr := server.ReadFrom(buffer)
+			if readErr != nil {
+				return
+			}
+			response := loopbackDNSResponse(buffer[:count])
+			if response != nil {
+				_, _ = server.WriteTo(response, address)
+			}
+		}
+	}()
+	previousResolver := net.DefaultResolver
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(
+			ctx context.Context,
+			_ string,
+			_ string,
+		) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(
+				ctx,
+				"udp",
+				server.LocalAddr().String(),
+			)
+		},
+	}
+	t.Cleanup(func() {
+		net.DefaultResolver = previousResolver
+		_ = server.Close()
+	})
+}
+
+func loopbackDNSResponse(request []byte) []byte {
+	if len(request) < 17 ||
+		binary.BigEndian.Uint16(request[4:6]) != 1 {
+		return nil
+	}
+	offset := 12
+	for {
+		if offset >= len(request) {
+			return nil
+		}
+		labelLength := int(request[offset])
+		offset++
+		if labelLength == 0 {
+			break
+		}
+		if labelLength&0xc0 != 0 || offset+labelLength > len(request) {
+			return nil
+		}
+		offset += labelLength
+	}
+	if offset+4 > len(request) {
+		return nil
+	}
+	questionEnd := offset + 4
+	queryType := binary.BigEndian.Uint16(request[offset : offset+2])
+	answerCount := uint16(0)
+	if queryType == 1 {
+		answerCount = 1
+	}
+	response := make([]byte, 12, 32+questionEnd)
+	copy(response[0:2], request[0:2])
+	binary.BigEndian.PutUint16(response[2:4], 0x8180)
+	binary.BigEndian.PutUint16(response[4:6], 1)
+	binary.BigEndian.PutUint16(response[6:8], answerCount)
+	response = append(response, request[12:questionEnd]...)
+	if answerCount == 0 {
+		return response
+	}
+	response = append(
+		response,
+		0xc0, 0x0c,
+		0x00, 0x01,
+		0x00, 0x01,
+		0x00, 0x00, 0x00, 0x3c,
+		0x00, 0x04,
+		127, 0, 0, 1,
+	)
+	return response
 }

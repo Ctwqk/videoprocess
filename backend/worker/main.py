@@ -232,7 +232,10 @@ async def _require_worker_redis_continuity() -> None:
         ) from None
 
 
-async def _require_worker_redis_identity(redis: aioredis.Redis) -> None:
+async def _require_worker_redis_identity(
+    redis: aioredis.Redis,
+    registration: PythonWorkerRegistration,
+) -> None:
     connection_pool = getattr(redis, "connection_pool", None)
     connection_kwargs = getattr(
         connection_pool,
@@ -246,14 +249,24 @@ async def _require_worker_redis_identity(redis: aioredis.Redis) -> None:
         or expected_user == "default"
     ):
         raise WorkerRegistrationError("worker_redis_identity_unready")
+
+    async def require_identity() -> None:
+        try:
+            observed_user = await redis.acl_whoami()
+        except Exception:
+            raise WorkerRegistrationError(
+                "worker_redis_identity_unready"
+            ) from None
+        if observed_user != expected_user:
+            raise WorkerRegistrationError("worker_redis_identity_unready")
+
+    handshake = registration.create_guarded_task(require_identity())
     try:
-        observed_user = await redis.acl_whoami()
-    except Exception:
-        raise WorkerRegistrationError(
-            "worker_redis_identity_unready"
-        ) from None
-    if observed_user != expected_user:
-        raise WorkerRegistrationError("worker_redis_identity_unready")
+        await handshake
+    except asyncio.CancelledError:
+        registration.raise_if_lost()
+        raise
+    registration.raise_if_lost()
 
 
 @dataclass(frozen=True)
@@ -2002,8 +2015,9 @@ async def main() -> None:
         redis = _redis()
         registration.raise_if_lost()
         try:
-            await _require_worker_redis_identity(redis)
+            await _require_worker_redis_identity(redis, registration)
         except WorkerRegistrationError as exc:
+            registration.raise_if_lost()
             logger.critical("Worker admission denied: %s", exc)
             raise SystemExit(2) from exc
         registration.raise_if_lost()

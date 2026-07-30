@@ -4,6 +4,7 @@ import asyncio
 import re
 import uuid
 from collections.abc import Awaitable, Mapping
+from pathlib import Path
 from typing import Protocol
 
 from app.services import worker_registration as registration_contract
@@ -14,7 +15,20 @@ from app.services.worker_registration import (
     WorkerRegistrationError,
     WorkerRegistrationService,
 )
-from worker._build_identity import BUILD_COMMIT as EMBEDDED_BUILD_COMMIT
+
+_BUILD_IDENTITY_PATH = Path(
+    "/usr/local/share/videoprocess/worker-build-commit"
+)
+
+
+def _load_embedded_build_commit() -> str:
+    try:
+        return _BUILD_IDENTITY_PATH.read_text(encoding="ascii").strip()
+    except OSError:
+        return ""
+
+
+EMBEDDED_BUILD_COMMIT = _load_embedded_build_commit()
 
 
 class _RegistrationService(Protocol):

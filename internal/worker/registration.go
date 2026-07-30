@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -457,6 +458,69 @@ func BuildEndpointBindingsWithRedis(
 	return CanonicalEndpointBindingsJSON(encoded)
 }
 
+func EffectiveWorkerDatabaseDSN(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" {
+		return "", claimMismatch()
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	var driver string
+	switch scheme {
+	case "postgres", "postgresql":
+		driver = scheme
+	case "postgres+asyncpg":
+		driver = "postgres"
+	case "postgresql+asyncpg":
+		driver = "postgresql"
+	default:
+		return "", claimMismatch()
+	}
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return "", claimMismatch()
+	}
+	for key := range query {
+		switch strings.ToLower(key) {
+		case "service", "servicefile":
+			return "", claimMismatch()
+		}
+	}
+	for _, key := range []string{
+		"PGHOST",
+		"PGPORT",
+		"PGDATABASE",
+		"PGSERVICE",
+		"PGSERVICEFILE",
+	} {
+		if strings.TrimSpace(os.Getenv(key)) != "" {
+			return "", claimMismatch()
+		}
+	}
+	schemeEnd := strings.Index(raw, "://")
+	if schemeEnd < 1 {
+		return "", claimMismatch()
+	}
+	effectiveDSN := driver + raw[schemeEnd:]
+	config, err := pgx.ParseConfig(effectiveDSN)
+	if err != nil {
+		return "", claimMismatch()
+	}
+	primaryHost, err := normalizedDependencyHost(config.Host)
+	if err != nil || config.Port == 0 {
+		return "", claimMismatch()
+	}
+	for _, fallback := range config.Fallbacks {
+		fallbackHost, err := normalizedDependencyHost(fallback.Host)
+		if err != nil ||
+			fallbackHost != primaryHost ||
+			fallback.Port != config.Port {
+			return "", claimMismatch()
+		}
+	}
+	return effectiveDSN, nil
+}
+
 func CanonicalEndpointBindingsJSON(raw []byte) (EndpointBindings, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
@@ -662,16 +726,11 @@ func exactJSONInteger(value any, minimum int64, maximum int64) (int64, bool) {
 }
 
 func databaseEndpointIdentity(raw string) (map[string]any, error) {
-	raw = strings.TrimSpace(raw)
-	schemeEnd := strings.Index(raw, "://")
-	if schemeEnd < 1 {
-		return nil, claimMismatch()
+	effectiveDSN, err := EffectiveWorkerDatabaseDSN(raw)
+	if err != nil {
+		return nil, err
 	}
-	driver := strings.ToLower(strings.SplitN(raw[:schemeEnd], "+", 2)[0])
-	if driver != "postgres" && driver != "postgresql" {
-		return nil, claimMismatch()
-	}
-	config, err := pgx.ParseConfig(driver + raw[schemeEnd:])
+	config, err := pgx.ParseConfig(effectiveDSN)
 	if err != nil {
 		return nil, claimMismatch()
 	}

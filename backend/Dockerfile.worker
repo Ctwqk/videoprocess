@@ -27,9 +27,18 @@ RUN pip install ".[worker]" \
 
 COPY app /app/app
 COPY worker /app/worker
-RUN printf 'BUILD_COMMIT = "%s"\n' "$VP_BUILD_COMMIT" \
-    > /app/worker/_build_identity.py \
-    && chmod 0444 /app/worker/_build_identity.py
+RUN install -d -o root -g root -m 0555 /usr/local/share/videoprocess \
+    && printf '%s\n' "$VP_BUILD_COMMIT" \
+    > /usr/local/share/videoprocess/worker-build-commit \
+    && chown root:root /usr/local/share/videoprocess/worker-build-commit \
+    && chmod 0444 /usr/local/share/videoprocess/worker-build-commit
+
+RUN printf '/app\n' \
+    > ${VIRTUAL_ENV}/lib/python3.12/site-packages/videoprocess-worker.pth \
+    && chown root:root \
+    ${VIRTUAL_ENV}/lib/python3.12/site-packages/videoprocess-worker.pth \
+    && chmod 0444 \
+    ${VIRTUAL_ENV}/lib/python3.12/site-packages/videoprocess-worker.pth
 
 RUN python -c "import importlib; [importlib.import_module(name) for name in ( \
     'app.channel_agent.staging_object_janitor_cli', \
@@ -44,4 +53,11 @@ RUN python -c "import importlib; [importlib.import_module(name) for name in ( \
     'app.services.worker_runtime_role_cli' \
 )]"
 
-CMD ["python", "-m", "worker.main"]
+RUN groupadd --system --gid 10001 videoprocess-worker \
+    && useradd --system --uid 10001 --gid videoprocess-worker \
+    --create-home --home-dir /home/videoprocess-worker \
+    --shell /usr/sbin/nologin videoprocess-worker
+
+USER videoprocess-worker
+
+CMD ["/opt/venv/bin/python", "-I", "-m", "worker.main"]
