@@ -15,6 +15,242 @@ log() {
 source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 
 (
+  head_helper="$ROOT_DIR/deploy/swarm/worker-admission-transaction.py"
+  legacy_fixture="$TEST_ROOT/legacy-schema-1"
+  legacy_archive="$legacy_fixture/archive"
+  mkdir -p "$legacy_archive"
+  git -C "$ROOT_DIR" archive --format=tar a0e1afa \
+    deploy/swarm/worker-admission-transaction.py \
+    | tar -xf - -C "$legacy_archive"
+  old_helper="$legacy_archive/deploy/swarm/worker-admission-transaction.py"
+  [[ -f "$old_helper" && ! -L "$old_helper" ]]
+
+  credentials=()
+  principals=(
+    vp_deploy_migrator
+    vp_deploy_read
+    vp_control_role_owner
+    vp_runtime_role_owner
+  )
+  for index in 0 1 2 3; do
+    credential="$legacy_fixture/credential-$index"
+    printf 'postgresql://legacy-%s:credential@database/videoprocess\n' \
+      "$index" >"$credential"
+    chmod 0400 "$credential"
+    credentials+=("$credential")
+  done
+  credential_records="$(
+    python3 "$old_helper" validate-credentials \
+      "${credentials[0]}" "${principals[0]}" \
+      "${credentials[1]}" "${principals[1]}" \
+      "${credentials[2]}" "${principals[2]}" \
+      "${credentials[3]}" "${principals[3]}"
+  )"
+  commit=7123456789abcdef0123456789abcdef01234567
+  backend_image="vp-backend:deploy-${commit:0:12}"
+  go_image="vp-ffmpeg-worker-go:deploy-${commit:0:12}"
+  control_image="vp-ffmpeg-worker-python:deploy-${commit:0:12}"
+  control_generation="c-${commit:0:20}"
+  operator_reference="control/$control_generation/worker-registration-operator-database-url"
+  control_secret_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  runtime_secret_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+  create_legacy_journal() {
+    local phase="$1"
+    local case_root="$2"
+    local transaction_root="$case_root/sync/state/vp-worker-admission"
+    mkdir -p "$transaction_root"
+    chmod 0700 "$transaction_root"
+    local lock_path
+    lock_path="$(
+      python3 "$old_helper" lock-prepare "$transaction_root"
+    )"
+    exec 18<>"$lock_path"
+    python3 "$old_helper" lock-acquire \
+      "$transaction_root" 18 >/dev/null
+    python3 "$old_helper" begin \
+      "$transaction_root" 18 \
+      "$commit" "$backend_image" "$go_image" "$commit" \
+      legacy_no_control <<<"$credential_records" >/dev/null
+    if [[ "$phase" == ABORTING ]]; then
+      python3 "$old_helper" record-prepared-secret \
+        "$transaction_root" 18 \
+        "vp-wc-operator-$control_generation" "$control_secret_id" \
+        vp-worker-control "$control_generation" operator >/dev/null
+      python3 "$old_helper" record-prepared-secret \
+        "$transaction_root" 18 \
+        vp-wr-ffmpeg-go-db-971 "$runtime_secret_id" \
+        vp-ffmpeg-worker-go-swarm 971 database >/dev/null
+      python3 "$old_helper" begin-abort \
+        "$transaction_root" 18 2 preparing_failed >/dev/null
+    fi
+    exec 18>&-
+  }
+
+  for legacy_phase in PREPARING ABORTING; do
+    case_root="$legacy_fixture/$legacy_phase"
+    create_legacy_journal "$legacy_phase" "$case_root"
+    transaction_root="$case_root/sync/state/vp-worker-admission"
+    active="$transaction_root/transactions/active.json"
+    original="$case_root/active.original.json"
+    cp "$active" "$original"
+    chmod 0600 "$original"
+    python3 - "$active" "$legacy_phase" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+phase = sys.argv[2]
+raw = path.read_bytes()
+document = json.loads(raw)
+if raw != (
+    json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+).encode("utf-8"):
+    raise SystemExit("legacy helper did not emit canonical JSON")
+if document["schema"] != 1 or document["phase"] != phase:
+    raise SystemExit("legacy helper emitted the wrong schema or phase")
+if "authorities" in document:
+    raise SystemExit("legacy helper unexpectedly emitted authority WAL")
+if phase == "ABORTING":
+    authorities = document["abort"]["authorities"]
+    if (
+        len(authorities) != 2
+        or any(
+            set(authority) != {"generation", "kind", "service"}
+            for authority in authorities
+        )
+    ):
+        raise SystemExit("legacy abort authority shape drifted")
+PY
+
+    plan_one="$case_root/quarantine-one.json"
+    plan_two="$case_root/quarantine-two.json"
+    if ! python3 "$head_helper" replay-plan \
+      "$transaction_root" >"$plan_one"; then
+      echo "FAIL: HEAD did not type quarantine legacy $legacy_phase" >&2
+      exit 1
+    fi
+    python3 "$head_helper" replay-plan \
+      "$transaction_root" >"$plan_two"
+    cmp -s "$plan_one" "$plan_two"
+    python3 - "$plan_one" "$active" "$legacy_phase" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+plan_path = pathlib.Path(sys.argv[1])
+active_path = pathlib.Path(sys.argv[2])
+phase = sys.argv[3]
+raw_plan = plan_path.read_bytes()
+plan = json.loads(raw_plan)
+if raw_plan != (
+    json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n"
+).encode("utf-8"):
+    raise SystemExit("legacy quarantine plan is not canonical")
+if plan != {
+    "active": True,
+    "allow_new_candidate": False,
+    "allow_stale_cleanup": False,
+    "journal_sha256": hashlib.sha256(active_path.read_bytes()).hexdigest(),
+    "namespace": None,
+    "next_action": "QUARANTINE_LEGACY_SCHEMA_1",
+    "pending_operation": None,
+    "phase": phase,
+    "reason_code": "legacy_schema_1_authority_context_unavailable",
+    "retirements": [],
+    "revision": plan["revision"],
+    "transaction_id": plan["transaction_id"],
+}:
+    raise SystemExit("legacy quarantine plan is not deterministic or closed")
+if (
+    not isinstance(plan["revision"], int)
+    or isinstance(plan["revision"], bool)
+    or plan["revision"] < 0
+    or not isinstance(plan["transaction_id"], str)
+    or not plan["transaction_id"].startswith("tx-")
+):
+    raise SystemExit("legacy quarantine identity is not typed")
+if b"postgresql://" in raw_plan or b"credential@" in raw_plan:
+    raise SystemExit("legacy quarantine disclosed credential material")
+PY
+    cmp -s "$active" "$original"
+
+    lock_path="$transaction_root/transaction.lock"
+    exec 18<>"$lock_path"
+    python3 "$head_helper" lock-acquire \
+      "$transaction_root" 18 >/dev/null
+    if python3 "$head_helper" begin \
+      "$transaction_root" 18 \
+      "$commit" "$backend_image" "$go_image" replacement-namespace \
+      legacy_no_control <<<"$credential_records" >/dev/null 2>&1; then
+      echo "FAIL: legacy $legacy_phase quarantine allowed begin" >&2
+      exit 1
+    fi
+    if [[ "$legacy_phase" == PREPARING ]]; then
+      if python3 "$head_helper" begin-abort \
+        "$transaction_root" 18 0 preparing_failed \
+        >/dev/null 2>&1; then
+        echo 'FAIL: legacy PREPARING quarantine allowed normal mutation' >&2
+        exit 1
+      fi
+    else
+      if python3 "$head_helper" intent-prepared-secret-removal \
+        "$transaction_root" 18 3 "$runtime_secret_id" \
+        >/dev/null 2>&1; then
+        echo 'FAIL: legacy ABORTING quarantine allowed abort mutation' >&2
+        exit 1
+      fi
+    fi
+    retirement_identity="$case_root/retirement.json"
+    printf '%s\n' \
+      '{"docker_id":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","generation":"971","kind":"secret","name":"legacy-retirement","purpose":"database","service":"vp-ffmpeg-worker-go-swarm","spec_digest":null}' \
+      >"$retirement_identity"
+    chmod 0600 "$retirement_identity"
+    if python3 "$head_helper" queue-retirement \
+      "$transaction_root" 18 0 \
+      retirement-cccccccccccccccccccccccccccccccc \
+      "$retirement_identity" >/dev/null 2>&1; then
+      echo "FAIL: legacy $legacy_phase quarantine allowed retirement" >&2
+      exit 1
+    fi
+    if python3 "$head_helper" archive \
+      "$transaction_root" 18 0 >/dev/null 2>&1; then
+      echo "FAIL: legacy $legacy_phase quarantine allowed archive" >&2
+      exit 1
+    fi
+    exec 18>&-
+    cmp -s "$active" "$original"
+
+    calls="$case_root/operator-calls"
+    : >"$calls"
+    ROOT="$case_root/sync"
+    REPO_ROOT="$case_root/repos"
+    VP_WORKER_DATABASE_CREDENTIAL_RECORDS="$credential_records"
+    docker() {
+      printf 'docker|%s\n' "$*" >>"$calls"
+    }
+    vp_worker_admission_operator() {
+      printf 'operator|%s\n' "$*" >>"$calls"
+    }
+    vp_worker_admission_lock_acquire "$transaction_root"
+    if vp_worker_admission_prepare_transaction \
+      "$backend_image" "$go_image" "$control_image" \
+      >/dev/null 2>&1; then
+      echo "FAIL: shell admission resumed legacy $legacy_phase quarantine" >&2
+      exit 1
+    fi
+    vp_worker_admission_lock_release
+    if [[ -s "$calls" ]]; then
+      echo "FAIL: legacy $legacy_phase quarantine reached Docker or operator" >&2
+      exit 1
+    fi
+    cmp -s "$active" "$original"
+  done
+)
+
+(
   transaction_helper="$ROOT_DIR/deploy/swarm/worker-admission-transaction.py"
   transaction_root="$TEST_ROOT/durable-core/state/vp-worker-admission"
   mkdir -p "$transaction_root"
@@ -93,7 +329,7 @@ expected = (
 ).encode("utf-8")
 if raw != expected:
     raise SystemExit("active transaction is not canonical JSON")
-if document["schema"] != 1:
+if document["schema"] != 2:
     raise SystemExit("unexpected transaction schema")
 if re.fullmatch(r"tx-[0-9a-f]{32}", document["transaction_id"]) is None:
     raise SystemExit("transaction id is not 128-bit lowercase hex")

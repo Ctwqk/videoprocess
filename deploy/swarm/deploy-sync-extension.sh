@@ -29,7 +29,9 @@ VP_PYTHON_WORKER_SIGNAL_NAME=""
 VP_PYTHON_WORKER_PENDING_SIGNAL_STATUS=0
 VP_PYTHON_WORKER_PENDING_SIGNAL_NAME=""
 VP_PYTHON_WORKER_LAUNCH_GATE_FD=16
+VP_PYTHON_WORKER_LAUNCH_GATE_READ_FD=17
 VP_PYTHON_WORKER_LAUNCH_GATE_OPEN=false
+VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN=false
 VP_PYTHON_WORKER_LAUNCH_GATE_PATH=""
 VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY=""
 VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN=""
@@ -1346,6 +1348,8 @@ def cleanup_operation(
                 gid,
             )
         except Exception:
+            if require_sentinels:
+                raise
             entries = sorted(os.listdir(operation_descriptor))
             if entries == []:
                 pass
@@ -1764,12 +1768,15 @@ vp_worker_admission_lock_drop_inherited() {
     && "$VP_WORKER_ADMISSION_LOCK_OWNER_BASHPID" \
       != "$VP_WORKER_ADMISSION_CURRENT_BASHPID" ]] \
     || return 1
-  exec 19>&- 2>/dev/null || true
+  local status=0
+  exec 19>&- 2>/dev/null || status=1
   VP_WORKER_ADMISSION_LOCK_HELD=false
   VP_WORKER_ADMISSION_LOCK_DEPTH=0
   VP_WORKER_ADMISSION_LOCK_ROOT=""
   VP_WORKER_ADMISSION_LOCK_OWNER_BASHPID=""
   VP_WORKER_ADMISSION_LOCK_TOKEN=""
+  VP_WORKER_ADMISSION_CURRENT_BASHPID=""
+  return "$status"
 }
 
 vp_worker_admission_lock_acquire() {
@@ -1993,11 +2000,14 @@ vp_python_worker_prepare_launch_gate() {
     && "$caller_uid" =~ ^[0-9]+$ \
     && "$caller_gid" =~ ^[0-9]+$ \
     && "$VP_PYTHON_WORKER_LAUNCH_GATE_FD" -eq 16 \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_READ_FD" -eq 17 \
     && "$VP_PYTHON_WORKER_LAUNCH_GATE_OPEN" == false \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN" == false \
     && -z "$VP_PYTHON_WORKER_LAUNCH_GATE_PATH" \
     && -z "$VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY" \
     && -z "$VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN" \
-    && ! -e /dev/fd/16 ]] || return 1
+    && ! -e /dev/fd/16 \
+    && ! -e /dev/fd/17 ]] || return 1
   local directory
   directory="$(
     vp_python_worker_prepare_controlled_directory \
@@ -2052,23 +2062,30 @@ PY
     && "$identity" != "$gate_record" \
     && "$identity" =~ ^[0-9]+:[1-9][0-9]*$ ]] || return 1
   exec 16<>"$path" || return 1
-  if ! python3 -I - "$path" 16 "$identity" \
+  exec 17<"$path" || {
+    exec 16>&-
+    return 1
+  }
+  if ! python3 -I - "$path" 16 17 "$identity" \
       "$caller_uid" "$caller_gid" <<'PY'
+import fcntl
 import os
 import stat
 import sys
 
 try:
     path = os.path.abspath(sys.argv[1])
-    descriptor = int(sys.argv[2])
+    writer_descriptor = int(sys.argv[2])
+    reader_descriptor = int(sys.argv[3])
     expected_device, expected_inode = (
-        int(value) for value in sys.argv[3].split(":", 1)
+        int(value) for value in sys.argv[4].split(":", 1)
     )
-    expected_uid = int(sys.argv[4])
-    expected_gid = int(sys.argv[5])
+    expected_uid = int(sys.argv[5])
+    expected_gid = int(sys.argv[6])
     path_metadata = os.lstat(path)
-    descriptor_metadata = os.fstat(descriptor)
-    for metadata in (path_metadata, descriptor_metadata):
+    writer_metadata = os.fstat(writer_descriptor)
+    reader_metadata = os.fstat(reader_descriptor)
+    for metadata in (path_metadata, writer_metadata, reader_metadata):
         if (
             not stat.S_ISFIFO(metadata.st_mode)
             or stat.S_IMODE(metadata.st_mode) != 0o600
@@ -2079,13 +2096,24 @@ try:
             != (expected_device, expected_inode)
         ):
             raise ValueError
+    writer_flags = fcntl.fcntl(writer_descriptor, fcntl.F_GETFL)
+    reader_flags = fcntl.fcntl(reader_descriptor, fcntl.F_GETFL)
+    if (
+        writer_flags & os.O_ACCMODE != os.O_RDWR
+        or reader_flags & os.O_ACCMODE != os.O_RDONLY
+    ):
+        raise ValueError
     os.unlink(path)
-    if os.fstat(descriptor).st_nlink != 0:
+    if (
+        os.fstat(writer_descriptor).st_nlink != 0
+        or os.fstat(reader_descriptor).st_nlink != 0
+    ):
         raise ValueError
 except (OSError, TypeError, ValueError):
     raise SystemExit(1)
 PY
   then
+    exec 17>&-
     exec 16>&-
     return 1
   fi
@@ -2093,14 +2121,17 @@ PY
   token="$(
     python3 -I -c 'import secrets; print(secrets.token_hex(16))'
   )" || {
+    exec 17>&-
     exec 16>&-
     return 1
   }
   [[ "$token" =~ ^[0-9a-f]{32}$ ]] || {
+    exec 17>&-
     exec 16>&-
     return 1
   }
   VP_PYTHON_WORKER_LAUNCH_GATE_OPEN=true
+  VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN=true
   VP_PYTHON_WORKER_LAUNCH_GATE_PATH="$path"
   VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY="$identity"
   VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN="$token"
@@ -2141,6 +2172,99 @@ except (OSError, TypeError, ValueError):
     "$VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY"
 }
 
+vp_python_worker_verify_launch_gate_reader() {
+  [[ "$VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN" == true \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_READ_FD" -eq 17 \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_PATH" = /* \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY" \
+      =~ ^[0-9]+:[1-9][0-9]*$ \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN" \
+      =~ ^[0-9a-f]{32}$ ]] || return 1
+  python3 -I -c '
+import fcntl
+import os
+import stat
+import sys
+
+try:
+    descriptor = int(sys.argv[1])
+    expected_device, expected_inode = (
+        int(value) for value in sys.argv[2].split(":", 1)
+    )
+    metadata = os.fstat(descriptor)
+    flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    if (
+        not stat.S_ISFIFO(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
+        or metadata.st_nlink != 0
+        or (metadata.st_dev, metadata.st_ino)
+        != (expected_device, expected_inode)
+        or flags & os.O_ACCMODE != os.O_RDONLY
+    ):
+        raise ValueError
+except (OSError, TypeError, ValueError):
+    raise SystemExit(1)
+' "$VP_PYTHON_WORKER_LAUNCH_GATE_READ_FD" \
+    "$VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY"
+}
+
+vp_python_worker_close_parent_launch_gate_reader() {
+  [[ "$VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN" == true ]] \
+    || return 1
+  local status=0
+  vp_python_worker_verify_launch_gate_reader || status=1
+  exec 17>&- || status=1
+  VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN=false
+  return "$status"
+}
+
+vp_python_worker_prepare_launch_supervisor() {
+  [[ "$VP_PYTHON_WORKER_LAUNCH_GATE_OPEN" == true \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN" == true ]] \
+    || return 1
+  local status=0
+  exec 16>&- || status=1
+  VP_PYTHON_WORKER_LAUNCH_GATE_OPEN=false
+  vp_worker_admission_lock_drop_inherited || status=1
+  if [[ "$status" -ne 0 ]] \
+    || ! vp_python_worker_verify_launch_gate_reader; then
+    exec 17>&- 2>/dev/null || true
+    VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN=false
+    return 1
+  fi
+}
+
+vp_python_worker_wait_for_launch_gate() {
+  local expected_token="$1"
+  [[ "$expected_token" =~ ^[0-9a-f]{32}$ ]] || return 1
+  vp_python_worker_prepare_launch_supervisor || return 1
+  local received_token=""
+  local status=0
+  IFS= read -r received_token <&17 || status=1
+  exec 17>&- || status=1
+  VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN=false
+  VP_PYTHON_WORKER_LAUNCH_GATE_PATH=""
+  VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY=""
+  VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN=""
+  [[ "$status" -eq 0 \
+    && "$received_token" == "VP-LAUNCH-1:$expected_token" ]]
+}
+
+vp_python_worker_drop_inherited_launch_resources() {
+  local status=0
+  exec 16>&- || status=1
+  exec 17>&- || status=1
+  VP_PYTHON_WORKER_LAUNCH_GATE_OPEN=false
+  VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN=false
+  VP_PYTHON_WORKER_LAUNCH_GATE_PATH=""
+  VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY=""
+  VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN=""
+  vp_worker_admission_lock_drop_inherited || status=1
+  return "$status"
+}
+
 vp_python_worker_release_launch_gate() {
   vp_worker_admission_raise_if_signaled || return $?
   vp_python_worker_verify_launch_gate || return 1
@@ -2150,11 +2274,16 @@ vp_python_worker_release_launch_gate() {
 
 vp_python_worker_discard_launch_gate() {
   local status=0
+  if [[ "$VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN" == true ]]; then
+    vp_python_worker_verify_launch_gate_reader || status=1
+    exec 17>&- || status=1
+  fi
   if [[ "$VP_PYTHON_WORKER_LAUNCH_GATE_OPEN" == true ]]; then
     vp_python_worker_verify_launch_gate || status=1
     exec 16>&- || status=1
   fi
   VP_PYTHON_WORKER_LAUNCH_GATE_OPEN=false
+  VP_PYTHON_WORKER_LAUNCH_GATE_READ_OPEN=false
   VP_PYTHON_WORKER_LAUNCH_GATE_PATH=""
   VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY=""
   VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN=""
@@ -2603,16 +2732,17 @@ except Exception:
       caller_pipefail=true
     fi
     set -o pipefail
-    vp_python_worker_host_guard \
-      stream-payloads "$caller_uid" "$caller_gid" \
-      "${stream_arguments[@]}" \
+    (
+      trap - HUP INT TERM
+      vp_python_worker_drop_inherited_launch_resources || exit 1
+      vp_python_worker_host_guard \
+        stream-payloads "$caller_uid" "$caller_gid" \
+        "${stream_arguments[@]}"
+    ) \
       | (
           trap - HUP INT TERM
-          local received_token=""
-          IFS= read -r received_token <&16 || exit 1
-          [[ "$received_token" == "VP-LAUNCH-1:$launch_token" ]] \
+          vp_python_worker_wait_for_launch_gate "$launch_token" \
             || exit 1
-          exec 16>&-
           if declare -F docker >/dev/null 2>&1; then
             "${docker_command[@]}"
           else
@@ -2622,11 +2752,8 @@ except Exception:
   else
     (
       trap - HUP INT TERM
-      local received_token=""
-      IFS= read -r received_token <&16 || exit 1
-      [[ "$received_token" == "VP-LAUNCH-1:$launch_token" ]] \
+      vp_python_worker_wait_for_launch_gate "$launch_token" \
         || exit 1
-      exec 16>&-
       if declare -F docker >/dev/null 2>&1; then
         "${docker_command[@]}" </dev/null
       else
@@ -2636,9 +2763,13 @@ except Exception:
   fi
   VP_PYTHON_WORKER_ACTIVE_CHILD_PID=$!
   launched_child_pid="$VP_PYTHON_WORKER_ACTIVE_CHILD_PID"
-  vp_python_worker_consume_pending_signal || true
   local launch_status=0
-  vp_python_worker_release_launch_gate || launch_status=$?
+  vp_python_worker_close_parent_launch_gate_reader \
+    || launch_status=1
+  vp_python_worker_consume_pending_signal || true
+  if [[ "$launch_status" -eq 0 ]]; then
+    vp_python_worker_release_launch_gate || launch_status=$?
+  fi
   vp_python_worker_discard_launch_gate || {
     [[ "$launch_status" -ne 0 ]] || launch_status=1
   }

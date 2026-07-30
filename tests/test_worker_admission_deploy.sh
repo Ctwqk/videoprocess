@@ -863,6 +863,239 @@ done
   fi
 )
 
+for parent_death_boundary in release-entry verified-before-token; do
+(
+  probe_root="$TEST_ROOT/one-shot-parent-death-$parent_death_boundary"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  docker_calls="$probe_root/docker-calls"
+  boundary_ready="$probe_root/boundary-ready"
+  supervisor_pid_file="$probe_root/supervisor-pid"
+  parent_log="$probe_root/parent.log"
+  fresh_owner_result="$probe_root/fresh-owner-result"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  secret_source=-
+  secret_target=-
+  if [[ "$parent_death_boundary" == verified-before-token ]]; then
+    secret_source="$probe_root/stream-payload"
+    secret_target=stream-payload
+    dd if=/dev/zero of="$secret_source" bs=262144 count=1 \
+      >/dev/null 2>&1
+    chmod 0400 "$secret_source"
+  fi
+  : >"$docker_calls"
+  parent_pid=""
+  supervisor_pid=""
+  parent_child_pids=""
+
+  cleanup_parent_death_probe() {
+    local status=$?
+    trap - EXIT
+    if [[ "$parent_pid" =~ ^[1-9][0-9]*$ ]] \
+      && builtin kill -0 "$parent_pid" 2>/dev/null; then
+      builtin kill -KILL "$parent_pid" 2>/dev/null || true
+      wait "$parent_pid" 2>/dev/null || true
+    fi
+    if [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ ]] \
+      && builtin kill -0 "$supervisor_pid" 2>/dev/null; then
+      builtin kill -KILL "$supervisor_pid" 2>/dev/null || true
+    fi
+    local child_pid
+    for child_pid in $parent_child_pids; do
+      if [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] \
+        && builtin kill -0 "$child_pid" 2>/dev/null; then
+        builtin kill -KILL "$child_pid" 2>/dev/null || true
+      fi
+    done
+    exit "$status"
+  }
+  trap cleanup_parent_death_probe EXIT
+
+  process_fd_access() {
+    local process_id="$1"
+    local descriptor="$2"
+    if [[ -r "/proc/$process_id/fdinfo/$descriptor" ]]; then
+      local raw_flags
+      raw_flags="$(
+        awk '$1 == "flags:" { print $2 }' \
+          "/proc/$process_id/fdinfo/$descriptor"
+      )" || return 1
+      [[ "$raw_flags" =~ ^[0-7]+$ ]] || return 1
+      case "$((8#$raw_flags & 3))" in
+        0) printf 'r\n' ;;
+        1) printf 'w\n' ;;
+        2) printf 'u\n' ;;
+        *) return 1 ;;
+      esac
+      return 0
+    fi
+    if [[ "$(uname -s)" == Darwin ]] && command -v lsof >/dev/null 2>&1; then
+      local lsof_record
+      lsof_record="$(
+        lsof -a -p "$process_id" -d "$descriptor" -Faf 2>/dev/null
+      )" || {
+        printf -- '-\n'
+        return 0
+      }
+      if [[ -z "$lsof_record" ]]; then
+        printf -- '-\n'
+        return 0
+      fi
+      case "$lsof_record" in
+        *$'\nar\n'*|*$'\nar') printf 'r\n' ;;
+        *$'\naw\n'*|*$'\naw') printf 'w\n' ;;
+        *$'\nau\n'*|*$'\nau') printf 'u\n' ;;
+        *) return 1 ;;
+      esac
+      return 0
+    fi
+    return 1
+  }
+
+  fresh_owner_reconcile() {
+    (
+      exec 18<>"$admission_root/transaction.lock"
+      python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+        lock-acquire "$admission_root" 18 >/dev/null 2>&1 \
+        || exit 1
+      vp_python_worker_host_guard \
+        prepare-operation "$admission_root" "$(id -u)" "$(id -g)" \
+        >"$fresh_owner_result"
+    )
+  }
+
+  (
+    docker() {
+      printf 'docker\n' >>"$docker_calls"
+    }
+    vp_python_worker_release_launch_gate() {
+      if [[ "$parent_death_boundary" == verified-before-token ]]; then
+        vp_worker_admission_raise_if_signaled || return $?
+        vp_python_worker_verify_launch_gate || return 1
+      fi
+      printf '%s\n' "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID" \
+        >"$supervisor_pid_file"
+      : >"$boundary_ready"
+      while :; do
+        :
+      done
+    }
+    vp_run_python_worker_container \
+      synthetic-image "$secret_source" "$secret_target" /runtime-state \
+      --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+      -- /bin/true
+  ) >"$parent_log" 2>&1 &
+  parent_pid=$!
+
+  for _attempt in $(seq 1 200); do
+    [[ -e "$boundary_ready" ]] && break
+    if ! builtin kill -0 "$parent_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.01
+  done
+  if [[ ! -e "$boundary_ready" || ! -s "$supervisor_pid_file" ]]; then
+    echo "FAIL: $parent_death_boundary probe did not reach its pre-token boundary" >&2
+    exit 1
+  fi
+  supervisor_pid="$(<"$supervisor_pid_file")"
+  if [[ ! "$supervisor_pid" =~ ^[1-9][0-9]*$ ]] \
+    || ! builtin kill -0 "$supervisor_pid" 2>/dev/null; then
+    echo "FAIL: $parent_death_boundary probe did not publish a live supervisor" >&2
+    exit 1
+  fi
+
+  child_read_access="$(process_fd_access "$supervisor_pid" 17 || true)"
+  child_gate_writer_access="$(process_fd_access "$supervisor_pid" 16 || true)"
+  child_lock_access="$(process_fd_access "$supervisor_pid" 19 || true)"
+  child_fd_audit=false
+  if [[ "$child_read_access" == r \
+    && "$child_gate_writer_access" == - \
+    && "$child_lock_access" == - ]]; then
+    child_fd_audit=true
+  fi
+  parent_child_pids="$(
+    pgrep -P "$parent_pid" 2>/dev/null \
+      | tr '\n' ' ' \
+      || true
+  )"
+  producer_fd_audit=true
+  child_pid=""
+  for child_pid in $parent_child_pids; do
+    [[ "$child_pid" == "$supervisor_pid" ]] && continue
+    if [[ "$(process_fd_access "$child_pid" 16 || true)" != - \
+      || "$(process_fd_access "$child_pid" 17 || true)" != - \
+      || "$(process_fd_access "$child_pid" 19 || true)" != - ]]; then
+      producer_fd_audit=false
+    fi
+  done
+  if ! compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null \
+    || ! compgen -G "$admission_root/one-shot-operations/op.*" \
+      >/dev/null; then
+    echo "FAIL: $parent_death_boundary probe lacked stale operation evidence" >&2
+    exit 1
+  fi
+
+  builtin kill -KILL "$parent_pid"
+  wait "$parent_pid" 2>/dev/null || true
+  parent_pid=""
+
+  supervisor_exited=false
+  all_children_exited=false
+  fresh_lock_acquired=false
+  for _attempt in $(seq 1 200); do
+    if ! builtin kill -0 "$supervisor_pid" 2>/dev/null; then
+      supervisor_exited=true
+    fi
+    all_children_exited=true
+    for child_pid in $parent_child_pids; do
+      if builtin kill -0 "$child_pid" 2>/dev/null; then
+        all_children_exited=false
+      fi
+    done
+    if [[ "$fresh_lock_acquired" != true ]] \
+      && fresh_owner_reconcile >/dev/null 2>&1; then
+      fresh_lock_acquired=true
+    fi
+    if [[ "$supervisor_exited" == true \
+      && "$all_children_exited" == true \
+      && "$fresh_lock_acquired" == true ]]; then
+      break
+    fi
+    sleep 0.01
+  done
+
+  stale_reconciled=false
+  if [[ "$fresh_lock_acquired" == true \
+    && -f "$fresh_owner_result" \
+    && "$(<"$fresh_owner_result")" == - ]] \
+    && ! compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null \
+    && ! compgen -G "$admission_root/one-shot-operations/op.*" \
+      >/dev/null; then
+    stale_reconciled=true
+  fi
+  docker_call_count="$(wc -l <"$docker_calls" | tr -d '[:space:]')"
+  if [[ "$child_fd_audit" != true \
+    || "$producer_fd_audit" != true \
+    || "$supervisor_exited" != true \
+    || "$all_children_exited" != true \
+    || "$fresh_lock_acquired" != true \
+    || "$stale_reconciled" != true \
+    || "$docker_call_count" -ne 0 ]]; then
+    printf '%s\n' \
+      "FAIL: $parent_death_boundary parent death retained supervisor, lock, writer, or stale operation" \
+      "fd=$child_read_access/$child_gate_writer_access/$child_lock_access child_audit=$child_fd_audit producer_audit=$producer_fd_audit supervisor_exit=$supervisor_exited children_exit=$all_children_exited fresh_lock=$fresh_lock_acquired reconcile=$stale_reconciled docker=$docker_call_count" \
+      >&2
+    exit 1
+  fi
+  supervisor_pid=""
+  trap - EXIT
+)
+done
+
 (
   probe_root="$TEST_ROOT/one-shot-post-spawn-term"
   ROOT="$probe_root/sync"

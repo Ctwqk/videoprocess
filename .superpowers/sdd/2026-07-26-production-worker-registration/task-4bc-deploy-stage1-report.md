@@ -1257,3 +1257,207 @@ cutover, marker mutation boundaries, first-deploy/failed-rollback
 orchestration, or janitor install recovery. It does not claim I-3 end-to-end
 closure. No SSH, push, deploy, remote access, YouTube/canary operation, or real
 Swarm service/secret mutation was performed.
+
+## Fix Round 4: Final Stage 1 Important Findings
+
+Review baseline:
+`b61a9ca` (prior code baseline `1d13211`).
+
+This round closes only the two Important findings in
+`task-4bc-deploy-stage1-rereview-round3.md`. It does not enter Stage 2.
+
+### Round 4 Important 1: Parent-Death Launch Gate and Lock
+
+Root cause:
+
+The release supervisor inherited the parent's read/write FIFO open file
+description and transaction-lock fd 19. If the parent died before publishing
+the release token, the inherited FIFO writer prevented EOF and fd 19 kept the
+exact transaction lock alive. The supervisor could wait indefinitely while a
+fresh process could neither acquire the lock nor reconcile the stale
+one-shot operation.
+
+Behavior RED:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: release-entry parent death retained supervisor, lock, writer, or stale operation
+```
+
+Fix:
+
+- The parent creates the unlinked FIFO with fd 16 as the sole read/write
+  release descriptor and opens a separate, independently verified read-only
+  fd 17 while the FIFO still has a pathname.
+- The supervisor immediately closes inherited fd 16 and inherited transaction
+  lock fd 19, clears all inherited lock ownership state, verifies fd 17 is the
+  exact unlinked FIFO opened read-only, and only then waits for the token.
+- A payload producer also closes fd 16, fd 17, and fd 19 plus inherited state
+  before streaming. It cannot keep either the release writer or transaction
+  lock alive.
+- The parent closes its copy of fd 17 after spawn. Normal release writes the
+  canonical token through fd 16. Parent SIGKILL or exit closes the only writer,
+  so the supervisor reads EOF and exits without invoking Docker.
+- Existing strict cleanup was preserved: a live operation's malformed or
+  replaced sentinel still fails closed, while a fresh exact lock owner may
+  reconcile stale evidence after owner death.
+
+The behavior test sends real SIGKILL at both `release-entry` and
+`verified-before-token`. The latter includes a blocked payload producer. On
+Linux it audits `/proc/<pid>/fdinfo`; on macOS it uses `lsof -Faf`. Both cases
+require:
+
+- supervisor fd 17 is read-only;
+- supervisor fd 16 and fd 19 are absent;
+- every other direct child has no fd 16, fd 17, or fd 19;
+- all children exit within the bounded wait without test-assisted killing;
+- a fresh process acquires the exact lock and reconciles the stale operation
+  and bind sentinel;
+- Docker call count remains zero.
+
+The EXIT cleanup trap kills residual processes only after a failed assertion;
+manual child termination is not a passing path.
+
+GREEN:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+worker admission deployment contract tests passed
+```
+
+The existing HUP/INT/TERM canonical-status, post-spawn signal, query-fd
+identity, bind replacement, and lock-BASHPID cases remain green.
+
+### Round 4 Important 2: Journal Version Compatibility
+
+Root cause:
+
+Round 3 added authority WAL fields while continuing to label active journals
+as schema 1. That changed the exact schema 1 field set and made canonical
+journals written by the `a0e1afa` helper fail as opaque parse errors. It also
+left no stable, typed replay result that could prohibit unsafe inference of
+missing authority evidence.
+
+Behavior RED:
+
+The test obtains the historical helper from the repository itself:
+
+```text
+git -C "$ROOT_DIR" archive --format=tar a0e1afa \
+  deploy/swarm/worker-admission-transaction.py
+```
+
+That helper creates exact canonical PREPARING and ABORTING schema 1 journals.
+The ABORTING fixture includes two prepared secrets and the historical exact
+three-field abort-authority records.
+
+```text
+$ bash tests/test_worker_admission_rollback.sh
+FAIL: HEAD did not type quarantine legacy PREPARING
+
+$ bash tests/test_worker_admission_rollback.sh
+unexpected transaction schema
+```
+
+The second RED occurred after adding the legacy read path but before bumping
+new active writes.
+
+Fix:
+
+- New active transaction journals now write `schema=2`; the independent
+  snapshots journal remains at its own schema 1.
+- The schema 2 path retains the complete authority-WAL validator, relational
+  checks, mutation matrix, abort handling, credential validation, retirement,
+  operation intent, and DONE rules.
+- The schema 1 field set is a fixed historical constant. A dedicated validator
+  accepts only the old exact canonical document shape and its historical abort
+  authority shape. It does not infer or synthesize absent authority WAL.
+- Only `replay-plan` may request typed legacy recognition. Every mutation
+  reader rejects schema 1, so begin/new namespace, normal phase mutation,
+  stale cleanup, retirement, abort mutation, and archive remain unavailable.
+- Repeated replay of the same valid legacy bytes returns canonical
+  `QUARANTINE_LEGACY_SCHEMA_1` with non-secret transaction id, phase, revision,
+  original-byte SHA-256 digest, and stable reason code
+  `legacy_schema_1_authority_context_unavailable`.
+- This is a read-only quarantine, not an atomic migration. Original
+  `active.json` bytes and evidence remain unchanged.
+
+The tests replay both old journals twice and compare byte-identical plans,
+verify the digest against the original active bytes, exercise blocked
+mutations under the exact lock, invoke the shell admission entry, and require
+zero Docker/operator calls. The existing current-schema transaction and abort
+matrices continue to run against schema 2.
+
+GREEN:
+
+```text
+$ bash tests/test_worker_admission_rollback.sh
+worker admission rollback transaction tests passed
+```
+
+### Round 4 Files
+
+- `deploy/swarm/deploy-sync-extension.sh`
+- `deploy/swarm/worker-admission-transaction.py`
+- `tests/test_worker_admission_deploy.sh`
+- `tests/test_worker_admission_rollback.sh`
+- `.superpowers/sdd/2026-07-26-production-worker-registration/task-4bc-deploy-stage1-report.md`
+
+No Stage 2, CI, backend, Go, Dockerfile, marker-control product, janitor
+product, janitor-install recovery, Task 4A, or frontend file changed.
+
+### Round 4 Verification
+
+```text
+bash tests/test_worker_admission_deploy.sh
+  PASS: worker admission deployment contract tests passed
+bash tests/test_worker_admission_rollback.sh
+  PASS: worker admission rollback transaction tests passed
+bash tests/test_staging_object_janitor_run.sh
+  PASS: staging object janitor launcher tests passed
+bash tests/test_vp_deploy_sync_extension.sh
+  PASS: exit 0, no stdout
+bash tests/test_staging_object_janitor_install.sh
+  PASS: staging object janitor installer tests passed
+bash tests/test_worker_redis_marker_control.sh
+  PASS: worker Redis marker control tests passed
+python3 -m py_compile deploy/swarm/worker-admission-transaction.py
+  PASS
+backend/.venv/bin/ruff check deploy/swarm/worker-admission-transaction.py
+  PASS: All checks passed!
+backend/.venv/bin/mypy deploy/swarm/worker-admission-transaction.py
+  PASS: Success: no issues found in 1 source file
+bash -n deploy/swarm/deploy-sync-extension.sh
+bash -n tests/test_worker_admission_deploy.sh
+bash -n tests/test_worker_admission_rollback.sh
+  PASS
+destructive Docker mutation inventory and deploy diff
+  PASS: no new docker secret/service create, update, or rm site
+production one-shot command-substitution inventory and deploy diff
+  PASS: no new vp_run_python_worker_container call; existing calls remain
+        outside command substitutions
+descriptor inventory
+  PASS: query output retains exact fd 14/15 identity; launch release uses
+        exact unlinked FIFO fd 16 plus independently opened read-only fd 17;
+        transaction locking retains exact fd 19 and BASHPID ownership
+parent-death process audit
+  PASS: no residual supervisor or payload producer
+changed-path allowlist
+  PASS: exactly the five Round 4 files listed above
+generated artifact check
+  PASS: no __pycache__ or .pyc remains
+git diff --check
+  PASS
+```
+
+Only auto-cleaned local fake Docker/operator fixtures were used. No SSH,
+push, deploy, remote access, YouTube/canary operation, or real Docker/Swarm
+service or secret mutation was performed.
+
+### Round 4 Unfinished Boundary
+
+This round closes only the final two Stage 1 review findings. It does not wire
+production forward/rollback phase advancement, service reconciliation,
+cutover, marker mutation boundaries, first-deploy/failed-rollback
+orchestration, or janitor install recovery. It does not claim I-3 end-to-end
+closure.

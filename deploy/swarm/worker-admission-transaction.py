@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 import re
 import secrets
 import stat
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 
 LOCK_NAME = "transaction.lock"
@@ -25,6 +27,7 @@ CREDENTIAL_MODE = 0o400
 DIRECTORY_MODE = 0o700
 LOCK_CONTENTION_STATUS = 75
 MAX_DOCUMENT_BYTES = 1024 * 1024
+CURRENT_DOCUMENT_SCHEMA = 2
 
 DATABASE_PURPOSES = (
     "deploy_migrator",
@@ -147,7 +150,7 @@ REPLAY_ACTIONS = {
     "DONE": "ARCHIVE",
 }
 
-TOP_LEVEL_FIELDS = {
+LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS = {
     "schema",
     "transaction_id",
     "revision",
@@ -159,7 +162,6 @@ TOP_LEVEL_FIELDS = {
     "created_at",
     "database_credentials",
     "runtime_redis",
-    "authorities",
     "prepared_secrets",
     "baseline",
     "failed_forward",
@@ -172,6 +174,7 @@ TOP_LEVEL_FIELDS = {
     "operation",
     "abort",
 }
+TOP_LEVEL_FIELDS = LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS | {"authorities"}
 IDENTITY_FIELDS = {
     "kind",
     "docker_id",
@@ -195,6 +198,14 @@ SNAPSHOT_FIELDS = {
 
 class TransactionError(Exception):
     """A stable, non-secret transaction validation failure."""
+
+
+@dataclass(frozen=True)
+class LegacySchema1Quarantine:
+    transaction_id: str
+    revision: int
+    phase: str
+    journal_sha256: str
 
 
 def _identity(metadata: os.stat_result) -> tuple[int, int]:
@@ -636,6 +647,57 @@ def _validate_authorities(
     return authorities
 
 
+def _validate_legacy_schema_1_abort_authority(
+    value: object,
+) -> dict[str, str]:
+    authority = _require_exact_fields(
+        value,
+        {"kind", "service", "generation"},
+    )
+    if authority["kind"] not in {"control", "runtime"}:
+        raise TransactionError
+    _require_string(
+        authority["service"],
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}",
+    )
+    _require_string(
+        authority["generation"],
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
+    )
+    if (
+        authority["kind"] == "control"
+        and authority["service"] != "vp-worker-control"
+    ) or (
+        authority["kind"] == "runtime"
+        and authority["service"] == "vp-worker-control"
+    ):
+        raise TransactionError
+    return authority
+
+
+def _validate_legacy_schema_1_abort(value: object) -> dict[str, Any]:
+    abort = _require_exact_fields(value, {"reason", "authorities"})
+    _require_string(
+        abort["reason"],
+        r"[a-z][a-z0-9_]{0,63}",
+        maximum=64,
+    )
+    if not isinstance(abort["authorities"], list):
+        raise TransactionError
+    identities: set[tuple[str, str, str]] = set()
+    for value in abort["authorities"]:
+        authority = _validate_legacy_schema_1_abort_authority(value)
+        identity = (
+            authority["kind"],
+            authority["service"],
+            authority["generation"],
+        )
+        if identity in identities:
+            raise TransactionError
+        identities.add(identity)
+    return abort
+
+
 def _validate_abort(
     value: object,
     target_commit: str,
@@ -852,9 +914,242 @@ def _validate_snapshots(value: object) -> dict[str, Any]:
     return snapshots
 
 
+def _validate_legacy_schema_1_document(value: object) -> dict[str, Any]:
+    document = _require_exact_fields(
+        value,
+        LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS,
+    )
+    if isinstance(document["schema"], bool) or document["schema"] != 1:
+        raise TransactionError
+    _require_string(document["transaction_id"], r"tx-[0-9a-f]{32}", maximum=35)
+    _require_integer(document["revision"])
+    if document["phase"] not in PHASES:
+        raise TransactionError
+    if document["outcome"] not in {
+        None,
+        "succeeded",
+        "rolled_back",
+        "manual",
+        "aborted",
+    }:
+        raise TransactionError
+    if (document["phase"] == "DONE") != (document["outcome"] is not None):
+        raise TransactionError
+    _require_string(document["target_commit"], r"[0-9a-f]{40}", maximum=40)
+    _require_string(
+        document["target_backend_image"],
+        r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}",
+    )
+    _require_string(
+        document["target_go_image"],
+        r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}",
+    )
+    _require_string(
+        document["created_at"],
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+        maximum=20,
+    )
+    _validate_database_credentials(document["database_credentials"])
+
+    runtime_redis = document["runtime_redis"]
+    if not isinstance(runtime_redis, dict):
+        raise TransactionError
+    runtime_secret_names: set[str] = set()
+    runtime_secret_ids: set[str] = set()
+    for role, reference in runtime_redis.items():
+        _require_string(role, r"[a-z][a-z0-9_-]{0,63}", maximum=64)
+        entry = _require_exact_fields(
+            reference,
+            {"runtime_generation", "secret_name", "docker_secret_id"},
+        )
+        _require_string(
+            entry["runtime_generation"],
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
+        )
+        _require_string(
+            entry["secret_name"],
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}",
+        )
+        _require_string(
+            entry["docker_secret_id"],
+            r"[a-z0-9]{20,64}",
+            maximum=64,
+        )
+        if (
+            entry["secret_name"] in runtime_secret_names
+            or entry["docker_secret_id"] in runtime_secret_ids
+        ):
+            raise TransactionError
+        runtime_secret_names.add(entry["secret_name"])
+        runtime_secret_ids.add(entry["docker_secret_id"])
+
+    _validate_secret_refs(document["prepared_secrets"])
+
+    baseline = _require_exact_fields(
+        document["baseline"],
+        {"kind", "control", "services"},
+    )
+    if baseline["kind"] not in {"managed", "legacy_no_control"}:
+        raise TransactionError
+    if baseline["control"] is not None:
+        _validate_control_identity(baseline["control"])
+    _validate_service_identities(baseline["services"])
+
+    failed_forward = _require_exact_fields(
+        document["failed_forward"],
+        {"services", "control"},
+    )
+    _validate_service_identities(failed_forward["services"])
+    if failed_forward["control"] is not None:
+        _validate_failed_forward_control(failed_forward["control"])
+
+    forward = _require_exact_fields(
+        document["forward"],
+        {"namespace", "control", "marker", "workers"},
+    )
+    _require_string(
+        forward["namespace"],
+        r"[a-z0-9][a-z0-9-]{0,127}",
+        maximum=128,
+    )
+    if forward["control"] is not None:
+        _validate_control_identity(forward["control"])
+    if forward["marker"] is not None:
+        _validate_marker_identity(forward["marker"])
+    _validate_worker_identities(forward["workers"])
+
+    rollback = _require_exact_fields(
+        document["rollback"],
+        {"attempt", "control", "marker", "workers"},
+    )
+    _require_integer(rollback["attempt"])
+    if rollback["control"] is not None:
+        _validate_control_identity(rollback["control"])
+    if rollback["marker"] is not None:
+        _validate_marker_identity(rollback["marker"])
+    _validate_worker_identities(rollback["workers"])
+
+    promotion = _require_exact_fields(
+        document["promotion"],
+        {"workers", "marker", "control"},
+    )
+    if any(not isinstance(promotion[key], bool) for key in promotion):
+        raise TransactionError
+    expected_promotion = PROMOTION_BY_PHASE[document["phase"]]
+    if document["phase"] == "DONE" and document["outcome"] == "aborted":
+        expected_promotion = (False, False, False)
+    if (
+        promotion["workers"],
+        promotion["marker"],
+        promotion["control"],
+    ) != expected_promotion:
+        raise TransactionError
+
+    retirements = document["pending_retirements"]
+    if not isinstance(retirements, list):
+        raise TransactionError
+    retirement_ids: set[str] = set()
+    docker_ids: set[str] = set()
+    logical_keys: set[tuple[str, str, str, str, str]] = set()
+    for item in retirements:
+        retirement = _require_exact_fields(
+            item,
+            {"retirement_id", "identity"},
+        )
+        retirement_id = _require_string(
+            retirement["retirement_id"],
+            r"retirement-[0-9a-f]{32}",
+            maximum=43,
+        )
+        identity = _validate_identity(retirement["identity"])
+        docker_id = identity["docker_id"]
+        logical_key = (
+            identity["service"],
+            identity["generation"],
+            identity["kind"],
+            identity["purpose"],
+            identity["name"],
+        )
+        if (
+            retirement_id in retirement_ids
+            or (docker_id is not None and docker_id in docker_ids)
+            or logical_key in logical_keys
+        ):
+            raise TransactionError
+        retirement_ids.add(retirement_id)
+        logical_keys.add(logical_key)
+        if docker_id is not None:
+            docker_ids.add(docker_id)
+
+    janitor = _require_exact_fields(document["janitor"], {"service"})
+    if janitor["service"] is not None:
+        _validate_janitor_service(janitor["service"])
+
+    if document["last_error"] is not None:
+        last_error = _require_exact_fields(
+            document["last_error"],
+            {"code", "phase"},
+        )
+        _require_string(
+            last_error["code"],
+            r"[a-z][a-z0-9_]{0,63}",
+            maximum=64,
+        )
+        if last_error["phase"] not in PHASES:
+            raise TransactionError
+
+    abort = document["abort"]
+    if abort is None:
+        if document["phase"] == "ABORTING" or document["outcome"] == "aborted":
+            raise TransactionError
+    else:
+        _validate_legacy_schema_1_abort(abort)
+        if document["phase"] != "ABORTING" and not (
+            document["phase"] == "DONE" and document["outcome"] == "aborted"
+        ):
+            raise TransactionError
+
+    if document["operation"] is not None:
+        operation = _require_exact_fields(
+            document["operation"],
+            {"operation_id", "kind", "target_phase", "identity"},
+        )
+        _require_string(
+            operation["operation_id"],
+            r"operation-[0-9a-f]{32}",
+            maximum=42,
+        )
+        if operation["kind"] not in INTENT_PHASES:
+            raise TransactionError
+        current_phase, target_phase = INTENT_PHASES[operation["kind"]]
+        if (
+            document["phase"] != current_phase
+            or operation["target_phase"] != target_phase
+        ):
+            raise TransactionError
+        identity = _validate_identity(operation["identity"])
+        if operation["kind"] == "REMOVE_PREPARED_SECRET":
+            matches = [
+                reference
+                for reference in document["prepared_secrets"]
+                if (
+                    reference["docker_secret_id"] == identity["docker_id"]
+                    and reference["name"] == identity["name"]
+                    and reference["service"] == identity["service"]
+                    and reference["generation"] == identity["generation"]
+                    and reference["purpose"] == identity["purpose"]
+                    and identity["kind"] == "secret"
+                    and identity["spec_digest"] is None
+                )
+            ]
+            if len(matches) != 1:
+                raise TransactionError
+    return document
+
+
 def _validate_document(value: object) -> dict[str, Any]:
     document = _require_exact_fields(value, TOP_LEVEL_FIELDS)
-    if document["schema"] != 1:
+    if document["schema"] != CURRENT_DOCUMENT_SCHEMA:
         raise TransactionError
     _require_string(document["transaction_id"], r"tx-[0-9a-f]{32}", maximum=35)
     _require_integer(document["revision"])
@@ -1107,11 +1402,36 @@ def _validate_document(value: object) -> dict[str, Any]:
     return document
 
 
+@overload
 def _read_active_from_descriptor(
     transactions_descriptor: int,
     *,
     allow_missing: bool,
-) -> tuple[dict[str, Any] | None, tuple[int, int] | None]:
+    allow_legacy_quarantine: Literal[False] = False,
+) -> tuple[dict[str, Any] | None, tuple[int, int] | None]: ...
+
+
+@overload
+def _read_active_from_descriptor(
+    transactions_descriptor: int,
+    *,
+    allow_missing: bool,
+    allow_legacy_quarantine: Literal[True],
+) -> tuple[
+    dict[str, Any] | LegacySchema1Quarantine | None,
+    tuple[int, int] | None,
+]: ...
+
+
+def _read_active_from_descriptor(
+    transactions_descriptor: int,
+    *,
+    allow_missing: bool,
+    allow_legacy_quarantine: bool = False,
+) -> tuple[
+    dict[str, Any] | LegacySchema1Quarantine | None,
+    tuple[int, int] | None,
+]:
     try:
         before = os.stat(
             ACTIVE_NAME,
@@ -1136,7 +1456,25 @@ def _read_active_from_descriptor(
         payload = _read_limited(descriptor)
     finally:
         os.close(descriptor)
-    document = _validate_document(_decode_canonical(payload))
+    decoded = _decode_canonical(payload)
+    if (
+        isinstance(decoded, dict)
+        and decoded.get("schema") == 1
+        and set(decoded) == LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS
+    ):
+        legacy = _validate_legacy_schema_1_document(decoded)
+        if not allow_legacy_quarantine:
+            raise TransactionError
+        document: dict[str, Any] | LegacySchema1Quarantine = (
+            LegacySchema1Quarantine(
+                transaction_id=legacy["transaction_id"],
+                revision=legacy["revision"],
+                phase=legacy["phase"],
+                journal_sha256=hashlib.sha256(payload).hexdigest(),
+            )
+        )
+    else:
+        document = _validate_document(decoded)
     return document, _identity(opened)
 
 
@@ -1441,7 +1779,7 @@ def _new_document(
         .replace("+00:00", "Z")
     )
     return {
-        "schema": 1,
+        "schema": CURRENT_DOCUMENT_SCHEMA,
         "transaction_id": f"tx-{secrets.token_hex(16)}",
         "revision": 0,
         "phase": "PREPARING",
@@ -2364,6 +2702,7 @@ def replay_plan(raw_root: str) -> None:
         document, _active_identity = _read_active_from_descriptor(
             transactions_descriptor,
             allow_missing=True,
+            allow_legacy_quarantine=True,
         )
     finally:
         os.close(transactions_descriptor)
@@ -2381,6 +2720,26 @@ def replay_plan(raw_root: str) -> None:
                 "retirements": [],
                 "revision": None,
                 "transaction_id": None,
+            }
+        )
+        return
+    if isinstance(document, LegacySchema1Quarantine):
+        _print_json(
+            {
+                "active": True,
+                "allow_new_candidate": False,
+                "allow_stale_cleanup": False,
+                "journal_sha256": document.journal_sha256,
+                "namespace": None,
+                "next_action": "QUARANTINE_LEGACY_SCHEMA_1",
+                "pending_operation": None,
+                "phase": document.phase,
+                "reason_code": (
+                    "legacy_schema_1_authority_context_unavailable"
+                ),
+                "retirements": [],
+                "revision": document.revision,
+                "transaction_id": document.transaction_id,
             }
         )
         return
