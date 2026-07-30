@@ -211,6 +211,15 @@ and still allow Docker/later outer mutation; partial secret prefixes resume
 without reminting but have no deterministic exact-ID abort cleanup.
 Task 4B/4C Deploy Track B stage 1: fix round 2/5 in progress; stage 2 remains
 blocked.
+Task 4B/4C Deploy Track B stage 1: fix round 2/5 at a0e1afa left all three
+prior findings open and added one Important finding: the query output pathname
+can be replaced after stdout opens and before parsing; a signal after the last
+gate can still be followed by Docker launch; fresh-process ABORTING replay
+does not restore the control generation required for authority revoke; and
+authority provisioned before the first secret is not durably represented, so
+an empty-secret abort can archive without revoke evidence.
+Task 4B/4C Deploy Track B stage 1: fix round 3/5 in progress; stage 2 remains
+blocked.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
