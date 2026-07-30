@@ -11,8 +11,9 @@ CALLS="$TEST_ROOT/calls"
 SERVICE_STATE="$TEST_ROOT/service-state"
 TASK_STATE_FILE="$TEST_ROOT/task-state"
 SPEC_FILE="$TEST_ROOT/spec.json"
+VOLUME_STATE="$TEST_ROOT/volume-state"
 mkdir -p "$FAKE_BIN"
-export CALLS SERVICE_STATE TASK_STATE_FILE SPEC_FILE
+export CALLS SERVICE_STATE TASK_STATE_FILE SPEC_FILE VOLUME_STATE
 
 cat >"$FAKE_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -21,6 +22,21 @@ printf 'docker|%s\n' "$*" >>"$CALLS"
 
 if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
   printf 'vp-pipeline-network-id|vp-pipeline-net|overlay|swarm\n'
+  exit 0
+fi
+if [[ "${1:-} ${2:-}" == "volume inspect" ]]; then
+  [[ -f "$VOLUME_STATE" ]] || exit 1
+  volume_name=vp-staging-janitor-evidence
+  if [[ "${FAIL_VOLUME_IDENTITY:-0}" == 1 ]]; then
+    volume_name=unexpected-evidence-volume
+  fi
+  printf '{"Name":"%s","Driver":"local","Scope":"local","Options":null,"Labels":{"vp.videoprocess.volume":"staging-object-janitor-evidence"}}\n' \
+    "$volume_name"
+  exit 0
+fi
+if [[ "${1:-} ${2:-}" == "volume create" ]]; then
+  : >"$VOLUME_STATE"
+  printf '%s\n' "${*: -1}"
   exit 0
 fi
 if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
@@ -41,6 +57,10 @@ fi
 if [[ "${1:-} ${2:-}" == "service create" ]]; then
   : >"$SERVICE_STATE"
   exit 0
+fi
+if [[ "${1:-}" == run ]]; then
+  [[ "${FAIL_EVIDENCE_PREPARE:-0}" != 1 ]]
+  exit
 fi
 exit 90
 EOF
@@ -85,6 +105,7 @@ cat >"$SPEC_FILE" <<EOF
   "TaskTemplate": {
     "ContainerSpec": {
       "Image": "$image",
+      "User": "10001:10001",
       "Args": ["python", "-m", "app.channel_agent.staging_object_janitor_cli"],
       "Env": [
         "DEPLOY_MODE=production",
@@ -98,9 +119,9 @@ cat >"$SPEC_FILE" <<EOF
         "MINIO_BUCKET=videoprocess"
       ],
       "Secrets": [
-        {"SecretName": "$database_secret", "File": {"Name": "vp-staging-janitor-database-url", "Mode": 256}},
-        {"SecretName": "$minio_access_secret", "File": {"Name": "vp-staging-janitor-minio-access-key", "Mode": 256}},
-        {"SecretName": "$minio_secret_secret", "File": {"Name": "vp-staging-janitor-minio-secret-key", "Mode": 256}}
+        {"SecretName": "$database_secret", "File": {"Name": "vp-staging-janitor-database-url", "UID": "10001", "GID": "10001", "Mode": 256}},
+        {"SecretName": "$minio_access_secret", "File": {"Name": "vp-staging-janitor-minio-access-key", "UID": "10001", "GID": "10001", "Mode": 256}},
+        {"SecretName": "$minio_secret_secret", "File": {"Name": "vp-staging-janitor-minio-secret-key", "UID": "10001", "GID": "10001", "Mode": 256}}
       ],
       "Mounts": [
         {"Type": "volume", "Source": "$evidence_volume", "Target": "/run/videoprocess/staging-janitor"}
@@ -115,15 +136,71 @@ EOF
 cp "$SPEC_FILE" "$TEST_ROOT/valid-spec.json"
 
 bash "$LAUNCHER"
+grep -Fq \
+  'docker|volume create --driver local --label vp.videoprocess.volume=staging-object-janitor-evidence vp-staging-janitor-evidence' \
+  "$CALLS"
+grep -Fq -- \
+  "docker|run --rm --user 0:0 --mount type=volume,src=$evidence_volume,dst=/run/videoprocess/staging-janitor $image /opt/venv/bin/python -I -m app.channel_agent.staging_object_janitor_cli prepare-evidence" \
+  "$CALLS"
 grep -Fq 'docker|service create' "$CALLS"
+grep -Fq -- '--user 10001:10001' "$CALLS"
 grep -Fq -- '--mode replicated-job --replicas 1 --max-concurrent 1' "$CALLS"
 grep -Fq -- '--constraint node.hostname==ccttww-lap' "$CALLS"
 grep -Fq -- '--restart-condition none' "$CALLS"
 grep -Fq -- '--network vp-pipeline-network-id' "$CALLS"
+grep -Fq -- \
+  "--secret source=$database_secret,target=vp-staging-janitor-database-url,uid=10001,gid=10001,mode=0400" \
+  "$CALLS"
+grep -Fq -- \
+  "--secret source=$minio_access_secret,target=vp-staging-janitor-minio-access-key,uid=10001,gid=10001,mode=0400" \
+  "$CALLS"
+grep -Fq -- \
+  "--secret source=$minio_secret_secret,target=vp-staging-janitor-minio-secret-key,uid=10001,gid=10001,mode=0400" \
+  "$CALLS"
 if grep -Fiq '126' "$CALLS"; then
   echo 'FAIL: staging janitor referenced host 126' >&2
   exit 1
 fi
+
+printf 'Running|Running 3 seconds ago\n' >"$TASK_STATE_FILE"
+python3 - "$TEST_ROOT/valid-spec.json" "$SPEC_FILE" <<'PY'
+import json
+import sys
+
+source, target = sys.argv[1:]
+with open(source, encoding="utf-8") as handle:
+    spec = json.load(handle)
+spec["TaskTemplate"]["ContainerSpec"]["Secrets"][0]["File"]["UID"] = "0"
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(spec, handle)
+PY
+if bash "$LAUNCHER" >/dev/null 2>&1; then
+  echo 'FAIL: root-owned staging janitor secret was accepted' >&2
+  exit 1
+fi
+cp "$TEST_ROOT/valid-spec.json" "$SPEC_FILE"
+
+: >"$CALLS"
+python3 - "$TEST_ROOT/valid-spec.json" "$SPEC_FILE" <<'PY'
+import json
+import sys
+
+source, target = sys.argv[1:]
+with open(source, encoding="utf-8") as handle:
+    spec = json.load(handle)
+spec["TaskTemplate"]["ContainerSpec"]["User"] = "0:0"
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(spec, handle)
+PY
+if bash "$LAUNCHER" >/dev/null 2>&1; then
+  echo 'FAIL: root staging janitor service was accepted' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service rm' "$CALLS"; then
+  echo 'FAIL: root staging janitor service was removed' >&2
+  exit 1
+fi
+cp "$TEST_ROOT/valid-spec.json" "$SPEC_FILE"
 
 : >"$CALLS"
 printf 'Running|Running 3 seconds ago\n' >"$TASK_STATE_FILE"
@@ -229,6 +306,43 @@ if VP_STAGING_JANITOR_CONFIG_FILE="$bad_host_config" \
 fi
 if grep -Fq 'docker|service create' "$CALLS"; then
   echo 'FAIL: forbidden host-126 configuration created a job' >&2
+  exit 1
+fi
+
+other_volume_config="$TEST_ROOT/other-volume.conf"
+sed 's/^EVIDENCE_VOLUME=.*/EVIDENCE_VOLUME=other-evidence-volume/' \
+  "$config" >"$other_volume_config"
+chmod 0600 "$other_volume_config"
+: >"$CALLS"
+if VP_STAGING_JANITOR_CONFIG_FILE="$other_volume_config" \
+  bash "$LAUNCHER" >/dev/null 2>&1; then
+  echo 'FAIL: non-canonical evidence volume was accepted' >&2
+  exit 1
+fi
+if grep -Eq 'docker\|(volume|run|service create)' "$CALLS"; then
+  echo 'FAIL: non-canonical evidence volume caused Docker mutation' >&2
+  exit 1
+fi
+
+rm -f "$SERVICE_STATE"
+: >"$CALLS"
+if FAIL_EVIDENCE_PREPARE=1 bash "$LAUNCHER" >/dev/null 2>&1; then
+  echo 'FAIL: failed evidence preparation was accepted' >&2
+  exit 1
+fi
+if grep -Fq 'docker|service create' "$CALLS"; then
+  echo 'FAIL: failed evidence preparation created the janitor service' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+if FAIL_VOLUME_IDENTITY=1 bash "$LAUNCHER" >/dev/null 2>&1; then
+  echo 'FAIL: mismatched evidence volume identity was accepted' >&2
+  exit 1
+fi
+if grep -Fq 'docker|run' "$CALLS" \
+  || grep -Fq 'docker|service create' "$CALLS"; then
+  echo 'FAIL: mismatched evidence volume was prepared or launched' >&2
   exit 1
 fi
 

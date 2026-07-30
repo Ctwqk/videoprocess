@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_ROOT="$(mktemp -d "$ROOT_DIR/.task4bc-python-image.XXXXXX")"
+LEGACY_EVIDENCE_VOLUME=""
+cleanup() {
+  local status=$?
+  if [[ -n "$LEGACY_EVIDENCE_VOLUME" ]]; then
+    docker volume rm -f "$LEGACY_EVIDENCE_VOLUME" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$TEST_ROOT"
+  exit "$status"
+}
+trap cleanup EXIT
+
 image="${1:?usage: $0 IMAGE EXPECTED_BUILD_COMMIT}"
 expected_commit="${2:?usage: $0 IMAGE EXPECTED_BUILD_COMMIT}"
 identity_path="/usr/local/share/videoprocess/worker-build-commit"
@@ -112,3 +125,187 @@ print(
 )
 PY
   '
+
+bind_secret="$TEST_ROOT/bind-secret"
+printf '%s\n' 'synthetic-bind-secret' >"$bind_secret"
+chmod 0400 "$bind_secret"
+REPO_ROOT="$ROOT_DIR"
+ROOT="$TEST_ROOT/sync"
+export REPO_ROOT ROOT
+source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
+
+if ! loader_output="$(
+  vp_run_python_worker_container \
+    "$image" \
+    "$bind_secret" \
+    worker-deploy-read-database-url \
+    - \
+    -- \
+    /opt/venv/bin/python -I -c '
+import os
+import stat
+from pathlib import Path
+
+from worker.secret_config import read_mode_0400_secret
+
+path = Path("/run/secrets/worker-deploy-read-database-url")
+metadata = path.lstat()
+assert os.geteuid() == 10001
+assert os.getegid() == 10001
+assert metadata.st_uid == 10001
+assert metadata.st_gid == 10001
+assert stat.S_IMODE(metadata.st_mode) == 0o400
+assert read_mode_0400_secret(
+    path,
+    label="worker deploy-read database URL",
+) == "synthetic-bind-secret"
+print("python-worker-bind-secret passed uid=10001 gid=10001 mode=0400")
+'
+)"; then
+  echo "FAIL: exact Python worker image could not read the transported secret" >&2
+  exit 1
+fi
+if [[ "$loader_output" != *"python-worker-bind-secret passed uid=10001 gid=10001 mode=0400"* ]]; then
+  echo "FAIL: exact Python worker image did not execute the real secret loader" >&2
+  exit 1
+fi
+printf '%s\n' "$loader_output"
+
+if ! fresh_evidence_output="$(
+  docker run --rm \
+    --user 0:0 \
+    --mount type=volume,dst=/run/videoprocess/staging-janitor \
+    "$image" \
+    /bin/bash -ceu '
+      /opt/venv/bin/python -I -m \
+        app.channel_agent.staging_object_janitor_cli prepare-evidence
+      exec /usr/bin/setpriv \
+        --reuid=10001 \
+        --regid=10001 \
+        --clear-groups \
+        --no-new-privs \
+        /opt/venv/bin/python -I - <<"PY"
+import os
+import stat
+from datetime import datetime, timezone
+from pathlib import Path
+
+from app.services.staging_object_janitor import StagingObjectJanitor
+
+status_file = Path("/run/videoprocess/staging-janitor/status.json")
+janitor = StagingObjectJanitor(
+    object(),
+    client=object(),
+    bucket="videoprocess",
+    status_file=status_file,
+)
+janitor._write_status(
+    datetime(2026, 7, 29, tzinfo=timezone.utc),
+    {
+        "scanned": 0,
+        "deleted": 0,
+        "protected": 0,
+        "too_young": 0,
+        "invalid": 0,
+        "errors": 0,
+    },
+)
+directory_metadata = status_file.parent.stat()
+status_metadata = status_file.stat()
+assert os.geteuid() == 10001
+assert os.getegid() == 10001
+assert directory_metadata.st_uid == 10001
+assert directory_metadata.st_gid == 10001
+assert stat.S_IMODE(directory_metadata.st_mode) == 0o700
+assert status_metadata.st_uid == 10001
+assert status_metadata.st_gid == 10001
+assert stat.S_IMODE(status_metadata.st_mode) == 0o600
+print("python-worker-fresh-evidence passed uid=10001 gid=10001")
+PY
+    '
+)"; then
+  echo "FAIL: fresh anonymous evidence volume was not prepared" >&2
+  exit 1
+fi
+if [[ "$fresh_evidence_output" != *"python-worker-fresh-evidence passed uid=10001 gid=10001"* ]]; then
+  echo "FAIL: fresh evidence probe did not call the real status writer" >&2
+  exit 1
+fi
+printf '%s\n' "$fresh_evidence_output"
+
+LEGACY_EVIDENCE_VOLUME="vp-task4bc-janitor-legacy-$$"
+docker volume create "$LEGACY_EVIDENCE_VOLUME" >/dev/null
+docker run --rm \
+  --user 0:0 \
+  --mount \
+  "type=volume,src=$LEGACY_EVIDENCE_VOLUME,dst=/run/videoprocess/staging-janitor" \
+  "$image" \
+  /bin/bash -ceu '
+    evidence=/run/videoprocess/staging-janitor
+    printf "%s\n" "legacy evidence" >"$evidence/status.json"
+    chown 0:0 "$evidence" "$evidence/status.json"
+    chmod 0700 "$evidence"
+    chmod 0600 "$evidence/status.json"
+  '
+for _ in 1 2; do
+  docker run --rm \
+    --user 0:0 \
+    --mount \
+    "type=volume,src=$LEGACY_EVIDENCE_VOLUME,dst=/run/videoprocess/staging-janitor" \
+    "$image" \
+    /opt/venv/bin/python -I -m \
+    app.channel_agent.staging_object_janitor_cli prepare-evidence >/dev/null
+done
+if ! legacy_evidence_output="$(
+  docker run --rm \
+    --mount \
+    "type=volume,src=$LEGACY_EVIDENCE_VOLUME,dst=/run/videoprocess/staging-janitor" \
+    "$image" \
+    /opt/venv/bin/python -I -c '
+import os
+import stat
+from datetime import datetime, timezone
+from pathlib import Path
+
+from app.services.staging_object_janitor import StagingObjectJanitor
+
+status_file = Path("/run/videoprocess/staging-janitor/status.json")
+assert status_file.read_text() == "legacy evidence\n"
+janitor = StagingObjectJanitor(
+    object(),
+    client=object(),
+    bucket="videoprocess",
+    status_file=status_file,
+)
+janitor._write_status(
+    datetime(2026, 7, 29, tzinfo=timezone.utc),
+    {
+        "scanned": 1,
+        "deleted": 0,
+        "protected": 1,
+        "too_young": 0,
+        "invalid": 0,
+        "errors": 0,
+    },
+)
+directory_metadata = status_file.parent.stat()
+status_metadata = status_file.stat()
+assert os.geteuid() == 10001
+assert os.getegid() == 10001
+assert directory_metadata.st_uid == 10001
+assert directory_metadata.st_gid == 10001
+assert stat.S_IMODE(directory_metadata.st_mode) == 0o700
+assert status_metadata.st_uid == 10001
+assert status_metadata.st_gid == 10001
+assert stat.S_IMODE(status_metadata.st_mode) == 0o600
+print("python-worker-legacy-evidence passed uid=10001 gid=10001")
+'
+)"; then
+  echo "FAIL: legacy named evidence volume was not writable after migration" >&2
+  exit 1
+fi
+if [[ "$legacy_evidence_output" != *"python-worker-legacy-evidence passed uid=10001 gid=10001"* ]]; then
+  echo "FAIL: legacy evidence probe did not call the real status writer" >&2
+  exit 1
+fi
+printf '%s\n' "$legacy_evidence_output"

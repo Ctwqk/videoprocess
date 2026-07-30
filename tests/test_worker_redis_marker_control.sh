@@ -160,7 +160,7 @@ if [[ "${1:-} ${2:-}" == "service create" ]]; then
   done
   [[ "$job_mode" == replicated-job && "$network" == vp-pipeline-net ]]
   printf '%s\n' \
-    "2|$mode|$generation|$image|replicated-job|$replicas|$replicas|$restart|$placement|vp-pipeline-network-id|$database_secret:worker-marker-database-url:256,$redis_secret:worker-marker-redis-url:256|$envs|${command_args%,}" \
+    "2|$mode|$generation|$image|replicated-job|$replicas|$replicas|$restart|$placement|vp-pipeline-network-id|$database_secret:worker-marker-database-url:10001:10001:256,$redis_secret:worker-marker-redis-url:10001:10001:256|$envs|${command_args%,}" \
     >"$(service_path "$name" identity)"
   created_state=Complete
   if [[ "$mode" == readiness && -n "${FAKE_READINESS_TASK_STATE:-}" ]]; then
@@ -353,9 +353,9 @@ assert_control_job() {
     || fail "$mode did not use exact host-150 placement"
   [[ "$create" == *"|--network|vp-pipeline-network-id|"* ]] \
     || fail "$mode did not use the reviewed network"
-  [[ "$create" == *"|--secret|source=$database_secret,target=worker-marker-database-url,mode=0400|"* ]] \
+  [[ "$create" == *"|--secret|source=$database_secret,target=worker-marker-database-url,uid=10001,gid=10001,mode=0400|"* ]] \
     || fail "$mode did not mount its own database secret at mode 0400"
-  [[ "$create" == *"|--secret|source=$redis_secret,target=worker-marker-redis-url,mode=0400|"* ]] \
+  [[ "$create" == *"|--secret|source=$redis_secret,target=worker-marker-redis-url,uid=10001,gid=10001,mode=0400|"* ]] \
     || fail "$mode did not mount its own Redis secret at mode 0400"
   [[ "$create" == *"|--env|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url|"* ]] \
     || fail "$mode database file environment is missing"
@@ -500,6 +500,27 @@ fi
 : >"$DOCKER_CALLS"
 "$LAUNCHER" readiness >/dev/null
 set_service_state vp-worker-redis-marker-readiness-job Complete
+cp \
+  "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity" \
+  "$TEST_ROOT/valid-readiness-identity"
+sed 's/:10001:10001:256/:0:10001:256/' \
+  "$TEST_ROOT/valid-readiness-identity" \
+  >"$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+: >"$DOCKER_CALLS"
+if "$LAUNCHER" readiness >"$TEST_ROOT/wrong-secret-owner.out" 2>&1; then
+  fail "root-owned marker secret descriptor was accepted"
+fi
+if grep -Fq \
+  'docker|service|rm|vp-worker-redis-marker-readiness-job' \
+  "$DOCKER_CALLS"; then
+  fail "wrong-owner fixed-name marker service was removed"
+fi
+grep -Fq 'code=job_identity_invalid' "$TEST_ROOT/wrong-secret-owner.out" \
+  || fail "wrong-owner marker service did not fail closed"
+cp \
+  "$TEST_ROOT/valid-readiness-identity" \
+  "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+
 sed 's/^2|readiness|/2|janitor|/' \
   "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity" \
   >"$TEST_ROOT/wrong-identity"
@@ -1426,7 +1447,7 @@ ROTATION_CANDIDATE_IDENTITY="$(
   cat "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
 )"
 [[ "$ROTATION_CANDIDATE_IDENTITY" \
-    == *"$ROTATION_NEW_READINESS_SECRET:worker-marker-redis-url:256"* \
+    == *"$ROTATION_NEW_READINESS_SECRET:worker-marker-redis-url:10001:10001:256"* \
   && "$ROTATION_CANDIDATE_IDENTITY" != *"$ROTATION_OLD_READINESS_SECRET"* ]] \
   || fail "rotation candidate did not use the current readiness Redis secret"
 vp_commit_worker_redis_marker_controls \

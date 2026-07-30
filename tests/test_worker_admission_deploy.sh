@@ -75,19 +75,19 @@ assert_worker_contract() {
 
   vp_worker_service_secret_specs "$service" >"$secret_file"
   grep -Fxq \
-    "source=$expected_db_secret,target=vp-worker-database-url,mode=0400" \
+    "source=$expected_db_secret,target=vp-worker-database-url,uid=10001,gid=10001,mode=0400" \
     "$secret_file"
   grep -Fxq \
-    "source=$expected_admission_secret,target=vp-worker-admission-token,mode=0400" \
+    "source=$expected_admission_secret,target=vp-worker-admission-token,uid=10001,gid=10001,mode=0400" \
     "$secret_file"
   grep -Fxq \
-    "source=$expected_redis_secret,target=vp-worker-redis-url,mode=0400" \
+    "source=$expected_redis_secret,target=vp-worker-redis-url,uid=10001,gid=10001,mode=0400" \
     "$secret_file"
   grep -Fxq \
-    "source=$VP_WORKER_MINIO_ACCESS_SECRET,target=vp-worker-minio-access-key,mode=0400" \
+    "source=$VP_WORKER_MINIO_ACCESS_SECRET,target=vp-worker-minio-access-key,uid=10001,gid=10001,mode=0400" \
     "$secret_file"
   grep -Fxq \
-    "source=$VP_WORKER_MINIO_SECRET_SECRET,target=vp-worker-minio-secret-key,mode=0400" \
+    "source=$VP_WORKER_MINIO_SECRET_SECRET,target=vp-worker-minio-secret-key,uid=10001,gid=10001,mode=0400" \
     "$secret_file"
   [[ "$(wc -l <"$secret_file" | tr -d ' ')" -eq 5 ]]
 }
@@ -183,11 +183,11 @@ cat >"$SERVICE_SPEC" <<EOF
         "VP_REQUIRE_STAGING_JANITOR=true"
       ],
       "Secrets": [
-        {"SecretName": "vision-db-secret", "File": {"Name": "vp-worker-database-url", "Mode": 256}},
-        {"SecretName": "vision-admission-secret", "File": {"Name": "vp-worker-admission-token", "Mode": 256}},
-        {"SecretName": "vision-redis-secret", "File": {"Name": "vp-worker-redis-url", "Mode": 256}},
-        {"SecretName": "worker-minio-access-secret", "File": {"Name": "vp-worker-minio-access-key", "Mode": 256}},
-        {"SecretName": "worker-minio-secret-secret", "File": {"Name": "vp-worker-minio-secret-key", "Mode": 256}}
+        {"SecretName": "vision-db-secret", "File": {"Name": "vp-worker-database-url", "UID": "10001", "GID": "10001", "Mode": 256}},
+        {"SecretName": "vision-admission-secret", "File": {"Name": "vp-worker-admission-token", "UID": "10001", "GID": "10001", "Mode": 256}},
+        {"SecretName": "vision-redis-secret", "File": {"Name": "vp-worker-redis-url", "UID": "10001", "GID": "10001", "Mode": 256}},
+        {"SecretName": "worker-minio-access-secret", "File": {"Name": "vp-worker-minio-access-key", "UID": "10001", "GID": "10001", "Mode": 256}},
+        {"SecretName": "worker-minio-secret-secret", "File": {"Name": "vp-worker-minio-secret-key", "UID": "10001", "GID": "10001", "Mode": 256}}
       ]
     },
     "Placement": {
@@ -200,6 +200,7 @@ cat >"$SERVICE_SPEC" <<EOF
   }
 }
 EOF
+cp "$SERVICE_SPEC" "$TEST_ROOT/valid-worker-service-spec.json"
 READINESS_ATTEMPTS="$TEST_ROOT/readiness-attempts"
 printf '0\n' >"$READINESS_ATTEMPTS"
 docker() {
@@ -239,8 +240,29 @@ vp_require_worker_service_descriptor \
 vp_require_worker_deployment_ready vp-vision-worker-swarm
 [[ "$(<"$READINESS_ATTEMPTS")" == 3 ]]
 
+python3 - \
+  "$TEST_ROOT/valid-worker-service-spec.json" \
+  "$SERVICE_SPEC" <<'PY'
+import json
+import sys
+
+source, target = sys.argv[1:]
+with open(source, encoding="utf-8") as handle:
+    spec = json.load(handle)
+spec["TaskTemplate"]["ContainerSpec"]["Secrets"][0]["File"]["UID"] = "0"
+with open(target, "w", encoding="utf-8") as handle:
+    json.dump(spec, handle)
+PY
+if vp_require_worker_service_descriptor \
+  vp-vision-worker-swarm \
+  vp-ffmpeg-worker-python:deploy-0123456789ab; then
+  echo 'FAIL: worker descriptor accepted a root-owned runtime secret' >&2
+  exit 1
+fi
+
 sed 's/"vision-redis-secret"/"worker-deploy-read-secret"/' \
-  "$SERVICE_SPEC" >"$TEST_ROOT/bad-service-spec.json"
+  "$TEST_ROOT/valid-worker-service-spec.json" \
+  >"$TEST_ROOT/bad-service-spec.json"
 mv "$TEST_ROOT/bad-service-spec.json" "$SERVICE_SPEC"
 if vp_require_worker_service_descriptor \
   vp-vision-worker-swarm \
@@ -280,6 +302,7 @@ cat >"$SERVICE_SPEC" <<EOF
   "TaskTemplate": {
     "ContainerSpec": {
       "Image": "vp-ffmpeg-worker-python:deploy-0123456789ab",
+      "User": "10001:10001",
       "Args": ["python", "-m", "app.channel_agent.staging_object_janitor_cli"],
       "Env": [
         "DEPLOY_MODE=production",
@@ -293,9 +316,9 @@ cat >"$SERVICE_SPEC" <<EOF
         "MINIO_BUCKET=videoprocess"
       ],
       "Secrets": [
-        {"SecretName": "$VP_STAGING_JANITOR_DATABASE_SECRET", "File": {"Name": "vp-staging-janitor-database-url", "Mode": 256}},
-        {"SecretName": "$VP_STAGING_JANITOR_MINIO_ACCESS_SECRET", "File": {"Name": "vp-staging-janitor-minio-access-key", "Mode": 256}},
-        {"SecretName": "$VP_STAGING_JANITOR_MINIO_SECRET_SECRET", "File": {"Name": "vp-staging-janitor-minio-secret-key", "Mode": 256}}
+        {"SecretName": "$VP_STAGING_JANITOR_DATABASE_SECRET", "File": {"Name": "vp-staging-janitor-database-url", "UID": "10001", "GID": "10001", "Mode": 256}},
+        {"SecretName": "$VP_STAGING_JANITOR_MINIO_ACCESS_SECRET", "File": {"Name": "vp-staging-janitor-minio-access-key", "UID": "10001", "GID": "10001", "Mode": 256}},
+        {"SecretName": "$VP_STAGING_JANITOR_MINIO_SECRET_SECRET", "File": {"Name": "vp-staging-janitor-minio-secret-key", "UID": "10001", "GID": "10001", "Mode": 256}}
       ],
       "Mounts": [
         {"Type": "volume", "Source": "vp-staging-janitor-evidence", "Target": "/run/videoprocess/staging-janitor"}
@@ -560,6 +583,8 @@ vp_worker_admission_operator() {
 vp_worker_admission_required_file() {
   printf '%s\n' "$TEST_ROOT/runtime-owner"
 }
+printf '%s\n' 'synthetic-runtime-owner' >"$TEST_ROOT/runtime-owner"
+chmod 0400 "$TEST_ROOT/runtime-owner"
 docker() {
   if [[ "${1:-}" == run ]]; then
     printf 'runtime-role|%s\n' "$*" >>"$CLEANUP_CALLS"

@@ -287,11 +287,113 @@ vp_worker_service_secret_specs() {
     return 1
   fi
   printf '%s\n' \
-    "source=$database_secret,target=vp-worker-database-url,mode=0400" \
-    "source=$admission_secret,target=vp-worker-admission-token,mode=0400" \
-    "source=$redis_secret,target=vp-worker-redis-url,mode=0400" \
-    "source=$VP_WORKER_MINIO_ACCESS_SECRET,target=vp-worker-minio-access-key,mode=0400" \
-    "source=$VP_WORKER_MINIO_SECRET_SECRET,target=vp-worker-minio-secret-key,mode=0400"
+    "source=$database_secret,target=vp-worker-database-url,uid=10001,gid=10001,mode=0400" \
+    "source=$admission_secret,target=vp-worker-admission-token,uid=10001,gid=10001,mode=0400" \
+    "source=$redis_secret,target=vp-worker-redis-url,uid=10001,gid=10001,mode=0400" \
+    "source=$VP_WORKER_MINIO_ACCESS_SECRET,target=vp-worker-minio-access-key,uid=10001,gid=10001,mode=0400" \
+    "source=$VP_WORKER_MINIO_SECRET_SECRET,target=vp-worker-minio-secret-key,uid=10001,gid=10001,mode=0400"
+}
+
+vp_run_python_worker_container() {
+  local image="$1"
+  local secret_source="$2"
+  local secret_target="$3"
+  local prepare_dirs="$4"
+  shift 4
+
+  [[ "$image" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ ]] || return 1
+  if [[ "$secret_source" == - && "$secret_target" == - ]]; then
+    secret_source=""
+    secret_target=""
+  elif [[ "$secret_source" != /* || ! -f "$secret_source" \
+    || -L "$secret_source" \
+    || "$(vp_worker_redis_marker_file_mode "$secret_source")" != 400 \
+    || ! "$secret_target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    return 1
+  fi
+  case "$prepare_dirs" in
+    -)
+      prepare_dirs=""
+      ;;
+    /control-state|/runtime-state|/requests|\
+    /control-state,/requests|/runtime-state,/requests)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  local docker_args=()
+  while [[ "$#" -gt 0 && "$1" != -- ]]; do
+    docker_args+=("$1")
+    shift
+  done
+  [[ "$#" -gt 1 && "$1" == -- ]] || return 1
+  shift
+  local command=("$@")
+
+  local run_args=(run --rm --user 0:0)
+  if [[ -n "$secret_source" ]]; then
+    run_args+=(
+      --mount
+      "type=bind,src=$secret_source,dst=/run/videoprocess-bootstrap-secret,readonly"
+      --mount
+      "type=tmpfs,dst=/run/secrets,tmpfs-size=65536,tmpfs-mode=0700"
+    )
+  fi
+  if (( ${#docker_args[@]} > 0 )); then
+    run_args+=("${docker_args[@]}")
+  fi
+
+  docker "${run_args[@]}" \
+    --env "VP_PYTHON_WORKER_SECRET_TARGET=$secret_target" \
+    --env "VP_PYTHON_WORKER_PREPARE_DIRS=$prepare_dirs" \
+    "$image" \
+    /bin/bash -ceu '
+      runtime_uid=10001
+      runtime_gid=10001
+      secret_target="${VP_PYTHON_WORKER_SECRET_TARGET:-}"
+      if [[ -n "$secret_target" ]]; then
+        [[ "$secret_target" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+        [[ -f /run/videoprocess-bootstrap-secret \
+          && ! -L /run/videoprocess-bootstrap-secret ]]
+        [[ "$(stat -c "%a" /run/videoprocess-bootstrap-secret)" == 400 ]]
+        chown "$runtime_uid:$runtime_gid" /run/secrets
+        chmod 0700 /run/secrets
+        install \
+          -o "$runtime_uid" \
+          -g "$runtime_gid" \
+          -m 0400 \
+          /run/videoprocess-bootstrap-secret \
+          "/run/secrets/$secret_target"
+        [[ "$(stat -c "%u:%g:%a" "/run/secrets/$secret_target")" \
+          == "$runtime_uid:$runtime_gid:400" ]]
+      fi
+
+      IFS=, read -r -a prepare_paths \
+        <<<"${VP_PYTHON_WORKER_PREPARE_DIRS:-}"
+      for path in "${prepare_paths[@]}"; do
+        [[ -n "$path" ]] || continue
+        case "$path" in
+          /control-state|/runtime-state|/requests) ;;
+          *) exit 1 ;;
+        esac
+        [[ -d "$path" && ! -L "$path" ]]
+        if find "$path" -xdev -type l -print -quit | grep -q .; then
+          exit 1
+        fi
+        chown -R "$runtime_uid:$runtime_gid" "$path"
+        chmod 0700 "$path"
+      done
+
+      export HOME=/home/videoprocess-worker
+      exec /usr/bin/setpriv \
+        --reuid="$runtime_uid" \
+        --regid="$runtime_gid" \
+        --clear-groups \
+        --no-new-privs \
+        -- "$@"
+    ' vp-python-worker-bootstrap "${command[@]}"
 }
 
 vp_worker_admission_root() {
@@ -526,12 +628,15 @@ vp_worker_admission_operator() {
     )
     set -- upsert --request-file /run/control/upsert.json
   fi
-  docker run --rm \
+  vp_run_python_worker_container \
+    "$image" \
+    "$operator_file" \
+    worker-operator-database-url \
+    - \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$operator_file,dst=/run/secrets/worker-operator-database-url,readonly" \
     "${request_mount[@]}" \
     --env WORKER_REGISTRATION_OPERATOR_DATABASE_URL_FILE=/run/secrets/worker-operator-database-url \
-    "$image" \
+    -- \
     python -m app.services.worker_registration_operator_cli \
     "$@" >/dev/null
 }
@@ -788,12 +893,15 @@ vp_worker_admission_prepare_control_roles() {
   vp_worker_control_write_manifest \
     "$root/control-candidates/$generation.conf" \
     "$generation" "$image" || return 1
-  docker run --rm \
+  vp_run_python_worker_container \
+    "$image" \
+    "$owner_file" \
+    worker-control-owner-database-url \
+    /control-state \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$owner_file,dst=/run/secrets/worker-control-owner-database-url,readonly" \
     --mount "type=bind,src=$state,dst=/control-state" \
     --env WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE=/run/secrets/worker-control-owner-database-url \
-    "$image" \
+    -- \
     python -m app.services.worker_control_role_cli \
       provision --generation "$generation" \
       --state-dir /control-state >/dev/null || return 1
@@ -875,12 +983,15 @@ vp_worker_admission_prepare_service() {
   local runtime_state="$root/runtime"
   mkdir -p "$runtime_state" || return 1
   chmod 0700 "$runtime_state" || return 1
-  docker run --rm \
+  vp_run_python_worker_container \
+    "$control_image" \
+    "$owner_file" \
+    worker-runtime-owner-database-url \
+    /runtime-state \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$owner_file,dst=/run/secrets/worker-runtime-owner-database-url,readonly" \
     --mount "type=bind,src=$runtime_state,dst=/runtime-state" \
     --env WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE=/run/secrets/worker-runtime-owner-database-url \
-    "$control_image" \
+    -- \
     python -m app.services.worker_runtime_role_cli \
       provision --service-name "$service" \
       --generation "$generation" \
@@ -901,11 +1012,15 @@ vp_worker_admission_prepare_service() {
   local request_file="$request_root/$generation/upsert.json"
   mkdir -p "$request_root" || return 1
   chmod 0700 "$request_root" || return 1
-  docker run --rm \
+  vp_run_python_worker_container \
+    "$control_image" \
+    - \
+    - \
+    /requests \
     --network "$VP_PIPELINE_NETWORK_ID" \
     --mount "type=bind,src=$runtime_state,dst=/runtime-state,readonly" \
     --mount "type=bind,src=$request_root,dst=/requests" \
-    "$control_image" \
+    -- \
     python -m app.services.worker_deployment_cli render-request \
       --service-name "$service" \
       --generation "$generation" \
@@ -1284,10 +1399,16 @@ try:
             field.split("=", 1)
             for field in secret_spec.split(",")
         )
-        if set(fields) != {"source", "target", "mode"}:
+        if set(fields) != {"source", "target", "uid", "gid", "mode"}:
             raise ValueError
         expected_secrets.add(
-            (fields["source"], fields["target"], int(fields["mode"], 8))
+            (
+                fields["source"],
+                fields["target"],
+                fields["uid"],
+                fields["gid"],
+                int(fields["mode"], 8),
+            )
         )
 
     task = spec["TaskTemplate"]
@@ -1312,6 +1433,8 @@ try:
         (
             entry["SecretName"],
             entry["File"]["Name"],
+            entry["File"]["UID"],
+            entry["File"]["GID"],
             entry["File"]["Mode"],
         )
         for entry in container.get("Secrets", [])
@@ -1364,11 +1487,14 @@ vp_require_worker_deployment_ready() {
     || return 1
   local attempt
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    if docker run --rm \
-      --network "$VP_PIPELINE_NETWORK_ID" \
-      --mount "type=bind,src=$read_file,dst=/run/secrets/worker-deploy-read-database-url,readonly" \
-      --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
+    if vp_run_python_worker_container \
       "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+      "$read_file" \
+      worker-deploy-read-database-url \
+      - \
+      --network "$VP_PIPELINE_NETWORK_ID" \
+      --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
+      -- \
       python -m app.services.worker_deployment_cli readiness \
         --service-name "$service" \
         --generation "$generation" >/dev/null 2>&1; then
@@ -1393,11 +1519,14 @@ vp_worker_admission_generation_state() {
   )" || return 1
   local payload
   payload="$(
-    docker run --rm \
-      --network "$VP_PIPELINE_NETWORK_ID" \
-      --mount "type=bind,src=$read_file,dst=/run/secrets/worker-deploy-read-database-url,readonly" \
-      --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
+    vp_run_python_worker_container \
       "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+      "$read_file" \
+      worker-deploy-read-database-url \
+      - \
+      --network "$VP_PIPELINE_NETWORK_ID" \
+      --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
+      -- \
       python -m app.services.worker_deployment_cli \
         generation-state \
         --service-name "$service" \
@@ -1444,11 +1573,14 @@ vp_worker_admission_retirement_ids() {
   )" || return 1
   local payload
   payload="$(
-    docker run --rm \
-      --network "$VP_PIPELINE_NETWORK_ID" \
-      --mount "type=bind,src=$read_file,dst=/run/secrets/worker-deploy-read-database-url,readonly" \
-      --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
+    vp_run_python_worker_container \
       "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+      "$read_file" \
+      worker-deploy-read-database-url \
+      - \
+      --network "$VP_PIPELINE_NETWORK_ID" \
+      --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
+      -- \
       python -m app.services.worker_deployment_cli \
         retirement-candidates \
         --service-name "$service" \
@@ -1528,12 +1660,15 @@ vp_worker_admission_retire_generation() {
       "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker runtime-role owner database URL file"
   )" || return 1
-  docker run --rm \
+  vp_run_python_worker_container \
+    "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+    "$owner_file" \
+    worker-runtime-owner-database-url \
+    /runtime-state \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$owner_file,dst=/run/secrets/worker-runtime-owner-database-url,readonly" \
     --mount "type=bind,src=$root/runtime,dst=/runtime-state" \
     --env WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE=/run/secrets/worker-runtime-owner-database-url \
-    "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+    -- \
     python -m app.services.worker_runtime_role_cli \
       revoke --service-name "$service" \
       --generation "$generation" \
@@ -1803,12 +1938,15 @@ vp_worker_control_retire_generation() {
       "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker control-role owner database URL file"
   )" || return 1
-  docker run --rm \
+  vp_run_python_worker_container \
+    "$image" \
+    "$owner_file" \
+    worker-control-owner-database-url \
+    /control-state \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$owner_file,dst=/run/secrets/worker-control-owner-database-url,readonly" \
     --mount "type=bind,src=$root/control,dst=/control-state" \
     --env WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE=/run/secrets/worker-control-owner-database-url \
-    "$image" \
+    -- \
     python -m app.services.worker_control_role_cli \
       revoke --generation "$generation" \
       --state-dir /control-state >/dev/null || return 1
@@ -1897,14 +2035,34 @@ try:
     labels = spec["Labels"]
     secret_entries = container.get("Secrets", [])
     expected_secrets = {
-        (sys.argv[4], "vp-staging-janitor-database-url", 0o400),
-        (sys.argv[5], "vp-staging-janitor-minio-access-key", 0o400),
-        (sys.argv[6], "vp-staging-janitor-minio-secret-key", 0o400),
+        (
+            sys.argv[4],
+            "vp-staging-janitor-database-url",
+            "10001",
+            "10001",
+            0o400,
+        ),
+        (
+            sys.argv[5],
+            "vp-staging-janitor-minio-access-key",
+            "10001",
+            "10001",
+            0o400,
+        ),
+        (
+            sys.argv[6],
+            "vp-staging-janitor-minio-secret-key",
+            "10001",
+            "10001",
+            0o400,
+        ),
     }
     actual_secrets = {
         (
             item["SecretName"],
             item["File"]["Name"],
+            item["File"]["UID"],
+            item["File"]["GID"],
             item["File"]["Mode"],
         )
         for item in secret_entries
@@ -1931,6 +2089,7 @@ try:
             "vp.videoprocess.generation": sys.argv[1],
         }
         and container.get("Image") == sys.argv[2]
+        and container.get("User") == "10001:10001"
         and spec.get("Mode", {}).get("ReplicatedJob", {}).get(
             "MaxConcurrent"
         )
@@ -4375,12 +4534,15 @@ vp_worker_redis_marker_provision_roles() {
   mkdir -p "$role_state" || return 1
   chmod 0700 "$role_state" || return 1
 
-  docker run --rm \
+  vp_run_python_worker_container \
+    "$image" \
+    "$owner_file" \
+    worker-marker-owner-database-url \
+    /control-state \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$owner_file,dst=/run/secrets/worker-marker-owner-database-url,readonly" \
     --mount "type=bind,src=$role_state,dst=/control-state" \
     --env WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE=/run/secrets/worker-marker-owner-database-url \
-    "$image" \
+    -- \
     python -m app.services.worker_marker_control_role_cli \
       provision \
       --generation "$generation" \
@@ -4394,12 +4556,15 @@ vp_worker_redis_marker_revoke_roles() {
   local owner_file
   owner_file="$(vp_worker_redis_marker_owner_file)" || return 1
 
-  docker run --rm \
+  vp_run_python_worker_container \
+    "$image" \
+    "$owner_file" \
+    worker-marker-owner-database-url \
+    /control-state \
     --network "$VP_PIPELINE_NETWORK_ID" \
-    --mount "type=bind,src=$owner_file,dst=/run/secrets/worker-marker-owner-database-url,readonly" \
     --mount "type=bind,src=$control_root/roles,dst=/control-state" \
     --env WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE=/run/secrets/worker-marker-owner-database-url \
-    "$image" \
+    -- \
     python -m app.services.worker_marker_control_role_cli \
       revoke \
       --generation "$generation" \
@@ -4466,7 +4631,7 @@ vp_worker_redis_marker_expected_job_identity() {
   esac
   vp_require_pipeline_network_identity || return 1
   printf '%s\n' \
-    "2|$mode|$generation|$image|replicated-job|1|1|none|node.hostname==$VP_MANAGER_NODE|$VP_PIPELINE_NETWORK_ID|$database_secret:worker-marker-database-url:256,$redis_secret:worker-marker-redis-url:256|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url,WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url|python,-m,$module,$command"
+    "2|$mode|$generation|$image|replicated-job|1|1|none|node.hostname==$VP_MANAGER_NODE|$VP_PIPELINE_NETWORK_ID|$database_secret:worker-marker-database-url:10001:10001:256,$redis_secret:worker-marker-redis-url:10001:10001:256|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url,WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url|python,-m,$module,$command"
 }
 
 vp_worker_redis_marker_job_identity() {
@@ -4474,7 +4639,7 @@ vp_worker_redis_marker_job_identity() {
   local identity
   identity="$(
     docker service inspect "$name" --format \
-      '{{len .Spec.Labels}}|{{index .Spec.Labels "vp.worker-redis-marker.mode"}}|{{index .Spec.Labels "vp.worker-redis-marker.generation"}}|{{.Spec.TaskTemplate.ContainerSpec.Image}}|{{if .Spec.Mode.ReplicatedJob}}replicated-job{{else}}other{{end}}|{{.Spec.Mode.ReplicatedJob.TotalCompletions}}|{{.Spec.Mode.ReplicatedJob.MaxConcurrent}}|{{.Spec.TaskTemplate.RestartPolicy.Condition}}|{{range .Spec.TaskTemplate.Placement.Constraints}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.Networks}}{{printf "%s," .Target}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Secrets}}{{printf "%s:%s:%d," .SecretName .File.Name .File.Mode}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Args}}{{printf "%s," .}}{{end}}'
+      '{{len .Spec.Labels}}|{{index .Spec.Labels "vp.worker-redis-marker.mode"}}|{{index .Spec.Labels "vp.worker-redis-marker.generation"}}|{{.Spec.TaskTemplate.ContainerSpec.Image}}|{{if .Spec.Mode.ReplicatedJob}}replicated-job{{else}}other{{end}}|{{.Spec.Mode.ReplicatedJob.TotalCompletions}}|{{.Spec.Mode.ReplicatedJob.MaxConcurrent}}|{{.Spec.TaskTemplate.RestartPolicy.Condition}}|{{range .Spec.TaskTemplate.Placement.Constraints}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.Networks}}{{printf "%s," .Target}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Secrets}}{{printf "%s:%s:%s:%s:%d," .SecretName .File.Name .File.UID .File.GID .File.Mode}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Args}}{{printf "%s," .}}{{end}}'
   )" || return 1
   identity="${identity//,|/|}"
   printf '%s\n' "${identity%,}"

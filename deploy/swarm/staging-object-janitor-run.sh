@@ -100,6 +100,8 @@ image_commit="${image##*:deploy-}"
   || fail "generation and image do not match"
 [[ "$network" == vp-pipeline-net && "$manager_node" == ccttww-lap ]] \
   || fail "topology is invalid"
+[[ "$evidence_volume" == vp-staging-janitor-evidence ]] \
+  || fail "evidence volume is invalid"
 [[ "$network_id" =~ ^[A-Za-z0-9._:-]+$ ]] \
   || fail "network identity is invalid"
 topology="$(
@@ -158,23 +160,35 @@ try:
     labels = spec["Labels"]
     secret_entries = container.get("Secrets", [])
     secrets = {
-        (entry["SecretName"], entry["File"]["Name"], entry["File"]["Mode"])
+        (
+            entry["SecretName"],
+            entry["File"]["Name"],
+            entry["File"]["UID"],
+            entry["File"]["GID"],
+            entry["File"]["Mode"],
+        )
         for entry in secret_entries
     }
     expected_secrets = {
         (
             os.environ["EXPECTED_DATABASE_SECRET"],
             "vp-staging-janitor-database-url",
+            "10001",
+            "10001",
             0o400,
         ),
         (
             os.environ["EXPECTED_MINIO_ACCESS_SECRET"],
             "vp-staging-janitor-minio-access-key",
+            "10001",
+            "10001",
             0o400,
         ),
         (
             os.environ["EXPECTED_MINIO_SECRET_SECRET"],
             "vp-staging-janitor-minio-secret-key",
+            "10001",
+            "10001",
             0o400,
         ),
     }
@@ -202,6 +216,7 @@ try:
             ],
         }
         and container["Image"] == os.environ["EXPECTED_IMAGE"]
+        and container.get("User") == "10001:10001"
         and spec.get("Mode", {}).get("ReplicatedJob", {}).get(
             "MaxConcurrent"
         )
@@ -274,6 +289,60 @@ fi
 
 [[ "$ACTION" == run ]] || exit 0
 
+volume_created=0
+if ! evidence_volume_json="$(
+  docker volume inspect "$evidence_volume" --format '{{json .}}'
+)"; then
+  docker volume create \
+    --driver local \
+    --label vp.videoprocess.volume=staging-object-janitor-evidence \
+    "$evidence_volume" >/dev/null \
+    || fail "evidence volume creation failed"
+  volume_created=1
+  evidence_volume_json="$(
+    docker volume inspect "$evidence_volume" --format '{{json .}}'
+  )" \
+    || fail "created evidence volume inspection failed"
+fi
+EVIDENCE_VOLUME_JSON="$evidence_volume_json" \
+  EXPECTED_EVIDENCE_VOLUME="$evidence_volume" \
+  EVIDENCE_VOLUME_CREATED="$volume_created" \
+  python3 - <<'PY' \
+  || fail "evidence volume identity is invalid"
+import json
+import os
+import sys
+
+try:
+    volume = json.loads(os.environ["EVIDENCE_VOLUME_JSON"])
+    labels = volume.get("Labels")
+    expected_labels = {
+        "vp.videoprocess.volume": "staging-object-janitor-evidence"
+    }
+    created = os.environ["EVIDENCE_VOLUME_CREATED"] == "1"
+    valid = (
+        volume.get("Name") == os.environ["EXPECTED_EVIDENCE_VOLUME"]
+        and volume.get("Driver") == "local"
+        and volume.get("Scope") == "local"
+        and volume.get("Options") in (None, {})
+        and (
+            labels == expected_labels
+            or (not created and labels in (None, {}))
+        )
+    )
+except (TypeError, ValueError, json.JSONDecodeError):
+    valid = False
+sys.exit(0 if valid else 1)
+PY
+
+docker run --rm \
+  --user 0:0 \
+  --mount "type=volume,src=$evidence_volume,dst=/run/videoprocess/staging-janitor" \
+  "$image" \
+  /opt/venv/bin/python -I -m \
+  app.channel_agent.staging_object_janitor_cli prepare-evidence >/dev/null \
+  || fail "evidence volume preparation failed"
+
 docker service create \
   --detach=true \
   --name "$JOB_NAME" \
@@ -285,9 +354,10 @@ docker service create \
   --restart-condition none \
   --constraint "node.hostname==$manager_node" \
   --network "$network_id" \
-  --secret "source=$database_secret,target=vp-staging-janitor-database-url,mode=0400" \
-  --secret "source=$minio_access_secret,target=vp-staging-janitor-minio-access-key,mode=0400" \
-  --secret "source=$minio_secret_secret,target=vp-staging-janitor-minio-secret-key,mode=0400" \
+  --user 10001:10001 \
+  --secret "source=$database_secret,target=vp-staging-janitor-database-url,uid=10001,gid=10001,mode=0400" \
+  --secret "source=$minio_access_secret,target=vp-staging-janitor-minio-access-key,uid=10001,gid=10001,mode=0400" \
+  --secret "source=$minio_secret_secret,target=vp-staging-janitor-minio-secret-key,uid=10001,gid=10001,mode=0400" \
   --mount "type=volume,src=$evidence_volume,dst=/run/videoprocess/staging-janitor" \
   --env DEPLOY_MODE=production \
   --env VP_STAGING_JANITOR_RUNNER_ID=ccttww-lap \

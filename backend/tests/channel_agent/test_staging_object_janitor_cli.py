@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -348,3 +350,85 @@ def test_minio_credentials_require_independent_mode_0400_secrets(
                 "VP_STAGING_JANITOR_MINIO_SECRET_KEY_FILE": "/run/b",
             }
         )
+
+
+@pytest.mark.asyncio
+async def test_prepare_evidence_action_runs_without_janitor_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_prepare_evidence_volume",
+        lambda: calls.append("prepare"),
+        raising=False,
+    )
+    monkeypatch.delenv("VP_STAGING_JANITOR_RUNNER_ID", raising=False)
+
+    assert await cli.run(["prepare-evidence"]) == 0
+    assert calls == ["prepare"]
+    assert capsys.readouterr().out == (
+        '{"action":"prepare-evidence","status":"ok"}\n'
+    )
+
+
+def test_prepare_evidence_rejects_symlink_without_touching_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    marker = target / "preserve"
+    marker.write_text("evidence\n")
+    evidence_directory = tmp_path / "evidence"
+    evidence_directory.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(
+        cli,
+        "_EVIDENCE_DIRECTORY",
+        evidence_directory,
+        raising=False,
+    )
+    monkeypatch.setattr(cli.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(cli.os, "getegid", lambda: 0)
+
+    with pytest.raises(RuntimeError):
+        cli._prepare_evidence_volume()
+
+    assert evidence_directory.is_symlink()
+    assert marker.read_text() == "evidence\n"
+
+
+def test_prepare_evidence_rejects_hardlinked_status_without_deleting_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    evidence_directory = tmp_path / "evidence"
+    evidence_directory.mkdir(mode=0o700)
+    os.chmod(evidence_directory, 0o700)
+    status_file = evidence_directory / "status.json"
+    status_file.write_text("legacy evidence\n")
+    os.chmod(status_file, 0o600)
+    hardlink = tmp_path / "status-hardlink"
+    os.link(status_file, hardlink)
+    owner_uid = evidence_directory.stat().st_uid
+    owner_gid = evidence_directory.stat().st_gid
+    monkeypatch.setattr(
+        cli,
+        "_EVIDENCE_DIRECTORY",
+        evidence_directory,
+        raising=False,
+    )
+    monkeypatch.setattr(cli, "_ROOT_UID", owner_uid, raising=False)
+    monkeypatch.setattr(cli, "_ROOT_GID", owner_gid, raising=False)
+    monkeypatch.setattr(cli, "_RUNTIME_UID", owner_uid, raising=False)
+    monkeypatch.setattr(cli, "_RUNTIME_GID", owner_gid, raising=False)
+    monkeypatch.setattr(cli.os, "geteuid", lambda: owner_uid)
+    monkeypatch.setattr(cli.os, "getegid", lambda: owner_gid)
+
+    with pytest.raises(RuntimeError):
+        cli._prepare_evidence_volume()
+
+    assert stat.S_IMODE(status_file.stat().st_mode) == 0o600
+    assert status_file.read_text() == "legacy evidence\n"
+    assert hardlink.read_text() == "legacy evidence\n"

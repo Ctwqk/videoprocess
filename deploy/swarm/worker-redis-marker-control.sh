@@ -226,7 +226,7 @@ expected_service_identity() {
   [[ "$network_identity" == "$NETWORK_ID|$NETWORK|overlay|swarm" ]] \
     || return 1
   printf '%s\n' \
-    "2|$mode|$GENERATION|$IMAGE|replicated-job|1|1|none|node.hostname==$CONTROL_NODE|$NETWORK_ID|$database_secret:worker-marker-database-url:256,$redis_secret:worker-marker-redis-url:256|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url,WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url|python,-m,$module,$command"
+    "2|$mode|$GENERATION|$IMAGE|replicated-job|1|1|none|node.hostname==$CONTROL_NODE|$NETWORK_ID|$database_secret:worker-marker-database-url:10001:10001:256,$redis_secret:worker-marker-redis-url:10001:10001:256|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url,WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url|python,-m,$module,$command"
 }
 
 service_identity() {
@@ -234,7 +234,7 @@ service_identity() {
   local identity
   identity="$(
     docker service inspect "$name" --format \
-      '{{len .Spec.Labels}}|{{index .Spec.Labels "vp.worker-redis-marker.mode"}}|{{index .Spec.Labels "vp.worker-redis-marker.generation"}}|{{.Spec.TaskTemplate.ContainerSpec.Image}}|{{if .Spec.Mode.ReplicatedJob}}replicated-job{{else}}other{{end}}|{{.Spec.Mode.ReplicatedJob.TotalCompletions}}|{{.Spec.Mode.ReplicatedJob.MaxConcurrent}}|{{.Spec.TaskTemplate.RestartPolicy.Condition}}|{{range .Spec.TaskTemplate.Placement.Constraints}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.Networks}}{{printf "%s," .Target}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Secrets}}{{printf "%s:%s:%d," .SecretName .File.Name .File.Mode}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Args}}{{printf "%s," .}}{{end}}' \
+      '{{len .Spec.Labels}}|{{index .Spec.Labels "vp.worker-redis-marker.mode"}}|{{index .Spec.Labels "vp.worker-redis-marker.generation"}}|{{.Spec.TaskTemplate.ContainerSpec.Image}}|{{if .Spec.Mode.ReplicatedJob}}replicated-job{{else}}other{{end}}|{{.Spec.Mode.ReplicatedJob.TotalCompletions}}|{{.Spec.Mode.ReplicatedJob.MaxConcurrent}}|{{.Spec.TaskTemplate.RestartPolicy.Condition}}|{{range .Spec.TaskTemplate.Placement.Constraints}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.Networks}}{{printf "%s," .Target}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Secrets}}{{printf "%s:%s:%s:%s:%d," .SecretName .File.Name .File.UID .File.GID .File.Mode}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Args}}{{printf "%s," .}}{{end}}' \
       2>/dev/null
   )" || return 1
   identity="${identity//,|/|}"
@@ -385,8 +385,8 @@ launch_job() {
     --network "$NETWORK_ID" \
     --label "vp.worker-redis-marker.mode=$mode" \
     --label "vp.worker-redis-marker.generation=$GENERATION" \
-    --secret "source=$database_secret,target=worker-marker-database-url,mode=0400" \
-    --secret "source=$redis_secret,target=worker-marker-redis-url,mode=0400" \
+    --secret "source=$database_secret,target=worker-marker-database-url,uid=10001,gid=10001,mode=0400" \
+    --secret "source=$redis_secret,target=worker-marker-redis-url,uid=10001,gid=10001,mode=0400" \
     --env "WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url" \
     --env "WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url" \
     "$IMAGE" \
