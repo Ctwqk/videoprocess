@@ -192,6 +192,16 @@ past protocol blocks and pre-approval of implementation plans authorizes
 routing I-R5-1 into Deploy Track B substage 1. It shares the already-designed
 exclusive `transaction.lock` and dead-owner-only reconciliation mechanism;
 that substage must close I-R5-1 before any forward/rollback mutation work.
+Task 4B/4C Deploy Track B stage 1: implementation at dbc792d plus marker-fake
+contract fix f62e422; independent review rejected it with 6 Important
+findings: inherited outer lock ownership admits concurrent child one-shots;
+signal launch/status propagation has a race; principal probes are not bound
+to the credential inodes recorded by the transaction; partial secret creation
+does not immediately persist immutable IDs; phase/promotion and logical
+retirement relations are under-validated; historical four-field worker
+retirement journals have no strict v1-to-v2 hydration path.
+Task 4B/4C Deploy Track B stage 1: fix round 1/5 in progress; stage 2 remains
+blocked and no production mutation is authorized.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
