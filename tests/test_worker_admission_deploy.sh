@@ -734,6 +734,136 @@ done
 )
 
 (
+  probe_root="$TEST_ROOT/one-shot-final-gate-term"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  docker_entered="$probe_root/docker-entered"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  signal_target_pid="$(
+    exec sh -c 'printf "%s\n" "$PPID"'
+  )"
+
+  docker() {
+    : >"$docker_entered"
+    cat >/dev/null
+  }
+  kill() {
+    if [[ "${1:-}" == -TERM \
+      && "${2:-}" != "$signal_target_pid" \
+      && "${VP_PYTHON_WORKER_LAUNCH_GATE_OPEN:-false}" != true ]]; then
+      return 0
+    fi
+    builtin kill "$@"
+  }
+
+  original_raise_definition="$(
+    declare -f vp_worker_admission_raise_if_signaled
+  )"
+  eval "${original_raise_definition/vp_worker_admission_raise_if_signaled/vp_worker_admission_raise_if_signaled_original}"
+  release_gate_available=false
+  if declare -F vp_python_worker_release_launch_gate >/dev/null 2>&1; then
+    release_gate_available=true
+    original_release_definition="$(
+      declare -f vp_python_worker_release_launch_gate
+    )"
+    eval "${original_release_definition/vp_python_worker_release_launch_gate/vp_python_worker_release_launch_gate_original}"
+    vp_python_worker_release_launch_gate() {
+      builtin kill -TERM "$signal_target_pid"
+      vp_python_worker_release_launch_gate_original
+    }
+  fi
+  final_gate_raise_count=0
+  vp_worker_admission_raise_if_signaled() {
+    local status=0
+    vp_worker_admission_raise_if_signaled_original || status=$?
+    if [[ "$status" -eq 0 \
+      && "$VP_PYTHON_WORKER_ACTIVE_OPERATION_CLEANED" != true \
+      && -z "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID" ]]; then
+      final_gate_raise_count=$((final_gate_raise_count + 1))
+    fi
+    if [[ "$status" -eq 0 \
+      && "$release_gate_available" != true \
+      && "$final_gate_raise_count" -eq 2 ]]; then
+      builtin kill -TERM "$signal_target_pid"
+    fi
+    return "$status"
+  }
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image - - /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1
+  operation_status=$?
+  set -e
+
+  if [[ "$operation_status" -ne 143 ]]; then
+    echo "FAIL: final-gate TERM returned $operation_status instead of 143" >&2
+    exit 1
+  fi
+  if [[ -e "$docker_entered" ]]; then
+    echo 'FAIL: final-gate TERM continued into Docker' >&2
+    exit 1
+  fi
+  if compgen -G "$bind_source/.vp-python-worker-bind-*" >/dev/null \
+    || compgen -G "$admission_root/one-shot-operations/op.*" >/dev/null \
+    || [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == true ]]; then
+    echo 'FAIL: final-gate TERM retained one-shot identity or lock state' >&2
+    exit 1
+  fi
+)
+
+(
+  probe_root="$TEST_ROOT/one-shot-launch-gate-failure"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  docker_entered="$probe_root/docker-entered"
+  supervisor_pid_file="$probe_root/supervisor-pid"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+
+  docker() {
+    : >"$docker_entered"
+  }
+  vp_python_worker_release_launch_gate() {
+    printf '%s\n' "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID" \
+      >"$supervisor_pid_file"
+    return 74
+  }
+
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image - - /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>&1
+  operation_status=$?
+  set -e
+  supervisor_pid="$(<"$supervisor_pid_file")"
+  supervisor_live=false
+  if [[ "$supervisor_pid" =~ ^[1-9][0-9]*$ ]] \
+    && builtin kill -0 "$supervisor_pid" 2>/dev/null; then
+    supervisor_live=true
+    builtin kill -TERM "$supervisor_pid" 2>/dev/null || true
+    wait "$supervisor_pid" 2>/dev/null || true
+  fi
+  if [[ "$operation_status" -eq 0 \
+    || "$supervisor_live" == true \
+    || -e "$docker_entered" \
+    || "$VP_PYTHON_WORKER_LAUNCH_GATE_OPEN" != false \
+    || -n "$VP_PYTHON_WORKER_LAUNCH_GATE_PATH" \
+    || -n "$VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY" \
+    || -n "$VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN" \
+    || -e /dev/fd/16 ]]; then
+    echo 'FAIL: launch-gate failure leaked its waiting supervisor' >&2
+    exit 1
+  fi
+)
+
+(
   probe_root="$TEST_ROOT/one-shot-post-spawn-term"
   ROOT="$probe_root/sync"
   REPO_ROOT="$probe_root/repos"
@@ -1033,8 +1163,11 @@ assert_worker_contract \
   expected_service=vp-ffmpeg-worker-go-swarm
   expected_generation=901
   retirement_uuid=01234567-89ab-4def-8123-456789abcdef
+  replacement_uuid=11234567-89ab-4def-8123-456789abcdef
   RETIREMENT_RESPONSE_SERVICE="$expected_service"
   RETIREMENT_RESPONSE_GENERATION="$expected_generation"
+  RETIREMENT_RESPONSE_REPLACE_PATH=false
+  RETIREMENT_RESPONSE_STATUS=0
   RETIREMENT_OPERATOR_CALLS="$TEST_ROOT/retirement-response-operator-calls"
   : >"$RETIREMENT_OPERATOR_CALLS"
   VP_WORKER_ADMISSION_CONTROL_IMAGE=synthetic-control-image
@@ -1052,6 +1185,19 @@ assert_worker_contract \
       "$RETIREMENT_RESPONSE_GENERATION" \
       "$retirement_uuid" \
       "$RETIREMENT_RESPONSE_SERVICE"
+    if [[ "$RETIREMENT_RESPONSE_REPLACE_PATH" == true ]]; then
+      local query_path="$VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE"
+      if [[ -e "$query_path" ]]; then
+        unlink "$query_path"
+      fi
+      printf '{"code":"worker_deployment_retirement_candidates","generation":%s,"registration_ids":["%s"],"service_name":"%s","status":"ok"}\n' \
+        "$RETIREMENT_RESPONSE_GENERATION" \
+        "$replacement_uuid" \
+        "$RETIREMENT_RESPONSE_SERVICE" >"$query_path"
+      chmod 0600 "$query_path"
+    fi
+    [[ "$RETIREMENT_RESPONSE_STATUS" -eq 0 ]] \
+      || return "$RETIREMENT_RESPONSE_STATUS"
   }
   vp_worker_admission_operator() {
     printf 'operator|%s\n' "$*" >>"$RETIREMENT_OPERATOR_CALLS"
@@ -1084,10 +1230,40 @@ assert_worker_contract \
   [[ ! -s "$RETIREMENT_OPERATOR_CALLS" ]]
 
   RETIREMENT_RESPONSE_GENERATION="$expected_generation"
+  RETIREMENT_RESPONSE_STATUS=143
+  set +e
+  vp_worker_admission_retirement_ids \
+    "$expected_service" "$expected_generation"
+  signal_status=$?
+  set -e
+  if [[ "$signal_status" -ne 143 \
+    || -n "$VP_WORKER_ADMISSION_RETIREMENT_IDS" \
+    || "$VP_WORKER_ADMISSION_QUERY_READ_OPEN" != false \
+    || "$VP_WORKER_ADMISSION_QUERY_WRITE_OPEN" != false \
+    || -n "$VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE" \
+    || -n "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" \
+    || -e /dev/fd/14 || -e /dev/fd/15 ]]; then
+    echo 'FAIL: signaled retirement query leaked its output channel' >&2
+    exit 1
+  fi
+
+  RETIREMENT_RESPONSE_STATUS=0
+  RETIREMENT_RESPONSE_REPLACE_PATH=true
   vp_worker_admission_retirement_ids \
     "$expected_service" "$expected_generation"
   exact_output="$VP_WORKER_ADMISSION_RETIREMENT_IDS"
-  [[ "$exact_output" == "$retirement_uuid" ]]
+  if [[ "$exact_output" != "$retirement_uuid" ]]; then
+    echo 'FAIL: retirement query accepted replacement pathname JSON' >&2
+    exit 1
+  fi
+  if [[ "$VP_WORKER_ADMISSION_QUERY_READ_OPEN" != false \
+    || "$VP_WORKER_ADMISSION_QUERY_WRITE_OPEN" != false \
+    || -n "$VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE" \
+    || -n "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" \
+    || -e /dev/fd/14 || -e /dev/fd/15 ]]; then
+    echo 'FAIL: successful retirement query leaked its output channel' >&2
+    exit 1
+  fi
   vp_worker_admission_lock_release
 )
 
@@ -1559,6 +1735,23 @@ grep -Fxq "credential-material" "$DOCKER_SECRET_PAYLOAD"
     "$partial_commit" legacy_no_control \
     <<<"$credential_records" >/dev/null
   VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+  partial_control_generation=c-${partial_commit:0:20}
+  partial_control_image="vp-ffmpeg-worker-python:deploy-${partial_commit:0:12}"
+  partial_operator_reference="control/$partial_control_generation/worker-registration-operator-database-url"
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    record-authority-intent \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    runtime vp-ffmpeg-worker-go-swarm 901 \
+    "$partial_control_image" "$partial_control_generation" \
+    "$partial_operator_reference" >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    mark-authority-provisioning \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    runtime vp-ffmpeg-worker-go-swarm 901 >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    mark-authority-provisioned \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    runtime vp-ffmpeg-worker-go-swarm 901 >/dev/null
 
   first_secret=vp-wr-ffmpeg-go-db-901
   first_secret_id=1111111111111111111111111111111111111111111111111111111111111111
@@ -1713,6 +1906,7 @@ PY
   abort_crash_id=""
   abort_crash_once=""
   abort_mounted_secret_id=""
+  abort_authorities=""
 
   abort_secret_id() {
     printf '%064x\n' "$1"
@@ -1732,6 +1926,7 @@ PY
     abort_crash_id=""
     abort_crash_once="$fixture_root/crash-once"
     abort_mounted_secret_id=""
+    abort_authorities=""
     mkdir -p "$admission_root" "$abort_secret_state"
     chmod 0700 "$admission_root" "$abort_secret_state"
     : >"$abort_calls"
@@ -1778,6 +1973,30 @@ PY
     local service="$3"
     local generation="$4"
     local purpose="$5"
+    local kind=runtime
+    [[ "$service" == vp-worker-control ]] && kind=control
+    local authority_key="$kind:$service:$generation"
+    if [[ "|$abort_authorities|" != *"|$authority_key|"* ]]; then
+      local operator_reference="control/$abort_control_generation/worker-registration-operator-database-url"
+      python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+        record-authority-intent \
+        "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+        "$VP_WORKER_ADMISSION_LOCK_FD" \
+        "$kind" "$service" "$generation" \
+        "$abort_control_image" "$abort_control_generation" \
+        "$operator_reference" >/dev/null
+      python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+        mark-authority-provisioning \
+        "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+        "$VP_WORKER_ADMISSION_LOCK_FD" \
+        "$kind" "$service" "$generation" >/dev/null
+      python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+        mark-authority-provisioned \
+        "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+        "$VP_WORKER_ADMISSION_LOCK_FD" \
+        "$kind" "$service" "$generation" >/dev/null
+      abort_authorities="${abort_authorities:+$abort_authorities|}$authority_key"
+    fi
     printf '%s|%s|%s|%s|%s\n' \
       "$secret_id" "$name" "$service" "$generation" "$purpose" \
       >"$abort_secret_state/$secret_id"
@@ -1982,6 +2201,442 @@ PY
     exit 1
   fi
   [[ -e "$abort_active" && "$(grep -c '^rm|' "$abort_calls")" -eq 0 ]]
+  vp_worker_admission_lock_release
+)
+
+(
+  wal_root="$TEST_ROOT/authority-wal"
+  wal_commit=4123456789abcdef0123456789abcdef01234567
+  wal_control_generation="c-${wal_commit:0:20}"
+  wal_control_image="vp-ffmpeg-worker-python:deploy-${wal_commit:0:12}"
+  wal_owner_file="$wal_root/runtime-owner"
+  wal_calls="$wal_root/calls"
+  mkdir -p "$wal_root"
+  printf 'postgresql://authority-owner:credential@database/videoprocess\n' \
+    >"$wal_owner_file"
+  chmod 0400 "$wal_owner_file"
+  : >"$wal_calls"
+
+  wal_credentials=()
+  wal_principals=(
+    vp_deploy_migrator
+    vp_deploy_read
+    vp_control_role_owner
+    vp_runtime_role_owner
+  )
+  for wal_index in 0 1 2 3; do
+    wal_credential="$wal_root/credential-$wal_index"
+    printf 'postgresql://wal-%s:credential@database/videoprocess\n' \
+      "$wal_index" >"$wal_credential"
+    chmod 0400 "$wal_credential"
+    wal_credentials+=("$wal_credential")
+  done
+  wal_credential_records="$(
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      validate-credentials \
+      "${wal_credentials[0]}" "${wal_principals[0]}" \
+      "${wal_credentials[1]}" "${wal_principals[1]}" \
+      "${wal_credentials[2]}" "${wal_principals[2]}" \
+      "${wal_credentials[3]}" "${wal_principals[3]}"
+  )"
+
+  begin_wal_fixture() {
+    local fixture="$1"
+    ROOT="$wal_root/$fixture/sync"
+    REPO_ROOT="$wal_root/$fixture/repos"
+    wal_admission_root="$ROOT/state/vp-worker-admission"
+    mkdir -p "$wal_admission_root"
+    chmod 0700 "$wal_admission_root"
+    vp_worker_admission_lock_acquire "$wal_admission_root"
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin \
+      "$wal_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      "$wal_commit" \
+      "vp-backend:deploy-${wal_commit:0:12}" \
+      "vp-ffmpeg-worker-go:deploy-${wal_commit:0:12}" \
+      "$wal_commit" legacy_no_control \
+      <<<"$wal_credential_records" >/dev/null
+    VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+    VP_WORKER_ADMISSION_CONTROL_IMAGE="$wal_control_image"
+    VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE="$wal_commit"
+    VP_WORKER_CONTROL_GENERATION="$wal_control_generation"
+  }
+
+  assert_wal_authority() {
+    local state="$1"
+    local kind="$2"
+    local service="$3"
+    local generation="$4"
+    local expected_state="${5:-provisioned}"
+    python3 - \
+      "$state" "$kind" "$service" "$generation" "$expected_state" <<'PY'
+import json
+import sys
+
+path, kind, service, generation, expected_state = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    document = json.load(handle)
+assert document["prepared_secrets"] == []
+assert document["authorities"] == [
+    {
+        "control_generation": "c-4123456789abcdef0123",
+        "control_image": "vp-ffmpeg-worker-python:deploy-4123456789ab",
+        "generation": generation,
+        "kind": kind,
+        "operator_reference": (
+            "control/c-4123456789abcdef0123/"
+            "worker-registration-operator-database-url"
+        ),
+        "service": service,
+        "state": expected_state,
+    }
+]
+PY
+  }
+
+  assert_wal_done() {
+    local done_root="$1"
+    local kind="$2"
+    local service="$3"
+    local generation="$4"
+    python3 - "$done_root" "$kind" "$service" "$generation" <<'PY'
+import json
+import pathlib
+import sys
+
+done_root, kind, service, generation = sys.argv[1:]
+paths = list(pathlib.Path(done_root).glob("*/done.json"))
+assert len(paths) == 1
+with paths[0].open(encoding="utf-8") as handle:
+    document = json.load(handle)
+assert document["phase"] == "DONE"
+assert document["outcome"] == "aborted"
+assert document["prepared_secrets"] == []
+assert document["abort"]["authorities"] == []
+assert document["operation"] is None
+assert document["authorities"] == [
+    {
+        "control_generation": "c-4123456789abcdef0123",
+        "control_image": "vp-ffmpeg-worker-python:deploy-4123456789ab",
+        "generation": generation,
+        "kind": kind,
+        "operator_reference": (
+            "control/c-4123456789abcdef0123/"
+            "worker-registration-operator-database-url"
+        ),
+        "service": service,
+        "state": "revoked",
+    }
+]
+PY
+  }
+
+  vp_require_pipeline_network_identity() {
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  vp_worker_admission_database_credential_file() {
+    printf '%s\n' "$wal_owner_file"
+  }
+  vp_python_worker_prepare_controlled_directory() {
+    mkdir -p "$1"
+    chmod 0700 "$1"
+    printf '%s\n' "$1"
+  }
+  vp_worker_control_write_manifest() {
+    :
+  }
+  vp_worker_admission_read_manifest() {
+    return 1
+  }
+  vp_worker_admission_write_manifest() {
+    :
+  }
+  vp_worker_admission_track_candidate() {
+    :
+  }
+  vp_worker_admission_set_candidate() {
+    :
+  }
+  vp_worker_admission_new_generation() {
+    printf '%s\n' "$wal_generation"
+  }
+  vp_run_python_worker_container() {
+    printf 'provision|%s\n' "$*" >>"$wal_calls"
+  }
+  vp_worker_admission_create_secret() {
+    printf 'secret|%s|%s|%s\n' "$1" "$3" "$4" >>"$wal_calls"
+    return 73
+  }
+  vp_worker_control_revoke_authority() {
+    printf 'revoke|control|%s|%s|%s\n' "$1" "$2" "$3" >>"$wal_calls"
+  }
+  vp_worker_admission_revoke_generation_authority() {
+    printf 'revoke|runtime|%s|%s|%s|%s|%s|%s\n' \
+      "$1" "$2" "$3" "$4" "$5" "$6" >>"$wal_calls"
+  }
+
+  wal_services=(
+    vp-worker-control
+    vp-ffmpeg-worker-go-swarm
+    vp-ffmpeg-worker-gpu-swarm
+    vp-vision-worker-swarm
+    vp-youtube-publisher-swarm
+  )
+  for wal_index in 0 1 2 3 4; do
+    (
+      : >"$wal_calls"
+      wal_service="${wal_services[$wal_index]}"
+      wal_kind=runtime
+      wal_generation="$((930 + wal_index))"
+      wal_image="vp-backend:deploy-${wal_commit:0:12}"
+      [[ "$wal_index" -eq 0 ]] && {
+        wal_kind=control
+        wal_generation="$wal_control_generation"
+        wal_image="$wal_control_image"
+      }
+      begin_wal_fixture "first-secret-$wal_index"
+      set +e
+      if [[ "$wal_kind" == control ]]; then
+        vp_worker_admission_prepare_control_roles \
+          "$wal_control_image" "$wal_commit" "$wal_admission_root"
+        wal_status=$?
+      else
+        vp_worker_admission_prepare_service \
+          "$wal_service" "$wal_image" "$wal_control_image" \
+          "$wal_commit" "$wal_admission_root" "$wal_commit"
+        wal_status=$?
+      fi
+      set -e
+      if [[ "$wal_status" -eq 0 ]]; then
+        echo "FAIL: $wal_service first-secret failure was ignored" >&2
+        exit 1
+      fi
+      assert_wal_authority \
+        "$wal_admission_root/transactions/active.json" \
+        "$wal_kind" "$wal_service" "$wal_generation"
+      vp_worker_admission_abort_preparing_transaction preparing_failed
+      grep -Fq "revoke|$wal_kind|" "$wal_calls"
+      [[ ! -e "$wal_admission_root/transactions/active.json" ]]
+      assert_wal_done \
+        "$wal_admission_root/transactions" \
+        "$wal_kind" "$wal_service" "$wal_generation"
+      vp_worker_admission_lock_release
+    )
+  done
+
+  (
+    : >"$wal_calls"
+    wal_generation=940
+    begin_wal_fixture mark-provisioned-crash
+    vp_worker_admission_mark_authority_provisioned() {
+      printf 'mark-crash\n' >>"$wal_calls"
+      return 91
+    }
+    set +e
+    vp_worker_admission_prepare_service \
+      vp-ffmpeg-worker-go-swarm \
+      "vp-ffmpeg-worker-go:deploy-${wal_commit:0:12}" \
+      "$wal_control_image" "$wal_commit" \
+      "$wal_admission_root" "$wal_commit"
+    wal_status=$?
+    set -e
+    if [[ "$wal_status" -eq 0 ]] \
+      || grep -Fq 'secret|' "$wal_calls"; then
+      echo 'FAIL: post-provision WAL mark crash reached secret creation' >&2
+      exit 1
+    fi
+    assert_wal_authority \
+      "$wal_admission_root/transactions/active.json" \
+      runtime vp-ffmpeg-worker-go-swarm "$wal_generation" provisioning
+    vp_worker_admission_lock_release
+
+    source "$EXTENSION"
+    [[ -z "$VP_WORKER_CONTROL_GENERATION" \
+      && -z "$VP_WORKER_ADMISSION_CONTROL_IMAGE" ]]
+    vp_worker_admission_revoke_generation_authority() {
+      printf 'revoke|fresh-runtime|%s|%s|%s|%s|%s|%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" >>"$wal_calls"
+    }
+    vp_worker_admission_lock_acquire "$wal_admission_root"
+    vp_worker_admission_abort_preparing_transaction preparing_failed
+    grep -Fq \
+      "revoke|fresh-runtime|vp-ffmpeg-worker-go-swarm|$wal_generation|$wal_admission_root|$wal_control_image|$wal_control_generation|control/$wal_control_generation/worker-registration-operator-database-url" \
+      "$wal_calls"
+    [[ ! -e "$wal_admission_root/transactions/active.json" ]]
+    assert_wal_done \
+      "$wal_admission_root/transactions" \
+      runtime vp-ffmpeg-worker-go-swarm "$wal_generation"
+    vp_worker_admission_lock_release
+  )
+)
+
+(
+  replay_root="$TEST_ROOT/fresh-aborting-replay"
+  ROOT="$replay_root/sync"
+  REPO_ROOT="$replay_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  mkdir -p "$admission_root"
+  chmod 0700 "$admission_root"
+  replay_commit=3123456789abcdef0123456789abcdef01234567
+  replay_control_generation=c-${replay_commit:0:20}
+  replay_control_image="vp-ffmpeg-worker-python:deploy-${replay_commit:0:12}"
+  replay_runtime_service=vp-ffmpeg-worker-go-swarm
+  replay_runtime_generation=902
+  replay_control_id=9111111111111111111111111111111111111111111111111111111111111111
+  replay_runtime_id=9222222222222222222222222222222222222222222222222222222222222222
+  replay_calls="$replay_root/replay-calls"
+  : >"$replay_calls"
+
+  replay_credentials=()
+  replay_principals=(
+    vp_deploy_migrator
+    vp_deploy_read
+    vp_control_role_owner
+    vp_runtime_role_owner
+  )
+  for index in 0 1 2 3; do
+    credential="$replay_root/credential-$index"
+    printf 'postgresql://fresh-%s:credential@database/videoprocess\n' \
+      "$index" >"$credential"
+    chmod 0400 "$credential"
+    replay_credentials+=("$credential")
+  done
+  replay_credential_records="$(
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      validate-credentials \
+      "${replay_credentials[0]}" "${replay_principals[0]}" \
+      "${replay_credentials[1]}" "${replay_principals[1]}" \
+      "${replay_credentials[2]}" "${replay_principals[2]}" \
+      "${replay_credentials[3]}" "${replay_principals[3]}"
+  )"
+  vp_worker_admission_lock_acquire "$admission_root"
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "$replay_commit" \
+    "vp-backend:deploy-${replay_commit:0:12}" \
+    "vp-ffmpeg-worker-go:deploy-${replay_commit:0:12}" \
+    "$replay_commit" legacy_no_control \
+    <<<"$replay_credential_records" >/dev/null
+  replay_operator_reference="control/$replay_control_generation/worker-registration-operator-database-url"
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    record-authority-intent \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    control vp-worker-control "$replay_control_generation" \
+    "$replay_control_image" "$replay_control_generation" \
+    "$replay_operator_reference" >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    mark-authority-provisioning \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    control vp-worker-control "$replay_control_generation" >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    mark-authority-provisioned \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    control vp-worker-control "$replay_control_generation" >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    record-authority-intent \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    runtime "$replay_runtime_service" "$replay_runtime_generation" \
+    "$replay_control_image" "$replay_control_generation" \
+    "$replay_operator_reference" >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    mark-authority-provisioning \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    runtime "$replay_runtime_service" "$replay_runtime_generation" \
+    >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    mark-authority-provisioned \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    runtime "$replay_runtime_service" "$replay_runtime_generation" \
+    >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    record-prepared-secret \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "vp-wc-operator-$replay_control_generation" "$replay_control_id" \
+    vp-worker-control "$replay_control_generation" operator >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    record-prepared-secret \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "vp-wr-ffmpeg-go-db-$replay_runtime_generation" "$replay_runtime_id" \
+    "$replay_runtime_service" "$replay_runtime_generation" database \
+    >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin-abort \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    8 preparing_failed >/dev/null
+
+  revision=9
+  for secret_id in "$replay_runtime_id" "$replay_control_id"; do
+    intent="$(
+      python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+        intent-prepared-secret-removal \
+        "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+        "$revision" "$secret_id"
+    )"
+    operation_id="$(
+      python3 -c \
+        'import json,sys; print(json.load(sys.stdin)["operation"]["operation_id"])' \
+        <<<"$intent"
+    )"
+    revision=$((revision + 1))
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      complete-prepared-secret-removal \
+      "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      "$revision" "$operation_id" >/dev/null
+    revision=$((revision + 1))
+  done
+  vp_worker_admission_lock_release
+
+  source "$EXTENSION"
+  [[ -z "$VP_WORKER_CONTROL_GENERATION" \
+    && -z "$VP_WORKER_ADMISSION_CONTROL_IMAGE" ]]
+  expected_operator="$admission_root/control/$replay_control_generation/worker-registration-operator-database-url"
+  vp_require_pipeline_network_identity() {
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  vp_worker_admission_generation_state() {
+    VP_WORKER_ADMISSION_GENERATION_STATE=active
+  }
+  vp_worker_admission_retirement_ids() {
+    VP_WORKER_ADMISSION_RETIREMENT_IDS=""
+  }
+  vp_worker_admission_operator() {
+    printf 'operator|%s|%s\n' "$1" "$*" >>"$replay_calls"
+    [[ "$1" == "$expected_operator" ]]
+  }
+  vp_worker_admission_database_credential_file() {
+    printf '%s\n' "${replay_credentials[3]}"
+  }
+  vp_run_python_worker_container() {
+    printf 'one-shot|%s\n' "$*" >>"$replay_calls"
+  }
+  docker() {
+    if [[ "${1:-} ${2:-}" == "service ls" ]]; then
+      return 0
+    fi
+    return 98
+  }
+
+  vp_worker_admission_lock_acquire "$admission_root"
+  set +e
+  vp_worker_admission_abort_preparing_transaction preparing_failed \
+    >/dev/null 2>&1
+  replay_status=$?
+  set -e
+  if [[ "$replay_status" -ne 0 ]]; then
+    vp_worker_admission_lock_release
+    echo 'FAIL: fresh ABORTING replay did not reconstruct authority context' >&2
+    exit 1
+  fi
+  if grep -Fq '/control//' "$replay_calls" \
+    || ! grep -Fq "operator|$expected_operator|" "$replay_calls" \
+    || ! grep -Fq \
+      "worker_runtime_role_cli revoke --service-name $replay_runtime_service --generation $replay_runtime_generation" \
+      "$replay_calls" \
+    || ! grep -Fq \
+      "worker_control_role_cli revoke --generation $replay_control_generation" \
+      "$replay_calls" \
+    || [[ -e "$admission_root/transactions/active.json" ]]; then
+    echo 'FAIL: fresh ABORTING replay did not converge exact authorities' >&2
+    exit 1
+  fi
   vp_worker_admission_lock_release
 )
 
@@ -2552,6 +3207,15 @@ grep -Fxq 'VERSION=1' \
   vp_worker_admission_operator() {
     :
   }
+  vp_worker_admission_record_authority_intent() {
+    :
+  }
+  vp_worker_admission_mark_authority_provisioning() {
+    :
+  }
+  vp_worker_admission_mark_authority_provisioned() {
+    :
+  }
 
   if ! vp_worker_admission_prepare_service \
     "$resume_service" "$resume_image" "$resume_control_image" \
@@ -2594,6 +3258,15 @@ grep -Fxq 'VERSION=1' \
   }
   vp_worker_admission_create_secret() {
     return 1
+  }
+  vp_worker_admission_record_authority_intent() {
+    :
+  }
+  vp_worker_admission_mark_authority_provisioning() {
+    :
+  }
+  vp_worker_admission_mark_authority_provisioned() {
+    :
   }
 
   if vp_worker_admission_prepare_control_roles \

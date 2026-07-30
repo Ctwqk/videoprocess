@@ -1004,3 +1004,256 @@ cutover, marker mutation boundaries, first-deploy/failed-rollback
 orchestration, or janitor install recovery. It does not claim I-3 end-to-end
 closure. No SSH, push, deploy, remote access, YouTube/canary operation, or real
 Swarm service/secret mutation was performed.
+
+## Fix Round 3
+
+Start HEAD: `3ede76bdf590b9485bd2a3aaa9fd8a0c5cfc0f98`.
+
+### Open Important 1: Query Output Identity
+
+Root cause:
+
+The query writer used a mode-`0600` pathname for Docker stdout and later
+reopened that pathname for parsing. Strict JSON and request binding did not
+bind the parser to the inode that received the legitimate one-shot output, so
+a same-UID unlink-and-replace could substitute different canonical JSON.
+
+RED command and output:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: retirement query accepted replacement pathname JSON
+```
+
+Shared fix:
+
+- Query preparation opens fixed, independently tracked read and write
+  descriptors for the same mode-`0600`, regular, owner-bound inode.
+- It captures the exact device/inode identity, unlinks the pathname, and
+  requires link count zero before Docker can write.
+- Docker stdout writes only fd 15. The parser seeks and reads only fd 14,
+  revalidating exact identity, mode, owner, link count, size, UTF-8,
+  canonical JSON, schema, service, and generation.
+- A same-UID canonical replacement at the former pathname is never opened.
+  The legitimate UUID written to the original fd is accepted.
+- Success, schema failure, and canonical signal status `143` all close the
+  exact read/write descriptors and clear their identity state.
+
+GREEN command and output:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+worker admission deployment contract tests passed
+```
+
+### Open Important 2: Signal Launch Gate
+
+Root cause:
+
+Even after the final signal check, normal shell execution could receive a
+first signal before the background Docker command started. The pending signal
+was eventually returned correctly, but Docker could still enter before PID
+publication and forwarding.
+
+RED commands and outputs:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: final-gate TERM continued into Docker
+
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: launch-gate failure leaked its waiting supervisor
+```
+
+Shared fix:
+
+- Each one-shot creates an operation-owned mode-`0600` FIFO, opens and
+  identity-checks fd 16, unlinks the pathname, and generates a 128-bit release
+  token.
+- The published supervisor initially does nothing except wait on that exact
+  descriptor. The parent publishes its PID, consumes pending signal state,
+  and releases the token only while first-signal state remains zero.
+- A signal before release kills and waits for the waiting supervisor, so the
+  Docker callable is never entered. A normal release permits the existing
+  Docker path to continue.
+- Release or descriptor-verification failure also stops and reaps only the
+  exact published supervisor before child identity is cleared. Gate fd and
+  identity state are cleared on all tested exits.
+- Existing full-handler forwarding, canonical HUP/INT/TERM statuses, outer
+  phase gates, caller-trap restoration, and record/sentinel cleanup remain in
+  force.
+
+GREEN command and output:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+worker admission deployment contract tests passed
+```
+
+### Open Important 3: Fresh ABORTING Reconstruction
+
+Root cause:
+
+The ABORTING shell record carried only authority kind/service/generation.
+Runtime revoke still built its operator path from
+`VP_WORKER_CONTROL_GENERATION`, which is empty after sourcing the extension in
+a fresh shell. Replay therefore produced `control//...` and retained the
+active transaction.
+
+RED command and output:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: fresh ABORTING replay did not reconstruct authority context
+
+$ bash tests/test_worker_admission_rollback.sh
+FAIL: authority WAL accepted an alternate control image
+```
+
+Shared fix:
+
+- Every durable authority record now carries exact kind, service, generation,
+  state, control image, control generation, and operator reference.
+- The strict helper validates the deterministic target-commit relationship,
+  fixed control identity, known runtime service/generation shape, unique
+  logical identities, and common control image.
+- `list-abort` emits those journal fields, and the shell parser requires the
+  exact seven-field authority schema.
+- Control and runtime revoke calls consume only the persisted authority
+  context. Runtime operator paths are built from the strict journal reference,
+  never an empty ambient generation global.
+- A real helper transaction is advanced to ABORTING, sourced in a fresh shell,
+  and converges both runtime and control revocation without a double slash or
+  retained `active.json`.
+
+GREEN command and output:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+worker admission deployment contract tests passed
+
+$ bash tests/test_worker_admission_rollback.sh
+worker admission rollback transaction tests passed
+```
+
+### Open Important 4: Authority Write-Ahead Log
+
+Root cause:
+
+The abort authority queue was inferred from prepared secrets. Provisioning
+occurs before the first secret is created and journaled, so a provisioned
+control/runtime authority could have zero secret evidence, produce an empty
+abort queue, and be archived without revocation.
+
+RED commands and outputs:
+
+```text
+$ bash tests/test_worker_admission_rollback.sh
+exit 1 (record-authority-intent/mark-authority CLI absent)
+
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: fresh ABORTING replay did not reconstruct authority context
+```
+
+Shared fix:
+
+- The transaction schema has a top-level, unique authority WAL independent of
+  `prepared_secrets`.
+- Before every control or runtime provision, production atomically records a
+  deterministic `planned` intent and advances it to `provisioning`. Only a
+  successful provision may be marked `provisioned`; only then may its first
+  secret record be accepted.
+- Retry is idempotent for an identical planned/provisioning/provisioned
+  authority, while contradictory context and backward state movement fail
+  closed.
+- `begin-abort` copies every non-revoked authority, including planned,
+  provisioning, and provisioned zero-secret records. Completion atomically
+  marks the matching top-level record `revoked` and removes it from the abort
+  queue.
+- The common relational validator requires the abort queue to equal exactly
+  the non-revoked WAL records. `DONE(aborted)` requires no prepared secret,
+  operation, promotion, retirement, or unrevoked authority evidence.
+- Behavior tests drive real control preparation and all four runtime services
+  through successful provision followed by first-secret failure. Each has
+  zero prepared secrets, still invokes exact authority revoke, retains a
+  revoked DONE record, and releases active state only after completion.
+- A separate post-provision mark-crash leaves a `provisioning` runtime record,
+  sources a fresh shell, uses the persisted control/operator context for
+  revoke, and archives only after durable completion.
+- The pure helper matrix covers planned, provisioning, and provisioned states
+  for control plus every runtime service; premature finish is rejected and
+  the DONE archive retains all five revoked records.
+
+GREEN commands and outputs:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+worker admission deployment contract tests passed
+
+$ bash tests/test_worker_admission_rollback.sh
+worker admission rollback transaction tests passed
+```
+
+### Round 3 Files
+
+- `deploy/swarm/deploy-sync-extension.sh`
+- `deploy/swarm/worker-admission-transaction.py`
+- `tests/test_worker_admission_deploy.sh`
+- `tests/test_worker_admission_rollback.sh`
+- `.superpowers/sdd/2026-07-26-production-worker-registration/task-4bc-deploy-stage1-report.md`
+
+No marker-control product code, janitor product code, janitor-install recovery,
+vision cutover, backend worker, Go, Dockerfile, CI, Task 4A, or frontend file
+changed in this round.
+
+### Round 3 Verification
+
+```text
+bash tests/test_worker_admission_deploy.sh
+  PASS: worker admission deployment contract tests passed
+bash tests/test_worker_admission_rollback.sh
+  PASS: worker admission rollback transaction tests passed
+bash tests/test_staging_object_janitor_run.sh
+  PASS: staging object janitor launcher tests passed
+bash tests/test_vp_deploy_sync_extension.sh
+  PASS: exit 0, no stdout
+bash tests/test_staging_object_janitor_install.sh
+  PASS: staging object janitor installer tests passed
+bash tests/test_worker_redis_marker_control.sh
+  PASS: worker Redis marker control tests passed
+python3 -m py_compile deploy/swarm/worker-admission-transaction.py
+  PASS
+backend/.venv/bin/ruff check deploy/swarm/worker-admission-transaction.py
+  PASS: All checks passed!
+backend/.venv/bin/mypy deploy/swarm/worker-admission-transaction.py
+  PASS: Success: no issues found in 1 source file
+bash -n deploy/swarm/deploy-sync-extension.sh
+bash -n tests/test_worker_admission_deploy.sh
+bash -n tests/test_worker_admission_rollback.sh
+  PASS
+destructive inventory
+  PASS: no new docker secret/service create, update, or rm site in this round
+production one-shot command-substitution inventory
+  PASS: no vp_run_python_worker_container call remains inside $(...)
+descriptor inventory
+  PASS: query output uses only exact fd 14/15 identity; launch release uses
+        only exact unlinked FIFO fd 16 identity
+changed-path allowlist
+  PASS: exactly the five Round 3 files listed above
+generated artifact check
+  PASS: no __pycache__ or .pyc remains
+git diff --check
+  PASS
+```
+
+Only auto-cleaned local fake Docker/operator fixtures were used. No real
+Docker/Swarm object was created, updated, or removed.
+
+### Round 3 Unfinished Boundary
+
+This round closes only the four Stage 1 re-review findings. It does not wire
+production forward/rollback phase advancement, service reconciliation,
+cutover, marker mutation boundaries, first-deploy/failed-rollback
+orchestration, or janitor install recovery. It does not claim I-3 end-to-end
+closure. No SSH, push, deploy, remote access, YouTube/canary operation, or real
+Swarm service/secret mutation was performed.

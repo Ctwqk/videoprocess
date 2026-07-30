@@ -32,6 +32,13 @@ DATABASE_PURPOSES = (
     "control_role_owner",
     "runtime_role_owner",
 )
+RUNTIME_AUTHORITY_SERVICES = {
+    "vp-ffmpeg-worker-go-swarm",
+    "vp-ffmpeg-worker-gpu-swarm",
+    "vp-vision-worker-swarm",
+    "vp-youtube-publisher-swarm",
+}
+AUTHORITY_STATES = {"planned", "provisioning", "provisioned", "revoked"}
 PHASES = {
     "PREPARING",
     "ABORTING",
@@ -152,6 +159,7 @@ TOP_LEVEL_FIELDS = {
     "created_at",
     "database_credentials",
     "runtime_redis",
+    "authorities",
     "prepared_secrets",
     "baseline",
     "failed_forward",
@@ -530,10 +538,21 @@ def _validate_secret_refs(value: object, *, exact_count: int | None = None) -> N
         identities.add(identity)
 
 
-def _validate_abort_authority(value: object) -> dict[str, str]:
+def _validate_authority(
+    value: object,
+    target_commit: str,
+) -> dict[str, str]:
     authority = _require_exact_fields(
         value,
-        {"kind", "service", "generation"},
+        {
+            "kind",
+            "service",
+            "generation",
+            "state",
+            "control_image",
+            "control_generation",
+            "operator_reference",
+        },
     )
     if authority["kind"] not in {"control", "runtime"}:
         raise TransactionError
@@ -545,29 +564,63 @@ def _validate_abort_authority(value: object) -> dict[str, str]:
         authority["generation"],
         r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
     )
+    if authority["state"] not in AUTHORITY_STATES:
+        raise TransactionError
+    _require_string(
+        authority["control_image"],
+        r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}",
+    )
+    _require_string(
+        authority["control_generation"],
+        r"c-[0-9a-f]{20}",
+        maximum=22,
+    )
+    _require_string(
+        authority["operator_reference"],
+        r"control/c-[0-9a-f]{20}/worker-registration-operator-database-url",
+    )
+    expected_control_generation = f"c-{target_commit[:20]}"
+    expected_operator_reference = (
+        f"control/{expected_control_generation}/"
+        "worker-registration-operator-database-url"
+    )
+    expected_control_image = (
+        f"vp-ffmpeg-worker-python:deploy-{target_commit[:12]}"
+    )
+    if (
+        authority["control_generation"] != expected_control_generation
+        or authority["operator_reference"] != expected_operator_reference
+        or authority["control_image"] != expected_control_image
+    ):
+        raise TransactionError
     if (
         authority["kind"] == "control"
-        and authority["service"] != "vp-worker-control"
+        and (
+            authority["service"] != "vp-worker-control"
+            or authority["generation"] != expected_control_generation
+        )
     ) or (
         authority["kind"] == "runtime"
-        and authority["service"] == "vp-worker-control"
+        and (
+            authority["service"] not in RUNTIME_AUTHORITY_SERVICES
+            or re.fullmatch(r"[1-9][0-9]*", authority["generation"]) is None
+        )
     ):
         raise TransactionError
     return authority
 
 
-def _validate_abort(value: object) -> dict[str, Any]:
-    abort = _require_exact_fields(value, {"reason", "authorities"})
-    _require_string(
-        abort["reason"],
-        r"[a-z][a-z0-9_]{0,63}",
-        maximum=64,
-    )
-    if not isinstance(abort["authorities"], list):
+def _validate_authorities(
+    value: object,
+    target_commit: str,
+) -> list[dict[str, str]]:
+    if not isinstance(value, list):
         raise TransactionError
     identities: set[tuple[str, str, str]] = set()
-    for value in abort["authorities"]:
-        authority = _validate_abort_authority(value)
+    control_images: set[str] = set()
+    authorities: list[dict[str, str]] = []
+    for item in value:
+        authority = _validate_authority(item, target_commit)
         identity = (
             authority["kind"],
             authority["service"],
@@ -576,6 +629,24 @@ def _validate_abort(value: object) -> dict[str, Any]:
         if identity in identities:
             raise TransactionError
         identities.add(identity)
+        control_images.add(authority["control_image"])
+        authorities.append(authority)
+    if len(control_images) > 1:
+        raise TransactionError
+    return authorities
+
+
+def _validate_abort(
+    value: object,
+    target_commit: str,
+) -> dict[str, Any]:
+    abort = _require_exact_fields(value, {"reason", "authorities"})
+    _require_string(
+        abort["reason"],
+        r"[a-z][a-z0-9_]{0,63}",
+        maximum=64,
+    )
+    _validate_authorities(abort["authorities"], target_commit)
     return abort
 
 
@@ -844,7 +915,41 @@ def _validate_document(value: object) -> dict[str, Any]:
         runtime_secret_names.add(entry["secret_name"])
         runtime_secret_ids.add(entry["docker_secret_id"])
 
+    authorities = _validate_authorities(
+        document["authorities"],
+        document["target_commit"],
+    )
+    if document["phase"] == "PREPARING":
+        if any(authority["state"] == "revoked" for authority in authorities):
+            raise TransactionError
+    elif document["phase"] == "ABORTING" or (
+        document["phase"] == "DONE" and document["outcome"] == "aborted"
+    ):
+        pass
+    elif any(
+        authority["state"] != "provisioned" for authority in authorities
+    ):
+        raise TransactionError
+
     _validate_secret_refs(document["prepared_secrets"])
+    for reference in document["prepared_secrets"]:
+        expected_kind = (
+            "control"
+            if reference["service"] == "vp-worker-control"
+            else "runtime"
+        )
+        matches = [
+            authority
+            for authority in authorities
+            if (
+                authority["kind"] == expected_kind
+                and authority["service"] == reference["service"]
+                and authority["generation"] == reference["generation"]
+                and authority["state"] == "provisioned"
+            )
+        ]
+        if len(matches) != 1:
+            raise TransactionError
 
     baseline = _require_exact_fields(
         document["baseline"],
@@ -954,10 +1059,17 @@ def _validate_document(value: object) -> dict[str, Any]:
         if document["phase"] == "ABORTING" or document["outcome"] == "aborted":
             raise TransactionError
     else:
-        _validate_abort(abort)
+        _validate_abort(abort, document["target_commit"])
         if document["phase"] != "ABORTING" and not (
             document["phase"] == "DONE" and document["outcome"] == "aborted"
         ):
+            raise TransactionError
+        remaining_authorities = [
+            authority
+            for authority in authorities
+            if authority["state"] != "revoked"
+        ]
+        if abort["authorities"] != remaining_authorities:
             raise TransactionError
 
     if document["operation"] is not None:
@@ -1340,6 +1452,7 @@ def _new_document(
         "created_at": created_at,
         "database_credentials": credentials,
         "runtime_redis": {},
+        "authorities": [],
         "prepared_secrets": [],
         "baseline": {
             "kind": baseline_kind,
@@ -1537,6 +1650,150 @@ def _prepared_secret_reference(arguments: list[str]) -> dict[str, str]:
     return reference
 
 
+def _update_current_document(
+    raw_root: str,
+    raw_lock_descriptor: str,
+    updater: Any,
+) -> dict[str, Any]:
+    _require_writer_lock(raw_root, raw_lock_descriptor)
+    _root, root_descriptor, transactions_descriptor = _open_transactions(
+        raw_root,
+        create=False,
+    )
+    try:
+        document, _active_identity = _read_active_from_descriptor(
+            transactions_descriptor,
+            allow_missing=False,
+        )
+        if document is None:
+            raise TransactionError
+        revision = document["revision"]
+    finally:
+        os.close(transactions_descriptor)
+        os.close(root_descriptor)
+    return _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        str(revision),
+        updater,
+    )
+
+
+def record_authority_intent(arguments: list[str]) -> None:
+    if len(arguments) != 8:
+        raise TransactionError
+    (
+        raw_root,
+        raw_lock_descriptor,
+        kind,
+        service,
+        generation,
+        control_image,
+        control_generation,
+        operator_reference,
+    ) = arguments
+
+    def updater(document: dict[str, Any]) -> None:
+        if document["phase"] != "PREPARING":
+            raise TransactionError
+        authority = _validate_authority(
+            {
+                "kind": kind,
+                "service": service,
+                "generation": generation,
+                "state": "planned",
+                "control_image": control_image,
+                "control_generation": control_generation,
+                "operator_reference": operator_reference,
+            },
+            document["target_commit"],
+        )
+        identity = (
+            authority["kind"],
+            authority["service"],
+            authority["generation"],
+        )
+        for existing in document["authorities"]:
+            existing_identity = (
+                existing["kind"],
+                existing["service"],
+                existing["generation"],
+            )
+            if existing_identity != identity:
+                continue
+            if (
+                existing["control_image"] != authority["control_image"]
+                or existing["control_generation"]
+                != authority["control_generation"]
+                or existing["operator_reference"]
+                != authority["operator_reference"]
+                or existing["state"] == "revoked"
+            ):
+                raise TransactionError
+            return
+        document["authorities"].append(authority)
+
+    document = _update_current_document(
+        raw_root,
+        raw_lock_descriptor,
+        updater,
+    )
+    _print_json(document)
+
+
+def _mark_authority(
+    arguments: list[str],
+    *,
+    target_state: str,
+) -> None:
+    if len(arguments) != 5:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, kind, service, generation = arguments
+
+    def updater(document: dict[str, Any]) -> None:
+        if document["phase"] != "PREPARING":
+            raise TransactionError
+        matches = [
+            authority
+            for authority in document["authorities"]
+            if (
+                authority["kind"] == kind
+                and authority["service"] == service
+                and authority["generation"] == generation
+            )
+        ]
+        if len(matches) != 1:
+            raise TransactionError
+        authority = matches[0]
+        if target_state == "provisioning":
+            if authority["state"] == "planned":
+                authority["state"] = "provisioning"
+            elif authority["state"] not in {"provisioning", "provisioned"}:
+                raise TransactionError
+        elif target_state == "provisioned":
+            if authority["state"] == "provisioning":
+                authority["state"] = "provisioned"
+            elif authority["state"] != "provisioned":
+                raise TransactionError
+        else:
+            raise TransactionError
+
+    document = _update_current_document(
+        raw_root,
+        raw_lock_descriptor,
+        updater,
+    )
+    _print_json(document)
+
+
+def mark_authority_provisioning(arguments: list[str]) -> None:
+    _mark_authority(arguments, target_state="provisioning")
+
+
+def mark_authority_provisioned(arguments: list[str]) -> None:
+    _mark_authority(arguments, target_state="provisioned")
+
+
 def record_prepared_secret(arguments: list[str]) -> None:
     if len(arguments) != 7:
         raise TransactionError
@@ -1570,26 +1827,9 @@ def record_prepared_secret(arguments: list[str]) -> None:
                 raise TransactionError
         document["prepared_secrets"].append(reference)
 
-    _require_writer_lock(raw_root, raw_lock_descriptor)
-    _root, root_descriptor, transactions_descriptor = _open_transactions(
-        raw_root,
-        create=False,
-    )
-    try:
-        document, _active_identity = _read_active_from_descriptor(
-            transactions_descriptor,
-            allow_missing=False,
-        )
-        if document is None:
-            raise TransactionError
-        revision = document["revision"]
-    finally:
-        os.close(transactions_descriptor)
-        os.close(root_descriptor)
-    document = _update_document(
+    document = _update_current_document(
         raw_root,
         raw_lock_descriptor,
-        str(revision),
         updater,
     )
     _print_json(document)
@@ -1679,6 +1919,10 @@ def _set_phase(document: dict[str, Any], target_phase: str, outcome: str | None)
                 or document["prepared_secrets"]
                 or document["abort"] is None
                 or document["abort"]["authorities"]
+                or any(
+                    authority["state"] != "revoked"
+                    for authority in document["authorities"]
+                )
                 or any(document["promotion"].values())
                 or document["pending_retirements"]
             ):
@@ -1757,32 +2001,13 @@ def begin_abort(arguments: list[str]) -> None:
             or document["abort"] is not None
         ):
             raise TransactionError
-        authorities: list[dict[str, str]] = []
-        seen: set[tuple[str, str, str]] = set()
-        for reference in document["prepared_secrets"]:
-            kind = (
-                "control"
-                if reference["service"] == "vp-worker-control"
-                else "runtime"
-            )
-            identity = (
-                kind,
-                reference["service"],
-                reference["generation"],
-            )
-            if identity in seen:
-                continue
-            seen.add(identity)
-            authorities.append(
-                {
-                    "kind": kind,
-                    "service": reference["service"],
-                    "generation": reference["generation"],
-                }
-            )
         document["abort"] = {
             "reason": reason,
-            "authorities": authorities,
+            "authorities": [
+                dict(authority)
+                for authority in document["authorities"]
+                if authority["state"] != "revoked"
+            ],
         }
         document["last_error"] = {
             "code": reason,
@@ -1924,13 +2149,10 @@ def complete_abort_authority(arguments: list[str]) -> None:
         service,
         generation,
     ) = arguments
-    authority = _validate_abort_authority(
-        {
-            "kind": kind,
-            "service": service,
-            "generation": generation,
-        }
-    )
+    if kind not in {"control", "runtime"}:
+        raise TransactionError
+    _require_string(service, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
+    _require_string(generation, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
     def updater(document: dict[str, Any]) -> None:
         if (
@@ -1940,17 +2162,32 @@ def complete_abort_authority(arguments: list[str]) -> None:
             or document["abort"] is None
         ):
             raise TransactionError
-        matches = [
+        queue_matches = [
             existing
             for existing in document["abort"]["authorities"]
-            if existing == authority
+            if (
+                existing["kind"] == kind
+                and existing["service"] == service
+                and existing["generation"] == generation
+            )
         ]
-        if len(matches) != 1:
+        authority_matches = [
+            existing
+            for existing in document["authorities"]
+            if (
+                existing["kind"] == kind
+                and existing["service"] == service
+                and existing["generation"] == generation
+                and existing["state"] != "revoked"
+            )
+        ]
+        if len(queue_matches) != 1 or len(authority_matches) != 1:
             raise TransactionError
+        authority_matches[0]["state"] = "revoked"
         document["abort"]["authorities"] = [
             existing
             for existing in document["abort"]["authorities"]
-            if existing != authority
+            if existing != queue_matches[0]
         ]
 
     document = _update_document(
@@ -2268,6 +2505,15 @@ def main(arguments: list[str]) -> int:
         return 0
     if arguments and arguments[0] == "lookup-prepared-secret":
         lookup_prepared_secret(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-authority-intent":
+        record_authority_intent(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "mark-authority-provisioning":
+        mark_authority_provisioning(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "mark-authority-provisioned":
+        mark_authority_provisioned(arguments[1:])
         return 0
     if arguments and arguments[0] == "begin-abort":
         begin_abort(arguments[1:])

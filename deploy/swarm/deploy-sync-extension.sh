@@ -28,11 +28,21 @@ VP_PYTHON_WORKER_SIGNAL_STATUS=0
 VP_PYTHON_WORKER_SIGNAL_NAME=""
 VP_PYTHON_WORKER_PENDING_SIGNAL_STATUS=0
 VP_PYTHON_WORKER_PENDING_SIGNAL_NAME=""
+VP_PYTHON_WORKER_LAUNCH_GATE_FD=16
+VP_PYTHON_WORKER_LAUNCH_GATE_OPEN=false
+VP_PYTHON_WORKER_LAUNCH_GATE_PATH=""
+VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY=""
+VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN=""
 VP_WORKER_ADMISSION_DEPLOY_SIGNAL_ACTIVE=false
 VP_WORKER_ADMISSION_DEPLOY_SIGNAL_STATUS=0
 VP_WORKER_DATABASE_CREDENTIAL_RECORDS=""
 VP_WORKER_PREPARED_SECRET_ID=""
+VP_WORKER_ADMISSION_QUERY_READ_FD=14
+VP_WORKER_ADMISSION_QUERY_WRITE_FD=15
+VP_WORKER_ADMISSION_QUERY_READ_OPEN=false
+VP_WORKER_ADMISSION_QUERY_WRITE_OPEN=false
 VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE=""
+VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY=""
 VP_WORKER_ADMISSION_GENERATION_STATE=""
 VP_WORKER_ADMISSION_RETIREMENT_IDS=""
 VP_WORKER_ADMISSION_HYDRATED_RETIREMENT_RECORDS=""
@@ -47,6 +57,10 @@ VP_WORKER_ABORT_SECRET_PURPOSE=""
 VP_WORKER_ABORT_AUTHORITY_KIND=""
 VP_WORKER_ABORT_AUTHORITY_SERVICE=""
 VP_WORKER_ABORT_AUTHORITY_GENERATION=""
+VP_WORKER_ABORT_AUTHORITY_STATE=""
+VP_WORKER_ABORT_AUTHORITY_CONTROL_IMAGE=""
+VP_WORKER_ABORT_AUTHORITY_CONTROL_GENERATION=""
+VP_WORKER_ABORT_AUTHORITY_OPERATOR_REFERENCE=""
 
 VP_RUNTIME_HOST="${VP_RUNTIME_HOST:-10.0.0.127}"
 VP_RUNTIME_NODE="${VP_RUNTIME_NODE:-colima-127}"
@@ -1970,6 +1984,183 @@ vp_python_worker_restore_trap() {
   fi
 }
 
+vp_python_worker_prepare_launch_gate() {
+  local admission_root="$1"
+  local caller_uid="$2"
+  local caller_gid="$3"
+  vp_worker_admission_lock_assert || return 1
+  [[ "$admission_root" == "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+    && "$caller_uid" =~ ^[0-9]+$ \
+    && "$caller_gid" =~ ^[0-9]+$ \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_FD" -eq 16 \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_OPEN" == false \
+    && -z "$VP_PYTHON_WORKER_LAUNCH_GATE_PATH" \
+    && -z "$VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY" \
+    && -z "$VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN" \
+    && ! -e /dev/fd/16 ]] || return 1
+  local directory
+  directory="$(
+    vp_python_worker_prepare_controlled_directory \
+      "$admission_root/launch-gates"
+  )" || return 1
+  local gate_record
+  gate_record="$(
+    python3 -I - "$directory" "$caller_uid" "$caller_gid" <<'PY'
+import os
+import secrets
+import stat
+import sys
+
+try:
+    directory = os.path.abspath(sys.argv[1])
+    expected_uid = int(sys.argv[2])
+    expected_gid = int(sys.argv[3])
+    directory_metadata = os.lstat(directory)
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        or directory_metadata.st_uid != expected_uid
+        or directory_metadata.st_gid != expected_gid
+    ):
+        raise ValueError
+    for _attempt in range(16):
+        path = os.path.join(directory, f".gate.{secrets.token_hex(16)}")
+        try:
+            os.mkfifo(path, 0o600)
+        except FileExistsError:
+            continue
+        metadata = os.lstat(path)
+        if (
+            not stat.S_ISFIFO(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or metadata.st_nlink != 1
+        ):
+            raise ValueError
+        print(f"{path}|{metadata.st_dev}:{metadata.st_ino}")
+        break
+    else:
+        raise ValueError
+except (OSError, TypeError, ValueError):
+    raise SystemExit(1)
+PY
+  )" || return 1
+  local path="${gate_record%%|*}"
+  local identity="${gate_record#*|}"
+  [[ "$path" == "$directory/".gate.* \
+    && "$identity" != "$gate_record" \
+    && "$identity" =~ ^[0-9]+:[1-9][0-9]*$ ]] || return 1
+  exec 16<>"$path" || return 1
+  if ! python3 -I - "$path" 16 "$identity" \
+      "$caller_uid" "$caller_gid" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    path = os.path.abspath(sys.argv[1])
+    descriptor = int(sys.argv[2])
+    expected_device, expected_inode = (
+        int(value) for value in sys.argv[3].split(":", 1)
+    )
+    expected_uid = int(sys.argv[4])
+    expected_gid = int(sys.argv[5])
+    path_metadata = os.lstat(path)
+    descriptor_metadata = os.fstat(descriptor)
+    for metadata in (path_metadata, descriptor_metadata):
+        if (
+            not stat.S_ISFIFO(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino)
+            != (expected_device, expected_inode)
+        ):
+            raise ValueError
+    os.unlink(path)
+    if os.fstat(descriptor).st_nlink != 0:
+        raise ValueError
+except (OSError, TypeError, ValueError):
+    raise SystemExit(1)
+PY
+  then
+    exec 16>&-
+    return 1
+  fi
+  local token
+  token="$(
+    python3 -I -c 'import secrets; print(secrets.token_hex(16))'
+  )" || {
+    exec 16>&-
+    return 1
+  }
+  [[ "$token" =~ ^[0-9a-f]{32}$ ]] || {
+    exec 16>&-
+    return 1
+  }
+  VP_PYTHON_WORKER_LAUNCH_GATE_OPEN=true
+  VP_PYTHON_WORKER_LAUNCH_GATE_PATH="$path"
+  VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY="$identity"
+  VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN="$token"
+}
+
+vp_python_worker_verify_launch_gate() {
+  [[ "$VP_PYTHON_WORKER_LAUNCH_GATE_OPEN" == true \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_FD" -eq 16 \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_PATH" = /* \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY" \
+      =~ ^[0-9]+:[1-9][0-9]*$ \
+    && "$VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN" \
+      =~ ^[0-9a-f]{32}$ ]] || return 1
+  python3 -I -c '
+import os
+import stat
+import sys
+
+try:
+    descriptor = int(sys.argv[1])
+    expected_device, expected_inode = (
+        int(value) for value in sys.argv[2].split(":", 1)
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISFIFO(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
+        or metadata.st_nlink != 0
+        or (metadata.st_dev, metadata.st_ino)
+        != (expected_device, expected_inode)
+    ):
+        raise ValueError
+except (OSError, TypeError, ValueError):
+    raise SystemExit(1)
+' "$VP_PYTHON_WORKER_LAUNCH_GATE_FD" \
+    "$VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY"
+}
+
+vp_python_worker_release_launch_gate() {
+  vp_worker_admission_raise_if_signaled || return $?
+  vp_python_worker_verify_launch_gate || return 1
+  printf 'VP-LAUNCH-1:%s\n' \
+    "$VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN" >&16 || return 1
+}
+
+vp_python_worker_discard_launch_gate() {
+  local status=0
+  if [[ "$VP_PYTHON_WORKER_LAUNCH_GATE_OPEN" == true ]]; then
+    vp_python_worker_verify_launch_gate || status=1
+    exec 16>&- || status=1
+  fi
+  VP_PYTHON_WORKER_LAUNCH_GATE_OPEN=false
+  VP_PYTHON_WORKER_LAUNCH_GATE_PATH=""
+  VP_PYTHON_WORKER_LAUNCH_GATE_IDENTITY=""
+  VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN=""
+  return "$status"
+}
+
 _vp_run_python_worker_container_locked() {
   local image="$1"
   local secret_source="$2"
@@ -2403,6 +2594,9 @@ except Exception:
   local caller_pipefail=false
   local launched_child_pid=""
   vp_worker_admission_raise_if_signaled || return $?
+  vp_python_worker_prepare_launch_gate \
+    "$admission_root" "$caller_uid" "$caller_gid" || return 1
+  local launch_token="$VP_PYTHON_WORKER_LAUNCH_GATE_TOKEN"
   if (( ${#payload_sources[@]} > 0 )); then
     if set -o | awk '$1 == "pipefail" && $2 == "on" { found=1 }
       END { exit found ? 0 : 1 }'; then
@@ -2412,16 +2606,58 @@ except Exception:
     vp_python_worker_host_guard \
       stream-payloads "$caller_uid" "$caller_gid" \
       "${stream_arguments[@]}" \
-      | "${docker_command[@]}" &
+      | (
+          trap - HUP INT TERM
+          local received_token=""
+          IFS= read -r received_token <&16 || exit 1
+          [[ "$received_token" == "VP-LAUNCH-1:$launch_token" ]] \
+            || exit 1
+          exec 16>&-
+          if declare -F docker >/dev/null 2>&1; then
+            "${docker_command[@]}"
+          else
+            exec "${docker_command[@]}"
+          fi
+        ) &
   else
-    "${docker_command[@]}" </dev/null &
+    (
+      trap - HUP INT TERM
+      local received_token=""
+      IFS= read -r received_token <&16 || exit 1
+      [[ "$received_token" == "VP-LAUNCH-1:$launch_token" ]] \
+        || exit 1
+      exec 16>&-
+      if declare -F docker >/dev/null 2>&1; then
+        "${docker_command[@]}" </dev/null
+      else
+        exec "${docker_command[@]}" </dev/null
+      fi
+    ) &
   fi
   VP_PYTHON_WORKER_ACTIVE_CHILD_PID=$!
   launched_child_pid="$VP_PYTHON_WORKER_ACTIVE_CHILD_PID"
   vp_python_worker_consume_pending_signal || true
-  if [[ "$launched_child_pid" =~ ^[1-9][0-9]*$ ]] \
+  local launch_status=0
+  vp_python_worker_release_launch_gate || launch_status=$?
+  vp_python_worker_discard_launch_gate || {
+    [[ "$launch_status" -ne 0 ]] || launch_status=1
+  }
+  if [[ "$launch_status" -ne 0 \
+    && "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID" == "$launched_child_pid" \
+    && "$launched_child_pid" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "$launched_child_pid" >/dev/null 2>&1 || true
+    wait "$launched_child_pid" >/dev/null 2>&1 || true
+    if [[ "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID" == "$launched_child_pid" ]]; then
+      VP_PYTHON_WORKER_ACTIVE_CHILD_PID=""
+    fi
+  fi
+  if [[ "$launch_status" -eq 0 \
+    && "$VP_PYTHON_WORKER_ACTIVE_CHILD_PID" == "$launched_child_pid" \
+    && "$launched_child_pid" =~ ^[1-9][0-9]*$ ]] \
     && wait "$launched_child_pid" 2>/dev/null; then
     docker_status=0
+  elif [[ "$launch_status" -ne 0 ]]; then
+    docker_status="$launch_status"
   else
     docker_status=$?
   fi
@@ -2855,6 +3091,53 @@ vp_worker_admission_record_prepared_secret() {
     >/dev/null
 }
 
+vp_worker_admission_record_authority_intent() {
+  local kind="$1"
+  local service="$2"
+  local generation="$3"
+  local control_image="$4"
+  local control_generation="$5"
+  local operator_reference="$6"
+  [[ "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true ]] \
+    || return 1
+  vp_worker_admission_lock_assert || return 1
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    record-authority-intent \
+    "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+    "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "$kind" "$service" "$generation" \
+    "$control_image" "$control_generation" "$operator_reference" \
+    >/dev/null
+}
+
+vp_worker_admission_mark_authority_provisioning() {
+  local kind="$1"
+  local service="$2"
+  local generation="$3"
+  [[ "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true ]] \
+    || return 1
+  vp_worker_admission_lock_assert || return 1
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    mark-authority-provisioning \
+    "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+    "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "$kind" "$service" "$generation" >/dev/null
+}
+
+vp_worker_admission_mark_authority_provisioned() {
+  local kind="$1"
+  local service="$2"
+  local generation="$3"
+  [[ "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true ]] \
+    || return 1
+  vp_worker_admission_lock_assert || return 1
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    mark-authority-provisioned \
+    "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+    "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "$kind" "$service" "$generation" >/dev/null
+}
+
 vp_worker_admission_load_abort_state() {
   vp_worker_admission_lock_assert || return 1
   local state
@@ -2959,10 +3242,18 @@ try:
         ]
     else:
         secret_fields = ["-", "-", "-", "-", "-"]
-    authority_fields = ["-", "-", "-"]
+    authority_fields = ["-", "-", "-", "-", "-", "-", "-"]
     if secret is None and state["authorities"]:
         authority = state["authorities"][0]
-        if set(authority) != {"generation", "kind", "service"}:
+        if set(authority) != {
+            "control_generation",
+            "control_image",
+            "generation",
+            "kind",
+            "operator_reference",
+            "service",
+            "state",
+        }:
             raise ValueError
         kind = require_string(authority["kind"], r"(control|runtime)")
         service = require_string(
@@ -2973,7 +3264,37 @@ try:
             authority["generation"],
             r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
         )
-        authority_fields = [kind, service, generation]
+        authority_state = require_string(
+            authority["state"],
+            r"(planned|provisioning|provisioned)",
+        )
+        control_image = require_string(
+            authority["control_image"],
+            r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}",
+        )
+        control_generation = require_string(
+            authority["control_generation"],
+            r"c-[0-9a-f]{20}",
+        )
+        operator_reference = require_string(
+            authority["operator_reference"],
+            r"control/c-[0-9a-f]{20}/worker-registration-operator-database-url",
+        )
+        if operator_reference != (
+            "control/"
+            + control_generation
+            + "/worker-registration-operator-database-url"
+        ):
+            raise ValueError
+        authority_fields = [
+            kind,
+            service,
+            generation,
+            authority_state,
+            control_image,
+            control_generation,
+            operator_reference,
+        ]
     print(
         "|".join(
             [
@@ -3002,6 +3323,10 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     VP_WORKER_ABORT_AUTHORITY_KIND \
     VP_WORKER_ABORT_AUTHORITY_SERVICE \
     VP_WORKER_ABORT_AUTHORITY_GENERATION \
+    VP_WORKER_ABORT_AUTHORITY_STATE \
+    VP_WORKER_ABORT_AUTHORITY_CONTROL_IMAGE \
+    VP_WORKER_ABORT_AUTHORITY_CONTROL_GENERATION \
+    VP_WORKER_ABORT_AUTHORITY_OPERATOR_REFERENCE \
     extra <<<"$fields"
   [[ -z "$extra" \
     && "$VP_WORKER_ABORT_REVISION" =~ ^(0|[1-9][0-9]*)$ \
@@ -3176,7 +3501,7 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
       case "$VP_WORKER_ABORT_AUTHORITY_KIND" in
         control)
           vp_worker_control_revoke_authority \
-            "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+            "$VP_WORKER_ABORT_AUTHORITY_CONTROL_IMAGE" \
             "$VP_WORKER_ABORT_AUTHORITY_GENERATION" \
             "$root" || return 1
           ;;
@@ -3184,7 +3509,11 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
           vp_worker_admission_revoke_generation_authority \
             "$VP_WORKER_ABORT_AUTHORITY_SERVICE" \
             "$VP_WORKER_ABORT_AUTHORITY_GENERATION" \
-            "$root" || return 1
+            "$root" \
+            "$VP_WORKER_ABORT_AUTHORITY_CONTROL_IMAGE" \
+            "$VP_WORKER_ABORT_AUTHORITY_CONTROL_GENERATION" \
+            "$VP_WORKER_ABORT_AUTHORITY_OPERATOR_REFERENCE" \
+            || return 1
           ;;
         *)
           return 1
@@ -3873,6 +4202,12 @@ vp_worker_admission_prepare_control_roles() {
     vp_worker_control_write_manifest \
       "$candidate" "$generation" "$image" || return 1
   fi
+  local operator_reference="control/$generation/worker-registration-operator-database-url"
+  vp_worker_admission_record_authority_intent \
+    control vp-worker-control "$generation" \
+    "$image" "$generation" "$operator_reference" || return 1
+  vp_worker_admission_mark_authority_provisioning \
+    control vp-worker-control "$generation" || return 1
   vp_run_python_worker_container \
     "$image" \
     "$owner_file" \
@@ -3885,6 +4220,8 @@ vp_worker_admission_prepare_control_roles() {
     python -m app.services.worker_control_role_cli \
       provision --generation "$generation" \
       --state-dir /control-state >/dev/null || return 1
+  vp_worker_admission_mark_authority_provisioned \
+    control vp-worker-control "$generation" || return 1
 
   vp_worker_admission_create_secret \
     "$VP_WORKER_OPERATOR_DATABASE_SECRET" \
@@ -4017,6 +4354,14 @@ vp_worker_admission_prepare_service() {
       "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
       "worker runtime-role owner database URL file"
   )" || return 1
+  local control_generation="$VP_WORKER_CONTROL_GENERATION"
+  local operator_reference="control/$control_generation/worker-registration-operator-database-url"
+  vp_worker_admission_record_authority_intent \
+    runtime "$service" "$generation" \
+    "$control_image" "$control_generation" "$operator_reference" \
+    || return 1
+  vp_worker_admission_mark_authority_provisioning \
+    runtime "$service" "$generation" || return 1
   vp_run_python_worker_container \
     "$control_image" \
     "$owner_file" \
@@ -4030,6 +4375,8 @@ vp_worker_admission_prepare_service() {
       provision --service-name "$service" \
       --generation "$generation" \
       --state-dir /runtime-state >/dev/null || return 1
+  vp_worker_admission_mark_authority_provisioned \
+    runtime "$service" "$generation" || return 1
 
   local credential_dir="$runtime_state/$service/$generation"
   vp_worker_admission_create_secret \
@@ -4704,7 +5051,13 @@ vp_require_worker_deployment_ready() {
 
 vp_worker_admission_prepare_query_output() {
   vp_worker_admission_lock_assert || return 1
-  [[ -z "$VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE" ]] || return 1
+  [[ "$VP_WORKER_ADMISSION_QUERY_READ_FD" -eq 14 \
+    && "$VP_WORKER_ADMISSION_QUERY_WRITE_FD" -eq 15 \
+    && "$VP_WORKER_ADMISSION_QUERY_READ_OPEN" == false \
+    && "$VP_WORKER_ADMISSION_QUERY_WRITE_OPEN" == false \
+    && -z "$VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE" \
+    && -z "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" \
+    && ! -e /dev/fd/14 && ! -e /dev/fd/15 ]] || return 1
   local directory
   directory="$(
     vp_python_worker_prepare_controlled_directory \
@@ -4718,26 +5071,147 @@ vp_worker_admission_prepare_query_output() {
     rm -f "$path"
     return 1
   fi
+  exec 14<"$path" || {
+    rm -f "$path"
+    return 1
+  }
+  if ! exec 15>"$path"; then
+    exec 14>&-
+    rm -f "$path"
+    return 1
+  fi
+  local identity
+  identity="$(
+    python3 -I - "$path" 14 15 <<'PY'
+import os
+import stat
+import sys
+
+try:
+    path = os.path.abspath(sys.argv[1])
+    read_descriptor = int(sys.argv[2])
+    write_descriptor = int(sys.argv[3])
+    path_metadata = os.lstat(path)
+    read_metadata = os.fstat(read_descriptor)
+    write_metadata = os.fstat(write_descriptor)
+    identities = {
+        (path_metadata.st_dev, path_metadata.st_ino),
+        (read_metadata.st_dev, read_metadata.st_ino),
+        (write_metadata.st_dev, write_metadata.st_ino),
+    }
+    for metadata in (path_metadata, read_metadata, write_metadata):
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or metadata.st_gid != os.getgid()
+            or metadata.st_nlink != 1
+        ):
+            raise ValueError
+    if len(identities) != 1:
+        raise ValueError
+    os.unlink(path)
+    if os.fstat(read_descriptor).st_nlink != 0:
+        raise ValueError
+    device, inode = identities.pop()
+    print(f"{device}:{inode}")
+except (OSError, TypeError, ValueError):
+    raise SystemExit(1)
+PY
+  )" || {
+    exec 15>&-
+    exec 14>&-
+    return 1
+  }
+  [[ "$identity" =~ ^[0-9]+:[1-9][0-9]*$ \
+    && ! -e "$path" ]] || {
+    exec 15>&-
+    exec 14>&-
+    return 1
+  }
+  VP_WORKER_ADMISSION_QUERY_READ_OPEN=true
+  VP_WORKER_ADMISSION_QUERY_WRITE_OPEN=true
   VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE="$path"
+  VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY="$identity"
+}
+
+vp_worker_admission_verify_query_output_fd() {
+  local descriptor="$1"
+  local identity="$2"
+  [[ "$descriptor" =~ ^(14|15)$ \
+    && "$identity" =~ ^[0-9]+:[1-9][0-9]*$ ]] || return 1
+  python3 -I -c '
+import os
+import stat
+import sys
+
+try:
+    descriptor = int(sys.argv[1])
+    expected_device, expected_inode = (
+        int(value) for value in sys.argv[2].split(":", 1)
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
+        or metadata.st_nlink != 0
+        or (metadata.st_dev, metadata.st_ino)
+        != (expected_device, expected_inode)
+    ):
+        raise ValueError
+except (OSError, TypeError, ValueError):
+    raise SystemExit(1)
+' "$descriptor" "$identity"
+}
+
+vp_worker_admission_seal_query_output() {
+  [[ "$VP_WORKER_ADMISSION_QUERY_READ_OPEN" == true \
+    && "$VP_WORKER_ADMISSION_QUERY_WRITE_OPEN" == true ]] || return 1
+  local status=0
+  vp_worker_admission_verify_query_output_fd \
+    "$VP_WORKER_ADMISSION_QUERY_WRITE_FD" \
+    "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" || status=1
+  exec 15>&- || status=1
+  VP_WORKER_ADMISSION_QUERY_WRITE_OPEN=false
+  return "$status"
 }
 
 vp_worker_admission_discard_query_output() {
-  local path="$VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE"
+  local status=0
+  if [[ "$VP_WORKER_ADMISSION_QUERY_WRITE_OPEN" == true ]]; then
+    vp_worker_admission_verify_query_output_fd \
+      "$VP_WORKER_ADMISSION_QUERY_WRITE_FD" \
+      "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" || status=1
+    exec 15>&- || status=1
+  fi
+  if [[ "$VP_WORKER_ADMISSION_QUERY_READ_OPEN" == true ]]; then
+    vp_worker_admission_verify_query_output_fd \
+      "$VP_WORKER_ADMISSION_QUERY_READ_FD" \
+      "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" || status=1
+    exec 14>&- || status=1
+  fi
+  VP_WORKER_ADMISSION_QUERY_READ_OPEN=false
+  VP_WORKER_ADMISSION_QUERY_WRITE_OPEN=false
   VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE=""
-  [[ "$path" = "$VP_WORKER_ADMISSION_LOCK_ROOT/query-output/".query.* \
-    && -f "$path" && ! -L "$path" \
-    && "$(vp_worker_redis_marker_file_mode "$path")" == 600 ]] \
-    || return 1
-  rm -f "$path"
+  VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY=""
+  return "$status"
 }
 
 vp_worker_admission_parse_query_output() {
   local kind="$1"
-  local path="$2"
-  local expected_service="$3"
-  local expected_generation="$4"
+  local expected_service="$2"
+  local expected_generation="$3"
+  [[ "$VP_WORKER_ADMISSION_QUERY_READ_OPEN" == true \
+    && "$VP_WORKER_ADMISSION_QUERY_WRITE_OPEN" == false \
+    && "$VP_WORKER_ADMISSION_QUERY_READ_FD" -eq 14 \
+    && "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" \
+      =~ ^[0-9]+:[1-9][0-9]*$ ]] || return 1
   python3 -I - \
-    "$kind" "$path" "$expected_service" "$expected_generation" <<'PY'
+    "$kind" "$VP_WORKER_ADMISSION_QUERY_READ_FD" \
+    "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" \
+    "$expected_service" "$expected_generation" <<'PY'
 import json
 import os
 import stat
@@ -4745,42 +5219,39 @@ import sys
 import uuid
 
 try:
-    kind, raw_path, expected_service, raw_generation = sys.argv[1:]
+    (
+        kind,
+        raw_descriptor,
+        raw_identity,
+        expected_service,
+        raw_generation,
+    ) = sys.argv[1:]
+    descriptor = int(raw_descriptor)
+    expected_device, expected_inode = (
+        int(value) for value in raw_identity.split(":", 1)
+    )
     expected_generation = int(raw_generation)
-    path = os.path.abspath(raw_path)
-    before = os.lstat(path)
+    opened = os.fstat(descriptor)
     if (
-        not stat.S_ISREG(before.st_mode)
-        or stat.S_IMODE(before.st_mode) != 0o600
-        or before.st_uid != os.getuid()
-        or before.st_gid != os.getgid()
-        or before.st_nlink != 1
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or opened.st_uid != os.getuid()
+        or opened.st_gid != os.getgid()
+        or opened.st_nlink != 0
+        or (opened.st_dev, opened.st_ino)
+        != (expected_device, expected_inode)
     ):
         raise ValueError
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-    )
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or stat.S_IMODE(opened.st_mode) != 0o600
-            or (before.st_dev, before.st_ino)
-            != (opened.st_dev, opened.st_ino)
-        ):
-            raise ValueError
-        chunks = []
-        remaining = 1024 * 1024 + 1
-        while remaining:
-            chunk = os.read(descriptor, min(65536, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-    finally:
-        os.close(descriptor)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    remaining = 1024 * 1024 + 1
+    while remaining:
+        chunk = os.read(descriptor, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    raw = b"".join(chunks)
     if not raw or len(raw) > 1024 * 1024:
         raise ValueError
     payload = json.loads(raw.decode("utf-8"))
@@ -4848,9 +5319,12 @@ PY
 vp_worker_admission_generation_state() {
   local service="$1"
   local generation="$2"
+  local control_image="${3:-$VP_WORKER_ADMISSION_CONTROL_IMAGE}"
   VP_WORKER_ADMISSION_GENERATION_STATE=""
   vp_worker_admission_kind "$service" >/dev/null || return 1
-  [[ "$generation" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$generation" =~ ^[1-9][0-9]*$ \
+    && "$control_image" \
+      =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ ]] || return 1
   vp_require_pipeline_network_identity || return 1
   local read_file
   read_file="$(
@@ -4860,10 +5334,9 @@ vp_worker_admission_generation_state() {
       "worker deploy-read database URL file"
   )" || return 1
   vp_worker_admission_prepare_query_output || return 1
-  local output_file="$VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE"
   local query_status=0
   if vp_run_python_worker_container \
-      "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+      "$control_image" \
       "$read_file" \
       worker-deploy-read-database-url \
       - \
@@ -4873,12 +5346,15 @@ vp_worker_admission_generation_state() {
       python -m app.services.worker_deployment_cli \
         generation-state \
         --service-name "$service" \
-        --generation "$generation" >"$output_file"; then
-    VP_WORKER_ADMISSION_GENERATION_STATE="$(
-      vp_worker_admission_parse_query_output \
-        generation-state "$output_file" "$service" "$generation" \
-        2>/dev/null
-    )" || query_status=1
+        --generation "$generation" >&15; then
+    vp_worker_admission_seal_query_output || query_status=1
+    if [[ "$query_status" -eq 0 ]]; then
+      VP_WORKER_ADMISSION_GENERATION_STATE="$(
+        vp_worker_admission_parse_query_output \
+          generation-state "$service" "$generation" \
+          2>/dev/null
+      )" || query_status=1
+    fi
   else
     query_status=$?
   fi
@@ -4893,9 +5369,12 @@ vp_worker_admission_generation_state() {
 vp_worker_admission_retirement_ids() {
   local service="$1"
   local generation="$2"
+  local control_image="${3:-$VP_WORKER_ADMISSION_CONTROL_IMAGE}"
   VP_WORKER_ADMISSION_RETIREMENT_IDS=""
   vp_worker_admission_kind "$service" >/dev/null || return 1
-  [[ "$generation" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$generation" =~ ^[1-9][0-9]*$ \
+    && "$control_image" \
+      =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ ]] || return 1
   vp_require_pipeline_network_identity || return 1
   local read_file
   read_file="$(
@@ -4905,10 +5384,9 @@ vp_worker_admission_retirement_ids() {
       "worker deploy-read database URL file"
   )" || return 1
   vp_worker_admission_prepare_query_output || return 1
-  local output_file="$VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE"
   local query_status=0
   if vp_run_python_worker_container \
-      "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+      "$control_image" \
       "$read_file" \
       worker-deploy-read-database-url \
       - \
@@ -4918,12 +5396,15 @@ vp_worker_admission_retirement_ids() {
       python -m app.services.worker_deployment_cli \
         retirement-candidates \
         --service-name "$service" \
-        --generation "$generation" >"$output_file"; then
-    VP_WORKER_ADMISSION_RETIREMENT_IDS="$(
-      vp_worker_admission_parse_query_output \
-        retirement-candidates "$output_file" "$service" "$generation" \
-        2>/dev/null
-    )" || query_status=1
+        --generation "$generation" >&15; then
+    vp_worker_admission_seal_query_output || query_status=1
+    if [[ "$query_status" -eq 0 ]]; then
+      VP_WORKER_ADMISSION_RETIREMENT_IDS="$(
+        vp_worker_admission_parse_query_output \
+          retirement-candidates "$service" "$generation" \
+          2>/dev/null
+      )" || query_status=1
+    fi
   else
     query_status=$?
   fi
@@ -4937,25 +5418,35 @@ vp_worker_admission_revoke_generation_authority() {
   local service="$1"
   local generation="$2"
   local root="$3"
+  local control_image="${4:-$VP_WORKER_ADMISSION_CONTROL_IMAGE}"
+  local control_generation="${5:-$VP_WORKER_CONTROL_GENERATION}"
+  local operator_reference="${6:-control/$control_generation/worker-registration-operator-database-url}"
+  [[ "$root" = /* \
+    && "$control_image" \
+      =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ \
+    && "$control_generation" =~ ^c-[0-9a-f]{20}$ \
+    && "$operator_reference" \
+      == "control/$control_generation/worker-registration-operator-database-url" ]] \
+    || return 1
   vp_require_pipeline_network_identity || return 1
   local runtime_state
   runtime_state="$(
     vp_python_worker_prepare_controlled_directory "$root/runtime"
   )" || return 1
-  local operator_file="$root/control/$VP_WORKER_CONTROL_GENERATION/worker-registration-operator-database-url"
+  local operator_file="$root/$operator_reference"
   local grant_state
   vp_worker_admission_generation_state \
-    "$service" "$generation" || return 1
+    "$service" "$generation" "$control_image" || return 1
   grant_state="$VP_WORKER_ADMISSION_GENERATION_STATE"
   local registration_ids
   vp_worker_admission_retirement_ids \
-    "$service" "$generation" || return 1
+    "$service" "$generation" "$control_image" || return 1
   registration_ids="$VP_WORKER_ADMISSION_RETIREMENT_IDS"
   local registration_id
   while IFS= read -r registration_id; do
     [[ -n "$registration_id" ]] || continue
     vp_worker_admission_operator \
-      "$operator_file" "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+      "$operator_file" "$control_image" \
       revoke-registration \
       --service-name "$service" \
       --registration-id "$registration_id" \
@@ -4963,7 +5454,7 @@ vp_worker_admission_revoke_generation_authority() {
   done <<<"$registration_ids"
   if [[ "$grant_state" != absent ]]; then
     vp_worker_admission_operator \
-      "$operator_file" "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+      "$operator_file" "$control_image" \
       revoke-grant \
       --service-name "$service" \
       --generation "$generation" \
@@ -4978,7 +5469,7 @@ vp_worker_admission_revoke_generation_authority() {
       "worker runtime-role owner database URL file"
   )" || return 1
   vp_run_python_worker_container \
-    "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+    "$control_image" \
     "$owner_file" \
     worker-runtime-owner-database-url \
     /runtime-state \

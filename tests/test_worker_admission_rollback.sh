@@ -488,6 +488,9 @@ PY
   commit=1123456789abcdef0123456789abcdef01234567
   backend_image="vp-backend:deploy-${commit:0:12}"
   go_image="vp-ffmpeg-worker-go:deploy-${commit:0:12}"
+  control_image="vp-ffmpeg-worker-python:deploy-${commit:0:12}"
+  control_generation=c-${commit:0:20}
+  operator_reference="control/$control_generation/worker-registration-operator-database-url"
   transaction_cli begin \
     "$transaction_root" 18 \
     "$commit" "$backend_image" "$go_image" "$commit" \
@@ -496,6 +499,25 @@ PY
   control_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   worker_database_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
   worker_admission_id=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  transaction_cli record-authority-intent \
+    "$transaction_root" 18 control vp-worker-control \
+    "$control_generation" "$control_image" "$control_generation" \
+    "$operator_reference" >/dev/null
+  transaction_cli mark-authority-provisioning \
+    "$transaction_root" 18 control vp-worker-control \
+    "$control_generation" >/dev/null
+  transaction_cli mark-authority-provisioned \
+    "$transaction_root" 18 control vp-worker-control \
+    "$control_generation" >/dev/null
+  transaction_cli record-authority-intent \
+    "$transaction_root" 18 runtime vp-ffmpeg-worker-go-swarm 901 \
+    "$control_image" "$control_generation" "$operator_reference" >/dev/null
+  transaction_cli mark-authority-provisioning \
+    "$transaction_root" 18 runtime vp-ffmpeg-worker-go-swarm 901 \
+    >/dev/null
+  transaction_cli mark-authority-provisioned \
+    "$transaction_root" 18 runtime vp-ffmpeg-worker-go-swarm 901 \
+    >/dev/null
   transaction_cli record-prepared-secret \
     "$transaction_root" 18 \
     vp-wc-operator-c-1123456789abcdef0123 "$control_id" \
@@ -510,7 +532,7 @@ PY
     vp-ffmpeg-worker-go-swarm 901 admission >/dev/null
 
   transaction_cli begin-abort \
-    "$transaction_root" 18 3 preparing_failed >/dev/null
+    "$transaction_root" 18 9 preparing_failed >/dev/null
   abort_state="$TEST_ROOT/abort-core/list.json"
   transaction_cli list-abort "$transaction_root" 18 >"$abort_state"
   python3 - \
@@ -522,7 +544,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     state = json.load(handle)
 if (
     state["phase"] != "ABORTING"
-    or state["revision"] != 4
+    or state["revision"] != 10
     or state["operation"] is not None
     or [
         item["docker_secret_id"]
@@ -530,14 +552,22 @@ if (
     ] != [sys.argv[4], sys.argv[3], sys.argv[2]]
     or state["authorities"] != [
         {
+            "control_generation": "c-1123456789abcdef0123",
+            "control_image": "vp-ffmpeg-worker-python:deploy-1123456789ab",
             "generation": "901",
             "kind": "runtime",
+            "operator_reference": "control/c-1123456789abcdef0123/worker-registration-operator-database-url",
             "service": "vp-ffmpeg-worker-go-swarm",
+            "state": "provisioned",
         },
         {
+            "control_generation": "c-1123456789abcdef0123",
+            "control_image": "vp-ffmpeg-worker-python:deploy-1123456789ab",
             "generation": "c-1123456789abcdef0123",
             "kind": "control",
+            "operator_reference": "control/c-1123456789abcdef0123/worker-registration-operator-database-url",
             "service": "vp-worker-control",
+            "state": "provisioned",
         },
     ]
 ):
@@ -553,7 +583,7 @@ PY
 
   intent="$(
     transaction_cli intent-prepared-secret-removal \
-      "$transaction_root" 18 4 "$worker_admission_id"
+      "$transaction_root" 18 10 "$worker_admission_id"
   )"
   operation_id="$(
     python3 -c \
@@ -580,7 +610,7 @@ PY
   before_wrong_complete="$(shasum -a 256 \
     "$transaction_root/transactions/active.json")"
   if transaction_cli complete-prepared-secret-removal \
-    "$transaction_root" 18 5 operation-00000000000000000000000000000000 \
+    "$transaction_root" 18 11 operation-00000000000000000000000000000000 \
     >/dev/null 2>&1; then
     echo 'FAIL: abort core accepted the wrong operation identity' >&2
     exit 1
@@ -588,9 +618,9 @@ PY
   [[ "$(shasum -a 256 "$transaction_root/transactions/active.json")" \
     == "$before_wrong_complete" ]]
   transaction_cli complete-prepared-secret-removal \
-    "$transaction_root" 18 5 "$operation_id" >/dev/null
+    "$transaction_root" 18 11 "$operation_id" >/dev/null
 
-  revision=6
+  revision=12
   for secret_id in "$worker_database_id" "$control_id"; do
     intent="$(
       transaction_cli intent-prepared-secret-removal \
@@ -608,12 +638,12 @@ PY
   done
 
   transaction_cli complete-abort-authority \
-    "$transaction_root" 18 10 runtime \
+    "$transaction_root" 18 16 runtime \
     vp-ffmpeg-worker-go-swarm 901 >/dev/null
   transaction_cli complete-abort-authority \
-    "$transaction_root" 18 11 control \
+    "$transaction_root" 18 17 control \
     vp-worker-control c-1123456789abcdef0123 >/dev/null
-  transaction_cli finish-abort "$transaction_root" 18 12 >/dev/null
+  transaction_cli finish-abort "$transaction_root" 18 18 >/dev/null
   if transaction_cli begin \
     "$transaction_root" 18 \
     "$commit" "$backend_image" "$go_image" replacement \
@@ -621,7 +651,7 @@ PY
     echo 'FAIL: unarchived DONE transaction allowed a new candidate' >&2
     exit 1
   fi
-  done_path="$(transaction_cli archive "$transaction_root" 18 13)"
+  done_path="$(transaction_cli archive "$transaction_root" 18 19)"
   [[ -f "$done_path" && ! -e "$transaction_root/transactions/active.json" ]]
   python3 - "$done_path" <<'PY'
 import json
@@ -634,6 +664,10 @@ if (
     or document["outcome"] != "aborted"
     or document["prepared_secrets"]
     or document["operation"] is not None
+    or any(
+        authority["state"] != "revoked"
+        for authority in document["authorities"]
+    )
     or document["abort"] != {
         "authorities": [],
         "reason": "preparing_failed",
@@ -645,6 +679,159 @@ PY
     "$transaction_root" 18 \
     "$commit" "$backend_image" "$go_image" replacement \
     legacy_no_control <<<"$credential_records" >/dev/null
+  exec 18>&-
+)
+
+(
+  transaction_helper="$ROOT_DIR/deploy/swarm/worker-admission-transaction.py"
+  transaction_root="$TEST_ROOT/authority-wal/state/vp-worker-admission"
+  mkdir -p "$transaction_root"
+  chmod 0700 "$transaction_root"
+  transaction_cli() {
+    python3 "$transaction_helper" "$@"
+  }
+
+  lock_path="$(transaction_cli lock-prepare "$transaction_root")"
+  exec 18<>"$lock_path"
+  transaction_cli lock-acquire "$transaction_root" 18 >/dev/null
+  credentials=()
+  principals=(
+    vp_deploy_migrator
+    vp_deploy_read
+    vp_control_role_owner
+    vp_runtime_role_owner
+  )
+  for index in 0 1 2 3; do
+    credential="$TEST_ROOT/authority-wal/credential-$index"
+    printf 'postgresql://authority-%s:credential@database/videoprocess\n' \
+      "$index" >"$credential"
+    chmod 0400 "$credential"
+    credentials+=("$credential")
+  done
+  credential_records="$(
+    transaction_cli validate-credentials \
+      "${credentials[0]}" "${principals[0]}" \
+      "${credentials[1]}" "${principals[1]}" \
+      "${credentials[2]}" "${principals[2]}" \
+      "${credentials[3]}" "${principals[3]}"
+  )"
+  commit=4123456789abcdef0123456789abcdef01234567
+  control_generation=c-${commit:0:20}
+  control_image="vp-ffmpeg-worker-python:deploy-${commit:0:12}"
+  operator_reference="control/$control_generation/worker-registration-operator-database-url"
+  transaction_cli begin \
+    "$transaction_root" 18 \
+    "$commit" "vp-backend:deploy-${commit:0:12}" \
+    "vp-ffmpeg-worker-go:deploy-${commit:0:12}" "$commit" \
+    legacy_no_control <<<"$credential_records" >/dev/null
+  before_wrong_control_image="$(
+    shasum -a 256 "$transaction_root/transactions/active.json"
+  )"
+  if transaction_cli record-authority-intent \
+    "$transaction_root" 18 runtime vp-ffmpeg-worker-go-swarm 999 \
+    "alternate-control:deploy-${commit:0:12}" \
+    "$control_generation" "$operator_reference" >/dev/null 2>&1; then
+    echo 'FAIL: authority WAL accepted an alternate control image' >&2
+    exit 1
+  fi
+  [[ "$(shasum -a 256 "$transaction_root/transactions/active.json")" \
+    == "$before_wrong_control_image" ]]
+
+  authority_services=(
+    vp-worker-control
+    vp-ffmpeg-worker-go-swarm
+    vp-ffmpeg-worker-gpu-swarm
+    vp-vision-worker-swarm
+    vp-youtube-publisher-swarm
+  )
+  authority_generations=(
+    "$control_generation"
+    921
+    922
+    923
+    924
+  )
+  for index in 0 1 2 3 4; do
+    kind=runtime
+    [[ "$index" -eq 0 ]] && kind=control
+    transaction_cli record-authority-intent \
+      "$transaction_root" 18 \
+      "$kind" "${authority_services[$index]}" \
+      "${authority_generations[$index]}" \
+      "$control_image" "$control_generation" "$operator_reference" \
+      >/dev/null
+  done
+  transaction_cli mark-authority-provisioning \
+    "$transaction_root" 18 runtime \
+    "${authority_services[1]}" "${authority_generations[1]}" >/dev/null
+  transaction_cli mark-authority-provisioning \
+    "$transaction_root" 18 runtime \
+    "${authority_services[2]}" "${authority_generations[2]}" >/dev/null
+  transaction_cli mark-authority-provisioned \
+    "$transaction_root" 18 runtime \
+    "${authority_services[2]}" "${authority_generations[2]}" >/dev/null
+
+  transaction_cli begin-abort \
+    "$transaction_root" 18 8 preparing_failed >/dev/null
+  transaction_cli list-abort "$transaction_root" 18 \
+    >"$TEST_ROOT/authority-wal/abort.json"
+  python3 - "$TEST_ROOT/authority-wal/abort.json" \
+    "$control_image" "$control_generation" "$operator_reference" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    state = json.load(handle)
+authorities = state["authorities"]
+if (
+    state["phase"] != "ABORTING"
+    or state["prepared_secrets"]
+    or len(authorities) != 5
+    or {item["state"] for item in authorities}
+    != {"planned", "provisioning", "provisioned"}
+    or any(item["control_image"] != sys.argv[2] for item in authorities)
+    or any(item["control_generation"] != sys.argv[3] for item in authorities)
+    or any(item["operator_reference"] != sys.argv[4] for item in authorities)
+):
+    raise SystemExit("authority WAL did not preserve zero-secret intents")
+PY
+  if transaction_cli finish-abort "$transaction_root" 18 9 \
+    >/dev/null 2>&1; then
+    echo 'FAIL: authority WAL archived without revoke evidence' >&2
+    exit 1
+  fi
+
+  revision=9
+  for index in 4 3 2 1 0; do
+    kind=runtime
+    [[ "$index" -eq 0 ]] && kind=control
+    transaction_cli complete-abort-authority \
+      "$transaction_root" 18 "$revision" \
+      "$kind" "${authority_services[$index]}" \
+      "${authority_generations[$index]}" >/dev/null
+    revision=$((revision + 1))
+  done
+  transaction_cli finish-abort \
+    "$transaction_root" 18 "$revision" >/dev/null
+  revision=$((revision + 1))
+  done_path="$(
+    transaction_cli archive "$transaction_root" 18 "$revision"
+  )"
+  python3 - "$done_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+if (
+    document["phase"] != "DONE"
+    or document["outcome"] != "aborted"
+    or len(document["authorities"]) != 5
+    or any(item["state"] != "revoked" for item in document["authorities"])
+    or document["abort"]["authorities"]
+):
+    raise SystemExit("authority WAL lost completion evidence")
+PY
   exec 18>&-
 )
 
