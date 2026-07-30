@@ -167,6 +167,18 @@ The architectural correction is to run control one-shots as the caller UID/GID
 on a read-only root filesystem with narrow operation-owned output directories,
 never recursively chown caller state, and to pin the janitor volume with a
 transaction-owned holder container through service/task acquisition.
+Task 4B/4C Worker Track A: fix round 4/5 at f713737 left both prior Important
+findings open and introduced a third: production wrappers still run
+path-following mkdir/chmod before the no-follow guard, SIGTERM leaves durable
+copies of privileged database credentials and sentinels, and the holder
+validator rejects the real CUDA image's inherited entrypoint.
+Task 4B/4C Worker Track A: minor (deferred): the real named-volume prune probe
+omits `--all`, so only direct remove/recreate currently proves pinning.
+Task 4B/4C Worker Track A: fix round 5/5 in progress. Final architecture:
+descriptor-relative no-follow creation owns every prospective bind path;
+database credentials stream over container stdin into tmpfs instead of being
+copied below durable admission state; holder creation explicitly clears and
+then production-validates the inherited image entrypoint.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
