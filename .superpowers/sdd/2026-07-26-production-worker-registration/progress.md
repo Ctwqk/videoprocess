@@ -391,6 +391,22 @@ and full rollback contract pass locally. The 19:45 and 20:00 app crons observed
 `94485ae` but failed closed while CI was incomplete, so production remains on
 `e51240f`. The fifth unlisted canary remains unused pending publication, CI,
 automatic deployment, and preflight.
+Task 4B/4C Deploy Track B stage 2: the full-history CI correction was published
+as `4f774ee977ea928e0614c63454f8ed9d1a273d72`. Actions run `31970020708`
+passed Go, frontend, backend/migrations, the workflow and deploy-sync contracts,
+worker admission deployment and rollback, and both staging janitor contracts.
+It then exited 3 at the worker Redis marker contract. Exact Linux reproduction
+showed the launcher correctly passed immutable network ID
+`vp-pipeline-network-id`, while fake Docker still asserted the mutable name
+`vp-pipeline-net`; the same test later already required the ID. Bash 5 exited
+on the stale assertion, while the macOS Bash 3.2 context had hidden it. The fake
+now requires the ID, and the test supports `KEEP_TEST_ROOT` diagnostics like the
+other long contracts. The complete marker contract passes in Linux Bash 5.1
+and macOS Bash 3.2; remaining Linux soak-watch, production-smoke, and macOS-path
+contracts plus local canary safeguards also pass. The 20:30 and 20:45 app crons
+observed `4f774ee` but failed closed while CI was incomplete, so production
+remains on `e51240f`. The fifth unlisted canary remains unused pending
+publication, CI, automatic deployment, and preflight.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak

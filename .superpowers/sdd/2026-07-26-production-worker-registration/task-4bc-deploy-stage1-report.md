@@ -1976,3 +1976,47 @@ The 19:45Z and 20:00Z app cron attempts observed `94485ae` and stopped at the
 in-progress CI gate before service mutation. Production remains on `e51240f`,
 PDS remains on `6b8f8be32399...`, and the fifth unlisted canary approval remains
 unused pending corrected CI, verified automatic deployment, and preflight.
+
+### Fifth Automatic Deployment Observation
+
+The full-history deployment-contract correction was published as
+`4f774ee977ea928e0614c63454f8ed9d1a273d72`. Actions run `31970020708`
+successfully completed Go, frontend, backend/migrations, the workflow and
+deploy-sync contracts, worker admission deployment and rollback, and both
+staging object janitor contracts. This proved the historical schema-1 helper was
+available and the rollback contract executed to completion.
+
+The next worker Redis marker contract exited 3 without a diagnostic. Exact
+reproduction in the production worker image's Linux Bash 5.1 runtime reported
+`mode=readiness code=job_create_failed`. Preserved fake-Docker evidence showed
+the launcher correctly used immutable Swarm network ID
+`vp-pipeline-network-id`. The fake service-create parser still asserted the
+mutable network name `vp-pipeline-net`, even though a later assertion in the
+same test already required the ID. Linux Bash 5 honored `errexit` for that
+failed assertion; the macOS Bash 3.2 execution context had continued and hidden
+the contradiction.
+
+The fake now requires the immutable network ID. The test also uses the same
+optional `KEEP_TEST_ROOT` preservation pattern as the other long deployment
+contracts, so future silent fixture failures retain exact evidence. Fresh
+verification:
+
+```text
+Linux Bash 5.1: bash tests/test_worker_redis_marker_control.sh
+  PASS: worker Redis marker control tests passed
+macOS Bash 3.2: bash tests/test_worker_redis_marker_control.sh
+  PASS: worker Redis marker control tests passed
+Linux Bash 5.1: bash tests/test_channelops_soak_watch.sh
+  PASS
+Linux Bash 5.1: bash tests/test_vp_production_smoke_script.sh
+  PASS
+Linux Bash 5.1: bash tests/test_macos_deploy_paths.sh
+  PASS
+local dev environment: bash tests/test_vp_unlisted_canary_scripts.sh
+  PASS
+```
+
+The 20:30Z and 20:45Z app cron attempts observed `4f774ee` and stopped at the
+in-progress CI gate before service mutation. Production remains on `e51240f`,
+PDS remains on `6b8f8be32399...`, and the fifth unlisted canary approval remains
+unused pending corrected CI, verified automatic deployment, and preflight.

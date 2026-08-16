@@ -16,7 +16,16 @@ FAKE_CRONTAB_WRITE_COUNT="$TEST_ROOT/crontab-write-count"
 CONFIG_FILE="$TEST_ROOT/control.conf"
 STATE_DIR="$TEST_ROOT/state"
 LOCK_DIR="$TEST_ROOT/locks"
-trap 'status=$?; rm -rf "$TEST_ROOT"; exit "$status"' EXIT
+cleanup_test_root() {
+  local status=$?
+  if [[ "${KEEP_TEST_ROOT:-false}" == true ]]; then
+    printf 'preserved test root: %s\n' "$TEST_ROOT" >&2
+  else
+    rm -rf "$TEST_ROOT"
+  fi
+  exit "$status"
+}
+trap cleanup_test_root EXIT
 
 fail() {
   echo "FAIL: $*" >&2
@@ -222,7 +231,8 @@ if [[ "${1:-} ${2:-}" == "service create" ]]; then
         ;;
     esac
   done
-  [[ "$job_mode" == replicated-job && "$network" == vp-pipeline-net ]]
+  [[ "$job_mode" == replicated-job \
+    && "$network" == vp-pipeline-network-id ]]
   printf '%s\n' \
     "2|$mode|$generation|$image|replicated-job|$replicas|$replicas|$restart|$placement|vp-pipeline-network-id|$database_secret:worker-marker-database-url:10001:10001:256,$redis_secret:worker-marker-redis-url:10001:10001:256|$envs|${command_args%,}" \
     >"$(service_path "$name" identity)"
