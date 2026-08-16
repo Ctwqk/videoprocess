@@ -341,6 +341,22 @@ the pipeline correction (141 to 0), and fresh local deploy-sync, scoped Ruff,
 shell syntax, backend pytest, and `git diff --check` pass. PostgreSQL 16
 verification remains delegated to the next CI run. The fifth unlisted canary
 remains unused.
+Task 4B/4C Deploy Track B stage 2: the compatibility fixes were committed as
+`a3944c8fda042ecd8c54047c758c2e601e2e1253` and fast-forwarded to GitHub
+`main`. Actions run `31962299427` passed backend/migrations, Go, and frontend;
+the deployment-contract job then exposed one Linux-only assertion-helper bug.
+The parent-death safety behavior itself passed: the supervisor and producer
+children exited, a fresh owner acquired the lock and reconciled stale state,
+and no Docker call occurred. Only the FD audit rendered absent descriptors as
+an empty string on `/proc`, while the cross-platform contract expected `-`.
+`process_fd_access` now distinguishes an absent `/proc/<pid>/fdinfo/<fd>` from
+an existing unreadable descriptor and returns the same `-` sentinel used by
+the Darwin `lsof` path. A dedicated closed-FD assertion prevents regression.
+Linux focused evidence reports closed/read/write as `-/r/w`; the full macOS
+worker-admission contract, shell syntax, and `git diff --check` pass. The 17:45
+and 18:00 app crons both observed `a3944c8` but failed closed while CI was not
+successful, so production remains on `e51240f`. The fifth unlisted canary
+remains unused pending the corrected CI run and observed automatic deployment.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak

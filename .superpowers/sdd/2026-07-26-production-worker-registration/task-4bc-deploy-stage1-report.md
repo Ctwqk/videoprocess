@@ -1848,3 +1848,40 @@ Fresh local evidence passes the full deploy-sync contract, changed-shell syntax,
 scoped Ruff, backend pytest (`1426 passed, 125 skipped, 17 warnings`), and
 `git diff --check`. The next GitHub Actions run is the required PostgreSQL 16
 verification. The fifth unlisted canary remains approved and unused.
+
+### Second Automatic Deployment Observation
+
+The CI compatibility corrections were published as
+`a3944c8fda042ecd8c54047c758c2e601e2e1253`. Actions run `31962299427`
+successfully completed backend/migrations, Go, and frontend. The remaining
+deployment-contract job failed in the Linux parent-death audit after all
+production safety outcomes had passed: the supervisor and producer children
+were gone, a fresh process acquired the transaction lock, stale state was
+reconciled, and Docker had not been called. Its diagnostic was
+`fd=r// child_audit=false`.
+
+The cause was limited to the test's cross-platform FD inspection helper. On
+Darwin, a missing descriptor is rendered as `-` by the `lsof` branch. On Linux,
+the old `/proc` branch returned no output when the descriptor file did not
+exist, even though the assertion expected the same `-` sentinel. The helper now
+reports `-` only when the process `fdinfo` directory exists and that descriptor
+does not; an existing unreadable descriptor still fails closed. A dedicated
+closed-descriptor assertion covers the contract.
+
+Fresh evidence after the correction:
+
+```text
+Linux process_fd_access focused contract
+  PASS: closed=- reader=r writer=w
+bash tests/test_worker_admission_deploy.sh
+  PASS: worker admission deployment contract tests passed
+bash -n tests/test_worker_admission_deploy.sh
+  PASS
+git diff --check
+  PASS
+```
+
+The 17:45Z and 18:00Z app cron attempts both detected `a3944c8` and stopped at
+the GitHub Actions gate before service mutation. Production therefore remains
+on `e51240f`. The fifth unlisted canary approval remains unused until corrected
+CI succeeds and the following 150/127 automatic deployment is verified.

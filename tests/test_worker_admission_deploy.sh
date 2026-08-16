@@ -1522,11 +1522,17 @@ for parent_death_boundary in release-entry verified-before-token; do
   process_fd_access() {
     local process_id="$1"
     local descriptor="$2"
-    if [[ -r "/proc/$process_id/fdinfo/$descriptor" ]]; then
+    local fdinfo_dir="/proc/$process_id/fdinfo"
+    local fdinfo_path="$fdinfo_dir/$descriptor"
+    if [[ -d "$fdinfo_dir" && ! -e "$fdinfo_path" ]]; then
+      printf -- '-\n'
+      return 0
+    fi
+    if [[ -r "$fdinfo_path" ]]; then
       local raw_flags
       raw_flags="$(
         awk '$1 == "flags:" { print $2 }' \
-          "/proc/$process_id/fdinfo/$descriptor"
+          "$fdinfo_path"
       )" || return 1
       [[ "$raw_flags" =~ ^[0-7]+$ ]] || return 1
       case "$((8#$raw_flags & 3))" in
@@ -1559,6 +1565,14 @@ for parent_death_boundary in release-entry verified-before-token; do
     fi
     return 1
   }
+
+  fd_audit_pid="$(exec sh -c 'printf "%s\n" "$PPID"')"
+  exec 251>&-
+  closed_fd_access="$(process_fd_access "$fd_audit_pid" 251 || true)"
+  if [[ "$closed_fd_access" != - ]]; then
+    echo 'FAIL: process_fd_access must report a closed descriptor as absent' >&2
+    exit 1
+  fi
 
   fresh_owner_reconcile() {
     (
