@@ -1977,6 +1977,46 @@ in-progress CI gate before service mutation. Production remains on `e51240f`,
 PDS remains on `6b8f8be32399...`, and the fifth unlisted canary approval remains
 unused pending corrected CI, verified automatic deployment, and preflight.
 
+### Sixth Automatic Deployment Observation
+
+The marker network-identity fixture correction was published as
+`e5688e5ec4129e5d4ef211ad7b26d09408ea5daf`. Actions run `31972077161`
+completed Go and frontend successfully. Its backend/migrations job failed in
+the otherwise unchanged Redis integration test
+`TestRegistrationRunDispatchesPartialPreferredClaimBeforeVisitorError/ticker`:
+
+```text
+Run did not reach forced visitor failure
+```
+
+The test starts a one-second affinity ticker but used a 1.6-second total context
+deadline. On this runner, the forced second XRANGE visitor call landed just
+outside that narrow scheduling and Redis-I/O budget. Prior runs passed the same
+test, and this publication changed only the marker shell fixture.
+
+A simple deadline increase is not correct: a three-second probe consistently
+allowed the second ticker to process the remaining message, violating the
+test's exact one-message partial-dispatch assertion. The test is now
+event-driven. After the hook forces the second XRANGE failure, its first XACK
+signals that the earlier partial claim was fully dispatched. The test cancels
+`Run` at that exact point, while retaining a five-second deadlock timeout and
+the assertions that initial reclaim fails before one second and ticker reclaim
+fails after 900 milliseconds.
+
+Fresh isolated Redis evidence:
+
+```text
+go test -count=5 -run TestRegistrationRunDispatchesPartialPreferredClaimBeforeVisitorError ./internal/worker
+  PASS: 5 consecutive runs
+go test -count=1 ./internal/worker
+  PASS
+```
+
+The 21:00Z app cron observed `e5688e5` and stopped at the in-progress CI gate
+before service mutation. Production remains on `e51240f`, PDS remains on
+`6b8f8be32399...`, and the fifth unlisted canary approval remains unused
+pending corrected CI, verified automatic deployment, and preflight.
+
 ### Fifth Automatic Deployment Observation
 
 The full-history deployment-contract correction was published as

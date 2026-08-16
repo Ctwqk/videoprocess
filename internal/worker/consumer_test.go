@@ -178,6 +178,7 @@ type pendingVisitorFailureHook struct {
 	xacks       atomic.Int32
 	failed      atomic.Bool
 	failedAt    atomic.Int64
+	partialDone chan struct{}
 }
 
 func (h *pendingVisitorFailureHook) DialHook(next redis.DialHook) redis.DialHook {
@@ -204,7 +205,9 @@ func (h *pendingVisitorFailureHook) ProcessHook(
 				return errors.New("forced later XCLAIM visitor failure")
 			}
 		case "xack":
-			h.xacks.Add(1)
+			if h.xacks.Add(1) == 1 && h.failed.Load() && h.partialDone != nil {
+				close(h.partialDone)
+			}
 		}
 		return next(ctx, cmd)
 	}
@@ -4648,7 +4651,10 @@ func TestRegistrationRunDispatchesPartialPreferredClaimBeforeVisitorError(
 				time.Sleep(600 * time.Millisecond)
 			}
 
-			hook := &pendingVisitorFailureHook{failCommand: "xrange"}
+			hook := &pendingVisitorFailureHook{
+				failCommand: "xrange",
+				partialDone: make(chan struct{}),
+			}
 			client.AddHook(hook)
 			lease := registrationLossTestLease()
 			taskStore := &registeredTaskStoreStub{lease: lease}
@@ -4671,19 +4677,24 @@ func TestRegistrationRunDispatchesPartialPreferredClaimBeforeVisitorError(
 				handler,
 			)
 			preferred.BlockTimeout = 20 * time.Millisecond
-			runTimeout := 700 * time.Millisecond
-			if phase == "ticker" {
-				runTimeout = 1600 * time.Millisecond
-			}
 			runContext, cancelRun := context.WithTimeout(
 				context.Background(),
-				runTimeout,
+				5*time.Second,
 			)
 			runStarted := time.Now()
-			runErr := preferred.Run(runContext)
+			runResult := make(chan error, 1)
+			go func() {
+				runResult <- preferred.Run(runContext)
+			}()
+			select {
+			case <-hook.partialDone:
+				cancelRun()
+			case <-runContext.Done():
+			}
+			runErr := <-runResult
 			cancelRun()
-			if !errors.Is(runErr, context.DeadlineExceeded) {
-				t.Fatalf("Run error = %v; want deadline exceeded", runErr)
+			if !errors.Is(runErr, context.Canceled) {
+				t.Fatalf("Run error = %v; want cancellation after partial dispatch", runErr)
 			}
 			if !hook.failed.Load() {
 				t.Fatal("Run did not reach forced visitor failure")

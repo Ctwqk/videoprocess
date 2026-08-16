@@ -407,6 +407,22 @@ contracts plus local canary safeguards also pass. The 20:30 and 20:45 app crons
 observed `4f774ee` but failed closed while CI was incomplete, so production
 remains on `e51240f`. The fifth unlisted canary remains unused pending
 publication, CI, automatic deployment, and preflight.
+Task 4B/4C Deploy Track B stage 2: the marker fixture correction was published
+as `e5688e5ec4129e5d4ef211ad7b26d09408ea5daf`. Actions run `31972077161`
+passed Go and frontend, but backend/migrations hit an intermittent timing edge
+in `TestRegistrationRunDispatchesPartialPreferredClaimBeforeVisitorError`:
+the one-second ticker had only a 1.6-second total deadline and the GitHub runner
+did not reach the forced second XRANGE before cancellation. Prior CI runs had
+passed the unchanged test. A simple three-second extension was rejected because
+repeat testing proved it permits the second ticker to dispatch both messages.
+The hook now signals only after the forced visitor failure and the first partial
+claim's XACK; the test then cancels `Run`, retaining a five-second safety timeout
+and its initial-versus-ticker delay assertions without racing the second tick.
+The exact test passes five consecutive isolated Redis runs and the complete
+`internal/worker` package passes. The 21:00 app cron observed `e5688e5` but
+failed closed while CI was incomplete, so production remains on `e51240f`. The
+fifth unlisted canary remains unused pending publication, CI, automatic
+deployment, and preflight.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak
