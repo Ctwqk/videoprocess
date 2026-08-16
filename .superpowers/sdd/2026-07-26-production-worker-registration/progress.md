@@ -322,6 +322,25 @@ contract. Full backend Ruff/mypy still expose repository-wide baseline findings
 (15 lint, 62 type), with none in the modified Python files. The fifth unlisted
 canary remains unused pending commit, push, and observed 150/127 auto-deployment;
 no production or YouTube mutation has occurred in this hardening round.
+Task 4B/4C Deploy Track B stage 2: the verified candidate was committed as
+`5c106609a1c196bfe8dd02f941fa217d7033529d` and fast-forwarded to GitHub
+`main`. The independent PDS cron automatically fetched that VideoProcess commit
+at 17:07Z while correctly leaving the unchanged PDS service at
+`6b8f8be32399...`. The 17:15Z app cron also detected `5c10660` but failed closed
+before service mutation because GitHub Actions run `31960451359` concluded
+failure; production VP services therefore remained on `e51240f`.
+Task 4B/4C Deploy Track B stage 2: CI investigation found test-contract drift,
+not a production deploy bypass. GNU grep returns SIGPIPE under `pipefail` when
+the long deploy contract uses `grep | head`; all first-line selectors now use
+`sed -n '1p'`. Three migration tests now compare Alembic head with the deploy
+CLI's `EXPECTED_MIGRATION_HEAD` instead of stale revision 033. Two PostgreSQL
+race tests now bind the real durable dispatch reconciler to their isolated
+session factory and provide its idempotent Redis `eval` interface, rather than
+letting it connect to default localhost:5435. Linux minimal reproduction proves
+the pipeline correction (141 to 0), and fresh local deploy-sync, scoped Ruff,
+shell syntax, backend pytest, and `git diff --check` pass. PostgreSQL 16
+verification remains delegated to the next CI run. The fifth unlisted canary
+remains unused.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak

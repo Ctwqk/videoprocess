@@ -2703,13 +2703,13 @@ done
 grep -Fq "docker|service ps $VISION_SAFETY_JOB_ID " "$CALLS"
 grep -Fq "docker|service ps $VISION_RECONCILE_JOB_ID " "$CALLS"
 worker_admission_commit_line="$(
-  grep -nF 'worker-admission|commit' "$CALLS" | head -1 | cut -d: -f1
+  grep -nF 'worker-admission|commit' "$CALLS" | sed -n '1p' | cut -d: -f1
 )"
 worker_marker_commit_line="$(
-  grep -nF 'worker-marker|commit' "$CALLS" | head -1 | cut -d: -f1
+  grep -nF 'worker-marker|commit' "$CALLS" | sed -n '1p' | cut -d: -f1
 )"
 worker_control_commit_line="$(
-  grep -nF 'worker-control|commit' "$CALLS" | head -1 | cut -d: -f1
+  grep -nF 'worker-control|commit' "$CALLS" | sed -n '1p' | cut -d: -f1
 )"
 if [[ -z "$worker_admission_commit_line" \
   || -z "$worker_marker_commit_line" \
@@ -2748,13 +2748,13 @@ fi
 
 vision_cutover_gate_line="$(
   grep -nF 'log|vision cutover gate verified: CLOSED and idle' "$CALLS" \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1 \
     || true
 )"
 first_service_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 if [[ -z "$vision_cutover_gate_line" \
@@ -2768,7 +2768,7 @@ runner_identity_update="$(
   grep -F 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-channelops-runner-go:deploy-0123456789ab' \
     | grep -F 'vp-channel-agent-runner-swarm' \
-    | head -n 1
+    | sed -n '1p'
 )"
 if [[ "$runner_identity_update" != *'--env-rm CHANNELOPS_RUNNER_ID'* \
   || "$runner_identity_update" != *'--env-add CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1'* ]]; then
@@ -2788,28 +2788,28 @@ python_worker_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-ffmpeg-worker-python:deploy-0123456789ab' \
     | grep -F 'vp-ffmpeg-worker-gpu-swarm' \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 vision_worker_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-ffmpeg-worker-python:deploy-0123456789ab' \
     | grep -F 'vp-vision-worker-swarm' \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 publisher_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-ffmpeg-worker-python:deploy-0123456789ab' \
     | grep -F 'vp-youtube-publisher-swarm' \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 python_listener_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-backend-api:deploy-0123456789ab' \
     | grep -F 'vp-autoflow-api-swarm' \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 if [[ -z "$python_worker_update_line" \
@@ -2825,29 +2825,29 @@ fi
 
 legacy_vision_remove_line="$(
   grep -nF "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS" \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 vision_running_line="$(
   grep -nF 'running|vp-vision-worker-swarm' "$CALLS" \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 vision_readiness_probe_line="$(
   grep -nF "$vision_readiness_probe" "$CALLS" \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 vision_consumer_cutover_line="$(
   grep -nF 'log|vision consumer reconciliation verified' "$CALLS" \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1 \
     || true
 )"
 final_vision_safety_job_line="$(
   grep -nF 'docker|service create' "$CALLS" \
     | grep -F -- '--label vp.purpose=final-safety' \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1 \
     || true
 )"
@@ -2855,7 +2855,7 @@ final_vision_safety_gate_line="$(
   grep -nF \
     'log|final vision cutover gate verified immediately before retirement' \
     "$CALLS" \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1 \
     || true
 )"
@@ -2889,10 +2889,10 @@ assert_managed_worker_gate_sequence() {
   local placement_line
   local container_line
   local exec_line
-  running_line="$(grep -nF "running|$service" "$CALLS" | head -1 | cut -d: -f1)"
-  placement_line="$(grep -nF "$(worker_service_ps_call "$service")" "$CALLS" | head -1 | cut -d: -f1)"
-  container_line="$(grep -nF "docker|container ls --filter label=com.docker.swarm.service.name=$service" "$CALLS" | head -1 | cut -d: -f1)"
-  exec_line="$(grep -nF "$readiness_probe" "$CALLS" | head -1 | cut -d: -f1)"
+  running_line="$(grep -nF "running|$service" "$CALLS" | sed -n '1p' | cut -d: -f1)"
+  placement_line="$(grep -nF "$(worker_service_ps_call "$service")" "$CALLS" | sed -n '1p' | cut -d: -f1)"
+  container_line="$(grep -nF "docker|container ls --filter label=com.docker.swarm.service.name=$service" "$CALLS" | sed -n '1p' | cut -d: -f1)"
+  exec_line="$(grep -nF "$readiness_probe" "$CALLS" | sed -n '1p' | cut -d: -f1)"
   if [[ -z "$running_line" || -z "$placement_line" || -z "$container_line" || -z "$exec_line" \
     || "$running_line" -ge "$placement_line" \
     || "$placement_line" -ge "$container_line" \
@@ -3161,7 +3161,7 @@ FAIL_WORKER_READINESS_SERVICE=
 assert_deploy_rejected_by_readiness missing-container
 readiness_rollback_line="$(
   grep -nF 'log|VideoProcess service apply failed; restoring prior images with fresh admission' \
-    "$CALLS" | head -1 | cut -d: -f1
+    "$CALLS" | sed -n '1p' | cut -d: -f1
 )"
 if sed -n "1,$((readiness_rollback_line - 1))p" "$CALLS" \
   | grep -Eq "docker\|exec\||docker\|container ls --filter label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE|docker\|rm -f $LEGACY_VISION_CONTAINER_ID"; then
@@ -3174,7 +3174,7 @@ WORKER_READINESS_CONTAINER_MODE=duplicate-then-normal
 assert_deploy_rejected_by_readiness duplicate-container
 readiness_rollback_line="$(
   grep -nF 'log|VideoProcess service apply failed; restoring prior images with fresh admission' \
-    "$CALLS" | head -1 | cut -d: -f1
+    "$CALLS" | sed -n '1p' | cut -d: -f1
 )"
 if sed -n "1,$((readiness_rollback_line - 1))p" "$CALLS" \
   | grep -Eq "docker\|exec\||docker\|container ls --filter label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE|docker\|rm -f $LEGACY_VISION_CONTAINER_ID"; then
@@ -3302,12 +3302,12 @@ if deploy_worker_review_fixture gpu-node-label-write-failure \
 fi
 gpu_node_update_line="$(
   grep -nF 'docker|node update --label-add vp.gpu=true ccttww-lap' "$CALLS" \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 gpu_node_rollback_line="$(
   grep -nF 'log|VideoProcess service apply failed; restoring prior images with fresh admission' "$CALLS" \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 if [[ -z "$gpu_node_update_line" || -z "$gpu_node_rollback_line" \
@@ -3373,7 +3373,7 @@ gpu_normalized_update="$(
   grep -F 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-ffmpeg-worker-python:gpu-placement-normalization' \
     | grep -F "$VP_PYTHON_WORKER_SERVICE" \
-    | head -1
+    | sed -n '1p'
 )"
 if [[ -z "$gpu_normalized_update" ]]; then
   echo 'FAIL: normal GPU placement fixture did not issue a service update' >&2
@@ -3477,12 +3477,12 @@ fi
 gpu_failed_update_call="$(grep -F 'docker|service update' "$CALLS" \
   | grep -F -- "--image vp-ffmpeg-worker-python:deploy-${TEST_COMMIT:0:12}" \
   | grep -F "$VP_PYTHON_WORKER_SERVICE" \
-  | head -1)"
+  | sed -n '1p')"
 if [[ -z "$gpu_failed_update_call" ]]; then
   echo 'FAIL: GPU update failure fixture did not issue the attempted image update' >&2
   exit 1
 fi
-gpu_attempt_line="$(grep -nF "$gpu_failed_update_call" "$CALLS" | head -1 | cut -d: -f1)"
+gpu_attempt_line="$(grep -nF "$gpu_failed_update_call" "$CALLS" | sed -n '1p' | cut -d: -f1)"
 grep -Fq 'log|VideoProcess service apply failed; restoring prior images with fresh admission' "$CALLS"
 gpu_baseline_line="$(
   test_service_update_line_for_image \
@@ -3729,27 +3729,27 @@ cp "$TEST_ROOT/successful-vision-deploy-calls" "$CALLS"
 migration_run_line="$(
   grep -nF 'docker|run --rm' "$CALLS" \
     | grep -F 'python -m app.services.worker_deployment_cli migrate' \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 backend_migration_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
     | grep -F -- '--image vp-backend-api:deploy-0123456789ab' \
     | grep -F 'vp-autoflow-api-swarm' \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 migration_gate_line="$(
   grep -nF 'docker|run --rm' "$CALLS" \
     | grep -F 'python -m app.services.worker_deployment_cli verify-head' \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 runner_update_line="$(
   grep -nF 'docker|service update' "$CALLS" \
     | grep -F 'vp-channel-agent-runner-swarm' \
     | grep -F -- '--image vp-channelops-runner-go:deploy-0123456789ab' \
-    | head -1 \
+    | sed -n '1p' \
     | cut -d: -f1
 )"
 if [[ -z "$migration_run_line" \
@@ -3765,12 +3765,12 @@ fi
 migration_gate_call="$(
   grep -F 'docker|run --rm' "$CALLS" \
     | grep -F 'python -m app.services.worker_deployment_cli verify-head' \
-    | head -1
+    | sed -n '1p'
 )"
 migration_run_call="$(
   grep -F 'docker|run --rm' "$CALLS" \
     | grep -F 'python -m app.services.worker_deployment_cli migrate' \
-    | head -1
+    | sed -n '1p'
 )"
 migration_mount_source="$(
   python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' \
@@ -4326,12 +4326,12 @@ grep -Fq -- '--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/
 publisher_mount_remove_line="$(grep -nF 'docker|service update' "$CALLS" \
   | grep -F 'vp-youtube-publisher-swarm' \
   | grep -F -- '--mount-rm /data/storage' \
-  | head -n 1 \
+  | sed -n '1p' \
   | cut -d: -f1)"
 publisher_mount_add_line="$(grep -nF 'docker|service update' "$CALLS" \
   | grep -F 'vp-youtube-publisher-swarm' \
   | grep -F -- '--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' \
-  | head -n 1 \
+  | sed -n '1p' \
   | cut -d: -f1)"
 if [[ -z "$publisher_mount_remove_line" || -z "$publisher_mount_add_line" \
   || "$publisher_mount_remove_line" -ge "$publisher_mount_add_line" ]]; then
@@ -4389,8 +4389,8 @@ if printf '%s\n' "$publisher_calls" | grep -Eq -- '--mount(-add)? .*youtube_cred
   exit 1
 fi
 
-publisher_health_line="$(grep -nF 'health|vp-youtube-manager|http://10.0.0.150:18999/api/auth/status' "$CALLS" | head -n 1 | cut -d: -f1)"
-publisher_update_line="$(grep -nF 'vp-youtube-publisher-swarm' "$CALLS" | grep -F 'docker|service update' | head -n 1 | cut -d: -f1)"
+publisher_health_line="$(grep -nF 'health|vp-youtube-manager|http://10.0.0.150:18999/api/auth/status' "$CALLS" | sed -n '1p' | cut -d: -f1)"
+publisher_update_line="$(grep -nF 'vp-youtube-publisher-swarm' "$CALLS" | grep -F 'docker|service update' | sed -n '1p' | cut -d: -f1)"
 if [[ -z "$publisher_health_line" || -z "$publisher_update_line" || "$publisher_health_line" -ge "$publisher_update_line" ]]; then
   echo 'FAIL: publisher manager auth health must precede publisher updates' >&2
   exit 1
@@ -4634,7 +4634,7 @@ runner_rollback_call="$(
   grep -F 'docker|service update' "$CALLS" \
     | grep -F -- '--image baseline-vp-channel-agent-runner-swarm:stable' \
     | grep -F 'vp-channel-agent-runner-swarm' \
-    | head -1
+    | sed -n '1p'
 )"
 if [[ "$runner_rollback_call" != *'--update-order stop-first'* \
   || "$runner_rollback_call" != *'--env-add CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1'* \
@@ -4811,7 +4811,7 @@ fi
 pds_update="$(
   grep -F 'docker|service update' "$CALLS" \
     | grep -F -- "--image vp-pds:health-gated-test $(test_service_id vp-pds-swarm)" \
-    | head -n 1
+    | sed -n '1p'
 )"
 for expected_pds_update_arg in \
   '--constraint-rm node.hostname==CASPERs-Mac-mini' \
@@ -4835,8 +4835,8 @@ if [[ "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 
   echo 'FAIL: PDS starting state did not use bounded readiness retries' >&2
   exit 1
 fi
-pds_node_line="$(grep -nF 'docker|service ps vp-pds-swarm' "$CALLS" | head -n 1 | cut -d: -f1)"
-pds_remote_line="$(grep -nF 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS" | head -n 1 | cut -d: -f1)"
+pds_node_line="$(grep -nF 'docker|service ps vp-pds-swarm' "$CALLS" | sed -n '1p' | cut -d: -f1)"
+pds_remote_line="$(grep -nF 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS" | sed -n '1p' | cut -d: -f1)"
 if [[ -z "$pds_node_line" || -z "$pds_remote_line" || "$pds_node_line" -ge "$pds_remote_line" ]]; then
   echo 'FAIL: PDS node verification must precede remote container health' >&2
   exit 1
@@ -4945,13 +4945,13 @@ candidate_pds_update="$(
   grep -F 'docker|service update' "$CALLS" \
     | grep -F -- '--update-order start-first' \
     | grep -F -- "--image vp-pds:rollback-test $(test_service_id vp-pds-swarm)" \
-    | head -n 1
+    | sed -n '1p'
 )"
 rollback_pds_update="$(
   grep -F 'docker|service update' "$CALLS" \
     | grep -F -- '--update-order stop-first' \
     | grep -F -- "--image baseline-vp-pds-swarm:stable $(test_service_id vp-pds-swarm)" \
-    | head -n 1
+    | sed -n '1p'
 )"
 if [[ "$candidate_pds_update" != *'--health-cmd  --health-interval 10s'* \
   || "$rollback_pds_update" != *'--health-cmd  --health-interval 10s'* ]]; then

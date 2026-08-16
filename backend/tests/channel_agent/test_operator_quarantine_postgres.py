@@ -32,6 +32,9 @@ from app.services.job_execution_authority import (
     JobExecutionAuthorityBlocked,
     NodeExecutionClaim,
 )
+from app.services.registered_worker_event_receipt import (
+    RegisteredWorkerEventReceiptService,
+)
 from app.services.schedule_service import VIDEO_SCHEDULE_SERVICE, VideoScheduleState
 from app.services.youtube_upload_operations import (
     UploadOperationContext,
@@ -845,11 +848,23 @@ async def test_running_job_replay_redelivers_stranded_queued_root(
         async def xadd(self, stream_key, payload):
             dispatches.append((stream_key, payload))
 
+        async def eval(self, _script, numkeys, stream_key, _marker, *fields):
+            assert numkeys == 2
+            dispatches.append((stream_key, dict(zip(fields[::2], fields[1::2]))))
+            return f"{len(dispatches)}-0"
+
+        async def get(self, _marker):
+            return None
+
         async def aclose(self):
             return None
 
     monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
     monkeypatch.setattr("app.orchestrator.engine._redis", lambda: RecordingRedis())
+    monkeypatch.setattr(
+        "app.orchestrator.engine._worker_task_dispatches",
+        RegisteredWorkerEventReceiptService(factory),
+    )
 
     await JobEngine().start_job(job_id)
 
@@ -1648,6 +1663,16 @@ async def test_quarantine_between_initial_roots_does_not_revive_second_root(
         async def xadd(self, stream_key: str, payload: dict) -> None:
             self.dispatches.append((stream_key, payload))
 
+        async def eval(self, _script, numkeys, stream_key, _marker, *fields):
+            assert numkeys == 2
+            self.dispatches.append(
+                (stream_key, dict(zip(fields[::2], fields[1::2])))
+            )
+            return f"{len(self.dispatches)}-0"
+
+        async def get(self, _marker):
+            return None
+
         async def aclose(self) -> None:
             return None
 
@@ -1671,6 +1696,10 @@ async def test_quarantine_between_initial_roots_does_not_revive_second_root(
 
     monkeypatch.setattr("app.orchestrator.engine.async_session", factory)
     monkeypatch.setattr("app.orchestrator.engine._redis", lambda: redis)
+    monkeypatch.setattr(
+        "app.orchestrator.engine._worker_task_dispatches",
+        RegisteredWorkerEventReceiptService(factory),
+    )
     monkeypatch.setattr(
         job_engine,
         "_before_initial_node_launch_recheck",

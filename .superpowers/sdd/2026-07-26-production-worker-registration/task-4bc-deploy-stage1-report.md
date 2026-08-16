@@ -1817,3 +1817,34 @@ debt: 15 Ruff findings and 62 mypy findings, none in the modified Python files.
 The fifth unlisted canary approval remains unused. No push, remote deployment,
 Swarm mutation, YouTube upload, or publication mutation occurred before this
 closure checkpoint.
+
+### First Automatic Deployment Observation
+
+The final candidate was committed as `5c106609a1c196bfe8dd02f941fa217d7033529d`
+and fast-forwarded to GitHub `main`. At 17:07Z the independent PDS cron fetched
+the new VideoProcess checkout and correctly left the unchanged PDS repository
+and service at `6b8f8be32399...`. At 17:15Z the app/feature cron detected the
+same commit but stopped before any Swarm mutation because GitHub Actions run
+`31960451359` was complete with conclusion `failure`. All VP services remained
+on the prior `e51240f` image set; the gate was not bypassed.
+
+The CI evidence identified three test-contract compatibility issues:
+
+1. The long deploy-sync test used `grep | head` under `pipefail`. GNU grep exits
+   with SIGPIPE when `head` closes early, while the macOS run had passed. All
+   first-line selectors now use `sed -n '1p'`, which consumes the stream. A
+   Linux minimal reproducer changed from exit 141 to exit 0.
+2. Three PostgreSQL migration tests still asserted revision 033 after the
+   worker-registration migration advanced the deployment head to 034. They now
+   compare the migrated database with the deploy CLI's
+   `EXPECTED_MIGRATION_HEAD` contract.
+3. Two PostgreSQL race tests patched JobEngine's session factory but not its new
+   durable dispatch reconciler, which therefore attempted the default
+   localhost:5435 database. They now construct the real reconciler with the
+   same isolated test session factory and expose its idempotent Redis `eval`
+   contract.
+
+Fresh local evidence passes the full deploy-sync contract, changed-shell syntax,
+scoped Ruff, backend pytest (`1426 passed, 125 skipped, 17 warnings`), and
+`git diff --check`. The next GitHub Actions run is the required PostgreSQL 16
+verification. The fifth unlisted canary remains approved and unused.
