@@ -5,7 +5,16 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTENSION="$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 TEST_ROOT="$(mktemp -d)"
 TEST_ROOT="$(cd "$TEST_ROOT" && pwd -P)"
-trap 'status=$?; rm -rf "$TEST_ROOT"; exit "$status"' EXIT
+cleanup_test_root() {
+  local status=$?
+  if [[ "${KEEP_TEST_ROOT:-false}" == true ]]; then
+    printf 'preserved test root: %s\n' "$TEST_ROOT" >&2
+  else
+    rm -rf "$TEST_ROOT"
+  fi
+  exit "$status"
+}
+trap cleanup_test_root EXIT
 
 REPO_ROOT="$TEST_ROOT/repos"
 ROOT="$TEST_ROOT/sync"
@@ -21,6 +30,489 @@ if grep -Eq 'chown[[:space:]]+-R' "$EXTENSION"; then
   echo 'FAIL: Python worker one-shot recursively chowns caller state' >&2
   exit 1
 fi
+
+(
+  selection_root="$TEST_ROOT/selection-journal"
+  selection_helper="$VP_WORKER_ADMISSION_TRANSACTION_HELPER"
+  selection_commit=5123456789abcdef0123456789abcdef01234567
+  mkdir -p "$selection_root"
+
+  selection_credentials=()
+  selection_principals=(
+    vp_deploy_migrator
+    vp_deploy_read
+    vp_control_role_owner
+    vp_runtime_role_owner
+  )
+  for selection_index in 0 1 2 3; do
+    selection_credential="$selection_root/credential-$selection_index"
+    printf 'postgresql://selection-%s:credential@database/videoprocess\n' \
+      "$selection_index" >"$selection_credential"
+    chmod 0400 "$selection_credential"
+    selection_credentials+=("$selection_credential")
+  done
+  selection_credential_records="$(
+    python3 "$selection_helper" validate-credentials \
+      "${selection_credentials[0]}" "${selection_principals[0]}" \
+      "${selection_credentials[1]}" "${selection_principals[1]}" \
+      "${selection_credentials[2]}" "${selection_principals[2]}" \
+      "${selection_credentials[3]}" "${selection_principals[3]}"
+  )"
+
+  selection_baseline="$selection_root/baseline.json"
+  selection_failed_forward="$selection_root/failed-forward.json"
+  selection_control="$selection_root/control.json"
+  selection_control_drift="$selection_root/control-drift.json"
+  selection_control_invalid="$selection_root/control-invalid.json"
+  selection_marker="$selection_root/marker.json"
+  selection_marker_drift="$selection_root/marker-drift.json"
+  selection_marker_invalid="$selection_root/marker-invalid.json"
+  selection_janitor="$selection_root/janitor.json"
+  selection_janitor_drift="$selection_root/janitor-drift.json"
+  selection_janitor_invalid="$selection_root/janitor-invalid.json"
+  selection_operation_identity="$selection_root/operation-identity.json"
+  python3 - \
+    "$selection_baseline" "$selection_failed_forward" \
+    "$selection_control" "$selection_control_drift" \
+    "$selection_control_invalid" "$selection_marker" \
+    "$selection_marker_drift" "$selection_marker_invalid" \
+    "$selection_janitor" "$selection_janitor_drift" \
+    "$selection_janitor_invalid" \
+    "$selection_operation_identity" <<'PY'
+import json
+import pathlib
+import sys
+
+
+def write(path, value):
+    pathlib.Path(path).write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+(
+    baseline_path,
+    failed_forward_path,
+    control_path,
+    control_drift_path,
+    control_invalid_path,
+    marker_path,
+    marker_drift_path,
+    marker_invalid_path,
+    janitor_path,
+    janitor_drift_path,
+    janitor_invalid_path,
+    operation_identity_path,
+) = sys.argv[1:]
+services = [
+    "vp-api-swarm",
+    "vp-frontend-swarm",
+    "vp-autoflow-api-swarm",
+    "vp-event-outbox-relay-swarm",
+    "vp-channel-agent-runner-swarm",
+    "vp-ffmpeg-worker-go-swarm",
+    "vp-ffmpeg-worker-gpu-swarm",
+    "vp-vision-worker-swarm",
+    "vp-youtube-publisher-swarm",
+]
+write(
+    baseline_path,
+    {
+        "control": None,
+        "kind": "legacy_no_control",
+        "services": [
+            {
+                "docker_service_id": None,
+                "existed": False,
+                "image": None,
+                "name": service,
+                "spec_digest": None,
+            }
+            for service in services
+        ],
+    },
+)
+write(failed_forward_path, {"control": None, "services": []})
+control = {
+    "generation": "c-selection-generation",
+    "image": "vp-ffmpeg-worker-python:deploy-5123456789ab",
+    "manifest_sha256": "1" * 64,
+    "secrets": [
+        {
+            "docker_secret_id": f"{index:064x}",
+            "generation": "c-selection-generation",
+            "name": f"vp-control-selection-{index}",
+            "purpose": f"selection-{index}",
+            "service": "vp-worker-control",
+        }
+        for index in range(1, 8)
+    ],
+}
+write(control_path, control)
+write(control_drift_path, {**control, "manifest_sha256": "2" * 64})
+write(control_invalid_path, {**control, "unexpected": True})
+marker = {
+    "config_sha256": "3" * 64,
+    "cron_sha256": "4" * 64,
+    "generation": "m-selection-generation",
+    "image": "vp-backend:deploy-5123456789ab",
+    "secrets": [],
+}
+write(marker_path, marker)
+write(marker_drift_path, {**marker, "cron_sha256": "5" * 64})
+invalid_marker = dict(marker)
+del invalid_marker["cron_sha256"]
+write(marker_invalid_path, invalid_marker)
+janitor = {
+    "docker_service_id": "j" * 24,
+    "generation": "c-selection-generation",
+    "name": "vp-staging-object-janitor",
+    "spec_digest": "7" * 64,
+}
+write(janitor_path, janitor)
+write(janitor_drift_path, {**janitor, "spec_digest": "8" * 64})
+write(janitor_invalid_path, {**janitor, "unexpected": True})
+write(
+    operation_identity_path,
+    {
+        "docker_id": "a" * 64,
+        "generation": "selection-generation",
+        "kind": "service",
+        "name": "vp-selection-service",
+        "purpose": "promotion",
+        "service": "vp-selection-service",
+        "spec_digest": "6" * 64,
+    },
+)
+PY
+  chmod 0600 "$selection_operation_identity"
+
+  begin_selection_fixture() {
+    local fixture="$1"
+    ROOT="$selection_root/$fixture/sync"
+    REPO_ROOT="$selection_root/$fixture/repos"
+    selection_admission_root="$ROOT/state/vp-worker-admission"
+    selection_active="$selection_admission_root/transactions/active.json"
+    mkdir -p "$selection_admission_root"
+    chmod 0700 "$selection_admission_root"
+    vp_worker_admission_lock_acquire "$selection_admission_root"
+    python3 "$selection_helper" begin \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      "$selection_commit" \
+      "vp-backend:deploy-${selection_commit:0:12}" \
+      "vp-ffmpeg-worker-go:deploy-${selection_commit:0:12}" \
+      "$selection_commit" legacy_no_control \
+      <<<"$selection_credential_records" >/dev/null
+  }
+
+  assert_selection() {
+    local direction="$1"
+    local field="$2"
+    local payload="$3"
+    local expected_revision="$4"
+    python3 - \
+      "$selection_active" "$direction" "$field" \
+      "$payload" "$expected_revision" <<'PY'
+import json
+import sys
+
+active_path, direction, field, payload_path, raw_revision = sys.argv[1:]
+with open(active_path, encoding="utf-8") as handle:
+    document = json.load(handle)
+with open(payload_path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+if document["schema"] != 3:
+    raise SystemExit("selection command changed the journal schema")
+if document["revision"] != int(raw_revision):
+    raise SystemExit("selection command wrote the wrong revision")
+if document[direction][field] != payload:
+    raise SystemExit("selection command wrote the wrong identity")
+PY
+  }
+
+  assert_selection_replay_unchanged() {
+    local label="$1"
+    local payload="$2"
+    shift 2
+    local before
+    before="$(mktemp "$selection_root/replay.XXXXXX")"
+    cp "$selection_active" "$before"
+    "$@" <"$payload" >/dev/null
+    if ! cmp -s "$before" "$selection_active"; then
+      echo "FAIL: $label exact replay changed the active journal" >&2
+      exit 1
+    fi
+    rm -f "$before"
+  }
+
+  assert_selection_rejected_unchanged() {
+    local label="$1"
+    local payload="$2"
+    shift 2
+    local before
+    before="$(mktemp "$selection_root/rejected.XXXXXX")"
+    cp "$selection_active" "$before"
+    if "$@" <"$payload" >/dev/null 2>&1; then
+      echo "FAIL: $label selection was accepted" >&2
+      exit 1
+    fi
+    if ! cmp -s "$before" "$selection_active"; then
+      echo "FAIL: $label rejection changed the active journal" >&2
+      exit 1
+    fi
+    rm -f "$before"
+  }
+
+  assert_janitor_service() {
+    local payload="$1"
+    local expected_revision="$2"
+    python3 - "$selection_active" "$payload" "$expected_revision" <<'PY'
+import json
+import sys
+
+active_path, payload_path, raw_revision = sys.argv[1:]
+with open(active_path, encoding="utf-8") as handle:
+    document = json.load(handle)
+with open(payload_path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+if document["schema"] != 3:
+    raise SystemExit("janitor command changed the journal schema")
+if document["revision"] != int(raw_revision):
+    raise SystemExit("janitor command wrote the wrong revision")
+if document["janitor"]["service"] != payload:
+    raise SystemExit("janitor command wrote the wrong service identity")
+PY
+  }
+
+  assert_janitor_absent() {
+    local expected_revision="$1"
+    python3 - "$selection_active" "$expected_revision" <<'PY'
+import json
+import sys
+
+active_path, raw_revision = sys.argv[1:]
+with open(active_path, encoding="utf-8") as handle:
+    document = json.load(handle)
+if (
+    document["schema"] != 3
+    or document["revision"] != int(raw_revision)
+    or document["janitor"]["service"] is not None
+):
+    raise SystemExit("janitor clear did not durably remove the service identity")
+PY
+  }
+
+  begin_selection_fixture forward
+  python3 "$selection_helper" record-control-selection \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    0 forward <"$selection_control" >/dev/null
+  assert_selection forward control "$selection_control" 1
+  assert_selection_replay_unchanged \
+    'forward control' "$selection_control" \
+    python3 "$selection_helper" record-control-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      1 forward
+  assert_selection_rejected_unchanged \
+    'forward control identity drift' "$selection_control_drift" \
+    python3 "$selection_helper" record-control-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      1 forward
+  assert_selection_rejected_unchanged \
+    'forward control invalid payload' "$selection_control_invalid" \
+    python3 "$selection_helper" record-control-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      1 forward
+
+  python3 "$selection_helper" record-marker-selection \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    1 forward <"$selection_marker" >/dev/null
+  assert_selection forward marker "$selection_marker" 2
+  assert_selection_replay_unchanged \
+    'forward marker' "$selection_marker" \
+    python3 "$selection_helper" record-marker-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      2 forward
+  assert_selection_rejected_unchanged \
+    'forward marker identity drift' "$selection_marker_drift" \
+    python3 "$selection_helper" record-marker-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      2 forward
+  assert_selection_rejected_unchanged \
+    'forward marker invalid payload' "$selection_marker_invalid" \
+    python3 "$selection_helper" record-marker-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      2 forward
+  assert_selection_rejected_unchanged \
+    'invalid direction' "$selection_control" \
+    python3 "$selection_helper" record-control-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      2 sideways
+  assert_selection_rejected_unchanged \
+    'rollback direction in forward phase' "$selection_control" \
+    python3 "$selection_helper" record-control-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      2 rollback
+
+  python3 "$selection_helper" capture-baseline \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 2 \
+    <"$selection_baseline" >/dev/null
+  python3 "$selection_helper" transition \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    3 FORWARD_APPLYING >/dev/null
+  assert_selection_replay_unchanged \
+    'forward applying control' "$selection_control" \
+    python3 "$selection_helper" record-control-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      4 forward
+  python3 "$selection_helper" transition \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    4 FORWARD_VERIFIED >/dev/null
+  assert_selection_rejected_unchanged \
+    'forward verified phase' "$selection_marker" \
+    python3 "$selection_helper" record-marker-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      5 forward
+  python3 "$selection_helper" intent \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    5 PROMOTE_WORKERS "$selection_operation_identity" >/dev/null
+  assert_selection_rejected_unchanged \
+    'pending operation' "$selection_control" \
+    python3 "$selection_helper" record-control-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      6 forward
+  vp_worker_admission_lock_release
+
+  begin_selection_fixture rollback
+  python3 "$selection_helper" capture-baseline \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 0 \
+    <"$selection_baseline" >/dev/null
+  python3 "$selection_helper" capture-failed-forward \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 1 \
+    <"$selection_failed_forward" >/dev/null
+  python3 "$selection_helper" transition \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    2 ROLLBACK_PREPARING >/dev/null
+  python3 "$selection_helper" record-control-selection \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    3 rollback <"$selection_control" >/dev/null
+  assert_selection rollback control "$selection_control" 4
+  python3 "$selection_helper" record-marker-selection \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    4 rollback <"$selection_marker" >/dev/null
+  assert_selection rollback marker "$selection_marker" 5
+  assert_selection_replay_unchanged \
+    'rollback preparing control' "$selection_control" \
+    python3 "$selection_helper" record-control-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      5 rollback
+  python3 "$selection_helper" allocate-rollback-attempt \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    5 >/dev/null
+  python3 "$selection_helper" transition \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    6 ROLLBACK_APPLYING >/dev/null
+  assert_selection_replay_unchanged \
+    'rollback applying marker' "$selection_marker" \
+    python3 "$selection_helper" record-marker-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      7 rollback
+  assert_selection_rejected_unchanged \
+    'forward direction in rollback phase' "$selection_marker" \
+    python3 "$selection_helper" record-marker-selection \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+      7 forward
+  vp_worker_admission_lock_release
+
+  begin_selection_fixture janitor-forward
+  python3 "$selection_helper" record-janitor-service \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    0 <"$selection_janitor" >/dev/null
+  assert_janitor_service "$selection_janitor" 1
+  assert_selection_replay_unchanged \
+    'janitor service' "$selection_janitor" \
+    python3 "$selection_helper" record-janitor-service \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 1
+  assert_selection_rejected_unchanged \
+    'janitor service identity drift' "$selection_janitor_drift" \
+    python3 "$selection_helper" record-janitor-service \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 1
+  assert_selection_rejected_unchanged \
+    'janitor invalid payload' "$selection_janitor_invalid" \
+    python3 "$selection_helper" record-janitor-service \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 1
+  python3 "$selection_helper" capture-baseline \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 1 \
+    <"$selection_baseline" >/dev/null
+  python3 "$selection_helper" transition \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    2 FORWARD_APPLYING >/dev/null
+  assert_selection_replay_unchanged \
+    'janitor forward applying phase' "$selection_janitor" \
+    python3 "$selection_helper" record-janitor-service \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 3
+  vp_worker_admission_lock_release
+
+  begin_selection_fixture janitor-rollback
+  python3 "$selection_helper" record-janitor-service \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    0 <"$selection_janitor" >/dev/null
+  python3 "$selection_helper" capture-baseline \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 1 \
+    <"$selection_baseline" >/dev/null
+  python3 "$selection_helper" capture-failed-forward \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 2 \
+    <"$selection_failed_forward" >/dev/null
+  python3 "$selection_helper" transition \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    3 ROLLBACK_PREPARING >/dev/null
+  python3 "$selection_helper" allocate-rollback-attempt \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 4 \
+    >/dev/null
+  assert_selection_rejected_unchanged \
+    'janitor rollback preparing phase' "$selection_janitor" \
+    python3 "$selection_helper" record-janitor-service \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 5
+  python3 "$selection_helper" transition \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    5 ROLLBACK_APPLYING >/dev/null
+  python3 "$selection_helper" clear-janitor-service \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    6 <"$selection_janitor" >/dev/null
+  assert_janitor_absent 7
+  assert_selection_replay_unchanged \
+    'janitor clear' "$selection_janitor" \
+    python3 "$selection_helper" clear-janitor-service \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 7
+  assert_selection_rejected_unchanged \
+    'janitor clear invalid payload' "$selection_janitor_invalid" \
+    python3 "$selection_helper" clear-janitor-service \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 7
+  python3 "$selection_helper" record-janitor-service \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    7 <"$selection_janitor_drift" >/dev/null
+  assert_janitor_service "$selection_janitor_drift" 8
+  vp_worker_admission_lock_release
+
+  begin_selection_fixture janitor-pending-operation
+  python3 "$selection_helper" capture-baseline \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 0 \
+    <"$selection_baseline" >/dev/null
+  python3 "$selection_helper" transition \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    1 FORWARD_APPLYING >/dev/null
+  python3 "$selection_helper" transition \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    2 FORWARD_VERIFIED >/dev/null
+  python3 "$selection_helper" intent \
+    "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    3 PROMOTE_WORKERS "$selection_operation_identity" >/dev/null
+  assert_selection_rejected_unchanged \
+    'janitor pending operation' "$selection_janitor" \
+    python3 "$selection_helper" record-janitor-service \
+      "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 4
+  vp_worker_admission_lock_release
+)
 
 (
   helper_root="$TEST_ROOT/helper-bind-guards"
@@ -548,6 +1040,119 @@ done
   if [[ "$VP_WORKER_ADMISSION_LOCK_HELD" != false \
     || "$VP_WORKER_ADMISSION_LOCK_DEPTH" -ne 0 ]]; then
     echo 'FAIL: outer deploy did not release its transaction lock' >&2
+    exit 1
+  fi
+)
+
+for stderr_case in docker-no-payload:0 docker-payload:1; do
+(
+  case_name="${stderr_case%%:*}"
+  docker_return="${stderr_case##*:}"
+  probe_root="$TEST_ROOT/one-shot-stderr-$case_name"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  stderr_log="$probe_root/stderr"
+  child_fd_closed="$probe_root/child-fd-closed"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  secret_source=-
+  secret_target=-
+  if [[ "$case_name" == docker-payload ]]; then
+    secret_source="$probe_root/payload"
+    secret_target=payload
+    printf 'stderr-payload\n' >"$secret_source"
+    chmod 0400 "$secret_source"
+  fi
+
+  docker() {
+    cat >/dev/null
+    if [[ -e /dev/fd/19 ]]; then
+      printf 'docker inherited transaction fd19\n' >&2
+      return 1
+    fi
+    : >"$child_fd_closed"
+    printf 'docker-stderr-sentinel-%s\n' "$case_name" >&2
+    return "$docker_return"
+  }
+
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image "$secret_source" "$secret_target" /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>"$stderr_log"
+  operation_status=$?
+  set -e
+  if [[ "$operation_status" -ne "$docker_return" \
+    || ! -e "$child_fd_closed" \
+    || ! -f "$stderr_log" \
+    || "$(grep -Fxc "docker-stderr-sentinel-$case_name" "$stderr_log" || true)" -ne 1 \
+    || "$VP_WORKER_ADMISSION_LOCK_HELD" != false \
+    || -e /dev/fd/19 ]]; then
+    echo \
+      "FAIL: $case_name did not preserve child fd closure, stderr, and status" \
+      >&2
+    exit 1
+  fi
+)
+done
+
+(
+  probe_root="$TEST_ROOT/one-shot-stderr-payload-producer"
+  ROOT="$probe_root/sync"
+  REPO_ROOT="$probe_root/repos"
+  admission_root="$ROOT/state/vp-worker-admission"
+  bind_source="$probe_root/runtime-state"
+  secret_source="$probe_root/payload"
+  stderr_log="$probe_root/stderr"
+  producer_fd_closed="$probe_root/producer-fd-closed"
+  docker_fd_closed="$probe_root/docker-fd-closed"
+  mkdir -p "$admission_root" "$bind_source"
+  chmod 0700 "$admission_root" "$bind_source"
+  printf 'producer-stderr-payload\n' >"$secret_source"
+  chmod 0400 "$secret_source"
+
+  eval "$(
+    declare -f vp_python_worker_host_guard \
+      | sed \
+        '1s/vp_python_worker_host_guard/vp_python_worker_host_guard_original/'
+  )"
+  vp_python_worker_host_guard() {
+    if [[ "${1:-}" == stream-payloads ]]; then
+      if [[ -e /dev/fd/19 ]]; then
+        printf 'payload producer inherited transaction fd19\n' >&2
+        return 1
+      fi
+      : >"$producer_fd_closed"
+      printf 'payload-producer-stderr-sentinel\n' >&2
+      return 1
+    fi
+    vp_python_worker_host_guard_original "$@"
+  }
+  docker() {
+    cat >/dev/null
+    [[ ! -e /dev/fd/19 ]] || return 1
+    : >"$docker_fd_closed"
+  }
+
+  set +e
+  vp_run_python_worker_container \
+    synthetic-image "$secret_source" payload /runtime-state \
+    --mount "type=bind,src=$bind_source,dst=/runtime-state" \
+    -- /bin/true >/dev/null 2>"$stderr_log"
+  operation_status=$?
+  set -e
+  if [[ "$operation_status" -ne 1 \
+    || ! -e "$producer_fd_closed" \
+    || ! -e "$docker_fd_closed" \
+    || ! -f "$stderr_log" \
+    || "$(grep -Fxc 'payload-producer-stderr-sentinel' "$stderr_log" || true)" -ne 1 \
+    || "$VP_WORKER_ADMISSION_LOCK_HELD" != false \
+    || -e /dev/fd/19 ]]; then
+    echo \
+      'FAIL: payload producer did not preserve fd closure, stderr, and status' \
+      >&2
     exit 1
   fi
 )
@@ -1542,6 +2147,18 @@ assert_worker_contract \
     if [[ "${1:-} ${2:-}" == "secret rm" ]]; then
       return 0
     fi
+    if [[ "${1:-} ${2:-}" == "secret ls" ]]; then
+      case "$SECRET_INSPECT_MODE" in
+        absent)
+          return 0
+          ;;
+        replacement)
+          printf '%s|%s\n' "$replacement_id" "$expected_name"
+          return 0
+          ;;
+      esac
+      return 1
+    fi
     return 97
   }
 
@@ -1581,6 +2198,33 @@ assert_worker_contract \
   if grep -Fq 'docker|secret rm' "$immutable_calls" \
     || grep -Fq "docker|secret inspect $expected_name" "$immutable_calls"; then
     echo 'FAIL: name reuse caused replacement lookup or removal' >&2
+    exit 1
+  fi
+
+  : >"$immutable_calls"
+  SECRET_INSPECT_MODE=absent
+  if ! vp_remove_managed_secret_if_absent_exact \
+    "$old_id" "$expected_name" "$expected_service" \
+    "$expected_generation" "$expected_purpose" >/dev/null 2>&1; then
+    echo 'FAIL: replay-safe managed-secret removal rejected exact absence' >&2
+    exit 1
+  fi
+  if [[ "$(<"$immutable_calls")" != \
+      $'docker|secret inspect '"$old_id"$' --format {{.ID}}|{{.Spec.Name}}|{{index .Spec.Labels "vp.service"}}|{{index .Spec.Labels "vp.generation"}}|{{index .Spec.Labels "vp.purpose"}}\n''docker|secret ls --format {{.ID}}|{{.Name}}' ]]; then
+    echo 'FAIL: replay-safe secret absence was not verified by ID and inventory' >&2
+    exit 1
+  fi
+
+  : >"$immutable_calls"
+  SECRET_INSPECT_MODE=replacement
+  if vp_remove_managed_secret_if_absent_exact \
+    "$old_id" "$expected_name" "$expected_service" \
+    "$expected_generation" "$expected_purpose" >/dev/null 2>&1; then
+    echo 'FAIL: replay-safe secret removal accepted a replacement ID' >&2
+    exit 1
+  fi
+  if grep -Fq 'docker|secret rm' "$immutable_calls"; then
+    echo 'FAIL: replacement secret reached replay-safe removal' >&2
     exit 1
   fi
 )
@@ -2887,7 +3531,7 @@ PY
   vp_restore_app_snapshots() {
     printf 'snapshots|%s|%s\n' "$2" "$3" >>"$restore_calls"
   }
-  vp_worker_admission_abort_preparing_transaction() {
+  vp_worker_admission_abort_transaction() {
     printf 'abort|%s\n' "$1" >>"$restore_calls"
     VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
   }
@@ -2920,13 +3564,24 @@ PY
   VP_WORKER_ADMISSION_CANDIDATE_SERVICES=vp-ffmpeg-worker-go-swarm
   VP_APP_ATTEMPTED_SERVICES=vp-ffmpeg-worker-go-swarm
   vp_vision_cutover_required() {
-    printf 'false\n'
+    VP_VISION_CUTOVER_REQUIRED=false
   }
   vp_capture_app_snapshots() {
     printf 'vp-ffmpeg-worker-go-swarm|baseline-image\n'
   }
+  vp_worker_admission_capture_baseline() {
+    return 0
+  }
   vp_apply_app_services() {
     return 1
+  }
+  vp_worker_admission_capture_failed_forward() {
+    return 0
+  }
+  vp_worker_admission_hydrate_recovery_context() {
+    VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS='vp-ffmpeg-worker-go-swarm|baseline-image'
+    VP_WORKER_ADMISSION_RECOVERY_ATTEMPTED_SERVICES=vp-ffmpeg-worker-go-swarm
+    VP_WORKER_ADMISSION_CANDIDATE_SERVICES=vp-ffmpeg-worker-go-swarm
   }
   vp_worker_admission_candidate_records() {
     return 1
@@ -3547,7 +4202,7 @@ docker() {
 }
 partial_database_id="$(printf '%064d' 901)"
 partial_admission_id="$(printf '%064d' 1901)"
-vp_remove_managed_secret() {
+vp_remove_managed_secret_if_absent_exact() {
   printf 'secret-rm|%s|%s|%s|%s|%s\n' "$@" >>"$CLEANUP_CALLS"
 }
 VP_WORKER_CONTROL_GENERATION=c-0123456789abcdef0123
@@ -3611,5 +4266,432 @@ if [[ -z "$janitor_line" || -z "$journal_line" \
   echo 'FAIL: control generation retired before dependencies converged' >&2
   exit 1
 fi
+
+(
+  ROOT="$TEST_ROOT/stage2-promotion-replay/sync"
+  REPO_ROOT="$TEST_ROOT/stage2-promotion-replay/repos"
+  mkdir -p "$ROOT/state/vp-worker-admission"
+  chmod 0700 "$ROOT/state/vp-worker-admission"
+  source "$EXTENSION"
+
+  replay_root="$(vp_worker_admission_root)"
+  vp_worker_admission_lock_acquire "$replay_root"
+  replay_credentials=()
+  replay_principals=(
+    vp_deploy_migrator
+    vp_deploy_read
+    vp_control_role_owner
+    vp_runtime_role_owner
+  )
+  for replay_purpose in \
+    deploy_migrator deploy_read control_role_owner runtime_role_owner; do
+    replay_credential="$ROOT/$replay_purpose"
+    printf 'postgresql://%s:credential@database/videoprocess\n' \
+      "$replay_purpose" >"$replay_credential"
+    chmod 0400 "$replay_credential"
+    replay_credentials+=("$replay_credential")
+  done
+  replay_credential_records="$(
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      validate-credentials \
+      "${replay_credentials[0]}" "${replay_principals[0]}" \
+      "${replay_credentials[1]}" "${replay_principals[1]}" \
+      "${replay_credentials[2]}" "${replay_principals[2]}" \
+      "${replay_credentials[3]}" "${replay_principals[3]}"
+  )"
+  replay_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin \
+    "$replay_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "$replay_commit" \
+    "vp-backend:deploy-${replay_commit:0:12}" \
+    "vp-ffmpeg-worker-go:deploy-${replay_commit:0:12}" \
+    "$replay_commit" legacy_no_control \
+    <<<"$replay_credential_records" >/dev/null
+  replay_baseline="$ROOT/replay-baseline.json"
+  python3 - "$replay_baseline" <<'PY'
+import json
+import pathlib
+import sys
+
+services = [
+    "vp-api-swarm",
+    "vp-frontend-swarm",
+    "vp-autoflow-api-swarm",
+    "vp-event-outbox-relay-swarm",
+    "vp-channel-agent-runner-swarm",
+    "vp-ffmpeg-worker-go-swarm",
+    "vp-ffmpeg-worker-gpu-swarm",
+    "vp-vision-worker-swarm",
+    "vp-youtube-publisher-swarm",
+]
+payload = {
+    "control": None,
+    "kind": "legacy_no_control",
+    "services": [
+        {
+            "docker_service_id": None,
+            "existed": False,
+            "image": None,
+            "name": service,
+            "spec_digest": None,
+        }
+        for service in services
+    ],
+}
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" capture-baseline \
+    "$replay_root" "$VP_WORKER_ADMISSION_LOCK_FD" 0 \
+    <"$replay_baseline" >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
+    "$replay_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    1 FORWARD_APPLYING >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
+    "$replay_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    2 FORWARD_VERIFIED >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
+    "$replay_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    3 WORKERS_PROMOTED >/dev/null
+
+  marker_control_root="$(vp_worker_redis_marker_control_root)"
+  mkdir -p "$marker_control_root"
+  printf 'marker-candidate\n' >"$marker_control_root/control.conf"
+  VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION=marker-candidate
+  vp_worker_admission_require_promotion_selection() { :; }
+  vp_worker_admission_load_replay_plan
+  replay_identity="$(
+    vp_worker_admission_promotion_identity PROMOTE_MARKER
+  )"
+  vp_worker_admission_capture_promotion_precondition \
+    PROMOTE_MARKER "$replay_identity"
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" intent \
+    "$replay_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    4 PROMOTE_MARKER "$replay_identity" >/dev/null
+  replay_transaction_id="$VP_WORKER_ADMISSION_TRANSACTION_ID"
+  marker_receipt="$replay_root/transactions/$replay_transaction_id/promotion-receipts/PROMOTE_MARKER.json"
+
+  replay_calls="$ROOT/replay-calls"
+  : >"$replay_calls"
+  VP_WORKER_CONTROL_GENERATION=control-candidate
+  mkdir -p "$replay_root/control-candidates"
+  printf 'control-candidate\n' \
+    >"$replay_root/control-candidates/$VP_WORKER_CONTROL_GENERATION.conf"
+  vp_commit_worker_redis_marker_controls() {
+    printf 'duplicate-marker-promotion\n' >>"$replay_calls"
+  }
+  vp_commit_worker_control_generation() {
+    printf 'promote-control\n' >>"$replay_calls"
+    cp "$replay_root/control-candidates/$VP_WORKER_CONTROL_GENERATION.conf" \
+      "$replay_root/control-current.conf"
+  }
+  vp_worker_admission_retire_transaction() {
+    printf 'retire\n' >>"$replay_calls"
+  }
+  vp_worker_admission_hydrate_recovery_context() {
+    VP_WORKER_ADMISSION_PREPARED=true
+    VP_WORKER_ADMISSION_COMMIT="$replay_commit"
+    VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE="$replay_commit"
+    VP_WORKER_CONTROL_GENERATION=control-candidate
+  }
+  vp_worker_control_cleanup_stale_candidates() {
+    printf 'stale-cleanup\n' >>"$replay_calls"
+    return 1
+  }
+
+  printf 'tampered-marker\n' >"$marker_control_root/control.conf"
+  if vp_reconcile_worker_admission_transaction; then
+    echo 'FAIL: promotion replay accepted a marker digest mismatch' >&2
+    exit 1
+  fi
+  mismatch_plan="$(
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      replay-plan "$replay_root"
+  )"
+  python3 - "$mismatch_plan" <<'PY'
+import json
+import sys
+
+plan = json.loads(sys.argv[1])
+operation = plan.get("pending_operation")
+if (
+    plan.get("phase") != "WORKERS_PROMOTED"
+    or not isinstance(operation, dict)
+    or operation.get("kind") != "PROMOTE_MARKER"
+):
+    raise SystemExit("marker mismatch advanced the durable promotion")
+PY
+  printf 'marker-candidate\n' >"$marker_control_root/control.conf"
+  if ! vp_reconcile_worker_admission_transaction; then
+    echo 'FAIL: WORKERS_PROMOTED transaction did not replay to DONE' >&2
+    exit 1
+  fi
+  if [[ "$(grep -c '^duplicate-marker-promotion$' "$replay_calls")" -ne 1 ]]; then
+    echo 'FAIL: marker target equality bypassed incomplete cleanup' >&2
+    exit 1
+  fi
+  if [[ ! -f "$marker_receipt" || -L "$marker_receipt" \
+    || "$(vp_worker_redis_marker_file_mode "$marker_receipt")" != 600 ]]; then
+    echo 'FAIL: marker promotion cleanup did not write a durable receipt' >&2
+    exit 1
+  fi
+  if grep -Fqx stale-cleanup "$replay_calls"; then
+    echo 'FAIL: active transaction reached stale candidate cleanup' >&2
+    exit 1
+  fi
+  if [[ "$(grep -c '^promote-control$' "$replay_calls")" -ne 1 \
+    || "$(grep -c '^retire$' "$replay_calls")" -ne 1 ]]; then
+    echo 'FAIL: replay did not perform control promotion and retirement once' >&2
+    exit 1
+  fi
+  control_line="$(grep -n '^promote-control$' "$replay_calls" | cut -d: -f1)"
+  retire_line="$(grep -n '^retire$' "$replay_calls" | cut -d: -f1)"
+  if [[ -z "$control_line" || -z "$retire_line" \
+    || "$control_line" -ge "$retire_line" ]]; then
+    echo 'FAIL: replay retired before all promotion phases completed' >&2
+    exit 1
+  fi
+  if [[ -e "$replay_root/transactions/active.json" ]] \
+    || [[ "$(find "$replay_root/transactions" -name done.json | wc -l | tr -d ' ')" -ne 1 ]]; then
+    echo 'FAIL: replay did not archive DONE atomically' >&2
+    exit 1
+  fi
+  vp_reconcile_worker_admission_transaction
+  [[ "$(grep -c '^duplicate-marker-promotion$' "$replay_calls")" -eq 1 ]]
+  [[ "$(grep -c '^promote-control$' "$replay_calls")" -eq 1 ]]
+  [[ "$(grep -c '^retire$' "$replay_calls")" -eq 1 ]]
+  vp_worker_admission_lock_release
+)
+
+(
+  selection_wiring_root="$TEST_ROOT/control-selection-wiring"
+  ROOT="$selection_wiring_root/sync"
+  REPO_ROOT="$selection_wiring_root/repos"
+  mkdir -p "$ROOT/state/vp-worker-admission"
+  chmod 0700 "$ROOT/state/vp-worker-admission"
+  selection_wiring_calls="$selection_wiring_root/calls"
+  : >"$selection_wiring_calls"
+  selection_wiring_commit=6123456789abcdef0123456789abcdef01234567
+  selection_wiring_control="vp-ffmpeg-worker-python:deploy-${selection_wiring_commit:0:12}"
+  selection_wiring_go="vp-ffmpeg-worker-go:deploy-${selection_wiring_commit:0:12}"
+
+  vp_require_worker_redis_runtime_state() {
+    :
+  }
+  docker() {
+    if [[ "$*" == *'org.opencontainers.image.revision'* ]]; then
+      printf '%s\n' "$selection_wiring_commit"
+      return 0
+    fi
+    return 1
+  }
+  vp_python_worker_prepare_controlled_directory() {
+    mkdir -p "$1"
+    chmod 0700 "$1"
+    printf '%s\n' "$1"
+  }
+  vp_worker_control_capture_prior() {
+    printf 'capture-prior\n' >>"$selection_wiring_calls"
+  }
+  vp_worker_admission_prepare_control_roles() {
+    VP_WORKER_CONTROL_GENERATION="c-${selection_wiring_commit:0:20}"
+    printf 'prepare-control\n' >>"$selection_wiring_calls"
+  }
+  vp_worker_admission_record_control_selection() {
+    printf 'record-control|%s|%s\n' "$1" "$2" \
+      >>"$selection_wiring_calls"
+  }
+  vp_worker_admission_prepare_service() {
+    printf 'prepare-worker|%s\n' "$1" >>"$selection_wiring_calls"
+  }
+  vp_worker_admission_record_prepared_worker_plan() {
+    printf 'record-worker|%s\n' "$1" >>"$selection_wiring_calls"
+  }
+
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+  VP_WORKER_ADMISSION_LOCK_HELD=true
+  vp_prepare_worker_admission \
+    "$selection_wiring_control" "$selection_wiring_go"
+  expected_control_manifest="$ROOT/state/vp-worker-admission/control-candidates/c-${selection_wiring_commit:0:20}.conf"
+  prepare_control_line="$(grep -n '^prepare-control$' "$selection_wiring_calls" | cut -d: -f1 || true)"
+  record_control_line="$(grep -nF "record-control|forward|$expected_control_manifest" "$selection_wiring_calls" | cut -d: -f1 || true)"
+  first_worker_line="$(grep -n '^prepare-worker|' "$selection_wiring_calls" | head -1 | cut -d: -f1 || true)"
+  if [[ -z "$prepare_control_line" || -z "$record_control_line" \
+    || -z "$first_worker_line" \
+    || "$prepare_control_line" -ge "$record_control_line" \
+    || "$record_control_line" -ge "$first_worker_line" ]]; then
+    echo 'FAIL: forward control identity was not journaled before worker provisioning' >&2
+    exit 1
+  fi
+)
+
+(
+  dry_run_root="$TEST_ROOT/update-services-zero"
+  ROOT="$dry_run_root/sync"
+  mkdir -p "$ROOT/state/vp-worker-admission/transactions"
+  dry_run_active="$ROOT/state/vp-worker-admission/transactions/active.json"
+  printf '%s\n' '{"sentinel":"must-remain-byte-identical"}' \
+    >"$dry_run_active"
+  chmod 0600 "$dry_run_active"
+  dry_run_before="$(shasum -a 256 "$dry_run_active")"
+  dry_run_calls="$dry_run_root/calls"
+  : >"$dry_run_calls"
+  UPDATE_SERVICES=0
+
+  vp_validate_deploy_config() {
+    printf 'validate\n' >>"$dry_run_calls"
+  }
+  _vp_deploy_vp_app_services_locked() {
+    printf 'deploy-read-only\n' >>"$dry_run_calls"
+  }
+  vp_worker_admission_root() {
+    printf 'forbidden|admission-root\n' >>"$dry_run_calls"
+    return 1
+  }
+  vp_reconcile_worker_admission_transaction() {
+    printf 'forbidden|reconcile\n' >>"$dry_run_calls"
+    return 1
+  }
+  vp_worker_admission_prepare_transaction() {
+    printf 'forbidden|prepare\n' >>"$dry_run_calls"
+    return 1
+  }
+
+  if ! deploy_vp_app_services api frontend backend channelops go worker \
+    >/dev/null; then
+    echo 'FAIL: UPDATE_SERVICES=0 entered the admission transaction path' >&2
+    exit 1
+  fi
+  dry_run_after="$(shasum -a 256 "$dry_run_active")"
+  if [[ "$dry_run_before" != "$dry_run_after" \
+    || "$(cat "$dry_run_calls")" != $'validate\ndeploy-read-only' ]]; then
+    echo 'FAIL: UPDATE_SERVICES=0 touched transaction state or mutation hooks' >&2
+    exit 1
+  fi
+)
+
+(
+  applying_order_calls="$TEST_ROOT/forward-applying-order.calls"
+  : >"$applying_order_calls"
+  UPDATE_SERVICES=1
+  vp_worker_admission_transition_to() {
+    printf 'phase|%s\n' "$1" >>"$applying_order_calls"
+  }
+  vp_update_app_runtime_service() {
+    printf 'update|%s\n' "$1" >>"$applying_order_calls"
+    return 1
+  }
+
+  if vp_apply_app_services api frontend backend channelops go worker \
+    >/dev/null 2>&1; then
+    echo 'FAIL: injected first app update failure unexpectedly succeeded' >&2
+    exit 1
+  fi
+  if [[ "$(cat "$applying_order_calls")" \
+    != $'phase|FORWARD_APPLYING\nupdate|vp-api-swarm' ]]; then
+    echo 'FAIL: live app mutation was attempted before FORWARD_APPLYING' >&2
+    exit 1
+  fi
+)
+
+(
+  marker_wal_root="$TEST_ROOT/marker-wal-order"
+  ROOT="$marker_wal_root/sync"
+  mkdir -p "$ROOT"
+  marker_wal_calls="$marker_wal_root/calls"
+  : >"$marker_wal_calls"
+  UPDATE_SERVICES=1
+  VP_WORKER_ADMISSION_TRANSACTION_ID=tx-7123456789abcdef0123456789abcdef
+  VP_WORKER_ADMISSION_COMMIT=7123456789abcdef0123456789abcdef01234567
+  VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+
+  vp_validate_topology() { :; }
+  vp_require_pipeline_network_identity() { :; }
+  vp_require_worker_redis_runtime_state() { :; }
+  vp_worker_redis_marker_owner_file() { printf '/dev/null\n'; }
+  vp_python_worker_prepare_controlled_directory() {
+    mkdir -p "$1"
+    chmod 0700 "$1"
+    printf '%s\n' "$1"
+  }
+  vp_worker_redis_marker_read_prior_config() {
+    VP_WORKER_REDIS_MARKER_PRIOR_GENERATION=marker-prior
+    VP_WORKER_REDIS_MARKER_PRIOR_IMAGE=vp-worker:prior
+  }
+  vp_worker_redis_marker_capture_managed_state() {
+    VP_WORKER_REDIS_MARKER_MANAGED_STATE="$2"
+    mkdir -p "$2"
+  }
+  vp_worker_redis_marker_new_generation() {
+    printf 'm-7123456789ab-1700000000-0001\n'
+  }
+  vp_worker_admission_record_authority_intent() {
+    printf 'intent|%s|%s|%s\n' "$1" "$2" "$3" >>"$marker_wal_calls"
+  }
+  vp_worker_redis_marker_provision_generation() {
+    printf 'provision\n' >>"$marker_wal_calls"
+  }
+  vp_worker_admission_record_marker_selection() {
+    printf 'record|%s|%s\n' "$1" "$2" >>"$marker_wal_calls"
+  }
+  vp_worker_redis_marker_deactivate_managed_cron() {
+    printf 'deactivate\n' >>"$marker_wal_calls"
+  }
+  vp_worker_redis_marker_remove_generation_jobs() {
+    printf 'remove-prior\n' >>"$marker_wal_calls"
+  }
+  vp_install_worker_redis_marker_control() {
+    printf 'install\n' >>"$marker_wal_calls"
+  }
+  vp_run_worker_redis_marker_readiness() {
+    printf 'readiness\n' >>"$marker_wal_calls"
+  }
+
+  vp_prepare_worker_redis_marker_controls vp-worker:candidate
+  if [[ "$(cat "$marker_wal_calls")" \
+    != $'intent|marker|worker-redis-marker-control|m-7123456789ab-1700000000-0001\nprovision\nrecord|forward|expected\ndeactivate\nremove-prior\ninstall\nreadiness' ]]; then
+    echo 'FAIL: marker live mutation happened before its durable selection' >&2
+    exit 1
+  fi
+
+  : >"$marker_wal_calls"
+  vp_worker_admission_record_marker_selection() {
+    printf 'record|%s|%s\n' "$1" "$2" >>"$marker_wal_calls"
+    return 1
+  }
+  vp_worker_redis_marker_retire_generation() {
+    printf 'retire-candidate\n' >>"$marker_wal_calls"
+  }
+  vp_worker_redis_marker_discard_managed_state() {
+    printf 'discard-baseline\n' >>"$marker_wal_calls"
+    VP_WORKER_REDIS_MARKER_MANAGED_STATE=""
+  }
+  if vp_prepare_worker_redis_marker_controls vp-worker:candidate; then
+    echo 'FAIL: failed marker selection unexpectedly prepared a candidate' >&2
+    exit 1
+  fi
+  if [[ "$(cat "$marker_wal_calls")" \
+    != $'intent|marker|worker-redis-marker-control|m-7123456789ab-1700000000-0001\nprovision\nrecord|forward|expected\nretire-candidate\ndiscard-baseline' ]]; then
+    echo 'FAIL: failed marker selection touched live state or leaked its candidate' >&2
+    exit 1
+  fi
+
+  : >"$marker_wal_calls"
+  vp_worker_redis_marker_provision_generation() {
+    printf 'provision-failed\n' >>"$marker_wal_calls"
+    return 1
+  }
+  if vp_prepare_worker_redis_marker_controls vp-worker:candidate; then
+    echo 'FAIL: failed marker provisioning unexpectedly prepared a candidate' >&2
+    exit 1
+  fi
+  if [[ "$(cat "$marker_wal_calls")" \
+    != $'intent|marker|worker-redis-marker-control|m-7123456789ab-1700000000-0001\nprovision-failed\ndiscard-baseline' ]]; then
+    echo 'FAIL: failed marker provisioning touched live state' >&2
+    exit 1
+  fi
+)
 
 echo "worker admission deployment contract tests passed"

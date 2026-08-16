@@ -21,13 +21,37 @@ LOCK_NAME = "transaction.lock"
 TRANSACTIONS_NAME = "transactions"
 ACTIVE_NAME = "active.json"
 SNAPSHOTS_NAME = "snapshots.json"
+APP_PROGRESS_NAME = "app-progress.json"
 LOCK_MODE = 0o600
 FILE_MODE = 0o600
 CREDENTIAL_MODE = 0o400
 DIRECTORY_MODE = 0o700
 LOCK_CONTENTION_STATUS = 75
 MAX_DOCUMENT_BYTES = 1024 * 1024
-CURRENT_DOCUMENT_SCHEMA = 2
+CURRENT_DOCUMENT_SCHEMA = 3
+
+APP_SERVICES = {
+    "vp-api-swarm",
+    "vp-frontend-swarm",
+    "vp-autoflow-api-swarm",
+    "vp-event-outbox-relay-swarm",
+    "vp-channel-agent-runner-swarm",
+    "vp-ffmpeg-worker-go-swarm",
+    "vp-ffmpeg-worker-gpu-swarm",
+    "vp-vision-worker-swarm",
+    "vp-youtube-publisher-swarm",
+}
+WORKER_STAGE_SUCCESSORS = {
+    "pending": "prepared",
+    "prepared": "applied",
+    "applied": "verified",
+}
+WORKER_STAGE_ORDER = {
+    "pending": 0,
+    "prepared": 1,
+    "applied": 2,
+    "verified": 3,
+}
 
 DATABASE_PURPOSES = (
     "deploy_migrator",
@@ -85,7 +109,11 @@ PROMOTION_BY_PHASE = {
 LEGAL_TRANSITIONS = {
     "PREPARING": {"ABORTING", "FORWARD_APPLYING", "ROLLBACK_PREPARING"},
     "ABORTING": {"DONE"},
-    "FORWARD_APPLYING": {"FORWARD_VERIFIED", "ROLLBACK_PREPARING"},
+    "FORWARD_APPLYING": {
+        "ABORTING",
+        "FORWARD_VERIFIED",
+        "ROLLBACK_PREPARING",
+    },
     "FORWARD_VERIFIED": {"WORKERS_PROMOTED", "ROLLBACK_PREPARING"},
     "WORKERS_PROMOTED": {"MARKER_PROMOTED"},
     "MARKER_PROMOTED": {"CONTROL_PROMOTED"},
@@ -174,7 +202,11 @@ LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS = {
     "operation",
     "abort",
 }
-TOP_LEVEL_FIELDS = LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS | {"authorities"}
+TOP_LEVEL_FIELDS = LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS | {
+    "authorities",
+    "retiring_outcome",
+    "vision_jobs",
+}
 IDENTITY_FIELDS = {
     "kind",
     "docker_id",
@@ -246,6 +278,12 @@ def _require_optional_string(
 
 def _require_integer(value: object, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise TransactionError
+    return value
+
+
+def _require_exact_schema(value: object, expected: int) -> int:
+    if type(value) is not int or value != expected:
         raise TransactionError
     return value
 
@@ -468,6 +506,33 @@ def _validate_database_credentials(value: object) -> dict[str, Any]:
     return credentials
 
 
+def _validate_app_progress(value: object) -> dict[str, Any]:
+    progress = _require_exact_fields(
+        value,
+        {
+            "schema",
+            "transaction_id",
+            "target_commit",
+            "attempted_services",
+            "migration_state",
+        },
+    )
+    _require_exact_schema(progress["schema"], 1)
+    _require_string(progress["transaction_id"], r"tx-[0-9a-f]{32}", maximum=35)
+    _require_string(progress["target_commit"], r"[0-9a-f]{40}", maximum=40)
+    attempted_services = progress["attempted_services"]
+    if not isinstance(attempted_services, list):
+        raise TransactionError
+    seen: set[str] = set()
+    for service in attempted_services:
+        if service not in APP_SERVICES or service in seen:
+            raise TransactionError
+        seen.add(service)
+    if progress["migration_state"] not in {"pending", "applying", "applied"}:
+        raise TransactionError
+    return progress
+
+
 def _validate_secret_ref(value: object) -> None:
     reference = _require_exact_fields(
         value,
@@ -511,6 +576,13 @@ def _validate_service_identity(value: object) -> None:
     )
     _require_optional_string(service["image"], r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}")
     _require_optional_string(service["spec_digest"], r"[0-9a-f]{64}", maximum=64)
+    present_fields = (
+        service["docker_service_id"],
+        service["image"],
+        service["spec_digest"],
+    )
+    if service["existed"] != all(value is not None for value in present_fields):
+        raise TransactionError
 
 
 def _validate_service_identities(value: object) -> None:
@@ -565,7 +637,7 @@ def _validate_authority(
             "operator_reference",
         },
     )
-    if authority["kind"] not in {"control", "runtime"}:
+    if authority["kind"] not in {"control", "marker", "runtime"}:
         raise TransactionError
     _require_string(
         authority["service"],
@@ -586,12 +658,13 @@ def _validate_authority(
         r"c-[0-9a-f]{20}",
         maximum=22,
     )
+    operator_reference = authority["operator_reference"]
     _require_string(
-        authority["operator_reference"],
-        r"control/c-[0-9a-f]{20}/worker-registration-operator-database-url",
+        operator_reference,
+        r"[A-Za-z0-9][A-Za-z0-9_./-]{0,254}",
     )
     expected_control_generation = f"c-{target_commit[:20]}"
-    expected_operator_reference = (
+    expected_control_operator_reference = (
         f"control/{expected_control_generation}/"
         "worker-registration-operator-database-url"
     )
@@ -600,7 +673,6 @@ def _validate_authority(
     )
     if (
         authority["control_generation"] != expected_control_generation
-        or authority["operator_reference"] != expected_operator_reference
         or authority["control_image"] != expected_control_image
     ):
         raise TransactionError
@@ -609,12 +681,29 @@ def _validate_authority(
         and (
             authority["service"] != "vp-worker-control"
             or authority["generation"] != expected_control_generation
+            or operator_reference != expected_control_operator_reference
+        )
+    ) or (
+        authority["kind"] == "marker"
+        and (
+            authority["service"] != "worker-redis-marker-control"
+            or re.fullmatch(
+                r"m-[0-9a-f]{12}-[1-9][0-9]*-[0-9]{4}",
+                authority["generation"],
+            )
+            is None
+            or operator_reference
+            != (
+                f"marker/{authority['generation']}/"
+                "worker-marker-owner-database-url"
+            )
         )
     ) or (
         authority["kind"] == "runtime"
         and (
             authority["service"] not in RUNTIME_AUTHORITY_SERVICES
             or re.fullmatch(r"[1-9][0-9]*", authority["generation"]) is None
+            or operator_reference != expected_control_operator_reference
         )
     ):
         raise TransactionError
@@ -753,19 +842,26 @@ def _validate_marker_identity(value: object) -> None:
     _validate_secret_refs(marker["secrets"])
 
 
-def _validate_worker_identity(value: object) -> None:
+def _validate_worker_identity(
+    value: object,
+    *,
+    require_target_spec_digest: bool = True,
+) -> None:
+    fields = {
+        "service",
+        "generation",
+        "commit",
+        "image",
+        "database_secret",
+        "admission_secret",
+        "docker_service_id",
+        "applied_stage",
+    }
+    if require_target_spec_digest:
+        fields.add("target_spec_digest")
     worker = _require_exact_fields(
         value,
-        {
-            "service",
-            "generation",
-            "commit",
-            "image",
-            "database_secret",
-            "admission_secret",
-            "docker_service_id",
-            "applied_stage",
-        },
+        fields,
     )
     _require_string(worker["service"], r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
     _require_integer(worker["generation"], 1)
@@ -774,11 +870,28 @@ def _validate_worker_identity(value: object) -> None:
         worker["image"],
         r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}",
     )
+    if require_target_spec_digest:
+        _require_optional_string(
+            worker["target_spec_digest"],
+            r"[0-9a-f]{64}",
+            maximum=64,
+        )
     _validate_secret_ref(worker["database_secret"])
     _validate_secret_ref(worker["admission_secret"])
     if (
         worker["database_secret"]["docker_secret_id"]
         == worker["admission_secret"]["docker_secret_id"]
+    ):
+        raise TransactionError
+    if require_target_spec_digest and (
+        worker["database_secret"]["service"] != worker["service"]
+        or worker["admission_secret"]["service"] != worker["service"]
+        or worker["database_secret"]["generation"]
+        != str(worker["generation"])
+        or worker["admission_secret"]["generation"]
+        != str(worker["generation"])
+        or worker["database_secret"]["purpose"] != "database"
+        or worker["admission_secret"]["purpose"] != "admission"
     ):
         raise TransactionError
     _require_optional_string(
@@ -793,9 +906,19 @@ def _validate_worker_identity(value: object) -> None:
         "verified",
     }:
         raise TransactionError
+    has_service_id = worker["docker_service_id"] is not None
+    if require_target_spec_digest:
+        has_spec_digest = worker["target_spec_digest"] is not None
+        is_applied = worker["applied_stage"] in {"applied", "verified"}
+        if has_service_id != is_applied or has_spec_digest != is_applied:
+            raise TransactionError
 
 
-def _validate_worker_identities(value: object) -> None:
+def _validate_worker_identities(
+    value: object,
+    *,
+    require_target_spec_digest: bool = True,
+) -> None:
     if not isinstance(value, list):
         raise TransactionError
     worker_keys: set[tuple[str, int]] = set()
@@ -803,7 +926,10 @@ def _validate_worker_identities(value: object) -> None:
     secret_names: set[str] = set()
     secret_ids: set[str] = set()
     for worker in value:
-        _validate_worker_identity(worker)
+        _validate_worker_identity(
+            worker,
+            require_target_spec_digest=require_target_spec_digest,
+        )
         worker_key = (worker["service"], worker["generation"])
         service_id = worker["docker_service_id"]
         if worker_key in worker_keys or (
@@ -859,6 +985,75 @@ def _validate_janitor_service(value: object) -> None:
     _require_string(service["spec_digest"], r"[0-9a-f]{64}", maximum=64)
 
 
+def _validate_vision_jobs(value: object) -> None:
+    if not isinstance(value, list):
+        raise TransactionError
+    modes: set[str] = set()
+    service_ids: set[str] = set()
+    for value in value:
+        job = _require_exact_fields(
+            value,
+            {
+                "mode",
+                "name",
+                "image",
+                "redis_secret",
+                "database_secret",
+                "docker_service_id",
+                "state",
+                "exit_code",
+            },
+        )
+        if job["mode"] not in {
+            "safety",
+            "final-safety",
+            "check",
+            "reconcile",
+        }:
+            raise TransactionError
+        _require_string(
+            job["name"],
+            r"vp-vision-cutover-(safety|final-safety|check|reconcile)-[0-9a-f]{12}",
+        )
+        _require_string(
+            job["image"],
+            r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}",
+        )
+        _validate_secret_ref(job["redis_secret"])
+        if job["database_secret"] is not None:
+            _validate_secret_ref(job["database_secret"])
+        if (job["mode"] in {"safety", "final-safety"}) != (
+            job["database_secret"] is not None
+        ):
+            raise TransactionError
+        service_id = _require_optional_string(
+            job["docker_service_id"],
+            r"[0-9a-z]{12,64}",
+            maximum=64,
+        )
+        if job["state"] not in {"planned", "created", "terminal", "removed"}:
+            raise TransactionError
+        if (
+            (job["state"] == "planned" and service_id is not None)
+            or (job["state"] in {"created", "terminal"} and service_id is None)
+        ):
+            raise TransactionError
+        exit_code = job["exit_code"]
+        if job["state"] in {"terminal", "removed"}:
+            _require_integer(exit_code)
+            if exit_code > 255:
+                raise TransactionError
+        elif exit_code is not None:
+            raise TransactionError
+        if job["mode"] in modes or (
+            service_id is not None and service_id in service_ids
+        ):
+            raise TransactionError
+        modes.add(job["mode"])
+        if service_id is not None:
+            service_ids.add(service_id)
+
+
 def _validate_identity(value: object) -> dict[str, Any]:
     identity = _require_exact_fields(value, IDENTITY_FIELDS)
     if identity["kind"] not in {"secret", "service", "manifest"}:
@@ -876,8 +1071,7 @@ def _validate_identity(value: object) -> dict[str, Any]:
 
 def _validate_snapshots(value: object) -> dict[str, Any]:
     snapshots = _require_exact_fields(value, SNAPSHOT_FIELDS)
-    if snapshots["schema"] != 1:
-        raise TransactionError
+    _require_exact_schema(snapshots["schema"], 1)
     _require_string(snapshots["transaction_id"], r"tx-[0-9a-f]{32}", maximum=35)
     _require_integer(snapshots["revision"])
 
@@ -906,7 +1100,10 @@ def _validate_snapshots(value: object) -> dict[str, Any]:
             _validate_control_identity(selection["control"])
         if selection["marker"] is not None:
             _validate_marker_identity(selection["marker"])
-        _validate_worker_identities(selection["workers"])
+        _validate_worker_identities(
+            selection["workers"],
+            require_target_spec_digest=False,
+        )
 
     janitor = _require_exact_fields(snapshots["janitor"], {"service"})
     if janitor["service"] is not None:
@@ -919,8 +1116,7 @@ def _validate_legacy_schema_1_document(value: object) -> dict[str, Any]:
         value,
         LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS,
     )
-    if isinstance(document["schema"], bool) or document["schema"] != 1:
-        raise TransactionError
+    _require_exact_schema(document["schema"], 1)
     _require_string(document["transaction_id"], r"tx-[0-9a-f]{32}", maximum=35)
     _require_integer(document["revision"])
     if document["phase"] not in PHASES:
@@ -1016,7 +1212,10 @@ def _validate_legacy_schema_1_document(value: object) -> dict[str, Any]:
         _validate_control_identity(forward["control"])
     if forward["marker"] is not None:
         _validate_marker_identity(forward["marker"])
-    _validate_worker_identities(forward["workers"])
+    _validate_worker_identities(
+        forward["workers"],
+        require_target_spec_digest=False,
+    )
 
     rollback = _require_exact_fields(
         document["rollback"],
@@ -1027,7 +1226,10 @@ def _validate_legacy_schema_1_document(value: object) -> dict[str, Any]:
         _validate_control_identity(rollback["control"])
     if rollback["marker"] is not None:
         _validate_marker_identity(rollback["marker"])
-    _validate_worker_identities(rollback["workers"])
+    _validate_worker_identities(
+        rollback["workers"],
+        require_target_spec_digest=False,
+    )
 
     promotion = _require_exact_fields(
         document["promotion"],
@@ -1149,8 +1351,7 @@ def _validate_legacy_schema_1_document(value: object) -> dict[str, Any]:
 
 def _validate_document(value: object) -> dict[str, Any]:
     document = _require_exact_fields(value, TOP_LEVEL_FIELDS)
-    if document["schema"] != CURRENT_DOCUMENT_SCHEMA:
-        raise TransactionError
+    _require_exact_schema(document["schema"], CURRENT_DOCUMENT_SCHEMA)
     _require_string(document["transaction_id"], r"tx-[0-9a-f]{32}", maximum=35)
     _require_integer(document["revision"])
     if document["phase"] not in PHASES:
@@ -1214,7 +1415,7 @@ def _validate_document(value: object) -> dict[str, Any]:
         document["authorities"],
         document["target_commit"],
     )
-    if document["phase"] == "PREPARING":
+    if document["phase"] in {"PREPARING", "FORWARD_APPLYING"}:
         if any(authority["state"] == "revoked" for authority in authorities):
             raise TransactionError
     elif document["phase"] == "ABORTING" or (
@@ -1228,11 +1429,19 @@ def _validate_document(value: object) -> dict[str, Any]:
 
     _validate_secret_refs(document["prepared_secrets"])
     for reference in document["prepared_secrets"]:
-        expected_kind = (
-            "control"
-            if reference["service"] == "vp-worker-control"
-            else "runtime"
-        )
+        if (
+            reference["service"] == "vision-cutover"
+            and reference["generation"] == document["transaction_id"]
+            and reference["purpose"]
+            in {"safety-database", "final-safety-database"}
+        ):
+            continue
+        if reference["service"] == "vp-worker-control":
+            expected_kind = "control"
+        elif reference["service"] == "worker-redis-marker-control":
+            expected_kind = "marker"
+        else:
+            expected_kind = "runtime"
         matches = [
             authority
             for authority in authorities
@@ -1248,27 +1457,50 @@ def _validate_document(value: object) -> dict[str, Any]:
 
     baseline = _require_exact_fields(
         document["baseline"],
-        {"kind", "control", "services"},
+        {"captured", "kind", "control", "services"},
     )
+    if not isinstance(baseline["captured"], bool):
+        raise TransactionError
     if baseline["kind"] not in {"managed", "legacy_no_control"}:
         raise TransactionError
     if baseline["control"] is not None:
         _validate_control_identity(baseline["control"])
     _validate_service_identities(baseline["services"])
+    baseline_names = {service["name"] for service in baseline["services"]}
+    if baseline["captured"]:
+        if baseline_names != APP_SERVICES:
+            raise TransactionError
+    elif baseline["control"] is not None or baseline["services"]:
+        raise TransactionError
 
     failed_forward = _require_exact_fields(
         document["failed_forward"],
-        {"services", "control"},
+        {"captured", "services", "control"},
     )
+    if not isinstance(failed_forward["captured"], bool):
+        raise TransactionError
     _validate_service_identities(failed_forward["services"])
     if failed_forward["control"] is not None:
         _validate_failed_forward_control(failed_forward["control"])
+    if not failed_forward["captured"] and (
+        failed_forward["control"] is not None or failed_forward["services"]
+    ):
+        raise TransactionError
+    if any(
+        service["name"] not in APP_SERVICES
+        for service in failed_forward["services"]
+    ):
+        raise TransactionError
 
     forward = _require_exact_fields(
         document["forward"],
         {"namespace", "control", "marker", "workers"},
     )
-    _require_string(forward["namespace"], r"[a-z0-9][a-z0-9-]{0,127}", maximum=128)
+    _require_string(
+        forward["namespace"],
+        r"[a-z0-9][a-z0-9-]{0,127}",
+        maximum=128,
+    )
     if forward["control"] is not None:
         _validate_control_identity(forward["control"])
     if forward["marker"] is not None:
@@ -1277,14 +1509,118 @@ def _validate_document(value: object) -> dict[str, Any]:
 
     rollback = _require_exact_fields(
         document["rollback"],
-        {"attempt", "control", "marker", "workers"},
+        {
+            "attempt",
+            "namespace",
+            "marker_generation",
+            "control",
+            "marker",
+            "workers",
+        },
     )
     _require_integer(rollback["attempt"])
+    _require_optional_string(
+        rollback["namespace"],
+        r"rollback-[1-9][0-9]{1,19}",
+        maximum=29,
+    )
+    _require_optional_string(
+        rollback["marker_generation"],
+        r"m-rb-[0-9a-f]{12}-[1-9][0-9]*",
+        maximum=64,
+    )
+    if rollback["attempt"] == 0:
+        rollback_identity_valid = (
+            rollback["namespace"] is None
+            and rollback["marker_generation"] is None
+        )
+    else:
+        rollback_identity_valid = (
+            rollback["namespace"] is not None
+            and rollback["marker_generation"] is not None
+        )
+    if not rollback_identity_valid:
+        raise TransactionError
     if rollback["control"] is not None:
         _validate_control_identity(rollback["control"])
     if rollback["marker"] is not None:
         _validate_marker_identity(rollback["marker"])
     _validate_worker_identities(rollback["workers"])
+
+    retiring_outcome = document["retiring_outcome"]
+    if retiring_outcome not in {None, "succeeded", "rolled_back", "manual"}:
+        raise TransactionError
+    if document["phase"] == "RETIRING":
+        if retiring_outcome is None:
+            raise TransactionError
+    elif document["phase"] == "DONE" and document["outcome"] != "aborted":
+        if retiring_outcome != document["outcome"]:
+            raise TransactionError
+    elif retiring_outcome is not None:
+        raise TransactionError
+
+    phase = document["phase"]
+    transaction_advanced = phase not in {"PREPARING", "ABORTING"} and not (
+        phase == "DONE" and document["outcome"] == "aborted"
+    )
+    if transaction_advanced and not baseline["captured"]:
+        raise TransactionError
+    rollback_started = phase in {
+        "ROLLBACK_PREPARING",
+        "ROLLBACK_APPLYING",
+        "ROLLBACK_VERIFIED",
+        "ROLLBACK_WORKERS_PROMOTED",
+        "ROLLBACK_MARKER_PROMOTED",
+        "ROLLBACK_CONTROL_PROMOTED",
+        "CANDIDATE_RESTORE_REQUIRED",
+        "CANDIDATE_RESTORING",
+        "CANDIDATE_RESTORED",
+    } or (
+        phase in {"RETIRING", "DONE"}
+        and retiring_outcome == "rolled_back"
+    )
+    if rollback_started and not failed_forward["captured"]:
+        raise TransactionError
+    rollback_allocated = phase in {
+        "ROLLBACK_APPLYING",
+        "ROLLBACK_VERIFIED",
+        "ROLLBACK_WORKERS_PROMOTED",
+        "ROLLBACK_MARKER_PROMOTED",
+        "ROLLBACK_CONTROL_PROMOTED",
+    } or (
+        phase in {"RETIRING", "DONE"}
+        and retiring_outcome == "rolled_back"
+    )
+    if rollback_allocated and rollback["attempt"] < 1:
+        raise TransactionError
+    forward_verified = phase in {
+        "FORWARD_VERIFIED",
+        "WORKERS_PROMOTED",
+        "MARKER_PROMOTED",
+        "CONTROL_PROMOTED",
+    } or (
+        phase in {"RETIRING", "DONE"}
+        and retiring_outcome == "succeeded"
+    )
+    if forward_verified and any(
+        worker["applied_stage"] != "verified"
+        for worker in forward["workers"]
+    ):
+        raise TransactionError
+    rollback_verified = phase in {
+        "ROLLBACK_VERIFIED",
+        "ROLLBACK_WORKERS_PROMOTED",
+        "ROLLBACK_MARKER_PROMOTED",
+        "ROLLBACK_CONTROL_PROMOTED",
+    } or (
+        phase in {"RETIRING", "DONE"}
+        and retiring_outcome == "rolled_back"
+    )
+    if rollback_verified and any(
+        worker["applied_stage"] != "verified"
+        for worker in rollback["workers"]
+    ):
+        raise TransactionError
 
     promotion = _require_exact_fields(
         document["promotion"],
@@ -1339,6 +1675,7 @@ def _validate_document(value: object) -> dict[str, Any]:
     janitor = _require_exact_fields(document["janitor"], {"service"})
     if janitor["service"] is not None:
         _validate_janitor_service(janitor["service"])
+    _validate_vision_jobs(document["vision_jobs"])
 
     if document["last_error"] is not None:
         last_error = _require_exact_fields(
@@ -1457,11 +1794,8 @@ def _read_active_from_descriptor(
     finally:
         os.close(descriptor)
     decoded = _decode_canonical(payload)
-    if (
-        isinstance(decoded, dict)
-        and decoded.get("schema") == 1
-        and set(decoded) == LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS
-    ):
+    if isinstance(decoded, dict) and set(decoded) == LEGACY_SCHEMA_1_TOP_LEVEL_FIELDS:
+        _require_exact_schema(decoded.get("schema"), 1)
         legacy = _validate_legacy_schema_1_document(decoded)
         if not allow_legacy_quarantine:
             raise TransactionError
@@ -1476,6 +1810,38 @@ def _read_active_from_descriptor(
     else:
         document = _validate_document(decoded)
     return document, _identity(opened)
+
+
+def _read_app_progress_from_descriptor(
+    transaction_descriptor: int,
+    *,
+    allow_missing: bool,
+) -> tuple[dict[str, Any] | None, tuple[int, int] | None]:
+    try:
+        before = os.stat(
+            APP_PROGRESS_NAME,
+            dir_fd=transaction_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        if allow_missing:
+            return None, None
+        raise TransactionError
+    _require_regular(before, FILE_MODE, single_link=True)
+    descriptor = os.open(
+        APP_PROGRESS_NAME,
+        _read_file_flags(),
+        dir_fd=transaction_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        _require_regular(opened, FILE_MODE, single_link=True)
+        if _identity(before) != _identity(opened):
+            raise TransactionError
+        payload = _read_limited(descriptor)
+    finally:
+        os.close(descriptor)
+    return _validate_app_progress(_decode_canonical(payload)), _identity(opened)
 
 
 def _write_document(
@@ -1751,6 +2117,13 @@ def _print_json(value: object) -> None:
     sys.stdout.buffer.write(_canonical(value))
 
 
+def _read_stdin_json() -> object:
+    payload = sys.stdin.buffer.read(MAX_DOCUMENT_BYTES + 1)
+    if not payload or len(payload) > MAX_DOCUMENT_BYTES:
+        raise TransactionError
+    return _decode_canonical(payload)
+
+
 def _new_document(
     *,
     target_commit: str,
@@ -1793,11 +2166,16 @@ def _new_document(
         "authorities": [],
         "prepared_secrets": [],
         "baseline": {
+            "captured": False,
             "kind": baseline_kind,
             "control": None,
             "services": [],
         },
-        "failed_forward": {"services": [], "control": None},
+        "failed_forward": {
+            "captured": False,
+            "services": [],
+            "control": None,
+        },
         "forward": {
             "namespace": namespace,
             "control": None,
@@ -1806,6 +2184,8 @@ def _new_document(
         },
         "rollback": {
             "attempt": 0,
+            "namespace": None,
+            "marker_generation": None,
             "control": None,
             "marker": None,
             "workers": [],
@@ -1816,7 +2196,9 @@ def _new_document(
             "control": False,
         },
         "pending_retirements": [],
+        "retiring_outcome": None,
         "janitor": {"service": None},
+        "vision_jobs": [],
         "last_error": None,
         "operation": None,
         "abort": None,
@@ -2032,7 +2414,7 @@ def record_authority_intent(arguments: list[str]) -> None:
     ) = arguments
 
     def updater(document: dict[str, Any]) -> None:
-        if document["phase"] != "PREPARING":
+        if document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}:
             raise TransactionError
         authority = _validate_authority(
             {
@@ -2089,7 +2471,7 @@ def _mark_authority(
     raw_root, raw_lock_descriptor, kind, service, generation = arguments
 
     def updater(document: dict[str, Any]) -> None:
-        if document["phase"] != "PREPARING":
+        if document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}:
             raise TransactionError
         matches = [
             authority
@@ -2139,7 +2521,7 @@ def record_prepared_secret(arguments: list[str]) -> None:
     reference = _prepared_secret_reference(reference_arguments)
 
     def updater(document: dict[str, Any]) -> None:
-        if document["phase"] != "PREPARING":
+        if document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}:
             raise TransactionError
         logical_key = (
             reference["name"],
@@ -2198,7 +2580,10 @@ def lookup_prepared_secret(arguments: list[str]) -> None:
             transactions_descriptor,
             allow_missing=False,
         )
-        if document is None or document["phase"] != "PREPARING":
+        if document is None or document["phase"] not in {
+            "PREPARING",
+            "FORWARD_APPLYING",
+        }:
             raise TransactionError
         matches = [
             reference
@@ -2226,6 +2611,37 @@ def _set_phase(document: dict[str, Any], target_phase: str, outcome: str | None)
         or document["operation"] is not None
     ):
         raise TransactionError
+    if target_phase == "FORWARD_APPLYING" and not document["baseline"]["captured"]:
+        raise TransactionError
+    if (
+        target_phase == "FORWARD_VERIFIED"
+        and any(
+            worker["applied_stage"] != "verified"
+            for worker in document["forward"]["workers"]
+        )
+    ):
+        raise TransactionError
+    if (
+        target_phase == "ROLLBACK_PREPARING"
+        and not document["failed_forward"]["captured"]
+    ):
+        raise TransactionError
+    if target_phase == "ROLLBACK_APPLYING":
+        rollback = document["rollback"]
+        if (
+            rollback["attempt"] < 1
+            or rollback["namespace"] is None
+            or rollback["marker_generation"] is None
+        ):
+            raise TransactionError
+    if (
+        target_phase == "ROLLBACK_VERIFIED"
+        and any(
+            worker["applied_stage"] != "verified"
+            for worker in document["rollback"]["workers"]
+        )
+    ):
+        raise TransactionError
     if target_phase == "WORKERS_PROMOTED":
         document["promotion"]["workers"] = True
     elif target_phase == "MARKER_PROMOTED":
@@ -2250,7 +2666,19 @@ def _set_phase(document: dict[str, Any], target_phase: str, outcome: str | None)
         if not document["promotion"]["marker"]:
             raise TransactionError
         document["promotion"]["control"] = True
+    elif target_phase == "RETIRING":
+        if outcome is None:
+            outcome = (
+                "rolled_back"
+                if current_phase == "ROLLBACK_CONTROL_PROMOTED"
+                else "succeeded"
+            )
+        if outcome not in {"succeeded", "rolled_back", "manual"}:
+            raise TransactionError
+        document["retiring_outcome"] = outcome
     elif target_phase == "DONE":
+        if any(job["state"] != "removed" for job in document["vision_jobs"]):
+            raise TransactionError
         if outcome == "aborted":
             if (
                 current_phase != "ABORTING"
@@ -2269,10 +2697,11 @@ def _set_phase(document: dict[str, Any], target_phase: str, outcome: str | None)
             document["pending_retirements"]
             or not all(document["promotion"].values())
             or outcome not in {"succeeded", "rolled_back", "manual"}
+            or outcome != document["retiring_outcome"]
         ):
             raise TransactionError
         document["outcome"] = outcome
-    if target_phase != "DONE" and outcome is not None:
+    if target_phase not in {"RETIRING", "DONE"} and outcome is not None:
         raise TransactionError
     document["phase"] = target_phase
 
@@ -2300,7 +2729,9 @@ def _update_document(
             or document["revision"] != expected_revision
         ):
             raise TransactionError
-        updater(document)
+        changed = updater(document)
+        if changed is False:
+            return document
         document["revision"] = expected_revision + 1
         _write_active(
             transactions_descriptor,
@@ -2333,10 +2764,21 @@ def begin_abort(arguments: list[str]) -> None:
     _require_string(reason, r"[a-z][a-z0-9_]{0,63}", maximum=64)
 
     def updater(document: dict[str, Any]) -> None:
+        aborting_forward = document["phase"] == "FORWARD_APPLYING"
         if (
-            document["phase"] != "PREPARING"
+            document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}
             or document["operation"] is not None
             or document["abort"] is not None
+            or (
+                aborting_forward
+                and (
+                    document["janitor"]["service"] is not None
+                    or any(
+                        worker["applied_stage"] in {"applied", "verified"}
+                        for worker in document["forward"]["workers"]
+                    )
+                )
+            )
         ):
             raise TransactionError
         document["abort"] = {
@@ -2550,6 +2992,225 @@ def finish_abort(arguments: list[str]) -> None:
     _print_json(document)
 
 
+def _update_app_progress(
+    raw_root: str,
+    raw_lock_descriptor: str,
+    allowed_phases: set[str],
+    updater: Any,
+) -> dict[str, Any]:
+    _require_writer_lock(raw_root, raw_lock_descriptor)
+    _root, root_descriptor, transactions_descriptor = _open_transactions(
+        raw_root,
+        create=False,
+    )
+    try:
+        document, _active_identity = _read_active_from_descriptor(
+            transactions_descriptor,
+            allow_missing=False,
+        )
+        if document is None or document["phase"] not in allowed_phases:
+            raise TransactionError
+        transaction_descriptor = _open_child_directory(
+            transactions_descriptor,
+            document["transaction_id"],
+            create=False,
+        )
+        try:
+            progress, progress_identity = _read_app_progress_from_descriptor(
+                transaction_descriptor,
+                allow_missing=False,
+            )
+            if (
+                progress is None
+                or progress_identity is None
+                or progress["transaction_id"] != document["transaction_id"]
+                or progress["target_commit"] != document["target_commit"]
+            ):
+                raise TransactionError
+            changed = updater(progress)
+            if changed is not False:
+                _write_document(
+                    transaction_descriptor,
+                    APP_PROGRESS_NAME,
+                    progress,
+                    expected_identity=progress_identity,
+                    validator=_validate_app_progress,
+                )
+        finally:
+            os.close(transaction_descriptor)
+    finally:
+        os.close(transactions_descriptor)
+        os.close(root_descriptor)
+    return progress
+
+
+def init_app_progress(arguments: list[str]) -> None:
+    if len(arguments) != 2:
+        raise TransactionError
+    raw_root, raw_lock_descriptor = arguments
+    _require_writer_lock(raw_root, raw_lock_descriptor)
+    _root, root_descriptor, transactions_descriptor = _open_transactions(
+        raw_root,
+        create=False,
+    )
+    try:
+        document, _active_identity = _read_active_from_descriptor(
+            transactions_descriptor,
+            allow_missing=False,
+        )
+        if document is None or document["phase"] != "PREPARING":
+            raise TransactionError
+        transaction_descriptor = _open_child_directory(
+            transactions_descriptor,
+            document["transaction_id"],
+            create=False,
+        )
+        try:
+            expected = {
+                "schema": 1,
+                "transaction_id": document["transaction_id"],
+                "target_commit": document["target_commit"],
+                "attempted_services": [],
+                "migration_state": "pending",
+            }
+            progress, progress_identity = _read_app_progress_from_descriptor(
+                transaction_descriptor,
+                allow_missing=True,
+            )
+            if progress is None:
+                _write_document(
+                    transaction_descriptor,
+                    APP_PROGRESS_NAME,
+                    expected,
+                    expected_identity=None,
+                    validator=_validate_app_progress,
+                )
+                progress = expected
+            elif progress_identity is None or progress != expected:
+                raise TransactionError
+        finally:
+            os.close(transaction_descriptor)
+    finally:
+        os.close(transactions_descriptor)
+        os.close(root_descriptor)
+    _print_json(progress)
+
+
+def record_app_attempt(arguments: list[str]) -> None:
+    if len(arguments) != 3:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, service = arguments
+    if service not in APP_SERVICES:
+        raise TransactionError
+
+    def updater(progress: dict[str, Any]) -> bool | None:
+        if service in progress["attempted_services"]:
+            return False
+        progress["attempted_services"].append(service)
+        return None
+
+    progress = _update_app_progress(
+        raw_root,
+        raw_lock_descriptor,
+        {"FORWARD_APPLYING"},
+        updater,
+    )
+    _print_json(progress)
+
+
+def remove_app_attempt(arguments: list[str]) -> None:
+    if len(arguments) != 3:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, service = arguments
+    if service not in APP_SERVICES:
+        raise TransactionError
+
+    def updater(progress: dict[str, Any]) -> bool | None:
+        if service not in progress["attempted_services"]:
+            return False
+        progress["attempted_services"] = [
+            attempted
+            for attempted in progress["attempted_services"]
+            if attempted != service
+        ]
+        return None
+
+    progress = _update_app_progress(
+        raw_root,
+        raw_lock_descriptor,
+        {"FORWARD_APPLYING"},
+        updater,
+    )
+    _print_json(progress)
+
+
+def advance_migration_state(arguments: list[str]) -> None:
+    if len(arguments) != 4:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, expected_state, target_state = arguments
+    if (expected_state, target_state) not in {
+        ("pending", "applying"),
+        ("applying", "applied"),
+    }:
+        raise TransactionError
+
+    def updater(progress: dict[str, Any]) -> bool | None:
+        current_state = progress["migration_state"]
+        if current_state == target_state:
+            return False
+        if current_state != expected_state:
+            raise TransactionError
+        progress["migration_state"] = target_state
+        return None
+
+    progress = _update_app_progress(
+        raw_root,
+        raw_lock_descriptor,
+        {"FORWARD_APPLYING"},
+        updater,
+    )
+    _print_json(progress)
+
+
+def read_app_progress(arguments: list[str]) -> None:
+    if len(arguments) != 1:
+        raise TransactionError
+    raw_root = arguments[0]
+    _root, root_descriptor, transactions_descriptor = _open_transactions(
+        raw_root,
+        create=False,
+    )
+    try:
+        document, _active_identity = _read_active_from_descriptor(
+            transactions_descriptor,
+            allow_missing=False,
+        )
+        if document is None:
+            raise TransactionError
+        transaction_descriptor = _open_child_directory(
+            transactions_descriptor,
+            document["transaction_id"],
+            create=False,
+        )
+        try:
+            progress, _progress_identity = _read_app_progress_from_descriptor(
+                transaction_descriptor,
+                allow_missing=False,
+            )
+            if (
+                progress is None
+                or progress["transaction_id"] != document["transaction_id"]
+                or progress["target_commit"] != document["target_commit"]
+            ):
+                raise TransactionError
+        finally:
+            os.close(transaction_descriptor)
+    finally:
+        os.close(transactions_descriptor)
+        os.close(root_descriptor)
+    _print_json(progress)
+
+
 def transition(arguments: list[str]) -> None:
     if len(arguments) not in {4, 5}:
         raise TransactionError
@@ -2562,6 +3223,691 @@ def transition(arguments: list[str]) -> None:
         lambda value: _set_phase(value, target_phase, outcome),
     )
     _print_json(document)
+
+
+def capture_baseline(arguments: list[str]) -> None:
+    if len(arguments) != 3:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision = arguments
+    captured = _require_exact_fields(
+        _read_stdin_json(),
+        {"kind", "control", "services"},
+    )
+    if captured["kind"] not in {"managed", "legacy_no_control"}:
+        raise TransactionError
+    if captured["control"] is not None:
+        _validate_control_identity(captured["control"])
+    if (captured["kind"] == "managed") != (captured["control"] is not None):
+        raise TransactionError
+    _validate_service_identities(captured["services"])
+    if {service["name"] for service in captured["services"]} != APP_SERVICES:
+        raise TransactionError
+    desired = {
+        "captured": True,
+        "kind": captured["kind"],
+        "control": captured["control"],
+        "services": captured["services"],
+    }
+
+    def updater(document: dict[str, Any]) -> bool | None:
+        if document["phase"] != "PREPARING" or document["operation"] is not None:
+            raise TransactionError
+        if document["baseline"]["kind"] != captured["kind"]:
+            raise TransactionError
+        if document["baseline"]["captured"]:
+            if document["baseline"] != desired:
+                raise TransactionError
+            return False
+        document["baseline"] = desired
+        return None
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def capture_failed_forward(arguments: list[str]) -> None:
+    if len(arguments) != 3:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision = arguments
+    captured = _require_exact_fields(
+        _read_stdin_json(),
+        {"control", "services"},
+    )
+    if captured["control"] is not None:
+        _validate_failed_forward_control(captured["control"])
+    _validate_service_identities(captured["services"])
+    if any(
+        not service["existed"] or service["name"] not in APP_SERVICES
+        for service in captured["services"]
+    ):
+        raise TransactionError
+    desired = {
+        "captured": True,
+        "control": captured["control"],
+        "services": captured["services"],
+    }
+
+    def updater(document: dict[str, Any]) -> bool | None:
+        if document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}:
+            raise TransactionError
+        if document["operation"] is not None:
+            raise TransactionError
+        if document["failed_forward"]["captured"]:
+            if document["failed_forward"] != desired:
+                raise TransactionError
+            return False
+        document["failed_forward"] = desired
+        return None
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def allocate_rollback_attempt(arguments: list[str]) -> None:
+    if len(arguments) != 3:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision = arguments
+
+    def updater(document: dict[str, Any]) -> bool | None:
+        if (
+            document["phase"] != "ROLLBACK_PREPARING"
+            or document["operation"] is not None
+        ):
+            raise TransactionError
+        rollback = document["rollback"]
+        if rollback["attempt"] != 0:
+            return False
+        attempt = 1
+        transaction_hex = document["transaction_id"][3:]
+        namespace_number = int(transaction_hex[:15], 16) + 10**17
+        rollback["attempt"] = attempt
+        rollback["namespace"] = f"rollback-{namespace_number}"
+        rollback["marker_generation"] = (
+            f"m-rb-{transaction_hex[:12]}-{attempt}"
+        )
+        return None
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def _record_selection(
+    arguments: list[str],
+    field: str,
+    validator: Any,
+) -> None:
+    if len(arguments) != 4:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, direction = arguments
+    if direction == "forward":
+        allowed_phases = {"PREPARING", "FORWARD_APPLYING"}
+    elif direction == "rollback":
+        allowed_phases = {"ROLLBACK_PREPARING", "ROLLBACK_APPLYING"}
+    else:
+        raise TransactionError
+    selection = _read_stdin_json()
+    validator(selection)
+
+    def updater(document: dict[str, Any]) -> bool | None:
+        if (
+            document["phase"] not in allowed_phases
+            or document["operation"] is not None
+        ):
+            raise TransactionError
+        existing = document[direction][field]
+        if existing is not None:
+            if existing != selection:
+                raise TransactionError
+            return False
+        document[direction][field] = selection
+        return None
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def record_control_selection(arguments: list[str]) -> None:
+    _record_selection(arguments, "control", _validate_control_identity)
+
+
+def record_marker_selection(arguments: list[str]) -> None:
+    _record_selection(arguments, "marker", _validate_marker_identity)
+
+
+def record_janitor_service(arguments: list[str]) -> None:
+    if len(arguments) != 3:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision = arguments
+    service = _read_stdin_json()
+    _validate_janitor_service(service)
+
+    def updater(document: dict[str, Any]) -> bool | None:
+        if (
+            document["phase"]
+            not in {"PREPARING", "FORWARD_APPLYING", "ROLLBACK_APPLYING"}
+            or document["operation"] is not None
+        ):
+            raise TransactionError
+        existing = document["janitor"]["service"]
+        if existing is not None:
+            if existing != service:
+                raise TransactionError
+            return False
+        document["janitor"]["service"] = service
+        return None
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def clear_janitor_service(arguments: list[str]) -> None:
+    if len(arguments) != 3:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision = arguments
+    service = _read_stdin_json()
+    _validate_janitor_service(service)
+
+    def updater(document: dict[str, Any]) -> bool | None:
+        if (
+            document["phase"] != "ROLLBACK_APPLYING"
+            or document["operation"] is not None
+        ):
+            raise TransactionError
+        existing = document["janitor"]["service"]
+        if existing is None:
+            return False
+        if existing != service:
+            raise TransactionError
+        document["janitor"]["service"] = None
+        return None
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def _worker_plan_direction(
+    document: dict[str, Any],
+    direction: str,
+) -> list[dict[str, Any]]:
+    if direction == "forward":
+        allowed_phases = {"PREPARING", "FORWARD_APPLYING"}
+    elif direction == "rollback":
+        allowed_phases = {"ROLLBACK_PREPARING", "ROLLBACK_APPLYING"}
+        if document["rollback"]["attempt"] == 0:
+            raise TransactionError
+    else:
+        raise TransactionError
+    if document["phase"] not in allowed_phases:
+        raise TransactionError
+    return document[direction]["workers"]
+
+
+def record_worker_plan(arguments: list[str]) -> None:
+    if len(arguments) != 4:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, direction = arguments
+    plan = _require_exact_fields(
+        _read_stdin_json(),
+        {
+            "service",
+            "generation",
+            "commit",
+            "image",
+            "target_spec_digest",
+            "database_secret",
+            "admission_secret",
+        },
+    )
+    worker = {
+        **plan,
+        "docker_service_id": None,
+        "applied_stage": "pending",
+    }
+    _validate_worker_identity(worker)
+
+    def updater(document: dict[str, Any]) -> bool | None:
+        if document["operation"] is not None:
+            raise TransactionError
+        workers = _worker_plan_direction(document, direction)
+        matches = [
+            existing
+            for existing in workers
+            if (
+                existing["service"] == worker["service"]
+                and existing["generation"] == worker["generation"]
+            )
+        ]
+        if matches:
+            if len(matches) != 1 or any(
+                matches[0][field] != plan[field]
+                for field in plan
+                if field != "target_spec_digest"
+            ):
+                raise TransactionError
+            return False
+        workers.append(worker)
+        return None
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def advance_worker_stage(arguments: list[str]) -> None:
+    if len(arguments) != 10:
+        raise TransactionError
+    (
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        direction,
+        service,
+        raw_generation,
+        expected_stage,
+        target_stage,
+        raw_service_id,
+        raw_spec_digest,
+    ) = arguments
+    _require_string(service, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
+    if re.fullmatch(r"[1-9][0-9]{0,18}", raw_generation) is None:
+        raise TransactionError
+    generation = int(raw_generation, 10)
+    if WORKER_STAGE_SUCCESSORS.get(expected_stage) != target_stage:
+        raise TransactionError
+    service_id = None
+    if raw_service_id != "-":
+        service_id = _require_string(
+            raw_service_id,
+            r"[0-9a-z]{12,64}",
+            maximum=64,
+        )
+    spec_digest = None
+    if raw_spec_digest != "-":
+        spec_digest = _require_string(
+            raw_spec_digest,
+            r"[0-9a-f]{64}",
+            maximum=64,
+        )
+
+    def updater(document: dict[str, Any]) -> bool | None:
+        if document["operation"] is not None:
+            raise TransactionError
+        workers = _worker_plan_direction(document, direction)
+        matches = [
+            worker
+            for worker in workers
+            if (
+                worker["service"] == service
+                and worker["generation"] == generation
+            )
+        ]
+        if len(matches) != 1:
+            raise TransactionError
+        worker = matches[0]
+        current_stage = worker["applied_stage"]
+        if WORKER_STAGE_ORDER[current_stage] >= WORKER_STAGE_ORDER[target_stage]:
+            if target_stage == "prepared":
+                if service_id is not None or spec_digest is not None:
+                    raise TransactionError
+            elif (
+                service_id != worker["docker_service_id"]
+                or spec_digest != worker["target_spec_digest"]
+            ):
+                raise TransactionError
+            return False
+        if current_stage != expected_stage:
+            raise TransactionError
+        if target_stage == "prepared":
+            if (
+                service_id is not None
+                or spec_digest is not None
+                or worker["docker_service_id"] is not None
+                or worker["target_spec_digest"] is not None
+            ):
+                raise TransactionError
+        elif target_stage == "applied":
+            if (
+                service_id is None
+                or spec_digest is None
+                or worker["docker_service_id"] is not None
+                or worker["target_spec_digest"] is not None
+            ):
+                raise TransactionError
+            worker["docker_service_id"] = service_id
+            worker["target_spec_digest"] = spec_digest
+        elif (
+            target_stage == "verified"
+            and (
+                service_id != worker["docker_service_id"]
+                or spec_digest != worker["target_spec_digest"]
+            )
+        ):
+            raise TransactionError
+        worker["applied_stage"] = target_stage
+        return None
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def record_runtime_secret(arguments: list[str]) -> None:
+    if len(arguments) != 7:
+        raise TransactionError
+    (
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        role,
+        runtime_generation,
+        secret_name,
+        docker_secret_id,
+    ) = arguments
+    _require_string(role, r"[a-z][a-z0-9_-]{0,63}", maximum=64)
+    _require_string(
+        runtime_generation,
+        r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
+    )
+    _require_string(secret_name, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
+    _require_string(docker_secret_id, r"[a-z0-9]{20,64}", maximum=64)
+
+    def updater(document: dict[str, Any]) -> None:
+        if document["phase"] != "PREPARING" or document["operation"] is not None:
+            raise TransactionError
+        reference = {
+            "runtime_generation": runtime_generation,
+            "secret_name": secret_name,
+            "docker_secret_id": docker_secret_id,
+        }
+        existing = document["runtime_redis"].get(role)
+        if existing is not None and existing != reference:
+            raise TransactionError
+        document["runtime_redis"][role] = reference
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def prepare_vision_job(arguments: list[str]) -> None:
+    if len(arguments) != 9:
+        raise TransactionError
+    (
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        mode,
+        name,
+        image,
+        redis_role,
+        database_secret_name,
+        database_secret_id,
+    ) = arguments
+    if mode not in {"safety", "final-safety", "check", "reconcile"}:
+        raise TransactionError
+    _require_string(
+        name,
+        r"vp-vision-cutover-(safety|final-safety|check|reconcile)-[0-9a-f]{12}",
+    )
+    _require_string(image, r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}")
+    if redis_role not in {"watcher", "control"}:
+        raise TransactionError
+
+    def updater(document: dict[str, Any]) -> None:
+        if (
+            document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}
+            or document["operation"] is not None
+        ):
+            raise TransactionError
+        if (mode == "reconcile") != (redis_role == "control"):
+            raise TransactionError
+        runtime_reference = document["runtime_redis"].get(redis_role)
+        if runtime_reference is None:
+            raise TransactionError
+        redis_secret = {
+            "name": runtime_reference["secret_name"],
+            "docker_secret_id": runtime_reference["docker_secret_id"],
+            "service": "worker-redis-runtime",
+            "generation": runtime_reference["runtime_generation"],
+            "purpose": redis_role,
+        }
+        database_secret = None
+        if mode in {"safety", "final-safety"}:
+            database_purpose = (
+                "final-safety-database"
+                if mode == "final-safety"
+                else "safety-database"
+            )
+            matches = [
+                reference
+                for reference in document["prepared_secrets"]
+                if (
+                    reference["name"] == database_secret_name
+                    and reference["docker_secret_id"] == database_secret_id
+                    and reference["service"] == "vision-cutover"
+                    and reference["generation"] == document["transaction_id"]
+                    and reference["purpose"] == database_purpose
+                )
+            ]
+            if len(matches) != 1:
+                raise TransactionError
+            database_secret = dict(matches[0])
+        elif database_secret_name != "-" or database_secret_id != "-":
+            raise TransactionError
+        job = {
+            "mode": mode,
+            "name": name,
+            "image": image,
+            "redis_secret": redis_secret,
+            "database_secret": database_secret,
+            "docker_service_id": None,
+            "state": "planned",
+            "exit_code": None,
+        }
+        matches = [item for item in document["vision_jobs"] if item["mode"] == mode]
+        if matches:
+            if len(matches) != 1 or any(
+                matches[0][field] != job[field]
+                for field in (
+                    "mode", "name", "image", "redis_secret", "database_secret"
+                )
+            ):
+                raise TransactionError
+            return
+        document["vision_jobs"].append(job)
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def record_vision_job_service(arguments: list[str]) -> None:
+    if len(arguments) != 5:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, mode, service_id = arguments
+    _require_string(service_id, r"[a-z0-9]{12,64}", maximum=64)
+
+    def updater(document: dict[str, Any]) -> None:
+        matches = [item for item in document["vision_jobs"] if item["mode"] == mode]
+        if len(matches) != 1:
+            raise TransactionError
+        job = matches[0]
+        if job["state"] == "planned" and job["docker_service_id"] is None:
+            job["docker_service_id"] = service_id
+            job["state"] = "created"
+        elif job["docker_service_id"] != service_id:
+            raise TransactionError
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def record_vision_job_terminal(arguments: list[str]) -> None:
+    if len(arguments) != 5:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, mode, raw_exit_code = arguments
+    exit_code = _parse_revision(raw_exit_code)
+    if exit_code > 255:
+        raise TransactionError
+
+    def updater(document: dict[str, Any]) -> None:
+        matches = [item for item in document["vision_jobs"] if item["mode"] == mode]
+        if len(matches) != 1:
+            raise TransactionError
+        job = matches[0]
+        if job["state"] == "created":
+            job["state"] = "terminal"
+            job["exit_code"] = exit_code
+        elif job["state"] not in {"terminal", "removed"} or job["exit_code"] != exit_code:
+            raise TransactionError
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def complete_vision_job_removal(arguments: list[str]) -> None:
+    if len(arguments) != 4:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, mode = arguments
+
+    def updater(document: dict[str, Any]) -> None:
+        matches = [item for item in document["vision_jobs"] if item["mode"] == mode]
+        if len(matches) != 1 or matches[0]["state"] != "terminal":
+            raise TransactionError
+        job = matches[0]
+        if job["database_secret"] is not None:
+            expected = job["database_secret"]
+            document["prepared_secrets"] = [
+                reference
+                for reference in document["prepared_secrets"]
+                if reference != expected
+            ]
+        job["state"] = "removed"
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def abort_vision_job_removal(arguments: list[str]) -> None:
+    if len(arguments) != 4:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, mode = arguments
+
+    def updater(document: dict[str, Any]) -> None:
+        if document["phase"] not in {
+            "PREPARING",
+            "FORWARD_APPLYING",
+            "ABORTING",
+        } or document["operation"] is not None:
+            raise TransactionError
+        matches = [item for item in document["vision_jobs"] if item["mode"] == mode]
+        if len(matches) != 1:
+            raise TransactionError
+        job = matches[0]
+        if job["state"] == "removed":
+            return
+        if job["database_secret"] is not None:
+            expected = job["database_secret"]
+            document["prepared_secrets"] = [
+                reference
+                for reference in document["prepared_secrets"]
+                if reference != expected
+            ]
+        job["state"] = "removed"
+        job["exit_code"] = 255
+
+    document = _update_document(
+        raw_root,
+        raw_lock_descriptor,
+        raw_revision,
+        updater,
+    )
+    _print_json(document)
+
+
+def lookup_vision_job(arguments: list[str]) -> None:
+    if len(arguments) != 2:
+        raise TransactionError
+    raw_root, mode = arguments
+    _root, root_descriptor, transactions_descriptor = _open_transactions(
+        raw_root,
+        create=False,
+    )
+    try:
+        document, _active_identity = _read_active_from_descriptor(
+            transactions_descriptor,
+            allow_missing=False,
+        )
+        if document is None:
+            raise TransactionError
+        matches = [item for item in document["vision_jobs"] if item["mode"] == mode]
+        if len(matches) > 1:
+            raise TransactionError
+        _print_json(matches[0] if matches else None)
+    finally:
+        os.close(transactions_descriptor)
+        os.close(root_descriptor)
 
 
 def queue_retirement(arguments: list[str]) -> None:
@@ -2769,6 +4115,42 @@ def replay_plan(raw_root: str) -> None:
     )
 
 
+def replay_state(raw_root: str) -> None:
+    _root, root_descriptor, transactions_descriptor = _open_transactions(
+        raw_root,
+        create=False,
+    )
+    try:
+        document, _active_identity = _read_active_from_descriptor(
+            transactions_descriptor,
+            allow_missing=False,
+        )
+        if document is None:
+            raise TransactionError
+        transaction_descriptor = _open_child_directory(
+            transactions_descriptor,
+            document["transaction_id"],
+            create=False,
+        )
+        try:
+            progress, _progress_identity = _read_app_progress_from_descriptor(
+                transaction_descriptor,
+                allow_missing=True,
+            )
+            if progress is not None and (
+                progress["transaction_id"] != document["transaction_id"]
+                or progress["target_commit"] != document["target_commit"]
+            ):
+                raise TransactionError
+        finally:
+            os.close(transaction_descriptor)
+    finally:
+        os.close(transactions_descriptor)
+        os.close(root_descriptor)
+    replay = {**document, "app_progress": progress}
+    _print_json(replay)
+
+
 def archive(arguments: list[str]) -> None:
     if len(arguments) != 3:
         raise TransactionError
@@ -2892,8 +4274,71 @@ def main(arguments: list[str]) -> int:
     if arguments and arguments[0] == "finish-abort":
         finish_abort(arguments[1:])
         return 0
+    if arguments and arguments[0] == "init-app-progress":
+        init_app_progress(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-app-attempt":
+        record_app_attempt(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "remove-app-attempt":
+        remove_app_attempt(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "advance-migration-state":
+        advance_migration_state(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "read-app-progress":
+        read_app_progress(arguments[1:])
+        return 0
     if arguments and arguments[0] == "transition":
         transition(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "capture-baseline":
+        capture_baseline(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "capture-failed-forward":
+        capture_failed_forward(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "allocate-rollback-attempt":
+        allocate_rollback_attempt(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-control-selection":
+        record_control_selection(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-marker-selection":
+        record_marker_selection(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-janitor-service":
+        record_janitor_service(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "clear-janitor-service":
+        clear_janitor_service(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-worker-plan":
+        record_worker_plan(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "advance-worker-stage":
+        advance_worker_stage(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-runtime-secret":
+        record_runtime_secret(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "prepare-vision-job":
+        prepare_vision_job(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-vision-job-service":
+        record_vision_job_service(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "record-vision-job-terminal":
+        record_vision_job_terminal(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "complete-vision-job-removal":
+        complete_vision_job_removal(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "abort-vision-job-removal":
+        abort_vision_job_removal(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "lookup-vision-job":
+        lookup_vision_job(arguments[1:])
         return 0
     if arguments and arguments[0] == "queue-retirement":
         queue_retirement(arguments[1:])
@@ -2909,6 +4354,9 @@ def main(arguments: list[str]) -> int:
         return 0
     if len(arguments) == 2 and arguments[0] == "replay-plan":
         replay_plan(arguments[1])
+        return 0
+    if len(arguments) == 2 and arguments[0] == "replay-state":
+        replay_state(arguments[1])
         return 0
     if arguments and arguments[0] == "archive":
         archive(arguments[1:])

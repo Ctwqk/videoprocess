@@ -228,6 +228,100 @@ the authority WAL changes required schema-1 fields without a version bump,
 migration, or stable quarantine for older PREPARING/ABORTING journals.
 Task 4B/4C Deploy Track B stage 1: fix round 4/5 in progress with a fresh
 implementer; stage 2 remains blocked.
+Task 4B/4C Deploy Track B stage 1: fix round 4/5 at 86c59ac addressed the
+parent-death launch gate but left journal compatibility open and introduced
+two additional Important findings: legacy quarantine is classified only after
+network inspect and four credential-bearing Docker probes; schema numeric
+equality accepts forged 1.0/2.0 values; and the inherited-lock close helper
+permanently redirects launch-child stderr to `/dev/null`.
+Task 4B/4C Deploy Track B stage 1: fix round 5/5 in progress; stage 2 remains
+blocked.
+Task 4B/4C Deploy Track B stage 1: fix round 5/5 addressed all three inherited
+production findings, but final review rejected the round because the rollback
+test accidentally nested its credential-leak assertion after an unconditional
+raise. The current product helper remained closed; the regression was in the
+security test contract. The controller accepted the finding and applied a
+minimal post-round correction under the user's standing continue authorization:
+the assertion is unconditional again and a negative probe proves the failure
+branch is reachable. Stage 2 remains blocked until fresh verification and
+breaker adjudication complete.
+Task 4B/4C Deploy Track B stage 1: APPROVED after independent breaker closure.
+The exact prior credential-bearing canonical-plan reproducer now fails closed;
+all six Stage 1 shell contracts and static checks pass. Stage 2 may begin.
+Task 4B/4C Deploy Track B stage 2: in progress; no production mutation is
+authorized by this transition.
+Task 4B/4C Deploy Track B stage 2: post-review hardening closed four recovery
+and identity findings. Durable promotion preconditions and marker receipts now
+use same-directory unique 0600 temporaries, so a fixed `.tmp` left by a crash
+cannot block replay. App snapshots retain exact service ID, image, and spec
+digest through capture, baseline, hydration, and rollback; all snapshot IDs are
+preflighted before mutation and ordinary/Go restores carry the expected ID into
+the update boundary. Vision cutover records a distinct `final-safety` job and
+database-secret purpose after managed vision readiness and immediately before
+legacy retirement. Fixed-name marker jobs resolve name to ID once and use only
+that ID for identity, task, remove, and convergence operations.
+Task 4B/4C Deploy Track B stage 2: fresh verification passes worker deploy,
+rollback, marker-control, macOS deploy-path, the full long deploy-sync contract,
+backend pytest (`1426 passed, 125 skipped`), scoped Ruff/mypy, frontend build and
+lint, shell syntax, helper compile/Ruff, and `git diff --check`. Full backend
+Ruff/mypy still report the pre-existing baseline (15 lint findings; 61 type
+findings), with none in the modified vision service or transaction helper.
+Task 4B/4C Deploy Track B stage 2: fifth unlisted canary authorization is
+recorded but remains unused. No push, remote deployment, YouTube upload, or
+publication mutation has occurred in this hardening round. Independent final
+review is in progress before commit/push and 150/127 deployment verification.
+Task 4B/4C Deploy Track B stage 2: fresh read-only production topology probe
+found 150 reachable through 127, Swarm manager `ccttww-lap` active/leader,
+`colima-127` Ready/Active with `vp.runtime=true`, and both scoped deploy crons
+active. `vp-app`/`vp-feature-aggregator` poll every 15 minutes; independent
+`vp-pds` polls at minute 7 plus 15. Their clean checkouts remain at deployed
+main SHAs `e51240f5c0f7...` and `6b8f8be32399...`. The historical
+`colima-swarmbridged` node is still joined and Ready but has only `role=app`,
+not `vp.runtime`, so the VideoProcess production constraints exclude it from
+the 127 runtime path. Direct local routing to 150 still fails; the 127 SSH hop
+is the working management path.
+Task 4B/4C Deploy Track B stage 2: follow-up review found two Important crash
+recovery gaps and one Moderate identity gap. Full `FORWARD_APPLYING` replay now
+removes all durable vision cutover jobs before failed-forward capture or the
+transition to rollback. A fresh process removes baseline-absent workers from
+the hydrated `service|generation|service_id` candidate record, verifies the
+name still resolves to that exact ID, and proves both ID and name absent after
+removal; the process-local contract is only a same-process fallback when no
+recovery records exist. Python, vision, and publisher restore helpers now
+accept the immutable baseline service ID, validate it before node/service
+mutation, reject create fallback, and revalidate at the registered-worker
+mutation boundary. Red-green rollback contracts cover all three corrections;
+worker deploy, rollback, marker-control, shell syntax, and `git diff --check`
+are green. The full long deploy-sync contract and focused independent re-review
+are still running. The fifth unlisted canary remains unused.
+Task 4B/4C Deploy Track B stage 2: focused independent re-review returned no
+P0/P1/P2/P3 findings and closed all three follow-up items on the latest diff,
+including the real mutation chain with process-local worker contract forced to
+fail. Residual notes concern only layered test granularity; exact-ID primitives
+independently enforce the invariants. The full long deploy-sync contract remains
+in progress. No production or YouTube mutation has occurred and the fifth
+unlisted canary remains unused.
+Task 4B/4C Deploy Track B stage 2: the full deploy-sync contract then exposed a
+same-process partial-create recovery edge hidden by hydration. New forward
+transactions now clear stale recovery candidates and capture exact in-memory
+`service|generation|service_id` records before hydration; only the immediate
+same-process rollback chain receives those records. Fresh-process replay remains
+durable-only and fail-closed. When durable and process records both identify a
+service they must agree exactly, and removal still requires a fresh marker,
+matching immutable ID/name/generation labels, ID-targeted deletion, and verified
+absence by both ID and name. The main test's rollback override now forwards this
+fifth argument, and its fake Docker persists the injected partial-create
+generation so the full-path assertion exercises the production identity model.
+Task 4B/4C Deploy Track B stage 2: final candidate verification is green for the
+full deploy-sync contract, worker deployment, rollback, Redis marker control,
+macOS deploy paths, canary script safeguards, changed-shell syntax,
+`git diff --check`, backend pytest (`1426 passed, 125 skipped, 17 warnings`),
+scoped Ruff/mypy, frontend install/build/lint, and independent review. The
+reviewer returned no P0/P1/P2/P3 findings after independently rerunning the full
+contract. Full backend Ruff/mypy still expose repository-wide baseline findings
+(15 lint, 62 type), with none in the modified Python files. The fifth unlisted
+canary remains unused pending commit, push, and observed 150/127 auto-deployment;
+no production or YouTube mutation has occurred in this hardening round.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak

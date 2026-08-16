@@ -746,7 +746,7 @@ bash tests/test_worker_redis_marker_control.sh
   PASS: worker Redis marker control tests passed
 python3 -m py_compile deploy/swarm/worker-admission-transaction.py
   PASS
-backend/.venv/bin/ruff check deploy/swarm/worker-admission-transaction.py
+backend/.venv/bin/ruff check --no-cache deploy/swarm/worker-admission-transaction.py
   PASS: All checks passed!
 backend/.venv/bin/mypy deploy/swarm/worker-admission-transaction.py
   PASS: Success: no issues found in 1 source file
@@ -1461,3 +1461,359 @@ production forward/rollback phase advancement, service reconciliation,
 cutover, marker mutation boundaries, first-deploy/failed-rollback
 orchestration, or janitor install recovery. It does not claim I-3 end-to-end
 closure.
+
+## Fix Round 5: Final Stage 1 Re-review Findings
+
+Start HEAD:
+`86c59acef86aee8fa1180efc2d13f8a6b52219a4`.
+
+This round addresses only the three Important findings in
+`task-4bc-deploy-stage1-rereview-round4.md`. It does not enter Stage 2.
+
+### Round 5 Important 1: Quarantine Is the First Locked Entry Gate
+
+Root cause:
+
+The real `deploy_vp_app_services` entry acquired the exact transaction lock
+but called `vp_validate_deploy_config` before transaction replay
+classification. That validation performs one Docker network inspect and four
+credential-bearing principal probes. The later preparation helper eventually
+quarantined legacy schema 1, but only after those external calls.
+
+Behavior RED:
+
+The full-entry fixture uses four distinct regular mode-`0400` credentials and
+a fake Docker implementation that returns the exact network identity and all
+four expected principal identities:
+
+```text
+$ bash tests/test_worker_admission_rollback.sh
+FAIL: full deploy entry touched Docker/operator before legacy PREPARING quarantine (docker=5 operator=0)
+```
+
+Fix:
+
+- Added a lock-asserting, local-only Stage 1 entry classifier immediately
+  after exact lock acquisition and before `vp_validate_deploy_config`.
+- The classifier consumes only canonical `replay-plan` JSON and validates the
+  complete absent, current-active, or legacy-quarantine result shape.
+- Absent state and current schema-2 `PREPARING` are the only entry states that
+  may continue to configuration validation.
+- Canonical legacy schema-1 PREPARING/ABORTING returns the stable quarantine
+  reason before network inspect, principal probes, Docker, or operator use.
+- Every other current active phase returns the existing Stage 2
+  reconciliation boundary before external execution.
+- The exact lock-root comparison accepts lexical `/var` versus canonical
+  `/private/var` only when both paths identify the same directory inode.
+- A post-classification signal gate prevents a signal arriving during local
+  classification from continuing into configuration or Docker.
+
+GREEN:
+
+```text
+$ bash tests/test_worker_admission_rollback.sh
+worker admission rollback transaction tests passed
+
+$ bash tests/test_vp_deploy_sync_extension.sh
+<exit 0; no stdout>
+```
+
+The legacy PREPARING and ABORTING full-entry cases now require exact canonical
+quarantine stderr, unchanged active bytes, Docker count zero, and operator
+count zero. A current `WORKERS_PROMOTED` full-entry case similarly requires
+the exact Stage 2 boundary with zero Docker calls.
+
+### Round 5 Important 2: Exact Integer Schema Discriminators
+
+Root cause:
+
+Legacy active, current active, legacy dispatch, and snapshots used Python
+numeric equality for schema versions. JSON floats such as `1.0` and `2.0`
+therefore compared equal to integer schema constants; the current path could
+replay and mutate a forged schema-`2.0` active journal.
+
+Behavior RED:
+
+```text
+$ bash tests/test_worker_admission_rollback.sh
+FAIL: legacy active reader accepted non-integer schema 1.0
+```
+
+Fix:
+
+- Added one `_require_exact_schema` primitive requiring
+  `type(value) is int` and exact version equality.
+- Legacy dispatch, the historical schema-1 validator, the current schema-2
+  validator, and the independent snapshot schema-1 validator all use that
+  primitive.
+- Replay, every normal/abort/retirement mutation, and archive continue to use
+  the same active reader, so there is no command-specific version bypass.
+
+GREEN:
+
+The matrix writes canonical forged `1.0`, `2.0`, `-0.0`, and `true` schema
+values. It requires failure, byte-for-byte preservation, and no archive or
+mutation. A valid active schema 2 and valid snapshot schema 1 are separately
+required to have exact Python `int` type; tests do not rely on `!=` alone.
+
+### Round 5 Important 3: Child Stderr Survives Inherited Lock Close
+
+Root cause:
+
+`vp_worker_admission_lock_drop_inherited` used the no-command Bash form
+`exec 19>&- 2>/dev/null`. The fd19 close was intentional, but the fd2
+redirection became permanent in the supervisor or payload-producer shell and
+discarded subsequent Docker/container or producer diagnostics.
+
+Behavior RED:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+FAIL: docker-no-payload did not preserve child fd closure, stderr, and status
+```
+
+Fix:
+
+The close now runs in a brace group whose `/dev/null` redirection is scoped to
+that group. Because the group runs in the current shell, fd19 remains closed;
+when the group returns, Bash restores the caller's fd2.
+
+GREEN:
+
+```text
+$ bash tests/test_worker_admission_deploy.sh
+worker admission deployment contract tests passed
+```
+
+The behavior matrix covers Docker stderr without a payload, Docker stderr
+with a payload, and payload-producer stderr. It preserves success/failure
+status, proves child fd19 is closed, and retains the existing two-boundary
+parent-SIGKILL audit with Docker count zero, bounded child exit, stale
+reconciliation, and fresh exact-lock acquisition.
+
+### Round 5 Files
+
+- `deploy/swarm/deploy-sync-extension.sh`
+- `deploy/swarm/worker-admission-transaction.py`
+- `tests/test_worker_admission_deploy.sh`
+- `tests/test_worker_admission_rollback.sh`
+- `tests/test_vp_deploy_sync_extension.sh`
+- `.superpowers/sdd/2026-07-26-production-worker-registration/task-4bc-deploy-stage1-report.md`
+
+The coordinator-owned progress ledger was not modified or reverted. No CI,
+backend, Go, Dockerfile, marker-control product, janitor product, Task 4A, or
+frontend file changed in this round.
+
+### Round 5 Verification
+
+```text
+bash tests/test_worker_admission_deploy.sh
+  PASS: worker admission deployment contract tests passed
+bash tests/test_worker_admission_rollback.sh
+  PASS: worker admission rollback transaction tests passed
+bash tests/test_staging_object_janitor_run.sh
+  PASS: staging object janitor launcher tests passed
+bash tests/test_vp_deploy_sync_extension.sh
+  PASS: exit 0, no stdout
+bash tests/test_staging_object_janitor_install.sh
+  PASS: staging object janitor installer tests passed
+bash tests/test_worker_redis_marker_control.sh
+  PASS: worker Redis marker control tests passed
+python3 -m py_compile deploy/swarm/worker-admission-transaction.py
+  PASS
+backend/.venv/bin/ruff check deploy/swarm/worker-admission-transaction.py
+  PASS: All checks passed!
+backend/.venv/bin/mypy --no-incremental deploy/swarm/worker-admission-transaction.py
+  PASS: Success: no issues found in 1 source file
+bash -n changed production/test shell files
+  PASS
+destructive Docker mutation and one-shot call-site inventory
+  PASS: no new production mutation or one-shot execution site
+generated artifact inventory
+  PASS: no deploy/swarm __pycache__ or .pyc
+git diff --check
+  PASS
+```
+
+Only auto-cleaned local fake-Docker/fake-operator and descriptor fixtures were
+used. No SSH, push, deploy, remote access, network access, YouTube/canary
+operation, or real Docker/Swarm service or secret mutation was performed.
+
+### Round 5 Unfinished Boundary
+
+This round closes only the three Stage 1 re-review findings. It does not wire
+production forward/rollback phase advancement, service reconciliation,
+cutover, marker mutation boundaries, first-deploy/failed-rollback
+orchestration, or janitor install recovery. It does not claim I-3 end-to-end
+closure.
+
+HEAD remains `86c59acef86aee8fa1180efc2d13f8a6b52219a4`. The managed sandbox
+exposes `.git` read-only, so no files were staged or committed.
+
+### Round 5 Breaker Closure
+
+The final scoped review found one test-contract regression: the legacy
+quarantine credential scan had been nested after an unconditional raise. The
+controller restored the scan as an unconditional assertion and added an
+explicit credential-bearing negative probe. Fresh verification passed all six
+Stage 1 shell contracts, Python compile, Ruff, mypy, shell syntax, and
+`git diff --check`.
+
+The original reviewer independently reran the exact credential-bearing
+canonical-plan reproducer. It now fails closed with the stable disclosure
+error, while the rollback contract remains green. The reviewer returned
+**APPROVED** and closed the Stage 1 breaker. Stage 2 wiring was not assessed by
+that closure review.
+
+## Stage 2 Post-Review Hardening
+
+Four independently reported Stage 2 risks were reproduced and fixed with
+red-green contracts:
+
+1. Promotion precondition and marker-receipt writers no longer use a fixed
+   `path.tmp` opened exclusively. They create a unique same-directory 0600
+   temporary, fsync the file, replace atomically, fsync the directory, and
+   clean only their own temporary on failure. A stale fixed `.tmp` is preserved
+   as evidence but cannot block crash replay.
+2. App snapshots use the exact four-field record
+   `service|service_id|image|spec_digest`. Baseline capture and recovery
+   hydration preserve those fields without rebinding by name. Rollback
+   validates every record and every current service ID before any mutation;
+   ordinary services and the Go worker pass the expected ID into the update
+   boundary.
+3. Vision cutover has an independent `final-safety` WAL entry and
+   `final-safety-database` secret authority. It executes with the deploy-read
+   credential and watcher Redis secret after managed vision readiness and
+   immediately before legacy container retirement. A nonzero or incomplete
+   final job leaves the legacy worker active.
+4. Fixed-name marker cleanup resolves `ID|Spec.Name` once. Descriptor
+   inspection, task terminal-state inspection, removal, and disappearance
+   polling all use the resolved service ID, so a same-name replacement cannot
+   be deleted by the old cleanup transaction.
+
+Fresh evidence after these changes:
+
+```text
+bash tests/test_worker_admission_deploy.sh
+  PASS
+bash tests/test_worker_admission_rollback.sh
+  PASS
+bash tests/test_worker_redis_marker_control.sh
+  PASS
+bash tests/test_macos_deploy_paths.sh
+  PASS
+bash tests/test_vp_deploy_sync_extension.sh
+  PASS: exit 0 after the full long contract
+backend pytest
+  PASS: 1426 passed, 125 skipped, 17 warnings
+transaction helper Ruff / shell syntax / git diff --check
+  PASS
+frontend npm run build / npm run lint
+  PASS (existing CSS and chunk-size build warnings only)
+```
+
+The required full backend Ruff and mypy commands still expose the repository
+baseline: 15 Ruff findings and 61 mypy findings. Scoped checks for the modified
+vision service/tests and transaction helper are clean.
+
+The fifth unlisted canary is approved but remains unused. This hardening round
+performed no push, SSH mutation, remote deployment, Docker/Swarm production
+mutation, YouTube upload, or publication action. Commit/push and 150/127
+deployment verification remain gated on the final independent review; 126
+remains excluded from normal participation.
+
+Read-only production probing after verification confirmed the intended
+automation is live: 150 is the active Swarm leader, 127 is Ready/Active with
+`vp.runtime=true`, the scoped app/feature cron runs every 15 minutes, and the
+independent PDS cron runs at minute 7 plus 15. The clean deployment checkouts
+match the last deployed main SHAs. The older `colima-swarmbridged` node remains
+joined with only `role=app`; it lacks `vp.runtime` and therefore does not match
+VideoProcess runtime placement. Direct local routing to 150 remains unavailable,
+while SSH from 127 to 150 succeeds. These probes were read-only.
+
+### Stage 2 Follow-up Corrections
+
+The first Stage 2 final review found three additional replay/identity risks.
+They were reproduced with failing contracts and corrected:
+
+1. Full `FORWARD_APPLYING` recovery now aborts all durable vision cutover jobs
+   before failed-forward capture and before changing phase to
+   `ROLLBACK_PREPARING`. A crash during cleanup therefore remains replayable in
+   the forward phase instead of stranding a job behind the rollback boundary.
+2. Baseline-absent registered workers are removed from the hydrated durable
+   `service|generation|service_id` candidate record after a process restart.
+   The record must be unique and valid, the service name must still resolve to
+   that ID, and both the ID and name must be absent after removal. Process-local
+   worker contracts are used only when no recovery record set exists.
+3. Python, vision, and publisher restore helpers accept the immutable baseline
+   service ID. They validate it before node or service mutation, reject a
+   create fallback when the baseline existed, and revalidate immediately before
+   the registered-worker mutation wrapper, which itself targets the exact ID.
+
+Fresh focused evidence is green for worker deployment, worker rollback, Redis
+marker control, shell syntax, and `git diff --check`. The full long deploy-sync
+contract and the focused independent re-review are still running. The fifth
+unlisted canary remains approved and unused; no production or YouTube mutation
+was performed by these corrections.
+
+The focused independent re-review of the latest diff returned no P0, P1, P2,
+or P3 findings and closed all three follow-up items. It specifically verified
+that the durable baseline-absent removal path uses marker freshness plus exact
+ID/name/generation labels and does not call the process-local worker contract.
+The reviewer noted only layered test-granularity residual risk; the underlying
+exact-ID primitives independently enforce each invariant. The restarted full
+long deploy-sync contract remains in progress.
+
+### Stage 2 Final Contract Closure
+
+The restarted full deploy-sync contract found one additional integration edge:
+hydrating durable recovery state intentionally clears process-local worker
+contracts, but an injected service create can mutate Swarm and fail before its
+candidate record reaches the durable journal. The immediate rollback therefore
+needs a narrowly scoped identity source that fresh-process replay must never
+trust.
+
+The deployment wrapper now captures exact in-memory
+`service|generation|service_id` records before hydration and passes them only
+through the same-process rollback call chain. New forward transactions clear any
+stale recovery candidate records first. The removal helper validates both
+durable and process records, requires exact agreement when both exist, verifies
+marker freshness and immutable service labels, removes by service ID, and proves
+both ID and name disappear. Fresh-process recovery receives no process record
+and remains durable-only and fail-closed. The full-contract rollback test double
+now forwards the fifth transaction argument, and fake Docker retains the
+injected partial-create generation so its exact-ID assertion matches real Swarm
+labels.
+
+Fresh final-candidate evidence:
+
+```text
+bash tests/test_vp_deploy_sync_extension.sh
+  PASS: full long contract, exit 0
+bash tests/test_worker_admission_deploy.sh
+  PASS: worker admission deployment contract tests passed
+bash tests/test_worker_admission_rollback.sh
+  PASS: worker admission rollback transaction tests passed
+bash tests/test_worker_redis_marker_control.sh
+  PASS: worker Redis marker control tests passed
+bash tests/test_macos_deploy_paths.sh
+  PASS
+bash tests/test_vp_unlisted_canary_scripts.sh
+  PASS
+changed-shell bash -n / git diff --check
+  PASS
+backend pytest
+  PASS: 1426 passed, 125 skipped, 17 warnings
+modified Python Ruff and mypy
+  PASS
+frontend npm install / npm run build / npm run lint
+  PASS (existing CSS and chunk-size warnings only)
+independent final re-review
+  PASS: no P0/P1/P2/P3 findings
+```
+
+The latest required repository-wide Ruff and mypy runs still expose baseline
+debt: 15 Ruff findings and 62 mypy findings, none in the modified Python files.
+The fifth unlisted canary approval remains unused. No push, remote deployment,
+Swarm mutation, YouTube upload, or publication mutation occurred before this
+closure checkpoint.

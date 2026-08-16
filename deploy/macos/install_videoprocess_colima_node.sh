@@ -10,8 +10,9 @@ PLIST_LABEL="com.constructure.vp-colima"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLIST_SOURCE="$SCRIPT_DIR/$PLIST_LABEL.plist"
 PLIST_TARGET="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
-CRON_REBOOT='@reboot /opt/homebrew/bin/colima start --profile swarmbridged >> /Users/wenjieliu/Library/Logs/constructure/vp-colima-cron.log 2>&1'
-CRON_WATCHDOG='*/5 * * * * /opt/homebrew/bin/colima start --profile swarmbridged >> /Users/wenjieliu/Library/Logs/constructure/vp-colima-cron.log 2>&1'
+COLIMA_COMMAND_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+CRON_REBOOT="@reboot /usr/bin/env PATH=$COLIMA_COMMAND_PATH /opt/homebrew/bin/colima start --profile swarmbridged >> /Users/wenjieliu/Library/Logs/constructure/vp-colima-cron.log 2>&1"
+CRON_WATCHDOG="*/5 * * * * /usr/bin/env PATH=$COLIMA_COMMAND_PATH /opt/homebrew/bin/colima start --profile swarmbridged >> /Users/wenjieliu/Library/Logs/constructure/vp-colima-cron.log 2>&1"
 
 run() {
   if [[ "${VP_DRY_RUN:-false}" == "true" ]]; then
@@ -96,11 +97,13 @@ install_node() {
 
   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/constructure"
   install -m 0644 "$PLIST_SOURCE" "$PLIST_TARGET"
-  if ! launchctl print "gui/$(id -u)/$PLIST_LABEL" >/dev/null 2>&1; then
-    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_TARGET"; then
-      echo "GUI launchd domain unavailable; installing cron persistence fallback" >&2
-      install_cron_fallback
-    fi
+  local launch_domain="gui/$(id -u)"
+  if launchctl print "$launch_domain/$PLIST_LABEL" >/dev/null 2>&1; then
+    launchctl bootout "$launch_domain/$PLIST_LABEL"
+  fi
+  if ! launchctl bootstrap "$launch_domain" "$PLIST_TARGET"; then
+    echo "GUI launchd domain unavailable; installing cron persistence fallback" >&2
+    install_cron_fallback
   fi
 }
 

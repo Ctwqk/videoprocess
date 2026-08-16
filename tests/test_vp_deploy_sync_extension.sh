@@ -10,11 +10,22 @@ FAKE_BIN="$TEST_ROOT/bin"
 FAKE_CRONTAB="$TEST_ROOT/crontab"
 FAKE_CRONTAB_CALLS="$TEST_ROOT/crontab-calls"
 FAKE_CRONTAB_FAILURE_USED="$TEST_ROOT/crontab-failure-used"
+FAKE_NODE_UPDATE_FAILURE_USED="$TEST_ROOT/node-update-failure-used"
+FAKE_RUNNING_FAILURE_USED="$TEST_ROOT/running-failure-used"
 FAKE_WATCH_TARGET="$ROOT/bin/channelops-soak-watch.sh"
 CHANNEL_RUNNER_ENV_STATE_FILE="$TEST_ROOT/channelops-runner-env-state"
 VP_SOAK_WATCH_SOURCE="$ROOT_DIR/deploy/swarm/channelops-soak-watch.sh"
 TEST_COMMIT="0123456789abcdef0123456789abcdef01234567"
-trap 'status=$?; rm -rf "$TEST_ROOT"; exit "$status"' EXIT
+cleanup_test_root() {
+  local exit_status=$?
+  if [[ "${KEEP_TEST_ROOT:-false}" == true ]]; then
+    printf 'preserved test root: %s\n' "$TEST_ROOT" >&2
+  else
+    rm -rf "$TEST_ROOT"
+  fi
+  exit "$exit_status"
+}
+trap cleanup_test_root EXIT
 
 mkdir -p "$FAKE_BIN"
 printf 'legacy\n' >"$CHANNEL_RUNNER_ENV_STATE_FILE"
@@ -157,6 +168,10 @@ VP_MINIO_SECRET_KEY=test-secret
 GPU_SERVICE_EXISTS=true
 VISION_SERVICE_EXISTS=true
 PUBLISHER_SERVICE_EXISTS=true
+GPU_SERVICE_STATE_FILE="$TEST_ROOT/gpu-service-created"
+GPU_SERVICE_GENERATION_FILE="$TEST_ROOT/gpu-service-generation"
+VISION_SERVICE_STATE_FILE="$TEST_ROOT/vision-service-created"
+PUBLISHER_SERVICE_STATE_FILE="$TEST_ROOT/publisher-service-created"
 LEGACY_VISION_CONTAINER_EXISTS=true
 LEGACY_VISION_CONTAINER_ID=374cabc27904a788beb221571438ed75ba6c6bc716b7c94849e0b7ca055d762e
 LEGACY_VISION_CONTAINER_NAME=/vp_vision_worker_1
@@ -179,8 +194,10 @@ FAIL_UPDATE_IMAGE=
 FAIL_UPDATE_EXIT=1
 FAIL_GPU_CREATE=false
 FAIL_RUNNING_SERVICE=
+FAIL_RUNNING_SERVICE_ONCE=
 FAIL_HEALTH_CHECK=
 FAIL_NODE_UPDATE=false
+FAIL_NODE_UPDATE_ONCE=false
 FAIL_NETWORK_INSPECT=false
 FAIL_PUBLISHER_CREATE=false
 FAIL_MANAGED_CRON_PRINTF=false
@@ -188,8 +205,26 @@ FAIL_SOAK_CLEANUP=false
 MIGRATION_GATE_MODE=success
 MIGRATION_RUN_MODE=success
 VISION_CUTOVER_GATE_MODE=success
+VISION_FINAL_CUTOVER_GATE_MODE=success
 VISION_CONSUMER_CUTOVER_MODE=success
 VISION_CONSUMER_AUDIT_MODE=converged
+VISION_JOB_EXISTS=false
+VISION_JOB_MODE=
+VISION_JOB_NAME=
+VISION_JOB_IMAGE=
+VISION_SAFETY_JOB_ID=dddddddddddddddddddddddddddddddd
+VISION_FINAL_SAFETY_JOB_ID=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+VISION_CHECK_JOB_ID=ffffffffffffffffffffffffffffffff
+VISION_RECONCILE_JOB_ID=gggggggggggggggggggggggggggggggg
+VISION_SAFETY_JOB_TASK_ID=hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh
+VISION_FINAL_SAFETY_JOB_TASK_ID=kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk
+VISION_CHECK_JOB_TASK_ID=iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii
+VISION_RECONCILE_JOB_TASK_ID=jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
+VISION_JOB_ID=
+VISION_JOB_TASK_ID=
+VISION_JOB_STATE_FILE="$TEST_ROOT/vision-job-state"
+printf '|||false\n' >"$VISION_JOB_STATE_FILE"
+VISION_SAFETY_DATABASE_SECRET_ID=cccccccccccccccccccccccccccccccc
 GPU_TASK_NODE=ccttww-lap
 VISION_TASK_NODE=ccttww-lap
 PUBLISHER_TASK_NODE=ccttww-lap
@@ -359,7 +394,15 @@ http_health() {
 
 swarm_service_running() {
   printf 'running|%s\n' "$1" >>"$CALLS"
-  [[ "$1" != "$FAIL_RUNNING_SERVICE" ]]
+  if [[ "$1" == "$FAIL_RUNNING_SERVICE" ]]; then
+    return 1
+  fi
+  if [[ "$1" == "$FAIL_RUNNING_SERVICE_ONCE" \
+    && ! -f "$FAKE_RUNNING_FAILURE_USED" ]]; then
+    : >"$FAKE_RUNNING_FAILURE_USED"
+    return 1
+  fi
+  return 0
 }
 
 remote_sh() {
@@ -474,14 +517,159 @@ remote_sh() {
     "$interval" "$timeout" "$start_period" "$retries"
 }
 
+test_service_id() {
+  builtin printf '%s' "$1" | shasum -a 256 \
+    | command awk '{print substr($1, 1, 24)}'
+}
+
+test_worker_generation() {
+  case "$1" in
+    vp-ffmpeg-worker-go-swarm)
+      builtin printf '%s\n' "$VP_WORKER_FFMPEG_GO_GENERATION"
+      ;;
+    vp-ffmpeg-worker-gpu-swarm)
+      if [[ -f "$GPU_SERVICE_GENERATION_FILE" ]]; then
+        command cat "$GPU_SERVICE_GENERATION_FILE"
+      else
+        builtin printf '%s\n' "$VP_WORKER_FFMPEG_GENERATION"
+      fi
+      ;;
+    vp-vision-worker-swarm)
+      builtin printf '%s\n' "$VP_WORKER_VISION_GENERATION"
+      ;;
+    vp-youtube-publisher-swarm)
+      builtin printf '%s\n' "$VP_WORKER_YOUTUBE_PUBLISHER_GENERATION"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+test_worker_service_exists() {
+  case "$1" in
+    vp-ffmpeg-worker-gpu-swarm)
+      [[ "$GPU_SERVICE_EXISTS" == true || -f "$GPU_SERVICE_STATE_FILE" ]]
+      ;;
+    vp-vision-worker-swarm)
+      [[ "$VISION_SERVICE_EXISTS" == true || -f "$VISION_SERVICE_STATE_FILE" ]]
+      ;;
+    vp-youtube-publisher-swarm)
+      [[ "$PUBLISHER_SERVICE_EXISTS" == true \
+        || -f "$PUBLISHER_SERVICE_STATE_FILE" ]]
+      ;;
+    vp-ffmpeg-worker-go-swarm)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+test_mark_worker_service_created() {
+  case "$1" in
+    vp-ffmpeg-worker-gpu-swarm) : >"$GPU_SERVICE_STATE_FILE" ;;
+    vp-vision-worker-swarm) : >"$VISION_SERVICE_STATE_FILE" ;;
+    vp-youtube-publisher-swarm) : >"$PUBLISHER_SERVICE_STATE_FILE" ;;
+    *) return 1 ;;
+  esac
+}
+
+test_mark_worker_service_absent() {
+  case "$1" in
+    vp-ffmpeg-worker-gpu-swarm)
+      command rm -f \
+        "$GPU_SERVICE_STATE_FILE" "$GPU_SERVICE_GENERATION_FILE"
+      ;;
+    vp-vision-worker-swarm) command rm -f "$VISION_SERVICE_STATE_FILE" ;;
+    vp-youtube-publisher-swarm) command rm -f "$PUBLISHER_SERVICE_STATE_FILE" ;;
+    *) return 1 ;;
+  esac
+}
+
+test_service_name_for_reference() {
+  local reference="$1"
+  local service
+  for service in \
+    $VP_APP_SERVICES "$VP_PDS_SERVICE" vp-feature-aggregator-swarm; do
+    if [[ "$reference" == "$service" \
+      || "$reference" == "$(test_service_id "$service")" ]]; then
+      builtin printf '%s\n' "$service"
+      return 0
+    fi
+  done
+  return 1
+}
+
 docker() {
+  local update_service=""
+  if [[ "${1:-} ${2:-}" == "service update" ]]; then
+    update_service="$(test_service_name_for_reference "${!#}")" || return 1
+  fi
   if [[ "${1:-}" == "exec" ]]; then
     printf 'docker'
     printf '|%s' "$@"
     printf '\n'
   else
-    printf 'docker|%s\n' "$*"
+    printf 'docker|%s' "$*"
+    if [[ -n "$update_service" ]]; then
+      printf ' logical-service=%s' "$update_service"
+    fi
+    printf '\n'
   fi >>"$CALLS"
+  IFS='|' read -r \
+    VISION_JOB_NAME VISION_JOB_MODE VISION_JOB_IMAGE VISION_JOB_EXISTS \
+    <"$VISION_JOB_STATE_FILE"
+  case "$VISION_JOB_MODE" in
+    safety)
+      VISION_JOB_ID="$VISION_SAFETY_JOB_ID"
+      VISION_JOB_TASK_ID="$VISION_SAFETY_JOB_TASK_ID"
+      ;;
+    final-safety)
+      VISION_JOB_ID="$VISION_FINAL_SAFETY_JOB_ID"
+      VISION_JOB_TASK_ID="$VISION_FINAL_SAFETY_JOB_TASK_ID"
+      ;;
+    check)
+      VISION_JOB_ID="$VISION_CHECK_JOB_ID"
+      VISION_JOB_TASK_ID="$VISION_CHECK_JOB_TASK_ID"
+      ;;
+    reconcile)
+      VISION_JOB_ID="$VISION_RECONCILE_JOB_ID"
+      VISION_JOB_TASK_ID="$VISION_RECONCILE_JOB_TASK_ID"
+      ;;
+    *)
+      VISION_JOB_ID=
+      VISION_JOB_TASK_ID=
+      ;;
+  esac
+  if [[ "${1:-} ${2:-}" == "image inspect" \
+    && "${3:-}" == *":deploy-${TEST_COMMIT:0:12}" ]]; then
+    builtin printf '%s\n' "$TEST_COMMIT"
+    return 0
+  fi
+  if [[ "${1:-} ${2:-}" == "secret inspect" \
+    && "$*" == *'{{.ID}}|{{.Spec.Name}}'* ]]; then
+    local runtime_secret_reference="${3:-}"
+    if [[ -n "$VP_WORKER_REDIS_WATCHER_SECRET_ID" \
+      && "$runtime_secret_reference" == "$VP_WORKER_REDIS_WATCHER_SECRET_ID" ]]; then
+      builtin printf '%s|%s\n' \
+        "$VP_WORKER_REDIS_WATCHER_SECRET_ID" \
+        "$VP_WORKER_REDIS_WATCHER_SECRET"
+      return 0
+    fi
+    if [[ -n "$VP_WORKER_REDIS_CONTROL_SECRET_ID" \
+      && "$runtime_secret_reference" == "$VP_WORKER_REDIS_CONTROL_SECRET_ID" ]]; then
+      builtin printf '%s|%s\n' \
+        "$VP_WORKER_REDIS_CONTROL_SECRET_ID" \
+        "$VP_WORKER_REDIS_CONTROL_SECRET"
+      return 0
+    fi
+    local runtime_secret_name="$runtime_secret_reference"
+    local runtime_secret_id
+    runtime_secret_id="$(
+      builtin printf '%s' "$runtime_secret_name" | shasum -a 256 \
+        | command awk '{print $1}'
+    )"
+    builtin printf '%s|%s\n' "$runtime_secret_id" "$runtime_secret_name"
+    return 0
+  fi
   if [[ "${1:-}" == "run" \
     && "$*" == *"python -m app.services.worker_deployment_cli migrate"* ]]; then
     [[ "$MIGRATION_RUN_MODE" == "success" ]]
@@ -511,41 +699,121 @@ docker() {
   if [[ "${1:-}" == "run" && "$GPU_PREFLIGHT_SUCCEEDS" != "true" ]]; then
     return 1
   fi
-  if [[ "${1:-} ${2:-}" == "node update" && "$FAIL_NODE_UPDATE" == "true" ]]; then
-    return 1
+  if [[ "${1:-} ${2:-}" == "node update" ]]; then
+    if [[ "$FAIL_NODE_UPDATE" == "true" ]]; then
+      return 1
+    fi
+    if [[ "$FAIL_NODE_UPDATE_ONCE" == "true" \
+      && ! -f "$FAKE_NODE_UPDATE_FAILURE_USED" ]]; then
+      : >"$FAKE_NODE_UPDATE_FAILURE_USED"
+      return 1
+    fi
   fi
   if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-ffmpeg-worker-gpu-swarm"* ]]; then
     GPU_SERVICE_EXISTS=true
+    test_mark_worker_service_created vp-ffmpeg-worker-gpu-swarm
     if [[ "$FAIL_GPU_CREATE" == "true" ]]; then
+      printf '%s\n' "$VP_WORKER_FFMPEG_GENERATION" \
+        >"$GPU_SERVICE_GENERATION_FILE"
       return 1
     fi
+    test_service_id vp-ffmpeg-worker-gpu-swarm
+    return 0
   fi
   if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-vision-worker-swarm"* ]]; then
     VISION_SERVICE_EXISTS=true
+    test_mark_worker_service_created vp-vision-worker-swarm
+    test_service_id vp-vision-worker-swarm
+    return 0
   fi
   if [[ "${1:-} ${2:-}" == "service create" && "$*" == *"--name vp-youtube-publisher-swarm"* ]]; then
     PUBLISHER_SERVICE_EXISTS=true
+    test_mark_worker_service_created vp-youtube-publisher-swarm
     if [[ "$FAIL_PUBLISHER_CREATE" == "true" ]]; then
       return 1
     fi
+    test_service_id vp-youtube-publisher-swarm
+    return 0
+  fi
+  if [[ "${1:-} ${2:-}" == "service create" \
+    && "$*" == *"--label vp.service=vision-cutover"* ]]; then
+    local previous=""
+    local argument
+    for argument in "$@"; do
+      if [[ "$previous" == --name ]]; then
+        VISION_JOB_NAME="$argument"
+      elif [[ "$argument" == vp.purpose=* ]]; then
+        VISION_JOB_MODE="${argument#vp.purpose=}"
+      elif [[ "$argument" == vp-ffmpeg-worker-python:* ]]; then
+        VISION_JOB_IMAGE="$argument"
+      fi
+      previous="$argument"
+    done
+    case "$VISION_JOB_MODE" in
+      safety)
+        VISION_JOB_ID="$VISION_SAFETY_JOB_ID"
+        VISION_JOB_TASK_ID="$VISION_SAFETY_JOB_TASK_ID"
+        ;;
+      final-safety)
+        VISION_JOB_ID="$VISION_FINAL_SAFETY_JOB_ID"
+        VISION_JOB_TASK_ID="$VISION_FINAL_SAFETY_JOB_TASK_ID"
+        ;;
+      check)
+        VISION_JOB_ID="$VISION_CHECK_JOB_ID"
+        VISION_JOB_TASK_ID="$VISION_CHECK_JOB_TASK_ID"
+        ;;
+      reconcile)
+        VISION_JOB_ID="$VISION_RECONCILE_JOB_ID"
+        VISION_JOB_TASK_ID="$VISION_RECONCILE_JOB_TASK_ID"
+        ;;
+      *) return 1 ;;
+    esac
+    VISION_JOB_EXISTS=true
+    builtin printf '%s|%s|%s|true\n' \
+      "$VISION_JOB_NAME" "$VISION_JOB_MODE" "$VISION_JOB_IMAGE" \
+      >"$VISION_JOB_STATE_FILE"
+    builtin printf '%s\n' "$VISION_JOB_ID"
+    return 0
   fi
   if [[ "${1:-} ${2:-} ${3:-}" == "service rm vp-ffmpeg-worker-gpu-swarm" ]]; then
     GPU_SERVICE_EXISTS=false
+    test_mark_worker_service_absent vp-ffmpeg-worker-gpu-swarm
   fi
   if [[ "${1:-} ${2:-} ${3:-}" == "service rm vp-vision-worker-swarm" ]]; then
     VISION_SERVICE_EXISTS=false
+    test_mark_worker_service_absent vp-vision-worker-swarm
   fi
   if [[ "${1:-} ${2:-} ${3:-}" == "service rm vp-youtube-publisher-swarm" ]]; then
     PUBLISHER_SERVICE_EXISTS=false
+    test_mark_worker_service_absent vp-youtube-publisher-swarm
+  fi
+  if [[ "${1:-} ${2:-}" == "service rm" ]]; then
+    case "${3:-}" in
+      "$(test_service_id vp-ffmpeg-worker-gpu-swarm)")
+        GPU_SERVICE_EXISTS=false
+        test_mark_worker_service_absent vp-ffmpeg-worker-gpu-swarm
+        return 0
+        ;;
+      "$(test_service_id vp-vision-worker-swarm)")
+        VISION_SERVICE_EXISTS=false
+        test_mark_worker_service_absent vp-vision-worker-swarm
+        return 0
+        ;;
+      "$(test_service_id vp-youtube-publisher-swarm)")
+        PUBLISHER_SERVICE_EXISTS=false
+        test_mark_worker_service_absent vp-youtube-publisher-swarm
+        return 0
+        ;;
+    esac
   fi
   if [[ "${1:-} ${2:-}" == "service update" \
     && -n "$FAIL_UPDATE_SERVICE" \
     && "$*" == *"--image $FAIL_UPDATE_IMAGE"* \
-    && "$*" == *"$FAIL_UPDATE_SERVICE"* ]]; then
+    && "$update_service" == "$FAIL_UPDATE_SERVICE" ]]; then
     return "$FAIL_UPDATE_EXIT"
   fi
   if [[ "${1:-} ${2:-}" == "service update" \
-    && "$*" == *"vp-pds-swarm"* ]]; then
+    && "$update_service" == "vp-pds-swarm" ]]; then
     local previous=""
     local argument
     for argument in "$@"; do
@@ -560,7 +828,7 @@ docker() {
     fi
   fi
   if [[ "${1:-} ${2:-}" == "service update" \
-    && "$*" == *"vp-channel-agent-runner-swarm"* \
+    && "$update_service" == "vp-channel-agent-runner-swarm" \
     && "$*" == *"CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1"* ]]; then
     printf 'converged\n' >"$CHANNEL_RUNNER_ENV_STATE_FILE"
   fi
@@ -580,6 +848,11 @@ docker() {
     fi
   fi
   if [[ "${1:-} ${2:-}" == "service ps" ]]; then
+    if [[ "${3:-}" == "$VISION_JOB_ID" ]]; then
+      builtin printf '%s|Shutdown|Complete 1 second ago\n' \
+        "$VISION_JOB_TASK_ID"
+      return 0
+    fi
     if [[ "$#" -ne 7 \
       || "${4:-}" != "--filter" \
       || "${5:-}" != "desired-state=running" \
@@ -604,6 +877,40 @@ docker() {
         return 1
         ;;
     esac
+    return 0
+  fi
+  if [[ "${1:-}" == inspect && "${2:-}" == "$VISION_JOB_TASK_ID" ]]; then
+    case "$VISION_JOB_MODE" in
+      safety)
+        [[ "$VISION_CUTOVER_GATE_MODE" == success ]] && builtin printf '0\n' \
+          || builtin printf '1\n'
+        ;;
+      final-safety)
+        [[ "$VISION_FINAL_CUTOVER_GATE_MODE" == success ]] \
+          && builtin printf '0\n' || builtin printf '1\n'
+        ;;
+      check)
+        [[ "$VISION_CONSUMER_AUDIT_MODE" == needs-cutover ]] \
+          && builtin printf '10\n' || builtin printf '0\n'
+        ;;
+      reconcile)
+        [[ "$VISION_CONSUMER_CUTOVER_MODE" == success ]] \
+          && builtin printf '0\n' || builtin printf '1\n'
+        ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  if [[ "${1:-} ${2:-}" == "service logs" \
+    && "${3:-}" == "$VISION_JOB_ID" ]]; then
+    return 0
+  fi
+  if [[ "${1:-} ${2:-}" == "service rm" \
+    && "${3:-}" == "$VISION_JOB_ID" ]]; then
+    VISION_JOB_EXISTS=false
+    builtin printf '%s|%s|%s|false\n' \
+      "$VISION_JOB_NAME" "$VISION_JOB_MODE" "$VISION_JOB_IMAGE" \
+      >"$VISION_JOB_STATE_FILE"
     return 0
   fi
   if [[ "${1:-} ${2:-}" == "container ls" \
@@ -639,6 +946,20 @@ docker() {
         ;;
       duplicate)
         printf '%s\n%s\n' "$readiness_container_id" "${readiness_container_id}duplicate"
+        ;;
+      missing-then-normal|duplicate-then-normal)
+        local readiness_container_call=0
+        if [[ -f "$WORKER_READINESS_CONTAINER_CALLS" ]]; then
+          readiness_container_call="$(<"$WORKER_READINESS_CONTAINER_CALLS")"
+        fi
+        readiness_container_call=$((readiness_container_call + 1))
+        printf '%s\n' "$readiness_container_call" >"$WORKER_READINESS_CONTAINER_CALLS"
+        if [[ "$readiness_container_call" -gt 10 ]]; then
+          printf '%s\n' "$readiness_container_id"
+        elif [[ "$WORKER_READINESS_CONTAINER_MODE" == duplicate-then-normal ]]; then
+          printf '%s\n%s\n' \
+            "$readiness_container_id" "${readiness_container_id}duplicate"
+        fi
         ;;
       transition)
         local readiness_container_call=0
@@ -717,20 +1038,59 @@ docker() {
     if [[ "$PUBLISHER_LIST_FAILURE" == "true" ]]; then
       return 1
     fi
-    if [[ "$PUBLISHER_SERVICE_EXISTS" == "true" ]]; then
+    if test_worker_service_exists vp-youtube-publisher-swarm; then
       printf '%s\n' "${PUBLISHER_LIST_NAME:-vp-youtube-publisher-swarm}"
     fi
     return 0
   fi
   if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
     local service="${3:-}"
-    if [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" && "$GPU_SERVICE_EXISTS" != "true" ]]; then
+    local registered_worker_service
+    for registered_worker_service in \
+      $VP_APP_SERVICES "$VP_PDS_SERVICE" vp-feature-aggregator-swarm; do
+      if [[ "$service" == "$(test_service_id "$registered_worker_service")" ]]; then
+        service="$registered_worker_service"
+        break
+      fi
+    done
+    if [[ "$service" == "$VISION_JOB_ID" || "$service" == "$VISION_JOB_NAME" ]]; then
+      [[ "$VISION_JOB_EXISTS" == true ]] || return 1
+      if [[ "$*" == *'{{.ID}}|{{.Spec.Name}}'* ]]; then
+        builtin printf '%s|%s|vision-cutover|%s|%s\n' \
+          "$VISION_JOB_ID" "$VISION_JOB_NAME" \
+          "$VP_WORKER_ADMISSION_TRANSACTION_ID" "$VISION_JOB_MODE"
+      elif [[ "$*" == *'{{json .Spec}}'* ]]; then
+        local redis_id="$VP_WORKER_REDIS_WATCHER_SECRET_ID"
+        local database_secret_json=""
+        local database_env_json=""
+        local cli_json=''
+        if [[ "$VISION_JOB_MODE" == reconcile ]]; then
+          redis_id="$VP_WORKER_REDIS_CONTROL_SECRET_ID"
+        elif [[ "$VISION_JOB_MODE" == safety \
+          || "$VISION_JOB_MODE" == final-safety ]]; then
+          cli_json=',"--safety"'
+          database_secret_json=',{"SecretID":"cccccccccccccccccccccccccccccccc","File":{"Name":"vision-cutover-database-url","UID":"10001","GID":"10001","Mode":256}}'
+          database_env_json=',"VISION_CUTOVER_DATABASE_URL_FILE=/run/secrets/vision-cutover-database-url"'
+        else
+          cli_json=',"--check-only"'
+        fi
+        builtin printf '{"Name":"%s","Labels":{"vp.service":"vision-cutover","vp.generation":"%s","vp.purpose":"%s"},"Mode":{"ReplicatedJob":{"TotalCompletions":1,"MaxConcurrent":1}},"TaskTemplate":{"ContainerSpec":{"Image":"%s","Args":["python","-m","app.services.vision_consumer_cutover"%s],"Env":["VISION_CUTOVER_REDIS_URL_FILE=/run/secrets/vision-cutover-redis-url"%s],"Secrets":[{"SecretID":"%s","File":{"Name":"vision-cutover-redis-url","UID":"10001","GID":"10001","Mode":256}}%s]},"RestartPolicy":{"Condition":"none"},"Placement":{"Constraints":["node.hostname==ccttww-lap"]},"Networks":[{"Target":"vp-pipeline-network-id"}]}}\n' \
+          "$VISION_JOB_NAME" "$VP_WORKER_ADMISSION_TRANSACTION_ID" \
+          "$VISION_JOB_MODE" "$VISION_JOB_IMAGE" "$cli_json" \
+          "$database_env_json" "$redis_id" "$database_secret_json"
+      fi
+      return 0
+    fi
+    if [[ "$service" == "vp-ffmpeg-worker-gpu-swarm" ]] \
+      && ! test_worker_service_exists "$service"; then
       return 1
     fi
-    if [[ "$service" == "vp-vision-worker-swarm" && "$VISION_SERVICE_EXISTS" != "true" ]]; then
+    if [[ "$service" == "vp-vision-worker-swarm" ]] \
+      && ! test_worker_service_exists "$service"; then
       return 1
     fi
-    if [[ "$service" == "vp-youtube-publisher-swarm" && "$PUBLISHER_SERVICE_EXISTS" != "true" ]]; then
+    if [[ "$service" == "vp-youtube-publisher-swarm" ]] \
+      && ! test_worker_service_exists "$service"; then
       echo "no such service: $service" >&2
       return 1
     fi
@@ -738,6 +1098,27 @@ docker() {
       && -n "$FAIL_PUBLISHER_INSPECT_FORMAT" \
       && "$*" == *"$FAIL_PUBLISHER_INSPECT_FORMAT"* ]]; then
       return 1
+    fi
+    if [[ "$*" == *'vp.managed-by'* ]]; then
+      local service_id
+      local worker_generation
+      service_id="$(test_service_id "$service")"
+      worker_generation="$(test_worker_generation "$service")" || return 1
+      builtin printf '%s|%s|%s|%s|videoprocess-deploy\n' \
+        "$service_id" "$service" "$service" "$worker_generation"
+      return 0
+    fi
+    if [[ "$*" == *'{{.ID}}|{{.Spec.Name}}' ]]; then
+      local service_id
+      service_id="$(test_service_id "$service")"
+      builtin printf '%s|%s\n' "$service_id" "$service"
+      return 0
+    fi
+    if [[ "$*" == *'{{json .Spec}}'* ]]; then
+      builtin printf \
+        '{"Name":"%s","TaskTemplate":{"ContainerSpec":{"Image":"baseline-%s:stable"}}}\n' \
+        "$service" "$service"
+      return 0
     fi
     case "$*" in
       *ContainerSpec.Image*)
@@ -1042,6 +1423,17 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
 fi
 source "$EXTENSION"
 
+vp_worker_admission_create_secret() {
+  builtin printf 'vision-secret-create|%s|%s|%s|%s|%s\n' "$@" >>"$CALLS"
+  VP_WORKER_CREATED_SECRET_ID="$VISION_SAFETY_DATABASE_SECRET_ID"
+  vp_worker_admission_record_prepared_secret \
+    "$1" "$VP_WORKER_CREATED_SECRET_ID" "$3" "$4" "$5"
+}
+
+vp_remove_managed_secret() {
+  builtin printf 'vision-secret-rm|%s|%s|%s|%s|%s\n' "$@" >>"$CALLS"
+}
+
 runtime_state="$TEST_ROOT/worker-redis-runtime.state"
 builtin printf '%s\n' \
   "GENERATION=$TEST_COMMIT" \
@@ -1152,8 +1544,98 @@ vp_worker_service_secret_specs() {
 }
 
 vp_prepare_worker_admission() {
+  local control_image="$1"
+  local go_image="$2"
   VP_WORKER_ADMISSION_PREPARED=true
-  printf 'worker-admission|prepare|%s|%s\n' "$1" "$2" >>"$CALLS"
+  VP_WORKER_CONTROL_PREPARED=false
+  VP_WORKER_ADMISSION_CANDIDATE_SERVICES=""
+  local root="$VP_WORKER_ADMISSION_LOCK_ROOT"
+  VP_WORKER_CONTROL_GENERATION="c-${TEST_COMMIT:0:20}"
+  VP_WORKER_OPERATOR_DATABASE_SECRET="test-control-operator"
+  VP_WORKER_ORCHESTRATOR_DATABASE_SECRET="test-control-orchestrator"
+  VP_STAGING_JANITOR_DATABASE_SECRET="test-control-staging"
+  VP_STAGING_JANITOR_MINIO_ACCESS_SECRET="test-control-staging-minio-access"
+  VP_STAGING_JANITOR_MINIO_SECRET_SECRET="test-control-staging-minio-secret"
+  VP_WORKER_MINIO_ACCESS_SECRET="test-control-worker-minio-access"
+  VP_WORKER_MINIO_SECRET_SECRET="test-control-worker-minio-secret"
+  local control_candidate="$root/control-candidates/$VP_WORKER_CONTROL_GENERATION.conf"
+  vp_worker_control_write_manifest \
+    "$control_candidate" "$VP_WORKER_CONTROL_GENERATION" "$control_image" \
+    301111111111111111111111 \
+    302222222222222222222222 \
+    303333333333333333333333 \
+    304444444444444444444444 \
+    305555555555555555555555 \
+    306666666666666666666666 \
+    307777777777777777777777
+  local operator_reference="control/$VP_WORKER_CONTROL_GENERATION/worker-registration-operator-database-url"
+  vp_worker_admission_record_authority_intent \
+    control vp-worker-control "$VP_WORKER_CONTROL_GENERATION" \
+    "$control_image" "$VP_WORKER_CONTROL_GENERATION" \
+    "$operator_reference"
+  vp_worker_admission_mark_authority_provisioning \
+    control vp-worker-control "$VP_WORKER_CONTROL_GENERATION"
+  vp_worker_admission_mark_authority_provisioned \
+    control vp-worker-control "$VP_WORKER_CONTROL_GENERATION"
+  vp_worker_admission_record_control_selection forward "$control_candidate"
+  local service
+  for service in \
+    vp-ffmpeg-worker-go-swarm \
+    "$VP_PYTHON_WORKER_SERVICE" \
+    "$VP_VISION_WORKER_SERVICE" \
+    "$VP_PUBLISHER_SERVICE"; do
+    local image="$control_image"
+    local generation
+    local database_id
+    local admission_id
+    case "$service" in
+      vp-ffmpeg-worker-go-swarm)
+        image="$go_image"
+        generation=101
+        database_id=aaaaaaaaaaaaaaaaaaaaaaaa
+        admission_id=bbbbbbbbbbbbbbbbbbbbbbbb
+        ;;
+      "$VP_PYTHON_WORKER_SERVICE")
+        generation=102
+        database_id=cccccccccccccccccccccccc
+        admission_id=dddddddddddddddddddddddd
+        ;;
+      "$VP_VISION_WORKER_SERVICE")
+        generation=103
+        database_id=eeeeeeeeeeeeeeeeeeeeeeee
+        admission_id=ffffffffffffffffffffffff
+        ;;
+      "$VP_PUBLISHER_SERVICE")
+        generation=104
+        database_id=111111111111111111111111
+        admission_id=222222222222222222222222
+        ;;
+    esac
+    vp_worker_admission_record_authority_intent \
+      runtime "$service" "$generation" \
+      "$control_image" "$VP_WORKER_CONTROL_GENERATION" \
+      "$operator_reference"
+    vp_worker_admission_mark_authority_provisioning \
+      runtime "$service" "$generation"
+    vp_worker_admission_mark_authority_provisioned \
+      runtime "$service" "$generation"
+    local kind
+    kind="$(vp_worker_admission_kind "$service")"
+    vp_worker_admission_write_manifest \
+      "$root/candidates/$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE/$kind.conf" \
+      "$service" "$VP_WORKER_ADMISSION_COMMIT" "$image" "$generation" \
+      "test-$kind-database-$generation" \
+      "test-$kind-admission-$generation" \
+      "$database_id" "$admission_id"
+    vp_worker_admission_set_candidate \
+      "$service" "$generation" \
+      "test-$kind-database-$generation" \
+      "test-$kind-admission-$generation"
+    vp_worker_admission_track_candidate "$service"
+    vp_worker_admission_record_prepared_worker_plan "$service" "$image"
+  done
+  printf 'worker-admission|prepare|%s|%s\n' \
+    "$control_image" "$go_image" >>"$CALLS"
 }
 
 vp_activate_worker_admission() {
@@ -1164,12 +1646,105 @@ vp_require_worker_deployment_ready() {
   printf 'worker-admission|ready|%s\n' "$1" >>"$CALLS"
 }
 
+vp_worker_admission_live_worker_identity() {
+  case "$1" in
+    vp-ffmpeg-worker-go-swarm)
+      printf '%s|%s\n' \
+        333333333333333333333333 \
+        1111111111111111111111111111111111111111111111111111111111111111
+      ;;
+    "$VP_PYTHON_WORKER_SERVICE")
+      printf '%s|%s\n' \
+        444444444444444444444444 \
+        2222222222222222222222222222222222222222222222222222222222222222
+      ;;
+    "$VP_VISION_WORKER_SERVICE")
+      printf '%s|%s\n' \
+        555555555555555555555555 \
+        3333333333333333333333333333333333333333333333333333333333333333
+      ;;
+    "$VP_PUBLISHER_SERVICE")
+      printf '%s|%s\n' \
+        666666666666666666666666 \
+        4444444444444444444444444444444444444444444444444444444444444444
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 vp_install_staging_object_janitor() {
   printf 'staging-janitor|install|%s\n' "$1" >>"$CALLS"
 }
 
 vp_run_staging_object_janitor_once() {
   printf 'staging-janitor|run\n' >>"$CALLS"
+}
+
+vp_worker_admission_janitor_service_json() {
+  local attempt="${VP_WORKER_ADMISSION_ROLLBACK_ATTEMPT:-0}"
+  local generation="test-janitor-$attempt"
+  local service_id
+  service_id="$(
+    printf '%s' \
+      "vp-staging-object-janitor|$VP_WORKER_ADMISSION_TRANSACTION_ID|$generation" \
+      | shasum -a 256 | cut -c1-24
+  )" || return 1
+  local spec_digest
+  spec_digest="$(
+    printf '%s' "vp-staging-object-janitor|$generation|spec" \
+      | shasum -a 256 | cut -c1-64
+  )" || return 1
+  python3 -I -c '
+import json
+import sys
+
+service_id, generation, spec_digest = sys.argv[1:]
+print(json.dumps({
+    "name": "vp-staging-object-janitor",
+    "docker_service_id": service_id,
+    "generation": generation,
+    "spec_digest": spec_digest,
+}, sort_keys=True, separators=(",", ":")))
+' "$service_id" "$generation" "$spec_digest"
+}
+
+vp_worker_admission_promotion_identity() {
+  local kind="$1"
+  local name=""
+  local service=""
+  local generation=""
+  case "$kind" in
+    PROMOTE_WORKERS|PROMOTE_ROLLBACK_WORKERS)
+      name=worker-manifests
+      service=worker-admission
+      generation="$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE"
+      ;;
+    PROMOTE_MARKER|PROMOTE_ROLLBACK_MARKER)
+      name=control.conf
+      service=worker-redis-marker-control
+      generation="$VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION"
+      ;;
+    PROMOTE_CONTROL|PROMOTE_ROLLBACK_CONTROL)
+      name=control-current.conf
+      service=worker-admission-control
+      generation="$VP_WORKER_CONTROL_GENERATION"
+      ;;
+    *) return 1 ;;
+  esac
+  local identity="$TEST_ROOT/promotion-$kind.json"
+  printf '%s\n' \
+    "{\"docker_id\":null,\"generation\":\"$generation\",\"kind\":\"manifest\",\"name\":\"$name\",\"purpose\":\"promotion\",\"service\":\"$service\",\"spec_digest\":\"0000000000000000000000000000000000000000000000000000000000000000\"}" \
+    >"$identity"
+  chmod 0600 "$identity"
+  printf '%s\n' "$identity"
+}
+
+vp_worker_admission_current_promotion_matches() {
+  return 0
+}
+
+vp_worker_admission_retire_transaction() {
+  printf 'worker-admission|retire\n' >>"$CALLS"
 }
 
 vp_commit_worker_admission() {
@@ -1186,23 +1761,146 @@ vp_commit_worker_control_generation() {
 }
 
 vp_finalize_worker_control_rollback() {
+  VP_WORKER_CONTROL_PREPARED=false
   printf 'worker-control|rollback-finalize\n' >>"$CALLS"
 }
 
+vp_restore_worker_redis_marker_controls() {
+  VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
+  printf 'worker-marker|rollback\n' >>"$CALLS"
+}
+
+test_record_rollback_worker_plan() {
+  local service="$1"
+  local image="$2"
+  local generation=""
+  local database_id=""
+  local admission_id=""
+  case "$service" in
+    vp-ffmpeg-worker-go-swarm)
+      generation=201
+      database_id=333333333333333333333333
+      admission_id=444444444444444444444444
+      ;;
+    "$VP_PYTHON_WORKER_SERVICE")
+      generation=202
+      database_id=555555555555555555555555
+      admission_id=666666666666666666666666
+      ;;
+    "$VP_VISION_WORKER_SERVICE")
+      generation=203
+      database_id=777777777777777777777777
+      admission_id=888888888888888888888888
+      ;;
+    "$VP_PUBLISHER_SERVICE")
+      generation=204
+      database_id=999999999999999999999999
+      admission_id=aaaaaaaaaaaaaaaaaaaaaaab
+      ;;
+    *) return 1 ;;
+  esac
+  local kind
+  kind="$(vp_worker_admission_kind "$service")" || return 1
+  if [[ -n "${VP_WORKER_ADMISSION_LOCK_ROOT:-}" \
+    && -n "${VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE:-}" ]]; then
+    vp_worker_admission_write_manifest \
+      "$VP_WORKER_ADMISSION_LOCK_ROOT/candidates/$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE/$kind.conf" \
+      "$service" "$TEST_COMMIT" "$image" "$generation" \
+      "test-rollback-$kind-database-$generation" \
+      "test-rollback-$kind-admission-$generation" \
+      "$database_id" "$admission_id" || return 1
+  fi
+  vp_worker_admission_set_candidate \
+    "$service" "$generation" \
+    "test-rollback-$kind-database-$generation" \
+    "test-rollback-$kind-admission-$generation" || return 1
+  vp_worker_admission_track_candidate "$service" || return 1
+  vp_worker_admission_load_replay_plan || return 1
+  printf '%s\n' \
+    "{\"admission_secret\":{\"docker_secret_id\":\"$admission_id\",\"generation\":\"$generation\",\"name\":\"test-rollback-$kind-admission-$generation\",\"purpose\":\"admission\",\"service\":\"$service\"},\"commit\":\"$TEST_COMMIT\",\"database_secret\":{\"docker_secret_id\":\"$database_id\",\"generation\":\"$generation\",\"name\":\"test-rollback-$kind-database-$generation\",\"purpose\":\"database\",\"service\":\"$service\"},\"generation\":$generation,\"image\":\"$image\",\"service\":\"$service\",\"target_spec_digest\":null}" \
+    | python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      record-worker-plan \
+      "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+      "$VP_WORKER_ADMISSION_LOCK_FD" \
+      "$VP_WORKER_ADMISSION_REPLAY_REVISION" rollback \
+      >/dev/null || return 1
+  vp_worker_admission_load_replay_plan || return 1
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    advance-worker-stage \
+    "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+    "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "$VP_WORKER_ADMISSION_REPLAY_REVISION" rollback \
+    "$service" "$generation" pending prepared - - \
+    >/dev/null
+}
+
+vp_worker_admission_select_candidate() {
+  local service="$1"
+  local image=""
+  image="$(
+    vp_worker_admission_snapshot_image \
+      "$TEST_ROLLBACK_SNAPSHOTS" "$service"
+  )" || return 1
+  test_record_rollback_worker_plan "$service" "$image"
+}
+
 vp_restore_worker_admission_transaction() {
-  vp_restore_app_snapshots "$1" "$2"
+  if [[ "$VP_WORKER_ADMISSION_PREPARED" != true ]]; then
+    vp_restore_app_snapshots "$1" "$2" false "${5:-}" || return 1
+    if [[ "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true ]]; then
+      vp_worker_redis_marker_discard_managed_state || return 1
+      vp_worker_admission_abort_preparing_transaction \
+        preparing_failed || return 1
+    fi
+    VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
+    return 0
+  fi
+  vp_worker_admission_transition_to ROLLBACK_PREPARING || return 1
+  vp_worker_admission_allocate_rollback_attempt || return 1
+  TEST_ROLLBACK_SNAPSHOTS="$1"
+  VP_WORKER_ADMISSION_CANDIDATE_SERVICES=""
+  local service
+  for service in \
+    vp-ffmpeg-worker-go-swarm \
+    "$VP_PYTHON_WORKER_SERVICE" \
+    "$VP_VISION_WORKER_SERVICE" \
+    "$VP_PUBLISHER_SERVICE"; do
+    vp_app_service_was_attempted "$service" "$2" || continue
+    local image
+    image="$(
+      vp_worker_admission_snapshot_image "$1" "$service"
+    )" || continue
+    test_record_rollback_worker_plan "$service" "$image" || return 1
+  done
+  vp_worker_admission_transition_to ROLLBACK_APPLYING || return 1
+  vp_restore_app_snapshots "$1" "$2" true "${5:-}" || return 1
+  vp_worker_admission_transition_to ROLLBACK_VERIFIED || return 1
+  VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
+  vp_worker_admission_promote_phase \
+    PROMOTE_ROLLBACK_WORKERS || return 1
+  vp_worker_admission_promote_phase \
+    PROMOTE_ROLLBACK_MARKER || return 1
+  vp_worker_admission_promote_phase \
+    PROMOTE_ROLLBACK_CONTROL || return 1
+  vp_worker_admission_finish_transaction rolled_back
 }
 
 vp_require_worker_redis_runtime_state() {
   VP_WORKER_REDIS_CONTROL_SECRET=control-runtime
+  VP_WORKER_REDIS_CONTROL_SECRET_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
   VP_WORKER_REDIS_FFMPEG_GO_SECRET=ffmpeg-go-runtime
   VP_WORKER_REDIS_FFMPEG_SECRET=ffmpeg-runtime
   VP_WORKER_REDIS_VISION_SECRET=vision-runtime
   VP_WORKER_REDIS_YOUTUBE_PUBLISHER_SECRET=youtube-runtime
   VP_WORKER_REDIS_WATCHER_SECRET=watcher-runtime
+  VP_WORKER_REDIS_WATCHER_SECRET_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  VP_WORKER_REDIS_MARKER_RUNTIME_GENERATION="$TEST_COMMIT"
   VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET=marker-readiness-runtime
+  VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET_ID=cccccccccccccccccccccccccccccccc
   VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET=marker-janitor-runtime
+  VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET_ID=dddddddddddddddddddddddddddddddd
   VP_WORKER_REDIS_MARKER_REPAIR_REDIS_SECRET=marker-repair-runtime
+  VP_WORKER_REDIS_MARKER_REPAIR_REDIS_SECRET_ID=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 }
 
 vp_worker_redis_marker_owner_file() {
@@ -1215,8 +1913,14 @@ vp_worker_redis_marker_read_prior_config() {
 }
 
 vp_worker_redis_marker_capture_managed_state() {
-  VP_WORKER_REDIS_MARKER_MANAGED_STATE="$1/.test-managed-$RANDOM"
+  VP_WORKER_REDIS_MARKER_MANAGED_STATE="${2:-$1/.test-managed-$RANDOM}"
   mkdir -p "$VP_WORKER_REDIS_MARKER_MANAGED_STATE"
+  chmod 0700 "$VP_WORKER_REDIS_MARKER_MANAGED_STATE"
+  printf 'VERSION=1\n' \
+    >"$VP_WORKER_REDIS_MARKER_MANAGED_STATE/captured"
+  chmod 0600 "$VP_WORKER_REDIS_MARKER_MANAGED_STATE/captured"
+  : >"$VP_WORKER_REDIS_MARKER_MANAGED_STATE/crontab"
+  : >"$VP_WORKER_REDIS_MARKER_MANAGED_STATE/control.conf"
 }
 
 vp_worker_redis_marker_deactivate_managed_cron() {
@@ -1232,7 +1936,11 @@ vp_worker_redis_marker_remove_generation_jobs() {
 }
 
 vp_worker_redis_marker_provision_generation() {
+  vp_worker_admission_mark_authority_provisioning \
+    marker worker-redis-marker-control "$2"
   printf 'marker-control|provision|%s|%s\n' "$1" "$2" >>"$CALLS"
+  vp_worker_admission_mark_authority_provisioned \
+    marker worker-redis-marker-control "$2"
 }
 
 vp_install_worker_redis_marker_control() {
@@ -1249,6 +1957,109 @@ vp_require_worker_redis_marker_status() {
 
 vp_worker_redis_marker_retire_generation() {
   printf 'marker-control|retire|%s|%s\n' "$1" "$2" >>"$CALLS"
+}
+
+vp_worker_admission_marker_selection_json() {
+  local selection_mode="${1:-active}"
+  [[ "$selection_mode" == active || "$selection_mode" == expected ]] \
+    || return 1
+  local generation="$VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION"
+  local image="$VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE"
+  local readiness_database_id
+  local janitor_database_id
+  local repair_database_id
+  local config_sha256
+  local cron_sha256
+  readiness_database_id="$(
+    printf '%s' "$generation|readiness-database" \
+      | shasum -a 256 | cut -c1-32
+  )" || return 1
+  janitor_database_id="$(
+    printf '%s' "$generation|janitor-database" \
+      | shasum -a 256 | cut -c1-32
+  )" || return 1
+  repair_database_id="$(
+    printf '%s' "$generation|repair-database" \
+      | shasum -a 256 | cut -c1-32
+  )" || return 1
+  config_sha256="$(
+    printf '%s' "$generation|$image|config" \
+      | shasum -a 256 | cut -c1-64
+  )" || return 1
+  cron_sha256="$(
+    printf '%s' "$generation|$image|cron" \
+      | shasum -a 256 | cut -c1-64
+  )" || return 1
+  python3 -I -c '
+import json
+import sys
+
+(
+    generation,
+    image,
+    config_sha256,
+    cron_sha256,
+    readiness_database_id,
+    janitor_database_id,
+    repair_database_id,
+    runtime_generation,
+    readiness_redis_name,
+    readiness_redis_id,
+    janitor_redis_name,
+    janitor_redis_id,
+) = sys.argv[1:]
+references = [
+    {
+        "name": f"vp-wrm-readiness-db-{generation}",
+        "docker_secret_id": readiness_database_id,
+        "service": "worker-redis-marker-control",
+        "generation": generation,
+        "purpose": "readiness-database",
+    },
+    {
+        "name": f"vp-wrm-janitor-db-{generation}",
+        "docker_secret_id": janitor_database_id,
+        "service": "worker-redis-marker-control",
+        "generation": generation,
+        "purpose": "janitor-database",
+    },
+    {
+        "name": f"vp-wrm-repair-db-{generation}",
+        "docker_secret_id": repair_database_id,
+        "service": "worker-redis-marker-control",
+        "generation": generation,
+        "purpose": "repair-database",
+    },
+    {
+        "name": readiness_redis_name,
+        "docker_secret_id": readiness_redis_id,
+        "service": "vp-worker-redis-runtime",
+        "generation": runtime_generation,
+        "purpose": "readiness-redis",
+    },
+    {
+        "name": janitor_redis_name,
+        "docker_secret_id": janitor_redis_id,
+        "service": "vp-worker-redis-runtime",
+        "generation": runtime_generation,
+        "purpose": "janitor-redis",
+    },
+]
+print(json.dumps({
+    "generation": generation,
+    "image": image,
+    "config_sha256": config_sha256,
+    "cron_sha256": cron_sha256,
+    "secrets": references,
+}, sort_keys=True, separators=(",", ":")))
+' \
+    "$generation" "$image" "$config_sha256" "$cron_sha256" \
+    "$readiness_database_id" "$janitor_database_id" \
+    "$repair_database_id" "$VP_WORKER_REDIS_MARKER_RUNTIME_GENERATION" \
+    "$VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET" \
+    "$VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET_ID" \
+    "$VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET" \
+    "$VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET_ID"
 }
 
 vp_worker_redis_marker_discard_managed_state() {
@@ -1598,8 +2409,33 @@ vp_worker_redis_marker_discard_managed_state() {
 
   vp_validate_worker_database_identities
   vp_worker_admission_lock_acquire "$transaction_root"
+  VP_WORKER_ADMISSION_PREPARED=true
+  VP_WORKER_ADMISSION_COMMITTED=true
+  VP_WORKER_ADMISSION_CANDIDATE_SERVICES=vp-stale-worker
+  VP_WORKER_CONTROL_PREPARED=true
+  VP_WORKER_CONTROL_GENERATION=c-stale
+  VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=true
+  VP_WORKER_REDIS_MARKER_CANDIDATE_READY=true
+  VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION=m-stale
+  VP_WORKER_REDIS_MARKER_MANAGED_STATE=/stale/managed-state
+  VP_WORKER_ADMISSION_JANITOR_SERVICE_ID=stalejanitorservice
+  VP_VISION_CUTOVER_JOB_SERVICE_ID=stalevisionservice
   vp_worker_admission_prepare_transaction \
     "$backend_image" "$go_image" "$control_image"
+  if [[ "$VP_WORKER_ADMISSION_PREPARED" != false \
+    || "$VP_WORKER_ADMISSION_COMMITTED" != false \
+    || -n "$VP_WORKER_ADMISSION_CANDIDATE_SERVICES" \
+    || "$VP_WORKER_CONTROL_PREPARED" != false \
+    || -n "$VP_WORKER_CONTROL_GENERATION" \
+    || "$VP_WORKER_REDIS_MARKER_CONTROL_PREPARED" != false \
+    || "$VP_WORKER_REDIS_MARKER_CANDIDATE_READY" != false \
+    || -n "$VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION" \
+    || -n "$VP_WORKER_REDIS_MARKER_MANAGED_STATE" \
+    || -n "$VP_WORKER_ADMISSION_JANITOR_SERVICE_ID" \
+    || -n "$VP_VISION_CUTOVER_JOB_SERVICE_ID" ]]; then
+    echo 'FAIL: transaction preparation retained stale forward context' >&2
+    exit 1
+  fi
   active="$transaction_root/transactions/active.json"
   [[ -f "$active" && ! -L "$active" ]]
   python3 - "$active" "$transaction_commit" <<'PY'
@@ -1614,15 +2450,50 @@ if (
 ):
     raise SystemExit("PREPARING transaction was not connected")
 PY
-  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
+  baseline_payload="$TEST_ROOT/transaction-preparation/baseline.json"
+  python3 - "$baseline_payload" <<'PY'
+import json
+import pathlib
+import sys
+
+services = [
+    "vp-api-swarm",
+    "vp-frontend-swarm",
+    "vp-autoflow-api-swarm",
+    "vp-event-outbox-relay-swarm",
+    "vp-channel-agent-runner-swarm",
+    "vp-ffmpeg-worker-go-swarm",
+    "vp-ffmpeg-worker-gpu-swarm",
+    "vp-vision-worker-swarm",
+    "vp-youtube-publisher-swarm",
+]
+payload = {
+    "control": None,
+    "kind": "legacy_no_control",
+    "services": [
+        {
+            "docker_service_id": None,
+            "existed": False,
+            "image": None,
+            "name": service,
+            "spec_digest": None,
+        }
+        for service in services
+    ],
+}
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+  vp_worker_admission_load_replay_plan
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" capture-baseline \
     "$transaction_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
-    0 FORWARD_APPLYING >/dev/null
-  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
-    "$transaction_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
-    1 FORWARD_VERIFIED >/dev/null
-  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
-    "$transaction_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
-    2 WORKERS_PROMOTED >/dev/null
+    "$VP_WORKER_ADMISSION_REPLAY_REVISION" \
+    <"$baseline_payload" >/dev/null
+  vp_worker_admission_transition_to FORWARD_APPLYING
+  vp_worker_admission_transition_to FORWARD_VERIFIED
+  vp_worker_admission_transition_to WORKERS_PROMOTED
   : >"$transaction_calls"
   if vp_worker_admission_prepare_transaction \
     "$backend_image" "$go_image" "$control_image" >/dev/null 2>&1; then
@@ -1634,6 +2505,59 @@ PY
     exit 1
   fi
   vp_worker_admission_lock_release
+  : >"$transaction_calls"
+  vp_commit_worker_redis_marker_controls() {
+    vp_worker_admission_lock_assert
+    printf 'replay|marker\n' >>"$transaction_calls"
+  }
+  vp_commit_worker_control_generation() {
+    vp_worker_admission_lock_assert
+    printf 'replay|control\n' >>"$transaction_calls"
+  }
+  vp_worker_admission_retire_transaction() {
+    vp_worker_admission_lock_assert
+    printf 'replay|retire\n' >>"$transaction_calls"
+  }
+  vp_worker_admission_hydrate_recovery_context() {
+    vp_worker_admission_lock_assert
+  }
+  vp_worker_admission_promote_phase() {
+    vp_worker_admission_lock_assert
+    case "$1" in
+      PROMOTE_MARKER)
+        vp_commit_worker_redis_marker_controls
+        vp_worker_admission_transition_to MARKER_PROMOTED
+        ;;
+      PROMOTE_CONTROL)
+        vp_commit_worker_control_generation
+        vp_worker_admission_transition_to CONTROL_PROMOTED
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  vp_validate_deploy_config() {
+    vp_worker_admission_lock_assert
+    printf 'deploy|validate\n' >>"$transaction_calls"
+  }
+  vp_worker_admission_prepare_transaction() {
+    vp_worker_admission_lock_assert
+    printf 'deploy|prepare\n' >>"$transaction_calls"
+  }
+  _vp_deploy_vp_app_services_locked() {
+    vp_worker_admission_lock_assert
+    printf 'deploy|apply\n' >>"$transaction_calls"
+  }
+  deploy_vp_app_services \
+    synthetic-pds synthetic-frontend "$backend_image" \
+    synthetic-channelops "$go_image" "$control_image" \
+    >/dev/null
+  expected_stage2_calls=$'replay|marker\nreplay|control\nreplay|retire\ndeploy|validate\ndeploy|prepare\ndeploy|apply'
+  if [[ "$(<"$transaction_calls")" != "$expected_stage2_calls" \
+    || -e "$active" \
+    || "$(find "$transaction_root/transactions" -name done.json -type f | wc -l | tr -d ' ')" -ne 1 ]]; then
+    echo 'FAIL: full deploy entry did not reconcile the promoted transaction before a new deployment' >&2
+    exit 1
+  fi
 )
 
 (
@@ -1661,10 +2585,6 @@ PY
 
 vp_probe_worker_database_principal() {
   printf 'database-principal|%s|%s\n' "$1" "$3" >>"$CALLS"
-}
-
-vp_worker_admission_prepare_transaction() {
-  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
 }
 
 VP_RUNTIME_HOST=10.0.0.126
@@ -1717,6 +2637,71 @@ if [[ "$deploy_output" != "$VP_APP_SERVICES" ]]; then
   echo 'FAIL: deploy_vp_app_services stdout must contain only the service inventory' >&2
   exit 1
 fi
+if [[ -e "$ROOT/state/vp-worker-admission/transactions/active.json" ]]; then
+  echo 'FAIL: successful deployment left an active worker admission transaction' >&2
+  exit 1
+fi
+forward_done="$(
+  find "$ROOT/state/vp-worker-admission/transactions" \
+    -name done.json -type f -print
+)"
+python3 - "$forward_done" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+workers = document["forward"]["workers"]
+marker = document["forward"]["marker"]
+janitor = document["janitor"]["service"]
+if (
+    document["phase"] != "DONE"
+    or document["outcome"] != "succeeded"
+    or len(workers) != 4
+    or any(worker["applied_stage"] != "verified" for worker in workers)
+    or any(
+        worker["docker_service_id"] is None
+        or worker["target_spec_digest"] is None
+        for worker in workers
+    )
+    or marker is None
+    or {reference["purpose"] for reference in marker["secrets"]} != {
+        "readiness-database",
+        "janitor-database",
+        "repair-database",
+        "readiness-redis",
+        "janitor-redis",
+    }
+    or janitor is None
+    or janitor["name"] != "vp-staging-object-janitor"
+    or janitor["docker_service_id"] is None
+    or janitor["spec_digest"] is None
+):
+    raise SystemExit("successful forward identities were not durable")
+PY
+for worker_contract in \
+  vp-ffmpeg-worker-go-swarm:101 \
+  "$VP_PYTHON_WORKER_SERVICE:102" \
+  "$VP_VISION_WORKER_SERVICE:103" \
+  "$VP_PUBLISHER_SERVICE:104"; do
+  worker_service="${worker_contract%%:*}"
+  worker_generation="${worker_contract##*:}"
+  worker_mutation="$(
+    grep -E '^docker\|service (create|update) ' "$CALLS" \
+      | grep -E "( |logical-service=)$worker_service( |$)" \
+      | tail -1
+  )"
+  if [[ "$worker_mutation" != *"--label-add vp.service=$worker_service"* \
+    || "$worker_mutation" \
+      != *"--label-add vp.generation=$worker_generation"* \
+    || "$worker_mutation" \
+      != *'--label-add vp.managed-by=videoprocess-deploy'* ]]; then
+    echo "FAIL: $worker_service bypassed the immutable worker mutation contract" >&2
+    exit 1
+  fi
+done
+grep -Fq "docker|service ps $VISION_SAFETY_JOB_ID " "$CALLS"
+grep -Fq "docker|service ps $VISION_RECONCILE_JOB_ID " "$CALLS"
 worker_admission_commit_line="$(
   grep -nF 'worker-admission|commit' "$CALLS" | head -1 | cut -d: -f1
 )"
@@ -1762,9 +2747,7 @@ if grep -Eq '10\.0\.0\.126|CASPERs-Mac-mini|colima-swarmbridged|test-access|test
 fi
 
 vision_cutover_gate_line="$(
-  grep -nF 'docker|run --rm' "$CALLS" \
-    | grep -F 'runtime_schedules' \
-    | grep -F 'vp:tasks:vision' \
+  grep -nF 'log|vision cutover gate verified: CLOSED and idle' "$CALLS" \
     | head -1 \
     | cut -d: -f1 \
     || true
@@ -1856,7 +2839,22 @@ vision_readiness_probe_line="$(
     | cut -d: -f1
 )"
 vision_consumer_cutover_line="$(
-  grep -nF 'python -m app.services.vision_consumer_cutover' "$CALLS" \
+  grep -nF 'log|vision consumer reconciliation verified' "$CALLS" \
+    | head -1 \
+    | cut -d: -f1 \
+    || true
+)"
+final_vision_safety_job_line="$(
+  grep -nF 'docker|service create' "$CALLS" \
+    | grep -F -- '--label vp.purpose=final-safety' \
+    | head -1 \
+    | cut -d: -f1 \
+    || true
+)"
+final_vision_safety_gate_line="$(
+  grep -nF \
+    'log|final vision cutover gate verified immediately before retirement' \
+    "$CALLS" \
     | head -1 \
     | cut -d: -f1 \
     || true
@@ -1864,11 +2862,15 @@ vision_consumer_cutover_line="$(
 if [[ -z "$legacy_vision_remove_line" \
   || -z "$vision_running_line" \
   || -z "$vision_readiness_probe_line" \
+  || -z "$final_vision_safety_job_line" \
+  || -z "$final_vision_safety_gate_line" \
   || -z "$vision_consumer_cutover_line" \
   || "$vision_running_line" -ge "$legacy_vision_remove_line" \
-  || "$vision_readiness_probe_line" -ge "$legacy_vision_remove_line" \
+  || "$vision_readiness_probe_line" -ge "$final_vision_safety_job_line" \
+  || "$final_vision_safety_job_line" -ge "$final_vision_safety_gate_line" \
+  || "$final_vision_safety_gate_line" -ge "$legacy_vision_remove_line" \
   || "$legacy_vision_remove_line" -ge "$vision_consumer_cutover_line" ]]; then
-  echo 'FAIL: managed health/readiness, legacy retirement, and consumer reconciliation order is unsafe' >&2
+  echo 'FAIL: final vision safety, retirement, and reconciliation order is unsafe' >&2
   exit 1
 fi
 
@@ -1911,17 +2913,38 @@ if docker service ps "$VP_PYTHON_WORKER_SERVICE" \
   exit 1
 fi
 
+deploy_prepared_python_worker_fixture() {
+  VP_WORKER_ADMISSION_PREPARED=true \
+    VP_WORKER_FFMPEG_GENERATION=102 \
+    vp_deploy_python_worker "$@"
+}
+
+deploy_prepared_vision_worker_fixture() {
+  VP_WORKER_ADMISSION_PREPARED=true \
+    VP_WORKER_VISION_GENERATION=103 \
+    vp_deploy_vision_worker "$@"
+}
+
+deploy_prepared_publisher_fixture() {
+  VP_WORKER_ADMISSION_PREPARED=true \
+    VP_WORKER_YOUTUBE_PUBLISHER_GENERATION=104 \
+    vp_deploy_publisher "$@"
+}
+
 deploy_managed_worker_for_gate_test() {
   local service="$1"
   case "$service" in
     "$VP_PYTHON_WORKER_SERVICE")
-      vp_deploy_python_worker vp-ffmpeg-worker-python:placement-gate-test
+      deploy_prepared_python_worker_fixture \
+        vp-ffmpeg-worker-python:placement-gate-test
       ;;
     "$VP_VISION_WORKER_SERVICE")
-      vp_deploy_vision_worker vp-ffmpeg-worker-python:placement-gate-test
+      deploy_prepared_vision_worker_fixture \
+        vp-ffmpeg-worker-python:placement-gate-test
       ;;
     "$VP_PUBLISHER_SERVICE")
-      vp_deploy_publisher vp-ffmpeg-worker-python:placement-gate-test
+      deploy_prepared_publisher_fixture \
+        vp-ffmpeg-worker-python:placement-gate-test
       ;;
     *)
       return 1
@@ -2114,18 +3137,13 @@ fi
 
 assert_deploy_rejected_by_readiness() {
   local name="$1"
+  local output="$TEST_ROOT/readiness-$name.out"
   : >"$CALLS"
   GPU_SERVICE_EXISTS=true
   VISION_SERVICE_EXISTS=true
   PUBLISHER_SERVICE_EXISTS=true
   LEGACY_VISION_CONTAINER_EXISTS=true
-  if deploy_vp_app_services \
-    "vp-api:worker-readiness-$name" \
-    "vp-frontend:worker-readiness-$name" \
-    "vp-backend-api:worker-readiness-$name" \
-    "vp-channelops-runner-go:worker-readiness-$name" \
-    "vp-ffmpeg-worker-go:worker-readiness-$name" \
-    "vp-ffmpeg-worker-python:worker-readiness-$name" >/dev/null 2>&1; then
+  if deploy_vp_app_services $images >"$output" 2>&1; then
     echo "FAIL: $name worker storage readiness failure unexpectedly allowed deployment" >&2
     exit 1
   fi
@@ -2134,23 +3152,32 @@ assert_deploy_rejected_by_readiness() {
     exit 1
   fi
   assert_readiness_failure_calls_are_safe
+  cp "$CALLS" "$TEST_ROOT/readiness-$name.calls"
 }
 
-WORKER_READINESS_CONTAINER_MODE=missing
+rm -f "$WORKER_READINESS_CONTAINER_CALLS"
+WORKER_READINESS_CONTAINER_MODE=missing-then-normal
 FAIL_WORKER_READINESS_SERVICE=
 assert_deploy_rejected_by_readiness missing-container
-if grep -Fq 'docker|exec|' "$CALLS" \
-  || grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE" "$CALLS" \
-  || grep -Fq "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS"; then
+readiness_rollback_line="$(
+  grep -nF 'log|VideoProcess service apply failed; restoring prior images with fresh admission' \
+    "$CALLS" | head -1 | cut -d: -f1
+)"
+if sed -n "1,$((readiness_rollback_line - 1))p" "$CALLS" \
+  | grep -Eq "docker\|exec\||docker\|container ls --filter label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE|docker\|rm -f $LEGACY_VISION_CONTAINER_ID"; then
   echo 'FAIL: missing readiness container advanced past the GPU deployment gate' >&2
   exit 1
 fi
 
-WORKER_READINESS_CONTAINER_MODE=duplicate
+rm -f "$WORKER_READINESS_CONTAINER_CALLS"
+WORKER_READINESS_CONTAINER_MODE=duplicate-then-normal
 assert_deploy_rejected_by_readiness duplicate-container
-if grep -Fq 'docker|exec|' "$CALLS" \
-  || grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE" "$CALLS" \
-  || grep -Fq "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS"; then
+readiness_rollback_line="$(
+  grep -nF 'log|VideoProcess service apply failed; restoring prior images with fresh admission' \
+    "$CALLS" | head -1 | cut -d: -f1
+)"
+if sed -n "1,$((readiness_rollback_line - 1))p" "$CALLS" \
+  | grep -Eq "docker\|exec\||docker\|container ls --filter label=com.docker.swarm.service.name=$VP_VISION_WORKER_SERVICE|docker\|rm -f $LEGACY_VISION_CONTAINER_ID"; then
   echo 'FAIL: duplicate readiness containers advanced past the GPU deployment gate' >&2
   exit 1
 fi
@@ -2160,7 +3187,9 @@ for failed_readiness_service in \
   "$VP_PYTHON_WORKER_SERVICE" \
   "$VP_VISION_WORKER_SERVICE" \
   "$VP_PUBLISHER_SERVICE"; do
-  FAIL_WORKER_READINESS_SERVICE="$failed_readiness_service"
+  rm -f "$WORKER_READINESS_FAILURE_USED"
+  WORKER_READINESS_EXEC_MODE=fail-first
+  WORKER_READINESS_FAIL_SERVICE="$failed_readiness_service"
   assert_deploy_rejected_by_readiness "exec-${failed_readiness_service}"
   case "$failed_readiness_service" in
     "$VP_PYTHON_WORKER_SERVICE")
@@ -2187,7 +3216,9 @@ for failed_readiness_service in \
       ;;
   esac
 done
-FAIL_WORKER_READINESS_SERVICE=
+WORKER_READINESS_EXEC_MODE=normal
+WORKER_READINESS_FAIL_SERVICE=
+rm -f "$WORKER_READINESS_FAILURE_USED"
 
 : >"$CALLS"
 if vp_require_managed_worker_storage_ready "$VP_PYTHON_WORKER_SERVICE" invalid >/dev/null 2>&1; then
@@ -2201,14 +3232,8 @@ if ! grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=
 fi
 
 deploy_worker_review_fixture() {
-  local name="$1"
-  deploy_vp_app_services \
-    "vp-api:worker-review-$name" \
-    "vp-frontend:worker-review-$name" \
-    "vp-backend-api:worker-review-$name" \
-    "vp-channelops-runner-go:worker-review-$name" \
-    "vp-ffmpeg-worker-go:worker-review-$name" \
-    "vp-ffmpeg-worker-python:worker-review-$name"
+  vp_require_worker_redis_runtime_state
+  deploy_vp_app_services $images
 }
 
 assert_rollback_targets_are_safe() {
@@ -2251,12 +3276,24 @@ assert_worker_gate_sequence_after() {
   fi
 }
 
+test_service_update_line_for_image() {
+  local service="$1"
+  local image="$2"
+  grep -nF 'docker|service update' "$CALLS" \
+    | grep -F -- "--image $image" \
+    | grep -F " $(test_service_id "$service")" \
+    | tail -1 \
+    | cut -d: -f1 \
+    || true
+}
+
 : >"$CALLS"
 GPU_SERVICE_EXISTS=true
 VISION_SERVICE_EXISTS=true
 PUBLISHER_SERVICE_EXISTS=true
 LEGACY_VISION_CONTAINER_EXISTS=true
-FAIL_NODE_UPDATE=true
+rm -f "$FAKE_NODE_UPDATE_FAILURE_USED"
+FAIL_NODE_UPDATE_ONCE=true
 gpu_node_failure_contract_failed=false
 if deploy_worker_review_fixture gpu-node-label-write-failure \
   >"$TEST_ROOT/gpu-node-label-write-failure.out" 2>&1; then
@@ -2283,9 +3320,8 @@ if sed -n "$((gpu_node_update_line + 1)),$((gpu_node_rollback_line - 1))p" "$CAL
   gpu_node_failure_contract_failed=true
 fi
 gpu_node_baseline_line="$(
-  grep -nF -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS" \
-    | tail -1 \
-    | cut -d: -f1
+  test_service_update_line_for_image \
+    "$VP_PYTHON_WORKER_SERVICE" 'baseline-vp-ffmpeg-worker-gpu-swarm:stable'
 )"
 if [[ -z "$gpu_node_baseline_line" || "$gpu_node_rollback_line" -ge "$gpu_node_baseline_line" ]]; then
   echo 'FAIL: GPU node label failure did not explicitly restore the baseline' >&2
@@ -2293,7 +3329,8 @@ if [[ -z "$gpu_node_baseline_line" || "$gpu_node_rollback_line" -ge "$gpu_node_b
 fi
 assert_worker_gate_sequence_after \
   "$VP_PYTHON_WORKER_SERVICE" "$gpu_readiness_probe" "$gpu_node_baseline_line"
-FAIL_NODE_UPDATE=false
+FAIL_NODE_UPDATE_ONCE=false
+rm -f "$FAKE_NODE_UPDATE_FAILURE_USED"
 
 assert_gpu_constraints_normalized() {
   local update_call="$1"
@@ -2330,7 +3367,7 @@ assert_gpu_constraints_normalized() {
 
 : >"$CALLS"
 CONSTRAINT_MODE=gpu-stale
-vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-placement-normalization \
+deploy_prepared_python_worker_fixture vp-ffmpeg-worker-python:gpu-placement-normalization \
   >/dev/null
 gpu_normalized_update="$(
   grep -F 'docker|service update' "$CALLS" \
@@ -2347,7 +3384,7 @@ assert_rollback_targets_are_safe
 
 : >"$CALLS"
 CONSTRAINT_MODE=gpu-duplicate
-if vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-duplicate-constraint \
+if deploy_prepared_python_worker_fixture vp-ffmpeg-worker-python:gpu-duplicate-constraint \
   >/dev/null 2>&1; then
   echo 'FAIL: duplicate approved GPU constraints unexpectedly passed' >&2
   exit 1
@@ -2362,7 +3399,7 @@ fi
 : >"$CALLS"
 CONSTRAINT_MODE=gpu-stale
 FAIL_GPU_CONSTRAINT_INSPECT=true
-if vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-constraint-inspect-failure \
+if deploy_prepared_python_worker_fixture vp-ffmpeg-worker-python:gpu-constraint-inspect-failure \
   >/dev/null 2>&1; then
   echo 'FAIL: GPU constraint inspect failure unexpectedly passed deployment' >&2
   exit 1
@@ -2399,9 +3436,8 @@ if deploy_worker_review_fixture gpu-placement-rollback \
   exit 1
 fi
 gpu_constraint_baseline_line="$(
-  grep -nF -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS" \
-    | tail -1 \
-    | cut -d: -f1
+  test_service_update_line_for_image \
+    "$VP_PYTHON_WORKER_SERVICE" 'baseline-vp-ffmpeg-worker-gpu-swarm:stable'
 )"
 gpu_constraint_baseline_update="$(
   grep -F 'docker|service update' "$CALLS" \
@@ -2433,13 +3469,13 @@ VISION_SERVICE_EXISTS=true
 PUBLISHER_SERVICE_EXISTS=true
 LEGACY_VISION_CONTAINER_EXISTS=true
 FAIL_UPDATE_SERVICE="$VP_PYTHON_WORKER_SERVICE"
-FAIL_UPDATE_IMAGE=vp-ffmpeg-worker-python:worker-review-gpu-update-write-failure
+FAIL_UPDATE_IMAGE="vp-ffmpeg-worker-python:deploy-${TEST_COMMIT:0:12}"
 if deploy_worker_review_fixture gpu-update-write-failure >"$TEST_ROOT/gpu-update-write-failure.out" 2>&1; then
   echo 'FAIL: failed GPU update was masked by an old healthy task' >&2
   exit 1
 fi
 gpu_failed_update_call="$(grep -F 'docker|service update' "$CALLS" \
-  | grep -F -- '--image vp-ffmpeg-worker-python:worker-review-gpu-update-write-failure' \
+  | grep -F -- "--image vp-ffmpeg-worker-python:deploy-${TEST_COMMIT:0:12}" \
   | grep -F "$VP_PYTHON_WORKER_SERVICE" \
   | head -1)"
 if [[ -z "$gpu_failed_update_call" ]]; then
@@ -2448,7 +3484,10 @@ if [[ -z "$gpu_failed_update_call" ]]; then
 fi
 gpu_attempt_line="$(grep -nF "$gpu_failed_update_call" "$CALLS" | head -1 | cut -d: -f1)"
 grep -Fq 'log|VideoProcess service apply failed; restoring prior images with fresh admission' "$CALLS"
-gpu_baseline_line="$(grep -nF -- '--image baseline-vp-ffmpeg-worker-gpu-swarm:stable vp-ffmpeg-worker-gpu-swarm' "$CALLS" | tail -1 | cut -d: -f1)"
+gpu_baseline_line="$(
+  test_service_update_line_for_image \
+    "$VP_PYTHON_WORKER_SERVICE" 'baseline-vp-ffmpeg-worker-gpu-swarm:stable'
+)"
 if [[ -z "$gpu_attempt_line" || -z "$gpu_baseline_line" || "$gpu_attempt_line" -ge "$gpu_baseline_line" ]]; then
   echo 'FAIL: GPU update rollback did not attempt the exact baseline image after the failed write' >&2
   exit 1
@@ -2470,6 +3509,7 @@ FAIL_UPDATE_IMAGE=
 
 : >"$CALLS"
 GPU_SERVICE_EXISTS=false
+test_mark_worker_service_absent "$VP_PYTHON_WORKER_SERVICE"
 VISION_SERVICE_EXISTS=true
 PUBLISHER_SERVICE_EXISTS=true
 LEGACY_VISION_CONTAINER_EXISTS=true
@@ -2480,7 +3520,17 @@ if deploy_worker_review_fixture gpu-create-write-failure >"$TEST_ROOT/gpu-create
 fi
 grep -Fq 'docker|service create --detach=false --name vp-ffmpeg-worker-gpu-swarm' "$CALLS"
 grep -Fq 'log|VideoProcess service apply failed; restoring prior images with fresh admission' "$CALLS"
-grep -Fq 'docker|service rm vp-ffmpeg-worker-gpu-swarm' "$CALLS"
+if ! grep -Fq \
+    "docker|service rm $(test_service_id "$VP_PYTHON_WORKER_SERVICE")" \
+    "$CALLS"; then
+  echo 'FAIL: failed GPU create rollback did not remove the immutable service ID' >&2
+  command cat "$TEST_ROOT/gpu-create-write-failure.out" >&2
+  exit 1
+fi
+if grep -Fq "docker|service rm $VP_PYTHON_WORKER_SERVICE" "$CALLS"; then
+  echo 'FAIL: failed GPU create rollback deleted by mutable service name' >&2
+  exit 1
+fi
 if grep -Fq "docker|container ls --filter label=com.docker.swarm.service.name=$VP_PYTHON_WORKER_SERVICE" "$CALLS" \
   || grep -Fq "$gpu_readiness_probe" "$CALLS"; then
   echo 'FAIL: failed GPU create reached readiness before rollback' >&2
@@ -2495,7 +3545,9 @@ assert_rollback_readiness_recovered() {
   local readiness_probe="$2"
   local output="$3"
   local baseline_line
-  baseline_line="$(grep -nF -- "--image baseline-$service:stable $service" "$CALLS" | tail -1 | cut -d: -f1)"
+  baseline_line="$(
+    test_service_update_line_for_image "$service" "baseline-$service:stable"
+  )"
   if [[ "$(grep -F "$readiness_probe" "$CALLS" | wc -l | tr -d ' ')" -lt 2 \
     || -z "$baseline_line" ]]; then
     echo "FAIL: $service rollback did not restore baseline readiness" >&2
@@ -2506,6 +3558,41 @@ assert_rollback_readiness_recovered() {
     exit 1
   fi
   assert_worker_gate_sequence_after "$service" "$readiness_probe" "$baseline_line"
+}
+
+preserve_persistent_rollback_transaction() {
+  local service="$1"
+  local transactions="$ROOT/state/vp-worker-admission/transactions"
+  local active="$transactions/active.json"
+  local evidence_root="$TEST_ROOT/persistent-rollback-transactions/$service"
+  local transaction_id
+  transaction_id="$(
+    python3 -I - "$active" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+if (
+    document.get("schema") != 3
+    or document.get("phase") != "ROLLBACK_APPLYING"
+    or document.get("outcome") is not None
+    or document.get("baseline", {}).get("captured") is not True
+    or document.get("failed_forward", {}).get("captured") is not True
+    or re.fullmatch(r"tx-[0-9a-f]{32}", document.get("transaction_id", ""))
+    is None
+):
+    raise SystemExit(1)
+print(document["transaction_id"])
+PY
+  )" || return 1
+  [[ -d "$transactions/$transaction_id" \
+    && ! -L "$transactions/$transaction_id" \
+    && ! -e "$evidence_root" ]] || return 1
+  mkdir -p "$evidence_root" || return 1
+  mv "$active" "$evidence_root/active.json" || return 1
+  mv "$transactions/$transaction_id" "$evidence_root/$transaction_id"
 }
 
 for rollback_service in \
@@ -2562,7 +3649,10 @@ for rollback_service in \
     "$VP_VISION_WORKER_SERVICE") readiness_probe="$vision_readiness_probe" ;;
     "$VP_PUBLISHER_SERVICE") readiness_probe="$publisher_readiness_probe" ;;
   esac
-  baseline_line="$(grep -nF -- "--image baseline-$rollback_service:stable $rollback_service" "$CALLS" | tail -1 | cut -d: -f1)"
+  baseline_line="$(
+    test_service_update_line_for_image \
+      "$rollback_service" "baseline-$rollback_service:stable"
+  )"
   if [[ -z "$baseline_line" \
     || "$(grep -F "$readiness_probe" "$CALLS" | wc -l | tr -d ' ')" -lt 2 ]]; then
     echo "FAIL: persistent $rollback_service failure did not attempt and verify baseline restore" >&2
@@ -2571,6 +3661,7 @@ for rollback_service in \
   assert_worker_gate_sequence_after "$rollback_service" "$readiness_probe" "$baseline_line"
   grep -Fq 'VideoProcess image restore did not fully converge' "$rollback_output"
   assert_rollback_targets_are_safe
+  preserve_persistent_rollback_transaction "$rollback_service"
 done
 FAIL_WORKER_READINESS_SERVICE=
 : >"$CALLS"
@@ -2681,12 +3772,20 @@ migration_run_call="$(
     | grep -F 'python -m app.services.worker_deployment_cli migrate' \
     | head -1
 )"
+migration_mount_source="$(
+  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' \
+    "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE"
+)"
+read_mount_source="$(
+  python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' \
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+)"
 if [[ "$migration_run_call" != \
-    *"--mount type=bind,src=$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE,dst=/run/secrets/worker-deploy-migrator-database-url,readonly"* \
+    *"--mount type=bind,src=$migration_mount_source,dst=/run/secrets/worker-deploy-migrator-database-url,readonly"* \
   || "$migration_run_call" != \
     *"--env WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE=/run/secrets/worker-deploy-migrator-database-url"* \
   || "$migration_gate_call" != \
-    *"--mount type=bind,src=$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE,dst=/run/secrets/worker-deploy-read-database-url,readonly"* \
+    *"--mount type=bind,src=$read_mount_source,dst=/run/secrets/worker-deploy-read-database-url,readonly"* \
   || "$migration_gate_call" != \
     *"--env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url"* \
   || "$migration_run_call$migration_gate_call" == *'postgresql://'* \
@@ -2703,13 +3802,7 @@ cp "$CALLS" "$TEST_ROOT/successful-deploy-calls"
 for migration_gate_mode in wrong missing error; do
   : >"$CALLS"
   MIGRATION_GATE_MODE="$migration_gate_mode"
-  if deploy_vp_app_services \
-    "vp-api:gate-$migration_gate_mode" \
-    "vp-frontend:gate-$migration_gate_mode" \
-    "vp-backend-api:gate-$migration_gate_mode" \
-    "vp-channelops-runner-go:gate-$migration_gate_mode" \
-    "vp-ffmpeg-worker-go:gate-$migration_gate_mode" \
-    "vp-ffmpeg-worker-python:gate-$migration_gate_mode" >/dev/null 2>&1; then
+  if deploy_vp_app_services $images >/dev/null 2>&1; then
     echo "FAIL: $migration_gate_mode migration gate unexpectedly succeeded" >&2
     exit 1
   fi
@@ -2734,13 +3827,7 @@ cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
 
 : >"$CALLS"
 MIGRATION_RUN_MODE=failure
-if deploy_vp_app_services \
-  vp-api:migration-failure \
-  vp-frontend:migration-failure \
-  vp-backend-api:migration-failure \
-  vp-channelops-runner-go:migration-failure \
-  vp-ffmpeg-worker-go:migration-failure \
-  vp-ffmpeg-worker-python:migration-failure >/dev/null 2>&1; then
+if deploy_vp_app_services $images >/dev/null 2>&1; then
   echo 'FAIL: failed protected migration unexpectedly succeeded' >&2
   exit 1
 fi
@@ -2763,11 +3850,31 @@ if deploy_vp_app_services $images >/dev/null 2>&1; then
 fi
 if grep -Fq 'docker|service update' "$CALLS" \
   || grep -Fq 'docker|rm -f ' "$CALLS" \
-  || grep -Fq 'python -m app.services.vision_consumer_cutover' "$CALLS"; then
+  || grep -F 'python -m app.services.vision_consumer_cutover' "$CALLS" \
+    | grep -Fvq -- '--safety'; then
   echo 'FAIL: unsafe vision cutover gate mutated services or the legacy worker' >&2
   exit 1
 fi
+grep -Fq \
+  'python -m app.services.vision_consumer_cutover --safety' "$CALLS"
+grep -Fq "docker|service rm $VISION_SAFETY_JOB_ID" "$CALLS"
 VISION_CUTOVER_GATE_MODE=success
+cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
+
+: >"$CALLS"
+LEGACY_VISION_CONTAINER_EXISTS=true
+VISION_FINAL_CUTOVER_GATE_MODE=unsafe
+if deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: stale final vision safety gate unexpectedly allowed retirement' >&2
+  exit 1
+fi
+grep -Fq -- '--label vp.purpose=final-safety' "$CALLS"
+if grep -Fq "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS" \
+  || grep -Fq 'log|vision consumer reconciliation verified' "$CALLS"; then
+  echo 'FAIL: failed final vision safety gate retired or reconciled consumers' >&2
+  exit 1
+fi
+VISION_FINAL_CUTOVER_GATE_MODE=success
 cp "$TEST_ROOT/successful-deploy-calls" "$CALLS"
 
 : >"$CALLS"
@@ -2791,7 +3898,7 @@ if deploy_vp_app_services $images >/dev/null 2>&1; then
   exit 1
 fi
 grep -Fq 'python -m app.services.vision_consumer_cutover --check-only' "$CALLS"
-grep -Fq 'runtime_schedules' "$CALLS"
+grep -Fq 'python -m app.services.vision_consumer_cutover --safety' "$CALLS"
 
 : >"$CALLS"
 VISION_CONSUMER_AUDIT_MODE=converged
@@ -2808,13 +3915,18 @@ fi
 
 : >"$CALLS"
 VISION_SERVICE_EXISTS=false
-if deploy_vp_app_services $images >/dev/null 2>&1; then
+test_mark_worker_service_absent "$VP_VISION_WORKER_SERVICE"
+vp_require_worker_redis_runtime_state
+if deploy_vp_app_services $images \
+  >"$TEST_ROOT/missing-vision-service.out" 2>&1; then
   echo 'FAIL: missing managed vision service bypassed the cutover gate' >&2
   exit 1
 fi
-grep -Fq 'runtime_schedules' "$CALLS"
+grep -Fq \
+  'python -m app.services.vision_consumer_cutover --safety' "$CALLS"
 if grep -Fq 'docker|service update' "$CALLS" \
-  || grep -Fq 'docker|service create' "$CALLS"; then
+  || grep -F 'docker|service create' "$CALLS" \
+    | grep -Fvq -- '--label vp.service=vision-cutover'; then
   echo 'FAIL: missing managed vision service mutated services before the cutover gate' >&2
   exit 1
 fi
@@ -3303,7 +4415,9 @@ if grep -Fq 'unbound variable' "$CALLS"; then
   echo 'FAIL: repeat runtime update is not compatible with Bash 3.2 set -u' >&2
   exit 1
 fi
-grep -Fq 'docker|service update --detach=false --no-resolve-image --update-order start-first --image vp-frontend:repeat-test vp-frontend-swarm' "$CALLS"
+grep -Fq \
+  "docker|service update --detach=false --no-resolve-image --update-order start-first --image vp-frontend:repeat-test $(test_service_id vp-frontend-swarm)" \
+  "$CALLS"
 CONSTRAINT_MODE=legacy
 
 : >"$CALLS"
@@ -3312,7 +4426,7 @@ PUBLISHER_CONSTRAINT_MODE=publisher
 PUBLISHER_NETWORK_MODE=pipeline
 PUBLISHER_MOUNT_MODE=desired
 PUBLISHER_ENV_MODE=desired
-if ! vp_deploy_publisher vp-ffmpeg-worker-python:publisher-repeat-test >/dev/null 2>>"$CALLS"; then
+if ! deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-repeat-test >/dev/null 2>>"$CALLS"; then
   echo 'FAIL: repeat publisher update returned non-zero' >&2
   exit 1
 fi
@@ -3321,7 +4435,9 @@ if grep -Fq 'unbound variable' "$CALLS"; then
   exit 1
 fi
 grep -Fq 'docker|service update --detach=false --no-resolve-image --update-order stop-first' "$CALLS"
-grep -Fq -- '--image vp-ffmpeg-worker-python:publisher-repeat-test vp-youtube-publisher-swarm' "$CALLS"
+grep -Fq -- \
+  "--image vp-ffmpeg-worker-python:publisher-repeat-test $(test_service_id vp-youtube-publisher-swarm)" \
+  "$CALLS"
 grep -Fq -- '--replicas 1' "$CALLS"
 if grep -Fq -- '--constraint-add node.labels.vp.publisher==true' "$CALLS" \
   || grep -Fq -- '--constraint-add node.hostname==ccttww-lap' "$CALLS" \
@@ -3338,7 +4454,7 @@ PUBLISHER_ENV_MODE=credentials
 
 : >"$CALLS"
 FAIL_HEALTH_CHECK=vp-youtube-manager
-if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-health-test >/dev/null 2>&1; then
+if deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-health-test >/dev/null 2>&1; then
   echo 'FAIL: publisher deploy must stop when manager auth health fails' >&2
   exit 1
 fi
@@ -3354,13 +4470,7 @@ FAIL_HEALTH_CHECK=
 : >"$CALLS"
 PUBLISHER_SERVICE_EXISTS=true
 PUBLISHER_LIST_FAILURE=true
-if deploy_vp_app_services \
-  vp-api:publisher-list-daemon-test \
-  vp-frontend:publisher-list-daemon-test \
-  vp-backend-api:publisher-list-daemon-test \
-  vp-channelops-runner-go:publisher-list-daemon-test \
-  vp-ffmpeg-worker-go:publisher-list-daemon-test \
-  vp-ffmpeg-worker-python:publisher-list-daemon-test >/dev/null 2>&1; then
+if deploy_vp_app_services $images >/dev/null 2>&1; then
   echo 'FAIL: publisher list daemon failure unexpectedly allowed deployment' >&2
   exit 1
 fi
@@ -3368,7 +4478,9 @@ if ! grep -Fq 'docker|service ls --filter name=vp-youtube-publisher-swarm --form
   echo 'FAIL: optional publisher snapshot must use an exact service list probe' >&2
   exit 1
 fi
-if grep -Fq 'docker|service rm vp-youtube-publisher-swarm' "$CALLS" \
+if grep -Fq \
+  "docker|service rm $(test_service_id "$VP_PUBLISHER_SERVICE")" "$CALLS" \
+  || grep -Fq "docker|service rm $VP_PUBLISHER_SERVICE" "$CALLS" \
   || grep -Fq 'docker|service create --detach=false --name vp-youtube-publisher-swarm' "$CALLS"; then
   echo 'FAIL: publisher list daemon failure must not omit, create, or delete the existing publisher' >&2
   exit 1
@@ -3377,7 +4489,7 @@ PUBLISHER_LIST_FAILURE=false
 
 : >"$CALLS"
 PUBLISHER_LIST_NAME=vp-youtube-publisher-swarm-stale
-if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-list-name-test >/dev/null 2>&1; then
+if deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-list-name-test >/dev/null 2>&1; then
   echo 'FAIL: non-exact publisher list result unexpectedly selected a service state' >&2
   exit 1
 fi
@@ -3389,7 +4501,7 @@ PUBLISHER_LIST_NAME=
 
 : >"$CALLS"
 FAIL_PUBLISHER_INSPECT_FORMAT=ContainerSpec.Configs
-if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-config-inspect-test >/dev/null 2>&1; then
+if deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-config-inspect-test >/dev/null 2>&1; then
   echo 'FAIL: publisher config inspection failure unexpectedly allowed deployment' >&2
   exit 1
 fi
@@ -3402,13 +4514,16 @@ FAIL_PUBLISHER_INSPECT_FORMAT=
 
 : >"$CALLS"
 GPU_SERVICE_EXISTS=false
+test_mark_worker_service_absent "$VP_PYTHON_WORKER_SERVICE"
 PUBLISHER_SERVICE_EXISTS=true
 PUBLISHER_LIST_FAILURE=true
 if vp_restore_app_snapshots "" >/dev/null 2>&1; then
   echo 'FAIL: publisher rollback removal accepted a list daemon failure' >&2
   exit 1
 fi
-if grep -Fq 'docker|service rm vp-youtube-publisher-swarm' "$CALLS"; then
+if grep -Fq \
+  "docker|service rm $(test_service_id "$VP_PUBLISHER_SERVICE")" "$CALLS" \
+  || grep -Fq "docker|service rm $VP_PUBLISHER_SERVICE" "$CALLS"; then
   echo 'FAIL: publisher rollback removal deleted a publisher after list daemon failure' >&2
   exit 1
 fi
@@ -3422,7 +4537,7 @@ PUBLISHER_NETWORK_MODE=pipeline
 PUBLISHER_MOUNT_MODE=desired
 PUBLISHER_ENV_MODE=desired
 FAIL_NODE_UPDATE=true
-if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-node-failure-test >/dev/null 2>&1; then
+if deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-node-failure-test >/dev/null 2>&1; then
   echo 'FAIL: publisher deploy must return non-zero when manager label update fails' >&2
   exit 1
 fi
@@ -3435,7 +4550,7 @@ FAIL_NODE_UPDATE=false
 
 : >"$CALLS"
 FAIL_NETWORK_INSPECT=true
-if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-network-failure-test >/dev/null 2>&1; then
+if deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-network-failure-test >/dev/null 2>&1; then
   echo 'FAIL: publisher deploy must return non-zero when network inspection fails' >&2
   exit 1
 fi
@@ -3451,8 +4566,9 @@ FAIL_NETWORK_INSPECT=false
 
 : >"$CALLS"
 PUBLISHER_SERVICE_EXISTS=false
+test_mark_worker_service_absent "$VP_PUBLISHER_SERVICE"
 FAIL_PUBLISHER_CREATE=true
-if vp_deploy_publisher vp-ffmpeg-worker-python:publisher-create-failure-test >/dev/null 2>&1; then
+if deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-create-failure-test >/dev/null 2>&1; then
   echo 'FAIL: publisher deploy must return non-zero when service creation fails' >&2
   exit 1
 fi
@@ -3465,18 +4581,18 @@ PUBLISHER_SERVICE_EXISTS=true
 PUBLISHER_MOUNT_MODE=wrong
 PUBLISHER_REPLICAS=3
 FAIL_UPDATE_SERVICE=vp-youtube-publisher-swarm
-FAIL_UPDATE_IMAGE=vp-ffmpeg-worker-python:publisher-update-failure-test
-if deploy_vp_app_services \
-  vp-api:publisher-update-failure-test \
-  vp-frontend:publisher-update-failure-test \
-  vp-backend-api:publisher-update-failure-test \
-  vp-channelops-runner-go:publisher-update-failure-test \
-  vp-ffmpeg-worker-go:publisher-update-failure-test \
-  vp-ffmpeg-worker-python:publisher-update-failure-test >/dev/null 2>&1; then
+FAIL_UPDATE_IMAGE="vp-ffmpeg-worker-python:deploy-${TEST_COMMIT:0:12}"
+if deploy_vp_app_services $images >/dev/null 2>&1; then
   echo 'FAIL: failed publisher update with an old running service unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq -- '--image baseline-vp-youtube-publisher-swarm:stable vp-youtube-publisher-swarm' "$CALLS"
+if [[ -z "$(
+  test_service_update_line_for_image \
+    "$VP_PUBLISHER_SERVICE" 'baseline-vp-youtube-publisher-swarm:stable'
+)" ]]; then
+  echo 'FAIL: publisher update failure did not restore the baseline image' >&2
+  exit 1
+fi
 if [[ "$PUBLISHER_MOUNT_MODE" != desired || "$PUBLISHER_REPLICAS" -ne 1 ]]; then
   echo 'FAIL: publisher rollback did not recover one replica with the desired scratch mount' >&2
   exit 1
@@ -3486,13 +4602,13 @@ FAIL_UPDATE_IMAGE=
 
 VP_GPU_RUNTIME_READY=true
 GPU_PREFLIGHT_SUCCEEDS=false
-if vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-preflight-test >/dev/null 2>&1; then
+if deploy_prepared_python_worker_fixture vp-ffmpeg-worker-python:gpu-preflight-test >/dev/null 2>&1; then
   echo 'FAIL: requested GPU mode must fail when the runtime preflight fails' >&2
   exit 1
 fi
 grep -Fq 'docker|run --rm --gpus all vp-ffmpeg-worker-python:gpu-preflight-test nvidia-smi' "$CALLS"
 GPU_PREFLIGHT_SUCCEEDS=true
-if vp_deploy_python_worker vp-ffmpeg-worker-python:gpu-swarm-allocation-test \
+if deploy_prepared_python_worker_fixture vp-ffmpeg-worker-python:gpu-swarm-allocation-test \
   >/dev/null 2>&1; then
   echo 'FAIL: GPU mode must remain disabled until Swarm task allocation is configured' >&2
   exit 1
@@ -3502,19 +4618,17 @@ VP_GPU_RUNTIME_READY=false
 : >"$CALLS"
 GPU_SERVICE_EXISTS=true
 FAIL_UPDATE_SERVICE=vp-channel-agent-runner-swarm
-FAIL_UPDATE_IMAGE=vp-channelops-runner-go:rollback-test
-if deploy_vp_app_services \
-  vp-api:rollback-test \
-  vp-frontend:rollback-test \
-  vp-backend-api:rollback-test \
-  vp-channelops-runner-go:rollback-test \
-  vp-ffmpeg-worker-go:rollback-test \
-  vp-ffmpeg-worker-python:rollback-test >/dev/null 2>&1; then
+FAIL_UPDATE_IMAGE="vp-channelops-runner-go:deploy-${TEST_COMMIT:0:12}"
+if deploy_vp_app_services $images >/dev/null 2>&1; then
   echo 'FAIL: injected service update failure unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq -- '--image baseline-vp-api-swarm:stable vp-api-swarm' "$CALLS"
-grep -Fq -- '--image baseline-vp-channel-agent-runner-swarm:stable vp-channel-agent-runner-swarm' "$CALLS"
+grep -Fq -- \
+  "--image baseline-vp-api-swarm:stable $(test_service_id vp-api-swarm)" \
+  "$CALLS"
+grep -Fq -- \
+  "--image baseline-vp-channel-agent-runner-swarm:stable $(test_service_id vp-channel-agent-runner-swarm)" \
+  "$CALLS"
 grep -Fq -- '--constraint-add node.labels.vp.runtime==true' "$CALLS"
 runner_rollback_call="$(
   grep -F 'docker|service update' "$CALLS" \
@@ -3545,53 +4659,59 @@ fi
 FAIL_UPDATE_SERVICE=
 FAIL_UPDATE_IMAGE=
 GPU_SERVICE_EXISTS=false
+test_mark_worker_service_absent "$VP_PYTHON_WORKER_SERVICE"
 FAIL_RUNNING_SERVICE=vp-ffmpeg-worker-gpu-swarm
-if deploy_vp_app_services \
-  vp-api:create-rollback-test \
-  vp-frontend:create-rollback-test \
-  vp-backend-api:create-rollback-test \
-  vp-channelops-runner-go:create-rollback-test \
-  vp-ffmpeg-worker-go:create-rollback-test \
-  vp-ffmpeg-worker-python:create-rollback-test >/dev/null 2>&1; then
+if deploy_vp_app_services $images >/dev/null 2>&1; then
   echo 'FAIL: injected new-worker health failure unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq 'docker|service rm vp-ffmpeg-worker-gpu-swarm' "$CALLS"
+grep -Fq \
+  "docker|service rm $(test_service_id "$VP_PYTHON_WORKER_SERVICE")" \
+  "$CALLS"
+if grep -Fq "docker|service rm $VP_PYTHON_WORKER_SERVICE" "$CALLS"; then
+  echo 'FAIL: new GPU rollback deleted by mutable service name' >&2
+  exit 1
+fi
 FAIL_RUNNING_SERVICE=
 
 : >"$CALLS"
 GPU_SERVICE_EXISTS=true
 PUBLISHER_SERVICE_EXISTS=true
-FAIL_RUNNING_SERVICE=vp-youtube-publisher-swarm
-if deploy_vp_app_services \
-  vp-api:publisher-rollback-test \
-  vp-frontend:publisher-rollback-test \
-  vp-backend-api:publisher-rollback-test \
-  vp-channelops-runner-go:publisher-rollback-test \
-  vp-ffmpeg-worker-go:publisher-rollback-test \
-  vp-ffmpeg-worker-python:publisher-rollback-test >/dev/null 2>&1; then
+rm -f "$FAKE_RUNNING_FAILURE_USED"
+FAIL_RUNNING_SERVICE_ONCE=vp-youtube-publisher-swarm
+if deploy_vp_app_services $images >/dev/null 2>&1; then
   echo 'FAIL: existing publisher convergence failure unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq -- '--image baseline-vp-youtube-publisher-swarm:stable vp-youtube-publisher-swarm' "$CALLS"
-FAIL_RUNNING_SERVICE=
+if [[ -z "$(
+  test_service_update_line_for_image \
+    "$VP_PUBLISHER_SERVICE" 'baseline-vp-youtube-publisher-swarm:stable'
+)" ]]; then
+  echo 'FAIL: existing publisher convergence failure did not restore the baseline image' >&2
+  exit 1
+fi
+FAIL_RUNNING_SERVICE_ONCE=
+rm -f "$FAKE_RUNNING_FAILURE_USED"
 
 : >"$CALLS"
 GPU_SERVICE_EXISTS=true
 PUBLISHER_SERVICE_EXISTS=false
-FAIL_RUNNING_SERVICE=vp-youtube-publisher-swarm
-if deploy_vp_app_services \
-  vp-api:publisher-create-rollback-test \
-  vp-frontend:publisher-create-rollback-test \
-  vp-backend-api:publisher-create-rollback-test \
-  vp-channelops-runner-go:publisher-create-rollback-test \
-  vp-ffmpeg-worker-go:publisher-create-rollback-test \
-  vp-ffmpeg-worker-python:publisher-create-rollback-test >/dev/null 2>&1; then
+test_mark_worker_service_absent "$VP_PUBLISHER_SERVICE"
+rm -f "$FAKE_RUNNING_FAILURE_USED"
+FAIL_RUNNING_SERVICE_ONCE=vp-youtube-publisher-swarm
+if deploy_vp_app_services $images >/dev/null 2>&1; then
   echo 'FAIL: new publisher convergence failure unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq 'docker|service rm vp-youtube-publisher-swarm' "$CALLS"
-FAIL_RUNNING_SERVICE=
+grep -Fq \
+  "docker|service rm $(test_service_id "$VP_PUBLISHER_SERVICE")" \
+  "$CALLS"
+if grep -Fq "docker|service rm $VP_PUBLISHER_SERVICE" "$CALLS"; then
+  echo 'FAIL: new publisher rollback deleted by mutable service name' >&2
+  exit 1
+fi
+FAIL_RUNNING_SERVICE_ONCE=
+rm -f "$FAKE_RUNNING_FAILURE_USED"
 
 : >"$CALLS"
 PUBLISHER_SERVICE_EXISTS=true
@@ -3599,7 +4719,7 @@ PUBLISHER_CONSTRAINT_MODE=stale
 PUBLISHER_NETWORK_MODE=pipeline
 PUBLISHER_MOUNT_MODE=desired
 PUBLISHER_ENV_MODE=desired
-vp_deploy_publisher vp-ffmpeg-worker-python:publisher-placement-test >/dev/null
+deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-placement-test >/dev/null
 grep -Fq -- '--constraint-rm node.labels.vp.runtime==true' "$CALLS"
 grep -Fq -- '--constraint-rm node.labels.vp.gpu==true' "$CALLS"
 grep -Fq -- '--constraint-rm node.hostname==colima-swarmbridged' "$CALLS"
@@ -3623,7 +4743,7 @@ CONSTRAINT_MODE=legacy
 : >"$CALLS"
 PUBLISHER_CONSTRAINT_MODE=publisher
 PUBLISHER_MOUNT_MODE=missing
-vp_deploy_publisher vp-ffmpeg-worker-python:publisher-missing-scratch-test >/dev/null
+deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-missing-scratch-test >/dev/null
 grep -Fq -- '--mount-add type=volume,src=vp-youtube-publisher-scratch,dst=/data/storage' "$CALLS"
 if grep -Fq -- '--mount-rm /data/storage' "$CALLS"; then
   echo 'FAIL: publisher deploy removed an absent scratch target' >&2
@@ -3690,7 +4810,7 @@ if [[ "$pds_output" != "vp-pds-swarm" ]]; then
 fi
 pds_update="$(
   grep -F 'docker|service update' "$CALLS" \
-    | grep -F -- '--image vp-pds:health-gated-test vp-pds-swarm' \
+    | grep -F -- "--image vp-pds:health-gated-test $(test_service_id vp-pds-swarm)" \
     | head -n 1
 )"
 for expected_pds_update_arg in \
@@ -3824,13 +4944,13 @@ fi
 candidate_pds_update="$(
   grep -F 'docker|service update' "$CALLS" \
     | grep -F -- '--update-order start-first' \
-    | grep -F -- '--image vp-pds:rollback-test vp-pds-swarm' \
+    | grep -F -- "--image vp-pds:rollback-test $(test_service_id vp-pds-swarm)" \
     | head -n 1
 )"
 rollback_pds_update="$(
   grep -F 'docker|service update' "$CALLS" \
     | grep -F -- '--update-order stop-first' \
-    | grep -F -- '--image baseline-vp-pds-swarm:stable vp-pds-swarm' \
+    | grep -F -- "--image baseline-vp-pds-swarm:stable $(test_service_id vp-pds-swarm)" \
     | head -n 1
 )"
 if [[ "$candidate_pds_update" != *'--health-cmd  --health-interval 10s'* \
@@ -3838,7 +4958,9 @@ if [[ "$candidate_pds_update" != *'--health-cmd  --health-interval 10s'* \
   echo 'FAIL: PDS candidate and rollback must retain the health contract' >&2
   exit 1
 fi
-grep -Fq -- '--image baseline-vp-pds-swarm:stable vp-pds-swarm' "$CALLS"
+grep -Fq -- \
+  "--image baseline-vp-pds-swarm:stable $(test_service_id vp-pds-swarm)" \
+  "$CALLS"
 if [[ "$(grep -Fc 'remote|10.0.0.127|/bin/sh|-s|--|vp-pds-swarm' "$CALLS")" -ne 2 ]]; then
   echo 'FAIL: PDS rollback did not verify both candidate and baseline readiness' >&2
   exit 1
@@ -3853,7 +4975,9 @@ if deploy_pds_services vp-pds:rollback-readiness-failure-test >/dev/null 2>&1; t
   echo 'FAIL: PDS rollback readiness failure unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq -- '--image baseline-vp-pds-swarm:stable vp-pds-swarm' "$CALLS"
+grep -Fq -- \
+  "--image baseline-vp-pds-swarm:stable $(test_service_id vp-pds-swarm)" \
+  "$CALLS"
 
 : >"$CALLS"
 FAIL_UPDATE_SERVICE=vp-pds-swarm
@@ -3899,7 +5023,9 @@ if deploy_pds_services vp-pds:update-failure-test >/dev/null 2>&1; then
   echo 'FAIL: injected PDS update failure unexpectedly succeeded' >&2
   exit 1
 fi
-grep -Fq -- '--image baseline-vp-pds-swarm:stable vp-pds-swarm' "$CALLS"
+grep -Fq -- \
+  "--image baseline-vp-pds-swarm:stable $(test_service_id vp-pds-swarm)" \
+  "$CALLS"
 grep -Fq -- '--constraint-add node.labels.vp.runtime==true' "$CALLS"
 FAIL_UPDATE_SERVICE=
 FAIL_UPDATE_IMAGE=
@@ -3968,12 +5094,14 @@ if [[ "$(grep -Fc 'docker|service update' "$CALLS")" -ne 2 ]]; then
   exit 1
 fi
 candidate_feature_update_line="$(
-  grep -nF -- "--image $FAIL_UPDATE_IMAGE vp-feature-aggregator-swarm" "$CALLS" \
+  grep -nF -- \
+    "--image $FAIL_UPDATE_IMAGE $(test_service_id vp-feature-aggregator-swarm)" \
+    "$CALLS" \
     | cut -d: -f1
 )"
 rollback_feature_update_line="$(
   grep -nF -- \
-    '--image baseline-vp-feature-aggregator-swarm:stable vp-feature-aggregator-swarm' \
+    "--image baseline-vp-feature-aggregator-swarm:stable $(test_service_id vp-feature-aggregator-swarm)" \
     "$CALLS" \
     | cut -d: -f1
 )"
@@ -4004,7 +5132,8 @@ RUNTIME_CONSTRAINT_INSPECT_MODE=normal
 rm -f "$RUNTIME_CONSTRAINT_INSPECT_CALLS_FILE"
 
 GPU_SERVICE_EXISTS=false
-vp_deploy_python_worker vp-ffmpeg-worker-python:deploy-create-test >/dev/null
+test_mark_worker_service_absent "$VP_PYTHON_WORKER_SERVICE"
+deploy_prepared_python_worker_fixture vp-ffmpeg-worker-python:deploy-create-test >/dev/null
 grep -Fq 'docker|service create --detach=false --name vp-ffmpeg-worker-gpu-swarm' "$CALLS"
 grep -Fq -- '--constraint node.labels.vp.gpu==true' "$CALLS"
 if grep -Fq '10.0.0.126' "$CALLS"; then
@@ -4014,7 +5143,8 @@ fi
 
 : >"$CALLS"
 VISION_SERVICE_EXISTS=false
-vp_deploy_vision_worker vp-ffmpeg-worker-python:vision-create-test >/dev/null
+test_mark_worker_service_absent "$VP_VISION_WORKER_SERVICE"
+deploy_prepared_vision_worker_fixture vp-ffmpeg-worker-python:vision-create-test >/dev/null
 grep -Fq 'docker|service create --detach=false --name vp-vision-worker-swarm' "$CALLS"
 grep -Fq -- '--constraint node.labels.vp.gpu==true' "$CALLS"
 grep -Fq -- '--constraint node.hostname==ccttww-lap' "$CALLS"
@@ -4026,7 +5156,7 @@ grep -Fq -- '--env WORKER_HOST=150-vision' "$CALLS"
 : >"$CALLS"
 VISION_SERVICE_EXISTS=true
 VISION_TASK_NODE=CASPERs-Mac-mini
-if vp_deploy_vision_worker vp-ffmpeg-worker-python:vision-forbidden-node-test \
+if deploy_prepared_vision_worker_fixture vp-ffmpeg-worker-python:vision-forbidden-node-test \
   >/dev/null 2>&1; then
   echo 'FAIL: vision worker placement on 126 unexpectedly passed verification' >&2
   exit 1
@@ -4036,7 +5166,8 @@ VISION_TASK_NODE=ccttww-lap
 
 : >"$CALLS"
 PUBLISHER_SERVICE_EXISTS=false
-vp_deploy_publisher vp-ffmpeg-worker-python:publisher-create-test >/dev/null
+test_mark_worker_service_absent "$VP_PUBLISHER_SERVICE"
+deploy_prepared_publisher_fixture vp-ffmpeg-worker-python:publisher-create-test >/dev/null
 grep -Fq 'docker|service create --detach=false --name vp-youtube-publisher-swarm' "$CALLS"
 grep -Fq -- '--constraint node.labels.vp.publisher==true' "$CALLS"
 grep -Fq -- '--constraint node.hostname==ccttww-lap' "$CALLS"
@@ -4116,3 +5247,535 @@ assert_channelops_runner_identity_reconciliation legacy 1
 assert_channelops_runner_identity_reconciliation duplicate 1
 assert_channelops_runner_identity_reconciliation converged 1
 assert_channelops_runner_identity_reconciliation converged 1
+
+(
+  ROOT="$TEST_ROOT/stage2-vision-jobs/sync"
+  REPO_ROOT="$TEST_ROOT/stage2-vision-jobs/repos"
+  mkdir -p "$ROOT"
+  source "$EXTENSION"
+  vision_calls="$TEST_ROOT/stage2-vision-jobs/calls"
+  vision_state="$TEST_ROOT/stage2-vision-jobs/service-state"
+  : >"$vision_calls"
+  rm -f "$vision_state"
+  VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  VP_WORKER_ADMISSION_TRANSACTION_ID=tx-0123456789abcdef0123456789abcdef
+  VP_WORKER_REDIS_MARKER_RUNTIME_GENERATION="$TEST_COMMIT"
+  VP_WORKER_REDIS_WATCHER_SECRET=vp-watcher-runtime
+  VP_WORKER_REDIS_WATCHER_SECRET_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  VP_WORKER_REDIS_CONTROL_SECRET=vp-control-runtime
+  VP_WORKER_REDIS_CONTROL_SECRET_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="$TEST_ROOT/stage2-vision-jobs/deploy-read"
+  printf '%s\n' 'postgresql://vision-read:sentinel@database/videoprocess' \
+    >"$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+  chmod 0400 "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+  VISION_JOB_EXIT=0
+  VISION_JOURNAL_MODE=
+  VISION_JOURNAL_STATE=
+  VISION_JOURNAL_SERVICE_ID=-
+  VISION_JOURNAL_EXIT=-
+  WATCHER_LIVE_ID="$VP_WORKER_REDIS_WATCHER_SECRET_ID"
+  CONTROL_LIVE_ID="$VP_WORKER_REDIS_CONTROL_SECRET_ID"
+
+  vp_require_pipeline_network_identity() {
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  vp_worker_admission_database_credential_file() {
+    printf '%s\n' "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+  }
+  vp_worker_admission_create_secret() {
+    printf 'secret-create|%s|%s|%s|%s|%s\n' "$@" >>"$vision_calls"
+    VP_WORKER_CREATED_SECRET_ID=cccccccccccccccccccccccccccccccc
+  }
+  vp_remove_managed_secret_if_absent_exact() {
+    printf 'secret-rm|%s|%s|%s|%s|%s\n' "$@" >>"$vision_calls"
+  }
+  vp_worker_admission_prepare_vision_job() {
+    printf 'journal-plan|%s|%s|%s|%s|%s|%s\n' "$@" >>"$vision_calls"
+    if [[ "$VISION_JOURNAL_MODE" != "$1" ]]; then
+      VISION_JOURNAL_MODE="$1"
+      VISION_JOURNAL_STATE=planned
+      VISION_JOURNAL_SERVICE_ID=-
+      VISION_JOURNAL_EXIT=-
+    fi
+  }
+  vp_worker_admission_load_vision_job() {
+    VP_VISION_JOB_NAME="$VISION_EXPECTED_JOB_NAME"
+    VP_VISION_JOB_IMAGE=vp-ffmpeg-worker-python:deploy-0123456789ab
+    VP_VISION_JOB_SERVICE_ID="$VISION_JOURNAL_SERVICE_ID"
+    VP_VISION_JOB_STATE="$VISION_JOURNAL_STATE"
+    VP_VISION_JOB_EXIT_CODE="$VISION_JOURNAL_EXIT"
+    if [[ "$1" == reconcile ]]; then
+      VP_VISION_JOB_REDIS_SECRET_NAME="$VP_WORKER_REDIS_CONTROL_SECRET"
+      VP_VISION_JOB_REDIS_SECRET_ID="$VP_WORKER_REDIS_CONTROL_SECRET_ID"
+    else
+      VP_VISION_JOB_REDIS_SECRET_NAME="$VP_WORKER_REDIS_WATCHER_SECRET"
+      VP_VISION_JOB_REDIS_SECRET_ID="$VP_WORKER_REDIS_WATCHER_SECRET_ID"
+    fi
+    if [[ "$1" == safety || "$1" == final-safety ]]; then
+      if [[ "$1" == final-safety ]]; then
+        VP_VISION_JOB_DATABASE_SECRET_NAME=vp-vision-cutover-final-read-db-0123456789ab
+      else
+        VP_VISION_JOB_DATABASE_SECRET_NAME=vp-vision-cutover-read-db-0123456789ab
+      fi
+      VP_VISION_JOB_DATABASE_SECRET_ID=cccccccccccccccccccccccccccccccc
+    else
+      VP_VISION_JOB_DATABASE_SECRET_NAME=-
+      VP_VISION_JOB_DATABASE_SECRET_ID=-
+    fi
+  }
+  vp_worker_admission_record_vision_job_service() {
+    printf 'journal-created|%s|%s\n' "$@" >>"$vision_calls"
+    VISION_JOURNAL_SERVICE_ID="$2"
+    VISION_JOURNAL_STATE=created
+  }
+  vp_worker_admission_record_vision_job_terminal() {
+    printf 'journal-terminal|%s|%s\n' "$@" >>"$vision_calls"
+    VISION_JOURNAL_EXIT="$2"
+    VISION_JOURNAL_STATE=terminal
+  }
+  vp_worker_admission_complete_vision_job_removal() {
+    printf 'journal-removed|%s\n' "$1" >>"$vision_calls"
+    VISION_JOURNAL_STATE=removed
+  }
+  vp_worker_admission_abort_vision_job_removal() {
+    printf 'journal-abort-removed|%s\n' "$1" >>"$vision_calls"
+    VISION_JOURNAL_EXIT=255
+    VISION_JOURNAL_STATE=removed
+  }
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$vision_calls"
+    if [[ "${1:-} ${2:-}" == 'secret inspect' ]]; then
+      case "${3:-}" in
+        "$VP_WORKER_REDIS_WATCHER_SECRET_ID"|"$VP_WORKER_REDIS_WATCHER_SECRET")
+          printf '%s|%s\n' "$WATCHER_LIVE_ID" "$VP_WORKER_REDIS_WATCHER_SECRET"
+          ;;
+        "$VP_WORKER_REDIS_CONTROL_SECRET_ID"|"$VP_WORKER_REDIS_CONTROL_SECRET")
+          printf '%s|%s\n' "$CONTROL_LIVE_ID" "$VP_WORKER_REDIS_CONTROL_SECRET"
+          ;;
+        *) return 1 ;;
+      esac
+      return
+    fi
+    if [[ "${1:-} ${2:-}" == 'container ls' ]]; then
+      return 0
+    fi
+    if [[ "${1:-} ${2:-}" == 'service create' ]]; then
+      printf '%s\n' dddddddddddddddddddddddddddddddd >"$vision_state"
+      printf '%s\n' dddddddddddddddddddddddddddddddd
+      return
+    fi
+    if [[ "${1:-} ${2:-}" == 'service ls' ]]; then
+      if [[ -f "$vision_state" ]]; then
+        printf '%s|%s\n' \
+          dddddddddddddddddddddddddddddddd \
+          "$VISION_EXPECTED_JOB_NAME"
+      fi
+      return
+    fi
+    if [[ "${1:-} ${2:-}" == 'service inspect' ]]; then
+      if [[ "${3:-}" == "$VP_VISION_WORKER_SERVICE" ]]; then
+        return 0
+      fi
+      [[ -f "$vision_state" ]] || return 1
+      if [[ "$*" == *'{{json .Spec}}'* ]]; then
+        local database_secret_json=""
+        local database_env_json=""
+        if [[ "$VISION_EXPECTED_MODE" == safety \
+          || "$VISION_EXPECTED_MODE" == final-safety ]]; then
+          database_secret_json=',{"SecretID":"cccccccccccccccccccccccccccccccc","File":{"Name":"vision-cutover-database-url","UID":"10001","GID":"10001","Mode":256}}'
+          database_env_json=',"VISION_CUTOVER_DATABASE_URL_FILE=/run/secrets/vision-cutover-database-url"'
+        fi
+        local redis_id="$VP_WORKER_REDIS_WATCHER_SECRET_ID"
+        local cli_json=''
+        if [[ "$VISION_EXPECTED_MODE" == reconcile ]]; then
+          redis_id="$VP_WORKER_REDIS_CONTROL_SECRET_ID"
+        elif [[ "$VISION_EXPECTED_MODE" == safety \
+          || "$VISION_EXPECTED_MODE" == final-safety ]]; then
+          cli_json=',"--safety"'
+        else
+          cli_json=',"--check-only"'
+        fi
+        printf '{"Name":"%s","Labels":{"vp.service":"vision-cutover","vp.generation":"%s","vp.purpose":"%s"},"Mode":{"ReplicatedJob":{"TotalCompletions":1,"MaxConcurrent":1}},"TaskTemplate":{"ContainerSpec":{"Image":"vp-ffmpeg-worker-python:deploy-0123456789ab","Args":["python","-m","app.services.vision_consumer_cutover"%s],"Env":["VISION_CUTOVER_REDIS_URL_FILE=/run/secrets/vision-cutover-redis-url"%s],"Secrets":[{"SecretID":"%s","File":{"Name":"vision-cutover-redis-url","UID":"10001","GID":"10001","Mode":256}}%s]},"RestartPolicy":{"Condition":"none"},"Placement":{"Constraints":["node.hostname==ccttww-lap"]},"Networks":[{"Target":"vp-pipeline-network-id"}]}}\n' \
+          "$VISION_EXPECTED_JOB_NAME" \
+          "$VP_WORKER_ADMISSION_TRANSACTION_ID" \
+          "$VISION_EXPECTED_MODE" "$cli_json" "$database_env_json" \
+          "$redis_id" "$database_secret_json"
+      elif [[ "$*" == *'{{.ID}}|{{.Spec.Name}}'* ]]; then
+        printf '%s|%s|vision-cutover|%s|%s\n' \
+          dddddddddddddddddddddddddddddddd \
+          "$VISION_EXPECTED_JOB_NAME" \
+          "$VP_WORKER_ADMISSION_TRANSACTION_ID" \
+          "$VISION_EXPECTED_MODE"
+      fi
+      return
+    fi
+    if [[ "${1:-} ${2:-}" == 'service ps' ]]; then
+      printf '%s|Shutdown|Complete 1 second ago\n' \
+        eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+      return
+    fi
+    if [[ "${1:-}" == inspect \
+      && "${2:-}" == eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee ]]; then
+      printf '%s\n' "$VISION_JOB_EXIT"
+      return
+    fi
+    if [[ "${1:-} ${2:-}" == 'service logs' ]]; then
+      return 0
+    fi
+    if [[ "${1:-} ${2:-}" == 'service rm' ]]; then
+      [[ "${3:-}" == dddddddddddddddddddddddddddddddd ]] || return 1
+      rm -f "$vision_state"
+      return
+    fi
+    return 1
+  }
+
+  VISION_EXPECTED_MODE=safety
+  VISION_EXPECTED_JOB_NAME=vp-vision-cutover-safety-0123456789ab
+  vp_run_vision_cutover_job \
+    safety vp-ffmpeg-worker-python:deploy-0123456789ab
+  plan_line="$(grep -n '^journal-plan|safety|' "$vision_calls" | cut -d: -f1)"
+  create_line="$(grep -n '^docker|service create' "$vision_calls" | cut -d: -f1)"
+  terminal_line="$(grep -n '^journal-terminal|safety|0$' "$vision_calls" | cut -d: -f1)"
+  remove_line="$(grep -n '^docker|service rm ddddd' "$vision_calls" | cut -d: -f1)"
+  if [[ -z "$plan_line" || -z "$create_line" || -z "$terminal_line" \
+    || -z "$remove_line" || "$plan_line" -ge "$create_line" \
+    || "$terminal_line" -ge "$remove_line" ]]; then
+    echo 'FAIL: vision job Docker mutation is not write-ahead journaled' >&2
+    exit 1
+  fi
+  safety_create="$(grep -F 'docker|service create' "$vision_calls")"
+  if [[ "$safety_create" != *'--mode replicated-job'* \
+    || "$safety_create" != *'--constraint node.hostname==ccttww-lap'* \
+    || "$safety_create" != *'--network vp-pipeline-network-id'* \
+    || "$safety_create" != *'source=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,target=vision-cutover-redis-url'* \
+    || "$safety_create" != *'source=cccccccccccccccccccccccccccccccc,target=vision-cutover-database-url'* \
+    || "$safety_create" != *'VISION_CUTOVER_REDIS_URL_FILE=/run/secrets/vision-cutover-redis-url'* \
+    || "$safety_create" != *'VISION_CUTOVER_DATABASE_URL_FILE=/run/secrets/vision-cutover-database-url'* \
+    || "$safety_create" != *'app.services.vision_consumer_cutover --safety'* ]]; then
+    echo 'FAIL: vision safety job transport is not exact-ID/file-only' >&2
+    exit 1
+  fi
+  if grep -Eq '(^|[ |])(DATABASE_URL|REDIS_URL)=|redis://|postgres(ql)?://' \
+    <<<"$safety_create"; then
+    echo 'FAIL: vision safety job exposed credential material' >&2
+    exit 1
+  fi
+  for immutable_call in \
+    'docker|service ps dddddddddddddddddddddddddddddddd' \
+    'docker|inspect eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' \
+    'docker|service logs dddddddddddddddddddddddddddddddd' \
+    'docker|service rm dddddddddddddddddddddddddddddddd'; do
+    grep -Fq "$immutable_call" "$vision_calls"
+  done
+
+  : >"$vision_calls"
+  rm -f "$vision_state"
+  VISION_JOURNAL_MODE=
+  VISION_JOURNAL_STATE=
+  VISION_JOURNAL_SERVICE_ID=-
+  VISION_JOURNAL_EXIT=-
+  VISION_EXPECTED_MODE=final-safety
+  VISION_EXPECTED_JOB_NAME=vp-vision-cutover-final-safety-0123456789ab
+  vp_run_vision_cutover_job \
+    final-safety vp-ffmpeg-worker-python:deploy-0123456789ab
+  final_safety_create="$(grep -F 'docker|service create' "$vision_calls")"
+  if [[ "$final_safety_create" != *'--label vp.purpose=final-safety'* \
+    || "$final_safety_create" != *'source=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,target=vision-cutover-redis-url'* \
+    || "$final_safety_create" != *'source=cccccccccccccccccccccccccccccccc,target=vision-cutover-database-url'* \
+    || "$final_safety_create" != *'app.services.vision_consumer_cutover --safety'* ]]; then
+    echo 'FAIL: final vision safety job transport is not isolated and exact' >&2
+    exit 1
+  fi
+  grep -Fq \
+    'secret-create|vp-vision-cutover-final-read-db-0123456789ab|' \
+    "$vision_calls"
+  grep -Fq \
+    '|vision-cutover|tx-0123456789abcdef0123456789abcdef|final-safety-database' \
+    "$vision_calls"
+  grep -Fq \
+    'secret-rm|cccccccccccccccccccccccccccccccc|vp-vision-cutover-final-read-db-0123456789ab|vision-cutover|tx-0123456789abcdef0123456789abcdef|final-safety-database' \
+    "$vision_calls"
+
+  : >"$vision_calls"
+  rm -f "$vision_state"
+  VISION_JOURNAL_MODE=
+  VISION_JOB_EXIT=10
+  VISION_EXPECTED_MODE=check
+  VISION_EXPECTED_JOB_NAME=vp-vision-cutover-check-0123456789ab
+  vp_vision_cutover_required \
+    vp-ffmpeg-worker-python:deploy-0123456789ab
+  if [[ "$VP_VISION_CUTOVER_REQUIRED" != true ]]; then
+    echo 'FAIL: vision check-only exit 10 did not require cutover' >&2
+    exit 1
+  fi
+  check_create="$(grep -F 'docker|service create' "$vision_calls")"
+  [[ "$check_create" == *'source=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,target=vision-cutover-redis-url'* ]]
+  [[ "$check_create" == *'app.services.vision_consumer_cutover --check-only'* ]]
+  [[ "$check_create" != *'vision-cutover-database-url'* ]]
+
+  : >"$vision_calls"
+  rm -f "$vision_state"
+  VISION_JOURNAL_MODE=
+  VISION_JOB_EXIT=1
+  if vp_vision_cutover_required \
+    vp-ffmpeg-worker-python:deploy-0123456789ab >/dev/null 2>&1; then
+    echo 'FAIL: vision check-only operational exit was treated as required' >&2
+    exit 1
+  fi
+
+  : >"$vision_calls"
+  rm -f "$vision_state"
+  VISION_JOURNAL_MODE=
+  VISION_JOB_EXIT=0
+  VISION_EXPECTED_MODE=reconcile
+  VISION_EXPECTED_JOB_NAME=vp-vision-cutover-reconcile-0123456789ab
+  vp_reconcile_vision_consumers \
+    vp-ffmpeg-worker-python:deploy-0123456789ab
+  reconcile_create="$(grep -F 'docker|service create' "$vision_calls")"
+  [[ "$reconcile_create" == *'source=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,target=vision-cutover-redis-url'* ]]
+  [[ "$reconcile_create" == *'app.services.vision_consumer_cutover'* ]]
+  [[ "$reconcile_create" != *'vision-cutover-database-url'* ]]
+
+  : >"$vision_calls"
+  printf '%s\n' dddddddddddddddddddddddddddddddd >"$vision_state"
+  VISION_JOURNAL_MODE=safety
+  VISION_JOURNAL_STATE=planned
+  VISION_JOURNAL_SERVICE_ID=-
+  VISION_JOURNAL_EXIT=-
+  VISION_EXPECTED_MODE=safety
+  VISION_EXPECTED_JOB_NAME=vp-vision-cutover-safety-0123456789ab
+  vp_worker_admission_abort_vision_job safety
+  grep -Fq \
+    'docker|service rm dddddddddddddddddddddddddddddddd' \
+    "$vision_calls"
+  grep -Fq \
+    'secret-rm|cccccccccccccccccccccccccccccccc|vp-vision-cutover-read-db-0123456789ab|vision-cutover|tx-0123456789abcdef0123456789abcdef|safety-database' \
+    "$vision_calls"
+  grep -Fxq 'journal-abort-removed|safety' "$vision_calls"
+
+  : >"$vision_calls"
+  rm -f "$vision_state"
+  VISION_JOURNAL_MODE=
+  WATCHER_LIVE_ID=ffffffffffffffffffffffffffffffff
+  VISION_EXPECTED_MODE=check
+  VISION_EXPECTED_JOB_NAME=vp-vision-cutover-check-0123456789ab
+  if vp_run_vision_cutover_job \
+    check vp-ffmpeg-worker-python:deploy-0123456789ab >/dev/null 2>&1; then
+    echo 'FAIL: replaced watcher secret ID was accepted for a vision job' >&2
+    exit 1
+  fi
+  if grep -Fq 'docker|service create' "$vision_calls"; then
+    echo 'FAIL: replaced watcher secret reached vision job creation' >&2
+    exit 1
+  fi
+)
+
+(
+  ROOT="$TEST_ROOT/immutable-service-mutations/sync"
+  REPO_ROOT="$TEST_ROOT/immutable-service-mutations/repos"
+  mkdir -p "$ROOT"
+  source "$EXTENSION"
+  immutable_calls="$TEST_ROOT/immutable-service-mutations/calls"
+  : >"$immutable_calls"
+  immutable_service=vp-ffmpeg-worker-go-swarm
+  immutable_id=aaaaaaaaaaaaaaaaaaaaaaaa
+  vp_worker_admission_require_worker_mutation() {
+    :
+  }
+  vp_worker_admission_complete_worker_mutation() {
+    :
+  }
+  vp_require_worker_redis_marker_status() {
+    :
+  }
+  vp_registered_worker_service_current_id() {
+    printf '%s\n' "$immutable_id"
+  }
+  vp_registered_worker_service_identity() {
+    printf '%s\n' "$immutable_id"
+  }
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$immutable_calls"
+  }
+  vp_mutate_registered_worker_service \
+    update "$immutable_service" "$immutable_id" 901 \
+    service update --detach=false --image vp-go:new "$immutable_service"
+  if ! grep -Fxq \
+    "docker|service update --detach=false --image vp-go:new $immutable_id" \
+    "$immutable_calls"; then
+    echo 'FAIL: registered worker update did not target its verified service ID' >&2
+    exit 1
+  fi
+
+  : >"$immutable_calls"
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$immutable_calls"
+    if [[ "$*" == "service inspect vp-api-swarm --format {{.ID}}|{{.Spec.Name}}" ]]; then
+      printf '%s|vp-api-swarm\n' "$immutable_id"
+    elif [[ "$*" == "service inspect $immutable_id --format {{json .Spec}}" ]]; then
+      printf '%s\n' \
+        '{"Name":"vp-api-swarm","TaskTemplate":{"ContainerSpec":{"Image":"vp-api:new"}}}'
+    else
+      return 1
+    fi
+  }
+  vp_app_service_durable_identity vp-api-swarm vp-api:new >/dev/null
+  if grep -Fxq \
+    'docker|service inspect vp-api-swarm --format {{json .Spec}}' \
+    "$immutable_calls"; then
+    echo 'FAIL: baseline capture inspected a mutable service name after ID resolution' >&2
+    exit 1
+  fi
+
+  : >"$immutable_calls"
+  VP_APP_SERVICES=vp-api-swarm
+  immutable_spec='{"Name":"vp-api-swarm","TaskTemplate":{"ContainerSpec":{"Image":"vp-api:prior"}}}'
+  immutable_digest="$(
+    printf '%s\n' "$immutable_spec" | python3 -I -c '
+import hashlib
+import json
+import sys
+
+value = json.load(sys.stdin)
+canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+print(hashlib.sha256(canonical).hexdigest())
+'
+  )"
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$immutable_calls"
+    if [[ "$*" == "service inspect $immutable_id --format {{.Spec.TaskTemplate.ContainerSpec.Image}}" ]]; then
+      printf '%s\n' vp-api:prior
+    elif [[ "$*" == "service inspect $immutable_id --format {{json .Spec}}" ]]; then
+      printf '%s\n' "$immutable_spec"
+    else
+      return 1
+    fi
+  }
+  immutable_snapshot="vp-api-swarm|$immutable_id|vp-api:prior|$immutable_digest"
+  if [[ "$(vp_capture_app_snapshots)" != "$immutable_snapshot" ]]; then
+    echo 'FAIL: app snapshot capture did not retain its immutable identity' >&2
+    exit 1
+  fi
+  if grep -Fq 'service inspect vp-api-swarm' "$immutable_calls"; then
+    echo 'FAIL: app snapshot capture inspected a mutable name after ID resolution' >&2
+    exit 1
+  fi
+
+  : >"$immutable_calls"
+  vp_worker_admission_root() {
+    printf '%s\n' "$TEST_ROOT/immutable-baseline"
+  }
+  vp_worker_admission_baseline_control_json() {
+    printf 'null\n'
+  }
+  vp_app_service_durable_identity() {
+    printf 'rebound-by-name|%s\n' "$*" >>"$immutable_calls"
+    return 1
+  }
+  immutable_baseline="$(
+    vp_worker_admission_baseline_payload "$immutable_snapshot"
+  )"
+  python3 -I - "$immutable_id" "$immutable_digest" \
+    "$immutable_baseline" <<'PY'
+import json
+import sys
+
+service_id, digest, raw = sys.argv[1:]
+value = json.loads(raw)
+expected = {
+    "control": None,
+    "kind": "legacy_no_control",
+    "services": [{
+        "docker_service_id": service_id,
+        "existed": True,
+        "image": "vp-api:prior",
+        "name": "vp-api-swarm",
+        "spec_digest": digest,
+    }],
+}
+if value != expected:
+    raise SystemExit("baseline did not preserve the captured service identity")
+PY
+  if grep -Fq 'rebound-by-name|' "$immutable_calls"; then
+    echo 'FAIL: baseline rebound an immutable snapshot by service name' >&2
+    exit 1
+  fi
+
+  : >"$immutable_calls"
+  rebound_id=bbbbbbbbbbbbbbbbbbbbbbbb
+  vp_registered_worker_service_current_id() {
+    printf '%s\n' "$rebound_id"
+  }
+  vp_update_runtime_service() {
+    printf 'mutation|%s\n' "$*" >>"$immutable_calls"
+  }
+  VP_BACKEND_MIGRATION_APPLIED=false
+  if vp_restore_app_snapshots \
+    "$immutable_snapshot" vp-api-swarm false >/dev/null 2>&1; then
+    echo 'FAIL: rollback accepted a service name rebound to a new ID' >&2
+    exit 1
+  fi
+  if grep -Fq 'mutation|' "$immutable_calls"; then
+    echo 'FAIL: rebound rollback reached a service mutation' >&2
+    exit 1
+  fi
+)
+
+(
+  ROOT="$TEST_ROOT/stage2-marker-mutations/sync"
+  REPO_ROOT="$TEST_ROOT/stage2-marker-mutations/repos"
+  mkdir -p "$ROOT"
+  source "$EXTENSION"
+  mutation_calls="$TEST_ROOT/stage2-marker-mutations/calls"
+  : >"$mutation_calls"
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+  vp_worker_admission_require_worker_mutation() {
+    printf 'journal|%s|%s|%s|%s\n' "$@" >>"$mutation_calls"
+  }
+  vp_worker_admission_complete_worker_mutation() {
+    printf 'applied|%s|%s|%s|%s\n' "$@" >>"$mutation_calls"
+  }
+  vp_require_worker_redis_marker_status() {
+    printf 'marker|status\n' >>"$mutation_calls"
+    return 1
+  }
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$mutation_calls"
+  }
+
+  mutation_cases="$({
+    printf '%s|update|%s|%s|901\n' go-final vp-ffmpeg-worker-go-swarm aaaaaaaaaaaaaaaaaaaaaaaa
+    printf '%s|update|%s|%s|902\n' python-update "$VP_PYTHON_WORKER_SERVICE" bbbbbbbbbbbbbbbbbbbbbbbb
+    printf '%s|create|%s|absent|902\n' python-create "$VP_PYTHON_WORKER_SERVICE"
+    printf '%s|update|%s|%s|903\n' vision-normalize "$VP_VISION_WORKER_SERVICE" cccccccccccccccccccccccc
+    printf '%s|update|%s|%s|903\n' vision-final "$VP_VISION_WORKER_SERVICE" cccccccccccccccccccccccc
+    printf '%s|create|%s|absent|903\n' vision-create "$VP_VISION_WORKER_SERVICE"
+    printf '%s|update|%s|%s|904\n' publisher-normalize "$VP_PUBLISHER_SERVICE" dddddddddddddddddddddddd
+    printf '%s|update|%s|%s|904\n' publisher-final "$VP_PUBLISHER_SERVICE" dddddddddddddddddddddddd
+    printf '%s|create|%s|absent|904\n' publisher-create "$VP_PUBLISHER_SERVICE"
+    printf '%s|update|%s|%s|902\n' rollback-gpu "$VP_PYTHON_WORKER_SERVICE" bbbbbbbbbbbbbbbbbbbbbbbb
+    printf '%s|rm|%s|%s|902\n' rollback-python-rm "$VP_PYTHON_WORKER_SERVICE" bbbbbbbbbbbbbbbbbbbbbbbb
+    printf '%s|rm|%s|%s|903\n' rollback-vision-rm "$VP_VISION_WORKER_SERVICE" cccccccccccccccccccccccc
+    printf '%s|rm|%s|%s|904\n' rollback-publisher-rm "$VP_PUBLISHER_SERVICE" dddddddddddddddddddddddd
+    printf '%s|update|%s|%s|903\n' candidate-restore-update "$VP_VISION_WORKER_SERVICE" cccccccccccccccccccccccc
+    printf '%s|rm|%s|%s|904\n' candidate-restore-rm "$VP_PUBLISHER_SERVICE" dddddddddddddddddddddddd
+  })"
+  while IFS='|' read -r mutation_name mutation_action mutation_service \
+    mutation_expected_id mutation_generation; do
+    : >"$mutation_calls"
+    if vp_mutate_registered_worker_service \
+      "$mutation_action" "$mutation_service" \
+      "$mutation_expected_id" "$mutation_generation" \
+      service "$mutation_action" "$mutation_service"; then
+      echo "FAIL: stale marker allowed $mutation_name mutation" >&2
+      exit 1
+    fi
+    if [[ "$(grep -c '^marker|status$' "$mutation_calls")" -ne 1 \
+      || -n "$(grep '^docker|' "$mutation_calls" || true)" \
+      || -n "$(grep '^applied|' "$mutation_calls" || true)" ]]; then
+      echo "FAIL: $mutation_name did not stop at its marker boundary" >&2
+      exit 1
+    fi
+  done <<<"$mutation_cases"
+)

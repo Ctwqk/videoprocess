@@ -41,6 +41,30 @@ service_path() {
   printf '%s/%s.%s\n' "$SERVICE_DIR" "$1" "$2"
 }
 
+marker_service_name() {
+  case "$1" in
+    vp-worker-redis-marker-readiness-job|aaaaaaaaaaaaaaaaaaaaaaaa)
+      printf '%s\n' vp-worker-redis-marker-readiness-job
+      ;;
+    vp-worker-redis-marker-janitor-job|bbbbbbbbbbbbbbbbbbbbbbbb)
+      printf '%s\n' vp-worker-redis-marker-janitor-job
+      ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+marker_service_id() {
+  case "$1" in
+    vp-worker-redis-marker-readiness-job)
+      printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaa
+      ;;
+    vp-worker-redis-marker-janitor-job)
+      printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbb
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 secret_path() {
   local reference="$1"
   if [[ -f "$SECRET_DIR/$reference" ]]; then
@@ -87,12 +111,14 @@ if [[ "${1:-} ${2:-}" == "network inspect" ]]; then
   exit
 fi
 if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
-  name="${3:-}"
+  name="$(marker_service_name "${3:-}")"
   state_path="$(service_path "$name" state)"
   identity_path="$(service_path "$name" identity)"
   [[ -f "$state_path" ]] || exit 1
   if [[ "$*" == *"--format"* ]]; then
-    if [[ "$*" == *"vp.worker-redis-marker.mode"* ]]; then
+    if [[ "$*" == *'{{.ID}}|{{.Spec.Name}}'* ]]; then
+      printf '%s|%s\n' "$(marker_service_id "$name")" "$name"
+    elif [[ "$*" == *"vp.worker-redis-marker.mode"* ]]; then
       cat "$identity_path"
     elif [[ -n "${FAKE_SERVICE_GENERATION:-}" ]]; then
       printf '%s\n' "$FAKE_SERVICE_GENERATION"
@@ -103,14 +129,14 @@ if [[ "${1:-} ${2:-}" == "service inspect" ]]; then
   exit
 fi
 if [[ "${1:-} ${2:-}" == "service ps" ]]; then
-  name="${3:-}"
+  name="$(marker_service_name "${3:-}")"
   if [[ "${FAKE_EMPTY_SERVICE_PS:-false}" != true ]]; then
     cat "$(service_path "$name" state)"
   fi
   exit
 fi
 if [[ "${1:-} ${2:-}" == "service rm" ]]; then
-  name="${3:-}"
+  name="$(marker_service_name "${3:-}")"
   generation="$(
     cut -d'|' -f3 "$(service_path "$name" identity)" 2>/dev/null || true
   )"
@@ -249,7 +275,17 @@ if [[ "${1:-} ${2:-}" == "secret inspect" ]]; then
     if [[ "$resolved_name" == "${FAKE_MISSING_SECRET:-__none__}" ]]; then
       exit 1
     fi
-    if [[ "$*" == *"--format"* ]]; then
+    if [[ "$*" == *'{{.ID}}|{{.Spec.Name}}' \
+      && "$*" != *'{{index .Spec.Labels'* ]]; then
+      python3 - "$secret_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    secret = json.load(handle)
+print("|".join((secret["ID"], secret["Spec"]["Name"])))
+PY
+    elif [[ "$*" == *"--format"* ]]; then
       python3 - "$secret_file" <<'PY'
 import json
 import sys
@@ -865,6 +901,94 @@ log() {
 }
 source "$EXTENSION"
 
+(
+  binding_calls="$TEST_ROOT/marker-job-id-binding-calls"
+  : >"$binding_calls"
+  marker_name=vp-worker-redis-marker-readiness-job
+  janitor_name=vp-worker-redis-marker-janitor-job
+  marker_id=aaaaaaaaaaaaaaaaaaaaaaaa
+  marker_removed=false
+  vp_worker_redis_marker_expected_job_identity() {
+    printf '%s\n' expected-marker-identity
+  }
+  vp_worker_redis_marker_job_identity() {
+    printf 'identity|%s\n' "$1" >>"$binding_calls"
+    [[ "$1" == "$marker_id" ]] || return 1
+    printf '%s\n' expected-marker-identity
+  }
+  docker() {
+    printf 'docker|%s\n' "$*" >>"$binding_calls"
+    if [[ "$*" == "service inspect $marker_name --format {{.ID}}|{{.Spec.Name}}" ]]; then
+      printf '%s|%s\n' "$marker_id" "$marker_name"
+      return 0
+    fi
+    if [[ "$*" == "service inspect $janitor_name --format {{.ID}}|{{.Spec.Name}}" ]]; then
+      return 1
+    fi
+    if [[ "$*" == "service inspect $marker_name" ]]; then
+      return 0
+    fi
+    if [[ "$*" == "service inspect $janitor_name" ]]; then
+      return 1
+    fi
+    if [[ "$*" == "service ps $marker_id --no-trunc --format {{.CurrentState}}" ]]; then
+      printf '%s\n' Complete
+      return 0
+    fi
+    if [[ "$*" == "service rm $marker_id" ]]; then
+      marker_removed=true
+      return 0
+    fi
+    if [[ "$*" == "service inspect $marker_id" \
+      && "$marker_removed" == true ]]; then
+      return 1
+    fi
+    return 1
+  }
+
+  if ! vp_worker_redis_marker_remove_generation_jobs \
+    vp-marker:test marker-generation readiness-redis janitor-redis; then
+    fail "fixed-name marker cleanup was not bound to its resolved service ID"
+  fi
+  grep -Fxq "identity|$marker_id" "$binding_calls" \
+    || fail "marker identity inspection did not use the resolved service ID"
+  grep -Fxq \
+    "docker|service ps $marker_id --no-trunc --format {{.CurrentState}}" \
+    "$binding_calls" \
+    || fail "marker task inspection did not use the resolved service ID"
+  grep -Fxq "docker|service rm $marker_id" "$binding_calls" \
+    || fail "marker cleanup did not remove the resolved service ID"
+  if grep -Eq \
+    "^(identity|docker\|service (ps|rm))\|?$marker_name" \
+    "$binding_calls"; then
+    fail "marker cleanup reused a mutable service name after binding"
+  fi
+)
+
+# Marker-control tests exercise candidate lifecycle behavior in isolation. The
+# deployment transaction contracts cover the durable journal implementation.
+VP_WORKER_ADMISSION_TRANSACTION_ID=tx-0123456789abcdef0123456789abcdef
+VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+VP_WORKER_ADMISSION_COMMIT=0123456789abcdef0123456789abcdef01234567
+vp_worker_admission_record_authority_intent() {
+  return 0
+}
+vp_worker_admission_mark_authority_provisioning() {
+  return 0
+}
+vp_worker_admission_mark_authority_provisioned() {
+  return 0
+}
+vp_worker_admission_record_marker_selection() {
+  return 0
+}
+vp_worker_admission_prepared_secret_id() {
+  VP_WORKER_PREPARED_SECRET_ID=-
+}
+vp_worker_admission_record_prepared_secret() {
+  return 0
+}
+
 : >"$DOCKER_CALLS"
 rm -rf "$ROOT"
 UPDATE_SERVICES=0
@@ -972,6 +1096,63 @@ REPAIR_REDIS_SECRET=$repair_secret
 EOF
   chmod 0400 "$RUNTIME_STATE"
 }
+
+write_runtime_secret() {
+  local name="$1"
+  local secret_id="$2"
+  local purpose="$3"
+  SECRET_ID="$secret_id" \
+  SECRET_NAME="$name" \
+  SECRET_GENERATION="$RUNTIME_GENERATION" \
+  SECRET_PURPOSE="$purpose" \
+    python3 - "$SECRET_DIR/$name" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+secret = {
+    "ID": os.environ["SECRET_ID"],
+    "Spec": {
+        "Labels": {
+            "vp.generation": os.environ["SECRET_GENERATION"],
+            "vp.purpose": os.environ["SECRET_PURPOSE"],
+            "vp.service": "vp-worker-redis-runtime",
+        },
+        "Name": os.environ["SECRET_NAME"],
+    },
+}
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps(secret, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+}
+
+write_runtime_secrets() {
+  local runtime_secret_index=0
+  local runtime_secret
+  local runtime_purpose
+  local runtime_secret_id
+  while IFS='|' read -r runtime_secret runtime_purpose; do
+    runtime_secret_index="$((runtime_secret_index + 1))"
+    printf -v runtime_secret_id '%032x' "$runtime_secret_index"
+    write_runtime_secret \
+      "$runtime_secret" "$runtime_secret_id" "$runtime_purpose"
+  done <<'EOF'
+vp-control-redis-runtime-abcdef012345|control
+vp-ffmpeg-go-redis-runtime-abcdef012345|ffmpeg-go
+vp-ffmpeg-redis-runtime-abcdef012345|ffmpeg
+vp-vision-redis-runtime-abcdef012345|vision
+vp-youtube-redis-runtime-abcdef012345|youtube-publisher
+vp-watcher-redis-runtime-abcdef012345|watcher
+vp-marker-readiness-redis-runtime-abcdef012345|readiness
+vp-marker-janitor-redis-runtime-abcdef012345|janitor
+vp-marker-repair-redis-runtime-abcdef012345|repair
+EOF
+}
+
+write_runtime_secrets
 
 VP_WORKER_REDIS_RUNTIME_STATE_FILE="$RUNTIME_STATE"
 VP_WORKER_REDIS_RUNTIME_GENERATION="$RUNTIME_GENERATION"
@@ -1246,6 +1427,9 @@ reset_marker_transaction_fixture() {
   export ROOT
   rm -rf "$ROOT" "$SERVICE_DIR" "$SECRET_DIR"
   mkdir -p "$SERVICE_DIR" "$SECRET_DIR"
+  write_runtime_secrets
+  write_runtime_state \
+    "$RUNTIME_GENERATION" vp-marker-acl-v1 yes ok noeviction
   cat >"$FAKE_CRONTAB" <<'EOF'
 */2 * * * * /srv/deploy/bin/deploy-github-sync.sh videoprocess
 */3 * * * * /srv/deploy/bin/deploy-github-sync.sh policy-decision-service
@@ -1268,13 +1452,22 @@ EOF
   export FAKE_READINESS_RESULT
 }
 
+prepare_marker_rollback_candidate_fixture() {
+  VP_WORKER_ROLLBACK_FAILED_MARKER_GENERATION="$VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION"
+  VP_WORKER_ROLLBACK_FAILED_MARKER_IMAGE="$VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE"
+  VP_WORKER_ADMISSION_ROLLBACK_MARKER_GENERATION=m-rb-0123456789ab-1780000000
+  vp_prepare_worker_redis_marker_rollback_candidate
+}
+
 managed_backup_matches() {
   local control_root="$1"
   local expected_launcher="$2"
   local expected_config="$3"
   local expected_crontab="$4"
   local state
-  for state in "$control_root"/.managed-state.*; do
+  for state in \
+    "$control_root"/.managed-state.* \
+    "$control_root"/transactions/tx-*/baseline-managed-state; do
     [[ -d "$state" ]] || continue
     if cmp -s "$expected_launcher" "$state/launcher" \
       && cmp -s "$expected_config" "$state/control.conf" \
@@ -1501,6 +1694,8 @@ ROLLBACK_CANDIDATE_GENERATION="$VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION"
 cp "$ROLLBACK_CONTROL_ROOT/control.conf" "$TEST_ROOT/candidate-control.conf"
 cp "$FAKE_CRONTAB" "$TEST_ROOT/candidate-crontab"
 : >"$CONTROL_EVENTS"
+prepare_marker_rollback_candidate_fixture \
+  || fail "rollback fixture generation was not provisioned"
 FAKE_READINESS_RESULT=failed
 export FAKE_READINESS_RESULT
 if vp_restore_worker_redis_marker_controls >/dev/null 2>&1; then
@@ -1571,6 +1766,8 @@ prepare_rollback_backup_fixture() {
   vp_prepare_worker_redis_marker_controls \
     "vp-ffmpeg-worker-python:$name-candidate" >/dev/null \
     || fail "$name candidate did not prepare"
+  prepare_marker_rollback_candidate_fixture \
+    || fail "$name rollback generation was not provisioned"
   cp "$ROOT/bin/worker-redis-marker-control.sh" \
     "$TEST_ROOT/$name-candidate-launcher"
   cp "$ROLLBACK_FAILURE_CONTROL_ROOT/control.conf" \
@@ -1656,6 +1853,12 @@ write_runtime_state \
   "$ROTATION_NEW_READINESS_SECRET" \
   "$ROTATION_NEW_JANITOR_SECRET" \
   "$ROTATION_NEW_REPAIR_SECRET"
+write_runtime_secret \
+  "$ROTATION_NEW_READINESS_SECRET" 0000000000000000000000000000000a readiness
+write_runtime_secret \
+  "$ROTATION_NEW_JANITOR_SECRET" 0000000000000000000000000000000b janitor
+write_runtime_secret \
+  "$ROTATION_NEW_REPAIR_SECRET" 0000000000000000000000000000000c repair
 vp_require_worker_redis_runtime_state >/dev/null \
   || fail "rotation fixture current runtime state was not ready"
 VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET="$ROTATION_OLD_READINESS_SECRET"
@@ -1782,6 +1985,21 @@ vp_run_worker_registration_migration() {
   :
 }
 vp_prepare_worker_admission() {
+  :
+}
+vp_worker_admission_transition_to() {
+  :
+}
+vp_worker_admission_advance_migration_state() {
+  :
+}
+vp_record_app_service_attempt() {
+  :
+}
+vp_worker_admission_record_janitor_service() {
+  :
+}
+vp_worker_admission_advance_live_worker_stage() {
   :
 }
 vp_install_staging_object_janitor() {
@@ -1930,9 +2148,23 @@ vp_deploy_vision_worker() {
 vp_deploy_publisher() {
   printf 'publisher\n' >>"$WORKER_MUTATIONS"
 }
-SNAPSHOTS="$VP_PYTHON_WORKER_SERVICE|vp-python:prior
-$VP_VISION_WORKER_SERVICE|vp-vision:prior
-$VP_PUBLISHER_SERVICE|vp-publisher:prior"
+vp_registered_worker_service_current_id() {
+  case "$1" in
+    "$VP_PYTHON_WORKER_SERVICE")
+      printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaa
+      ;;
+    "$VP_VISION_WORKER_SERVICE")
+      printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbb
+      ;;
+    "$VP_PUBLISHER_SERVICE")
+      printf '%s\n' cccccccccccccccccccccccc
+      ;;
+    *) return 1 ;;
+  esac
+}
+SNAPSHOTS="$VP_PYTHON_WORKER_SERVICE|aaaaaaaaaaaaaaaaaaaaaaaa|vp-python:prior|1111111111111111111111111111111111111111111111111111111111111111
+$VP_VISION_WORKER_SERVICE|bbbbbbbbbbbbbbbbbbbbbbbb|vp-vision:prior|2222222222222222222222222222222222222222222222222222222222222222
+$VP_PUBLISHER_SERVICE|cccccccccccccccccccccccc|vp-publisher:prior|3333333333333333333333333333333333333333333333333333333333333333"
 if vp_restore_app_snapshots "$SNAPSHOTS" \
   "$VP_PYTHON_WORKER_SERVICE $VP_VISION_WORKER_SERVICE $VP_PUBLISHER_SERVICE" \
   >/dev/null 2>&1; then

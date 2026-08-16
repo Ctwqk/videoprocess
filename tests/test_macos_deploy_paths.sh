@@ -4,8 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMMON="$ROOT_DIR/deploy/macos/common.sh"
 TOPOLOGY="$ROOT_DIR/deploy/four-machine-topology.md"
+COLIMA_INSTALLER="$ROOT_DIR/deploy/macos/install_videoprocess_colima_node.sh"
+COLIMA_PLIST="$ROOT_DIR/deploy/macos/com.constructure.vp-colima.plist"
 
 bash -n "$COMMON"
+bash -n "$COLIMA_INSTALLER"
 
 assert_contains() {
   local needle="$1"
@@ -44,3 +47,7 @@ assert_not_contains 'PLATFORM_UPLOAD_ROOT="${PLATFORM_UPLOAD_ROOT:-$CONSTRUCTURE
 assert_file_contains "$TOPOLOGY" 'node.labels.vp.runtime == true'
 assert_file_contains "$TOPOLOGY" '126 is not a VideoProcess automatic failover target'
 assert_file_contains "$TOPOLOGY" '--project vp-app --project vp-feature-aggregator'
+assert_file_contains "$COLIMA_PLIST" '<key>EnvironmentVariables</key>'
+assert_file_contains "$COLIMA_PLIST" '<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>'
+assert_file_contains "$COLIMA_INSTALLER" '/usr/bin/env PATH=$COLIMA_COMMAND_PATH /opt/homebrew/bin/colima start'
+assert_file_contains "$COLIMA_INSTALLER" 'launchctl bootout "$launch_domain/$PLIST_LABEL"'
