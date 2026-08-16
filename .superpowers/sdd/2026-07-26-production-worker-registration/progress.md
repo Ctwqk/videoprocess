@@ -357,6 +357,25 @@ worker-admission contract, shell syntax, and `git diff --check` pass. The 17:45
 and 18:00 app crons both observed `a3944c8` but failed closed while CI was not
 successful, so production remains on `e51240f`. The fifth unlisted canary
 remains unused pending the corrected CI run and observed automatic deployment.
+Task 4B/4C Deploy Track B stage 2: the Linux FD-audit correction was committed
+as `48ec37f8c923cd7d2ac4daae54831dc8c0776d0b`. Actions run `31964483742`
+passed backend/migrations, Go, frontend, and the repaired absent-FD audit, then
+exposed a separate Bash 5 runtime defect in real outer-lock retirement. Calling
+the shell runner with function-level `>&15` caused Bash to reserve FD16 while
+saving stdout, colliding with the fixed launch-gate FD16. Query capture is now
+runner-owned through the internal `--query-output` switch: the runner accepts no
+arbitrary output FD, validates the open and unlinked FD15 identity before
+launch, and redirects only the final Docker command after the supervisor has
+consumed the gate and closed inherited FD16/17. Both query callers and the test
+double now enforce this contract. Direct regressions cover no-payload capture,
+mismatched FD15 identity, and duplicate switch rejection. The full
+worker-admission contract passes in the production worker image's Linux Bash
+5.1 runtime and on macOS; rollback,
+the full deploy-sync contract, Redis marker control, canary safeguards, macOS
+paths, shell syntax, and `git diff --check` also pass. The 18:30 and 18:45 app
+crons observed `48ec37f` but failed closed, so production remains on `e51240f`.
+The fifth unlisted canary remains unused pending review, publication, successful
+CI, and verified automatic deployment.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak

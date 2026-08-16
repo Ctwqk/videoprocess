@@ -1885,3 +1885,60 @@ The 17:45Z and 18:00Z app cron attempts both detected `a3944c8` and stopped at
 the GitHub Actions gate before service mutation. Production therefore remains
 on `e51240f`. The fifth unlisted canary approval remains unused until corrected
 CI succeeds and the following 150/127 automatic deployment is verified.
+
+### Third Automatic Deployment Observation
+
+The cross-platform FD-audit correction was published as
+`48ec37f8c923cd7d2ac4daae54831dc8c0776d0b`. Actions run `31964483742`
+passed backend/migrations, Go, frontend, and the repaired parent-death FD audit.
+The deployment-contract job then reached the next Linux-only failure: real
+outer-lock retirement rejected the worker launch before Docker was invoked.
+
+The failure was a Bash 5 descriptor collision in the production runner. The
+query callers invoked a shell function with `>&15`; Bash reserved FD16 while
+saving the function's original stdout. The launch protocol deliberately uses
+fixed FD16 for its one-byte gate, so `vp_python_worker_prepare_launch_gate`
+correctly failed closed when it found that descriptor occupied. This behavior
+was reproduced with an exact trace under Bash 5.1 in the production worker
+image.
+
+Query output capture is now an internal runner responsibility. The runner:
+
+1. accepts the fixed-purpose `--query-output` switch exactly once and never an
+   arbitrary caller-supplied FD;
+2. verifies that the expected FD15 is open and still matches the captured
+   unlinked descriptor identity before starting a worker;
+3. consumes the launch gate and closes inherited FD16/17 first; and
+4. redirects only the final Docker command's stdout to FD15 in both payload and
+   no-payload paths.
+
+The generation-state and retirement-ID callers use this switch instead of
+function-level redirection, and the Docker test double asserts the same
+fixed-descriptor contract. Direct regressions also cover no-payload query
+capture, mismatched FD15 identity, and duplicate `--query-output` rejection
+before Docker. Fresh evidence after the correction:
+
+```text
+Linux Bash 5.1: bash tests/test_worker_admission_deploy.sh
+  PASS: worker admission deployment contract tests passed
+macOS: bash tests/test_worker_admission_deploy.sh
+  PASS: worker admission deployment contract tests passed
+bash tests/test_worker_admission_rollback.sh
+  PASS
+bash tests/test_vp_deploy_sync_extension.sh
+  PASS
+bash tests/test_worker_redis_marker_control.sh
+  PASS
+bash tests/test_vp_unlisted_canary_scripts.sh
+  PASS
+bash tests/test_macos_deploy_paths.sh
+  PASS
+changed-shell bash -n / git diff --check
+  PASS
+```
+
+The 18:30Z and 18:45Z app cron attempts both observed `48ec37f` and stopped at
+the failed GitHub Actions gate before service mutation. Production remains on
+`e51240f`, and the independent PDS service remains on `6b8f8be32399...`. The
+fifth unlisted canary approval remains unused pending independent review,
+publication, successful CI, and verified 150/127 automatic deployment.

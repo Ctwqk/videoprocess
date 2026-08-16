@@ -1099,6 +1099,80 @@ for stderr_case in docker-no-payload:0 docker-payload:1; do
 done
 
 (
+  probe_root="$TEST_ROOT/query-output-no-payload"
+  ROOT="$probe_root/sync"
+  mkdir -p "$ROOT"
+  admission_root="$(vp_worker_admission_root)"
+  mkdir -p "$admission_root"
+  chmod 0700 "$admission_root"
+  vp_worker_admission_lock_acquire "$admission_root"
+  vp_worker_admission_prepare_query_output
+
+  docker() {
+    printf 'query-output-no-payload\n'
+  }
+
+  _vp_run_python_worker_container_locked \
+    synthetic-image - - - \
+    --query-output \
+    -- /bin/true
+  vp_worker_admission_seal_query_output
+  IFS= read -r query_output <&14
+  if [[ "$query_output" != query-output-no-payload ]]; then
+    echo 'FAIL: no-payload query did not capture Docker stdout' >&2
+    exit 1
+  fi
+  vp_worker_admission_discard_query_output
+  vp_worker_admission_lock_release
+)
+
+(
+  probe_root="$TEST_ROOT/query-output-rejection"
+  ROOT="$probe_root/sync"
+  mkdir -p "$ROOT"
+  admission_root="$(vp_worker_admission_root)"
+  mkdir -p "$admission_root"
+  chmod 0700 "$admission_root"
+  vp_worker_admission_lock_acquire "$admission_root"
+  docker_called="$probe_root/docker-called"
+  docker() {
+    : >"$docker_called"
+  }
+
+  vp_worker_admission_prepare_query_output
+  original_query_identity="$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY"
+  query_device="${original_query_identity%%:*}"
+  query_inode="${original_query_identity##*:}"
+  VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY="$query_device:$((query_inode + 1))"
+  set +e
+  _vp_run_python_worker_container_locked \
+    synthetic-image - - - \
+    --query-output \
+    -- /bin/true >/dev/null 2>&1
+  identity_status=$?
+  set -e
+  VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY="$original_query_identity"
+  vp_worker_admission_discard_query_output
+  if [[ "$identity_status" -eq 0 || -e "$docker_called" ]]; then
+    echo 'FAIL: query output accepted a mismatched descriptor identity' >&2
+    exit 1
+  fi
+
+  set +e
+  _vp_run_python_worker_container_locked \
+    synthetic-image - - - \
+    --query-output --query-output \
+    -- /bin/true >/dev/null 2>&1
+  duplicate_status=$?
+  set -e
+  if [[ "$duplicate_status" -eq 0 || -e "$docker_called" ]]; then
+    echo 'FAIL: duplicate query-output option reached Docker' >&2
+    exit 1
+  fi
+  vp_worker_admission_lock_release
+)
+
+(
   probe_root="$TEST_ROOT/one-shot-stderr-payload-producer"
   ROOT="$probe_root/sync"
   REPO_ROOT="$probe_root/repos"
@@ -2033,10 +2107,22 @@ assert_worker_contract \
     printf '%s\n' "$TEST_ROOT/retirement-response-read"
   }
   vp_run_python_worker_container() {
+    local query_output_count=0
+    local argument
+    for argument in "$@"; do
+      if [[ "$argument" == --query-output ]]; then
+        query_output_count=$((query_output_count + 1))
+      fi
+    done
+    [[ "$query_output_count" -eq 1 \
+      && "$VP_WORKER_ADMISSION_QUERY_WRITE_FD" -eq 15 \
+      && "$VP_WORKER_ADMISSION_QUERY_WRITE_OPEN" == true ]] \
+      || return 97
     printf '{"code":"worker_deployment_retirement_candidates","generation":%s,"registration_ids":["%s"],"service_name":"%s","status":"ok"}\n' \
       "$RETIREMENT_RESPONSE_GENERATION" \
       "$retirement_uuid" \
-      "$RETIREMENT_RESPONSE_SERVICE"
+      "$RETIREMENT_RESPONSE_SERVICE" \
+      >&"$VP_WORKER_ADMISSION_QUERY_WRITE_FD"
     if [[ "$RETIREMENT_RESPONSE_REPLACE_PATH" == true ]]; then
       local query_path="$VP_WORKER_ADMISSION_QUERY_OUTPUT_FILE"
       if [[ -e "$query_path" ]]; then

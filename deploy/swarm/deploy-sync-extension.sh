@@ -2387,6 +2387,7 @@ _vp_run_python_worker_container_locked() {
   local payload_sources=()
   local payload_targets=()
   local payload_modes=()
+  local capture_query_output=false
   if [[ -n "$secret_source" ]]; then
     payload_sources+=("$secret_source")
     payload_targets+=("/run/secrets/$secret_target")
@@ -2444,6 +2445,11 @@ _vp_run_python_worker_container_locked() {
         esac
         seen_targets+="$bind_target|"
         shift 2
+        ;;
+      --query-output)
+        [[ "$capture_query_output" == false ]] || return 1
+        capture_query_output=true
+        shift
         ;;
       *)
         return 1
@@ -2774,6 +2780,16 @@ except Exception:
     vp-python-worker-bootstrap
     "${command[@]}"
   )
+  if [[ "$capture_query_output" == true ]]; then
+    [[ "$VP_WORKER_ADMISSION_QUERY_WRITE_FD" -eq 15 \
+      && "$VP_WORKER_ADMISSION_QUERY_WRITE_OPEN" == true \
+      && "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" \
+        =~ ^[0-9]+:[1-9][0-9]*$ ]] \
+      && vp_worker_admission_verify_query_output_fd \
+        "$VP_WORKER_ADMISSION_QUERY_WRITE_FD" \
+        "$VP_WORKER_ADMISSION_QUERY_OUTPUT_IDENTITY" \
+      || return 1
+  fi
   vp_worker_admission_lock_assert || return 1
   vp_worker_admission_raise_if_signaled || return $?
   local caller_pipefail=false
@@ -2799,7 +2815,15 @@ except Exception:
           trap - HUP INT TERM
           vp_python_worker_wait_for_launch_gate "$launch_token" \
             || exit 1
-          if declare -F docker >/dev/null 2>&1; then
+          if [[ "$capture_query_output" == true ]]; then
+            if declare -F docker >/dev/null 2>&1; then
+              "${docker_command[@]}" \
+                >&"$VP_WORKER_ADMISSION_QUERY_WRITE_FD"
+            else
+              exec "${docker_command[@]}" \
+                >&"$VP_WORKER_ADMISSION_QUERY_WRITE_FD"
+            fi
+          elif declare -F docker >/dev/null 2>&1; then
             "${docker_command[@]}"
           else
             exec "${docker_command[@]}"
@@ -2810,7 +2834,15 @@ except Exception:
       trap - HUP INT TERM
       vp_python_worker_wait_for_launch_gate "$launch_token" \
         || exit 1
-      if declare -F docker >/dev/null 2>&1; then
+      if [[ "$capture_query_output" == true ]]; then
+        if declare -F docker >/dev/null 2>&1; then
+          "${docker_command[@]}" </dev/null \
+            >&"$VP_WORKER_ADMISSION_QUERY_WRITE_FD"
+        else
+          exec "${docker_command[@]}" </dev/null \
+            >&"$VP_WORKER_ADMISSION_QUERY_WRITE_FD"
+        fi
+      elif declare -F docker >/dev/null 2>&1; then
         "${docker_command[@]}" </dev/null
       else
         exec "${docker_command[@]}" </dev/null
@@ -9286,11 +9318,12 @@ vp_worker_admission_generation_state() {
       - \
       --network "$VP_PIPELINE_NETWORK_ID" \
       --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
+      --query-output \
       -- \
       python -m app.services.worker_deployment_cli \
         generation-state \
         --service-name "$service" \
-        --generation "$generation" >&15; then
+        --generation "$generation"; then
     vp_worker_admission_seal_query_output || query_status=1
     if [[ "$query_status" -eq 0 ]]; then
       VP_WORKER_ADMISSION_GENERATION_STATE="$(
@@ -9336,11 +9369,12 @@ vp_worker_admission_retirement_ids() {
       - \
       --network "$VP_PIPELINE_NETWORK_ID" \
       --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
+      --query-output \
       -- \
       python -m app.services.worker_deployment_cli \
         retirement-candidates \
         --service-name "$service" \
-        --generation "$generation" >&15; then
+        --generation "$generation"; then
     vp_worker_admission_seal_query_output || query_status=1
     if [[ "$query_status" -eq 0 ]]; then
       VP_WORKER_ADMISSION_RETIREMENT_IDS="$(
