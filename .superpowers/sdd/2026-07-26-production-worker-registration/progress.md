@@ -423,6 +423,26 @@ The exact test passes five consecutive isolated Redis runs and the complete
 failed closed while CI was incomplete, so production remains on `e51240f`. The
 fifth unlisted canary remains unused pending publication, CI, automatic
 deployment, and preflight.
+Task 4B/4C Deploy Track B stage 2: the event-driven Go timing correction was
+published as `e9f8e9889beeb8eff5b2ab6cbe595b6f134db20b`; Actions run
+`31972685087` passed every job. The 22:00Z automatic deployment built all six
+images but stopped before service mutation because the sync root and state
+directory were group-writable (`0775`), while controlled transaction state
+requires owner-only write access. Both directories are now `0700`, and this
+failure has an explicit regression-tested diagnostic. The 22:15Z retry then
+exposed the previously unbootstrapped database authority identities. Production
+now has four distinct `0400` credential files and four distinct non-superuser
+login principals; only the three deployment/role-owner principals have
+`CREATEROLE`, while the deploy-read principal is read-only. The 22:30Z retry
+proved every principal could connect but exposed two probe-wiring defects: the
+manager was given the backend image that exists only on node 127, and the CUDA
+worker entrypoint wrote a license banner ahead of the probe's canonical JSON.
+The probe now receives the manager-local Python worker image and invokes its
+absolute Python entrypoint directly. Focused identity probes, the full worker
+admission deployment contract, the full deploy-sync contract, shell syntax, and
+`git diff --check` pass. Production remains on `e51240f`, with all services
+healthy; the fifth unlisted canary remains unused pending publication, CI,
+automatic deployment, and preflight.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak

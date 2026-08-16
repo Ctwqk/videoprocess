@@ -314,8 +314,9 @@ vp_probe_worker_database_principal() {
       --network "$VP_PIPELINE_NETWORK_ID" \
       --mount "type=bind,src=$credential_file,dst=/run/secrets/vp-database-identity-url,readonly" \
       --env VP_DATABASE_IDENTITY_URL_FILE=/run/secrets/vp-database-identity-url \
+      --entrypoint /opt/venv/bin/python3 \
       "$image" \
-      python3 -I -c '
+      -I -c '
 import asyncio
 import json
 import os
@@ -1774,11 +1775,14 @@ vp_python_worker_prepare_controlled_directory() {
   [[ "$caller_uid" =~ ^[0-9]+$ && "$caller_gid" =~ ^[0-9]+$ ]] \
     || return 1
   local result
-  result="$(
+  if ! result="$(
     vp_python_worker_host_guard \
       prepare-controlled-directory \
       "$ROOT" "$target" "$caller_uid" "$caller_gid"
-  )" || return 1
+  )"; then
+    echo 'controlled directory preparation failed: deployment root and existing state path components must be caller-owned and not group/world-writable' >&2
+    return 1
+  fi
   local path="${result%%|*}"
   local record="${result#*|}"
   [[ "$path" = /* && "$record" != "$result" \
@@ -16292,7 +16296,7 @@ deploy_vp_app_services() {
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
     VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
     local validation_status=0
-    if ! vp_validate_deploy_config "${3:-}"; then
+    if ! vp_validate_deploy_config "${6:-}"; then
       validation_status=1
     elif _vp_deploy_vp_app_services_locked "$@"; then
       validation_status=0
@@ -16372,7 +16376,7 @@ deploy_vp_app_services() {
     deploy_status=$?
   fi
   if [[ "$deploy_status" -eq 0 ]]; then
-    if ! vp_validate_deploy_config "${3:-}"; then
+    if ! vp_validate_deploy_config "${6:-}"; then
       deploy_status=1
     fi
   fi

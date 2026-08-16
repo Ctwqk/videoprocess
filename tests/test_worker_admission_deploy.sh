@@ -26,6 +26,26 @@ source "$EXTENSION"
 mkdir -p "$(vp_worker_admission_root)"
 chmod 0700 "$(vp_worker_admission_root)"
 
+(
+  unsafe_root="$TEST_ROOT/group-writable-sync-root"
+  ROOT="$unsafe_root"
+  mkdir -p "$ROOT/state"
+  chmod 0775 "$ROOT"
+  output="$TEST_ROOT/group-writable-sync-root.out"
+  if vp_python_worker_prepare_controlled_directory \
+    "$ROOT/state/vp-worker-admission" >"$output" 2>&1; then
+    echo 'FAIL: group-writable sync root unexpectedly passed controlled-directory preparation' >&2
+    exit 1
+  fi
+  if ! grep -Fq \
+    'controlled directory preparation failed: deployment root and existing state path components must be caller-owned and not group/world-writable' \
+    "$output"; then
+    echo 'FAIL: group-writable sync root failure did not explain the required permissions' >&2
+    cat "$output" >&2
+    exit 1
+  fi
+)
+
 if grep -Eq 'chown[[:space:]]+-R' "$EXTENSION"; then
   echo 'FAIL: Python worker one-shot recursively chowns caller state' >&2
   exit 1
@@ -968,6 +988,7 @@ done
   chmod 0700 "$admission_root" "$bind_source"
 
   vp_validate_deploy_config() {
+    [[ "${1:-}" == f ]] || return 98
     vp_worker_admission_lock_assert
   }
   vp_worker_admission_prepare_transaction() {
@@ -4641,7 +4662,7 @@ PY
   UPDATE_SERVICES=0
 
   vp_validate_deploy_config() {
-    printf 'validate\n' >>"$dry_run_calls"
+    printf 'validate|%s\n' "${1:-}" >>"$dry_run_calls"
   }
   _vp_deploy_vp_app_services_locked() {
     printf 'deploy-read-only\n' >>"$dry_run_calls"
@@ -4666,7 +4687,7 @@ PY
   fi
   dry_run_after="$(shasum -a 256 "$dry_run_active")"
   if [[ "$dry_run_before" != "$dry_run_after" \
-    || "$(cat "$dry_run_calls")" != $'validate\ndeploy-read-only' ]]; then
+    || "$(cat "$dry_run_calls")" != $'validate|worker\ndeploy-read-only' ]]; then
     echo 'FAIL: UPDATE_SERVICES=0 touched transaction state or mutation hooks' >&2
     exit 1
   fi

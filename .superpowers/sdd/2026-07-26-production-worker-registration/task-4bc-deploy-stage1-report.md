@@ -2060,3 +2060,54 @@ The 20:30Z and 20:45Z app cron attempts observed `4f774ee` and stopped at the
 in-progress CI gate before service mutation. Production remains on `e51240f`,
 PDS remains on `6b8f8be32399...`, and the fifth unlisted canary approval remains
 unused pending corrected CI, verified automatic deployment, and preflight.
+
+### Seventh Automatic Deployment Observation
+
+The event-driven Go test correction was published as
+`e9f8e9889beeb8eff5b2ab6cbe595b6f134db20b`. Actions run `31972685087`
+passed Go, frontend, backend/migrations, and the complete deployment contract.
+At 22:00Z, the 150 cron automatically synced the commit and built all six app
+images on their assigned hosts, then stopped before any service update. The
+transaction state guard rejected the existing `0775` sync root and state
+directory. They are now `0700`; the controlled-directory helper also emits a
+specific, regression-tested permission diagnostic instead of a silent status.
+
+The 22:15Z automatic retry reached the next fail-closed gate and reported four
+missing database identity settings. The database now has four distinct login
+principals and four distinct owner-only (`0400`) credential files:
+
+```text
+vp_deploy_migrator    NOSUPERUSER CREATEROLE
+vp_deploy_read        NOSUPERUSER NOCREATEROLE, read-only
+vp_control_role_owner NOSUPERUSER CREATEROLE
+vp_runtime_role_owner NOSUPERUSER CREATEROLE
+```
+
+The privileged principals inherit the existing schema owner's object rights
+without permission to `SET ROLE`; none is a superuser. All four independently
+connect with matching `session_user` and `current_user`.
+
+The 22:30Z retry then exposed two production-only probe wiring errors. The
+manager-side identity probe received the backend image built only on node 127,
+while the manager-local CUDA worker image prints an NVIDIA banner before normal
+stdout. The probe now receives the sixth build artifact, the manager-local
+Python worker, and starts `/opt/venv/bin/python3` as an explicit entrypoint so
+stdout contains only the canonical identity JSON. Both live and no-update paths
+assert this image selection, and the fake probe requires the explicit
+entrypoint. Fresh evidence:
+
+```text
+bash tests/test_worker_admission_deploy.sh
+  PASS
+bash tests/test_vp_deploy_sync_extension.sh
+  PASS
+bash -n deploy/swarm/deploy-sync-extension.sh \
+  tests/test_worker_admission_deploy.sh \
+  tests/test_vp_deploy_sync_extension.sh
+  PASS
+```
+
+All production services remain on the previous healthy images and at `1/1`;
+PDS remains on `6b8f8be32399...`. No canary or YouTube mutation occurred. The
+fifth unlisted canary approval remains unused pending publication, successful
+CI, verified automatic deployment, and preflight.

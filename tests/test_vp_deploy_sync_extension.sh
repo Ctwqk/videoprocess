@@ -2138,7 +2138,8 @@ vp_worker_redis_marker_discard_managed_state() {
       return 0
     fi
     if [[ "${1:-}" != run \
-      || "$*" != *"VP_DATABASE_IDENTITY_URL_FILE=/run/secrets/vp-database-identity-url"* ]]; then
+      || "$*" != *"VP_DATABASE_IDENTITY_URL_FILE=/run/secrets/vp-database-identity-url"* \
+      || "$*" != *"--entrypoint /opt/venv/bin/python3"* ]]; then
       return 97
     fi
     local source=""
