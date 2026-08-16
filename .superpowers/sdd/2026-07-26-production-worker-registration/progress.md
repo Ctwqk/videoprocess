@@ -376,6 +376,21 @@ paths, shell syntax, and `git diff --check` also pass. The 18:30 and 18:45 app
 crons observed `48ec37f` but failed closed, so production remains on `e51240f`.
 The fifth unlisted canary remains unused pending review, publication, successful
 CI, and verified automatic deployment.
+Task 4B/4C Deploy Track B stage 2: the Bash 5 query-capture correction was
+published as `94485ae621436171b61df7f20cebccc74f355760`. Actions run
+`31968096657` passed Go, frontend, backend/migrations, and the complete worker
+admission deployment contract, proving the original FD16 collision fixed on
+the GitHub Linux runner. The next rollback contract then failed before its
+assertions because it archives the historical schema-1 helper commit
+`a0e1afa1cb837ad89eca8fa1eb61ed568eb44a6a`, while the deployment job used the
+default shallow checkout. That commit remains an ancestor of `main`. The deploy
+job now uses `fetch-depth: 0`; the fast workflow contract requires this exact
+history capability, and the rollback test names the full commit and emits a
+clear fail-closed diagnostic when it is unavailable. The fast workflow contract
+and full rollback contract pass locally. The 19:45 and 20:00 app crons observed
+`94485ae` but failed closed while CI was incomplete, so production remains on
+`e51240f`. The fifth unlisted canary remains unused pending publication, CI,
+automatic deployment, and preflight.
 Task 5: pending
 Task 6: pending
 Live boundary: no sixth canary, upload, schedule opening, channel resume, soak

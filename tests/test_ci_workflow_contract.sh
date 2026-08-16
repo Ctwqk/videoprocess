@@ -46,6 +46,20 @@ done
 grep -Fq "name: Install deployment contract dependencies" "$workflow" \
   || fail "deployment contracts do not install the backend test environment"
 
+deploy_checkout_block="$(
+  awk '
+    /^  deploy-contracts:$/ { in_deploy_job=1; next }
+    in_deploy_job && /^  [A-Za-z0-9_-]+:$/ { exit }
+    in_deploy_job && /- uses: actions\/checkout@v6/ { in_checkout=1 }
+    in_checkout && /^      - / && ! /actions\/checkout@v6/ { exit }
+    in_checkout { print }
+  ' "$workflow"
+)"
+grep -Fq "uses: actions/checkout@v6" <<<"$deploy_checkout_block" \
+  || fail "deployment contracts do not check out the repository"
+grep -Fq "fetch-depth: 0" <<<"$deploy_checkout_block" \
+  || fail "deployment contracts do not fetch legacy journal history"
+
 grep -Eq '^  (backend|go|frontend|deploy-contracts):$' "$workflow" \
   || fail "workflow has no blocking jobs"
 

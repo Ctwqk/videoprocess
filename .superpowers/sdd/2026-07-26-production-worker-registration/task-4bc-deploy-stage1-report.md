@@ -1942,3 +1942,37 @@ the failed GitHub Actions gate before service mutation. Production remains on
 `e51240f`, and the independent PDS service remains on `6b8f8be32399...`. The
 fifth unlisted canary approval remains unused pending independent review,
 publication, successful CI, and verified 150/127 automatic deployment.
+
+### Fourth Automatic Deployment Observation
+
+The Bash 5 query-capture correction was published as
+`94485ae621436171b61df7f20cebccc74f355760`. Actions run `31968096657`
+successfully completed Go, frontend, and backend/migrations. Its deployment job
+also printed `worker admission deployment contract tests passed`, independently
+proving that the original Linux FD16 launch-gate collision was corrected on the
+GitHub runner.
+
+The following rollback contract failed before executing its assertions:
+
+```text
+fatal: not a valid object name: a0e1afa
+tar: This does not look like a tar archive
+```
+
+The rollback test deliberately archives the helper from historical schema-1
+commit `a0e1afa1cb837ad89eca8fa1eb61ed568eb44a6a` so current recovery is tested
+against a journal emitted by the actual old implementation. That commit remains
+an ancestor of `main`, but `actions/checkout` defaults to a shallow checkout,
+whereas local full clones contained the object.
+
+The deployment-contract checkout now uses `fetch-depth: 0`. The fast CI
+workflow contract requires that exact setting in the deployment job, so future
+shallow-checkout regressions fail before the long contracts run. The rollback
+test also uses the full commit identity and returns a direct fail-closed message
+when the historical object is unavailable. Fresh local evidence passes both the
+fast workflow contract and the complete rollback transaction contract.
+
+The 19:45Z and 20:00Z app cron attempts observed `94485ae` and stopped at the
+in-progress CI gate before service mutation. Production remains on `e51240f`,
+PDS remains on `6b8f8be32399...`, and the fifth unlisted canary approval remains
+unused pending corrected CI, verified automatic deployment, and preflight.

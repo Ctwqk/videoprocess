@@ -87,10 +87,16 @@ source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 
 (
   head_helper="$ROOT_DIR/deploy/swarm/worker-admission-transaction.py"
+  legacy_schema_one_commit=a0e1afa1cb837ad89eca8fa1eb61ed568eb44a6a
   legacy_fixture="$TEST_ROOT/legacy-schema-1"
   legacy_archive="$legacy_fixture/archive"
   mkdir -p "$legacy_archive"
-  git -C "$ROOT_DIR" archive --format=tar a0e1afa \
+  if ! git -C "$ROOT_DIR" cat-file -e \
+    "$legacy_schema_one_commit^{commit}" 2>/dev/null; then
+    echo 'FAIL: legacy schema-1 journal commit is unavailable' >&2
+    exit 1
+  fi
+  git -C "$ROOT_DIR" archive --format=tar "$legacy_schema_one_commit" \
     deploy/swarm/worker-admission-transaction.py \
     | tar -xf - -C "$legacy_archive"
   old_helper="$legacy_archive/deploy/swarm/worker-admission-transaction.py"
