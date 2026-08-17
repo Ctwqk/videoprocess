@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -46,6 +47,32 @@ async def test_migrate_uses_only_mode_0400_migrator_url(
     }
     assert "database-secret" not in output
     assert "environment-secret" not in output
+
+
+@pytest.mark.asyncio
+async def test_migrate_runs_alembic_upgrade_without_an_active_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url_file = tmp_path / "deploy-migrator-url"
+    url_file.write_text(
+        "postgresql+asyncpg://deploy_migrator:database-secret@"
+        "db/videoprocess\n"
+    )
+    url_file.chmod(0o400)
+    monkeypatch.setenv(cli.DEPLOY_MIGRATOR_URL_FILE_ENV, str(url_file))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    def upgrade(_database_url: str) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        raise AssertionError("Alembic upgrade inherited the CLI event loop")
+
+    monkeypatch.setattr(cli, "_upgrade_database", upgrade)
+
+    assert await cli.run(["migrate"]) == 0
 
 
 @pytest.mark.asyncio

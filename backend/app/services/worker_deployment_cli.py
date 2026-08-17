@@ -70,7 +70,7 @@ async def run(argv: Sequence[str] | None = None) -> int:
             _emit("error", "worker_deployment_migrator_url_invalid")
             return 3
         try:
-            _upgrade_database(database_url)
+            await asyncio.to_thread(_upgrade_database, database_url)
         except Exception:
             _emit("error", "worker_deployment_migration_failed")
             return 4
