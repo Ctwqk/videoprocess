@@ -6234,9 +6234,8 @@ except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
   if [[ "$VP_WORKER_ADMISSION_RECOVERY_EARLY_FORWARD" == true ]]; then
     require_baseline_marker_state=false
   fi
-  if [[ "$VP_WORKER_ADMISSION_RECOVERY_BASELINE_KIND" == managed \
-    && ( "$require_baseline_marker_state" == true \
-      || "$VP_WORKER_ADMISSION_RECOVERY_EARLY_FORWARD" == true ) ]]; then
+  if [[ "$require_baseline_marker_state" == true \
+    || "$VP_WORKER_ADMISSION_RECOVERY_EARLY_FORWARD" == true ]]; then
     local marker_control_root
     marker_control_root="$(vp_worker_redis_marker_control_root)" || return 1
     local baseline_marker_state="$marker_control_root/transactions/$recovery_transaction_id/baseline-managed-state"
@@ -6257,10 +6256,12 @@ except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     fi
     if [[ -n "$baseline_marker_state" ]]; then
       VP_WORKER_REDIS_MARKER_MANAGED_STATE="$baseline_marker_state"
-      vp_worker_redis_marker_read_prior_config \
-        "$baseline_marker_state/control.conf" || return 1
-      [[ -n "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \
-        && -n "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" ]] || return 1
+      if [[ "$VP_WORKER_ADMISSION_RECOVERY_BASELINE_KIND" == managed ]]; then
+        vp_worker_redis_marker_read_prior_config \
+          "$baseline_marker_state/control.conf" || return 1
+        [[ -n "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \
+          && -n "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" ]] || return 1
+      fi
     fi
   fi
 

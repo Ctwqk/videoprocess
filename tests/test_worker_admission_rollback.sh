@@ -4252,6 +4252,48 @@ PY
     echo 'FAIL: partial forward crash was not hydrated as an abort-only recovery' >&2
     exit 1
   fi
+
+  legacy_partial_forward_state="${recovery_state%/*}/legacy-partial-forward-applying-state.json"
+  cp "$partial_forward_state" "$legacy_partial_forward_state"
+  python3 - "$legacy_partial_forward_state" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+state = json.loads(path.read_text(encoding="utf-8"))
+state["transaction_id"] = "tx-55555555555555555555555555555555"
+state["app_progress"]["transaction_id"] = state["transaction_id"]
+state["baseline"]["kind"] = "legacy_no_control"
+state["baseline"]["control"] = None
+path.write_text(
+    json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+  legacy_partial_marker_state="$ROOT/state/worker-redis-marker-control/transactions/tx-55555555555555555555555555555555/baseline-managed-state"
+  mkdir -p "$legacy_partial_marker_state"
+  chmod 0700 "$legacy_partial_marker_state"
+  printf 'VERSION=1\n' >"$legacy_partial_marker_state/captured"
+  chmod 0600 "$legacy_partial_marker_state/captured"
+  : >"$legacy_partial_marker_state/crontab"
+  chmod 0600 "$legacy_partial_marker_state/crontab"
+  vp_worker_admission_recovery_state() {
+    command cat "$legacy_partial_forward_state"
+  }
+  if ! vp_worker_admission_hydrate_recovery_context; then
+    echo 'FAIL: valid legacy partial forward crash state was rejected' >&2
+    exit 1
+  fi
+  if [[ "$VP_WORKER_ADMISSION_RECOVERY_BASELINE_KIND" != legacy_no_control \
+    || "$VP_WORKER_ADMISSION_RECOVERY_PARTIAL_FORWARD" != true \
+    || "$VP_WORKER_REDIS_MARKER_MANAGED_STATE" \
+      != "$legacy_partial_marker_state" \
+    || -n "$VP_WORKER_REDIS_MARKER_PRIOR_GENERATION" \
+    || -n "$VP_WORKER_REDIS_MARKER_PRIOR_IMAGE" ]]; then
+    echo 'FAIL: legacy partial forward crash lost its captured marker baseline' >&2
+    exit 1
+  fi
   vp_worker_admission_recovery_state() {
     command cat "$recovery_state"
   }
