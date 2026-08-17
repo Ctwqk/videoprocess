@@ -10847,7 +10847,7 @@ vp_wait_vision_cutover_job() {
     [[ -z "$extra" && "$task_id" =~ ^[a-z0-9]{12,64}$ ]] \
       || return 1
     case "$desired_state|$current_state" in
-      Shutdown\|Complete*)
+      Complete\|Complete*|Shutdown\|Complete*)
         local exit_code
         exit_code="$(
           docker inspect "$task_id" \
@@ -10858,6 +10858,7 @@ vp_wait_vision_cutover_job() {
         docker service logs "$service_id" >/dev/null 2>&1 || return 1
         return "$exit_code"
         ;;
+      Complete\|Failed*|Complete\|Rejected*|Complete\|Shutdown*|\
       Shutdown\|Failed*|Shutdown\|Rejected*|Shutdown\|Shutdown*)
         docker service logs "$service_id" >/dev/null 2>&1 || true
         return 1

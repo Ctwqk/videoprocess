@@ -5270,6 +5270,8 @@ assert_channelops_runner_identity_reconciliation converged 1
     >"$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
   chmod 0400 "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
   VISION_JOB_EXIT=0
+  VISION_JOB_DESIRED_STATE=Complete
+  VISION_JOB_CURRENT_STATE='Complete 1 second ago'
   VISION_JOURNAL_MODE=
   VISION_JOURNAL_STATE=
   VISION_JOURNAL_SERVICE_ID=-
@@ -5411,8 +5413,9 @@ assert_channelops_runner_identity_reconciliation converged 1
       return
     fi
     if [[ "${1:-} ${2:-}" == 'service ps' ]]; then
-      printf '%s|Shutdown|Complete 1 second ago\n' \
-        eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+      printf '%s|%s|%s\n' \
+        eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+        "$VISION_JOB_DESIRED_STATE" "$VISION_JOB_CURRENT_STATE"
       return
     fi
     if [[ "${1:-}" == inspect \
@@ -5469,6 +5472,17 @@ assert_channelops_runner_identity_reconciliation converged 1
     'docker|service rm dddddddddddddddddddddddddddddddd'; do
     grep -Fq "$immutable_call" "$vision_calls"
   done
+
+  VISION_JOB_DESIRED_STATE=Shutdown
+  vp_wait_vision_cutover_job dddddddddddddddddddddddddddddddd
+  VISION_JOB_DESIRED_STATE=Complete
+  VISION_JOB_CURRENT_STATE='Failed 1 second ago'
+  if vp_wait_vision_cutover_job \
+    dddddddddddddddddddddddddddddddd >/dev/null 2>&1; then
+    echo 'FAIL: failed replicated vision job was accepted' >&2
+    exit 1
+  fi
+  VISION_JOB_CURRENT_STATE='Complete 1 second ago'
 
   : >"$vision_calls"
   rm -f "$vision_state"
