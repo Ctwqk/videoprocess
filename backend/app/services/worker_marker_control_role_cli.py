@@ -26,6 +26,7 @@ STABLE_ROLES = {
     "janitor": "vp_marker_janitor_runtime",
     "repair": "vp_marker_repair_runtime",
 }
+CONTROL_ROLE_OWNER = "vp_control_role_owner"
 ROLE_FUNCTIONS = {
     "readiness": (
         "vp_list_worker_redis_marker_expectations(text,integer)",
@@ -376,40 +377,39 @@ async def _ensure_stable_role(
     connection: asyncpg.Connection,
     role_name: str,
 ) -> None:
-    await connection.execute(
-        "SELECT pg_catalog.set_config("
-        "'vp.marker_control.role_name', $1, true)",
-        role_name,
-    )
-    await connection.execute(
-        """
-        DO $block$
-        DECLARE
-            v_role_name text := pg_catalog.current_setting(
-                'vp.marker_control.role_name'
-            );
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_roles
-                WHERE rolname = v_role_name
-            ) THEN
-                EXECUTE pg_catalog.format(
-                    'CREATE ROLE %I NOLOGIN NOINHERIT NOSUPERUSER '
-                    'NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS',
-                    v_role_name
+    existing = await _load_role_attributes(connection, role_name)
+    if existing is None:
+        await connection.execute(
+            "SELECT pg_catalog.set_config("
+            "'vp.marker_control.role_name', $1, true)",
+            role_name,
+        )
+        await connection.execute(
+            """
+            DO $block$
+            DECLARE
+                v_role_name text := pg_catalog.current_setting(
+                    'vp.marker_control.role_name'
                 );
-            ELSE
-                EXECUTE pg_catalog.format(
-                    'ALTER ROLE %I NOLOGIN NOINHERIT NOSUPERUSER '
-                    'NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS',
-                    v_role_name
-                );
-            END IF;
-        END
-        $block$
-        """
-    )
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_roles
+                    WHERE rolname = v_role_name
+                ) THEN
+                    EXECUTE pg_catalog.format(
+                        'CREATE ROLE %I NOLOGIN NOINHERIT NOSUPERUSER '
+                        'NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS',
+                        v_role_name
+                    );
+                END IF;
+            END
+            $block$
+            """
+        )
+        existing = await _load_role_attributes(connection, role_name)
+    if existing is None or not _stable_role_is_safe(existing):
+        raise MarkerControlRoleError("stable role is unsafe")
     inherited_roles = await connection.fetch(
         """
         SELECT granted.rolname
@@ -427,6 +427,138 @@ async def _ensure_stable_role(
             f"REVOKE {_quote_identifier(inherited_role['rolname'])} "
             f"FROM {_quote_identifier(role_name)}"
         )
+
+
+async def _delegate_stable_role_administration(
+    connection: asyncpg.Connection,
+) -> None:
+    owner = await _load_role_attributes(connection, CONTROL_ROLE_OWNER)
+    if owner is None or not _control_role_owner_is_safe(owner):
+        raise MarkerControlRoleError("control role owner is unsafe")
+
+    stable_role_names = sorted(STABLE_ROLES.values())
+    rows = await connection.fetch(
+        """
+        SELECT rolname, rolcanlogin, rolinherit, rolsuper, rolcreatedb,
+               rolcreaterole, rolreplication, rolbypassrls
+        FROM pg_catalog.pg_roles
+        WHERE rolname = ANY($1::text[])
+        ORDER BY rolname
+        """,
+        stable_role_names,
+    )
+    stable_roles = {row["rolname"]: row for row in rows}
+    if any(not _stable_role_is_safe(role) for role in stable_roles.values()):
+        raise MarkerControlRoleError("stable role is unsafe")
+
+    for role_name in sorted(stable_roles):
+        await connection.execute(
+            f"GRANT {_quote_identifier(role_name)} "
+            f"TO {_quote_identifier(CONTROL_ROLE_OWNER)} "
+            "WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"
+        )
+
+    memberships = await connection.fetch(
+        """
+        SELECT granted.rolname AS granted, member.rolname AS member,
+               membership.admin_option, membership.inherit_option,
+               membership.set_option
+        FROM pg_catalog.pg_auth_members AS membership
+        JOIN pg_catalog.pg_roles AS granted
+          ON granted.oid = membership.roleid
+        JOIN pg_catalog.pg_roles AS member
+          ON member.oid = membership.member
+        WHERE granted.rolname = ANY($1::text[])
+          AND member.rolname = $2
+        ORDER BY granted.rolname
+        """,
+        sorted(stable_roles),
+        CONTROL_ROLE_OWNER,
+    )
+    delegated: dict[str, list[asyncpg.Record]] = {}
+    for membership in memberships:
+        delegated.setdefault(membership["granted"], []).append(membership)
+    if any(
+        role_name not in delegated
+        or not any(
+            grant["admin_option"] is True for grant in delegated[role_name]
+        )
+        or any(
+            grant["member"] != CONTROL_ROLE_OWNER
+            or grant["inherit_option"] is not False
+            or grant["set_option"] is not False
+            for grant in delegated[role_name]
+        )
+        for role_name in stable_roles
+    ):
+        raise MarkerControlRoleError("stable role administration is invalid")
+
+    effective_memberships = await connection.fetch(
+        """
+        SELECT granted.rolname AS granted,
+               pg_catalog.pg_has_role(
+                   $2::name, granted.oid, 'MEMBER'
+               ) AS is_member,
+               pg_catalog.pg_has_role(
+                   $2::name, granted.oid, 'USAGE'
+               ) AS has_usage,
+               pg_catalog.pg_has_role(
+                   $2::name, granted.oid, 'SET'
+               ) AS can_set
+        FROM pg_catalog.pg_roles AS granted
+        WHERE granted.rolname = ANY($1::text[])
+        ORDER BY granted.rolname
+        """,
+        sorted(stable_roles),
+        CONTROL_ROLE_OWNER,
+    )
+    effective = {row["granted"]: row for row in effective_memberships}
+    if any(
+        role_name not in effective
+        or effective[role_name]["is_member"] is not True
+        or effective[role_name]["has_usage"] is not False
+        or effective[role_name]["can_set"] is not False
+        for role_name in stable_roles
+    ):
+        raise MarkerControlRoleError("stable role effective access is invalid")
+
+
+async def _load_role_attributes(
+    connection: asyncpg.Connection,
+    role_name: str,
+) -> asyncpg.Record | Mapping[str, object] | None:
+    return await connection.fetchrow(
+        """
+        SELECT rolname, rolcanlogin, rolinherit, rolsuper, rolcreatedb,
+               rolcreaterole, rolreplication, rolbypassrls
+        FROM pg_catalog.pg_roles
+        WHERE rolname = $1
+        """,
+        role_name,
+    )
+
+
+def _stable_role_is_safe(role: Mapping[str, object]) -> bool:
+    return (
+        role["rolcanlogin"] is False
+        and role["rolinherit"] is False
+        and role["rolsuper"] is False
+        and role["rolcreatedb"] is False
+        and role["rolcreaterole"] is False
+        and role["rolreplication"] is False
+        and role["rolbypassrls"] is False
+    )
+
+
+def _control_role_owner_is_safe(role: Mapping[str, object]) -> bool:
+    return (
+        role["rolcanlogin"] is True
+        and role["rolsuper"] is False
+        and role["rolcreatedb"] is False
+        and role["rolcreaterole"] is True
+        and role["rolreplication"] is False
+        and role["rolbypassrls"] is False
+    )
 
 
 async def _create_login_role(

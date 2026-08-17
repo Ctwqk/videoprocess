@@ -189,6 +189,373 @@ def test_credential_paths_are_generation_scoped_and_independent(
     assert len(set(paths.values())) == 3
 
 
+@pytest.mark.asyncio
+async def test_existing_safe_stable_role_does_not_require_admin_option() -> None:
+    module = _module()
+
+    class Postgres16Connection:
+        async def fetchrow(self, _query: str, role_name: str):
+            return {
+                "rolname": role_name,
+                "rolcanlogin": False,
+                "rolinherit": False,
+                "rolsuper": False,
+                "rolcreatedb": False,
+                "rolcreaterole": False,
+                "rolreplication": False,
+                "rolbypassrls": False,
+            }
+
+        async def execute(self, query: str, *_args):
+            if "ALTER ROLE" in query:
+                raise module.asyncpg.InsufficientPrivilegeError(
+                    "must have admin option on role"
+                )
+            return "SELECT 1"
+
+        async def fetch(self, _query: str, _role_name: str):
+            return []
+
+    await module._ensure_stable_role(
+        Postgres16Connection(),
+        "vp_marker_readiness_runtime",
+    )
+
+
+@pytest.mark.asyncio
+async def test_existing_unsafe_stable_role_fails_closed() -> None:
+    module = _module()
+
+    class UnsafeRoleConnection:
+        async def fetchrow(self, _query: str, role_name: str):
+            return {
+                "rolname": role_name,
+                "rolcanlogin": True,
+                "rolinherit": False,
+                "rolsuper": False,
+                "rolcreatedb": False,
+                "rolcreaterole": False,
+                "rolreplication": False,
+                "rolbypassrls": False,
+            }
+
+        async def execute(self, _query: str, *_args):
+            raise AssertionError("unsafe role must not be changed")
+
+        async def fetch(self, _query: str, _role_name: str):
+            return []
+
+    with pytest.raises(module.MarkerControlRoleError):
+        await module._ensure_stable_role(
+            UnsafeRoleConnection(),
+            "vp_marker_readiness_runtime",
+        )
+
+
+@pytest.mark.asyncio
+async def test_deploy_migrator_delegates_only_marker_role_administration() -> None:
+    module = _module()
+
+    class Postgres16Connection:
+        def __init__(self) -> None:
+            self.memberships: dict[tuple[str, str], dict[str, bool]] = {}
+
+        async def fetchrow(self, _query: str, role_name: str):
+            if role_name == "vp_control_role_owner":
+                return {
+                    "rolname": role_name,
+                    "rolcanlogin": True,
+                    "rolinherit": True,
+                    "rolsuper": False,
+                    "rolcreatedb": False,
+                    "rolcreaterole": True,
+                    "rolreplication": False,
+                    "rolbypassrls": False,
+                }
+            raise AssertionError(f"unexpected role lookup: {role_name}")
+
+        async def fetch(
+            self,
+            query: str,
+            role_names: list[str],
+            *_arguments,
+        ):
+            if "pg_catalog.pg_has_role" in query:
+                return [
+                    {
+                        "granted": role_name,
+                        "is_member": True,
+                        "has_usage": False,
+                        "can_set": False,
+                    }
+                    for role_name in role_names
+                ]
+            if "FROM pg_catalog.pg_roles" in query:
+                return [
+                    {
+                        "rolname": role_name,
+                        "rolcanlogin": False,
+                        "rolinherit": False,
+                        "rolsuper": False,
+                        "rolcreatedb": False,
+                        "rolcreaterole": False,
+                        "rolreplication": False,
+                        "rolbypassrls": False,
+                    }
+                    for role_name in role_names
+                ]
+            if "FROM pg_catalog.pg_auth_members" in query:
+                return [
+                    {
+                        "granted": granted,
+                        "member": member,
+                        **options,
+                    }
+                    for (granted, member), options in self.memberships.items()
+                ]
+            raise AssertionError("unexpected database query")
+
+        async def execute(self, query: str):
+            prefix = 'GRANT "'
+            separator = '" TO "'
+            suffix = '" WITH ADMIN TRUE, INHERIT FALSE, SET FALSE'
+            if not query.startswith(prefix) or not query.endswith(suffix):
+                raise AssertionError(f"unexpected database command: {query}")
+            granted, member = query[len(prefix) : -len(suffix)].split(
+                separator,
+                1,
+            )
+            self.memberships[(granted, member)] = {
+                "admin_option": True,
+                "inherit_option": False,
+                "set_option": False,
+            }
+            return "GRANT ROLE"
+
+    connection = Postgres16Connection()
+
+    await module._delegate_stable_role_administration(connection)
+
+    assert connection.memberships == {
+        (
+            "vp_marker_janitor_runtime",
+            "vp_control_role_owner",
+        ): {
+            "admin_option": True,
+            "inherit_option": False,
+            "set_option": False,
+        },
+        (
+            "vp_marker_readiness_runtime",
+            "vp_control_role_owner",
+        ): {
+            "admin_option": True,
+            "inherit_option": False,
+            "set_option": False,
+        },
+        (
+            "vp_marker_repair_runtime",
+            "vp_control_role_owner",
+        ): {
+            "admin_option": True,
+            "inherit_option": False,
+            "set_option": False,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_delegation_rejects_unsafe_stable_role_before_grant() -> None:
+    module = _module()
+
+    class UnsafeRoleConnection:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        async def fetchrow(self, _query: str, role_name: str):
+            return {
+                "rolname": role_name,
+                "rolcanlogin": True,
+                "rolinherit": True,
+                "rolsuper": False,
+                "rolcreatedb": False,
+                "rolcreaterole": True,
+                "rolreplication": False,
+                "rolbypassrls": False,
+            }
+
+        async def fetch(
+            self,
+            query: str,
+            role_names: list[str],
+            *_arguments,
+        ):
+            if "FROM pg_catalog.pg_roles" in query:
+                return [
+                    {
+                        "rolname": role_names[0],
+                        "rolcanlogin": True,
+                        "rolinherit": False,
+                        "rolsuper": False,
+                        "rolcreatedb": False,
+                        "rolcreaterole": False,
+                        "rolreplication": False,
+                        "rolbypassrls": False,
+                    }
+                ]
+            return []
+
+        async def execute(self, query: str):
+            self.commands.append(query)
+            return "GRANT ROLE"
+
+    connection = UnsafeRoleConnection()
+
+    with pytest.raises(module.MarkerControlRoleError):
+        await module._delegate_stable_role_administration(connection)
+
+    assert connection.commands == []
+
+
+@pytest.mark.asyncio
+async def test_delegation_rejects_inheritable_grant_from_another_grantor() -> None:
+    module = _module()
+
+    class ConflictingGrantConnection:
+        async def fetchrow(self, _query: str, role_name: str):
+            return {
+                "rolname": role_name,
+                "rolcanlogin": True,
+                "rolinherit": True,
+                "rolsuper": False,
+                "rolcreatedb": False,
+                "rolcreaterole": True,
+                "rolreplication": False,
+                "rolbypassrls": False,
+            }
+
+        async def fetch(
+            self,
+            query: str,
+            role_names: list[str],
+            *_arguments,
+        ):
+            role_name = role_names[0]
+            if "pg_catalog.pg_has_role" in query:
+                return [
+                    {
+                        "granted": role_name,
+                        "is_member": True,
+                        "has_usage": True,
+                        "can_set": False,
+                    }
+                ]
+            if "FROM pg_catalog.pg_roles" in query:
+                return [
+                    {
+                        "rolname": role_name,
+                        "rolcanlogin": False,
+                        "rolinherit": False,
+                        "rolsuper": False,
+                        "rolcreatedb": False,
+                        "rolcreaterole": False,
+                        "rolreplication": False,
+                        "rolbypassrls": False,
+                    }
+                ]
+            return [
+                {
+                    "granted": role_name,
+                    "member": "vp_control_role_owner",
+                    "admin_option": False,
+                    "inherit_option": True,
+                    "set_option": True,
+                },
+                {
+                    "granted": role_name,
+                    "member": "vp_control_role_owner",
+                    "admin_option": True,
+                    "inherit_option": False,
+                    "set_option": False,
+                },
+            ]
+
+        async def execute(self, _query: str):
+            return "GRANT ROLE"
+
+    with pytest.raises(module.MarkerControlRoleError):
+        await module._delegate_stable_role_administration(
+            ConflictingGrantConnection()
+        )
+
+
+@pytest.mark.asyncio
+async def test_delegation_rejects_effective_inheritance_through_role_chain() -> None:
+    module = _module()
+
+    class IndirectGrantConnection:
+        async def fetchrow(self, _query: str, role_name: str):
+            return {
+                "rolname": role_name,
+                "rolcanlogin": True,
+                "rolinherit": True,
+                "rolsuper": False,
+                "rolcreatedb": False,
+                "rolcreaterole": True,
+                "rolreplication": False,
+                "rolbypassrls": False,
+            }
+
+        async def fetch(
+            self,
+            query: str,
+            role_names: list[str],
+            *_arguments,
+        ):
+            role_name = role_names[0]
+            if "pg_catalog.pg_has_role" in query:
+                return [
+                    {
+                        "granted": role_name,
+                        "is_member": True,
+                        "has_usage": True,
+                        "can_set": False,
+                    }
+                ]
+            if "FROM pg_catalog.pg_roles" in query:
+                return [
+                    {
+                        "rolname": role_name,
+                        "rolcanlogin": False,
+                        "rolinherit": False,
+                        "rolsuper": False,
+                        "rolcreatedb": False,
+                        "rolcreaterole": False,
+                        "rolreplication": False,
+                        "rolbypassrls": False,
+                    }
+                ]
+            if "FROM pg_catalog.pg_auth_members" in query:
+                return [
+                    {
+                        "granted": role_name,
+                        "member": "vp_control_role_owner",
+                        "admin_option": True,
+                        "inherit_option": False,
+                        "set_option": False,
+                    }
+                ]
+            raise AssertionError("unexpected database query")
+
+        async def execute(self, _query: str):
+            return "GRANT ROLE"
+
+    with pytest.raises(module.MarkerControlRoleError):
+        await module._delegate_stable_role_administration(
+            IndirectGrantConnection()
+        )
+
+
 def test_owner_url_file_mode_is_revalidated_after_open(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 import asyncpg
 import pytest
 import pytest_asyncio
+from sqlalchemy.engine import make_url
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -2715,6 +2716,196 @@ async def test_postgres_16_worker_redis_marker_lifecycle_is_fail_closed(
                 worker_role,
                 ORCHESTRATOR_CONTROL_ROLE,
                 *STABLE_ROLES.values(),
+            ):
+                with suppress(asyncpg.PostgresError):
+                    await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres16_marker_role_setup_retries_after_delegation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    identity = uuid.uuid4().hex[:12]
+    database = f"vp_marker_delegate_{identity}"
+    deploy_migrator = f"vp_mkr_migrator_{identity}"
+    control_owner = f"vp_mkr_owner_{identity}"
+    stable_roles = {
+        "readiness": f"vp_mkr_readiness_{identity}",
+        "janitor": f"vp_mkr_janitor_{identity}",
+        "repair": f"vp_mkr_repair_{identity}",
+    }
+    generation = f"marker-delegate-{identity}"
+    deploy_password = uuid.uuid4().hex
+    owner_password = uuid.uuid4().hex
+    admin_url = _database_url("postgres")
+    target_admin_url = _database_url(database)
+    versioned_roles: tuple[str, ...] = ()
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(
+            f'CREATE ROLE "{deploy_migrator}" LOGIN INHERIT '
+            "NOSUPERUSER NOCREATEDB CREATEROLE NOREPLICATION "
+            f"NOBYPASSRLS PASSWORD '{deploy_password}'"
+        )
+        await admin.execute(
+            f'CREATE ROLE "{control_owner}" LOGIN INHERIT '
+            "NOSUPERUSER NOCREATEDB CREATEROLE NOREPLICATION "
+            f"NOBYPASSRLS PASSWORD '{owner_password}'"
+        )
+        await admin.execute(
+            f'CREATE DATABASE "{database}" OWNER "{control_owner}"'
+        )
+        for stable_role in stable_roles.values():
+            await admin.execute(
+                f'CREATE ROLE "{stable_role}" NOLOGIN NOINHERIT '
+                "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION "
+                "NOBYPASSRLS"
+            )
+            await admin.execute(
+                f'GRANT "{stable_role}" TO "{deploy_migrator}" '
+                "WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"
+            )
+    finally:
+        await admin.close()
+
+    try:
+        marker_module = importlib.import_module(
+            "app.services.worker_marker_control_role_cli"
+        )
+        deployment_module = importlib.import_module(
+            "app.services.worker_deployment_cli"
+        )
+        monkeypatch.setattr(marker_module, "STABLE_ROLES", stable_roles)
+        monkeypatch.setattr(
+            marker_module,
+            "CONTROL_ROLE_OWNER",
+            control_owner,
+        )
+        monkeypatch.setattr(
+            marker_module,
+            "ROLE_FUNCTIONS",
+            {purpose: () for purpose in stable_roles},
+        )
+        monkeypatch.setattr(marker_module, "MARKER_TABLES", ())
+        names = marker_module.role_names_for_generation(generation)
+        versioned_roles = tuple(names.versioned.values())
+
+        owner_url = make_url(target_admin_url).set(
+            username=control_owner,
+            password=owner_password,
+        ).render_as_string(hide_password=False)
+        deploy_url = make_url(target_admin_url).set(
+            username=deploy_migrator,
+            password=deploy_password,
+        ).render_as_string(hide_password=False)
+        owner_url_file = tmp_path / "control-owner-url"
+        owner_url_file.write_text(f"{owner_url}\n", encoding="utf-8")
+        owner_url_file.chmod(0o400)
+        monkeypatch.setenv(
+            marker_module.OWNER_URL_FILE_ENV,
+            str(owner_url_file),
+        )
+        state_dir = tmp_path / "marker-state"
+        arguments = [
+            "provision",
+            "--generation",
+            generation,
+            "--state-dir",
+            str(state_dir),
+        ]
+
+        assert await marker_module.run(arguments) == 4
+        failed = json.loads(capsys.readouterr().out)
+        assert failed == {
+            "reason_code": "marker_control_operation_failed",
+            "stage": "role_setup",
+            "status": "error",
+        }
+        assert not (state_dir / generation).exists()
+
+        await deployment_module._delegate_marker_control_authority(deploy_url)
+        await deployment_module._delegate_marker_control_authority(deploy_url)
+
+        assert await marker_module.run(arguments) == 0
+        provisioned = json.loads(capsys.readouterr().out)
+        assert provisioned == {
+            "reason_code": "marker_control_roles_provisioned",
+            "roles": dict(names.versioned),
+            "status": "ok",
+        }
+
+        proof = await asyncpg.connect(_asyncpg_url(target_admin_url))
+        try:
+            memberships = await proof.fetch(
+                """
+                SELECT granted.rolname AS granted,
+                       membership.admin_option,
+                       membership.inherit_option,
+                       membership.set_option,
+                       pg_catalog.pg_has_role(
+                           $2::name, granted.oid, 'MEMBER'
+                       ) AS is_member,
+                       pg_catalog.pg_has_role(
+                           $2::name, granted.oid, 'USAGE'
+                       ) AS has_usage,
+                       pg_catalog.pg_has_role(
+                           $2::name, granted.oid, 'SET'
+                       ) AS can_set
+                FROM pg_catalog.pg_auth_members AS membership
+                JOIN pg_catalog.pg_roles AS granted
+                  ON granted.oid = membership.roleid
+                JOIN pg_catalog.pg_roles AS member
+                  ON member.oid = membership.member
+                WHERE granted.rolname = ANY($1::text[])
+                  AND member.rolname = $2
+                ORDER BY granted.rolname
+                """,
+                sorted(stable_roles.values()),
+                control_owner,
+            )
+            assert len(memberships) == 3
+            assert all(
+                row["admin_option"]
+                and not row["inherit_option"]
+                and not row["set_option"]
+                and row["is_member"]
+                and not row["has_usage"]
+                and not row["can_set"]
+                for row in memberships
+            )
+        finally:
+            await proof.close()
+
+        assert await marker_module.run(
+            [
+                "revoke",
+                "--generation",
+                generation,
+                "--state-dir",
+                str(state_dir),
+            ]
+        ) == 0
+        capsys.readouterr()
+    finally:
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            for role_name in (
+                *versioned_roles,
+                control_owner,
+                deploy_migrator,
+                *stable_roles.values(),
             ):
                 with suppress(asyncpg.PostgresError):
                     await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')

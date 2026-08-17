@@ -15,11 +15,13 @@ import asyncpg  # type: ignore[import-untyped]
 from alembic import command
 from alembic.config import Config
 
+from app.services import worker_marker_control_role_cli as marker_control_cli
 from app.services import worker_registration as registration_contract
 from app.services import worker_registration_operator_cli as operator_cli
 from app.services import worker_runtime_role_cli as runtime_cli
 from app.services.worker_role_cli_common import (
     WorkerRoleCommonError,
+    acquire_database_acl_dcl_lock,
     asyncpg_url,
     load_database_url_file,
     read_secure_file,
@@ -362,6 +364,19 @@ def _upgrade_database(database_url: str) -> None:
         contextlib.redirect_stderr(io.StringIO()),
     ):
         command.upgrade(config, EXPECTED_MIGRATION_HEAD)
+    asyncio.run(_delegate_marker_control_authority(database_url))
+
+
+async def _delegate_marker_control_authority(database_url: str) -> None:
+    connection = await asyncpg.connect(asyncpg_url(database_url))
+    try:
+        await acquire_database_acl_dcl_lock(connection)
+        async with connection.transaction():
+            await marker_control_cli._delegate_stable_role_administration(
+                connection
+            )
+    finally:
+        await connection.close()
 
 
 def _render_request(
