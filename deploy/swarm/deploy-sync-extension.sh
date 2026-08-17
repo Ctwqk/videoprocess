@@ -2413,6 +2413,14 @@ _vp_run_python_worker_container_locked() {
           && "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ \
           && "$2" != *$'\n'* && "$2" != *$'\r'* \
           && "$2" != VP_PYTHON_WORKER_* ]] || return 1
+        local environment_name="${2%%=*}"
+        case "$environment_name" in
+          BASH_ENV|ENV|SHELLOPTS|BASHOPTS|BASH_FUNC_*|\
+          CDPATH|GLOBIGNORE|PS4|BASH_XTRACEFD|\
+          LD_*|GCONV_PATH|GLIBC_TUNABLES|LOCPATH|NLSPATH|MALLOC_*)
+            return 1
+            ;;
+        esac
         passthrough_args+=("$1" "$2")
         shift 2
         ;;
@@ -2603,17 +2611,17 @@ _vp_run_python_worker_container_locked() {
     --env "VP_PYTHON_WORKER_STDIN_TARGETS=$payload_manifest" \
     --env "VP_PYTHON_WORKER_BIND_SENTINELS=$bind_manifest" \
     "$image"
-    -ceu
+    -pceu
     '
       runtime_uid="${VP_PYTHON_WORKER_CALLER_UID:?}"
       runtime_gid="${VP_PYTHON_WORKER_CALLER_GID:?}"
       [[ "$runtime_uid" =~ ^[0-9]+$ && "$runtime_gid" =~ ^[0-9]+$ ]]
-      [[ "$(id -u)" == 0 && "$(id -g)" == 0 ]]
+      [[ "$(/usr/bin/id -u)" == 0 && "$(/usr/bin/id -g)" == 0 ]]
       umask 077
       export HOME=/tmp/vp-python-worker-home
-      mkdir -p "$HOME"
-      chmod 0700 "$HOME"
-      chown "$runtime_uid:$runtime_gid" "$HOME"
+      /usr/bin/mkdir -p "$HOME"
+      /usr/bin/chmod 0700 "$HOME"
+      /usr/bin/chown "$runtime_uid:$runtime_gid" "$HOME"
 
       payload_manifest="${VP_PYTHON_WORKER_STDIN_TARGETS:-}"
       if [[ -n "$payload_manifest" ]]; then
@@ -2746,26 +2754,7 @@ except Exception:
 '"'"' "$runtime_uid" "$runtime_gid" "$payload_manifest"
       fi
 
-      while IFS="|" read -r path sentinel marker extra; do
-        [[ -n "$path" || -n "$sentinel" || -n "$marker" || -n "$extra" ]] \
-          || continue
-        [[ -z "$extra" ]]
-        case "$path" in
-          /control-state|/runtime-state|/requests) ;;
-          *) exit 1 ;;
-        esac
-        [[ "$sentinel" =~ ^\.vp-python-worker-bind-[0-9a-f]{32}$ ]]
-        [[ -d "$path" && ! -L "$path" ]]
-        [[ "$(stat -c "%a" "$path")" == 700 ]]
-        [[ -f "$path/$sentinel" && ! -L "$path/$sentinel" ]]
-        sentinel_identity="$(
-          stat -c "%u:%g:%a:%h" "$path/$sentinel"
-        )"
-        [[ "$sentinel_identity" == "$runtime_uid:$runtime_gid:400:1" \
-          || "$sentinel_identity" == 0:0:400:1 ]]
-        [[ "$(<"$path/$sentinel")" == "$marker" ]]
-      done <<<"${VP_PYTHON_WORKER_BIND_SENTINELS:-}"
-
+      bind_manifest="${VP_PYTHON_WORKER_BIND_SENTINELS:-}"
       unset \
         VP_PYTHON_WORKER_SECRET_TARGET \
         VP_PYTHON_WORKER_CALLER_UID \
@@ -2780,7 +2769,159 @@ except Exception:
         --ambient-caps=-all \
         --bounding-set=-all \
         --no-new-privs \
-        -- "$@"
+        -- /opt/venv/bin/python -I -c '"'"'
+# VP_PYTHON_WORKER_RUNTIME_GUARD_BEGIN
+import os
+import re
+import stat
+import sys
+
+ALLOWED_BIND_PATHS = frozenset(("/control-state", "/runtime-state", "/requests"))
+
+
+def fail():
+    raise RuntimeError("python worker runtime bind validation failed")
+
+
+def identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def read_limited(descriptor, limit):
+    payload = bytearray()
+    while True:
+        chunk = os.read(descriptor, min(65536, limit + 1 - len(payload)))
+        if not chunk:
+            return bytes(payload)
+        payload.extend(chunk)
+        if len(payload) > limit:
+            fail()
+
+
+def verify_binding(path, sentinel_name, marker, uid, gid):
+    if path not in ALLOWED_BIND_PATHS:
+        fail()
+    sentinel_match = re.fullmatch(
+        r"\.vp-python-worker-bind-([0-9a-f]{32})",
+        sentinel_name,
+    )
+    if sentinel_match is None:
+        fail()
+    expected_marker = re.fullmatch(
+        rf"vp-python-worker-bind-v2:op\.[0-9a-f]{{32}}:"
+        rf"{sentinel_match.group(1)}:{uid}:{gid}:{re.escape(path)}",
+        marker,
+    )
+    if expected_marker is None:
+        fail()
+
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory = os.open(path, directory_flags)
+    try:
+        directory_metadata = os.fstat(directory)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
+            fail()
+        sentinel_flags = (
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        sentinel = os.open(
+            sentinel_name,
+            sentinel_flags,
+            dir_fd=directory,
+        )
+        try:
+            opened = os.fstat(sentinel)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_uid, opened.st_gid)
+                not in {(uid, gid), (0, 0)}
+                or stat.S_IMODE(opened.st_mode) != 0o400
+                or opened.st_nlink != 1
+            ):
+                fail()
+            payload = read_limited(sentinel, 1024)
+            if identity(opened) != identity(os.fstat(sentinel)):
+                fail()
+            current = os.stat(
+                sentinel_name,
+                dir_fd=directory,
+                follow_symlinks=False,
+            )
+            if identity(opened) != identity(current):
+                fail()
+            try:
+                expected = marker.encode("ascii")
+            except UnicodeEncodeError:
+                fail()
+            if payload != expected:
+                fail()
+        finally:
+            os.close(sentinel)
+    finally:
+        os.close(directory)
+
+
+try:
+    runtime_uid = int(sys.argv[1])
+    runtime_gid = int(sys.argv[2])
+    bind_manifest = sys.argv[3]
+    command = sys.argv[4:]
+    if (
+        runtime_uid < 0
+        or runtime_gid < 0
+        or os.getuid() != runtime_uid
+        or os.getgid() != runtime_gid
+        or not command
+        or len(bind_manifest.encode("utf-8")) > 4096
+    ):
+        fail()
+    lines = bind_manifest.split("\n") if bind_manifest else []
+    if len(lines) > 3:
+        fail()
+    seen_paths = set()
+    for line in lines:
+        if not line or "\r" in line:
+            fail()
+        fields = line.split("|")
+        if len(fields) != 3 or not all(fields):
+            fail()
+        path, sentinel_name, marker = fields
+        if path in seen_paths:
+            fail()
+        verify_binding(
+            path,
+            sentinel_name,
+            marker,
+            runtime_uid,
+            runtime_gid,
+        )
+        seen_paths.add(path)
+    os.execvp(command[0], command)
+except Exception:
+    sys.exit(1)
+# VP_PYTHON_WORKER_RUNTIME_GUARD_END
+'"'"' \
+        "$runtime_uid" "$runtime_gid" "$bind_manifest" "$@"
     '
     vp-python-worker-bootstrap
     "${command[@]}"

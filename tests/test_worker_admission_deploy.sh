@@ -51,6 +51,145 @@ if grep -Eq 'chown[[:space:]]+-R' "$EXTENSION"; then
   exit 1
 fi
 
+runtime_guard_root="$TEST_ROOT/runtime-bind-guard"
+runtime_guard_source="$runtime_guard_root/runtime_guard.py"
+mkdir -p "$runtime_guard_root"
+chmod 0700 "$runtime_guard_root"
+python3 - "$EXTENSION" "$runtime_guard_source" "$runtime_guard_root" <<'PY'
+import pathlib
+import sys
+
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = source.index("  local docker_command=(")
+end = source.index("\n    vp-python-worker-bootstrap", start)
+bootstrap = source[start:end]
+privilege_drop = bootstrap.index("exec /usr/bin/setpriv")
+runtime_guard_launch = bootstrap.index("/opt/venv/bin/python -I -c", privilege_drop)
+if "\n    -pceu\n" not in bootstrap:
+    raise SystemExit(
+        "FAIL: Python worker root bootstrap does not ignore Bash startup environments"
+    )
+if runtime_guard_launch < privilege_drop:
+    raise SystemExit(
+        "FAIL: Python worker bootstrap launches its bind guard before "
+        "dropping to the caller identity"
+    )
+if "DAC_OVERRIDE" in bootstrap:
+    raise SystemExit(
+        "FAIL: Python worker bootstrap retained DAC_OVERRIDE to read bind sentinels"
+    )
+if "/bin/bash -ceu" in bootstrap[privilege_drop:]:
+    raise SystemExit(
+        "FAIL: Python worker runtime bind guard can load caller-controlled Bash startup files"
+    )
+
+begin = "# VP_PYTHON_WORKER_RUNTIME_GUARD_BEGIN\n"
+end = "# VP_PYTHON_WORKER_RUNTIME_GUARD_END"
+if source.count(begin) != 1 or source.count(end) != 1:
+    raise SystemExit("FAIL: Python worker runtime bind guard source is not extractable")
+guard = source.split(begin, 1)[1].split(end, 1)[0]
+allowed = (
+    'ALLOWED_BIND_PATHS = frozenset('
+    '("/control-state", "/runtime-state", "/requests")'
+    ')'
+)
+if guard.count(allowed) != 1:
+    raise SystemExit("FAIL: Python worker runtime bind guard path contract changed")
+guard = guard.replace(
+    allowed,
+    f"ALLOWED_BIND_PATHS = frozenset(({sys.argv[3]!r},))",
+)
+pathlib.Path(sys.argv[2]).write_text(guard, encoding="utf-8")
+PY
+
+runtime_uid="$(id -u)"
+runtime_gid="$(id -g)"
+runtime_token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+runtime_operation=op.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+runtime_sentinel=".vp-python-worker-bind-$runtime_token"
+runtime_marker="vp-python-worker-bind-v2:$runtime_operation:$runtime_token:$runtime_uid:$runtime_gid:$runtime_guard_root"
+runtime_manifest="$runtime_guard_root|$runtime_sentinel|$runtime_marker"
+printf '%s' "$runtime_marker" >"$runtime_guard_root/$runtime_sentinel"
+chmod 0400 "$runtime_guard_root/$runtime_sentinel"
+runtime_bash_env="$runtime_guard_root/bash-env"
+runtime_bash_env_ran="$runtime_guard_root/bash-env-ran"
+printf 'touch %q\n' "$runtime_bash_env_ran" >"$runtime_bash_env"
+chmod 0600 "$runtime_bash_env"
+runtime_success="$runtime_guard_root/success"
+if ! BASH_ENV="$runtime_bash_env" python3 -I -c \
+  "$(<"$runtime_guard_source")" \
+  "$runtime_uid" "$runtime_gid" "$runtime_manifest" \
+  /usr/bin/touch "$runtime_success"; then
+  echo 'FAIL: exact Python worker runtime bind sentinel was rejected' >&2
+  exit 1
+fi
+if [[ ! -f "$runtime_success" || -e "$runtime_bash_env_ran" ]]; then
+  echo 'FAIL: Python worker runtime bind guard ran a Bash startup hook' >&2
+  exit 1
+fi
+
+runtime_outer_bash_env_ran="$runtime_guard_root/outer-bash-env-ran"
+printf 'touch %q\n' "$runtime_outer_bash_env_ran" >"$runtime_bash_env"
+if ! BASH_ENV="$runtime_bash_env" /bin/bash -pceu 'true' \
+  || [[ -e "$runtime_outer_bash_env_ran" ]]; then
+  echo 'FAIL: privileged Python worker bootstrap loaded BASH_ENV' >&2
+  exit 1
+fi
+
+chmod 0600 "$runtime_guard_root/$runtime_sentinel"
+printf '\n' >>"$runtime_guard_root/$runtime_sentinel"
+chmod 0400 "$runtime_guard_root/$runtime_sentinel"
+runtime_newline_target="$runtime_guard_root/newline-target"
+if python3 -I -c "$(<"$runtime_guard_source")" \
+  "$runtime_uid" "$runtime_gid" "$runtime_manifest" \
+  /usr/bin/touch "$runtime_newline_target" >/dev/null 2>&1 \
+  || [[ -e "$runtime_newline_target" ]]; then
+  echo 'FAIL: Python worker runtime bind guard accepted a trailing newline' >&2
+  exit 1
+fi
+
+rm "$runtime_guard_root/$runtime_sentinel"
+printf '%s' "$runtime_marker" >"$runtime_guard_root/symlink-target"
+chmod 0400 "$runtime_guard_root/symlink-target"
+ln -s "$runtime_guard_root/symlink-target" \
+  "$runtime_guard_root/$runtime_sentinel"
+runtime_symlink_target="$runtime_guard_root/symlink-command-target"
+if python3 -I -c "$(<"$runtime_guard_source")" \
+  "$runtime_uid" "$runtime_gid" "$runtime_manifest" \
+  /usr/bin/touch "$runtime_symlink_target" >/dev/null 2>&1 \
+  || [[ -e "$runtime_symlink_target" ]]; then
+  echo 'FAIL: Python worker runtime bind guard accepted a symlink sentinel' >&2
+  exit 1
+fi
+
+unsafe_bootstrap_calls="$runtime_guard_root/unsafe-bootstrap-calls"
+: >"$unsafe_bootstrap_calls"
+docker() {
+  printf 'docker|%s\n' "$*" >>"$unsafe_bootstrap_calls"
+  return 1
+}
+for unsafe_environment in \
+  "BASH_ENV=$runtime_bash_env" \
+  "ENV=$runtime_bash_env" \
+  'SHELLOPTS=xtrace' \
+  'BASHOPTS=extdebug' \
+  "LD_PRELOAD=$runtime_guard_root/preload.so" \
+  "GCONV_PATH=$runtime_guard_root"; do
+  if vp_run_python_worker_container \
+    synthetic-image - - - \
+    --env "$unsafe_environment" \
+    -- /bin/true >/dev/null 2>&1; then
+    echo "FAIL: unsafe bootstrap environment was accepted: ${unsafe_environment%%=*}" >&2
+    exit 1
+  fi
+done
+unset -f docker
+if [[ -s "$unsafe_bootstrap_calls" ]]; then
+  echo 'FAIL: unsafe bootstrap environment reached Docker' >&2
+  exit 1
+fi
+
 (
   selection_root="$TEST_ROOT/selection-journal"
   selection_helper="$VP_WORKER_ADMISSION_TRANSACTION_HELPER"
