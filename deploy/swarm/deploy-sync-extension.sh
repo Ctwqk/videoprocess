@@ -11716,8 +11716,13 @@ vp_build_manager_image() {
     [[ "$build_commit" =~ ^[0-9a-f]{40}$ ]] || return 1
     build_args+=(--build-arg "VP_BUILD_COMMIT=$build_commit")
   fi
-  docker build "${build_args[@]}" \
-    -f "$context_dir/$dockerfile" -t "$image" "$context_dir" >&2
+  if (( ${#build_args[@]} > 0 )); then
+    docker build "${build_args[@]}" \
+      -f "$context_dir/$dockerfile" -t "$image" "$context_dir" >&2
+  else
+    docker build \
+      -f "$context_dir/$dockerfile" -t "$image" "$context_dir" >&2
+  fi
 }
 
 vp_build_runtime_worker_image() {
@@ -11787,6 +11792,8 @@ build_vp_app_images() {
     /Users/wenjieliu/VideoProcess-app \
     backend/Dockerfile.ffmpeg-worker-go \
     "$ffmpeg_go" "$commit" || return 1
+  vp_build_manager_image "$REPO_ROOT/videoprocess/backend" \
+    Dockerfile.api "$backend" || return 1
   vp_build_manager_image "$REPO_ROOT/videoprocess/backend" \
     Dockerfile.worker "$python_worker" "$commit" || return 1
 

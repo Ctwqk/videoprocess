@@ -4271,6 +4271,7 @@ if grep -Fq \
   echo 'FAIL: versioned Go worker used the four-argument build helper' >&2
   exit 1
 fi
+grep -Fq 'docker|build -f /home/taiwei/deploy-github-sync/repos/videoprocess/backend/Dockerfile.api -t vp-backend-api:deploy-0123456789ab /home/taiwei/deploy-github-sync/repos/videoprocess/backend' "$CALLS"
 grep -Fq 'docker|build --build-arg VP_BUILD_COMMIT=0123456789abcdef0123456789abcdef01234567 -f /home/taiwei/deploy-github-sync/repos/videoprocess/backend/Dockerfile.worker -t vp-ffmpeg-worker-python:deploy-0123456789ab /home/taiwei/deploy-github-sync/repos/videoprocess/backend' "$CALLS"
 if grep -Fq 'build|10.0.0.150|' "$CALLS"; then
   echo 'FAIL: manager-local images must use the manager Docker CLI directly' >&2
