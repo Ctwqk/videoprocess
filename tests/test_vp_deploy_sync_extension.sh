@@ -1436,17 +1436,25 @@ marker_owner_records="$(
     "$VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL"
 )"
 VP_WORKER_DATABASE_CREDENTIAL_RECORDS="$marker_owner_records"
+database_dcl_file="$(vp_worker_database_dcl_file)"
+if [[ ! "$database_dcl_file" -ef \
+  "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" ]]; then
+  echo 'FAIL: worker role DCL did not use the captured deploy migrator' >&2
+  exit 1
+fi
 unset VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE
 marker_owner_file="$(vp_worker_redis_marker_owner_file)"
 if [[ ! "$marker_owner_file" -ef \
-  "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE" ]]; then
-  echo 'FAIL: marker control did not reuse the captured control owner' >&2
+  "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" ]]; then
+  echo 'FAIL: marker control did not reuse the worker DCL authority' >&2
   exit 1
 fi
 VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE=\
-"$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
-if vp_worker_redis_marker_owner_file >/dev/null 2>&1; then
-  echo 'FAIL: marker control accepted an uncaptured owner override' >&2
+"$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE"
+marker_owner_file="$(vp_worker_redis_marker_owner_file)"
+if [[ ! "$marker_owner_file" -ef \
+  "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" ]]; then
+  echo 'FAIL: legacy marker override changed the worker DCL authority' >&2
   exit 1
 fi
 unset VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE

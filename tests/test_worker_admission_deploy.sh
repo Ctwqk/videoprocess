@@ -695,6 +695,7 @@ PY
   runtime_owner="$probe_root/runtime-owner"
   printf '%s\n' 'prepare-owner-credential' >"$runtime_owner"
   chmod 0400 "$runtime_owner"
+  VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="$runtime_owner"
   VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="$runtime_owner"
   VP_WORKER_ADMISSION_CANDIDATE_SERVICES=""
   PREPARE_DOCKER_CALLS="$probe_root/docker-calls"
@@ -754,6 +755,7 @@ PY
   marker_owner="$probe_root/marker-owner"
   printf '%s\n' 'marker-owner-credential' >"$marker_owner"
   chmod 0400 "$marker_owner"
+  VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="$marker_owner"
   VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE="$marker_owner"
   MARKER_REVOKE_DOCKER_CALLS="$probe_root/docker-calls"
   : >"$MARKER_REVOKE_DOCKER_CALLS"
@@ -2566,6 +2568,7 @@ assert_worker_contract \
   VP_WORKER_CONTROL_GENERATION=c-0123456789abcdef0123
   operator_file="$admission_root/control/$VP_WORKER_CONTROL_GENERATION/worker-registration-operator-database-url"
   VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="$read_file"
+  VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="$owner_file"
   VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="$owner_file"
   VP_WORKER_ADMISSION_CONTROL_IMAGE=synthetic-control-image
   VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
@@ -2945,6 +2948,10 @@ PY
       chmod 0400 "$credential"
       credentials+=("$credential")
     done
+    VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="${credentials[0]}"
+    VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="${credentials[1]}"
+    VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE="${credentials[2]}"
+    VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="${credentials[3]}"
     local credential_records
     credential_records="$(
       python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
@@ -3229,6 +3236,10 @@ PY
     chmod 0400 "$wal_credential"
     wal_credentials+=("$wal_credential")
   done
+  VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="${wal_credentials[0]}"
+  VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="${wal_credentials[1]}"
+  VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE="${wal_credentials[2]}"
+  VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="${wal_credentials[3]}"
   wal_credential_records="$(
     python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
       validate-credentials \
@@ -3479,6 +3490,7 @@ PY
   replay_control_image="vp-ffmpeg-worker-python:deploy-${replay_commit:0:12}"
   replay_runtime_service=vp-ffmpeg-worker-go-swarm
   replay_runtime_generation=902
+  replay_vision_id=9333333333333333333333333333333333333333333333333333333333333333
   replay_control_id=9111111111111111111111111111111111111111111111111111111111111111
   replay_runtime_id=9222222222222222222222222222222222222222222222222222222222222222
   replay_calls="$replay_root/replay-calls"
@@ -3514,6 +3526,22 @@ PY
     "vp-ffmpeg-worker-go:deploy-${replay_commit:0:12}" \
     "$replay_commit" legacy_no_control \
     <<<"$replay_credential_records" >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    record-runtime-secret \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    0 watcher replay-runtime \
+    vp-watcher-redis-replay \
+    9444444444444444444444444444444444444444444444444444444444444444 \
+    >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    prepare-vision-job \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    1 check vp-vision-cutover-check-${replay_commit:0:12} \
+    "$replay_control_image" watcher - - >/dev/null
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    record-vision-job-service \
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    2 check "$replay_vision_id" >/dev/null
   replay_operator_reference="control/$replay_control_generation/worker-registration-operator-database-url"
   python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
     record-authority-intent \
@@ -3556,11 +3584,17 @@ PY
     "vp-wr-ffmpeg-go-db-$replay_runtime_generation" "$replay_runtime_id" \
     "$replay_runtime_service" "$replay_runtime_generation" database \
     >/dev/null
+  replay_revision="$(
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+      replay-plan "$admission_root" \
+      | python3 -c \
+        'import json,sys; print(json.load(sys.stdin)["revision"])'
+  )"
   python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin-abort \
     "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
-    8 preparing_failed >/dev/null
+    "$replay_revision" preparing_failed >/dev/null
 
-  revision=9
+  revision=$((replay_revision + 1))
   for secret_id in "$replay_runtime_id" "$replay_control_id"; do
     intent="$(
       python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
@@ -3599,22 +3633,46 @@ PY
     printf 'operator|%s|%s\n' "$1" "$*" >>"$replay_calls"
     [[ "$1" == "$expected_operator" ]]
   }
-  vp_worker_admission_database_credential_file() {
-    printf '%s\n' "${replay_credentials[3]}"
-  }
+  VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="${replay_credentials[0]}"
+  VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="${replay_credentials[1]}"
+  VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE="${replay_credentials[2]}"
+  VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="${replay_credentials[3]}"
   vp_run_python_worker_container() {
     printf 'one-shot|%s\n' "$*" >>"$replay_calls"
   }
+  vp_remove_vision_cutover_job() {
+    printf 'vision-remove|%s\n' "$1" >>"$replay_calls"
+  }
   docker() {
+    printf 'docker|%s\n' "$*" >>"$replay_calls"
     if [[ "${1:-} ${2:-}" == "service ls" ]]; then
       return 0
     fi
     return 98
   }
 
+  mv "${replay_credentials[0]}" "${replay_credentials[0]}.captured"
+  cp "${replay_credentials[0]}.captured" "${replay_credentials[0]}"
+  chmod 0400 "${replay_credentials[0]}"
   vp_worker_admission_lock_acquire "$admission_root"
   set +e
-  vp_worker_admission_abort_preparing_transaction preparing_failed \
+  vp_reconcile_worker_admission_transaction \
+    >/dev/null 2>&1
+  replay_status=$?
+  set -e
+  if [[ "$replay_status" -eq 0 || -s "$replay_calls" \
+    || ! -e "$admission_root/transactions/active.json" ]]; then
+    vp_worker_admission_lock_release
+    echo 'FAIL: ABORTING replay accepted deploy migrator identity drift' >&2
+    exit 1
+  fi
+  vp_worker_admission_lock_release
+  rm -f "${replay_credentials[0]}"
+  mv "${replay_credentials[0]}.captured" "${replay_credentials[0]}"
+
+  vp_worker_admission_lock_acquire "$admission_root"
+  set +e
+  vp_reconcile_worker_admission_transaction \
     >/dev/null 2>&1
   replay_status=$?
   set -e
@@ -3624,6 +3682,7 @@ PY
     exit 1
   fi
   if grep -Fq '/control//' "$replay_calls" \
+    || ! grep -Fq "vision-remove|$replay_vision_id" "$replay_calls" \
     || ! grep -Fq "operator|$expected_operator|" "$replay_calls" \
     || ! grep -Fq \
       "worker_runtime_role_cli revoke --service-name $replay_runtime_service --generation $replay_runtime_generation" \
@@ -4412,6 +4471,10 @@ fi
     chmod 0400 "$replay_credential"
     replay_credentials+=("$replay_credential")
   done
+  VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="${replay_credentials[0]}"
+  VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="${replay_credentials[1]}"
+  VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE="${replay_credentials[2]}"
+  VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="${replay_credentials[3]}"
   replay_credential_records="$(
     python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
       validate-credentials \

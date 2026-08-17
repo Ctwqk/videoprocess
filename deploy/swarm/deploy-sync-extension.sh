@@ -3044,6 +3044,8 @@ vp_worker_admission_database_credential_file() {
   local purpose="$1"
   local path="$2"
   local label="$3"
+  local verify_active="${4:-false}"
+  [[ "$verify_active" == true || "$verify_active" == false ]] || return 1
   case "$purpose" in
     deploy_migrator|deploy_read|control_role_owner|runtime_role_owner)
       ;;
@@ -3055,7 +3057,8 @@ vp_worker_admission_database_credential_file() {
     vp_worker_admission_required_file "$path" "$label"
   )" || return 1
   if [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == true \
-    && "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true ]]; then
+    && ( "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true \
+      || "$verify_active" == true ) ]]; then
     path="$(
       python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
         verify-credential \
@@ -3069,6 +3072,37 @@ vp_worker_admission_database_credential_file() {
     }
   fi
   printf '%s\n' "$path"
+}
+
+vp_worker_database_dcl_file() {
+  vp_worker_admission_database_credential_file \
+    deploy_migrator \
+    "${VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE:-}" \
+    "worker database DCL URL file"
+}
+
+vp_worker_admission_verify_active_database_credentials() {
+  vp_worker_admission_lock_assert || return 1
+  vp_worker_admission_database_credential_file \
+    deploy_migrator \
+    "${VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE:-}" \
+    "worker deploy migrator database URL file" true >/dev/null \
+    || return 1
+  vp_worker_admission_database_credential_file \
+    deploy_read \
+    "${VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE:-}" \
+    "worker deploy read database URL file" true >/dev/null \
+    || return 1
+  vp_worker_admission_database_credential_file \
+    control_role_owner \
+    "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
+    "worker control role owner database URL file" true >/dev/null \
+    || return 1
+  vp_worker_admission_database_credential_file \
+    runtime_role_owner \
+    "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
+    "worker runtime role owner database URL file" true >/dev/null \
+    || return 1
 }
 
 vp_worker_admission_new_generation() {
@@ -3667,6 +3701,7 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
   local extra
   IFS='|' read -r phase revision extra <<<"$replay_fields"
   [[ -z "$extra" && "$revision" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  vp_worker_admission_verify_active_database_credentials || return 1
   case "$phase" in
     PREPARING|FORWARD_APPLYING)
       python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
@@ -4445,12 +4480,7 @@ vp_worker_admission_prepare_control_roles() {
   local root="$3"
   vp_require_pipeline_network_identity || return 1
   local owner_file
-  owner_file="$(
-    vp_worker_admission_database_credential_file \
-      control_role_owner \
-      "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
-      "worker control-role owner database URL file"
-  )" || return 1
+  owner_file="$(vp_worker_database_dcl_file)" || return 1
   local generation="c-${commit:0:20}"
   local state
   state="$(
@@ -4638,12 +4668,7 @@ vp_worker_admission_prepare_service() {
   vp_worker_admission_track_candidate "$service" || return 1
 
   local owner_file
-  owner_file="$(
-    vp_worker_admission_database_credential_file \
-      runtime_role_owner \
-      "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
-      "worker runtime-role owner database URL file"
-  )" || return 1
+  owner_file="$(vp_worker_database_dcl_file)" || return 1
   local control_generation="$VP_WORKER_CONTROL_GENERATION"
   local operator_reference="control/$control_generation/worker-registration-operator-database-url"
   vp_worker_admission_record_authority_intent \
@@ -7856,6 +7881,7 @@ vp_reconcile_worker_admission_transaction() {
       VP_WORKER_ADMISSION_TRANSACTION_REPLAYED=true
       return 0
     fi
+    vp_worker_admission_verify_active_database_credentials || return 1
     if [[ "$VP_WORKER_ADMISSION_REPLAY_OPERATION_KIND" != - ]]; then
       case "$VP_WORKER_ADMISSION_REPLAY_OPERATION_KIND" in
         PROMOTE_WORKERS|PROMOTE_MARKER|PROMOTE_CONTROL|PROMOTE_ROLLBACK_WORKERS|PROMOTE_ROLLBACK_MARKER|PROMOTE_ROLLBACK_CONTROL)
@@ -9445,12 +9471,7 @@ vp_worker_admission_revoke_generation_authority() {
   fi
 
   local owner_file
-  owner_file="$(
-    vp_worker_admission_database_credential_file \
-      runtime_role_owner \
-      "${VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE:-}" \
-      "worker runtime-role owner database URL file"
-  )" || return 1
+  owner_file="$(vp_worker_database_dcl_file)" || return 1
   vp_run_python_worker_container \
     "$control_image" \
     "$owner_file" \
@@ -9985,12 +10006,7 @@ vp_worker_control_revoke_authority() {
     vp_python_worker_prepare_controlled_directory "$root/control"
   )" || return 1
   local owner_file
-  owner_file="$(
-    vp_worker_admission_database_credential_file \
-      control_role_owner \
-      "${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}" \
-      "worker control-role owner database URL file"
-  )" || return 1
+  owner_file="$(vp_worker_database_dcl_file)" || return 1
   vp_run_python_worker_container \
     "$image" \
     "$owner_file" \
@@ -14915,22 +14931,11 @@ vp_worker_redis_marker_new_generation() {
 }
 
 vp_worker_redis_marker_owner_file() {
-  local path="${VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE:-}"
-  if [[ -z "$path" ]]; then
-    path="${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}"
-  fi
-  if [[ -n "${VP_WORKER_DATABASE_CREDENTIAL_RECORDS:-}" ]]; then
-    path="$(
-      vp_verify_worker_database_credential_record \
-        control_role_owner \
-        "$path" \
-        "${VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL:-}" \
-        2>/dev/null
-    )" || {
-      echo "worker marker owner database URL file is absent or invalid" >&2
-      return 1
-    }
-  fi
+  local path
+  path="$(vp_worker_database_dcl_file)" || {
+    echo "worker marker owner database URL file is absent or invalid" >&2
+    return 1
+  }
   if [[ ! "$path" = /* || ! -f "$path" || -L "$path" \
     || "$(vp_worker_redis_marker_file_mode "$path")" != 400 ]]; then
     echo "worker marker owner database URL file is absent or invalid" >&2

@@ -3567,6 +3567,9 @@ PY
     VP_WORKER_ADMISSION_REPLAY_PHASE="$REPLAY_TEST_PHASE"
     VP_WORKER_ADMISSION_REPLAY_OPERATION_KIND=-
   }
+  vp_worker_admission_verify_active_database_credentials() {
+    printf 'verify|' >>"$replay_calls"
+  }
   vp_worker_admission_resume_preparing_transaction() {
     printf 'resume|preparing\n' >>"$replay_calls"
     REPLAY_TEST_ACTIVE=false
@@ -3597,13 +3600,13 @@ PY
       exit 1
     fi
   done <<'EOF'
-PREPARING|resume|preparing
-FORWARD_APPLYING|resume|forward-failure
-ROLLBACK_PREPARING|resume|rollback|ROLLBACK_PREPARING
-ROLLBACK_APPLYING|resume|rollback|ROLLBACK_APPLYING
-CANDIDATE_RESTORE_REQUIRED|resume|candidate|CANDIDATE_RESTORE_REQUIRED
-CANDIDATE_RESTORING|resume|candidate|CANDIDATE_RESTORING
-CANDIDATE_RESTORED|resume|candidate|CANDIDATE_RESTORED
+PREPARING|verify|resume|preparing
+FORWARD_APPLYING|verify|resume|forward-failure
+ROLLBACK_PREPARING|verify|resume|rollback|ROLLBACK_PREPARING
+ROLLBACK_APPLYING|verify|resume|rollback|ROLLBACK_APPLYING
+CANDIDATE_RESTORE_REQUIRED|verify|resume|candidate|CANDIDATE_RESTORE_REQUIRED
+CANDIDATE_RESTORING|verify|resume|candidate|CANDIDATE_RESTORING
+CANDIDATE_RESTORED|verify|resume|candidate|CANDIDATE_RESTORED
 EOF
 )
 
