@@ -33,6 +33,31 @@ source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 )
 
 (
+  target_secret=aaaaaaaaaaaaaaaaaaaaaaaa
+  docker() {
+    if [[ "$1" == service && "$2" == ls ]]; then
+      [[ "$*" == 'service ls --quiet' ]] || return 125
+      printf '%s\n' service000001 service000002
+      return 0
+    fi
+    if [[ "$1" == service && "$2" == inspect ]]; then
+      case "$3" in
+        service000001) printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbb ;;
+        service000002) printf '%s\n' cccccccccccccccccccccccc ;;
+        *) return 1 ;;
+      esac
+      return 0
+    fi
+    return 1
+  }
+
+  if ! vp_worker_admission_secret_unused "$target_secret"; then
+    echo 'FAIL: secret usage check required an unsupported service-list flag' >&2
+    exit 1
+  fi
+)
+
+(
   mutation_calls="$TEST_ROOT/worker-restore-identity-race-mutations"
   : >"$mutation_calls"
   baseline_service_id=aaaaaaaaaaaaaaaaaaaaaaaa
@@ -1693,6 +1718,8 @@ if (
 ):
     raise SystemExit("prepared-secret removal intent is not replayable")
 PY
+  pending_replay_root="$TEST_ROOT/abort-pending-replay"
+  cp -R "$transaction_root" "$pending_replay_root"
   before_wrong_complete="$(shasum -a 256 \
     "$transaction_root/transactions/active.json")"
   if transaction_cli complete-prepared-secret-removal \
@@ -1766,6 +1793,101 @@ PY
     "$commit" "$backend_image" "$go_image" replacement \
     legacy_no_control <<<"$credential_records" >/dev/null
   exec 18>&-
+)
+
+(
+  pending_replay_root="$TEST_ROOT/abort-pending-replay"
+  vp_worker_admission_lock_acquire "$pending_replay_root"
+  trap 'vp_worker_admission_lock_release' EXIT
+  if ! vp_worker_admission_load_replay_plan; then
+    echo 'FAIL: shell replay loader rejected a pending secret removal' >&2
+    exit 1
+  fi
+  if [[ "$VP_WORKER_ADMISSION_REPLAY_PHASE" != ABORTING \
+    || "$VP_WORKER_ADMISSION_REPLAY_NEXT_ACTION" \
+      != VERIFY_REMOVE_PREPARED_SECRET \
+    || "$VP_WORKER_ADMISSION_REPLAY_OPERATION_KIND" \
+      != REMOVE_PREPARED_SECRET \
+    || "$VP_WORKER_ADMISSION_REPLAY_OPERATION_ID" \
+      != operation-* \
+    || "$VP_WORKER_ADMISSION_REPLAY_OPERATION_NAME" \
+      != vp-wr-ffmpeg-go-admission-901 \
+    || "$VP_WORKER_ADMISSION_REPLAY_OPERATION_SERVICE" \
+      != vp-ffmpeg-worker-go-swarm \
+    || "$VP_WORKER_ADMISSION_REPLAY_OPERATION_GENERATION" != 901 \
+    || "$VP_WORKER_ADMISSION_REPLAY_OPERATION_DIGEST" != - ]]; then
+    echo 'FAIL: pending secret removal replay identity was not hydrated' >&2
+    exit 1
+  fi
+)
+
+(
+  interrupted_replay_root="$TEST_ROOT/abort-interrupted-replay"
+  cp -R "$TEST_ROOT/abort-pending-replay" "$interrupted_replay_root"
+  python3 - "$interrupted_replay_root/transactions/active.json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+state = json.loads(path.read_text(encoding="utf-8"))
+state["abort"]["reason"] = "interrupted_preparing"
+path.write_text(
+    json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+  reason_calls="$TEST_ROOT/abort-interrupted-reason-calls"
+  : >"$reason_calls"
+  vp_worker_admission_lock_acquire "$interrupted_replay_root"
+  trap 'vp_worker_admission_lock_release' EXIT
+  vp_worker_admission_abort_transaction() {
+    printf '%s\n' "$1" >>"$reason_calls"
+  }
+  if ! vp_worker_admission_resume_abort_transaction; then
+    echo 'FAIL: pending abort did not resume with its durable reason' >&2
+    exit 1
+  fi
+  if [[ "$(command cat "$reason_calls")" != interrupted_preparing ]]; then
+    echo 'FAIL: pending abort replaced its durable reason' >&2
+    exit 1
+  fi
+)
+
+(
+  invalid_plan="$TEST_ROOT/abort-invalid-purpose-replay.json"
+  python3 - "$TEST_ROOT/abort-core/replay.json" "$invalid_plan" <<'PY'
+import json
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+plan = json.loads(source.read_text(encoding="utf-8"))
+plan["pending_operation"]["identity"]["purpose"] = "INVALID.PURPOSE"
+target.write_text(
+    json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+  invalid_helper="$TEST_ROOT/invalid-purpose-helper.py"
+  vp_worker_admission_lock_assert() {
+    return 0
+  }
+  python3() {
+    if [[ "${1:-}" == "$invalid_helper" \
+      && "${2:-}" == replay-plan ]]; then
+      command cat "$invalid_plan"
+      return 0
+    fi
+    command python3 "$@"
+  }
+  VP_WORKER_ADMISSION_TRANSACTION_HELPER="$invalid_helper"
+  VP_WORKER_ADMISSION_LOCK_ROOT="$TEST_ROOT/invalid-purpose-lock-root"
+  if vp_worker_admission_load_replay_plan; then
+    echo 'FAIL: shell replay loader accepted an invalid secret purpose' >&2
+    exit 1
+  fi
 )
 
 (
@@ -3654,6 +3776,7 @@ PY
   : >"$replay_calls"
   REPLAY_TEST_PHASE=
   REPLAY_TEST_ACTIVE=true
+  REPLAY_TEST_OPERATION_KIND=-
 
   vp_worker_admission_lock_assert() {
     return 0
@@ -3661,7 +3784,8 @@ PY
   vp_worker_admission_load_replay_plan() {
     VP_WORKER_ADMISSION_REPLAY_ACTIVE="$REPLAY_TEST_ACTIVE"
     VP_WORKER_ADMISSION_REPLAY_PHASE="$REPLAY_TEST_PHASE"
-    VP_WORKER_ADMISSION_REPLAY_OPERATION_KIND=-
+    VP_WORKER_ADMISSION_REPLAY_OPERATION_KIND="$REPLAY_TEST_OPERATION_KIND"
+    VP_WORKER_ADMISSION_REPLAY_OPERATION_ID=operation-11111111111111111111111111111111
   }
   vp_worker_admission_verify_active_database_credentials() {
     printf 'verify|' >>"$replay_calls"
@@ -3680,6 +3804,14 @@ PY
   }
   vp_worker_admission_resume_candidate_restore() {
     printf 'resume|candidate|%s\n' "$REPLAY_TEST_PHASE" >>"$replay_calls"
+    REPLAY_TEST_ACTIVE=false
+  }
+  vp_worker_admission_abort_transaction() {
+    printf 'resume|abort|%s\n' "$1" >>"$replay_calls"
+    REPLAY_TEST_ACTIVE=false
+  }
+  vp_worker_admission_resume_abort_transaction() {
+    printf 'resume|abort-state\n' >>"$replay_calls"
     REPLAY_TEST_ACTIVE=false
   }
 
@@ -3704,6 +3836,20 @@ CANDIDATE_RESTORE_REQUIRED|verify|resume|candidate|CANDIDATE_RESTORE_REQUIRED
 CANDIDATE_RESTORING|verify|resume|candidate|CANDIDATE_RESTORING
 CANDIDATE_RESTORED|verify|resume|candidate|CANDIDATE_RESTORED
 EOF
+
+  : >"$replay_calls"
+  REPLAY_TEST_PHASE=ABORTING
+  REPLAY_TEST_ACTIVE=true
+  REPLAY_TEST_OPERATION_KIND=REMOVE_PREPARED_SECRET
+  if ! vp_reconcile_worker_admission_transaction; then
+    echo 'FAIL: pending secret removal did not resume its abort transaction' >&2
+    exit 1
+  fi
+  if [[ "$(command cat "$replay_calls")" \
+    != $'verify|resume|abort-state' ]]; then
+    echo 'FAIL: pending secret removal used the wrong replay dispatcher' >&2
+    exit 1
+  fi
 )
 
 (

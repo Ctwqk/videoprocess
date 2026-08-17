@@ -3745,7 +3745,7 @@ vp_worker_admission_secret_unused() {
   [[ "$secret_id" =~ ^[a-z0-9]{20,64}$ ]] || return 1
   local service_ids
   service_ids="$(
-    docker service ls --quiet --no-trunc 2>/dev/null
+    docker service ls --quiet 2>/dev/null
   )" || return 1
   local seen_services="|"
   local service_id
@@ -4961,7 +4961,43 @@ try:
         ):
             raise ValueError
         identity = operation["identity"]
-        if (
+        if operation["kind"] == "REMOVE_PREPARED_SECRET":
+            if (
+                plan["phase"] != "ABORTING"
+                or plan["next_action"] != "VERIFY_REMOVE_PREPARED_SECRET"
+                or operation["target_phase"] != "ABORTING"
+                or not isinstance(identity, dict)
+                or set(identity) != {
+                    "docker_id", "generation", "kind", "name", "purpose",
+                    "service", "spec_digest",
+                }
+                or re.fullmatch(r"[a-z0-9]{20,64}", identity["docker_id"] or "")
+                is None
+                or identity["kind"] != "secret"
+                or identity["spec_digest"] is not None
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}",
+                    identity["name"] or "",
+                )
+                is None
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}",
+                    identity["service"] or "",
+                )
+                is None
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}",
+                    identity["generation"] or "",
+                )
+                is None
+                or re.fullmatch(
+                    r"[a-z][a-z0-9_-]{0,63}",
+                    identity["purpose"] or "",
+                )
+                is None
+            ):
+                raise ValueError
+        elif (
             not isinstance(identity, dict)
             or set(identity) != {
                 "docker_id", "generation", "kind", "name", "purpose",
@@ -4994,7 +5030,7 @@ try:
         operation_name = identity["name"]
         operation_service = identity["service"]
         operation_generation = identity["generation"]
-        operation_digest = identity["spec_digest"]
+        operation_digest = identity["spec_digest"] or "-"
     print("|".join([
         "true", plan["phase"], str(plan["revision"]),
         plan["transaction_id"], plan["next_action"],
@@ -7957,6 +7993,11 @@ vp_worker_admission_resume_preparing_transaction() {
   vp_worker_admission_abort_transaction interrupted_preparing
 }
 
+vp_worker_admission_resume_abort_transaction() {
+  vp_worker_admission_load_abort_state || return 1
+  vp_worker_admission_abort_transaction "$VP_WORKER_ABORT_REASON"
+}
+
 vp_worker_admission_resume_durable_rollback() {
   vp_worker_admission_hydrate_recovery_context || return 1
   vp_restore_worker_admission_transaction \
@@ -8032,6 +8073,9 @@ vp_reconcile_worker_admission_transaction() {
             "$VP_WORKER_ADMISSION_REPLAY_OPERATION_ID" || return 1
           continue
           ;;
+        REMOVE_PREPARED_SECRET)
+          [[ "$VP_WORKER_ADMISSION_REPLAY_PHASE" == ABORTING ]] || return 1
+          ;;
         *) return 1 ;;
       esac
     fi
@@ -8049,8 +8093,7 @@ vp_reconcile_worker_admission_transaction() {
         vp_worker_admission_resume_candidate_restore || return 1
         ;;
       ABORTING)
-        vp_worker_admission_abort_transaction \
-          preparing_failed || return 1
+        vp_worker_admission_resume_abort_transaction || return 1
         ;;
       FORWARD_VERIFIED)
         vp_worker_admission_hydrate_recovery_context || return 1
