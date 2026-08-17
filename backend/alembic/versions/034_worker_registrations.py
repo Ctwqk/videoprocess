@@ -721,8 +721,15 @@ BEGIN
         FROM relevant_owner_oids
         JOIN pg_catalog.pg_roles AS owner
           ON owner.oid = relevant_owner_oids.oid
-        WHERE owner.rolname = current_user
-           OR owner.rolname !~ '^pg_'
+        WHERE owner.rolname !~ '^pg_'
+          AND (
+              owner.rolname = current_user
+              OR pg_catalog.pg_has_role(
+                   current_user,
+                   owner.oid,
+                   'SET'
+              )
+          )
         ORDER BY owner.rolname
     LOOP
         FOREACH v_object_kind IN ARRAY ARRAY[

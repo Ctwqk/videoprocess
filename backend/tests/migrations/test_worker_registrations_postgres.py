@@ -372,6 +372,13 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
     assert "pg_catalog.has_schema_privilege(" in sql
     assert "owner.rolname !~ '^pg_'" in sql
     assert (
+        "pg_catalog.pg_has_role("
+        "\n                   current_user,"
+        "\n                   owner.oid,"
+        "\n                   'SET'"
+        in sql
+    )
+    assert (
         "'ALTER DEFAULT PRIVILEGES FOR ROLE %I '"
         in sql
     )
@@ -605,6 +612,95 @@ def test_worker_registration_migration_has_marker_lifecycle_surface() -> None:
     ) < downgrade_sql.index(
         "DROP TABLE worker_redis_marker_repair_audits"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_migration_accepts_inherited_owner_without_set_role() -> None:
+    suffix = uuid.uuid4().hex[:12]
+    database = f"vp_worker_migrator_{suffix}"
+    owner_role = f"vp_schema_owner_{suffix}"
+    migrator_role = f"vp_deploy_migrator_{suffix}"
+    owner_password = uuid.uuid4().hex
+    migrator_password = uuid.uuid4().hex
+    admin_url = _database_url("postgres")
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(
+            f'CREATE ROLE "{owner_role}" LOGIN NOSUPERUSER NOCREATEDB '
+            f'NOCREATEROLE INHERIT PASSWORD \'{owner_password}\''
+        )
+        await admin.execute(
+            f'CREATE ROLE "{migrator_role}" LOGIN NOSUPERUSER NOCREATEDB '
+            f'CREATEROLE INHERIT PASSWORD \'{migrator_password}\''
+        )
+        await admin.execute(
+            f'GRANT "{owner_role}" TO "{migrator_role}" '
+            "WITH INHERIT TRUE, SET FALSE, ADMIN FALSE"
+        )
+        await admin.execute(
+            f'CREATE DATABASE "{database}" OWNER "{owner_role}"'
+        )
+    finally:
+        await admin.close()
+
+    connection_suffix = _database_url(database).split("@", 1)[1]
+    owner_url = (
+        f"postgresql://{owner_role}:{owner_password}@{connection_suffix}"
+    )
+    migrator_url = (
+        f"postgresql://{migrator_role}:{migrator_password}@{connection_suffix}"
+    )
+    try:
+        previous = _run_alembic(owner_url, "upgrade", PREVIOUS_REVISION)
+        assert previous.returncode == 0, previous.stdout + previous.stderr
+
+        migrated = _run_alembic(migrator_url, "upgrade", TARGET_REVISION)
+        assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+
+        connection = await asyncpg.connect(_asyncpg_url(migrator_url))
+        try:
+            assert (
+                await connection.fetchval(
+                    "SELECT version_num FROM public.alembic_version"
+                )
+                == TARGET_REVISION
+            )
+            membership = await connection.fetchrow(
+                """
+                SELECT membership.inherit_option, membership.set_option
+                FROM pg_catalog.pg_auth_members AS membership
+                JOIN pg_catalog.pg_roles AS granted
+                  ON granted.oid = membership.roleid
+                JOIN pg_catalog.pg_roles AS member
+                  ON member.oid = membership.member
+                WHERE granted.rolname = $1
+                  AND member.rolname = $2
+                """,
+                owner_role,
+                migrator_role,
+            )
+            assert membership is not None
+            assert membership["inherit_option"] is True
+            assert membership["set_option"] is False
+        finally:
+            await connection.close()
+    finally:
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            await admin.execute(
+                f'REVOKE "{owner_role}" FROM "{migrator_role}"'
+            )
+            await admin.execute(f'DROP ROLE IF EXISTS "{migrator_role}"')
+            await admin.execute(f'DROP ROLE IF EXISTS "{owner_role}"')
+        finally:
+            await admin.close()
 
 
 @pytest.mark.asyncio
