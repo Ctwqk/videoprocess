@@ -15177,6 +15177,7 @@ vp_worker_redis_marker_revoke_roles() {
   local image="$1"
   local generation="$2"
   local control_root="$3"
+  vp_require_pipeline_network_identity || return 1
   local owner_file
   owner_file="$(vp_worker_redis_marker_owner_file)" || return 1
   local role_state

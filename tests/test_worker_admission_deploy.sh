@@ -5017,4 +5017,46 @@ PY
   fi
 )
 
+(
+  marker_revoke_root="$TEST_ROOT/marker-revoke-network"
+  ROOT="$marker_revoke_root/sync"
+  mkdir -p "$ROOT"
+  marker_revoke_calls="$marker_revoke_root/calls"
+  : >"$marker_revoke_calls"
+  marker_owner_file="$marker_revoke_root/marker-owner.url"
+  printf '%s\n' 'postgresql://marker-owner:sentinel@database/videoprocess' \
+    >"$marker_owner_file"
+  chmod 0400 "$marker_owner_file"
+  VP_PIPELINE_NETWORK_ID=""
+
+  vp_worker_redis_marker_owner_file() {
+    printf '%s\n' "$marker_owner_file"
+  }
+  vp_python_worker_prepare_controlled_directory() {
+    mkdir -p "$1"
+    chmod 0700 "$1"
+    printf '%s\n' "$1"
+  }
+  vp_require_pipeline_network_identity() {
+    printf 'network\n' >>"$marker_revoke_calls"
+    VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
+  }
+  vp_run_python_worker_container() {
+    printf 'container|%s\n' "$VP_PIPELINE_NETWORK_ID" \
+      >>"$marker_revoke_calls"
+    [[ "$VP_PIPELINE_NETWORK_ID" == vp-pipeline-network-id ]]
+  }
+
+  if ! vp_worker_redis_marker_revoke_roles \
+    vp-worker:prior marker-prior "$marker_revoke_root/control"; then
+    echo 'FAIL: marker role revoke did not resolve the pipeline network before replay' >&2
+    exit 1
+  fi
+  if [[ "$(cat "$marker_revoke_calls")" \
+    != $'network\ncontainer|vp-pipeline-network-id' ]]; then
+    echo 'FAIL: marker role revoke used the pipeline network out of order' >&2
+    exit 1
+  fi
+)
+
 echo "worker admission deployment contract tests passed"
