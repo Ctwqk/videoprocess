@@ -2929,7 +2929,7 @@ def complete_abort_authority(arguments: list[str]) -> None:
         service,
         generation,
     ) = arguments
-    if kind not in {"control", "runtime"}:
+    if kind not in {"control", "marker", "runtime"}:
         raise TransactionError
     _require_string(service, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
     _require_string(generation, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")

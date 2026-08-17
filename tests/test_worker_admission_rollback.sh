@@ -1803,8 +1803,10 @@ PY
   )"
   commit=4123456789abcdef0123456789abcdef01234567
   control_generation=c-${commit:0:20}
+  marker_generation=m-${commit:0:12}-1700000000-0001
   control_image="vp-ffmpeg-worker-python:deploy-${commit:0:12}"
   operator_reference="control/$control_generation/worker-registration-operator-database-url"
+  marker_operator_reference="marker/$marker_generation/worker-marker-owner-database-url"
   transaction_cli begin \
     "$transaction_root" 18 \
     "$commit" "vp-backend:deploy-${commit:0:12}" \
@@ -1829,6 +1831,7 @@ PY
     vp-ffmpeg-worker-gpu-swarm
     vp-vision-worker-swarm
     vp-youtube-publisher-swarm
+    worker-redis-marker-control
   )
   authority_generations=(
     "$control_generation"
@@ -1836,15 +1839,26 @@ PY
     922
     923
     924
+    "$marker_generation"
   )
-  for index in 0 1 2 3 4; do
+  authority_operator_references=(
+    "$operator_reference"
+    "$operator_reference"
+    "$operator_reference"
+    "$operator_reference"
+    "$operator_reference"
+    "$marker_operator_reference"
+  )
+  for index in 0 1 2 3 4 5; do
     kind=runtime
     [[ "$index" -eq 0 ]] && kind=control
+    [[ "$index" -eq 5 ]] && kind=marker
     transaction_cli record-authority-intent \
       "$transaction_root" 18 \
       "$kind" "${authority_services[$index]}" \
       "${authority_generations[$index]}" \
-      "$control_image" "$control_generation" "$operator_reference" \
+      "$control_image" "$control_generation" \
+      "${authority_operator_references[$index]}" \
       >/dev/null
   done
   transaction_cli mark-authority-provisioning \
@@ -1858,11 +1872,12 @@ PY
     "${authority_services[2]}" "${authority_generations[2]}" >/dev/null
 
   transaction_cli begin-abort \
-    "$transaction_root" 18 8 preparing_failed >/dev/null
+    "$transaction_root" 18 9 preparing_failed >/dev/null
   transaction_cli list-abort "$transaction_root" 18 \
     >"$TEST_ROOT/authority-wal/abort.json"
   python3 - "$TEST_ROOT/authority-wal/abort.json" \
-    "$control_image" "$control_generation" "$operator_reference" <<'PY'
+    "$control_image" "$control_generation" "$operator_reference" \
+    "$marker_generation" "$marker_operator_reference" <<'PY'
 import json
 import sys
 
@@ -1872,29 +1887,47 @@ authorities = state["authorities"]
 if (
     state["phase"] != "ABORTING"
     or state["prepared_secrets"]
-    or len(authorities) != 5
+    or len(authorities) != 6
     or {item["state"] for item in authorities}
     != {"planned", "provisioning", "provisioned"}
     or any(item["control_image"] != sys.argv[2] for item in authorities)
     or any(item["control_generation"] != sys.argv[3] for item in authorities)
-    or any(item["operator_reference"] != sys.argv[4] for item in authorities)
+    or any(
+        item["operator_reference"] != sys.argv[4]
+        for item in authorities
+        if item["kind"] != "marker"
+    )
+    or [
+        (
+            item["service"],
+            item["generation"],
+            item["operator_reference"],
+        )
+        for item in authorities
+        if item["kind"] == "marker"
+    ]
+    != [("worker-redis-marker-control", sys.argv[5], sys.argv[6])]
 ):
     raise SystemExit("authority WAL did not preserve zero-secret intents")
 PY
-  if transaction_cli finish-abort "$transaction_root" 18 9 \
+  if transaction_cli finish-abort "$transaction_root" 18 10 \
     >/dev/null 2>&1; then
     echo 'FAIL: authority WAL archived without revoke evidence' >&2
     exit 1
   fi
 
-  revision=9
-  for index in 4 3 2 1 0; do
+  revision=10
+  for index in 5 4 3 2 1 0; do
     kind=runtime
     [[ "$index" -eq 0 ]] && kind=control
-    transaction_cli complete-abort-authority \
+    [[ "$index" -eq 5 ]] && kind=marker
+    if ! transaction_cli complete-abort-authority \
       "$transaction_root" 18 "$revision" \
       "$kind" "${authority_services[$index]}" \
-      "${authority_generations[$index]}" >/dev/null
+      "${authority_generations[$index]}" >/dev/null; then
+      echo "FAIL: authority WAL could not complete $kind revoke evidence" >&2
+      exit 1
+    fi
     revision=$((revision + 1))
   done
   transaction_cli finish-abort \
@@ -1912,7 +1945,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 if (
     document["phase"] != "DONE"
     or document["outcome"] != "aborted"
-    or len(document["authorities"]) != 5
+    or len(document["authorities"]) != 6
     or any(item["state"] != "revoked" for item in document["authorities"])
     or document["abort"]["authorities"]
 ):
