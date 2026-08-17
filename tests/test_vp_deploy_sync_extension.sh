@@ -5449,12 +5449,12 @@ assert_channelops_runner_identity_reconciliation converged 1
   if [[ "$safety_create" != *'--mode replicated-job'* \
     || "$safety_create" != *'--constraint node.hostname==ccttww-lap'* \
     || "$safety_create" != *'--network vp-pipeline-network-id'* \
-    || "$safety_create" != *'source=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,target=vision-cutover-redis-url'* \
-    || "$safety_create" != *'source=cccccccccccccccccccccccccccccccc,target=vision-cutover-database-url'* \
+    || "$safety_create" != *'source=vp-watcher-runtime,target=vision-cutover-redis-url'* \
+    || "$safety_create" != *'source=vp-vision-cutover-read-db-0123456789ab,target=vision-cutover-database-url'* \
     || "$safety_create" != *'VISION_CUTOVER_REDIS_URL_FILE=/run/secrets/vision-cutover-redis-url'* \
     || "$safety_create" != *'VISION_CUTOVER_DATABASE_URL_FILE=/run/secrets/vision-cutover-database-url'* \
     || "$safety_create" != *'app.services.vision_consumer_cutover --safety'* ]]; then
-    echo 'FAIL: vision safety job transport is not exact-ID/file-only' >&2
+    echo 'FAIL: vision safety job transport does not resolve verified secret names' >&2
     exit 1
   fi
   if grep -Eq '(^|[ |])(DATABASE_URL|REDIS_URL)=|redis://|postgres(ql)?://' \
@@ -5482,8 +5482,8 @@ assert_channelops_runner_identity_reconciliation converged 1
     final-safety vp-ffmpeg-worker-python:deploy-0123456789ab
   final_safety_create="$(grep -F 'docker|service create' "$vision_calls")"
   if [[ "$final_safety_create" != *'--label vp.purpose=final-safety'* \
-    || "$final_safety_create" != *'source=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,target=vision-cutover-redis-url'* \
-    || "$final_safety_create" != *'source=cccccccccccccccccccccccccccccccc,target=vision-cutover-database-url'* \
+    || "$final_safety_create" != *'source=vp-watcher-runtime,target=vision-cutover-redis-url'* \
+    || "$final_safety_create" != *'source=vp-vision-cutover-final-read-db-0123456789ab,target=vision-cutover-database-url'* \
     || "$final_safety_create" != *'app.services.vision_consumer_cutover --safety'* ]]; then
     echo 'FAIL: final vision safety job transport is not isolated and exact' >&2
     exit 1
@@ -5511,7 +5511,7 @@ assert_channelops_runner_identity_reconciliation converged 1
     exit 1
   fi
   check_create="$(grep -F 'docker|service create' "$vision_calls")"
-  [[ "$check_create" == *'source=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,target=vision-cutover-redis-url'* ]]
+  [[ "$check_create" == *'source=vp-watcher-runtime,target=vision-cutover-redis-url'* ]]
   [[ "$check_create" == *'app.services.vision_consumer_cutover --check-only'* ]]
   [[ "$check_create" != *'vision-cutover-database-url'* ]]
 
@@ -5534,7 +5534,7 @@ assert_channelops_runner_identity_reconciliation converged 1
   vp_reconcile_vision_consumers \
     vp-ffmpeg-worker-python:deploy-0123456789ab
   reconcile_create="$(grep -F 'docker|service create' "$vision_calls")"
-  [[ "$reconcile_create" == *'source=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,target=vision-cutover-redis-url'* ]]
+  [[ "$reconcile_create" == *'source=vp-control-runtime,target=vision-cutover-redis-url'* ]]
   [[ "$reconcile_create" == *'app.services.vision_consumer_cutover'* ]]
   [[ "$reconcile_create" != *'vision-cutover-database-url'* ]]
 

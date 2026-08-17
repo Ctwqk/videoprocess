@@ -11162,12 +11162,12 @@ vp_run_vision_cutover_job() {
       --label vp.service=vision-cutover
       --label "vp.generation=$VP_WORKER_ADMISSION_TRANSACTION_ID"
       --label "vp.purpose=$mode"
-      --secret "source=$redis_secret_id,target=vision-cutover-redis-url,uid=10001,gid=10001,mode=0400"
+      --secret "source=$redis_secret_name,target=vision-cutover-redis-url,uid=10001,gid=10001,mode=0400"
       --env VISION_CUTOVER_REDIS_URL_FILE=/run/secrets/vision-cutover-redis-url
     )
     if [[ "$mode" == safety || "$mode" == final-safety ]]; then
       create_args+=(
-        --secret "source=$database_secret_id,target=vision-cutover-database-url,uid=10001,gid=10001,mode=0400"
+        --secret "source=$database_secret_name,target=vision-cutover-database-url,uid=10001,gid=10001,mode=0400"
         --env VISION_CUTOVER_DATABASE_URL_FILE=/run/secrets/vision-cutover-database-url
       )
     fi
