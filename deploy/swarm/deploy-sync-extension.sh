@@ -494,6 +494,7 @@ vp_validate_deploy_config() {
     "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE" \
     "$VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL" \
     runtime_role_owner || return 1
+  vp_worker_redis_marker_owner_file >/dev/null || return 1
 }
 
 vp_worker_service_contract() {
@@ -14915,6 +14916,21 @@ vp_worker_redis_marker_new_generation() {
 
 vp_worker_redis_marker_owner_file() {
   local path="${VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE:-}"
+  if [[ -z "$path" ]]; then
+    path="${VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE:-}"
+  fi
+  if [[ -n "${VP_WORKER_DATABASE_CREDENTIAL_RECORDS:-}" ]]; then
+    path="$(
+      vp_verify_worker_database_credential_record \
+        control_role_owner \
+        "$path" \
+        "${VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL:-}" \
+        2>/dev/null
+    )" || {
+      echo "worker marker owner database URL file is absent or invalid" >&2
+      return 1
+    }
+  fi
   if [[ ! "$path" = /* || ! -f "$path" || -L "$path" \
     || "$(vp_worker_redis_marker_file_mode "$path")" != 400 ]]; then
     echo "worker marker owner database URL file is absent or invalid" >&2

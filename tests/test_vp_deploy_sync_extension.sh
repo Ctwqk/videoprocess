@@ -1423,6 +1423,35 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
 fi
 source "$EXTENSION"
 
+marker_owner_records="$(
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
+    validate-credentials \
+    "$VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE" \
+    "$VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL" \
+    "$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE" \
+    "$VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL" \
+    "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE" \
+    "$VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL" \
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE" \
+    "$VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL"
+)"
+VP_WORKER_DATABASE_CREDENTIAL_RECORDS="$marker_owner_records"
+unset VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE
+marker_owner_file="$(vp_worker_redis_marker_owner_file)"
+if [[ ! "$marker_owner_file" -ef \
+  "$VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE" ]]; then
+  echo 'FAIL: marker control did not reuse the captured control owner' >&2
+  exit 1
+fi
+VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE=\
+"$VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE"
+if vp_worker_redis_marker_owner_file >/dev/null 2>&1; then
+  echo 'FAIL: marker control accepted an uncaptured owner override' >&2
+  exit 1
+fi
+unset VP_WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE
+VP_WORKER_DATABASE_CREDENTIAL_RECORDS=""
+
 vp_worker_admission_create_secret() {
   builtin printf 'vision-secret-create|%s|%s|%s|%s|%s\n' "$@" >>"$CALLS"
   VP_WORKER_CREATED_SECRET_ID="$VISION_SAFETY_DATABASE_SECRET_ID"
@@ -1904,6 +1933,9 @@ vp_require_worker_redis_runtime_state() {
 }
 
 vp_worker_redis_marker_owner_file() {
+  if [[ "${FAIL_MARKER_OWNER_VALIDATION:-false}" == true ]]; then
+    return 1
+  fi
   printf '/dev/null\n'
 }
 
@@ -2197,6 +2229,15 @@ vp_worker_redis_marker_discard_managed_state() {
       chmod 0400 "$path"
     done
   }
+
+  prepare_distinct_identity_files marker-owner-preflight
+  FAIL_MARKER_OWNER_VALIDATION=true
+  if vp_validate_deploy_config "$principal_image" >/dev/null 2>&1; then
+    echo 'FAIL: deploy config accepted an invalid marker owner' >&2
+    exit 1
+  fi
+  assert_no_identity_mutation
+  FAIL_MARKER_OWNER_VALIDATION=false
 
   prepare_distinct_identity_files same-path
   VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE=\
