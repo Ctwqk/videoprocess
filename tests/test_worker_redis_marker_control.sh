@@ -438,6 +438,11 @@ if [[ "${1:-}" == run ]]; then
   [[ -n "$control_state" && -n "$operation" && -n "$generation" ]]
   printf 'role|%s|%s\n' "$operation" "$generation" >>"$CONTROL_EVENTS"
   if [[ "$operation" == provision ]]; then
+    if [[ "$generation" == "${FAKE_FAIL_ROLE_PROVISION:-__none__}" ]]; then
+      printf '%s\n' \
+        '{"reason_code":"marker_control_operation_failed","stage":"database_privileges","status":"error"}'
+      exit 4
+    fi
     mkdir -p "$control_state/$generation"
     chmod 0700 "$control_state/$generation"
     for purpose in readiness janitor repair; do
@@ -1456,6 +1461,7 @@ EOF
   VP_WORKER_REDIS_MARKER_PRIOR_IMAGE=""
   VP_WORKER_REDIS_MARKER_MANAGED_STATE=""
   unset FAKE_FAIL_ROLE_REVOKE FAKE_FAIL_SECRET_CREATE
+  unset FAKE_FAIL_ROLE_PROVISION
   unset FAKE_FAIL_SECRET_REMOVE FAKE_READINESS_TASK_STATE
   unset FAKE_FAIL_CRONTAB_INSTALL FAKE_CORRUPT_CRONTAB_ON_WRITE
   FAKE_READINESS_RESULT=ready
@@ -1647,6 +1653,28 @@ eval "$(
   declare -f vp_worker_redis_marker_new_generation_real \
     | sed '1s/vp_worker_redis_marker_new_generation_real/vp_worker_redis_marker_new_generation/'
 )"
+
+reset_marker_transaction_fixture role-provision-failure
+ROLE_PROVISION_FAILURE_CONTROL_ROOT="$ROOT/state/worker-redis-marker-control"
+mkdir -p "$ROLE_PROVISION_FAILURE_CONTROL_ROOT"
+ROLE_PROVISION_FAILURE_GENERATION=m-role-failure-1780000000-0001
+FAKE_FAIL_ROLE_PROVISION="$ROLE_PROVISION_FAILURE_GENERATION"
+export FAKE_FAIL_ROLE_PROVISION
+ROLE_PROVISION_FAILURE_OUTPUT="$TEST_ROOT/role-provision-failure.out"
+if vp_worker_redis_marker_provision_roles \
+  vp-ffmpeg-worker-python:role-provision-failure \
+  "$ROLE_PROVISION_FAILURE_GENERATION" \
+  "$ROLE_PROVISION_FAILURE_CONTROL_ROOT" \
+  >"$ROLE_PROVISION_FAILURE_OUTPUT" 2>&1; then
+  fail "marker role provisioning failure unexpectedly succeeded"
+fi
+[[ "$(cat "$ROLE_PROVISION_FAILURE_OUTPUT")" == \
+  '{"reason_code":"marker_control_operation_failed","stage":"database_privileges","status":"error"}' ]] \
+  || fail "marker role provisioning hid its sanitized failure stage"
+if grep -Fq 'owner-database-credential' "$ROLE_PROVISION_FAILURE_OUTPUT"; then
+  fail "marker role provisioning exposed its owner credential"
+fi
+unset FAKE_FAIL_ROLE_PROVISION
 
 reset_marker_transaction_fixture deactivation-failure
 DEACTIVATION_CONTROL_ROOT="$ROOT/state/worker-redis-marker-control"

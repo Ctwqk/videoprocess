@@ -69,6 +69,20 @@ class MarkerControlOwnerURLFileError(MarkerControlRoleError):
     pass
 
 
+class MarkerControlOperationError(MarkerControlRoleError):
+    def __init__(self, stage: str) -> None:
+        if stage not in {
+            "credential_state",
+            "database_connect",
+            "database_privileges",
+            "role_cleanup",
+            "role_setup",
+        }:
+            raise ValueError("invalid marker control operation stage")
+        super().__init__(stage)
+        self.stage = stage
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> Never:
         raise MarkerControlArgumentError(message)
@@ -142,6 +156,13 @@ async def run(argv: Sequence[str] | None = None) -> int:
                 names,
             )
             reason_code = "marker_control_roles_revoked"
+    except MarkerControlOperationError as exc:
+        _emit(
+            "error",
+            "marker_control_operation_failed",
+            stage=exc.stage,
+        )
+        return 4
     except (asyncpg.PostgresError, OSError, MarkerControlRoleError):
         _emit("error", "marker_control_operation_failed")
         return 4
@@ -268,8 +289,12 @@ async def _provision(
     if len(set(passwords.values())) != len(passwords):
         raise MarkerControlRoleError("password generation failed")
 
-    connection = await asyncpg.connect(_asyncpg_url(owner_url))
+    try:
+        connection = await asyncpg.connect(_asyncpg_url(owner_url))
+    except (asyncpg.PostgresError, OSError) as exc:
+        raise MarkerControlOperationError("database_connect") from exc
     roles_created = False
+    stage = "role_setup"
     try:
         async with connection.transaction():
             for stable_role in names.stable.values():
@@ -284,6 +309,7 @@ async def _provision(
                     f"GRANT {_quote_identifier(names.stable[purpose])} "
                     f"TO {_quote_identifier(versioned_role)}"
                 )
+            stage = "database_privileges"
             for purpose, stable_role in names.stable.items():
                 await _set_stable_role_privileges(
                     connection,
@@ -292,6 +318,7 @@ async def _provision(
                 )
         roles_created = True
 
+        stage = "credential_state"
         role_urls = {}
         for purpose in paths:
             role_url = _role_database_url(
@@ -305,7 +332,7 @@ async def _provision(
             generation,
             role_urls,
         )
-    except BaseException:
+    except (asyncpg.PostgresError, OSError, MarkerControlRoleError) as exc:
         try:
             _remove_generation_credentials(state_dir, generation)
         except MarkerControlRoleError:
@@ -315,7 +342,9 @@ async def _provision(
                 await _revoke_roles(connection, names)
             except (asyncpg.PostgresError, OSError, MarkerControlRoleError):
                 pass
-        raise
+        if isinstance(exc, MarkerControlOperationError):
+            raise
+        raise MarkerControlOperationError(stage) from exc
     finally:
         await connection.close()
 
@@ -326,12 +355,21 @@ async def _revoke(
     state_dir: Path,
     names: MarkerControlRoleNames,
 ) -> None:
-    connection = await asyncpg.connect(_asyncpg_url(owner_url))
     try:
-        await _revoke_roles(connection, names)
+        connection = await asyncpg.connect(_asyncpg_url(owner_url))
+    except (asyncpg.PostgresError, OSError) as exc:
+        raise MarkerControlOperationError("database_connect") from exc
+    try:
+        try:
+            await _revoke_roles(connection, names)
+        except (asyncpg.PostgresError, OSError, MarkerControlRoleError) as exc:
+            raise MarkerControlOperationError("role_cleanup") from exc
     finally:
         await connection.close()
-    _remove_generation_credentials(state_dir, generation)
+    try:
+        _remove_generation_credentials(state_dir, generation)
+    except (OSError, MarkerControlRoleError) as exc:
+        raise MarkerControlOperationError("credential_state") from exc
 
 
 async def _ensure_stable_role(
@@ -737,6 +775,7 @@ def _emit(
     reason_code: str,
     *,
     roles: Mapping[str, str] | None = None,
+    stage: str | None = None,
 ) -> None:
     payload: dict[str, object] = {
         "reason_code": reason_code,
@@ -744,6 +783,8 @@ def _emit(
     }
     if roles is not None:
         payload["roles"] = dict(roles)
+    if stage is not None:
+        payload["stage"] = stage
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 

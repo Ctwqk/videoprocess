@@ -123,6 +123,49 @@ def test_cli_requires_the_owner_url_file_environment_only(
     assert "secret" not in captured.out
 
 
+def test_cli_reports_a_sanitized_operation_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    owner_url_file = tmp_path / "owner-database-url"
+    owner_url_file.write_text(
+        "postgresql://owner:must-not-leak@database/videoprocess\n",
+        encoding="utf-8",
+    )
+    owner_url_file.chmod(0o400)
+    monkeypatch.setenv(
+        "WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE",
+        str(owner_url_file),
+    )
+
+    async def fail_provision(*_args, **_kwargs) -> None:
+        raise module.MarkerControlOperationError("database_privileges")
+
+    monkeypatch.setattr(module, "_provision", fail_provision)
+
+    result = module.main(
+        [
+            "provision",
+            "--generation",
+            "release-1",
+            "--state-dir",
+            str(tmp_path / "state"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 4
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "reason_code": "marker_control_operation_failed",
+        "stage": "database_privileges",
+        "status": "error",
+    }
+    assert "must-not-leak" not in captured.out
+
+
 def test_credential_paths_are_generation_scoped_and_independent(
     tmp_path,
 ) -> None:

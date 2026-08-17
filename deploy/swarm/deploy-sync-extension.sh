@@ -14945,6 +14945,47 @@ vp_worker_redis_marker_database_secret_name() {
   printf 'vp-wrm-%s-db-%s\n' "$purpose" "$generation"
 }
 
+vp_worker_redis_marker_report_role_failure() {
+  local output_file="$1"
+  if [[ ! -f "$output_file" || -L "$output_file" \
+    || "$(vp_worker_redis_marker_file_mode "$output_file")" != 600 ]]; then
+    echo "worker marker database role operation failed" >&2
+    return 0
+  fi
+  if ! python3 - "$output_file" <<'PY' >&2
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if path.stat().st_size > 4096:
+    raise SystemExit(1)
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+allowed_stages = {
+    "credential_state",
+    "database_connect",
+    "database_privileges",
+    "role_cleanup",
+    "role_setup",
+}
+if (
+    not isinstance(payload, dict)
+    or set(payload) != {"reason_code", "stage", "status"}
+    or payload.get("reason_code") != "marker_control_operation_failed"
+    or payload.get("status") != "error"
+    or payload.get("stage") not in allowed_stages
+):
+    raise SystemExit(1)
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+PY
+  then
+    echo "worker marker database role operation failed" >&2
+  fi
+}
+
 vp_worker_redis_marker_provision_roles() {
   local image="$1"
   local generation="$2"
@@ -14956,7 +14997,15 @@ vp_worker_redis_marker_provision_roles() {
     vp_python_worker_prepare_controlled_directory "$control_root/roles"
   )" || return 1
 
-  vp_run_python_worker_container \
+  local output_file
+  output_file="$(mktemp "${TMPDIR:-/tmp}/vp-marker-role.XXXXXX")" \
+    || return 1
+  chmod 0600 "$output_file" || {
+    rm -f "$output_file"
+    return 1
+  }
+  local status=0
+  if vp_run_python_worker_container \
     "$image" \
     "$owner_file" \
     worker-marker-owner-database-url \
@@ -14968,7 +15017,14 @@ vp_worker_redis_marker_provision_roles() {
     python -m app.services.worker_marker_control_role_cli \
       provision \
       --generation "$generation" \
-      --state-dir /control-state >/dev/null
+      --state-dir /control-state >"$output_file"; then
+    status=0
+  else
+    status=$?
+    vp_worker_redis_marker_report_role_failure "$output_file"
+  fi
+  rm -f "$output_file"
+  return "$status"
 }
 
 vp_worker_redis_marker_revoke_roles() {
@@ -14982,7 +15038,15 @@ vp_worker_redis_marker_revoke_roles() {
     vp_python_worker_prepare_controlled_directory "$control_root/roles"
   )" || return 1
 
-  vp_run_python_worker_container \
+  local output_file
+  output_file="$(mktemp "${TMPDIR:-/tmp}/vp-marker-role.XXXXXX")" \
+    || return 1
+  chmod 0600 "$output_file" || {
+    rm -f "$output_file"
+    return 1
+  }
+  local status=0
+  if vp_run_python_worker_container \
     "$image" \
     "$owner_file" \
     worker-marker-owner-database-url \
@@ -14994,7 +15058,14 @@ vp_worker_redis_marker_revoke_roles() {
     python -m app.services.worker_marker_control_role_cli \
       revoke \
       --generation "$generation" \
-      --state-dir /control-state >/dev/null
+      --state-dir /control-state >"$output_file"; then
+    status=0
+  else
+    status=$?
+    vp_worker_redis_marker_report_role_failure "$output_file"
+  fi
+  rm -f "$output_file"
+  return "$status"
 }
 
 vp_worker_redis_marker_write_secret_manifest() {
