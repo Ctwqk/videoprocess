@@ -63,6 +63,12 @@ if [[ "${1:-}" == "-r" ]]; then
 fi
 
 [[ "$#" -eq 1 ]]
+install_source="$1"
+if [[ "$install_source" == - ]]; then
+  install_source="$(mktemp "${TMPDIR:-/tmp}/vp-fake-crontab.XXXXXX")"
+  trap 'rm -f "$install_source"' EXIT
+  cat >"$install_source"
+fi
 if [[ "${FAKE_CRONTAB_ROLLBACK_FAIL:-false}" == "true" \
   && -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
   echo 'crontab: injected rollback install failure' >&2
@@ -78,7 +84,7 @@ case "${FAKE_CRONTAB_INSTALL_MODE:-normal}" in
     ;;
   mutate-then-fail)
     if [[ ! -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
-      cp "$1" "$FAKE_CRONTAB"
+      cp "$install_source" "$FAKE_CRONTAB"
       : >"$FAKE_CRONTAB_FAILURE_USED"
       echo 'crontab: injected post-mutation failure' >&2
       exit 1
@@ -86,7 +92,7 @@ case "${FAKE_CRONTAB_INSTALL_MODE:-normal}" in
     ;;
   verify-mismatch)
     if [[ ! -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
-      cp "$1" "$FAKE_CRONTAB"
+      cp "$install_source" "$FAKE_CRONTAB"
       printf '# injected verification mismatch\n' >>"$FAKE_CRONTAB"
       : >"$FAKE_CRONTAB_FAILURE_USED"
       printf 'write-mismatch\n' >>"$FAKE_CRONTAB_CALLS"
@@ -95,7 +101,7 @@ case "${FAKE_CRONTAB_INSTALL_MODE:-normal}" in
     ;;
   target-verify-mismatch)
     if [[ ! -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
-      cp "$1" "$FAKE_CRONTAB"
+      cp "$install_source" "$FAKE_CRONTAB"
       printf '#!/usr/bin/env bash\nprintf "injected target mismatch\\n"\n' >"$FAKE_WATCH_TARGET"
       chmod 0644 "$FAKE_WATCH_TARGET"
       : >"$FAKE_CRONTAB_FAILURE_USED"
@@ -105,14 +111,14 @@ case "${FAKE_CRONTAB_INSTALL_MODE:-normal}" in
     ;;
   signal-term)
     if [[ ! -f "$FAKE_CRONTAB_FAILURE_USED" ]]; then
-      cp "$1" "$FAKE_CRONTAB"
+      cp "$install_source" "$FAKE_CRONTAB"
       : >"$FAKE_CRONTAB_FAILURE_USED"
       kill -TERM "$PPID"
       exit 0
     fi
     ;;
 esac
-cp "$1" "$FAKE_CRONTAB"
+cp "$install_source" "$FAKE_CRONTAB"
 printf 'write\n' >>"$FAKE_CRONTAB_CALLS"
 EOF
 chmod +x "$FAKE_BIN/crontab"

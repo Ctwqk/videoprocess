@@ -15862,7 +15862,7 @@ vp_worker_redis_marker_deactivate_managed_cron() {
     return 0
   fi
   vp_worker_redis_marker_unmanaged_cron "$current" "$unmanaged" || return 1
-  LC_ALL=C crontab "$unmanaged"
+  LC_ALL=C crontab - <"$unmanaged"
 }
 
 vp_worker_redis_marker_restore_managed_state() {
@@ -15887,7 +15887,7 @@ vp_worker_redis_marker_restore_managed_state() {
   if [[ -f "$state/crontab.absent" ]]; then
     LC_ALL=C crontab -r >/dev/null 2>&1 || true
   else
-    LC_ALL=C crontab "$state/crontab" || return 1
+    LC_ALL=C crontab - <"$state/crontab" || return 1
   fi
 
   if [[ -f "$state/launcher" ]]; then

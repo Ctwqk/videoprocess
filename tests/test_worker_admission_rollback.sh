@@ -2886,6 +2886,69 @@ PY
 )
 
 (
+  long_cron_root="$TEST_ROOT/marker-long-crontab-path/deploy-github-sync"
+  ROOT="$long_cron_root"
+  marker_control_root="$ROOT/state/worker-redis-marker-control"
+  transaction_id=tx-77777777777777777777777777777777
+  marker_state="$marker_control_root/transactions/$transaction_id/baseline-managed-state"
+  installed_cron="$long_cron_root/installed-crontab"
+  mkdir -p "$marker_state" "$ROOT/bin"
+  chmod 0700 "$marker_control_root" \
+    "$marker_control_root/transactions" \
+    "$marker_control_root/transactions/$transaction_id" \
+    "$marker_state"
+  printf '%s\n' \
+    'MAILTO=video-ops@example.com' \
+    '# BEGIN VIDEOPROCESS WORKER REDIS MARKER CONTROL' \
+    '* * * * * /usr/local/bin/marker-readiness' \
+    '# END VIDEOPROCESS WORKER REDIS MARKER CONTROL' \
+    >"$marker_state/crontab"
+  chmod 0600 "$marker_state/crontab"
+  printf 'VERSION=1\n' >"$marker_state/captured"
+  chmod 0600 "$marker_state/captured"
+  cp "$marker_state/crontab" "$installed_cron"
+
+  if [[ "${#marker_state}" -le 99 ]]; then
+    echo 'FAIL: long-path crontab regression fixture did not exceed the platform limit' >&2
+    exit 1
+  fi
+  crontab() {
+    if [[ "$#" -eq 1 && "$1" == -l ]]; then
+      command cat "$installed_cron"
+      return 0
+    fi
+    if [[ "$#" -eq 1 && "$1" == - ]]; then
+      command cat >"$installed_cron"
+      return 0
+    fi
+    if [[ "$#" -eq 1 && "${#1}" -gt 99 ]]; then
+      printf '%s: No such file or directory\n' "${1:0:99}" >&2
+      return 1
+    fi
+    [[ "$#" -eq 1 ]] || return 1
+    command cp "$1" "$installed_cron"
+  }
+
+  if ! vp_worker_redis_marker_deactivate_managed_cron "$marker_state"; then
+    echo 'FAIL: marker cron deactivation passed a long transaction path to crontab' >&2
+    exit 1
+  fi
+  if grep -Fq 'VIDEOPROCESS WORKER REDIS MARKER CONTROL' "$installed_cron" \
+    || ! grep -Fqx 'MAILTO=video-ops@example.com' "$installed_cron"; then
+    echo 'FAIL: marker cron deactivation did not preserve only unmanaged entries' >&2
+    exit 1
+  fi
+  if ! vp_worker_redis_marker_restore_managed_state "$marker_state"; then
+    echo 'FAIL: marker cron restore passed a long transaction path to crontab' >&2
+    exit 1
+  fi
+  if ! cmp -s "$marker_state/crontab" "$installed_cron"; then
+    echo 'FAIL: marker cron restore changed the captured crontab' >&2
+    exit 1
+  fi
+)
+
+(
   crash_replay_root="$TEST_ROOT/fixed-temporary-crash-replay"
   VP_WORKER_ADMISSION_LOCK_ROOT="$crash_replay_root"
   VP_WORKER_ADMISSION_TRANSACTION_ID=tx-66666666666666666666666666666666

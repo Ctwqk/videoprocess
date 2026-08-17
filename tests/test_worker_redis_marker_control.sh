@@ -483,10 +483,16 @@ fi
 if [[ "${FAKE_FAIL_CRONTAB_INSTALL:-false}" == true ]]; then
   exit 1
 fi
+install_source="$1"
+if [[ "$install_source" == - ]]; then
+  install_source="$(mktemp "${TMPDIR:-/tmp}/vp-fake-crontab.XXXXXX")"
+  trap 'rm -f "$install_source"' EXIT
+  cat >"$install_source"
+fi
 write_count="$(cat "$FAKE_CRONTAB_WRITE_COUNT")"
 write_count="$((write_count + 1))"
 printf '%s\n' "$write_count" >"$FAKE_CRONTAB_WRITE_COUNT"
-cp "$1" "$FAKE_CRONTAB"
+cp "$install_source" "$FAKE_CRONTAB"
 if [[ "$write_count" == "${FAKE_CORRUPT_CRONTAB_ON_WRITE:-__none__}" ]]; then
   printf '# injected verification mismatch\n' >>"$FAKE_CRONTAB"
 fi
