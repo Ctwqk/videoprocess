@@ -15478,6 +15478,58 @@ vp_worker_redis_marker_create_database_secrets() {
     "$VP_WORKER_REDIS_MARKER_REPAIR_DATABASE_SECRET_ID"
 }
 
+vp_worker_redis_marker_canonical_job_identity() {
+  local identity="$1"
+  [[ "$identity" != *$'\n'* && "$identity" != *$'\r'* ]] || return 1
+  local separators="${identity//[^|]/}"
+  [[ "${#separators}" -eq 12 ]] || return 1
+  local label_count
+  local marker_mode
+  local marker_generation
+  local image
+  local job_mode
+  local total_completions
+  local max_concurrent
+  local restart_condition
+  local placement
+  local network
+  local secrets
+  local environment
+  local arguments
+  local extra
+  IFS='|' read -r \
+    label_count marker_mode marker_generation image job_mode \
+    total_completions max_concurrent restart_condition placement network \
+    secrets environment arguments extra <<<"$identity"
+  [[ -n "$label_count" \
+    && -n "$marker_mode" \
+    && -n "$marker_generation" \
+    && -n "$image" \
+    && -n "$job_mode" \
+    && -n "$total_completions" \
+    && -n "$max_concurrent" \
+    && -n "$restart_condition" \
+    && -n "$placement" \
+    && -n "$network" \
+    && -n "$secrets" \
+    && -n "$environment" \
+    && -n "$arguments" \
+    && -z "$extra" ]] || return 1
+  local -a secret_bindings=()
+  IFS=',' read -r -a secret_bindings <<<"$secrets"
+  [[ "${#secret_bindings[@]}" -eq 2 \
+    && -n "${secret_bindings[0]}" \
+    && -n "${secret_bindings[1]}" \
+    && "${secret_bindings[0]}" != "${secret_bindings[1]}" ]] || return 1
+  local canonical_secrets
+  canonical_secrets="$(
+    printf '%s\n' "${secret_bindings[@]}" | LC_ALL=C sort
+  )" || return 1
+  canonical_secrets="${canonical_secrets//$'\n'/,}"
+  printf '%s\n' \
+    "$label_count|$marker_mode|$marker_generation|$image|$job_mode|$total_completions|$max_concurrent|$restart_condition|$placement|$network|$canonical_secrets|$environment|$arguments"
+}
+
 vp_worker_redis_marker_expected_job_identity() {
   local image="$1"
   local generation="$2"
@@ -15510,7 +15562,7 @@ vp_worker_redis_marker_expected_job_identity() {
       ;;
   esac
   vp_require_pipeline_network_identity || return 1
-  printf '%s\n' \
+  vp_worker_redis_marker_canonical_job_identity \
     "2|$mode|$generation|$image|replicated-job|1|1|none|node.hostname==$VP_MANAGER_NODE|$VP_PIPELINE_NETWORK_ID|$database_secret:worker-marker-database-url:10001:10001:256,$redis_secret:worker-marker-redis-url:10001:10001:256|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url,WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url|python,-m,$module,$command"
 }
 
@@ -15522,7 +15574,7 @@ vp_worker_redis_marker_job_identity() {
       '{{len .Spec.Labels}}|{{index .Spec.Labels "vp.worker-redis-marker.mode"}}|{{index .Spec.Labels "vp.worker-redis-marker.generation"}}|{{.Spec.TaskTemplate.ContainerSpec.Image}}|{{if .Spec.Mode.ReplicatedJob}}replicated-job{{else}}other{{end}}|{{.Spec.Mode.ReplicatedJob.TotalCompletions}}|{{.Spec.Mode.ReplicatedJob.MaxConcurrent}}|{{.Spec.TaskTemplate.RestartPolicy.Condition}}|{{range .Spec.TaskTemplate.Placement.Constraints}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.Networks}}{{printf "%s," .Target}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Secrets}}{{printf "%s:%s:%s:%s:%d," .SecretName .File.Name .File.UID .File.GID .File.Mode}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{printf "%s," .}}{{end}}|{{range .Spec.TaskTemplate.ContainerSpec.Args}}{{printf "%s," .}}{{end}}'
   )" || return 1
   identity="${identity//,|/|}"
-  printf '%s\n' "${identity%,}"
+  vp_worker_redis_marker_canonical_job_identity "${identity%,}"
 }
 
 vp_worker_redis_marker_remove_generation_jobs() {

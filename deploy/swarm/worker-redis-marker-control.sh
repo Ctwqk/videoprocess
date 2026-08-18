@@ -195,6 +195,58 @@ service_state() {
   printf '%s\n' "${states%% *}"
 }
 
+canonicalize_service_identity() {
+  local identity="$1"
+  [[ "$identity" != *$'\n'* && "$identity" != *$'\r'* ]] || return 1
+  local separators="${identity//[^|]/}"
+  [[ "${#separators}" -eq 12 ]] || return 1
+  local label_count
+  local marker_mode
+  local marker_generation
+  local image
+  local job_mode
+  local total_completions
+  local max_concurrent
+  local restart_condition
+  local placement
+  local network
+  local secrets
+  local environment
+  local arguments
+  local extra
+  IFS='|' read -r \
+    label_count marker_mode marker_generation image job_mode \
+    total_completions max_concurrent restart_condition placement network \
+    secrets environment arguments extra <<<"$identity"
+  [[ -n "$label_count" \
+    && -n "$marker_mode" \
+    && -n "$marker_generation" \
+    && -n "$image" \
+    && -n "$job_mode" \
+    && -n "$total_completions" \
+    && -n "$max_concurrent" \
+    && -n "$restart_condition" \
+    && -n "$placement" \
+    && -n "$network" \
+    && -n "$secrets" \
+    && -n "$environment" \
+    && -n "$arguments" \
+    && -z "$extra" ]] || return 1
+  local -a secret_bindings=()
+  IFS=',' read -r -a secret_bindings <<<"$secrets"
+  [[ "${#secret_bindings[@]}" -eq 2 \
+    && -n "${secret_bindings[0]}" \
+    && -n "${secret_bindings[1]}" \
+    && "${secret_bindings[0]}" != "${secret_bindings[1]}" ]] || return 1
+  local canonical_secrets
+  canonical_secrets="$(
+    printf '%s\n' "${secret_bindings[@]}" | LC_ALL=C sort
+  )" || return 1
+  canonical_secrets="${canonical_secrets//$'\n'/,}"
+  printf '%s\n' \
+    "$label_count|$marker_mode|$marker_generation|$image|$job_mode|$total_completions|$max_concurrent|$restart_condition|$placement|$network|$canonical_secrets|$environment|$arguments"
+}
+
 expected_service_identity() {
   local mode="$1"
   local database_secret
@@ -225,7 +277,7 @@ expected_service_identity() {
   )" || return 1
   [[ "$network_identity" == "$NETWORK_ID|$NETWORK|overlay|swarm" ]] \
     || return 1
-  printf '%s\n' \
+  canonicalize_service_identity \
     "2|$mode|$GENERATION|$IMAGE|replicated-job|1|1|none|node.hostname==$CONTROL_NODE|$NETWORK_ID|$database_secret:worker-marker-database-url:10001:10001:256,$redis_secret:worker-marker-redis-url:10001:10001:256|WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url,WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url|python,-m,$module,$command"
 }
 
@@ -238,7 +290,7 @@ service_identity() {
       2>/dev/null
   )" || return 1
   identity="${identity//,|/|}"
-  printf '%s\n' "${identity%,}"
+  canonicalize_service_identity "${identity%,}"
 }
 
 remove_completed_job() {
@@ -355,6 +407,19 @@ finish_janitor() {
   [[ "$status" == ok && "$code" == ready && "$conflict" -eq 0 ]]
 }
 
+extract_protocol_output() {
+  local output="$1"
+  local line
+  local protocol_line=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == \{* ]] || continue
+    [[ -z "$protocol_line" ]] || return 1
+    protocol_line="$line"
+  done <<<"$output"
+  [[ -n "$protocol_line" ]] || return 1
+  printf '%s\n' "$protocol_line"
+}
+
 launch_job() {
   local mode="$1"
   local name="$2"
@@ -429,7 +494,7 @@ launch_job() {
     emit "mode=$mode" "code=job_output_unavailable"
     return 3
   fi
-  if [[ -z "$output" || "$output" == *$'\n'* ]]; then
+  if ! output="$(extract_protocol_output "$output")"; then
     emit "mode=$mode" "code=job_output_invalid"
     return 3
   fi

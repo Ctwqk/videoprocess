@@ -260,14 +260,40 @@ if [[ "${1:-} ${2:-}" == "service logs" ]]; then
         malformed)
           printf '%s\n' 'not-json'
           ;;
+        startup-noise)
+          printf '%s\n' \
+            '========== CUDA startup ==========' \
+            'WARNING: GPU functionality is unavailable.' \
+            '{"checked_count":7,"code":"ready","expected_count":7,"status":"ok"}'
+          ;;
+        ambiguous)
+          printf '%s\n' \
+            '{"checked_count":7,"code":"ready","expected_count":7,"status":"ok"}' \
+            '{"checked_count":7,"code":"ready","expected_count":7,"status":"ok"}'
+          ;;
+        json-noise)
+          printf '%s\n' \
+            '{"message":"unexpected structured output"}' \
+            '{"checked_count":7,"code":"ready","expected_count":7,"status":"ok"}'
+          ;;
         unavailable)
           exit 3
           ;;
       esac
       ;;
     vp-worker-redis-marker-janitor-job)
-      printf '%s\n' \
-        '{"absent":1,"claimed":3,"code":"ready","conflict":0,"deleted":2,"status":"ok"}'
+      case "${FAKE_JANITOR_RESULT:-ready}" in
+        ready)
+          printf '%s\n' \
+            '{"absent":1,"claimed":3,"code":"ready","conflict":0,"deleted":2,"status":"ok"}'
+          ;;
+        startup-noise)
+          printf '%s\n' \
+            '========== CUDA startup ==========' \
+            'WARNING: GPU functionality is unavailable.' \
+            '{"absent":1,"claimed":3,"code":"ready","conflict":0,"deleted":2,"status":"ok"}'
+          ;;
+      esac
       ;;
     *)
       exit 91
@@ -605,7 +631,15 @@ set_service_state vp-worker-redis-marker-readiness-job Complete
 "$LAUNCHER" readiness >/dev/null \
   || fail "readiness did not recover after a failed Swarm task"
 
-for failure_case in rejected timeout malformed-log unavailable-log failed-result; do
+set_service_state vp-worker-redis-marker-readiness-job Complete
+FAKE_READINESS_RESULT=startup-noise
+export FAKE_READINESS_RESULT
+"$LAUNCHER" readiness >/dev/null \
+  || fail "readiness rejected non-protocol container startup noise"
+
+for failure_case in \
+  rejected timeout malformed-log ambiguous-log json-noise unavailable-log \
+  failed-result; do
   unset FAKE_READINESS_TASK_STATE
   FAKE_READINESS_RESULT=ready
   export FAKE_READINESS_RESULT
@@ -622,6 +656,12 @@ for failure_case in rejected timeout malformed-log unavailable-log failed-result
       ;;
     malformed-log)
       FAKE_READINESS_RESULT=malformed
+      ;;
+    ambiguous-log)
+      FAKE_READINESS_RESULT=ambiguous
+      ;;
+    json-noise)
+      FAKE_READINESS_RESULT=json-noise
       ;;
     unavailable-log)
       FAKE_READINESS_RESULT=unavailable
@@ -663,6 +703,12 @@ assert_control_job \
   && "$janitor_output" == *"claimed=3"* \
   && "$janitor_output" == *"conflict=0"* ]] \
   || fail "janitor output did not contain only stable status and counts"
+set_service_state vp-worker-redis-marker-janitor-job Complete
+FAKE_JANITOR_RESULT=startup-noise
+export FAKE_JANITOR_RESULT
+"$LAUNCHER" janitor >/dev/null \
+  || fail "janitor rejected non-protocol container startup noise"
+unset FAKE_JANITOR_RESULT
 
 : >"$DOCKER_CALLS"
 set_service_state vp-worker-redis-marker-readiness-job Running
@@ -690,6 +736,80 @@ fi
 
 : >"$DOCKER_CALLS"
 "$LAUNCHER" readiness >/dev/null
+set_service_state vp-worker-redis-marker-readiness-job Complete
+cp \
+  "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity" \
+  "$TEST_ROOT/valid-readiness-identity"
+for malformed_identity in embedded-newline trailing-separator third-secret duplicate-secret; do
+  case "$malformed_identity" in
+    embedded-newline)
+      {
+        cat "$TEST_ROOT/valid-readiness-identity"
+        printf '%s\n' malicious-suffix
+      } >"$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+      ;;
+    trailing-separator)
+      sed 's/$/|/' \
+        "$TEST_ROOT/valid-readiness-identity" \
+        >"$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+      ;;
+    third-secret)
+      awk -F'|' '
+        BEGIN { OFS="|" }
+        {
+          $11=$11 ",unexpected:unexpected:10001:10001:256"
+          print
+        }
+      ' "$TEST_ROOT/valid-readiness-identity" \
+        >"$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+      ;;
+    duplicate-secret)
+      awk -F'|' '
+        BEGIN { OFS="|" }
+        {
+          split($11, secrets, ",")
+          $11=secrets[1] "," secrets[1]
+          print
+        }
+      ' "$TEST_ROOT/valid-readiness-identity" \
+        >"$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+      ;;
+  esac
+  set_service_state vp-worker-redis-marker-readiness-job Complete
+  : >"$DOCKER_CALLS"
+  if "$LAUNCHER" readiness \
+    >"$TEST_ROOT/$malformed_identity-identity.out" 2>&1; then
+    fail "marker identity accepted $malformed_identity"
+  fi
+  if grep -Fq \
+    'docker|service|rm|vp-worker-redis-marker-readiness-job' \
+    "$DOCKER_CALLS"; then
+    fail "marker identity removed $malformed_identity"
+  fi
+  grep -Eq \
+    'code=job_(identity_invalid|inspection_failed)' \
+    "$TEST_ROOT/$malformed_identity-identity.out" \
+    || fail "marker identity did not fail closed for $malformed_identity"
+done
+cp \
+  "$TEST_ROOT/valid-readiness-identity" \
+  "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+awk -F'|' '
+  BEGIN { OFS="|" }
+  {
+    split($11, secrets, ",")
+    $11=secrets[2] "," secrets[1]
+    print
+  }
+' "$TEST_ROOT/valid-readiness-identity" \
+  >"$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity"
+: >"$DOCKER_CALLS"
+"$LAUNCHER" readiness >/dev/null \
+  || fail "Swarm-normalized marker secret order was rejected"
+grep -Fq \
+  'docker|service|rm|vp-worker-redis-marker-readiness-job' \
+  "$DOCKER_CALLS" \
+  || fail "completed marker job with normalized secret order was not replaced"
 set_service_state vp-worker-redis-marker-readiness-job Complete
 cp \
   "$SERVICE_DIR/vp-worker-redis-marker-readiness-job.identity" \
@@ -1037,10 +1157,68 @@ RETIREMENT_GENERATION=m-retirement-1780000000-9999
 VP_WORKER_REDIS_MARKER_READINESS_REDIS_SECRET=vp-marker-readiness-redis-retirement
 VP_WORKER_REDIS_MARKER_JANITOR_REDIS_SECRET=vp-marker-janitor-redis-retirement
 RETIREMENT_JOB=vp-worker-redis-marker-readiness-job
+rm -f \
+  "$SERVICE_DIR/vp-worker-redis-marker-janitor-job.state" \
+  "$SERVICE_DIR/vp-worker-redis-marker-janitor-job.identity"
 printf '%s\n' Complete >"$SERVICE_DIR/$RETIREMENT_JOB.state"
 vp_worker_redis_marker_expected_job_identity \
   "$RETIREMENT_IMAGE" "$RETIREMENT_GENERATION" readiness \
+  >"$TEST_ROOT/canonical-retirement-identity"
+awk -F'|' '
+  BEGIN { OFS="|" }
+  {
+    split($11, secrets, ",")
+    $11=secrets[2] "," secrets[1]
+    print
+  }
+' "$TEST_ROOT/canonical-retirement-identity" \
   >"$SERVICE_DIR/$RETIREMENT_JOB.identity"
+: >"$DOCKER_CALLS"
+vp_worker_redis_marker_remove_generation_jobs \
+  "$RETIREMENT_IMAGE" "$RETIREMENT_GENERATION" \
+  || fail "generation retirement rejected Swarm-normalized secret order"
+grep -Fq 'docker|service|rm|aaaaaaaaaaaaaaaaaaaaaaaa' "$DOCKER_CALLS" \
+  || fail "generation retirement did not remove normalized marker job"
+
+OTHER_GENERATION=m-other-1780000000-9998
+OTHER_IMAGE=vp-ffmpeg-worker-python:other-identity
+printf '%s\n' Complete >"$SERVICE_DIR/$RETIREMENT_JOB.state"
+vp_worker_redis_marker_expected_job_identity \
+  "$OTHER_IMAGE" "$OTHER_GENERATION" readiness \
+  >"$TEST_ROOT/canonical-other-generation-identity"
+awk -F'|' '
+  BEGIN { OFS="|" }
+  {
+    split($11, secrets, ",")
+    $11=secrets[2] "," secrets[1]
+    print
+  }
+' "$TEST_ROOT/canonical-other-generation-identity" \
+  >"$SERVICE_DIR/$RETIREMENT_JOB.identity"
+: >"$DOCKER_CALLS"
+vp_worker_redis_marker_remove_generation_jobs \
+  "$RETIREMENT_IMAGE" "$RETIREMENT_GENERATION" \
+  || fail "generation retirement rejected a valid newer fixed-name job"
+if grep -Fq 'docker|service|rm|aaaaaaaaaaaaaaaaaaaaaaaa' "$DOCKER_CALLS"; then
+  fail "generation retirement removed another valid generation"
+fi
+
+sed 's/:10001:10001:256/:0:10001:256/' \
+  "$TEST_ROOT/canonical-other-generation-identity" \
+  >"$SERVICE_DIR/$RETIREMENT_JOB.identity"
+: >"$DOCKER_CALLS"
+if vp_worker_redis_marker_remove_generation_jobs \
+  "$RETIREMENT_IMAGE" "$RETIREMENT_GENERATION" 2>/dev/null; then
+  fail "generation retirement accepted a malformed newer fixed-name job"
+fi
+if grep -Fq 'docker|service|rm|aaaaaaaaaaaaaaaaaaaaaaaa' "$DOCKER_CALLS"; then
+  fail "generation retirement removed a malformed newer generation"
+fi
+
+printf '%s\n' Complete >"$SERVICE_DIR/$RETIREMENT_JOB.state"
+cp \
+  "$TEST_ROOT/canonical-retirement-identity" \
+  "$SERVICE_DIR/$RETIREMENT_JOB.identity"
 FAKE_EMPTY_SERVICE_PS=true
 export FAKE_EMPTY_SERVICE_PS
 : >"$DOCKER_CALLS"
