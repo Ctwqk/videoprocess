@@ -3959,18 +3959,83 @@ grep -Fq 'python -m app.services.vision_consumer_cutover --safety' "$CALLS"
 
 : >"$CALLS"
 VISION_CONSUMER_AUDIT_MODE=converged
-if ! deploy_vp_app_services $images >/dev/null 2>&1; then
-  echo 'FAIL: converged vision deployment was blocked by the migration-only gate' >&2
+VISION_CONSUMER_CUTOVER_MODE=success
+if deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: converged vision deployment bypassed the unsafe pre-apply gate' >&2
   exit 1
 fi
-if grep -Fq 'runtime_schedules' "$CALLS" \
-  || grep -F 'python -m app.services.vision_consumer_cutover' "$CALLS" \
-    | grep -Fvq -- '--check-only'; then
-  echo 'FAIL: converged vision deployment reran migration-only checks' >&2
+grep -Fq 'python -m app.services.vision_consumer_cutover --check-only' "$CALLS"
+grep -Fq -- '--label vp.purpose=safety' "$CALLS"
+grep -Fq "docker|service rm $VISION_SAFETY_JOB_ID" "$CALLS"
+if grep -Fq 'docker|service update' "$CALLS" \
+  || grep -Fq 'docker|rm -f ' "$CALLS" \
+  || grep -Fq -- '--label vp.purpose=final-safety' "$CALLS" \
+  || grep -Fq -- '--label vp.purpose=reconcile' "$CALLS"; then
+  echo 'FAIL: unsafe converged vision deployment reached updates or cleanup' >&2
   exit 1
 fi
 
 : >"$CALLS"
+VISION_CUTOVER_GATE_MODE=success
+VISION_FINAL_CUTOVER_GATE_MODE=success
+if ! deploy_vp_app_services $images >/dev/null 2>&1; then
+  echo 'FAIL: safe converged vision deployment did not complete' >&2
+  exit 1
+fi
+grep -Fq 'python -m app.services.vision_consumer_cutover --check-only' "$CALLS"
+converged_safety_line="$(
+  grep -nF 'docker|service create' "$CALLS" \
+    | grep -F -- '--label vp.purpose=safety' \
+    | sed -n '1p' | cut -d: -f1 || true
+)"
+converged_first_update_line="$(
+  grep -nF 'docker|service update' "$CALLS" \
+    | sed -n '1p' | cut -d: -f1 || true
+)"
+converged_vision_update_line="$(
+  grep -nF 'docker|service update' "$CALLS" \
+    | grep -F -- '--image vp-ffmpeg-worker-python:deploy-0123456789ab' \
+    | grep -F 'vp-vision-worker-swarm' \
+    | sed -n '1p' | cut -d: -f1 || true
+)"
+converged_readiness_line="$(
+  grep -nF "$vision_readiness_probe" "$CALLS" \
+    | sed -n '1p' | cut -d: -f1 || true
+)"
+converged_final_safety_line="$(
+  grep -nF 'docker|service create' "$CALLS" \
+    | grep -F -- '--label vp.purpose=final-safety' \
+    | sed -n '1p' | cut -d: -f1 || true
+)"
+converged_reconcile_line="$(
+  grep -nF 'docker|service create' "$CALLS" \
+    | grep -F -- '--label vp.purpose=reconcile' \
+    | sed -n '1p' | cut -d: -f1 || true
+)"
+if [[ -z "$converged_safety_line" \
+  || -z "$converged_first_update_line" \
+  || -z "$converged_vision_update_line" \
+  || -z "$converged_readiness_line" \
+  || -z "$converged_final_safety_line" \
+  || -z "$converged_reconcile_line" \
+  || "$converged_safety_line" -ge "$converged_first_update_line" \
+  || "$converged_vision_update_line" -ge "$converged_readiness_line" \
+  || "$converged_readiness_line" -ge "$converged_final_safety_line" \
+  || "$converged_final_safety_line" -ge "$converged_reconcile_line" ]]; then
+  echo 'FAIL: converged vision deployment skipped or reordered safe reconciliation' >&2
+  exit 1
+fi
+grep -Fq 'log|vision consumer reconciliation verified' "$CALLS"
+grep -Fq "docker|service rm $VISION_FINAL_SAFETY_JOB_ID" "$CALLS"
+grep -Fq "docker|service rm $VISION_RECONCILE_JOB_ID" "$CALLS"
+if grep -Fq "docker|rm -f $LEGACY_VISION_CONTAINER_ID" "$CALLS"; then
+  echo 'FAIL: converged vision deployment attempted legacy container removal' >&2
+  exit 1
+fi
+
+: >"$CALLS"
+VISION_CUTOVER_GATE_MODE=unsafe
+VISION_CONSUMER_CUTOVER_MODE=failure
 VISION_SERVICE_EXISTS=false
 test_mark_worker_service_absent "$VP_VISION_WORKER_SERVICE"
 vp_require_worker_redis_runtime_state

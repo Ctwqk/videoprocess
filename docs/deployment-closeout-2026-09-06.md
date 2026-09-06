@@ -2,10 +2,48 @@
 
 ## Scope
 
-Finish the approved 127/150 deployment and fifth unlisted canary. Do not enable
-unreviewed public publication or place VideoProcess services on 126.
+Finish the approved 127/150 deployment. Do not enable unreviewed public
+publication or place VideoProcess services on 126. The fifth unlisted canary
+already ran on July 26; its authorization is not unused.
 
-## Verified State
+## Current Checkpoint, September 6 At 16:25 UTC
+
+- The first registered-worker rollout, release `fab36e3a818b`, is verified.
+  Transaction `tx-d01da0bb551fb3e07da99515c5c5be0a` is archived as `DONE`,
+  `succeeded`, revision 85. Worker, marker, and control promotion completed;
+  the VERSION 2 control manifest retains all seven selected secret identities.
+- Release `3ecb936d2f48` passed all four CI jobs (run `34041768295`). The
+  scheduled 16:00 deployment pulled and built it automatically, but stopped
+  safely before service changes during vision-consumer verification. Runtime
+  services remain on `fab36e3a818b`, not the newer built image.
+- Redis records now include the worker-registration UUID. The pending repair
+  recognizes canonical UUID identities, waits for superseded consumers to be
+  idle for more than two minutes, and atomically rechecks every record before
+  removing only zero-pending stale records. The Swarm waiter preserves exit 10
+  for a failed check-only task and allows the full reconciliation window.
+  Each rolling replacement now runs pre-apply and final safety gates followed
+  by reconciliation, even when its pre-update consumer audit was converged.
+- PDS remains independently deployed at
+  `6b8f8be32399fb0cf4278198e3d26d77cc8e8fd6`. VP and PDS retain separate
+  15-minute polling schedules. No VideoProcess deployment targets 126.
+- Fifth-canary evidence is
+  `.runtime/youtube-canary/unlisted-canary-a3148595-a060-440d-a0d0-5826ee7a4e96.json`.
+  It ran from 02:43 to 03:16 UTC on July 26, timed out, and was cancelled.
+  It created no upload operation, publication, or YouTube video. A sixth live
+  test requires fresh approval; no such upload has been started at this
+  checkpoint. A successful full production/feedback loop is still unproven.
+- Remaining acceptance is exact-commit CI and automatic rollout of this repair,
+  a fresh read-only preflight, and separately authorized live publication.
+- Final local repair verification: 1585 backend tests passed, 166 optional
+  integrations skipped, 17 deprecation warnings. The 92 vision-cutover tests
+  include 12 real isolated Redis 7.4.7 cases with no skips. All 184 canary-runner
+  tests and the worker-admission deployment contract passed. Changed Python
+  files pass Ruff and the changed service passes mypy; full-tree advisory
+  checks retain the existing 15 lint and 61 type findings.
+
+The notes below are earlier checkpoints, not the current deployment state.
+
+## Earlier Verified State
 
 - GitHub main before this repair: `8940cac83c0f9dd374cbc7408f393370b8967f3d`.
 - 150 is reachable from this workstation through SSH jump host 127.

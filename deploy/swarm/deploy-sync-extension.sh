@@ -11207,7 +11207,7 @@ vp_wait_vision_cutover_job() {
   local service_id="$1"
   local task_record
   local attempt
-  for ((attempt = 0; attempt < 120; attempt++)); do
+  for ((attempt = 0; attempt < 240; attempt++)); do
     task_record="$(
       docker service ps "$service_id" --no-trunc \
         --format '{{.ID}}|{{.DesiredState}}|{{.CurrentState}}'
@@ -11222,7 +11222,7 @@ vp_wait_vision_cutover_job() {
     [[ -z "$extra" && "$task_id" =~ ^[a-z0-9]{12,64}$ ]] \
       || return 1
     case "$desired_state|$current_state" in
-      Complete\|Complete*|Shutdown\|Complete*)
+      Complete\|Complete*|Shutdown\|Complete*|Complete\|Failed*|Shutdown\|Failed*)
         local exit_code
         exit_code="$(
           docker inspect "$task_id" \
@@ -11230,12 +11230,13 @@ vp_wait_vision_cutover_job() {
         )" || return 1
         [[ "$exit_code" =~ ^(0|[1-9][0-9]{0,2})$ \
           && "$exit_code" -le 255 ]] || return 1
+        [[ "$current_state" != Failed* || "$exit_code" -ne 0 ]] || return 1
         # Log transport availability is independent of the verified task exit.
         docker service logs "$service_id" >/dev/null 2>&1 || true
         return "$exit_code"
         ;;
-      Complete\|Failed*|Complete\|Rejected*|Complete\|Shutdown*|\
-      Shutdown\|Failed*|Shutdown\|Rejected*|Shutdown\|Shutdown*)
+      Complete\|Rejected*|Complete\|Shutdown*|\
+      Shutdown\|Rejected*|Shutdown\|Shutdown*)
         docker service logs "$service_id" >/dev/null 2>&1 || true
         return 1
         ;;
@@ -16687,13 +16688,15 @@ vp_apply_app_services() {
   vp_worker_admission_advance_live_worker_stage \
     "$VP_VISION_WORKER_SERVICE" "$python_worker" \
     applied verified || return 1
-  if [[ "$VP_VISION_CUTOVER_REQUIRED" == true ]]; then
+  if [[ "${UPDATE_SERVICES:-1}" -ne 0 ]]; then
     if ! vp_run_vision_cutover_job final-safety "$python_worker"; then
       echo "final vision cutover gate failed; legacy worker remains active" >&2
       return 1
     fi
     log "final vision cutover gate verified immediately before retirement"
-    vp_retire_legacy_vision_worker || return 1
+    if [[ "$VP_VISION_CUTOVER_REQUIRED" == true ]]; then
+      vp_retire_legacy_vision_worker || return 1
+    fi
     vp_reconcile_vision_consumers "$python_worker" || return 1
   fi
 
@@ -16736,13 +16739,11 @@ _vp_deploy_vp_app_services_locked() {
     return 1
   fi
   case "$VP_VISION_CUTOVER_REQUIRED" in
-    true)
+    true|false)
       if ! vp_require_vision_cutover_safe "${6:-}"; then
         vp_worker_admission_abort_failed_preapply || return 1
         return 1
       fi
-      ;;
-    false)
       ;;
     *)
       echo "invalid vision cutover state" >&2

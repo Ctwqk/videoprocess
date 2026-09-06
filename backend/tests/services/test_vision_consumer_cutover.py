@@ -24,6 +24,10 @@ DATABASE_SECRET = (
     "postgresql+asyncpg://vision-read:database-credential-sentinel@"
     "database.example:5432/videoprocess"
 )
+MANAGED_NAME = "vision-worker@150-vision:1:96431987-9cd9-4145-b6f8-106f30b74196"
+PREVIOUS_NAME = "vision-worker@150-vision:1:12345678-1234-4234-8234-123456789abc"
+SECOND_MANAGED_NAME = "vision-worker@150-vision:2:12345678-1234-4234-8234-123456789abc"
+OBSOLETE_NAME = "vision-worker@150-vision:1"
 
 
 class FakeRedis:
@@ -58,21 +62,17 @@ class FakeRedis:
         stream: str,
         group: str,
         _managed_pattern: str,
+        *_args: object,
     ):
         assert key_count == 1
         assert stream == "vp:tasks:vision"
         assert group == "vision-workers"
-        records = self.snapshots[max(0, self.reads - 1)]
-        managed = [
-            row["name"]
-            for row in records
-            if str(row["name"]).startswith("vision-worker@150-vision:")
-        ]
-        legacy = [row["name"] for row in records if row["name"] not in managed]
+        records = self.snapshots[min(max(0, self.reads - 1), len(self.snapshots) - 1)]
+        legacy = [row["name"] for row in records if row["name"] != MANAGED_NAME]
         if any(self.deleted_pending.get(str(name), 0) for name in legacy):
             raise redis.ResponseError("VISION_PENDING")
         self.deleted.extend(str(name) for name in legacy)
-        return [*managed, *legacy]
+        return [MANAGED_NAME, *legacy]
 
     async def aclose(self):
         return None
@@ -235,18 +235,18 @@ def make_invalid_secret(path: Path, invalid_class: str, value: str) -> Path:
 
 
 
-def consumer(name: str, *, pending: int = 0) -> dict[str, object]:
+def consumer(name: str, *, pending: int = 0, idle: object = 500) -> dict[str, object]:
     return {
         "name": name,
         "pending": pending,
-        "idle": 500,
+        "idle": idle,
         "inactive": 500,
     }
 
 
 @pytest.mark.anyio
 async def test_converged_requires_only_one_zero_pending_managed_consumer():
-    managed = consumer("vision-worker@150-vision:1")
+    managed = consumer(MANAGED_NAME)
 
     assert await vision_consumers_converged(FakeRedis([[managed]])) is True
     assert (
@@ -257,25 +257,25 @@ async def test_converged_requires_only_one_zero_pending_managed_consumer():
     )
     assert (
         await vision_consumers_converged(
-            FakeRedis([[consumer("vision-worker@150-vision:1", pending=1)]])
+            FakeRedis([[consumer(MANAGED_NAME, pending=1)]])
         )
         is False
     )
 
 
 @pytest.mark.anyio
-async def test_reconcile_removes_only_zero_pending_legacy_consumers():
-    managed = consumer("vision-worker@150-vision:1")
+async def test_reconcile_removes_only_stale_zero_pending_legacy_consumers():
+    managed = consumer(MANAGED_NAME)
     legacy = [
-        consumer("vision-worker@17add19d51d0:1"),
-        consumer("vision-worker@7a2bcf87f570:1"),
+        consumer("vision-worker@17add19d51d0:1", idle=120001),
+        consumer("vision-worker@7a2bcf87f570:1", idle=120001),
     ]
     redis = FakeRedis([legacy + [managed], [managed]])
 
     result = await reconcile_vision_consumers(redis, wait_attempts=1)
 
     assert result == {
-        "managed_consumer": "vision-worker@150-vision:1",
+        "managed_consumer": MANAGED_NAME,
         "removed_consumers": [
             "vision-worker@17add19d51d0:1",
             "vision-worker@7a2bcf87f570:1",
@@ -295,8 +295,8 @@ async def test_reconcile_waits_for_managed_consumer_before_deleting(monkeypatch)
         sleeps.append(delay)
 
     monkeypatch.setattr("app.services.vision_consumer_cutover.asyncio.sleep", fake_sleep)
-    legacy = consumer("vision-worker@7a2bcf87f570:1")
-    managed = consumer("vision-worker@150-vision:1")
+    legacy = consumer("vision-worker@7a2bcf87f570:1", idle=120001)
+    managed = consumer(MANAGED_NAME)
     redis = FakeRedis([[legacy], [legacy, managed], [managed]])
 
     await reconcile_vision_consumers(redis, wait_attempts=2, wait_delay_seconds=0.25)
@@ -308,7 +308,7 @@ async def test_reconcile_waits_for_managed_consumer_before_deleting(monkeypatch)
 @pytest.mark.anyio
 async def test_reconcile_rejects_pending_without_deleting():
     redis = FakeRedis(
-        [[consumer("vision-worker@7a2bcf87f570:1", pending=1), consumer("vision-worker@150-vision:1")]]
+        [[consumer("vision-worker@7a2bcf87f570:1", pending=1), consumer(MANAGED_NAME)]]
     )
 
     with pytest.raises(VisionConsumerCutoverError, match="pending"):
@@ -322,8 +322,8 @@ async def test_reconcile_rejects_duplicate_managed_consumers_without_deleting():
     redis = FakeRedis(
         [
             [
-                consumer("vision-worker@150-vision:1"),
-                consumer("vision-worker@150-vision:2"),
+                consumer(MANAGED_NAME),
+                consumer(SECOND_MANAGED_NAME),
             ]
         ]
     )
@@ -338,7 +338,7 @@ async def test_reconcile_rejects_duplicate_managed_consumers_without_deleting():
 async def test_reconcile_rejects_pending_detected_by_atomic_cutover():
     legacy_name = "vision-worker@7a2bcf87f570:1"
     redis = FakeRedis(
-        [[consumer(legacy_name), consumer("vision-worker@150-vision:1")]],
+        [[consumer(legacy_name, idle=120001), consumer(MANAGED_NAME)]],
         deleted_pending={legacy_name: 1},
     )
 
@@ -357,6 +357,204 @@ async def test_reconcile_rejects_malformed_consumer_records():
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "name",
+    [
+        OBSOLETE_NAME,
+        MANAGED_NAME.upper(),
+        MANAGED_NAME.replace("96431987-", "96431987"),
+        MANAGED_NAME.replace("96431987", "g6431987"),
+        MANAGED_NAME.replace(":1:", ":0:"),
+        MANAGED_NAME.replace(":1:", ":01:"),
+        MANAGED_NAME + ":extra",
+        MANAGED_NAME + "\n",
+        MANAGED_NAME.replace("150-vision", "other-host"),
+    ],
+)
+async def test_slot_only_and_noncanonical_ids_are_not_current_workers(name):
+    client = FakeRedis([[consumer(name)]])
+
+    assert await vision_consumers_converged(client) is False
+    with pytest.raises(VisionConsumerCutoverError, match="exactly one"):
+        await reconcile_vision_consumers(client, wait_attempts=1)
+    assert client.deleted == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("idle", "expected"), [(0, True), (120000, True), (120001, False)])
+async def test_converged_uses_attempted_interaction_idle_boundary(idle, expected):
+    managed = consumer(MANAGED_NAME, idle=idle)
+    managed["inactive"] = 9000000
+
+    assert await vision_consumers_converged(FakeRedis([[managed]])) is expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", [MANAGED_NAME, OBSOLETE_NAME])
+@pytest.mark.parametrize("idle", [None, -1, True, False, 1.5, "500", float("nan")])
+async def test_consumer_idle_must_be_a_nonnegative_integer(name, idle):
+    records = [consumer(name, idle=idle)]
+    if name != MANAGED_NAME:
+        records.append(consumer(MANAGED_NAME))
+    client = FakeRedis([records])
+
+    with pytest.raises(VisionConsumerCutoverError, match="malformed"):
+        await vision_consumers_converged(client)
+    with pytest.raises(VisionConsumerCutoverError, match="malformed"):
+        await reconcile_vision_consumers(client, wait_attempts=1)
+    assert client.deleted == []
+
+
+@pytest.mark.anyio
+async def test_consumer_idle_is_required():
+    record = consumer(MANAGED_NAME)
+    del record["idle"]
+    client = FakeRedis([[record]])
+
+    with pytest.raises(VisionConsumerCutoverError, match="malformed"):
+        await vision_consumers_converged(client)
+    with pytest.raises(VisionConsumerCutoverError, match="malformed"):
+        await reconcile_vision_consumers(client, wait_attempts=1)
+    assert client.deleted == []
+
+
+@pytest.mark.anyio
+async def test_reconcile_removes_slot_only_and_stale_previous_uuid_instances():
+    managed = consumer(MANAGED_NAME, idle=2970)
+    client = FakeRedis([
+        [consumer(OBSOLETE_NAME, idle=6533215), consumer(PREVIOUS_NAME, idle=120001), managed],
+        [managed],
+    ])
+
+    assert await reconcile_vision_consumers(client, wait_attempts=1) == {
+        "managed_consumer": MANAGED_NAME,
+        "removed_consumers": [OBSOLETE_NAME, PREVIOUS_NAME],
+    }
+    assert client.deleted == [OBSOLETE_NAME, PREVIOUS_NAME]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("idle", [0, 120000])
+async def test_reconcile_refuses_an_active_previous_uuid_instance(idle):
+    client = FakeRedis([[consumer(MANAGED_NAME), consumer(PREVIOUS_NAME, idle=idle)]])
+
+    with pytest.raises(VisionConsumerCutoverError, match="exactly one"):
+        await reconcile_vision_consumers(client, wait_attempts=1)
+    assert client.deleted == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("records", [[], [consumer(OBSOLETE_NAME)], [consumer(MANAGED_NAME, idle=120001)]])
+async def test_reconcile_refuses_missing_active_current_worker(records):
+    client = FakeRedis([records])
+
+    with pytest.raises(VisionConsumerCutoverError, match="exactly one"):
+        await reconcile_vision_consumers(client, wait_attempts=1)
+    assert client.deleted == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("other_name", [OBSOLETE_NAME, PREVIOUS_NAME])
+async def test_reconcile_waits_until_other_consumers_are_strictly_stale(monkeypatch, other_name):
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(cutover.asyncio, "sleep", fake_sleep)
+    managed = consumer(MANAGED_NAME)
+    client = FakeRedis([
+        [managed, consumer(other_name, idle=119999)],
+        [managed, consumer(other_name, idle=120000)],
+        [managed, consumer(other_name, idle=120001)],
+        [managed],
+    ])
+
+    result = await reconcile_vision_consumers(client, wait_attempts=3)
+
+    assert result["removed_consumers"] == [other_name]
+    assert sleeps == [1.0, 1.0]
+    assert client.reads == 4
+
+
+@pytest.mark.anyio
+async def test_reconcile_never_deletes_an_active_unmanaged_consumer(monkeypatch):
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(cutover.asyncio, "sleep", fake_sleep)
+    client = FakeRedis([[consumer(MANAGED_NAME), consumer(OBSOLETE_NAME, idle=120000)]])
+
+    with pytest.raises(VisionConsumerCutoverError, match="active"):
+        await reconcile_vision_consumers(client, wait_attempts=3)
+    assert client.deleted == []
+    assert client.reads == 3
+    assert sleeps == [1.0, 1.0]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("via_cli", [False, True])
+async def test_default_wait_allows_180_attempts_at_one_second(monkeypatch, tmp_path, via_cli):
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(cutover.asyncio, "sleep", fake_sleep)
+    managed = consumer(MANAGED_NAME)
+    waiting = [managed, consumer(OBSOLETE_NAME, idle=120000)]
+    ready = [managed, consumer(OBSOLETE_NAME, idle=120001)]
+    client = FakeRedis([waiting] * 179 + [ready, [managed]])
+
+    if via_cli:
+        configure_secret_files(monkeypatch, tmp_path)
+        monkeypatch.delenv("VISION_CUTOVER_WAIT_ATTEMPTS", raising=False)
+        monkeypatch.setattr(cutover.redis, "from_url", lambda *_args, **_kwargs: client)
+        assert await cutover.run() == 0
+    else:
+        result = await reconcile_vision_consumers(client)
+        assert result["managed_consumer"] == MANAGED_NAME
+    assert client.deleted == [OBSOLETE_NAME]
+    assert client.reads == 181
+    assert sleeps == [1.0] * 179
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", [MANAGED_NAME, PREVIOUS_NAME, OBSOLETE_NAME])
+async def test_reconcile_refuses_pending_work_that_appears_while_waiting(monkeypatch, name):
+    async def fake_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(cutover.asyncio, "sleep", fake_sleep)
+    managed = consumer(MANAGED_NAME)
+    client = FakeRedis([
+        [managed, consumer(OBSOLETE_NAME)],
+        [consumer(name, pending=1, idle=120001), managed],
+    ])
+
+    with pytest.raises(VisionConsumerCutoverError, match="pending"):
+        await reconcile_vision_consumers(client, wait_attempts=2)
+    assert client.deleted == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("final_records", [
+    [],
+    [consumer(PREVIOUS_NAME)],
+    [consumer(MANAGED_NAME, pending=1)],
+    [consumer(MANAGED_NAME, idle=120001)],
+    [consumer(MANAGED_NAME), consumer(OBSOLETE_NAME, idle=120001)],
+])
+async def test_final_read_must_be_exactly_the_active_retained_consumer(final_records):
+    client = FakeRedis([[consumer(MANAGED_NAME)], final_records])
+
+    with pytest.raises(VisionConsumerCutoverError, match="converge"):
+        await reconcile_vision_consumers(client, wait_attempts=1)
+
+
+@pytest.mark.anyio
 async def test_cli_rejects_redis_url_environment_only(monkeypatch, capsys):
     monkeypatch.setenv("REDIS_URL", REDIS_SECRET)
     monkeypatch.delenv("VISION_CUTOVER_REDIS_URL_FILE", raising=False)
@@ -364,7 +562,7 @@ async def test_cli_rejects_redis_url_environment_only(monkeypatch, capsys):
         cutover.redis,
         "from_url",
         lambda *_args, **_kwargs: FakeCliRedis(
-            [consumer("vision-worker@150-vision:1")]
+            [consumer(MANAGED_NAME)]
         ),
     )
 
@@ -381,7 +579,7 @@ async def test_cli_rejects_redis_url_environment_only(monkeypatch, capsys):
     ("client", "expected_status", "expected_stdout"),
     [
         pytest.param(
-            FakeCliRedis([consumer("vision-worker@150-vision:1")]),
+            FakeCliRedis([consumer(MANAGED_NAME)]),
             0,
             '{"converged": true}\n',
             id="converged",
@@ -450,7 +648,7 @@ def test_cli_rejects_invalid_credential_files_without_disclosure(
         cutover.redis,
         "from_url",
         lambda *_args, **_kwargs: FakeCliRedis(
-            [consumer("vision-worker@150-vision:1")]
+            [consumer(MANAGED_NAME)]
         ),
     )
     monkeypatch.setattr(
@@ -618,8 +816,8 @@ def test_reconcile_is_default_and_can_be_selected_explicitly(
     arguments,
 ):
     configure_secret_files(monkeypatch, tmp_path)
-    managed = consumer("vision-worker@150-vision:1")
-    client = FakeRedis([[consumer("vision-worker@legacy:1"), managed], [managed]])
+    managed = consumer(MANAGED_NAME)
+    client = FakeRedis([[consumer("vision-worker@legacy:1", idle=120001), managed], [managed]])
     monkeypatch.setattr(
         cutover.redis,
         "from_url",
@@ -642,9 +840,21 @@ def test_cli_modes_are_mutually_exclusive(monkeypatch, capsys):
 
 
 @pytest.mark.anyio
-async def test_reconcile_atomically_preserves_consumer_when_pending_appears(
-    monkeypatch: pytest.MonkeyPatch,
-):
+@pytest.mark.parametrize("race", [
+    "none",
+    "pending-legacy",
+    "pending-previous",
+    "pending-current",
+    "active-legacy",
+    "active-previous",
+    "active-slot-only",
+    "missing-current",
+    "replaced-current",
+    "stale-current",
+    "new-active-current",
+    "noncanonical-current",
+])
+async def test_reconcile_real_redis_atomic_stale_cleanup_and_races(monkeypatch, race):
     redis_url = os.environ.get("VISION_CUTOVER_REDIS_TEST_URL")
     if not redis_url:
         pytest.skip("VISION_CUTOVER_REDIS_TEST_URL is not configured")
@@ -652,7 +862,7 @@ async def test_reconcile_atomically_preserves_consumer_when_pending_appears(
     stream = f"vp:test:vision-cutover:{uuid.uuid4()}"
     group = "vision-workers"
     legacy_name = "vision-worker@legacy-race:1"
-    managed_name = "vision-worker@150-vision:1"
+    stale_names = [legacy_name, OBSOLETE_NAME, PREVIOUS_NAME]
     primary = redis.from_url(redis_url, decode_responses=True)
     racing = redis.from_url(redis_url, decode_responses=True)
 
@@ -664,13 +874,36 @@ async def test_reconcile_atomically_preserves_consumer_when_pending_appears(
             records = await primary.xinfo_consumers(target_stream, target_group)
             if not self.raced:
                 self.raced = True
-                claimed = await racing.xreadgroup(
-                    target_group,
-                    legacy_name,
-                    {target_stream: ">"},
-                    count=1,
-                )
-                assert claimed
+                if race.startswith("pending-"):
+                    name = {
+                        "pending-legacy": legacy_name,
+                        "pending-previous": PREVIOUS_NAME,
+                        "pending-current": MANAGED_NAME,
+                    }[race]
+                    await racing.xadd(target_stream, {"task": "race"})
+                    claimed = await racing.xreadgroup(
+                        target_group, name, {target_stream: ">"}, count=1,
+                    )
+                    assert claimed
+                elif race.startswith("active-"):
+                    name = {
+                        "active-legacy": legacy_name,
+                        "active-previous": PREVIOUS_NAME,
+                        "active-slot-only": OBSOLETE_NAME,
+                    }[race]
+                    # Redis >= 7.2 resets idle even when no work was returned.
+                    assert await racing.xreadgroup(
+                        target_group, name, {target_stream: ">"}, count=1,
+                    ) == []
+                elif race in {"missing-current", "replaced-current", "noncanonical-current"}:
+                    await racing.xgroup_delconsumer(target_stream, target_group, MANAGED_NAME)
+                    if race != "missing-current":
+                        name = PREVIOUS_NAME if race == "replaced-current" else MANAGED_NAME.upper()
+                        await racing.xreadgroup(target_group, name, {target_stream: ">"})
+                elif race == "stale-current":
+                    await cutover.asyncio.sleep(1.1)
+                elif race == "new-active-current":
+                    await racing.xgroup_createconsumer(target_stream, target_group, SECOND_MANAGED_NAME)
             return records
 
         async def xgroup_delconsumer(
@@ -690,19 +923,36 @@ async def test_reconcile_atomically_preserves_consumer_when_pending_appears(
 
     monkeypatch.setattr(cutover, "VISION_STREAM", stream)
     monkeypatch.setattr(cutover, "VISION_GROUP", group)
+    # Scale only integration-test time; unit tests exercise the real 120000ms boundary.
+    monkeypatch.setattr(cutover, "CONSUMER_ACTIVE_IDLE_MS", 1000, raising=False)
     try:
-        await primary.xadd(stream, {"task": "race"})
-        await primary.xgroup_create(stream, group, id="0")
-        await primary.xgroup_createconsumer(stream, group, legacy_name)
-        await primary.xgroup_createconsumer(stream, group, managed_name)
+        await primary.xadd(stream, {"task": "seed"})
+        await primary.xgroup_create(stream, group, id="$")
+        for name in stale_names:
+            await primary.xgroup_createconsumer(stream, group, name)
+        await cutover.asyncio.sleep(1.1)
+        await primary.xgroup_createconsumer(stream, group, MANAGED_NAME)
 
-        with pytest.raises(VisionConsumerCutoverError, match="pending"):
-            await reconcile_vision_consumers(RacingRedis(), wait_attempts=1)
+        if race == "none":
+            result = await reconcile_vision_consumers(RacingRedis(), wait_attempts=1)
+            assert result == {
+                "managed_consumer": MANAGED_NAME,
+                "removed_consumers": sorted(stale_names),
+            }
+        else:
+            match = "pending" if race.startswith("pending-") else "active|exactly one|changed"
+            with pytest.raises(VisionConsumerCutoverError, match=match):
+                await reconcile_vision_consumers(RacingRedis(), wait_attempts=1)
 
         consumers = await primary.xinfo_consumers(stream, group)
-        assert any(
-            row["name"] == legacy_name and row["pending"] == 1 for row in consumers
-        )
+        names = {row["name"] for row in consumers}
+        if race == "none":
+            assert names == {MANAGED_NAME}
+            assert consumers[0]["pending"] == 0
+        else:
+            assert set(stale_names) <= names
+            if race.startswith("pending-"):
+                assert sum(row["pending"] for row in consumers) == 1
     finally:
         await primary.delete(stream)
         await primary.aclose()

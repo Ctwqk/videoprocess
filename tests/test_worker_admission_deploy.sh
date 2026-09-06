@@ -27,6 +27,72 @@ mkdir -p "$(vp_worker_admission_root)"
 chmod 0700 "$(vp_worker_admission_root)"
 
 (
+  docker() {
+    case "$1 $2" in
+      'service ps') printf 'aaaaaaaaaaaaaaaaaaaaaaaa|%s|Failed 1 second ago\n' "$desired" ;;
+      'inspect aaaaaaaaaaaaaaaaaaaaaaaa') printf '%s\n' "$job_exit" ;;
+      'service logs') return 1 ;;
+      *) return 1 ;;
+    esac
+  }
+  for desired in Complete Shutdown; do
+    for job_exit in 2 10; do
+      result=0
+      vp_wait_vision_cutover_job bbbbbbbbbbbbbbbbbbbbbbbb || result=$?
+      [[ "$result" -eq "$job_exit" ]] || {
+        echo 'FAIL: failed vision task masked its application exit code' >&2
+        exit 1
+      }
+    done
+    job_exit=0
+    if vp_wait_vision_cutover_job bbbbbbbbbbbbbbbbbbbbbbbb; then
+      echo 'FAIL: failed vision task with inconsistent zero exit was accepted' >&2
+      exit 1
+    fi
+  done
+)
+
+(
+  ticks=0
+  sleep() { ticks=$((ticks + 1)); }
+  docker() {
+    case "$1 $2" in
+      'service ps')
+        if ((ticks < 180)); then
+          printf 'aaaaaaaaaaaaaaaaaaaaaaaa|Complete|Running 1 second ago\n'
+        else
+          printf 'aaaaaaaaaaaaaaaaaaaaaaaa|Complete|Complete 1 second ago\n'
+        fi
+        ;;
+      'inspect aaaaaaaaaaaaaaaaaaaaaaaa') printf '0\n' ;;
+      'service logs') return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  vp_wait_vision_cutover_job bbbbbbbbbbbbbbbbbbbbbbbb || {
+    echo 'FAIL: vision job wait ended before the safe reconciliation window' >&2
+    exit 1
+  }
+)
+
+(
+  UPDATE_SERVICES=1
+  gate_calls=""
+  vp_vision_cutover_required() { VP_VISION_CUTOVER_REQUIRED=false; }
+  vp_require_vision_cutover_safe() { gate_calls+=safe; return 1; }
+  vp_worker_admission_abort_failed_preapply() { gate_calls+='|abort'; }
+  vp_capture_app_snapshots() { return 1; }
+  if _vp_deploy_vp_app_services_locked a b c d e f; then
+    echo 'FAIL: converged vision skipped its pre-replacement safety gate' >&2
+    exit 1
+  fi
+  [[ "$gate_calls" == 'safe|abort' ]] || {
+    echo 'FAIL: converged vision failed after bypassing the safety gate' >&2
+    exit 1
+  }
+)
+
+(
   ROOT="$TEST_ROOT/control-promotion-identity"
   control_root="$(vp_worker_admission_root)"
   mkdir -p "$control_root"
@@ -3918,6 +3984,9 @@ PY
   VP_APP_ATTEMPTED_SERVICES=vp-ffmpeg-worker-go-swarm
   vp_vision_cutover_required() {
     VP_VISION_CUTOVER_REQUIRED=false
+  }
+  vp_require_vision_cutover_safe() {
+    return 0
   }
   vp_capture_app_snapshots() {
     printf 'vp-ffmpeg-worker-go-swarm|baseline-image\n'

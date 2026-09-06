@@ -22,8 +22,17 @@ VISION_STREAM = "vp:tasks:vision"
 VISION_GROUP = "vision-workers"
 VISION_CUTOVER_REDIS_URL_FILE = "VISION_CUTOVER_REDIS_URL_FILE"
 VISION_CUTOVER_DATABASE_URL_FILE = "VISION_CUTOVER_DATABASE_URL_FILE"
-MANAGED_VISION_CONSUMER = re.compile(r"^vision-worker@150-vision:[1-9][0-9]*$")
-_MANAGED_VISION_CONSUMER_LUA = "^vision%-worker@150%-vision:[1-9][0-9]*$"
+MANAGED_VISION_CONSUMER = re.compile(
+    r"vision-worker@150-vision:[1-9][0-9]*:"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+_MANAGED_VISION_CONSUMER_LUA = (
+    "^vision%-worker@150%-vision:[1-9][0-9]*:"
+    + "%-".join("[0-9a-f]" * length for length in (8, 4, 4, 4, 12))
+    + "$"
+)
+# Redis >= 7.2 idle measures the last attempted interaction, including empty reads.
+CONSUMER_ACTIVE_IDLE_MS = 120000
 _CONFIGURATION_ERROR = "vision cutover configuration invalid"
 _OPERATION_ERROR = "vision cutover operation failed"
 _SAFETY_ERROR = "vision cutover safety check failed"
@@ -42,33 +51,49 @@ local records = redis.call("XINFO", "CONSUMERS", KEYS[1], ARGV[1])
 local managed_name = nil
 local managed_count = 0
 local legacy_names = {}
+local active_other = false
+local active_idle_ms = tonumber(ARGV[3])
 
 for _, record in ipairs(records) do
   local name = nil
   local pending = nil
+  local idle = nil
   for index = 1, #record, 2 do
     if record[index] == "name" then
       name = record[index + 1]
     elseif record[index] == "pending" then
-      pending = tonumber(record[index + 1])
+      pending = record[index + 1]
+    elseif record[index] == "idle" then
+      idle = record[index + 1]
     end
   end
-  if not name or not pending then
+  if type(name) ~= "string" or name == ""
+      or type(pending) ~= "number" or pending < 0 or pending % 1 ~= 0
+      or type(idle) ~= "number" or idle < 0 or idle % 1 ~= 0 then
     return redis.error_reply("VISION_MALFORMED")
   end
   if pending ~= 0 then
     return redis.error_reply("VISION_PENDING")
   end
-  if string.match(name, ARGV[2]) then
+  if idle <= active_idle_ms and string.match(name, ARGV[2]) then
     managed_name = name
     managed_count = managed_count + 1
   else
+    if idle <= active_idle_ms then
+      active_other = true
+    end
     table.insert(legacy_names, name)
   end
 end
 
 if managed_count ~= 1 then
   return redis.error_reply("VISION_MANAGED_COUNT")
+end
+if managed_name ~= ARGV[4] then
+  return redis.error_reply("VISION_MANAGED_CHANGED")
+end
+if active_other then
+  return redis.error_reply("VISION_ACTIVE")
 end
 
 local result = {managed_name}
@@ -158,24 +183,27 @@ def _load_database_url() -> str:
     return database_url
 
 
-def _validated_consumers(records: object) -> list[tuple[str, int]]:
+def _validated_consumers(records: object) -> list[tuple[str, int, int]]:
     if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
         raise VisionConsumerCutoverError("vision consumer records are malformed")
 
-    validated: list[tuple[str, int]] = []
+    validated: list[tuple[str, int, int]] = []
     for record in records:
         if not isinstance(record, Mapping):
             raise VisionConsumerCutoverError("vision consumer records are malformed")
         name = record.get("name")
         pending = record.get("pending")
+        idle = record.get("idle")
         if (
             not isinstance(name, str)
             or not name
             or type(pending) is not int
             or pending < 0
+            or type(idle) is not int
+            or idle < 0
         ):
             raise VisionConsumerCutoverError("vision consumer records are malformed")
-        validated.append((name, pending))
+        validated.append((name, pending, idle))
     return validated
 
 
@@ -186,6 +214,7 @@ async def vision_consumers_converged(client: Any) -> bool:
     return (
         len(consumers) == 1
         and consumers[0][1] == 0
+        and consumers[0][2] <= CONSUMER_ACTIVE_IDLE_MS
         and MANAGED_VISION_CONSUMER.fullmatch(consumers[0][0]) is not None
     )
 
@@ -229,32 +258,36 @@ async def vision_cutover_safe(engine: Any, client: Any) -> bool:
 async def reconcile_vision_consumers(
     client: Any,
     *,
-    wait_attempts: int = 60,
+    wait_attempts: int = 180,
     wait_delay_seconds: float = 1.0,
 ) -> dict[str, object]:
     if wait_attempts < 1 or wait_delay_seconds < 0:
         raise ValueError("invalid vision consumer wait settings")
 
-    consumers: list[tuple[str, int]] = []
+    consumers: list[tuple[str, int, int]] = []
     managed: list[str] = []
     for attempt in range(wait_attempts):
         consumers = _validated_consumers(
             await client.xinfo_consumers(VISION_STREAM, VISION_GROUP)
         )
-        if any(pending != 0 for _, pending in consumers):
+        if any(pending != 0 for _, pending, _ in consumers):
             raise VisionConsumerCutoverError("vision consumer has pending work")
-        managed = [name for name, _ in consumers if MANAGED_VISION_CONSUMER.fullmatch(name)]
-        if len(managed) > 1:
-            raise VisionConsumerCutoverError(
-                "vision cutover requires exactly one managed consumer"
-            )
-        if len(managed) == 1:
+        managed = [
+            name for name, _, idle in consumers
+            if MANAGED_VISION_CONSUMER.fullmatch(name) and idle <= CONSUMER_ACTIVE_IDLE_MS
+        ]
+        if len(managed) == 1 and all(
+            name == managed[0] or idle > CONSUMER_ACTIVE_IDLE_MS
+            for name, _, idle in consumers
+        ):
             break
         if attempt + 1 < wait_attempts:
             await asyncio.sleep(wait_delay_seconds)
     else:
+        if len(managed) == 1:
+            raise VisionConsumerCutoverError("vision consumer is still active")
         raise VisionConsumerCutoverError(
-            "vision cutover requires exactly one managed consumer"
+            "vision cutover requires exactly one active managed consumer"
         )
 
     try:
@@ -264,14 +297,22 @@ async def reconcile_vision_consumers(
             VISION_STREAM,
             VISION_GROUP,
             _MANAGED_VISION_CONSUMER_LUA,
+            CONSUMER_ACTIVE_IDLE_MS,
+            managed[0],
         )
     except redis.ResponseError as exc:
         if "VISION_PENDING" in str(exc):
             raise VisionConsumerCutoverError("vision consumer has pending work") from None
         if "VISION_MANAGED_COUNT" in str(exc):
             raise VisionConsumerCutoverError(
-                "vision cutover requires exactly one managed consumer"
+                "vision cutover requires exactly one active managed consumer"
             ) from None
+        if "VISION_MANAGED_CHANGED" in str(exc):
+            raise VisionConsumerCutoverError("vision managed consumer changed") from None
+        if "VISION_ACTIVE" in str(exc):
+            raise VisionConsumerCutoverError("vision consumer is still active") from None
+        if "VISION_MALFORMED" in str(exc):
+            raise VisionConsumerCutoverError("vision consumer records are malformed") from None
         raise VisionConsumerCutoverError("vision consumer atomic cutover failed") from exc
 
     if (
@@ -283,13 +324,17 @@ async def reconcile_vision_consumers(
         raise VisionConsumerCutoverError("vision consumer atomic cutover failed")
     managed_name = atomic_result[0]
     removed = list(atomic_result[1:])
-    if MANAGED_VISION_CONSUMER.fullmatch(managed_name) is None:
+    if managed_name != managed[0] or MANAGED_VISION_CONSUMER.fullmatch(managed_name) is None:
         raise VisionConsumerCutoverError("vision consumer atomic cutover failed")
 
     final_consumers = _validated_consumers(
         await client.xinfo_consumers(VISION_STREAM, VISION_GROUP)
     )
-    if final_consumers != [(managed_name, 0)]:
+    if (
+        len(final_consumers) != 1
+        or final_consumers[0][:2] != (managed_name, 0)
+        or final_consumers[0][2] > CONSUMER_ACTIVE_IDLE_MS
+    ):
         raise VisionConsumerCutoverError("vision consumer cutover did not converge")
     return {
         "managed_consumer": managed_name,
@@ -305,9 +350,9 @@ async def run(*, check_only: bool = False, safety: bool = False) -> int:
         redis_url = _load_redis_url()
         database_url = _load_database_url() if safety else None
         wait_attempts = (
-            60
+            180
             if safety
-            else int(os.environ.get("VISION_CUTOVER_WAIT_ATTEMPTS", "60"))
+            else int(os.environ.get("VISION_CUTOVER_WAIT_ATTEMPTS", "180"))
         )
     except (ValueError, VisionConsumerCutoverConfigError):
         print(_CONFIGURATION_ERROR, file=sys.stderr)

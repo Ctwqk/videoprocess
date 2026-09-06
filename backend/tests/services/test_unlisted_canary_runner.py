@@ -63,25 +63,33 @@ def approved_redis_readiness_audit() -> dict:
             "vp:tasks:ffmpeg": {
                 "group": "ffmpeg-workers",
                 "pending": 0,
-                "active_consumers": ["ffmpeg-worker@150-gpu:1"],
+                "active_consumers": [
+                    "ffmpeg-worker@150-gpu:1:12345678-9abc-4def-8123-456789abcdef"
+                ],
                 "stale_consumer_count": 0,
             },
             "vp:tasks:ffmpeg_go": {
                 "group": "ffmpeg_go-workers",
                 "pending": 0,
-                "active_consumers": ["ffmpeg_go-worker@colima-127:1"],
+                "active_consumers": [
+                    "ffmpeg_go-worker@colima-127:1:12345678-9abc-4def-8123-456789abcdef"
+                ],
                 "stale_consumer_count": 0,
             },
             "vp:tasks:vision": {
                 "group": "vision-workers",
                 "pending": 0,
-                "active_consumers": ["vision-worker@150-vision:1"],
+                "active_consumers": [
+                    "vision-worker@150-vision:1:12345678-9abc-4def-8123-456789abcdef"
+                ],
                 "stale_consumer_count": 0,
             },
             "vp:tasks:youtube_publisher": {
                 "group": "youtube_publisher-workers",
                 "pending": 0,
-                "active_consumers": ["youtube_publisher-worker@150-publisher:1"],
+                "active_consumers": [
+                    "youtube_publisher-worker@150-publisher:1:12345678-9abc-4def-8123-456789abcdef"
+                ],
                 "stale_consumer_count": 0,
             },
             "vp:events": {
@@ -142,18 +150,59 @@ async def test_redis_pending_audit_records_five_stream_active_consumer_identitie
     runner.assert_redis_readiness_audit(audit)
 
 
+@pytest.mark.parametrize("worker_type", ("ffmpeg", "ffmpeg_go", "vision", "youtube_publisher"))
+@pytest.mark.parametrize(
+    ("suffix", "accepted"),
+    (
+        ("1:12345678-9abc-4def-8123-456789abcdef", True),
+        ("12:abcdef01-2345-4678-9abc-def012345678", True),
+        ("1", False),
+        ("1:", False),
+        ("1:12345678-9ABC-4DEF-8123-456789ABCDEF", False),
+        ("1:123456789abc4def8123456789abcdef", False),
+        ("1:1234567-89abc-4def-8123-456789abcdef", False),
+        ("1:12345678-9abc-4def-8123-456789abcde", False),
+        ("1:12345678-9abc-4def-8123-456789abcdeg", False),
+        ("1:{12345678-9abc-4def-8123-456789abcdef}", False),
+        ("1:12345678-9abc-4def-8123-456789abcdef:extra", False),
+        ("1:12345678-9abc-4def-8123-456789abcdef\n", False),
+        ("0:12345678-9abc-4def-8123-456789abcdef", False),
+        ("01:12345678-9abc-4def-8123-456789abcdef", False),
+    ),
+)
+def test_redis_readiness_worker_consumer_uuid_contract(
+    worker_type: str,
+    suffix: str,
+    accepted: bool,
+):
+    runner = load_runner()
+    audit = approved_redis_readiness_audit()
+    stream = f"vp:tasks:{worker_type}"
+    row = audit["streams"][stream]
+    prefix = row["active_consumers"][0].split(":", 1)[0]
+    row["active_consumers"] = [f"{prefix}:{suffix}"]
+
+    if accepted:
+        runner.assert_redis_readiness_audit(audit)
+    else:
+        with pytest.raises(runner.CanaryError, match=f"identity is invalid for {stream}$"):
+            runner.assert_redis_readiness_audit(audit)
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
         lambda audit: audit["streams"].pop("vp:tasks:vision"),
         lambda audit: audit["streams"]["vp:tasks:vision"].update(pending=1),
         lambda audit: audit["streams"]["vp:tasks:vision"].update(
-            active_consumers=["vision-worker@vp-vision-worker:1"]
+            active_consumers=[
+                "vision-worker@vp-vision-worker:1:12345678-9abc-4def-8123-456789abcdef"
+            ]
         ),
         lambda audit: audit["streams"]["vp:tasks:vision"].update(
             active_consumers=[
-                "vision-worker@150-vision:1",
-                "vision-worker@150-vision:2",
+                "vision-worker@150-vision:1:12345678-9abc-4def-8123-456789abcdef",
+                "vision-worker@150-vision:2:abcdef01-2345-4678-9abc-def012345678",
             ]
         ),
         lambda audit: audit["streams"]["vp:tasks:vision"].update(stale_consumer_count=1),
