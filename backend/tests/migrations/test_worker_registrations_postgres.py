@@ -16,6 +16,8 @@ from sqlalchemy import CheckConstraint, Index, UniqueConstraint
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
+from app.services.worker_deployment_cli import EXPECTED_MIGRATION_HEAD
+
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -973,7 +975,7 @@ async def test_postgres_16_schema_functions_and_lease_fencing_are_restrictive() 
                 await connection.fetchval(
                     "SELECT version_num FROM alembic_version"
                 )
-                == TARGET_REVISION
+                == EXPECTED_MIGRATION_HEAD
             )
             grant_columns = {
                 row["column_name"]

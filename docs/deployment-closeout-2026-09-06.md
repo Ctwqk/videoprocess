@@ -82,3 +82,9 @@ plus 39 dedicated real PG16.14 operator lifecycle tests passed. CI runs that
 focused lifecycle before other role-mutating suites and rejects skipped tests.
 The deployment rollback regression also passed. Advisory full-tree Ruff/mypy
 retain their unchanged 15/61 baseline findings.
+
+After aligning legacy integration assertions with the new migration head,
+the complete backend suite against isolated PG16 + Redis passed: 1623 passed,
+15 optional integrations skipped, 30 deprecation warnings (247.89 seconds).
+The earlier CI attempts stopped only at stale migration-version assertions;
+the dedicated PG16 lifecycle and Go registration integration gates passed.
