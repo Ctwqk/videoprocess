@@ -4440,6 +4440,62 @@ PY
     echo 'FAIL: legacy partial forward crash lost its captured marker baseline' >&2
     exit 1
   fi
+
+  for compensated_baseline in legacy_no_control managed; do
+    (
+      if [[ "$compensated_baseline" == legacy_no_control ]]; then
+        compensated_state="$legacy_partial_forward_state"
+        compensated_marker_state="$legacy_partial_marker_state"
+        VP_WORKER_ADMISSION_TRANSACTION_ID=tx-55555555555555555555555555555555
+      else
+        compensated_state="$partial_forward_state"
+        compensated_marker_state="$partial_marker_state"
+        VP_WORKER_ADMISSION_TRANSACTION_ID=tx-66666666666666666666666666666666
+      fi
+      VP_WORKER_ADMISSION_COMMIT=2222222222222222222222222222222222222222
+      vp_worker_admission_recovery_state() { command cat "$compensated_state"; }
+      vp_validate_topology() { return 0; }
+      vp_require_pipeline_network_identity() { return 0; }
+      vp_require_worker_redis_runtime_state() { return 0; }
+      vp_worker_redis_marker_owner_file() { return 0; }
+      vp_python_worker_prepare_controlled_directory() { printf '%s\n' "$1"; }
+      vp_worker_redis_marker_new_generation() {
+        printf 'm-222222222222-1700000000-0001\n'
+      }
+      vp_worker_admission_record_authority_intent() { return 0; }
+      vp_worker_redis_marker_provision_generation() { return 0; }
+      vp_worker_admission_record_marker_selection() { return 0; }
+      vp_worker_redis_marker_deactivate_managed_cron() { return 0; }
+      vp_worker_redis_marker_remove_generation_jobs() { return 0; }
+      vp_install_worker_redis_marker_control() { return 0; }
+      vp_run_worker_redis_marker_readiness() { return 1; }
+      vp_worker_redis_marker_restore_managed_state() { return 0; }
+      vp_worker_redis_marker_retire_generation() { return 0; }
+
+      if vp_prepare_worker_redis_marker_controls \
+        vp-ffmpeg-worker-python:deploy-222222222222; then
+        echo 'FAIL: unready marker candidate unexpectedly prepared' >&2
+        exit 1
+      fi
+      if ! vp_worker_admission_hydrate_recovery_context; then
+        echo "FAIL: $compensated_baseline readiness compensation destroyed recovery context" >&2
+        exit 1
+      fi
+      if [[ "$VP_WORKER_ADMISSION_RECOVERY_PARTIAL_FORWARD" != true \
+        || "$VP_WORKER_ADMISSION_PREPARED" != false \
+        || "$VP_WORKER_REDIS_MARKER_MANAGED_STATE" != "$compensated_marker_state" \
+        || "$VP_WORKER_ADMISSION_RECOVERY_ATTEMPTED_SERVICES" \
+          != 'vp-api-swarm vp-frontend-swarm' ]]; then
+        echo 'FAIL: compensated marker lost its abort-only recovery baseline' >&2
+        exit 1
+      fi
+      vp_worker_redis_marker_cleanup_transaction_baseline
+      if [[ -e "$compensated_marker_state" ]]; then
+        echo 'FAIL: terminal transaction cleanup retained the marker baseline' >&2
+        exit 1
+      fi
+    )
+  done
   vp_worker_admission_recovery_state() {
     command cat "$recovery_state"
   }

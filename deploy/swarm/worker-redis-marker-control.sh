@@ -420,6 +420,46 @@ extract_protocol_output() {
   printf '%s\n' "$protocol_line"
 }
 
+read_job_output() {
+  local mode="$1"
+  local service_id="$2"
+  [[ "$service_id" =~ ^[a-z0-9]{12,64}$ ]] || return 1
+  local output
+  if output="$(docker service logs --raw "$service_id" 2>/dev/null)"; then
+    printf '%s\n' "$output"
+    return 0
+  fi
+
+  # Swarm log transport can fail while the exact local task remains readable.
+  local expected actual task_record task_id task_service task_node
+  local task_state task_exit container_id task_image extra local_node
+  expected="$(expected_service_identity "$mode")" || return 1
+  actual="$(service_identity "$service_id")" || return 1
+  [[ "$actual" == "$expected" ]] || return 1
+  task_id="$(docker service ps "$service_id" --no-trunc --format '{{.ID}}')" \
+    || return 1
+  [[ "$task_id" =~ ^[a-z0-9]{12,64}$ ]] || return 1
+  task_record="$(docker inspect "$task_id" --format \
+    '{{.ID}}|{{.ServiceID}}|{{.NodeID}}|{{.Status.State}}|{{.Status.ContainerStatus.ExitCode}}|{{.Status.ContainerStatus.ContainerID}}|{{.Spec.ContainerSpec.Image}}')" \
+    || return 1
+  local inspected_task
+  IFS='|' read -r inspected_task task_service task_node task_state task_exit \
+    container_id task_image extra <<<"$task_record"
+  [[ "$inspected_task" == "$task_id" && "$task_service" == "$service_id" \
+    && "$task_node" =~ ^[a-z0-9]{12,64}$ \
+    && "$task_state" == complete && "$task_exit" == 0 \
+    && "$container_id" =~ ^[0-9a-f]{64}$ && "$task_image" == "$IMAGE" \
+    && -z "$extra" && "$task_record" != *$'\n'* ]] || return 1
+  local_node="$(docker info --format '{{.Swarm.NodeID}}')" || return 1
+  [[ "$task_node" == "$local_node" ]] || return 1
+  actual="$(docker container inspect "$container_id" --format \
+    '{{.Id}}|{{index .Config.Labels "com.docker.swarm.task.id"}}|{{index .Config.Labels "com.docker.swarm.service.id"}}|{{index .Config.Labels "com.docker.swarm.node.id"}}|{{.State.Status}}|{{.State.ExitCode}}|{{.Config.Image}}')" \
+    || return 1
+  [[ "$actual" == "$container_id|$task_id|$service_id|$task_node|exited|0|$IMAGE" ]] \
+    || return 1
+  docker logs "$container_id" 2>/dev/null
+}
+
 launch_job() {
   local mode="$1"
   local name="$2"
@@ -439,7 +479,8 @@ launch_job() {
     return "$remove_status"
   fi
 
-  if ! docker service create \
+  local service_id
+  if ! service_id="$(docker service create \
     --detach=true \
     --no-resolve-image \
     --name "$name" \
@@ -455,15 +496,19 @@ launch_job() {
     --env "WORKER_REDIS_MARKER_DATABASE_URL_FILE=/run/secrets/worker-marker-database-url" \
     --env "WORKER_REDIS_MARKER_REDIS_URL_FILE=/run/secrets/worker-marker-redis-url" \
     "$IMAGE" \
-    python -m "$module" "$command" >/dev/null; then
+    python -m "$module" "$command")"; then
     emit "mode=$mode" "code=job_create_failed"
+    return 3
+  fi
+  if [[ ! "$service_id" =~ ^[a-z0-9]{12,64}$ ]]; then
+    emit "mode=$mode" "code=job_identity_invalid"
     return 3
   fi
 
   local attempt
   local state=""
   for ((attempt = 0; attempt < MAX_WAIT_SECONDS; attempt++)); do
-    state="$(service_state "$name")" || {
+    state="$(service_state "$service_id")" || {
       emit "mode=$mode" "code=job_inspection_failed"
       return 3
     }
@@ -490,7 +535,7 @@ launch_job() {
   fi
 
   local output
-  if ! output="$(docker service logs --raw "$name" 2>/dev/null)"; then
+  if ! output="$(read_job_output "$mode" "$service_id")"; then
     emit "mode=$mode" "code=job_output_unavailable"
     return 3
   fi

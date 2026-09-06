@@ -44,3 +44,13 @@ The script is intentionally one-shot; a repeat fails without changes.
   now preserves the verified task exit code regardless of log transport.
 - Verify exact-commit CI and 127/150 rollout for the waiter correction.
 - Complete one approved unlisted canary and verify publication/feedback evidence.
+
+## Runtime Follow-up
+
+`5e05ded24918` passed all CI jobs (run `34020963732`) and reached service apply.
+The same Swarm log transport fault then blocked marker readiness. Exact local
+task/container output retrieval has been verified on 150 and now retains strict
+identity, exit-code, and protocol checks. Marker compensation also retains its
+baseline snapshot until transaction cleanup, preventing recovery hydration loss.
+The interrupted production transaction must be recovered before canary approval
+is consumed; API/frontend were updated, while workers still use prior images.

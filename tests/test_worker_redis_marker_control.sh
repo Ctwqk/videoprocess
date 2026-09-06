@@ -243,10 +243,11 @@ if [[ "${1:-} ${2:-}" == "service create" ]]; then
     created_state="$FAKE_JANITOR_TASK_STATE"
   fi
   printf '%s\n' "$created_state" >"$(service_path "$name" state)"
+  marker_service_id "$name"
   exit
 fi
 if [[ "${1:-} ${2:-}" == "service logs" ]]; then
-  case "${4:-}" in
+  case "$(marker_service_name "${4:-}")" in
     vp-worker-redis-marker-readiness-job)
       case "${FAKE_READINESS_RESULT:-ready}" in
         ready)

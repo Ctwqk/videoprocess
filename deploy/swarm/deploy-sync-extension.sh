@@ -16295,7 +16295,7 @@ vp_prepare_worker_redis_marker_controls() {
       VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
       VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION=""
       VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE=""
-      vp_worker_redis_marker_discard_managed_state || return 1
+      # Recovery still needs the baseline for the journaled forward marker.
     else
       echo "worker Redis marker candidate cleanup did not converge" >&2
     fi

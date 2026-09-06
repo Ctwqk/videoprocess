@@ -202,6 +202,7 @@ jobs:
             bash tests/test_staging_object_janitor_install.sh
             bash tests/test_staging_object_janitor_run.sh
             bash tests/test_worker_redis_marker_control.sh
+            bash tests/test_worker_marker_job_output.sh
             bash tests/test_channelops_soak_watch.sh
             bash tests/test_vp_unlisted_canary_scripts.sh
             bash tests/test_vp_production_smoke_script.sh
