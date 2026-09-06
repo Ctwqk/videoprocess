@@ -15,6 +15,7 @@ VP_WORKER_ADMISSION_LOCK_HELD=false
 VP_WORKER_ADMISSION_LOCK_DEPTH=0
 VP_WORKER_ADMISSION_LOCK_ROOT=""
 VP_WORKER_ADMISSION_LOCK_OWNER_BASHPID=""
+VP_WORKER_ADMISSION_PROMOTION_IDENTITY=""
 VP_WORKER_ADMISSION_LOCK_TOKEN=""
 VP_WORKER_ADMISSION_CURRENT_BASHPID=""
 VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
@@ -5157,6 +5158,8 @@ vp_worker_admission_hydrate_recovery_context() {
   vp_worker_admission_lock_assert || return 1
   VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
   VP_WORKER_ADMISSION_PREPARED=false
+  VP_WORKER_ADMISSION_COMMITTED=false
+  VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=false
   VP_WORKER_ADMISSION_COMMIT=""
   VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE=""
   VP_WORKER_ADMISSION_CANDIDATE_SERVICES=""
@@ -6356,6 +6359,32 @@ except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
       *) return 1 ;;
     esac
   fi
+  # Recover promotion flags from the durable phase, not this process's history.
+  case "$VP_WORKER_ADMISSION_RECOVERY_PHASE" in
+    WORKERS_PROMOTED|MARKER_PROMOTED|CONTROL_PROMOTED|ROLLBACK_WORKERS_PROMOTED|ROLLBACK_MARKER_PROMOTED|ROLLBACK_CONTROL_PROMOTED|RETIRING)
+      VP_WORKER_ADMISSION_COMMITTED=true
+      ;;
+  esac
+  case "$VP_WORKER_ADMISSION_RECOVERY_PHASE" in
+    MARKER_PROMOTED|CONTROL_PROMOTED|ROLLBACK_MARKER_PROMOTED|ROLLBACK_CONTROL_PROMOTED|RETIRING)
+      VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
+      VP_WORKER_REDIS_MARKER_CANDIDATE_READY=false
+      ;;
+  esac
+  case "$VP_WORKER_ADMISSION_RECOVERY_PHASE" in
+    CONTROL_PROMOTED|ROLLBACK_CONTROL_PROMOTED|RETIRING)
+      VP_WORKER_CONTROL_PREPARED=false
+      ;;
+  esac
+  case "$VP_WORKER_ADMISSION_RECOVERY_PHASE" in
+    ROLLBACK_VERIFIED|ROLLBACK_WORKERS_PROMOTED|ROLLBACK_MARKER_PROMOTED|ROLLBACK_CONTROL_PROMOTED)
+      VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
+      ;;
+    RETIRING)
+      [[ "$recovery_promotion_context" != rollback ]] \
+        || VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
+      ;;
+  esac
 }
 
 vp_worker_admission_allocate_rollback_attempt() {
@@ -7656,6 +7685,7 @@ for worker in workers:
 
 vp_worker_admission_promotion_identity() {
   local kind="$1"
+  VP_WORKER_ADMISSION_PROMOTION_IDENTITY=""
   local root="$VP_WORKER_ADMISSION_LOCK_ROOT"
   local transaction_id="$VP_WORKER_ADMISSION_TRANSACTION_ID"
   [[ "$transaction_id" =~ ^tx-[0-9a-f]{32}$ ]] || return 1
@@ -7742,6 +7772,7 @@ with open(temporary, "w", encoding="utf-8") as handle:
 os.chmod(temporary, 0o600)
 os.replace(temporary, path)
 ' "$path" "$name" "$service" "$generation" "$digest" || return 1
+  VP_WORKER_ADMISSION_PROMOTION_IDENTITY="$path"
   printf '%s\n' "$path"
 }
 
@@ -7973,8 +8004,9 @@ vp_worker_admission_complete_pending_promotion() {
 
 vp_worker_admission_promote_phase() {
   local kind="$1"
-  local identity
-  identity="$(vp_worker_admission_promotion_identity "$kind")" || return 1
+  # Identity preparation asserts ownership of the parent shell's writer lock.
+  vp_worker_admission_promotion_identity "$kind" >/dev/null || return 1
+  local identity="$VP_WORKER_ADMISSION_PROMOTION_IDENTITY"
   vp_worker_admission_capture_promotion_precondition \
     "$kind" "$identity" || return 1
   vp_worker_admission_load_replay_plan || return 1
@@ -7994,7 +8026,9 @@ vp_worker_admission_retire_transaction() {
   vp_worker_admission_process_retirement_journals "$root" || return 1
   vp_worker_control_process_retirements \
     "$root" "$VP_WORKER_CONTROL_GENERATION" || return 1
-  vp_worker_redis_marker_cleanup_transaction_baseline
+  vp_worker_redis_marker_cleanup_transaction_baseline || return 1
+  vp_worker_admission_discard_namespace \
+    "$root" "$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE"
 }
 
 vp_worker_admission_finish_transaction() {
@@ -10235,11 +10269,7 @@ vp_commit_worker_admission() {
       || return 1
   done
   vp_worker_admission_process_retirement_journals "$root" || return 1
-  local candidate_dir="$root/candidates/$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE"
-  if [[ -e "$candidate_dir" ]]; then
-    [[ -d "$candidate_dir" && ! -L "$candidate_dir" ]] || return 1
-    rm -rf "$candidate_dir" || return 1
-  fi
+  # The durable promotion verifier still needs the immutable candidate manifests.
   VP_WORKER_ADMISSION_COMMITTED=true
 }
 
@@ -13275,7 +13305,13 @@ PY
     fi
     if [[ -n "$selected_cron" ]]; then
     local cron_sha256
-    cron_sha256="$(shasum -a 256 "$selected_cron" | awk '{print $1}')" \
+    cron_sha256="$(
+      awk -v begin="$cron_begin" -v end="$cron_end" '
+        $0 == begin { inside=1 }
+        inside { print }
+        $0 == end { inside=0 }
+      ' "$selected_cron" | shasum -a 256 | awk '{print $1}'
+    )" \
       || status=1
     local references="$({
       printf '%s|%s|%s|%s|%s\n' \

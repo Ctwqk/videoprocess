@@ -24,6 +24,62 @@ log() {
 source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 
 (
+  ROOT="$TEST_ROOT/promotion-owner"
+  mkdir -p "$ROOT"
+  admission_root="$ROOT/state/vp-worker-admission"
+  mkdir -p "$admission_root"
+  chmod 0700 "$admission_root"
+  vp_worker_admission_lock_acquire "$admission_root"
+  trap 'vp_worker_admission_lock_release' EXIT
+  vp_worker_admission_promotion_identity() {
+    vp_worker_admission_lock_assert || return 1
+    VP_WORKER_ADMISSION_PROMOTION_IDENTITY="$ROOT/identity.json"
+    printf '%s\n' "$VP_WORKER_ADMISSION_PROMOTION_IDENTITY"
+  }
+  vp_worker_admission_capture_promotion_precondition() {
+    vp_worker_admission_lock_assert && [[ "$2" == "$ROOT/identity.json" ]]
+  }
+  vp_worker_admission_load_replay_plan() {
+    VP_WORKER_ADMISSION_REPLAY_REVISION=1
+    VP_WORKER_ADMISSION_REPLAY_OPERATION_ID=fixture-operation
+  }
+  python3() {
+    if [[ "${2:-}" == intent ]]; then return 0; fi
+    command python3 "$@"
+  }
+  vp_worker_admission_apply_promotion_effect() { vp_worker_admission_lock_assert; }
+  vp_worker_admission_complete_pending_promotion() { vp_worker_admission_lock_assert; }
+  if ! vp_worker_admission_promote_phase PROMOTE_WORKERS; then
+    echo 'FAIL: promotion identity escaped the real lock-owning shell' >&2
+    exit 1
+  fi
+)
+
+(
+  ROOT="$TEST_ROOT/retained-candidate"
+  VP_WORKER_ADMISSION_LOCK_ROOT="$ROOT/state/vp-worker-admission"
+  VP_WORKER_ADMISSION_PREPARED=true
+  VP_WORKER_ADMISSION_CANDIDATE_SERVICES=""
+  VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE=retained-candidate
+  candidate="$VP_WORKER_ADMISSION_LOCK_ROOT/candidates/retained-candidate"
+  mkdir -p "$candidate"
+  printf 'fixture\n' >"$candidate/worker.conf"
+  vp_worker_admission_process_retirement_journals() { return 0; }
+  vp_worker_control_process_retirements() { return 0; }
+  vp_worker_redis_marker_cleanup_transaction_baseline() { return 0; }
+  vp_commit_worker_admission
+  if [[ ! -f "$candidate/worker.conf" ]]; then
+    echo 'FAIL: worker commit removed evidence before promotion verification' >&2
+    exit 1
+  fi
+  vp_worker_admission_retire_transaction
+  [[ ! -e "$candidate" ]] || {
+    echo 'FAIL: completed promotion retained its candidate namespace' >&2
+    exit 1
+  }
+)
+
+(
   VP_WORKER_ADMISSION_LOCK_ROOT="$TEST_ROOT/preapply-janitor"
   mkdir -p "$VP_WORKER_ADMISSION_LOCK_ROOT"
   config="$VP_WORKER_ADMISSION_LOCK_ROOT/staging-object-janitor.conf"
@@ -2890,7 +2946,8 @@ vp_worker_admission_promote_phase() {
 }
 
 vp_worker_admission_retire_transaction() {
-  return 0
+  vp_worker_admission_discard_namespace \
+    "$VP_WORKER_ADMISSION_LOCK_ROOT" "$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE"
 }
 
 if vp_restore_worker_admission_transaction \
@@ -3258,6 +3315,13 @@ assert_order \
   fi
 
   marker_payload="$(vp_worker_admission_marker_selection_json)"
+  cp "$marker_cron" "$marker_cron.original"
+  printf '# unrelated maintenance\n*/5 * * * * /operator/staging-janitor\n' >>"$marker_cron"
+  if [[ "$(vp_worker_admission_marker_selection_json)" != "$marker_payload" ]]; then
+    echo 'FAIL: unrelated maintenance cron changed marker identity' >&2
+    exit 1
+  fi
+  cp "$marker_cron.original" "$marker_cron"
   python3 - "$marker_config" "$marker_cron" "$marker_payload" <<'PY'
 import hashlib
 import json
@@ -4984,6 +5048,8 @@ PY
       mv "$recovery_marker_state" "$hidden_marker_state"
     fi
     promotion_status=0
+    VP_WORKER_ADMISSION_COMMITTED=false
+    VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=false
     vp_worker_admission_hydrate_recovery_context || promotion_status=$?
     if [[ "$promotion_phase" == MARKER_PROMOTED ]]; then
       mv "$hidden_marker_state" "$recovery_marker_state"
@@ -4998,6 +5064,30 @@ PY
       echo "FAIL: fresh promotion hydration lost $promotion_phase context" >&2
       exit 1
     fi
+    case "$promotion_phase" in
+      *WORKERS_PROMOTED|*MARKER_PROMOTED)
+        [[ "$VP_WORKER_ADMISSION_COMMITTED" == true ]] || {
+          echo "FAIL: $promotion_phase lost committed worker state" >&2
+          exit 1
+        }
+        ;;
+    esac
+    case "$promotion_phase" in
+      *MARKER_PROMOTED)
+        [[ "$VP_WORKER_REDIS_MARKER_CONTROL_PREPARED" == false ]] || {
+          echo "FAIL: $promotion_phase re-prepared the committed marker" >&2
+          exit 1
+        }
+        ;;
+    esac
+    case "$promotion_phase" in
+      ROLLBACK_*)
+        [[ "$VP_WORKER_ADMISSION_ROLLBACK_CONVERGED" == true ]] || {
+          echo "FAIL: $promotion_phase lost verified rollback convergence" >&2
+          exit 1
+        }
+        ;;
+    esac
   done
   vp_worker_admission_recovery_state() {
     command cat "$recovery_state"

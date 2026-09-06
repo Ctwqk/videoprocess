@@ -1779,6 +1779,7 @@ vp_worker_admission_promotion_identity() {
     "{\"docker_id\":null,\"generation\":\"$generation\",\"kind\":\"manifest\",\"name\":\"$name\",\"purpose\":\"promotion\",\"service\":\"$service\",\"spec_digest\":\"0000000000000000000000000000000000000000000000000000000000000000\"}" \
     >"$identity"
   chmod 0600 "$identity"
+  VP_WORKER_ADMISSION_PROMOTION_IDENTITY="$identity"
   printf '%s\n' "$identity"
 }
 
