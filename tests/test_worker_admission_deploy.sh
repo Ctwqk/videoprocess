@@ -27,6 +27,40 @@ mkdir -p "$(vp_worker_admission_root)"
 chmod 0700 "$(vp_worker_admission_root)"
 
 (
+  ROOT="$TEST_ROOT/control-promotion-identity"
+  control_root="$(vp_worker_admission_root)"
+  mkdir -p "$control_root"
+  VP_WORKER_CONTROL_GENERATION=c-0123456789abcdef0123
+  VP_WORKER_ADMISSION_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-0123456789ab
+  VP_WORKER_CONTROL_PREPARED=true
+  VP_WORKER_ADMISSION_COMMITTED=true
+  VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
+  VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
+  VP_WORKER_CONTROL_PRIOR_GENERATION=""
+  VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION="$VP_WORKER_CONTROL_GENERATION"
+  ids=()
+  for n in 1 2 3 4 5 6 7; do ids+=("$(printf '%064d' "$n")"); done
+  candidate="$control_root/control-candidates/$VP_WORKER_CONTROL_GENERATION.conf"
+  vp_worker_control_write_manifest "$candidate" "$VP_WORKER_CONTROL_GENERATION" \
+    "$VP_WORKER_ADMISSION_CONTROL_IMAGE" "${ids[@]}"
+  cp "$candidate" "$control_root/expected.conf"
+  vp_require_pipeline_network_identity() { return 0; }
+  vp_require_worker_service_descriptor() { return 0; }
+  vp_require_staging_object_janitor_control() { return 0; }
+  vp_worker_control_process_retirements() { return 0; }
+  vp_commit_worker_control_generation
+  cmp -s "$control_root/expected.conf" "$control_root/control-current.conf" || {
+    echo 'FAIL: control promotion discarded the selected secret identities' >&2
+    exit 1
+  }
+  vp_finalize_worker_control_rollback
+  cmp -s "$control_root/expected.conf" "$control_root/control-current.conf" || {
+    echo 'FAIL: control rollback discarded the selected secret identities' >&2
+    exit 1
+  }
+)
+
+(
   unsafe_root="$TEST_ROOT/group-writable-sync-root"
   ROOT="$unsafe_root"
   mkdir -p "$ROOT/state"
@@ -4555,6 +4589,12 @@ VP_WORKER_CONTROL_GENERATION=c-0123456789abcdef0123
 VP_WORKER_ADMISSION_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-0123456789ab
 VP_WORKER_CONTROL_PRIOR_GENERATION=c-11111111111111111111
 VP_WORKER_CONTROL_PRIOR_IMAGE=vp-ffmpeg-worker-python:deploy-111111111111
+control_commit_ids=()
+for n in 1 2 3 4 5 6 7; do control_commit_ids+=("$(printf '%064d' "$n")"); done
+vp_worker_control_write_manifest \
+  "$(vp_worker_admission_root)/control-candidates/$VP_WORKER_CONTROL_GENERATION.conf" \
+  "$VP_WORKER_CONTROL_GENERATION" "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+  "${control_commit_ids[@]}"
 vp_require_worker_service_descriptor() {
   printf 'descriptor|%s\n' "$1" >>"$CONTROL_COMMIT_CALLS"
 }

@@ -3119,6 +3119,12 @@ VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION=c-aaaaaaaaaaaaaaaaaaaa
 VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-aaaaaaaaaaaa
 VP_WORKER_CONTROL_GENERATION=c-11111111111111111111
 VP_WORKER_ADMISSION_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-111111111111
+rollback_control_ids=()
+for n in 1 2 3 4 5 6 7; do rollback_control_ids+=("$(printf '%064d' "$n")"); done
+vp_worker_control_write_manifest \
+  "$(vp_worker_admission_root)/control-current.conf" \
+  "$VP_WORKER_CONTROL_GENERATION" "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
+  "${rollback_control_ids[@]}"
 vp_require_pipeline_network_identity() {
   VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
 }
