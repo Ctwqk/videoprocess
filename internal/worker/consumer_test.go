@@ -4988,10 +4988,10 @@ func newWorkerIntakePostgresFixture(
 		admin.Close()
 		t.Fatalf("read intake migration version: %v", err)
 	}
-	if migration != "034_worker_registrations" {
+	if migration != "035_worker_creator_edges" {
 		admin.Close()
 		t.Fatalf(
-			"intake migration version = %q; want 034_worker_registrations",
+			"intake migration version = %q; want 035_worker_creator_edges",
 			migration,
 		)
 	}
