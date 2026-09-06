@@ -157,13 +157,98 @@ chmod 0700 "$(vp_worker_admission_root)"
     "$VP_WORKER_ADMISSION_CONTROL_IMAGE" "${ids[@]}"
   cp "$candidate" "$control_root/expected.conf"
   vp_require_pipeline_network_identity() { return 0; }
-  vp_require_worker_service_descriptor() { return 0; }
   vp_require_staging_object_janitor_control() { return 0; }
   vp_worker_control_process_retirements() { return 0; }
-  vp_commit_worker_control_generation
+  (
+    vp_require_worker_service_descriptor() { return 0; }
+    vp_commit_worker_control_generation
+  )
   cmp -s "$control_root/expected.conf" "$control_root/control-current.conf" || {
     echo 'FAIL: control promotion discarded the selected secret identities' >&2
     exit 1
+  }
+  # Finalization validates the durable rollback and unchanged worker identities.
+  vp_worker_admission_lock_acquire "$control_root"
+  trap 'vp_worker_admission_lock_release' EXIT
+  VP_WORKER_ADMISSION_TRANSACTION_ID=tx-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE=rollback-123456789012345678
+  VP_WORKER_ADMISSION_CANDIDATE_SERVICES=""
+  control_selection="$(
+    vp_worker_admission_control_selection_json "$control_root/control-current.conf"
+  )"
+  python3 - "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" "$control_root" \
+    "$VP_WORKER_ADMISSION_TRANSACTION_ID" \
+    "$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE" "$control_selection" <<'PY'
+import copy
+import hashlib
+import json
+from pathlib import Path
+import runpy
+import sys
+
+helper = runpy.run_path(sys.argv[1])
+root = Path(sys.argv[2])
+transaction_id, namespace = sys.argv[3:5]
+control = json.loads(sys.argv[5])
+credentials = {}
+for purpose in helper["DATABASE_PURPOSES"]:
+    path = root / purpose
+    path.write_text("postgresql://fixture:password@database/videoprocess\n")
+    path.chmod(0o400)
+    credentials[purpose] = helper["_capture_credential"](str(path), "vp_" + purpose)
+state = helper["_new_document"](
+    target_commit="2" * 40,
+    target_backend_image="vp-backend:deploy-222222222222",
+    target_go_image="vp-ffmpeg-worker-go:deploy-222222222222",
+    namespace="2" * 40, baseline_kind="managed", credentials=credentials,
+)
+state.update(transaction_id=transaction_id, phase="ROLLBACK_MARKER_PROMOTED", revision=41)
+state["baseline"].update(captured=True, control=copy.deepcopy(control))
+state["failed_forward"]["captured"] = True
+state["rollback"].update(
+    attempt=1, namespace=namespace, marker_generation="m-rb-aaaaaaaaaaaa-1", control=control,
+)
+state["promotion"].update(workers=True, marker=True, control=False)
+live = {}
+for index, name in enumerate(sorted(helper["APP_SERVICES"]), 1):
+    baseline = dict(name=name, existed=False, docker_service_id=None, image=None, spec_digest=None)
+    if name in helper["RUNTIME_AUTHORITY_SERVICES"]:
+        spec = dict(Name=name, TaskTemplate=dict(ContainerSpec=dict(Image=control["image"])))
+        service_id = f"{index:024x}"
+        live[name] = dict(ID=service_id, Spec=spec)
+        digest = hashlib.sha256(json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        baseline.update(existed=True, docker_service_id=service_id,
+                        image=control["image"], spec_digest=digest)
+    state["baseline"]["services"].append(baseline)
+helper["_validate_document"](state)
+(root / "transactions").mkdir(mode=0o700)
+(root / "transactions" / transaction_id).mkdir(mode=0o700)
+active = root / "transactions/active.json"
+active.write_bytes(helper["_canonical"](state))
+active.chmod(0o600)
+(root / "live.json").write_text(json.dumps(live))
+PY
+  docker() {
+    python3 - "$control_root/live.json" "$@" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+arguments = sys.argv[2:]
+if len(arguments) != 5 or arguments[:2] != ["service", "inspect"] or arguments[3] != "--format":
+    raise SystemExit(97)
+services = json.loads(Path(sys.argv[1]).read_text())
+service = next((item for item in services.values()
+                if arguments[2] in (item["ID"], item["Spec"]["Name"])), None)
+if service is None:
+    raise SystemExit(1)
+if arguments[4] == "{{.ID}}|{{.Spec.Name}}":
+    print(service["ID"] + "|" + service["Spec"]["Name"])
+elif arguments[4] == "{{json .Spec}}":
+    print(json.dumps(service["Spec"]))
+else:
+    raise SystemExit(97)
+PY
   }
   vp_finalize_worker_control_rollback
   cmp -s "$control_root/expected.conf" "$control_root/control-current.conf" || {

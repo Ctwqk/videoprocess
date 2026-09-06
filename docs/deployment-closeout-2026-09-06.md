@@ -104,6 +104,15 @@ was fixed and re-reviewed with no remaining P1/P2 findings. A fresh production
 status query returned `CLOSED`, no guarded job, and zero waiting/active jobs or
 queued/running nodes. PDS independently polled its unchanged revision at 18:52.
 
+CI `34053626183` for `906c8680144aaadb873fd2fe249fa3dd1731a752` passed Go,
+frontend, backend, and all 39 focused tests. The deployment job failed at an
+older control-manifest fixture that invoked rollback finalization without an
+active journal. The follow-up changes only test setup and CI ordering/log labels:
+it supplies validated durable state and exact live identities, retains both
+byte-for-byte manifest assertions, and runs short contracts before the long
+entry-point suite. No production validation is relaxed and no service rollout
+has been authorized by this failed CI run.
+
 The notes below are earlier checkpoints, not the current deployment state.
 
 ## Earlier Verified State

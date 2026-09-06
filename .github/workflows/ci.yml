@@ -204,26 +204,30 @@ jobs:
           set -o pipefail
           mkdir -p ci-evidence/deploy
           printf '%s\n' "$GITHUB_SHA" > ci-evidence/deploy/commit.txt
+          run_contract() {
+            printf '\nRunning contract: %s\n' "$*"
+            "$@"
+          }
           {
-            bash tests/test_ci_workflow_contract.sh
-            bash tests/test_vp_deploy_ci_gate.sh
-            python3 tests/test_worker_admission_transaction.py
-            python3 tests/test_worker_marker_prior_config.py
-            python3 tests/test_worker_control_untouched_rollback.py
-            bash tests/test_vp_deploy_sync_extension.sh
-            bash tests/test_worker_admission_deploy.sh
-            bash tests/test_worker_control_recovery_executor.sh
-            bash tests/test_worker_admission_rollback.sh
-            bash tests/test_staging_object_janitor_install.sh
-            bash tests/test_staging_object_janitor_run.sh
-            bash tests/test_worker_redis_marker_control.sh
-            bash tests/test_worker_marker_job_output.sh
-            bash tests/test_channelops_soak_watch.sh
-            bash tests/test_vp_unlisted_canary_scripts.sh
-            bash tests/test_vp_production_smoke_script.sh
-            bash tests/test_macos_deploy_paths.sh
-            bash -n deploy/swarm/deploy-sync-extension.sh
-            bash -n deploy/swarm/channelops-soak-watch.sh
+            run_contract bash tests/test_ci_workflow_contract.sh
+            run_contract bash tests/test_vp_deploy_ci_gate.sh
+            run_contract python3 tests/test_worker_admission_transaction.py
+            run_contract python3 tests/test_worker_marker_prior_config.py
+            run_contract python3 tests/test_worker_control_untouched_rollback.py
+            run_contract bash tests/test_worker_admission_deploy.sh
+            run_contract bash tests/test_worker_control_recovery_executor.sh
+            run_contract bash tests/test_worker_admission_rollback.sh
+            run_contract bash tests/test_staging_object_janitor_install.sh
+            run_contract bash tests/test_staging_object_janitor_run.sh
+            run_contract bash tests/test_worker_redis_marker_control.sh
+            run_contract bash tests/test_worker_marker_job_output.sh
+            run_contract bash tests/test_channelops_soak_watch.sh
+            run_contract bash tests/test_vp_unlisted_canary_scripts.sh
+            run_contract bash tests/test_vp_production_smoke_script.sh
+            run_contract bash tests/test_macos_deploy_paths.sh
+            run_contract bash -n deploy/swarm/deploy-sync-extension.sh
+            run_contract bash -n deploy/swarm/channelops-soak-watch.sh
+            run_contract bash tests/test_vp_deploy_sync_extension.sh
           } | tee ci-evidence/deploy/contracts.txt
       - name: Upload deployment evidence
         if: always()

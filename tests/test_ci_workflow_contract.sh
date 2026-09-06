@@ -63,4 +63,9 @@ grep -Fq "fetch-depth: 0" <<<"$deploy_checkout_block" \
 grep -Eq '^  (backend|go|frontend|deploy-contracts):$' "$workflow" \
   || fail "workflow has no blocking jobs"
 
+fast_contract_line="$(grep -nF 'bash tests/test_worker_admission_deploy.sh' "$workflow" | cut -d: -f1)"
+full_contract_line="$(grep -nF 'bash tests/test_vp_deploy_sync_extension.sh' "$workflow" | cut -d: -f1)"
+[[ "$fast_contract_line" -lt "$full_contract_line" ]] \
+  || fail "short admission contracts must run before the full deployment suite"
+
 echo "VideoProcess CI workflow contract passed"
