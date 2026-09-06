@@ -6,7 +6,79 @@ Finish the approved 127/150 deployment. Do not enable unreviewed public
 publication or place VideoProcess services on 126. The fifth unlisted canary
 already ran on July 26; its authorization is not unused.
 
-## Current Checkpoint, September 6 At 16:25 UTC
+## Repair Verification, September 6 At 22:05 UTC
+
+The session-retirement repair adds migration `036_worker_session_signal` and
+an administrator-owned catalog-only helper. It grants no general signaling
+privilege to deployment. Both ordinary activation/revocation and canonical
+runtime cleanup retire old sessions through this boundary; helper lock waits
+are limited to two seconds. A separately committed drain handles pre-commit
+reconnects, subject to the documented PostgreSQL PID signaling limitation.
+
+Forward rollout now journals each existing worker attempt before database activation.
+Failures after activation, including a failed drain or marker check before
+Docker replacement, retain that worker in durable rollback selection. A Docker
+preflight refusal cannot remove an existing database activation attempt.
+
+Verification: 240 targeted PG16/service tests pass with no skips. The complete
+backend run passed 1825 tests, with 15 optional integrations skipped and 30
+deprecation warnings, against password-authenticated PG16 and Redis. All Go
+package tests, deployment and rollback contracts, CI wiring, changed-file Ruff,
+and focused mypy pass; full-tree advisory findings remain the existing 15 lint
+and 61 type issues. The final review constrained the change to workers whose
+durable baseline proves they existed. Initially absent workers keep their prior
+pre-creation authority cleanup and post-activation Docker-attempt recording;
+this repair does not redesign absent-worker rollback. Baseline lookup errors,
+missing or duplicate entries, and invalid existence values fail closed.
+The final scoped review found no introduced issues; the 26 transaction tests
+and worker-admission deployment contract pass with this narrowed implementation.
+
+Exact-commit CI, administrator installation, and ordinary deployment remain
+required before claiming production convergence. No production bootstrap or
+new rollout has been performed at this checkpoint. The production state below
+remains true; the independent PDS poll succeeded again at 21:52.
+
+## Production Checkpoint, September 6 At 21:10 UTC
+
+- Release `22f0e541e28b7406aabee53c55733aa65a74300f` passed all four CI jobs
+  in run `34056199862`. Ordinary scheduled deployment fetched and built it.
+- Interrupted rollback recovery now completes. Latest diagnostic transaction
+  `tx-6141a941330878c5b8b3e094e2fc1476` was recovered through the ordinary
+  transaction reconciler, and no active transaction remains.
+- Forward deployment still fails before the first worker replacement. The
+  exact PostgreSQL error at 20:54:24 was `permission denied to terminate process`
+  in `vp_worker_grant_activate`, while retiring the old CPU worker's sessions.
+  A real isolated PG16 regression reproduces the same SQLSTATE 42501. The
+  original lifecycle fixture had never kept a prior worker connection open.
+- API, frontend, four workers, runner, and outbox remain at `fab36e3a818b`.
+  AutoFlow retains migration-compatible `22f0e541e28b`. The deployment is NOT
+  converged. Feature aggregator remains `e51240f5c0f7`; PDS independently
+  verified unchanged `6b8f8be32399` at 21:07.
+- Only the VP application deployment timer is temporarily held while the
+  permission repair is developed. PDS, cleanup, readiness, and other projects'
+  timer lines are unchanged. Restore the exact held VP line after verification;
+  do not overwrite the full crontab from an older backup.
+- A diagnostic scope error briefly affected unrelated ForWin services on126.
+  All six service versions were restored and verified running. See
+  [incident record](deployment-incidents/2026-09-06-diagnostic-project-scope.md)
+  for exact effects, recovery evidence, and filesystem verification limits.
+- Fifth-canary approval was consumed by the July26 failed attempt; it produced
+  no YouTube video. No sixth canary or public upload has started. The production
+  schedule is CLOSED with no active backlog. The overall goal remains incomplete.
+
+The 21:19 read-only preflight failed while reading the absent
+`/Users/wenjieliu/VideoProcess-app/.deploy-sync-source-commit`. Its generic
+`ssh (CalledProcessError)` is not a connection outage: independent SSH checks
+worked on127 and150. The marker must be written by a successful ordinary
+deployment, never synthesized to pass preflight. Evidence is
+`.runtime/youtube-canary/preflight-20260906-before-signal-repair.json`.
+Independent YouTubeManager auth status was authenticated; quota was only a local
+estimate, not a verified platform quota. All stream pending counts were zero;
+stale consumer counts were GPU2, CPU8, vision1, publisher1, events0. A final
+post-deployment cleanup must revalidate CLOSED/idle state, current consumer
+identity, and zero pending before removing only superseded idle metadata.
+
+## Earlier Checkpoint, September 6 At 16:25 UTC
 
 - The first registered-worker rollout, release `fab36e3a818b`, is verified.
   Transaction `tx-d01da0bb551fb3e07da99515c5c5be0a` is archived as `DONE`,

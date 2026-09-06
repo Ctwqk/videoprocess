@@ -1299,6 +1299,26 @@ if (
 ):
     raise SystemExit("durable app progress did not replay monotonically")
 PY
+  (
+    VP_WORKER_ADMISSION_TRANSACTION_HELPER="$transaction_helper"
+    VP_WORKER_ADMISSION_LOCK_ROOT="$transaction_root"
+    VP_WORKER_ADMISSION_LOCK_FD=18
+    VP_APP_ATTEMPTED_SERVICES=vp-api-swarm
+    vp_update_runtime_service() { return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"; }
+    vp_record_app_service_attempt vp-ffmpeg-worker-go-swarm
+    if vp_update_app_runtime_service vp-ffmpeg-worker-go-swarm image stop-first; then
+      exit 1
+    fi
+    if vp_update_app_runtime_service vp-frontend-swarm image stop-first; then
+      exit 1
+    fi
+    transaction_cli read-app-progress "$transaction_root" | python3 -c '
+import json, sys
+progress = json.load(sys.stdin)
+assert progress["attempted_services"] == ["vp-api-swarm", "vp-ffmpeg-worker-go-swarm"], progress
+'
+    vp_remove_app_service_attempt vp-ffmpeg-worker-go-swarm
+  )
   assert_transition_rejected \
     3 FORWARD_VERIFIED 'with a pending forward worker'
   assert_transition_rejected \

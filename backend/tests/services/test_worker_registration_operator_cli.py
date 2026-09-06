@@ -204,8 +204,13 @@ async def test_upsert_uses_only_schema_qualified_function_and_redacts(
         async def close(self) -> None:
             return None
 
-    async def fake_connect(url: str) -> FakeConnection:
+    async def fake_connect(url: str, **options) -> FakeConnection:
         assert "database-secret" in url
+        assert options == {
+            "timeout": 10,
+            "command_timeout": 60,
+            "server_settings": {"lock_timeout": "2s", "statement_timeout": "60s"},
+        }
         return FakeConnection()
 
     monkeypatch.setattr(operator_cli.asyncpg, "connect", fake_connect)
@@ -309,7 +314,7 @@ async def test_upsert_uses_only_schema_qualified_function_and_redacts(
         ),
     ],
 )
-async def test_operator_mutations_use_one_exact_function_call(
+async def test_operator_mutations_commit_then_repeat_guarded_retirement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -338,8 +343,13 @@ async def test_operator_mutations_use_one_exact_function_call(
         async def close(self) -> None:
             return None
 
-    async def fake_connect(url: str) -> FakeConnection:
+    async def fake_connect(url: str, **options) -> FakeConnection:
         assert "database-secret" in url
+        assert options == {
+            "timeout": 10,
+            "command_timeout": 60,
+            "server_settings": {"lock_timeout": "2s", "statement_timeout": "60s"},
+        }
         return FakeConnection()
 
     monkeypatch.setattr(operator_cli.asyncpg, "connect", fake_connect)
@@ -350,7 +360,8 @@ async def test_operator_mutations_use_one_exact_function_call(
 
     assert await operator_cli.run(arguments) == 0
 
-    assert calls == [(expected_query, expected_arguments)]
+    repetitions = 2 if arguments[0] in {"activate", "revoke-grant"} else 1
+    assert calls == [(expected_query, expected_arguments)] * repetitions
     assert not any(
         token in expected_query.lower()
         for token in (
@@ -384,7 +395,7 @@ async def test_operator_failure_is_stable_and_sanitized(
     )
     url_file.chmod(0o400)
 
-    async def failing_connect(url: str) -> object:
+    async def failing_connect(url: str, **options) -> object:
         raise OSError(f"could not connect with {url}")
 
     monkeypatch.setattr(operator_cli.asyncpg, "connect", failing_connect)
@@ -407,3 +418,30 @@ async def test_operator_failure_is_stable_and_sanitized(
         "code": "worker_operator_operation_failed",
         "status": "error",
     }
+
+
+@pytest.mark.parametrize("fail_on", [1, 2])
+async def test_operator_distinguishes_post_commit_failure(monkeypatch, capsys, fail_on):
+    calls = []
+
+    class Connection:
+        async def fetchval(self, query, *args):
+            calls.append((query, args))
+            if len(calls) == fail_on:
+                raise operator_cli.asyncpg.PostgresError("private-error-details")
+            return uuid.uuid4()
+
+        async def close(self):
+            pass
+
+    async def connect(_, **options):
+        return Connection()
+
+    monkeypatch.setattr(operator_cli, "load_database_url_file", lambda _: "postgresql://operator@localhost/test")
+    monkeypatch.setattr(operator_cli.asyncpg, "connect", connect)
+    assert await operator_cli.run([
+        "activate", "--service-name", "vp-ffmpeg-worker-go-swarm", "--generation", "41",
+    ]) == 4
+    assert len(calls) == fail_on
+    code = "worker_operator_operation_failed" if fail_on == 1 else "worker_operator_post_commit_drain_failed"
+    assert json.loads(capsys.readouterr().out) == {"status": "error", "code": code}

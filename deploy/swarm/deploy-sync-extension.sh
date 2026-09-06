@@ -11148,10 +11148,10 @@ vp_require_channelops_migration_head() {
     --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
     "$backend_image" \
     python -m app.services.worker_deployment_cli verify-head >/dev/null; then
-    echo "ChannelOps migration head gate failed; expected exactly 035_worker_creator_edges" >&2
+    echo "ChannelOps migration head gate failed; expected exactly 036_worker_session_signal" >&2
     return 1
   fi
-  log "ChannelOps migration head verified: 035_worker_creator_edges"
+  log "ChannelOps migration head verified: 036_worker_session_signal"
 }
 
 vp_runtime_redis_secret_id() {
@@ -13847,6 +13847,37 @@ vp_worker_admission_capture_failed_forward() {
     <<<"$payload" >/dev/null
 }
 
+vp_record_worker_activation_attempt() {
+  local service="$1"
+  [[ "${UPDATE_SERVICES:-1}" -ne 0 ]] || return 0
+  vp_worker_admission_lock_assert || return 1
+  vp_worker_admission_kind "$service" >/dev/null || return 1
+  local state
+  state="$(vp_worker_admission_recovery_state)" || return 1
+  local existed
+  existed="$(printf '%s\n' "$state" | python3 -I -c '
+import json
+import sys
+
+try:
+    service, transaction_id = sys.argv[1:]
+    state = json.load(sys.stdin)
+    baseline = state["baseline"]
+    matches = [item for item in baseline["services"] if item["name"] == service]
+    if (state["transaction_id"] != transaction_id
+            or state["phase"] != "FORWARD_APPLYING"
+            or baseline["captured"] is not True
+            or len(matches) != 1 or type(matches[0]["existed"]) is not bool):
+        raise ValueError
+    print(str(matches[0]["existed"]).lower())
+except (KeyError, TypeError, ValueError):
+    raise SystemExit(1)
+' "$service" "$VP_WORKER_ADMISSION_TRANSACTION_ID")" || return 1
+  # New workers retain their pre-creation authority cleanup, not image rollback.
+  [[ "$existed" == true ]] || return 0
+  vp_record_app_service_attempt "$service"
+}
+
 vp_record_app_service_attempt() {
   local service="$1"
   case " $VP_APP_ATTEMPTED_SERVICES " in
@@ -13900,14 +13931,19 @@ vp_update_app_runtime_service() {
   local image="$2"
   local order="$3"
   local update_status=0
+  local previously_attempted=false
 
+  if vp_app_service_was_attempted "$service" "$VP_APP_ATTEMPTED_SERVICES"; then
+    previously_attempted=true
+  fi
   vp_record_app_service_attempt "$service" || return 1
   if vp_update_runtime_service "$service" "$image" "$order"; then
     return 0
   else
     update_status=$?
   fi
-  if [[ "$update_status" -eq "$VP_SERVICE_UPDATE_NOT_ATTEMPTED" ]]; then
+  if [[ "$update_status" -eq "$VP_SERVICE_UPDATE_NOT_ATTEMPTED" \
+    && "$previously_attempted" == false ]]; then
     vp_remove_app_service_attempt "$service" || return 1
   fi
   return 1
@@ -16797,6 +16833,8 @@ vp_apply_app_services() {
   fi
 
   vp_require_worker_redis_marker_status || return 1
+  # Activation can commit before its drain fails, so journal rollback intent first.
+  vp_record_worker_activation_attempt vp-ffmpeg-worker-go-swarm || return 1
   vp_activate_worker_admission \
     vp-ffmpeg-worker-go-swarm || return 1
   vp_require_worker_redis_marker_status || return 1
@@ -16812,6 +16850,7 @@ vp_apply_app_services() {
     applied verified || return 1
 
   vp_require_worker_redis_marker_status || return 1
+  vp_record_worker_activation_attempt "$VP_PYTHON_WORKER_SERVICE" || return 1
   vp_activate_worker_admission \
     "$VP_PYTHON_WORKER_SERVICE" || return 1
   vp_require_worker_redis_marker_status || return 1
@@ -16827,6 +16866,7 @@ vp_apply_app_services() {
     applied verified || return 1
 
   vp_require_worker_redis_marker_status || return 1
+  vp_record_worker_activation_attempt "$VP_VISION_WORKER_SERVICE" || return 1
   vp_activate_worker_admission \
     "$VP_VISION_WORKER_SERVICE" || return 1
   vp_require_worker_redis_marker_status || return 1
@@ -16853,6 +16893,7 @@ vp_apply_app_services() {
   fi
 
   vp_require_worker_redis_marker_status || return 1
+  vp_record_worker_activation_attempt "$VP_PUBLISHER_SERVICE" || return 1
   vp_activate_worker_admission \
     "$VP_PUBLISHER_SERVICE" || return 1
   vp_require_worker_redis_marker_status || return 1

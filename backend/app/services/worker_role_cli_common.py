@@ -7,7 +7,7 @@ import hmac
 import os
 import secrets
 import stat
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1290,6 +1290,7 @@ async def drop_login_roles(
     role_names: Sequence[str],
     *,
     state_guard: Callable[[], None] | None = None,
+    retire_sessions: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     if connection.is_in_transaction():
         raise WorkerRoleCommonError(
@@ -1303,7 +1304,12 @@ async def drop_login_roles(
     if state_guard is not None:
         state_guard()
     try:
-        await quarantine_login_roles(connection, ordered_roles)
+        if retire_sessions is None:
+            await quarantine_login_roles(connection, ordered_roles)
+        else:
+            await quarantine_login_roles(
+                connection, ordered_roles, retire_sessions=retire_sessions,
+            )
         if state_guard is not None:
             state_guard()
         async with connection.transaction():
@@ -1337,6 +1343,8 @@ async def drop_login_roles(
 async def quarantine_login_roles(
     connection: asyncpg.Connection,
     role_names: Sequence[str],
+    *,
+    retire_sessions: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     if connection.is_in_transaction():
         raise WorkerRoleCommonError(
@@ -1371,6 +1379,11 @@ async def quarantine_login_roles(
             connection,
             ordered_roles,
         )
+    if retire_sessions is not None:
+        # Worker-only signaling runs after NOLOGIN/membership changes commit.
+        # Failure propagates: never fall back to the generic signal or drop roles.
+        await retire_sessions()
+        return
     await connection.execute(
         """
         SELECT pg_catalog.pg_terminate_backend(activity.pid)

@@ -243,11 +243,26 @@ async def run(argv: Sequence[str] | None = None) -> int:
 
     connection: asyncpg.Connection | None = None
     try:
-        connection = await asyncpg.connect(asyncpg_url(database_url))
+        connection = await asyncpg.connect(
+            asyncpg_url(database_url),
+            timeout=10,
+            command_timeout=60,
+            server_settings={"lock_timeout": "2s", "statement_timeout": "60s"},
+        )
         result = await connection.fetchval(
             operation.query,
             *operation.arguments,
         )
+        if args.command in {"activate", "revoke-grant"}:
+            # asyncpg completes the implicit commit before returning fetchval.
+            # Re-enter the same idempotent guards in a separate transaction to
+            # drain pre-commit reconnects. Lease fences remain authoritative;
+            # one sweep cannot guarantee all in-flight authentications finished.
+            try:
+                await connection.fetchval(operation.query, *operation.arguments)
+            except (asyncpg.PostgresError, OSError, OperatorError):
+                _emit("error", "worker_operator_post_commit_drain_failed")
+                return 4
     except (asyncpg.PostgresError, OSError, OperatorError):
         _emit("error", "worker_operator_operation_failed")
         return 4

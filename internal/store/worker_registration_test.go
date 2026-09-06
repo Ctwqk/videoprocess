@@ -1234,9 +1234,9 @@ func newWorkerPostgresFixture(t *testing.T) *workerPostgresFixture {
 		admin.Close()
 		t.Fatalf("read migration version: %v", err)
 	}
-	if migration != "035_worker_creator_edges" {
+	if migration != "036_worker_session_signal" {
 		admin.Close()
-		t.Fatalf("migration version = %q; want 035_worker_creator_edges", migration)
+		t.Fatalf("migration version = %q; want 036_worker_session_signal", migration)
 	}
 
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]

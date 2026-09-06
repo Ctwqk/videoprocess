@@ -22,6 +22,9 @@ required_lines=(
   "uv sync --frozen --extra dev"
   ".venv/bin/alembic upgrade head"
   ".venv/bin/python -m pytest"
+  "tests/migrations/test_worker_operator_creator_edges_postgres.py"
+  "tests/migrations/test_worker_session_signal_postgres.py"
+  "PG16 worker operator lifecycle tests skipped"
   'CHANNELOPS_REQUIRE_DATABASE="1"'
   'go test -count=1 ./internal/channelops ./internal/store'
   "name: Run Go worker registration fence integration tests"
@@ -67,5 +70,10 @@ fast_contract_line="$(grep -nF 'bash tests/test_worker_admission_deploy.sh' "$wo
 full_contract_line="$(grep -nF 'bash tests/test_vp_deploy_sync_extension.sh' "$workflow" | cut -d: -f1)"
 [[ "$fast_contract_line" -lt "$full_contract_line" ]] \
   || fail "short admission contracts must run before the full deployment suite"
+
+signal_test_line="$(grep -nF 'tests/migrations/test_worker_session_signal_postgres.py' "$workflow" | cut -d: -f1)"
+go_integration_line="$(grep -nF 'name: Run PostgreSQL ChannelOps integration tests' "$workflow" | cut -d: -f1)"
+[[ "$signal_test_line" -lt "$go_integration_line" ]] \
+  || fail "session signaling tests must run before shared-role integration suites"
 
 echo "VideoProcess CI workflow contract passed"

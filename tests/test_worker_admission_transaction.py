@@ -140,6 +140,85 @@ class RollbackPreparedSecretTests(unittest.TestCase):
     def read_state(self):
         return json.loads(self.active.read_bytes())
 
+    def prepare_absent_forward_worker(self):
+        self.state.update(phase="FORWARD_APPLYING", revision=0)
+        self.state["rollback"] = dict(
+            attempt=0, namespace=None, marker_generation=None,
+            control=None, marker=None, workers=[],
+        )
+        self.state["failed_forward"] = dict(captured=False, control=None, services=[])
+        self.worker.update(applied_stage="prepared", commit="2" * 40,
+                           image="vp-ffmpeg-worker-go:deploy-222222222222")
+        self.state["forward"]["workers"] = [self.worker]
+        absent = dict(name=self.worker["service"], existed=False,
+                      docker_service_id=None, image=None, spec_digest=None)
+        self.state["baseline"]["services"] = [
+            copy.deepcopy(absent) if item["name"] == absent["name"] else item
+            for item in self.state["baseline"]["services"]
+        ]
+        self.write_state()
+        directory = self.active.parent / TRANSACTION_ID
+        directory.mkdir(mode=0o700)
+        self.progress_path = directory / "app-progress.json"
+        self.progress_path.write_bytes(HELPER["_canonical"](dict(
+            schema=1, transaction_id=TRANSACTION_ID, target_commit="2" * 40,
+            attempted_services=[], migration_state="pending",
+        )))
+        self.progress_path.chmod(0o600)
+
+    def test_existing_worker_activation_intent_survives_restart(self):
+        self.prepare_absent_forward_worker()
+        self.state["baseline"]["services"] = [
+            dict(item, existed=True, docker_service_id="d" * 24,
+                 image=OLD_IMAGE, spec_digest="e" * 64)
+            if item["name"] == self.worker["service"] else item
+            for item in self.state["baseline"]["services"]
+        ]
+        self.write_state()
+        for _ in range(2):
+            self.shell("vp_record_worker_activation_attempt vp-ffmpeg-worker-go-swarm\n")
+            progress = json.loads(self.progress_path.read_bytes())
+            self.assertEqual(progress["attempted_services"], [self.worker["service"]])
+
+    def test_absent_worker_activation_preserves_precreation_cleanup(self):
+        self.prepare_absent_forward_worker()
+        before = (self.active.read_bytes(), self.progress_path.read_bytes())
+        self.shell("vp_record_worker_activation_attempt vp-ffmpeg-worker-go-swarm\n")
+        self.assertEqual((self.active.read_bytes(), self.progress_path.read_bytes()), before)
+        self.assertEqual(self.read_state()["forward"]["workers"], [self.worker])
+
+    def test_activation_baseline_lookup_fails_closed_without_progress_write(self):
+        self.prepare_absent_forward_worker()
+        original = copy.deepcopy(self.state)
+        for invalid in ("missing", "duplicate", "invalid-bool", "uncaptured", "wrong-phase"):
+            with self.subTest(invalid=invalid):
+                self.state = copy.deepcopy(original)
+                baseline = self.state["baseline"]
+                worker = next(item for item in baseline["services"]
+                              if item["name"] == self.worker["service"])
+                if invalid == "missing":
+                    baseline["services"] = [
+                        item for item in baseline["services"] if item is not worker
+                    ]
+                elif invalid == "duplicate":
+                    baseline["services"].append(copy.deepcopy(worker))
+                elif invalid == "invalid-bool":
+                    worker["existed"] = "false"
+                elif invalid == "uncaptured":
+                    baseline["captured"] = False
+                else:
+                    self.state["phase"] = "PREPARING"
+                self.write_state(validate=False)
+                before = self.progress_path.read_bytes()
+                self.shell("vp_record_worker_activation_attempt vp-ffmpeg-worker-go-swarm\n",
+                           success=False)
+                self.assertEqual(self.progress_path.read_bytes(), before)
+        self.state = original
+        self.write_state()
+        self.shell("vp_worker_admission_recovery_state() { return 1; }; "
+                   "vp_record_worker_activation_attempt vp-ffmpeg-worker-go-swarm\n",
+                   success=False)
+
     def assert_rejected_without_write(self, reference):
         before = self.active.read_bytes()
         self.lookup(reference, success=False)

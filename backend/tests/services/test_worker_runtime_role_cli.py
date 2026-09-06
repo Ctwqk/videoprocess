@@ -560,3 +560,37 @@ async def test_revoke_checks_durable_admission_when_login_is_missing(
         "code": "worker_runtime_role_operation_failed",
         "status": "error",
     }
+
+
+@pytest.mark.parametrize("service_name", tuple(runtime_cli.TOPOLOGY))
+async def test_worker_cleanup_callback_binds_explicit_canonical_identity(service_name):
+    from app.services.worker_session_signal_sql import SERVICES_SQL
+
+    assert f"'{service_name}'" in SERVICES_SQL
+    generation = runtime_cli.MAX_GENERATION
+    names = runtime_cli.role_names_for_generation(service_name, generation)
+    calls = []
+
+    class Connection:
+        async def fetchval(self, query, *arguments):
+            calls.append((query, arguments))
+            return 0
+
+    retire = runtime_cli._generation_session_retirement(
+        Connection(), service_name, generation, names,
+    )
+    assert calls == []
+    assert retire is not None
+    await retire()
+    assert calls == [(
+        "SELECT vp_worker_session_private.retire($1, $2)",
+        (service_name, generation),
+    )]
+
+
+def test_generic_cleanup_has_no_privileged_callback():
+    service_name = "generic-fixture"
+    names = runtime_cli.role_names_for_generation(service_name, 1)
+    assert runtime_cli._generation_session_retirement(
+        object(), service_name, 1, names,
+    ) is None

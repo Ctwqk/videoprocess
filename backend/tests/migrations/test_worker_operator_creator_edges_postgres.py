@@ -16,11 +16,15 @@ import asyncpg
 import pytest
 from sqlalchemy.engine import make_url
 
+from app.services.worker_runtime_role_cli import role_names_for_generation
+from app.services.worker_session_signal_sql import bootstrap_sql
+
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 PREVIOUS_REVISION = "034_worker_registrations"
-TARGET_REVISION = "035_worker_creator_edges"
+TARGET_REVISION = "036_worker_session_signal"
+SERVICE = "vp-ffmpeg-worker-go-swarm"
 RUNTIME_ROLE = "vp_worker_runtime"
 ENDPOINT_BINDINGS = next(
     case["canonical"]
@@ -105,8 +109,9 @@ class OperatorDatabase:
     workers: tuple[str, str]
     other_name: str
     functions_before: list[dict[str, object]]
+    password: str
 
-    async def upsert(self, generation: int = 1, service: str = "creator-edge") -> uuid.UUID:
+    async def upsert(self, generation: int = 1, service: str = SERVICE) -> uuid.UUID:
         grant_id = await self.operator.fetchval(
             """
             SELECT public.vp_worker_grant_upsert(
@@ -128,13 +133,13 @@ class OperatorDatabase:
 
     async def activate(self, generation: int = 1) -> uuid.UUID:
         return await self.operator.fetchval(
-            "SELECT public.vp_worker_grant_activate('creator-edge', $1)", generation
+            "SELECT public.vp_worker_grant_activate($1, $2)", SERVICE, generation
         )
 
     async def revoke(self, generation: int = 1) -> bool:
         return await self.operator.fetchval(
-            "SELECT public.vp_worker_grant_revoke('creator-edge', $1, 'fixture-stop')",
-            generation,
+            "SELECT public.vp_worker_grant_revoke($1, $2, 'fixture-stop')",
+            SERVICE, generation,
         )
 
     async def edges(self) -> list[tuple[object, ...]]:
@@ -179,7 +184,7 @@ async def operator_database(request: pytest.FixtureRequest) -> AsyncIterator[Ope
     database = f"vp_operator_edges_{suffix}"
     owner_name = f"vp_deploy_migrator_{suffix}"
     operator_name = f"vp_operator_{suffix}"
-    workers = (f"vp_runtime_one_{suffix}", f"vp_runtime_two_{suffix}")
+    workers = tuple(role_names_for_generation(SERVICE, gen).versioned for gen in (1, 2))
     other_name = f"vp_other_{suffix}"
     password = uuid.uuid4().hex
     role_names: list[str] = []
@@ -225,7 +230,7 @@ async def operator_database(request: pytest.FixtureRequest) -> AsyncIterator[Ope
                     # Let PG16 create the real OID-10, admin-only creator grant.
                     await owner.execute(
                         f'CREATE ROLE "{name}" {attributes} NOSUPERUSER NOCREATEDB '
-                        "NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+                        f"NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '{password}'"
                     )
                     role_names.append(name)
                 for signature in OPERATOR_SIGNATURES:
@@ -234,20 +239,36 @@ async def operator_database(request: pytest.FixtureRequest) -> AsyncIterator[Ope
                     )
                 functions_before = await _functions(owner)
                 revision = getattr(request, "param", TARGET_REVISION)
-                if revision != PREVIOUS_REVISION:
-                    await asyncio.to_thread(_migrate, owner_url, revision)
                 target_admin = await _connect(_url(database))
                 connections.push_async_callback(target_admin.close)
+                if revision == TARGET_REVISION:
+                    await target_admin.execute(bootstrap_sql())
+                if revision != PREVIOUS_REVISION:
+                    await asyncio.to_thread(_migrate, owner_url, revision)
                 operator = await _connect(
                     _url(database, user=operator_name, password=password)
                 )
                 connections.push_async_callback(operator.close)
                 yield OperatorDatabase(
                     target_admin, owner, operator, owner_name, operator_name,
-                    bootstrap_name, workers, other_name, functions_before,
+                    bootstrap_name, workers, other_name, functions_before, password,
                 )
         finally:
             await admin.execute(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)')
+            # PG16 refuses DROP ROLE while that role remains a membership grantor.
+            for edge in await admin.fetch(
+                "SELECT granted.rolname AS role, member.rolname AS member, "
+                "grantor.rolname AS grantor FROM pg_catalog.pg_auth_members AS m "
+                "JOIN pg_catalog.pg_roles AS granted ON granted.oid = m.roleid "
+                "JOIN pg_catalog.pg_roles AS member ON member.oid = m.member "
+                "JOIN pg_catalog.pg_roles AS grantor ON grantor.oid = m.grantor "
+                "WHERE grantor.rolname = ANY($1::text[])",
+                role_names,
+            ):
+                await admin.execute(
+                    f'REVOKE "{edge["role"]}" FROM "{edge["member"]}" '
+                    f'GRANTED BY "{edge["grantor"]}" CASCADE'
+                )
             for name in reversed(role_names):
                 await admin.execute(f'DROP ROLE IF EXISTS "{name}"')
 
@@ -333,6 +354,33 @@ async def test_035_distinct_operator_lifecycle_preserves_only_safe_creator_edges
         ("revoked", False), ("revoked", False),
     ]
     assert await fixture.edges() == creators
+
+
+async def test_worker_replacement_retires_an_open_old_generation_session(
+    operator_database: OperatorDatabase,
+) -> None:
+    fixture = operator_database
+    await fixture.upsert()
+    await fixture.activate()
+    database = await fixture.owner.fetchval("SELECT current_database()")
+    old_worker = await _connect(
+        _url(database, user=fixture.workers[0], password=fixture.password)
+    )
+    try:
+        old_pid = old_worker.get_server_pid()
+        replacement = await fixture.upsert(2)
+        assert await fixture.activate(2) == replacement
+        for _ in range(50):
+            if old_worker.is_closed():
+                break
+            await asyncio.sleep(0.02)
+        assert old_worker.is_closed()
+        assert not await fixture.admin.fetchval(
+            "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1)", old_pid
+        )
+        assert await fixture.operator.fetchval("SELECT 1") == 1
+    finally:
+        await old_worker.close()
 
 
 @pytest.mark.parametrize("operation", ["activate", "revoke"])

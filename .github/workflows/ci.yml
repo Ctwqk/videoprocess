@@ -74,7 +74,9 @@ jobs:
           output="ci-evidence/backend/pg16-worker-operator.txt"
           (
             cd backend
-            .venv/bin/python -m pytest -q -rs tests/migrations/test_worker_operator_creator_edges_postgres.py
+            .venv/bin/python -m pytest -q -rs \
+              tests/migrations/test_worker_operator_creator_edges_postgres.py \
+              tests/migrations/test_worker_session_signal_postgres.py
           ) | tee "$output"
           if grep -Eq '[0-9]+ skipped|SKIPPED' "$output"; then
             echo "PG16 worker operator lifecycle tests skipped" >&2

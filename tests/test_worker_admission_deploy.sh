@@ -27,6 +27,94 @@ mkdir -p "$(vp_worker_admission_root)"
 chmod 0700 "$(vp_worker_admission_root)"
 
 (
+  UPDATE_SERVICES=1
+  vp_worker_admission_transition_to() { :; }
+  vp_worker_admission_advance_migration_state() { :; }
+  vp_run_worker_registration_migration() { :; }
+  vp_require_channelops_migration_head() { :; }
+  vp_prepare_worker_redis_marker_controls() { :; }
+  vp_prepare_worker_admission() { :; }
+  vp_install_staging_object_janitor() { :; }
+  vp_run_staging_object_janitor_once() { :; }
+  vp_worker_admission_record_janitor_service() { :; }
+  vp_worker_admission_advance_live_worker_stage() { :; }
+  vp_require_worker_deployment_ready() { :; }
+  vp_run_vision_cutover_job() { :; }
+  vp_reconcile_vision_consumers() { :; }
+  http_health() { :; }
+  VP_VISION_CUTOVER_REQUIRED=false
+  vp_record_app_service_attempt() {
+    if [[ "$1" == "$failed_service" && "$failure_mode" == journal ]]; then
+      return 1
+    fi
+    VP_APP_ATTEMPTED_SERVICES+=" $1"
+  }
+  vp_update_app_runtime_service() { vp_record_app_service_attempt "$1"; }
+  vp_record_worker_activation_attempt() { vp_record_app_service_attempt "$1"; }
+  vp_deploy_python_worker() { :; }
+  vp_deploy_vision_worker() { :; }
+  vp_deploy_publisher() { :; }
+  vp_activate_worker_admission() {
+    last_activated="$1"
+    [[ "$1" != "$failed_service" || "$failure_mode" != drain ]]
+  }
+  vp_require_worker_redis_marker_status() {
+    [[ "$last_activated" != "$failed_service" || "$failure_mode" != marker ]]
+  }
+  for failed_service in vp-ffmpeg-worker-go-swarm \
+    "$VP_PYTHON_WORKER_SERVICE" "$VP_VISION_WORKER_SERVICE" "$VP_PUBLISHER_SERVICE"; do
+    for failure_mode in drain marker journal; do
+      last_activated=""
+      if vp_apply_app_services api frontend backend runner go worker; then
+        echo 'FAIL: injected post-activation failure was accepted' >&2
+        exit 1
+      fi
+      if [[ "$failure_mode" == journal ]]; then
+        [[ "$last_activated" != "$failed_service" ]] || {
+          echo 'FAIL: activation ran without durable rollback intent' >&2
+          exit 1
+        }
+      elif ! vp_app_service_was_attempted "$failed_service" "$VP_APP_ATTEMPTED_SERVICES"; then
+        echo "FAIL: $failed_service lost rollback selection after $failure_mode failure" >&2
+        exit 1
+      fi
+    done
+  done
+  vp_record_worker_activation_attempt() { return 0; }
+  failed_service="$VP_PYTHON_WORKER_SERVICE"
+  failure_mode=drain
+  last_activated=""
+  if vp_apply_app_services api frontend backend runner go worker; then
+    exit 1
+  fi
+  if vp_app_service_was_attempted "$failed_service" "$VP_APP_ATTEMPTED_SERVICES"; then
+    echo 'FAIL: baseline-absent activation changed pre-creation rollback semantics' >&2
+    exit 1
+  fi
+)
+
+(
+  UPDATE_SERVICES=0
+  vp_update_runtime_service() { return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"; }
+  VP_APP_ATTEMPTED_SERVICES=vp-ffmpeg-worker-go-swarm
+  if vp_update_app_runtime_service vp-ffmpeg-worker-go-swarm image stop-first; then
+    echo 'FAIL: not-attempted update unexpectedly succeeded' >&2
+    exit 1
+  fi
+  [[ "$VP_APP_ATTEMPTED_SERVICES" == vp-ffmpeg-worker-go-swarm ]] || {
+    echo 'FAIL: Docker preflight erased an earlier database activation attempt' >&2
+    exit 1
+  }
+  if vp_update_app_runtime_service vp-frontend-swarm image stop-first; then
+    exit 1
+  fi
+  [[ "$VP_APP_ATTEMPTED_SERVICES" == vp-ffmpeg-worker-go-swarm ]] || {
+    echo 'FAIL: a new untouched service was retained in rollback selection' >&2
+    exit 1
+  }
+)
+
+(
   docker() {
     case "$1 $2" in
       'service ps') printf 'aaaaaaaaaaaaaaaaaaaaaaaa|%s|Failed 1 second ago\n' "$desired" ;;

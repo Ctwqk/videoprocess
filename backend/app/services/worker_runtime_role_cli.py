@@ -7,13 +7,14 @@ import json
 import os
 import re
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Never
 
 import asyncpg  # type: ignore[import-untyped]
 
+from app.services.worker_registration_operator_cli import TOPOLOGY
 from app.services.worker_role_cli_common import (
     PinnedPrivateDirectory,
     PrivateDirectorySnapshot,
@@ -42,6 +43,7 @@ from app.services.worker_role_cli_common import (
     verify_pinned_private_directory,
     write_secure_files,
 )
+from app.services.worker_session_signal_sql import SCHEMA as SIGNAL_SCHEMA
 
 
 OWNER_URL_FILE_ENV = "WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE"
@@ -422,7 +424,7 @@ async def _provision(
             f"runtime:{service_name}:{generation}",
         )
         if state_tree_error is not None:
-            await _deauthorize_generation(connection, names)
+            await _deauthorize_generation(connection, service_name, generation, names)
             raise RuntimeRoleError("generation state directory invalid") from (
                 state_tree_error
             )
@@ -436,7 +438,7 @@ async def _provision(
             )
             operation_pins.extend(tree_pins)
         except RuntimeStateTreeError as exc:
-            await _deauthorize_generation(connection, names)
+            await _deauthorize_generation(connection, service_name, generation, names)
             raise RuntimeRoleError("generation state directory invalid") from exc
         state_presence = {
             purpose: path.exists()
@@ -476,7 +478,7 @@ async def _provision(
                     _verify_pinned_directories(operation_pins)
                 except RuntimeStateTreeError as detected_tree_error:
                     tree_error = detected_tree_error
-                await _deauthorize_generation(connection, names)
+                await _deauthorize_generation(connection, service_name, generation, names)
                 if tree_error is None and not isinstance(
                     exc,
                     RuntimeStateTreeError,
@@ -517,7 +519,7 @@ async def _provision(
                 )
                 raise RuntimeRoleError("generation authority revoked")
             if authority.state == "mismatch":
-                await _deauthorize_generation(connection, names)
+                await _deauthorize_generation(connection, service_name, generation, names)
                 await _converge_members_after_quarantine(
                     connection,
                     owner_url,
@@ -537,7 +539,7 @@ async def _provision(
                     operation_pins,
                 )
             except RuntimeStateTreeError as exc:
-                await _deauthorize_generation(connection, names)
+                await _deauthorize_generation(connection, service_name, generation, names)
                 raise RuntimeRoleError(
                     "generation state directory invalid"
                 ) from exc
@@ -572,7 +574,7 @@ async def _provision(
                     operation_pins,
                 )
                 return
-            await _deauthorize_generation(connection, names)
+            await _deauthorize_generation(connection, service_name, generation, names)
             await _converge_members_after_quarantine(
                 connection,
                 owner_url,
@@ -654,6 +656,9 @@ async def _provision(
                 await drop_login_roles(
                     connection,
                     (names.versioned,),
+                    retire_sessions=_generation_session_retirement(
+                        connection, service_name, generation, names,
+                    ),
                 )
                 remove_secure_files(
                     state_dir,
@@ -748,13 +753,39 @@ async def _generation_has_any_authority(
     )
 
 
+def _generation_session_retirement(
+    connection: asyncpg.Connection,
+    service_name: str,
+    generation: int,
+    names: RuntimeRoleNames,
+) -> Callable[[], Awaitable[None]] | None:
+    if names != role_names_for_generation(service_name, generation):
+        raise RuntimeRoleError("generation role identity invalid")
+    if service_name not in TOPOLOGY:
+        return None
+
+    async def retire_sessions() -> None:
+        await connection.fetchval(
+            f"SELECT {SIGNAL_SCHEMA}.retire($1, $2)",
+            service_name,
+            generation,
+        )
+
+    return retire_sessions
+
+
 async def _deauthorize_generation(
     connection: asyncpg.Connection,
+    service_name: str,
+    generation: int,
     names: RuntimeRoleNames,
 ) -> None:
     await quarantine_login_roles(
         connection,
         (names.versioned,),
+        retire_sessions=_generation_session_retirement(
+            connection, service_name, generation, names,
+        ),
     )
 
 
@@ -798,7 +829,12 @@ async def _retire_local_generation(
     names: RuntimeRoleNames,
 ) -> None:
     try:
-        await drop_login_roles(connection, (names.versioned,))
+        await drop_login_roles(
+            connection, (names.versioned,),
+            retire_sessions=_generation_session_retirement(
+                connection, service_name, generation, names,
+            ),
+        )
     except (asyncpg.PostgresError, WorkerRoleCommonError) as exc:
         raise RuntimeRoleError(
             "revoked generation cleanup failed"
@@ -957,7 +993,7 @@ async def _reconstruct_generation_state(
         )
         raise RuntimeRoleError("generation authority revoked")
     if authority.state not in {"pending", "active"}:
-        await _deauthorize_generation(connection, names)
+        await _deauthorize_generation(connection, service_name, generation, names)
         await _converge_members_after_quarantine(
             connection,
             owner_url,
@@ -977,7 +1013,7 @@ async def _reconstruct_generation_state(
         OSError,
         WorkerRoleCommonError,
     ) as exc:
-        await _deauthorize_generation(connection, names)
+        await _deauthorize_generation(connection, service_name, generation, names)
         await _converge_members_after_quarantine(
             connection,
             owner_url,
@@ -1172,7 +1208,9 @@ async def _scan_authorized_runtime_members(
                 if generation_pin is not None:
                     generation_pin.close()
                 try:
-                    await _deauthorize_generation(connection, names)
+                    await _deauthorize_generation(
+                        connection, managed_service_name, generation, names,
+                    )
                 except BaseException:
                     close_pinned_private_directories(pins)
                     raise
@@ -1182,7 +1220,9 @@ async def _scan_authorized_runtime_members(
                 authorized.add(names.versioned)
             else:
                 try:
-                    await _deauthorize_generation(connection, names)
+                    await _deauthorize_generation(
+                        connection, managed_service_name, generation, names,
+                    )
                 except BaseException:
                     close_pinned_private_directories(pins)
                     raise
@@ -1355,7 +1395,7 @@ async def _revoke(
             )
             operation_pins.extend(tree_pins)
         except RuntimeStateTreeError as exc:
-            await _deauthorize_generation(connection, names)
+            await _deauthorize_generation(connection, service_name, generation, names)
             raise RuntimeRoleError("generation state directory invalid") from exc
         async with connection.transaction():
             _verify_pinned_directories(operation_pins)
@@ -1386,6 +1426,9 @@ async def _revoke(
             (names.versioned,),
             state_guard=lambda: _verify_pinned_directories(
                 operation_pins
+            ),
+            retire_sessions=_generation_session_retirement(
+                connection, service_name, generation, names,
             ),
         )
         close_pinned_private_directories(operation_pins)
