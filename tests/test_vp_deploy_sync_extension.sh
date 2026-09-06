@@ -5480,7 +5480,7 @@ assert_channelops_runner_identity_reconciliation converged 1
       return
     fi
     if [[ "${1:-} ${2:-}" == 'service logs' ]]; then
-      return 0
+      return "${VISION_JOB_LOGS_EXIT:-0}"
     fi
     if [[ "${1:-} ${2:-}" == 'service rm' ]]; then
       [[ "${3:-}" == dddddddddddddddddddddddddddddddd ]] || return 1
@@ -5531,6 +5531,21 @@ assert_channelops_runner_identity_reconciliation converged 1
 
   VISION_JOB_DESIRED_STATE=Shutdown
   vp_wait_vision_cutover_job dddddddddddddddddddddddddddddddd
+  VISION_JOB_LOGS_EXIT=1
+  if ! vp_wait_vision_cutover_job dddddddddddddddddddddddddddddddd; then
+    echo 'FAIL: unavailable Swarm logs masked successful vision job exit' >&2
+    exit 1
+  fi
+  VISION_JOB_EXIT=2
+  vision_wait_exit=0
+  vp_wait_vision_cutover_job dddddddddddddddddddddddddddddddd \
+    || vision_wait_exit=$?
+  [[ "$vision_wait_exit" -eq 2 ]] || {
+    echo 'FAIL: unavailable Swarm logs masked failing vision job exit' >&2
+    exit 1
+  }
+  VISION_JOB_EXIT=0
+  VISION_JOB_LOGS_EXIT=0
   VISION_JOB_DESIRED_STATE=Complete
   VISION_JOB_CURRENT_STATE='Failed 1 second ago'
   if vp_wait_vision_cutover_job \

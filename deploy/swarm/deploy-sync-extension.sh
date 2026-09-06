@@ -11061,7 +11061,8 @@ vp_wait_vision_cutover_job() {
         )" || return 1
         [[ "$exit_code" =~ ^(0|[1-9][0-9]{0,2})$ \
           && "$exit_code" -le 255 ]] || return 1
-        docker service logs "$service_id" >/dev/null 2>&1 || return 1
+        # Log transport availability is independent of the verified task exit.
+        docker service logs "$service_id" >/dev/null 2>&1 || true
         return "$exit_code"
         ;;
       Complete\|Failed*|Complete\|Rejected*|Complete\|Shutdown*|\

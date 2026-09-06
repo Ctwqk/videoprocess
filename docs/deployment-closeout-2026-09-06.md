@@ -13,8 +13,8 @@ unreviewed public publication or place VideoProcess services on 126.
 - 127 hosts the application runtime and CPU worker.
 - PDS independently polls its repository every 15 minutes. Its deployed commit
   is `6b8f8be32399fb0cf4278198e3d26d77cc8e8fd6`; a fresh poll succeeded.
-- The VP app deployment timer is still paused pending recovery. Do not report
-  automatic VP deployment as ready until that timer is restored and verified.
+- The VP app deployment timer is restored, independently of the PDS timer.
+  A fresh scheduled poll pulled `17894bfe3598` and correctly waited for CI.
 - The production schedule is CLOSED; no fifth upload has been started.
 
 ## Production Bootstrap Applied
@@ -37,6 +37,10 @@ The script is intentionally one-shot; a repeat fails without changes.
 
 ## Remaining Acceptance
 
-- Push the tested repair and verify exact-commit CI and 127/150 rollout.
-- Restore the VP app deployment timer without altering the independent PDS timer.
+- Commit `17894bfe3598` passed all four GitHub CI jobs (run `34018440716`).
+  Production recovery archived the old interrupted admission transaction.
+- New images built on 127 and 150, but pre-apply vision verification stopped
+  deployment: the task exited zero while Swarm log retrieval failed. The waiter
+  now preserves the verified task exit code regardless of log transport.
+- Verify exact-commit CI and 127/150 rollout for the waiter correction.
 - Complete one approved unlisted canary and verify publication/feedback evidence.
