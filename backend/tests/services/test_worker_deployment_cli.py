@@ -75,7 +75,7 @@ async def test_migrate_runs_alembic_upgrade_without_an_active_event_loop(
     assert await cli.run(["migrate"]) == 0
 
 
-def test_upgrade_delegates_marker_authority_after_schema_migration(
+def test_upgrade_does_not_restore_legacy_marker_delegation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
@@ -84,18 +84,17 @@ def test_upgrade_delegates_marker_authority_after_schema_migration(
         assert revision == cli.EXPECTED_MIGRATION_HEAD
         events.append("schema")
 
-    async def delegate(database_url: str) -> None:
-        assert database_url == "postgresql://migrator:secret@db/videoprocess"
-        events.append("marker-authority")
+    async def connect(*_args, **_kwargs) -> None:
+        pytest.fail("schema migration must not restore legacy role delegation")
 
     monkeypatch.setattr(cli.command, "upgrade", upgrade)
-    monkeypatch.setattr(cli, "_delegate_marker_control_authority", delegate)
+    monkeypatch.setattr(cli.asyncpg, "connect", connect)
 
     cli._upgrade_database(
         "postgresql://migrator:secret@db/videoprocess"
     )
 
-    assert events == ["schema", "marker-authority"]
+    assert events == ["schema"]
 
 
 @pytest.mark.asyncio

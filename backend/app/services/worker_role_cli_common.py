@@ -400,17 +400,12 @@ async def ensure_stable_role(
                     'NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS',
                     v_role_name
                 );
-            ELSE
-                EXECUTE pg_catalog.format(
-                    'ALTER ROLE %I NOLOGIN NOINHERIT NOSUPERUSER '
-                    'NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS',
-                    v_role_name
-                );
             END IF;
         END
         $block$
         """
     )
+    await require_safe_role_attributes(connection, role_name, login=False)
     if await _role_owns_objects(connection, role_name):
         raise WorkerRoleCommonError("database role owns objects")
     await connection.execute(
@@ -440,6 +435,34 @@ async def ensure_stable_role(
             )
 
 
+async def require_safe_role_attributes(
+    connection: asyncpg.Connection,
+    role_name: str,
+    *,
+    login: bool,
+) -> None:
+    role = await connection.fetchrow(
+        """
+        SELECT rolcanlogin, rolinherit, rolsuper, rolcreatedb,
+               rolcreaterole, rolreplication, rolbypassrls
+        FROM pg_catalog.pg_roles
+        WHERE rolname = $1
+        """,
+        role_name,
+    )
+    expected = {
+        "rolcanlogin": login,
+        "rolinherit": login,
+        "rolsuper": False,
+        "rolcreatedb": False,
+        "rolcreaterole": False,
+        "rolreplication": False,
+        "rolbypassrls": False,
+    }
+    if role is None or any(role[key] is not value for key, value in expected.items()):
+        raise WorkerRoleCommonError("database role attributes invalid")
+
+
 async def harden_existing_login_role(
     connection: asyncpg.Connection,
     role_name: str,
@@ -456,14 +479,13 @@ async def harden_existing_login_role(
         role_name,
     ):
         raise WorkerRoleCommonError("database login role missing")
+    await require_safe_role_attributes(connection, role_name, login=True)
     if await _role_owns_objects(connection, role_name):
         raise WorkerRoleCommonError("database login role owns objects")
 
     quoted_role = quote_identifier(role_name)
     await connection.execute(
         f"ALTER ROLE {quoted_role} "
-        "LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
-        "NOREPLICATION NOBYPASSRLS "
         "CONNECTION LIMIT -1 VALID UNTIL 'infinity'"
     )
     await connection.execute(f"ALTER ROLE {quoted_role} RESET ALL")
@@ -489,6 +511,14 @@ async def harden_existing_login_role(
         "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public "
         f"FROM {quoted_role}"
     )
+    await _revoke_column_privileges(connection, role_name)
+    await mark_managed_login_role(connection, role_name, stable_role)
+
+
+async def _revoke_column_privileges(
+    connection: asyncpg.Connection,
+    role_name: str,
+) -> None:
     column_privileges = await connection.fetch(
         """
         SELECT
@@ -517,9 +547,8 @@ async def harden_existing_login_role(
             f"REVOKE {privilege['privilege_type']} "
             f"({quote_identifier(privilege['attname'])}) "
             f"ON TABLE public.{quote_identifier(privilege['relname'])} "
-            f"FROM {quoted_role}"
+            f"FROM {quote_identifier(role_name)}"
         )
-    await mark_managed_login_role(connection, role_name, stable_role)
 
 
 async def create_login_role(
@@ -700,6 +729,7 @@ async def reset_public_privileges(
         "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public "
         f"FROM {quoted}"
     )
+    await _revoke_column_privileges(connection, role_name)
 
 
 async def grant_functions(
@@ -809,13 +839,31 @@ async def revoke_role_membership_authority(
         quote_identifier(role_name)
 
     while True:
-        membership = await connection.fetchrow(
+        memberships = await connection.fetch(
             """
             SELECT
                 membership.oid AS membership_oid,
                 granted.rolname AS granted_role,
                 member.rolname AS member_role,
-                grantor.rolname AS grantor_role
+                grantor.rolname AS grantor_role,
+                grantor.oid AS grantor_oid,
+                grantor.rolsuper AS grantor_is_superuser,
+                membership.admin_option,
+                membership.inherit_option,
+                membership.set_option,
+                member.rolname = current_user AS member_is_current_principal,
+                (
+                    member.rolname = session_user
+                    AND member.rolcanlogin AND member.rolinherit
+                    AND member.rolcreaterole AND NOT member.rolsuper
+                    AND NOT member.rolcreatedb AND NOT member.rolreplication
+                    AND NOT member.rolbypassrls
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_auth_members AS parent
+                        WHERE parent.member = member.oid
+                          AND (parent.inherit_option OR parent.set_option)
+                    )
+                ) AS creator_principal_is_safe
             FROM pg_catalog.pg_auth_members AS membership
             JOIN pg_catalog.pg_roles AS granted
               ON granted.oid = membership.roleid
@@ -832,10 +880,27 @@ async def revoke_role_membership_authority(
                 member.rolname,
                 grantor.rolname,
                 membership.oid
-            LIMIT 1
             """,
             list(ordered_roles),
         )
+        membership = None
+        for edge in memberships:
+            if edge["member_is_current_principal"]:
+                # PG16's bootstrap grant is admin-only, not runtime authority.
+                if not (
+                    edge["granted_role"] in ordered_roles
+                    and edge["member_role"] not in ordered_roles
+                    and edge["grantor_role"] not in ordered_roles
+                    and edge["grantor_oid"] == 10
+                    and edge["grantor_is_superuser"] is True
+                    and edge["admin_option"] is True
+                    and edge["inherit_option"] is False
+                    and edge["set_option"] is False
+                    and edge["creator_principal_is_safe"] is True
+                ):
+                    raise WorkerRoleCommonError("database creator membership invalid")
+            elif membership is None:
+                membership = edge
         if membership is None:
             return
         await connection.execute(
@@ -1002,6 +1067,7 @@ async def _converge_public_privileges(
             'vp_orchestrator_control_runtime',
             'vp_staging_janitor_runtime'
         )
+          AND (membership.inherit_option OR membership.set_option)
         ORDER BY member.rolname
         """
     )
@@ -1067,23 +1133,9 @@ async def _converge_public_privileges(
         FROM relevant_owner_oids
         JOIN pg_catalog.pg_roles AS owner
           ON owner.oid = relevant_owner_oids.oid
-        WHERE owner.rolname = current_user
-           OR (
-               owner.rolname !~ '^pg_'
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM pg_catalog.pg_auth_members AS membership
-                   JOIN pg_catalog.pg_roles AS stable
-                     ON stable.oid = membership.roleid
-                   WHERE membership.member = owner.oid
-                     AND stable.rolname IN (
-                         'vp_worker_runtime',
-                         'vp_worker_operator_runtime',
-                         'vp_orchestrator_control_runtime',
-                         'vp_staging_janitor_runtime'
-                     )
-               )
-           )
+        WHERE (owner.rolname = current_user
+               OR pg_catalog.pg_has_role(owner.oid, 'SET'))
+          AND (owner.rolname = current_user OR owner.rolname !~ '^pg_')
         ORDER BY owner.rolname
         """
     )
@@ -1114,6 +1166,65 @@ async def _converge_public_privileges(
                 "REVOKE ALL PRIVILEGES "
                 f"ON {object_kind} FROM PUBLIC"
             )
+    # REVOKE can warn without changing ACLs when the caller lacks grant options.
+    if await connection.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_database AS database
+            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                database.datacl, pg_catalog.acldefault('d', database.datdba)
+            )) AS privilege
+            WHERE database.datname = pg_catalog.current_database()
+              AND privilege.grantee = 0
+              AND privilege.privilege_type IN ('CREATE', 'TEMPORARY')
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_namespace AS namespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(namespace.nspacl) AS privilege
+            WHERE namespace.nspname = 'public'
+              AND privilege.grantee = 0 AND privilege.privilege_type = 'CREATE'
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(relation.relacl) AS privilege
+            WHERE namespace.nspname = 'public'
+              AND relation.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+              AND privilege.grantee = 0
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_attribute AS attribute
+            JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(attribute.attacl) AS privilege
+            WHERE namespace.nspname = 'public'
+              AND attribute.attnum > 0 AND NOT attribute.attisdropped
+              AND privilege.grantee = 0
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_proc AS routine
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = routine.pronamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                routine.proacl, pg_catalog.acldefault('f', routine.proowner)
+            )) AS privilege
+            WHERE namespace.nspname = 'public' AND routine.prosecdef
+              AND privilege.grantee = 0 AND privilege.privilege_type = 'EXECUTE'
+            UNION ALL
+            SELECT 1
+            FROM pg_catalog.pg_default_acl AS defaults
+            LEFT JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = defaults.defaclnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS privilege
+            WHERE (defaults.defaclnamespace = 0 OR namespace.nspname = 'public')
+              AND privilege.grantee = 0
+        )
+        """
+    ):
+        raise WorkerRoleCommonError("database PUBLIC privileges remain")
 
 
 async def _converge_function_execute_grantees(

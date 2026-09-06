@@ -10186,6 +10186,10 @@ vp_worker_control_revoke_authority() {
   [[ "$generation" =~ ^c-[0-9a-f]{20}$ \
     && "$image" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*:deploy-[0-9a-f]{12}$ \
     && "${generation#c-}" == "${image##*:deploy-}"* ]] || return 1
+  local executor_image="${VP_WORKER_ADMISSION_RECOVERY_DCL_IMAGE:-$image}"
+  if [[ "$executor_image" != "$image" ]]; then
+    vp_worker_admission_image_commit "$executor_image" >/dev/null || return 1
+  fi
   local control_state
   control_state="$(
     vp_python_worker_prepare_controlled_directory "$root/control"
@@ -10193,7 +10197,7 @@ vp_worker_control_revoke_authority() {
   local owner_file
   owner_file="$(vp_worker_database_dcl_file)" || return 1
   vp_run_python_worker_container \
-    "$image" \
+    "$executor_image" \
     "$owner_file" \
     worker-control-owner-database-url \
     /control-state \
@@ -16631,6 +16635,8 @@ _vp_deploy_vp_app_services_locked() {
 }
 
 deploy_vp_app_services() {
+  # Recovery must use fixed DCL code while retaining the recorded generation.
+  local VP_WORKER_ADMISSION_RECOVERY_DCL_IMAGE="${6:-}"
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
     VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
     local validation_status=0

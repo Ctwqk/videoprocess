@@ -2728,7 +2728,7 @@ async def test_postgres_16_worker_redis_marker_lifecycle_is_fail_closed(
     not POSTGRES_URL,
     reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
 )
-async def test_postgres16_marker_role_setup_retries_after_delegation(
+async def test_postgres16_marker_role_setup_uses_deploy_principal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -2762,7 +2762,7 @@ async def test_postgres16_marker_role_setup_retries_after_delegation(
             f"NOBYPASSRLS PASSWORD '{owner_password}'"
         )
         await admin.execute(
-            f'CREATE DATABASE "{database}" OWNER "{control_owner}"'
+            f'CREATE DATABASE "{database}" OWNER "{deploy_migrator}"'
         )
         for stable_role in stable_roles.values():
             await admin.execute(
@@ -2780,9 +2780,6 @@ async def test_postgres16_marker_role_setup_retries_after_delegation(
     try:
         marker_module = importlib.import_module(
             "app.services.worker_marker_control_role_cli"
-        )
-        deployment_module = importlib.import_module(
-            "app.services.worker_deployment_cli"
         )
         monkeypatch.setattr(marker_module, "STABLE_ROLES", stable_roles)
         monkeypatch.setattr(
@@ -2832,8 +2829,9 @@ async def test_postgres16_marker_role_setup_retries_after_delegation(
         }
         assert not (state_dir / generation).exists()
 
-        await deployment_module._delegate_marker_control_authority(deploy_url)
-        await deployment_module._delegate_marker_control_authority(deploy_url)
+        owner_url_file.chmod(0o600)
+        owner_url_file.write_text(f"{deploy_url}\n", encoding="utf-8")
+        owner_url_file.chmod(0o400)
 
         assert await marker_module.run(arguments) == 0
         provisioned = json.loads(capsys.readouterr().out)
@@ -2870,7 +2868,7 @@ async def test_postgres16_marker_role_setup_retries_after_delegation(
                 ORDER BY granted.rolname
                 """,
                 sorted(stable_roles.values()),
-                control_owner,
+                deploy_migrator,
             )
             assert len(memberships) == 3
             assert all(
@@ -2881,6 +2879,12 @@ async def test_postgres16_marker_role_setup_retries_after_delegation(
                 and not row["has_usage"]
                 and not row["can_set"]
                 for row in memberships
+            )
+            assert not await proof.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_auth_members "
+                "WHERE roleid = ANY($1::regrole[]) AND member = $2::regrole)",
+                sorted(stable_roles.values()),
+                control_owner,
             )
         finally:
             await proof.close()

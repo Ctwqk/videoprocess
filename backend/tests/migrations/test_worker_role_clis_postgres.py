@@ -878,6 +878,36 @@ async def test_real_role_clis_enforce_exact_cross_role_boundaries(
                 f'GRANT "{control_names.stable["operator"]}" '
                 f'TO "{rogue_principal}"'
             )
+            # Elevated attributes require explicit bootstrap repair, even as owner.
+            for drifted_roles, login_options in (
+                ((runtime_names.stable, orchestrator_stable), "NOLOGIN NOINHERIT"),
+                ((runtime_names.versioned, orchestrator_login), "LOGIN INHERIT"),
+            ):
+                with pytest.raises(
+                    role_common.WorkerRoleCommonError, match="attributes invalid"
+                ):
+                    await runtime_cli._provision(
+                        target_url, service_name, worker_generation,
+                        runtime_state, runtime_names,
+                    )
+                with pytest.raises(
+                    role_common.WorkerRoleCommonError, match="attributes invalid"
+                ):
+                    await control_cli._provision(
+                        target_url, control_generation, control_state, control_names,
+                    )
+                for role_name in drifted_roles:
+                    assert await drift_owner.fetchval(
+                        "SELECT rolcanlogin AND rolinherit AND rolsuper "
+                        "AND rolcreatedb AND rolcreaterole AND rolreplication "
+                        "AND rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = $1",
+                        role_name,
+                    )
+                    await drift_owner.execute(
+                        f"ALTER ROLE {role_common.quote_identifier(role_name)} "
+                        f"{login_options} NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                        "NOREPLICATION NOBYPASSRLS"
+                    )
         finally:
             await drift_owner.close()
 
@@ -5057,6 +5087,37 @@ async def test_overlap_provision_hardens_every_authorized_generation(
                 await owner.execute(
                     "GRANT SELECT ON TABLE public.worker_admission_grants "
                     f"TO {quoted_role}"
+                )
+            with pytest.raises(
+                role_common.WorkerRoleCommonError, match="attributes invalid"
+            ):
+                await runtime_cli._provision(
+                    target_url, service_name, generations[1],
+                    runtime_state, runtime_names[1],
+                )
+            with pytest.raises(
+                role_common.WorkerRoleCommonError, match="attributes invalid"
+            ):
+                await control_cli._provision(
+                    target_url, control_generations[1], control_state, control_names[1],
+                )
+            assert not await owner.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles "
+                "WHERE rolname = ANY($1::text[]))",
+                [runtime_names[1].versioned, *control_names[1].versioned.values()],
+            )
+            # Authorized older generations survive; bootstrap repairs their flags.
+            for role_name in old_generation_roles:
+                assert await owner.fetchval(
+                    "SELECT rolcanlogin AND rolinherit AND rolsuper "
+                    "AND rolcreatedb AND rolcreaterole AND rolreplication "
+                    "AND rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = $1",
+                    role_name,
+                )
+                await owner.execute(
+                    f"ALTER ROLE {role_common.quote_identifier(role_name)} "
+                    "LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE "
+                    "NOREPLICATION NOBYPASSRLS"
                 )
         finally:
             await owner.close()
