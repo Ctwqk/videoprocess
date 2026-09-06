@@ -88,3 +88,22 @@ the complete backend suite against isolated PG16 + Redis passed: 1623 passed,
 15 optional integrations skipped, 30 deprecation warnings (247.89 seconds).
 The earlier CI attempts stopped only at stale migration-version assertions;
 the dedicated PG16 lifecycle and Go registration integration gates passed.
+
+## First Worker Cutover
+
+`fab36e3a818b` passed all four CI jobs (`34031018815`). Production migration
+035 and recovery of transaction `tx-9fa931affc65f08856c615aa58e9c8c1` completed.
+The following rollout registered the new CPU worker successfully, but its
+observer lacked EXECUTE on `public.vp_worker_endpoint_fingerprints(jsonb)`.
+A narrowly scoped grant to the verified deploy-read principal fixed the real
+readiness command; generation `178869778511496` returned status `ok`.
+
+Transaction `tx-d01da0bb551fb3e07da99515c5c5be0a` remains in rollback preparation:
+this first cutover has no prior managed control environment. The explicit
+`resume-legacy-forward` journal operation permits the original release to
+continue only before any rollback control, marker, worker, promotion, or
+retirement effect. It verifies complete prepared authority, credential file
+identity, transaction/commit/revision, and applied worker snapshots. It keeps
+the original failure evidence and all worker stages; it never marks deployment
+verified. The operator must verify live service identities first, then run the
+ordinary deployment/readiness/promotion checks. No fifth upload has started.

@@ -2758,8 +2758,10 @@ def _secret_reference_identity(reference: dict[str, str]) -> dict[str, Any]:
     return _validate_identity(identity)
 
 
-def legacy_preapply_abort_eligible(document: dict[str, Any], progress: object) -> bool:
-    """Only a complete, unused bootstrap candidate can bypass managed rollback."""
+def _legacy_candidate_eligible(
+    document: dict[str, Any], progress: object, *, resume_forward: bool = False,
+) -> bool:
+    """Validate complete bootstrap authority before either recovery direction."""
     try:
         _validate_document(document)
         progress = _validate_app_progress(progress)
@@ -2775,21 +2777,24 @@ def legacy_preapply_abort_eligible(document: dict[str, Any], progress: object) -
             or document["operation"] is not None or document["abort"] is not None
             or any(document["promotion"].values())
             or document["pending_retirements"]
-            or document["janitor"]["service"] is not None
+            or (not resume_forward and document["janitor"]["service"] is not None)
             or rollback["attempt"] > 1
             or rollback["control"] is not None or rollback["marker"] is not None
             or rollback["workers"]
             or control is None or marker is None
             or progress["transaction_id"] != document["transaction_id"]
             or progress["target_commit"] != document["target_commit"]
-            or set(progress["attempted_services"]) & RUNTIME_AUTHORITY_SERVICES
+            or (not resume_forward
+                and set(progress["attempted_services"]) & RUNTIME_AUTHORITY_SERVICES)
         ):
             return False
         workers = forward["workers"]
         if (
             len(workers) != 4
             or {worker["service"] for worker in workers} != RUNTIME_AUTHORITY_SERVICES
-            or any(worker["applied_stage"] != "prepared" for worker in workers)
+            or any(worker["applied_stage"] not in (
+                {"prepared", "applied", "verified"} if resume_forward else {"prepared"}
+            ) for worker in workers)
             or control["generation"] != "c-" + document["target_commit"][:20]
             or marker["image"] != control["image"]
         ):
@@ -2817,6 +2822,27 @@ def legacy_preapply_abort_eligible(document: dict[str, Any], progress: object) -
         ):
             return False
         failed = document["failed_forward"]
+        if resume_forward:
+            if (
+                document["phase"] != "ROLLBACK_PREPARING"
+                or progress["migration_state"] != "applied"
+                or not failed["captured"]
+                or not any(worker["applied_stage"] in {"applied", "verified"} for worker in workers)
+            ):
+                return False
+            failed_services = {item["name"]: item for item in failed["services"]}
+            for worker in workers:
+                applied = worker["applied_stage"] in {"applied", "verified"}
+                if applied != (worker["service"] in progress["attempted_services"]):
+                    return False
+                if applied:
+                    identity = failed_services.get(worker["service"], {})
+                    if (
+                        identity.get("docker_service_id") != worker["docker_service_id"]
+                        or identity.get("spec_digest") != worker["target_spec_digest"]
+                        or identity.get("image") != worker["image"]
+                    ):
+                        return False
         if failed["captured"]:
             baseline_services = {item["name"]: item for item in baseline["services"]}
             if (
@@ -2831,6 +2857,47 @@ def legacy_preapply_abort_eligible(document: dict[str, Any], progress: object) -
         return True
     except (TransactionError, KeyError, TypeError, ValueError):
         return False
+
+
+def legacy_preapply_abort_eligible(document: dict[str, Any], progress: object) -> bool:
+    """Only a complete, unused bootstrap candidate can bypass managed rollback."""
+    return _legacy_candidate_eligible(document, progress)
+
+
+def legacy_forward_resume_eligible(document: dict[str, Any], progress: object) -> bool:
+    """An applied bootstrap candidate may resume only before rollback has effects."""
+    return _legacy_candidate_eligible(document, progress, resume_forward=True)
+
+
+def resume_legacy_forward(arguments: list[str]) -> None:
+    if len(arguments) != 5:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, raw_revision, transaction_id, commit = arguments
+
+    def updater(document: dict[str, Any]) -> None:
+        if document["transaction_id"] != transaction_id or document["target_commit"] != commit:
+            raise TransactionError
+        _verify_captured_credentials(document["database_credentials"])
+        _root, root_descriptor, transactions_descriptor = _open_transactions(raw_root, create=False)
+        try:
+            descriptor = _open_child_directory(
+                transactions_descriptor, document["transaction_id"], create=False,
+            )
+            try:
+                progress, _identity = _read_app_progress_from_descriptor(descriptor, allow_missing=False)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(transactions_descriptor)
+            os.close(root_descriptor)
+        if not legacy_forward_resume_eligible(document, progress):
+            raise TransactionError
+        # This explicit recovery command is not a general reverse phase transition.
+        # Preserve the original failure snapshot and require normal worker verification.
+        document["last_error"] = {"code": "legacy_forward_resumed", "phase": document["phase"]}
+        document["phase"] = "FORWARD_APPLYING"
+
+    _print_json(_update_document(raw_root, raw_lock_descriptor, raw_revision, updater))
 
 
 def begin_abort(arguments: list[str]) -> None:
@@ -4355,6 +4422,9 @@ def main(arguments: list[str]) -> int:
         return 0
     if arguments and arguments[0] == "begin-abort":
         begin_abort(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "resume-legacy-forward":
+        resume_legacy_forward(arguments[1:])
         return 0
     if arguments and arguments[0] == "list-abort":
         list_abort(arguments[1:])

@@ -193,6 +193,43 @@ helper["_validate_document"](state)
 progress = dict(schema=1, transaction_id=state["transaction_id"], target_commit=commit,
                 attempted_services=attempted, migration_state="applied")
 
+# Bootstrap recovery can resume the same release only before any rollback effect.
+import copy
+resume = copy.deepcopy(state)
+resume_worker = resume["forward"]["workers"][0]
+resume_id = next(item["docker_service_id"] for item in resume["baseline"]["services"]
+                 if item["name"] == resume_worker["service"])
+resume_worker.update(applied_stage="applied", docker_service_id=resume_id,
+                     target_spec_digest="9" * 64)
+resume_progress = copy.deepcopy(progress)
+resume_progress["attempted_services"].append(resume_worker["service"])
+resume["failed_forward"]["services"].append(dict(
+    name=resume_worker["service"], existed=True, docker_service_id=resume_id,
+    image=resume_worker["image"], spec_digest="9" * 64))
+eligible = helper.get("legacy_forward_resume_eligible")
+assert eligible is not None, "missing guarded bootstrap forward recovery"
+assert eligible(resume, resume_progress)
+for invalid in ("managed", "rollback-started", "rollback-control", "rollback-marker",
+                "rollback-workers", "missing-worker", "missing-authority",
+                "revoked-authority", "missing-secret", "unattempted-worker",
+                "wrong-progress", "migration-pending", "pending-retirement"):
+    bad, bad_progress = copy.deepcopy(resume), copy.deepcopy(resume_progress)
+    if invalid == "managed":
+        bad["baseline"].update(kind="managed", control=bad["forward"]["control"])
+    elif invalid == "rollback-started": bad["phase"] = "ROLLBACK_APPLYING"
+    elif invalid == "rollback-control": bad["rollback"]["control"] = bad["forward"]["control"]
+    elif invalid == "rollback-marker": bad["rollback"]["marker"] = bad["forward"]["marker"]
+    elif invalid == "rollback-workers": bad["rollback"]["workers"] = bad["forward"]["workers"]
+    elif invalid == "missing-worker": bad["forward"]["workers"].pop()
+    elif invalid == "missing-authority": bad["authorities"].pop()
+    elif invalid == "revoked-authority": bad["authorities"][0]["state"] = "revoked"
+    elif invalid == "missing-secret": bad["prepared_secrets"].pop()
+    elif invalid == "unattempted-worker": bad_progress["attempted_services"].remove(resume_worker["service"])
+    elif invalid == "wrong-progress": bad_progress["transaction_id"] = "tx-" + "3" * 32
+    elif invalid == "migration-pending": bad_progress["migration_state"] = "pending"
+    elif invalid == "pending-retirement": bad["pending_retirements"].append({})
+    assert not eligible(bad, bad_progress), invalid
+
 def write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
@@ -201,6 +238,34 @@ def write(path, value):
 write(root / "fixture.json", state)
 write(root / "state/vp-worker-admission/transactions/active.json", state)
 write(root / "state/vp-worker-admission/transactions" / state["transaction_id"] / "app-progress.json", progress)
+active_path = root / "state/vp-worker-admission/transactions/active.json"
+progress_path = active_path.parent / state["transaction_id"] / "app-progress.json"
+write(active_path, resume)
+write(progress_path, resume_progress)
+arguments = [str(root / "state/vp-worker-admission"), "19", "64", state["transaction_id"], commit]
+import contextlib
+import io
+for index, value in ((2, "63"), (3, "tx-" + "3" * 32), (4, "3" * 40)):
+    wrong = arguments.copy()
+    wrong[index] = value
+    before = active_path.read_bytes()
+    try:
+        helper["resume_legacy_forward"](wrong)
+    except helper["TransactionError"]:
+        pass
+    else:
+        raise AssertionError("wrong resume identity accepted")
+    assert active_path.read_bytes() == before
+with contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO())):
+    assert helper["main"](["resume-legacy-forward", *arguments]) == 0
+resumed = json.loads(active_path.read_text())
+assert resumed["phase"] == "FORWARD_APPLYING" and resumed["revision"] == 65
+assert resumed["forward"] == resume["forward"]
+assert resumed["failed_forward"] == resume["failed_forward"]
+assert not any(resumed["promotion"].values())
+assert resumed["last_error"]["code"] == "legacy_forward_resumed"
+write(active_path, state)
+write(progress_path, progress)
 baseline = root / "state/worker-redis-marker-control/transactions" / state["transaction_id"] / "baseline-managed-state"
 baseline.mkdir(parents=True, mode=0o700)
 (baseline / "captured").write_text("VERSION=1\n")
