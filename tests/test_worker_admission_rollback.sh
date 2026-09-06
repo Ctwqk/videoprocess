@@ -264,6 +264,8 @@ assert resumed["forward"] == resume["forward"]
 assert resumed["failed_forward"] == resume["failed_forward"]
 assert not any(resumed["promotion"].values())
 assert resumed["last_error"]["code"] == "legacy_forward_resumed"
+write(root / "resumed-fixture.json", resumed)
+write(root / "resumed-progress.json", resume_progress)
 write(active_path, state)
 write(progress_path, progress)
 baseline = root / "state/worker-redis-marker-control/transactions" / state["transaction_id"] / "baseline-managed-state"
@@ -272,9 +274,35 @@ baseline.mkdir(parents=True, mode=0o700)
 (baseline / "captured").chmod(0o600)
 (baseline / "crontab").write_text("")
 PY
-  # A real journal and fresh hydration must route both entry points to abort.
   vp_worker_admission_lock_assert() { return 0; }
   vp_worker_admission_verify_active_database_credentials() { return 0; }
+  (
+    # Resuming can add attempts; the captured failure remains historical evidence.
+    cp "$ROOT/resumed-fixture.json" "$admission_root/transactions/active.json"
+    python3 - "$ROOT/resumed-progress.json" "$admission_root/transactions/tx-22222222222222222222222222222222/app-progress.json" <<'PY'
+import json, pathlib, sys
+progress = json.loads(pathlib.Path(sys.argv[1]).read_text())
+progress["attempted_services"].append("vp-event-outbox-relay-swarm")
+pathlib.Path(sys.argv[2]).write_text(json.dumps(progress, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+    if ! vp_worker_admission_hydrate_recovery_context; then
+      echo 'FAIL: resumed forward hydration rejected a subsequent service attempt' >&2
+      exit 1
+    fi
+    [[ "$VP_WORKER_ADMISSION_RECOVERY_PHASE" == FORWARD_APPLYING ]]
+    python3 - "$admission_root/transactions/active.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+state = json.loads(path.read_text())
+state["last_error"] = None
+path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+    if vp_worker_admission_hydrate_recovery_context; then
+      echo 'FAIL: ordinary recovery accepted mismatched failure snapshots' >&2
+      exit 1
+    fi
+  )
+  # A real journal and fresh hydration must route both entry points to abort.
   for invalid in attempted-worker applied-worker missing-baseline promoted-control promoted-marker \
     rollback-worker rollback-control missing-authority missing-secret missing-progress; do
     python3 - "$ROOT/fixture.json" "$admission_root/transactions/active.json" "$invalid" <<'PY'

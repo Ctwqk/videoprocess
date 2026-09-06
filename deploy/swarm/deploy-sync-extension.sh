@@ -5628,7 +5628,22 @@ try:
     baseline_services = service_snapshots(baseline.get("services"))
     failed_services = service_snapshots(failed_forward.get("services"))
     if failed_captured and set(failed_services) != set(attempted_services):
-        raise ValueError
+        resumed_forward = (
+            state.get("last_error") == {
+                "code": "legacy_forward_resumed", "phase": "ROLLBACK_PREPARING",
+            }
+            and baseline_kind == "legacy_no_control"
+            and phase in {
+                "FORWARD_APPLYING", "FORWARD_VERIFIED", "WORKERS_PROMOTED",
+                "MARKER_PROMOTED", "CONTROL_PROMOTED", "RETIRING",
+            }
+            and rollback.get("control") is None
+            and rollback.get("marker") is None
+            and not rollback.get("workers")
+        )
+        # The resume operation preserves its historical failure snapshot.
+        if not resumed_forward or not set(failed_services) < set(attempted_services):
+            raise ValueError
     forward_workers = workers(forward.get("workers"))
     rollback_workers = workers(rollback.get("workers", []))
     baseline_control = baseline.get("control")
