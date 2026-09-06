@@ -54,3 +54,12 @@ identity, exit-code, and protocol checks. Marker compensation also retains its
 baseline snapshot until transaction cleanup, preventing recovery hydration loss.
 The interrupted production transaction must be recovered before canary approval
 is consumed; API/frontend were updated, while workers still use prior images.
+
+`d7e6415fb502` passed CI (`34023454874`) and marker readiness on 150. The staging
+janitor also completed with exit zero, but its launcher rejected Docker's
+`Complete` desired state. All corresponding janitor state checks now support
+replicated jobs. Recovery also handles the tightly verified legacy-bootstrap
+case where every worker authority is prepared but no worker service was touched;
+this avoids requiring a prior control configuration that never existed. The live
+transaction `tx-9fa931affc65f08856c615aa58e9c8c1` passed its read-only eligibility
+check. No fifth canary upload has started.

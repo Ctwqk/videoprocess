@@ -316,7 +316,7 @@ if [[ "${1:-} ${2:-}" == "service create" ]]; then
     exit 43
   fi
   : >"$SERVICE_STATE"
-  printf 'Running|Running 1 second ago\n' >"$TASK_STATE_FILE"
+  printf 'Complete|Running 1 second ago\n' >"$TASK_STATE_FILE"
   printf '%s\n' "$SERVICE_ID"
   exit 0
 fi
@@ -619,7 +619,7 @@ fi
 
 : >"$CALLS"
 rm -f "$SERVICE_INSPECT_COUNT_FILE"
-printf 'Running|Running 3 seconds ago\n' >"$TASK_STATE_FILE"
+printf 'Complete|Running 3 seconds ago\n' >"$TASK_STATE_FILE"
 bash "$LAUNCHER"
 if grep -Fq 'docker|service rm' "$CALLS" \
   || grep -Fq 'docker|service create' "$CALLS"; then
@@ -629,7 +629,7 @@ fi
 
 : >"$CALLS"
 rm -f "$SERVICE_INSPECT_COUNT_FILE"
-printf 'Shutdown|Complete 2 seconds ago\n' >"$TASK_STATE_FILE"
+printf 'Complete|Complete 2 seconds ago\n' >"$TASK_STATE_FILE"
 bash "$LAUNCHER"
 grep -Fq "docker|service rm $SERVICE_ID" "$CALLS"
 grep -Fq 'docker|service create' "$CALLS"
@@ -637,7 +637,7 @@ grep -Fq "docker|container rm $HOLDER_ID" "$CALLS"
 
 : >"$CALLS"
 rm -f "$SERVICE_INSPECT_COUNT_FILE"
-printf 'Shutdown|Complete 2 seconds ago\n' >"$TASK_STATE_FILE"
+printf 'Complete|Complete 2 seconds ago\n' >"$TASK_STATE_FILE"
 bash "$LAUNCHER" retire
 grep -Fq "docker|service rm $SERVICE_ID" "$CALLS"
 if grep -Fq 'docker|service create' "$CALLS"; then
@@ -1053,5 +1053,42 @@ print(hashlib.sha256(encoded).hexdigest())
   REAL_VOLUME=""
   echo "real Docker holder pin/replacement tests passed"
 fi
+
+(
+  eval "$(sed -n '/^vp_run_staging_object_janitor_once() {/,/^}/p' \
+    "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh")"
+  ROOT="$TEST_ROOT/waiter"
+  mkdir -p "$ROOT/bin"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$ROOT/bin/vp-staging-object-janitor-run.sh"
+  chmod 0700 "$ROOT/bin/vp-staging-object-janitor-run.sh"
+  vp_worker_admission_root() { printf '%s\n' "$ROOT"; }
+  docker() {
+    [[ "$1 $2 $3" == 'service ps vp-staging-object-janitor' ]] || return 1
+    printf '%s\n' "$observed_task_state"
+  }
+  sleep() { return 0; }
+  for desired in Complete Shutdown; do
+    observed_task_state="$desired|Complete 1 second ago"
+    vp_run_staging_object_janitor_once || {
+      echo "FAIL: completed $desired janitor job was rejected" >&2
+      exit 1
+    }
+    for current in Failed Rejected Shutdown; do
+      observed_task_state="$desired|$current 1 second ago"
+      if vp_run_staging_object_janitor_once; then
+        echo 'FAIL: failed janitor task was accepted' >&2
+        exit 1
+      fi
+    done
+  done
+  for observed_task_state in '' \
+    $'Complete|Complete 1 second ago\nComplete|Failed 1 second ago' \
+    'Complete|Running 1 second ago'; do
+    if vp_run_staging_object_janitor_once; then
+      echo 'FAIL: missing, ambiguous, or unfinished janitor task was accepted' >&2
+      exit 1
+    fi
+  done
+) || exit 1
 
 echo "staging object janitor launcher tests passed"

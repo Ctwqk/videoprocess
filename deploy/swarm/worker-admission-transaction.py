@@ -120,6 +120,7 @@ LEGAL_TRANSITIONS = {
     "CONTROL_PROMOTED": {"RETIRING"},
     "RETIRING": {"DONE"},
     "ROLLBACK_PREPARING": {
+        "ABORTING",
         "ROLLBACK_APPLYING",
         "CANDIDATE_RESTORE_REQUIRED",
     },
@@ -2757,6 +2758,81 @@ def _secret_reference_identity(reference: dict[str, str]) -> dict[str, Any]:
     return _validate_identity(identity)
 
 
+def legacy_preapply_abort_eligible(document: dict[str, Any], progress: object) -> bool:
+    """Only a complete, unused bootstrap candidate can bypass managed rollback."""
+    try:
+        _validate_document(document)
+        progress = _validate_app_progress(progress)
+        forward = document["forward"]
+        rollback = document["rollback"]
+        control = forward["control"]
+        marker = forward["marker"]
+        baseline = document["baseline"]
+        if (
+            document["phase"] not in {"FORWARD_APPLYING", "ROLLBACK_PREPARING"}
+            or baseline["kind"] != "legacy_no_control"
+            or not baseline["captured"] or baseline["control"] is not None
+            or document["operation"] is not None or document["abort"] is not None
+            or any(document["promotion"].values())
+            or document["pending_retirements"]
+            or document["janitor"]["service"] is not None
+            or rollback["attempt"] > 1
+            or rollback["control"] is not None or rollback["marker"] is not None
+            or rollback["workers"]
+            or control is None or marker is None
+            or progress["transaction_id"] != document["transaction_id"]
+            or progress["target_commit"] != document["target_commit"]
+            or set(progress["attempted_services"]) & RUNTIME_AUTHORITY_SERVICES
+        ):
+            return False
+        workers = forward["workers"]
+        if (
+            len(workers) != 4
+            or {worker["service"] for worker in workers} != RUNTIME_AUTHORITY_SERVICES
+            or any(worker["applied_stage"] != "prepared" for worker in workers)
+            or control["generation"] != "c-" + document["target_commit"][:20]
+            or marker["image"] != control["image"]
+        ):
+            return False
+        expected_authorities = {
+            ("control", "vp-worker-control", control["generation"]),
+            ("marker", "worker-redis-marker-control", marker["generation"]),
+            *(("runtime", worker["service"], str(worker["generation"])) for worker in workers),
+        }
+        authorities = document["authorities"]
+        if len(authorities) != 6 or {
+            (item["kind"], item["service"], item["generation"]) for item in authorities
+        } != expected_authorities or any(
+            item["state"] != "provisioned"
+            or item["control_generation"] != control["generation"]
+            or item["control_image"] != control["image"]
+            for item in authorities
+        ):
+            return False
+        expected_secrets = control["secrets"] + [
+            item for item in marker["secrets"] if item["purpose"].endswith("-database")
+        ] + [worker[key] for worker in workers for key in ("database_secret", "admission_secret")]
+        if sorted(expected_secrets, key=lambda item: item["docker_secret_id"]) != sorted(
+            document["prepared_secrets"], key=lambda item: item["docker_secret_id"]
+        ):
+            return False
+        failed = document["failed_forward"]
+        if failed["captured"]:
+            baseline_services = {item["name"]: item for item in baseline["services"]}
+            if (
+                {item["name"] for item in failed["services"]} != set(progress["attempted_services"])
+                or failed["control"] is None
+                or failed["control"]["generation"] != control["generation"]
+                or failed["control"]["image"] != control["image"]
+                or any(item["docker_service_id"] != baseline_services[item["name"]]["docker_service_id"]
+                       for item in failed["services"])
+            ):
+                return False
+        return True
+    except (TransactionError, KeyError, TypeError, ValueError):
+        return False
+
+
 def begin_abort(arguments: list[str]) -> None:
     if len(arguments) != 4:
         raise TransactionError
@@ -2764,10 +2840,31 @@ def begin_abort(arguments: list[str]) -> None:
     _require_string(reason, r"[a-z][a-z0-9_]{0,63}", maximum=64)
 
     def updater(document: dict[str, Any]) -> None:
+        legacy_preapply = document["phase"] == "ROLLBACK_PREPARING" or (
+            document["baseline"]["kind"] == "legacy_no_control"
+            and len(document["forward"]["workers"]) == 4
+        )
+        if legacy_preapply:
+            _root, root_descriptor, transactions_descriptor = _open_transactions(raw_root, create=False)
+            try:
+                descriptor = _open_child_directory(
+                    transactions_descriptor, document["transaction_id"], create=False,
+                )
+                try:
+                    progress, _identity = _read_app_progress_from_descriptor(descriptor, allow_missing=False)
+                finally:
+                    os.close(descriptor)
+            finally:
+                os.close(transactions_descriptor)
+                os.close(root_descriptor)
+            if not legacy_preapply_abort_eligible(document, progress):
+                raise TransactionError
         aborting_forward = document["phase"] == "FORWARD_APPLYING"
         if (
             document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}
-            or document["operation"] is not None
+            and not legacy_preapply
+        ) or (
+            document["operation"] is not None
             or document["abort"] is not None
             or (
                 aborting_forward

@@ -3825,7 +3825,7 @@ try:
         or plan["allow_new_candidate"]
         or plan["allow_stale_cleanup"]
         or plan["phase"] not in {
-            "PREPARING", "FORWARD_APPLYING", "ABORTING", "DONE"
+            "PREPARING", "FORWARD_APPLYING", "ROLLBACK_PREPARING", "ABORTING", "DONE"
         }
         or isinstance(plan["revision"], bool)
         or not isinstance(plan["revision"], int)
@@ -3844,7 +3844,7 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
   [[ -z "$extra" && "$revision" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
   vp_worker_admission_verify_active_database_credentials || return 1
   case "$phase" in
-    PREPARING|FORWARD_APPLYING)
+    PREPARING|FORWARD_APPLYING|ROLLBACK_PREPARING)
       python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
         begin-abort \
         "$root" "$VP_WORKER_ADMISSION_LOCK_FD" \
@@ -5232,6 +5232,7 @@ vp_worker_admission_hydrate_recovery_context() {
   VP_WORKER_ADMISSION_RECOVERY_FAILED_FORWARD_CAPTURED=false
   VP_WORKER_ADMISSION_RECOVERY_EARLY_FORWARD=false
   VP_WORKER_ADMISSION_RECOVERY_PARTIAL_FORWARD=false
+  VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY=false
   VP_WORKER_ADMISSION_RECOVERY_BASELINE_KIND=""
   VP_WORKER_ADMISSION_RECOVERY_BASELINE_WORKER_RECORDS=""
   VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS=""
@@ -5791,6 +5792,13 @@ try:
     ):
         raise ValueError
 
+    if baseline_kind == "legacy_no_control" and fully_prepared_forward:
+        import runpy
+        helper = runpy.run_path(sys.argv[1])
+        document = {key: value for key, value in state.items() if key != "app_progress"}
+        if helper["legacy_preapply_abort_eligible"](document, app_progress):
+            print("legacy-preapply|true")
+
     print("|".join((
         "meta",
         phase,
@@ -5908,7 +5916,7 @@ try:
                 print(f"candidate-service|rollback|{service}")
 except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
-'
+' "$VP_WORKER_ADMISSION_TRANSACTION_HELPER"
   )" || return 1
 
   local recovery_commit=""
@@ -5942,6 +5950,10 @@ except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     local eleventh=""
     local extra=""
     case "$record_type" in
+      legacy-preapply)
+        [[ "$payload" == true ]] || return 1
+        VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY=true
+        ;;
       meta)
         [[ "$seen_meta" == false ]] || return 1
         IFS='|' read -r \
@@ -7998,6 +8010,89 @@ vp_worker_admission_resume_abort_transaction() {
   vp_worker_admission_abort_transaction "$VP_WORKER_ABORT_REASON"
 }
 
+vp_worker_admission_retire_preapply_janitor() {
+  local action="${1:-retire}"
+  [[ "$action" == check || "$action" == retire ]] || return 1
+  local root="$VP_WORKER_ADMISSION_LOCK_ROOT"
+  local config="$root/staging-object-janitor.conf"
+  local services
+  services="$(docker service ls --format '{{.Name}}')" || return 1
+  if [[ ! -e "$config" ]]; then
+    [[ ! -L "$config" ]] || return 1
+    ! grep -Fxq vp-staging-object-janitor <<<"$services"
+    return
+  fi
+  [[ -f "$config" && ! -L "$config" \
+    && "$(vp_worker_redis_marker_file_mode "$config")" == 600 \
+    && "$(shasum -a 256 "$config" | awk '{print $1}')" \
+      == "$VP_WORKER_ROLLBACK_FAILED_CONTROL_CONFIG_SHA256" ]] || return 1
+  if grep -Fxq vp-staging-object-janitor <<<"$services"; then
+    vp_require_staging_object_janitor_control \
+      "$root" "$VP_WORKER_ADMISSION_CONTROL_IMAGE" || return 1
+  fi
+  [[ "$action" != check ]] || return 0
+  # Use the checked-in launcher, including its terminal-job identity recheck.
+  VP_STAGING_JANITOR_CONFIG_FILE="$config" \
+    bash "$VP_STAGING_JANITOR_SOURCE" retire || return 1
+  services="$(docker service ls --format '{{.Name}}')" || return 1
+  ! grep -Fxq vp-staging-object-janitor <<<"$services"
+}
+
+vp_worker_admission_abort_legacy_preapply() {
+  vp_worker_admission_hydrate_recovery_context || return 1
+  [[ "$VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY" == true ]] || return 1
+  if [[ "$VP_WORKER_ADMISSION_RECOVERY_FAILED_FORWARD_CAPTURED" != true ]]; then
+    vp_worker_admission_capture_failed_forward \
+      "$VP_WORKER_ADMISSION_RECOVERY_ATTEMPTED_SERVICES" || return 1
+    vp_worker_admission_hydrate_recovery_context || return 1
+    [[ "$VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY" == true ]] || return 1
+  fi
+  local root="$VP_WORKER_ADMISSION_LOCK_ROOT"
+  [[ ! -e "$root/control-current.conf" && ! -L "$root/control-current.conf" ]] || return 1
+  local service existed service_id image digest extra kind identity
+  local count=0
+  while IFS='|' read -r service existed service_id image digest extra; do
+    [[ -n "$service" && -z "$extra" ]] || return 1
+    kind="$(vp_worker_admission_kind "$service")" || return 1
+    [[ ! -e "$root/current/$kind.conf" && ! -L "$root/current/$kind.conf" ]] || return 1
+    if [[ "$existed" == true ]]; then
+      identity="$(vp_app_service_durable_identity "$service" "$image")" || return 1
+      [[ "$identity" == "$service_id|$digest" ]] || return 1
+    elif [[ "$existed" == false ]]; then
+      local services
+      services="$(docker service ls --format '{{.Name}}')" || return 1
+      ! grep -Fxq "$service" <<<"$services" || return 1
+    else
+      return 1
+    fi
+    count=$((count + 1))
+  done <<<"$VP_WORKER_ADMISSION_RECOVERY_BASELINE_WORKER_RECORDS"
+  [[ "$count" == 4 ]] || return 1
+  local marker_root
+  marker_root="$(vp_worker_redis_marker_control_root)" || return 1
+  local baseline="$VP_WORKER_REDIS_MARKER_MANAGED_STATE"
+  [[ -n "$baseline" && ! -e "$baseline/control.conf" \
+    && ! -L "$baseline/control.conf" ]] || return 1
+  if [[ -e "$marker_root/control.conf" || -L "$marker_root/control.conf" ]]; then
+    [[ -f "$marker_root/control.conf" && ! -L "$marker_root/control.conf" \
+      && "$(vp_worker_redis_marker_file_mode "$marker_root/control.conf")" == 600 \
+      && "$(shasum -a 256 "$marker_root/control.conf" | awk '{print $1}')" \
+      == "$VP_WORKER_REDIS_MARKER_CANDIDATE_CONFIG_SHA256" ]] || return 1
+  fi
+  vp_worker_admission_retire_preapply_janitor check || return 1
+  vp_restore_app_snapshots \
+    "$VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS" \
+    "$VP_WORKER_ADMISSION_RECOVERY_ATTEMPTED_SERVICES" false || return 1
+  vp_worker_redis_marker_restore_managed_state || return 1
+  vp_worker_admission_retire_preapply_janitor || return 1
+  vp_worker_redis_marker_remove_generation_jobs \
+    "$VP_WORKER_REDIS_MARKER_CANDIDATE_IMAGE" \
+    "$VP_WORKER_REDIS_MARKER_CANDIDATE_GENERATION" || return 1
+  vp_worker_admission_abort_transaction preparing_failed || return 1
+  vp_worker_redis_marker_discard_managed_state || return 1
+  VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
+}
+
 vp_worker_admission_resume_durable_rollback() {
   vp_worker_admission_hydrate_recovery_context || return 1
   vp_restore_worker_admission_transaction \
@@ -8008,6 +8103,10 @@ vp_worker_admission_resume_durable_rollback() {
 
 vp_worker_admission_resume_forward_failure() {
   vp_worker_admission_hydrate_recovery_context || return 1
+  if [[ "${VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY:-false}" == true ]]; then
+    vp_worker_admission_abort_legacy_preapply
+    return
+  fi
   if [[ "$VP_WORKER_ADMISSION_RECOVERY_EARLY_FORWARD" == true ]]; then
     vp_restore_app_snapshots \
       "$VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS" \
@@ -8321,6 +8420,7 @@ except Exception:
 }
 
 vp_worker_admission_reset_forward_context() {
+  VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY=false
   VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
   VP_WORKER_ADMISSION_TRANSACTION_ID=""
   VP_WORKER_ADMISSION_PREPARED=false
@@ -10674,14 +10774,16 @@ vp_run_staging_object_janitor_once() {
         --no-trunc \
         --format '{{.DesiredState}}|{{.CurrentState}}'
     )" || return 1
+    [[ -n "$task_state" && "$task_state" != *$'\n'* ]] || return 1
     case "$task_state" in
-      Shutdown\|Complete*)
+      Complete\|Complete*|Shutdown\|Complete*)
         return 0
         ;;
+      Complete\|Failed*|Complete\|Rejected*|Complete\|Shutdown*|\
       Shutdown\|Failed*|Shutdown\|Rejected*|Shutdown\|Shutdown*)
         return 1
         ;;
-      Running\|*)
+      Running\|*|Complete\|*)
         sleep 2 || return 1
         ;;
       *)
@@ -14481,6 +14583,10 @@ vp_restore_worker_admission_transaction() {
   local process_candidate_records="${5:-}"
   [[ "$preserve_incomplete" == true || "$preserve_incomplete" == false ]] \
     || return 1
+  if [[ "${VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY:-false}" == true ]]; then
+    vp_worker_admission_abort_legacy_preapply
+    return
+  fi
   local root
   root="$(vp_worker_admission_root)" || return 1
   if [[ -z "$VP_WORKER_ROLLBACK_FAILED_CANDIDATE_NAMESPACE" ]]; then

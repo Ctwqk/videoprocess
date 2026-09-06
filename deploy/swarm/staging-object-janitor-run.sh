@@ -391,7 +391,8 @@ if docker service inspect "$JOB_NAME" >/dev/null 2>&1; then
   [[ -n "$task_state" && "$task_state" != *$'\n'* ]] \
     || fail "task set is invalid"
   case "$task_state" in
-    Running\|New*|Running\|Pending*|Running\|Assigned*|Running\|Accepted*|Running\|Preparing*|Running\|Ready*|Running\|Starting*|Running\|Running*)
+    Running\|New*|Running\|Pending*|Running\|Assigned*|Running\|Accepted*|Running\|Preparing*|Running\|Ready*|Running\|Starting*|Running\|Running*|\
+    Complete\|New*|Complete\|Pending*|Complete\|Assigned*|Complete\|Accepted*|Complete\|Preparing*|Complete\|Ready*|Complete\|Starting*|Complete\|Running*)
       [[ "$ACTION" == run ]] \
         || fail "running job cannot be retired"
       if ! docker container inspect "$holder_name" >/dev/null 2>&1; then
@@ -400,7 +401,8 @@ if docker service inspect "$JOB_NAME" >/dev/null 2>&1; then
       fi
       service_running=1
       ;;
-    Shutdown\|Complete*|Shutdown\|Failed*|Shutdown\|Rejected*|Shutdown\|Shutdown*)
+    Shutdown\|Complete*|Shutdown\|Failed*|Shutdown\|Rejected*|Shutdown\|Shutdown*|\
+    Complete\|Complete*|Complete\|Failed*|Complete\|Rejected*|Complete\|Shutdown*)
       final_service_id="$(
         validate_existing_job "$JOB_NAME"
       )" || fail "terminal job final identity mismatch"
@@ -597,6 +599,7 @@ acquire_service_task_volume() {
         <<<"$task_rows"
       if [[ "$task_id" =~ ^[a-z0-9]{20,64}$ \
         && ( "$desired_state" == Running \
+          || "$desired_state" == Complete \
           || "$desired_state" == Shutdown ) \
         && -n "$current_state" ]]; then
         task_containers="$(

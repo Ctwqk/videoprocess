@@ -24,6 +24,349 @@ log() {
 source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 
 (
+  VP_WORKER_ADMISSION_LOCK_ROOT="$TEST_ROOT/preapply-janitor"
+  mkdir -p "$VP_WORKER_ADMISSION_LOCK_ROOT"
+  config="$VP_WORKER_ADMISSION_LOCK_ROOT/staging-object-janitor.conf"
+  printf 'VERSION=2\n' >"$config"
+  chmod 0600 "$config"
+  VP_WORKER_ROLLBACK_FAILED_CONTROL_CONFIG_SHA256="$(shasum -a 256 "$config" | awk '{print $1}')"
+  VP_WORKER_ADMISSION_CONTROL_IMAGE=candidate-image
+  janitor_calls="$TEST_ROOT/preapply-janitor-calls"
+  : >"$janitor_calls"
+  present=true
+  docker() {
+    [[ "$*" == "service ls --format {{.Name}}" ]] || return 1
+    if [[ "$present" == true ]]; then printf 'vp-staging-object-janitor\n'; fi
+  }
+  vp_require_staging_object_janitor_control() { [[ "$JANITOR_IDENTITY_OK" == true ]]; }
+  bash() {
+    [[ "$1" == "$VP_STAGING_JANITOR_SOURCE" && "$2" == retire \
+      && "$VP_STAGING_JANITOR_CONFIG_FILE" == "$config" ]] || return 1
+    printf 'retire\n' >>"$janitor_calls"
+    present=false
+  }
+  JANITOR_IDENTITY_OK=false
+  if vp_worker_admission_retire_preapply_janitor; then
+    echo 'FAIL: unrelated staging janitor was retired' >&2; exit 1
+  fi
+  [[ ! -s "$janitor_calls" ]]
+  JANITOR_IDENTITY_OK=true
+  vp_worker_admission_retire_preapply_janitor check
+  [[ ! -s "$janitor_calls" ]] || {
+    echo 'FAIL: janitor preflight mutated the service' >&2; exit 1
+  }
+  if ! vp_worker_admission_retire_preapply_janitor; then
+    echo 'FAIL: journal SHA256 did not authorize the exact preapply janitor config' >&2; exit 1
+  fi
+  [[ "$(command cat "$janitor_calls")" == retire ]]
+  : >"$janitor_calls"
+  printf 'changed\n' >>"$config"
+  if vp_worker_admission_retire_preapply_janitor; then
+    echo 'FAIL: changed staging janitor config authorized cleanup' >&2; exit 1
+  fi
+  [[ ! -s "$janitor_calls" ]]
+)
+
+# Fully prepared bootstrap authority is not evidence of a worker service apply.
+(
+  ROOT="$TEST_ROOT/legacy-preapply"
+  admission_root="$ROOT/state/vp-worker-admission"
+  mkdir -p "$admission_root"
+  chmod 0700 "$admission_root"
+  lock_path="$(python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" lock-prepare "$admission_root")"
+  exec 19<>"$lock_path"
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" lock-acquire "$admission_root" 19 >/dev/null
+  VP_WORKER_ADMISSION_LOCK_ROOT="$admission_root"
+  VP_WORKER_ADMISSION_LOCK_FD=19
+  CALLS="$ROOT/calls"
+  : >"$CALLS"
+  python3 - "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" "$ROOT" <<'PY'
+import hashlib
+import json
+import pathlib
+import runpy
+import sys
+
+helper = runpy.run_path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+commit = "2" * 40
+image = "vp-ffmpeg-worker-python:deploy-222222222222"
+control_generation = "c-22222222222222222222"
+marker_generation = "m-222222222222-1700000000-0001"
+credentials = {}
+for purpose in helper["DATABASE_PURPOSES"]:
+    path = root / purpose
+    path.write_text("postgresql://fixture:password@database/videoprocess\n")
+    path.chmod(0o400)
+    credentials[purpose] = helper["_capture_credential"](str(path), "vp_" + purpose)
+state = helper["_new_document"](
+    target_commit=commit, target_backend_image="vp-backend:deploy-222222222222",
+    target_go_image="vp-ffmpeg-worker-go:deploy-222222222222", namespace=commit,
+    baseline_kind="legacy_no_control", credentials=credentials,
+)
+state["transaction_id"] = "tx-" + "2" * 32
+state["phase"] = "ROLLBACK_PREPARING"
+state["revision"] = 64
+state["rollback"].update(attempt=1, namespace="rollback-123456789012345678",
+                         marker_generation="m-rb-222222222222-1")
+state["baseline"]["captured"] = True
+state["baseline"]["services"] = [
+    dict(name=name, existed=True, docker_service_id=f"{i:024x}",
+         image="vp-baseline:deploy-111111111111", spec_digest="a" * 64)
+    for i, name in enumerate(sorted(helper["APP_SERVICES"]), 100)
+]
+attempted = ["vp-api-swarm", "vp-frontend-swarm", "vp-autoflow-api-swarm"]
+state["failed_forward"] = dict(
+    captured=True,
+    services=[dict(item, image="vp-candidate:deploy-222222222222", spec_digest="b" * 64)
+              for item in state["baseline"]["services"] if item["name"] in attempted],
+    control=dict(generation=control_generation, image=image,
+                 config_sha256="c" * 64, cron_sha256="d" * 64),
+)
+serial = 200
+
+def secret(service, generation, purpose, name):
+    global serial
+    serial += 1
+    return dict(service=service, generation=str(generation), purpose=purpose,
+                name=name, docker_secret_id=f"{serial:024x}")
+
+def authority(kind, service, generation):
+    return dict(kind=kind, service=service, generation=str(generation), state="provisioned",
+                control_image=image, control_generation=control_generation,
+                operator_reference=(f"marker/{generation}/worker-marker-owner-database-url"
+                                    if kind == "marker" else
+                                    f"control/{control_generation}/worker-registration-operator-database-url"))
+
+purposes = ["operator", "orchestrator", "staging-janitor", "staging-minio-access",
+            "staging-minio-secret", "worker-minio-access", "worker-minio-secret"]
+control_secrets = [secret("vp-worker-control", control_generation, purpose, "control-" + purpose)
+                   for purpose in purposes]
+state["forward"]["control"] = dict(generation=control_generation, image=image,
+                                    manifest_sha256="e" * 64, secrets=control_secrets)
+marker_secrets = [secret("worker-redis-marker-control", marker_generation, purpose + "-database",
+                         f"vp-wrm-{purpose}-db-{marker_generation}")
+                  for purpose in ("readiness", "janitor", "repair")]
+state["prepared_secrets"] = control_secrets + marker_secrets
+state["authorities"] = [authority("marker", "worker-redis-marker-control", marker_generation),
+                        authority("control", "vp-worker-control", control_generation)]
+for role in ("control", "ffmpeg_go", "ffmpeg", "vision", "youtube_publisher",
+             "watcher", "readiness", "janitor", "repair"):
+    ref = secret("vp-worker-redis-runtime", commit, role + "-redis", "runtime-" + role)
+    state["runtime_redis"][role] = dict(runtime_generation=commit, secret_name=ref["name"],
+                                       docker_secret_id=ref["docker_secret_id"])
+    if role in {"readiness", "janitor"}:
+        marker_secrets.append(ref)
+state["forward"]["marker"] = dict(generation=marker_generation, image=image,
+                                   config_sha256="f" * 64, cron_sha256="a" * 64,
+                                   secrets=marker_secrets)
+marker_config = root / "state/worker-redis-marker-control/control.conf"
+marker_config.parent.mkdir(parents=True, mode=0o700)
+marker_config.write_text("GENERATION=" + marker_generation + "\n")
+marker_config.chmod(0o600)
+state["forward"]["marker"]["config_sha256"] = hashlib.sha256(marker_config.read_bytes()).hexdigest()
+for i, service in enumerate(sorted(helper["RUNTIME_AUTHORITY_SERVICES"]), 301):
+    database = secret(service, i, "database", service + "-database")
+    admission = secret(service, i, "admission", service + "-admission")
+    state["forward"]["workers"].append(dict(
+        service=service, generation=i, commit=commit, image=image, applied_stage="prepared",
+        docker_service_id=None, target_spec_digest=None,
+        database_secret=database, admission_secret=admission))
+    state["authorities"].append(authority("runtime", service, i))
+    state["prepared_secrets"].extend([database, admission])
+helper["_validate_document"](state)
+progress = dict(schema=1, transaction_id=state["transaction_id"], target_commit=commit,
+                attempted_services=attempted, migration_state="applied")
+
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+    path.chmod(0o600)
+
+write(root / "fixture.json", state)
+write(root / "state/vp-worker-admission/transactions/active.json", state)
+write(root / "state/vp-worker-admission/transactions" / state["transaction_id"] / "app-progress.json", progress)
+baseline = root / "state/worker-redis-marker-control/transactions" / state["transaction_id"] / "baseline-managed-state"
+baseline.mkdir(parents=True, mode=0o700)
+(baseline / "captured").write_text("VERSION=1\n")
+(baseline / "captured").chmod(0o600)
+(baseline / "crontab").write_text("")
+PY
+  # A real journal and fresh hydration must route both entry points to abort.
+  vp_worker_admission_lock_assert() { return 0; }
+  vp_worker_admission_verify_active_database_credentials() { return 0; }
+  for invalid in attempted-worker applied-worker missing-baseline promoted-control promoted-marker \
+    rollback-worker rollback-control missing-authority missing-secret missing-progress; do
+    python3 - "$ROOT/fixture.json" "$admission_root/transactions/active.json" "$invalid" <<'PY'
+import json
+import pathlib
+import sys
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+path = pathlib.Path(sys.argv[2])
+progress_path = path.parent / state["transaction_id"] / "app-progress.json"
+progress = json.loads(progress_path.read_text())
+progress["attempted_services"] = ["vp-api-swarm", "vp-frontend-swarm", "vp-autoflow-api-swarm"]
+worker = state["forward"]["workers"][0]
+case = sys.argv[3]
+if case == "attempted-worker":
+    progress["attempted_services"].append(worker["service"])
+elif case == "applied-worker":
+    worker.update(applied_stage="applied", docker_service_id="9" * 24, target_spec_digest="9" * 64)
+elif case == "missing-baseline":
+    state["baseline"]["services"].pop()
+elif case.startswith("promoted-"):
+    state["promotion"][case.removeprefix("promoted-")] = True
+elif case == "rollback-worker":
+    state["rollback"]["workers"] = [worker]
+elif case == "rollback-control":
+    state["rollback"]["control"] = state["forward"]["control"]
+elif case == "missing-authority":
+    state["authorities"].pop()
+elif case == "missing-secret":
+    state["prepared_secrets"].pop()
+elif case == "missing-progress":
+    progress["transaction_id"] = "tx-" + "3" * 32
+for target, value in ((path, state), (progress_path, progress)):
+    target.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+    if vp_worker_admission_hydrate_recovery_context 2>/dev/null \
+      && [[ "${VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY:-false}" == true ]]; then
+      echo "FAIL: $invalid selected legacy preapply cleanup" >&2
+      exit 1
+    fi
+    before="$(cksum "$admission_root/transactions/active.json")"
+    if python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin-abort \
+      "$admission_root" 19 64 preparing_failed >/dev/null 2>&1; then
+      echo "FAIL: $invalid allowed journal abort" >&2
+      exit 1
+    fi
+    [[ "$(cksum "$admission_root/transactions/active.json")" == "$before" ]]
+  done
+  python3 - "$admission_root/transactions/tx-22222222222222222222222222222222/app-progress.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+progress = json.loads(path.read_text())
+progress["transaction_id"] = "tx-" + "2" * 32
+path.write_text(json.dumps(progress, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+  for phase in ROLLBACK_PREPARING FORWARD_APPLYING; do
+    python3 - "$ROOT/fixture.json" "$admission_root/transactions/active.json" "$phase" <<'PY'
+import json
+import pathlib
+import sys
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+state["phase"] = sys.argv[3]
+if state["phase"] == "FORWARD_APPLYING":
+    state["rollback"].update(attempt=0, namespace=None, marker_generation=None)
+pathlib.Path(sys.argv[2]).write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+    if ! vp_worker_admission_hydrate_recovery_context \
+      || [[ "${VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY:-false}" != true ]]; then
+      echo "FAIL: fully prepared legacy $phase did not select zero-worker abort" >&2
+      exit 1
+    fi
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin-abort \
+      "$admission_root" 19 64 preparing_failed >/dev/null || {
+      echo "FAIL: legacy $phase could not journal abort" >&2
+      exit 1
+    }
+    python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" list-abort \
+      "$admission_root" 19 | python3 -c '
+import json, sys
+state = json.load(sys.stdin)
+assert state["phase"] == "ABORTING"
+assert len(state["authorities"]) == 6
+assert len(state["prepared_secrets"]) == 18
+'
+  done
+  # Exercise actual recovery dispatch and journal cleanup; only external effects are doubles.
+  vp_app_service_durable_identity() {
+    case "$1" in
+      vp-ffmpeg-worker-go-swarm) printf '%024x|%s\n' 104 "${LIVE_WORKER_DIGEST:-$(printf 'a%.0s' {1..64})}" ;;
+      vp-ffmpeg-worker-gpu-swarm) printf '%024x|%s\n' 105 "$(printf 'a%.0s' {1..64})" ;;
+      vp-vision-worker-swarm) printf '%024x|%s\n' 107 "$(printf 'a%.0s' {1..64})" ;;
+      vp-youtube-publisher-swarm) printf '%024x|%s\n' 108 "$(printf 'a%.0s' {1..64})" ;;
+      *) return 1 ;;
+    esac
+  }
+  vp_restore_app_snapshots() {
+    [[ "$2" == 'vp-api-swarm vp-frontend-swarm vp-autoflow-api-swarm' && "$3" == false ]] || return 1
+    printf 'restore-apps\n' >>"$CALLS"
+  }
+  vp_worker_admission_retire_preapply_janitor() {
+    if [[ "${1:-}" != check ]]; then
+      grep -Fxq restore-marker "$CALLS" || return 1
+      printf 'retire-janitor\n' >>"$CALLS"
+    fi
+  }
+  vp_worker_redis_marker_restore_managed_state() { printf 'restore-marker\n' >>"$CALLS"; }
+  vp_worker_redis_marker_remove_generation_jobs() { printf 'remove-marker-jobs\n' >>"$CALLS"; }
+  vp_worker_admission_secret_unused() {
+    grep -Fxq retire-janitor "$CALLS" && grep -Fxq remove-marker-jobs "$CALLS"
+  }
+  vp_managed_secret_id() { printf '%s\n' "$1"; }
+  docker() {
+    [[ "$1 $2" == 'secret rm' ]] || return 1
+    printf 'remove-secret|%s\n' "$3" >>"$CALLS"
+  }
+  vp_worker_control_revoke_authority() { printf 'revoke-control\n' >>"$CALLS"; }
+  vp_worker_redis_marker_revoke_roles() { printf 'revoke-marker\n' >>"$CALLS"; }
+  vp_worker_admission_revoke_generation_authority() { printf 'revoke-runtime|%s\n' "$1" >>"$CALLS"; }
+  for entry in durable forward same-process changed-worker promoted-file missing-marker-baseline; do
+    cp "$ROOT/fixture.json" "$admission_root/transactions/active.json"
+    rm -f "$admission_root/transactions/tx-22222222222222222222222222222222/done.json"
+    : >"$CALLS"
+    if [[ "$entry" == forward || "$entry" == same-process ]]; then
+      python3 - "$admission_root/transactions/active.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+state = json.loads(path.read_text())
+state["phase"] = "FORWARD_APPLYING"
+state["rollback"].update(attempt=0, namespace=None, marker_generation=None)
+path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+    fi
+    baseline="$ROOT/state/worker-redis-marker-control/transactions/tx-22222222222222222222222222222222/baseline-managed-state"
+    mkdir -p "$baseline"
+    chmod 0700 "$baseline"
+    printf 'VERSION=1\n' >"$baseline/captured"
+    chmod 0600 "$baseline/captured"
+    : >"$baseline/crontab"
+    LIVE_WORKER_DIGEST=""
+    if [[ "$entry" == changed-worker ]]; then LIVE_WORKER_DIGEST="$(printf 'b%.0s' {1..64})"; fi
+    if [[ "$entry" == promoted-file ]]; then : >"$admission_root/control-current.conf"; fi
+    if [[ "$entry" == missing-marker-baseline ]]; then rm "$baseline/captured"; fi
+    rc=0
+    case "$entry" in
+      forward) vp_worker_admission_resume_forward_failure || rc=$? ;;
+      same-process)
+        vp_worker_admission_hydrate_recovery_context
+        vp_restore_worker_admission_transaction \
+          "$VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS" \
+          "$VP_WORKER_ADMISSION_RECOVERY_ATTEMPTED_SERVICES" "" || rc=$?
+        ;;
+      *) vp_worker_admission_resume_durable_rollback || rc=$? ;;
+    esac
+    case "$entry" in
+      changed-worker|promoted-file|missing-marker-baseline)
+        [[ "$rc" != 0 && ! -s "$CALLS" && -f "$admission_root/transactions/active.json" ]] || {
+          echo "FAIL: $entry did not fail closed before cleanup" >&2; exit 1;
+        }
+        rm -f "$admission_root/control-current.conf"
+        ;;
+      *)
+        [[ "$rc" == 0 && ! -e "$admission_root/transactions/active.json" ]] || {
+          echo "FAIL: $entry did not finish durable legacy abort" >&2; exit 1;
+        }
+        [[ "$(grep -c '^remove-secret|' "$CALLS")" == 18 \
+          && "$(grep -c '^revoke-runtime|' "$CALLS")" == 4 ]]
+        ;;
+    esac
+  done
+  exec 19>&-
+)
+
+(
   VP_WORKER_ADMISSION_RECOVERY_CANDIDATE_SERVICE_RECORDS=stale-recovery-authority
   vp_worker_admission_reset_forward_context
   if [[ -n "$VP_WORKER_ADMISSION_RECOVERY_CANDIDATE_SERVICE_RECORDS" ]]; then
