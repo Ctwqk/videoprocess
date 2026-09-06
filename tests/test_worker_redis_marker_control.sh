@@ -2222,6 +2222,9 @@ vp_worker_admission_advance_migration_state() {
 vp_record_app_service_attempt() {
   :
 }
+vp_record_worker_activation_attempt() {
+  vp_record_app_service_attempt "$1"
+}
 vp_worker_admission_record_janitor_service() {
   :
 }
