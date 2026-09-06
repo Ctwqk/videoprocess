@@ -16343,10 +16343,35 @@ vp_run_worker_redis_marker_readiness() {
   VP_WORKER_REDIS_MARKER_LOCK_DIR="$lock_dir" \
     "$launcher" readiness >/dev/null \
     || return 1
-  VP_WORKER_REDIS_MARKER_CONFIG_FILE="$config" \
-  VP_WORKER_REDIS_MARKER_STATE_DIR="$state_dir" \
-  VP_WORKER_REDIS_MARKER_LOCK_DIR="$lock_dir" \
-    "$launcher" status >/dev/null
+  vp_wait_worker_redis_marker_status "$control_root"
+}
+
+vp_wait_worker_redis_marker_status() {
+  local control_root="$1"
+  local launcher="${ROOT}/bin/worker-redis-marker-control.sh"
+  local attempt
+  local output
+  local status
+  for ((attempt = 0; attempt < 60; attempt++)); do
+    if output="$(
+      VP_WORKER_REDIS_MARKER_CONFIG_FILE="$control_root/control.conf" \
+      VP_WORKER_REDIS_MARKER_STATE_DIR="$control_root/status" \
+      VP_WORKER_REDIS_MARKER_LOCK_DIR="$control_root/locks" \
+        "$launcher" status
+    )"; then
+      return 0
+    else
+      status=$?
+    fi
+    # The periodic readiness check invalidates its cache before refreshing it.
+    [[ "$status" -eq 3 \
+      && "$output" == 'mode=status code=readiness_status_missing' ]] || return 1
+    if [[ "$attempt" -lt 59 ]]; then
+      sleep 1 || return 1
+    fi
+  done
+  echo "worker Redis marker readiness refresh did not complete" >&2
+  return 1
 }
 
 vp_require_worker_redis_marker_status() {
@@ -16356,11 +16381,7 @@ vp_require_worker_redis_marker_status() {
   fi
   local control_root
   control_root="$(vp_worker_redis_marker_control_root)" || return 1
-  local launcher="${ROOT}/bin/worker-redis-marker-control.sh"
-  VP_WORKER_REDIS_MARKER_CONFIG_FILE="$control_root/control.conf" \
-  VP_WORKER_REDIS_MARKER_STATE_DIR="$control_root/status" \
-  VP_WORKER_REDIS_MARKER_LOCK_DIR="$control_root/locks" \
-    "$launcher" status >/dev/null
+  vp_wait_worker_redis_marker_status "$control_root"
 }
 
 vp_worker_redis_marker_provision_generation() {

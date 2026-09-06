@@ -41,6 +41,36 @@ already ran on July 26; its authorization is not unused.
   files pass Ruff and the changed service passes mypy; full-tree advisory
   checks retain the existing 15 lint and 61 type findings.
 
+## Automatic Rollout Follow-up, 17:20 UTC
+
+`c2bb0de7b2e653b1c0db9a056f7ce25e2242b22b` passed all four GitHub CI jobs
+(`34045807906`). The normal 17:15 timer automatically built and deployed it;
+no manual deployment trigger was used. Its vision precheck correctly returned
+10, its safety check passed, and API/AutoFlow/frontend were updated on 127.
+
+At 17:20:04 the forward deployment failed before any worker replacement.
+Read-only observation reproduced the marker readiness cache disappearing at
+17:25:01 during its periodic refresh and returning `ready` at 17:25:05. The
+deployment gate now waits at most 60 checks for this exact missing-status
+response; invalid, stale, unready, and unexpected responses still fail
+immediately. Deployment and marker-control tests passed locally, and focused
+review found no concrete P1/P2 issue in this change.
+
+Automatic rollback then stopped before creating its first marker database
+secret: the durable helper accepts prepared-secret operations only during
+forward phases. Transaction `tx-e84fb31f632be927e6abe9ffb642fc79` remains
+`ROLLBACK_PREPARING`; its selected rollback marker is `m-rb-e84fb31f632b-1`.
+The rollback-phase authorization repair is implemented: only the allocated
+marker's three database secrets and provisioned runtime authorities bound to
+the selected baseline control are accepted. `ROLLBACK_APPLYING` permits only
+idempotent reuse of already recorded identities. No schema or production
+journal rewrite is required. All 15 focused tests, existing rollback contracts,
+marker-control tests, and recovery-executor tests passed; the real revision-71
+journal and its three marker bindings validate offline. Focused review found
+no concrete P1/P2 issue. Exact-commit CI and production recovery remain pending.
+Workers still run `fab36e3a818b`; the mixed deployment must not be reported
+as converged. No upload or public production has been started.
+
 The notes below are earlier checkpoints, not the current deployment state.
 
 ## Earlier Verified State

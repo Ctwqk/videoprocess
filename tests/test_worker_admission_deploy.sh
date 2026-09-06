@@ -93,6 +93,52 @@ chmod 0700 "$(vp_worker_admission_root)"
 )
 
 (
+  ROOT="$TEST_ROOT/marker-status-refresh"
+  mkdir -p "$ROOT/bin"
+  export MARKER_STATUS_READS="$ROOT/reads"
+  export MARKER_STATUS_MODE
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    '[[ "$1" == readiness ]] && exit 0' \
+    'read -r count <"$MARKER_STATUS_READS"' \
+    'count=$((count + 1))' \
+    'printf "%s\n" "$count" >"$MARKER_STATUS_READS"' \
+    'case "$MARKER_STATUS_MODE" in' \
+    '  refreshing) if ((count > 2)); then printf "mode=status code=ready\n"; exit 0; fi ;;' \
+    '  missing) ;;' \
+    '  *) printf "mode=status code=readiness_status_%s\n" "$MARKER_STATUS_MODE"; exit 3 ;;' \
+    'esac' \
+    'printf "mode=status code=readiness_status_missing\n"' \
+    'exit 3' >"$ROOT/bin/worker-redis-marker-control.sh"
+  chmod 0755 "$ROOT/bin/worker-redis-marker-control.sh"
+  sleep() { sleeps=$((sleeps + 1)); }
+  UPDATE_SERVICES=1
+  for gate in vp_require_worker_redis_marker_status vp_run_worker_redis_marker_readiness; do
+    MARKER_STATUS_MODE=refreshing
+    printf '0\n' >"$MARKER_STATUS_READS"
+    sleeps=0
+    "$gate" "$ROOT/state/worker-redis-marker-control" || {
+      echo 'FAIL: marker gate rejected a successful in-flight refresh' >&2
+      exit 1
+    }
+    [[ "$(<"$MARKER_STATUS_READS")" == 3 && "$sleeps" == 2 ]]
+  done
+  for MARKER_STATUS_MODE in missing stale invalid unready unexpected; do
+    printf '0\n' >"$MARKER_STATUS_READS"
+    sleeps=0
+    if vp_require_worker_redis_marker_status >/dev/null 2>&1; then
+      echo 'FAIL: marker status gate accepted an unavailable readiness result' >&2
+      exit 1
+    fi
+    if [[ "$MARKER_STATUS_MODE" == missing ]]; then
+      [[ "$(<"$MARKER_STATUS_READS")" == 60 && "$sleeps" == 59 ]]
+    else
+      [[ "$(<"$MARKER_STATUS_READS")" == 1 && "$sleeps" == 0 ]]
+    fi
+  done
+)
+
+(
   ROOT="$TEST_ROOT/control-promotion-identity"
   control_root="$(vp_worker_admission_root)"
   mkdir -p "$control_root"

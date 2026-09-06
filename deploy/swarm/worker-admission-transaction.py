@@ -625,6 +625,8 @@ def _validate_secret_refs(value: object, *, exact_count: int | None = None) -> N
 def _validate_authority(
     value: object,
     target_commit: str,
+    *,
+    rollback_control: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     authority = _require_exact_fields(
         value,
@@ -665,12 +667,17 @@ def _validate_authority(
         r"[A-Za-z0-9][A-Za-z0-9_./-]{0,254}",
     )
     expected_control_generation = f"c-{target_commit[:20]}"
+    expected_control_image = (
+        f"vp-ffmpeg-worker-python:deploy-{target_commit[:12]}"
+    )
+    if rollback_control is not None:
+        if authority["kind"] != "runtime":
+            raise TransactionError
+        expected_control_generation = rollback_control["generation"]
+        expected_control_image = rollback_control["image"]
     expected_control_operator_reference = (
         f"control/{expected_control_generation}/"
         "worker-registration-operator-database-url"
-    )
-    expected_control_image = (
-        f"vp-ffmpeg-worker-python:deploy-{target_commit[:12]}"
     )
     if (
         authority["control_generation"] != expected_control_generation
@@ -714,14 +721,23 @@ def _validate_authority(
 def _validate_authorities(
     value: object,
     target_commit: str,
+    *,
+    document: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     if not isinstance(value, list):
         raise TransactionError
     identities: set[tuple[str, str, str]] = set()
     control_images: set[str] = set()
+    rollback_services: set[str] = set()
     authorities: list[dict[str, str]] = []
     for item in value:
-        authority = _validate_authority(item, target_commit)
+        rollback_authority = (
+            document is not None and _is_rollback_runtime_authority(document, item)
+        )
+        authority = _validate_authority(
+            item, target_commit,
+            rollback_control=document["rollback"]["control"] if rollback_authority else None,
+        )
         identity = (
             authority["kind"],
             authority["service"],
@@ -730,11 +746,102 @@ def _validate_authorities(
         if identity in identities:
             raise TransactionError
         identities.add(identity)
-        control_images.add(authority["control_image"])
+        if rollback_authority:
+            if authority["service"] in rollback_services:
+                raise TransactionError
+            rollback_services.add(authority["service"])
+        else:
+            control_images.add(authority["control_image"])
         authorities.append(authority)
     if len(control_images) > 1:
         raise TransactionError
     return authorities
+
+
+def _rollback_control(document: dict[str, Any]) -> dict[str, Any] | None:
+    rollback = document["rollback"]
+    control = rollback["control"]
+    if (
+        document["phase"] in {"PREPARING", "FORWARD_APPLYING", "ABORTING"}
+        or document["outcome"] == "aborted"
+        or not document["baseline"]["captured"]
+        or not document["failed_forward"]["captured"]
+        or rollback["attempt"] < 1
+        or rollback["namespace"] is None
+        or rollback["marker_generation"]
+        != f"m-rb-{document['transaction_id'][3:15]}-{rollback['attempt']}"
+        or control is None
+        or control != document["baseline"]["control"]
+    ):
+        return None
+    return control
+
+
+def _is_rollback_runtime_authority(document: dict[str, Any], value: object) -> bool:
+    control = _rollback_control(document)
+    if control is None or not isinstance(value, dict):
+        return False
+    service = value.get("service")
+    generation = value.get("generation")
+    return (
+        value.get("kind") == "runtime"
+        and service in RUNTIME_AUTHORITY_SERVICES
+        and value.get("control_image") == control["image"]
+        and value.get("control_generation") == control["generation"]
+        and all(
+            any(item["name"] == service and item["existed"] for item in document[field]["services"])
+            for field in ("baseline", "failed_forward")
+        )
+        and not any(
+            worker["service"] == service and str(worker["generation"]) == generation
+            for worker in document["forward"]["workers"]
+        )
+    )
+
+
+def _is_rollback_prepared_secret(document: dict[str, Any], reference: dict[str, str]) -> bool:
+    control = _rollback_control(document)
+    if control is None:
+        return False
+    rollback = document["rollback"]
+    service, generation, purpose = (
+        reference["service"], reference["generation"], reference["purpose"]
+    )
+    if service == "worker-redis-marker-control":
+        if (
+            generation != rollback["marker_generation"]
+            or purpose not in {"readiness-database", "janitor-database", "repair-database"}
+            or reference["name"] != f"vp-wrm-{purpose.removesuffix('-database')}-db-{generation}"
+        ):
+            return False
+        marker = rollback["marker"]
+        return marker is None or (
+            marker["generation"] == generation and marker["image"] == control["image"]
+            and any(all(item.get(key) == value for key, value in reference.items())
+                    for item in marker["secrets"])
+        )
+    if service not in RUNTIME_AUTHORITY_SERVICES or purpose not in {"database", "admission"}:
+        return False
+    workers = [worker for worker in rollback["workers"] if worker["service"] == service]
+    if workers:
+        return len(workers) == 1 and all(
+            workers[0][purpose + "_secret"].get(key) == value
+            for key, value in reference.items()
+        )
+    # A fresh worker journals authority before Docker IDs and the worker plan exist.
+    kind = {
+        "vp-ffmpeg-worker-go-swarm": "ffmpeg-go",
+        "vp-ffmpeg-worker-gpu-swarm": "ffmpeg",
+        "vp-vision-worker-swarm": "vision",
+        "vp-youtube-publisher-swarm": "youtube-publisher",
+    }[service]
+    suffix = "db" if purpose == "database" else "admission"
+    return reference["name"] == f"vp-wr-{kind}-{suffix}-{generation}" and any(
+        _is_rollback_runtime_authority(document, authority)
+        and authority["service"] == service and authority["generation"] == generation
+        and authority["state"] == "provisioned"
+        for authority in document["authorities"]
+    )
 
 
 def _validate_legacy_schema_1_abort_authority(
@@ -1412,50 +1519,6 @@ def _validate_document(value: object) -> dict[str, Any]:
         runtime_secret_names.add(entry["secret_name"])
         runtime_secret_ids.add(entry["docker_secret_id"])
 
-    authorities = _validate_authorities(
-        document["authorities"],
-        document["target_commit"],
-    )
-    if document["phase"] in {"PREPARING", "FORWARD_APPLYING"}:
-        if any(authority["state"] == "revoked" for authority in authorities):
-            raise TransactionError
-    elif document["phase"] == "ABORTING" or (
-        document["phase"] == "DONE" and document["outcome"] == "aborted"
-    ):
-        pass
-    elif any(
-        authority["state"] != "provisioned" for authority in authorities
-    ):
-        raise TransactionError
-
-    _validate_secret_refs(document["prepared_secrets"])
-    for reference in document["prepared_secrets"]:
-        if (
-            reference["service"] == "vision-cutover"
-            and reference["generation"] == document["transaction_id"]
-            and reference["purpose"]
-            in {"safety-database", "final-safety-database"}
-        ):
-            continue
-        if reference["service"] == "vp-worker-control":
-            expected_kind = "control"
-        elif reference["service"] == "worker-redis-marker-control":
-            expected_kind = "marker"
-        else:
-            expected_kind = "runtime"
-        matches = [
-            authority
-            for authority in authorities
-            if (
-                authority["kind"] == expected_kind
-                and authority["service"] == reference["service"]
-                and authority["generation"] == reference["generation"]
-                and authority["state"] == "provisioned"
-            )
-        ]
-        if len(matches) != 1:
-            raise TransactionError
-
     baseline = _require_exact_fields(
         document["baseline"],
         {"captured", "kind", "control", "services"},
@@ -1547,6 +1610,48 @@ def _validate_document(value: object) -> dict[str, Any]:
     if rollback["marker"] is not None:
         _validate_marker_identity(rollback["marker"])
     _validate_worker_identities(rollback["workers"])
+
+    authorities = _validate_authorities(
+        document["authorities"], document["target_commit"], document=document,
+    )
+    for authority in authorities:
+        if document["phase"] in {"PREPARING", "FORWARD_APPLYING"} or (
+            document["phase"] == "ROLLBACK_PREPARING"
+            and _is_rollback_runtime_authority(document, authority)
+        ):
+            if authority["state"] == "revoked":
+                raise TransactionError
+        elif document["phase"] == "ABORTING" or (
+            document["phase"] == "DONE" and document["outcome"] == "aborted"
+        ):
+            pass
+        elif authority["state"] != "provisioned":
+            raise TransactionError
+
+    _validate_secret_refs(document["prepared_secrets"])
+    for reference in document["prepared_secrets"]:
+        if _is_rollback_prepared_secret(document, reference) or (
+            reference["service"] == "vision-cutover"
+            and reference["generation"] == document["transaction_id"]
+            and reference["purpose"] in {"safety-database", "final-safety-database"}
+        ):
+            continue
+        if reference["service"] == "vp-worker-control":
+            expected_kind = "control"
+        elif reference["service"] == "worker-redis-marker-control":
+            expected_kind = "marker"
+        else:
+            expected_kind = "runtime"
+        matches = [
+            authority for authority in authorities
+            if authority["kind"] == expected_kind
+            and authority["service"] == reference["service"]
+            and authority["generation"] == reference["generation"]
+            and authority["state"] == "provisioned"
+            and not _is_rollback_runtime_authority(document, authority)
+        ]
+        if len(matches) != 1:
+            raise TransactionError
 
     retiring_outcome = document["retiring_outcome"]
     if retiring_outcome not in {None, "succeeded", "rolled_back", "manual"}:
@@ -2414,9 +2519,14 @@ def record_authority_intent(arguments: list[str]) -> None:
         operator_reference,
     ) = arguments
 
-    def updater(document: dict[str, Any]) -> None:
-        if document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}:
+    def updater(document: dict[str, Any]) -> bool | None:
+        if document["phase"] not in {
+            "PREPARING", "FORWARD_APPLYING", "ROLLBACK_PREPARING", "ROLLBACK_APPLYING",
+        }:
             raise TransactionError
+        rollback_control = (
+            _rollback_control(document) if document["phase"].startswith("ROLLBACK_") else None
+        )
         authority = _validate_authority(
             {
                 "kind": kind,
@@ -2428,7 +2538,12 @@ def record_authority_intent(arguments: list[str]) -> None:
                 "operator_reference": operator_reference,
             },
             document["target_commit"],
+            rollback_control=rollback_control,
         )
+        if document["phase"].startswith("ROLLBACK_") and (
+            rollback_control is None or not _is_rollback_runtime_authority(document, authority)
+        ):
+            raise TransactionError
         identity = (
             authority["kind"],
             authority["service"],
@@ -2451,8 +2566,15 @@ def record_authority_intent(arguments: list[str]) -> None:
                 or existing["state"] == "revoked"
             ):
                 raise TransactionError
-            return
+            if document["phase"] == "ROLLBACK_APPLYING":
+                if existing["state"] != "provisioned":
+                    raise TransactionError
+                return False
+            return None
+        if document["phase"] == "ROLLBACK_APPLYING":
+            raise TransactionError
         document["authorities"].append(authority)
+        return None
 
     document = _update_current_document(
         raw_root,
@@ -2471,8 +2593,10 @@ def _mark_authority(
         raise TransactionError
     raw_root, raw_lock_descriptor, kind, service, generation = arguments
 
-    def updater(document: dict[str, Any]) -> None:
-        if document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}:
+    def updater(document: dict[str, Any]) -> bool | None:
+        if document["phase"] not in {
+            "PREPARING", "FORWARD_APPLYING", "ROLLBACK_PREPARING", "ROLLBACK_APPLYING",
+        }:
             raise TransactionError
         matches = [
             authority
@@ -2486,6 +2610,12 @@ def _mark_authority(
         if len(matches) != 1:
             raise TransactionError
         authority = matches[0]
+        if document["phase"].startswith("ROLLBACK_") and not _is_rollback_runtime_authority(document, authority):
+            raise TransactionError
+        if document["phase"] == "ROLLBACK_APPLYING":
+            if authority["state"] != "provisioned":
+                raise TransactionError
+            return False
         if target_state == "provisioning":
             if authority["state"] == "planned":
                 authority["state"] = "provisioning"
@@ -2498,6 +2628,7 @@ def _mark_authority(
                 raise TransactionError
         else:
             raise TransactionError
+        return None
 
     document = _update_current_document(
         raw_root,
@@ -2521,8 +2652,11 @@ def record_prepared_secret(arguments: list[str]) -> None:
     raw_root, raw_lock_descriptor, *reference_arguments = arguments
     reference = _prepared_secret_reference(reference_arguments)
 
-    def updater(document: dict[str, Any]) -> None:
-        if document["phase"] not in {"PREPARING", "FORWARD_APPLYING"}:
+    def updater(document: dict[str, Any]) -> bool | None:
+        if document["phase"] not in {"PREPARING", "FORWARD_APPLYING"} and not (
+            document["phase"] in {"ROLLBACK_PREPARING", "ROLLBACK_APPLYING"}
+            and _is_rollback_prepared_secret(document, reference)
+        ):
             raise TransactionError
         logical_key = (
             reference["name"],
@@ -2538,7 +2672,7 @@ def record_prepared_secret(arguments: list[str]) -> None:
                 existing["purpose"],
             )
             if existing == reference:
-                return
+                return False if document["phase"] == "ROLLBACK_APPLYING" else None
             if (
                 existing["name"] == reference["name"]
                 or existing["docker_secret_id"]
@@ -2546,7 +2680,10 @@ def record_prepared_secret(arguments: list[str]) -> None:
                 or existing_key == logical_key
             ):
                 raise TransactionError
+        if document["phase"] == "ROLLBACK_APPLYING":
+            raise TransactionError
         document["prepared_secrets"].append(reference)
+        return None
 
     document = _update_current_document(
         raw_root,
@@ -2581,10 +2718,14 @@ def lookup_prepared_secret(arguments: list[str]) -> None:
             transactions_descriptor,
             allow_missing=False,
         )
-        if document is None or document["phase"] not in {
-            "PREPARING",
-            "FORWARD_APPLYING",
-        }:
+        if document is None or (
+            document["phase"] not in {"PREPARING", "FORWARD_APPLYING"} and not (
+                document["phase"] in {"ROLLBACK_PREPARING", "ROLLBACK_APPLYING"}
+                and _is_rollback_prepared_secret(document, {
+                    "name": name, "service": service, "generation": generation, "purpose": purpose,
+                })
+            )
+        ):
             raise TransactionError
         matches = [
             reference
@@ -2596,7 +2737,7 @@ def lookup_prepared_secret(arguments: list[str]) -> None:
                 and reference["purpose"] == purpose
             )
         ]
-        if len(matches) > 1:
+        if len(matches) > 1 or (document["phase"] == "ROLLBACK_APPLYING" and not matches):
             raise TransactionError
     finally:
         os.close(transactions_descriptor)
