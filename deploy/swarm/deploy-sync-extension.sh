@@ -6672,8 +6672,6 @@ if stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
     digest.update(payload)
 elif stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
     entries = sorted(os.scandir(source), key=lambda entry: entry.name)
-    if not entries:
-        raise ValueError
     digest.update(b"directory\0")
     for entry in entries:
         if (
@@ -6886,7 +6884,7 @@ if operation_kind in {"PROMOTE_WORKERS", "PROMOTE_ROLLBACK_WORKERS"}:
     ):
         raise SystemExit(1)
     candidate_entries = sorted(os.scandir(candidate), key=lambda item: item.name)
-    if not candidate_entries or any(
+    if (not candidate_entries and operation_kind != "PROMOTE_ROLLBACK_WORKERS") or any(
         not item.name.endswith(".conf")
         or item.is_symlink()
         or not item.is_file(follow_symlinks=False)
@@ -7263,7 +7261,7 @@ def promotion_digest(path):
         digest.update(payload)
     elif stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
         entries = sorted(os.scandir(path), key=lambda item: item.name)
-        if not entries:
+        if not entries and operation_kind != "PROMOTE_ROLLBACK_WORKERS":
             raise SystemExit(1)
         digest.update(b"directory\0")
         for item in entries:
@@ -7633,15 +7631,7 @@ if kind in {"PROMOTE_CONTROL", "PROMOTE_ROLLBACK_CONTROL"}:
 
 namespace = selection["namespace"]
 workers = selection["workers"]
-if not isinstance(namespace, str) or not isinstance(workers, list) or not workers:
-    raise SystemExit(1)
-directory = root / "candidates" / namespace
-metadata = os.lstat(directory)
-if (
-    not stat.S_ISDIR(metadata.st_mode)
-    or stat.S_ISLNK(metadata.st_mode)
-    or stat.S_IMODE(metadata.st_mode) != 0o700
-):
+if not isinstance(namespace, str) or not isinstance(workers, list):
     raise SystemExit(1)
 filenames = {
     "vp-ffmpeg-worker-go-swarm": "ffmpeg-go.conf",
@@ -7649,6 +7639,48 @@ filenames = {
     "vp-vision-worker-swarm": "vision.conf",
     "vp-youtube-publisher-swarm": "youtube-publisher.conf",
 }
+directory = root / "candidates" / namespace
+if not workers:
+    # A failure before worker application preserves every current worker.
+    baseline = state["baseline"]
+    if (
+        kind != "PROMOTE_ROLLBACK_WORKERS"
+        or baseline["kind"] != "managed"
+        or not baseline["captured"]
+        or not state["failed_forward"]["captured"]
+        or any(item["name"] in filenames for item in state["failed_forward"]["services"])
+        or any(item["applied_stage"] not in {"pending", "prepared"}
+               for item in state["forward"]["workers"])
+        or {item["name"] for item in baseline["services"]
+            if item["existed"] and item["name"] in filenames} != set(filenames)
+    ):
+        raise SystemExit(1)
+    parent_metadata = os.lstat(directory.parent)
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or stat.S_ISLNK(parent_metadata.st_mode)
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+    ):
+        raise SystemExit(1)
+    current = root / "current"
+    current_metadata = os.lstat(current)
+    if (
+        not stat.S_ISDIR(current_metadata.st_mode)
+        or stat.S_ISLNK(current_metadata.st_mode)
+        or stat.S_IMODE(current_metadata.st_mode) != 0o700
+        or {entry.name for entry in os.scandir(current)} != set(filenames.values())
+    ):
+        raise SystemExit(1)
+    for name in filenames.values():
+        read_regular(current / name)
+    directory.mkdir(mode=0o700, exist_ok=True)
+metadata = os.lstat(directory)
+if (
+    not stat.S_ISDIR(metadata.st_mode)
+    or stat.S_ISLNK(metadata.st_mode)
+    or stat.S_IMODE(metadata.st_mode) != 0o700
+):
+    raise SystemExit(1)
 expected_files = {filenames[worker["service"]] for worker in workers}
 actual_files = {entry.name for entry in os.scandir(directory)}
 if actual_files != expected_files:
@@ -8277,6 +8309,25 @@ vp_reconcile_worker_admission_transaction() {
         ;;
       RETIRING)
         vp_worker_admission_hydrate_recovery_context || return 1
+        if [[ "$VP_WORKER_ADMISSION_ROLLBACK_CONVERGED" == true ]]; then
+          local root="$VP_WORKER_ADMISSION_LOCK_ROOT"
+          local records="$VP_WORKER_ADMISSION_RECOVERY_FAILED_CANDIDATE_RECORDS"
+          local stale_records stale_namespaces namespace
+          stale_records="$(vp_worker_admission_stale_rollback_records)" || return 1
+          stale_namespaces="$(vp_worker_admission_stale_rollback_namespaces)" || return 1
+          if [[ -n "$stale_records" ]]; then
+            records="${records:+$records$'\n'}$stale_records"
+          fi
+          vp_worker_admission_retire_records "$records" "$root" || return 1
+          if [[ -n "$VP_WORKER_ROLLBACK_FAILED_CANDIDATE_NAMESPACE" ]]; then
+            vp_worker_admission_discard_namespace \
+              "$root" "$VP_WORKER_ROLLBACK_FAILED_CANDIDATE_NAMESPACE" || return 1
+          fi
+          while IFS= read -r namespace; do
+            [[ -n "$namespace" ]] || continue
+            vp_worker_admission_discard_namespace "$root" "$namespace" || return 1
+          done <<<"$stale_namespaces"
+        fi
         vp_worker_admission_retire_transaction || return 1
         vp_worker_admission_load_durable_state || return 1
         local outcome="$VP_WORKER_ADMISSION_DURABLE_RETIRING_OUTCOME"
@@ -10203,6 +10254,10 @@ vp_commit_worker_admission() {
     return 0
   fi
   [[ "$VP_WORKER_ADMISSION_PREPARED" == true ]] || return 1
+  if [[ -z "$VP_WORKER_ADMISSION_CANDIDATE_SERVICES" ]]; then
+    VP_WORKER_ADMISSION_COMMITTED=true
+    return 0
+  fi
   [[ -z "$VP_WORKER_ADMISSION_CANDIDATE_SERVICES" \
     || "$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE" \
       =~ ^[a-z0-9][a-z0-9-]{0,127}$ ]] || return 1
@@ -10617,6 +10672,88 @@ vp_commit_worker_control_generation() {
   VP_WORKER_CONTROL_PREPARED=false
 }
 
+vp_worker_control_require_rollback_workers() (
+  local state
+  state="$(vp_worker_admission_recovery_state)" || return 1
+  local records
+  records="$(printf '%s\n' "$state" | python3 -I -c '
+import json
+import sys
+
+transaction_id, namespace, candidate_services, control_generation, control_image = sys.argv[1:]
+state = json.load(sys.stdin)
+services = (
+    "vp-ffmpeg-worker-go-swarm", "vp-ffmpeg-worker-gpu-swarm",
+    "vp-vision-worker-swarm", "vp-youtube-publisher-swarm",
+)
+baseline = state["baseline"]
+rollback = state["rollback"]
+selected = {worker["service"]: worker for worker in rollback["workers"]}
+attempted = {item["name"] for item in state["failed_forward"]["services"]}
+candidate_names = candidate_services.split()
+if (
+    state["transaction_id"] != transaction_id
+    or state["phase"] not in {
+        "ROLLBACK_MARKER_PROMOTED", "ROLLBACK_CONTROL_PROMOTED", "RETIRING",
+    }
+    or (state["phase"] == "RETIRING" and state["retiring_outcome"] != "rolled_back")
+    or not baseline["captured"] or baseline["kind"] != "managed"
+    or not state["failed_forward"]["captured"]
+    or rollback["namespace"] != namespace
+    or rollback["control"]["generation"] != control_generation
+    or rollback["control"]["image"] != control_image
+    or len(candidate_names) != len(set(candidate_names))
+    or set(candidate_names) != set(selected)
+    or not set(selected).issubset(set(services) & attempted)
+):
+    raise SystemExit(1)
+for service in services:
+    if service in selected:
+        worker = selected[service]
+        if worker["applied_stage"] != "verified":
+            raise SystemExit(1)
+        fields = ("selected", service, worker["docker_service_id"],
+                  worker["image"], worker["target_spec_digest"])
+    else:
+        matches = [item for item in baseline["services"] if item["name"] == service]
+        if (
+            service in attempted or len(matches) != 1 or not matches[0]["existed"]
+            or any(worker["service"] == service and worker["applied_stage"] not in {"pending", "prepared"}
+                   for worker in state["forward"]["workers"])
+        ):
+            raise SystemExit(1)
+        worker = matches[0]
+        fields = ("untouched", service, worker["docker_service_id"],
+                  worker["image"], worker["spec_digest"])
+    print("|".join(fields))
+' \
+    "$VP_WORKER_ADMISSION_TRANSACTION_ID" \
+    "$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE" \
+    "$VP_WORKER_ADMISSION_CANDIDATE_SERVICES" \
+    "$VP_WORKER_CONTROL_GENERATION" \
+    "$VP_WORKER_ADMISSION_CONTROL_IMAGE")" || return 1
+  local mode
+  local service
+  local service_id
+  local image
+  local digest
+  local extra
+  while IFS='|' read -r mode service service_id image digest extra; do
+    [[ -z "$extra" && "$service_id" =~ ^[a-z0-9]{12,64}$ \
+      && "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    if [[ "$mode" == selected ]]; then
+      vp_worker_admission_select_candidate "$service" || return 1
+      vp_require_worker_service_descriptor "$service" "$image" || return 1
+    elif [[ "$mode" != untouched ]]; then
+      return 1
+    fi
+    # Full spec identity includes database/admission secret IDs and runtime env.
+    local actual
+    actual="$(vp_app_service_durable_identity "$service" "$image")" || return 1
+    [[ "$actual" == "$service_id|$digest" ]] || return 1
+  done <<<"$records"
+)
+
 vp_finalize_worker_control_rollback() {
   [[ "$VP_WORKER_ADMISSION_ROLLBACK_CONVERGED" == true \
     && "$VP_WORKER_REDIS_MARKER_CONTROL_PREPARED" == false ]] \
@@ -10626,14 +10763,7 @@ vp_finalize_worker_control_rollback() {
   fi
   local root
   root="$(vp_worker_admission_root)" || return 1
-  local service
-  for service in \
-    vp-ffmpeg-worker-go-swarm \
-    "$VP_PYTHON_WORKER_SERVICE" \
-    "$VP_VISION_WORKER_SERVICE" \
-    "$VP_PUBLISHER_SERVICE"; do
-    vp_require_worker_service_descriptor "$service" || return 1
-  done
+  vp_worker_control_require_rollback_workers || return 1
   vp_require_staging_object_janitor_control \
     "$root" "$VP_WORKER_ADMISSION_CONTROL_IMAGE" || return 1
   if [[ "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" \
@@ -15907,6 +16037,7 @@ vp_worker_redis_marker_read_prior_config() {
     echo "worker marker active configuration is invalid" >&2
     return 1
   fi
+  vp_require_pipeline_network_identity || return 1
   local key
   local value
   local generation=""

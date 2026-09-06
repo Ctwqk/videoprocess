@@ -3112,48 +3112,13 @@ if grep -Fq '10.0.0.126' "$CALLS"; then
 fi
 vp_worker_admission_lock_release
 
-: >"$CALLS"
-VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
-VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
-VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION=c-aaaaaaaaaaaaaaaaaaaa
-VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-aaaaaaaaaaaa
-VP_WORKER_CONTROL_GENERATION=c-11111111111111111111
-VP_WORKER_ADMISSION_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-111111111111
-rollback_control_ids=()
-for n in 1 2 3 4 5 6 7; do rollback_control_ids+=("$(printf '%064d' "$n")"); done
-vp_worker_control_write_manifest \
-  "$(vp_worker_admission_root)/control-current.conf" \
-  "$VP_WORKER_CONTROL_GENERATION" "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
-  "${rollback_control_ids[@]}"
+# Control finalization requires live durable state, not the archived transaction
+# above. The shared fixture exercises real worker validation and control journals.
+python3 "$ROOT_DIR/tests/test_worker_control_untouched_rollback.py"
+
 vp_require_pipeline_network_identity() {
   VP_PIPELINE_NETWORK_ID=vp-pipeline-network-id
 }
-vp_require_worker_service_descriptor() {
-  printf 'descriptor|%s\n' "$1" >>"$CALLS"
-}
-vp_require_staging_object_janitor_control() {
-  printf 'janitor|converged\n' >>"$CALLS"
-}
-vp_worker_control_schedule_retirement() {
-  printf 'control|journal|%s|%s\n' "$2" "$3" >>"$CALLS"
-}
-vp_worker_control_write_manifest() {
-  printf 'control|current|%s|%s\n' "$2" "$3" >>"$CALLS"
-}
-vp_worker_control_process_retirements() {
-  printf 'control|process|%s\n' "$2" >>"$CALLS"
-}
-vp_finalize_worker_control_rollback
-assert_order 'janitor|converged' \
-  'control|journal|vp-ffmpeg-worker-python:deploy-aaaaaaaaaaaa|c-aaaaaaaaaaaaaaaaaaaa'
-assert_order \
-  'control|journal|vp-ffmpeg-worker-python:deploy-aaaaaaaaaaaa|c-aaaaaaaaaaaaaaaaaaaa' \
-  'control|current|c-11111111111111111111|vp-ffmpeg-worker-python:deploy-111111111111'
-assert_order \
-  'control|current|c-11111111111111111111|vp-ffmpeg-worker-python:deploy-111111111111' \
-  'control|process|c-11111111111111111111'
-[[ -z "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" ]]
-[[ -z "$VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE" ]]
 
 (
   legacy_calls="$TEST_ROOT/legacy-first-deploy-calls"

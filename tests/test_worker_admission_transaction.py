@@ -409,6 +409,168 @@ class RollbackPreparedSecretTests(unittest.TestCase):
                  data=selection, success=False)
         self.assertEqual(self.active.read_bytes(), before)
 
+    def shell(self, body, *, success=True):
+        result = subprocess.run(
+            ["bash", "-c", r'''
+set -euo pipefail
+REPO_ROOT="$CASE_REPO"
+source "$CASE_REPO/deploy/swarm/deploy-sync-extension.sh"
+vp_worker_admission_root() { printf '%s\n' "$CASE_ROOT"; }
+vp_worker_admission_lock_acquire "$CASE_ROOT"
+trap 'vp_worker_admission_lock_release' EXIT
+VP_WORKER_ADMISSION_TRANSACTION_ID=tx-e84fb31f632be927e6abe9ffb642fc79
+VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE=rollback-123456789012345678
+VP_WORKER_ADMISSION_CANDIDATE_SERVICES=""
+VP_WORKER_ADMISSION_PREPARED=true
+''' + body],
+            env=dict(os.environ, CASE_ROOT=str(self.root),
+                     CASE_REPO=str(HELPER_PATH.parents[2])),
+            capture_output=True, text=True, timeout=20,
+        )
+        if success:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0)
+        return result
+
+    def prepare_empty_worker_promotion(self):
+        self.state["phase"] = "ROLLBACK_VERIFIED"
+        self.state["rollback"]["marker"] = dict(
+            generation=MARKER_GENERATION, image=OLD_IMAGE,
+            config_sha256="c" * 64, cron_sha256="d" * 64,
+            secrets=[marker_secret()],
+        )
+        self.write_state()
+        (self.active.parent / TRANSACTION_ID).mkdir(mode=0o700)
+        (self.root / "candidates").mkdir(mode=0o700)
+        current = self.root / "current"
+        current.mkdir(mode=0o700)
+        for name in ("ffmpeg-go", "ffmpeg", "vision", "youtube-publisher"):
+            path = current / f"{name}.conf"
+            path.write_text(f"preserved-{name}\n")
+            path.chmod(0o600)
+        return {path.name: path.read_bytes() for path in current.iterdir()}
+
+    def test_empty_rollback_worker_promotion_preserves_all_current_manifests(self):
+        before = self.prepare_empty_worker_promotion()
+        self.shell("vp_worker_admission_promote_phase PROMOTE_ROLLBACK_WORKERS\n")
+        state = self.read_state()
+        self.assertEqual(state["phase"], "ROLLBACK_WORKERS_PROMOTED")
+        self.assertEqual(state["promotion"], dict(workers=True, marker=False, control=False))
+        self.assertIsNone(state["operation"])
+        self.assertEqual(state["pending_retirements"], [])
+        self.assertEqual(before, {path.name: path.read_bytes()
+                                 for path in (self.root / "current").iterdir()})
+        retirements = self.root / "retirements"
+        self.assertTrue(not retirements.exists() or not list(retirements.iterdir()))
+
+    def test_empty_worker_commit_does_not_drain_other_retirement_journals(self):
+        self.prepare_empty_worker_promotion()
+        self.shell(r'''
+vp_worker_admission_process_retirement_journals() { return 77; }
+vp_worker_admission_promote_phase PROMOTE_ROLLBACK_WORKERS
+''')
+
+    def test_empty_worker_selection_requires_all_preserved_manifests(self):
+        self.prepare_empty_worker_promotion()
+        (self.root / "current/vision.conf").unlink()
+        self.shell("vp_worker_admission_require_promotion_selection PROMOTE_ROLLBACK_WORKERS\n",
+                   success=False)
+
+    def test_empty_worker_pending_promotion_rejects_current_manifest_drift(self):
+        self.prepare_empty_worker_promotion()
+        self.shell(r'''
+vp_worker_admission_promotion_identity PROMOTE_ROLLBACK_WORKERS >/dev/null
+vp_worker_admission_capture_promotion_precondition PROMOTE_ROLLBACK_WORKERS "$VP_WORKER_ADMISSION_PROMOTION_IDENTITY"
+vp_worker_admission_load_replay_plan
+python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" intent "$CASE_ROOT" "$VP_WORKER_ADMISSION_LOCK_FD" "$VP_WORKER_ADMISSION_REPLAY_REVISION" PROMOTE_ROLLBACK_WORKERS "$VP_WORKER_ADMISSION_PROMOTION_IDENTITY"
+''')
+        current = self.root / "current/vision.conf"
+        original = current.read_bytes()
+        extra = self.root / "current/unexpected.conf"
+        for change in ("modify", "delete", "add"):
+            with self.subTest(change=change):
+                if change == "modify":
+                    current.write_text("changed\n")
+                elif change == "delete":
+                    current.unlink()
+                else:
+                    extra.write_text("extra\n")
+                    extra.chmod(0o600)
+                self.shell(r'''
+vp_worker_admission_load_replay_plan
+vp_worker_admission_current_promotion_matches PROMOTE_ROLLBACK_WORKERS
+''', success=False)
+                current.write_bytes(original)
+                current.chmod(0o600)
+                extra.unlink(missing_ok=True)
+        self.assertEqual(self.read_state()["phase"], "ROLLBACK_VERIFIED")
+
+    def test_empty_rollback_worker_promotion_replays_pending_intent(self):
+        before = self.prepare_empty_worker_promotion()
+        self.shell(r'''
+vp_worker_admission_promotion_identity PROMOTE_ROLLBACK_WORKERS >/dev/null
+vp_worker_admission_capture_promotion_precondition PROMOTE_ROLLBACK_WORKERS "$VP_WORKER_ADMISSION_PROMOTION_IDENTITY"
+vp_worker_admission_load_replay_plan
+python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" intent "$CASE_ROOT" "$VP_WORKER_ADMISSION_LOCK_FD" "$VP_WORKER_ADMISSION_REPLAY_REVISION" PROMOTE_ROLLBACK_WORKERS "$VP_WORKER_ADMISSION_PROMOTION_IDENTITY"
+''')
+        self.assertIsNotNone(self.read_state()["operation"])
+        self.shell(r'''
+vp_worker_admission_load_replay_plan
+vp_worker_admission_complete_pending_promotion PROMOTE_ROLLBACK_WORKERS "$VP_WORKER_ADMISSION_REPLAY_OPERATION_ID"
+''')
+        self.assertEqual(self.read_state()["phase"], "ROLLBACK_WORKERS_PROMOTED")
+        self.assertEqual(before, {path.name: path.read_bytes()
+                                 for path in (self.root / "current").iterdir()})
+
+    def test_empty_worker_selection_rejects_forward_and_attempted_worker(self):
+        self.prepare_empty_worker_promotion()
+        self.shell("vp_worker_admission_require_promotion_selection PROMOTE_WORKERS\n",
+                   success=False)
+        self.state["failed_forward"]["services"] = [
+            item for item in self.state["baseline"]["services"]
+            if item["name"] == self.worker["service"]
+        ]
+        self.write_state()
+        self.shell("vp_worker_admission_require_promotion_selection PROMOTE_ROLLBACK_WORKERS\n",
+                   success=False)
+        self.assertFalse((self.root / "candidates" / self.state["rollback"]["namespace"]).exists())
+
+    def test_empty_worker_selection_rejects_unexpected_candidate(self):
+        self.prepare_empty_worker_promotion()
+        directory = self.root / "candidates" / self.state["rollback"]["namespace"]
+        directory.mkdir(mode=0o700)
+        (directory / "vision.conf").write_text("unselected\n")
+        self.shell("vp_worker_admission_require_promotion_selection PROMOTE_ROLLBACK_WORKERS\n",
+                   success=False)
+
+    def test_reconcile_retires_failed_candidates_before_archiving_rollback(self):
+        self.prepare_empty_worker_promotion()
+        self.state.update(phase="RETIRING", retiring_outcome="rolled_back",
+                          promotion=dict(workers=True, marker=True, control=True))
+        self.write_state()
+        result = self.shell(r'''
+vp_worker_admission_verify_active_database_credentials() { :; }
+vp_worker_admission_hydrate_recovery_context() {
+  VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
+  VP_WORKER_ADMISSION_RECOVERY_FAILED_CANDIDATE_RECORDS=failed-records
+  VP_WORKER_ROLLBACK_FAILED_CANDIDATE_NAMESPACE=failed-namespace
+}
+vp_worker_admission_stale_rollback_records() { printf 'stale-records\n'; }
+vp_worker_admission_stale_rollback_namespaces() { printf 'stale-namespace\n'; }
+vp_worker_admission_retire_records() { printf 'retire|%s\n' "$1"; }
+vp_worker_admission_discard_namespace() { printf 'discard|%s\n' "$2"; }
+vp_worker_admission_retire_transaction() { printf 'transaction-cleanup\n'; }
+vp_reconcile_worker_admission_transaction
+''')
+        self.assertEqual(result.stdout.splitlines(), [
+            "retire|failed-records", "stale-records", "discard|failed-namespace",
+            "discard|stale-namespace", "transaction-cleanup",
+        ])
+        self.assertFalse(self.active.exists())
+        done = json.loads((self.active.parent / TRANSACTION_ID / "done.json").read_bytes())
+        self.assertEqual((done["phase"], done["outcome"]), ("DONE", "rolled_back"))
+
 
 if __name__ == "__main__":
     unittest.main()

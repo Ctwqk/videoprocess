@@ -71,6 +71,39 @@ no concrete P1/P2 issue. Exact-commit CI and production recovery remain pending.
 Workers still run `fab36e3a818b`; the mixed deployment must not be reported
 as converged. No upload or public production has been started.
 
+## Recovery Closeout, 18:50 UTC
+
+Release `7bcb9044cb3cd6363125e9b6def96b63c48cd89e` passed all four CI jobs
+(`34049348630`), including 1736 backend tests (15 optional skips). Its ordinary
+recovery entry exposed a missing live-network initialization before loading the
+prior marker configuration. After resolving the network with the existing
+identity validator, recovery restored API/frontend and reached
+`ROLLBACK_VERIFIED`, revision 79. AutoFlow retains the migration-compatible
+attempted release; the four workers were never replaced by this transaction.
+
+The final repair batch is limited to this interrupted recovery:
+
+- Resolve and verify the canonical network before reading prior marker config.
+- Represent zero attempted rollback workers as a verified empty candidate set,
+  with all four current manifests retained as immutable promotion preconditions.
+  Preserve ordinary durable intent, replay, and ordered promotion checks.
+- A no-op worker commit does not drain unrelated retirement journals.
+- Validate untouched workers against their baseline identity during control
+  rollback, rather than requiring nonexistent rollback candidates.
+- On restart in rollback retirement, clean failed/stale candidate generations
+  and namespaces before archiving, matching uninterrupted recovery behavior.
+
+Tests and exact-commit CI must pass before deploying this batch. The release
+is not yet converged. No sixth canary or public upload has been started.
+
+Pre-push verification: 23 transaction, nine prior-marker-config, and seven
+control-finalizer tests passed. The complete rollback contract, worker admission
+deployment, marker control, recovery executor, CI workflow, shell syntax, and
+changed-file lint checks passed. Independent review's single fixture finding
+was fixed and re-reviewed with no remaining P1/P2 findings. A fresh production
+status query returned `CLOSED`, no guarded job, and zero waiting/active jobs or
+queued/running nodes. PDS independently polled its unchanged revision at 18:52.
+
 The notes below are earlier checkpoints, not the current deployment state.
 
 ## Earlier Verified State
