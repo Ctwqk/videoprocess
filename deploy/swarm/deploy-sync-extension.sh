@@ -8027,6 +8027,7 @@ vp_worker_admission_retire_preapply_janitor() {
     && "$(shasum -a 256 "$config" | awk '{print $1}')" \
       == "$VP_WORKER_ROLLBACK_FAILED_CONTROL_CONFIG_SHA256" ]] || return 1
   if grep -Fxq vp-staging-object-janitor <<<"$services"; then
+    vp_require_pipeline_network_identity || return 1
     vp_require_staging_object_janitor_control \
       "$root" "$VP_WORKER_ADMISSION_CONTROL_IMAGE" || return 1
   fi
@@ -10951,10 +10952,10 @@ vp_require_channelops_migration_head() {
     --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
     "$backend_image" \
     python -m app.services.worker_deployment_cli verify-head >/dev/null; then
-    echo "ChannelOps migration head gate failed; expected exactly 034_worker_registrations" >&2
+    echo "ChannelOps migration head gate failed; expected exactly 035_worker_creator_edges" >&2
     return 1
   fi
-  log "ChannelOps migration head verified: 034_worker_registrations"
+  log "ChannelOps migration head verified: 035_worker_creator_edges"
 }
 
 vp_runtime_redis_secret_id() {

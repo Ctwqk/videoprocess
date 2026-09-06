@@ -38,7 +38,16 @@ source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
     [[ "$*" == "service ls --format {{.Name}}" ]] || return 1
     if [[ "$present" == true ]]; then printf 'vp-staging-object-janitor\n'; fi
   }
-  vp_require_staging_object_janitor_control() { [[ "$JANITOR_IDENTITY_OK" == true ]]; }
+  VP_PIPELINE_NETWORK_ID=""
+  NETWORK_IDENTITY_OK=true
+  vp_require_pipeline_network_identity() {
+    [[ "$NETWORK_IDENTITY_OK" == true ]] || return 1
+    VP_PIPELINE_NETWORK_ID=verified-network
+  }
+  vp_require_staging_object_janitor_control() {
+    [[ "$JANITOR_IDENTITY_OK" == true \
+      && "$VP_PIPELINE_NETWORK_ID" == verified-network ]]
+  }
   bash() {
     [[ "$1" == "$VP_STAGING_JANITOR_SOURCE" && "$2" == retire \
       && "$VP_STAGING_JANITOR_CONFIG_FILE" == "$config" ]] || return 1
@@ -55,6 +64,12 @@ source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
   [[ ! -s "$janitor_calls" ]] || {
     echo 'FAIL: janitor preflight mutated the service' >&2; exit 1
   }
+  NETWORK_IDENTITY_OK=false
+  if vp_worker_admission_retire_preapply_janitor; then
+    echo 'FAIL: unresolved pipeline network authorized janitor retirement' >&2; exit 1
+  fi
+  [[ ! -s "$janitor_calls" ]]
+  NETWORK_IDENTITY_OK=true
   if ! vp_worker_admission_retire_preapply_janitor; then
     echo 'FAIL: journal SHA256 did not authorize the exact preapply janitor config' >&2; exit 1
   fi

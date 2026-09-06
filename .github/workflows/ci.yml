@@ -68,6 +68,18 @@ jobs:
             cd backend
             .venv/bin/alembic heads
           ) | tee ci-evidence/backend/alembic-heads.txt
+      - name: Verify PG16 non-superuser operator lifecycle
+        run: |
+          set -o pipefail
+          output="ci-evidence/backend/pg16-worker-operator.txt"
+          (
+            cd backend
+            .venv/bin/python -m pytest -q -rs tests/migrations/test_worker_operator_creator_edges_postgres.py
+          ) | tee "$output"
+          if grep -Eq '[0-9]+ skipped|SKIPPED' "$output"; then
+            echo "PG16 worker operator lifecycle tests skipped" >&2
+            exit 1
+          fi
       - name: Run PostgreSQL ChannelOps integration tests
         run: |
           set -o pipefail

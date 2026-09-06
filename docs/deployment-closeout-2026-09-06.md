@@ -63,3 +63,22 @@ case where every worker authority is prepared but no worker service was touched;
 this avoids requiring a prior control configuration that never existed. The live
 transaction `tx-9fa931affc65f08856c615aa58e9c8c1` passed its read-only eligibility
 check. No fifth canary upload has started.
+
+`f945bf0eb324` passed CI (`34026467549`). The legacy pre-apply recovery
+restored application snapshots and removed the unused staging/marker jobs and
+all 18 prepared secrets. Its durable transaction is now `ABORTING`: runtime
+grant revocation exposed the same PG16 creator-edge issue inside the database
+operator functions, separate from the already fixed Python role lifecycle.
+Migration `035_worker_creator_edges` replaces only activation/revocation bodies
+and retains their signatures, owners, and ACLs. It preserves only the exact
+bootstrap-granted, admin-only edge to a safe non-superuser function owner.
+The janitor recovery preflight also resolves its pipeline network before
+validating the pinned descriptor. These fixes require exact-commit CI and a
+verified migration before resuming the interrupted transaction; no fifth
+canary upload or public publishing has been enabled by this checkpoint.
+
+Local verification: 1471 backend tests passed (128 optional integrations skipped),
+plus 39 dedicated real PG16.14 operator lifecycle tests passed. CI runs that
+focused lifecycle before other role-mutating suites and rejects skipped tests.
+The deployment rollback regression also passed. Advisory full-tree Ruff/mypy
+retain their unchanged 15/61 baseline findings.
