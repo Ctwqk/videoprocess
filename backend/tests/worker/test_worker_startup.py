@@ -1112,6 +1112,87 @@ async def test_consumer_cancellation_cancels_inflight_messages_without_xack(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reclaim_stage", ["startup", "periodic"])
+async def test_registered_pending_reclaim_preserves_lease_refresher(
+    monkeypatch: pytest.MonkeyPatch,
+    reclaim_stage: str,
+) -> None:
+    lease = worker_lease_for(registered_execution_claim(uuid.uuid4(), uuid.uuid4()))
+    processed = asyncio.Event()
+    message_cancelled = asyncio.Event()
+    calls: list[dict] = []
+
+    class Registration:
+        redis_stream = "vp:tasks:youtube_publisher"
+        redis_group = "youtube_publisher-workers"
+        worker_host = "150-publisher"
+        redis_consumer_id = lease.redis_consumer_id
+
+        def __init__(self):
+            self.lease = lease
+
+        def raise_if_lost(self):
+            return None
+
+        async def heartbeat_now(self, *, minimum_margin_seconds=0):
+            assert minimum_margin_seconds == 150
+            return self.lease
+
+    class Redis:
+        reclaim_count = 0
+
+        async def xgroup_create(self, *_args, **_kwargs):
+            return None
+
+        async def xautoclaim(self, *_args, **_kwargs):
+            self.reclaim_count += 1
+            selected = 1 if reclaim_stage == "startup" else 2
+            entries = (
+                [("1-0", {"node_type": "youtube_upload"}), ("2-0", {"node_type": "youtube_upload"})]
+                if self.reclaim_count == selected else []
+            )
+            return ["0-0", entries, []]
+
+        async def xreadgroup(self, *_args, **_kwargs):
+            await asyncio.sleep(0)
+            return []
+
+    async def process_message(_redis, message_id, data, **kwargs):
+        calls.append({"message_id": message_id, "data": data, **kwargs})
+        processed.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            message_cancelled.set()
+
+    async def no_affinity_reclaim(*_args, **_kwargs):
+        return None
+
+    async def reconcile_forever(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(worker_main, "_process_message", process_message)
+    monkeypatch.setattr(worker_main, "_reclaim_preferred_pending", no_affinity_reclaim)
+    monkeypatch.setattr(worker_main, "_prepared_event_reconciler_loop", reconcile_forever)
+    monkeypatch.setattr(worker_main, "PEL_RECLAIM_INTERVAL", -1)
+    monkeypatch.setenv("WORKER_CONCURRENCY", "1")
+    registration = Registration()
+    consumer = asyncio.create_task(worker_main._consume_registered_worker(Redis(), registration))
+    try:
+        await asyncio.wait_for(processed.wait(), timeout=1)
+    finally:
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+
+    assert len(calls) == 1
+    assert message_cancelled.is_set()
+    assert calls[0]["worker_lease"] is lease
+    assert calls[0].get("lease_refresher") == registration.heartbeat_now
+    assert await calls[0]["lease_refresher"](minimum_margin_seconds=150) is lease
+
+
+@pytest.mark.asyncio
 async def test_process_task_downloads_missing_local_artifact_through_api(
     monkeypatch,
     tmp_path: Path,

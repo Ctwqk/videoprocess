@@ -1422,6 +1422,7 @@ async def _reclaim_pending(
     r: aioredis.Redis,
     *,
     worker_lease: WorkerLease | None = None,
+    message_scheduler: Callable[[str, dict], Awaitable[None]] | None = None,
 ) -> None:
     """Reclaim stale pending messages from any consumer in the group."""
     try:
@@ -1435,12 +1436,15 @@ async def _reclaim_pending(
             for msg_id, data in claimed[1]:
                 if data:
                     logger.info(f"Reclaimed pending task {msg_id}")
-                    await _process_message(
-                        r,
-                        msg_id,
-                        data,
-                        worker_lease=worker_lease,
-                    )
+                    if message_scheduler is not None:
+                        await message_scheduler(msg_id, data)
+                    else:
+                        await _process_message(
+                            r,
+                            msg_id,
+                            data,
+                            worker_lease=worker_lease,
+                        )
     except Exception:
         logger.exception("PEL reclaim failed")
 
@@ -1885,6 +1889,7 @@ async def _consume_registered_worker(
         await _reclaim_pending(
             redis,
             worker_lease=registration.lease,
+            message_scheduler=schedule_message,
         )
         last_reclaim = asyncio.get_event_loop().time()
         last_affinity_reclaim = 0.0
@@ -1906,6 +1911,7 @@ async def _consume_registered_worker(
                     await _reclaim_pending(
                         redis,
                         worker_lease=registration.lease,
+                        message_scheduler=schedule_message,
                     )
                     last_reclaim = now
 
