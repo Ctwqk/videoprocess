@@ -6,10 +6,14 @@ import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from asyncpg.exceptions import RaiseError
+from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
+from sqlalchemy.exc import DBAPIError
 
 from app.services.worker_admission import WorkerAdmissionError
 from app.services.worker_registration import WorkerLease, WorkerRegistrationError
@@ -262,6 +266,197 @@ async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> N
     assert node.worker_lease_epoch is None
     assert claims
     assert delivery.attestation_id == attestation_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("adapted", [False, True])
+async def test_registered_claim_retries_only_before_execution_in_fresh_transactions(
+    monkeypatch, persistent, adapted,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    delivery = worker_main.WorkerTaskDelivery(
+        "vp:tasks:vision", "vision-workers", "123-1", "a" * 64, uuid.uuid4(),
+    )
+    attestation_id = uuid.uuid4()
+    sessions = []
+    attempts = []
+    active = False
+    sleeps = []
+
+    class Session:
+        @asynccontextmanager
+        async def begin(self):
+            nonlocal active
+            assert not active
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+    @asynccontextmanager
+    async def factory():
+        session = Session()
+        sessions.append(session)
+        yield session
+
+    async def claim_registered(db, **facts):
+        assert active
+        attempts.append((db, facts))
+        if persistent or len(attempts) < 3:
+            error = RaiseError("task_dispatch_mismatch")
+            if adapted:
+                wrapper = AsyncAdapt_asyncpg_dbapi.Error(str(error))
+                wrapper.__cause__ = error
+                raise DBAPIError(None, None, wrapper)
+            raise DBAPIError(None, None, error)
+        return claim, attestation_id
+
+    async def sleep(delay):
+        assert not active
+        assert delivery.attestation_id is None
+        sleeps.append(delay)
+
+    monkeypatch.setattr(worker_main, "claim_registered_worker_node", claim_registered)
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    token = worker_main._current_task_delivery.set(delivery)
+    try:
+        if persistent:
+            with pytest.raises(DBAPIError, match="task_dispatch_mismatch"):
+                await worker_main._claim_node_execution(
+                    str(claim.job_id), str(claim.node_execution_id),
+                    worker_lease=lease, session_factory=factory,
+                )
+            assert delivery.attestation_id is None
+            assert len(attempts) == 4
+        else:
+            result = await worker_main._claim_node_execution(
+                str(claim.job_id), str(claim.node_execution_id),
+                worker_lease=lease, session_factory=factory,
+            )
+            assert result == claim
+            assert delivery.attestation_id == attestation_id
+            assert len(attempts) == 3
+    finally:
+        worker_main._current_task_delivery.reset(token)
+
+    assert len({id(session) for session in sessions}) == len(attempts)
+    assert len(sleeps) == len(attempts) - 1
+    assert 0 < sum(sleeps) <= 2
+    for _, facts in attempts:
+        assert facts == {
+            "job_id": claim.job_id,
+            "node_execution_id": claim.node_execution_id,
+            "registration_id": lease.registration_id,
+            "lease_epoch": lease.lease_epoch,
+            "worker_id": lease.redis_consumer_id,
+            "redis_stream": "vp:tasks:vision",
+            "consumer_group": "vision-workers",
+            "message_id": "123-1",
+            "payload_sha256": "a" * 64,
+            "dispatch_key": delivery.dispatch_key,
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    RaiseError("worker_registration_lost"),
+    RuntimeError("task_dispatch_mismatch"),
+])
+async def test_registered_claim_does_not_retry_other_database_failures(monkeypatch, error):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    attempts = []
+
+    class Session:
+        @asynccontextmanager
+        async def begin(self):
+            yield
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    async def claim_registered(db, **facts):
+        attempts.append(facts)
+        raise DBAPIError(None, None, error)
+
+    monkeypatch.setattr(worker_main, "claim_registered_worker_node", claim_registered)
+    token = worker_main._current_task_delivery.set(worker_main.WorkerTaskDelivery(
+        "vp:tasks:vision", "vision-workers", "123-1", "a" * 64, uuid.uuid4(),
+    ))
+    try:
+        with pytest.raises(DBAPIError):
+            await worker_main._claim_node_execution(
+                str(claim.job_id), str(claim.node_execution_id),
+                worker_lease=worker_lease_for(claim), session_factory=factory,
+            )
+    finally:
+        worker_main._current_task_delivery.reset(token)
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_registered_claim_backoff_cancellation_stops_retry(monkeypatch):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    waiting = asyncio.Event()
+    attempts = []
+
+    async def claim_once(*args, **kwargs):
+        attempts.append(args)
+        raise DBAPIError(None, None, RaiseError("task_dispatch_mismatch"))
+
+    async def sleep(delay):
+        waiting.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(worker_main, "_claim_node_execution_once", claim_once)
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    task = asyncio.create_task(worker_main._claim_node_execution(
+        str(claim.job_id), str(claim.node_execution_id),
+        worker_lease=worker_lease_for(claim),
+    ))
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_registered_claim_commit_failure_cannot_execute_or_ack(monkeypatch):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    attempts = []
+    handler_starts = []
+
+    class Session:
+        @asynccontextmanager
+        async def begin(self):
+            yield
+            raise DBAPIError(None, None, RuntimeError("commit connection lost"))
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    async def claim_registered(db, **facts):
+        attempts.append(facts)
+        return claim, uuid.uuid4()
+
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: factory)
+    monkeypatch.setattr(worker_main, "claim_registered_worker_node", claim_registered)
+    monkeypatch.setitem(worker_main.HANDLER_MAP, "must-not-execute", lambda: handler_starts.append(True))
+    # No handler or Redis methods exist: a failed commit must return before either.
+    await worker_main._process_message(object(), "123-1", {
+        "job_id": str(claim.job_id), "node_execution_id": str(claim.node_execution_id),
+        "dispatch_key": str(uuid.uuid4()), "node_type": "must-not-execute",
+        "node_id": "probe", "config": "{}", "input_artifacts": "{}",
+    }, worker_lease=worker_lease_for(claim))
+    assert len(attempts) == 1
+    assert handler_starts == []
 
 
 @pytest.mark.asyncio
@@ -860,6 +1055,146 @@ async def test_registered_dispatch_is_validated_before_affinity(
             },
             worker_lease=lease,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["self", "preferred", "acknowledged"])
+async def test_registered_affinity_expiry_resumes_only_its_original_pending_delivery(
+    monkeypatch, owner,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    now = 1800000000
+    payload = {
+        "dispatch_key": str(uuid.uuid4()),
+        "preferred_hosts": '["127"]',
+        "affinity_enqueued_at": str(now - 5),
+    }
+    processed = []
+    waited = []
+    refresher = object()
+
+    class Redis:
+        async def xpending_range(self, stream, group, start, end, count):
+            assert (start, end, count) == ("123-1", "123-1", 1)
+            if owner == "acknowledged":
+                return []
+            return [{
+                "message_id": b"123-1",
+                "consumer": (
+                    lease.redis_consumer_id.encode() if owner == "self"
+                    else b"preferred-worker"
+                ),
+                "time_since_delivered": 20000,
+                "times_delivered": 1,
+            }]
+
+    async def sleep(delay):
+        waited.append(delay)
+
+    async def process(data, *, worker_lease, lease_refresher):
+        assert worker_lease is lease
+        assert lease_refresher is refresher
+        delivery = worker_main._current_task_delivery.get()
+        processed.append((dict(data), delivery.message_id, delivery.payload_sha256))
+        return None
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "150")
+    monkeypatch.setattr(worker_main, "AFFINITY_WAIT_SECONDS", 20)
+    monkeypatch.setattr(worker_main.time, "time", lambda: now)
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    monkeypatch.setattr(worker_main, "process_task", process)
+    await worker_main._process_message(
+        Redis(), "123-1", payload, worker_lease=lease, lease_refresher=refresher,
+    )
+    assert waited == [15]
+    assert processed == ([(
+        payload, "123-1", hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    )] if owner == "self" else [])
+
+
+@pytest.mark.asyncio
+async def test_registered_affinity_wait_is_cancelled_without_processing(monkeypatch):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    waiting = asyncio.Event()
+    processed = []
+
+    async def sleep(delay):
+        waiting.set()
+        await asyncio.Event().wait()
+
+    async def process(*args, **kwargs):
+        processed.append(args)
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "150")
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    monkeypatch.setattr(worker_main, "process_task", process)
+    task = asyncio.create_task(worker_main._process_message(
+        object(), "123-1", {
+            "dispatch_key": str(uuid.uuid4()), "preferred_hosts": '["127"]',
+            "affinity_enqueued_at": str(int(worker_main.time.time())),
+        }, worker_lease=worker_lease_for(claim),
+    ))
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=0.2)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert processed == []
+
+
+@pytest.mark.asyncio
+async def test_affinity_takeover_after_pending_snapshot_still_requires_durable_claim(monkeypatch):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    owner = lease.redis_consumer_id
+    attempts = []
+    handler_starts = []
+
+    class Redis:
+        async def xpending_range(self, *args):
+            nonlocal owner
+            snapshot = [{"message_id": "123-1", "consumer": owner}]
+            owner = "preferred-worker"
+            return snapshot
+
+    class Session:
+        @asynccontextmanager
+        async def begin(self):
+            yield
+
+        async def rollback(self):
+            return None
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    async def claim_registered(db, **facts):
+        assert owner == "preferred-worker"
+        attempts.append(facts)
+        raise worker_main.JobExecutionAuthorityBlocked("node already claimed")
+
+    async def sleep(delay):
+        return None
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "150")
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: factory)
+    monkeypatch.setattr(worker_main, "claim_registered_worker_node", claim_registered)
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    monkeypatch.setitem(worker_main.HANDLER_MAP, "must-not-execute", lambda: handler_starts.append(True))
+    await worker_main._process_message(Redis(), "123-1", {
+        "job_id": str(claim.job_id), "node_execution_id": str(claim.node_execution_id),
+        "dispatch_key": str(uuid.uuid4()), "node_type": "must-not-execute",
+        "node_id": "probe", "config": "{}", "input_artifacts": "{}",
+        "preferred_hosts": '["127"]',
+        "affinity_enqueued_at": str(int(worker_main.time.time())),
+    }, worker_lease=lease)
+    assert len(attempts) == 1
+    assert owner == "preferred-worker"
+    assert handler_starts == []
 
 
 @pytest.mark.asyncio

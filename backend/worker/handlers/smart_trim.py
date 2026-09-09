@@ -55,7 +55,7 @@ class SmartTrimConfig:
     language: str = "zh"
     whisper_model: str = "medium"
     output_format: str = "mp4"
-    no_match_policy: str = "placeholder"
+    no_match_policy: str = "fail"
 
     @classmethod
     def from_node_config(cls, node_config: dict[str, Any]) -> SmartTrimConfig:
@@ -83,7 +83,7 @@ class SmartTrimConfig:
                 {"tiny", "base", "small", "medium", "large-v3"},
             ),
             output_format=_select_value(node_config.get("output_format"), "mp4", {"mp4", "mkv", "webm"}),
-            no_match_policy=_select_value(node_config.get("no_match_policy"), "placeholder", {"placeholder", "fail"}),
+            no_match_policy=_select_value(node_config.get("no_match_policy"), "fail", {"placeholder", "fail"}),
         )
 
 
@@ -118,15 +118,24 @@ class SmartTrimHandler(BaseHandler):
             warnings.extend(visual_warnings)
 
         if config.use_asr:
-            subtitle_windows, subtitle_warnings = await self._subtitle_windows(video_path, config)
-            windows.extend(subtitle_windows)
-            warnings.extend(subtitle_warnings)
+            if has_audio:
+                subtitle_windows, subtitle_warnings = await self._subtitle_windows(video_path, config)
+                windows.extend(subtitle_windows)
+                warnings.extend(subtitle_warnings)
+            else:
+                warnings.append("ASR skipped: input video has no audio stream")
 
         selected = select_smart_trim_segments(windows, duration=duration, config=config, warnings=warnings)
 
         if selected.decision == "no_match":
             if config.no_match_policy == "fail":
-                raise RuntimeError("smart_trim found no matching video segment")
+                details = f" Warnings: {'; '.join(selected.warnings)}" if selected.warnings else ""
+                raise RuntimeError(
+                    f"smart_trim found no matching video segment for prompt {config.prompt!r} "
+                    f"at match_threshold={config.match_threshold:g}. "
+                    "Refusing to generate a placeholder; provide matching source footage "
+                    f"and ensure semantic scoring is available.{details}"
+                )
             await self.run_ffmpeg(self.build_no_match_placeholder_args(output_path))
         elif selected.decision == "return_full_video":
             try:
@@ -251,7 +260,7 @@ class SmartTrimHandler(BaseHandler):
     ) -> tuple[list[ScoredWindow], list[str]]:
         endpoint = str(getattr(settings, "vision_embedding_url", "") or "").strip()
         if not endpoint:
-            return [], ["visual scoring unavailable; result may be poor for visual-only queries"]
+            return [], ["visual scoring unavailable: vision_embedding_url is not configured"]
 
         with TemporaryDirectory(prefix="smart_trim_frames_") as temp_dir:
             frames = await self._extract_frames(video_path, duration, config.sample_fps, Path(temp_dir))

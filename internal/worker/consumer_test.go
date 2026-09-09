@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/redisstream"
@@ -254,6 +255,93 @@ type registrationReadRaceHook struct {
 
 type registrationDeadlineReadHook struct {
 	reads atomic.Int32
+}
+
+// Virtual-time dependencies exercise Run without a network or scheduler jitter.
+type registeredReadBudgetHook struct {
+	readDelay time.Duration
+	readErr   error
+	reads     int
+	firstErr  error
+	readDone  context.Context
+	cancelRun context.CancelFunc
+}
+
+func (h *registeredReadBudgetHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *registeredReadBudgetHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *registeredReadBudgetHook) ProcessHook(redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		switch cmd := cmd.(type) {
+		case *redis.StatusCmd:
+			cmd.SetVal("OK")
+		case *redis.XAutoClaimCmd:
+			cmd.SetVal(nil, "0-0")
+		case *redis.XPendingCmd:
+			cmd.SetVal(&redis.XPending{})
+		case *redis.XStreamSliceCmd:
+			h.reads++
+			if h.reads == 2 {
+				h.cancelRun()
+				return ctx.Err()
+			}
+			h.readDone = ctx
+			select {
+			case <-ctx.Done():
+				h.firstErr = ctx.Err()
+			case <-time.After(h.readDelay):
+				h.firstErr = h.readErr
+			}
+			cmd.SetVal(nil)
+			return h.firstErr
+		default:
+			return fmt.Errorf("unexpected budget-test Redis command: %s", cmd.Name())
+		}
+		return nil
+	}
+}
+
+type registeredReadBudgetStore struct {
+	*registeredTaskStoreStub
+	hook              *registeredReadBudgetHook
+	acquireDelay      time.Duration
+	commitDelay       time.Duration
+	callbackFenceErr  error
+	forceFenceErr     error
+	firstReadFenceErr error
+}
+
+func (s *registeredReadBudgetStore) WithWorkerRegistrationFence(
+	ctx context.Context,
+	_ store.WorkerRegistrationLease,
+	callback store.WorkerRegistrationFenceCallback,
+) error {
+	time.Sleep(s.acquireDelay)
+	// Match the real store's fail-closed database error classification.
+	if ctx.Err() != nil || s.forceFenceErr != nil {
+		return &store.WorkerRegistrationError{Code: "lease_fenced"}
+	}
+	readsBefore := s.hook.reads
+	err := callback(ctx)
+	firstRead := readsBefore == 0 && s.hook.reads == 1
+	if firstRead {
+		s.callbackFenceErr = ctx.Err()
+	}
+	if err == nil {
+		time.Sleep(s.commitDelay)
+		if ctx.Err() != nil {
+			err = &store.WorkerRegistrationError{Code: "lease_fenced"}
+		}
+	}
+	if firstRead {
+		s.firstReadFenceErr = err
+	}
+	return err
 }
 
 func (h *registrationDeadlineReadHook) DialHook(
@@ -1727,6 +1815,140 @@ func TestRegistrationLossBetweenFinalCheckAndDispatchStartsNoExecution(
 	if calls := handler.calls.Load(); calls != 0 {
 		t.Fatalf("handler calls after forced dispatch loss = %d; want 0", calls)
 	}
+}
+
+func TestConsumerRegisteredReadBudgets(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		acquireDelay time.Duration
+		commitDelay  time.Duration
+		readDelay    time.Duration
+		readErr      error
+		wantReadErr  error
+	}{
+		{
+			name:         "fence acquisition cannot expire the Redis budget",
+			acquireDelay: 400 * time.Millisecond,
+			readDelay:    200 * time.Millisecond,
+			readErr:      redis.Nil,
+			wantReadErr:  redis.Nil,
+		},
+		{
+			name:         "Redis gets its full budget after acquisition",
+			acquireDelay: 150 * time.Millisecond,
+			readDelay:    200 * time.Millisecond,
+			readErr:      redis.Nil,
+			wantReadErr:  redis.Nil,
+		},
+		{
+			name:        "successful read leaves commit context alive",
+			commitDelay: 200 * time.Millisecond,
+			readDelay:   200 * time.Millisecond,
+		},
+		{
+			name:        "Redis deadline does not cancel database lifecycle",
+			readDelay:   time.Hour,
+			wantReadErr: context.DeadlineExceeded,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				lease := registrationLossTestLease()
+				registration := newOwnedTestRegistration(context.Background(), lease)
+				ctx, cancel := context.WithCancel(registration.Context())
+				defer cancel()
+				hook := &registeredReadBudgetHook{
+					readDelay: test.readDelay,
+					readErr:   test.readErr,
+					cancelRun: cancel,
+				}
+				client := redis.NewClient(&redis.Options{ContextTimeoutEnabled: true})
+				defer client.Close()
+				client.AddHook(hook)
+				taskStore := &registeredReadBudgetStore{
+					registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+					hook:                    hook,
+					acquireDelay:            test.acquireDelay,
+					commitDelay:             test.commitDelay,
+				}
+				consumer := NewRegisteredConsumer(client, registrationLossTestConfig(lease), taskStore, registration)
+				err := consumer.Run(ctx)
+				if !errors.Is(err, context.Canceled) || registration.Context().Err() != nil {
+					t.Fatalf("healthy registration stopped: Run=%v registration=%v", err, context.Cause(registration.Context()))
+				}
+				if !errors.Is(hook.firstErr, test.wantReadErr) {
+					t.Errorf("first Redis read = %v; want %v", hook.firstErr, test.wantReadErr)
+				}
+				if taskStore.callbackFenceErr != nil {
+					t.Errorf("Redis read expired database context: %v", taskStore.callbackFenceErr)
+				}
+				if !errors.Is(taskStore.firstReadFenceErr, test.wantReadErr) {
+					t.Errorf("first fence = %v; want %v", taskStore.firstReadFenceErr, test.wantReadErr)
+				}
+				if hook.readDone == nil || hook.readDone.Err() == nil {
+					t.Error("completed Redis read context was not canceled")
+				}
+			})
+		})
+	}
+}
+
+func TestRegisteredReadFenceLossWaitsForCleanup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fence := &registeredReadFence{}
+		ctx, finish, ready := fence.begin(context.Background())
+		if !ready {
+			t.Fatal("active fence rejected read")
+		}
+		stopped := make(chan struct{})
+		go func() {
+			fence.stop()
+			close(stopped)
+		}()
+		synctest.Wait()
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("read context = %v; want cancellation", ctx.Err())
+		}
+		select {
+		case <-stopped:
+			t.Fatal("loss guard returned before synchronous read/fence cleanup")
+		default:
+		}
+		finish()
+		finish() // Completion is idempotent, including cancellation races.
+		synctest.Wait()
+		select {
+		case <-stopped:
+		default:
+			t.Fatal("loss guard did not return after cleanup")
+		}
+		if _, _, ready := fence.begin(context.Background()); ready {
+			t.Fatal("loss guard allowed an orphan late read")
+		}
+	})
+}
+
+func TestConsumerRegisteredReadDatabaseErrorsRemainFailClosed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		lease := registrationLossTestLease()
+		registration := newOwnedTestRegistration(context.Background(), lease)
+		hook := &registeredReadBudgetHook{}
+		client := redis.NewClient(&redis.Options{ContextTimeoutEnabled: true})
+		defer client.Close()
+		client.AddHook(hook)
+		taskStore := &registeredReadBudgetStore{
+			registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+			hook:                    hook,
+			forceFenceErr:           errors.New("database unavailable"),
+		}
+		consumer := NewRegisteredConsumer(client, registrationLossTestConfig(lease), taskStore, registration)
+		if err := consumer.Run(registration.Context()); !errors.Is(err, ErrRegistrationLost) {
+			t.Fatalf("Run = %v; want registration loss", err)
+		}
+		if hook.reads != 0 {
+			t.Fatalf("Redis reads without authorization = %d; want 0", hook.reads)
+		}
+	})
 }
 
 func TestConsumerRegistrationLossDeadlineStopsBeforeRedisRetrySleep(

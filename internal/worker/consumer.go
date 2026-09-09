@@ -244,10 +244,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 				blockTimeout = registeredReadBlockLimit
 			}
 			var ready bool
-			readContext, finishRead, ready = reads.begin(
-				ctx,
-				blockTimeout+registeredReadDeadlineMargin,
-			)
+			readContext, finishRead, ready = reads.begin(ctx)
 			if !ready {
 				<-executions.sem
 				return c.waitForActive(ctx, &executions.wg)
@@ -257,9 +254,20 @@ func (c *Consumer) Run(ctx context.Context) error {
 		err := c.withRegistrationFence(
 			readContext,
 			func(fenceContext context.Context) error {
+				redisContext := fenceContext
+				if reads != nil {
+					// Budget only Redis blocking, not database acquisition or
+					// commit. The loss guard still cancels and joins the whole fence.
+					var cancel context.CancelFunc
+					redisContext, cancel = context.WithTimeout(
+						fenceContext,
+						blockTimeout+registeredReadDeadlineMargin,
+					)
+					defer cancel()
+				}
 				var readErr error
 				res, readErr = c.Redis.XReadGroup(
-					fenceContext,
+					redisContext,
 					&redis.XReadGroupArgs{
 						Group:    c.ConsumerGroup,
 						Consumer: c.WorkerID,
@@ -330,14 +338,13 @@ type registeredReadFence struct {
 
 func (f *registeredReadFence) begin(
 	parent context.Context,
-	timeout time.Duration,
 ) (context.Context, func(), bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.stoppedFlag {
 		return parent, func() {}, false
 	}
-	readContext, cancel := context.WithTimeout(parent, timeout)
+	readContext, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
 	f.cancel = cancel
 	f.done = done

@@ -1,9 +1,55 @@
 from __future__ import annotations
 
+import pytest
+
 from app.autoflow.pipeline_builder import PipelineBuilder
 from app.autoflow.storyboard_generator import StoryboardGenerator
 from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import AutoFlowStoryboardRequest
+
+
+@pytest.mark.parametrize("shot_count", [1, 3])
+@pytest.mark.parametrize(
+    ("publish_mode", "no_match_policy", "privacy"),
+    [
+        ("preview_only", "placeholder", None),
+        ("private_upload", "fail", "private"),
+        ("unlisted_upload", "fail", "unlisted"),
+        ("public_after_review", "fail", "private"),
+    ],
+)
+def test_storyboard_input_video_no_match_policy_respects_upload_mode(
+    shot_count, publish_mode, no_match_policy, privacy,
+):
+    storyboard = StoryboardGenerator().generate(
+        AutoFlowStoryboardRequest(
+            prompt="Create a 15 second product video",
+            input_asset_id="asset-product",
+            target_duration=15,
+            source_strategy="input_video",
+            min_shots=3,
+            max_shots=3,
+        )
+    ).storyboard
+    storyboard.shots = storyboard.shots[:shot_count]
+
+    definition = PipelineBuilder().build_storyboard_input_video(
+        storyboard, input_asset_id="asset-product", publish_mode=publish_mode,
+    )
+
+    validation = validate_pipeline(definition)
+    assert validation.valid, [error.message for error in validation.errors]
+    trims = [node for node in definition.nodes if node.type == "smart_trim"]
+    assert len(trims) == shot_count
+    assert all(node.data.config["no_match_policy"] == no_match_policy for node in trims)
+    uploads = [node for node in definition.nodes if node.type == "youtube_upload"]
+    assert len(uploads) == (0 if privacy is None else 1)
+    if uploads:
+        assert uploads[0].data.config["privacy"] == privacy
+        assert any(
+            edge.source == "transcode_1" and edge.target == uploads[0].id
+            for edge in definition.edges
+        )
 
 
 def test_storyboard_input_video_pipeline_uses_smart_trim_per_shot():

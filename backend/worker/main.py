@@ -19,6 +19,7 @@ import httpx
 import redis.asyncio as aioredis
 from redis.typing import EncodableT
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -329,6 +330,38 @@ async def _load_cancel_state(node_execution_id: str) -> CancelState:
 
 
 async def _claim_node_execution(
+    job_id: str,
+    node_execution_id: str,
+    *,
+    worker_lease: WorkerLease | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> NodeExecutionClaim | None:
+    # Redis delivery can become visible just before the outbox transaction commits.
+    # Retry only this pre-execution claim, with a fresh transaction and exact identity.
+    delays = (0.1, 0.3, 0.6)
+    for attempt in range(len(delays) + 1):
+        try:
+            return await _claim_node_execution_once(
+                job_id,
+                node_execution_id,
+                worker_lease=worker_lease,
+                session_factory=session_factory,
+            )
+        except DBAPIError as exc:
+            original = getattr(exc.orig, "__cause__", None) or exc.orig
+            if (
+                worker_lease is None
+                or getattr(original, "sqlstate", None) != "P0001"
+                or (getattr(original, "message", None) or str(original))
+                != "task_dispatch_mismatch"
+                or attempt == len(delays)
+            ):
+                raise
+            await asyncio.sleep(delays[attempt])
+    return None
+
+
+async def _claim_node_execution_once(
     job_id: str,
     node_execution_id: str,
     *,
@@ -1588,7 +1621,10 @@ async def _process_message(
         data,
         worker_lease=worker_lease,
     ):
-        return
+        if worker_lease is None or not await _wait_for_affinity_expiry(
+            r, msg_id, data, worker_lease=worker_lease,
+        ):
+            return
 
     delivery_token = _current_task_delivery.set(
         WorkerTaskDelivery(
@@ -1738,6 +1774,34 @@ def _parse_preferred_hosts(data: dict) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+async def _wait_for_affinity_expiry(
+    r: aioredis.Redis,
+    msg_id: str,
+    data: dict,
+    *,
+    worker_lease: WorkerLease,
+) -> bool:
+    try:
+        enqueued_at = int(data.get("affinity_enqueued_at", "0") or "0")
+    except ValueError:
+        enqueued_at = 0
+    age = max(0, int(time.time()) - enqueued_at) if enqueued_at else 0
+    # Do not heartbeat during this bounded wait: a preferred worker may take over.
+    await asyncio.sleep(max(0, AFFINITY_WAIT_SECONDS - age))
+    pending = await r.xpending_range(
+        TASK_STREAM, CONSUMER_GROUP, msg_id, msg_id, 1,
+    )
+    if len(pending) != 1:
+        return False
+    message_id = pending[0].get("message_id")
+    owner = pending[0].get("consumer")
+    if isinstance(message_id, bytes):
+        message_id = message_id.decode()
+    if isinstance(owner, bytes):
+        owner = owner.decode()
+    return message_id == msg_id and owner == worker_lease.redis_consumer_id
 
 
 async def _maybe_defer_for_affinity(
