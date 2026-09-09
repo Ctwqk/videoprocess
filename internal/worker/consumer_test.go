@@ -259,12 +259,14 @@ type registrationDeadlineReadHook struct {
 
 // Virtual-time dependencies exercise Run without a network or scheduler jitter.
 type registeredReadBudgetHook struct {
-	readDelay time.Duration
-	readErr   error
-	reads     int
-	firstErr  error
-	readDone  context.Context
-	cancelRun context.CancelFunc
+	readDelay         time.Duration
+	blockingReadDelay time.Duration
+	readErr           error
+	reads             int
+	readStarts        []time.Time
+	firstErr          error
+	readDone          context.Context
+	cancelRun         context.CancelFunc
 }
 
 func (h *registeredReadBudgetHook) DialHook(next redis.DialHook) redis.DialHook {
@@ -286,15 +288,22 @@ func (h *registeredReadBudgetHook) ProcessHook(redis.ProcessHook) redis.ProcessH
 			cmd.SetVal(&redis.XPending{})
 		case *redis.XStreamSliceCmd:
 			h.reads++
+			h.readStarts = append(h.readStarts, time.Now())
 			if h.reads == 2 {
 				h.cancelRun()
 				return ctx.Err()
 			}
 			h.readDone = ctx
+			readDelay := h.readDelay
+			for _, arg := range cmd.Args() {
+				if strings.EqualFold(fmt.Sprint(arg), "block") && h.blockingReadDelay > 0 {
+					readDelay = h.blockingReadDelay
+				}
+			}
 			select {
 			case <-ctx.Done():
 				h.firstErr = ctx.Err()
-			case <-time.After(h.readDelay):
+			case <-time.After(readDelay):
 				h.firstErr = h.readErr
 			}
 			cmd.SetVal(nil)
@@ -308,12 +317,13 @@ func (h *registeredReadBudgetHook) ProcessHook(redis.ProcessHook) redis.ProcessH
 
 type registeredReadBudgetStore struct {
 	*registeredTaskStoreStub
-	hook              *registeredReadBudgetHook
-	acquireDelay      time.Duration
-	commitDelay       time.Duration
-	callbackFenceErr  error
-	forceFenceErr     error
-	firstReadFenceErr error
+	hook                   *registeredReadBudgetHook
+	acquireDelay           time.Duration
+	commitDelay            time.Duration
+	callbackFenceErr       error
+	forceFenceErr          error
+	firstReadFenceErr      error
+	firstReadFenceFinished time.Time
 }
 
 func (s *registeredReadBudgetStore) WithWorkerRegistrationFence(
@@ -340,6 +350,7 @@ func (s *registeredReadBudgetStore) WithWorkerRegistrationFence(
 	}
 	if firstRead {
 		s.firstReadFenceErr = err
+		s.firstReadFenceFinished = time.Now()
 	}
 	return err
 }
@@ -413,8 +424,9 @@ type blockingReadLossStore struct {
 }
 
 type registeredIntakeReadHook struct {
-	starts chan int32
-	reads  atomic.Int32
+	starts            chan int32
+	reads             atomic.Int32
+	secondReadRelease <-chan struct{}
 }
 
 type registeredClaimCountingHook struct {
@@ -453,7 +465,15 @@ func (h *registeredIntakeReadHook) ProcessHook(
 ) redis.ProcessHook {
 	return func(ctx context.Context, cmd redis.Cmder) error {
 		if cmd.Name() == "xreadgroup" {
-			h.starts <- h.reads.Add(1)
+			read := h.reads.Add(1)
+			h.starts <- read
+			if read == 2 && h.secondReadRelease != nil {
+				select {
+				case <-h.secondReadRelease:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 		}
 		return next(ctx, cmd)
 	}
@@ -1819,13 +1839,21 @@ func TestRegistrationLossBetweenFinalCheckAndDispatchStartsNoExecution(
 
 func TestConsumerRegisteredReadBudgets(t *testing.T) {
 	for _, test := range []struct {
-		name         string
-		acquireDelay time.Duration
-		commitDelay  time.Duration
-		readDelay    time.Duration
-		readErr      error
-		wantReadErr  error
+		name              string
+		acquireDelay      time.Duration
+		commitDelay       time.Duration
+		readDelay         time.Duration
+		blockingReadDelay time.Duration
+		readErr           error
+		wantReadErr       error
 	}{
+		{
+			name:              "empty queue avoids Redis blocking timeout overshoot",
+			readDelay:         20 * time.Millisecond,
+			blockingReadDelay: 450 * time.Millisecond,
+			readErr:           redis.Nil,
+			wantReadErr:       redis.Nil,
+		},
 		{
 			name:         "fence acquisition cannot expire the Redis budget",
 			acquireDelay: 400 * time.Millisecond,
@@ -1858,9 +1886,10 @@ func TestConsumerRegisteredReadBudgets(t *testing.T) {
 				ctx, cancel := context.WithCancel(registration.Context())
 				defer cancel()
 				hook := &registeredReadBudgetHook{
-					readDelay: test.readDelay,
-					readErr:   test.readErr,
-					cancelRun: cancel,
+					readDelay:         test.readDelay,
+					blockingReadDelay: test.blockingReadDelay,
+					readErr:           test.readErr,
+					cancelRun:         cancel,
 				}
 				client := redis.NewClient(&redis.Options{ContextTimeoutEnabled: true})
 				defer client.Close()
@@ -1887,6 +1916,94 @@ func TestConsumerRegisteredReadBudgets(t *testing.T) {
 				}
 				if hook.readDone == nil || hook.readDone.Err() == nil {
 					t.Error("completed Redis read context was not canceled")
+				}
+			})
+		})
+	}
+}
+
+func TestConsumerRegisteredEmptyReadWaitsOutsideFence(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		blockTimeout time.Duration
+		wantWait     time.Duration
+	}{
+		{"default", 5 * time.Second, 200 * time.Millisecond},
+		{"short configured interval", 30 * time.Millisecond, 30 * time.Millisecond},
+		{"zero cannot busy poll", 0, 200 * time.Millisecond},
+		{"negative cannot busy poll", -time.Second, 200 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				lease := registrationLossTestLease()
+				registration := newOwnedTestRegistration(context.Background(), lease)
+				ctx, cancel := context.WithCancel(registration.Context())
+				defer cancel()
+				hook := &registeredReadBudgetHook{readErr: redis.Nil, cancelRun: cancel}
+				client := redis.NewClient(&redis.Options{ContextTimeoutEnabled: true})
+				defer client.Close()
+				client.AddHook(hook)
+				taskStore := &registeredReadBudgetStore{
+					registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+					hook:                    hook,
+				}
+				consumer := NewRegisteredConsumer(client, registrationLossTestConfig(lease), taskStore, registration)
+				consumer.BlockTimeout = test.blockTimeout
+				if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+					t.Fatalf("Run = %v; want cancellation", err)
+				}
+				if len(hook.readStarts) != 2 {
+					t.Fatalf("read attempts = %d; want 2", len(hook.readStarts))
+				}
+				if elapsed := hook.readStarts[1].Sub(taskStore.firstReadFenceFinished); elapsed != test.wantWait {
+					t.Fatalf("empty queue wait outside fence = %s; want %s", elapsed, test.wantWait)
+				}
+			})
+		})
+	}
+}
+
+func TestConsumerRegisteredIdleWaitCancelsPromptly(t *testing.T) {
+	for _, loseRegistration := range []bool{false, true} {
+		t.Run(fmt.Sprintf("registration loss=%t", loseRegistration), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				lease := registrationLossTestLease()
+				registration := newOwnedTestRegistration(context.Background(), lease)
+				ctx, cancel := context.WithCancel(registration.Context())
+				defer cancel()
+				hook := &registeredReadBudgetHook{readErr: redis.Nil, cancelRun: cancel}
+				client := redis.NewClient(&redis.Options{ContextTimeoutEnabled: true})
+				defer client.Close()
+				client.AddHook(hook)
+				taskStore := &registeredReadBudgetStore{
+					registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+					hook:                    hook,
+				}
+				consumer := NewRegisteredConsumer(client, registrationLossTestConfig(lease), taskStore, registration)
+				done := make(chan error, 1)
+				go func() { done <- consumer.Run(ctx) }()
+				synctest.Wait()
+				if hook.reads != 1 || taskStore.firstReadFenceFinished.IsZero() {
+					t.Fatalf("not idle outside completed fence: reads=%d finished=%v", hook.reads, taskStore.firstReadFenceFinished)
+				}
+				wantErr := context.Canceled
+				if loseRegistration {
+					wantErr = ErrRegistrationLost
+					registration.MarkLost()
+				} else {
+					cancel()
+				}
+				synctest.Wait()
+				select {
+				case err := <-done:
+					if !errors.Is(err, wantErr) {
+						t.Fatalf("Run = %v; want %v", err, wantErr)
+					}
+				default:
+					t.Fatal("idle wait did not stop immediately on cancellation")
+				}
+				if hook.reads != 1 {
+					t.Fatalf("Redis reads after idle cancellation = %d; want 1", hook.reads)
 				}
 			})
 		})
@@ -2276,7 +2393,14 @@ func TestConsumerRegistrationFenceOrdersRedisIntakeBeforeTakeoverProof(
 		defer cleanupCancel()
 		_ = client.Del(cleanupContext, cfg.RedisStream).Err()
 	})
-	intakeHook := &registeredIntakeReadHook{starts: make(chan int32, 8)}
+	secondReadRelease := make(chan struct{})
+	var releaseReadOnce sync.Once
+	releaseRead := func() { releaseReadOnce.Do(func() { close(secondReadRelease) }) }
+	defer releaseRead()
+	intakeHook := &registeredIntakeReadHook{
+		starts:            make(chan int32, 8),
+		secondReadRelease: secondReadRelease,
+	}
 	client.AddHook(intakeHook)
 	taskStore := &registeredIntakeFenceStore{fenceStore: fixture.worker}
 	handlerRelease := make(chan struct{})
@@ -2304,10 +2428,6 @@ func TestConsumerRegistrationFenceOrdersRedisIntakeBeforeTakeoverProof(
 		5*time.Second,
 	)
 	defer cancelRun()
-	runDone := make(chan error, 1)
-	go func() {
-		runDone <- consumer.Run(runContext)
-	}()
 	waitForRead := func(want int32) {
 		t.Helper()
 		select {
@@ -2350,8 +2470,12 @@ func TestConsumerRegistrationFenceOrdersRedisIntakeBeforeTakeoverProof(
 		}
 	}
 
-	waitForRead(1)
 	firstID := addDelivery("first pre-proof")
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- consumer.Run(runContext)
+	}()
+	waitForRead(1)
 	waitForHandler(1)
 	waitForRead(2)
 
@@ -2384,6 +2508,7 @@ func TestConsumerRegistrationFenceOrdersRedisIntakeBeforeTakeoverProof(
 		)
 	case <-time.After(75 * time.Millisecond):
 	}
+	releaseRead()
 
 	select {
 	case takeoverErr := <-takeoverDone:

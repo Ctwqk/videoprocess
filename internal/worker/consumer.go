@@ -19,7 +19,7 @@ import (
 var ErrConfirmedCancellation = errors.New("confirmed cancellation")
 
 const registeredAffinityWait = 20 * time.Second
-const registeredReadBlockLimit = 200 * time.Millisecond
+const registeredReadPollLimit = 200 * time.Millisecond
 const registeredReadDeadlineMargin = 100 * time.Millisecond
 
 // Handler executes a single node's media transform. Each implementation is
@@ -239,10 +239,15 @@ func (c *Consumer) Run(ctx context.Context) error {
 		readContext := ctx
 		finishRead := func() {}
 		blockTimeout := c.BlockTimeout
+		idleWait := time.Duration(0)
 		if reads != nil {
-			if blockTimeout <= 0 || blockTimeout > registeredReadBlockLimit {
-				blockTimeout = registeredReadBlockLimit
+			idleWait = blockTimeout
+			if idleWait <= 0 || idleWait > registeredReadPollLimit {
+				idleWait = registeredReadPollLimit
 			}
+			// Redis BLOCK may overshoot its requested duration. Poll immediately
+			// under the fence and wait outside the database transaction instead.
+			blockTimeout = -1
 			var ready bool
 			readContext, finishRead, ready = reads.begin(ctx)
 			if !ready {
@@ -256,12 +261,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 			func(fenceContext context.Context) error {
 				redisContext := fenceContext
 				if reads != nil {
-					// Budget only Redis blocking, not database acquisition or
+					// Budget only Redis I/O, not database acquisition or
 					// commit. The loss guard still cancels and joins the whole fence.
 					var cancel context.CancelFunc
 					redisContext, cancel = context.WithTimeout(
 						fenceContext,
-						blockTimeout+registeredReadDeadlineMargin,
+						idleWait+registeredReadDeadlineMargin,
 					)
 					defer cancel()
 				}
@@ -295,6 +300,18 @@ func (c *Consumer) Run(ctx context.Context) error {
 				return c.waitForActive(ctx, &executions.wg)
 			}
 			if errors.Is(err, redis.Nil) {
+				if reads != nil {
+					timer := time.NewTimer(idleWait)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return c.waitForActive(ctx, &executions.wg)
+					case <-c.Registration.Context().Done():
+						timer.Stop()
+						return c.waitForActive(c.Registration.Context(), &executions.wg)
+					case <-timer.C:
+					}
+				}
 				continue
 			}
 			c.log.Warn("xreadgroup failed", "error", err)
