@@ -62,6 +62,8 @@ from app.storage.manager import get_storage
 from worker.handlers import HANDLER_MAP
 from worker.handlers.base import BaseHandler, CancelledError
 from worker.handlers.youtube_upload import YouTubeUploadHandler
+from worker.task_delivery import WorkerTaskDelivery
+from worker.youtube_ack_drill_arming import AckDrillArming
 from worker.registration import (
     PythonWorkerRegistration,
     build_worker_registration_claims,
@@ -112,17 +114,6 @@ WORKER_REDIS_CONTINUITY_MAX_AGE_SECONDS = 90
 
 engine_db: AsyncEngine | None = None
 worker_session: async_sessionmaker[AsyncSession] | None = None
-
-
-@dataclass
-class WorkerTaskDelivery:
-    redis_stream: str
-    consumer_group: str
-    message_id: str
-    payload_sha256: str
-    dispatch_key: uuid.UUID | None
-    attestation_id: uuid.UUID | None = None
-    event_emission_id: uuid.UUID | None = None
 
 
 _current_task_delivery: ContextVar[WorkerTaskDelivery | None] = ContextVar(
@@ -647,10 +638,21 @@ async def process_task(
     try:
         handler: BaseHandler
         if node_type == "youtube_upload":
-            handler = YouTubeUploadHandler(
-                session_factory=get_worker_session(),
-                lease_refresher=lease_refresher,
+            arming = AckDrillArming.from_environment(
+                worker_type=WORKER_TYPE, worker_lease=worker_lease,
+                execution_claim=claim, delivery=_current_task_delivery.get(),
             )
+            if arming is None:
+                handler = YouTubeUploadHandler(
+                    session_factory=get_worker_session(),
+                    lease_refresher=lease_refresher,
+                )
+            else:
+                handler = YouTubeUploadHandler(
+                    session_factory=get_worker_session(),
+                    lease_refresher=lease_refresher,
+                    ack_drill_arming=arming,
+                )
         else:
             handler = handler_cls()
     except Exception as exc:

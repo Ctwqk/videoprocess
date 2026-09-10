@@ -1,4 +1,4 @@
-"""Trusted-code-only pre-receipt drill, not live arming or receiver-audit proof."""
+"""Pre-receipt drill; runtime arming is separate from receiver-audit proof."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import stat
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -27,6 +27,7 @@ from app.services.youtube_upload_operations import (
     UploadOperationContext,
     YouTubeUploadOperationStore,
 )
+from worker.youtube_ack_drill_evidence import validate_ack_drill_evidence as validate_ack_drill_evidence
 
 
 def _digest(value: Any) -> str:
@@ -38,6 +39,43 @@ def _encode(value: Any) -> bytes:
 
 
 @dataclass(frozen=True)
+class AckDrillArmingIdentity:
+    release_commit: str
+    channel_id: str
+    account_id: str
+    platform_channel_id: str
+    service_name: str
+    redis_stream: str
+    consumer_group: str
+    message_id: str
+    payload_sha256: str
+    dispatch_key: str
+    attestation_id: str
+    receiver_container_id: str
+    receiver_image_id: str
+    audit_window_id: str
+    audit_cursor_sha256: str
+
+    def __post_init__(self) -> None:
+        patterns = {
+            "release_commit": r"[0-9a-f]{40}", "platform_channel_id": r"UC[A-Za-z0-9_-]{22}",
+            "message_id": r"[0-9]{1,20}-[0-9]{1,20}", "payload_sha256": r"[0-9a-f]{64}",
+            "receiver_container_id": r"[0-9a-f]{64}", "receiver_image_id": r"sha256:[0-9a-f]{64}",
+            "audit_cursor_sha256": r"[0-9a-f]{64}",
+        }
+        for key, value in asdict(self).items():
+            if not isinstance(value, str) or re.fullmatch(
+                patterns.get(key, r"[A-Za-z0-9_.:@-]{1,255}"), value,
+            ) is None:
+                raise ValueError("ack drill arming identity is invalid")
+        for key in ("channel_id", "account_id", "dispatch_key", "attestation_id", "audit_window_id"):
+            value = getattr(self, key)
+            parsed = uuid.UUID(value)
+            if not parsed.int or str(parsed) != value:
+                raise ValueError("ack drill arming identity requires exact UUIDs")
+
+
+@dataclass(frozen=True)
 class AckDrillTarget:
     context: UploadOperationContext
     production_task_id: uuid.UUID
@@ -45,8 +83,13 @@ class AckDrillTarget:
     expires_at: datetime
     owned_attestation_sha256: str
     manager_origin: str
+    arming_identity: AckDrillArmingIdentity | None = None
 
     def __post_init__(self) -> None:
+        if self.arming_identity is not None:
+            if type(self.arming_identity) is not AckDrillArmingIdentity:
+                raise ValueError("ack drill requires immutable typed arming identity")
+            self.arming_identity.__post_init__()
         context = self.context
         if type(context) is not UploadOperationContext or type(context.execution_claim) is not NodeExecutionClaim:
             raise ValueError("ack drill requires an immutable upload context")
@@ -126,6 +169,8 @@ class OwnedUnlistedAckDrill:
             "owned_attestation_sha256": target.owned_attestation_sha256,
             "manager_origin": target.manager_origin, "expires_at": target.expires_at.isoformat(),
         }
+        if target.arming_identity is not None:
+            self._identity.update(asdict(target.arming_identity))
         self._records: dict[str, bytes] = {}
         self._phase = "new"
         self._operation_id: uuid.UUID | None = None
@@ -222,6 +267,11 @@ class OwnedUnlistedAckDrill:
         if remaining <= 0:
             raise RuntimeError("ack drill deadline expired")
         return remaining
+
+    def check_arming_before_claim(self, cancelled: asyncio.Event) -> None:
+        self._check_cancelled(cancelled)
+        if self._target.expires_at.timestamp() <= time.time():
+            raise ValueError("ack drill manifest expired before reservation")
 
     def _match(self, context: UploadOperationContext, operation: Any) -> None:
         if context != self._target.context or operation.production_task_id != self._target.production_task_id:

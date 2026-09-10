@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import subprocess
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +13,14 @@ from types import SimpleNamespace
 import pytest
 
 from worker import main as worker_main
+from worker.handlers import youtube_upload as upload_module
+from tests.worker.test_youtube_ack_drill_arming import (
+    arming_case as _arming_case, protected_dir as _protected_dir, write_manifest,
+)
+
+
+arming_case = _arming_case
+protected_dir = _protected_dir
 
 
 class WorkerHarness:
@@ -238,3 +250,145 @@ async def test_invalid_youtube_queue_binding_never_constructs_handler(
     assert harness.created == []
     assert harness.executed_configs == []
     assert len(harness.failures) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["exact", "spoofed-delivery", "missing-delivery", "off-queue-spoof", "cancel-wait", "arrival"])
+async def test_real_main_construction_binds_runtime_arming(monkeypatch, tmp_path, arming_case, case):
+    context = arming_case["context"]
+    _, _, _, node, artifact = authoritative_rows(tmp_path)
+    node.id, node.job_id, node.input_artifact_ids = context.node_execution_id, context.job_id, [context.input_artifact_id]
+    node.node_config = {"title": context.title, "privacy": "unlisted"}
+    artifact.id, artifact.job_id = context.input_artifact_id, context.job_id
+    Path(artifact.storage_path).write_bytes(b"owned media")
+    harness = WorkerHarness(tmp_path=tmp_path, node_execution=node, input_artifact=artifact)
+    harness.install(monkeypatch)
+    monkeypatch.setattr(worker_main, "YouTubeUploadHandler", upload_module.YouTubeUploadHandler)
+    monkeypatch.setattr(upload_module.settings, "youtube_manager_url", "http://youtube-manager")
+    async def real_claim(*args, **kwargs):
+        return context.execution_claim
+    monkeypatch.setattr(worker_main, "_claim_node_execution", real_claim)
+    reached = []
+    class StopAtReservation:
+        async def claim(self, actual):
+            reached.append(actual)
+            raise RuntimeError("test stopped at reservation boundary")
+    monkeypatch.setattr(upload_module, "YouTubeUploadOperationStore", lambda factory: StopAtReservation())
+    data = worker_data(job_id=context.job_id, node_execution_id=context.node_execution_id, artifact_id=context.input_artifact_id)
+    data["config"] = json.dumps({
+        "VP_YOUTUBE_ACK_DRILL_ENABLED": "true", "VP_YOUTUBE_ACK_DRILL_MANIFEST": str(arming_case["path"]),
+        "ack_drill_arming": arming_case["manifest"], "_delivery": vars(arming_case["delivery"]),
+    }, default=str)
+    delivered = arming_case["delivery"]
+    if case == "spoofed-delivery":
+        delivered.message_id = "999-0"
+    elif case == "missing-delivery":
+        delivered = None
+    elif case == "off-queue-spoof":
+        monkeypatch.delenv("VP_YOUTUBE_ACK_DRILL_ENABLED")
+    if case not in {"cancel-wait", "arrival", "off-queue-spoof"}:
+        write_manifest(arming_case)
+    token = worker_main._current_task_delivery.set(delivered)
+    cancel_watch_entered = asyncio.Event()
+    release_watcher = asyncio.Event()
+    checks = 0
+    async def watch(_node_id):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            return worker_main.CancelState(None, None, None, False, None)
+        cancel_watch_entered.set()
+        await release_watcher.wait()
+        return worker_main.CancelState(None, None, None, True, "test cancellation")
+    if case in {"cancel-wait", "arrival"}:
+        monkeypatch.setattr(worker_main, "_load_cancel_state", watch)
+    try:
+        task = asyncio.create_task(worker_main.process_task(data, worker_lease=arming_case["lease"]))
+        if case in {"cancel-wait", "arrival"}:
+            await asyncio.wait_for(cancel_watch_entered.wait(), 2)
+            assert reached == []
+            assert not task.done()
+            if case == "arrival":
+                write_manifest(arming_case)
+            else:
+                release_watcher.set()
+        await asyncio.wait_for(task, 3)
+    finally:
+        worker_main._current_task_delivery.reset(token)
+    if case in {"exact", "arrival", "off-queue-spoof"}:
+        assert reached == [context]
+        assert harness.failures == ["test stopped at reservation boundary"]
+    else:
+        assert reached == []
+        if case != "cancel-wait":
+            assert len(harness.failures) == 1
+
+
+def test_module_entrypoint_accepts_its_real_delivery_without_importing_main_again(arming_case):
+    # Isolated interpreter plus Python's actual -m execution primitive. Startup
+    # is intercepted before the coroutine runs, so no services are contacted.
+    bootstrap = r'''
+import asyncio
+import dataclasses
+import json
+import runpy
+import sys
+import uuid
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, sys.argv[1])
+
+def probe(startup):
+    startup.close()
+    entry = sys.modules["__main__"]
+    from worker import registration
+    from worker.youtube_ack_drill_arming import AckDrillArming
+    registration.EMBEDDED_BUILD_COMMIT = "a" * 40
+    now = datetime.now(timezone.utc)
+    claim = entry.NodeExecutionClaim(
+        job_id=uuid.uuid4(), node_execution_id=uuid.uuid4(),
+        worker_id="youtube_publisher-worker@host:1", started_at=now,
+        worker_registration_id=uuid.uuid4(), worker_lease_epoch=7,
+    )
+    lease = entry.WorkerLease(
+        registration_id=claim.worker_registration_id, grant_id=uuid.uuid4(),
+        service_name="vp-youtube-publisher", worker_instance_id=uuid.uuid4(),
+        worker_slot=1, redis_consumer_id=claim.worker_id, lease_epoch=7,
+        lease_secret="test-only", lease_expires_at=now + timedelta(minutes=5),
+    )
+    delivery = entry.WorkerTaskDelivery(
+        redis_stream="vp:tasks:youtube_publisher", consumer_group="youtube_publisher-workers",
+        message_id="1234567890-0", payload_sha256="d" * 64,
+        dispatch_key=uuid.uuid4(), attestation_id=uuid.uuid4(),
+    )
+    options = dict(worker_type=entry.WORKER_TYPE, worker_lease=lease, execution_claim=claim)
+    assert "worker.main" not in sys.modules
+    pending = AckDrillArming.from_environment(**options, delivery=delivery)
+    assert pending.message_id == "1234567890-0"
+    assert "worker.main" not in sys.modules, "arming imported the entry point again"
+    class DeliverySubclass(entry.WorkerTaskDelivery):
+        pass
+    Lookalike = dataclasses.make_dataclass("WorkerTaskDelivery", [
+        (field.name, field.type) for field in dataclasses.fields(delivery)
+    ])
+    for spoof in (vars(delivery), DeliverySubclass(**vars(delivery)), Lookalike(**vars(delivery))):
+        try:
+            AckDrillArming.from_environment(**options, delivery=spoof)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("noncanonical delivery was accepted")
+    print(json.dumps({"module": entry.__name__, "delivery_module": type(delivery).__module__}))
+
+asyncio.run = probe
+runpy._run_module_as_main("worker.main", alter_argv=True)
+'''
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", bootstrap, str(Path(__file__).resolve().parents[2])],
+        capture_output=True, text=True, timeout=10,
+        env={key: value for key, value in os.environ.items() if key not in {
+            "CHANNEL_OPS_POSTGRES_TEST_URL", "CHANNEL_OPS_REDIS_TEST_URL",
+        }},
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"module": "__main__", "delivery_module": "worker.task_delivery"}

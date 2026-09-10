@@ -26,6 +26,7 @@ from app.services.youtube_upload_operations import (
 )
 from worker.handlers.base import BaseHandler, CancelledError
 from worker.youtube_ack_drill import InjectedPreReceiptAbort, OwnedUnlistedAckDrill
+from worker.youtube_ack_drill_arming import AckDrillArming
 
 
 UPLOAD_INSERT_COST = 1_600
@@ -51,6 +52,7 @@ class YouTubeUploadHandler(BaseHandler):
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         lease_refresher: Callable[..., Awaitable[Any]] | None = None,
         ack_drill: OwnedUnlistedAckDrill | None = None,
+        ack_drill_arming: AckDrillArming | None = None,
     ) -> None:
         super().__init__()
         if operation_store is None:
@@ -68,7 +70,13 @@ class YouTubeUploadHandler(BaseHandler):
         if ack_drill is not None and type(ack_drill) is not OwnedUnlistedAckDrill:
             raise ValueError("ack_drill must be a concrete trusted-code helper")
         self._ack_drill = ack_drill
-        self._drill_cancelled = asyncio.Event() if ack_drill is not None else None
+        if ack_drill_arming is not None and (
+            type(ack_drill_arming) is not AckDrillArming or ack_drill is not None
+        ):
+            raise ValueError("ack_drill_arming requires exclusive concrete trusted runtime configuration")
+        self._ack_drill_arming = ack_drill_arming
+        self._arming_attempted = False
+        self._drill_cancelled = asyncio.Event() if ack_drill is not None or ack_drill_arming is not None else None
         if not self._base_url:
             raise ValueError("YOUTUBE_MANAGER_URL is required for youtube uploads")
         if not math.isfinite(self._poll_interval_seconds) or self._poll_interval_seconds < 0:
@@ -104,6 +112,16 @@ class YouTubeUploadHandler(BaseHandler):
                 privacy=privacy,
             )
             self._raise_if_cancelled()
+            if self._ack_drill_arming is not None:
+                if self._arming_attempted:
+                    raise RuntimeError("ack drill arming cannot be retried")
+                self._arming_attempted = True
+                assert self._drill_cancelled is not None
+                self._ack_drill = await self._ack_drill_arming.arm(
+                    context, manager_origin=self._base_url, cancelled=self._drill_cancelled,
+                )
+                self._raise_if_cancelled()
+                self._ack_drill.check_arming_before_claim(self._drill_cancelled)
             claim = await self._operation_store.claim(context)
             operation = claim.operation
             self._raise_if_cancelled()
