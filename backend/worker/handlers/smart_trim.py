@@ -377,12 +377,17 @@ class SmartTrimHandler(BaseHandler):
             "texts": texts,
             "image_paths": [str(path) for _timestamp, path in frames],
         }).encode("utf-8")
-        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
-            *self._local_scoring_command(),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        ))
+        async def spawn_child() -> asyncio.subprocess.Process:
+            if self._cancelled:
+                raise CancelledError("visual scoring cancelled")
+            return await asyncio.create_subprocess_exec(
+                *self._local_scoring_command(),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+        spawn = asyncio.create_task(spawn_child())
 
         async def reap_child() -> None:
             # Also own a child created while the handler was being cancelled.
@@ -398,6 +403,7 @@ class SmartTrimHandler(BaseHandler):
                 if self._proc is proc:
                     self._proc = None
 
+        cancellation: asyncio.CancelledError | None = None
         try:
             proc = self._proc = await asyncio.shield(spawn)
             if self._cancelled:
@@ -414,17 +420,23 @@ class SmartTrimHandler(BaseHandler):
                 detail = stderr.decode("utf-8", errors="replace")[-2000:].strip()
                 raise RuntimeError(f"local visual scoring failed ({proc.returncode}): {detail}")
             return _scores_from_similarity_matrix(json.loads(stdout), frames, len(texts))
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            raise
         finally:
             cleanup = asyncio.create_task(reap_child())
-            cancelled = False
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    cancelled = True
-            cleanup.result()
-            if cancelled:
-                raise asyncio.CancelledError
+            try:
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError as exc:
+                        if cancellation is None:
+                            cancellation = exc
+                cleanup.result()
+            finally:
+                # Cleanup failures must not turn task cancellation into a warning.
+                if cancellation is not None:
+                    raise cancellation
 
     async def _subtitle_windows(
         self,

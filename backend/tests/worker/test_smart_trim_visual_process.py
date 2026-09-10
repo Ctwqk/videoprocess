@@ -155,37 +155,167 @@ async def test_cancelled_handler_never_starts_visual_child(local_handler, monkey
     assert not pid_path.exists()
 
 
-async def test_cancellation_during_spawn_still_owns_and_reaps_child(local_handler, monkeypatch, tmp_path):
+async def test_handler_cancellation_prevents_queued_spawn(local_handler, monkeypatch, tmp_path):
     handler, _ = local_handler
-    pid_path = child_command(handler, monkeypatch, tmp_path, wait=True)
+    child_command(handler, monkeypatch, tmp_path, wait=True)
     original_spawn = asyncio.create_subprocess_exec
-    created = asyncio.Event()
+    children = []
+
+    async def observed_spawn(*args, **kwargs):
+        proc = await original_spawn(*args, **kwargs)
+        children.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", observed_spawn)
+    task = asyncio.create_task(handler._visual_windows("source.mp4", 5.0, SmartTrimConfig(prompt="blue")))
+    try:
+        # Resume after scoring queues the spawn, before that spawn gets its turn.
+        await asyncio.sleep(0)
+        handler.cancel()
+        with pytest.raises(CancelledError):
+            await asyncio.wait_for(task, 3.0)
+        assert children == []
+        assert handler._proc is None
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        for proc in children:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.communicate()
+
+
+@pytest.mark.parametrize("cancel_requests", [1, 3])
+async def test_task_cancellation_survives_failed_spawn(
+    local_handler, monkeypatch, tmp_path, cancel_requests,
+):
+    handler, _ = local_handler
+    monkeypatch.setattr(handler, "_local_scoring_command", lambda: [str(tmp_path / "missing-command")])
+    original_spawn = asyncio.create_subprocess_exec
+    spawning = asyncio.Event()
     release = asyncio.Event()
 
     async def delayed_spawn(*args, **kwargs):
-        proc = await original_spawn(*args, **kwargs)
-        created.set()
+        spawning.set()
         await release.wait()
-        return proc
+        return await original_spawn(*args, **kwargs)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
     task = asyncio.create_task(handler._visual_windows("source.mp4", 5.0, SmartTrimConfig(prompt="blue")))
     try:
-        await asyncio.wait_for(created.wait(), 3.0)
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done()
+        await asyncio.wait_for(spawning.wait(), 3.0)
+        for _ in range(cancel_requests):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 3.0)
+        assert task.cancelled()
         assert handler._proc is None
-        if pid_path.exists():
-            assert_reaped(pid_path)
     finally:
         release.set()
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("cancel_requests", [1, 3])
+async def test_cancellation_during_spawn_still_owns_and_reaps_child(
+    local_handler, monkeypatch, tmp_path, cancel_requests,
+):
+    handler, _ = local_handler
+    child_command(handler, monkeypatch, tmp_path, wait=True)
+    original_spawn = asyncio.create_subprocess_exec
+    created = asyncio.Event()
+    release = asyncio.Event()
+    child = None
+
+    async def delayed_spawn(*args, **kwargs):
+        nonlocal child
+        child = await original_spawn(*args, **kwargs)
+        created.set()
+        await release.wait()
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    task = asyncio.create_task(handler._visual_windows("source.mp4", 5.0, SmartTrimConfig(prompt="blue")))
+    try:
+        await asyncio.wait_for(created.wait(), 3.0)
+        for _ in range(cancel_requests):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 3.0)
+        assert handler._proc is None
+        assert child is not None
+        assert child.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(child.pid, 0)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if child is not None:
+            if child.returncode is None:
+                child.kill()
+            await child.communicate()
+
+
+async def test_repeated_cancellation_survives_cleanup_error(local_handler, monkeypatch, tmp_path):
+    handler, _ = local_handler
+    child_command(handler, monkeypatch, tmp_path)
+    original_spawn = asyncio.create_subprocess_exec
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+    child = None
+
+    async def observed_spawn(*args, **kwargs):
+        nonlocal child
+        child = await original_spawn(*args, **kwargs)
+        communicate = child.communicate
+
+        async def failing_cleanup(input=None):
+            if input is not None:
+                return await communicate(input)
+            cleaning.set()
+            await release.wait()
+            await communicate()
+            raise OSError("cleanup failed")
+
+        monkeypatch.setattr(child, "communicate", failing_cleanup)
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", observed_spawn)
+    task = asyncio.create_task(handler._visual_windows("source.mp4", 5.0, SmartTrimConfig(prompt="blue")))
+    try:
+        await asyncio.wait_for(cleaning.wait(), 3.0)
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 3.0)
+        assert task.cancelled()
+        assert handler._proc is None
+        assert child is not None
+        assert child.returncode is not None
+        with pytest.raises(ProcessLookupError):
+            os.kill(child.pid, 0)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if child is not None:
+            if child.returncode is None:
+                child.kill()
+            await child.wait()
 
 
 async def test_low_local_score_fails_without_rendering_placeholder(local_handler, monkeypatch, tmp_path):
