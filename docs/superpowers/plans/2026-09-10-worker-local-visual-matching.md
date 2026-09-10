@@ -40,7 +40,7 @@ CPU PyTorch, Pillow, existing Docker worker and CI-gated Swarm deployment.
 - CLI stdout: `{"similarities": [[0.4]], "model_revision": "f4a64596bbcf9a2a94591b74b9dc39b2e4e77e3e"}`
 - Download command: `python worker/visual_embedding_model.py --download DIRECTORY`
 
-- [ ] Write tests rejecting empty/oversized inputs and missing local models
+- [x] Write tests rejecting empty/oversized inputs and missing local models
   before model import/download; subprocess exit must be nonzero, stdout must not
   contain a fabricated successful matrix. Example:
   ```python
@@ -51,8 +51,8 @@ CPU PyTorch, Pillow, existing Docker worker and CI-gated Swarm deployment.
   assert result.returncode != 0
   assert '"similarities"' not in result.stdout
   ```
-- [ ] Run focused tests and record missing-command/behavior RED evidence.
-- [ ] Implement validation before lazy heavy imports, official processor/model
+- [x] Run focused tests and record missing-command/behavior RED evidence.
+- [x] Implement validation before lazy heavy imports, official processor/model
   offline loading, bounded batches, and normalized output:
   ```python
   with torch.inference_mode():
@@ -63,13 +63,13 @@ CPU PyTorch, Pillow, existing Docker worker and CI-gated Swarm deployment.
   Validate no truncation beyond 512 characters; use tokenizer truncation at its
   supported length when token count exceeds the model's positional capacity.
   Decode images with Pillow context managers; close them after each batch.
-- [ ] Implement build-only snapshot download with an explicit allowlist of
+- [x] Implement build-only snapshot download with an explicit allowlist of
   model/config/tokenizer files, fixed revision, and streaming SHA-256 validation
   of `model.safetensors`; reject a mismatch. Preserve upstream provenance.
-- [ ] Pin visual dependencies separately from API/test dependencies. Verify
+- [x] Pin visual dependencies separately from API/test dependencies. Verify
   the command with the real model on 150 in an isolated container with no network
   during inference, Chinese positive fixtures, singleton query, and batch order.
-- [ ] Run focused tests and commit only the task files.
+- [x] Run focused tests and commit only the task files.
 
 ### Task 2: Smart Trim Child Lifecycle and Matrix Validation
 
@@ -85,21 +85,21 @@ CPU PyTorch, Pillow, existing Docker worker and CI-gated Swarm deployment.
 - Keep `_score_frames(endpoint, frames, config)` as the remote implementation;
   both use one exact-shape numeric cosine validator/scorer.
 
-- [ ] Add RED tests for missing/extra rows/columns, NaN/infinity, booleans,
+- [x] Add RED tests for missing/extra rows/columns, NaN/infinity, booleans,
   strings, and out-of-range similarities. Include a literal valid negative
   penalty case: `[[0.8, 0.5]]` produces score `0.6`.
-- [ ] Add selection tests proving URL priority, opt-in local path, existing
+- [x] Add selection tests proving URL priority, opt-in local path, existing
   missing-provider diagnostic, local invalid-output warning, and no-match stop.
-- [ ] Add real-child lifecycle tests with a tiny Python fixture replacing only
+- [x] Add real-child lifecycle tests with a tiny Python fixture replacing only
   process argv construction: successful JSON, nonzero exit, timeout, task cancel,
   handler cancel before spawn and during execution. Check no live child remains.
-- [ ] Implement a per-handler child in `self._proc`, awaiting communication under
+- [x] Implement a per-handler child in `self._proc`, awaiting communication under
   the 120-second deadline and killing/awaiting it in a `finally` block. Propagate
   asyncio and handler cancellation before the visual-warning catch; prevent
   spawning after handler cancellation. Use argv, never a shell.
-- [ ] Implement provider selection and shared validation without changing ASR,
+- [x] Implement provider selection and shared validation without changing ASR,
   match thresholds, publication policy, or deterministic workflow builders.
-- [ ] Run focused tests, full backend pytest, Ruff and mypy; commit task files.
+- [x] Run focused tests, full backend pytest, Ruff and mypy; commit task files.
 
 ### Task 3: Existing Automatic Deployment and Real Render
 
@@ -115,14 +115,14 @@ CPU PyTorch, Pillow, existing Docker worker and CI-gated Swarm deployment.
   `VISION_EMBEDDING_MODEL_PATH=/usr/local/share/videoprocess/chinese-clip`.
 - Existing `VISION_EMBEDDING_URL` override remains higher priority in the worker.
 
-- [ ] Add a shell behavior check by invoking the deployment environment function:
+- [x] Add a shell behavior check by invoking the deployment environment function:
   ```bash
   output="$(vp_vision_worker_env vp-ffmpeg-worker-python:deploy-0123456789ab)"
   grep -Fx 'VISION_EMBEDDING_MODEL_PATH=/usr/local/share/videoprocess/chinese-clip' <<<"$output"
   ```
   Use the existing registration fixture required by that function. Verify other
   worker environment functions do not opt into the local model.
-- [ ] Add Docker install/download layers before application source copying;
+- [x] Add Docker install/download layers before application source copying;
   use the separate visual requirements and CPU Torch wheel index. Download and
   hash-check before service rotation. Keep the directory read-only to UID 10001.
 - [ ] Build an isolated candidate on 150 and run the real CLI offline, then run
