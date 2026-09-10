@@ -350,6 +350,16 @@ class JobEngine:
             for node_id in dep_map:
                 current_dep_map = dep_map
                 if guard_initial_launch:
+                    # Observations only skip work; eligible nodes still need fresh locks.
+                    observed = ne_by_node_id.get(node_id)
+                    if observed is None or observed.status != NodeStatus.PENDING:
+                        continue
+                    if not all(
+                        ne_by_node_id.get(dep_id)
+                        and ne_by_node_id[dep_id].status == NodeStatus.SUCCEEDED
+                        for dep_id in current_dep_map[node_id]
+                    ):
+                        continue
                     await self._before_initial_node_launch_recheck(job.id, node_id)
                     fresh_job = await self._lock_initial_launch_authority(db, job.id)
                     if fresh_job is None:

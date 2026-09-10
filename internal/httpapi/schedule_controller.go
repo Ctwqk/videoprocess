@@ -73,7 +73,18 @@ func (c *httpScheduleController) Status(ctx context.Context) (store.VideoSchedul
 }
 
 func (c *httpScheduleController) SetState(ctx context.Context, state string) (store.VideoScheduleStatusRow, error) {
-	return c.request(ctx, http.MethodPost, strings.ToLower(state), "")
+	var action string
+	switch state {
+	case "OPEN":
+		action = "open"
+	case "DRAINING":
+		action = "drain"
+	case "CLOSED":
+		action = "close"
+	default:
+		return store.VideoScheduleStatusRow{}, errors.New("unsupported video schedule state")
+	}
+	return c.request(ctx, http.MethodPost, action, "")
 }
 
 func (c *httpScheduleController) OpenExpectedJob(
