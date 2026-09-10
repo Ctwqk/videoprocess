@@ -117,3 +117,24 @@ def test_storyboard_fit_uses_short_video_hook_and_clamps():
     assert durations[0] == 1.0
     assert all(0.5 <= duration <= 2.0 for duration in durations)
     assert storyboard.extra["platform_profile"]["platform_key"] == "douyin"
+
+
+@pytest.mark.parametrize("platform", ["youtube", "youtube_shorts", "generic"])
+@pytest.mark.parametrize("duration", [1, 2, 4, 8, 12, 30])
+def test_fitted_shot_bounds_contain_the_duration_budget(platform, duration):
+    storyboard = StoryboardGenerator().generate(AutoFlowStoryboardRequest(
+        prompt="Blue ceramic cup", target_platforms=[platform],
+        target_duration=duration, min_shots=3, max_shots=3,
+    )).storyboard
+
+    assert sum(shot.target_duration for shot in storyboard.shots) == pytest.approx(duration)
+    assert all(0 < shot.min_duration <= shot.target_duration <= shot.max_duration
+               for shot in storyboard.shots)
+
+
+@pytest.mark.parametrize("duration", [-1, 0.0001, float("nan"), float("inf")])
+def test_unrepresentable_fitted_durations_fail_before_building_a_pipeline(duration):
+    with pytest.raises(ValueError, match="duration"):
+        StoryboardGenerator().generate(AutoFlowStoryboardRequest(
+            prompt="Blue ceramic cup", target_platforms=["youtube"], target_duration=duration,
+        ))

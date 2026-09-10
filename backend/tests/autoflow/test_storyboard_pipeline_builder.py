@@ -31,6 +31,48 @@ def test_unlisted_storyboard_preserves_freeform_topic_without_relaxing_publicati
     assert uploads[0].data.config["privacy"] == "unlisted"
 
 
+def test_short_youtube_plan_does_not_expand_eight_seconds_to_nine():
+    from worker.handlers.smart_trim import ScoredWindow, SmartTrimConfig, _clip_segment
+
+    storyboard = StoryboardGenerator().generate(AutoFlowStoryboardRequest(
+        prompt="Blue ceramic cup", target_platforms=["youtube"],
+        target_duration=8, min_shots=3, max_shots=3,
+    )).storyboard
+    definition = PipelineBuilder().build_storyboard_input_video(
+        storyboard, input_asset_id="owned-cup", publish_mode="unlisted_upload",
+    )
+
+    assert validate_pipeline(definition).valid
+    trims = [node for node in definition.nodes if node.type == "smart_trim"]
+    assert [node.data.config["target_duration"] for node in trims] == [3.0, 2.297, 2.703]
+    windows = [_clip_segment(ScoredWindow(0, 8, .9), duration=8,
+                             config=SmartTrimConfig.from_node_config(node.data.config)) for node in trims]
+    assert sum(window.end - window.start for window in windows) == pytest.approx(8)
+    assert "platform_pacing_relaxed" in storyboard.warnings
+    assert all(node.data.config["match_threshold"] == .35 for node in trims)
+    assert all(node.data.config["no_match_policy"] == "fail" for node in trims)
+    uploads = [node for node in definition.nodes if node.type == "youtube_upload"]
+    assert len(uploads) == 1 and uploads[0].data.config["privacy"] == "unlisted"
+
+
+@pytest.mark.parametrize("prompt,duration,shot_count", [
+    ("Blue ceramic cup", 3.5, 3), ("A cat video", 4, 5), ("Blue ceramic cup", 1, 3),
+])
+def test_relaxed_short_budgets_stay_within_registered_trim_bounds(prompt, duration, shot_count):
+    storyboard = StoryboardGenerator().generate(AutoFlowStoryboardRequest(
+        prompt=prompt, target_platforms=["youtube"], target_duration=duration,
+        min_shots=shot_count, max_shots=shot_count,
+    )).storyboard
+    definition = PipelineBuilder().build_storyboard_input_video(
+        storyboard, input_asset_id="owned-cup", publish_mode="unlisted_upload",
+    )
+    validation = validate_pipeline(definition)
+    assert validation.valid, [error.message for error in validation.errors]
+    assert len(storyboard.shots) == shot_count
+    assert sum(shot.target_duration for shot in storyboard.shots) == pytest.approx(duration)
+    assert all(.3 <= shot.min_duration <= shot.target_duration for shot in storyboard.shots)
+
+
 @pytest.mark.parametrize("shot_count", [1, 3])
 @pytest.mark.parametrize(
     ("publish_mode", "no_match_policy", "privacy"),

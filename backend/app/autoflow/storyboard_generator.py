@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 
 from app.schemas.autoflow import (
@@ -12,6 +13,9 @@ from app.schemas.autoflow import (
     VisualStyleSpec,
 )
 from app.autoflow.platform_profiles import PlatformProfile, PlatformProfileService
+
+
+_MIN_TRIM_SECONDS = 0.3  # SmartTrim's registered min_clip_duration lower bound.
 
 
 class StoryboardGenerator:
@@ -234,7 +238,11 @@ def _fit_durations(
     if not shots:
         return [], []
     total = float(target_duration or len(shots) * 4)
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("target duration must be finite and positive")
     count = len(shots)
+    if total < count * _MIN_TRIM_SECONDS:
+        raise ValueError("target duration is too short for the supported clip minimum")
     min_total = profile.min_shot_seconds * count
     max_total = profile.max_shot_seconds * count
     relaxed = total < min_total or total > max_total
@@ -252,6 +260,8 @@ def _fit_durations(
 
     if relaxed:
         durations = _redistribute_relaxed(durations, total)
+        if any(duration < _MIN_TRIM_SECONDS for duration in durations):
+            durations = [total / count] * count
     else:
         durations = [_clamp_duration(duration, profile) for duration in durations]
         durations = _redistribute_to_total(durations, total, profile, protected_indices={0})
@@ -259,11 +269,13 @@ def _fit_durations(
     rounded = [round(duration, 3) for duration in durations]
     if rounded:
         rounded[-1] = round(total - sum(rounded[:-1]), 3)
+    if any(duration < _MIN_TRIM_SECONDS for duration in rounded):
+        raise ValueError("target duration is too short for the supported clip minimum")
     updated = [
         shot.model_copy(
             update={
                 "target_duration": rounded[index],
-                "min_duration": profile.min_shot_seconds,
+                "min_duration": min(profile.min_shot_seconds, rounded[index]),
                 "max_duration": max(profile.max_shot_seconds, rounded[index]),
             }
         )
