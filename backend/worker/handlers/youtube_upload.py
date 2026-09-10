@@ -287,6 +287,8 @@ class YouTubeUploadHandler(BaseHandler):
                 self._raise_if_cancelled()
                 if self._ack_drill is not None:
                     self._ack_drill.record_post_attempt(context, operation)
+                    self._raise_if_cancelled()
+                    self._ack_drill.remaining()
                 response = await self._await_request(
                     client.post(
                         f"{self._base_url}/api/upload",

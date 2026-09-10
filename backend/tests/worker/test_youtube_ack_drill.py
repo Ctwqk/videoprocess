@@ -294,6 +294,115 @@ async def test_video_verifier_rejects_ambiguous_or_unsafe_states(target, state_d
     assert not (state_dir / "consumed.json").exists()
 
 
+@pytest.mark.parametrize("extra", [
+    {}, {"processing_status": "succeeded"}, {"published_at": None},
+    {"published_at": "2026-09-10T07:00:00Z"},
+    {"processing_status": "succeeded", "published_at": "2026-09-10T07:00:00Z"},
+])
+@pytest.mark.asyncio
+async def test_video_verifier_preserves_deployed_canonical_fields(target, state_dir, extra):
+    helper = drill_api().OwnedUnlistedAckDrill(target, state_dir=state_dir)
+    prepare(helper, target, reserved(target))
+    requests = []
+
+    def route(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "video_id": "video", "privacy": "unlisted", "upload_status": "processed", **extra,
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        await helper.verify_video(client, "video", asyncio.Event())
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/api/videos/video/status"),
+    ]
+
+
+@pytest.mark.parametrize("extra", [
+    pytest.param('"current_privacy":"public"', id="conflicting-current-privacy"),
+    pytest.param('"privacy_status":"public"', id="conflicting-privacy-status"),
+    pytest.param('"privacyStatus":"public"', id="conflicting-camel-privacy"),
+    pytest.param('"current_privacy":"unlisted"', id="unsupported-agreeing-alias"),
+    pytest.param('"id":"other"', id="conflicting-id"),
+    pytest.param('"videoId":"other"', id="conflicting-video-id"),
+    pytest.param('"account_id":"other"', id="unsupported-account-identity"),
+    pytest.param('"platform_channel_id":"other"', id="unsupported-channel-identity"),
+    pytest.param('"uploadStatus":"failed"', id="conflicting-upload-state"),
+    pytest.param('"processingStatus":"failed"', id="conflicting-processing-state"),
+    pytest.param('"status":"failed"', id="conflicting-status"),
+    pytest.param('"privacy":"public"', id="duplicate-privacy"),
+    pytest.param('"privacy":"unlisted"', id="duplicate-agreeing-privacy"),
+    pytest.param('"video_id":"other"', id="duplicate-video-id"),
+    pytest.param('"upload_status":"failed"', id="duplicate-upload-state"),
+    pytest.param('"processing_status":"failed","processing_status":"succeeded"', id="duplicate-processing-state"),
+    pytest.param('"published_at":null,"published_at":"2026-09-10T07:00:00Z"', id="duplicate-published-at"),
+    pytest.param('"published_at":{"value":1,"value":2}', id="nested-duplicate-key"),
+    pytest.param('"published_at":NaN', id="nonfinite-nan"),
+    pytest.param('"published_at":Infinity', id="nonfinite-infinity"),
+    pytest.param('"published_at":-Infinity', id="nonfinite-negative-infinity"),
+    pytest.param('"published_at":1e999', id="nonfinite-overflow"),
+    pytest.param('"published_at":{"value":NaN}', id="nested-nonfinite"),
+    pytest.param('"unsupported_field":true', id="unsupported-field"),
+])
+@pytest.mark.parametrize("stage", ["first", "resume"])
+@pytest.mark.asyncio
+async def test_receipt_verifier_rejects_noncanonical_json_on_first_and_resume(
+    target, state_dir, extra, stage,
+):
+    api = drill_api()
+    helper = api.OwnedUnlistedAckDrill(target, state_dir=state_dir)
+    claim = reserved(target)
+    prepare(helper, target, claim)
+    operation = claim.operation
+    operation.request_attempted_at = datetime.now(timezone.utc)
+    helper.record_post_attempt(target.context, operation)
+    manager_task_id = str(uuid.uuid4())
+    operation.status, operation.manager_task_id = "submitted", manager_task_id
+    helper.record_submitted(target.context, operation, manager_task_id)
+    loads = []
+
+    async def load_submitted(context, *, operation_id, manager_task_id):
+        assert context == target.context and operation_id == operation.id
+        assert manager_task_id == operation.manager_task_id
+        loads.append(operation_id)
+        return UploadOperationClaim("resume", operation)
+
+    # Unit-only store boundary; real helper verification, journal and abort authentication.
+    store = SimpleNamespace(load_submitted=load_submitted)
+    canonical = '"video_id":"video","privacy":"unlisted","upload_status":"processed"'
+    invalid_body = "{" + extra + "," + canonical + "}"
+    requests = []
+
+    def route(request):
+        requests.append(request)
+        assert request.method == "GET" and request.url.path == "/api/videos/video/status"
+        body = "{" + canonical + "}" if stage == "resume" and len(requests) == 1 else invalid_body
+        return httpx.Response(200, content=body)
+
+    cancelled = asyncio.Event()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        if stage == "resume":
+            with pytest.raises(api.InjectedPreReceiptAbort) as aborted:
+                await helper.before_receipt(
+                    store, target.context, operation, manager_task_id, "video", client, cancelled,
+                )
+            helper.authenticate_abort(aborted.value, target.context, operation.id, manager_task_id)
+            operation = await helper.load_for_resume(store, target.context, cancelled)
+        with pytest.raises(RuntimeError) as rejected:
+            await helper.before_receipt(
+                store, target.context, operation, manager_task_id, "video", client, cancelled,
+            )
+        assert type(rejected.value) is RuntimeError  # The injected abort must not count as rejection.
+
+    assert len(requests) == (2 if stage == "resume" else 1)
+    assert len(loads) == (2 if stage == "resume" else 0)
+    events = [record["event"] for record in journal_records(state_dir)]
+    assert events[-1] == ("completed_get_2" if stage == "resume" else "completed_get_1")
+    assert events.count("token_consumed") == (1 if stage == "resume" else 0)
+    assert (state_dir / "consumed.json").exists() == (stage == "resume")
+    assert operation.receipt_json == {} and operation.platform_video_id is None
+
+
 def journal_records(state_dir):
     return [json.loads(path.read_text()) for path in sorted(state_dir.glob("[0-9]*.json"))]
 

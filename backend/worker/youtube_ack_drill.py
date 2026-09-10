@@ -38,6 +38,22 @@ def _encode(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("ascii")
 
 
+def _unique_video_status_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("ack drill video status contains duplicate JSON keys")
+        result[key] = value
+    return result
+
+
+def _finite_video_status_number(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("ack drill video status contains nonfinite JSON")
+    return number
+
+
 @dataclass(frozen=True)
 class AckDrillArmingIdentity:
     release_commit: str
@@ -362,10 +378,17 @@ class OwnedUnlistedAckDrill:
             if response.status_code != 200:
                 raise RuntimeError("ack drill video status HTTP failure")
             try:
-                payload = response.json()
+                payload = json.loads(
+                    response.content, object_pairs_hook=_unique_video_status_object,
+                    parse_constant=_finite_video_status_number, parse_float=_finite_video_status_number,
+                )
             except ValueError as exc:
                 raise RuntimeError("ack drill video status is malformed") from exc
-            if not isinstance(payload, dict) or payload.get("video_id") != video_id or payload.get("privacy") != "unlisted":
+            if (
+                not isinstance(payload, dict)
+                or set(payload) - {"video_id", "privacy", "upload_status", "processing_status", "published_at"}
+                or payload.get("video_id") != video_id or payload.get("privacy") != "unlisted"
+            ):
                 raise RuntimeError("ack drill requires exact processed unlisted video state")
             upload, processing = payload.get("upload_status"), payload.get("processing_status")
             if upload == "processed" and ("processing_status" not in payload or processing == "succeeded"):

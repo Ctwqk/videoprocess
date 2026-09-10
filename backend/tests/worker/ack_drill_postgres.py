@@ -1,4 +1,4 @@
-"""Task1b's explicit PG16 scratch fixture; never uses application DB settings."""
+"""Explicit PG16 scratch fixtures; never use application DB settings."""
 
 from __future__ import annotations
 
@@ -20,10 +20,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.models.artifact import Artifact
+from app.models.asset import Asset
 from app.models.channel_agent import ChannelProfile, ProductionTask
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.pipeline import Pipeline
 from app.services.job_execution_authority import claim_registered_worker_node
+from app.services.registered_worker_event_receipt import (
+    RegisteredWorkerEventReceiptService, stage_worker_task_dispatch,
+)
+from app.services.worker_registration import WorkerLease
 from app.services.worker_control_role_cli import ROLE_FUNCTIONS
 from app.services.worker_role_cli_common import (
     create_login_role, ensure_stable_role, grant_functions, reset_public_privileges,
@@ -157,7 +162,9 @@ def ack_drill_database():
 
 
 @pytest.fixture
-async def ack_drill_runtime(ack_drill_database, media_paths):
+async def ack_drill_runtime(ack_drill_database, media_paths, request):
+    # Existing handler cases retain their preclaimed, minimal fixture unchanged.
+    whole_worker = getattr(request, "param", None) == "whole_worker"
     database = ack_drill_database
     owner_engine = create_async_engine(database.owner_url, poolclass=NullPool)
     runtime_engine = create_async_engine(database.runtime_url, poolclass=NullPool)
@@ -174,7 +181,8 @@ async def ack_drill_runtime(ack_drill_database, media_paths):
         worker = f"publisher:{uuid.uuid4().hex}"
         instance = uuid.uuid4()
         token_hash = database.token_hash
-        lease_hash = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+        lease_secret = secrets.token_hex(32)
+        lease_hash = hashlib.sha256(lease_secret.encode()).hexdigest()
         bindings = {
             # Admission metadata forbids loopback; these fixture-only names are
             # never resolved. All actual connections use the guarded scratch URL.
@@ -184,6 +192,9 @@ async def ack_drill_runtime(ack_drill_database, media_paths):
             "storage": {"backend": "not_applicable"},
         }
         release, image = "da2b6a703335909ec521faab9f882ed53bc53d9f", "vp-python-worker:deploy-da2b6a703335"
+        if whole_worker:
+            release = "dc53c3768486a20aa1d2581b6b4b0bc1b050c739"
+            image = "vp-python-worker:deploy-dc53c3768486"
         if not await owner.fetchval("SELECT EXISTS(SELECT 1 FROM public.worker_admission_grants WHERE service_name=$1)", service):
             await operator.fetchval(
                 "SELECT public.vp_worker_grant_upsert($1,$2,$3,$4,$5::jsonb,$6,$7,$8,$9,$10,$11::jsonb,$12,$13)",
@@ -202,49 +213,107 @@ async def ack_drill_runtime(ack_drill_database, media_paths):
             fingerprints["database_fingerprint"], fingerprints["redis_fingerprint"],
             fingerprints["storage_fingerprint"], token_hash, lease_hash,
         )
+        asset = source = None
+        snapshot = {"nodes": [], "edges": []}
+        upload_config = {"title": "Owned canary", "privacy": "unlisted"}
         async with owner_sessions() as db:
-            pipeline = Pipeline(name="Task1b scratch", definition={"nodes": [], "edges": []})
+            if whole_worker:
+                input_path = Path(media_paths[0]["input"])
+                asset = Asset(
+                    filename="input.mp4", original_name="input.mp4", mime_type="video/mp4",
+                    storage_path=str(input_path), file_size=input_path.stat().st_size,
+                    media_info={"license": "owned", "provenance": "generated"},
+                )
+                db.add(asset)
+                await db.flush()
+                snapshot = {
+                    "nodes": [
+                        {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                         "data": {"config": {"asset_id": str(asset.id), "media_type": "video"}}},
+                        {"id": "publish", "type": "youtube_upload", "position": {"x": 200, "y": 0},
+                         "data": {"config": upload_config}},
+                    ],
+                    "edges": [{"id": "source-publish", "source": "source", "target": "publish",
+                               "sourceHandle": "output", "targetHandle": "input"}],
+                }
+            pipeline = Pipeline(name="Task1b scratch", definition=snapshot)
             channel = ChannelProfile(name=f"Task1b-{uuid.uuid4().hex}")
             db.add_all([pipeline, channel])
             await db.flush()
-            job = Job(pipeline_id=pipeline.id, pipeline_snapshot={"nodes": [], "edges": []}, status=JobStatus.RUNNING)
+            job = Job(pipeline_id=pipeline.id, pipeline_snapshot=snapshot, status=JobStatus.RUNNING)
             db.add(job)
             await db.flush()
             node = NodeExecution(job_id=job.id, node_id="publish", node_type="youtube_upload", status=NodeStatus.QUEUED)
+            if whole_worker:
+                node.node_config = upload_config
+                source = NodeExecution(
+                    job_id=job.id, node_id="source", node_type="source", status=NodeStatus.SUCCEEDED,
+                    node_config=snapshot["nodes"][0]["data"]["config"],
+                )
+                db.add(source)
             task = ProductionTask(
                 channel_profile_id=channel.id, target_account_id=uuid.uuid4(), prompt="Task1b owned scratch bytes",
                 job_id=job.id, pipeline_id=pipeline.id, state="producing",
             )
             db.add_all([node, task])
             await db.flush()
-            artifact = Artifact(job_id=job.id, node_execution_id=node.id, filename="input.mp4", storage_path="test/input.mp4")
+            artifact = Artifact(
+                job_id=job.id, node_execution_id=source.id if whole_worker else node.id,
+                filename="input.mp4", storage_path=str(input_path) if whole_worker else "test/input.mp4",
+            )
+            if whole_worker:
+                artifact.file_size = input_path.stat().st_size
+                artifact.media_info = dict(asset.media_info)
             db.add(artifact)
             await db.flush()
             node.input_artifact_ids = [artifact.id]
+            if whole_worker:
+                source.output_artifact_id = artifact.id
             await db.commit()
 
-        dispatch, message = uuid.uuid4(), f"1710000000000-{secrets.randbits(63)}"
-        payload = {"dispatch_key": str(dispatch), "job_id": str(job.id), "node_execution_id": str(node.id)}
-        payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        await owner.execute(
-            "INSERT INTO public.worker_task_dispatches (dispatch_key,job_id,node_execution_id,"
-            "redis_stream,consumer_group,payload_sha256,payload_json,delivery_state,redis_message_id,"
-            "delivery_attempted_at,delivered_at) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,'delivered',$8,"
-            "clock_timestamp(),clock_timestamp())",
-            dispatch, job.id, node.id, stream, group, payload_hash, json.dumps(payload), message,
-        )
-        async with runtime_sessions() as db:
-            claim, attestation = await claim_registered_worker_node(
-                db, registration_id=registration["registration_id"], lease_epoch=registration["lease_epoch"],
-                worker_id=worker, job_id=job.id, node_execution_id=node.id, redis_stream=stream,
-                consumer_group=group, message_id=message, payload_sha256=payload_hash, dispatch_key=dispatch,
+        claim = attestation = context = None
+        if whole_worker:
+            redis = request.getfixturevalue("worker_redis")
+            async with owner_sessions() as db:
+                staged = await stage_worker_task_dispatch(
+                    db, origin_receipt_id=None, job_id=job.id, node_execution_id=node.id,
+                    redis_stream=stream, consumer_group=group,
+                    payload={
+                        "job_id": str(job.id), "node_execution_id": str(node.id),
+                        "node_id": node.node_id, "node_type": node.node_type,
+                        "config": json.dumps({"title": "UNTRUSTED queue title", "privacy": "public"}),
+                        "input_artifacts": json.dumps({"input": str(artifact.id)}),
+                    },
+                )
+                await db.commit()
+            await RegisteredWorkerEventReceiptService(owner_sessions).deliver_pending_dispatches(redis)
+            dispatch, payload, payload_hash = staged.dispatch_key, staged.payload_json, staged.payload_sha256
+            message = await owner.fetchval(
+                "SELECT redis_message_id FROM public.worker_task_dispatches WHERE dispatch_key=$1", dispatch,
             )
-            await db.commit()
-        context = UploadOperationContext(
-            job_id=job.id, node_execution_id=node.id, execution_claim=claim, input_artifact_id=artifact.id,
-            content_sha256=hashlib.sha256(Path(media_paths[0]["input"]).read_bytes()).hexdigest(),
-            title="Owned canary", privacy="unlisted",
-        )
+        else:
+            dispatch, message = uuid.uuid4(), f"1710000000000-{secrets.randbits(63)}"
+            payload = {"dispatch_key": str(dispatch), "job_id": str(job.id), "node_execution_id": str(node.id)}
+            payload_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            await owner.execute(
+                "INSERT INTO public.worker_task_dispatches (dispatch_key,job_id,node_execution_id,"
+                "redis_stream,consumer_group,payload_sha256,payload_json,delivery_state,redis_message_id,"
+                "delivery_attempted_at,delivered_at) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,'delivered',$8,"
+                "clock_timestamp(),clock_timestamp())",
+                dispatch, job.id, node.id, stream, group, payload_hash, json.dumps(payload), message,
+            )
+            async with runtime_sessions() as db:
+                claim, attestation = await claim_registered_worker_node(
+                    db, registration_id=registration["registration_id"], lease_epoch=registration["lease_epoch"],
+                    worker_id=worker, job_id=job.id, node_execution_id=node.id, redis_stream=stream,
+                    consumer_group=group, message_id=message, payload_sha256=payload_hash, dispatch_key=dispatch,
+                )
+                await db.commit()
+            context = UploadOperationContext(
+                job_id=job.id, node_execution_id=node.id, execution_claim=claim, input_artifact_id=artifact.id,
+                content_sha256=hashlib.sha256(Path(media_paths[0]["input"]).read_bytes()).hexdigest(),
+                title="Owned canary", privacy="unlisted",
+            )
 
         async def refresh_worker_lease(*, minimum_margin_seconds):
             await runtime.fetchval("SELECT public.vp_worker_heartbeat($1,$2,$3,$4,$5)",
@@ -256,6 +325,16 @@ async def ack_drill_runtime(ack_drill_database, media_paths):
             context=context, task_id=task.id, sessions=runtime_sessions, owner_sessions=owner_sessions,
             owner=owner, runtime=runtime, role=database.role, refresh=refresh_worker_lease,
             dispatch_key=dispatch, attestation_id=attestation, message_id=message,
+            job_id=job.id, node_id=node.id, artifact_id=artifact.id,
+            asset_id=asset.id if asset is not None else None,
+            channel_id=channel.id, account_id=task.target_account_id, snapshot=snapshot,
+            payload=payload, payload_sha256=payload_hash, release=release,
+            lease=WorkerLease(
+                registration_id=registration["registration_id"], grant_id=registration["grant_id"],
+                service_name=service, worker_instance_id=instance, worker_slot=1,
+                redis_consumer_id=worker, lease_epoch=registration["lease_epoch"],
+                lease_secret=lease_secret, lease_expires_at=registration["lease_expires_at"],
+            ),
         )
     finally:
         if operator is not None:

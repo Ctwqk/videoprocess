@@ -23,11 +23,19 @@ from tests.worker.ack_drill_postgres import (
     ack_drill_database as _ack_drill_database,
     ack_drill_runtime as _ack_drill_runtime,
 )
-from tests.worker.test_youtube_ack_drill import drill_api, journal_records
+from tests.worker.test_youtube_ack_drill import (
+    drill_api,
+    journal_records,
+    reserved,
+    state_dir as _ack_drill_state_dir,
+    target as _ack_drill_target,
+)
 
 
 ack_drill_database = _ack_drill_database
 ack_drill_runtime = _ack_drill_runtime
+ack_drill_state_dir = _ack_drill_state_dir
+ack_drill_target = _ack_drill_target
 
 
 JOB_ID = uuid.UUID("00000000-0000-0000-0000-000000000101")
@@ -212,6 +220,88 @@ def make_handler(store: FakeOperationStore, client: httpx.AsyncClient, **overrid
     )
 
 
+@pytest.mark.parametrize("change", ["wall", "monotonic", "cancel", "control"])
+@pytest.mark.asyncio
+async def test_ack_drill_post_attempt_journal_boundary_blocks_late_post(
+    ack_drill_target, ack_drill_state_dir, media_paths, monkeypatch, change,
+):
+    api = drill_api()
+    target, state_dir = ack_drill_target, ack_drill_state_dir
+    helper = api.OwnedUnlistedAckDrill(target, state_dir=state_dir)
+    store = FakeOperationStore(["submit"])
+    store.operation = reserved(target).operation
+    claim = await store.claim(target.context)
+    helper.prepare(target.context, claim, manager_origin=target.manager_origin, timeout_seconds=5)
+    real_time = api.time
+    clock_offsets = {"wall": 0.0, "monotonic": 0.0}
+    monkeypatch.setattr(api, "time", SimpleNamespace(
+        time=lambda: real_time.time() + clock_offsets["wall"],
+        monotonic=lambda: real_time.monotonic() + clock_offsets["monotonic"],
+    ))
+    original_write = helper._write
+    counts = {"journal": 0, "construction": 0, "post": 0}
+
+    def journal(name, record):
+        original_write(name, record)
+        if record["event"] == "upload_post_attempt":
+            counts["journal"] += 1
+            if change == "wall":
+                clock_offsets["wall"] = target.expires_at.timestamp() - real_time.time() + 1
+            elif change == "monotonic":
+                clock_offsets["monotonic"] = helper._deadline - real_time.monotonic() + 1
+            elif change == "cancel":
+                handler.cancel()
+
+    monkeypatch.setattr(helper, "_write", journal)
+
+    def route(request):
+        assert request.method == "POST" and request.url.path == "/api/upload"
+        counts["post"] += 1
+        return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client, ack_drill=helper)
+        original_post = client.post
+
+        def construct_post(*args, **kwargs):
+            counts["construction"] += 1
+            return original_post(*args, **kwargs)
+
+        monkeypatch.setattr(client, "post", construct_post)
+        async with store.submission_fence(target.context):
+            operation = await store.mark_attempting(store.operation.id, context=target.context)
+            attempted_at = operation.request_attempted_at
+            failure, manager_task_id = None, None
+            try:
+                manager_task_id = await handler._submit_upload(
+                    operation, client, context=target.context, input_file=media_paths[0]["input"],
+                    title=target.context.title, description="", tags=[], privacy="unlisted",
+                )
+            except (RuntimeError, CancelledError) as exc:
+                failure = exc
+
+    expected_posts = 1 if change == "control" else 0
+    assert counts == {"journal": 1, "construction": expected_posts, "post": expected_posts}
+    assert store.attempting == [operation.id]
+    assert operation.request_attempted_at is attempted_at
+    assert not store.succeeded and not store.failed
+    assert operation.receipt_json == {} and operation.platform_video_id is None
+    assert not Path(media_paths[1]).exists()
+    assert [record["event"] for record in journal_records(state_dir)] == ["start", "upload_post_attempt"]
+    if change == "control":
+        assert failure is None and manager_task_id == MANAGER_TASK_ID
+        assert operation.status == "submitted" and not store.uncertain
+        assert store.submitted == [(operation.id, MANAGER_TASK_ID)]
+    else:
+        assert isinstance(failure, RuntimeError) and manager_task_id is None
+        assert isinstance(failure.__cause__, CancelledError if change == "cancel" else RuntimeError)
+        assert operation.status == "uncertain" and len(store.uncertain) == 1
+        assert not store.submitted and operation.manager_task_id is None
+    with pytest.raises(RuntimeError):
+        helper.record_post_attempt(target.context, operation)
+    assert counts["journal"] == 1
+
+
 @pytest.fixture
 async def durable_drill(ack_drill_runtime, tmp_path):
     from app.services import youtube_upload_operations as operations
@@ -336,7 +426,6 @@ async def test_ack_drill_discards_first_completion_and_commits_only_fresh_get(
         return httpx.Response(200, json={
             "video_id": "video-123", "privacy": "unlisted",
             "upload_status": "processed", "processing_status": "succeeded",
-            "secret": "must-not-enter-journal",
         })
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
