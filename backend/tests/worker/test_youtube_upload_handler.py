@@ -5,17 +5,29 @@ import contextlib
 import hashlib
 import stat
 import uuid
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 from app.services.job_execution_authority import JobExecutionAuthorityBlocked
 from app.services.youtube_upload_operations import UploadOperationClaim
 from worker.handlers import youtube_upload as youtube_upload_module
 from worker.handlers.base import CancelledError
 from worker.handlers.youtube_upload import YouTubeUploadHandler
+from tests.worker.ack_drill_postgres import (
+    ack_drill_database as _ack_drill_database,
+    ack_drill_runtime as _ack_drill_runtime,
+)
+from tests.worker.test_youtube_ack_drill import drill_api, journal_records
+
+
+ack_drill_database = _ack_drill_database
+ack_drill_runtime = _ack_drill_runtime
 
 
 JOB_ID = uuid.UUID("00000000-0000-0000-0000-000000000101")
@@ -198,6 +210,668 @@ def make_handler(store: FakeOperationStore, client: httpx.AsyncClient, **overrid
         poll_interval_seconds=0,
         **overrides,
     )
+
+
+@pytest.fixture
+async def durable_drill(ack_drill_runtime, tmp_path):
+    from app.services import youtube_upload_operations as operations
+
+    runtime = ack_drill_runtime
+    context = runtime.context
+    api = drill_api()
+    target = api.AckDrillTarget(
+        context=context, production_task_id=runtime.task_id, drill_id=uuid.uuid4(),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        owned_attestation_sha256="b" * 64, manager_origin="http://youtube-manager",
+    )
+    state_dir = tmp_path / "ack-drill"
+    state_dir.mkdir(mode=0o700)
+    return SimpleNamespace(
+        store=operations.YouTubeUploadOperationStore(runtime.sessions), runtime=runtime,
+        target=target, state_dir=state_dir,
+        helper=api.OwnedUnlistedAckDrill(target, state_dir=state_dir),
+        config=upload_config(
+            title=context.title, _job_id=str(context.job_id),
+            _node_execution_id=str(context.node_execution_id),
+            _input_artifact_ids={"input": str(context.input_artifact_id)},
+            _execution_claim={
+                "worker_id": context.execution_claim.worker_id,
+                "started_at": context.execution_claim.started_at.isoformat(),
+                "worker_registration_id": str(context.execution_claim.worker_registration_id),
+                "worker_lease_epoch": context.execution_claim.worker_lease_epoch,
+            },
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_ack_drill_fresh_reader_uses_canonical_runtime_permissions(ack_drill_runtime):
+    from app.services.youtube_upload_operations import YouTubeUploadOperationStore
+
+    runtime = ack_drill_runtime
+    context = runtime.context
+    store = YouTubeUploadOperationStore(runtime.sessions)
+    assert not await runtime.owner.fetchval(
+        "SELECT has_table_privilege($1,'public.production_tasks','SELECT')",
+        runtime.role,
+    )
+    reserved = await store.claim(context)
+    await runtime.refresh(minimum_margin_seconds=150)
+    async with store.submission_fence(context):
+        attempted = await store.mark_attempting(reserved.operation.id, context=context)
+        assert attempted.request_attempted_at is not None
+        await store.mark_submitted(attempted.id, MANAGER_TASK_ID, context=context)
+    # This is deliberately not an owner session or a widened test-role grant.
+    loaded = await store.load_submitted(
+        context, operation_id=reserved.operation.id, manager_task_id=MANAGER_TASK_ID,
+    )
+    assert loaded.operation.id == reserved.operation.id and loaded.action == "resume"
+
+
+@pytest.mark.asyncio
+async def test_ack_drill_discards_first_completion_and_commits_only_fresh_get(
+    durable_drill, media_paths, monkeypatch,
+):
+    from app.models.youtube_upload_operation import YouTubeUploadOperation
+
+    drill = durable_drill
+    store = drill.store
+    requests, observations, writes, claims = [], [], [], []
+    original_load, original_succeed, original_claim = store.load_submitted, store.mark_succeeded, store.claim
+    abort_observed = asyncio.Event()
+    release_resume = asyncio.Event()
+
+    async def claim(context):
+        claims.append(context)
+        return await original_claim(context)
+
+    async def observe(context, **kwargs):
+        loaded = await original_load(context, **kwargs)
+        assert store._active_submission_fence.get() is None
+        async with drill.runtime.owner_sessions() as db:
+            row = await db.get(YouTubeUploadOperation, loaded.operation.id)
+            assert row.status == "submitted"
+            assert row.request_attempted_at is not None
+            assert row.receipt_json == {}
+            assert row.platform_video_id is None and row.completed_at is None
+            assert row.manager_task_id == MANAGER_TASK_ID
+        assert not writes and not Path(media_paths[1]).exists()
+        observations.append(loaded.operation)
+        if len(observations) == 2:
+            assert (drill.state_dir / "consumed.json").exists()
+            assert journal_records(drill.state_dir)[-1]["event"] == "pre_receipt_abort"
+            abort_observed.set()
+            await release_resume.wait()
+        return loaded
+
+    async def succeed(*args, **kwargs):
+        assert len(observations) == 2
+        writes.append(args)
+        return await original_succeed(*args, **kwargs)
+
+    monkeypatch.setattr(store, "claim", claim)
+    monkeypatch.setattr(store, "load_submitted", observe)
+    monkeypatch.setattr(store, "mark_succeeded", succeed)
+    statuses = 0
+
+    def route(request):
+        nonlocal statuses
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST":
+            assert store._active_submission_fence.get() is not None
+            assert journal_records(drill.state_dir)[-1]["event"] == "upload_post_attempt"
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+        if request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            statuses += 1
+            if statuses == 1:
+                assert journal_records(drill.state_dir)[-1]["event"] == "submitted_committed"
+            return httpx.Response(200, json={"status": "completed", "result": {
+                "video_id": "video-123", "url": "https://www.youtube.com/watch?v=video-123",
+                "title": "First discarded" if statuses == 1 else "Fresh receipt",
+                "secret": "must-not-enter-journal", "signed_url": "https://secret.invalid/?token=secret",
+            }})
+        assert request.url.path == "/api/videos/video-123/status"
+        return httpx.Response(200, json={
+            "video_id": "video-123", "privacy": "unlisted",
+            "upload_status": "processed", "processing_status": "succeeded",
+            "secret": "must-not-enter-journal",
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(store, client, ack_drill=drill.helper, lease_refresher=drill.runtime.refresh)
+        running = asyncio.create_task(handler.execute(drill.config, *media_paths))
+        boundary = asyncio.create_task(abort_observed.wait())
+        try:
+            done, _ = await asyncio.wait((running, boundary), timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            if running in done:
+                await running
+            assert boundary in done, "handler never reached the pre-receipt boundary"
+            assert not running.done()
+            assert not writes and not Path(media_paths[1]).exists()
+            release_resume.set()
+            result = await running
+        finally:
+            if not running.done():
+                running.cancel()
+            boundary.cancel()
+            await asyncio.gather(running, boundary, return_exceptions=True)
+
+    assert len(claims) == 1 and len(writes) == 1
+    assert observations[0] is not observations[1]
+    assert observations[0].id == observations[1].id == writes[0][0]
+    assert result["youtube"]["title"] == "Fresh receipt"
+    assert Path(media_paths[1]).read_bytes() == Path(media_paths[0]["input"]).read_bytes()
+    assert requests == [
+        ("GET", "/api/auth/status"), ("POST", "/api/upload"),
+        ("GET", f"/api/status/{MANAGER_TASK_ID}"), ("GET", "/api/videos/video-123/status"),
+        ("GET", f"/api/status/{MANAGER_TASK_ID}"), ("GET", "/api/videos/video-123/status"),
+    ]
+    records = journal_records(drill.state_dir)
+    assert [record["event"] for record in records] == [
+        "start", "upload_post_attempt", "submitted_committed", "completed_get_1",
+        "processed_unlisted_get_1", "fresh_submitted_empty_receipt", "token_consumed",
+        "pre_receipt_abort", "fresh_submitted_resume", "completed_get_2",
+        "processed_unlisted_get_2", "mark_succeeded_commit",
+    ]
+    assert [record["sequence"] for record in records] == list(range(1, 13))
+    journal = "".join(path.read_text() for path in drill.state_dir.iterdir())
+    assert "secret" not in journal and "signed_url" not in journal
+    assert records[-1]["receipt_sha256"] == hashlib.sha256(
+        __import__("json").dumps(result["youtube"], sort_keys=True, separators=(",", ":"), allow_nan=False).encode(),
+    ).hexdigest()
+
+
+@pytest.mark.parametrize("failure", [
+    "missing-video", "bad-url", "public", "private", "wrong-video", "malformed",
+    "not-processed", "changed-second-video", "second-public", "cancel-first-get",
+    "cancel-resume", "authority-loss", "storage", "snapshot", "forged", "ordinary-write",
+    "copied-sentinel", "wrong-nonce", "wrong-operation", "wrong-manager", "wrong-context",
+    "wrong-sentinel-video", "missing-token", "partial-token", "duplicate-consumer", "reconstructed",
+    "token-fsync", "abort-fsync", "expired-lease", "processing-cancel", "processing-timeout",
+])
+@pytest.mark.asyncio
+async def test_ack_drill_failure_never_posts_twice_or_manufactures_receipt(
+    durable_drill, media_paths, monkeypatch, failure,
+):
+    from app.models.job import Job, JobStatus
+    from app.models.youtube_upload_operation import YouTubeUploadOperation
+
+    drill = durable_drill
+    counts = {"post": 0, "status": 0, "video": 0, "write": 0}
+    original_load = drill.store.load_submitted
+    original_succeed = drill.store.mark_succeeded
+    original_boundary = drill.helper.before_receipt
+    reads = 0
+
+    async def load(context, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            if failure == "cancel-resume":
+                handler.cancel()
+            if failure == "authority-loss":
+                async with drill.runtime.owner_sessions() as db:
+                    job = await db.get(Job, context.job_id)
+                    job.status = JobStatus.CANCELLED
+                    await db.commit()
+            if failure == "expired-lease":
+                await drill.runtime.owner.execute(
+                    "UPDATE public.worker_registrations SET lease_expires_at=clock_timestamp() WHERE id=$1",
+                    context.execution_claim.worker_registration_id,
+                )
+        if failure == "storage":
+            raise OSError("storage unavailable: secret")
+        return await original_load(context, **kwargs)
+
+    async def succeed(*args, **kwargs):
+        counts["write"] += 1
+        return await original_succeed(*args, **kwargs)
+
+    async def boundary(*args, **kwargs):
+        api = drill_api()
+        try:
+            await original_boundary(*args, **kwargs)
+        except api.InjectedPreReceiptAbort as abort:
+            if failure in {"forged", "copied-sentinel"}:
+                forged = api.InjectedPreReceiptAbort()
+                if failure == "copied-sentinel":
+                    forged.__dict__.update(abort.__dict__)
+                raise forged from None
+            changes = {"wrong-nonce": (1, "wrong"), "wrong-context": (2, replace(drill.target.context, title="other")),
+                       "wrong-operation": (3, uuid.uuid4()), "wrong-manager": (4, str(uuid.uuid4())),
+                       "wrong-sentinel-video": (5, "other")}
+            if failure in changes:
+                identity = list(abort._identity)
+                index, value = changes[failure]
+                identity[index] = value
+                abort._identity = tuple(identity)
+            if failure == "missing-token":
+                (drill.state_dir / "consumed.json").unlink()
+            if failure == "partial-token":
+                (drill.state_dir / "consumed.json").write_text("{")
+            if failure == "duplicate-consumer":
+                drill.helper.authenticate_abort(abort, drill.target.context, args[2].id, MANAGER_TASK_ID)
+            if failure == "reconstructed":
+                handler._ack_drill = api.OwnedUnlistedAckDrill(drill.target, state_dir=drill.state_dir)
+            raise
+
+    monkeypatch.setattr(drill.store, "load_submitted", load)
+    monkeypatch.setattr(drill.store, "mark_succeeded", succeed)
+    monkeypatch.setattr(drill.helper, "before_receipt", boundary)
+    if failure == "ordinary-write":
+        from sqlalchemy import event
+
+        def fail_completion_sql(conn, cursor, statement, parameters, context, executemany):
+            if "vp_transition_worker_youtube_upload" in statement and "succeeded" in parameters:
+                raise OSError("test connection failure at ordinary success transition")
+
+        event.listen(drill.runtime.sessions.kw["bind"].sync_engine, "before_cursor_execute", fail_completion_sql)
+    if failure in {"token-fsync", "abort-fsync"}:
+        original_write = drill.helper._write
+
+        def write_with_disk_failure(name, record):
+            if (failure == "token-fsync" and name == "consumed.json") or (
+                failure == "abort-fsync" and record.get("event") == "pre_receipt_abort"
+            ):
+                def fail_fsync(fd):
+                    raise OSError("test journal durability failure")
+                with monkeypatch.context() as patcher:
+                    patcher.setattr(drill_api().os, "fsync", fail_fsync)
+                    return original_write(name, record)
+            return original_write(name, record)
+
+        monkeypatch.setattr(drill.helper, "_write", write_with_disk_failure)
+    if failure == "snapshot":
+        original_hash = YouTubeUploadHandler._content_sha256
+        hashes = 0
+
+        def changed_hash(path):
+            nonlocal hashes
+            hashes += 1
+            return original_hash(path) if hashes == 1 else "c" * 64
+
+        monkeypatch.setattr(YouTubeUploadHandler, "_content_sha256", staticmethod(changed_hash))
+
+    async def route(request):
+        if request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST":
+            counts["post"] += 1
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+        if request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            counts["status"] += 1
+            video = "other" if failure == "changed-second-video" and counts["status"] == 2 else "video-123"
+            result = {"video_id": video, "url": f"https://www.youtube.com/watch?v={video}"}
+            if failure == "missing-video":
+                del result["video_id"]
+            if failure == "bad-url":
+                result["url"] = "https://untrusted.invalid/"
+            return httpx.Response(200, json={"status": "completed", "result": result})
+        counts["video"] += 1
+        if failure == "cancel-first-get":
+            handler.cancel()
+            await asyncio.sleep(10)
+        payload = {"video_id": "video-123", "privacy": "unlisted", "upload_status": "processed"}
+        if failure in {"public", "private"}:
+            payload["privacy"] = failure
+        if failure == "second-public" and counts["video"] == 2:
+            payload["privacy"] = "public"
+        if failure == "wrong-video":
+            payload["video_id"] = "other"
+        if failure == "not-processed":
+            payload["upload_status"] = "uploaded"
+        if failure in {"processing-cancel", "processing-timeout"}:
+            payload.update(upload_status="uploaded", processing_status="processing")
+            if failure == "processing-cancel":
+                asyncio.get_running_loop().call_soon(handler.cancel)
+            else:
+                # Shorten only the test's post-submission verification budget.
+                drill.helper._deadline = min(drill.helper._deadline, __import__("time").monotonic() + 0.15)
+        return httpx.Response(200, json=[] if failure == "malformed" else payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(drill.store, client, ack_drill=drill.helper,
+                               lease_refresher=drill.runtime.refresh, timeout_seconds=10)
+        with pytest.raises((RuntimeError, ValueError, OSError, CancelledError, asyncio.CancelledError)):
+            await handler.execute(drill.config, *media_paths)
+    second_completion = failure in {"changed-second-video", "second-public", "ordinary-write"}
+    assert counts["post"] == 1 and counts["status"] == (2 if second_completion else 1)
+    expected_reads = 1
+    if failure in {"missing-video", "bad-url", "public", "private", "wrong-video", "malformed",
+                   "not-processed", "cancel-first-get", "processing-cancel", "processing-timeout"}:
+        expected_reads = 0
+    elif second_completion or failure in {"cancel-resume", "authority-loss", "expired-lease"}:
+        expected_reads = 2
+    assert reads == expected_reads
+    if failure in {"missing-video", "bad-url"}:
+        assert counts["video"] == 0
+    elif failure == "processing-timeout":
+        assert counts["video"] >= 2
+    else:
+        assert counts["video"] == (2 if failure in {"second-public", "ordinary-write"} else 1)
+    assert counts["write"] == (1 if failure == "ordinary-write" else 0)
+    assert not Path(media_paths[1]).exists()
+    async with drill.runtime.owner_sessions() as db:
+        operation = (await db.execute(select(YouTubeUploadOperation).where(
+            YouTubeUploadOperation.node_execution_id == drill.target.context.node_execution_id,
+        ))).scalar_one()
+        assert operation.status != "succeeded"
+        assert operation.receipt_json == {} and operation.platform_video_id is None
+        if failure == "ordinary-write":
+            assert operation.status == "uncertain"
+    assert "mark_succeeded_commit" not in [r["event"] for r in journal_records(drill.state_dir)]
+
+
+@pytest.mark.parametrize("waiting_on", ["first-status", "second-status", "second-video"])
+@pytest.mark.asyncio
+async def test_ack_drill_cancels_pending_fresh_get_without_waiting_for_response(
+    durable_drill, media_paths, waiting_on,
+):
+    from app.models.youtube_upload_operation import YouTubeUploadOperation
+
+    drill = durable_drill
+    reached = asyncio.Event()
+    counts = {"post": 0, "status": 0, "video": 0}
+
+    async def route(request):
+        if request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST":
+            counts["post"] += 1
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+        if request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            counts["status"] += 1
+            current = "first-status" if counts["status"] == 1 else "second-status"
+            payload = {"status": "completed", "result": {
+                "video_id": "video-123", "url": "https://www.youtube.com/watch?v=video-123",
+            }}
+        else:
+            assert request.url.path == "/api/videos/video-123/status"
+            counts["video"] += 1
+            current = "first-video" if counts["video"] == 1 else "second-video"
+            payload = {"video_id": "video-123", "privacy": "unlisted", "upload_status": "processed"}
+        if current == waiting_on:
+            reached.set()
+            await asyncio.Event().wait()
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(drill.store, client, ack_drill=drill.helper,
+                               lease_refresher=drill.runtime.refresh, timeout_seconds=10)
+        running = asyncio.create_task(handler.execute(drill.config, *media_paths))
+        try:
+            await asyncio.wait_for(reached.wait(), timeout=3)
+            handler.cancel()
+            done, _ = await asyncio.wait((running,), timeout=1)
+            assert running in done, "armed cancellation waited for the remote response"
+            with pytest.raises((CancelledError, RuntimeError)):
+                await running
+        finally:
+            if not running.done():
+                running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+    assert counts["post"] == 1
+    assert counts["status"] == (1 if waiting_on == "first-status" else 2)
+    assert not Path(media_paths[1]).exists()
+    async with drill.runtime.owner_sessions() as db:
+        operation = (await db.execute(select(YouTubeUploadOperation).where(
+            YouTubeUploadOperation.node_execution_id == drill.target.context.node_execution_id,
+        ))).scalar_one()
+        assert operation.status == "uncertain" and operation.receipt_json == {}
+    assert "mark_succeeded_commit" not in [r["event"] for r in journal_records(drill.state_dir)]
+
+
+@pytest.mark.parametrize("changed", ["job", "lease", "node", "channel", "schedule"])
+@pytest.mark.asyncio
+async def test_ack_drill_final_write_rechecks_actual_authority(durable_drill, media_paths, monkeypatch, changed):
+    from sqlalchemy.exc import DBAPIError
+
+    from app.models.youtube_upload_operation import YouTubeUploadOperation
+
+    drill = durable_drill
+    context = drill.target.context
+    counts = {"post": 0, "status": 0, "video": 0, "read": 0, "write": 0}
+    original_load, original_write = drill.store.load_submitted, drill.store.mark_succeeded
+
+    async def load(*args, **kwargs):
+        result = await original_load(*args, **kwargs)
+        counts["read"] += 1
+        return result
+
+    async def write(*args, **kwargs):
+        counts["write"] += 1
+        return await original_write(*args, **kwargs)
+
+    monkeypatch.setattr(drill.store, "load_submitted", load)
+    monkeypatch.setattr(drill.store, "mark_succeeded", write)
+
+    async def route(request):
+        if request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST":
+            counts["post"] += 1
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+        if request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            counts["status"] += 1
+            return httpx.Response(200, json={"status": "completed", "result": {
+                "video_id": "video-123", "url": "https://www.youtube.com/watch?v=video-123",
+            }})
+        assert request.url.path == "/api/videos/video-123/status"
+        counts["video"] += 1
+        if counts["video"] == 2:
+            assert counts["read"] == 2 and counts["write"] == 0
+            if changed == "job":
+                await drill.runtime.owner.execute("UPDATE public.jobs SET status='CANCELLED' WHERE id=$1", context.job_id)
+            elif changed == "lease":
+                await drill.runtime.owner.execute(
+                    "UPDATE public.worker_registrations SET lease_expires_at=clock_timestamp() WHERE id=$1",
+                    context.execution_claim.worker_registration_id,
+                )
+            elif changed == "node":
+                await drill.runtime.owner.execute(
+                    "UPDATE public.node_executions SET worker_id='other-worker' WHERE id=$1", context.node_execution_id,
+                )
+            elif changed == "channel":
+                await drill.runtime.owner.execute(
+                    "UPDATE public.channel_profiles SET halted_at=clock_timestamp(),halt_reason='test hold' "
+                    "WHERE id=(SELECT channel_profile_id FROM public.production_tasks WHERE id=$1)",
+                    drill.target.production_task_id,
+                )
+            else:
+                await drill.runtime.owner.execute("UPDATE public.runtime_schedules SET state='CLOSED' WHERE service_name='videoprocess'")
+        return httpx.Response(200, json={"video_id": "video-123", "privacy": "unlisted", "upload_status": "processed"})
+
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+            handler = make_handler(drill.store, client, ack_drill=drill.helper, lease_refresher=drill.runtime.refresh)
+            expected_error = {
+                "job": "job_authority_changed", "lease": "lease_fenced", "node": "node_claim_mismatch",
+                "channel": "channel_authority_changed", "schedule": "schedule_authority_changed",
+            }[changed]
+            # Existing terminal transitions surface the actual SQL authority error.
+            with pytest.raises(DBAPIError, match=expected_error):
+                await handler.execute(drill.config, *media_paths)
+    finally:
+        if changed == "schedule":
+            await drill.runtime.owner.execute("UPDATE public.runtime_schedules SET state='OPEN' WHERE service_name='videoprocess'")
+    assert counts == {"post": 1, "status": 2, "video": 2, "read": 2, "write": 1}
+    async with drill.runtime.owner_sessions() as db:
+        operation = (await db.execute(select(YouTubeUploadOperation).where(
+            YouTubeUploadOperation.node_execution_id == context.node_execution_id,
+        ))).scalar_one()
+        assert operation.status == "submitted" and operation.receipt_json == {}
+        assert operation.platform_video_id is None and operation.completed_at is None
+    assert not Path(media_paths[1]).exists()
+    assert "mark_succeeded_commit" not in [r["event"] for r in journal_records(drill.state_dir)]
+
+
+@pytest.mark.asyncio
+async def test_ack_drill_final_journal_failure_preserves_receipt_but_never_reports_or_reuploads(
+    durable_drill, media_paths, monkeypatch,
+):
+    from app.models.youtube_upload_operation import YouTubeUploadOperation
+
+    drill = durable_drill
+    requests = []
+    original_write = drill.helper._write
+
+    def fail_final_record(name, record):
+        if record.get("event") == "mark_succeeded_commit":
+            raise OSError("test journal storage unavailable after receipt commit")
+        return original_write(name, record)
+
+    monkeypatch.setattr(drill.helper, "_write", fail_final_record)
+
+    def route(request):
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST":
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+        if request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            return httpx.Response(200, json={"status": "completed", "result": {
+                "video_id": "video-audit-failure", "url": "https://www.youtube.com/watch?v=video-audit-failure",
+            }})
+        assert request.url.path == "/api/videos/video-audit-failure/status"
+        return httpx.Response(200, json={"video_id": "video-audit-failure", "privacy": "unlisted", "upload_status": "processed"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(drill.store, client, ack_drill=drill.helper, lease_refresher=drill.runtime.refresh)
+        with pytest.raises(OSError, match="journal storage unavailable"):
+            await handler.execute(drill.config, *media_paths)
+        assert len(requests) == 6
+        reconstructed = drill_api().OwnedUnlistedAckDrill(drill.target, state_dir=drill.state_dir)
+        retry = make_handler(drill.store, client, ack_drill=reconstructed, lease_refresher=drill.runtime.refresh)
+        with pytest.raises(RuntimeError, match="fresh unlisted submission"):
+            await retry.execute(drill.config, *media_paths)
+        assert len(requests) == 6
+    async with drill.runtime.owner_sessions() as db:
+        operation = (await db.execute(select(YouTubeUploadOperation).where(
+            YouTubeUploadOperation.node_execution_id == drill.target.context.node_execution_id,
+        ))).scalar_one()
+        assert operation.status == "succeeded"
+        assert operation.receipt_json["video_id"] == "video-audit-failure"
+    assert not Path(media_paths[1]).exists()
+    assert "mark_succeeded_commit" not in [r["event"] for r in journal_records(drill.state_dir)]
+
+
+@pytest.mark.parametrize("boundary,change", [
+    ("journal-fsync", "wall"), ("journal-fsync", "monotonic"), ("journal-fsync", "cancel"),
+    ("helper-return", "wall"), ("helper-return", "monotonic"),
+])
+@pytest.mark.asyncio
+async def test_ack_drill_rechecks_expiry_after_second_processed_journal_before_success(
+    durable_drill, media_paths, monkeypatch, boundary, change,
+):
+    from app.models.youtube_upload_operation import YouTubeUploadOperation
+
+    drill = durable_drill
+    api = drill_api()
+    real_time = api.time
+    clock_offsets = {"wall": 0.0, "monotonic": 0.0}
+    monkeypatch.setattr(api, "time", SimpleNamespace(
+        time=lambda: real_time.time() + clock_offsets["wall"],
+        monotonic=lambda: real_time.monotonic() + clock_offsets["monotonic"],
+    ))
+    original_journal, original_boundary = drill.helper._write, drill.helper.before_receipt
+    original_success = drill.store.mark_succeeded
+    video_id = f"expiry-{boundary}-{change}"
+    counts = {"post": 0, "status": 0, "video": 0, "success": 0, "crossed": 0}
+
+    def cross_boundary():
+        counts["crossed"] += 1
+        if change == "cancel":
+            handler.cancel()
+        elif change == "wall":
+            clock_offsets["wall"] = drill.target.expires_at.timestamp() - real_time.time() + 1
+        else:
+            clock_offsets["monotonic"] = drill.helper._deadline - real_time.monotonic() + 1
+
+    def journal(name, record):
+        if boundary != "journal-fsync" or record.get("event") != "processed_unlisted_get_2":
+            return original_journal(name, record)
+        original_fsync = api.os.fsync
+
+        def slow_directory_fsync(fd):
+            original_fsync(fd)
+            if stat.S_ISDIR(api.os.fstat(fd).st_mode):
+                # Model time spent in successful real journal I/O, not DB authority.
+                cross_boundary()
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(api.os, "fsync", slow_directory_fsync)
+            return original_journal(name, record)
+
+    async def before_receipt(*args, **kwargs):
+        await original_boundary(*args, **kwargs)
+        if boundary == "helper-return":
+            cross_boundary()
+
+    async def success(*args, **kwargs):
+        counts["success"] += 1
+        return await original_success(*args, **kwargs)
+
+    monkeypatch.setattr(drill.helper, "_write", journal)
+    monkeypatch.setattr(drill.helper, "before_receipt", before_receipt)
+    monkeypatch.setattr(drill.store, "mark_succeeded", success)
+
+    def route(request):
+        if request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST":
+            counts["post"] += 1
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+        if request.url.path == f"/api/status/{MANAGER_TASK_ID}":
+            counts["status"] += 1
+            return httpx.Response(200, json={"status": "completed", "result": {
+                "video_id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}",
+            }})
+        assert request.url.path == f"/api/videos/{video_id}/status"
+        counts["video"] += 1
+        return httpx.Response(200, json={"video_id": video_id, "privacy": "unlisted", "upload_status": "processed"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        handler = make_handler(drill.store, client, ack_drill=drill.helper, lease_refresher=drill.runtime.refresh)
+        expected_error = CancelledError if change == "cancel" else RuntimeError
+        with pytest.raises(expected_error, match="cancelled" if change == "cancel" else "deadline expired"):
+            await handler.execute(drill.config, *media_paths)
+    assert counts == {"post": 1, "status": 2, "video": 2, "success": 0, "crossed": 1}
+    async with drill.runtime.owner_sessions() as db:
+        operation = (await db.execute(select(YouTubeUploadOperation).where(
+            YouTubeUploadOperation.node_execution_id == drill.target.context.node_execution_id,
+        ))).scalar_one()
+        assert operation.status in ({"submitted", "uncertain"} if change == "cancel" else {"submitted"})
+        assert operation.receipt_json == {} and operation.platform_video_id is None and operation.completed_at is None
+    assert not Path(media_paths[1]).exists()
+    assert (drill.state_dir / "consumed.json").exists()
+    records = journal_records(drill.state_dir)
+    assert records[-1]["event"] == "processed_unlisted_get_2"
+    assert "mark_succeeded_commit" not in [record["event"] for record in records]
+
+
+@pytest.mark.asyncio
+async def test_node_config_cannot_enable_ack_drill(media_paths):
+    store = FakeOperationStore(["submit"])
+    routes = []
+
+    def route(request):
+        routes.append(request.url.path)
+        if request.url.path == "/api/auth/status":
+            return httpx.Response(200, json=auth_payload())
+        if request.method == "POST":
+            return httpx.Response(200, json={"task_id": MANAGER_TASK_ID})
+        return httpx.Response(200, json={"status": "completed", "result": {
+            "video_id": "video-123", "url": "https://www.youtube.com/watch?v=video-123",
+        }})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        await make_handler(store, client).execute(upload_config(
+            ack_drill={"enabled": True}, _ack_drill={"enabled": True},
+            VP_YOUTUBE_ACK_DRILL_ENABLED=True,
+        ), *media_paths)
+    assert routes == ["/api/auth/status", "/api/upload", f"/api/status/{MANAGER_TASK_ID}"]
 
 
 @pytest.mark.asyncio

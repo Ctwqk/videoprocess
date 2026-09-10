@@ -93,6 +93,7 @@ WORKER_FUNCTIONS = (
     "vp_require_worker_redis_continuity(integer)",
 )
 WORKER_SELECT_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "production_tasks": ("id", "job_id"),
     "jobs": (
         "id",
         "pipeline_id",

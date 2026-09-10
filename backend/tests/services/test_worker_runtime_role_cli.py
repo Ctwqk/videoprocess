@@ -5,10 +5,51 @@ import os
 import stat
 from pathlib import Path
 
+import asyncpg
 import pytest
 
 from app.services import worker_runtime_role_cli as runtime_cli
 from app.services import worker_role_cli_common as role_common
+from tests.worker.ack_drill_postgres import (
+    ack_drill_database as _ack_drill_database,
+    asyncpg_dsn,
+)
+
+
+ack_drill_database = _ack_drill_database
+
+
+@pytest.mark.asyncio
+async def test_runtime_task_identifier_read_and_all_other_columns_and_writes_denied(ack_drill_database):
+    database = ack_drill_database
+    owner = await asyncpg.connect(asyncpg_dsn(database.owner_url))
+    runtime = await asyncpg.connect(asyncpg_dsn(database.runtime_url))
+    try:
+        assert await runtime.fetch("SELECT id, job_id FROM public.production_tasks LIMIT 1") == []
+        assert not await owner.fetchval(
+            "SELECT has_table_privilege($1,'public.production_tasks','SELECT')", database.role,
+        )
+        columns = await owner.fetch(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='production_tasks'",
+        )
+        denied = {row["column_name"] for row in columns} - {"id", "job_id"}
+        assert {"prompt", "channel_profile_id", "state"} <= denied
+        for column in sorted(denied):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await runtime.fetch(f'SELECT "{column}" FROM public.production_tasks LIMIT 0')
+        for statement in (
+            "SELECT * FROM public.production_tasks LIMIT 0",
+            "INSERT INTO public.production_tasks (id,job_id) VALUES (gen_random_uuid(),gen_random_uuid())",
+            "UPDATE public.production_tasks SET job_id=job_id WHERE FALSE",
+            "DELETE FROM public.production_tasks WHERE FALSE",
+            "TRUNCATE public.production_tasks",
+        ):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await runtime.execute(statement)
+    finally:
+        await runtime.close()
+        await owner.close()
 
 
 def test_runtime_role_names_are_stable_and_generation_scoped() -> None:

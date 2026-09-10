@@ -25,6 +25,7 @@ from app.services.youtube_upload_operations import (
     YouTubeUploadOperationStore,
 )
 from worker.handlers.base import BaseHandler, CancelledError
+from worker.youtube_ack_drill import InjectedPreReceiptAbort, OwnedUnlistedAckDrill
 
 
 UPLOAD_INSERT_COST = 1_600
@@ -49,6 +50,7 @@ class YouTubeUploadHandler(BaseHandler):
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         lease_refresher: Callable[..., Awaitable[Any]] | None = None,
+        ack_drill: OwnedUnlistedAckDrill | None = None,
     ) -> None:
         super().__init__()
         if operation_store is None:
@@ -63,12 +65,21 @@ class YouTubeUploadHandler(BaseHandler):
         self._poll_interval_seconds = float(poll_interval_seconds)
         self._timeout_seconds = float(timeout_seconds)
         self._lease_refresher = lease_refresher
+        if ack_drill is not None and type(ack_drill) is not OwnedUnlistedAckDrill:
+            raise ValueError("ack_drill must be a concrete trusted-code helper")
+        self._ack_drill = ack_drill
+        self._drill_cancelled = asyncio.Event() if ack_drill is not None else None
         if not self._base_url:
             raise ValueError("YOUTUBE_MANAGER_URL is required for youtube uploads")
         if not math.isfinite(self._poll_interval_seconds) or self._poll_interval_seconds < 0:
             raise ValueError("poll_interval_seconds must be finite and non-negative")
         if not math.isfinite(self._timeout_seconds) or self._timeout_seconds < 0:
             raise ValueError("timeout_seconds must be finite and non-negative")
+
+    def cancel(self) -> None:
+        super().cancel()
+        if self._drill_cancelled is not None:
+            self._drill_cancelled.set()
 
     async def execute(
         self,
@@ -103,6 +114,12 @@ class YouTubeUploadHandler(BaseHandler):
                     operation,
                     content_sha256,
                     context,
+                )
+
+            if self._ack_drill is not None:
+                self._ack_drill.prepare(
+                    context, claim, manager_origin=self._base_url,
+                    timeout_seconds=self._timeout_seconds,
                 )
 
             if claim.action == "replay":
@@ -147,6 +164,9 @@ class YouTubeUploadHandler(BaseHandler):
                             tags=tags,
                             privacy=privacy,
                         )
+                    if self._ack_drill is not None:
+                        # The normal submission fence has exited and M is committed.
+                        self._ack_drill.record_submitted(context, operation, manager_task_id)
                 else:
                     resumed_manager_task_id = self._require_canonical_manager_task_id(
                         getattr(operation, "manager_task_id", None)
@@ -160,12 +180,28 @@ class YouTubeUploadHandler(BaseHandler):
                         raise RuntimeError("submitted youtube upload operation has no canonical manager task id")
                     manager_task_id = resumed_manager_task_id
 
-                succeeded_operation = await self._poll_for_completion(
-                    operation,
-                    manager_task_id,
-                    client,
-                    context,
-                )
+                try:
+                    succeeded_operation = await self._poll_for_completion(
+                        operation, manager_task_id, client, context,
+                    )
+                except InjectedPreReceiptAbort as abort:
+                    if self._ack_drill is None:
+                        raise
+                    self._ack_drill.authenticate_abort(abort, context, operation.id, manager_task_id)
+                    self._raise_if_cancelled()
+                    await self._verify_claim_content_hash(
+                        "resume", operation, self._content_sha256(snapshot_path), context,
+                    )
+                    assert self._drill_cancelled is not None
+                    operation = await self._ack_drill.load_for_resume(
+                        self._operation_store, context, self._drill_cancelled,
+                    )
+                    self._raise_if_cancelled()
+                    # No edge back to claim, preflight, fence, attempting or POST.
+                    # The first Manager payload has unwound and is never reused.
+                    succeeded_operation = await self._poll_for_completion(
+                        operation, manager_task_id, client, context,
+                    )
 
             self._raise_if_cancelled()
             return self._copy_durable_receipt(succeeded_operation, snapshot_path, output_path)
@@ -231,6 +267,8 @@ class YouTubeUploadHandler(BaseHandler):
         try:
             with open(input_file, "rb") as media_file:
                 self._raise_if_cancelled()
+                if self._ack_drill is not None:
+                    self._ack_drill.record_post_attempt(context, operation)
                 response = await self._await_request(
                     client.post(
                         f"{self._base_url}/api/upload",
@@ -347,8 +385,18 @@ class YouTubeUploadHandler(BaseHandler):
                 )
                 raise CancelledError("youtube upload cancelled during polling")
             try:
+                request_options = {}
+                request_timeout = self._timeout_seconds
+                if self._ack_drill is not None:
+                    request_options = {
+                        "headers": {"Cache-Control": "no-cache, no-store", "Pragma": "no-cache"},
+                        "follow_redirects": False,
+                    }
+                    request_timeout = min(request_timeout, self._ack_drill.remaining())
                 response = await self._await_request(
-                    client.get(f"{self._base_url}/api/status/{manager_task_id}")
+                    client.get(f"{self._base_url}/api/status/{manager_task_id}", **request_options),
+                    timeout_seconds=request_timeout,
+                    cancelled=self._drill_cancelled,
                 )
             except asyncio.CancelledError:
                 await self._mark_uncertain(
@@ -396,6 +444,8 @@ class YouTubeUploadHandler(BaseHandler):
                     operation,
                     payload,
                     context,
+                    manager_task_id=manager_task_id,
+                    client=client,
                 )
             if status == "failed":
                 error_message = payload.get("error")
@@ -420,13 +470,19 @@ class YouTubeUploadHandler(BaseHandler):
                     context,
                 )
                 raise RuntimeError("YouTubeManager upload polling timed out")
-            await asyncio.sleep(self._poll_interval_seconds)
+            await asyncio.sleep(
+                self._poll_interval_seconds if self._ack_drill is None
+                else min(self._poll_interval_seconds, self._ack_drill.remaining(), 0.1)
+            )
 
     async def _record_completion(
         self,
         operation: Any,
         payload: dict[str, Any],
         context: UploadOperationContext,
+        *,
+        manager_task_id: str | None = None,
+        client: httpx.AsyncClient | None = None,
     ) -> Any:
         result = payload.get("result")
         if not isinstance(result, dict):
@@ -453,8 +509,21 @@ class YouTubeUploadHandler(BaseHandler):
                 context,
             )
             raise RuntimeError("YouTubeManager completed upload has invalid result fields")
+        if self._ack_drill is not None:
+            assert client is not None and manager_task_id is not None and self._drill_cancelled is not None
+            self._raise_if_cancelled()
+            try:
+                await self._ack_drill.before_receipt(
+                    self._operation_store, context, operation, manager_task_id,
+                    platform_video_id, client, self._drill_cancelled,
+                )
+            except (CancelledError, asyncio.CancelledError):
+                await self._mark_uncertain(operation, "YouTubeManager upload polling was cancelled", context)
+                raise
+            self._raise_if_cancelled()
+            self._ack_drill.remaining()
         try:
-            return await self._operation_store.mark_succeeded(
+            succeeded_operation = await self._operation_store.mark_succeeded(
                 operation.id,
                 platform_video_id,
                 result,
@@ -467,19 +536,36 @@ class YouTubeUploadHandler(BaseHandler):
                 context,
             )
             raise RuntimeError("YouTubeManager completion could not be recorded durably") from exc
+        if self._ack_drill is not None:
+            self._ack_drill.record_succeeded(context, succeeded_operation)
+        return succeeded_operation
 
     async def _await_request(
         self,
         request: Awaitable[httpx.Response],
         *,
         timeout_seconds: float | None = None,
+        cancelled: asyncio.Event | None = None,
     ) -> httpx.Response:
         async with asyncio.timeout(
             self._timeout_seconds
             if timeout_seconds is None
             else timeout_seconds
         ):
-            return await request
+            if cancelled is None:
+                return await request
+            request_task = asyncio.ensure_future(request)
+            cancellation = asyncio.create_task(cancelled.wait())
+            try:
+                await asyncio.wait((request_task, cancellation), return_when=asyncio.FIRST_COMPLETED)
+                if cancelled.is_set():
+                    raise CancelledError("youtube upload polling was cancelled")
+                return request_task.result()
+            finally:
+                for task in (request_task, cancellation):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(request_task, cancellation, return_exceptions=True)
 
     async def _persist_manager_task(
         self,
