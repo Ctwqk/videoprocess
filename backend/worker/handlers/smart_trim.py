@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,8 +12,10 @@ from typing import Any
 import httpx
 
 from app.config import settings
-from worker.handlers.base import BaseHandler
+from worker.handlers.base import BaseHandler, CancelledError
 from worker.handlers.subtitle_utils import SubtitleCue
+
+LOCAL_VISUAL_TIMEOUT_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -258,8 +262,11 @@ class SmartTrimHandler(BaseHandler):
         duration: float,
         config: SmartTrimConfig,
     ) -> tuple[list[ScoredWindow], list[str]]:
+        if self._cancelled:
+            raise CancelledError("visual scoring cancelled")
         endpoint = str(getattr(settings, "vision_embedding_url", "") or "").strip()
-        if not endpoint:
+        model_path = str(getattr(settings, "vision_embedding_model_path", "") or "").strip()
+        if not endpoint and not model_path:
             return [], ["visual scoring unavailable: vision_embedding_url is not configured"]
 
         with TemporaryDirectory(prefix="smart_trim_frames_") as temp_dir:
@@ -267,8 +274,17 @@ class SmartTrimHandler(BaseHandler):
             if not frames:
                 return [], ["visual scoring produced no sampled frames"]
             try:
-                scores = await self._score_frames(endpoint, frames, config)
+                if endpoint:
+                    scores = await self._score_frames(endpoint, frames, config)
+                else:
+                    scores = await self._score_local_frames(model_path, frames, config)
+                if self._cancelled:
+                    raise CancelledError("visual scoring cancelled")
+            except CancelledError:
+                raise
             except Exception as exc:
+                if self._cancelled:
+                    raise CancelledError("visual scoring cancelled") from exc
                 return [], [f"visual scoring unavailable: {exc}"]
 
         windows = []
@@ -340,14 +356,75 @@ class SmartTrimHandler(BaseHandler):
             response.raise_for_status()
             payload = response.json()
 
-        scores: list[tuple[float, float]] = []
-        for (timestamp, _path), item in zip(frames, payload.get("similarities") or []):
-            if not item:
-                continue
-            positive = float(item[0])
-            negative = float(item[1]) if len(item) > 1 else 0.0
-            scores.append((timestamp, _clamp(positive - max(0.0, negative) * 0.4)))
-        return scores
+        return _scores_from_similarity_matrix(payload, frames, len(texts))
+
+    def _local_scoring_command(self) -> list[str]:
+        return [sys.executable, "-I", "-m", "worker.visual_embedding_cli"]
+
+    async def _score_local_frames(
+        self,
+        model_path: str,
+        frames: list[tuple[float, Path]],
+        config: SmartTrimConfig,
+    ) -> list[tuple[float, float]]:
+        if self._cancelled:
+            raise CancelledError("visual scoring cancelled")
+        texts = [config.prompt]
+        if config.negative_prompt:
+            texts.append(config.negative_prompt)
+        request = json.dumps({
+            "model_path": model_path,
+            "texts": texts,
+            "image_paths": [str(path) for _timestamp, path in frames],
+        }).encode("utf-8")
+        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+            *self._local_scoring_command(),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        ))
+
+        async def reap_child() -> None:
+            # Also own a child created while the handler was being cancelled.
+            proc = await spawn
+            try:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                await proc.communicate()
+            finally:
+                if self._proc is proc:
+                    self._proc = None
+
+        try:
+            proc = self._proc = await asyncio.shield(spawn)
+            if self._cancelled:
+                raise CancelledError("visual scoring cancelled")
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(request), timeout=LOCAL_VISUAL_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                raise RuntimeError("local visual scoring timed out") from exc
+            if self._cancelled:
+                raise CancelledError("visual scoring cancelled")
+            if proc.returncode != 0:
+                detail = stderr.decode("utf-8", errors="replace")[-2000:].strip()
+                raise RuntimeError(f"local visual scoring failed ({proc.returncode}): {detail}")
+            return _scores_from_similarity_matrix(json.loads(stdout), frames, len(texts))
+        finally:
+            cleanup = asyncio.create_task(reap_child())
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+            cleanup.result()
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _subtitle_windows(
         self,
@@ -398,6 +475,29 @@ class SmartTrimHandler(BaseHandler):
             if text:
                 cues.append(SubtitleCue(index=index, start_seconds=float(segment.start), end_seconds=float(segment.end), text=text))
         return cues
+
+
+def _scores_from_similarity_matrix(
+    payload: Any,
+    frames: list[tuple[float, Path]],
+    text_count: int,
+) -> list[tuple[float, float]]:
+    matrix = payload.get("similarities") if isinstance(payload, dict) else None
+    if not isinstance(matrix, list) or len(matrix) != len(frames):
+        raise ValueError("invalid similarity matrix: expected one row per frame")
+    for row in matrix:
+        if not isinstance(row, list) or len(row) != text_count:
+            raise ValueError("invalid similarity matrix: expected one column per text")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not -1.0 <= value <= 1.0
+            for value in row
+        ):
+            raise ValueError("invalid similarity matrix: expected finite cosine values")
+    return [
+        (timestamp, _clamp(row[0] - max(0.0, row[1] if text_count == 2 else 0.0) * 0.4))
+        for (timestamp, _path), row in zip(frames, matrix, strict=True)
+    ]
 
 
 def select_smart_trim_segments(

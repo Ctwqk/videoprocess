@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from app.config import settings
@@ -161,6 +162,56 @@ async def test_below_threshold_scores_fail_without_source_fallback(handler, monk
         )
 
     handler.run_ffmpeg.assert_not_awaited()
+
+
+@pytest.mark.parametrize("matrix", [
+    None, [], [[0.8]], [[0.8], [0.7], [0.6]],
+    [[0.8, 0.2], [0.7, 0.1]], [[], []],
+    [[True], [0.7]], [["0.8"], [0.7]], [[None], [0.7]],
+    [[float("nan")], [0.7]], [[float("inf")], [0.7]],
+    [[1.1], [0.7]], [[-1.1], [0.7]],
+    {"0": [0.8], "1": [0.7]},
+])
+async def test_visual_provider_rejects_incomplete_or_invalid_cosine_matrix(
+    handler, monkeypatch, tmp_path, matrix,
+):
+    import json
+
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, content=json.dumps({"similarities": matrix}),
+        headers={"content-type": "application/json"},
+    ))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(
+        transport=transport, **kwargs,
+    ))
+    frame = tmp_path / "frame.jpg"
+    frame.write_bytes(b"image fixture sent to external provider")
+
+    with pytest.raises(ValueError, match="similarity matrix"):
+        await handler._score_frames(
+            "http://visual.test", [(0.0, frame), (1.0, frame)],
+            SmartTrimConfig(prompt="blue"),
+        )
+
+
+async def test_visual_cosines_preserve_negative_penalty_and_timestamp_order(
+    handler, monkeypatch, tmp_path,
+):
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, json={"similarities": [[0.8, 0.5], [-0.1, -0.5]]},
+    ))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(
+        transport=transport, **kwargs,
+    ))
+    frame = tmp_path / "frame.jpg"
+    frame.write_bytes(b"image fixture sent to external provider")
+    result = await handler._score_frames(
+        "http://visual.test", [(1.5, frame), (3.5, frame)],
+        SmartTrimConfig(prompt="blue", negative_prompt="red"),
+    )
+    assert result == [(1.5, pytest.approx(0.6)), (3.5, 0.0)]
 
 
 def test_smart_trim_config_parses_node_params():

@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     material_lighthouse_url: str = ""
     material_univtg_url: str = ""
     vision_embedding_url: str = ""
+    vision_embedding_model_path: str = ""
     smart_trim_vlm_url: str = ""
     smart_trim_default_worker_type: str = "vision"
 
