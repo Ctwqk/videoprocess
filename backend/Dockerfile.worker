@@ -25,6 +25,14 @@ COPY pyproject.toml .
 RUN pip install ".[worker]" \
     && pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 
+COPY requirements-vision.txt /tmp/requirements-vision.txt
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0 \
+    && pip install -r /tmp/requirements-vision.txt
+COPY worker/visual_embedding_model.py /tmp/vp-visual-embedding-model.py
+RUN python /tmp/vp-visual-embedding-model.py \
+    --download /usr/local/share/videoprocess/chinese-clip \
+    && chmod -R a-w,a+rX /usr/local/share/videoprocess/chinese-clip
+
 COPY app /app/app
 COPY worker /app/worker
 RUN install -d -o root -g root -m 0555 /usr/local/share/videoprocess \

@@ -12382,6 +12382,7 @@ vp_vision_worker_env() {
     "WORKER_CONCURRENCY=${VP_VISION_WORKER_CONCURRENCY:-1}" \
     "VP_ARTIFACT_DOWNLOAD_BASE_URL=http://vp-api-swarm:8080/api/v1" \
     "VISION_EMBEDDING_URL=${VP_VISION_EMBEDDING_URL:-}" \
+    "VISION_EMBEDDING_MODEL_PATH=/usr/local/share/videoprocess/chinese-clip" \
     "VIDEO_USE_GPU=false" \
     "VIDEO_GPU_FALLBACK_TO_CPU=true" \
     "VIDEO_WHISPER_DEVICE=cpu"

@@ -1516,6 +1516,24 @@ VP_WORKER_ADMISSION_PREPARED=true
 VP_WORKER_ADMISSION_COMMIT="$TEST_COMMIT"
 VP_WORKER_ADMISSION_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-0123456789ab
 
+verify_visual_model_environment() (
+  vp_worker_service_registration_env() { :; }
+  local image=vp-ffmpeg-worker-python:deploy-0123456789ab
+  local visual_env
+  visual_env="$(VP_VISION_EMBEDDING_URL=http://visual.example vp_vision_worker_env "$image")"
+  grep -Fxq 'VISION_EMBEDDING_MODEL_PATH=/usr/local/share/videoprocess/chinese-clip' <<<"$visual_env"
+  grep -Fxq 'VISION_EMBEDDING_URL=http://visual.example' <<<"$visual_env"
+  if vp_python_worker_env false "$image" | grep -q '^VISION_EMBEDDING_MODEL_PATH='; then
+    echo 'FAIL: general media worker unexpectedly enables local visual scoring' >&2
+    return 1
+  fi
+  if vp_publisher_env "$image" | grep -q '^VISION_EMBEDDING_MODEL_PATH='; then
+    echo 'FAIL: publisher unexpectedly enables local visual scoring' >&2
+    return 1
+  fi
+)
+verify_visual_model_environment
+
 vp_worker_service_registration_env() {
   local service="$1"
   local image="$2"
