@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from app.schemas.autoflow import (
     AutoFlowStoryboardRequest,
     AutoFlowStoryboardResponse,
@@ -57,13 +59,15 @@ def _storyboard_strategy(request: AutoFlowStoryboardRequest) -> str:
 
 def _subject(prompt: str) -> str:
     lowered = prompt.lower()
-    if any(term in prompt for term in ("小猫", "猫咪")) or "kitten" in lowered or "cat" in lowered:
+    if any(term in prompt for term in ("小猫", "猫咪")) or re.search(r"\b(?:kittens?|cats?)\b", lowered):
         return "小猫"
-    if any(term in prompt for term in ("小狗", "狗狗")) or "puppy" in lowered or "dog" in lowered:
-        return "dog" if "dog" in lowered and "小狗" not in prompt else "小狗"
-    if "产品" in prompt or "product" in lowered:
+    english_dog = re.search(r"\bdogs?\b", lowered)
+    if any(term in prompt for term in ("小狗", "狗狗")) or english_dog or re.search(r"\bpupp(?:y|ies)\b", lowered):
+        return "dog" if english_dog and "小狗" not in prompt else "小狗"
+    if "产品" in prompt or re.search(r"\bproducts?\b", lowered):
         return "产品"
-    return "视频主题"
+    # Retain free-form topic evidence while bounding generated titles and queries.
+    return " ".join(prompt.split())[:80]
 
 
 def _shot_templates(subject: str, generation_enabled: bool) -> list[ShotSpec]:
@@ -203,7 +207,7 @@ def _shot(
         id=shot_id,
         role=role,  # type: ignore[arg-type]
         description=description,
-        director_notes=f"优先选择主体清楚、动作完整、无明显水印和安全风险的素材。检索失败时保留缺失状态，不用错误素材冒充。",
+        director_notes="优先选择主体清楚、动作完整、无明显水印和安全风险的素材。检索失败时保留缺失状态，不用错误素材冒充。",
         search_query=search_query,
         search_queries=[search_query, generation_prompt],
         negative_queries=["水印", "低清晰度", "危险", "侵权"],

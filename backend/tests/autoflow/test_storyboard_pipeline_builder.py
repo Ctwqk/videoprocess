@@ -8,6 +8,29 @@ from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import AutoFlowStoryboardRequest
 
 
+def test_unlisted_storyboard_preserves_freeform_topic_without_relaxing_publication_gates():
+    storyboard = StoryboardGenerator().generate(AutoFlowStoryboardRequest(
+        prompt="绿色背景上的白色中文文字",
+        input_asset_id="owned-green-title",
+        target_duration=8,
+        aspect_ratio="16:9",
+        min_shots=3,
+        max_shots=3,
+    )).storyboard
+    definition = PipelineBuilder().build_storyboard_input_video(
+        storyboard, input_asset_id="owned-green-title", publish_mode="unlisted_upload",
+    )
+
+    assert validate_pipeline(definition).valid
+    trims = [node for node in definition.nodes if node.type == "smart_trim"]
+    assert len(trims) == 3
+    assert all("绿色背景上的白色中文文字" in node.data.config["prompt"] for node in trims)
+    assert all(node.data.config["no_match_policy"] == "fail" for node in trims)
+    uploads = [node for node in definition.nodes if node.type == "youtube_upload"]
+    assert len(uploads) == 1
+    assert uploads[0].data.config["privacy"] == "unlisted"
+
+
 @pytest.mark.parametrize("shot_count", [1, 3])
 @pytest.mark.parametrize(
     ("publish_mode", "no_match_policy", "privacy"),

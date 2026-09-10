@@ -1,7 +1,57 @@
 from __future__ import annotations
 
+import pytest
+
 from app.autoflow.storyboard_generator import StoryboardGenerator
 from app.schemas.autoflow import AutoFlowStoryboardRequest, StoryboardPlan
+
+
+@pytest.mark.parametrize(
+    ("prompt", "subject"),
+    [
+        ("绿色背景上的白色中文文字", "绿色背景上的白色中文文字"),
+        ("深色网格背景，黄色边框内的红色矩形", "深色网格背景，黄色边框内的红色矩形"),
+        ("  Green\n background\tand white text  ", "Green background and white text"),
+        ("An educational video about green backgrounds", "An educational video about green backgrounds"),
+        ("A video about dogma", "A video about dogma"),
+        ("Film production workflow", "Film production workflow"),
+    ],
+)
+def test_unknown_topic_survives_into_storyboard_search_queries(prompt, subject):
+    storyboard = StoryboardGenerator().generate(AutoFlowStoryboardRequest(prompt=prompt)).storyboard
+
+    assert storyboard.subject == subject
+    assert len(storyboard.shots) == 3
+    assert all(subject in shot.search_query for shot in storyboard.shots)
+    assert all(subject in shot.generation.prompt for shot in storyboard.shots)
+
+
+@pytest.mark.parametrize(
+    ("prompt", "subject"),
+    [
+        ("A CAT video", "小猫"),
+        ("Two kittens playing", "小猫"),
+        ("A dog's day", "dog"),
+        ("Two puppies playing", "小狗"),
+        ("A product-demo", "产品"),
+        ("Two products", "产品"),
+    ],
+)
+def test_builtin_topics_remain_available_as_whole_words(prompt, subject):
+    storyboard = StoryboardGenerator().generate(AutoFlowStoryboardRequest(prompt=prompt)).storyboard
+
+    assert storyboard.subject == subject
+    assert all(subject in shot.search_query or "小狗" in shot.search_query for shot in storyboard.shots)
+
+
+def test_long_freeform_topic_keeps_queries_within_visual_provider_limit():
+    prompt = "绿色背景上的白色中文文字" * 100
+    storyboard = StoryboardGenerator().generate(AutoFlowStoryboardRequest(prompt=prompt)).storyboard
+
+    assert storyboard.subject.startswith("绿色背景上的白色中文文字")
+    assert len(storyboard.title) <= 100
+    assert all(0 < len(shot.search_query) <= 512 for shot in storyboard.shots)
+    assert all(0 < len(shot.generation.prompt) <= 512 for shot in storyboard.shots)
 
 
 def test_rule_based_storyboard_generates_long_cat_shots_without_video_generation():
