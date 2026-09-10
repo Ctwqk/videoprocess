@@ -13,11 +13,13 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models.channel_agent import ProductionTask
-from app.models.job import JobStatus, NodeExecution, NodeStatus
+from app.models.channel_agent import ChannelProfile, ProductionTask
+from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.models.schedule import RuntimeSchedule
 from app.models.youtube_upload_operation import YouTubeUploadOperation
 from app.services.job_execution_authority import (
     JobExecutionAuthorityBlocked,
+    LockedJobExecutionAuthority,
     NodeExecutionClaim,
     lock_job_execution_authority,
     require_active_execution_authority,
@@ -26,6 +28,7 @@ from app.services.job_execution_authority import (
     require_worker_registration_lease,
     require_worker_registration_margin,
 )
+from app.services.schedule_service import VIDEO_SCHEDULE_SERVICE
 
 SUBMISSION_LEASE_MARGIN_SECONDS = 150
 
@@ -216,6 +219,88 @@ class YouTubeUploadOperationStore:
 
             await db.refresh(operation)
             return UploadOperationClaim("submit", operation)
+
+    async def load_submitted(
+        self,
+        context: UploadOperationContext,
+        *,
+        operation_id: uuid.UUID,
+        manager_task_id: str,
+    ) -> UploadOperationClaim:
+        """Observe an existing pre-receipt submission under fresh authority."""
+
+        canonical_manager_task_id = self._canonical_manager_task_id(manager_task_id)
+        if canonical_manager_task_id is None:
+            raise ValueError("manager task id must be a canonical UUID")
+        claim = context.execution_claim
+        if (
+            claim.job_id != context.job_id
+            or claim.node_execution_id != context.node_execution_id
+        ):
+            raise JobExecutionAuthorityBlocked("upload operation execution context changed")
+
+        async with self._session_factory() as db:
+            operation = await self._operation(db, operation_id)
+            production_task_id = await self._production_task_id(db, context.job_id)
+            if claim.worker_registration_id is not None and _session_is_postgresql(db):
+                await require_registered_worker_node_claim(db, claim)
+            else:
+                # The general authority-lock helper upserts the schedule. This
+                # read instead requires existing rows and uses the same validators.
+                result = await db.execute(
+                    select(ChannelProfile, RuntimeSchedule, ProductionTask, Job, NodeExecution)
+                    .select_from(ProductionTask)
+                    .join(ChannelProfile, ChannelProfile.id == ProductionTask.channel_profile_id)
+                    .join(RuntimeSchedule, RuntimeSchedule.service_name == VIDEO_SCHEDULE_SERVICE)
+                    .join(Job, Job.id == ProductionTask.job_id)
+                    .join(NodeExecution, NodeExecution.job_id == Job.id)
+                    .where(
+                        ProductionTask.id == production_task_id,
+                        Job.id == context.job_id,
+                        NodeExecution.id == context.node_execution_id,
+                    )
+                )
+                authority_rows = result.one_or_none()
+                if authority_rows is None:
+                    raise JobExecutionAuthorityBlocked("upload execution authority was not found")
+                authority = LockedJobExecutionAuthority(*authority_rows)
+                require_active_execution_authority(
+                    authority,
+                    job_statuses={JobStatus.RUNNING},
+                    node_statuses={NodeStatus.RUNNING},
+                )
+                require_matching_node_execution_claim(authority, claim)
+                if claim.worker_registration_id is not None:
+                    await require_worker_registration_lease(db, claim)
+
+            await db.refresh(operation)
+            if (
+                operation.job_id != context.job_id
+                or operation.node_execution_id != context.node_execution_id
+                or operation.input_artifact_id != context.input_artifact_id
+                or operation.content_sha256 != context.content_sha256
+                or operation.title != context.title
+                or operation.privacy != context.privacy
+            ):
+                raise JobExecutionAuthorityBlocked("upload operation context changed")
+            current_production_task_id = await self._production_task_id(db, context.job_id)
+            if (
+                current_production_task_id is None
+                or current_production_task_id != production_task_id
+                or operation.production_task_id != current_production_task_id
+            ):
+                raise JobExecutionAuthorityBlocked("upload operation production task changed")
+            action = self._action_for(operation)
+            if (
+                action != "resume"
+                or operation.manager_task_id != canonical_manager_task_id
+                or operation.request_attempted_at is None
+                or operation.receipt_json != {}
+                or operation.platform_video_id is not None
+                or operation.completed_at is not None
+            ):
+                raise ValueError("upload operation is not a matching pre-receipt submission")
+            return UploadOperationClaim(action, operation)
 
     async def mark_attempting(
         self,

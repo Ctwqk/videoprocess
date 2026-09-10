@@ -6,13 +6,14 @@ import os
 import subprocess
 import sys
 import uuid
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, event, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -145,6 +146,389 @@ async def _context_for(
         title="Owned canary",
         privacy="unlisted",
     )
+
+
+@pytest.fixture
+async def submitted_operation(operation_session_factory):
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+    reserved = await store.claim(context)
+    await store.mark_attempting(reserved.operation.id, context=context)
+    submitted = await store.mark_submitted(
+        reserved.operation.id, MANAGER_TASK_ID, context=context,
+    )
+    return store, context, submitted
+
+
+@asynccontextmanager
+async def _observe_read_only(session_factory):
+    tables = (
+        Job.__table__, NodeExecution.__table__, Artifact.__table__,
+        ChannelProfile.__table__, ProductionTask.__table__,
+        RuntimeSchedule.__table__, YouTubeUploadOperation.__table__,
+    )
+
+    async def snapshot():
+        async with session_factory() as db:
+            return [list((await db.execute(select(table))).mappings()) for table in tables]
+
+    before = await snapshot()
+    statements = []
+
+    def record_sql(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = session_factory.kw["bind"].sync_engine
+    event.listen(engine, "before_cursor_execute", record_sql)
+    try:
+        yield
+    finally:
+        event.remove(engine, "before_cursor_execute", record_sql)
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in statements)
+    assert await snapshot() == before
+
+
+@pytest.mark.asyncio
+async def test_load_submitted_reads_fresh_detached_operation_without_writes(
+    operation_session_factory, submitted_operation,
+):
+    store, context, submitted = submitted_operation
+    reads = []
+    for _ in range(2):
+        async with _observe_read_only(operation_session_factory):
+            loaded = await store.load_submitted(
+                context, operation_id=submitted.id, manager_task_id=MANAGER_TASK_ID,
+            )
+        assert loaded.action == "resume"
+        assert loaded.operation.id == submitted.id
+        assert loaded.operation.status == "submitted"
+        assert loaded.operation.manager_task_id == MANAGER_TASK_ID
+        assert loaded.operation.request_attempted_at is not None
+        assert loaded.operation.receipt_json == {}
+        assert loaded.operation.platform_video_id is None
+        assert loaded.operation.completed_at is None
+        assert inspect(loaded.operation).detached
+        reads.append(loaded.operation)
+    assert reads[0] is not reads[1]
+
+    await store.mark_succeeded(
+        submitted.id, "abcdefghijk", {"video_id": "abcdefghijk"}, context=context,
+    )
+    async with _observe_read_only(operation_session_factory):
+        with pytest.raises(ValueError):
+            await store.load_submitted(
+                context, operation_id=submitted.id, manager_task_id=MANAGER_TASK_ID,
+            )
+
+
+@pytest.mark.asyncio
+async def test_load_submitted_rechecks_operation_after_authority_observation(
+    monkeypatch, operation_session_factory, submitted_operation,
+):
+    store, context, submitted = submitted_operation
+    production_task_id = store._production_task_id
+
+    async def complete_during_read(db, job_id):
+        task_id = await production_task_id(db, job_id)
+        await store.mark_succeeded(
+            submitted.id, "abcdefghijk", {"video_id": "abcdefghijk"}, context=context,
+        )
+        return task_id
+
+    # A real transition commits through an independent session during the read.
+    monkeypatch.setattr(store, "_production_task_id", complete_during_read)
+    with pytest.raises(ValueError):
+        await store.load_submitted(
+            context, operation_id=submitted.id, manager_task_id=MANAGER_TASK_ID,
+        )
+    async with operation_session_factory() as db:
+        stored = await db.get(YouTubeUploadOperation, submitted.id)
+        assert stored.status == "succeeded"
+        assert stored.receipt_json["video_id"] == "abcdefghijk"
+
+
+@pytest.mark.parametrize("change", ["unlinked", "reassigned", "replaced"])
+@pytest.mark.asyncio
+async def test_load_submitted_rechecks_task_link_after_registered_authority(
+    monkeypatch, operation_session_factory, change,
+):
+    async def require_lease(db, claim):
+        pass
+
+    monkeypatch.setattr(upload_operations, "require_worker_registration_lease", require_lease)
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db, registered=True)
+    reserved = await store.claim(context)
+    await store.mark_attempting(reserved.operation.id, context=context)
+    submitted = await store.mark_submitted(reserved.operation.id, MANAGER_TASK_ID, context=context)
+
+    async with AsyncExitStack() as observations:
+        async def change_link_during_authority(db, claim):
+            async with operation_session_factory() as writer:
+                task = await writer.get(ProductionTask, submitted.production_task_id)
+                task.job_id = None
+                if change == "reassigned":
+                    other_job = Job(
+                        pipeline_id=uuid.uuid4(), pipeline_snapshot={}, status=JobStatus.RUNNING,
+                    )
+                    writer.add(other_job)
+                    await writer.flush()
+                    task.job_id = other_job.id
+                elif change == "replaced":
+                    writer.add(ProductionTask(
+                        channel_profile_id=task.channel_profile_id,
+                        target_account_id=task.target_account_id,
+                        prompt="Replacement task", job_id=context.job_id, state="producing",
+                    ))
+                await writer.commit()
+            # Exclude the deliberate independent writer, then observe the reader.
+            await observations.enter_async_context(_observe_read_only(operation_session_factory))
+
+        # Exercise registered-branch ordering with real SQLite rows, not PostgreSQL authority.
+        monkeypatch.setattr(upload_operations, "_session_is_postgresql", lambda db: True)
+        monkeypatch.setattr(
+            upload_operations, "require_registered_worker_node_claim", change_link_during_authority,
+        )
+        with pytest.raises(JobExecutionAuthorityBlocked, match="production task changed"):
+            await store.load_submitted(
+                context, operation_id=submitted.id, manager_task_id=MANAGER_TASK_ID,
+            )
+
+
+@pytest.mark.parametrize("with_existing_operation", [False, True])
+@pytest.mark.asyncio
+async def test_load_submitted_missing_operation_never_reserves(
+    operation_session_factory, with_existing_operation,
+):
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+    if with_existing_operation:
+        await store.claim(context)
+    async with _observe_read_only(operation_session_factory):
+        with pytest.raises(LookupError):
+            await store.load_submitted(
+                context, operation_id=uuid.uuid4(), manager_task_id=MANAGER_TASK_ID,
+            )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("job_id", uuid.UUID(int=101)),
+        ("node_execution_id", uuid.UUID(int=102)),
+        ("input_artifact_id", uuid.UUID(int=103)),
+        ("content_sha256", "b" * 64),
+        ("title", "Different title"),
+        ("privacy", "private"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_load_submitted_rejects_context_mismatch(
+    operation_session_factory, submitted_operation, field, value,
+):
+    store, context, submitted = submitted_operation
+    async with _observe_read_only(operation_session_factory):
+        with pytest.raises(JobExecutionAuthorityBlocked):
+            await store.load_submitted(
+                replace(context, **{field: value}),
+                operation_id=submitted.id, manager_task_id=MANAGER_TASK_ID,
+            )
+
+
+@pytest.mark.parametrize("manager_task_id", [SECOND_MANAGER_TASK_ID, *INVALID_MANAGER_TASK_ID_CASES])
+@pytest.mark.asyncio
+async def test_load_submitted_requires_exact_canonical_manager_id(
+    operation_session_factory, submitted_operation, manager_task_id,
+):
+    store, context, submitted = submitted_operation
+    async with _observe_read_only(operation_session_factory):
+        with pytest.raises(ValueError):
+            await store.load_submitted(
+                context, operation_id=submitted.id, manager_task_id=manager_task_id,
+            )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("status", "reserved"),
+        ("status", "uncertain"),
+        ("status", "failed"),
+        ("status", "succeeded"),
+        ("request_attempted_at", None),
+        ("receipt_json", {"video_id": "abcdefghijk"}),
+        ("receipt_json", None),
+        ("receipt_json", []),
+        ("platform_video_id", "abcdefghijk"),
+        ("platform_video_id", ""),
+        ("completed_at", datetime(2026, 9, 9, tzinfo=timezone.utc)),
+        ("manager_task_id", SECOND_MANAGER_TASK_ID),
+        ("manager_task_id", MANAGER_TASK_ID.upper()),
+        ("manager_task_id", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_load_submitted_rejects_nonresumable_durable_state(
+    operation_session_factory, submitted_operation, field, value,
+):
+    store, context, submitted = submitted_operation
+    async with operation_session_factory() as db:
+        # Deliberately corrupt only negative fixtures, including legacy Manager IDs.
+        await db.execute(text("PRAGMA ignore_check_constraints = ON"))
+        operation = await db.get(YouTubeUploadOperation, submitted.id)
+        setattr(operation, field, value)
+        await db.commit()
+        await db.execute(text("PRAGMA ignore_check_constraints = OFF"))
+    async with _observe_read_only(operation_session_factory):
+        with pytest.raises(ValueError):
+            await store.load_submitted(
+                context, operation_id=submitted.id, manager_task_id=MANAGER_TASK_ID,
+            )
+
+
+@pytest.mark.parametrize("attempted", [False, True])
+@pytest.mark.asyncio
+async def test_load_submitted_rejects_unsubmitted_reservations(
+    operation_session_factory, attempted,
+):
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+    reserved = await store.claim(context)
+    if attempted:
+        await store.mark_attempting(reserved.operation.id, context=context)
+    async with _observe_read_only(operation_session_factory):
+        with pytest.raises(ValueError):
+            await store.load_submitted(
+                context, operation_id=reserved.operation.id, manager_task_id=MANAGER_TASK_ID,
+            )
+
+
+@pytest.mark.parametrize("change", ["unlinked", "wrong-task", "missing-link", "multiple-tasks"])
+@pytest.mark.asyncio
+async def test_load_submitted_requires_same_linked_production_task(
+    operation_session_factory, submitted_operation, change,
+):
+    store, context, submitted = submitted_operation
+    async with operation_session_factory() as db:
+        task = await db.get(ProductionTask, submitted.production_task_id)
+        operation = await db.get(YouTubeUploadOperation, submitted.id)
+        if change == "unlinked":
+            task.job_id = None
+        elif change == "wrong-task":
+            operation.production_task_id = uuid.uuid4()
+        elif change == "missing-link":
+            operation.production_task_id = None
+        else:
+            db.add(ProductionTask(
+                channel_profile_id=task.channel_profile_id,
+                target_account_id=task.target_account_id,
+                prompt="Conflicting task", job_id=context.job_id, state="producing",
+            ))
+        await db.commit()
+    async with _observe_read_only(operation_session_factory):
+        with pytest.raises((JobExecutionAuthorityBlocked, UploadOperationConflictError)):
+            await store.load_submitted(
+                context, operation_id=submitted.id, manager_task_id=MANAGER_TASK_ID,
+            )
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value"),
+    [
+        ("job", "status", JobStatus.CANCELLED),
+        ("job", "status", JobStatus.SUCCEEDED),
+        ("node", "status", NodeStatus.FAILED),
+        ("node", "job_id", uuid.UUID("bbbbbbbb-0000-4000-8000-000000000104")),
+        ("node", "worker_id", "replacement-worker"),
+        ("node", "started_at", datetime(2026, 9, 9, tzinfo=timezone.utc)),
+        ("node", "worker_registration_id", uuid.UUID("bbbbbbbb-0000-4000-8000-000000000105")),
+        ("node", "worker_lease_epoch", 12),
+        ("task", "state", "failed"),
+        ("channel", "enabled", False),
+        ("channel", "halted_at", datetime(2026, 9, 9, tzinfo=timezone.utc)),
+        ("schedule", "state", "CLOSED"),
+        ("schedule", "guarded_job_id", uuid.UUID(int=106)),
+        ("schedule", None, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_load_submitted_rechecks_durable_execution_authority(
+    operation_session_factory, submitted_operation, target, field, value,
+):
+    store, context, submitted = submitted_operation
+    async with operation_session_factory() as db:
+        task = await db.get(ProductionTask, submitted.production_task_id)
+        model, identity = {
+            "job": (Job, context.job_id),
+            "node": (NodeExecution, context.node_execution_id),
+            "task": (ProductionTask, task.id),
+            "channel": (ChannelProfile, task.channel_profile_id),
+            "schedule": (RuntimeSchedule, "videoprocess"),
+        }[target]
+        row = await db.get(model, identity)
+        if field is None:
+            await db.delete(row)
+        else:
+            # Negative fixtures may intentionally violate the paired lease binding.
+            await db.execute(text("PRAGMA ignore_check_constraints = ON"))
+            setattr(row, field, value)
+        await db.commit()
+        await db.execute(text("PRAGMA ignore_check_constraints = OFF"))
+    async with _observe_read_only(operation_session_factory):
+        with pytest.raises(JobExecutionAuthorityBlocked):
+            await store.load_submitted(
+                context, operation_id=submitted.id, manager_task_id=MANAGER_TASK_ID,
+            )
+
+
+@pytest.mark.asyncio
+async def test_load_submitted_does_not_trust_active_submission_fence(
+    operation_session_factory, submitted_operation,
+):
+    store, context, submitted = submitted_operation
+    async with store.submission_fence(context):
+        # Release SQLite's write lock while retaining the active fence context.
+        await store._active_submission_fence.get().db.commit()
+        async with operation_session_factory() as db:
+            node = await db.get(NodeExecution, context.node_execution_id)
+            node.worker_id = "replacement-worker"
+            await db.commit()
+        async with _observe_read_only(operation_session_factory):
+            with pytest.raises(JobExecutionAuthorityBlocked):
+                await store.load_submitted(
+                    context, operation_id=submitted.id, manager_task_id=MANAGER_TASK_ID,
+                )
+
+
+@pytest.mark.asyncio
+async def test_load_submitted_propagates_registration_lease_loss(
+    monkeypatch, operation_session_factory,
+):
+    async def require_lease(db, claim):
+        pass
+
+    monkeypatch.setattr(upload_operations, "require_worker_registration_lease", require_lease)
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db, registered=True)
+    reserved = await store.claim(context)
+    await store.mark_attempting(reserved.operation.id, context=context)
+    await store.mark_submitted(reserved.operation.id, MANAGER_TASK_ID, context=context)
+
+    async def lost_lease(db, claim):
+        raise JobExecutionAuthorityBlocked("worker registration lease is no longer authoritative")
+
+    # SQLite cannot execute PostgreSQL's lease function; only its rejection is simulated.
+    monkeypatch.setattr(upload_operations, "require_worker_registration_lease", lost_lease)
+    async with _observe_read_only(operation_session_factory):
+        with pytest.raises(JobExecutionAuthorityBlocked, match="registration lease"):
+            await store.load_submitted(
+                context, operation_id=reserved.operation.id, manager_task_id=MANAGER_TASK_ID,
+            )
 
 
 @pytest.mark.asyncio
