@@ -128,6 +128,100 @@ def test_complete_independent_window_and_fresh_resume_pass_without_mutation():
     assert (journal, receiver) == before
 
 
+def postflow_evidence():
+    journal, receiver = evidence()
+    durable = journal["durable"]
+    durable["observed_at"] = at(90)
+    publication = durable["publications"][0]
+    publication.update(publish_status="scheduled", scheduled_publish_at=at(30), updated_at=at(35))
+    return journal, receiver
+
+
+@pytest.mark.parametrize("status", ["uploaded", "scheduled"])
+def test_postflow_snapshot_after_core_close_preserves_actual_unlisted_publication(status):
+    journal, receiver = postflow_evidence()
+    journal["durable"]["publications"][0]["publish_status"] = status
+    before = copy.deepcopy((journal, receiver))
+    result = validate_ack_drill_evidence(journal, receiver)
+    assert result == {"status": "passed", "reasons": [], "counts": {
+        "upload_posts": 1, "completed_gets": 2, "consumed_tokens": 1,
+    }}
+    assert (journal, receiver) == before
+
+
+@pytest.mark.parametrize("uploaded,observed", [(30, 30), (30, 90), (19, 25)])
+def test_publication_and_snapshot_may_follow_core_ack_window(uploaded, observed):
+    journal, receiver = postflow_evidence()
+    journal["durable"]["publications"][0].update(
+        uploaded_at=at(uploaded), scheduled_publish_at=at(observed), updated_at=at(observed),
+    )
+    journal["durable"]["observed_at"] = at(observed)
+    assert validate_ack_drill_evidence(journal, receiver)["status"] == "passed"
+
+
+@pytest.mark.parametrize("boundary", [25, 26], ids=["at-core-close", "after-core-close"])
+@pytest.mark.parametrize("late", ["output", "prepared", "emitted", "resolved", "ack"])
+def test_postflow_observation_cannot_hide_worker_completion_outside_core_window(late, boundary):
+    journal, receiver = postflow_evidence()
+    durable = journal["durable"]
+    times = {"output": 16, "prepared": 17, "emitted": 17.1, "resolved": 18, "ack": 18}
+    worker_order = ["output", "prepared", "emitted", "resolved"]
+    if late == "ack":
+        times["ack"] = boundary
+    else:
+        for index, field in enumerate(worker_order[worker_order.index(late):]):
+            times[field] = boundary + index
+        times["ack"] = max(times["ack"], times["emitted"])
+    durable["outputs"][0]["created_at"] = at(times["output"])
+    for field in ("prepared", "emitted", "resolved"):
+        durable["emissions"][0][field + "_at"] = at(times[field])
+    durable["deliveries"][0]["acknowledged_at"] = at(times["ack"])
+    durable["publications"][0]["uploaded_at"] = at(40)
+    result = validate_ack_drill_evidence(journal, receiver)
+    assert result["status"] == "failed"
+    assert result["reasons"] == ["output event ACK or publication ordering is invalid"]
+
+
+@pytest.mark.parametrize("observed", [15.9, 16.9, 17.05, 17.9, 18.5, 29.9])
+def test_postflow_observation_must_cover_all_worker_and_upload_timestamps(observed):
+    journal, receiver = postflow_evidence()
+    journal["durable"]["publications"][0]["uploaded_at"] = at(30)
+    journal["durable"]["observed_at"] = at(observed)
+    assert validate_ack_drill_evidence(journal, receiver)["status"] == "failed"
+
+
+def test_postflow_observation_must_cover_ack_later_than_resolved_event():
+    journal, receiver = postflow_evidence()
+    journal["durable"]["deliveries"][0]["acknowledged_at"] = at(24)
+    journal["durable"]["observed_at"] = at(23)
+    assert validate_ack_drill_evidence(journal, receiver)["status"] == "failed"
+
+
+@pytest.mark.parametrize("table,field,value", [
+    ("outputs", "created_at", at(14)), ("emissions", "prepared_at", at(15.9)),
+    ("emissions", "emitted_at", at(16.9)), ("emissions", "resolved_at", at(17.05)),
+    ("deliveries", "acknowledged_at", at(17.05)), ("publications", "uploaded_at", at(14.8)),
+])
+def test_postflow_snapshot_keeps_existing_worker_and_receipt_order(table, field, value):
+    journal, receiver = postflow_evidence()
+    journal["durable"][table][0][field] = value
+    assert validate_ack_drill_evidence(journal, receiver)["status"] == "failed"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("platform_content_id", "different12"), ("platform", "other"),
+    ("current_privacy", "public"), ("current_privacy", "private"), ("current_privacy", None),
+    ("desired_privacy", "public"), ("desired_privacy", "private"),
+    ("public_at", at(30)), ("publish_status", "unknown"), ("publish_status", "failed"),
+    ("publish_status", "pending"), ("publish_status", "published"),
+    ("production_task_id", uid(99)), ("account_id", uid(99)),
+])
+def test_postflow_snapshot_does_not_relax_publication_identity_or_unlisted_scope(field, value):
+    journal, receiver = postflow_evidence()
+    journal["durable"]["publications"][0][field] = value
+    assert validate_ack_drill_evidence(journal, receiver)["status"] == "failed"
+
+
 @pytest.mark.parametrize("missing", ["receiver", "durable", "runtime_identity", "token"])
 def test_missing_independent_or_durable_evidence_never_passes(missing):
     journal, receiver = evidence()

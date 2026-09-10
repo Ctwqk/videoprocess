@@ -296,13 +296,16 @@ def _durable(journal: dict, first: dict, events: list[dict], receiver: dict) -> 
     _matches(publication, first, ("production_task_id", "account_id"))
     _require(publication.get("platform") == "youtube" and publication.get("platform_content_id") == final["video_id"]
              and publication.get("desired_privacy") == "unlisted" and publication.get("current_privacy") == "unlisted"
-             and publication.get("publish_status") == "uploaded" and "public_at" in publication and publication["public_at"] is None,
+             and publication.get("publish_status") in {"uploaded", "scheduled"}
+             and "public_at" in publication and publication["public_at"] is None,
              "publication is not the one unlisted recovered video")
     prepared, emitted, resolved, ack = (_time(row.get(key)) for row, key in
                                       ((emission, "prepared_at"), (emission, "emitted_at"), (emission, "resolved_at"), (delivery, "acknowledged_at")))
     observed, uploaded, closed = _time(durable.get("observed_at")), _time(publication.get("uploaded_at")), _time(receiver["end"]["at"])
-    _require(_time(final["utc"]) <= output_at <= prepared <= emitted <= resolved <= observed < closed
-             and emitted <= ack <= observed and receipt_at <= uploaded <= observed,
+    # Core worker recovery precedes closure; normal publication may be observed later.
+    _require(_time(final["utc"]) <= output_at <= prepared <= emitted <= resolved < closed
+             and emitted <= ack < closed and max(resolved, ack, uploaded) <= observed
+             and receipt_at <= uploaded,
              "output event ACK or publication ordering is invalid")
 
 
@@ -313,6 +316,8 @@ Durable collections must be complete queries scoped to the target operation,
 node, task, attested delivery and video linkage, not a preselected successful row.
 Only the collector can establish that query scope and provenance. Passing here
 does not prove arbitrary process-crash recovery or close other production gates.
+Worker output, event completion and ACK must precede core receiver closure;
+the durable snapshot may follow normal unlisted publication/promotion.
 """
     counts = {"upload_posts": 0, "completed_gets": 0, "consumed_tokens": 0}
     try:
