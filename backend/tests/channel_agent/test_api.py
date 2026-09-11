@@ -30,6 +30,7 @@ from app.models.channel_agent import (
     TopicLane,
 )
 from app.models.asset import Asset
+from app.models.owned_seed_inventory import OwnedSeedInventory, OwnedSeedInventoryItem
 from app.models.autoflow import AutoFlowPlan
 
 
@@ -51,6 +52,8 @@ CHANNEL_AGENT_TABLES = (
     FeedbackSnapshot.__table__,
     DecisionAuditEntry.__table__,
     LearningState.__table__,
+    OwnedSeedInventory.__table__,
+    OwnedSeedInventoryItem.__table__,
 )
 
 

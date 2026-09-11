@@ -91,6 +91,23 @@ class MinioStorageBackend(StorageBackend):
             response.close()
             response.release_conn()
 
+    async def read_bounded(self, path: str, max_bytes: int) -> bytes:
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError("storage_read_limit_invalid")
+
+        def read() -> bytes:
+            response = self.client.get_object(self.bucket, path)
+            try:
+                content = response.read(max_bytes + 1)
+                if len(content) > max_bytes:
+                    raise ValueError("storage_read_limit_exceeded")
+                return content
+            finally:
+                response.close()
+                response.release_conn()
+
+        return await asyncio.to_thread(read)
+
     async def delete(self, path: str) -> None:
         await asyncio.to_thread(self.client.remove_object, self.bucket, path)
 

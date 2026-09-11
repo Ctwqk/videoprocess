@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import uuid
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.autoflow.service import autoflow_service
 from app.channel_agent.clock import Clock
@@ -57,10 +59,14 @@ from app.schemas.channel_agent import (
     HealthSummary,
     LaneFormatCreate,
     ManualSeedCreate,
+    OwnedSeedInventoryApprove,
+    OwnedSeedInventoryCreate,
+    OwnedSeedInventoryRevoke,
     PublishingAccountCreate,
     QueueItemRead,
     TopicLaneCreate,
 )
+from app.services import owned_seed_inventory as owned_inventory
 from app.services.discovery_ingestion import (
     DiscoveryIngestionAuthorityError,
     DiscoveryIngestionConflictError,
@@ -73,6 +79,50 @@ from app.services.discovery_ingestion import (
 
 
 router = APIRouter(prefix="/api/v1/channel-agent", tags=["channel-agent"])
+
+
+def _inventory_operator(authorization: str = Header(default="")) -> str:
+    expected = settings.owned_seed_inventory_operator_token.get_secret_value()
+    supplied = authorization[7:] if authorization.startswith("Bearer ") else ""
+    subject = settings.owned_seed_inventory_operator_subject.strip()
+    matches = secrets.compare_digest(supplied.encode(), expected.encode())
+    if not settings.owned_seed_inventory_enabled or len(expected) < 32 or not matches or not 1 <= len(subject) <= 255:
+        raise HTTPException(status_code=403, detail="owned_inventory_operator_required")
+    return subject
+
+
+async def _inventory_result(db: AsyncSession, operation):
+    try:
+        return await operation
+    except owned_inventory.OwnedInventoryError as error:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except (SQLAlchemyError, ValueError, TypeError, KeyError):
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="owned_inventory_conflict") from None
+
+
+@router.post("/channels/{channel_id}/owned-seed-inventories")
+async def create_owned_inventory(channel_id: uuid.UUID, data: OwnedSeedInventoryCreate,
+                                 subject: str = Depends(_inventory_operator), db: AsyncSession = Depends(get_db)):
+    return await _inventory_result(db, owned_inventory.create_inventory(db, channel_id, data, subject))
+
+
+@router.get("/channels/{channel_id}/owned-seed-inventories/{inventory_id}")
+async def read_owned_inventory(channel_id: uuid.UUID, inventory_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    return await _inventory_result(db, owned_inventory.read_inventory(db, channel_id, inventory_id))
+
+
+@router.post("/channels/{channel_id}/owned-seed-inventories/{inventory_id}/approve")
+async def approve_owned_inventory(channel_id: uuid.UUID, inventory_id: uuid.UUID, data: OwnedSeedInventoryApprove,
+                                  subject: str = Depends(_inventory_operator), db: AsyncSession = Depends(get_db)):
+    return await _inventory_result(db, owned_inventory.approve_inventory(db, channel_id, inventory_id, data, subject))
+
+
+@router.post("/channels/{channel_id}/owned-seed-inventories/{inventory_id}/revoke")
+async def revoke_owned_inventory(channel_id: uuid.UUID, inventory_id: uuid.UUID, data: OwnedSeedInventoryRevoke,
+                                 subject: str = Depends(_inventory_operator), db: AsyncSession = Depends(get_db)):
+    return await _inventory_result(db, owned_inventory.revoke_inventory(db, channel_id, inventory_id, data, subject))
 
 
 class DryRunPatch(BaseModel):
@@ -219,6 +269,8 @@ async def get_channel(channel_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.patch("/channels/{channel_id}")
 async def patch_channel(channel_id: str, data: dict[str, Any], db: AsyncSession = Depends(get_db)):
+    if {"owned_seed_inventory_id", "tick_interval_minutes"} & data.keys():
+        raise HTTPException(status_code=400, detail="owned_inventory_typed_api_required")
     channel = await db.get(ChannelProfile, _uuid(channel_id))
     if channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
@@ -279,7 +331,11 @@ async def patch_lane(channel_id: str, lane_id: str, data: dict[str, Any], db: As
 
 @router.post("/channels/{channel_id}/accounts")
 async def create_account(channel_id: str, data: PublishingAccountCreate, db: AsyncSession = Depends(get_db)):
-    await _require_channel(db, channel_id)
+    channel = (await db.scalars(select(ChannelProfile).where(ChannelProfile.id == _uuid(channel_id)).with_for_update())).one_or_none()
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    if data.platform == "youtube":
+        await _inventory_result(db, owned_inventory.assert_account_binding_available(db, data.platform_account_id))
     row = PublishingAccount(channel_profile_id=_uuid(channel_id), **data.model_dump())
     db.add(row)
     await db.commit()
@@ -289,10 +345,17 @@ async def create_account(channel_id: str, data: PublishingAccountCreate, db: Asy
 
 @router.patch("/channels/{channel_id}/accounts/{account_id}")
 async def patch_account(channel_id: str, account_id: str, data: dict[str, Any], db: AsyncSession = Depends(get_db)):
-    channel = await _require_channel(db, channel_id)
+    channel = (await db.scalars(select(ChannelProfile).where(ChannelProfile.id == _uuid(channel_id)).with_for_update())).one_or_none()
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
     account = await db.get(PublishingAccount, _uuid(account_id))
     if account is None or account.channel_profile_id != channel.id:
         raise HTTPException(status_code=404, detail="Account not found")
+    if account.platform == "youtube":
+        for platform_id in sorted({account.platform_account_id, str(data.get("platform_account_id", account.platform_account_id))}):
+            await _inventory_result(db, owned_inventory.assert_account_binding_available(db, platform_id, account.id))
+        if set(data) - {"account_label"}:
+            await _inventory_result(db, owned_inventory.assert_account_mutable(db, account.id))
     for field in (
         "account_label",
         "platform_account_id",
