@@ -147,8 +147,8 @@ func newOwnedPGFixture(t *testing.T) *ownedPGFixture {
 	}
 	t.Cleanup(store.Close)
 	var revision string
-	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "039_registered_consumer_guard" {
-		t.Fatal("disposable database must be migrated to 039")
+	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "041_registered_consumer_terminal" {
+		t.Fatal("disposable database must be migrated to 041")
 	}
 	var now time.Time
 	if err := store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {

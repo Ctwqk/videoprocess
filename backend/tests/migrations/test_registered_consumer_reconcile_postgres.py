@@ -46,7 +46,7 @@ from tests.services.test_registered_consumer_reconcile import (
 from tests.services.test_registered_consumer_reconcile_runtime import invocation
 
 
-HEAD = "039_registered_consumer_guard"
+HEAD = "041_registered_consumer_terminal"
 SIGNATURE = "public.vp_registered_consumer_reconcile_guard(text,uuid[],uuid[])"
 CALL = "SELECT * FROM public.vp_registered_consumer_reconcile_guard($1::text,$2::uuid[],$3::uuid[])"
 
