@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -365,6 +368,39 @@ class FakeYouTubeClient:
         return []
 
 
+class YouTubeHistoryQualificationError(ValueError):
+    """Static errors only; Manager response bodies are not operator evidence."""
+
+
+@dataclass(frozen=True, repr=False)
+class YouTubeHistoryObservation:
+    manager_task_id: str
+    platform_video_id: str
+    actual_platform_channel_id: str
+
+
+def _history_require(condition: bool) -> None:
+    if not condition:
+        raise YouTubeHistoryQualificationError("owned_inventory_manager_observation_invalid")
+
+
+def _history_json(content: bytes) -> dict[str, Any]:
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            _history_require(key not in result)
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(content, object_pairs_hook=pairs)
+        json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        _history_require(isinstance(value, dict))
+        return value
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise YouTubeHistoryQualificationError("owned_inventory_manager_observation_invalid") from None
+
+
 class YouTubeManagerClient:
     def __init__(
         self,
@@ -408,6 +444,47 @@ class YouTubeManagerClient:
     async def fetch_status(self, *, video_id: str) -> dict[str, Any]:
         return await self._get(f"/api/videos/{quote(video_id, safe='')}/status")
 
+    @property
+    def history_endpoint_identity(self) -> str:
+        return "sha256:" + hashlib.sha256(self.base_url.encode("utf-8")).hexdigest()
+
+    async def qualify_upload(self, *, manager_task_id: str, video_id: str) -> YouTubeHistoryObservation:
+        try:
+            _history_require(str(uuid.UUID(manager_task_id)) == manager_task_id and
+                             bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id)))
+            task = await self._get(f"/api/status/{manager_task_id}", strict=True)
+            _history_require(set(task) == {"id", "type", "status", "progress", "result", "error"} and
+                             task["id"] == manager_task_id and task["type"] == "upload" and task["status"] == "completed" and
+                             type(task["progress"]) in {int, float} and task["progress"] == 100 and task["error"] is None and
+                             task["result"] == {"video_id": video_id, "url": f"https://www.youtube.com/watch?v={video_id}"})
+            video = await self._get(f"/api/videos/{video_id}/status", strict=True)
+            _history_require(set(video) == {"video_id", "privacy", "upload_status", "made_for_kids", "public_stats_viewable",
+                                          "title", "published_at", "processing_status", "raw"} and
+                             video["video_id"] == video_id and video["privacy"] == "unlisted" and
+                             video["upload_status"] == "processed" and video["processing_status"] == "succeeded" and
+                             type(video["made_for_kids"]) is bool and type(video["public_stats_viewable"]) is bool and
+                             isinstance(video["title"], str) and
+                             (video["published_at"] is None or isinstance(video["published_at"], str)))
+            raw = video["raw"]
+            _history_require(isinstance(raw, dict) and set(raw) == {"status", "snippet", "processingDetails"} and
+                             all(isinstance(value, dict) for value in raw.values()))
+            actual_channel = raw["snippet"].get("channelId")
+            _history_require(isinstance(actual_channel, str) and bool(re.fullmatch(r"UC[A-Za-z0-9_-]{22}", actual_channel)))
+            for section, alias, canonical in (
+                ("status", "privacyStatus", "privacy"), ("status", "uploadStatus", "upload_status"),
+                ("status", "madeForKids", "made_for_kids"), ("status", "publicStatsViewable", "public_stats_viewable"),
+                ("snippet", "title", "title"), ("snippet", "publishedAt", "published_at"),
+                ("processingDetails", "processingStatus", "processing_status"),
+            ):
+                if alias in raw[section]:
+                    value = raw[section][alias]
+                    _history_require(type(value) is type(video[canonical]) and value == video[canonical])
+            return YouTubeHistoryObservation(manager_task_id, video_id, actual_channel)
+        except httpx.HTTPError:
+            raise YouTubeHistoryQualificationError("owned_inventory_manager_read_failed") from None
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise YouTubeHistoryQualificationError("owned_inventory_manager_observation_invalid") from None
+
     async def refresh_token(self, account) -> bool:
         payload = await self._get("/api/auth/status")
         return bool(payload.get("authenticated"))
@@ -434,8 +511,16 @@ class YouTubeManagerClient:
             return []
         return [dict(item) for item in items if isinstance(item, dict)]
 
-    async def _get(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _get(self, path: str, *, params: dict[str, Any] | None = None, strict: bool = False) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
+            if strict:
+                async with client.stream("GET", f"{self.base_url}{path}", params=params) as response:
+                    response.raise_for_status()
+                    content = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        _history_require(len(content) + len(chunk) <= 512 * 1024)
+                        content.extend(chunk)
+                    return _history_json(bytes(content))
             response = await client.get(f"{self.base_url}{path}", params=params)
             response.raise_for_status()
             return _dict_response(response)

@@ -10,12 +10,17 @@ from typing import Any
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.channel_agent import clients as channel_clients
 from app.models.asset import Asset
 from app.models.channel_agent import ChannelOpsQueueItem, ChannelProfile, LaneFormatMatrix, ManualSeed, ProductionTask, PublishingAccount, TopicLane
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.owned_seed_inventory import OwnedSeedInventory, OwnedSeedInventoryItem
+from app.models.schedule import RuntimeSchedule
 from app.models.youtube_upload_operation import YouTubeUploadOperation
-from app.schemas.channel_agent import OwnedSeedInventoryApprove, OwnedSeedInventoryCreate, OwnedSeedInventoryRevoke
+from app.schemas.channel_agent import (
+    OwnedHistoryLocators, OwnedSeedInventoryApprove, OwnedSeedInventoryCreate, OwnedSeedInventoryCreateV2, OwnedSeedInventoryRevoke,
+)
+from app.services import owned_seed_inventory_history as history
 from app.storage import manager as storage_manager
 
 
@@ -193,7 +198,119 @@ async def _verify_manifest(db: AsyncSession, row: OwnedSeedInventory) -> list[Ow
     return items
 
 
-async def create_inventory(db: AsyncSession, channel_id: uuid.UUID, data: OwnedSeedInventoryCreate, subject: str) -> dict:
+def _history_sources(snapshot: history.OwnedHistorySnapshot, locators: OwnedHistoryLocators, target_account_id: str) -> dict:
+    require(locators.retired_unassigned_preupload is None, "owned_inventory_retirement_sealing_unavailable")
+    rows = snapshot.rows.as_dict()
+    groups: dict[str, dict] = {}
+    for locator in locators.operations:
+        op = history._one([o for o in rows["youtube_upload_operations"] if o["id"] == locator.operation_id], "owned_history_orphan")
+        task = history._one([t for t in rows["production_tasks"] if t["id"] == op["production_task_id"]], "owned_history_orphan")
+        account = history._one([a for a in rows["publishing_accounts"] if a["id"] == locator.legacy_account_id], "owned_history_orphan")
+        require(account["id"] != target_account_id and account["channel_profile_id"] == task["channel_profile_id"] == locator.legacy_channel_profile_id
+                and task["target_account_id"] == account["id"] and is_youtube_platform(account["platform"])
+                and account["platform_account_id"] in {"", snapshot.platform_channel_id}, "owned_inventory_history_scope_mismatch")
+        history._one([c for c in rows["channel_profiles"] if c["id"] == locator.legacy_channel_profile_id], "owned_history_orphan")
+        _, _, effect = history._normal_history(history._task_history(rows, task), None, snapshot.observed_at)
+        require(all(other["id"] == op["id"] or
+                    (other.get("manager_task_id") != op["manager_task_id"] and
+                     other.get("platform_video_id") != op["platform_video_id"])
+                    for other in rows["youtube_upload_operations"]), "owned_inventory_history_identity_ambiguous")
+        group = groups.setdefault(account["id"], {"legacy_account_id": account["id"],
+            "legacy_channel_profile_id": account["channel_profile_id"],
+            "account_descriptor_sha256": history.account_descriptor_sha256(account), "operations": [], "effects": []})
+        group["operations"].append(op)
+        group["effects"].append(effect)
+    for account_id, group in groups.items():
+        tasks = {t["id"] for t in rows["production_tasks"] if t["target_account_id"] == account_id}
+        operations = [o for o in rows["youtube_upload_operations"] if o["production_task_id"] in tasks]
+        require([o["id"] for o in operations] == [o["id"] for o in group["operations"]] and
+                tasks == {o["production_task_id"] for o in operations}, "owned_inventory_history_membership_changed")
+    return groups
+
+
+async def _observe_history_uploads(groups: dict, platform_channel_id: str) -> tuple[str, dict]:
+    try:
+        manager = channel_clients.build_youtube_manager_client()
+    except (RuntimeError, ValueError):
+        raise OwnedInventoryError("owned_inventory_manager_unavailable") from None
+    observed = {}
+    for group in groups.values():
+        for op in group["operations"]:
+            try:
+                value = await manager.qualify_upload(manager_task_id=op["manager_task_id"], video_id=op["platform_video_id"])
+            except channel_clients.YouTubeHistoryQualificationError as error:
+                raise OwnedInventoryError(str(error)) from None
+            require(value.actual_platform_channel_id == platform_channel_id, "owned_inventory_history_channel_mismatch")
+            observed[op["id"]] = value
+    return manager.history_endpoint_identity, observed
+
+
+async def _lock_history_scope(db: AsyncSession, channel_id: uuid.UUID, locators: OwnedHistoryLocators) -> None:
+    channels = {channel_id} | {uuid.UUID(locator.legacy_channel_profile_id) for locator in locators.operations}
+    if locators.retired_unassigned_preupload:
+        channels.add(uuid.UUID(locators.retired_unassigned_preupload.legacy_channel_profile_id))
+    for selected in sorted(channels, key=str):
+        await _row(db, ChannelProfile, selected, lock=True)
+    schedule = (await db.scalars(select(RuntimeSchedule).where(RuntimeSchedule.service_name == "videoprocess")
+        .with_for_update().execution_options(populate_existing=True))).one_or_none()
+    require(schedule is not None, "owned_inventory_schedule_missing")
+
+
+def _stable_binding(value: dict) -> dict:
+    result = history.FrozenJSON.from_value(value).as_dict()
+    qualification = result["qualification"]
+    qualification.pop("observed_at")
+    qualification.pop("facts_sha256")
+    for fact in qualification["sanitized_facts"]:
+        fact.pop("observed_at")
+    return result
+
+
+def _qualified_history(snapshot: history.OwnedHistorySnapshot, groups: dict, observation: tuple[str, dict],
+                       subject: str, reference: str) -> dict:
+    endpoint, observations = observation
+    existing, _, _ = history._approved_authority(snapshot.rows.as_dict(), snapshot.observed_at)
+    bindings = []
+    for account_id in sorted(groups):
+        group = groups[account_id]
+        facts = [{"operation_id": op["id"], "manager_task_id": observations[op["id"]].manager_task_id,
+                  "platform_video_id": observations[op["id"]].platform_video_id,
+                  "actual_platform_channel_id": observations[op["id"]].actual_platform_channel_id,
+                  "operation_sha256": history.history_sha256(op), "receipt_sha256": history.history_sha256(op["receipt_json"]),
+                  "observed_at": snapshot.observed_at.isoformat()} for op in group["operations"]]
+        first = facts[0]
+        qualification = {"observed_at": snapshot.observed_at.isoformat(), "server_subject": subject,
+            "manager_endpoint_identity": endpoint, "manager_task_id": first["manager_task_id"],
+            "platform_video_id": first["platform_video_id"], "actual_platform_channel_id": snapshot.platform_channel_id,
+            "sanitized_facts": facts, "facts_sha256": history.history_sha256(facts), "approval_reference": reference}
+        binding = {key: group[key] for key in ("legacy_account_id", "legacy_channel_profile_id", "account_descriptor_sha256")}
+        binding.update(platform="youtube", use="history_only", canonical_platform_channel_id=snapshot.platform_channel_id,
+                       qualified_operation_ids=[f["operation_id"] for f in facts], qualification=qualification)
+        if account_id in existing:
+            original = existing[account_id].document.as_dict()
+            binding["qualification"]["approval_reference"] = original["qualification"]["approval_reference"]
+            require(_stable_binding(binding) == _stable_binding(original), "owned_inventory_history_authority_conflict")
+            binding = original
+        history.HistoryOnlyBinding.parse(binding)
+        bindings.append(binding)
+    return {"version": 1, "bindings": bindings, "retired_unassigned_preupload": None}
+
+
+def _assess_qualified_draft(snapshot: history.OwnedHistorySnapshot, row: OwnedSeedInventory, subject: str, now: datetime) -> None:
+    # Only this server-verified draft is provisionally assessed; runtime stays approved-only.
+    rows = snapshot.rows.as_dict()
+    rows["owned_seed_inventories"] = [r for r in rows["owned_seed_inventories"] if r["id"] != str(row.id)]
+    rows["owned_seed_inventories"].append({"id": str(row.id), "state": "approved", "manifest_json": row.manifest_json,
+        "manifest_sha256": row.manifest_sha256, "channel_profile_id": str(row.channel_profile_id),
+        "target_account_id": str(row.target_account_id), "platform_channel_id": row.platform_channel_id,
+        "approved_at": now.isoformat(), "approved_by": subject, "approval_reference": f"owned-inventory-draft:{row.client_request_id}"})
+    result = history.assess_owned_history(history.OwnedHistorySnapshot.from_rows(rows,
+        platform_channel_id=snapshot.platform_channel_id, observed_at=snapshot.observed_at,
+        redis_observations=snapshot.redis_observations), now=now)
+    require(result.block_reason is None, result.block_reason or "owned_inventory_history_invalid")
+
+
+async def create_inventory(db: AsyncSession, channel_id: uuid.UUID, data: OwnedSeedInventoryCreate | OwnedSeedInventoryCreateV2, subject: str) -> dict:
     request_digest = sha256(data.model_dump(mode="json"))
     existing = (await db.scalars(select(OwnedSeedInventory).where(OwnedSeedInventory.client_request_id == uuid.UUID(data.client_request_id)))).one_or_none()
     if existing is not None:
@@ -201,14 +318,29 @@ async def create_inventory(db: AsyncSession, channel_id: uuid.UUID, data: OwnedS
         return await read_inventory(db, channel_id, existing.id)
     _, fingerprint = await _scope(db, channel_id, data)
     descriptors = await _observe_assets(db, [uuid.UUID(entry.asset_id) for entry in data.entries])
+    sources = {}
+    if isinstance(data, OwnedSeedInventoryCreateV2):
+        initial = await history.load_owned_history_evidence(db, platform_channel_id=data.platform_channel_id)
+        sources = _history_sources(initial, data.history_locators, data.target_account_id)
     # Storage I/O is outside the SQL transaction; all observations are rechecked below.
     await db.rollback()
     hashes = await _hash_assets(descriptors)
     for entry in data.entries:
         require(hashes[uuid.UUID(entry.asset_id)] == entry.expected_content_sha256, "owned_inventory_content_mismatch")
+    observation = None
+    if isinstance(data, OwnedSeedInventoryCreateV2):
+        observation = await _observe_history_uploads(sources, data.platform_channel_id)
+        await _lock_history_scope(db, channel_id, data.history_locators)
     _, fresh_fingerprint = await _scope(db, channel_id, data, lock=True)
     require(fingerprint == fresh_fingerprint, "owned_inventory_configuration_changed")
     await _lock_assets(db, descriptors)
+    qualified = None
+    if isinstance(data, OwnedSeedInventoryCreateV2):
+        fresh = await history.load_owned_history_evidence(db, platform_channel_id=data.platform_channel_id)
+        fresh_sources = _history_sources(fresh, data.history_locators, data.target_account_id)
+        require(sources == fresh_sources, "owned_inventory_history_changed")
+        assert observation is not None
+        qualified = _qualified_history(fresh, fresh_sources, observation, subject, f"owned-inventory-draft:{data.client_request_id}")
     existing = (await db.scalars(select(OwnedSeedInventory).where(OwnedSeedInventory.client_request_id == uuid.UUID(data.client_request_id)))).one_or_none()
     if existing is not None:
         require(existing.channel_profile_id == channel_id and existing.request_sha256 == request_digest, "owned_inventory_idempotency_conflict")
@@ -248,6 +380,11 @@ async def create_inventory(db: AsyncSession, channel_id: uuid.UUID, data: OwnedS
                          "privacy": "unlisted", "max_admissions": 7, "minimum_interval_seconds": 86400,
                          "tick_interval_minutes": 1, "configuration_sha256": fingerprint, "entries": entries}
     row.manifest_sha256 = sha256(row.manifest_json)
+    if qualified is not None:
+        row.manifest_json = {**row.manifest_json, "version": 2, "legacy_history": qualified}
+        row.manifest_sha256 = sha256(row.manifest_json)
+        history.decode_history_manifest(row.manifest_json)
+        _assess_qualified_draft(fresh, row, subject, now)
     await db.commit()
     return await read_inventory(db, channel_id, row.id)
 
@@ -292,10 +429,52 @@ async def closeout(db: AsyncSession, row: OwnedSeedInventory) -> dict:
     return {"status": "ready", "sha256": sha256(evidence), "evidence": json.loads(canonical(evidence))}
 
 
+async def _requalify_v2_draft(db: AsyncSession, row: OwnedSeedInventory, subject: str) -> None:
+    decoded = history.decode_history_manifest(row.manifest_json)
+    assert decoded.legacy_history is not None
+    require(decoded.legacy_history.retired_unassigned_preupload is None, "owned_inventory_retirement_sealing_unavailable")
+    locators = OwnedHistoryLocators.model_validate({"operations": sorted([
+        {"operation_id": operation_id, "legacy_account_id": b.legacy_account_id,
+         "legacy_channel_profile_id": b.legacy_channel_profile_id}
+        for b in decoded.legacy_history.bindings for operation_id in b.qualified_operation_ids], key=lambda locator: locator["operation_id"])})
+    row_id, channel_id, platform, target = row.id, row.channel_profile_id, row.platform_channel_id, str(row.target_account_id)
+    digest, reference = row.manifest_sha256, f"owned-inventory-draft:{row.client_request_id}"
+    items = await _verify_manifest(db, row)
+    _, fingerprint = await _scope(db, channel_id, row)
+    require(fingerprint == row.manifest_json["configuration_sha256"], "owned_inventory_configuration_changed")
+    descriptors = await _observe_assets(db, [item.asset_id for item in items])
+    expected = {item.asset_id: (item.content_sha256, item.storage_descriptor_json) for item in items}
+    require(all(canonical(value) == canonical(expected[key][1]) for key, value in descriptors.items()), "owned_inventory_asset_changed")
+    initial = await history.load_owned_history_evidence(db, platform_channel_id=platform)
+    sources = _history_sources(initial, locators, target)
+    await db.rollback()
+    hashes = await _hash_assets(descriptors)
+    require(all(hashes[key] == expected[key][0] for key in hashes), "owned_inventory_content_mismatch")
+    observation = await _observe_history_uploads(sources, platform)
+    await _lock_history_scope(db, channel_id, locators)
+    await lock_platform_scope(db, platform)
+    row = await _row(db, OwnedSeedInventory, row_id, lock=True)
+    require(row.manifest_sha256 == digest and row.state == "draft" and row.approved_at is None, "owned_inventory_manifest_changed")
+    _, fresh_fingerprint = await _scope(db, channel_id, row, lock=True)
+    require(fingerprint == fresh_fingerprint, "owned_inventory_configuration_changed")
+    await _verify_manifest(db, row)
+    await _lock_assets(db, descriptors)
+    fresh = await history.load_owned_history_evidence(db, platform_channel_id=platform)
+    fresh_sources = _history_sources(fresh, locators, target)
+    require(sources == fresh_sources, "owned_inventory_history_changed")
+    qualified = _qualified_history(fresh, fresh_sources, observation, subject, reference)
+    require([_stable_binding(b) for b in qualified["bindings"]] ==
+            [_stable_binding(b.document.as_dict()) for b in decoded.legacy_history.bindings], "owned_inventory_history_changed")
+    _assess_qualified_draft(fresh, row, subject, await _now(db))
+
+
 async def approve_inventory(db: AsyncSession, channel_id: uuid.UUID, inventory_id: uuid.UUID,
                             data: OwnedSeedInventoryApprove, subject: str) -> dict:
     row = await _row(db, OwnedSeedInventory, inventory_id)
     require(row.channel_profile_id == channel_id and row.manifest_sha256 == data.manifest_sha256, "owned_inventory_manifest_mismatch")
+    if row.manifest_json.get("version") == 2:
+        await _requalify_v2_draft(db, row, subject)
+        raise OwnedInventoryError("owned_inventory_v2_activation_disabled")
     items = await _verify_manifest(db, row)
     _, fingerprint = await _scope(db, channel_id, row)
     require(fingerprint == row.manifest_json["configuration_sha256"], "owned_inventory_configuration_changed")

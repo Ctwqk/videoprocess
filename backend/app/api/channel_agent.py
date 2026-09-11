@@ -61,6 +61,7 @@ from app.schemas.channel_agent import (
     ManualSeedCreate,
     OwnedSeedInventoryApprove,
     OwnedSeedInventoryCreate,
+    OwnedSeedInventoryCreateV2,
     OwnedSeedInventoryRevoke,
     PublishingAccountCreate,
     QueueItemRead,
@@ -103,7 +104,7 @@ async def _inventory_result(db: AsyncSession, operation):
 
 
 @router.post("/channels/{channel_id}/owned-seed-inventories")
-async def create_owned_inventory(channel_id: uuid.UUID, data: OwnedSeedInventoryCreate,
+async def create_owned_inventory(channel_id: uuid.UUID, data: OwnedSeedInventoryCreate | OwnedSeedInventoryCreateV2,
                                  subject: str = Depends(_inventory_operator), db: AsyncSession = Depends(get_db)):
     return await _inventory_result(db, owned_inventory.create_inventory(db, channel_id, data, subject))
 

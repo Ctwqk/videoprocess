@@ -87,6 +87,47 @@ class OwnedSeedInventoryCreate(BaseModel):
         return self
 
 
+class OwnedHistoryOperationLocator(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    operation_id: InventoryUUID
+    legacy_account_id: InventoryUUID
+    legacy_channel_profile_id: InventoryUUID
+
+
+class OwnedRetiredPreuploadLocator(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    operation_id: Literal["c25b9c38-b96a-4a21-80d0-352180cea206"]
+    legacy_account_id: Literal["2c4184d5-a02e-41e3-aeeb-16db8122f6e1"]
+    legacy_channel_profile_id: Literal["4057a1a3-c37c-4bae-85a9-6d9d3dcac869"]
+
+
+class OwnedHistoryLocators(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    operations: Annotated[list[OwnedHistoryOperationLocator], Field(max_length=128)]
+    retired_unassigned_preupload: OwnedRetiredPreuploadLocator | None = None
+
+    @model_validator(mode="after")
+    def exact_unique_scope(self) -> OwnedHistoryLocators:
+        ids = [item.operation_id for item in self.operations]
+        if ids != sorted(set(ids)) or not ids and self.retired_unassigned_preupload is None:
+            raise ValueError("nonempty sorted unique history locators required")
+        if self.retired_unassigned_preupload and self.retired_unassigned_preupload.operation_id in ids:
+            raise ValueError("retired operation is not an upload qualification")
+        return self
+
+
+class OwnedSeedInventoryCreateV2(OwnedSeedInventoryCreate):
+    version: Literal[2]
+    history_locators: OwnedHistoryLocators
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def integer_version(cls, value: Any) -> Any:
+        if type(value) is not int:
+            raise ValueError("integer version required")
+        return value
+
+
 class OwnedSeedInventoryApprove(BaseModel):
     model_config = ConfigDict(extra="forbid")
     manifest_sha256: InventorySHA256
