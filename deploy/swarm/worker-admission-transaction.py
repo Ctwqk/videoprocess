@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import datetime
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
 import os
 import re
+import runpy
 import secrets
 import stat
 import sys
@@ -4213,6 +4215,174 @@ def lookup_vision_job(arguments: list[str]) -> None:
     finally:
         os.close(transactions_descriptor)
         os.close(root_descriptor)
+
+
+_REGISTERED_PROTOCOL: dict[str, Any] | None = None
+REGISTERED_RECONCILE_NAME = "registered-reconcile.json"
+
+
+def _registered_protocol() -> dict[str, Any]:
+    global _REGISTERED_PROTOCOL
+    if _REGISTERED_PROTOCOL is None:
+        _REGISTERED_PROTOCOL = runpy.run_path(str(
+            Path(__file__).resolve().parents[2]
+            / "backend/app/services/registered_consumer_reconcile_job.py"
+        ))
+    return _REGISTERED_PROTOCOL
+
+
+@contextmanager
+def _registered_context(raw_root: str, raw_descriptor: str, raw_revision: str):
+    """Same writer lock/CAS as the main journal; no deployment activation."""
+    root_fd = transactions_fd = transaction_fd = None
+    try:
+        _require_writer_lock(raw_root, raw_descriptor)
+        _root, root_fd, transactions_fd = _open_transactions(raw_root, create=False)
+        document, _identity = _read_active_from_descriptor(transactions_fd, allow_missing=False)
+        if (document is None or document["phase"] != "FORWARD_APPLYING"
+                or document["operation"] is not None
+                or document["revision"] != _parse_revision(raw_revision)):
+            raise TransactionError
+        transaction_fd = _open_child_directory(
+            transactions_fd, document["transaction_id"], create=True,
+        )
+        yield document, transaction_fd
+    except Exception:
+        raise TransactionError from None
+    finally:
+        for descriptor in (transaction_fd, transactions_fd, root_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def _registered_selection(document: dict, binding: dict, service_id: str | None,
+                          verify_owner: Any) -> None:
+    """Task2 must supply live owning-shell FD9/FD19 and exact-job verification.
+
+    There is deliberately no default verifier, CLI dispatch, or stale descriptor
+    boolean. The callback must raise on refusal and return None only on success.
+    """
+    _registered_protocol()["validate_binding"](binding)
+    if (binding["transaction_id"] != document["transaction_id"]
+            or binding["release_commit"] != document["target_commit"]
+            or binding["binding_revision"] > document["revision"]):
+        raise TransactionError
+    workers = document["forward"]["workers"]
+    if (len(workers) != 4
+            or any(worker["applied_stage"] != "verified"
+                   or worker["commit"] != binding["release_commit"] for worker in workers)
+            or {worker["service"]: [worker["generation"], worker["image"]]
+                for worker in workers} != binding["targets"]):
+        raise TransactionError
+    control = document["forward"]["control"]
+    credentials = binding["credentials"]
+    if (control is None or control["generation"] != credentials["control_generation"]
+            or not any(secret["purpose"] == "operator"
+                       and secret["docker_secret_id"] == credentials["database_secret_id"]
+                       and secret["name"] == "vp-wc-operator-" + credentials["control_generation"]
+                       for secret in control["secrets"])):
+        raise TransactionError
+    if document["runtime_redis"].get("control") != {
+        "runtime_generation": credentials["redis_generation"],
+        "secret_name": "vp-control-redis-" + credentials["redis_generation"],
+        "docker_secret_id": credentials["redis_secret_id"],
+    }:
+        raise TransactionError
+    if not callable(verify_owner) or verify_owner(binding, service_id) is not None:
+        raise TransactionError
+
+
+def _registered_files(raw_root: str, binding: dict) -> None:
+    files = binding["files"]
+    request, replies = (Path(files[key]["path"]) for key in ("request", "replies"))
+    if request.name != "requests" or replies.name != "replies" or request.parent != replies.parent:
+        raise TransactionError
+    relative = request.parent.relative_to(Path(raw_root))
+    if not relative.parts or any(part in {".", ".."} for part in relative.parts):
+        raise TransactionError
+    _root, descriptor = _open_admission_root(raw_root)
+    try:
+        for part in relative.parts:
+            child = _open_child_directory(descriptor, part, create=False)
+            os.close(descriptor)
+            descriptor = child
+        for key, mode, directory in (("request", 0o602, False), ("replies", 0o755, True)):
+            if (files[key]["uid"], files[key]["gid"]) != (os.getuid(), os.getgid()):
+                raise TransactionError
+            fd = _registered_protocol()["open_checked"](files[key], os.O_RDONLY, mode, directory=directory)
+            os.close(fd)
+    finally:
+        os.close(descriptor)
+
+
+def _read_registered_record(descriptor: int) -> tuple[dict, tuple[int, int]]:
+    before = os.stat(REGISTERED_RECONCILE_NAME, dir_fd=descriptor, follow_symlinks=False)
+    _require_regular(before, FILE_MODE, single_link=True)
+    fd = os.open(REGISTERED_RECONCILE_NAME, _read_file_flags(), dir_fd=descriptor)
+    try:
+        opened = os.fstat(fd)
+        _require_regular(opened, FILE_MODE, single_link=True)
+        if _identity(before) != _identity(opened):
+            raise TransactionError
+        record = _decode_canonical(_read_limited(fd))
+        _registered_protocol()["validate_record"](record)
+        return record, _identity(opened)
+    finally:
+        os.close(fd)
+
+
+def prepare_registered_reconcile(raw_root: str, raw_descriptor: str, raw_revision: str,
+                                 binding: dict, *, verify_owner: Any) -> None:
+    with _registered_context(raw_root, raw_descriptor, raw_revision) as (document, descriptor):
+        _registered_selection(document, binding, None, verify_owner)
+        if binding["binding_revision"] != document["revision"]:
+            raise TransactionError
+        _registered_files(raw_root, binding)
+        protocol = _registered_protocol()
+        record = protocol["new_record"](binding)
+        if protocol["read_request"](record) is not None or os.stat(binding["files"]["request"]["path"]).st_size:
+            raise TransactionError
+        _write_document(descriptor, REGISTERED_RECONCILE_NAME, record,
+                        expected_identity=None, validator=protocol["validate_record"])
+
+
+def bind_registered_reconcile_job(raw_root: str, raw_descriptor: str, raw_revision: str,
+                                  attempt_id: str, service_id: str, descriptor_sha256: str,
+                                  *, verify_owner: Any) -> None:
+    with _registered_context(raw_root, raw_descriptor, raw_revision) as (document, descriptor):
+        record, identity = _read_registered_record(descriptor)
+        binding = record["binding"]
+        _require_string(service_id, r"[a-z0-9]{12,64}", maximum=64)
+        if (attempt_id != binding["attempt_id"] or descriptor_sha256 != binding["descriptor_sha256"]
+                or record["service_id"] not in {None, service_id} or record["sequence"] != 0):
+            raise TransactionError
+        _registered_selection(document, binding, service_id, verify_owner)
+        record["service_id"] = service_id
+        _write_document(descriptor, REGISTERED_RECONCILE_NAME, record, expected_identity=identity,
+                        validator=_registered_protocol()["validate_record"])
+
+
+def answer_registered_reconcile(raw_root: str, raw_descriptor: str, raw_revision: str,
+                                *, verify_owner: Any) -> bool:
+    """Consume and fsync before replying. An acknowledged prefix is never replayed."""
+    with _registered_context(raw_root, raw_descriptor, raw_revision) as (document, descriptor):
+        protocol = _registered_protocol()
+        record, identity = _read_registered_record(descriptor)
+        if record["service_id"] is None:
+            raise TransactionError
+        _registered_files(raw_root, record["binding"])
+        found = protocol["read_request"](record)
+        if found is None:
+            return False
+        _registered_selection(document, record["binding"], record["service_id"], verify_owner)
+        if protocol["read_request"](record) != found:
+            raise TransactionError
+        request, prefix = found
+        advanced = protocol["advance_record"](record, request, prefix)
+        _write_document(descriptor, REGISTERED_RECONCILE_NAME, advanced,
+                        expected_identity=identity, validator=protocol["validate_record"])
+        protocol["write_reply"](record["binding"]["files"], request)
+        return True
 
 
 def queue_retirement(arguments: list[str]) -> None:

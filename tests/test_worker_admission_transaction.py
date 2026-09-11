@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 HELPER_PATH = (
@@ -649,6 +651,193 @@ vp_reconcile_worker_admission_transaction
         self.assertFalse(self.active.exists())
         done = json.loads((self.active.parent / TRANSACTION_ID / "done.json").read_bytes())
         self.assertEqual((done["phase"], done["outcome"]), ("DONE", "rolled_back"))
+
+
+class RegisteredReconcileJournalTests(unittest.TestCase):
+    def setUp(self):
+        self.assertIn("prepare_registered_reconcile", HELPER, "Task1 journal operations missing")
+        fixture = RollbackPreparedSecretTests(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.fixture = fixture
+        self.root, self.fd = fixture.root, fixture.lock_fd
+        self.protocol = HELPER["_registered_protocol"]()
+        state = fixture.state
+        state.update(phase="FORWARD_APPLYING", revision=71)
+        state["failed_forward"] = dict(captured=False, control=None, services=[])
+        state["rollback"] = dict(attempt=0, namespace=None, marker_generation=None,
+                                  control=None, marker=None, workers=[])
+        control = copy.deepcopy(state["baseline"]["control"])
+        control["secrets"][0].update(docker_secret_id="a" * 25,
+                                     name="vp-wc-operator-" + control["generation"])
+        state["forward"]["control"] = control
+        state["runtime_redis"]["control"] = dict(
+            runtime_generation="redis-1", secret_name="vp-control-redis-redis-1",
+            docker_secret_id="b" * 25,
+        )
+        state["forward"]["workers"] = []
+        for index, service in enumerate(sorted(HELPER["RUNTIME_AUTHORITY_SERVICES"])):
+            worker = copy.deepcopy(fixture.worker)
+            worker.update(service=service, generation=900 + index, commit="2" * 40,
+                          image="vp-worker:deploy-222222222222", applied_stage="verified",
+                          docker_service_id=f"{index + 900:024x}", target_spec_digest="a" * 64)
+            for purpose, serial in (("database", 700 + index), ("admission", 800 + index)):
+                worker[purpose + "_secret"] = secret(service, worker["generation"], purpose,
+                                                     service + "-" + purpose, serial)
+            state["forward"]["workers"].append(worker)
+        fixture.write_state()
+        attempt = self.root / "handshake"
+        attempt.mkdir(mode=0o700)
+        files = self.protocol["prepare_files"](attempt)
+        workers = state["forward"]["workers"]
+        # Host journal fixture tests the independently validated pin projection;
+        # actual Unit1 pin decoding is exercised by the backend callback tests.
+        pins = dict(version=1, transaction_id=TRANSACTION_ID, revision=71,
+                    release_commit="2" * 40, workers=[dict(current=dict(
+                        service_name=w["service"], generation=w["generation"],
+                        release_commit=w["commit"], image_identity=w["image"]),
+                        predecessor={}) for w in workers])
+        pin_json = json.dumps(pins, sort_keys=True, separators=(",", ":"))
+        self.binding = dict(
+            version=1, attempt_id="00000000-0000-0000-0000-000000000987", replay_only=False,
+            transaction_id=TRANSACTION_ID, binding_revision=71, release_commit="2" * 40,
+            pin_json=pin_json, pin_sha256=hashlib.sha256(pin_json.encode()).hexdigest(),
+            targets={w["service"]: [w["generation"], w["image"]] for w in workers},
+            commands={s: "e" * 64 for s in self.protocol["STREAMS"].values()},
+            credentials=dict(control_generation=control["generation"], redis_generation="redis-1",
+                             redis_username="vp_control_1", database_secret_id="a" * 25,
+                             redis_secret_id="b" * 25, database_secret_sha256="c" * 64,
+                             redis_secret_sha256="d" * 64), files=files, descriptor_sha256="f" * 64,
+        )
+        self.checked = []
+
+    def verify(self, binding, service_id):
+        self.assertEqual(binding, self.binding)
+        HELPER["acquire_lock"](str(self.root), str(self.fd))
+        self.checked.append(service_id)
+
+    def prepare(self):
+        HELPER["prepare_registered_reconcile"](
+            str(self.root), str(self.fd), "71", self.binding, verify_owner=self.verify)
+        HELPER["bind_registered_reconcile_job"](
+            str(self.root), str(self.fd), "71", self.binding["attempt_id"],
+            "j" * 25, self.binding["descriptor_sha256"], verify_owner=self.verify)
+
+    def record(self):
+        path = self.root / "transactions" / TRANSACTION_ID / "registered-reconcile.json"
+        return json.loads(path.read_bytes())
+
+    def request(self, action="before_eval", *, sequence=1, outcome=None, **changes):
+        value = dict(version=1, attempt_id=self.binding["attempt_id"], sequence=sequence,
+                     nonce=f"{sequence:032x}", binding_sha256=self.protocol["digest"](self.binding),
+                     action=action, stream="vp:tasks:ffmpeg_go", command_sha256="e" * 64,
+                     outcome=outcome)
+        if action == "revalidate":
+            value.update(stream=None, command_sha256=None)
+        value.update(changes)
+        with open(self.binding["files"]["request"]["path"], "ab") as handle:
+            handle.write(self.protocol["canonical"](value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        return value
+
+    def answer(self, revision="71", verify=None):
+        return HELPER["answer_registered_reconcile"](
+            str(self.root), str(self.fd), revision, verify_owner=verify or self.verify)
+
+    def test_intent_is_durable_before_reply_and_no_second_authorization(self):
+        self.prepare()
+        request = self.request()
+        observed = []
+        original = self.protocol["write_reply"]
+
+        def reply(files, value):
+            observed.append(self.record()["streams"]["vp:tasks:ffmpeg_go"])
+            original(files, value)
+
+        with patch.dict(self.protocol, write_reply=reply):
+            self.assertTrue(self.answer())
+        self.assertEqual(observed, ["consumed"])
+        self.assertTrue(self.protocol["read_reply"](self.binding["files"], request))
+        self.request(sequence=2)
+        with self.assertRaises(HELPER["TransactionError"]):
+            self.answer()
+        self.assertEqual(self.record()["sequence"], 1)
+
+    def test_lost_reply_survives_reload_without_reissuing(self):
+        self.prepare()
+        self.request()
+        with patch.dict(self.protocol, write_reply=lambda *args: (_ for _ in ()).throw(OSError())):
+            with self.assertRaises(HELPER["TransactionError"]):
+                self.answer()
+        self.assertEqual(self.record()["streams"]["vp:tasks:ffmpeg_go"], "consumed")
+        self.assertFalse(self.answer())
+        self.assertFalse((Path(self.binding["files"]["replies"]["path"]) / "reply.json").exists())
+
+    def test_unknown_is_durable_and_blocks_other_streams(self):
+        self.prepare()
+        self.request()
+        self.answer()
+        self.request("after_eval", sequence=2, outcome="unknown")
+        self.answer()
+        self.assertEqual(self.record()["streams"]["vp:tasks:ffmpeg_go"], "unknown")
+        self.request(sequence=3, stream="vp:tasks:ffmpeg")
+        with self.assertRaises(HELPER["TransactionError"]):
+            self.answer()
+
+    def test_failed_fsync_cannot_publish_reply(self):
+        self.prepare()
+        self.request()
+        with patch.dict(HELPER["answer_registered_reconcile"].__globals__,
+                        _write_document=lambda *args, **kw: (_ for _ in ()).throw(OSError())):
+            with self.assertRaises(HELPER["TransactionError"]):
+                self.answer()
+        self.assertEqual(self.record()["sequence"], 0)
+        self.assertFalse((Path(self.binding["files"]["replies"]["path"]) / "reply.json").exists())
+
+    def test_binding_revision_is_frozen_but_journal_revision_can_advance(self):
+        self.prepare()
+        self.fixture.state["revision"] = 72
+        self.fixture.write_state()
+        self.request("revalidate")
+        self.assertTrue(self.answer("72"))
+        self.assertEqual(self.record()["binding"]["binding_revision"], 71)
+
+    def test_fresh_owner_refusal_prevents_write(self):
+        self.prepare()
+        self.request()
+        with self.assertRaises(HELPER["TransactionError"]):
+            self.answer(verify=lambda *args: (_ for _ in ()).throw(ValueError("private")))
+        self.assertEqual(self.record()["sequence"], 0)
+
+    def test_no_overwrite_or_rebind(self):
+        self.prepare()
+        with self.assertRaises(HELPER["TransactionError"]):
+            HELPER["prepare_registered_reconcile"](
+                str(self.root), str(self.fd), "71", self.binding, verify_owner=self.verify)
+        with self.assertRaises(HELPER["TransactionError"]):
+            HELPER["bind_registered_reconcile_job"](
+                str(self.root), str(self.fd), "71", self.binding["attempt_id"],
+                "k" * 25, self.binding["descriptor_sha256"], verify_owner=self.verify)
+
+    def test_fresh_phase_target_credentials_and_revision_refusal(self):
+        for change in ("phase", "target", "credentials", "revision"):
+            with self.subTest(change=change):
+                original = copy.deepcopy(self.fixture.state)
+                if change == "phase":
+                    self.fixture.state["phase"] = "FORWARD_VERIFIED"
+                elif change == "target":
+                    self.fixture.state["forward"]["workers"][0]["generation"] += 1
+                elif change == "credentials":
+                    self.fixture.state["runtime_redis"]["control"]["docker_secret_id"] = "z" * 25
+                else:
+                    self.fixture.state["revision"] += 1
+                self.fixture.write_state(validate=False)
+                with self.assertRaises(HELPER["TransactionError"]):
+                    HELPER["prepare_registered_reconcile"](
+                        str(self.root), str(self.fd), "71", self.binding, verify_owner=self.verify)
+                self.fixture.state = original
+                self.fixture.write_state()
 
 
 if __name__ == "__main__":
