@@ -54,6 +54,33 @@ def _finite_video_status_number(value: str) -> float:
     return number
 
 
+def _validate_video_status_metadata(payload: dict[str, Any]) -> None:
+    for key, expected in (("made_for_kids", bool), ("public_stats_viewable", bool), ("title", str)):
+        if key in payload and type(payload[key]) is not expected:
+            raise RuntimeError("ack drill video status metadata is malformed")
+    raw = payload.get("raw", {})
+    if not isinstance(raw, dict) or set(raw) - {"status", "snippet", "processingDetails"}:
+        raise RuntimeError("ack drill video status metadata is malformed")
+    # These are the Manager's exact projections, never alternate sources of authority.
+    for section, aliases in (
+        ("status", (
+            ("privacyStatus", "privacy"), ("uploadStatus", "upload_status"),
+            ("madeForKids", "made_for_kids"), ("publicStatsViewable", "public_stats_viewable"),
+        )),
+        ("snippet", (("title", "title"), ("publishedAt", "published_at"))),
+        ("processingDetails", (("processingStatus", "processing_status"),)),
+    ):
+        values = raw.get(section, {})
+        if not isinstance(values, dict):
+            raise RuntimeError("ack drill video status metadata is malformed")
+        for alias, canonical in aliases:
+            if alias in values and (
+                canonical not in payload or type(values[alias]) is not type(payload[canonical])
+                or values[alias] != payload[canonical]
+            ):
+                raise RuntimeError("ack drill video status aliases disagree")
+
+
 @dataclass(frozen=True)
 class AckDrillArmingIdentity:
     release_commit: str
@@ -386,10 +413,14 @@ class OwnedUnlistedAckDrill:
                 raise RuntimeError("ack drill video status is malformed") from exc
             if (
                 not isinstance(payload, dict)
-                or set(payload) - {"video_id", "privacy", "upload_status", "processing_status", "published_at"}
+                or set(payload) - {
+                    "video_id", "privacy", "upload_status", "processing_status", "published_at",
+                    "made_for_kids", "public_stats_viewable", "title", "raw",
+                }
                 or payload.get("video_id") != video_id or payload.get("privacy") != "unlisted"
             ):
                 raise RuntimeError("ack drill requires exact processed unlisted video state")
+            _validate_video_status_metadata(payload)
             upload, processing = payload.get("upload_status"), payload.get("processing_status")
             if upload == "processed" and ("processing_status" not in payload or processing == "succeeded"):
                 return

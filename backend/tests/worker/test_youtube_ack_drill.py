@@ -318,6 +318,185 @@ async def test_video_verifier_preserves_deployed_canonical_fields(target, state_
     ]
 
 
+@pytest.fixture
+def manager_video_status():
+    # Same nine-field/three-raw-section shape as the captured D415 Manager response.
+    return {
+        "video_id": "video", "privacy": "unlisted", "upload_status": "processed",
+        "made_for_kids": False, "public_stats_viewable": True, "title": "Owned canary",
+        "published_at": "2026-09-11T01:07:12Z", "processing_status": "succeeded",
+        "raw": {
+            "status": {
+                "uploadStatus": "processed", "privacyStatus": "unlisted", "license": "youtube",
+                "embeddable": True, "publicStatsViewable": True, "madeForKids": False,
+            },
+            "snippet": {
+                "publishedAt": "2026-09-11T01:07:12Z", "channelId": "UC" + "a" * 22,
+                "title": "Owned canary", "description": "Owned fixture description",
+                "thumbnails": {
+                    "default": {"url": "https://i.ytimg.com/vi/video/default.jpg", "width": 120, "height": 90},
+                    "medium": {"url": "https://i.ytimg.com/vi/video/mqdefault.jpg", "width": 320, "height": 180},
+                    "high": {"url": "https://i.ytimg.com/vi/video/hqdefault.jpg", "width": 480, "height": 360},
+                    "standard": {"url": "https://i.ytimg.com/vi/video/sddefault.jpg", "width": 640, "height": 480},
+                    "maxres": {"url": "https://i.ytimg.com/vi/video/maxresdefault.jpg", "width": 1280, "height": 720},
+                },
+                "channelTitle": "Owned fixture", "tags": ["AutoFlow", "owned"], "categoryId": "22",
+                "liveBroadcastContent": "none", "defaultLanguage": "en",
+                "localized": {"title": "Owned canary", "description": "Owned fixture description"},
+            },
+            "processingDetails": {
+                "processingStatus": "succeeded", "fileDetailsAvailability": "available",
+                "processingIssuesAvailability": "available", "tagSuggestionsAvailability": "inProgress",
+                "editorSuggestionsAvailability": "inProgress", "thumbnailsAvailability": "available",
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_deployed_manager_contract_supports_first_and_resume_receipt_checks(
+    target, state_dir, manager_video_status,
+):
+    api = drill_api()
+    helper = api.OwnedUnlistedAckDrill(target, state_dir=state_dir)
+    claim = reserved(target)
+    prepare(helper, target, claim)
+    operation = claim.operation
+    operation.request_attempted_at = datetime.now(timezone.utc)
+    helper.record_post_attempt(target.context, operation)
+    manager_task_id = str(uuid.uuid4())
+    operation.status, operation.manager_task_id = "submitted", manager_task_id
+    helper.record_submitted(target.context, operation, manager_task_id)
+
+    async def load_submitted(*args, **kwargs):
+        return UploadOperationClaim("resume", operation)
+
+    store, requests = SimpleNamespace(load_submitted=load_submitted), []
+
+    def route(request):
+        requests.append(request)
+        return httpx.Response(200, json=manager_video_status)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        with pytest.raises(api.InjectedPreReceiptAbort) as aborted:
+            await helper.before_receipt(
+                store, target.context, operation, manager_task_id, "video", client, asyncio.Event(),
+            )
+        helper.authenticate_abort(aborted.value, target.context, operation.id, manager_task_id)
+        operation = await helper.load_for_resume(store, target.context, asyncio.Event())
+        await helper.before_receipt(
+            store, target.context, operation, manager_task_id, "video", client, asyncio.Event(),
+        )
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/api/videos/video/status"), ("GET", "/api/videos/video/status"),
+    ]
+    events = [record["event"] for record in journal_records(state_dir)]
+    assert "processed_unlisted_get_1" in events and "processed_unlisted_get_2" in events
+    assert operation.receipt_json == {} and operation.platform_video_id is None
+
+
+@pytest.mark.parametrize("path,value", [
+    (("made_for_kids",), 0), (("public_stats_viewable",), 1), (("title",), []),
+    (("raw",), []), (("raw", "status"), None), (("raw", "snippet"), []),
+    (("raw", "processingDetails"), "succeeded"), (("raw", "id"), "other"),
+    (("raw", "status", "privacyStatus"), "public"),
+    (("raw", "status", "uploadStatus"), "failed"),
+    (("raw", "status", "madeForKids"), True),
+    (("raw", "status", "madeForKids"), 0),
+    (("raw", "status", "publicStatsViewable"), False),
+    (("raw", "status", "publicStatsViewable"), 1),
+    (("raw", "snippet", "title"), "other"),
+    (("raw", "snippet", "publishedAt"), "2026-09-11T00:00:00Z"),
+    (("raw", "processingDetails", "processingStatus"), "failed"),
+    (("video_id",), "other"), (("privacy",), "public"),
+    (("upload_status",), "completed"), (("processing_status",), None),
+    (("privacyStatus",), "unlisted"), (("unexpected",), True),
+])
+@pytest.mark.asyncio
+async def test_deployed_manager_contract_rejects_malformed_or_conflicting_fields(
+    target, state_dir, manager_video_status, path, value,
+):
+    helper = drill_api().OwnedUnlistedAckDrill(target, state_dir=state_dir)
+    prepare(helper, target, reserved(target))
+    node = manager_video_status
+    for key in path[:-1]:
+        node = node[key]
+    node[path[-1]] = value
+    requests = []
+
+    def route(request):
+        requests.append(request)
+        return httpx.Response(200, json=manager_video_status)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        with pytest.raises(RuntimeError):
+            await helper.verify_video(client, "video", asyncio.Event())
+    assert len(requests) == 1 and not (state_dir / "consumed.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_deployed_manager_contract_polls_matching_explicit_nonterminal_state(
+    target, state_dir, manager_video_status,
+):
+    helper = drill_api().OwnedUnlistedAckDrill(target, state_dir=state_dir)
+    prepare(helper, target, reserved(target))
+    requests = []
+
+    def route(request):
+        requests.append(request)
+        payload = json.loads(json.dumps(manager_video_status))
+        if len(requests) == 1:
+            payload["upload_status"] = payload["raw"]["status"]["uploadStatus"] = "uploaded"
+            payload["processing_status"] = payload["raw"]["processingDetails"]["processingStatus"] = "processing"
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(route)) as client:
+        await helper.verify_video(client, "video", asyncio.Event())
+    assert len(requests) == 2 and all(request.method == "GET" for request in requests)
+
+
+@pytest.mark.parametrize("canonical", [
+    "privacy", "upload_status", "processing_status", "made_for_kids",
+    "public_stats_viewable", "title", "published_at",
+])
+@pytest.mark.asyncio
+async def test_deployed_manager_raw_alias_never_replaces_missing_canonical(
+    target, state_dir, manager_video_status, canonical,
+):
+    del manager_video_status[canonical]
+    helper = drill_api().OwnedUnlistedAckDrill(target, state_dir=state_dir)
+    prepare(helper, target, reserved(target))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=manager_video_status),
+    )) as client:
+        with pytest.raises(RuntimeError):
+            await helper.verify_video(client, "video", asyncio.Event())
+    assert not (state_dir / "consumed.json").exists()
+
+
+@pytest.mark.parametrize("original,replacement", [
+    ('"privacyStatus": "unlisted"', '"privacyStatus": "public", "privacyStatus": "unlisted"'),
+    ('"made_for_kids": false', '"made_for_kids": false, "made_for_kids": false'),
+    ('"height": 90', '"height": NaN'),
+    ('"height": 90', '"height": 1e999'),
+])
+@pytest.mark.asyncio
+async def test_deployed_manager_contract_preserves_strict_recursive_json_parser(
+    target, state_dir, manager_video_status, original, replacement,
+):
+    body = json.dumps(manager_video_status)
+    assert body.count(original) == 1
+    body = body.replace(original, replacement)
+    helper = drill_api().OwnedUnlistedAckDrill(target, state_dir=state_dir)
+    prepare(helper, target, reserved(target))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, content=body),
+    )) as client:
+        with pytest.raises(RuntimeError, match="video status is malformed"):
+            await helper.verify_video(client, "video", asyncio.Event())
+    assert not (state_dir / "consumed.json").exists()
+
+
 @pytest.mark.parametrize("extra", [
     pytest.param('"current_privacy":"public"', id="conflicting-current-privacy"),
     pytest.param('"privacy_status":"public"', id="conflicting-privacy-status"),
