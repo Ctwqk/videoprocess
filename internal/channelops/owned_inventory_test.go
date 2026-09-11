@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type ownedTestPDS func(context.Context, PDSDecisionRequest) (PDSDecision, error)
@@ -240,10 +242,12 @@ func ownedTestCompletedHistory(t *testing.T, data *ownedInventoryData, at time.T
 	for i, plan := range BuildMetricSchedulePlans(pubID, at) {
 		id := ownedTestID(520 + i)
 		m := map[string]any{"id": id, "publication_id": pubID, "snapshot_stage": plan.Stage, "effective_start_at": ownedISO(at), "due_at": ownedISO(plan.DueAt), "grace_until": ownedISO(plan.GraceUntil), "status": "pending", "attempt_count": 0, "last_error_code": nil, "completed_at": nil}
-		q := queue(530+i, QueueCollectMetrics, plan.IdempotencyKey, map[string]any{"publication_id": pubID, "metric_schedule_id": id, "snapshot_stage": plan.Stage}, plan.DueAt)
+		q := queue(530+i, QueueCollectMetrics, plan.IdempotencyKey, map[string]any{"publication_id": pubID, "metric_schedule_id": id, "snapshot_stage": plan.Stage, "metrics_poll_count": 0}, plan.DueAt)
+		q["parent_queue_item_id"] = promote["id"]
 		q["status"], q["attempt_count"] = "queued", 0
 		if plan.DueAt.Sub(at) <= 24*time.Hour {
 			m["status"], m["attempt_count"], m["completed_at"] = "succeeded", 1, ownedISO(plan.DueAt)
+			m["last_attempt_at"] = m["completed_at"]
 			q["status"], q["attempt_count"] = "succeeded", 1
 			feedback = append(feedback, map[string]any{"publication_id": pubID, "snapshot_stage": plan.Stage})
 		}
@@ -256,6 +260,387 @@ func ownedTestCompletedHistory(t *testing.T, data *ownedInventoryData, at time.T
 		"artifacts":    []any{map[string]any{"id": ownedTestID(510), "job_id": jobID, "node_execution_id": nodeID, "media_info": map[string]any{"youtube": receipt}}},
 		"publications": []any{pub}, "queues": queues, "metrics": metrics, "feedback": feedback,
 	}}
+}
+
+func ownedTestPendingPromotion(t *testing.T, data *ownedInventoryData, at time.Time) {
+	t.Helper()
+	ownedTestCompletedHistory(t, data, at)
+	h := data.Tasks[0]
+	pub := ownedMap(ownedArray(h["publications"])[0])
+	pub["scheduled_publish_at"] = nil
+	ownedMap(h["task"])["state"] = TaskUploadedPrivate
+	due := at.Add(time.Hour)
+	parent := map[string]any{"id": ownedTestID(550), "kind": QueuePublishTask, "channel_profile_id": ownedTestID(2), "payload_json": map[string]any{"production_task_id": ownedTestID(501)}, "status": "succeeded", "attempt_count": 1}
+	promote := ownedMap(ownedArray(h["queues"])[0])
+	promote["status"], promote["attempt_count"] = "queued", 0
+	promote["parent_queue_item_id"], promote["run_after"] = parent["id"], ownedISO(due)
+	promote["idempotency_key"] = "promote_publication:" + ownedString(pub["id"]) + ":unlisted:" + due.Format(time.RFC3339)
+	promote["payload_json"] = map[string]any{"publication_id": pub["id"], "target_visibility": "unlisted", "scheduled_at": due.Format(time.RFC3339)}
+	h["queues"], h["metrics"], h["feedback"] = []any{parent, promote}, []any{}, []any{}
+}
+
+func TestOwnedNormalUnlistedPendingPromotionWaits(t *testing.T) {
+	for _, status := range []string{"queued", "running"} {
+		t.Run(status, func(t *testing.T) {
+			channel, data, now := ownedTestFixture(t)
+			ownedTestPendingPromotion(t, &data, now)
+			q := ownedMap(ownedArray(data.Tasks[0]["queues"])[1])
+			q["status"] = status
+			if status == "running" {
+				q["attempt_count"], q["locked_by"], q["locked_at"] = 1, "normal-worker", ownedISO(now.Add(time.Hour))
+			}
+			state := assessOwnedInventory(channel, data, now.Add(time.Hour))
+			if state.HoldReason != "" || state.SkipReason != "owned_inventory_outstanding" || state.Candidate != nil || len(state.CompleteItemIDs) != 0 {
+				t.Fatalf("normal promotion must retain reservation: %+v", state)
+			}
+		})
+	}
+}
+
+func TestOwnedPromotionCommitBeforeQueueCompletionRetainsReservation(t *testing.T) {
+	channel, data, now := ownedTestFixture(t)
+	ownedTestCompletedHistory(t, &data, now)
+	queues := ownedArray(data.Tasks[0]["queues"])
+	promote, reconcile := ownedMap(queues[0]), ownedMap(queues[1])
+	promote["status"], promote["locked_at"], promote["locked_by"] = "running", ownedISO(now), "normal-worker"
+	reconcile["status"], reconcile["attempt_count"] = "queued", 0
+	got := assessOwnedInventory(channel, data, now)
+	if got.HoldReason != "" || got.Candidate != nil || got.SkipReason != "owned_inventory_outstanding" || len(got.CompleteItemIDs) != 0 {
+		t.Fatalf("normal promotion commit gap did not wait: %+v", got)
+	}
+	reconcile["status"], reconcile["attempt_count"] = "succeeded", 1
+	if got := assessOwnedInventory(channel, data, now); got.HoldReason == "" {
+		t.Fatal("reconciliation completed before promotion queue settlement")
+	}
+}
+
+func TestOwnedPendingPromotionRejectsUnrelatedOrMalformedWork(t *testing.T) {
+	for _, mode := range []string{"video", "public", "status", "due", "key", "parent", "missing", "duplicate", "metrics"} {
+		t.Run(mode, func(t *testing.T) {
+			channel, data, now := ownedTestFixture(t)
+			ownedTestPendingPromotion(t, &data, now)
+			h := data.Tasks[0]
+			pub, q := ownedMap(ownedArray(h["publications"])[0]), ownedMap(ownedArray(h["queues"])[1])
+			switch mode {
+			case "video":
+				pub["platform_content_id"] = "other_video"
+			case "public":
+				pub["current_privacy"] = "public"
+			case "status":
+				pub["publish_status"] = "held"
+			case "due":
+				q["run_after"] = ownedISO(now)
+			case "key":
+				q["idempotency_key"] = "other"
+			case "parent":
+				q["parent_queue_item_id"] = ownedTestID(999)
+			case "missing":
+				h["queues"] = ownedArray(h["queues"])[:1]
+			case "duplicate":
+				h["queues"] = append(ownedArray(h["queues"]), q)
+			case "metrics":
+				h["metrics"] = []any{map[string]any{"status": "pending"}}
+			}
+			if got := assessOwnedInventory(channel, data, now.Add(time.Hour)); got.HoldReason == "" || got.Candidate != nil {
+				t.Fatalf("unsafe pending promotion: %+v", got)
+			}
+		})
+	}
+}
+
+type ownedHoldProbe struct {
+	dbExecutor
+	reason string
+	stop   error
+}
+
+func (p *ownedHoldProbe) Exec(_ context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(query, "UPDATE owned_seed_inventories SET state=CASE") {
+		p.reason = args[1].(string)
+	}
+	return pgconn.CommandTag{}, p.stop
+}
+
+func TestOwnedFailedPolicySurvivesTransientRuntimeBlock(t *testing.T) {
+	for _, runtime := range []string{"closed", "busy"} {
+		for _, policy := range []string{"block", "error"} {
+			t.Run(runtime+"/"+policy, func(t *testing.T) {
+				channel, data, now := ownedTestFixture(t)
+				before := assessOwnedInventory(channel, data, now)
+				candidate := *before.Candidate
+				candidate.Rejected = true
+				if policy == "block" {
+					candidate.PDSDecisionJSON = map[string]any{"verdict": "block"}
+				}
+				data.RuntimeOpen, data.Busy = runtime != "closed", runtime == "busy"
+				current := assessOwnedInventory(channel, data, now)
+				probe := &ownedHoldProbe{stop: errors.New("hold probe")}
+				store := &Store{executionDB: probe}
+				err := store.finalizeOwnedTick(context.Background(), tickPreparation{Owned: &before, Candidates: []TickCandidate{*before.Candidate}}, tickPreparation{Owned: &current}, []TickCandidate{candidate})
+				if !errors.Is(err, probe.stop) || probe.reason != "owned_inventory_pds_denied" {
+					t.Fatalf("policy failure was discarded: reason=%s error=%v", probe.reason, err)
+				}
+			})
+		}
+	}
+}
+
+func TestOwnedHistoryWatermarkIgnoresValidMetricLeaseChurn(t *testing.T) {
+	channel, data, now := ownedTestFixture(t)
+	ownedTestCompletedHistory(t, &data, now)
+	q := ownedMap(ownedArray(data.Tasks[0]["queues"])[4])
+	q["status"], q["locked_at"], q["locked_by"] = "running", ownedISO(now.Add(24*time.Hour)), "worker"
+	before := assessOwnedInventory(channel, data, now.Add(24*time.Hour))
+	q["status"], q["locked_at"], q["locked_by"] = "succeeded", nil, nil
+	after := assessOwnedInventory(channel, data, now.Add(24*time.Hour))
+	if before.Candidate != nil || before.HoldReason != "" || after.Candidate == nil || before.HistorySHA != after.HistorySHA {
+		t.Fatal("valid metric lease churn changed immutable history watermark")
+	}
+	ownedMap(ownedArray(data.Tasks[0]["operations"])[0])["content_sha256"] = strings.Repeat("b", 64)
+	changed := assessOwnedInventory(channel, data, now.Add(25*time.Hour))
+	if changed.HistorySHA == before.HistorySHA {
+		t.Fatal("operation binding drift was hidden")
+	}
+}
+
+func TestOwnedAdmissionDigestRechecksReadinessWithoutHashingTickLease(t *testing.T) {
+	channel, data, now := ownedTestFixture(t)
+	q := map[string]any{"id": ownedTestID(580), "kind": QueueAgentTick, "channel_profile_id": channel.ID, "payload_json": map[string]any{"channel_id": channel.ID}, "status": "queued", "attempt_count": 0}
+	data.Queues = []map[string]any{q}
+	before, err := ownedAdmissionDigest(data, assessOwnedInventory(channel, data, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q["status"], q["attempt_count"], q["locked_by"], q["locked_at"] = "running", 1, "other-tick-worker", ownedISO(now)
+	if !ownedQueuesSafe(channel.ID, data, now) {
+		t.Fatal("valid tick lease rejected")
+	}
+	after, err := ownedAdmissionDigest(data, assessOwnedInventory(channel, data, now))
+	if err != nil || after != before {
+		t.Fatal("tick lease affected stable bindings")
+	}
+	data.RuntimeOpen = false
+	closed, _ := ownedAdmissionDigest(data, assessOwnedInventory(channel, data, now))
+	if closed == before {
+		t.Fatal("pre-PDS runtime revalidation was removed")
+	}
+	data.RuntimeOpen = true
+	q["kind"] = QueueExecuteTask
+	if ownedQueuesSafe(channel.ID, data, now) {
+		t.Fatal("unsafe work accepted")
+	}
+}
+
+func TestOwnedFailedPolicyCannotHoldNextItemAfterCompetingAdmission(t *testing.T) {
+	channel, data, now := ownedTestFixture(t)
+	before := assessOwnedInventory(channel, data, now)
+	rejected := *before.Candidate
+	rejected.Rejected = true
+	ownedTestCompletedHistory(t, &data, now)
+	data.Tasks[0]["operations"], data.Tasks[0]["publications"] = []any{}, []any{}
+	current := assessOwnedInventory(channel, data, now)
+	probe := &ownedHoldProbe{stop: errors.New("unexpected mutation")}
+	err := (&Store{executionDB: probe}).finalizeOwnedTick(context.Background(), tickPreparation{Owned: &before, Candidates: []TickCandidate{*before.Candidate}}, tickPreparation{Owned: &current}, []TickCandidate{rejected})
+	if err != nil || probe.reason != "" {
+		t.Fatal("losing policy outcome held a different unused item")
+	}
+}
+
+func ownedTestMetricRetry(t *testing.T, data *ownedInventoryData, at time.Time, recovered bool) {
+	t.Helper()
+	ownedTestCompletedHistory(t, data, at)
+	h := data.Tasks[0]
+	m := ownedMap(ownedArray(h["metrics"])[2])
+	q := ownedMap(ownedArray(h["queues"])[4])
+	next := map[string]any{}
+	for k, v := range q {
+		next[k] = v
+	}
+	next["id"], next["parent_queue_item_id"] = ownedTestID(560), q["id"]
+	next["idempotency_key"] = strings.TrimSuffix(ownedString(q["idempotency_key"]), "0") + "1"
+	next["run_after"], next["status"], next["attempt_count"] = ownedISO(at.Add(25*time.Hour)), "queued", 0
+	payload := map[string]any{}
+	for k, v := range ownedMap(q["payload_json"]) {
+		payload[k] = v
+	}
+	payload["metrics_poll_count"] = 1
+	next["payload_json"] = payload
+	m["status"], m["attempt_count"], m["last_error_code"], m["completed_at"], m["last_attempt_at"] = "pending", 1, MetricErrorUnavailable, nil, ownedISO(at.Add(24*time.Hour))
+	h["feedback"] = ownedArray(h["feedback"])[:2]
+	if recovered {
+		m["status"], m["attempt_count"], m["last_error_code"], m["completed_at"], m["last_attempt_at"] = "succeeded", 2, nil, ownedISO(at.Add(25*time.Hour)), ownedISO(at.Add(25*time.Hour))
+		next["status"], next["attempt_count"] = "succeeded", 1
+		h["feedback"] = append(ownedArray(h["feedback"]), map[string]any{"publication_id": m["publication_id"], "snapshot_stage": "24h"})
+	}
+	h["queues"] = append(ownedArray(h["queues"]), next)
+}
+
+func TestOwnedMetricRetryPendingAndRecovered(t *testing.T) {
+	for _, recovered := range []bool{false, true} {
+		t.Run(fmt.Sprint(recovered), func(t *testing.T) {
+			channel, data, now := ownedTestFixture(t)
+			ownedTestMetricRetry(t, &data, now, recovered)
+			got := assessOwnedInventory(channel, data, now.Add(25*time.Hour))
+			if got.HoldReason != "" || (got.Candidate != nil) != recovered || (!recovered && got.SkipReason != "owned_inventory_metrics_pending") {
+				t.Fatalf("normal metric retry rejected: %+v", got)
+			}
+		})
+	}
+}
+
+func TestOwnedMetricRetryCommitBeforeQueueCompletionWaits(t *testing.T) {
+	for _, recovered := range []bool{false, true} {
+		t.Run(fmt.Sprint(recovered), func(t *testing.T) {
+			channel, data, now := ownedTestFixture(t)
+			ownedTestMetricRetry(t, &data, now, recovered)
+			queues := ownedArray(data.Tasks[0]["queues"])
+			index := 4
+			if recovered {
+				index = len(queues) - 1
+			}
+			q := ownedMap(queues[index])
+			q["status"], q["locked_at"], q["locked_by"] = "running", ownedISO(now.Add(24*time.Hour)), "normal-worker"
+			got := assessOwnedInventory(channel, data, now.Add(25*time.Hour))
+			if got.HoldReason != "" || got.Candidate != nil || got.SkipReason != "owned_inventory_metrics_pending" {
+				t.Fatalf("normal result/queue completion boundary rejected: %+v", got)
+			}
+		})
+	}
+}
+
+func TestOwnedMetricRetryRejectsMalformedChains(t *testing.T) {
+	for _, mode := range []string{"parent", "duplicate", "missing", "key", "poll", "publication", "channel", "early", "late", "error", "parent_failed", "attempts", "expired", "unrelated_schedule"} {
+		t.Run(mode, func(t *testing.T) {
+			channel, data, now := ownedTestFixture(t)
+			ownedTestMetricRetry(t, &data, now, false)
+			h := data.Tasks[0]
+			queues := ownedArray(h["queues"])
+			q, m := ownedMap(queues[len(queues)-1]), ownedMap(ownedArray(h["metrics"])[2])
+			switch mode {
+			case "parent":
+				q["parent_queue_item_id"] = ownedTestID(999)
+			case "duplicate":
+				h["queues"] = append(queues, q)
+			case "missing":
+				h["queues"] = queues[:len(queues)-1]
+			case "key":
+				q["idempotency_key"] = "other"
+			case "poll":
+				ownedMap(q["payload_json"])["metrics_poll_count"] = 2
+			case "publication":
+				ownedMap(q["payload_json"])["publication_id"] = ownedTestID(999)
+			case "channel":
+				q["channel_profile_id"] = ownedTestID(999)
+			case "early":
+				q["run_after"] = ownedISO(now.Add(23 * time.Hour))
+			case "late":
+				q["run_after"] = ownedISO(now.Add(31 * time.Hour))
+			case "error":
+				m["last_error_code"] = "other"
+			case "parent_failed":
+				ownedMap(queues[4])["status"] = "failed"
+			case "attempts":
+				m["attempt_count"] = 2
+			case "expired":
+				now = now.Add(6 * time.Hour)
+			case "unrelated_schedule":
+				extra := map[string]any{}
+				for k, v := range q {
+					extra[k] = v
+				}
+				extra["id"] = ownedTestID(998)
+				extra["payload_json"] = map[string]any{"publication_id": m["publication_id"], "metric_schedule_id": ownedTestID(999), "snapshot_stage": "24h", "metrics_poll_count": 1}
+				h["queues"] = append(queues, extra)
+			}
+			if got := assessOwnedInventory(channel, data, now.Add(25*time.Hour)); got.HoldReason == "" || got.Candidate != nil {
+				t.Fatalf("malformed metric chain accepted: %+v", got)
+			}
+		})
+	}
+}
+
+func ownedTestHistoricalReplacement(t *testing.T, data *ownedInventoryData, at time.Time) {
+	t.Helper()
+	ownedTestCompletedHistory(t, data, at)
+	// This is historical account activity, not a replacement of a current inventory item.
+	data.Items[0].Item["state"], data.Items[0].Item["production_task_id"], data.Items[0].Item["consumed_at"] = "unused", nil, nil
+	data.Items[0].Seed["status"] = "active"
+	h := data.Tasks[0]
+	pub := ownedMap(ownedArray(h["publications"])[0])
+	pub["uploaded_at"] = ownedISO(at.Add(-time.Minute))
+	op := ownedMap(ownedArray(h["operations"])[0])
+	op["completed_at"] = pub["uploaded_at"]
+	op["request_attempted_at"] = ownedISO(at.Add(-2 * time.Minute))
+	manual := ownedMap(ownedArray(h["queues"])[0])
+	manual["idempotency_key"] = "promote_publication:" + ownedString(pub["id"]) + ":unlisted:manual"
+	manual["run_after"] = ownedISO(at.Add(-time.Second))
+	autoDue := at.Add(59 * time.Minute)
+	parent := map[string]any{"id": ownedTestID(570), "kind": QueuePublishTask, "channel_profile_id": ownedTestID(2), "payload_json": map[string]any{"production_task_id": ownedTestID(501)}, "status": "succeeded", "attempt_count": 1}
+	auto := map[string]any{"id": ownedTestID(571), "kind": QueuePromotePublication, "idempotency_key": "promote_publication:" + ownedString(pub["id"]) + ":unlisted:" + autoDue.Format(time.RFC3339), "channel_profile_id": ownedTestID(2), "parent_queue_item_id": parent["id"], "payload_json": map[string]any{"publication_id": pub["id"], "target_visibility": "unlisted", "scheduled_at": autoDue.Format(time.RFC3339)}, "run_after": ownedISO(autoDue), "status": "cancelled", "attempt_count": 0, "last_error": "replaced_by_immediate_unlisted_canary_promotion", "dead_letter_at": ownedISO(at.Add(-2 * time.Second))}
+	h["queues"] = append(ownedArray(h["queues"]), parent, auto)
+}
+
+func TestOwnedHistoricalPromotionReplacementRequiresSettlement(t *testing.T) {
+	for _, mode := range []string{"valid", "reason", "claimed", "lock", "cancel_time", "key", "scope", "parent", "manual_failed", "manual_scope", "manual_key", "manual_public", "manual_parent", "reconcile_pending", "reconcile_parent", "video", "account", "uncertain", "extra_promotion"} {
+		t.Run(mode, func(t *testing.T) {
+			channel, data, now := ownedTestFixture(t)
+			ownedTestHistoricalReplacement(t, &data, now)
+			h := data.Tasks[0]
+			queues := ownedArray(h["queues"])
+			auto, manual, reconcile := ownedMap(queues[len(queues)-1]), ownedMap(queues[0]), ownedMap(queues[1])
+			switch mode {
+			case "reason":
+				auto["last_error"] = "other"
+			case "claimed":
+				auto["attempt_count"] = 1
+			case "lock":
+				auto["locked_by"] = "old-worker"
+			case "cancel_time":
+				auto["dead_letter_at"] = ownedISO(now.Add(time.Hour))
+			case "key":
+				auto["idempotency_key"] = "other"
+			case "scope":
+				auto["channel_profile_id"] = ownedTestID(999)
+			case "parent":
+				auto["parent_queue_item_id"] = ownedTestID(999)
+			case "manual_failed":
+				manual["status"] = "failed"
+			case "manual_scope":
+				ownedMap(manual["payload_json"])["publication_id"] = ownedTestID(999)
+			case "manual_key":
+				manual["idempotency_key"] = "other"
+			case "manual_public":
+				ownedMap(manual["payload_json"])["target_visibility"] = "public"
+			case "manual_parent":
+				manual["parent_queue_item_id"] = auto["id"]
+			case "reconcile_pending":
+				reconcile["status"] = "queued"
+			case "reconcile_parent":
+				reconcile["parent_queue_item_id"] = auto["id"]
+			case "video":
+				ownedMap(ownedArray(h["publications"])[0])["platform_content_id"] = "wrong_video"
+			case "account":
+				ownedMap(ownedArray(h["publications"])[0])["account_id"] = ownedTestID(999)
+			case "uncertain":
+				ownedMap(ownedArray(h["operations"])[0])["status"] = "uncertain"
+			case "extra_promotion":
+				h["queues"] = append(queues, manual)
+			}
+			state := assessOwnedInventory(channel, data, now.Add(25*time.Hour))
+			if mode == "valid" {
+				if state.HoldReason != "" || state.Candidate == nil {
+					t.Fatalf("settled administrative replacement rejected: %+v", state)
+				}
+				before := state.HistorySHA
+				auto["priority"] = 71
+				if next := assessOwnedInventory(channel, data, now.Add(25*time.Hour)); next.HistorySHA == before {
+					t.Fatal("cancelled evidence was omitted from watermark")
+				}
+			} else if state.HoldReason == "" || state.Candidate != nil {
+				t.Fatalf("invalid replacement accepted: %+v", state)
+			}
+		})
+	}
 }
 
 func TestOwnedRollingCompletionFloorAndSettlement(t *testing.T) {
@@ -510,6 +895,7 @@ func TestOwnedSeventhOrdinalAfterSixSettledDailyAttempts(t *testing.T) {
 				continue
 			}
 			m["status"], m["attempt_count"], m["completed_at"] = "succeeded", 1, ownedISO(due)
+			m["last_attempt_at"] = m["completed_at"]
 			q := ownedMap(ownedArray(history["queues"])[i+2])
 			q["status"], q["attempt_count"] = "succeeded", 1
 		}

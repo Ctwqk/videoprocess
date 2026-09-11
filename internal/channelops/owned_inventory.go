@@ -35,6 +35,7 @@ type ownedInventoryData struct {
 type ownedCandidateAuthority struct{ InventoryID, ItemID, ManifestSHA, ContentSHA, AssetID, SeedSHA, ConfigurationSHA, HistorySHA string }
 type ownedTickState struct {
 	InventoryID, HoldReason, SkipReason, HistorySHA string
+	UnusedItemID                                    string
 	Candidate                                       *TickCandidate
 	CompleteItemIDs                                 []string
 	ConsumedCount                                   int
@@ -275,6 +276,9 @@ func assessOwnedInventory(channel ChannelProfileRow, data ownedInventoryData, no
 	if reserved > 1 {
 		return hold("owned_inventory_multiple_outstanding")
 	}
+	if selected != nil {
+		state.UnusedItemID = ownedString(selected.Item["id"])
+	}
 	history := assessOwnedHistory(data, now)
 	state.HistorySHA = history.digest
 	state.CompleteItemIDs = history.complete
@@ -342,8 +346,15 @@ func assessOwnedHistory(data ownedInventoryData, now time.Time) ownedHistoryStat
 		if ownedInt(task["retry_count"]) != 0 || task["failure_reason"] != nil || task["blocked_by_guard"] != nil {
 			return fail("owned_inventory_task_failed")
 		}
+		var replacement map[string]any
+		if !own {
+			replacement = ownedSettledPromotionReplacement(history)
+		}
 		for _, value := range ownedArray(history["queues"]) {
 			q := ownedMap(value)
+			if replacement != nil && q["id"] == ownedMap(replacement["automatic"])["id"] {
+				continue
+			}
 			if !ownedQueueClean(q) || (q["status"] != "queued" && q["status"] != "running" && q["status"] != "succeeded") {
 				return fail("owned_inventory_queue_failed")
 			}
@@ -443,6 +454,10 @@ func assessOwnedHistory(data ownedInventoryData, now time.Time) ownedHistoryStat
 		if pub["current_privacy"] != "unlisted" || (pub["publish_status"] != "uploaded" && pub["publish_status"] != "scheduled") {
 			return fail("owned_inventory_publication_privacy")
 		}
+		if pub["scheduled_publish_at"] == nil && own && item["state"] == "reserved" && ownedPendingPromotion(history, pub, completed, now) {
+			state.skip = "owned_inventory_outstanding"
+			continue
+		}
 		start, ok := ownedTime(pub["scheduled_publish_at"])
 		if !ok || start.Before(completed) || start.After(now) {
 			return fail("owned_inventory_publication_time")
@@ -468,7 +483,17 @@ func assessOwnedHistory(data ownedInventoryData, now time.Time) ownedHistoryStat
 		if now.Sub(attempted) < 24*time.Hour || now.Sub(completed) < 24*time.Hour {
 			state.skip = "owned_inventory_cooldown"
 		}
-		watermark = append(watermark, history)
+		// Queue leases, feedback and task/publication status advance normally after upload.
+		// Revalidate them above, but bind policy to the settled effect and its identities.
+		taskBinding, err := ownedFields(task, "id channel_profile_id target_account_id manual_seed_id job_id")
+		if err != nil {
+			return fail("owned_inventory_history_digest")
+		}
+		pubBinding, err := ownedFields(pub, "id production_task_id account_id platform platform_content_id desired_privacy current_privacy public_at uploaded_at scheduled_publish_at")
+		if err != nil {
+			return fail("owned_inventory_history_digest")
+		}
+		watermark = append(watermark, map[string]any{"task": taskBinding, "operations": history["operations"], "job": history["job"], "nodes": history["nodes"], "artifacts": history["artifacts"], "publication": pubBinding, "settled_promotion_replacement": replacement})
 	}
 	for id := range items {
 		if !seen[id] {
@@ -485,6 +510,121 @@ func assessOwnedHistory(data ownedInventoryData, now time.Time) ownedHistoryStat
 
 func ownedQueueClean(q map[string]any) bool {
 	return q["last_error"] == nil && q["dead_letter_at"] == nil && ownedInt(q["attempt_count"]) >= 0 && ownedInt(q["attempt_count"]) <= 1
+}
+
+func ownedSettledPromotionReplacement(history map[string]any) map[string]any {
+	pubs := ownedArray(history["publications"])
+	if len(pubs) != 1 {
+		return nil
+	}
+	pub, task := ownedMap(pubs[0]), ownedMap(history["task"])
+	uploaded, uploadOK := ownedTime(pub["uploaded_at"])
+	start, startOK := ownedTime(pub["scheduled_publish_at"])
+	if !uploadOK || !startOK || start.Before(uploaded) || pub["desired_privacy"] != "unlisted" || pub["current_privacy"] != "unlisted" || pub["public_at"] != nil {
+		return nil
+	}
+	var auto, manual, reconcile, parent map[string]any
+	for _, value := range ownedArray(history["queues"]) {
+		q := ownedMap(value)
+		if q["kind"] == QueueReconcilePublication {
+			reconcile = q
+		}
+		if q["kind"] != QueuePromotePublication {
+			continue
+		}
+		if q["status"] == "cancelled" {
+			if auto != nil {
+				return nil
+			}
+			auto = q
+		} else {
+			if manual != nil {
+				return nil
+			}
+			manual = q
+		}
+	}
+	if auto == nil || manual == nil || auto["id"] == manual["id"] || !uuidPattern.MatchString(ownedString(auto["id"])) || !uuidPattern.MatchString(ownedString(manual["id"])) {
+		return nil
+	}
+	due := uploaded.Add(time.Hour)
+	run, runOK := ownedTime(auto["run_after"])
+	cancelled, cancelOK := ownedTime(auto["dead_letter_at"])
+	manualRun, manualOK := ownedTime(manual["run_after"])
+	payload, immediate := ownedMap(auto["payload_json"]), ownedMap(manual["payload_json"])
+	if !runOK || !run.Equal(due) || !cancelOK || cancelled.Before(uploaded) || !manualOK || manualRun.Before(cancelled) || manualRun.After(start) || auto["last_error"] != "replaced_by_immediate_unlisted_canary_promotion" || ownedInt(auto["attempt_count"]) != 0 || auto["locked_at"] != nil || auto["locked_by"] != nil || auto["channel_profile_id"] != task["channel_profile_id"] || auto["idempotency_key"] != "promote_publication:"+ownedString(pub["id"])+":unlisted:"+due.Format(time.RFC3339) || payload["publication_id"] != pub["id"] || payload["target_visibility"] != "unlisted" || payload["scheduled_at"] != due.Format(time.RFC3339) {
+		return nil
+	}
+	if manual["status"] != "succeeded" || !ownedQueueClean(manual) || ownedInt(manual["attempt_count"]) != 1 || manual["locked_at"] != nil || manual["locked_by"] != nil || manual["parent_queue_item_id"] != nil || manual["channel_profile_id"] != task["channel_profile_id"] || manual["idempotency_key"] != "promote_publication:"+ownedString(pub["id"])+":unlisted:manual" || immediate["publication_id"] != pub["id"] || immediate["target_visibility"] != "unlisted" || immediate["channel_profile_id"] != task["channel_profile_id"] || immediate["scheduled_at"] != nil {
+		return nil
+	}
+	for _, value := range ownedArray(history["queues"]) {
+		q := ownedMap(value)
+		if q["id"] == auto["parent_queue_item_id"] {
+			parent = q
+		}
+	}
+	if parent == nil || parent["kind"] != QueuePublishTask || parent["status"] != "succeeded" || !ownedQueueClean(parent) || ownedInt(parent["attempt_count"]) != 1 || parent["locked_at"] != nil || parent["locked_by"] != nil || parent["channel_profile_id"] != task["channel_profile_id"] || ownedMap(parent["payload_json"])["production_task_id"] != task["id"] {
+		return nil
+	}
+	done, valid := ownedReconciled(history, pub, start)
+	if !valid || !done || reconcile["parent_queue_item_id"] != manual["id"] {
+		return nil
+	}
+	// Retain the entire settled administrative proof, including the cancelled record.
+	return map[string]any{"automatic": auto, "manual": manual, "reconcile": reconcile, "publish_parent": parent}
+}
+
+func ownedPendingPromotion(history, pub map[string]any, completed, now time.Time) bool {
+	uploaded, ok := ownedTime(pub["uploaded_at"])
+	if !ok || uploaded.Before(completed) || uploaded.After(now) || pub["publish_status"] != "uploaded" || len(ownedArray(history["metrics"])) != 0 || len(ownedArray(history["feedback"])) != 0 {
+		return false
+	}
+	var promote map[string]any
+	for _, value := range ownedArray(history["queues"]) {
+		q := ownedMap(value)
+		if q["kind"] == QueueReconcilePublication || q["kind"] == QueueCollectMetrics {
+			return false
+		}
+		if q["kind"] == QueuePromotePublication {
+			if promote != nil {
+				return false
+			}
+			promote = q
+		}
+	}
+	if promote == nil {
+		return false
+	}
+	task, payload := ownedMap(history["task"]), ownedMap(promote["payload_json"])
+	if task["state"] != TaskUploadedPrivate {
+		return false
+	}
+	due := uploaded.Add(time.Hour)
+	run, ok := ownedTime(promote["run_after"])
+	if !ok || !run.Equal(due) || promote["idempotency_key"] != "promote_publication:"+ownedString(pub["id"])+":unlisted:"+due.Format(time.RFC3339) || promote["channel_profile_id"] != task["channel_profile_id"] || payload["publication_id"] != pub["id"] || payload["target_visibility"] != "unlisted" || payload["scheduled_at"] != due.Format(time.RFC3339) || !ownedQueueClean(promote) || (promote["status"] != "queued" && promote["status"] != "running") {
+		return false
+	}
+	if promote["status"] == "queued" && (ownedInt(promote["attempt_count"]) != 0 || promote["locked_by"] != nil || promote["locked_at"] != nil) {
+		return false
+	}
+	if promote["status"] == "running" {
+		_, locked := ownedTime(promote["locked_at"])
+		if ownedInt(promote["attempt_count"]) != 1 || ownedString(promote["locked_by"]) == "" || !locked {
+			return false
+		}
+	}
+	for _, value := range ownedArray(history["queues"]) {
+		q := ownedMap(value)
+		if q["id"] == promote["parent_queue_item_id"] && q["kind"] == QueuePublishTask && q["channel_profile_id"] == task["channel_profile_id"] && ownedMap(q["payload_json"])["production_task_id"] == task["id"] && ownedQueueClean(q) && ownedInt(q["attempt_count"]) == 1 {
+			if q["status"] == "succeeded" {
+				return q["locked_by"] == nil && q["locked_at"] == nil
+			}
+			_, locked := ownedTime(q["locked_at"])
+			return q["status"] == "running" && locked && ownedString(q["locked_by"]) != ""
+		}
+	}
+	return false
 }
 func ownedReconciled(history, pub map[string]any, start time.Time) (bool, bool) {
 	queues := ownedArray(history["queues"])
@@ -511,8 +651,14 @@ func ownedReconciled(history, pub map[string]any, start time.Time) (bool, bool) 
 	for _, value := range queues {
 		q := ownedMap(value)
 		payload := ownedMap(q["payload_json"])
-		if q["id"] == found["parent_queue_item_id"] && q["kind"] == QueuePromotePublication && q["status"] == "succeeded" && q["channel_profile_id"] == task["channel_profile_id"] && payload["publication_id"] == pub["id"] && payload["target_visibility"] == "unlisted" && ownedQueueClean(q) && q["locked_at"] == nil && q["locked_by"] == nil {
-			parentOK = true
+		if q["id"] == found["parent_queue_item_id"] && q["kind"] == QueuePromotePublication && q["channel_profile_id"] == task["channel_profile_id"] && payload["publication_id"] == pub["id"] && payload["target_visibility"] == "unlisted" && ownedQueueClean(q) {
+			if q["status"] == "succeeded" && q["locked_at"] == nil && q["locked_by"] == nil {
+				parentOK = true
+			}
+			_, locked := ownedTime(q["locked_at"])
+			if q["status"] == "running" && ownedInt(q["attempt_count"]) == 1 && locked && ownedString(q["locked_by"]) != "" && found["status"] == "queued" && ownedInt(found["attempt_count"]) == 0 && found["locked_at"] == nil && found["locked_by"] == nil {
+				return false, true
+			}
 		}
 	}
 	if !parentOK {
@@ -534,6 +680,23 @@ func ownedMetricsReady(history, pub map[string]any, start, now time.Time) (hold,
 	if len(metrics) != len(metricStageSpecs) {
 		return true, false
 	}
+	for _, value := range ownedArray(history["queues"]) {
+		q := ownedMap(value)
+		payload := ownedMap(q["payload_json"])
+		if q["kind"] != QueueCollectMetrics || payload["metric_schedule_id"] == nil {
+			continue
+		}
+		matched := false
+		for _, value := range metrics {
+			m := ownedMap(value)
+			if m["id"] == payload["metric_schedule_id"] {
+				matched = true
+			}
+		}
+		if !matched {
+			return true, false
+		}
+	}
 	for _, plan := range BuildMetricSchedulePlans(ownedString(pub["id"]), start) {
 		var m map[string]any
 		for _, value := range metrics {
@@ -545,7 +708,7 @@ func ownedMetricsReady(history, pub map[string]any, start, now time.Time) (hold,
 				m = row
 			}
 		}
-		if m == nil || m["publication_id"] != pub["id"] || m["last_error_code"] != nil {
+		if m == nil || m["publication_id"] != pub["id"] {
 			return true, false
 		}
 		for key, want := range map[string]time.Time{"effective_start_at": start, "due_at": plan.DueAt, "grace_until": plan.GraceUntil} {
@@ -554,28 +717,11 @@ func ownedMetricsReady(history, pub map[string]any, start, now time.Time) (hold,
 				return true, false
 			}
 		}
-		count := 0
-		for _, value := range ownedArray(history["queues"]) {
-			q := ownedMap(value)
-			payload := ownedMap(q["payload_json"])
-			if q["kind"] != QueueCollectMetrics || payload["metric_schedule_id"] != m["id"] {
-				continue
-			}
-			count++
-			run, ok := ownedTime(q["run_after"])
-			if !ok || !run.Equal(plan.DueAt) || q["idempotency_key"] != plan.IdempotencyKey || payload["publication_id"] != pub["id"] || payload["snapshot_stage"] != plan.Stage || q["channel_profile_id"] != ownedMap(history["task"])["channel_profile_id"] || !ownedQueueClean(q) || (q["status"] != "queued" && q["status"] != "running" && q["status"] != "succeeded") {
-				return true, false
-			}
-			if m["status"] == "succeeded" && q["status"] != "succeeded" {
-				wait = true
-			}
-			if q["status"] == "succeeded" && (q["locked_at"] != nil || q["locked_by"] != nil || ownedInt(q["attempt_count"]) != 1 || m["status"] != "succeeded") {
-				return true, false
-			}
-		}
-		if count != 1 {
+		chainHold, chainWait := ownedMetricChain(history, pub, m, plan, now)
+		if chainHold {
 			return true, false
 		}
+		wait = wait || chainWait
 		switch m["status"] {
 		case "succeeded":
 			done, ok := ownedTime(m["completed_at"])
@@ -603,6 +749,100 @@ func ownedMetricsReady(history, pub map[string]any, start, now time.Time) (hold,
 		default:
 			return true, false
 		}
+	}
+	return false, wait
+}
+
+func ownedMetricChain(history, pub, metric map[string]any, plan MetricSchedulePlan, now time.Time) (hold, wait bool) {
+	attempts := ownedInt(metric["attempt_count"])
+	lastIndex := attempts
+	succeeded := metric["status"] == MetricScheduleSucceeded
+	if succeeded {
+		lastIndex--
+	}
+	if lastIndex < 0 || lastIndex > 1024 {
+		return true, false
+	}
+	if succeeded || attempts == 0 {
+		if metric["last_error_code"] != nil {
+			return true, false
+		}
+	} else if metric["status"] != MetricSchedulePending || metric["last_error_code"] != MetricErrorUnavailable {
+		return true, false
+	}
+	lastAttempt, lastOK := ownedTime(metric["last_attempt_at"])
+	if attempts > 0 && (!lastOK || lastAttempt.Before(plan.DueAt) || lastAttempt.After(now) || lastAttempt.After(plan.GraceUntil)) {
+		return true, false
+	}
+	chain := make([]map[string]any, lastIndex+1)
+	channelID := ownedMap(history["task"])["channel_profile_id"]
+	for _, value := range ownedArray(history["queues"]) {
+		q := ownedMap(value)
+		payload := ownedMap(q["payload_json"])
+		if q["kind"] != QueueCollectMetrics || payload["metric_schedule_id"] != metric["id"] {
+			continue
+		}
+		index := ownedInt(payload["metrics_poll_count"])
+		if index < 0 || index > lastIndex || chain[index] != nil || !uuidPattern.MatchString(ownedString(q["id"])) || payload["publication_id"] != pub["id"] || payload["snapshot_stage"] != plan.Stage || q["channel_profile_id"] != channelID || q["idempotency_key"] != strings.TrimSuffix(plan.IdempotencyKey, "0")+strconv.FormatInt(index, 10) || !ownedQueueClean(q) {
+			return true, false
+		}
+		chain[index] = q
+	}
+	var previousRun time.Time
+	for index, q := range chain {
+		if q == nil {
+			return true, false
+		}
+		run, ok := ownedTime(q["run_after"])
+		if !ok || run.After(plan.GraceUntil) || (index == 0 && !run.Equal(plan.DueAt)) || (index > 0 && (!run.After(previousRun) || q["parent_queue_item_id"] != chain[index-1]["id"])) {
+			return true, false
+		}
+		if index == 0 {
+			parentOK := false
+			for _, value := range ownedArray(history["queues"]) {
+				parent := ownedMap(value)
+				if parent["id"] == q["parent_queue_item_id"] && parent["kind"] == QueuePromotePublication && parent["status"] == "succeeded" && parent["channel_profile_id"] == channelID && ownedMap(parent["payload_json"])["publication_id"] == pub["id"] && ownedMap(parent["payload_json"])["target_visibility"] == "unlisted" && ownedQueueClean(parent) {
+					parentOK = true
+				}
+			}
+			if !parentOK {
+				return true, false
+			}
+		}
+		previousRun = run
+		switch q["status"] {
+		case "succeeded":
+			if q["locked_at"] != nil || q["locked_by"] != nil || ownedInt(q["attempt_count"]) != 1 || (int64(index) == lastIndex && !succeeded) {
+				return true, false
+			}
+		case "queued", "running":
+			// A handler commits its metric result before the runner marks that queue done.
+			if int64(index) < lastIndex && (int64(index) != lastIndex-1 || q["status"] != "running" || succeeded) {
+				return true, false
+			}
+			if q["status"] == "queued" && (ownedInt(q["attempt_count"]) != 0 || q["locked_at"] != nil || q["locked_by"] != nil) {
+				return true, false
+			}
+			if q["status"] == "running" {
+				_, locked := ownedTime(q["locked_at"])
+				if ownedInt(q["attempt_count"]) != 1 || !locked || ownedString(q["locked_by"]) == "" {
+					return true, false
+				}
+			}
+			if succeeded || int64(index) < lastIndex {
+				wait = true
+			}
+		default:
+			return true, false
+		}
+	}
+	if succeeded {
+		done, ok := ownedTime(metric["completed_at"])
+		if !ok || !done.Equal(lastAttempt) || done.Before(previousRun) {
+			return true, false
+		}
+	} else if attempts > 0 && !previousRun.After(lastAttempt) {
+		return true, false
 	}
 	return false, wait
 }
@@ -791,10 +1031,7 @@ func (s *Store) prepareOwnedTick(ctx context.Context, channel ChannelProfileRow,
 	}
 	data.Busy = data.Busy || !ownedQueuesSafe(channel.ID, data, now)
 	state := assessOwnedInventory(channel, data, now.UTC())
-	digest, err := handlerSnapshotDigest(struct {
-		Data  ownedInventoryData
-		State ownedTickState
-	}{data, state})
+	digest, err := ownedAdmissionDigest(data, state)
 	if err != nil {
 		return tickPreparation{}, err
 	}
@@ -803,6 +1040,16 @@ func (s *Store) prepareOwnedTick(ctx context.Context, channel ChannelProfileRow,
 		candidates = []TickCandidate{*state.Candidate}
 	}
 	return tickPreparation{Channel: channel, ChannelID: channel.ID, Bucket: bucket, Options: options, Now: now.UTC(), Candidates: candidates, InputDigest: digest, Owned: &state}, nil
+}
+
+func ownedAdmissionDigest(data ownedInventoryData, state ownedTickState) (string, error) {
+	// Immutable inputs are validated against the manifest on every fenced read. Runtime
+	// readiness and queue leases are fresh guards, not immutable policy input bindings.
+	return handlerSnapshotDigest(struct {
+		Inventory                map[string]any
+		UnusedItemID, HistorySHA string
+		Ready                    bool
+	}{data.Inventory, state.UnusedItemID, state.HistorySHA, state.Candidate != nil && state.HoldReason == ""})
 }
 
 const ownedHistorySQL = `
@@ -841,7 +1088,7 @@ func ownedQueuesSafe(channelID string, data ownedInventoryData, now time.Time) b
 		}
 		for _, value := range ownedArray(history["queues"]) {
 			q := ownedMap(value)
-			if q["kind"] == QueueCollectMetrics {
+			if q["kind"] == QueueCollectMetrics && ownedMap(q["payload_json"])["metric_schedule_id"] != nil {
 				allowed[ownedString(q["id"])] = q
 			}
 		}
@@ -865,6 +1112,9 @@ func (s *Store) finalizeOwnedTick(ctx context.Context, before, current tickPrepa
 	}
 	if state.HoldReason != "" {
 		return s.holdOwnedInventory(ctx, current, state.HoldReason, before.Candidates)
+	}
+	if len(before.Candidates) == 1 && before.Candidates[0].owned != nil && before.Candidates[0].owned.ItemID == state.UnusedItemID && len(candidates) == 1 && candidates[0].CandidateID == before.Candidates[0].CandidateID && candidates[0].RejectionGuard != "owned_inventory_inputs_changed" && (candidates[0].Rejected || firstString(candidates[0].PDSDecisionJSON, "verdict") != "allow") {
+		return s.holdOwnedInventory(ctx, current, "owned_inventory_pds_denied", candidates)
 	}
 	// A competing committed admission or normal completion is a safe no-op on replay.
 	if state.Candidate == nil {

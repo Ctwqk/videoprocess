@@ -438,7 +438,7 @@ func TestOwnedPGEmptyPlatformAliasDeniedBeforePDS(t *testing.T) {
 }
 
 func TestOwnedPGPolicyFailureAndMutationHoldWithoutReplacement(t *testing.T) {
-	for _, mode := range []string{"deny", "error", "seed_mutation", "asset_mutation", "runtime_closed"} {
+	for _, mode := range []string{"deny", "error", "seed_mutation", "asset_mutation", "runtime_closed", "deny_closed", "error_closed", "deny_busy", "error_busy"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newOwnedPGFixture(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -446,10 +446,20 @@ func TestOwnedPGPolicyFailureAndMutationHoldWithoutReplacement(t *testing.T) {
 			var calls atomic.Int32
 			pds := ownedTestPDS(func(ctx context.Context, _ PDSDecisionRequest) (PDSDecision, error) {
 				calls.Add(1)
+				if strings.HasSuffix(mode, "_closed") {
+					if _, err := f.store.Pool.Exec(ctx, `UPDATE runtime_schedules SET state='CLOSED' WHERE service_name='videoprocess'`); err != nil {
+						return PDSDecision{}, err
+					}
+				}
+				if strings.HasSuffix(mode, "_busy") {
+					if _, err := f.store.Enqueue(ctx, EnqueueOptions{Kind: QueueIngestDiscovery, IdempotencyKey: "owned-test-busy:" + f.channel.ID, Payload: map[string]any{"channel_id": f.channel.ID}, ChannelProfileID: &f.channel.ID}); err != nil {
+						return PDSDecision{}, err
+					}
+				}
 				switch mode {
-				case "deny":
+				case "deny", "deny_closed", "deny_busy":
 					return PDSDecision{Verdict: "block"}, nil
-				case "error":
+				case "error", "error_closed", "error_busy":
 					return PDSDecision{}, errors.New("offline failure")
 				case "seed_mutation":
 					_, err := f.store.Pool.Exec(ctx, `UPDATE manual_seeds SET prompt='changed during PDS' WHERE id=$1::uuid`, f.data.Items[0].Seed["id"])
@@ -481,11 +491,227 @@ func TestOwnedPGPolicyFailureAndMutationHoldWithoutReplacement(t *testing.T) {
 			if mode != "runtime_closed" && (state != "held" || !paused) {
 				t.Fatal("failed input/policy did not close intake")
 			}
+			if strings.HasPrefix(mode, "deny_") || strings.HasPrefix(mode, "error_") {
+				var audits int
+				if err := f.store.Pool.QueryRow(ctx, `SELECT count(*) FROM decision_audit_entries WHERE channel_profile_id=$1::uuid AND created_task_id IS NULL`, f.channel.ID).Scan(&audits); err != nil || audits != 1 {
+					t.Fatal("policy failure audit was lost")
+				}
+				if _, err := f.store.Pool.Exec(ctx, `UPDATE runtime_schedules SET state='OPEN' WHERE service_name='videoprocess'`); err != nil {
+					t.Fatal("fixture reopening failed")
+				}
+				if _, err := f.store.Pool.Exec(ctx, `UPDATE channel_ops_queue_items SET status='succeeded' WHERE channel_profile_id=$1::uuid AND kind=$2`, f.channel.ID, QueueIngestDiscovery); err != nil {
+					t.Fatal("fixture busy completion failed")
+				}
+			}
 			_ = f.store.RunTick(ctx, f.channel.ID, "next", HandlerService{PDS: pds})
 			if calls.Load() != 1 {
 				t.Fatal("failure selected a replacement")
 			}
 		})
+	}
+}
+
+func TestOwnedPGQueuedHandleAgentTickContenders(t *testing.T) {
+	f := newOwnedPGFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, bucket := range []string{"first", "second"} {
+		if _, err := f.store.Enqueue(ctx, EnqueueOptions{Kind: QueueAgentTick, IdempotencyKey: "owned-contender:" + f.channel.ID + ":" + bucket, Payload: map[string]any{"channel_id": f.channel.ID, "bucket": bucket}, ChannelProfileID: &f.channel.ID}); err != nil {
+			t.Fatal("tick enqueue failed")
+		}
+	}
+	claim := func() QueueItemRow {
+		t.Helper()
+		item, err := f.store.ClaimNextForKinds(ctx, handlerWorkerID(f.lease.Authority()), []string{QueueAgentTick})
+		if err != nil || item == nil {
+			t.Fatal("tick claim failed")
+		}
+		return *item
+	}
+	first := claim()
+	entered, release, results := make(chan struct{}, 2), make(chan struct{}), make(chan error, 2)
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	h := HandlerService{Store: f.store, PDS: ownedTestPDS(func(ctx context.Context, _ PDSDecisionRequest) (PDSDecision, error) {
+		entered <- struct{}{}
+		select {
+		case <-release:
+			return PDSDecision{Verdict: "allow", DecisionID: "offline-contender"}, nil
+		case <-ctx.Done():
+			return PDSDecision{}, ctx.Err()
+		}
+	})}
+	go func() { results <- h.HandleAgentTick(ctx, first) }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("first tick did not reach PDS")
+	}
+	// This real claim changes the other tick's status, lease, and attempt count while
+	// the first handler is outside its transaction, exactly as the native runner does.
+	second := claim()
+	go func() { results <- h.HandleAgentTick(ctx, second) }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("second tick did not reach PDS")
+	}
+	once.Do(func() { close(release) })
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("queued handler failed: %T", err)
+		}
+	}
+	f.assertCounts(t, 1)
+	var state string
+	if err := f.store.Pool.QueryRow(ctx, `SELECT state FROM owned_seed_inventories WHERE id=$1::uuid`, *f.channel.OwnedSeedInventoryID).Scan(&state); err != nil || state != "approved" {
+		t.Fatal("normal contention permanently held inventory")
+	}
+}
+
+func (f *ownedPGFixture) loadHistory(t *testing.T, ctx context.Context, taskID string) map[string]any {
+	t.Helper()
+	rows, err := f.store.Pool.Query(ctx, ownedHistorySQL, f.data.AccountIDs[0], f.data.Inventory["platform_channel_id"])
+	if err != nil {
+		t.Fatal("fixture history query failed")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatal("fixture history scan failed")
+		}
+		v, err := ownedDecode(raw)
+		if err != nil {
+			t.Fatal("fixture history decode failed")
+		}
+		h := ownedMap(v)
+		if ownedMap(h["task"])["id"] == taskID {
+			return h
+		}
+	}
+	t.Fatal("fixture task history missing")
+	return nil
+}
+
+func TestOwnedPGNormalPublicationCreationAndMetricRecovery(t *testing.T) {
+	f := newOwnedPGFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := f.store.RunTick(ctx, f.channel.ID, "normal-publication", HandlerService{PDS: fakePDS{decision: PDSDecision{Verdict: "allow"}}}); err != nil {
+		t.Fatal("fixture admission failed")
+	}
+	var taskID string
+	if err := f.store.Pool.QueryRow(ctx, `SELECT id FROM production_tasks WHERE channel_profile_id=$1::uuid`, f.channel.ID).Scan(&taskID); err != nil {
+		t.Fatal("fixture task lookup failed")
+	}
+	task, err := f.store.GetProductionTask(ctx, taskID)
+	if err != nil {
+		t.Fatal("fixture task read failed")
+	}
+	var observed time.Time
+	if err := f.store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&observed); err != nil {
+		t.Fatal("fixture clock failed")
+	}
+	// Inject only this disposable fixture's Store clock; no server clock is changed.
+	at := observed.UTC().Add(-25 * time.Hour)
+	f.store.Now = func() time.Time { return at }
+	if _, err := f.store.Enqueue(ctx, EnqueueOptions{Kind: QueuePublishTask, IdempotencyKey: "owned-publish:" + taskID, Payload: map[string]any{"production_task_id": taskID}, ChannelProfileID: &f.channel.ID}); err != nil {
+		t.Fatal("fixture publish enqueue failed")
+	}
+	parent, err := f.store.ClaimNextForKinds(ctx, handlerWorkerID(f.lease.Authority()), []string{QueuePublishTask})
+	if err != nil || parent == nil {
+		t.Fatal("fixture publish claim failed")
+	}
+	task.RationaleJSON = map[string]any{"autoflow_job_observation": map[string]any{"upload_metadata": map[string]any{"video_id": "abcdefghijk", "privacy": "unlisted"}}}
+	if err := f.store.CreateOrUpdatePublicationFromTask(ctx, task, parent.ID); err != nil {
+		t.Fatal("normal publication creation failed")
+	}
+	if err := f.store.MarkQueueDone(ctx, *parent); err != nil {
+		t.Fatal("normal publish completion failed")
+	}
+	h := f.loadHistory(t, ctx, taskID)
+	pub := ownedMap(ownedArray(h["publications"])[0])
+	if pub["current_privacy"] != "unlisted" || pub["scheduled_publish_at"] != nil || !ownedPendingPromotion(h, pub, at, observed) {
+		t.Fatal("actual normal unlisted publication did not wait for promotion")
+	}
+	promote, err := f.store.ClaimNextForKinds(ctx, handlerWorkerID(f.lease.Authority()), []string{QueuePromotePublication})
+	if err != nil || promote == nil {
+		t.Fatal("fixture promotion claim failed")
+	}
+	start := at.Add(time.Hour)
+	at = start
+	if err := f.store.PromotePublication(ctx, ownedString(pub["id"]), "unlisted", start, PDSDecision{Verdict: "allow"}, promote.ID, 0); err != nil {
+		t.Fatal("normal promotion failed")
+	}
+	if err := f.store.MarkQueueDone(ctx, *promote); err != nil {
+		t.Fatal("normal promotion completion failed")
+	}
+	publication, err := f.store.GetPublication(ctx, ownedString(pub["id"]))
+	if err != nil {
+		t.Fatal("fixture publication read failed")
+	}
+	// Complete 1h/6h normally; the due 24h collection returns unavailable once.
+	var retrySchedule MetricScheduleRow
+	for i := range 3 {
+		item, err := f.store.ClaimNextForKinds(ctx, handlerWorkerID(f.lease.Authority()), []string{QueueCollectMetrics})
+		if err != nil || item == nil {
+			t.Fatal("normal metrics claim failed")
+		}
+		m, err := f.store.getMetricSchedule(ctx, firstString(item.PayloadJSON, "metric_schedule_id"), false)
+		if err != nil {
+			t.Fatal("normal metrics read failed")
+		}
+		at = m.DueAt
+		if i < 2 {
+			err = f.store.CompleteMetricSchedule(ctx, publication, m, map[string]any{"views": 1}, 1, []string{"views"}, 1, map[string]any{})
+		} else {
+			if m.SnapshotStage != "24h" {
+				t.Fatal("unexpected metric stage order")
+			}
+			err = f.store.RequeueOrExpireMetricSchedule(ctx, publication, m, *item, 24, time.Second)
+			retrySchedule = m
+		}
+		if err != nil {
+			t.Fatal("normal metric transition failed")
+		}
+		if err := f.store.MarkQueueDone(ctx, *item); err != nil {
+			t.Fatal("normal metric queue completion failed")
+		}
+	}
+	h = f.loadHistory(t, ctx, taskID)
+	pub = ownedMap(ownedArray(h["publications"])[0])
+	if hold, wait := ownedMetricsReady(h, pub, start, at); hold || !wait {
+		t.Fatal("actual pending metric retry chain rejected")
+	}
+	// The retry is future-due relative to the real DB; claim that exact queue in the
+	// disposable fixture with its normal lease shape, without advancing any clock.
+	var raw []byte
+	if err := f.store.Pool.QueryRow(ctx, `UPDATE channel_ops_queue_items q SET status='running',attempt_count=1,locked_by=$2,locked_at=clock_timestamp() WHERE payload_json->>'metric_schedule_id'=$1 AND status='queued' RETURNING row_to_json(q)`, retrySchedule.ID, handlerWorkerID(f.lease.Authority())).Scan(&raw); err != nil {
+		t.Fatal("fixture retry lease failed")
+	}
+	v, err := ownedDecode(raw)
+	if err != nil {
+		t.Fatal("fixture retry decode failed")
+	}
+	q := ownedMap(v)
+	locked, _ := ownedTime(q["locked_at"])
+	worker := ownedString(q["locked_by"])
+	item := QueueItemRow{ID: ownedString(q["id"]), Status: QueueStatusRunning, LockedBy: &worker, LockedAt: &locked}
+	at = retrySchedule.DueAt.Add(time.Second)
+	m, err := f.store.getMetricSchedule(ctx, retrySchedule.ID, false)
+	if err != nil {
+		t.Fatal("retry schedule read failed")
+	}
+	if err := f.store.CompleteMetricSchedule(ctx, publication, m, map[string]any{"views": 2}, 1, []string{"views"}, 1, map[string]any{}); err != nil {
+		t.Fatal("normal recovered metric completion failed")
+	}
+	if err := f.store.MarkQueueDone(ctx, item); err != nil {
+		t.Fatal("normal retry queue completion failed")
+	}
+	h = f.loadHistory(t, ctx, taskID)
+	if hold, wait := ownedMetricsReady(h, pub, start, at); hold || wait {
+		t.Fatal("actual recovered metric retry chain rejected")
 	}
 }
 
