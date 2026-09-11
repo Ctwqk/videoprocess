@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Parent-run contracts only. Never infer a database from DATABASE_URL or LoadConfig.
@@ -49,6 +51,73 @@ type ownedPGFixture struct {
 	channel ChannelProfileRow
 	data    ownedInventoryData
 	lease   *LeaderLease
+}
+
+func ownedReleaseLeaderAtDBTime(ctx context.Context, row pgx.Row, release func(context.Context, time.Time) error) error {
+	var observed time.Time
+	if err := row.Scan(&observed); err != nil {
+		return err
+	}
+	return release(ctx, observed.UTC())
+}
+
+type ownedClockRow struct {
+	at  time.Time
+	err error
+}
+
+func (row ownedClockRow) Scan(dest ...any) error {
+	if row.err != nil {
+		return row.err
+	}
+	if len(dest) != 1 {
+		return errors.New("unexpected fixture clock columns")
+	}
+	value, ok := dest[0].(*time.Time)
+	if !ok {
+		return errors.New("unexpected fixture clock type")
+	}
+	*value = row.at
+	return nil
+}
+
+func TestOwnedFixtureLeaderReleaseUsesDatabaseObservation(t *testing.T) {
+	local := time.Date(2026, 9, 11, 1, 53, 5, 804823000, time.UTC)
+	for _, skew := range []time.Duration{91 * time.Millisecond, -91 * time.Millisecond} {
+		t.Run(skew.String(), func(t *testing.T) {
+			acquired := local.Add(skew)
+			observed := acquired.Add(time.Millisecond)
+			err := ownedReleaseLeaderAtDBTime(context.Background(), ownedClockRow{at: observed}, func(_ context.Context, released time.Time) error {
+				if released.Before(acquired) {
+					return errors.New("ck_channelops_leader_release_order")
+				}
+				if !released.Equal(observed) {
+					return errors.New("release did not use the database observation")
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestOwnedFixtureLeaderReleaseDoesNotFallbackOnClockError(t *testing.T) {
+	failure := errors.New("offline clock read failed")
+	called := false
+	err := ownedReleaseLeaderAtDBTime(context.Background(), ownedClockRow{err: failure}, func(context.Context, time.Time) error { called = true; return nil })
+	if !errors.Is(err, failure) || called {
+		t.Fatal("clock error caused a fabricated release timestamp")
+	}
+}
+
+func TestOwnedFixtureLeaderReleasePreservesReleaseError(t *testing.T) {
+	failure := errors.New("offline release failed")
+	err := ownedReleaseLeaderAtDBTime(context.Background(), ownedClockRow{at: time.Date(2026, 9, 11, 1, 53, 6, 0, time.UTC)}, func(context.Context, time.Time) error { return failure })
+	if !errors.Is(err, failure) {
+		t.Fatal("release error was hidden")
+	}
 }
 
 func ownedNewUUID(t *testing.T) string {
@@ -213,7 +282,17 @@ func newOwnedPGFixture(t *testing.T) *ownedPGFixture {
 		if _, err := store.Pool.Exec(cleanup, `UPDATE channel_ops_queue_items SET status='failed',locked_at=NULL,locked_by=NULL WHERE channel_profile_id=$1::uuid AND status IN ('queued','running')`, channel.ID); err != nil {
 			t.Error("fixture queue cleanup failed")
 		}
-		releaseLeaderTestLease(t, cleanup, f.lease, time.Now().UTC())
+		err := ownedReleaseLeaderAtDBTime(cleanup, store.Pool.QueryRow(cleanup, `SELECT clock_timestamp()`), f.lease.Release)
+		if err != nil && !errors.Is(err, ErrLeaderAuthorityLost) {
+			t.Error("fixture leader release failed")
+		}
+		// A failed clock read must not strand the dedicated lease connection or fabricate released_at.
+		f.lease.mu.Lock()
+		defer f.lease.mu.Unlock()
+		f.lease.state.clear(f.lease.authority)
+		if err := f.lease.releaseConnectionLocked(cleanup); err != nil {
+			t.Error("fixture leader connection cleanup failed")
+		}
 	})
 	return f
 }
@@ -316,7 +395,8 @@ func TestOwnedPGQueueAndLeaderLossDuringPDSCannotConsume(t *testing.T) {
 						return PDSDecision{}, err
 					}
 				} else {
-					if err := f.lease.Release(ctx, time.Now().UTC()); err != nil {
+					if err := ownedReleaseLeaderAtDBTime(ctx, f.store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`), f.lease.Release); err != nil {
+						t.Error("fixture intentional leader release failed")
 						return PDSDecision{}, err
 					}
 				}
