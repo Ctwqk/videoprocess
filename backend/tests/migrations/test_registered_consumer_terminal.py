@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import re
 import runpy
+import sqlite3
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +14,16 @@ from types import SimpleNamespace
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import Enum
+from sqlalchemy import (
+    CheckConstraint,
+    Enum,
+    ForeignKeyConstraint,
+    Index,
+    MetaData,
+    PrimaryKeyConstraint,
+    Table,
+    UniqueConstraint,
+)
 
 
 ROOT = Path(__file__).parents[2]
@@ -177,6 +190,8 @@ def test_terminal_fixture_is_schema_complete_and_preserves_real_retry_staging_or
                     assert row[column.name] in column.type.enums, (table, column.name)
             if table == "artifacts":
                 assert raw["kind"] == "intermediate"
+            if table == "jobs":
+                assert raw["orchestrator_owner"] == ""
     retry = next(d for d in rows["worker_task_dispatches"] if d["origin_receipt_id"])
     origin = next(
         r
@@ -222,9 +237,195 @@ def test_negative_fixtures_reach_guard_instead_of_missing_required_columns():
                             table,
                             column.name,
                         )
-                    if isinstance(column.type, Enum) and row.get(column.name) is not None:
+                    if (
+                        isinstance(column.type, Enum)
+                        and row.get(column.name) is not None
+                    ):
                         assert row[column.name] in column.type.enums, (
                             fault,
                             table,
                             column.name,
                         )
+
+
+def test_fixture_satisfies_migration_checks_defaults_foreign_keys_and_unique_keys(
+    monkeypatch,
+):
+    """Evaluate portable row predicates offline, not PostgreSQL or trigger behavior."""
+    from app.models.base import Base
+    from tests.migrations.test_registered_consumer_reconcile_postgres import seed_rows
+    from tests.migrations.test_registered_consumer_terminal_postgres import (
+        FAULTS,
+        corrupt,
+        terminal_rows,
+        with_defaults,
+    )
+    from tests.services.test_owned_seed_inventory_history import NOW
+
+    owner_migration = runpy.run_path(
+        str(ROOT / "alembic/versions/018_go_orchestrator_owner.py")
+    )
+    checks, columns = {}, {}
+    monkeypatch.setattr(
+        owner_migration["op"],
+        "add_column",
+        lambda table, column: columns.update({column.name: column}),
+    )
+    monkeypatch.setattr(
+        owner_migration["op"],
+        "create_check_constraint",
+        lambda name, table, sql: checks.update({table: (name, sql)}),
+    )
+    owner_migration["upgrade"]()
+    assert str(columns["orchestrator_owner"].server_default.arg) == "python"
+
+    native = MetaData()
+    migration034 = runpy.run_path(
+        str(ROOT / "alembic/versions/034_worker_registrations.py")
+    )
+    monkeypatch.setattr(
+        migration034["op"],
+        "create_table",
+        lambda name, *args, **kwargs: Table(name, native, *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        migration034["op"],
+        "create_index",
+        lambda name, table, cols, **kwargs: Index(
+            name, *(native.tables[table].c[col] for col in cols), **kwargs
+        ),
+    )
+    monkeypatch.setattr(
+        migration034["op"],
+        "create_foreign_key",
+        lambda name, table, remote, local, target, **kwargs: native.tables[
+            table
+        ].append_constraint(
+            ForeignKeyConstraint(
+                local, [f"{remote}.{col}" for col in target], name=name, **kwargs
+            )
+        ),
+    )
+    migration034["_create_registered_event_receipt_tables"]()
+    assert len(native.tables) == 5
+
+    def bind(value):
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        if value is None or isinstance(value, (str, int, float)):
+            return value
+        return str(value)
+
+    _, registrations, grants = seed_rows(NOW, "terminal-test")
+    errors = []
+    with closing(sqlite3.connect(":memory:")) as sql:
+
+        def predicate(expression, row, table):
+            projection = ",".join(f'? AS "{key}"' for key in row)
+            return sql.execute(
+                f'SELECT ({expression}) FROM (SELECT {projection}) AS "{table}"',
+                [bind(v) for v in row.values()],
+            ).fetchone()[0]
+
+        for fault in (None, *FAULTS):
+            rows = terminal_rows(
+                SimpleNamespace(registrations=registrations, grants=grants), NOW
+            )
+            if fault:
+                corrupt(rows, fault, NOW)
+            rows = {
+                table: [with_defaults(table, row) for row in records]
+                for table, records in rows.items()
+            }
+            external = {
+                "worker_registrations": registrations,
+                "worker_admission_grants": grants,
+            }
+            ids = {
+                table: {row["id"] for row in records} for table, records in rows.items()
+            }
+            ids.update(
+                {
+                    table: {str(row.id) for row in records}
+                    for table, records in external.items()
+                }
+            )
+            for table, records in rows.items():
+                schema = (
+                    native.tables[table]
+                    if table in native.tables
+                    else Base.metadata.tables[table]
+                )
+                for row in records:
+                    for column in schema.columns:
+                        if not column.nullable and (
+                            column.name in row or column.server_default is None
+                        ):
+                            if row.get(column.name) is None:
+                                errors.append(
+                                    (
+                                        fault,
+                                        table,
+                                        column.name,
+                                        "missing nonnull/default",
+                                    )
+                                )
+                    for fk in schema.foreign_keys:
+                        value = row.get(fk.parent.name)
+                        if value is not None:
+                            remote, key = fk.target_fullname.rsplit(".", 1)
+                            assert key == "id"
+                            if str(value) not in ids.get(remote, set()):
+                                errors.append(
+                                    (fault, table, fk.parent.name, "foreign key")
+                                )
+                    expressions = [
+                        (
+                            check.name,
+                            str(
+                                check.sqltext.compile(
+                                    compile_kwargs={"literal_binds": True}
+                                )
+                            ),
+                        )
+                        for check in schema.constraints
+                        if isinstance(check, CheckConstraint)
+                    ]
+                    if table in checks:
+                        expressions.append(checks[table])
+                    for name, expression in expressions:
+                        if expression == "(payload_sha256 ~ '^[0-9a-f]{64}$') IS TRUE":
+                            valid = (
+                                re.fullmatch(r"[0-9a-f]{64}", row["payload_sha256"])
+                                is not None
+                            )
+                        else:
+                            valid = predicate(expression, row, table) == 1
+                        if not valid:
+                            errors.append((fault, table, name, "check"))
+                keys = [
+                    (tuple(c.name for c in key.columns), None)
+                    for key in schema.constraints
+                    if isinstance(key, (PrimaryKeyConstraint, UniqueConstraint))
+                ]
+                keys.extend(
+                    (
+                        tuple(c.name for c in index.columns),
+                        index.dialect_options["postgresql"].get("where"),
+                    )
+                    for index in schema.indexes
+                    if index.unique
+                )
+                for names, condition in keys:
+                    seen = set()
+                    for row in records:
+                        values = tuple(bind(row.get(name)) for name in names)
+                        if None in values or (
+                            condition is not None
+                            and predicate(str(condition), row, table) != 1
+                        ):
+                            continue
+                        if values in seen:
+                            errors.append((fault, table, names, "unique"))
+                        seen.add(values)
+    assert not errors, errors

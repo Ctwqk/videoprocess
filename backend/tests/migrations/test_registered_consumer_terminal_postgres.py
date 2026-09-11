@@ -170,6 +170,8 @@ def with_defaults(table, row):
     result = copy.deepcopy(row)
     if table == "artifacts" and result.get("kind") == "intermediate":
         result["kind"] = "INTERMEDIATE"
+    if table == "jobs" and result.get("orchestrator_owner") == "":
+        result["orchestrator_owner"] = "python"
     for column in Base.metadata.tables[table].columns:
         if result.get(column.name) is None and not column.nullable:
             if column.default is not None:
