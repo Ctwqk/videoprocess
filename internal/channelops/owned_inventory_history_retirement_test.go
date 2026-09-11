@@ -55,6 +55,44 @@ func historyTestReseal(t *testing.T, f map[string]any) {
 	historyTestRehash(t, f)
 }
 
+func TestOwnedHistoryReviewR2EmptyUpstreamCardinality(t *testing.T) {
+	for _, variant := range []string{"empty", "empty_string"} {
+		t.Run(variant, func(t *testing.T) {
+			f := historyGolden(t, "retired_unassigned")
+			pipeline := historyTestFirst(f, "jobs")["pipeline_snapshot"].(map[string]any)
+			edges := []any{}
+			for _, edge := range pipeline["edges"].([]any) {
+				if edge.(map[string]any)["target"] != "unused_trim" {
+					edges = append(edges, edge)
+				}
+			}
+			pipeline["edges"] = edges
+			node := historyTestFind(t, f, "node_executions", "node_id", "unused_trim")
+			node["input_artifact_ids"] = []any{}
+			if variant == "empty_string" {
+				node["input_artifact_ids"] = []any{""}
+			}
+			dispatch := historyTestFind(t, f, "worker_task_dispatches", "node_execution_id", node["id"])
+			dispatch["payload_json"].(map[string]any)["input_artifacts"] = "{}"
+			dispatch["payload_sha256"] = historyTestHash(t, dispatch["payload_json"])
+			for _, raw := range f["redis_observations"].([]any) {
+				obs := raw.(map[string]any)
+				if obs["dispatch_key"] == dispatch["dispatch_key"] {
+					obs["payload_sha256"] = dispatch["payload_sha256"]
+				}
+			}
+			historyTestReseal(t, f)
+			want := historyTestCopy(t, f["expected"]).(map[string]any)
+			// Independently rehashed and assessed with frozen Python A1.
+			want["authority_sha256"] = "6169441613ebd6a013b0ec9f2f104e625b27430f531bbd6cd793b8747fde66b7"
+			if variant == "empty_string" {
+				want = historyTestRefusal("owned_history_retired_changed")
+			}
+			historyTestFullAssessment(t, f, want)
+		})
+	}
+}
+
 func TestOwnedHistoryRetiredDrift(t *testing.T) {
 	for _, bad := range []string{"attempt", "manager", "video", "receipt", "complete", "fk", "registration", "started", "job_running", "node_running", "unhalt", "unpause", "claim", "emission", "delivery", "pending", "marker", "stale", "future", "origin", "retry_key", "retry_message", "retry_hash", "retry_no_ack", "retry_authorized", "retry_invented_cancel", "source_missing", "source_hash", "render_hash", "payload_missing", "orphan_receipt", "new_job", "new_queue", "no_redis", "source_hash_missing", "extra_observation", "duplicate_observation", "no_certificate", "v1"} {
 		t.Run(bad, func(t *testing.T) {

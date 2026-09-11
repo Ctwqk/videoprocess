@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"math/big"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -150,7 +151,7 @@ func historyTruth(v any) bool {
 	case map[string]any:
 		return len(v) > 0
 	case json.Number:
-		return v != "0" && v != "0.0"
+		return historyNumeric(v).Sign() != 0
 	}
 	return true
 }
@@ -159,20 +160,34 @@ func historyTime(v any) time.Time {
 	if t, ok := historyAwareTime(s); ok {
 		return t
 	}
-	for _, layout := range []string{"2006-01-02T15:04:05.999999999", "2006-01-02 15:04:05.999999999", "2006-01-02T15:04", "2006-01-02"} {
-		if t, err := time.Parse(layout, s); err == nil {
+	for _, date := range []string{"2006-01-02", "20060102"} {
+		if t, err := time.Parse(date, s); err == nil && t.Year() >= 1 {
 			return t.UTC().Truncate(time.Microsecond)
+		}
+		for _, separator := range []string{"T", " "} {
+			for _, clock := range []string{"15:04:05.999999999", "15:04", "15", "150405.999999999", "1504"} {
+				if t, err := time.Parse(date+separator+clock, s); err == nil && t.Year() >= 1 {
+					return t.UTC().Truncate(time.Microsecond)
+				}
+			}
 		}
 	}
 	historyRequire(false)
 	return time.Time{}
 }
 func historyAwareTime(s string) (time.Time, bool) {
-	for _, separator := range []string{"T", " "} {
-		for _, zone := range []string{"Z07:00", "Z0700", "Z07:00:00", "Z070000", "Z07"} {
-			for _, clock := range []string{"15:04:05.999999999", "15:04", "15"} {
-				if at, err := time.Parse("2006-01-02"+separator+clock+zone, s); err == nil {
-					return at.UTC().Truncate(time.Microsecond), true
+	for _, date := range []string{"2006-01-02", "20060102"} {
+		for _, separator := range []string{"T", " "} {
+			for _, zone := range []string{"Z07:00", "Z0700", "Z07:00:00", "Z070000", "Z07"} {
+				for _, clock := range []string{"15:04:05.999999999", "15:04", "15", "150405.999999999", "1504"} {
+					if at, err := time.Parse(date+separator+clock+zone, s); err == nil {
+						utc := at.UTC()
+						// Python bounds both the parsed date and the UTC conversion.
+						if at.Year() < 1 || utc.Year() < 1 || utc.Year() > 9999 {
+							return time.Time{}, false
+						}
+						return utc.Truncate(time.Microsecond), true
+					}
 				}
 			}
 		}
@@ -839,7 +854,7 @@ func historySettledReplacement(h map[string]any) (result map[string]any) {
 	due := uploaded.Add(time.Hour)
 	p := historyObject(auto["payload_json"])
 	mp := historyObject(manual["payload_json"])
-	historyRequire(auto["id"] != manual["id"] && historyTime(auto["run_after"]).Equal(due) && historyBetween(historyTime(auto["dead_letter_at"]), uploaded, historyTime(manual["run_after"])) && historyBefore(historyTime(manual["run_after"]), start) && auto["last_error"] == "replaced_by_immediate_unlisted_canary_promotion" && historyInt(auto["attempt_count"]) == 0 && auto["locked_at"] == nil && auto["locked_by"] == nil && auto["channel_profile_id"] == channel && auto["idempotency_key"] == "promote_publication:"+historyString(pub["id"])+":unlisted:"+historyZ(due) && p["publication_id"] == pub["id"] && p["target_visibility"] == "unlisted" && p["scheduled_at"] == historyZ(due))
+	historyRequire(auto["id"] != manual["id"] && historyTime(auto["run_after"]).Equal(due) && historyBetween(historyTime(auto["dead_letter_at"]), uploaded, historyTime(manual["run_after"])) && historyBefore(historyTime(manual["run_after"]), start) && auto["last_error"] == "replaced_by_immediate_unlisted_canary_promotion" && historyEqual(auto["attempt_count"], json.Number("0")) && auto["locked_at"] == nil && auto["locked_by"] == nil && auto["channel_profile_id"] == channel && auto["idempotency_key"] == "promote_publication:"+historyString(pub["id"])+":unlisted:"+historyZ(due) && p["publication_id"] == pub["id"] && p["target_visibility"] == "unlisted" && p["scheduled_at"] == historyZ(due))
 	historyRequire(historyQueueState(manual, "succeeded") && manual["parent_queue_item_id"] == nil && manual["channel_profile_id"] == channel && manual["idempotency_key"] == "promote_publication:"+historyString(pub["id"])+":unlisted:manual" && mp["publication_id"] == pub["id"] && mp["target_visibility"] == "unlisted" && mp["channel_profile_id"] == channel && mp["scheduled_at"] == nil)
 	parent := historyOne(historySelect(h["queues"], func(q map[string]any) bool { return q["id"] == auto["parent_queue_item_id"] }), "owned_history_invalid")
 	historyRequire(parent["kind"] == "publish_task" && parent["channel_profile_id"] == channel && historyObject(parent["payload_json"])["production_task_id"] == task["id"] && historyQueueState(parent, "succeeded") && historyReconciled(h, pub, start))
@@ -960,7 +975,7 @@ func historyNormal(h, item map[string]any, now time.Time) (string, bool, any) {
 		return "owned_inventory_outstanding", false, nil
 	}
 	op := historyOne(historyArray(h["operations"]), "owned_inventory_operation_count")
-	historyRequire(op["production_task_id"] == task["id"] && op["job_id"] == task["job_id"] && historySHA.MatchString(historyString(op["content_sha256"])) && op["error_message"] == nil, "owned_inventory_operation_identity")
+	historyRequire(op["production_task_id"] == task["id"] && historyEqual(op["job_id"], task["job_id"]) && historySHA.MatchString(historyString(op["content_sha256"])) && op["error_message"] == nil, "owned_inventory_operation_identity")
 	if op["status"] != "succeeded" {
 		historyRequire(reserved && historyIs(op["status"], "reserved", "attempted", "submitted"), "owned_inventory_operation_unresolved")
 		return "owned_inventory_outstanding", false, nil
@@ -1096,8 +1111,11 @@ func historyTerminalGraph(rows, c map[string]any) map[string]any {
 		return r["job_id"] == c["job_id"] || nodeIDs[historyReference(r["node_execution_id"])] || eventIDs[historyEventIdentity(r)]
 	})
 	g["channel_ops_queue_items"] = historySelect(rows["channel_ops_queue_items"], func(r map[string]any) bool {
-		p := historyObject(r["payload_json"])
-		return r["channel_profile_id"] == c["legacy_channel_profile_id"] || p["production_task_id"] == c["task_id"] || p["job_id"] == c["job_id"]
+		if r["channel_profile_id"] == c["legacy_channel_profile_id"] {
+			return true
+		}
+		p := historyDefaultObject(r, "payload_json")
+		return p["production_task_id"] == c["task_id"] || p["job_id"] == c["job_id"]
 	})
 	sourceIDs := map[string]bool{}
 	for _, table := range []string{"worker_task_dispatches", "worker_event_emissions"} {
@@ -1357,7 +1375,7 @@ func historyUpstream(p historyPipeline, byName map[string]map[string]any, node m
 		inputs = append(inputs, historyString(v))
 	}
 	sort.Strings(inputs)
-	historyRequire(strings.Join(values, "\x00") == strings.Join(inputs, "\x00"), reason)
+	historyRequire(slices.Equal(values, inputs), reason)
 	return out
 }
 

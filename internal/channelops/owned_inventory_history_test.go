@@ -78,6 +78,154 @@ func historyTestReason(t *testing.T, f map[string]any, want string) {
 	}
 }
 
+func historyTestFullAssessment(t *testing.T, f map[string]any, want any) {
+	t.Helper()
+	defer func() {
+		if p := recover(); p != nil {
+			t.Fatalf("constructor/assessor panicked instead of returning an assessment: %v", p)
+		}
+	}()
+	raw := mustHistoryAssessmentJSON(t, historyTestAssess(t, f))
+	got, err := ownedDecode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ownedEqual(got, want) {
+		t.Fatalf("full assessment\ngot %s\nwant %s", raw, historyJSON(t, want))
+	}
+}
+
+func historyTestRefusal(reason string) map[string]any {
+	return map[string]any{
+		"block_reason": reason, "classifications": []any{}, "account_ids": []any{},
+		"retired_source_sha256": []any{}, "retired_render_sha256": []any{},
+		"authority_sha256": "", "stable_history_sha256": "", "wait_reason": nil,
+		"completed_item_ids": []any{}, "terminal_paths": []any{},
+	}
+}
+
+func TestOwnedHistoryReviewR1StructuredJobReferences(t *testing.T) {
+	for _, structured := range []bool{false, true} {
+		t.Run(fmt.Sprint(structured), func(t *testing.T) {
+			f := historyGolden(t, "direct")
+			want := f["expected"]
+			if structured {
+				historyTestFirst(f, "production_tasks")["job_id"] = map[string]any{}
+				historyTestFirst(f, "youtube_upload_operations")["job_id"] = map[string]any{}
+				want = historyTestRefusal("owned_inventory_job_receipt")
+			}
+			historyTestFullAssessment(t, f, want)
+		})
+	}
+}
+
+func TestOwnedHistoryReviewR3NumericTruth(t *testing.T) {
+	for _, field := range []string{"approved_by", "approval_reference"} {
+		for _, variant := range []string{"control", "negative_zero", "one"} {
+			t.Run(field+"/"+variant, func(t *testing.T) {
+				f := historyGolden(t, "history_only")
+				want := historyTestCopy(t, f["expected"]).(map[string]any)
+				switch variant {
+				case "negative_zero":
+					historyTestFirst(f, "owned_seed_inventories")[field] = json.Number("-0.0")
+					want = historyTestRefusal("owned_history_authority_invalid")
+				case "one":
+					historyTestFirst(f, "owned_seed_inventories")[field] = json.Number("1")
+					// Complete frozen Python assessments differ only in this authority hash.
+					want["authority_sha256"] = map[string]string{
+						"approved_by":        "9ee1966f4e143a0e7b195964df6a4c44a8724917295e12e21dc673efdbb5caf2",
+						"approval_reference": "a03002851b157dfe9c44756db98b6da9078503aae0f3fd36821e3dd7141f1751",
+					}[field]
+				}
+				historyTestFullAssessment(t, f, want)
+			})
+		}
+	}
+	for _, negativeZero := range []bool{false, true} {
+		t.Run("running/"+fmt.Sprint(negativeZero), func(t *testing.T) {
+			f := historyGolden(t, "direct")
+			q := historyTestFind(t, f, "channel_ops_queue_items", "kind", "reconcile_publication")
+			q["status"], q["attempt_count"], q["locked_at"], q["locked_by"] = "running", json.Number("1"), f["now"], "fixture-owner"
+			want := historyTestCopy(t, f["expected"]).(map[string]any)
+			want["wait_reason"] = "owned_inventory_outstanding"
+			want["stable_history_sha256"] = "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+			if negativeZero {
+				q["locked_by"] = json.Number("-0.0")
+				want = historyTestRefusal("owned_inventory_reconciliation")
+			}
+			historyTestFullAssessment(t, f, want)
+		})
+	}
+}
+
+func TestOwnedHistoryReviewR5OrdinaryTimestamp(t *testing.T) {
+	for _, tc := range []struct{ name, timestamp, stable string }{
+		{"control", "", ""},
+		{"year_zero", "0000-09-10T06:59:00+00:00", ""},
+		{"year_zero_naive", "0000-09-10T06:59:00", ""},
+		{"utc_underflow", "0001-01-01T00:00:00+00:01", ""},
+		{"utc_overflow", "9999-12-31T23:59:59-00:01", ""},
+		{"basic_aware", "20260910T065900+00:00", "fe73b998df2833efab45eb422f86d71fb096abcb3706467e845bc95a6b5eb39e"},
+		{"basic_date_extended_clock", "20260910T06:59:00+00:00", "4ce9eabf3e088d5e78d317bc7f88a80925848fedf3fae9e9c8a85250e1da1deb"},
+		{"basic_naive", "20260910T065900", "5cedf8603d23d25a2ce5fd62140a05aaee64fcbb2040a67a44f1ba4cd52268f4"},
+		{"basic_naive_space", "20260910 065900", "e630d0e2d54f2914d282f8b155f1a88240eccba7330319eb21202b09e85704bc"},
+		{"basic_naive_minutes", "20260910T0659", "a43f37e24711e22ce1355191c1d7fdf5689e9b8d958750726bc3768d1545ed23"},
+		{"extended_date_basic_clock", "2026-09-10T065900", "d2c978cb3412018aad2fdb22ee07ced03a76504a8eb7a8b0ea0b2837f2017843"},
+		{"basic_date_only", "20260910", "aed1aa2e6be37d8a7f7f70fa2430f8e7d369ba91ea4747d7d161aa4e8e9c09e3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := historyGolden(t, "direct")
+			want := historyTestCopy(t, f["expected"]).(map[string]any)
+			if tc.timestamp != "" {
+				historyTestFirst(f, "youtube_upload_operations")["request_attempted_at"] = tc.timestamp
+				if tc.stable == "" {
+					want = historyTestRefusal("owned_history_invalid")
+				} else {
+					// Observed from the frozen Python assessor, not computed by this port.
+					want["stable_history_sha256"] = tc.stable
+				}
+			}
+			historyTestFullAssessment(t, f, want)
+		})
+	}
+	for _, basic := range []bool{false, true} {
+		t.Run("authority/"+fmt.Sprint(basic), func(t *testing.T) {
+			f := historyGolden(t, "history_only")
+			want := f["expected"]
+			if basic {
+				historyTestManifest(f)["starts_at"] = "20260911T080000+00:00"
+				historyTestRehash(t, f)
+				want = historyTestRefusal("owned_history_manifest_invalid")
+			}
+			historyTestFullAssessment(t, f, want)
+		})
+	}
+}
+
+func TestOwnedHistoryReviewR6ReplacementEquality(t *testing.T) {
+	for _, tc := range []struct {
+		name, stable string
+		value        any
+	}{
+		{"integer_zero", "490a318f97dcf9634c7b4adbc3b11a0a3c521d2fdebe05dd68fee54476b0b747", json.Number("0")},
+		{"float_zero", "d7f982c715388fdafc1057004c32e1300b28b2897ad1e7d5992c2cda717a544f", json.Number("0.0")},
+		{"false", "cfbb430790cf5696a5cc0c35b45b66d581ba178fea56101863c31ff01673937d", false},
+		{"integer_one", "", json.Number("1")}, {"float_one", "", json.Number("1.0")}, {"true", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := historyGolden(t, "promotion_replacement")
+			historyTestFind(t, f, "channel_ops_queue_items", "status", "cancelled")["attempt_count"] = tc.value
+			want := historyTestCopy(t, f["expected"]).(map[string]any)
+			if tc.stable == "" {
+				want = historyTestRefusal("owned_inventory_queue_failed")
+			} else {
+				want["stable_history_sha256"] = tc.stable
+			}
+			historyTestFullAssessment(t, f, want)
+		})
+	}
+}
+
 func TestOwnedHistorySnapshotValidation(t *testing.T) {
 	for _, bad := range []string{"missing", "extra", "duplicate", "duplicate_schedule", "overflow", "not_array", "not_object", "missing_id", "invalid_uc", "too_large", "bad_json", "bad_redis"} {
 		t.Run(bad, func(t *testing.T) {
@@ -528,12 +676,29 @@ func TestOwnedHistoryA1StructuredReceiptEquality(t *testing.T) {
 	}
 }
 
-func TestOwnedHistoryUnrelatedProjectedQueueMayOmitPayload(t *testing.T) {
-	f := historyGolden(t, "direct")
-	rows := historyTestRows(f)
-	rows["channel_ops_queue_items"] = append(rows["channel_ops_queue_items"].([]any), map[string]any{"id": historyTestUID(999)})
-	if r := historyTestAssess(t, f); r.BlockReason != nil {
-		t.Fatal(*r.BlockReason)
+func TestOwnedHistoryReviewR4UnrelatedProjectedQueue(t *testing.T) {
+	for _, name := range []string{"direct", "retired_unassigned"} {
+		for _, variant := range []string{"control", "missing", "null", "array"} {
+			t.Run(name+"/"+variant, func(t *testing.T) {
+				f := historyGolden(t, name)
+				want := f["expected"]
+				if variant != "control" {
+					q := map[string]any{"id": historyTestUID(999)}
+					if variant == "null" {
+						q["payload_json"] = nil
+					}
+					if variant == "array" {
+						q["payload_json"] = []any{}
+					}
+					if variant != "missing" {
+						want = historyTestRefusal("owned_history_invalid")
+					}
+					rows := historyTestRows(f)
+					rows["channel_ops_queue_items"] = append(rows["channel_ops_queue_items"].([]any), q)
+				}
+				historyTestFullAssessment(t, f, want)
+			})
+		}
 	}
 }
 
