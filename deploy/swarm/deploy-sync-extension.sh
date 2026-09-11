@@ -16,6 +16,8 @@ VP_WORKER_ADMISSION_LOCK_DEPTH=0
 VP_WORKER_ADMISSION_LOCK_ROOT=""
 VP_WORKER_ADMISSION_LOCK_OWNER_BASHPID=""
 VP_WORKER_ADMISSION_PROMOTION_IDENTITY=""
+VP_AUTOFLOW_CONTROL_IDENTITY=""
+VP_AUTOFLOW_RUNTIME_UPDATE_ARGS=""
 VP_WORKER_ADMISSION_LOCK_TOKEN=""
 VP_WORKER_ADMISSION_CURRENT_BASHPID=""
 VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
@@ -11999,6 +12001,7 @@ vp_require_github_actions_success() {
 }
 
 vp_autoflow_control_identity() {
+  VP_AUTOFLOW_CONTROL_IDENTITY=""
   [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == true \
     && "$VP_WORKER_CONTROL_GENERATION" =~ ^c-[0-9a-f]{20}$ ]] || return 1
   vp_worker_admission_load_replay_plan || return 1
@@ -12026,8 +12029,7 @@ try:
     if sys.argv[3]!="vp-backend-api:deploy-"+state["target_commit"][:12]: raise ValueError
 except (KeyError,TypeError,ValueError): raise SystemExit(1)
 ' "$selected" "$1" "$2" <<<"$state" || return 1
-  printf '%s|%s|%s\n' "$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET" \
-    "$secret_id" "$VP_WORKER_CONTROL_GENERATION"
+  VP_AUTOFLOW_CONTROL_IDENTITY="$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET|$secret_id|$VP_WORKER_CONTROL_GENERATION"
 }
 
 vp_autoflow_selected_image() {
@@ -12055,11 +12057,13 @@ vp_autoflow_health_command() {
 
 vp_autoflow_runtime_update_args() {
   local service_id="$1" image="$2" identity spec image_user health
-  identity="$(vp_autoflow_control_identity "$service_id" "$image")" || return 1
+  VP_AUTOFLOW_RUNTIME_UPDATE_ARGS=""
+  vp_autoflow_control_identity "$service_id" "$image" || return 1
+  identity="$VP_AUTOFLOW_CONTROL_IDENTITY"
   spec="$(vp_service_values "$service_id" '{{json .Spec.TaskTemplate.ContainerSpec}}')" || return 1
   image_user="$(docker image inspect "$image" --format '{{.Config.User}}')" || return 1
   health="$(vp_autoflow_health_command)" || return 1
-  python3 -I -c '
+  VP_AUTOFLOW_RUNTIME_UPDATE_ARGS="$(python3 -I -c '
 import json,re,sys
 try:
     name,identity,generation=sys.argv[1].split("|")
@@ -12089,7 +12093,7 @@ try:
     print("\n".join(args))
 except (TypeError,ValueError,KeyError,AttributeError):
     raise SystemExit(1)
-' "$identity" "$image_user" "$health" <<<"$spec"
+' "$identity" "$image_user" "$health" <<<"$spec")" || return 1
 }
 
 vp_autoflow_tasks() {
@@ -12113,7 +12117,8 @@ vp_require_autoflow_control_ready() {
   local image="$1" service=vp-autoflow-api-swarm identity before service_id spec tasks image_user health container
   before="$(vp_app_service_durable_identity "$service" "$image")" || return 1
   service_id="${before%%|*}"
-  identity="$(vp_autoflow_control_identity "$service_id" "$image")" || return 1
+  vp_autoflow_control_identity "$service_id" "$image" || return 1
+  identity="$VP_AUTOFLOW_CONTROL_IDENTITY"
   vp_require_service_node "$service_id" "$VP_RUNTIME_NODE" || return 1
   spec="$(docker service inspect "$service_id" --format '{{json .Spec}}')" || return 1
   tasks="$(vp_autoflow_tasks "$service_id")" || return 1
@@ -12222,8 +12227,10 @@ vp_update_runtime_service() {
   local worker_current_id=""
   if [[ "$service" == "vp-autoflow-api-swarm" ]]; then
     local autoflow_args autoflow_arg
-    autoflow_args="$(vp_autoflow_runtime_update_args "$current_service_id" "$image")" \
+    # Journal validation must execute in the shell that owns the writer lock.
+    vp_autoflow_runtime_update_args "$current_service_id" "$image" \
       || return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
+    autoflow_args="$VP_AUTOFLOW_RUNTIME_UPDATE_ARGS"
     while IFS= read -r autoflow_arg; do
       service_args+=("$autoflow_arg")
     done <<<"$autoflow_args"

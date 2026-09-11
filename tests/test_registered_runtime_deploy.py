@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import shlex
 import sys
@@ -44,7 +45,7 @@ curl() { return 94; }
 UPDATE_SERVICES=1
 VP_WORKER_ADMISSION_LOCK_HELD=true
 VP_WORKER_CONTROL_GENERATION=c-0123456789abcdef0123
-vp_autoflow_control_identity() { printf '%s\n' 'vp-wc-orchestrator-c-0123456789abcdef0123|bbbbbbbbbbbbbbbbbbbbbbbbb|c-0123456789abcdef0123'; }
+vp_autoflow_control_identity() { VP_AUTOFLOW_CONTROL_IDENTITY='vp-wc-orchestrator-c-0123456789abcdef0123|bbbbbbbbbbbbbbbbbbbbbbbbb|c-0123456789abcdef0123'; }
 """
             + script,
         ],
@@ -85,6 +86,7 @@ def test_update_binds_only_selected_secret_and_preserves_unrelated_runtime():
 vp_service_values() { printf '%s\n' "$SPEC"; }
 docker() { [[ "$1 $2" == 'image inspect' ]] && printf '\n'; }
 vp_autoflow_runtime_update_args aaaaaaaaaaaaaaaaaaaaaaaaa vp-backend-api:deploy-0123456789ab
+printf '%s\n' "$VP_AUTOFLOW_RUNTIME_UPDATE_ARGS"
 """,
         SPEC=spec(),
     )
@@ -381,6 +383,7 @@ vp_managed_secret_id() { if [[ "$FAULT" == secret_id ]]; then echo changed; else
 vp_worker_admission_control_selection_json() { printf '%s\n' "$SELECTION"; }
 vp_worker_admission_recovery_state() { [[ "$FAULT" != read_error ]] && printf '%s\n' "$STATE"; }
 vp_autoflow_control_identity aaaaaaaaaaaaaaaaaaaaaaaaa vp-backend-api:deploy-0123456789ab
+printf '%s\n' "$VP_AUTOFLOW_CONTROL_IDENTITY"
 """,
         FAULT=fault or "none",
         STATE=state,
@@ -426,3 +429,200 @@ urllib.request.urlopen=request
         timeout=10,
     )
     assert completed.returncode == (0 if fault is None else 1), completed.stderr
+
+
+def locked_runtime_fixture(tmp_path, action):
+    """A real, validated journal/lock; Docker and mounted metadata remain fake."""
+    helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
+    root = tmp_path.resolve()
+    root.chmod(0o700)
+    credentials = {}
+    for purpose in helper["DATABASE_PURPOSES"]:
+        path = root / purpose
+        path.write_text("postgresql://fixture:password@database.invalid/fixture\n")
+        path.chmod(0o400)
+        credentials[purpose] = helper["_capture_credential"](str(path), "vp_" + purpose)
+    commit = "0123456789abcdef0123" + "4" * 20
+    image = "vp-backend-api:deploy-0123456789ab"
+    generation = "c-11111111111111111111" if action == "rollback" else GENERATION
+    control = {
+        "generation": generation,
+        "image": "vp-ffmpeg-worker-python:deploy-" + generation[2:14],
+        "manifest_sha256": "d" * 64,
+        "secrets": [
+            {
+                "service": "vp-worker-control", "generation": generation,
+                "purpose": purpose, "name": f"vp-wc-{purpose}-{generation}",
+                "docker_secret_id": SECRET_ID if purpose == "orchestrator" else f"{i:025x}",
+            }
+            for i, purpose in enumerate((
+                "operator", "orchestrator", "staging-janitor", "staging-minio-access",
+                "staging-minio-secret", "worker-minio-access", "worker-minio-secret",
+            ), 100)
+        ],
+    }
+    state = helper["_new_document"](
+        target_commit=commit, target_backend_image=image,
+        target_go_image="vp-ffmpeg-worker-go:deploy-0123456789ab",
+        namespace=commit, baseline_kind="managed", credentials=credentials,
+    )
+    state["phase"] = "ROLLBACK_APPLYING" if action == "rollback" else "FORWARD_APPLYING"
+    state["baseline"].update(captured=True, control=control, services=[
+        {
+            "name": name, "existed": True,
+            "docker_service_id": SERVICE_ID if name == "vp-autoflow-api-swarm" else f"{i:025x}",
+            "image": "vp-backend-api:deploy-111111111111", "spec_digest": "d" * 64,
+        }
+        for i, name in enumerate(sorted(helper["APP_SERVICES"]), 200)
+    ])
+    state["forward"]["control"] = control
+    if action == "rollback":
+        state["rollback"].update(
+            attempt=1, namespace="rollback-123456789012345678",
+            marker_generation="m-rb-0123456789ab-1", control=control,
+        )
+        state["forward"]["control"] = dict(
+            control, generation=GENERATION,
+            image="vp-ffmpeg-worker-python:deploy-0123456789ab",
+            secrets=[
+                dict(secret, generation=GENERATION,
+                     name=f"vp-wc-{secret['purpose']}-{GENERATION}",
+                     docker_secret_id=f"{i:025x}")
+                for i, secret in enumerate(control["secrets"], 300)
+            ],
+        )
+        state["failed_forward"]["captured"] = True
+    helper["_validate_document"](state)
+    transactions = root / "transactions"
+    transactions.mkdir(mode=0o700)
+    (transactions / state["transaction_id"]).mkdir(mode=0o700)
+    active = transactions / "active.json"
+    active.write_bytes(helper["_canonical"](state))
+    active.chmod(0o600)
+    container = {
+        "Image": image, "User": "", "Env": [
+            "KEEP=yes",
+            "WORKER_ORCHESTRATOR_DATABASE_URL_FILE=/run/secrets/worker-orchestrator-database-url",
+            "WORKER_ORCHESTRATOR_CONTROL_GENERATION=" + generation,
+        ],
+        "Secrets": [{
+            "SecretName": "vp-wc-orchestrator-" + generation, "SecretID": SECRET_ID,
+            "File": {"Name": "worker-orchestrator-database-url", "UID": "0", "GID": "0", "Mode": 256},
+        }],
+        "Healthcheck": {"Test": ["CMD-SHELL", "true"]},
+    }
+    spec = {"Name": "vp-autoflow-api-swarm", "Mode": {"Replicated": {"Replicas": 1}},
+            "TaskTemplate": {"ContainerSpec": container}}
+    tasks = [{"ServiceID": SERVICE_ID, "Spec": {"ContainerSpec": container}, "Status": {
+        "State": "running", "ContainerStatus": {"ContainerID": "c" * 64},
+    }}]
+    return dict(ADMISSION_ROOT=str(root), AUDIT=str(root / "operations.log"), IMAGE=image, SELECTED_GENERATION=generation,
+                CONTROL=control, SPEC=spec, CONTAINER=container, TASKS=tasks, ACTION=action)
+
+
+LOCKED_RUNTIME_BOUNDARY = r"""
+eval "$identity_function"
+: > "$AUDIT"
+VP_WORKER_ADMISSION_LOCK_HELD=false
+vp_worker_admission_lock_acquire "$ADMISSION_ROOT"
+trap 'vp_worker_admission_lock_release' EXIT
+vp_worker_admission_lock_assert
+vp_worker_admission_load_replay_plan
+[[ "$VP_WORKER_ADMISSION_REPLAY_ACTIVE" == true ]]
+VP_WORKER_CONTROL_GENERATION="$SELECTED_GENERATION"
+if [[ "$FAULT" == generation ]]; then VP_WORKER_CONTROL_GENERATION=c-22222222222222222222; fi
+vp_worker_admission_root() { printf '%s\n' "$ADMISSION_ROOT"; }
+vp_worker_control_find_v2_manifest() { printf '%s/fixture.conf\n' "$ADMISSION_ROOT"; }
+vp_worker_control_read_manifest() {
+  VP_WORKER_CONTROL_MANIFEST_VERSION=2
+  VP_WORKER_CONTROL_MANIFEST_GENERATION="$SELECTED_GENERATION"
+  VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET="vp-wc-orchestrator-$SELECTED_GENERATION"
+  VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET_ID=bbbbbbbbbbbbbbbbbbbbbbbbb
+}
+vp_managed_secret_id() {
+  if [[ "$FAULT" == secret ]]; then echo zzzzzzzzzzzzzzzzzzzzzzzzz
+  else echo bbbbbbbbbbbbbbbbbbbbbbbbb; fi
+}
+vp_worker_admission_control_selection_json() { printf '%s\n' "$CONTROL"; }
+vp_registered_worker_service_current_id() {
+  if [[ "$FAULT" == service ]]; then echo zzzzzzzzzzzzzzzzzzzzzzzzz
+  else echo aaaaaaaaaaaaaaaaaaaaaaaaa; fi
+}
+vp_service_values() {
+  case "$2" in
+    *Placement.Constraints*) printf '%s\n' "$VP_RUNTIME_CONSTRAINT" "$VP_RUNTIME_NODE_CONSTRAINT" ;;
+    '{{json .Spec.TaskTemplate.ContainerSpec}}') printf '%s\n' "$CONTAINER" ;;
+    *) return 91 ;;
+  esac
+}
+vp_autoflow_health_command() { echo true; }
+vp_require_service_node() { [[ "$2" == colima-127 ]]; }
+docker() {
+  case "$1 $2" in
+    'image inspect') [[ "$3" == "$IMAGE" ]] && printf '\n' ;;
+    'service inspect')
+      case "$5" in
+        '{{.ID}}|{{.Spec.Name}}')
+          printf '%s|vp-autoflow-api-swarm\n' "$(vp_registered_worker_service_current_id)" ;;
+        '{{json .Spec}}') printf '%s\n' "$SPEC" ;;
+        *) return 91 ;;
+      esac ;;
+    'service ps') echo aaaaaaaaaaaaaaaaaaaaaaaaa ;;
+    'inspect --type') printf '%s\n' "$TASKS" ;;
+    'service update')
+      echo ATTEMPT_UPDATE >> "$AUDIT"
+      vp_worker_admission_lock_assert || return 91
+      { printf UPDATE; printf '|%s' "$@"; printf '\n'; } >> "$AUDIT" ;;
+    *) return 91 ;;
+  esac
+}
+remote_sh() {
+  echo ATTEMPT_HEALTH >> "$AUDIT"
+  vp_worker_admission_lock_assert || return 92
+  [[ "$1" == 10.0.0.127 && "$5" == cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc ]]
+  echo HEALTH >> "$AUDIT"
+}
+boundary() {
+  case "$ACTION" in
+    forward)
+      vp_update_runtime_service vp-autoflow-api-swarm "$IMAGE" start-first || return $?
+      vp_require_selected_autoflow_control_ready ;;
+    readiness) vp_require_selected_autoflow_control_ready ;;
+    rollback)
+      VP_BACKEND_MIGRATION_APPLIED=true
+      vp_restore_app_snapshots \
+        'vp-autoflow-api-swarm|aaaaaaaaaaaaaaaaaaaaaaaaa|vp-backend-api:deploy-111111111111|dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' \
+        vp-autoflow-api-swarm true ;;
+    *) return 93 ;;
+  esac
+}
+status=0
+if [[ "$FAULT" == child ]]; then ( boundary ) || status=$?
+else boundary || status=$?; fi
+vp_worker_admission_lock_assert
+exit "$status"
+"""
+
+
+@pytest.mark.parametrize("action", ["forward", "readiness", "rollback"])
+@pytest.mark.parametrize("fault", ["none", "child", "generation", "secret", "service"])
+def test_real_owning_shell_lock_and_replay_boundary(tmp_path, action, fault):
+    data = locked_runtime_fixture(tmp_path, action)
+    active = Path(data["ADMISSION_ROOT"]) / "transactions/active.json"
+    before = active.read_bytes()
+    result = run(LOCKED_RUNTIME_BOUNDARY, **data, FAULT=fault)
+    assert result.returncode == (0 if fault == "none" else 2 if action == "forward" else 1), result.stderr
+    assert active.read_bytes() == before
+    operations = Path(data["AUDIT"]).read_text().splitlines()
+    updates = [line for line in operations if line.startswith("UPDATE|")]
+    health = operations.count("HEALTH")
+    if fault != "none":
+        assert not operations, operations
+    else:
+        assert len(updates) == (0 if action == "readiness" else 1)
+        assert health == 1
+        if updates:
+            assert f"|--env-add|WORKER_ORCHESTRATOR_CONTROL_GENERATION={data['SELECTED_GENERATION']}|" in updates[0]
+            assert f"|--secret-add|source={SECRET_ID},target=worker-orchestrator-database-url,uid=0,gid=0,mode=0400|" in updates[0]
+            assert f"|--image|{data['IMAGE']}|{SERVICE_ID}" in updates[0]
+            assert "|--update-order|" + ("stop-first|" if action == "rollback" else "start-first|") in updates[0]
