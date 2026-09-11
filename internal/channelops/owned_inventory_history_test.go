@@ -166,6 +166,8 @@ func TestOwnedHistoryReviewR5OrdinaryTimestamp(t *testing.T) {
 		{"utc_underflow", "0001-01-01T00:00:00+00:01", ""},
 		{"utc_overflow", "9999-12-31T23:59:59-00:01", ""},
 		{"basic_aware", "20260910T065900+00:00", "fe73b998df2833efab45eb422f86d71fb096abcb3706467e845bc95a6b5eb39e"},
+		{"zone_under_24_hours", "20260910T065900+23:59", "887e96aff6777ac61c4de5929dc9f9ebf125cca4e5acea9f84821a5fba9b85a5"},
+		{"zone_at_24_hours", "20260910T065900+24:00", ""},
 		{"basic_date_extended_clock", "20260910T06:59:00+00:00", "4ce9eabf3e088d5e78d317bc7f88a80925848fedf3fae9e9c8a85250e1da1deb"},
 		{"basic_naive", "20260910T065900", "5cedf8603d23d25a2ce5fd62140a05aaee64fcbb2040a67a44f1ba4cd52268f4"},
 		{"basic_naive_space", "20260910 065900", "e630d0e2d54f2914d282f8b155f1a88240eccba7330319eb21202b09e85704bc"},

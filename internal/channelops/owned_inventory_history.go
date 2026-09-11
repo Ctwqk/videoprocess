@@ -181,6 +181,10 @@ func historyAwareTime(s string) (time.Time, bool) {
 			for _, zone := range []string{"Z07:00", "Z0700", "Z07:00:00", "Z070000", "Z07"} {
 				for _, clock := range []string{"15:04:05.999999999", "15:04", "15", "150405.999999999", "1504"} {
 					if at, err := time.Parse(date+separator+clock+zone, s); err == nil {
+						_, offset := at.Zone()
+						if offset <= -24*60*60 || offset >= 24*60*60 {
+							return time.Time{}, false
+						}
 						utc := at.UTC()
 						// Python bounds both the parsed date and the UTC conversion.
 						if at.Year() < 1 || utc.Year() < 1 || utc.Year() > 9999 {
