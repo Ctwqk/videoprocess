@@ -334,7 +334,7 @@ async def create_account(channel_id: str, data: PublishingAccountCreate, db: Asy
     channel = (await db.scalars(select(ChannelProfile).where(ChannelProfile.id == _uuid(channel_id)).with_for_update())).one_or_none()
     if channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
-    if data.platform == "youtube":
+    if owned_inventory.is_youtube_platform(data.platform):
         await _inventory_result(db, owned_inventory.assert_account_binding_available(db, data.platform_account_id))
     row = PublishingAccount(channel_profile_id=_uuid(channel_id), **data.model_dump())
     db.add(row)
@@ -351,7 +351,7 @@ async def patch_account(channel_id: str, account_id: str, data: dict[str, Any], 
     account = await db.get(PublishingAccount, _uuid(account_id))
     if account is None or account.channel_profile_id != channel.id:
         raise HTTPException(status_code=404, detail="Account not found")
-    if account.platform == "youtube":
+    if owned_inventory.is_youtube_platform(account.platform):
         for platform_id in sorted({account.platform_account_id, str(data.get("platform_account_id", account.platform_account_id))}):
             await _inventory_result(db, owned_inventory.assert_account_binding_available(db, platform_id, account.id))
         if set(data) - {"account_label"}:

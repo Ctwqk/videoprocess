@@ -8,10 +8,12 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.channel_agent import ProductionTask
+from app.models.channel_agent import ChannelOpsQueueItem, ChannelProfile, ProductionTask, PublishingAccount
 from app.models.owned_seed_inventory import OwnedSeedInventory, OwnedSeedInventoryItem
-from test_owned_seed_inventory import approval, draft, inventory_env as inventory_env
+from app.services import owned_seed_inventory as inventory_service
+from test_owned_seed_inventory import approval, draft, legacy_alias, inventory_env as inventory_env
 
 
 DISPOSABLE_URL = os.environ.get("OWNED_INVENTORY_DISPOSABLE_TEST_URL", "")
@@ -152,3 +154,137 @@ async def test_pg_one_reserved_item_constraint(inventory_env):
         with pytest.raises(DBAPIError):
             await db.commit()
         await db.rollback()
+
+
+@pytest.mark.parametrize("platform", ["", "youtube"])
+async def test_pg_successor_rejects_alias_producer_before_unsafe_absence_read(inventory_env, monkeypatch, platform):
+    env = inventory_env
+    _, old = await draft(env)
+    old_url = f"{env.url}/{old['id']}"
+    assert (await env.client.post(old_url + "/approve", json=approval(old))).status_code == 200
+    revoked = await env.client.post(old_url + "/revoke", json={"manifest_sha256": old["manifest_sha256"], "reason": "unused closeout"})
+    old_digest = revoked.json()["closeout"]["sha256"]
+    assert old_digest
+    _, candidate = await draft(env, "barrier-successor")
+    # Seed the already-approved legacy state that previously allowed alias producers.
+    alias_channel, alias_account = await legacy_alias(env, platform)
+    observed = asyncio.Event()
+    committed = asyncio.Event()
+    absence_reads = []
+    original_scalars = AsyncSession.scalars
+
+    async def scalars_with_producer_barrier(db, statement, *args, **kwargs):
+        result = await original_scalars(db, statement, *args, **kwargs)
+        descriptions = getattr(statement, "column_descriptions", [])
+        accounts = any(item.get("entity") is PublishingAccount and getattr(item.get("expr"), "key", None) == "id"
+                       for item in descriptions)
+        tasks = any(item.get("entity") is ProductionTask for item in descriptions)
+        if tasks:
+            absence_reads.append(True)
+        # Old code reaches the empty task read. Fixed code rejects at the earlier binding read.
+        if not observed.is_set() and (accounts or tasks):
+            observed.set()
+            await asyncio.wait_for(committed.wait(), timeout=5)
+        return result
+
+    async def ordinary_producer():
+        await asyncio.wait_for(observed.wait(), timeout=5)
+        async with env.factory() as db:
+            await db.execute(select(ChannelProfile).where(ChannelProfile.id == alias_channel).with_for_update())
+            task = ProductionTask(channel_profile_id=alias_channel, target_account_id=alias_account,
+                                  prompt="ordinary producer", state="selected")
+            db.add(task)
+            await db.flush()
+            db.add(ChannelOpsQueueItem(kind="plan_task", channel_profile_id=alias_channel,
+                                      idempotency_key=f"plan_task:{task.id}",
+                                      payload_json={"production_task_id": str(task.id)}, status="queued"))
+            await db.commit()
+            committed.set()
+            return task.id
+
+    monkeypatch.setattr(AsyncSession, "scalars", scalars_with_producer_barrier)
+    producer = asyncio.create_task(ordinary_producer())
+    try:
+        response = await asyncio.wait_for(env.client.post(f"{env.url}/{candidate['id']}/approve", json=approval(
+            candidate, predecessor_inventory_id=old["id"], predecessor_closeout_sha256=old_digest,
+        )), timeout=12)
+        task_id = await asyncio.wait_for(producer, timeout=6)
+    finally:
+        if not producer.done():
+            producer.cancel()
+        await asyncio.gather(producer, return_exceptions=True)
+        monkeypatch.setattr(AsyncSession, "scalars", original_scalars)
+    assert response.status_code == 409
+    assert committed.is_set() and absence_reads == []
+    async with env.factory() as db:
+        assert (await db.get(ProductionTask, task_id)).state == "selected"
+        assert (await db.get(OwnedSeedInventory, uuid.UUID(old["id"]))).succession_released_at is None
+        assert (await db.get(OwnedSeedInventory, uuid.UUID(candidate["id"]))).approved_at is None
+        assert (await db.get(ChannelProfile, env.channel_id)).owned_seed_inventory_id == uuid.UUID(old["id"])
+
+
+@pytest.mark.parametrize("platform", ["", "youtube"])
+@pytest.mark.parametrize("mutation", ["create", "patch"])
+async def test_pg_effective_youtube_account_writes_wait_for_platform_scope(inventory_env, monkeypatch, platform, mutation):
+    env = inventory_env
+    async with env.factory() as db:
+        channel = ChannelProfile(name="other writer")
+        db.add(channel)
+        await db.flush()
+        channel_id = channel.id
+        if mutation == "patch":
+            account = PublishingAccount(channel_profile_id=channel_id, account_label="ordinary",
+                                        platform=platform, platform_account_id="unoccupied-writer")
+            db.add(account)
+            await db.flush()
+            account_id = account.id
+        await db.commit()
+    _, row = await draft(env)
+    assert (await env.client.post(f"{env.url}/{row['id']}/approve", json=approval(row))).status_code == 200
+    original_lock = inventory_service.lock_platform_scope
+    reached = asyncio.Event()
+    writer_pid = None
+
+    async def signalled_lock(db, platform_id):
+        nonlocal writer_pid
+        if platform_id == env.scope["platform_channel_id"]:
+            writer_pid = await db.scalar(text("SELECT pg_backend_pid()"))
+            reached.set()
+        await original_lock(db, platform_id)
+
+    url = f"/api/v1/channel-agent/channels/{channel_id}/accounts"
+    async with env.factory() as blocker:
+        await original_lock(blocker, env.scope["platform_channel_id"])
+        monkeypatch.setattr(inventory_service, "lock_platform_scope", signalled_lock)
+        if mutation == "create":
+            request = env.client.post(url, json={"account_label": "alias", "platform": platform,
+                                                "platform_account_id": env.scope["platform_channel_id"]})
+        else:
+            request = env.client.patch(f"{url}/{account_id}", json={"platform_account_id": env.scope["platform_channel_id"]})
+        writer = asyncio.create_task(request)
+        entered = asyncio.create_task(reached.wait())
+        try:
+            await asyncio.wait({writer, entered}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+            assert reached.is_set() and not writer.done()
+
+            async def has_advisory_wait():
+                while not writer.done():
+                    blocked = await blocker.scalar(text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                        "WHERE pid = :pid AND locktype = 'advisory' AND NOT granted)"
+                    ), {"pid": writer_pid})
+                    if blocked:
+                        return True
+                    await asyncio.sleep(0.01)
+                return False
+
+            assert await asyncio.wait_for(has_advisory_wait(), timeout=5)
+        finally:
+            await blocker.rollback()
+            entered.cancel()
+            await asyncio.gather(entered, return_exceptions=True)
+            result = await asyncio.wait_for(writer, timeout=5)
+    assert result.status_code == 409
+    async with env.factory() as db:
+        accounts = list((await db.scalars(select(PublishingAccount).where(PublishingAccount.channel_profile_id == channel_id))).all())
+        assert [account.platform_account_id for account in accounts] == ([] if mutation == "create" else ["unoccupied-writer"])

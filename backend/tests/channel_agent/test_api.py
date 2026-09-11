@@ -126,6 +126,20 @@ def _app(db_session):
     return app
 
 
+@pytest.mark.parametrize("platform", ["", "youtube", "x", "bilibili", "xiaohongshu"])
+async def test_ordinary_account_create_and_patch_preserve_provider(api_session, platform):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "ordinary"})).json()
+        url = f"/api/v1/channel-agent/channels/{channel['id']}/accounts"
+        created = await client.post(url, json={"account_label": "ordinary", "platform": platform,
+                                               "platform_account_id": "unoccupied-first"})
+        assert created.status_code == 200
+        updated = await client.patch(f"{url}/{created.json()['id']}", json={"platform_account_id": "unoccupied-second"})
+        assert updated.status_code == 200
+        assert updated.json()["platform"] == platform
+        assert updated.json()["platform_account_id"] == "unoccupied-second"
+
+
 @pytest.mark.asyncio
 async def test_channel_agent_api_config_seed_enqueue_and_status(api_session):
     async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:

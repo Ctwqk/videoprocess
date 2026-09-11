@@ -66,6 +66,18 @@ async def lock_platform_scope(db: AsyncSession, platform_channel_id: str) -> Non
         await db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
 
 
+def is_youtube_platform(platform: str | None) -> bool:
+    # Match ChannelAgentService's execution fallback without rewriting other providers.
+    return str(platform or "youtube") == "youtube"
+
+
+async def _youtube_account_ids(db: AsyncSession, platform_channel_id: str) -> list[uuid.UUID]:
+    return list((await db.scalars(select(PublishingAccount.id).where(
+        or_(PublishingAccount.platform.in_(["youtube", ""]), PublishingAccount.platform.is_(None)),
+        PublishingAccount.platform_account_id == platform_channel_id,
+    ))).all())
+
+
 async def _row(db: AsyncSession, model: Any, row_id: uuid.UUID, *, lock: bool = False) -> Any:
     statement = select(model).where(model.id == row_id).execution_options(populate_existing=True)
     if lock:
@@ -84,7 +96,7 @@ async def _scope(db: AsyncSession, channel_id: uuid.UUID, data: Any, *, lock: bo
     lane_format = await _row(db, LaneFormatMatrix, uuid.UUID(str(data.lane_format_id)), lock=lock)
     require(account.channel_profile_id == channel.id and lane.channel_profile_id == channel.id
             and lane_format.topic_lane_id == lane.id, "owned_inventory_scope_mismatch")
-    require(account.platform == "youtube" and account.platform_account_id == data.platform_channel_id
+    require(is_youtube_platform(account.platform) and account.platform_account_id == data.platform_channel_id
             and account.default_privacy == "unlisted" and not account.external_asset_auto_publish
             and account.enabled and account.paused_until is None, "owned_inventory_account_unsafe")
     require(channel.enabled and not channel.dry_run and channel.halted_at is None
@@ -244,11 +256,13 @@ async def closeout(db: AsyncSession, row: OwnedSeedInventory) -> dict:
     unavailable = {"status": "unresolved", "sha256": None}
     if row.state != "revoked" or row.approved_at is None or row.revoked_at is None or not row.revoked_by:
         return unavailable
+    account_ids = await _youtube_account_ids(db, row.platform_channel_id)
+    if account_ids != [row.target_account_id]:
+        return unavailable
     items = await inventory_items(db, row.id)
     # Used-item closeout needs the later verified receipt/settlement authority, not a status label.
     if len(items) != 7 or any(item.state != "unused" or item.production_task_id is not None or item.consumed_at is not None for item in items):
         return unavailable
-    account_ids = select(PublishingAccount.id).where(PublishingAccount.platform == "youtube", PublishingAccount.platform_account_id == row.platform_channel_id)
     tasks = list((await db.scalars(select(ProductionTask).where(or_(
         ProductionTask.target_account_id.in_(account_ids), ProductionTask.manual_seed_id.in_([item.manual_seed_id for item in items]),
     )))).all())
@@ -298,6 +312,9 @@ async def approve_inventory(db: AsyncSession, channel_id: uuid.UUID, inventory_i
     row = await _row(db, OwnedSeedInventory, inventory_id, lock=True)
     _, fresh_fingerprint = await _scope(db, channel_id, row, lock=True)
     require(fingerprint == fresh_fingerprint, "owned_inventory_configuration_changed")
+    # Alias producers do not take this scope lock; refuse their bindings before reading work absence.
+    require(await _youtube_account_ids(db, platform_channel_id) == [row.target_account_id],
+            "owned_inventory_account_alias")
     items = await _verify_manifest(db, row)
     assets = await _lock_assets(db, descriptors)
     require(row.manifest_sha256 == data.manifest_sha256, "owned_inventory_manifest_mismatch")

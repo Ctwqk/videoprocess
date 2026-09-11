@@ -461,3 +461,168 @@ async def test_unused_closeout_rejects_orphaned_runtime_risk(inventory_env, risk
     result = await env.client.get(url)
     assert result.status_code == 200
     assert result.json()["closeout"]["status"] == "unresolved"
+
+
+async def legacy_alias(env, platform, *, same_channel=False, enabled=True):
+    async with env.factory() as db:
+        if same_channel:
+            channel_id = env.channel_id
+        else:
+            channel = ChannelProfile(name="legacy alias producer", enabled=True, dry_run=False)
+            db.add(channel)
+            await db.flush()
+            channel_id = channel.id
+        account = PublishingAccount(channel_profile_id=channel_id, account_label="legacy alias",
+                                    platform=platform, platform_account_id=env.scope["platform_channel_id"],
+                                    default_privacy="unlisted", enabled=enabled)
+        db.add(account)
+        await db.commit()
+        return channel_id, account.id
+
+
+@pytest.mark.parametrize("state", ["approved", "held", "expired", "exhausted", "revoked"])
+@pytest.mark.parametrize("platform", ["", "youtube"])
+@pytest.mark.parametrize("mutation", ["create", "patch"])
+async def test_effective_youtube_alias_writes_reject_every_occupied_state(inventory_env, state, platform, mutation):
+    from app.models.owned_seed_inventory import OwnedSeedInventory
+
+    env = inventory_env
+    async with env.factory() as db:
+        other = ChannelProfile(name="ordinary channel")
+        db.add(other)
+        await db.flush()
+        other_id = other.id
+        if mutation == "patch":
+            account = PublishingAccount(channel_profile_id=other_id, account_label="preexisting",
+                                        platform=platform, platform_account_id="ordinary-unoccupied")
+            db.add(account)
+            await db.flush()
+            account_id = account.id
+        await db.commit()
+    _, row = await draft(env)
+    assert (await env.client.post(f"{env.url}/{row['id']}/approve", json=approval(row))).status_code == 200
+    async with env.factory() as db:
+        inventory = await db.get(OwnedSeedInventory, uuid.UUID(row["id"]))
+        inventory.state = state
+        await db.commit()
+    url = f"/api/v1/channel-agent/channels/{other_id}/accounts"
+    if mutation == "create":
+        result = await env.client.post(url, json={"account_label": "alias", "platform": platform,
+                                                "platform_account_id": env.scope["platform_channel_id"]})
+    else:
+        result = await env.client.patch(f"{url}/{account_id}", json={"platform_account_id": env.scope["platform_channel_id"]})
+    assert result.status_code == 409
+    async with env.factory() as db:
+        accounts = list((await db.scalars(select(PublishingAccount).where(PublishingAccount.channel_profile_id == other_id))).all())
+        assert [account.platform_account_id for account in accounts] == ([] if mutation == "create" else ["ordinary-unoccupied"])
+
+
+@pytest.mark.parametrize("platform", ["", "youtube"])
+@pytest.mark.parametrize("same_channel", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_initial_approval_refuses_preexisting_effective_alias(inventory_env, platform, same_channel, enabled):
+    from app.models.owned_seed_inventory import OwnedSeedInventory
+
+    env = inventory_env
+    await legacy_alias(env, platform, same_channel=same_channel, enabled=enabled)
+    _, row = await draft(env)
+    response = await env.client.post(f"{env.url}/{row['id']}/approve", json=approval(row))
+    assert response.status_code == 409
+    async with env.factory() as db:
+        current = await db.get(OwnedSeedInventory, uuid.UUID(row["id"]))
+        assert current.state == "draft" and current.approved_at is None
+        assert (await db.get(ChannelProfile, env.channel_id)).owned_seed_inventory_id is None
+        assert {seed.status for seed in (await db.scalars(select(ManualSeed))).all()} == {"inventory_pending"}
+
+
+@pytest.mark.parametrize("platform", ["", "youtube"])
+@pytest.mark.parametrize("with_history", [False, True])
+async def test_closeout_and_successor_refuse_legacy_alias_even_without_work(inventory_env, platform, with_history):
+    from app.models.channel_agent import ChannelOpsQueueItem, ProductionTask
+    from app.models.owned_seed_inventory import OwnedSeedInventory
+
+    env = inventory_env
+    _, old = await draft(env)
+    url = f"{env.url}/{old['id']}"
+    assert (await env.client.post(url + "/approve", json=approval(old))).status_code == 200
+    revoked = await env.client.post(url + "/revoke", json={"manifest_sha256": old["manifest_sha256"], "reason": "unused closeout"})
+    old_digest = revoked.json()["closeout"]["sha256"]
+    assert old_digest
+    _, candidate = await draft(env, "next")
+    # Represents an already-approved legacy scope with an alternate binding.
+    alias_channel, alias_account = await legacy_alias(env, platform)
+    if with_history:
+        async with env.factory() as db:
+            task = ProductionTask(channel_profile_id=alias_channel, target_account_id=alias_account,
+                                  prompt="ordinary alias task", state="selected")
+            db.add(task)
+            await db.flush()
+            db.add(ChannelOpsQueueItem(kind="plan_task", channel_profile_id=alias_channel,
+                                      idempotency_key=f"plan_task:{task.id}",
+                                      payload_json={"production_task_id": str(task.id)}, status="queued"))
+            await db.commit()
+    observed = await env.client.get(url)
+    assert observed.status_code == 200
+    assert observed.json()["closeout"] == {"status": "unresolved", "sha256": None}
+    response = await env.client.post(f"{env.url}/{candidate['id']}/approve", json=approval(
+        candidate, predecessor_inventory_id=old["id"], predecessor_closeout_sha256=old_digest,
+    ))
+    assert response.status_code == 409
+    async with env.factory() as db:
+        assert (await db.get(OwnedSeedInventory, uuid.UUID(old["id"]))).succession_released_at is None
+        assert (await db.get(OwnedSeedInventory, uuid.UUID(candidate["id"]))).approved_at is None
+        assert str((await db.get(ChannelProfile, env.channel_id)).owned_seed_inventory_id) == old["id"]
+
+
+async def test_initial_approval_rechecks_alias_created_during_unlocked_hash_read(inventory_env):
+    env = inventory_env
+    _, row = await draft(env)
+    created = False
+
+    async def introduce_alias(_path):
+        nonlocal created
+        if not created:
+            created = True
+            async with env.factory() as db:
+                channel = ChannelProfile(name="other channel")
+                db.add(channel)
+                await db.commit()
+            response = await env.client.post(f"/api/v1/channel-agent/channels/{channel.id}/accounts", json={
+                "account_label": "new alias", "platform": "", "platform_account_id": env.scope["platform_channel_id"],
+            })
+            assert response.status_code == 200
+
+    env.storage.on_read = introduce_alias
+    response = await env.client.post(f"{env.url}/{row['id']}/approve", json=approval(row))
+    assert created and response.status_code == 409
+
+
+async def test_empty_platform_target_uses_execution_fallback_without_alias(inventory_env):
+    env = inventory_env
+    async with env.factory() as db:
+        account = await db.get(PublishingAccount, uuid.UUID(env.scope["target_account_id"]))
+        account.platform = ""
+        await db.commit()
+    _, row = await draft(env)
+    assert (await env.client.post(f"{env.url}/{row['id']}/approve", json=approval(row))).status_code == 200
+    result = await env.client.patch(f"/api/v1/channel-agent/channels/{env.channel_id}/accounts/{env.scope['target_account_id']}",
+                                    json={"platform_account_id": "ordinary-unoccupied"})
+    assert result.status_code == 409
+
+
+@pytest.mark.parametrize("platform", ["x", "bilibili", "xiaohongshu"])
+async def test_other_provider_identity_does_not_occupy_youtube_scope(inventory_env, platform):
+    env = inventory_env
+    other_id, other_account = await legacy_alias(env, platform)
+    _, row = await draft(env)
+    url = f"{env.url}/{row['id']}"
+    assert (await env.client.post(url + "/approve", json=approval(row))).status_code == 200
+    accounts_url = f"/api/v1/channel-agent/channels/{other_id}/accounts"
+    assert (await env.client.post(accounts_url, json={
+        "account_label": "other provider", "platform": platform, "platform_account_id": env.scope["platform_channel_id"],
+    })).status_code == 200
+    assert (await env.client.patch(f"{accounts_url}/{other_account}", json={
+        "platform_account_id": env.scope["platform_channel_id"], "account_label": "renamed",
+    })).status_code == 200
+    revoked = await env.client.post(url + "/revoke", json={"manifest_sha256": row["manifest_sha256"], "reason": "unused closeout"})
+    assert revoked.json()["closeout"]["status"] == "ready"
