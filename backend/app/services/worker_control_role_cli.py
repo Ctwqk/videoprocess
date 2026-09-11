@@ -66,6 +66,7 @@ ROLE_FUNCTIONS = {
         "vp_worker_registration_expire(text,uuid)",
     ),
     "orchestrator": (
+        "vp_release_registered_retry_claim(uuid)",
         "vp_observe_worker_lease(uuid,bigint)",
         "vp_observe_worker_task_delivery("
         "uuid,bigint,text,timestamp with time zone,uuid,uuid,"

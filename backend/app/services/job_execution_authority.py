@@ -196,6 +196,10 @@ async def claim_registered_worker_node(
         or not isinstance(database_now, datetime)
         or job.status != JobStatus.RUNNING
         or node.status != NodeStatus.QUEUED
+        or node.worker_id is not None
+        or node.worker_registration_id is not None
+        or node.worker_lease_epoch is not None
+        or node.started_at is not None
         or registration.lease_epoch != lease_epoch
         or registration.status != "active"
         or _utc(registration.lease_expires_at) <= _utc(database_now)

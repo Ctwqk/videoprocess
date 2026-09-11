@@ -41,6 +41,7 @@ from app.services.registered_worker_event_receipt import (
     RegisteredWorkerEventReceiptService,
     stage_worker_task_dispatch,
 )
+from app.services.registered_worker_retry import release_registered_retry_claim
 
 logger = logging.getLogger(__name__)
 
@@ -758,6 +759,8 @@ class JobEngine:
                 job,
                 ne,
             )
+            await db.flush()
+            await release_registered_retry_claim(db, receipt.id)
             return
 
         ne.status = NodeStatus.FAILED

@@ -35,6 +35,7 @@ def test_control_function_allowlists_are_exact() -> None:
         "vp_worker_registration_expire(text,uuid)",
     }
     assert set(control_cli.ROLE_FUNCTIONS["orchestrator"]) == {
+        "vp_release_registered_retry_claim(uuid)",
         "vp_observe_worker_lease(uuid,bigint)",
         "vp_observe_worker_task_delivery("
         "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
