@@ -23,6 +23,12 @@ log() {
   :
 }
 source "$EXTENSION"
+# The registered-runtime shell contract is executed in test_registered_runtime_deploy.py.
+vp_require_autoflow_control_ready() { :; }
+vp_require_selected_autoflow_control_ready() { :; }
+vp_autoflow_tasks() { printf '[]\n'; }
+vp_autoflow_selected_image() { printf 'vp-backend-api:deploy-0123456789ab\n'; }
+vp_autoflow_runtime_update_args() { VP_AUTOFLOW_RUNTIME_UPDATE_ARGS=$'--env-add\nWORKER_ORCHESTRATOR_CONTROL_GENERATION=fixture'; }
 mkdir -p "$(vp_worker_admission_root)"
 chmod 0700 "$(vp_worker_admission_root)"
 
@@ -4922,6 +4928,7 @@ fi
   source "$EXTENSION"
 
   replay_root="$(vp_worker_admission_root)"
+  vp_require_selected_autoflow_control_ready() { :; }
   vp_worker_admission_lock_acquire "$replay_root"
   replay_credentials=()
   replay_principals=(

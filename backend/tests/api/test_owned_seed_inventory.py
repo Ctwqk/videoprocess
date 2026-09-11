@@ -77,7 +77,7 @@ async def inventory_env(monkeypatch, request):
                 sync, tables=[Base.metadata.tables[name] for name in names if name in Base.metadata.tables],
             ))
         else:
-            assert (await connection.scalar(text("SELECT version_num FROM alembic_version"))) == "037_owned_seed_inventory"
+            assert (await connection.scalar(text("SELECT version_num FROM alembic_version"))) == "038_owned_seed_inventory"
     factory = async_sessionmaker(engine, expire_on_commit=False)
     storage = FakeStorage()
     monkeypatch.setattr("app.storage.manager.get_storage", lambda *a, **kw: storage)

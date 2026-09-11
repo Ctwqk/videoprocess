@@ -5,8 +5,8 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import UUID
 
 
-revision = "037_owned_seed_inventory"
-down_revision = "036_worker_session_signal"
+revision = "038_owned_seed_inventory"
+down_revision = "037_registered_retry_release"
 branch_labels = None
 depends_on = None
 

@@ -6,7 +6,7 @@ from datetime import datetime
 
 import redis.asyncio as aioredis
 from app.config import settings
-from app.db import async_session
+from app.orchestrator.registered_db import registered_session
 from app.orchestrator.engine import engine, EVENT_STREAM
 from app.services.job_execution_authority import (
     NodeExecutionClaim,
@@ -25,7 +25,7 @@ PEL_MIN_IDLE = 30000       # ms
 REDIS_BLOCK_MILLISECONDS = 5000
 REDIS_SOCKET_TIMEOUT_SECONDS = 30.0
 _registered_event_receipts = RegisteredWorkerEventReceiptService(
-    async_session
+    registered_session
 )
 
 

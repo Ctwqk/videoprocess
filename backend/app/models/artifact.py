@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from sqlalchemy import String, BigInteger, Enum, ForeignKey, JSON, Integer, func
+from sqlalchemy import String, BigInteger, DateTime, Enum, ForeignKey, JSON, Integer, func
 from sqlalchemy.dialects.postgresql import JSON as PGJSON
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -55,6 +55,6 @@ class IntermediateArtifactCache(UUIDPrimaryKeyMixin, Base):
     file_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     media_info: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
-    last_used_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     hit_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     metadata_json: Mapped[dict] = mapped_column(PGJSON, default=dict, nullable=False)

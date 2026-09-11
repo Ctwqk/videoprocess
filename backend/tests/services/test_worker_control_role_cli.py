@@ -35,6 +35,7 @@ def test_control_function_allowlists_are_exact() -> None:
         "vp_worker_registration_expire(text,uuid)",
     }
     assert set(control_cli.ROLE_FUNCTIONS["orchestrator"]) == {
+        "vp_release_registered_retry_claim(uuid)",
         "vp_observe_worker_lease(uuid,bigint)",
         "vp_observe_worker_task_delivery("
         "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
@@ -136,6 +137,16 @@ def test_orchestrator_column_allowlists_cover_real_receipt_transaction() -> None
     assert control_cli.ORCHESTRATOR_UPDATE_COLUMNS["runtime_schedules"] == (
         "updated_at",
     )
+
+
+def test_orchestrator_channel_projection_keeps_inventory_pointer_read_only() -> None:
+    from app.models.channel_agent import ChannelProfile
+
+    assert set(control_cli.ORCHESTRATOR_ENTITY_COLUMNS["channel_profiles"]) == {
+        column.name for column in ChannelProfile.__table__.columns
+    }
+    assert "owned_seed_inventory_id" not in control_cli.ORCHESTRATOR_UPDATE_COLUMNS["channel_profiles"]
+    assert "channel_profiles" not in control_cli.ORCHESTRATOR_INSERT_COLUMNS
 
 
 async def test_control_provision_writes_independent_mode_0400_urls(
