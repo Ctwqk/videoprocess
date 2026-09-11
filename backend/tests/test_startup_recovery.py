@@ -12,6 +12,58 @@ from app.models.job import JobStatus, NodeStatus
 from app.services.schedule_service import VideoScheduleState
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_restricted_database_qualified_before_recovery_and_listener(monkeypatch, failed):
+    import asyncio
+    import httpx
+
+    events = []
+    class Runtime:
+        ready = False
+        generation = "c-0123456789abcdef0123"
+        principal = "restricted"
+        async def start(self, target):
+            events.append("qualify")
+            if failed:
+                raise RuntimeError("qualification rejected")
+            self.ready = True
+        async def close(self):
+            events.append("dispose")
+            self.ready = False
+    async def listener():
+        events.append("listen")
+        try:
+            await asyncio.Future()
+        finally:
+            events.append("listener-closed")
+    async def recover():
+        assert events == ["qualify"]
+        events.append("recover")
+    monkeypatch.setattr(main, "registered_database", Runtime(), raising=False)
+    monkeypatch.setattr(main, "event_listener", listener)
+    monkeypatch.setattr(main, "_recover_stale_jobs", recover)
+    monkeypatch.setattr(main.settings, "event_listener_enabled", True)
+    monkeypatch.setattr(main.settings, "startup_recovery_enabled", True)
+    app = main.create_app()
+    if failed:
+        with pytest.raises(RuntimeError, match="qualification rejected"):
+            async with main.lifespan(app):
+                pytest.fail("unqualified application became ready")
+        assert "listen" not in events and "recover" not in events
+    else:
+        async with main.lifespan(app):
+            await asyncio.sleep(0)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.get("/health")
+                assert response.status_code == 200
+                assert response.json()["registered_runtime"]["generation"] == "c-0123456789abcdef0123"
+                app.state.event_listener_task.cancel()
+                await asyncio.sleep(0)
+                assert (await client.get("/health")).status_code == 503
+        assert events == ["qualify", "recover", "listen", "listener-closed", "dispose"]
+
+
 class _RecoverySession:
     def __init__(self, events):
         self.events = events

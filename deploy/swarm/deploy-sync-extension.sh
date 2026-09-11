@@ -8009,6 +8009,9 @@ vp_worker_admission_current_promotion_matches() {
     PROMOTE_MARKER|PROMOTE_ROLLBACK_MARKER)
       vp_worker_admission_marker_promotion_receipt_matches "$kind"
       ;;
+    PROMOTE_CONTROL|PROMOTE_ROLLBACK_CONTROL)
+      vp_require_selected_autoflow_control_ready
+      ;;
     *)
       return 0
       ;;
@@ -8054,6 +8057,7 @@ vp_worker_admission_promote_phase() {
 }
 
 vp_worker_admission_retire_transaction() {
+  vp_require_selected_autoflow_control_ready || return 1
   local root="$VP_WORKER_ADMISSION_LOCK_ROOT"
   vp_worker_admission_process_retirement_journals "$root" || return 1
   vp_worker_control_process_retirements \
@@ -10344,6 +10348,7 @@ vp_worker_control_generation_unused() {
     "$VP_PYTHON_WORKER_SERVICE" \
     "$VP_VISION_WORKER_SERVICE" \
     "$VP_PUBLISHER_SERVICE" \
+    vp-autoflow-api-swarm \
     vp-staging-object-janitor; do
     local mounted_secrets
     if ! mounted_secrets="$(
@@ -10376,6 +10381,24 @@ vp_worker_control_generation_unused() {
         return 1
       fi
     done <<<"$managed_secrets"
+    if [[ "$service" == vp-autoflow-api-swarm ]]; then
+      local tasks
+      tasks="$(vp_autoflow_tasks "$service")" || return 1
+      python3 -I -c '
+import json,sys
+try:
+    names=set(sys.argv[1].splitlines())
+    tasks=json.load(sys.stdin)
+    if not isinstance(tasks,list): raise ValueError
+    for task in tasks:
+        state=task["Status"]["State"]
+        if state in {"shutdown","complete","failed","rejected","remove"}: continue
+        secrets=task["Spec"]["ContainerSpec"].get("Secrets",[])
+        if any(s["SecretName"] in names for s in secrets): raise ValueError
+except (KeyError,TypeError,ValueError):
+    raise SystemExit(1)
+' "$managed_secrets" <<<"$tasks" || return 1
+    fi
   done
 }
 
@@ -10630,6 +10653,7 @@ vp_commit_worker_control_generation() {
     && "$VP_WORKER_ADMISSION_COMMITTED" == true \
     && "$VP_WORKER_REDIS_MARKER_CONTROL_PREPARED" == false ]] \
     || return 1
+  vp_require_selected_autoflow_control_ready || return 1
   vp_require_pipeline_network_identity || return 1
   local service
   for service in \
@@ -10761,6 +10785,7 @@ vp_finalize_worker_control_rollback() {
   if [[ -z "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" ]]; then
     return 0
   fi
+  vp_require_selected_autoflow_control_ready || return 1
   local root
   root="$(vp_worker_admission_root)" || return 1
   vp_worker_control_require_rollback_workers || return 1
@@ -11973,6 +11998,169 @@ vp_require_github_actions_success() {
   log "GitHub Actions gate passed $repository@$commit workflow=$workflow run=$run_id"
 }
 
+vp_autoflow_control_identity() {
+  [[ "$VP_WORKER_ADMISSION_LOCK_HELD" == true \
+    && "$VP_WORKER_CONTROL_GENERATION" =~ ^c-[0-9a-f]{20}$ ]] || return 1
+  vp_worker_admission_load_replay_plan || return 1
+  local root manifest secret_id selected state
+  root="$(vp_worker_admission_root)" || return 1
+  manifest="$(vp_worker_control_find_v2_manifest "$root" "$VP_WORKER_CONTROL_GENERATION")" || return 1
+  vp_worker_control_read_manifest "$manifest" || return 1
+  [[ "$VP_WORKER_CONTROL_MANIFEST_VERSION" == 2 \
+    && "$VP_WORKER_CONTROL_MANIFEST_GENERATION" == "$VP_WORKER_CONTROL_GENERATION" ]] || return 1
+  secret_id="$(vp_managed_secret_id \
+    "$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET" \
+    "$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET" \
+    vp-worker-control "$VP_WORKER_CONTROL_GENERATION" orchestrator)" || return 1
+  [[ "$secret_id" == "$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET_ID" ]] || return 1
+  selected="$(vp_worker_admission_control_selection_json "$manifest")" || return 1
+  state="$(vp_worker_admission_recovery_state)" || return 1
+  python3 -I -c '
+import json,sys
+try:
+    state=json.load(sys.stdin)
+    rollback=state["phase"].startswith("ROLLBACK") or state.get("retiring_outcome")=="rolled_back"
+    if state["rollback" if rollback else "forward"]["control"]!=json.loads(sys.argv[1]): raise ValueError
+    services=[s for s in state["baseline"]["services"] if s["name"]=="vp-autoflow-api-swarm"]
+    if len(services)!=1 or not services[0]["existed"] or services[0]["docker_service_id"]!=sys.argv[2]: raise ValueError
+    if sys.argv[3]!="vp-backend-api:deploy-"+state["target_commit"][:12]: raise ValueError
+except (KeyError,TypeError,ValueError): raise SystemExit(1)
+' "$selected" "$1" "$2" <<<"$state" || return 1
+  printf '%s|%s|%s\n' "$VP_WORKER_CONTROL_MANIFEST_ORCHESTRATOR_DATABASE_SECRET" \
+    "$secret_id" "$VP_WORKER_CONTROL_GENERATION"
+}
+
+vp_autoflow_selected_image() {
+  local state
+  state="$(vp_worker_admission_recovery_state)" || return 1
+  python3 -I -c '
+import json,re,sys
+try:
+    commit=json.load(sys.stdin)["target_commit"]
+    if not re.fullmatch(r"[0-9a-f]{40}",commit): raise ValueError
+    print("vp-backend-api:deploy-"+commit[:12])
+except (KeyError,TypeError,ValueError): raise SystemExit(1)
+' <<<"$state"
+}
+
+vp_require_selected_autoflow_control_ready() {
+  local image
+  image="$(vp_autoflow_selected_image)" || return 1
+  vp_require_autoflow_control_ready "$image"
+}
+
+vp_autoflow_health_command() {
+  printf '%s\n' 'python -c '\''import json,os,urllib.request; from app.services.worker_control_role_cli import role_names_for_generation; g=os.environ["WORKER_ORCHESTRATOR_CONTROL_GENERATION"]; d=json.load(urllib.request.urlopen("http://127.0.0.1:8080/health",timeout=2)); assert d["status"]=="ok" and d["registered_runtime"]=={"ready":True,"generation":g,"principal":role_names_for_generation(g).versioned["orchestrator"]}'\'''
+}
+
+vp_autoflow_runtime_update_args() {
+  local service_id="$1" image="$2" identity spec image_user health
+  identity="$(vp_autoflow_control_identity "$service_id" "$image")" || return 1
+  spec="$(vp_service_values "$service_id" '{{json .Spec.TaskTemplate.ContainerSpec}}')" || return 1
+  image_user="$(docker image inspect "$image" --format '{{.Config.User}}')" || return 1
+  health="$(vp_autoflow_health_command)" || return 1
+  python3 -I -c '
+import json,re,sys
+try:
+    name,identity,generation=sys.argv[1].split("|")
+    spec=json.load(sys.stdin)
+    user=spec.get("User") or sys.argv[2] or "0:0"
+    if user in {"0","root"}: user="0:0"
+    if not re.fullmatch(r"[0-9]+:[0-9]+", user): raise ValueError
+    uid,gid=user.split(":")
+    env=spec.get("Env") or []
+    keys=[item.split("=",1)[0] for item in env]
+    if len(keys)!=len(set(keys)): raise ValueError
+    secrets=spec.get("Secrets") or []
+    target="worker-orchestrator-database-url"
+    old=[s for s in secrets if s.get("File",{}).get("Name")==target]
+    if len(old)>1 or any(not s.get("SecretName","").startswith("vp-wc-orchestrator-") for s in old): raise ValueError
+    for secret in secrets:
+        if secret.get("SecretName","").startswith("vp-wc-orchestrator-") and secret not in old: raise ValueError
+    args=[]
+    for key,value in (("WORKER_ORCHESTRATOR_DATABASE_URL_FILE","/run/secrets/"+target),
+                      ("WORKER_ORCHESTRATOR_CONTROL_GENERATION",generation)):
+        if key in keys: args += ["--env-rm",key]
+        args += ["--env-add",key+"="+value]
+    for secret in old: args += ["--secret-rm",secret["SecretName"]]
+    args += ["--secret-add",f"source={identity},target={target},uid={uid},gid={gid},mode=0400",
+             "--health-cmd",sys.argv[3],"--health-interval","10s","--health-timeout","3s",
+             "--health-retries","6","--health-start-period","10s"]
+    print("\n".join(args))
+except (TypeError,ValueError,KeyError,AttributeError):
+    raise SystemExit(1)
+' "$identity" "$image_user" "$health" <<<"$spec"
+}
+
+vp_autoflow_tasks() {
+  local service="$1" task_ids task_id
+  task_ids="$(docker service ps "$service" --no-trunc --format '{{.ID}}')" || return 1
+  local ids=()
+  while IFS= read -r task_id; do
+    [[ -n "$task_id" ]] || continue
+    [[ "$task_id" =~ ^[a-z0-9]{20,64}$ ]] || return 1
+    ids+=("$task_id")
+  done <<<"$task_ids"
+  if [[ "${#ids[@]}" == 0 ]]; then
+    printf '[]\n'
+  else
+    docker inspect --type task "${ids[@]}"
+  fi
+}
+
+vp_require_autoflow_control_ready() {
+  [[ "${UPDATE_SERVICES:-1}" -ne 0 ]] || return 0
+  local image="$1" service=vp-autoflow-api-swarm identity before service_id spec tasks image_user health container
+  before="$(vp_app_service_durable_identity "$service" "$image")" || return 1
+  service_id="${before%%|*}"
+  identity="$(vp_autoflow_control_identity "$service_id" "$image")" || return 1
+  vp_require_service_node "$service_id" "$VP_RUNTIME_NODE" || return 1
+  spec="$(docker service inspect "$service_id" --format '{{json .Spec}}')" || return 1
+  tasks="$(vp_autoflow_tasks "$service_id")" || return 1
+  image_user="$(docker image inspect "$image" --format '{{.Config.User}}')" || return 1
+  health="$(vp_autoflow_health_command)" || return 1
+  container="$(python3 -I -c '
+import json,re,sys
+try:
+    name,secret_id,generation=sys.argv[1].split("|")
+    service_id,image,image_user,health=sys.argv[2:6]
+    raw=sys.stdin.read()
+    spec,end=json.JSONDecoder().raw_decode(raw)
+    tasks=json.loads(raw[end:])
+    c=spec["TaskTemplate"]["ContainerSpec"]
+    if spec["Name"]!="vp-autoflow-api-swarm" or spec["Mode"]!={"Replicated":{"Replicas":1}} or c["Image"]!=image: raise ValueError
+    user=c.get("User") or image_user or "0:0"
+    if user in {"0","root"}: user="0:0"
+    if not re.fullmatch(r"[0-9]+:[0-9]+",user): raise ValueError
+    uid,gid=user.split(":")
+    env=c.get("Env") or []
+    keys=[v.split("=",1)[0] for v in env]
+    if len(keys)!=len(set(keys)): raise ValueError
+    if not {"WORKER_ORCHESTRATOR_DATABASE_URL_FILE=/run/secrets/worker-orchestrator-database-url",
+            "WORKER_ORCHESTRATOR_CONTROL_GENERATION="+generation}.issubset(env): raise ValueError
+    mounted=[s for s in c.get("Secrets",[]) if s.get("File",{}).get("Name")=="worker-orchestrator-database-url" or s.get("SecretName","").startswith("vp-wc-orchestrator-")]
+    expected={"SecretName":name,"SecretID":secret_id,"File":{"Name":"worker-orchestrator-database-url","UID":uid,"GID":gid,"Mode":256}}
+    if mounted!=[expected] or c.get("Healthcheck",{}).get("Test")!=["CMD-SHELL",health]: raise ValueError
+    active=[t for t in tasks if t["Status"]["State"] not in {"shutdown","complete","failed","rejected","remove"}]
+    if len(active)!=1: raise ValueError
+    t=active[0]
+    if t["ServiceID"]!=service_id or t["Status"]["State"]!="running" or t["Spec"]["ContainerSpec"]!=c: raise ValueError
+    container=t["Status"]["ContainerStatus"]["ContainerID"]
+    if not re.fullmatch(r"[0-9a-f]{64}",container): raise ValueError
+    print(container)
+except (KeyError,TypeError,ValueError,AttributeError):
+    raise SystemExit(1)
+' "$identity" "$service_id" "$image" "$image_user" "$health" <<<"$spec"$'\n'"$tasks")" || return 1
+  remote_sh "$VP_RUNTIME_HOST" /bin/sh -s -- "$container" "$service_id" "$image" "$health" <<'REMOTE' >/dev/null 2>&1 || return 1
+set -eu
+container="$1"; service_id="$2"; image="$3"; health="$4"
+actual="$(docker inspect "$container" --format '{{index .Config.Labels "com.docker.swarm.service.id"}}|{{.Config.Image}}|{{.State.Running}}|{{.State.Health.Status}}')"
+[ "$actual" = "$service_id|$image|true|healthy" ]
+exec docker exec "$container" sh -c "$health"
+REMOTE
+  [[ "$(vp_app_service_durable_identity "$service" "$image")" == "$before" ]]
+}
+
 vp_update_runtime_service() {
   local service="$1"
   local image="$2"
@@ -12032,6 +12220,14 @@ vp_update_runtime_service() {
   local service_args=()
   local worker_generation=""
   local worker_current_id=""
+  if [[ "$service" == "vp-autoflow-api-swarm" ]]; then
+    local autoflow_args autoflow_arg
+    autoflow_args="$(vp_autoflow_runtime_update_args "$current_service_id" "$image")" \
+      || return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
+    while IFS= read -r autoflow_arg; do
+      service_args+=("$autoflow_arg")
+    done <<<"$autoflow_args"
+  fi
   if [[ "$service" == "vp-api-swarm" ]]; then
     service_args+=(--no-healthcheck)
     local api_env_key
@@ -14182,7 +14378,12 @@ vp_restore_app_snapshots() {
 
   while IFS='|' read -r service service_id image digest extra; do
     [[ -n "$service" ]] || continue
-    vp_app_service_was_attempted "$service" "$attempted_services" || continue
+    if ! vp_app_service_was_attempted "$service" "$attempted_services"; then
+      # A migrated rollback must retain a backend that understands the new RPC.
+      [[ "$service" == vp-autoflow-api-swarm \
+        && "$worker_admission_rollback" == true \
+        && "$VP_BACKEND_MIGRATION_APPLIED" == true ]] || continue
+    fi
     log "restore $service -> $image with dedicated VP placement"
     local registered_worker=false
     case "$service" in
@@ -14228,6 +14429,16 @@ vp_restore_app_snapshots() {
     elif [[ "$service" == "$VP_PUBLISHER_SERVICE" ]]; then
       publisher_was_present=true
       if ! vp_deploy_publisher "$image" "$service_id"; then
+        status=1
+        restored=false
+      fi
+    elif [[ "$service" == vp-autoflow-api-swarm \
+      && "$worker_admission_rollback" == true \
+      && "$VP_BACKEND_MIGRATION_APPLIED" == true ]]; then
+      local compatible_image
+      compatible_image="$(vp_autoflow_selected_image)" || return 1
+      if ! vp_update_runtime_service "$service" "$compatible_image" stop-first "$service_id" \
+        || ! vp_require_autoflow_control_ready "$compatible_image"; then
         status=1
         restored=false
       fi
@@ -16824,9 +17035,10 @@ vp_apply_app_services() {
   vp_worker_admission_advance_migration_state applying applied || return 1
   VP_BACKEND_MIGRATION_APPLIED=true
   vp_require_channelops_migration_head "$backend" || return 1
-  vp_update_app_runtime_service vp-autoflow-api-swarm "$backend" start-first || return 1
   vp_prepare_worker_redis_marker_controls "$python_worker" || return 1
   vp_prepare_worker_admission "$python_worker" "$ffmpeg_go" || return 1
+  vp_update_app_runtime_service vp-autoflow-api-swarm "$backend" start-first || return 1
+  vp_require_autoflow_control_ready "$backend" || return 1
   vp_install_staging_object_janitor "$python_worker" || return 1
   vp_run_staging_object_janitor_once || return 1
   if [[ "${UPDATE_SERVICES:-1}" -ne 0 ]]; then

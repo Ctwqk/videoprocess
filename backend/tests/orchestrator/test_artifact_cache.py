@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import asyncpg as pg_asyncpg
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models.artifact import Artifact, ArtifactKind, IntermediateArtifactCache
@@ -42,6 +44,35 @@ def artifact(
         storage_path=storage_path,
         media_info=media_info or {"width": 1080, "height": 1920},
     )
+
+
+@pytest.mark.asyncio
+async def test_record_hit_binds_utc_aware_cache_timestamp(cache_db_session):
+    entry = IntermediateArtifactCache(
+        cache_key="timestamp-contract", node_type="transcode",
+        node_config_hash="fixture", input_signature_hash="fixture",
+        storage_backend="local", storage_path="fixture/cached.mp4",
+        filename="cached.mp4", hit_count=2,
+    )
+    cache_db_session.add(entry)
+    await cache_db_session.flush()
+    before = datetime.now(timezone.utc)
+
+    await IntermediateArtifactCacheService().record_hit(cache_db_session, entry)
+
+    assert entry.last_used_at.tzinfo is timezone.utc
+    assert before <= entry.last_used_at <= datetime.now(timezone.utc)
+    assert entry.hit_count == 3
+
+
+def test_cache_timestamp_update_matches_migration_008_timezone_contract():
+    timestamp = datetime.now(timezone.utc)
+    compiled = update(IntermediateArtifactCache).values(last_used_at=timestamp).compile(
+        dialect=pg_asyncpg.dialect(),
+    )
+    assert IntermediateArtifactCache.__table__.c.last_used_at.type.timezone is True
+    assert "last_used_at=$1::TIMESTAMP WITH TIME ZONE" in str(compiled)
+    assert compiled.params["last_used_at"] is timestamp
 
 
 def test_cache_key_is_stable_for_config_order_and_changes_for_inputs():

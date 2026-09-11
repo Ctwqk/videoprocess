@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import insert, literal, or_, select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.registered_worker_event_receipt import (
@@ -306,7 +306,7 @@ async def stage_worker_task_dispatch(
 class RegisteredWorkerEventReceiptService:
     def __init__(
         self,
-        session_factory: async_sessionmaker[AsyncSession],
+        session_factory: Callable[[], AsyncSession],
         *,
         authority_locker: Callable[..., Awaitable[Any]] = (
             lock_job_execution_authority
