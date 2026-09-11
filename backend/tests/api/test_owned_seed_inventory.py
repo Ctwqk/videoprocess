@@ -22,6 +22,7 @@ from app.config import settings
 from app.db import get_db
 from app.models import Base
 from app.models.asset import Asset
+from app.models.schedule import RuntimeSchedule
 from app.models.channel_agent import (
     ChannelProfile, LaneFormatMatrix, ManualSeed, PublishingAccount, TopicLane,
 )
@@ -69,7 +70,7 @@ async def inventory_env(monkeypatch, request):
         "assets", "channel_profiles", "topic_lanes", "publishing_accounts", "lane_format_matrix",
         "manual_seeds", "jobs", "node_executions", "production_tasks", "channel_ops_queue_items",
         "youtube_upload_operations", "publication_records", "publication_promotion_operations",
-        "owned_seed_inventories", "owned_seed_inventory_items",
+        "owned_seed_inventories", "owned_seed_inventory_items", "runtime_schedules",
     )
     async with engine.begin() as connection:
         if database_url.startswith("sqlite"):
@@ -86,6 +87,8 @@ async def inventory_env(monkeypatch, request):
     monkeypatch.setitem(settings.__dict__, "owned_seed_inventory_operator_token", SecretStr(TOKEN))
     monkeypatch.setitem(settings.__dict__, "owned_seed_inventory_operator_subject", "test-operator")
     async with factory() as db:
+        if database_url.startswith("sqlite"):
+            db.add(RuntimeSchedule(service_name="videoprocess", state="CLOSED"))
         channel = ChannelProfile(name="finite owned", enabled=True, dry_run=False,
                                  intake_paused_at=datetime.now(timezone.utc))
         db.add(channel)

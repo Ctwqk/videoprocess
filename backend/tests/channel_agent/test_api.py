@@ -32,9 +32,11 @@ from app.models.channel_agent import (
 from app.models.asset import Asset
 from app.models.owned_seed_inventory import OwnedSeedInventory, OwnedSeedInventoryItem
 from app.models.autoflow import AutoFlowPlan
+from app.models.schedule import RuntimeSchedule
 
 
 CHANNEL_AGENT_TABLES = (
+    RuntimeSchedule.__table__,
     Asset.__table__,
     AutoFlowPlan.__table__,
     ChannelProfile.__table__,
@@ -114,6 +116,8 @@ async def api_session():
 
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with session_factory() as session:
+        session.add(RuntimeSchedule(service_name="videoprocess", state="CLOSED"))
+        await session.commit()
         yield session
 
     await engine.dispose()

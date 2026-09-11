@@ -1177,36 +1177,27 @@ def require_active_execution_authority(
             raise JobExecutionAuthorityBlocked("node status no longer permits execution")
 
 
-async def lock_job_execution_authority(
+async def lock_job_execution_entry(
     db: AsyncSession,
     job_id: uuid.UUID,
-    *,
-    node_execution_id: uuid.UUID | None = None,
-    lock_all_nodes: bool = False,
-) -> LockedJobExecutionAuthority:
-    """Lock shared execution authority in quarantine-compatible order.
+) -> tuple:
+    """Shared channel/schedule entry before task, job, node or receipt locks."""
+    channels, references, schedule = await lock_job_execution_entries(db, [job_id])
+    refs = [(task_id, channel_id) for task_id, channel_id, _job_id in references]
+    return channels.get(refs[0][1]) if refs else None, refs, schedule
 
-    ChannelOps jobs lock channel -> schedule -> task -> job -> node. Jobs that
-    are not linked to ChannelOps lock schedule -> job -> node.
-    """
 
-    task_refs = list(
-        (
-            await db.execute(
-                select(ProductionTask.id, ProductionTask.channel_profile_id)
-                .where(ProductionTask.job_id == job_id)
-                .order_by(ProductionTask.id)
-                .limit(2)
-            )
-        ).all()
-    )
-    if len(task_refs) > 1:
+async def lock_job_execution_entries(db: AsyncSession, job_ids: list[uuid.UUID], *, create_schedule: bool = True) -> tuple:
+    """Batch writers acquire every channel first, then the single schedule row."""
+
+    references = select(ProductionTask.id, ProductionTask.channel_profile_id, ProductionTask.job_id).where(
+        ProductionTask.job_id.in_(job_ids)).order_by(ProductionTask.id).limit(2 * len(job_ids) + 1)
+    task_refs = list((await db.execute(references)).all())
+    if len(task_refs) != len({row[2] for row in task_refs}):
         raise JobExecutionAuthorityBlocked("job is linked to multiple production tasks")
 
-    channel = None
-    task = None
-    if task_refs:
-        task_id, discovered_channel_id = task_refs[0]
+    channels = {}
+    for discovered_channel_id in sorted({row[1] for row in task_refs}, key=str):
         channel = (
             await db.execute(
                 select(ChannelProfile)
@@ -1217,8 +1208,32 @@ async def lock_job_execution_authority(
         ).scalar_one_or_none()
         if channel is None:
             raise JobExecutionAuthorityBlocked("production task channel was not found")
+        channels[discovered_channel_id] = channel
 
-    schedule, _created = await get_or_create_and_lock_runtime_schedule(db)
+    if create_schedule:
+        schedule, _created = await get_or_create_and_lock_runtime_schedule(db)
+    else:
+        existing_schedule = (await db.execute(select(RuntimeSchedule).where(
+            RuntimeSchedule.service_name == "videoprocess").with_for_update()
+            .execution_options(populate_existing=True))).scalar_one_or_none()
+        if existing_schedule is None:
+            raise JobExecutionAuthorityBlocked("runtime schedule was not found")
+        schedule = existing_schedule
+    if task_refs != list((await db.execute(references)).all()):
+        raise JobExecutionAuthorityBlocked("production task channel authority changed")
+    return channels, task_refs, schedule
+
+
+async def lock_job_execution_authority(
+    db: AsyncSession,
+    job_id: uuid.UUID,
+    *,
+    node_execution_id: uuid.UUID | None = None,
+    lock_all_nodes: bool = False,
+) -> LockedJobExecutionAuthority:
+    """Lock channel -> schedule -> task -> job -> node in quarantine order."""
+    channel, task_refs, schedule = await lock_job_execution_entry(db, job_id)
+    task = None
 
     if task_refs:
         task_id, discovered_channel_id = task_refs[0]

@@ -27,6 +27,7 @@ from app.services.job_execution_authority import (
     require_active_execution_authority,
     require_matching_node_execution_claim,
 )
+from app.services import job_execution_authority
 
 
 _IDEMPOTENT_XADD_SCRIPT = """
@@ -931,6 +932,7 @@ class RegisteredWorkerEventReceiptService:
         node_execution_id: uuid.UUID,
         registration_id: uuid.UUID,
     ) -> None:
+        await job_execution_authority.lock_job_execution_entry(db, job_id)
         job = (
             await db.execute(
                 select(Job).where(Job.id == job_id).with_for_update()
@@ -1184,15 +1186,12 @@ class RegisteredWorkerEventReceiptService:
                     .where(WorkerTaskDispatch.delivery_state == "pending")
                     .order_by(WorkerTaskDispatch.created_at)
                     .limit(limit)
-                    .with_for_update(skip_locked=True)
                 )
                 if receipt_id is not None:
                     statement = statement.where(
                         WorkerTaskDispatch.origin_receipt_id == receipt_id
                     )
-                dispatches = list(
-                    (await db.execute(statement)).scalars()
-                )
+                dispatches = await self._locked_dispatch_batch(db, statement)
                 attempted_at = datetime.now(timezone.utc)
                 for dispatch in dispatches:
                     dispatch.delivery_state = "attempting"
@@ -1200,6 +1199,15 @@ class RegisteredWorkerEventReceiptService:
                     dispatch.delivery_error = None
                 await db.flush()
                 return dispatches
+
+    @staticmethod
+    async def _locked_dispatch_batch(db: AsyncSession, statement, *, skip_locked: bool = True) -> list[WorkerTaskDispatch]:
+        observed = list((await db.execute(statement)).scalars())
+        if not observed:
+            return []
+        await job_execution_authority.lock_job_execution_entries(db, sorted({d.job_id for d in observed}, key=str))
+        return list((await db.execute(statement.where(WorkerTaskDispatch.id.in_([d.id for d in observed]))
+            .with_for_update(skip_locked=skip_locked).execution_options(populate_existing=True))).scalars())
 
     async def _recover_stale_dispatch_attempts(
         self,
@@ -1298,13 +1306,7 @@ class RegisteredWorkerEventReceiptService:
                     .order_by(WorkerTaskDispatch.created_at)
                     .limit(limit)
                 )
-                if not is_postgresql:
-                    statement = statement.with_for_update(
-                        skip_locked=True
-                    )
-                dispatches = list(
-                    (await db.execute(statement)).scalars()
-                )
+                dispatches = await self._locked_dispatch_batch(db, statement)
                 if is_postgresql:
                     for dispatch in dispatches:
                         await db.execute(
@@ -1355,13 +1357,7 @@ class RegisteredWorkerEventReceiptService:
                     .order_by(WorkerTaskDispatch.created_at)
                     .limit(limit)
                 )
-                if not is_postgresql:
-                    statement = statement.with_for_update(
-                        skip_locked=True
-                    )
-                dispatches = list(
-                    (await db.execute(statement)).scalars()
-                )
+                dispatches = await self._locked_dispatch_batch(db, statement)
                 if is_postgresql:
                     authorized_ids: list[uuid.UUID] = []
                     for dispatch in dispatches:
@@ -1397,11 +1393,8 @@ class RegisteredWorkerEventReceiptService:
                 statement = select(WorkerTaskDispatch).where(
                     WorkerTaskDispatch.id == dispatch_id
                 )
-                if not is_postgresql:
-                    statement = statement.with_for_update()
-                dispatch = (
-                    await db.execute(statement)
-                ).scalar_one_or_none()
+                dispatches = await self._locked_dispatch_batch(db, statement, skip_locked=False)
+                dispatch = dispatches[0] if dispatches else None
                 if dispatch is None:
                     return
                 if dispatch.resolution_state == "acknowledged":
@@ -1536,13 +1529,8 @@ class RegisteredWorkerEventReceiptService:
     ) -> None:
         async with self._session_factory() as db:
             async with db.begin():
-                dispatch = (
-                    await db.execute(
-                        select(WorkerTaskDispatch)
-                        .where(WorkerTaskDispatch.id == dispatch_id)
-                        .with_for_update()
-                    )
-                ).scalar_one_or_none()
+                rows = await self._locked_dispatch_batch(db, select(WorkerTaskDispatch).where(WorkerTaskDispatch.id == dispatch_id), skip_locked=False)
+                dispatch = rows[0] if rows else None
                 if dispatch is None:
                     raise RegisteredWorkerEventError(
                         "worker task dispatch is missing"
@@ -1569,13 +1557,8 @@ class RegisteredWorkerEventReceiptService:
     ) -> None:
         async with self._session_factory() as db:
             async with db.begin():
-                dispatch = (
-                    await db.execute(
-                        select(WorkerTaskDispatch)
-                        .where(WorkerTaskDispatch.id == dispatch_id)
-                        .with_for_update()
-                    )
-                ).scalar_one_or_none()
+                rows = await self._locked_dispatch_batch(db, select(WorkerTaskDispatch).where(WorkerTaskDispatch.id == dispatch_id), skip_locked=False)
+                dispatch = rows[0] if rows else None
                 if dispatch is None:
                     raise RegisteredWorkerEventError(
                         "worker task dispatch is missing"

@@ -110,8 +110,12 @@ async def create_owned_inventory(channel_id: uuid.UUID, data: OwnedSeedInventory
 
 
 @router.get("/channels/{channel_id}/owned-seed-inventories/{inventory_id}")
-async def read_owned_inventory(channel_id: uuid.UUID, inventory_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    return await _inventory_result(db, owned_inventory.read_inventory(db, channel_id, inventory_id))
+async def read_owned_inventory(channel_id: uuid.UUID, inventory_id: uuid.UUID, authorization: str = Header(default=""),
+                               db: AsyncSession = Depends(get_db)):
+    result = await _inventory_result(db, owned_inventory.read_inventory(db, channel_id, inventory_id))
+    if result["manifest"].get("version") == 2:
+        _inventory_operator(authorization)
+    return result
 
 
 @router.post("/channels/{channel_id}/owned-seed-inventories/{inventory_id}/approve")
@@ -275,6 +279,7 @@ async def patch_channel(channel_id: str, data: dict[str, Any], db: AsyncSession 
     channel = await db.get(ChannelProfile, _uuid(channel_id))
     if channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
+    channel = await _inventory_result(db, owned_inventory.lock_history_channel_mutation(db, channel.id))
     for field in (
         "name",
         "positioning",
@@ -335,6 +340,7 @@ async def create_account(channel_id: str, data: PublishingAccountCreate, db: Asy
     channel = (await db.scalars(select(ChannelProfile).where(ChannelProfile.id == _uuid(channel_id)).with_for_update())).one_or_none()
     if channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
+    await _inventory_result(db, owned_inventory.lock_history_channel_mutation(db, channel.id))
     if owned_inventory.is_youtube_platform(data.platform):
         await _inventory_result(db, owned_inventory.assert_account_binding_available(db, data.platform_account_id))
     row = PublishingAccount(channel_profile_id=_uuid(channel_id), **data.model_dump())
@@ -349,6 +355,7 @@ async def patch_account(channel_id: str, account_id: str, data: dict[str, Any], 
     channel = (await db.scalars(select(ChannelProfile).where(ChannelProfile.id == _uuid(channel_id)).with_for_update())).one_or_none()
     if channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
+    await _inventory_result(db, owned_inventory.lock_history_channel_mutation(db, channel.id))
     account = await db.get(PublishingAccount, _uuid(account_id))
     if account is None or account.channel_profile_id != channel.id:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -469,6 +476,7 @@ async def enqueue_tick(channel_id: str, db: AsyncSession = Depends(get_db)):
 @router.patch("/channels/{channel_id}/dry-run")
 async def patch_dry_run(channel_id: str, data: DryRunPatch, db: AsyncSession = Depends(get_db)):
     channel = await _require_channel(db, channel_id)
+    channel = await _inventory_result(db, owned_inventory.lock_history_channel_mutation(db, channel.id))
     channel.dry_run = data.dry_run
     channel.config_version += 1
     await db.commit()
@@ -479,6 +487,7 @@ async def patch_dry_run(channel_id: str, data: DryRunPatch, db: AsyncSession = D
 @router.post("/channels/{channel_id}/halt")
 async def halt_channel(channel_id: str, data: HaltRequest, db: AsyncSession = Depends(get_db)):
     channel = await _require_channel(db, channel_id)
+    channel = await _inventory_result(db, owned_inventory.lock_history_channel_mutation(db, channel.id))
     channel.halted_at = datetime.now(timezone.utc)
     channel.halt_reason = data.reason
     await db.commit()
@@ -489,6 +498,7 @@ async def halt_channel(channel_id: str, data: HaltRequest, db: AsyncSession = De
 @router.post("/channels/{channel_id}/resume")
 async def resume_channel(channel_id: str, db: AsyncSession = Depends(get_db)):
     channel = await _require_channel(db, channel_id)
+    channel = await _inventory_result(db, owned_inventory.lock_history_channel_mutation(db, channel.id))
     channel.halted_at = None
     channel.halt_reason = None
     await db.commit()
@@ -732,6 +742,7 @@ async def pause_account(account_id: str, data: PauseRequest, db: AsyncSession = 
     account = await db.get(PublishingAccount, _uuid(account_id))
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
+    account = await _inventory_result(db, owned_inventory.lock_history_account_mutation(db, account.id))
     account.enabled = False
     account.paused_until = data.until
     await db.commit()
@@ -744,6 +755,7 @@ async def resume_account(account_id: str, db: AsyncSession = Depends(get_db)):
     account = await db.get(PublishingAccount, _uuid(account_id))
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
+    account = await _inventory_result(db, owned_inventory.lock_history_account_mutation(db, account.id))
     account.enabled = True
     account.paused_until = None
     await db.commit()

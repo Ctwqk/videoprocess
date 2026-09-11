@@ -4,7 +4,7 @@ import copy
 import hashlib
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +17,7 @@ from app.channel_agent import clients
 from app.models.channel_agent import ChannelProfile, PublishingAccount, ManualSeed
 from app.models.owned_seed_inventory import OwnedSeedInventory, OwnedSeedInventoryItem
 from app.models.schedule import RuntimeSchedule
+from app.models.asset import Asset
 from app.schemas import channel_agent as schemas
 from app.services import owned_seed_inventory as service
 from app.services import owned_seed_inventory_history as history
@@ -77,6 +78,8 @@ async def history_env(inventory_env, monkeypatch):
             return [remap(item) for item in value]
         return identities.get(value, value) if isinstance(value, str) else value
     rows = remap(fixture["rows"])
+    for job in rows["jobs"]:
+        job.setdefault("parent_job_id", None)
     rows["owned_seed_inventories"] = []
     old_account = rows["publishing_accounts"][0]
     old_channel = rows["channel_profiles"][0]
@@ -84,7 +87,6 @@ async def history_env(inventory_env, monkeypatch):
     async with env.factory() as db:
         connection = await db.connection()
         await connection.run_sync(lambda sync: RuntimeSchedule.__table__.create(sync, checkfirst=True))
-        db.add(RuntimeSchedule(service_name="videoprocess", state="CLOSED"))
         db.add(ChannelProfile(id=uuid.UUID(old_channel["id"]), name="Historical channel", dry_run=False))
         db.add(PublishingAccount(id=uuid.UUID(old_account["id"]), channel_profile_id=uuid.UUID(old_channel["id"]),
                                 account_label="Historical account", platform_account_id="", default_privacy="unlisted"))
@@ -93,6 +95,7 @@ async def history_env(inventory_env, monkeypatch):
 
     async def snapshot(db, *, platform_channel_id):
         active_transactions[:] = [db]
+        controls.db = db
         current = copy.deepcopy(rows)
         for model in (OwnedSeedInventory, OwnedSeedInventoryItem, ChannelProfile, PublishingAccount, RuntimeSchedule):
             values = list((await db.scalars(select(model))).all())
@@ -240,3 +243,145 @@ async def test_v2_ambiguous_global_manager_identity_blocks_before_http(history_e
     response = await h.env.client.post(h.env.url, json=h.data)
     assert response.status_code == 409
     assert h.requests == []
+
+
+@pytest.mark.parametrize("phase", ["create", "approve"])
+@pytest.mark.parametrize("seconds", [-1, 61])
+async def test_v2_platform_reads_keep_the_original_database_freshness_bound(history_env, phase, seconds):
+    h = history_env
+    result = None
+    if phase == "approve":
+        created = await h.env.client.post(h.env.url, json=h.data)
+        assert created.status_code == 200
+        result = created.json()
+    async def elapsed():
+        h.controls.on_get = None
+        h.controls.observed_at += timedelta(seconds=seconds)
+    h.controls.on_get = elapsed
+    response = await h.env.client.post(h.env.url if result is None else f"{h.env.url}/{result['id']}/approve",
+        json=h.data if result is None else approval(result))
+    assert response.status_code == 409 and response.json()["detail"] == "owned_inventory_history_observation_stale"
+    async with h.env.factory() as db:
+        rows = (await db.scalars(select(OwnedSeedInventory))).all()
+        assert len(rows) == (0 if result is None else 1)
+        assert all(row.approved_at is None for row in rows)
+
+
+@pytest.fixture
+async def retirement_env(history_env, monkeypatch):
+    h = history_env
+    fixture = json.loads((Path(__file__).parents[1] / "fixtures/owned_seed_inventory_history/retired_unassigned.json").read_text())
+    source = fixture["rows"]["assets"][0]
+    old_id, new_id = source["id"], str(uuid.uuid4())
+    fixture = json.loads(json.dumps(fixture).replace(old_id, new_id))
+    rows = fixture["rows"]
+    rows["owned_seed_inventories"] = []
+    for table, records in rows.items():
+        h.rows[table].extend(records)
+    channel = rows["channel_profiles"][0]
+    account = rows["publishing_accounts"][0]
+    asset = rows["assets"][0]
+    async with h.env.factory() as db:
+        db.add(ChannelProfile(id=uuid.UUID(channel["id"]), name="Retired channel", enabled=False,
+            halted_at=datetime.fromisoformat(channel["halted_at"]), halt_reason=channel["halt_reason"],
+            intake_paused_at=datetime.fromisoformat(channel["intake_paused_at"])))
+        db.add(PublishingAccount(id=uuid.UUID(account["id"]), channel_profile_id=uuid.UUID(channel["id"]),
+            account_label="Retired account", platform_account_id="", default_privacy="unlisted"))
+        db.add(Asset(id=uuid.UUID(asset["id"]), filename=asset["filename"], original_name=asset["original_name"],
+            mime_type=asset["mime_type"], file_size=asset["file_size"], storage_backend=asset["storage_backend"],
+            storage_path=asset["storage_path"], media_info=asset["media_info"]))
+        await db.commit()
+    h.env.storage.blobs[asset["storage_path"]] = b"a" * asset["file_size"]
+    h.data["history_locators"]["retired_unassigned_preupload"] = {"operation_id": history.RETIRED_TUPLE[0],
+        "legacy_account_id": account["id"], "legacy_channel_profile_id": channel["id"]}
+    markers = {"vp:worker-task-dispatch:" + row["dispatch_key"]: row["redis_message_id"] for row in rows["worker_task_dispatches"]}
+    calls = []
+    h.controls.redis_pending = False
+    class Redis:
+        async def get(self, key):
+            assert not h.controls.db.in_transaction()
+            calls.append(("get", key))
+            return markers[key]
+        async def xpending_range(self, *args):
+            assert not h.controls.db.in_transaction()
+            calls.append(("pending", args))
+            return [{}] if h.controls.redis_pending else []
+        async def aclose(self):
+            calls.append(("close",))
+    monkeypatch.setattr(service, "_history_redis", lambda: Redis())
+    h.redis_calls = calls
+    return h
+
+
+async def test_v2_retirement_draft_and_approval_use_fresh_native_evidence_without_activation(retirement_env):
+    h = retirement_env
+    created = await h.env.client.post(h.env.url, json=h.data)
+    assert created.status_code == 200, created.text
+    result = created.json()
+    certificate = result["manifest"]["legacy_history"]["retired_unassigned_preupload"]
+    assert certificate["retained_facts"]["account"]["platform_account_id"] == ""
+    assert h.redis_calls[-1] == ("close",)
+    h.controls.observed_at = h.controls.observed_at.replace(microsecond=1)
+    denied = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
+    assert denied.status_code == 409 and denied.json()["detail"] == "owned_inventory_v2_activation_disabled", denied.text
+    h.controls.redis_pending = True
+    changed = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
+    assert changed.status_code == 409 and changed.json()["detail"] == "owned_inventory_retirement_pending"
+    reread = await h.env.client.get(f"{h.env.url}/{result['id']}")
+    assert reread.json()["manifest_sha256"] == result["manifest_sha256"] and reread.json()["approved_at"] is None
+
+
+async def test_v2_complete_retained_certificate_read_requires_existing_operator_auth(retirement_env):
+    h = retirement_env
+    created = await h.env.client.post(h.env.url, json=h.data)
+    assert created.status_code == 200, created.text
+    response = await h.env.client.get(f"{h.env.url}/{created.json()['id']}", headers={"Authorization": ""})
+    assert response.status_code == 403 and "retained_facts" not in response.text
+
+
+@pytest.mark.parametrize("action", ["patch_identity", "patch_enabled", "resume_account", "resume_channel", "pause_account", "channel_enabled", "new_account", "dry_run", "halt"])
+async def test_approved_history_only_producers_cannot_be_rebound_or_reactivated(history_env, action):
+    h = history_env
+    created = await h.env.client.post(h.env.url, json=h.data)
+    assert created.status_code == 200, created.text
+    # Explicit prequalified fixture authority only; production v2 approval stays disabled.
+    async with h.env.factory() as db:
+        row = await db.get(OwnedSeedInventory, uuid.UUID(created.json()["id"]))
+        row.approved_at, row.approved_by, row.approval_reference, row.state = h.observed_at, "test-operator", "fixture:approved", "revoked"
+        await db.commit()
+    locator = h.data["history_locators"]["operations"][0]
+    base = "/api/v1/channel-agent"
+    if action.startswith("patch"):
+        payload = {"platform_account_id": "UC" + "z" * 22} if action == "patch_identity" else {"enabled": True}
+        response = await h.env.client.patch(f"{base}/channels/{locator['legacy_channel_profile_id']}/accounts/{locator['legacy_account_id']}", json=payload)
+    elif action == "resume_channel":
+        response = await h.env.client.post(f"{base}/channels/{locator['legacy_channel_profile_id']}/resume")
+    elif action == "channel_enabled":
+        response = await h.env.client.patch(f"{base}/channels/{locator['legacy_channel_profile_id']}", json={"enabled": True})
+    elif action == "new_account":
+        response = await h.env.client.post(f"{base}/channels/{locator['legacy_channel_profile_id']}/accounts", json={"account_label": "new"})
+    elif action == "dry_run":
+        response = await h.env.client.patch(f"{base}/channels/{locator['legacy_channel_profile_id']}/dry-run", json={"dry_run": False})
+    elif action == "halt":
+        response = await h.env.client.post(f"{base}/channels/{locator['legacy_channel_profile_id']}/halt", json={"reason": "changed"})
+    else:
+        command = "pause" if action == "pause_account" else "resume"
+        response = await h.env.client.post(f"{base}/accounts/{locator['legacy_account_id']}/{command}", json={})
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "owned_inventory_historical_producer_pinned"
+
+
+async def test_retired_source_asset_stays_pinned_after_revocation(retirement_env):
+    h = retirement_env
+    created = await h.env.client.post(h.env.url, json=h.data)
+    assert created.status_code == 200, created.text
+    result = created.json()
+    async with h.env.factory() as db:
+        row = await db.get(OwnedSeedInventory, uuid.UUID(result["id"]))
+        row.approved_at, row.approved_by, row.approval_reference, row.state = h.observed_at, "test-operator", "fixture:approved", "revoked"
+        await db.commit()
+    source = result["manifest"]["legacy_history"]["retired_unassigned_preupload"]["retained_facts"]["source_assets"][0]["asset"]
+    response = await h.env.client.delete(f"/api/v1/assets/{source['id']}")
+    assert response.status_code == 409 and response.json()["detail"] == "owned_inventory_asset_pinned"
+    async with h.env.factory() as db:
+        assert await db.get(Asset, uuid.UUID(source["id"])) is not None

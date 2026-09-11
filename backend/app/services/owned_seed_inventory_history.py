@@ -878,21 +878,21 @@ def _approved_authority(rows: dict, now: datetime) -> tuple[dict[str, HistoryOnl
     return bindings, certificate, authority
 
 
-def _terminal_graph(rows: dict, cert: RetiredPreuploadCertificate) -> dict:
+def _terminal_graph(rows: dict, *, job_id: str, upload_node_id: str, task_id: str, legacy_channel_profile_id: str) -> dict:
     """Close over identities in both directions, including inconsistent/orphan links."""
     graph: dict[str, list[dict]] = {name: [] for name in TERMINAL_TABLES}
-    nodes = [n for n in rows["node_executions"] if n["job_id"] == cert.job_id or n["id"] == cert.upload_node_id]
+    nodes = [n for n in rows["node_executions"] if n["job_id"] == job_id or n["id"] == upload_node_id]
     node_ids = {n["id"] for n in nodes}
     graph["node_executions"] = nodes
     artifact_ids = {a for n in nodes for a in (n.get("input_artifact_ids") or [])} | {n.get("output_artifact_id") for n in nodes}
-    graph["artifacts"] = [a for a in rows["artifacts"] if a["job_id"] == cert.job_id or a["id"] in artifact_ids]
+    graph["artifacts"] = [a for a in rows["artifacts"] if a["job_id"] == job_id or a["id"] in artifact_ids]
     linked_attestations: set[str] = set()
     linked_receipts: set[str] = set()
     linked_dispatches: set[str] = set()
     while True:
         old = (frozenset(linked_attestations), frozenset(linked_receipts), frozenset(linked_dispatches))
         for table in ("worker_task_dispatches", "worker_task_delivery_attestations", "worker_event_emissions", "registered_worker_event_receipts"):
-            graph[table] = [r for r in rows[table] if r.get("job_id") == cert.job_id or r.get("node_execution_id") in node_ids or
+            graph[table] = [r for r in rows[table] if r.get("job_id") == job_id or r.get("node_execution_id") in node_ids or
                 r.get("source_task_attestation_id") in linked_attestations or r.get("dispatch_key") in linked_dispatches or
                 r.get("origin_receipt_id") in linked_receipts or r["id"] in linked_receipts or
                 r.get("payload_json", {}).get("task_dispatch_key") in linked_dispatches]
@@ -916,11 +916,11 @@ def _terminal_graph(rows: dict, cert: RetiredPreuploadCertificate) -> dict:
     graph["worker_admission_grants"] = [r for r in rows["worker_admission_grants"] if r["id"] in grant_ids]
     _require({r["id"] for r in graph["worker_admission_grants"]} == grant_ids, "owned_history_retired_orphan")
     graph["legacy_worker_event_resolutions"] = [r for r in rows["legacy_worker_event_resolutions"] if
-        r["job_id"] == cert.job_id or r["node_execution_id"] in node_ids or
+        r["job_id"] == job_id or r["node_execution_id"] in node_ids or
         (r["redis_stream"], r["consumer_group"], r["message_id"]) in event_identities]
     graph["channel_ops_queue_items"] = [r for r in rows["channel_ops_queue_items"] if
-        r.get("channel_profile_id") == cert.legacy_channel_profile_id or
-        r.get("payload_json", {}).get("production_task_id") == cert.task_id or r.get("payload_json", {}).get("job_id") == cert.job_id]
+        r.get("channel_profile_id") == legacy_channel_profile_id or
+        r.get("payload_json", {}).get("production_task_id") == task_id or r.get("payload_json", {}).get("job_id") == job_id]
     source_ids = {r["id"] for r in graph["worker_task_dispatches"] + graph["worker_event_emissions"]}
     for name in ("worker_redis_marker_cleanup_authorizations", "worker_redis_marker_repair_audits"):
         graph[name] = [r for r in rows[name] if r["source_id"] in source_ids]
@@ -1062,7 +1062,8 @@ def _assess_retired(rows: dict, cert: RetiredPreuploadCertificate, snapshot: Own
              not any(t["id"] != task["id"] and (t["target_account_id"] == account["id"] or t["channel_profile_id"] == channel["id"] or
                      t.get("job_id") == job["id"]) for t in rows["production_tasks"]) and
              not any(s.get("guarded_job_id") == job["id"] for s in rows["runtime_schedules"]), reason)
-    graph = _terminal_graph(rows, cert)
+    graph = _terminal_graph(rows, job_id=cert.job_id, upload_node_id=cert.upload_node_id,
+                            task_id=cert.task_id, legacy_channel_profile_id=cert.legacy_channel_profile_id)
     TerminalGraph.parse(graph)
     _require(_terminal_projection(graph) == _terminal_projection(cert.terminal_graph.as_dict()), reason)
     _require(not graph["legacy_worker_event_resolutions"], "owned_history_retired_unsupported_legacy_resolution")

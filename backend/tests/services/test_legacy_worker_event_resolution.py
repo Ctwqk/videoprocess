@@ -434,11 +434,11 @@ async def test_apply_rechecks_payload_after_archive_before_ack(
     payload, message_id = await seed_terminal_event(resolution_db)
     redis = FakeRedis({message_id: payload})
 
-    def mutate_on_second_read(call_count: int):
-        if call_count == 2:
+    def mutate_after_archive(call_count: int):
+        if call_count == 3:
             redis.entries[message_id] = dict(payload, error="changed after archive")
 
-    redis.before_xrange = mutate_on_second_read
+    redis.before_xrange = mutate_after_archive
 
     with pytest.raises(LegacyEventResolutionError, match="payload hash"):
         await resolve_legacy_worker_events(

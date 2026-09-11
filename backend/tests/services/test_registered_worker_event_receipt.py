@@ -11,6 +11,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.models.channel_agent import ChannelProfile, ProductionTask
+from app.models.schedule import RuntimeSchedule
 from app.models.registered_worker_event_receipt import (
     RegisteredWorkerEventDelivery,
     RegisteredWorkerEventReceipt,
@@ -33,6 +35,8 @@ async def receipt_session_factory(tmp_path):
         json_serializer=lambda value: json.dumps(value, default=str),
     )
     async with engine.begin() as connection:
+        for model in (ChannelProfile, ProductionTask, RuntimeSchedule):
+            await connection.run_sync(model.__table__.create)
         await connection.run_sync(Job.__table__.create)
         await connection.run_sync(NodeExecution.__table__.create)
         await connection.run_sync(
