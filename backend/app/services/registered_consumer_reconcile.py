@@ -345,6 +345,9 @@ def validate_deployment(
 
 
 def _same(actual: object, expected: object) -> bool:
+    # Native asyncpg UUIDs preserve UUID values but have a distinct concrete type.
+    if isinstance(expected, UUID):
+        return isinstance(actual, UUID) and actual.int == expected.int
     # bool == 1 must not make malformed facts into a valid epoch/generation.
     return type(actual) is type(expected) and actual == expected
 
@@ -447,7 +450,8 @@ def validate_database(
     )
     _require(
         all(
-            type(row.id) is UUID and row.service_name in _CONTRACTS for row in all_rows
+            isinstance(row.id, UUID) and row.service_name in _CONTRACTS
+            for row in all_rows
         ),
         "database_scope_invalid",
     )
@@ -500,7 +504,7 @@ def validate_database(
                     and grant.state == "revoked"
                     and _revoked(row, now)
                     and _revoked(grant, now)
-                    and row.superseded_by == worker.current.registration_id,
+                    and _same(row.superseded_by, worker.current.registration_id),
                     "predecessor_not_superseded",
                 )
                 if row.lease_expires_at > now:

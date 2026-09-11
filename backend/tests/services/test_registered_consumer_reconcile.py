@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -373,6 +374,62 @@ def test_every_grant_binding_is_pinned(old, field, value):
         assess(rows=rows)
 
 
+@pytest.mark.parametrize("old", [False, True])
+@pytest.mark.parametrize(
+    "table,field", [(0, "id"), (1, "id"), (0, "grant_id"), (0, "worker_instance_id")]
+)
+def test_same_value_native_asyncpg_uuid_facts_remain_eligible(old, table, field):
+    from asyncpg.pgproto.pgproto import UUID as NativeUUID
+
+    rows = facts(document())
+    row = rows[table][int(old)]
+    setattr(row, field, NativeUUID(str(getattr(row, field))))
+    assert assess(rows=rows).outcome == "ready"
+
+
+@pytest.mark.parametrize("old", [False, True])
+@pytest.mark.parametrize(
+    "table,field", [(0, "id"), (1, "id"), (0, "grant_id"), (0, "worker_instance_id")]
+)
+@pytest.mark.parametrize("variant", ["changed_native", "string", "boolean"])
+def test_uuid_fact_compatibility_does_not_accept_changed_or_coerced_values(
+    old,
+    table,
+    field,
+    variant,
+):
+    from asyncpg.pgproto.pgproto import UUID as NativeUUID
+
+    rows = facts(document())
+    row = rows[table][int(old)]
+    value = {
+        "changed_native": NativeUUID(str(UUID(int=999))),
+        "string": str(getattr(row, field)),
+        "boolean": True,
+    }[variant]
+    setattr(row, field, value)
+    with pytest.raises(reconcile.ReconcileRefused):
+        assess(rows=rows)
+
+
+def test_complete_native_uuid_snapshot_preserves_exact_supersession():
+    from asyncpg.pgproto.pgproto import UUID as NativeUUID
+
+    rows = facts(document())
+    for registration in rows[0]:
+        for field in ("id", "grant_id", "worker_instance_id", "superseded_by"):
+            value = getattr(registration, field)
+            if value is not None:
+                setattr(registration, field, NativeUUID(str(value)))
+    for grant in rows[1]:
+        grant.id = NativeUUID(str(grant.id))
+    assert assess(rows=rows).outcome == "ready"
+    for value in (NativeUUID(str(UUID(int=999))), str(rows[0][0].id), True):
+        rows[0][1].superseded_by = value
+        with pytest.raises(reconcile.ReconcileRefused):
+            assess(rows=rows)
+
+
 @pytest.mark.parametrize(
     "old,table,field,value",
     [
@@ -673,7 +730,121 @@ def test_lua_has_only_fixed_metadata_commands_and_no_vision_or_event_key():
 
 
 @pytest.fixture
-async def isolated_redis_lag_race():
+def loop_bound_redis_boundary(monkeypatch):
+    """Fake only Redis I/O and the long wait; exercise the actual fixture runner."""
+    import asyncio
+
+    from redis.asyncio import Redis
+
+    events = []
+    url = "redis://127.0.0.1:1/15"
+
+    class LoopBoundRedis:
+        def __init__(self):
+            self.loop = asyncio.get_running_loop()
+
+        def record(self, event):
+            assert asyncio.get_running_loop() is self.loop, "Redis client crossed loops"
+            events.append(event)
+
+        async def exists(self, *keys):
+            self.record("setup")
+            assert keys == (
+                "vp:tasks:ffmpeg_go",
+                "vp:tasks:ffmpeg",
+                "vp:tasks:youtube_publisher",
+            )
+            return 0
+
+        async def info(self, section):
+            assert section == "server"
+            return {"redis_version": "7.4.7"}
+
+        async def xadd(self, stream, fields):
+            assert (stream, fields) == ("vp:tasks:ffmpeg_go", {"fixture": "seed"})
+            return "1-0"
+
+        async def xgroup_create(self, stream, group, *, id):
+            assert (stream, group, id) == (
+                "vp:tasks:ffmpeg_go",
+                "ffmpeg_go-workers",
+                "$",
+            )
+
+        async def xgroup_createconsumer(self, stream, group, consumer):
+            self.record("consumer")
+            assert (stream, group) == ("vp:tasks:ffmpeg_go", "ffmpeg_go-workers")
+            assert consumer in {
+                identity(0)["redis_consumer_id"],
+                identity(0, old=True)["redis_consumer_id"],
+            }
+
+        async def xinfo_consumers(self, stream, group):
+            self.record("body")
+            assert (stream, group) == ("vp:tasks:ffmpeg_go", "ffmpeg_go-workers")
+            return []
+
+        async def delete(self, stream):
+            self.record("cleanup")
+            assert stream == "vp:tasks:ffmpeg_go"
+
+        async def aclose(self):
+            self.record("closed")
+
+    def from_url(actual_url, *, decode_responses):
+        assert actual_url == url and decode_responses is True
+        return LoopBoundRedis()
+
+    async def skip_natural_wait(delay):
+        assert delay == 120.1
+        events.append("wait")
+
+    monkeypatch.setenv("REGISTERED_RECONCILE_REDIS_TEST_URL", url)
+    monkeypatch.setenv(
+        "REGISTERED_RECONCILE_REDIS_TEST_CONFIRM", "disposable-fixed-stream-db15"
+    )
+    monkeypatch.setattr(Redis, "from_url", from_url)
+    monkeypatch.setattr(asyncio, "sleep", skip_natural_wait)
+    return events
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("body_fails", [False, True])
+async def test_isolated_redis_fixture_keeps_setup_body_cleanup_on_one_loop(
+    loop_bound_redis_boundary,
+    isolated_redis_lag_race,
+    body_fails,
+):
+    expected = (
+        pytest.raises(RuntimeError, match="test body failure")
+        if body_fails
+        else nullcontext()
+    )
+    with expected:
+        async with isolated_redis_lag_race() as (client, stream, group):
+            await client.xinfo_consumers(stream, group)
+            if body_fails:
+                raise RuntimeError("test body failure")
+    assert loop_bound_redis_boundary == [
+        "setup",
+        "consumer",
+        "wait",
+        "consumer",
+        "body",
+        "cleanup",
+        "closed",
+    ]
+
+
+@pytest.fixture
+def isolated_redis_lag_race():
+    # A sync factory keeps creation through cleanup in the test's own loop,
+    # regardless of pytest-asyncio auto mode and AnyIO's independent runner.
+    return _isolated_redis_lag_race
+
+
+@asynccontextmanager
+async def _isolated_redis_lag_race():
     """Parent-only opt-in. Fixed production keys need an empty disposable DB.
 
     No default URL, flush, server setup or threshold override. Unit 1 delivery
@@ -736,33 +907,37 @@ async def test_real_redis_lag_only_xadd_after_observation_is_not_zero_backlog(
 ):
     from redis.exceptions import ResponseError
 
-    client, stream, group = isolated_redis_lag_race
-    inventory = inventories(document())
-    before_consumers = await client.xinfo_consumers(stream, group)
-    before_group = next(
-        item for item in await client.xinfo_groups(stream) if item["name"] == group
-    )
-    assert before_group["lag"] == 0
-    inventory[TOPOLOGY[0][0]] = {
-        "stream": stream,
-        "group": group,
-        "pending": (await client.xpending(stream, group))["pending"],
-        "lag": before_group["lag"],
-        "consumers": before_consumers,
-    }
-    command = assess(inventory=inventory).commands[0]
-    # Distinct from the PEL race: no XREADGROUP occurs after this append.
-    await client.xadd(stream, {"fixture": "lag-only-race"})
-    assert (await client.xpending(stream, group))["pending"] == 0
-    assert (
-        next(
+    async with isolated_redis_lag_race() as (client, stream, group):
+        inventory = inventories(document())
+        before_consumers = await client.xinfo_consumers(stream, group)
+        before_group = next(
             item for item in await client.xinfo_groups(stream) if item["name"] == group
-        )["lag"]
-        == 1
-    )
-    with pytest.raises(ResponseError, match="registered_reconcile_backlog"):
-        await client.execute_command(*command.arguments)
-    assert {item["name"] for item in await client.xinfo_consumers(stream, group)} == {
-        identity(0)["redis_consumer_id"],
-        identity(0, old=True)["redis_consumer_id"],
-    }
+        )
+        assert before_group["lag"] == 0
+        inventory[TOPOLOGY[0][0]] = {
+            "stream": stream,
+            "group": group,
+            "pending": (await client.xpending(stream, group))["pending"],
+            "lag": before_group["lag"],
+            "consumers": before_consumers,
+        }
+        command = assess(inventory=inventory).commands[0]
+        # Distinct from the PEL race: no XREADGROUP occurs after this append.
+        await client.xadd(stream, {"fixture": "lag-only-race"})
+        assert (await client.xpending(stream, group))["pending"] == 0
+        assert (
+            next(
+                item
+                for item in await client.xinfo_groups(stream)
+                if item["name"] == group
+            )["lag"]
+            == 1
+        )
+        with pytest.raises(ResponseError, match="registered_reconcile_backlog"):
+            await client.execute_command(*command.arguments)
+        assert {
+            item["name"] for item in await client.xinfo_consumers(stream, group)
+        } == {
+            identity(0)["redis_consumer_id"],
+            identity(0, old=True)["redis_consumer_id"],
+        }
