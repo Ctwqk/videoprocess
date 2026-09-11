@@ -90,6 +90,7 @@ class IntermediateArtifactCacheService:
         node_type: str,
         node_config: dict[str, Any],
         input_artifacts: Mapping[str, Artifact],
+        registered: bool = False,
     ) -> IntermediateArtifactCache | None:
         if not self.is_cache_eligible(node_type, node_config, input_artifacts.keys()):
             return None
@@ -98,6 +99,8 @@ class IntermediateArtifactCacheService:
             await db.execute(select(IntermediateArtifactCache).where(IntermediateArtifactCache.cache_key == cache_key))
         ).scalar_one_or_none()
         if entry is None:
+            return None
+        if registered and (not entry.storage_backend or not entry.storage_path or not entry.filename):
             return None
         if entry.output_artifact_id is not None:
             output_artifact = await db.get(

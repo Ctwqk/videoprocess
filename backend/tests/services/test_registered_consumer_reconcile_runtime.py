@@ -897,13 +897,13 @@ def test_guard_migration_is_the_executable_local_head_and_operator_only():
     config.set_main_option("script_location", str(root / "alembic"))
     assert (
         ScriptDirectory.from_config(config).get_current_head()
-        == "037_registered_consumer_guard"
+        == "039_registered_consumer_guard"
     )
-    assert EXPECTED_MIGRATION_HEAD == "037_registered_consumer_guard"
+    assert EXPECTED_MIGRATION_HEAD == "039_registered_consumer_guard"
     migration = runpy.run_path(
-        str(root / "alembic/versions/037_registered_consumer_guard.py")
+        str(root / "alembic/versions/039_registered_consumer_guard.py")
     )
-    assert migration["down_revision"] == "036_worker_session_signal"
+    assert migration["down_revision"] == "038_owned_seed_inventory"
     signature = "vp_registered_consumer_reconcile_guard(text,uuid[],uuid[])"
     assert signature in ROLE_FUNCTIONS["operator"]
     assert all(

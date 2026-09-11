@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db import async_session
+from app.orchestrator.registered_db import registered_session
 from app.models.asset import Asset
 from app.models.artifact import Artifact, ArtifactKind
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
@@ -41,6 +42,7 @@ from app.services.registered_worker_event_receipt import (
     RegisteredWorkerEventReceiptService,
     stage_worker_task_dispatch,
 )
+from app.services.registered_worker_retry import release_registered_retry_claim
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +50,7 @@ TASK_STREAM = "vp:tasks:{worker_type}"
 EVENT_STREAM = "vp:events"
 CONSUMER_GROUP = "orchestrator"
 CONSUMER_NAME = "orchestrator-1"
-_worker_task_dispatches = RegisteredWorkerEventReceiptService(async_session)
+_worker_task_dispatches = RegisteredWorkerEventReceiptService(registered_session)
 
 
 def _require_receipt_entrypoint_for_registered_claim(
@@ -534,15 +536,27 @@ class JobEngine:
         job: Job,
         ne: NodeExecution,
         input_artifacts: dict[str, Artifact],
+        *,
+        registered: bool = False,
     ) -> bool:
+        if registered and (
+            ne.status != NodeStatus.PENDING
+            or any(value is not None for value in (
+                ne.worker_id, ne.worker_registration_id, ne.worker_lease_epoch, ne.started_at,
+            ))
+        ):
+            raise RegisteredWorkerEventError("registered cache node authority changed")
         try:
             entry = await self.artifact_cache.lookup(
                 db,
                 node_type=ne.node_type,
                 node_config=ne.node_config or {},
                 input_artifacts=input_artifacts,
+                **({"registered": True} if registered else {}),
             )
         except Exception:
+            if registered:
+                raise
             logger.exception("Artifact cache lookup failed for job=%s node=%s", job.id, ne.node_id)
             return False
         if entry is None:
@@ -555,7 +569,8 @@ class JobEngine:
             node_execution_id=ne.id,
         )
         ne.status = NodeStatus.SUCCEEDED
-        ne.started_at = ne.started_at or datetime.utcnow()
+        if not registered:
+            ne.started_at = ne.started_at or datetime.utcnow()
         ne.completed_at = datetime.utcnow()
         ne.progress = 100
         ne.output_artifact_id = cached_artifact.id
@@ -758,6 +773,8 @@ class JobEngine:
                 job,
                 ne,
             )
+            await db.flush()
+            await release_registered_retry_claim(db, receipt.id)
             return
 
         ne.status = NodeStatus.FAILED
@@ -825,6 +842,7 @@ class JobEngine:
                 job,
                 ne,
                 input_objects,
+                registered=True,
             ):
                 progressed = True
                 continue

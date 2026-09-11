@@ -1428,6 +1428,12 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
   exit 1
 fi
 source "$EXTENSION"
+# The registered-runtime shell contract is executed in test_registered_runtime_deploy.py.
+vp_require_autoflow_control_ready() { :; }
+vp_require_selected_autoflow_control_ready() { :; }
+vp_autoflow_tasks() { printf '[]\n'; }
+vp_autoflow_selected_image() { printf 'vp-backend-api:deploy-%s\n' "${TEST_COMMIT:0:12}"; }
+vp_autoflow_runtime_update_args() { VP_AUTOFLOW_RUNTIME_UPDATE_ARGS=$'--env-add\nWORKER_ORCHESTRATOR_CONTROL_GENERATION=fixture'; }
 
 marker_owner_records="$(
   python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \

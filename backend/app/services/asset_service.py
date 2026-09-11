@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.asset import Asset
 from app.storage.manager import get_storage
+from app.services.owned_seed_inventory import assert_asset_deletable
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ async def list_assets(db: AsyncSession, skip: int = 0, limit: int = 50) -> tuple
 
 
 async def delete_asset(db: AsyncSession, asset_id: uuid.UUID) -> bool:
-    asset = await db.get(Asset, asset_id)
+    asset = await assert_asset_deletable(db, asset_id)
     if not asset:
         return False
 

@@ -1,9 +1,7 @@
 """Restricted, non-mutating registered-consumer reconciliation guard.
 
-Revision ID: 037_registered_consumer_guard
-Revises: 036_worker_session_signal
-
-Local branch ordering only. Parent must renumber after ACK/native migrations.
+Revision ID: 039_registered_consumer_guard
+Revises: 038_owned_seed_inventory
 """
 
 from __future__ import annotations
@@ -14,8 +12,8 @@ from pathlib import Path
 from alembic import op
 
 
-revision = "037_registered_consumer_guard"
-down_revision = "036_worker_session_signal"
+revision = "039_registered_consumer_guard"
+down_revision = "038_owned_seed_inventory"
 branch_labels = None
 depends_on = None
 SIGNATURE = "public.vp_registered_consumer_reconcile_guard(text,uuid[],uuid[])"

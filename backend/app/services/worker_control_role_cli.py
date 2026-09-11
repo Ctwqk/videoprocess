@@ -67,6 +67,7 @@ ROLE_FUNCTIONS = {
         "vp_registered_consumer_reconcile_guard(text,uuid[],uuid[])",
     ),
     "orchestrator": (
+        "vp_release_registered_retry_claim(uuid)",
         "vp_observe_worker_lease(uuid,bigint)",
         "vp_observe_worker_task_delivery("
         "uuid,bigint,text,timestamp with time zone,uuid,uuid,"
@@ -359,6 +360,7 @@ ORCHESTRATOR_ENTITY_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "intake_pause_reason",
         "config_version",
         "tick_interval_minutes",
+        "owned_seed_inventory_id",
         "id",
         "created_at",
         "updated_at",

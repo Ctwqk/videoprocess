@@ -80,6 +80,7 @@ type tickPreparation struct {
 	Bucket      string
 	Options     agentTickOptions
 	Now         time.Time
+	Owned       *ownedTickState
 }
 
 func (p tickPreparation) validate(current tickPreparation) error {
@@ -102,6 +103,9 @@ func (s *Store) prepareTick(
 	}
 	if channel.IntakePausedAt != nil {
 		return tickPreparation{}, fmt.Errorf("%w: channel %s intake is paused", ErrChannelExecutionBlocked, channelID)
+	}
+	if channel.OwnedSeedInventoryID != nil {
+		return s.prepareOwnedTick(ctx, channel, bucket, options)
 	}
 	candidates := BuildTickCandidates(channel, lanes, accounts, seeds, signals, laneFormats, bucket)
 	var taskCount int64
@@ -160,6 +164,9 @@ func (s *Store) finalizeTick(
 	)
 	if err != nil {
 		return err
+	}
+	if preparation.Owned != nil || current.Owned != nil {
+		return s.finalizeOwnedTick(ctx, preparation, current, candidates)
 	}
 	if err := preparation.validate(current); err != nil {
 		return err
@@ -283,6 +290,11 @@ func evaluateTickCandidatePolicyWithRevalidation(
 	revalidate func() error,
 ) ([]TickCandidate, []AlertPayload, error) {
 	if h.PDS == nil {
+		for i := range candidates {
+			if candidates[i].owned != nil {
+				rejectCandidate(&candidates[i], "owned_inventory_pds_unavailable", "Owned inventory requires a policy decision.")
+			}
+		}
 		return candidates, nil, nil
 	}
 	alerts := []AlertPayload{}
@@ -293,8 +305,19 @@ func evaluateTickCandidatePolicyWithRevalidation(
 		}
 		if revalidate != nil {
 			if err := revalidate(); err != nil {
+				if candidate.owned != nil {
+					rejectCandidate(candidate, "owned_inventory_inputs_changed", "Owned inventory inputs changed.")
+					continue
+				}
 				return candidates, nil, err
 			}
+		}
+		policyContext := map[string]any{
+			"channel_profile_id": channel.ID, "candidate_id": candidate.CandidateID,
+			"source_kind": candidate.SourceKind, "topic_lane_id": candidateLaneID(*candidate), "lane_format_id": candidateFormatID(*candidate),
+		}
+		if candidate.owned != nil {
+			policyContext["owned_inventory"] = ownedTaskEvidence(*candidate)
 		}
 		decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
 			ActorID:    candidate.Account.ID,
@@ -304,18 +327,19 @@ func evaluateTickCandidatePolicyWithRevalidation(
 				"title":       candidate.TitleSeed,
 				"description": candidate.Prompt,
 			},
-			Context: map[string]any{
-				"channel_profile_id": channel.ID,
-				"candidate_id":       candidate.CandidateID,
-				"source_kind":        candidate.SourceKind,
-				"topic_lane_id":      candidateLaneID(*candidate),
-				"lane_format_id":     candidateFormatID(*candidate),
-			},
+			Context: policyContext,
 		})
 		if err != nil {
+			if candidate.owned != nil {
+				rejectCandidate(candidate, "owned_inventory_pds_unavailable", "Owned inventory policy call failed.")
+				continue
+			}
 			return candidates, nil, err
 		}
 		candidate.PDSDecisionJSON = pdsDecisionAuditJSON(decision)
+		if candidate.owned != nil && (decision.Verdict != "allow" || isPDSFailPolicyDecision(decision)) {
+			rejectCandidate(candidate, "owned_inventory_pds_denied", "Owned inventory requires an explicit allow decision.")
+		}
 		if alert, ok := maybePDSOutageAlert(decision, channel.ID, candidate.CandidateID, "candidate_accept"); ok {
 			alerts = append(alerts, alert)
 		}

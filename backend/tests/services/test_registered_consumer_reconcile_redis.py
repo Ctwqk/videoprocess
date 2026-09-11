@@ -45,6 +45,29 @@ def group(command):
     return f"{command.worker.current.worker_type}-workers"
 
 
+def unknown_lag_fixture_ids(last_delivered_id):
+    milliseconds, sequence = map(int, last_delivered_id.split("-"))
+    return f"{milliseconds}-{sequence + 1}", f"{milliseconds}-{sequence + 2}"
+
+
+@pytest.mark.parametrize(
+    "previous,expected",
+    [
+        ("1789099999999-0", ("1789099999999-1", "1789099999999-2")),
+        ("1789099999999-7", ("1789099999999-8", "1789099999999-9")),
+        ("9007199254740993-41", ("9007199254740993-42", "9007199254740993-43")),
+    ],
+)
+def test_unknown_lag_fixture_ids_leave_an_interior_gap(previous, expected):
+    interior, appended = unknown_lag_fixture_ids(previous)
+    assert (interior, appended) == expected
+    assert (
+        tuple(map(int, previous.split("-")))
+        < tuple(map(int, interior.split("-")))
+        < tuple(map(int, appended.split("-")))
+    )
+
+
 def checked_url(raw, confirmation):
     try:
         url = urlsplit(raw)
@@ -253,18 +276,32 @@ async def test_actual_lua_success_atomic_races_and_restricted_acls(redis_case):
             await case.control.execute_command(*cpu.arguments)
         assert await case.admin.xack(cpu.stream, group(cpu), message) == 1
 
-        # An arbitrary last-delivered ID makes Redis report unknown (nil) lag.
+        # Before-first IDs permit inferred lag. Leave an absent interior ID
+        # between the last ACKed entry and one new fixture-owned entry instead.
         groups = await case.admin.xinfo_groups(cpu.stream)
-        await case.admin.xgroup_setid(cpu.stream, group(cpu), "1-1")
+        interior, appended = unknown_lag_fixture_ids(groups[0]["last-delivered-id"])
+        assert (
+            await case.admin.xadd(
+                cpu.stream, {"fixture": "unknown-lag-gap"}, id=appended
+            )
+            == appended
+        )
+        assert await case.admin.xrange(cpu.stream, min=interior, max=interior) == []
+        await case.admin.xgroup_setid(cpu.stream, group(cpu), interior)
+        assert (await case.admin.xpending(cpu.stream, group(cpu)))["pending"] == 0
         assert (await case.admin.xinfo_groups(cpu.stream))[0]["lag"] is None
         with pytest.raises(ResponseError, match="backlog"):
             await case.control.execute_command(*cpu.arguments)
+        assert cpu.predecessor in await case.names(cpu)
         await case.admin.xgroup_setid(
             cpu.stream,
             group(cpu),
             groups[0]["last-delivered-id"],
             entries_read=groups[0]["entries-read"],
         )
+        await case.drain_fixture_message(cpu, appended)
+        assert (await case.admin.xpending(cpu.stream, group(cpu)))["pending"] == 0
+        assert (await case.admin.xinfo_groups(cpu.stream))[0]["lag"] == 0
 
         await case.admin.xgroup_createconsumer(cpu.stream, group(cpu), "unknown-worker")
         with pytest.raises(ResponseError, match="inventory_changed"):

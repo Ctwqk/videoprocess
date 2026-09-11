@@ -1,6 +1,4 @@
 from __future__ import annotations
-import os
-import shutil
 from pathlib import Path
 from typing import BinaryIO
 
@@ -31,6 +29,15 @@ class LocalStorageBackend(StorageBackend):
         full_path = self._full_path(path)
         async with aiofiles.open(full_path, "rb") as f:
             return await f.read()
+
+    async def read_bounded(self, path: str, max_bytes: int) -> bytes:
+        if type(max_bytes) is not int or max_bytes <= 0:
+            raise ValueError("storage_read_limit_invalid")
+        async with aiofiles.open(self._full_path(path), "rb") as handle:
+            content = await handle.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise ValueError("storage_read_limit_exceeded")
+        return content
 
     async def delete(self, path: str) -> None:
         full_path = self._full_path(path)

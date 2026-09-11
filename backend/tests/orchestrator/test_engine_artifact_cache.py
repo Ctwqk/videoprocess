@@ -134,6 +134,72 @@ async def _seed_job(db, *, node_type: str = "trim"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ownership", [None, "worker_id", "worker_registration_id", "worker_lease_epoch", "started_at"])
+async def test_registered_cache_hit_preserves_null_claim_and_rejects_owned_pending(engine_cache_db_session, ownership):
+    from datetime import datetime
+    from app.services.registered_worker_event_receipt import RegisteredWorkerEventError
+
+    db = engine_cache_db_session
+    job, _, node, source = await _seed_job(db)
+    output = _artifact(job.id, node.id, "cached.mp4")
+    db.add(output)
+    await db.flush()
+    await IntermediateArtifactCacheService().store(
+        db, node_type=node.node_type, node_config=node.node_config,
+        input_artifacts={"input": source}, output_artifact=output,
+        node_id=node.node_id, job_id=job.id,
+    )
+    if ownership:
+        setattr(node, ownership, {"worker_id": "old-worker", "worker_registration_id": uuid.uuid4(), "worker_lease_epoch": 1, "started_at": datetime(2026, 1, 1)}[ownership])
+        with pytest.raises(RegisteredWorkerEventError):
+            await JobEngine()._apply_cached_artifact_uncommitted(db, job, node, {"input": source}, registered=True)
+        assert node.status == NodeStatus.PENDING
+    else:
+        assert await JobEngine()._apply_cached_artifact_uncommitted(db, job, node, {"input": source}, registered=True)
+        await db.flush()
+        assert node.status == NodeStatus.SUCCEEDED and node.started_at is None
+        assert node.worker_id is node.worker_registration_id is node.worker_lease_epoch is None
+
+
+@pytest.mark.asyncio
+async def test_registered_unusable_cache_is_nonmutating_miss(engine_cache_db_session):
+    from sqlalchemy import event
+
+    db = engine_cache_db_session
+    job, _, node, source = await _seed_job(db)
+    cache = IntermediateArtifactCacheService()
+    entry = IntermediateArtifactCache(
+        cache_key=cache.cache_key(node.node_type, node.node_config, {"input": source}),
+        node_type=node.node_type, node_config_hash="a", input_signature_hash="b",
+        output_artifact_id=uuid.uuid4(), storage_path=None,
+    )
+    db.add(entry)
+    await db.commit()
+    statements = []
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+    event.listen(db.bind.sync_engine, "before_cursor_execute", capture)
+    try:
+        assert not await JobEngine()._apply_cached_artifact_uncommitted(db, job, node, {"input": source}, registered=True)
+        await db.flush()
+    finally:
+        event.remove(db.bind.sync_engine, "before_cursor_execute", capture)
+    assert not any(sql.lstrip().upper().startswith(("UPDATE", "DELETE", "INSERT")) for sql in statements)
+    assert await db.get(IntermediateArtifactCache, entry.id) is entry
+
+
+@pytest.mark.asyncio
+async def test_registered_cache_query_failure_is_not_swallowed(engine_cache_db_session):
+    class FailedCache(IntermediateArtifactCacheService):
+        async def lookup(self, *args, **kwargs):
+            raise RuntimeError("transaction aborted")
+    db = engine_cache_db_session
+    job, _, node, source = await _seed_job(db)
+    with pytest.raises(RuntimeError, match="transaction aborted"):
+        await JobEngine(FailedCache())._apply_cached_artifact_uncommitted(db, job, node, {"input": source}, registered=True)
+
+
+@pytest.mark.asyncio
 async def test_cache_hit_marks_node_succeeded_without_redis_dispatch(engine_cache_db_session, monkeypatch):
     fake_redis = FakeRedis()
     monkeypatch.setattr("app.orchestrator.engine._redis", lambda: fake_redis)

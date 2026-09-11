@@ -30,6 +30,7 @@ from app.models.channel_agent import (
     TopicLane,
 )
 from app.models.asset import Asset
+from app.models.owned_seed_inventory import OwnedSeedInventory, OwnedSeedInventoryItem
 from app.models.autoflow import AutoFlowPlan
 
 
@@ -51,6 +52,8 @@ CHANNEL_AGENT_TABLES = (
     FeedbackSnapshot.__table__,
     DecisionAuditEntry.__table__,
     LearningState.__table__,
+    OwnedSeedInventory.__table__,
+    OwnedSeedInventoryItem.__table__,
 )
 
 
@@ -121,6 +124,20 @@ def _app(db_session):
     app.include_router(router)
     app.dependency_overrides[get_db] = lambda: db_session
     return app
+
+
+@pytest.mark.parametrize("platform", ["", "youtube", "x", "bilibili", "xiaohongshu"])
+async def test_ordinary_account_create_and_patch_preserve_provider(api_session, platform):
+    async with AsyncClient(transport=ASGITransport(app=_app(api_session)), base_url="http://test") as client:
+        channel = (await client.post("/api/v1/channel-agent/channels", json={"name": "ordinary"})).json()
+        url = f"/api/v1/channel-agent/channels/{channel['id']}/accounts"
+        created = await client.post(url, json={"account_label": "ordinary", "platform": platform,
+                                               "platform_account_id": "unoccupied-first"})
+        assert created.status_code == 200
+        updated = await client.patch(f"{url}/{created.json()['id']}", json={"platform_account_id": "unoccupied-second"})
+        assert updated.status_code == 200
+        assert updated.json()["platform"] == platform
+        assert updated.json()["platform_account_id"] == "unoccupied-second"
 
 
 @pytest.mark.asyncio

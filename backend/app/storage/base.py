@@ -1,6 +1,5 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import BinaryIO
 
 
@@ -14,6 +13,10 @@ class StorageBackend(ABC):
     async def read(self, path: str) -> bytes:
         """Read file content."""
         ...
+
+    async def read_bounded(self, path: str, max_bytes: int) -> bytes:
+        """Read at most max_bytes, failing without allocating an unbounded blob."""
+        raise NotImplementedError("bounded_storage_read_unsupported")
 
     @abstractmethod
     async def delete(self, path: str) -> None:

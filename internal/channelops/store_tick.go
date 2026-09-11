@@ -13,6 +13,9 @@ func (s *Store) LoadTickInputs(ctx context.Context, channelID string, now time.T
 	if err != nil {
 		return ChannelProfileRow{}, nil, nil, nil, nil, nil, err
 	}
+	if channel.OwnedSeedInventoryID != nil {
+		return channel, nil, nil, nil, nil, nil, nil
+	}
 	lanes, err := s.ListActiveLanes(ctx, channelID, now)
 	if err != nil {
 		return ChannelProfileRow{}, nil, nil, nil, nil, nil, err
@@ -43,7 +46,7 @@ func (s *Store) GetChannelProfile(ctx context.Context, channelID string) (Channe
 		SELECT id, enabled, dry_run, halted_at, intake_paused_at,
 	       tick_interval_minutes, config_version,
 	       risk_policy_json, cadence_policy_json, content_mix_policy_json,
-	       default_aspect_ratio, created_at, updated_at
+	       default_aspect_ratio, created_at, updated_at, owned_seed_inventory_id::text
 	FROM channel_profiles
 	WHERE id = $1::uuid
 	`, channelID).Scan(
@@ -60,6 +63,7 @@ func (s *Store) GetChannelProfile(ctx context.Context, channelID string) (Channe
 		&row.DefaultAspectRatio,
 		&row.CreatedAt,
 		&row.UpdatedAt,
+		&row.OwnedSeedInventoryID,
 	)
 	if err != nil {
 		return ChannelProfileRow{}, err
@@ -454,6 +458,12 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 	if candidate.SourceKind == SourceManualSeed {
 		approvalMode = ApprovalHuman
 	}
+	if candidate.owned != nil {
+		if !s.hasExecutionTransaction() || s.executionChannelID == nil || *s.executionChannelID != channel.ID || channel.OwnedSeedInventoryID == nil || *channel.OwnedSeedInventoryID != candidate.owned.InventoryID {
+			return "", errOwnedInventory
+		}
+		approvalMode = ApprovalAgent
+	}
 	rationale := map[string]any{
 		"candidate_id": candidate.CandidateID,
 		"source_kind":  candidate.SourceKind,
@@ -466,6 +476,15 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 		"source_kind": candidate.SourceKind,
 	}
 	snapshot := channelConfigSnapshot(channel, candidate)
+	approvalEvidence := map[string]any{}
+	if candidate.owned != nil {
+		approvalEvidence["owned_inventory"] = ownedTaskEvidence(candidate)
+		approvalEvidence["candidate_pds"] = candidate.PDSDecisionJSON
+	}
+	approvalJSON, err := json.Marshal(approvalEvidence)
+	if err != nil {
+		return "", err
+	}
 	transition := []map[string]any{Transition("seeded", TaskSelected, "agent_tick", now)}
 
 	rationaleJSON, err := json.Marshal(rationale)
@@ -508,14 +527,14 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 		VALUES (
 			gen_random_uuid(), $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6::uuid, $7, $8, $9,
 			$10::json, $11::json, 'explore', $12::json, $13::json,
-			$14, $15, '{}'::json, '{}'::json, 0.0, $16, $17::timestamptz, 0, $18, $19::json,
+			$14, $15, $21::json, '{}'::json, 0.0, $16, $17::timestamptz, 0, $18, $19::json,
 			$20::json, $17::timestamp, $17::timestamp
 		)
 		RETURNING id
 	`, channel.ID, laneID, formatID, candidate.Account.ID, manualSeedID, discoverySignalID, candidate.Source,
 		candidate.TitleSeed, candidate.Prompt, rationaleJSON, scoreJSON, sourcePlatformsJSON,
 		materialLibraryIDsJSON, usesExternalAssets(candidate), approvalMode, TaskSelected, now.UTC(),
-		channel.ConfigVersion, snapshotJSON, transitionJSON).Scan(&id)
+		channel.ConfigVersion, snapshotJSON, transitionJSON, approvalJSON).Scan(&id)
 	if err != nil {
 		return "", err
 	}
@@ -651,6 +670,9 @@ func channelConfigSnapshot(channel ChannelProfileRow, candidate TickCandidate) m
 			"source_policy":    candidate.Seed.SourcePolicy,
 			"constraints_json": jsonObject(candidate.Seed.ConstraintsJSON),
 		}
+	}
+	if candidate.owned != nil {
+		snapshot["owned_inventory"] = ownedTaskEvidence(candidate)
 	}
 	if candidate.DiscoverySignal != nil {
 		snapshot["discovery_signal"] = map[string]any{

@@ -1,0 +1,657 @@
+{
+  "canonical_vector": {
+    "canonical_ascii": "{\"at\":\"2026-09-11T08:00:00+00:00\",\"float\":1.0,\"nested\":{\"a\":1,\"b\":2},\"small\":1e-07,\"text\":\"\\u4e2d\\u6587\"}",
+    "sha256": "fedecccf8b35019d26a070b55ba90e3d3f384b2ba8d8d503791d0afca9798481",
+    "value": {
+      "at": "2026-09-11T08:00:00+00:00",
+      "float": 1.0,
+      "nested": {
+        "a": 1,
+        "b": 2
+      },
+      "small": 1e-07,
+      "text": "\u4e2d\u6587"
+    }
+  },
+  "contract_version": 1,
+  "expected": {
+    "account_ids": [
+      "00000000-0000-0000-0000-000000000003"
+    ],
+    "authority_sha256": "2acc82da2cd8a91882cf99a83482b5b848d103a1c88255be0f5415e8eda99a7f",
+    "block_reason": null,
+    "classifications": [
+      {
+        "account_id": "00000000-0000-0000-0000-000000000003",
+        "classification": "history_only",
+        "operation_id": "00000000-0000-0000-0000-000000000007",
+        "platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "completed_item_ids": [],
+    "retired_render_sha256": [],
+    "retired_source_sha256": [],
+    "stable_history_sha256": "dc13ea5b18ba85666adbc02549df9bd2376ea3cafc780461286224ea65f46fcf",
+    "terminal_paths": [],
+    "wait_reason": null
+  },
+  "note": "Offline synthetic graph; no live qualification or approved production facts.",
+  "now": "2026-09-11T08:00:00+00:00",
+  "observed_at": "2026-09-11T08:00:00+00:00",
+  "platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+  "redis_observations": [],
+  "rows": {
+    "artifacts": [
+      {
+        "id": "00000000-0000-0000-0000-000000000009",
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "media_info": {},
+        "node_execution_id": "00000000-0000-0000-0000-000000000012"
+      },
+      {
+        "id": "00000000-0000-0000-0000-000000000011",
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "media_info": {
+          "youtube": {
+            "privacy": "unlisted",
+            "quota_estimate": 1600,
+            "tags": [],
+            "title": "owned",
+            "url": "https://www.youtube.com/watch?v=abcdefghijk",
+            "video_id": "abcdefghijk"
+          }
+        },
+        "node_execution_id": "00000000-0000-0000-0000-000000000008"
+      }
+    ],
+    "assets": [],
+    "channel_ops_queue_items": [
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000014",
+        "idempotency_key": "promote_publication:00000000-0000-0000-0000-000000000013",
+        "kind": "promote_publication",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": null,
+        "payload_json": {
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "target_visibility": "unlisted"
+        },
+        "run_after": "2026-09-10T07:00:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000015",
+        "idempotency_key": "reconcile_publication:00000000-0000-0000-0000-000000000013:2026-09-10T07:00:00Z",
+        "kind": "reconcile_publication",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "publication_id": "00000000-0000-0000-0000-000000000013"
+        },
+        "run_after": "2026-09-10T07:30:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000030",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:1h:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000020",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "1h"
+        },
+        "run_after": "2026-09-10T08:00:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000031",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:6h:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000021",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "6h"
+        },
+        "run_after": "2026-09-10T13:00:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000032",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:24h:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000022",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "24h"
+        },
+        "run_after": "2026-09-11T07:00:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 0,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000033",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:72h:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000023",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "72h"
+        },
+        "run_after": "2026-09-13T07:00:00+00:00",
+        "status": "queued"
+      },
+      {
+        "attempt_count": 0,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000034",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:7d:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000024",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "7d"
+        },
+        "run_after": "2026-09-17T07:00:00+00:00",
+        "status": "queued"
+      }
+    ],
+    "channel_profiles": [
+      {
+        "id": "00000000-0000-0000-0000-000000000002"
+      }
+    ],
+    "feedback_snapshots": [
+      {
+        "id": "00000000-0000-0000-0000-000000000040",
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "1h"
+      },
+      {
+        "id": "00000000-0000-0000-0000-000000000041",
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "6h"
+      },
+      {
+        "id": "00000000-0000-0000-0000-000000000042",
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "24h"
+      }
+    ],
+    "jobs": [
+      {
+        "completed_at": "2026-09-10T07:00:00+00:00",
+        "error_message": null,
+        "id": "00000000-0000-0000-0000-000000000006",
+        "status": "SUCCEEDED"
+      }
+    ],
+    "legacy_worker_event_resolutions": [],
+    "manual_seeds": [],
+    "node_executions": [
+      {
+        "completed_at": "2026-09-10T07:00:00+00:00",
+        "error_message": null,
+        "id": "00000000-0000-0000-0000-000000000008",
+        "input_artifact_ids": [
+          "00000000-0000-0000-0000-000000000009"
+        ],
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "node_type": "youtube_upload",
+        "output_artifact_id": "00000000-0000-0000-0000-000000000011",
+        "status": "SUCCEEDED"
+      }
+    ],
+    "owned_seed_inventories": [
+      {
+        "approval_reference": "synthetic:approval",
+        "approved_at": "2026-09-11T08:00:00+00:00",
+        "approved_by": "test-server-operator",
+        "channel_profile_id": "00000000-0000-0000-0000-000000000104",
+        "id": "00000000-0000-0000-0000-000000000100",
+        "manifest_json": {
+          "channel_profile_id": "00000000-0000-0000-0000-000000000104",
+          "configuration_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "entries": [
+            {
+              "asset_id": "00000000-0000-0000-0000-000000001100",
+              "byte_size": 10,
+              "content_sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+              "id": "00000000-0000-0000-0000-000000001000",
+              "manual_seed_id": "00000000-0000-0000-0000-000000001200",
+              "ordinal": 1,
+              "prompt": "Synthetic owned input",
+              "provenance_evidence": {
+                "attestation": "Synthetic owned test input",
+                "evidence_reference": "synthetic:test",
+                "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provenance": "generated",
+                "rights": "owned"
+              },
+              "provenance_sha256": "657591dc50d5d7bae67ee1bd04729cb4b8cd5a22d7c961660913e3af70ecd6df",
+              "seed_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "storage_descriptor": {
+                "file_size": 10,
+                "id": "00000000-0000-0000-0000-000000001100",
+                "media_info_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "mime_type": "video/mp4",
+                "storage_backend": "local",
+                "storage_path": "assets/0.mp4"
+              },
+              "title_seed": ""
+            },
+            {
+              "asset_id": "00000000-0000-0000-0000-000000001101",
+              "byte_size": 10,
+              "content_sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+              "id": "00000000-0000-0000-0000-000000001001",
+              "manual_seed_id": "00000000-0000-0000-0000-000000001201",
+              "ordinal": 2,
+              "prompt": "Synthetic owned input",
+              "provenance_evidence": {
+                "attestation": "Synthetic owned test input",
+                "evidence_reference": "synthetic:test",
+                "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provenance": "generated",
+                "rights": "owned"
+              },
+              "provenance_sha256": "657591dc50d5d7bae67ee1bd04729cb4b8cd5a22d7c961660913e3af70ecd6df",
+              "seed_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "storage_descriptor": {
+                "file_size": 10,
+                "id": "00000000-0000-0000-0000-000000001101",
+                "media_info_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "mime_type": "video/mp4",
+                "storage_backend": "local",
+                "storage_path": "assets/1.mp4"
+              },
+              "title_seed": ""
+            },
+            {
+              "asset_id": "00000000-0000-0000-0000-000000001102",
+              "byte_size": 10,
+              "content_sha256": "0000000000000000000000000000000000000000000000000000000000000003",
+              "id": "00000000-0000-0000-0000-000000001002",
+              "manual_seed_id": "00000000-0000-0000-0000-000000001202",
+              "ordinal": 3,
+              "prompt": "Synthetic owned input",
+              "provenance_evidence": {
+                "attestation": "Synthetic owned test input",
+                "evidence_reference": "synthetic:test",
+                "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provenance": "generated",
+                "rights": "owned"
+              },
+              "provenance_sha256": "657591dc50d5d7bae67ee1bd04729cb4b8cd5a22d7c961660913e3af70ecd6df",
+              "seed_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "storage_descriptor": {
+                "file_size": 10,
+                "id": "00000000-0000-0000-0000-000000001102",
+                "media_info_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "mime_type": "video/mp4",
+                "storage_backend": "local",
+                "storage_path": "assets/2.mp4"
+              },
+              "title_seed": ""
+            },
+            {
+              "asset_id": "00000000-0000-0000-0000-000000001103",
+              "byte_size": 10,
+              "content_sha256": "0000000000000000000000000000000000000000000000000000000000000004",
+              "id": "00000000-0000-0000-0000-000000001003",
+              "manual_seed_id": "00000000-0000-0000-0000-000000001203",
+              "ordinal": 4,
+              "prompt": "Synthetic owned input",
+              "provenance_evidence": {
+                "attestation": "Synthetic owned test input",
+                "evidence_reference": "synthetic:test",
+                "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provenance": "generated",
+                "rights": "owned"
+              },
+              "provenance_sha256": "657591dc50d5d7bae67ee1bd04729cb4b8cd5a22d7c961660913e3af70ecd6df",
+              "seed_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "storage_descriptor": {
+                "file_size": 10,
+                "id": "00000000-0000-0000-0000-000000001103",
+                "media_info_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "mime_type": "video/mp4",
+                "storage_backend": "local",
+                "storage_path": "assets/3.mp4"
+              },
+              "title_seed": ""
+            },
+            {
+              "asset_id": "00000000-0000-0000-0000-000000001104",
+              "byte_size": 10,
+              "content_sha256": "0000000000000000000000000000000000000000000000000000000000000005",
+              "id": "00000000-0000-0000-0000-000000001004",
+              "manual_seed_id": "00000000-0000-0000-0000-000000001204",
+              "ordinal": 5,
+              "prompt": "Synthetic owned input",
+              "provenance_evidence": {
+                "attestation": "Synthetic owned test input",
+                "evidence_reference": "synthetic:test",
+                "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provenance": "generated",
+                "rights": "owned"
+              },
+              "provenance_sha256": "657591dc50d5d7bae67ee1bd04729cb4b8cd5a22d7c961660913e3af70ecd6df",
+              "seed_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "storage_descriptor": {
+                "file_size": 10,
+                "id": "00000000-0000-0000-0000-000000001104",
+                "media_info_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "mime_type": "video/mp4",
+                "storage_backend": "local",
+                "storage_path": "assets/4.mp4"
+              },
+              "title_seed": ""
+            },
+            {
+              "asset_id": "00000000-0000-0000-0000-000000001105",
+              "byte_size": 10,
+              "content_sha256": "0000000000000000000000000000000000000000000000000000000000000006",
+              "id": "00000000-0000-0000-0000-000000001005",
+              "manual_seed_id": "00000000-0000-0000-0000-000000001205",
+              "ordinal": 6,
+              "prompt": "Synthetic owned input",
+              "provenance_evidence": {
+                "attestation": "Synthetic owned test input",
+                "evidence_reference": "synthetic:test",
+                "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provenance": "generated",
+                "rights": "owned"
+              },
+              "provenance_sha256": "657591dc50d5d7bae67ee1bd04729cb4b8cd5a22d7c961660913e3af70ecd6df",
+              "seed_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "storage_descriptor": {
+                "file_size": 10,
+                "id": "00000000-0000-0000-0000-000000001105",
+                "media_info_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "mime_type": "video/mp4",
+                "storage_backend": "local",
+                "storage_path": "assets/5.mp4"
+              },
+              "title_seed": ""
+            },
+            {
+              "asset_id": "00000000-0000-0000-0000-000000001106",
+              "byte_size": 10,
+              "content_sha256": "0000000000000000000000000000000000000000000000000000000000000007",
+              "id": "00000000-0000-0000-0000-000000001006",
+              "manual_seed_id": "00000000-0000-0000-0000-000000001206",
+              "ordinal": 7,
+              "prompt": "Synthetic owned input",
+              "provenance_evidence": {
+                "attestation": "Synthetic owned test input",
+                "evidence_reference": "synthetic:test",
+                "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provenance": "generated",
+                "rights": "owned"
+              },
+              "provenance_sha256": "657591dc50d5d7bae67ee1bd04729cb4b8cd5a22d7c961660913e3af70ecd6df",
+              "seed_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "storage_descriptor": {
+                "file_size": 10,
+                "id": "00000000-0000-0000-0000-000000001106",
+                "media_info_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                "mime_type": "video/mp4",
+                "storage_backend": "local",
+                "storage_path": "assets/6.mp4"
+              },
+              "title_seed": ""
+            }
+          ],
+          "expires_at": "2026-09-18T08:00:00+00:00",
+          "inventory_id": "00000000-0000-0000-0000-000000000100",
+          "lane_format_id": "00000000-0000-0000-0000-000000000102",
+          "legacy_history": {
+            "bindings": [
+              {
+                "account_descriptor_sha256": "62897f9071d6f341a924fcdf6b19f78bd495a82212de1657c215933fd2652d81",
+                "canonical_platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+                "legacy_account_id": "00000000-0000-0000-0000-000000000003",
+                "legacy_channel_profile_id": "00000000-0000-0000-0000-000000000002",
+                "platform": "youtube",
+                "qualification": {
+                  "actual_platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+                  "approval_reference": "synthetic:approval",
+                  "facts_sha256": "eb8f2df80782b551c1978959ae7fd8e1f7087f3e8899fccf9ed513fbff227e2f",
+                  "manager_endpoint_identity": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                  "manager_task_id": "00000000-0000-0000-0000-000000000010",
+                  "observed_at": "2026-09-11T08:00:00+00:00",
+                  "platform_video_id": "abcdefghijk",
+                  "sanitized_facts": [
+                    {
+                      "actual_platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+                      "manager_task_id": "00000000-0000-0000-0000-000000000010",
+                      "observed_at": "2026-09-11T08:00:00+00:00",
+                      "operation_id": "00000000-0000-0000-0000-000000000007",
+                      "operation_sha256": "d24e9f7b4d3353f35ef09460969f64967828af1c33318298fc38ad4ecb24fda0",
+                      "platform_video_id": "abcdefghijk",
+                      "receipt_sha256": "dae60e4093fddc54fd42656000f9c0aae8c7792d784e4fbd1b8a6f79edfa35cc"
+                    }
+                  ],
+                  "server_subject": "test-server-operator"
+                },
+                "qualified_operation_ids": [
+                  "00000000-0000-0000-0000-000000000007"
+                ],
+                "use": "history_only"
+              }
+            ],
+            "retired_unassigned_preupload": null,
+            "version": 1
+          },
+          "max_admissions": 7,
+          "minimum_interval_seconds": 86400,
+          "platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+          "privacy": "unlisted",
+          "starts_at": "2026-09-11T08:00:00+00:00",
+          "target_account_id": "00000000-0000-0000-0000-000000000103",
+          "tick_interval_minutes": 1,
+          "topic_lane_id": "00000000-0000-0000-0000-000000000101",
+          "version": 2
+        },
+        "manifest_sha256": "1c9130230ca0ce27e961e93c0d285c9bee4a712cf59fbe7e7cf43c367361020a",
+        "platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+        "revoked_at": "2026-09-11T08:00:00+00:00",
+        "state": "revoked",
+        "succession_released_at": "2026-09-11T08:00:00+00:00",
+        "target_account_id": "00000000-0000-0000-0000-000000000103"
+      }
+    ],
+    "owned_seed_inventory_items": [],
+    "production_tasks": [
+      {
+        "blocked_by_guard": null,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "failure_reason": null,
+        "id": "00000000-0000-0000-0000-000000000004",
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "manual_seed_id": "00000000-0000-0000-0000-000000000005",
+        "retry_count": 0,
+        "state": "measured",
+        "target_account_id": "00000000-0000-0000-0000-000000000003"
+      }
+    ],
+    "publication_metric_schedules": [
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-09-10T08:00:00+00:00",
+        "due_at": "2026-09-10T08:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-10T10:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000020",
+        "last_attempt_at": "2026-09-10T08:00:00+00:00",
+        "last_error_code": null,
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "1h",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-09-10T13:00:00+00:00",
+        "due_at": "2026-09-10T13:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-10T19:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000021",
+        "last_attempt_at": "2026-09-10T13:00:00+00:00",
+        "last_error_code": null,
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "6h",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-09-11T07:00:00+00:00",
+        "due_at": "2026-09-11T07:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-11T13:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000022",
+        "last_attempt_at": "2026-09-11T07:00:00+00:00",
+        "last_error_code": null,
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "24h",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 0,
+        "completed_at": null,
+        "due_at": "2026-09-13T07:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-13T19:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000023",
+        "last_attempt_at": null,
+        "last_error_code": null,
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "72h",
+        "status": "pending"
+      },
+      {
+        "attempt_count": 0,
+        "completed_at": null,
+        "due_at": "2026-09-17T07:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-18T07:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000024",
+        "last_attempt_at": null,
+        "last_error_code": null,
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "7d",
+        "status": "pending"
+      }
+    ],
+    "publication_promotion_operations": [],
+    "publication_records": [
+      {
+        "account_id": "00000000-0000-0000-0000-000000000003",
+        "current_privacy": "unlisted",
+        "desired_privacy": "unlisted",
+        "id": "00000000-0000-0000-0000-000000000013",
+        "platform": "youtube",
+        "platform_content_id": "abcdefghijk",
+        "production_task_id": "00000000-0000-0000-0000-000000000004",
+        "public_at": null,
+        "publish_status": "uploaded",
+        "scheduled_publish_at": "2026-09-10T07:00:00+00:00",
+        "uploaded_at": "2026-09-10T07:00:00+00:00"
+      }
+    ],
+    "publishing_accounts": [
+      {
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "credential_ref": "fixture-reference",
+        "id": "00000000-0000-0000-0000-000000000003",
+        "platform": "youtube",
+        "platform_account_id": "",
+        "platform_specific_config_json": {}
+      }
+    ],
+    "registered_worker_event_deliveries": [],
+    "registered_worker_event_receipts": [],
+    "runtime_schedules": [],
+    "worker_admission_grants": [],
+    "worker_event_emissions": [],
+    "worker_redis_marker_cleanup_authorizations": [],
+    "worker_redis_marker_repair_audits": [],
+    "worker_registrations": [],
+    "worker_task_delivery_attestations": [],
+    "worker_task_dispatches": [],
+    "youtube_upload_operations": [
+      {
+        "completed_at": "2026-09-10T07:00:00+00:00",
+        "content_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "error_message": null,
+        "id": "00000000-0000-0000-0000-000000000007",
+        "input_artifact_id": "00000000-0000-0000-0000-000000000009",
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "manager_task_id": "00000000-0000-0000-0000-000000000010",
+        "node_execution_id": "00000000-0000-0000-0000-000000000008",
+        "platform_video_id": "abcdefghijk",
+        "privacy": "unlisted",
+        "production_task_id": "00000000-0000-0000-0000-000000000004",
+        "receipt_json": {
+          "privacy": "unlisted",
+          "quota_estimate": 1600,
+          "tags": [],
+          "title": "owned",
+          "url": "https://www.youtube.com/watch?v=abcdefghijk",
+          "video_id": "abcdefghijk"
+        },
+        "request_attempted_at": "2026-09-10T06:59:00+00:00",
+        "status": "succeeded",
+        "title": "owned"
+      }
+    ]
+  },
+  "snapshot_sha256": "d4aeee2b496a70537f8df6ef618c57a6e7d517c966e92a371c33210d87904c06",
+  "synthetic": true
+}

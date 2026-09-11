@@ -5,12 +5,12 @@
 - Base: Unit 1 `b7188c91c7cc5e88893fccfa2786825d0783a7b6` on `codex/registered-consumer-reconcile`.
 - Inert library plus restricted SQL guard only. No CLI, shell, admission transaction, managed-job transport, daemon, deployment activation, or legacy vision changes.
 - Unit 1 immutable pins, assessment, and fixed Lua are byte-unchanged.
-- Local executable head is `037_registered_consumer_guard`, after `036_worker_session_signal`. Parent has assigned final `039_registered_consumer_guard`, after integrated `038_owned_seed_inventory`. Parent must merge/reparent/renumber the migration, expected-head constant and tests together. Do not overwrite integrated ACK037 or native038 role/pointer restrictions. A2's future040 is outside this checkpoint.
+- Frozen8ffdaff used local037 after036. Parent integration now uses final `039_registered_consumer_guard`, after integrated `038_owned_seed_inventory`, preserving ACK037 and native038 role/pointer restrictions. Runtime head, fixture constants and migration-chain tests moved together. A2's future040 is outside this checkpoint.
 - Agent did not run PG, Redis, network, SSH, Docker, live recovery, push, or another agent. All actual role/lock/Lua qualification below remains parent-owned.
 
 ## Delivered Files
 
-1. `backend/alembic/versions/037_registered_consumer_guard.py`: fixed SECURITY DEFINER guard, `pg_catalog` search path, exact generation-bound operator login, stable operator membership, safe-principal/assumable-role checks, no PUBLIC execution. Locks CLOSED/no-guard schedule plus all pinned registration/grant rows and rejects active work. Returns at most eight nonsecret typed rows and fresh DB time; no DML.
+1. `backend/alembic/versions/039_registered_consumer_guard.py`: fixed SECURITY DEFINER guard, `pg_catalog` search path, exact generation-bound operator login, stable operator membership, safe-principal/assumable-role checks, no PUBLIC execution. Locks CLOSED/no-guard schedule plus all pinned registration/grant rows and rejects active work. Returns at most eight nonsecret typed rows and fresh DB time; no DML.
 2. `backend/app/services/registered_consumer_reconcile_runtime.py`: fixed mounted credentials, endpoint/generation/principal validation, direct no-retry connections, bounded fully awaited controller, fresh guards/polls, one EVAL per stream, final read-only proof, owned rollback/resource cleanup.
 3. `backend/app/services/worker_control_role_cli.py`: one operator function allowlist addition; no table privileges added.
 4. `backend/app/services/worker_deployment_cli.py`: expected local migration head only.
