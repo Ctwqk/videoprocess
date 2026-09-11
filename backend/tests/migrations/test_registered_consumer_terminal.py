@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from sqlalchemy import Enum
 
 
 ROOT = Path(__file__).parents[2]
@@ -172,6 +173,10 @@ def test_terminal_fixture_is_schema_complete_and_preserves_real_retry_staging_or
             for column in Base.metadata.tables[table].columns:
                 if not column.nullable and column.server_default is None:
                     assert row.get(column.name) is not None, (table, column.name)
+                if isinstance(column.type, Enum) and row.get(column.name) is not None:
+                    assert row[column.name] in column.type.enums, (table, column.name)
+            if table == "artifacts":
+                assert raw["kind"] == "intermediate"
     retry = next(d for d in rows["worker_task_dispatches"] if d["origin_receipt_id"])
     origin = next(
         r
@@ -213,6 +218,12 @@ def test_negative_fixtures_reach_guard_instead_of_missing_required_columns():
                 for column in Base.metadata.tables[table].columns:
                     if not column.nullable and column.server_default is None:
                         assert row.get(column.name) is not None, (
+                            fault,
+                            table,
+                            column.name,
+                        )
+                    if isinstance(column.type, Enum) and row.get(column.name) is not None:
+                        assert row[column.name] in column.type.enums, (
                             fault,
                             table,
                             column.name,

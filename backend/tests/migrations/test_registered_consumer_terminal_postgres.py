@@ -168,6 +168,8 @@ def terminal_rows(case, now):
 
 def with_defaults(table, row):
     result = copy.deepcopy(row)
+    if table == "artifacts" and result.get("kind") == "intermediate":
+        result["kind"] = "INTERMEDIATE"
     for column in Base.metadata.tables[table].columns:
         if result.get(column.name) is None and not column.nullable:
             if column.default is not None:
