@@ -169,6 +169,36 @@ async def test_v2_draft_is_server_qualified_immutable_and_never_producer_authori
         assert {s.status for s in (await db.scalars(select(ManualSeed))).all()} == {"inventory_pending"}
 
 
+@pytest.mark.parametrize("successor", [False, True])
+async def test_new_authorized_observer_preserves_original_history_envelope(history_env, monkeypatch, successor):
+    h = history_env
+    created = await h.env.client.post(h.env.url, json=h.data)
+    assert created.status_code == 200, created.text
+    original = created.json()
+    if successor:
+        # Explicit fixture authority; the public v2 approval gate remains disabled.
+        async with h.env.factory() as db:
+            row = await db.get(OwnedSeedInventory, uuid.UUID(original["id"]))
+            row.approved_at, row.approved_by, row.approval_reference = h.observed_at, "test-operator", "fixture:approved"
+            row.state, row.revoked_at, row.revoked_by = "revoked", h.observed_at, "test-operator"
+            await db.commit()
+    monkeypatch.setattr(service.settings, "owned_seed_inventory_operator_subject", "rotated-operator")
+    h.controls.observed_at += timedelta(seconds=1)
+    if successor:
+        data = await h.env.data("successor")
+        data.update(version=2, history_locators=h.data["history_locators"])
+        response = await h.env.client.post(h.env.url, json=data)
+        assert response.status_code == 200, response.text
+        assert response.json()["manifest"]["legacy_history"]["bindings"] == original["manifest"]["legacy_history"]["bindings"]
+    else:
+        response = await h.env.client.post(f"{h.env.url}/{original['id']}/approve", json=approval(original))
+        assert response.status_code == 409 and response.json()["detail"] == "owned_inventory_v2_activation_disabled", response.text
+    reread = await h.env.client.get(f"{h.env.url}/{original['id']}")
+    assert reread.json()["manifest"] == original["manifest"]
+    assert reread.json()["manifest_sha256"] == original["manifest_sha256"]
+    assert len(h.requests) == 4
+
+
 @pytest.mark.parametrize("bad", ["submitted", "actual_uc", "foreign_task", "drift", "new_operation"])
 async def test_v2_qualification_rejects_unknown_or_changing_effects_without_draft(history_env, bad):
     h = history_env
@@ -195,16 +225,27 @@ async def test_v2_qualification_rejects_unknown_or_changing_effects_without_draf
         assert h.requests == []
 
 
-@pytest.mark.parametrize("bad", ["actual_uc", "operation_hash", "submitted"])
-async def test_v2_approval_requalifies_without_rewriting_changed_draft(history_env, bad):
+@pytest.mark.parametrize("bad", ["actual_uc", "operation_hash", "submitted", "manager", "video", "receipt", "account", "endpoint"])
+async def test_v2_approval_requalifies_without_rewriting_changed_draft(history_env, monkeypatch, bad):
     h = history_env
     created = await h.env.client.post(h.env.url, json=h.data)
     assert created.status_code == 200, created.text
     result = created.json()
+    monkeypatch.setattr(service.settings, "owned_seed_inventory_operator_subject", "rotated-operator")
     if bad == "actual_uc":
         h.controls.actual_channel = "UC" + "z" * 22
+    elif bad == "endpoint":
+        clients.build_youtube_manager_client().base_url = "http://other-configured-manager"
+    elif bad == "account":
+        async with h.env.factory() as db:
+            row = await db.get(PublishingAccount, uuid.UUID(h.data["history_locators"]["operations"][0]["legacy_account_id"]))
+            row.credential_ref = "changed-test-reference"
+            await db.commit()
+    elif bad == "receipt":
+        h.rows["youtube_upload_operations"][0]["receipt_json"]["extra"] = "changed"
     else:
-        key, value = ("content_sha256", "e" * 64) if bad == "operation_hash" else ("status", "submitted")
+        key, value = {"operation_hash": ("content_sha256", "e" * 64), "submitted": ("status", "submitted"),
+                      "manager": ("manager_task_id", "changed-task"), "video": ("platform_video_id", "changed_vid")}[bad]
         h.rows["youtube_upload_operations"][0][key] = value
     response = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
     assert response.status_code == 409 and response.json()["detail"] != "owned_inventory_v2_activation_disabled"

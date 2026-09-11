@@ -343,7 +343,11 @@ def _qualified_retirement(snapshot: history.OwnedHistorySnapshot, sources: dict 
                           subject: str, reference: str) -> dict | None:
     if sources is None:
         return None
-    require(_retirement_sources(snapshot, requested=True) == sources, "owned_inventory_retirement_changed")
+    fresh_sources = _retirement_sources(snapshot, requested=True)
+    assert fresh_sources is not None
+    require({**fresh_sources, "terminal_graph": history._terminal_projection(fresh_sources["terminal_graph"])} ==
+            {**sources, "terminal_graph": history._terminal_projection(sources["terminal_graph"])},
+            "owned_inventory_retirement_changed")
     assert observation is not None
     hashes, redis = observation
     retained = {**sources["retained_facts"], "source_assets": [{"asset": row, "content_sha256": hashes[uuid.UUID(row["id"]) ]}
@@ -381,6 +385,8 @@ def _stable_binding(value: dict) -> dict:
     qualification = result["qualification"]
     qualification.pop("observed_at")
     qualification.pop("facts_sha256")
+    qualification.pop("server_subject")
+    qualification.pop("approval_reference")
     for fact in qualification["sanitized_facts"]:
         fact.pop("observed_at")
     return result
@@ -410,7 +416,6 @@ def _qualified_history(snapshot: history.OwnedHistorySnapshot, groups: dict, obs
                        qualified_operation_ids=[f["operation_id"] for f in facts], qualification=qualification)
         if account_id in existing:
             original = existing[account_id].document.as_dict()
-            binding["qualification"]["approval_reference"] = original["qualification"]["approval_reference"]
             require(_stable_binding(binding) == _stable_binding(original), "owned_inventory_history_authority_conflict")
             binding = original
         history.HistoryOnlyBinding.parse(binding)

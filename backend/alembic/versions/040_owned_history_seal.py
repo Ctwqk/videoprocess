@@ -5,7 +5,7 @@ import sqlalchemy as sa
 
 
 revision = "040_owned_history_seal"
-down_revision = "038_owned_seed_inventory"
+down_revision = "039_registered_consumer_guard"
 branch_labels = None
 depends_on = None
 
@@ -109,7 +109,6 @@ BEGIN
     END IF;
 END;
 $f$;
-REVOKE ALL ON FUNCTION public.vp_owned_history_job_entry(uuid) FROM PUBLIC;
 """
 
 
@@ -204,13 +203,14 @@ BEGIN
     RETURN NEW;
 END;
 $f$;
-REVOKE ALL ON FUNCTION public.vp_owned_history_seal_guard() FROM PUBLIC;
 """
 
 
 def upgrade() -> None:
     op.execute(ENTRY_SQL)
+    op.execute("REVOKE ALL ON FUNCTION public.vp_owned_history_job_entry(uuid) FROM PUBLIC")
     op.execute(GUARD_SQL)
+    op.execute("REVOKE ALL ON FUNCTION public.vp_owned_history_seal_guard() FROM PUBLIC")
     for table in TABLES:
         op.execute(f"CREATE TRIGGER owned_history_seal_{table} BEFORE INSERT OR UPDATE OR DELETE ON public.{table} "
                    "FOR EACH ROW EXECUTE FUNCTION public.vp_owned_history_seal_guard()")

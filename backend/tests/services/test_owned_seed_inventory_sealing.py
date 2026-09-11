@@ -114,6 +114,48 @@ async def test_existing_revoked_certificate_is_reobserved_not_replaced(sealing):
     assert result == certificate
 
 
+@pytest.mark.parametrize("table, field, value", [
+    ("worker_registrations", "heartbeat_at", (NOW + timedelta(seconds=1)).isoformat()),
+    ("worker_registrations", "lease_expires_at", (NOW + timedelta(minutes=1)).isoformat()),
+    ("worker_registrations", "status", "expired"),
+    ("worker_registrations", "revoked_at", NOW.isoformat()),
+    ("worker_registrations", "revoke_reason", "release"),
+    ("worker_registrations", "superseded_by", "aaaaaaaa-0000-0000-0000-000000000099"),
+    ("worker_admission_grants", "state", "active"),
+    ("worker_admission_grants", "revoked_at", NOW.isoformat()),
+    ("worker_admission_grants", "revoke_reason", "release"),
+    ("worker_admission_grants", "updated_at", (NOW + timedelta(seconds=1)).isoformat()),
+])
+async def test_retirement_reload_allows_only_a1_liveness_projection(sealing, table, field, value):
+    h = sealing
+    sources = service._retirement_sources(snap(h.rows), requested=True)
+    observed = await service._observe_retirement(sources, observed_at=NOW)
+    original = service._qualified_retirement(snap(h.rows), sources, observed, "operator", "draft:one")
+    assert h.rows[table][0][field] != value
+    h.rows[table][0][field] = value
+    result = service._qualified_retirement(snap(h.rows), sources, observed, "operator", "draft:one")
+    assert result == original
+
+
+@pytest.mark.parametrize("table, field, value", [
+    ("worker_registrations", "worker_id", "foreign-worker"),
+    ("worker_registrations", "lease_epoch", 999),
+    ("worker_registrations", "grant_id", "aaaaaaaa-0000-0000-0000-000000000099"),
+    ("worker_admission_grants", "release_id", "foreign-release"),
+    ("worker_task_dispatches", "payload_sha256", "f" * 64),
+    ("registered_worker_event_receipts", "payload_sha256", "f" * 64),
+    ("node_executions", "worker_id", "foreign-worker"),
+    ("assets", "storage_path", "different-source.mp4"),
+])
+async def test_retirement_reload_still_rejects_identity_claim_effect_and_source_drift(sealing, table, field, value):
+    h = sealing
+    sources = service._retirement_sources(snap(h.rows), requested=True)
+    observed = await service._observe_retirement(sources, observed_at=NOW)
+    h.rows[table][0][field] = value
+    with pytest.raises((service.OwnedInventoryError, history.OwnedHistoryError)):
+        service._qualified_retirement(snap(h.rows), sources, observed, "operator", "draft:one")
+
+
 async def test_no_retirement_does_not_build_external_clients(monkeypatch):
     def forbidden():
         pytest.fail("no external client is required")

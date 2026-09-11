@@ -1,4 +1,4 @@
-"""Parent-run only: an explicitly named disposable database already at migration 038."""
+"""Parent-run only: an explicitly named disposable database already at migration 040."""
 
 import asyncio
 import os

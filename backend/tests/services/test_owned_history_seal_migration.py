@@ -14,7 +14,7 @@ def migration():
 @pytest.mark.parametrize("remove", [False, True])
 def test_catalogue_patch_emits_existing_definition_replacement_without_new_acl(monkeypatch, remove):
     m = migration()
-    assert m["revision"] == "040_owned_history_seal" and m["down_revision"] == "038_owned_seed_inventory"
+    assert m["revision"] == "040_owned_history_seal" and m["down_revision"] == "039_registered_consumer_guard"
     emitted = []
     monkeypatch.setattr(m["op"], "execute", emitted.append)
     m["_fence_installed_functions"](remove=remove)
@@ -57,3 +57,52 @@ def test_sql_entry_recompares_task_channel_membership_after_schedule_lock():
     assert "INTO v_references" in sql and "INTO v_fresh_references" in sql
     assert sql.index("INTO v_references") < sql.index("FROM public.runtime_schedules") < sql.index("INTO v_fresh_references")
     assert "v_references IS DISTINCT FROM v_fresh_references" in sql
+
+
+@pytest.mark.parametrize("constant, signature", [
+    ("ENTRY_SQL", "vp_owned_history_job_entry(uuid)"),
+    ("GUARD_SQL", "vp_owned_history_seal_guard()"),
+])
+def test_upgrade_executes_each_function_and_revoke_as_separate_commands(monkeypatch, constant, signature):
+    m = migration()
+    emitted = []
+    monkeypatch.setattr(m["op"], "execute", emitted.append)
+    m["upgrade"]()
+    create = m[constant]
+    assert create.rstrip().endswith("END;\n$f$;")
+    assert create.count("$f$") == 2
+    assert "REVOKE " not in create
+    index = emitted.index(create)
+    assert emitted[index + 1] == f"REVOKE ALL ON FUNCTION public.{signature} FROM PUBLIC"
+
+
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+def test_migration_keeps_do_blocks_whole_and_trigger_commands_individual(monkeypatch, direction):
+    m = migration()
+    emitted = []
+    monkeypatch.setattr(m["op"], "execute", emitted.append)
+    m[direction]()
+    if direction == "upgrade":
+        triggers = emitted[4:-1]
+        assert triggers == [
+            f"CREATE TRIGGER owned_history_seal_{table} BEFORE INSERT OR UPDATE OR DELETE ON public.{table} "
+            "FOR EACH ROW EXECUTE FUNCTION public.vp_owned_history_seal_guard()"
+            for table in m["TABLES"]
+        ]
+        patch = emitted[-1]
+    else:
+        assert emitted[0].startswith("DO $$ BEGIN")
+        assert emitted[0].rstrip().endswith("END $$;")
+        assert "owned_inventory_history_requires_preservation" in emitted[0]
+        assert emitted[2:-2] == [
+            f"DROP TRIGGER owned_history_seal_{table} ON public.{table}" for table in m["TABLES"]
+        ]
+        assert emitted[-2:] == [
+            "DROP FUNCTION public.vp_owned_history_seal_guard()",
+            "DROP FUNCTION public.vp_owned_history_job_entry(uuid)",
+        ]
+        patch = emitted[1]
+    assert patch.startswith("DO $patch$")
+    assert patch.endswith("END $patch$;")
+    assert patch.count("$patch$") == 2
+    assert "EXECUTE replace(v_definition, v_source, v_changed);" in patch
