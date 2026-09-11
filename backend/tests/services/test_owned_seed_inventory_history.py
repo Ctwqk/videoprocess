@@ -822,6 +822,52 @@ def reseal_synthetic_certificate(rows):
     inv["manifest_sha256"] = history.history_sha256(inv["manifest_json"])
 
 
+def receipt_authorized_ack_rows():
+    rows, redis = retired_rows()
+    att = rows["worker_task_delivery_attestations"][0]
+    receipt = rows["registered_worker_event_receipts"][0]
+    dispatch = rows["worker_task_dispatches"][0]
+    att["ack_event_emission_id"] = None
+    ack = iso(history._time(receipt["applied_at"]) + timedelta(seconds=10))
+    att["acknowledged_at"] = dispatch["acknowledged_at"] = receipt["source_task_acknowledged_at"] = ack
+    reseal_synthetic_certificate(rows)
+    return rows, redis
+
+
+def test_retired_receipt_authorized_ack_accepts_exact_applied_receipt_without_emission_link():
+    rows, redis = receipt_authorized_ack_rows()
+    before = copy.deepcopy(rows)
+    result = retired_assess(rows, redis)
+    assert result.block_reason is None
+    assert result.classifications[0].classification == "retired_unassigned_preupload"
+    assert result.classifications[0].platform_channel_id is None
+    assert result.account_ids == result.completed_item_ids == () and result.wait_reason is None
+    assert any(p.record_id == uid(250) and p.path == "receipt_backed" for p in result.terminal_paths)
+    assert rows == before
+
+
+@pytest.mark.parametrize("bad", ["missing_receipt", "unapplied_receipt", "foreign_receipt", "wrong_emission", "premature_ack"])
+def test_retired_receipt_authorized_ack_rejects_rehashed_invalid_authority(bad):
+    rows, redis = receipt_authorized_ack_rows()
+    att = rows["worker_task_delivery_attestations"][0]
+    receipt = rows["registered_worker_event_receipts"][0]
+    if bad == "missing_receipt":
+        rows["registered_worker_event_receipts"].remove(receipt)
+    elif bad == "unapplied_receipt":
+        receipt.update(application_state="accepted", applied_at=None)
+    elif bad == "foreign_receipt":
+        receipt["source_task_attestation_id"] = rows["worker_task_delivery_attestations"][1]["id"]
+    elif bad == "wrong_emission":
+        att["ack_event_emission_id"] = rows["worker_event_emissions"][1]["id"]
+    else:
+        ack = iso(history._time(receipt["applied_at"]) - timedelta(seconds=1))
+        att["acknowledged_at"] = rows["worker_task_dispatches"][0]["acknowledged_at"] = receipt["source_task_acknowledged_at"] = ack
+    reseal_synthetic_certificate(rows)
+    before = copy.deepcopy(rows)
+    assert retired_assess(rows, redis).block_reason == "owned_history_retired_receipt"
+    assert rows == before
+
+
 @pytest.mark.parametrize("bad", ["origin_completed", "retry_emission", "missing_ack", "applied", "att_mismatch",
     "payload_event", "wrong_stream", "extra_dispatch", "broken_dependency", "source_path", "source_claim", "grant_image",
     "transition", "invented_cancel", "never_attempted", "missing_column", "cleanup_authority", "orphan_delivery"])

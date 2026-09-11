@@ -971,8 +971,12 @@ def _receipt_path(dispatch: dict, att: dict, graph: dict, node: dict, cert: Reti
     deliveries = [d for d in graph["registered_worker_event_deliveries"] if d["source_task_attestation_id"] == att["id"]]
     _require(bool(deliveries) and _claim_equal(att, emission) and _claim_equal(att, receipt) and
              emission["emission_state"] == "resolved" and receipt["application_state"] == "applied" and
-             receipt["ack_state"] == receipt["source_task_ack_state"] == "acknowledged" and
-             att["ack_event_emission_id"] == emission["id"], reason)
+             receipt["ack_state"] == receipt["source_task_ack_state"] == "acknowledged", reason)
+    if att["ack_event_emission_id"] is None:
+        # Native receipt-authorized ACK does not populate the emission link.
+        _require(_time(receipt["applied_at"]) <= _time(att["acknowledged_at"]), reason)
+    else:
+        _require(att["ack_event_emission_id"] == emission["id"], reason)
     parsed = parse_registered_worker_event(redis_stream=receipt["redis_stream"], consumer_group=receipt["consumer_group"],
                                            message_id=receipt["message_id"], payload=receipt["payload_json"])
     facts = parsed.receipt_facts(source_task_attestation_id=uuid.UUID(att["id"]))
