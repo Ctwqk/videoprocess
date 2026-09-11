@@ -139,6 +139,16 @@ def test_orchestrator_column_allowlists_cover_real_receipt_transaction() -> None
     )
 
 
+def test_orchestrator_channel_projection_keeps_inventory_pointer_read_only() -> None:
+    from app.models.channel_agent import ChannelProfile
+
+    assert set(control_cli.ORCHESTRATOR_ENTITY_COLUMNS["channel_profiles"]) == {
+        column.name for column in ChannelProfile.__table__.columns
+    }
+    assert "owned_seed_inventory_id" not in control_cli.ORCHESTRATOR_UPDATE_COLUMNS["channel_profiles"]
+    assert "channel_profiles" not in control_cli.ORCHESTRATOR_INSERT_COLUMNS
+
+
 async def test_control_provision_writes_independent_mode_0400_urls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

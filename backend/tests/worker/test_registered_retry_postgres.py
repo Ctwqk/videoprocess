@@ -190,7 +190,7 @@ async def _node(db, node_id):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["superuser", "ownership_update", "authority_select", "missing_update", "missing_rpc"])
+@pytest.mark.parametrize("fault", ["superuser", "ownership_update", "authority_select", "missing_update", "missing_rpc", "missing_inventory_select", "inventory_update", "inventory_insert"])
 async def test_actual_factory_rejects_unsafe_or_incomplete_pg_grants(retry_pg, fault):
     case = retry_pg
     await case.runtime.close()
@@ -200,11 +200,36 @@ async def test_actual_factory_rejects_unsafe_or_incomplete_pg_grants(retry_pg, f
         "authority_select": 'GRANT SELECT(id) ON public.worker_registrations TO vp_orchestrator_control_runtime',
         "missing_update": 'REVOKE UPDATE(status) ON public.node_executions FROM vp_orchestrator_control_runtime',
         "missing_rpc": 'REVOKE EXECUTE ON FUNCTION public.vp_release_registered_retry_claim(uuid) FROM vp_orchestrator_control_runtime',
+        "missing_inventory_select": 'REVOKE SELECT(owned_seed_inventory_id) ON public.channel_profiles FROM vp_orchestrator_control_runtime',
+        "inventory_update": 'GRANT UPDATE(owned_seed_inventory_id) ON public.channel_profiles TO vp_orchestrator_control_runtime',
+        "inventory_insert": 'GRANT INSERT(owned_seed_inventory_id) ON public.channel_profiles TO vp_orchestrator_control_runtime',
     }
     await case.worker.owner.execute(statements[fault])
     with pytest.raises(RegisteredDatabaseError):
         await case.runtime.start(case.target)
     assert not case.runtime.ready
+
+
+@pytest.mark.asyncio
+async def test_actual_factory_inventory_pointer_is_read_only(retry_pg):
+    connection = retry_pg.connection
+    assert await connection.fetchval(
+        "SELECT has_column_privilege(current_user, 'public.channel_profiles', 'owned_seed_inventory_id', 'SELECT')"
+    )
+    for privilege in ("INSERT", "UPDATE"):
+        assert not await connection.fetchval(
+            "SELECT has_column_privilege(current_user, 'public.channel_profiles', 'owned_seed_inventory_id', $1)", privilege
+        )
+    assert not await connection.fetchval(
+        "SELECT has_table_privilege(current_user, 'public.channel_profiles', 'SELECT')"
+    )
+    assert await connection.fetchval(
+        "SELECT owned_seed_inventory_id FROM public.channel_profiles WHERE id=$1", retry_pg.worker.channel_id
+    ) is None
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        await connection.execute(
+            "UPDATE public.channel_profiles SET owned_seed_inventory_id=NULL WHERE id=$1", retry_pg.worker.channel_id
+        )
 
 
 @pytest.mark.asyncio

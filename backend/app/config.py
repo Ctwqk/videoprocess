@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field, SecretStr
 
 
 class Settings(BaseSettings):
@@ -66,6 +67,9 @@ class Settings(BaseSettings):
     channel_agent_retention_audit_days: int = 90
     channel_agent_retention_feedback_days: int = 365
     channelops_runner_admin_url: str = "http://channelops-runner-go:8080"
+    owned_seed_inventory_enabled: bool = False
+    owned_seed_inventory_operator_token: SecretStr = Field(default=SecretStr(""), repr=False)
+    owned_seed_inventory_operator_subject: str = ""
 
     # Policy Decision Service
     pds_enabled: bool = False

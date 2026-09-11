@@ -359,6 +359,7 @@ ORCHESTRATOR_ENTITY_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "intake_pause_reason",
         "config_version",
         "tick_interval_minutes",
+        "owned_seed_inventory_id",
         "id",
         "created_at",
         "updated_at",

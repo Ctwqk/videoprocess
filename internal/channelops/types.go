@@ -68,6 +68,8 @@ const (
 
 type ChannelProfileRow struct {
 	ID                   string
+	OwnedSeedInventoryID *string
+	OwnedInventoryActive bool
 	Enabled              bool
 	DryRun               bool
 	HaltedAt             *time.Time

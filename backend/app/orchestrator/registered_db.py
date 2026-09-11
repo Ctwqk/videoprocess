@@ -67,6 +67,8 @@ SELECT session_user=:principal AND current_user=session_user
         SELECT 1 FROM unnest(ARRAY['worker_id','worker_registration_id','worker_lease_epoch','started_at']) col
         WHERE pg_catalog.has_column_privilege(session_user, 'public.node_executions', col, 'UPDATE')
     )
+    AND NOT pg_catalog.has_column_privilege(session_user,
+        'public.channel_profiles', 'owned_seed_inventory_id', 'INSERT,UPDATE')
     AND NOT EXISTS (
         SELECT 1 FROM jsonb_to_recordset(CAST(:columns AS jsonb)) AS c(tbl text, col text, privilege text)
         WHERE NOT coalesce(pg_catalog.has_column_privilege(session_user,
