@@ -612,6 +612,7 @@ T = TypeVar("T")
 
 
 async def _settle(task: asyncio.Task[T]) -> T:
+    """Own terminal cleanup after cancellation/kill, including repeated cancels."""
     while not task.done():
         try:
             await asyncio.shield(task)
@@ -715,13 +716,23 @@ class FileAuthority:
         finally:
             try:
                 if created is not None:
-                    process = await _settle(created)
-                    if process.returncode is None:
-                        try:
-                            process.kill()
-                        except ProcessLookupError:
-                            pass
-                    await _settle(asyncio.create_task(process.wait()))
+                    if not created.done():
+                        # CPython owns any child before publishing Process. Cancel
+                        # startup so its transport closes and reaps that child.
+                        created.cancel()
+                    try:
+                        process = await _settle(created)
+                    except asyncio.CancelledError:
+                        # This is the creator's terminal cancellation, not the
+                        # caller's cancellation (preserved below).
+                        pass
+                    else:
+                        if process.returncode is None:
+                            try:
+                                process.kill()
+                            except ProcessLookupError:
+                                pass
+                        await _settle(asyncio.create_task(process.wait()))
             except Exception:
                 self.poisoned = True
                 raise ProtocolError() from None

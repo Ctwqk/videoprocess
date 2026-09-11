@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from asyncio.base_subprocess import BaseSubprocessTransport
 import copy
 import importlib
 import json
@@ -319,6 +320,158 @@ async def test_process_start_failure_is_static_and_poisoned(tmp_path, monkeypatc
         await client.revalidate(request)
     assert client.pending_process is None
     assert client.poisoned
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", ["timeout", "cancel", "repeated_cancel"])
+async def test_pending_startup_is_cancelled_not_passively_settled(
+    tmp_path, monkeypatch, interrupt
+):
+    job, request, files, binding = setup_protocol(tmp_path)
+    monkeypatch.setattr(job, "require_writer_identity", lambda *args: None)
+    entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = asyncio.create_subprocess_exec
+    creators, processes = [], []
+
+    async def create(*args, **kwargs):
+        creators.append(asyncio.current_task())
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        process = await original(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    client = job.FileAuthority(binding, files)
+    started = time.monotonic()
+    running = asyncio.create_task(client.revalidate(request))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        if interrupt != "timeout":
+            for _ in range(3 if interrupt == "repeated_cancel" else 1):
+                running.cancel()
+                await asyncio.sleep(0)
+        done, _ = await asyncio.wait({running}, timeout=1.9)
+        assert done, "pending cooperative creator escaped callback cancellation"
+        with pytest.raises(
+            job.ProtocolError if interrupt == "timeout" else asyncio.CancelledError
+        ):
+            await running
+        assert time.monotonic() - started < 2
+        assert cancelled.is_set() and all(task.done() for task in creators)
+        assert processes == [] and client.pending_process is None and client.poisoned
+        assert Path(files["request"]["path"]).stat().st_size == 0
+        with pytest.raises(job.ProtocolError):
+            await client.revalidate(request)
+    finally:
+        # Release only to clean up the expected RED failure, never to make it pass.
+        release.set()
+        await asyncio.gather(running, return_exceptions=True)
+        assert all(process.returncode is not None for process in processes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", ["timeout", "cancel", "repeated_cancel"])
+async def test_child_before_handle_publication_uses_transport_cancel_cleanup(
+    tmp_path, monkeypatch, interrupt
+):
+    job, request, files, binding = setup_protocol(tmp_path)
+    monkeypatch.setattr(job, "require_writer_identity", lambda *args: None)
+    entered, reaped, release_reap = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_connect = BaseSubprocessTransport._connect_pipes
+    original_wait = BaseSubprocessTransport._wait
+    transports, waiters, creators = [], [], []
+    original_create = asyncio.create_subprocess_exec
+
+    async def create(*args, **kwargs):
+        creators.append(asyncio.current_task())
+        return await original_create(*args, **kwargs)
+
+    async def connect(transport, waiter):
+        # Finish real pipe setup but withhold the native startup waiter. CPython
+        # owns the real child here; no public Process handle exists yet.
+        ready = asyncio.get_running_loop().create_future()
+        await original_connect(transport, ready)
+        ready.result()
+        transports.append(transport)
+        waiters.append(waiter)
+        entered.set()
+
+    async def wait(transport):
+        result = await original_wait(transport)
+        if transport in transports:
+            reaped.set()
+            if interrupt == "repeated_cancel":
+                await release_reap.wait()
+        return result
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(BaseSubprocessTransport, "_connect_pipes", connect)
+    monkeypatch.setattr(BaseSubprocessTransport, "_wait", wait)
+    client = job.FileAuthority(binding, files)
+    started = time.monotonic()
+    running = asyncio.create_task(client.revalidate(request))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert client.pending_process is None and transports[0].get_returncode() is None
+        pid = transports[0].get_pid()
+        if interrupt != "timeout":
+            running.cancel()
+        if interrupt == "repeated_cancel":
+            await asyncio.wait_for(reaped.wait(), 0.5)
+            for _ in range(3):
+                running.cancel()
+                await asyncio.sleep(0)
+            assert not running.done(), "callback detached pending transport cleanup"
+            release_reap.set()
+        done, _ = await asyncio.wait({running}, timeout=1.9)
+        assert done, "native startup transport was not cancelled"
+        with pytest.raises(
+            job.ProtocolError if interrupt == "timeout" else asyncio.CancelledError
+        ):
+            await running
+        assert time.monotonic() - started < 2
+        assert reaped.is_set() and all(task.done() for task in creators)
+        assert transports[0].get_returncode() is not None
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+        assert client.pending_process is None and client.poisoned
+        assert Path(files["request"]["path"]).stat().st_size == 0
+    finally:
+        release_reap.set()
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+        await asyncio.gather(running, return_exceptions=True)
+        assert all(transport.get_returncode() is not None for transport in transports)
+
+
+@pytest.mark.asyncio
+async def test_cancel_racing_completed_creator_retains_and_reaps_handle(
+    tmp_path, monkeypatch
+):
+    job, request, files, binding = setup_protocol(tmp_path)
+    monkeypatch.setattr(job, "require_writer_identity", lambda *args: None)
+    original = asyncio.create_subprocess_exec
+    processes = []
+
+    async def create(*args, **kwargs):
+        process = await original(*args, **kwargs)
+        processes.append(process)
+        asyncio.get_running_loop().call_soon(running.cancel)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    client = job.FileAuthority(binding, files)
+    running = asyncio.create_task(client.revalidate(request))
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert len(processes) == 1 and processes[0].returncode is not None
+    assert client.pending_process is None and client.poisoned
 
 
 @pytest.mark.asyncio
