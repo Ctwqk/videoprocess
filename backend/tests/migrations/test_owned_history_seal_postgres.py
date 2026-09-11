@@ -33,6 +33,7 @@ from tests.migrations.owned_history_postgres import (
 @pytest.fixture
 async def a2_env(a2_pg, monkeypatch):
     case = a2_pg
+    monkeypatch.setenv("OWNED_INVENTORY_DISPOSABLE_TEST_CONFIRM", case.target.database)
     generator = _inventory_env.__wrapped__(monkeypatch, SimpleNamespace(param=case.target.render_as_string(hide_password=False)))
     async with aclosing(generator):
         env = await anext(generator)
@@ -339,3 +340,99 @@ async def test_actual_liveness_revocation_and_succession_keep_original_certifica
         cert = service._qualified_retirement(fresh, sources, observed, "new-fixture-operator", "fixture:successor")
         assert cert == h.result["manifest"]["legacy_history"]["retired_unassigned_preupload"]
     assert await catalogue(h.case.owner) == h.case.granted_catalogue
+
+
+@pytest.mark.parametrize("action", ["account_patch", "account_resume", "source_delete", "task_rebind"])
+async def test_actual_producer_mutation_after_committed_retirement_is_refused(a2_env, action):
+    h = a2_env
+    async with h.case.sessions() as db:
+        await seal(h, db)
+        await db.commit()
+    if action == "task_rebind":
+        with pytest.raises(DBAPIError, match="owned_history_sealed"):
+            await mutate_producer(h, action)
+    else:
+        response = await mutate_producer(h, action)
+        assert response.status_code == 409
+        assert response.json()["detail"] == ("owned_inventory_asset_pinned" if action == "source_delete" else
+                                             "owned_inventory_historical_producer_pinned")
+    assert h.env.storage.deletions == []
+    assert await h.case.owner.fetchval("SELECT channel_profile_id FROM production_tasks WHERE id=$1",
+        uuid.UUID(history.RETIRED_TUPLE[1])) == uuid.UUID(history.RETIRED_TUPLE[5])
+    reread = await h.env.client.get(f"{h.env.url}/{h.result['id']}")
+    assert reread.json()["manifest"] == h.result["manifest"]
+
+
+@pytest.mark.parametrize("seal_first", [True, False])
+async def test_actual_graph_insert_two_orders_never_qualifies_a_stale_graph(a2_env, monkeypatch, seal_first):
+    h = a2_env
+    node_id, job_id = uuid.uuid4(), uuid.UUID(history.RETIRED_TUPLE[2])
+    entered, sealing = asyncio.Event(), asyncio.Event()
+    pids = {}
+    original = service._lock_history_scope
+
+    async def sealer_entry(db, *args, **kwargs):
+        pids["sealer"] = await db.scalar(text("SELECT pg_backend_pid()"))
+        sealing.set()
+        return await original(db, *args, **kwargs)
+
+    monkeypatch.setattr(service, "_lock_history_scope", sealer_entry)
+    statement = text("""INSERT INTO node_executions(id,job_id,node_id,node_type,node_config,status,progress,completed_at)
+        SELECT :id,:job,'new-native-member','trim','{}','CANCELLED',0,completed_at FROM jobs WHERE id=:job""")
+    pending = None
+    async with h.case.sessions() as writer:
+        pids["writer"] = await writer.scalar(text("SELECT pg_backend_pid()"))
+
+        async def write():
+            entered.set()
+            await lock_job_execution_entry(writer, job_id)
+            await writer.execute(statement, {"id": node_id, "job": job_id})
+
+        try:
+            if seal_first:
+                async with h.case.sessions() as db:
+                    await seal(h, db)
+                    blocker = await db.scalar(text("SELECT pg_backend_pid()"))
+                    pending = asyncio.create_task(write())
+                    await asyncio.wait_for(entered.wait(), 5)
+                    await wait_blocked(h.case.owner, pids["writer"], blocker)
+                    async with h.case.owner.transaction():
+                        await h.case.owner.fetch("SELECT id FROM node_executions FOR UPDATE NOWAIT")
+                    await db.commit()
+                    with pytest.raises(DBAPIError, match="owned_history_sealed"):
+                        await asyncio.wait_for(pending, 5)
+                    await writer.rollback()
+                assert await h.case.owner.fetchval("SELECT count(*) FROM node_executions WHERE id=$1", node_id) == 0
+            else:
+                await write()
+                sealing.clear()
+                pending = asyncio.create_task(approve(h))
+                await asyncio.wait_for(sealing.wait(), 5)
+                await wait_blocked(h.case.owner, pids["sealer"], pids["writer"])
+                await writer.commit()
+                response = await asyncio.wait_for(pending, 5)
+                assert response.status_code == 409 and response.json()["detail"] != "owned_inventory_v2_activation_disabled"
+                assert await h.case.owner.fetchval("SELECT count(*) FROM node_executions WHERE id=$1", node_id) == 1
+                assert await h.case.owner.fetchval("SELECT approved_at FROM owned_seed_inventories WHERE id=$1", uuid.UUID(h.result["id"])) is None
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+            if pending is not None:
+                await asyncio.gather(pending, return_exceptions=True)
+            await writer.rollback()
+
+
+@pytest.mark.parametrize("table,column", [("worker_registrations", "database_fingerprint"),
+                                         ("worker_admission_grants", "image_identity")])
+async def test_actual_retired_registration_identity_is_not_liveness_projection(a2_env, table, column):
+    h = a2_env
+    async with h.case.sessions() as db:
+        await seal(h, db)
+        await db.commit()
+        with pytest.raises(DBAPIError, match="owned_history_sealed"):
+            await db.execute(text(f"UPDATE {table} SET {column}=:value WHERE id=:id"), {
+                "value": "f" * 64 if column == "database_fingerprint" else "vp-python-worker:deploy-ffffffffffff",
+                "id": uuid.UUID(h.case.rows[table][0]["id"])})
+        await db.rollback()
+    reread = await h.env.client.get(f"{h.env.url}/{h.result['id']}")
+    assert reread.json()["manifest"] == h.result["manifest"]

@@ -7,6 +7,7 @@ immutable approved history is never deleted or trigger-bypassed for cleanup.
 from __future__ import annotations
 
 import asyncio
+import enum
 import hashlib
 import json
 import os
@@ -38,7 +39,7 @@ from app.services.worker_role_cli_common import (
     quote_identifier, reset_public_privileges,
 )
 from app.services.worker_runtime_role_cli import _set_runtime_privileges
-from tests.services.test_owned_seed_inventory_history import NOW, retired_rows
+from tests.services.test_owned_seed_inventory_history import NOW, completed_rows, metric_retry, retired_rows
 
 BACKEND = Path(__file__).resolve().parents[2]
 HEAD = "040_owned_history_seal"
@@ -107,6 +108,71 @@ def seed_document(now, *, null_link=False):
     return rows, tuple(history.RedisTerminalObservation.parse(r) for r in redis)
 
 
+def succeeded_document(now, *, metrics_retry=False):
+    """Native publication/metric rows, without any imported binding authority."""
+    rows = completed_rows()
+    if metrics_retry:
+        metric_retry(rows)
+    start = rows["youtube_upload_operations"][0]["completed_at"]
+    job, upload = rows["jobs"][0], rows["node_executions"][0]
+    job.update(pipeline_id=str(uuid.uuid4()), pipeline_snapshot={"nodes": [], "edges": []})
+    upload.update(node_id="upload", node_config={}, started_at=start)
+    input_artifact = rows["artifacts"][1]
+    rows["node_executions"].insert(0, dict(id=input_artifact["node_execution_id"], job_id=job["id"],
+        node_id="render", node_type="transcode", node_config={}, status="SUCCEEDED", input_artifact_ids=[],
+        output_artifact_id=input_artifact["id"], started_at=start, completed_at=start, error_message=None))
+    job["pipeline_snapshot"] = {"nodes": [
+        {"id": n["node_id"], "type": n["node_type"], "position": {"x": i * 100, "y": 0}, "data": {"config": {}}}
+        for i, n in enumerate(rows["node_executions"])], "edges": [
+        {"id": "input", "source": "render", "target": "upload", "sourceHandle": "video", "targetHandle": "video"}]}
+    rows["publishing_accounts"][0].update(platform_account_id="", account_label="Historical synthetic account")
+    rows["channel_profiles"][0].update(name="Historical synthetic channel", intake_paused_at=start)
+    rows["production_tasks"][0]["prompt"] = "Synthetic completed history"
+    rows["publication_records"][0].update(title="owned", compliance_disposition="owned_generated")
+    rows["youtube_upload_operations"][0]["content_sha256"] = "e" * 64
+    for artifact in rows["artifacts"]:
+        artifact.update(kind="INTERMEDIATE", filename="synthetic.mp4", mime_type="video/mp4", file_size=100,
+                        storage_backend="local", storage_path="artifacts/synthetic.mp4")
+    identities = {value: str(uuid.uuid4()) for value in re.findall(
+        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", json.dumps(rows))}
+    shift = now - NOW
+
+    def remap(value):
+        if isinstance(value, dict):
+            return {key: remap(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [remap(item) for item in value]
+        if isinstance(value, str):
+            # Queue idempotency keys contain both UUIDs and RFC3339 dates.
+            value = re.sub(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", lambda m: identities[m[0]], value)
+            value = re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:\+00:00|Z)",
+                lambda m: (datetime.fromisoformat(m[0]) + shift).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+                if m[0].endswith("Z") else (datetime.fromisoformat(m[0]) + shift).isoformat(), value)
+        return value
+
+    rows = remap(rows)
+    for name, records in rows.items():
+        model = history.HISTORY_MODELS[name]
+        for row in records:
+            for column in model.__table__.columns:
+                if column.name in row:
+                    continue
+                if column.nullable:
+                    value = None
+                elif column.type.python_type is datetime:
+                    value = now.isoformat()
+                elif column.default is not None:
+                    value = column.default.arg(None) if column.default.is_callable else column.default.arg
+                else:
+                    raise AssertionError((name, column.name, "fixture value required"))
+                if isinstance(value, enum.Enum):
+                    value = value.name
+                if isinstance(value, uuid.UUID):
+                    value = str(value)
+                row[column.name] = value
+    return rows
+
+
 async def catalogue(connection):
     return {r["name"]: dict(r) for r in await connection.fetch("""
         SELECT p.proname AS name, pg_get_function_identity_arguments(p.oid) AS arguments,
@@ -167,7 +233,7 @@ async def a2_pg(monkeypatch, tmp_path, request):
     system = os.environ.get("OWNED_HISTORY_A2_POSTGRES_SYSTEM_ID", "")
     assert re.fullmatch(r"[0-9]{10,20}", system), "explicit scratch cluster identity required"
     admin = await asyncpg.connect(dsn(anchor), timeout=5, command_timeout=10)
-    name = "vp_owned_history_a2_" + uuid.uuid4().hex
+    name = "vp_owned_inventory_test_a2_" + uuid.uuid4().hex
     target = anchor.set(database=name)
     created, roles, stables, engines = False, [], [], []
     owner = None

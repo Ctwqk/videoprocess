@@ -219,3 +219,218 @@ async def test_actual_restricted_unknown_reserve_serializes_on_the_same_schedule
                 await asyncio.gather(task, return_exceptions=True)
             await qualifier.rollback()
             await writer.rollback()
+
+
+async def first_failure(worker):
+    from app.services.job_execution_authority import prepare_worker_event_emission, mark_worker_event_emitted
+
+    claim = worker.context.execution_claim
+    payload = {"event": "node_failed", "error": "synthetic first failure", "job_id": str(worker.job_id),
+        "node_execution_id": str(worker.node_id), "worker_id": claim.worker_id, "started_at": claim.started_at.isoformat(),
+        "worker_registration_id": str(claim.worker_registration_id), "worker_lease_epoch": str(claim.worker_lease_epoch),
+        "task_stream": "vp:tasks:youtube_publisher", "task_group": "youtube_publisher-workers",
+        "task_message_id": worker.message_id, "task_payload_sha256": worker.payload_sha256,
+        "task_dispatch_key": str(worker.dispatch_key)}
+    event = parse_registered_worker_event(redis_stream="vp:events", consumer_group="orchestrator",
+        message_id=f"9100000-{uuid.uuid4().int % (2**63)}", payload=payload)
+    async with worker.sessions() as db:
+        emission = await prepare_worker_event_emission(db, claim, attestation_id=worker.attestation_id,
+            redis_stream=event.redis_stream, consumer_group=event.consumer_group, payload_sha256=event.payload_sha256,
+            payload=payload, event_type=event.event_type)
+        await mark_worker_event_emitted(db, claim, emission_id=emission, message_id=event.message_id)
+        await db.commit()
+    return event
+
+
+@pytest.mark.parametrize("order", ["seal_first", "writer_commit", "writer_rollback"])
+async def test_actual_first_failure_retry_transaction_serializes_with_populated_seal(a2_active_worker, monkeypatch, order):
+    from app.orchestrator.engine import JobEngine
+
+    h, worker = a2_active_worker
+    event = await first_failure(worker)
+    receiver = RegisteredWorkerEventReceiptService(h.case.registered.session)
+    entered, applied, release, sealing = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+    pids, receipts, applications = {}, [], []
+    original = receiver._authority_locker
+    original_lock = service._lock_history_scope
+    original_assess = service._assess_qualified_draft
+    fresh_nodes = []
+
+    async def entry(db, *args, **kwargs):
+        pids["writer"] = await db.scalar(text("SELECT pg_backend_pid()"))
+        entered.set()
+        return await original(db, *args, **kwargs)
+
+    async def before_seal(db, *args, **kwargs):
+        pids["sealer"] = await db.scalar(text("SELECT pg_backend_pid()"))
+        sealing.set()
+        return await original_lock(db, *args, **kwargs)
+
+    def assessed(snapshot, *args, **kwargs):
+        fresh_nodes.extend(n for n in snapshot.rows.as_dict()["node_executions"] if n["id"] == str(worker.node_id))
+        return original_assess(snapshot, *args, **kwargs)
+
+    async def apply(db, receipt, received):
+        assert receipt.application_state == "accepted"
+        applications.append(receipt.id)
+        await JobEngine().apply_registered_worker_event(db, receipt, received)
+        row = (await db.execute(text("SELECT * FROM node_executions WHERE id=:id"), {"id": worker.node_id})).mappings().one()
+        assert row["status"] == "QUEUED" and row["retry_count"] == 1
+        assert all(row[name] is None for name in ("worker_id", "worker_registration_id", "worker_lease_epoch", "started_at"))
+        retry = (await db.execute(text("SELECT * FROM worker_task_dispatches WHERE origin_receipt_id=:id"), {"id": receipt.id})).mappings().one()
+        assert retry["delivery_state"] == "pending" and retry["delivery_attempted_at"] is None
+        assert retry["resolution_state"] == "unresolved" and retry["redis_message_id"] is None
+        assert await db.scalar(text("SELECT count(*) FROM worker_task_delivery_attestations WHERE node_execution_id=:id"), {"id": worker.node_id}) == 1
+        receipts.append(receipt.id)
+        applied.set()
+        if order != "seal_first":
+            await asyncio.wait_for(release.wait(), 8)
+        if order == "writer_rollback" and len(applications) == 1:
+            raise RuntimeError("synthetic atomic rollback")
+
+    receiver._authority_locker = entry
+    monkeypatch.setattr(service, "_lock_history_scope", before_seal)
+    monkeypatch.setattr(service, "_assess_qualified_draft", assessed)
+    task = qualifier = None
+    try:
+        if order == "seal_first":
+            from app.services.job_execution_authority import JobExecutionAuthorityBlocked
+
+            await h.case.owner.execute("UPDATE runtime_schedules SET state='CLOSED' WHERE service_name='videoprocess'")
+            async with h.case.sessions() as db:
+                await seal(h, db)
+                blocker = await db.scalar(text("SELECT pg_backend_pid()"))
+                task = asyncio.create_task(receiver.accept_and_apply(event, apply))
+                await asyncio.wait_for(entered.wait(), 5)
+                await wait_blocked(h.case.owner, pids["writer"], blocker)
+                async with h.case.owner.transaction():
+                    await h.case.owner.fetch("SELECT id FROM node_executions WHERE id=$1 FOR UPDATE NOWAIT", worker.node_id)
+                await db.commit()
+                with pytest.raises((DBAPIError, JobExecutionAuthorityBlocked)):
+                    await asyncio.wait_for(task, 5)
+            assert applications == []
+            assert await h.case.owner.fetchval("SELECT count(*) FROM registered_worker_event_receipts WHERE node_execution_id=$1", worker.node_id) == 0
+            # Only this disposable fixture reopens the unrelated live job. The
+            # approved c25 certificate remains installed and immutable.
+            await h.case.owner.execute("UPDATE runtime_schedules SET state='OPEN' WHERE service_name='videoprocess'")
+            receipt_id = await receiver.accept_and_apply(event, apply)
+            assert receipt_id == receipts[-1] and len(applications) == 1
+        else:
+            task = asyncio.create_task(receiver.accept_and_apply(event, apply))
+            await asyncio.wait_for(applied.wait(), 5)
+            qualifier = asyncio.create_task(approve(h))
+            await asyncio.wait_for(sealing.wait(), 5)
+            await wait_blocked(h.case.owner, pids["sealer"], pids["writer"])
+            # Accepted receipt + retry + released ownership are still invisible.
+            assert await h.case.owner.fetchval("SELECT count(*) FROM registered_worker_event_receipts WHERE node_execution_id=$1", worker.node_id) == 0
+            release.set()
+            if order == "writer_rollback":
+                with pytest.raises(RuntimeError, match="synthetic atomic rollback"):
+                    await asyncio.wait_for(task, 5)
+            else:
+                await asyncio.wait_for(task, 5)
+            response = await asyncio.wait_for(qualifier, 5)
+            assert response.status_code == 409 and response.json()["detail"] == "owned_inventory_v2_activation_disabled"
+            assert fresh_nodes[-1]["status"] == ("RUNNING" if order == "writer_rollback" else "QUEUED")
+            if order == "writer_rollback":
+                assert fresh_nodes[-1]["worker_id"] == event.claim.worker_id
+                assert await h.case.owner.fetchval("SELECT count(*) FROM worker_task_dispatches WHERE node_execution_id=$1", worker.node_id) == 1
+                await receiver.accept_and_apply(event, apply)
+        committed = await h.case.owner.fetchrow("SELECT * FROM registered_worker_event_receipts WHERE node_execution_id=$1", worker.node_id)
+        assert committed["application_state"] == "applied"
+        before = len(applications)
+        assert await receiver.accept_and_apply(event, apply) == committed["id"]
+        assert len(applications) == before
+        assert await h.case.owner.fetchval("SELECT count(*) FROM worker_task_dispatches WHERE origin_receipt_id=$1", committed["id"]) == 1
+        assert await h.case.owner.fetchval("SELECT count(*) FROM youtube_upload_operations WHERE node_execution_id=$1", worker.node_id) == 0
+        assert h.redis.calls and all(call[0] in {"get", "pending", "close"} for call in h.redis.calls)
+        from app.services.job_execution_authority import claim_registered_worker_node
+
+        class Bus:
+            evals = 0
+
+            async def eval(self, *_args):
+                self.evals += 1
+                return "9200000-0"
+
+            async def xack(self, *_args):
+                return 1
+
+        bus = Bus()
+        await receiver.acknowledge_applied(bus, event)
+        await receiver.deliver_pending_dispatches(bus)
+        retry = await h.case.owner.fetchrow("SELECT * FROM worker_task_dispatches WHERE origin_receipt_id=$1", committed["id"])
+        assert bus.evals == 1 and retry["redis_message_id"] == "9200000-0"
+        await worker.refresh(minimum_margin_seconds=1)
+        async with worker.sessions() as db:
+            claim, attestation = await claim_registered_worker_node(db, job_id=worker.job_id,
+                node_execution_id=worker.node_id, registration_id=worker.lease.registration_id,
+                lease_epoch=worker.lease.lease_epoch, worker_id=event.claim.worker_id,
+                redis_stream=retry["redis_stream"], consumer_group=retry["consumer_group"],
+                message_id=retry["redis_message_id"], payload_sha256=retry["payload_sha256"], dispatch_key=retry["dispatch_key"])
+            await db.commit()
+        assert attestation != worker.attestation_id and claim.started_at != event.claim.started_at
+        assert await receiver.accept_and_apply(event, apply) == committed["id"]
+        assert len(applications) == before and bus.evals == 1
+    finally:
+        release.set()
+        for pending in (task, qualifier):
+            if pending is not None and not pending.done():
+                pending.cancel()
+        await asyncio.gather(*(t for t in (task, qualifier) if t is not None), return_exceptions=True)
+
+
+async def test_actual_unresolved_cancel_ack_commits_before_waiting_sealer_reloads(a2_env, monkeypatch):
+    h = a2_env
+    retry = next(d for d in h.case.rows["worker_task_dispatches"] if d["origin_receipt_id"] is not None)
+    dispatch_id = uuid.UUID(retry["id"])
+    await h.case.owner.execute("UPDATE worker_task_dispatches SET resolution_state='unresolved',acknowledged_at=NULL WHERE id=$1", dispatch_id)
+    receiver = RegisteredWorkerEventReceiptService(h.case.registered.session)
+    assert await receiver._authorize_cancelled_dispatches(limit=10) == [dispatch_id]
+    locked, release, sealing = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    pids, ack_calls = {}, []
+    original = receiver._locked_dispatch_batch
+    original_lock = service._lock_history_scope
+
+    async def batch(db, *args, **kwargs):
+        result = await original(db, *args, **kwargs)
+        pids["writer"] = await db.scalar(text("SELECT pg_backend_pid()"))
+        return result
+
+    async def before_seal(db, *args, **kwargs):
+        pids["sealer"] = await db.scalar(text("SELECT pg_backend_pid()"))
+        sealing.set()
+        return await original_lock(db, *args, **kwargs)
+
+    class Redis:
+        async def xack(self, *args):
+            ack_calls.append(args)
+            locked.set()
+            await asyncio.wait_for(release.wait(), 8)
+            return 1
+
+    monkeypatch.setattr(receiver, "_locked_dispatch_batch", batch)
+    monkeypatch.setattr(service, "_lock_history_scope", before_seal)
+    task = asyncio.create_task(receiver._acknowledge_cancelled_dispatch(Redis(), dispatch_id))
+    qualifier = None
+    try:
+        await asyncio.wait_for(locked.wait(), 5)
+        qualifier = asyncio.create_task(approve(h))
+        await asyncio.wait_for(sealing.wait(), 5)
+        await wait_blocked(h.case.owner, pids["sealer"], pids["writer"])
+        release.set()
+        await asyncio.wait_for(task, 5)
+        result = await asyncio.wait_for(qualifier, 5)
+        assert result.status_code == 409 and result.json()["detail"] != "owned_inventory_v2_activation_disabled"
+        row = await h.case.owner.fetchrow("SELECT * FROM worker_task_dispatches WHERE id=$1", dispatch_id)
+        assert row["resolution_state"] == "acknowledged" and row["acknowledged_at"] is not None
+        assert ack_calls == [(retry["redis_stream"], retry["consumer_group"], retry["redis_message_id"])]
+        await receiver._acknowledge_cancelled_dispatch(Redis(), dispatch_id)
+        assert len(ack_calls) == 1
+        assert await h.case.owner.fetchval("SELECT count(*) FROM worker_task_delivery_attestations WHERE dispatch_key=$1", uuid.UUID(retry["dispatch_key"])) == 0
+    finally:
+        release.set()
+        for pending in (task, qualifier):
+            if pending is not None and not pending.done():
+                pending.cancel()
+        await asyncio.gather(*(t for t in (task, qualifier) if t is not None), return_exceptions=True)
