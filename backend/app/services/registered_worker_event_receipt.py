@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import insert, literal, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
@@ -269,7 +269,7 @@ async def stage_worker_task_dispatch(
         **dict(payload),
         "dispatch_key": str(dispatch_key),
     }
-    dispatch = WorkerTaskDispatch(
+    dispatch_values = dict(
         origin_receipt_id=origin_receipt_id,
         dispatch_key=dispatch_key,
         job_id=job_id,
@@ -280,6 +280,24 @@ async def stage_worker_task_dispatch(
         payload_json=dispatched_payload,
         delivery_state="pending",
     )
+    if db.get_bind().dialect.name == "postgresql":
+        values = {"id": uuid.uuid4(), **dispatch_values}
+        # Ordinary INSERT adds mapper defaults/nulls outside the orchestrator's
+        # column grant. Keep this explicit projection and use deployed DB defaults.
+        statement = (
+            insert(WorkerTaskDispatch)
+            .from_select(
+                list(values),
+                select(*(
+                    literal(value, type_=WorkerTaskDispatch.__table__.c[name].type)
+                    for name, value in values.items()
+                )),
+                include_defaults=False,
+            )
+            .returning(WorkerTaskDispatch)
+        )
+        return (await db.execute(statement)).scalar_one()
+    dispatch = WorkerTaskDispatch(**dispatch_values)
     db.add(dispatch)
     await db.flush()
     return dispatch
