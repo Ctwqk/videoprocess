@@ -216,6 +216,7 @@ jobs:
             run_contract python3 tests/test_worker_admission_transaction.py
             run_contract python3 tests/test_worker_marker_prior_config.py
             run_contract python3 tests/test_worker_control_untouched_rollback.py
+            run_contract python3 tests/test_vp_stage_overlay.py
             run_contract bash tests/test_worker_admission_deploy.sh
             run_contract bash tests/test_worker_control_recovery_executor.sh
             run_contract bash tests/test_worker_admission_rollback.sh

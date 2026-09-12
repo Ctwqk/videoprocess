@@ -202,6 +202,31 @@ VP_WORKER_ADMISSION_JANITOR_SERVICE_ID=""
 VP_WORKER_ADMISSION_JANITOR_GENERATION=""
 VP_WORKER_ADMISSION_JANITOR_SPEC_DIGEST=""
 
+stage_from_repo() {
+  local project="$1"
+  local repo_name="$2"
+  local source_subdir="$3"
+  local stage_tmp="$STAGE_ROOT/$project.tmp"
+  local stage_dir="$STAGE_ROOT/$project"
+  rm -rf "$stage_tmp" || return 1
+  mkdir -p "$stage_tmp" || return 1
+  rsync -a --delete --exclude '.git/' \
+    "$REPO_ROOT/$repo_name/$source_subdir"/ "$stage_tmp"/ || return 1
+  if [[ "$project" == vp-app ]]; then
+    # Startup switches and proxy routing are native; the host patch is obsolete.
+    install -m 0644 "$OVERLAY_ROOT/127-vp-backend.dockerignore" \
+      "$stage_tmp/backend/.dockerignore" || return 1
+    install -m 0644 "$OVERLAY_ROOT/127-vp-frontend/.dockerignore" \
+      "$stage_tmp/frontend/.dockerignore" || return 1
+    install -m 0644 "$OVERLAY_ROOT/127-vp-frontend/nginx.conf" \
+      "$stage_tmp/frontend/nginx.conf" || return 1
+  else
+    apply_overlay "$project" "$stage_tmp" || return 1
+  fi
+  rm -rf "$stage_dir" || return 1
+  mv "$stage_tmp" "$stage_dir"
+}
+
 vp_validate_topology() {
   if [[ "${BUILD_IMAGES:-1}" -eq 0 && "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
     return 0
