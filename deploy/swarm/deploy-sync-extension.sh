@@ -8277,6 +8277,7 @@ vp_reconcile_worker_admission_transaction() {
   for ((iteration = 0; iteration < 64; iteration++)); do
     vp_worker_admission_load_replay_plan || return 1
     if [[ "$VP_WORKER_ADMISSION_REPLAY_ACTIVE" != true ]]; then
+      VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
       VP_WORKER_ADMISSION_TRANSACTION_REPLAYED=true
       return 0
     fi
