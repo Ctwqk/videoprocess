@@ -3,6 +3,7 @@ package channelops
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Normal upload/history rows are synthetic fixture inputs, not measured worker
@@ -425,6 +427,17 @@ func TestOwnedProducerPGPromotionFreshAuthorityAndMissingPlan(t *testing.T) {
 	}
 }
 
+func TestOwnedProducerPGPromotionAfterRetainedB2History(t *testing.T) {
+	if !t.Run("retain-B2-history", func(t *testing.T) {
+		newOwnedPGFixtureWithHistory(t, func(store *Store, now time.Time) map[string]any {
+			return ownedB2PGSeedRetirement(t, store, now)
+		})
+	}) {
+		t.Fatal("retained-history setup failed")
+	}
+	t.Run("promotion", TestOwnedProducerPGPromotionFreshAuthorityAndMissingPlan)
+}
+
 func TestOwnedClosureNativeRowsHaveRequiredFieldsAndReferences(t *testing.T) {
 	// Derived from the existing native models' non-null columns without server
 	// defaults. PG constraints remain parent-qualified, never disabled here.
@@ -478,6 +491,119 @@ func TestOwnedClosureNativeRowsHaveRequiredFieldsAndReferences(t *testing.T) {
 			item := data.Items[0].Item
 			if wait, _, _ := historyNormal(historyObject(historyDecode(mustJSON(h))), item, now); wait == "" {
 				t.Fatal("current seeded work lost its real normal-history wait")
+			}
+		})
+	}
+}
+
+type ownedPromotionReentryProbe struct {
+	pgx.Tx
+	publication    PublicationRow
+	task           ProductionTaskRow
+	snapshot       ownedHistorySnapshot
+	historyReads   int
+	producerChecks int
+	reservation    bool
+	stop           error
+}
+
+func (p *ownedPromotionReentryProbe) QueryRow(_ context.Context, query string, args ...any) pgx.Row {
+	return ownedB2FenceRow(func(dest ...any) error {
+		switch {
+		case strings.Contains(query, "FROM runtime_schedules"):
+			return snapshotScan([]any{"OPEN"}, dest)
+		case strings.Contains(query, "FROM publication_records") && strings.Contains(query, "SELECT production_task_id"):
+			return snapshotScan([]any{p.task.ID}, dest)
+		case strings.Contains(query, "FROM publication_records"):
+			if args[0] != p.publication.ID {
+				return errors.New("publication identity changed on reentry")
+			}
+			v := p.publication
+			return snapshotScan([]any{v.ID, v.ProductionTaskID, v.Platform, v.AccountID, v.PlatformContentID, v.Permalink, v.Title, v.Description, v.DesiredPrivacy, v.CurrentPrivacy, v.PublishStatus, v.UploadedAt, v.ScheduledPublishAt, v.PublicAt, v.ComplianceDisposition, v.QuotaUnitsEstimated, v.LastMetricsPolledAt, []byte(mustJSON(v.WarningsJSON)), v.CreatedAt, v.UpdatedAt}, dest)
+		case strings.Contains(query, "FROM production_tasks AS task"):
+			v := p.task
+			return snapshotScan([]any{v.ID, v.ChannelProfileID, v.TopicLaneID, v.LaneFormatID, v.TargetAccountID, v.ManualSeedID, v.DiscoverySignalID, v.Source, v.TitleSeed, v.Prompt, []byte(mustJSON(v.RationaleJSON)), []byte(mustJSON(v.ScoreBreakdownJSON)), []byte(mustJSON(v.SourcePlatformsJSON)), []byte(mustJSON(v.MaterialLibraryIDsJSON)), v.UsesExternalAssets, v.ApprovalMode, []byte(mustJSON(v.HumanReviewEvidenceJSON)), v.AutoFlowPlanID, v.AutoFlowRunID, v.JobID, v.State, v.BlockedByGuard, v.FailureReason, v.FailureCategory, []byte(mustJSON(v.TransitionHistoryJSON)), v.ChannelConfigVersionSnapshot, []byte(mustJSON(v.ChannelConfigSnapshotJSON)), v.StateUpdatedAt, []byte(mustJSON(v.AgentApprovalEvidenceJSON))}, dest)
+		case strings.Contains(query, "FROM production_tasks") && strings.Contains(query, "FOR UPDATE"):
+			return snapshotScan([]any{p.task.ID}, dest)
+		case strings.Contains(query, "FROM publication_promotion_operations"):
+			return pgx.ErrNoRows
+		case strings.Contains(query, "SELECT EXISTS(SELECT 1 FROM owned_seed_inventories"):
+			p.producerChecks++
+			// Defer the observation request to the reservation's nested check.
+			return snapshotScan([]any{!p.reservation || p.producerChecks > 1}, dest)
+		case strings.Contains(query, "SELECT a.platform_account_id"):
+			return snapshotScan([]any{p.snapshot.platformChannelID}, dest)
+		case strings.Contains(query, "SELECT inventory_id::text"):
+			return pgx.ErrNoRows
+		case strings.Contains(query, "json_build_object("):
+			p.historyReads++
+			return snapshotScan([]any{p.snapshot.observedAt, []byte(p.snapshot.rowsJSON)}, dest)
+		case query == "SELECT clock_timestamp()":
+			return p.stop
+		default:
+			return fmt.Errorf("unexpected promotion reentry query: %s", query)
+		}
+	})
+}
+
+func (p *ownedPromotionReentryProbe) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
+	if !strings.Contains(query, "pg_advisory_xact_lock") {
+		return pgconn.CommandTag{}, fmt.Errorf("unexpected promotion reentry write: %s", query)
+	}
+	return pgconn.NewCommandTag("SELECT 1"), nil
+}
+
+func TestOwnedPromotionDecisionRetainsPreparationAcrossHistoryObservation(t *testing.T) {
+	for _, boundary := range []string{"revalidation", "reservation"} {
+		t.Run(boundary, func(t *testing.T) {
+			data, task, now := ownedProducerFixture(t)
+			history := ownedClosureHistory(t, data, 0, task, now.Add(-2*time.Hour), now, "promotion")
+			pub := historyRows(history["publications"])[0]
+			queue := historyOne(historySelect(history["queues"], func(q map[string]any) bool {
+				return q["kind"] == QueuePromotePublication
+			}), "fixture_promotion_queue")
+			item := QueueItemRow{ID: ownedString(queue["id"]), Kind: QueuePromotePublication, PayloadJSON: ownedMap(queue["payload_json"])}
+			if firstString(item.PayloadJSON, "publication_id") != pub["id"] {
+				t.Fatal("native promotion fixture lost its publication payload binding")
+			}
+			probe := &ownedPromotionReentryProbe{
+				publication: PublicationRow{ID: ownedString(pub["id"]), ProductionTaskID: ownedString(task["id"]), PlatformContentID: ownedString(pub["platform_content_id"])},
+				task:        ProductionTaskRow{ID: ownedString(task["id"]), ChannelProfileID: ownedString(task["channel_profile_id"])},
+				snapshot:    historySnapshot(t, historyGolden(t, "retired_unassigned")),
+				reservation: boundary == "reservation",
+				stop:        errors.New("bounded stop after fresh history observation"),
+			}
+			ctx := context.Background()
+			store := &Store{executionDB: probe, executionChannelID: &probe.task.ChannelProfileID}
+			// Load the same native row shape the finalizer will lock; this probe stops
+			// before producer assessment or writes, not a substitute for PG qualification.
+			publication, current, err := store.LockPromotionOperatorScope(ctx, probe.publication.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			scope, err := newPreparedPublicationSnapshot(publication, current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared := promotionPreparation{Scope: scope, DecisionRequest: ownedPromotionPolicyRequest(publication, current, "unlisted"), NeedsDecision: true, TargetVisibility: "unlisted", ScheduledAt: now}
+			original := string(mustJSON(prepared))
+			h := (&ownedPGFixture{}).handler(t, nil)
+			phases := 0
+			err = h.withOwnedHistoryObservation(ctx, func(evidence *ownedHistoryRedisEvidence) error {
+				phases++
+				clone := *store
+				clone.ownedHistoryEvidence = evidence
+				fenced := h
+				fenced.Store = &clone
+				var err error
+				prepared, err = fenced.finalizePromotionDecision(ctx, item, prepared, ownedProducerRealDecision())
+				return err
+			})
+			if !errors.Is(err, probe.stop) || phases != 2 || probe.historyReads != 2 {
+				t.Fatalf("promotion lost preparation before fresh authority reentry: err=%v phases=%d history_reads=%d", err, phases, probe.historyReads)
+			}
+			if string(mustJSON(prepared)) != original {
+				t.Fatal("observation retry changed the PDS-bound preparation")
 			}
 		})
 	}

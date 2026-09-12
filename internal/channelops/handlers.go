@@ -1149,6 +1149,9 @@ func (h HandlerService) finalizePromotionDecision(
 	prepared promotionPreparation,
 	decision PDSDecision,
 ) (promotionPreparation, error) {
+	// Observation reentry must retain the PDS-bound input, not an empty result
+	// or policy changes made inside the transaction that is being rolled back.
+	original := prepared
 	publication, task, err := h.Store.LockPromotionOperatorScope(
 		ctx,
 		prepared.Scope.Publication.ID,
@@ -1174,7 +1177,7 @@ func (h HandlerService) finalizePromotionDecision(
 	}
 	currentProducer, err := h.Store.lockOwnedProducer(ctx, task, "")
 	if err != nil {
-		return promotionPreparation{}, err
+		return original, err
 	}
 	if err := (preparedTaskSnapshot{Producer: prepared.Scope.Producer}).validateProducer(currentProducer); err != nil {
 		return promotionPreparation{}, err
@@ -1248,7 +1251,7 @@ func (h HandlerService) finalizePromotionDecision(
 		decision,
 	)
 	if err != nil {
-		return promotionPreparation{}, err
+		return original, err
 	}
 	prepared.Operation = operation
 	prepared.NeedsDecision = false
