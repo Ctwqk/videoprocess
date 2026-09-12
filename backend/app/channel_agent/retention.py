@@ -38,7 +38,11 @@ async def cleanup_expired(
         )
     ).scalars().all()
     audit_rows = (
-        await db.execute(select(AgentTickAudit).where(AgentTickAudit.started_at < audit_cutoff))
+        await db.execute(
+            select(AgentTickAudit)
+            .where(AgentTickAudit.started_at < audit_cutoff)
+            .where(AgentTickAudit.replay_status == "legacy_unreplayable")
+        )
     ).scalars().all()
     feedback_rows = (
         await db.execute(select(FeedbackSnapshot).where(FeedbackSnapshot.collected_at < feedback_cutoff))

@@ -81,6 +81,8 @@ type tickPreparation struct {
 	Options     agentTickOptions
 	Now         time.Time
 	Owned       *ownedTickState
+	Policy      PolicyVersion
+	Features    SnapshotSet
 }
 
 func (p tickPreparation) validate(current tickPreparation) error {
@@ -105,7 +107,11 @@ func (s *Store) prepareTick(
 		return tickPreparation{}, fmt.Errorf("%w: channel %s intake is paused", ErrChannelExecutionBlocked, channelID)
 	}
 	if channel.OwnedSeedInventoryID != nil {
-		return s.prepareOwnedTick(ctx, channel, bucket, options)
+		p, err := s.prepareOwnedTick(ctx, channel, bucket, options)
+		if err != nil {
+			return tickPreparation{}, err
+		}
+		return s.captureTickFacts(p)
 	}
 	candidates := BuildTickCandidates(channel, lanes, accounts, seeds, signals, laneFormats, bucket)
 	var taskCount int64
@@ -138,7 +144,7 @@ func (s *Store) prepareTick(
 	if err != nil {
 		return tickPreparation{}, err
 	}
-	return tickPreparation{
+	return s.captureTickFacts(tickPreparation{
 		Channel:     channel,
 		Candidates:  candidates,
 		TaskCount:   taskCount,
@@ -147,7 +153,7 @@ func (s *Store) prepareTick(
 		Bucket:      bucket,
 		Options:     options,
 		Now:         now,
-	}, nil
+	})
 }
 
 func (s *Store) finalizeTick(
@@ -200,21 +206,21 @@ func (s *Store) finalizeTick(
 		tickSummary["canary_run_id"] = options.CanaryRunID
 		tickSummary["pause_intake_after_selection"] = true
 	}
-	tickAuditID, err := s.insertTickAudit(ctx, db, channelID, bucket, result, tickSummary)
+	auditWrite, err := s.beginSnapshotAudit(ctx, preparation, result, tickSummary)
 	if err != nil {
 		return err
 	}
-	decisionAuditIDs, err := s.insertDecisionAuditEntries(ctx, db, tickAuditID, channelID, result)
-	if err != nil {
-		return err
+	if auditWrite.replay {
+		return nil
 	}
+	decisionAuditIDs := auditWrite.decisionIDs
 	for _, alert := range alerts {
 		if _, err := s.enqueueAlert(ctx, db, alert, 5, ""); err != nil {
 			return err
 		}
 	}
 	if channel.DryRun {
-		return nil
+		return auditWrite.complete(ctx, db)
 	}
 
 	for _, candidate := range accepted {
@@ -227,10 +233,12 @@ func (s *Store) finalizeTick(
 				return err
 			}
 		}
-		if auditID := decisionAuditIDs[candidate.CandidateID]; auditID != "" {
-			if err := s.attachDecisionAuditTask(ctx, db, auditID, taskID); err != nil {
-				return err
-			}
+		auditID := decisionAuditIDs[candidate.CandidateID]
+		if auditID == "" {
+			return errors.New("missing candidate decision audit")
+		}
+		if err := s.attachDecisionAuditTask(ctx, db, auditID, taskID); err != nil {
+			return err
 		}
 		channelProfileID := channel.ID
 		if _, err := s.enqueue(ctx, db, EnqueueOptions{
@@ -249,7 +257,7 @@ func (s *Store) finalizeTick(
 			return err
 		}
 	}
-	return nil
+	return auditWrite.complete(ctx, db)
 }
 
 func (s *Store) pauseChannelIntake(

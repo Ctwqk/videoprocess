@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -333,12 +334,25 @@ func (s *Store) InsertTickAudit(ctx context.Context, channelID string, bucket st
 }
 
 func (s *Store) insertTickAudit(ctx context.Context, db dbExecutor, channelID string, bucket string, result TickResult, summary map[string]any) (string, error) {
+	return s.insertTickAuditWithSnapshots(ctx, db, channelID, bucket, result, summary, nil)
+}
+
+func (s *Store) insertTickAuditWithSnapshots(ctx context.Context, db dbExecutor, channelID string, bucket string, result TickResult, summary map[string]any, facts *snapshotAuditWrite) (string, error) {
 	now := s.Now().UTC()
 	tickID := fmt.Sprintf("tick:%s:%s", channelID, bucket)
 	decisionSummary := jsonObject(summary)
 	decisionSummary["accepted_candidates"] = candidateAuditSummaries(result.Accepted)
 	decisionSummary["rejected_candidates"] = candidateAuditSummaries(result.Rejected)
 	decisionSummary["tasks_to_create"] = result.TasksToCreate()
+	if facts != nil {
+		// Preserve the exact hash-covered decision inputs, including PDS requests
+		// and unavailable values not represented by the legacy audit columns.
+		decisions := make(map[string]CandidateDecisionFacts, len(facts.snapshots.Candidates))
+		for _, snapshot := range facts.snapshots.Candidates {
+			decisions[snapshot.CandidateID] = snapshot.CandidateDecisionFacts
+		}
+		decisionSummary["snapshot_decisions"] = decisions
+	}
 
 	summaryJSON, err := json.Marshal(decisionSummary)
 	if err != nil {
@@ -349,14 +363,21 @@ func (s *Store) insertTickAudit(ctx context.Context, db dbExecutor, channelID st
 		return "", err
 	}
 
+	var policyID, setHash, asOf any
+	status := "legacy_unreplayable"
+	if facts != nil {
+		policyID, setHash, asOf = facts.policyID, facts.snapshots.CandidateSetHash, facts.snapshots.FeatureAsOf
+		status = "snapshot_pending"
+	}
 	var id string
 	err = db.QueryRow(ctx, `
 		INSERT INTO agent_tick_audits (
 			id, channel_profile_id, tick_id, started_at, finished_at, dry_run,
 			ideas_discovered, candidates_scored, tasks_selected, tasks_rejected,
-			guards_triggered_json, decision_summary_json, error_message
+			guards_triggered_json, decision_summary_json, error_message,
+			policy_version_id, candidate_set_hash, feature_as_of, replay_status
 		)
-		VALUES (gen_random_uuid(), $1::uuid, $2, $3, $4, $5, $6, $6, $7, $8, $9::json, $10::json, NULL)
+		VALUES (gen_random_uuid(), $1::uuid, $2, $3, $4, $5, $6, $6, $7, $8, $9::json, $10::json, NULL, $11::uuid, $12, $13::timestamptz, $14)
 		ON CONFLICT (channel_profile_id, tick_id) DO UPDATE
 		SET finished_at = EXCLUDED.finished_at,
 		    dry_run = EXCLUDED.dry_run,
@@ -367,9 +388,11 @@ func (s *Store) insertTickAudit(ctx context.Context, db dbExecutor, channelID st
 		    guards_triggered_json = EXCLUDED.guards_triggered_json,
 		    decision_summary_json = EXCLUDED.decision_summary_json,
 		    error_message = NULL
+		WHERE agent_tick_audits.replay_status = 'legacy_unreplayable'
+		  AND EXCLUDED.replay_status = 'legacy_unreplayable'
 		RETURNING id
 	`, channelID, tickID, now, now, result.DryRun, len(result.Accepted)+len(result.Rejected),
-		result.TasksToCreate(), len(result.Rejected), guardsJSON, summaryJSON).Scan(&id)
+		result.TasksToCreate(), len(result.Rejected), guardsJSON, summaryJSON, policyID, setHash, asOf, status).Scan(&id)
 	return id, err
 }
 
@@ -383,6 +406,9 @@ func (s *Store) insertDecisionAuditEntries(ctx context.Context, db dbExecutor, t
 	candidates = append(candidates, result.Accepted...)
 	candidates = append(candidates, result.Rejected...)
 	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.CandidateID) == "" || ids[candidate.CandidateID] != "" {
+			return nil, errors.New("duplicate or missing decision candidate identity")
+		}
 		scoreJSON, err := json.Marshal(candidateScoreJSON(candidate))
 		if err != nil {
 			return nil, err

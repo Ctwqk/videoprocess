@@ -154,9 +154,10 @@ func newOwnedPGFixtureWithWindow(t *testing.T, legacy func(*Store, time.Time) ma
 		t.Fatal("disposable database unavailable")
 	}
 	t.Cleanup(store.Close)
+	store.buildCommitSHA = snapshotTestCommit
 	var revision string
-	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "043_owned_history_snapshot_rows" {
-		t.Fatal("disposable database must be migrated to 043_owned_history_snapshot_rows")
+	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "044_policy_decision_snapshots" {
+		t.Fatal("disposable database must be migrated to 044_policy_decision_snapshots")
 	}
 	var now time.Time
 	if err := store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
@@ -332,6 +333,9 @@ func (f *ownedPGFixture) assertCounts(t *testing.T, want int) {
 			t.Fatalf("%s count=%d want=%d", name, got, want)
 		}
 	}
+	if want == 1 {
+		assertPGSnapshotFacts(t, f.store, f.channel.ID, 1, 1)
+	}
 }
 
 func TestOwnedPGAtomicContendersAndCommittedResultLossReplay(t *testing.T) {
@@ -447,6 +451,7 @@ func TestOwnedPGEmptyPlatformAliasDeniedBeforePDS(t *testing.T) {
 		t.Fatalf("alias hold failed: %T", err)
 	}
 	f.assertCounts(t, 0)
+	assertPGSnapshotFacts(t, f.store, f.channel.ID, 0, 0)
 	var state string
 	if err := f.store.Pool.QueryRow(ctx, `SELECT state FROM owned_seed_inventories WHERE id=$1::uuid`, *f.channel.OwnedSeedInventoryID).Scan(&state); err != nil || state != "held" {
 		t.Fatal("alias did not close intake")
@@ -499,6 +504,9 @@ func TestOwnedPGPolicyFailureAndMutationHoldWithoutReplacement(t *testing.T) {
 				t.Fatalf("fresh finalizer failed: %T", err)
 			}
 			f.assertCounts(t, 0)
+			if mode != "runtime_closed" {
+				assertPGSnapshotFacts(t, f.store, f.channel.ID, 1, 0)
+			}
 			var state string
 			var paused bool
 			if err := f.store.Pool.QueryRow(ctx, `SELECT i.state,c.intake_paused_at IS NOT NULL FROM channel_profiles c JOIN owned_seed_inventories i ON i.id=c.owned_seed_inventory_id WHERE c.id=$1::uuid`, f.channel.ID).Scan(&state, &paused); err != nil {
@@ -746,6 +754,21 @@ func TestOwnedPGRollbackIncludesReservationTaskSeedAuditAndQueue(t *testing.T) {
 		t.Fatalf("rollback failed before tested boundary: %T", err)
 	}
 	f.assertCounts(t, 0)
+	for _, query := range []string{
+		`SELECT count(*) FROM decision_policy_versions WHERE portfolio_config_json->>'channel_profile_id'=$1`,
+		`SELECT count(*) FROM agent_tick_audits WHERE channel_profile_id=$1::uuid`,
+		`SELECT count(*) FROM decision_audit_entries WHERE channel_profile_id=$1::uuid`,
+		`SELECT count(*) FROM candidate_feature_snapshots WHERE source_record_refs_json->>'owned_inventory_id'=$1`,
+	} {
+		arg := f.channel.ID
+		if strings.Contains(query, "source_record_refs_json") {
+			arg = *f.channel.OwnedSeedInventoryID
+		}
+		var count int
+		if err := f.store.Pool.QueryRow(ctx, query, arg).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("snapshot rollback partial count=%d err=%v", count, err)
+		}
+	}
 	if err := f.store.RunTick(ctx, f.channel.ID, "retry", HandlerService{PDS: fakePDS{decision: ownedProducerRealDecision()}}); err != nil {
 		t.Fatalf("retry failed: %T", err)
 	}

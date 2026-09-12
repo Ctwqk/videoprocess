@@ -539,20 +539,20 @@ func (s *Store) finalizeOwnedTick(ctx context.Context, before, current tickPrepa
 		return errOwnedInventory
 	}
 	if state.HoldReason != "" {
-		return s.holdOwnedInventory(ctx, current, state.HoldReason, before.Candidates)
+		return s.holdOwnedInventory(ctx, current, before, state.HoldReason, before.Candidates)
 	}
 	if len(before.Candidates) == 1 && before.Candidates[0].owned != nil && before.Candidates[0].owned.ItemID == state.UnusedItemID && len(candidates) == 1 && candidates[0].CandidateID == before.Candidates[0].CandidateID && candidates[0].RejectionGuard != "owned_inventory_inputs_changed" && (candidates[0].Rejected || firstString(candidates[0].PDSDecisionJSON, "verdict") != "allow") {
-		return s.holdOwnedInventory(ctx, current, "owned_inventory_pds_denied", candidates)
+		return s.holdOwnedInventory(ctx, current, before, "owned_inventory_pds_denied", candidates)
 	}
 	// A competing committed admission or normal completion is a safe no-op on replay.
 	if state.Candidate == nil {
 		return s.completeOwnedItems(ctx, current)
 	}
 	if before.InputDigest != current.InputDigest {
-		return s.holdOwnedInventory(ctx, current, "owned_inventory_inputs_changed", before.Candidates)
+		return s.holdOwnedInventory(ctx, current, before, "owned_inventory_inputs_changed", before.Candidates)
 	}
 	if len(candidates) != 1 || candidates[0].CandidateID != state.Candidate.CandidateID || candidates[0].Rejected || firstString(candidates[0].PDSDecisionJSON, "verdict") != "allow" {
-		return s.holdOwnedInventory(ctx, current, "owned_inventory_pds_denied", candidates)
+		return s.holdOwnedInventory(ctx, current, before, "owned_inventory_pds_denied", candidates)
 	}
 	if current.Options.PauseIntakeAfterSelection || current.Options.PlanDelay != 0 || current.Channel.DryRun {
 		return errOwnedInventory
@@ -564,18 +564,18 @@ func (s *Store) finalizeOwnedTick(ctx context.Context, before, current tickPrepa
 	candidate.PDSDecisionJSON = candidates[0].PDSDecisionJSON
 	candidate.PDSRequestJSON = candidates[0].PDSRequestJSON
 	if err := requireOwnedCandidatePolicy(current.Channel, candidate); err != nil {
-		return s.holdOwnedInventory(ctx, current, "owned_inventory_pds_denied", candidates)
+		return s.holdOwnedInventory(ctx, current, before, "owned_inventory_pds_denied", candidates)
 	}
 	result := TickResult{Accepted: []TickCandidate{candidate}}
 	db := s.db()
-	audit, err := s.insertTickAudit(ctx, db, current.ChannelID, current.Bucket, result, map[string]any{"handler_version": "go", "owned_inventory_id": state.InventoryID, "manifest_sha256": candidate.owned.ManifestSHA})
+	auditWrite, err := s.beginSnapshotAudit(ctx, before, result, map[string]any{"handler_version": "go", "owned_inventory_id": state.InventoryID, "manifest_sha256": candidate.owned.ManifestSHA})
 	if err != nil {
 		return err
 	}
-	audits, err := s.insertDecisionAuditEntries(ctx, db, audit, current.ChannelID, result)
-	if err != nil {
-		return err
+	if auditWrite.replay {
+		return nil
 	}
+	audits := auditWrite.decisionIDs
 	taskID, err := s.insertProductionTask(ctx, db, current.Channel, candidate, current.Now)
 	if err != nil {
 		return err
@@ -613,9 +613,11 @@ func (s *Store) finalizeOwnedTick(ctx context.Context, before, current tickPrepa
 		if _, err := db.Exec(ctx, `UPDATE owned_seed_inventories SET state='exhausted',updated_at=$2::timestamp WHERE id=$1::uuid AND state='approved'`, state.InventoryID, current.Now); err != nil {
 			return err
 		}
-		return s.pauseChannelIntake(ctx, db, current.ChannelID, current.Now, "owned_inventory_exhausted")
+		if err := s.pauseChannelIntake(ctx, db, current.ChannelID, current.Now, "owned_inventory_exhausted"); err != nil {
+			return err
+		}
 	}
-	return nil
+	return auditWrite.complete(ctx, db)
 }
 
 func (s *Store) completeOwnedItems(ctx context.Context, preparation tickPreparation) error {
@@ -631,7 +633,7 @@ func (s *Store) completeOwnedItems(ctx context.Context, preparation tickPreparat
 	return nil
 }
 
-func (s *Store) holdOwnedInventory(ctx context.Context, preparation tickPreparation, reason string, candidates []TickCandidate) error {
+func (s *Store) holdOwnedInventory(ctx context.Context, preparation, source tickPreparation, reason string, candidates []TickCandidate) error {
 	tag, err := s.db().Exec(ctx, `UPDATE owned_seed_inventories SET state=CASE WHEN $2='owned_inventory_expired' THEN 'expired' ELSE 'held' END,hold_reason=$2,updated_at=$3::timestamp WHERE id=$1::uuid AND state='approved'`, preparation.Owned.InventoryID, reason, preparation.Now)
 	if err != nil {
 		return err
@@ -649,12 +651,11 @@ func (s *Store) holdOwnedInventory(ctx context.Context, preparation tickPreparat
 		}
 	}
 	result := TickResult{Rejected: rejected}
-	audit, err := s.insertTickAudit(ctx, s.db(), preparation.ChannelID, preparation.Bucket, result, map[string]any{"handler_version": "go", "owned_inventory_id": preparation.Owned.InventoryID, "hold_reason": reason})
+	auditWrite, err := s.beginSnapshotAudit(ctx, source, result, map[string]any{"handler_version": "go", "owned_inventory_id": preparation.Owned.InventoryID, "hold_reason": reason})
 	if err != nil {
 		return err
 	}
-	_, err = s.insertDecisionAuditEntries(ctx, s.db(), audit, preparation.ChannelID, result)
-	return err
+	return auditWrite.complete(ctx, s.db())
 }
 
 // This marker is minted only by finalizeOwnedTick after the fresh typed lookup.

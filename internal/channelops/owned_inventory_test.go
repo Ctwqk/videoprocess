@@ -359,6 +359,105 @@ type ownedHoldProbe struct {
 	stop   error
 }
 
+func TestOwnedTickPersistsPolicySnapshots(t *testing.T) {
+	for _, name := range []string{"success", "seventh", "hold", "changed", "pds-denied", "empty-hold"} {
+		t.Run(name, func(t *testing.T) {
+			channel, data, now := ownedTestFixture(t)
+			state := ownedTestAssess(t, channel, data, now)
+			db := &snapshotDB{}
+			s := &Store{executionDB: db, executionChannelID: &channel.ID, Now: func() time.Time { return now }, buildCommitSHA: snapshotTestCommit}
+			before, err := s.captureTickFacts(tickPreparation{Channel: channel, ChannelID: channel.ID, Bucket: "bucket", Now: now, Owned: &state, Candidates: []TickCandidate{*state.Candidate}, InputDigest: "original"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := before
+			copyState := state
+			current.Owned = &copyState
+			candidate := *state.Candidate
+			ownedProducerApproveCandidateFixture(t, channel, &candidate)
+			wantTasks := 1
+			switch name {
+			case "seventh":
+				copyState.ConsumedCount = 6
+			case "hold":
+				copyState.HoldReason = "owned_inventory_expired"
+				wantTasks = 0
+			case "changed":
+				current.InputDigest = "changed"
+				current.Channel.ConfigVersion++
+				wantTasks = 0
+			case "pds-denied":
+				candidate.Rejected = true
+				candidate.PDSDecisionJSON = map[string]any{"verdict": "block"}
+				wantTasks = 0
+			case "empty-hold":
+				copyState.HoldReason = "owned_inventory_expired"
+				wantTasks = 0
+				before.Candidates = nil
+				before, err = s.captureTickFacts(before)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.finalizeOwnedTick(context.Background(), before, current, []TickCandidate{candidate}); err != nil {
+				t.Fatal(err)
+			}
+			if !db.pending || !db.complete || db.tasks != wantTasks || db.attached != wantTasks {
+				t.Fatalf("incomplete owned %s: pending=%t complete=%t tasks=%d attached=%d", name, db.pending, db.complete, db.tasks, db.attached)
+			}
+			if len(db.snapshotFacts) != len(before.Candidates) {
+				t.Fatal("owned candidate facts lost")
+			}
+			if !strings.Contains(db.statements[len(db.statements)-1], "snapshot_complete") {
+				t.Fatal("owned completion not last")
+			}
+			var persisted PolicyVersion
+			if err := json.Unmarshal(db.policy, &persisted); err != nil {
+				t.Fatal(err)
+			}
+			if persisted.ConfigHash != before.Policy.ConfigHash {
+				t.Fatal("hold relabeled current config as prior facts")
+			}
+		})
+	}
+}
+
+func TestOwnedSnapshotNoAuditNoOpRemainsNoOp(t *testing.T) {
+	db := &snapshotDB{}
+	state := ownedTickState{InventoryID: "inventory"}
+	p := tickPreparation{Owned: &state}
+	if err := (&Store{executionDB: db}).finalizeOwnedTick(context.Background(), p, p, nil); err != nil {
+		t.Fatal(err)
+	}
+	if db.writes != 0 || db.queries != 0 {
+		t.Fatal("owned no-op added audit or policy writes")
+	}
+}
+
+func TestOwnedSnapshotLateFailuresRemainIncomplete(t *testing.T) {
+	for _, failure := range []string{"UPDATE owned_seed_inventory_items item", "UPDATE manual_seeds SET status='exhausted'", "UPDATE owned_seed_inventories SET state='exhausted'", "UPDATE channel_profiles", "snapshot_complete"} {
+		t.Run(failure, func(t *testing.T) {
+			channel, data, now := ownedTestFixture(t)
+			state := ownedTestAssess(t, channel, data, now)
+			state.ConsumedCount = 6
+			db := &snapshotDB{fail: failure}
+			s := &Store{executionDB: db, executionChannelID: &channel.ID, Now: func() time.Time { return now }, buildCommitSHA: snapshotTestCommit}
+			p, err := s.captureTickFacts(tickPreparation{Channel: channel, ChannelID: channel.ID, Bucket: "bucket", Now: now, Owned: &state, Candidates: []TickCandidate{*state.Candidate}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate := *state.Candidate
+			ownedProducerApproveCandidateFixture(t, channel, &candidate)
+			if err := s.finalizeOwnedTick(context.Background(), p, p, []TickCandidate{candidate}); err == nil {
+				t.Fatal("owned final write failure swallowed")
+			}
+			if db.complete {
+				t.Fatal("failed owned write marked complete")
+			}
+		})
+	}
+}
+
 func (p *ownedHoldProbe) Exec(_ context.Context, query string, args ...any) (pgconn.CommandTag, error) {
 	if strings.Contains(query, "UPDATE owned_seed_inventories SET state=CASE") {
 		p.reason = args[1].(string)
