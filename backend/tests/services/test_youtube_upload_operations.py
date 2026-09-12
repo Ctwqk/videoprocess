@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.models.artifact import Artifact
 from app.models.channel_agent import ChannelProfile, ProductionTask, PublicationRecord
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.models.owned_seed_inventory import OwnedSeedInventory
 from app.models.schedule import RuntimeSchedule
 from app.models.youtube_upload_operation import YouTubeUploadOperation
 from app.services import youtube_upload_operations as upload_operations
@@ -68,6 +69,7 @@ async def operation_session_factory(tmp_path):
             ProductionTask.__table__,
             RuntimeSchedule.__table__,
             YouTubeUploadOperation.__table__,
+            OwnedSeedInventory.__table__,
         ):
             await conn.run_sync(table.create)
 
@@ -541,6 +543,7 @@ async def test_submission_fence_rejects_reassigned_execution_claim(
     context = SimpleNamespace(
         job_id=job_id,
         node_execution_id=node_execution_id,
+        content_sha256="a" * 64,
         execution_claim=SimpleNamespace(
             job_id=job_id,
             node_execution_id=node_execution_id,
@@ -564,8 +567,11 @@ async def test_submission_fence_rejects_reassigned_execution_claim(
         async def __aexit__(self, exc_type, exc, traceback):
             return False
 
-        def begin(self):
+        async def begin(self):
             return FakeTransaction()
+
+        def in_transaction(self):
+            return False
 
     def session_factory():
         return FakeSession()
@@ -592,11 +598,48 @@ async def test_submission_fence_rejects_reassigned_execution_claim(
     )
     store = YouTubeUploadOperationStore(session_factory)
 
+    async def task_id(_db, _job_id):
+        return None
+
+    async def producer(_db, _task_id, **_kwargs):
+        return None
+
+    from app.services import owned_producer_fence
+    monkeypatch.setattr(store, "_production_task_id", task_id)
+    monkeypatch.setattr(owned_producer_fence, "lock_producer", producer)
+
     with pytest.raises(JobExecutionAuthorityBlocked, match="claim"):
         async with store.submission_fence(context):
             entered.append("posted")
 
     assert entered == []
+
+
+async def test_local_final_fence_rechecks_after_committed_attempt(operation_session_factory, monkeypatch):
+    from app.services import owned_producer_fence
+    from app.services.owned_seed_inventory import OwnedInventoryError
+    store = YouTubeUploadOperationStore(operation_session_factory)
+    async with operation_session_factory() as db:
+        context = await _context_for(db)
+    claim = await store.claim(context)
+    original = owned_producer_fence.lock_producer
+    calls = []
+
+    async def guarded(db, task_id, **kwargs):
+        calls.append(task_id)
+        if len(calls) == 3:
+            raise OwnedInventoryError("owned_inventory_producer_inactive")
+        return await original(db, task_id, **kwargs)
+
+    monkeypatch.setattr(owned_producer_fence, "lock_producer", guarded)
+    with pytest.raises(OwnedInventoryError, match="producer_inactive"):
+        async with store.submission_fence(context):
+            await store.mark_attempting(claim.operation.id, context=context)
+    assert len(calls) == 3
+    async with operation_session_factory() as db:
+        operation = await db.get(YouTubeUploadOperation, claim.operation.id)
+        assert operation.status == "reserved" and operation.request_attempted_at is not None
+        assert operation.manager_task_id is None
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import uuid
+from copy import deepcopy
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, get_args
 
 from sqlalchemy import func, or_, select
@@ -58,6 +61,7 @@ from app.models.channel_agent import (
     ManualSeed,
     MaterialUsageLedger,
     ProductionTask,
+    PublicationMetricSchedule,
     PublicationRecord,
     PublishingAccount,
     TakedownEvent,
@@ -65,6 +69,9 @@ from app.models.channel_agent import (
 )
 from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
 from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
+from app.models.owned_seed_inventory import OwnedSeedInventory, OwnedSeedInventoryItem
+from app.models.publication_promotion_operation import PublicationPromotionOperation
+from app.models.youtube_upload_operation import YouTubeUploadOperation
 from app.pds_client import (
     NoopPDSClient,
     PDSDecision,
@@ -72,6 +79,8 @@ from app.pds_client import (
     PolicyDecisionClient,
 )
 from app.schemas.autoflow import AutoFlowRequest, PlanningMode, SourceStrategy
+from app.services import owned_seed_inventory as inventory
+from app.services import owned_seed_inventory_history as owned_history
 
 
 _SAFE_PRIVACY_VALUES = {"private", "unlisted"}
@@ -960,6 +969,10 @@ class ChannelAgentService:
         return task
 
     async def handle_plan_task(self, db: AsyncSession, item: ChannelOpsQueueItem) -> ProductionTask:
+        from app.channel_agent.owned_producer import NOT_OWNED, maybe_plan
+        owned = await maybe_plan(self, db, item)
+        if owned is not NOT_OWNED:
+            return owned
         task = await self._task_from_item(db, item)
         request = self._autoflow_request(task)
         observation = await self.autoflow_client.plan_task(task, request)
@@ -1033,7 +1046,503 @@ class ChannelAgentService:
         await db.refresh(task)
         return task
 
+    async def _owned_downstream(self, db, item):
+        from app.channel_agent import owned_producer as owned
+        if await db.scalar(select(OwnedSeedInventory.id).where(OwnedSeedInventory.approved_at.is_not(None)).limit(1)) is None:
+            return owned.NOT_OWNED
+        lease = owned.QueueLease.capture(item)
+        db.info["owned_tick_lease"] = lease
+        publication_id = _uuid(lease.payload["publication_id"]) if "publication_id" in lease.payload else None
+        publication = await db.get(PublicationRecord, publication_id) if publication_id else None
+        task_id = publication.production_task_id if publication is not None else _uuid(lease.payload["production_task_id"])
+        policy_audit = {}
+        try:
+            linked = await db.scalar(select(OwnedSeedInventoryItem.id).where(OwnedSeedInventoryItem.production_task_id == task_id))
+            if linked is None:
+                # Absence of an inventory pointer must not bypass historical scope.
+                await owned.phase(db, lease, task_id)
+                await db.rollback()
+                await db.refresh(item)
+                db.info.pop("owned_tick_lease", None)
+                return owned.NOT_OWNED
+            if lease.kind == "execute_task":
+                return await self._execute_owned(db, lease, task_id)
+            if lease.kind == "publish_task":
+                return await self._publish_owned(db, lease, task_id)
+            if lease.kind == "observe_job":
+                return await self._observe_owned(db, lease, task_id)
+            if lease.kind == "promote_publication":
+                return await self._promote_owned(db, lease, task_id, publication_id, policy_audit)
+            if lease.kind == "collect_metrics":
+                return await self._collect_owned(db, lease, task_id, publication_id)
+            return await self._reconcile_owned(db, lease, task_id, publication_id)
+        except (inventory.OwnedInventoryError, owned_history.OwnedHistoryError) as error:
+            task = await owned.hold(db, self, lease, task_id, str(error),
+                policy_audit.get("promotion_pds"), evidence_key="promotion_pds")
+            if lease.kind in {"execute_task", "observe_job"}:
+                return task
+            return await db.get(PublicationRecord, publication_id) if lease.kind != "collect_metrics" and publication_id else None
+        except BaseException:
+            await db.rollback()
+            raise
+
+    async def _owned_settlement(self, db, lease, task_id):
+        from app.channel_agent import owned_producer as owned
+        task = await owned.settlement_phase(db, lease, task_id)
+        channel = await db.get(ChannelProfile, task.channel_profile_id)
+        inventory.require(channel.enabled and not channel.dry_run and channel.halted_at is None, "channel_execution_blocked")
+        return task
+
+    async def _execute_owned(self, db, lease, task_id):
+        from app.channel_agent import owned_producer as owned
+        task = await self._owned_settlement(db, lease, task_id)
+        if not (task.autoflow_run_id and task.job_id):
+            authority, task = await owned.phase(db, lease, task_id)
+            plan = await self._owned_approved_plan(db, task, authority)
+            inventory.require(plan is not None and lease.payload.get("plan_id") == str(plan.id)
+                and lease.payload.get("autoflow_plan_id") == str(plan.id)
+                and lease.payload.get("expected_approved_revision") == plan.approved_revision
+                and lease.payload.get("expected_approved_revision_hash") == plan.approved_revision_hash
+                and plan.approved_revision == plan.execution_revision and bool(plan.approved_revision_hash),
+                "owned_inventory_execute_binding")
+            queue = await lease.lock(db)
+            request = self._autoflow_request(task)
+            request["_channelops_execute"] = {
+                "production_task_id": str(task.id), "channelops_queue_item_id": str(lease.id),
+                "channelops_queue_locked_by": lease.owner, "channelops_queue_locked_at": lease.at,
+                "expected_approved_revision": plan.approved_revision,
+                "expected_approved_revision_hash": plan.approved_revision_hash,
+                "idempotency_key": queue.idempotency_key,
+            }
+            detached = SimpleNamespace(**{c.name: getattr(task, c.name) for c in ProductionTask.__table__.columns})
+            await db.rollback()
+            observation = await self.autoflow_client.execute_task(detached, request)
+            # AutoFlow owns the atomic run/job/task write. A response is not a replacement receipt.
+            task = await self._owned_settlement(db, lease, task_id)
+            inventory.require(task.autoflow_run_id is not None and task.job_id is not None
+                and str(task.autoflow_run_id) == observation.run_id and str(task.job_id) == observation.job_id,
+                "owned_inventory_execute_result")
+        run = await db.get(AutoFlowRunModel, task.autoflow_run_id)
+        queue = await lease.lock(db)
+        inventory.require(run is not None and run.plan_id == task.autoflow_plan_id and run.job_id == task.job_id
+            and run.pipeline_id == task.pipeline_id and run.execute_idempotency_key == queue.idempotency_key,
+            "owned_inventory_execute_result")
+        await self.queue.enqueue(db, kind="observe_job", idempotency_key=f"observe_job:{task.id}:{run.id}:{task.job_id}:0",
+            payload={"production_task_id": str(task.id), "run_id": str(run.id), "job_id": str(task.job_id), "observe_count": 0},
+            priority=65, channel_profile_id=task.channel_profile_id, parent_queue_item_id=lease.id, commit=False)
+        await owned.complete_queue(db, lease)
+        await db.commit()
+        await db.refresh(task)
+        return task
+
+    async def _owned_approved_plan(self, db, task, authority):
+        from app.services.owned_producer_fence import require_owned_pipeline
+        from app.services.owned_producer_workflow import require_policy, require_request
+
+        inventory.require(task.autoflow_plan_id is not None, "owned_inventory_plan_missing")
+        plan = (await db.scalars(select(AutoFlowPlanModel).where(AutoFlowPlanModel.id == task.autoflow_plan_id)
+            .execution_options(populate_existing=True))).one_or_none()
+        inventory.require(plan is not None and plan.approved_revision == plan.execution_revision
+            and bool(plan.approved_revision_hash) and bool(plan.review_approved_at or plan.agent_approved_by),
+            "owned_inventory_plan_approval")
+        require_policy(task, plan_id=str(plan.id))
+        require_request(plan.request_json, task, authority.identity)
+        require_owned_pipeline(plan.pipeline_definition, task.agent_approval_evidence_json["owned_inventory"]["input_asset_id"])
+        return plan
+
+    async def _owned_upload_receipt(self, db, task):
+        operation = (await db.scalars(select(YouTubeUploadOperation).where(
+            YouTubeUploadOperation.production_task_id == task.id).execution_options(populate_existing=True))).one_or_none()
+        inventory.require(operation is not None and operation.status == "succeeded" and operation.privacy == "unlisted"
+            and operation.job_id == task.job_id and operation.platform_video_id
+            and operation.receipt_json.get("video_id") == operation.platform_video_id
+            and operation.receipt_json.get("privacy") == "unlisted", "owned_inventory_receipt")
+        binding = (await db.scalars(select(OwnedSeedInventoryItem).where(OwnedSeedInventoryItem.production_task_id == task.id))).one()
+        snapshot = await owned_history.load_owned_history_evidence(db, platform_channel_id=binding.platform_channel_id)
+        rows = snapshot.rows.as_dict()
+        facts = owned_history._task_history(rows, next(t for t in rows["production_tasks"] if t["id"] == str(task.id)))
+        owned_history._normal_history(facts, next(i for i in rows["owned_seed_inventory_items"] if i["id"] == str(binding.id)),
+            await inventory._now(db))
+        inventory.require(facts["job"]["status"] == "SUCCEEDED", "owned_inventory_job_receipt")
+        return operation
+
+    async def _observe_owned(self, db, lease, task_id):
+        from app.channel_agent import owned_producer as owned
+
+        task = await self._owned_settlement(db, lease, task_id)
+        run_id, job_id = str(task.autoflow_run_id), str(task.job_id)
+        inventory.require(lease.payload.get("run_id") == run_id and lease.payload.get("job_id") == job_id
+            and task.autoflow_run_id is not None and task.job_id is not None, "owned_inventory_execute_result")
+        count = _nonnegative_int(lease.payload.get("observe_count"), default=0)
+        inventory.require(count < _MAX_AUTOFLOW_OBSERVE_POLLS, "autoflow_observe_timeout")
+        await db.rollback()
+        observation = await self.autoflow_client.observe_job(db, run_id=run_id, job_id=job_id)
+        await db.rollback()
+        task = await self._owned_settlement(db, lease, task_id)
+        inventory.require(str(task.autoflow_run_id) == run_id and str(task.job_id) == job_id
+            and observation.run_id == run_id and observation.job_id == job_id, "owned_inventory_execute_result")
+        status = _status_value(observation.status)
+        if status in {"pending", "running", "queued", "waiting_window", "validating", "planning"}:
+            await self.queue.enqueue(db, kind="observe_job", idempotency_key=f"observe_job:{task_id}:{run_id}:{job_id}:{count + 1}",
+                payload={"production_task_id": str(task_id), "run_id": run_id, "job_id": job_id, "observe_count": count + 1},
+                priority=65, run_after=self.clock.now() + timedelta(seconds=min(30 * 2 ** count, 300)), channel_profile_id=task.channel_profile_id,
+                parent_queue_item_id=lease.id, commit=False)
+        elif status == "failed":
+            raise inventory.OwnedInventoryError("autoflow_job_failed")
+        else:
+            operation = await self._owned_upload_receipt(db, task)
+            inventory.require(observation.youtube == operation.receipt_json, "owned_inventory_receipt")
+            await self.queue.enqueue(db, kind="publish_task", idempotency_key=f"publish_task:{task_id}",
+                payload={"production_task_id": str(task_id), "youtube": operation.receipt_json}, priority=66,
+                channel_profile_id=task.channel_profile_id, parent_queue_item_id=lease.id, commit=False)
+        await owned.complete_queue(db, lease)
+        await db.commit()
+        await db.refresh(task)
+        return task
+
+    async def _publish_owned(self, db, lease, task_id):
+        from app.channel_agent import owned_producer as owned
+        task = await self._owned_settlement(db, lease, task_id)
+        operation = await self._owned_upload_receipt(db, task)
+        inventory.require(lease.payload.get("youtube") == operation.receipt_json, "owned_inventory_receipt")
+        publication = await self._publication_for_task(db, task)
+        if publication is None:
+            references = await self._material_references_for_publish(db, task=task, upload_metadata=operation.receipt_json)
+            guard = await self._publish_time_material_usage_guard(db, task=task, references=references)
+            inventory.require(guard is None, guard or "owned_inventory_material_usage")
+            now = await inventory._now(db)
+            publication = PublicationRecord(production_task_id=task.id, platform="youtube", account_id=task.target_account_id,
+                platform_content_id=operation.platform_video_id, permalink=operation.receipt_json["url"],
+                title=operation.receipt_json["title"], description=task.prompt, tags_json=operation.receipt_json["tags"],
+                desired_privacy="unlisted", current_privacy="unlisted", publish_status="uploaded", uploaded_at=now,
+                compliance_disposition="assumed_fair_use", quota_units_estimated=operation.receipt_json["quota_estimate"])
+            db.add(publication)
+            await db.flush()
+            await self._write_material_usage_ledger(db, task=task, publication=publication,
+                upload_metadata=operation.receipt_json, references=references)
+            task.state, task.state_updated_at = TASK_UPLOADED_PRIVATE, now
+        inventory.require(publication.platform_content_id == operation.platform_video_id
+            and publication.account_id == task.target_account_id and publication.desired_privacy == "unlisted"
+            and publication.public_at is None, "owned_inventory_publication_identity")
+        scheduled = inventory.utc(publication.uploaded_at) + timedelta(hours=1)
+        stamp = owned_history._z(scheduled)
+        await self.queue.enqueue(db, kind="promote_publication",
+            idempotency_key=f"promote_publication:{publication.id}:unlisted:{stamp}",
+            payload={"publication_id": str(publication.id), "scheduled_at": stamp, "target_visibility": "unlisted"},
+            priority=70, run_after=scheduled, channel_profile_id=task.channel_profile_id, parent_queue_item_id=lease.id, commit=False)
+        await owned.complete_queue(db, lease)
+        await db.commit()
+        await db.refresh(publication)
+        return publication
+
+    async def _owned_publication(self, db, lease, task_id, publication_id):
+        task = await self._owned_settlement(db, lease, task_id)
+        publication = (await db.scalars(select(PublicationRecord).where(PublicationRecord.id == publication_id)
+            .with_for_update().execution_options(populate_existing=True))).one_or_none()
+        inventory.require(publication is not None and publication.production_task_id == task.id
+            and publication.account_id == task.target_account_id and publication.platform == "youtube"
+            and publication.platform_content_id and publication.public_at is None, "owned_inventory_publication_identity")
+        return task, publication
+
+    async def _promote_owned(self, db, lease, task_id, publication_id, policy_audit):
+        from app.channel_agent import owned_producer as owned
+        from app.services.owned_producer_fence import policy_evidence, require_real_pds
+        task, publication = await self._owned_publication(db, lease, task_id, publication_id)
+        operation = (await db.scalars(select(PublicationPromotionOperation).where(
+            PublicationPromotionOperation.publication_id == publication_id).with_for_update()
+            .execution_options(populate_existing=True))).one_or_none()
+        scheduled = _parse_datetime(lease.payload["scheduled_at"])
+        inventory.require(lease.payload.get("target_visibility") == publication.desired_privacy == "unlisted",
+            "owned_inventory_publication_privacy")
+        if operation is None or operation.status == "reserved":
+            authority, task = await owned.phase(db, lease, task_id)
+            prepared = authority.digest
+            task, publication = await self._owned_publication(db, lease, task_id, publication_id)
+            inventory.require(task.state == TASK_UPLOADED_PRIVATE and publication.publish_status == "uploaded",
+                "owned_inventory_promotion_state")
+            await self._owned_upload_receipt(db, task)
+            plan = await self._owned_approved_plan(db, task, authority)
+            plan_binding = (plan.id, plan.approved_revision, plan.approved_revision_hash)
+            request = self._owned_promotion_policy_request(publication, task)
+            prepared_evidence = deepcopy(task.agent_approval_evidence_json)
+            publication_facts = (publication.platform_content_id, publication.title, publication.description,
+                publication.desired_privacy, publication.current_privacy, publication.publish_status)
+            operation = (await db.scalars(select(PublicationPromotionOperation).where(
+                PublicationPromotionOperation.publication_id == publication_id).with_for_update()
+                .execution_options(populate_existing=True))).one_or_none()
+            reservation = None
+            if operation is not None:
+                inventory.require(operation.status == "reserved", "owned_inventory_promotion_changed")
+                self._check_owned_promotion(operation, lease, publication, task_id, scheduled)
+                decision = deepcopy(operation.decision_json)
+                self._require_owned_promotion_policy(publication, task, decision)
+                envelope = policy_evidence(request, decision)
+                reservation = operation.id
+            else:
+                inventory.require("promotion_pds" not in prepared_evidence, "owned_inventory_pds_context")
+            await db.rollback()
+            if reservation is None:
+                try:
+                    decision = asdict(await self.pds_client.decide(request))
+                except Exception:
+                    raise inventory.OwnedInventoryError("owned_inventory_pds_error") from None
+                envelope = policy_evidence(request, decision)
+                policy_audit["promotion_pds"] = envelope
+            authority, task = await owned.phase(db, lease, task_id)
+            inventory.require(authority.digest == prepared, "owned_inventory_producer_changed")
+            task, publication = await self._owned_publication(db, lease, task_id, publication_id)
+            inventory.require(task.agent_approval_evidence_json == prepared_evidence
+                and asdict(self._owned_promotion_policy_request(publication, task)) == envelope["request"],
+                "owned_inventory_pds_context")
+            require_real_pds(decision)
+            inventory.require(publication_facts == (publication.platform_content_id, publication.title, publication.description,
+                publication.desired_privacy, publication.current_privacy, publication.publish_status),
+                "owned_inventory_publication_identity")
+            inventory.require(task.state == TASK_UPLOADED_PRIVATE, "owned_inventory_promotion_state")
+            plan = await self._owned_approved_plan(db, task, authority)
+            inventory.require(plan_binding == (plan.id, plan.approved_revision, plan.approved_revision_hash),
+                "owned_inventory_plan_approval")
+            await self._owned_upload_receipt(db, task)
+            operation = (await db.scalars(select(PublicationPromotionOperation).where(
+                PublicationPromotionOperation.publication_id == publication_id).with_for_update()
+                .execution_options(populate_existing=True))).one_or_none()
+            inventory.require((operation.id if operation is not None else None) == reservation,
+                "owned_inventory_promotion_changed")
+            if operation is None:
+                operation_id = uuid.uuid4()
+                operation = PublicationPromotionOperation(id=operation_id, publication_id=publication_id,
+                    production_task_id=task_id, queue_item_id=lease.id, platform_video_id=publication.platform_content_id,
+                    target_privacy="unlisted", scheduled_at=scheduled, attempt_key=f"channelops-promotion:{operation_id}",
+                    status="reserved", decision_json=decision)
+                db.add(operation)
+            inventory.require(operation.status == "reserved", "owned_inventory_promotion_changed")
+            inventory.require(operation.decision_json == decision, "owned_inventory_pds_context")
+            self._check_owned_promotion(operation, lease, publication, task_id, scheduled)
+            expected_evidence = {**prepared_evidence, "promotion_pds": envelope}
+            task.agent_approval_evidence_json = expected_evidence
+            operation.status, operation.request_attempted_at = "submitting", await inventory._now(db)
+            operation.decision_json = decision
+            video_id = operation.platform_video_id
+            attempt = (operation.id, operation.attempt_key, inventory.utc(operation.request_attempted_at))
+            await db.commit()
+            # Only this first-attempt path may POST, under a freshly acquired final schedule fence.
+            authority, task = await owned.phase(db, lease, task_id)
+            inventory.require(authority.digest == prepared, "owned_inventory_producer_changed")
+            plan = await self._owned_approved_plan(db, task, authority)
+            inventory.require(plan_binding == (plan.id, plan.approved_revision, plan.approved_revision_hash),
+                "owned_inventory_plan_approval")
+            task, publication = await self._owned_publication(db, lease, task_id, publication_id)
+            inventory.require(task.agent_approval_evidence_json == expected_evidence, "owned_inventory_pds_context")
+            self._require_owned_promotion_policy(publication, task, decision)
+            inventory.require(publication_facts == (publication.platform_content_id, publication.title, publication.description,
+                publication.desired_privacy, publication.current_privacy, publication.publish_status)
+                and task.state == TASK_UPLOADED_PRIVATE, "owned_inventory_publication_identity")
+            operation = (await db.scalars(select(PublicationPromotionOperation).where(PublicationPromotionOperation.id == attempt[0])
+                .with_for_update().execution_options(populate_existing=True))).one()
+            self._check_owned_promotion(operation, lease, publication, task_id, scheduled)
+            inventory.require(operation.status == "submitting" and operation.request_attempted_at is not None
+                and attempt == (operation.id, operation.attempt_key, inventory.utc(operation.request_attempted_at))
+                and operation.decision_json == decision, "owned_inventory_promotion_changed")
+            await self._owned_upload_receipt(db, task)
+            try:
+                response = await self.youtube_client.schedule_publish(video_id=video_id, scheduled_at=scheduled, privacy="unlisted")
+                status = {"video_id": video_id, "privacy": "unlisted", "publish_status": "scheduled"}
+                evidence = {"manager_response": response}
+            except Exception:
+                status, evidence = {}, {}
+            finally:
+                await db.rollback()
+        else:
+            self._check_owned_promotion(operation, lease, publication, task_id, scheduled)
+            if operation.status == "finalized":
+                await owned.complete_queue(db, lease)
+                await db.commit()
+                await db.refresh(publication)
+                return publication
+            video_id = operation.platform_video_id
+            if operation.status == "confirmed":
+                status = {"video_id": video_id, "privacy": operation.observed_privacy,
+                    "publish_status": operation.observed_publish_status}
+                evidence = operation.evidence_json
+                await db.rollback()
+            else:
+                inventory.require(operation.status in {"submitting", "uncertain"}, "owned_inventory_promotion_state")
+                await db.rollback()
+                status, evidence = {}, {}
+        if not status:
+            try:
+                status = await self.youtube_client.fetch_status(video_id=video_id)
+                evidence = {"status_reconciliation": status}
+            except Exception:
+                status = {}
+        task, publication = await self._owned_publication(db, lease, task_id, publication_id)
+        operation = (await db.scalars(select(PublicationPromotionOperation).where(
+            PublicationPromotionOperation.publication_id == publication_id).with_for_update()
+            .execution_options(populate_existing=True))).one()
+        self._check_owned_promotion(operation, lease, publication, task_id, scheduled)
+        inventory.require(operation.status in {"submitting", "uncertain", "confirmed"}, "owned_inventory_promotion_changed")
+        privacy = status.get("privacy") or status.get("current_privacy")
+        state = status.get("publish_status") or status.get("processing_state") or status.get("upload_status")
+        if privacy != "unlisted" or status.get("video_id", video_id) != video_id or state in {"rejected", "removed", "failed", "claim", "claimed", "blocked"}:
+            operation.status, operation.error_message = "uncertain", "owned_inventory_promotion_uncertain"
+            operation.evidence_json = evidence
+            await db.commit()
+            raise inventory.OwnedInventoryError("owned_inventory_promotion_uncertain")
+        now = await inventory._now(db)
+        operation.status, operation.confirmed_at, operation.completed_at = "finalized", operation.confirmed_at or now, now
+        operation.observed_privacy, operation.observed_publish_status, operation.evidence_json = privacy, state, evidence
+        operation.error_message = None
+        publication.current_privacy, publication.publish_status, publication.scheduled_publish_at = "unlisted", "scheduled", scheduled
+        if task.state not in {TASK_HELD, TASK_FAILED, TASK_REJECTED}:
+            before = task.state
+            task.state, task.state_updated_at = TASK_SCHEDULED, now
+            task.transition_history_json = [*task.transition_history_json, _transition(before, TASK_SCHEDULED, "promote_publication", now)]
+        await self._owned_metric_schedules(db, lease, task, publication, scheduled)
+        stamp = owned_history._z(scheduled)
+        await self.queue.enqueue(db, kind="reconcile_publication", idempotency_key=f"reconcile_publication:{publication_id}:{stamp}",
+            payload={"publication_id": str(publication_id)}, priority=80, run_after=scheduled + timedelta(minutes=30),
+            channel_profile_id=task.channel_profile_id, parent_queue_item_id=lease.id, commit=False)
+        await owned.complete_queue(db, lease)
+        await db.commit()
+        await db.refresh(publication)
+        return publication
+
+    @staticmethod
+    def _owned_promotion_policy_request(publication, task):
+        return PDSDecisionRequest(actor_id=str(publication.account_id), action_type="publish", platform="youtube",
+            content={"title": publication.title, "description": publication.description or ""},
+            context={"publication_id": str(publication.id), "production_task_id": str(task.id),
+                "target_visibility": "unlisted",
+                "owned_inventory": deepcopy(task.agent_approval_evidence_json["owned_inventory"])})
+
+    @classmethod
+    def _require_owned_promotion_policy(cls, publication, task, decision):
+        from app.services.owned_producer_fence import policy_evidence, require_real_pds
+        require_real_pds(decision)
+        inventory.require(task.agent_approval_evidence_json.get("promotion_pds") ==
+            policy_evidence(cls._owned_promotion_policy_request(publication, task), decision),
+            "owned_inventory_pds_context")
+
+    @staticmethod
+    def _check_owned_promotion(operation, lease, publication, task_id, scheduled):
+        inventory.require(operation.production_task_id == task_id and operation.publication_id == publication.id
+            and operation.queue_item_id == lease.id and operation.platform_video_id == publication.platform_content_id
+            and operation.target_privacy == "unlisted" and inventory.utc(operation.scheduled_at) == scheduled,
+            "owned_inventory_promotion_binding")
+
+    async def _owned_metric_schedules(self, db, lease, task, publication, start):
+        for stage, due_hours, grace_hours in owned_history._METRIC_STAGES:
+            schedule = (await db.scalars(select(PublicationMetricSchedule).where(
+                PublicationMetricSchedule.publication_id == publication.id, PublicationMetricSchedule.snapshot_stage == stage))).one_or_none()
+            if schedule is None:
+                schedule = PublicationMetricSchedule(publication_id=publication.id, snapshot_stage=stage, effective_start_at=start,
+                    due_at=start + timedelta(hours=due_hours), grace_until=start + timedelta(hours=grace_hours))
+                db.add(schedule)
+                await db.flush()
+                await self.queue.enqueue(db, kind="collect_metrics",
+                    idempotency_key=f"collect_metrics:{publication.id}:stage:{stage}:attempt:0",
+                    payload={"publication_id": str(publication.id), "metric_schedule_id": str(schedule.id),
+                        "snapshot_stage": stage, "metrics_poll_count": 0}, priority=90, run_after=schedule.due_at,
+                    channel_profile_id=task.channel_profile_id, parent_queue_item_id=lease.id, commit=False)
+
+    async def _reconcile_owned(self, db, lease, task_id, publication_id):
+        from app.channel_agent import owned_producer as owned
+        from app.services.owned_inventory_feedback import finalize_owned_inventory_items
+
+        task, publication = await self._owned_publication(db, lease, task_id, publication_id)
+        video_id = publication.platform_content_id
+        await db.rollback()
+        status = await self.youtube_client.fetch_status(video_id=video_id)
+        task, publication = await self._owned_publication(db, lease, task_id, publication_id)
+        inventory.require(publication.platform_content_id == video_id and status.get("video_id", video_id) == video_id,
+            "owned_inventory_publication_identity")
+        privacy = str(status.get("privacy") or status.get("current_privacy") or "").strip().lower()
+        state = str(status.get("publish_status") or status.get("processing_state") or status.get("upload_status") or "").strip().lower()
+        inventory.require(privacy == "unlisted" and state in {"uploaded", "scheduled", "processed", "published"}
+            and not (status.get("error_message") or status.get("failure_reason")), "owned_inventory_reconcile_unconfirmed")
+        publication.current_privacy = privacy
+        publication.publish_status = "scheduled" if publication.scheduled_publish_at else "uploaded"
+        publication.permalink = str(status.get("permalink") or status.get("url") or publication.permalink or "")
+        await owned.complete_queue(db, lease)
+        await finalize_owned_inventory_items(db, task.channel_profile_id, publication_id=publication.id)
+        await db.commit()
+        await db.refresh(publication)
+        return publication
+
+    async def _collect_owned(self, db, lease, task_id, publication_id):
+        from app.channel_agent import owned_producer as owned
+
+        async def scope():
+            task, publication = await self._owned_publication(db, lease, task_id, publication_id)
+            schedule = (await db.scalars(select(PublicationMetricSchedule).where(
+                PublicationMetricSchedule.id == _uuid(lease.payload["metric_schedule_id"]))
+                .with_for_update().execution_options(populate_existing=True))).one_or_none()
+            inventory.require(schedule is not None and schedule.publication_id == publication_id
+                and schedule.snapshot_stage == lease.payload.get("snapshot_stage"), "owned_inventory_metrics")
+            return task, publication, schedule
+
+        task, publication, schedule = await scope()
+        if schedule.status == "succeeded":
+            await owned.complete_queue(db, lease)
+            await db.commit()
+            return None
+        now = await inventory._now(db)
+        inventory.require(schedule.status == "pending" and inventory.utc(schedule.due_at) <= now
+            and schedule.attempt_count == lease.payload.get("metrics_poll_count"), "owned_inventory_metrics")
+        video_id = publication.platform_content_id
+        await db.rollback()
+        try:
+            metrics = await self.youtube_client.fetch_metrics(video_id=video_id)
+        except Exception:
+            metrics = {}
+        task, publication, schedule = await scope()
+        now = await inventory._now(db)
+        inventory.require(publication.platform_content_id == video_id and schedule.status == "pending"
+            and schedule.attempt_count == lease.payload.get("metrics_poll_count"), "owned_inventory_metrics")
+        schedule.attempt_count += 1
+        schedule.last_attempt_at = now
+        publication.last_metrics_polled_at = now
+        snapshot = None
+        if _has_real_metrics(metrics) and now <= inventory.utc(schedule.grace_until):
+            snapshot = (await db.scalars(select(FeedbackSnapshot).where(FeedbackSnapshot.publication_id == publication_id,
+                FeedbackSnapshot.snapshot_stage == schedule.snapshot_stage))).one_or_none()
+            if snapshot is None:
+                snapshot = FeedbackSnapshot(publication_id=publication_id, snapshot_stage=schedule.snapshot_stage)
+                db.add(snapshot)
+            snapshot.collected_at = now
+            for key in ("views", "likes", "comments", "shares"):
+                setattr(snapshot, key, _nonnegative_int(metrics.get(key), default=0))
+            snapshot.avg_view_duration_sec = _nonnegative_float(metrics.get("avg_view_duration_sec"), default=0.0)
+            snapshot.retention_curve_json = _list_value(metrics.get("retention_curve_json") or metrics.get("retention_curve"))
+            snapshot.ctr, snapshot.impressions = _optional_float(metrics.get("ctr")), _optional_int(metrics.get("impressions"))
+            snapshot.virality_score = _nonnegative_float(metrics.get("virality_score"), default=0.0)
+            snapshot.raw_json = {**lease.payload, "metrics": metrics, "metrics_source": "youtube_manager"}
+            schedule.status, schedule.completed_at, schedule.last_error_code = "succeeded", now, None
+            schedule.available_fields_json = sorted(k for k in metrics if k in _RECOGNIZED_METRIC_KEYS and metrics[k] is not None)
+            if task.state not in {TASK_HELD, TASK_FAILED, TASK_REJECTED}:
+                task.state, task.state_updated_at = TASK_MEASURED, now
+        else:
+            schedule.last_error_code = "metrics_unavailable"
+            if schedule.attempt_count >= _MAX_METRICS_POLLS or now >= inventory.utc(schedule.grace_until):
+                schedule.status = "expired"
+            else:
+                count = schedule.attempt_count
+                await self.queue.enqueue(db, kind="collect_metrics",
+                    idempotency_key=f"collect_metrics:{publication_id}:stage:{schedule.snapshot_stage}:attempt:{count}",
+                    payload={**lease.payload, "metrics_poll_count": count}, priority=90,
+                    run_after=min(now + _METRICS_POLL_DELAY, inventory.utc(schedule.grace_until)),
+                    channel_profile_id=task.channel_profile_id, parent_queue_item_id=lease.id, commit=False)
+        await owned.complete_queue(db, lease)
+        await db.commit()
+        if snapshot is not None:
+            await db.refresh(snapshot)
+        return snapshot
+
     async def handle_execute_task(self, db: AsyncSession, item: ChannelOpsQueueItem) -> ProductionTask:
+        from app.channel_agent import owned_producer as owned
+        result = await self._owned_downstream(db, item)
+        if result is not owned.NOT_OWNED:
+            return result
         task = await self._task_from_item(db, item)
         if await self._hold_invalid_external_review(db, task, "execute_task_human_review"):
             return task
@@ -1134,6 +1643,10 @@ class ChannelAgentService:
         return task
 
     async def handle_observe_job(self, db: AsyncSession, item: ChannelOpsQueueItem) -> ProductionTask:
+        from app.channel_agent import owned_producer as owned
+        result = await self._owned_downstream(db, item)
+        if result is not owned.NOT_OWNED:
+            return result
         task = await self._task_from_item(db, item)
         payload = dict(item.payload_json or {})
         run_id = str(payload.get("run_id") or task.autoflow_run_id or "")
@@ -1221,6 +1734,10 @@ class ChannelAgentService:
         return task
 
     async def handle_publish_task(self, db: AsyncSession, item: ChannelOpsQueueItem) -> PublicationRecord | None:
+        from app.channel_agent import owned_producer as owned
+        result = await self._owned_downstream(db, item)
+        if result is not owned.NOT_OWNED:
+            return result
         task = await self._task_from_item(db, item)
         if await self._hold_invalid_external_review(db, task, "publish_task_human_review"):
             return None
@@ -1330,6 +1847,10 @@ class ChannelAgentService:
         return publication
 
     async def handle_promote_publication(self, db: AsyncSession, item: ChannelOpsQueueItem) -> PublicationRecord:
+        from app.channel_agent import owned_producer as owned
+        result = await self._owned_downstream(db, item)
+        if result is not owned.NOT_OWNED:
+            return result
         publication_id = _uuid(item.payload_json["publication_id"])
         publication = await db.get(PublicationRecord, publication_id)
         if publication is None:
@@ -1475,6 +1996,10 @@ class ChannelAgentService:
         db: AsyncSession,
         item: ChannelOpsQueueItem,
     ) -> PublicationRecord:
+        from app.channel_agent import owned_producer as owned
+        result = await self._owned_downstream(db, item)
+        if result is not owned.NOT_OWNED:
+            return result
         publication_id = _uuid(item.payload_json["publication_id"])
         publication = await db.get(PublicationRecord, publication_id)
         if publication is None:
@@ -1531,6 +2056,10 @@ class ChannelAgentService:
         return publication
 
     async def handle_collect_metrics(self, db: AsyncSession, item: ChannelOpsQueueItem) -> FeedbackSnapshot | None:
+        from app.channel_agent import owned_producer as owned
+        result = await self._owned_downstream(db, item)
+        if result is not owned.NOT_OWNED:
+            return result
         publication_id = _uuid(item.payload_json["publication_id"])
         publication = await db.get(PublicationRecord, publication_id)
         if publication is None:
@@ -2050,6 +2579,7 @@ class ChannelAgentService:
         constraints.update(
             {key: value for key, value in manual_seed_constraints.items() if key != "input_asset_id"}
         )
+        constraints["channelops"] = {"production_task_id": str(task.id), "channel_profile_id": str(task.channel_profile_id)}
 
         source_platforms = self._effective_source_platforms(task)
         request = {

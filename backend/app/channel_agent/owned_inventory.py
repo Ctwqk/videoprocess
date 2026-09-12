@@ -386,7 +386,8 @@ async def finish(db, service, phase, before, decision, denied, lease):
         if phase.candidate is not None:
             task = service._task_from_candidate(channel, phase.candidate, created_at=now)
             task.approval_mode = "agent"
-            task.agent_approval_evidence_json = {"owned_inventory": phase.evidence, "candidate_pds": decision}
+            task.agent_approval_evidence_json = {"owned_inventory": phase.evidence, "candidate_pds": decision,
+                                                 "candidate_pds_request": asdict(before.request)}
             task.channel_config_snapshot_json = {**task.channel_config_snapshot_json, "owned_inventory": phase.evidence}
             task.state_updated_at = now
             task.transition_history_json = [{**entry, "at": now.isoformat()} for entry in task.transition_history_json]

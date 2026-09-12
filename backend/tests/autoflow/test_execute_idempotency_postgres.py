@@ -20,6 +20,7 @@ from app.models.autoflow import AutoFlowPlan, AutoFlowRun, AutoFlowUsedClip
 from app.models.channel_agent import ChannelOpsQueueItem, ChannelProfile, ProductionTask
 from app.models.job import Job, JobStatus
 from app.models.pipeline import Pipeline
+from app.models.owned_seed_inventory import OwnedSeedInventory
 from app.models.schedule import RuntimeSchedule
 from app.orchestrator.engine import JobEngine
 from app.schemas.autoflow import (
@@ -106,6 +107,7 @@ async def sqlite_bound_execute_db(monkeypatch):
             AutoFlowUsedClip.__table__,
             ProductionTask.__table__,
             ChannelOpsQueueItem.__table__,
+            OwnedSeedInventory.__table__,
         ):
             await conn.run_sync(table.create)
 
@@ -313,7 +315,7 @@ async def test_bound_execute_closed_window_creates_waiting_job_without_start(
     service, plan = await _approved_plan(factory, prompt="Bound closed-window canary")
     task_id, _queue_id, request = await _bound_execute_request(factory, plan)
     async with factory() as db:
-        db.add(
+        await db.merge(
             RuntimeSchedule(
                 service_name=VIDEO_SCHEDULE_SERVICE,
                 state=VideoScheduleState.CLOSED.value,
@@ -346,7 +348,7 @@ async def test_bound_execute_closed_window_parks_then_opens_exact_job(
     service, plan = await _approved_plan(factory, prompt="Guarded canary materialization")
     _task_id, _queue_id, request = await _bound_execute_request(factory, plan)
     async with factory() as db:
-        db.add(
+        await db.merge(
             RuntimeSchedule(
                 service_name=VIDEO_SCHEDULE_SERVICE,
                 state=VideoScheduleState.CLOSED.value,
@@ -873,7 +875,7 @@ async def test_r1_retry_rechecks_committed_key_before_live_r2_authority(postgres
     durable_r1_id = uuid.uuid4()
 
     async with factory() as schedule_db:
-        schedule_db.add(
+        await schedule_db.merge(
             RuntimeSchedule(
                 service_name=VIDEO_SCHEDULE_SERVICE,
                 state=VideoScheduleState.OPEN.value,

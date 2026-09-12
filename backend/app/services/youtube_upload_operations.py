@@ -117,27 +117,18 @@ class YouTubeUploadOperationStore:
                     if db.in_transaction():
                         await db.rollback()
                 return
-            async with db.begin():
-                authority = await lock_job_execution_authority(
-                    db,
-                    context.job_id,
-                    node_execution_id=context.node_execution_id,
-                )
-                require_active_execution_authority(
-                    authority,
-                    job_statuses={JobStatus.RUNNING},
-                    node_statuses={NodeStatus.RUNNING},
-                )
-                require_matching_node_execution_claim(
-                    authority,
-                    context.execution_claim,
-                )
+            await db.begin()
+            try:
+                await self._require_local_submission_authority(db, context)
                 state = _SubmissionFenceState(context=context, db=db)
                 token = self._active_submission_fence.set(state)
                 try:
                     yield
                 finally:
                     self._active_submission_fence.reset(token)
+            finally:
+                if db.in_transaction():
+                    await db.rollback()
 
     async def claim(self, context: UploadOperationContext) -> UploadOperationClaim:
         async with self._session_factory() as db:
@@ -156,6 +147,12 @@ class YouTubeUploadOperationStore:
                     self._action_for(operation),
                     operation,
                 )
+            prior = await self._operation_for_node(db, context.node_execution_id)
+            producer = None
+            if prior is None or self._action_for(prior) == "submit":
+                from app.services.owned_producer_fence import lock_producer
+                producer = await lock_producer(db, await self._production_task_id(db, context.job_id),
+                                    render_sha256=context.content_sha256)
             authority = await lock_job_execution_authority(
                 db,
                 context.job_id,
@@ -170,6 +167,8 @@ class YouTubeUploadOperationStore:
                 authority,
                 context.execution_claim,
             )
+            from app.services.owned_producer_lineage import require_local_upload
+            await require_local_upload(db, producer, context)
             if (
                 getattr(
                     context.execution_claim,
@@ -188,6 +187,8 @@ class YouTubeUploadOperationStore:
                 for_update=True,
             )
             if existing is not None:
+                if self._action_for(existing) == "submit":
+                    self._require_operation_context(existing, context)
                 return UploadOperationClaim(self._action_for(existing), existing)
 
             production_task_id = await self._production_task_id(db, context.job_id)
@@ -318,6 +319,25 @@ class YouTubeUploadOperationStore:
                 active_fence,
                 operation_id,
             )
+        local_fence = self._local_submission_fence(context, operation_id, phases={"initial"})
+        if local_fence is not None:
+            local_fence.operation_id = operation_id
+            try:
+                await self._mark_attempting_local(local_fence.db, operation_id, context)
+                await local_fence.db.commit()
+                local_fence.phase = "attempted_unfenced"
+                await local_fence.db.begin()
+                await self._require_local_submission_authority(local_fence.db, local_fence.context)
+                operation = await self._operation(local_fence.db, operation_id)
+                if operation.status != "reserved" or operation.request_attempted_at is None or operation.manager_task_id is not None:
+                    raise JobExecutionAuthorityBlocked("upload operation final fence changed")
+            except BaseException:
+                if local_fence.db.in_transaction():
+                    await local_fence.db.rollback()
+                local_fence.phase = "attempted_unfenced"
+                raise
+            local_fence.phase = "post_fenced"
+            return operation
         async with self._session_factory() as db:
             if (
                 context is not None
@@ -338,32 +358,28 @@ class YouTubeUploadOperationStore:
                 )
                 await db.commit()
                 return operation
-            await self._require_transition_context(
-                db,
-                operation_id,
-                context,
-            )
-            result = await db.execute(
-                update(YouTubeUploadOperation)
-                .where(YouTubeUploadOperation.id == operation_id)
-                .where(YouTubeUploadOperation.status == "reserved")
-                .where(YouTubeUploadOperation.request_attempted_at.is_(None))
-                .values(
-                    request_attempted_at=datetime.now(timezone.utc),
-                    updated_at=func.now(),
-                )
-                .returning(YouTubeUploadOperation)
-            )
-            updated_operation = result.scalar_one_or_none()
-            if updated_operation is not None:
-                await db.commit()
-                return updated_operation
+            operation = await self._mark_attempting_local(db, operation_id, context)
+            await db.commit()
+            return operation
 
-            await db.rollback()
-            current = await self._operation(db, operation_id)
-            raise ValueError(
-                f"cannot begin submission from {current.status} operation"
-            )
+    async def _mark_attempting_local(self, db, operation_id, context):
+        from app.services.owned_producer_fence import lock_producer
+        from app.services.owned_seed_inventory import _now, require
+        operation = await self._operation(db, operation_id)
+        producer = await lock_producer(db, operation.production_task_id, render_sha256=operation.content_sha256)
+        require(producer is None or context is not None, "owned_inventory_execution_context_missing")
+        if context is not None:
+            await self._require_local_claim_and_lineage(db, producer, context)
+            self._require_operation_context(await self._operation(db, operation_id), context)
+        await self._require_transition_context(db, operation_id, context)
+        result = await db.execute(update(YouTubeUploadOperation).where(
+            YouTubeUploadOperation.id == operation_id, YouTubeUploadOperation.status == "reserved",
+            YouTubeUploadOperation.request_attempted_at.is_(None)).values(
+                request_attempted_at=await _now(db), updated_at=func.now()).returning(YouTubeUploadOperation))
+        operation = result.scalar_one_or_none()
+        if operation is None:
+            raise ValueError("cannot begin submission from current operation")
+        return operation
 
     async def mark_submitted(
         self,
@@ -375,6 +391,20 @@ class YouTubeUploadOperationStore:
         canonical_manager_task_id = self._canonical_manager_task_id(manager_task_id)
         if canonical_manager_task_id is None:
             raise ValueError("manager task id must be a canonical UUID")
+
+        local_fence = self._local_submission_fence(context, operation_id, phases={"post_fenced"})
+        if local_fence is not None:
+            result = await local_fence.db.execute(update(YouTubeUploadOperation).where(
+                YouTubeUploadOperation.id == operation_id, YouTubeUploadOperation.status == "reserved",
+                YouTubeUploadOperation.request_attempted_at.is_not(None)).values(
+                    status="submitted", manager_task_id=canonical_manager_task_id,
+                    error_message=None, updated_at=func.now()).returning(YouTubeUploadOperation))
+            operation = result.scalar_one_or_none()
+            if operation is None:
+                raise JobExecutionAuthorityBlocked("upload operation final fence changed")
+            await local_fence.db.commit()
+            local_fence.phase = "submitted"
+            return operation
 
         active_fence = self._registered_submission_fence(
             context,
@@ -586,6 +616,19 @@ class YouTubeUploadOperationStore:
         *,
         context: UploadOperationContext | None,
     ) -> YouTubeUploadOperation:
+        local_fence = self._local_submission_fence(context, operation_id, phases={"initial", "post_fenced"})
+        if local_fence is not None:
+            await self._require_transition_context(local_fence.db, operation_id, context)
+            result = await local_fence.db.execute(update(YouTubeUploadOperation).where(
+                YouTubeUploadOperation.id == operation_id,
+                YouTubeUploadOperation.status.in_(("reserved", "submitted"))).values(
+                    status=status, error_message=error_message, updated_at=func.now()).returning(YouTubeUploadOperation))
+            operation = result.scalar_one_or_none()
+            if operation is None:
+                raise JobExecutionAuthorityBlocked("upload operation final fence changed")
+            await local_fence.db.commit()
+            local_fence.phase = status
+            return operation
         active_fence = self._registered_submission_fence(
             context,
             operation_id,
@@ -706,6 +749,7 @@ class YouTubeUploadOperationStore:
         if (
             active_fence is not None
             and active_fence.context == context
+            and active_fence.phase in {"initial", "post_fenced"}
         ):
             return
         authority = await lock_job_execution_authority(
@@ -722,6 +766,38 @@ class YouTubeUploadOperationStore:
             authority,
             context.execution_claim,
         )
+
+    async def _require_local_submission_authority(self, db, context):
+        from app.services.owned_producer_fence import lock_producer
+        producer = await lock_producer(db, await self._production_task_id(db, context.job_id),
+                            render_sha256=context.content_sha256)
+        await self._require_local_claim_and_lineage(db, producer, context)
+        operation = await self._operation_for_node(db, context.node_execution_id, for_update=True)
+        if operation is not None:
+            self._require_operation_context(operation, context)
+
+    @staticmethod
+    def _require_operation_context(operation, context):
+        if any(getattr(operation, name) != getattr(context, name) for name in (
+                "job_id", "node_execution_id", "input_artifact_id", "content_sha256", "title", "privacy")):
+            raise JobExecutionAuthorityBlocked("upload operation execution context changed")
+
+    async def _require_local_claim_and_lineage(self, db, producer, context):
+        from app.services.owned_producer_lineage import require_local_upload
+        authority = await lock_job_execution_authority(db, context.job_id, node_execution_id=context.node_execution_id)
+        require_active_execution_authority(authority, job_statuses={JobStatus.RUNNING}, node_statuses={NodeStatus.RUNNING})
+        require_matching_node_execution_claim(authority, context.execution_claim)
+        if context.execution_claim.worker_registration_id is not None:
+            await require_worker_registration_lease(db, context.execution_claim)
+        await require_local_upload(db, producer, context)
+
+    def _local_submission_fence(self, context, operation_id, *, phases):
+        active = self._active_submission_fence.get()
+        if (context is not None and active is not None and active.context == context
+                and active.phase in phases and active.operation_id in {None, operation_id}
+                and not (context.execution_claim.worker_registration_id is not None and _session_is_postgresql(active.db))):
+            return active
+        return None
 
     async def _mark_attempting_in_fence(
         self,

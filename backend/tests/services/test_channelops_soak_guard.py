@@ -21,6 +21,8 @@ from app.models.channel_agent import (
     TopicLane,
 )
 from app.models.autoflow import AutoFlowPlan
+from app.models.owned_seed_inventory import OwnedSeedInventory
+from app.models.schedule import RuntimeSchedule
 from app.autoflow.service import autoflow_service
 from app.schemas.autoflow import AutoFlowPlanPatch
 from app.models.youtube_upload_operation import YouTubeUploadOperation
@@ -37,6 +39,8 @@ STARTED_AT = NOW - timedelta(hours=72)
 ROW_CREATED_AT = STARTED_AT + timedelta(minutes=5)
 NAIVE_ROW_CREATED_AT = ROW_CREATED_AT.replace(tzinfo=None)
 TABLES = (
+    RuntimeSchedule.__table__,
+    OwnedSeedInventory.__table__,
     AutoFlowPlan.__table__,
     ChannelProfile.__table__,
     TopicLane.__table__,
