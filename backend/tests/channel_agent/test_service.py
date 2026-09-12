@@ -34,6 +34,7 @@ from app.models.channel_agent import (
     TopicLane,
 )
 from app.models.autoflow import AutoFlowPlan, AutoFlowRun
+from app.models.owned_seed_inventory import OwnedSeedInventory
 from app.pds_client import PDSDecision, PDSDecisionRequest
 from app.schemas.autoflow import AutoFlowRequest
 
@@ -41,6 +42,7 @@ from app.schemas.autoflow import AutoFlowRequest
 CHANNEL_AGENT_TABLES = (
     AutoFlowPlan.__table__,
     AutoFlowRun.__table__,
+    OwnedSeedInventory.__table__,
     ChannelProfile.__table__,
     TopicLane.__table__,
     PublishingAccount.__table__,

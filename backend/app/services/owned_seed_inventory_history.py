@@ -1190,11 +1190,23 @@ def _assess_retired(rows: dict, cert: RetiredPreuploadCertificate, snapshot: Own
 
 
 def assess_owned_history(snapshot: OwnedHistorySnapshot, *, now: datetime) -> OwnedHistoryAssessment:
+    return _assess_owned_history(snapshot, now=now)
+
+
+def assess_owned_producer_history(snapshot: OwnedHistorySnapshot, *, now: datetime,
+                                  current_task_id: str) -> OwnedHistoryAssessment:
+    """Classify every operation; the caller validates its own task/effect separately."""
+    return _assess_owned_history(snapshot, now=now, current_task_id=current_task_id)
+
+
+def _assess_owned_history(snapshot: OwnedHistorySnapshot, *, now: datetime,
+                          current_task_id: str | None = None) -> OwnedHistoryAssessment:
     try:
         age = (_time(now) - snapshot.observed_at).total_seconds()
         _require(0 <= age <= MAX_OBSERVATION_AGE_SECONDS, "owned_history_observation_stale")
         rows = snapshot.rows.as_dict()
         tasks = {r["id"]: r for r in rows["production_tasks"]}
+        _require(current_task_id is None or current_task_id in tasks, "owned_inventory_producer_missing")
         accounts = {r["id"]: r for r in rows["publishing_accounts"]}
         channels = {r["id"]: r for r in rows["channel_profiles"]}
         bindings, certificate, authority = _approved_authority(rows, _time(now))
@@ -1239,6 +1251,8 @@ def assess_owned_history(snapshot: OwnedHistorySnapshot, *, now: datetime) -> Ow
                      inv["target_account_id"] == tasks[task_id]["target_account_id"], "owned_history_item_authority")
         stable, completed_items, wait_reason = [], [], None
         for task in tasks.values():
+            if task["id"] == current_task_id:
+                continue
             if task.get("target_account_id") not in members and task["id"] not in items:
                 continue
             h = _task_history(rows, task)

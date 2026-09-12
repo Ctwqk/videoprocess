@@ -189,9 +189,17 @@ class LocalAutoFlowClient:
 
         factory = self.session_factory or async_session
         try:
+            authority: dict[str, Any] = {}
+            if (getattr(task, "agent_approval_evidence_json", None) or {}).get("owned_inventory"):
+                candidate = request.get("_channelops_execute")
+                fields = {"production_task_id", "channelops_queue_item_id", "channelops_queue_locked_by",
+                    "channelops_queue_locked_at", "expected_approved_revision_hash", "expected_approved_revision", "idempotency_key"}
+                if not isinstance(candidate, dict) or set(candidate) != fields or candidate.get("production_task_id") != str(task.id):
+                    raise ValueError("owned_inventory_execute_binding")
+                authority = candidate
             async with factory() as db:
                 run = await autoflow_service.execute(
-                    AutoFlowExecuteRequest(plan_id=str(task.autoflow_plan_id), execute=True),
+                    AutoFlowExecuteRequest(plan_id=str(task.autoflow_plan_id), execute=True, **authority),
                     db,
                 )
         except (PermissionError, ValueError) as exc:
