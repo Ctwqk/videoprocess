@@ -234,6 +234,13 @@ func (s *Store) GetPublication(ctx context.Context, publicationID string) (Publi
 }
 
 func (s *Store) LockPromotionOperatorScope(ctx context.Context, publicationID string) (PublicationRow, ProductionTaskRow, error) {
+	if !s.hasExecutionTransaction() || s.executionChannelID == nil {
+		return PublicationRow{}, ProductionTaskRow{}, errOwnedInventory
+	}
+	var schedule string
+	if err := s.db().QueryRow(ctx, `SELECT state FROM runtime_schedules WHERE service_name='videoprocess' FOR UPDATE`).Scan(&schedule); err != nil {
+		return PublicationRow{}, ProductionTaskRow{}, err
+	}
 	discovered, err := s.GetPublication(ctx, publicationID)
 	if err != nil {
 		return PublicationRow{}, ProductionTaskRow{}, err

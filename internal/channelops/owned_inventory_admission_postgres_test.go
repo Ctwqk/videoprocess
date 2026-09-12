@@ -214,7 +214,7 @@ func TestOwnedB2PGQueuedRetirementProofAndAuthorityRecheck(t *testing.T) {
 				case "error":
 					return PDSDecision{}, errors.New("synthetic policy failure")
 				}
-				return PDSDecision{Verdict: "allow", DecisionID: "synthetic"}, nil
+				return ownedProducerRealDecision(), nil
 			})
 			h := ownedB2PGHandler(t, f, &drift, &reads, pds)
 			err := h.HandleAgentTick(ctx, item)
@@ -371,7 +371,7 @@ func TestOwnedB2PGNewBlankOperationDuringQueuedPDS(t *testing.T) {
 		if err := tx.Commit(ctx); err != nil {
 			return PDSDecision{}, err
 		}
-		return PDSDecision{Verdict: "allow"}, nil
+		return ownedProducerRealDecision(), nil
 	}))
 	if err := h.HandleAgentTick(ctx, item); err != nil {
 		t.Fatalf("blank-operation finalizer failed: %T", err)
@@ -432,7 +432,7 @@ func TestOwnedB2PGQueuedAtomicRollbackBeforePlanQueue(t *testing.T) {
 	item := ownedB2PGClaimTick(t, f, ctx, "rollback")
 	var drift atomic.Bool
 	var reads atomic.Int32
-	h := ownedB2PGHandler(t, f, &drift, &reads, fakePDS{decision: PDSDecision{Verdict: "allow"}})
+	h := ownedB2PGHandler(t, f, &drift, &reads, fakePDS{decision: ownedProducerRealDecision()})
 	var before tickPreparation
 	if err := h.withOwnedTickQueuePhase(ctx, item, func(fenced HandlerService) error {
 		var err error
@@ -442,7 +442,7 @@ func TestOwnedB2PGQueuedAtomicRollbackBeforePlanQueue(t *testing.T) {
 		t.Fatal("rollback fixture preparation failed")
 	}
 	candidates := append([]TickCandidate{}, before.Candidates...)
-	candidates[0].PDSDecisionJSON = map[string]any{"verdict": "allow"}
+	ownedProducerApproveCandidateFixture(t, f.channel, &candidates[0])
 	stop := errors.New("synthetic plan queue write failure")
 	var blocked atomic.Int32
 	err := h.withOwnedTickQueuePhase(ctx, item, func(fenced HandlerService) error {
@@ -506,7 +506,7 @@ func TestOwnedB2PGConfiguredNativePrincipals(t *testing.T) {
 			item := ownedB2PGClaimTick(t, f, ctx, "native-principal")
 			var drift atomic.Bool
 			var reads atomic.Int32
-			h := ownedB2PGHandler(t, f, &drift, &reads, fakePDS{decision: PDSDecision{Verdict: "allow"}})
+			h := ownedB2PGHandler(t, f, &drift, &reads, fakePDS{decision: ownedProducerRealDecision()})
 			h.Store = s
 			if err := h.HandleAgentTick(ctx, item); err != nil {
 				t.Fatalf("native Go principal cannot execute bounded queued admission: %T", err)

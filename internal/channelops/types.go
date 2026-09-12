@@ -181,6 +181,7 @@ type ProductionTaskRow struct {
 	UsesExternalAssets           bool
 	ApprovalMode                 string
 	HumanReviewEvidenceJSON      map[string]any
+	AgentApprovalEvidenceJSON    map[string]any
 	AutoFlowPlanID               *string
 	AutoFlowApprovedRevisionHash *string
 	AutoFlowApprovedRevision     *int64

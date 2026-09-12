@@ -135,6 +135,10 @@ func newOwnedPGFixture(t *testing.T) *ownedPGFixture {
 }
 
 func newOwnedPGFixtureWithHistory(t *testing.T, legacy func(*Store, time.Time) map[string]any) *ownedPGFixture {
+	return newOwnedPGFixtureWithWindow(t, legacy, time.Hour)
+}
+
+func newOwnedPGFixtureWithWindow(t *testing.T, legacy func(*Store, time.Time) map[string]any, age time.Duration) *ownedPGFixture {
 	t.Helper()
 	if testing.Short() || os.Getenv("OWNED_INVENTORY_DISPOSABLE_TEST_URL") == "" {
 		t.Skip("explicit disposable inventory PostgreSQL required")
@@ -151,8 +155,8 @@ func newOwnedPGFixtureWithHistory(t *testing.T, legacy func(*Store, time.Time) m
 	}
 	t.Cleanup(store.Close)
 	var revision string
-	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "041_registered_consumer_terminal" {
-		t.Fatal("disposable database must be migrated to 041")
+	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "042_owned_producer_fence" {
+		t.Fatal("disposable database must be migrated to 042_owned_producer_fence")
 	}
 	var now time.Time
 	if err := store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
@@ -201,7 +205,7 @@ func newOwnedPGFixtureWithHistory(t *testing.T, legacy func(*Store, time.Time) m
 	inventoryID := ownedString(data.Inventory["id"])
 	channel.OwnedSeedInventoryID = &inventoryID
 	data.AccountIDs = []string{ownedString(data.Inventory["target_account_id"])}
-	starts := now.UTC().Add(-time.Hour)
+	starts := now.UTC().Add(-age)
 	data.Inventory["starts_at"], data.Inventory["expires_at"], data.Inventory["approved_at"] = ownedISO(starts), ownedISO(starts.Add(168*time.Hour)), ownedISO(starts)
 	for _, kind := range []string{"channel", "account", "lane", "format"} {
 		row := ownedMap(data.Bindings[kind])
@@ -345,7 +349,7 @@ func TestOwnedPGAtomicContendersAndCommittedResultLossReplay(t *testing.T) {
 		case <-ctx.Done():
 			return PDSDecision{}, ctx.Err()
 		}
-		return PDSDecision{Verdict: "allow", DecisionID: "offline"}, nil
+		return ownedProducerRealDecision(), nil
 	})
 	results := make(chan error, 2)
 	for _, bucket := range []string{"first", "different-bucket"} {
@@ -412,7 +416,7 @@ func TestOwnedPGQueueAndLeaderLossDuringPDSCannotConsume(t *testing.T) {
 						return PDSDecision{}, err
 					}
 				}
-				return PDSDecision{Verdict: "allow", DecisionID: "offline"}, nil
+				return ownedProducerRealDecision(), nil
 			})}
 			err = h.HandleAgentTick(ctx, *item)
 			if mode == "queue" && !errors.Is(err, ErrQueueLeaseLost) {
@@ -489,7 +493,7 @@ func TestOwnedPGPolicyFailureAndMutationHoldWithoutReplacement(t *testing.T) {
 						return PDSDecision{}, err
 					}
 				}
-				return PDSDecision{Verdict: "allow", DecisionID: "offline"}, nil
+				return ownedProducerRealDecision(), nil
 			})
 			if err := f.store.RunTick(ctx, f.channel.ID, "first", HandlerService{PDS: pds}); err != nil {
 				t.Fatalf("fresh finalizer failed: %T", err)
@@ -548,7 +552,7 @@ func TestOwnedPGQueuedHandleAgentTickContenders(t *testing.T) {
 		entered <- struct{}{}
 		select {
 		case <-release:
-			return PDSDecision{Verdict: "allow", DecisionID: "offline-contender"}, nil
+			return ownedProducerRealDecision(), nil
 		case <-ctx.Done():
 			return PDSDecision{}, ctx.Err()
 		}
@@ -601,7 +605,7 @@ func TestOwnedPGNormalPublicationCreationAndMetricRecovery(t *testing.T) {
 	f := newOwnedPGFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := f.store.RunTick(ctx, f.channel.ID, "normal-publication", HandlerService{PDS: fakePDS{decision: PDSDecision{Verdict: "allow"}}}); err != nil {
+	if err := f.store.RunTick(ctx, f.channel.ID, "normal-publication", HandlerService{PDS: fakePDS{decision: ownedProducerRealDecision()}}); err != nil {
 		t.Fatal("fixture admission failed")
 	}
 	var taskID string
@@ -732,7 +736,7 @@ func TestOwnedPGRollbackIncludesReservationTaskSeedAuditAndQueue(t *testing.T) {
 			return errOwnedInventory
 		}
 		candidate := p.Candidates[0]
-		candidate.PDSDecisionJSON = map[string]any{"verdict": "allow"}
+		ownedProducerApproveCandidateFixture(t, f.channel, &candidate)
 		if err := s.finalizeTick(ctx, p, []TickCandidate{candidate}, nil); err != nil {
 			return err
 		}
@@ -742,7 +746,7 @@ func TestOwnedPGRollbackIncludesReservationTaskSeedAuditAndQueue(t *testing.T) {
 		t.Fatalf("rollback failed before tested boundary: %T", err)
 	}
 	f.assertCounts(t, 0)
-	if err := f.store.RunTick(ctx, f.channel.ID, "retry", HandlerService{PDS: fakePDS{decision: PDSDecision{Verdict: "allow"}}}); err != nil {
+	if err := f.store.RunTick(ctx, f.channel.ID, "retry", HandlerService{PDS: fakePDS{decision: ownedProducerRealDecision()}}); err != nil {
 		t.Fatalf("retry failed: %T", err)
 	}
 	f.assertCounts(t, 1)

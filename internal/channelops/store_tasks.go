@@ -312,23 +312,8 @@ func evaluateTickCandidatePolicyWithRevalidation(
 				return candidates, nil, err
 			}
 		}
-		policyContext := map[string]any{
-			"channel_profile_id": channel.ID, "candidate_id": candidate.CandidateID,
-			"source_kind": candidate.SourceKind, "topic_lane_id": candidateLaneID(*candidate), "lane_format_id": candidateFormatID(*candidate),
-		}
-		if candidate.owned != nil {
-			policyContext["owned_inventory"] = ownedTaskEvidence(*candidate)
-		}
-		decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
-			ActorID:    candidate.Account.ID,
-			ActionType: "candidate_accept",
-			Platform:   "youtube",
-			Content: map[string]any{
-				"title":       candidate.TitleSeed,
-				"description": candidate.Prompt,
-			},
-			Context: policyContext,
-		})
+		request := ownedCandidatePolicyRequest(channel, *candidate)
+		decision, err := h.PDS.Decide(ctx, request)
 		if err != nil {
 			if candidate.owned != nil {
 				rejectCandidate(candidate, "owned_inventory_pds_unavailable", "Owned inventory policy call failed.")
@@ -337,8 +322,15 @@ func evaluateTickCandidatePolicyWithRevalidation(
 			return candidates, nil, err
 		}
 		candidate.PDSDecisionJSON = pdsDecisionAuditJSON(decision)
-		if candidate.owned != nil && (decision.Verdict != "allow" || isPDSFailPolicyDecision(decision)) {
-			rejectCandidate(candidate, "owned_inventory_pds_denied", "Owned inventory requires an explicit allow decision.")
+		if candidate.owned != nil {
+			evidence, evidenceErr := ownedPolicyEvidence(request, decision)
+			if evidenceErr != nil {
+				return nil, nil, evidenceErr
+			}
+			candidate.PDSRequestJSON = ownedMap(evidence["request"])
+			if requireOwnedRealPDS(decision) != nil {
+				rejectCandidate(candidate, "owned_inventory_pds_denied", "Owned inventory requires an explicit allow decision.")
+			}
 		}
 		if alert, ok := maybePDSOutageAlert(decision, channel.ID, candidate.CandidateID, "candidate_accept"); ok {
 			alerts = append(alerts, alert)
@@ -359,7 +351,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		return ProductionTaskRow{}, err
 	}
 	var row ProductionTaskRow
-	var rationaleJSON, scoreJSON, sourcePlatformsJSON, materialIDsJSON, humanReviewJSON, transitionJSON, snapshotJSON []byte
+	var rationaleJSON, scoreJSON, sourcePlatformsJSON, materialIDsJSON, humanReviewJSON, transitionJSON, snapshotJSON, agentApprovalJSON []byte
 	err := s.db().QueryRow(ctx, `
 		SELECT task.id, task.channel_profile_id, task.topic_lane_id, task.lane_format_id,
 		       task.target_account_id, task.manual_seed_id, task.discovery_signal_id,
@@ -371,7 +363,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		       task.autoflow_run_id, task.job_id, task.state, task.blocked_by_guard,
 		       task.failure_reason, task.failure_category, task.transition_history_json,
 		       task.channel_config_version_snapshot, task.channel_config_snapshot_json,
-		       task.state_updated_at
+		       task.state_updated_at, task.agent_approval_evidence_json
 		FROM production_tasks AS task
 		WHERE task.id = $1::uuid
 	`, taskID).Scan(
@@ -403,6 +395,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		&row.ChannelConfigVersionSnapshot,
 		&snapshotJSON,
 		&row.StateUpdatedAt,
+		&agentApprovalJSON,
 	)
 	if err != nil {
 		return ProductionTaskRow{}, err
@@ -422,6 +415,9 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 	}
 	if err := unmarshalJSONObject(humanReviewJSON, &row.HumanReviewEvidenceJSON); err != nil {
 		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.human_review_evidence_json: %w", err)
+	}
+	if err := unmarshalJSONObject(agentApprovalJSON, &row.AgentApprovalEvidenceJSON); err != nil {
+		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.agent_approval_evidence_json: %w", err)
 	}
 	if err := unmarshalJSONMapSlice(transitionJSON, &row.TransitionHistoryJSON); err != nil {
 		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.transition_history_json: %w", err)
@@ -493,6 +489,26 @@ func (s *Store) MarkTaskPlanningAndEnqueueExecute(
 	task, err := s.GetProductionTask(ctx, taskID)
 	if err != nil {
 		return err
+	}
+	producer, err := s.lockOwnedProducer(ctx, task, "")
+	if err != nil {
+		return err
+	}
+	if producer != nil && producer.Identity.InventoryID != "" {
+		if _, _, _, found, err := ownedPendingPlan(task); err != nil || !found {
+			if err != nil {
+				return err
+			}
+			return ownedHistoryError("owned_inventory_pds_evidence")
+		}
+		stored := task.RationaleJSON["autoflow_plan_payload"]
+		actual, err := ownedDecode([]byte(mustJSON(planPayload)))
+		if err != nil {
+			return err
+		}
+		if !ownedPolicyJSONEqual(stored, actual) {
+			return ErrHandlerSnapshotStale
+		}
 	}
 	durablePlanPayload := map[string]any{}
 	for key, value := range jsonObject(planPayload) {
