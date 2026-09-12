@@ -1814,6 +1814,58 @@ PY
     <"$TEST_ROOT/durable-stage2/baseline.json" >/dev/null
   transaction_cli transition \
     "$transaction_root" 18 1 FORWARD_APPLYING >/dev/null
+  fresh_active="$active"
+  fresh_before="$(shasum -a 256 "$fresh_active")"
+  if transaction_cli transition \
+    "$transaction_root" 18 2 FORWARD_VERIFIED >/dev/null 2>&1; then
+    echo 'FAIL: fresh journal promoted without registered reconciliation proof' >&2
+    exit 1
+  fi
+  [[ "$(shasum -a 256 "$fresh_active")" == "$fresh_before" ]]
+  python3 - "$fresh_active" <<'PY'
+import json, pathlib, sys
+state = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+assert state["phase"] == "FORWARD_APPLYING" and state["revision"] == 2
+assert state["registered_reconcile"] == {
+    "version": 1, "baseline": None, "current": None, "run": None,
+}
+PY
+  exec 18>&-
+
+  # Exercise old CAS/promotion journals using bytes emitted by the historical CLI.
+  pre_registered_commit=9f18966553b4049fd4feb60dd604b4806d7925af
+  historical_archive="$TEST_ROOT/durable-core-pre-registered/archive"
+  mkdir -p "$historical_archive"
+  git -C "$ROOT_DIR" cat-file -e "$pre_registered_commit^{commit}"
+  git -C "$ROOT_DIR" archive --format=tar "$pre_registered_commit" \
+    deploy/swarm/worker-admission-transaction.py | tar -xf - -C "$historical_archive"
+  historical_helper="$historical_archive/deploy/swarm/worker-admission-transaction.py"
+  [[ -f "$historical_helper" && ! -L "$historical_helper" ]]
+  transaction_root="$TEST_ROOT/durable-core-pre-registered/state/vp-worker-admission"
+  mkdir -p "$transaction_root"
+  chmod 0700 "$transaction_root"
+  lock_path="$(transaction_cli lock-prepare "$transaction_root")"
+  exec 18<>"$lock_path"
+  transaction_cli lock-acquire "$transaction_root" 18 >/dev/null
+  python3 "$historical_helper" begin "$transaction_root" 18 \
+    "$commit" "$backend_image" "$go_image" "$namespace" legacy_no_control \
+    <<<"$credential_records" >/dev/null
+  active="$transaction_root/transactions/active.json"
+  python3 - "$active" "$fresh_active" <<'PY'
+import json, pathlib, sys
+old = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+fresh = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
+assert old["schema"] == 3 and old["phase"] == "PREPARING" and old["revision"] == 0
+assert "registered_reconcile" not in old
+assert old["transaction_id"] != fresh["transaction_id"]
+assert "registered_reconcile" in fresh
+PY
+  transaction_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["transaction_id"])' "$active")"
+  snapshots_path="$transaction_root/transactions/$transaction_id/snapshots.json"
+  transaction_cli capture-baseline \
+    "$transaction_root" 18 0 <"$TEST_ROOT/durable-stage2/baseline.json" >/dev/null
+  transaction_cli transition \
+    "$transaction_root" 18 1 FORWARD_APPLYING >/dev/null
   transaction_cli transition \
     "$transaction_root" 18 2 FORWARD_VERIFIED >/dev/null
   transaction_cli transition \
@@ -3753,16 +3805,31 @@ PY
   vp_worker_admission_abort_vision_jobs() {
     printf 'abort-vision-jobs\n' >>"$partial_prepare_calls"
   }
+  PARTIAL_CLEANUP_READY=false
+  vp_registered_reconcile_cleanup() {
+    [[ "$1" == all ]] || return 1
+    printf 'cleanup-registered\n' >>"$partial_prepare_calls"
+    [[ "$PARTIAL_CLEANUP_READY" == true ]]
+  }
   vp_worker_redis_marker_discard_managed_state() {
     printf 'discard-marker\n' >>"$partial_prepare_calls"
   }
 
+  if vp_restore_worker_admission_transaction '' '' ''; then
+    echo 'FAIL: partial preparation ignored unresolved registered cleanup' >&2; exit 1
+  fi
+  if grep -Eq '^(abort|discard-marker)' "$partial_prepare_calls"; then
+    echo 'FAIL: partial preparation retired authority before registered cleanup' >&2; exit 1
+  fi
+  : >"$partial_prepare_calls"
+  PARTIAL_CLEANUP_READY=true
   vp_restore_worker_admission_transaction '' '' ''
   expected_partial_prepare="$({
     printf '%s\n' \
       'restore-apps' \
       'restore-marker' \
       'remove-marker-jobs|vp-ffmpeg-worker-python:partial|m-0123456789ab-1780000000-0001' \
+      'cleanup-registered' \
       'abort-vision-jobs' \
       'abort|preparing_failed' \
       'discard-marker'
