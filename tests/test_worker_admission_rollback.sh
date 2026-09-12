@@ -67,11 +67,18 @@ source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
   vp_worker_admission_process_retirement_journals() { return 0; }
   vp_worker_control_process_retirements() { return 0; }
   vp_worker_redis_marker_cleanup_transaction_baseline() { return 0; }
+  AUTOFLOW_READY=false
+  vp_require_selected_autoflow_control_ready() { [[ "$AUTOFLOW_READY" == true ]]; }
   vp_commit_worker_admission
   if [[ ! -f "$candidate/worker.conf" ]]; then
     echo 'FAIL: worker commit removed evidence before promotion verification' >&2
     exit 1
   fi
+  if vp_worker_admission_retire_transaction; then
+    echo 'FAIL: retirement ignored unready AutoFlow' >&2; exit 1
+  fi
+  [[ -f "$candidate/worker.conf" ]]
+  AUTOFLOW_READY=true
   vp_worker_admission_retire_transaction
   [[ ! -e "$candidate" ]] || {
     echo 'FAIL: completed promotion retained its candidate namespace' >&2
@@ -141,14 +148,16 @@ source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 # Fully prepared bootstrap authority is not evidence of a worker service apply.
 (
   ROOT="$TEST_ROOT/legacy-preapply"
+  mkdir -p "$ROOT"
+  ROOT="$(cd "$ROOT" && pwd -P)"
   admission_root="$ROOT/state/vp-worker-admission"
   mkdir -p "$admission_root"
   chmod 0700 "$admission_root"
-  lock_path="$(python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" lock-prepare "$admission_root")"
-  exec 19<>"$lock_path"
-  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" lock-acquire "$admission_root" 19 >/dev/null
-  VP_WORKER_ADMISSION_LOCK_ROOT="$admission_root"
-  VP_WORKER_ADMISSION_LOCK_FD=19
+  exec 9<>"$ROOT/sync.lock"
+  chmod 0600 "$ROOT/sync.lock"
+  python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)'
+  vp_worker_admission_lock_acquire "$admission_root"
+  trap 'vp_worker_admission_lock_release' EXIT
   CALLS="$ROOT/calls"
   : >"$CALLS"
   python3 - "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" "$ROOT" <<'PY'
@@ -330,9 +339,9 @@ baseline.mkdir(parents=True, mode=0o700)
 (baseline / "captured").chmod(0o600)
 (baseline / "crontab").write_text("")
 PY
-  vp_worker_admission_lock_assert() { return 0; }
   vp_worker_admission_verify_active_database_credentials() { return 0; }
-  (
+  {
+    # Hydration runs in the real lock owner; later cases rehydrate their own state.
     # Resuming can add attempts; the captured failure remains historical evidence.
     cp "$ROOT/resumed-fixture.json" "$admission_root/transactions/active.json"
     python3 - "$ROOT/resumed-progress.json" "$admission_root/transactions/tx-22222222222222222222222222222222/app-progress.json" <<'PY'
@@ -357,7 +366,7 @@ PY
       echo 'FAIL: ordinary recovery accepted mismatched failure snapshots' >&2
       exit 1
     fi
-  )
+  }
   # A real journal and fresh hydration must route both entry points to abort.
   for invalid in attempted-worker applied-worker missing-baseline promoted-control promoted-marker \
     rollback-worker rollback-control missing-authority missing-secret missing-progress; do
@@ -527,7 +536,8 @@ PY
         ;;
     esac
   done
-  exec 19>&-
+  vp_worker_admission_lock_release
+  trap - EXIT
 )
 
 (
@@ -4382,6 +4392,13 @@ EOF
   vp_worker_admission_abort_vision_jobs() {
     printf 'abort-vision-jobs\n' >>"$resume_calls"
   }
+  # This block checks recovery ordering; live job settlement is a dependency.
+  REGISTERED_CLEANUP_READY=true
+  vp_registered_reconcile_cleanup() {
+    [[ "$1" == all ]] || return 1
+    printf 'cleanup-registered\n' >>"$resume_calls"
+    [[ "$REGISTERED_CLEANUP_READY" == true ]]
+  }
   vp_worker_admission_capture_failed_forward() {
     printf 'capture-failed|%s\n' "$1" >>"$resume_calls"
     VP_WORKER_ADMISSION_RECOVERY_FAILED_FORWARD_CAPTURED=true
@@ -4414,11 +4431,20 @@ EOF
     printf 'verify-candidate\n' >>"$resume_calls"
   }
 
+  REGISTERED_CLEANUP_READY=false
+  for recovery in vp_worker_admission_resume_preparing_transaction vp_worker_admission_resume_forward_failure; do
+    : >"$resume_calls"
+    if "$recovery"; then
+      echo 'FAIL: unresolved registered cleanup allowed recovery effects' >&2; exit 1
+    fi
+    [[ "$(command cat "$resume_calls")" == cleanup-registered ]]
+  done
+  REGISTERED_CLEANUP_READY=true
   : >"$resume_calls"
   VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
   vp_worker_admission_resume_preparing_transaction
   if [[ "$(command cat "$resume_calls")" != \
-      $'abort-vision-jobs\nabort|interrupted_preparing' \
+      $'cleanup-registered\nabort-vision-jobs\nabort|interrupted_preparing' \
     || "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" != true ]]; then
     echo 'FAIL: interrupted PREPARING did not enter durable abort' >&2
     exit 1
@@ -4432,6 +4458,7 @@ EOF
   vp_worker_admission_resume_forward_failure
   expected_forward="$({
     printf '%s\n' \
+      'cleanup-registered' \
       'hydrate|FORWARD_APPLYING' \
       'abort-vision-jobs' \
       'capture-failed|vp-api-swarm' \
@@ -4452,8 +4479,10 @@ EOF
   vp_worker_admission_resume_forward_failure
   expected_early_forward="$({
     printf '%s\n' \
+      'cleanup-registered' \
       'hydrate|FORWARD_APPLYING' \
       "restore-apps|$VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS|vp-api-swarm|false" \
+      'cleanup-registered' \
       'abort-vision-jobs' \
       'abort|preparing_failed' \
       'discard-marker-baseline'
@@ -4470,10 +4499,12 @@ EOF
   vp_worker_admission_resume_forward_failure
   expected_partial_forward="$({
     printf '%s\n' \
+      'cleanup-registered' \
       'hydrate|FORWARD_APPLYING' \
       "restore-apps|$VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS|vp-api-swarm|false" \
       'restore-marker-baseline' \
       'remove-marker-jobs|marker-image|marker-generation' \
+      'cleanup-registered' \
       'abort-vision-jobs' \
       'abort|preparing_failed' \
       'discard-marker-baseline'
