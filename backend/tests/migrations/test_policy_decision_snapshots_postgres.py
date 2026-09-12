@@ -198,6 +198,7 @@ async def test_policy_snapshot_migration_contract_and_retention(scratch, forward
         )
         activation_id = await insert(conn, "policy_activation_history", activation)
         account_id = await insert(conn, "publishing_accounts", dict(
+            id=uuid.uuid4(),
             channel_profile_id=parent["id"], platform="youtube", account_label="fixture",
             platform_account_id="", credential_ref="", platform_specific_config_json="{}",
             default_privacy="private", external_asset_auto_publish=False, enabled=False,
