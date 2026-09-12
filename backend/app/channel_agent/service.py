@@ -126,6 +126,7 @@ class ChannelAgentService:
         *,
         channel_id,
         plan_delay_seconds: int = 0,
+        queue_item: ChannelOpsQueueItem | None = None,
     ) -> AgentTickAudit:
         if (
             isinstance(plan_delay_seconds, bool)
@@ -136,6 +137,12 @@ class ChannelAgentService:
         channel = await db.get(ChannelProfile, _uuid(channel_id))
         if channel is None:
             raise ValueError("Channel not found")
+
+        if channel.owned_seed_inventory_id is not None:
+            from app.channel_agent.owned_inventory import tick as owned_tick
+
+            return await owned_tick(db, self, channel_id=channel.id, inventory_id=channel.owned_seed_inventory_id,
+                                    queue_item=queue_item, plan_delay_seconds=plan_delay_seconds)
 
         now = self.clock.now()
         bucket = utc_hour_bucket(now)

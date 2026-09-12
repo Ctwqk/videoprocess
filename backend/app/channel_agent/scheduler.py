@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent.queue import ChannelOpsQueueService
 from app.models.channel_agent import ChannelProfile, InternalSchedulerRun
+from app.models.owned_seed_inventory import OwnedSeedInventory
 
 
 @dataclass(frozen=True)
@@ -34,10 +35,19 @@ class ChannelOpsScheduler:
         enqueued = 0
         skipped = 0
         for channel in channels:
+            if channel.owned_seed_inventory_id is not None:
+                inventory = await db.get(OwnedSeedInventory, channel.owned_seed_inventory_id)
+                if (inventory is None or inventory.state != "approved" or inventory.approved_at is None
+                        or inventory.revoked_at is not None or inventory.succession_released_at is not None):
+                    skipped += 1
+                    continue
             interval_minutes = _normalized_interval_minutes(channel.tick_interval_minutes)
-            if channel.tick_interval_minutes != interval_minutes:
+            if channel.owned_seed_inventory_id is not None and channel.tick_interval_minutes == 1:
+                bucket = current.strftime("%Y-%m-%d-%H-%M")
+            else:
+                bucket = scheduler_bucket(current, interval_minutes)
+            if channel.owned_seed_inventory_id is None and channel.tick_interval_minutes != interval_minutes:
                 channel.tick_interval_minutes = interval_minutes
-            bucket = scheduler_bucket(current, interval_minutes)
             key = f"agent_tick:{channel.id}:{bucket}"
             if await self.queue.get_by_key(db, key) is not None:
                 skipped += 1
