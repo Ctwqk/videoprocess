@@ -167,11 +167,12 @@ async def test_actual_final_requalification_fence_blocks_native_writers(a2_env, 
     blocker_pid = None
     async def pause_after_entry(db, descriptors):
         nonlocal blocker_pid
-        await original(db, descriptors)
+        assets = await original(db, descriptors)
         if not locked.is_set():
             blocker_pid = await db.scalar(text("SELECT pg_backend_pid()"))
             locked.set()
             await asyncio.wait_for(release.wait(), 8)
+        return assets
     monkeypatch.setattr(service, "_lock_assets", pause_after_entry)
     qualifier = asyncio.create_task(approve(h))
     writer_task = None
@@ -190,9 +191,9 @@ async def test_actual_final_requalification_fence_blocks_native_writers(a2_env, 
             assert not writer_task.done()
             release.set()
             response = await asyncio.wait_for(qualifier, 5)
+            assert response.status_code == 200, response.text
             with pytest.raises(service.OwnedInventoryError, match="owned_inventory_(asset_pinned|historical_producer_pinned)"):
                 await asyncio.wait_for(writer_task, 5)
-        assert response.status_code == 200, response.text
     finally:
         release.set()
         for task in (qualifier, writer_task):

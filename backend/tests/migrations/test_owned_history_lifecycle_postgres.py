@@ -128,7 +128,7 @@ async def test_actual_history_only_binding_survives_native_metric_settlement_and
         child = await db.get(OwnedSeedInventory, uuid.UUID(successor.result["id"]))
         assert predecessor.manifest_json == original["manifest"] and predecessor.manifest_sha256 == original["manifest_sha256"]
         assert child.predecessor_inventory_id == predecessor.id
-        assert await db.scalar(text("SELECT owned_seed_inventory_id FROM channel_profiles WHERE id=:id"), {"id": h.env.channel_id}) is None
+        assert await db.scalar(text("SELECT owned_seed_inventory_id FROM channel_profiles WHERE id=:id"), {"id": h.env.channel_id}) == predecessor.id
     assert (await assessment(h)).block_reason is None
     assert all(method == "GET" for method, _ in h.manager_calls)
     divergent = copy.deepcopy(successor.result["manifest"])
