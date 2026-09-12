@@ -48,6 +48,7 @@ func (s *Store) CleanupExpired(ctx context.Context, now time.Time, cfg Retention
 	tag, err = s.db().Exec(ctx, `
 		DELETE FROM agent_tick_audits
 		WHERE started_at < $1::timestamptz
+		  AND replay_status = 'legacy_unreplayable'
 	`, auditBefore)
 	if err != nil {
 		return result, err

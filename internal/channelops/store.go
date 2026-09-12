@@ -18,6 +18,7 @@ type Store struct {
 	executionDB          dbExecutor
 	executionChannelID   *string
 	ownedHistoryEvidence *ownedHistoryRedisEvidence
+	buildCommitSHA       string
 }
 
 type dbExecutor interface {
@@ -40,6 +41,7 @@ func OpenStore(ctx context.Context, databaseURL string) (*Store, error) {
 		Now:                func() time.Time { return time.Now().UTC() },
 		DefaultMaxAttempts: 3,
 		leadership:         &leaderState{},
+		buildCommitSHA:     BuildCommitSHA,
 	}, nil
 }
 

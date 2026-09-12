@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/redis/go-redis/v9"
 )
 
 // Parent-run contracts only. Never infer a database from DATABASE_URL or LoadConfig.
@@ -51,6 +52,89 @@ type ownedPGFixture struct {
 	channel ChannelProfileRow
 	data    ownedInventoryData
 	lease   *LeaderLease
+}
+
+func (f *ownedPGFixture) handler(t *testing.T, pds PDSDecider) HandlerService {
+	t.Helper()
+	// Earlier B2 fixtures retain global retirement history in this disposable DB.
+	// Use the same synthetic reader without sharing clients across contenders.
+	retained := historyGolden(t, "retired_unassigned")
+	return HandlerService{Store: f.store, PDS: pds,
+		Config: Config{OwnedHistoryRedisURL: "redis://fixture-history-reader:fixture-secret@127.0.0.1:55464/15"},
+		ownedHistoryRedisFactory: func(*redis.Options) ownedHistoryRedisClient {
+			return ownedHistoryRedisFixture(t, retained)
+		},
+	}
+}
+
+func TestOwnedFixtureRetainedHistoryPreparationReachesPDS(t *testing.T) {
+	for _, retained := range []bool{false, true} {
+		t.Run(fmt.Sprint(retained), func(t *testing.T) {
+			channel, data, now := ownedTestFixtureOffset(t, 20000)
+			rows := ownedTestHistoryRows(t, data)
+			if retained {
+				for table, records := range historyTestRows(historyGolden(t, "retired_unassigned")) {
+					rows[table] = append(rows[table].([]any), records.([]any)...)
+				}
+			}
+			snapshot, err := newOwnedHistorySnapshot(historyJSON(t, rows), ownedString(data.Inventory["platform_channel_id"]), now, []byte("[]"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := &Store{buildCommitSHA: snapshotTestCommit}
+			f := &ownedPGFixture{store: store, channel: channel, data: data}
+			calls := 0
+			h := f.handler(t, ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
+				calls++
+				return ownedProducerRealDecision(), nil
+			}))
+			var prepared tickPreparation
+			err = h.withOwnedHistoryObservation(context.Background(), func(evidence *ownedHistoryRedisEvidence) error {
+				current, err := ownedHistoryWithObservations(snapshot, evidence)
+				if err != nil {
+					return err
+				}
+				data.History = &current
+				state := assessOwnedInventory(channel, data, now)
+				if state.Candidate == nil || state.HoldReason != "" || state.SkipReason != "" {
+					return fmt.Errorf("unexpected fixture assessment: %+v", state)
+				}
+				prepared, err = store.captureTickFacts(tickPreparation{Channel: channel, ChannelID: channel.ID, Now: now, Owned: &state, Candidates: []TickCandidate{*state.Candidate}})
+				return err
+			})
+			if err != nil {
+				t.Fatalf("owned preparation before PDS: %v", err)
+			}
+			candidates, _, err := evaluateTickCandidatePolicyWithRevalidation(context.Background(), channel, prepared.Candidates, h, func() error { return nil })
+			if err != nil || calls != 1 || len(candidates) != 1 || candidates[0].Rejected {
+				t.Fatalf("owned PDS boundary: calls=%d candidates=%+v err=%v", calls, candidates, err)
+			}
+			if prepared.Policy.CodeCommitSHA != snapshotTestCommit || !prepared.Features.FeatureAsOf.Equal(now) || len(prepared.Features.Candidates) != 1 {
+				t.Fatal("owned preparation lost exact snapshot identity/facts")
+			}
+		})
+	}
+}
+
+func TestOwnedFixtureHistoryReadersAreIndependent(t *testing.T) {
+	h := (&ownedPGFixture{}).handler(t, nil)
+	first := h.ownedHistoryRedisFactory(nil).(*ownedHistoryRedisStub)
+	second := h.ownedHistoryRedisFactory(nil).(*ownedHistoryRedisStub)
+	if first == second || len(first.markers) == 0 {
+		t.Fatal("fixture did not create independent populated readers")
+	}
+	for key := range first.markers {
+		first.markers[key] = "9999-0"
+		if second.markers[key] == first.markers[key] {
+			t.Fatal("one contender changed another's reader")
+		}
+	}
+	if err := first.Close(); err != nil || second.closed {
+		t.Fatal("one observation closed another's reader")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func ownedReleaseLeaderAtDBTime(ctx context.Context, row pgx.Row, release func(context.Context, time.Time) error) error {
@@ -154,9 +238,10 @@ func newOwnedPGFixtureWithWindow(t *testing.T, legacy func(*Store, time.Time) ma
 		t.Fatal("disposable database unavailable")
 	}
 	t.Cleanup(store.Close)
+	store.buildCommitSHA = snapshotTestCommit
 	var revision string
-	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "043_owned_history_snapshot_rows" {
-		t.Fatal("disposable database must be migrated to 043_owned_history_snapshot_rows")
+	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "044_policy_decision_snapshots" {
+		t.Fatal("disposable database must be migrated to 044_policy_decision_snapshots")
 	}
 	var now time.Time
 	if err := store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
@@ -332,6 +417,58 @@ func (f *ownedPGFixture) assertCounts(t *testing.T, want int) {
 			t.Fatalf("%s count=%d want=%d", name, got, want)
 		}
 	}
+	if want == 1 {
+		assertPGSnapshotFacts(t, f.store, f.channel.ID, 1, 1)
+	}
+}
+
+func waitOwnedContendersAtPDS(ctx context.Context, entered <-chan struct{}, results <-chan error, want int) error {
+	for reached := 0; reached < want; reached++ {
+		select {
+		case <-entered:
+		case err := <-results:
+			if err == nil {
+				return fmt.Errorf("contender returned without error before PDS barrier (%d/%d)", reached, want)
+			}
+			return fmt.Errorf("contender returned before PDS barrier (%d/%d): %w", reached, want, err)
+		case <-ctx.Done():
+			return fmt.Errorf("contender did not reach external PDS (%d/%d): %w", reached, want, ctx.Err())
+		}
+	}
+	return nil
+}
+
+func TestOwnedContenderPDSWaitReportsEarlyError(t *testing.T) {
+	failure := errors.New("preparation failed before PDS")
+	results := make(chan error, 1)
+	results <- failure
+	err := waitOwnedContendersAtPDS(context.Background(), make(chan struct{}), results, 2)
+	if !errors.Is(err, failure) || !strings.Contains(err.Error(), "0/2") {
+		t.Fatalf("early preparation failure hidden: %v", err)
+	}
+}
+
+func TestOwnedContenderPDSWaitReportsEarlyNoOp(t *testing.T) {
+	results := make(chan error, 1)
+	results <- nil
+	err := waitOwnedContendersAtPDS(context.Background(), make(chan struct{}), results, 2)
+	if err == nil || !strings.Contains(err.Error(), "without error") {
+		t.Fatalf("early no-op hidden: %v", err)
+	}
+}
+
+func TestOwnedContenderPDSWaitPreservesBarrierAndDeadline(t *testing.T) {
+	entered := make(chan struct{}, 2)
+	entered <- struct{}{}
+	entered <- struct{}{}
+	if err := waitOwnedContendersAtPDS(context.Background(), entered, make(chan error), 2); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitOwnedContendersAtPDS(ctx, entered, make(chan error), 2); !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait lost cancellation: %v", err)
+	}
 }
 
 func TestOwnedPGAtomicContendersAndCommittedResultLossReplay(t *testing.T) {
@@ -352,21 +489,19 @@ func TestOwnedPGAtomicContendersAndCommittedResultLossReplay(t *testing.T) {
 		return ownedProducerRealDecision(), nil
 	})
 	results := make(chan error, 2)
+	h := f.handler(t, pds)
 	for _, bucket := range []string{"first", "different-bucket"} {
-		go func(bucket string) { results <- f.store.RunTick(ctx, f.channel.ID, bucket, HandlerService{PDS: pds}) }(bucket)
+		go func(bucket string) { results <- f.store.RunTick(ctx, f.channel.ID, bucket, h) }(bucket)
 	}
-	for range 2 {
-		select {
-		case <-entered:
-		case <-ctx.Done():
-			t.Fatal("contender did not reach external PDS")
-		}
+	if err := waitOwnedContendersAtPDS(ctx, entered, results, 2); err != nil {
+		cancel()
+		t.Fatal(err)
 	}
 	// Two callers passed prepare, but no database locks remain during PDS.
 	releaseOnce.Do(func() { close(release) })
 	for range 2 {
 		if err := <-results; err != nil {
-			t.Fatalf("contender failed: %T", err)
+			t.Fatalf("contender failed: %T: %v", err, err)
 		}
 	}
 	f.assertCounts(t, 1)
@@ -375,7 +510,7 @@ func TestOwnedPGAtomicContendersAndCommittedResultLossReplay(t *testing.T) {
 		return PDSDecision{}, nil
 	})
 	// Model a caller that lost the committed return value, then restarted in a new bucket.
-	if err := f.store.RunTick(ctx, f.channel.ID, "restarted", HandlerService{PDS: noPDS}); err != nil {
+	if err := f.store.RunTick(ctx, f.channel.ID, "restarted", f.handler(t, noPDS)); err != nil {
 		t.Fatalf("replay failed: %T", err)
 	}
 	f.assertCounts(t, 1)
@@ -388,6 +523,17 @@ func TestOwnedPGAtomicContendersAndCommittedResultLossReplay(t *testing.T) {
 	if err != nil || mode != ApprovalAgent || ownedMap(ownedMap(v)["owned_inventory"])["inventory_id"] != *f.channel.OwnedSeedInventoryID {
 		t.Fatal("task typed authority missing")
 	}
+}
+
+func TestOwnedPGAtomicContendersAfterRetainedB2History(t *testing.T) {
+	if !t.Run("retain-B2-history", func(t *testing.T) {
+		newOwnedPGFixtureWithHistory(t, func(store *Store, now time.Time) map[string]any {
+			return ownedB2PGSeedRetirement(t, store, now)
+		})
+	}) {
+		t.Fatal("retained-history setup failed")
+	}
+	t.Run("v1-contenders", TestOwnedPGAtomicContendersAndCommittedResultLossReplay)
 }
 
 func TestOwnedPGQueueAndLeaderLossDuringPDSCannotConsume(t *testing.T) {
@@ -404,7 +550,7 @@ func TestOwnedPGQueueAndLeaderLossDuringPDSCannotConsume(t *testing.T) {
 			if err != nil || item == nil {
 				t.Fatal("fixture tick claim failed")
 			}
-			h := HandlerService{Store: f.store, PDS: ownedTestPDS(func(ctx context.Context, _ PDSDecisionRequest) (PDSDecision, error) {
+			h := f.handler(t, ownedTestPDS(func(ctx context.Context, _ PDSDecisionRequest) (PDSDecision, error) {
 				if mode == "queue" {
 					_, err := f.store.Pool.Exec(ctx, `UPDATE channel_ops_queue_items SET locked_by='replacement' WHERE id=$1::uuid`, item.ID)
 					if err != nil {
@@ -417,7 +563,7 @@ func TestOwnedPGQueueAndLeaderLossDuringPDSCannotConsume(t *testing.T) {
 					}
 				}
 				return ownedProducerRealDecision(), nil
-			})}
+			}))
 			err = h.HandleAgentTick(ctx, *item)
 			if mode == "queue" && !errors.Is(err, ErrQueueLeaseLost) {
 				t.Fatalf("queue loss not fenced: %T", err)
@@ -439,14 +585,15 @@ func TestOwnedPGEmptyPlatformAliasDeniedBeforePDS(t *testing.T) {
 		SELECT gen_random_uuid(),channel_profile_id,'','legacy alias',platform_account_id,credential_ref,'{}'::json,'private',FALSE,FALSE,now(),now() FROM publishing_accounts WHERE id=$1::uuid`, f.data.AccountIDs[0]); err != nil {
 		t.Fatal("legacy alias fixture failed")
 	}
-	h := HandlerService{PDS: ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
+	h := f.handler(t, ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
 		t.Error("alias reached policy call")
 		return PDSDecision{}, nil
-	})}
+	}))
 	if err := f.store.RunTick(ctx, f.channel.ID, "alias", h); err != nil {
 		t.Fatalf("alias hold failed: %T", err)
 	}
 	f.assertCounts(t, 0)
+	assertPGSnapshotFacts(t, f.store, f.channel.ID, 0, 0)
 	var state string
 	if err := f.store.Pool.QueryRow(ctx, `SELECT state FROM owned_seed_inventories WHERE id=$1::uuid`, *f.channel.OwnedSeedInventoryID).Scan(&state); err != nil || state != "held" {
 		t.Fatal("alias did not close intake")
@@ -495,10 +642,13 @@ func TestOwnedPGPolicyFailureAndMutationHoldWithoutReplacement(t *testing.T) {
 				}
 				return ownedProducerRealDecision(), nil
 			})
-			if err := f.store.RunTick(ctx, f.channel.ID, "first", HandlerService{PDS: pds}); err != nil {
+			if err := f.store.RunTick(ctx, f.channel.ID, "first", f.handler(t, pds)); err != nil {
 				t.Fatalf("fresh finalizer failed: %T", err)
 			}
 			f.assertCounts(t, 0)
+			if mode != "runtime_closed" {
+				assertPGSnapshotFacts(t, f.store, f.channel.ID, 1, 0)
+			}
 			var state string
 			var paused bool
 			if err := f.store.Pool.QueryRow(ctx, `SELECT i.state,c.intake_paused_at IS NOT NULL FROM channel_profiles c JOIN owned_seed_inventories i ON i.id=c.owned_seed_inventory_id WHERE c.id=$1::uuid`, f.channel.ID).Scan(&state, &paused); err != nil {
@@ -519,7 +669,7 @@ func TestOwnedPGPolicyFailureAndMutationHoldWithoutReplacement(t *testing.T) {
 					t.Fatal("fixture busy completion failed")
 				}
 			}
-			_ = f.store.RunTick(ctx, f.channel.ID, "next", HandlerService{PDS: pds})
+			_ = f.store.RunTick(ctx, f.channel.ID, "next", f.handler(t, pds))
 			if calls.Load() != 1 {
 				t.Fatal("failure selected a replacement")
 			}
@@ -548,7 +698,7 @@ func TestOwnedPGQueuedHandleAgentTickContenders(t *testing.T) {
 	entered, release, results := make(chan struct{}, 2), make(chan struct{}), make(chan error, 2)
 	var once sync.Once
 	defer once.Do(func() { close(release) })
-	h := HandlerService{Store: f.store, PDS: ownedTestPDS(func(ctx context.Context, _ PDSDecisionRequest) (PDSDecision, error) {
+	h := f.handler(t, ownedTestPDS(func(ctx context.Context, _ PDSDecisionRequest) (PDSDecision, error) {
 		entered <- struct{}{}
 		select {
 		case <-release:
@@ -556,7 +706,7 @@ func TestOwnedPGQueuedHandleAgentTickContenders(t *testing.T) {
 		case <-ctx.Done():
 			return PDSDecision{}, ctx.Err()
 		}
-	})}
+	}))
 	go func() { results <- h.HandleAgentTick(ctx, first) }()
 	select {
 	case <-entered:
@@ -605,7 +755,7 @@ func TestOwnedPGNormalPublicationCreationAndMetricRecovery(t *testing.T) {
 	f := newOwnedPGFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := f.store.RunTick(ctx, f.channel.ID, "normal-publication", HandlerService{PDS: fakePDS{decision: ownedProducerRealDecision()}}); err != nil {
+	if err := f.store.RunTick(ctx, f.channel.ID, "normal-publication", f.handler(t, fakePDS{decision: ownedProducerRealDecision()})); err != nil {
 		t.Fatal("fixture admission failed")
 	}
 	var taskID string
@@ -727,7 +877,8 @@ func TestOwnedPGRollbackIncludesReservationTaskSeedAuditAndQueue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	sentinel := errors.New("offline rollback after complete finalizer")
-	err := f.store.withChannelExecutionFence(ctx, f.channel.ID, true, func(s *Store) error {
+	h := f.handler(t, nil)
+	err := f.store.withOwnedTickChannelPhase(ctx, f.channel.ID, h, func(s *Store) error {
 		p, err := s.prepareTick(ctx, f.channel.ID, "rollback", agentTickOptions{})
 		if err != nil {
 			return err
@@ -743,10 +894,25 @@ func TestOwnedPGRollbackIncludesReservationTaskSeedAuditAndQueue(t *testing.T) {
 		return sentinel
 	})
 	if !errors.Is(err, sentinel) {
-		t.Fatalf("rollback failed before tested boundary: %T", err)
+		t.Fatalf("rollback failed before tested boundary: %T: %v", err, err)
 	}
 	f.assertCounts(t, 0)
-	if err := f.store.RunTick(ctx, f.channel.ID, "retry", HandlerService{PDS: fakePDS{decision: ownedProducerRealDecision()}}); err != nil {
+	for _, query := range []string{
+		`SELECT count(*) FROM decision_policy_versions WHERE portfolio_config_json->>'channel_profile_id'=$1`,
+		`SELECT count(*) FROM agent_tick_audits WHERE channel_profile_id=$1::uuid`,
+		`SELECT count(*) FROM decision_audit_entries WHERE channel_profile_id=$1::uuid`,
+		`SELECT count(*) FROM candidate_feature_snapshots WHERE source_record_refs_json->>'owned_inventory_id'=$1`,
+	} {
+		arg := f.channel.ID
+		if strings.Contains(query, "source_record_refs_json") {
+			arg = *f.channel.OwnedSeedInventoryID
+		}
+		var count int
+		if err := f.store.Pool.QueryRow(ctx, query, arg).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("snapshot rollback partial count=%d err=%v", count, err)
+		}
+	}
+	if err := f.store.RunTick(ctx, f.channel.ID, "retry", f.handler(t, fakePDS{decision: ownedProducerRealDecision()})); err != nil {
 		t.Fatalf("retry failed: %T", err)
 	}
 	f.assertCounts(t, 1)

@@ -240,7 +240,7 @@ func registerBoundedFixtureCleanup(t *testing.T, fixture *ChannelOpsFixture, ope
 			t.Errorf("fixture cleanup exceeded %s: %v", testOperationCleanupTimeout, cleanupCtx.Err())
 			return
 		}
-		fixture.Store.Close()
+		fixture.closeConnections(cleanupCtx)
 	})
 }
 
@@ -2680,26 +2680,39 @@ type ChannelOpsFixture struct {
 	FormatID             string
 	AccountID            string
 	AdditionalChannelIDs []string
+	snapshotFixtureLock  *pgx.Conn
 }
 
 func NewChannelOpsFixture(t *testing.T) *ChannelOpsFixture {
 	t.Helper()
-	cfg := LoadConfig()
-	store, err := OpenStore(context.Background(), cfg.DatabaseURL)
+	if testing.Short() {
+		t.Skip("disposable PostgreSQL fixture skipped in short mode")
+	}
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" && os.Getenv("CHANNELOPS_REQUIRE_DATABASE") != "1" {
+		t.Skip("explicit disposable PostgreSQL required")
+	}
+	if _, err := snapshotDisposableTarget(dsn, os.Getenv("CHANNEL_OPS_GO_POSTGRES_TEST_URL"), os.Getenv("GITHUB_ACTIONS"), os.Getenv("CHANNELOPS_REQUIRE_DATABASE"), os.Getenv("POLICY_SNAPSHOTS_DISPOSABLE_CONFIRM"), os.Getenv("POLICY_SNAPSHOTS_DISPOSABLE_SYSTEM_ID")); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenStore(context.Background(), dsn)
 	if err != nil {
 		if os.Getenv("CHANNELOPS_REQUIRE_DATABASE") == "1" {
-			t.Fatalf("required ChannelOps integration DATABASE_URL %q is unreachable: %v", cfg.DatabaseURL, err)
+			t.Fatalf("required disposable ChannelOps database is unreachable: %v", err)
 		}
-		t.Skipf("ChannelOps integration test requires reachable DATABASE_URL %q: %v", cfg.DatabaseURL, err)
+		t.Fatalf("confirmed disposable ChannelOps database is unreachable: %v", err)
 	}
+	lock := lockSnapshotFixture(t, store, dsn)
+	store.buildCommitSHA = snapshotTestCommit
 	store.Now = func() time.Time { return time.Date(2026, 5, 21, 18, 0, 0, 0, time.UTC) }
 	fixture := &ChannelOpsFixture{
-		T:         t,
-		Store:     store,
-		ChannelID: testUUID(t, "channel"),
-		LaneID:    testUUID(t, "lane"),
-		FormatID:  testUUID(t, "format"),
-		AccountID: testUUID(t, "account"),
+		T:                   t,
+		Store:               store,
+		ChannelID:           testUUID(t, "channel"),
+		LaneID:              testUUID(t, "lane"),
+		FormatID:            testUUID(t, "format"),
+		AccountID:           testUUID(t, "account"),
+		snapshotFixtureLock: lock,
 	}
 	fixture.cleanup(context.Background())
 	return fixture
@@ -2770,6 +2783,19 @@ func TestExecutionFenceBlocksIntakeButAllowsDownstreamWhenPaused(t *testing.T) {
 
 func (f *ChannelOpsFixture) Close(ctx context.Context) {
 	f.cleanup(ctx)
+	f.closeConnections(ctx)
+}
+
+func (f *ChannelOpsFixture) closeConnections(ctx context.Context) {
+	if f.snapshotFixtureLock != nil {
+		if _, err := f.snapshotFixtureLock.Exec(ctx, `SELECT pg_advisory_unlock(774403030044)`); err != nil {
+			f.T.Errorf("fixture lock release: %v", err)
+		}
+		if err := f.snapshotFixtureLock.Close(ctx); err != nil {
+			f.T.Errorf("fixture connection close: %v", err)
+		}
+		f.snapshotFixtureLock = nil
+	}
 	f.Store.Close()
 }
 
@@ -3310,59 +3336,28 @@ func (f *ChannelOpsFixture) CountRows(ctx context.Context, table string) int {
 }
 
 func (f *ChannelOpsFixture) cleanup(ctx context.Context) {
-	_, _ = f.Store.Pool.Exec(ctx, `
-		DELETE FROM channel_ops_queue_items
-		WHERE channel_profile_id = $1::uuid
-		   OR (payload_json ->> 'channel_id') = $1::text
-		   OR (payload_json ->> 'production_task_id') IN (
-				SELECT id::text FROM production_tasks WHERE channel_profile_id = $1::uuid
-		   )
-		   OR (payload_json ->> 'publication_id') IN (
-				SELECT publication.id::text
-				FROM publication_records AS publication
-				JOIN production_tasks AS task ON task.id = publication.production_task_id
-				WHERE task.channel_profile_id = $1::uuid
-		   )
-	`, f.ChannelID)
-	_, _ = f.Store.Pool.Exec(ctx, `
-		WITH fixture_tasks AS (
-			SELECT id FROM production_tasks WHERE channel_profile_id = $1::uuid
-		), fixture_publications AS (
-			SELECT id FROM publication_records WHERE production_task_id IN (SELECT id FROM fixture_tasks)
-		), deleted_feedback AS (
-			DELETE FROM feedback_snapshots WHERE publication_id IN (SELECT id FROM fixture_publications)
-		), deleted_takedowns AS (
-			DELETE FROM takedown_events WHERE publication_id IN (SELECT id FROM fixture_publications)
-		), deleted_ledger AS (
-			DELETE FROM material_usage_ledger
-			WHERE channel_profile_id = $1::uuid OR publication_id IN (SELECT id FROM fixture_publications)
-		), deleted_publications AS (
-			DELETE FROM publication_records WHERE id IN (SELECT id FROM fixture_publications)
-		), deleted_queue AS (
-			DELETE FROM channel_ops_queue_items
-			WHERE channel_profile_id = $1::uuid
-			   OR (payload_json ->> 'channel_id') = $1::text
-			   OR (payload_json ->> 'production_task_id') IN (SELECT id::text FROM fixture_tasks)
-			   OR (payload_json ->> 'publication_id') IN (SELECT id::text FROM fixture_publications)
-		), deleted_decisions AS (
-			DELETE FROM decision_audit_entries WHERE channel_profile_id = $1::uuid
-		), deleted_discovery AS (
-			DELETE FROM discovery_signals WHERE channel_profile_id = $1::uuid
-		), deleted_learning AS (
-			DELETE FROM learning_states WHERE channel_profile_id = $1::uuid
-		), deleted_audits AS (
-			DELETE FROM agent_tick_audits WHERE channel_profile_id = $1::uuid
-		), deleted_scheduler AS (
-			DELETE FROM internal_scheduler_runs WHERE channel_profile_id = $1::uuid
-		)
-		DELETE FROM channel_profiles WHERE id = $1::uuid
-	`, f.ChannelID)
-	_, _ = f.Store.Pool.Exec(ctx, `
+	// Row DELETE cannot erase immutable facts. This fixture owns an explicitly
+	// confirmed disposable database and holds its exclusive fixture lock.
+	if f.snapshotFixtureLock == nil {
+		f.T.Error("refusing cleanup without disposable fixture lock")
+		return
+	}
+	// Publication, feedback, ledger, learning and scheduler links are not FKs.
+	// Include those old fixture cleanup roots explicitly, including orphan rows.
+	if _, err := f.snapshotFixtureLock.Exec(ctx, `
+		TRUNCATE public.channel_profiles, public.decision_policy_versions,
+		         public.publication_records, public.material_usage_ledger,
+		         public.takedown_events, public.feedback_snapshots,
+		         public.learning_states, public.internal_scheduler_runs CASCADE
+	`); err != nil {
+		f.T.Errorf("disposable fixture cleanup: %v", err)
+		return
+	}
+	if _, err := f.snapshotFixtureLock.Exec(ctx, `
 		DELETE FROM autoflow_plans
 		WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
-	`)
-	for _, channelID := range f.AdditionalChannelIDs {
-		_, _ = f.Store.Pool.Exec(ctx, `DELETE FROM channel_profiles WHERE id = $1::uuid`, channelID)
+	`); err != nil {
+		f.T.Errorf("fixture plan cleanup: %v", err)
 	}
 }
 

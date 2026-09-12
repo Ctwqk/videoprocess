@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -78,14 +79,88 @@ func (a *ownedProducerPGAutoFlow) ApprovePlan(ctx context.Context, planID string
 
 func ownedProducerPGClaimPlan(t *testing.T, f *ownedPGFixture, ctx context.Context) (QueueItemRow, *ownedProducerPGAutoFlow) {
 	t.Helper()
-	if err := f.store.RunTick(ctx, f.channel.ID, "owned-producer", HandlerService{PDS: fakePDS{decision: ownedProducerRealDecision()}}); err != nil {
-		t.Fatal("native admission", err)
+	if err := f.store.RunTick(ctx, f.channel.ID, "owned-producer", f.handler(t, fakePDS{decision: ownedProducerRealDecision()})); err != nil {
+		t.Fatal("native admission", err, ownedProducerPGAdmissionDiagnostic(f, ctx))
 	}
 	item, err := f.store.ClaimNextForChannelAndKinds(ctx, handlerWorkerID(f.lease.Authority()), f.channel.ID, []string{QueuePlanTask})
 	if err != nil || item == nil {
-		t.Fatal("native plan claim", err)
+		t.Fatal("native plan claim", err, ownedProducerPGAdmissionDiagnostic(f, ctx))
 	}
 	return *item, &ownedProducerPGAutoFlow{t: t, f: f, planID: ownedNewUUID(t)}
+}
+
+func ownedProducerPGAdmissionDiagnostic(f *ownedPGFixture, ctx context.Context) string {
+	return ownedProducerAdmissionDiagnostic(f.store.Pool.QueryRow(ctx, `
+		SELECT jsonb_build_object(
+			'inventory_id', i.id, 'state', i.state, 'hold_reason', i.hold_reason,
+			'intake_pause_reason', c.intake_pause_reason,
+			'task_count', (SELECT count(*) FROM production_tasks WHERE channel_profile_id=c.id),
+			'plan_queue_count', (SELECT count(*) FROM channel_ops_queue_items WHERE channel_profile_id=c.id AND kind='plan_task'),
+			'ticks', (SELECT jsonb_agg(jsonb_build_object('tick_id',a.tick_id,'replay_status',a.replay_status,'summary',a.decision_summary_json) ORDER BY a.started_at)
+			          FROM agent_tick_audits a WHERE a.channel_profile_id=c.id),
+			'prior_inventories', (SELECT jsonb_agg(to_jsonb(p)) FROM (
+				SELECT previous.id, previous.channel_profile_id, previous.state, previous.hold_reason,
+				       previous.manifest_json->>'version' AS manifest_version,
+				       (SELECT jsonb_agg(a.tick_id ORDER BY a.started_at) FROM agent_tick_audits a WHERE a.channel_profile_id=previous.channel_profile_id) AS tick_ids
+				FROM owned_seed_inventories previous WHERE previous.id<>i.id
+				ORDER BY previous.created_at DESC, previous.id LIMIT 64
+			) p)
+		)
+		FROM channel_profiles c JOIN owned_seed_inventories i ON i.id=c.owned_seed_inventory_id
+		WHERE c.id=$1::uuid
+	`, f.channel.ID))
+}
+
+func ownedProducerAdmissionDiagnostic(row pgx.Row) string {
+	var raw []byte
+	if err := row.Scan(&raw); err != nil {
+		return fmt.Sprintf("admission diagnostic unavailable: %v", err)
+	}
+	return string(raw)
+}
+
+func TestOwnedProducerAdmissionDiagnosticPreservesHoldAndAudit(t *testing.T) {
+	want := `{"inventory_id":"fixture-id","state":"held","hold_reason":"owned_history_redis_configuration","task_count":0,"plan_queue_count":0,"ticks":[{"tick_id":"tick:fixture-channel:owned-producer","replay_status":"snapshot_complete","summary":{"reason":"owned_history_redis_configuration"}}]}`
+	row := ownedB2FenceRow(func(dest ...any) error {
+		*dest[0].(*[]byte) = []byte(want)
+		return nil
+	})
+	if got := ownedProducerAdmissionDiagnostic(row); got != want {
+		t.Fatalf("admission diagnostic lost decisive stored facts: %s", got)
+	}
+}
+
+func TestOwnedProducerAdmissionDiagnosticReportsReadFailure(t *testing.T) {
+	failure := errors.New("synthetic diagnostic read failed")
+	row := ownedB2FenceRow(func(...any) error { return failure })
+	if got := ownedProducerAdmissionDiagnostic(row); !strings.Contains(got, failure.Error()) {
+		t.Fatalf("diagnostic failure hidden: %s", got)
+	}
+}
+
+func TestOwnedProducerFixtureReaderPreservesExternalClients(t *testing.T) {
+	f := &ownedPGFixture{store: &Store{}}
+	pds := &fakePDS{decision: ownedProducerRealDecision()}
+	api := &ownedProducerPGAutoFlow{t: t, f: f}
+	youtube := &durablePromotionYouTube{}
+	h := f.handler(t, pds)
+	h.AutoFlow, h.YouTube = api, youtube
+	snapshot := historySnapshot(t, historyGolden(t, "retired_unassigned"))
+	phases := 0
+	err := h.withOwnedHistoryObservation(context.Background(), func(evidence *ownedHistoryRedisEvidence) error {
+		phases++
+		fresh, err := ownedHistoryWithObservations(snapshot, evidence)
+		if err != nil {
+			return err
+		}
+		if assessment := assessOwnedHistorySnapshot(fresh, fresh.observedAt); assessment.BlockReason != nil {
+			return fmt.Errorf("retained fixture proof refused: %s", *assessment.BlockReason)
+		}
+		return nil
+	})
+	if err != nil || phases != 2 || h.Store != f.store || h.PDS != pds || h.AutoFlow != api || h.YouTube != youtube {
+		t.Fatalf("reader lost fixture clients or fresh proof: phases=%d err=%v", phases, err)
+	}
 }
 
 func ownedProducerPGAssertTask(t *testing.T, f *ownedPGFixture, ctx context.Context, state string, execute int) ProductionTaskRow {
@@ -181,7 +256,15 @@ func ownedProducerPGAssertRecoveredHistoryHeld(t *testing.T, f *ownedPGFixture, 
 	if state != "held" || reason != "owned_inventory_queue_failed" || queueState != QueueStatusSucceeded || attempts != 2 || lastError != nil || owner != nil || locked != nil || completed != 0 {
 		t.Fatal("retry was erased or strict completion/replacement guard weakened", state, reason, attempts, completed)
 	}
-	snapshot, err := loadOwnedHistorySnapshot(ctx, f.store.Pool, ownedString(f.data.Inventory["platform_channel_id"]))
+	var snapshot ownedHistorySnapshot
+	err := f.handler(t, nil).withOwnedHistoryObservation(ctx, func(evidence *ownedHistoryRedisEvidence) error {
+		current, err := loadOwnedHistorySnapshot(ctx, f.store.Pool, ownedString(f.data.Inventory["platform_channel_id"]))
+		if err != nil {
+			return err
+		}
+		snapshot, err = ownedHistoryWithObservations(current, evidence)
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +276,7 @@ func ownedProducerPGAssertRecoveredHistoryHeld(t *testing.T, f *ownedPGFixture, 
 		t.Fatal("held recovered item attempted replacement policy")
 		return PDSDecision{}, nil
 	})
-	if err := f.store.RunTick(ctx, f.channel.ID, "after-native-recovery-held", HandlerService{PDS: noPDS}); !errors.Is(err, ErrChannelExecutionBlocked) {
+	if err := f.store.RunTick(ctx, f.channel.ID, "after-native-recovery-held", f.handler(t, noPDS)); !errors.Is(err, ErrChannelExecutionBlocked) {
 		t.Fatal("held native tick did not refuse replacement", err)
 	}
 	if after := ownedProducerPGAssertTask(t, f, ctx, TaskPlanning, 1); !bytes.Equal(mustJSON(before), mustJSON(after)) {
@@ -209,7 +292,7 @@ func TestOwnedProducerPGPlanFreshFenceAndRealPolicy(t *testing.T) {
 			defer cancel()
 			item, api := ownedProducerPGClaimPlan(t, f, ctx)
 			calls := 0
-			h := HandlerService{Store: f.store, AutoFlow: api, PDS: ownedTestPDS(func(ctx context.Context, request PDSDecisionRequest) (PDSDecision, error) {
+			h := f.handler(t, ownedTestPDS(func(ctx context.Context, request PDSDecisionRequest) (PDSDecision, error) {
 				calls++
 				if request.ActionType != "plan_approval" || request.Context["autoflow_plan_id"] != api.planID {
 					t.Fatal("wrong actual PDS request")
@@ -240,7 +323,8 @@ func TestOwnedProducerPGPlanFreshFenceAndRealPolicy(t *testing.T) {
 					}
 				}
 				return d, nil
-			})}
+			}))
+			h.AutoFlow = api
 			err := h.HandlePlanTask(ctx, item)
 			if calls != 1 || api.planCalls != 1 {
 				t.Fatal("unexpected external retry", calls, api.planCalls)
@@ -292,10 +376,11 @@ func TestOwnedProducerPGApprovalResultLossReusesDurablePlan(t *testing.T) {
 	item, api := ownedProducerPGClaimPlan(t, f, ctx)
 	api.loseFirstApproval = true
 	calls := 0
-	h := HandlerService{Store: f.store, AutoFlow: api, PDS: ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
+	h := f.handler(t, ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
 		calls++
 		return ownedProducerRealDecision(), nil
-	})}
+	}))
+	h.AutoFlow = api
 	failure := h.HandlePlanTask(ctx, item)
 	if failure == nil {
 		t.Fatal("lost approval response not surfaced")
@@ -329,10 +414,11 @@ func TestOwnedProducerPGNativePlanResponseLossReusesOriginalBinding(t *testing.T
 	item, api := ownedProducerPGClaimPlan(t, f, ctx)
 	api.loseFirstPlan = true
 	calls := 0
-	h := HandlerService{Store: f.store, AutoFlow: api, PDS: ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
+	h := f.handler(t, ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
 		calls++
 		return ownedProducerRealDecision(), nil
-	})}
+	}))
+	h.AutoFlow = api
 	failure := h.HandlePlanTask(ctx, item)
 	if failure == nil {
 		t.Fatal("native plan response loss hidden")
@@ -395,7 +481,8 @@ func TestOwnedProducerPGPlanningRollbackKeepsOriginalPendingPlan(t *testing.T) {
 	defer cancel()
 	item, api := ownedProducerPGClaimPlan(t, f, ctx)
 	api.loseFirstApproval = true
-	h := HandlerService{Store: f.store, AutoFlow: api, PDS: fakePDS{decision: ownedProducerRealDecision()}}
+	h := f.handler(t, fakePDS{decision: ownedProducerRealDecision()})
+	h.AutoFlow = api
 	if err := h.HandlePlanTask(ctx, item); err == nil {
 		t.Fatal("missing intentional approval response loss")
 	}
