@@ -12224,8 +12224,31 @@ except (KeyError,TypeError,ValueError): raise SystemExit(1)
 
 vp_require_autoflow_control_ready() {
   [[ "${UPDATE_SERVICES:-1}" -ne 0 ]] || return 0
+  local image="$1" expected attempt status
+  local attempts="${VP_WORKER_DEPLOY_READINESS_ATTEMPTS:-30}"
+  local interval="${VP_WORKER_DEPLOY_READINESS_INTERVAL_SECONDS:-2}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ && "$attempts" -le 120 \
+    && "$interval" =~ ^[1-9][0-9]*$ && "$interval" -le 30 ]] || return 1
+  expected="$(vp_app_service_durable_identity vp-autoflow-api-swarm "$image")" || return 1
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if vp_autoflow_control_ready_once "$image" "$expected"; then
+      return 0
+    else
+      status=$?
+    fi
+    # UpdateStatus=completed can precede old-task shutdown and new-task health.
+    [[ "$status" -eq 3 ]] || return 1
+    if [[ "$attempt" -lt "$attempts" ]]; then
+      sleep "$interval" || return 1
+    fi
+  done
+  return 1
+}
+
+vp_autoflow_control_ready_once() {
   local image="$1" service=vp-autoflow-api-swarm identity before service_id spec tasks image_user health container
   before="$(vp_app_service_durable_identity "$service" "$image")" || return 1
+  [[ "$before" == "$2" ]] || return 1
   service_id="${before%%|*}"
   vp_autoflow_control_identity "$service_id" "$image" || return 1
   identity="$VP_AUTOFLOW_CONTROL_IDENTITY"
@@ -12233,7 +12256,6 @@ vp_require_autoflow_control_ready() {
   if [[ -n "${OWNED_HISTORY_REDIS_URL_FILE:-}" ]]; then
     owned_history_identity="$(vp_owned_history_redis_identity)" || return 1
   fi
-  vp_require_service_node "$service_id" "$VP_RUNTIME_NODE" || return 1
   spec="$(docker service inspect "$service_id" --format '{{json .Spec}}')" || return 1
   tasks="$(vp_autoflow_tasks "$service_id")" || return 1
   image_user="$(docker image inspect "$image" --format '{{.Config.User}}')" || return 1
@@ -12270,21 +12292,29 @@ try:
         if any(s.get("File",{}).get("Name") in {history_target,history_path} for s in c.get("Configs",[])): raise ValueError
         if any(history_path==m.get("Target","").rstrip("/") or history_path.startswith(m.get("Target","").rstrip("/")+"/") for m in c.get("Mounts",[])): raise ValueError
     active=[t for t in tasks if t["Status"]["State"] not in {"shutdown","complete","failed","rejected","remove"}]
-    if len(active)!=1: raise ValueError
+    pending={"new","pending","assigned","accepted","preparing","ready","starting"}
+    if any(t["ServiceID"]!=service_id or t["Status"]["State"] not in pending|{"running"} for t in active): raise ValueError
+    if len(active)!=1: raise SystemExit(3)
     t=active[0]
-    if t["ServiceID"]!=service_id or t["Status"]["State"]!="running" or t["Spec"]["ContainerSpec"]!=c: raise ValueError
+    if t["Spec"]["ContainerSpec"]!=c: raise ValueError
+    if t["Status"]["State"] in pending: raise SystemExit(3)
     container=t["Status"]["ContainerStatus"]["ContainerID"]
     if not re.fullmatch(r"[0-9a-f]{64}",container): raise ValueError
     print(container)
 except (KeyError,TypeError,ValueError,AttributeError):
     raise SystemExit(1)
-' "$identity" "$service_id" "$image" "$image_user" "$health" "$owned_history_identity" <<<"$spec"$'\n'"$tasks")" || return 1
-  remote_sh "$VP_RUNTIME_HOST" /bin/sh -s -- "$container" "$service_id" "$image" "$health" <<'REMOTE' >/dev/null 2>&1 || return 1
+' "$identity" "$service_id" "$image" "$image_user" "$health" "$owned_history_identity" <<<"$spec"$'\n'"$tasks")" || return $?
+  vp_require_service_node "$service_id" "$VP_RUNTIME_NODE" || return 1
+  remote_sh "$VP_RUNTIME_HOST" /bin/sh -s -- "$container" "$service_id" "$image" "$health" <<'REMOTE' >/dev/null 2>&1 || return $?
 set -eu
 container="$1"; service_id="$2"; image="$3"; health="$4"
 actual="$(docker inspect "$container" --format '{{index .Config.Labels "com.docker.swarm.service.id"}}|{{.Config.Image}}|{{.State.Running}}|{{.State.Health.Status}}')"
-[ "$actual" = "$service_id|$image|true|healthy" ]
-exec docker exec "$container" sh -c "$health"
+case "$actual" in
+  "$service_id|$image|true|starting") exit 3 ;;
+  "$service_id|$image|true|healthy") ;;
+  *) exit 1 ;;
+esac
+docker exec "$container" sh -c "$health" || exit 3
 REMOTE
   [[ "$(vp_app_service_durable_identity "$service" "$image")" == "$before" ]]
 }

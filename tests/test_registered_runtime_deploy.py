@@ -266,6 +266,9 @@ def test_exact_ready_descriptor_and_current_task_qualification(fault):
 vp_app_service_durable_identity() { echo 'aaaaaaaaaaaaaaaaaaaaaaaaa|dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'; }
 vp_autoflow_health_command() { echo true; }
 vp_require_service_node() { :; }
+VP_WORKER_DEPLOY_READINESS_ATTEMPTS=2
+VP_WORKER_DEPLOY_READINESS_INTERVAL_SECONDS=1
+sleep() { :; }
 docker() {
   if [[ "$1 $2" == 'service inspect' ]]; then printf '%s\n' "$SPEC"
   elif [[ "$1 $2" == 'service ps' ]]; then echo aaaaaaaaaaaaaaaaaaaaaaaaa
@@ -854,6 +857,86 @@ def test_owned_history_readiness_rechecks_fixed_mount_before_health(tmp_path, fa
     assert result.returncode == (0 if fault == "none" else 1), result.stderr
     assert active.read_bytes() == before
     assert ("HEALTH" in Path(data["AUDIT"]).read_text().splitlines()) == (fault == "none")
+
+
+@pytest.mark.parametrize("fault", ["settle", "two_forever", "health_forever", "body_pending",
+                                  "service_drift", "spec_drift", "secret_drift", "journal_drift", "node_drift"])
+def test_completed_start_first_waits_for_exact_single_healthy_task(tmp_path, fault):
+    data = locked_runtime_fixture(tmp_path, "forward")
+    final = json.loads(json.dumps(data["TASKS"]))
+    old = json.loads(json.dumps(final[0]))
+    old["Spec"]["ContainerSpec"]["Image"] = "vp-backend-api:deploy-111111111111"
+    old["Status"]["ContainerStatus"]["ContainerID"] = "d" * 64
+    data["TASKS"] = [final[0], old]
+    transition = r'''
+eval "$node_function"
+export POLL=0
+VP_WORKER_DEPLOY_READINESS_ATTEMPTS=4
+VP_WORKER_DEPLOY_READINESS_INTERVAL_SECONDS=1
+sleep() {
+  [[ "$1" == 1 ]] || return 91
+  POLL=$((POLL + 1))
+  echo "WAIT:$POLL" >> "$AUDIT"
+  if [[ "$FAULT" != two_forever ]]; then TASKS="$FINAL_TASKS"; fi
+  if [[ "$FAULT" == service_drift ]]; then
+    vp_registered_worker_service_current_id() { echo zzzzzzzzzzzzzzzzzzzzzzzzz; }
+  elif [[ "$FAULT" == spec_drift || "$FAULT" == secret_drift || "$FAULT" == journal_drift ]]; then
+    python3 -c 'import json,os,pathlib
+root=pathlib.Path(os.environ["ADMISSION_ROOT"]); fault=os.environ["FAULT"]
+p=root/("transactions/active.json" if fault=="journal_drift" else "engine-spec.json")
+v=json.loads(p.read_text())
+if fault=="journal_drift": v["phase"]="ROLLBACK_PREPARING"
+elif fault=="spec_drift": v["Labels"]={"drift":"unexpected"}
+else: v["TaskTemplate"]["ContainerSpec"]["Secrets"][0]["SecretID"]="z"*25
+p.write_text(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n")'
+  fi
+}
+remote_sh() {
+  vp_worker_admission_lock_assert || return 92
+  [[ "$1" == 10.0.0.127 && "$5" == cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc ]] || return 92
+  echo "HEALTH_PROBE:$POLL" >> "$AUDIT"
+  local script
+  script="$(cat)"
+  (
+    docker() {
+      case "$1" in
+        inspect)
+          local health=healthy
+          if [[ "$POLL" == 1 || "$FAULT" == health_forever ]]; then health=starting; fi
+          printf '%s|%s|true|%s\n' aaaaaaaaaaaaaaaaaaaaaaaaa "$IMAGE" "$health" ;;
+        exec)
+          echo "HEALTH_BODY:$POLL" >> "$AUDIT"
+          if [[ "$FAULT" == body_pending && "$POLL" == 2 ]]; then return 1; fi ;;
+        *) return 91 ;;
+      esac
+    }
+    export -f docker
+    SCRIPT="$script" bash -c 'eval "$SCRIPT"' -- "${@:5}"
+  )
+}
+'''
+    script = 'node_function="$(declare -f vp_require_service_node)"\n' + LOCKED_RUNTIME_BOUNDARY
+    script = script.replace("status=0\n", transition + "\nstatus=0\n", 1)
+    script = script.replace("'service ps') echo aaaaaaaaaaaaaaaaaaaaaaaaa ;;", r''' 'service ps')
+      if [[ "$4" == --filter ]]; then
+        if [[ "$FAULT" == node_drift ]]; then echo 'wrong-node|Running 1 second'
+        else
+          echo 'colima-127|Running 1 second'
+          if [[ "$POLL" == 0 || "$FAULT" == two_forever ]]; then echo 'colima-127|Running 5 minutes'; fi
+        fi
+      else echo aaaaaaaaaaaaaaaaaaaaaaaaa; fi ;;''')
+    result = run(script, **data, FINAL_TASKS=final, FAULT=fault)
+    assert result.returncode == (0 if fault in {"settle", "body_pending"} else 1), result.stderr
+    operations = Path(data["AUDIT"]).read_text().splitlines()
+    assert sum(line.startswith("UPDATE|") for line in operations) == 1
+    waits = [line for line in operations if line.startswith("WAIT:")]
+    expected_waits = 3 if fault in {"two_forever", "health_forever", "body_pending"} else 2 if fault == "settle" else 1
+    assert len(waits) == expected_waits
+    assert "HEALTH_PROBE:0" not in operations
+    if fault in {"settle", "body_pending"}:
+        assert operations[-1] == ("HEALTH_BODY:3" if fault == "body_pending" else "HEALTH_BODY:2")
+    else:
+        assert not any(line.startswith("HEALTH_BODY:") for line in operations)
 
 
 @pytest.mark.parametrize(
