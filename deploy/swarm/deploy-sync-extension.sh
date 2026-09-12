@@ -8023,6 +8023,10 @@ vp_worker_admission_current_promotion_matches() {
 vp_worker_admission_complete_pending_promotion() {
   local kind="$1"
   local operation_id="$2"
+  case "$kind" in
+    PROMOTE_WORKERS|PROMOTE_MARKER|PROMOTE_CONTROL)
+      vp_registered_reconcile_action verify all || return 1 ;;
+  esac
   if ! vp_worker_admission_current_promotion_matches "$kind"; then
     vp_worker_admission_hydrate_recovery_context || return 1
     vp_worker_admission_replay_pending_promotion_effect "$kind" || return 1
@@ -8190,6 +8194,7 @@ vp_worker_admission_resume_durable_rollback() {
 }
 
 vp_worker_admission_resume_forward_failure() {
+  vp_registered_reconcile_cleanup all || return 1
   vp_worker_admission_hydrate_recovery_context || return 1
   if [[ "${VP_WORKER_ADMISSION_RECOVERY_LEGACY_PREAPPLY:-false}" == true ]]; then
     vp_worker_admission_abort_legacy_preapply
@@ -11591,8 +11596,80 @@ vp_worker_admission_abort_vision_jobs() {
   done
 }
 
+vp_registered_reconcile_action() {
+  vp_worker_admission_lock_assert || return 1
+  [[ "${ROOT:-}" = /* ]] || return 1
+  # Direct invocation preserves the owning shell as the helper's immediate parent.
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" registered-job \
+    "$VP_WORKER_ADMISSION_LOCK_ROOT" 19 "$ROOT/sync.lock" 9 \
+    "$VP_WORKER_ADMISSION_CURRENT_BASHPID" "$VP_WORKER_ADMISSION_LOCK_TOKEN" \
+    "$@" >/dev/null 2>/dev/null
+}
+
+vp_registered_reconcile_wait() {
+  local stage="$1" started="$SECONDS" next_observation=0 action status
+  while (( SECONDS - started < 240 )); do
+    [[ "${VP_WORKER_ADMISSION_DEPLOY_SIGNAL_STATUS:-0}" -eq 0 ]] || return 1
+    action=poll
+    if (( SECONDS >= next_observation )); then
+      action=observe
+      next_observation=$((SECONDS + 1))
+    fi
+    status=0
+    vp_registered_reconcile_action "$action" "$stage" || status=$?
+    case "$status" in
+      0) ;;
+      10) return 0 ;;
+      *) return 1 ;;
+    esac
+    sleep 0.01
+  done
+  return 1
+}
+
+vp_registered_reconcile_cleanup() {
+  local stage="${1:-all}" started="$SECONDS"
+  while (( SECONDS - started < 30 )); do
+    if vp_registered_reconcile_action cleanup "$stage"; then return 0; fi
+    sleep 0.1
+  done
+  echo "registered reconcile cleanup pending" >&2
+  return 1
+}
+
+vp_registered_reconcile_capture() {
+  local stage="$1" status=0
+  [[ "${VP_WORKER_ADMISSION_DEPLOY_SIGNAL_STATUS:-0}" -eq 0 ]] || return 1
+  vp_require_pipeline_network_identity || return 1
+  vp_registered_reconcile_action prepare "$stage" \
+    "$VP_PIPELINE_NETWORK_ID" "$VP_MANAGER_NODE" || return 1
+  if vp_registered_reconcile_action launch "$stage"; then
+    vp_registered_reconcile_wait "$stage" || status=1
+  else
+    status=1
+  fi
+  vp_registered_reconcile_cleanup "$stage" || return 1
+  [[ "${VP_WORKER_ADMISSION_DEPLOY_SIGNAL_STATUS:-0}" -eq 0 ]] || return 1
+  return "$status"
+}
+
+vp_registered_reconcile_forward() {
+  local status=0
+  vp_registered_reconcile_capture current || return 1
+  if vp_registered_reconcile_action prepare run \
+    && vp_registered_reconcile_action launch run; then
+    vp_registered_reconcile_wait run || status=1
+  else
+    status=1
+  fi
+  vp_registered_reconcile_cleanup all || return 1
+  [[ "$status" -eq 0 && "${VP_WORKER_ADMISSION_DEPLOY_SIGNAL_STATUS:-0}" -eq 0 ]] || return 1
+  vp_registered_reconcile_action verify all
+}
+
 vp_worker_admission_abort_transaction() {
   local reason="$1"
+  vp_registered_reconcile_cleanup all || return 1
   vp_worker_admission_abort_vision_jobs || return 1
   vp_worker_admission_abort_preparing_transaction "$reason"
 }
@@ -17054,6 +17131,9 @@ vp_apply_app_services() {
 
   vp_require_worker_redis_marker_status || return 1
   # Activation can commit before its drain fails, so journal rollback intent first.
+  if [[ "${UPDATE_SERVICES:-1}" -ne 0 ]]; then
+    vp_registered_reconcile_capture baseline || return 1
+  fi
   vp_record_worker_activation_attempt vp-ffmpeg-worker-go-swarm || return 1
   vp_activate_worker_admission \
     vp-ffmpeg-worker-go-swarm || return 1
@@ -17138,6 +17218,7 @@ vp_apply_app_services() {
   done
   vp_install_soak_watch || return 1
   if [[ "${UPDATE_SERVICES:-1}" -ne 0 ]]; then
+    vp_registered_reconcile_forward || return 1
     vp_worker_admission_transition_to FORWARD_VERIFIED || return 1
     vp_worker_admission_promote_phase PROMOTE_WORKERS || return 1
     vp_worker_admission_promote_phase PROMOTE_MARKER || return 1
@@ -17182,6 +17263,7 @@ _vp_deploy_vp_app_services_locked() {
     return 1
   fi
   if ! vp_apply_app_services "$@"; then
+    vp_registered_reconcile_cleanup all || return 1
     local process_candidate_records=""
     if ! process_candidate_records="$(
       vp_worker_admission_process_candidate_service_records \

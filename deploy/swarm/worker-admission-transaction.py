@@ -14,6 +14,8 @@ import runpy
 import secrets
 import stat
 import sys
+import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, overload
@@ -1460,7 +1462,14 @@ def _validate_legacy_schema_1_document(value: object) -> dict[str, Any]:
 
 
 def _validate_document(value: object) -> dict[str, Any]:
-    document = _require_exact_fields(value, TOP_LEVEL_FIELDS)
+    fields = TOP_LEVEL_FIELDS | (
+        {"registered_reconcile"}
+        if isinstance(value, dict) and "registered_reconcile" in value
+        else set()
+    )
+    document = _require_exact_fields(value, fields)
+    if "registered_reconcile" in document:
+        _validate_registered_jobs(document["registered_reconcile"])
     _require_exact_schema(document["schema"], CURRENT_DOCUMENT_SCHEMA)
     _require_string(document["transaction_id"], r"tx-[0-9a-f]{32}", maximum=35)
     _require_integer(document["revision"])
@@ -2337,6 +2346,9 @@ def begin(arguments: list[str]) -> None:
         baseline_kind=baseline_kind,
         credentials=credentials,
     )
+    document["registered_reconcile"] = dict(
+        version=1, baseline=None, current=None, run=None
+    )
     root, root_descriptor, transactions_descriptor = _open_transactions(
         raw_root,
         create=True,
@@ -2747,7 +2759,9 @@ def lookup_prepared_secret(arguments: list[str]) -> None:
     print(matches[0]["docker_secret_id"] if matches else "-")
 
 
-def _set_phase(document: dict[str, Any], target_phase: str, outcome: str | None) -> None:
+def _set_phase(
+    document: dict[str, Any], target_phase: str, outcome: str | None
+) -> None:
     current_phase = document["phase"]
     if (
         target_phase not in PHASES
@@ -2757,6 +2771,15 @@ def _set_phase(document: dict[str, Any], target_phase: str, outcome: str | None)
         raise TransactionError
     if target_phase == "FORWARD_APPLYING" and not document["baseline"]["captured"]:
         raise TransactionError
+    if target_phase in {
+        "FORWARD_VERIFIED",
+        "WORKERS_PROMOTED",
+        "MARKER_PROMOTED",
+        "CONTROL_PROMOTED",
+    }:
+        _registered_gate(document, success=True)
+    if target_phase in {"ROLLBACK_PREPARING", "ABORTING", "RETIRING", "DONE"}:
+        _registered_gate(document, success=False)
     if (
         target_phase == "FORWARD_VERIFIED"
         and any(
@@ -4221,6 +4244,1017 @@ _REGISTERED_PROTOCOL: dict[str, Any] | None = None
 REGISTERED_RECONCILE_NAME = "registered-reconcile.json"
 
 
+def _validate_registered_jobs(value: object) -> None:
+    record = _require_exact_fields(
+        value,
+        {"version", "baseline", "current", "run"}
+        | (
+            {"pins", "capture_read"}.intersection(value)
+            if isinstance(value, dict)
+            else set()
+        ),
+    )
+    _require_exact_schema(record["version"], 1)
+    reader = record.get("capture_read")
+    if reader is not None:
+        _require_exact_fields(reader, {"state", "id", "name", "sha256", "principal"})
+        if reader["state"] not in {"creating", "present", "removing", "removed"}:
+            raise TransactionError
+        _require_optional_string(reader["id"], r"[a-z0-9]{25}")
+        if reader["state"] != "creating" and reader["id"] is None:
+            raise TransactionError
+        _require_string(reader["name"], r"vp-registered-read-tx-[0-9a-f]{32}")
+        _require_string(reader["sha256"], r"[0-9a-f]{64}")
+        _require_string(reader["principal"], r"[A-Za-z_][A-Za-z0-9_.$@-]{0,127}")
+    pins = record.get("pins")
+    if pins is not None:
+        _require_exact_fields(pins, {"state", "id", "name", "sha256"})
+        if pins["state"] not in {"creating", "present", "removing", "removed"}:
+            raise TransactionError
+        _require_optional_string(pins["id"], r"[a-z0-9]{25}")
+        if pins["state"] != "creating" and pins["id"] is None:
+            raise TransactionError
+        _require_string(pins["name"], r"vp-registered-pins-[0-9a-f-]{36}")
+        _require_string(pins["sha256"], r"[0-9a-f]{64}")
+    for stage in ("baseline", "current", "run"):
+        job = record[stage]
+        if job is None:
+            continue
+        _require_exact_fields(
+            job,
+            {
+                "attempt_id",
+                "files",
+                "input_file",
+                "input_sha256",
+                "spec",
+                "service_id",
+                "task_id",
+                "exit_code",
+                "state",
+                "result",
+                "pins_secret_id",
+            },
+        )
+        _require_string(
+            job["attempt_id"],
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        )
+        _require_string(job["input_sha256"], r"[0-9a-f]{64}")
+        if job["state"] not in {
+            "planned",
+            "launching",
+            "created",
+            "terminal",
+            "removing",
+            "removed",
+        }:
+            raise TransactionError
+        _require_optional_string(job["service_id"], r"[a-z0-9]{25}")
+        _require_optional_string(job["task_id"], r"[a-z0-9]{25}")
+        if job["state"] == "terminal" or job["exit_code"] is not None:
+            _require_integer(job["exit_code"])
+            if job["exit_code"] > 255:
+                raise TransactionError
+        if job["state"] == "created" and job["service_id"] is None:
+            raise TransactionError
+        if job["state"] == "planned" and job["service_id"] is not None:
+            raise TransactionError
+        if not isinstance(job["files"], dict) or not isinstance(job["spec"], dict):
+            raise TransactionError
+
+
+def _registered_gate(document: dict, *, success: bool) -> None:
+    record = document.get("registered_reconcile")
+    if record is None:
+        return  # Explicit older-journal compatibility; never synthesize a result.
+    jobs = [record[stage] for stage in ("baseline", "current", "run")]
+    if any(job is not None and job["state"] != "removed" for job in jobs):
+        raise TransactionError
+    for key in ("pins", "capture_read"):
+        if record.get(key) is not None and record[key]["state"] != "removed":
+            raise TransactionError
+    if success and (
+        any(job is None or job["exit_code"] != 0 for job in jobs)
+        or record["run"]["result"] is None
+        or record.get("capture_read") is None
+    ):
+        raise TransactionError
+    if success:
+        try:
+            baseline, current, run = jobs
+            pins = record["pins"]
+            result = _require_exact_fields(
+                run["result"],
+                {
+                    "outcome",
+                    "pin_sha256",
+                    "attempted_streams",
+                    "request_bytes",
+                    "request_sha256",
+                    "service_id",
+                    "task_id",
+                },
+            )
+            if (
+                pins is None
+                or pins["id"] != current["pins_secret_id"]
+                or pins["id"] != run["pins_secret_id"]
+                or pins["sha256"] != current["result"]["pins"]["pin_sha256"]
+                or result["pin_sha256"] != pins["sha256"]
+                or result["service_id"] != run["service_id"]
+                or result["task_id"] != run["task_id"]
+                or result["outcome"] not in {"reconciled", "already_absent"}
+                or baseline["result"]["credentials"] != current["result"]["credentials"]
+            ):
+                raise TransactionError
+            _require_string(result["request_sha256"], r"[0-9a-f]{64}")
+            _require_integer(result["request_bytes"], 1)
+            _require_string(result["service_id"], r"[a-z0-9]{25}")
+            _require_string(result["task_id"], r"[a-z0-9]{25}")
+            streams = result["attempted_streams"]
+            if (
+                type(streams) is not list
+                or streams != sorted(set(streams))
+                or not set(streams).issubset(current["result"]["pins"]["commands"])
+                or (result["outcome"] == "already_absent") != (not streams)
+            ):
+                raise TransactionError
+        except Exception:
+            raise TransactionError from None
+
+
+def _registered_credentials(document: dict) -> dict:
+    control = document["forward"]["control"]
+    if control is None:
+        raise TransactionError
+    matches = [item for item in control["secrets"] if item["purpose"] == "operator"]
+    if (
+        len(matches) != 1
+        or matches[0]["name"] != "vp-wc-operator-" + control["generation"]
+    ):
+        raise TransactionError
+    redis = document["runtime_redis"].get("control")
+    if (
+        redis is None
+        or redis["secret_name"] != "vp-control-redis-" + redis["runtime_generation"]
+    ):
+        raise TransactionError
+    return dict(
+        control_generation=control["generation"],
+        database_secret_id=matches[0]["docker_secret_id"],
+        redis_generation=redis["runtime_generation"],
+        redis_secret_id=redis["docker_secret_id"],
+    )
+
+
+def _registered_directory(raw_root: str, transaction_id: str, stage: str) -> Path:
+    root, root_fd, transactions_fd = _open_transactions(raw_root, create=False)
+    descriptor = None
+    try:
+        descriptor = _open_child_directory(transactions_fd, transaction_id, create=True)
+        child = _open_child_directory(descriptor, "registered-" + stage, create=True)
+        os.close(child)
+        return root / TRANSACTIONS_NAME / transaction_id / ("registered-" + stage)
+    finally:
+        for fd in (descriptor, transactions_fd, root_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+def prepare_registered_capture(
+    raw_root: str,
+    raw_descriptor: str,
+    raw_revision: str,
+    stage: str,
+    network_id: str,
+    manager_node: str,
+    manager_node_id: str,
+) -> dict:
+    def updater(document: dict) -> None:
+        if (
+            stage not in {"baseline", "current"}
+            or document["phase"] != "FORWARD_APPLYING"
+            or document["operation"] is not None
+        ):
+            raise TransactionError
+        registered = document["registered_reconcile"]
+        if registered[stage] is not None or not document["baseline"]["captured"]:
+            raise TransactionError
+        reader = registered.get("capture_read")
+        if reader is None or reader["state"] != "present":
+            raise TransactionError
+        capture_read = {
+            key: reader[key] for key in ("id", "name", "sha256", "principal")
+        }
+        workers = document["forward"]["workers"]
+        expected = {"pending", "prepared"} if stage == "baseline" else {"verified"}
+        if len(workers) != 4 or any(
+            worker["applied_stage"] not in expected for worker in workers
+        ):
+            raise TransactionError
+        baseline = None
+        if stage == "current":
+            prior = registered["baseline"]
+            if (
+                prior is None
+                or prior["state"] != "removed"
+                or prior["exit_code"] != 0
+                or prior["result"] is None
+            ):
+                raise TransactionError
+            baseline = prior["result"]["snapshot"]
+        images = {
+            worker["image"]
+            for worker in workers
+            if worker["service"] != "vp-ffmpeg-worker-go-swarm"
+        }
+        if len(images) != 1:
+            raise TransactionError
+        image = images.pop()
+        if not image.endswith(":deploy-" + document["target_commit"][:12]):
+            raise TransactionError
+        protocol = _registered_protocol()
+        directory = _registered_directory(raw_root, document["transaction_id"], stage)
+        if stage == "baseline":
+            descriptor = os.open(
+                directory.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            try:
+                progress, _identity = _read_app_progress_from_descriptor(
+                    descriptor, allow_missing=False
+                )
+                if (
+                    progress["transaction_id"] != document["transaction_id"]
+                    or progress["target_commit"] != document["target_commit"]
+                    or progress["migration_state"] != "applied"
+                    or RUNTIME_AUTHORITY_SERVICES.intersection(
+                        progress["attempted_services"]
+                    )
+                ):
+                    raise TransactionError
+            finally:
+                os.close(descriptor)
+        files = protocol["prepare_files"](directory)
+        attempt_id = str(uuid.uuid4())
+        credentials = _registered_credentials(document)
+        payload = dict(
+            files=files,
+            credentials=credentials,
+            capture_read=capture_read,
+            baseline=baseline,
+            transaction_id=document["transaction_id"],
+            revision=document["revision"],
+            release_commit=document["target_commit"],
+        )
+        input_file = protocol["write_input"](directory / "input.json", payload)
+        spec = protocol["capture_spec"](
+            attempt_id=attempt_id,
+            transaction_id=document["transaction_id"],
+            files=files,
+            credentials=credentials,
+            capture_read=capture_read,
+            image=image,
+            network_id=network_id,
+            manager_node=manager_node,
+            manager_node_id=manager_node_id,
+        )
+        registered[stage] = dict(
+            attempt_id=attempt_id,
+            files=files,
+            input_file=input_file,
+            input_sha256=protocol["digest"](payload),
+            spec=spec,
+            service_id=None,
+            task_id=None,
+            exit_code=None,
+            state="planned",
+            result=None,
+            pins_secret_id=None,
+        )
+
+    try:
+        return _update_document(raw_root, raw_descriptor, raw_revision, updater)
+    except Exception:
+        raise TransactionError from None
+
+
+def require_registered_outer_lock(path: str, descriptor: str, owner_pid: str) -> None:
+    candidate = Path(path)
+    probe = None
+    try:
+        if (
+            not candidate.is_absolute()
+            or candidate.name != "sync.lock"
+            or candidate.resolve() != candidate
+        ):
+            raise TransactionError
+        if int(owner_pid) != os.getppid():
+            raise TransactionError
+        opened, named = os.fstat(int(descriptor)), candidate.lstat()
+        for metadata in (opened, named):
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                raise TransactionError
+        if _identity(opened) != _identity(named):
+            raise TransactionError
+        probe = os.open(candidate, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        raise TransactionError
+    except (OSError, ValueError):
+        raise TransactionError from None
+    finally:
+        if probe is not None:
+            os.close(probe)
+
+
+def _registered_docker(
+    arguments: list[str], *, timeout: float = 0.35, input_bytes: bytes | None = None
+) -> str:
+    try:
+        result = subprocess.run(
+            ["docker", *arguments],
+            input=input_bytes,
+            **({"stdin": subprocess.DEVNULL} if input_bytes is None else {}),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=True,
+        )
+        if len(result.stdout) > MAX_DOCUMENT_BYTES:
+            raise TransactionError
+        return result.stdout.decode("utf-8").strip()
+    except Exception:
+        raise TransactionError from None
+
+
+def _registered_document(raw_root: str) -> dict:
+    _root, root_fd, transactions_fd = _open_transactions(raw_root, create=False)
+    try:
+        document, _identity = _read_active_from_descriptor(
+            transactions_fd, allow_missing=False
+        )
+        if document is None:
+            raise TransactionError
+        return document
+    finally:
+        os.close(transactions_fd)
+        os.close(root_fd)
+
+
+def _registered_inspect(job: dict, *, task: bool = False) -> dict | None:
+    protocol = _registered_protocol()
+    reference = job["service_id"] or job["spec"]["Name"]
+    values = json.loads(_registered_docker(["service", "inspect", reference]))
+    if type(values) is not list or len(values) != 1:
+        raise TransactionError
+    actual = values[0]
+    _require_string(actual["ID"], r"[a-z0-9]{25}")
+    if job["service_id"] is not None and actual["ID"] != job["service_id"]:
+        raise TransactionError
+    protocol["validate_managed_spec"](actual["Spec"], job["spec"])
+    if not task:
+        return actual
+    if job["task_id"] is None:
+        raise TransactionError
+    tasks = json.loads(_registered_docker(["inspect", job["task_id"]]))
+    if type(tasks) is not list or len(tasks) != 1 or tasks[0]["ID"] != job["task_id"]:
+        raise TransactionError
+    protocol["task_exit"](tasks[0], actual["ID"], job["spec"])
+    return tasks[0]
+
+
+def _registered_input(job: dict) -> dict:
+    protocol = _registered_protocol()
+    value = protocol["read_input"](Path(job["input_file"]["path"]), job["input_file"])
+    if protocol["digest"](value) != job["input_sha256"]:
+        raise TransactionError
+    return value
+
+
+def _registered_create_args(spec: dict) -> list[str]:
+    container = spec["TaskTemplate"]["ContainerSpec"]
+    args = [
+        "service",
+        "create",
+        "--detach=true",
+        "--no-resolve-image",
+        "--name",
+        spec["Name"],
+        "--mode",
+        "replicated-job",
+        "--replicas",
+        "1",
+        "--max-concurrent",
+        "1",
+        "--restart-condition",
+        "none",
+        "--user",
+        "10001:10001",
+        "--read-only",
+        "--no-healthcheck",
+        "--entrypoint",
+        "python",
+        "--network",
+        spec["TaskTemplate"]["Networks"][0]["Target"],
+    ]
+    for constraint in spec["TaskTemplate"]["Placement"]["Constraints"]:
+        args.extend(["--constraint", constraint])
+    for key, value in spec["Labels"].items():
+        args.extend(["--label", key + "=" + value])
+    for mount in container["Mounts"]:
+        args.extend(
+            [
+                "--mount",
+                "type=bind,src="
+                + mount["Source"]
+                + ",dst="
+                + mount["Target"]
+                + (",readonly" if mount["ReadOnly"] else ""),
+            ]
+        )
+    for secret in container["Secrets"]:
+        args.extend(
+            [
+                "--secret",
+                "source="
+                + secret["SecretID"]
+                + ",target="
+                + secret["File"]["Name"]
+                + ",uid=10001,gid=10001,mode=0400",
+            ]
+        )
+    return args + [container["Image"], *container["Args"]]
+
+
+def launch_registered_job(raw_root: str, raw_descriptor: str, stage: str) -> dict:
+    def consume(document: dict) -> None:
+        if document["phase"] != "FORWARD_APPLYING" or document["operation"] is not None:
+            raise TransactionError
+        job = document["registered_reconcile"][stage]
+        if job is None or job["state"] != "planned":
+            raise TransactionError
+        _registered_files(raw_root, {"files": job["files"]})
+        _registered_input(job)
+        job["state"] = "launching"
+
+    document = _update_current_document(raw_root, raw_descriptor, consume)
+    job = document["registered_reconcile"][stage]
+    service_id = _registered_docker(_registered_create_args(job["spec"]), timeout=30)
+    _require_string(service_id, r"[a-z0-9]{25}")
+
+    def bind(document: dict) -> None:
+        current = document["registered_reconcile"][stage]
+        if current != job:
+            raise TransactionError
+        current.update(service_id=service_id, state="created")
+
+    return _update_current_document(raw_root, raw_descriptor, bind)
+
+
+def _registered_capture_result(document: dict, stage: str, job: dict) -> dict:
+    protocol = _registered_protocol()
+    fd = protocol["open_checked"](job["files"]["request"], os.O_RDONLY, 0o602)
+    try:
+        result = protocol["decode"](_read_limited(fd))
+    finally:
+        os.close(fd)
+    protocol["exact"](result, {"snapshot", "credentials", "pins"})
+    credentials = protocol["exact"](
+        result["credentials"], protocol["CREDENTIAL_FIELDS"]
+    )
+    if any(
+        credentials[key] != value
+        for key, value in _registered_credentials(document).items()
+    ):
+        raise TransactionError
+    for key in ("database_secret_sha256", "redis_secret_sha256"):
+        _require_string(credentials[key], r"[0-9a-f]{64}")
+    _require_string(credentials["redis_username"], r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+    snapshot = protocol["exact"](result["snapshot"], {"observed_at", "workers"})
+    observed = datetime.datetime.fromisoformat(snapshot["observed_at"])
+    if observed.tzinfo is None or len(snapshot["workers"]) != 4:
+        raise TransactionError
+    services = (
+        "vp-ffmpeg-worker-go-swarm",
+        "vp-ffmpeg-worker-gpu-swarm",
+        "vp-vision-worker-swarm",
+        "vp-youtube-publisher-swarm",
+    )
+    baseline = {item["name"]: item for item in document["baseline"]["services"]}
+    targets = {item["service"]: item for item in document["forward"]["workers"]}
+    for service, pin in zip(services, snapshot["workers"], strict=True):
+        if pin is None:
+            if stage != "baseline" or baseline[service]["existed"]:
+                raise TransactionError
+        elif (
+            pin["service_name"] != service
+            or pin["image_identity"]
+            != (
+                baseline[service]["image"]
+                if stage == "baseline"
+                else targets[service]["image"]
+            )
+            or (
+                stage == "current"
+                and (
+                    pin["generation"] != targets[service]["generation"]
+                    or pin["release_commit"] != document["target_commit"]
+                )
+            )
+        ):
+            raise TransactionError
+    if stage == "baseline" and result["pins"] is not None:
+        raise TransactionError
+    if stage == "current":
+        protocol["exact"](result["pins"], {"pin_json", "pin_sha256", "commands"})
+        pin_document = json.loads(result["pins"]["pin_json"])
+        supplied = _registered_input(job)
+        if (
+            pin_document["transaction_id"] != document["transaction_id"]
+            or pin_document["revision"] != supplied["revision"]
+            or pin_document["release_commit"] != document["target_commit"]
+            or pin_document["workers"]
+            != [
+                dict(current=current, predecessor=old)
+                for current, old in zip(
+                    snapshot["workers"], supplied["baseline"]["workers"], strict=True
+                )
+            ]
+            or hashlib.sha256(result["pins"]["pin_json"].encode("ascii")).hexdigest()
+            != result["pins"]["pin_sha256"]
+        ):
+            raise TransactionError
+    return result
+
+
+def observe_registered_job(raw_root: str, raw_descriptor: str, stage: str) -> dict:
+    document = _registered_document(raw_root)
+    job = document["registered_reconcile"][stage]
+    if job is None or job["state"] not in {"launching", "created", "terminal"}:
+        raise TransactionError
+    actual = _registered_inspect(job)
+    task_ids = _registered_docker(
+        ["service", "ps", actual["ID"], "--no-trunc", "--format", "{{.ID}}"]
+    )
+    ids = task_ids.splitlines()
+    if len(ids) > 1 or (job["task_id"] is not None and ids != [job["task_id"]]):
+        raise TransactionError
+    task = None
+    code = None
+    if ids:
+        _require_string(ids[0], r"[a-z0-9]{25}")
+        task = _registered_inspect(
+            {**job, "service_id": actual["ID"], "task_id": ids[0]}, task=True
+        )
+        code = _registered_protocol()["task_exit"](task, actual["ID"], job["spec"])
+
+    def update(value: dict) -> None:
+        current = value["registered_reconcile"][stage]
+        if current != job:
+            raise TransactionError
+        current.update(
+            service_id=actual["ID"],
+            state="created" if code is None else "terminal",
+            task_id=None if task is None else task["ID"],
+            exit_code=code,
+        )
+        if code == 0 and stage != "run":
+            try:
+                current["result"] = _registered_capture_result(value, stage, current)
+            except Exception:
+                current["result"] = (
+                    None  # Actual exit is still recorded; invalid output cannot qualify.
+                )
+        elif code == 0:
+            try:
+                current["result"] = registered_finish_receipt(raw_root, value, current)
+            except Exception:
+                current["result"] = None
+
+    return _update_current_document(raw_root, raw_descriptor, update)
+
+
+def prepare_registered_run(
+    raw_root: str, raw_descriptor: str, *, verify_owner: Any
+) -> dict:
+    def prepare(document: dict) -> None:
+        registered = document["registered_reconcile"]
+        current = registered["current"]
+        if (
+            document["phase"] != "FORWARD_APPLYING"
+            or document["operation"] is not None
+            or registered["run"] is not None
+            or current is None
+            or current["state"] != "removed"
+            or current["exit_code"] != 0
+            or current["result"] is None
+        ):
+            raise TransactionError
+        _require_string(current["pins_secret_id"], r"[a-z0-9]{25}")
+        protocol = _registered_protocol()
+        directory = _registered_directory(raw_root, document["transaction_id"], "run")
+        files = protocol["prepare_files"](directory)
+        result = current["result"]
+        pin_fields = result["pins"]
+        pins = json.loads(pin_fields["pin_json"])
+        binding = dict(
+            version=1,
+            attempt_id=current["attempt_id"],
+            replay_only=False,
+            transaction_id=document["transaction_id"],
+            release_commit=document["target_commit"],
+            binding_revision=pins["revision"],
+            **pin_fields,
+            targets={
+                item["current"]["service_name"]: [
+                    item["current"]["generation"],
+                    item["current"]["image_identity"],
+                ]
+                for item in pins["workers"]
+            },
+            credentials=result["credentials"],
+            files=files,
+            descriptor_sha256="0" * 64,
+        )
+        _registered_selection(document, binding, None, verify_owner)
+        spec = current["spec"]
+        expected = protocol["managed_spec"](
+            binding,
+            image=spec["TaskTemplate"]["ContainerSpec"]["Image"],
+            network_id=spec["TaskTemplate"]["Networks"][0]["Target"],
+            manager_node=spec["TaskTemplate"]["Placement"]["Constraints"][0].split(
+                "==", 1
+            )[1],
+            pins_secret_id=current["pins_secret_id"],
+            manager_node_id=spec["Labels"]["vp.manager-node-id"],
+        )
+        binding["descriptor_sha256"] = protocol["digest"](expected)
+        payload = {"binding": binding}
+        input_file = protocol["write_input"](directory / "input.json", payload)
+        registered["run"] = dict(
+            attempt_id=current["attempt_id"],
+            files=files,
+            input_file=input_file,
+            input_sha256=protocol["digest"](payload),
+            spec=expected,
+            service_id=None,
+            task_id=None,
+            exit_code=None,
+            state="planned",
+            result=None,
+            pins_secret_id=current["pins_secret_id"],
+        )
+
+    try:
+        return _update_current_document(raw_root, raw_descriptor, prepare)
+    except Exception:
+        raise TransactionError from None
+
+
+def create_registered_pins(raw_root: str, raw_descriptor: str) -> dict:
+    def intent(document: dict) -> None:
+        record = document["registered_reconcile"]
+        current = record["current"]
+        if (
+            document["phase"] != "FORWARD_APPLYING"
+            or document["operation"] is not None
+            or record.get("pins") is not None
+            or current is None
+            or current["state"] != "removed"
+            or current["exit_code"] != 0
+            or current["result"] is None
+        ):
+            raise TransactionError
+        pins = current["result"]["pins"]
+        if (
+            hashlib.sha256(pins["pin_json"].encode("ascii")).hexdigest()
+            != pins["pin_sha256"]
+        ):
+            raise TransactionError
+        record["pins"] = dict(
+            state="creating",
+            id=None,
+            name="vp-registered-pins-" + current["attempt_id"],
+            sha256=pins["pin_sha256"],
+        )
+
+    document = _update_current_document(raw_root, raw_descriptor, intent)
+    record = document["registered_reconcile"]
+    pins = record["pins"]
+    identity = _registered_docker(
+        [
+            "secret",
+            "create",
+            "--label",
+            "vp.transaction=" + document["transaction_id"],
+            "--label",
+            "vp.pin_sha256=" + pins["sha256"],
+            pins["name"],
+            "-",
+        ],
+        timeout=2,
+        input_bytes=record["current"]["result"]["pins"]["pin_json"].encode("ascii"),
+    )
+    _require_string(identity, r"[a-z0-9]{25}")
+
+    def bind(value: dict) -> None:
+        current = value["registered_reconcile"]
+        if current["pins"] != pins:
+            raise TransactionError
+        current["pins"].update(state="present", id=identity)
+        current["current"]["pins_secret_id"] = identity
+
+    return _update_current_document(raw_root, raw_descriptor, bind)
+
+
+def create_registered_read(raw_root: str, raw_descriptor: str) -> dict:
+    """Copy only the captured deploy-read URL; persist no URL in the journal."""
+    _require_writer_lock(raw_root, raw_descriptor)
+    document = _registered_document(raw_root)
+    source = document["database_credentials"]["deploy_read"]
+    expected = _capture_credential(
+        source["canonical_path"], source["expected_principal"]
+    )
+    if source != expected:
+        raise TransactionError
+    descriptor = os.open(source["canonical_path"], _read_file_flags())
+    try:
+        before = os.fstat(descriptor)
+        _require_regular(before, CREDENTIAL_MODE, single_link=False)
+        if (before.st_dev, before.st_ino) != (source["device"], source["inode"]):
+            raise TransactionError
+        raw = os.read(descriptor, 32769)
+        after = os.fstat(descriptor)
+        if (
+            not 0 < len(raw) <= 32768
+            or any(
+                getattr(before, field) != getattr(after, field)
+                for field in (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_uid",
+                    "st_gid",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                )
+            )
+            or len(raw) != before.st_size
+        ):
+            raise TransactionError
+    finally:
+        os.close(descriptor)
+    from urllib.parse import unquote, urlsplit
+
+    line = raw.decode("utf-8").removesuffix("\n")
+    parsed = urlsplit(line)
+    if (
+        not line
+        or any(char.isspace() for char in line)
+        or parsed.scheme not in {"postgresql", "postgres", "postgresql+asyncpg"}
+        or not parsed.password
+        or unquote(parsed.username or "") != source["expected_principal"]
+    ):
+        raise TransactionError
+
+    def intent(value: dict) -> None:
+        record = value["registered_reconcile"]
+        if (
+            value["phase"] != "FORWARD_APPLYING"
+            or value["operation"] is not None
+            or record.get("capture_read") is not None
+            or record["baseline"] is not None
+            or value["database_credentials"]["deploy_read"] != source
+            or not value["baseline"]["captured"]
+            or any(
+                worker["applied_stage"] not in {"pending", "prepared"}
+                for worker in value["forward"]["workers"]
+            )
+        ):
+            raise TransactionError
+        record["capture_read"] = dict(
+            state="creating",
+            id=None,
+            name="vp-registered-read-" + value["transaction_id"],
+            sha256=hashlib.sha256(raw).hexdigest(),
+            principal=source["expected_principal"],
+        )
+
+    document = _update_current_document(raw_root, raw_descriptor, intent)
+    reader = document["registered_reconcile"]["capture_read"]
+    identity = _registered_docker(
+        [
+            "secret",
+            "create",
+            "--label",
+            "vp.transaction=" + document["transaction_id"],
+            "--label",
+            "vp.credential_sha256=" + reader["sha256"],
+            reader["name"],
+            "-",
+        ],
+        timeout=2,
+        input_bytes=raw,
+    )
+    _require_string(identity, r"[a-z0-9]{25}")
+
+    def bind(value: dict) -> None:
+        if value["registered_reconcile"]["capture_read"] != reader:
+            raise TransactionError
+        value["registered_reconcile"]["capture_read"].update(
+            state="present", id=identity
+        )
+
+    return _update_current_document(raw_root, raw_descriptor, bind)
+
+
+def cleanup_registered_read(raw_root: str, raw_descriptor: str) -> dict:
+    return _cleanup_registered_secret(raw_root, raw_descriptor, "capture_read")
+
+
+def cleanup_registered_pins(raw_root: str, raw_descriptor: str) -> dict:
+    return _cleanup_registered_secret(raw_root, raw_descriptor, "pins")
+
+
+def _cleanup_registered_secret(raw_root: str, raw_descriptor: str, key: str) -> dict:
+    _require_writer_lock(raw_root, raw_descriptor)
+    document = _registered_document(raw_root)
+    record = document.get("registered_reconcile")
+    if key not in {"pins", "capture_read"}:
+        raise TransactionError
+    if record is None or record.get(key) is None:
+        return document
+    pins = record[key]
+    if pins["state"] == "creating" or any(
+        record[stage] is not None and record[stage]["state"] != "removed"
+        for stage in ("baseline", "current", "run")
+    ):
+        raise TransactionError
+
+    def inventory() -> dict:
+        result = {}
+        for line in _registered_docker(
+            ["secret", "ls", "--format", "{{.ID}} {{.Name}}"]
+        ).splitlines():
+            parts = line.split()
+            if len(parts) != 2 or parts[0] in result:
+                raise TransactionError
+            _require_string(parts[0], r"[a-z0-9]{25}")
+            result[parts[0]] = parts[1]
+        return result
+
+    secrets = inventory()
+    if pins["name"] in secrets.values() and secrets.get(pins["id"]) != pins["name"]:
+        raise TransactionError
+    if pins["id"] in secrets:
+        if pins["state"] == "removed":
+            raise TransactionError
+        actual = json.loads(_registered_docker(["secret", "inspect", pins["id"]]))
+        if (
+            type(actual) is not list
+            or len(actual) != 1
+            or actual[0]["ID"] != pins["id"]
+            or actual[0]["Spec"]
+            != {
+                "Name": pins["name"],
+                "Labels": {
+                    "vp.transaction": document["transaction_id"],
+                    (
+                        "vp.pin_sha256" if key == "pins" else "vp.credential_sha256"
+                    ): pins["sha256"],
+                },
+            }
+        ):
+            raise TransactionError
+        _registered_docker(["secret", "rm", pins["id"]], timeout=2)
+    remaining = inventory()
+    if pins["id"] in remaining or pins["name"] in remaining.values():
+        raise TransactionError
+
+    def removed(value: dict) -> None:
+        if value["registered_reconcile"][key] != pins:
+            raise TransactionError
+        value["registered_reconcile"][key]["state"] = "removed"
+
+    return _update_current_document(raw_root, raw_descriptor, removed)
+
+
+def _registered_services() -> dict[str, str]:
+    rows = _registered_docker(
+        ["service", "ls", "--format", "{{.ID}} {{.Name}}", "--no-trunc"]
+    )
+    result = {}
+    for row in rows.splitlines():
+        values = row.split()
+        if len(values) != 2 or values[0] in result:
+            raise TransactionError
+        _require_string(values[0], r"[a-z0-9]{25}")
+        result[values[0]] = values[1]
+    return result
+
+
+def _registered_absent(job: dict) -> None:
+    services = _registered_services()
+    if job["service_id"] in services or job["spec"]["Name"] in services.values():
+        raise TransactionError
+    if job["service_id"] is None:
+        return
+    containers = _registered_docker(
+        [
+            "container",
+            "ls",
+            "--all",
+            "--no-trunc",
+            "--format",
+            "{{.ID}}",
+            "--filter",
+            "label=com.docker.swarm.service.id=" + job["service_id"],
+        ]
+    ).splitlines()
+    if len(set(containers)) != len(containers):
+        raise TransactionError
+    for container_id in containers:
+        _require_string(container_id, r"[0-9a-f]{64}")
+        values = json.loads(_registered_docker(["container", "inspect", container_id]))
+        if (
+            type(values) is not list
+            or len(values) != 1
+            or values[0].get("ID") != container_id
+            or values[0]["Config"]["Labels"].get("com.docker.swarm.service.id")
+            != job["service_id"]
+            or values[0]["State"].get("Running") is not False
+            or values[0]["State"].get("Status") not in {"exited", "dead"}
+        ):
+            raise TransactionError
+
+
+def cleanup_registered_job(raw_root: str, raw_descriptor: str, stage: str) -> dict:
+    """Stop only the pinned job; preserve bindings on any ambiguous observation."""
+    _require_writer_lock(raw_root, raw_descriptor)
+    document = _registered_document(raw_root)
+    job = document["registered_reconcile"][stage]
+    if job is None:
+        return document
+    if job["state"] == "removed":
+        _registered_absent(job)
+        _registered_protocol()["retain_managed_files"](job["files"], job["input_file"])
+        return document
+    if job["state"] == "launching" and job["service_id"] is None:
+        # Discover an exact existing attempt only to stop it, never relaunch it.
+        actual = _registered_inspect(job)
+
+        def discovered(value: dict) -> None:
+            current = value["registered_reconcile"][stage]
+            if current != job:
+                raise TransactionError
+            current.update(service_id=actual["ID"], state="created")
+
+        document = _update_current_document(raw_root, raw_descriptor, discovered)
+        job = document["registered_reconcile"][stage]
+    if job["state"] != "removing":
+        if job["service_id"] is not None:
+            _registered_inspect(job)
+        else:
+            _registered_absent(job)
+
+        def removing(value: dict) -> None:
+            current = value["registered_reconcile"][stage]
+            if current != job:
+                raise TransactionError
+            current["state"] = "removing"
+
+        document = _update_current_document(raw_root, raw_descriptor, removing)
+        job = document["registered_reconcile"][stage]
+    services = _registered_services()
+    if (
+        job["spec"]["Name"] in services.values()
+        and services.get(job["service_id"]) != job["spec"]["Name"]
+    ):
+        raise TransactionError
+    if job["service_id"] in services:
+        _registered_inspect(job)
+        _registered_docker(["service", "rm", job["service_id"]], timeout=2)
+    _registered_absent(job)
+    _registered_protocol()["retain_managed_files"](job["files"], job["input_file"])
+
+    def removed(value: dict) -> None:
+        current = value["registered_reconcile"][stage]
+        if current != job:
+            raise TransactionError
+        current["state"] = "removed"
+
+    return _update_current_document(raw_root, raw_descriptor, removed)
+
+
 def _registered_protocol() -> dict[str, Any]:
     global _REGISTERED_PROTOCOL
     if _REGISTERED_PROTOCOL is None:
@@ -4331,19 +5365,42 @@ def _read_registered_record(descriptor: int) -> tuple[dict, tuple[int, int]]:
         os.close(fd)
 
 
-def prepare_registered_reconcile(raw_root: str, raw_descriptor: str, raw_revision: str,
-                                 binding: dict, *, verify_owner: Any) -> None:
-    with _registered_context(raw_root, raw_descriptor, raw_revision) as (document, descriptor):
+def prepare_registered_reconcile(
+    raw_root: str,
+    raw_descriptor: str,
+    raw_revision: str,
+    binding: dict,
+    *,
+    verify_owner: Any,
+) -> None:
+    with _registered_context(raw_root, raw_descriptor, raw_revision) as (
+        document,
+        descriptor,
+    ):
         _registered_selection(document, binding, None, verify_owner)
         if binding["binding_revision"] != document["revision"]:
-            raise TransactionError
+            run = document.get("registered_reconcile", {}).get("run")
+            if (
+                run is None
+                or run["state"] != "planned"
+                or _registered_input(run) != {"binding": binding}
+            ):
+                raise TransactionError
         _registered_files(raw_root, binding)
         protocol = _registered_protocol()
         record = protocol["new_record"](binding)
-        if protocol["read_request"](record) is not None or os.stat(binding["files"]["request"]["path"]).st_size:
+        if (
+            protocol["read_request"](record) is not None
+            or os.stat(binding["files"]["request"]["path"]).st_size
+        ):
             raise TransactionError
-        _write_document(descriptor, REGISTERED_RECONCILE_NAME, record,
-                        expected_identity=None, validator=protocol["validate_record"])
+        _write_document(
+            descriptor,
+            REGISTERED_RECONCILE_NAME,
+            record,
+            expected_identity=None,
+            validator=protocol["validate_record"],
+        )
 
 
 def bind_registered_reconcile_job(raw_root: str, raw_descriptor: str, raw_revision: str,
@@ -4383,6 +5440,196 @@ def answer_registered_reconcile(raw_root: str, raw_descriptor: str, raw_revision
                         expected_identity=identity, validator=protocol["validate_record"])
         protocol["write_reply"](record["binding"]["files"], request)
         return True
+
+
+def registered_finish_receipt(raw_root: str, document: dict, job: dict) -> dict:
+    root_fd = transactions_fd = descriptor = None
+    try:
+        _root, root_fd, transactions_fd = _open_transactions(raw_root, create=False)
+        descriptor = _open_child_directory(
+            transactions_fd, document["transaction_id"], create=False
+        )
+        record, _identity = _read_registered_record(descriptor)
+        if (
+            record["binding"]["attempt_id"] != job["attempt_id"]
+            or record["service_id"] != job["service_id"]
+            or record["binding"]["files"] != job["files"]
+            or record["last_request"] is None
+            or record["last_request"]["action"] != "finished"
+        ):
+            raise TransactionError
+        metadata = dict(job["files"]["request"])
+        if job["state"] == "removed":
+            path = Path(metadata["path"])
+            metadata["path"] = str(path.with_name("retained-" + path.name))
+        fd = _registered_protocol()["open_checked"](metadata, os.O_RDONLY, 0o602)
+        try:
+            raw = _read_limited(fd)
+        finally:
+            os.close(fd)
+        if (
+            len(raw) != record["prefix_length"]
+            or hashlib.sha256(raw).hexdigest() != record["prefix_sha256"]
+        ):
+            raise TransactionError
+        return dict(
+            outcome=record["last_request"]["outcome"],
+            pin_sha256=record["binding"]["pin_sha256"],
+            attempted_streams=sorted(
+                stream
+                for stream, value in record["streams"].items()
+                if value != "unused"
+            ),
+            request_bytes=len(raw),
+            request_sha256=record["prefix_sha256"],
+            service_id=job["service_id"],
+            task_id=job["task_id"],
+        )
+    except Exception:
+        raise TransactionError from None
+    finally:
+        for fd in (descriptor, transactions_fd, root_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+def registered_job_action(arguments: list[str]) -> int:
+    """One fixed owning-shell action; callbacks never run the replay-plan pipeline."""
+    try:
+        if len(arguments) < 8:
+            raise TransactionError
+        root, fd, outer_path, outer_fd, owner_pid, token, action, stage, *extra = (
+            arguments
+        )
+        if stage not in {"baseline", "current", "run", "all"}:
+            raise TransactionError
+
+        def locks() -> None:
+            require_registered_outer_lock(outer_path, outer_fd, owner_pid)
+            if fd != "19" or outer_fd != "9" or acquire_lock(root, fd) != token:
+                raise TransactionError
+
+        locks()
+        document = _registered_document(root)
+        record = document.get("registered_reconcile")
+        if record is None:
+            if action in {"cleanup", "verify"} and not extra:
+                return 0
+            raise TransactionError
+
+        def owner(binding: dict, service_id: str | None) -> None:
+            locks()
+            current = _registered_document(root)
+            job = current["registered_reconcile"]["run"]
+            if service_id is None:
+                if job is not None and _registered_input(job) != {"binding": binding}:
+                    raise TransactionError
+                return
+            if (
+                job is None
+                or job["service_id"] != service_id
+                or _registered_input(job) != {"binding": binding}
+                or _registered_protocol()["digest"](job["spec"])
+                != binding["descriptor_sha256"]
+            ):
+                raise TransactionError
+            actual = _registered_inspect(job, task=job["task_id"] is not None)
+            if job["task_id"] is not None and actual["Status"]["State"] != "running":
+                raise TransactionError
+
+        if action == "prepare" and stage in {"baseline", "current"} and len(extra) == 2:
+            network_id, manager = extra
+            if manager != "ccttww-lap":
+                raise TransactionError
+            network = json.loads(_registered_docker(["network", "inspect", network_id]))
+            info = json.loads(_registered_docker(["info", "--format", "{{json .}} "]))
+            if (
+                len(network) != 1
+                or network[0]["Id"] != network_id
+                or network[0]["Name"] != "vp-pipeline-net"
+                or network[0]["Driver"] != "overlay"
+                or network[0]["Scope"] != "swarm"
+                or info["Name"] != manager
+                or info["OSType"] != "linux"
+                or info["Swarm"]["ControlAvailable"] is not True
+            ):
+                raise TransactionError
+            if stage == "baseline":
+                document = create_registered_read(root, fd)
+            prepare_registered_capture(
+                root,
+                fd,
+                str(document["revision"]),
+                stage,
+                network_id,
+                manager,
+                info["Swarm"]["NodeID"],
+            )
+        elif action == "prepare" and stage == "run" and not extra:
+            create_registered_pins(root, fd)
+            document = prepare_registered_run(root, fd, verify_owner=owner)
+            binding = _registered_input(document["registered_reconcile"]["run"])[
+                "binding"
+            ]
+            prepare_registered_reconcile(
+                root, fd, str(document["revision"]), binding, verify_owner=owner
+            )
+        elif action == "launch" and stage != "all" and not extra:
+            document = launch_registered_job(root, fd, stage)
+            if stage == "run":
+                job = document["registered_reconcile"][stage]
+                binding = _registered_input(job)["binding"]
+                bind_registered_reconcile_job(
+                    root,
+                    fd,
+                    str(document["revision"]),
+                    job["attempt_id"],
+                    job["service_id"],
+                    binding["descriptor_sha256"],
+                    verify_owner=owner,
+                )
+        elif action in {"poll", "observe"} and stage != "all" and not extra:
+            job = record[stage]
+            if job is None:
+                raise TransactionError
+            if job["state"] != "terminal" and (
+                action == "observe" or job["task_id"] is None
+            ):
+                document = observe_registered_job(root, fd, stage)
+                job = document["registered_reconcile"][stage]
+            if job["state"] == "terminal":
+                return 10 if job["exit_code"] == 0 and job["result"] is not None else 11
+            if stage == "run" and job["task_id"] is not None:
+                answer_registered_reconcile(
+                    root, fd, str(document["revision"]), verify_owner=owner
+                )
+        elif action == "cleanup" and not extra:
+            for selected in (
+                ("run", "current", "baseline") if stage == "all" else (stage,)
+            ):
+                cleanup_registered_job(root, fd, selected)
+            if stage == "all":
+                cleanup_registered_pins(root, fd)
+                cleanup_registered_read(root, fd)
+        elif action == "verify" and stage == "all" and not extra:
+            _registered_gate(document, success=True)
+            for job in (record["baseline"], record["current"], record["run"]):
+                _registered_absent(job)
+                _registered_protocol()["retain_managed_files"](
+                    job["files"], job["input_file"]
+                )
+            if (
+                registered_finish_receipt(root, document, record["run"])
+                != record["run"]["result"]
+            ):
+                raise TransactionError
+            cleanup_registered_pins(root, fd)
+            cleanup_registered_read(root, fd)
+        else:
+            raise TransactionError
+        return 0
+    except Exception:
+        raise TransactionError from None
 
 
 def queue_retirement(arguments: list[str]) -> None:
@@ -4456,6 +5703,8 @@ def intent(arguments: list[str]) -> None:
         current_phase, target_phase = INTENT_PHASES[kind]
         if document["phase"] != current_phase or document["operation"] is not None:
             raise TransactionError
+        if kind in {"PROMOTE_WORKERS", "PROMOTE_MARKER", "PROMOTE_CONTROL"}:
+            _registered_gate(document, success=True)
         document["operation"] = {
             "operation_id": f"operation-{secrets.token_hex(16)}",
             "kind": kind,
@@ -4692,6 +5941,8 @@ def archive(arguments: list[str]) -> None:
 
 
 def main(arguments: list[str]) -> int:
+    if arguments and arguments[0] == "registered-job":
+        return registered_job_action(arguments[1:])
     if len(arguments) == 2 and arguments[0] == "lock-prepare":
         prepare_lock(arguments[1])
         return 0
