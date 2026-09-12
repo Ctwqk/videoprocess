@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -79,13 +80,62 @@ func (a *ownedProducerPGAutoFlow) ApprovePlan(ctx context.Context, planID string
 func ownedProducerPGClaimPlan(t *testing.T, f *ownedPGFixture, ctx context.Context) (QueueItemRow, *ownedProducerPGAutoFlow) {
 	t.Helper()
 	if err := f.store.RunTick(ctx, f.channel.ID, "owned-producer", HandlerService{PDS: fakePDS{decision: ownedProducerRealDecision()}}); err != nil {
-		t.Fatal("native admission", err)
+		t.Fatal("native admission", err, ownedProducerPGAdmissionDiagnostic(f, ctx))
 	}
 	item, err := f.store.ClaimNextForChannelAndKinds(ctx, handlerWorkerID(f.lease.Authority()), f.channel.ID, []string{QueuePlanTask})
 	if err != nil || item == nil {
-		t.Fatal("native plan claim", err)
+		t.Fatal("native plan claim", err, ownedProducerPGAdmissionDiagnostic(f, ctx))
 	}
 	return *item, &ownedProducerPGAutoFlow{t: t, f: f, planID: ownedNewUUID(t)}
+}
+
+func ownedProducerPGAdmissionDiagnostic(f *ownedPGFixture, ctx context.Context) string {
+	return ownedProducerAdmissionDiagnostic(f.store.Pool.QueryRow(ctx, `
+		SELECT jsonb_build_object(
+			'inventory_id', i.id, 'state', i.state, 'hold_reason', i.hold_reason,
+			'intake_pause_reason', c.intake_pause_reason,
+			'task_count', (SELECT count(*) FROM production_tasks WHERE channel_profile_id=c.id),
+			'plan_queue_count', (SELECT count(*) FROM channel_ops_queue_items WHERE channel_profile_id=c.id AND kind='plan_task'),
+			'ticks', (SELECT jsonb_agg(jsonb_build_object('tick_id',a.tick_id,'replay_status',a.replay_status,'summary',a.decision_summary_json) ORDER BY a.started_at)
+			          FROM agent_tick_audits a WHERE a.channel_profile_id=c.id),
+			'prior_inventories', (SELECT jsonb_agg(to_jsonb(p)) FROM (
+				SELECT previous.id, previous.channel_profile_id, previous.state, previous.hold_reason,
+				       previous.manifest_json->>'version' AS manifest_version,
+				       (SELECT jsonb_agg(a.tick_id ORDER BY a.started_at) FROM agent_tick_audits a WHERE a.channel_profile_id=previous.channel_profile_id) AS tick_ids
+				FROM owned_seed_inventories previous WHERE previous.id<>i.id
+				ORDER BY previous.created_at DESC, previous.id LIMIT 64
+			) p)
+		)
+		FROM channel_profiles c JOIN owned_seed_inventories i ON i.id=c.owned_seed_inventory_id
+		WHERE c.id=$1::uuid
+	`, f.channel.ID))
+}
+
+func ownedProducerAdmissionDiagnostic(row pgx.Row) string {
+	var raw []byte
+	if err := row.Scan(&raw); err != nil {
+		return fmt.Sprintf("admission diagnostic unavailable: %v", err)
+	}
+	return string(raw)
+}
+
+func TestOwnedProducerAdmissionDiagnosticPreservesHoldAndAudit(t *testing.T) {
+	want := `{"inventory_id":"fixture-id","state":"held","hold_reason":"owned_history_redis_configuration","task_count":0,"plan_queue_count":0,"ticks":[{"tick_id":"tick:fixture-channel:owned-producer","replay_status":"snapshot_complete","summary":{"reason":"owned_history_redis_configuration"}}]}`
+	row := ownedB2FenceRow(func(dest ...any) error {
+		*dest[0].(*[]byte) = []byte(want)
+		return nil
+	})
+	if got := ownedProducerAdmissionDiagnostic(row); got != want {
+		t.Fatalf("admission diagnostic lost decisive stored facts: %s", got)
+	}
+}
+
+func TestOwnedProducerAdmissionDiagnosticReportsReadFailure(t *testing.T) {
+	failure := errors.New("synthetic diagnostic read failed")
+	row := ownedB2FenceRow(func(...any) error { return failure })
+	if got := ownedProducerAdmissionDiagnostic(row); !strings.Contains(got, failure.Error()) {
+		t.Fatalf("diagnostic failure hidden: %s", got)
+	}
 }
 
 func ownedProducerPGAssertTask(t *testing.T, f *ownedPGFixture, ctx context.Context, state string, execute int) ProductionTaskRow {
