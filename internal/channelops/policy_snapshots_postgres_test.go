@@ -113,6 +113,111 @@ func TestSnapshotFixtureCleanupAfterStoreClose(t *testing.T) {
 	}
 }
 
+func TestSnapshotFixtureCleanupRemovesPublicationOperationsAndOrphanFacts(t *testing.T) {
+	f := NewChannelOpsFixture(t)
+	ctx := context.Background()
+	defer f.Close(ctx)
+	var firstVideo string
+	for pass := 0; pass < 2; pass++ {
+		f.InsertChannelWithLaneAccountSeed(ctx)
+		handler := f.HandlerService(PDSDecision{Verdict: "allow", DecisionID: "allow"})
+		if err := f.Store.RunTick(ctx, f.ChannelID, "fixture-cleanup-reuse", handler); err != nil {
+			t.Fatalf("pass %d RunTick: %v", pass, err)
+		}
+		f.ProcessAllQueueItems(ctx, handler)
+		if task := f.RequireSingleTask(ctx); task.State != TaskMeasured {
+			t.Fatalf("pass %d task state = %s", pass, task.State)
+		}
+		assertPGSnapshotFacts(t, f.Store, f.ChannelID, 1, 1)
+		var video string
+		if err := f.Store.Pool.QueryRow(ctx, `SELECT platform_content_id FROM publication_records`).Scan(&video); err != nil {
+			t.Fatal(err)
+		}
+		if pass == 0 {
+			firstVideo = video
+		} else if video != firstVideo {
+			t.Fatalf("fixture changed video identity: %q != %q", video, firstVideo)
+		}
+		for table, want := range map[string]int{
+			"publication_records": 1, "publication_promotion_operations": 1,
+			"publication_metric_schedules": 5, "feedback_snapshots": 5,
+		} {
+			var count int
+			if err := f.Store.Pool.QueryRow(ctx, `SELECT count(*) FROM `+pgx.Identifier{table}.Sanitize()).Scan(&count); err != nil || count != want {
+				t.Fatalf("pass %d %s=%d, want %d: %v", pass, table, count, want, err)
+			}
+		}
+		if pass == 1 {
+			break
+		}
+
+		// These links deliberately have no FK. Cleanup must not depend on a
+		// surviving channel/task/publication join to find their orphan facts.
+		orphan := testUUID(t, "orphan-facts")
+		for _, query := range []string{
+			`UPDATE publication_records SET production_task_id=$1::uuid`,
+			`INSERT INTO material_usage_ledger (id,material_id,channel_profile_id,publication_id,segment_signature,metadata_json)
+			 VALUES (gen_random_uuid(),'fixture-orphan',$1::uuid,$1::uuid,'fixture-orphan','{}')`,
+			`INSERT INTO takedown_events (id,publication_id,event_type,severity,raw_payload_json,auto_actions_taken_json)
+			 VALUES (gen_random_uuid(),$1::uuid,'fixture-orphan','info','{}','[]')`,
+			`INSERT INTO learning_states (channel_profile_id,dimension_type,dimension_key,window_days,sample_count,avg_reward,confidence,recommendation_json)
+			 VALUES ($1::uuid,'topic_lane','fixture-orphan',7,1,0,0,'{}')`,
+			`INSERT INTO internal_scheduler_runs (channel_profile_id,bucket,status,metadata_json)
+			 VALUES ($1::uuid,'fixture-orphan','enqueued','{}')`,
+		} {
+			if _, err := f.Store.Pool.Exec(ctx, query, orphan); err != nil {
+				t.Fatalf("seed orphan fact: %v", err)
+			}
+		}
+		if err := f.Store.UpsertFeedbackSnapshot(ctx, PublicationRow{ID: orphan}, map[string]any{}, "1h", 0, []string{}, 0, map[string]any{}); err != nil {
+			t.Fatalf("seed orphan feedback: %v", err)
+		}
+		lock := f.snapshotFixtureLock
+		f.cleanup(ctx)
+		if t.Failed() {
+			t.FailNow()
+		}
+		if lock == nil || lock.IsClosed() || f.snapshotFixtureLock != lock {
+			t.Fatal("cleanup lost disposable fixture ownership")
+		}
+		for _, table := range []string{
+			"channel_profiles", "production_tasks", "channel_ops_queue_items",
+			"publication_records", "publication_promotion_operations", "publication_metric_schedules",
+			"youtube_upload_operations", "material_usage_ledger", "takedown_events",
+			"feedback_snapshots", "learning_states", "internal_scheduler_runs",
+			"agent_tick_audits", "decision_audit_entries", "candidate_feature_snapshots", "decision_policy_versions",
+		} {
+			var count int
+			if err := lock.QueryRow(ctx, `SELECT count(*) FROM `+pgx.Identifier{table}.Sanitize()).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("cleanup left %s=%d: %v", table, count, err)
+			}
+		}
+	}
+}
+
+func TestSnapshotFixtureBoundedCleanupReleasesOwnership(t *testing.T) {
+	if testing.Short() {
+		t.Skip("parent-owned disposable PostgreSQL qualification")
+	}
+	var lock *pgx.Conn
+	t.Run("bounded-teardown", func(t *testing.T) {
+		f := NewChannelOpsFixture(t)
+		lock = f.snapshotFixtureLock
+		operations := []*cancellableTestOperation{}
+		registerBoundedFixtureCleanup(t, f, &operations)
+		f.InsertChannelWithLaneAccountSeed(context.Background())
+	})
+	if lock == nil {
+		t.Skip("disposable PostgreSQL fixture unavailable")
+	}
+	if !lock.IsClosed() {
+		defer lock.Close(context.Background())
+		t.Fatal("bounded teardown left the disposable fixture lock session open")
+	}
+	f := NewChannelOpsFixture(t)
+	defer f.Close(context.Background())
+}
+
 func TestPolicySnapshotsPostgresAtomicMatrix(t *testing.T) {
 	if testing.Short() {
 		t.Skip("parent-owned disposable PostgreSQL qualification")

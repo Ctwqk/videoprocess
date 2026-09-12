@@ -240,7 +240,7 @@ func registerBoundedFixtureCleanup(t *testing.T, fixture *ChannelOpsFixture, ope
 			t.Errorf("fixture cleanup exceeded %s: %v", testOperationCleanupTimeout, cleanupCtx.Err())
 			return
 		}
-		fixture.Store.Close()
+		fixture.closeConnections(cleanupCtx)
 	})
 }
 
@@ -2783,6 +2783,10 @@ func TestExecutionFenceBlocksIntakeButAllowsDownstreamWhenPaused(t *testing.T) {
 
 func (f *ChannelOpsFixture) Close(ctx context.Context) {
 	f.cleanup(ctx)
+	f.closeConnections(ctx)
+}
+
+func (f *ChannelOpsFixture) closeConnections(ctx context.Context) {
 	if f.snapshotFixtureLock != nil {
 		if _, err := f.snapshotFixtureLock.Exec(ctx, `SELECT pg_advisory_unlock(774403030044)`); err != nil {
 			f.T.Errorf("fixture lock release: %v", err)
@@ -3338,7 +3342,14 @@ func (f *ChannelOpsFixture) cleanup(ctx context.Context) {
 		f.T.Error("refusing cleanup without disposable fixture lock")
 		return
 	}
-	if _, err := f.snapshotFixtureLock.Exec(ctx, `TRUNCATE public.channel_profiles, public.decision_policy_versions CASCADE`); err != nil {
+	// Publication, feedback, ledger, learning and scheduler links are not FKs.
+	// Include those old fixture cleanup roots explicitly, including orphan rows.
+	if _, err := f.snapshotFixtureLock.Exec(ctx, `
+		TRUNCATE public.channel_profiles, public.decision_policy_versions,
+		         public.publication_records, public.material_usage_ledger,
+		         public.takedown_events, public.feedback_snapshots,
+		         public.learning_states, public.internal_scheduler_runs CASCADE
+	`); err != nil {
 		f.T.Errorf("disposable fixture cleanup: %v", err)
 		return
 	}
