@@ -16,6 +16,7 @@ import re
 import runpy
 import secrets
 import selectors
+import shlex
 import stat
 import sys
 import subprocess
@@ -5066,6 +5067,38 @@ def _owned_history_runner_update_spec(
         raise TransactionError from None
 
 
+def _owned_history_runner_image_user(image: str, runtime_node: str) -> str:
+    """Read runtime-only image metadata on its fixed build and execution node."""
+    try:
+        _require_string(image, r"vp-channelops-runner-go:deploy-[0-9a-f]{12}")
+        if runtime_node != "colima-127":
+            raise TransactionError
+        command = shlex.join([
+            "/opt/homebrew/bin/docker", "--context", "colima-swarmbridged",
+            "image", "inspect", image,
+        ])
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "10.0.0.127", command],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10, check=True,
+        )
+        if len(result.stdout) > MAX_DOCUMENT_BYTES:
+            raise TransactionError
+        records = json.loads(result.stdout)
+        if type(records) is not list or len(records) != 1:
+            raise TransactionError
+        metadata = records[0]
+        _require_string(metadata["Id"], r"sha256:[0-9a-f]{64}")
+        if type(metadata["RepoTags"]) is not list or image not in metadata["RepoTags"]:
+            raise TransactionError
+        config = metadata["Config"]
+        if type(config) is not dict or type(config.get("User", "")) is not str:
+            raise TransactionError
+        return config.get("User", "")
+    except Exception:
+        raise TransactionError from None
+
+
 def _autoflow_update_spec(
     actual: dict, service_id: str, image: str, order: str, identity: str,
     image_user: str, health: str, runtime_node: str, *, owned_history: dict | None = None,
@@ -5188,7 +5221,8 @@ def autoflow_update(arguments: list[str], *, owned_history_runner: bool = False)
         version = actual["Version"]["Index"]
         if type(version) is not int or version < 0:
             raise TransactionError
-        image_user = _registered_docker(["image", "inspect", image, "--format", "{{.Config.User}}"], timeout=5)
+        image_user = (_owned_history_runner_image_user(image, node) if owned_history_runner else
+                      _registered_docker(["image", "inspect", image, "--format", "{{.Config.User}}"], timeout=5))
         if owned_history_runner:
             if owned_history is None:
                 raise TransactionError

@@ -788,7 +788,8 @@ def test_owned_history_entry_uses_journal_pin_and_one_cas(tmp_path, runner, acti
             "-" if runner else f"vp-wc-orchestrator-{data['SELECTED_GENERATION']}|{SECRET_ID}|{data['SELECTED_GENERATION']}",
             "colima-127", "-" if runner else "true", "owned-history-file"]
     with patch.dict(helper["autoflow_update"].__globals__, acquire_lock=lambda *args: "token",
-                    _registered_document=read, _registered_docker=docker, _engine_service_post=post):
+                    _registered_document=read, _registered_docker=docker, _engine_service_post=post,
+                    _owned_history_runner_image_user=lambda *args: ""):
         result = helper["main"](["owned-history-runner-update" if runner else "autoflow-update", *args])
     assert result == (0 if fault == "none" else 1 if fault == "lost" else 2)
     assert len(posted) == (1 if fault in {"none", "lost"} else 0)
@@ -799,6 +800,93 @@ def test_owned_history_entry_uses_journal_pin_and_one_cas(tmp_path, runner, acti
         assert [s for s in c["Secrets"] if s["File"]["Name"] == "owned-history-redis-url"] == [
             {"SecretID": "r" * 25, "SecretName": reference["secret_name"],
              "File": {"Name": "owned-history-redis-url", "UID": "0", "GID": "0", "Mode": 256}}]
+
+
+@pytest.mark.parametrize("action", ["forward", "rollback"])
+@pytest.mark.parametrize("user", [None, "", "10001:10001"])
+@pytest.mark.parametrize("fault", ["none", "timeout", "command_failed", "wrong_tag", "wrong_node",
+                                   "invalid_json", "missing_config", "invalid_user", "invalid_id", "oversize"])
+def test_runner_image_metadata_comes_from_127_not_manager(tmp_path, action, user, fault):
+    data = locked_runtime_fixture(tmp_path, action)
+    helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
+    document = json.loads((Path(data["ADMISSION_ROOT"]) / "transactions/active.json").read_text())
+    reference = {"runtime_generation": "e" * 40, "secret_name": "vp-control-redis-eeeeeeeeeeee",
+                 "docker_secret_id": "r" * 25}
+    document["runtime_redis"] = {"control": reference}
+    baseline = next(row for row in document["baseline"]["services"]
+                    if row["name"] == "vp-channel-agent-runner-swarm")
+    baseline["image"] = "vp-channelops-runner-go:deploy-111111111111"
+    service_id = baseline["docker_service_id"]
+    image = baseline["image"] if action == "rollback" else "vp-channelops-runner-go:deploy-0123456789ab"
+    original = json.loads(json.dumps(data["SPEC"]))
+    original["Name"] = baseline["name"]
+    original["TaskTemplate"]["ContainerSpec"]["User"] = ""
+    posted, remote_reads, manager_image_reads = [], [], []
+
+    def docker(args, **kwargs):
+        if args[:2] == ["secret", "inspect"]:
+            return reference["docker_secret_id"] + "|" + reference["secret_name"]
+        if args[:2] == ["image", "inspect"]:
+            manager_image_reads.append(args)
+            raise RuntimeError("runner image is intentionally absent from manager")
+        assert args == ["service", "inspect", service_id]
+        return json.dumps([{"ID": service_id, "Version": {"Index": 71},
+                            "Spec": posted[0] if posted else original,
+                            "UpdateStatus": {"State": "completed"}}])
+
+    def remote(args, **kwargs):
+        assert args[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "10.0.0.127"]
+        assert len(args) == 7
+        assert shlex.split(args[6]) == ["/opt/homebrew/bin/docker", "--context", "colima-swarmbridged",
+                                      "image", "inspect", image]
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        assert kwargs["stderr"] == subprocess.DEVNULL
+        assert 0 < kwargs["timeout"] <= 10 and kwargs["check"] is True
+        remote_reads.append(args)
+        if fault == "timeout":
+            raise subprocess.TimeoutExpired(args, 10, stderr=b"private transport error")
+        if fault == "command_failed":
+            raise subprocess.CalledProcessError(1, args, stderr=b"private transport error")
+        config = {} if user is None else {"User": user}
+        payload = [{"Id": "sha256:" + "a" * 64, "RepoTags": [image], "Config": config}]
+        if fault == "wrong_tag":
+            payload[0]["RepoTags"] = ["vp-channelops-runner-go:deploy-ffffffffffff"]
+        if fault == "missing_config":
+            del payload[0]["Config"]
+        if fault == "invalid_user":
+            payload[0]["Config"]["User"] = 10001
+        if fault == "invalid_id":
+            payload[0]["Id"] = "not-an-image-id"
+        output = json.dumps(payload).encode()
+        if fault == "invalid_json":
+            output = b"not-json"
+        if fault == "oversize":
+            output = b" " * (helper["MAX_DOCUMENT_BYTES"] + 1)
+        return subprocess.CompletedProcess(args, 0, output)
+
+    def post(path, value, status):
+        assert path == f"/services/{service_id}/update?version=71&registryAuthFrom=spec" and status == 200
+        posted.append(value)
+        return {}
+
+    before = json.dumps(document, sort_keys=True)
+    with patch.dict(helper["autoflow_update"].__globals__, acquire_lock=lambda *args: "token",
+                    _registered_document=lambda *args: document, _registered_docker=docker,
+                    _engine_service_post=post), patch("subprocess.run", remote):
+        result = helper["autoflow_update"]([
+            data["ADMISSION_ROOT"], "19", str(os.getppid()), "token", str(document["revision"]),
+            service_id, image, "stop-first", "-", "colima-126" if fault == "wrong_node" else "colima-127",
+            "-", "owned-history-file",
+        ], owned_history_runner=True)
+    assert result == (0 if fault == "none" else 2)
+    assert len(remote_reads) == (0 if fault == "wrong_node" else 1)
+    assert not manager_image_reads and len(posted) == (1 if fault == "none" else 0)
+    if posted:
+        mount = next(item for item in posted[0]["TaskTemplate"]["ContainerSpec"]["Secrets"]
+                     if item["File"]["Name"] == "owned-history-redis-url")
+        uid, gid = (user or "0:0").split(":")
+        assert mount["File"] == {"Name": "owned-history-redis-url", "UID": uid, "GID": gid, "Mode": 256}
+    assert json.dumps(document, sort_keys=True) == before
 
 
 @pytest.mark.parametrize("size", [255, 256])
