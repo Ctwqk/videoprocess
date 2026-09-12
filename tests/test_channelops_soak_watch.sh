@@ -53,6 +53,7 @@ run_watcher() {
     FAKE_MISSING_SERVICES="${FAKE_MISSING_SERVICES:-}" \
     FAKE_CLI_EXIT="${FAKE_CLI_EXIT:-0}" \
     FAKE_DATE_MODE="${FAKE_DATE_MODE:-gnu}" \
+    FAKE_EXPECT_REDIS_FILE="${FAKE_EXPECT_REDIS_FILE:-false}" \
     bash "$WATCHER" >"$OUTPUT" 2>&1
   WATCHER_EXIT=$?
   set -e
@@ -294,7 +295,12 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
 fi
 
 if [[ "${1:-}" == "run" ]]; then
-  [[ "${REDIS_URL:-}" == 'redis://history-reader:do-not-log-redis@redis.example:6380/0' ]] || exit 91
+  if [[ "${FAKE_EXPECT_REDIS_FILE:-false}" == true ]]; then
+    [[ "${OWNED_HISTORY_REDIS_URL_FILE:-}" == /run/secrets/owned-history-redis-url ]] || exit 92
+    [[ -z "${REDIS_URL+x}" ]] || exit 93
+  else
+    [[ "${REDIS_URL:-}" == 'redis://history-reader:do-not-log-redis@redis.example:6380/0' ]] || exit 91
+  fi
   exit "${FAKE_CLI_EXIT:-0}"
 fi
 
@@ -539,6 +545,65 @@ assert_not_contains "$SECRET_URL" "$CALLS"
 assert_not_contains "$SECRET_URL" "$OUTPUT"
 assert_not_contains '|--apply' "$CALLS"
 assert_not_contains '|--external-condition|redis_consumer_identity_invalid' "$CALLS"
+
+# Explicit file selection must replace, never supplement, Redis URL forwarding.
+cp "$DEPLOY_ENV" "$TEST_ROOT/deploy-legacy.env"
+redis_file="$TEST_ROOT/owned-history-redis-url"
+printf '%s\n' 'redis://file-reader:file-secret-do-not-log@redis.example:6380/0' >"$redis_file"
+chmod 0400 "$redis_file"
+printf 'OWNED_HISTORY_REDIS_URL_FILE=%q\n' "$redis_file" >>"$DEPLOY_ENV"
+FAKE_EXPECT_REDIS_FILE=true
+run_watcher
+[[ "$WATCHER_EXIT" -eq 0 ]] || fail "explicit Redis credential file run failed"
+assert_contains "|--mount|type=bind,source=$redis_file,target=/run/secrets/owned-history-redis-url,readonly|" "$CALLS"
+assert_contains '|--env|OWNED_HISTORY_REDIS_URL_FILE|' "$CALLS"
+assert_not_contains '|--env|REDIS_URL|' "$CALLS"
+assert_not_contains '|--apply' "$CALLS"
+assert_not_contains 'file-secret-do-not-log' "$ALL_CALLS"
+assert_not_contains 'file-secret-do-not-log' "$OUTPUT"
+assert_not_contains 'do-not-log-redis' "$OUTPUT"
+FAKE_EXPECT_REDIS_FILE=false
+
+# Empty is the original environment-only branch, with no mount or new env key.
+cp "$TEST_ROOT/deploy-legacy.env" "$DEPLOY_ENV"
+printf 'OWNED_HISTORY_REDIS_URL_FILE=\n' >>"$DEPLOY_ENV"
+run_watcher
+[[ "$WATCHER_EXIT" -eq 0 ]] || fail "empty Redis credential file changed legacy behavior"
+assert_contains '|--env|REDIS_URL|' "$CALLS"
+assert_not_contains '|--mount|' "$CALLS"
+assert_not_contains '|--env|OWNED_HISTORY_REDIS_URL_FILE|' "$CALLS"
+
+# Invalid explicit sources refuse before Docker; a valid legacy URL cannot mask it.
+for invalid_file_case in relative missing directory symlink mode600 mode440 comma quote newline; do
+  cp "$TEST_ROOT/deploy-legacy.env" "$DEPLOY_ENV"
+  invalid_file="$TEST_ROOT/invalid-$invalid_file_case"
+  case "$invalid_file_case" in
+    relative) invalid_file=relative-redis-url ;;
+    missing) ;;
+    directory) mkdir "$invalid_file" ;;
+    symlink) ln -s "$redis_file" "$invalid_file" ;;
+    mode600|mode440)
+      cp "$redis_file" "$invalid_file"
+      chmod "${invalid_file_case#mode}" "$invalid_file"
+      ;;
+    comma|quote|newline)
+      case "$invalid_file_case" in
+        comma) invalid_file="$invalid_file,readonly=false" ;;
+        quote) invalid_file="$invalid_file\"" ;;
+        newline) invalid_file="$invalid_file"$'\n' ;;
+      esac
+      cp "$redis_file" "$invalid_file"
+      chmod 0400 "$invalid_file"
+      ;;
+  esac
+  printf 'OWNED_HISTORY_REDIS_URL_FILE=%q\n' "$invalid_file" >>"$DEPLOY_ENV"
+  run_watcher
+  [[ "$WATCHER_EXIT" -eq 2 ]] || fail "$invalid_file_case Redis file must fail configuration"
+  [[ "$(cat "$OUTPUT")" == 'status=configuration_error reason=invalid_owned_history_redis_url_file' ]] \
+    || fail "$invalid_file_case Redis file error was not static"
+  [[ ! -s "$CALLS" ]] || fail "$invalid_file_case Redis file contacted Docker or fell back"
+done
+cp "$TEST_ROOT/deploy-legacy.env" "$DEPLOY_ENV"
 
 # Auto-hold is the sole switch that adds the mutating guard flag.
 write_state true 123e4567-e89b-12d3-a456-426614174000 2026-07-19T18:30:00Z 1 45 30 true
