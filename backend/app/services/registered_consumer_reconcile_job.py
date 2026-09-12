@@ -1207,13 +1207,16 @@ def validate_managed_spec(actual: dict, expected: dict) -> None:
         container = task["ContainerSpec"]
         for key in ("Groups", "Env"):
             container.setdefault(key, [])
-        for key, value in (
+        for key, container_default in (
             ("StopGracePeriod", 10_000_000_000),
             ("DNSConfig", {}),
             ("Isolation", "default"),
             ("Init", False),
         ):
-            require(canonical(container.pop(key, value)) == canonical(value))
+            require(
+                canonical(container.pop(key, container_default))
+                == canonical(container_default)
+            )
         for mount in container["Mounts"]:
             require(type(mount) is dict)
             mount.setdefault("ReadOnly", False)
