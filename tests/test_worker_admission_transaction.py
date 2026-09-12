@@ -1274,28 +1274,43 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
                         HELPER["cleanup_registered_read"](str(self.root), str(self.fd))
                 self.assertEqual(self.fixture.read_state()["registered_reconcile"]["capture_read"]["state"], "present")
 
+    def test_managed_create_submits_exact_id_pinned_spec(self):
+        job = self.capture_job()
+        observed = []
+
+        def transport(request):
+            observed.append(request)
+            headers, body = request.split(b"\r\n\r\n", 1)
+            self.assertTrue(headers.startswith(b"POST /v1.52/services/create HTTP/1.1"))
+            self.assertEqual(json.loads(body), job["spec"])
+            self.assertEqual(self.fixture.read_state()["registered_reconcile"]["baseline"]["state"], "launching")
+            payload = json.dumps({"ID": "s" * 25}).encode()
+            return b"HTTP/1.1 201 Created\r\nContent-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload
+
+        with patch.dict(HELPER["launch_registered_job"].__globals__, _engine_exchange=transport):
+            result = HELPER["launch_registered_job"](str(self.root), str(self.fd), "baseline")
+        self.assertEqual(result["registered_reconcile"]["baseline"]["service_id"], "s" * 25)
+        self.assertEqual(len(observed), 1)
+
     def test_create_intent_survives_unknown_transport_and_cannot_retry(self):
         job = self.capture_job()
         observed = []
 
-        def docker(arguments, **kwargs):
-            observed.append(arguments)
+        def post(path, spec, status):
+            observed.append((path, spec, status))
             current = self.fixture.read_state()["registered_reconcile"]["baseline"]
             self.assertEqual(current["state"], "launching")
             raise HELPER["TransactionError"]
 
         namespace = HELPER["launch_registered_job"].__globals__
-        with patch.dict(namespace, _registered_docker=docker):
+        with patch.dict(namespace, _engine_service_post=post):
             for _ in range(2):
                 with self.assertRaises(HELPER["TransactionError"]):
                     HELPER["launch_registered_job"](
                         str(self.root), str(self.fd), "baseline"
                     )
         self.assertEqual(len(observed), 1)
-        self.assertEqual(observed[0][:2], ["service", "create"])
-        self.assertIn("--read-only", observed[0])
-        self.assertIn("10001:10001", observed[0])
-        self.assertIn(job["spec"]["Name"], observed[0])
+        self.assertEqual(observed[0], ("/services/create", job["spec"], 201))
 
     def test_observation_error_never_becomes_terminal_or_cleanup_success(self):
         self.capture_job()

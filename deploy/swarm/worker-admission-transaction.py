@@ -3,18 +3,23 @@
 
 from __future__ import annotations
 
+import copy
 import datetime
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import http.client
+import io
 import json
 import os
 import re
 import runpy
 import secrets
+import selectors
 import stat
 import sys
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -4597,6 +4602,209 @@ def _registered_docker(
         raise TransactionError from None
 
 
+def _engine_exchange(request: bytes) -> bytes:
+    process = subprocess.Popen(
+        ["docker", "system", "dial-stdio"], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        output = bytearray()
+        sent = 0
+        with selectors.DefaultSelector() as ready:
+            for stream, event in ((process.stdin, selectors.EVENT_WRITE), (process.stdout, selectors.EVENT_READ)):
+                os.set_blocking(stream.fileno(), False)
+                ready.register(stream, event)
+            while ready.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TransactionError
+                for key, event in ready.select(remaining):
+                    try:
+                        if event == selectors.EVENT_WRITE:
+                            sent += os.write(key.fd, request[sent:sent + 65536])
+                            if sent == len(request):
+                                ready.unregister(key.fileobj)
+                                key.fileobj.close()
+                        else:
+                            block = os.read(key.fd, min(65536, MAX_DOCUMENT_BYTES + 1 - len(output)))
+                            if not block:
+                                ready.unregister(key.fileobj)
+                            output.extend(block)
+                            if len(output) > MAX_DOCUMENT_BYTES:
+                                raise TransactionError
+                    except BlockingIOError:
+                        continue
+        if process.wait(timeout=max(0.01, deadline - time.monotonic())) != 0:
+            raise TransactionError
+        return bytes(output)
+    finally:
+        for stream in (process.stdin, process.stdout):
+            stream.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)
+
+
+def _engine_service_post(path: str, spec: dict, status: int) -> dict:
+    """Send only the two ID-pinned service mutations through the CLI context."""
+    try:
+        if not (
+            (path == "/services/create" and status == 201)
+            or (re.fullmatch(r"/services/[a-z0-9]{25}/update\?version=[0-9]+&registryAuthFrom=spec", path) and status == 200)
+        ):
+            raise TransactionError
+        body = json.dumps(spec, separators=(",", ":"), allow_nan=False).encode()
+        if len(body) > MAX_DOCUMENT_BYTES:
+            raise TransactionError
+        request = (
+            f"POST /v1.52{path} HTTP/1.1\r\nHost: docker\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode() + body
+        raw = _engine_exchange(request)
+        if len(raw) > MAX_DOCUMENT_BYTES:
+            raise TransactionError
+
+        class ResponseSocket:
+            def makefile(self, mode: str) -> io.BytesIO:
+                return io.BytesIO(raw)
+
+        response = http.client.HTTPResponse(ResponseSocket())
+        try:
+            response.begin()
+            if response.status != status:
+                raise TransactionError
+            payload = response.read(MAX_DOCUMENT_BYTES + 1)
+            if len(payload) > MAX_DOCUMENT_BYTES or response.length not in (None, 0):
+                raise TransactionError
+            value = json.loads(payload or b"{}")
+            if type(value) is not dict:
+                raise TransactionError
+            return value
+        finally:
+            response.close()
+    except Exception:
+        raise TransactionError from None
+
+
+def _autoflow_update_spec(
+    actual: dict, service_id: str, image: str, order: str, identity: str,
+    image_user: str, health: str, runtime_node: str,
+) -> dict:
+    try:
+        name, secret_id, generation = identity.split("|")
+        _require_string(service_id, r"[a-z0-9]{25}")
+        _require_string(secret_id, r"[a-z0-9]{25}")
+        _require_string(generation, r"c-[0-9a-f]{20}")
+        _require_string(runtime_node, r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}")
+        if name != "vp-wc-orchestrator-" + generation or order not in {"start-first", "stop-first"}:
+            raise TransactionError
+        if actual["ID"] != service_id or actual["Spec"]["Name"] != "vp-autoflow-api-swarm":
+            raise TransactionError
+        spec = copy.deepcopy(actual["Spec"])
+        container = spec["TaskTemplate"]["ContainerSpec"]
+        user = container.get("User") or image_user or "0:0"
+        if user in {"0", "root"}:
+            user = "0:0"
+        _require_string(user, r"[0-9]+:[0-9]+")
+        uid, gid = user.split(":")
+        env = container.get("Env") or []
+        keys = [entry.split("=", 1)[0] for entry in env]
+        if len(keys) != len(set(keys)):
+            raise TransactionError
+        target = "worker-orchestrator-database-url"
+        secrets = container.get("Secrets") or []
+        old = [entry for entry in secrets if entry.get("File", {}).get("Name") == target]
+        if len(old) > 1 or any(not entry.get("SecretName", "").startswith("vp-wc-orchestrator-") for entry in old):
+            raise TransactionError
+        if any(entry.get("SecretName", "").startswith("vp-wc-orchestrator-") and entry not in old for entry in secrets):
+            raise TransactionError
+        env_keys = {"WORKER_ORCHESTRATOR_DATABASE_URL_FILE", "WORKER_ORCHESTRATOR_CONTROL_GENERATION"}
+        container["Env"] = [entry for entry in env if entry.split("=", 1)[0] not in env_keys] + [
+            "WORKER_ORCHESTRATOR_DATABASE_URL_FILE=/run/secrets/" + target,
+            "WORKER_ORCHESTRATOR_CONTROL_GENERATION=" + generation,
+        ]
+        container["Secrets"] = [entry for entry in secrets if entry not in old] + [{
+            "SecretID": secret_id, "SecretName": name,
+            "File": {"Name": target, "UID": uid, "GID": gid, "Mode": 0o400},
+        }]
+        container["Image"] = image
+        container.setdefault("Healthcheck", {}).update(
+            Test=["CMD-SHELL", health], Interval=10_000_000_000,
+            Timeout=3_000_000_000, Retries=6, StartPeriod=10_000_000_000,
+        )
+        spec["TaskTemplate"].setdefault("Placement", {})["Constraints"] = [
+            "node.labels.vp.runtime==true", "node.hostname==" + runtime_node,
+        ]
+        spec.setdefault("UpdateConfig", {})["Order"] = order
+        return spec
+    except Exception:
+        raise TransactionError from None
+
+
+def autoflow_update(arguments: list[str]) -> int:
+    attempted = False
+    try:
+        root, fd, owner, token, revision, service_id, image, order, identity, node, health = arguments
+
+        def locked_document() -> dict:
+            if fd != "19" or int(owner) != os.getppid() or acquire_lock(root, fd) != token:
+                raise TransactionError
+            document = _registered_document(root)
+            if str(document["revision"]) != revision:
+                raise TransactionError
+            return document
+
+        document = locked_document()
+        rollback = document["phase"].startswith("ROLLBACK") or document.get("retiring_outcome") == "rolled_back"
+        selected = document["rollback" if rollback else "forward"]["control"]
+        name, secret_id, generation = identity.split("|")
+        if selected["generation"] != generation or not any(
+            ref["name"] == name and ref["docker_secret_id"] == secret_id
+            and ref["purpose"] == "orchestrator" for ref in selected["secrets"]
+        ):
+            raise TransactionError
+        baseline = [entry for entry in document["baseline"]["services"] if entry["name"] == "vp-autoflow-api-swarm"]
+        if len(baseline) != 1 or not baseline[0]["existed"] or baseline[0]["docker_service_id"] != service_id:
+            raise TransactionError
+        if image != "vp-backend-api:deploy-" + document["target_commit"][:12]:
+            raise TransactionError
+
+        def inspect(timeout: float = 5) -> dict:
+            records = json.loads(_registered_docker(["service", "inspect", service_id], timeout=timeout))
+            if type(records) is not list or len(records) != 1 or records[0]["ID"] != service_id:
+                raise TransactionError
+            return records[0]
+
+        actual = inspect()
+        version = actual["Version"]["Index"]
+        if type(version) is not int or version < 0:
+            raise TransactionError
+        image_user = _registered_docker(["image", "inspect", image, "--format", "{{.Config.User}}"], timeout=5)
+        spec = _autoflow_update_spec(actual, service_id, image, order, identity, image_user, health, node)
+        if locked_document() != document:
+            raise TransactionError
+        attempted = True
+        _engine_service_post(f"/services/{service_id}/update?version={version}&registryAuthFrom=spec", spec, 200)
+        # API acceptance replaces neither CLI convergence nor the caller's strict readiness.
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            locked_document()
+            current = inspect(timeout=min(5, max(0.01, deadline - time.monotonic())))
+            if current["Spec"] != spec:
+                raise TransactionError
+            state = current.get("UpdateStatus", {}).get("State")
+            if state == "completed" or (state is None and actual["Spec"] == spec):
+                return 0
+            if state != "updating":
+                raise TransactionError
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+        raise TransactionError
+    except Exception:
+        return 1 if attempted else 2
+
+
 def _registered_document(raw_root: str) -> dict:
     _root, root_fd, transactions_fd = _open_transactions(raw_root, create=False)
     try:
@@ -4641,61 +4849,6 @@ def _registered_input(job: dict) -> dict:
     return value
 
 
-def _registered_create_args(spec: dict) -> list[str]:
-    container = spec["TaskTemplate"]["ContainerSpec"]
-    args = [
-        "service",
-        "create",
-        "--detach=true",
-        "--no-resolve-image",
-        "--name",
-        spec["Name"],
-        "--mode",
-        "replicated-job",
-        "--replicas",
-        "1",
-        "--max-concurrent",
-        "1",
-        "--restart-condition",
-        "none",
-        "--user",
-        "10001:10001",
-        "--read-only",
-        "--no-healthcheck",
-        "--entrypoint",
-        "python",
-        "--network",
-        spec["TaskTemplate"]["Networks"][0]["Target"],
-    ]
-    for constraint in spec["TaskTemplate"]["Placement"]["Constraints"]:
-        args.extend(["--constraint", constraint])
-    for key, value in spec["Labels"].items():
-        args.extend(["--label", key + "=" + value])
-    for mount in container["Mounts"]:
-        args.extend(
-            [
-                "--mount",
-                "type=bind,src="
-                + mount["Source"]
-                + ",dst="
-                + mount["Target"]
-                + (",readonly" if mount["ReadOnly"] else ""),
-            ]
-        )
-    for secret in container["Secrets"]:
-        args.extend(
-            [
-                "--secret",
-                "source="
-                + secret["SecretID"]
-                + ",target="
-                + secret["File"]["Name"]
-                + ",uid=10001,gid=10001,mode=0400",
-            ]
-        )
-    return args + [container["Image"], *container["Args"]]
-
-
 def launch_registered_job(raw_root: str, raw_descriptor: str, stage: str) -> dict:
     def consume(document: dict) -> None:
         if document["phase"] != "FORWARD_APPLYING" or document["operation"] is not None:
@@ -4709,7 +4862,7 @@ def launch_registered_job(raw_root: str, raw_descriptor: str, stage: str) -> dic
 
     document = _update_current_document(raw_root, raw_descriptor, consume)
     job = document["registered_reconcile"][stage]
-    service_id = _registered_docker(_registered_create_args(job["spec"]), timeout=30)
+    service_id = _engine_service_post("/services/create", job["spec"], 201).get("ID")
     _require_string(service_id, r"[a-z0-9]{25}")
 
     def bind(document: dict) -> None:
@@ -5943,6 +6096,8 @@ def archive(arguments: list[str]) -> None:
 
 
 def main(arguments: list[str]) -> int:
+    if arguments and arguments[0] == "autoflow-update":
+        return autoflow_update(arguments[1:])
     if arguments and arguments[0] == "registered-job":
         return registered_job_action(arguments[1:])
     if len(arguments) == 2 and arguments[0] == "lock-prepare":
