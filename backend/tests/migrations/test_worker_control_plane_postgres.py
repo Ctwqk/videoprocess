@@ -18,6 +18,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models.job import JobStatus, NodeStatus
+from app.services import worker_control_role_cli as control_cli
+from app.services import worker_role_cli_common as role_common
 from app.services.registered_worker_event_receipt import (
     RegisteredWorkerEventReceiptService,
     parse_registered_worker_event,
@@ -72,6 +74,69 @@ def _run_alembic(database_url: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         check=False,
     )
+
+
+async def _grant_orchestrator_execution_privileges(admin, orchestrator_role: str) -> None:
+    await admin.execute(
+        "GRANT SELECT ON public.jobs "
+        f'TO "{orchestrator_role}"'
+    )
+    await admin.execute(
+        "GRANT UPDATE (status) ON public.jobs "
+        f'TO "{orchestrator_role}"'
+    )
+    # Current-head receipt writers enter channel/schedule authority before job locks.
+    await role_common.grant_columns(
+        admin, orchestrator_role, "SELECT", "production_tasks",
+        ("id", "channel_profile_id", "job_id"),
+    )
+    for table in ("channel_profiles", "runtime_schedules"):
+        await role_common.grant_columns(
+            admin, orchestrator_role, "SELECT", table,
+            control_cli.ORCHESTRATOR_ENTITY_COLUMNS[table],
+        )
+        await role_common.grant_columns(
+            admin, orchestrator_role, "UPDATE", table,
+            control_cli.ORCHESTRATOR_UPDATE_COLUMNS[table],
+        )
+    await role_common.grant_columns(
+        admin, orchestrator_role, "INSERT", "runtime_schedules",
+        control_cli.ORCHESTRATOR_INSERT_COLUMNS["runtime_schedules"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_control_plane_fixture_grants_only_native_entry_fence_columns() -> None:
+    calls = []
+
+    class Admin:
+        async def execute(self, sql):
+            calls.append(sql)
+
+    role = "fixture_orchestrator"
+    await _grant_orchestrator_execution_privileges(Admin(), role)
+    expected = {
+        f'GRANT SELECT ON public.jobs TO "{role}"',
+        f'GRANT UPDATE (status) ON public.jobs TO "{role}"',
+    }
+    for privilege, table, columns in (
+        ("SELECT", "production_tasks", ("id", "channel_profile_id", "job_id")),
+        ("SELECT", "channel_profiles", control_cli.ORCHESTRATOR_ENTITY_COLUMNS["channel_profiles"]),
+        ("UPDATE", "channel_profiles", ("updated_at",)),
+        ("SELECT", "runtime_schedules", ("service_name", "state", "guarded_job_id", "updated_at", "updated_by")),
+        ("UPDATE", "runtime_schedules", ("updated_at",)),
+        ("INSERT", "runtime_schedules", ("service_name", "state", "updated_by")),
+    ):
+        approved = {
+            "SELECT": control_cli.ORCHESTRATOR_ENTITY_COLUMNS,
+            "UPDATE": control_cli.ORCHESTRATOR_UPDATE_COLUMNS,
+            "INSERT": control_cli.ORCHESTRATOR_INSERT_COLUMNS,
+        }[privilege][table]
+        assert set(columns) <= set(approved)
+        quoted = ", ".join(f'"{column}"' for column in columns)
+        expected.add(f'GRANT {privilege} ({quoted}) ON TABLE public."{table}" TO "{role}"')
+    assert set(calls) == expected
+    assert len(calls) == len(expected)
 
 
 @pytest.mark.asyncio
@@ -629,16 +694,24 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
                         f"GRANT EXECUTE ON FUNCTION public.{signature} "
                         f'TO "{orchestrator_role}"'
                     )
-                await admin.execute(
-                    "GRANT SELECT ON public.jobs "
-                    f'TO "{orchestrator_role}"'
-                )
-                await admin.execute(
-                    "GRANT UPDATE (status) ON public.jobs "
-                    f'TO "{orchestrator_role}"'
-                )
+                await _grant_orchestrator_execution_privileges(admin, orchestrator_role)
             finally:
                 await admin.close()
+
+            for connection, role in ((worker, worker_role), (operator, operator_role), (orchestrator, orchestrator_role)):
+                identity = await connection.fetchrow("SELECT current_user, session_user")
+                assert tuple(identity) == (role, role)
+            for connection in (worker, operator):
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await connection.execute("SELECT id, channel_profile_id, job_id FROM public.production_tasks WHERE FALSE")
+            for table, column in (
+                ("runtime_schedules", "state"),
+                ("runtime_schedules", "guarded_job_id"),
+                ("channel_profiles", "owned_seed_inventory_id"),
+                ("production_tasks", "job_id"),
+            ):
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await orchestrator.execute(f'UPDATE public."{table}" SET "{column}"="{column}" WHERE FALSE')
 
             with pytest.raises(asyncpg.InsufficientPrivilegeError):
                 await worker.execute(
