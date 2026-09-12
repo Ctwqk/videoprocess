@@ -186,3 +186,70 @@ VP_SOAK_SMOKE_DATABASE_URL=postgresql+asyncpg://vp:password@host.docker.internal
 VP_SOAK_SMOKE_TEST_DATABASE=true \
 bash tests/test_channelops_soak_image_smoke.sh
 ```
+
+## Passive Policy Snapshot Preflight
+
+This additive audit is not a runner startup or activation step. Production
+deployment remains the normal exact-SHA CI deployment path: 127 is the CPU
+runtime, 150 provides support/GPU services, and 126 is excluded. The historical
+Compose, manual startup, and trial examples above are not production deployment
+instructions for this rollout. Do not enable or resume channels, start a soak,
+run another canary, or change schedules, queues, guards, counters, or runtime
+state as part of this preflight. Privacy remains `private` or `unlisted`, with
+`public` blocked; external platform assets still require explicit human review.
+
+Run the script from the checked-out exact SHA in an existing Python environment
+with the backend's `asyncpg` dependency. Supply `DATABASE_URL` through the
+approved secret environment mechanism, never as a command-line argument or a
+literal in shell history. There is no default database target and the script
+does not load application settings or start application services.
+
+```bash
+python scripts/channelops_policy_snapshot_preflight.py
+```
+
+The explicit URL must include a PostgreSQL host, user, and database. Supported
+schemes are `postgres`, `postgresql`, and `postgresql+asyncpg`; the only optional
+query setting is `sslmode`. Configure transport security according to the
+existing database access policy. No URL, credentials, prompt, raw source payload,
+raw feature, candidate name, or media metadata is printed. Connection, query,
+argument, and evidence-file failures use fixed sanitized error codes.
+
+Default output is JSON on stdout, with exit 0 for a passing passive audit and
+exit 1 for any failure. The connection starts with read-only defaults and uses
+one repeatable-read, read-only transaction, a five-second connection timeout,
+and fifteen-second command/statement and idle-in-transaction timeouts. It issues
+only fixed metadata SELECTs; it makes no provider, HTTP, SSH, Redis, queue, or
+scheduler calls and performs no database mutation.
+
+The report requires exactly `044_policy_decision_snapshots` as the migration
+head. Tick counts distinguish `legacy`, `pending`, `complete_labelled`,
+`actually_complete`, and `partial`; `new` means non-legacy snapshot ticks,
+not a timestamp-based reconstruction of historical records. Completeness
+requires stored policy/set/schema/as-of identities and hashes, candidate and
+decision cardinalities, and one-to-one matching snapshot links. A zero-candidate
+complete tick is valid when its policy/set/as-of metadata is complete. Stored
+hash format and link equality are checked; raw payloads are not fetched or
+rehash-verified, and this audit does not prove scoring replay or a live run.
+
+Any partial new tick fails the audit. `coverage` is actually-complete/new as a
+fraction, or `null` when there are no new ticks. A passing report with no new
+ticks is not proof of a production run. Historical `legacy_unreplayable` rows
+remain legacy and are never rebuilt from current configuration. Activation
+counts include all stored history, not only currently effective rows: any
+`canary`, `active`, or unknown mode fails. No activation or rollback is attempted.
+
+Optional local evidence must use a new destination in a trusted directory:
+
+```bash
+python scripts/channelops_policy_snapshot_preflight.py --evidence /approved/private-directory/policy-snapshot-audit.json
+```
+
+The JSON is written to a temporary `0600` file, flushed, then atomically linked
+to the destination without replacement. Existing files, directories, and
+symlink destinations are refused; temporary files are cleaned up on ordinary
+failures. Evidence contains only aggregate counts, fixed status/error labels,
+and validated tick/policy UUIDs and stored hashes. Keep it private. A failed
+audit is diagnostic evidence only, never authority to repair rows or activate
+anything. Parent integration owns actual PostgreSQL qualification and the
+whole-branch checks before rollout through exact-SHA CI.
