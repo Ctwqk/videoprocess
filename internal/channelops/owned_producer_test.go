@@ -153,6 +153,34 @@ func TestOwnedProducerTypedAuthorityRejectsSnapshotAndScopeBypass(t *testing.T) 
 	}
 }
 
+func TestOwnedProducerCurrentNativeRetryDoesNotBecomePriorHistory(t *testing.T) {
+	for _, status := range []string{"queued", "running", "succeeded"} {
+		t.Run(status, func(t *testing.T) {
+			data, task, now := ownedProducerFixture(t)
+			q := map[string]any{"id": ownedTestID(701), "kind": QueuePlanTask, "channel_profile_id": task["channel_profile_id"], "payload_json": map[string]any{"production_task_id": task["id"]}, "status": status, "attempt_count": json.Number("2"), "max_attempts": json.Number("3"), "last_error": "synthetic response loss", "dead_letter_at": nil, "locked_by": nil, "locked_at": nil}
+			if status == "running" {
+				q["locked_by"], q["locked_at"] = "native-current-claim", ownedISO(now)
+			}
+			if status == "succeeded" {
+				q["last_error"] = nil
+			}
+			data.Tasks[0]["queues"] = []any{q}
+			snapshot := ownedProducerSnapshot(t, data, now)
+			before := historyJSON(t, snapshot.rows())
+			if _, _, err := assessOwnedProducerSnapshot(snapshot, now, ownedString(task["id"]), ""); err != nil {
+				t.Fatal("current native retry refused before exact lease-fenced reentry", err)
+			}
+			prior := assessOwnedHistorySnapshot(snapshot, now)
+			if prior.BlockReason == nil || *prior.BlockReason != "owned_inventory_queue_failed" {
+				t.Fatal("A1 prior-history queue predicate weakened", prior)
+			}
+			if string(before) != string(historyJSON(t, snapshot.rows())) {
+				t.Fatal("producer assessment erased error/attempt evidence")
+			}
+		})
+	}
+}
+
 func TestOwnedProducerRealPDSEvidence(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -396,7 +424,10 @@ func TestOwnedProducerPlanningRequestStaysExactAfterNativePlanBinding(t *testing
 }
 
 func TestOwnedProducerPromotionPolicyPinsRequest(t *testing.T) {
-	task := ProductionTaskRow{ID: ownedTestID(600), TargetAccountID: ownedTestID(5), AgentApprovalEvidenceJSON: map[string]any{"owned_inventory": map[string]any{"item_id": ownedTestID(301)}}}
+	task := ProductionTaskRow{ID: ownedTestID(600), TargetAccountID: ownedTestID(5), AutoFlowPlanID: ptrString(ownedTestID(700)), AgentApprovalEvidenceJSON: map[string]any{"owned_inventory": map[string]any{"item_id": ownedTestID(301), "input_asset_id": ownedTestID(101)}}}
+	plan := AutoFlowPlanObservation{PlanID: *task.AutoFlowPlanID, PlanPayload: map[string]any{"plan_id": *task.AutoFlowPlanID, "pipeline_definition": ownedProducerPipeline(ownedTestID(101))}}
+	task.RationaleJSON = map[string]any{"autoflow_plan_payload": plan.PlanPayload}
+	task.AgentApprovalEvidenceJSON["plan_pds"], _ = ownedPolicyEvidence(ownedPlanPolicyRequest(task, plan), ownedProducerRealDecision())
 	pub := PublicationRow{ID: ownedTestID(800), ProductionTaskID: task.ID, AccountID: task.TargetAccountID, Platform: "youtube", Title: "title", Description: "description"}
 	d := ownedProducerRealDecision()
 	evidence, err := ownedPolicyEvidence(ownedPromotionPolicyRequest(pub, task, "unlisted"), d)
@@ -404,9 +435,11 @@ func TestOwnedProducerPromotionPolicyPinsRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	task.AgentApprovalEvidenceJSON["promotion_pds"] = evidence
-	for _, variant := range []string{"valid", "private", "publication", "account", "decision"} {
+	for _, variant := range []string{"valid", "private", "publication", "account", "decision", "missing_plan_and_pds", "missing_plan", "missing_plan_pds"} {
 		t.Run(variant, func(t *testing.T) {
 			p, decision, target := pub, d, "unlisted"
+			current := task
+			current.AgentApprovalEvidenceJSON = historyTestCopy(t, task.AgentApprovalEvidenceJSON).(map[string]any)
 			switch variant {
 			case "private":
 				target = "private"
@@ -416,8 +449,15 @@ func TestOwnedProducerPromotionPolicyPinsRequest(t *testing.T) {
 				p.AccountID = ownedTestID(999)
 			case "decision":
 				decision.DecisionID = "different"
+			case "missing_plan_and_pds":
+				current.AutoFlowPlanID = nil
+				delete(current.AgentApprovalEvidenceJSON, "plan_pds")
+			case "missing_plan":
+				current.AutoFlowPlanID = nil
+			case "missing_plan_pds":
+				delete(current.AgentApprovalEvidenceJSON, "plan_pds")
 			}
-			if err := requireOwnedPromotionPolicy(p, task, target, decision); (err == nil) != (variant == "valid") {
+			if err := requireOwnedPromotionPolicy(p, current, target, decision); (err == nil) != (variant == "valid") {
 				t.Fatalf("promotion %s: %v", variant, err)
 			}
 		})

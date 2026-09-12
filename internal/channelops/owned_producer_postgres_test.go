@@ -106,6 +106,51 @@ func ownedProducerPGAssertTask(t *testing.T, f *ownedPGFixture, ctx context.Cont
 	return task
 }
 
+// Exercise the runner's real error writer and native due-time reclaim. Never
+// rewrite run_after, last_error, attempt_count or the lease to simulate retry.
+func ownedProducerPGReclaimAfterFailure(t *testing.T, f *ownedPGFixture, ctx context.Context, item QueueItemRow, failure error) QueueItemRow {
+	t.Helper()
+	if failure == nil {
+		t.Fatal("native retry requires the actual handler error")
+	}
+	if err := completeUncommittedQueueClaim(ctx, f.store, item, failure, false); err != nil {
+		t.Fatal("native failure cleanup", err)
+	}
+	var status, message string
+	var owner *string
+	var locked *time.Time
+	var due, now time.Time
+	var attempts int
+	if err := f.store.Pool.QueryRow(ctx, `SELECT status,last_error,locked_by,locked_at,attempt_count,run_after,clock_timestamp() FROM channel_ops_queue_items WHERE id=$1::uuid`, item.ID).Scan(&status, &message, &owner, &locked, &attempts, &due, &now); err != nil {
+		t.Fatal(err)
+	}
+	if status != QueueStatusQueued || message != failure.Error() || owner != nil || locked != nil || attempts != item.AttemptCount || due.Sub(now) < RetryDelay(attempts)-time.Second {
+		t.Fatal("native retry row was not retained", status, attempts)
+	}
+	for now.Before(due) {
+		if err := f.lease.Heartbeat(ctx, now.UTC()); err != nil {
+			t.Fatal("native leader heartbeat during retry wait", err)
+		}
+		delay := min(time.Second, due.Sub(now))
+		select {
+		case <-ctx.Done():
+			t.Fatal("natural native retry wait", ctx.Err())
+		case <-time.After(delay):
+		}
+		if err := f.store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	retry, err := f.store.ClaimNextForChannelAndKinds(ctx, handlerWorkerID(f.lease.Authority()), f.channel.ID, []string{item.Kind})
+	if err != nil || retry == nil {
+		t.Fatal("native due-time reclaim", err)
+	}
+	if retry.ID != item.ID || retry.AttemptCount != item.AttemptCount+1 || retry.LastError == nil || *retry.LastError != failure.Error() || retry.LockedAt == nil || retry.LockedBy == nil || !retry.LockedAt.After(*item.LockedAt) || !ownedPolicyJSONEqual(retry.PayloadJSON, item.PayloadJSON) || retry.IdempotencyKey != item.IdempotencyKey {
+		t.Fatal("native reclaim changed identity or lost error/attempt history")
+	}
+	return *retry
+}
+
 func TestOwnedProducerPGPlanFreshFenceAndRealPolicy(t *testing.T) {
 	for _, mode := range []string{"allow", "advisory", "deny", "degraded", "unavailable", "task_drift", "queue_loss", "leader_loss"} {
 		t.Run(mode, func(t *testing.T) {
@@ -192,7 +237,7 @@ func TestOwnedProducerPGPlanFreshFenceAndRealPolicy(t *testing.T) {
 
 func TestOwnedProducerPGApprovalResultLossReusesDurablePlan(t *testing.T) {
 	f := newOwnedPGFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), RetryDelay(1)+time.Minute)
 	defer cancel()
 	item, api := ownedProducerPGClaimPlan(t, f, ctx)
 	api.loseFirstApproval = true
@@ -201,12 +246,18 @@ func TestOwnedProducerPGApprovalResultLossReusesDurablePlan(t *testing.T) {
 		calls++
 		return ownedProducerRealDecision(), nil
 	})}
-	if err := h.HandlePlanTask(ctx, item); err == nil {
+	failure := h.HandlePlanTask(ctx, item)
+	if failure == nil {
 		t.Fatal("lost approval response not surfaced")
 	}
 	task := ownedProducerPGAssertTask(t, f, ctx, TaskSelected, 0)
 	if task.AutoFlowPlanID == nil || *task.AutoFlowPlanID != api.planID {
 		t.Fatal("pending original plan not durable")
+	}
+	before := mustJSON(task)
+	item = ownedProducerPGReclaimAfterFailure(t, f, ctx, item, failure)
+	if after := ownedProducerPGAssertTask(t, f, ctx, TaskSelected, 0); !bytes.Equal(before, mustJSON(after)) {
+		t.Fatal("queue retry changed durable original plan/PDS/task")
 	}
 	if err := h.HandlePlanTask(ctx, item); err != nil {
 		t.Fatal("idempotent original approval retry", err)
@@ -222,7 +273,7 @@ func TestOwnedProducerPGApprovalResultLossReusesDurablePlan(t *testing.T) {
 
 func TestOwnedProducerPGNativePlanResponseLossReusesOriginalBinding(t *testing.T) {
 	f := newOwnedPGFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), RetryDelay(1)+time.Minute)
 	defer cancel()
 	item, api := ownedProducerPGClaimPlan(t, f, ctx)
 	api.loseFirstPlan = true
@@ -231,13 +282,15 @@ func TestOwnedProducerPGNativePlanResponseLossReusesOriginalBinding(t *testing.T
 		calls++
 		return ownedProducerRealDecision(), nil
 	})}
-	if err := h.HandlePlanTask(ctx, item); err == nil {
+	failure := h.HandlePlanTask(ctx, item)
+	if failure == nil {
 		t.Fatal("native plan response loss hidden")
 	}
 	task := ownedProducerPGAssertTask(t, f, ctx, TaskSelected, 0)
 	if task.AutoFlowPlanID == nil || *task.AutoFlowPlanID != api.planID || calls != 0 || api.approveCalls != 0 {
 		t.Fatal("lost native plan had later effects")
 	}
+	item = ownedProducerPGReclaimAfterFailure(t, f, ctx, item, failure)
 	if err := h.HandlePlanTask(ctx, item); err != nil {
 		t.Fatal("native plan retry", err)
 	}
@@ -286,7 +339,7 @@ func TestOwnedProducerRollbackInjectionUsesActualExecuteEnqueue(t *testing.T) {
 
 func TestOwnedProducerPGPlanningRollbackKeepsOriginalPendingPlan(t *testing.T) {
 	f := newOwnedPGFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), RetryDelay(1)+time.Minute)
 	defer cancel()
 	item, api := ownedProducerPGClaimPlan(t, f, ctx)
 	api.loseFirstApproval = true
@@ -313,6 +366,7 @@ func TestOwnedProducerPGPlanningRollbackKeepsOriginalPendingPlan(t *testing.T) {
 	if !bytes.Equal(mustJSON(after), before) {
 		t.Fatal("rollback changed original pending task/evidence/history")
 	}
+	item = ownedProducerPGReclaimAfterFailure(t, f, ctx, item, err)
 	if err := h.HandlePlanTask(ctx, item); err != nil {
 		t.Fatal("normal retry after rollback", err)
 	}
