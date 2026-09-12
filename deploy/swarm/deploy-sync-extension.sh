@@ -13975,75 +13975,24 @@ vp_worker_admission_failed_forward_control_json() {
     printf 'null\n'
     return 0
   fi
-  [[ "$VP_WORKER_CONTROL_GENERATION" \
-      =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ \
-    && "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
-      =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ ]] || return 1
+  vp_worker_admission_failed_control_read observe
+}
+
+vp_worker_admission_failed_control_read() {
+  local mode="$1"
+  [[ "$mode" == observe || "$mode" == select || "$mode" == verify ]] || return 1
   local root
   root="$(vp_worker_admission_root)" || return 1
-  local config="$root/staging-object-janitor.conf"
-  if [[ ! -f "$config" || -L "$config" \
-    || "$(vp_worker_redis_marker_file_mode "$config")" != 600 ]]; then
-    return 1
-  fi
+  vp_require_pipeline_network_identity || return 1
   local cron
   cron="$(mktemp "${TMPDIR:-/tmp}/vp-failed-control-cron.XXXXXX")" \
     || return 1
   local status=1
-  local target="$ROOT/bin/vp-staging-object-janitor-run.sh"
-  local log_file="$ROOT/logs/vp-staging-object-janitor.log"
-  local cron_begin="# BEGIN VIDEOPROCESS STAGING JANITOR"
-  local cron_end="# END VIDEOPROCESS STAGING JANITOR"
-  local cron_command="*/5 * * * * VP_STAGING_JANITOR_CONFIG_FILE=$config $target >> $log_file 2>&1"
   if LC_ALL=C crontab -l >"$cron" \
-    && awk -v begin="$cron_begin" -v end="$cron_end" \
-      -v command="$cron_command" '
-      BEGIN { inside=0; begins=0; ends=0; commands=0; invalid=0 }
-      $0 == begin {
-        if (inside || begins) { invalid=1; exit }
-        inside=1
-        begins++
-        next
-      }
-      $0 == end {
-        if (!inside || ends) { invalid=1; exit }
-        inside=0
-        ends++
-        next
-      }
-      inside {
-        if ($0 != command || commands) { invalid=1; exit }
-        commands++
-      }
-      END {
-        exit invalid || inside || begins != 1 || ends != 1 || commands != 1
-      }
-    ' "$cron"; then
-    local config_sha256
-    local cron_sha256
-    config_sha256="$(shasum -a 256 "$config" | awk '{print $1}')" \
-      || status=1
-    cron_sha256="$(shasum -a 256 "$cron" | awk '{print $1}')" \
-      || status=1
-    if [[ "$config_sha256" =~ ^[0-9a-f]{64}$ \
-      && "$cron_sha256" =~ ^[0-9a-f]{64}$ ]]; then
-      python3 -I -c '
-import json
-import sys
-
-generation, image, config_sha256, cron_sha256 = sys.argv[1:]
-print(json.dumps({
-    "generation": generation,
-    "image": image,
-    "config_sha256": config_sha256,
-    "cron_sha256": cron_sha256,
-}, sort_keys=True, separators=(",", ":")))
-' \
-        "$VP_WORKER_CONTROL_GENERATION" \
-        "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
-        "$config_sha256" "$cron_sha256" \
-        && status=0
-    fi
+    && python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" failed-control \
+      "$root" "$VP_WORKER_ADMISSION_LOCK_FD" "$mode" \
+      "$VP_PIPELINE_NETWORK_ID" <"$cron"; then
+    status=0
   fi
   rm -f "$cron"
   return "$status"
@@ -14102,6 +14051,7 @@ except (TypeError, ValueError, json.JSONDecodeError):
 }
 
 vp_worker_admission_capture_failed_forward() {
+  vp_worker_admission_lock_assert || return 1
   local attempted_services="$1"
   local payload
   payload="$(
@@ -14769,48 +14719,86 @@ vp_restore_legacy_worker_admission_baseline() {
 }
 
 vp_failed_forward_control_identity_matches() {
-  local identity
-  identity="$(vp_worker_admission_failed_forward_control_json)" || return 1
-  printf '%s\n' "$identity" | python3 -I -c '
+  vp_worker_admission_failed_control_read verify >/dev/null
+}
+
+vp_worker_admission_failed_control_action() {
+  local action="$1"
+  [[ "$action" == install || "$action" == verify ]] || return 1
+  vp_worker_admission_lock_assert || return 1
+  local selection
+  selection="$(vp_worker_admission_failed_control_read select)" || return 1
+  local records
+  records="$(printf '%s\n' "$selection" | python3 -I -c '
 import json
 import sys
 
-generation, image, config_sha256, cron_sha256 = sys.argv[1:]
 try:
-    identity = json.load(sys.stdin)
-    expected = {
-        "generation": generation,
-        "image": image,
-        "config_sha256": config_sha256,
-        "cron_sha256": cron_sha256,
-    }
-    if identity != expected:
-        raise ValueError
-except (TypeError, ValueError, json.JSONDecodeError):
+    value = json.load(sys.stdin)
+    purposes = (
+        "operator", "orchestrator", "staging-janitor", "staging-minio-access",
+        "staging-minio-secret", "worker-minio-access", "worker-minio-secret",
+    )
+    refs = {item["purpose"]: item for item in value["secrets"]}
+    print("|".join(("control", value["generation"], value["image"],
+                    *(refs[purpose]["name"] for purpose in purposes))))
+    for purpose in purposes:
+        print("|".join(("secret", refs[purpose]["name"],
+                        refs[purpose]["docker_secret_id"], purpose)))
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
-' \
-    "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" \
-    "$VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE" \
-    "$VP_WORKER_ROLLBACK_FAILED_CONTROL_CONFIG_SHA256" \
-    "$VP_WORKER_ROLLBACK_FAILED_CONTROL_CRON_SHA256"
+')" || return 1
+  # The installed observation can be baseline while forward authority is still
+  # prepared. Keep this control selection local; never rebind forward history.
+  local VP_WORKER_CONTROL_GENERATION=""
+  local VP_WORKER_ADMISSION_CONTROL_IMAGE=""
+  local VP_WORKER_OPERATOR_DATABASE_SECRET=""
+  local VP_WORKER_ORCHESTRATOR_DATABASE_SECRET=""
+  local VP_STAGING_JANITOR_DATABASE_SECRET=""
+  local VP_STAGING_JANITOR_MINIO_ACCESS_SECRET=""
+  local VP_STAGING_JANITOR_MINIO_SECRET_SECRET=""
+  local VP_WORKER_MINIO_ACCESS_SECRET=""
+  local VP_WORKER_MINIO_SECRET_SECRET=""
+  local record payload extra name expected_id purpose actual_id
+  local count=0
+  while IFS='|' read -r record payload; do
+    case "$record" in
+      control)
+        [[ -z "$VP_WORKER_CONTROL_GENERATION" ]] || return 1
+        IFS='|' read -r VP_WORKER_CONTROL_GENERATION VP_WORKER_ADMISSION_CONTROL_IMAGE \
+          VP_WORKER_OPERATOR_DATABASE_SECRET VP_WORKER_ORCHESTRATOR_DATABASE_SECRET \
+          VP_STAGING_JANITOR_DATABASE_SECRET VP_STAGING_JANITOR_MINIO_ACCESS_SECRET \
+          VP_STAGING_JANITOR_MINIO_SECRET_SECRET VP_WORKER_MINIO_ACCESS_SECRET \
+          VP_WORKER_MINIO_SECRET_SECRET extra <<<"$payload"
+        [[ -z "$extra" && -n "$VP_WORKER_CONTROL_GENERATION" ]] || return 1
+        ;;
+      secret)
+        IFS='|' read -r name expected_id purpose extra <<<"$payload"
+        [[ -z "$extra" && -n "$VP_WORKER_CONTROL_GENERATION" ]] || return 1
+        actual_id="$(vp_managed_secret_id "$name" "$name" vp-worker-control \
+          "$VP_WORKER_CONTROL_GENERATION" "$purpose")" || return 1
+        [[ "$actual_id" == "$expected_id" ]] || return 1
+        count=$((count + 1))
+        ;;
+      *) return 1 ;;
+    esac
+  done <<<"$records"
+  [[ "$count" -eq 7 ]] || return 1
+  vp_worker_admission_lock_assert || return 1
+  if [[ "$action" == install ]]; then
+    vp_install_staging_object_janitor "$VP_WORKER_ADMISSION_CONTROL_IMAGE" || return 1
+    vp_failed_forward_control_identity_matches
+  else
+    vp_failed_forward_control_identity_matches || return 1
+    vp_run_staging_object_janitor_once || return 1
+    local root
+    root="$(vp_worker_admission_root)" || return 1
+    vp_require_staging_object_janitor_control "$root" "$VP_WORKER_ADMISSION_CONTROL_IMAGE"
+  fi
 }
 
 vp_reinstall_failed_forward_control() {
-  [[ "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" \
-      =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ \
-    && "$VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE" \
-      =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$ \
-    && "$VP_WORKER_ROLLBACK_FAILED_CONTROL_CONFIG_SHA256" \
-      =~ ^[0-9a-f]{64}$ \
-    && "$VP_WORKER_ROLLBACK_FAILED_CONTROL_CRON_SHA256" \
-      =~ ^[0-9a-f]{64}$ \
-    && "$VP_WORKER_CONTROL_GENERATION" \
-      == "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" \
-    && "$VP_WORKER_ADMISSION_CONTROL_IMAGE" \
-      == "$VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE" ]] || return 1
-  vp_install_staging_object_janitor \
-    "$VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE" || return 1
-  vp_failed_forward_control_identity_matches
+  vp_worker_admission_failed_control_action install
 }
 
 vp_failed_forward_marker_identity_matches() {
@@ -15015,11 +15003,9 @@ vp_restore_failed_forward_worker_service() {
 vp_verify_failed_forward_candidate() {
   vp_failed_forward_control_identity_matches || return 1
   vp_failed_forward_marker_identity_matches || return 1
-  vp_run_staging_object_janitor_once || return 1
+  vp_worker_admission_failed_control_action verify || return 1
   local root
   root="$(vp_worker_admission_root)" || return 1
-  vp_require_staging_object_janitor_control \
-    "$root" "$VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE" || return 1
   vp_require_worker_redis_marker_status || return 1
   local service
   local generation

@@ -35,7 +35,7 @@ required_lines=(
   "bash tests/test_vp_deploy_sync_extension.sh"
   "bash tests/test_vp_deploy_ci_gate.sh"
   "bash tests/test_worker_admission_deploy.sh"
-  "backend/.venv/bin/python -m pytest -q tests/test_registered_runtime_deploy.py tests/test_docker_secret_id_transport.py"
+  "backend/.venv/bin/python -m pytest -q tests/test_registered_runtime_deploy.py tests/test_docker_secret_id_transport.py tests/test_failed_control_recovery.py"
   "bash tests/test_worker_admission_rollback.sh"
   "bash tests/test_staging_object_janitor_install.sh"
   "bash tests/test_staging_object_janitor_run.sh"
