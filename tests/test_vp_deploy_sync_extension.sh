@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTENSION="$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
-TEST_ROOT="$(mktemp -d)"
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vp-deploy-sync-extension.XXXXXX")"
 CALLS="$TEST_ROOT/calls"
 ROOT="$TEST_ROOT/deploy-github-sync"
 FAKE_BIN="$TEST_ROOT/bin"
@@ -411,6 +411,25 @@ swarm_service_running() {
   return 0
 }
 
+run_channelops_build_script() {
+  local script="$1"
+  shift
+  local fake_dir="$TEST_ROOT/channelops-build-bin"
+  mkdir -p "$fake_dir"
+  cat >"$fake_dir/docker" <<'EOF'
+#!/bin/sh
+printf 'channelops-docker' >>"$CALLS"
+printf '|%s' "$@" >>"$CALLS"
+printf '\n' >>"$CALLS"
+exit "${CHANNEL_BUILD_STATUS:-0}"
+EOF
+  chmod 0700 "$fake_dir/docker"
+  printf '%s\n' "$script" >"$fake_dir/build.sh"
+  env -i PATH="$fake_dir:$PATH" HOME="$HOME" TMPDIR="$TMPDIR" \
+    CALLS="$CALLS" CHANNEL_BUILD_STATUS="${CHANNEL_BUILD_STATUS:-0}" \
+    /bin/sh "$fake_dir/build.sh" "$@"
+}
+
 remote_sh() {
   local host="$1"
   printf 'remote|%s' "$1" >>"$CALLS"
@@ -419,6 +438,13 @@ remote_sh() {
   printf '\n' >>"$CALLS"
   local remote_script
   remote_script="$(command cat)"
+
+  if [[ "$host" == 10.0.0.127 \
+    && "${1:-}" == /bin/sh && "${2:-}" == -s && "${3:-}" == -- \
+    && "${5:-}" == backend/Dockerfile.channelops-runner-go ]]; then
+    run_channelops_build_script "$remote_script" "${@:4}"
+    return
+  fi
 
   if [[ "$host" == "$VP_RUNTIME_HOST" \
     && "${1:-}" == "/bin/sh" \
@@ -1428,6 +1454,183 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
   exit 1
 fi
 source "$EXTENSION"
+
+test_channelops_build_contract() (
+  CALLS="$TEST_ROOT/channelops-contract-calls"
+  local context=/Users/wenjieliu/VideoProcess-app
+  local dockerfile=backend/Dockerfile.channelops-runner-go
+  local image=vp-channelops-runner-go:deploy-0123456789ab
+  local invalid mode
+  if ! declare -F vp_build_runtime_channelops_image >/dev/null; then
+    echo 'FAIL: ChannelOps identity-aware build helper is missing' >&2
+    exit 1
+  fi
+
+  for mode in 1 0; do
+    BUILD_IMAGES="$mode"
+    for invalid in '' development unknown 0123456789ab \
+      0123456789abcdef0123456789abcdef0123456 \
+      0123456789abcdef0123456789abcdef012345678 \
+      0123456789abcdef0123456789abcdef0123456g \
+      0123456789ABCDEF0123456789ABCDEF01234567 \
+      "$TEST_COMMIT " "$TEST_COMMIT"$'\n' '$(touch forbidden)'; do
+      : >"$CALLS"
+      if vp_build_runtime_channelops_image "$context" "$dockerfile" "$image" "$invalid"; then
+        echo 'FAIL: ChannelOps accepted an invalid build identity' >&2
+        exit 1
+      fi
+      [[ ! -s "$CALLS" ]] || { echo 'FAIL: invalid identity reached transport/logging' >&2; exit 1; }
+    done
+    : >"$CALLS"
+    if vp_build_runtime_channelops_image "$context" "$dockerfile" "$image"; then
+      echo 'FAIL: ChannelOps accepted a missing commit argument' >&2
+      exit 1
+    fi
+    [[ ! -s "$CALLS" ]] || exit 1
+
+    for invalid in host context dockerfile image; do
+      local host=10.0.0.127 ctx="$context" file="$dockerfile" tag="$image"
+      case "$invalid" in
+        host) host=10.0.0.126 ;;
+        context) ctx=/Users/wenjieliu/VideoProcess-app/backend ;;
+        dockerfile) file=backend/Dockerfile.ffmpeg-worker-go ;;
+        image) tag=vp-channelops-runner-go:deploy-ffffffffffff ;;
+      esac
+      : >"$CALLS"
+      if VP_RUNTIME_HOST="$host" vp_build_runtime_channelops_image "$ctx" "$file" "$tag" "$TEST_COMMIT"; then
+        echo "FAIL: ChannelOps accepted invalid $invalid" >&2
+        exit 1
+      fi
+      [[ ! -s "$CALLS" ]] || exit 1
+    done
+  done
+
+  : >"$CALLS"
+  vp_build_runtime_channelops_image "$context" "$dockerfile" "$image" "$TEST_COMMIT"
+  grep -Fq 'log|build skipped ' "$CALLS"
+  ! grep -Eq '^(remote|channelops-docker)\|' "$CALLS" || exit 1
+  BUILD_IMAGES=1
+  : >"$CALLS"
+  vp_build_runtime_channelops_image "$context" "$dockerfile" "$image" "$TEST_COMMIT"
+  grep -Fxq "remote|10.0.0.127|/bin/sh|-s|--|$context|$dockerfile|$image|$TEST_COMMIT" "$CALLS"
+  local expected="channelops-docker|build|--build-arg|VP_BUILD_COMMIT_SHA=$TEST_COMMIT|-f|$context/$dockerfile|-t|$image|$context"
+  [[ "$(grep '^channelops-docker|' "$CALLS")" == "$expected" ]] || exit 1
+
+  # Execute the captured remote script locally, with only the Docker boundary faked.
+  local remote_script
+  remote_script="$(<"$TEST_ROOT/channelops-build-bin/build.sh")"
+  for invalid in '' development 0123456789ab "$TEST_COMMIT"$'\n'; do
+    : >"$CALLS"
+    if run_channelops_build_script "$remote_script" "$context" "$dockerfile" "$image" "$invalid"; then
+      echo 'FAIL: remote ChannelOps script accepted an invalid identity' >&2
+      exit 1
+    fi
+    [[ ! -s "$CALLS" ]] || exit 1
+  done
+  for invalid in context dockerfile image; do
+    local ctx="$context" file="$dockerfile" tag="$image"
+    case "$invalid" in
+      context) ctx=/Users/wenjieliu/VideoProcess-app/backend ;;
+      dockerfile) file=backend/Dockerfile.ffmpeg-worker-go ;;
+      image) tag=vp-channelops-runner-go:deploy-ffffffffffff ;;
+    esac
+    : >"$CALLS"
+    if run_channelops_build_script "$remote_script" "$ctx" "$file" "$tag" "$TEST_COMMIT"; then
+      echo "FAIL: remote ChannelOps script accepted invalid $invalid" >&2
+      exit 1
+    fi
+    [[ ! -s "$CALLS" ]] || exit 1
+  done
+  : >"$CALLS"
+  if CHANNEL_BUILD_STATUS=37 vp_build_runtime_channelops_image "$context" "$dockerfile" "$image" "$TEST_COMMIT"; then
+    echo 'FAIL: ChannelOps swallowed a Docker build failure' >&2
+    exit 1
+  fi
+
+  local ci_status=success ci_sha="$TEST_COMMIT"
+  gh() {
+    printf 'gh|%s\n' "$*" >>"$CALLS"
+    printf 'found\tcompleted\t%s\t%s\t101\n' "$ci_status" "$ci_sha"
+  }
+  for invalid in '' development unknown 0123456789ab "$TEST_COMMIT"$'\n'; do
+    : >"$CALLS"
+    if build_vp_app_images "$invalid" >/dev/null 2>&1; then
+      echo 'FAIL: app builder accepted invalid commit' >&2
+      exit 1
+    fi
+    [[ ! -s "$CALLS" ]] || exit 1
+  done
+  for mode in failed mismatch; do
+    ci_status=success ci_sha="$TEST_COMMIT"
+    if [[ "$mode" == failed ]]; then ci_status=failure; else ci_sha=ffffffffffffffffffffffffffffffffffffffff; fi
+    : >"$CALLS"
+    if build_vp_app_images "$TEST_COMMIT" >/dev/null 2>&1; then
+      echo 'FAIL: app builder bypassed exact-SHA successful CI' >&2
+      exit 1
+    fi
+    ! grep -Eq '^(build|remote|docker|channelops-docker)\|' "$CALLS" || exit 1
+  done
+  ci_status=success ci_sha="$TEST_COMMIT"
+  : >"$CALLS"
+  local images
+  images="$(build_vp_app_images "$TEST_COMMIT")"
+  [[ "$images" == 'vp-api:deploy-0123456789ab vp-frontend:deploy-0123456789ab vp-backend-api:deploy-0123456789ab vp-channelops-runner-go:deploy-0123456789ab vp-ffmpeg-worker-go:deploy-0123456789ab vp-ffmpeg-worker-python:deploy-0123456789ab' ]] || exit 1
+  [[ "$(grep '^channelops-docker|' "$CALLS")" == "$expected" ]] || exit 1
+  [[ "$(head -n 1 "$CALLS")" == gh\|*head_sha="$TEST_COMMIT"* ]] || exit 1
+  ! grep -Eq '^build\|.*Dockerfile.channelops-runner-go' "$CALLS" || exit 1
+  echo 'PASS: ChannelOps offline build identity contract'
+)
+
+test_channelops_migration_head_reporting() (
+  CALLS="$TEST_ROOT/channelops-head-calls"
+  local backend_image=vp-backend-api:deploy-0123456789ab
+  local fixture_read_file="$TEST_ROOT/deploy-read-url"
+  local cli_status=0 output status failures=0
+  UPDATE_SERVICES=1
+  vp_require_pipeline_network_identity() { VP_PIPELINE_NETWORK_ID=fixture-pipeline-network; }
+  vp_worker_admission_database_credential_file() {
+    [[ "$#" -eq 3 && "$1" == deploy_read && "$2" == "$fixture_read_file" \
+      && "$3" == 'worker deploy-read database URL file' ]] || return 1
+    printf '%s\n' "$fixture_read_file"
+  }
+  docker() {
+    printf 'docker' >>"$CALLS"
+    printf '|%s' "$@" >>"$CALLS"
+    printf '\n' >>"$CALLS"
+    printf 'private CLI stdout must remain suppressed\n'
+    return "$cli_status"
+  }
+  for cli_status in 0 23; do
+    : >"$CALLS"
+    status=0
+    output="$(vp_require_channelops_migration_head "$backend_image" 2>"$TEST_ROOT/channelops-head-error")" || status=$?
+    [[ -z "$output" ]] || exit 1
+    [[ "$(grep '^docker|' "$CALLS")" == "docker|run|--rm|--network|fixture-pipeline-network|--mount|type=bind,src=$fixture_read_file,dst=/run/secrets/worker-deploy-read-database-url,readonly|--env|WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url|$backend_image|python|-m|app.services.worker_deployment_cli|verify-head" ]] || exit 1
+    if [[ "$cli_status" -eq 0 ]]; then
+      [[ "$status" -eq 0 && ! -s "$TEST_ROOT/channelops-head-error" ]] || exit 1
+      if ! grep -Fxq 'log|ChannelOps migration head verified against the release backend image' "$CALLS"; then
+        echo 'FAIL: migration head success must report image-owned verification, not a hardcoded version' >&2
+        failures=$((failures + 1))
+      fi
+    else
+      [[ "$status" -eq 1 ]] || exit 1
+      ! grep -q '^log|' "$CALLS" || exit 1
+      if [[ "$(<"$TEST_ROOT/channelops-head-error")" != 'ChannelOps migration head gate failed; expected the exact head required by the release backend image' ]]; then
+        echo 'FAIL: migration head failure must report the image-owned exact-head requirement' >&2
+        failures=$((failures + 1))
+      fi
+    fi
+  done
+  [[ "$failures" -eq 0 ]] || exit 1
+  echo 'PASS: ChannelOps image-owned migration head reporting contract'
+)
+
+test_channelops_build_contract
+test_channelops_migration_head_reporting
+if [[ "${1:-}" == --channelops-build-only ]]; then
+  exit 0
+fi
+
 # The registered-runtime shell contract is executed in test_registered_runtime_deploy.py.
 vp_registered_reconcile_capture() { :; }
 vp_registered_reconcile_forward() {

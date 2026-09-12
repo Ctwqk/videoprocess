@@ -120,3 +120,28 @@ def test_channelops_go_runner_exposes_queue_and_metrics_envs():
     ]:
         assert env_name in compose
         assert f"`{env_name}`" in docs
+
+
+def test_channelops_build_identity_is_embedded_in_both_binaries():
+    dockerfile = (ROOT / "backend" / "Dockerfile.channelops-runner-go").read_text(encoding="utf-8")
+    build, _runtime = re.split(r"(?m)^FROM ", dockerfile)[1:]
+    assert "ARG VP_BUILD_COMMIT_SHA=development" in build
+    commands = [shlex.split(line) for line in build.splitlines() if line.startswith("RUN CGO_ENABLED=0 go build ")]
+    assert len(commands) == 2
+    assert {command[-1] for command in commands} == {
+        "./cmd/channelops-runner", "./cmd/channelops-live-smoke",
+    }
+    for command in commands:
+        flags = next(arg.removeprefix("-ldflags=") for arg in command if arg.startswith("-ldflags="))
+        assert shlex.split(flags) == [
+            "-s", "-w", "-X",
+            "github.com/Ctwqk/videoprocess/internal/channelops.BuildCommitSHA=$VP_BUILD_COMMIT_SHA",
+        ]
+
+
+def test_channelops_release_identity_preserves_dependency_cache():
+    dockerfile = (ROOT / "backend" / "Dockerfile.channelops-runner-go").read_text(encoding="utf-8")
+    build, _runtime = re.split(r"(?m)^FROM ", dockerfile)[1:]
+    identity = build.index("ARG VP_BUILD_COMMIT_SHA=development")
+    assert build.index("COPY go.mod go.sum ./") < build.index("RUN go mod download") < identity
+    assert identity < build.index("RUN CGO_ENABLED=0 go build")

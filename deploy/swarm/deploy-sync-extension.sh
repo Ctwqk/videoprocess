@@ -11206,10 +11206,10 @@ vp_require_channelops_migration_head() {
     --env WORKER_DEPLOY_READ_DATABASE_URL_FILE=/run/secrets/worker-deploy-read-database-url \
     "$backend_image" \
     python -m app.services.worker_deployment_cli verify-head >/dev/null; then
-    echo "ChannelOps migration head gate failed; expected exactly 036_worker_session_signal" >&2
+    echo "ChannelOps migration head gate failed; expected the exact head required by the release backend image" >&2
     return 1
   fi
-  log "ChannelOps migration head verified: 036_worker_session_signal"
+  log "ChannelOps migration head verified against the release backend image"
 }
 
 vp_runtime_redis_secret_id() {
@@ -12630,6 +12630,48 @@ exec docker build \
 REMOTE
 }
 
+vp_build_runtime_channelops_image() {
+  local context_dir="${1:-}"
+  local dockerfile="${2:-}"
+  local image="${3:-}"
+  local build_commit="${4:-}"
+  if [[ "$VP_RUNTIME_HOST" != 10.0.0.127 \
+    || "$context_dir" != /Users/wenjieliu/VideoProcess-app \
+    || "$dockerfile" != backend/Dockerfile.channelops-runner-go \
+    || ! "$build_commit" =~ ^[0-9a-f]{40}$ \
+    || "$image" != "vp-channelops-runner-go:deploy-${build_commit:0:12}" ]]; then
+    return 1
+  fi
+  if [[ "${BUILD_IMAGES:-1}" -eq 0 ]]; then
+    log "build skipped $VP_RUNTIME_HOST:$context_dir $image"
+    return 0
+  fi
+  log "build $VP_RUNTIME_HOST:$context_dir $image"
+  remote_sh "$VP_RUNTIME_HOST" /bin/sh -s -- \
+    "$context_dir" "$dockerfile" "$image" "$build_commit" <<'REMOTE'
+set -eu
+context_dir="$1"
+dockerfile="$2"
+image="$3"
+build_commit="$4"
+case "$context_dir|$dockerfile|$image|$build_commit" in
+  *10.0.0.126*|*colima-126*|*colima-swarmbridged*|*CASPERs-Mac-mini*)
+    exit 1
+    ;;
+esac
+[ "$context_dir" = /Users/wenjieliu/VideoProcess-app ]
+[ "$dockerfile" = backend/Dockerfile.channelops-runner-go ]
+[ "${#build_commit}" -eq 40 ]
+printf '%s\n' "$build_commit" | grep -Eq '^[0-9a-f]{40}$'
+[ "$image" = "vp-channelops-runner-go:deploy-$(printf '%s' "$build_commit" | cut -c1-12)" ]
+exec docker build \
+  --build-arg "VP_BUILD_COMMIT_SHA=$build_commit" \
+  -f "$context_dir/$dockerfile" \
+  -t "$image" \
+  "$context_dir"
+REMOTE
+}
+
 build_vp_app_images() {
   local commit="$1"
   vp_validate_topology || return 1
@@ -12650,8 +12692,10 @@ build_vp_app_images() {
     Dockerfile "$frontend" || return 1
   build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app/backend \
     Dockerfile.api "$backend" || return 1
-  build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app \
-    backend/Dockerfile.channelops-runner-go "$channelops_runner" || return 1
+  vp_build_runtime_channelops_image \
+    /Users/wenjieliu/VideoProcess-app \
+    backend/Dockerfile.channelops-runner-go \
+    "$channelops_runner" "$commit" || return 1
   vp_build_runtime_worker_image \
     /Users/wenjieliu/VideoProcess-app \
     backend/Dockerfile.ffmpeg-worker-go \
