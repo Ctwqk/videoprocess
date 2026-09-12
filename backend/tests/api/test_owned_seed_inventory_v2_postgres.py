@@ -20,10 +20,34 @@ from tests.migrations.test_owned_history_seal_postgres import a2_env as a2_env
 from tests.migrations.test_owned_history_lifecycle_postgres import a2_history as a2_history
 
 
+HISTORY_DRIFT_FIELD = "credential_ref"
+
+
+def signal_account_writer(monkeypatch, pids, entering):
+    original = AsyncSession.scalars
+    async def writer_entry(db, statement, *args, **kwargs):
+        # Account PATCH takes the channel row lock before its history helper.
+        if getattr(statement, "_for_update_arg", None) is not None and any(
+            d.get("entity") is ChannelProfile for d in statement.column_descriptions
+        ):
+            pids["writer"] = await db.scalar(text("SELECT pg_backend_pid()"))
+            entering.set()
+        return await original(db, statement, *args, **kwargs)
+    monkeypatch.setattr(AsyncSession, "scalars", writer_entry)
+
+
 @pytest.fixture
 async def v2_pg(a2_history):
     await migrate(a2_history.case.target, "042_owned_producer_fence")
     assert await a2_history.case.owner.fetchval("SELECT version_num FROM alembic_version") == "042_owned_producer_fence"
+    owner = a2_history.case.owner
+    schedule = await owner.fetchrow(
+        "SELECT state, guarded_job_id FROM runtime_schedules WHERE service_name='videoprocess'")
+    assert schedule is not None and schedule["guarded_job_id"] is None
+    await owner.execute(
+        "UPDATE runtime_schedules SET state='CLOSED', updated_by='v2-fixture' "
+        "WHERE service_name='videoprocess' AND guarded_job_id IS NULL")
+    assert await owner.fetchval("SELECT state FROM runtime_schedules WHERE service_name='videoprocess'") == "CLOSED"
     return a2_history
 
 
@@ -121,7 +145,8 @@ async def test_pg_v2_committed_history_drift_during_io_denies_approval(v2_pg):
     async def change(_path):
         h.env.storage.on_read = None
         old = uuid.UUID(h.data["history_locators"]["operations"][0]["legacy_account_id"])
-        await h.case.owner.execute("UPDATE publishing_accounts SET account_label='changed during unlocked IO' WHERE id=$1", old)
+        await h.case.owner.execute(f"UPDATE publishing_accounts SET {HISTORY_DRIFT_FIELD}=$2 WHERE id=$1",
+                                   old, "changed during unlocked IO")
         changed.append(True)
     h.env.storage.on_read = change
     result = await approve(h)
@@ -135,7 +160,6 @@ async def test_pg_v2_approval_holds_final_fence_until_history_is_sealed(v2_pg, m
     locked, release, entering = asyncio.Event(), asyncio.Event(), asyncio.Event()
     pids = {}
     original = service._lock_assets
-    original_channel = service.lock_history_channel_mutation
     old = h.data["history_locators"]["operations"][0]
     async def pause(db, descriptors):
         value = await original(db, descriptors)
@@ -144,12 +168,8 @@ async def test_pg_v2_approval_holds_final_fence_until_history_is_sealed(v2_pg, m
             locked.set()
             await asyncio.wait_for(release.wait(), 8)
         return value
-    async def writer_entry(db, channel_id):
-        pids["writer"] = await db.scalar(text("SELECT pg_backend_pid()"))
-        entering.set()
-        return await original_channel(db, channel_id)
     monkeypatch.setattr(service, "_lock_assets", pause)
-    monkeypatch.setattr(service, "lock_history_channel_mutation", writer_entry)
+    signal_account_writer(monkeypatch, pids, entering)
     activation = asyncio.create_task(approve(h))
     writer = None
     try:
