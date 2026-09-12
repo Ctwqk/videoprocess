@@ -7,6 +7,7 @@ import runpy
 import subprocess
 import shlex
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -81,24 +82,18 @@ def spec():
 
 
 def test_update_binds_only_selected_secret_and_preserves_unrelated_runtime():
-    result = run(
-        r"""
-vp_service_values() { printf '%s\n' "$SPEC"; }
-docker() { [[ "$1 $2" == 'image inspect' ]] && printf '\n'; }
-vp_autoflow_runtime_update_args aaaaaaaaaaaaaaaaaaaaaaaaa vp-backend-api:deploy-0123456789ab
-printf '%s\n' "$VP_AUTOFLOW_RUNTIME_UPDATE_ARGS"
-""",
-        SPEC=spec(),
+    helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
+    desired = helper["_autoflow_update_spec"](
+        {"ID": SERVICE_ID, "Spec": {"Name": "vp-autoflow-api-swarm", "TaskTemplate": {"ContainerSpec": spec()}}},
+        SERVICE_ID, "vp-backend-api:deploy-0123456789ab", "start-first",
+        f"{SECRET}|{SECRET_ID}|{GENERATION}", "", "true", "colima-127",
     )
-    assert result.returncode == 0, result.stderr
-    args = result.stdout.splitlines()
-    assert (
-        args[args.index("--secret-add") + 1]
-        == f"source={SECRET_ID},target=worker-orchestrator-database-url,uid=0,gid=0,mode=0400"
-    )
-    assert args[args.index("--secret-rm") + 1] == "vp-wc-orchestrator-old"
-    assert "unrelated" not in args and "KEEP" not in args
-    assert "WORKER_ORCHESTRATOR_CONTROL_GENERATION=" + GENERATION in args
+    container = desired["TaskTemplate"]["ContainerSpec"]
+    assert container["Secrets"][0] == spec()["Secrets"][0]
+    assert container["Secrets"][1] == {"SecretID": SECRET_ID, "SecretName": SECRET,
+        "File": {"Name": "worker-orchestrator-database-url", "UID": "0", "GID": "0", "Mode": 256}}
+    assert "KEEP=yes" in container["Env"]
+    assert "WORKER_ORCHESTRATOR_CONTROL_GENERATION=" + GENERATION in container["Env"]
 
 
 @pytest.mark.parametrize(
@@ -112,16 +107,14 @@ def test_update_rejects_ambiguous_mount_or_identity(fault):
         value["Secrets"][-1]["SecretName"] = "operator-credential"
     if fault == "unknown_user":
         value["User"] = "unexpected-user"
-    result = run(
-        r"""
-vp_service_values() { [[ "$FAULT" != inspect_error ]] && printf '%s\n' "$SPEC"; }
-docker() { [[ "$1 $2" == 'image inspect' ]] && printf '\n'; }
-vp_autoflow_runtime_update_args aaaaaaaaaaaaaaaaaaaaaaaaa vp-backend-api:deploy-0123456789ab
-""",
-        SPEC=value,
-        FAULT=fault,
-    )
-    assert result.returncode == 1
+    helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
+    actual = {"ID": SERVICE_ID, "Spec": {"Name": "vp-autoflow-api-swarm", "TaskTemplate": {"ContainerSpec": value}}}
+    with pytest.raises(helper["TransactionError"]):
+        helper["_autoflow_update_spec"](
+            {} if fault == "inspect_error" else actual, SERVICE_ID,
+            "vp-backend-api:deploy-0123456789ab", "start-first",
+            f"{SECRET}|{SECRET_ID}|{GENERATION}", "", "true", "colima-127",
+        )
 
 
 @pytest.mark.parametrize(
@@ -517,8 +510,37 @@ def locked_runtime_fixture(tmp_path, action):
     tasks = [{"ServiceID": SERVICE_ID, "Spec": {"ContainerSpec": container}, "Status": {
         "State": "running", "ContainerStatus": {"ContainerID": "c" * 64},
     }}]
+    fake_bin = root / "bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text("#!" + sys.executable + "\n" + r'''
+import json,os,pathlib,sys
+root=pathlib.Path(os.environ["ADMISSION_ROOT"])
+stored=root/"engine-spec.json"
+spec=json.loads(stored.read_text() if stored.exists() else os.environ["SPEC"])
+args=sys.argv[1:]
+if args[:2]==["image","inspect"]:
+    print("")
+elif args==["service","inspect","aaaaaaaaaaaaaaaaaaaaaaaaa"]:
+    print(json.dumps([{"ID":"a"*25,"Version":{"Index":72 if stored.exists() else 71},"Spec":spec,"UpdateStatus":{"State":"completed"}}]))
+elif args==["system","dial-stdio"]:
+    headers,body=sys.stdin.buffer.read().split(b"\r\n\r\n",1)
+    assert headers.startswith(b"POST /v1.52/services/aaaaaaaaaaaaaaaaaaaaaaaaa/update?version=71&registryAuthFrom=spec HTTP/1.1\r\n")
+    value=json.loads(body)
+    with open(os.environ["AUDIT"],"a") as audit: audit.write("UPDATE|"+json.dumps(value,separators=(",",":"))+"\n")
+    if os.environ["FAULT"] in {"engine_id_replaced","engine_version_conflict"}:
+        sys.stdout.buffer.write(b"HTTP/1.1 409 Conflict\r\nContent-Length: 2\r\n\r\n{}")
+    else:
+        stored.write_text(json.dumps(value))
+        if os.environ["FAULT"]!="engine_lost":
+            sys.stdout.buffer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+else:
+    raise SystemExit(91)
+''')
+    docker.chmod(0o700)
     return dict(ADMISSION_ROOT=str(root), AUDIT=str(root / "operations.log"), IMAGE=image, SELECTED_GENERATION=generation,
-                CONTROL=control, SPEC=spec, CONTAINER=container, TASKS=tasks, ACTION=action)
+                CONTROL=control, SPEC=spec, CONTAINER=container, TASKS=tasks, ACTION=action,
+                PATH=str(fake_bin) + os.pathsep + os.environ["PATH"])
 
 
 LOCKED_RUNTIME_BOUNDARY = r"""
@@ -565,11 +587,14 @@ docker() {
       case "$5" in
         '{{.ID}}|{{.Spec.Name}}')
           printf '%s|vp-autoflow-api-swarm\n' "$(vp_registered_worker_service_current_id)" ;;
-        '{{json .Spec}}') printf '%s\n' "$SPEC" ;;
+        '{{json .Spec}}')
+          if [[ -f "$ADMISSION_ROOT/engine-spec.json" ]]; then cat "$ADMISSION_ROOT/engine-spec.json"
+          else printf '%s\n' "$SPEC"; fi ;;
         *) return 91 ;;
       esac ;;
     'service ps') echo aaaaaaaaaaaaaaaaaaaaaaaaa ;;
-    'inspect --type') printf '%s\n' "$TASKS" ;;
+    'inspect --type')
+      python3 -c 'import json,os,pathlib; t=json.loads(os.environ["TASKS"]); p=pathlib.Path(os.environ["ADMISSION_ROOT"])/"engine-spec.json"; t[0]["Spec"]["ContainerSpec"]=json.loads(p.read_text())["TaskTemplate"]["ContainerSpec"] if p.exists() else t[0]["Spec"]["ContainerSpec"]; print(json.dumps(t))' ;;
     'service update')
       echo ATTEMPT_UPDATE >> "$AUDIT"
       vp_worker_admission_lock_assert || return 91
@@ -623,10 +648,90 @@ def test_real_owning_shell_lock_and_replay_boundary(tmp_path, action, fault):
         assert len(updates) == (0 if action == "readiness" else 1)
         assert health == 1
         if updates:
-            assert f"|--env-add|WORKER_ORCHESTRATOR_CONTROL_GENERATION={data['SELECTED_GENERATION']}|" in updates[0]
-            assert f"|--secret-add|source={SECRET_ID},target=worker-orchestrator-database-url,uid=0,gid=0,mode=0400|" in updates[0]
-            assert f"|--image|{data['IMAGE']}|{SERVICE_ID}" in updates[0]
-            assert "|--update-order|" + ("stop-first|" if action == "rollback" else "start-first|") in updates[0]
+            posted = json.loads(updates[0].split("|", 1)[1])
+            container = posted["TaskTemplate"]["ContainerSpec"]
+            assert "WORKER_ORCHESTRATOR_CONTROL_GENERATION=" + data["SELECTED_GENERATION"] in container["Env"]
+            assert container["Secrets"][0]["SecretID"] == SECRET_ID
+            assert container["Secrets"][0]["SecretName"] == "vp-wc-orchestrator-" + data["SELECTED_GENERATION"]
+            assert container["Image"] == data["IMAGE"]
+            assert posted["UpdateConfig"]["Order"] == ("stop-first" if action == "rollback" else "start-first")
+
+
+@pytest.mark.parametrize("action", ["forward", "rollback"])
+@pytest.mark.parametrize("fault", ["engine_id_replaced", "engine_version_conflict", "engine_lost"])
+def test_owning_shell_engine_failure_keeps_pin_and_never_retries(tmp_path, action, fault):
+    data = locked_runtime_fixture(tmp_path, action)
+    result = run(LOCKED_RUNTIME_BOUNDARY, **data, FAULT=fault)
+    assert result.returncode == 1
+    operations = Path(data["AUDIT"]).read_text().splitlines()
+    updates = [entry for entry in operations if entry.startswith("UPDATE|")]
+    assert len(updates) == 1
+    assert json.loads(updates[0].split("|", 1)[1])["TaskTemplate"]["ContainerSpec"]["Secrets"][0]["SecretID"] == SECRET_ID
+    assert "HEALTH" not in operations
+
+
+@pytest.mark.parametrize("fixture", ["test_worker_admission_deploy.sh", "test_vp_deploy_sync_extension.sh"])
+@pytest.mark.parametrize("order", ["start-first", "stop-first"])
+def test_legacy_flow_fixture_covers_new_atomic_transport_entry(fixture, order):
+    result = run(r'''
+vp_registered_worker_service_current_id() { printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaa; }
+eval "$(sed -n '/^vp_autoflow_update_runtime_service() {/,/^}/p' "$FIXTURE")"
+docker() { printf '%s\n' "$@"; }
+vp_update_runtime_service vp-autoflow-api-swarm vp-backend-api:deploy-0123456789ab "$ORDER"
+''', FIXTURE=str(EXTENSION.parents[2] / "tests" / fixture), ORDER=order)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "service", "update", "--detach=false", "--no-resolve-image", "--update-order", order,
+        "--constraint-add", "node.labels.vp.runtime==true", "--constraint-add", "node.hostname==colima-127",
+        "--env-add", "WORKER_ORCHESTRATOR_CONTROL_GENERATION=fixture", "--image",
+        "vp-backend-api:deploy-0123456789ab", SERVICE_ID,
+    ]
+
+
+@pytest.mark.parametrize("fault", ["none", "paused", "spec_drift", "timeout"])
+def test_atomic_update_acceptance_waits_for_convergence(tmp_path, fault):
+    data = locked_runtime_fixture(tmp_path, "forward")
+    helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
+    document = json.loads((Path(data["ADMISSION_ROOT"]) / "transactions/active.json").read_text())
+    posted = []
+    polls = []
+    now = [0.0]
+
+    def docker(args, **kwargs):
+        if args[:2] == ["image", "inspect"]:
+            return ""
+        assert args == ["service", "inspect", SERVICE_ID]
+        value = json.loads(json.dumps(posted[0] if posted else data["SPEC"]))
+        state = "completed"
+        if posted:
+            polls.append(1)
+            state = "updating" if fault == "timeout" or len(polls) == 1 else "completed"
+            if fault == "paused":
+                state = "paused"
+            if fault == "spec_drift":
+                value["TaskTemplate"]["ContainerSpec"]["Secrets"][0]["SecretID"] = "z" * 25
+        return json.dumps([{"ID": SERVICE_ID, "Version": {"Index": 71}, "Spec": value, "UpdateStatus": {"State": state}}])
+
+    def post(path, spec, status):
+        assert path == f"/services/{SERVICE_ID}/update?version=71&registryAuthFrom=spec" and status == 200
+        posted.append(spec)
+        return {}
+
+    def sleep(seconds):
+        now[0] += 60 if fault == "timeout" else seconds
+
+    with patch.dict(helper["autoflow_update"].__globals__,
+                    acquire_lock=lambda *args: "token", _registered_document=lambda *args: document,
+                    _registered_docker=docker, _engine_service_post=post), \
+         patch("time.monotonic", lambda: now[0]), patch("time.sleep", sleep):
+        result = helper["autoflow_update"]([
+            data["ADMISSION_ROOT"], "19", str(os.getppid()), "token", str(document["revision"]),
+            SERVICE_ID, data["IMAGE"], "start-first", f"{SECRET}|{SECRET_ID}|{GENERATION}", "colima-127", "true",
+        ])
+    assert result == (0 if fault == "none" else 1)
+    assert len(posted) == 1
+    if fault == "none":
+        assert len(polls) == 2
 
 
 @pytest.mark.parametrize(

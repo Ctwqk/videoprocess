@@ -214,6 +214,7 @@ jobs:
             run_contract bash tests/test_ci_workflow_contract.sh
             run_contract bash tests/test_vp_deploy_ci_gate.sh
             run_contract python3 tests/test_worker_admission_transaction.py
+            run_contract backend/.venv/bin/python -m pytest -q tests/test_registered_runtime_deploy.py tests/test_docker_secret_id_transport.py
             run_contract python3 tests/test_worker_marker_prior_config.py
             run_contract python3 tests/test_worker_control_untouched_rollback.py
             run_contract python3 tests/test_vp_stage_overlay.py

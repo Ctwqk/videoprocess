@@ -17,7 +17,6 @@ VP_WORKER_ADMISSION_LOCK_ROOT=""
 VP_WORKER_ADMISSION_LOCK_OWNER_BASHPID=""
 VP_WORKER_ADMISSION_PROMOTION_IDENTITY=""
 VP_AUTOFLOW_CONTROL_IDENTITY=""
-VP_AUTOFLOW_RUNTIME_UPDATE_ARGS=""
 VP_WORKER_ADMISSION_LOCK_TOKEN=""
 VP_WORKER_ADMISSION_CURRENT_BASHPID=""
 VP_WORKER_ADMISSION_TRANSACTION_PREPARING=false
@@ -12157,45 +12156,19 @@ vp_autoflow_health_command() {
   printf '%s\n' 'python -c '\''import json,os,urllib.request; from app.services.worker_control_role_cli import role_names_for_generation; g=os.environ["WORKER_ORCHESTRATOR_CONTROL_GENERATION"]; d=json.load(urllib.request.urlopen("http://127.0.0.1:8080/health",timeout=2)); assert d["status"]=="ok" and d["registered_runtime"]=={"ready":True,"generation":g,"principal":role_names_for_generation(g).versioned["orchestrator"]}'\'''
 }
 
-vp_autoflow_runtime_update_args() {
-  local service_id="$1" image="$2" identity spec image_user health
-  VP_AUTOFLOW_RUNTIME_UPDATE_ARGS=""
-  vp_autoflow_control_identity "$service_id" "$image" || return 1
-  identity="$VP_AUTOFLOW_CONTROL_IDENTITY"
-  spec="$(vp_service_values "$service_id" '{{json .Spec.TaskTemplate.ContainerSpec}}')" || return 1
-  image_user="$(docker image inspect "$image" --format '{{.Config.User}}')" || return 1
-  health="$(vp_autoflow_health_command)" || return 1
-  VP_AUTOFLOW_RUNTIME_UPDATE_ARGS="$(python3 -I -c '
-import json,re,sys
-try:
-    name,identity,generation=sys.argv[1].split("|")
-    spec=json.load(sys.stdin)
-    user=spec.get("User") or sys.argv[2] or "0:0"
-    if user in {"0","root"}: user="0:0"
-    if not re.fullmatch(r"[0-9]+:[0-9]+", user): raise ValueError
-    uid,gid=user.split(":")
-    env=spec.get("Env") or []
-    keys=[item.split("=",1)[0] for item in env]
-    if len(keys)!=len(set(keys)): raise ValueError
-    secrets=spec.get("Secrets") or []
-    target="worker-orchestrator-database-url"
-    old=[s for s in secrets if s.get("File",{}).get("Name")==target]
-    if len(old)>1 or any(not s.get("SecretName","").startswith("vp-wc-orchestrator-") for s in old): raise ValueError
-    for secret in secrets:
-        if secret.get("SecretName","").startswith("vp-wc-orchestrator-") and secret not in old: raise ValueError
-    args=[]
-    for key,value in (("WORKER_ORCHESTRATOR_DATABASE_URL_FILE","/run/secrets/"+target),
-                      ("WORKER_ORCHESTRATOR_CONTROL_GENERATION",generation)):
-        if key in keys: args += ["--env-rm",key]
-        args += ["--env-add",key+"="+value]
-    for secret in old: args += ["--secret-rm",secret["SecretName"]]
-    args += ["--secret-add",f"source={identity},target={target},uid={uid},gid={gid},mode=0400",
-             "--health-cmd",sys.argv[3],"--health-interval","10s","--health-timeout","3s",
-             "--health-retries","6","--health-start-period","10s"]
-    print("\n".join(args))
-except (TypeError,ValueError,KeyError,AttributeError):
-    raise SystemExit(1)
-' "$identity" "$image_user" "$health" <<<"$spec")" || return 1
+vp_autoflow_update_runtime_service() {
+  local service_id="$1" image="$2" order="$3" health
+  vp_autoflow_control_identity "$service_id" "$image" \
+    || return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
+  health="$(vp_autoflow_health_command)" \
+    || return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
+  # Direct invocation retains the owning shell and the existing journal fence.
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" autoflow-update \
+    "$VP_WORKER_ADMISSION_LOCK_ROOT" "$VP_WORKER_ADMISSION_LOCK_FD" \
+    "$VP_WORKER_ADMISSION_CURRENT_BASHPID" "$VP_WORKER_ADMISSION_LOCK_TOKEN" \
+    "$VP_WORKER_ADMISSION_REPLAY_REVISION" "$service_id" "$image" "$order" \
+    "$VP_AUTOFLOW_CONTROL_IDENTITY" "$VP_RUNTIME_NODE" "$health" \
+    >/dev/null 2>/dev/null
 }
 
 vp_autoflow_tasks() {
@@ -12290,6 +12263,10 @@ vp_update_runtime_service() {
     echo "service identity changed before update: $service" >&2
     return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
   fi
+  if [[ "$service" == vp-autoflow-api-swarm ]]; then
+    vp_autoflow_update_runtime_service "$current_service_id" "$image" "$order"
+    return
+  fi
 
   local constraint
   local has_runtime=false
@@ -12327,16 +12304,6 @@ vp_update_runtime_service() {
   local service_args=()
   local worker_generation=""
   local worker_current_id=""
-  if [[ "$service" == "vp-autoflow-api-swarm" ]]; then
-    local autoflow_args autoflow_arg
-    # Journal validation must execute in the shell that owns the writer lock.
-    vp_autoflow_runtime_update_args "$current_service_id" "$image" \
-      || return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
-    autoflow_args="$VP_AUTOFLOW_RUNTIME_UPDATE_ARGS"
-    while IFS= read -r autoflow_arg; do
-      service_args+=("$autoflow_arg")
-    done <<<"$autoflow_args"
-  fi
   if [[ "$service" == "vp-api-swarm" ]]; then
     service_args+=(--no-healthcheck)
     local api_env_key
