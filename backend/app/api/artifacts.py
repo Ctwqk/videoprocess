@@ -7,7 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.downloads import build_download_response
 from app.db import get_db
 from app.models.asset import Asset
-from app.models.artifact import Artifact, ArtifactKind
+from app.models.artifact import (
+    Artifact,
+    ArtifactKind,
+    IntermediateArtifactCache,
+)
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.schemas.artifact import ArtifactResponse
 from app.storage.manager import get_storage
@@ -106,8 +110,22 @@ async def cleanup_intermediates(
             )
             .limit(1)
         )
+        cached_pointer = await db.execute(
+            select(IntermediateArtifactCache.id)
+            .where(
+                IntermediateArtifactCache.storage_backend
+                == artifact.storage_backend,
+                IntermediateArtifactCache.storage_path
+                == artifact.storage_path,
+            )
+            .limit(1)
+        )
 
-        if not shared_asset.scalar_one_or_none() and not shared_artifact.scalar_one_or_none():
+        if (
+            not shared_asset.scalar_one_or_none()
+            and not shared_artifact.scalar_one_or_none()
+            and not cached_pointer.scalar_one_or_none()
+        ):
             try:
                 await get_storage(artifact.storage_backend).delete(artifact.storage_path)
             except Exception as exc:

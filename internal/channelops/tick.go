@@ -6,6 +6,7 @@ import (
 )
 
 type TickCandidate struct {
+	owned                  *ownedCandidateAuthority
 	CandidateID            string
 	Source                 string
 	SourceKind             string
@@ -22,6 +23,7 @@ type TickCandidate struct {
 	ScoreJSON              map[string]any
 	GuardResultsJSON       []map[string]any
 	PDSDecisionJSON        map[string]any
+	PDSRequestJSON         map[string]any
 	LearningContextJSON    map[string]any
 	DiscoverySignal        *DiscoverySignalRow
 	Rejected               bool
@@ -51,6 +53,9 @@ func BuildTickCandidates(
 	laneFormats map[string][]LaneFormatRow,
 	bucket string,
 ) []TickCandidate {
+	if channel.OwnedSeedInventoryID != nil {
+		return []TickCandidate{}
+	}
 	candidates := []TickCandidate{}
 	activeLanes := enabledLanes(lanes)
 	activeAccounts := enabledAccounts(accounts)

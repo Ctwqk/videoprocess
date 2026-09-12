@@ -76,6 +76,11 @@ build_image_on_host() {
   printf 'build|remote|%s\n' "$*" >>"$TRACE"
 }
 
+remote_sh() {
+  command cat >/dev/null
+  printf 'build|remote|%s\n' "$*" >>"$TRACE"
+}
+
 source "$ROOT_DIR/deploy/swarm/deploy-sync-extension.sh"
 
 vp_build_manager_image() {

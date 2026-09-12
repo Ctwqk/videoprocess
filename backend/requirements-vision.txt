@@ -1,0 +1,4 @@
+# Vision worker only. Dockerfile.worker installs torch==2.8.0 separately from
+# https://download.pytorch.org/whl/cpu. No torchvision required.
+transformers==5.9.0
+Pillow==11.3.0

@@ -6,13 +6,31 @@ import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from asyncpg.exceptions import RaiseError
+from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
+from sqlalchemy.exc import DBAPIError
 
 from app.services.worker_admission import WorkerAdmissionError
+from app.services.worker_registration import WorkerLease, WorkerRegistrationError
 from worker import main as worker_main
+from worker.registration import PythonWorkerRegistration
+from worker.secret_config import (
+    load_worker_redis_url as load_real_worker_redis_url,
+)
+
+
+@pytest.fixture(autouse=True)
+def _worker_redis_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_redis_url",
+        lambda _env: "redis://vp-worker:test-secret@vp-redis:6379/0",
+    )
 
 
 def execution_claim(
@@ -24,6 +42,36 @@ def execution_claim(
         node_execution_id=node_execution_id,
         worker_id="test-worker@localhost:1",
         started_at=datetime(2026, 7, 22, 12, 0, 0),
+    )
+
+
+def registered_execution_claim(
+    job_id: uuid.UUID,
+    node_execution_id: uuid.UUID,
+) -> worker_main.NodeExecutionClaim:
+    return worker_main.NodeExecutionClaim(
+        job_id=job_id,
+        node_execution_id=node_execution_id,
+        worker_id="test-worker@localhost:1",
+        started_at=datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc),
+        worker_registration_id=uuid.uuid4(),
+        worker_lease_epoch=9,
+    )
+
+
+def worker_lease_for(claim: worker_main.NodeExecutionClaim) -> WorkerLease:
+    assert claim.worker_registration_id is not None
+    assert claim.worker_lease_epoch is not None
+    return WorkerLease(
+        registration_id=claim.worker_registration_id,
+        grant_id=uuid.uuid4(),
+        service_name="vp-ffmpeg-worker-gpu-swarm",
+        worker_instance_id=uuid.uuid4(),
+        worker_slot=1,
+        redis_consumer_id=claim.worker_id,
+        lease_epoch=claim.worker_lease_epoch,
+        lease_secret="lease-secret",
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=180),
     )
 
 
@@ -95,6 +143,1388 @@ async def test_worker_events_include_canonical_execution_claim(monkeypatch) -> N
         ),
     ]
     assert close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_claim_persists_worker_registration_id_and_epoch(monkeypatch) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    registration_id = uuid.uuid4()
+    node = SimpleNamespace(
+        id=node_execution_id,
+        status=worker_main.NodeStatus.QUEUED,
+        started_at=None,
+        worker_id=None,
+        worker_registration_id=None,
+        worker_lease_epoch=None,
+    )
+    lease = WorkerLease(
+        registration_id=registration_id,
+        grant_id=uuid.uuid4(),
+        service_name="vp-vision-worker-swarm",
+        worker_instance_id=uuid.uuid4(),
+        worker_slot=1,
+        redis_consumer_id="vision-worker@127:1:instance",
+        lease_epoch=12,
+        lease_secret="lease-secret",
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=180),
+    )
+    dispatch_key = uuid.uuid4()
+    payload_sha256 = hashlib.sha256(b"canonical-task").hexdigest()
+    delivery = worker_main.WorkerTaskDelivery(
+        redis_stream="vp:tasks:vision",
+        consumer_group="vision-workers",
+        message_id="1710000000000-4",
+        payload_sha256=payload_sha256,
+        dispatch_key=dispatch_key,
+    )
+    attestation_id = uuid.uuid4()
+    claims: list[dict[str, object]] = []
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+        async def flush(self):
+            return None
+
+    async def lock_authority(_db, locked_job_id, *, node_execution_id):
+        assert locked_job_id == job_id
+        return SimpleNamespace(
+            job=SimpleNamespace(id=job_id, status=worker_main.JobStatus.RUNNING),
+            node=node,
+            channel=None,
+            task=None,
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=job_id),
+        )
+
+    claimed_at = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+
+    async def claim_registered(_db, **facts):
+        assert node.status == worker_main.NodeStatus.QUEUED
+        assert node.worker_registration_id is None
+        assert facts == {
+            "job_id": job_id,
+            "node_execution_id": node_execution_id,
+            "registration_id": registration_id,
+            "lease_epoch": 12,
+            "worker_id": lease.redis_consumer_id,
+            "redis_stream": delivery.redis_stream,
+            "consumer_group": delivery.consumer_group,
+            "message_id": delivery.message_id,
+            "payload_sha256": payload_sha256,
+            "dispatch_key": dispatch_key,
+        }
+        claims.append(facts)
+        return worker_main.NodeExecutionClaim(
+            job_id=job_id,
+            node_execution_id=node_execution_id,
+            worker_id=lease.redis_consumer_id,
+            started_at=claimed_at,
+            worker_registration_id=registration_id,
+            worker_lease_epoch=12,
+        ), attestation_id
+
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "claim_registered_worker_node",
+        claim_registered,
+        raising=False,
+    )
+
+    delivery_token = worker_main._current_task_delivery.set(delivery)
+    try:
+        claim = await worker_main._claim_node_execution(
+            str(job_id),
+            str(node_execution_id),
+            worker_lease=lease,
+            session_factory=lambda: Session(),
+        )
+    finally:
+        worker_main._current_task_delivery.reset(delivery_token)
+
+    assert claim is not None
+    assert claim.started_at == claimed_at
+    assert claim.worker_registration_id == registration_id
+    assert claim.worker_lease_epoch == 12
+    assert node.status == worker_main.NodeStatus.QUEUED
+    assert node.worker_registration_id is None
+    assert node.worker_lease_epoch is None
+    assert claims
+    assert delivery.attestation_id == attestation_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("adapted", [False, True])
+async def test_registered_claim_retries_only_before_execution_in_fresh_transactions(
+    monkeypatch, persistent, adapted,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    delivery = worker_main.WorkerTaskDelivery(
+        "vp:tasks:vision", "vision-workers", "123-1", "a" * 64, uuid.uuid4(),
+    )
+    attestation_id = uuid.uuid4()
+    sessions = []
+    attempts = []
+    active = False
+    sleeps = []
+
+    class Session:
+        @asynccontextmanager
+        async def begin(self):
+            nonlocal active
+            assert not active
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+    @asynccontextmanager
+    async def factory():
+        session = Session()
+        sessions.append(session)
+        yield session
+
+    async def claim_registered(db, **facts):
+        assert active
+        attempts.append((db, facts))
+        if persistent or len(attempts) < 3:
+            error = RaiseError("task_dispatch_mismatch")
+            if adapted:
+                wrapper = AsyncAdapt_asyncpg_dbapi.Error(str(error))
+                wrapper.__cause__ = error
+                raise DBAPIError(None, None, wrapper)
+            raise DBAPIError(None, None, error)
+        return claim, attestation_id
+
+    async def sleep(delay):
+        assert not active
+        assert delivery.attestation_id is None
+        sleeps.append(delay)
+
+    monkeypatch.setattr(worker_main, "claim_registered_worker_node", claim_registered)
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    token = worker_main._current_task_delivery.set(delivery)
+    try:
+        if persistent:
+            with pytest.raises(DBAPIError, match="task_dispatch_mismatch"):
+                await worker_main._claim_node_execution(
+                    str(claim.job_id), str(claim.node_execution_id),
+                    worker_lease=lease, session_factory=factory,
+                )
+            assert delivery.attestation_id is None
+            assert len(attempts) == 4
+        else:
+            result = await worker_main._claim_node_execution(
+                str(claim.job_id), str(claim.node_execution_id),
+                worker_lease=lease, session_factory=factory,
+            )
+            assert result == claim
+            assert delivery.attestation_id == attestation_id
+            assert len(attempts) == 3
+    finally:
+        worker_main._current_task_delivery.reset(token)
+
+    assert len({id(session) for session in sessions}) == len(attempts)
+    assert len(sleeps) == len(attempts) - 1
+    assert 0 < sum(sleeps) <= 2
+    for _, facts in attempts:
+        assert facts == {
+            "job_id": claim.job_id,
+            "node_execution_id": claim.node_execution_id,
+            "registration_id": lease.registration_id,
+            "lease_epoch": lease.lease_epoch,
+            "worker_id": lease.redis_consumer_id,
+            "redis_stream": "vp:tasks:vision",
+            "consumer_group": "vision-workers",
+            "message_id": "123-1",
+            "payload_sha256": "a" * 64,
+            "dispatch_key": delivery.dispatch_key,
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [
+    RaiseError("worker_registration_lost"),
+    RuntimeError("task_dispatch_mismatch"),
+])
+async def test_registered_claim_does_not_retry_other_database_failures(monkeypatch, error):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    attempts = []
+
+    class Session:
+        @asynccontextmanager
+        async def begin(self):
+            yield
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    async def claim_registered(db, **facts):
+        attempts.append(facts)
+        raise DBAPIError(None, None, error)
+
+    monkeypatch.setattr(worker_main, "claim_registered_worker_node", claim_registered)
+    token = worker_main._current_task_delivery.set(worker_main.WorkerTaskDelivery(
+        "vp:tasks:vision", "vision-workers", "123-1", "a" * 64, uuid.uuid4(),
+    ))
+    try:
+        with pytest.raises(DBAPIError):
+            await worker_main._claim_node_execution(
+                str(claim.job_id), str(claim.node_execution_id),
+                worker_lease=worker_lease_for(claim), session_factory=factory,
+            )
+    finally:
+        worker_main._current_task_delivery.reset(token)
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_registered_claim_backoff_cancellation_stops_retry(monkeypatch):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    waiting = asyncio.Event()
+    attempts = []
+
+    async def claim_once(*args, **kwargs):
+        attempts.append(args)
+        raise DBAPIError(None, None, RaiseError("task_dispatch_mismatch"))
+
+    async def sleep(delay):
+        waiting.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(worker_main, "_claim_node_execution_once", claim_once)
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    task = asyncio.create_task(worker_main._claim_node_execution(
+        str(claim.job_id), str(claim.node_execution_id),
+        worker_lease=worker_lease_for(claim),
+    ))
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_registered_claim_commit_failure_cannot_execute_or_ack(monkeypatch):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    attempts = []
+    handler_starts = []
+
+    class Session:
+        @asynccontextmanager
+        async def begin(self):
+            yield
+            raise DBAPIError(None, None, RuntimeError("commit connection lost"))
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    async def claim_registered(db, **facts):
+        attempts.append(facts)
+        return claim, uuid.uuid4()
+
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: factory)
+    monkeypatch.setattr(worker_main, "claim_registered_worker_node", claim_registered)
+    monkeypatch.setitem(worker_main.HANDLER_MAP, "must-not-execute", lambda: handler_starts.append(True))
+    # No handler or Redis methods exist: a failed commit must return before either.
+    await worker_main._process_message(object(), "123-1", {
+        "job_id": str(claim.job_id), "node_execution_id": str(claim.node_execution_id),
+        "dispatch_key": str(uuid.uuid4()), "node_type": "must-not-execute",
+        "node_id": "probe", "config": "{}", "input_artifacts": "{}",
+    }, worker_lease=worker_lease_for(claim))
+    assert len(attempts) == 1
+    assert handler_starts == []
+
+
+@pytest.mark.asyncio
+async def test_event_xadd_occurs_while_exact_claim_and_lease_transaction_are_held(
+    monkeypatch,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    claim = registered_execution_claim(job_id, node_execution_id)
+    transaction_active = False
+    lease_checked = False
+    events: list[dict] = []
+
+    class Transaction:
+        async def __aenter__(self):
+            nonlocal transaction_active
+            transaction_active = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            nonlocal transaction_active
+            transaction_active = False
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+    class Redis:
+        async def xadd(self, stream, payload):
+            assert transaction_active
+            assert lease_checked
+            events.append(dict(payload))
+
+        async def aclose(self):
+            return None
+
+    async def lock_authority(_db, locked_job_id, *, node_execution_id):
+        return SimpleNamespace(
+            job=SimpleNamespace(id=job_id, status=worker_main.JobStatus.RUNNING),
+            node=SimpleNamespace(
+                id=node_execution_id,
+                status=worker_main.NodeStatus.RUNNING,
+                worker_id=claim.worker_id,
+                started_at=claim.started_at,
+                worker_registration_id=claim.worker_registration_id,
+                worker_lease_epoch=claim.worker_lease_epoch,
+            ),
+            channel=None,
+            task=None,
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=job_id),
+        )
+
+    async def require_lease(_db, checked_claim):
+        nonlocal lease_checked
+        assert transaction_active
+        assert checked_claim == claim
+        lease_checked = True
+
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_lease",
+        require_lease,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_current_task_delivery",
+        SimpleNamespace(
+            get=lambda: worker_main.WorkerTaskDelivery(
+                redis_stream="vp:tasks:vision",
+                consumer_group="vision-workers",
+                message_id="1710000000000-4",
+                payload_sha256=hashlib.sha256(b"task").hexdigest(),
+                dispatch_key=uuid.uuid4(),
+            )
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(worker_main, "_redis", lambda: Redis())
+
+    await worker_main._report_success(
+        str(job_id),
+        str(node_execution_id),
+        str(uuid.uuid4()),
+        claim,
+    )
+
+    assert len(events) == 1
+    assert events[0]["worker_registration_id"] == str(
+        claim.worker_registration_id
+    )
+    assert events[0]["worker_lease_epoch"] == str(claim.worker_lease_epoch)
+    assert events[0]["task_stream"] == "vp:tasks:vision"
+    assert events[0]["task_group"] == "vision-workers"
+    assert events[0]["task_message_id"] == "1710000000000-4"
+    assert events[0]["task_payload_sha256"] == hashlib.sha256(
+        b"task"
+    ).hexdigest()
+    assert uuid.UUID(events[0]["task_dispatch_key"])
+
+
+@pytest.mark.asyncio
+async def test_final_xack_uses_exact_claim_fence(monkeypatch) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    acknowledgements: list[tuple[object, str, object]] = []
+
+    class Redis:
+        async def xack(self, *args):
+            raise AssertionError("raw XACK must not bypass the database fence")
+
+    async def process(_data, *, worker_lease=None):
+        return claim
+
+    async def heartbeat(_redis, _message_id):
+        await asyncio.Event().wait()
+
+    async def ack(redis, message_id, handled_claim):
+        acknowledgements.append((redis, message_id, handled_claim))
+
+    monkeypatch.setattr(worker_main, "process_task", process)
+    monkeypatch.setattr(worker_main, "_heartbeat_message", heartbeat)
+    monkeypatch.setattr(
+        worker_main,
+        "_ack_message_for_claim",
+        ack,
+        raising=False,
+    )
+
+    redis = Redis()
+    await worker_main._process_message(
+        redis,
+        "1-0",
+        {
+            "job_id": str(claim.job_id),
+            "node_execution_id": str(claim.node_execution_id),
+            "dispatch_key": str(uuid.uuid4()),
+        },
+        worker_lease=worker_lease_for(claim),
+    )
+
+    assert acknowledgements == [(redis, "1-0", claim)]
+
+
+@pytest.mark.asyncio
+async def test_final_xack_accepts_exact_claim_after_orchestrator_finalizes_node(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease_checked = False
+    ack_authorized = False
+    ack_authority_checked = False
+    attestation_marked = False
+    acknowledgements: list[str] = []
+    delivery = worker_main.WorkerTaskDelivery(
+        redis_stream=worker_main.TASK_STREAM,
+        consumer_group=worker_main.CONSUMER_GROUP,
+        message_id="1-0",
+        payload_sha256="a" * 64,
+        dispatch_key=uuid.uuid4(),
+        attestation_id=uuid.uuid4(),
+    )
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+    class Redis:
+        async def xack(self, stream, group, message_id):
+            acknowledgements.append(message_id)
+            return 1
+
+    async def lock_authority(_db, job_id, *, node_execution_id):
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(state="CLOSED", guarded_job_id=None),
+            task=None,
+            job=SimpleNamespace(
+                id=claim.job_id,
+                status=worker_main.JobStatus.SUCCEEDED,
+            ),
+            node=SimpleNamespace(
+                id=claim.node_execution_id,
+                status=worker_main.NodeStatus.SUCCEEDED,
+                worker_id=claim.worker_id,
+                started_at=claim.started_at,
+                worker_registration_id=claim.worker_registration_id,
+                worker_lease_epoch=claim.worker_lease_epoch,
+            ),
+        )
+
+    async def require_lease(_db, checked_claim):
+        nonlocal lease_checked
+        assert checked_claim == claim
+        lease_checked = True
+
+    async def mark_ack(_db, checked_claim, **exact_delivery):
+        nonlocal attestation_marked
+        assert checked_claim == claim
+        assert exact_delivery["attestation_id"] == delivery.attestation_id
+        attestation_marked = True
+
+    async def authorize_ack(_db, checked_claim, *, attestation_id):
+        nonlocal ack_authorized
+        assert checked_claim == claim
+        assert attestation_id == delivery.attestation_id
+        ack_authorized = True
+
+    async def require_ack_authority(_db, checked_claim, **exact_delivery):
+        nonlocal ack_authority_checked
+        assert checked_claim == claim
+        assert ack_authorized
+        assert exact_delivery["dispatch_key"] == delivery.dispatch_key
+        ack_authority_checked = True
+
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_lease",
+        require_lease,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "acknowledge_worker_task_delivery",
+        mark_ack,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "authorize_worker_task_ack",
+        authorize_ack,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_task_ack_receipt",
+        require_ack_authority,
+        raising=False,
+    )
+
+    token = worker_main._current_task_delivery.set(delivery)
+    try:
+        await worker_main._ack_message_for_claim(Redis(), "1-0", claim)
+    finally:
+        worker_main._current_task_delivery.reset(token)
+
+    assert lease_checked
+    assert ack_authorized
+    assert ack_authority_checked
+    assert attestation_marked
+    assert acknowledgements == ["1-0"]
+
+
+@pytest.mark.asyncio
+async def test_final_xack_uses_exact_applied_receipt_after_lease_loss(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    receipt_checks: list[dict[str, str]] = []
+    marked: list[dict[str, object]] = []
+    acknowledgements: list[tuple[str, str, str]] = []
+    delivery = worker_main.WorkerTaskDelivery(
+        redis_stream=worker_main.TASK_STREAM,
+        consumer_group=worker_main.CONSUMER_GROUP,
+        message_id="1710000000000-4",
+        payload_sha256="b" * 64,
+        dispatch_key=uuid.uuid4(),
+        attestation_id=uuid.uuid4(),
+    )
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+    class Redis:
+        async def xack(self, stream, group, message_id):
+            acknowledgements.append((stream, group, message_id))
+            return 1
+
+    async def lock_authority(_db, _job_id, *, node_execution_id):
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(state="CLOSED", guarded_job_id=None),
+            task=None,
+            job=SimpleNamespace(
+                id=claim.job_id,
+                status=worker_main.JobStatus.SUCCEEDED,
+            ),
+            node=SimpleNamespace(
+                id=node_execution_id,
+                status=worker_main.NodeStatus.SUCCEEDED,
+                worker_id=claim.worker_id,
+                started_at=claim.started_at,
+                worker_registration_id=claim.worker_registration_id,
+                worker_lease_epoch=claim.worker_lease_epoch,
+            ),
+        )
+
+    async def reject_expired_lease(_db, _claim):
+        raise worker_main.JobExecutionAuthorityBlocked("lease expired")
+
+    async def require_receipt(_db, checked_claim, **delivery):
+        assert checked_claim == claim
+        receipt_checks.append(delivery)
+
+    async def mark_ack(_db, checked_claim, **exact_delivery):
+        assert checked_claim == claim
+        marked.append(exact_delivery)
+
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_lease",
+        reject_expired_lease,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_task_ack_receipt",
+        require_receipt,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "acknowledge_worker_task_delivery",
+        mark_ack,
+        raising=False,
+    )
+
+    token = worker_main._current_task_delivery.set(delivery)
+    try:
+        await worker_main._ack_message_for_claim(
+            Redis(),
+            "1710000000000-4",
+            claim,
+        )
+    finally:
+        worker_main._current_task_delivery.reset(token)
+
+    assert receipt_checks == [
+        {
+            "redis_stream": worker_main.TASK_STREAM,
+            "consumer_group": worker_main.CONSUMER_GROUP,
+            "message_id": "1710000000000-4",
+            "payload_sha256": delivery.payload_sha256,
+            "dispatch_key": delivery.dispatch_key,
+        }
+    ]
+    assert marked == [
+        {
+            "attestation_id": delivery.attestation_id,
+            "redis_stream": worker_main.TASK_STREAM,
+            "consumer_group": worker_main.CONSUMER_GROUP,
+            "message_id": "1710000000000-4",
+            "payload_sha256": delivery.payload_sha256,
+            "dispatch_key": delivery.dispatch_key,
+        }
+    ]
+    assert acknowledgements == [
+        (
+            worker_main.TASK_STREAM,
+            worker_main.CONSUMER_GROUP,
+            "1710000000000-4",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_final_xack_after_lease_loss_without_receipt_stays_pending(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    receipt_checks = 0
+    acknowledgements: list[str] = []
+    delivery = worker_main.WorkerTaskDelivery(
+        redis_stream=worker_main.TASK_STREAM,
+        consumer_group=worker_main.CONSUMER_GROUP,
+        message_id="1710000000000-4",
+        payload_sha256="c" * 64,
+        dispatch_key=uuid.uuid4(),
+        attestation_id=uuid.uuid4(),
+    )
+
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return Transaction()
+
+    class Redis:
+        async def xack(self, _stream, _group, message_id):
+            acknowledgements.append(message_id)
+
+    async def lock_authority(_db, _job_id, *, node_execution_id):
+        return SimpleNamespace(
+            node=SimpleNamespace(
+                id=node_execution_id,
+                worker_id=claim.worker_id,
+                started_at=claim.started_at,
+                worker_registration_id=claim.worker_registration_id,
+                worker_lease_epoch=claim.worker_lease_epoch,
+            ),
+            job=SimpleNamespace(id=claim.job_id),
+        )
+
+    async def reject_expired_lease(_db, _claim):
+        raise worker_main.JobExecutionAuthorityBlocked("lease expired")
+
+    async def reject_missing_receipt(_db, _claim, **_delivery):
+        nonlocal receipt_checks
+        receipt_checks += 1
+        raise worker_main.JobExecutionAuthorityBlocked("receipt missing")
+
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: lambda: Session())
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_lease",
+        reject_expired_lease,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_task_ack_receipt",
+        reject_missing_receipt,
+        raising=False,
+    )
+
+    token = worker_main._current_task_delivery.set(delivery)
+    try:
+        with pytest.raises(
+            worker_main.JobExecutionAuthorityBlocked,
+            match="receipt missing",
+        ):
+            await worker_main._ack_message_for_claim(
+                Redis(),
+                "1710000000000-4",
+                claim,
+            )
+    finally:
+        worker_main._current_task_delivery.reset(token)
+
+    assert receipt_checks == 1
+    assert acknowledgements == []
+
+
+@pytest.mark.asyncio
+async def test_registration_loss_cancels_consumer_and_propagates_stable_error() -> None:
+    consumer_cancelled = asyncio.Event()
+    loss = WorkerRegistrationError("lease_fenced")
+
+    class Registration:
+        def create_guarded_task(self, awaitable):
+            return asyncio.ensure_future(awaitable)
+
+        async def wait_lost(self):
+            await asyncio.sleep(0)
+            return loss
+
+    async def consume():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            consumer_cancelled.set()
+
+    with pytest.raises(WorkerRegistrationError) as exc:
+        await worker_main._run_until_registration_loss(
+            Registration(),
+            consume(),
+        )
+
+    assert exc.value.code == "lease_fenced"
+    assert consumer_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_registered_affinity_defer_leaves_exact_delivery_pending(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    redis_calls: list[str] = []
+
+    class Redis:
+        async def xadd(self, stream, payload):
+            redis_calls.append("xadd")
+
+        async def xack(self, stream, group, message_id):
+            redis_calls.append("xack")
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "127")
+    now = int(worker_main.time.time())
+    payload = {
+        "job_id": str(claim.job_id),
+        "node_execution_id": str(claim.node_execution_id),
+        "dispatch_key": str(uuid.uuid4()),
+        "preferred_hosts": json.dumps(["150"]),
+        "affinity_enqueued_at": str(now),
+        "affinity_bounces": "0",
+    }
+    original = dict(payload)
+    deferred = await worker_main._maybe_defer_for_affinity(
+        Redis(),
+        "1-0",
+        payload,
+        worker_lease=lease,
+    )
+
+    assert deferred is True
+    assert redis_calls == []
+    assert payload == original
+    assert worker_main._canonical_task_payload_sha256(payload) == (
+        worker_main._canonical_task_payload_sha256(original)
+    )
+
+    monkeypatch.setattr(
+        worker_main.time,
+        "time",
+        lambda: now + worker_main.AFFINITY_WAIT_SECONDS,
+    )
+    assert await worker_main._maybe_defer_for_affinity(
+        Redis(),
+        "1-0",
+        payload,
+        worker_lease=lease,
+    ) is False
+    assert redis_calls == []
+
+
+@pytest.mark.asyncio
+async def test_registered_dispatch_is_validated_before_affinity(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "127")
+
+    with pytest.raises(
+        worker_main.JobExecutionAuthorityBlocked,
+        match="dispatch key is invalid",
+    ):
+        await worker_main._process_message(
+            object(),
+            "1-0",
+            {
+                "job_id": str(claim.job_id),
+                "node_execution_id": str(claim.node_execution_id),
+                "dispatch_key": "not-a-uuid",
+                "preferred_hosts": json.dumps(["150"]),
+                "affinity_enqueued_at": str(int(worker_main.time.time())),
+            },
+            worker_lease=lease,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["self", "preferred", "acknowledged"])
+async def test_registered_affinity_expiry_resumes_only_its_original_pending_delivery(
+    monkeypatch, owner,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    now = 1800000000
+    payload = {
+        "dispatch_key": str(uuid.uuid4()),
+        "preferred_hosts": '["127"]',
+        "affinity_enqueued_at": str(now - 5),
+    }
+    processed = []
+    waited = []
+    refresher = object()
+
+    class Redis:
+        async def xpending_range(self, stream, group, start, end, count):
+            assert (start, end, count) == ("123-1", "123-1", 1)
+            if owner == "acknowledged":
+                return []
+            return [{
+                "message_id": b"123-1",
+                "consumer": (
+                    lease.redis_consumer_id.encode() if owner == "self"
+                    else b"preferred-worker"
+                ),
+                "time_since_delivered": 20000,
+                "times_delivered": 1,
+            }]
+
+    async def sleep(delay):
+        waited.append(delay)
+
+    async def process(data, *, worker_lease, lease_refresher):
+        assert worker_lease is lease
+        assert lease_refresher is refresher
+        delivery = worker_main._current_task_delivery.get()
+        processed.append((dict(data), delivery.message_id, delivery.payload_sha256))
+        return None
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "150")
+    monkeypatch.setattr(worker_main, "AFFINITY_WAIT_SECONDS", 20)
+    monkeypatch.setattr(worker_main.time, "time", lambda: now)
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    monkeypatch.setattr(worker_main, "process_task", process)
+    await worker_main._process_message(
+        Redis(), "123-1", payload, worker_lease=lease, lease_refresher=refresher,
+    )
+    assert waited == [15]
+    assert processed == ([(
+        payload, "123-1", hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest(),
+    )] if owner == "self" else [])
+
+
+@pytest.mark.asyncio
+async def test_registered_affinity_wait_is_cancelled_without_processing(monkeypatch):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    waiting = asyncio.Event()
+    processed = []
+
+    async def sleep(delay):
+        waiting.set()
+        await asyncio.Event().wait()
+
+    async def process(*args, **kwargs):
+        processed.append(args)
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "150")
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    monkeypatch.setattr(worker_main, "process_task", process)
+    task = asyncio.create_task(worker_main._process_message(
+        object(), "123-1", {
+            "dispatch_key": str(uuid.uuid4()), "preferred_hosts": '["127"]',
+            "affinity_enqueued_at": str(int(worker_main.time.time())),
+        }, worker_lease=worker_lease_for(claim),
+    ))
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=0.2)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert processed == []
+
+
+@pytest.mark.asyncio
+async def test_affinity_takeover_after_pending_snapshot_still_requires_durable_claim(monkeypatch):
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    owner = lease.redis_consumer_id
+    attempts = []
+    handler_starts = []
+
+    class Redis:
+        async def xpending_range(self, *args):
+            nonlocal owner
+            snapshot = [{"message_id": "123-1", "consumer": owner}]
+            owner = "preferred-worker"
+            return snapshot
+
+    class Session:
+        @asynccontextmanager
+        async def begin(self):
+            yield
+
+        async def rollback(self):
+            return None
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    async def claim_registered(db, **facts):
+        assert owner == "preferred-worker"
+        attempts.append(facts)
+        raise worker_main.JobExecutionAuthorityBlocked("node already claimed")
+
+    async def sleep(delay):
+        return None
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "150")
+    monkeypatch.setattr(worker_main, "get_worker_session", lambda: factory)
+    monkeypatch.setattr(worker_main, "claim_registered_worker_node", claim_registered)
+    monkeypatch.setattr(worker_main.asyncio, "sleep", sleep)
+    monkeypatch.setitem(worker_main.HANDLER_MAP, "must-not-execute", lambda: handler_starts.append(True))
+    await worker_main._process_message(Redis(), "123-1", {
+        "job_id": str(claim.job_id), "node_execution_id": str(claim.node_execution_id),
+        "dispatch_key": str(uuid.uuid4()), "node_type": "must-not-execute",
+        "node_id": "probe", "config": "{}", "input_artifacts": "{}",
+        "preferred_hosts": '["127"]',
+        "affinity_enqueued_at": str(int(worker_main.time.time())),
+    }, worker_lease=lease)
+    assert len(attempts) == 1
+    assert owner == "preferred-worker"
+    assert handler_starts == []
+
+
+@pytest.mark.asyncio
+async def test_preferred_registered_worker_reclaims_exact_pending_affinity_message(
+    monkeypatch,
+) -> None:
+    message_id = "1710000000000-31"
+    now = int(worker_main.time.time())
+    payload = {
+        "job_id": str(uuid.uuid4()),
+        "node_execution_id": str(uuid.uuid4()),
+        "node_id": "preferred-reclaim",
+        "node_type": "vision",
+        "config": "{}",
+        "input_artifacts": "{}",
+        "dispatch_key": str(uuid.uuid4()),
+        "preferred_hosts": json.dumps(["worker-127"]),
+        "affinity_enqueued_at": str(now),
+        "affinity_bounces": "0",
+    }
+    processed: list[tuple[str, dict]] = []
+
+    class Redis:
+        async def xpending_range(self, stream, group, start, end, count):
+            assert (stream, group, start, end, count) == (
+                worker_main.TASK_STREAM,
+                worker_main.CONSUMER_GROUP,
+                "-",
+                "+",
+                50,
+            )
+            return [
+                {
+                    "message_id": message_id,
+                    "consumer": "vision-worker@worker-150:other",
+                    "time_since_delivered": 1000,
+                    "times_delivered": 1,
+                }
+            ]
+
+        async def xrange(self, stream, min, max, count):
+            assert (stream, min, max, count) == (
+                worker_main.TASK_STREAM,
+                message_id,
+                message_id,
+                1,
+            )
+            return [(message_id, payload)]
+
+        async def xclaim(
+            self,
+            stream,
+            group,
+            consumer,
+            min_idle_time,
+            message_ids,
+        ):
+            assert (stream, group, consumer, message_ids) == (
+                worker_main.TASK_STREAM,
+                worker_main.CONSUMER_GROUP,
+                worker_main.WORKER_ID,
+                [message_id],
+            )
+            assert min_idle_time <= 1000
+            return [(message_id, payload)]
+
+    lease = SimpleNamespace()
+
+    async def process(redis, claimed_id, claimed_payload, *, worker_lease):
+        assert worker_lease is lease
+        processed.append((claimed_id, claimed_payload))
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "worker-127")
+    monkeypatch.setattr(worker_main, "_process_message", process)
+
+    await worker_main._reclaim_preferred_pending(
+        Redis(),
+        worker_lease=lease,
+    )
+
+    assert processed == [(message_id, payload)]
+
+
+@pytest.mark.asyncio
+async def test_preferred_reclaim_hands_message_to_consumer_scheduler(
+    monkeypatch,
+) -> None:
+    message_id = "1710000000000-33"
+    payload = {
+        "preferred_hosts": json.dumps(["worker-127"]),
+        "affinity_enqueued_at": str(int(worker_main.time.time())),
+    }
+    scheduled: list[tuple[str, dict]] = []
+
+    class Redis:
+        async def xpending_range(self, *args, **kwargs):
+            return [
+                {
+                    "message_id": message_id,
+                    "consumer": "vision-worker@worker-150:other",
+                    "time_since_delivered": 1000,
+                }
+            ]
+
+        async def xrange(self, *args, **kwargs):
+            return [(message_id, payload)]
+
+        async def xclaim(self, *args, **kwargs):
+            return [(message_id, payload)]
+
+    async def schedule(claimed_id, claimed_payload):
+        scheduled.append((claimed_id, claimed_payload))
+
+    async def reject_inline_processing(*args, **kwargs):
+        raise AssertionError(
+            "preferred reclaim must use the consumer scheduler"
+        )
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "worker-127")
+    monkeypatch.setattr(
+        worker_main,
+        "_process_message",
+        reject_inline_processing,
+    )
+
+    await worker_main._reclaim_preferred_pending(
+        Redis(),
+        worker_lease=SimpleNamespace(),
+        message_scheduler=schedule,
+    )
+
+    assert scheduled == [(message_id, payload)]
+
+
+@pytest.mark.asyncio
+async def test_nonpreferred_registered_worker_does_not_reclaim_affinity_message(
+    monkeypatch,
+) -> None:
+    message_id = "1710000000000-32"
+    payload = {
+        "preferred_hosts": json.dumps(["worker-127"]),
+        "affinity_enqueued_at": str(int(worker_main.time.time())),
+    }
+    claimed: list[str] = []
+
+    class Redis:
+        async def xpending_range(self, *args, **kwargs):
+            return [{"message_id": message_id, "time_since_delivered": 1000}]
+
+        async def xrange(self, *args, **kwargs):
+            return [(message_id, payload)]
+
+        async def xclaim(self, *args, **kwargs):
+            claimed.append(message_id)
+            return [(message_id, payload)]
+
+    async def reject_process(*args, **kwargs):
+        raise AssertionError("non-preferred worker must not process the message")
+
+    monkeypatch.setattr(worker_main, "WORKER_HOST", "worker-150")
+    monkeypatch.setattr(worker_main, "_process_message", reject_process)
+
+    await worker_main._reclaim_preferred_pending(
+        Redis(),
+        worker_lease=SimpleNamespace(),
+    )
+
+    assert claimed == []
+
+
+@pytest.mark.asyncio
+async def test_consumer_cancellation_cancels_inflight_messages_without_xack(
+    monkeypatch,
+) -> None:
+    claim = registered_execution_claim(uuid.uuid4(), uuid.uuid4())
+    lease = worker_lease_for(claim)
+    message_started = asyncio.Event()
+    message_cancelled = asyncio.Event()
+    reads = 0
+
+    class Registration:
+        def __init__(self, current_lease):
+            self.lease = current_lease
+            self.redis_consumer_id = current_lease.redis_consumer_id
+            self.redis_stream = "vp:tasks:admitted-vision"
+            self.redis_group = "admitted-vision-workers"
+            self.worker_host = "127"
+
+        def raise_if_lost(self) -> None:
+            return None
+
+        async def heartbeat_now(self, *, minimum_margin_seconds: float = 0):
+            return self.lease
+
+    class Redis:
+        async def xgroup_create(self, stream, group, *args, **kwargs):
+            assert stream == "vp:tasks:admitted-vision"
+            assert group == "admitted-vision-workers"
+            return None
+
+        async def xreadgroup(self, group, consumer, streams, **kwargs):
+            nonlocal reads
+            assert group == "admitted-vision-workers"
+            assert streams == {"vp:tasks:admitted-vision": ">"}
+            reads += 1
+            if reads == 1:
+                return [
+                    (
+                        worker_main.TASK_STREAM,
+                        [
+                            (
+                                "1-0",
+                                {
+                                    "job_id": str(claim.job_id),
+                                    "node_execution_id": str(
+                                        claim.node_execution_id
+                                    ),
+                                },
+                            )
+                        ],
+                    )
+                ]
+            await asyncio.Event().wait()
+
+        async def xack(self, *args):
+            raise AssertionError("lease-loss cancellation must leave the PEL pending")
+
+    async def process_message(*args, **kwargs):
+        message_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            message_cancelled.set()
+
+    async def no_reclaim(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(worker_main, "_process_message", process_message)
+    monkeypatch.setattr(worker_main, "_reclaim_pending", no_reclaim)
+
+    consumer = asyncio.create_task(
+        worker_main._consume_registered_worker(Redis(), Registration(lease))
+    )
+    await asyncio.wait_for(message_started.wait(), timeout=0.2)
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert message_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reclaim_stage", ["startup", "periodic"])
+async def test_registered_pending_reclaim_preserves_lease_refresher(
+    monkeypatch: pytest.MonkeyPatch,
+    reclaim_stage: str,
+) -> None:
+    lease = worker_lease_for(registered_execution_claim(uuid.uuid4(), uuid.uuid4()))
+    processed = asyncio.Event()
+    message_cancelled = asyncio.Event()
+    calls: list[dict] = []
+
+    class Registration:
+        redis_stream = "vp:tasks:youtube_publisher"
+        redis_group = "youtube_publisher-workers"
+        worker_host = "150-publisher"
+        redis_consumer_id = lease.redis_consumer_id
+
+        def __init__(self):
+            self.lease = lease
+
+        def raise_if_lost(self):
+            return None
+
+        async def heartbeat_now(self, *, minimum_margin_seconds=0):
+            assert minimum_margin_seconds == 150
+            return self.lease
+
+    class Redis:
+        reclaim_count = 0
+
+        async def xgroup_create(self, *_args, **_kwargs):
+            return None
+
+        async def xautoclaim(self, *_args, **_kwargs):
+            self.reclaim_count += 1
+            selected = 1 if reclaim_stage == "startup" else 2
+            entries = (
+                [("1-0", {"node_type": "youtube_upload"}), ("2-0", {"node_type": "youtube_upload"})]
+                if self.reclaim_count == selected else []
+            )
+            return ["0-0", entries, []]
+
+        async def xreadgroup(self, *_args, **_kwargs):
+            await asyncio.sleep(0)
+            return []
+
+    async def process_message(_redis, message_id, data, **kwargs):
+        calls.append({"message_id": message_id, "data": data, **kwargs})
+        processed.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            message_cancelled.set()
+
+    async def no_affinity_reclaim(*_args, **_kwargs):
+        return None
+
+    async def reconcile_forever(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(worker_main, "_process_message", process_message)
+    monkeypatch.setattr(worker_main, "_reclaim_preferred_pending", no_affinity_reclaim)
+    monkeypatch.setattr(worker_main, "_prepared_event_reconciler_loop", reconcile_forever)
+    monkeypatch.setattr(worker_main, "PEL_RECLAIM_INTERVAL", -1)
+    monkeypatch.setenv("WORKER_CONCURRENCY", "1")
+    registration = Registration()
+    consumer = asyncio.create_task(worker_main._consume_registered_worker(Redis(), registration))
+    try:
+        await asyncio.wait_for(processed.wait(), timeout=1)
+    finally:
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+
+    assert len(calls) == 1
+    assert message_cancelled.is_set()
+    assert calls[0]["worker_lease"] is lease
+    assert calls[0].get("lease_refresher") == registration.heartbeat_now
+    assert await calls[0]["lease_refresher"](minimum_margin_seconds=150) is lease
 
 
 @pytest.mark.asyncio
@@ -399,6 +1829,7 @@ async def test_process_task_cancels_cross_node_download_after_closing_database_s
     job_id = uuid.uuid4()
     node_execution_id = uuid.uuid4()
     input_artifact_id = uuid.uuid4()
+    claim = execution_claim(job_id, node_execution_id)
     missing_local_path = tmp_path / "gpu-scratch" / "assets" / "input.mp4"
     download_started = asyncio.Event()
     session_active = False
@@ -476,7 +1907,7 @@ async def test_process_task_cancels_cross_node_download_after_closing_database_s
         return FakeSession()
 
     async def claim_node(*args, **kwargs):
-        return execution_claim(job_id, node_execution_id)
+        return claim
 
     async def load_cancel_state(_node_execution_id: str):
         await download_started.wait()
@@ -504,7 +1935,7 @@ async def test_process_task_cancels_cross_node_download_after_closing_database_s
     monkeypatch.setattr(worker_main.httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setattr(worker_main.settings, "storage_local_root", str(tmp_path / "storage"))
 
-    await asyncio.wait_for(
+    returned_claim = await asyncio.wait_for(
         worker_main.process_task(
             {
                 "job_id": str(job_id),
@@ -519,6 +1950,7 @@ async def test_process_task_cancels_cross_node_download_after_closing_database_s
     )
 
     assert session_state_during_stream == [False]
+    assert returned_claim == claim
     assert handler_calls == ["cancel"]
     assert succeeded == []
     assert failed == []
@@ -749,6 +2181,208 @@ async def test_failure_claim_database_error_propagates_without_event(
 
 
 @pytest.mark.asyncio
+async def test_remote_artifact_save_and_pointer_flush_share_worker_lease_transaction(
+    monkeypatch,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    claim = registered_execution_claim(job_id, node_execution_id)
+    transaction_active = False
+    calls: list[str] = []
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            nonlocal transaction_active
+            transaction_active = True
+            calls.append("begin")
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            nonlocal transaction_active
+            calls.append("end")
+            transaction_active = False
+            return False
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return FakeTransaction()
+
+        def add(self, _item) -> None:
+            assert transaction_active
+            calls.append("add")
+
+        async def flush(self) -> None:
+            assert transaction_active
+            calls.append("flush")
+
+    async def lock_authority(_db, locked_job_id, *, node_execution_id):
+        calls.append("lock")
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=job_id),
+            task=None,
+            job=SimpleNamespace(
+                id=locked_job_id,
+                status=worker_main.JobStatus.RUNNING,
+            ),
+            node=SimpleNamespace(
+                id=node_execution_id,
+                status=worker_main.NodeStatus.RUNNING,
+                worker_id=claim.worker_id,
+                started_at=claim.started_at,
+                worker_registration_id=claim.worker_registration_id,
+                worker_lease_epoch=claim.worker_lease_epoch,
+            ),
+        )
+
+    async def require_lease(_db, checked_claim) -> None:
+        assert transaction_active
+        assert checked_claim == claim
+        calls.append("lease")
+
+    async def save_remote_object() -> None:
+        assert transaction_active
+        assert calls[-1] == "lease"
+        calls.append("save")
+
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_lease",
+        require_lease,
+    )
+
+    await worker_main._persist_artifact_for_current_claim(
+        claim,
+        filename="output.mp4",
+        mime_type="video/mp4",
+        file_size=42,
+        storage_backend="minio",
+        storage_path="artifacts/output.mp4",
+        media_info={},
+        before_persist=save_remote_object,
+        session_factory=lambda: FakeSession(),
+    )
+
+    assert calls == [
+        "begin",
+        "lock",
+        "lease",
+        "save",
+        "lease",
+        "add",
+        "flush",
+        "end",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lease_expiry_during_remote_save_rolls_back_before_pointer_insert(
+    monkeypatch,
+) -> None:
+    job_id = uuid.uuid4()
+    node_execution_id = uuid.uuid4()
+    claim = registered_execution_claim(job_id, node_execution_id)
+    calls: list[str] = []
+    lease_checks = 0
+
+    class FakeTransaction:
+        async def __aenter__(self):
+            calls.append("begin")
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            calls.append("rollback" if exc_type is not None else "commit")
+            return False
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def begin(self):
+            return FakeTransaction()
+
+        def add(self, _item) -> None:
+            calls.append("add")
+
+        async def flush(self) -> None:
+            calls.append("flush")
+
+    async def lock_authority(_db, locked_job_id, *, node_execution_id):
+        calls.append("lock")
+        return SimpleNamespace(
+            channel=None,
+            schedule=SimpleNamespace(state="OPEN", guarded_job_id=job_id),
+            task=None,
+            job=SimpleNamespace(
+                id=locked_job_id,
+                status=worker_main.JobStatus.RUNNING,
+            ),
+            node=SimpleNamespace(
+                id=node_execution_id,
+                status=worker_main.NodeStatus.RUNNING,
+                worker_id=claim.worker_id,
+                started_at=claim.started_at,
+                worker_registration_id=claim.worker_registration_id,
+                worker_lease_epoch=claim.worker_lease_epoch,
+            ),
+        )
+
+    async def require_lease(_db, _claim) -> None:
+        nonlocal lease_checks
+        lease_checks += 1
+        calls.append(f"lease-{lease_checks}")
+        if lease_checks == 2:
+            raise worker_main.JobExecutionAuthorityBlocked(
+                "worker registration lease expired during save"
+            )
+
+    async def save_remote_object() -> None:
+        calls.append("save")
+
+    monkeypatch.setattr(worker_main, "lock_job_execution_authority", lock_authority)
+    monkeypatch.setattr(
+        worker_main,
+        "require_worker_registration_lease",
+        require_lease,
+    )
+
+    with pytest.raises(
+        worker_main.JobExecutionAuthorityBlocked,
+        match="expired during save",
+    ):
+        await worker_main._persist_artifact_for_current_claim(
+            claim,
+            filename="output.mp4",
+            mime_type="video/mp4",
+            file_size=42,
+            storage_backend="minio",
+            storage_path="artifacts/output.mp4",
+            media_info={},
+            before_persist=save_remote_object,
+            session_factory=lambda: FakeSession(),
+        )
+
+    assert calls == [
+        "begin",
+        "lock",
+        "lease-1",
+        "save",
+        "lease-2",
+        "rollback",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_artifact_persistence_rejects_replaced_execution_claim(
     monkeypatch,
 ) -> None:
@@ -818,7 +2452,7 @@ async def test_artifact_persistence_rejects_replaced_execution_claim(
 
 
 @pytest.mark.asyncio
-async def test_stale_artifact_persistence_cleans_generation_outputs(
+async def test_lease_expiry_after_remote_save_cleans_generation_output(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -865,6 +2499,7 @@ async def test_stale_artifact_persistence_cleans_generation_outputs(
         )
 
     async def reject_artifact(_claim, **kwargs) -> str:
+        await kwargs["before_persist"]()
         raise worker_main.JobExecutionAuthorityBlocked(
             "node execution claim changed"
         )
@@ -910,12 +2545,40 @@ async def test_stale_artifact_persistence_cleans_generation_outputs(
     )
 
     expected_storage_path = (
-        f"artifacts/{job_id}/{Path(output_paths[0]).name}"
+        f"staging/artifacts/{job_id}/{Path(output_paths[0]).name}"
     )
     assert saved == [(expected_storage_path, b"generation output")]
     assert deleted == [expected_storage_path]
     assert not Path(output_paths[0]).exists()
     assert handler_calls == ["execute", "cancel"]
+
+
+@pytest.mark.asyncio
+async def test_uncommitted_remote_output_cleanup_is_bounded(
+    monkeypatch,
+) -> None:
+    delete_started = asyncio.Event()
+
+    class HangingStorage:
+        async def delete(self, _path: str) -> None:
+            delete_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        worker_main,
+        "REMOTE_ARTIFACT_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    await asyncio.wait_for(
+        worker_main._cleanup_uncommitted_remote_output(
+            HangingStorage(),
+            "artifacts/uncommitted.mp4",
+        ),
+        timeout=0.1,
+    )
+
+    assert delete_started.is_set()
 
 
 @pytest.mark.asyncio
@@ -1120,22 +2783,601 @@ async def test_completed_artifact_download_is_removed_when_cancel_wins_race(
 
 
 @pytest.mark.asyncio
+async def test_main_restores_process_globals_for_repeated_in_process_runs(
+    monkeypatch,
+) -> None:
+    original_worker_id = "ffmpeg-worker@original:1"
+    disposed: list[str] = []
+
+    class StopRun(RuntimeError):
+        pass
+
+    class Engine:
+        async def dispose(self):
+            disposed.append("engine")
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@127:2:registered"
+
+        def raise_if_lost(self) -> None:
+            return None
+
+        async def close(self):
+            return None
+
+    class Redis:
+        async def aclose(self):
+            return None
+
+    def configure(_database_url):
+        worker_main.engine_db = Engine()
+        worker_main.worker_session = object()
+
+    async def start_registration(*_args):
+        return Registration()
+
+    async def stop_run(_registration, _consumer):
+        if hasattr(_consumer, "close"):
+            _consumer.close()
+        raise StopRun
+
+    async def consume(_redis, _registration):
+        return None
+
+    monkeypatch.setattr(worker_main, "WORKER_ID", original_worker_id)
+    monkeypatch.setattr(worker_main, "engine_db", None)
+    monkeypatch.setattr(worker_main, "worker_session", None)
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda _env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
+    )
+    monkeypatch.setattr(worker_main, "configure_worker_database", configure)
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env, **_kwargs: "token",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        start_registration,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lambda: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_identity",
+        lambda _redis, _registration: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(worker_main, "_redis", Redis)
+    monkeypatch.setattr(worker_main, "_consume_registered_worker", consume)
+    monkeypatch.setattr(
+        worker_main,
+        "_run_until_registration_loss",
+        stop_run,
+    )
+
+    with pytest.raises(StopRun):
+        await worker_main.main()
+
+    assert worker_main.WORKER_ID == original_worker_id
+    assert worker_main.engine_db is None
+    assert worker_main.worker_session is None
+    assert disposed == ["engine"]
+
+
+@pytest.mark.asyncio
+async def test_registered_worker_requires_continuity_and_acl_identity_before_group(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    close_reasons: list[str] = []
+
+    class StopStartup(RuntimeError):
+        pass
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@150-gpu:1:registered"
+        redis_stream = "vp:tasks:ffmpeg"
+        redis_group = "ffmpeg-workers"
+        worker_host = "150-gpu"
+        lease = SimpleNamespace()
+
+        def raise_if_lost(self) -> None:
+            return None
+
+        def create_guarded_task(self, awaitable):
+            return asyncio.create_task(awaitable)
+
+        async def close(self, *, reason: str = "shutdown"):
+            close_reasons.append(reason)
+
+    class Redis:
+        connection_pool = SimpleNamespace(
+            connection_kwargs={"username": "vp-worker-ffmpeg"}
+        )
+
+        async def acl_whoami(self):
+            calls.append("redis_whoami")
+            return "vp-worker-ffmpeg"
+
+        async def xgroup_create(self, *_args, **_kwargs):
+            calls.append("redis_group_create")
+            raise StopStartup
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda _env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: calls.append("database_open"),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env, **_kwargs: "token",
+    )
+
+    async def register(*_args):
+        calls.append("registration_complete")
+        return Registration()
+
+    async def require_continuity():
+        calls.append("continuity_ready")
+
+    def construct_redis():
+        calls.append("redis_constructed")
+        return Redis()
+
+    async def run_consumer(_registration, consumer):
+        await consumer
+
+    async def no_reclaim(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(worker_main, "_start_worker_registration", register)
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        require_continuity,
+        raising=False,
+    )
+    monkeypatch.setattr(worker_main, "_redis", construct_redis)
+    monkeypatch.setattr(
+        worker_main,
+        "_run_until_registration_loss",
+        run_consumer,
+    )
+    monkeypatch.setattr(worker_main, "_reclaim_pending", no_reclaim)
+
+    with pytest.raises(StopStartup):
+        await worker_main.main()
+
+    assert calls == [
+        "database_open",
+        "registration_complete",
+        "continuity_ready",
+        "redis_constructed",
+        "redis_whoami",
+        "redis_group_create",
+    ]
+    assert close_reasons == ["shutdown"]
+
+
+@pytest.mark.asyncio
+async def test_registration_lost_during_continuity_performs_zero_redis_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_commands: list[str] = []
+    registration_loss = WorkerRegistrationError("lease_fenced")
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@150-gpu:1:registered"
+        redis_stream = "vp:tasks:ffmpeg"
+        redis_group = "ffmpeg-workers"
+        worker_host = "150-gpu"
+        lease = SimpleNamespace()
+
+        def __init__(self) -> None:
+            self.lost = False
+
+        def raise_if_lost(self) -> None:
+            if self.lost:
+                raise registration_loss
+
+        async def wait_lost(self) -> WorkerRegistrationError:
+            return registration_loss
+
+        async def close(self, *, reason: str = "shutdown") -> None:
+            return None
+
+    class Redis:
+        connection_pool = SimpleNamespace(
+            connection_kwargs={"username": "vp-worker-ffmpeg"}
+        )
+
+        async def acl_whoami(self) -> str:
+            redis_commands.append("acl_whoami")
+            return "vp-worker-ffmpeg"
+
+        async def aclose(self) -> None:
+            return None
+
+    registration = Registration()
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda _env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env, **_kwargs: "token",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        lambda *_args: asyncio.sleep(0, result=registration),
+    )
+
+    async def lose_during_continuity() -> None:
+        registration.lost = True
+
+    async def consume(*_args) -> None:
+        redis_commands.append("consumer")
+
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lose_during_continuity,
+    )
+    monkeypatch.setattr(worker_main, "_redis", Redis)
+    monkeypatch.setattr(
+        worker_main,
+        "_consume_registered_worker",
+        consume,
+    )
+
+    with pytest.raises(WorkerRegistrationError, match="lease_fenced"):
+        await worker_main.main()
+
+    assert redis_commands == []
+
+
+@pytest.mark.asyncio
+async def test_registration_loss_cancels_acl_handshake_before_command_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis_commands: list[str] = []
+    send_boundary = asyncio.Event()
+    allow_send = asyncio.Event()
+    registration_loss = WorkerRegistrationError("lease_fenced")
+    registration = PythonWorkerRegistration(
+        object(),
+        SimpleNamespace(),
+        "admission-token",
+    )
+    registration._lease = SimpleNamespace(  # noqa: SLF001
+        redis_consumer_id="ffmpeg-worker@150-gpu:1:registered"
+    )
+
+    class Redis:
+        connection_pool = SimpleNamespace(
+            connection_kwargs={"username": "vp-worker-ffmpeg"}
+        )
+
+        async def acl_whoami(self) -> str:
+            send_boundary.set()
+            await allow_send.wait()
+            redis_commands.append("acl_whoami")
+            return "vp-worker-ffmpeg"
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda _env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env, **_kwargs: "token",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        lambda *_args: asyncio.sleep(0, result=registration),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lambda: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(worker_main, "_redis", Redis)
+
+    run = asyncio.create_task(worker_main.main())
+    await asyncio.wait_for(send_boundary.wait(), timeout=1)
+    registration._mark_lost(registration_loss)  # noqa: SLF001
+    allow_send.set()
+
+    with pytest.raises(WorkerRegistrationError, match="lease_fenced"):
+        await asyncio.wait_for(run, timeout=1)
+    assert redis_commands == []
+
+
+@pytest.mark.asyncio
+async def test_worker_continuity_gate_calls_database_function_with_90_seconds(
+    monkeypatch,
+) -> None:
+    statements: list[tuple[str, dict[str, int]]] = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def execute(self, statement, parameters):
+            statements.append((str(statement), dict(parameters)))
+
+    monkeypatch.setattr(
+        worker_main,
+        "get_worker_session",
+        lambda: lambda: Session(),
+    )
+
+    await worker_main._require_worker_redis_continuity()
+
+    assert len(statements) == 1
+    assert "public.vp_require_worker_redis_continuity" in statements[0][0]
+    assert statements[0][1] == {"max_age_seconds": 90}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "database_reason",
+    [
+        "worker_redis_continuity_missing",
+        "worker_redis_continuity_stale",
+        "worker_redis_continuity_error",
+        "worker_redis_continuity_running",
+    ],
+)
+async def test_unready_continuity_revokes_registration_before_any_redis(
+    monkeypatch,
+    caplog,
+    database_reason: str,
+) -> None:
+    redis_constructions = 0
+    close_reasons: list[str] = []
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@150-gpu:1:registered"
+
+        def __init__(self):
+            self.closed = False
+
+        async def close(self, *, reason: str = "shutdown"):
+            if self.closed:
+                return
+            self.closed = True
+            close_reasons.append(reason)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def execute(self, _statement, _parameters):
+            raise RuntimeError(f"{database_reason}: sensitive database detail")
+
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda _env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env, **_kwargs: "postgresql+asyncpg://worker@db/vp",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env, **_kwargs: "token",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        lambda *_args: asyncio.sleep(0, result=Registration()),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "get_worker_session",
+        lambda: lambda: Session(),
+    )
+
+    def construct_redis():
+        nonlocal redis_constructions
+        redis_constructions += 1
+        raise AssertionError("unready continuity constructed Redis")
+
+    monkeypatch.setattr(worker_main, "_redis", construct_redis)
+
+    with pytest.raises(SystemExit) as exc:
+        await worker_main.main()
+
+    assert exc.value.code == 2
+    assert redis_constructions == 0
+    assert close_reasons == ["worker_redis_continuity_unready"]
+    assert caplog.text.count("worker_redis_continuity_unready") == 1
+    assert database_reason not in caplog.text
+    assert "sensitive database detail" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> None:
     events: list[str] = []
+    monkeypatch.setenv("STORAGE_BACKEND", "minio")
 
     class StopStartup(RuntimeError):
         pass
 
     monkeypatch.setattr(
         worker_main,
+        "load_worker_minio_credentials",
+        lambda env, **_kwargs: events.append("minio-secrets")
+        or ("worker-minio-access", "worker-minio-secret"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
         "enforce_worker_admission_from_env",
-        lambda: events.append("admission"),
+        lambda env=None, **_kwargs: events.append("admission"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda env, **_kwargs: events.append("database-secret")
+        or "postgresql+asyncpg://worker@db/vp",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_redis_url",
+        lambda env: events.append("redis-secret")
+        or "redis://vp-worker:test-secret@vp-redis:6379/0",
         raising=False,
     )
     monkeypatch.setattr(
         worker_main,
         "configure_worker_database",
-        lambda: events.append("database"),
+        lambda database_url=None: events.append("database"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda env, **_kwargs: events.append("token-secret") or "token",
+        raising=False,
+    )
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@127:1:instance"
+
+        def raise_if_lost(self) -> None:
+            return None
+
+        async def close(self):
+            events.append("revoke")
+
+    async def register(env, database_url, redis_url, admission_token):
+        assert "REDIS_URL" not in env
+        assert redis_url == "redis://vp-worker:test-secret@vp-redis:6379/0"
+        events.append("registration")
+        return Registration()
+
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        register,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lambda: asyncio.sleep(0, result=events.append("continuity")),
         raising=False,
     )
 
@@ -1148,7 +3390,229 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
     with pytest.raises(StopStartup):
         await worker_main.main()
 
-    assert events == ["admission", "database", "redis"]
+    assert events == [
+        "redis-secret",
+        "admission",
+        "minio-secrets",
+        "database-secret",
+        "database",
+        "token-secret",
+        "registration",
+        "continuity",
+        "redis",
+        "revoke",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_file_backed_remote_redis_reclassifies_before_database_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    redis_secret = tmp_path / "redis-url"
+    redis_secret.write_text(
+        "redis://vp-worker:redis-secret@vp-redis:6379/7",
+        encoding="utf-8",
+    )
+    redis_secret.chmod(0o400)
+    env = {
+        "DEPLOY_MODE": "development",
+        "WORKER_REDIS_URL_FILE": str(redis_secret),
+        "DATABASE_URL": (
+            "postgresql+asyncpg://runtime:environment-secret@"
+            "vp-postgres/videoprocess"
+        ),
+        "WORKER_ADMISSION_TOKEN": "environment-admission-token",
+        "MINIO_ACCESS_KEY": "environment-minio-access",
+        "MINIO_SECRET_KEY": "environment-minio-secret",
+        "WORKER_TYPE": "ffmpeg",
+        "WORKER_HOST": "150-gpu",
+        "STORAGE_BACKEND": "minio",
+        "MINIO_ENDPOINT": "vp-minio:9000",
+        "MINIO_BUCKET": "videoprocess",
+    }
+    touched: list[str] = []
+
+    class DatabaseReached(RuntimeError):
+        pass
+
+    def configure_database(_database_url: str) -> None:
+        touched.append("database")
+        raise DatabaseReached
+
+    monkeypatch.setattr(worker_main.os, "environ", env)
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_redis_url",
+        load_real_worker_redis_url,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        configure_database,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_redis",
+        lambda: touched.append("redis"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        await worker_main.main()
+
+    assert exc.value.code == 2
+    assert touched == []
+
+
+@pytest.mark.asyncio
+async def test_local_storage_development_does_not_load_minio_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StopAtRedis(RuntimeError):
+        pass
+
+    class Registration:
+        redis_consumer_id = "ffmpeg-worker@localhost:1:registered"
+
+        def raise_if_lost(self) -> None:
+            return None
+
+        async def close(self, *, reason: str = "shutdown") -> None:
+            return None
+
+    minio_loads = 0
+
+    def load_minio(*_args, **_kwargs):
+        nonlocal minio_loads
+        minio_loads += 1
+        raise AssertionError("local storage must not load MinIO credentials")
+
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_redis_url",
+        lambda _env: "redis://127.0.0.1:6379/14",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda _env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        load_minio,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda _env, **_kwargs: "sqlite+aiosqlite:///worker.db",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda _database_url: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda _env, **_kwargs: "development-token",
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        lambda *_args: asyncio.sleep(0, result=Registration()),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_require_worker_redis_continuity",
+        lambda: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_redis",
+        lambda: (_ for _ in ()).throw(StopAtRedis),
+    )
+    monkeypatch.setattr(
+        worker_main.os,
+        "environ",
+        {
+            "DEPLOY_MODE": "development",
+            "STORAGE_BACKEND": "local",
+        },
+    )
+
+    with pytest.raises(StopAtRedis):
+        await worker_main.main()
+
+    assert minio_loads == 0
+
+
+@pytest.mark.asyncio
+async def test_denied_durable_registration_performs_zero_redis_calls(
+    monkeypatch,
+    caplog,
+) -> None:
+    touched: list[str] = []
+    credential = "postgresql+asyncpg://runtime:never-log-me@vp-postgres/vp"
+
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_minio_credentials",
+        lambda _env, **_kwargs: (
+            "worker-minio-access",
+            "worker-minio-secret",
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "enforce_worker_admission_from_env",
+        lambda env=None, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_database_url",
+        lambda env, **_kwargs: credential,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "configure_worker_database",
+        lambda database_url=None: touched.append("database"),
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_worker_admission_token",
+        lambda env, **_kwargs: "admission-token",
+        raising=False,
+    )
+
+    async def deny_registration(
+        env,
+        database_url,
+        redis_url,
+        admission_token,
+    ):
+        raise worker_main.WorkerRegistrationError("token_invalid")
+
+    monkeypatch.setattr(
+        worker_main,
+        "_start_worker_registration",
+        deny_registration,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "_redis",
+        lambda: touched.append("redis"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        await worker_main.main()
+
+    assert exc.value.code == 2
+    assert touched == ["database"]
+    assert credential not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1246,7 +3710,7 @@ async def test_handler_constructor_failure_reports_for_exact_claim(monkeypatch) 
 async def test_denied_worker_stops_before_database_or_redis(monkeypatch) -> None:
     touched: list[str] = []
 
-    def deny_worker() -> None:
+    def deny_worker(*_args, **_kwargs) -> None:
         raise WorkerAdmissionError("unsafe worker configuration")
 
     monkeypatch.setattr(
@@ -1281,11 +3745,13 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
     input_path = tmp_path / "input.mp4"
     input_path.write_bytes(b"input")
     created: list[tuple[str, object | None]] = []
+    lease_refreshers: list[object | None] = []
     executed_configs: list[dict] = []
 
     class YouTubeHandler:
-        def __init__(self, *, session_factory):
+        def __init__(self, *, session_factory, lease_refresher=None):
             created.append(("youtube", session_factory))
+            lease_refreshers.append(lease_refresher)
 
         async def execute(self, config, input_paths, output_path):
             executed_configs.append(dict(config))
@@ -1360,8 +3826,13 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
     async def report_success(*args) -> None:
         return None
 
+    claim = registered_execution_claim(job_id, node_execution_id)
+
     async def claim_node(*args, **kwargs):
-        return execution_claim(job_id, node_execution_id)
+        return claim
+
+    async def refresh_worker_lease(*, minimum_margin_seconds: float):
+        return None
 
     async def require_current_claim(_claim) -> None:
         return None
@@ -1401,21 +3872,30 @@ async def test_process_task_injects_youtube_context_without_changing_other_handl
         "config": json.dumps({"title": "Canary"}),
         "input_artifacts": json.dumps({"input": str(input_artifact_id)}),
     }
-    await worker_main.process_task(data)
+    await worker_main.process_task(
+        data,
+        worker_lease=worker_lease_for(claim),
+        lease_refresher=refresh_worker_lease,
+    )
 
     await worker_main.process_task({**data, "node_id": "source_1", "node_type": "source"})
 
     assert created == [("youtube", process_session_factory), ("other", None)]
+    assert lease_refreshers == [refresh_worker_lease]
     assert executed_configs == [
         {
             "title": "Canary",
             "_job_id": str(job_id),
             "_node_execution_id": str(node_execution_id),
             "_input_artifact_ids": {"input": str(input_artifact_id)},
-            "_execution_claim": {
-                "worker_id": "test-worker@localhost:1",
-                "started_at": "2026-07-22T12:00:00+00:00",
-            },
+                "_execution_claim": {
+                    "worker_id": "test-worker@localhost:1",
+                    "started_at": "2026-07-22T12:00:00+00:00",
+                    "worker_registration_id": str(
+                        claim.worker_registration_id
+                    ),
+                    "worker_lease_epoch": claim.worker_lease_epoch,
+                },
             "_input_artifact_meta": {"input": {}},
         }
     ]

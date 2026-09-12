@@ -180,7 +180,13 @@ func TestPromotionConfirmationMismatchDoesNotAdvanceOperation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("finalize promotion decision: %v", err)
 	}
-	operation, shouldSubmit, err := fixture.Store.BeginPromotionSubmission(ctx, preparation.Operation.ID)
+	var operation PromotionOperationRow
+	var shouldSubmit bool
+	err := fixture.Store.WithQueueExecutionFence(ctx, promote, func(fenced *Store) error {
+		var err error
+		operation, shouldSubmit, err = fenced.BeginPromotionSubmission(ctx, preparation.Operation.ID)
+		return err
+	})
 	if err != nil || !shouldSubmit {
 		t.Fatalf("begin submission = %#v, %v, want submission authority", operation, err)
 	}

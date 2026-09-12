@@ -11,7 +11,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.artifact import Artifact, IntermediateArtifactCache
+from app.models.artifact import Artifact, ArtifactKind, IntermediateArtifactCache
+from app.services.external_url_identity import normalize_external_media_url
 
 
 CACHE_SCHEMA_VERSION = 1
@@ -27,6 +28,7 @@ DETERMINISTIC_NODE_TYPES = {
     "watermark",
     "concat_timeline",
     "concat_vertical_timeline",
+    "url_download",
 }
 TRANSIENT_CONFIG_KEYS = {
     "disable_cache",
@@ -46,6 +48,12 @@ class IntermediateArtifactCacheService:
             return False
         if _truthy(node_config.get("disable_cache")):
             return False
+        if node_type == "url_download":
+            return (
+                isinstance(node_config.get("url"), str)
+                and bool(node_config["url"].strip())
+                and not bool(list(input_handles))
+            )
         return bool(list(input_handles))
 
     def cache_key(
@@ -57,13 +65,20 @@ class IntermediateArtifactCacheService:
         payload = {
             "schema_version": CACHE_SCHEMA_VERSION,
             "node_type": node_type,
-            "node_config": _stable_config(node_config),
+            "node_config": _stable_config_for_node(node_type, node_config),
             "inputs": _input_signature(input_artifacts),
         }
         return _sha256_json(payload)
 
-    def node_config_hash(self, node_config: dict[str, Any]) -> str:
-        return _sha256_json(_stable_config(node_config))
+    def node_config_hash(
+        self,
+        node_config: dict[str, Any],
+        *,
+        node_type: str | None = None,
+    ) -> str:
+        return _sha256_json(
+            _stable_config_for_node(node_type, node_config)
+        )
 
     def input_signature_hash(self, input_artifacts: Mapping[str, Artifact]) -> str:
         return _sha256_json(_input_signature(input_artifacts))
@@ -75,6 +90,7 @@ class IntermediateArtifactCacheService:
         node_type: str,
         node_config: dict[str, Any],
         input_artifacts: Mapping[str, Artifact],
+        registered: bool = False,
     ) -> IntermediateArtifactCache | None:
         if not self.is_cache_eligible(node_type, node_config, input_artifacts.keys()):
             return None
@@ -84,8 +100,17 @@ class IntermediateArtifactCacheService:
         ).scalar_one_or_none()
         if entry is None:
             return None
-        output_artifact = await db.get(Artifact, entry.output_artifact_id)
-        if output_artifact is None:
+        if registered and (not entry.storage_backend or not entry.storage_path or not entry.filename):
+            return None
+        if entry.output_artifact_id is not None:
+            output_artifact = await db.get(
+                Artifact,
+                entry.output_artifact_id,
+            )
+            if output_artifact is None:
+                entry.output_artifact_id = None
+                await db.flush()
+        if not entry.storage_backend or not entry.storage_path or not entry.filename:
             await db.delete(entry)
             await db.flush()
             return None
@@ -117,7 +142,9 @@ class IntermediateArtifactCacheService:
             "cache_schema_version": CACHE_SCHEMA_VERSION,
             "node_id": node_id,
             "input_artifact_ids": [str(artifact.id) for _handle, artifact in _ordered_inputs(input_artifacts)],
-            "config_keys": sorted(_stable_config(node_config).keys()),
+            "config_keys": sorted(
+                _stable_config_for_node(node_type, node_config).keys()
+            ),
             "created_by_job_id": str(job_id),
         }
         if entry is None:
@@ -125,9 +152,18 @@ class IntermediateArtifactCacheService:
                 IntermediateArtifactCache(
                     cache_key=cache_key,
                     node_type=node_type,
-                    node_config_hash=self.node_config_hash(node_config),
+                    node_config_hash=self.node_config_hash(
+                        node_config,
+                        node_type=node_type,
+                    ),
                     input_signature_hash=self.input_signature_hash(input_artifacts),
                     output_artifact_id=output_artifact.id,
+                    storage_backend=output_artifact.storage_backend,
+                    storage_path=output_artifact.storage_path,
+                    filename=output_artifact.filename,
+                    mime_type=output_artifact.mime_type,
+                    file_size=output_artifact.file_size,
+                    media_info=output_artifact.media_info,
                     metadata_json=metadata,
                 )
             )
@@ -135,11 +171,49 @@ class IntermediateArtifactCacheService:
             return
 
         entry.node_type = node_type
-        entry.node_config_hash = self.node_config_hash(node_config)
+        entry.node_config_hash = self.node_config_hash(
+            node_config,
+            node_type=node_type,
+        )
         entry.input_signature_hash = self.input_signature_hash(input_artifacts)
         entry.output_artifact_id = output_artifact.id
+        entry.storage_backend = output_artifact.storage_backend
+        entry.storage_path = output_artifact.storage_path
+        entry.filename = output_artifact.filename
+        entry.mime_type = output_artifact.mime_type
+        entry.file_size = output_artifact.file_size
+        entry.media_info = output_artifact.media_info
         entry.metadata_json = metadata
         await db.flush()
+
+    async def materialize_hit(
+        self,
+        db: AsyncSession,
+        entry: IntermediateArtifactCache,
+        *,
+        job_id: uuid.UUID,
+        node_execution_id: uuid.UUID,
+    ) -> Artifact:
+        if not entry.storage_backend or not entry.storage_path or not entry.filename:
+            raise ValueError("cache entry has no durable artifact snapshot")
+        if entry.output_artifact_id is not None:
+            existing = await db.get(Artifact, entry.output_artifact_id)
+            if existing is not None and existing.job_id == job_id:
+                return existing
+        artifact = Artifact(
+            job_id=job_id,
+            node_execution_id=node_execution_id,
+            kind=ArtifactKind.INTERMEDIATE,
+            filename=entry.filename,
+            mime_type=entry.mime_type,
+            file_size=entry.file_size,
+            storage_backend=entry.storage_backend,
+            storage_path=entry.storage_path,
+            media_info=entry.media_info,
+        )
+        db.add(artifact)
+        await db.flush()
+        return artifact
 
 
 def _stable_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -148,6 +222,16 @@ def _stable_config(config: dict[str, Any]) -> dict[str, Any]:
         if key.startswith("_") or key in TRANSIENT_CONFIG_KEYS:
             continue
         result[key] = value
+    return result
+
+
+def _stable_config_for_node(
+    node_type: str | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    result = _stable_config(config)
+    if node_type == "url_download" and isinstance(result.get("url"), str):
+        result["url"] = normalize_external_media_url(result["url"])
     return result
 
 

@@ -1,0 +1,413 @@
+{
+  "canonical_vector": {
+    "canonical_ascii": "{\"at\":\"2026-09-11T08:00:00+00:00\",\"float\":1.0,\"nested\":{\"a\":1,\"b\":2},\"small\":1e-07,\"text\":\"\\u4e2d\\u6587\"}",
+    "sha256": "fedecccf8b35019d26a070b55ba90e3d3f384b2ba8d8d503791d0afca9798481",
+    "value": {
+      "at": "2026-09-11T08:00:00+00:00",
+      "float": 1.0,
+      "nested": {
+        "a": 1,
+        "b": 2
+      },
+      "small": 1e-07,
+      "text": "\u4e2d\u6587"
+    }
+  },
+  "contract_version": 1,
+  "expected": {
+    "account_ids": [
+      "00000000-0000-0000-0000-000000000003"
+    ],
+    "authority_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "block_reason": null,
+    "classifications": [
+      {
+        "account_id": "00000000-0000-0000-0000-000000000003",
+        "classification": "direct",
+        "operation_id": "00000000-0000-0000-0000-000000000007",
+        "platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "completed_item_ids": [],
+    "retired_render_sha256": [],
+    "retired_source_sha256": [],
+    "stable_history_sha256": "dc13ea5b18ba85666adbc02549df9bd2376ea3cafc780461286224ea65f46fcf",
+    "terminal_paths": [],
+    "wait_reason": "owned_inventory_metrics_pending"
+  },
+  "note": "Offline synthetic graph; no live qualification or approved production facts.",
+  "now": "2026-09-11T08:00:00+00:00",
+  "observed_at": "2026-09-11T08:00:00+00:00",
+  "platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+  "redis_observations": [],
+  "rows": {
+    "artifacts": [
+      {
+        "id": "00000000-0000-0000-0000-000000000009",
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "media_info": {},
+        "node_execution_id": "00000000-0000-0000-0000-000000000012"
+      },
+      {
+        "id": "00000000-0000-0000-0000-000000000011",
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "media_info": {
+          "youtube": {
+            "privacy": "unlisted",
+            "quota_estimate": 1600,
+            "tags": [],
+            "title": "owned",
+            "url": "https://www.youtube.com/watch?v=abcdefghijk",
+            "video_id": "abcdefghijk"
+          }
+        },
+        "node_execution_id": "00000000-0000-0000-0000-000000000008"
+      }
+    ],
+    "assets": [],
+    "channel_ops_queue_items": [
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000014",
+        "idempotency_key": "promote_publication:00000000-0000-0000-0000-000000000013",
+        "kind": "promote_publication",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": null,
+        "payload_json": {
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "target_visibility": "unlisted"
+        },
+        "run_after": "2026-09-10T07:00:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000015",
+        "idempotency_key": "reconcile_publication:00000000-0000-0000-0000-000000000013:2026-09-10T07:00:00Z",
+        "kind": "reconcile_publication",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "publication_id": "00000000-0000-0000-0000-000000000013"
+        },
+        "run_after": "2026-09-10T07:30:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000030",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:1h:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000020",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "1h"
+        },
+        "run_after": "2026-09-10T08:00:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000031",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:6h:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000021",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "6h"
+        },
+        "run_after": "2026-09-10T13:00:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000032",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:24h:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000022",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "24h"
+        },
+        "run_after": "2026-09-11T07:00:00+00:00",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 0,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000033",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:72h:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000023",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "72h"
+        },
+        "run_after": "2026-09-13T07:00:00+00:00",
+        "status": "queued"
+      },
+      {
+        "attempt_count": 0,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000034",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:7d:attempt:0",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000014",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000024",
+          "metrics_poll_count": 0,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "7d"
+        },
+        "run_after": "2026-09-17T07:00:00+00:00",
+        "status": "queued"
+      },
+      {
+        "attempt_count": 0,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "dead_letter_at": null,
+        "id": "00000000-0000-0000-0000-000000000061",
+        "idempotency_key": "collect_metrics:00000000-0000-0000-0000-000000000013:stage:24h:attempt:1",
+        "kind": "collect_metrics",
+        "last_error": null,
+        "locked_at": null,
+        "locked_by": null,
+        "parent_queue_item_id": "00000000-0000-0000-0000-000000000032",
+        "payload_json": {
+          "metric_schedule_id": "00000000-0000-0000-0000-000000000022",
+          "metrics_poll_count": 1,
+          "publication_id": "00000000-0000-0000-0000-000000000013",
+          "snapshot_stage": "24h"
+        },
+        "run_after": "2026-09-11T07:15:00+00:00",
+        "status": "queued"
+      }
+    ],
+    "channel_profiles": [
+      {
+        "id": "00000000-0000-0000-0000-000000000002"
+      }
+    ],
+    "feedback_snapshots": [
+      {
+        "id": "00000000-0000-0000-0000-000000000040",
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "1h"
+      },
+      {
+        "id": "00000000-0000-0000-0000-000000000041",
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "6h"
+      }
+    ],
+    "jobs": [
+      {
+        "completed_at": "2026-09-10T07:00:00+00:00",
+        "error_message": null,
+        "id": "00000000-0000-0000-0000-000000000006",
+        "status": "SUCCEEDED"
+      }
+    ],
+    "legacy_worker_event_resolutions": [],
+    "manual_seeds": [],
+    "node_executions": [
+      {
+        "completed_at": "2026-09-10T07:00:00+00:00",
+        "error_message": null,
+        "id": "00000000-0000-0000-0000-000000000008",
+        "input_artifact_ids": [
+          "00000000-0000-0000-0000-000000000009"
+        ],
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "node_type": "youtube_upload",
+        "output_artifact_id": "00000000-0000-0000-0000-000000000011",
+        "status": "SUCCEEDED"
+      }
+    ],
+    "owned_seed_inventories": [],
+    "owned_seed_inventory_items": [],
+    "production_tasks": [
+      {
+        "blocked_by_guard": null,
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "failure_reason": null,
+        "id": "00000000-0000-0000-0000-000000000004",
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "manual_seed_id": "00000000-0000-0000-0000-000000000005",
+        "retry_count": 0,
+        "state": "measured",
+        "target_account_id": "00000000-0000-0000-0000-000000000003"
+      }
+    ],
+    "publication_metric_schedules": [
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-09-10T08:00:00+00:00",
+        "due_at": "2026-09-10T08:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-10T10:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000020",
+        "last_attempt_at": "2026-09-10T08:00:00+00:00",
+        "last_error_code": null,
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "1h",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-09-10T13:00:00+00:00",
+        "due_at": "2026-09-10T13:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-10T19:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000021",
+        "last_attempt_at": "2026-09-10T13:00:00+00:00",
+        "last_error_code": null,
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "6h",
+        "status": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "completed_at": null,
+        "due_at": "2026-09-11T07:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-11T13:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000022",
+        "last_attempt_at": "2026-09-11T07:00:00+00:00",
+        "last_error_code": "metrics_unavailable",
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "24h",
+        "status": "pending"
+      },
+      {
+        "attempt_count": 0,
+        "completed_at": null,
+        "due_at": "2026-09-13T07:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-13T19:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000023",
+        "last_attempt_at": null,
+        "last_error_code": null,
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "72h",
+        "status": "pending"
+      },
+      {
+        "attempt_count": 0,
+        "completed_at": null,
+        "due_at": "2026-09-17T07:00:00+00:00",
+        "effective_start_at": "2026-09-10T07:00:00+00:00",
+        "grace_until": "2026-09-18T07:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000024",
+        "last_attempt_at": null,
+        "last_error_code": null,
+        "publication_id": "00000000-0000-0000-0000-000000000013",
+        "snapshot_stage": "7d",
+        "status": "pending"
+      }
+    ],
+    "publication_promotion_operations": [],
+    "publication_records": [
+      {
+        "account_id": "00000000-0000-0000-0000-000000000003",
+        "current_privacy": "unlisted",
+        "desired_privacy": "unlisted",
+        "id": "00000000-0000-0000-0000-000000000013",
+        "platform": "youtube",
+        "platform_content_id": "abcdefghijk",
+        "production_task_id": "00000000-0000-0000-0000-000000000004",
+        "public_at": null,
+        "publish_status": "uploaded",
+        "scheduled_publish_at": "2026-09-10T07:00:00+00:00",
+        "uploaded_at": "2026-09-10T07:00:00+00:00"
+      }
+    ],
+    "publishing_accounts": [
+      {
+        "channel_profile_id": "00000000-0000-0000-0000-000000000002",
+        "credential_ref": "fixture-reference",
+        "id": "00000000-0000-0000-0000-000000000003",
+        "platform": "youtube",
+        "platform_account_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+        "platform_specific_config_json": {}
+      }
+    ],
+    "registered_worker_event_deliveries": [],
+    "registered_worker_event_receipts": [],
+    "runtime_schedules": [],
+    "worker_admission_grants": [],
+    "worker_event_emissions": [],
+    "worker_redis_marker_cleanup_authorizations": [],
+    "worker_redis_marker_repair_audits": [],
+    "worker_registrations": [],
+    "worker_task_delivery_attestations": [],
+    "worker_task_dispatches": [],
+    "youtube_upload_operations": [
+      {
+        "completed_at": "2026-09-10T07:00:00+00:00",
+        "content_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "error_message": null,
+        "id": "00000000-0000-0000-0000-000000000007",
+        "input_artifact_id": "00000000-0000-0000-0000-000000000009",
+        "job_id": "00000000-0000-0000-0000-000000000006",
+        "manager_task_id": "00000000-0000-0000-0000-000000000010",
+        "node_execution_id": "00000000-0000-0000-0000-000000000008",
+        "platform_video_id": "abcdefghijk",
+        "privacy": "unlisted",
+        "production_task_id": "00000000-0000-0000-0000-000000000004",
+        "receipt_json": {
+          "privacy": "unlisted",
+          "quota_estimate": 1600,
+          "tags": [],
+          "title": "owned",
+          "url": "https://www.youtube.com/watch?v=abcdefghijk",
+          "video_id": "abcdefghijk"
+        },
+        "request_attempted_at": "2026-09-10T06:59:00+00:00",
+        "status": "succeeded",
+        "title": "owned"
+      }
+    ]
+  },
+  "snapshot_sha256": "c2530769a9a3701d93119c6f6ce24c46b337b0d217d4bb25571acfa733bf7e1b",
+  "synthetic": true
+}

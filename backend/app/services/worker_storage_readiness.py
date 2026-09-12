@@ -3,16 +3,22 @@ from __future__ import annotations
 import io
 import os
 import uuid
+from collections.abc import Awaitable
 from pathlib import Path
 from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
 import httpx
 
+from app.services.staging_janitor_status import (
+    STAGING_JANITOR_MAX_AGE_SECONDS,
+    STAGING_JANITOR_STALE_RUN_SECONDS,
+)
 from app.storage.base import StorageBackend
 
 
 _PROBE_PAYLOAD = b"vp-worker-storage-readiness-v1\n"
+StagingJanitorProbe = Callable[..., Awaitable[str]]
 
 
 class ReadinessFailure(RuntimeError):
@@ -53,6 +59,7 @@ async def probe_worker_storage(
     require_artifact_api: bool,
     storage: StorageBackend | None = None,
     http_client_factory: Callable[..., httpx.AsyncClient] | None = None,
+    staging_janitor_probe: StagingJanitorProbe | None = None,
 ) -> dict[str, object]:
     if env.get("STORAGE_BACKEND") != "minio":
         raise ReadinessFailure("configuration_invalid")
@@ -162,11 +169,29 @@ async def probe_worker_storage(
     if require_artifact_api:
         artifact_api_status = "ready"
 
+    staging_janitor_status = "not_required"
+    if env.get("VP_REQUIRE_STAGING_JANITOR", "").strip().lower() == "true":
+        try:
+            durable_status = (
+                await staging_janitor_probe(
+                    max_age_seconds=STAGING_JANITOR_MAX_AGE_SECONDS,
+                    stale_run_seconds=STAGING_JANITOR_STALE_RUN_SECONDS,
+                )
+                if staging_janitor_probe is not None
+                else None
+            )
+        except Exception:
+            durable_status = None
+        if durable_status != "ready":
+            raise ReadinessFailure("staging_janitor_unavailable")
+        staging_janitor_status = "ready"
+
     return {
         "status": "ready",
         "components": {
             "scratch": "ready",
             "minio": "ready",
             "artifact_api": artifact_api_status,
+            "staging_janitor": staging_janitor_status,
         },
     }

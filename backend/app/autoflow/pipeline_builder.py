@@ -189,7 +189,7 @@ class PipelineBuilder:
                             "use_vlm_verify": False,
                             "language": "zh",
                             "output_format": "mp4",
-                            "no_match_policy": "placeholder",
+                            "no_match_policy": "placeholder" if publish_mode == "preview_only" else "fail",
                             "storyboard_shot_id": shot.id,
                         },
                     ),

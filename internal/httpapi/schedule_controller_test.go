@@ -65,6 +65,69 @@ func TestHTTPScheduleControllerGuardedOpenSendsExpectedJobID(t *testing.T) {
 	}
 }
 
+func TestHTTPScheduleControllerUsesPythonStateActionRoutes(t *testing.T) {
+	for _, tc := range []struct{ state, action string }{
+		{"OPEN", "open"}, {"DRAINING", "drain"}, {"CLOSED", "close"},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/internal/schedule/video/"+tc.action {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(store.VideoScheduleStatusRow{State: tc.state})
+			}))
+			defer upstream.Close()
+			controller := NewHTTPScheduleController(upstream.URL, upstream.Client())
+			row, err := controller.SetState(context.Background(), tc.state)
+			if err != nil || row.State != tc.state {
+				t.Fatalf("state %s: row=%#v error=%v", tc.state, row, err)
+			}
+		})
+	}
+}
+
+func TestHTTPScheduleControllerRejectsUnknownStateWithoutRequest(t *testing.T) {
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_ = json.NewEncoder(w).Encode(store.VideoScheduleStatusRow{State: "UNKNOWN"})
+	}))
+	defer upstream.Close()
+	controller := NewHTTPScheduleController(upstream.URL, upstream.Client())
+	if _, err := controller.SetState(context.Background(), "UNKNOWN"); err == nil {
+		t.Fatal("expected invalid-state error")
+	}
+	if requests != 0 {
+		t.Fatalf("unexpected HTTP requests: %d", requests)
+	}
+}
+
+func TestCoordinatedGuardedFailureCallsActualPythonCloseRoute(t *testing.T) {
+	paths := []string{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/internal/schedule/video/open":
+			w.WriteHeader(http.StatusInternalServerError)
+		case "/internal/schedule/video/close":
+			_ = json.NewEncoder(w).Encode(store.VideoScheduleStatusRow{State: "CLOSED"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	local := &fakeScheduleController{}
+	controller := NewCoordinatedScheduleController(local, NewHTTPScheduleController(upstream.URL, upstream.Client()))
+	_, err := controller.OpenExpectedJob(context.Background(), "11111111-1111-4111-8111-111111111111")
+	if !errors.Is(err, errGuardedScheduleHandoff) {
+		t.Fatalf("expected failed handoff with completed cleanup, got %v", err)
+	}
+	if !reflect.DeepEqual(paths, []string{"/internal/schedule/video/open", "/internal/schedule/video/close"}) || !reflect.DeepEqual(local.setStates, []string{"CLOSED"}) {
+		t.Fatalf("HTTP paths=%v local states=%v", paths, local.setStates)
+	}
+}
+
 func TestScheduleRouteUsesConfiguredController(t *testing.T) {
 	controller := &fakeScheduleController{
 		setRows: []store.VideoScheduleStatusRow{{State: "OPEN", ReleasedJobs: 1}},

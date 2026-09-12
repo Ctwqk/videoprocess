@@ -72,6 +72,16 @@ async def quarantine_channelops_backlog(
     )
 
 
+async def apply_inventory_soak_guard(db, channel_id, inventory_id, *, external_conditions):
+    from app.services.channelops_soak_guard import inventory_soak_assessment
+    from app.services.owned_inventory_feedback import check_owned_inventory_feedback
+
+    feedback = await check_owned_inventory_feedback(
+        db, channel_id, inventory_id, apply=True, external_conditions=external_conditions,
+    )
+    return inventory_soak_assessment(channel_id, inventory_id, feedback)
+
+
 async def run(argv: Sequence[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
@@ -105,11 +115,27 @@ async def run(argv: Sequence[str] | None = None) -> int:
         _emit("database_error")
         return 3
 
+    if assessment.inventory_id is not None and args.apply:
+        try:
+            async with session_factory() as db:
+                assessment = await apply_inventory_soak_guard(
+                    db, policy.channel_id, assessment.inventory_id,
+                    external_conditions=tuple(args.external_condition),
+                )
+        except Exception:
+            _emit("inventory_hold_error")
+            return 3
+
     payload: dict[str, Any] = {
         "status": "healthy" if assessment.healthy else "critical",
         "critical_codes": list(assessment.critical_codes),
         "metrics": dict(assessment.metrics),
     }
+    if assessment.inventory_id is not None:
+        if args.apply and not assessment.healthy:
+            payload["status"] = "inventory_held"
+        _emit_payload(payload)
+        return 0 if assessment.healthy else 20
     if assessment.healthy:
         _emit_payload(payload)
         return 0

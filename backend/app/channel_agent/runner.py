@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import logging
 
+from sqlalchemy import select
+
 from app.channel_agent.alerts import AlertService
 from app.channel_agent.clients import (
     LocalAutoFlowClient,
@@ -66,12 +68,21 @@ class ChannelAgentRunner:
             except Exception as exc:
                 logger.exception("ChannelOps queue item failed: %s", item_id)
                 await db.rollback()
-                failed_item = await db.get(ChannelOpsQueueItem, item_id)
+                lease = db.info.pop("owned_tick_lease", None)
+                if lease is not None:
+                    failed_item = (await db.scalars(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.id == item_id)
+                        .with_for_update().execution_options(populate_existing=True))).one_or_none()
+                    if not lease.matches(failed_item):
+                        await db.rollback()
+                        return True
+                else:
+                    failed_item = await db.get(ChannelOpsQueueItem, item_id)
                 if failed_item is None:
                     raise
                 await self.queue.mark_failed_or_retry(db, failed_item, str(exc))
                 return True
-            await self.queue.mark_succeeded(db, item)
+            if db.info.pop("owned_tick_lease", None) is None:
+                await self.queue.mark_succeeded(db, item)
             return True
 
     async def run_forever(self, *, poll_seconds: float = 5.0) -> None:
@@ -110,6 +121,7 @@ class ChannelAgentRunner:
                 db,
                 channel_id=item.payload_json["channel_id"],
                 plan_delay_seconds=plan_delay_seconds,
+                queue_item=item,
             )
         elif item.kind == "plan_task":
             await self.service.handle_plan_task(db, item)

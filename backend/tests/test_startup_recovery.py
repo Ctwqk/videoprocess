@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -7,8 +8,60 @@ from types import SimpleNamespace
 import pytest
 
 from app import main
-from app.models.job import JobStatus
+from app.models.job import JobStatus, NodeStatus
 from app.services.schedule_service import VideoScheduleState
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [False, True])
+async def test_restricted_database_qualified_before_recovery_and_listener(monkeypatch, failed):
+    import asyncio
+    import httpx
+
+    events = []
+    class Runtime:
+        ready = False
+        generation = "c-0123456789abcdef0123"
+        principal = "restricted"
+        async def start(self, target):
+            events.append("qualify")
+            if failed:
+                raise RuntimeError("qualification rejected")
+            self.ready = True
+        async def close(self):
+            events.append("dispose")
+            self.ready = False
+    async def listener():
+        events.append("listen")
+        try:
+            await asyncio.Future()
+        finally:
+            events.append("listener-closed")
+    async def recover():
+        assert events == ["qualify"]
+        events.append("recover")
+    monkeypatch.setattr(main, "registered_database", Runtime(), raising=False)
+    monkeypatch.setattr(main, "event_listener", listener)
+    monkeypatch.setattr(main, "_recover_stale_jobs", recover)
+    monkeypatch.setattr(main.settings, "event_listener_enabled", True)
+    monkeypatch.setattr(main.settings, "startup_recovery_enabled", True)
+    app = main.create_app()
+    if failed:
+        with pytest.raises(RuntimeError, match="qualification rejected"):
+            async with main.lifespan(app):
+                pytest.fail("unqualified application became ready")
+        assert "listen" not in events and "recover" not in events
+    else:
+        async with main.lifespan(app):
+            await asyncio.sleep(0)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.get("/health")
+                assert response.status_code == 200
+                assert response.json()["registered_runtime"]["generation"] == "c-0123456789abcdef0123"
+                app.state.event_listener_task.cancel()
+                await asyncio.sleep(0)
+                assert (await client.get("/health")).status_code == 503
+        assert events == ["qualify", "recover", "listen", "listener-closed", "dispose"]
 
 
 class _RecoverySession:
@@ -34,6 +87,151 @@ def _job(*, status=JobStatus.PENDING, started_at=None, node_statuses=()):
         started_at=started_at,
         node_executions=[SimpleNamespace(status=node_status) for node_status in node_statuses],
     )
+
+
+def _registered_stale_job() -> tuple[SimpleNamespace, SimpleNamespace]:
+    registration_id = uuid.uuid4()
+    node = SimpleNamespace(
+        id=uuid.uuid4(),
+        node_id="vision-1",
+        status=NodeStatus.RUNNING,
+        worker_id="vision-worker@127:1",
+        worker_registration_id=registration_id,
+        worker_lease_epoch=11,
+        queued_at=None,
+        started_at=datetime(2026, 7, 26, tzinfo=timezone.utc),
+        completed_at=None,
+        progress=25,
+        error_message=None,
+        input_artifact_ids=[uuid.uuid4()],
+    )
+    job = SimpleNamespace(
+        id=uuid.uuid4(),
+        status=JobStatus.RUNNING,
+        started_at=node.started_at,
+        submitted_at=node.started_at,
+        completed_at=None,
+        error_message=None,
+        node_executions=[node],
+    )
+    return job, node
+
+
+@pytest.mark.asyncio
+async def test_registered_startup_recovery_keeps_live_old_claim(
+    monkeypatch,
+) -> None:
+    job, node = _registered_stale_job()
+    original = dict(vars(node))
+
+    async def recover(_db, job_id, node_execution_id):
+        assert job_id == job.id
+        assert node_execution_id == node.id
+        return "live"
+
+    monkeypatch.setattr(
+        main,
+        "recover_registered_worker_node",
+        recover,
+        raising=False,
+    )
+
+    assert await main._prepare_job_for_recovery(object(), job) is False
+    assert vars(node) == original
+    assert job.status == JobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_registered_startup_recovery_holds_expired_unresolved_claim(
+    monkeypatch,
+) -> None:
+    job, node = _registered_stale_job()
+    node.started_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    job.started_at = node.started_at
+    job.submitted_at = node.started_at
+    original = dict(vars(node))
+
+    async def recover(_db, job_id, node_execution_id):
+        return "held_unresolved"
+
+    monkeypatch.setattr(
+        main,
+        "recover_registered_worker_node",
+        recover,
+        raising=False,
+    )
+
+    assert await main._prepare_job_for_recovery(object(), job) is False
+    assert vars(node) == original
+    assert job.status == JobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    ("terminal", "held_unresolved_event"),
+)
+async def test_registered_startup_recovery_preserves_new_terminal_outcomes(
+    monkeypatch,
+    caplog,
+    outcome,
+) -> None:
+    caplog.set_level(logging.INFO, logger=main.__name__)
+    job, node = _registered_stale_job()
+    node.started_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    job.started_at = node.started_at
+    job.submitted_at = node.started_at
+    original = dict(vars(node))
+
+    async def recover(_db, job_id, node_execution_id):
+        assert job_id == job.id
+        assert node_execution_id == node.id
+        return outcome
+
+    monkeypatch.setattr(
+        main,
+        "recover_registered_worker_node",
+        recover,
+        raising=False,
+    )
+
+    assert await main._prepare_job_for_recovery(object(), job) is False
+    assert vars(node) == original
+    assert job.status == JobStatus.RUNNING
+    assert outcome in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_registered_startup_recovery_resets_resolved_expired_once(
+    monkeypatch,
+) -> None:
+    job, node = _registered_stale_job()
+    calls = 0
+
+    async def recover(_db, job_id, node_execution_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            node.status = NodeStatus.PENDING
+            node.worker_id = None
+            node.worker_registration_id = None
+            node.worker_lease_epoch = None
+            node.started_at = None
+            node.progress = 0
+            return "recovered"
+        return "not_registered"
+
+    monkeypatch.setattr(
+        main,
+        "recover_registered_worker_node",
+        recover,
+        raising=False,
+    )
+
+    assert await main._prepare_job_for_recovery(object(), job) is True
+    assert node.status == NodeStatus.PENDING
+    assert node.worker_registration_id is None
+    assert job.status == JobStatus.PENDING
 
 
 @pytest.mark.asyncio

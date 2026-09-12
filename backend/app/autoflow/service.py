@@ -99,6 +99,11 @@ class AutoFlowService:
         self._runs: dict[str, AutoFlowRun] = {}
 
     async def plan(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
+        if db is not None:
+            from app.services.owned_producer_workflow import plan_owned
+            owned = await plan_owned(self, request, db)
+            if owned is not None:
+                return owned
         await self._validate_owned_input_asset(request, db)
         fallback_warnings: list[str] = []
         if request.planning_mode == "ai_graph":
@@ -205,6 +210,9 @@ class AutoFlowService:
 
     async def plan_graph(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
         graph_request = request.model_copy(update={"planning_mode": "ai_graph"})
+        if db is not None:
+            from app.services.owned_producer_workflow import plan_owned
+            await plan_owned(self, graph_request, db)
         await self._validate_owned_input_asset(graph_request, db)
         return await self._plan_graph(graph_request, db)
 
@@ -433,11 +441,20 @@ class AutoFlowService:
         patch: AutoFlowPlanPatch,
         db: AsyncSession | None = None,
     ) -> AutoFlowPlan | None:
+        owned = None
+        if db is not None:
+            from app.services.owned_producer_workflow import lock_plan
+            owned = await lock_plan(db, plan_id)
         plan = await self._get_plan_for_update(plan_id, db) if db is not None else await self.get_plan(plan_id)
         if not plan:
             return None
 
         request = _patched_request(plan.request, patch)
+        if owned is not None and owned.identity.inventory_id is not None:
+            from types import SimpleNamespace
+            from app.services.owned_producer_workflow import require_request
+            task = next(t for t in owned.snapshot.rows.as_dict()["production_tasks"] if t["id"] == owned.identity.task_id)
+            require_request(request, SimpleNamespace(**task), owned.identity)
         intent = plan.intent.model_copy(
             update={
                 "target_platforms": request.target_platforms,
@@ -473,6 +490,9 @@ class AutoFlowService:
                 template = self.template_library.get_template(plan.template_id)
                 definition = self.pipeline_builder.build(template, intent, candidates, metadata)
 
+        if owned is not None and owned.identity.inventory_id is not None:
+            from app.services.owned_producer_fence import require_owned_pipeline
+            require_owned_pipeline(definition, request.input_asset_id)
         if patch.run_validation:
             validation = validate_pipeline(definition)
             repair_result = None
@@ -563,6 +583,9 @@ class AutoFlowService:
         approved_by: str,
         evidence: dict[str, Any],
     ) -> AutoFlowPlan | None:
+        if db is not None:
+            from app.services.owned_producer_workflow import lock_plan
+            await lock_plan(db, plan_id)
         plan = await self._get_plan_for_update(plan_id, db) if db is not None else await self.get_plan(plan_id)
         if not plan:
             return None
@@ -611,6 +634,9 @@ class AutoFlowService:
         *,
         commit: bool = True,
     ) -> AutoFlowPlan | None:
+        if db is not None:
+            from app.services.owned_producer_workflow import lock_plan
+            await lock_plan(db, plan_id)
         plan = await self._get_plan_for_update(plan_id, db) if db is not None else await self.get_plan(plan_id)
         if not plan:
             return None
@@ -652,6 +678,9 @@ class AutoFlowService:
         db: AsyncSession | None = None,
         review_notes: str | None = None,
     ) -> AutoFlowPlan | None:
+        if db is not None:
+            from app.services.owned_producer_workflow import lock_plan
+            await lock_plan(db, plan_id, public=True)
         plan = await self._get_plan_for_update(plan_id, db) if db is not None else await self.get_plan(plan_id)
         if not plan:
             return None
@@ -691,6 +720,9 @@ class AutoFlowService:
         db: AsyncSession | None = None,
         rejected_reason: str | None = None,
     ) -> AutoFlowPlan | None:
+        if db is not None:
+            from app.services.owned_producer_workflow import lock_plan_mutation
+            await lock_plan_mutation(db, plan_id)
         plan = await self._get_plan_for_update(plan_id, db) if db is not None else await self.get_plan(plan_id)
         if not plan:
             return None
@@ -790,6 +822,10 @@ class AutoFlowService:
             await db.commit()
             return run
 
+        from app.services.owned_producer_workflow import lock_plan
+        from app.services.owned_seed_inventory import require as require_owned
+        producer = await lock_plan(db, plan_id)
+        require_owned(producer is None or producer.identity.inventory_id is None, "owned_inventory_execute_binding")
         schedule, _schedule_created = await get_or_create_and_lock_runtime_schedule(db)
         existing = (
             await db.execute(
@@ -940,6 +976,24 @@ class AutoFlowService:
             raise ValueError("ChannelOps-bound AutoFlow execution requires exact approved revision authority")
 
         try:
+            from app.channel_agent.owned_producer import QueueAuthorityLost, QueueLease
+            queue_item = (await db.execute(select(ChannelOpsQueueItem).where(ChannelOpsQueueItem.id == queue_item_id)
+                .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+            if queue_item is None:
+                raise PermissionError("ChannelOps execute queue item was not found")
+            try:
+                queue_lease = QueueLease.capture(queue_item)
+            except QueueAuthorityLost:
+                raise PermissionError("ChannelOps execute queue item is not claimed") from None
+            if queue_lease.owner != queue_locked_by or queue_lease.at != queue_locked_at:
+                raise PermissionError("ChannelOps execute queue lease authority changed")
+            # A committed run is observation/replay, not another producer admission.
+            committed_run = await db.scalar(select(AutoFlowRunModel.id).where(AutoFlowRunModel.execute_idempotency_key == key))
+            if committed_run is None:
+                from app.services.owned_producer_workflow import lock_plan
+                from app.services.owned_seed_inventory import require as require_owned
+                producer = await lock_plan(db, plan_id, queue_lease=queue_lease)
+                require_owned(producer is None or producer.identity.task_id == str(task_id), "owned_inventory_execute_binding")
             discovered_task = await db.get(ProductionTask, task_id)
             if discovered_task is None:
                 raise PermissionError("ChannelOps production task was not found")

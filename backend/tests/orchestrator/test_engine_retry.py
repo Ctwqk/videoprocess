@@ -124,6 +124,8 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
         queued_at=None,
         worker_id=worker_id,
         started_at=started_at,
+        worker_registration_id=None,
+        worker_lease_epoch=None,
     )
     source_node = SimpleNamespace(
         id=uuid.uuid4(),
@@ -170,6 +172,8 @@ async def test_on_node_failed_retry_redispatches_with_dependency_preferred_hosts
             node_execution_id=failed_node_execution_id,
             worker_id=worker_id,
             started_at=started_at,
+            worker_registration_id=None,
+            worker_lease_epoch=None,
         ),
     )
 

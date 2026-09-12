@@ -1,16 +1,12 @@
 import asyncio
-import hashlib
 import logging
-import os
-import re
-import shutil
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse
 
 import httpx
 
 from app.config import settings
-from app.storage.manager import get_storage
+from app.services.external_url_identity import normalize_external_media_url
 from worker.handlers.base import BaseHandler, CancelledError
 
 logger = logging.getLogger(__name__)
@@ -24,17 +20,6 @@ class UrlDownloadHandler(BaseHandler):
 
         normalized_url = self._normalize_url(url)
         fmt = node_config.get("format", "best")
-        cache_path = self._cache_storage_path(normalized_url, fmt, output_path)
-        if await self._restore_from_cache(cache_path, output_path):
-            logger.info("URL download cache hit for %s (%s)", normalized_url, fmt)
-            return {
-                "_storage_path": cache_path,
-                "_skip_upload": True,
-                "cache_hit": True,
-                "source_url": normalized_url,
-            }
-
-        logger.info("URL download cache miss for %s (%s)", normalized_url, fmt)
 
         platform = self._detect_platform(normalized_url)
         if platform in {"xiaohongshu", "bilibili", "x"}:
@@ -42,11 +27,7 @@ class UrlDownloadHandler(BaseHandler):
         else:
             await self._download_via_ytdlp(normalized_url, fmt, output_path)
 
-        await self._save_to_cache(cache_path, output_path)
         return {
-            "_storage_path": cache_path,
-            "_skip_upload": True,
-            "cache_hit": False,
             "source_url": normalized_url,
         }
 
@@ -84,9 +65,18 @@ class UrlDownloadHandler(BaseHandler):
 
         if self._cancelled:
             raise CancelledError("Cancelled during download")
-        if self._proc.returncode != 0:
+        exit_code = self._proc.returncode
+        if exit_code is None:
+            raise RuntimeError("download process exited without a status")
+        if exit_code != 0:
             stderr_text = stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(self._format_download_error(normalized_url, self._proc.returncode, stderr_text))
+            raise RuntimeError(
+                self._format_download_error(
+                    normalized_url,
+                    exit_code,
+                    stderr_text,
+                )
+            )
 
     async def _download_via_platform_manager(self, platform: str, normalized_url: str, fmt: str, output_path: str) -> None:
         base_url = self._platform_manager_base_url(platform)
@@ -152,70 +142,8 @@ class UrlDownloadHandler(BaseHandler):
         return settings.platform_browser_manager_url.rstrip("/")
 
     @staticmethod
-    def _cache_storage_path(url: str, fmt: str, output_path: str) -> str:
-        cache_key = hashlib.sha256(f"{url}\n{fmt}".encode("utf-8")).hexdigest()
-        suffix = Path(output_path).suffix or ".mp4"
-        return f"download-cache/{cache_key}{suffix}"
-
-    @staticmethod
     def _normalize_url(url: str) -> str:
-        parsed = urlparse(url.strip())
-        host = parsed.netloc.lower()
-
-        if "youtu.be" in host:
-            video_id = parsed.path.strip("/")
-            if video_id:
-                return f"https://www.youtube.com/watch?v={video_id}"
-
-        if "youtube.com" in host:
-            query = dict(parse_qsl(parsed.query, keep_blank_values=False))
-            video_id = query.get("v", "").strip()
-            if video_id:
-                return f"https://www.youtube.com/watch?v={video_id}"
-
-        bilibili_id = UrlDownloadHandler._extract_bilibili_bvid(url)
-        if bilibili_id:
-            return f"https://www.bilibili.com/video/{bilibili_id}"
-
-        xiaohongshu_note_id = UrlDownloadHandler._extract_xiaohongshu_note_id(url)
-        if xiaohongshu_note_id:
-            return f"https://www.xiaohongshu.com/explore/{xiaohongshu_note_id}"
-
-        x_post_id, x_screen_name = UrlDownloadHandler._extract_x_post_components(url)
-        if x_post_id and x_screen_name:
-            return f"https://x.com/{x_screen_name}/status/{x_post_id}"
-
-        normalized_query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
-        cleaned = parsed._replace(
-            scheme=(parsed.scheme or "https").lower(),
-            netloc=host,
-            fragment="",
-            query=normalized_query,
-        )
-        return urlunparse(cleaned)
-
-    async def _restore_from_cache(self, cache_path: str, output_path: str) -> bool:
-        storage = get_storage(settings.storage_backend)
-        if not await storage.exists(cache_path):
-            return False
-
-        local_cached_path = storage.get_local_path(cache_path)
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        if local_cached_path and os.path.exists(local_cached_path):
-            shutil.copy2(local_cached_path, output_path)
-            return True
-
-        content = await storage.read(cache_path)
-        with open(output_path, "wb") as f:
-            f.write(content)
-        return True
-
-    async def _save_to_cache(self, cache_path: str, output_path: str) -> None:
-        storage = get_storage(settings.storage_backend)
-        if await storage.exists(cache_path):
-            return
-        with open(output_path, "rb") as f:
-            await storage.save(cache_path, f)
+        return normalize_external_media_url(url)
 
     @staticmethod
     def _detect_platform(url: str) -> str | None:
@@ -232,20 +160,26 @@ class UrlDownloadHandler(BaseHandler):
 
     @staticmethod
     def _extract_bilibili_bvid(url: str) -> str | None:
-        match = re.search(r"(BV[0-9A-Za-z]+)", url)
-        return match.group(1) if match else None
+        normalized = normalize_external_media_url(url)
+        if "/video/" not in normalized:
+            return None
+        return normalized.rsplit("/video/", 1)[1].split("/", 1)[0]
 
     @staticmethod
     def _extract_xiaohongshu_note_id(url: str) -> str | None:
-        match = re.search(r"([0-9a-f]{24})", url, flags=re.IGNORECASE)
-        return match.group(1) if match else None
+        normalized = normalize_external_media_url(url)
+        if "/explore/" not in normalized:
+            return None
+        return normalized.rsplit("/explore/", 1)[1].split("/", 1)[0]
 
     @staticmethod
     def _extract_x_post_components(url: str) -> tuple[str | None, str | None]:
-        match = re.search(r"(?:x|twitter)\.com/([^/]+)/status/(\d+)", url, flags=re.IGNORECASE)
-        if not match:
+        normalized = normalize_external_media_url(url)
+        parsed = urlparse(normalized)
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 3 or parts[1] != "status":
             return None, None
-        return match.group(2), match.group(1)
+        return parts[2], parts[0]
 
     @staticmethod
     async def _extract_error_detail(response: httpx.Response) -> str:

@@ -268,9 +268,13 @@ def _dog_cat_vertical_timeline_draft(request: AutoFlowRequest) -> PipelineDraft 
     include_upload = request.publish_mode in {"private_upload", "unlisted_upload", "public_after_review"}
     nodes = [
         _source_node("source_dog", "Dog source", "autoflow-ai-graph-dog"),
-        _smart_trim_node("smart_trim_dog", "Dog smart trim", "cute puppy, dog playing, clear subject"),
+        _smart_trim_node(
+            "smart_trim_dog", "Dog smart trim", "cute puppy, dog playing, clear subject", include_upload=include_upload,
+        ),
         _source_node("source_cat", "Cat source", "autoflow-ai-graph-cat"),
-        _smart_trim_node("smart_trim_cat", "Cat smart trim", "cute kitten, cat playing, clear subject"),
+        _smart_trim_node(
+            "smart_trim_cat", "Cat smart trim", "cute kitten, cat playing, clear subject", include_upload=include_upload,
+        ),
         DraftNode(
             id="concat_vertical_timeline_1",
             type="concat_vertical_timeline",
@@ -355,7 +359,7 @@ def _source_node(node_id: str, label: str, asset_id: str) -> DraftNode:
     )
 
 
-def _smart_trim_node(node_id: str, label: str, prompt: str) -> DraftNode:
+def _smart_trim_node(node_id: str, label: str, prompt: str, *, include_upload: bool) -> DraftNode:
     return DraftNode(
         id=node_id,
         type="smart_trim",
@@ -379,7 +383,7 @@ def _smart_trim_node(node_id: str, label: str, prompt: str) -> DraftNode:
             "use_vlm_verify": False,
             "language": "zh",
             "output_format": "mp4",
-            "no_match_policy": "placeholder",
+            "no_match_policy": "fail" if include_upload else "placeholder",
         },
     )
 

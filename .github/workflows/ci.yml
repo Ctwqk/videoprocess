@@ -40,6 +40,7 @@ jobs:
     env:
       CHANNEL_OPS_POSTGRES_TEST_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/postgres
       CHANNEL_OPS_GO_POSTGRES_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      CHANNEL_OPS_GO_REDIS_TEST_URL: redis://127.0.0.1:6379/14
       VISION_CUTOVER_REDIS_TEST_URL: redis://127.0.0.1:6379/0
     steps:
       - uses: actions/checkout@v6
@@ -67,6 +68,20 @@ jobs:
             cd backend
             .venv/bin/alembic heads
           ) | tee ci-evidence/backend/alembic-heads.txt
+      - name: Verify PG16 non-superuser operator lifecycle
+        run: |
+          set -o pipefail
+          output="ci-evidence/backend/pg16-worker-operator.txt"
+          (
+            cd backend
+            .venv/bin/python -m pytest -q -rs \
+              tests/migrations/test_worker_operator_creator_edges_postgres.py \
+              tests/migrations/test_worker_session_signal_postgres.py
+          ) | tee "$output"
+          if grep -Eq '[0-9]+ skipped|SKIPPED' "$output"; then
+            echo "PG16 worker operator lifecycle tests skipped" >&2
+            exit 1
+          fi
       - name: Run PostgreSQL ChannelOps integration tests
         run: |
           set -o pipefail
@@ -74,6 +89,15 @@ jobs:
             CHANNELOPS_REQUIRE_DATABASE="1" \
             go test -count=1 ./internal/channelops ./internal/store \
             | tee ci-evidence/backend/go-channelops-postgres.txt
+      - name: Run Go worker registration fence integration tests
+        run: |
+          set -o pipefail
+          output="ci-evidence/backend/go-worker-registration.txt"
+          go test -count=1 -v ./internal/worker ./cmd/vp-ffmpeg-worker | tee "$output"
+          if grep -Eq '^[[:space:]]*--- SKIP:' "$output"; then
+            echo "Go worker registration integration tests skipped" >&2
+            exit 1
+          fi
       - name: Run backend tests
         run: |
           set -o pipefail
@@ -167,6 +191,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -180,16 +206,32 @@ jobs:
           set -o pipefail
           mkdir -p ci-evidence/deploy
           printf '%s\n' "$GITHUB_SHA" > ci-evidence/deploy/commit.txt
+          run_contract() {
+            printf '\nRunning contract: %s\n' "$*"
+            "$@"
+          }
           {
-            bash tests/test_ci_workflow_contract.sh
-            bash tests/test_vp_deploy_ci_gate.sh
-            bash tests/test_vp_deploy_sync_extension.sh
-            bash tests/test_channelops_soak_watch.sh
-            bash tests/test_vp_unlisted_canary_scripts.sh
-            bash tests/test_vp_production_smoke_script.sh
-            bash tests/test_macos_deploy_paths.sh
-            bash -n deploy/swarm/deploy-sync-extension.sh
-            bash -n deploy/swarm/channelops-soak-watch.sh
+            run_contract bash tests/test_ci_workflow_contract.sh
+            run_contract bash tests/test_vp_deploy_ci_gate.sh
+            run_contract python3 tests/test_worker_admission_transaction.py
+            run_contract backend/.venv/bin/python -m pytest -q tests/test_registered_runtime_deploy.py tests/test_docker_secret_id_transport.py tests/test_failed_control_recovery.py
+            run_contract python3 tests/test_worker_marker_prior_config.py
+            run_contract python3 tests/test_worker_control_untouched_rollback.py
+            run_contract python3 tests/test_vp_stage_overlay.py
+            run_contract bash tests/test_worker_admission_deploy.sh
+            run_contract bash tests/test_worker_control_recovery_executor.sh
+            run_contract bash tests/test_worker_admission_rollback.sh
+            run_contract bash tests/test_staging_object_janitor_install.sh
+            run_contract bash tests/test_staging_object_janitor_run.sh
+            run_contract bash tests/test_worker_redis_marker_control.sh
+            run_contract bash tests/test_worker_marker_job_output.sh
+            run_contract bash tests/test_channelops_soak_watch.sh
+            run_contract bash tests/test_vp_unlisted_canary_scripts.sh
+            run_contract bash tests/test_vp_production_smoke_script.sh
+            run_contract bash tests/test_macos_deploy_paths.sh
+            run_contract bash -n deploy/swarm/deploy-sync-extension.sh
+            run_contract bash -n deploy/swarm/channelops-soak-watch.sh
+            run_contract bash tests/test_vp_deploy_sync_extension.sh
           } | tee ci-evidence/deploy/contracts.txt
       - name: Upload deployment evidence
         if: always()

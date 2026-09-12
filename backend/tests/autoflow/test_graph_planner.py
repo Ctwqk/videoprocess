@@ -190,22 +190,45 @@ async def test_graph_planner_uses_pipeline_draft_constraint_and_policy_repair():
 
 
 @pytest.mark.asyncio
-async def test_graph_planner_builds_dog_cat_vertical_timeline_from_prompt():
+@pytest.mark.parametrize(
+    ("publish_mode", "no_match_policy", "privacy"),
+    [
+        ("preview_only", "placeholder", None),
+        ("private_upload", "fail", "private"),
+        ("unlisted_upload", "fail", "unlisted"),
+        ("public_after_review", "fail", "private"),
+    ],
+)
+async def test_graph_planner_builds_dog_cat_vertical_timeline_from_prompt(
+    publish_mode, no_match_policy, privacy,
+):
     request = AutoFlowRequest(
         prompt="生成一个视频，上半部分是小狗，下半部分是小猫视频，上半部分先播放，下半部分后播放",
         planning_mode="ai_graph",
-        publish_mode="private_upload",
+        publish_mode=publish_mode,
     )
 
     outcome = await AutoFlowGraphPlanner().plan(request)
 
     node_types = [node.type for node in outcome.definition.nodes]
     assert outcome.validation.valid is True
+    assert validate_pipeline(outcome.definition).valid
     assert "concat_vertical_timeline" in node_types
-    assert "youtube_upload" in node_types
-    upload = next(node for node in outcome.definition.nodes if node.type == "youtube_upload")
-    assert upload.data.config["privacy"] == "private"
-    assert outcome.policy.requires_review is True
+    draft_trims = [node for node in outcome.draft.nodes if node.type == "smart_trim"]
+    trims = [node for node in outcome.definition.nodes if node.type == "smart_trim"]
+    assert len(draft_trims) == len(trims) == 2
+    assert all(node.config["no_match_policy"] == no_match_policy for node in draft_trims)
+    assert all(node.data.config["no_match_policy"] == no_match_policy for node in trims)
+    uploads = [node for node in outcome.definition.nodes if node.type == "youtube_upload"]
+    assert len(uploads) == (0 if privacy is None else 1)
+    if uploads:
+        assert uploads[0].data.config["privacy"] == privacy
+        assert any(
+            edge.source == "transcode_1" and edge.target == uploads[0].id
+            for edge in outcome.definition.edges
+        )
+    assert outcome.policy.requires_review is (privacy is not None)
+    assert outcome.graph_result.attempts[0].source == "rule.dog_cat_vertical_timeline"
     assert [candidate.asset_id for candidate in outcome.candidates] == ["autoflow-ai-graph-dog", "autoflow-ai-graph-cat"]
 
 

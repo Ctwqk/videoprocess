@@ -4,16 +4,22 @@ import logging
 import time
 import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.db import async_session
+from app.orchestrator.registered_db import registered_session
 from app.models.asset import Asset
 from app.models.artifact import Artifact, ArtifactKind
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
+from app.models.registered_worker_event_receipt import (
+    RegisteredWorkerEventReceipt,
+)
 from app.node_registry.registry import NodeTypeRegistry
 from app.orchestrator.artifact_cache import IntermediateArtifactCacheService
 from app.schemas.pipeline import PipelineDefinition
@@ -30,6 +36,13 @@ from app.services.job_execution_authority import (
     require_active_execution_authority,
     require_matching_node_execution_claim,
 )
+from app.services.registered_worker_event_receipt import (
+    RegisteredWorkerEvent,
+    RegisteredWorkerEventError,
+    RegisteredWorkerEventReceiptService,
+    stage_worker_task_dispatch,
+)
+from app.services.registered_worker_retry import release_registered_retry_claim
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +50,16 @@ TASK_STREAM = "vp:tasks:{worker_type}"
 EVENT_STREAM = "vp:events"
 CONSUMER_GROUP = "orchestrator"
 CONSUMER_NAME = "orchestrator-1"
+_worker_task_dispatches = RegisteredWorkerEventReceiptService(registered_session)
+
+
+def _require_receipt_entrypoint_for_registered_claim(
+    claim: NodeExecutionClaim,
+) -> None:
+    if claim.worker_registration_id is not None:
+        raise RegisteredWorkerEventError(
+            "registered worker events require a durable receipt"
+        )
 
 
 def _extract_worker_host(worker_id: str | None) -> str | None:
@@ -60,6 +83,12 @@ def _leaf_node_ids(definition: PipelineDefinition) -> set[str]:
     return {node.id for node in definition.nodes if node.id not in has_outgoing}
 
 
+def _utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class JobEngine:
     """Orchestrates job execution by dispatching nodes to workers via Redis Streams."""
 
@@ -68,6 +97,16 @@ class JobEngine:
 
     async def _maybe_finalize_job(self, db: AsyncSession, job: Job) -> bool:
         """Mark the job terminal once all node executions have reached a terminal state."""
+        finalized = await self._apply_job_finalization(db, job)
+        if finalized:
+            await db.commit()
+        return finalized
+
+    async def _apply_job_finalization(
+        self,
+        db: AsyncSession,
+        job: Job,
+    ) -> bool:
         statuses = [n.status for n in job.node_executions]
         active_statuses = {NodeStatus.PENDING, NodeStatus.QUEUED, NodeStatus.RUNNING}
         if any(status in active_statuses for status in statuses):
@@ -84,8 +123,7 @@ class JobEngine:
         if all(status == NodeStatus.SUCCEEDED for status in statuses):
             job.status = JobStatus.SUCCEEDED
             job.completed_at = datetime.utcnow()
-            await db.commit()
-            await self._mark_final_artifacts(db, job)
+            await self._mark_final_artifacts_uncommitted(db, job)
             logger.info(f"Job {job.id} SUCCEEDED")
             return True
 
@@ -100,9 +138,8 @@ class JobEngine:
                 if failed_nodes:
                     job.error_message = f"Failed nodes: {', '.join(failed_nodes)}"
             job.completed_at = datetime.utcnow()
-            await db.commit()
             if job.status != JobStatus.FAILED:
-                await self._mark_final_artifacts(db, job)
+                await self._mark_final_artifacts_uncommitted(db, job)
             logger.info(f"Job {job.id} {job.status.value}")
             return True
 
@@ -315,6 +352,16 @@ class JobEngine:
             for node_id in dep_map:
                 current_dep_map = dep_map
                 if guard_initial_launch:
+                    # Observations only skip work; eligible nodes still need fresh locks.
+                    observed = ne_by_node_id.get(node_id)
+                    if observed is None or observed.status != NodeStatus.PENDING:
+                        continue
+                    if not all(
+                        ne_by_node_id.get(dep_id)
+                        and ne_by_node_id[dep_id].status == NodeStatus.SUCCEEDED
+                        for dep_id in current_dep_map[node_id]
+                    ):
+                        continue
                     await self._before_initial_node_launch_recheck(job.id, node_id)
                     fresh_job = await self._lock_initial_launch_authority(db, job.id)
                     if fresh_job is None:
@@ -348,30 +395,66 @@ class JobEngine:
                         upstream_ne = ne_by_node_id.get(edge.source)
                         if upstream_ne and upstream_ne.output_artifact_id:
                             input_artifacts[edge.targetHandle] = str(upstream_ne.output_artifact_id)
-                input_artifact_objects = await self._input_artifacts_by_handle(db, input_artifacts)
-                if await self._apply_cached_artifact_if_available(db, job, ne, input_artifact_objects):
-                    continue
-
-                ne.status = NodeStatus.QUEUED
-                ne.queued_at = datetime.utcnow()
-                ne.input_artifact_ids = [
-                    uuid.UUID(aid) for aid in input_artifacts.values()
-                ]
-                await db.commit()
-
                 await self._before_node_dispatch_recheck(job.id, ne.node_id)
                 locked = await self._lock_dispatch_authority(db, job.id, ne.id)
                 if locked is None:
                     return
                 job, ne = locked
+                ne_by_node_id = {
+                    execution.node_id: execution
+                    for execution in job.node_executions
+                }
+                fresh_dep_map = (
+                    job.execution_plan.get("dependencies", {})
+                    if job.execution_plan
+                    else {}
+                )
+                deps = fresh_dep_map.get(ne.node_id, [])
+                if not all(
+                    ne_by_node_id.get(dep_id)
+                    and ne_by_node_id[dep_id].status
+                    == NodeStatus.SUCCEEDED
+                    for dep_id in deps
+                ):
+                    await db.rollback()
+                    continue
+                definition = PipelineDefinition.model_validate(
+                    job.pipeline_snapshot
+                )
+                input_artifacts = {}
+                for edge in definition.edges:
+                    if edge.target != ne.node_id:
+                        continue
+                    upstream_ne = ne_by_node_id.get(edge.source)
+                    if upstream_ne and upstream_ne.output_artifact_id:
+                        input_artifacts[edge.targetHandle] = str(
+                            upstream_ne.output_artifact_id
+                        )
+                input_artifact_objects = (
+                    await self._input_artifacts_by_handle(
+                        db,
+                        input_artifacts,
+                    )
+                )
+                if await self._apply_cached_artifact_uncommitted(
+                    db,
+                    job,
+                    ne,
+                    input_artifact_objects,
+                ):
+                    await db.commit()
+                    continue
+                preferred_hosts = self._preferred_hosts_for_node(
+                    ne_by_node_id,
+                    deps,
+                )
 
                 # Determine worker_type from node registry
                 registry = NodeTypeRegistry.get()
                 node_def = registry.get_type(ne.node_type)
                 worker_type = node_def.worker_type if node_def else "ffmpeg"
 
-                # Push task to Redis Stream
-                task = {
+                task: dict[str, str] = {
                     "job_id": str(job.id),
                     "node_execution_id": str(ne.id),
                     "node_id": ne.node_id,
@@ -383,8 +466,22 @@ class JobEngine:
                     "affinity_bounces": "0",
                 }
                 stream_key = TASK_STREAM.format(worker_type=worker_type)
-                await r.xadd(stream_key, task)
+                ne.status = NodeStatus.QUEUED
+                ne.queued_at = datetime.utcnow()
+                ne.input_artifact_ids = [
+                    uuid.UUID(aid) for aid in input_artifacts.values()
+                ]
+                await stage_worker_task_dispatch(
+                    db,
+                    origin_receipt_id=None,
+                    job_id=job.id,
+                    node_execution_id=ne.id,
+                    redis_stream=stream_key,
+                    consumer_group=f"{worker_type}-workers",
+                    payload=task,
+                )
                 await db.commit()
+                await _worker_task_dispatches.reconcile_pending_dispatches(r)
                 logger.info(
                     "Dispatched node %s (type=%s) to %s for job %s with preferred_hosts=%s",
                     ne.node_id, ne.node_type, stream_key, job.id, preferred_hosts,
@@ -408,7 +505,7 @@ class JobEngine:
             require_active_execution_authority(
                 authority,
                 job_statuses={JobStatus.RUNNING},
-                node_statuses={NodeStatus.QUEUED},
+                node_statuses={NodeStatus.PENDING},
             )
         except JobExecutionAuthorityBlocked:
             await db.rollback()
@@ -423,34 +520,67 @@ class JobEngine:
         ne: NodeExecution,
         input_artifacts: dict[str, Artifact],
     ) -> bool:
-        if not input_artifacts:
-            return False
+        applied = await self._apply_cached_artifact_uncommitted(
+            db,
+            job,
+            ne,
+            input_artifacts,
+        )
+        if applied:
+            await db.commit()
+        return applied
+
+    async def _apply_cached_artifact_uncommitted(
+        self,
+        db: AsyncSession,
+        job: Job,
+        ne: NodeExecution,
+        input_artifacts: dict[str, Artifact],
+        *,
+        registered: bool = False,
+    ) -> bool:
+        if registered and (
+            ne.status != NodeStatus.PENDING
+            or any(value is not None for value in (
+                ne.worker_id, ne.worker_registration_id, ne.worker_lease_epoch, ne.started_at,
+            ))
+        ):
+            raise RegisteredWorkerEventError("registered cache node authority changed")
         try:
             entry = await self.artifact_cache.lookup(
                 db,
                 node_type=ne.node_type,
                 node_config=ne.node_config or {},
                 input_artifacts=input_artifacts,
+                **({"registered": True} if registered else {}),
             )
         except Exception:
+            if registered:
+                raise
             logger.exception("Artifact cache lookup failed for job=%s node=%s", job.id, ne.node_id)
             return False
         if entry is None:
             return False
 
+        cached_artifact = await self.artifact_cache.materialize_hit(
+            db,
+            entry,
+            job_id=job.id,
+            node_execution_id=ne.id,
+        )
         ne.status = NodeStatus.SUCCEEDED
-        ne.started_at = ne.started_at or datetime.utcnow()
+        if not registered:
+            ne.started_at = ne.started_at or datetime.utcnow()
         ne.completed_at = datetime.utcnow()
         ne.progress = 100
-        ne.output_artifact_id = entry.output_artifact_id
+        ne.output_artifact_id = cached_artifact.id
         ne.input_artifact_ids = [artifact.id for artifact in input_artifacts.values()]
         await self.artifact_cache.record_hit(db, entry)
-        await db.commit()
         logger.info(
             "Reused cached artifact for job=%s node=%s artifact=%s",
             job.id,
             ne.node_id,
-            entry.output_artifact_id,
+            cached_artifact.id,
         )
         return True
 
@@ -515,6 +645,317 @@ class JobEngine:
             job_id=job.id,
         )
 
+    async def apply_registered_worker_event(
+        self,
+        db: AsyncSession,
+        receipt: RegisteredWorkerEventReceipt,
+        event: RegisteredWorkerEvent,
+    ) -> None:
+        """Apply one registered event inside its receipt transaction."""
+        self._require_accepted_receipt(receipt, event)
+        job = (
+            await db.execute(
+                select(Job)
+                .where(Job.id == event.job_id)
+                .options(selectinload(Job.node_executions))
+            )
+        ).scalar_one_or_none()
+        if job is None:
+            raise RegisteredWorkerEventError(
+                "registered event job is missing"
+            )
+        ne = next(
+            (
+                node
+                for node in job.node_executions
+                if node.id == event.node_execution_id
+            ),
+            None,
+        )
+        if (
+            ne is None
+            or job.status != JobStatus.RUNNING
+            or ne.status != NodeStatus.RUNNING
+            or ne.worker_id != event.claim.worker_id
+            or ne.worker_registration_id
+            != event.claim.worker_registration_id
+            or ne.worker_lease_epoch != event.claim.worker_lease_epoch
+            or not isinstance(ne.started_at, datetime)
+            or _utc_datetime(ne.started_at)
+            != _utc_datetime(event.claim.started_at)
+        ):
+            raise RegisteredWorkerEventError(
+                "registered event node authority changed"
+            )
+
+        if event.event_type == "node_completed":
+            await self._apply_registered_completion(
+                db,
+                receipt,
+                event,
+                job,
+                ne,
+            )
+        else:
+            await self._apply_registered_failure(
+                db,
+                receipt,
+                event,
+                job,
+                ne,
+            )
+        await db.flush()
+
+    async def _apply_registered_completion(
+        self,
+        db: AsyncSession,
+        receipt: RegisteredWorkerEventReceipt,
+        event: RegisteredWorkerEvent,
+        job: Job,
+        ne: NodeExecution,
+    ) -> None:
+        try:
+            output_artifact_id = uuid.UUID(
+                event.payload["output_artifact_id"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RegisteredWorkerEventError(
+                "registered completion artifact is invalid"
+            ) from exc
+        output_artifact = await db.get(Artifact, output_artifact_id)
+        if (
+            output_artifact is None
+            or output_artifact.job_id != job.id
+            or output_artifact.node_execution_id != ne.id
+        ):
+            raise RegisteredWorkerEventError(
+                "registered completion artifact authority mismatch"
+            )
+
+        ne.status = NodeStatus.SUCCEEDED
+        ne.output_artifact_id = output_artifact_id
+        ne.completed_at = datetime.utcnow()
+        ne.progress = 100
+        await self._write_artifact_cache_for_node(db, job, ne)
+
+        if await self._apply_job_finalization(db, job):
+            return
+        dep_map = (
+            job.execution_plan.get("dependencies", {})
+            if job.execution_plan
+            else {}
+        )
+        await self._stage_receipt_dispatches(
+            db,
+            receipt,
+            job,
+            dep_map,
+        )
+        await self._apply_job_finalization(db, job)
+
+    async def _apply_registered_failure(
+        self,
+        db: AsyncSession,
+        receipt: RegisteredWorkerEventReceipt,
+        event: RegisteredWorkerEvent,
+        job: Job,
+        ne: NodeExecution,
+    ) -> None:
+        error = event.payload.get("error", "Unknown error")[:2000]
+        if ne.retry_count < 1:
+            ne.retry_count += 1
+            ne.status = NodeStatus.QUEUED
+            ne.error_message = None
+            ne.queued_at = datetime.utcnow()
+            await self._stage_receipt_dispatch(
+                db,
+                receipt,
+                job,
+                ne,
+            )
+            await db.flush()
+            await release_registered_retry_claim(db, receipt.id)
+            return
+
+        ne.status = NodeStatus.FAILED
+        ne.error_message = error
+        ne.completed_at = datetime.utcnow()
+        dep_map = (
+            job.execution_plan.get("dependencies", {})
+            if job.execution_plan
+            else {}
+        )
+        await self._skip_downstream(db, job, ne.node_id, dep_map)
+        job.error_message = f"Node '{ne.node_label}' failed: {error}"
+        await self._apply_job_finalization(db, job)
+
+    async def _stage_receipt_dispatches(
+        self,
+        db: AsyncSession,
+        receipt: RegisteredWorkerEventReceipt,
+        job: Job,
+        dep_map: dict[str, list[str]],
+    ) -> None:
+        while await self._stage_ready_receipt_dispatches_once(
+            db,
+            receipt,
+            job,
+            dep_map,
+        ):
+            pass
+
+    async def _stage_ready_receipt_dispatches_once(
+        self,
+        db: AsyncSession,
+        receipt: RegisteredWorkerEventReceipt,
+        job: Job,
+        dep_map: dict[str, list[str]],
+    ) -> bool:
+        progressed = False
+        ne_by_node_id = {ne.node_id: ne for ne in job.node_executions}
+        definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
+        for node_id, deps in dep_map.items():
+            ne = ne_by_node_id.get(node_id)
+            if ne is None or ne.status != NodeStatus.PENDING:
+                continue
+            if not all(
+                ne_by_node_id.get(dep_id)
+                and ne_by_node_id[dep_id].status == NodeStatus.SUCCEEDED
+                for dep_id in deps
+            ):
+                continue
+            input_artifacts: dict[str, str] = {}
+            for edge in definition.edges:
+                if edge.target != node_id:
+                    continue
+                upstream = ne_by_node_id.get(edge.source)
+                if upstream and upstream.output_artifact_id:
+                    input_artifacts[edge.targetHandle] = str(
+                        upstream.output_artifact_id
+                    )
+            input_objects = await self._input_artifacts_by_handle(
+                db,
+                input_artifacts,
+            )
+            if await self._apply_cached_artifact_uncommitted(
+                db,
+                job,
+                ne,
+                input_objects,
+                registered=True,
+            ):
+                progressed = True
+                continue
+            ne.status = NodeStatus.QUEUED
+            ne.queued_at = datetime.utcnow()
+            ne.input_artifact_ids = [
+                uuid.UUID(value) for value in input_artifacts.values()
+            ]
+            await self._stage_receipt_dispatch(
+                db,
+                receipt,
+                job,
+                ne,
+                input_artifacts=input_artifacts,
+                preferred_hosts=self._preferred_hosts_for_node(
+                    ne_by_node_id,
+                    deps,
+                ),
+            )
+            progressed = True
+        return progressed
+
+    async def _stage_receipt_dispatch(
+        self,
+        db: AsyncSession,
+        receipt: RegisteredWorkerEventReceipt,
+        job: Job,
+        ne: NodeExecution,
+        *,
+        input_artifacts: dict[str, str] | None = None,
+        preferred_hosts: list[str] | None = None,
+    ) -> None:
+        if receipt.id is None:
+            raise RegisteredWorkerEventError(
+                "registered event receipt has no durable identity"
+            )
+        if input_artifacts is None:
+            input_artifacts = await self._receipt_input_artifacts(job, ne)
+        if preferred_hosts is None:
+            dep_map = (
+                job.execution_plan.get("dependencies", {})
+                if job.execution_plan
+                else {}
+            )
+            deps = dep_map.get(ne.node_id, [])
+            preferred_hosts = self._preferred_hosts_for_node(
+                {node.node_id: node for node in job.node_executions},
+                deps,
+            )
+        registry = NodeTypeRegistry.get()
+        node_def = registry.get_type(ne.node_type)
+        worker_type = node_def.worker_type if node_def else "ffmpeg"
+        payload = {
+            "job_id": str(job.id),
+            "node_execution_id": str(ne.id),
+            "node_id": ne.node_id,
+            "node_type": ne.node_type,
+            "config": json.dumps(ne.node_config),
+            "input_artifacts": json.dumps(input_artifacts),
+            "preferred_hosts": json.dumps(preferred_hosts),
+            "affinity_enqueued_at": str(int(time.time())),
+            "affinity_bounces": "0",
+        }
+        await stage_worker_task_dispatch(
+            db,
+            origin_receipt_id=receipt.id,
+            job_id=job.id,
+            node_execution_id=ne.id,
+            redis_stream=TASK_STREAM.format(worker_type=worker_type),
+            consumer_group=f"{worker_type}-workers",
+            payload=payload,
+        )
+
+    async def _receipt_input_artifacts(
+        self,
+        job: Job,
+        ne: NodeExecution,
+    ) -> dict[str, str]:
+        definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
+        nodes = {node.node_id: node for node in job.node_executions}
+        result: dict[str, str] = {}
+        for edge in definition.edges:
+            if edge.target != ne.node_id:
+                continue
+            upstream = nodes.get(edge.source)
+            if upstream and upstream.output_artifact_id:
+                result[edge.targetHandle] = str(
+                    upstream.output_artifact_id
+                )
+        return result
+
+    @staticmethod
+    def _require_accepted_receipt(
+        receipt: RegisteredWorkerEventReceipt,
+        event: RegisteredWorkerEvent,
+    ) -> None:
+        if (
+            receipt.application_state != "accepted"
+            or receipt.redis_stream != event.redis_stream
+            or receipt.consumer_group != event.consumer_group
+            or receipt.message_id != event.message_id
+            or receipt.payload_sha256 != event.payload_sha256
+            or receipt.job_id != event.job_id
+            or receipt.node_execution_id != event.node_execution_id
+            or receipt.worker_registration_id
+            != event.claim.worker_registration_id
+            or receipt.worker_lease_epoch
+            != event.claim.worker_lease_epoch
+        ):
+            raise RegisteredWorkerEventError(
+                "registered event receipt authority mismatch"
+            )
+
     @staticmethod
     def _preferred_hosts_for_node(
         ne_by_node_id: dict[str, NodeExecution],
@@ -541,6 +982,7 @@ class JobEngine:
         claim: NodeExecutionClaim,
     ) -> None:
         """Handle a node completion event: update status, dispatch downstream."""
+        _require_receipt_entrypoint_for_registered_claim(claim)
         async with async_session() as db:
             try:
                 authority = await lock_job_execution_authority(
@@ -618,6 +1060,7 @@ class JobEngine:
         claim: NodeExecutionClaim,
     ) -> None:
         """Handle a node failure event."""
+        _require_receipt_entrypoint_for_registered_claim(claim)
         async with async_session() as db:
             try:
                 authority = await lock_job_execution_authority(
@@ -692,7 +1135,7 @@ class JobEngine:
                     node_def = registry.get_type(ne.node_type)
                     worker_type = node_def.worker_type if node_def else "ffmpeg"
 
-                    task = {
+                    task: dict[str, str] = {
                         "job_id": str(job.id),
                         "node_execution_id": str(ne.id),
                         "node_id": ne.node_id,
@@ -753,6 +1196,14 @@ class JobEngine:
 
     async def _mark_final_artifacts(self, db: AsyncSession, job: Job) -> None:
         """Mark output artifacts of terminal nodes as FINAL."""
+        await self._mark_final_artifacts_uncommitted(db, job)
+        await db.commit()
+
+    async def _mark_final_artifacts_uncommitted(
+        self,
+        db: AsyncSession,
+        job: Job,
+    ) -> None:
         definition = PipelineDefinition.model_validate(job.pipeline_snapshot)
         terminal_node_ids = _leaf_node_ids(definition)
 
@@ -761,7 +1212,6 @@ class JobEngine:
                 artifact = await db.get(Artifact, ne.output_artifact_id)
                 if artifact:
                     artifact.kind = ArtifactKind.FINAL
-        await db.commit()
 
 
 # Singleton

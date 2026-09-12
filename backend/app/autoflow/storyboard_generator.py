@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+import re
+
 from app.schemas.autoflow import (
     AutoFlowStoryboardRequest,
     AutoFlowStoryboardResponse,
@@ -10,6 +13,9 @@ from app.schemas.autoflow import (
     VisualStyleSpec,
 )
 from app.autoflow.platform_profiles import PlatformProfile, PlatformProfileService
+
+
+_MIN_TRIM_SECONDS = 0.3  # SmartTrim's registered min_clip_duration lower bound.
 
 
 class StoryboardGenerator:
@@ -57,13 +63,15 @@ def _storyboard_strategy(request: AutoFlowStoryboardRequest) -> str:
 
 def _subject(prompt: str) -> str:
     lowered = prompt.lower()
-    if any(term in prompt for term in ("小猫", "猫咪")) or "kitten" in lowered or "cat" in lowered:
+    if any(term in prompt for term in ("小猫", "猫咪")) or re.search(r"\b(?:kittens?|cats?)\b", lowered):
         return "小猫"
-    if any(term in prompt for term in ("小狗", "狗狗")) or "puppy" in lowered or "dog" in lowered:
-        return "dog" if "dog" in lowered and "小狗" not in prompt else "小狗"
-    if "产品" in prompt or "product" in lowered:
+    english_dog = re.search(r"\bdogs?\b", lowered)
+    if any(term in prompt for term in ("小狗", "狗狗")) or english_dog or re.search(r"\bpupp(?:y|ies)\b", lowered):
+        return "dog" if english_dog and "小狗" not in prompt else "小狗"
+    if "产品" in prompt or re.search(r"\bproducts?\b", lowered):
         return "产品"
-    return "视频主题"
+    # Retain free-form topic evidence while bounding generated titles and queries.
+    return " ".join(prompt.split())[:80]
 
 
 def _shot_templates(subject: str, generation_enabled: bool) -> list[ShotSpec]:
@@ -203,7 +211,7 @@ def _shot(
         id=shot_id,
         role=role,  # type: ignore[arg-type]
         description=description,
-        director_notes=f"优先选择主体清楚、动作完整、无明显水印和安全风险的素材。检索失败时保留缺失状态，不用错误素材冒充。",
+        director_notes="优先选择主体清楚、动作完整、无明显水印和安全风险的素材。检索失败时保留缺失状态，不用错误素材冒充。",
         search_query=search_query,
         search_queries=[search_query, generation_prompt],
         negative_queries=["水印", "低清晰度", "危险", "侵权"],
@@ -230,7 +238,11 @@ def _fit_durations(
     if not shots:
         return [], []
     total = float(target_duration or len(shots) * 4)
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("target duration must be finite and positive")
     count = len(shots)
+    if total < count * _MIN_TRIM_SECONDS:
+        raise ValueError("target duration is too short for the supported clip minimum")
     min_total = profile.min_shot_seconds * count
     max_total = profile.max_shot_seconds * count
     relaxed = total < min_total or total > max_total
@@ -248,6 +260,8 @@ def _fit_durations(
 
     if relaxed:
         durations = _redistribute_relaxed(durations, total)
+        if any(duration < _MIN_TRIM_SECONDS for duration in durations):
+            durations = [total / count] * count
     else:
         durations = [_clamp_duration(duration, profile) for duration in durations]
         durations = _redistribute_to_total(durations, total, profile, protected_indices={0})
@@ -255,11 +269,13 @@ def _fit_durations(
     rounded = [round(duration, 3) for duration in durations]
     if rounded:
         rounded[-1] = round(total - sum(rounded[:-1]), 3)
+    if any(duration < _MIN_TRIM_SECONDS for duration in rounded):
+        raise ValueError("target duration is too short for the supported clip minimum")
     updated = [
         shot.model_copy(
             update={
                 "target_duration": rounded[index],
-                "min_duration": profile.min_shot_seconds,
+                "min_duration": min(profile.min_shot_seconds, rounded[index]),
                 "max_duration": max(profile.max_shot_seconds, rounded[index]),
             }
         )

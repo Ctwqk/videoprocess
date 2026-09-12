@@ -1,10 +1,159 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Literal
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _canonical_inventory_uuid(value: str) -> str:
+    if str(UUID(value)) != value:
+        raise ValueError("canonical UUID required")
+    return value
+
+
+InventoryUUID = Annotated[str, AfterValidator(_canonical_inventory_uuid)]
+InventorySHA256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+InventoryText = Annotated[str, Field(min_length=1, max_length=512),
+                          AfterValidator(lambda value: value if value.strip() else _blank_inventory_text())]
+
+
+def _blank_inventory_text() -> str:
+    raise ValueError("nonblank text required")
+
+
+class OwnedSeedProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    rights: Literal["owned"]
+    provenance: Literal["generated"]
+    evidence_reference: InventoryText
+    evidence_sha256: InventorySHA256
+    attestation: InventoryText
+
+
+class OwnedSeedInventoryEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    asset_id: InventoryUUID
+    expected_content_sha256: InventorySHA256
+    provenance_evidence: OwnedSeedProvenance
+    prompt: Annotated[str, Field(min_length=1, max_length=4096)]
+    title_seed: Annotated[str, Field(max_length=512)] = ""
+
+    @field_validator("prompt")
+    @classmethod
+    def nonblank_prompt(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("nonblank prompt required")
+        return value
+
+
+class OwnedSeedInventoryCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    client_request_id: InventoryUUID
+    topic_lane_id: InventoryUUID
+    lane_format_id: InventoryUUID
+    target_account_id: InventoryUUID
+    platform_channel_id: Annotated[str, Field(pattern=r"^UC[A-Za-z0-9_-]{22}$")]
+    starts_at: datetime
+    expires_at: datetime
+    privacy: Literal["unlisted"]
+    max_admissions: Literal[7]
+    minimum_interval_seconds: Literal[86400]
+    entries: Annotated[list[OwnedSeedInventoryEntry], Field(min_length=7, max_length=7)]
+
+    @field_validator("starts_at", "expires_at")
+    @classmethod
+    def utc_time(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise ValueError("UTC timestamp required")
+        return value.astimezone(timezone.utc)
+
+    @field_validator("max_admissions", "minimum_interval_seconds", mode="before")
+    @classmethod
+    def integer_limits(cls, value: Any) -> Any:
+        if type(value) is not int:
+            raise ValueError("integer required")
+        return value
+
+    @model_validator(mode="after")
+    def finite_window_and_distinct_inputs(self) -> OwnedSeedInventoryCreate:
+        if self.expires_at - self.starts_at != timedelta(days=7):
+            raise ValueError("exact seven-day window required")
+        if len({entry.asset_id for entry in self.entries}) != 7:
+            raise ValueError("seven distinct assets required")
+        if len({entry.expected_content_sha256 for entry in self.entries}) != 7:
+            raise ValueError("seven distinct content hashes required")
+        return self
+
+
+class OwnedHistoryOperationLocator(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    operation_id: InventoryUUID
+    legacy_account_id: InventoryUUID
+    legacy_channel_profile_id: InventoryUUID
+
+
+class OwnedRetiredPreuploadLocator(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    operation_id: Literal["c25b9c38-b96a-4a21-80d0-352180cea206"]
+    legacy_account_id: Literal["2c4184d5-a02e-41e3-aeeb-16db8122f6e1"]
+    legacy_channel_profile_id: Literal["4057a1a3-c37c-4bae-85a9-6d9d3dcac869"]
+
+
+class OwnedHistoryLocators(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    operations: Annotated[list[OwnedHistoryOperationLocator], Field(max_length=128)]
+    retired_unassigned_preupload: OwnedRetiredPreuploadLocator | None = None
+
+    @model_validator(mode="after")
+    def exact_unique_scope(self) -> OwnedHistoryLocators:
+        ids = [item.operation_id for item in self.operations]
+        if ids != sorted(set(ids)) or not ids and self.retired_unassigned_preupload is None:
+            raise ValueError("nonempty sorted unique history locators required")
+        if self.retired_unassigned_preupload and self.retired_unassigned_preupload.operation_id in ids:
+            raise ValueError("retired operation is not an upload qualification")
+        return self
+
+
+class OwnedSeedInventoryCreateV2(OwnedSeedInventoryCreate):
+    version: Literal[2]
+    history_locators: OwnedHistoryLocators
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def integer_version(cls, value: Any) -> Any:
+        if type(value) is not int:
+            raise ValueError("integer version required")
+        return value
+
+
+class OwnedSeedInventoryApprove(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    manifest_sha256: InventorySHA256
+    approval_reference: InventoryText
+    tick_interval_minutes: Literal[1]
+    predecessor_inventory_id: InventoryUUID | None = None
+    predecessor_closeout_sha256: InventorySHA256 | None = None
+
+    @field_validator("tick_interval_minutes", mode="before")
+    @classmethod
+    def integer_interval(cls, value: Any) -> Any:
+        if type(value) is not int:
+            raise ValueError("integer required")
+        return value
+
+    @model_validator(mode="after")
+    def predecessor_pair(self) -> OwnedSeedInventoryApprove:
+        if (self.predecessor_inventory_id is None) != (self.predecessor_closeout_sha256 is None):
+            raise ValueError("predecessor and closeout digest required together")
+        return self
+
+
+class OwnedSeedInventoryRevoke(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    manifest_sha256: InventorySHA256
+    reason: InventoryText
 
 
 class ChannelProfileCreate(BaseModel):

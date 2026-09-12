@@ -6,8 +6,15 @@ from datetime import datetime
 
 import redis.asyncio as aioredis
 from app.config import settings
+from app.orchestrator.registered_db import registered_session
 from app.orchestrator.engine import engine, EVENT_STREAM
-from app.services.job_execution_authority import NodeExecutionClaim
+from app.services.job_execution_authority import (
+    NodeExecutionClaim,
+)
+from app.services.registered_worker_event_receipt import (
+    RegisteredWorkerEventReceiptService,
+    parse_registered_worker_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +24,9 @@ PEL_RECLAIM_INTERVAL = 60  # seconds
 PEL_MIN_IDLE = 30000       # ms
 REDIS_BLOCK_MILLISECONDS = 5000
 REDIS_SOCKET_TIMEOUT_SECONDS = 30.0
+_registered_event_receipts = RegisteredWorkerEventReceiptService(
+    registered_session
+)
 
 
 class UnverifiableExecutionClaimEvent(RuntimeError):
@@ -37,6 +47,25 @@ def _redis() -> aioredis.Redis:
 async def _reclaim_pending(r: aioredis.Redis) -> None:
     """Reclaim stale pending events from any consumer in the group."""
     try:
+        await _registered_event_receipts.reconcile_cancelled_dispatches(r)
+    except Exception:
+        logger.exception("Cancelled worker task reconciliation failed")
+    try:
+        await _registered_event_receipts.reconcile_pending_dispatches(r)
+    except Exception:
+        logger.exception("Worker task dispatch reconciliation failed")
+    try:
+        await (
+            _registered_event_receipts
+            .reconcile_authorized_task_acknowledgements(r)
+        )
+    except Exception:
+        logger.exception("Worker task acknowledgement reconciliation failed")
+    try:
+        await _registered_event_receipts.reconcile_pending_acknowledgements(r)
+    except Exception:
+        logger.exception("Registered event acknowledgement reconciliation failed")
+    try:
         claimed = await r.xautoclaim(
             EVENT_STREAM, CONSUMER_GROUP, CONSUMER_NAME,
             min_idle_time=PEL_MIN_IDLE,
@@ -48,8 +77,7 @@ async def _reclaim_pending(r: aioredis.Redis) -> None:
                 if data:
                     logger.info(f"Reclaimed pending event {msg_id}")
                     try:
-                        await _handle_event(data)
-                        await r.xack(EVENT_STREAM, CONSUMER_GROUP, msg_id)
+                        await _process_event(r, msg_id, data)
                     except Exception:
                         logger.exception(f"Failed to process reclaimed event {msg_id}")
     except Exception:
@@ -97,8 +125,7 @@ async def event_listener() -> None:
                 for stream_name, entries in messages:
                     for msg_id, data in entries:
                         try:
-                            await _handle_event(data)
-                            await r.xack(EVENT_STREAM, CONSUMER_GROUP, msg_id)
+                            await _process_event(r, msg_id, data)
                         except Exception:
                             logger.exception(f"Failed to handle event {msg_id}: {data}")
 
@@ -109,6 +136,78 @@ async def event_listener() -> None:
                 await asyncio.sleep(2)
     finally:
         await r.aclose()
+
+
+async def _ack_event(
+    redis: aioredis.Redis,
+    message_id: str,
+    data: dict,
+) -> None:
+    try:
+        job_id = uuid.UUID(data["job_id"])
+        node_execution_id = uuid.UUID(data["node_execution_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise UnverifiableExecutionClaimEvent(
+            "event acknowledgement has invalid identifiers"
+        ) from exc
+    claim = _execution_claim_from_event(
+        data,
+        job_id,
+        node_execution_id,
+    )
+    if claim is None:
+        raise UnverifiableExecutionClaimEvent(
+            "event acknowledgement has no valid execution claim"
+        )
+    if claim.worker_registration_id is None:
+        await redis.xack(EVENT_STREAM, CONSUMER_GROUP, message_id)
+        return
+    raise UnverifiableExecutionClaimEvent(
+        "registered event acknowledgement requires an applied receipt"
+    )
+
+
+async def _process_event(
+    redis: aioredis.Redis,
+    message_id: str,
+    data: dict,
+) -> None:
+    has_registration_claim = (
+        data.get("worker_registration_id") is not None
+        or data.get("worker_lease_epoch") is not None
+    )
+    if not has_registration_claim:
+        await _handle_event(data)
+        await _ack_event(redis, message_id, data)
+        return
+
+    event = parse_registered_worker_event(
+        redis_stream=EVENT_STREAM,
+        consumer_group=CONSUMER_GROUP,
+        message_id=message_id,
+        payload=data,
+    )
+    receipt_id = await _registered_event_receipts.accept_and_apply(
+        event,
+        engine.apply_registered_worker_event,
+    )
+    if receipt_id is None:
+        logger.error(
+            "quarantined registered worker event "
+            "stream=%s group=%s message=%s job=%s node=%s",
+            event.redis_stream,
+            event.consumer_group,
+            event.message_id,
+            event.job_id,
+            event.node_execution_id,
+        )
+        await _registered_event_receipts.acknowledge_applied(redis, event)
+        return
+    await _registered_event_receipts.deliver_pending_dispatches(
+        redis,
+        receipt_id,
+    )
+    await _registered_event_receipts.acknowledge_applied(redis, event)
 
 
 async def _handle_event(data: dict) -> None:
@@ -138,6 +237,10 @@ async def _handle_event(data: dict) -> None:
             node_execution_id,
         )
         return
+    if claim.worker_registration_id is not None:
+        raise UnverifiableExecutionClaimEvent(
+            f"{event_type} registered event requires a durable receipt"
+        )
 
     if event_type == "node_completed":
         try:
@@ -182,9 +285,32 @@ def _execution_claim_from_event(
         return None
     if started_at.tzinfo is None or started_at.utcoffset() is None:
         return None
+    raw_registration_id = data.get("worker_registration_id")
+    raw_lease_epoch = data.get("worker_lease_epoch")
+    if raw_registration_id is None and raw_lease_epoch is None:
+        registration_id = None
+        lease_epoch = None
+    else:
+        try:
+            registration_id = uuid.UUID(str(raw_registration_id))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if type(raw_lease_epoch) is int:
+            lease_epoch = raw_lease_epoch
+        elif (
+            isinstance(raw_lease_epoch, str)
+            and raw_lease_epoch.isdigit()
+        ):
+            lease_epoch = int(raw_lease_epoch)
+        else:
+            return None
+        if lease_epoch <= 0:
+            return None
     return NodeExecutionClaim(
         job_id=job_id,
         node_execution_id=node_execution_id,
         worker_id=worker_id.strip(),
         started_at=started_at,
+        worker_registration_id=registration_id,
+        worker_lease_epoch=lease_epoch,
     )

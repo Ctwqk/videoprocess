@@ -54,6 +54,7 @@ _INTERNAL_CRITICAL_CODES = frozenset(
         "unsafe_lane_privacy",
         "unsafe_publication_privacy",
         "unsafe_upload_operation_privacy",
+        "owned_inventory_stop",
     }
 )
 CRITICAL_CODES = _INTERNAL_CRITICAL_CODES | ALLOWED_EXTERNAL_CONDITIONS
@@ -96,6 +97,7 @@ class SoakGuardPolicy:
 class SoakGuardAssessment:
     critical_codes: tuple[str, ...]
     metrics: Mapping[str, str | int]
+    inventory_id: uuid.UUID | None = None
 
     def __post_init__(self) -> None:
         codes = tuple(sorted(set(self.critical_codes)))
@@ -136,6 +138,15 @@ async def assess_channelops_soak(
     if channel is None:
         critical_codes.add("channel_missing")
         return _assessment(critical_codes, metrics)
+
+    if channel.owned_seed_inventory_id is not None:
+        from app.services.owned_inventory_feedback import check_owned_inventory_feedback
+
+        inventory_id = channel.owned_seed_inventory_id
+        feedback = await check_owned_inventory_feedback(
+            db, policy.channel_id, inventory_id, external_conditions=tuple(sorted(external_codes)),
+        )
+        return inventory_soak_assessment(policy.channel_id, inventory_id, feedback)
 
     metrics["channel_count"] = 1
     if not channel.enabled:
@@ -427,6 +438,15 @@ def _assessment(
     metrics: Mapping[str, str | int],
 ) -> SoakGuardAssessment:
     return SoakGuardAssessment(tuple(sorted(critical_codes)), metrics)
+
+
+def inventory_soak_assessment(channel_id, inventory_id, feedback) -> SoakGuardAssessment:
+    return SoakGuardAssessment(
+        ("owned_inventory_stop",) if feedback.hold_reason else (),
+        {"channel_id": str(channel_id), **feedback.metrics,
+         "inventory_hold_reason": feedback.hold_reason or ""},
+        inventory_id=inventory_id,
+    )
 
 
 def _publication_timestamp(publication: PublicationRecord) -> datetime | None:

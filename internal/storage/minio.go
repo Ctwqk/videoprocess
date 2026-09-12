@@ -69,12 +69,21 @@ func (b *MinIOBackend) Read(ctx context.Context, path string) ([]byte, error) {
 }
 
 func (b *MinIOBackend) Save(ctx context.Context, path string, data []byte) error {
+	return b.SaveStream(ctx, path, bytes.NewReader(data), int64(len(data)))
+}
+
+func (b *MinIOBackend) SaveStream(
+	ctx context.Context,
+	path string,
+	reader io.Reader,
+	size int64,
+) error {
 	_, err := b.client.PutObject(
 		ctx,
 		b.bucket,
 		path,
-		bytes.NewReader(data),
-		int64(len(data)),
+		reader,
+		size,
 		minio.PutObjectOptions{ContentType: "application/octet-stream"},
 	)
 	return err

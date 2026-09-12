@@ -7,6 +7,7 @@ from app.db import get_db
 from app.schemas.asset import AssetResponse, AssetListResponse
 from app.services.asset_service import upload_asset, get_asset, list_assets, delete_asset
 from app.storage.manager import get_storage
+from app.services.owned_seed_inventory import OwnedInventoryError
 
 router = APIRouter(prefix="/api/v1/assets", tags=["assets"])
 
@@ -78,7 +79,11 @@ async def download(asset_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
 @router.delete("/{asset_id}")
 async def delete(asset_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    deleted = await delete_asset(db, asset_id)
+    try:
+        deleted = await delete_asset(db, asset_id)
+    except OwnedInventoryError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="owned_inventory_asset_pinned") from None
     if not deleted:
         raise HTTPException(status_code=404, detail="Asset not found")
     return {"status": "deleted"}

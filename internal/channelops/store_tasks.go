@@ -40,7 +40,7 @@ func (s *Store) RunTickWithOptions(
 		return errors.New("agent_tick cannot call PDS while a database fence is held")
 	}
 	var preparation tickPreparation
-	if err := s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
+	if err := s.withOwnedTickChannelPhase(ctx, channelID, h, func(fencedStore *Store) error {
 		prepared, err := fencedStore.prepareTick(ctx, channelID, bucket, options)
 		preparation = prepared
 		return err
@@ -48,7 +48,7 @@ func (s *Store) RunTickWithOptions(
 		return err
 	}
 	revalidate := func() error {
-		return s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
+		return s.withOwnedTickChannelPhase(ctx, channelID, h, func(fencedStore *Store) error {
 			current, err := fencedStore.prepareTick(ctx, channelID, bucket, options)
 			if err != nil {
 				return err
@@ -66,7 +66,7 @@ func (s *Store) RunTickWithOptions(
 	if err != nil {
 		return err
 	}
-	return s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
+	return s.withOwnedTickChannelPhase(ctx, channelID, h, func(fencedStore *Store) error {
 		return fencedStore.finalizeTick(ctx, preparation, candidates, alerts)
 	})
 }
@@ -80,6 +80,7 @@ type tickPreparation struct {
 	Bucket      string
 	Options     agentTickOptions
 	Now         time.Time
+	Owned       *ownedTickState
 }
 
 func (p tickPreparation) validate(current tickPreparation) error {
@@ -102,6 +103,9 @@ func (s *Store) prepareTick(
 	}
 	if channel.IntakePausedAt != nil {
 		return tickPreparation{}, fmt.Errorf("%w: channel %s intake is paused", ErrChannelExecutionBlocked, channelID)
+	}
+	if channel.OwnedSeedInventoryID != nil {
+		return s.prepareOwnedTick(ctx, channel, bucket, options)
 	}
 	candidates := BuildTickCandidates(channel, lanes, accounts, seeds, signals, laneFormats, bucket)
 	var taskCount int64
@@ -160,6 +164,9 @@ func (s *Store) finalizeTick(
 	)
 	if err != nil {
 		return err
+	}
+	if preparation.Owned != nil || current.Owned != nil {
+		return s.finalizeOwnedTick(ctx, preparation, current, candidates)
 	}
 	if err := preparation.validate(current); err != nil {
 		return err
@@ -283,6 +290,11 @@ func evaluateTickCandidatePolicyWithRevalidation(
 	revalidate func() error,
 ) ([]TickCandidate, []AlertPayload, error) {
 	if h.PDS == nil {
+		for i := range candidates {
+			if candidates[i].owned != nil {
+				rejectCandidate(&candidates[i], "owned_inventory_pds_unavailable", "Owned inventory requires a policy decision.")
+			}
+		}
 		return candidates, nil, nil
 	}
 	alerts := []AlertPayload{}
@@ -293,29 +305,33 @@ func evaluateTickCandidatePolicyWithRevalidation(
 		}
 		if revalidate != nil {
 			if err := revalidate(); err != nil {
+				if candidate.owned != nil {
+					rejectCandidate(candidate, "owned_inventory_inputs_changed", "Owned inventory inputs changed.")
+					continue
+				}
 				return candidates, nil, err
 			}
 		}
-		decision, err := h.PDS.Decide(ctx, PDSDecisionRequest{
-			ActorID:    candidate.Account.ID,
-			ActionType: "candidate_accept",
-			Platform:   "youtube",
-			Content: map[string]any{
-				"title":       candidate.TitleSeed,
-				"description": candidate.Prompt,
-			},
-			Context: map[string]any{
-				"channel_profile_id": channel.ID,
-				"candidate_id":       candidate.CandidateID,
-				"source_kind":        candidate.SourceKind,
-				"topic_lane_id":      candidateLaneID(*candidate),
-				"lane_format_id":     candidateFormatID(*candidate),
-			},
-		})
+		request := ownedCandidatePolicyRequest(channel, *candidate)
+		decision, err := h.PDS.Decide(ctx, request)
 		if err != nil {
+			if candidate.owned != nil {
+				rejectCandidate(candidate, "owned_inventory_pds_unavailable", "Owned inventory policy call failed.")
+				continue
+			}
 			return candidates, nil, err
 		}
 		candidate.PDSDecisionJSON = pdsDecisionAuditJSON(decision)
+		if candidate.owned != nil {
+			evidence, evidenceErr := ownedPolicyEvidence(request, decision)
+			if evidenceErr != nil {
+				return nil, nil, evidenceErr
+			}
+			candidate.PDSRequestJSON = ownedMap(evidence["request"])
+			if requireOwnedRealPDS(decision) != nil {
+				rejectCandidate(candidate, "owned_inventory_pds_denied", "Owned inventory requires an explicit allow decision.")
+			}
+		}
 		if alert, ok := maybePDSOutageAlert(decision, channel.ID, candidate.CandidateID, "candidate_accept"); ok {
 			alerts = append(alerts, alert)
 		}
@@ -335,7 +351,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		return ProductionTaskRow{}, err
 	}
 	var row ProductionTaskRow
-	var rationaleJSON, scoreJSON, sourcePlatformsJSON, materialIDsJSON, humanReviewJSON, transitionJSON, snapshotJSON []byte
+	var rationaleJSON, scoreJSON, sourcePlatformsJSON, materialIDsJSON, humanReviewJSON, transitionJSON, snapshotJSON, agentApprovalJSON []byte
 	err := s.db().QueryRow(ctx, `
 		SELECT task.id, task.channel_profile_id, task.topic_lane_id, task.lane_format_id,
 		       task.target_account_id, task.manual_seed_id, task.discovery_signal_id,
@@ -347,7 +363,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		       task.autoflow_run_id, task.job_id, task.state, task.blocked_by_guard,
 		       task.failure_reason, task.failure_category, task.transition_history_json,
 		       task.channel_config_version_snapshot, task.channel_config_snapshot_json,
-		       task.state_updated_at
+		       task.state_updated_at, task.agent_approval_evidence_json
 		FROM production_tasks AS task
 		WHERE task.id = $1::uuid
 	`, taskID).Scan(
@@ -379,6 +395,7 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 		&row.ChannelConfigVersionSnapshot,
 		&snapshotJSON,
 		&row.StateUpdatedAt,
+		&agentApprovalJSON,
 	)
 	if err != nil {
 		return ProductionTaskRow{}, err
@@ -398,6 +415,9 @@ func (s *Store) GetProductionTask(ctx context.Context, taskID string) (Productio
 	}
 	if err := unmarshalJSONObject(humanReviewJSON, &row.HumanReviewEvidenceJSON); err != nil {
 		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.human_review_evidence_json: %w", err)
+	}
+	if err := unmarshalJSONObject(agentApprovalJSON, &row.AgentApprovalEvidenceJSON); err != nil {
+		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.agent_approval_evidence_json: %w", err)
 	}
 	if err := unmarshalJSONMapSlice(transitionJSON, &row.TransitionHistoryJSON); err != nil {
 		return ProductionTaskRow{}, fmt.Errorf("scan production_tasks.transition_history_json: %w", err)
@@ -469,6 +489,26 @@ func (s *Store) MarkTaskPlanningAndEnqueueExecute(
 	task, err := s.GetProductionTask(ctx, taskID)
 	if err != nil {
 		return err
+	}
+	producer, err := s.lockOwnedProducer(ctx, task, "")
+	if err != nil {
+		return err
+	}
+	if producer != nil && producer.Identity.InventoryID != "" {
+		if _, _, _, found, err := ownedPendingPlan(task); err != nil || !found {
+			if err != nil {
+				return err
+			}
+			return ownedHistoryError("owned_inventory_pds_evidence")
+		}
+		stored := task.RationaleJSON["autoflow_plan_payload"]
+		actual, err := ownedDecode([]byte(mustJSON(planPayload)))
+		if err != nil {
+			return err
+		}
+		if !ownedPolicyJSONEqual(stored, actual) {
+			return ErrHandlerSnapshotStale
+		}
 	}
 	durablePlanPayload := map[string]any{}
 	for key, value := range jsonObject(planPayload) {

@@ -68,6 +68,8 @@ const (
 
 type ChannelProfileRow struct {
 	ID                   string
+	OwnedSeedInventoryID *string
+	OwnedInventoryActive bool
 	Enabled              bool
 	DryRun               bool
 	HaltedAt             *time.Time
@@ -179,6 +181,7 @@ type ProductionTaskRow struct {
 	UsesExternalAssets           bool
 	ApprovalMode                 string
 	HumanReviewEvidenceJSON      map[string]any
+	AgentApprovalEvidenceJSON    map[string]any
 	AutoFlowPlanID               *string
 	AutoFlowApprovedRevisionHash *string
 	AutoFlowApprovedRevision     *int64

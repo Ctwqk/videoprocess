@@ -12,7 +12,17 @@ func ChannelDueForTick(channel ChannelProfileRow, now time.Time) bool {
 	if !channelAvailableForExecution(channel) || channel.IntakePausedAt != nil {
 		return false
 	}
+	if channel.OwnedSeedInventoryID != nil && !channel.OwnedInventoryActive {
+		return false
+	}
 	return true
+}
+
+func channelSchedulerBucket(channel ChannelProfileRow, now time.Time) string {
+	if channel.OwnedSeedInventoryID != nil && channel.OwnedInventoryActive && channel.TickIntervalMinutes == 1 {
+		return now.UTC().Format("2006-01-02-15-04")
+	}
+	return SchedulerBucket(now, channel.TickIntervalMinutes)
 }
 
 func channelAvailableForExecution(channel ChannelProfileRow) bool {
@@ -76,7 +86,7 @@ func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 		if err := s.enqueueDiscovery(ctx, channel, now); err != nil {
 			return enqueued, err
 		}
-		bucket := SchedulerBucket(now, channel.TickIntervalMinutes)
+		bucket := channelSchedulerBucket(channel, now)
 		created, err := s.Store.InsertSchedulerRun(ctx, channel.ID, bucket)
 		if err != nil {
 			return enqueued, err
@@ -105,6 +115,9 @@ func (s Scheduler) RunOnce(ctx context.Context, now time.Time) (int, error) {
 }
 
 func (s Scheduler) enqueueDiscovery(ctx context.Context, channel ChannelProfileRow, now time.Time) error {
+	if channel.OwnedSeedInventoryID != nil {
+		return nil
+	}
 	policy, err := DiscoveryPolicyFromContentMix(channel.ContentMixPolicyJSON)
 	if err != nil || !policy.Enabled {
 		return nil
@@ -163,7 +176,9 @@ func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]C
 		SELECT id, enabled, dry_run, halted_at, intake_paused_at,
 		       tick_interval_minutes, config_version,
 		       risk_policy_json, cadence_policy_json, content_mix_policy_json,
-		       default_aspect_ratio, created_at, updated_at
+		       default_aspect_ratio, created_at, updated_at, owned_seed_inventory_id::text,
+		       EXISTS(SELECT 1 FROM owned_seed_inventories i WHERE i.id=channel_profiles.owned_seed_inventory_id
+		         AND i.state='approved' AND i.approved_at IS NOT NULL AND i.revoked_at IS NULL AND i.succession_released_at IS NULL)
 		FROM channel_profiles
 		WHERE enabled = TRUE AND halted_at IS NULL
 		ORDER BY created_at ASC
@@ -179,7 +194,7 @@ func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]C
 		var contentMixJSON []byte
 		if err := rows.Scan(&row.ID, &row.Enabled, &row.DryRun, &row.HaltedAt, &row.IntakePausedAt, &row.TickIntervalMinutes,
 			&row.ConfigVersion, &row.RiskPolicyJSON, &row.CadencePolicyJSON, &contentMixJSON,
-			&row.DefaultAspectRatio, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			&row.DefaultAspectRatio, &row.CreatedAt, &row.UpdatedAt, &row.OwnedSeedInventoryID, &row.OwnedInventoryActive); err != nil {
 			return nil, err
 		}
 		decoder := json.NewDecoder(bytes.NewReader(contentMixJSON))

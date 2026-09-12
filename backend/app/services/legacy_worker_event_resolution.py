@@ -16,6 +16,7 @@ from app.models.channel_agent import ChannelProfile, ProductionTask
 from app.models.job import Job, JobStatus, NodeExecution, NodeStatus
 from app.models.legacy_worker_event_resolution import LegacyWorkerEventResolution
 from app.models.schedule import RuntimeSchedule
+from app.services import job_execution_authority
 
 
 _MESSAGE_ID_PATTERN = re.compile(r"^[1-9][0-9]*-[0-9]+$")
@@ -127,8 +128,17 @@ async def resolve_legacy_worker_events(
     pending_ids: tuple[str, ...]
     validated_events: list[_ValidatedLegacyEvent] = []
     resolutions: list[LegacyWorkerEventResolution] = []
+    # Discover all channel locks before the schedule lock. Payloads are reread
+    # and checked against the same exact hashes inside the fenced transaction.
+    job_ids = set()
+    for message_id, expected_sha in expected_by_id.items():
+        payload = await _read_exact_payload(redis_client, message_id)
+        if canonical_payload_sha256(payload) != expected_sha:
+            raise LegacyEventResolutionError("legacy event payload hash changed")
+        job_ids.add(_candidate_from_payload(message_id, expected_sha, payload).job_id)
     async with db.begin():
         await _acquire_advisory_lock(db)
+        await _lock_history_entry(db, sorted(job_ids, key=str))
         await _require_closed_schedule(db)
 
         existing_rows = list(
@@ -487,6 +497,9 @@ async def _record_acknowledgement(
 ) -> None:
     acknowledged_at = datetime.now(timezone.utc)
     async with db.begin():
+        job_ids = list((await db.scalars(select(LegacyWorkerEventResolution.job_id).where(
+            LegacyWorkerEventResolution.id.in_(resolution_ids)).distinct())).all())
+        await _lock_history_entry(db, sorted(job_ids, key=str))
         rows = list(
             (
                 await db.execute(
@@ -502,3 +515,10 @@ async def _record_acknowledgement(
             )
         for row in rows:
             row.acknowledged_at = row.acknowledged_at or acknowledged_at
+
+
+async def _lock_history_entry(db: AsyncSession, job_ids: list[uuid.UUID]) -> None:
+    try:
+        await job_execution_authority.lock_job_execution_entries(db, job_ids, create_schedule=False)
+    except job_execution_authority.JobExecutionAuthorityBlocked:
+        raise LegacyEventResolutionError("legacy event execution authority changed") from None

@@ -12,14 +12,16 @@ import (
 var ErrHandlerSnapshotStale = errors.New("handler preparation snapshot stale")
 
 type preparedTaskSnapshot struct {
-	Task   ProductionTaskRow
-	Digest string
+	Task     ProductionTaskRow
+	Digest   string
+	Producer *ownedProducerAuthority
 }
 
 type preparedPublicationSnapshot struct {
 	Publication PublicationRow
 	Task        ProductionTaskRow
 	Digest      string
+	Producer    *ownedProducerAuthority
 }
 
 type preparedAccountSnapshot struct {
@@ -74,17 +76,51 @@ func (p preparedTaskSnapshot) validate(task ProductionTaskRow) error {
 	return validateHandlerSnapshot(p.Digest, task, "production task")
 }
 
+func (p preparedTaskSnapshot) validateProducer(current *ownedProducerAuthority) error {
+	if p.Producer == nil && current == nil {
+		return nil
+	}
+	if p.Producer == nil || current == nil || *p.Producer != *current {
+		return ErrHandlerSnapshotStale
+	}
+	return nil
+}
+
+func (p preparedTaskSnapshot) ownedProfile() bool {
+	return p.Producer != nil && p.Producer.Identity.InventoryID != ""
+}
+
+func (h HandlerService) prepareProducerTask(ctx context.Context, task ProductionTaskRow) (preparedTaskSnapshot, error) {
+	prepared, err := newPreparedTaskSnapshot(task)
+	if err != nil {
+		return preparedTaskSnapshot{}, err
+	}
+	prepared.Producer, err = h.Store.lockOwnedProducer(ctx, task, "")
+	return prepared, err
+}
+
+func (h HandlerService) validateProducerTask(ctx context.Context, prepared preparedTaskSnapshot, task ProductionTaskRow) error {
+	if err := prepared.validate(task); err != nil {
+		return err
+	}
+	current, err := h.Store.lockOwnedProducer(ctx, task, "")
+	if err != nil {
+		return err
+	}
+	return prepared.validateProducer(current)
+}
+
 func (h HandlerService) revalidatePreparedTask(
 	ctx context.Context,
 	item QueueItemRow,
 	prepared preparedTaskSnapshot,
 ) error {
-	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+	return h.withOwnedTickQueuePhase(ctx, item, func(fenced HandlerService) error {
 		task, err := fenced.Store.GetProductionTask(ctx, prepared.Task.ID)
 		if err != nil {
 			return err
 		}
-		return prepared.validate(task)
+		return fenced.validateProducerTask(ctx, prepared, task)
 	})
 }
 

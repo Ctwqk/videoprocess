@@ -7,10 +7,14 @@ import os
 from collections.abc import Sequence
 from typing import Never
 
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from app.services.staging_janitor_status import StagingJanitorStatusStore
 from app.services.worker_storage_readiness import (
     ReadinessFailure,
     probe_worker_storage,
 )
+from worker.secret_config import load_worker_database_url
 
 
 class _CLIUsageError(ValueError):
@@ -32,17 +36,49 @@ async def run(argv: Sequence[str] | None = None) -> int:
         _emit({"status": "failed", "code": "invalid_arguments"})
         return 3
 
+    engine = None
     try:
-        result = await probe_worker_storage(
-            os.environ,
-            require_artifact_api=args.require_artifact_api,
-        )
+        if (
+            os.environ.get("VP_REQUIRE_STAGING_JANITOR", "")
+            .strip()
+            .lower()
+            == "true"
+        ):
+            database_url = load_worker_database_url(os.environ)
+            engine = create_async_engine(
+                database_url,
+                pool_pre_ping=True,
+            )
+            session_factory = async_sessionmaker(
+                engine,
+                expire_on_commit=False,
+            )
+            result = await probe_worker_storage(
+                os.environ,
+                require_artifact_api=args.require_artifact_api,
+                staging_janitor_probe=(
+                    StagingJanitorStatusStore(
+                        session_factory
+                    ).readiness
+                ),
+            )
+        else:
+            result = await probe_worker_storage(
+                os.environ,
+                require_artifact_api=args.require_artifact_api,
+            )
     except ReadinessFailure as exc:
         _emit({"status": "failed", "code": exc.code})
         return 3
     except Exception:
         _emit({"status": "failed", "code": "unexpected_failure"})
         return 3
+    finally:
+        if engine is not None:
+            try:
+                await engine.dispose()
+            except Exception:
+                pass
 
     _emit(result)
     return 0

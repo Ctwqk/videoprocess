@@ -8,6 +8,8 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from app.services.worker_deployment_cli import EXPECTED_MIGRATION_HEAD
+
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -132,7 +134,7 @@ async def test_postgres_16_promotion_operation_migration_is_rolling_safe_and_rev
                 row["version_num"]
                 for row in await conn.fetch("SELECT version_num FROM alembic_version")
             }
-            assert current_heads == {"033_legacy_worker_event_resolutions"}
+            assert current_heads == {EXPECTED_MIGRATION_HEAD}
             constraints = {
                 row["conname"]
                 for row in await conn.fetch(

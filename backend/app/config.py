@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field, SecretStr
 
 
 class Settings(BaseSettings):
@@ -9,6 +10,7 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
+    owned_history_redis_url_file: str | None = None
 
     # Storage
     storage_backend: str = "local"  # "local" or "minio"
@@ -20,6 +22,10 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "videoprocess"
     minio_secure: bool = False
+    minio_connect_timeout_seconds: float = 5.0
+    minio_read_timeout_seconds: float = 120.0
+    minio_max_retries: int = 2
+    minio_operation_timeout_seconds: float = 180.0
 
     # API
     api_host: str = "0.0.0.0"
@@ -39,6 +45,7 @@ class Settings(BaseSettings):
     material_lighthouse_url: str = ""
     material_univtg_url: str = ""
     vision_embedding_url: str = ""
+    vision_embedding_model_path: str = ""
     smart_trim_vlm_url: str = ""
     smart_trim_default_worker_type: str = "vision"
 
@@ -61,6 +68,9 @@ class Settings(BaseSettings):
     channel_agent_retention_audit_days: int = 90
     channel_agent_retention_feedback_days: int = 365
     channelops_runner_admin_url: str = "http://channelops-runner-go:8080"
+    owned_seed_inventory_enabled: bool = False
+    owned_seed_inventory_operator_token: SecretStr = Field(default=SecretStr(""), repr=False)
+    owned_seed_inventory_operator_subject: str = ""
 
     # Policy Decision Service
     pds_enabled: bool = False

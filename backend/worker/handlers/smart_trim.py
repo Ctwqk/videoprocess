@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,8 +12,10 @@ from typing import Any
 import httpx
 
 from app.config import settings
-from worker.handlers.base import BaseHandler
+from worker.handlers.base import BaseHandler, CancelledError
 from worker.handlers.subtitle_utils import SubtitleCue
+
+LOCAL_VISUAL_TIMEOUT_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -55,7 +59,7 @@ class SmartTrimConfig:
     language: str = "zh"
     whisper_model: str = "medium"
     output_format: str = "mp4"
-    no_match_policy: str = "placeholder"
+    no_match_policy: str = "fail"
 
     @classmethod
     def from_node_config(cls, node_config: dict[str, Any]) -> SmartTrimConfig:
@@ -83,7 +87,7 @@ class SmartTrimConfig:
                 {"tiny", "base", "small", "medium", "large-v3"},
             ),
             output_format=_select_value(node_config.get("output_format"), "mp4", {"mp4", "mkv", "webm"}),
-            no_match_policy=_select_value(node_config.get("no_match_policy"), "placeholder", {"placeholder", "fail"}),
+            no_match_policy=_select_value(node_config.get("no_match_policy"), "fail", {"placeholder", "fail"}),
         )
 
 
@@ -118,15 +122,24 @@ class SmartTrimHandler(BaseHandler):
             warnings.extend(visual_warnings)
 
         if config.use_asr:
-            subtitle_windows, subtitle_warnings = await self._subtitle_windows(video_path, config)
-            windows.extend(subtitle_windows)
-            warnings.extend(subtitle_warnings)
+            if has_audio:
+                subtitle_windows, subtitle_warnings = await self._subtitle_windows(video_path, config)
+                windows.extend(subtitle_windows)
+                warnings.extend(subtitle_warnings)
+            else:
+                warnings.append("ASR skipped: input video has no audio stream")
 
         selected = select_smart_trim_segments(windows, duration=duration, config=config, warnings=warnings)
 
         if selected.decision == "no_match":
             if config.no_match_policy == "fail":
-                raise RuntimeError("smart_trim found no matching video segment")
+                details = f" Warnings: {'; '.join(selected.warnings)}" if selected.warnings else ""
+                raise RuntimeError(
+                    f"smart_trim found no matching video segment for prompt {config.prompt!r} "
+                    f"at match_threshold={config.match_threshold:g}. "
+                    "Refusing to generate a placeholder; provide matching source footage "
+                    f"and ensure semantic scoring is available.{details}"
+                )
             await self.run_ffmpeg(self.build_no_match_placeholder_args(output_path))
         elif selected.decision == "return_full_video":
             try:
@@ -249,17 +262,29 @@ class SmartTrimHandler(BaseHandler):
         duration: float,
         config: SmartTrimConfig,
     ) -> tuple[list[ScoredWindow], list[str]]:
+        if self._cancelled:
+            raise CancelledError("visual scoring cancelled")
         endpoint = str(getattr(settings, "vision_embedding_url", "") or "").strip()
-        if not endpoint:
-            return [], ["visual scoring unavailable; result may be poor for visual-only queries"]
+        model_path = str(getattr(settings, "vision_embedding_model_path", "") or "").strip()
+        if not endpoint and not model_path:
+            return [], ["visual scoring unavailable: vision_embedding_url is not configured"]
 
         with TemporaryDirectory(prefix="smart_trim_frames_") as temp_dir:
             frames = await self._extract_frames(video_path, duration, config.sample_fps, Path(temp_dir))
             if not frames:
                 return [], ["visual scoring produced no sampled frames"]
             try:
-                scores = await self._score_frames(endpoint, frames, config)
+                if endpoint:
+                    scores = await self._score_frames(endpoint, frames, config)
+                else:
+                    scores = await self._score_local_frames(model_path, frames, config)
+                if self._cancelled:
+                    raise CancelledError("visual scoring cancelled")
+            except CancelledError:
+                raise
             except Exception as exc:
+                if self._cancelled:
+                    raise CancelledError("visual scoring cancelled") from exc
                 return [], [f"visual scoring unavailable: {exc}"]
 
         windows = []
@@ -331,14 +356,87 @@ class SmartTrimHandler(BaseHandler):
             response.raise_for_status()
             payload = response.json()
 
-        scores: list[tuple[float, float]] = []
-        for (timestamp, _path), item in zip(frames, payload.get("similarities") or []):
-            if not item:
-                continue
-            positive = float(item[0])
-            negative = float(item[1]) if len(item) > 1 else 0.0
-            scores.append((timestamp, _clamp(positive - max(0.0, negative) * 0.4)))
-        return scores
+        return _scores_from_similarity_matrix(payload, frames, len(texts))
+
+    def _local_scoring_command(self) -> list[str]:
+        return [sys.executable, "-I", "-m", "worker.visual_embedding_cli"]
+
+    async def _score_local_frames(
+        self,
+        model_path: str,
+        frames: list[tuple[float, Path]],
+        config: SmartTrimConfig,
+    ) -> list[tuple[float, float]]:
+        if self._cancelled:
+            raise CancelledError("visual scoring cancelled")
+        texts = [config.prompt]
+        if config.negative_prompt:
+            texts.append(config.negative_prompt)
+        request = json.dumps({
+            "model_path": model_path,
+            "texts": texts,
+            "image_paths": [str(path) for _timestamp, path in frames],
+        }).encode("utf-8")
+        async def spawn_child() -> asyncio.subprocess.Process:
+            if self._cancelled:
+                raise CancelledError("visual scoring cancelled")
+            return await asyncio.create_subprocess_exec(
+                *self._local_scoring_command(),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+        spawn = asyncio.create_task(spawn_child())
+
+        async def reap_child() -> None:
+            # Also own a child created while the handler was being cancelled.
+            proc = await spawn
+            try:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                await proc.communicate()
+            finally:
+                if self._proc is proc:
+                    self._proc = None
+
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            proc = self._proc = await asyncio.shield(spawn)
+            if self._cancelled:
+                raise CancelledError("visual scoring cancelled")
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(request), timeout=LOCAL_VISUAL_TIMEOUT_SECONDS,
+                )
+            except TimeoutError as exc:
+                raise RuntimeError("local visual scoring timed out") from exc
+            if self._cancelled:
+                raise CancelledError("visual scoring cancelled")
+            if proc.returncode != 0:
+                detail = stderr.decode("utf-8", errors="replace")[-2000:].strip()
+                raise RuntimeError(f"local visual scoring failed ({proc.returncode}): {detail}")
+            return _scores_from_similarity_matrix(json.loads(stdout), frames, len(texts))
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+            raise
+        finally:
+            cleanup = asyncio.create_task(reap_child())
+            try:
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError as exc:
+                        if cancellation is None:
+                            cancellation = exc
+                cleanup.result()
+            finally:
+                # Cleanup failures must not turn task cancellation into a warning.
+                if cancellation is not None:
+                    raise cancellation
 
     async def _subtitle_windows(
         self,
@@ -389,6 +487,29 @@ class SmartTrimHandler(BaseHandler):
             if text:
                 cues.append(SubtitleCue(index=index, start_seconds=float(segment.start), end_seconds=float(segment.end), text=text))
         return cues
+
+
+def _scores_from_similarity_matrix(
+    payload: Any,
+    frames: list[tuple[float, Path]],
+    text_count: int,
+) -> list[tuple[float, float]]:
+    matrix = payload.get("similarities") if isinstance(payload, dict) else None
+    if not isinstance(matrix, list) or len(matrix) != len(frames):
+        raise ValueError("invalid similarity matrix: expected one row per frame")
+    for row in matrix:
+        if not isinstance(row, list) or len(row) != text_count:
+            raise ValueError("invalid similarity matrix: expected one column per text")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not -1.0 <= value <= 1.0
+            for value in row
+        ):
+            raise ValueError("invalid similarity matrix: expected finite cosine values")
+    return [
+        (timestamp, _clamp(row[0] - max(0.0, row[1] if text_count == 2 else 0.0) * 0.4))
+        for (timestamp, _path), row in zip(frames, matrix, strict=True)
+    ]
 
 
 def select_smart_trim_segments(

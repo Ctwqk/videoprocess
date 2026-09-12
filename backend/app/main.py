@@ -20,6 +20,11 @@ from app.db import async_session
 from app.models.job import Job, JobStatus, NodeStatus
 from app.orchestrator.engine import engine
 from app.orchestrator.event_listener import event_listener
+from app.orchestrator.registered_db import registered_database
+from fastapi.responses import JSONResponse
+from app.services.job_execution_authority import (
+    recover_registered_worker_node,
+)
 from app.services.schedule_service import (
     VideoScheduleState,
     default_video_schedule_state,
@@ -53,6 +58,24 @@ async def _prepare_job_for_recovery(db, job) -> bool:
 
         reference_time = _ensure_utc(node.started_at or node.queued_at or job.started_at or job.submitted_at)
         if not reference_time or (now - reference_time) < STALE_NODE_RECOVERY_THRESHOLD:
+            continue
+
+        if getattr(node, "worker_registration_id", None) is not None:
+            recovery_outcome = await recover_registered_worker_node(
+                db,
+                job.id,
+                node.id,
+            )
+            if recovery_outcome != "recovered":
+                logger.info(
+                    "Startup recovery left registered node %s for job %s "
+                    "unchanged (%s)",
+                    node.node_id,
+                    job.id,
+                    recovery_outcome,
+                )
+                continue
+            changed = True
             continue
 
         logger.warning(
@@ -110,25 +133,31 @@ async def _recover_stale_jobs():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = None
-    if settings.event_listener_enabled:
-        task = asyncio.create_task(event_listener())
-        logger.info("Orchestrator event listener background task started")
-    else:
-        logger.info("Orchestrator event listener disabled by configuration")
-
-    if settings.startup_recovery_enabled:
-        await _recover_stale_jobs()
-    else:
-        logger.info("Startup job recovery disabled by configuration")
-
-    yield
-    if task is not None:
-        task.cancel()
+    app.state.event_listener_task = None
+    try:
+        await registered_database.start(settings.database_url)
+        if settings.startup_recovery_enabled:
+            await _recover_stale_jobs()
+        else:
+            logger.info("Startup job recovery disabled by configuration")
+        if settings.event_listener_enabled:
+            task = asyncio.create_task(event_listener())
+            app.state.event_listener_task = task
+            logger.info("Orchestrator event listener background task started")
+        else:
+            logger.info("Orchestrator event listener disabled by configuration")
+        yield
+    finally:
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        logger.info("Orchestrator event listener stopped")
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("Orchestrator event listener stopped")
+        finally:
+            await registered_database.close()
 
 
 def create_app() -> FastAPI:
@@ -159,7 +188,17 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        task = getattr(app.state, "event_listener_task", None)
+        ready = registered_database.ready and (
+            not settings.event_listener_enabled or task is not None and not task.done()
+        )
+        return JSONResponse(status_code=200 if ready else 503, content={
+            "status": "ok" if ready else "unavailable",
+            "registered_runtime": {
+                "ready": ready, "generation": registered_database.generation,
+                "principal": registered_database.principal,
+            },
+        })
 
     return app
 

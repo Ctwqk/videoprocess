@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import asyncpg as pg_asyncpg
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.models.artifact import Artifact, ArtifactKind, IntermediateArtifactCache
 from app.orchestrator.artifact_cache import IntermediateArtifactCacheService
+from app.services.external_url_identity import normalize_external_media_url
 
 
 @pytest.fixture
@@ -43,6 +46,35 @@ def artifact(
     )
 
 
+@pytest.mark.asyncio
+async def test_record_hit_binds_utc_aware_cache_timestamp(cache_db_session):
+    entry = IntermediateArtifactCache(
+        cache_key="timestamp-contract", node_type="transcode",
+        node_config_hash="fixture", input_signature_hash="fixture",
+        storage_backend="local", storage_path="fixture/cached.mp4",
+        filename="cached.mp4", hit_count=2,
+    )
+    cache_db_session.add(entry)
+    await cache_db_session.flush()
+    before = datetime.now(timezone.utc)
+
+    await IntermediateArtifactCacheService().record_hit(cache_db_session, entry)
+
+    assert entry.last_used_at.tzinfo is timezone.utc
+    assert before <= entry.last_used_at <= datetime.now(timezone.utc)
+    assert entry.hit_count == 3
+
+
+def test_cache_timestamp_update_matches_migration_008_timezone_contract():
+    timestamp = datetime.now(timezone.utc)
+    compiled = update(IntermediateArtifactCache).values(last_used_at=timestamp).compile(
+        dialect=pg_asyncpg.dialect(),
+    )
+    assert IntermediateArtifactCache.__table__.c.last_used_at.type.timezone is True
+    assert "last_used_at=$1::TIMESTAMP WITH TIME ZONE" in str(compiled)
+    assert compiled.params["last_used_at"] is timestamp
+
+
 def test_cache_key_is_stable_for_config_order_and_changes_for_inputs():
     service = IntermediateArtifactCacheService()
     input_artifact = artifact()
@@ -70,6 +102,171 @@ def test_cache_eligibility_uses_allowlist_inputs_and_disable_flag():
     assert service.is_cache_eligible("youtube_upload", {}, ["input"]) is False
     assert service.is_cache_eligible("trim", {"disable_cache": True}, ["input"]) is False
     assert service.is_cache_eligible("trim", {"duration": 5}, []) is False
+    assert service.is_cache_eligible(
+        "url_download",
+        {"url": "https://example.test/video", "format": "best"},
+        [],
+    ) is True
+    assert service.is_cache_eligible(
+        "url_download",
+        {
+            "url": "https://example.test/video",
+            "format": "best",
+            "disable_cache": True,
+        },
+        [],
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_url_download_cache_reuses_zero_input_artifact_across_jobs(
+    cache_db_session,
+) -> None:
+    service = IntermediateArtifactCacheService()
+    output_artifact = artifact(storage_path="artifacts/job-1/download.mp4")
+    cache_db_session.add(output_artifact)
+    await cache_db_session.commit()
+    config = {
+        "url": "https://example.test/video?b=2&a=1",
+        "format": "1080p",
+    }
+
+    await service.store(
+        cache_db_session,
+        node_type="url_download",
+        node_config=config,
+        input_artifacts={},
+        output_artifact=output_artifact,
+        node_id="download-1",
+        job_id=uuid.uuid4(),
+    )
+    await cache_db_session.commit()
+
+    hit = await service.lookup(
+        cache_db_session,
+        node_type="url_download",
+        node_config=config,
+        input_artifacts={},
+    )
+
+    assert hit is not None
+    assert hit.output_artifact_id == output_artifact.id
+
+
+def test_url_download_cache_key_uses_normalized_external_url() -> None:
+    service = IntermediateArtifactCacheService()
+
+    short_url = service.cache_key(
+        "url_download",
+        {
+            "url": "https://youtu.be/abc123?utm_source=ignored",
+            "format": "best",
+        },
+        {},
+    )
+    watch_url = service.cache_key(
+        "url_download",
+        {
+            "url": "https://www.youtube.com/watch?feature=share&v=abc123",
+            "format": "best",
+        },
+        {},
+    )
+
+    assert short_url == watch_url
+
+
+def test_external_url_normalization_does_not_alias_unrelated_hosts() -> None:
+    assert normalize_external_media_url(
+        "https://notyoutube.com/watch?v=abc123"
+    ) == "https://notyoutube.com/watch?v=abc123"
+    assert normalize_external_media_url(
+        "https://example.test/video/0123456789abcdef01234567"
+    ) == "https://example.test/video/0123456789abcdef01234567"
+    assert normalize_external_media_url(
+        "https://example.test/path/BV1abc"
+    ) == "https://example.test/path/BV1abc"
+
+
+@pytest.mark.asyncio
+async def test_cache_snapshot_survives_source_artifact_deletion(
+    cache_db_session,
+) -> None:
+    service = IntermediateArtifactCacheService()
+    source = artifact(storage_path="download-cache/youtube/abc123.mp4")
+    cache_db_session.add(source)
+    await cache_db_session.flush()
+    await service.store(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://youtu.be/abc123"},
+        input_artifacts={},
+        output_artifact=source,
+        node_id="download",
+        job_id=source.job_id,
+    )
+    await cache_db_session.delete(source)
+    await cache_db_session.flush()
+
+    hit = await service.lookup(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://www.youtube.com/watch?v=abc123"},
+        input_artifacts={},
+    )
+
+    assert hit is not None
+    assert hit.storage_backend == "local"
+    assert hit.storage_path == "download-cache/youtube/abc123.mp4"
+    assert hit.output_artifact_id is None
+
+
+@pytest.mark.asyncio
+async def test_materialized_cache_hit_survives_later_source_deletion(
+    cache_db_session,
+) -> None:
+    service = IntermediateArtifactCacheService()
+    source = artifact(storage_path="staging/artifacts/source/output.mp4")
+    cache_db_session.add(source)
+    await cache_db_session.flush()
+    await service.store(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://youtu.be/abc123"},
+        input_artifacts={},
+        output_artifact=source,
+        node_id="download-source",
+        job_id=source.job_id,
+    )
+    hit = await service.lookup(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://www.youtube.com/watch?v=abc123"},
+        input_artifacts={},
+    )
+    assert hit is not None
+    consumer_job_id = uuid.uuid4()
+    materialized = await service.materialize_hit(
+        cache_db_session,
+        hit,
+        job_id=consumer_job_id,
+        node_execution_id=uuid.uuid4(),
+    )
+    await cache_db_session.delete(source)
+    await cache_db_session.flush()
+    hit = await service.lookup(
+        cache_db_session,
+        node_type="url_download",
+        node_config={"url": "https://youtu.be/abc123"},
+        input_artifacts={},
+    )
+
+    stored = await cache_db_session.get(Artifact, materialized.id)
+    assert stored is not None
+    assert hit is not None
+    assert stored.job_id == consumer_job_id
+    assert stored.storage_path == "staging/artifacts/source/output.mp4"
+    assert hit.output_artifact_id is None
 
 
 @pytest.mark.asyncio

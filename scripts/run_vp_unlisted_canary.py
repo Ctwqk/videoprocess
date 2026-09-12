@@ -109,11 +109,21 @@ REDIS_PENDING_STREAM_GROUPS = (
 )
 REDIS_CONSUMER_ACTIVE_IDLE_MS = 120_000
 REDIS_ACTIVE_CONSUMER_PATTERNS: dict[str, re.Pattern[str]] = {
-    "vp:tasks:ffmpeg": re.compile(r"^ffmpeg-worker@150-gpu:[1-9][0-9]*$"),
-    "vp:tasks:ffmpeg_go": re.compile(r"^ffmpeg_go-worker@colima-127:[1-9][0-9]*$"),
-    "vp:tasks:vision": re.compile(r"^vision-worker@150-vision:[1-9][0-9]*$"),
+    "vp:tasks:ffmpeg": re.compile(
+        r"^ffmpeg-worker@150-gpu:[1-9][0-9]*:"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    ),
+    "vp:tasks:ffmpeg_go": re.compile(
+        r"^ffmpeg_go-worker@colima-127:[1-9][0-9]*:"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    ),
+    "vp:tasks:vision": re.compile(
+        r"^vision-worker@150-vision:[1-9][0-9]*:"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    ),
     "vp:tasks:youtube_publisher": re.compile(
-        r"^youtube_publisher-worker@150-publisher:[1-9][0-9]*$"
+        r"^youtube_publisher-worker@150-publisher:[1-9][0-9]*:"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
     ),
     "vp:events": re.compile(r"^orchestrator-api-[1-9][0-9]*$"),
 }

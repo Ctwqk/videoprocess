@@ -2,22 +2,59 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Ctwqk/videoprocess/internal/redisstream"
+	"github.com/Ctwqk/videoprocess/internal/store"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sys/unix"
 )
 
 type fakeHandler struct {
 	node string
 	err  error
 	seen []TaskMessage
+}
+
+type countingHandler struct {
+	node  string
+	err   error
+	calls atomic.Int32
+}
+
+func (h *countingHandler) NodeType() string {
+	return h.node
+}
+
+func (h *countingHandler) Execute(
+	context.Context,
+	TaskMessage,
+) (NodeResult, error) {
+	h.calls.Add(1)
+	if h.err != nil {
+		return NodeResult{}, h.err
+	}
+	return NodeResult{OutputArtifactID: "artifact-1"}, nil
 }
 
 func (f *fakeHandler) NodeType() string { return f.node }
@@ -38,6 +75,859 @@ func (h emptyArtifactHandler) Execute(context.Context, TaskMessage) (NodeResult,
 
 type publishFailHandler struct {
 	mr *miniredis.Miniredis
+}
+
+type registeredTaskStoreStub struct {
+	lease          RegistrationLease
+	fenceErr       error
+	fenceCommitErr error
+	fenceCalls     int
+	claim          store.WorkerNodeClaim
+	claimErr       error
+	prepareErr     error
+	publishErr     error
+	listErr        error
+	ackErr         error
+	preparedIDs    []uuid.UUID
+	claimCalls     int
+	prepareCalls   int
+	publishCalls   int
+	ackCalls       int
+	claimedProof   store.WorkerTaskDeliveryProof
+	preparedValues map[string]string
+}
+
+func (s *registeredTaskStoreStub) WithWorkerRegistrationFence(
+	ctx context.Context,
+	_ store.WorkerRegistrationLease,
+	callback store.WorkerRegistrationFenceCallback,
+) error {
+	s.fenceCalls++
+	if s.fenceErr != nil {
+		return s.fenceErr
+	}
+	if err := callback(ctx); err != nil {
+		return err
+	}
+	return s.fenceCommitErr
+}
+
+type registeredRuntimeStore struct {
+	*fakeTaskStore
+	requiredClaimCalls int
+	persistCalls       int
+	persistSaveCalls   int
+}
+
+func (s *registeredRuntimeStore) RequireWorkerNodeClaim(
+	context.Context,
+	store.WorkerNodeClaim,
+) error {
+	s.requiredClaimCalls++
+	return nil
+}
+
+func (s *registeredRuntimeStore) PersistWorkerArtifact(
+	ctx context.Context,
+	_ store.WorkerNodeClaim,
+	input store.CreateArtifactInput,
+	save store.WorkerArtifactSaver,
+) (string, error) {
+	s.persistCalls++
+	if err := save(ctx); err != nil {
+		return "", err
+	}
+	s.persistSaveCalls++
+	s.createdInput = input
+	return "00000000-0000-0000-0000-000000000777", nil
+}
+
+type retryingStorage struct {
+	saveAttempts atomic.Int32
+	failures     int32
+	block        bool
+	savedPath    string
+	legacySaves  atomic.Int32
+	streamedSize atomic.Int64
+}
+
+type nonCooperativeStreamStorage struct {
+	started chan struct{}
+	release chan struct{}
+	done    chan struct{}
+}
+
+type growingPendingTailHook struct {
+	client *redis.Client
+	stream string
+	group  string
+	pages  atomic.Int32
+	mu     sync.Mutex
+	err    error
+}
+
+type pendingPageFailureHook struct {
+	extendedPages atomic.Int32
+	xclaims       atomic.Int32
+	failed        atomic.Bool
+}
+
+type pendingVisitorFailureHook struct {
+	failCommand string
+	xranges     atomic.Int32
+	xclaims     atomic.Int32
+	xacks       atomic.Int32
+	failed      atomic.Bool
+	failedAt    atomic.Int64
+	partialDone chan struct{}
+}
+
+func (h *pendingVisitorFailureHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *pendingVisitorFailureHook) ProcessHook(
+	next redis.ProcessHook,
+) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		switch cmd.Name() {
+		case "xrange":
+			if h.xranges.Add(1) == 2 &&
+				h.failCommand == "xrange" &&
+				h.failed.CompareAndSwap(false, true) {
+				h.failedAt.Store(time.Now().UnixNano())
+				return errors.New("forced later XRANGE visitor failure")
+			}
+		case "xclaim":
+			if h.xclaims.Add(1) == 2 &&
+				h.failCommand == "xclaim" &&
+				h.failed.CompareAndSwap(false, true) {
+				h.failedAt.Store(time.Now().UnixNano())
+				return errors.New("forced later XCLAIM visitor failure")
+			}
+		case "xack":
+			if h.xacks.Add(1) == 1 && h.failed.Load() && h.partialDone != nil {
+				close(h.partialDone)
+			}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *pendingVisitorFailureHook) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *pendingPageFailureHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *pendingPageFailureHook) ProcessHook(
+	next redis.ProcessHook,
+) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xclaim" {
+			h.xclaims.Add(1)
+		}
+		if cmd.Name() == "xpending" &&
+			len(cmd.Args()) > 3 &&
+			h.extendedPages.Add(1) == 2 &&
+			h.failed.CompareAndSwap(false, true) {
+			return errors.New("forced later XPENDING page failure")
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *pendingPageFailureHook) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+type registrationReadRaceHook struct {
+	secondReadStarted chan struct{}
+	lateMessage       *redis.XMessage
+	reads             atomic.Int32
+}
+
+type registrationDeadlineReadHook struct {
+	reads atomic.Int32
+}
+
+// Virtual-time dependencies exercise Run without a network or scheduler jitter.
+type registeredReadBudgetHook struct {
+	readDelay         time.Duration
+	blockingReadDelay time.Duration
+	readErr           error
+	reads             int
+	readStarts        []time.Time
+	firstErr          error
+	readDone          context.Context
+	cancelRun         context.CancelFunc
+}
+
+func (h *registeredReadBudgetHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *registeredReadBudgetHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *registeredReadBudgetHook) ProcessHook(redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		switch cmd := cmd.(type) {
+		case *redis.StatusCmd:
+			cmd.SetVal("OK")
+		case *redis.XAutoClaimCmd:
+			cmd.SetVal(nil, "0-0")
+		case *redis.XPendingCmd:
+			cmd.SetVal(&redis.XPending{})
+		case *redis.XStreamSliceCmd:
+			h.reads++
+			h.readStarts = append(h.readStarts, time.Now())
+			if h.reads == 2 {
+				h.cancelRun()
+				return ctx.Err()
+			}
+			h.readDone = ctx
+			readDelay := h.readDelay
+			for _, arg := range cmd.Args() {
+				if strings.EqualFold(fmt.Sprint(arg), "block") && h.blockingReadDelay > 0 {
+					readDelay = h.blockingReadDelay
+				}
+			}
+			select {
+			case <-ctx.Done():
+				h.firstErr = ctx.Err()
+			case <-time.After(readDelay):
+				h.firstErr = h.readErr
+			}
+			cmd.SetVal(nil)
+			return h.firstErr
+		default:
+			return fmt.Errorf("unexpected budget-test Redis command: %s", cmd.Name())
+		}
+		return nil
+	}
+}
+
+type registeredReadBudgetStore struct {
+	*registeredTaskStoreStub
+	hook                   *registeredReadBudgetHook
+	acquireDelay           time.Duration
+	commitDelay            time.Duration
+	callbackFenceErr       error
+	forceFenceErr          error
+	firstReadFenceErr      error
+	firstReadFenceFinished time.Time
+}
+
+func (s *registeredReadBudgetStore) WithWorkerRegistrationFence(
+	ctx context.Context,
+	_ store.WorkerRegistrationLease,
+	callback store.WorkerRegistrationFenceCallback,
+) error {
+	time.Sleep(s.acquireDelay)
+	// Match the real store's fail-closed database error classification.
+	if ctx.Err() != nil || s.forceFenceErr != nil {
+		return &store.WorkerRegistrationError{Code: "lease_fenced"}
+	}
+	readsBefore := s.hook.reads
+	err := callback(ctx)
+	firstRead := readsBefore == 0 && s.hook.reads == 1
+	if firstRead {
+		s.callbackFenceErr = ctx.Err()
+	}
+	if err == nil {
+		time.Sleep(s.commitDelay)
+		if ctx.Err() != nil {
+			err = &store.WorkerRegistrationError{Code: "lease_fenced"}
+		}
+	}
+	if firstRead {
+		s.firstReadFenceErr = err
+		s.firstReadFenceFinished = time.Now()
+	}
+	return err
+}
+
+func (h *registrationDeadlineReadHook) DialHook(
+	next redis.DialHook,
+) redis.DialHook {
+	return next
+}
+
+func (h *registrationDeadlineReadHook) ProcessHook(
+	next redis.ProcessHook,
+) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() != "xreadgroup" {
+			return next(ctx, cmd)
+		}
+		read := h.reads.Add(1)
+		<-ctx.Done()
+		if read == 1 {
+			return context.DeadlineExceeded
+		}
+		return context.Canceled
+	}
+}
+
+func (h *registrationDeadlineReadHook) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *registrationReadRaceHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *registrationReadRaceHook) ProcessHook(
+	next redis.ProcessHook,
+) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() != "xreadgroup" || h.reads.Add(1) != 2 {
+			return next(ctx, cmd)
+		}
+		close(h.secondReadStarted)
+		if h.lateMessage == nil {
+			return next(ctx, cmd)
+		}
+		<-ctx.Done()
+		read, ok := cmd.(*redis.XStreamSliceCmd)
+		if !ok {
+			return errors.New("unexpected XREADGROUP command type")
+		}
+		read.SetVal([]redis.XStream{{
+			Stream:   "late-registration-loss",
+			Messages: []redis.XMessage{*h.lateMessage},
+		}})
+		return nil
+	}
+}
+
+func (h *registrationReadRaceHook) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+type blockingReadLossStore struct {
+	*registeredTaskStoreStub
+	secondReadStarted <-chan struct{}
+	claimCalls        atomic.Int32
+}
+
+type registeredIntakeReadHook struct {
+	starts            chan int32
+	reads             atomic.Int32
+	secondReadRelease <-chan struct{}
+}
+
+type registeredClaimCountingHook struct {
+	claims atomic.Int32
+}
+
+func (h *registeredClaimCountingHook) DialHook(
+	next redis.DialHook,
+) redis.DialHook {
+	return next
+}
+
+func (h *registeredClaimCountingHook) ProcessHook(
+	next redis.ProcessHook,
+) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xclaim" {
+			h.claims.Add(1)
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *registeredClaimCountingHook) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *registeredIntakeReadHook) DialHook(next redis.DialHook) redis.DialHook {
+	return next
+}
+
+func (h *registeredIntakeReadHook) ProcessHook(
+	next redis.ProcessHook,
+) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "xreadgroup" {
+			read := h.reads.Add(1)
+			h.starts <- read
+			if read == 2 && h.secondReadRelease != nil {
+				select {
+				case <-h.secondReadRelease:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (h *registeredIntakeReadHook) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+type registeredIntakeFenceStore struct {
+	fenceStore         *store.Store
+	fenceCalls         atomic.Int32
+	callbackCalls      atomic.Int32
+	staleFenceCalls    atomic.Int32
+	staleCallbackCalls atomic.Int32
+	claimCalls         atomic.Int32
+}
+
+type registeredDispatchGapStore struct {
+	*registeredTaskStoreStub
+	fenceStore         *store.Store
+	readHook           *registeredIntakeReadHook
+	readFenceCommitted chan struct{}
+	releaseFenceReturn <-chan struct{}
+	paused             atomic.Bool
+}
+
+type registeredPublicReclaimGapStore struct {
+	*registeredTaskStoreStub
+	fenceStore *store.Store
+	pauseAfter int32
+	fenceCalls atomic.Int32
+	paused     chan struct{}
+	release    <-chan struct{}
+}
+
+func (s *registeredDispatchGapStore) WithWorkerRegistrationFence(
+	ctx context.Context,
+	lease store.WorkerRegistrationLease,
+	callback store.WorkerRegistrationFenceCallback,
+) error {
+	readsBefore := s.readHook.reads.Load()
+	err := s.fenceStore.WithWorkerRegistrationFence(ctx, lease, callback)
+	if err != nil ||
+		s.readHook.reads.Load() == readsBefore ||
+		!s.paused.CompareAndSwap(false, true) {
+		return err
+	}
+	close(s.readFenceCommitted)
+	select {
+	case <-s.releaseFenceReturn:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+func (s *registeredPublicReclaimGapStore) WithWorkerRegistrationFence(
+	ctx context.Context,
+	lease store.WorkerRegistrationLease,
+	callback store.WorkerRegistrationFenceCallback,
+) error {
+	call := s.fenceCalls.Add(1)
+	err := s.fenceStore.WithWorkerRegistrationFence(ctx, lease, callback)
+	if err != nil || call != s.pauseAfter {
+		return err
+	}
+	close(s.paused)
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+func (s *registeredIntakeFenceStore) WithWorkerRegistrationFence(
+	ctx context.Context,
+	lease store.WorkerRegistrationLease,
+	callback store.WorkerRegistrationFenceCallback,
+) error {
+	s.fenceCalls.Add(1)
+	callbackRan := false
+	err := s.fenceStore.WithWorkerRegistrationFence(
+		ctx,
+		lease,
+		func(callbackContext context.Context) error {
+			callbackRan = true
+			s.callbackCalls.Add(1)
+			return callback(callbackContext)
+		},
+	)
+	if errors.Is(err, ErrRegistrationLost) {
+		s.staleFenceCalls.Add(1)
+		if callbackRan {
+			s.staleCallbackCalls.Add(1)
+		}
+	}
+	return err
+}
+
+func (s *registeredIntakeFenceStore) ClaimWorkerNode(
+	_ context.Context,
+	lease store.WorkerRegistrationLease,
+	jobID uuid.UUID,
+	nodeExecutionID uuid.UUID,
+	proof store.WorkerTaskDeliveryProof,
+) (store.WorkerNodeClaim, error) {
+	s.claimCalls.Add(1)
+	return store.WorkerNodeClaim{
+		RegistrationID:  lease.RegistrationID,
+		LeaseEpoch:      lease.LeaseEpoch,
+		WorkerID:        lease.RedisConsumerID,
+		WorkerStartedAt: time.Now().UTC(),
+		JobID:           jobID,
+		NodeExecutionID: nodeExecutionID,
+		AttestationID:   uuid.New(),
+		Delivery:        proof,
+	}, nil
+}
+
+func (s *registeredIntakeFenceStore) PrepareWorkerEvent(
+	context.Context,
+	store.WorkerNodeClaim,
+	string,
+	string,
+	map[string]string,
+) (uuid.UUID, error) {
+	return uuid.Nil, errors.New("unexpected intake-test event preparation")
+}
+
+func (s *registeredIntakeFenceStore) PublishPreparedWorkerEvent(
+	context.Context,
+	store.WorkerRegistrationLease,
+	uuid.UUID,
+	store.WorkerEventPublisher,
+) (store.WorkerNodeClaim, error) {
+	return store.WorkerNodeClaim{}, errors.New(
+		"unexpected intake-test event publication",
+	)
+}
+
+func (s *registeredIntakeFenceStore) ListPreparedWorkerEventIDs(
+	context.Context,
+	store.WorkerRegistrationLease,
+	int,
+) ([]uuid.UUID, error) {
+	return nil, nil
+}
+
+func (s *registeredIntakeFenceStore) AcknowledgeWorkerTask(
+	context.Context,
+	store.WorkerNodeClaim,
+	store.WorkerTaskAcknowledger,
+) error {
+	return errors.New("unexpected intake-test acknowledgement")
+}
+
+type blockingCancelledHandler struct {
+	started chan struct{}
+	release <-chan struct{}
+	calls   atomic.Int32
+}
+
+func (h *blockingCancelledHandler) NodeType() string {
+	return "trim"
+}
+
+func (h *blockingCancelledHandler) Execute(
+	context.Context,
+	TaskMessage,
+) (NodeResult, error) {
+	h.calls.Add(1)
+	h.started <- struct{}{}
+	<-h.release
+	return NodeResult{}, ErrConfirmedCancellation
+}
+
+func (s *blockingReadLossStore) ClaimWorkerNode(
+	ctx context.Context,
+	_ store.WorkerRegistrationLease,
+	_ uuid.UUID,
+	_ uuid.UUID,
+	_ store.WorkerTaskDeliveryProof,
+) (store.WorkerNodeClaim, error) {
+	s.claimCalls.Add(1)
+	select {
+	case <-s.secondReadStarted:
+		return store.WorkerNodeClaim{}, store.ErrWorkerRegistrationLost
+	case <-ctx.Done():
+		return store.WorkerNodeClaim{}, context.Cause(ctx)
+	}
+}
+
+func (h *growingPendingTailHook) DialHook(next redis.DialHook) redis.DialHook {
+	return func(
+		ctx context.Context,
+		network string,
+		addr string,
+	) (net.Conn, error) {
+		return next(ctx, network, addr)
+	}
+}
+
+func (h *growingPendingTailHook) ProcessHook(
+	next redis.ProcessHook,
+) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		err := next(ctx, cmd)
+		if err == nil && cmd.Name() == "xpending" && len(cmd.Args()) > 3 {
+			h.appendPendingPage()
+		}
+		return err
+	}
+}
+
+func (h *growingPendingTailHook) ProcessPipelineHook(
+	next redis.ProcessPipelineHook,
+) redis.ProcessPipelineHook {
+	return next
+}
+
+func (h *growingPendingTailHook) appendPendingPage() {
+	page := h.pages.Add(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	pipe := h.client.Pipeline()
+	for index := 0; index < 50; index++ {
+		pipe.XAdd(ctx, &redis.XAddArgs{
+			Stream: h.stream,
+			Values: map[string]any{
+				"config":          "{}",
+				"input_artifacts": "{}",
+				"tail_page":       page,
+				"tail_index":      index,
+			},
+		})
+	}
+	_, err := pipe.Exec(ctx)
+	if err == nil {
+		_, err = h.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    h.group,
+			Consumer: "growing-tail",
+			Streams:  []string{h.stream, ">"},
+			Count:    50,
+		}).Result()
+	}
+	if err != nil {
+		h.mu.Lock()
+		if h.err == nil {
+			h.err = err
+		}
+		h.mu.Unlock()
+	}
+}
+
+func (h *growingPendingTailHook) result() (int32, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pages.Load(), h.err
+}
+
+func (s *nonCooperativeStreamStorage) Read(
+	context.Context,
+	string,
+) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *nonCooperativeStreamStorage) Save(
+	context.Context,
+	string,
+	[]byte,
+) error {
+	return errors.New("whole-buffer save is forbidden")
+}
+
+func (s *nonCooperativeStreamStorage) SaveStream(
+	ctx context.Context,
+	_ string,
+	reader io.Reader,
+	_ int64,
+) error {
+	close(s.started)
+	<-s.release
+	_, _ = io.Copy(io.Discard, reader)
+	close(s.done)
+	return context.Cause(ctx)
+}
+
+func (s *nonCooperativeStreamStorage) Exists(
+	context.Context,
+	string,
+) (bool, error) {
+	return false, nil
+}
+
+func (s *nonCooperativeStreamStorage) Delete(context.Context, string) error {
+	return nil
+}
+
+func (s *nonCooperativeStreamStorage) LocalPath(string) (string, bool) {
+	return "", false
+}
+
+func (s *retryingStorage) Read(context.Context, string) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (s *retryingStorage) Save(
+	ctx context.Context,
+	path string,
+	_ []byte,
+) error {
+	s.legacySaves.Add(1)
+	return s.save(ctx, path, nil)
+}
+
+func (s *retryingStorage) SaveStream(
+	ctx context.Context,
+	path string,
+	reader io.Reader,
+	_ int64,
+) error {
+	return s.save(ctx, path, reader)
+}
+
+func (s *retryingStorage) save(
+	ctx context.Context,
+	path string,
+	reader io.Reader,
+) error {
+	attempt := s.saveAttempts.Add(1)
+	s.savedPath = path
+	if s.block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	if attempt <= s.failures {
+		return errors.New("temporary object-store failure")
+	}
+	if reader != nil {
+		written, err := io.Copy(io.Discard, reader)
+		s.streamedSize.Add(written)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *retryingStorage) Exists(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+func (s *retryingStorage) Delete(context.Context, string) error {
+	return nil
+}
+
+func (s *retryingStorage) LocalPath(string) (string, bool) {
+	return "", false
+}
+
+func (s *registeredTaskStoreStub) ClaimWorkerNode(
+	_ context.Context,
+	lease store.WorkerRegistrationLease,
+	jobID uuid.UUID,
+	nodeExecutionID uuid.UUID,
+	proof store.WorkerTaskDeliveryProof,
+) (store.WorkerNodeClaim, error) {
+	s.claimCalls++
+	s.claimedProof = proof
+	if s.claimErr != nil {
+		return store.WorkerNodeClaim{}, s.claimErr
+	}
+	s.claim = store.WorkerNodeClaim{
+		RegistrationID:  lease.RegistrationID,
+		LeaseEpoch:      lease.LeaseEpoch,
+		WorkerID:        lease.RedisConsumerID,
+		WorkerStartedAt: time.Now().UTC(),
+		JobID:           jobID,
+		NodeExecutionID: nodeExecutionID,
+		AttestationID:   uuid.New(),
+		Delivery:        proof,
+	}
+	return s.claim, nil
+}
+
+func (s *registeredTaskStoreStub) PrepareWorkerEvent(
+	_ context.Context,
+	claim store.WorkerNodeClaim,
+	_ string,
+	_ string,
+	values map[string]string,
+) (uuid.UUID, error) {
+	s.prepareCalls++
+	s.preparedValues = values
+	s.claim = claim
+	if s.prepareErr != nil {
+		return uuid.Nil, s.prepareErr
+	}
+	return uuid.New(), nil
+}
+
+func (s *registeredTaskStoreStub) PublishPreparedWorkerEvent(
+	ctx context.Context,
+	_ store.WorkerRegistrationLease,
+	_ uuid.UUID,
+	publish store.WorkerEventPublisher,
+) (store.WorkerNodeClaim, error) {
+	s.publishCalls++
+	if s.publishErr != nil {
+		return store.WorkerNodeClaim{}, s.publishErr
+	}
+	if _, err := publish(
+		ctx,
+		"vp:events",
+		"vp:worker-event-emission:"+uuid.NewString(),
+		s.preparedValues,
+	); err != nil {
+		return store.WorkerNodeClaim{}, err
+	}
+	return s.claim, nil
+}
+
+func (s *registeredTaskStoreStub) ListPreparedWorkerEventIDs(
+	context.Context,
+	store.WorkerRegistrationLease,
+	int,
+) ([]uuid.UUID, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return append([]uuid.UUID(nil), s.preparedIDs...), nil
+}
+
+func (s *registeredTaskStoreStub) AcknowledgeWorkerTask(
+	ctx context.Context,
+	claim store.WorkerNodeClaim,
+	acknowledge store.WorkerTaskAcknowledger,
+) error {
+	s.ackCalls++
+	if s.ackErr != nil {
+		return s.ackErr
+	}
+	_, err := acknowledge(
+		ctx,
+		claim.Delivery.RedisStream,
+		claim.Delivery.ConsumerGroup,
+		claim.Delivery.MessageID,
+	)
+	return err
 }
 
 func (h publishFailHandler) NodeType() string { return "trim" }
@@ -441,6 +1331,42 @@ type blockingHandler struct {
 	invocation atomic.Int32
 }
 
+type stubbornHandler struct {
+	node    string
+	started chan struct{}
+	release chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+type concurrentLossErrorHandler struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (h *concurrentLossErrorHandler) NodeType() string { return "trim" }
+
+func (h *concurrentLossErrorHandler) Execute(
+	context.Context,
+	TaskMessage,
+) (NodeResult, error) {
+	close(h.started)
+	<-h.release
+	return NodeResult{}, errors.New("ordinary handler failure")
+}
+
+func (h *stubbornHandler) NodeType() string { return h.node }
+
+func (h *stubbornHandler) Execute(
+	context.Context,
+	TaskMessage,
+) (NodeResult, error) {
+	h.once.Do(func() { close(h.started) })
+	<-h.release
+	close(h.done)
+	return NodeResult{OutputArtifactID: "artifact-1"}, nil
+}
+
 func (h *blockingHandler) NodeType() string { return h.node }
 
 func (h *blockingHandler) Execute(ctx context.Context, task TaskMessage) (NodeResult, error) {
@@ -495,4 +1421,4168 @@ func TestConsumerHonorsConcurrencyLimit(t *testing.T) {
 	}
 	close(handler.release)
 	<-done
+}
+
+func TestConsumerRegistrationLossReturnsFenceError(t *testing.T) {
+	client, _ := newRedis(t)
+	cfg := Config{
+		WorkerType:  "ffmpeg_go",
+		WorkerID:    "ffmpeg_go-worker@host127:1:00000000-0000-0000-0000-000000000001",
+		Concurrency: 1,
+	}
+	consumer := NewConsumer(client, cfg, &fakeHandler{node: "trim"})
+	consumer.BlockTimeout = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(ErrRegistrationLost)
+	err := consumer.Run(ctx)
+	if !errors.Is(err, ErrRegistrationLost) {
+		t.Fatalf("Run error = %v; want ErrRegistrationLost", err)
+	}
+}
+
+func TestRegistrationStoreLossCancelsOwnedContextAcrossTaskLifecycle(
+	t *testing.T,
+) {
+	lost := store.ErrWorkerRegistrationLost
+	for _, testCase := range []struct {
+		name           string
+		configureStore func(*registeredTaskStoreStub)
+		handler        Handler
+	}{
+		{
+			name: "node claim",
+			configureStore: func(taskStore *registeredTaskStoreStub) {
+				taskStore.claimErr = lost
+			},
+			handler: &fakeHandler{node: "trim"},
+		},
+		{
+			name:           "handler transaction",
+			configureStore: func(*registeredTaskStoreStub) {},
+			handler: &fakeHandler{
+				node: "trim",
+				err:  lost,
+			},
+		},
+		{
+			name: "prepare finalize",
+			configureStore: func(taskStore *registeredTaskStoreStub) {
+				taskStore.prepareErr = lost
+			},
+			handler: &fakeHandler{node: "trim"},
+		},
+		{
+			name: "publish finalize",
+			configureStore: func(taskStore *registeredTaskStoreStub) {
+				taskStore.publishErr = lost
+			},
+			handler: &fakeHandler{node: "trim"},
+		},
+		{
+			name: "task ACK",
+			configureStore: func(taskStore *registeredTaskStoreStub) {
+				taskStore.ackErr = lost
+			},
+			handler: &fakeHandler{node: "trim"},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			client, _ := newRedis(t)
+			lease := registrationLossTestLease()
+			registration := newOwnedTestRegistration(
+				context.Background(),
+				lease,
+			)
+			taskStore := &registeredTaskStoreStub{lease: lease}
+			testCase.configureStore(taskStore)
+			cfg := registrationLossTestConfig(lease)
+			consumer := NewRegisteredConsumer(
+				client,
+				cfg,
+				taskStore,
+				registration,
+				testCase.handler,
+			)
+			message := redis.XMessage{
+				ID:     "1-0",
+				Values: registeredLossTestPayload(),
+			}
+
+			consumer.handleRegisteredMessage(registration.Context(), message)
+
+			select {
+			case <-registration.Context().Done():
+			case <-time.After(250 * time.Millisecond):
+				t.Fatal("store-proven loss did not cancel owned context")
+			}
+			if !errors.Is(
+				context.Cause(registration.Context()),
+				ErrRegistrationLost,
+			) {
+				t.Fatalf(
+					"registration cause = %v; want ErrRegistrationLost",
+					context.Cause(registration.Context()),
+				)
+			}
+			if testCase.name == "handler transaction" &&
+				taskStore.prepareCalls != 0 {
+				t.Fatalf(
+					"handler-side registration loss prepared %d failure events; want 0",
+					taskStore.prepareCalls,
+				)
+			}
+		})
+	}
+}
+
+func TestRegistrationReconcileLossCancelsOwnedContext(t *testing.T) {
+	lost := store.ErrWorkerRegistrationLost
+	for _, testCase := range []struct {
+		name           string
+		configureStore func(*registeredTaskStoreStub)
+	}{
+		{
+			name: "list",
+			configureStore: func(taskStore *registeredTaskStoreStub) {
+				taskStore.listErr = lost
+			},
+		},
+		{
+			name: "publish",
+			configureStore: func(taskStore *registeredTaskStoreStub) {
+				taskStore.preparedIDs = []uuid.UUID{uuid.New()}
+				taskStore.publishErr = lost
+			},
+		},
+		{
+			name: "ACK",
+			configureStore: func(taskStore *registeredTaskStoreStub) {
+				taskStore.preparedIDs = []uuid.UUID{uuid.New()}
+				taskStore.preparedValues = map[string]string{
+					"event": "node_completed",
+				}
+				taskStore.ackErr = lost
+				taskStore.claim = store.WorkerNodeClaim{
+					Delivery: store.WorkerTaskDeliveryProof{
+						RedisStream:   "vp:test:loss:tasks",
+						ConsumerGroup: "vp-test-loss-workers",
+						MessageID:     "1-0",
+					},
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			client, _ := newRedis(t)
+			lease := registrationLossTestLease()
+			registration := newOwnedTestRegistration(
+				context.Background(),
+				lease,
+			)
+			taskStore := &registeredTaskStoreStub{lease: lease}
+			testCase.configureStore(taskStore)
+			consumer := NewRegisteredConsumer(
+				client,
+				registrationLossTestConfig(lease),
+				taskStore,
+				registration,
+			)
+
+			err := consumer.ReconcilePreparedWorkerEvents(
+				registration.Context(),
+			)
+			if !errors.Is(err, ErrRegistrationLost) {
+				t.Fatalf(
+					"ReconcilePreparedWorkerEvents error = %v; want ErrRegistrationLost",
+					err,
+				)
+			}
+			if !errors.Is(
+				context.Cause(registration.Context()),
+				ErrRegistrationLost,
+			) {
+				t.Fatalf(
+					"registration cause = %v; want ErrRegistrationLost",
+					context.Cause(registration.Context()),
+				)
+			}
+		})
+	}
+}
+
+func TestConsumerStoreProvenRegistrationLossStopsReadsAndReturnsCause(
+	t *testing.T,
+) {
+	client, _ := newRedis(t)
+	lease := registrationLossTestLease()
+	parent, parentCancel := context.WithTimeout(
+		context.Background(),
+		750*time.Millisecond,
+	)
+	defer parentCancel()
+	registration := newOwnedTestRegistration(parent, lease)
+	cfg := registrationLossTestConfig(lease)
+	cfg.Concurrency = 1
+	taskStore := &registeredTaskStoreStub{
+		lease:    lease,
+		claimErr: store.ErrWorkerRegistrationLost,
+	}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		&fakeHandler{node: "trim"},
+	)
+	consumer.BlockTimeout = 10 * time.Millisecond
+	withGroup(t, consumer)
+	for index := 0; index < 2; index++ {
+		if _, err := client.XAdd(
+			context.Background(),
+			&redis.XAddArgs{
+				Stream: cfg.RedisStream,
+				Values: registeredLossTestPayload(),
+			},
+		).Result(); err != nil {
+			t.Fatalf("add registered loss task %d: %v", index, err)
+		}
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- consumer.Run(registration.Context())
+	}()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrRegistrationLost) {
+			t.Fatalf("Run error = %v; want ErrRegistrationLost", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop promptly after store-proven registration loss")
+	}
+	pending, err := client.XPending(
+		context.Background(),
+		cfg.RedisStream,
+		cfg.RedisGroup,
+	).Result()
+	if err != nil {
+		t.Fatalf("read pending after registration loss: %v", err)
+	}
+	if pending.Count != 1 {
+		t.Fatalf(
+			"pending deliveries after registration loss = %d; want 1",
+			pending.Count,
+		)
+	}
+	if taskStore.claimCalls != 1 {
+		t.Fatalf("claim calls after registration loss = %d; want 1", taskStore.claimCalls)
+	}
+}
+
+func TestConsumerNoHandlerPrepareLossStopsReadsAndReturnsCause(t *testing.T) {
+	client, _ := newRedis(t)
+	lease := registrationLossTestLease()
+	parent, parentCancel := context.WithTimeout(
+		context.Background(),
+		750*time.Millisecond,
+	)
+	defer parentCancel()
+	registration := newOwnedTestRegistration(parent, lease)
+	cfg := registrationLossTestConfig(lease)
+	cfg.Concurrency = 1
+	taskStore := &registeredTaskStoreStub{
+		lease:      lease,
+		prepareErr: store.ErrWorkerRegistrationLost,
+	}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+	)
+	consumer.BlockTimeout = 10 * time.Millisecond
+	withGroup(t, consumer)
+	for index := 0; index < 2; index++ {
+		if _, err := client.XAdd(
+			context.Background(),
+			&redis.XAddArgs{
+				Stream: cfg.RedisStream,
+				Values: registeredLossTestPayload(),
+			},
+		).Result(); err != nil {
+			t.Fatalf("add no-handler loss task %d: %v", index, err)
+		}
+	}
+
+	err := consumer.Run(registration.Context())
+	if !errors.Is(err, ErrRegistrationLost) {
+		t.Fatalf("Run error = %v; want ErrRegistrationLost", err)
+	}
+	if taskStore.claimCalls != 1 || taskStore.prepareCalls != 1 {
+		t.Fatalf(
+			"claim/prepare after no-handler loss = %d/%d; want 1/1",
+			taskStore.claimCalls,
+			taskStore.prepareCalls,
+		)
+	}
+}
+
+func TestConsumerConcurrentRegistrationLossBeatsHandlerFailure(
+	t *testing.T,
+) {
+	client, _ := newRedis(t)
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := registrationLossTestConfig(lease)
+	cfg.Concurrency = 1
+	taskStore := &registeredTaskStoreStub{lease: lease}
+	handler := &concurrentLossErrorHandler{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		handler,
+	)
+	consumer.BlockTimeout = 10 * time.Millisecond
+	withGroup(t, consumer)
+	for index := 0; index < 2; index++ {
+		if _, err := client.XAdd(
+			context.Background(),
+			&redis.XAddArgs{
+				Stream: cfg.RedisStream,
+				Values: registeredLossTestPayload(),
+			},
+		).Result(); err != nil {
+			t.Fatalf("add concurrent loss task %d: %v", index, err)
+		}
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- consumer.Run(registration.Context())
+	}()
+	select {
+	case <-handler.started:
+	case <-time.After(time.Second):
+		close(handler.release)
+		t.Fatal("handler did not start")
+	}
+	registration.MarkLost()
+	close(handler.release)
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrRegistrationLost) {
+			t.Fatalf("Run error = %v; want ErrRegistrationLost", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after concurrent registration loss")
+	}
+	if taskStore.prepareCalls != 0 ||
+		taskStore.publishCalls != 0 ||
+		taskStore.ackCalls != 0 {
+		t.Fatalf(
+			"prepare/publish/ack after concurrent loss = %d/%d/%d; want 0/0/0",
+			taskStore.prepareCalls,
+			taskStore.publishCalls,
+			taskStore.ackCalls,
+		)
+	}
+	if taskStore.claimCalls != 1 {
+		t.Fatalf("claim calls after concurrent loss = %d; want 1", taskStore.claimCalls)
+	}
+}
+
+func TestRegistrationLossBetweenFinalCheckAndDispatchStartsNoExecution(
+	t *testing.T,
+) {
+	client, _ := newRedis(t)
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	taskStore := &registeredTaskStoreStub{lease: lease}
+	handler := &countingHandler{node: "trim"}
+	consumer := NewRegisteredConsumer(
+		client,
+		registrationLossTestConfig(lease),
+		taskStore,
+		registration,
+		handler,
+	)
+	executions := newConsumerExecutions(consumer, context.Background(), 1)
+	if registration.Context().Err() != nil {
+		t.Fatal("final registration check did not start active")
+	}
+	registration.MarkLost()
+	executions.sem <- struct{}{}
+	accepted := executions.startReserved(redis.XMessage{
+		ID:     "1-0",
+		Values: registeredLossTestPayload(),
+	})
+	if !accepted {
+		<-executions.sem
+	} else {
+		executions.wg.Wait()
+	}
+	if accepted {
+		t.Fatal("execution was accepted after registration loss publication")
+	}
+	if taskStore.claimCalls != 0 {
+		t.Fatalf("claim calls after forced dispatch loss = %d; want 0", taskStore.claimCalls)
+	}
+	if calls := handler.calls.Load(); calls != 0 {
+		t.Fatalf("handler calls after forced dispatch loss = %d; want 0", calls)
+	}
+}
+
+func TestConsumerRegisteredReadBudgets(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		acquireDelay      time.Duration
+		commitDelay       time.Duration
+		readDelay         time.Duration
+		blockingReadDelay time.Duration
+		readErr           error
+		wantReadErr       error
+	}{
+		{
+			name:              "empty queue avoids Redis blocking timeout overshoot",
+			readDelay:         20 * time.Millisecond,
+			blockingReadDelay: 450 * time.Millisecond,
+			readErr:           redis.Nil,
+			wantReadErr:       redis.Nil,
+		},
+		{
+			name:         "fence acquisition cannot expire the Redis budget",
+			acquireDelay: 400 * time.Millisecond,
+			readDelay:    200 * time.Millisecond,
+			readErr:      redis.Nil,
+			wantReadErr:  redis.Nil,
+		},
+		{
+			name:         "Redis gets its full budget after acquisition",
+			acquireDelay: 150 * time.Millisecond,
+			readDelay:    200 * time.Millisecond,
+			readErr:      redis.Nil,
+			wantReadErr:  redis.Nil,
+		},
+		{
+			name:        "successful read leaves commit context alive",
+			commitDelay: 200 * time.Millisecond,
+			readDelay:   200 * time.Millisecond,
+		},
+		{
+			name:        "Redis deadline does not cancel database lifecycle",
+			readDelay:   time.Hour,
+			wantReadErr: context.DeadlineExceeded,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				lease := registrationLossTestLease()
+				registration := newOwnedTestRegistration(context.Background(), lease)
+				ctx, cancel := context.WithCancel(registration.Context())
+				defer cancel()
+				hook := &registeredReadBudgetHook{
+					readDelay:         test.readDelay,
+					blockingReadDelay: test.blockingReadDelay,
+					readErr:           test.readErr,
+					cancelRun:         cancel,
+				}
+				client := redis.NewClient(&redis.Options{ContextTimeoutEnabled: true})
+				defer client.Close()
+				client.AddHook(hook)
+				taskStore := &registeredReadBudgetStore{
+					registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+					hook:                    hook,
+					acquireDelay:            test.acquireDelay,
+					commitDelay:             test.commitDelay,
+				}
+				consumer := NewRegisteredConsumer(client, registrationLossTestConfig(lease), taskStore, registration)
+				err := consumer.Run(ctx)
+				if !errors.Is(err, context.Canceled) || registration.Context().Err() != nil {
+					t.Fatalf("healthy registration stopped: Run=%v registration=%v", err, context.Cause(registration.Context()))
+				}
+				if !errors.Is(hook.firstErr, test.wantReadErr) {
+					t.Errorf("first Redis read = %v; want %v", hook.firstErr, test.wantReadErr)
+				}
+				if taskStore.callbackFenceErr != nil {
+					t.Errorf("Redis read expired database context: %v", taskStore.callbackFenceErr)
+				}
+				if !errors.Is(taskStore.firstReadFenceErr, test.wantReadErr) {
+					t.Errorf("first fence = %v; want %v", taskStore.firstReadFenceErr, test.wantReadErr)
+				}
+				if hook.readDone == nil || hook.readDone.Err() == nil {
+					t.Error("completed Redis read context was not canceled")
+				}
+			})
+		})
+	}
+}
+
+func TestConsumerRegisteredEmptyReadWaitsOutsideFence(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		blockTimeout time.Duration
+		wantWait     time.Duration
+	}{
+		{"default", 5 * time.Second, 200 * time.Millisecond},
+		{"short configured interval", 30 * time.Millisecond, 30 * time.Millisecond},
+		{"zero cannot busy poll", 0, 200 * time.Millisecond},
+		{"negative cannot busy poll", -time.Second, 200 * time.Millisecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				lease := registrationLossTestLease()
+				registration := newOwnedTestRegistration(context.Background(), lease)
+				ctx, cancel := context.WithCancel(registration.Context())
+				defer cancel()
+				hook := &registeredReadBudgetHook{readErr: redis.Nil, cancelRun: cancel}
+				client := redis.NewClient(&redis.Options{ContextTimeoutEnabled: true})
+				defer client.Close()
+				client.AddHook(hook)
+				taskStore := &registeredReadBudgetStore{
+					registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+					hook:                    hook,
+				}
+				consumer := NewRegisteredConsumer(client, registrationLossTestConfig(lease), taskStore, registration)
+				consumer.BlockTimeout = test.blockTimeout
+				if err := consumer.Run(ctx); !errors.Is(err, context.Canceled) {
+					t.Fatalf("Run = %v; want cancellation", err)
+				}
+				if len(hook.readStarts) != 2 {
+					t.Fatalf("read attempts = %d; want 2", len(hook.readStarts))
+				}
+				if elapsed := hook.readStarts[1].Sub(taskStore.firstReadFenceFinished); elapsed != test.wantWait {
+					t.Fatalf("empty queue wait outside fence = %s; want %s", elapsed, test.wantWait)
+				}
+			})
+		})
+	}
+}
+
+func TestConsumerRegisteredIdleWaitCancelsPromptly(t *testing.T) {
+	for _, loseRegistration := range []bool{false, true} {
+		t.Run(fmt.Sprintf("registration loss=%t", loseRegistration), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				lease := registrationLossTestLease()
+				registration := newOwnedTestRegistration(context.Background(), lease)
+				ctx, cancel := context.WithCancel(registration.Context())
+				defer cancel()
+				hook := &registeredReadBudgetHook{readErr: redis.Nil, cancelRun: cancel}
+				client := redis.NewClient(&redis.Options{ContextTimeoutEnabled: true})
+				defer client.Close()
+				client.AddHook(hook)
+				taskStore := &registeredReadBudgetStore{
+					registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+					hook:                    hook,
+				}
+				consumer := NewRegisteredConsumer(client, registrationLossTestConfig(lease), taskStore, registration)
+				done := make(chan error, 1)
+				go func() { done <- consumer.Run(ctx) }()
+				synctest.Wait()
+				if hook.reads != 1 || taskStore.firstReadFenceFinished.IsZero() {
+					t.Fatalf("not idle outside completed fence: reads=%d finished=%v", hook.reads, taskStore.firstReadFenceFinished)
+				}
+				wantErr := context.Canceled
+				if loseRegistration {
+					wantErr = ErrRegistrationLost
+					registration.MarkLost()
+				} else {
+					cancel()
+				}
+				synctest.Wait()
+				select {
+				case err := <-done:
+					if !errors.Is(err, wantErr) {
+						t.Fatalf("Run = %v; want %v", err, wantErr)
+					}
+				default:
+					t.Fatal("idle wait did not stop immediately on cancellation")
+				}
+				if hook.reads != 1 {
+					t.Fatalf("Redis reads after idle cancellation = %d; want 1", hook.reads)
+				}
+			})
+		})
+	}
+}
+
+func TestRegisteredReadFenceLossWaitsForCleanup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		fence := &registeredReadFence{}
+		ctx, finish, ready := fence.begin(context.Background())
+		if !ready {
+			t.Fatal("active fence rejected read")
+		}
+		stopped := make(chan struct{})
+		go func() {
+			fence.stop()
+			close(stopped)
+		}()
+		synctest.Wait()
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("read context = %v; want cancellation", ctx.Err())
+		}
+		select {
+		case <-stopped:
+			t.Fatal("loss guard returned before synchronous read/fence cleanup")
+		default:
+		}
+		finish()
+		finish() // Completion is idempotent, including cancellation races.
+		synctest.Wait()
+		select {
+		case <-stopped:
+		default:
+			t.Fatal("loss guard did not return after cleanup")
+		}
+		if _, _, ready := fence.begin(context.Background()); ready {
+			t.Fatal("loss guard allowed an orphan late read")
+		}
+	})
+}
+
+func TestConsumerRegisteredReadDatabaseErrorsRemainFailClosed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		lease := registrationLossTestLease()
+		registration := newOwnedTestRegistration(context.Background(), lease)
+		hook := &registeredReadBudgetHook{}
+		client := redis.NewClient(&redis.Options{ContextTimeoutEnabled: true})
+		defer client.Close()
+		client.AddHook(hook)
+		taskStore := &registeredReadBudgetStore{
+			registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+			hook:                    hook,
+			forceFenceErr:           errors.New("database unavailable"),
+		}
+		consumer := NewRegisteredConsumer(client, registrationLossTestConfig(lease), taskStore, registration)
+		if err := consumer.Run(registration.Context()); !errors.Is(err, ErrRegistrationLost) {
+			t.Fatalf("Run = %v; want registration loss", err)
+		}
+		if hook.reads != 0 {
+			t.Fatalf("Redis reads without authorization = %d; want 0", hook.reads)
+		}
+	})
+}
+
+func TestConsumerRegistrationLossDeadlineStopsBeforeRedisRetrySleep(
+	t *testing.T,
+) {
+	client, _ := newRedis(t)
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := registrationLossTestConfig(lease)
+	cfg.Concurrency = 1
+	cfg.PELMinIdle = time.Hour
+	cfg.ShutdownGracePeriod = 50 * time.Millisecond
+	taskStore := &registeredTaskStoreStub{lease: lease}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		&countingHandler{node: "trim"},
+	)
+	withGroup(t, consumer)
+	readHook := &registrationDeadlineReadHook{}
+	client.AddHook(readHook)
+	runContext, cancelRun := context.WithTimeout(
+		registration.Context(),
+		25*time.Millisecond,
+	)
+	defer cancelRun()
+
+	started := time.Now()
+	runErr := consumer.Run(runContext)
+	elapsed := time.Since(started)
+	if !errors.Is(runErr, context.DeadlineExceeded) {
+		t.Fatalf("Run error = %v; want deadline exceeded", runErr)
+	}
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf(
+			"Run deadline shutdown = %s; want no one-second Redis retry sleep",
+			elapsed,
+		)
+	}
+	if reads := readHook.reads.Load(); reads != 1 {
+		t.Fatalf("XREADGROUP calls after deadline = %d; want 1", reads)
+	}
+}
+
+func TestRegistrationDispatchCommitErrorKeepsAcceptedSemaphoreOwnership(
+	t *testing.T,
+) {
+	client, _ := newRedis(t)
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	taskStore := &registeredTaskStoreStub{
+		lease:          lease,
+		fenceCommitErr: store.ErrWorkerRegistrationLost,
+	}
+	handlerRelease := make(chan struct{})
+	handler := &blockingCancelledHandler{
+		started: make(chan struct{}, 1),
+		release: handlerRelease,
+	}
+	consumer := NewRegisteredConsumer(
+		client,
+		registrationLossTestConfig(lease),
+		taskStore,
+		registration,
+		handler,
+	)
+	executions := newConsumerExecutions(consumer, context.Background(), 1)
+	executions.sem <- struct{}{}
+
+	accepted := executions.startReserved(redis.XMessage{
+		ID:     "1-0",
+		Values: registeredLossTestPayload(),
+	})
+	if !accepted {
+		t.Fatal("callback-started execution was reported as unaccepted")
+	}
+	select {
+	case <-handler.started:
+	case <-time.After(time.Second):
+		t.Fatal("callback-started handler did not run")
+	}
+	close(handlerRelease)
+	executions.wg.Wait()
+
+	if taskStore.fenceCalls != 1 {
+		t.Fatalf("registration fence calls = %d; want 1", taskStore.fenceCalls)
+	}
+	if taskStore.claimCalls != 1 {
+		t.Fatalf("claim calls = %d; want 1", taskStore.claimCalls)
+	}
+	if cause := context.Cause(registration.Context()); cause != ErrRegistrationLost {
+		t.Fatalf(
+			"registration cause = %v; want exact ErrRegistrationLost",
+			cause,
+		)
+	}
+	if got := len(executions.sem); got != 0 {
+		t.Fatalf("semaphore reservations after execution = %d; want 0", got)
+	}
+	select {
+	case executions.sem <- struct{}{}:
+	default:
+		t.Fatal("semaphore capacity was not restored")
+	}
+	select {
+	case executions.sem <- struct{}{}:
+		t.Fatal("semaphore capacity was restored more than once")
+	default:
+	}
+	<-executions.sem
+}
+
+func TestConsumerRegistrationLossRejectsSuccessfulLateRead(t *testing.T) {
+	client, _ := newRedis(t)
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := registrationLossTestConfig(lease)
+	cfg.Concurrency = 2
+	secondReadStarted := make(chan struct{})
+	hook := &registrationReadRaceHook{
+		secondReadStarted: secondReadStarted,
+		lateMessage: &redis.XMessage{
+			ID:     "9999999999999-0",
+			Values: registeredLossTestPayload(),
+		},
+	}
+	client.AddHook(hook)
+	taskStore := &blockingReadLossStore{
+		registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+		secondReadStarted:       secondReadStarted,
+	}
+	handler := &countingHandler{node: "trim"}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		handler,
+	)
+	consumer.BlockTimeout = 5 * time.Second
+	withGroup(t, consumer)
+	if _, err := client.XAdd(
+		context.Background(),
+		&redis.XAddArgs{
+			Stream: cfg.RedisStream,
+			Values: registeredLossTestPayload(),
+		},
+	).Result(); err != nil {
+		t.Fatalf("add initial loss task: %v", err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- consumer.Run(registration.Context()) }()
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrRegistrationLost) {
+			t.Fatalf("Run error = %v; want ErrRegistrationLost", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after successful read returned behind loss")
+	}
+	if calls := taskStore.claimCalls.Load(); calls != 1 {
+		t.Fatalf("claim calls after late successful read = %d; want 1", calls)
+	}
+	if calls := handler.calls.Load(); calls != 0 {
+		t.Fatalf("handler calls after late successful read = %d; want 0", calls)
+	}
+}
+
+func TestConsumerRegistrationLossCancelsBlockingRedisReadPromptly(
+	t *testing.T,
+) {
+	rawURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"))
+	if rawURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_REDIS_TEST_URL for Redis 7.4 worker integration tests")
+	}
+	options, err := ParseWorkerRedisOptions(rawURL)
+	if err != nil {
+		t.Fatalf("parse worker Redis options: %v", err)
+	}
+	if !options.ContextTimeoutEnabled {
+		t.Fatal("ContextTimeoutEnabled = false; want registration-owned cancellation")
+	}
+	client := redis.NewClient(options)
+	t.Cleanup(func() { _ = client.Close() })
+	probeContext, cancelProbe := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancelProbe()
+	if err := client.Ping(probeContext).Err(); err != nil {
+		t.Fatalf("ping Redis integration server: %v", err)
+	}
+
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := registrationLossTestConfig(lease)
+	cfg.Concurrency = 2
+	cfg.ShutdownGracePeriod = time.Second
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupContext, cfg.RedisStream).Err()
+	})
+	secondReadStarted := make(chan struct{})
+	client.AddHook(&registrationReadRaceHook{
+		secondReadStarted: secondReadStarted,
+	})
+	taskStore := &blockingReadLossStore{
+		registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+		secondReadStarted:       secondReadStarted,
+	}
+	handler := &countingHandler{node: "trim"}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		handler,
+	)
+	consumer.BlockTimeout = 30 * time.Second
+	withGroup(t, consumer)
+	initialID, err := client.XAdd(
+		context.Background(),
+		&redis.XAddArgs{
+			Stream: cfg.RedisStream,
+			Values: registeredLossTestPayload(),
+		},
+	).Result()
+	if err != nil {
+		t.Fatalf("add initial registered delivery: %v", err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- consumer.Run(registration.Context()) }()
+	select {
+	case <-registration.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("registration loss was not published")
+	}
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, ErrRegistrationLost) {
+			t.Fatalf("Run error = %v; want ErrRegistrationLost", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not promptly cancel blocking XREADGROUP")
+	}
+	pending, err := client.XPending(
+		context.Background(),
+		cfg.RedisStream,
+		cfg.RedisGroup,
+	).Result()
+	if err != nil {
+		t.Fatalf("read pending after blocking-read cancellation: %v", err)
+	}
+	if pending.Count != 1 {
+		t.Fatalf("pending deliveries after loss = %d; want 1", pending.Count)
+	}
+	initialPending, err := client.XPendingExt(
+		context.Background(),
+		&redis.XPendingExtArgs{
+			Stream: cfg.RedisStream,
+			Group:  cfg.RedisGroup,
+			Start:  initialID,
+			End:    initialID,
+			Count:  1,
+		},
+	).Result()
+	if err != nil {
+		t.Fatalf("inspect original delivery PEL state: %v", err)
+	}
+	if len(initialPending) != 1 {
+		t.Fatalf("original delivery PEL state = %#v; want exact entry", initialPending)
+	}
+	if calls := taskStore.claimCalls.Load(); calls != 1 {
+		t.Fatalf("claim calls after loss = %d; want 1", calls)
+	}
+	if calls := handler.calls.Load(); calls != 0 {
+		t.Fatalf("handler calls after loss = %d; want 0", calls)
+	}
+}
+
+func TestConsumerRegistrationFenceOrdersRedisIntakeBeforeTakeoverProof(
+	t *testing.T,
+) {
+	rawRedisURL := strings.TrimSpace(
+		os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"),
+	)
+	if rawRedisURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_REDIS_TEST_URL for Redis 7.4 worker integration tests")
+	}
+	client := newRealWorkerRedisClient(t)
+	fixture := newWorkerIntakePostgresFixture(t, rawRedisURL)
+	lease, err := fixture.worker.RegisterWorker(
+		fixture.ctx,
+		fixture.claims,
+		fixture.token,
+	)
+	if err != nil {
+		t.Fatalf("register intake worker: %v", err)
+	}
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := Config{
+		WorkerType:          fixture.claims.WorkerType,
+		WorkerID:            lease.RedisConsumerID,
+		WorkerHost:          fixture.claims.WorkerHost,
+		RedisStream:         fixture.claims.RedisStream,
+		RedisGroup:          fixture.claims.RedisGroup,
+		Concurrency:         2,
+		HeartbeatInterval:   time.Hour,
+		ShutdownGracePeriod: time.Second,
+		PELMinIdle:          time.Hour,
+	}
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupContext, cfg.RedisStream).Err()
+	})
+	secondReadRelease := make(chan struct{})
+	var releaseReadOnce sync.Once
+	releaseRead := func() { releaseReadOnce.Do(func() { close(secondReadRelease) }) }
+	defer releaseRead()
+	intakeHook := &registeredIntakeReadHook{
+		starts:            make(chan int32, 8),
+		secondReadRelease: secondReadRelease,
+	}
+	client.AddHook(intakeHook)
+	taskStore := &registeredIntakeFenceStore{fenceStore: fixture.worker}
+	handlerRelease := make(chan struct{})
+	var releaseHandlers sync.Once
+	release := func() {
+		releaseHandlers.Do(func() { close(handlerRelease) })
+	}
+	defer release()
+	handler := &blockingCancelledHandler{
+		started: make(chan struct{}, 2),
+		release: handlerRelease,
+	}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		handler,
+	)
+	consumer.BlockTimeout = 30 * time.Second
+	withGroup(t, consumer)
+
+	runContext, cancelRun := context.WithTimeout(
+		registration.Context(),
+		5*time.Second,
+	)
+	defer cancelRun()
+	waitForRead := func(want int32) {
+		t.Helper()
+		select {
+		case got := <-intakeHook.starts:
+			if got != want {
+				cancelRun()
+				release()
+				t.Fatalf("XREADGROUP start = %d; want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			cancelRun()
+			release()
+			t.Fatalf("XREADGROUP %d did not start", want)
+		}
+	}
+	addDelivery := func(label string) string {
+		t.Helper()
+		messageID, addErr := client.XAdd(
+			context.Background(),
+			&redis.XAddArgs{
+				Stream: cfg.RedisStream,
+				Values: registeredLossTestPayload(),
+			},
+		).Result()
+		if addErr != nil {
+			cancelRun()
+			release()
+			t.Fatalf("add %s delivery: %v", label, addErr)
+		}
+		return messageID
+	}
+	waitForHandler := func(index int) {
+		t.Helper()
+		select {
+		case <-handler.started:
+		case <-time.After(time.Second):
+			cancelRun()
+			release()
+			t.Fatalf("handler %d did not start", index)
+		}
+	}
+
+	firstID := addDelivery("first pre-proof")
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- consumer.Run(runContext)
+	}()
+	waitForRead(1)
+	waitForHandler(1)
+	waitForRead(2)
+
+	takeoverClaims := fixture.claims
+	takeoverClaims.WorkerInstanceID = uuid.New()
+	takeoverClaims.RedisConsumerID = fmt.Sprintf(
+		"%s-worker@%s:%d:%s",
+		takeoverClaims.WorkerType,
+		takeoverClaims.WorkerHost,
+		takeoverClaims.WorkerSlot,
+		takeoverClaims.WorkerInstanceID,
+	)
+	takeoverDone := make(chan error, 1)
+	go func() {
+		_, takeoverErr := fixture.worker.RegisterWorker(
+			fixture.ctx,
+			takeoverClaims,
+			fixture.token,
+		)
+		takeoverDone <- takeoverErr
+	}()
+	select {
+	case takeoverErr := <-takeoverDone:
+		cancelRun()
+		release()
+		<-runDone
+		t.Fatalf(
+			"takeover proof completed while XREADGROUP was in flight: %v",
+			takeoverErr,
+		)
+	case <-time.After(75 * time.Millisecond):
+	}
+	releaseRead()
+
+	select {
+	case takeoverErr := <-takeoverDone:
+		if takeoverErr != nil {
+			cancelRun()
+			release()
+			<-runDone
+			t.Fatalf("takeover proof after intake: %v", takeoverErr)
+		}
+	case <-time.After(2 * time.Second):
+		cancelRun()
+		release()
+		<-runDone
+		t.Fatal("takeover proof did not complete after fenced intake")
+	}
+	postProofID := addDelivery("post-proof")
+	release()
+
+	select {
+	case runErr := <-runDone:
+		if !errors.Is(runErr, ErrRegistrationLost) {
+			t.Fatalf("Run error = %v; want exact ErrRegistrationLost", runErr)
+		}
+	case <-time.After(2 * time.Second):
+		cancelRun()
+		t.Fatal("Run did not stop after stale intake fence")
+	}
+	if !errors.Is(
+		context.Cause(registration.Context()),
+		ErrRegistrationLost,
+	) {
+		t.Fatalf(
+			"registration cause = %v; want exact ErrRegistrationLost",
+			context.Cause(registration.Context()),
+		)
+	}
+	if calls := taskStore.claimCalls.Load(); calls != 1 {
+		t.Fatalf("pre-proof claim calls = %d; want 1", calls)
+	}
+	if calls := handler.calls.Load(); calls != 1 {
+		t.Fatalf("pre-proof handler calls = %d; want 1", calls)
+	}
+	if calls := intakeHook.reads.Load(); calls != 2 {
+		t.Fatalf("Redis XREADGROUP calls = %d; want 2 pre-proof calls", calls)
+	}
+	if calls := taskStore.staleFenceCalls.Load(); calls == 0 {
+		t.Fatal("no registration fence was attempted after takeover proof")
+	}
+	if calls := taskStore.staleCallbackCalls.Load(); calls != 0 {
+		t.Fatalf("stale-fence Redis callbacks = %d; want 0", calls)
+	}
+	pending, err := client.XPending(
+		context.Background(),
+		cfg.RedisStream,
+		cfg.RedisGroup,
+	).Result()
+	if err != nil {
+		t.Fatalf("inspect ordered intake PEL: %v", err)
+	}
+	if pending.Count != 1 {
+		t.Fatalf("ordered intake PEL count = %d; want 1", pending.Count)
+	}
+	exact, inspectErr := client.XPendingExt(
+		context.Background(),
+		&redis.XPendingExtArgs{
+			Stream: cfg.RedisStream,
+			Group:  cfg.RedisGroup,
+			Start:  firstID,
+			End:    firstID,
+			Count:  1,
+		},
+	).Result()
+	if inspectErr != nil || len(exact) != 1 {
+		t.Fatalf(
+			"pre-proof delivery %s pending = %#v, err=%v",
+			firstID,
+			exact,
+			inspectErr,
+		)
+	}
+	postProofPending, err := client.XPendingExt(
+		context.Background(),
+		&redis.XPendingExtArgs{
+			Stream: cfg.RedisStream,
+			Group:  cfg.RedisGroup,
+			Start:  postProofID,
+			End:    postProofID,
+			Count:  1,
+		},
+	).Result()
+	if err != nil {
+		t.Fatalf("inspect post-proof PEL: %v", err)
+	}
+	if len(postProofPending) != 0 {
+		t.Fatalf("post-proof delivery entered PEL: %#v", postProofPending)
+	}
+}
+
+func TestRegistrationHeartbeatFenceRejectsRedisClaimAfterTakeoverProof(
+	t *testing.T,
+) {
+	rawRedisURL := strings.TrimSpace(
+		os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"),
+	)
+	if rawRedisURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_REDIS_TEST_URL for Redis 7.4 worker integration tests")
+	}
+	client := newRealWorkerRedisClient(t)
+	fixture := newWorkerIntakePostgresFixture(t, rawRedisURL)
+	lease, err := fixture.worker.RegisterWorker(
+		fixture.ctx,
+		fixture.claims,
+		fixture.token,
+	)
+	if err != nil {
+		t.Fatalf("register heartbeat-fence worker: %v", err)
+	}
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := Config{
+		WorkerType:        fixture.claims.WorkerType,
+		WorkerID:          lease.RedisConsumerID,
+		WorkerHost:        fixture.claims.WorkerHost,
+		RedisStream:       fixture.claims.RedisStream,
+		RedisGroup:        fixture.claims.RedisGroup,
+		HeartbeatInterval: 5 * time.Millisecond,
+	}
+	claimHook := &registeredClaimCountingHook{}
+	client.AddHook(claimHook)
+	taskStore := &registeredIntakeFenceStore{fenceStore: fixture.worker}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		&countingHandler{node: "trim"},
+	)
+
+	takeoverClaims := fixture.claims
+	takeoverClaims.WorkerInstanceID = uuid.New()
+	takeoverClaims.RedisConsumerID = fmt.Sprintf(
+		"%s-worker@%s:%d:%s",
+		takeoverClaims.WorkerType,
+		takeoverClaims.WorkerHost,
+		takeoverClaims.WorkerSlot,
+		takeoverClaims.WorkerInstanceID,
+	)
+	if _, err := fixture.worker.RegisterWorker(
+		fixture.ctx,
+		takeoverClaims,
+		fixture.token,
+	); err != nil {
+		t.Fatalf("complete heartbeat-fence takeover proof: %v", err)
+	}
+
+	heartbeatContext, cancelHeartbeat := context.WithCancel(context.Background())
+	heartbeatDone := consumer.startTaskHeartbeat(heartbeatContext, "1-0")
+	t.Cleanup(func() {
+		cancelHeartbeat()
+		select {
+		case <-heartbeatDone:
+		case <-time.After(time.Second):
+			t.Error("registered heartbeat did not stop during cleanup")
+		}
+	})
+	deadline := time.Now().Add(time.Second)
+	for taskStore.staleFenceCalls.Load() == 0 &&
+		claimHook.claims.Load() == 0 &&
+		time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if claims := claimHook.claims.Load(); claims != 0 {
+		t.Fatalf("post-takeover Redis XCLAIM calls = %d; want 0", claims)
+	}
+	if calls := taskStore.staleFenceCalls.Load(); calls == 0 {
+		t.Fatal("post-takeover heartbeat did not check the registration fence")
+	}
+	if callbacks := taskStore.staleCallbackCalls.Load(); callbacks != 0 {
+		t.Fatalf("post-takeover heartbeat Redis callbacks = %d; want 0", callbacks)
+	}
+	select {
+	case <-heartbeatDone:
+	case <-time.After(time.Second):
+		t.Fatal("stale-fenced registered heartbeat did not stop")
+	}
+	if cause := context.Cause(registration.Context()); cause != ErrRegistrationLost {
+		t.Fatalf(
+			"registration cause = %v; want exact ErrRegistrationLost",
+			cause,
+		)
+	}
+}
+
+func TestConsumerRegistrationFenceRejectsDispatchAfterTakeoverProof(
+	t *testing.T,
+) {
+	rawRedisURL := strings.TrimSpace(
+		os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"),
+	)
+	if rawRedisURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_REDIS_TEST_URL for Redis 7.4 worker integration tests")
+	}
+	client := newRealWorkerRedisClient(t)
+	fixture := newWorkerIntakePostgresFixture(t, rawRedisURL)
+	lease, err := fixture.worker.RegisterWorker(
+		fixture.ctx,
+		fixture.claims,
+		fixture.token,
+	)
+	if err != nil {
+		t.Fatalf("register dispatch-gap worker: %v", err)
+	}
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := Config{
+		WorkerType:          fixture.claims.WorkerType,
+		WorkerID:            lease.RedisConsumerID,
+		WorkerHost:          fixture.claims.WorkerHost,
+		RedisStream:         fixture.claims.RedisStream,
+		RedisGroup:          fixture.claims.RedisGroup,
+		Concurrency:         1,
+		HeartbeatInterval:   time.Hour,
+		ShutdownGracePeriod: time.Second,
+		PELMinIdle:          time.Hour,
+	}
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupContext, cfg.RedisStream).Err()
+	})
+	readHook := &registeredIntakeReadHook{starts: make(chan int32, 4)}
+	client.AddHook(readHook)
+	releaseFenceReturn := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseFenceReturn) })
+	}
+	defer release()
+	taskStore := &registeredDispatchGapStore{
+		registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+		fenceStore:              fixture.worker,
+		readHook:                readHook,
+		readFenceCommitted:      make(chan struct{}),
+		releaseFenceReturn:      releaseFenceReturn,
+	}
+	handler := &countingHandler{node: "trim"}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		handler,
+	)
+	consumer.BlockTimeout = 30 * time.Second
+	withGroup(t, consumer)
+
+	runContext, cancelRun := context.WithTimeout(
+		registration.Context(),
+		5*time.Second,
+	)
+	defer cancelRun()
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- consumer.Run(runContext)
+	}()
+	select {
+	case readNumber := <-readHook.starts:
+		if readNumber != 1 {
+			release()
+			t.Fatalf("dispatch-gap XREADGROUP start = %d; want 1", readNumber)
+		}
+	case <-time.After(time.Second):
+		release()
+		t.Fatal("dispatch-gap XREADGROUP did not start")
+	}
+	messageID, err := client.XAdd(
+		context.Background(),
+		&redis.XAddArgs{
+			Stream: cfg.RedisStream,
+			Values: registeredLossTestPayload(),
+		},
+	).Result()
+	if err != nil {
+		release()
+		t.Fatalf("add dispatch-gap delivery: %v", err)
+	}
+	select {
+	case <-taskStore.readFenceCommitted:
+	case <-time.After(time.Second):
+		release()
+		t.Fatal("intake transaction did not commit before dispatch gap")
+	}
+
+	takeoverClaims := fixture.claims
+	takeoverClaims.WorkerInstanceID = uuid.New()
+	takeoverClaims.RedisConsumerID = fmt.Sprintf(
+		"%s-worker@%s:%d:%s",
+		takeoverClaims.WorkerType,
+		takeoverClaims.WorkerHost,
+		takeoverClaims.WorkerSlot,
+		takeoverClaims.WorkerInstanceID,
+	)
+	if _, err := fixture.worker.RegisterWorker(
+		fixture.ctx,
+		takeoverClaims,
+		fixture.token,
+	); err != nil {
+		release()
+		t.Fatalf("dispatch-gap takeover proof: %v", err)
+	}
+	release()
+
+	select {
+	case runErr := <-runDone:
+		if !errors.Is(runErr, ErrRegistrationLost) {
+			t.Fatalf("dispatch-gap Run error = %v; want ErrRegistrationLost", runErr)
+		}
+	case <-time.After(2 * time.Second):
+		cancelRun()
+		t.Fatal("dispatch-gap Run did not stop after takeover")
+	}
+	if taskStore.claimCalls != 0 {
+		t.Fatalf("post-proof claim calls = %d; want 0", taskStore.claimCalls)
+	}
+	if calls := handler.calls.Load(); calls != 0 {
+		t.Fatalf("post-proof handler calls = %d; want 0", calls)
+	}
+	if taskStore.ackCalls != 0 {
+		t.Fatalf("post-proof acknowledgement calls = %d; want 0", taskStore.ackCalls)
+	}
+	pending, err := client.XPendingExt(
+		context.Background(),
+		&redis.XPendingExtArgs{
+			Stream: cfg.RedisStream,
+			Group:  cfg.RedisGroup,
+			Start:  messageID,
+			End:    messageID,
+			Count:  1,
+		},
+	).Result()
+	if err != nil || len(pending) != 1 {
+		t.Fatalf(
+			"dispatch-gap delivery pending = %#v, err=%v; want exact original",
+			pending,
+			err,
+		)
+	}
+}
+
+func TestRegistrationPublicReclaimHandoffOrdersLossBeforeExecution(
+	t *testing.T,
+) {
+	for _, reclaim := range []string{"pending", "preferred"} {
+		for _, loss := range []string{"takeover", "local"} {
+			t.Run(reclaim+"/"+loss, func(t *testing.T) {
+				runPublicReclaimHandoffCase(t, reclaim, loss, false)
+			})
+		}
+	}
+}
+
+func TestRegistrationPublicReclaimAcceptedBeforeTakeoverRunsOnce(
+	t *testing.T,
+) {
+	for _, reclaim := range []string{"pending", "preferred"} {
+		t.Run(reclaim, func(t *testing.T) {
+			runPublicReclaimHandoffCase(t, reclaim, "takeover", true)
+		})
+	}
+}
+
+func runPublicReclaimHandoffCase(
+	t *testing.T,
+	reclaim string,
+	loss string,
+	acceptBeforeLoss bool,
+) {
+	t.Helper()
+	rawRedisURL := strings.TrimSpace(
+		os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"),
+	)
+	if rawRedisURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_REDIS_TEST_URL for Redis 7.4 worker integration tests")
+	}
+	client := newRealWorkerRedisClient(t)
+	fixture := newWorkerIntakePostgresFixture(t, rawRedisURL)
+	lease, err := fixture.worker.RegisterWorker(
+		fixture.ctx,
+		fixture.claims,
+		fixture.token,
+	)
+	if err != nil {
+		t.Fatalf("register public reclaim worker: %v", err)
+	}
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	cfg := Config{
+		WorkerType:        fixture.claims.WorkerType,
+		WorkerID:          lease.RedisConsumerID,
+		WorkerHost:        fixture.claims.WorkerHost,
+		RedisStream:       fixture.claims.RedisStream,
+		RedisGroup:        fixture.claims.RedisGroup,
+		PELMinIdle:        time.Millisecond,
+		HeartbeatInterval: time.Hour,
+	}
+	eventStream := cfg.RedisStream + ":events"
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupContext, cfg.RedisStream, eventStream).Err()
+	})
+	reclaimContext, cancelReclaim := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	defer cancelReclaim()
+	if err := client.XGroupCreateMkStream(
+		reclaimContext,
+		cfg.RedisStream,
+		cfg.RedisGroup,
+		"0",
+	).Err(); err != nil {
+		t.Fatalf("create public reclaim group: %v", err)
+	}
+	payload := registeredLossTestPayload()
+	payload["event_stream"] = eventStream
+	if reclaim == "preferred" {
+		payload["preferred_hosts"] = `["host127"]`
+		payload["affinity_enqueued_at"] = time.Now().UTC().
+			Format(time.RFC3339Nano)
+	}
+	messageID, err := client.XAdd(
+		reclaimContext,
+		&redis.XAddArgs{
+			Stream: cfg.RedisStream,
+			Values: payload,
+		},
+	).Result()
+	if err != nil {
+		t.Fatalf("add public reclaim delivery: %v", err)
+	}
+	before, err := client.XRangeN(
+		reclaimContext,
+		cfg.RedisStream,
+		messageID,
+		messageID,
+		1,
+	).Result()
+	if err != nil || len(before) != 1 {
+		t.Fatalf("read exact public reclaim delivery: messages=%#v err=%v", before, err)
+	}
+	wrongConsumer := "ffmpeg_go-worker@host150:1:" + uuid.NewString()
+	delivered, err := client.XReadGroup(
+		reclaimContext,
+		&redis.XReadGroupArgs{
+			Group:    cfg.RedisGroup,
+			Consumer: wrongConsumer,
+			Streams:  []string{cfg.RedisStream, ">"},
+			Count:    1,
+		},
+	).Result()
+	if err != nil ||
+		len(delivered) != 1 ||
+		len(delivered[0].Messages) != 1 ||
+		delivered[0].Messages[0].ID != messageID {
+		t.Fatalf("deliver public reclaim message: streams=%#v err=%v", delivered, err)
+	}
+	if reclaim == "preferred" {
+		time.Sleep(600 * time.Millisecond)
+	} else {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	releaseFence := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseFence) })
+	}
+	defer release()
+	taskStore := &registeredPublicReclaimGapStore{
+		registeredTaskStoreStub: &registeredTaskStoreStub{lease: lease},
+		fenceStore:              fixture.worker,
+		pauseAfter:              1,
+		paused:                  make(chan struct{}),
+		release:                 releaseFence,
+	}
+	if acceptBeforeLoss {
+		taskStore.pauseAfter = 2
+	}
+	handler := &countingHandler{node: "trim"}
+	if acceptBeforeLoss {
+		handler.err = ErrConfirmedCancellation
+	}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		registration,
+		handler,
+	)
+	type reclaimResult struct {
+		count int
+		err   error
+	}
+	reclaimDone := make(chan reclaimResult, 1)
+	go func() {
+		var count int
+		var reclaimErr error
+		if reclaim == "preferred" {
+			count, reclaimErr = consumer.ReclaimPreferredPending(reclaimContext)
+		} else {
+			count, reclaimErr = consumer.ReclaimPending(reclaimContext)
+		}
+		reclaimDone <- reclaimResult{count: count, err: reclaimErr}
+	}()
+	select {
+	case <-taskStore.paused:
+	case result := <-reclaimDone:
+		release()
+		t.Fatalf(
+			"public reclaim returned before forced handoff gap: result=%#v fences=%d claims=%d handlers=%d",
+			result,
+			taskStore.fenceCalls.Load(),
+			taskStore.claimCalls,
+			handler.calls.Load(),
+		)
+	case <-time.After(3 * time.Second):
+		release()
+		t.Fatalf(
+			"public reclaim did not reach forced handoff gap: fences=%d claims=%d handlers=%d",
+			taskStore.fenceCalls.Load(),
+			taskStore.claimCalls,
+			handler.calls.Load(),
+		)
+	}
+
+	switch loss {
+	case "local":
+		registration.MarkLost()
+	case "takeover":
+		takeoverClaims := fixture.claims
+		takeoverClaims.WorkerInstanceID = uuid.New()
+		takeoverClaims.RedisConsumerID = fmt.Sprintf(
+			"%s-worker@%s:%d:%s",
+			takeoverClaims.WorkerType,
+			takeoverClaims.WorkerHost,
+			takeoverClaims.WorkerSlot,
+			takeoverClaims.WorkerInstanceID,
+		)
+		if _, err := fixture.worker.RegisterWorker(
+			fixture.ctx,
+			takeoverClaims,
+			fixture.token,
+		); err != nil {
+			release()
+			t.Fatalf("complete public reclaim takeover proof: %v", err)
+		}
+	default:
+		release()
+		t.Fatalf("unknown public reclaim loss %q", loss)
+	}
+	release()
+
+	var result reclaimResult
+	select {
+	case result = <-reclaimDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("public reclaim did not return after the handoff gap")
+	}
+	if result.count != 1 {
+		t.Fatalf("public reclaim count = %d; want exact claimed count 1", result.count)
+	}
+	if acceptBeforeLoss {
+		if result.err != nil {
+			t.Fatalf("accepted public reclaim error = %v; want nil", result.err)
+		}
+		if taskStore.claimCalls != 1 {
+			t.Fatalf("accepted public reclaim claims = %d; want 1", taskStore.claimCalls)
+		}
+		if calls := handler.calls.Load(); calls != 1 {
+			t.Fatalf("accepted public reclaim handler calls = %d; want 1", calls)
+		}
+	} else {
+		if !errors.Is(result.err, ErrRegistrationLost) {
+			t.Fatalf(
+				"post-loss public reclaim error = %v; want ErrRegistrationLost",
+				result.err,
+			)
+		}
+		if taskStore.claimCalls != 0 {
+			t.Fatalf("post-loss public reclaim claims = %d; want 0", taskStore.claimCalls)
+		}
+		if calls := handler.calls.Load(); calls != 0 {
+			t.Fatalf("post-loss public reclaim handler calls = %d; want 0", calls)
+		}
+		if cause := context.Cause(registration.Context()); cause != ErrRegistrationLost {
+			t.Fatalf(
+				"public reclaim registration cause = %v; want exact ErrRegistrationLost",
+				cause,
+			)
+		}
+	}
+	if taskStore.ackCalls != 0 {
+		t.Fatalf("public reclaim acknowledgement calls = %d; want 0", taskStore.ackCalls)
+	}
+	after, err := client.XRangeN(
+		context.Background(),
+		cfg.RedisStream,
+		messageID,
+		messageID,
+		1,
+	).Result()
+	if err != nil ||
+		len(after) != 1 ||
+		after[0].ID != before[0].ID ||
+		!reflect.DeepEqual(after[0].Values, before[0].Values) {
+		t.Fatalf(
+			"public reclaim changed exact delivery: before=%#v after=%#v err=%v",
+			before,
+			after,
+			err,
+		)
+	}
+	pending, err := client.XPendingExt(
+		context.Background(),
+		&redis.XPendingExtArgs{
+			Stream: cfg.RedisStream,
+			Group:  cfg.RedisGroup,
+			Start:  messageID,
+			End:    messageID,
+			Count:  1,
+		},
+	).Result()
+	if err != nil ||
+		len(pending) != 1 ||
+		pending[0].Consumer != cfg.WorkerID {
+		t.Fatalf(
+			"public reclaim exact PEL entry = %#v, err=%v; want current owner",
+			pending,
+			err,
+		)
+	}
+	if length, err := client.XLen(
+		context.Background(),
+		cfg.RedisStream,
+	).Result(); err != nil || length != 1 {
+		t.Fatalf("public reclaim stream length = %d, err=%v; want 1", length, err)
+	}
+}
+
+func TestRegistrationConsumerClaimsExactDeliveryCompletesAndAcks(t *testing.T) {
+	client, _ := newRedis(t)
+	instanceID := uuid.New()
+	cfg := Config{
+		WorkerType:  "ffmpeg_go",
+		WorkerID:    "ffmpeg_go-worker@host127:1:" + instanceID.String(),
+		WorkerHost:  "host127",
+		RedisStream: "vp:test:registered:tasks",
+		RedisGroup:  "vp-test-registered-workers",
+	}
+	lease := RegistrationLease{
+		RegistrationID:   uuid.New(),
+		WorkerInstanceID: instanceID,
+		RedisConsumerID:  cfg.WorkerID,
+		LeaseEpoch:       11,
+		LeaseExpiresAt:   time.Now().UTC().Add(RegistrationLeaseDuration),
+	}
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	authority := &registeredTaskStoreStub{lease: lease}
+	handler := &fakeHandler{node: "trim"}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		authority,
+		registration,
+		handler,
+	)
+	consumer.BlockTimeout = 50 * time.Millisecond
+	withGroup(t, consumer)
+
+	jobID := uuid.New()
+	nodeExecutionID := uuid.New()
+	dispatchKey := uuid.New()
+	payload := map[string]any{
+		"job_id":             jobID.String(),
+		"node_execution_id":  nodeExecutionID.String(),
+		"node_id":            "trim-1",
+		"node_type":          "trim",
+		"config":             `{"duration":"1"}`,
+		"input_artifacts":    "{}",
+		"preferred_hosts":    "[]",
+		"event_stream":       "vp:events",
+		"orchestrator_owner": "python",
+		"dispatch_key":       dispatchKey.String(),
+	}
+	messageID, err := client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: cfg.RedisStream,
+		Values: payload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add registered task: %v", err)
+	}
+	runOneTick(t, consumer)
+
+	stringPayload := make(map[string]string, len(payload))
+	for key, value := range payload {
+		stringPayload[key] = value.(string)
+	}
+	payloadHash, err := store.CanonicalRedisPayloadSHA256(stringPayload)
+	if err != nil {
+		t.Fatalf("hash registered payload: %v", err)
+	}
+	wantProof := store.WorkerTaskDeliveryProof{
+		RedisStream:   cfg.RedisStream,
+		ConsumerGroup: cfg.RedisGroup,
+		MessageID:     messageID,
+		PayloadSHA256: payloadHash,
+		DispatchKey:   dispatchKey,
+	}
+	if authority.claimCalls != 1 ||
+		!reflect.DeepEqual(authority.claimedProof, wantProof) {
+		t.Fatalf("claim calls/proof = %d/%#v; want 1/%#v",
+			authority.claimCalls,
+			authority.claimedProof,
+			wantProof,
+		)
+	}
+	if len(handler.seen) != 1 ||
+		authority.prepareCalls != 1 ||
+		authority.publishCalls != 1 ||
+		authority.ackCalls != 1 {
+		t.Fatalf(
+			"handler/prepare/publish/ack = %d/%d/%d/%d; want 1/1/1/1",
+			len(handler.seen),
+			authority.prepareCalls,
+			authority.publishCalls,
+			authority.ackCalls,
+		)
+	}
+	for key, want := range map[string]string{
+		"task_stream":         wantProof.RedisStream,
+		"task_group":          wantProof.ConsumerGroup,
+		"task_message_id":     wantProof.MessageID,
+		"task_payload_sha256": wantProof.PayloadSHA256,
+		"task_dispatch_key":   wantProof.DispatchKey.String(),
+	} {
+		if got := authority.preparedValues[key]; got != want {
+			t.Errorf("completed event %s = %q; want %q", key, got, want)
+		}
+	}
+	pending, err := client.XPending(
+		context.Background(),
+		cfg.RedisStream,
+		cfg.RedisGroup,
+	).Result()
+	if err != nil || pending.Count != 0 {
+		t.Fatalf("pending after registered completion = %#v, err=%v", pending, err)
+	}
+}
+
+func TestRegistrationConsumerFailureCopiesExactProofAndAcks(t *testing.T) {
+	client, _ := newRedis(t)
+	instanceID := uuid.New()
+	cfg := Config{
+		WorkerType:  "ffmpeg_go",
+		WorkerID:    "ffmpeg_go-worker@host127:1:" + instanceID.String(),
+		WorkerHost:  "host127",
+		RedisStream: "vp:test:registered:failure:tasks",
+		RedisGroup:  "vp-test-registered-failure-workers",
+	}
+	lease := RegistrationLease{
+		RegistrationID:   uuid.New(),
+		WorkerInstanceID: instanceID,
+		RedisConsumerID:  cfg.WorkerID,
+		LeaseEpoch:       12,
+		LeaseExpiresAt:   time.Now().UTC().Add(RegistrationLeaseDuration),
+	}
+	authority := &registeredTaskStoreStub{lease: lease}
+	handler := &fakeHandler{
+		node: "trim",
+		err:  errors.New("ffmpeg integration failure"),
+	}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		authority,
+		newOwnedTestRegistration(context.Background(), lease),
+		handler,
+	)
+	consumer.BlockTimeout = 50 * time.Millisecond
+	withGroup(t, consumer)
+
+	dispatchKey := uuid.New()
+	payload := map[string]any{
+		"job_id":             uuid.NewString(),
+		"node_execution_id":  uuid.NewString(),
+		"node_id":            "trim-1",
+		"node_type":          "trim",
+		"config":             "{}",
+		"input_artifacts":    "{}",
+		"preferred_hosts":    "[]",
+		"event_stream":       "vp:events",
+		"orchestrator_owner": "python",
+		"dispatch_key":       dispatchKey.String(),
+	}
+	messageID, err := client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: cfg.RedisStream,
+		Values: payload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add registered failure task: %v", err)
+	}
+	runOneTick(t, consumer)
+
+	if authority.claimCalls != 1 ||
+		authority.prepareCalls != 1 ||
+		authority.publishCalls != 1 ||
+		authority.ackCalls != 1 {
+		t.Fatalf(
+			"claim/prepare/publish/ack = %d/%d/%d/%d; want 1/1/1/1",
+			authority.claimCalls,
+			authority.prepareCalls,
+			authority.publishCalls,
+			authority.ackCalls,
+		)
+	}
+	if authority.preparedValues["event"] != "node_failed" ||
+		authority.preparedValues["error"] != handler.err.Error() {
+		t.Fatalf("failure event = %#v", authority.preparedValues)
+	}
+	for key, want := range map[string]string{
+		"task_stream":         authority.claimedProof.RedisStream,
+		"task_group":          authority.claimedProof.ConsumerGroup,
+		"task_message_id":     messageID,
+		"task_payload_sha256": authority.claimedProof.PayloadSHA256,
+		"task_dispatch_key":   dispatchKey.String(),
+	} {
+		if got := authority.preparedValues[key]; got != want {
+			t.Errorf("failed event %s = %q; want %q", key, got, want)
+		}
+	}
+	pending, err := client.XPending(
+		context.Background(),
+		cfg.RedisStream,
+		cfg.RedisGroup,
+	).Result()
+	if err != nil || pending.Count != 0 {
+		t.Fatalf("pending after registered failure = %#v, err=%v", pending, err)
+	}
+}
+
+func TestRegistrationMediaTaskPersistsRemoteObjectAndPointerUnderClaim(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	inputPath := filepath.Join(root, "input.mp4")
+	if err := os.WriteFile(inputPath, []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.MustParse("00000000-0000-0000-0000-000000000101")
+	nodeID := uuid.MustParse("00000000-0000-0000-0000-000000000201")
+	claim := store.WorkerNodeClaim{
+		RegistrationID:  uuid.MustParse("00000000-0000-0000-0000-000000000301"),
+		LeaseEpoch:      9,
+		WorkerID:        "ffmpeg_go-worker@host127:1:00000000-0000-0000-0000-000000000401",
+		WorkerStartedAt: time.Date(2026, 7, 28, 20, 0, 0, 123000000, time.UTC),
+		JobID:           jobID,
+		NodeExecutionID: nodeID,
+		AttestationID:   uuid.MustParse("00000000-0000-0000-0000-000000000501"),
+		Delivery: store.WorkerTaskDeliveryProof{
+			RedisStream:   "vp:tasks:ffmpeg_go",
+			ConsumerGroup: "ffmpeg_go-workers",
+			MessageID:     "1-0",
+			PayloadSHA256: strings.Repeat("a", 64),
+			DispatchKey:   uuid.MustParse("00000000-0000-0000-0000-000000000601"),
+		},
+	}
+	storeFake := &registeredRuntimeStore{
+		fakeTaskStore: &fakeTaskStore{
+			artifacts: map[string]store.ArtifactRow{
+				"input-artifact": {
+					ID:             "input-artifact",
+					Filename:       "input.mp4",
+					StorageBackend: "local",
+					StoragePath:    inputPath,
+				},
+			},
+		},
+	}
+	remote := &retryingStorage{failures: 2}
+	handler := NewMediaTaskHandler(RuntimeEnv{
+		Store:                   storeFake,
+		Storage:                 remote,
+		StorageBackend:          "minio",
+		LocalRoot:               root,
+		WorkerID:                claim.WorkerID,
+		StorageOperationTimeout: 100 * time.Millisecond,
+		StorageSaveAttempts:     3,
+	}, &fakeMediaHandler{})
+
+	result, err := handler.Execute(context.Background(), TaskMessage{
+		JobID:           jobID.String(),
+		NodeExecutionID: nodeID.String(),
+		NodeType:        "trim",
+		Config:          map[string]any{"output_format": "mp4"},
+		InputArtifacts:  map[string]any{"input": "input-artifact"},
+		WorkerClaim:     &claim,
+	})
+	if err != nil {
+		t.Fatalf("registered Execute: %v", err)
+	}
+	if result.OutputArtifactID == "" {
+		t.Fatal("registered artifact id is empty")
+	}
+	if storeFake.runningNode != "" {
+		t.Fatalf("registered handler directly marked node running: %q", storeFake.runningNode)
+	}
+	if storeFake.requiredClaimCalls == 0 ||
+		storeFake.persistCalls != 1 ||
+		storeFake.persistSaveCalls != 1 {
+		t.Fatalf(
+			"require/persist/save = %d/%d/%d; want >=1/1/1",
+			storeFake.requiredClaimCalls,
+			storeFake.persistCalls,
+			storeFake.persistSaveCalls,
+		)
+	}
+	if attempts := remote.saveAttempts.Load(); attempts != 3 {
+		t.Fatalf("remote Save attempts = %d; want 3", attempts)
+	}
+	const wantGeneration = "55d25999c6240b9c"
+	if got := workerClaimGeneration(claim); got != wantGeneration {
+		t.Fatalf(
+			"claim generation = %q; want Python %q",
+			got,
+			wantGeneration,
+		)
+	}
+	wantPrefix := "staging/artifacts/" + jobID.String() + "/" +
+		nodeID.String() + "-" + wantGeneration
+	if !strings.HasPrefix(remote.savedPath, wantPrefix) ||
+		storeFake.createdInput.StoragePath != remote.savedPath {
+		t.Fatalf(
+			"remote/pointer paths = %q/%q; want prefix %q",
+			remote.savedPath,
+			storeFake.createdInput.StoragePath,
+			wantPrefix,
+		)
+	}
+}
+
+func TestRegistrationMediaTaskRemoteSaveHasBoundedDeadline(t *testing.T) {
+	root := t.TempDir()
+	inputPath := filepath.Join(root, "input.mp4")
+	if err := os.WriteFile(inputPath, []byte("input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.New()
+	nodeID := uuid.New()
+	claim := store.WorkerNodeClaim{
+		RegistrationID:  uuid.New(),
+		LeaseEpoch:      3,
+		WorkerID:        "ffmpeg_go-worker@host127:1:" + uuid.NewString(),
+		WorkerStartedAt: time.Now().UTC(),
+		JobID:           jobID,
+		NodeExecutionID: nodeID,
+		AttestationID:   uuid.New(),
+		Delivery: store.WorkerTaskDeliveryProof{
+			RedisStream:   "vp:tasks:ffmpeg_go",
+			ConsumerGroup: "ffmpeg_go-workers",
+			MessageID:     "2-0",
+			PayloadSHA256: strings.Repeat("b", 64),
+			DispatchKey:   uuid.New(),
+		},
+	}
+	storeFake := &registeredRuntimeStore{
+		fakeTaskStore: &fakeTaskStore{
+			artifacts: map[string]store.ArtifactRow{
+				"input-artifact": {
+					ID:             "input-artifact",
+					Filename:       "input.mp4",
+					StorageBackend: "local",
+					StoragePath:    inputPath,
+				},
+			},
+		},
+	}
+	remote := &retryingStorage{block: true}
+	handler := NewMediaTaskHandler(RuntimeEnv{
+		Store:                   storeFake,
+		Storage:                 remote,
+		StorageBackend:          "minio",
+		LocalRoot:               root,
+		WorkerID:                claim.WorkerID,
+		StorageOperationTimeout: 20 * time.Millisecond,
+		StorageSaveAttempts:     2,
+	}, &fakeMediaHandler{})
+
+	started := time.Now()
+	_, err := handler.Execute(context.Background(), TaskMessage{
+		JobID:           jobID.String(),
+		NodeExecutionID: nodeID.String(),
+		NodeType:        "trim",
+		Config:          map[string]any{"output_format": "mp4"},
+		InputArtifacts:  map[string]any{"input": "input-artifact"},
+		WorkerClaim:     &claim,
+	})
+	if err == nil {
+		t.Fatal("blocking remote Save succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("blocking remote Save returned after %s; want bounded shutdown", elapsed)
+	}
+	if attempts := remote.saveAttempts.Load(); attempts != 1 {
+		t.Fatalf(
+			"blocking remote Save attempts = %d; want 1 within overall deadline",
+			attempts,
+		)
+	}
+	if storeFake.persistSaveCalls != 0 {
+		t.Fatalf(
+			"artifact pointer persisted after timed out Save: %d",
+			storeFake.persistSaveCalls,
+		)
+	}
+}
+
+func TestRegistrationMediaTaskJoinsNonCooperativeStreamBeforeReturning(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	inputPath := filepath.Join(root, "input.mp4")
+	if err := os.WriteFile(inputPath, []byte("input"), 0o600); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	jobID := uuid.New()
+	nodeID := uuid.New()
+	storeFake := &registeredRuntimeStore{
+		fakeTaskStore: &fakeTaskStore{
+			artifacts: map[string]store.ArtifactRow{
+				"input-artifact": {
+					ID:             "input-artifact",
+					Filename:       "input.mp4",
+					StorageBackend: "local",
+					StoragePath:    inputPath,
+				},
+			},
+		},
+	}
+	storageFake := &nonCooperativeStreamStorage{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	handler := NewMediaTaskHandler(
+		RuntimeEnv{
+			Store:                   storeFake,
+			Storage:                 storageFake,
+			StorageBackend:          "minio",
+			LocalRoot:               root,
+			StorageOperationTimeout: 40 * time.Millisecond,
+			StorageSaveAttempts:     1,
+		},
+		&fakeMediaHandler{},
+	)
+	result := make(chan error, 1)
+	go func() {
+		_, err := handler.Execute(
+			context.Background(),
+			TaskMessage{
+				JobID:           jobID.String(),
+				NodeExecutionID: nodeID.String(),
+				NodeType:        "trim",
+				Config:          map[string]any{"output_format": "mp4"},
+				InputArtifacts: map[string]any{
+					"input": "input-artifact",
+				},
+				WorkerClaim: workerRuntimeTestClaim(jobID, nodeID),
+			},
+		)
+		result <- err
+	}()
+	select {
+	case <-storageFake.started:
+	case <-time.After(time.Second):
+		t.Fatal("stream save did not start")
+	}
+	select {
+	case err := <-result:
+		close(storageFake.release)
+		t.Fatalf(
+			"Execute returned before noncooperative stream ended: %v",
+			err,
+		)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(storageFake.release)
+	select {
+	case <-storageFake.done:
+	case <-time.After(time.Second):
+		t.Fatal("stream save did not finish after release")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Execute error = %v; want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Execute did not join completed stream save")
+	}
+}
+
+type fifoOutputMediaHandler struct {
+	outputPath chan string
+}
+
+func (h *fifoOutputMediaHandler) NodeType() string { return "trim" }
+
+func (h *fifoOutputMediaHandler) Execute(
+	_ context.Context,
+	_ map[string]string,
+	outputPath string,
+	_ map[string]any,
+) (map[string]any, error) {
+	if err := unix.Mkfifo(outputPath, 0o600); err != nil {
+		return nil, err
+	}
+	h.outputPath <- outputPath
+	return map[string]any{}, nil
+}
+
+func TestRegistrationMediaTaskRejectsBlockingNonRegularOutputBeforeFence(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	inputPath := filepath.Join(root, "input.mp4")
+	if err := os.WriteFile(inputPath, []byte("input"), 0o600); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	jobID := uuid.New()
+	nodeID := uuid.New()
+	storeFake := &registeredRuntimeStore{
+		fakeTaskStore: &fakeTaskStore{
+			artifacts: map[string]store.ArtifactRow{
+				"input-artifact": {
+					ID:             "input-artifact",
+					Filename:       "input.mp4",
+					StorageBackend: "local",
+					StoragePath:    inputPath,
+				},
+			},
+		},
+	}
+	storageFake := &retryingStorage{}
+	media := &fifoOutputMediaHandler{outputPath: make(chan string, 1)}
+	handler := NewMediaTaskHandler(
+		RuntimeEnv{
+			Store:                   storeFake,
+			Storage:                 storageFake,
+			StorageBackend:          "minio",
+			LocalRoot:               root,
+			StorageOperationTimeout: 75 * time.Millisecond,
+		},
+		media,
+	)
+	result := make(chan error, 1)
+	go func() {
+		_, err := handler.Execute(
+			context.Background(),
+			TaskMessage{
+				JobID:           jobID.String(),
+				NodeExecutionID: nodeID.String(),
+				NodeType:        "trim",
+				Config:          map[string]any{"output_format": "mp4"},
+				InputArtifacts: map[string]any{
+					"input": "input-artifact",
+				},
+				WorkerClaim: workerRuntimeTestClaim(jobID, nodeID),
+			},
+		)
+		result <- err
+	}()
+	var outputPath string
+	select {
+	case outputPath = <-media.outputPath:
+	case <-time.After(time.Second):
+		t.Fatal("FIFO media output was not created")
+	}
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("non-regular blocking output was accepted")
+		}
+	case <-time.After(250 * time.Millisecond):
+		writerDone := make(chan struct{})
+		go func() {
+			defer close(writerDone)
+			writer, err := os.OpenFile(outputPath, os.O_WRONLY, 0)
+			if err == nil {
+				_, _ = writer.Write([]byte("unblock"))
+				_ = writer.Close()
+			}
+		}()
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+		}
+		select {
+		case <-writerDone:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("blocking local read escaped storage operation deadline")
+	}
+	if storeFake.persistCalls != 0 || storageFake.saveAttempts.Load() != 0 {
+		t.Fatalf(
+			"persist/storage calls = %d/%d; want 0/0",
+			storeFake.persistCalls,
+			storageFake.saveAttempts.Load(),
+		)
+	}
+}
+
+type largeOutputMediaHandler struct {
+	size int64
+}
+
+func (h largeOutputMediaHandler) NodeType() string { return "trim" }
+
+func (h largeOutputMediaHandler) Execute(
+	_ context.Context,
+	_ map[string]string,
+	outputPath string,
+	_ map[string]any,
+) (map[string]any, error) {
+	file, err := os.OpenFile(
+		outputPath,
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+		0o600,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := file.Truncate(h.size); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return map[string]any{}, file.Close()
+}
+
+func TestRegistrationMediaTaskStreamsLargeOutputWithinOverallDeadline(
+	t *testing.T,
+) {
+	const outputSize = int64(32 << 20)
+	root := t.TempDir()
+	inputPath := filepath.Join(root, "input.mp4")
+	if err := os.WriteFile(inputPath, []byte("input"), 0o600); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	jobID := uuid.New()
+	nodeID := uuid.New()
+	storeFake := &registeredRuntimeStore{
+		fakeTaskStore: &fakeTaskStore{
+			artifacts: map[string]store.ArtifactRow{
+				"input-artifact": {
+					ID:             "input-artifact",
+					Filename:       "input.mp4",
+					StorageBackend: "local",
+					StoragePath:    inputPath,
+				},
+			},
+		},
+	}
+	storageFake := &retryingStorage{}
+	handler := NewMediaTaskHandler(
+		RuntimeEnv{
+			Store:                   storeFake,
+			Storage:                 storageFake,
+			StorageBackend:          "minio",
+			LocalRoot:               root,
+			StorageOperationTimeout: 2 * time.Second,
+			StorageSaveAttempts:     1,
+		},
+		largeOutputMediaHandler{size: outputSize},
+	)
+
+	result, err := handler.Execute(
+		context.Background(),
+		TaskMessage{
+			JobID:           jobID.String(),
+			NodeExecutionID: nodeID.String(),
+			NodeType:        "trim",
+			Config:          map[string]any{"output_format": "mp4"},
+			InputArtifacts: map[string]any{
+				"input": "input-artifact",
+			},
+			WorkerClaim: workerRuntimeTestClaim(jobID, nodeID),
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.OutputArtifactID == "" {
+		t.Fatal("streamed artifact ID is empty")
+	}
+	if storageFake.legacySaves.Load() != 0 {
+		t.Fatalf(
+			"whole-buffer Save calls = %d; want 0",
+			storageFake.legacySaves.Load(),
+		)
+	}
+	if storageFake.streamedSize.Load() != outputSize {
+		t.Fatalf(
+			"streamed bytes = %d; want %d",
+			storageFake.streamedSize.Load(),
+			outputSize,
+		)
+	}
+}
+
+func TestRegistrationConsumerMissingDispatchLeavesOriginalPending(t *testing.T) {
+	client, _ := newRedis(t)
+	instanceID := uuid.New()
+	cfg := Config{
+		WorkerType:  "ffmpeg_go",
+		WorkerID:    "ffmpeg_go-worker@host127:1:" + instanceID.String(),
+		WorkerHost:  "host127",
+		RedisStream: "vp:test:registered:missing-dispatch:tasks",
+		RedisGroup:  "vp-test-registered-missing-dispatch-workers",
+	}
+	lease := RegistrationLease{
+		RegistrationID:   uuid.New(),
+		WorkerInstanceID: instanceID,
+		RedisConsumerID:  cfg.WorkerID,
+		LeaseEpoch:       13,
+		LeaseExpiresAt:   time.Now().UTC().Add(RegistrationLeaseDuration),
+	}
+	authority := &registeredTaskStoreStub{lease: lease}
+	handler := &fakeHandler{node: "trim"}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		authority,
+		newOwnedTestRegistration(context.Background(), lease),
+		handler,
+	)
+	consumer.BlockTimeout = 50 * time.Millisecond
+	withGroup(t, consumer)
+	messageID, err := client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: cfg.RedisStream,
+		Values: map[string]any{
+			"job_id":            uuid.NewString(),
+			"node_execution_id": uuid.NewString(),
+			"node_id":           "trim-1",
+			"node_type":         "trim",
+			"config":            "{}",
+			"input_artifacts":   "{}",
+			"preferred_hosts":   "[]",
+		},
+	}).Result()
+	if err != nil {
+		t.Fatalf("add missing-dispatch task: %v", err)
+	}
+	runOneTick(t, consumer)
+
+	if authority.claimCalls != 0 ||
+		len(handler.seen) != 0 ||
+		authority.prepareCalls != 0 ||
+		authority.publishCalls != 0 ||
+		authority.ackCalls != 0 {
+		t.Fatalf(
+			"claim/handler/prepare/publish/ack = %d/%d/%d/%d/%d; want all zero",
+			authority.claimCalls,
+			len(handler.seen),
+			authority.prepareCalls,
+			authority.publishCalls,
+			authority.ackCalls,
+		)
+	}
+	pending, err := client.XPendingExt(
+		context.Background(),
+		&redis.XPendingExtArgs{
+			Stream: cfg.RedisStream,
+			Group:  cfg.RedisGroup,
+			Start:  messageID,
+			End:    messageID,
+			Count:  1,
+		},
+	).Result()
+	if err != nil || len(pending) != 1 || pending[0].ID != messageID {
+		t.Fatalf("missing-dispatch pending = %#v, err=%v", pending, err)
+	}
+}
+
+func TestRegistrationConsumerLostEpochLeavesPendingWithoutFinalWrite(t *testing.T) {
+	client, _ := newRedis(t)
+	instanceID := uuid.New()
+	cfg := Config{
+		WorkerType:  "ffmpeg_go",
+		WorkerID:    "ffmpeg_go-worker@host127:1:" + instanceID.String(),
+		WorkerHost:  "host127",
+		RedisStream: "vp:test:lost-registration:tasks",
+		RedisGroup:  "vp-test-lost-registration-workers",
+	}
+	lease := RegistrationLease{
+		RegistrationID:   uuid.New(),
+		WorkerInstanceID: instanceID,
+		RedisConsumerID:  cfg.WorkerID,
+		LeaseEpoch:       12,
+		LeaseExpiresAt:   time.Now().UTC().Add(RegistrationLeaseDuration),
+	}
+	authority := &registeredTaskStoreStub{
+		lease:    lease,
+		claimErr: store.ErrWorkerRegistrationLost,
+	}
+	handler := &fakeHandler{node: "trim"}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		authority,
+		newOwnedTestRegistration(context.Background(), lease),
+		handler,
+	)
+	consumer.BlockTimeout = 50 * time.Millisecond
+	withGroup(t, consumer)
+	messageID, err := client.XAdd(context.Background(), &redis.XAddArgs{
+		Stream: cfg.RedisStream,
+		Values: map[string]any{
+			"job_id":            uuid.NewString(),
+			"node_execution_id": uuid.NewString(),
+			"node_id":           "trim-1",
+			"node_type":         "trim",
+			"config":            "{}",
+			"input_artifacts":   "{}",
+			"preferred_hosts":   "[]",
+			"dispatch_key":      uuid.NewString(),
+		},
+	}).Result()
+	if err != nil {
+		t.Fatalf("add lost-epoch task: %v", err)
+	}
+	runOneTick(t, consumer)
+	if authority.claimCalls != 1 {
+		t.Fatalf("claim calls = %d; want 1", authority.claimCalls)
+	}
+	if len(handler.seen) != 0 ||
+		authority.prepareCalls != 0 ||
+		authority.publishCalls != 0 ||
+		authority.ackCalls != 0 {
+		t.Fatalf(
+			"handler/prepare/publish/ack = %d/%d/%d/%d; want all zero",
+			len(handler.seen),
+			authority.prepareCalls,
+			authority.publishCalls,
+			authority.ackCalls,
+		)
+	}
+	pending, err := client.XPendingExt(
+		context.Background(),
+		&redis.XPendingExtArgs{
+			Stream: cfg.RedisStream,
+			Group:  cfg.RedisGroup,
+			Start:  messageID,
+			End:    messageID,
+			Count:  1,
+		},
+	).Result()
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("lost-epoch pending = %#v, err=%v; want exact entry", pending, err)
+	}
+}
+
+func TestRegistrationAffinityDefersWithoutReplacementAndPreferredClaimsExactPELMessage(
+	t *testing.T,
+) {
+	client := newRealWorkerRedisClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	stream := "vp:test:affinity:" + suffix
+	group := "vp-test-affinity-" + suffix
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupCtx, stream).Err()
+	})
+	if err := client.XGroupCreateMkStream(ctx, stream, group, "0").Err(); err != nil {
+		t.Fatalf("create affinity group: %v", err)
+	}
+
+	instanceID := uuid.New()
+	payload := map[string]any{
+		"job_id":               uuid.NewString(),
+		"node_execution_id":    uuid.NewString(),
+		"node_id":              "trim-1",
+		"node_type":            "trim",
+		"config":               "{}",
+		"input_artifacts":      "{}",
+		"preferred_hosts":      `["host127"]`,
+		"affinity_enqueued_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"affinity_bounces":     "0",
+		"dispatch_key":         uuid.NewString(),
+	}
+	messageID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		Values: payload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add affinity task: %v", err)
+	}
+	delivered, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: "ffmpeg_go-worker@host150:1:" + instanceID.String(),
+		Streams:  []string{stream, ">"},
+		Count:    1,
+	}).Result()
+	if err != nil || len(delivered) != 1 || len(delivered[0].Messages) != 1 {
+		t.Fatalf("deliver affinity task: streams=%#v err=%v", delivered, err)
+	}
+	original := delivered[0].Messages[0]
+	task, err := decodeTask(original.Values)
+	if err != nil {
+		t.Fatalf("decode affinity task: %v", err)
+	}
+	wrongLease := RegistrationLease{
+		RegistrationID:   uuid.New(),
+		WorkerInstanceID: instanceID,
+		RedisConsumerID:  "ffmpeg_go-worker@host150:1:" + instanceID.String(),
+		LeaseEpoch:       1,
+		LeaseExpiresAt:   time.Now().UTC().Add(RegistrationLeaseDuration),
+	}
+	wrongAuthority := &registeredTaskStoreStub{lease: wrongLease}
+	wrongHost := NewRegisteredConsumer(
+		client,
+		Config{
+			WorkerType:   "ffmpeg_go",
+			WorkerID:     wrongLease.RedisConsumerID,
+			WorkerHost:   "host150",
+			RedisStream:  stream,
+			RedisGroup:   group,
+			AffinityWait: 20 * time.Second,
+		},
+		wrongAuthority,
+		&Registration{lease: wrongLease},
+	)
+	wrongHost.handleRegisteredMessage(ctx, original)
+	if wrongAuthority.claimCalls != 0 {
+		t.Fatalf(
+			"registered affinity claim calls = %d; want 0",
+			wrongAuthority.claimCalls,
+		)
+	}
+	if length, err := client.XLen(ctx, stream).Result(); err != nil || length != 1 {
+		t.Fatalf("stream length after defer = %d, err=%v; want 1", length, err)
+	}
+	pending, err := client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: stream,
+		Group:  group,
+		Start:  messageID,
+		End:    messageID,
+		Count:  1,
+	}).Result()
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending after defer = %#v, err=%v; want exact entry", pending, err)
+	}
+	if pending[0].Consumer != wrongHost.WorkerID {
+		t.Fatalf("pending owner = %q; want %q", pending[0].Consumer, wrongHost.WorkerID)
+	}
+	exact, err := client.XRangeN(ctx, stream, messageID, messageID, 1).Result()
+	if err != nil || len(exact) != 1 || !reflect.DeepEqual(exact[0].Values, original.Values) {
+		t.Fatalf("exact message changed after defer: message=%#v err=%v", exact, err)
+	}
+
+	time.Sleep(600 * time.Millisecond)
+	preferredInstance := uuid.New()
+	preferred := NewRegisteredConsumer(
+		client,
+		Config{
+			WorkerType:   "ffmpeg_go",
+			WorkerID:     "ffmpeg_go-worker@host127:1:" + preferredInstance.String(),
+			WorkerHost:   "host127",
+			RedisStream:  stream,
+			RedisGroup:   group,
+			AffinityWait: 20 * time.Second,
+		},
+		&registeredTaskStoreStub{},
+		&Registration{},
+	)
+	if preferred.shouldDeferRegisteredForAffinity(
+		task,
+		time.Now().UTC(),
+	) {
+		t.Fatal("preferred registered consumer misidentified its process-UUID consumer ID")
+	}
+	claimed, err := preferred.claimPreferredPending(ctx)
+	if err != nil {
+		t.Fatalf("claim preferred pending: %v", err)
+	}
+	if len(claimed) != 1 ||
+		claimed[0].ID != messageID ||
+		!reflect.DeepEqual(claimed[0].Values, original.Values) {
+		t.Fatalf("claimed messages = %#v; want unchanged %s", claimed, messageID)
+	}
+	pending, err = client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: stream,
+		Group:  group,
+		Start:  messageID,
+		End:    messageID,
+		Count:  1,
+	}).Result()
+	if err != nil || len(pending) != 1 ||
+		pending[0].Consumer != preferred.WorkerID {
+		t.Fatalf("preferred pending owner = %#v, err=%v", pending, err)
+	}
+
+	expiredPayload := make(map[string]any, len(payload))
+	for key, value := range payload {
+		expiredPayload[key] = value
+	}
+	expiredPayload["job_id"] = uuid.NewString()
+	expiredPayload["node_execution_id"] = uuid.NewString()
+	expiredPayload["dispatch_key"] = uuid.NewString()
+	expiredPayload["affinity_enqueued_at"] = time.Now().UTC().
+		Add(-21 * time.Second).
+		Format(time.RFC3339Nano)
+	expiredMessageID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		Values: expiredPayload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add expired-affinity task: %v", err)
+	}
+	expiredDelivery, err := client.XReadGroup(
+		ctx,
+		&redis.XReadGroupArgs{
+			Group:    group,
+			Consumer: wrongHost.WorkerID,
+			Streams:  []string{stream, ">"},
+			Count:    1,
+		},
+	).Result()
+	if err != nil ||
+		len(expiredDelivery) != 1 ||
+		len(expiredDelivery[0].Messages) != 1 {
+		t.Fatalf(
+			"deliver expired-affinity task: streams=%#v err=%v",
+			expiredDelivery,
+			err,
+		)
+	}
+	expiredOriginal := expiredDelivery[0].Messages[0]
+	time.Sleep(600 * time.Millisecond)
+	expired, err := wrongHost.claimPreferredPending(ctx)
+	if err != nil {
+		t.Fatalf("claim expired affinity pending: %v", err)
+	}
+	if len(expired) != 1 ||
+		expired[0].ID != expiredMessageID ||
+		!reflect.DeepEqual(expired[0].Values, expiredOriginal.Values) {
+		t.Fatalf(
+			"expired affinity messages = %#v; want unchanged %s",
+			expired,
+			expiredMessageID,
+		)
+	}
+	expiredPending, err := client.XPendingExt(
+		ctx,
+		&redis.XPendingExtArgs{
+			Stream: stream,
+			Group:  group,
+			Start:  expiredMessageID,
+			End:    expiredMessageID,
+			Count:  1,
+		},
+	).Result()
+	if err != nil ||
+		len(expiredPending) != 1 ||
+		expiredPending[0].Consumer != wrongHost.WorkerID {
+		t.Fatalf(
+			"expired affinity pending owner = %#v, err=%v",
+			expiredPending,
+			err,
+		)
+	}
+}
+
+func TestRegistrationHighBounceAffinityPreservesOriginalPEL(t *testing.T) {
+	client, _ := newRedis(t)
+	ctx := context.Background()
+	lease := registrationLossTestLease()
+	cfg := registrationLossTestConfig(lease)
+	cfg.WorkerHost = "host150"
+	cfg.AffinityWait = time.Second
+	cfg.AffinityMaxBounces = 6
+	taskStore := &registeredTaskStoreStub{lease: lease}
+	consumer := NewRegisteredConsumer(
+		client,
+		cfg,
+		taskStore,
+		newOwnedTestRegistration(ctx, lease),
+		&fakeHandler{node: "trim"},
+	)
+	withGroup(t, consumer)
+	payload := registeredLossTestPayload()
+	payload["preferred_hosts"] = `["host127"]`
+	payload["affinity_enqueued_at"] = time.Now().UTC().
+		Add(-5 * time.Second).
+		Format(time.RFC3339Nano)
+	payload["affinity_bounces"] = "99"
+	messageID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: cfg.RedisStream,
+		Values: payload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add high-bounce affinity task: %v", err)
+	}
+	delivered, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    cfg.RedisGroup,
+		Consumer: cfg.WorkerID,
+		Streams:  []string{cfg.RedisStream, ">"},
+		Count:    1,
+	}).Result()
+	if err != nil ||
+		len(delivered) != 1 ||
+		len(delivered[0].Messages) != 1 {
+		t.Fatalf("deliver high-bounce task: streams=%#v err=%v", delivered, err)
+	}
+	original := delivered[0].Messages[0]
+
+	consumer.handleRegisteredMessage(ctx, original)
+
+	if taskStore.claimCalls != 0 ||
+		taskStore.prepareCalls != 0 ||
+		taskStore.publishCalls != 0 ||
+		taskStore.ackCalls != 0 {
+		t.Fatalf(
+			"claim/prepare/publish/ack = %d/%d/%d/%d; want 0/0/0/0",
+			taskStore.claimCalls,
+			taskStore.prepareCalls,
+			taskStore.publishCalls,
+			taskStore.ackCalls,
+		)
+	}
+	if length, err := client.XLen(ctx, cfg.RedisStream).Result(); err != nil ||
+		length != 1 {
+		t.Fatalf("stream length after defer = %d, err=%v; want 1", length, err)
+	}
+	pending, err := client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: cfg.RedisStream,
+		Group:  cfg.RedisGroup,
+		Start:  messageID,
+		End:    messageID,
+		Count:  1,
+	}).Result()
+	if err != nil || len(pending) != 1 ||
+		pending[0].Consumer != cfg.WorkerID {
+		t.Fatalf("high-bounce pending = %#v, err=%v; want original owner", pending, err)
+	}
+	exact, err := client.XRangeN(
+		ctx,
+		cfg.RedisStream,
+		messageID,
+		messageID,
+		1,
+	).Result()
+	if err != nil ||
+		len(exact) != 1 ||
+		!reflect.DeepEqual(exact[0].Values, original.Values) {
+		t.Fatalf("high-bounce message changed: message=%#v err=%v", exact, err)
+	}
+}
+
+func TestRegistrationAffinityWindowIsExactlyTwentySeconds(t *testing.T) {
+	now := time.Now().UTC()
+	task := TaskMessage{
+		PreferredHosts: []string{"host127"},
+	}
+	for _, testCase := range []struct {
+		name         string
+		configured   time.Duration
+		age          time.Duration
+		wantDeferred bool
+	}{
+		{
+			name:         "one-second override cannot shorten",
+			configured:   time.Second,
+			age:          5 * time.Second,
+			wantDeferred: true,
+		},
+		{
+			name:         "sixty-second override cannot extend",
+			configured:   60 * time.Second,
+			age:          21 * time.Second,
+			wantDeferred: false,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			task.AffinityEnqueuedAt = now.Add(-testCase.age).
+				Format(time.RFC3339Nano)
+			consumer := NewRegisteredConsumer(
+				nil,
+				Config{
+					WorkerID:     "ffmpeg_go-worker@host150:1:" + uuid.NewString(),
+					WorkerHost:   "host150",
+					AffinityWait: testCase.configured,
+				},
+				nil,
+				&Registration{},
+			)
+			if got := consumer.shouldDeferRegisteredForAffinity(
+				task,
+				now,
+			); got != testCase.wantDeferred {
+				t.Fatalf(
+					"registered defer with configured %s at age %s = %t; want %t",
+					testCase.configured,
+					testCase.age,
+					got,
+					testCase.wantDeferred,
+				)
+			}
+		})
+	}
+}
+
+func TestRegistrationAffinityScansBeyondFirstPendingPage(t *testing.T) {
+	client := newRealWorkerRedisClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	stream := "vp:test:affinity-pages:" + suffix
+	group := "vp-test-affinity-pages-" + suffix
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupContext, stream).Err()
+	})
+	if err := client.XGroupCreateMkStream(
+		ctx,
+		stream,
+		group,
+		"0",
+	).Err(); err != nil {
+		t.Fatalf("create paginated affinity group: %v", err)
+	}
+
+	const precedingEntries = 55
+	for index := 0; index < precedingEntries; index++ {
+		if _, err := client.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream,
+			Values: map[string]any{
+				"preferred_hosts": "[]",
+				"config":          "{}",
+				"input_artifacts": "{}",
+			},
+		}).Result(); err != nil {
+			t.Fatalf("add preceding PEL entry %d: %v", index, err)
+		}
+	}
+	if _, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: "filler-consumer",
+		Streams:  []string{stream, ">"},
+		Count:    precedingEntries,
+	}).Result(); err != nil {
+		t.Fatalf("deliver preceding PEL entries: %v", err)
+	}
+
+	activePayload := registeredLossTestPayload()
+	activePayload["preferred_hosts"] = `["host127"]`
+	activePayload["affinity_enqueued_at"] = time.Now().UTC().
+		Format(time.RFC3339Nano)
+	activePayload["affinity_bounces"] = "0"
+	activeID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		Values: activePayload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add active paginated affinity task: %v", err)
+	}
+	wrongInstance := uuid.New()
+	wrongConsumerID := "ffmpeg_go-worker@host150:1:" +
+		wrongInstance.String()
+	activeDelivery, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: wrongConsumerID,
+		Streams:  []string{stream, ">"},
+		Count:    1,
+	}).Result()
+	if err != nil ||
+		len(activeDelivery) != 1 ||
+		len(activeDelivery[0].Messages) != 1 {
+		t.Fatalf("deliver active paginated task: streams=%#v err=%v", activeDelivery, err)
+	}
+	activeOriginal := activeDelivery[0].Messages[0]
+	time.Sleep(600 * time.Millisecond)
+	preferredInstance := uuid.New()
+	preferred := NewRegisteredConsumer(
+		client,
+		Config{
+			WorkerType:   "ffmpeg_go",
+			WorkerID:     "ffmpeg_go-worker@host127:1:" + preferredInstance.String(),
+			WorkerHost:   "host127",
+			RedisStream:  stream,
+			RedisGroup:   group,
+			AffinityWait: 20 * time.Second,
+		},
+		&registeredTaskStoreStub{},
+		&Registration{},
+	)
+	claimed, err := preferred.claimPreferredPending(ctx)
+	if err != nil {
+		t.Fatalf("claim active task beyond first PEL page: %v", err)
+	}
+	if len(claimed) != 1 ||
+		claimed[0].ID != activeID ||
+		!reflect.DeepEqual(claimed[0].Values, activeOriginal.Values) {
+		t.Fatalf(
+			"preferred claims beyond page = %#v; want unchanged %s",
+			claimed,
+			activeID,
+		)
+	}
+
+	expiredPayload := registeredLossTestPayload()
+	expiredPayload["preferred_hosts"] = `["host127"]`
+	expiredPayload["affinity_enqueued_at"] = time.Now().UTC().
+		Add(-21 * time.Second).
+		Format(time.RFC3339Nano)
+	expiredPayload["affinity_bounces"] = "0"
+	expiredID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		Values: expiredPayload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add expired paginated affinity task: %v", err)
+	}
+	expiredDelivery, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: wrongConsumerID,
+		Streams:  []string{stream, ">"},
+		Count:    1,
+	}).Result()
+	if err != nil ||
+		len(expiredDelivery) != 1 ||
+		len(expiredDelivery[0].Messages) != 1 {
+		t.Fatalf("deliver expired paginated task: streams=%#v err=%v", expiredDelivery, err)
+	}
+	expiredOriginal := expiredDelivery[0].Messages[0]
+	time.Sleep(600 * time.Millisecond)
+	wrongHost := NewRegisteredConsumer(
+		client,
+		Config{
+			WorkerType:   "ffmpeg_go",
+			WorkerID:     wrongConsumerID,
+			WorkerHost:   "host150",
+			RedisStream:  stream,
+			RedisGroup:   group,
+			AffinityWait: 20 * time.Second,
+		},
+		&registeredTaskStoreStub{},
+		&Registration{},
+	)
+	expired, err := wrongHost.claimPreferredPending(ctx)
+	if err != nil {
+		t.Fatalf("recover expired task beyond first PEL page: %v", err)
+	}
+	if len(expired) != 1 ||
+		expired[0].ID != expiredID ||
+		!reflect.DeepEqual(expired[0].Values, expiredOriginal.Values) {
+		t.Fatalf(
+			"current-owner recoveries beyond page = %#v; want unchanged %s",
+			expired,
+			expiredID,
+		)
+	}
+	pending, err := client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: stream,
+		Group:  group,
+		Start:  expiredID,
+		End:    expiredID,
+		Count:  1,
+	}).Result()
+	if err != nil || len(pending) != 1 ||
+		pending[0].Consumer != wrongConsumerID {
+		t.Fatalf("expired target owner = %#v, err=%v", pending, err)
+	}
+}
+
+func TestRegistrationAffinityScanUsesFiniteInitialPendingSnapshot(
+	t *testing.T,
+) {
+	client := newRealWorkerRedisClient(t)
+	rawURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"))
+	tailOptions, err := redis.ParseURL(rawURL)
+	if err != nil {
+		t.Fatalf("parse tail Redis URL: %v", err)
+	}
+	tailClient := redis.NewClient(tailOptions)
+	t.Cleanup(func() { _ = tailClient.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	stream := "vp:test:affinity-growing:" + suffix
+	group := "vp-test-affinity-growing-" + suffix
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = tailClient.Del(cleanupContext, stream).Err()
+	})
+	if err := client.XGroupCreateMkStream(ctx, stream, group, "0").Err(); err != nil {
+		t.Fatalf("create growing-tail group: %v", err)
+	}
+	for index := 0; index < 55; index++ {
+		if _, err := client.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream,
+			Values: map[string]any{
+				"config":          "{}",
+				"input_artifacts": "{}",
+				"preceding":       index,
+			},
+		}).Result(); err != nil {
+			t.Fatalf("add preceding entry %d: %v", index, err)
+		}
+	}
+	if _, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: "preceding-owner",
+		Streams:  []string{stream, ">"},
+		Count:    55,
+	}).Result(); err != nil {
+		t.Fatalf("deliver preceding entries: %v", err)
+	}
+	payload := registeredLossTestPayload()
+	payload["preferred_hosts"] = `["host127"]`
+	payload["affinity_enqueued_at"] = time.Now().UTC().
+		Format(time.RFC3339Nano)
+	targetID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		Values: payload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add growing-tail target: %v", err)
+	}
+	wrongConsumer := "ffmpeg_go-worker@host150:1:" + uuid.NewString()
+	delivered, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: wrongConsumer,
+		Streams:  []string{stream, ">"},
+		Count:    1,
+	}).Result()
+	if err != nil ||
+		len(delivered) != 1 ||
+		len(delivered[0].Messages) != 1 {
+		t.Fatalf("deliver growing-tail target: streams=%#v err=%v", delivered, err)
+	}
+	original := delivered[0].Messages[0]
+	time.Sleep(600 * time.Millisecond)
+	hook := &growingPendingTailHook{
+		client: tailClient,
+		stream: stream,
+		group:  group,
+	}
+	client.AddHook(hook)
+	preferred := NewRegisteredConsumer(
+		client,
+		Config{
+			WorkerType: "ffmpeg_go",
+			WorkerID: "ffmpeg_go-worker@host127:1:" +
+				uuid.NewString(),
+			WorkerHost:  "host127",
+			RedisStream: stream,
+			RedisGroup:  group,
+		},
+		&registeredTaskStoreStub{},
+		&Registration{},
+	)
+	scanContext, cancelScan := context.WithTimeout(
+		context.Background(),
+		2*time.Second,
+	)
+	defer cancelScan()
+	claimed, err := preferred.claimPreferredPending(scanContext)
+	if err != nil {
+		t.Fatalf("claim bounded growing-tail snapshot: %v", err)
+	}
+	if len(claimed) != 1 ||
+		claimed[0].ID != targetID ||
+		!reflect.DeepEqual(claimed[0].Values, original.Values) {
+		t.Fatalf(
+			"growing-tail claims = %#v; want unchanged %s",
+			claimed,
+			targetID,
+		)
+	}
+	pages, hookErr := hook.result()
+	if hookErr != nil {
+		t.Fatalf("grow pending tail: %v", hookErr)
+	}
+	if pages != 2 {
+		t.Fatalf("XPENDING extended pages = %d; want finite initial 2", pages)
+	}
+}
+
+func TestRegistrationAffinitySnapshotHasNoPartialClaimOnLaterPageError(
+	t *testing.T,
+) {
+	client := newRealWorkerRedisClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	stream := "vp:test:affinity-page-error:" + suffix
+	group := "vp-test-affinity-page-error-" + suffix
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			5*time.Second,
+		)
+		defer cleanupCancel()
+		_ = client.Del(cleanupContext, stream).Err()
+	})
+	if err := client.XGroupCreateMkStream(ctx, stream, group, "0").Err(); err != nil {
+		t.Fatalf("create page-error affinity group: %v", err)
+	}
+
+	targetPayload := registeredLossTestPayload()
+	targetPayload["preferred_hosts"] = `["host127"]`
+	targetPayload["affinity_enqueued_at"] = time.Now().UTC().
+		Format(time.RFC3339Nano)
+	targetID, err := client.XAdd(ctx, &redis.XAddArgs{
+		Stream: stream,
+		Values: targetPayload,
+	}).Result()
+	if err != nil {
+		t.Fatalf("add early-page affinity target: %v", err)
+	}
+	for index := 0; index < 55; index++ {
+		if _, err := client.XAdd(ctx, &redis.XAddArgs{
+			Stream: stream,
+			Values: map[string]any{
+				"preferred_hosts": "[]",
+				"config":          "{}",
+				"input_artifacts": "{}",
+				"filler":          index,
+			},
+		}).Result(); err != nil {
+			t.Fatalf("add page-error filler %d: %v", index, err)
+		}
+	}
+	wrongConsumer := "ffmpeg_go-worker@host150:1:" + uuid.NewString()
+	delivered, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    group,
+		Consumer: wrongConsumer,
+		Streams:  []string{stream, ">"},
+		Count:    56,
+	}).Result()
+	if err != nil ||
+		len(delivered) != 1 ||
+		len(delivered[0].Messages) != 56 {
+		t.Fatalf("deliver page-error snapshot: streams=%#v err=%v", delivered, err)
+	}
+	time.Sleep(600 * time.Millisecond)
+
+	hook := &pendingPageFailureHook{}
+	client.AddHook(hook)
+	lease := registrationLossTestLease()
+	registration := newOwnedTestRegistration(context.Background(), lease)
+	taskStore := &registeredTaskStoreStub{lease: lease}
+	handler := &countingHandler{node: "trim"}
+	preferred := NewRegisteredConsumer(
+		client,
+		Config{
+			WorkerType:  "ffmpeg_go",
+			WorkerID:    lease.RedisConsumerID,
+			WorkerHost:  "host127",
+			RedisStream: stream,
+			RedisGroup:  group,
+		},
+		taskStore,
+		registration,
+		handler,
+	)
+
+	claimed, err := preferred.claimPreferredPending(ctx)
+	if err == nil || !strings.Contains(err.Error(), "forced later XPENDING") {
+		t.Fatalf("first scan error = %v; want forced later-page failure", err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("first scan claims = %#v; want none on snapshot failure", claimed)
+	}
+	if claims := hook.xclaims.Load(); claims != 0 {
+		t.Fatalf("partial XCLAIM calls before snapshot completion = %d; want 0", claims)
+	}
+
+	handled, err := preferred.ReclaimPreferredPending(ctx)
+	if err != nil {
+		t.Fatalf("healthy preferred scan: %v", err)
+	}
+	if handled != 1 {
+		t.Fatalf("healthy preferred dispatches = %d; want 1", handled)
+	}
+	if calls := handler.calls.Load(); calls != 1 {
+		t.Fatalf("handler calls after healthy scan = %d; want 1", calls)
+	}
+	if taskStore.claimCalls != 1 || taskStore.ackCalls != 1 {
+		t.Fatalf(
+			"claim/ack calls after healthy scan = %d/%d; want 1/1",
+			taskStore.claimCalls,
+			taskStore.ackCalls,
+		)
+	}
+	if claims := hook.xclaims.Load(); claims != 1 {
+		t.Fatalf("total XCLAIM calls = %d; want exact target claim only", claims)
+	}
+	pending, err := client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: stream,
+		Group:  group,
+		Start:  targetID,
+		End:    targetID,
+		Count:  1,
+	}).Result()
+	if err != nil {
+		t.Fatalf("inspect target PEL after healthy dispatch: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("target remains pending after healthy dispatch: %#v", pending)
+	}
+}
+
+func TestRegistrationAffinityPreservesPartialClaimOnVisitorError(t *testing.T) {
+	for _, failCommand := range []string{"xrange", "xclaim"} {
+		t.Run(failCommand, func(t *testing.T) {
+			client := newRealWorkerRedisClient(t)
+			ctx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			defer cancel()
+			suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+			stream := "vp:test:affinity-visitor-error:" + suffix
+			group := "vp-test-affinity-visitor-error-" + suffix
+			t.Cleanup(func() {
+				cleanupContext, cleanupCancel := context.WithTimeout(
+					context.Background(),
+					5*time.Second,
+				)
+				defer cleanupCancel()
+				_ = client.Del(cleanupContext, stream).Err()
+			})
+			if err := client.XGroupCreateMkStream(
+				ctx,
+				stream,
+				group,
+				"0",
+			).Err(); err != nil {
+				t.Fatalf("create visitor-error affinity group: %v", err)
+			}
+
+			messageIDs := make([]string, 0, 2)
+			for index := 0; index < 2; index++ {
+				payload := registeredLossTestPayload()
+				payload["preferred_hosts"] = `["host127"]`
+				payload["affinity_enqueued_at"] = time.Now().UTC().
+					Format(time.RFC3339Nano)
+				messageID, err := client.XAdd(ctx, &redis.XAddArgs{
+					Stream: stream,
+					Values: payload,
+				}).Result()
+				if err != nil {
+					t.Fatalf("add visitor target %d: %v", index, err)
+				}
+				messageIDs = append(messageIDs, messageID)
+			}
+			wrongConsumer := "ffmpeg_go-worker@host150:1:" + uuid.NewString()
+			delivered, err := client.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group:    group,
+				Consumer: wrongConsumer,
+				Streams:  []string{stream, ">"},
+				Count:    2,
+			}).Result()
+			if err != nil ||
+				len(delivered) != 1 ||
+				len(delivered[0].Messages) != 2 {
+				t.Fatalf(
+					"deliver visitor targets: streams=%#v err=%v",
+					delivered,
+					err,
+				)
+			}
+			time.Sleep(600 * time.Millisecond)
+
+			hook := &pendingVisitorFailureHook{failCommand: failCommand}
+			client.AddHook(hook)
+			lease := registrationLossTestLease()
+			taskStore := &registeredTaskStoreStub{lease: lease}
+			handler := &countingHandler{node: "trim"}
+			preferred := NewRegisteredConsumer(
+				client,
+				Config{
+					WorkerType:  "ffmpeg_go",
+					WorkerID:    lease.RedisConsumerID,
+					WorkerHost:  "host127",
+					RedisStream: stream,
+					RedisGroup:  group,
+				},
+				taskStore,
+				newOwnedTestRegistration(context.Background(), lease),
+				handler,
+			)
+
+			handled, err := preferred.ReclaimPreferredPending(ctx)
+			if err == nil ||
+				!strings.Contains(
+					err.Error(),
+					"forced later "+strings.ToUpper(failCommand),
+				) {
+				t.Fatalf("visitor scan error = %v; want forced %s error", err, failCommand)
+			}
+			if handled != 1 {
+				t.Fatalf("partial visitor dispatches = %d; want 1", handled)
+			}
+			if calls := handler.calls.Load(); calls != 1 {
+				t.Fatalf("handler calls after partial scan = %d; want 1", calls)
+			}
+			if taskStore.claimCalls != 1 || taskStore.ackCalls != 1 {
+				t.Fatalf(
+					"claim/ack after partial scan = %d/%d; want 1/1",
+					taskStore.claimCalls,
+					taskStore.ackCalls,
+				)
+			}
+			if xacks := hook.xacks.Load(); xacks != 1 {
+				t.Fatalf("XACK calls after partial scan = %d; want 1", xacks)
+			}
+			if length, err := client.XLen(ctx, stream).Result(); err != nil ||
+				length != 2 {
+				t.Fatalf(
+					"stream length after partial scan = %d, err=%v; want 2",
+					length,
+					err,
+				)
+			}
+			firstPending, err := client.XPendingExt(
+				ctx,
+				&redis.XPendingExtArgs{
+					Stream: stream,
+					Group:  group,
+					Start:  messageIDs[0],
+					End:    messageIDs[0],
+					Count:  1,
+				},
+			).Result()
+			if err != nil || len(firstPending) != 0 {
+				t.Fatalf(
+					"early successful target pending = %#v, err=%v; want acked",
+					firstPending,
+					err,
+				)
+			}
+			secondPending, err := client.XPendingExt(
+				ctx,
+				&redis.XPendingExtArgs{
+					Stream: stream,
+					Group:  group,
+					Start:  messageIDs[1],
+					End:    messageIDs[1],
+					Count:  1,
+				},
+			).Result()
+			if err != nil ||
+				len(secondPending) != 1 ||
+				secondPending[0].Consumer != wrongConsumer {
+				t.Fatalf(
+					"later failed target pending = %#v, err=%v; want original owner",
+					secondPending,
+					err,
+				)
+			}
+
+			handled, err = preferred.ReclaimPreferredPending(ctx)
+			if err != nil {
+				t.Fatalf("next coherent visitor scan: %v", err)
+			}
+			if handled != 1 {
+				t.Fatalf("next visitor dispatches = %d; want 1", handled)
+			}
+			if calls := handler.calls.Load(); calls != 2 {
+				t.Fatalf("total handler calls = %d; want exact two targets", calls)
+			}
+			if taskStore.claimCalls != 2 || taskStore.ackCalls != 2 {
+				t.Fatalf(
+					"total claim/ack = %d/%d; want 2/2",
+					taskStore.claimCalls,
+					taskStore.ackCalls,
+				)
+			}
+			if xacks := hook.xacks.Load(); xacks != 2 {
+				t.Fatalf("total XACK calls = %d; want 2", xacks)
+			}
+			pending, err := client.XPending(ctx, stream, group).Result()
+			if err != nil {
+				t.Fatalf("inspect final visitor PEL: %v", err)
+			}
+			if pending.Count != 0 {
+				t.Fatalf("final visitor PEL count = %d; want 0", pending.Count)
+			}
+		})
+	}
+}
+
+func TestRegistrationRunDispatchesPartialPreferredClaimBeforeVisitorError(
+	t *testing.T,
+) {
+	for _, phase := range []string{"initial", "ticker"} {
+		t.Run(phase, func(t *testing.T) {
+			client := newRealWorkerRedisClient(t)
+			setupContext, cancelSetup := context.WithTimeout(
+				context.Background(),
+				5*time.Second,
+			)
+			defer cancelSetup()
+			suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+			stream := "vp:test:affinity-run-visitor-error:" + suffix
+			group := "vp-test-affinity-run-visitor-error-" + suffix
+			t.Cleanup(func() {
+				cleanupContext, cleanupCancel := context.WithTimeout(
+					context.Background(),
+					5*time.Second,
+				)
+				defer cleanupCancel()
+				_ = client.Del(cleanupContext, stream).Err()
+			})
+			if err := client.XGroupCreateMkStream(
+				setupContext,
+				stream,
+				group,
+				"0",
+			).Err(); err != nil {
+				t.Fatalf("create Run visitor-error group: %v", err)
+			}
+			messageIDs := make([]string, 0, 2)
+			for index := 0; index < 2; index++ {
+				payload := registeredLossTestPayload()
+				payload["preferred_hosts"] = `["host127"]`
+				payload["affinity_enqueued_at"] = time.Now().UTC().
+					Format(time.RFC3339Nano)
+				messageID, err := client.XAdd(
+					setupContext,
+					&redis.XAddArgs{Stream: stream, Values: payload},
+				).Result()
+				if err != nil {
+					t.Fatalf("add Run visitor target %d: %v", index, err)
+				}
+				messageIDs = append(messageIDs, messageID)
+			}
+			wrongConsumer := "ffmpeg_go-worker@host150:1:" + uuid.NewString()
+			delivered, err := client.XReadGroup(
+				setupContext,
+				&redis.XReadGroupArgs{
+					Group:    group,
+					Consumer: wrongConsumer,
+					Streams:  []string{stream, ">"},
+					Count:    2,
+				},
+			).Result()
+			if err != nil ||
+				len(delivered) != 1 ||
+				len(delivered[0].Messages) != 2 {
+				t.Fatalf(
+					"deliver Run visitor targets: streams=%#v err=%v",
+					delivered,
+					err,
+				)
+			}
+			if phase == "initial" {
+				time.Sleep(600 * time.Millisecond)
+			}
+
+			hook := &pendingVisitorFailureHook{
+				failCommand: "xrange",
+				partialDone: make(chan struct{}),
+			}
+			client.AddHook(hook)
+			lease := registrationLossTestLease()
+			taskStore := &registeredTaskStoreStub{lease: lease}
+			handler := &countingHandler{node: "trim"}
+			cfg := Config{
+				WorkerType:          "ffmpeg_go",
+				WorkerID:            lease.RedisConsumerID,
+				WorkerHost:          "host127",
+				RedisStream:         stream,
+				RedisGroup:          group,
+				Concurrency:         1,
+				PELMinIdle:          time.Hour,
+				ShutdownGracePeriod: 200 * time.Millisecond,
+			}
+			preferred := NewRegisteredConsumer(
+				client,
+				cfg,
+				taskStore,
+				newOwnedTestRegistration(context.Background(), lease),
+				handler,
+			)
+			preferred.BlockTimeout = 20 * time.Millisecond
+			runContext, cancelRun := context.WithTimeout(
+				context.Background(),
+				5*time.Second,
+			)
+			runStarted := time.Now()
+			runResult := make(chan error, 1)
+			go func() {
+				runResult <- preferred.Run(runContext)
+			}()
+			select {
+			case <-hook.partialDone:
+				cancelRun()
+			case <-runContext.Done():
+			}
+			runErr := <-runResult
+			cancelRun()
+			if !errors.Is(runErr, context.Canceled) {
+				t.Fatalf("Run error = %v; want cancellation after partial dispatch", runErr)
+			}
+			if !hook.failed.Load() {
+				t.Fatal("Run did not reach forced visitor failure")
+			}
+			failureDelay := time.Unix(
+				0,
+				hook.failedAt.Load(),
+			).Sub(runStarted)
+			if phase == "initial" && failureDelay >= time.Second {
+				t.Fatalf("initial visitor failure delay = %s; want before ticker", failureDelay)
+			}
+			if phase == "ticker" && failureDelay < 900*time.Millisecond {
+				t.Fatalf("ticker visitor failure delay = %s; want ticker phase", failureDelay)
+			}
+			if calls := handler.calls.Load(); calls != 1 {
+				t.Fatalf("Run handler calls after partial scan = %d; want 1", calls)
+			}
+			if taskStore.claimCalls != 1 || taskStore.ackCalls != 1 {
+				t.Fatalf(
+					"Run claim/ack after partial scan = %d/%d; want 1/1",
+					taskStore.claimCalls,
+					taskStore.ackCalls,
+				)
+			}
+			if xacks := hook.xacks.Load(); xacks != 1 {
+				t.Fatalf("Run XACK calls after partial scan = %d; want 1", xacks)
+			}
+			inspectContext, cancelInspect := context.WithTimeout(
+				context.Background(),
+				time.Second,
+			)
+			defer cancelInspect()
+			firstPending, err := client.XPendingExt(
+				inspectContext,
+				&redis.XPendingExtArgs{
+					Stream: stream,
+					Group:  group,
+					Start:  messageIDs[0],
+					End:    messageIDs[0],
+					Count:  1,
+				},
+			).Result()
+			if err != nil || len(firstPending) != 0 {
+				t.Fatalf(
+					"Run early target pending = %#v, err=%v; want acked",
+					firstPending,
+					err,
+				)
+			}
+			secondPending, err := client.XPendingExt(
+				inspectContext,
+				&redis.XPendingExtArgs{
+					Stream: stream,
+					Group:  group,
+					Start:  messageIDs[1],
+					End:    messageIDs[1],
+					Count:  1,
+				},
+			).Result()
+			if err != nil ||
+				len(secondPending) != 1 ||
+				secondPending[0].Consumer != wrongConsumer {
+				t.Fatalf(
+					"Run later target pending = %#v, err=%v; want original owner",
+					secondPending,
+					err,
+				)
+			}
+		})
+	}
+}
+
+func TestRegistrationRunBoundsReclaimedAndPreferredPendingExecution(
+	t *testing.T,
+) {
+	for _, path := range []string{"stale reclaim", "preferred pending"} {
+		t.Run(path, func(t *testing.T) {
+			client, _ := newRedis(t)
+			lease := registrationLossTestLease()
+			registration := newOwnedTestRegistration(
+				context.Background(),
+				lease,
+			)
+			cfg := registrationLossTestConfig(lease)
+			cfg.Concurrency = 1
+			cfg.ShutdownGracePeriod = 50 * time.Millisecond
+			cfg.PELMinIdle = time.Hour
+			if path == "stale reclaim" {
+				cfg.PELMinIdle = 500 * time.Millisecond
+			}
+			taskStore := &registeredTaskStoreStub{lease: lease}
+			handler := &stubbornHandler{
+				node:    "trim",
+				started: make(chan struct{}),
+				release: make(chan struct{}),
+				done:    make(chan struct{}),
+			}
+			consumer := NewRegisteredConsumer(
+				client,
+				cfg,
+				taskStore,
+				registration,
+				handler,
+			)
+			consumer.BlockTimeout = 10 * time.Millisecond
+			withGroup(t, consumer)
+			payload := registeredLossTestPayload()
+			if path == "preferred pending" {
+				payload["preferred_hosts"] = `["host127"]`
+				payload["affinity_enqueued_at"] = time.Now().UTC().
+					Format(time.RFC3339Nano)
+				payload["affinity_bounces"] = "0"
+			}
+			if _, err := client.XAdd(
+				context.Background(),
+				&redis.XAddArgs{
+					Stream: cfg.RedisStream,
+					Values: payload,
+				},
+			).Result(); err != nil {
+				t.Fatalf("add pending task: %v", err)
+			}
+			if _, err := client.XReadGroup(
+				context.Background(),
+				&redis.XReadGroupArgs{
+					Group:    cfg.RedisGroup,
+					Consumer: "previous-consumer",
+					Streams:  []string{cfg.RedisStream, ">"},
+					Count:    1,
+				},
+			).Result(); err != nil {
+				t.Fatalf("deliver pending task: %v", err)
+			}
+			time.Sleep(600 * time.Millisecond)
+
+			runContext, cancelRun := context.WithCancel(
+				registration.Context(),
+			)
+			runDone := make(chan error, 1)
+			go func() {
+				runDone <- consumer.Run(runContext)
+			}()
+			select {
+			case <-handler.started:
+			case <-time.After(time.Second):
+				cancelRun()
+				close(handler.release)
+				t.Fatal("pending handler did not start")
+			}
+			cancelRun()
+			select {
+			case err := <-runDone:
+				if !errors.Is(err, context.Canceled) {
+					close(handler.release)
+					t.Fatalf("Run error = %v; want context.Canceled", err)
+				}
+			case <-time.After(250 * time.Millisecond):
+				close(handler.release)
+				<-handler.done
+				select {
+				case <-runDone:
+				case <-time.After(time.Second):
+				}
+				t.Fatal("inline pending work bypassed shutdown grace")
+			}
+			close(handler.release)
+			select {
+			case <-handler.done:
+			case <-time.After(time.Second):
+				t.Fatal("pending handler did not finish after release")
+			}
+		})
+	}
+}
+
+func newRealWorkerRedisClient(t *testing.T) *redis.Client {
+	t.Helper()
+	rawURL := strings.TrimSpace(os.Getenv("CHANNEL_OPS_GO_REDIS_TEST_URL"))
+	if rawURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_REDIS_TEST_URL for Redis 7.4 worker integration tests")
+	}
+	options, err := redis.ParseURL(rawURL)
+	if err != nil {
+		t.Fatalf("parse Redis integration URL: %v", err)
+	}
+	client := redis.NewClient(options)
+	t.Cleanup(func() { _ = client.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("ping Redis integration server: %v", err)
+	}
+	info, err := client.Info(ctx, "server").Result()
+	if err != nil {
+		t.Fatalf("read Redis server version: %v", err)
+	}
+	version := ""
+	for _, line := range strings.Split(info, "\n") {
+		if value, ok := strings.CutPrefix(
+			strings.TrimSpace(line),
+			"redis_version:",
+		); ok {
+			version = value
+			break
+		}
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		t.Fatalf("invalid Redis server version %q", version)
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	if majorErr != nil || minorErr != nil ||
+		major < 7 || major == 7 && minor < 4 {
+		t.Fatalf("Redis version = %q; require 7.4 or newer", version)
+	}
+	return client
+}
+
+func registrationLossTestLease() RegistrationLease {
+	instanceID := uuid.New()
+	return RegistrationLease{
+		RegistrationID:   uuid.New(),
+		WorkerInstanceID: instanceID,
+		RedisConsumerID: "ffmpeg_go-worker@host127:1:" +
+			instanceID.String(),
+		LeaseEpoch:     19,
+		LeaseExpiresAt: time.Now().UTC().Add(RegistrationLeaseDuration),
+	}
+}
+
+func registrationLossTestConfig(lease RegistrationLease) Config {
+	return Config{
+		WorkerType:  "ffmpeg_go",
+		WorkerID:    lease.RedisConsumerID,
+		WorkerHost:  "host127",
+		RedisStream: "vp:test:registration-loss:" + uuid.NewString(),
+		RedisGroup:  "vp-test-registration-loss-workers",
+	}
+}
+
+type workerIntakePostgresFixture struct {
+	ctx     context.Context
+	admin   *pgxpool.Pool
+	worker  *store.Store
+	role    string
+	service string
+	token   string
+	claims  RegistrationClaims
+}
+
+func newWorkerIntakePostgresFixture(
+	t *testing.T,
+	redisURL string,
+) *workerIntakePostgresFixture {
+	t.Helper()
+	testURL := strings.TrimSpace(
+		os.Getenv("CHANNEL_OPS_GO_POSTGRES_TEST_URL"),
+	)
+	if testURL == "" {
+		t.Skip("set CHANNEL_OPS_GO_POSTGRES_TEST_URL for PostgreSQL 16 worker integration tests")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	admin, err := pgxpool.New(ctx, testURL)
+	if err != nil {
+		t.Fatalf("open intake PostgreSQL admin: %v", err)
+	}
+	if err := admin.Ping(ctx); err != nil {
+		admin.Close()
+		t.Fatalf("ping intake PostgreSQL admin: %v", err)
+	}
+	var serverVersionText string
+	if err := admin.QueryRow(
+		ctx,
+		"SHOW server_version_num",
+	).Scan(&serverVersionText); err != nil {
+		admin.Close()
+		t.Fatalf("read intake PostgreSQL version: %v", err)
+	}
+	serverVersion, err := strconv.Atoi(serverVersionText)
+	if err != nil || serverVersion < 160000 {
+		admin.Close()
+		t.Fatalf("PostgreSQL version = %q; require 160000 or newer", serverVersionText)
+	}
+	var migration string
+	if err := admin.QueryRow(
+		ctx,
+		"SELECT version_num FROM public.alembic_version",
+	).Scan(&migration); err != nil {
+		admin.Close()
+		t.Fatalf("read intake migration version: %v", err)
+	}
+	// CI migrates this functional fixture to head, not the historical 036 schema.
+	if migration != "043_owned_history_snapshot_rows" {
+		admin.Close()
+		t.Fatalf(
+			"intake migration version = %q; want 043_owned_history_snapshot_rows",
+			migration,
+		)
+	}
+
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	role := "vp_go_intake_" + suffix
+	roleIdentifier := fmt.Sprintf("%q", role)
+	password := strings.ReplaceAll(uuid.NewString(), "-", "")
+	serviceName := "vp-go-intake-" + suffix
+	token := "admission-" + suffix
+	if _, err := admin.Exec(
+		ctx,
+		fmt.Sprintf(
+			"CREATE ROLE %s LOGIN PASSWORD '%s'",
+			roleIdentifier,
+			password,
+		),
+	); err != nil {
+		admin.Close()
+		t.Fatalf("create intake worker role: %v", err)
+	}
+	fixture := &workerIntakePostgresFixture{
+		ctx:     ctx,
+		admin:   admin,
+		role:    role,
+		service: serviceName,
+		token:   token,
+	}
+	t.Cleanup(func() {
+		if fixture.worker != nil {
+			fixture.worker.Close()
+		}
+		cleanupContext, cleanupCancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cleanupCancel()
+		_, _ = admin.Exec(
+			cleanupContext,
+			"DELETE FROM public.worker_registrations WHERE service_name = $1",
+			serviceName,
+		)
+		_, _ = admin.Exec(
+			cleanupContext,
+			"DELETE FROM public.worker_admission_grants WHERE service_name = $1",
+			serviceName,
+		)
+		dropTx, beginErr := admin.Begin(cleanupContext)
+		if beginErr != nil {
+			t.Errorf("begin intake role cleanup: %v", beginErr)
+		} else {
+			if _, lockErr := dropTx.Exec(
+				cleanupContext,
+				"SELECT pg_advisory_xact_lock(8675309, 4)",
+			); lockErr != nil {
+				t.Errorf("lock intake role cleanup: %v", lockErr)
+			} else if _, dropErr := dropTx.Exec(
+				cleanupContext,
+				fmt.Sprintf("DROP OWNED BY %s", roleIdentifier),
+			); dropErr != nil {
+				t.Errorf("drop intake role ownership: %v", dropErr)
+			} else if _, dropErr := dropTx.Exec(
+				cleanupContext,
+				fmt.Sprintf("DROP ROLE IF EXISTS %s", roleIdentifier),
+			); dropErr != nil {
+				t.Errorf("drop intake role: %v", dropErr)
+			} else if commitErr := dropTx.Commit(cleanupContext); commitErr != nil {
+				t.Errorf("commit intake role cleanup: %v", commitErr)
+			}
+			_ = dropTx.Rollback(cleanupContext)
+		}
+		admin.Close()
+	})
+	signatures := []string{
+		"vp_worker_register(text,bigint,text,text,uuid,integer,text,jsonb,text,text,text,text,jsonb,text,text,text,text,text)",
+		"vp_require_worker_lease(uuid,bigint)",
+	}
+	grantErr := func() error {
+		grantTx, err := admin.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = grantTx.Rollback(ctx) }()
+		if _, err := grantTx.Exec(
+			ctx,
+			"SELECT pg_advisory_xact_lock(8675309, 4)",
+		); err != nil {
+			return err
+		}
+		for _, signature := range signatures {
+			if _, err := grantTx.Exec(
+				ctx,
+				fmt.Sprintf(
+					"GRANT EXECUTE ON FUNCTION public.%s TO %s",
+					signature,
+					roleIdentifier,
+				),
+			); err != nil {
+				return fmt.Errorf("grant intake function %s: %w", signature, err)
+			}
+		}
+		return grantTx.Commit(ctx)
+	}()
+	if grantErr != nil {
+		t.Fatalf("grant intake worker functions: %v", grantErr)
+	}
+	workerURL, err := url.Parse(testURL)
+	if err != nil {
+		t.Fatalf("parse intake PostgreSQL URL: %v", err)
+	}
+	workerURL.User = url.UserPassword(role, password)
+	stream := "vp:test:intake:" + suffix
+	group := "vp-test-intake-" + suffix
+	claimDatabaseURL := *workerURL
+	databasePort := workerURL.Port()
+	if databasePort == "" {
+		databasePort = "5432"
+	}
+	claimDatabaseURL.Host = net.JoinHostPort("vp-postgres", databasePort)
+	claimRedisURL, err := url.Parse(redisURL)
+	if err != nil {
+		t.Fatalf("parse intake Redis URL: %v", err)
+	}
+	redisPort := claimRedisURL.Port()
+	if redisPort == "" {
+		redisPort = "6379"
+	}
+	claimRedisURL.Host = net.JoinHostPort("vp-redis", redisPort)
+	claims, err := BuildRegistrationClaims(
+		map[string]string{
+			"DEPLOY_MODE":                 "production",
+			"WORKER_SERVICE_NAME":         serviceName,
+			"WORKER_ADMISSION_GENERATION": "1",
+			"WORKER_SLOT":                 "1",
+			"WORKER_TYPE":                 "ffmpeg_go",
+			"WORKER_HOST":                 "host127",
+			"WORKER_CAPABILITIES":         "media_cpu",
+			"WORKER_RELEASE_COMMIT":       "0123456789abcdef0123456789abcdef01234567",
+			"VP_BUILD_COMMIT":             "0123456789abcdef0123456789abcdef01234567",
+			"WORKER_IMAGE_IDENTITY":       "vp-ffmpeg-go-worker:deploy-0123456789ab",
+			"WORKER_REDIS_STREAM":         stream,
+			"WORKER_REDIS_GROUP":          group,
+			"REDIS_URL":                   claimRedisURL.String(),
+			"STORAGE_BACKEND":             "not_applicable",
+		},
+		claimDatabaseURL.String(),
+		uuid.New(),
+	)
+	if err != nil {
+		t.Fatalf("build intake registration claims: %v", err)
+	}
+	capabilitiesJSON, err := json.Marshal(claims.Capabilities)
+	if err != nil {
+		t.Fatalf("marshal intake capabilities: %v", err)
+	}
+	if _, err := admin.Exec(
+		ctx,
+		`INSERT INTO public.worker_admission_grants (
+			service_name, generation, worker_type, worker_host,
+			capabilities_json, release_commit, image_identity,
+			database_principal, redis_stream, redis_group,
+			endpoint_bindings_json, token_sha256, state, issued_at,
+			issued_by, activated_at
+		) VALUES (
+			$1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10,
+			$11::jsonb, $12, 'active', clock_timestamp(), 'go-intake-test',
+			clock_timestamp()
+		)`,
+		claims.ServiceName,
+		claims.Generation,
+		claims.WorkerType,
+		claims.WorkerHost,
+		string(capabilitiesJSON),
+		claims.ReleaseCommit,
+		claims.ImageIdentity,
+		role,
+		claims.RedisStream,
+		claims.RedisGroup,
+		claims.EndpointBindingsJSON,
+		workerIntakeSHA256(token),
+	); err != nil {
+		t.Fatalf("insert intake admission grant: %v", err)
+	}
+	workerStore, err := store.Open(ctx, workerURL.String())
+	if err != nil {
+		t.Fatalf("open intake worker store: %v", err)
+	}
+	fixture.worker = workerStore
+	fixture.claims = claims
+	return fixture
+}
+
+func workerIntakeSHA256(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
+func newOwnedTestRegistration(
+	parent context.Context,
+	lease RegistrationLease,
+) *Registration {
+	ownedContext, cancelOwned := context.WithCancelCause(parent)
+	return &Registration{
+		lease:        lease,
+		ownedContext: ownedContext,
+		cancelOwned:  cancelOwned,
+		lost:         make(chan struct{}),
+	}
+}
+
+func registeredLossTestPayload() map[string]any {
+	return map[string]any{
+		"job_id":             uuid.NewString(),
+		"node_execution_id":  uuid.NewString(),
+		"node_id":            "trim-1",
+		"node_type":          "trim",
+		"config":             "{}",
+		"input_artifacts":    "{}",
+		"preferred_hosts":    "[]",
+		"event_stream":       "vp:events",
+		"orchestrator_owner": "python",
+		"dispatch_key":       uuid.NewString(),
+	}
+}
+
+func workerRuntimeTestClaim(
+	jobID uuid.UUID,
+	nodeID uuid.UUID,
+) *store.WorkerNodeClaim {
+	return &store.WorkerNodeClaim{
+		RegistrationID:  uuid.New(),
+		LeaseEpoch:      23,
+		WorkerID:        "ffmpeg_go-worker@host127:1:" + uuid.NewString(),
+		WorkerStartedAt: time.Now().UTC(),
+		JobID:           jobID,
+		NodeExecutionID: nodeID,
+		AttestationID:   uuid.New(),
+		Delivery: store.WorkerTaskDeliveryProof{
+			RedisStream:   "vp:tasks:ffmpeg_go",
+			ConsumerGroup: "ffmpeg_go-workers",
+			MessageID:     "1-0",
+			PayloadSHA256: strings.Repeat("a", 64),
+			DispatchKey:   uuid.New(),
+		},
+	}
 }

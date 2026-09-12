@@ -20,6 +20,8 @@ from app.models.autoflow import AutoFlowRun as AutoFlowRunModel
 from app.models.autoflow import AutoFlowUsedClip
 from app.models.autoflow import ContentMetric, TrendSignal
 from app.models.asset import Asset
+from app.models.channel_agent import ProductionTask
+from app.models.owned_seed_inventory import OwnedSeedInventory
 from app.models.schedule import RuntimeSchedule
 from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import (
@@ -38,6 +40,8 @@ async def autoflow_db_session():
         for table in (
             Asset.__table__,
             RuntimeSchedule.__table__,
+            ProductionTask.__table__,
+            OwnedSeedInventory.__table__,
             AutoFlowPlanModel.__table__,
             AutoFlowRunModel.__table__,
             AutoFlowUsedClip.__table__,
@@ -295,6 +299,7 @@ async def test_db_plan_rejects_untrusted_owned_input_assets(autoflow_db_session)
     image_asset.mime_type = "image/png"
     autoflow_db_session.add_all([unowned_asset, image_asset])
     await autoflow_db_session.commit()
+    unowned_id, image_id = str(unowned_asset.id), str(image_asset.id)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         payload = {
@@ -306,11 +311,11 @@ async def test_db_plan_rejects_untrusted_owned_input_assets(autoflow_db_session)
         missing = await client.post("/api/v1/autoflow/plan", json=payload)
         unowned = await client.post(
             "/api/v1/autoflow/plan",
-            json={**payload, "input_asset_id": str(unowned_asset.id)},
+            json={**payload, "input_asset_id": unowned_id},
         )
         wrong_type = await client.post(
             "/api/v1/autoflow/plan",
-            json={**payload, "input_asset_id": str(image_asset.id)},
+            json={**payload, "input_asset_id": image_id},
         )
         graph = await client.post(
             "/api/v1/autoflow/plan/graph",

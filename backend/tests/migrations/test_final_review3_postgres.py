@@ -8,6 +8,8 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from app.services.worker_deployment_cli import EXPECTED_MIGRATION_HEAD
+
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -146,7 +148,7 @@ async def test_postgres_16_fresh_repair_and_mixed_writer_migrations() -> None:
             assert await conn.fetchval("SELECT version()")
             assert (
                 await conn.fetchval("SELECT version_num FROM alembic_version")
-                == "033_legacy_worker_event_resolutions"
+                == EXPECTED_MIGRATION_HEAD
             )
             assert await conn.fetchval(
                 "SELECT column_default FROM information_schema.columns "

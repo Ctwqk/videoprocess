@@ -42,6 +42,10 @@ class ChannelProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     intake_pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     config_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     tick_interval_minutes: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
+    owned_seed_inventory_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("owned_seed_inventories.id", ondelete="RESTRICT", use_alter=True,
+                                     name="fk_channel_owned_inventory"), nullable=True
+    )
 
 
 class TopicLane(UUIDPrimaryKeyMixin, TimestampMixin, Base):

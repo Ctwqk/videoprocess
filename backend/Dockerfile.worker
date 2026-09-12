@@ -1,5 +1,8 @@
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
+ARG VP_BUILD_COMMIT
+RUN printf '%s\n' "$VP_BUILD_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+LABEL org.opencontainers.image.revision=$VP_BUILD_COMMIT
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DEBIAN_FRONTEND=noninteractive
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -22,7 +25,47 @@ COPY pyproject.toml .
 RUN pip install ".[worker]" \
     && pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 
+COPY requirements-vision.txt /tmp/requirements-vision.txt
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0 \
+    && pip install -r /tmp/requirements-vision.txt
+COPY worker/visual_embedding_model.py /tmp/vp-visual-embedding-model.py
+RUN python /tmp/vp-visual-embedding-model.py \
+    --download /usr/local/share/videoprocess/chinese-clip \
+    && chmod -R a-w,a+rX /usr/local/share/videoprocess/chinese-clip
+
 COPY app /app/app
 COPY worker /app/worker
+RUN install -d -o root -g root -m 0555 /usr/local/share/videoprocess \
+    && printf '%s\n' "$VP_BUILD_COMMIT" \
+    > /usr/local/share/videoprocess/worker-build-commit \
+    && chown root:root /usr/local/share/videoprocess/worker-build-commit \
+    && chmod 0444 /usr/local/share/videoprocess/worker-build-commit
 
-CMD ["python", "-m", "worker.main"]
+RUN printf '/app\n' \
+    > ${VIRTUAL_ENV}/lib/python3.12/site-packages/videoprocess-worker.pth \
+    && chown root:root \
+    ${VIRTUAL_ENV}/lib/python3.12/site-packages/videoprocess-worker.pth \
+    && chmod 0444 \
+    ${VIRTUAL_ENV}/lib/python3.12/site-packages/videoprocess-worker.pth
+
+RUN python -c "import importlib; [importlib.import_module(name) for name in ( \
+    'app.channel_agent.staging_object_janitor_cli', \
+    'app.channel_agent.worker_redis_marker_janitor_cli', \
+    'app.channel_agent.worker_redis_marker_readiness_cli', \
+    'app.services.worker_control_role_cli', \
+    'app.services.worker_deployment_cli', \
+    'app.services.worker_marker_control_role_cli', \
+    'app.services.worker_redis_marker_control', \
+    'app.services.worker_redis_marker_repair_cli', \
+    'app.services.worker_registration_operator_cli', \
+    'app.services.worker_runtime_role_cli' \
+)]"
+
+RUN groupadd --system --gid 10001 videoprocess-worker \
+    && useradd --system --uid 10001 --gid videoprocess-worker \
+    --create-home --home-dir /home/videoprocess-worker \
+    --shell /usr/sbin/nologin videoprocess-worker
+
+USER videoprocess-worker
+
+CMD ["/opt/venv/bin/python", "-I", "-m", "worker.main"]

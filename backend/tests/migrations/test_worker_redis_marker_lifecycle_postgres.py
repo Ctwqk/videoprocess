@@ -1,0 +1,2917 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import importlib
+import json
+import os
+import stat
+import subprocess
+import sys
+import uuid
+from contextlib import suppress
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import asyncpg
+import pytest
+import pytest_asyncio
+from sqlalchemy.engine import make_url
+
+
+POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+STABLE_ROLES = {
+    "readiness": "vp_marker_readiness_runtime",
+    "janitor": "vp_marker_janitor_runtime",
+    "repair": "vp_marker_repair_runtime",
+}
+ORCHESTRATOR_CONTROL_ROLE = "vp_orchestrator_control_runtime"
+FUNCTIONS = {
+    "readiness": {
+        "vp_list_worker_redis_marker_expectations(text,integer)",
+        "vp_begin_worker_redis_continuity_check(uuid,integer)",
+        "vp_finish_worker_redis_continuity_check("
+        "uuid,text,text,text,bigint,bigint)",
+        "vp_record_worker_redis_marker_observation("
+        "uuid,text,uuid,text,text)",
+    },
+    "janitor": {
+        "vp_claim_worker_redis_marker_cleanup(uuid,integer,integer)",
+        "vp_finish_worker_redis_marker_cleanup(uuid,uuid,text,text)",
+    },
+    "repair": {
+        "vp_load_worker_redis_marker_repair(text,uuid)",
+        "vp_promote_observed_worker_event_emission(uuid,text,text)",
+    },
+    "worker": {"vp_require_worker_redis_continuity(integer)"},
+}
+ALL_FUNCTIONS = set().union(*FUNCTIONS.values())
+MARKER_TABLES = (
+    "worker_redis_marker_cleanup_authorizations",
+    "worker_redis_continuity_status",
+    "worker_redis_continuity_expectations",
+    "worker_redis_marker_repair_audits",
+)
+
+
+def _database_url(database: str) -> str:
+    return f"{POSTGRES_URL.rsplit('/', 1)[0]}/{database}"
+
+
+def _asyncpg_url(url: str) -> str:
+    return url.replace("postgresql+asyncpg://", "postgresql://", 1)
+
+
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _versioned_roles(generation: str) -> dict[str, str]:
+    suffix = hashlib.sha256(generation.encode("utf-8")).hexdigest()[:16]
+    return {
+        purpose: f"vp_marker_{purpose}_{suffix}"
+        for purpose in STABLE_ROLES
+    }
+
+
+def _run_alembic(database_url: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "alembic", *args],
+        cwd=BACKEND_ROOT,
+        env={**os.environ, "DATABASE_URL": database_url},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _run_role_cli(
+    command: str,
+    generation: str,
+    state_dir: Path,
+    owner_url_file: Path,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "app.services.worker_marker_control_role_cli",
+            command,
+            "--generation",
+            generation,
+            "--state-dir",
+            str(state_dir),
+        ],
+        cwd=BACKEND_ROOT,
+        env={
+            **os.environ,
+            "WORKER_MARKER_CONTROL_OWNER_DATABASE_URL_FILE": str(
+                owner_url_file
+            ),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+async def _seed_authority(
+    connection: asyncpg.Connection,
+    *,
+    resolved: bool,
+    prepared: bool = False,
+) -> dict[str, object]:
+    identity = uuid.uuid4().hex
+    service_name = f"marker-seed-{identity}"
+    registration_id = uuid.uuid4()
+    grant_id = uuid.uuid4()
+    pipeline_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    node_id = uuid.uuid4()
+    dispatch_id = uuid.uuid4()
+    dispatch_key = uuid.uuid4()
+    attestation_id = uuid.uuid4()
+    emission_id = uuid.uuid4()
+    receipt_id = uuid.uuid4()
+    task_message_id = f"1710000000000-{int(identity[:4], 16)}"
+    event_message_id = f"1710000000001-{int(identity[4:8], 16)}"
+    task_payload = {"dispatch_key": str(dispatch_key)}
+    event_payload = {
+        "event": "node_completed",
+        "job_id": str(job_id),
+    }
+    task_hash = _sha256(
+        json.dumps(task_payload, sort_keys=True, separators=(",", ":"))
+    )
+    event_hash = _sha256(
+        json.dumps(event_payload, sort_keys=True, separators=(",", ":"))
+    )
+    worker_started_at = datetime(
+        2026,
+        7,
+        28,
+        12,
+        0,
+        tzinfo=timezone.utc,
+    )
+    source_acknowledged = resolved or prepared
+    emission_state = (
+        "prepared" if prepared else ("resolved" if resolved else "emitted")
+    )
+
+    await connection.execute(
+        """
+        INSERT INTO public.worker_admission_grants (
+            id, service_name, generation, worker_type, worker_host,
+            capabilities_json, release_commit, image_identity,
+            database_principal, redis_stream, redis_group,
+            endpoint_bindings_json, token_sha256, state, issued_at,
+            issued_by, activated_at
+        ) VALUES (
+            $1, $2, 1, 'vision', 'worker-150', '["vision"]'::jsonb,
+            '0123456789abcdef0123456789abcdef01234567',
+            'vp-python-worker:deploy-0123456789ab', $3,
+            'vp:tasks:vision', 'vision-workers', '{}'::jsonb, $4,
+            'active', clock_timestamp(), 'marker-test', clock_timestamp()
+        )
+        """,
+        grant_id,
+        service_name,
+        f"seed_{identity[:16]}",
+        _sha256(f"token-{identity}"),
+    )
+    await connection.execute(
+        """
+        INSERT INTO public.worker_registrations (
+            id, grant_id, service_name, worker_type, worker_host,
+            capabilities_json, worker_instance_id, worker_slot,
+            redis_consumer_id, image_identity, database_principal,
+            database_fingerprint, redis_fingerprint, storage_fingerprint,
+            lease_epoch, lease_secret_sha256, status, registered_at,
+            heartbeat_at, lease_expires_at
+        ) VALUES (
+            $1, $2, $3, 'vision', 'worker-150', '["vision"]'::jsonb,
+            $4, 1, $5, 'vp-python-worker:deploy-0123456789ab', $6,
+            $7, $7, $7, 1, $8, 'active',
+            clock_timestamp() - interval '1 second',
+            clock_timestamp(), clock_timestamp() + interval '180 seconds'
+        )
+        """,
+        registration_id,
+        grant_id,
+        service_name,
+        uuid.uuid4(),
+        f"consumer-{identity[:16]}",
+        f"seed_{identity[:16]}",
+        _sha256(f"fingerprint-{identity}"),
+        _sha256(f"lease-{identity}"),
+    )
+    await connection.execute(
+        """
+        INSERT INTO public.pipelines (id, name, definition)
+        VALUES ($1, $2, '{}'::json)
+        """,
+        pipeline_id,
+        f"marker-pipeline-{identity}",
+    )
+    await connection.execute(
+        """
+        INSERT INTO public.jobs (
+            id, pipeline_id, pipeline_snapshot, status
+        ) VALUES ($1, $2, '{}'::json, 'RUNNING'::job_status)
+        """,
+        job_id,
+        pipeline_id,
+    )
+    await connection.execute(
+        """
+        INSERT INTO public.node_executions (
+            id, job_id, node_id, node_type, status, worker_id,
+            started_at, worker_registration_id, worker_lease_epoch
+        ) VALUES (
+            $1, $2, 'vision-1', 'vision', 'RUNNING'::node_status,
+            $3, $4::timestamptz, $5, 1
+        )
+        """,
+        node_id,
+        job_id,
+        f"worker-{identity[:16]}",
+        worker_started_at,
+        registration_id,
+    )
+    await connection.execute(
+        """
+        INSERT INTO public.worker_task_dispatches (
+            id, dispatch_key, job_id, node_execution_id, redis_stream,
+            consumer_group, payload_sha256, payload_json, delivery_state,
+            delivery_attempted_at, redis_message_id, resolution_state,
+            acknowledged_at, delivered_at
+        ) VALUES (
+            $1, $2, $3, $4, 'vp:tasks:vision', 'vision-workers',
+            $5, $6::jsonb, 'delivered', clock_timestamp(), $7, $8::text,
+            CASE WHEN $8::text = 'acknowledged'
+                THEN clock_timestamp() END,
+            clock_timestamp()
+        )
+        """,
+        dispatch_id,
+        dispatch_key,
+        job_id,
+        node_id,
+        task_hash,
+        json.dumps(task_payload),
+        task_message_id,
+        "acknowledged" if source_acknowledged else "unresolved",
+    )
+    await connection.execute(
+        """
+        INSERT INTO public.worker_task_delivery_attestations (
+            id, redis_stream, consumer_group, message_id, payload_sha256,
+            dispatch_key, job_id, node_execution_id,
+            worker_registration_id, worker_lease_epoch, worker_id,
+            worker_started_at, ack_state, acknowledged_at,
+            ack_event_emission_id
+        ) VALUES (
+            $1, 'vp:tasks:vision', 'vision-workers', $2, $3, $4, $5, $6,
+            $7, 1, $8, $9::timestamptz, $10::text,
+            CASE WHEN $10::text = 'acknowledged'
+                THEN clock_timestamp() END,
+            CASE WHEN $10::text = 'acknowledged' THEN $11::uuid END
+        )
+        """,
+        attestation_id,
+        task_message_id,
+        task_hash,
+        dispatch_key,
+        job_id,
+        node_id,
+        registration_id,
+        f"worker-{identity[:16]}",
+        worker_started_at,
+        "acknowledged" if source_acknowledged else "pending",
+        emission_id,
+    )
+    await connection.execute(
+        """
+        INSERT INTO public.worker_event_emissions (
+            id, source_task_attestation_id, redis_stream, consumer_group,
+            message_id, payload_sha256, payload_json, event_type, job_id,
+            node_execution_id, worker_registration_id, worker_lease_epoch,
+            worker_id, worker_started_at, emission_state, prepared_at,
+            emitted_at, resolved_at
+        ) VALUES (
+            $1, $2, 'vp:events', 'orchestrator-events',
+            CASE WHEN $3 = 'prepared' THEN NULL ELSE $4 END,
+            $5, $6::jsonb, 'node_completed', $7, $8, $9, 1, $10,
+            $11::timestamptz, $3, clock_timestamp(),
+            CASE WHEN $3 = 'prepared' THEN NULL ELSE clock_timestamp() END,
+            CASE WHEN $3 = 'resolved' THEN clock_timestamp() END
+        )
+        """,
+        emission_id,
+        attestation_id,
+        emission_state,
+        event_message_id,
+        event_hash,
+        json.dumps(event_payload),
+        job_id,
+        node_id,
+        registration_id,
+        f"worker-{identity[:16]}",
+        worker_started_at,
+    )
+    if resolved:
+        await connection.execute(
+            """
+            INSERT INTO public.registered_worker_event_receipts (
+                id, source_task_attestation_id, redis_stream,
+                consumer_group, message_id, payload_sha256, payload_json,
+                event_type, job_id, node_execution_id,
+                worker_registration_id, worker_lease_epoch, worker_id,
+                worker_started_at, source_task_stream, source_task_group,
+                source_task_message_id, application_state, ack_state,
+                source_task_ack_state, applied_at, acknowledged_at,
+                source_task_acknowledged_at
+            ) VALUES (
+                $1, $2, 'vp:events', 'orchestrator-events', $3, $4,
+                $5::jsonb, 'node_completed', $6, $7, $8, 1, $9,
+                $10::timestamptz, 'vp:tasks:vision', 'vision-workers', $11,
+                'applied', 'acknowledged', 'acknowledged',
+                clock_timestamp(), clock_timestamp(), clock_timestamp()
+            )
+            """,
+            receipt_id,
+            attestation_id,
+            event_message_id,
+            event_hash,
+            json.dumps(event_payload),
+            job_id,
+            node_id,
+            registration_id,
+            f"worker-{identity[:16]}",
+            worker_started_at,
+            task_message_id,
+        )
+        await connection.execute(
+            """
+            INSERT INTO public.registered_worker_event_deliveries (
+                source_task_attestation_id, receipt_id, redis_stream,
+                consumer_group, message_id, payload_sha256,
+                resolution_state, ack_state, acknowledged_at
+            ) VALUES (
+                $1, $2, 'vp:events', 'orchestrator-events', $3, $4,
+                'accepted', 'acknowledged', clock_timestamp()
+            )
+            """,
+            attestation_id,
+            receipt_id,
+            event_message_id,
+            event_hash,
+        )
+    if not prepared:
+        await connection.execute(
+            """
+            UPDATE public.node_executions
+            SET status = 'SUCCEEDED'::node_status,
+                progress = 100,
+                completed_at = clock_timestamp()
+            WHERE id = $1
+            """,
+            node_id,
+        )
+        await connection.execute(
+            """
+            UPDATE public.jobs
+            SET status = 'SUCCEEDED'::job_status,
+                completed_at = clock_timestamp()
+            WHERE id = $1
+            """,
+            job_id,
+        )
+    return {
+        "service_name": service_name,
+        "registration_id": registration_id,
+        "job_id": job_id,
+        "dispatch_id": dispatch_id,
+        "dispatch_key": dispatch_key,
+        "dispatch_stream": "vp:tasks:vision",
+        "dispatch_message_id": task_message_id,
+        "dispatch_hash": task_hash,
+        "dispatch_payload": task_payload,
+        "emission_id": emission_id,
+        "emission_stream": "vp:events",
+        "emission_message_id": event_message_id,
+        "emission_hash": event_hash,
+        "emission_payload": event_payload,
+    }
+
+
+async def _assert_direct_table_denial(
+    connection: asyncpg.Connection,
+) -> None:
+    for table_name in MARKER_TABLES:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await connection.fetch(f"SELECT * FROM public.{table_name}")
+
+
+async def _assert_exact_function_access(
+    connection: asyncpg.Connection,
+    expected: set[str],
+) -> None:
+    for signature in ALL_FUNCTIONS:
+        assert await connection.fetchval(
+            """
+            SELECT pg_catalog.has_function_privilege(
+                session_user, $1, 'EXECUTE'
+            )
+            """,
+            f"public.{signature}",
+        ) is (signature in expected)
+
+
+@pytest_asyncio.fixture
+async def marker_database(tmp_path: Path):
+    database = f"vp_worker_marker_review_{uuid.uuid4().hex}"
+    generation = f"marker-review-{uuid.uuid4().hex}"
+    generation_roles = _versioned_roles(generation)
+    admin_url = _database_url("postgres")
+    cluster_admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await cluster_admin.execute(f'CREATE DATABASE "{database}"')
+    finally:
+        await cluster_admin.close()
+
+    target_url = _database_url(database)
+    owner_url_file = tmp_path / "owner-database-url"
+    owner_url_file.write_text(f"{target_url}\n", encoding="utf-8")
+    owner_url_file.chmod(0o400)
+    state_dir = tmp_path / "marker-control"
+    migrated = _run_alembic(target_url, "upgrade", "head")
+    assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+    provisioned = _run_role_cli(
+        "provision",
+        generation,
+        state_dir,
+        owner_url_file,
+    )
+    assert provisioned.returncode == 0, (
+        provisioned.stdout + provisioned.stderr
+    )
+    module = importlib.import_module(
+        "app.services.worker_marker_control_role_cli"
+    )
+    credential_urls = {
+        purpose: path.read_text(encoding="utf-8").strip()
+        for purpose, path in module.credential_paths(
+            state_dir,
+            generation,
+        ).items()
+    }
+    admin = await asyncpg.connect(_asyncpg_url(target_url))
+    extra_roles: list[str] = []
+    context = {
+        "admin": admin,
+        "admin_url": admin_url,
+        "credential_urls": credential_urls,
+        "database": database,
+        "extra_roles": extra_roles,
+        "generation": generation,
+        "generation_roles": generation_roles,
+        "owner_url_file": owner_url_file,
+        "state_dir": state_dir,
+        "target_url": target_url,
+    }
+    try:
+        yield context
+    finally:
+        await admin.close()
+        _run_role_cli(
+            "revoke",
+            generation,
+            state_dir,
+            owner_url_file,
+        )
+        cluster_admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await cluster_admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            for role_name in reversed(extra_roles):
+                with suppress(asyncpg.PostgresError):
+                    await cluster_admin.execute(
+                        f'DROP ROLE IF EXISTS "{role_name}"'
+                    )
+            for role_name in (
+                *generation_roles.values(),
+                *STABLE_ROLES.values(),
+            ):
+                with suppress(asyncpg.PostgresError):
+                    await cluster_admin.execute(
+                        f'DROP ROLE IF EXISTS "{role_name}"'
+                    )
+        finally:
+            await cluster_admin.close()
+
+
+async def _connect_control(
+    marker_database: dict[str, object],
+    purpose: str,
+) -> asyncpg.Connection:
+    credential_urls = marker_database["credential_urls"]
+    assert isinstance(credential_urls, dict)
+    return await asyncpg.connect(
+        _asyncpg_url(str(credential_urls[purpose]))
+    )
+
+
+async def _wait_until_backend_is_lock_blocked(
+    admin: asyncpg.Connection,
+    backend_pid: int,
+) -> None:
+    for _ in range(100):
+        wait_event_type = await admin.fetchval(
+            """
+            SELECT wait_event_type
+            FROM pg_catalog.pg_stat_activity
+            WHERE pid = $1
+            """,
+            backend_pid,
+        )
+        if wait_event_type == "Lock":
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail("backend did not block on the expected row lock")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_expectation_pages_are_snapshot_stable_and_payload_minimal(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    original = await _seed_authority(admin, resolved=True)
+    readiness = await _connect_control(marker_database, "readiness")
+    try:
+        async with asyncio.timeout(15):
+            run_id = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                run_id,
+            ) == "begun"
+            expected_count = await admin.fetchval(
+                """
+                SELECT expected_count
+                FROM public.worker_redis_continuity_status
+                WHERE singleton
+                """
+            )
+            assert expected_count == 2
+
+            first_page = await readiness.fetch(
+                """
+                SELECT *
+                FROM public.vp_list_worker_redis_marker_expectations('', 1)
+                """
+            )
+            assert len(first_page) == 1
+            assert set(first_page[0].keys()) == {
+                "marker_kind",
+                "source_id",
+                "marker_key",
+                "redis_stream",
+                "expected_message_id",
+                "payload_sha256",
+                "source_state",
+                "absence_allowed",
+            }
+            concurrent = await _seed_authority(admin, resolved=True)
+
+            rows = list(first_page)
+            after_key = first_page[-1]["marker_key"]
+            while True:
+                page = await readiness.fetch(
+                    """
+                    SELECT *
+                    FROM public.vp_list_worker_redis_marker_expectations(
+                        $1, 1
+                    )
+                    """,
+                    after_key,
+                )
+                if not page:
+                    break
+                rows.extend(page)
+                after_key = page[-1]["marker_key"]
+
+            assert len(rows) == expected_count
+            assert {row["source_id"] for row in rows} == {
+                original["emission_id"],
+                original["dispatch_id"],
+            }
+            assert {
+                concurrent["emission_id"],
+                concurrent["dispatch_id"],
+            }.isdisjoint({row["source_id"] for row in rows})
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_continuity_check(
+                    $1, 'ready', 'ready', 'redis-run', $2, $2
+                )
+                """,
+                run_id,
+                expected_count,
+            )
+    finally:
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_error_finish_uses_locked_snapshot_count(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    await _seed_authority(admin, resolved=True)
+    readiness = await _connect_control(marker_database, "readiness")
+    try:
+        async with asyncio.timeout(15):
+            failed_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                failed_run,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_continuity_check(
+                    $1, 'error', 'expectation_page_incomplete',
+                    NULL, 0, 0
+                )
+                """,
+                failed_run,
+            ) is False
+            status = await admin.fetchrow(
+                """
+                SELECT state, reason_code, expected_count, checked_count
+                FROM public.worker_redis_continuity_status
+                WHERE singleton
+                """
+            )
+            assert dict(status) == {
+                "state": "error",
+                "reason_code": "expectation_page_incomplete",
+                "expected_count": 2,
+                "checked_count": 0,
+            }
+
+            next_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                next_run,
+            ) == "begun"
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_result_invalid",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_continuity_check(
+                        $1, 'ready', 'ready', 'redis-run', 0, 0
+                    )
+                    """,
+                    next_run,
+                )
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_continuity_check(
+                    $1, 'error', 'expectation_page_incomplete',
+                    NULL, 0, 0
+                )
+                """,
+                next_run,
+            ) is False
+    finally:
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_expired_continuity_run_cannot_finish_ready(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    readiness = await _connect_control(marker_database, "readiness")
+    try:
+        async with asyncio.timeout(15):
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_request_invalid",
+            ):
+                await readiness.execute(
+                    "SELECT public."
+                    "vp_begin_worker_redis_continuity_check($1, 301)",
+                    uuid.uuid4(),
+                )
+
+            expired_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                expired_run,
+            ) == "begun"
+            await admin.execute(
+                """
+                UPDATE public.worker_redis_continuity_status
+                SET started_at = captured.now - interval '301 seconds',
+                    lease_expires_at = captured.now - interval '1 second'
+                FROM (SELECT clock_timestamp() AS now) AS captured
+                WHERE singleton
+                """
+            )
+            expected_count = await admin.fetchval(
+                """
+                SELECT expected_count
+                FROM public.worker_redis_continuity_status
+                WHERE singleton
+                """
+            )
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_run_expired",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_continuity_check(
+                        $1, 'ready', 'ready', 'redis-run', $2, $2
+                    )
+                    """,
+                    expired_run,
+                    expected_count,
+                )
+
+            takeover_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                takeover_run,
+            ) == "begun"
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_run_mismatch",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_continuity_check(
+                        $1, 'error', 'stale_run', NULL, $2, 0
+                    )
+                    """,
+                    expired_run,
+                    expected_count,
+                )
+    finally:
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_cleanup_claim_renewal_takeover_and_blocked_finish_expiry(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    authorization_id = uuid.uuid4()
+    await admin.execute(
+        """
+        INSERT INTO public.worker_redis_marker_cleanup_authorizations (
+            id, marker_kind, source_id, marker_key, redis_stream,
+            expected_message_id, payload_sha256
+        ) VALUES (
+            $1, 'event_emission', $2, $3, 'vp:events',
+            '1710000000000-0', $4
+        )
+        """,
+        authorization_id,
+        uuid.uuid4(),
+        f"vp:worker-event-emission:{uuid.uuid4()}",
+        _sha256("cleanup-lease"),
+    )
+    janitor = await _connect_control(marker_database, "janitor")
+    try:
+        async with asyncio.timeout(15):
+            first_run = uuid.uuid4()
+            first_claim = await janitor.fetchrow(
+                """
+                SELECT *
+                FROM public.vp_claim_worker_redis_marker_cleanup(
+                    $1, 1, 300
+                )
+                """,
+                first_run,
+            )
+            assert first_claim is not None
+            renewed_claim = await janitor.fetchrow(
+                """
+                SELECT *
+                FROM public.vp_claim_worker_redis_marker_cleanup(
+                    $1, 1, 300
+                )
+                """,
+                first_run,
+            )
+            assert renewed_claim is not None
+            assert renewed_claim["id"] == authorization_id
+            assert (
+                renewed_claim["claim_expires_at"]
+                > first_claim["claim_expires_at"]
+            )
+
+            second_run = uuid.uuid4()
+            assert await janitor.fetch(
+                """
+                SELECT *
+                FROM public.vp_claim_worker_redis_marker_cleanup(
+                    $1, 1, 300
+                )
+                """,
+                second_run,
+            ) == []
+            await admin.execute(
+                """
+                UPDATE public.worker_redis_marker_cleanup_authorizations
+                SET claim_expires_at =
+                    clock_timestamp() - interval '1 second'
+                WHERE id = $1
+                """,
+                authorization_id,
+            )
+            taken_over = await janitor.fetchrow(
+                """
+                SELECT *
+                FROM public.vp_claim_worker_redis_marker_cleanup(
+                    $1, 1, 300
+                )
+                """,
+                second_run,
+            )
+            assert taken_over is not None
+            assert await admin.fetchval(
+                """
+                SELECT claimed_by_run_id = $2
+                FROM public.worker_redis_marker_cleanup_authorizations
+                WHERE id = $1
+                """,
+                authorization_id,
+                second_run,
+            )
+
+            lock_transaction = admin.transaction()
+            await lock_transaction.start()
+            await admin.execute(
+                """
+                UPDATE public.worker_redis_marker_cleanup_authorizations
+                SET claim_expires_at =
+                    clock_timestamp() + interval '100 milliseconds'
+                WHERE id = $1
+                """,
+                authorization_id,
+            )
+            backend_pid = await janitor.fetchval(
+                "SELECT pg_catalog.pg_backend_pid()"
+            )
+            finish_task = asyncio.create_task(
+                janitor.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_marker_cleanup(
+                        $1, $2, 'absent', 'marker_absent'
+                    )
+                    """,
+                    authorization_id,
+                    second_run,
+                )
+            )
+            await _wait_until_backend_is_lock_blocked(admin, backend_pid)
+            await asyncio.sleep(0.2)
+            await lock_transaction.commit()
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_cleanup_claim_mismatch",
+            ):
+                await finish_task
+            assert await admin.fetchval(
+                """
+                SELECT authorization_state = 'claimed'
+                FROM public.worker_redis_marker_cleanup_authorizations
+                WHERE id = $1
+                """,
+                authorization_id,
+            )
+    finally:
+        if admin.is_in_transaction():
+            await admin.execute("ROLLBACK")
+        await janitor.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_repair_promotion_requires_readiness_observation(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    prepared = await _seed_authority(
+        admin,
+        resolved=False,
+        prepared=True,
+    )
+    readiness = await _connect_control(marker_database, "readiness")
+    repair = await _connect_control(marker_database, "repair")
+    try:
+        async with asyncio.timeout(15):
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_repair_observation_missing",
+            ):
+                await repair.execute(
+                    """
+                    SELECT public.vp_promote_observed_worker_event_emission(
+                        $1, $2, $3
+                    )
+                    """,
+                    prepared["emission_id"],
+                    prepared["emission_message_id"],
+                    prepared["emission_hash"],
+                )
+            run_id = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                run_id,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                run_id,
+                prepared["emission_id"],
+                prepared["emission_message_id"],
+                prepared["emission_hash"],
+            )
+            assert await repair.fetchval(
+                """
+                SELECT public.vp_promote_observed_worker_event_emission(
+                    $1, $2, $3
+                )
+                """,
+                prepared["emission_id"],
+                prepared["emission_message_id"],
+                prepared["emission_hash"],
+            )
+            audit = await admin.fetchrow(
+                """
+                SELECT source_id, action, result_code, principal
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1
+                """,
+                prepared["emission_id"],
+            )
+            assert dict(audit) == {
+                "source_id": prepared["emission_id"],
+                "action": "promote_prepared",
+                "result_code": "promoted",
+                "principal": marker_database["generation_roles"]["repair"],
+            }
+    finally:
+        await repair.close()
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_observed_promotion_blocked_across_continuity_expiry_fails_closed(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    prepared = await _seed_authority(
+        admin,
+        resolved=False,
+        prepared=True,
+    )
+    readiness = await _connect_control(marker_database, "readiness")
+    repair = await _connect_control(marker_database, "repair")
+    lock_transaction = None
+    promotion_task = None
+    try:
+        async with asyncio.timeout(15):
+            run_id = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                run_id,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                run_id,
+                prepared["emission_id"],
+                prepared["emission_message_id"],
+                prepared["emission_hash"],
+            )
+
+            lock_transaction = admin.transaction()
+            await lock_transaction.start()
+            lease_expires_at = await admin.fetchval(
+                """
+                UPDATE public.worker_redis_continuity_status
+                SET started_at =
+                        captured.now - interval '299 seconds',
+                    lease_expires_at =
+                        captured.now + interval '1 second'
+                FROM (SELECT clock_timestamp() AS now) AS captured
+                WHERE singleton
+                RETURNING lease_expires_at
+                """
+            )
+            backend_pid = await repair.fetchval(
+                "SELECT pg_catalog.pg_backend_pid()"
+            )
+            promotion_task = asyncio.create_task(
+                repair.execute(
+                    """
+                    SELECT public.vp_promote_observed_worker_event_emission(
+                        $1, $2, $3
+                    )
+                    """,
+                    prepared["emission_id"],
+                    prepared["emission_message_id"],
+                    prepared["emission_hash"],
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not promotion_task.done()
+            await _wait_until_backend_is_lock_blocked(admin, backend_pid)
+            sleep_seconds = max(
+                (
+                    lease_expires_at - datetime.now(timezone.utc)
+                ).total_seconds()
+                + 0.1,
+                0.1,
+            )
+            await asyncio.sleep(sleep_seconds)
+            await lock_transaction.commit()
+            lock_transaction = None
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_repair_observation_missing",
+            ):
+                await promotion_task
+            emission = await admin.fetchrow(
+                """
+                SELECT emission_state, message_id
+                FROM public.worker_event_emissions
+                WHERE id = $1
+                """,
+                prepared["emission_id"],
+            )
+            assert dict(emission) == {
+                "emission_state": "prepared",
+                "message_id": None,
+            }
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1
+                """,
+                prepared["emission_id"],
+            ) == 0
+    finally:
+        if lock_transaction is not None and admin.is_in_transaction():
+            await lock_transaction.rollback()
+        if promotion_task is not None and not promotion_task.done():
+            promotion_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await promotion_task
+        await repair.close()
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_observed_promotion_waiting_on_expectation_rechecks_expiry(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    prepared = await _seed_authority(
+        admin,
+        resolved=False,
+        prepared=True,
+    )
+    readiness = await _connect_control(marker_database, "readiness")
+    repair = await _connect_control(marker_database, "repair")
+    holder_transaction = None
+    promotion_task = None
+    try:
+        async with asyncio.timeout(15):
+            run_id = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                run_id,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                run_id,
+                prepared["emission_id"],
+                prepared["emission_message_id"],
+                prepared["emission_hash"],
+            )
+            lease_expires_at = await admin.fetchval(
+                """
+                UPDATE public.worker_redis_continuity_status
+                SET started_at =
+                        captured.now - interval '299 seconds',
+                    lease_expires_at =
+                        captured.now + interval '1 second'
+                FROM (SELECT clock_timestamp() AS now) AS captured
+                WHERE singleton
+                RETURNING lease_expires_at
+                """
+            )
+
+            holder_transaction = admin.transaction()
+            await holder_transaction.start()
+            assert await admin.fetchval(
+                """
+                SELECT true
+                FROM public.worker_redis_continuity_expectations
+                WHERE run_id = $1
+                  AND marker_kind = 'event_emission'
+                  AND source_id = $2
+                FOR UPDATE
+                """,
+                run_id,
+                prepared["emission_id"],
+            )
+            backend_pid = await repair.fetchval(
+                "SELECT pg_catalog.pg_backend_pid()"
+            )
+            promotion_task = asyncio.create_task(
+                repair.execute(
+                    """
+                    SELECT public.vp_promote_observed_worker_event_emission(
+                        $1, $2, $3
+                    )
+                    """,
+                    prepared["emission_id"],
+                    prepared["emission_message_id"],
+                    prepared["emission_hash"],
+                )
+            )
+            await _wait_until_backend_is_lock_blocked(admin, backend_pid)
+            sleep_seconds = max(
+                (
+                    lease_expires_at - datetime.now(timezone.utc)
+                ).total_seconds()
+                + 0.1,
+                0.1,
+            )
+            await asyncio.sleep(sleep_seconds)
+            await holder_transaction.commit()
+            holder_transaction = None
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_repair_observation_missing",
+            ):
+                await promotion_task
+            assert await admin.fetchval(
+                """
+                SELECT emission_state = 'prepared' AND message_id IS NULL
+                FROM public.worker_event_emissions
+                WHERE id = $1
+                """,
+                prepared["emission_id"],
+            )
+    finally:
+        if (
+            holder_transaction is not None
+            and admin.is_in_transaction()
+        ):
+            await holder_transaction.rollback()
+        if promotion_task is not None and not promotion_task.done():
+            promotion_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await promotion_task
+        await repair.close()
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_restore_authorization_rejects_cleanup_covered_sources(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    resolved = await _seed_authority(admin, resolved=True)
+    covered_sources = (
+        (
+            "event_emission",
+            resolved["emission_id"],
+            f"vp:worker-event-emission:{resolved['emission_id']}",
+            resolved["emission_stream"],
+            resolved["emission_message_id"],
+            resolved["emission_hash"],
+            "deleted",
+        ),
+        (
+            "task_dispatch",
+            resolved["dispatch_id"],
+            f"vp:worker-task-dispatch:{resolved['dispatch_key']}",
+            resolved["dispatch_stream"],
+            resolved["dispatch_message_id"],
+            resolved["dispatch_hash"],
+            "absent",
+        ),
+    )
+    await admin.executemany(
+        """
+        INSERT INTO public.worker_redis_marker_cleanup_authorizations (
+            marker_kind, source_id, marker_key, redis_stream,
+            expected_message_id, payload_sha256, authorization_state,
+            claimed_by_run_id, claim_expires_at, finished_at, result_code
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8,
+            clock_timestamp() + interval '300 seconds',
+            clock_timestamp(), 'cleanup_final'
+        )
+        """,
+        [
+            (*covered_source, uuid.uuid4())
+            for covered_source in covered_sources
+        ],
+    )
+    repair = await _connect_control(marker_database, "repair")
+    try:
+        async with asyncio.timeout(15):
+            for action in ("restore_marker", "authorize_restore_marker"):
+                for covered_source in covered_sources:
+                    with pytest.raises(
+                        asyncpg.RaiseError,
+                        match="marker_repair_evidence_missing",
+                    ):
+                        await repair.fetch(
+                            """
+                            SELECT *
+                            FROM public.vp_load_worker_redis_marker_repair(
+                                $1, $2
+                            )
+                            """,
+                            action,
+                            covered_source[1],
+                        )
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = ANY($1::uuid[])
+                """,
+                [source[1] for source in covered_sources],
+            ) == 0
+    finally:
+        await repair.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_cleanup_finalization_invalidates_restore_authorization(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    resolved = await _seed_authority(admin, resolved=True)
+    repair_principal = marker_database["generation_roles"]["repair"]
+    await admin.execute(
+        """
+        INSERT INTO public.worker_redis_marker_repair_audits (
+            source_id, action, result_code, principal
+        ) VALUES ($1, 'restore_marker', 'authorized', $2)
+        """,
+        resolved["emission_id"],
+        repair_principal,
+    )
+    await admin.execute(
+        """
+        INSERT INTO public.worker_redis_marker_cleanup_authorizations (
+            marker_kind, source_id, marker_key, redis_stream,
+            expected_message_id, payload_sha256, authorization_state,
+            claimed_by_run_id, claim_expires_at, finished_at, result_code
+        ) VALUES (
+            'event_emission', $1, $2, $3, $4, $5, 'deleted', $6,
+            clock_timestamp() + interval '300 seconds',
+            clock_timestamp(), 'cleanup_deleted'
+        )
+        """,
+        resolved["emission_id"],
+        f"vp:worker-event-emission:{resolved['emission_id']}",
+        resolved["emission_stream"],
+        resolved["emission_message_id"],
+        resolved["emission_hash"],
+        uuid.uuid4(),
+    )
+    readiness = await _connect_control(marker_database, "readiness")
+    try:
+        async with asyncio.timeout(15):
+            run_id = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                run_id,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                run_id,
+                resolved["emission_id"],
+                resolved["emission_message_id"],
+                resolved["emission_hash"],
+            )
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1 AND result_code = 'restored'
+                """,
+                resolved["emission_id"],
+            ) == 0
+            cleanup = await admin.fetchrow(
+                """
+                SELECT authorization_state, claimed_by_run_id,
+                       claim_expires_at, finished_at, result_code
+                FROM public.worker_redis_marker_cleanup_authorizations
+                WHERE marker_kind = 'event_emission'
+                  AND source_id = $1
+                """,
+                resolved["emission_id"],
+            )
+            assert dict(cleanup) == {
+                "authorization_state": "pending",
+                "claimed_by_run_id": None,
+                "claim_expires_at": None,
+                "finished_at": None,
+                "result_code": None,
+            }
+            observation = await admin.fetchrow(
+                """
+                SELECT observed_message_id, observed_payload_sha256,
+                       observed_by, observed_at
+                FROM public.worker_redis_continuity_expectations
+                WHERE run_id = $1
+                  AND marker_kind = 'event_emission'
+                  AND source_id = $2
+                """,
+                run_id,
+                resolved["emission_id"],
+            )
+            assert observation["observed_message_id"] == resolved[
+                "emission_message_id"
+            ]
+            assert observation["observed_payload_sha256"] == resolved[
+                "emission_hash"
+            ]
+            assert observation["observed_by"] == marker_database[
+                "generation_roles"
+            ]["readiness"]
+            assert observation["observed_at"] is not None
+    finally:
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_late_cached_restore_is_requeued_for_janitor_cleanup(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    resolved = await _seed_authority(admin, resolved=True)
+    suffix = marker_database["target_url"].split("@", 1)[1]
+    orchestrator_role = f"vp_late_restore_{uuid.uuid4().hex[:16]}"
+    orchestrator_password = uuid.uuid4().hex
+    await admin.execute(
+        f'CREATE ROLE "{ORCHESTRATOR_CONTROL_ROLE}" NOLOGIN NOINHERIT'
+    )
+    await admin.execute(
+        f'CREATE ROLE "{orchestrator_role}" LOGIN INHERIT '
+        f"PASSWORD '{orchestrator_password}'"
+    )
+    marker_database["extra_roles"].extend(
+        [ORCHESTRATOR_CONTROL_ROLE, orchestrator_role]
+    )
+    await admin.execute(
+        f'GRANT "{ORCHESTRATOR_CONTROL_ROLE}" TO "{orchestrator_role}"'
+    )
+    await admin.execute(
+        "GRANT EXECUTE ON FUNCTION public."
+        "vp_resolve_worker_event_authority_for_job_deletion(uuid) "
+        f'TO "{ORCHESTRATOR_CONTROL_ROLE}"'
+    )
+    orchestrator = await asyncpg.connect(
+        "postgresql://"
+        f"{orchestrator_role}:{orchestrator_password}@{suffix}"
+    )
+    repair = await _connect_control(marker_database, "repair")
+    janitor = await _connect_control(marker_database, "janitor")
+    readiness = await _connect_control(marker_database, "readiness")
+    try:
+        async with asyncio.timeout(15):
+            cached_evidence = await repair.fetchrow(
+                """
+                SELECT *
+                FROM public.vp_load_worker_redis_marker_repair(
+                    'authorize_restore_marker', $1
+                )
+                """,
+                resolved["emission_id"],
+            )
+            assert cached_evidence is not None
+            assert "payload_json" not in cached_evidence.keys()
+
+            await orchestrator.execute(
+                "SELECT public."
+                "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                resolved["job_id"],
+            )
+            first_janitor_run = uuid.uuid4()
+            claims = await janitor.fetch(
+                """
+                SELECT *
+                FROM public.vp_claim_worker_redis_marker_cleanup(
+                    $1, 10, 300
+                )
+                """,
+                first_janitor_run,
+            )
+            assert len(claims) == 2
+            for claim in claims:
+                assert await janitor.fetchval(
+                    """
+                    SELECT public.vp_finish_worker_redis_marker_cleanup(
+                        $1, $2, 'absent', 'marker_absent'
+                    )
+                    """,
+                    claim["id"],
+                    first_janitor_run,
+                )
+
+            continuity_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                continuity_run,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                continuity_run,
+                cached_evidence["source_id"],
+                cached_evidence["expected_message_id"],
+                cached_evidence["payload_sha256"],
+            )
+            expected_count = await admin.fetchval(
+                """
+                SELECT expected_count
+                FROM public.worker_redis_continuity_status
+                WHERE singleton
+                """
+            )
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_result_invalid",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_continuity_check(
+                        $1, 'ready', 'ready', 'redis-run', $2, $2
+                    )
+                    """,
+                    continuity_run,
+                    expected_count,
+                )
+            assert not await readiness.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_continuity_check(
+                    $1, 'error', 'late_cleanup_pending', NULL, $2, $2
+                )
+                """,
+                continuity_run,
+                expected_count,
+            )
+
+            restarted_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                restarted_run,
+            ) == "begun"
+            assert not await admin.fetchval(
+                """
+                SELECT absence_allowed
+                FROM public.worker_redis_continuity_expectations
+                WHERE run_id = $1
+                  AND marker_kind = 'event_emission'
+                  AND source_id = $2
+                """,
+                restarted_run,
+                resolved["emission_id"],
+            )
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                restarted_run,
+                cached_evidence["source_id"],
+                cached_evidence["expected_message_id"],
+                cached_evidence["payload_sha256"],
+            )
+            restarted_expected_count = await admin.fetchval(
+                """
+                SELECT expected_count
+                FROM public.worker_redis_continuity_status
+                WHERE singleton
+                """
+            )
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_result_invalid",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_continuity_check(
+                        $1, 'ready', 'ready', 'redis-restart', $2, $2
+                    )
+                    """,
+                    restarted_run,
+                    restarted_expected_count,
+                )
+
+            second_janitor_run = uuid.uuid4()
+            reclaimed = await janitor.fetch(
+                """
+                SELECT *
+                FROM public.vp_claim_worker_redis_marker_cleanup(
+                    $1, 10, 300
+                )
+                """,
+                second_janitor_run,
+            )
+            assert len(reclaimed) == 1
+            assert reclaimed[0]["source_id"] == resolved["emission_id"]
+            assert await janitor.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_marker_cleanup(
+                    $1, $2, 'deleted', 'late_marker_deleted'
+                )
+                """,
+                reclaimed[0]["id"],
+                second_janitor_run,
+            )
+            assert await admin.fetchval(
+                """
+                SELECT authorization_state = 'deleted'
+                FROM public.worker_redis_marker_cleanup_authorizations
+                WHERE marker_kind = 'event_emission'
+                  AND source_id = $1
+                """,
+                resolved["emission_id"],
+            )
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1 AND result_code = 'restored'
+                """,
+                resolved["emission_id"],
+            ) == 0
+    finally:
+        await readiness.close()
+        await janitor.close()
+        await repair.close()
+        await orchestrator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_restore_success_requires_independent_observation(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    resolved = await _seed_authority(admin, resolved=True)
+    readiness = await _connect_control(marker_database, "readiness")
+    repair = await _connect_control(marker_database, "repair")
+    try:
+        async with asyncio.timeout(15):
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_repair_request_invalid",
+            ):
+                await repair.fetch(
+                    """
+                    SELECT *
+                    FROM public.vp_load_worker_redis_marker_repair(
+                        'restore_marker_applied', $1
+                    )
+                    """,
+                    resolved["emission_id"],
+                )
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1 AND result_code = 'restored'
+                """,
+                resolved["emission_id"],
+            ) == 0
+
+            evidence = await repair.fetchrow(
+                """
+                SELECT *
+                FROM public.vp_load_worker_redis_marker_repair(
+                    'authorize_restore_marker', $1
+                )
+                """,
+                resolved["emission_id"],
+            )
+            assert evidence is not None
+            assert "payload_json" not in evidence.keys()
+            assert await admin.fetchval(
+                """
+                SELECT count(*)
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1 AND result_code = 'restored'
+                """,
+                resolved["emission_id"],
+            ) == 0
+
+            run_id = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                run_id,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                run_id,
+                resolved["emission_id"],
+                resolved["emission_message_id"],
+                resolved["emission_hash"],
+            )
+            audits = await admin.fetch(
+                """
+                SELECT action, result_code, principal
+                FROM public.worker_redis_marker_repair_audits
+                WHERE source_id = $1
+                ORDER BY created_at, id
+                """,
+                resolved["emission_id"],
+            )
+            assert [dict(row) for row in audits] == [
+                {
+                    "action": "restore_marker",
+                    "result_code": "authorized",
+                    "principal": marker_database["generation_roles"][
+                        "repair"
+                    ],
+                },
+                {
+                    "action": "restore_marker",
+                    "result_code": "restored",
+                    "principal": marker_database["generation_roles"][
+                        "repair"
+                    ],
+                },
+            ]
+    finally:
+        await repair.close()
+        await readiness.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_repair_audit_is_bounded_and_payload_minimal(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    rows = [
+        (
+            "event_emission",
+            uuid.uuid4(),
+            f"vp:worker-event-emission:{uuid.uuid4()}",
+            "vp:events",
+            f"1710000000000-{index}",
+            _sha256(f"audit-{index}"),
+        )
+        for index in range(101)
+    ]
+    await admin.executemany(
+        """
+        INSERT INTO public.worker_redis_marker_cleanup_authorizations (
+            marker_kind, source_id, marker_key, redis_stream,
+            expected_message_id, payload_sha256
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        """,
+        rows,
+    )
+    repair = await _connect_control(marker_database, "repair")
+    try:
+        async with asyncio.timeout(15):
+            evidence = await repair.fetch(
+                """
+                SELECT *
+                FROM public.vp_load_worker_redis_marker_repair(
+                    'audit', NULL
+                )
+                """
+            )
+            assert len(evidence) == 100
+            assert all("payload_json" not in row.keys() for row in evidence)
+    finally:
+        await repair.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_cleanup_requires_orchestrator_control_principal(
+    marker_database,
+) -> None:
+    admin = marker_database["admin"]
+    assert isinstance(admin, asyncpg.Connection)
+    resolved = await _seed_authority(admin, resolved=True)
+    suffix = marker_database["target_url"].split("@", 1)[1]
+    stable_role = ORCHESTRATOR_CONTROL_ROLE
+    orchestrator_role = f"vp_cleanup_{uuid.uuid4().hex[:16]}"
+    outsider_role = f"vp_cleanup_outsider_{uuid.uuid4().hex[:12]}"
+    password = uuid.uuid4().hex
+    outsider_password = uuid.uuid4().hex
+    await admin.execute(f'CREATE ROLE "{stable_role}" NOLOGIN NOINHERIT')
+    marker_database["extra_roles"].extend(
+        [stable_role, orchestrator_role, outsider_role]
+    )
+    await admin.execute(
+        f'CREATE ROLE "{orchestrator_role}" LOGIN INHERIT '
+        f"PASSWORD '{password}'"
+    )
+    await admin.execute(
+        f'CREATE ROLE "{outsider_role}" LOGIN INHERIT '
+        f"PASSWORD '{outsider_password}'"
+    )
+    await admin.execute(
+        "GRANT EXECUTE ON FUNCTION public."
+        "vp_resolve_worker_event_authority_for_job_deletion(uuid) "
+        f'TO "{stable_role}", "{outsider_role}"'
+    )
+    await admin.execute(
+        f'GRANT "{stable_role}" TO "{orchestrator_role}"'
+    )
+    with pytest.raises(
+        asyncpg.RaiseError,
+        match="database_principal_privileged",
+    ):
+        await admin.execute(
+            "SELECT public."
+            "vp_resolve_worker_event_authority_for_job_deletion($1)",
+            resolved["job_id"],
+        )
+    outsider = await asyncpg.connect(
+        f"postgresql://{outsider_role}:{outsider_password}@{suffix}"
+    )
+    orchestrator = await asyncpg.connect(
+        f"postgresql://{orchestrator_role}:{password}@{suffix}"
+    )
+    try:
+        with pytest.raises(
+            asyncpg.RaiseError,
+            match="marker_control_principal_unauthorized",
+        ):
+            await outsider.execute(
+                "SELECT public."
+                "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                resolved["job_id"],
+            )
+        await orchestrator.execute(
+            "SELECT public."
+            "vp_resolve_worker_event_authority_for_job_deletion($1)",
+            resolved["job_id"],
+        )
+        assert await admin.fetchval(
+            """
+            SELECT count(*) = 2
+            FROM public.worker_redis_marker_cleanup_authorizations
+            WHERE source_id = ANY($1::uuid[])
+            """,
+            [resolved["emission_id"], resolved["dispatch_id"]],
+        )
+    finally:
+        await orchestrator.close()
+        await outsider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres_16_worker_redis_marker_lifecycle_is_fail_closed(
+    tmp_path: Path,
+) -> None:
+    database = f"vp_worker_marker_{uuid.uuid4().hex}"
+    worker_role = f"vp_marker_worker_{uuid.uuid4().hex[:16]}"
+    orchestrator_role = f"vp_marker_orchestrator_{uuid.uuid4().hex[:12]}"
+    worker_password = uuid.uuid4().hex
+    orchestrator_password = uuid.uuid4().hex
+    generation = f"marker-test-{uuid.uuid4().hex}"
+    next_generation = f"marker-test-{uuid.uuid4().hex}"
+    generation_roles = _versioned_roles(generation)
+    next_generation_roles = _versioned_roles(next_generation)
+    admin_url = _database_url("postgres")
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(f'CREATE DATABASE "{database}"')
+        await admin.execute(
+            f'CREATE ROLE "{worker_role}" LOGIN PASSWORD '
+            f"'{worker_password}'"
+        )
+        await admin.execute(
+            f'CREATE ROLE "{ORCHESTRATOR_CONTROL_ROLE}" NOLOGIN NOINHERIT'
+        )
+        await admin.execute(
+            f'CREATE ROLE "{orchestrator_role}" LOGIN INHERIT PASSWORD '
+            f"'{orchestrator_password}'"
+        )
+        await admin.execute(
+            f'GRANT "{ORCHESTRATOR_CONTROL_ROLE}" '
+            f'TO "{orchestrator_role}"'
+        )
+    finally:
+        await admin.close()
+
+    target_url = _database_url(database)
+    owner_url_file = tmp_path / "owner-database-url"
+    owner_url_file.write_text(f"{target_url}\n", encoding="utf-8")
+    owner_url_file.chmod(0o400)
+    state_dir = tmp_path / "marker-control"
+    migrated = _run_alembic(target_url, "upgrade", "head")
+    assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+
+    async def exercise_marker_lifecycle_under_real_roles(
+        database_url: str,
+    ) -> None:
+        module = importlib.import_module(
+            "app.services.worker_marker_control_role_cli"
+        )
+        assert module.role_names_for_generation(
+            generation
+        ).versioned == generation_roles
+
+        provisioned = _run_role_cli(
+            "provision",
+            generation,
+            state_dir,
+            owner_url_file,
+        )
+        assert provisioned.returncode == 0, (
+            provisioned.stdout + provisioned.stderr
+        )
+        provision_payload = json.loads(provisioned.stdout)
+        assert provision_payload == {
+            "reason_code": "marker_control_roles_provisioned",
+            "roles": generation_roles,
+            "status": "ok",
+        }
+        assert provisioned.stderr == ""
+        assert "postgresql" not in provisioned.stdout
+        assert "postgres" not in provisioned.stdout
+
+        next_provisioned = _run_role_cli(
+            "provision",
+            next_generation,
+            state_dir,
+            owner_url_file,
+        )
+        assert next_provisioned.returncode == 0, (
+            next_provisioned.stdout + next_provisioned.stderr
+        )
+
+        generation_dir = state_dir / generation
+        assert stat.S_IMODE(generation_dir.stat().st_mode) == 0o700
+        credential_paths = module.credential_paths(state_dir, generation)
+        for path in credential_paths.values():
+            assert path.is_file()
+            assert stat.S_IMODE(path.stat().st_mode) == 0o400
+        credential_urls = {
+            purpose: path.read_text(encoding="utf-8").strip()
+            for purpose, path in credential_paths.items()
+        }
+        assert len(set(credential_urls.values())) == 3
+        for purpose, url in credential_urls.items():
+            parsed = urlsplit(url.replace("postgresql+asyncpg://", "postgresql://", 1))
+            assert parsed.username == generation_roles[purpose]
+            assert parsed.password
+            assert parsed.path == f"/{database}"
+
+        admin_connection = await asyncpg.connect(_asyncpg_url(database_url))
+        try:
+            assert await admin_connection.fetchval(
+                "SHOW server_version_num"
+            ) >= "160000"
+            await admin_connection.execute(
+                "GRANT EXECUTE ON FUNCTION "
+                "public.vp_require_worker_redis_continuity(integer) "
+                f'TO "{worker_role}"'
+            )
+            await admin_connection.execute(
+                "GRANT EXECUTE ON FUNCTION public."
+                "vp_resolve_worker_event_authority_for_job_deletion(uuid) "
+                f'TO "{ORCHESTRATOR_CONTROL_ROLE}"'
+            )
+            stable_rows = await admin_connection.fetch(
+                """
+                SELECT rolname, rolcanlogin, rolsuper, rolcreaterole,
+                       rolcreatedb, rolreplication, rolbypassrls
+                FROM pg_catalog.pg_roles
+                WHERE rolname = ANY($1::text[])
+                ORDER BY rolname
+                """,
+                list(STABLE_ROLES.values()),
+            )
+            assert len(stable_rows) == 3
+            assert all(
+                not row["rolcanlogin"]
+                and not row["rolsuper"]
+                and not row["rolcreaterole"]
+                and not row["rolcreatedb"]
+                and not row["rolreplication"]
+                and not row["rolbypassrls"]
+                for row in stable_rows
+            )
+            memberships = await admin_connection.fetch(
+                """
+                SELECT member.rolname AS member_name,
+                       granted.rolname AS granted_name
+                FROM pg_catalog.pg_auth_members AS membership
+                JOIN pg_catalog.pg_roles AS member
+                  ON member.oid = membership.member
+                JOIN pg_catalog.pg_roles AS granted
+                  ON granted.oid = membership.roleid
+                WHERE member.rolname = ANY($1::text[])
+                ORDER BY member.rolname, granted.rolname
+                """,
+                list(generation_roles.values()),
+            )
+            assert {
+                (row["member_name"], row["granted_name"])
+                for row in memberships
+            } == {
+                (generation_roles[purpose], STABLE_ROLES[purpose])
+                for purpose in STABLE_ROLES
+            }
+        finally:
+            await admin_connection.close()
+
+        role_connections = {
+            purpose: await asyncpg.connect(_asyncpg_url(url))
+            for purpose, url in credential_urls.items()
+        }
+        worker_url = (
+            "postgresql://"
+            f"{worker_role}:{worker_password}@{database_url.split('@', 1)[1]}"
+        )
+        worker = await asyncpg.connect(worker_url)
+        orchestrator = await asyncpg.connect(
+            "postgresql://"
+            f"{orchestrator_role}:{orchestrator_password}@"
+            f"{database_url.split('@', 1)[1]}"
+        )
+        try:
+            for connection in (*role_connections.values(), worker):
+                await _assert_direct_table_denial(connection)
+            for purpose, connection in role_connections.items():
+                await _assert_exact_function_access(
+                    connection,
+                    FUNCTIONS[purpose],
+                )
+            await _assert_exact_function_access(worker, FUNCTIONS["worker"])
+
+            admin_connection = await asyncpg.connect(
+                _asyncpg_url(database_url)
+            )
+            try:
+                await admin_connection.execute(
+                    "GRANT SELECT ON public."
+                    "worker_redis_continuity_status "
+                    f'TO "{STABLE_ROLES["readiness"]}"'
+                )
+                with pytest.raises(
+                    asyncpg.RaiseError,
+                    match="database_principal_privileged",
+                ):
+                    await role_connections["readiness"].execute(
+                        "SELECT public."
+                        "vp_begin_worker_redis_continuity_check($1, 300)",
+                        uuid.uuid4(),
+                    )
+            finally:
+                await admin_connection.execute(
+                    "REVOKE SELECT ON public."
+                    "worker_redis_continuity_status "
+                    f'FROM "{STABLE_ROLES["readiness"]}"'
+                )
+                await admin_connection.close()
+
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_missing",
+            ):
+                await worker.execute(
+                    "SELECT public.vp_require_worker_redis_continuity(90)"
+                )
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await worker.execute(
+                    "SELECT * FROM public."
+                    "vp_list_worker_redis_marker_expectations('', 10)"
+                )
+
+            readiness = role_connections["readiness"]
+            first_run = uuid.uuid4()
+            second_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                first_run,
+            ) == "begun"
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                second_run,
+            ) == "overlap"
+            admin_connection = await asyncpg.connect(
+                _asyncpg_url(database_url)
+            )
+            try:
+                await admin_connection.execute(
+                    """
+                    UPDATE public.worker_redis_continuity_status
+                    SET started_at =
+                            captured.now - interval '301 seconds',
+                        lease_expires_at =
+                            captured.now - interval '1 second'
+                    FROM (SELECT clock_timestamp() AS now) AS captured
+                    WHERE singleton
+                    """
+                )
+            finally:
+                await admin_connection.close()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                second_run,
+            ) == "begun"
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_result_invalid",
+            ):
+                await readiness.execute(
+                    """
+                    SELECT public.vp_finish_worker_redis_continuity_check(
+                        $1, 'unknown', 'ready', 'redis-run', 0, 0
+                    )
+                    """,
+                    second_run,
+                )
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_continuity_check(
+                    $1, 'ready', 'ready', 'redis-run', 0, 0
+                )
+                """,
+                second_run,
+            )
+            await worker.execute(
+                "SELECT public.vp_require_worker_redis_continuity(90)"
+            )
+            admin_connection = await asyncpg.connect(
+                _asyncpg_url(database_url)
+            )
+            try:
+                await admin_connection.execute(
+                    """
+                    UPDATE public.worker_redis_continuity_status
+                    SET finished_at =
+                        clock_timestamp() - interval '91 seconds'
+                    WHERE singleton
+                    """
+                )
+            finally:
+                await admin_connection.close()
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_stale",
+            ):
+                await worker.execute(
+                    "SELECT public.vp_require_worker_redis_continuity(90)"
+                )
+            error_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                error_run,
+            ) == "begun"
+            assert not await readiness.fetchval(
+                """
+                SELECT public.vp_finish_worker_redis_continuity_check(
+                    $1, 'error', 'redis_unavailable', NULL, 0, 0
+                )
+                """,
+                error_run,
+            )
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="worker_redis_continuity_error",
+            ):
+                await worker.execute(
+                    "SELECT public.vp_require_worker_redis_continuity(90)"
+                )
+
+            admin_connection = await asyncpg.connect(
+                _asyncpg_url(database_url)
+            )
+            try:
+                resolved = await _seed_authority(
+                    admin_connection,
+                    resolved=True,
+                )
+                await orchestrator.execute(
+                    "SELECT public."
+                    "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                    resolved["job_id"],
+                )
+                tombstones = await admin_connection.fetch(
+                    """
+                    SELECT marker_kind, source_id, marker_key, redis_stream,
+                           expected_message_id, payload_sha256,
+                           authorization_state
+                    FROM public.worker_redis_marker_cleanup_authorizations
+                    WHERE source_id = ANY($1::uuid[])
+                    ORDER BY marker_kind
+                    """,
+                    [resolved["emission_id"], resolved["dispatch_id"]],
+                )
+                assert [dict(row) for row in tombstones] == [
+                    {
+                        "marker_kind": "event_emission",
+                        "source_id": resolved["emission_id"],
+                        "marker_key": (
+                            "vp:worker-event-emission:"
+                            f"{resolved['emission_id']}"
+                        ),
+                        "redis_stream": resolved["emission_stream"],
+                        "expected_message_id": resolved[
+                            "emission_message_id"
+                        ],
+                        "payload_sha256": resolved["emission_hash"],
+                        "authorization_state": "pending",
+                    },
+                    {
+                        "marker_kind": "task_dispatch",
+                        "source_id": resolved["dispatch_id"],
+                        "marker_key": (
+                            "vp:worker-task-dispatch:"
+                            f"{resolved['dispatch_key']}"
+                        ),
+                        "redis_stream": resolved["dispatch_stream"],
+                        "expected_message_id": resolved[
+                            "dispatch_message_id"
+                        ],
+                        "payload_sha256": resolved["dispatch_hash"],
+                        "authorization_state": "pending",
+                    },
+                ]
+                assert await admin_connection.fetchval(
+                    """
+                    SELECT count(*)
+                    FROM public.worker_event_emissions
+                    WHERE job_id = $1
+                    """,
+                    resolved["job_id"],
+                ) == 0
+                with pytest.raises(
+                    asyncpg.RaiseError,
+                    match="marker_cleanup_proof_immutable",
+                ):
+                    await admin_connection.execute(
+                        """
+                        UPDATE public.worker_redis_marker_cleanup_authorizations
+                        SET marker_key = marker_key || '-changed'
+                        WHERE source_id = $1
+                        """,
+                        resolved["emission_id"],
+                    )
+
+                unresolved = await _seed_authority(
+                    admin_connection,
+                    resolved=False,
+                )
+                with pytest.raises(
+                    asyncpg.RaiseError,
+                    match="worker_event_authority_unresolved",
+                ):
+                    await orchestrator.execute(
+                        "SELECT public."
+                        "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                        unresolved["job_id"],
+                    )
+                assert await admin_connection.fetchval(
+                    """
+                    SELECT count(*)
+                    FROM public.worker_redis_marker_cleanup_authorizations
+                    WHERE source_id = ANY($1::uuid[])
+                    """,
+                    [unresolved["emission_id"], unresolved["dispatch_id"]],
+                ) == 0
+                assert await admin_connection.fetchval(
+                    """
+                    SELECT count(*) FROM public.worker_event_emissions
+                    WHERE job_id = $1
+                    """,
+                    unresolved["job_id"],
+                ) == 1
+
+                raced = await _seed_authority(
+                    admin_connection,
+                    resolved=True,
+                )
+                await admin_connection.executemany(
+                    """
+                    INSERT INTO public.
+                        worker_redis_marker_cleanup_authorizations (
+                            marker_kind, source_id, marker_key, redis_stream,
+                            expected_message_id, payload_sha256,
+                            authorization_state, authorized_at
+                        )
+                    VALUES ($1, $2, $3, $4, $5, $6, 'pending',
+                            clock_timestamp())
+                    """,
+                    [
+                        (
+                            "event_emission",
+                            raced["emission_id"],
+                            "vp:worker-event-emission:"
+                            f"{raced['emission_id']}",
+                            raced["emission_stream"],
+                            raced["emission_message_id"],
+                            raced["emission_hash"],
+                        ),
+                        (
+                            "task_dispatch",
+                            raced["dispatch_id"],
+                            "vp:worker-task-dispatch:"
+                            f"{raced['dispatch_key']}",
+                            raced["dispatch_stream"],
+                            raced["dispatch_message_id"],
+                            raced["dispatch_hash"],
+                        ),
+                    ],
+                )
+            finally:
+                await admin_connection.close()
+
+            janitor = role_connections["janitor"]
+            janitor_transaction = janitor.transaction()
+            await janitor_transaction.start()
+            race_run = uuid.uuid4()
+            claims = await janitor.fetch(
+                """
+                SELECT *
+                FROM public.vp_claim_worker_redis_marker_cleanup($1, 100, 300)
+                """,
+                race_run,
+            )
+            assert len(claims) >= 2
+            cleanup_connection = await asyncpg.connect(
+                "postgresql://"
+                f"{orchestrator_role}:{orchestrator_password}@"
+                f"{database_url.split('@', 1)[1]}"
+            )
+            cleanup_task = asyncio.create_task(
+                cleanup_connection.execute(
+                    "SELECT public."
+                    "vp_resolve_worker_event_authority_for_job_deletion($1)",
+                    raced["job_id"],
+                )
+            )
+            try:
+                done, _ = await asyncio.wait({cleanup_task}, timeout=0.1)
+                assert cleanup_task not in done
+                for claim in claims:
+                    if claim["source_id"] in {
+                        raced["emission_id"],
+                        raced["dispatch_id"],
+                    }:
+                        await janitor.execute(
+                            """
+                            SELECT public.vp_finish_worker_redis_marker_cleanup(
+                                $1, $2, 'absent', 'marker_absent'
+                            )
+                            """,
+                            claim["id"],
+                            race_run,
+                        )
+                await janitor_transaction.commit()
+                await asyncio.wait_for(cleanup_task, timeout=3)
+            finally:
+                if not cleanup_task.done():
+                    cleanup_task.cancel()
+                    await asyncio.gather(
+                        cleanup_task,
+                        return_exceptions=True,
+                    )
+                if janitor.is_in_transaction():
+                    await janitor_transaction.rollback()
+                await cleanup_connection.close()
+
+            admin_connection = await asyncpg.connect(
+                _asyncpg_url(database_url)
+            )
+            try:
+                assert await admin_connection.fetchval(
+                    """
+                    SELECT count(*) FROM public.worker_event_emissions
+                    WHERE job_id = $1
+                    """,
+                    raced["job_id"],
+                ) == 0
+                assert await admin_connection.fetchval(
+                    """
+                    SELECT bool_and(authorization_state = 'absent')
+                    FROM public.worker_redis_marker_cleanup_authorizations
+                    WHERE source_id = ANY($1::uuid[])
+                    """,
+                    [raced["emission_id"], raced["dispatch_id"]],
+                )
+
+                prepared = await _seed_authority(
+                    admin_connection,
+                    resolved=False,
+                    prepared=True,
+                )
+            finally:
+                await admin_connection.close()
+
+            repair = role_connections["repair"]
+            repair_evidence = await repair.fetchrow(
+                """
+                SELECT *
+                FROM public.vp_load_worker_redis_marker_repair(
+                    'promote_prepared', $1
+                )
+                """,
+                prepared["emission_id"],
+            )
+            assert repair_evidence is not None
+            assert repair_evidence["source_id"] == prepared["emission_id"]
+            assert repair_evidence["payload_sha256"] == prepared[
+                "emission_hash"
+            ]
+            assert repair_evidence["expected_message_id"] is None
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_repair_proof_mismatch",
+            ):
+                await repair.execute(
+                    """
+                    SELECT public.vp_promote_observed_worker_event_emission(
+                        $1, 'not-a-message-id', $2
+                    )
+                    """,
+                    prepared["emission_id"],
+                    prepared["emission_hash"],
+                )
+            with pytest.raises(
+                asyncpg.RaiseError,
+                match="marker_repair_proof_mismatch",
+            ):
+                await repair.execute(
+                    """
+                    SELECT public.vp_promote_observed_worker_event_emission(
+                        $1, '1710000000999-0', $2
+                    )
+                """,
+                prepared["emission_id"],
+                _sha256("wrong"),
+            )
+            repair_run = uuid.uuid4()
+            assert await readiness.fetchval(
+                "SELECT public."
+                "vp_begin_worker_redis_continuity_check($1, 300)",
+                repair_run,
+            ) == "begun"
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, '1710000000999-0', $3
+                )
+                """,
+                repair_run,
+                prepared["emission_id"],
+                prepared["emission_hash"],
+            )
+            assert await repair.fetchval(
+                """
+                SELECT public.vp_promote_observed_worker_event_emission(
+                    $1, '1710000000999-0', $2
+                )
+                """,
+                prepared["emission_id"],
+                prepared["emission_hash"],
+            )
+            restored_evidence = await repair.fetchrow(
+                """
+                SELECT *
+                FROM public.vp_load_worker_redis_marker_repair(
+                    'authorize_restore_marker', $1
+                )
+                """,
+                unresolved["emission_id"],
+            )
+            assert restored_evidence is not None
+            assert restored_evidence["source_id"] == unresolved[
+                "emission_id"
+            ]
+            assert await readiness.fetchval(
+                """
+                SELECT public.vp_record_worker_redis_marker_observation(
+                    $1, 'event_emission', $2, $3, $4
+                )
+                """,
+                repair_run,
+                unresolved["emission_id"],
+                unresolved["emission_message_id"],
+                unresolved["emission_hash"],
+            )
+            audit_sources = {
+                row["source_id"]
+                for row in await repair.fetch(
+                    """
+                    SELECT source_id
+                    FROM public.vp_load_worker_redis_marker_repair(
+                        'audit', NULL
+                    )
+                    """
+                )
+            }
+            assert {
+                unresolved["emission_id"],
+                unresolved["dispatch_id"],
+                prepared["emission_id"],
+            } <= audit_sources
+
+            admin_connection = await asyncpg.connect(
+                _asyncpg_url(database_url)
+            )
+            try:
+                promoted = await admin_connection.fetchrow(
+                    """
+                    SELECT emission_state, message_id, payload_sha256
+                    FROM public.worker_event_emissions
+                    WHERE id = $1
+                    """,
+                    prepared["emission_id"],
+                )
+                assert dict(promoted) == {
+                    "emission_state": "emitted",
+                    "message_id": "1710000000999-0",
+                    "payload_sha256": prepared["emission_hash"],
+                }
+                audits = await admin_connection.fetch(
+                    """
+                    SELECT source_id, action, result_code, principal
+                    FROM public.worker_redis_marker_repair_audits
+                    WHERE source_id = ANY($1::uuid[])
+                    ORDER BY action, result_code
+                    """,
+                    [
+                        prepared["emission_id"],
+                        unresolved["emission_id"],
+                    ],
+                )
+                assert [dict(row) for row in audits] == [
+                    {
+                        "source_id": prepared["emission_id"],
+                        "action": "promote_prepared",
+                        "result_code": "promoted",
+                        "principal": generation_roles["repair"],
+                    },
+                    {
+                        "source_id": unresolved["emission_id"],
+                        "action": "restore_marker",
+                        "result_code": "authorized",
+                        "principal": generation_roles["repair"],
+                    },
+                    {
+                        "source_id": unresolved["emission_id"],
+                        "action": "restore_marker",
+                        "result_code": "restored",
+                        "principal": generation_roles["repair"],
+                    },
+                ]
+                audit_columns = {
+                    row["column_name"]
+                    for row in await admin_connection.fetch(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name =
+                              'worker_redis_marker_repair_audits'
+                        """
+                    )
+                }
+                assert audit_columns == {
+                    "id",
+                    "source_id",
+                    "action",
+                    "result_code",
+                    "principal",
+                    "created_at",
+                }
+                with pytest.raises(
+                    asyncpg.RaiseError,
+                    match="marker_repair_audit_append_only",
+                ):
+                    await admin_connection.execute(
+                        """
+                        UPDATE public.worker_redis_marker_repair_audits
+                        SET result_code = 'changed'
+                        WHERE source_id = $1
+                        """,
+                        prepared["emission_id"],
+                    )
+            finally:
+                await admin_connection.close()
+        finally:
+            await orchestrator.close()
+            await worker.close()
+            for connection in role_connections.values():
+                await connection.close()
+
+        revoked = _run_role_cli(
+            "revoke",
+            generation,
+            state_dir,
+            owner_url_file,
+        )
+        assert revoked.returncode == 0, revoked.stdout + revoked.stderr
+        assert json.loads(revoked.stdout) == {
+            "reason_code": "marker_control_roles_revoked",
+            "roles": generation_roles,
+            "status": "ok",
+        }
+        admin_connection = await asyncpg.connect(_asyncpg_url(database_url))
+        try:
+            assert not await admin_connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_roles
+                    WHERE rolname = ANY($1::text[])
+                )
+                """,
+                list(generation_roles.values()),
+            )
+            assert await admin_connection.fetchval(
+                """
+                SELECT count(*) = 3
+                FROM pg_catalog.pg_roles
+                WHERE rolname = ANY($1::text[])
+                """,
+                list(next_generation_roles.values()),
+            )
+        finally:
+            await admin_connection.close()
+        assert not (state_dir / generation).exists()
+        assert (state_dir / next_generation).is_dir()
+        for path in module.credential_paths(
+            state_dir,
+            next_generation,
+        ).values():
+            assert path.is_file()
+
+        next_revoked = _run_role_cli(
+            "revoke",
+            next_generation,
+            state_dir,
+            owner_url_file,
+        )
+        assert next_revoked.returncode == 0, (
+            next_revoked.stdout + next_revoked.stderr
+        )
+
+    try:
+        await asyncio.wait_for(
+            exercise_marker_lifecycle_under_real_roles(target_url),
+            timeout=15,
+        )
+        downgraded = _run_alembic(target_url, "downgrade", "033")
+        assert downgraded.returncode == 0, (
+            downgraded.stdout + downgraded.stderr
+        )
+        connection = await asyncpg.connect(_asyncpg_url(target_url))
+        try:
+            for table_name in MARKER_TABLES:
+                assert not await connection.fetchval(
+                    "SELECT pg_catalog.to_regclass($1) IS NOT NULL",
+                    f"public.{table_name}",
+                )
+        finally:
+            await connection.close()
+    finally:
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            for role_name in (
+                *generation_roles.values(),
+                *next_generation_roles.values(),
+                orchestrator_role,
+                worker_role,
+                ORCHESTRATOR_CONTROL_ROLE,
+                *STABLE_ROLES.values(),
+            ):
+                with suppress(asyncpg.PostgresError):
+                    await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
+        finally:
+            await admin.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not POSTGRES_URL,
+    reason="set CHANNEL_OPS_POSTGRES_TEST_URL for live migration tests",
+)
+async def test_postgres16_marker_role_setup_uses_deploy_principal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    identity = uuid.uuid4().hex[:12]
+    database = f"vp_marker_delegate_{identity}"
+    deploy_migrator = f"vp_mkr_migrator_{identity}"
+    control_owner = f"vp_mkr_owner_{identity}"
+    stable_roles = {
+        "readiness": f"vp_mkr_readiness_{identity}",
+        "janitor": f"vp_mkr_janitor_{identity}",
+        "repair": f"vp_mkr_repair_{identity}",
+    }
+    generation = f"marker-delegate-{identity}"
+    deploy_password = uuid.uuid4().hex
+    owner_password = uuid.uuid4().hex
+    admin_url = _database_url("postgres")
+    target_admin_url = _database_url(database)
+    versioned_roles: tuple[str, ...] = ()
+
+    admin = await asyncpg.connect(_asyncpg_url(admin_url))
+    try:
+        await admin.execute(
+            f'CREATE ROLE "{deploy_migrator}" LOGIN INHERIT '
+            "NOSUPERUSER NOCREATEDB CREATEROLE NOREPLICATION "
+            f"NOBYPASSRLS PASSWORD '{deploy_password}'"
+        )
+        await admin.execute(
+            f'CREATE ROLE "{control_owner}" LOGIN INHERIT '
+            "NOSUPERUSER NOCREATEDB CREATEROLE NOREPLICATION "
+            f"NOBYPASSRLS PASSWORD '{owner_password}'"
+        )
+        await admin.execute(
+            f'CREATE DATABASE "{database}" OWNER "{deploy_migrator}"'
+        )
+        for stable_role in stable_roles.values():
+            await admin.execute(
+                f'CREATE ROLE "{stable_role}" NOLOGIN NOINHERIT '
+                "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION "
+                "NOBYPASSRLS"
+            )
+            await admin.execute(
+                f'GRANT "{stable_role}" TO "{deploy_migrator}" '
+                "WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"
+            )
+    finally:
+        await admin.close()
+
+    try:
+        marker_module = importlib.import_module(
+            "app.services.worker_marker_control_role_cli"
+        )
+        monkeypatch.setattr(marker_module, "STABLE_ROLES", stable_roles)
+        monkeypatch.setattr(
+            marker_module,
+            "CONTROL_ROLE_OWNER",
+            control_owner,
+        )
+        monkeypatch.setattr(
+            marker_module,
+            "ROLE_FUNCTIONS",
+            {purpose: () for purpose in stable_roles},
+        )
+        monkeypatch.setattr(marker_module, "MARKER_TABLES", ())
+        names = marker_module.role_names_for_generation(generation)
+        versioned_roles = tuple(names.versioned.values())
+
+        owner_url = make_url(target_admin_url).set(
+            username=control_owner,
+            password=owner_password,
+        ).render_as_string(hide_password=False)
+        deploy_url = make_url(target_admin_url).set(
+            username=deploy_migrator,
+            password=deploy_password,
+        ).render_as_string(hide_password=False)
+        owner_url_file = tmp_path / "control-owner-url"
+        owner_url_file.write_text(f"{owner_url}\n", encoding="utf-8")
+        owner_url_file.chmod(0o400)
+        monkeypatch.setenv(
+            marker_module.OWNER_URL_FILE_ENV,
+            str(owner_url_file),
+        )
+        state_dir = tmp_path / "marker-state"
+        arguments = [
+            "provision",
+            "--generation",
+            generation,
+            "--state-dir",
+            str(state_dir),
+        ]
+
+        assert await marker_module.run(arguments) == 4
+        failed = json.loads(capsys.readouterr().out)
+        assert failed == {
+            "reason_code": "marker_control_operation_failed",
+            "stage": "role_setup",
+            "status": "error",
+        }
+        assert not (state_dir / generation).exists()
+
+        owner_url_file.chmod(0o600)
+        owner_url_file.write_text(f"{deploy_url}\n", encoding="utf-8")
+        owner_url_file.chmod(0o400)
+
+        assert await marker_module.run(arguments) == 0
+        provisioned = json.loads(capsys.readouterr().out)
+        assert provisioned == {
+            "reason_code": "marker_control_roles_provisioned",
+            "roles": dict(names.versioned),
+            "status": "ok",
+        }
+
+        proof = await asyncpg.connect(_asyncpg_url(target_admin_url))
+        try:
+            memberships = await proof.fetch(
+                """
+                SELECT granted.rolname AS granted,
+                       membership.admin_option,
+                       membership.inherit_option,
+                       membership.set_option,
+                       pg_catalog.pg_has_role(
+                           $2::name, granted.oid, 'MEMBER'
+                       ) AS is_member,
+                       pg_catalog.pg_has_role(
+                           $2::name, granted.oid, 'USAGE'
+                       ) AS has_usage,
+                       pg_catalog.pg_has_role(
+                           $2::name, granted.oid, 'SET'
+                       ) AS can_set
+                FROM pg_catalog.pg_auth_members AS membership
+                JOIN pg_catalog.pg_roles AS granted
+                  ON granted.oid = membership.roleid
+                JOIN pg_catalog.pg_roles AS member
+                  ON member.oid = membership.member
+                WHERE granted.rolname = ANY($1::text[])
+                  AND member.rolname = $2
+                ORDER BY granted.rolname
+                """,
+                sorted(stable_roles.values()),
+                deploy_migrator,
+            )
+            assert len(memberships) == 3
+            assert all(
+                row["admin_option"]
+                and not row["inherit_option"]
+                and not row["set_option"]
+                and row["is_member"]
+                and not row["has_usage"]
+                and not row["can_set"]
+                for row in memberships
+            )
+            assert not await proof.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_auth_members "
+                "WHERE roleid = ANY($1::regrole[]) AND member = $2::regrole)",
+                sorted(stable_roles.values()),
+                control_owner,
+            )
+        finally:
+            await proof.close()
+
+        assert await marker_module.run(
+            [
+                "revoke",
+                "--generation",
+                generation,
+                "--state-dir",
+                str(state_dir),
+            ]
+        ) == 0
+        capsys.readouterr()
+    finally:
+        admin = await asyncpg.connect(_asyncpg_url(admin_url))
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'
+            )
+            for role_name in (
+                *versioned_roles,
+                control_owner,
+                deploy_migrator,
+                *stable_roles.values(),
+            ):
+                with suppress(asyncpg.PostgresError):
+                    await admin.execute(f'DROP ROLE IF EXISTS "{role_name}"')
+        finally:
+            await admin.close()

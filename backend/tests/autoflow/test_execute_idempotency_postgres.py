@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.autoflow import service as autoflow_service
@@ -20,6 +21,7 @@ from app.models.autoflow import AutoFlowPlan, AutoFlowRun, AutoFlowUsedClip
 from app.models.channel_agent import ChannelOpsQueueItem, ChannelProfile, ProductionTask
 from app.models.job import Job, JobStatus
 from app.models.pipeline import Pipeline
+from app.models.owned_seed_inventory import OwnedSeedInventory
 from app.models.schedule import RuntimeSchedule
 from app.orchestrator.engine import JobEngine
 from app.schemas.autoflow import (
@@ -106,6 +108,7 @@ async def sqlite_bound_execute_db(monkeypatch):
             AutoFlowUsedClip.__table__,
             ProductionTask.__table__,
             ChannelOpsQueueItem.__table__,
+            OwnedSeedInventory.__table__,
         ):
             await conn.run_sync(table.create)
 
@@ -194,7 +197,7 @@ async def _install_guarded_job(factory, plan) -> uuid.UUID:
             guarded_job_id=job.id,
             updated_by="guarded-autoflow-test",
         )
-        db.add(schedule)
+        await db.merge(schedule)
         await db.commit()
         return job.id
 
@@ -313,7 +316,7 @@ async def test_bound_execute_closed_window_creates_waiting_job_without_start(
     service, plan = await _approved_plan(factory, prompt="Bound closed-window canary")
     task_id, _queue_id, request = await _bound_execute_request(factory, plan)
     async with factory() as db:
-        db.add(
+        await db.merge(
             RuntimeSchedule(
                 service_name=VIDEO_SCHEDULE_SERVICE,
                 state=VideoScheduleState.CLOSED.value,
@@ -346,7 +349,7 @@ async def test_bound_execute_closed_window_parks_then_opens_exact_job(
     service, plan = await _approved_plan(factory, prompt="Guarded canary materialization")
     _task_id, _queue_id, request = await _bound_execute_request(factory, plan)
     async with factory() as db:
-        db.add(
+        await db.merge(
             RuntimeSchedule(
                 service_name=VIDEO_SCHEDULE_SERVICE,
                 state=VideoScheduleState.CLOSED.value,
@@ -873,7 +876,7 @@ async def test_r1_retry_rechecks_committed_key_before_live_r2_authority(postgres
     durable_r1_id = uuid.uuid4()
 
     async with factory() as schedule_db:
-        schedule_db.add(
+        await schedule_db.merge(
             RuntimeSchedule(
                 service_name=VIDEO_SCHEDULE_SERVICE,
                 state=VideoScheduleState.OPEN.value,
@@ -1021,10 +1024,11 @@ async def test_idempotent_execute_preserves_closed_window_and_replay_does_not_st
     _engine, factory, starts = postgres_idempotency_db
     service, plan = await _approved_plan(factory, prompt="Closed-window idempotent private upload")
     async with factory() as db:
-        await db.execute(
-            text(
-                "INSERT INTO runtime_schedules (service_name, state, updated_by) "
-                "VALUES ('videoprocess', 'CLOSED', 'idempotency-test')"
+        await db.merge(
+            RuntimeSchedule(
+                service_name=VIDEO_SCHEDULE_SERVICE,
+                state=VideoScheduleState.CLOSED.value,
+                updated_by="idempotency-test",
             )
         )
         await db.commit()
@@ -1045,6 +1049,10 @@ async def test_idempotent_execute_preserves_closed_window_and_replay_does_not_st
         job = await db.get(Job, first.job_id)
         assert job is not None
         assert job.status == JobStatus.WAITING_WINDOW
+        schedule = await db.get(RuntimeSchedule, VIDEO_SCHEDULE_SERVICE)
+        assert schedule is not None
+        assert schedule.state == VideoScheduleState.CLOSED.value
+        assert schedule.guarded_job_id is None
 
 
 async def test_execute_first_holds_plan_authority_until_patch_commits_afterward(
@@ -1071,6 +1079,8 @@ async def test_execute_first_holds_plan_authority_until_patch_commits_afterward(
     monkeypatch.setattr(service_module, "create_pipeline", blocked_create_pipeline)
 
     async with factory() as execute_db, factory() as patch_db:
+        execute_pid = await execute_db.scalar(text("SELECT pg_backend_pid()"))
+        patch_pid = await patch_db.scalar(text("SELECT pg_backend_pid()"))
         execution = asyncio.create_task(service.execute(request, execute_db))
         await asyncio.wait_for(entered_pipeline_create.wait(), timeout=5)
         patch = asyncio.create_task(
@@ -1086,7 +1096,21 @@ async def test_execute_first_holds_plan_authority_until_patch_commits_afterward(
             )
         )
         try:
-            await _wait_until_lock_wait(engine, "autoflow_plans", patch)
+            # Producer authority locks schedule before plan; patch waits there first.
+            await _wait_until_lock_wait(engine, "runtime_schedules", patch)
+            async with engine.connect() as conn:
+                assert execute_pid in await conn.scalar(
+                    text("SELECT pg_blocking_pids(:patch_pid)"), {"patch_pid": patch_pid}
+                )
+            async with factory() as probe_db:
+                with pytest.raises(DBAPIError) as blocked:
+                    await probe_db.execute(
+                        select(AutoFlowPlan.id)
+                        .where(AutoFlowPlan.id == uuid.UUID(plan.plan_id))
+                        .with_for_update(nowait=True)
+                    )
+                assert blocked.value.orig.sqlstate == "55P03"
+                await probe_db.rollback()
             release_pipeline_create.set()
             run = await execution
             patched = await patch
@@ -1095,6 +1119,8 @@ async def test_execute_first_holds_plan_authority_until_patch_commits_afterward(
             await asyncio.gather(execution, patch, return_exceptions=True)
 
     assert run.job_id is not None
+    assert run.publish["approved_revision_hash"] == plan.approved_revision_hash
+    assert run.publish["approved_revision"] == plan.approved_revision
     assert patched is not None
     assert patched.approved_revision_hash is None
     assert patched.approved_revision is None

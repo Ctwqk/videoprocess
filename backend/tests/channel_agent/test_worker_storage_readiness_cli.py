@@ -76,6 +76,84 @@ async def test_run_requires_artifact_api_when_flag_is_present(
 
 
 @pytest.mark.asyncio
+async def test_run_uses_worker_database_secret_for_shared_janitor_status(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Engine:
+        def __init__(self) -> None:
+            self.disposed = False
+
+        async def dispose(self) -> None:
+            self.disposed = True
+
+    engine = Engine()
+    session_factory = object()
+
+    class StatusStore:
+        def __init__(self, actual_session_factory):
+            assert actual_session_factory is session_factory
+
+        async def readiness(
+            self,
+            *,
+            max_age_seconds,
+            stale_run_seconds,
+        ):
+            return "ready"
+
+    async def probe(env, *, require_artifact_api, staging_janitor_probe):
+        assert env is os.environ
+        assert require_artifact_api is False
+        assert (
+            await staging_janitor_probe(
+                max_age_seconds=900,
+                stale_run_seconds=600,
+            )
+            == "ready"
+        )
+        return READY_RESULT
+
+    monkeypatch.setenv("VP_REQUIRE_STAGING_JANITOR", "true")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        cli,
+        "load_worker_database_url",
+        lambda env: (
+            "postgresql+asyncpg://worker:secret@database/videoprocess"
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "create_async_engine",
+        lambda url, **kwargs: engine,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "async_sessionmaker",
+        lambda actual_engine, **kwargs: (
+            session_factory
+            if actual_engine is engine
+            else None
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "StagingJanitorStatusStore",
+        StatusStore,
+        raising=False,
+    )
+    monkeypatch.setattr(cli, "probe_worker_storage", probe)
+
+    assert await cli.run([]) == 0
+    assert engine.disposed
+    assert capsys.readouterr().out == READY_STDOUT
+
+
+@pytest.mark.asyncio
 async def test_run_sanitizes_readiness_failure(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

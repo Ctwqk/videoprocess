@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "kind": "offline_assumption_model_not_live_qualification",
+  "starts_at": "2026-09-11T08:00:00+00:00",
+  "expires_at": "2026-09-18T08:00:00+00:00",
+  "open_hour": 8,
+  "drain_hour": 13,
+  "close_hour": 14,
+  "maximum_items": 7,
+  "minimum_interval_seconds": 86400,
+  "observation_required_seconds": 604800,
+  "assumed_bounds_seconds": {"tick_and_queue": 120, "upload_completion": 1200, "normal_settlement": 5700},
+  "cases": [
+    {
+      "name": "minute_worst_phase_and_queue",
+      "poll_seconds": 60,
+      "queue_seconds": 60,
+      "upload_seconds": 1200,
+      "settlement_seconds": 5700,
+      "missed_days": [],
+      "admission_minutes": [2, 1464, 2926, 4388, 5850, 7312, 8774],
+      "last_completion_minute": 8794,
+      "last_settlement_minute": 8889,
+      "fits_assumptions": true
+    },
+    {
+      "name": "hourly_poll_accumulates_rounding_and_misses_window",
+      "poll_seconds": 3600,
+      "queue_seconds": 60,
+      "upload_seconds": 1200,
+      "settlement_seconds": 5700,
+      "missed_days": [],
+      "admission_minutes": [61, 1561, 3061, 4561, 7261, 8761],
+      "last_completion_minute": 8781,
+      "last_settlement_minute": 8876,
+      "fits_assumptions": false
+    },
+    {
+      "name": "missed_third_open_window_is_not_backfilled",
+      "poll_seconds": 60,
+      "queue_seconds": 60,
+      "upload_seconds": 1200,
+      "settlement_seconds": 5700,
+      "missed_days": [3],
+      "admission_minutes": [2, 1464, 4322, 5784, 7246, 8708],
+      "last_completion_minute": 8728,
+      "last_settlement_minute": 8823,
+      "fits_assumptions": false
+    },
+    {
+      "name": "completion_bound_exceeded_is_not_qualification",
+      "poll_seconds": 60,
+      "queue_seconds": 60,
+      "upload_seconds": 7200,
+      "settlement_seconds": 5700,
+      "missed_days": [],
+      "admission_minutes": [2, 1564, 3126, 5762, 7324, 8886],
+      "last_completion_minute": 9006,
+      "last_settlement_minute": 9101,
+      "fits_assumptions": false
+    },
+    {
+      "name": "late_settlement_keeps_slot_after_cooldown",
+      "poll_seconds": 60,
+      "queue_seconds": 60,
+      "upload_seconds": 1200,
+      "settlement_seconds": 90000,
+      "missed_days": [],
+      "admission_minutes": [2, 1524, 3046, 4568, 7202, 8724],
+      "last_completion_minute": 8744,
+      "last_settlement_minute": 10244,
+      "fits_assumptions": false
+    }
+  ]
+}
