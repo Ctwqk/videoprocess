@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 import runpy
 import subprocess
@@ -51,3 +52,37 @@ def test_new_revision_only_replaces_existing_wrappers_after_validation():
         assert "SECURITY DEFINER\nSET search_path = pg_catalog" in sql
         assert sql.index("worker_signal_identity_invalid") < sql.index(".retire(")
         assert sql.index(".validate_target(") < sql.index(".retire(")
+
+
+def test_session_signal_operator_fixture_uses_its_migration_allowlist():
+    backend = Path(__file__).resolve().parents[2]
+    fixtures = backend / "tests/migrations"
+    source = ast.parse((fixtures / "test_worker_session_signal_postgres.py").read_text())
+    case = next(
+        node for node in source.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "test_real_operator_stable_allowlist_supports_repeated_drain"
+    )
+    loop = next(node for node in ast.walk(case) if isinstance(node, ast.For))
+    assert isinstance(loop.iter, ast.Name), "036 fixture must not iterate current ROLE_FUNCTIONS"
+    signatures = next(
+        node.value for node in source.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == loop.iter.id for target in node.targets)
+    )
+    migration = runpy.run_path(str(backend / "alembic/versions/034_worker_registrations.py"))
+    expected = tuple(
+        migration[name].removeprefix("public.")
+        for name in (
+            "GRANT_UPSERT_SIGNATURE", "GRANT_ACTIVATE_SIGNATURE", "GRANT_REVOKE_SIGNATURE",
+            "REGISTRATION_REVOKE_SIGNATURE", "REGISTRATION_EXPIRE_SIGNATURE",
+        )
+    )
+    assert ast.literal_eval(signatures) == expected
+    owner_fixture = ast.parse((fixtures / "test_worker_operator_creator_edges_postgres.py").read_text())
+    target_revision = next(
+        node.value for node in owner_fixture.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "TARGET_REVISION" for target in node.targets)
+    )
+    assert ast.literal_eval(target_revision) == "036_worker_session_signal"
