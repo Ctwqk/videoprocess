@@ -174,6 +174,21 @@ fi
 if [[ -z "${VP_PYTHON_WORKER_DATABASE_URL:-}" ]]; then
   configuration_error database_credential_missing
 fi
+owned_history_redis_url_file="${OWNED_HISTORY_REDIS_URL_FILE:-}"
+if [[ -n "$owned_history_redis_url_file" ]]; then
+  # Keep the source a single unambiguous Docker --mount CSV field.
+  if [[ ! "$owned_history_redis_url_file" =~ ^/[a-zA-Z0-9._/-]+$ ]] \
+    || [[ ! -f "$owned_history_redis_url_file" || -L "$owned_history_redis_url_file" ]]; then
+    configuration_error invalid_owned_history_redis_url_file
+  fi
+  if ! redis_file_mode="$(stat -c '%a' "$owned_history_redis_url_file" 2>/dev/null)" \
+    && ! redis_file_mode="$(stat -f '%Lp' "$owned_history_redis_url_file" 2>/dev/null)"; then
+    configuration_error invalid_owned_history_redis_url_file
+  fi
+  if [[ "$redis_file_mode" != 400 ]]; then
+    configuration_error invalid_owned_history_redis_url_file
+  fi
+fi
 
 services='vp-api-swarm
 vp-frontend-swarm
@@ -389,7 +404,19 @@ fi
 guard_args=(
   run --rm
   --env DATABASE_URL
-  --env REDIS_URL
+)
+if [[ -n "$owned_history_redis_url_file" ]]; then
+  guard_args+=(
+    --mount "type=bind,source=$owned_history_redis_url_file,target=/run/secrets/owned-history-redis-url,readonly"
+    --env OWNED_HISTORY_REDIS_URL_FILE
+  )
+  export OWNED_HISTORY_REDIS_URL_FILE=/run/secrets/owned-history-redis-url
+  unset REDIS_URL
+else
+  guard_args+=(--env REDIS_URL)
+  export REDIS_URL="${REDIS_URL:-}"
+fi
+guard_args+=(
   "$trusted_python_image"
   python -m app.channel_agent.soak_guard_cli
   --channel-id "$channel_id"
@@ -406,9 +433,6 @@ if [[ "$auto_hold" == "true" ]]; then
 fi
 
 export DATABASE_URL="$VP_PYTHON_WORKER_DATABASE_URL"
-# The typed profile rechecks retired evidence using the existing named reader.
-# Pass credentials only through the environment, never Docker arguments/logs.
-export REDIS_URL="${REDIS_URL:-}"
 unset VP_PYTHON_WORKER_DATABASE_URL
 
 guard_exit=0
