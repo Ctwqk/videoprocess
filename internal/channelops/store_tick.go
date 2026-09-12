@@ -478,8 +478,12 @@ func (s *Store) insertProductionTask(ctx context.Context, db dbExecutor, channel
 	snapshot := channelConfigSnapshot(channel, candidate)
 	approvalEvidence := map[string]any{}
 	if candidate.owned != nil {
+		if err := requireOwnedCandidatePolicy(channel, candidate); err != nil {
+			return "", err
+		}
 		approvalEvidence["owned_inventory"] = ownedTaskEvidence(candidate)
 		approvalEvidence["candidate_pds"] = candidate.PDSDecisionJSON
+		approvalEvidence["candidate_pds_request"] = candidate.PDSRequestJSON
 	}
 	approvalJSON, err := json.Marshal(approvalEvidence)
 	if err != nil {

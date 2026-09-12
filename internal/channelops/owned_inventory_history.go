@@ -1572,7 +1572,21 @@ func historyAssessRetired(rows, c map[string]any, snapshot ownedHistorySnapshot,
 	return historySorted(sourceHashes), []string{historyString(op["content_sha256"])}, paths
 }
 
-func assessOwnedHistorySnapshot(snapshot ownedHistorySnapshot, now time.Time) (result ownedHistoryAssessment) {
+func assessOwnedHistorySnapshot(snapshot ownedHistorySnapshot, now time.Time) ownedHistoryAssessment {
+	return assessOwnedHistory(snapshot, now, "")
+}
+
+// Only the current task's cooldown/outstanding pass is excluded. Its operations
+// remain in complete identity classification and retained-proof validation.
+func assessOwnedProducerHistory(snapshot ownedHistorySnapshot, now time.Time, currentTaskID string) ownedHistoryAssessment {
+	if currentTaskID == "" {
+		reason := "owned_inventory_producer_missing"
+		return historyEmptyAssessment(&reason)
+	}
+	return assessOwnedHistory(snapshot, now, currentTaskID)
+}
+
+func assessOwnedHistory(snapshot ownedHistorySnapshot, now time.Time, currentTaskID string) (result ownedHistoryAssessment) {
 	result = historyEmptyAssessment(nil)
 	defer func() {
 		if p := recover(); p != nil {
@@ -1588,6 +1602,7 @@ func assessOwnedHistorySnapshot(snapshot ownedHistorySnapshot, now time.Time) (r
 	historyRequire(age >= 0 && age <= 60*time.Second, "owned_history_observation_stale")
 	rows := snapshot.rows()
 	tasks, accounts, channels := historyIndex(rows["production_tasks"]), historyIndex(rows["publishing_accounts"]), historyIndex(rows["channel_profiles"])
+	historyRequire(currentTaskID == "" || tasks[currentTaskID] != nil, "owned_inventory_producer_missing")
 	bindings, cert, authority := historyApprovedAuthority(rows, now)
 	if cert != nil {
 		result.RetiredSourceSHA256, result.RetiredRenderSHA256, result.TerminalPaths = historyAssessRetired(rows, cert, snapshot, now)
@@ -1643,6 +1658,9 @@ func assessOwnedHistorySnapshot(snapshot ownedHistorySnapshot, now time.Time) (r
 	}
 	stable := []any{}
 	for _, id := range historySortedKeys(tasks) {
+		if id == currentTaskID {
+			continue
+		}
 		task := tasks[id]
 		item := items[id]
 		if !members[historyReference(task["target_account_id"])] && item == nil {

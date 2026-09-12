@@ -101,7 +101,7 @@ func TestOwnedPythonContenderBridge(t *testing.T) {
 			}
 			released = true
 		}
-		return PDSDecision{Verdict: "allow", DecisionID: "scratch-contender"}, nil
+		return ownedProducerRealDecision(), nil
 	})}
 	err = h.HandleAgentTick(ctx, *item)
 	if os.Getenv("OWNED_PYTHON_CONTENDER_MODE") == "leader_loss" {

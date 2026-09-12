@@ -1120,7 +1120,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionFails(t *testing.T) {
 		t.Fatalf("RunTick: %v", err)
 	}
 	task := fixture.RequireSingleTask(ctx)
-	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
+	if err := markTaskPlanningWithNativeTestFence(ctx, fixture.Store, task, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
 	item := claimQueuedKindForTest(t, ctx, fixture, QueueExecuteTask)
@@ -1154,9 +1154,9 @@ func TestHandleExecuteTaskRejectsMissingOrMismatchedDurableAuthorityBeforeAutoFl
 				t.Fatalf("RunTick: %v", err)
 			}
 			task := fixture.RequireSingleTask(ctx)
-			if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(
+			if err := markTaskPlanningWithNativeTestFence(
 				ctx,
-				task.ID,
+				fixture.Store, task,
 				"00000000-0000-0000-0000-000000000101",
 				map[string]any{},
 				testApprovalObservation(),
@@ -1209,7 +1209,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingRunID(t *testing.
 		t.Fatalf("RunTick: %v", err)
 	}
 	task := fixture.RequireSingleTask(ctx)
-	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
+	if err := markTaskPlanningWithNativeTestFence(ctx, fixture.Store, task, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
 	item := claimQueuedKindForTest(t, ctx, fixture, QueueExecuteTask)
@@ -1236,7 +1236,7 @@ func TestHandleExecuteTaskFailsTaskWhenAutoFlowExecutionMissingJobID(t *testing.
 		t.Fatalf("RunTick: %v", err)
 	}
 	task := fixture.RequireSingleTask(ctx)
-	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
+	if err := markTaskPlanningWithNativeTestFence(ctx, fixture.Store, task, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
 	item := claimQueuedKindForTest(t, ctx, fixture, QueueExecuteTask)
@@ -1265,7 +1265,7 @@ func TestHandleObserveJobRequiresRunIDPayload(t *testing.T) {
 	task := fixture.RequireSingleTask(ctx)
 	runID := "00000000-0000-0000-0000-000000000201"
 	jobID := "00000000-0000-0000-0000-000000000301"
-	if err := fixture.Store.MarkTaskPlanningAndEnqueueExecute(ctx, task.ID, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
+	if err := markTaskPlanningWithNativeTestFence(ctx, fixture.Store, task, "00000000-0000-0000-0000-000000000101", map[string]any{}, testApprovalObservation(), ""); err != nil {
 		t.Fatalf("MarkTaskPlanningAndEnqueueExecute: %v", err)
 	}
 	if err := fixture.Store.MarkTaskProducingAndEnqueueObserve(ctx, task.ID, runID, jobID, ""); err != nil {

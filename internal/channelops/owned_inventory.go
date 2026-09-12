@@ -562,6 +562,10 @@ func (s *Store) finalizeOwnedTick(ctx context.Context, before, current tickPrepa
 	}
 	candidate := *state.Candidate
 	candidate.PDSDecisionJSON = candidates[0].PDSDecisionJSON
+	candidate.PDSRequestJSON = candidates[0].PDSRequestJSON
+	if err := requireOwnedCandidatePolicy(current.Channel, candidate); err != nil {
+		return s.holdOwnedInventory(ctx, current, "owned_inventory_pds_denied", candidates)
+	}
 	result := TickResult{Accepted: []TickCandidate{candidate}}
 	db := s.db()
 	audit, err := s.insertTickAudit(ctx, db, current.ChannelID, current.Bucket, result, map[string]any{"handler_version": "go", "owned_inventory_id": state.InventoryID, "manifest_sha256": candidate.owned.ManifestSHA})

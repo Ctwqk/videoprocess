@@ -739,7 +739,7 @@ func TestOwnedPDSUnavailableAndFallbackCloseAdmission(t *testing.T) {
 					if mode == "error" {
 						return PDSDecision{}, errors.New("fake policy failure")
 					}
-					decision := PDSDecision{Verdict: mode, DecisionID: "fixture-decision", RulesVersion: "fixture-rules"}
+					decision := PDSDecision{Verdict: mode, DecisionID: "fixture-decision", RulesVersion: "fixture-rules", EvaluatedRules: []string{"owned_source"}, Metadata: map[string]any{}}
 					if mode == "empty" {
 						decision.Verdict = ""
 					}

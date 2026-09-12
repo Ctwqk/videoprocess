@@ -57,6 +57,26 @@ func (s *Store) ReservePromotionOperation(
 	if strings.TrimSpace(publication.PlatformContentID) == "" {
 		return PromotionOperationRow{}, fmt.Errorf("%w: platform video id is required", ErrPromotionOperationConflict)
 	}
+	current, task, err := s.LockPromotionOperatorScope(ctx, publication.ID)
+	if err != nil {
+		return PromotionOperationRow{}, err
+	}
+	producer, err := s.lockOwnedProducer(ctx, task, "")
+	if err != nil {
+		return PromotionOperationRow{}, err
+	}
+	if producer != nil && producer.Identity.InventoryID != "" {
+		prepared, err := newPreparedPublicationSnapshot(publication, task)
+		if err != nil {
+			return PromotionOperationRow{}, err
+		}
+		if err := prepared.validate(current, task); err != nil {
+			return PromotionOperationRow{}, err
+		}
+		if err := requireOwnedPromotionPolicy(current, task, privacy, decision); err != nil {
+			return PromotionOperationRow{}, err
+		}
+	}
 	if scheduledAt.IsZero() {
 		scheduledAt = s.Now().UTC()
 	}
@@ -114,6 +134,30 @@ func (s *Store) BeginPromotionSubmission(
 ) (PromotionOperationRow, bool, error) {
 	if err := requireUUID("promotion_operation_id", operationID); err != nil {
 		return PromotionOperationRow{}, false, err
+	}
+	existing, err := s.getPromotionOperation(ctx, operationID, false)
+	if err != nil {
+		return PromotionOperationRow{}, false, err
+	}
+	publication, task, err := s.LockPromotionOperatorScope(ctx, existing.PublicationID)
+	if err != nil {
+		return PromotionOperationRow{}, false, err
+	}
+	existing, err = s.LockPromotionOperation(ctx, operationID)
+	if err != nil {
+		return PromotionOperationRow{}, false, err
+	}
+	if existing.Status != PromotionReserved {
+		return existing, false, nil
+	}
+	producer, err := s.lockOwnedProducer(ctx, task, "")
+	if err != nil {
+		return PromotionOperationRow{}, false, err
+	}
+	if producer != nil && producer.Identity.InventoryID != "" {
+		if err := requireOwnedPromotionPolicy(publication, task, existing.TargetPrivacy, existing.Decision); err != nil {
+			return PromotionOperationRow{}, false, err
+		}
 	}
 	now := s.Now().UTC()
 	operation, err := scanPromotionOperation(s.db().QueryRow(ctx, `
