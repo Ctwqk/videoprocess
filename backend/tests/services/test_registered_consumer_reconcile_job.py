@@ -16,6 +16,7 @@ import pytest
 
 from app.services.registered_consumer_reconcile import EvalCommand
 from tests.services.test_registered_consumer_reconcile import decode, document
+from tests.services.test_registered_consumer_reconcile import facts, NOW
 
 
 def module():
@@ -50,6 +51,538 @@ def setup_protocol(tmp_path):
     request = invocation()
     binding = job.make_binding(request, files, descriptor_sha256="e" * 64)
     return job, request, files, binding
+
+
+def test_capture_uses_complete_active_registration_and_grant_facts():
+    job = module()
+    payload = document()
+    registrations, grants = facts(payload)
+    current_ids = {worker.current.registration_id for worker in decode().workers}
+    current = [row for row in registrations if row.id in current_ids]
+    current_grants = [row for row in grants if row.id in {r.grant_id for r in current}]
+    captured = job.capture_snapshot(current, current_grants, now=NOW)
+    assert captured["workers"] == [item["current"] for item in payload["workers"]]
+    assert job.capture_snapshot([], [], now=NOW)["workers"] == [None] * 4
+
+
+@pytest.mark.parametrize("fault", ["extra", "grant", "lease", "binding", "revoked"])
+def test_capture_refuses_ambiguous_or_unready_predecessor(fault):
+    job = module()
+    registrations, grants = facts(document())
+    current_ids = {worker.current.registration_id for worker in decode().workers}
+    registrations = [row for row in registrations if row.id in current_ids]
+    grants = [row for row in grants if row.id in {r.grant_id for r in registrations}]
+    if fault == "extra":
+        registrations.append(copy.copy(registrations[0]))
+    elif fault == "grant":
+        grants.pop()
+    elif fault == "lease":
+        registrations[0].lease_expires_at = NOW
+    elif fault == "binding":
+        grants[0].database_principal = "other"
+    else:
+        registrations[0].revoked_at = NOW
+    with pytest.raises(job.ProtocolError):
+        job.capture_snapshot(registrations, grants, now=NOW)
+
+
+def managed_spec(job, binding):
+    return job.managed_spec(
+        binding,
+        image="vp-ffmpeg-worker-python:deploy-" + binding["release_commit"][:12],
+        network_id="n" * 25,
+        manager_node="ccttww-lap",
+        manager_node_id="m" * 25,
+        pins_secret_id="p" * 25,
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "user",
+        "env",
+        "mount",
+        "secret",
+        "network",
+        "replicas",
+        "restart",
+        "command",
+        "write_root",
+        "group",
+        "port",
+        "force",
+    ],
+)
+def test_managed_descriptor_has_only_exact_mounts_and_authority(tmp_path, fault):
+    job, _, _, binding = setup_protocol(tmp_path)
+    expected = managed_spec(job, binding)
+    actual = copy.deepcopy(expected)
+    container = actual["TaskTemplate"]["ContainerSpec"]
+    if fault == "user":
+        container["User"] = "0"
+    elif fault == "env":
+        container["Env"] = ["DATABASE_URL=forbidden"]
+    elif fault == "mount":
+        container["Mounts"].append({"Source": "/var/run/docker.sock"})
+    elif fault == "secret":
+        container["Secrets"][0]["SecretID"] = "x" * 25
+    elif fault == "network":
+        actual["TaskTemplate"]["Networks"][0]["Target"] = "x" * 25
+    elif fault == "replicas":
+        actual["Mode"]["ReplicatedJob"]["MaxConcurrent"] = 2
+    elif fault == "restart":
+        actual["TaskTemplate"]["RestartPolicy"]["Condition"] = "any"
+    elif fault == "command":
+        container["Args"].append("--other")
+    elif fault == "write_root":
+        container["ReadOnly"] = False
+    elif fault == "group":
+        container["Groups"] = [str(os.getgid())]
+    elif fault == "port":
+        actual["EndpointSpec"] = {"Ports": [{"PublishedPort": 8080}]}
+    elif fault == "force":
+        actual["TaskTemplate"]["ForceUpdate"] = 1
+    if fault is None:
+        job.validate_managed_spec(actual, expected)
+        assert len(container["Mounts"]) == 3 and len(container["Secrets"]) == 3
+        assert not any("transactions" in item["Target"] for item in container["Mounts"])
+    else:
+        with pytest.raises(job.ProtocolError):
+            job.validate_managed_spec(actual, expected)
+
+
+@pytest.mark.asyncio
+async def test_fixed_entry_awaits_actual_unit2_and_preserves_result(
+    tmp_path, monkeypatch
+):
+    job, request, files, binding = setup_protocol(tmp_path)
+    monkeypatch.setattr(job, "require_writer_identity", lambda *args: None)
+    from app.services import registered_consumer_reconcile_runtime as runtime
+
+    entered = []
+
+    async def reconcile(invocation, authority):
+        assert type(invocation) is runtime.Invocation
+        assert invocation.pins.sha256 == request.pins.sha256
+        assert type(authority) is job.FileAuthority
+        entered.append(True)
+        return runtime.RunResult("already_absent", invocation.pins.sha256, ())
+
+    async def finished(self, invocation, outcome):
+        assert entered == [True] and outcome == "already_absent"
+        entered.append("finished")
+
+    monkeypatch.setattr(runtime, "reconcile_registered_consumers", reconcile)
+    monkeypatch.setattr(job.FileAuthority, "finished", finished)
+    result = await job.run_managed(binding, files)
+    assert entered == [True, "finished"] and result["pin_sha256"] == request.pins.sha256
+    assert result["outcome"] == "already_absent"
+
+
+@pytest.mark.parametrize(
+    "state,allowed",
+    [
+        ("unused", True),
+        ("retired", True),
+        ("already_absent", True),
+        ("consumed", False),
+        ("unknown", False),
+    ],
+)
+def test_finish_is_durable_only_after_known_results_and_never_reopens(
+    tmp_path, state, allowed
+):
+    job, _, _, binding = setup_protocol(tmp_path)
+    record = job.new_record(binding)
+    if state != "unused":
+        first = frame(
+            job,
+            binding,
+            action="before_eval",
+            stream="vp:tasks:ffmpeg_go",
+            command_sha256=binding["commands"]["vp:tasks:ffmpeg_go"],
+        )
+        prefix = job.canonical(first)
+        record = job.advance_record(record, first, prefix)
+        if state != "consumed":
+            second = frame(
+                job,
+                binding,
+                2,
+                "after_eval",
+                stream="vp:tasks:ffmpeg_go",
+                command_sha256=binding["commands"]["vp:tasks:ffmpeg_go"],
+                outcome=state,
+                nonce="e" * 32,
+            )
+            prefix += job.canonical(second)
+            record = job.advance_record(record, second, prefix)
+    else:
+        prefix = b""
+    finish = frame(
+        job,
+        binding,
+        record["sequence"] + 1,
+        "finished",
+        outcome="already_absent" if state == "unused" else "reconciled",
+        nonce="d" * 32,
+    )
+    if not allowed:
+        with pytest.raises(job.ProtocolError):
+            job.advance_record(record, finish, prefix + job.canonical(finish))
+        return
+    prefix += job.canonical(finish)
+    record = job.advance_record(record, finish, prefix)
+    assert record["last_request"]["action"] == "finished"
+    more = frame(job, binding, record["sequence"] + 1, nonce="c" * 32)
+    with pytest.raises(job.ProtocolError):
+        job.advance_record(record, more, prefix + job.canonical(more))
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reader_is_selective_readonly_rr_and_uses_db_clock():
+    job = module()
+    calls = []
+
+    class Transaction:
+        async def __aenter__(self):
+            calls.append("begin")
+
+        async def __aexit__(self, *args):
+            calls.append("end")
+
+    class Connection:
+        def transaction(self, **kwargs):
+            assert kwargs == {"isolation": "repeatable_read", "readonly": True}
+            return Transaction()
+
+        async def fetchval(self, sql):
+            assert sql == "SELECT transaction_timestamp()"
+            return NOW
+
+        async def fetch(self, sql, services):
+            assert "token_sha256" not in sql and "*" not in sql
+            assert "FOR UPDATE" not in sql and "FOR SHARE" not in sql
+            assert set(services) == job.SERVICES
+            calls.append(sql)
+            return []
+
+    result = await job.read_snapshot(Connection())
+    assert result == {"observed_at": NOW.isoformat(), "workers": [None] * 4}
+    assert calls[0] == "begin" and calls[-1] == "end" and len(calls) == 4
+
+
+def test_capture_builds_current_pins_only_from_preserved_baseline():
+    job = module()
+    payload = document()
+    snapshot = {
+        "observed_at": NOW.isoformat(),
+        "workers": [w["current"] for w in payload["workers"]],
+    }
+    baseline = {
+        "observed_at": NOW.isoformat(),
+        "workers": [w["predecessor"] for w in payload["workers"]],
+    }
+    result = job.build_capture_pins(
+        snapshot,
+        baseline,
+        transaction_id=payload["transaction_id"],
+        revision=payload["revision"],
+        release_commit=payload["release_commit"],
+    )
+    assert result["pin_json"] == decode().canonical_json
+    assert result["pin_sha256"] == decode().sha256
+    assert set(result["commands"]) == set(job.STREAMS.values())
+    baseline["workers"][0] = snapshot["workers"][0]
+    with pytest.raises(job.ProtocolError):
+        job.build_capture_pins(
+            snapshot,
+            baseline,
+            transaction_id=payload["transaction_id"],
+            revision=payload["revision"],
+            release_commit=payload["release_commit"],
+        )
+
+
+def test_fresh_baseline_absence_does_not_manufacture_retiring_commands():
+    job = module()
+    payload = document()
+    snapshot = {
+        "observed_at": NOW.isoformat(),
+        "workers": [w["current"] for w in payload["workers"]],
+    }
+    baseline = {"observed_at": NOW.isoformat(), "workers": [None] * 4}
+    result = job.build_capture_pins(
+        snapshot,
+        baseline,
+        transaction_id=payload["transaction_id"],
+        revision=payload["revision"],
+        release_commit=payload["release_commit"],
+    )
+    assert result["commands"] == {}
+
+
+def test_finished_record_cannot_reload_with_unknown_or_consumed_results(tmp_path):
+    job, _, _, binding = setup_protocol(tmp_path)
+    finish = frame(job, binding, action="finished", outcome="already_absent")
+    state = job.advance_record(job.new_record(binding), finish, job.canonical(finish))
+    for outcome in ("consumed", "unknown", "retired"):
+        altered = copy.deepcopy(state)
+        altered["streams"]["vp:tasks:ffmpeg_go"] = outcome
+        with pytest.raises(job.ProtocolError):
+            job.validate_record(altered)
+
+
+def test_capture_descriptor_cannot_execute_reconcile_or_mount_extra_authority(tmp_path):
+    job, _, files, binding = setup_protocol(tmp_path)
+    spec = job.capture_spec(
+        attempt_id=binding["attempt_id"],
+        transaction_id=binding["transaction_id"],
+        files=files,
+        credentials=binding["credentials"],
+        image="vp-ffmpeg-worker-python:deploy-" + binding["release_commit"][:12],
+        network_id="n" * 25,
+        manager_node="ccttww-lap",
+        manager_node_id="m" * 25,
+        capture_read=dict(
+            id="r" * 25,
+            name="vp-registered-read-" + binding["transaction_id"],
+            sha256="a" * 64,
+            principal="vp_deploy_read",
+        ),
+    )
+    container = spec["TaskTemplate"]["ContainerSpec"]
+    assert container["Args"][-1] == "--capture"
+    assert len(container["Secrets"]) == 3
+    assert container["Secrets"][-1]["File"] == dict(
+        Name="registered-reconcile-capture-read", UID="10001", GID="10001", Mode=0o400
+    )
+    assert all(
+        secret["File"]["Name"] != "registered-reconcile-capture-read"
+        for secret in managed_spec(job, binding)["TaskTemplate"]["ContainerSpec"][
+            "Secrets"
+        ]
+    )
+    assert container["User"] == "10001:10001"
+    assert len(container["Mounts"]) == 3
+
+
+def test_input_and_capture_output_are_exact_private_inodes(tmp_path, monkeypatch):
+    job, _, files, binding = setup_protocol(tmp_path)
+    payload = {"binding": binding, "files": files}
+    path = tmp_path / "attempt/input.json"
+    metadata = job.write_input(path, payload)
+    assert path.stat().st_mode & 0o777 == 0o644
+    assert job.read_input(path, metadata) == payload
+    with pytest.raises(job.ProtocolError):
+        job.write_input(path, payload)
+    path.unlink()
+    path.write_bytes(job.canonical(payload))
+    path.chmod(0o644)
+    with pytest.raises(job.ProtocolError):
+        job.read_input(path, metadata)
+
+
+@pytest.mark.parametrize(
+    "state,exit_code,expected",
+    [
+        ("running", None, None),
+        ("complete", 0, 0),
+        ("failed", 7, 7),
+        ("failed", 0, "error"),
+        ("orphaned", None, "error"),
+        ("shutdown", None, "error"),
+    ],
+)
+def test_terminal_task_is_evidence_not_waiter_returncode(
+    tmp_path, state, exit_code, expected
+):
+    job, _, _, binding = setup_protocol(tmp_path)
+    spec = managed_spec(job, binding)
+    task = {
+        "ID": "t" * 25,
+        "ServiceID": "s" * 25,
+        "NodeID": "m" * 25,
+        "Spec": spec["TaskTemplate"],
+        "Status": {"State": state, "ContainerStatus": {"ExitCode": exit_code}},
+    }
+    if expected == "error":
+        with pytest.raises(job.ProtocolError):
+            job.task_exit(task, "s" * 25, spec)
+    else:
+        assert job.task_exit(task, "s" * 25, spec) == expected
+        task["ServiceID"] = "x" * 25
+        with pytest.raises(job.ProtocolError):
+            job.task_exit(task, "s" * 25, spec)
+
+
+def test_task_must_actually_run_on_the_captured_manager_node(tmp_path):
+    job, _, _, binding = setup_protocol(tmp_path)
+    spec = managed_spec(job, binding)
+    spec["Labels"]["vp.manager-node-id"] = "m" * 25
+    task = dict(
+        ID="t" * 25,
+        ServiceID="s" * 25,
+        NodeID="x" * 25,
+        Spec=spec["TaskTemplate"],
+        Status={"State": "running"},
+    )
+    with pytest.raises(job.ProtocolError):
+        job.task_exit(task, "s" * 25, spec)
+
+
+def test_cleanup_preserves_raw_bytes_and_only_removes_bound_names(tmp_path):
+    job, _, files, binding = setup_protocol(tmp_path)
+    input_file = job.write_input(tmp_path / "attempt/input.json", {"binding": binding})
+    raw = b'{"unchanged":"raw"}\n'
+    Path(files["request"]["path"]).write_bytes(raw)
+    Path(files["replies"]["path"], "reply.json").write_bytes(b"{}\n")
+    unrelated = tmp_path / "unrelated"
+    unrelated.write_bytes(b"retained")
+    job.retain_managed_files(files, input_file)
+    assert not Path(files["request"]["path"]).exists()
+    assert (tmp_path / "attempt/retained-requests").read_bytes() == raw
+    assert unrelated.read_bytes() == b"retained"
+    job.retain_managed_files(files, input_file)
+    Path(files["request"]["path"]).write_bytes(b"replacement")
+    with pytest.raises(job.ProtocolError):
+        job.retain_managed_files(files, input_file)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "hash",
+        "url_principal",
+        "session_principal",
+        "target_host",
+        "target_port",
+        "target_database",
+        "reader_database_name",
+        "operator_database_name",
+        "query_redirect",
+        "fragment",
+        "missing_port",
+        "normalized_target",
+    ],
+)
+async def test_capture_reads_secret_bytes_but_returns_only_hashes_and_real_principal(
+    tmp_path, monkeypatch, fault
+):
+    import hashlib
+    import asyncpg
+    from app.services import registered_consumer_reconcile_runtime as runtime
+    from app.services.worker_control_role_cli import role_names_for_generation
+
+    job, _, files, binding = setup_protocol(tmp_path)
+    credentials = {
+        key: binding["credentials"][key]
+        for key in (
+            "control_generation",
+            "redis_generation",
+            "database_secret_id",
+            "redis_secret_id",
+        )
+    }
+    principal = role_names_for_generation(credentials["control_generation"]).versioned[
+        "operator"
+    ]
+    raw = {
+        "database": f"postgresql://{principal}:private@database.invalid:5432/fixture\n",
+        "redis": "redis://vp_control:private@redis.invalid:6379/0\n",
+    }
+    reader = "postgresql://vp_deploy_read:private@database.invalid:5432/fixture\n"
+    for case, before, after in (
+        ("target_host", "database.invalid", "other.invalid"),
+        ("target_port", ":5432", ":5433"),
+        ("target_database", "/fixture", "/other"),
+        ("query_redirect", "/fixture", "/fixture?host=other.invalid"),
+        ("fragment", "/fixture", "/fixture#extra"),
+        ("missing_port", ":5432", ""),
+        ("normalized_target", "postgresql://", "postgresql+asyncpg://"),
+    ):
+        if fault == case:
+            reader = reader.replace(before, after)
+    if fault == "normalized_target":
+        reader = reader.replace("database.invalid", "DATABASE.INVALID")
+    capture_read = dict(
+        id="r" * 25,
+        name="vp-registered-read-" + binding["transaction_id"],
+        sha256=hashlib.sha256(reader.encode()).hexdigest(),
+        principal="vp_deploy_read",
+    )
+    if fault == "hash":
+        capture_read["sha256"] = "f" * 64
+    elif fault == "url_principal":
+        capture_read["principal"] = "other_reader"
+    closed = []
+    snapshots = []
+
+    class Connection:
+        def __init__(self, user):
+            self.user = user
+
+        async def fetchrow(self, query):
+            assert query in (
+                "SELECT session_user, current_user",
+                "SELECT session_user, current_user, pg_catalog.current_database() AS database_name",
+            )
+            identity = dict(
+                session_user=self.user, current_user=self.user, database_name="fixture"
+            )
+            if fault == "session_principal" and self.user == "vp_deploy_read":
+                identity["current_user"] = "other_reader"
+            if (
+                fault == "reader_database_name"
+                and self.user == "vp_deploy_read"
+                or fault == "operator_database_name"
+                and self.user == principal
+            ):
+                identity["database_name"] = "other"
+            return identity
+
+        async def close(self, **kwargs):
+            closed.append(self.user)
+
+    async def connect(*args, **kwargs):
+        from urllib.parse import urlsplit
+
+        return Connection(urlsplit(args[0]).username)
+
+    async def snapshot(connection):
+        # The actual operator role has no table SELECT grants.
+        assert connection.user == "vp_deploy_read"
+        snapshots.append(connection.user)
+        return {"observed_at": NOW.isoformat(), "workers": [None] * 4}
+
+    monkeypatch.setattr(asyncpg, "connect", connect)
+    monkeypatch.setattr(runtime, "_read_mount", raw.__getitem__)
+    monkeypatch.setattr(job, "_read_capture_mount", lambda: reader, raising=False)
+    monkeypatch.setattr(job, "read_snapshot", snapshot)
+    payload = dict(
+        files=files, credentials=credentials, baseline=None, capture_read=capture_read
+    )
+    if fault not in (None, "normalized_target"):
+        with pytest.raises(
+            job.ProtocolError, match="^registered_reconcile_protocol_failed$"
+        ):
+            await job.capture_managed(payload)
+        assert principal in closed
+        assert snapshots == []
+        return
+    result = await job.capture_managed(payload)
+    assert sorted(closed) == sorted([principal, "vp_deploy_read"])
+    assert (
+        result["credentials"]["database_secret_sha256"]
+        == hashlib.sha256(raw["database"].encode()).hexdigest()
+    )
+    assert result["credentials"]["redis_username"] == "vp_control"
+    assert "private" not in json.dumps(result)
+    assert result["snapshot"]["workers"] == [None] * 4
 
 
 def frame(job, binding, sequence=1, action="revalidate", **changes):

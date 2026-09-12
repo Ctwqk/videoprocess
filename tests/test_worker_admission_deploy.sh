@@ -24,6 +24,22 @@ log() {
 }
 source "$EXTENSION"
 # The registered-runtime shell contract is executed in test_registered_runtime_deploy.py.
+vp_registered_reconcile_capture() { :; }
+vp_registered_reconcile_forward() { :; }
+vp_registered_reconcile_cleanup() { :; }
+vp_registered_reconcile_action() { :; }
+legacy_registered_fixture() {
+  # These pre-existing promotion fixtures exercise explicit older-journal replay.
+  python3 - "$1/transactions/active.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+value = json.loads(path.read_bytes())
+assert value.pop("registered_reconcile") == dict(version=1, baseline=None, current=None, run=None)
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+}
 vp_require_autoflow_control_ready() { :; }
 vp_require_selected_autoflow_control_ready() { :; }
 vp_autoflow_tasks() { printf '[]\n'; }
@@ -849,6 +865,7 @@ PY
     python3 "$selection_helper" record-control-selection \
       "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
       4 forward
+  legacy_registered_fixture "$selection_admission_root"
   python3 "$selection_helper" transition \
     "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
     4 FORWARD_VERIFIED >/dev/null
@@ -979,6 +996,7 @@ PY
   vp_worker_admission_lock_release
 
   begin_selection_fixture janitor-pending-operation
+  legacy_registered_fixture "$selection_admission_root"
   python3 "$selection_helper" capture-baseline \
     "$selection_admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 0 \
     <"$selection_baseline" >/dev/null
@@ -3923,6 +3941,8 @@ PY
     vp_worker_admission_lock_release
 
     source "$EXTENSION"
+    vp_registered_reconcile_cleanup() { :; }
+    vp_registered_reconcile_action() { :; }
     [[ -z "$VP_WORKER_CONTROL_GENERATION" \
       && -z "$VP_WORKER_ADMISSION_CONTROL_IMAGE" ]]
     vp_worker_admission_revoke_generation_authority() {
@@ -4081,6 +4101,8 @@ PY
   vp_worker_admission_lock_release
 
   source "$EXTENSION"
+  vp_registered_reconcile_cleanup() { :; }
+  vp_registered_reconcile_action() { :; }
   [[ -z "$VP_WORKER_CONTROL_GENERATION" \
     && -z "$VP_WORKER_ADMISSION_CONTROL_IMAGE" ]]
   expected_operator="$admission_root/control/$replay_control_generation/worker-registration-operator-database-url"
@@ -4928,6 +4950,8 @@ fi
   source "$EXTENSION"
 
   replay_root="$(vp_worker_admission_root)"
+  vp_registered_reconcile_action() { :; }
+  vp_registered_reconcile_cleanup() { :; }
   vp_require_selected_autoflow_control_ready() { :; }
   vp_worker_admission_lock_acquire "$replay_root"
   replay_credentials=()
@@ -5007,6 +5031,7 @@ PY
   python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
     "$replay_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
     1 FORWARD_APPLYING >/dev/null
+  legacy_registered_fixture "$replay_root"
   python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
     "$replay_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
     2 FORWARD_VERIFIED >/dev/null

@@ -167,6 +167,7 @@ vp_require_autoflow_control_ready() { echo qualify; }
 vp_install_staging_object_janitor() { :; }
 vp_run_staging_object_janitor_once() { :; }
 vp_worker_admission_record_janitor_service() { :; }
+vp_registered_reconcile_capture() { :; }
 vp_require_worker_redis_marker_status() { :; }
 vp_record_worker_activation_attempt() { :; }
 vp_activate_worker_admission() { echo activate; return 1; }
@@ -626,3 +627,208 @@ def test_real_owning_shell_lock_and_replay_boundary(tmp_path, action, fault):
             assert f"|--secret-add|source={SECRET_ID},target=worker-orchestrator-database-url,uid=0,gid=0,mode=0400|" in updates[0]
             assert f"|--image|{data['IMAGE']}|{SERVICE_ID}" in updates[0]
             assert "|--update-order|" + ("stop-first|" if action == "rollback" else "start-first|") in updates[0]
+
+
+@pytest.mark.parametrize(
+    "fault", ["none", "child", "substitution", "outer_unlocked", "outer_replaced"]
+)
+def test_registered_action_requires_real_owning_shell_and_both_lock_inodes(
+    tmp_path, fault
+):
+    data = locked_runtime_fixture(tmp_path, "forward")
+    result = run(
+        r"""
+ROOT="$ADMISSION_ROOT"
+exec 9<>"$ROOT/sync.lock"
+chmod 600 "$ROOT/sync.lock"
+python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)'
+VP_WORKER_ADMISSION_LOCK_HELD=false
+vp_worker_admission_lock_acquire "$ADMISSION_ROOT"
+if [[ "$FAULT" == outer_unlocked ]]; then
+  python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_UN)'
+elif [[ "$FAULT" == outer_replaced ]]; then
+  mv "$ROOT/sync.lock" "$ROOT/original.lock"
+  : >"$ROOT/sync.lock"
+  chmod 600 "$ROOT/sync.lock"
+fi
+if [[ "$FAULT" == child ]]; then ( vp_registered_reconcile_action verify all )
+elif [[ "$FAULT" == substitution ]]; then value="$(vp_registered_reconcile_action verify all)"
+else vp_registered_reconcile_action verify all; fi
+""",
+        **data,
+        FAULT=fault,
+    )
+    assert result.returncode == (0 if fault == "none" else 1), result.stderr
+    assert not result.stdout and not result.stderr
+
+
+@pytest.mark.parametrize("terminal", [10, 11, 1])
+def test_registered_waiter_does_not_confuse_observation_failure_with_success(terminal):
+    result = run(
+        r"""
+vp_registered_reconcile_action() {
+  echo "$1:$2"
+  if [[ "$1" == observe ]]; then return "$TERMINAL"; fi
+}
+vp_registered_reconcile_wait run
+""",
+        TERMINAL=str(terminal),
+    )
+    assert result.returncode == (0 if terminal == 10 else 1), result.stderr
+    assert result.stdout.splitlines() == ["observe:run"]
+
+
+def test_registered_capture_finishes_cleanup_before_returning_failure():
+    result = run(r"""
+vp_require_pipeline_network_identity() { :; }
+vp_registered_reconcile_action() { echo "$1:$2"; }
+vp_registered_reconcile_wait() { echo wait; return 1; }
+vp_registered_reconcile_capture baseline
+""")
+    assert result.returncode == 1
+    assert result.stdout.splitlines() == [
+        "prepare:baseline",
+        "launch:baseline",
+        "wait",
+        "cleanup:baseline",
+    ]
+
+
+@pytest.mark.parametrize("boundary", ["forward_failure", "abort", "pending_promotion"])
+def test_unsettled_registered_job_blocks_recovery_before_other_effects(boundary):
+    result = run(
+        r"""
+vp_worker_admission_hydrate_recovery_context() { echo hydrate; }
+vp_registered_reconcile_cleanup() { echo cleanup; return 1; }
+vp_registered_reconcile_action() { echo verify; return 1; }
+vp_worker_admission_current_promotion_matches() { echo unsafe; return 1; }
+vp_restore_app_snapshots() { echo unsafe; }
+vp_worker_admission_abort_vision_jobs() { echo unsafe; }
+vp_worker_admission_abort_preparing_transaction() { echo unsafe; }
+if [[ "$BOUNDARY" == forward_failure ]]; then
+  vp_worker_admission_resume_forward_failure
+elif [[ "$BOUNDARY" == abort ]]; then
+  vp_worker_admission_abort_transaction preparing_failed
+else
+  vp_worker_admission_complete_pending_promotion PROMOTE_WORKERS operation-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+fi
+""",
+        BOUNDARY=boundary,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "unsafe" not in result.stdout
+    assert result.stdout.splitlines() == (
+        ["verify"] if boundary == "pending_promotion" else ["cleanup"]
+    )
+
+
+def test_normal_reconcile_gate_follows_readiness_and_precedes_first_promotion():
+    result = run(r"""
+for function in vp_worker_admission_advance_migration_state vp_run_worker_registration_migration \
+  vp_require_channelops_migration_head vp_prepare_worker_redis_marker_controls vp_prepare_worker_admission \
+  vp_require_autoflow_control_ready vp_install_staging_object_janitor vp_run_staging_object_janitor_once \
+  vp_worker_admission_record_janitor_service vp_require_worker_redis_marker_status vp_record_worker_activation_attempt \
+  vp_worker_admission_advance_live_worker_stage vp_record_app_service_attempt vp_deploy_python_worker \
+  vp_deploy_vision_worker vp_run_vision_cutover_job vp_reconcile_vision_consumers vp_deploy_publisher \
+  http_health vp_update_app_runtime_service vp_require_worker_deployment_ready; do
+  eval "$function() { :; }"
+done
+VP_VISION_CUTOVER_REQUIRED=false
+vp_registered_reconcile_capture() { echo "capture:$1"; }
+vp_activate_worker_admission() { echo "activate:$1"; }
+swarm_service_running() { echo "ready:$1"; }
+vp_install_soak_watch() { echo soak; }
+vp_registered_reconcile_forward() { echo reconcile; }
+vp_worker_admission_transition_to() { echo "phase:$1"; }
+vp_worker_admission_promote_phase() { echo "promote:$1"; }
+vp_worker_admission_finish_transaction() { echo finish; }
+vp_apply_app_services api frontend backend runner go worker
+""")
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines.index("capture:baseline") < lines.index(
+        "activate:vp-ffmpeg-worker-go-swarm"
+    )
+    assert lines.index("soak") + 1 == lines.index("reconcile")
+    assert lines.index("reconcile") + 1 == lines.index("phase:FORWARD_VERIFIED")
+    assert lines.index("phase:FORWARD_VERIFIED") < lines.index(
+        "promote:PROMOTE_WORKERS"
+    )
+
+
+@pytest.mark.parametrize("boundary", ["before_capture", "after_capture", "after_run"])
+def test_pending_signal_prevents_new_attempt_or_success_but_allows_cleanup(boundary):
+    result = run(
+        r"""
+vp_require_pipeline_network_identity() { :; }
+vp_registered_reconcile_action() { echo "$1:$2"; }
+vp_registered_reconcile_wait() { :; }
+vp_registered_reconcile_cleanup() {
+  echo "cleanup:$1"
+  if [[ "$BOUNDARY" == after_capture && "$1" == current \
+    || "$BOUNDARY" == after_run && "$1" == all ]]; then
+    VP_WORKER_ADMISSION_DEPLOY_SIGNAL_STATUS=143
+  fi
+}
+if [[ "$BOUNDARY" == before_capture ]]; then VP_WORKER_ADMISSION_DEPLOY_SIGNAL_STATUS=143; fi
+vp_registered_reconcile_forward
+""",
+        BOUNDARY=boundary,
+    )
+    assert result.returncode == 1, result.stderr
+    lines = result.stdout.splitlines()
+    assert "verify:all" not in lines
+    if boundary == "before_capture":
+        assert lines == []
+    elif boundary == "after_capture":
+        assert lines == ["prepare:current", "launch:current", "cleanup:current"]
+    else:
+        assert lines[-1] == "cleanup:all" and lines.count("launch:run") == 1
+
+
+@pytest.mark.parametrize("mode", ["skip", "unlocked", "normal", "writer_failure", "journal_failure"])
+def test_broad_preparation_fake_matches_skip_and_authority_contract(mode):
+    source = (EXTENSION.parents[2] / "tests/test_vp_deploy_sync_extension.sh").read_text()
+    marker = "vp_prepare_worker_admission() {\n"
+    definition = marker + source.split(marker, 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+    result = run(r'''
+eval "$DEFINITION"
+UPDATE_SERVICES=1
+VP_WORKER_ADMISSION_LOCK_ROOT=/fixture-only/admission
+if [[ "$MODE" == skip ]]; then UPDATE_SERVICES=0; VP_WORKER_ADMISSION_LOCK_ROOT=; fi
+VP_WORKER_ADMISSION_PREPARED=unchanged
+VP_WORKER_CONTROL_PREPARED=unchanged
+TEST_COMMIT=0123456789abcdef0123456789abcdef01234567
+VP_WORKER_ADMISSION_COMMIT="$TEST_COMMIT"
+VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE="$TEST_COMMIT"
+CALLS=/dev/null
+vp_worker_admission_lock_assert() { echo lock; [[ "$MODE" != unlocked ]]; }
+vp_worker_control_write_manifest() { echo "control:$1"; [[ "$MODE" != writer_failure ]]; }
+vp_worker_admission_write_manifest() { echo "worker:$1"; }
+vp_worker_admission_record_authority_intent() { echo intent; [[ "$MODE" != journal_failure ]]; }
+vp_worker_admission_mark_authority_provisioning() { echo provisioning; }
+vp_worker_admission_mark_authority_provisioned() { echo provisioned; }
+vp_worker_admission_record_control_selection() { echo selection; }
+vp_worker_admission_set_candidate() { :; }
+vp_worker_admission_track_candidate() { :; }
+vp_worker_admission_record_prepared_worker_plan() { :; }
+status=0
+vp_prepare_worker_admission vp-python:fixture vp-go:fixture || status=$?
+printf 'status:%s\nflags:%s:%s\n' "$status" "$VP_WORKER_ADMISSION_PREPARED" "$VP_WORKER_CONTROL_PREPARED"
+''', MODE=mode, DEFINITION=definition)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    if mode == "skip":
+        assert lines == ["status:0", "flags:unchanged:unchanged"]
+    elif mode == "unlocked":
+        assert lines == ["lock", "status:1", "flags:unchanged:unchanged"]
+    elif mode in {"writer_failure", "journal_failure"}:
+        assert "status:1" in lines
+        assert not any(line.startswith("worker:") for line in lines)
+        assert ("intent" in lines) == (mode == "journal_failure")
+        assert "provisioning" not in lines
+    else:
+        assert lines[0] == "lock" and lines[-2:] == ["status:0", "flags:true:false"]
+        paths = [line.split(":", 1)[1] for line in lines if line.startswith(("control:", "worker:"))]
+        assert len(paths) == 5 and len(set(paths)) == 5
+        assert all(path.startswith("/fixture-only/admission/") for path in paths)

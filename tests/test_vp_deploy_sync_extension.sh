@@ -1429,6 +1429,22 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
 fi
 source "$EXTENSION"
 # The registered-runtime shell contract is executed in test_registered_runtime_deploy.py.
+vp_registered_reconcile_capture() { :; }
+vp_registered_reconcile_forward() {
+  # This broad transport fixture retains the older journal contract. The new
+  # mandatory receipt gate is exercised with real journal/file I/O separately.
+  python3 - "$VP_WORKER_ADMISSION_LOCK_ROOT/transactions/active.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+value = json.loads(path.read_bytes())
+assert value.pop("registered_reconcile") == dict(version=1, baseline=None, current=None, run=None)
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+}
+vp_registered_reconcile_cleanup() { :; }
+vp_registered_reconcile_action() { :; }
 vp_require_autoflow_control_ready() { :; }
 vp_require_selected_autoflow_control_ready() { :; }
 vp_autoflow_tasks() { printf '[]\n'; }
@@ -1613,6 +1629,11 @@ vp_worker_service_secret_specs() {
 vp_prepare_worker_admission() {
   local control_image="$1"
   local go_image="$2"
+  if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
+    log "worker admission preparation skipped"
+    return 0
+  fi
+  vp_worker_admission_lock_assert || return 1
   VP_WORKER_ADMISSION_PREPARED=true
   VP_WORKER_CONTROL_PREPARED=false
   VP_WORKER_ADMISSION_CANDIDATE_SERVICES=""
@@ -1634,17 +1655,17 @@ vp_prepare_worker_admission() {
     304444444444444444444444 \
     305555555555555555555555 \
     306666666666666666666666 \
-    307777777777777777777777
+    307777777777777777777777 || return 1
   local operator_reference="control/$VP_WORKER_CONTROL_GENERATION/worker-registration-operator-database-url"
   vp_worker_admission_record_authority_intent \
     control vp-worker-control "$VP_WORKER_CONTROL_GENERATION" \
     "$control_image" "$VP_WORKER_CONTROL_GENERATION" \
-    "$operator_reference"
+    "$operator_reference" || return 1
   vp_worker_admission_mark_authority_provisioning \
-    control vp-worker-control "$VP_WORKER_CONTROL_GENERATION"
+    control vp-worker-control "$VP_WORKER_CONTROL_GENERATION" || return 1
   vp_worker_admission_mark_authority_provisioned \
-    control vp-worker-control "$VP_WORKER_CONTROL_GENERATION"
-  vp_worker_admission_record_control_selection forward "$control_candidate"
+    control vp-worker-control "$VP_WORKER_CONTROL_GENERATION" || return 1
+  vp_worker_admission_record_control_selection forward "$control_candidate" || return 1
   local service
   for service in \
     vp-ffmpeg-worker-go-swarm \
@@ -1681,25 +1702,25 @@ vp_prepare_worker_admission() {
     vp_worker_admission_record_authority_intent \
       runtime "$service" "$generation" \
       "$control_image" "$VP_WORKER_CONTROL_GENERATION" \
-      "$operator_reference"
+      "$operator_reference" || return 1
     vp_worker_admission_mark_authority_provisioning \
-      runtime "$service" "$generation"
+      runtime "$service" "$generation" || return 1
     vp_worker_admission_mark_authority_provisioned \
-      runtime "$service" "$generation"
+      runtime "$service" "$generation" || return 1
     local kind
-    kind="$(vp_worker_admission_kind "$service")"
+    kind="$(vp_worker_admission_kind "$service")" || return 1
     vp_worker_admission_write_manifest \
       "$root/candidates/$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE/$kind.conf" \
       "$service" "$VP_WORKER_ADMISSION_COMMIT" "$image" "$generation" \
       "test-$kind-database-$generation" \
       "test-$kind-admission-$generation" \
-      "$database_id" "$admission_id"
+      "$database_id" "$admission_id" || return 1
     vp_worker_admission_set_candidate \
       "$service" "$generation" \
       "test-$kind-database-$generation" \
-      "test-$kind-admission-$generation"
-    vp_worker_admission_track_candidate "$service"
-    vp_worker_admission_record_prepared_worker_plan "$service" "$image"
+      "test-$kind-admission-$generation" || return 1
+    vp_worker_admission_track_candidate "$service" || return 1
+    vp_worker_admission_record_prepared_worker_plan "$service" "$image" || return 1
   done
   printf 'worker-admission|prepare|%s|%s\n' \
     "$control_image" "$go_image" >>"$CALLS"
@@ -2573,6 +2594,16 @@ PY
     "$VP_WORKER_ADMISSION_REPLAY_REVISION" \
     <"$baseline_payload" >/dev/null
   vp_worker_admission_transition_to FORWARD_APPLYING
+  # This older replay fixture has no registered-maintenance receipt by design.
+  python3 - "$transaction_root/transactions/active.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+value = json.loads(path.read_bytes())
+assert value.pop("registered_reconcile") == dict(version=1, baseline=None, current=None, run=None)
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+PY
   vp_worker_admission_transition_to FORWARD_VERIFIED
   vp_worker_admission_transition_to WORKERS_PROMOTED
   : >"$transaction_calls"
