@@ -151,8 +151,7 @@ type ownedHistoryRedisClient interface {
 
 type ownedHistoryRedisFactory func(*redis.Options) ownedHistoryRedisClient
 
-func observeOwnedHistoryRedis(ctx context.Context, request *ownedHistoryObservationRequest, rawURL string, factory ownedHistoryRedisFactory) (evidence *ownedHistoryRedisEvidence, err error) {
-	defer historyRecover(&err, "owned_history_redis_read_failed")
+func ownedHistoryRedisOptions(rawURL string) (*redis.Options, error) {
 	parsed, parseErr := url.Parse(rawURL)
 	if parseErr != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Scheme != "redis" && parsed.Scheme != "rediss") || parsed.User == nil {
 		return nil, ownedHistoryError("owned_history_redis_configuration")
@@ -170,6 +169,16 @@ func observeOwnedHistoryRedis(ctx context.Context, request *ownedHistoryObservat
 	options.DialTimeout, options.ReadTimeout, options.WriteTimeout = 5*time.Second, 5*time.Second, 5*time.Second
 	options.ContextTimeoutEnabled, options.DisableIdentity = true, true
 	options.Protocol = 2
+	return options, nil
+}
+
+func observeOwnedHistoryRedis(ctx context.Context, request *ownedHistoryObservationRequest, rawURL string, factory ownedHistoryRedisFactory) (evidence *ownedHistoryRedisEvidence, err error) {
+	defer historyRecover(&err, "owned_history_redis_read_failed")
+	options, parseErr := ownedHistoryRedisOptions(rawURL)
+	if parseErr != nil {
+		return nil, parseErr
+	}
+	principal := options.Username
 	if factory == nil {
 		factory = func(options *redis.Options) ownedHistoryRedisClient { return redis.NewClient(options) }
 	}

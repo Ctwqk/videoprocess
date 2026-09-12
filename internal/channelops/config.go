@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Ctwqk/videoprocess/internal/worker"
 )
 
 var runnerIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.@:-]+$`)
@@ -43,13 +45,29 @@ type Config struct {
 	RetentionAuditDays           int
 	RetentionFeedbackDays        int
 	discoveryTimeoutParseFailed  bool
+	ownedHistoryRedisFileInvalid bool
 }
 
 func LoadConfig() Config {
 	discoveryTimeout, discoveryTimeoutParseFailed := discoveryTimeoutEnv()
+	var ownedHistoryRedisURL string
+	var ownedHistoryRedisFileInvalid bool
+	if path := env("OWNED_HISTORY_REDIS_URL_FILE", ""); path != "" {
+		var err error
+		ownedHistoryRedisURL, err = worker.ReadMode0400Secret(path, "owned history Redis URL")
+		if err == nil {
+			_, err = ownedHistoryRedisOptions(ownedHistoryRedisURL)
+		}
+		if err != nil {
+			ownedHistoryRedisURL = ""
+			ownedHistoryRedisFileInvalid = true
+		}
+	} else {
+		ownedHistoryRedisURL = env("REDIS_URL", "")
+	}
 	return Config{
 		DatabaseURL:                  env("DATABASE_URL", "postgresql://vp:vp_secret@localhost:5435/videoprocess"),
-		OwnedHistoryRedisURL:         env("REDIS_URL", ""),
+		OwnedHistoryRedisURL:         ownedHistoryRedisURL,
 		RunnerID:                     env("CHANNELOPS_RUNNER_ID", ""),
 		YouTubeManagerURL:            env("YOUTUBE_MANAGER_URL", ""),
 		AutoFlowBaseURL:              env("AUTOFLOW_BASE_URL", "http://api:8080"),
@@ -79,10 +97,14 @@ func LoadConfig() Config {
 		RetentionAuditDays:           intEnv("CHANNELOPS_RETENTION_AUDIT_DAYS", 90),
 		RetentionFeedbackDays:        intEnv("CHANNELOPS_RETENTION_FEEDBACK_DAYS", 365),
 		discoveryTimeoutParseFailed:  discoveryTimeoutParseFailed,
+		ownedHistoryRedisFileInvalid: ownedHistoryRedisFileInvalid,
 	}
 }
 
 func (c Config) Validate() error {
+	if c.ownedHistoryRedisFileInvalid {
+		return errors.New("OWNED_HISTORY_REDIS_URL_FILE is invalid")
+	}
 	if strings.TrimSpace(c.DatabaseURL) == "" {
 		return errors.New("DATABASE_URL is required")
 	}
