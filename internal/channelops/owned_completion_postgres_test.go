@@ -77,13 +77,20 @@ func ownedCompletionPGFixture(t *testing.T) (*ownedPGFixture, QueueItemRow, Publ
 	if err != nil || item.PayloadJSON["publication_id"] != pub.ID {
 		t.Fatal("exact seventh publication claim", err)
 	}
+	snapshot, err := loadOwnedHistorySnapshot(ctx, f.store.Pool, ownedString(f.data.Inventory["platform_channel_id"]))
+	if err != nil {
+		t.Fatal("native completion fixture reread", err)
+	}
+	if ids, err := completedOwnedInventoryItems(snapshot, *f.channel.OwnedSeedInventoryID, pub.ID, snapshot.observedAt); err != nil || len(ids) != 0 {
+		t.Fatalf("native running completion fixture: completion_count=%d classifier_reason=%v", len(ids), err)
+	}
 	return f, item, pub
 }
 
 func ownedCompletionPGState(t *testing.T, f *ownedPGFixture, ctx context.Context, item QueueItemRow, pub PublicationRow) []byte {
 	t.Helper()
 	var raw []byte
-	if err := f.store.Pool.QueryRow(ctx, `SELECT jsonb_build_object('publication',to_jsonb(p),'queue',to_jsonb(q),'items',(SELECT jsonb_agg(to_jsonb(i) ORDER BY ordinal) FROM owned_seed_inventory_items i WHERE i.inventory_id=$3::uuid),'metrics',(SELECT jsonb_agg(to_jsonb(m) ORDER BY m.id) FROM publication_metric_schedules m WHERE m.publication_id=p.id),'future_queues',(SELECT jsonb_agg(to_jsonb(f) ORDER BY f.id) FROM channel_ops_queue_items f WHERE f.payload_json->>'publication_id'=p.id::text AND f.kind='collect_metrics')) FROM publication_records p CROSS JOIN channel_ops_queue_items q WHERE p.id=$1::uuid AND q.id=$2::uuid`, pub.ID, item.ID, *f.channel.OwnedSeedInventoryID).Scan(&raw); err != nil {
+	if err := f.store.Pool.QueryRow(ctx, `SELECT jsonb_build_object('inventory',(SELECT jsonb_build_object('state',v.state,'hold_reason',v.hold_reason) FROM owned_seed_inventories v WHERE v.id=$3::uuid),'publication',to_jsonb(p),'queue',to_jsonb(q),'items',(SELECT jsonb_agg(to_jsonb(i) ORDER BY ordinal) FROM owned_seed_inventory_items i WHERE i.inventory_id=$3::uuid),'metrics',(SELECT jsonb_agg(to_jsonb(m) ORDER BY m.id) FROM publication_metric_schedules m WHERE m.publication_id=p.id),'future_queues',(SELECT jsonb_agg(to_jsonb(f) ORDER BY f.id) FROM channel_ops_queue_items f WHERE f.payload_json->>'publication_id'=p.id::text AND f.kind='collect_metrics')) FROM publication_records p CROSS JOIN channel_ops_queue_items q WHERE p.id=$1::uuid AND q.id=$2::uuid`, pub.ID, item.ID, *f.channel.OwnedSeedInventoryID).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	return raw
@@ -196,7 +203,8 @@ func TestOwnedProducerPGSeventhReconcileAtomicCompletion(t *testing.T) {
 			queue := ownedMap(after["queue"])
 			items := historyRows(after["items"])
 			if queue["status"] != QueueStatusSucceeded || queue["locked_at"] != nil || queue["locked_by"] != nil || ownedMap(after["publication"])["publish_status"] != "scheduled" || items[6]["state"] != "completed" || items[6]["completed_at"] == nil {
-				t.Fatal("publication / cleared queue / seventh completion did not commit together")
+				inventory := ownedMap(after["inventory"])
+				t.Fatalf("completion transaction: inventory_state=%v hold_reason=%v publication_status=%v queue_status=%v lease_owner_present=%t lease_time_present=%t item_count=%d seventh_state=%v seventh_completed_at_present=%t", inventory["state"], inventory["hold_reason"], ownedMap(after["publication"])["publish_status"], queue["status"], queue["locked_by"] != nil, queue["locked_at"] != nil, len(items), items[6]["state"], items[6]["completed_at"] != nil)
 			}
 			for i := 0; i < 6; i++ {
 				if !ownedPolicyJSONEqual(historyRows(old["items"])[i], items[i]) {
@@ -221,27 +229,37 @@ func TestOwnedProducerPGSeventhReconcileAtomicCompletion(t *testing.T) {
 }
 
 func TestOwnedClosureSevenFixtureUsesNormalClassifier(t *testing.T) {
-	_, data, now := ownedTestFixture(t)
-	manifest := ownedMap(data.Inventory["manifest_json"])
-	starts := now.Add(-167 * time.Hour)
-	data.Inventory["starts_at"], data.Inventory["expires_at"], data.Inventory["approved_at"] = ownedISO(starts), ownedISO(starts.Add(168*time.Hour)), ownedISO(starts)
-	manifest["starts_at"], manifest["expires_at"] = data.Inventory["starts_at"], data.Inventory["expires_at"]
-	data.Inventory["manifest_sha256"] = ownedTestHash(t, manifest)
-	seventh := ownedClosureSeven(t, &data, now)
-	pub := historyRows(seventh["publications"])[0]
-	check := func() ([]string, error) {
-		return completedOwnedInventoryItems(ownedProducerSnapshot(t, data, now), ownedString(data.Inventory["id"]), ownedString(pub["id"]), now)
-	}
-	if ids, err := check(); err != nil || len(ids) != 0 {
-		t.Fatal("queued native fixture pretended to complete", ids, err)
-	}
-	queue := historyOne(historySelect(seventh["queues"], func(q map[string]any) bool { return q["kind"] == QueueReconcilePublication }), "fixture_reconcile")
-	queue["status"], queue["attempt_count"] = "succeeded", 1
-	if ids, err := check(); err != nil || len(ids) != 1 || ids[0] != data.Items[6].Item["id"] {
-		t.Fatal("shared normal history fixture invalid", ids, err)
-	}
-	queue["attempt_count"] = 2
-	if ids, err := check(); err == nil || err.Error() != "owned_inventory_queue_failed" || len(ids) != 0 {
-		t.Fatal("recovered attempt2 must retain strict completion refusal", ids, err)
+	for _, location := range []*time.Location{time.UTC, time.FixedZone("pgx-local-minus-seven", -7*60*60)} {
+		t.Run(location.String(), func(t *testing.T) {
+			_, data, now := ownedTestFixture(t)
+			now = now.In(location)
+			manifest := ownedMap(data.Inventory["manifest_json"])
+			starts := now.Add(-167 * time.Hour)
+			data.Inventory["starts_at"], data.Inventory["expires_at"], data.Inventory["approved_at"] = ownedISO(starts), ownedISO(starts.Add(168*time.Hour)), ownedISO(starts)
+			manifest["starts_at"], manifest["expires_at"] = data.Inventory["starts_at"], data.Inventory["expires_at"]
+			data.Inventory["manifest_sha256"] = ownedTestHash(t, manifest)
+			seventh := ownedClosureSeven(t, &data, now)
+			pub := historyRows(seventh["publications"])[0]
+			check := func() ([]string, error) {
+				return completedOwnedInventoryItems(ownedProducerSnapshot(t, data, now), ownedString(data.Inventory["id"]), ownedString(pub["id"]), now)
+			}
+			if ids, err := check(); err != nil || len(ids) != 0 {
+				t.Fatal("queued native fixture pretended to complete", ids, err)
+			}
+			queue := historyOne(historySelect(seventh["queues"], func(q map[string]any) bool { return q["kind"] == QueueReconcilePublication }), "fixture_reconcile")
+			queue["status"], queue["attempt_count"] = "succeeded", 1
+			if ids, err := check(); err != nil || len(ids) != 1 || ids[0] != data.Items[6].Item["id"] {
+				t.Fatal("shared normal history fixture invalid", ids, err)
+			}
+			queue["attempt_count"] = 2
+			if ids, err := check(); err == nil || err.Error() != "owned_inventory_queue_failed" || len(ids) != 0 {
+				t.Fatal("recovered attempt2 must retain strict completion refusal", ids, err)
+			}
+			queue["attempt_count"] = 1
+			data.Items[6].Item["state"], data.Items[6].Item["completed_at"] = "completed", ownedISO(now)
+			if ids, err := completedOwnedInventoryItems(ownedProducerSnapshot(t, data, now), ownedString(data.Inventory["id"]), "", now); err != nil || len(ids) != 0 {
+				t.Fatal("unfiltered accounting must validate but not rewrite completed items", ids, err)
+			}
+		})
 	}
 }
