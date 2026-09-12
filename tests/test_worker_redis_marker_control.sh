@@ -2183,6 +2183,19 @@ stale_active_readiness_status() {
 vp_update_app_runtime_service() {
   :
 }
+FRESHNESS_AUTOFLOW_READY=true
+vp_require_autoflow_control_ready() {
+  case "$1" in
+    vp-backend:freshness|vp-backend:publisher-freshness|vp-backend:ffmpeg-freshness|vp-backend:unready-autoflow) ;;
+    *) return 1 ;;
+  esac
+  [[ "$FRESHNESS_AUTOFLOW_READY" == true ]]
+}
+# Managed capture is covered by test_registered_runtime_deploy.py. This fixture
+# exercises marker freshness without creating a registered journal or receipt.
+vp_registered_reconcile_capture() {
+  [[ "$#" -eq 1 && "$1" == baseline ]]
+}
 http_health() {
   :
 }
@@ -2203,6 +2216,10 @@ vp_retire_legacy_vision_worker() {
 }
 vp_reconcile_vision_consumers() {
   :
+}
+vp_run_vision_cutover_job() {
+  [[ "$#" -eq 2 && "$1" == final-safety \
+    && "$2" == vp-ffmpeg-worker-python:publisher-freshness ]]
 }
 vp_require_channelops_migration_head() {
   :
@@ -2309,6 +2326,23 @@ done
 if grep -Fxq publisher "$WORKER_MUTATIONS"; then
   fail "stale status after vision allowed publisher mutation"
 fi
+
+reset_marker_transaction_fixture unready-autoflow
+FRESHNESS_CONTROL_ROOT="$ROOT/state/worker-redis-marker-control"
+: >"$WORKER_MUTATIONS"
+FRESHNESS_AUTOFLOW_READY=false
+if vp_apply_app_services \
+  vp-api:unready-autoflow \
+  vp-frontend:unready-autoflow \
+  vp-backend:unready-autoflow \
+  vp-channelops:unready-autoflow \
+  vp-ffmpeg-go:unready-autoflow \
+  vp-ffmpeg-worker-python:unready-autoflow >/dev/null 2>&1; then
+  fail "unready AutoFlow unexpectedly completed app apply"
+fi
+[[ ! -s "$WORKER_MUTATIONS" ]] \
+  || fail "unready AutoFlow allowed a worker mutation"
+FRESHNESS_AUTOFLOW_READY=true
 
 eval "$(
   declare -f vp_prepare_worker_redis_marker_controls \
