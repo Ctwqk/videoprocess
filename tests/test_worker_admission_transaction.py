@@ -673,8 +673,9 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
                                      name="vp-wc-operator-" + control["generation"])
         state["forward"]["control"] = control
         state["runtime_redis"]["control"] = dict(
-            runtime_generation="redis-1", secret_name="vp-control-redis-redis-1",
-            docker_secret_id="b" * 25,
+            runtime_generation="eeb8593f43dc5709d0191a06c528a9d35b22785e",
+            secret_name="vp-control-redis-eeb8593f43dc",
+            docker_secret_id="8421647r928yg9q4rfysv89m3",
         )
         state["forward"]["workers"] = []
         for index, service in enumerate(sorted(HELPER["RUNTIME_AUTHORITY_SERVICES"])):
@@ -705,9 +706,11 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
             pin_json=pin_json, pin_sha256=hashlib.sha256(pin_json.encode()).hexdigest(),
             targets={w["service"]: [w["generation"], w["image"]] for w in workers},
             commands={s: "e" * 64 for s in self.protocol["STREAMS"].values()},
-            credentials=dict(control_generation=control["generation"], redis_generation="redis-1",
+            credentials=dict(control_generation=control["generation"],
+                             redis_generation=state["runtime_redis"]["control"]["runtime_generation"],
+                             redis_secret_name=state["runtime_redis"]["control"]["secret_name"],
                              redis_username="vp_control_1", database_secret_id="a" * 25,
-                             redis_secret_id="b" * 25, database_secret_sha256="c" * 64,
+                             redis_secret_id=state["runtime_redis"]["control"]["docker_secret_id"], database_secret_sha256="c" * 64,
                              redis_secret_sha256="d" * 64), files=files, descriptor_sha256="f" * 64,
         )
         self.checked = []
@@ -726,6 +729,49 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
             )
         )
         self.progress_path.chmod(0o600)
+
+    def test_capture_credentials_preserve_exact_observed_tuple(self):
+        state = copy.deepcopy(self.fixture.state)
+        control = state["forward"]["control"]
+        control["generation"] = "c-b22b08a924b60c7d38f7"
+        operator = next(s for s in control["secrets"] if s["purpose"] == "operator")
+        operator.update(name="vp-wc-operator-c-b22b08a924b60c7d38f7",
+                        docker_secret_id="heg2wd7bzitiyhzz8zei02hwg")
+        for name in ("vp-control-redis-eeb8593f43dc", "qualified-control.current", "a" * 255):
+            state["runtime_redis"]["control"]["secret_name"] = name
+            before = copy.deepcopy(state)
+            self.assertEqual(HELPER["_registered_credentials"](state), dict(
+                control_generation="c-b22b08a924b60c7d38f7",
+                database_secret_id="heg2wd7bzitiyhzz8zei02hwg",
+                redis_generation="eeb8593f43dc5709d0191a06c528a9d35b22785e",
+                redis_secret_name=name, redis_secret_id="8421647r928yg9q4rfysv89m3"))
+            self.assertEqual(state, before)
+        for name in (None, "", "bad/name", "a" * 256):
+            state["runtime_redis"]["control"]["secret_name"] = name
+            with self.assertRaises(HELPER["TransactionError"]):
+                HELPER["_registered_credentials"](state)
+        del state["runtime_redis"]["control"]["secret_name"]
+        with self.assertRaises(HELPER["TransactionError"]):
+            HELPER["_registered_credentials"](state)
+
+    def test_callback_refuses_each_redis_journal_identity_change(self):
+        self.prepare()
+        self.request("revalidate")
+        reference = self.fixture.state["runtime_redis"]["control"]
+        for key, value in (("runtime_generation", "f" * 40),
+                           ("secret_name", "vp-control-redis-" + reference["runtime_generation"]),
+                           ("docker_secret_id", "z" * 25)):
+            with self.subTest(key=key):
+                original = reference[key]
+                reference[key] = value
+                self.fixture.write_state()
+                with self.assertRaises(HELPER["TransactionError"]):
+                    self.answer()
+                self.assertEqual(self.record()["sequence"], 0)
+                self.assertFalse((Path(self.binding["files"]["replies"]["path"]) / "reply.json").exists())
+                reference[key] = original
+        self.fixture.write_state()
+        self.assertTrue(self.answer())
 
     def verify(self, binding, service_id):
         self.assertEqual(binding, self.binding)

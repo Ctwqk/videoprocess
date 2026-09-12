@@ -736,12 +736,12 @@ def test_atomic_update_acceptance_waits_for_convergence(tmp_path, fault):
 
 @pytest.mark.parametrize("runner", [False, True])
 @pytest.mark.parametrize("action", ["forward", "rollback"])
-@pytest.mark.parametrize("fault", ["none", "secret_replaced", "pin_missing", "journal_changed", "wrong_owner", "lost"])
+@pytest.mark.parametrize("fault", ["none", "secret_replaced", "name_changed", "pin_missing", "journal_changed", "wrong_owner", "lost"])
 def test_owned_history_entry_uses_journal_pin_and_one_cas(tmp_path, runner, action, fault):
     data = locked_runtime_fixture(tmp_path, action)
     helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
     document = json.loads((Path(data["ADMISSION_ROOT"]) / "transactions/active.json").read_text())
-    reference = {"runtime_generation": "a" * 40, "secret_name": "vp-control-redis-" + "a" * 40,
+    reference = {"runtime_generation": "eeb8593f43dc5709d0191a06c528a9d35b22785e", "secret_name": "vp-control-redis-eeb8593f43dc",
                  "docker_secret_id": "r" * 25}
     document["runtime_redis"] = {} if fault == "pin_missing" else {"control": reference}
     before = json.dumps(document, sort_keys=True)
@@ -758,7 +758,8 @@ def test_owned_history_entry_uses_journal_pin_and_one_cas(tmp_path, runner, acti
     def docker(args, **kwargs):
         if args[:2] == ["secret", "inspect"]:
             assert args == ["secret", "inspect", "r" * 25, "--format", "{{.ID}}|{{.Spec.Name}}"]
-            return ("z" * 25 if fault == "secret_replaced" else "r" * 25) + "|" + reference["secret_name"]
+            name = "other-qualified-name" if fault == "name_changed" else reference["secret_name"]
+            return ("z" * 25 if fault == "secret_replaced" else "r" * 25) + "|" + name
         if args[:2] == ["image", "inspect"]:
             assert args[2] == image
             return ""
@@ -797,6 +798,18 @@ def test_owned_history_entry_uses_journal_pin_and_one_cas(tmp_path, runner, acti
              "File": {"Name": "owned-history-redis-url", "UID": "0", "GID": "0", "Mode": 256}}]
 
 
+@pytest.mark.parametrize("size", [255, 256])
+def test_owned_history_reference_name_limit_matches_journal(size):
+    reference = {"runtime_generation": "a" * 40, "secret_name": "a" * size,
+                 "docker_secret_id": "r" * 25}
+    result = run(r'''
+vp_worker_admission_recovery_state() { printf '%s\n' "$STATE"; }
+vp_owned_history_redis_identity
+''', STATE=json.dumps({"runtime_redis": {"control": reference}}))
+    assert result.returncode == (0 if size == 255 else 1)
+    assert result.stdout.strip() == (reference["secret_name"] + "|" + "r" * 25 if size == 255 else "")
+
+
 @pytest.mark.parametrize("service", ["vp-autoflow-api-swarm", "vp-channel-agent-runner-swarm"])
 def test_explicit_owned_history_shell_routes_through_atomic_entry(tmp_path, service):
     audit = tmp_path / "args"
@@ -823,7 +836,7 @@ def test_owned_history_readiness_rechecks_fixed_mount_before_health(tmp_path, fa
     data = locked_runtime_fixture(tmp_path, "readiness")
     active = Path(data["ADMISSION_ROOT"]) / "transactions/active.json"
     state = json.loads(active.read_text())
-    reference = {"runtime_generation": "a" * 40, "secret_name": "vp-control-redis-" + "a" * 40,
+    reference = {"runtime_generation": "eeb8593f43dc5709d0191a06c528a9d35b22785e", "secret_name": "vp-control-redis-eeb8593f43dc",
                  "docker_secret_id": "r" * 25}
     state["runtime_redis"] = {"control": reference}
     helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))

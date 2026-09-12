@@ -4707,16 +4707,18 @@ def _registered_credentials(document: dict) -> dict:
         or matches[0]["name"] != "vp-wc-operator-" + control["generation"]
     ):
         raise TransactionError
-    redis = document["runtime_redis"].get("control")
-    if (
-        redis is None
-        or redis["secret_name"] != "vp-control-redis-" + redis["runtime_generation"]
-    ):
-        raise TransactionError
+    redis = _require_exact_fields(
+        document["runtime_redis"].get("control"),
+        {"runtime_generation", "secret_name", "docker_secret_id"},
+    )
+    _require_string(redis["runtime_generation"], r"[a-z0-9][a-z0-9-]{0,62}")
+    _require_string(redis["secret_name"], r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+    _require_string(redis["docker_secret_id"], r"[a-z0-9]{25}")
     return dict(
         control_generation=control["generation"],
         database_secret_id=matches[0]["docker_secret_id"],
         redis_generation=redis["runtime_generation"],
+        redis_secret_name=redis["secret_name"],
         redis_secret_id=redis["docker_secret_id"],
     )
 
@@ -5000,8 +5002,7 @@ def _owned_history_secret(reference: dict, user: str) -> dict:
     _require_exact_fields(reference, {"runtime_generation", "secret_name", "docker_secret_id"})
     _require_string(reference["runtime_generation"], r"[0-9a-f]{40}")
     _require_string(reference["docker_secret_id"], r"[a-z0-9]{25}")
-    if reference["secret_name"] != "vp-control-redis-" + reference["runtime_generation"]:
-        raise TransactionError
+    _require_string(reference["secret_name"], r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
     if user in {"", "0", "root"}:
         user = "0:0"
     _require_string(user, r"[0-9]+:[0-9]+")
@@ -5885,7 +5886,7 @@ def _registered_selection(document: dict, binding: dict, service_id: str | None,
         raise TransactionError
     if document["runtime_redis"].get("control") != {
         "runtime_generation": credentials["redis_generation"],
-        "secret_name": "vp-control-redis-" + credentials["redis_generation"],
+        "secret_name": credentials["redis_secret_name"],
         "docker_secret_id": credentials["redis_secret_id"],
     }:
         raise TransactionError

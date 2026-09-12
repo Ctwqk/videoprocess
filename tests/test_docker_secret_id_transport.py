@@ -62,14 +62,17 @@ def target(source, order="start-first", **kwargs):
     )
 
 
-HISTORY = {"runtime_generation": "a" * 40, "secret_name": "vp-control-redis-" + "a" * 40,
-           "docker_secret_id": "r" * 25}
+HISTORY = {"runtime_generation": "eeb8593f43dc5709d0191a06c528a9d35b22785e",
+           "secret_name": "vp-control-redis-eeb8593f43dc",
+           "docker_secret_id": "8421647r928yg9q4rfysv89m3"}
 
 
 @pytest.mark.parametrize("runner", [False, True])
 @pytest.mark.parametrize("order", ["start-first", "stop-first"])
-def test_owned_history_file_is_atomic_id_pinned_and_repeatable(runner, order):
+@pytest.mark.parametrize("name", [HISTORY["secret_name"], "qualified-control-redis.current", "a" * 255])
+def test_owned_history_file_is_atomic_id_pinned_and_repeatable(runner, order, name):
     source = record()
+    reference = {**HISTORY, "secret_name": name}
     if runner:
         source["Spec"]["Name"] = "vp-channel-agent-runner-swarm"
     before = copy.deepcopy(source)
@@ -78,15 +81,15 @@ def test_owned_history_file_is_atomic_id_pinned_and_repeatable(runner, order):
         if runner:
             return HELPER["_owned_history_runner_update_spec"](
                 value, SERVICE, "vp-channelops-runner-go:deploy-0123456789ab", order,
-                "10001:10001", "colima-127", HISTORY,
+                "10001:10001", "colima-127", reference,
             )
-        return target(value, order, owned_history=HISTORY)
+        return target(value, order, owned_history=reference)
 
     desired = build(source)
     c = desired["TaskTemplate"]["ContainerSpec"]
     mounted = [s for s in c["Secrets"] if s["File"]["Name"] == "owned-history-redis-url"]
     uid = "10001" if runner else "0"
-    assert mounted == [{"SecretName": HISTORY["secret_name"], "SecretID": HISTORY["docker_secret_id"],
+    assert mounted == [{"SecretName": name, "SecretID": HISTORY["docker_secret_id"],
                         "File": {"Name": "owned-history-redis-url", "UID": uid, "GID": uid, "Mode": 256}}]
     assert c["Env"].count("OWNED_HISTORY_REDIS_URL_FILE=/run/secrets/owned-history-redis-url") == 1
     assert "KEEP=private-value" in c["Env"]
@@ -99,15 +102,17 @@ def test_owned_history_file_is_atomic_id_pinned_and_repeatable(runner, order):
     assert source == before
 
 
-@pytest.mark.parametrize("fault", ["generation", "name", "id", "extra", "existing_id", "duplicate",
+@pytest.mark.parametrize("fault", ["generation", "name", "long_name", "id", "extra", "existing_id", "duplicate",
                                   "wrong_env", "bind_shadow", "config_shadow"])
 def test_owned_history_file_refuses_unbound_or_ambiguous_mount(fault):
     source = record()
     reference = copy.deepcopy(HISTORY)
     c = source["Spec"]["TaskTemplate"]["ContainerSpec"]
-    if fault in {"generation", "name", "id", "extra"}:
+    if fault == "long_name":
+        reference["secret_name"] = "a" * 256
+    elif fault in {"generation", "name", "id", "extra"}:
         key = {"generation": "runtime_generation", "name": "secret_name", "id": "docker_secret_id", "extra": "extra"}[fault]
-        reference[key] = "wrong"
+        reference[key] = "bad/name" if fault == "name" else "wrong"
     elif fault in {"existing_id", "duplicate"}:
         entry = {"SecretID": "z" * 25 if fault == "existing_id" else HISTORY["docker_secret_id"],
                  "SecretName": HISTORY["secret_name"],

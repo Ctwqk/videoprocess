@@ -37,6 +37,7 @@ OUTCOMES = {"retired", "already_absent", "unknown"}
 CREDENTIAL_FIELDS = {
     "control_generation",
     "redis_generation",
+    "redis_secret_name",
     "redis_username",
     "database_secret_id",
     "redis_secret_id",
@@ -321,6 +322,9 @@ def validate_binding(binding: dict) -> None:
     credentials = exact(binding["credentials"], CREDENTIAL_FIELDS)
     for key in ("control_generation", "redis_generation"):
         require(matches(credentials[key], r"[a-z0-9][a-z0-9-]{0,62}"))
+    require(
+        matches(credentials["redis_secret_name"], r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+    )
     require(
         matches(credentials["redis_username"], r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
         and credentials["redis_username"] != "default"
@@ -926,6 +930,9 @@ def _job_spec(
     require(matches(manager_node_id, r"[a-z0-9]{25}"))
     directory = str(Path(files["request"]["path"]).parent)
     require("," not in directory and "\n" not in directory)
+    require(
+        matches(credentials.get("redis_secret_name"), r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+    )
     secret_refs = [
         (
             credentials["database_secret_id"],
@@ -934,7 +941,7 @@ def _job_spec(
         ),
         (
             credentials["redis_secret_id"],
-            "vp-control-redis-" + credentials["redis_generation"],
+            credentials["redis_secret_name"],
             "redis-url",
         ),
     ]
@@ -1355,9 +1362,13 @@ async def capture_managed(value: dict) -> dict:
                 {
                     "control_generation",
                     "redis_generation",
+                    "redis_secret_name",
                     "database_secret_id",
                     "redis_secret_id",
                 },
+            )
+            require(
+                matches(credentials["redis_secret_name"], r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
             )
             database, redis = _read_mount("database"), _read_mount("redis")
             principal = role_names_for_generation(

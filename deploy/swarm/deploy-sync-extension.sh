@@ -12216,7 +12216,7 @@ try:
     if set(ref)!={"runtime_generation","secret_name","docker_secret_id"}: raise ValueError
     generation=ref["runtime_generation"]
     if not re.fullmatch(r"[0-9a-f]{40}",generation): raise ValueError
-    if ref["secret_name"]!="vp-control-redis-"+generation or not re.fullmatch(r"[a-z0-9]{25}",ref["docker_secret_id"]): raise ValueError
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}",ref["secret_name"]) or not re.fullmatch(r"[a-z0-9]{25}",ref["docker_secret_id"]): raise ValueError
     print(ref["secret_name"]+"|"+ref["docker_secret_id"])
 except (KeyError,TypeError,ValueError): raise SystemExit(1)
 ' <<<"$state"
