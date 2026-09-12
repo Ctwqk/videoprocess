@@ -16,6 +16,7 @@ import (
 // or seven-day proof. The tested producer/completion writes use real native TXs.
 func ownedClosureHistory(t *testing.T, data ownedInventoryData, index int, task map[string]any, at, now time.Time, stage string) map[string]any {
 	t.Helper()
+	at = at.UTC()
 	input := data.Items[index]
 	seedData := ownedInventoryData{Items: []ownedInventoryInput{{Item: historyTestCopy(t, input.Item).(map[string]any), Seed: historyTestCopy(t, input.Seed).(map[string]any)}}}
 	if stage == "promotion" {
