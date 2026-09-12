@@ -1100,8 +1100,10 @@ func (h HandlerService) preparePromotion(
 			if targetVisibility != "unlisted" {
 				return promotionPreparation{}, ownedHistoryError("owned_inventory_publication_privacy")
 			}
-			if _, _, _, _, err := ownedPendingPlan(task); err != nil {
+			if _, _, _, found, err := ownedPendingPlan(task); err != nil {
 				return promotionPreparation{}, err
+			} else if !found {
+				return promotionPreparation{}, ErrHandlerSnapshotStale
 			}
 			if existingOperation != nil {
 				if err := requireOwnedPromotionPolicy(publication, task, targetVisibility, existingOperation.Decision); err != nil {

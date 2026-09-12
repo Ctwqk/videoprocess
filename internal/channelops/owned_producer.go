@@ -264,6 +264,11 @@ func ownedPromotionPolicyRequest(publication PublicationRow, task ProductionTask
 }
 
 func requireOwnedPromotionPolicy(publication PublicationRow, task ProductionTaskRow, target string, decision PDSDecision) error {
+	if _, _, _, found, err := ownedPendingPlan(task); err != nil {
+		return err
+	} else if !found {
+		return ErrHandlerSnapshotStale
+	}
 	if target != "unlisted" || publication.ProductionTaskID != task.ID || publication.AccountID != task.TargetAccountID || publication.Platform != "youtube" {
 		return ownedHistoryError("owned_inventory_publication_identity")
 	}
@@ -391,9 +396,8 @@ func assessOwnedProducerSnapshot(snapshot ownedHistorySnapshot, now time.Time, t
 	}
 	rows := snapshot.rows()
 	if identity.InventoryID != "" {
-		task := historyIndex(rows["production_tasks"])[taskID]
-		item := historyIndex(rows["owned_seed_inventory_items"])[identity.ItemID]
-		_, _, _ = historyNormal(historyTask(rows, task), item, now)
+		// Current-task retry state is fenced by the native queue lease, not A1's
+		// prior-effect normal-history gate. Complete classification stays above.
 		for _, op := range historyRows(rows["youtube_upload_operations"]) {
 			if op["production_task_id"] == taskID {
 				currentHash := historyHashValue(op["content_sha256"])

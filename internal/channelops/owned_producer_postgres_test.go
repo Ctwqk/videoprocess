@@ -67,7 +67,7 @@ func (a *ownedProducerPGAutoFlow) ApprovePlan(ctx context.Context, planID string
 	if task.State != TaskSelected || planID != a.planID {
 		a.t.Fatal("approval changed task or plan identity")
 	}
-	if _, err := a.f.store.Pool.Exec(ctx, `UPDATE autoflow_plans SET status='approved',agent_approved_by='native-go-test',approved_revision_hash=$2,approved_revision=execution_revision,updated_at=now() WHERE id=$1::uuid`, planID, strings.Repeat("a", 64)); err != nil {
+	if _, err := a.f.store.Pool.Exec(ctx, `UPDATE autoflow_plans SET status='approved',agent_approved_by='native-go-test',review_approved_at=COALESCE(review_approved_at,now()),approved_revision_hash=$2,approved_revision=execution_revision,updated_at=now() WHERE id=$1::uuid`, planID, strings.Repeat("a", 64)); err != nil {
 		return AutoFlowApprovalObservation{}, err
 	}
 	if a.loseFirstApproval && a.approveCalls == 1 {
@@ -148,7 +148,57 @@ func ownedProducerPGReclaimAfterFailure(t *testing.T, f *ownedPGFixture, ctx con
 	if retry.ID != item.ID || retry.AttemptCount != item.AttemptCount+1 || retry.LastError == nil || *retry.LastError != failure.Error() || retry.LockedAt == nil || retry.LockedBy == nil || !retry.LockedAt.After(*item.LockedAt) || !ownedPolicyJSONEqual(retry.PayloadJSON, item.PayloadJSON) || retry.IdempotencyKey != item.IdempotencyKey {
 		t.Fatal("native reclaim changed identity or lost error/attempt history")
 	}
+	entered := false
+	if err := f.store.WithQueueExecutionFence(ctx, item, func(*Store) error { entered = true; return nil }); !errors.Is(err, ErrQueueLeaseLost) || entered {
+		t.Fatal("original lease still authorized after native reclaim", err)
+	}
 	return *retry
+}
+
+func ownedProducerPGAssertRecoveredHistoryHeld(t *testing.T, f *ownedPGFixture, ctx context.Context, item QueueItemRow) {
+	t.Helper()
+	before := ownedProducerPGAssertTask(t, f, ctx, TaskPlanning, 1)
+	if item.AttemptCount != 2 {
+		t.Fatal("strict completion proof requires the actual second native attempt")
+	}
+	// Exercise Task5's existing accounting/repair entry under the exact current
+	// claim. Normal success clears last_error; the failed-attempt count survives.
+	if err := f.store.WithQueueExecutionFence(ctx, item, func(fenced *Store) error {
+		if err := fenced.MarkQueueDone(ctx, item); err != nil {
+			return err
+		}
+		return fenced.finalizeOwnedInventoryItems(ctx, f.channel.ID, "")
+	}); err != nil {
+		t.Fatal("strict Task5 accounting boundary", err)
+	}
+	var state, reason, queueState string
+	var attempts, completed int
+	var lastError, owner *string
+	var locked *time.Time
+	if err := f.store.Pool.QueryRow(ctx, `SELECT i.state,i.hold_reason,q.status,q.attempt_count,q.last_error,q.locked_by,q.locked_at,(SELECT count(*) FROM owned_seed_inventory_items WHERE inventory_id=i.id AND state='completed') FROM owned_seed_inventories i CROSS JOIN channel_ops_queue_items q WHERE i.id=$1::uuid AND q.id=$2::uuid`, *f.channel.OwnedSeedInventoryID, item.ID).Scan(&state, &reason, &queueState, &attempts, &lastError, &owner, &locked, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if state != "held" || reason != "owned_inventory_queue_failed" || queueState != QueueStatusSucceeded || attempts != 2 || lastError != nil || owner != nil || locked != nil || completed != 0 {
+		t.Fatal("retry was erased or strict completion/replacement guard weakened", state, reason, attempts, completed)
+	}
+	snapshot, err := loadOwnedHistorySnapshot(ctx, f.store.Pool, ownedString(f.data.Inventory["platform_channel_id"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assessment := assessOwnedHistorySnapshot(snapshot, snapshot.observedAt)
+	if assessment.BlockReason == nil || *assessment.BlockReason != "owned_inventory_queue_failed" {
+		t.Fatal("A1 accepted recovered prior history", assessment)
+	}
+	noPDS := ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
+		t.Fatal("held recovered item attempted replacement policy")
+		return PDSDecision{}, nil
+	})
+	if err := f.store.RunTick(ctx, f.channel.ID, "after-native-recovery-held", HandlerService{PDS: noPDS}); !errors.Is(err, ErrChannelExecutionBlocked) {
+		t.Fatal("held native tick did not refuse replacement", err)
+	}
+	if after := ownedProducerPGAssertTask(t, f, ctx, TaskPlanning, 1); !bytes.Equal(mustJSON(before), mustJSON(after)) {
+		t.Fatal("strict history hold replaced or changed original recovered task/plan/PDS")
+	}
 }
 
 func TestOwnedProducerPGPlanFreshFenceAndRealPolicy(t *testing.T) {
@@ -269,6 +319,7 @@ func TestOwnedProducerPGApprovalResultLossReusesDurablePlan(t *testing.T) {
 	if calls != 1 || api.planCalls != 1 || api.approveCalls != 2 {
 		t.Fatal("retry replanned or reevaluated PDS", calls, api.planCalls, api.approveCalls)
 	}
+	ownedProducerPGAssertRecoveredHistoryHeld(t, f, ctx, item)
 }
 
 func TestOwnedProducerPGNativePlanResponseLossReusesOriginalBinding(t *testing.T) {
@@ -302,6 +353,7 @@ func TestOwnedProducerPGNativePlanResponseLossReusesOriginalBinding(t *testing.T
 	if err := f.store.Pool.QueryRow(ctx, `SELECT count(*) FROM autoflow_plans WHERE id=$1::uuid`, api.planID).Scan(&count); err != nil || count != 1 {
 		t.Fatal("original native plan not reused", err)
 	}
+	ownedProducerPGAssertRecoveredHistoryHeld(t, f, ctx, item)
 }
 
 type ownedProducerRollbackTx struct {
@@ -371,4 +423,5 @@ func TestOwnedProducerPGPlanningRollbackKeepsOriginalPendingPlan(t *testing.T) {
 		t.Fatal("normal retry after rollback", err)
 	}
 	ownedProducerPGAssertTask(t, f, ctx, TaskPlanning, 1)
+	ownedProducerPGAssertRecoveredHistoryHeld(t, f, ctx, item)
 }

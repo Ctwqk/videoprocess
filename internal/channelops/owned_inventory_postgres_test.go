@@ -135,6 +135,10 @@ func newOwnedPGFixture(t *testing.T) *ownedPGFixture {
 }
 
 func newOwnedPGFixtureWithHistory(t *testing.T, legacy func(*Store, time.Time) map[string]any) *ownedPGFixture {
+	return newOwnedPGFixtureWithWindow(t, legacy, time.Hour)
+}
+
+func newOwnedPGFixtureWithWindow(t *testing.T, legacy func(*Store, time.Time) map[string]any, age time.Duration) *ownedPGFixture {
 	t.Helper()
 	if testing.Short() || os.Getenv("OWNED_INVENTORY_DISPOSABLE_TEST_URL") == "" {
 		t.Skip("explicit disposable inventory PostgreSQL required")
@@ -201,7 +205,7 @@ func newOwnedPGFixtureWithHistory(t *testing.T, legacy func(*Store, time.Time) m
 	inventoryID := ownedString(data.Inventory["id"])
 	channel.OwnedSeedInventoryID = &inventoryID
 	data.AccountIDs = []string{ownedString(data.Inventory["target_account_id"])}
-	starts := now.UTC().Add(-time.Hour)
+	starts := now.UTC().Add(-age)
 	data.Inventory["starts_at"], data.Inventory["expires_at"], data.Inventory["approved_at"] = ownedISO(starts), ownedISO(starts.Add(168*time.Hour)), ownedISO(starts)
 	for _, kind := range []string{"channel", "account", "lane", "format"} {
 		row := ownedMap(data.Bindings[kind])
