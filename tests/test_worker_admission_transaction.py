@@ -39,6 +39,71 @@ def marker_secret(purpose="readiness", serial=500):
     )
 
 
+class RegisteredServiceInventoryTests(unittest.TestCase):
+    def inventory(self, listed, inspected=""):
+        calls = []
+        self.inventory_calls = calls
+
+        def docker(arguments, **kwargs):
+            calls.append(arguments)
+            if arguments == ["service", "ls", "--format", "{{.Name}}"]:
+                return listed
+            if arguments[:4] == [
+                "service", "inspect", "--format", "{{.ID}} {{.Spec.Name}}"
+            ]:
+                if isinstance(inspected, Exception):
+                    raise inspected
+                return inspected
+            # Real service ls rejects --no-trunc; its ID and quiet formats
+            # return only 12 characters and cannot establish full identity.
+            raise HELPER["TransactionError"]("unsupported service inventory command")
+
+        function = HELPER["_registered_services"]
+        with patch.dict(function.__globals__, _registered_docker=docker):
+            result = function()
+        return result, calls
+
+    def test_resolves_complete_service_identities_with_supported_cli_commands(self):
+        first = "a" * 25
+        second = "a" * 12 + "b" * 13
+        result, calls = self.inventory(
+            "vp-first\nvp-second",
+            f"{second} vp-second\n{first} vp-first",
+        )
+        self.assertEqual(result, {first: "vp-first", second: "vp-second"})
+        self.assertEqual(calls, [
+            ["service", "ls", "--format", "{{.Name}}"],
+            ["service", "inspect", "--format", "{{.ID}} {{.Spec.Name}}",
+             "vp-first", "vp-second"],
+        ])
+
+    def test_successful_empty_inventory_does_not_inspect_without_references(self):
+        result, calls = self.inventory("")
+        self.assertEqual(result, {})
+        self.assertEqual(len(calls), 1)
+
+    def test_rejects_invalid_or_duplicate_names_before_inspect(self):
+        for listed in ("--help", "vp first", "vp-first\nvp-first", "vp-first\n\nvp-second"):
+            with self.subTest(listed=listed), self.assertRaises(HELPER["TransactionError"]):
+                self.inventory(listed)
+            self.assertEqual(len(self.inventory_calls), 1)
+
+    def test_rejects_changed_or_ambiguous_inspection(self):
+        for inspected in (
+            "", "a" * 12 + " vp-first", "a" * 25 + " vp-renamed",
+            "a" * 25 + " vp-first\n" + "b" * 25 + " vp-first",
+            "a" * 25 + " vp-first\n" + "a" * 25 + " vp-second",
+            "a" * 25 + " vp-first extra",
+            HELPER["TransactionError"]("service disappeared during inspect"),
+        ):
+            with self.subTest(inspected=inspected), self.assertRaises(HELPER["TransactionError"]):
+                self.inventory("vp-first", inspected)
+
+    def test_refuses_partial_batch_instead_of_reporting_absence(self):
+        with self.assertRaises(HELPER["TransactionError"]):
+            self.inventory("vp-first\nvp-second", "a" * 25 + " vp-first")
+
+
 class RollbackPreparedSecretTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -1546,13 +1611,16 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
 
         def docker(arguments, **kwargs):
             if arguments[:2] == ["service", "inspect"]:
+                if arguments[2:4] == ["--format", "{{.ID}} {{.Spec.Name}}"]:
+                    return "s" * 25 + " " + job["spec"]["Name"]
                 return json.dumps([{"ID": "s" * 25, "Spec": job["spec"]}])
             if arguments[:2] == ["service", "rm"]:
                 present[0] = False
                 removed.append(arguments[-1])
                 return ""
             if arguments[:2] == ["service", "ls"]:
-                return ("s" * 25 + " " + job["spec"]["Name"]) if present[0] else ""
+                self.assertEqual(arguments[2:], ["--format", "{{.Name}}"])
+                return job["spec"]["Name"] if present[0] else ""
             if arguments[:2] == ["container", "ls"]:
                 return "c" * 64
             if arguments[:2] == ["container", "inspect"]:
@@ -1674,8 +1742,11 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
         def docker(arguments, **kwargs):
             actions.append(arguments[:2])
             if arguments[:2] == ["service", "ls"]:
-                return ("s" * 25 + " " + job["spec"]["Name"]) if present[0] else ""
+                self.assertEqual(arguments[2:], ["--format", "{{.Name}}"])
+                return job["spec"]["Name"] if present[0] else ""
             if arguments[:2] == ["service", "inspect"]:
+                if arguments[2:4] == ["--format", "{{.ID}} {{.Spec.Name}}"]:
+                    return "s" * 25 + " " + job["spec"]["Name"]
                 return json.dumps([{"ID": "s" * 25, "Spec": job["spec"]}])
             if arguments[:2] == ["service", "rm"]:
                 self.assertEqual(arguments[-1], "s" * 25)

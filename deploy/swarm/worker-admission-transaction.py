@@ -5717,16 +5717,37 @@ def _cleanup_registered_secret(raw_root: str, raw_descriptor: str, key: str) -> 
 
 
 def _registered_services() -> dict[str, str]:
-    rows = _registered_docker(
-        ["service", "ls", "--format", "{{.ID}} {{.Name}}", "--no-trunc"]
-    )
+    # service ls truncates IDs and has no --no-trunc flag. Resolve names with
+    # inspect, refusing a partial or changed batch instead of inferring absence.
+    names = _registered_docker(
+        ["service", "ls", "--format", "{{.Name}}"]
+    ).splitlines()
+    for name in names:
+        _require_string(name, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
+    expected_names = set(names)
+    if len(expected_names) != len(names):
+        raise TransactionError
+    if not names:
+        return {}
+    rows = _registered_docker([
+        "service", "inspect", "--format", "{{.ID}} {{.Spec.Name}}", *names,
+    ])
     result = {}
+    observed_names = set()
     for row in rows.splitlines():
         values = row.split()
-        if len(values) != 2 or values[0] in result:
+        if (
+            len(values) != 2
+            or values[0] in result
+            or values[1] not in expected_names
+            or values[1] in observed_names
+        ):
             raise TransactionError
         _require_string(values[0], r"[a-z0-9]{25}")
         result[values[0]] = values[1]
+        observed_names.add(values[1])
+    if observed_names != expected_names:
+        raise TransactionError
     return result
 
 
