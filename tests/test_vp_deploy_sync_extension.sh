@@ -425,7 +425,7 @@ exit "${CHANNEL_BUILD_STATUS:-0}"
 EOF
   chmod 0700 "$fake_dir/docker"
   printf '%s\n' "$script" >"$fake_dir/build.sh"
-  env -i PATH="$fake_dir:$PATH" HOME="$HOME" TMPDIR="$TMPDIR" \
+  env -i PATH="$fake_dir:$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-$TEST_ROOT}" \
     CALLS="$CALLS" CHANNEL_BUILD_STATUS="${CHANNEL_BUILD_STATUS:-0}" \
     /bin/sh "$fake_dir/build.sh" "$@"
 }
