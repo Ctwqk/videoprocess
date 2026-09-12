@@ -102,7 +102,8 @@ write_state() {
 mkdir -p "$FAKE_BIN"
 : >"$CALLS"
 : >"$ALL_CALLS"
-printf 'VP_PYTHON_WORKER_DATABASE_URL=%s\n' "$SECRET_URL" >"$DEPLOY_ENV"
+printf 'VP_PYTHON_WORKER_DATABASE_URL=%s\nREDIS_URL=%s\n' "$SECRET_URL" \
+  'redis://history-reader:do-not-log-redis@redis.example:6380/0' >"$DEPLOY_ENV"
 
 cat >"$FAKE_BIN/docker" <<'FAKE_DOCKER'
 #!/usr/bin/env bash
@@ -293,6 +294,7 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
 fi
 
 if [[ "${1:-}" == "run" ]]; then
+  [[ "${REDIS_URL:-}" == 'redis://history-reader:do-not-log-redis@redis.example:6380/0' ]] || exit 91
   exit "${FAKE_CLI_EXIT:-0}"
 fi
 
@@ -528,7 +530,9 @@ done
   || fail "healthy run must query exactly 5 Redis streams"
 [[ "$(grep -Fc 'docker|exec|constructure_vp_redis|redis-cli|-p|6380|--raw|XINFO|CONSUMERS|' "$CALLS")" -eq 5 ]] \
   || fail "healthy run must query exactly 5 Redis consumer sets"
-assert_contains 'docker|run|--rm|--env|DATABASE_URL|vp-ffmpeg-worker-python:deploy-0123456789ab|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
+assert_contains 'docker|run|--rm|--env|DATABASE_URL|--env|REDIS_URL|vp-ffmpeg-worker-python:deploy-0123456789ab|python|-m|app.channel_agent.soak_guard_cli' "$CALLS"
+assert_not_contains 'do-not-log-redis' "$ALL_CALLS"
+assert_not_contains 'do-not-log-redis' "$OUTPUT"
 assert_contains '|--channel-id|123e4567-e89b-12d3-a456-426614174000' "$CALLS"
 assert_contains '|--started-at|2026-07-19T18:30:00Z' "$CALLS"
 assert_not_contains "$SECRET_URL" "$CALLS"

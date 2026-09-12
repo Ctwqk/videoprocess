@@ -389,6 +389,7 @@ fi
 guard_args=(
   run --rm
   --env DATABASE_URL
+  --env REDIS_URL
   "$trusted_python_image"
   python -m app.channel_agent.soak_guard_cli
   --channel-id "$channel_id"
@@ -405,6 +406,9 @@ if [[ "$auto_hold" == "true" ]]; then
 fi
 
 export DATABASE_URL="$VP_PYTHON_WORKER_DATABASE_URL"
+# The typed profile rechecks retired evidence using the existing named reader.
+# Pass credentials only through the environment, never Docker arguments/logs.
+export REDIS_URL="${REDIS_URL:-}"
 unset VP_PYTHON_WORKER_DATABASE_URL
 
 guard_exit=0
