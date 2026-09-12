@@ -127,7 +127,8 @@ async def test_empty_status_is_off_and_service_matches_api(session, client):
     response = await client.get(f"{PREFIX}/channels/{owner.id}/policy-status")
     assert response.status_code == 200
     assert response.json() == {
-        "channel_id": str(owner.id), "mode": "off", "latest_policy": None, "current_activation": None,
+        "channel_id": str(owner.id), "mode": "off", "latest_policy": None,
+        "latest_validated_policy": None, "current_activation": None,
     }
     from app.services.policy_evidence import get_policy_status
 
@@ -151,7 +152,8 @@ async def test_versions_are_channel_linked_deduplicated_and_latest_validated(ses
     rows = (await client.get(f"{PREFIX}/channels/{owner.id}/policy-versions")).json()
     assert [row["version"] for row in rows] == ["v4", "v3", "v2", "v1"]
     status = (await client.get(f"{PREFIX}/channels/{owner.id}/policy-status")).json()
-    assert status["latest_policy"]["id"] == str(latest.id)
+    assert status["latest_policy"]["id"] == str(retired.id)
+    assert status["latest_validated_policy"]["id"] == str(latest.id)
     assert status["mode"] == "shadow"
     assert status["current_activation"]["policy_version_id"] == str(retired.id)
     assert (await client.get(f"{PREFIX}/channels/{owner.id}/policy-versions/{foreign.id}")).status_code == 404
@@ -201,8 +203,30 @@ async def test_status_does_not_invent_validated_policy_from_other_stored_version
     await policy(session, number=2)
     response = await client.get(f"{PREFIX}/channels/{owner.id}/policy-status")
     assert response.status_code == 200
-    assert response.json()["latest_policy"] is None
+    assert response.json()["latest_policy"]["id"] == str(version.id)
+    assert response.json()["latest_policy"]["status"] == status
+    assert response.json()["latest_validated_policy"] is None
     assert response.json()["mode"] == "off"
+
+
+async def test_status_returns_newer_draft_and_older_validated_independently_of_activation(session, client):
+    owner, other = await channel(session), await channel(session)
+    validated = await policy(session)
+    draft = await policy(session, number=2, status="draft", created_at=NOW + timedelta(days=1))
+    foreign = await policy(session, number=3, created_at=NOW + timedelta(days=2))
+    await tick(session, owner, validated)
+    await tick(session, owner, draft)
+    await tick(session, other, foreign)
+    await activation(session, owner, validated, mode="active", account=uuid4())
+    response = await client.get(f"{PREFIX}/channels/{owner.id}/policy-status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["latest_policy"]["id"] == str(draft.id)
+    assert body["latest_policy"]["status"] == "draft"
+    assert body["latest_validated_policy"]["id"] == str(validated.id)
+    assert body["latest_validated_policy"]["status"] == "validated"
+    assert body["mode"] == "off"
+    assert body["current_activation"] is None
 
 
 async def test_activation_starts_inclusively_and_created_at_precedes_id_tiebreak(session):
@@ -333,6 +357,7 @@ async def test_empty_and_legacy_explanations_are_explicit_not_reconstructed(sess
     body = response.json()
     assert body["replay_status"] == state
     assert body["snapshots"] == []
+    assert body["decision_summary_json"] == {}
     if state != "snapshot_complete":
         assert body["policy"] is None
         assert body["policy_version_id"] is None
@@ -344,6 +369,61 @@ async def test_empty_and_legacy_explanations_are_explicit_not_reconstructed(sess
             assert body["decisions"][0][field] is None
     else:
         assert body["decisions"] == []
+
+
+@pytest.mark.parametrize("state", ["snapshot_complete", "snapshot_pending", "legacy_unreplayable"])
+async def test_explanation_preserves_exact_stored_decision_summary(session, client, state):
+    owner = await channel(session)
+    version = await policy(session)
+    audit = await tick(session, owner, version if state != "legacy_unreplayable" else None, state=state)
+    if state == "legacy_unreplayable":
+        summary = {
+            "legacy_selection": ["historic-candidate"],
+            "pds_request_json": {"context": "legacy-request-not-reconstructed"},
+            "historical_unknown": None,
+        }
+    else:
+        await candidate(session, audit, version)
+        summary = {
+            "snapshot_decisions": {
+                "accepted": {
+                    "decision": "accepted",
+                    "rejection_guard": "",
+                    "rejection_reason": "",
+                    "score_json": {"hash-covered-score": 7.125},
+                    "guard_results_json": [{"guard": "stored-guard", "verdict": "allow"}],
+                    "pds_decision_json": {"hash-covered-verdict": "stored-only"},
+                    "pds_request_json": {
+                        "request_id": "exact-pds-request-47",
+                        "context": {"policy_hash": "f" * 64, "ordered_values": [3, None, False, 0]},
+                    },
+                    "learning_context_json": {"stored_reference": "as-of-not-current"},
+                    "baseline_score": 7.125,
+                    "final_score": None,
+                    "rank": None,
+                },
+            },
+            "unrecognized_stored_metadata": {"retain": [None, "", {}, []]},
+        }
+    audit.decision_summary_json = summary
+    await session.commit()
+    await session.refresh(audit)
+
+    response = await client.get(f"{PREFIX}/ticks/{audit.id}/decision-explanation")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["replay_status"] == state
+    assert body["decision_summary_json"] == summary
+    await session.refresh(audit)
+    assert audit.decision_summary_json == summary
+    if state == "legacy_unreplayable":
+        assert "snapshot_decisions" not in body["decision_summary_json"]
+        assert body["policy"] is None
+    else:
+        assert body["decisions"][0]["score_json"] == {"stored_score": 1.25}
+        assert body["decision_summary_json"]["snapshot_decisions"]["accepted"]["score_json"] == {
+            "hash-covered-score": 7.125,
+        }
 
 
 async def test_explanation_does_not_truncate_at_list_cap(session, client):

@@ -415,6 +415,7 @@ class PolicyStatusRead(BaseModel):
     channel_id: UUID
     mode: Literal["off", "shadow", "canary", "active"]
     latest_policy: PolicyVersionRead | None
+    latest_validated_policy: PolicyVersionRead | None
     current_activation: PolicyActivationRead | None
 
 
@@ -490,5 +491,6 @@ class TickDecisionExplanationRead(BaseModel):
     policy: PolicyVersionRead | None
     candidate_set_hash: str | None
     feature_as_of: datetime | None
+    decision_summary_json: dict[str, Any]
     snapshots: list[CandidateFeatureSnapshotRead]
     decisions: list[PolicyDecisionEvidenceRead]

@@ -57,7 +57,8 @@ async def get_policy_status(
     db: AsyncSession, channel_id: UUID, *, now: datetime | None = None,
 ) -> PolicyStatusRead:
     await _require_channel(db, channel_id)
-    latest = await db.scalar(
+    latest = await db.scalar(_channel_versions(channel_id).limit(1))
+    latest_validated = await db.scalar(
         _channel_versions(channel_id).where(DecisionPolicyVersion.status == "validated").limit(1)
     )
     as_of = now if now is not None else datetime.now(timezone.utc)
@@ -73,6 +74,9 @@ async def get_policy_status(
         channel_id=channel_id,
         mode=current.mode if current is not None else "off",
         latest_policy=PolicyVersionRead.model_validate(latest) if latest is not None else None,
+        latest_validated_policy=(
+            PolicyVersionRead.model_validate(latest_validated) if latest_validated is not None else None
+        ),
         current_activation=current,
     )
 
@@ -154,6 +158,7 @@ async def get_decision_explanation(db: AsyncSession, tick_audit_id: UUID) -> Tic
         "policy": PolicyVersionRead.model_validate(policy) if policy is not None else None,
         "candidate_set_hash": tick.candidate_set_hash,
         "feature_as_of": tick.feature_as_of,
+        "decision_summary_json": tick.decision_summary_json,
         "snapshots": [CandidateFeatureSnapshotRead.model_validate(row) for row in snapshots],
         "decisions": [PolicyDecisionEvidenceRead.model_validate(row) for row in decisions],
     })
