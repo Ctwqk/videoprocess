@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import copy
 import uuid
@@ -207,6 +208,119 @@ async def test_policy_runs_without_database_transaction(owned_env):
         async def action():
             assert not db.in_transaction()
         await ChannelAgentService(pds_client=Policy(action)).tick(db, channel_id=owned_env.channel_id)
+
+
+async def test_policy_advisory_allows_atomic_admission_and_replay(owned_env):
+    policy = Policy(metadata={"warning": "advisory"})
+    audit = await tick(owned_env, policy)
+    result = await state(owned_env)
+    assert audit.tasks_selected == len(result["tasks"]) == 1
+    task, first = result["tasks"][0], result["items"][0]
+    assert first.state == "reserved" and first.production_task_id == task.id
+    assert task.agent_approval_evidence_json["candidate_pds"]["metadata"] == {"warning": "advisory"}
+    assert sum(s.status == "exhausted" for s in result["seeds"]) == 1
+    assert len(result["decisions"]) == 1 and result["decisions"][0].created_task_id == task.id
+    assert [(q.kind, q.idempotency_key) for q in result["queue"]] == [("plan_task", f"plan_task:{task.id}")]
+    await tick(owned_env, policy)
+    assert len(policy.calls) == len((await state(owned_env))["tasks"]) == 1
+
+
+@pytest.mark.parametrize("metadata", [
+    {"warning": "pds_disabled"}, {"warning": "pds_unavailable"}, {"warning": "pds_parse_failed"},
+    {"warning": "advisory", "fail_policy": "allow"},
+])
+async def test_policy_fail_markers_hold_even_with_allow_verdict(owned_env, metadata):
+    policy = Policy(metadata=metadata)
+    audit = await tick(owned_env, policy)
+    result = await state(owned_env)
+    assert len(policy.calls) == 1 and audit.tasks_selected == 0
+    assert result["inventory"].state == "held"
+    assert result["inventory"].hold_reason == "owned_inventory_pds_denied"
+    assert result["channel"].intake_paused_at is not None
+    assert not result["tasks"] and not result["queue"]
+    assert all(i.state == "unused" for i in result["items"])
+    assert all(s.status == "active" for s in result["seeds"])
+
+
+@pytest.mark.parametrize("close_mode", ["success", "error", "timeout"])
+async def test_redis_cancel_never_reenters_or_finalizes(owned_env, monkeypatch, close_mode):
+    env = owned_env
+    item = await claimed_tick(env)
+    entered = asyncio.Event()
+    lock_calls, finish_calls, close_calls = [], [], []
+    original_lock, original_finish = admission.lock_scope, admission.finish
+    original_timeout = asyncio.timeout
+    monkeypatch.setattr(asyncio, "timeout", lambda seconds: original_timeout(0.01 if seconds == 5 else seconds))
+
+    class Reader:
+        async def acl_whoami(self):
+            entered.set()
+            await asyncio.Future()
+
+        async def aclose(self):
+            close_calls.append(True)
+            if close_mode == "error":
+                raise RuntimeError("close-failed")
+            if close_mode == "timeout":
+                await asyncio.Future()
+
+    async def locked(*args):
+        lock_calls.append(True)
+        return await original_lock(*args)
+
+    async def needs_observation(db, phase, observation):
+        if observation is None:
+            raise admission.ObservationRequired(admission.RedisRequest("fixture", phase.now, ()))
+        phase.hold = "owned_history_redis_close_failed"
+
+    async def finished(*args):
+        finish_calls.append(True)
+        return await original_finish(*args)
+
+    monkeypatch.setattr(admission, "lock_scope", locked)
+    monkeypatch.setattr(admission, "assess", needs_observation)
+    monkeypatch.setattr(admission, "finish", finished)
+    monkeypatch.setattr(inventory, "_history_redis", Reader)
+    monkeypatch.setattr(settings, "redis_url", "redis://history-reader:fixture@127.0.0.1:55464/15")
+    policy = Policy()
+    task = asyncio.create_task(tick(env, policy, queue_item=item))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel("cancel-owned-observation")
+        with pytest.raises(asyncio.CancelledError, match="cancel-owned-observation"):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert lock_calls == close_calls == [True]
+    assert not finish_calls and not policy.calls
+    result = await state(env)
+    assert result["inventory"].state == "approved" and result["channel"].intake_paused_at is None
+    assert not result["tasks"] and not result["audits"] and not result["decisions"]
+    assert all(i.state == "unused" for i in result["items"])
+    assert all(s.status == "active" for s in result["seeds"])
+    assert len(result["queue"]) == 1 and result["queue"][0].status == "running"
+
+
+@pytest.mark.parametrize("close_mode", ["error", "timeout"])
+async def test_redis_ordinary_close_failure_remains_an_error(monkeypatch, close_mode):
+    original_timeout = asyncio.timeout
+    monkeypatch.setattr(asyncio, "timeout", lambda seconds: original_timeout(0.01 if seconds == 5 else seconds))
+
+    class Reader:
+        async def acl_whoami(self):
+            return "history-reader"
+
+        async def aclose(self):
+            if close_mode == "error":
+                raise RuntimeError("close-failed")
+            await asyncio.Future()
+
+    monkeypatch.setattr(inventory, "_history_redis", Reader)
+    monkeypatch.setattr(settings, "redis_url", "redis://history-reader:fixture@127.0.0.1:55464/15")
+    with pytest.raises(inventory.OwnedInventoryError, match="owned_history_redis_close_failed"):
+        await admission.observe_redis(admission.RedisRequest("fixture", NOW, ()))
 
 
 async def test_profile_scheduler_minute_and_inactive_pointer_no_rewrite(owned_env):

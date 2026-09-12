@@ -9,6 +9,25 @@ import (
 	"time"
 )
 
+func TestOwnedPythonReleasedLeaderRejectsBeforeDBValidation(t *testing.T) {
+	state := &leaderState{}
+	store := &Store{leadership: state}
+	authority := LeaderAuthority{ServiceName: leaderServiceName, HolderID: "python-go-contender", Epoch: 1}
+	state.publish(authority)
+	fenced := store.withExecutionDB(nil, nil)
+	// Release clears this shared state; its actual SQL/unlock remains parent-PG tested.
+	state.clear(authority)
+	configured, current := fenced.leadership.snapshot()
+	if !configured || current != nil {
+		t.Fatal("released authority remains published")
+	}
+	// A nil DB proves refusal happens before any stale-epoch SQL validation.
+	err := fenced.assertLeaderAuthority(context.Background(), nil, true)
+	if !errors.Is(err, ErrLeaderAuthorityUnavailable) {
+		t.Fatalf("released leader error = %v", err)
+	}
+}
+
 // Only the parent-run Python scratch fixture supplies these exact identities.
 // No fixture data, approval, Go production path, or leader checks are replaced.
 func TestOwnedPythonContenderBridge(t *testing.T) {
@@ -86,8 +105,21 @@ func TestOwnedPythonContenderBridge(t *testing.T) {
 	})}
 	err = h.HandleAgentTick(ctx, *item)
 	if os.Getenv("OWNED_PYTHON_CONTENDER_MODE") == "leader_loss" {
-		if !errors.Is(err, ErrLeaderAuthorityLost) {
+		if !released || !errors.Is(err, ErrLeaderAuthorityUnavailable) {
 			t.Fatalf("actual lost Go leader was not refused: %v", err)
+		}
+		authority := lease.Authority()
+		var releaseRecorded bool
+		if err := store.Pool.QueryRow(ctx, `SELECT EXISTS(
+			SELECT 1 FROM channelops_leader_epochs WHERE service_name=$1 AND holder_id=$2 AND epoch=$3
+			AND released_at IS NOT NULL AND released_at>=heartbeat_at)`,
+			authority.ServiceName, authority.HolderID, authority.Epoch).Scan(&releaseRecorded); err != nil || !releaseRecorded {
+			t.Fatal("actual leader release was not durably recorded")
+		}
+		var goAudits int
+		if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM agent_tick_audits
+			WHERE channel_profile_id=$1::uuid AND decision_summary_json->>'handler_version'='go'`, channel).Scan(&goAudits); err != nil || goAudits != 0 {
+			t.Fatal("released Go contender produced an audit/effect")
 		}
 	} else if err != nil {
 		t.Fatal(err)

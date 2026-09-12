@@ -146,6 +146,15 @@ async def test_pg_actual_go_python_contenders(owned_env, tmp_path, mode):
         await asyncio.gather(python, return_exceptions=True)
     result = await state(env)
     assert len(result["tasks"]) == sum(i.state == "reserved" for i in result["items"]) == 1
+    if mode == "leader_loss":
+        task = result["tasks"][0]
+        assert task.agent_approval_evidence_json["candidate_pds"]["decision_id"] == "fixture"
+        assert sum(s.status == "exhausted" for s in result["seeds"]) == 1
+        plans = [q for q in result["queue"] if q.kind == "plan_task"]
+        assert len(plans) == 1 and plans[0].payload_json["production_task_id"] == str(task.id)
+        selected = [d for d in result["decisions"] if d.selected]
+        assert len(selected) == 1 and selected[0].created_task_id == task.id
+        assert {a.decision_summary_json["handler_version"] for a in result["audits"]} == {"python"}
 
 
 async def test_pg_complete_a1_reader_and_database_clock(owned_env):

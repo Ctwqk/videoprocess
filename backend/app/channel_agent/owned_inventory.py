@@ -11,6 +11,7 @@ from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import select, text, update
 
+from app.channel_agent.service import _is_pds_fail_policy_decision
 from app.config import settings
 from app.models.asset import Asset
 from app.models.channel_agent import (
@@ -121,6 +122,7 @@ def redis_request(snapshot):
 
 async def observe_redis(request):
     client = None
+    cancelled = False
     try:
         url = urlsplit(settings.redis_url)
         principal = unquote(url.username or "")
@@ -144,6 +146,9 @@ async def observe_redis(request):
                     "pending_message_ids": [p["message_id"] for p in pending],
                     "observed_at": request.observed_at.isoformat()}))
             return tuple(result)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except (inv.OwnedInventoryError, history.OwnedHistoryError):
         raise
     except Exception:
@@ -154,7 +159,9 @@ async def observe_redis(request):
                 async with asyncio.timeout(5):
                     await client.aclose()
             except Exception:
-                raise inv.OwnedInventoryError("owned_history_redis_close_failed") from None
+                # Cleanup must not turn cancellation into a durable admission hold.
+                if not cancelled:
+                    raise inv.OwnedInventoryError("owned_history_redis_close_failed") from None
 
 
 def production_target(rows, row, now):
@@ -461,7 +468,7 @@ async def tick(db, service, *, channel_id, inventory_id, queue_item=None, plan_d
         try:
             result = await service.pds_client.decide(before.request)
             decision = json.loads(inv.canonical(asdict(result)))
-            denied = result.verdict != "allow" or bool(result.metadata.get("warning") or result.metadata.get("fail_policy"))
+            denied = result.verdict != "allow" or _is_pds_fail_policy_decision(result)
         except Exception:
             decision = {"verdict": "block", "reason": "owned_inventory_pds_unavailable"}
         phase = await read_phase(db, channel_id, inventory_id, lease)
