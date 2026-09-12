@@ -11,7 +11,7 @@ from app.services import worker_runtime_role_cli as runtime_cli
 from app.services import worker_role_cli_common as role_common
 from app.services import worker_control_role_cli as control_cli
 from app.services import worker_marker_control_role_cli as marker_cli
-from app.services.worker_control_role_cli import ROLE_FUNCTIONS, STABLE_ROLES
+from app.services.worker_control_role_cli import STABLE_ROLES
 from app.services.worker_runtime_role_cli import role_names_for_generation
 from app.services.worker_session_signal_sql import SCHEMA, VERIFY_SQL, bootstrap_sql
 from test_worker_operator_creator_edges_postgres import (
@@ -23,6 +23,17 @@ from test_worker_operator_creator_edges_postgres import (
     _url,
     operator_database as operator_database,
     pytestmark as pytestmark,
+)
+
+
+# This fixture stops at 036; later production operator grants are not installed.
+SESSION_SIGNAL_OPERATOR_SIGNATURES = (
+    "vp_worker_grant_upsert(text,bigint,text,text,jsonb,text,text,text,text,text,"
+    "jsonb,text,text)",
+    "vp_worker_grant_activate(text,bigint)",
+    "vp_worker_grant_revoke(text,bigint,text)",
+    "vp_worker_registration_revoke(text,uuid,text)",
+    "vp_worker_registration_expire(text,uuid)",
 )
 
 
@@ -527,7 +538,7 @@ async def test_real_operator_stable_allowlist_supports_repeated_drain(
     stable = STABLE_ROLES["operator"]
     await f.owner.execute(f'CREATE ROLE "{stable}" NOLOGIN NOINHERIT')
     try:
-        for signature in ROLE_FUNCTIONS["operator"]:
+        for signature in SESSION_SIGNAL_OPERATOR_SIGNATURES:
             await f.owner.execute(
                 f'REVOKE ALL ON FUNCTION public.{signature} FROM "{f.operator_name}"'
             )
