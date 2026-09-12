@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -386,15 +385,46 @@ func TestOwnedB2PGNewBlankOperationDuringQueuedPDS(t *testing.T) {
 
 type ownedB2RollbackTx struct {
 	pgx.Tx
-	stop error
+	stop    error
+	blocked *atomic.Int32
 }
 
-func (p ownedB2RollbackTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if strings.Contains(sql, "INSERT INTO channel_ops_queue_items") {
-		return pgconn.CommandTag{}, p.stop
+func (p ownedB2RollbackTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	// enqueue writes INSERT ... RETURNING through QueryRow, not Exec.
+	if strings.Contains(sql, "INSERT INTO channel_ops_queue_items") && len(args) > 0 && args[0] == QueuePlanTask {
+		p.blocked.Add(1)
+		return ownedB2FenceRow(func(...any) error { return p.stop })
 	}
-	return p.Tx.Exec(ctx, sql, args...)
+	return p.Tx.QueryRow(ctx, sql, args...)
 }
+
+func TestOwnedB2RollbackInjectionUsesActualPlanEnqueue(t *testing.T) {
+	for _, kind := range []string{QueuePlanTask, QueueObserveJob} {
+		t.Run(kind, func(t *testing.T) {
+			stop := errors.New("synthetic plan queue write failure")
+			delegated := errors.New("underlying transaction reached")
+			probe := &ownedB2FenceProbe{stop: delegated}
+			var blocked atomic.Int32
+			tx := ownedB2RollbackTx{Tx: probe, stop: stop, blocked: &blocked}
+			s := &Store{Now: func() time.Time { return time.Unix(1, 0).UTC() }}
+			_, err := s.enqueue(context.Background(), tx, EnqueueOptions{
+				Kind: kind, IdempotencyKey: "offline:" + kind,
+			})
+			if kind == QueuePlanTask {
+				if !errors.Is(err, stop) || len(probe.queries) != 0 || blocked.Load() != 1 {
+					t.Fatalf("actual plan enqueue bypassed rollback injection: %v", err)
+				}
+			} else if !errors.Is(err, delegated) || len(probe.queries) != 1 || blocked.Load() != 0 {
+				t.Fatal("rollback injection intercepted an unrelated queue write")
+			}
+			err = tx.QueryRow(context.Background(), "SELECT clock_timestamp()").Scan()
+			if !errors.Is(err, delegated) {
+				t.Fatal("rollback injection intercepted proof reads")
+			}
+		})
+	}
+}
+
 func TestOwnedB2PGQueuedAtomicRollbackBeforePlanQueue(t *testing.T) {
 	f := newOwnedPGFixtureWithHistory(t, func(s *Store, at time.Time) map[string]any { return ownedB2PGSeedRetirement(t, s, at) })
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -414,12 +444,13 @@ func TestOwnedB2PGQueuedAtomicRollbackBeforePlanQueue(t *testing.T) {
 	candidates := append([]TickCandidate{}, before.Candidates...)
 	candidates[0].PDSDecisionJSON = map[string]any{"verdict": "allow"}
 	stop := errors.New("synthetic plan queue write failure")
+	var blocked atomic.Int32
 	err := h.withOwnedTickQueuePhase(ctx, item, func(fenced HandlerService) error {
-		fenced.Store.executionDB = ownedB2RollbackTx{Tx: fenced.Store.executionDB.(pgx.Tx), stop: stop}
+		fenced.Store.executionDB = ownedB2RollbackTx{Tx: fenced.Store.executionDB.(pgx.Tx), stop: stop, blocked: &blocked}
 		return fenced.Store.finalizeTick(ctx, before, candidates, nil)
 	})
-	if !errors.Is(err, stop) {
-		t.Fatalf("rollback boundary not reached: %T", err)
+	if !errors.Is(err, stop) || blocked.Load() != 1 || reads.Load() < 2 {
+		t.Fatalf("rollback boundary not reached: %T; blocked=%d observations=%d", err, blocked.Load(), reads.Load())
 	}
 	f.assertCounts(t, 0)
 	var audits int
