@@ -141,12 +141,14 @@ async def inventory_env(monkeypatch, request):
             yield db
 
     app.dependency_overrides[get_db] = session_override
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
-                           headers={"Authorization": f"Bearer {TOKEN}"}) as client:
-        yield SimpleNamespace(client=client, factory=factory, storage=storage, data=request_data,
-                              channel_id=channel_id, scope=scope,
-                              url=f"/api/v1/channel-agent/channels/{channel_id}/owned-seed-inventories")
-    await engine.dispose()
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                               headers={"Authorization": f"Bearer {TOKEN}"}) as client:
+            yield SimpleNamespace(client=client, factory=factory, storage=storage, data=request_data,
+                                  channel_id=channel_id, scope=scope,
+                                  url=f"/api/v1/channel-agent/channels/{channel_id}/owned-seed-inventories")
+    finally:
+        await engine.dispose()
 
 
 async def draft(env, label="first"):

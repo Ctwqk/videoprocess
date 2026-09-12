@@ -1183,7 +1183,10 @@ class RegisteredWorkerEventReceiptService:
                         )
                 statement = (
                     select(WorkerTaskDispatch)
-                    .where(WorkerTaskDispatch.delivery_state == "pending")
+                    .where(
+                        WorkerTaskDispatch.delivery_state == "pending",
+                        WorkerTaskDispatch.resolution_state == "unresolved",
+                    )
                     .order_by(WorkerTaskDispatch.created_at)
                     .limit(limit)
                 )

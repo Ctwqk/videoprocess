@@ -1261,6 +1261,51 @@ async def _seed_cancelled_dispatch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_after_observation", [False, True])
+async def test_terminal_pending_dispatch_is_not_republished(
+    receipt_session_factory, monkeypatch, cancel_after_observation,
+) -> None:
+    from app.services import job_execution_authority
+
+    dispatch_id, _ = await _seed_cancelled_dispatch(
+        receipt_session_factory, delivery_state="pending",
+    )
+
+    async def resolve(db):
+        row = await db.get(WorkerTaskDispatch, dispatch_id)
+        row.resolution_state = "cancelled"
+        row.cancelled_at = datetime.now(timezone.utc)
+        await db.flush()
+
+    if cancel_after_observation:
+        original = job_execution_authority.lock_job_execution_entries
+
+        async def resolve_at_entry(db, job_ids):
+            await original(db, job_ids)
+            await resolve(db)
+
+        monkeypatch.setattr(
+            job_execution_authority, "lock_job_execution_entries", resolve_at_entry,
+        )
+    else:
+        async with receipt_session_factory() as db, db.begin():
+            await resolve(db)
+
+    class Redis:
+        async def eval(self, *args):
+            raise AssertionError("terminal resolution must never be republished")
+
+    service = RegisteredWorkerEventReceiptService(receipt_session_factory)
+    await service.reconcile_pending_dispatches(Redis())
+    async with receipt_session_factory() as db:
+        stored = await db.get(WorkerTaskDispatch, dispatch_id)
+        assert stored.resolution_state == "cancelled"
+        assert stored.delivery_state == "pending"
+        assert stored.delivery_attempted_at is None
+        assert stored.redis_message_id is None
+
+
+@pytest.mark.asyncio
 async def test_cancel_before_dispatch_delivery_never_calls_redis(
     receipt_session_factory,
 ) -> None:
