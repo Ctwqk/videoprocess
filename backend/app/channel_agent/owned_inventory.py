@@ -12,7 +12,6 @@ from urllib.parse import unquote, urlsplit
 from sqlalchemy import select, text, update
 
 from app.channel_agent.service import _is_pds_fail_policy_decision
-from app.config import settings
 from app.models.asset import Asset
 from app.models.channel_agent import (
     AgentTickAudit, ChannelOpsQueueItem, ChannelProfile, DecisionAuditEntry,
@@ -124,14 +123,15 @@ async def observe_redis(request):
     client = None
     cancelled = False
     try:
-        url = urlsplit(settings.redis_url)
+        redis_url = inv._history_redis_url()
+        url = urlsplit(redis_url)
         principal = unquote(url.username or "")
         inv.require(url.scheme in {"redis", "rediss"} and bool(url.hostname) and not url.query and not url.fragment
                     and principal not in {"", "default"} and bool(url.password)
                     and (url.path in {"", "/"} or url.path[1:].isdigit() and 0 <= int(url.path[1:]) <= 15),
                     "owned_history_redis_configuration")
         async with asyncio.timeout(30):
-            client = inv._history_redis()
+            client = inv._history_redis(redis_url)
             inv.require(await client.acl_whoami() == principal, "owned_history_redis_identity")
             result = []
             for source in request.sources:

@@ -330,7 +330,8 @@ async def test_actual_first_failure_retry_transaction_serializes_with_populated_
             else:
                 await asyncio.wait_for(task, 5)
             response = await asyncio.wait_for(qualifier, 5)
-            assert response.status_code == 409 and response.json()["detail"] == "owned_inventory_v2_activation_disabled"
+            assert response.status_code == 200, response.text
+            assert await h.case.owner.fetchval("SELECT intake_paused_at IS NOT NULL FROM channel_profiles WHERE id=$1", h.env.channel_id)
             assert fresh_nodes[-1]["status"] == ("RUNNING" if order == "writer_rollback" else "QUEUED")
             if order == "writer_rollback":
                 assert fresh_nodes[-1]["worker_id"] == event.claim.worker_id
