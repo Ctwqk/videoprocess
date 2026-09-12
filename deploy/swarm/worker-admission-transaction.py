@@ -1084,6 +1084,314 @@ def _validate_failed_forward_control(value: object) -> None:
     _require_string(control["cron_sha256"], r"[0-9a-f]{64}", maximum=64)
 
 
+def _staging_control_config(control: dict, network_id: str) -> bytes:
+    _validate_control_identity(control)
+    _require_string(network_id, r"[a-z0-9]{12,64}")
+    purposes = {
+        "operator", "orchestrator", "staging-janitor", "staging-minio-access",
+        "staging-minio-secret", "worker-minio-access", "worker-minio-secret",
+    }
+    references = {item["purpose"]: item for item in control["secrets"]}
+    if set(references) != purposes or any(
+        item["service"] != "vp-worker-control"
+        or item["generation"] != control["generation"]
+        for item in references.values()
+    ):
+        raise TransactionError
+    return (
+        "VERSION=2\n"
+        f"GENERATION={control['generation']}\nIMAGE={control['image']}\n"
+        f"NETWORK=vp-pipeline-net\nNETWORK_ID={network_id}\n"
+        f"DATABASE_SECRET={references['staging-janitor']['name']}\n"
+        f"MINIO_ACCESS_SECRET={references['staging-minio-access']['name']}\n"
+        f"MINIO_SECRET_SECRET={references['staging-minio-secret']['name']}\n"
+        "EVIDENCE_VOLUME=vp-staging-janitor-evidence\nMANAGER_NODE=ccttww-lap\n"
+    ).encode("ascii")
+
+
+def _control_cron_blocks(sync_root: str) -> tuple[bytes, bytes]:
+    _require_string(sync_root, r"/[A-Za-z0-9_./-]+", maximum=4095)
+    if str(Path(sync_root)) != sync_root or ".." in Path(sync_root).parts:
+        raise TransactionError
+    marker_root = sync_root + "/state/worker-redis-marker-control"
+    prefix = (
+        f"VP_WORKER_REDIS_MARKER_CONFIG_FILE={marker_root}/control.conf "
+        f"VP_WORKER_REDIS_MARKER_STATE_DIR={marker_root}/status "
+        f"VP_WORKER_REDIS_MARKER_LOCK_DIR={marker_root}/locks "
+        f"{sync_root}/bin/worker-redis-marker-control.sh"
+    )
+    marker = (
+        "# BEGIN VIDEOPROCESS WORKER REDIS MARKER CONTROL\n"
+        f"* * * * * {prefix} readiness >> {sync_root}/logs/worker-redis-marker-readiness.log 2>&1\n"
+        f"*/5 * * * * {prefix} janitor >> {sync_root}/logs/worker-redis-marker-janitor.log 2>&1\n"
+        "# END VIDEOPROCESS WORKER REDIS MARKER CONTROL\n"
+    ).encode("ascii")
+    staging = (
+        "# BEGIN VIDEOPROCESS STAGING JANITOR\n"
+        f"*/5 * * * * VP_STAGING_JANITOR_CONFIG_FILE={sync_root}/state/vp-worker-admission/staging-object-janitor.conf "
+        f"{sync_root}/bin/vp-staging-object-janitor-run.sh >> {sync_root}/logs/vp-staging-object-janitor.log 2>&1\n"
+        "# END VIDEOPROCESS STAGING JANITOR\n"
+    ).encode("ascii")
+    return marker, staging
+
+
+def _control_cron_foreign(cron: bytes, sync_root: str) -> bytes:
+    if not cron or len(cron) > MAX_DOCUMENT_BYTES or not cron.endswith(b"\n"):
+        raise TransactionError
+    foreign = cron
+    for block in _control_cron_blocks(sync_root):
+        position = foreign.find(block)
+        if foreign.count(block) != 1 or (position > 0 and foreign[position - 1] != 10):
+            raise TransactionError
+        foreign = foreign.replace(block, b"", 1)
+    # Duplicate/malformed blocks and unframed invocations are never foreign data.
+    if any(token in foreign for token in (
+        b"VIDEOPROCESS STAGING JANITOR", b"VIDEOPROCESS WORKER REDIS MARKER CONTROL",
+        b"vp-staging-object-janitor-run.sh", b"worker-redis-marker-control.sh",
+    )):
+        raise TransactionError
+    return foreign
+
+
+def _control_config_selections(document: dict, network_id: str) -> dict[bytes, dict]:
+    selections: dict[bytes, dict] = {}
+    for scope in ("baseline", "forward", "rollback"):
+        control = document.get(scope, {}).get("control")
+        if control is None:
+            continue
+        payload = _staging_control_config(control, network_id)
+        if payload in selections and selections[payload] != control:
+            raise TransactionError
+        selections[payload] = control
+    return selections
+
+
+def _observe_failed_control(
+    document: dict, sync_root: str, network_id: str, config: bytes, cron: bytes,
+) -> dict:
+    selections = _control_config_selections(document, network_id)
+    if config not in selections:
+        raise TransactionError
+    _control_cron_foreign(cron, sync_root)
+    selected = selections[config]
+    return dict(
+        generation=selected["generation"], image=selected["image"],
+        config_sha256=hashlib.sha256(config).hexdigest(),
+        cron_sha256=hashlib.sha256(cron).hexdigest(),
+    )
+
+
+def _preinstall_failed_control(document: dict, progress: dict) -> bool:
+    attempted = progress.get("attempted_services")
+    workers = document["forward"]["workers"]
+    return (
+        document["baseline"]["kind"] == "managed"
+        and document["baseline"]["captured"] is True
+        and attempted == [
+            "vp-api-swarm", "vp-frontend-swarm", "vp-autoflow-api-swarm",
+        ]
+        and progress.get("migration_state") == "applied"
+        and {item["name"] for item in document["failed_forward"]["services"]}
+        == set(attempted)
+        and len(workers) == len(RUNTIME_AUTHORITY_SERVICES)
+        and {item["service"] for item in workers} == RUNTIME_AUTHORITY_SERVICES
+        and all(
+            item["applied_stage"] == "prepared"
+            and item["docker_service_id"] is None
+            and item["target_spec_digest"] is None
+            for item in workers
+        )
+    )
+
+
+def _recover_failed_control(
+    *, document: dict, progress: dict, sync_root: str, network_id: str,
+    baseline_cron: bytes | None, current_cron: bytes, current_config: bytes,
+    observation: dict | None,
+) -> dict:
+    if document["phase"] not in {
+        "CANDIDATE_RESTORE_REQUIRED", "CANDIDATE_RESTORING", "CANDIDATE_RESTORED",
+    } or document["operation"] is not None or not document["failed_forward"]["captured"]:
+        raise TransactionError
+    expected = document["failed_forward"]["control"]
+    _validate_failed_forward_control(expected)
+    selections = _control_config_selections(document, network_id)
+    matching = [
+        control for payload, control in selections.items()
+        if hashlib.sha256(payload).hexdigest() == expected["config_sha256"]
+    ]
+    if len(matching) != 1 or current_config not in selections:
+        raise TransactionError
+    selected = matching[0]
+    actual_labels = (selected["generation"], selected["image"])
+    recorded_labels = (expected["generation"], expected["image"])
+    if actual_labels != recorded_labels:
+        forward = document["forward"]["control"]
+        if (
+            selected != document["baseline"]["control"]
+            or recorded_labels != (forward["generation"], forward["image"])
+            or observation is not None
+            or not _preinstall_failed_control(document, progress)
+        ):
+            raise TransactionError
+    if observation is not None:
+        observation = _require_exact_fields(observation, {"config", "cron"})
+        original_config = observation["config"].encode("utf-8")
+        original_cron = observation["cron"].encode("utf-8")
+        if _observe_failed_control(
+            document, sync_root, network_id, original_config, original_cron,
+        ) != expected:
+            raise TransactionError
+    elif (
+        actual_labels == recorded_labels
+        and hashlib.sha256(current_cron).hexdigest() == expected["cron_sha256"]
+    ):
+        original_cron = current_cron
+    else:
+        # Old captures have no raw observation. Prove this exact pre-install
+        # preimage using the retained baseline and the normal marker transform.
+        if (
+            selected != document["baseline"]["control"]
+            or not _preinstall_failed_control(document, progress)
+            or baseline_cron is None
+        ):
+            raise TransactionError
+        _control_cron_foreign(baseline_cron, sync_root)
+        marker, _staging = _control_cron_blocks(sync_root)
+        original_cron = baseline_cron.replace(marker, b"", 1) + marker
+    if hashlib.sha256(original_cron).hexdigest() != expected["cron_sha256"]:
+        raise TransactionError
+    if _control_cron_foreign(current_cron, sync_root) != _control_cron_foreign(
+        original_cron, sync_root,
+    ):
+        raise TransactionError
+    return selected
+
+
+def _failed_control_read_file(
+    parent_descriptor: int, name: str, *, modes: tuple[int, ...] = (FILE_MODE,),
+) -> bytes:
+    before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    mode = stat.S_IMODE(before.st_mode)
+    if mode not in modes:
+        raise TransactionError
+    _require_regular(before, mode, single_link=True)
+    descriptor = os.open(name, _read_file_flags(), dir_fd=parent_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        if opened != before:
+            raise TransactionError
+        payload = _read_limited(descriptor)
+        after = os.fstat(descriptor)
+        if (
+            _identity(after) != _identity(opened)
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise TransactionError
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _failed_control_observation(value: object) -> dict:
+    result = _require_exact_fields(value, {"config", "cron"})
+    if (
+        any(not isinstance(item, str) for item in result.values())
+        or len(_canonical(result)) > MAX_DOCUMENT_BYTES
+    ):
+        raise TransactionError
+    return result
+
+
+def failed_control(arguments: list[str]) -> None:
+    if len(arguments) != 4:
+        raise TransactionError
+    raw_root, raw_lock_descriptor, mode, network_id = arguments
+    if mode not in {"observe", "select", "verify"}:
+        raise TransactionError
+    _require_writer_lock(raw_root, raw_lock_descriptor)
+    root, root_fd, transactions_fd = _open_transactions(raw_root, create=False)
+    transaction_fd = None
+    try:
+        if root.name != "vp-worker-admission" or root.parent.name != "state":
+            raise TransactionError
+        sync_root = str(root.parent.parent)
+        document, _identity = _read_active_from_descriptor(transactions_fd, allow_missing=False)
+        if document is None:
+            raise TransactionError
+        transaction_fd = _open_child_directory(
+            transactions_fd, document["transaction_id"], create=False,
+        )
+        config = _failed_control_read_file(root_fd, "staging-object-janitor.conf")
+        cron = sys.stdin.buffer.read(MAX_DOCUMENT_BYTES + 1)
+        name = "failed-control-observation.json"
+        try:
+            observation = _failed_control_observation(_decode_canonical(
+                _failed_control_read_file(transaction_fd, name),
+            ))
+        except FileNotFoundError:
+            observation = None
+        if mode == "observe":
+            if document["phase"] not in {"PREPARING", "FORWARD_APPLYING"} or document["operation"] is not None:
+                raise TransactionError
+            identity = _observe_failed_control(document, sync_root, network_id, config, cron)
+            if document["failed_forward"]["captured"] and document["failed_forward"]["control"] != identity:
+                raise TransactionError
+            desired = dict(config=config.decode("utf-8"), cron=cron.decode("utf-8"))
+            if observation is not None and observation != desired:
+                raise TransactionError
+            if observation is None:
+                _write_document(
+                    transaction_fd, name, desired, expected_identity=None,
+                    validator=_failed_control_observation,
+                )
+            _print_json(identity)
+            return
+        progress, _progress_identity = _read_app_progress_from_descriptor(
+            transaction_fd, allow_missing=False,
+        )
+        if progress is None or (
+            progress["transaction_id"] != document["transaction_id"]
+            or progress["target_commit"] != document["target_commit"]
+        ):
+            raise TransactionError
+        baseline_cron = None
+        if observation is None:
+            descriptors = []
+            try:
+                _path, marker_fd = _open_admission_root(str(root.parent / "worker-redis-marker-control"))
+                descriptors.append(marker_fd)
+                for child in ("transactions", document["transaction_id"], "baseline-managed-state"):
+                    descriptors.append(_open_child_directory(descriptors[-1], child, create=False))
+                if _failed_control_read_file(descriptors[-1], "captured").rstrip(b"\n") != b"VERSION=1":
+                    raise TransactionError
+                baseline_cron = _failed_control_read_file(
+                    descriptors[-1], "crontab", modes=(0o600, 0o644, 0o664),
+                )
+            except FileNotFoundError:
+                # Strict original-byte equality remains available to old,
+                # non-hybrid records even when no reconstruction is possible.
+                baseline_cron = None
+            finally:
+                for descriptor in reversed(descriptors):
+                    os.close(descriptor)
+        selected = _recover_failed_control(
+            document=document, progress=progress, sync_root=sync_root,
+            network_id=network_id, baseline_cron=baseline_cron,
+            current_cron=cron, current_config=config, observation=observation,
+        )
+        if mode == "verify" and config != _staging_control_config(selected, network_id):
+            raise TransactionError
+        _print_json(selected)
+    finally:
+        if transaction_fd is not None:
+            os.close(transaction_fd)
+        os.close(transactions_fd)
+        os.close(root_fd)
+
+
 def _validate_janitor_service(value: object) -> None:
     service = _require_exact_fields(
         value,
@@ -6123,6 +6431,12 @@ def main(arguments: list[str]) -> int:
         return 0
     if arguments and arguments[0] == "verify-credential":
         verify_credential(arguments[1:])
+        return 0
+    if arguments and arguments[0] == "failed-control":
+        try:
+            failed_control(arguments[1:])
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+            raise TransactionError from None
         return 0
     if arguments and arguments[0] == "record-prepared-secret":
         record_prepared_secret(arguments[1:])

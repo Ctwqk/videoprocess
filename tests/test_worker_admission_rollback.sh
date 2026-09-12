@@ -3867,6 +3867,24 @@ PY
   VP_WORKER_CONTROL_GENERATION=c-22222222222222222222
   VP_WORKER_ADMISSION_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-222222222222
 
+  # Payload assembly fixture. Native locked observation and canonical content
+  # validation are exercised in test_failed_control_recovery.py.
+  vp_worker_admission_failed_control_read() {
+    [[ "$1" == observe && -f "$failed_control_config" ]] || return 1
+    python3 - "$failed_control_config" "$failed_control_cron" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+print(json.dumps({
+    "generation": "c-22222222222222222222",
+    "image": "vp-ffmpeg-worker-python:deploy-222222222222",
+    "config_sha256": hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest(),
+    "cron_sha256": hashlib.sha256(pathlib.Path(sys.argv[2]).read_bytes()).hexdigest(),
+}))
+PY
+  }
   failed_control_payload="$(vp_worker_admission_failed_forward_payload '')"
   python3 - \
     "$failed_control_config" "$failed_control_cron" \
@@ -3945,6 +3963,11 @@ PY
 (
   compensation_calls="$TEST_ROOT/failed-forward-compensation-calls"
   : >"$compensation_calls"
+  ROOT="$TEST_ROOT/failed-forward-compensation"
+  mkdir -p "$ROOT/state/vp-worker-admission"
+  chmod 0700 "$ROOT/state/vp-worker-admission"
+  vp_worker_admission_lock_acquire "$ROOT/state/vp-worker-admission"
+  trap 'vp_worker_admission_lock_release' EXIT
   VP_WORKER_CONTROL_GENERATION=c-22222222222222222222
   VP_WORKER_ADMISSION_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-222222222222
   VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION="$VP_WORKER_CONTROL_GENERATION"
@@ -3955,14 +3978,32 @@ PY
   vp_install_staging_object_janitor() {
     printf 'control|install|%s\n' "$1" >>"$compensation_calls"
   }
-  vp_worker_admission_failed_forward_control_json() {
-    local config_hash="$VP_WORKER_ROLLBACK_FAILED_CONTROL_CONFIG_SHA256"
-    [[ "$CONTROL_IDENTITY_MATCH" == true ]] || config_hash="$(printf 'f%.0s' {1..64})"
-    printf '{"config_sha256":"%s","cron_sha256":"%s","generation":"%s","image":"%s"}\n' \
-      "$config_hash" \
-      "$VP_WORKER_ROLLBACK_FAILED_CONTROL_CRON_SHA256" \
-      "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" \
-      "$VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE"
+  vp_worker_admission_failed_control_read() {
+    if [[ "$1" == verify ]]; then
+      [[ "$CONTROL_IDENTITY_MATCH" == true ]]
+      return
+    fi
+    [[ "$1" == select ]] || return 1
+    python3 - "$VP_WORKER_CONTROL_GENERATION" "$VP_WORKER_ADMISSION_CONTROL_IMAGE" <<'PY'
+import json
+import sys
+
+purposes = ("operator", "orchestrator", "staging-janitor", "staging-minio-access",
+            "staging-minio-secret", "worker-minio-access", "worker-minio-secret")
+print(json.dumps({"generation": sys.argv[1], "image": sys.argv[2], "secrets": [
+    {"purpose": purpose, "name": purpose, "docker_secret_id": f"{index:025x}"}
+    for index, purpose in enumerate(purposes, 1)
+]}))
+PY
+  }
+  vp_managed_secret_id() {
+    local index=1 purpose
+    for purpose in operator orchestrator staging-janitor staging-minio-access \
+      staging-minio-secret worker-minio-access worker-minio-secret; do
+      if [[ "$1" == "$purpose" ]]; then printf '%025x\n' "$index"; return; fi
+      index=$((index + 1))
+    done
+    return 1
   }
   vp_reinstall_failed_forward_control
   grep -Fqx \
@@ -4143,6 +4184,13 @@ PY
   }
   vp_require_staging_object_janitor_control() {
     printf 'verify|janitor-control\n' >>"$compensation_calls"
+  }
+  # This fixture checks the outer candidate gate order. The locked control
+  # selection/action is covered with the real helper in the Python family.
+  vp_worker_admission_failed_control_action() {
+    [[ "$1" == verify ]] || return 1
+    vp_run_staging_object_janitor_once
+    vp_require_staging_object_janitor_control
   }
   vp_require_worker_redis_marker_status() {
     printf 'verify|marker-status\n' >>"$compensation_calls"
