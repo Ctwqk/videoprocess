@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import redis.asyncio as aioredis
 from redis.asyncio.retry import Retry
@@ -26,6 +27,7 @@ from app.schemas.channel_agent import (
 )
 from app.services import owned_seed_inventory_history as history
 from app.storage import manager as storage_manager
+from worker import secret_config
 
 
 MAX_ASSET_BYTES = 64 * 1024 * 1024
@@ -289,8 +291,25 @@ def _retirement_descriptors(sources: dict) -> dict:
     return {uuid.UUID(row["id"]): asset_descriptor(Asset(**row)) for row in sources["source_assets"]}
 
 
-def _history_redis():
-    return aioredis.from_url(settings.redis_url, decode_responses=True, socket_timeout=5, socket_connect_timeout=5,
+def _history_redis_url() -> str:
+    path = settings.owned_history_redis_url_file
+    if path is None:
+        return settings.redis_url
+    try:
+        value = secret_config.read_mode_0400_secret(path, label="owned history Redis URL")
+        url = urlsplit(value)
+        require(url.scheme in {"redis", "rediss"} and bool(url.hostname) and not url.query and not url.fragment
+                and unquote(url.username or "") not in {"", "default"} and bool(url.password)
+                and (url.port is None or 1 <= url.port <= 65535)
+                and (url.path in {"", "/"} or url.path[1:].isdigit() and 0 <= int(url.path[1:]) <= 15),
+                "owned_history_redis_configuration")
+        return value
+    except Exception:
+        raise OwnedInventoryError("owned_history_redis_configuration") from None
+
+
+def _history_redis(url: str | None = None):
+    return aioredis.from_url(_history_redis_url() if url is None else url, decode_responses=True, socket_timeout=5, socket_connect_timeout=5,
                             retry=Retry(NoBackoff(), 0), retry_on_timeout=False, health_check_interval=0)
 
 
@@ -572,7 +591,7 @@ async def closeout(db: AsyncSession, row: OwnedSeedInventory) -> dict:
     return {"status": "ready", "sha256": sha256(evidence), "evidence": json.loads(canonical(evidence))}
 
 
-async def _requalify_v2_draft(db: AsyncSession, row: OwnedSeedInventory, subject: str) -> None:
+async def _requalify_v2_draft(db: AsyncSession, row: OwnedSeedInventory, subject: str, *, allow_replay: bool = False):
     decoded = history.decode_history_manifest(row.manifest_json)
     assert decoded.legacy_history is not None
     certificate = decoded.legacy_history.retired_unassigned_preupload
@@ -584,6 +603,12 @@ async def _requalify_v2_draft(db: AsyncSession, row: OwnedSeedInventory, subject
             "legacy_channel_profile_id": certificate.legacy_channel_profile_id} if certificate else None})
     row_id, channel_id, platform, target = row.id, row.channel_profile_id, row.platform_channel_id, str(row.target_account_id)
     digest, reference = row.manifest_sha256, f"owned-inventory-draft:{row.client_request_id}"
+    if allow_replay and row.approved_at is not None:
+        await _lock_history_scope(db, channel_id, locators)
+        await lock_platform_scope(db, platform)
+        row = await _row(db, OwnedSeedInventory, row_id, lock=True)
+        require(row.manifest_sha256 == digest and row.approved_at is not None, "owned_inventory_manifest_changed")
+        return row, None, None, None, None
     items = await _verify_manifest(db, row)
     _, fingerprint = await _scope(db, channel_id, row)
     require(fingerprint == row.manifest_json["configuration_sha256"], "owned_inventory_configuration_changed")
@@ -601,13 +626,23 @@ async def _requalify_v2_draft(db: AsyncSession, row: OwnedSeedInventory, subject
     await _lock_history_scope(db, channel_id, locators, retirement)
     await lock_platform_scope(db, platform)
     row = await _row(db, OwnedSeedInventory, row_id, lock=True)
+    # A concurrent identical request may have committed after our initial draft read.
+    # The caller validates the exact persisted approval before returning it unchanged.
+    if allow_replay and row.approved_at is not None:
+        require(row.manifest_sha256 == digest, "owned_inventory_manifest_changed")
+        return row, None, None, None, None
     require(row.manifest_sha256 == digest and row.state == "draft" and row.approved_at is None, "owned_inventory_manifest_changed")
-    _, fresh_fingerprint = await _scope(db, channel_id, row, lock=True)
+    channel, fresh_fingerprint = await _scope(db, channel_id, row, lock=True)
     require(fingerprint == fresh_fingerprint, "owned_inventory_configuration_changed")
-    await _verify_manifest(db, row)
-    await _lock_assets(db, descriptors)
+    items = await _verify_manifest(db, row)
+    assets = await _lock_assets(db, descriptors)
     if retirement:
         await _lock_assets(db, _retirement_descriptors(retirement))
+    if allow_replay:
+        items = await inventory_items(db, row.id, lock=True)
+        for item in items:
+            await _row(db, ManualSeed, item.manual_seed_id, lock=True)
+        items = await _verify_manifest(db, row)
     fresh = await history.load_owned_history_evidence(db, platform_channel_id=platform)
     fresh_sources = _history_sources(fresh, locators, target)
     require(sources == fresh_sources, "owned_inventory_history_changed")
@@ -622,6 +657,7 @@ async def _requalify_v2_draft(db: AsyncSession, row: OwnedSeedInventory, subject
         fresh = history.OwnedHistorySnapshot.from_rows(fresh.rows.as_dict(), platform_channel_id=fresh.platform_channel_id,
             observed_at=fresh.observed_at, redis_observations=retired_observation[1])
     _assess_qualified_draft(fresh, row, subject, await _now(db))
+    return row, channel, items, assets, initial.observed_at
 
 
 async def approve_inventory(db: AsyncSession, channel_id: uuid.UUID, inventory_id: uuid.UUID,
@@ -629,8 +665,30 @@ async def approve_inventory(db: AsyncSession, channel_id: uuid.UUID, inventory_i
     row = await _row(db, OwnedSeedInventory, inventory_id)
     require(row.channel_profile_id == channel_id and row.manifest_sha256 == data.manifest_sha256, "owned_inventory_manifest_mismatch")
     if row.manifest_json.get("version") == 2:
-        await _requalify_v2_draft(db, row, subject)
-        raise OwnedInventoryError("owned_inventory_v2_activation_disabled")
+        require(data.predecessor_inventory_id is None and data.predecessor_closeout_sha256 is None,
+                "owned_inventory_v2_successor_unsupported")
+        row, channel, items, assets, observed_at = await _requalify_v2_draft(db, row, subject, allow_replay=True)
+        require(row.manifest_sha256 == data.manifest_sha256, "owned_inventory_manifest_mismatch")
+        if row.approved_at is not None:
+            require(row.approved_by == subject and row.approval_reference == data.approval_reference
+                    and row.predecessor_inventory_id is None and row.predecessor_closeout_sha256 is None,
+                    "owned_inventory_approval_conflict")
+            return await read_inventory(db, channel_id, inventory_id)
+        require(await _youtube_account_ids(db, row.platform_channel_id) == [row.target_account_id],
+                "owned_inventory_account_alias")
+        occupied = (await db.scalars(select(OwnedSeedInventory).where(
+            OwnedSeedInventory.platform_channel_id == row.platform_channel_id,
+            OwnedSeedInventory.approved_at.is_not(None), OwnedSeedInventory.succession_released_at.is_(None),
+        ).with_for_update())).one_or_none()
+        require(occupied is None and channel.owned_seed_inventory_id is None, "owned_inventory_platform_slot_occupied")
+        items = await inventory_items(db, row.id, lock=True)
+        require(len(items) == 7 and all(item.state == "unused" and item.production_task_id is None
+                and item.consumed_at is None for item in items), "owned_inventory_seed_changed")
+        now = await _now(db)
+        require(row.state == "draft" and utc(row.expires_at) > now, "owned_inventory_not_approvable")
+        require(0 <= (now - observed_at).total_seconds() <= history.MAX_OBSERVATION_AGE_SECONDS,
+                "owned_inventory_history_observation_stale")
+        return await _activate_inventory(db, row, channel, items, assets, data, subject, now)
     items = await _verify_manifest(db, row)
     _, fingerprint = await _scope(db, channel_id, row)
     require(fingerprint == row.manifest_json["configuration_sha256"], "owned_inventory_configuration_changed")
@@ -679,6 +737,10 @@ async def approve_inventory(db: AsyncSession, channel_id: uuid.UUID, inventory_i
     else:
         require(data.predecessor_inventory_id is None and channel.owned_seed_inventory_id is None,
                 "owned_inventory_predecessor_mismatch")
+    return await _activate_inventory(db, row, channel, items, assets, data, subject, now)
+
+
+async def _activate_inventory(db, row, channel, items, assets, data, subject, now):
     for item in items:
         seed = await _row(db, ManualSeed, item.manual_seed_id, lock=True)
         require(seed.status == "inventory_pending" and item.state == "unused", "owned_inventory_seed_changed")
@@ -691,6 +753,7 @@ async def approve_inventory(db: AsyncSession, channel_id: uuid.UUID, inventory_i
     row.approval_reference = data.approval_reference
     channel.owned_seed_inventory_id = row.id
     channel.tick_interval_minutes = data.tick_interval_minutes
+    channel_id, inventory_id = channel.id, row.id
     await db.commit()
     return await read_inventory(db, channel_id, inventory_id)
 

@@ -280,7 +280,7 @@ async def test_redis_cancel_never_reenters_or_finalizes(owned_env, monkeypatch, 
     monkeypatch.setattr(admission, "lock_scope", locked)
     monkeypatch.setattr(admission, "assess", needs_observation)
     monkeypatch.setattr(admission, "finish", finished)
-    monkeypatch.setattr(inventory, "_history_redis", Reader)
+    monkeypatch.setattr(inventory, "_history_redis", lambda url: Reader())
     monkeypatch.setattr(settings, "redis_url", "redis://history-reader:fixture@127.0.0.1:55464/15")
     policy = Policy()
     task = asyncio.create_task(tick(env, policy, queue_item=item))
@@ -317,7 +317,7 @@ async def test_redis_ordinary_close_failure_remains_an_error(monkeypatch, close_
                 raise RuntimeError("close-failed")
             await asyncio.Future()
 
-    monkeypatch.setattr(inventory, "_history_redis", Reader)
+    monkeypatch.setattr(inventory, "_history_redis", lambda url: Reader())
     monkeypatch.setattr(settings, "redis_url", "redis://history-reader:fixture@127.0.0.1:55464/15")
     with pytest.raises(inventory.OwnedInventoryError, match="owned_history_redis_close_failed"):
         await admission.observe_redis(admission.RedisRequest("fixture", NOW, ()))
@@ -474,7 +474,7 @@ async def test_native_retirement_reader_is_named_readonly_and_never_uses_saved_o
     rows, _ = retired_rows()
     request = admission.redis_request(snap(rows))
     native = NativeReader(rows)
-    monkeypatch.setattr(inv := inventory, "_history_redis", lambda: native)
+    monkeypatch.setattr(inv := inventory, "_history_redis", lambda url: native)
     monkeypatch.setattr(settings, "redis_url", "redis://history-reader:fixture@127.0.0.1:55464/15")
     if mode == "pending":
         native.pending = True
@@ -522,7 +522,7 @@ async def test_complete_history_and_retirement_reentry_during_policy(owned_env, 
                                                      observed_at=current.observed_at)
 
     monkeypatch.setattr(history, "load_owned_history_evidence", loader)
-    monkeypatch.setattr(inventory, "_history_redis", lambda: native)
+    monkeypatch.setattr(inventory, "_history_redis", lambda url: native)
     monkeypatch.setattr(settings, "redis_url", "redis://history-reader:fixture@127.0.0.1:55464/15")
 
     async def policy_action():

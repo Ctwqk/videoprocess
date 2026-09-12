@@ -12,6 +12,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.channel_agent import clients
 from app.models.channel_agent import ChannelProfile, PublishingAccount, ManualSeed
@@ -140,7 +141,7 @@ async def history_env(inventory_env, monkeypatch):
     return SimpleNamespace(env=env, rows=rows, data=data, requests=requests, controls=controls, observed_at=observed_at)
 
 
-async def test_v2_draft_is_server_qualified_immutable_and_never_producer_authority(history_env):
+async def test_v2_draft_is_server_qualified_and_approval_atomically_publishes_authority(history_env):
     h = history_env
     response = await h.env.client.post(h.env.url, json=h.data)
     assert response.status_code == 200, response.text
@@ -158,15 +159,25 @@ async def test_v2_draft_is_server_qualified_immutable_and_never_producer_authori
     assert repeated.status_code == 200 and repeated.json()["manifest_sha256"] == result["manifest_sha256"]
     assert len(h.requests) == 2
     h.controls.observed_at = h.controls.observed_at.replace(microsecond=1)
-    denied = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
-    assert denied.status_code == 409 and denied.json()["detail"] == "owned_inventory_v2_activation_disabled"
+    approved = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["state"] == "approved"
     assert len(h.requests) == 4
     async with h.env.factory() as db:
         row = await db.get(OwnedSeedInventory, uuid.UUID(result["id"]))
-        assert row.manifest_sha256 == result["manifest_sha256"] and row.approved_at is None
+        assert row.manifest_json == result["manifest"] and row.manifest_sha256 == result["manifest_sha256"]
+        assert row.approved_at is not None and row.approved_by == "test-operator"
+        assert row.approval_reference == approval(result)["approval_reference"]
         channel = await db.get(ChannelProfile, h.env.channel_id)
-        assert channel.owned_seed_inventory_id is None
-        assert {s.status for s in (await db.scalars(select(ManualSeed))).all()} == {"inventory_pending"}
+        assert channel.owned_seed_inventory_id == row.id and channel.tick_interval_minutes == 1
+        assert channel.intake_paused_at is not None
+        assert (await db.get(RuntimeSchedule, "videoprocess")).state == "CLOSED"
+        assert {s.status for s in (await db.scalars(select(ManualSeed))).all()} == {"active"}
+        for entry in h.data["entries"]:
+            asset = await db.get(Asset, uuid.UUID(entry["asset_id"]))
+            assert asset.media_info == {"duration": 30, "license": "owned", "provenance": "generated"}
+        for item in (await db.scalars(select(OwnedSeedInventoryItem))).all():
+            assert item.state == "unused" and item.production_task_id is None and item.consumed_at is None
 
 
 @pytest.mark.parametrize("successor", [False, True])
@@ -176,7 +187,7 @@ async def test_new_authorized_observer_preserves_original_history_envelope(histo
     assert created.status_code == 200, created.text
     original = created.json()
     if successor:
-        # Explicit fixture authority; the public v2 approval gate remains disabled.
+        # Historical successor fixture; activating a v2 successor remains excluded.
         async with h.env.factory() as db:
             row = await db.get(OwnedSeedInventory, uuid.UUID(original["id"]))
             row.approved_at, row.approved_by, row.approval_reference = h.observed_at, "test-operator", "fixture:approved"
@@ -192,7 +203,7 @@ async def test_new_authorized_observer_preserves_original_history_envelope(histo
         assert response.json()["manifest"]["legacy_history"]["bindings"] == original["manifest"]["legacy_history"]["bindings"]
     else:
         response = await h.env.client.post(f"{h.env.url}/{original['id']}/approve", json=approval(original))
-        assert response.status_code == 409 and response.json()["detail"] == "owned_inventory_v2_activation_disabled", response.text
+        assert response.status_code == 200, response.text
     reread = await h.env.client.get(f"{h.env.url}/{original['id']}")
     assert reread.json()["manifest"] == original["manifest"]
     assert reread.json()["manifest_sha256"] == original["manifest_sha256"]
@@ -354,7 +365,7 @@ async def retirement_env(history_env, monkeypatch):
     return h
 
 
-async def test_v2_retirement_draft_and_approval_use_fresh_native_evidence_without_activation(retirement_env):
+async def test_v2_retirement_approval_rejects_pending_then_preserves_exact_certificate(retirement_env):
     h = retirement_env
     created = await h.env.client.post(h.env.url, json=h.data)
     assert created.status_code == 200, created.text
@@ -363,13 +374,16 @@ async def test_v2_retirement_draft_and_approval_use_fresh_native_evidence_withou
     assert certificate["retained_facts"]["account"]["platform_account_id"] == ""
     assert h.redis_calls[-1] == ("close",)
     h.controls.observed_at = h.controls.observed_at.replace(microsecond=1)
-    denied = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
-    assert denied.status_code == 409 and denied.json()["detail"] == "owned_inventory_v2_activation_disabled", denied.text
     h.controls.redis_pending = True
     changed = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
     assert changed.status_code == 409 and changed.json()["detail"] == "owned_inventory_retirement_pending"
     reread = await h.env.client.get(f"{h.env.url}/{result['id']}")
     assert reread.json()["manifest_sha256"] == result["manifest_sha256"] and reread.json()["approved_at"] is None
+    h.controls.redis_pending = False
+    approved = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["manifest"] == result["manifest"]
+    assert approved.json()["approved_at"] is not None
 
 
 async def test_v2_complete_retained_certificate_read_requires_existing_operator_auth(retirement_env):
@@ -385,7 +399,7 @@ async def test_approved_history_only_producers_cannot_be_rebound_or_reactivated(
     h = history_env
     created = await h.env.client.post(h.env.url, json=h.data)
     assert created.status_code == 200, created.text
-    # Explicit prequalified fixture authority only; production v2 approval stays disabled.
+    # Explicit prequalified historical fixture authority.
     async with h.env.factory() as db:
         row = await db.get(OwnedSeedInventory, uuid.UUID(created.json()["id"]))
         row.approved_at, row.approved_by, row.approval_reference, row.state = h.observed_at, "test-operator", "fixture:approved", "revoked"
@@ -426,3 +440,131 @@ async def test_retired_source_asset_stays_pinned_after_revocation(retirement_env
     assert response.status_code == 409 and response.json()["detail"] == "owned_inventory_asset_pinned"
     async with h.env.factory() as db:
         assert await db.get(Asset, uuid.UUID(source["id"])) is not None
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_v2_exact_approval_replay_is_observation_not_reactivation(history_env, terminal):
+    h = history_env
+    result = (await h.env.client.post(h.env.url, json=h.data)).json()
+    url = f"{h.env.url}/{result['id']}"
+    first = await h.env.client.post(url + "/approve", json=approval(result))
+    assert first.status_code == 200, first.text
+    if terminal:
+        response = await h.env.client.post(url + "/revoke", json={
+            "manifest_sha256": result["manifest_sha256"], "reason": "operator stop"})
+        assert response.status_code == 200, response.text
+    # Replay must work after the initial pause has changed, without new qualification.
+    async with h.env.factory() as db:
+        channel = await db.get(ChannelProfile, h.env.channel_id)
+        if not terminal:
+            channel.intake_paused_at = None
+        await db.commit()
+    before = len(h.requests), len(h.env.storage.reads)
+    h.controls.actual_channel = "UC" + "z" * 22
+    repeated = await h.env.client.post(url + "/approve", json=approval(result))
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["approved_at"] == first.json()["approved_at"]
+    assert repeated.json()["state"] == ("revoked" if terminal else "approved")
+    assert (len(h.requests), len(h.env.storage.reads)) == before
+    async with h.env.factory() as db:
+        assert {s.status for s in (await db.scalars(select(ManualSeed))).all()} == (
+            {"inventory_revoked"} if terminal else {"active"})
+
+
+@pytest.mark.parametrize("conflict", ["reference", "subject", "digest", "successor"])
+async def test_v2_approval_replay_rejects_conflicting_authority(history_env, monkeypatch, conflict):
+    h = history_env
+    result = (await h.env.client.post(h.env.url, json=h.data)).json()
+    url = f"{h.env.url}/{result['id']}/approve"
+    first = await h.env.client.post(url, json=approval(result))
+    assert first.status_code == 200, first.text
+    data = approval(result)
+    if conflict == "subject":
+        monkeypatch.setattr(service.settings, "owned_seed_inventory_operator_subject", "another-operator")
+    elif conflict == "reference":
+        data["approval_reference"] = "different reference"
+    elif conflict == "digest":
+        data["manifest_sha256"] = "f" * 64
+    else:
+        data.update(predecessor_inventory_id=str(uuid.uuid4()), predecessor_closeout_sha256="a" * 64)
+    before = len(h.requests)
+    response = await h.env.client.post(url, json=data)
+    assert response.status_code == 409, response.text
+    assert len(h.requests) == before
+    async with h.env.factory() as db:
+        row = await db.get(OwnedSeedInventory, uuid.UUID(result["id"]))
+        assert row.approval_reference == approval(result)["approval_reference"]
+        assert row.approved_by == "test-operator" and row.manifest_json == result["manifest"]
+
+
+async def test_v2_finalization_failure_rolls_back_every_approval_write(history_env, monkeypatch):
+    h = history_env
+    result = (await h.env.client.post(h.env.url, json=h.data)).json()
+    original = AsyncSession.commit
+    attempted = []
+    async def fail_approval(db):
+        if any(isinstance(row, OwnedSeedInventory) and row.approved_at is not None for row in db.dirty):
+            await db.flush()
+            attempted.append(True)
+            raise service.OwnedInventoryError("synthetic_commit_failure")
+        await original(db)
+    monkeypatch.setattr(AsyncSession, "commit", fail_approval)
+    response = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
+    assert response.status_code == 409 and attempted == [True], response.text
+    async with h.env.factory() as db:
+        row = await db.get(OwnedSeedInventory, uuid.UUID(result["id"]))
+        assert row.state == "draft" and row.approved_at is None and row.manifest_json == result["manifest"]
+        channel = await db.get(ChannelProfile, h.env.channel_id)
+        assert channel.owned_seed_inventory_id is None and channel.tick_interval_minutes == 60
+        assert {s.status for s in (await db.scalars(select(ManualSeed))).all()} == {"inventory_pending"}
+        for entry in h.data["entries"]:
+            assert (await db.get(Asset, uuid.UUID(entry["asset_id"]))).media_info == {"duration": 30}
+
+
+async def test_v2_draft_cannot_request_successor_authority(history_env):
+    h = history_env
+    result = (await h.env.client.post(h.env.url, json=h.data)).json()
+    before = len(h.requests)
+    response = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result,
+        predecessor_inventory_id=str(uuid.uuid4()), predecessor_closeout_sha256="a" * 64))
+    assert response.status_code == 409
+    assert response.json()["detail"] == "owned_inventory_v2_successor_unsupported"
+    assert len(h.requests) == before
+
+
+@pytest.mark.parametrize("same", [True, False])
+async def test_v2_approval_committed_after_initial_draft_read_is_replayed_or_conflicted(history_env, same):
+    h = history_env
+    result = (await h.env.client.post(h.env.url, json=h.data)).json()
+    url = f"{h.env.url}/{result['id']}/approve"
+    winner = []
+    async def concurrent_approval():
+        h.controls.on_get = None
+        response = await h.env.client.post(url, json=approval(result))
+        assert response.status_code == 200, response.text
+        winner.append(response.json())
+    h.controls.on_get = concurrent_approval
+    data = approval(result)
+    if not same:
+        data["approval_reference"] = "losing reference"
+    response = await h.env.client.post(url, json=data)
+    assert response.status_code == (200 if same else 409), response.text
+    assert len(winner) == 1
+    async with h.env.factory() as db:
+        row = await db.get(OwnedSeedInventory, uuid.UUID(result["id"]))
+        assert row.approval_reference == approval(result)["approval_reference"]
+        assert service.utc(row.approved_at) == service.utc(datetime.fromisoformat(winner[0]["approved_at"]))
+
+
+async def test_v2_final_lock_delay_cannot_extend_native_observation_freshness(history_env, monkeypatch):
+    h = history_env
+    result = (await h.env.client.post(h.env.url, json=h.data)).json()
+    original = service._requalify_v2_draft
+    async def delayed(*args, **kwargs):
+        qualified = await original(*args, **kwargs)
+        h.controls.observed_at += timedelta(seconds=61)
+        return qualified
+    monkeypatch.setattr(service, "_requalify_v2_draft", delayed)
+    response = await h.env.client.post(f"{h.env.url}/{result['id']}/approve", json=approval(result))
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == "owned_inventory_history_observation_stale"

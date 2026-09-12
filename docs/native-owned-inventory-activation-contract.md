@@ -110,7 +110,8 @@ time nor snapshot completion establishes continuous 168-hour observation.
 3. Measure scheduler/queue, render/upload and publication/reconcile timing
    against the modeled 2/20/95-minute bounds, or obtain a re-reviewed bounded
    model. Configure and approve the finite scope once through the existing
-   operator API. No flag is enabled by this document or commit, including v2.
+   operator API. The V2 approval transition is implemented but the existing
+   feature flag remains false by default; no live approval is granted here.
 4. Parent alone enables the existing watcher/native intake after prerequisites.
    Other channels remain paused. Existing normal UTC window transitions govern
    admission; no exact-job canary loop, replacement POST, renewal, catch-up or
@@ -128,3 +129,24 @@ time nor snapshot completion establishes continuous 168-hour observation.
 
 No live configuration, assets, PDS identity, service placement, watcher health,
 Redis identity or timing has been qualified by this offline task.
+
+## Bounded V2 Approval
+
+The existing authenticated approve endpoint now finalizes a freshly requalified
+V2 draft in the same channel/schedule/platform transaction. The immutable manifest,
+history-only bindings and retired certificate are not rewritten. It verifies the
+empty occupied slot, seven untouched items, pending seeds, DB-clock expiry and
+original observation freshness before atomically publishing approval, compatibility
+ownership labels, active seeds, the typed channel pointer and one-minute interval.
+Intake stays paused. V2 successor fields are refused; V1 semantics are unchanged.
+An exact committed approval replay returns persisted state without requalification
+or reactivation, including after revocation. Conflicting approvals refuse.
+
+Python owned-history readers optionally use `OWNED_HISTORY_REDIS_URL_FILE` through
+the existing mode-0400 secret reader. Each observer resolves the file once and
+uses those same URL bytes for its connection and existing identity validation.
+An explicitly supplied invalid file fails closed with a static error and never
+falls back to `REDIS_URL`. When unset, existing behavior remains; ordinary Redis
+clients are unchanged. Parent alone qualifies/mounts the existing managed named
+control credential. No new Redis principal, ACL widening or raw credential
+environment value is required by this optional file path.

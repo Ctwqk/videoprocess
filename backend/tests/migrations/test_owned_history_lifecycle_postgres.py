@@ -78,11 +78,8 @@ async def test_actual_history_only_binding_survives_native_metric_settlement_and
     binding = original["manifest"]["legacy_history"]["bindings"][0]
     assert binding["use"] == "history_only" and binding["canonical_platform_channel_id"] == h.env.scope["platform_channel_id"]
     assert len(h.manager_calls) == 2
-    denied = await approve(h)
-    assert denied.status_code == 409 and denied.json()["detail"] == "owned_inventory_v2_activation_disabled"
-    async with h.case.sessions() as db:
-        await seal(h, db)
-        await db.commit()
+    approved = await approve(h)
+    assert approved.status_code == 200, approved.text
     pending = await assessment(h)
     assert pending.block_reason is None and pending.wait_reason == "owned_inventory_metrics_pending"
     assert {c.classification for c in pending.classifications} == {"history_only", "retired_unassigned_preupload"}
@@ -116,10 +113,10 @@ async def test_actual_history_only_binding_survives_native_metric_settlement_and
     assert successor.result["id"] != original["id"]
     assert successor.result["manifest"]["legacy_history"] == original["manifest"]["legacy_history"]
     denied = await approve(successor)
-    assert denied.status_code == 409 and denied.json()["detail"] == "owned_inventory_v2_activation_disabled"
+    assert denied.status_code == 409 and denied.json()["detail"] == "owned_inventory_platform_slot_occupied"
     async with h.case.sessions() as db:
         # Bind lineage in the same first approval transition, as the native v1
-        # succession path does. Public v2 activation remains disabled.
+        # succession path does. Public v2 succession remains unsupported.
         row = await db.get(OwnedSeedInventory, uuid.UUID(successor.result["id"]))
         await service._requalify_v2_draft(db, row, "a2-fixture")
         await db.execute(update(OwnedSeedInventory).where(OwnedSeedInventory.id == uuid.UUID(successor.result["id"])).values(
@@ -131,7 +128,7 @@ async def test_actual_history_only_binding_survives_native_metric_settlement_and
         child = await db.get(OwnedSeedInventory, uuid.UUID(successor.result["id"]))
         assert predecessor.manifest_json == original["manifest"] and predecessor.manifest_sha256 == original["manifest_sha256"]
         assert child.predecessor_inventory_id == predecessor.id
-        assert await db.scalar(text("SELECT owned_seed_inventory_id FROM channel_profiles WHERE id=:id"), {"id": h.env.channel_id}) is None
+        assert await db.scalar(text("SELECT owned_seed_inventory_id FROM channel_profiles WHERE id=:id"), {"id": h.env.channel_id}) == predecessor.id
     assert (await assessment(h)).block_reason is None
     assert all(method == "GET" for method, _ in h.manager_calls)
     divergent = copy.deepcopy(successor.result["manifest"])

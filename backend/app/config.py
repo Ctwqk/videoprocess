@@ -10,6 +10,7 @@ class Settings(BaseSettings):
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
+    owned_history_redis_url_file: str | None = None
 
     # Storage
     storage_backend: str = "local"  # "local" or "minio"

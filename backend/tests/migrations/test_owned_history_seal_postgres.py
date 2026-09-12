@@ -1,7 +1,7 @@
-"""Parent-run A2 barriers. No HTTP server, real Redis, upload, or activation.
+"""Parent-run A2 barriers. No HTTP server, real Redis, upload, or live activation.
 
 Explicit fixture approval below is isolated database data for trigger tests;
-the production v2 approve route is always asserted disabled.
+the API transition now also publishes that authority while keeping intake paused.
 """
 from __future__ import annotations
 
@@ -127,15 +127,17 @@ async def test_actual_complete_sql_graph_and_fresh_readonly_qualification(a2_pg,
         assert "token_sha256" not in snapshot.rows.canonical_json
 
 
-async def test_actual_v2_draft_requalifies_but_never_activates(a2_env):
+async def test_actual_v2_draft_requalifies_and_approves_without_opening_intake(a2_env):
     h = a2_env
     result = await approve(h)
-    assert result.status_code == 409 and result.json()["detail"] == "owned_inventory_v2_activation_disabled"
+    assert result.status_code == 200, result.text
     reread = await h.env.client.get(f"{h.env.url}/{h.result['id']}")
     assert reread.json()["manifest"] == h.result["manifest"]
-    assert reread.json()["approved_at"] is None
+    assert reread.json()["approved_at"] is not None
     async with h.case.sessions() as db:
-        assert (await db.get(ChannelProfile, h.env.channel_id)).owned_seed_inventory_id is None
+        channel = await db.get(ChannelProfile, h.env.channel_id)
+        assert channel.owned_seed_inventory_id == uuid.UUID(h.result["id"])
+        assert channel.intake_paused_at is not None
 
 
 @pytest.mark.parametrize("action", ["account_patch", "account_resume", "source_delete", "task_rebind"])
@@ -165,11 +167,12 @@ async def test_actual_final_requalification_fence_blocks_native_writers(a2_env, 
     blocker_pid = None
     async def pause_after_entry(db, descriptors):
         nonlocal blocker_pid
-        await original(db, descriptors)
+        assets = await original(db, descriptors)
         if not locked.is_set():
             blocker_pid = await db.scalar(text("SELECT pg_backend_pid()"))
             locked.set()
             await asyncio.wait_for(release.wait(), 8)
+        return assets
     monkeypatch.setattr(service, "_lock_assets", pause_after_entry)
     qualifier = asyncio.create_task(approve(h))
     writer_task = None
@@ -188,8 +191,9 @@ async def test_actual_final_requalification_fence_blocks_native_writers(a2_env, 
             assert not writer_task.done()
             release.set()
             response = await asyncio.wait_for(qualifier, 5)
-            await asyncio.wait_for(writer_task, 5)
-        assert response.json()["detail"] == "owned_inventory_v2_activation_disabled"
+            assert response.status_code == 200, response.text
+            with pytest.raises(service.OwnedInventoryError, match="owned_inventory_(asset_pinned|historical_producer_pinned)"):
+                await asyncio.wait_for(writer_task, 5)
     finally:
         release.set()
         for task in (qualifier, writer_task):
