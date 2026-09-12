@@ -115,6 +115,23 @@ async def read_owned_inventory(channel_id: uuid.UUID, inventory_id: uuid.UUID, a
     result = await _inventory_result(db, owned_inventory.read_inventory(db, channel_id, inventory_id))
     if result["manifest"].get("version") == 2:
         _inventory_operator(authorization)
+        from app.services.owned_inventory_feedback import check_owned_inventory_feedback
+
+        assessment: dict[str, Any] = {
+            "status": "unavailable", "observation_only": True, "observed_at": None,
+            "hold_reason": "owned_inventory_assessment_unavailable", "metrics": {}, "completed_item_ids": [],
+        }
+        try:
+            feedback = await check_owned_inventory_feedback(db, channel_id, inventory_id, apply=False)
+        except Exception:
+            await db.rollback()
+        else:
+            assessment.update(
+                status="blocked" if feedback.hold_reason else "observed",
+                hold_reason=feedback.hold_reason, metrics=dict(feedback.metrics),
+                completed_item_ids=list(feedback.completed_item_ids),
+            )
+        result["assessment"] = assessment
     return result
 
 

@@ -50,7 +50,7 @@ Independent boundary probes are not a live controller or a simulated clock
 advance used as acceptance evidence. The seventh item's durable finalization
 remains Task 5's normal completion path, not a new Task 6 helper.
 
-## Existing GET Surfaces and Task 5 Delta
+## Existing GET Surfaces and Completion Readout
 
 Use the existing GET
 `/api/v1/channel-agent/channels/{channel_id}/owned-seed-inventories/{inventory_id}`.
@@ -71,21 +71,29 @@ The existing `/internal/schedule/video/status` GET supplies `service_name`,
 last schedule update, not the observation clock. Do not add a second schedule
 reader or make an activation decision from two non-atomic GETs.
 
-Minimal proposed additive completion-report delta for Task 5's owner, not
-implemented here:
+V2 GET now adds `assessment` only after the existing operator authorization,
+using `check_owned_inventory_feedback(..., apply=False)`. V1 GET/output/auth and
+all existing V2 manifest/items/closeout fields remain unchanged. This is a bounded
+observation, not approval, a new classifier, or a mutation/commit/hold/enqueue path.
 
-| Missing evidence | Proposed fields on the same inventory GET |
+| Assessment field | Implemented meaning |
 | --- | --- |
-| Freshness and next eligibility | DB `observed_at`, account-wide `last_attempted_at`/`last_completed_at`, `next_eligible_at`, explicit blocking/wait reason and outstanding item IDs. A timestamp alone must not override slot/history/runtime guards. |
-| Per-item normal outcome and audit links | `consumed_at`, `completed_at`, task/job/upload-operation/publication IDs, M/V identity, current privacy and `public_at`, normal reconciliation outcome, and existing candidate/plan/promotion PDS audit references. Use exact retained rows; no mirrored receipt authority. |
-| Intake versus feedback | Consumed/settled counts, explicit `intake_complete`, then-due metric/reconcile health, `full_feedback_complete`, and each relevant stage's due/grace/status/error code and existing queue/feedback references. Future stages are pending, not failed or complete. |
+| `status` | `observed` when the helper returns without a hold reason; `blocked` when it returns a hold reason; `unavailable` when assessment raises. None means seven-day acceptance. |
+| `observation_only` | Always `true`; no intake or publication authority is granted. |
+| `hold_reason` | Existing helper reason, or the static `owned_inventory_assessment_unavailable` when assessment fails. The persisted top-level hold reason remains separate and unchanged. |
+| `metrics` | Existing bounded intake/settlement/feedback statuses, item counts and due/future/succeeded metric counts. No duplicated stage classifier or new eligibility calculation. Empty when unavailable. |
+| `completed_item_ids` | Existing helper's observed completion candidates; GET does not mark these reserved items completed. Empty when unavailable; not a replacement for persisted item state. |
+| `observed_at` | Explicitly `null`: the existing helper does not expose its database observation clock. No wall-clock, approval-time or inferred timestamp is substituted. |
 
-Task 5 should derive these through its existing strict read-only assessment,
-without changing queue timing or creating a duplicate helper. Unavailable,
-stale, malformed or incomplete proof must remain explicitly unresolved. The
-operator's external evidence record supplies observation start/end; neither
-approval time nor GET time proves continuous actual observation. This proposal
-adds no new acceptance conditions beyond the approved inventory plan.
+Stale/read-failed proof retains the helper's blocking reason/status; unexpected
+assessment failure returns `unavailable`, never complete. Original Redis phase,
+freshness and rollback behavior are reused, with no new external reader. The
+existing inventory read still determines ordinary scope/manifest errors.
+No account-wide watermarks, next eligibility, per-item receipt expansion or
+continuous-observation timestamps are added by this small readout slice.
+The operator's external evidence record still supplies actual observation
+start/end and detailed receipt/audit references. Neither repeated GETs, approval
+time nor snapshot completion establishes continuous 168-hour observation.
 
 ## Parent-Owned Activation and Acceptance
 
