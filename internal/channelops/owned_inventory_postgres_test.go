@@ -131,6 +131,10 @@ func ownedNewUUID(t *testing.T) string {
 }
 
 func newOwnedPGFixture(t *testing.T) *ownedPGFixture {
+	return newOwnedPGFixtureWithHistory(t, nil)
+}
+
+func newOwnedPGFixtureWithHistory(t *testing.T, legacy func(*Store, time.Time) map[string]any) *ownedPGFixture {
 	t.Helper()
 	if testing.Short() || os.Getenv("OWNED_INVENTORY_DISPOSABLE_TEST_URL") == "" {
 		t.Skip("explicit disposable inventory PostgreSQL required")
@@ -230,6 +234,14 @@ func newOwnedPGFixture(t *testing.T) *ownedPGFixture {
 		entry := ownedMap(value)
 		entry["seed_sha256"] = data.Items[i].Item["seed_sha256"]
 		entry["storage_descriptor"] = data.Items[i].Item["storage_descriptor_json"]
+	}
+	if legacy != nil {
+		manifest["version"], manifest["legacy_history"] = 2, legacy(store, now.UTC())
+		var approved time.Time
+		if err := store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&approved); err != nil {
+			t.Fatal("fixture approval clock unavailable")
+		}
+		data.Inventory["approved_at"] = ownedISO(approved.UTC())
 	}
 	data.Inventory["manifest_sha256"] = ownedTestHash(t, manifest)
 	data.Inventory["client_request_id"], data.Inventory["request_sha256"], data.Inventory["created_by"] = ownedNewUUID(t), strings.Repeat("a", 64), "offline-test"
@@ -571,23 +583,14 @@ func TestOwnedPGQueuedHandleAgentTickContenders(t *testing.T) {
 
 func (f *ownedPGFixture) loadHistory(t *testing.T, ctx context.Context, taskID string) map[string]any {
 	t.Helper()
-	rows, err := f.store.Pool.Query(ctx, ownedHistorySQL, f.data.AccountIDs[0], f.data.Inventory["platform_channel_id"])
+	snapshot, err := loadOwnedHistorySnapshot(ctx, f.store.Pool, ownedString(f.data.Inventory["platform_channel_id"]))
 	if err != nil {
 		t.Fatal("fixture history query failed")
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
-			t.Fatal("fixture history scan failed")
-		}
-		v, err := ownedDecode(raw)
-		if err != nil {
-			t.Fatal("fixture history decode failed")
-		}
-		h := ownedMap(v)
-		if ownedMap(h["task"])["id"] == taskID {
-			return h
+	rows := snapshot.rows()
+	for _, task := range historyRows(rows["production_tasks"]) {
+		if task["id"] == taskID {
+			return historyTask(rows, task)
 		}
 	}
 	t.Fatal("fixture task history missing")
@@ -632,7 +635,7 @@ func TestOwnedPGNormalPublicationCreationAndMetricRecovery(t *testing.T) {
 	}
 	h := f.loadHistory(t, ctx, taskID)
 	pub := ownedMap(ownedArray(h["publications"])[0])
-	if pub["current_privacy"] != "unlisted" || pub["scheduled_publish_at"] != nil || !ownedPendingPromotion(h, pub, at, observed) {
+	if pub["current_privacy"] != "unlisted" || pub["scheduled_publish_at"] != nil || !historyPendingPromotion(h, pub, at, observed) {
 		t.Fatal("actual normal unlisted publication did not wait for promotion")
 	}
 	promote, err := f.store.ClaimNextForKinds(ctx, handlerWorkerID(f.lease.Authority()), []string{QueuePromotePublication})
@@ -681,7 +684,7 @@ func TestOwnedPGNormalPublicationCreationAndMetricRecovery(t *testing.T) {
 	}
 	h = f.loadHistory(t, ctx, taskID)
 	pub = ownedMap(ownedArray(h["publications"])[0])
-	if hold, wait := ownedMetricsReady(h, pub, start, at); hold || !wait {
+	if !historyMetricsReady(h, pub, start, at) {
 		t.Fatal("actual pending metric retry chain rejected")
 	}
 	// The retry is future-due relative to the real DB; claim that exact queue in the
@@ -710,7 +713,7 @@ func TestOwnedPGNormalPublicationCreationAndMetricRecovery(t *testing.T) {
 		t.Fatal("normal retry queue completion failed")
 	}
 	h = f.loadHistory(t, ctx, taskID)
-	if hold, wait := ownedMetricsReady(h, pub, start, at); hold || wait {
+	if historyMetricsReady(h, pub, start, at) {
 		t.Fatal("actual recovered metric retry chain rejected")
 	}
 }

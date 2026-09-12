@@ -85,7 +85,7 @@ async def test_agent_tick_passes_bounded_plan_delay_to_service():
     await runner.handle_item(db, item)
 
     assert runner.service.calls == [
-        (db, {"channel_id": "channel-1", "plan_delay_seconds": 300})
+        (db, {"channel_id": "channel-1", "plan_delay_seconds": 300, "queue_item": item})
     ]
 
 

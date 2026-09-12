@@ -119,13 +119,17 @@ async def _scope(db: AsyncSession, channel_id: uuid.UUID, data: Any, *, lock: bo
             and channel.intake_paused_at is not None and lane.enabled and lane.paused_until is None
             and lane_format.enabled and lane_format.default_publish_visibility == "unlisted"
             and lane_format.source_platforms_json == [], "owned_inventory_scope_unsafe")
-    fingerprint = sha256({
+    return channel, configuration_sha256(channel, account, lane, lane_format)
+
+
+def configuration_sha256(channel: ChannelProfile, account: PublishingAccount, lane: TopicLane,
+                         lane_format: LaneFormatMatrix) -> str:
+    return sha256({
         "channel": _fields(channel, "id config_version name positioning language default_aspect_ratio risk_policy_json content_mix_policy_json cadence_policy_json alert_policy_json enabled dry_run"),
         "account": _fields(account, "id channel_profile_id platform platform_account_id credential_ref platform_specific_config_json default_privacy external_asset_auto_publish enabled paused_until"),
         "lane": _fields(lane, "id channel_profile_id name description weight keywords_json negative_keywords_json min_posts_per_week max_posts_per_day max_consecutive_streak cooldown_after_post_minutes enabled paused_until"),
         "format": _fields(lane_format, "id topic_lane_id format_key enabled weight target_duration_sec template_pool_json source_platforms_json default_publish_visibility"),
     })
-    return channel, fingerprint
 
 
 def asset_descriptor(asset: Asset) -> dict:
