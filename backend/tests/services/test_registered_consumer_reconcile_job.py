@@ -378,9 +378,11 @@ def test_input_and_capture_output_are_exact_private_inodes(tmp_path, monkeypatch
     assert job.read_input(path, metadata) == payload
     with pytest.raises(job.ProtocolError):
         job.write_input(path, payload)
-    path.unlink()
+    # Retain the original inode so Linux cannot reuse it for the replacement.
+    path.rename(path.with_name("original-input.json"))
     path.write_bytes(job.canonical(payload))
     path.chmod(0o644)
+    assert path.stat().st_ino != metadata["inode"]
     with pytest.raises(job.ProtocolError):
         job.read_input(path, metadata)
 
