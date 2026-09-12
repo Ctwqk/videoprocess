@@ -366,3 +366,129 @@ class LearningStateRead(BaseModel):
     confidence: float
     recommendation_json: dict[str, Any]
     last_computed_at: datetime
+
+
+class PolicyVersionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    policy_key: str
+    version: str
+    status: Literal["draft", "validated", "retired"]
+    feature_schema_version: str
+    reward_version: str
+    formula_json: dict[str, Any]
+    hard_guard_config_json: dict[str, Any]
+    portfolio_config_json: dict[str, Any]
+    exploration_config_json: dict[str, Any]
+    code_commit_sha: str
+    template_registry_version: str
+    prompt_bundle_version: str
+    config_hash: str
+    created_by: str
+    change_reason: str
+    created_at: datetime
+
+
+class PolicyActivationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    channel_profile_id: UUID
+    target_account_id: UUID | None
+    policy_version_id: UUID
+    mode: Literal["off", "shadow", "canary", "active"]
+    rollout_percentage: float
+    deterministic_salt: str
+    effective_from: datetime
+    effective_to: datetime | None
+    previous_activation_id: UUID | None
+    request_id: str
+    actor: str
+    reason: str
+    rollback_reason: str | None
+    feature_flag_snapshot_json: dict[str, Any]
+    created_at: datetime
+
+
+class PolicyStatusRead(BaseModel):
+    channel_id: UUID
+    mode: Literal["off", "shadow", "canary", "active"]
+    latest_policy: PolicyVersionRead | None
+    current_activation: PolicyActivationRead | None
+
+
+class CandidateFeatureSnapshotRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    tick_audit_id: UUID
+    candidate_id: str
+    candidate_source: str
+    source_kind: str
+    topic_lane_id: UUID | None
+    lane_format_id: UUID | None
+    target_account_id: UUID | None
+    policy_version_id: UUID
+    feature_schema_version: str
+    feature_as_of: datetime
+    raw_features_json: dict[str, Any]
+    normalized_features_json: dict[str, Any] | None
+    missing_feature_mask_json: dict[str, Any]
+    cadence_snapshot_json: dict[str, Any] | None
+    content_mix_snapshot_json: dict[str, Any] | None
+    material_supply_json: dict[str, Any] | None
+    production_reliability_json: dict[str, Any] | None
+    learning_references_json: dict[str, Any] | None
+    source_record_refs_json: dict[str, Any]
+    cost_estimate_json: dict[str, Any] | None
+    risk_estimate_json: dict[str, Any] | None
+    candidate_set_hash: str
+    feature_hash: str
+    created_at: datetime
+
+
+class PolicyDecisionEvidenceRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    tick_audit_id: UUID
+    channel_profile_id: UUID
+    candidate_id: str
+    candidate_source: str
+    topic_lane_id: UUID | None
+    lane_format_id: UUID | None
+    target_account_id: UUID | None
+    score_json: dict[str, Any]
+    guard_results_json: list[Any]
+    pds_decision_json: dict[str, Any]
+    learning_context_json: dict[str, Any]
+    selected: bool
+    rejection_reason: str | None
+    created_task_id: UUID | None
+    created_at: datetime
+    policy_version_id: UUID | None
+    feature_snapshot_id: UUID | None
+    candidate_set_hash: str | None
+    decision_hash: str | None
+    decision: Literal["accepted", "rejected"] | None
+    baseline_score: float | None
+    final_score: float | None
+    rank: int | None
+    shadow_score: float | None
+    shadow_rank: int | None
+    shadow_selected: bool | None
+    experiment_id: UUID | None
+
+
+class TickDecisionExplanationRead(BaseModel):
+    tick_audit_id: UUID
+    channel_profile_id: UUID
+    tick_id: str
+    replay_status: Literal["legacy_unreplayable", "snapshot_pending", "snapshot_complete"]
+    policy_version_id: UUID | None
+    policy: PolicyVersionRead | None
+    candidate_set_hash: str | None
+    feature_as_of: datetime | None
+    snapshots: list[CandidateFeatureSnapshotRead]
+    decisions: list[PolicyDecisionEvidenceRead]

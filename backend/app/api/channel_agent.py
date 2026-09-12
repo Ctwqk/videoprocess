@@ -63,11 +63,16 @@ from app.schemas.channel_agent import (
     OwnedSeedInventoryCreate,
     OwnedSeedInventoryCreateV2,
     OwnedSeedInventoryRevoke,
+    PolicyActivationRead,
+    PolicyStatusRead,
+    PolicyVersionRead,
     PublishingAccountCreate,
     QueueItemRead,
+    TickDecisionExplanationRead,
     TopicLaneCreate,
 )
 from app.services import owned_seed_inventory as owned_inventory
+from app.services import policy_evidence
 from app.services.discovery_ingestion import (
     DiscoveryIngestionAuthorityError,
     DiscoveryIngestionConflictError,
@@ -1470,3 +1475,34 @@ def _material_usage(row: MaterialUsageLedger) -> dict[str, Any]:
         "segment_signature": row.segment_signature,
         "metadata_json": row.metadata_json or {},
     }
+
+
+@router.get("/channels/{channel_id}/policy-status", response_model=PolicyStatusRead)
+async def channel_policy_status(channel_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    return await policy_evidence.get_policy_status(db, channel_id)
+
+
+@router.get("/channels/{channel_id}/policy-versions", response_model=list[PolicyVersionRead])
+async def channel_policy_versions(
+    channel_id: uuid.UUID, limit: int = 100, offset: int = 0, db: AsyncSession = Depends(get_db),
+):
+    return await policy_evidence.list_policy_versions(db, channel_id, limit=limit, offset=offset)
+
+
+@router.get("/channels/{channel_id}/policy-versions/{policy_version_id}", response_model=PolicyVersionRead)
+async def channel_policy_version(
+    channel_id: uuid.UUID, policy_version_id: uuid.UUID, db: AsyncSession = Depends(get_db),
+):
+    return await policy_evidence.get_policy_version(db, channel_id, policy_version_id)
+
+
+@router.get("/channels/{channel_id}/policy-activations", response_model=list[PolicyActivationRead])
+async def channel_policy_activations(
+    channel_id: uuid.UUID, limit: int = 100, offset: int = 0, db: AsyncSession = Depends(get_db),
+):
+    return await policy_evidence.list_policy_activations(db, channel_id, limit=limit, offset=offset)
+
+
+@router.get("/ticks/{tick_audit_id}/decision-explanation", response_model=TickDecisionExplanationRead)
+async def tick_decision_explanation(tick_audit_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    return await policy_evidence.get_decision_explanation(db, tick_audit_id)
