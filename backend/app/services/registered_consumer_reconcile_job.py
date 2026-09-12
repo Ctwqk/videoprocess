@@ -1180,18 +1180,45 @@ def validate_managed_spec(actual: dict, expected: dict) -> None:
     actual = copy.deepcopy(actual)
     try:
         require(actual.pop("EndpointSpec", {}) in ({}, {"Mode": "vip"}))
+        update_defaults = {
+            "Parallelism": 1,
+            "FailureAction": "pause",
+            "Monitor": 5_000_000_000,
+            "MaxFailureRatio": 0,
+            "Order": "stop-first",
+        }
+        for key in ("UpdateConfig", "RollbackConfig"):
+            require(
+                canonical(actual.pop(key, update_defaults))
+                == canonical(update_defaults)
+            )
         task = actual["TaskTemplate"]
-        require(task.pop("ForceUpdate", 0) == 0)
-        for key in ("Resources", "LogDriver"):
-            require(task.pop(key, {}) == {})
+        require(canonical(task.pop("ForceUpdate", 0)) == canonical(0))
+        # Engine 29.1.3 serializes unspecified swappiness as null on services.
+        require(
+            canonical(task.pop("Resources", {}))
+            in (canonical({}), canonical({"MemorySwappiness": None}))
+        )
+        require(task.pop("LogDriver", {}) == {})
+        require(task.pop("Runtime", "container") == "container")
+        restart = task["RestartPolicy"]
+        for key, value in (("Delay", 5_000_000_000), ("MaxAttempts", 0)):
+            require(canonical(restart.pop(key, value)) == canonical(value))
         container = task["ContainerSpec"]
         for key in ("Groups", "Env"):
-            if not container.get(key):
-                container[key] = []
-        for key in ("Isolation", "Init"):
-            require(container.pop(key, None) in (None, False, "default"))
+            container.setdefault(key, [])
+        for key, value in (
+            ("StopGracePeriod", 10_000_000_000),
+            ("DNSConfig", {}),
+            ("Isolation", "default"),
+            ("Init", False),
+        ):
+            require(canonical(container.pop(key, value)) == canonical(value))
+        for mount in container["Mounts"]:
+            require(type(mount) is dict)
+            mount.setdefault("ReadOnly", False)
         require(canonical(actual) == canonical(expected))
-    except (KeyError, TypeError):
+    except (KeyError, TypeError, ValueError):
         raise ProtocolError() from None
 
 

@@ -98,6 +98,141 @@ def managed_spec(job, binding):
     )
 
 
+def engine_default_spec(expected, *, task_only=False):
+    # Docker 29.1.3/API 1.52 paired service/task inspection shapes.
+    actual = copy.deepcopy(expected)
+    task = actual["TaskTemplate"]
+    task["ForceUpdate"] = 0
+    task["RestartPolicy"]["MaxAttempts"] = 0
+    container = task["ContainerSpec"]
+    del container["Env"], container["Groups"]
+    container["Isolation"] = "default"
+    del container["Mounts"][1]["ReadOnly"]
+    if not task_only:
+        task["Resources"] = {"MemorySwappiness": None}
+        task["Runtime"] = "container"
+        task["RestartPolicy"]["Delay"] = 5_000_000_000
+        container["StopGracePeriod"] = 10_000_000_000
+        container["DNSConfig"] = {}
+        for key in ("UpdateConfig", "RollbackConfig"):
+            actual[key] = {
+                "Parallelism": 1,
+                "FailureAction": "pause",
+                "Monitor": 5_000_000_000,
+                "MaxFailureRatio": 0,
+                "Order": "stop-first",
+            }
+    return actual
+
+
+@pytest.mark.parametrize("task_only", [False, True], ids=["service", "task"])
+def test_managed_spec_accepts_exact_engine_defaults_without_changing_pins(
+    tmp_path, task_only
+):
+    job, _, _, binding = setup_protocol(tmp_path)
+    expected = managed_spec(job, binding)
+    actual = engine_default_spec(expected, task_only=task_only)
+    before = job.canonical([actual, expected])
+    job.validate_managed_spec(actual, expected)
+    if task_only:
+        task = {
+            "ID": "t" * 25,
+            "ServiceID": "s" * 25,
+            "NodeID": "m" * 25,
+            "Spec": actual["TaskTemplate"],
+            "Status": {"State": "complete", "ContainerStatus": {"ExitCode": 0}},
+        }
+        assert job.task_exit(task, "s" * 25, expected) == 0
+    assert job.canonical([actual, expected]) == before
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("Resources",), {"MemorySwappiness": 0}),
+        (("Resources",), {"MemorySwappiness": None, "Limits": {}}),
+        (("Resources",), {"Limits": {"MemoryBytes": 64}}),
+        (("Resources",), None),
+        (("Runtime",), "other"),
+        (("ForceUpdate",), False),
+        (("ForceUpdate",), 0.0),
+        (("RestartPolicy", "Delay"), 0),
+        (("RestartPolicy", "Delay"), 5_000_000_000.0),
+        (("RestartPolicy", "MaxAttempts"), 1),
+        (("RestartPolicy", "MaxAttempts"), False),
+        (("RestartPolicy", "MaxAttempts"), 0.0),
+        (("RestartPolicy", "Window"), 0),
+        (("ContainerSpec", "StopGracePeriod"), 0),
+        (("ContainerSpec", "StopGracePeriod"), 10_000_000_000.0),
+        (("ContainerSpec", "DNSConfig"), {"Nameservers": ["127.0.0.1"]}),
+        (("ContainerSpec", "DNSConfig"), []),
+        (("ContainerSpec", "Isolation"), "host"),
+        (("ContainerSpec", "Isolation"), False),
+        (("ContainerSpec", "Init"), 0),
+        (("ContainerSpec", "Init"), "default"),
+        (("ContainerSpec", "Env"), False),
+        (("ContainerSpec", "Groups"), None),
+        (("ContainerSpec", "Mounts", 1, "ReadOnly"), True),
+        (("ContainerSpec", "Mounts", 1, "ReadOnly"), 0),
+        (("ContainerSpec", "Mounts", 1, "ReadOnly"), None),
+        (("ContainerSpec", "Mounts", 1, "Source"), "/var/run/docker.sock"),
+        (("ContainerSpec", "Mounts", 1, "BindOptions"), {}),
+        (("ContainerSpec", "Secrets", 0, "SecretID"), "x" * 25),
+        (("Networks", 0, "Target"), "x" * 25),
+    ],
+)
+def test_managed_engine_defaults_reject_task_field_drift(tmp_path, path, value):
+    job, _, _, binding = setup_protocol(tmp_path)
+    expected = managed_spec(job, binding)
+    actual = engine_default_spec(expected)
+    target = actual["TaskTemplate"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(job.ProtocolError):
+        job.validate_managed_spec(actual, expected)
+
+
+@pytest.mark.parametrize("config", ["UpdateConfig", "RollbackConfig"])
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("Parallelism", 2),
+        ("Parallelism", True),
+        ("FailureAction", "continue"),
+        ("Monitor", 0),
+        ("Monitor", 5_000_000_000.0),
+        ("MaxFailureRatio", False),
+        ("MaxFailureRatio", 0.1),
+        ("Order", "start-first"),
+        ("Delay", 0),
+        ("Order", None),
+    ],
+)
+def test_managed_engine_defaults_reject_update_policy_drift(
+    tmp_path, config, key, value
+):
+    job, _, _, binding = setup_protocol(tmp_path)
+    expected = managed_spec(job, binding)
+    actual = engine_default_spec(expected)
+    if value is None:
+        del actual[config][key]
+    else:
+        actual[config][key] = value
+    with pytest.raises(job.ProtocolError):
+        job.validate_managed_spec(actual, expected)
+
+
+@pytest.mark.parametrize("index", [0, 2])
+def test_managed_engine_defaults_never_infer_readonly_mount(tmp_path, index):
+    job, _, _, binding = setup_protocol(tmp_path)
+    expected = managed_spec(job, binding)
+    actual = engine_default_spec(expected)
+    del actual["TaskTemplate"]["ContainerSpec"]["Mounts"][index]["ReadOnly"]
+    with pytest.raises(job.ProtocolError):
+        job.validate_managed_spec(actual, expected)
+
+
 @pytest.mark.parametrize(
     "fault",
     [
