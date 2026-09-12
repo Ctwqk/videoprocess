@@ -1235,9 +1235,9 @@ func newWorkerPostgresFixture(t *testing.T) *workerPostgresFixture {
 		t.Fatalf("read migration version: %v", err)
 	}
 	// CI migrates this functional fixture to head, not the historical 036 schema.
-	if migration != "043_owned_history_snapshot_rows" {
+	if migration != "044_policy_decision_snapshots" {
 		admin.Close()
-		t.Fatalf("migration version = %q; want 043_owned_history_snapshot_rows", migration)
+		t.Fatalf("migration version = %q; want 044_policy_decision_snapshots", migration)
 	}
 
 	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
