@@ -357,7 +357,10 @@ func TestOwnedProducerPGPromotionFreshAuthorityAndMissingPlan(t *testing.T) {
 				if resume {
 					if err := h.withOwnedTickQueuePhase(ctx, item, func(fenced HandlerService) error {
 						op, submit, err := fenced.Store.BeginPromotionSubmission(ctx, preparation.Operation.ID)
-						if err != nil || !submit {
+						if err != nil {
+							return err
+						}
+						if !submit {
 							t.Fatal("valid native submission boundary", err)
 						}
 						status := YouTubePublicationStatus{VideoID: op.PlatformVideoID, Privacy: "unlisted", PublishStatus: "scheduled"}
