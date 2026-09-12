@@ -653,6 +653,114 @@ vp_reconcile_worker_admission_transaction
         done = json.loads((self.active.parent / TRANSACTION_ID / "done.json").read_bytes())
         self.assertEqual((done["phase"], done["outcome"]), ("DONE", "rolled_back"))
 
+    def prepare_cold_retirement(self):
+        self.prepare_empty_worker_promotion()
+        self.state.update(phase="RETIRING", retiring_outcome="rolled_back",
+                          promotion=dict(workers=True, marker=True, control=True))
+        self.write_state()
+
+    def cold_retirement_shell(self, body):
+        return self.shell(r'''
+VP_WORKER_DEPLOY_MIGRATOR_DATABASE_URL_FILE="$CASE_ROOT/deploy_migrator"
+VP_WORKER_DEPLOY_READ_DATABASE_URL_FILE="$CASE_ROOT/deploy_read"
+VP_WORKER_CONTROL_ROLE_OWNER_DATABASE_URL_FILE="$CASE_ROOT/control_role_owner"
+VP_WORKER_RUNTIME_ROLE_OWNER_DATABASE_URL_FILE="$CASE_ROOT/runtime_role_owner"
+VP_WORKER_DEPLOY_MIGRATOR_EXPECTED_PRINCIPAL=vp_deploy_migrator
+VP_WORKER_DEPLOY_READ_EXPECTED_PRINCIPAL=vp_deploy_read
+VP_WORKER_CONTROL_ROLE_OWNER_EXPECTED_PRINCIPAL=vp_control_role_owner
+VP_WORKER_RUNTIME_ROLE_OWNER_EXPECTED_PRINCIPAL=vp_runtime_role_owner
+VP_API_DATABASE_URL_GO=fixture
+VP_PYTHON_WORKER_DATABASE_URL=fixture
+VP_MINIO_ACCESS_KEY=fixture
+VP_MINIO_SECRET_KEY=fixture
+docker() {
+  [[ "$1 $2 $3" == 'network inspect vp-pipeline-net' ]] || return 91
+  printf 'fixture-network|vp-pipeline-net|overlay|swarm\n'
+}
+# External DB probing is fake; captured file identity checks remain real.
+vp_probe_worker_database_principal() {
+  vp_verify_worker_database_credential_record "$4" "$2" "$3" >/dev/null
+}
+# Model the completed retirement's hydrated context; retain real journal effects.
+vp_worker_admission_hydrate_recovery_context() {
+  VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+  VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
+  VP_WORKER_ADMISSION_RECOVERY_FAILED_CANDIDATE_RECORDS=''
+  VP_WORKER_ROLLBACK_FAILED_CANDIDATE_NAMESPACE=''
+}
+vp_worker_admission_stale_rollback_records() { :; }
+vp_worker_admission_stale_rollback_namespaces() { :; }
+vp_worker_admission_retire_records() { :; }
+vp_worker_admission_retire_transaction() { :; }
+''' + body)
+
+    def test_cold_archive_reaches_real_next_config_and_credential_gate(self):
+        self.prepare_cold_retirement()
+        self.cold_retirement_shell(r'''
+vp_reconcile_worker_admission_transaction
+[[ ! -e "$CASE_ROOT/transactions/active.json" ]]
+vp_worker_admission_lock_assert
+vp_worker_admission_require_stage1_entry_state
+vp_validate_deploy_config vp-ffmpeg-worker-python:deploy-222222222222
+vp_worker_redis_marker_owner_file >/dev/null
+# A following transaction still requires its own durable credential pins.
+python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" begin "$CASE_ROOT" 19 \
+  3333333333333333333333333333333333333333 \
+  vp-backend:deploy-333333333333 vp-ffmpeg-worker-go:deploy-333333333333 \
+  3333333333333333333333333333333333333333 managed \
+  <<<"$VP_WORKER_DATABASE_CREDENTIAL_RECORDS" >/dev/null
+VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+vp_worker_admission_verify_active_database_credentials
+vp_worker_redis_marker_owner_file >/dev/null
+''')
+        done = json.loads((self.active.parent / TRANSACTION_ID / "done.json").read_bytes())
+        self.assertEqual((done["phase"], done["outcome"]), ("DONE", "rolled_back"))
+        self.assertEqual(self.read_state()["phase"], "PREPARING")
+        self.assertNotEqual(self.read_state()["transaction_id"], TRANSACTION_ID)
+        self.assertEqual(done["database_credentials"], self.read_state()["database_credentials"])
+
+    def test_cold_active_credential_drift_remains_rejected_without_archive(self):
+        self.prepare_cold_retirement()
+        before = self.active.read_bytes()
+        path = self.root / "deploy_migrator"
+        path.rename(self.root / "retained-deploy-migrator")
+        path.write_text("postgresql://fixture:password@database/videoprocess\n")
+        path.chmod(0o400)
+        self.cold_retirement_shell(r'''
+VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+if vp_reconcile_worker_admission_transaction; then exit 91; fi
+if vp_worker_redis_marker_owner_file >/dev/null; then exit 92; fi
+[[ "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true ]]
+''')
+        self.assertEqual(self.active.read_bytes(), before)
+        self.assertFalse((self.active.parent / TRANSACTION_ID / "done.json").exists())
+
+    def test_cold_replay_read_failure_does_not_disable_active_credential_check(self):
+        self.prepare_cold_retirement()
+        self.active.write_bytes(b"invalid-json\n")
+        self.cold_retirement_shell(r'''
+VP_WORKER_ADMISSION_TRANSACTION_PREPARING=true
+if vp_reconcile_worker_admission_transaction; then exit 91; fi
+if vp_worker_redis_marker_owner_file >/dev/null; then exit 92; fi
+[[ "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true ]]
+''')
+        self.assertEqual(self.active.read_bytes(), b"invalid-json\n")
+
+    def test_cold_archive_failure_keeps_active_credential_validation(self):
+        self.prepare_cold_retirement()
+        archive = self.active.parent / TRANSACTION_ID / "done.json"
+        archive.write_bytes(b"conflicting-archive\n")
+        archive.chmod(0o600)
+        self.cold_retirement_shell(r'''
+if vp_reconcile_worker_admission_transaction; then exit 91; fi
+[[ -f "$CASE_ROOT/transactions/active.json" ]]
+[[ "$VP_WORKER_ADMISSION_TRANSACTION_PREPARING" == true ]]
+vp_worker_admission_verify_active_database_credentials
+vp_worker_redis_marker_owner_file >/dev/null
+''')
+        self.assertEqual(self.read_state()["phase"], "DONE")
+        self.assertEqual(archive.read_bytes(), b"conflicting-archive\n")
+
 
 class RegisteredReconcileJournalTests(unittest.TestCase):
     def setUp(self):
