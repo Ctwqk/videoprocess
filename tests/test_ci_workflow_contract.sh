@@ -26,7 +26,6 @@ required_lines=(
   "tests/migrations/test_worker_session_signal_postgres.py"
   "PG16 worker operator lifecycle tests skipped"
   'CHANNELOPS_REQUIRE_DATABASE="1"'
-  'go test -count=1 ./internal/channelops ./internal/store'
   "name: Run Go worker registration fence integration tests"
   "go test -count=1 -v ./internal/worker ./cmd/vp-ffmpeg-worker"
   "Go worker registration integration tests skipped"
@@ -45,6 +44,28 @@ required_lines=(
 
 for line in "${required_lines[@]}"; do
   grep -Fq -- "$line" "$workflow" || fail "workflow is missing contract: $line"
+done
+
+channelops_postgres_run="$(
+  awk '
+    /^  backend:$/ { in_backend_job=1; next }
+    in_backend_job && /^  [A-Za-z0-9_-]+:$/ { exit }
+    in_backend_job && /^      - name: Run PostgreSQL ChannelOps integration tests$/ { in_step=1; next }
+    in_step && /^      - / { exit }
+    in_step && /^        run: \|$/ { in_run=1; next }
+    in_run && /^          / { sub(/^          /, ""); print }
+  ' "$workflow"
+)"
+channelops_postgres_lines=(
+  'set -o pipefail'
+  'DATABASE_URL="$CHANNEL_OPS_GO_POSTGRES_TEST_URL" \'
+  '  CHANNELOPS_REQUIRE_DATABASE="1" \'
+  '  go test -count=1 -ldflags "-X github.com/Ctwqk/videoprocess/internal/channelops.BuildCommitSHA=$GITHUB_SHA" ./internal/channelops ./internal/store \'
+  '  | tee ci-evidence/backend/go-channelops-postgres.txt'
+)
+for line in "${channelops_postgres_lines[@]}"; do
+  grep -Fxq -- "$line" <<<"$channelops_postgres_run" \
+    || fail "PostgreSQL ChannelOps invocation is missing contract: $line"
 done
 
 grep -Fq "name: Install deployment contract dependencies" "$workflow" \
