@@ -10817,6 +10817,7 @@ vp_finalize_worker_control_rollback() {
     return 0
   fi
   vp_require_selected_autoflow_control_ready || return 1
+  vp_require_pipeline_network_identity || return 1
   local root
   root="$(vp_worker_admission_root)" || return 1
   vp_worker_control_require_rollback_workers || return 1

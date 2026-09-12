@@ -35,7 +35,10 @@ def digest(spec):
 
 def docker_fixture(arguments):
     if arguments[:2] == ["network", "inspect"]:
-        print(f"{NETWORK}|vp-pipeline-net|overlay|swarm")
+        identity = os.environ["CASE_NETWORK_IDENTITY"]
+        if not identity:
+            return 1
+        print(identity)
         return 0
     if arguments == ["service", "ps", "vp-autoflow-api-swarm", "--no-trunc", "--format", "{{.ID}}"]:
         print("a" * 25)
@@ -106,8 +109,51 @@ class UntouchedRollbackControlTests(unittest.TestCase):
                 image=spec["TaskTemplate"]["ContainerSpec"]["Image"], spec_digest=digest(spec),
             ))
         self.live["vp-staging-object-janitor"] = dict(
-            ID="9" * 24, Spec=dict(Name="vp-staging-object-janitor", TaskTemplate=dict(ContainerSpec=dict(Secrets=[]))),
+            ID="9" * 24, Spec=dict(
+                Name="vp-staging-object-janitor",
+                Labels={"vp.videoprocess.job": "staging-object-janitor",
+                        "vp.videoprocess.generation": OLD_CONTROL},
+                Mode=dict(ReplicatedJob=dict(MaxConcurrent=1, TotalCompletions=1)),
+                TaskTemplate=dict(
+                    RestartPolicy=dict(Condition="none"),
+                    Placement=dict(Constraints=["node.hostname==ccttww-lap"]),
+                    Networks=[dict(Target=NETWORK)],
+                    ContainerSpec=dict(
+                        Image=OLD_IMAGE, User="10001:10001",
+                        Args=["python", "-m", "app.channel_agent.staging_object_janitor_cli"],
+                        Mounts=[dict(Type="volume", Source="vp-staging-janitor-evidence",
+                                     Target="/run/videoprocess/staging-janitor")],
+                        Secrets=[dict(
+                            SecretID=f"{i:024d}", SecretName=f"vp-wc-{name}-{OLD_CONTROL}",
+                            File=dict(Name=f"vp-staging-janitor-{target}", UID="10001", GID="10001", Mode=0o400),
+                        ) for i, (name, target) in enumerate((
+                            ("staging", "database-url"), ("minio-access", "minio-access-key"),
+                            ("minio-secret", "minio-secret-key"),
+                        ), 3)],
+                        Env=[
+                            "DEPLOY_MODE=production", "VP_STAGING_JANITOR_RUNNER_ID=ccttww-lap",
+                            "VP_STAGING_JANITOR_DATABASE_URL_FILE=/run/secrets/vp-staging-janitor-database-url",
+                            "VP_STAGING_JANITOR_MINIO_ACCESS_KEY_FILE=/run/secrets/vp-staging-janitor-minio-access-key",
+                            "VP_STAGING_JANITOR_MINIO_SECRET_KEY_FILE=/run/secrets/vp-staging-janitor-minio-secret-key",
+                            "VP_STAGING_JANITOR_STATUS_FILE=/run/videoprocess/staging-janitor/status.json",
+                            "STORAGE_BACKEND=minio", "MINIO_ENDPOINT=10.0.0.150:9000", "MINIO_BUCKET=videoprocess",
+                        ],
+                    ),
+                ),
+            ),
         )
+        self.network_identity = f"{NETWORK}|vp-pipeline-net|overlay|swarm"
+        self.initial_network_id = ""
+        config = self.root / "staging-object-janitor.conf"
+        config.write_text(
+            f"VERSION=2\nGENERATION={OLD_CONTROL}\nIMAGE={OLD_IMAGE}\n"
+            f"NETWORK=vp-pipeline-net\nNETWORK_ID={NETWORK}\n"
+            f"DATABASE_SECRET=vp-wc-staging-{OLD_CONTROL}\n"
+            f"MINIO_ACCESS_SECRET=vp-wc-minio-access-{OLD_CONTROL}\n"
+            f"MINIO_SECRET_SECRET=vp-wc-minio-secret-{OLD_CONTROL}\n"
+            "EVIDENCE_VOLUME=vp-staging-janitor-evidence\nMANAGER_NODE=ccttww-lap\n"
+        )
+        config.chmod(0o600)
         self.live["vp-autoflow-api-swarm"] = dict(
             ID="8" * 24,
             Spec=dict(Name="vp-autoflow-api-swarm", TaskTemplate=dict(ContainerSpec=dict(Secrets=[dict(
@@ -185,7 +231,7 @@ class UntouchedRollbackControlTests(unittest.TestCase):
         path.write_text("".join(f"{key}={value}\n" for key, value in fields.items()))
         path.chmod(0o600)
 
-    def finalize(self, success=True, *, autoflow_ready=True):
+    def finalize(self, success=True, *, autoflow_ready=True, probe_subshell=False):
         self.helper["_validate_document"](self.state)
         active = self.root / "transactions/active.json"
         active.write_bytes(self.helper["_canonical"](self.state))
@@ -208,12 +254,17 @@ VP_WORKER_ADMISSION_PREPARED=true
 VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=true
 VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
 VP_WORKER_CONTROL_PREPARED=true
+[[ -z "$VP_PIPELINE_NETWORK_ID" ]]
+VP_PIPELINE_NETWORK_ID="$CASE_INITIAL_NETWORK_ID"
 VP_WORKER_CONTROL_GENERATION="$CASE_OLD_CONTROL"
 VP_WORKER_ADMISSION_CONTROL_IMAGE="$CASE_OLD_IMAGE"
 VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION="$CASE_FAILED_CONTROL"
 VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE="$CASE_FAILED_IMAGE"
 VP_WORKER_MINIO_ACCESS_SECRET="vp-wc-worker-minio-access-$CASE_OLD_CONTROL"
 VP_WORKER_MINIO_SECRET_SECRET="vp-wc-worker-minio-secret-$CASE_OLD_CONTROL"
+VP_STAGING_JANITOR_DATABASE_SECRET="vp-wc-staging-$CASE_OLD_CONTROL"
+VP_STAGING_JANITOR_MINIO_ACCESS_SECRET="vp-wc-minio-access-$CASE_OLD_CONTROL"
+VP_STAGING_JANITOR_MINIO_SECRET_SECRET="vp-wc-minio-secret-$CASE_OLD_CONTROL"
 VP_WORKER_REDIS_FFMPEG_GO_SECRET=redis-ffmpeg-go
 VP_WORKER_REDIS_FFMPEG_SECRET=redis-ffmpeg
 VP_WORKER_REDIS_VISION_SECRET=redis-vision
@@ -224,34 +275,70 @@ vp_worker_control_write_manifest "$CASE_ROOT/control-current.conf" "$CASE_OLD_CO
 ids=()
 for n in 11 12 13 14 15 16 17; do ids+=("$(printf '%024d' "$n")"); done
 vp_worker_control_write_manifest "$CASE_ROOT/control-candidates/$CASE_FAILED_CONTROL.conf" "$CASE_FAILED_CONTROL" "$CASE_FAILED_IMAGE" "${ids[@]}"
-vp_require_staging_object_janitor_control() {
-  [[ "$1" == "$CASE_ROOT" && "$2" == "$CASE_OLD_IMAGE" ]] || return 1
-  printf 'janitor\n' >>"$CASE_ROOT/effects"
-}
+python3 -c 'import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+files = [root / "control-current.conf", root / "control-candidates" / (sys.argv[2] + ".conf")]
+(root / "before.json").write_text(json.dumps({str(p): [p.read_text(), p.stat().st_mtime_ns] for p in files}))
+' "$CASE_ROOT" "$CASE_FAILED_CONTROL"
 vp_worker_control_revoke_authority() { printf 'revoke|%s|%s\n' "$1" "$2" >>"$CASE_ROOT/effects"; }
 vp_remove_managed_secret_if_absent_exact() { printf 'secret|%s\n' "$*" >>"$CASE_ROOT/effects"; }
 # Remote health is a dependency here; selected-image and retirement checks stay real.
 vp_require_autoflow_control_ready() {
   [[ "$1" == vp-backend-api:deploy-222222222222 && "$CASE_AUTOFLOW_READY" == true ]]
 }
-vp_finalize_worker_control_rollback
+if [[ "$CASE_PROBE_SUBSHELL" == true ]]; then
+  vp_worker_control_require_rollback_workers
+  [[ -z "$VP_PIPELINE_NETWORK_ID" ]]
+fi
+vp_worker_admission_apply_promotion_effect PROMOTE_ROLLBACK_CONTROL
 [[ -z "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" && "$VP_WORKER_CONTROL_PREPARED" == false ]]
 [[ "$VP_WORKER_ADMISSION_COMMIT" == 2222222222222222222222222222222222222222 ]]
 '''], env=dict(os.environ, CASE_ROOT=str(self.root), CASE_REPO=str(REPO), CASE_TEST=__file__,
               CASE_TRANSACTION=TRANSACTION, CASE_NAMESPACE=NAMESPACE, CASE_SELECTED=" ".join(self.selected),
               CASE_OLD_CONTROL=OLD_CONTROL, CASE_OLD_IMAGE=OLD_IMAGE,
               CASE_FAILED_CONTROL=FAILED_CONTROL, CASE_FAILED_IMAGE=FAILED_IMAGE,
+              CASE_NETWORK_IDENTITY=self.network_identity, CASE_INITIAL_NETWORK_ID=self.initial_network_id,
+              CASE_PROBE_SUBSHELL=str(probe_subshell).lower(),
               CASE_AUTOFLOW_READY=str(autoflow_ready).lower()),
             capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode == 0, success, result.stderr)
         effects = (self.root / "effects").read_text().splitlines() if (self.root / "effects").exists() else []
         if success:
-            self.assertEqual(effects[:2], ["janitor", f"revoke|{FAILED_IMAGE}|{FAILED_CONTROL}"])
-            self.assertEqual(len(effects), 9)
-            self.assertTrue(all(FAILED_CONTROL in line for line in effects[2:]))
+            self.assertEqual(effects[0], f"revoke|{FAILED_IMAGE}|{FAILED_CONTROL}")
+            self.assertEqual(len(effects), 8)
+            self.assertTrue(all(FAILED_CONTROL in line for line in effects[1:]))
             self.assertFalse((self.root / "control-candidates" / f"{FAILED_CONTROL}.conf").exists())
         else:
             self.assertEqual(effects, [])
+            self.assertFalse((self.root / "control-retirements").exists())
+            for path, (content, mtime) in json.loads((self.root / "before.json").read_text()).items():
+                self.assertEqual(Path(path).read_text(), content)
+                self.assertEqual(Path(path).stat().st_mtime_ns, mtime)
+        self.assertEqual(active.read_bytes(), self.helper["_canonical"](self.state))
+
+    def test_cold_pending_promotion_keeps_worker_subshell_network_resolution_local(self):
+        self.select_worker(2)
+        self.finalize(probe_subshell=True)
+
+    def test_missing_network_refuses_before_control_writes_or_retirement(self):
+        self.network_identity = ""
+        self.finalize(success=False)
+
+    def test_pinned_network_mismatch_refuses_before_control_writes_or_retirement(self):
+        self.initial_network_id = "different-network"
+        self.finalize(success=False)
+
+    def test_wrong_network_driver_refuses_before_control_writes_or_retirement(self):
+        self.network_identity = f"{NETWORK}|vp-pipeline-net|bridge|swarm"
+        self.finalize(success=False)
+
+    def test_recreated_network_refuses_existing_janitor_config(self):
+        self.network_identity = "different-network|vp-pipeline-net|overlay|swarm"
+        self.finalize(success=False)
+
+    def test_janitor_spec_network_drift_still_refuses(self):
+        self.live["vp-staging-object-janitor"]["Spec"]["TaskTemplate"]["Networks"][0]["Target"] = "different-network"
+        self.finalize(success=False)
 
     def test_zero_attempted_workers_finalize_using_unchanged_baseline(self):
         self.finalize()
