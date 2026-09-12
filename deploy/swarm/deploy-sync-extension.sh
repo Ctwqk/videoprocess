@@ -12162,13 +12162,32 @@ vp_autoflow_update_runtime_service() {
     || return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
   health="$(vp_autoflow_health_command)" \
     || return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
+  local update_args=(
+    "$VP_WORKER_ADMISSION_LOCK_ROOT" "$VP_WORKER_ADMISSION_LOCK_FD"
+    "$VP_WORKER_ADMISSION_CURRENT_BASHPID" "$VP_WORKER_ADMISSION_LOCK_TOKEN"
+    "$VP_WORKER_ADMISSION_REPLAY_REVISION" "$service_id" "$image" "$order"
+    "$VP_AUTOFLOW_CONTROL_IDENTITY" "$VP_RUNTIME_NODE" "$health"
+  )
+  if [[ -n "${OWNED_HISTORY_REDIS_URL_FILE:-}" ]]; then
+    update_args+=(owned-history-file)
+  fi
   # Direct invocation retains the owning shell and the existing journal fence.
   python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" autoflow-update \
+    "${update_args[@]}" \
+    >/dev/null 2>/dev/null
+}
+
+vp_owned_history_runner_update_runtime_service() {
+  local service_id="$1" image="$2" order="$3"
+  [[ -n "${OWNED_HISTORY_REDIS_URL_FILE:-}" ]] \
+    || return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
+  vp_worker_admission_load_replay_plan \
+    || return "$VP_SERVICE_UPDATE_NOT_ATTEMPTED"
+  python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" owned-history-runner-update \
     "$VP_WORKER_ADMISSION_LOCK_ROOT" "$VP_WORKER_ADMISSION_LOCK_FD" \
     "$VP_WORKER_ADMISSION_CURRENT_BASHPID" "$VP_WORKER_ADMISSION_LOCK_TOKEN" \
     "$VP_WORKER_ADMISSION_REPLAY_REVISION" "$service_id" "$image" "$order" \
-    "$VP_AUTOFLOW_CONTROL_IDENTITY" "$VP_RUNTIME_NODE" "$health" \
-    >/dev/null 2>/dev/null
+    - "$VP_RUNTIME_NODE" - owned-history-file >/dev/null 2>/dev/null
 }
 
 vp_autoflow_tasks() {
@@ -12187,6 +12206,22 @@ vp_autoflow_tasks() {
   fi
 }
 
+vp_owned_history_redis_identity() {
+  local state
+  state="$(vp_worker_admission_recovery_state)" || return 1
+  python3 -I -c '
+import json,re,sys
+try:
+    ref=json.load(sys.stdin)["runtime_redis"]["control"]
+    if set(ref)!={"runtime_generation","secret_name","docker_secret_id"}: raise ValueError
+    generation=ref["runtime_generation"]
+    if not re.fullmatch(r"[0-9a-f]{40}",generation): raise ValueError
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}",ref["secret_name"]) or not re.fullmatch(r"[a-z0-9]{25}",ref["docker_secret_id"]): raise ValueError
+    print(ref["secret_name"]+"|"+ref["docker_secret_id"])
+except (KeyError,TypeError,ValueError): raise SystemExit(1)
+' <<<"$state"
+}
+
 vp_require_autoflow_control_ready() {
   [[ "${UPDATE_SERVICES:-1}" -ne 0 ]] || return 0
   local image="$1" service=vp-autoflow-api-swarm identity before service_id spec tasks image_user health container
@@ -12194,6 +12229,10 @@ vp_require_autoflow_control_ready() {
   service_id="${before%%|*}"
   vp_autoflow_control_identity "$service_id" "$image" || return 1
   identity="$VP_AUTOFLOW_CONTROL_IDENTITY"
+  local owned_history_identity="-"
+  if [[ -n "${OWNED_HISTORY_REDIS_URL_FILE:-}" ]]; then
+    owned_history_identity="$(vp_owned_history_redis_identity)" || return 1
+  fi
   vp_require_service_node "$service_id" "$VP_RUNTIME_NODE" || return 1
   spec="$(docker service inspect "$service_id" --format '{{json .Spec}}')" || return 1
   tasks="$(vp_autoflow_tasks "$service_id")" || return 1
@@ -12221,6 +12260,15 @@ try:
     mounted=[s for s in c.get("Secrets",[]) if s.get("File",{}).get("Name")=="worker-orchestrator-database-url" or s.get("SecretName","").startswith("vp-wc-orchestrator-")]
     expected={"SecretName":name,"SecretID":secret_id,"File":{"Name":"worker-orchestrator-database-url","UID":uid,"GID":gid,"Mode":256}}
     if mounted!=[expected] or c.get("Healthcheck",{}).get("Test")!=["CMD-SHELL",health]: raise ValueError
+    if sys.argv[6]!="-":
+        history_name,history_id=sys.argv[6].split("|")
+        history_target="owned-history-redis-url"
+        history_path="/run/secrets/"+history_target
+        if "OWNED_HISTORY_REDIS_URL_FILE="+history_path not in env: raise ValueError
+        history_mounts=[s for s in c.get("Secrets",[]) if s.get("File",{}).get("Name") in {history_target,history_path}]
+        if history_mounts!=[{"SecretName":history_name,"SecretID":history_id,"File":{"Name":history_target,"UID":uid,"GID":gid,"Mode":256}}]: raise ValueError
+        if any(s.get("File",{}).get("Name") in {history_target,history_path} for s in c.get("Configs",[])): raise ValueError
+        if any(history_path==m.get("Target","").rstrip("/") or history_path.startswith(m.get("Target","").rstrip("/")+"/") for m in c.get("Mounts",[])): raise ValueError
     active=[t for t in tasks if t["Status"]["State"] not in {"shutdown","complete","failed","rejected","remove"}]
     if len(active)!=1: raise ValueError
     t=active[0]
@@ -12230,7 +12278,7 @@ try:
     print(container)
 except (KeyError,TypeError,ValueError,AttributeError):
     raise SystemExit(1)
-' "$identity" "$service_id" "$image" "$image_user" "$health" <<<"$spec"$'\n'"$tasks")" || return 1
+' "$identity" "$service_id" "$image" "$image_user" "$health" "$owned_history_identity" <<<"$spec"$'\n'"$tasks")" || return 1
   remote_sh "$VP_RUNTIME_HOST" /bin/sh -s -- "$container" "$service_id" "$image" "$health" <<'REMOTE' >/dev/null 2>&1 || return 1
 set -eu
 container="$1"; service_id="$2"; image="$3"; health="$4"
@@ -12265,6 +12313,11 @@ vp_update_runtime_service() {
   fi
   if [[ "$service" == vp-autoflow-api-swarm ]]; then
     vp_autoflow_update_runtime_service "$current_service_id" "$image" "$order"
+    return
+  fi
+  if [[ "$service" == vp-channel-agent-runner-swarm \
+    && -n "${OWNED_HISTORY_REDIS_URL_FILE:-}" ]]; then
+    vp_owned_history_runner_update_runtime_service "$current_service_id" "$image" "$order"
     return
   fi
 

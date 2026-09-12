@@ -170,6 +170,7 @@ class Invocation:
     replay_only: bool
     control_generation: str
     redis_generation: str
+    redis_secret_name: str
     redis_username: str
     database_secret_id: str
     redis_secret_id: str
@@ -191,6 +192,12 @@ class Invocation:
                 "generation_invalid",
             )
         _require(
+            type(self.redis_secret_name) is str
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", self.redis_secret_name)
+            is not None,
+            "secret_identity_invalid",
+        )
+        _require(
             type(self.redis_username) is str
             and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", self.redis_username)
             is not None
@@ -211,10 +218,6 @@ class Invocation:
     @property
     def database_secret_name(self) -> str:
         return f"vp-wc-operator-{self.control_generation}"
-
-    @property
-    def redis_secret_name(self) -> str:
-        return f"vp-control-redis-{self.redis_generation}"
 
 
 class AttemptAuthority(Protocol):

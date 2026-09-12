@@ -33,7 +33,8 @@ def invocation(**changes):
         attempt_id=UUID(int=987),
         replay_only=False,
         control_generation="control-1",
-        redis_generation="redis-1",
+        redis_generation="eeb8593f43dc5709d0191a06c528a9d35b22785e",
+        redis_secret_name="vp-control-redis-eeb8593f43dc",
         redis_username="vp_control_1",
         database_secret_id="a" * 25,
         redis_secret_id="b" * 25,
@@ -335,8 +336,10 @@ def test_finished_record_cannot_reload_with_unknown_or_consumed_results(tmp_path
             job.validate_record(altered)
 
 
-def test_capture_descriptor_cannot_execute_reconcile_or_mount_extra_authority(tmp_path):
+@pytest.mark.parametrize("name", ["vp-control-redis-eeb8593f43dc", "a" * 255])
+def test_capture_descriptor_cannot_execute_reconcile_or_mount_extra_authority(tmp_path, name):
     job, _, files, binding = setup_protocol(tmp_path)
+    binding["credentials"]["redis_secret_name"] = name
     spec = job.capture_spec(
         attempt_id=binding["attempt_id"],
         transaction_id=binding["transaction_id"],
@@ -356,6 +359,13 @@ def test_capture_descriptor_cannot_execute_reconcile_or_mount_extra_authority(tm
     container = spec["TaskTemplate"]["ContainerSpec"]
     assert container["Args"][-1] == "--capture"
     assert len(container["Secrets"]) == 3
+    expected_redis = dict(
+        SecretID=binding["credentials"]["redis_secret_id"],
+        SecretName=binding["credentials"]["redis_secret_name"],
+        File=dict(Name="registered-reconcile-redis-url", UID="10001", GID="10001", Mode=0o400),
+    )
+    assert container["Secrets"][1] == expected_redis
+    assert managed_spec(job, binding)["TaskTemplate"]["ContainerSpec"]["Secrets"][1] == expected_redis
     assert container["Secrets"][-1]["File"] == dict(
         Name="registered-reconcile-capture-read", UID="10001", GID="10001", Mode=0o400
     )
@@ -454,6 +464,27 @@ def test_cleanup_preserves_raw_bytes_and_only_removes_bound_names(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("name", [None, "", "bad/name", "missing", "a" * 256])
+async def test_capture_rejects_missing_or_malformed_name_before_secret_read(tmp_path, monkeypatch, name):
+    from app.services import registered_consumer_reconcile_runtime as runtime
+
+    job, _, files, binding = setup_protocol(tmp_path)
+    credentials = {key: binding["credentials"][key] for key in (
+        "control_generation", "redis_generation", "redis_secret_name",
+        "database_secret_id", "redis_secret_id",
+    )}
+    if name == "missing":
+        del credentials["redis_secret_name"]
+    else:
+        credentials["redis_secret_name"] = name
+    reads = []
+    monkeypatch.setattr(runtime, "_read_mount", lambda key: reads.append(key))
+    with pytest.raises(job.ProtocolError, match="^registered_reconcile_protocol_failed$"):
+        await job.capture_managed(dict(files=files, credentials=credentials))
+    assert reads == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fault",
     [
@@ -470,6 +501,7 @@ def test_cleanup_preserves_raw_bytes_and_only_removes_bound_names(tmp_path):
         "fragment",
         "missing_port",
         "normalized_target",
+        "name_255",
     ],
 )
 async def test_capture_reads_secret_bytes_but_returns_only_hashes_and_real_principal(
@@ -486,10 +518,13 @@ async def test_capture_reads_secret_bytes_but_returns_only_hashes_and_real_princ
         for key in (
             "control_generation",
             "redis_generation",
+            "redis_secret_name",
             "database_secret_id",
             "redis_secret_id",
         )
     }
+    if fault == "name_255":
+        credentials["redis_secret_name"] = "a" * 255
     principal = role_names_for_generation(credentials["control_generation"]).versioned[
         "operator"
     ]
@@ -568,7 +603,7 @@ async def test_capture_reads_secret_bytes_but_returns_only_hashes_and_real_princ
     payload = dict(
         files=files, credentials=credentials, baseline=None, capture_read=capture_read
     )
-    if fault not in (None, "normalized_target"):
+    if fault not in (None, "normalized_target", "name_255"):
         with pytest.raises(
             job.ProtocolError, match="^registered_reconcile_protocol_failed$"
         ):
@@ -583,6 +618,7 @@ async def test_capture_reads_secret_bytes_but_returns_only_hashes_and_real_princ
         == hashlib.sha256(raw["database"].encode()).hexdigest()
     )
     assert result["credentials"]["redis_username"] == "vp_control"
+    assert result["credentials"]["redis_secret_name"] == credentials["redis_secret_name"]
     assert "private" not in json.dumps(result)
     assert result["snapshot"]["workers"] == [None] * 4
 
@@ -735,6 +771,20 @@ def test_binding_pins_and_credentials_are_exact(tmp_path):
     assert "password" not in json.dumps(binding)
     changed = invocation(redis_secret_id="z" * 25)
     assert job.make_binding(changed, files, descriptor_sha256="e" * 64) != binding
+    changed = invocation(redis_secret_name="qualified-control.current")
+    renamed = job.make_binding(changed, files, descriptor_sha256="e" * 64)
+    assert renamed["credentials"]["redis_secret_name"] == "qualified-control.current"
+    assert job.digest(renamed) != job.digest(binding)
+    longest = job.make_binding(invocation(redis_secret_name="a" * 255), files, descriptor_sha256="e" * 64)
+    assert longest["credentials"]["redis_secret_name"] == "a" * 255
+    for name in (None, "", "bad/name", "bad\nname", "a" * 256):
+        damaged = copy.deepcopy(binding)
+        damaged["credentials"]["redis_secret_name"] = name
+        with pytest.raises(job.ProtocolError):
+            job.validate_binding(damaged)
+    del damaged["credentials"]["redis_secret_name"]
+    with pytest.raises(job.ProtocolError):
+        job.validate_binding(damaged)
     for value in (True, -1):
         damaged = copy.deepcopy(binding)
         damaged["binding_revision"] = value

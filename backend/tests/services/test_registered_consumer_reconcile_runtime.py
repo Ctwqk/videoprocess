@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -26,13 +27,29 @@ def invocation(*, replay_only=False):
         attempt_id=UUID(int=900),
         replay_only=replay_only,
         control_generation="rcr-unit2",
-        redis_generation="runtime-unit2",
+        redis_generation="eeb8593f43dc5709d0191a06c528a9d35b22785e",
+        redis_secret_name="vp-control-redis-eeb8593f43dc",
         redis_username="vp-control-test",
         database_secret_id="a" * 25,
         redis_secret_id="b" * 25,
         database_secret_sha256="c" * 64,
         redis_secret_sha256="d" * 64,
     )
+
+
+def test_invocation_preserves_explicit_redis_name_and_full_generation():
+    request = invocation()
+    assert request.redis_generation == "eeb8593f43dc5709d0191a06c528a9d35b22785e"
+    assert request.redis_secret_name == "vp-control-redis-eeb8593f43dc"
+    assert replace(request, redis_secret_name="qualified-control.current").redis_secret_name == "qualified-control.current"
+    assert replace(request, redis_secret_name="a" * 255).redis_secret_name == "a" * 255
+    for name in (None, "", "bad/name", "bad\nname", "a" * 256):
+        with pytest.raises(runtime.ReconcileRuntimeError):
+            replace(request, redis_secret_name=name)
+    values = dict(request.__dict__)
+    del values["redis_secret_name"]
+    with pytest.raises(TypeError):
+        runtime.Invocation(**values)
 
 
 def native_record(values):

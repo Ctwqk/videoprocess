@@ -4707,16 +4707,18 @@ def _registered_credentials(document: dict) -> dict:
         or matches[0]["name"] != "vp-wc-operator-" + control["generation"]
     ):
         raise TransactionError
-    redis = document["runtime_redis"].get("control")
-    if (
-        redis is None
-        or redis["secret_name"] != "vp-control-redis-" + redis["runtime_generation"]
-    ):
-        raise TransactionError
+    redis = _require_exact_fields(
+        document["runtime_redis"].get("control"),
+        {"runtime_generation", "secret_name", "docker_secret_id"},
+    )
+    _require_string(redis["runtime_generation"], r"[a-z0-9][a-z0-9-]{0,62}")
+    _require_string(redis["secret_name"], r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+    _require_string(redis["docker_secret_id"], r"[a-z0-9]{25}")
     return dict(
         control_generation=control["generation"],
         database_secret_id=matches[0]["docker_secret_id"],
         redis_generation=redis["runtime_generation"],
+        redis_secret_name=redis["secret_name"],
         redis_secret_id=redis["docker_secret_id"],
     )
 
@@ -4996,9 +4998,77 @@ def _engine_service_post(path: str, spec: dict, status: int) -> dict:
         raise TransactionError from None
 
 
+def _owned_history_secret(reference: dict, user: str) -> dict:
+    _require_exact_fields(reference, {"runtime_generation", "secret_name", "docker_secret_id"})
+    _require_string(reference["runtime_generation"], r"[0-9a-f]{40}")
+    _require_string(reference["docker_secret_id"], r"[a-z0-9]{25}")
+    _require_string(reference["secret_name"], r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+    if user in {"", "0", "root"}:
+        user = "0:0"
+    _require_string(user, r"[0-9]+:[0-9]+")
+    uid, gid = user.split(":")
+    return {"SecretID": reference["docker_secret_id"], "SecretName": reference["secret_name"],
+            "File": {"Name": "owned-history-redis-url", "UID": uid, "GID": gid, "Mode": 0o400}}
+
+
+def _mount_owned_history(container: dict, image_user: str, reference: dict) -> None:
+    expected = _owned_history_secret(reference, container.get("User") or image_user)
+    target = expected["File"]["Name"]
+    path = "/run/secrets/" + target
+    env_key = "OWNED_HISTORY_REDIS_URL_FILE"
+    env = container.get("Env") or []
+    keys = [entry.split("=", 1)[0] for entry in env]
+    configured = [entry for entry in env if entry.split("=", 1)[0] == env_key]
+    secrets = container.get("Secrets") or []
+    mounted = [entry for entry in secrets if entry.get("File", {}).get("Name") in {target, path}]
+    if len(keys) != len(set(keys)) or configured not in ([], [env_key + "=" + path]):
+        raise TransactionError
+    if mounted not in ([], [expected]):
+        raise TransactionError
+    if any(entry.get("File", {}).get("Name") in {target, path} for entry in container.get("Configs", [])):
+        raise TransactionError
+    for mount in container.get("Mounts", []):
+        mount_target = mount.get("Target", "").rstrip("/")
+        if path == mount_target or path.startswith(mount_target + "/"):
+            raise TransactionError
+    container["Secrets"] = [entry for entry in secrets if entry not in mounted] + [expected]
+    container["Env"] = [entry for entry in env if entry.split("=", 1)[0] != env_key] + [env_key + "=" + path]
+
+
+def _owned_history_runner_update_spec(
+    actual: dict, service_id: str, image: str, order: str,
+    image_user: str, runtime_node: str, reference: dict,
+) -> dict:
+    try:
+        _require_string(service_id, r"[a-z0-9]{25}")
+        _require_string(runtime_node, r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}")
+        if (actual["ID"] != service_id or actual["Spec"]["Name"] != "vp-channel-agent-runner-swarm"
+                or order not in {"start-first", "stop-first"}):
+            raise TransactionError
+        spec = copy.deepcopy(actual["Spec"])
+        container = spec["TaskTemplate"]["ContainerSpec"]
+        _mount_owned_history(container, image_user, reference)
+        container["Image"] = image
+        overrides = {"CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS", "CHANNELOPS_RUNNER_ID"}
+        container["Env"] = [entry for entry in container["Env"] if entry.split("=", 1)[0] not in overrides] + [
+            "CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS=120", "CHANNELOPS_RUNNER_ID=channelops-go@colima-127:1",
+        ]
+        container.setdefault("Healthcheck", {}).update(
+            Test=["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/readyz >/dev/null || exit 1"],
+            Interval=10_000_000_000, Timeout=3_000_000_000, Retries=6, StartPeriod=10_000_000_000,
+        )
+        spec["TaskTemplate"].setdefault("Placement", {})["Constraints"] = [
+            "node.labels.vp.runtime==true", "node.hostname==" + runtime_node,
+        ]
+        spec.setdefault("UpdateConfig", {})["Order"] = order
+        return spec
+    except Exception:
+        raise TransactionError from None
+
+
 def _autoflow_update_spec(
     actual: dict, service_id: str, image: str, order: str, identity: str,
-    image_user: str, health: str, runtime_node: str,
+    image_user: str, health: str, runtime_node: str, *, owned_history: dict | None = None,
 ) -> dict:
     try:
         name, secret_id, generation = identity.split("|")
@@ -5037,6 +5107,8 @@ def _autoflow_update_spec(
             "SecretID": secret_id, "SecretName": name,
             "File": {"Name": target, "UID": uid, "GID": gid, "Mode": 0o400},
         }]
+        if owned_history is not None:
+            _mount_owned_history(container, image_user, owned_history)
         container["Image"] = image
         container.setdefault("Healthcheck", {}).update(
             Test=["CMD-SHELL", health], Interval=10_000_000_000,
@@ -5051,10 +5123,13 @@ def _autoflow_update_spec(
         raise TransactionError from None
 
 
-def autoflow_update(arguments: list[str]) -> int:
+def autoflow_update(arguments: list[str], *, owned_history_runner: bool = False) -> int:
     attempted = False
     try:
-        root, fd, owner, token, revision, service_id, image, order, identity, node, health = arguments
+        file_mode = len(arguments) == 12 and arguments[-1] == "owned-history-file"
+        if owned_history_runner and not file_mode:
+            raise TransactionError
+        root, fd, owner, token, revision, service_id, image, order, identity, node, health = arguments[:-1] if file_mode else arguments
 
         def locked_document() -> dict:
             if fd != "19" or int(owner) != os.getppid() or acquire_lock(root, fd) != token:
@@ -5066,18 +5141,42 @@ def autoflow_update(arguments: list[str]) -> int:
 
         document = locked_document()
         rollback = document["phase"].startswith("ROLLBACK") or document.get("retiring_outcome") == "rolled_back"
-        selected = document["rollback" if rollback else "forward"]["control"]
-        name, secret_id, generation = identity.split("|")
-        if selected["generation"] != generation or not any(
-            ref["name"] == name and ref["docker_secret_id"] == secret_id
-            and ref["purpose"] == "orchestrator" for ref in selected["secrets"]
-        ):
-            raise TransactionError
-        baseline = [entry for entry in document["baseline"]["services"] if entry["name"] == "vp-autoflow-api-swarm"]
+        service = "vp-channel-agent-runner-swarm" if owned_history_runner else "vp-autoflow-api-swarm"
+        baseline = [entry for entry in document["baseline"]["services"] if entry["name"] == service]
         if len(baseline) != 1 or not baseline[0]["existed"] or baseline[0]["docker_service_id"] != service_id:
             raise TransactionError
-        if image != "vp-backend-api:deploy-" + document["target_commit"][:12]:
+        if owned_history_runner:
+            if identity != "-" or health != "-":
+                raise TransactionError
+            expected_image = "vp-channelops-runner-go:deploy-" + document["target_commit"][:12]
+            if rollback:
+                expected_image = baseline[0]["image"]
+            elif document["phase"].startswith("CANDIDATE_RESTORE"):
+                failed = [entry for entry in document["failed_forward"]["services"] if entry["name"] == service]
+                if len(failed) != 1 or failed[0]["docker_service_id"] != service_id:
+                    raise TransactionError
+                expected_image = failed[0]["image"]
+        else:
+            selected = document["rollback" if rollback else "forward"]["control"]
+            name, secret_id, generation = identity.split("|")
+            if selected["generation"] != generation or not any(
+                ref["name"] == name and ref["docker_secret_id"] == secret_id
+                and ref["purpose"] == "orchestrator" for ref in selected["secrets"]
+            ):
+                raise TransactionError
+            expected_image = "vp-backend-api:deploy-" + document["target_commit"][:12]
+        if image != expected_image:
             raise TransactionError
+        owned_history = document["runtime_redis"].get("control") if file_mode else None
+        if file_mode:
+            if owned_history is None:
+                raise TransactionError
+            mounted = _owned_history_secret(owned_history, "0:0")
+            actual_secret = _registered_docker([
+                "secret", "inspect", mounted["SecretID"], "--format", "{{.ID}}|{{.Spec.Name}}",
+            ], timeout=5)
+            if actual_secret != mounted["SecretID"] + "|" + mounted["SecretName"]:
+                raise TransactionError
 
         def inspect(timeout: float = 5) -> dict:
             records = json.loads(_registered_docker(["service", "inspect", service_id], timeout=timeout))
@@ -5090,7 +5189,13 @@ def autoflow_update(arguments: list[str]) -> int:
         if type(version) is not int or version < 0:
             raise TransactionError
         image_user = _registered_docker(["image", "inspect", image, "--format", "{{.Config.User}}"], timeout=5)
-        spec = _autoflow_update_spec(actual, service_id, image, order, identity, image_user, health, node)
+        if owned_history_runner:
+            if owned_history is None:
+                raise TransactionError
+            spec = _owned_history_runner_update_spec(actual, service_id, image, order, image_user, node, owned_history)
+        else:
+            spec = _autoflow_update_spec(actual, service_id, image, order, identity, image_user, health, node,
+                                        owned_history=owned_history)
         if locked_document() != document:
             raise TransactionError
         attempted = True
@@ -5781,7 +5886,7 @@ def _registered_selection(document: dict, binding: dict, service_id: str | None,
         raise TransactionError
     if document["runtime_redis"].get("control") != {
         "runtime_generation": credentials["redis_generation"],
-        "secret_name": "vp-control-redis-" + credentials["redis_generation"],
+        "secret_name": credentials["redis_secret_name"],
         "docker_secret_id": credentials["redis_secret_id"],
     }:
         raise TransactionError
@@ -6406,6 +6511,8 @@ def archive(arguments: list[str]) -> None:
 def main(arguments: list[str]) -> int:
     if arguments and arguments[0] == "autoflow-update":
         return autoflow_update(arguments[1:])
+    if arguments and arguments[0] == "owned-history-runner-update":
+        return autoflow_update(arguments[1:], owned_history_runner=True)
     if arguments and arguments[0] == "registered-job":
         return registered_job_action(arguments[1:])
     if len(arguments) == 2 and arguments[0] == "lock-prepare":
