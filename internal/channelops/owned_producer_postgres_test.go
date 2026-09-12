@@ -79,7 +79,7 @@ func (a *ownedProducerPGAutoFlow) ApprovePlan(ctx context.Context, planID string
 
 func ownedProducerPGClaimPlan(t *testing.T, f *ownedPGFixture, ctx context.Context) (QueueItemRow, *ownedProducerPGAutoFlow) {
 	t.Helper()
-	if err := f.store.RunTick(ctx, f.channel.ID, "owned-producer", HandlerService{PDS: fakePDS{decision: ownedProducerRealDecision()}}); err != nil {
+	if err := f.store.RunTick(ctx, f.channel.ID, "owned-producer", f.handler(t, fakePDS{decision: ownedProducerRealDecision()})); err != nil {
 		t.Fatal("native admission", err, ownedProducerPGAdmissionDiagnostic(f, ctx))
 	}
 	item, err := f.store.ClaimNextForChannelAndKinds(ctx, handlerWorkerID(f.lease.Authority()), f.channel.ID, []string{QueuePlanTask})
@@ -135,6 +135,31 @@ func TestOwnedProducerAdmissionDiagnosticReportsReadFailure(t *testing.T) {
 	row := ownedB2FenceRow(func(...any) error { return failure })
 	if got := ownedProducerAdmissionDiagnostic(row); !strings.Contains(got, failure.Error()) {
 		t.Fatalf("diagnostic failure hidden: %s", got)
+	}
+}
+
+func TestOwnedProducerFixtureReaderPreservesExternalClients(t *testing.T) {
+	f := &ownedPGFixture{store: &Store{}}
+	pds := &fakePDS{decision: ownedProducerRealDecision()}
+	api := &ownedProducerPGAutoFlow{t: t, f: f}
+	youtube := &durablePromotionYouTube{}
+	h := f.handler(t, pds)
+	h.AutoFlow, h.YouTube = api, youtube
+	snapshot := historySnapshot(t, historyGolden(t, "retired_unassigned"))
+	phases := 0
+	err := h.withOwnedHistoryObservation(context.Background(), func(evidence *ownedHistoryRedisEvidence) error {
+		phases++
+		fresh, err := ownedHistoryWithObservations(snapshot, evidence)
+		if err != nil {
+			return err
+		}
+		if assessment := assessOwnedHistorySnapshot(fresh, fresh.observedAt); assessment.BlockReason != nil {
+			return fmt.Errorf("retained fixture proof refused: %s", *assessment.BlockReason)
+		}
+		return nil
+	})
+	if err != nil || phases != 2 || h.Store != f.store || h.PDS != pds || h.AutoFlow != api || h.YouTube != youtube {
+		t.Fatalf("reader lost fixture clients or fresh proof: phases=%d err=%v", phases, err)
 	}
 }
 
@@ -231,7 +256,15 @@ func ownedProducerPGAssertRecoveredHistoryHeld(t *testing.T, f *ownedPGFixture, 
 	if state != "held" || reason != "owned_inventory_queue_failed" || queueState != QueueStatusSucceeded || attempts != 2 || lastError != nil || owner != nil || locked != nil || completed != 0 {
 		t.Fatal("retry was erased or strict completion/replacement guard weakened", state, reason, attempts, completed)
 	}
-	snapshot, err := loadOwnedHistorySnapshot(ctx, f.store.Pool, ownedString(f.data.Inventory["platform_channel_id"]))
+	var snapshot ownedHistorySnapshot
+	err := f.handler(t, nil).withOwnedHistoryObservation(ctx, func(evidence *ownedHistoryRedisEvidence) error {
+		current, err := loadOwnedHistorySnapshot(ctx, f.store.Pool, ownedString(f.data.Inventory["platform_channel_id"]))
+		if err != nil {
+			return err
+		}
+		snapshot, err = ownedHistoryWithObservations(current, evidence)
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +276,7 @@ func ownedProducerPGAssertRecoveredHistoryHeld(t *testing.T, f *ownedPGFixture, 
 		t.Fatal("held recovered item attempted replacement policy")
 		return PDSDecision{}, nil
 	})
-	if err := f.store.RunTick(ctx, f.channel.ID, "after-native-recovery-held", HandlerService{PDS: noPDS}); !errors.Is(err, ErrChannelExecutionBlocked) {
+	if err := f.store.RunTick(ctx, f.channel.ID, "after-native-recovery-held", f.handler(t, noPDS)); !errors.Is(err, ErrChannelExecutionBlocked) {
 		t.Fatal("held native tick did not refuse replacement", err)
 	}
 	if after := ownedProducerPGAssertTask(t, f, ctx, TaskPlanning, 1); !bytes.Equal(mustJSON(before), mustJSON(after)) {
@@ -259,7 +292,7 @@ func TestOwnedProducerPGPlanFreshFenceAndRealPolicy(t *testing.T) {
 			defer cancel()
 			item, api := ownedProducerPGClaimPlan(t, f, ctx)
 			calls := 0
-			h := HandlerService{Store: f.store, AutoFlow: api, PDS: ownedTestPDS(func(ctx context.Context, request PDSDecisionRequest) (PDSDecision, error) {
+			h := f.handler(t, ownedTestPDS(func(ctx context.Context, request PDSDecisionRequest) (PDSDecision, error) {
 				calls++
 				if request.ActionType != "plan_approval" || request.Context["autoflow_plan_id"] != api.planID {
 					t.Fatal("wrong actual PDS request")
@@ -290,7 +323,8 @@ func TestOwnedProducerPGPlanFreshFenceAndRealPolicy(t *testing.T) {
 					}
 				}
 				return d, nil
-			})}
+			}))
+			h.AutoFlow = api
 			err := h.HandlePlanTask(ctx, item)
 			if calls != 1 || api.planCalls != 1 {
 				t.Fatal("unexpected external retry", calls, api.planCalls)
@@ -342,10 +376,11 @@ func TestOwnedProducerPGApprovalResultLossReusesDurablePlan(t *testing.T) {
 	item, api := ownedProducerPGClaimPlan(t, f, ctx)
 	api.loseFirstApproval = true
 	calls := 0
-	h := HandlerService{Store: f.store, AutoFlow: api, PDS: ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
+	h := f.handler(t, ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
 		calls++
 		return ownedProducerRealDecision(), nil
-	})}
+	}))
+	h.AutoFlow = api
 	failure := h.HandlePlanTask(ctx, item)
 	if failure == nil {
 		t.Fatal("lost approval response not surfaced")
@@ -379,10 +414,11 @@ func TestOwnedProducerPGNativePlanResponseLossReusesOriginalBinding(t *testing.T
 	item, api := ownedProducerPGClaimPlan(t, f, ctx)
 	api.loseFirstPlan = true
 	calls := 0
-	h := HandlerService{Store: f.store, AutoFlow: api, PDS: ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
+	h := f.handler(t, ownedTestPDS(func(context.Context, PDSDecisionRequest) (PDSDecision, error) {
 		calls++
 		return ownedProducerRealDecision(), nil
-	})}
+	}))
+	h.AutoFlow = api
 	failure := h.HandlePlanTask(ctx, item)
 	if failure == nil {
 		t.Fatal("native plan response loss hidden")
@@ -445,7 +481,8 @@ func TestOwnedProducerPGPlanningRollbackKeepsOriginalPendingPlan(t *testing.T) {
 	defer cancel()
 	item, api := ownedProducerPGClaimPlan(t, f, ctx)
 	api.loseFirstApproval = true
-	h := HandlerService{Store: f.store, AutoFlow: api, PDS: fakePDS{decision: ownedProducerRealDecision()}}
+	h := f.handler(t, fakePDS{decision: ownedProducerRealDecision()})
+	h.AutoFlow = api
 	if err := h.HandlePlanTask(ctx, item); err == nil {
 		t.Fatal("missing intentional approval response loss")
 	}

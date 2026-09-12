@@ -177,7 +177,8 @@ func ownedClosureClaim(t *testing.T, f *ownedPGFixture, ctx context.Context, kin
 func ownedClosurePlanned(t *testing.T, f *ownedPGFixture, ctx context.Context) (ProductionTaskRow, QueueItemRow) {
 	t.Helper()
 	plan, api := ownedProducerPGClaimPlan(t, f, ctx)
-	h := HandlerService{Store: f.store, AutoFlow: api, PDS: fakePDS{decision: ownedProducerRealDecision()}}
+	h := f.handler(t, fakePDS{decision: ownedProducerRealDecision()})
+	h.AutoFlow = api
 	if err := h.HandlePlanTask(ctx, plan); err != nil {
 		t.Fatal("native owned plan", err)
 	}
@@ -195,7 +196,8 @@ func TestOwnedProducerPGFirstExecuteFreshAuthority(t *testing.T) {
 			defer cancel()
 			task, item := ownedClosurePlanned(t, f, ctx)
 			runID, jobID, calls := ownedNewUUID(t), ownedNewUUID(t), 0
-			h := HandlerService{Store: f.store, AutoFlow: executeHookAutoFlow{execute: func(ctx context.Context, actual ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error) {
+			h := f.handler(t, nil)
+			h.AutoFlow = executeHookAutoFlow{execute: func(ctx context.Context, actual ProductionTaskRow, request map[string]any) (AutoFlowExecuteObservation, error) {
 				calls++
 				if actual.ID != task.ID || request["channelops_queue_item_id"] != item.ID || request["channelops_queue_locked_by"] != *item.LockedBy || request["channelops_queue_locked_at"] != item.LockedAt.UTC().Format(time.RFC3339Nano) {
 					t.Fatal("execution lost exact native claim")
@@ -206,7 +208,7 @@ func TestOwnedProducerPGFirstExecuteFreshAuthority(t *testing.T) {
 					}
 				}
 				return AutoFlowExecuteObservation{RunID: runID, JobID: jobID, Status: "running"}, nil
-			}}}
+			}}
 			err := h.HandleExecuteTask(ctx, item)
 			if (err != nil) != drift || calls != 1 {
 				t.Fatal("first execute fresh boundary", err, calls)
@@ -228,6 +230,17 @@ func TestOwnedProducerPGFirstExecuteFreshAuthority(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOwnedProducerPGFirstExecuteAfterRetainedB2History(t *testing.T) {
+	if !t.Run("retain-B2-history", func(t *testing.T) {
+		newOwnedPGFixtureWithHistory(t, func(store *Store, now time.Time) map[string]any {
+			return ownedB2PGSeedRetirement(t, store, now)
+		})
+	}) {
+		t.Fatal("retained-history setup failed")
+	}
+	t.Run("first-execute", TestOwnedProducerPGFirstExecuteFreshAuthority)
 }
 
 func ownedClosurePublicationFixture(t *testing.T, stage string) (*ownedPGFixture, QueueItemRow) {
@@ -264,7 +277,7 @@ func TestOwnedProducerPGPublishFreshAuthority(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			calls := 0
-			h := HandlerService{Store: f.store, PDS: ownedTestPDS(func(ctx context.Context, request PDSDecisionRequest) (PDSDecision, error) {
+			h := f.handler(t, ownedTestPDS(func(ctx context.Context, request PDSDecisionRequest) (PDSDecision, error) {
 				calls++
 				if request.Context["production_task_id"] != item.PayloadJSON["production_task_id"] || request.ActionType != "publish" || request.Context["owned_inventory"] == nil {
 					t.Fatal("publish PDS lost owned binding")
@@ -275,7 +288,7 @@ func TestOwnedProducerPGPublishFreshAuthority(t *testing.T) {
 					}
 				}
 				return ownedProducerRealDecision(), nil
-			})}
+			}))
 			err := h.HandlePublishTask(ctx, item)
 			if (err != nil) != drift || calls != 1 {
 				t.Fatal("publish fresh fence", err, calls)
@@ -307,7 +320,7 @@ func TestOwnedProducerPGPromotionFreshAuthorityAndMissingPlan(t *testing.T) {
 			defer cancel()
 			youtube := &durablePromotionYouTube{}
 			pdsCalls := 0
-			h := HandlerService{Store: f.store, YouTube: youtube, PDS: ownedTestPDS(func(ctx context.Context, _ PDSDecisionRequest) (PDSDecision, error) {
+			h := f.handler(t, ownedTestPDS(func(ctx context.Context, _ PDSDecisionRequest) (PDSDecision, error) {
 				pdsCalls++
 				if mode == "pds_drift" {
 					if _, err := f.store.Pool.Exec(ctx, `UPDATE production_tasks SET prompt='changed during promotion PDS' WHERE id=(SELECT production_task_id FROM publication_records WHERE id=$1::uuid)`, item.PayloadJSON["publication_id"]); err != nil {
@@ -315,7 +328,8 @@ func TestOwnedProducerPGPromotionFreshAuthorityAndMissingPlan(t *testing.T) {
 					}
 				}
 				return ownedProducerRealDecision(), nil
-			})}
+			}))
+			h.YouTube = youtube
 			pub, err := f.store.GetPublication(ctx, firstString(item.PayloadJSON, "publication_id"))
 			if err != nil {
 				t.Fatal(err)
