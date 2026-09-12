@@ -4566,6 +4566,8 @@ def require_registered_outer_lock(path: str, descriptor: str, owner_pid: str) ->
         try:
             fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            # Contention alone does not prove the inherited description owns it.
+            fcntl.flock(int(descriptor), fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
         raise TransactionError
     except (OSError, ValueError):
@@ -5188,7 +5190,7 @@ def _registered_absent(job: dict) -> None:
         if (
             type(values) is not list
             or len(values) != 1
-            or values[0].get("ID") != container_id
+            or values[0].get("Id") != container_id
             or values[0]["Config"]["Labels"].get("com.docker.swarm.service.id")
             != job["service_id"]
             or values[0]["State"].get("Running") is not False

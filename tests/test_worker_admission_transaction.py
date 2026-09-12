@@ -1068,6 +1068,37 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
         with self.assertRaises(HELPER["TransactionError"]):
             function(str(path), str(descriptor), str(os.getppid()))
 
+    def test_outer_lock_rejects_foreign_holder_on_same_inode(self):
+        path = self.root / "sync.lock"
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, descriptor)
+        holder = subprocess.Popen(
+            [
+                sys.executable, "-B", "-c",
+                "import fcntl,sys; f=open(sys.argv[1], 'r+'); "
+                "fcntl.flock(f, fcntl.LOCK_EX); "
+                "print('locked', flush=True); sys.stdin.read()",
+                str(path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(HELPER["TransactionError"]):
+                HELPER["require_registered_outer_lock"](
+                    str(path), str(descriptor), str(os.getppid())
+                )
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            _stdout, stderr = holder.communicate("", timeout=5)
+        self.assertEqual(holder.returncode, 0, stderr)
+
     def capture_job(self):
         state = self.fixture.state
         state["registered_reconcile"] = dict(
@@ -1354,16 +1385,19 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
             if arguments[:2] == ["service", "ls"]:
                 return ("s" * 25 + " " + job["spec"]["Name"]) if present[0] else ""
             if arguments[:2] == ["container", "ls"]:
-                return "c" * 64 if running[0] else ""
+                return "c" * 64
             if arguments[:2] == ["container", "inspect"]:
                 return json.dumps(
                     [
                         {
-                            "ID": "c" * 64,
+                            "Id": "c" * 64,
                             "Config": {
                                 "Labels": {"com.docker.swarm.service.id": "s" * 25}
                             },
-                            "State": {"Running": True, "Status": "running"},
+                            "State": {
+                                "Running": running[0],
+                                "Status": "running" if running[0] else "exited",
+                            },
                         }
                     ]
                 )
@@ -1384,6 +1418,46 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
             "removed",
         )
         self.assertEqual(removed, ["s" * 25])
+
+    def test_cleanup_container_inspect_requires_actual_identity_and_terminal_state(self):
+        job = {"service_id": "s" * 25, "spec": {"Name": "vp-registered-fixture"}}
+        container = {
+            "Id": "c" * 64,
+            "Config": {"Labels": {"com.docker.swarm.service.id": "s" * 25}},
+            "State": {"Running": False, "Status": "exited"},
+        }
+
+        def docker(arguments, **kwargs):
+            if arguments[:2] == ["service", "ls"]:
+                return ""
+            if arguments[:2] == ["container", "ls"]:
+                return "c" * 64
+            if arguments == ["container", "inspect", "c" * 64]:
+                return json.dumps([actual])
+            raise AssertionError(arguments)
+
+        function = HELPER["_registered_absent"]
+        with patch.dict(function.__globals__, _registered_docker=docker):
+            for status in ("exited", "dead"):
+                with self.subTest(status=status):
+                    actual = copy.deepcopy(container)
+                    actual["State"]["Status"] = status
+                    function(job)
+            for fault in ("wrong_id", "swarm_ID", "wrong_service", "running", "paused"):
+                with self.subTest(fault=fault):
+                    actual = copy.deepcopy(container)
+                    if fault == "wrong_id":
+                        actual["Id"] = "d" * 64
+                    elif fault == "swarm_ID":
+                        actual["ID"] = actual.pop("Id")
+                    elif fault == "wrong_service":
+                        actual["Config"]["Labels"]["com.docker.swarm.service.id"] = "x" * 25
+                    elif fault == "running":
+                        actual["State"]["Running"] = True
+                    else:
+                        actual["State"]["Status"] = "paused"
+                    with self.assertRaises(HELPER["TransactionError"]):
+                        function(job)
 
     def test_pin_secret_uncertain_creation_is_durably_consumed_once(self):
         job = self.capture_job()
