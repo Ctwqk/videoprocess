@@ -37,6 +37,12 @@ def docker_fixture(arguments):
     if arguments[:2] == ["network", "inspect"]:
         print(f"{NETWORK}|vp-pipeline-net|overlay|swarm")
         return 0
+    if arguments == ["service", "ps", "vp-autoflow-api-swarm", "--no-trunc", "--format", "{{.ID}}"]:
+        print("a" * 25)
+        return 0
+    if arguments == ["inspect", "--type", "task", "a" * 25]:
+        print(Path(os.environ["CASE_ROOT"], "autoflow-tasks.json").read_text())
+        return 0
     if arguments[:2] != ["service", "inspect"] or len(arguments) != 5:
         return 90
     services = json.loads(Path(os.environ["CASE_ROOT"], "live.json").read_text())
@@ -102,6 +108,17 @@ class UntouchedRollbackControlTests(unittest.TestCase):
         self.live["vp-staging-object-janitor"] = dict(
             ID="9" * 24, Spec=dict(Name="vp-staging-object-janitor", TaskTemplate=dict(ContainerSpec=dict(Secrets=[]))),
         )
+        self.live["vp-autoflow-api-swarm"] = dict(
+            ID="8" * 24,
+            Spec=dict(Name="vp-autoflow-api-swarm", TaskTemplate=dict(ContainerSpec=dict(Secrets=[dict(
+                SecretName=f"vp-wc-orchestrator-{OLD_CONTROL}", SecretID=f"{2:024d}",
+                File=dict(Name="worker-orchestrator-database-url", UID="0", GID="0", Mode=0o400),
+            )]))),
+        )
+        self.autoflow_tasks = [dict(
+            ID="a" * 25, ServiceID="8" * 24, Status=dict(State="running"),
+            Spec=copy.deepcopy(self.live["vp-autoflow-api-swarm"]["Spec"]["TaskTemplate"]),
+        )]
         for name in sorted(self.helper["APP_SERVICES"] - {worker[0] for worker in WORKERS}):
             self.state["baseline"]["services"].append(dict(
                 name=name, existed=False, docker_service_id=None, image=None, spec_digest=None,
@@ -168,12 +185,13 @@ class UntouchedRollbackControlTests(unittest.TestCase):
         path.write_text("".join(f"{key}={value}\n" for key, value in fields.items()))
         path.chmod(0o600)
 
-    def finalize(self, success=True):
+    def finalize(self, success=True, *, autoflow_ready=True):
         self.helper["_validate_document"](self.state)
         active = self.root / "transactions/active.json"
         active.write_bytes(self.helper["_canonical"](self.state))
         active.chmod(0o600)
         (self.root / "live.json").write_text(json.dumps(self.live))
+        (self.root / "autoflow-tasks.json").write_text(json.dumps(self.autoflow_tasks))
         result = subprocess.run(["bash", "-c", r'''
 set -euo pipefail
 REPO_ROOT="$CASE_REPO"
@@ -212,13 +230,18 @@ vp_require_staging_object_janitor_control() {
 }
 vp_worker_control_revoke_authority() { printf 'revoke|%s|%s\n' "$1" "$2" >>"$CASE_ROOT/effects"; }
 vp_remove_managed_secret_if_absent_exact() { printf 'secret|%s\n' "$*" >>"$CASE_ROOT/effects"; }
+# Remote health is a dependency here; selected-image and retirement checks stay real.
+vp_require_autoflow_control_ready() {
+  [[ "$1" == vp-backend-api:deploy-222222222222 && "$CASE_AUTOFLOW_READY" == true ]]
+}
 vp_finalize_worker_control_rollback
 [[ -z "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" && "$VP_WORKER_CONTROL_PREPARED" == false ]]
 [[ "$VP_WORKER_ADMISSION_COMMIT" == 2222222222222222222222222222222222222222 ]]
 '''], env=dict(os.environ, CASE_ROOT=str(self.root), CASE_REPO=str(REPO), CASE_TEST=__file__,
               CASE_TRANSACTION=TRANSACTION, CASE_NAMESPACE=NAMESPACE, CASE_SELECTED=" ".join(self.selected),
               CASE_OLD_CONTROL=OLD_CONTROL, CASE_OLD_IMAGE=OLD_IMAGE,
-              CASE_FAILED_CONTROL=FAILED_CONTROL, CASE_FAILED_IMAGE=FAILED_IMAGE),
+              CASE_FAILED_CONTROL=FAILED_CONTROL, CASE_FAILED_IMAGE=FAILED_IMAGE,
+              CASE_AUTOFLOW_READY=str(autoflow_ready).lower()),
             capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode == 0, success, result.stderr)
         effects = (self.root / "effects").read_text().splitlines() if (self.root / "effects").exists() else []
@@ -236,6 +259,9 @@ vp_finalize_worker_control_rollback
     def test_mixed_rollback_selects_candidate_only_for_attempted_worker(self):
         self.select_worker(2)
         self.finalize()
+
+    def test_unready_autoflow_blocks_rollback_finalization_before_retirement(self):
+        self.finalize(success=False, autoflow_ready=False)
 
     def test_untouched_worker_rejects_recreated_service(self):
         self.live[WORKERS[0][0]]["ID"] = "f" * 24
