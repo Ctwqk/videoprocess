@@ -55,11 +55,72 @@ def record():
     }
 
 
-def target(source, order="start-first"):
+def target(source, order="start-first", **kwargs):
     return HELPER["_autoflow_update_spec"](
         source, SERVICE, IMAGE, order, NAME + "|" + SECRET_ID + "|" + GENERATION,
-        "", "health-command", "colima-127",
+        "", "health-command", "colima-127", **kwargs,
     )
+
+
+HISTORY = {"runtime_generation": "a" * 40, "secret_name": "vp-control-redis-" + "a" * 40,
+           "docker_secret_id": "r" * 25}
+
+
+@pytest.mark.parametrize("runner", [False, True])
+@pytest.mark.parametrize("order", ["start-first", "stop-first"])
+def test_owned_history_file_is_atomic_id_pinned_and_repeatable(runner, order):
+    source = record()
+    if runner:
+        source["Spec"]["Name"] = "vp-channel-agent-runner-swarm"
+    before = copy.deepcopy(source)
+
+    def build(value):
+        if runner:
+            return HELPER["_owned_history_runner_update_spec"](
+                value, SERVICE, "vp-channelops-runner-go:deploy-0123456789ab", order,
+                "10001:10001", "colima-127", HISTORY,
+            )
+        return target(value, order, owned_history=HISTORY)
+
+    desired = build(source)
+    c = desired["TaskTemplate"]["ContainerSpec"]
+    mounted = [s for s in c["Secrets"] if s["File"]["Name"] == "owned-history-redis-url"]
+    uid = "10001" if runner else "0"
+    assert mounted == [{"SecretName": HISTORY["secret_name"], "SecretID": HISTORY["docker_secret_id"],
+                        "File": {"Name": "owned-history-redis-url", "UID": uid, "GID": uid, "Mode": 256}}]
+    assert c["Env"].count("OWNED_HISTORY_REDIS_URL_FILE=/run/secrets/owned-history-redis-url") == 1
+    assert "KEEP=private-value" in c["Env"]
+    assert c["Mounts"] == before["Spec"]["TaskTemplate"]["ContainerSpec"]["Mounts"]
+    assert c["Configs"] == before["Spec"]["TaskTemplate"]["ContainerSpec"]["Configs"]
+    for key in ("Labels", "Mode", "EndpointSpec", "RollbackConfig"):
+        assert desired[key] == before["Spec"][key]
+    assert desired["UpdateConfig"]["Order"] == order
+    assert build({**source, "Spec": desired}) == desired
+    assert source == before
+
+
+@pytest.mark.parametrize("fault", ["generation", "name", "id", "extra", "existing_id", "duplicate",
+                                  "wrong_env", "bind_shadow", "config_shadow"])
+def test_owned_history_file_refuses_unbound_or_ambiguous_mount(fault):
+    source = record()
+    reference = copy.deepcopy(HISTORY)
+    c = source["Spec"]["TaskTemplate"]["ContainerSpec"]
+    if fault in {"generation", "name", "id", "extra"}:
+        key = {"generation": "runtime_generation", "name": "secret_name", "id": "docker_secret_id", "extra": "extra"}[fault]
+        reference[key] = "wrong"
+    elif fault in {"existing_id", "duplicate"}:
+        entry = {"SecretID": "z" * 25 if fault == "existing_id" else HISTORY["docker_secret_id"],
+                 "SecretName": HISTORY["secret_name"],
+                 "File": {"Name": "owned-history-redis-url", "UID": "0", "GID": "0", "Mode": 256}}
+        c["Secrets"].extend([entry] * (2 if fault == "duplicate" else 1))
+    elif fault == "wrong_env":
+        c["Env"].append("OWNED_HISTORY_REDIS_URL_FILE=/wrong")
+    elif fault == "bind_shadow":
+        c["Mounts"].append({"Type": "bind", "Source": "/other", "Target": "/run/secrets"})
+    else:
+        c["Configs"].append({"ConfigID": "z" * 25, "File": {"Name": "owned-history-redis-url"}})
+    with pytest.raises(ERROR):
+        target(source, owned_history=reference)
 
 
 @pytest.mark.parametrize("order", ["start-first", "stop-first"])

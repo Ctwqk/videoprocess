@@ -734,6 +734,115 @@ def test_atomic_update_acceptance_waits_for_convergence(tmp_path, fault):
         assert len(polls) == 2
 
 
+@pytest.mark.parametrize("runner", [False, True])
+@pytest.mark.parametrize("action", ["forward", "rollback"])
+@pytest.mark.parametrize("fault", ["none", "secret_replaced", "pin_missing", "journal_changed", "wrong_owner", "lost"])
+def test_owned_history_entry_uses_journal_pin_and_one_cas(tmp_path, runner, action, fault):
+    data = locked_runtime_fixture(tmp_path, action)
+    helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
+    document = json.loads((Path(data["ADMISSION_ROOT"]) / "transactions/active.json").read_text())
+    reference = {"runtime_generation": "a" * 40, "secret_name": "vp-control-redis-" + "a" * 40,
+                 "docker_secret_id": "r" * 25}
+    document["runtime_redis"] = {} if fault == "pin_missing" else {"control": reference}
+    before = json.dumps(document, sort_keys=True)
+    service = "vp-channel-agent-runner-swarm" if runner else "vp-autoflow-api-swarm"
+    baseline = next(row for row in document["baseline"]["services"] if row["name"] == service)
+    service_id = baseline["docker_service_id"]
+    image = data["IMAGE"]
+    if runner:
+        image = baseline["image"] if action == "rollback" else "vp-channelops-runner-go:deploy-0123456789ab"
+    original = json.loads(json.dumps(data["SPEC"]))
+    original["Name"] = service
+    posted, reads = [], []
+
+    def docker(args, **kwargs):
+        if args[:2] == ["secret", "inspect"]:
+            assert args == ["secret", "inspect", "r" * 25, "--format", "{{.ID}}|{{.Spec.Name}}"]
+            return ("z" * 25 if fault == "secret_replaced" else "r" * 25) + "|" + reference["secret_name"]
+        if args[:2] == ["image", "inspect"]:
+            assert args[2] == image
+            return ""
+        assert args == ["service", "inspect", service_id]
+        return json.dumps([{"ID": service_id, "Version": {"Index": 71}, "Spec": posted[0] if posted else original,
+                            "UpdateStatus": {"State": "completed"}}])
+
+    def read(*args):
+        reads.append(1)
+        if fault == "journal_changed" and len(reads) > 1:
+            return {**document, "revision": document["revision"] + 1}
+        return document
+
+    def post(path, spec, status):
+        assert path == f"/services/{service_id}/update?version=71&registryAuthFrom=spec" and status == 200
+        posted.append(spec)
+        if fault == "lost":
+            raise TimeoutError("private-error")
+        return {}
+
+    args = [data["ADMISSION_ROOT"], "19", str(os.getppid() + (fault == "wrong_owner")), "token",
+            str(document["revision"]), service_id, image, "stop-first" if action == "rollback" else "start-first",
+            "-" if runner else f"vp-wc-orchestrator-{data['SELECTED_GENERATION']}|{SECRET_ID}|{data['SELECTED_GENERATION']}",
+            "colima-127", "-" if runner else "true", "owned-history-file"]
+    with patch.dict(helper["autoflow_update"].__globals__, acquire_lock=lambda *args: "token",
+                    _registered_document=read, _registered_docker=docker, _engine_service_post=post):
+        result = helper["main"](["owned-history-runner-update" if runner else "autoflow-update", *args])
+    assert result == (0 if fault == "none" else 1 if fault == "lost" else 2)
+    assert len(posted) == (1 if fault in {"none", "lost"} else 0)
+    assert json.dumps(document, sort_keys=True) == before
+    if posted:
+        c = posted[0]["TaskTemplate"]["ContainerSpec"]
+        assert c["Image"] == image
+        assert [s for s in c["Secrets"] if s["File"]["Name"] == "owned-history-redis-url"] == [
+            {"SecretID": "r" * 25, "SecretName": reference["secret_name"],
+             "File": {"Name": "owned-history-redis-url", "UID": "0", "GID": "0", "Mode": 256}}]
+
+
+@pytest.mark.parametrize("service", ["vp-autoflow-api-swarm", "vp-channel-agent-runner-swarm"])
+def test_explicit_owned_history_shell_routes_through_atomic_entry(tmp_path, service):
+    audit = tmp_path / "args"
+    result = run(r'''
+OWNED_HISTORY_REDIS_URL_FILE=/protected/host-file
+VP_WORKER_ADMISSION_LOCK_ROOT=/unused
+VP_WORKER_ADMISSION_CURRENT_BASHPID=${BASHPID:-$$}
+vp_worker_admission_load_replay_plan() { VP_WORKER_ADMISSION_REPLAY_REVISION=71; }
+VP_WORKER_ADMISSION_REPLAY_REVISION=71
+vp_registered_worker_service_current_id() { printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaa; }
+python3() { printf '%s\n' "$@" >"$AUDIT"; }
+vp_update_runtime_service "$SERVICE" "$IMAGE" stop-first
+''', AUDIT=str(audit), SERVICE=service,
+        IMAGE="vp-backend-api:deploy-0123456789ab" if service == "vp-autoflow-api-swarm" else "vp-channelops-runner-go:deploy-0123456789ab")
+    assert result.returncode == 0, result.stderr
+    args = audit.read_text().splitlines()
+    assert args[1] == ("autoflow-update" if service == "vp-autoflow-api-swarm" else "owned-history-runner-update")
+    assert args[-1] == "owned-history-file"
+    assert "/protected/host-file" not in args
+
+
+@pytest.mark.parametrize("fault", ["none", "missing", "id", "mode", "env"])
+def test_owned_history_readiness_rechecks_fixed_mount_before_health(tmp_path, fault):
+    data = locked_runtime_fixture(tmp_path, "readiness")
+    active = Path(data["ADMISSION_ROOT"]) / "transactions/active.json"
+    state = json.loads(active.read_text())
+    reference = {"runtime_generation": "a" * 40, "secret_name": "vp-control-redis-" + "a" * 40,
+                 "docker_secret_id": "r" * 25}
+    state["runtime_redis"] = {"control": reference}
+    helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
+    helper["_validate_document"](state)
+    active.write_bytes(helper["_canonical"](state))
+    before = active.read_bytes()
+    c = data["CONTAINER"]
+    c["Env"].append("OWNED_HISTORY_REDIS_URL_FILE=" + ("/wrong" if fault == "env" else "/run/secrets/owned-history-redis-url"))
+    if fault != "missing":
+        c["Secrets"].append({"SecretID": "z" * 25 if fault == "id" else "r" * 25,
+                             "SecretName": reference["secret_name"],
+                             "File": {"Name": "owned-history-redis-url", "UID": "0", "GID": "0",
+                                      "Mode": 292 if fault == "mode" else 256}})
+    result = run(LOCKED_RUNTIME_BOUNDARY, **data, FAULT=fault, OWNED_HISTORY_REDIS_URL_FILE="/protected/host-file")
+    assert result.returncode == (0 if fault == "none" else 1), result.stderr
+    assert active.read_bytes() == before
+    assert ("HEALTH" in Path(data["AUDIT"]).read_text().splitlines()) == (fault == "none")
+
+
 @pytest.mark.parametrize(
     "fault", ["none", "child", "substitution", "outer_unlocked", "outer_replaced"]
 )
