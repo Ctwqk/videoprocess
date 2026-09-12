@@ -13,6 +13,7 @@ var runnerIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.@:-]+$`)
 
 type Config struct {
 	DatabaseURL                  string
+	OwnedHistoryRedisURL         string
 	RunnerID                     string
 	YouTubeManagerURL            string
 	AutoFlowBaseURL              string
@@ -48,6 +49,7 @@ func LoadConfig() Config {
 	discoveryTimeout, discoveryTimeoutParseFailed := discoveryTimeoutEnv()
 	return Config{
 		DatabaseURL:                  env("DATABASE_URL", "postgresql://vp:vp_secret@localhost:5435/videoprocess"),
+		OwnedHistoryRedisURL:         env("REDIS_URL", ""),
 		RunnerID:                     env("CHANNELOPS_RUNNER_ID", ""),
 		YouTubeManagerURL:            env("YOUTUBE_MANAGER_URL", ""),
 		AutoFlowBaseURL:              env("AUTOFLOW_BASE_URL", "http://api:8080"),

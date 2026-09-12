@@ -15,13 +15,14 @@ type PDSDecider interface {
 }
 
 type HandlerService struct {
-	Store     *Store
-	PDS       PDSDecider
-	AutoFlow  AutoFlowClient
-	YouTube   YouTubeClient
-	Discovery DiscoveryClient
-	Alerts    AlertSink
-	Config    Config
+	ownedHistoryRedisFactory ownedHistoryRedisFactory
+	Store                    *Store
+	PDS                      PDSDecider
+	AutoFlow                 AutoFlowClient
+	YouTube                  YouTubeClient
+	Discovery                DiscoveryClient
+	Alerts                   AlertSink
+	Config                   Config
 }
 
 type PlanResult struct {
@@ -255,7 +256,7 @@ func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) 
 		return err
 	}
 	var preparation tickPreparation
-	if err := h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+	if err := h.withOwnedTickQueuePhase(ctx, item, func(fenced HandlerService) error {
 		prepared, err := fenced.Store.prepareTick(ctx, channelID, bucket, options)
 		preparation = prepared
 		return err
@@ -263,7 +264,7 @@ func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) 
 		return err
 	}
 	revalidate := func() error {
-		return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+		return h.withOwnedTickQueuePhase(ctx, item, func(fenced HandlerService) error {
 			current, err := fenced.Store.prepareTick(ctx, channelID, bucket, options)
 			if err != nil {
 				return err
@@ -281,7 +282,7 @@ func (h HandlerService) HandleAgentTick(ctx context.Context, item QueueItemRow) 
 	if err != nil {
 		return err
 	}
-	return h.withQueueExecutionPhase(ctx, item, func(fenced HandlerService) error {
+	return h.withOwnedTickQueuePhase(ctx, item, func(fenced HandlerService) error {
 		return fenced.Store.finalizeTick(ctx, preparation, candidates, alerts)
 	})
 }

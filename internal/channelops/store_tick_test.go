@@ -37,7 +37,7 @@ func TestRunTickUsesTransactionForDecisionAuditWrites(t *testing.T) {
 	}
 	text := string(source)
 	for _, want := range []string{
-		"s.withChannelExecutionFence(ctx, channelID, true",
+		"s.withOwnedTickChannelPhase(ctx, channelID, h",
 		"fencedStore.finalizeTick(ctx, preparation, candidates, alerts)",
 	} {
 		if !strings.Contains(text, want) {
@@ -52,10 +52,14 @@ func TestRunTickAcquiresOpenIntakeFenceBeforeReadingInputs(t *testing.T) {
 		t.Fatalf("read store_tasks.go: %v", err)
 	}
 	text := string(source)
-	fence := strings.Index(text, "withChannelExecutionFence(ctx, channelID, true")
+	fence := strings.Index(text, "withOwnedTickChannelPhase(ctx, channelID, h")
 	load := strings.Index(text, "s.LoadTickInputs(ctx, channelID, now)")
 	if fence < 0 || load < 0 || fence > load {
 		t.Fatalf("RunTick must acquire the open-intake channel fence before loading inputs")
+	}
+	wrapper, err := os.ReadFile("owned_inventory_history_io.go")
+	if err != nil || !strings.Contains(string(wrapper), "s.withChannelExecutionFence(ctx, channelID, true") {
+		t.Fatal("history observation wrapper lost the original open-intake transaction fence")
 	}
 }
 
