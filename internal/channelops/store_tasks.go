@@ -40,7 +40,7 @@ func (s *Store) RunTickWithOptions(
 		return errors.New("agent_tick cannot call PDS while a database fence is held")
 	}
 	var preparation tickPreparation
-	if err := s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
+	if err := s.withOwnedTickChannelPhase(ctx, channelID, h, func(fencedStore *Store) error {
 		prepared, err := fencedStore.prepareTick(ctx, channelID, bucket, options)
 		preparation = prepared
 		return err
@@ -48,7 +48,7 @@ func (s *Store) RunTickWithOptions(
 		return err
 	}
 	revalidate := func() error {
-		return s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
+		return s.withOwnedTickChannelPhase(ctx, channelID, h, func(fencedStore *Store) error {
 			current, err := fencedStore.prepareTick(ctx, channelID, bucket, options)
 			if err != nil {
 				return err
@@ -66,7 +66,7 @@ func (s *Store) RunTickWithOptions(
 	if err != nil {
 		return err
 	}
-	return s.withChannelExecutionFence(ctx, channelID, true, func(fencedStore *Store) error {
+	return s.withOwnedTickChannelPhase(ctx, channelID, h, func(fencedStore *Store) error {
 		return fencedStore.finalizeTick(ctx, preparation, candidates, alerts)
 	})
 }

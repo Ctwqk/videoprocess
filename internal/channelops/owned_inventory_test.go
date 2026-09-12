@@ -31,7 +31,12 @@ func ownedTestHash(t *testing.T, value any) string {
 }
 
 func ownedTestFixture(t *testing.T) (ChannelProfileRow, ownedInventoryData, time.Time) {
+	return ownedTestFixtureOffset(t, 0)
+}
+
+func ownedTestFixtureOffset(t *testing.T, offset int) (ChannelProfileRow, ownedInventoryData, time.Time) {
 	t.Helper()
+	ownedTestID := func(n int) string { return fmt.Sprintf("00000000-0000-0000-0000-%012d", n+offset) }
 	now := time.Date(2026, 9, 11, 8, 0, 0, 0, time.UTC)
 	id := ownedTestID(1)
 	channel := ChannelProfileRow{ID: ownedTestID(2), Enabled: true, OwnedSeedInventoryID: &id, OwnedInventoryActive: true, TickIntervalMinutes: 1, ConfigVersion: 1}
@@ -67,7 +72,7 @@ func ownedTestFixture(t *testing.T) (ChannelProfileRow, ownedInventoryData, time
 
 func TestOwnedSelectsExactLowestUnusedAndStableCandidate(t *testing.T) {
 	channel, data, now := ownedTestFixture(t)
-	state := assessOwnedInventory(channel, data, now)
+	state := ownedTestAssess(t, channel, data, now)
 	if state.HoldReason != "" || state.SkipReason != "" || state.Candidate == nil {
 		t.Fatalf("state = %+v", state)
 	}
@@ -102,7 +107,7 @@ func TestOwnedAdmissionRejectsImmutableBindingDrift(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			channel, data, now := ownedTestFixture(t)
 			mutate(&data)
-			state := assessOwnedInventory(channel, data, now)
+			state := ownedTestAssess(t, channel, data, now)
 			if state.HoldReason == "" || state.Candidate != nil {
 				t.Fatalf("did not hold invalid %s", name)
 			}
@@ -128,7 +133,7 @@ func TestOwnedWindowAndRuntimeGates(t *testing.T) {
 			case "terminal":
 				data.Inventory["state"] = "held"
 			}
-			state := assessOwnedInventory(channel, data, now)
+			state := ownedTestAssess(t, channel, data, now)
 			if state.Candidate != nil {
 				t.Fatalf("%s admitted a candidate", mode)
 			}
@@ -249,7 +254,7 @@ func ownedTestCompletedHistory(t *testing.T, data *ownedInventoryData, at time.T
 			m["status"], m["attempt_count"], m["completed_at"] = "succeeded", 1, ownedISO(plan.DueAt)
 			m["last_attempt_at"] = m["completed_at"]
 			q["status"], q["attempt_count"] = "succeeded", 1
-			feedback = append(feedback, map[string]any{"publication_id": pubID, "snapshot_stage": plan.Stage})
+			feedback = append(feedback, map[string]any{"id": ownedTestID(540 + i), "publication_id": pubID, "snapshot_stage": plan.Stage})
 		}
 		metrics, queues = append(metrics, m), append(queues, q)
 	}
@@ -289,7 +294,7 @@ func TestOwnedNormalUnlistedPendingPromotionWaits(t *testing.T) {
 			if status == "running" {
 				q["attempt_count"], q["locked_by"], q["locked_at"] = 1, "normal-worker", ownedISO(now.Add(time.Hour))
 			}
-			state := assessOwnedInventory(channel, data, now.Add(time.Hour))
+			state := ownedTestAssess(t, channel, data, now.Add(time.Hour))
 			if state.HoldReason != "" || state.SkipReason != "owned_inventory_outstanding" || state.Candidate != nil || len(state.CompleteItemIDs) != 0 {
 				t.Fatalf("normal promotion must retain reservation: %+v", state)
 			}
@@ -304,12 +309,12 @@ func TestOwnedPromotionCommitBeforeQueueCompletionRetainsReservation(t *testing.
 	promote, reconcile := ownedMap(queues[0]), ownedMap(queues[1])
 	promote["status"], promote["locked_at"], promote["locked_by"] = "running", ownedISO(now), "normal-worker"
 	reconcile["status"], reconcile["attempt_count"] = "queued", 0
-	got := assessOwnedInventory(channel, data, now)
+	got := ownedTestAssess(t, channel, data, now)
 	if got.HoldReason != "" || got.Candidate != nil || got.SkipReason != "owned_inventory_outstanding" || len(got.CompleteItemIDs) != 0 {
 		t.Fatalf("normal promotion commit gap did not wait: %+v", got)
 	}
 	reconcile["status"], reconcile["attempt_count"] = "succeeded", 1
-	if got := assessOwnedInventory(channel, data, now); got.HoldReason == "" {
+	if got := ownedTestAssess(t, channel, data, now); got.HoldReason == "" {
 		t.Fatal("reconciliation completed before promotion queue settlement")
 	}
 }
@@ -341,7 +346,7 @@ func TestOwnedPendingPromotionRejectsUnrelatedOrMalformedWork(t *testing.T) {
 			case "metrics":
 				h["metrics"] = []any{map[string]any{"status": "pending"}}
 			}
-			if got := assessOwnedInventory(channel, data, now.Add(time.Hour)); got.HoldReason == "" || got.Candidate != nil {
+			if got := ownedTestAssess(t, channel, data, now.Add(time.Hour)); got.HoldReason == "" || got.Candidate != nil {
 				t.Fatalf("unsafe pending promotion: %+v", got)
 			}
 		})
@@ -366,14 +371,14 @@ func TestOwnedFailedPolicySurvivesTransientRuntimeBlock(t *testing.T) {
 		for _, policy := range []string{"block", "error"} {
 			t.Run(runtime+"/"+policy, func(t *testing.T) {
 				channel, data, now := ownedTestFixture(t)
-				before := assessOwnedInventory(channel, data, now)
+				before := ownedTestAssess(t, channel, data, now)
 				candidate := *before.Candidate
 				candidate.Rejected = true
 				if policy == "block" {
 					candidate.PDSDecisionJSON = map[string]any{"verdict": "block"}
 				}
 				data.RuntimeOpen, data.Busy = runtime != "closed", runtime == "busy"
-				current := assessOwnedInventory(channel, data, now)
+				current := ownedTestAssess(t, channel, data, now)
 				probe := &ownedHoldProbe{stop: errors.New("hold probe")}
 				store := &Store{executionDB: probe}
 				err := store.finalizeOwnedTick(context.Background(), tickPreparation{Owned: &before, Candidates: []TickCandidate{*before.Candidate}}, tickPreparation{Owned: &current}, []TickCandidate{candidate})
@@ -390,14 +395,14 @@ func TestOwnedHistoryWatermarkIgnoresValidMetricLeaseChurn(t *testing.T) {
 	ownedTestCompletedHistory(t, &data, now)
 	q := ownedMap(ownedArray(data.Tasks[0]["queues"])[4])
 	q["status"], q["locked_at"], q["locked_by"] = "running", ownedISO(now.Add(24*time.Hour)), "worker"
-	before := assessOwnedInventory(channel, data, now.Add(24*time.Hour))
+	before := ownedTestAssess(t, channel, data, now.Add(24*time.Hour))
 	q["status"], q["locked_at"], q["locked_by"] = "succeeded", nil, nil
-	after := assessOwnedInventory(channel, data, now.Add(24*time.Hour))
+	after := ownedTestAssess(t, channel, data, now.Add(24*time.Hour))
 	if before.Candidate != nil || before.HoldReason != "" || after.Candidate == nil || before.HistorySHA != after.HistorySHA {
 		t.Fatal("valid metric lease churn changed immutable history watermark")
 	}
 	ownedMap(ownedArray(data.Tasks[0]["operations"])[0])["content_sha256"] = strings.Repeat("b", 64)
-	changed := assessOwnedInventory(channel, data, now.Add(25*time.Hour))
+	changed := ownedTestAssess(t, channel, data, now.Add(25*time.Hour))
 	if changed.HistorySHA == before.HistorySHA {
 		t.Fatal("operation binding drift was hidden")
 	}
@@ -407,38 +412,38 @@ func TestOwnedAdmissionDigestRechecksReadinessWithoutHashingTickLease(t *testing
 	channel, data, now := ownedTestFixture(t)
 	q := map[string]any{"id": ownedTestID(580), "kind": QueueAgentTick, "channel_profile_id": channel.ID, "payload_json": map[string]any{"channel_id": channel.ID}, "status": "queued", "attempt_count": 0}
 	data.Queues = []map[string]any{q}
-	before, err := ownedAdmissionDigest(data, assessOwnedInventory(channel, data, now))
+	before, err := ownedAdmissionDigest(data, ownedTestAssess(t, channel, data, now))
 	if err != nil {
 		t.Fatal(err)
 	}
 	q["status"], q["attempt_count"], q["locked_by"], q["locked_at"] = "running", 1, "other-tick-worker", ownedISO(now)
-	if !ownedQueuesSafe(channel.ID, data, now) {
+	if !ownedTestQueuesSafe(t, channel.ID, data, now) {
 		t.Fatal("valid tick lease rejected")
 	}
-	after, err := ownedAdmissionDigest(data, assessOwnedInventory(channel, data, now))
+	after, err := ownedAdmissionDigest(data, ownedTestAssess(t, channel, data, now))
 	if err != nil || after != before {
 		t.Fatal("tick lease affected stable bindings")
 	}
 	data.RuntimeOpen = false
-	closed, _ := ownedAdmissionDigest(data, assessOwnedInventory(channel, data, now))
+	closed, _ := ownedAdmissionDigest(data, ownedTestAssess(t, channel, data, now))
 	if closed == before {
 		t.Fatal("pre-PDS runtime revalidation was removed")
 	}
 	data.RuntimeOpen = true
 	q["kind"] = QueueExecuteTask
-	if ownedQueuesSafe(channel.ID, data, now) {
+	if ownedTestQueuesSafe(t, channel.ID, data, now) {
 		t.Fatal("unsafe work accepted")
 	}
 }
 
 func TestOwnedFailedPolicyCannotHoldNextItemAfterCompetingAdmission(t *testing.T) {
 	channel, data, now := ownedTestFixture(t)
-	before := assessOwnedInventory(channel, data, now)
+	before := ownedTestAssess(t, channel, data, now)
 	rejected := *before.Candidate
 	rejected.Rejected = true
 	ownedTestCompletedHistory(t, &data, now)
 	data.Tasks[0]["operations"], data.Tasks[0]["publications"] = []any{}, []any{}
-	current := assessOwnedInventory(channel, data, now)
+	current := ownedTestAssess(t, channel, data, now)
 	probe := &ownedHoldProbe{stop: errors.New("unexpected mutation")}
 	err := (&Store{executionDB: probe}).finalizeOwnedTick(context.Background(), tickPreparation{Owned: &before, Candidates: []TickCandidate{*before.Candidate}}, tickPreparation{Owned: &current}, []TickCandidate{rejected})
 	if err != nil || probe.reason != "" {
@@ -470,7 +475,7 @@ func ownedTestMetricRetry(t *testing.T, data *ownedInventoryData, at time.Time, 
 	if recovered {
 		m["status"], m["attempt_count"], m["last_error_code"], m["completed_at"], m["last_attempt_at"] = "succeeded", 2, nil, ownedISO(at.Add(25*time.Hour)), ownedISO(at.Add(25*time.Hour))
 		next["status"], next["attempt_count"] = "succeeded", 1
-		h["feedback"] = append(ownedArray(h["feedback"]), map[string]any{"publication_id": m["publication_id"], "snapshot_stage": "24h"})
+		h["feedback"] = append(ownedArray(h["feedback"]), map[string]any{"id": ownedTestID(542), "publication_id": m["publication_id"], "snapshot_stage": "24h"})
 	}
 	h["queues"] = append(ownedArray(h["queues"]), next)
 }
@@ -480,7 +485,7 @@ func TestOwnedMetricRetryPendingAndRecovered(t *testing.T) {
 		t.Run(fmt.Sprint(recovered), func(t *testing.T) {
 			channel, data, now := ownedTestFixture(t)
 			ownedTestMetricRetry(t, &data, now, recovered)
-			got := assessOwnedInventory(channel, data, now.Add(25*time.Hour))
+			got := ownedTestAssess(t, channel, data, now.Add(25*time.Hour))
 			if got.HoldReason != "" || (got.Candidate != nil) != recovered || (!recovered && got.SkipReason != "owned_inventory_metrics_pending") {
 				t.Fatalf("normal metric retry rejected: %+v", got)
 			}
@@ -500,7 +505,7 @@ func TestOwnedMetricRetryCommitBeforeQueueCompletionWaits(t *testing.T) {
 			}
 			q := ownedMap(queues[index])
 			q["status"], q["locked_at"], q["locked_by"] = "running", ownedISO(now.Add(24*time.Hour)), "normal-worker"
-			got := assessOwnedInventory(channel, data, now.Add(25*time.Hour))
+			got := ownedTestAssess(t, channel, data, now.Add(25*time.Hour))
 			if got.HoldReason != "" || got.Candidate != nil || got.SkipReason != "owned_inventory_metrics_pending" {
 				t.Fatalf("normal result/queue completion boundary rejected: %+v", got)
 			}
@@ -552,7 +557,7 @@ func TestOwnedMetricRetryRejectsMalformedChains(t *testing.T) {
 				extra["payload_json"] = map[string]any{"publication_id": m["publication_id"], "metric_schedule_id": ownedTestID(999), "snapshot_stage": "24h", "metrics_poll_count": 1}
 				h["queues"] = append(queues, extra)
 			}
-			if got := assessOwnedInventory(channel, data, now.Add(25*time.Hour)); got.HoldReason == "" || got.Candidate != nil {
+			if got := ownedTestAssess(t, channel, data, now.Add(25*time.Hour)); got.HoldReason == "" || got.Candidate != nil {
 				t.Fatalf("malformed metric chain accepted: %+v", got)
 			}
 		})
@@ -626,14 +631,14 @@ func TestOwnedHistoricalPromotionReplacementRequiresSettlement(t *testing.T) {
 			case "extra_promotion":
 				h["queues"] = append(queues, manual)
 			}
-			state := assessOwnedInventory(channel, data, now.Add(25*time.Hour))
+			state := ownedTestAssess(t, channel, data, now.Add(25*time.Hour))
 			if mode == "valid" {
 				if state.HoldReason != "" || state.Candidate == nil {
 					t.Fatalf("settled administrative replacement rejected: %+v", state)
 				}
 				before := state.HistorySHA
 				auto["priority"] = 71
-				if next := assessOwnedInventory(channel, data, now.Add(25*time.Hour)); next.HistorySHA == before {
+				if next := ownedTestAssess(t, channel, data, now.Add(25*time.Hour)); next.HistorySHA == before {
 					t.Fatal("cancelled evidence was omitted from watermark")
 				}
 			} else if state.HoldReason == "" || state.Candidate != nil {
@@ -652,11 +657,12 @@ func TestOwnedRollingCompletionFloorAndSettlement(t *testing.T) {
 			if delay < 0 {
 				m := ownedMap(ownedArray(data.Tasks[0]["metrics"])[2])
 				m["status"], m["attempt_count"], m["completed_at"] = "pending", 0, nil
+				m["last_attempt_at"] = nil
 				q := ownedMap(ownedArray(data.Tasks[0]["queues"])[4])
 				q["status"], q["attempt_count"] = "queued", 0
 				data.Tasks[0]["feedback"] = ownedArray(data.Tasks[0]["feedback"])[:2]
 			}
-			state := assessOwnedInventory(channel, data, completed.Add(24*time.Hour+delay))
+			state := ownedTestAssess(t, channel, data, completed.Add(24*time.Hour+delay))
 			if state.HoldReason != "" || len(state.CompleteItemIDs) != 1 {
 				t.Fatalf("normal receipt failed settlement: %+v", state)
 			}
@@ -698,7 +704,7 @@ func TestOwnedHistoryFailsClosed(t *testing.T) {
 			channel, data, now := ownedTestFixture(t)
 			ownedTestCompletedHistory(t, &data, now)
 			mutate(&data)
-			state := assessOwnedInventory(channel, data, now.Add(25*time.Hour))
+			state := ownedTestAssess(t, channel, data, now.Add(25*time.Hour))
 			if state.Candidate != nil || state.HoldReason == "" {
 				t.Fatalf("unsafe %s: %+v", name, state)
 			}
@@ -712,7 +718,7 @@ func TestOwnedOutstandingDoesNotSpendAnotherItem(t *testing.T) {
 	ownedMap(data.Tasks[0]["task"])["state"] = "selected"
 	data.Tasks[0]["operations"], data.Tasks[0]["publications"], data.Tasks[0]["job"] = []any{}, []any{}, nil
 	for _, later := range []time.Duration{0, time.Hour, 48 * time.Hour} {
-		state := assessOwnedInventory(channel, data, now.Add(later))
+		state := ownedTestAssess(t, channel, data, now.Add(later))
 		if state.Candidate != nil || state.SkipReason != "owned_inventory_outstanding" || state.HoldReason != "" {
 			t.Fatalf("outstanding replay: %+v", state)
 		}
@@ -723,7 +729,7 @@ func TestOwnedPDSUnavailableAndFallbackCloseAdmission(t *testing.T) {
 	for _, mode := range []string{"nil", "error", "empty", "block", "flag", "fallback", "dev", "allow"} {
 		t.Run(mode, func(t *testing.T) {
 			channel, data, now := ownedTestFixture(t)
-			candidate := *assessOwnedInventory(channel, data, now).Candidate
+			candidate := *ownedTestAssess(t, channel, data, now).Candidate
 			handler := HandlerService{}
 			if mode != "nil" {
 				handler.PDS = ownedTestPDS(func(_ context.Context, request PDSDecisionRequest) (PDSDecision, error) {
@@ -758,7 +764,7 @@ func TestOwnedPDSUnavailableAndFallbackCloseAdmission(t *testing.T) {
 func TestOwnedNotDueNeverCallsPDS(t *testing.T) {
 	channel, data, now := ownedTestFixture(t)
 	data.RuntimeOpen = false
-	state := assessOwnedInventory(channel, data, now)
+	state := ownedTestAssess(t, channel, data, now)
 	var candidates []TickCandidate
 	if state.Candidate != nil {
 		candidates = append(candidates, *state.Candidate)
@@ -774,7 +780,7 @@ func TestOwnedNotDueNeverCallsPDS(t *testing.T) {
 
 func TestOwnedSnapshotPreservesManualConstraintsAndTypedReferences(t *testing.T) {
 	channel, data, now := ownedTestFixture(t)
-	candidate := *assessOwnedInventory(channel, data, now).Candidate
+	candidate := *ownedTestAssess(t, channel, data, now).Candidate
 	snapshot := channelConfigSnapshot(channel, candidate)
 	if !ownedEqual(ownedMap(snapshot["manual_seed"])["constraints_json"], data.Items[0].Seed["constraints_json"]) {
 		t.Fatal("owned input constraints lost")
@@ -791,7 +797,7 @@ func TestOwnedSnapshotPreservesManualConstraintsAndTypedReferences(t *testing.T)
 func TestOwnedAllSevenConsumedNeverFallsBack(t *testing.T) {
 	channel, data, now := ownedTestFixture(t)
 	data.Inventory["state"] = "exhausted"
-	state := assessOwnedInventory(channel, data, now)
+	state := ownedTestAssess(t, channel, data, now)
 	if state.Candidate != nil || state.SkipReason != "owned_inventory_terminal" {
 		t.Fatal("terminal inventory admitted")
 	}
@@ -806,13 +812,14 @@ func TestOwnedHistoryAcrossMidnightAndSlowCompletionDoesNotResetFloor(t *testing
 	for _, value := range ownedArray(data.Tasks[0]["metrics"]) {
 		m := ownedMap(value)
 		m["status"], m["attempt_count"], m["completed_at"] = "pending", 0, nil
+		m["last_attempt_at"] = nil
 	}
 	for _, value := range ownedArray(data.Tasks[0]["queues"])[2:] {
 		q := ownedMap(value)
 		q["status"], q["attempt_count"] = "queued", 0
 	}
 	data.Tasks[0]["feedback"] = []any{}
-	state := assessOwnedInventory(channel, data, completed.Add(31*time.Minute))
+	state := ownedTestAssess(t, channel, data, completed.Add(31*time.Minute))
 	if state.HoldReason != "" || state.SkipReason != "owned_inventory_cooldown" || state.Candidate != nil {
 		t.Fatalf("midnight reset the floor: %+v", state)
 	}
@@ -821,10 +828,11 @@ func TestOwnedHistoryAcrossMidnightAndSlowCompletionDoesNotResetFloor(t *testing
 	op["request_attempted_at"] = ownedISO(completed.Add(-6 * time.Hour))
 	m := ownedMap(ownedArray(data.Tasks[0]["metrics"])[2])
 	m["status"], m["attempt_count"], m["completed_at"] = "pending", 0, nil
+	m["last_attempt_at"] = nil
 	q := ownedMap(ownedArray(data.Tasks[0]["queues"])[4])
 	q["status"], q["attempt_count"] = "queued", 0
 	data.Tasks[0]["feedback"] = ownedArray(data.Tasks[0]["feedback"])[:2]
-	state = assessOwnedInventory(channel, data, completed.Add(24*time.Hour-time.Second))
+	state = ownedTestAssess(t, channel, data, completed.Add(24*time.Hour-time.Second))
 	if state.HoldReason != "" || state.SkipReason != "owned_inventory_cooldown" || state.Candidate != nil {
 		t.Fatal("attempt time bypassed delayed completion floor")
 	}
@@ -839,6 +847,7 @@ func TestOwnedMetricsDueGraceAndQueueIdentity(t *testing.T) {
 			if mode == "due_pending" || mode == "past_grace" {
 				m := ownedMap(ownedArray(data.Tasks[0]["metrics"])[2])
 				m["status"], m["attempt_count"], m["completed_at"] = "pending", 0, nil
+				m["last_attempt_at"] = nil
 				q := ownedMap(ownedArray(data.Tasks[0]["queues"])[4])
 				q["status"], q["attempt_count"] = "queued", 0
 				data.Tasks[0]["feedback"] = ownedArray(data.Tasks[0]["feedback"])[:2]
@@ -856,8 +865,8 @@ func TestOwnedMetricsDueGraceAndQueueIdentity(t *testing.T) {
 			if mode == "foreign_queue" {
 				data.Queues[0]["kind"] = QueueExecuteTask
 			}
-			safe := ownedQueuesSafe(channel.ID, data, at)
-			state := assessOwnedInventory(channel, data, at)
+			safe := ownedTestQueuesSafe(t, channel.ID, data, at)
+			state := ownedTestAssess(t, channel, data, at)
 			switch mode {
 			case "due_pending":
 				if state.Candidate != nil || state.SkipReason != "owned_inventory_metrics_pending" {
@@ -900,10 +909,10 @@ func TestOwnedSeventhOrdinalAfterSixSettledDailyAttempts(t *testing.T) {
 			q["status"], q["attempt_count"] = "succeeded", 1
 		}
 		feedback := []any{}
-		for _, value := range ownedArray(history["metrics"]) {
+		for i, value := range ownedArray(history["metrics"]) {
 			m := ownedMap(value)
 			if m["status"] == "succeeded" {
-				feedback = append(feedback, map[string]any{"publication_id": m["publication_id"], "snapshot_stage": m["snapshot_stage"]})
+				feedback = append(feedback, map[string]any{"id": ownedTestID(540 + i), "publication_id": m["publication_id"], "snapshot_stage": m["snapshot_stage"]})
 			}
 		}
 		history["feedback"] = feedback
@@ -914,7 +923,7 @@ func TestOwnedSeventhOrdinalAfterSixSettledDailyAttempts(t *testing.T) {
 		text := string(raw)
 		text = strings.ReplaceAll(text, "abcdefghijk", fmt.Sprintf("video%06d", ordinal))
 		text = strings.ReplaceAll(text, fmt.Sprintf("%x", sha256.Sum256([]byte("render"))), fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("render%d", ordinal)))))
-		for id := 501; id <= 534; id++ {
+		for id := 501; id <= 544; id++ {
 			text = strings.ReplaceAll(text, ownedTestID(id), ownedTestID(id+1000*ordinal))
 		}
 		text = strings.ReplaceAll(text, ownedTestID(201), ownedTestID(200+ordinal))
@@ -927,19 +936,19 @@ func TestOwnedSeventhOrdinalAfterSixSettledDailyAttempts(t *testing.T) {
 		item["state"], item["production_task_id"], item["consumed_at"], item["completed_at"] = "completed", ownedTestID(501+1000*ordinal), ownedISO(at.Add(-time.Hour)), ownedISO(at.Add(31*time.Minute))
 		data.Items[ordinal-1].Seed["status"] = "exhausted"
 	}
-	state := assessOwnedInventory(channel, data, now)
+	state := ownedTestAssess(t, channel, data, now)
 	if state.HoldReason != "" || state.SkipReason != "" || state.ConsumedCount != 6 || state.Candidate == nil || state.Candidate.Seed.ID != ownedTestID(207) {
 		t.Fatalf("seventh ordinal rejected: %+v", state)
 	}
 	data.Inventory["state"] = "exhausted"
-	if state := assessOwnedInventory(channel, data, now); state.Candidate != nil {
+	if state := ownedTestAssess(t, channel, data, now); state.Candidate != nil {
 		t.Fatal("exhausted scope selected an eighth task")
 	}
 }
 
 func TestOwnedAgentMarkerRequiresActualExecutionFence(t *testing.T) {
 	channel, data, now := ownedTestFixture(t)
-	candidate := *assessOwnedInventory(channel, data, now).Candidate
+	candidate := *ownedTestAssess(t, channel, data, now).Candidate
 	_, err := (&Store{}).InsertProductionTask(context.Background(), channel, candidate, now)
 	if !errors.Is(err, errOwnedInventory) {
 		t.Fatal("typed reference bypassed transaction authority")

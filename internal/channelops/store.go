@@ -10,13 +10,14 @@ import (
 )
 
 type Store struct {
-	Pool               *pgxpool.Pool
-	Now                func() time.Time
-	DefaultMaxAttempts int
-	leadership         *leaderState
-	leaderLockAttempt  leaderLockAttempt
-	executionDB        dbExecutor
-	executionChannelID *string
+	Pool                 *pgxpool.Pool
+	Now                  func() time.Time
+	DefaultMaxAttempts   int
+	leadership           *leaderState
+	leaderLockAttempt    leaderLockAttempt
+	executionDB          dbExecutor
+	executionChannelID   *string
+	ownedHistoryEvidence *ownedHistoryRedisEvidence
 }
 
 type dbExecutor interface {
