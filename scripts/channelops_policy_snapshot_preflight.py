@@ -52,7 +52,7 @@ def group_by(rows, key):
     return grouped
 
 
-def tick_is_complete(tick, policies, features, decisions):
+def tick_is_complete(tick, policies, features, decisions, decisions_by_snapshot):
     """Verify stored identities and one-to-one links, not raw-feature hash contents."""
     policy_rows = policies[tick["policy_version_id"]]
     if len(policy_rows) != 1:
@@ -80,8 +80,11 @@ def tick_is_complete(tick, policies, features, decisions):
             or len({decision["feature_snapshot_id"] for decision in decisions}) != count):
         return False
     for feature in features:
+        references = decisions_by_snapshot[feature["id"]]
         if not (
             stored_uuid(feature["id"])
+            and len(references) == 1
+            and references[0]["tick_audit_id"] == tick["id"]
             and isinstance(feature["candidate_id"], str)
             and feature["candidate_id"].strip()
             and feature["policy_version_id"] == tick["policy_version_id"]
@@ -124,7 +127,10 @@ async def collect_report(connection):
     ticks = await connection.fetch(TICKS_SQL)
     policies = group_by(await connection.fetch(POLICIES_SQL), "id")
     features = group_by(await connection.fetch(FEATURES_SQL), "tick_audit_id")
-    decisions = group_by(await connection.fetch(DECISIONS_SQL), "tick_audit_id")
+    decision_rows = await connection.fetch(DECISIONS_SQL)
+    decisions = group_by(decision_rows, "tick_audit_id")
+    # Legacy decisions remain unreplayable but can still corrupt new reverse links.
+    decisions_by_snapshot = group_by(decision_rows, "feature_snapshot_id")
     modes = dict.fromkeys(("off", "shadow", "canary", "active", "unknown"), 0)
     for activation in await connection.fetch(ACTIVATIONS_SQL):
         mode = activation["mode"] if activation["mode"] in modes else "unknown"
@@ -141,7 +147,9 @@ async def collect_report(connection):
         counts["new"] += 1
         counts["pending"] += tick["replay_status"] == "snapshot_pending"
         counts["complete_labelled"] += tick["replay_status"] == "snapshot_complete"
-        complete = tick_is_complete(tick, policies, features[tick["id"]], decisions[tick["id"]])
+        complete = tick_is_complete(
+            tick, policies, features[tick["id"]], decisions[tick["id"]], decisions_by_snapshot,
+        )
         counts["actually_complete" if complete else "partial"] += 1
         policy_rows = policies[tick["policy_version_id"]]
         evidence.append({

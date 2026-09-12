@@ -256,6 +256,39 @@ async def test_duplicate_linkage_cannot_hide_behind_equal_cardinality(preflight,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_snapshot_id", [FEATURE, None])
+async def test_legacy_reverse_link_marks_only_affected_new_tick_partial(
+    preflight, database, legacy_snapshot_id,
+):
+    unaffected_tick = str(UUID(int=100))
+    database.execute("INSERT INTO agent_tick_audits VALUES (?, ?, ?, NULL, NULL, NULL, 7)",
+                     (OTHER, CHANNEL, "legacy_unreplayable"))
+    database.execute("INSERT INTO agent_tick_audits VALUES (?, ?, ?, ?, ?, ?, 0)",
+                     (unaffected_tick, CHANNEL, "snapshot_complete", POLICY, HASH, AS_OF))
+    database.execute("INSERT INTO decision_audit_entries SELECT ?, ?, channel_profile_id, "
+                     "policy_version_id, ?, candidate_id, candidate_source, topic_lane_id, "
+                     "lane_format_id, target_account_id, candidate_set_hash, decision_hash, "
+                     "decision, selected, score_json FROM decision_audit_entries",
+                     (OTHER, OTHER, legacy_snapshot_id))
+    changes_before = database.total_changes
+    report = await audit(preflight, database)
+    linked = legacy_snapshot_id is not None
+    assert report["ok"] is (not linked)
+    assert report["ticks"] == {
+        "total": 3, "legacy": 1, "new": 2, "pending": 0,
+        "complete_labelled": 2, "actually_complete": 1 if linked else 2,
+        "partial": 1 if linked else 0, "coverage": 0.5 if linked else 1.0,
+    }
+    assert report["errors"] == (["partial_new_ticks"] if linked else [])
+    evidence = {row["tick_audit_id"]: row for row in report["tick_evidence"]}
+    assert evidence[TICK]["complete"] is (not linked)
+    assert evidence[unaffected_tick]["complete"] is True
+    assert OTHER not in evidence
+    assert database.total_changes == changes_before
+    assert SECRET not in json.dumps(report)
+
+
+@pytest.mark.asyncio
 async def test_accepted_and_rejected_candidates_are_both_required(preflight, database):
     database.execute("UPDATE agent_tick_audits SET candidates_scored=2")
     database.execute("INSERT INTO candidate_feature_snapshots SELECT ?, tick_audit_id, policy_version_id, "
