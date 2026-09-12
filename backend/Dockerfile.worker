@@ -1,8 +1,5 @@
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
-ARG VP_BUILD_COMMIT
-RUN printf '%s\n' "$VP_BUILD_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
-LABEL org.opencontainers.image.revision=$VP_BUILD_COMMIT
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 DEBIAN_FRONTEND=noninteractive
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -32,6 +29,10 @@ COPY worker/visual_embedding_model.py /tmp/vp-visual-embedding-model.py
 RUN python /tmp/vp-visual-embedding-model.py \
     --download /usr/local/share/videoprocess/chinese-clip \
     && chmod -R a-w,a+rX /usr/local/share/videoprocess/chinese-clip
+
+ARG VP_BUILD_COMMIT
+RUN printf '%s\n' "$VP_BUILD_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+LABEL org.opencontainers.image.revision=$VP_BUILD_COMMIT
 
 COPY app /app/app
 COPY worker /app/worker

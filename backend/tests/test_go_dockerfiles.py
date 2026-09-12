@@ -77,6 +77,38 @@ def test_go_dockerfiles_use_go_mod_toolchain_version():
         assert f"FROM golang:{go_version}-bookworm AS build" in text
 
 
+def test_worker_release_identity_does_not_invalidate_dependency_layers():
+    go_worker = (ROOT / "backend" / "Dockerfile.ffmpeg-worker-go").read_text(encoding="utf-8")
+    build, runtime = re.split(r"(?m)^FROM ", go_worker)[1:]
+    assert build.index("RUN go mod download") < build.index("ARG VP_BUILD_COMMIT")
+    assert runtime.index("RUN apt-get update") < runtime.index("ARG VP_BUILD_COMMIT")
+
+    python_worker = (ROOT / "backend" / "Dockerfile.worker").read_text(encoding="utf-8")
+    identity = python_worker.index("ARG VP_BUILD_COMMIT")
+    for dependency in (
+        "RUN apt-get update", "RUN pip install", "RUN python /tmp/vp-visual-embedding-model.py",
+    ):
+        assert python_worker.rindex(dependency) < identity
+
+
+def test_worker_dependency_cache_preserves_checked_release_identity():
+    go_worker = (ROOT / "backend" / "Dockerfile.ffmpeg-worker-go").read_text(encoding="utf-8")
+    build, runtime = re.split(r"(?m)^FROM ", go_worker)[1:]
+    python_worker = (ROOT / "backend" / "Dockerfile.worker").read_text(encoding="utf-8")
+    check = "RUN printf '%s\\n' \"$VP_BUILD_COMMIT\" | grep -Eq '^[0-9a-f]{40}$'"
+    for stage in (build, runtime, python_worker):
+        assert stage.index("ARG VP_BUILD_COMMIT") < stage.index(check)
+    assert build.index(check) < build.index("RUN CGO_ENABLED=0 go build")
+    assert "-X main.buildCommit=$VP_BUILD_COMMIT" in build
+    for stage in (runtime, python_worker):
+        assert stage.index(check) < stage.index("LABEL org.opencontainers.image.revision=$VP_BUILD_COMMIT")
+    assert runtime.index(check) < runtime.index("COPY --from=build")
+    assert python_worker.index(check) < python_worker.index("/usr/local/share/videoprocess/worker-build-commit")
+    assert "chmod 0444 /usr/local/share/videoprocess/worker-build-commit" in python_worker
+    assert "USER videoprocess-worker" in python_worker
+    assert 'CMD ["/opt/venv/bin/python", "-I", "-m", "worker.main"]' in python_worker
+
+
 def test_channelops_go_runner_exposes_queue_and_metrics_envs():
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     docs = (ROOT / "docs" / "channelops-go-live-runner.md").read_text(encoding="utf-8")
