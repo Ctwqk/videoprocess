@@ -433,4 +433,4 @@ async def test_generation_state_is_sanitized_and_exact(
     assert "database-secret" not in output_text
 def test_current_deployment_applies_owned_producer_fence_042():
     from app.services import worker_deployment_cli
-    assert worker_deployment_cli.EXPECTED_MIGRATION_HEAD == "042_owned_producer_fence"
+    assert worker_deployment_cli.EXPECTED_MIGRATION_HEAD == "043_owned_history_snapshot_rows"

@@ -245,7 +245,7 @@ func TestOwnedHistorySnapshotValidation(t *testing.T) {
 				rows["runtime_schedules"] = []any{map[string]any{"service_name": "video"}, map[string]any{"service_name": "video"}}
 			case "overflow":
 				a := []any{}
-				for i := 0; i < 4097; i++ {
+				for i := 0; i < ownedHistoryMaxSnapshotRows+1; i++ {
 					a = append(a, map[string]any{"id": historyTestUID(i)})
 				}
 				rows["jobs"] = a

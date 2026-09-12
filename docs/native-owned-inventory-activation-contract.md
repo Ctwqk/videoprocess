@@ -150,3 +150,26 @@ falls back to `REDIS_URL`. When unset, existing behavior remains; ordinary Redis
 clients are unchanged. Parent alone qualifies/mounts the existing managed named
 control credential. No new Redis principal, ACL widening or raw credential
 environment value is required by this optional file path.
+
+## Snapshot Capacity Amendment
+
+The parent-approved 2026-09-12 resource-capacity amendment raises only complete
+history snapshot transport to 8192 rows per selected set, with an 8193-row
+sentinel. It is not an interpretation that the original 4096 bound already
+allowed larger snapshots. Parent read-only evidence found 4930 node rows; the
+27-set raw UTF-8, Python/SQL canonical JSON, and consumer 21-set UTF-8 accounting
+all remain below the unchanged 16 MiB bounds. These are capacity observations,
+not authority qualification or activation approval.
+
+Python and Go retain every row of all 27 fixed sets in the same MVCC statement,
+then reject any overflow. Migration 043 changes only the installed producer-row
+and consumer-quiescence snapshot limits, and makes the consumer terminal graph's
+previously implicit 4096-per-set bound explicit. Function identities, ACLs,
+search paths, classifiers, lock order and time budgets are retained. Terminal
+graphs, Redis PEL, producer pipeline graphs and other existing proof bounds stay
+4096. There is no history filtering, truncation, deletion, alias normalization,
+certificate exception, new authority, schedule change or live action.
+
+The aggregate 16 MiB serialization cap is not a peak-memory bound. The existing
+canonicalizer can OOM a 512 MiB PostgreSQL instance on one huge scalar; this
+remains unresolved and is not qualified or fixed by this capacity patch.

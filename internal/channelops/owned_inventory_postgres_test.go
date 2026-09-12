@@ -155,8 +155,8 @@ func newOwnedPGFixtureWithWindow(t *testing.T, legacy func(*Store, time.Time) ma
 	}
 	t.Cleanup(store.Close)
 	var revision string
-	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "042_owned_producer_fence" {
-		t.Fatal("disposable database must be migrated to 042_owned_producer_fence")
+	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "043_owned_history_snapshot_rows" {
+		t.Fatal("disposable database must be migrated to 043_owned_history_snapshot_rows")
 	}
 	var now time.Time
 	if err := store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {

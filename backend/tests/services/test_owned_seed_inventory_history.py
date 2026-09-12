@@ -86,7 +86,7 @@ def test_incomplete_or_ambiguous_snapshot_rejected(bad):
     elif bad == "duplicate":
         rows["jobs"] = [{"id": uid(1)}, {"id": uid(1)}]
     else:
-        rows["jobs"] = [{"id": uid(i)} for i in range(history.MAX_ROWS + 1)]
+        rows["jobs"] = [{"id": uid(i)} for i in range(history.MAX_SNAPSHOT_ROWS + 1)]
     with pytest.raises(history.OwnedHistoryError, match="^owned_history_"):
         snap(rows)
 

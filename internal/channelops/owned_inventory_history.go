@@ -17,6 +17,7 @@ import (
 )
 
 const ownedHistoryMaxRows = 4096
+const ownedHistoryMaxSnapshotRows = 8192
 const ownedHistoryMaxBytes = 16 * 1024 * 1024
 
 var historyUC = regexp.MustCompile(`^UC[A-Za-z0-9_-]{22}$`)
@@ -408,7 +409,7 @@ func newOwnedHistorySnapshot(rowsJSON []byte, platformChannelID string, observed
 	for _, name := range strings.Fields(historyTableNames) {
 		v, exists := rows[name]
 		a, ok := v.([]any)
-		historyRequire(exists && ok && len(a) <= ownedHistoryMaxRows, "owned_history_incomplete")
+		historyRequire(exists && ok && len(a) <= ownedHistoryMaxSnapshotRows, "owned_history_incomplete")
 		key := "id"
 		if name == "runtime_schedules" {
 			key = "service_name"

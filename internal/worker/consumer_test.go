@@ -5336,10 +5336,10 @@ func newWorkerIntakePostgresFixture(
 		t.Fatalf("read intake migration version: %v", err)
 	}
 	// CI migrates this functional fixture to head, not the historical 036 schema.
-	if migration != "042_owned_producer_fence" {
+	if migration != "043_owned_history_snapshot_rows" {
 		admin.Close()
 		t.Fatalf(
-			"intake migration version = %q; want 042_owned_producer_fence",
+			"intake migration version = %q; want 043_owned_history_snapshot_rows",
 			migration,
 		)
 	}

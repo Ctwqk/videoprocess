@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,7 +39,7 @@ func ownedHistoryReadSQL() string {
 		if table == "runtime_schedules" {
 			key = "service_name"
 		}
-		sets = append(sets, "'"+table+"', (SELECT COALESCE(json_agg(row_to_json(bounded)), '[]'::json) FROM (SELECT "+strings.Join(strings.Fields(columns), ",")+" FROM public."+table+" ORDER BY "+key+" LIMIT 4097) bounded)")
+		sets = append(sets, "'"+table+"', (SELECT COALESCE(json_agg(row_to_json(bounded)), '[]'::json) FROM (SELECT "+strings.Join(strings.Fields(columns), ",")+" FROM public."+table+" ORDER BY "+key+" LIMIT "+strconv.Itoa(ownedHistoryMaxSnapshotRows+1)+") bounded)")
 	}
 	return "SELECT clock_timestamp(), json_build_object(" + strings.Join(sets, ",") + ")"
 }

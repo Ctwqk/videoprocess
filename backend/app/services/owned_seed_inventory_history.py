@@ -37,6 +37,7 @@ from app.services.registered_worker_event_receipt import (
 )
 
 MAX_ROWS = 4096
+MAX_SNAPSHOT_ROWS = 8192
 MAX_BYTES = 16 * 1024 * 1024
 MAX_OBSERVATION_AGE_SECONDS = 60
 _UC = re.compile(r"UC[A-Za-z0-9_-]{22}\Z")
@@ -487,7 +488,7 @@ class OwnedHistorySnapshot:
         _require(set(rows) == set(HISTORY_MODELS), "owned_history_incomplete")
         data = FrozenJSON.from_value(dict(rows)).as_dict()
         for name, records in data.items():
-            _require(isinstance(records, list) and len(records) <= MAX_ROWS, "owned_history_incomplete")
+            _require(isinstance(records, list) and len(records) <= MAX_SNAPSHOT_ROWS, "owned_history_incomplete")
             key = "service_name" if name == "runtime_schedules" else "id"
             _require(all(isinstance(row, dict) and isinstance(row.get(key), str) for row in records))
             _require(len({row[key] for row in records}) == len(records), "owned_history_duplicate")
@@ -535,7 +536,7 @@ async def load_owned_history_evidence(db, *, platform_channel_id: str) -> OwnedH
         for name, model in HISTORY_MODELS.items():
             table = model.__table__
             columns = [c for c in table.columns if c.name not in {"lease_secret_sha256", "token_sha256"}]
-            bounded = select(*columns).order_by(*table.primary_key).limit(MAX_ROWS + 1).subquery()
+            bounded = select(*columns).order_by(*table.primary_key).limit(MAX_SNAPSHOT_ROWS + 1).subquery()
             rows = select(func.coalesce(func.json_agg(func.row_to_json(bounded.table_valued())),
                                         literal("[]").cast(JSON))).scalar_subquery()
             fields.extend((literal(name), rows))

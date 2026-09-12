@@ -66,7 +66,7 @@ func TestOwnedHistoryDBLoaderCompleteBoundedProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	query := strings.ToLower(db.query)
-	if strings.Count(query, "limit 4097") != 27 || !strings.Contains(query, "clock_timestamp()") {
+	if strings.Count(query, "limit 8193") != 27 || !strings.Contains(query, "clock_timestamp()") {
 		t.Fatal("missing complete bounded MVCC enumeration")
 	}
 	for _, table := range strings.Fields(historyTableNames) {
@@ -91,7 +91,7 @@ func TestOwnedHistoryDBLoaderRefusesIncompleteAndOverflow(t *testing.T) {
 			}
 			if variant == "overflow" {
 				values := []any{}
-				for i := 0; i < 4097; i++ {
+				for i := 0; i < ownedHistoryMaxSnapshotRows+1; i++ {
 					values = append(values, map[string]any{"id": historyTestUID(i)})
 				}
 				rows["youtube_upload_operations"] = values
