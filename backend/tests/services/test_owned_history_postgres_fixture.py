@@ -50,6 +50,59 @@ def test_pg_seed_uses_actual_native_enum_labels():
                     assert row[column.name] in column.type.enums, (name, column.name, row[column.name])
 
 
+@pytest.mark.parametrize("defer_retry", [False, True])
+async def test_cancel_ack_fixture_inserts_unresolved_branch_without_rewinding_history(defer_retry):
+    import copy
+    import hashlib
+    import json
+    import uuid
+    from app.services import owned_seed_inventory as service
+    from tests.migrations.owned_history_postgres import insert_record, seed_graph
+
+    inserted = []
+
+    class Owner:
+        async def fetchval(self, sql):
+            assert sql == "SELECT clock_timestamp()"
+            return NOW
+
+        async def execute(self, sql, *args):
+            assert sql.startswith("INSERT INTO "), "fixture must not rewind a terminal row"
+            if sql.startswith("INSERT INTO public.worker_task_dispatches "):
+                inserted.append(json.loads(args[0]))
+
+    owner = Owner()
+    rows, pending = await seed_graph(owner, defer_cancel_retry=defer_retry)
+    assert len(inserted) == (3 if defer_retry else 4)
+    assert all(row["resolution_state"] in {"acknowledged", "cancelled"} for row in inserted)
+    keys = {row["dispatch_key"] for row in inserted}
+    _, all_observations = seed_document(NOW)
+    observations = tuple(o for o in all_observations if o.dispatch_key is None or o.dispatch_key in keys)
+    snapshot = history.OwnedHistorySnapshot.from_rows(rows, platform_channel_id="UC" + "a" * 22,
+        observed_at=NOW, redis_observations=observations)
+    sources = service._retirement_sources(snapshot, requested=True)
+    hashes = {uuid.UUID(s["id"]): hashlib.sha256(b"a" * 100).hexdigest() for s in sources["source_assets"]}
+    certificate = service._qualified_retirement(snapshot, sources, (hashes, observations), "fixture", "fixture:only")
+    assert len(certificate["terminal_graph"]["worker_task_dispatches"]) == len(inserted)
+    if not defer_retry:
+        assert pending is None
+        return
+    original = copy.deepcopy(rows)
+    assert pending["origin_receipt_id"] is not None
+    assert pending["delivery_state"] == "delivered" and pending["resolution_state"] == "unresolved"
+    assert pending["acknowledged_at"] is pending["cancelled_at"] is None
+    assert pending["redis_message_id"] == "3000-0" and pending["dispatch_key"] not in keys
+    await insert_record(owner, "worker_task_dispatches", pending)
+    assert len({row["id"] for row in inserted}) == 4
+    assert inserted[-1] == pending and rows == original
+    fresh_rows = copy.deepcopy(rows)
+    fresh_rows["worker_task_dispatches"].append(pending)
+    fresh = history.OwnedHistorySnapshot.from_rows(fresh_rows, platform_channel_id=snapshot.platform_channel_id,
+        observed_at=NOW, redis_observations=all_observations)
+    with pytest.raises(service.OwnedInventoryError, match="^owned_inventory_retirement_changed$"):
+        service._qualified_retirement(fresh, sources, (hashes, all_observations), "fixture", "fixture:only")
+
+
 @pytest.mark.parametrize("exit_kind", ["close", "error"])
 async def test_nested_inventory_fixture_disposes_pool_on_generator_exit(monkeypatch, exit_kind):
     from types import SimpleNamespace

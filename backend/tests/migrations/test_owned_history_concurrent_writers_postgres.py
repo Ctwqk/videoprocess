@@ -15,7 +15,7 @@ from app.models.channel_agent import PublishingAccount
 from app.services import owned_seed_inventory as service
 from app.services import owned_seed_inventory_history as history
 from app.services.registered_worker_event_receipt import RegisteredWorkerEventReceiptService, parse_registered_worker_event
-from tests.migrations.owned_history_postgres import a2_pg as a2_pg, wait_blocked
+from tests.migrations.owned_history_postgres import a2_pg as a2_pg, insert_record, wait_blocked
 from tests.migrations.test_owned_history_seal_postgres import a2_env as a2_env, approve, seal
 from tests.worker.ack_drill_postgres import ack_drill_runtime as _ack_drill_runtime
 
@@ -380,13 +380,19 @@ async def test_actual_first_failure_retry_transaction_serializes_with_populated_
         await asyncio.gather(*(t for t in (task, qualifier) if t is not None), return_exceptions=True)
 
 
+@pytest.mark.parametrize("a2_pg", ["deferred_cancel_retry"], indirect=True)
 async def test_actual_unresolved_cancel_ack_commits_before_waiting_sealer_reloads(a2_env, monkeypatch):
     h = a2_env
-    retry = next(d for d in h.case.rows["worker_task_dispatches"] if d["origin_receipt_id"] is not None)
+    retry = h.case.pending_retry
+    assert retry is not None and retry["resolution_state"] == "unresolved"
     dispatch_id = uuid.UUID(retry["id"])
-    await h.case.owner.execute("UPDATE worker_task_dispatches SET resolution_state='unresolved',acknowledged_at=NULL WHERE id=$1", dispatch_id)
+    assert not await h.case.owner.fetchval("SELECT EXISTS(SELECT 1 FROM worker_task_dispatches WHERE id=$1)", dispatch_id)
+    await insert_record(h.case.owner, "worker_task_dispatches", retry)
+    h.redis.markers["vp:worker-task-dispatch:" + retry["dispatch_key"]] = retry["redis_message_id"]
     receiver = RegisteredWorkerEventReceiptService(h.case.registered.session)
     assert await receiver._authorize_cancelled_dispatches(limit=10) == [dispatch_id]
+    authorized = await h.case.owner.fetchrow("SELECT resolution_state,acknowledged_at FROM worker_task_dispatches WHERE id=$1", dispatch_id)
+    assert authorized["resolution_state"] == "cancel_authorized" and authorized["acknowledged_at"] is None
     locked, release, sealing = asyncio.Event(), asyncio.Event(), asyncio.Event()
     pids, ack_calls = {}, []
     original = receiver._locked_dispatch_batch
@@ -421,13 +427,16 @@ async def test_actual_unresolved_cancel_ack_commits_before_waiting_sealer_reload
         release.set()
         await asyncio.wait_for(task, 5)
         result = await asyncio.wait_for(qualifier, 5)
-        assert result.status_code == 409 and result.json()["detail"] != "owned_inventory_v2_activation_disabled"
+        assert result.status_code == 409 and result.json()["detail"] == "owned_inventory_retirement_changed"
         row = await h.case.owner.fetchrow("SELECT * FROM worker_task_dispatches WHERE id=$1", dispatch_id)
         assert row["resolution_state"] == "acknowledged" and row["acknowledged_at"] is not None
         assert ack_calls == [(retry["redis_stream"], retry["consumer_group"], retry["redis_message_id"])]
         await receiver._acknowledge_cancelled_dispatch(Redis(), dispatch_id)
         assert len(ack_calls) == 1
         assert await h.case.owner.fetchval("SELECT count(*) FROM worker_task_delivery_attestations WHERE dispatch_key=$1", uuid.UUID(retry["dispatch_key"])) == 0
+        draft = await h.case.owner.fetchrow("SELECT manifest_sha256,state,approved_at FROM owned_seed_inventories WHERE id=$1", uuid.UUID(h.result["id"]))
+        assert draft["manifest_sha256"] == h.result["manifest_sha256"]
+        assert draft["state"] == "draft" and draft["approved_at"] is None
     finally:
         release.set()
         for pending in (task, qualifier):

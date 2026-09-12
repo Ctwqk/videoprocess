@@ -202,9 +202,18 @@ async def insert_record(owner, table, row):
                         json.dumps(row))
 
 
-async def seed_graph(owner, *, null_link=False):
+async def seed_graph(owner, *, null_link=False, defer_cancel_retry=False):
     now = await owner.fetchval("SELECT clock_timestamp()")
     rows, _ = seed_document(now, null_link=null_link)
+    pending_retry = None
+    if defer_cancel_retry:
+        retries = [row for row in rows["worker_task_dispatches"] if row["origin_receipt_id"] is not None]
+        assert len(retries) == 1
+        pending_retry = retries[0]
+        rows["worker_task_dispatches"].remove(pending_retry)
+        # Construct the pre-ACK branch before its first INSERT, never by
+        # resetting a persisted terminal dispatch's immutable resolution.
+        pending_retry.update(resolution_state="unresolved", acknowledged_at=None)
     pipeline = rows["jobs"][0]["pipeline_id"]
     await owner.execute("INSERT INTO pipelines(id,name,definition) VALUES($1,'A2 synthetic terminal graph',$2::json)",
                         uuid.UUID(pipeline), json.dumps(rows["jobs"][0]["pipeline_snapshot"]))
@@ -221,7 +230,7 @@ async def seed_graph(owner, *, null_link=False):
             if table == "worker_registrations":
                 value["lease_secret_sha256"] = hashlib.sha256(value["id"].encode()).hexdigest()
             await insert_record(owner, table, value)
-    return rows
+    return rows, pending_retry
 
 
 @pytest.fixture
@@ -251,7 +260,8 @@ async def a2_pg(monkeypatch, tmp_path, request):
         after = await catalogue(owner)
         await owner.execute("INSERT INTO runtime_schedules(service_name,state,updated_by) VALUES('videoprocess','CLOSED','a2-fixture') ON CONFLICT(service_name) DO NOTHING")
         async with owner.transaction():
-            rows = await seed_graph(owner, null_link=getattr(request, "param", False))
+            rows, pending_retry = await seed_graph(owner, null_link=getattr(request, "param", False) is True,
+                defer_cancel_retry=getattr(request, "param", None) == "deferred_cancel_retry")
         generation = "a2-" + uuid.uuid4().hex[:20]
         orchestration = role_names_for_generation(generation)
         urls = {}
@@ -287,7 +297,8 @@ async def a2_pg(monkeypatch, tmp_path, request):
         engines.append(owner_engine)
         worker_engine = create_async_engine(urls["worker"], poolclass=NullPool, hide_parameters=True)
         engines.append(worker_engine)
-        yield SimpleNamespace(owner=owner, target=target, urls=urls, rows=rows, before=before, after=after,
+        yield SimpleNamespace(owner=owner, target=target, urls=urls, rows=rows, pending_retry=pending_retry,
+            before=before, after=after,
             sessions=async_sessionmaker(owner_engine, expire_on_commit=False), registered=registered,
             worker_sessions=async_sessionmaker(worker_engine, expire_on_commit=False),
             migration=runpy.run_path(str(MIGRATION)), granted_catalogue=await catalogue(owner))
