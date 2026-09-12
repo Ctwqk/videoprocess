@@ -137,6 +137,10 @@ class AgentTickAudit(UUIDPrimaryKeyMixin, Base):
     __table_args__ = (
         UniqueConstraint("channel_profile_id", "tick_id", name="uq_agent_tick_audit_channel_tick"),
         Index("ix_agent_tick_audits_channel_profile_id", "channel_profile_id"),
+        CheckConstraint(
+            "replay_status IN ('legacy_unreplayable','snapshot_pending','snapshot_complete')",
+            name="ck_agent_tick_audits_replay_status",
+        ),
     )
 
     channel_profile_id: Mapped[uuid_mod.UUID] = mapped_column(
@@ -154,6 +158,14 @@ class AgentTickAudit(UUIDPrimaryKeyMixin, Base):
     guards_triggered_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     decision_summary_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    policy_version_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("decision_policy_versions.id", ondelete="RESTRICT"), nullable=True
+    )
+    candidate_set_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    feature_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replay_status: Mapped[str] = mapped_column(
+        String(32), default="legacy_unreplayable", server_default="legacy_unreplayable", nullable=False
+    )
 
 
 class DecisionAuditEntry(UUIDPrimaryKeyMixin, Base):
@@ -163,6 +175,7 @@ class DecisionAuditEntry(UUIDPrimaryKeyMixin, Base):
         Index("ix_decision_audit_entries_channel_created", "channel_profile_id", "created_at"),
         Index("ix_decision_audit_entries_task", "created_task_id"),
         Index("ix_decision_audit_entries_source_created", "candidate_source", "created_at"),
+        CheckConstraint("decision IN ('accepted','rejected')", name="ck_decision_audit_entries_decision"),
     )
 
     tick_audit_id: Mapped[uuid_mod.UUID] = mapped_column(
@@ -181,6 +194,127 @@ class DecisionAuditEntry(UUIDPrimaryKeyMixin, Base):
     selected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     rejection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_task_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    policy_version_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("decision_policy_versions.id", ondelete="RESTRICT"), nullable=True
+    )
+    feature_snapshot_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("candidate_feature_snapshots.id", ondelete="RESTRICT"), nullable=True
+    )
+    candidate_set_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decision_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    baseline_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    final_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    shadow_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    shadow_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    shadow_selected: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    experiment_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
+class DecisionPolicyVersion(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "decision_policy_versions"
+    __table_args__ = (
+        UniqueConstraint("policy_key", "version", name="uq_decision_policy_versions_key_version"),
+        CheckConstraint("status IN ('draft','validated','retired')", name="ck_decision_policy_versions_status"),
+    )
+
+    policy_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    version: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    feature_schema_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    reward_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    formula_json: Mapped[dict] = mapped_column(JSON(none_as_null=True), nullable=False)
+    hard_guard_config_json: Mapped[dict] = mapped_column(JSON(none_as_null=True), nullable=False)
+    portfolio_config_json: Mapped[dict] = mapped_column(JSON(none_as_null=True), nullable=False)
+    exploration_config_json: Mapped[dict] = mapped_column(JSON(none_as_null=True), nullable=False)
+    code_commit_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    template_registry_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    prompt_bundle_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by: Mapped[str] = mapped_column(Text, nullable=False)
+    change_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PolicyActivationHistory(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "policy_activation_history"
+    __table_args__ = (
+        UniqueConstraint("request_id", name="uq_policy_activation_history_request_id"),
+        CheckConstraint("mode IN ('off','shadow','canary','active')", name="ck_policy_activation_history_mode"),
+        CheckConstraint(
+            "rollout_percentage >= 0 AND rollout_percentage <= 100",
+            name="ck_policy_activation_history_rollout",
+        ),
+        CheckConstraint(
+            "effective_to IS NULL OR effective_to > effective_from",
+            name="ck_policy_activation_history_interval",
+        ),
+    )
+
+    channel_profile_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("channel_profiles.id", ondelete="RESTRICT"), nullable=False
+    )
+    target_account_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("publishing_accounts.id", ondelete="RESTRICT"), nullable=True
+    )
+    policy_version_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("decision_policy_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    rollout_percentage: Mapped[float] = mapped_column(Float, nullable=False)
+    deterministic_salt: Mapped[str] = mapped_column(Text, nullable=False)
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    previous_activation_id: Mapped[uuid_mod.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("policy_activation_history.id", ondelete="RESTRICT"), nullable=True
+    )
+    request_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    rollback_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feature_flag_snapshot_json: Mapped[dict] = mapped_column(JSON(none_as_null=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class CandidateFeatureSnapshot(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "candidate_feature_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "tick_audit_id", "candidate_id", "feature_schema_version",
+            name="uq_candidate_feature_snapshots_tick_candidate_schema",
+        ),
+    )
+
+    tick_audit_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_tick_audits.id", ondelete="RESTRICT"), nullable=False
+    )
+    candidate_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    candidate_source: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Captured identities, like the existing decision audit, are not mutable-parent FKs.
+    topic_lane_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    lane_format_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    target_account_id: Mapped[uuid_mod.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    policy_version_id: Mapped[uuid_mod.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("decision_policy_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    feature_schema_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    feature_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    raw_features_json: Mapped[dict] = mapped_column(JSON(none_as_null=True), nullable=False)
+    normalized_features_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    missing_feature_mask_json: Mapped[dict] = mapped_column(JSON(none_as_null=True), nullable=False)
+    cadence_snapshot_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    content_mix_snapshot_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    material_supply_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    production_reliability_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    learning_references_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    source_record_refs_json: Mapped[dict] = mapped_column(JSON(none_as_null=True), nullable=False)
+    cost_estimate_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    risk_estimate_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    candidate_set_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    feature_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
