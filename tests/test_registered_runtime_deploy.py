@@ -1,5 +1,7 @@
 """Execute deployment shell functions with no external operations available."""
 
+import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -800,6 +802,261 @@ def test_owned_history_entry_uses_journal_pin_and_one_cas(tmp_path, runner, acti
         assert [s for s in c["Secrets"] if s["File"]["Name"] == "owned-history-redis-url"] == [
             {"SecretID": "r" * 25, "SecretName": reference["secret_name"],
              "File": {"Name": "owned-history-redis-url", "UID": "0", "GID": "0", "Mode": 256}}]
+
+
+def owned_history_transition_fixture(tmp_path, runner, action):
+    data = locked_runtime_fixture(tmp_path, "rollback" if action != "forward" else action)
+    helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
+    active = Path(data["ADMISSION_ROOT"]) / "transactions/active.json"
+    document = json.loads(active.read_text())
+    reference = {"runtime_generation": "3729fcdc8ac5" + "a" * 28,
+                 "secret_name": "vp-control-redis-3729fcdc8ac5",
+                 "docker_secret_id": "ijnv9hl2y8whxz3zigrgcysly"}
+    document["runtime_redis"] = {"control": reference}
+    service = "vp-channel-agent-runner-swarm" if runner else "vp-autoflow-api-swarm"
+    baseline = next(row for row in document["baseline"]["services"] if row["name"] == service)
+    image = ("vp-channelops-runner-go" if runner else "vp-backend-api") + ":deploy-0123456789ab"
+    baseline["image"] = image.replace("0123456789ab", "111111111111")
+    if runner and action == "rollback":
+        image = baseline["image"]
+    if action == "candidate_restore":
+        document["phase"] = "CANDIDATE_RESTORE_REQUIRED"
+        # The production failure already had the selected image at its baseline.
+        baseline["image"] = image
+        document["failed_forward"]["services"] = [dict(baseline, image=image)]
+    original = copy.deepcopy(data["SPEC"])
+    original["Name"] = service
+    original["Labels"] = {"keep": "yes"}
+    container = original["TaskTemplate"]["ContainerSpec"]
+    container["Image"] = baseline["image"]
+    container["Env"].append("OWNED_HISTORY_REDIS_URL_FILE=/run/secrets/owned-history-redis-url")
+    old = {"SecretID": "8421647r928yg9q4rfysv89m3", "SecretName": "vp-control-redis-eeb8593f43dc",
+           "File": {"Name": "owned-history-redis-url", "UID": "0", "GID": "0", "Mode": 256}}
+    container["Secrets"].append(copy.deepcopy(old))
+    actual = {"ID": baseline["docker_service_id"], "Version": {"Index": 71}, "Spec": original,
+              "UpdateStatus": {"State": "completed"}}
+    rollback = action == "rollback"
+    selected = document["rollback" if rollback else "forward"]["control"]
+    secret = next(ref for ref in selected["secrets"] if ref["purpose"] == "orchestrator")
+    args = [data["ADMISSION_ROOT"], "19", str(os.getppid()), "token", str(document["revision"]),
+            actual["ID"], image, "start-first" if action == "forward" else "stop-first",
+            "-" if runner else f"{secret['name']}|{secret['docker_secret_id']}|{selected['generation']}",
+            "colima-127", "-" if runner else "true", "owned-history-file"]
+    return dict(helper=helper, active=active, document=document, baseline=baseline, actual=actual,
+                old=old, reference=reference, args=args, runner=runner, image_user="")
+
+
+def run_owned_history_transition(case, fault="none"):
+    helper, document, actual = case["helper"], case["document"], case["actual"]
+    active, args = case["active"], case["args"]
+    helper["_validate_document"](document)
+    active.write_bytes(helper["_canonical"](document))
+    before = active.read_bytes()
+    source_before = copy.deepcopy(actual)
+    requests, posted, secrets, reads, polls = [], [], [], [], []
+
+    def read(root):
+        value = helper["_registered_document"](root)
+        reads.append(value)
+        if len(reads) > 1:
+            if fault == "revision":
+                value["revision"] += 1
+            elif fault == "pin_changed":
+                value["runtime_redis"]["control"]["docker_secret_id"] = "z" * 25
+        return value
+
+    def docker(argv, **kwargs):
+        if argv[:2] == ["secret", "inspect"]:
+            assert argv[3:] == ["--format", "{{.ID}}|{{.Spec.Name}}"]
+            secrets.append(argv[2])
+            old = argv[2] == case["old"]["SecretID"]
+            assert old or argv[2] == case["reference"]["docker_secret_id"]
+            secret_id = argv[2]
+            name = case["old"]["SecretName"] if old else case["reference"]["secret_name"]
+            if fault == ("old_id_replaced" if old else "target_id_replaced"):
+                secret_id = "z" * 25
+            if fault == ("old_name_replaced" if old else "target_name_replaced"):
+                name = "vp-control-redis-ffffffffffff"
+            if old and fault == "old_missing":
+                raise RuntimeError("secret unavailable")
+            return secret_id + "|" + name
+        if argv[:2] == ["image", "inspect"]:
+            assert not case["runner"] and argv == ["image", "inspect", args[6], "--format", "{{.Config.User}}"]
+            return case["image_user"]
+        assert argv == ["service", "inspect", args[5]]
+        value = copy.deepcopy(actual)
+        if posted:
+            polls.append(1)
+            value["Spec"] = copy.deepcopy(posted[-1])
+            value["Version"]["Index"] = 72
+            if fault == "convergence_drift":
+                value["Spec"]["Labels"]["drift"] = "yes"
+            if fault == "paused":
+                value["UpdateStatus"]["State"] = "paused"
+        return json.dumps([value])
+
+    def exchange(request):
+        requests.append(request)
+        headers, body = request.split(b"\r\n\r\n", 1)
+        posted.append(json.loads(body))
+        if fault == "lost":
+            raise TimeoutError("uncertain POST")
+        status = b"409 Conflict" if fault == "cas_conflict" else b"200 OK"
+        return b"HTTP/1.1 " + status + b"\r\nContent-Length: 2\r\n\r\n{}"
+
+    with patch.dict(helper["autoflow_update"].__globals__,
+                    acquire_lock=lambda *args: "token", _registered_document=read,
+                    _registered_docker=docker, _engine_exchange=exchange,
+                    _owned_history_runner_image_user=lambda *args: case["image_user"]), \
+         patch("subprocess.run", side_effect=AssertionError("external operation forbidden")):
+        result = helper["main"](["owned-history-runner-update" if case["runner"] else "autoflow-update", *args])
+    assert active.read_bytes() == before
+    assert helper["_canonical"](document) == before
+    assert actual == source_before
+    for request in requests:
+        assert request.startswith(
+            f"POST /v1.52/services/{args[5]}/update?version=71&registryAuthFrom=spec HTTP/1.1\r\n".encode()
+        )
+    return result, posted, secrets, polls
+
+
+def pin_owned_history_baseline(case):
+    # Match the existing shell snapshot format, including array order and no newline.
+    case["baseline"]["spec_digest"] = hashlib.sha256(json.dumps(
+        case["actual"]["Spec"], sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+
+
+@pytest.mark.parametrize("runner", [False, True])
+@pytest.mark.parametrize("action", ["forward", "rollback", "candidate_restore"])
+@pytest.mark.parametrize("user", ["", "10001:10002"])
+def test_owned_history_baseline_transition_and_target_retry(tmp_path, runner, action, user):
+    case = owned_history_transition_fixture(tmp_path, runner, action)
+    case["image_user"] = user
+    uid, gid = (user or "0:0").split(":")
+    case["actual"]["Spec"]["TaskTemplate"]["ContainerSpec"]["Secrets"][-1]["File"].update(UID=uid, GID=gid)
+    pin_owned_history_baseline(case)
+    result, posted, secrets, polls = run_owned_history_transition(case)
+    assert result == 0
+    assert len(posted) == 1 and len(polls) == 1
+    assert secrets == [case["reference"]["docker_secret_id"], case["old"]["SecretID"]]
+    container = posted[0]["TaskTemplate"]["ContainerSpec"]
+    assert container["Image"] == case["args"][6]
+    assert container["Secrets"][-1] == {
+        "SecretID": "ijnv9hl2y8whxz3zigrgcysly", "SecretName": "vp-control-redis-3729fcdc8ac5",
+        "File": {"Name": "owned-history-redis-url", "UID": uid, "GID": gid, "Mode": 256},
+    }
+    assert container["Env"].count("OWNED_HISTORY_REDIS_URL_FILE=/run/secrets/owned-history-redis-url") == 1
+    assert "KEEP=yes" in container["Env"] and posted[0]["Labels"] == {"keep": "yes"}
+    assert posted[0]["UpdateConfig"]["Order"] == case["args"][7]
+    assert posted[0]["TaskTemplate"]["Placement"]["Constraints"] == [
+        "node.labels.vp.runtime==true", "node.hostname==colima-127",
+    ]
+    # The first update no longer matches the immutable baseline. An exact target
+    # retry must still work, with no predecessor inspection or journal mutation.
+    case["actual"]["Spec"] = copy.deepcopy(posted[0])
+    assert hashlib.sha256(json.dumps(posted[0], sort_keys=True, separators=(",", ":")).encode()).hexdigest() != case["baseline"]["spec_digest"]
+    result, retried, secrets, polls = run_owned_history_transition(case)
+    assert result == 0 and retried == posted and len(polls) == 1
+    assert secrets == [case["reference"]["docker_secret_id"]]
+
+
+@pytest.mark.parametrize("runner", [False, True])
+def test_owned_history_mount_default_refuses_valid_different_secret(tmp_path, runner):
+    case = owned_history_transition_fixture(tmp_path, runner, "forward")
+    container = case["actual"]["Spec"]["TaskTemplate"]["ContainerSpec"]
+    before = copy.deepcopy(container)
+    with pytest.raises(case["helper"]["TransactionError"]):
+        case["helper"]["_mount_owned_history"](container, "", case["reference"])
+    assert container == before
+
+
+@pytest.mark.parametrize("runner", [False, True])
+@pytest.mark.parametrize("action", ["forward", "rollback", "candidate_restore"])
+@pytest.mark.parametrize("fault", [
+    "digest", "service_id", "baseline_service_id", "image", "spec_label", "spec_list_order",
+    "old_id_replaced", "old_name_replaced", "old_missing", "invalid_old_id", "invalid_old_name",
+    "wrong_target", "absolute_alias", "uid", "gid", "mode", "extra_file", "extra_secret",
+    "duplicate", "old_id_alias", "old_name_alias", "target_alias", "other_managed_alias",
+    "config_target", "config_absolute", "config_dotted", "bind_target", "bind_parent", "bind_dotted",
+    "secret_dotted", "wrong_env", "duplicate_env",
+    "duplicate_unrelated_env", "target_id_replaced", "target_name_replaced", "pin_changed",
+    "owner", "fd", "token", "revision", "initial_revision", "cas_conflict", "lost",
+    "convergence_drift", "paused",
+])
+def test_owned_history_baseline_transition_refuses_drift_and_conflicts(tmp_path, runner, action, fault):
+    case = owned_history_transition_fixture(tmp_path, runner, action)
+    actual, baseline = case["actual"], case["baseline"]
+    container = actual["Spec"]["TaskTemplate"]["ContainerSpec"]
+    old = container["Secrets"][-1]
+    if fault in {"wrong_target", "absolute_alias", "uid", "gid", "mode", "extra_file"}:
+        field, value = {
+            "wrong_target": ("Name", "other-target"), "absolute_alias": ("Name", "/run/secrets/owned-history-redis-url"),
+            "uid": ("UID", "1"), "gid": ("GID", "1"), "mode": ("Mode", 292), "extra_file": ("Extra", True),
+        }[fault]
+        old["File"][field] = value
+    elif fault == "extra_secret":
+        old["Extra"] = True
+    elif fault == "invalid_old_id":
+        old["SecretID"] = "not-an-id"
+    elif fault == "invalid_old_name":
+        old["SecretName"] = "operator-credential"
+    elif fault == "duplicate":
+        container["Secrets"].append(copy.deepcopy(old))
+    elif fault in {"old_id_alias", "old_name_alias", "target_alias", "other_managed_alias"}:
+        alias = copy.deepcopy(old)
+        alias["File"]["Name"] = "alias"
+        if fault == "old_id_alias":
+            alias["SecretName"] = "unrelated"
+        elif fault == "old_name_alias":
+            alias["SecretID"] = "z" * 25
+        elif fault == "target_alias":
+            alias.update(SecretID=case["reference"]["docker_secret_id"], SecretName=case["reference"]["secret_name"])
+        elif fault == "other_managed_alias":
+            alias.update(SecretID="z" * 25, SecretName="vp-control-redis-ffffffffffff")
+        container["Secrets"].append(alias)
+    elif fault.startswith("config_"):
+        name = {"config_target": "owned-history-redis-url", "config_absolute": "/run/secrets/owned-history-redis-url",
+                "config_dotted": "/run/secrets/./owned-history-redis-url"}[fault]
+        container["Configs"] = [{"ConfigID": "z" * 25, "File": {"Name": name}}]
+    elif fault.startswith("bind_"):
+        target = {"bind_parent": "/run/secrets", "bind_target": "/run/secrets/owned-history-redis-url",
+                  "bind_dotted": "/run/secrets/../secrets"}[fault]
+        container["Mounts"] = [{"Type": "bind", "Source": "/other", "Target": target}]
+    elif fault == "secret_dotted":
+        container["Secrets"].append({"SecretID": "z" * 25, "SecretName": "unrelated",
+                                     "File": {"Name": "/run/secrets/./owned-history-redis-url"}})
+    elif fault == "wrong_env":
+        container["Env"][-1] = "OWNED_HISTORY_REDIS_URL_FILE=/wrong"
+    elif fault in {"duplicate_env", "duplicate_unrelated_env"}:
+        container["Env"].append(container["Env"][-1] if fault == "duplicate_env" else "KEEP=other")
+    pin_owned_history_baseline(case)
+    if fault == "digest":
+        baseline["spec_digest"] = "d" * 64
+    elif fault == "service_id":
+        actual["ID"] = "z" * 25
+    elif fault == "baseline_service_id":
+        baseline["docker_service_id"] = "z" * 25
+    elif fault == "image":
+        # Even a matching digest cannot authorize a baseline image mismatch.
+        baseline["image"] = "vp-backend-api:deploy-ffffffffffff"
+    elif fault == "spec_label":
+        actual["Spec"]["Labels"]["drift"] = "yes"
+    elif fault == "spec_list_order":
+        container["Env"].reverse()
+    elif fault == "owner":
+        case["args"][2] = str(os.getppid() + 1)
+    elif fault == "fd":
+        case["args"][1] = "18"
+    elif fault == "token":
+        case["args"][3] = "not-the-owner-token"
+    elif fault == "initial_revision":
+        case["args"][4] = str(case["document"]["revision"] + 1)
+    result, posted, secrets, polls = run_owned_history_transition(case, fault)
+    attempted = fault in {"cas_conflict", "lost", "convergence_drift", "paused"}
+    assert result == (1 if attempted else 2)
+    assert len(posted) == int(attempted)
+    assert len(polls) == int(fault in {"convergence_drift", "paused"})
 
 
 @pytest.mark.parametrize("action", ["forward", "rollback"])

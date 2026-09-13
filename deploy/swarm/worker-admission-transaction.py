@@ -12,6 +12,7 @@ import http.client
 import io
 import json
 import os
+import posixpath
 import re
 import runpy
 import secrets
@@ -5012,7 +5013,70 @@ def _owned_history_secret(reference: dict, user: str) -> dict:
             "File": {"Name": "owned-history-redis-url", "UID": uid, "GID": gid, "Mode": 0o400}}
 
 
-def _mount_owned_history(container: dict, image_user: str, reference: dict) -> None:
+def _owned_history_predecessor(
+    actual: dict, baseline: dict, image_user: str, reference: dict,
+) -> dict | None:
+    """Attest the immutable service baseline before authorizing one prior mount."""
+    container = actual["Spec"]["TaskTemplate"]["ContainerSpec"]
+    expected = _owned_history_secret(reference, container.get("User") or image_user)
+    target = expected["File"]["Name"]
+    secrets = container.get("Secrets") or []
+    related = [entry for entry in secrets if (
+        entry.get("File", {}).get("Name") in {target, "/run/secrets/" + target}
+        or entry.get("SecretName", "").startswith("vp-control-redis-")
+        or entry.get("SecretID") == expected["SecretID"]
+        or entry.get("SecretName") == expected["SecretName"]
+    )]
+    if related in ([], [expected]):
+        return None
+    if len(related) != 1:
+        raise TransactionError
+    prior = _require_exact_fields(related[0], {"SecretID", "SecretName", "File"})
+    _require_string(prior["SecretID"], r"[a-z0-9]{25}")
+    _require_string(prior["SecretName"], r"vp-control-redis-[0-9a-f]{12}")
+    if (
+        prior["File"] != expected["File"]
+        or prior["SecretID"] == expected["SecretID"]
+        or prior["SecretName"] == expected["SecretName"]
+        or [entry for entry in secrets if (
+            entry.get("SecretID") == prior["SecretID"]
+            or entry.get("SecretName") == prior["SecretName"]
+        )] != [prior]
+    ):
+        raise TransactionError
+    # Match vp_app_service_spec_digest exactly: sorted keys, ordered lists, no newline.
+    digest = hashlib.sha256(json.dumps(
+        actual["Spec"], sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    if (
+        baseline["existed"] is not True
+        or actual["ID"] != baseline["docker_service_id"]
+        or actual["Spec"]["Name"] != baseline["name"]
+        or container["Image"] != baseline["image"]
+        or digest != baseline["spec_digest"]
+    ):
+        raise TransactionError
+    path = "/run/secrets/" + target
+    for entry in [*secrets, *container.get("Configs", [])]:
+        name = entry.get("File", {}).get("Name", "")
+        file_path = posixpath.normpath("/" + posixpath.join("/run/secrets", name).lstrip("/"))
+        if entry is not prior and file_path == path:
+            raise TransactionError
+    for mount in container.get("Mounts", []):
+        mount_path = posixpath.normpath("/" + mount.get("Target", "").lstrip("/"))
+        if path == mount_path or path.startswith(mount_path.rstrip("/") + "/"):
+            raise TransactionError
+    actual_secret = _registered_docker([
+        "secret", "inspect", prior["SecretID"], "--format", "{{.ID}}|{{.Spec.Name}}",
+    ], timeout=5)
+    if actual_secret != prior["SecretID"] + "|" + prior["SecretName"]:
+        raise TransactionError
+    return copy.deepcopy(prior)
+
+
+def _mount_owned_history(
+    container: dict, image_user: str, reference: dict, *, predecessor: dict | None = None,
+) -> None:
     expected = _owned_history_secret(reference, container.get("User") or image_user)
     target = expected["File"]["Name"]
     path = "/run/secrets/" + target
@@ -5024,7 +5088,9 @@ def _mount_owned_history(container: dict, image_user: str, reference: dict) -> N
     mounted = [entry for entry in secrets if entry.get("File", {}).get("Name") in {target, path}]
     if len(keys) != len(set(keys)) or configured not in ([], [env_key + "=" + path]):
         raise TransactionError
-    if mounted not in ([], [expected]):
+    if mounted not in ([], [expected]) and (
+        predecessor is None or mounted != [predecessor] or predecessor["File"] != expected["File"]
+    ):
         raise TransactionError
     if any(entry.get("File", {}).get("Name") in {target, path} for entry in container.get("Configs", [])):
         raise TransactionError
@@ -5038,7 +5104,7 @@ def _mount_owned_history(container: dict, image_user: str, reference: dict) -> N
 
 def _owned_history_runner_update_spec(
     actual: dict, service_id: str, image: str, order: str,
-    image_user: str, runtime_node: str, reference: dict,
+    image_user: str, runtime_node: str, reference: dict, *, predecessor: dict | None = None,
 ) -> dict:
     try:
         _require_string(service_id, r"[a-z0-9]{25}")
@@ -5048,7 +5114,7 @@ def _owned_history_runner_update_spec(
             raise TransactionError
         spec = copy.deepcopy(actual["Spec"])
         container = spec["TaskTemplate"]["ContainerSpec"]
-        _mount_owned_history(container, image_user, reference)
+        _mount_owned_history(container, image_user, reference, predecessor=predecessor)
         container["Image"] = image
         overrides = {"CHANNELOPS_DISCOVERY_TIMEOUT_SECONDS", "CHANNELOPS_RUNNER_ID"}
         container["Env"] = [entry for entry in container["Env"] if entry.split("=", 1)[0] not in overrides] + [
@@ -5102,6 +5168,7 @@ def _owned_history_runner_image_user(image: str, runtime_node: str) -> str:
 def _autoflow_update_spec(
     actual: dict, service_id: str, image: str, order: str, identity: str,
     image_user: str, health: str, runtime_node: str, *, owned_history: dict | None = None,
+    predecessor: dict | None = None,
 ) -> dict:
     try:
         name, secret_id, generation = identity.split("|")
@@ -5141,7 +5208,7 @@ def _autoflow_update_spec(
             "File": {"Name": target, "UID": uid, "GID": gid, "Mode": 0o400},
         }]
         if owned_history is not None:
-            _mount_owned_history(container, image_user, owned_history)
+            _mount_owned_history(container, image_user, owned_history, predecessor=predecessor)
         container["Image"] = image
         container.setdefault("Healthcheck", {}).update(
             Test=["CMD-SHELL", health], Interval=10_000_000_000,
@@ -5223,13 +5290,16 @@ def autoflow_update(arguments: list[str], *, owned_history_runner: bool = False)
             raise TransactionError
         image_user = (_owned_history_runner_image_user(image, node) if owned_history_runner else
                       _registered_docker(["image", "inspect", image, "--format", "{{.Config.User}}"], timeout=5))
+        predecessor = (_owned_history_predecessor(actual, baseline[0], image_user, owned_history)
+                       if owned_history is not None else None)
         if owned_history_runner:
             if owned_history is None:
                 raise TransactionError
-            spec = _owned_history_runner_update_spec(actual, service_id, image, order, image_user, node, owned_history)
+            spec = _owned_history_runner_update_spec(actual, service_id, image, order, image_user, node, owned_history,
+                                                     predecessor=predecessor)
         else:
             spec = _autoflow_update_spec(actual, service_id, image, order, identity, image_user, health, node,
-                                        owned_history=owned_history)
+                                        owned_history=owned_history, predecessor=predecessor)
         if locked_document() != document:
             raise TransactionError
         attempted = True
