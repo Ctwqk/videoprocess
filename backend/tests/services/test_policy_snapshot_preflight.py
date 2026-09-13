@@ -46,7 +46,7 @@ def database():
             candidate_set_hash TEXT, feature_as_of TEXT, candidates_scored INTEGER);
         CREATE TABLE candidate_feature_snapshots (
             id TEXT, tick_audit_id TEXT, policy_version_id TEXT, candidate_id TEXT,
-            candidate_source TEXT, topic_lane_id TEXT, lane_format_id TEXT,
+            candidate_source TEXT, source_kind TEXT, topic_lane_id TEXT, lane_format_id TEXT,
             target_account_id TEXT, feature_schema_version TEXT, feature_as_of TEXT,
             candidate_set_hash TEXT, feature_hash TEXT, raw_features_json TEXT);
         CREATE TABLE decision_audit_entries (
@@ -62,8 +62,8 @@ def database():
                (POLICY, "channelops-candidate-v1", HASH, "sha256:" + HASH))
     db.execute("INSERT INTO agent_tick_audits VALUES (?, ?, ?, ?, ?, ?, ?)",
                (TICK, CHANNEL, "snapshot_complete", POLICY, HASH, AS_OF, 1))
-    db.execute("INSERT INTO candidate_feature_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               (FEATURE, TICK, POLICY, "candidate-one", "idea", None, None, None,
+    db.execute("INSERT INTO candidate_feature_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+               (FEATURE, TICK, POLICY, "candidate-one", "idea", "idea", None, None, None,
                 "channelops-candidate-v1", AS_OF, HASH, "b" * 64, SECRET))
     db.execute("INSERT INTO decision_audit_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                (DECISION, TICK, CHANNEL, POLICY, FEATURE, "candidate-one", "idea",
@@ -130,6 +130,45 @@ async def test_complete_queries_are_read_only_and_do_not_read_raw_payloads(prefl
     assert SECRET not in encoded and "candidate-one" not in encoded
 
 
+@pytest.mark.parametrize("selected", [True, False])
+@pytest.mark.asyncio
+async def test_trend_policy_manual_seed_source_kind_is_complete(preflight, database, selected):
+    database.execute("UPDATE candidate_feature_snapshots "
+                     "SET candidate_source='manual_seed', source_kind='trend_youtube'")
+    database.execute("UPDATE decision_audit_entries "
+                     "SET candidate_source='trend_youtube', decision=?, selected=?",
+                     ("accepted" if selected else "rejected", selected))
+    changes_before = database.total_changes
+
+    report = await audit(preflight, database)
+
+    assert report["ok"] is True
+    assert report["ticks"]["actually_complete"] == 1
+    assert report["ticks"]["partial"] == 0
+    assert report["ticks"]["coverage"] == 1.0
+    assert report["tick_evidence"][0]["complete"] is True
+    assert database.total_changes == changes_before
+    assert SECRET not in json.dumps(report)
+
+
+@pytest.mark.parametrize("decision_source", ["manual_seed", "lane_seed"])
+@pytest.mark.asyncio
+async def test_mismatched_source_kind_is_partial_even_when_origin_matches(
+    preflight, database, decision_source,
+):
+    database.execute("UPDATE candidate_feature_snapshots "
+                     "SET candidate_source='manual_seed', source_kind='trend_youtube'")
+    database.execute("UPDATE decision_audit_entries SET candidate_source=?", (decision_source,))
+
+    report = await audit(preflight, database)
+
+    assert report["ok"] is False
+    assert report["ticks"]["actually_complete"] == 0
+    assert report["ticks"]["partial"] == 1
+    assert report["tick_evidence"][0]["complete"] is False
+    assert report["errors"] == ["partial_new_ticks"]
+
+
 @pytest.mark.asyncio
 async def test_counts_separate_legacy_pending_labels_and_actual_completeness(preflight, database):
     database.execute("INSERT INTO agent_tick_audits VALUES (?, ?, ?, NULL, NULL, NULL, 7)",
@@ -189,7 +228,7 @@ async def test_empty_candidate_complete_tick_is_valid(preflight, database):
     ("candidate_feature_snapshots", "policy_version_id", OTHER),
     ("candidate_feature_snapshots", "candidate_id", "wrong-candidate"),
     ("candidate_feature_snapshots", "candidate_id", " "),
-    ("candidate_feature_snapshots", "candidate_source", "wrong-source"),
+    ("candidate_feature_snapshots", "source_kind", "wrong-source"),
     ("candidate_feature_snapshots", "topic_lane_id", OTHER),
     ("candidate_feature_snapshots", "lane_format_id", OTHER),
     ("candidate_feature_snapshots", "target_account_id", OTHER),
@@ -228,7 +267,7 @@ async def test_malformed_new_tick_is_partial(preflight, database, table, field, 
     "INSERT INTO decision_audit_entries SELECT * FROM decision_audit_entries",
     "INSERT INTO candidate_feature_snapshots SELECT * FROM candidate_feature_snapshots",
     "INSERT INTO candidate_feature_snapshots SELECT 'extra', tick_audit_id, policy_version_id, "
-    "candidate_id, candidate_source, topic_lane_id, lane_format_id, target_account_id, "
+    "candidate_id, candidate_source, source_kind, topic_lane_id, lane_format_id, target_account_id, "
     "feature_schema_version, feature_as_of, candidate_set_hash, feature_hash, raw_features_json "
     "FROM candidate_feature_snapshots",
 ])
@@ -244,7 +283,7 @@ async def test_missing_extra_or_duplicate_rows_fail(preflight, database, mutatio
 async def test_duplicate_linkage_cannot_hide_behind_equal_cardinality(preflight, database):
     database.execute("UPDATE agent_tick_audits SET candidates_scored=2")
     database.execute("INSERT INTO candidate_feature_snapshots SELECT ?, tick_audit_id, policy_version_id, "
-                     "'candidate-two', candidate_source, topic_lane_id, lane_format_id, target_account_id, "
+                     "'candidate-two', candidate_source, source_kind, topic_lane_id, lane_format_id, target_account_id, "
                      "feature_schema_version, feature_as_of, candidate_set_hash, feature_hash, raw_features_json "
                      "FROM candidate_feature_snapshots", (OTHER,))
     database.execute("INSERT INTO decision_audit_entries SELECT ?, tick_audit_id, channel_profile_id, "
@@ -292,7 +331,7 @@ async def test_legacy_reverse_link_marks_only_affected_new_tick_partial(
 async def test_accepted_and_rejected_candidates_are_both_required(preflight, database):
     database.execute("UPDATE agent_tick_audits SET candidates_scored=2")
     database.execute("INSERT INTO candidate_feature_snapshots SELECT ?, tick_audit_id, policy_version_id, "
-                     "'candidate-two', candidate_source, topic_lane_id, lane_format_id, target_account_id, "
+                     "'candidate-two', candidate_source, source_kind, topic_lane_id, lane_format_id, target_account_id, "
                      "feature_schema_version, feature_as_of, candidate_set_hash, feature_hash, raw_features_json "
                      "FROM candidate_feature_snapshots", (OTHER,))
     database.execute("INSERT INTO decision_audit_entries SELECT ?, tick_audit_id, channel_profile_id, "

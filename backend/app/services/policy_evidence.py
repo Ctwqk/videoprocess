@@ -142,7 +142,7 @@ async def get_decision_explanation(db: AsyncSession, tick_audit_id: UUID) -> Tic
             inconsistent |= (
                 snapshot is None
                 or snapshot.candidate_id != decision.candidate_id
-                or snapshot.candidate_source != decision.candidate_source
+                or snapshot.source_kind != decision.candidate_source
                 or snapshot.policy_version_id != decision.policy_version_id
             )
     if inconsistent:

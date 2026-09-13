@@ -375,6 +375,62 @@ func TestPolicySnapshotsPostgresAtomicMatrix(t *testing.T) {
 			}
 		})
 	}
+	t.Run("trend-policy-manual-seed", func(t *testing.T) {
+		f := NewChannelOpsFixture(t)
+		ctx := context.Background()
+		defer f.Close(ctx)
+		f.InsertChannelWithLaneAccountSeed(ctx)
+		seedID := testUUID(t, "trend-policy-manual-seed")
+		if _, err := f.Store.Pool.Exec(ctx, `
+   INSERT INTO manual_seeds (
+    id,channel_profile_id,topic_lane_id,target_account_id,prompt,title_seed,
+    source_policy,source_platforms_json,material_library_ids_json,constraints_json,status)
+   VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,'Trend-policy manual seed','Trend seed',
+    'trend_youtube','["youtube"]'::json,'[]'::json,'{}'::json,'active')`,
+			seedID, f.ChannelID, f.LaneID, f.AccountID); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := f.Store.Pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		s := f.Store.withExecutionDB(tx, &f.ChannelID)
+		p, err := s.prepareTick(ctx, f.ChannelID, "snapshot-matrix-source-kind", agentTickOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p.Candidates) != 1 {
+			t.Fatalf("prepared candidates=%d, want one real manual seed", len(p.Candidates))
+		}
+		candidate := p.Candidates[0]
+		if candidate.Seed == nil || candidate.Seed.ID != seedID || candidate.Source != "manual_seed" || candidate.SourceKind != "trend_youtube" || candidate.Rejected || candidate.ManualMaterialOverride {
+			t.Fatalf("trend-policy manual seed semantics changed: %+v", candidate)
+		}
+		if err := s.finalizeTick(ctx, p, p.Candidates, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		assertPGSnapshotFacts(t, f.Store, f.ChannelID, 1, 1)
+		var source, sourceKind, decisionSource, storedSeedID, decision string
+		var selected bool
+		if err := f.Store.Pool.QueryRow(ctx, `
+   SELECT f.candidate_source,f.source_kind,d.candidate_source,
+    f.source_record_refs_json->>'manual_seed_id',d.decision,d.selected
+   FROM candidate_feature_snapshots f
+   JOIN agent_tick_audits a ON a.id=f.tick_audit_id
+   JOIN decision_audit_entries d ON d.feature_snapshot_id=f.id
+   WHERE a.channel_profile_id=$1::uuid AND f.candidate_id=$2`, f.ChannelID, candidate.CandidateID).
+			Scan(&source, &sourceKind, &decisionSource, &storedSeedID, &decision, &selected); err != nil {
+			t.Fatal(err)
+		}
+		if source != "manual_seed" || sourceKind != "trend_youtube" || decisionSource != "trend_youtube" || storedSeedID != seedID || decision != "accepted" || !selected {
+			t.Fatalf("stored source=%q kind=%q decision_source=%q seed=%q decision=%q selected=%t",
+				source, sourceKind, decisionSource, storedSeedID, decision, selected)
+		}
+	})
 }
 
 func assertPGSnapshotFacts(t *testing.T, s *Store, channelID string, wantCandidates, wantTasks int) {

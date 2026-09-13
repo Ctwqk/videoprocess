@@ -24,7 +24,7 @@ TICKS_SQL = """SELECT id, channel_profile_id, replay_status, policy_version_id,
 POLICIES_SQL = """SELECT id, feature_schema_version, config_hash, version
     FROM decision_policy_versions"""
 FEATURES_SQL = """SELECT id, tick_audit_id, policy_version_id, candidate_id,
-    candidate_source, topic_lane_id, lane_format_id, target_account_id,
+    candidate_source, source_kind, topic_lane_id, lane_format_id, target_account_id,
     feature_schema_version, feature_as_of, candidate_set_hash, feature_hash
     FROM candidate_feature_snapshots"""
 DECISIONS_SQL = """SELECT id, tick_audit_id, channel_profile_id, policy_version_id,
@@ -105,8 +105,9 @@ def tick_is_complete(tick, policies, features, decisions, decisions_by_snapshot)
             and stored_hash(decision["decision_hash"])
             and decision["decision"] in {"accepted", "rejected"}
             and decision["selected"] == (decision["decision"] == "accepted")
+            and decision["candidate_source"] == feature["source_kind"]
             and all(decision[key] == feature[key] for key in (
-                "candidate_id", "candidate_source", "topic_lane_id",
+                "candidate_id", "topic_lane_id",
                 "lane_format_id", "target_account_id",
             ))
         ):

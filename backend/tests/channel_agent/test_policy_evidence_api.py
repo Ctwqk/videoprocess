@@ -99,7 +99,7 @@ async def activation(session, owner, version, *, number=1, mode="shadow",
 
 async def candidate(session, audit, version, *, name="accepted", selected=True):
     snapshot = CandidateFeatureSnapshot(
-        tick_audit_id=audit.id, candidate_id=name, candidate_source="manual_seed", source_kind="owned",
+        tick_audit_id=audit.id, candidate_id=name, candidate_source="manual_seed", source_kind="manual_seed",
         policy_version_id=version.id, feature_schema_version="channelops-candidate-v1", feature_as_of=NOW,
         raw_features_json={"freshness": 0.25}, normalized_features_json=None,
         missing_feature_mask_json={"reward": True}, source_record_refs_json={"seed_id": "stored-seed"},
@@ -338,6 +338,47 @@ async def test_complete_explanation_returns_all_stored_candidates_and_nullable_f
     for field in ("baseline_score", "final_score", "rank", "shadow_score", "shadow_rank",
                   "shadow_selected", "experiment_id"):
         assert row[field] is None
+
+
+@pytest.mark.parametrize("selected", [True, False])
+async def test_explanation_accepts_trend_policy_manual_seed_source_kind(session, client, selected):
+    owner = await channel(session)
+    version = await policy(session)
+    audit = await tick(session, owner, version)
+    snapshot, decision = await candidate(session, audit, version, selected=selected)
+    snapshot.source_kind = "trend_youtube"
+    decision.candidate_source = "trend_youtube"
+    await session.flush()
+
+    response = await client.get(f"{PREFIX}/ticks/{audit.id}/decision-explanation")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["snapshots"]) == len(body["decisions"]) == 1
+    assert body["snapshots"][0]["candidate_source"] == "manual_seed"
+    assert body["snapshots"][0]["source_kind"] == "trend_youtube"
+    assert body["decisions"][0]["candidate_source"] == "trend_youtube"
+    assert body["decisions"][0]["feature_snapshot_id"] == str(snapshot.id)
+    assert body["decisions"][0]["selected"] is selected
+    assert body["decisions"][0]["decision"] == ("accepted" if selected else "rejected")
+
+
+@pytest.mark.parametrize("decision_source", ["manual_seed", "lane_seed"])
+async def test_explanation_denies_mismatched_source_kind_even_when_origin_matches(
+    session, client, decision_source,
+):
+    owner = await channel(session)
+    version = await policy(session)
+    audit = await tick(session, owner, version)
+    snapshot, decision = await candidate(session, audit, version)
+    snapshot.source_kind = "trend_youtube"
+    decision.candidate_source = decision_source
+    await session.flush()
+
+    response = await client.get(f"{PREFIX}/ticks/{audit.id}/decision-explanation")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Inconsistent policy evidence links"}
 
 
 @pytest.mark.parametrize("state", ["legacy_unreplayable", "snapshot_pending", "snapshot_complete"])
