@@ -5057,11 +5057,13 @@ def _owned_history_predecessor(
     ):
         raise TransactionError
     path = "/run/secrets/" + target
-    for entry in [*secrets, *container.get("Configs", [])]:
-        name = entry.get("File", {}).get("Name", "")
-        file_path = posixpath.normpath("/" + posixpath.join("/run/secrets", name).lstrip("/"))
-        if entry is not prior and file_path == path:
-            raise TransactionError
+    # Linux relative Config targets start at /, unlike Secret targets.
+    for base, entries in (("/run/secrets", secrets), ("/", container.get("Configs", []))):
+        for entry in entries:
+            name = entry.get("File", {}).get("Name", "")
+            file_path = posixpath.normpath("/" + posixpath.join(base, name).lstrip("/"))
+            if entry is not prior and file_path == path:
+                raise TransactionError
     for mount in container.get("Mounts", []):
         mount_path = posixpath.normpath("/" + mount.get("Target", "").lstrip("/"))
         if path == mount_path or path.startswith(mount_path.rstrip("/") + "/"):

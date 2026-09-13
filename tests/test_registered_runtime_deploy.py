@@ -1059,6 +1059,43 @@ def test_owned_history_baseline_transition_refuses_drift_and_conflicts(tmp_path,
     assert len(polls) == int(fault in {"convergence_drift", "paused"})
 
 
+@pytest.mark.parametrize("runner", [False, True])
+@pytest.mark.parametrize("action", ["forward", "rollback", "candidate_restore"])
+@pytest.mark.parametrize("resource,name,denied", [
+    ("Config", "run/secrets/owned-history-redis-url", True),
+    ("Config", "./run/secrets/owned-history-redis-url", True),
+    ("Config", "run/secrets/../secrets/owned-history-redis-url", True),
+    ("Config", "run//secrets//owned-history-redis-url", True),
+    ("Config", "/run/secrets/owned-history-redis-url", True),
+    ("Config", "/run/secrets/../secrets/owned-history-redis-url", True),
+    ("Config", "//run//secrets//owned-history-redis-url", True),
+    ("Secret", "./owned-history-redis-url", True),
+    ("Secret", "child/../owned-history-redis-url", True),
+    ("Secret", ".//owned-history-redis-url", True),
+    ("Secret", "/run/secrets/../secrets/owned-history-redis-url", True),
+    ("Secret", "//run//secrets//owned-history-redis-url", True),
+    ("Config", "./owned-history-redis-url", False),
+    ("Config", "child/../owned-history-redis-url", False),
+    ("Secret", "run/secrets/owned-history-redis-url", False),
+    ("Secret", "./run//secrets/owned-history-redis-url", False),
+])
+def test_owned_history_predecessor_resolves_config_and_secret_targets(
+    tmp_path, runner, action, resource, name, denied,
+):
+    case = owned_history_transition_fixture(tmp_path, runner, action)
+    container = case["actual"]["Spec"]["TaskTemplate"]["ContainerSpec"]
+    entry = {resource + "ID": "z" * 25, resource + "Name": "unrelated",
+             "File": {"Name": name, "UID": "0", "GID": "0", "Mode": 256}}
+    container.setdefault(resource + "s", []).append(copy.deepcopy(entry))
+    pin_owned_history_baseline(case)
+    result, posted, secrets, polls = run_owned_history_transition(case)
+    assert result == (2 if denied else 0)
+    assert len(posted) == (0 if denied else 1)
+    assert len(polls) == (0 if denied else 1)
+    if posted:
+        assert entry in posted[0]["TaskTemplate"]["ContainerSpec"][resource + "s"]
+
+
 @pytest.mark.parametrize("action", ["forward", "rollback"])
 @pytest.mark.parametrize("user", [None, "", "10001:10001"])
 @pytest.mark.parametrize("fault", ["none", "timeout", "command_failed", "wrong_tag", "wrong_node",
