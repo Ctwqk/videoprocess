@@ -119,3 +119,33 @@ def test_runtime_decodes_repeated_shared_grant_with_exact_row_count():
     corrupt_row["grant_facts"] = json.dumps(grant_facts)
     with pytest.raises(runtime.ReconcileRuntimeError):
         runtime.decode_guard(corrupted, pins)
+
+
+@pytest.mark.parametrize("occurrence", [0, 1])
+@pytest.mark.parametrize("fault", ["generation_float", "generation_bool", "nested_database_bool", "nested_database_float"])
+def test_runtime_rejects_type_aliases_in_either_shared_grant_occurrence(occurrence, fault):
+    payload = restart_document()
+    if fault == "generation_bool":
+        worker = payload["workers"][0]
+        worker["current"]["generation"] = 2
+        worker["predecessor"]["generation"] = 1
+        worker["ancestors"] = worker["ancestors"][:1]
+        worker["ancestors"][0]["generation"] = 1
+    pins = decode(payload)
+    rows = history_rows(payload)
+    assert runtime.decode_guard(rows, pins).registrations
+    shared = [row for row in rows if row["grant_id"] == pins.workers[0].predecessor.grant_id]
+    assert len(shared) == 2
+    row = shared[occurrence]
+    facts = json.loads(row["grant_facts"])
+    if fault == "generation_float":
+        facts["generation"] = float(facts["generation"])
+    elif fault == "generation_bool":
+        facts["generation"] = True
+    elif fault == "nested_database_bool":
+        facts["endpoint_bindings_json"]["redis"]["database"] = False
+    else:
+        facts["endpoint_bindings_json"]["redis"]["database"] = 0.0
+    row["grant_facts"] = json.dumps(facts)
+    with pytest.raises(runtime.ReconcileRuntimeError):
+        runtime.decode_guard(rows, pins)

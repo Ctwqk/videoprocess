@@ -495,6 +495,23 @@ def _revoked(value: WorkerRegistration | WorkerAdmissionGrant, now: datetime) ->
     )
 
 
+def _same_fact_value(actual: object, expected: object) -> bool:
+    if isinstance(expected, Mapping):
+        if type(actual) is not type(expected) or not isinstance(actual, Mapping):
+            return False
+        if {(type(key), key) for key in actual} != {(type(key), key) for key in expected}:
+            return False
+        return all(_same_fact_value(actual[key], value) for key, value in expected.items())
+    if isinstance(expected, (list, tuple)):
+        return (
+            type(actual) is type(expected)
+            and isinstance(actual, (list, tuple))
+            and len(actual) == len(expected)
+            and all(_same_fact_value(left, right) for left, right in zip(actual, expected, strict=True))
+        )
+    return _same(actual, expected)
+
+
 def collapse_grant_facts(
     pins: PinDocument, grants: Sequence[WorkerAdmissionGrant]
 ) -> list[WorkerAdmissionGrant]:
@@ -507,7 +524,7 @@ def collapse_grant_facts(
     for row in grants:
         if row.id in by_id:
             _require(
-                all(getattr(row, column.key) == getattr(by_id[row.id], column.key)
+                all(_same_fact_value(getattr(row, column.key), getattr(by_id[row.id], column.key))
                     for column in WorkerAdmissionGrant.__table__.columns),
                 "database_duplicate_facts",
             )
