@@ -14568,6 +14568,41 @@ vp_validate_app_snapshot_identities() {
   done < <(printf '%s\n' "$snapshots")
 }
 
+vp_worker_admission_rollback_worker_mode() {
+  local service="$1" image="$2"
+  VP_WORKER_ADMISSION_ROLLBACK_WORKER_MODE=""
+  vp_worker_admission_lock_assert || return 1
+  local expected
+  expected="$(vp_worker_admission_recovery_state | python3 -I -c '
+import json
+import sys
+try:
+    state = json.load(sys.stdin)
+    service, image = sys.argv[1:]
+    workers = [worker for worker in state["rollback"]["workers"] if worker["service"] == service]
+    if (state["phase"] != "ROLLBACK_APPLYING" or state["operation"] is not None
+        or len(workers) != 1 or workers[0]["image"] != image):
+        raise ValueError
+    worker = workers[0]
+    if worker["applied_stage"] == "prepared":
+        print("apply")
+    elif worker["applied_stage"] in {"applied", "verified"}:
+        print(worker["docker_service_id"] + "|" + worker["target_spec_digest"])
+    else:
+        raise ValueError
+except (KeyError, TypeError, ValueError):
+    raise SystemExit(1)
+' "$service" "$image")" || return 1
+  if [[ "$expected" == apply ]]; then
+    VP_WORKER_ADMISSION_ROLLBACK_WORKER_MODE=apply
+    return
+  fi
+  local actual
+  actual="$(vp_worker_admission_live_worker_identity "$service" "$image")" || return 1
+  [[ "$actual" == "$expected" ]] || return 1
+  VP_WORKER_ADMISSION_ROLLBACK_WORKER_MODE=reuse
+}
+
 vp_restore_app_snapshots() {
   local snapshots="$1"
   local attempted_services="${2-$VP_APP_SERVICES}"
@@ -14615,7 +14650,20 @@ vp_restore_app_snapshots() {
     fi
 
     local restored=true
-    if [[ "$service" == "vp-ffmpeg-worker-go-swarm" ]]; then
+    local rollback_worker_mode=apply
+    if [[ "$registered_worker" == true && "$worker_admission_rollback" == true ]]; then
+      vp_worker_admission_rollback_worker_mode "$service" "$image" || return 1
+      rollback_worker_mode="$VP_WORKER_ADMISSION_ROLLBACK_WORKER_MODE"
+    fi
+    # CLI updates can reorder Env/Secrets or add defaults, changing the pinned
+    # full-spec digest even when no deployment change is required.
+    if [[ "$rollback_worker_mode" == reuse ]]; then
+      case "$service" in
+        "$VP_PYTHON_WORKER_SERVICE") gpu_was_present=true ;;
+        "$VP_VISION_WORKER_SERVICE") vision_was_present=true ;;
+        "$VP_PUBLISHER_SERVICE") publisher_was_present=true ;;
+      esac
+    elif [[ "$service" == "vp-ffmpeg-worker-go-swarm" ]]; then
       if ! vp_update_runtime_service \
         "$service" "$image" stop-first "$service_id"; then
         status=1

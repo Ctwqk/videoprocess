@@ -676,6 +676,35 @@ vp_worker_admission_prepare_rollback_service vp-ffmpeg-worker-go-swarm \
 ''')
         self.assertEqual(result.stdout, "prepare\n")
 
+    def test_applied_rollback_checks_health_without_rewriting_pinned_service(self):
+        self.prepare_rollback_reentry()
+        self.state["phase"] = "ROLLBACK_APPLYING"
+        self.worker.update(applied_stage="applied", docker_service_id="d" * 24,
+                           target_spec_digest="e" * 64)
+        self.state["rollback"]["workers"] = [self.worker]
+        self.write_state()
+        body = r'''
+log() { :; }
+vp_validate_app_snapshot_identities() { :; }
+vp_worker_admission_select_candidate() { :; }
+vp_require_worker_redis_marker_status() { :; }
+vp_activate_worker_admission() { printf 'activate\n'; }
+vp_worker_admission_live_worker_identity() {
+  printf 'dddddddddddddddddddddddd|eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n'
+}
+vp_update_runtime_service() { echo unexpected_service_rewrite >&2; return 1; }
+vp_require_worker_deployment_ready() { printf 'ready\n'; }
+vp_worker_admission_advance_live_worker_stage() { printf 'stage|%s\n' "$4"; }
+vp_restore_app_snapshots \
+  'vp-ffmpeg-worker-go-swarm|dddddddddddddddddddddddd|vp-ffmpeg-worker-go:deploy-fab36e3a818b|eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' \
+  vp-ffmpeg-worker-go-swarm true
+'''
+        self.assertEqual(self.shell(body).stdout, "activate\nstage|applied\nready\nstage|verified\n")
+        # A changed service is never accepted merely because it reports ready.
+        result = self.shell(body.replace("printf 'dddd", "printf 'ffff"), success=False)
+        self.assertNotIn("ready\n", result.stdout)
+        self.assertNotIn("unexpected_service_rewrite", result.stderr)
+
     def test_marker_selection_cannot_replace_a_recorded_secret_identity(self):
         self.record(marker_secret())
         before = self.active.read_bytes()

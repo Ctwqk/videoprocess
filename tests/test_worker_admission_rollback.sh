@@ -3172,22 +3172,13 @@ for service in $attempted_services; do
       ;;
   esac
   assert_order "activate|$service|$generation|$old_commit" \
-    "restore|$service|$image"
-  assert_order "restore|$service|$image" "ready|$service|$generation"
+    "ready|$service|$generation"
   grep -Eq \
     "^prepare\\|$service\\|$old_commit\\|$generation\\|rollback-[^|]+\\|vp-ffmpeg-worker-python:deploy-$old_short$" \
     "$CALLS"
 done
-if ! grep -Fxq \
-    "restore|$VP_PYTHON_WORKER_SERVICE|vp-ffmpeg-worker-python:deploy-$old_short|bbbbbbbbbbbbbbbbbbbbbbbb" \
-    "$CALLS" \
-  || ! grep -Fxq \
-    "restore|$VP_VISION_WORKER_SERVICE|vp-ffmpeg-worker-python:deploy-$old_short|cccccccccccccccccccccccc" \
-    "$CALLS" \
-  || ! grep -Fxq \
-    "restore|$VP_PUBLISHER_SERVICE|vp-ffmpeg-worker-python:deploy-$old_short|dddddddddddddddddddddddd" \
-    "$CALLS"; then
-  echo 'FAIL: rollback restore did not carry baseline service IDs to worker helpers' >&2
+if grep -q '^restore|' "$CALLS"; then
+  echo 'FAIL: rollback replay rewrote an already-applied worker spec' >&2
   exit 1
 fi
 rollback_control_manifest="$ROOT/state/vp-worker-admission/control-current.conf"
