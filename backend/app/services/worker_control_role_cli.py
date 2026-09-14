@@ -65,6 +65,7 @@ ROLE_FUNCTIONS = {
         "vp_worker_registration_revoke(text,uuid,text)",
         "vp_worker_registration_expire(text,uuid)",
         "vp_registered_consumer_reconcile_guard(text,uuid[],uuid[])",
+        "vp_registered_consumer_reconcile_history_guard(text,uuid[],uuid[])",
     ),
     "orchestrator": (
         "vp_release_registered_retry_claim(uuid)",

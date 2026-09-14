@@ -1,4 +1,4 @@
-"""Parent-only Redis >=7.2 qualification; two natural 120.1s aging phases.
+"""Parent-only Redis >=7.2 qualification; three natural 120.1s aging phases.
 
 REGISTERED_RECONCILE_DISPOSABLE_REDIS_URL must name loopback/nondefault port/DB15;
 REGISTERED_RECONCILE_DISPOSABLE_REDIS_CONFIRM must be the literal
@@ -22,6 +22,11 @@ from redis.exceptions import ResponseError
 
 from app.services import registered_consumer_reconcile as pure
 from app.services import registered_consumer_reconcile_runtime as runtime
+from tests.services.registered_consumer_history_fixtures import (
+    history_assess,
+    history_document,
+    history_facts,
+)
 from tests.services.test_registered_consumer_reconcile import (
     NOW,
     assess,
@@ -430,3 +435,133 @@ async def test_real_redis_runtime_partial_failure_no_retry_or_replay(
                 replace(request, replay_only=True), authority
             )
         assert calls == [command.stream for command in case.commands[:2]]
+
+
+@pytest.mark.asyncio
+async def test_actual_history_lua_complete_inventory_bounds_and_absence(redis_case):
+    """Direct Lua qualification, not permission to replay an owned attempt."""
+    payload = history_document()
+    payload["workers"][0] = history_document(64)["workers"][0]
+    pins = decode(payload)
+    commands = history_assess(payload).commands
+    async with redis_case() as case:
+        cpu, gpu, publisher = commands
+        for command in commands:
+            for ancestor in command.worker.ancestors:
+                await case.admin.xgroup_createconsumer(
+                    command.stream, group(command), ancestor.redis_consumer_id
+                )
+        expected = {
+            command.stream: {command.current, *command.predecessors}
+            for command in commands
+        }
+        with pytest.raises(ResponseError, match="permission|NOPERM|permissions"):
+            await case.watcher.execute_command(*cpu.arguments)
+        await asyncio.sleep(120.1)
+        with pytest.raises(ResponseError, match="inventory_changed"):
+            await case.control.execute_command(*cpu.arguments)
+        assert await case.names(cpu) == expected[cpu.stream]
+        await case.refresh()
+
+        for names in (
+            (cpu.current,),
+            (cpu.current, *cpu.predecessors, "overflow"),
+            (cpu.current, cpu.current),
+            (cpu.current, cpu.predecessor, cpu.predecessor),
+            (cpu.current, ""),
+        ):
+            with pytest.raises(ResponseError, match="arguments_invalid|scope_invalid"):
+                await case.control.execute_command(
+                    "EVAL", pure.ATOMIC_RECONCILE_HISTORY_LUA, 1, cpu.stream, *names
+                )
+            assert await case.names(cpu) == expected[cpu.stream]
+
+        message = await case.admin.xadd(cpu.stream, {"fixture": "history-lag"})
+        assert (await case.admin.xpending(cpu.stream, group(cpu)))["pending"] == 0
+        with pytest.raises(ResponseError, match="backlog"):
+            await case.control.execute_command(*cpu.arguments)
+        assert await case.names(cpu) == expected[cpu.stream]
+        await case.drain_fixture_message(cpu, message)
+
+        message = await case.admin.xadd(cpu.stream, {"fixture": "history-pending"})
+        await case.admin.xreadgroup(group(cpu), cpu.current, {cpu.stream: ">"}, count=1)
+        with pytest.raises(ResponseError, match="backlog"):
+            await case.control.execute_command(*cpu.arguments)
+        assert await case.names(cpu) == expected[cpu.stream]
+        assert await case.admin.xack(cpu.stream, group(cpu), message) == 1
+
+        groups = await case.admin.xinfo_groups(cpu.stream)
+        interior, appended = unknown_lag_fixture_ids(groups[0]["last-delivered-id"])
+        await case.admin.xadd(
+            cpu.stream, {"fixture": "history-unknown-lag"}, id=appended
+        )
+        await case.admin.xgroup_setid(cpu.stream, group(cpu), interior)
+        assert (await case.admin.xinfo_groups(cpu.stream))[0]["lag"] is None
+        with pytest.raises(ResponseError, match="backlog"):
+            await case.control.execute_command(*cpu.arguments)
+        assert await case.names(cpu) == expected[cpu.stream]
+        await case.admin.xgroup_setid(
+            cpu.stream,
+            group(cpu),
+            groups[0]["last-delivered-id"],
+            entries_read=groups[0]["entries-read"],
+        )
+        await case.drain_fixture_message(cpu, appended)
+
+        await case.admin.xgroup_createconsumer(
+            cpu.stream, group(cpu), "unknown-history"
+        )
+        with pytest.raises(ResponseError, match="inventory_changed"):
+            await case.control.execute_command(*cpu.arguments)
+        assert await case.names(cpu) == expected[cpu.stream] | {"unknown-history"}
+        await case.admin.xgroup_delconsumer(cpu.stream, group(cpu), "unknown-history")
+        await case.admin.xgroup_delconsumer(cpu.stream, group(cpu), cpu.current)
+        with pytest.raises(ResponseError, match="inventory_changed"):
+            await case.control.execute_command(*cpu.arguments)
+        assert await case.names(cpu) == expected[cpu.stream] - {cpu.current}
+        await case.admin.xgroup_createconsumer(cpu.stream, group(cpu), cpu.current)
+        await case.refresh()
+
+        # The last requested old name is young. Earlier eligible names must stay.
+        await case.admin.xreadgroup(
+            group(gpu), gpu.predecessors[-1], {gpu.stream: ">"}, count=1
+        )
+        with pytest.raises(ResponseError, match="inventory_changed"):
+            await case.control.execute_command(*gpu.arguments)
+        assert await case.names(gpu) == expected[gpu.stream]
+        await case.admin.xgroup_delconsumer(
+            gpu.stream, group(gpu), gpu.predecessors[-1]
+        )
+        # Also omit the direct predecessor: the remaining ancestor is still pinned.
+        await case.admin.xgroup_delconsumer(gpu.stream, group(gpu), gpu.predecessor)
+        for name in publisher.predecessors:
+            await case.admin.xgroup_delconsumer(
+                publisher.stream, group(publisher), name
+            )
+
+        for command in (cpu, gpu):
+            reply = await case.control.execute_command(*command.arguments)
+            assert reply == ["retired", command.current, *command.predecessors]
+            assert pure.validate_lua_result(command, reply) == "retired"
+            assert await case.names(command) == {command.current}
+        reply = await case.control.execute_command(*publisher.arguments)
+        assert reply == ["already_absent", publisher.current]
+        assert pure.validate_lua_result(publisher, reply) == "already_absent"
+
+        final = {}
+        for command in commands:
+            final[command.service_name] = {
+                "stream": command.stream,
+                "group": group(command),
+                "pending": (
+                    await case.control.xpending(command.stream, group(command))
+                )["pending"],
+                "lag": (await case.control.xinfo_groups(command.stream))[0]["lag"],
+                "consumers": await case.control.xinfo_consumers(
+                    command.stream, group(command)
+                ),
+            }
+        assessment = pure.assess(
+            pins, *history_facts(payload), final, now=NOW, replay_only=True
+        )
+        assert (assessment.outcome, assessment.commands) == ("already_absent", ())

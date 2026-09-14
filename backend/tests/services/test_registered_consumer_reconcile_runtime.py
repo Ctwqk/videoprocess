@@ -914,9 +914,9 @@ def test_guard_migration_is_in_the_single_chain_and_operator_only():
     config.set_main_option("script_location", str(root / "alembic"))
     assert (
         ScriptDirectory.from_config(config).get_current_head()
-        == "044_policy_decision_snapshots"
+        == "045_registered_consumer_history"
     )
-    assert EXPECTED_MIGRATION_HEAD == "044_policy_decision_snapshots"
+    assert EXPECTED_MIGRATION_HEAD == "045_registered_consumer_history"
     migration = runpy.run_path(
         str(root / "alembic/versions/041_registered_consumer_terminal.py")
     )

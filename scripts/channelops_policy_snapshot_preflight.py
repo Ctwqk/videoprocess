@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from uuid import UUID
 
 
-EXPECTED_HEAD = "044_policy_decision_snapshots"
+EXPECTED_HEAD = "045_registered_consumer_history"
 FEATURE_SCHEMA = "channelops-candidate-v1"
 HEAD_SQL = "SELECT version_num FROM alembic_version"
 TICKS_SQL = """SELECT id, channel_profile_id, replay_status, policy_version_id,

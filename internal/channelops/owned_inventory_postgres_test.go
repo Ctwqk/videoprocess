@@ -240,8 +240,8 @@ func newOwnedPGFixtureWithWindow(t *testing.T, legacy func(*Store, time.Time) ma
 	t.Cleanup(store.Close)
 	store.buildCommitSHA = snapshotTestCommit
 	var revision string
-	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "044_policy_decision_snapshots" {
-		t.Fatal("disposable database must be migrated to 044_policy_decision_snapshots")
+	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "045_registered_consumer_history" {
+		t.Fatal("disposable database must be migrated to 045_registered_consumer_history")
 	}
 	var now time.Time
 	if err := store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {

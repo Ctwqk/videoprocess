@@ -42,6 +42,7 @@ _CONTRACTS = MappingProxyType(
 _RETIRING_SERVICES = tuple(
     name for name in _CONTRACTS if name != "vp-vision-worker-swarm"
 )
+MAX_RETIRING_PER_SERVICE = 64
 _MAX_BIGINT = 9_223_372_036_854_775_807
 _SHA256 = r"[0-9a-f]{64}"
 _RELEASE = r"[0-9a-f]{40}"
@@ -160,21 +161,44 @@ class WorkerPin:
     current: IdentityPin
     # None is a captured absence, never an omitted field or a wildcard.
     predecessor: IdentityPin | None
+    ancestors: tuple[IdentityPin, ...] = ()
 
     def __post_init__(self) -> None:
         _require(type(self.current) is IdentityPin, "pin_current_invalid")
-        old = self.predecessor
-        if old is None:
-            return
-        _require(type(old) is IdentityPin, "pin_predecessor_invalid")
         _require(
-            old.service_name == self.current.service_name
-            and old.lease_epoch < self.current.lease_epoch
-            and old.generation < self.current.generation
-            and old.registration_id != self.current.registration_id
-            and old.grant_id != self.current.grant_id
-            and old.worker_instance_id != self.current.worker_instance_id,
-            "pin_successor_invalid",
+            type(self.ancestors) is tuple
+            and all(type(pin) is IdentityPin for pin in self.ancestors),
+            "pin_ancestors_invalid",
+        )
+        _require(
+            not self.ancestors
+            or (
+                self.predecessor is not None
+                and self.current.service_name in _RETIRING_SERVICES
+            ),
+            "pin_ancestors_invalid",
+        )
+        _require(len(self.retiring) <= MAX_RETIRING_PER_SERVICE, "pin_history_limit")
+        successor = self.current
+        for old in self.retiring:
+            _require(type(old) is IdentityPin, "pin_predecessor_invalid")
+            _require(
+                old.service_name == successor.service_name
+                and old.lease_epoch < successor.lease_epoch
+                and old.generation < successor.generation
+                and old.registration_id != successor.registration_id
+                and old.grant_id != successor.grant_id
+                and old.worker_instance_id != successor.worker_instance_id,
+                "pin_successor_invalid",
+            )
+            successor = old
+
+    @property
+    def retiring(self) -> tuple[IdentityPin, ...]:
+        return (
+            (self.predecessor, *self.ancestors)
+            if self.predecessor is not None
+            else self.ancestors
         )
 
 
@@ -195,7 +219,9 @@ class PinDocument:
     workers: tuple[WorkerPin, ...]
 
     def __post_init__(self) -> None:
-        _require(type(self.version) is int and self.version == 1, "pin_version_invalid")
+        _require(
+            type(self.version) is int and self.version in (1, 2), "pin_version_invalid"
+        )
         _require(
             _matches(self.transaction_id, r"tx-[0-9a-f]{32}"), "pin_transaction_invalid"
         )
@@ -218,12 +244,17 @@ class PinDocument:
             ),
             "pin_deployment_mismatch",
         )
+        _require(
+            self.version == 2 or not any(worker.ancestors for worker in self.workers),
+            "pin_version_invalid",
+        )
         identities = [
-            pin
-            for worker in self.workers
-            for pin in (worker.current, worker.predecessor)
-            if pin is not None
+            pin for worker in self.workers for pin in (worker.current, *worker.retiring)
         ]
+        _require(
+            len(identities) <= len(_CONTRACTS) * (1 + MAX_RETIRING_PER_SERVICE),
+            "pin_history_limit",
+        )
         for field in (
             "registration_id",
             "grant_id",
@@ -237,8 +268,12 @@ class PinDocument:
 
     @property
     def canonical_json(self) -> str:
+        payload = asdict(self)
+        if self.version == 1:
+            for worker in payload["workers"]:
+                del worker["ancestors"]
         return json.dumps(
-            asdict(self), sort_keys=True, separators=(",", ":"), default=_json_scalar
+            payload, sort_keys=True, separators=(",", ":"), default=_json_scalar
         )
 
     @property
@@ -291,16 +326,29 @@ def decode_pins(raw: str) -> PinDocument:
             ),
             {field.name for field in fields(PinDocument)},
         )
+        version = payload["version"]
+        _require(type(version) is int and version in (1, 2), "pin_version_invalid")
         _require(type(payload["workers"]) is list, "pin_workers_invalid")
         workers = []
         for value in payload["workers"]:
-            worker = _exact_fields(value, {"current", "predecessor"})
+            expected = {"current", "predecessor"}
+            if version == 2:
+                expected.add("ancestors")
+            worker = _exact_fields(value, expected)
+            ancestors = worker["ancestors"] if version == 2 else []
+            _require(type(ancestors) is list, "pin_ancestors_invalid")
+            _require(
+                len(ancestors) + (worker["predecessor"] is not None)
+                <= MAX_RETIRING_PER_SERVICE,
+                "pin_history_limit",
+            )
             workers.append(
                 WorkerPin(
                     current=_decode_identity(worker["current"]),
                     predecessor=None
                     if worker["predecessor"] is None
                     else _decode_identity(worker["predecessor"]),
+                    ancestors=tuple(_decode_identity(pin) for pin in ancestors),
                 )
             )
         return PinDocument(**{**payload, "workers": tuple(workers)})
@@ -461,6 +509,15 @@ def validate_database(
         len(by_registration) == len(registrations) and len(by_grant) == len(grants),
         "database_duplicate_facts",
     )
+    if pins.version == 2:
+        identities = tuple(
+            pin for worker in pins.workers for pin in (worker.current, *worker.retiring)
+        )
+        _require(
+            set(by_registration) == {pin.registration_id for pin in identities}
+            and set(by_grant) == {pin.grant_id for pin in identities},
+            "database_pin_set_changed",
+        )
     current_ids = {worker.current.registration_id for worker in pins.workers}
     current_grants = {worker.current.grant_id for worker in pins.workers}
     _require(
@@ -473,9 +530,8 @@ def validate_database(
     )
     waiting = []
     for worker in pins.workers:
-        for pin in (worker.current, worker.predecessor):
-            if pin is None:
-                continue
+        successor = worker.current
+        for pin in (worker.current, *worker.retiring):
             row, grant = (
                 by_registration.get(pin.registration_id),
                 by_grant.get(pin.grant_id),
@@ -504,11 +560,12 @@ def validate_database(
                     and grant.state == "revoked"
                     and _revoked(row, now)
                     and _revoked(grant, now)
-                    and _same(row.superseded_by, worker.current.registration_id),
+                    and _same(row.superseded_by, successor.registration_id),
                     "predecessor_not_superseded",
                 )
-                if row.lease_expires_at > now:
+                if row.lease_expires_at > now and pin.service_name not in waiting:
                     waiting.append(pin.service_name)
+            successor = pin
     return tuple(waiting)
 
 
@@ -537,7 +594,7 @@ def _inventory_outcome(
         "inventory_consumers_invalid",
     )
     by_name = {}
-    old_name = worker.predecessor.redis_consumer_id if worker.predecessor else None
+    old_names = {pin.redis_consumer_id for pin in worker.retiring}
     for consumer in consumers:
         _require(isinstance(consumer, Mapping), "inventory_consumer_invalid")
         _require(
@@ -550,7 +607,7 @@ def _inventory_outcome(
         _require(
             type(name) is str
             and name not in by_name
-            and name in (current.redis_consumer_id, old_name),
+            and (name == current.redis_consumer_id or name in old_names),
             "inventory_identity_changed",
         )
         _require(
@@ -568,9 +625,14 @@ def _inventory_outcome(
         by_name[current.redis_consumer_id]["idle"] <= 120000,
         "inventory_current_inactive",
     )
-    if old_name not in by_name:
+    present_old = old_names & by_name.keys()
+    if not present_old:
         return "already_absent"
-    return "ready" if by_name[old_name]["idle"] > 120000 else "wait"
+    return (
+        "ready"
+        if all(by_name[name]["idle"] > 120000 for name in present_old)
+        else "wait"
+    )
 
 
 # Fixed keys/groups, no caller-provided group, idle threshold or name regex.
@@ -659,6 +721,114 @@ return {"retired", final_current.name, old.name}
 """
 
 
+# Separate immutable protocol version: never interpolate or alter the v1 script.
+ATOMIC_RECONCILE_HISTORY_LUA = r"""
+if #KEYS ~= 1 or #ARGV < 2 or #ARGV > 65 then
+    return redis.error_reply("registered_reconcile_arguments_invalid")
+end
+local groups = {
+    ["vp:tasks:ffmpeg"] = "ffmpeg-workers",
+    ["vp:tasks:ffmpeg_go"] = "ffmpeg_go-workers",
+    ["vp:tasks:youtube_publisher"] = "youtube_publisher-workers"
+}
+local group = groups[KEYS[1]]
+if not group then
+    return redis.error_reply("registered_reconcile_scope_invalid")
+end
+local allowed = {}
+for _, name in ipairs(ARGV) do
+    if type(name) ~= "string" or name == "" or allowed[name] then
+        return redis.error_reply("registered_reconcile_scope_invalid")
+    end
+    allowed[name] = true
+end
+local function integer(value)
+    return type(value) == "number" and value >= 0 and value % 1 == 0
+end
+local function record(values)
+    if type(values) ~= "table" or #values % 2 ~= 0 then return nil end
+    local result = {}
+    for index = 1, #values, 2 do
+        if type(values[index]) ~= "string" or result[values[index]] ~= nil then
+            return nil
+        end
+        result[values[index]] = values[index + 1]
+    end
+    return result
+end
+local function backlog_clear()
+    local pending = redis.call("XPENDING", KEYS[1], group)
+    if type(pending) ~= "table" or not integer(pending[1]) or pending[1] ~= 0 then
+        return false
+    end
+    local matches = 0
+    for _, values in ipairs(redis.call("XINFO", "GROUPS", KEYS[1])) do
+        local item = record(values)
+        if not item then return false end
+        if item.name == group then
+            matches = matches + 1
+            if not integer(item.lag) or item.lag ~= 0 then return false end
+        end
+    end
+    return matches == 1
+end
+local function inventory()
+    local current, old, seen = nil, {}, {}
+    local consumers = redis.call("XINFO", "CONSUMERS", KEYS[1], group)
+    if type(consumers) ~= "table" or #consumers > #ARGV then
+        return nil, nil, false
+    end
+    for _, values in ipairs(consumers) do
+        local item = record(values)
+        if not item or type(item.name) ~= "string" or not allowed[item.name]
+            or seen[item.name] or not integer(item.pending) or item.pending ~= 0
+            or not integer(item.idle) then return nil, nil, false end
+        if item.inactive ~= nil and item.inactive ~= -1
+            and not integer(item.inactive) then return nil, nil, false end
+        seen[item.name] = true
+        if item.name == ARGV[1] then
+            if item.idle > 120000 then return nil, nil, false end
+            current = item
+        else
+            if item.idle <= 120000 then return nil, nil, false end
+            old[item.name] = true
+        end
+    end
+    return current, old, current ~= nil
+end
+if not backlog_clear() then
+    return redis.error_reply("registered_reconcile_backlog")
+end
+local current, old, valid = inventory()
+if not valid then
+    return redis.error_reply("registered_reconcile_inventory_changed")
+end
+if next(old) == nil then
+    return {"already_absent", current.name}
+end
+-- Complete inventory validation precedes the first irreversible mutation.
+for index = 2, #ARGV do
+    local name = ARGV[index]
+    if old[name] then
+        local deleted = redis.call("XGROUP", "DELCONSUMER", KEYS[1], group, name)
+        if not integer(deleted) or deleted ~= 0 then
+            return redis.error_reply("registered_reconcile_delete_uncertain")
+        end
+    end
+end
+local final_current, final_old, final_valid = inventory()
+if not final_valid or next(final_old) ~= nil or not backlog_clear() then
+    return redis.error_reply("registered_reconcile_final_uncertain")
+end
+-- This attests absence of all requested names, including absent intermediates.
+local result = {"retired", final_current.name}
+for index = 2, #ARGV do
+    table.insert(result, ARGV[index])
+end
+return result
+"""
+
+
 @dataclass(frozen=True)
 class EvalCommand:
     """Transport data only. Unit 2/3 must fence and journal its single attempt."""
@@ -698,14 +868,20 @@ class EvalCommand:
         return old.redis_consumer_id
 
     @property
+    def predecessors(self) -> tuple[str, ...]:
+        return tuple(pin.redis_consumer_id for pin in self.worker.retiring)
+
+    @property
     def arguments(self) -> tuple[str | int, ...]:
         return (
             "EVAL",
-            ATOMIC_RECONCILE_LUA,
+            ATOMIC_RECONCILE_LUA
+            if self.pins.version == 1
+            else ATOMIC_RECONCILE_HISTORY_LUA,
             1,
             self.stream,
             self.current,
-            self.predecessor,
+            *self.predecessors,
         )
 
 
@@ -764,7 +940,7 @@ def assess(
 def validate_lua_result(
     command: EvalCommand, result: object
 ) -> Literal["retired", "already_absent"]:
-    if result == ["retired", command.current, command.predecessor]:
+    if result == ["retired", command.current, *command.predecessors]:
         return "retired"
     if result == ["already_absent", command.current]:
         return "already_absent"

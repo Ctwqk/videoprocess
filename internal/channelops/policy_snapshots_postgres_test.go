@@ -75,7 +75,7 @@ func lockSnapshotFixture(t *testing.T, store *Store, raw string) *pgx.Conn {
 		t.Fatal(err)
 	}
 	var current, revision string
-	if err := conn.QueryRow(ctx, `SELECT current_database(),version_num FROM public.alembic_version`).Scan(&current, &revision); err != nil || current != name || revision != "044_policy_decision_snapshots" {
+	if err := conn.QueryRow(ctx, `SELECT current_database(),version_num FROM public.alembic_version`).Scan(&current, &revision); err != nil || current != name || revision != "045_registered_consumer_history" {
 		_ = conn.Close(ctx)
 		store.Close()
 		t.Fatal("fixture database identity or revision044 mismatch")

@@ -90,7 +90,9 @@ def test_legacy_binding_still_valid(tmp_path):
 Files: new `backend/alembic/versions/045_registered_consumer_history.py`,
 `backend/app/services/registered_consumer_reconcile_runtime.py`,
 `backend/app/services/worker_control_role_cli.py`,
-`backend/app/services/worker_deployment_cli.py`, migration/runtime/role/head tests.
+`backend/app/services/worker_deployment_cli.py`,
+`scripts/channelops_policy_snapshot_preflight.py` release-head constant,
+migration/runtime/role/head tests.
 
 Interfaces: new SQL guard name from spec with the existing typed row shape;
 runtime selects it only for version 2 and passes all `worker.retiring` IDs.

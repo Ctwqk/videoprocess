@@ -30,6 +30,7 @@ from sqlalchemy.engine import make_url
 from app.models.worker_registration import WorkerAdmissionGrant, WorkerRegistration
 from app.services.registered_consumer_reconcile import (
     EvalCommand,
+    MAX_RETIRING_PER_SERVICE,
     PinDocument,
     assess,
     decode_pins,
@@ -347,7 +348,7 @@ def load_credentials(request: Invocation) -> Credentials:
             }
         )
         for worker in request.pins.workers:
-            for pin in (worker.current, worker.predecessor):
+            for pin in (worker.current, *worker.retiring):
                 if pin is not None:
                     _require(
                         pin.database_fingerprint == _fingerprint(database_binding)
@@ -410,12 +411,18 @@ def _json_object(value: object, expected: frozenset[str]) -> dict:
 
 def decode_guard(rows: object, pins: PinDocument) -> GuardFacts:
     try:
+        maximum_rows = 8 if pins.version == 1 else 4 * (1 + MAX_RETIRING_PER_SERVICE)
         if (
             not isinstance(rows, Sequence)
             or isinstance(rows, (str, bytes))
-            or not 4 <= len(rows) <= 8
+            or not 4 <= len(rows) <= maximum_rows
         ):
             raise ReconcileRuntimeError("guard_facts_invalid")
+        if pins.version == 2:
+            _require(
+                len(rows) == 4 + sum(len(worker.retiring) for worker in pins.workers),
+                "guard_facts_invalid",
+            )
         registrations, grants = [], []
         now = None
         for row in rows:
@@ -471,14 +478,19 @@ def decode_guard(rows: object, pins: PinDocument) -> GuardFacts:
 
 
 async def read_guard(connection: Any, request: Invocation) -> GuardFacts:
+    function = (
+        "vp_registered_consumer_reconcile_history_guard"
+        if request.pins.version == 2
+        else "vp_registered_consumer_reconcile_guard"
+    )
     rows = await connection.fetch(
-        "SELECT * FROM public.vp_registered_consumer_reconcile_guard($1::text,$2::uuid[],$3::uuid[])",
+        f"SELECT * FROM public.{function}($1::text,$2::uuid[],$3::uuid[])",
         request.control_generation,
         [worker.current.registration_id for worker in request.pins.workers],
         [
-            worker.predecessor.registration_id
+            old.registration_id
             for worker in request.pins.workers
-            if worker.predecessor is not None
+            for old in worker.retiring
         ],
     )
     return decode_guard(rows, request.pins)
