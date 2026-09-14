@@ -14,6 +14,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.autoflow.rights_policy import merge_rights_metadata, rights_metadata_from_mapping
 from app.config import settings
 from app.models.asset import Asset
 from app.models.material import (
@@ -102,9 +103,21 @@ def _merge_visual_metadata(*sources: dict[str, Any] | None) -> dict[str, Any]:
     return merged
 
 
+def _merge_material_metadata(*sources: dict[str, Any] | None) -> dict[str, Any]:
+    merged = _merge_visual_metadata(*sources)
+    merged.update(merge_rights_metadata(*sources))
+    return merged
+
+
 def _with_visual_metadata(base: dict[str, Any], visual_metadata: dict[str, Any] | None) -> dict[str, Any]:
     result = dict(base)
     result.update(_merge_visual_metadata(visual_metadata))
+    return result
+
+
+def _with_material_metadata(base: dict[str, Any], *sources: dict[str, Any] | None) -> dict[str, Any]:
+    result = dict(base)
+    result.update(_merge_material_metadata(*sources))
     return result
 
 
@@ -121,7 +134,7 @@ def _material_visual_metadata(asset: Asset, media_info: dict[str, Any]) -> dict[
 
 
 def _material_result_metadata(window: CandidateWindow) -> dict[str, Any]:
-    return _merge_visual_metadata(window.visual_metadata)
+    return _merge_material_metadata(window.visual_metadata)
 
 
 async def list_material_libraries(db: AsyncSession, skip: int = 0, limit: int = 100) -> tuple[list[MaterialLibrary], int]:
@@ -310,7 +323,8 @@ async def ingest_material_asset(
         await db.flush()
 
     visual_metadata = _material_visual_metadata(asset, media_info)
-    item_metadata = _with_visual_metadata({"clip_len": clip_len, "stride": stride}, visual_metadata)
+    source_metadata = _merge_material_metadata(media_info, visual_metadata)
+    item_metadata = _with_material_metadata({"clip_len": clip_len, "stride": stride}, source_metadata)
 
     windows: list[tuple[float, float]] = []
     cursor = 0.0
@@ -405,7 +419,7 @@ async def ingest_material_asset(
                 subtitle_text=payload["subtitle_text"],
                 neighbor_clip_ids=payload["neighbor_clip_ids"],
                 clip_kind="coarse_window",
-                metadata_json=_with_visual_metadata({"index": clip_index}, visual_metadata),
+                metadata_json=_with_material_metadata({"index": clip_index}, source_metadata),
             )
             db.add(clip)
             await db.flush()
@@ -498,7 +512,7 @@ async def _fallback_db_search(db: AsyncSession, query: str, source_library_ids: 
                 "end_sec": clip.end_sec,
                 "subtitle_text": clip.subtitle_text,
                 "neighbor_clip_ids": clip.neighbor_clip_ids,
-                "metadata": _merge_visual_metadata(item_metadata, clip.metadata_json),
+                "metadata": _merge_material_metadata(item_metadata, clip.metadata_json),
             },
         }
         for clip, item_metadata in scored
@@ -513,7 +527,7 @@ def _merge_candidates(raw_results: list[dict[str, Any]]) -> list[dict[str, Any]]
         score = float(item.get("score") or 0.0)
         existing = merged.get(point_id)
         if existing is None or score > existing["coarse_score"]:
-            metadata = _merge_visual_metadata(payload.get("metadata"), payload)
+            metadata = _merge_material_metadata(payload.get("metadata"), payload)
             merged[point_id] = {
                 "id": point_id,
                 "library_id": str(payload.get("library_id")),
@@ -575,7 +589,7 @@ def _candidate_window_from_cluster(cluster: list[dict[str, Any]]) -> CandidateWi
         neighbor_clip_ids=sorted(set(neighbor_clip_ids)),
         member_clip_ids=member_clip_ids,
         clips=cluster,
-        visual_metadata=_merge_visual_metadata(*(item.get("metadata") for item in cluster)),
+        visual_metadata=_merge_material_metadata(*(item.get("metadata") for item in cluster)),
         lighthouse_score=0.0,
     )
 
@@ -737,6 +751,10 @@ async def _cut_asset_clip(source_asset: Asset, start_sec: float, end_sec: float,
             mime_type="video/mp4",
             uploaded_by="material-search",
         )
+        source_rights = rights_metadata_from_mapping(source_asset.media_info)
+        if source_rights:
+            asset.media_info = {**(asset.media_info or {}), **source_rights}
+            await db.flush()
         return asset
     finally:
         if temp_source_path:
@@ -830,6 +848,7 @@ async def materialize_material_search(db: AsyncSession, request) -> tuple[Materi
             continue
         accepted_ranges[source_asset_id].append((item["start_sec"], item["end_sec"]))
         source_asset = source_assets[source_asset_id]
+        source_rights = rights_metadata_from_mapping(source_asset.media_info)
         title_hint = f"material_{source_asset_id[:8]}_{int(item['start_sec'] * 1000)}_{int(item['end_sec'] * 1000)}"
         final_asset = await _cut_asset_clip(source_asset, item["start_sec"], item["end_sec"], title_hint, db)
 
@@ -846,7 +865,7 @@ async def materialize_material_search(db: AsyncSession, request) -> tuple[Materi
                 neighbor_clip_ids=item["neighbor_clip_ids"],
                 clip_kind="final_refined",
                 storage_asset_id=final_asset.id,
-                metadata_json=_with_visual_metadata(
+                metadata_json=_with_material_metadata(
                     {
                         "query": request.query,
                         "coarse_score": item["coarse_score"],
@@ -854,6 +873,7 @@ async def materialize_material_search(db: AsyncSession, request) -> tuple[Materi
                         "confidence": item["confidence"],
                     },
                     item.get("metadata"),
+                    source_rights,
                 ),
             )
             db.add(clip)
@@ -871,7 +891,7 @@ async def materialize_material_search(db: AsyncSession, request) -> tuple[Materi
                 confidence=item["confidence"],
                 start_sec=item["start_sec"],
                 end_sec=item["end_sec"],
-                metadata_json=_with_visual_metadata(
+                metadata_json=_with_material_metadata(
                     {
                         "member_clip_ids": item["member_clip_ids"],
                         "neighbor_clip_ids": item["neighbor_clip_ids"],
@@ -880,6 +900,7 @@ async def materialize_material_search(db: AsyncSession, request) -> tuple[Materi
                         "material_clip_id": str(clip.id),
                     },
                     item.get("metadata"),
+                    source_rights,
                 ),
             )
             db.add(query_result)
@@ -897,13 +918,14 @@ async def materialize_material_search(db: AsyncSession, request) -> tuple[Materi
                     "coarse_score": item["coarse_score"],
                     "lighthouse_score": item["lighthouse_score"],
                     "confidence": item["confidence"],
-                    "metadata": _with_visual_metadata(
+                    "metadata": _with_material_metadata(
                         {
                             "storage_asset_id": str(final_asset.id),
                             "material_clip_id": str(clip.id),
                             "result_library_id": str(clip.library_id),
                         },
                         item.get("metadata"),
+                        source_rights,
                     ),
                 }
             )

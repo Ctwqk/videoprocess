@@ -142,7 +142,7 @@ def test_storyboard_input_video_pipeline_uses_smart_trim_per_shot():
     assert smart_trim.data.config["target_duration"] == storyboard.shots[0].target_duration
 
 
-def test_storyboard_material_pipeline_uses_matched_assets_and_skips_missing_shots():
+def test_storyboard_material_preview_records_missing_shots_and_effective_duration():
     storyboard = StoryboardGenerator().generate(
         AutoFlowStoryboardRequest(
             prompt="Create a 10 second generic product video",
@@ -166,6 +166,36 @@ def test_storyboard_material_pipeline_uses_matched_assets_and_skips_missing_shot
     assert [node.type for node in definition.nodes].count("source") == 2
     assert all(node.type != "smart_trim" for node in definition.nodes)
     assert any(node.type == "concat_timeline" for node in definition.nodes)
+    assert storyboard.extra["omitted_shot_ids"] == [storyboard.shots[2].id]
+    assert storyboard.extra["effective_duration"] == pytest.approx(
+        storyboard.shots[0].target_duration + storyboard.shots[1].target_duration
+    )
+    concat = next(node for node in definition.nodes if node.type == "concat_timeline")
+    assert concat.data.config["target_duration"] == storyboard.extra["effective_duration"]
+    assert any("omitted_storyboard_shots" in warning for warning in storyboard.warnings)
+
+
+def test_storyboard_material_upload_rejects_unmatched_required_shots():
+    storyboard = StoryboardGenerator().generate(
+        AutoFlowStoryboardRequest(
+            prompt="Create a 10 second generic product video",
+            target_duration=10,
+            source_strategy="material_library",
+            min_shots=3,
+            max_shots=3,
+        )
+    ).storyboard
+    storyboard.shots[0].matched_asset_id = "asset-1"
+    storyboard.shots[0].match_status = "matched"
+    storyboard.shots[1].match_status = "missing"
+    storyboard.shots[2].matched_asset_id = None
+    storyboard.shots[2].match_status = "matched"
+
+    with pytest.raises(ValueError, match=r"missing_required_shots:.*shot_02.*shot_03"):
+        PipelineBuilder().build_storyboard_material_library(
+            storyboard,
+            publish_mode="unlisted_upload",
+        )
 
 
 def test_storyboard_material_pipeline_adds_private_upload_node_when_requested():
@@ -183,6 +213,8 @@ def test_storyboard_material_pipeline_adds_private_upload_node_when_requested():
     storyboard.shots[0].match_status = "matched"
     storyboard.shots[1].matched_asset_id = "asset-2"
     storyboard.shots[1].match_status = "matched"
+    storyboard.shots[2].required = False
+    storyboard.shots[2].match_status = "missing"
 
     definition = PipelineBuilder().build_storyboard_material_library(
         storyboard,
@@ -194,6 +226,10 @@ def test_storyboard_material_pipeline_adds_private_upload_node_when_requested():
     assert upload.type == "youtube_upload"
     assert upload.data.config["privacy"] == "private"
     assert any(edge.source == "transcode_1" and edge.target == "youtube_upload_1" for edge in definition.edges)
+    assert storyboard.extra["omitted_shot_ids"] == [storyboard.shots[2].id]
+    assert storyboard.extra["effective_duration"] == pytest.approx(
+        storyboard.shots[0].target_duration + storyboard.shots[1].target_duration
+    )
 
 
 def test_storyboard_input_video_pipeline_does_not_truncate_more_than_twelve_shots():
@@ -204,8 +240,8 @@ def test_storyboard_input_video_pipeline_does_not_truncate_more_than_twelve_shot
             target_duration=52,
             aspect_ratio="9:16",
             source_strategy="input_video",
-            min_shots=13,
-            max_shots=13,
+            min_shots=5,
+            max_shots=5,
         )
     ).storyboard
     base_shot = storyboard.shots[0]

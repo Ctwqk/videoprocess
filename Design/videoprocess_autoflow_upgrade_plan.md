@@ -1,5 +1,11 @@
 # VideoProcess AutoFlow 升级改造计划
 
+> **Status:** Historical implementation plan
+>
+> **Applies to:** The original AutoFlow build-out and phased roadmap. Checked or imperative language below describes the plan at that time, not the repository's current verified state.
+>
+> **Superseded by:** [`docs/current-architecture.md`](../docs/current-architecture.md) for current ownership, planning, rights, review, and completion contracts. Richer structured scripts, active learning, and executable generated media remain roadmap unless the current contract says otherwise.
+
 > 目标：把 `Ctwqk/videoprocess` 从“手动搭建视频处理工作流的平台”升级为“用户用自然语言描述内容需求，系统自动规划、选材、拼接、预览、导出、可控发布，并持续从表现数据中优化选题和模板”的内容自动化平台。
 
 ---

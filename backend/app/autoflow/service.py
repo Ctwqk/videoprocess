@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -115,13 +117,15 @@ class AutoFlowService:
                 fallback_warnings.append(f"AI graph planner failed validation: {exc}")
 
         if _uses_storyboard_planner(request):
-            return await self._plan_storyboard(request, db)
+            return await self._plan_storyboard(request, db, fallback_reason="; ".join(fallback_warnings) or None)
 
         intent = self.intent_parser.parse(request)
         template = self.template_library.select_template(intent)
         warnings: list[str] = list(fallback_warnings)
         select_with_warnings = getattr(self.material_selector, "find_candidates_with_warnings", None)
-        if callable(select_with_warnings):
+        if request.input_asset_id:
+            candidates = [await self._input_candidate(request, db)]
+        elif callable(select_with_warnings):
             selection = await select_with_warnings(intent, request, db=db)
             candidates = selection.candidates
             warnings.extend(selection.warnings)
@@ -129,8 +133,8 @@ class AutoFlowService:
             candidates = await self.material_selector.find_candidates(intent, request, db=db)
             warnings.extend(getattr(self.material_selector, "last_warnings", []))
         if not candidates:
-            candidates = self._fixture_candidates(intent, request)
-            warnings.append("Material selector returned no candidates; using AutoFlow fixture candidates.")
+            return await self._blocked_plan(request, db, reason="no_material", warnings=warnings,
+                                            fallback_reason="; ".join(fallback_warnings) or None)
         recent_used_asset_ids: set[str] = set()
         if db is not None:
             try:
@@ -192,6 +196,8 @@ class AutoFlowService:
             metadata=metadata,
             validation={
                 "valid": validation.valid,
+                "planning": _planning_provenance(request, "template", fallback_reason="; ".join(fallback_warnings) or None),
+                "material_status": "complete",
                 "errors": [error.model_dump(mode="json") for error in validation.errors],
                 "warnings": [warning.model_dump(mode="json") for warning in validation.warnings],
                 "repairs": repair_result.applied_repairs if repair_result else [],
@@ -209,7 +215,7 @@ class AutoFlowService:
         return plan
 
     async def plan_graph(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
-        graph_request = request.model_copy(update={"planning_mode": "ai_graph"})
+        graph_request = request.model_copy(update={"planning_mode": "ai_graph", "planning_options": None})
         if db is not None:
             from app.services.owned_producer_workflow import plan_owned
             await plan_owned(self, graph_request, db)
@@ -225,7 +231,8 @@ class AutoFlowService:
     async def _plan_graph(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
         outcome = await self.graph_planner.plan(request)
         intent = self.intent_parser.parse(request)
-        rights_payload = self.rights_policy.evaluate(request, outcome.candidates).model_dump(mode="json")
+        candidates = [await self._asset_candidate_rights(candidate, db) for candidate in outcome.candidates]
+        rights_payload = self.rights_policy.evaluate(request, candidates).model_dump(mode="json")
         if outcome.policy.requires_review and rights_payload.get("status") == "allowed":
             rights_payload = {
                 **rights_payload,
@@ -238,6 +245,9 @@ class AutoFlowService:
             }
 
         validation_payload = {
+            "planning": _planning_provenance(request, "ai_graph" if outcome.graph_result.attempts[-1].source.startswith("llm.") else "bounded_graph",
+                                             provider_used=outcome.graph_result.attempts[-1].source if outcome.graph_result.attempts[-1].source.startswith("llm.") else None,
+                                             source=outcome.graph_result.attempts[-1].source),
             "valid": outcome.validation.valid and outcome.policy.valid,
             "errors": [error.model_dump(mode="json") for error in outcome.validation.errors],
             "warnings": [warning.model_dump(mode="json") for warning in outcome.validation.warnings],
@@ -252,7 +262,7 @@ class AutoFlowService:
             intent=intent,
             template_id="ai_graph",
             pipeline_definition=outcome.definition,
-            candidates=outcome.candidates,
+            candidates=candidates,
             metadata=outcome.metadata,
             validation=validation_payload,
             rights=rights_payload,
@@ -267,7 +277,7 @@ class AutoFlowService:
         return plan
 
 
-    async def _plan_storyboard(self, request: AutoFlowRequest, db: AsyncSession | None = None) -> AutoFlowPlan:
+    async def _plan_storyboard(self, request: AutoFlowRequest, db: AsyncSession | None = None, *, fallback_reason: str | None = None) -> AutoFlowPlan:
         storyboard_request = _storyboard_request_from_autoflow(request)
         storyboard_response = self.storyboard_generator.generate(storyboard_request)
         storyboard = storyboard_response.storyboard
@@ -290,18 +300,7 @@ class AutoFlowService:
                 definition = PipelineDefinition(nodes=[], edges=[])
                 warnings.append("Storyboard input_video strategy requires input_asset_id.")
             else:
-                candidates = [
-                    AutoFlowClipCandidate(
-                        id=f"storyboard-input-{request.input_asset_id}",
-                        title=storyboard.title or "Storyboard input video",
-                        source_type="asset",
-                        asset_id=request.input_asset_id,
-                        start_sec=0,
-                        end_sec=storyboard.total_duration,
-                        rights_status="allowed",
-                        metadata={"storyboard_source": "input_video"},
-                    )
-                ]
+                candidates = [await self._input_candidate(request, db)]
                 definition = self.pipeline_builder.build_storyboard_input_video(
                     storyboard,
                     input_asset_id=request.input_asset_id,
@@ -309,11 +308,18 @@ class AutoFlowService:
                     publish_mode=request.publish_mode,
                 )
         else:
-            definition = self.pipeline_builder.build_storyboard_material_library(
-                storyboard,
-                metadata=metadata,
-                publish_mode=request.publish_mode,
-            )
+            try:
+                definition = self.pipeline_builder.build_storyboard_material_library(
+                    storyboard,
+                    metadata=metadata,
+                    publish_mode=request.publish_mode,
+                )
+            except ValueError as exc:
+                if not str(exc).startswith("missing_required_shots:"):
+                    raise
+                return await self._blocked_plan(request, db, reason=str(exc), warnings=warnings,
+                                                storyboard=storyboard, candidates=candidates,
+                                                fallback_reason=fallback_reason)
             if not definition.nodes:
                 warnings.append("Storyboard found no matched material clips; no executable media pipeline was generated.")
 
@@ -328,6 +334,10 @@ class AutoFlowService:
                     shot.match_status = "missing"
 
         validation = validate_pipeline(definition)
+        if not definition.nodes:
+            return await self._blocked_plan(request, db, reason="no_material", warnings=warnings,
+                                            storyboard=storyboard, candidates=candidates, fallback_reason=fallback_reason)
+        warnings.extend(warning for warning in storyboard.warnings if warning not in warnings)
         rights_payload = self.rights_policy.evaluate(request, candidates).model_dump()
         plan = AutoFlowPlan(
             plan_id=str(uuid.uuid4()),
@@ -340,6 +350,8 @@ class AutoFlowService:
             metadata=metadata,
             validation={
                 "valid": validation.valid,
+                "planning": _planning_provenance(request, "storyboard", fallback_reason=fallback_reason),
+                "material_status": "partial" if storyboard.extra.get("omitted_shot_ids") else "complete",
                 "errors": [error.model_dump(mode="json") for error in validation.errors],
                 "warnings": [warning.model_dump(mode="json") for warning in validation.warnings],
                 "repairs": [],
@@ -355,6 +367,52 @@ class AutoFlowService:
 
         self._plans[plan.plan_id] = plan
         return plan
+
+    async def _blocked_plan(self, request, db, *, reason, warnings=(), storyboard=None,
+                            candidates=None, fallback_reason=None):
+        """Persist an honest planning failure without constructing a fake workflow."""
+        candidates = candidates or []
+        warnings = [*warnings, reason]
+        rights = self.rights_policy.evaluate(request, candidates).model_dump()
+        rights.update(status="blocked", execute_allowed=False, publish_allowed=False,
+                      reasons=[*rights.get("reasons", []), reason])
+        plan = AutoFlowPlan(
+            plan_id=str(uuid.uuid4()), request=request, intent=self.intent_parser.parse(request),
+            template_id=f"storyboard_{storyboard.source_strategy}" if storyboard else "material_library_remix",
+            pipeline_definition=PipelineDefinition(nodes=[], edges=[]), storyboard=storyboard,
+            candidates=candidates, metadata=_metadata_from_storyboard(storyboard) if storyboard else AutoFlowMetadata(),
+            validation={"valid": False, "errors": [{"type": reason.split(":")[0], "message": reason}],
+                        "warnings": [], "repairs": [], "plan_warnings": warnings,
+                        "material_status": "partial" if candidates else "no_material",
+                        "planning": _planning_provenance(request, "storyboard" if storyboard else "template", fallback_reason=fallback_reason)},
+            rights=rights, warnings=warnings, status="blocked", needs_review=True,
+        )
+        if db is not None:
+            return await self._save_plan(db, plan)
+        self._plans[plan.plan_id] = plan
+        return plan
+
+    async def _input_candidate(self, request, db):
+        candidate = AutoFlowClipCandidate(id=f"input-{request.input_asset_id}", title="Input video",
+            source_type="asset", asset_id=request.input_asset_id, start_sec=0,
+            end_sec=float(request.duration_sec or 30), rights_status="unknown")
+        return await self._asset_candidate_rights(candidate, db)
+
+    async def _asset_candidate_rights(self, candidate, db):
+        """Only stored asset evidence can establish graph/input rights, never draft claims."""
+        if db is None or not candidate.asset_id:
+            return candidate
+        asset_id = _uuid_or_none(candidate.asset_id)
+        asset = await db.get(Asset, asset_id) if asset_id else None
+        if asset is None:
+            return candidate.model_copy(update={"rights_status": "unknown"})
+        from app.autoflow.rights_policy import RIGHTS_METADATA_KEYS, candidate_rights_facts, rights_metadata_from_mapping, rights_status_from_metadata
+        facts = rights_metadata_from_mapping(asset.media_info)
+        status = rights_status_from_metadata(facts)
+        if rights_status_from_metadata(candidate_rights_facts(candidate)) == "blocked":
+            status = "blocked"
+        return candidate.model_copy(update={"rights_status": status,
+            "metadata": {**{key: value for key, value in candidate.metadata.items() if key not in RIGHTS_METADATA_KEYS}, **facts}})
 
     async def _materialize_storyboard_shots(
         self,
@@ -392,13 +450,22 @@ class AutoFlowService:
                 shot.match_status = "missing"
                 continue
 
-            best = results[0]
+            eligible = [result for result in results if _storyboard_result_satisfies(shot, result, request)]
+            if not eligible:
+                shot.match_status = "missing"
+                warnings.append(f"{shot.id}: no material satisfies required content and minimum match score")
+                continue
+            best = max(eligible, key=_storyboard_result_score)
+            from app.autoflow.search_service import _candidate_from_material_result
+            candidate = _candidate_from_material_result(best, 1)
+            shot.extra.update(rights_status=candidate.rights_status, rights_metadata=candidate.metadata,
+                              material_id=candidate.material_id)
             shot.match_status = "matched"
             shot.matched_asset_id = _string_or_none(best.get("asset_id"))
             shot.matched_source_asset_id = _string_or_none(best.get("source_asset_id"))
             shot.matched_start_sec = _float_or_none(best.get("start_sec"))
             shot.matched_end_sec = _float_or_none(best.get("end_sec"))
-            shot.match_score = _float_or_none(best.get("confidence") or best.get("lighthouse_score") or best.get("coarse_score"))
+            shot.match_score = _storyboard_result_score(best)
             if not shot.matched_asset_id:
                 shot.match_status = "missing"
                 warnings.append(f"{shot.id} material search returned no refined asset_id.")
@@ -493,6 +560,20 @@ class AutoFlowService:
         if owned is not None and owned.identity.inventory_id is not None:
             from app.services.owned_producer_fence import require_owned_pipeline
             require_owned_pipeline(definition, request.input_asset_id)
+        if candidates != plan.candidates:
+            if _candidate_material_references(candidates) != _pipeline_material_references(definition):
+                raise ValueError("Candidate replacements must match executable storyboard/pipeline sources; rebuild or replan")
+            if plan.storyboard:
+                # A shot's stored match is the source of truth for its rights.
+                from app.autoflow.rights_policy import candidate_rights_facts, merge_rights_metadata, rights_metadata_from_mapping, rights_status_from_metadata
+                originals = {candidate.id: candidate for candidate in plan.candidates}
+                candidates = [candidate.model_copy(update={
+                    "rights_status": rights_status_from_metadata(merge_rights_metadata(
+                        candidate_rights_facts(candidate), candidate_rights_facts(originals[candidate.id]))),
+                    "metadata": {**candidate.metadata, **rights_metadata_from_mapping(originals[candidate.id].metadata)},
+                }) if candidate.id in originals else candidate for candidate in candidates]
+            if db is not None:
+                candidates = [await self._asset_candidate_rights(candidate, db) for candidate in candidates]
         if patch.run_validation:
             validation = validate_pipeline(definition)
             repair_result = None
@@ -523,6 +604,7 @@ class AutoFlowService:
                     definition = repair_result.definition
                     validation = validate_pipeline(definition)
             validation_payload = {
+                **validation_payload,
                 "valid": validation.valid,
                 "errors": [error.model_dump(mode="json") for error in validation.errors],
                 "warnings": [warning.model_dump(mode="json") for warning in validation.warnings],
@@ -531,7 +613,7 @@ class AutoFlowService:
             }
 
         rights_payload = dict(plan.rights)
-        if patch.evaluate_rights:
+        if patch.evaluate_rights or candidates != plan.candidates or request != plan.request:
             rights_payload = self.rights_policy.evaluate(request, candidates).model_dump(mode="json")
 
         review_approved_at = plan.review_approved_at
@@ -590,6 +672,11 @@ class AutoFlowService:
         if not plan:
             return None
         _assert_not_blocked_or_rejected(plan, action="approve internally")
+        automatic_rights = self.rights_policy.evaluate(
+            plan.request.model_copy(update={"publish_mode": "preview_only"}), plan.candidates
+        )
+        if automatic_rights.status != "allowed":
+            raise PermissionError("Candidate rights require explicit human review before internal approval")
 
         rights = {
             **plan.rights,
@@ -1181,7 +1268,7 @@ class AutoFlowService:
             return
         asset_id = _uuid_or_none(request.input_asset_id)
         if asset_id is None or str(asset_id) != request.input_asset_id:
-            raise OwnedInputAssetError("input_asset_id must be a canonical owned generated video asset UUID")
+            raise OwnedInputAssetError("input_asset_id must be a canonical owned video asset UUID")
         asset = await db.get(Asset, asset_id)
         if asset is None:
             raise OwnedInputAssetError("Owned input asset was not found")
@@ -1190,9 +1277,9 @@ class AutoFlowService:
             not isinstance(asset.mime_type, str)
             or not asset.mime_type.startswith("video/")
             or media_info.get("license") != "owned"
-            or media_info.get("provenance") != "generated"
+            or media_info.get("rights_status", "allowed") != "allowed"
         ):
-            raise OwnedInputAssetError("Input asset must be an owned generated video")
+            raise OwnedInputAssetError("Input asset must be an owned video with allowed rights")
 
     async def list_runs(self, db: AsyncSession | None = None) -> list[AutoFlowRun]:
         if db is None:
@@ -1245,6 +1332,9 @@ class AutoFlowService:
                 raise ValueError("AutoFlow plan changed concurrently; reload before writing")
             plan = _invalidate_approval_for_revision_change(previous, plan)
         if row is None:
+            if "planning" not in plan.validation:
+                plan.validation = {**plan.validation, "planning": _planning_provenance(plan.request,
+                    "template", source="owned_inventory" if plan.request.constraints.get("channelops") else None)}
             row = AutoFlowPlanModel(id=plan_uuid)
             db.add(row)
 
@@ -1329,56 +1419,6 @@ class AutoFlowService:
                 await db.commit()
             await db.refresh(row)
         return _run_from_model(row)
-
-    def _fixture_candidates(
-        self,
-        intent,
-        request: AutoFlowRequest,
-    ) -> list[AutoFlowClipCandidate]:
-        subject = intent.subject or "video"
-        if request.source_policy in {"research_only", "remix_with_review"}:
-            return [
-                AutoFlowClipCandidate(
-                    id="external-1",
-                    title=f"{subject} review-required placeholder 1",
-                    source_type="external_url",
-                    asset_id="autoflow-review-placeholder-1",
-                    start_sec=0,
-                    end_sec=5,
-                    rights_status="review_required",
-                    metadata={"placeholder": True, "source_policy": request.source_policy},
-                ),
-                AutoFlowClipCandidate(
-                    id="external-2",
-                    title=f"{subject} review-required placeholder 2",
-                    source_type="external_url",
-                    asset_id="autoflow-review-placeholder-2",
-                    start_sec=0,
-                    end_sec=5,
-                    rights_status="review_required",
-                    metadata={"placeholder": True, "source_policy": request.source_policy},
-                ),
-            ]
-        return [
-            AutoFlowClipCandidate(
-                id="owned-1",
-                title=f"{subject} owned clip 1",
-                source_type="asset",
-                asset_id="autoflow-demo-asset-1",
-                start_sec=0,
-                end_sec=5,
-                rights_status="allowed",
-            ),
-            AutoFlowClipCandidate(
-                id="owned-2",
-                title=f"{subject} owned clip 2",
-                source_type="asset",
-                asset_id="autoflow-demo-asset-2",
-                start_sec=0,
-                end_sec=5,
-                rights_status="allowed",
-            ),
-        ]
 
 
 def _llm_metadata_client() -> LLMGatewayMetadataClient:
@@ -1705,7 +1745,64 @@ def _request_json(row: AutoFlowPlanModel) -> dict[str, Any]:
     }
 
 
+def _candidate_material_references(candidates: list[AutoFlowClipCandidate]) -> set[tuple[str, str]]:
+    references = set()
+    for candidate in candidates:
+        if candidate.url:
+            references.add(("url", candidate.url))
+        elif candidate.asset_id:
+            references.add(("asset", candidate.asset_id))
+    return references
+
+
+def _pipeline_material_references(definition: PipelineDefinition) -> set[tuple[str, str]]:
+    references = set()
+    for node in definition.nodes:
+        if node.type == "source":
+            asset_id = node.data.config.get("asset_id") or node.data.asset_id
+            if asset_id:
+                references.add(("asset", str(asset_id)))
+        elif node.type == "url_download" and node.data.config.get("url"):
+            references.add(("url", str(node.data.config["url"])))
+    return references
+
+
+def _storyboard_result_score(result: dict[str, Any]) -> float:
+    for key in ("confidence", "lighthouse_score", "coarse_score"):
+        if result.get(key) is not None:
+            score = _float_or_none(result[key])
+            return score if score is not None and math.isfinite(score) else 0.0
+    return 0.0
+
+
+def _storyboard_result_satisfies(shot, result: dict[str, Any], request: AutoFlowRequest) -> bool:
+    threshold = float(request.constraints.get("minimum_match_score", 0.35))
+    if not math.isfinite(threshold) or not 0.35 <= threshold <= 1:
+        raise ValueError("minimum_match_score must be between 0.35 and 1")
+    if not result.get("asset_id") or _storyboard_result_score(result) < threshold:
+        return False
+    metadata = result.get("metadata") or {}
+    # Hard content requirements require actual retrieval evidence, not the query itself.
+    evidence = json.dumps([result.get("subtitle_text", ""), metadata.get("visual", {}),
+                           metadata.get("matched_requirements", [])], ensure_ascii=False).casefold()
+    def present(term):
+        term = term.strip().casefold()
+        if re.fullmatch(r"[a-z0-9 ]+", term):
+            return re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", evidence) is not None
+        return bool(term) and term in evidence
+    return all(present(term) for term in shot.must_have) and not any(present(term) for term in shot.must_not_have)
+
+
+def _planning_provenance(request, effective_mode, *, provider_used=None, fallback_reason=None, source=None):
+    return {"requested_mode": request.planning_mode, "effective_mode": effective_mode,
+            "provider_used": provider_used, "fallback_reason": fallback_reason, "source": source}
+
+
 def _uses_storyboard_planner(request: AutoFlowRequest) -> bool:
+    if request.planning_mode == "storyboard":
+        return True
+    if request.planning_mode == "template":
+        return False
     return bool(
         request.input_asset_id
         or request.source_strategy != "auto"
@@ -1719,7 +1816,7 @@ def _storyboard_request_from_autoflow(request: AutoFlowRequest) -> AutoFlowStory
     strategy = request.source_strategy
     if strategy == "auto" and request.input_asset_id:
         strategy = "input_video"
-    elif strategy == "auto" and request.material_library_ids:
+    elif strategy == "auto":
         strategy = "material_library"
     return AutoFlowStoryboardRequest(
         prompt=request.prompt,
@@ -1766,8 +1863,9 @@ def _candidates_from_storyboard_matches(storyboard: StoryboardPlan) -> list[Auto
                 start_sec=shot.matched_start_sec,
                 end_sec=shot.matched_end_sec,
                 score=shot.match_score or 0,
-                rights_status="allowed",
+                rights_status=shot.extra.get("rights_status", "unknown"),
                 metadata={
+                    **shot.extra.get("rights_metadata", {}),
                     "storyboard_shot_id": shot.id,
                     "source_asset_id": shot.matched_source_asset_id,
                 },

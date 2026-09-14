@@ -125,13 +125,19 @@ class AutoFlowGraphPlanner:
         raw_draft = request.constraints.get("pipeline_draft") if isinstance(request.constraints, dict) else None
         if raw_draft:
             return PipelineDraft.model_validate(raw_draft), "constraints.pipeline_draft"
-        if request.allow_experimental_graph_planning:
+        if request.allow_experimental_graph_planning and settings.autoflow_ai_enabled:
             provider_result = await self.provider.draft_for_request(request, get_capability_manifest())
             if provider_result is not None:
                 return provider_result
         dog_cat = _dog_cat_vertical_timeline_draft(request)
         if dog_cat is not None:
             return dog_cat, "rule.dog_cat_vertical_timeline"
+        if not request.allow_experimental_graph_planning:
+            raise GraphPlanningUnavailable("experimental_graph_planning_disabled")
+        if not settings.autoflow_ai_enabled:
+            raise GraphPlanningUnavailable("autoflow_ai_disabled")
+        if not request.provider_config_id or not request.model:
+            raise GraphPlanningUnavailable("graph_provider_configuration_missing")
         raise GraphPlanningUnavailable("No AI graph planner provider produced a draft")
 
 
@@ -391,6 +397,18 @@ def _smart_trim_node(node_id: str, label: str, prompt: str, *, include_upload: b
 def _candidates_from_draft(draft: PipelineDraft) -> list[AutoFlowClipCandidate]:
     candidates: list[AutoFlowClipCandidate] = []
     for node in draft.nodes:
+        if node.type == "url_download":
+            candidates.append(
+                AutoFlowClipCandidate(
+                    id=f"graph-{node.id}",
+                    title=node.label or node.id,
+                    source_type="external_url",
+                    url=_string_or_none(node.config.get("url")),
+                    rights_status="unknown",
+                    metadata={"graph_node_id": node.id},
+                )
+            )
+            continue
         if node.type != "source":
             continue
         asset_id = node.asset_id or _string_or_none(node.config.get("asset_id"))
@@ -402,7 +420,7 @@ def _candidates_from_draft(draft: PipelineDraft) -> list[AutoFlowClipCandidate]:
                 title=node.label or node.id,
                 source_type="asset",
                 asset_id=asset_id,
-                rights_status="allowed",
+                rights_status="unknown",
                 metadata={"graph_node_id": node.id},
             )
         )

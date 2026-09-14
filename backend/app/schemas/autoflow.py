@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.pipeline import PipelineDefinition
 
@@ -37,6 +37,24 @@ AutoFlowPlanStatus = Literal[
 ]
 
 
+class PlanningOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: Literal[1] = 1
+    planning_mode: PlanningMode = "auto"
+    provider_config_id: str | None = None
+    model: str | None = None
+    allow_experimental_graph_planning: bool = False
+    max_repair_attempts: int = Field(default=3, ge=0, le=5)
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def version_is_integer(cls, value):
+        if type(value) is not int:
+            raise ValueError("planning_options.version must be integer 1")
+        return value
+
+
 class AutoFlowRequest(BaseModel):
     prompt: str
     input_asset_id: str | None = None
@@ -58,6 +76,32 @@ class AutoFlowRequest(BaseModel):
     planning_mode: PlanningMode = "auto"
     max_repair_attempts: int = Field(default=3, ge=0, le=5)
     allow_experimental_graph_planning: bool = False
+    planning_options: PlanningOptions | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def resolve_planning_options(cls, value):
+        if not isinstance(value, dict) or value.get("planning_options") is None:
+            return value
+        options = PlanningOptions.model_validate(value["planning_options"])
+        resolved = dict(value)
+        for key, option in options.model_dump(exclude={"version"}).items():
+            if key not in options.model_fields_set:
+                continue
+            if key in resolved and resolved[key] != option:
+                raise ValueError(f"conflicting planning option: {key}")
+            resolved[key] = option
+        resolved["planning_options"] = {
+            "version": 1,
+            **{key: resolved.get(key, option) for key, option in options.model_dump(exclude={"version"}).items()},
+        }
+        return resolved
+
+    @model_validator(mode="after")
+    def validate_shot_range(self):
+        if self.min_shots > self.max_shots:
+            raise ValueError("min_shots must not exceed max_shots")
+        return self
 
     @field_validator("prompt")
     @classmethod
@@ -250,6 +294,7 @@ class VisualStyleSpec(BaseModel):
 
 
 class ShotSpec(BaseModel):
+    required: bool = True
     id: str
     role: Literal[
         "hook",

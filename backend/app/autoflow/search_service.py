@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.autoflow.platform_media_client import PlatformMediaClient, PlatformMediaClientError, SUPPORTED_SOURCE_PLATFORMS
+from app.autoflow.rights_policy import merge_rights_metadata, rights_status_from_metadata
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent, AutoFlowRequest
 from app.schemas.material import MaterialSearchRequest
 from app.services import material_service
@@ -187,6 +188,7 @@ def _candidate_from_material_result(
     asset_id = materialized_asset_id or source_asset_id
     start_sec = _float_or_none(result.get("start_sec"))
     end_sec = _float_or_none(result.get("end_sec"))
+    metadata = _material_metadata(result, material_id, materialized_asset_id, source_asset_id)
     return AutoFlowClipCandidate(
         id=_string_or_none(result.get("id")) or _material_result_id(index, source_asset_id, start_sec, end_sec),
         title=str(result.get("title") or result.get("subtitle_text") or f"Material clip {index}"),
@@ -195,8 +197,8 @@ def _candidate_from_material_result(
         asset_id=asset_id,
         start_sec=start_sec,
         end_sec=end_sec,
-        rights_status="allowed",
-        metadata=_material_metadata(result, material_id, materialized_asset_id, source_asset_id),
+        rights_status=rights_status_from_metadata(metadata),
+        metadata=metadata,
     )
 
 
@@ -219,6 +221,7 @@ def _material_metadata(
     _put_if_present(metadata, "lighthouse", result.get("lighthouse") or result.get("lighthouse_score"))
     _put_if_present(metadata, "confidence", result.get("confidence"))
     _put_if_present(metadata, "subtitle", result.get("subtitle") or result.get("subtitle_text"))
+    metadata.update(merge_rights_metadata(raw_metadata, result))
     _put_if_present(metadata, "visual", result.get("visual") or raw_metadata.get("visual"))
     return metadata
 

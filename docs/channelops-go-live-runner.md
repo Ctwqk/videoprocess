@@ -1,12 +1,18 @@
 # ChannelOps Go Live Runner
 
+> **Status:** Current operator runbook. See [`current-architecture.md`](current-architecture.md) for the normative cross-component contracts.
+
 Use the `channelops-runner-go` Compose service for Go live mode. It runs the
 `channelops-runner` binary built from `cmd/channelops-runner` and includes the
 `channelops-live-smoke` binary for manual smoke checks.
 
-Do not run the Python legacy `channel-agent-runner` at the same time as the Go
-runner. The Python runner is behind the `channelops-python` profile; the Go
-runner is behind the `channelops-go` profile.
+Go is the sole production ChannelOps owner. The legacy Python
+`channel-agent-runner` is available only for explicit `DEPLOY_MODE=local` or
+`DEPLOY_MODE=test`; its CLI exits before importing runtime code in missing,
+shared, or production modes. Its queue claim is also restricted to the kinds
+implemented by the Python handler. The Python runner is behind the
+`channelops-python` profile; the Go runner is behind the `channelops-go`
+profile. Never run both against the same queue.
 
 ## Dev No-PDS Startup
 
@@ -49,8 +55,9 @@ YOUTUBE_MANAGER_URL=http://youtube-manager:8899 \
 docker compose --profile channelops-go up channelops-runner-go
 ```
 
-Do not include `--profile channelops-python` in the same run unless you are
-explicitly comparing legacy behavior and have paused one of the runners.
+The `channelops-python` profile is not a production-like runner. For a legacy
+comparison, stop the Go runner and use an isolated local/test queue with an
+explicit `DEPLOY_MODE=local` or `DEPLOY_MODE=test`.
 
 ## Live Smoke
 
@@ -222,8 +229,11 @@ and fifteen-second command/statement and idle-in-transaction timeouts. It issues
 only fixed metadata SELECTs; it makes no provider, HTTP, SSH, Redis, queue, or
 scheduler calls and performs no database mutation.
 
-The report requires exactly `044_policy_decision_snapshots` as the migration
-head. Tick counts distinguish `legacy`, `pending`, `complete_labelled`,
+The report requires exactly `045_registered_consumer_history` as the migration
+head. This value is enforced by both
+`scripts/channelops_policy_snapshot_preflight.py` and
+`backend/app/services/worker_deployment_cli.py`. Tick counts distinguish
+`legacy`, `pending`, `complete_labelled`,
 `actually_complete`, and `partial`; `new` means non-legacy snapshot ticks,
 not a timestamp-based reconstruction of historical records. Completeness
 requires stored policy/set/schema/as-of identities and hashes, candidate and

@@ -14,6 +14,7 @@ from app.channel_agent.constants import (
     QUEUE_QUEUED,
     QUEUE_RUNNING,
     QUEUE_SUCCEEDED,
+    PYTHON_RUNNER_QUEUE_KINDS,
 )
 from app.models.channel_agent import ChannelOpsQueueItem
 
@@ -86,6 +87,7 @@ class ChannelOpsQueueService:
             select(ChannelOpsQueueItem)
             .where(ChannelOpsQueueItem.status == QUEUE_QUEUED)
             .where(ChannelOpsQueueItem.run_after <= now)
+            .where(ChannelOpsQueueItem.kind.in_(PYTHON_RUNNER_QUEUE_KINDS))
             .order_by(ChannelOpsQueueItem.priority.asc(), ChannelOpsQueueItem.created_at.asc())
             .limit(1)
             .with_for_update(skip_locked=True)

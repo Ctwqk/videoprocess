@@ -98,6 +98,42 @@ def test_rule_based_storyboard_marks_generation_enabled_when_allowed():
     assert all(shot.match_status == "pending" for shot in storyboard.shots)
 
 
+def test_generic_storyboard_rejects_minimum_above_available_templates():
+    with pytest.raises(ValueError, match="unsupported_shot_count"):
+        StoryboardGenerator().generate(
+            AutoFlowStoryboardRequest(
+                prompt="Blue ceramic cup",
+                target_duration=18,
+                min_shots=6,
+                max_shots=8,
+            )
+        )
+
+
+def test_storyboard_rejects_inverted_shot_count_range():
+    with pytest.raises(ValueError, match="min_shots"):
+        StoryboardGenerator().generate(
+            AutoFlowStoryboardRequest(
+                prompt="A cat video",
+                min_shots=5,
+                max_shots=3,
+            )
+        )
+
+
+def test_cat_storyboard_keeps_ending_when_templates_are_truncated():
+    storyboard = StoryboardGenerator().generate(
+        AutoFlowStoryboardRequest(
+            prompt="A cat video",
+            target_duration=12,
+            min_shots=3,
+            max_shots=3,
+        )
+    ).storyboard
+
+    assert [shot.role for shot in storyboard.shots] == ["hook", "action", "ending"]
+
+
 def test_storyboard_fit_uses_short_video_hook_and_clamps():
     request = AutoFlowStoryboardRequest(
         prompt="我要一个 8 秒小猫视频，竖屏，可爱快节奏。",

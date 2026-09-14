@@ -227,6 +227,41 @@ async def test_queue_service_idempotency_priority_and_dead_letter(channel_agent_
 
 
 @pytest.mark.asyncio
+async def test_python_queue_claim_leaves_go_only_kinds_queued(channel_agent_session):
+    clock = FakeClock(datetime(2026, 5, 18, 8, 30, tzinfo=timezone.utc))
+    queue = ChannelOpsQueueService(clock=clock)
+
+    unsupported = []
+    for priority, kind in enumerate(("ingest_discovery", "learning_recompute"), start=1):
+        unsupported.append(
+            await queue.enqueue(
+                channel_agent_session,
+                kind=kind,
+                idempotency_key=f"{kind}:go-owned",
+                priority=priority,
+            )
+        )
+    supported = await queue.enqueue(
+        channel_agent_session,
+        kind="send_alert",
+        idempotency_key="send_alert:python-owned",
+        priority=100,
+    )
+
+    claimed = await queue.claim_next(channel_agent_session, worker_id="python-runner")
+
+    assert claimed is not None
+    assert claimed.id == supported.id
+    assert await queue.claim_next(channel_agent_session, worker_id="python-runner") is None
+    for item in unsupported:
+        await channel_agent_session.refresh(item)
+        assert item.status == "queued"
+        assert item.locked_by is None
+        assert item.locked_at is None
+        assert item.attempt_count == 0
+
+
+@pytest.mark.asyncio
 async def test_lane_format_source_platforms_and_queue_channel_scope(channel_agent_session):
     channel = ChannelProfile(
         name="Platform Lab",

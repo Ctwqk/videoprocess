@@ -68,10 +68,15 @@ FastAPI server. They intentionally do not import backend internals. Use them for
 manual smoke checks after starting the API:
 
 ```bash
-python3 scripts/autoflow_demo_cat_compilation.py --base-url http://127.0.0.1:8000
+python3 scripts/autoflow_demo_cat_compilation.py --base-url http://127.0.0.1:8000 --material-library-id "$MATERIAL_LIBRARY_ID"
 python3 scripts/autoflow_demo_hot_topic.py --base-url http://127.0.0.1:8000
-python3 scripts/autoflow_demo_material_remix.py --base-url http://127.0.0.1:8000
+python3 scripts/autoflow_demo_material_remix.py --base-url http://127.0.0.1:8000 --material-library-id "$MATERIAL_LIBRARY_ID"
 ```
+
+Set `MATERIAL_LIBRARY_ID` to an existing, indexed library UUID whose materials
+have explicit usable rights. Repeat `--material-library-id` to search multiple
+libraries. These clients do not supply synthetic fallback materials; empty
+searches return a blocked `no_material` result.
 
 Each script exits non-zero if the API returns an invalid plan, the selected
 intent/template does not match the scenario, or the expected safety state is

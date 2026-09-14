@@ -73,3 +73,23 @@ def test_bilibili_prompt_does_not_infer_unsupported_publish_target():
     intent = parse("从 b站找小猫素材，做一个 30 秒预览。")
 
     assert "bilibili" not in intent.target_platforms
+
+
+def test_words_containing_x_do_not_infer_x_platform():
+    intent = parse("Explain text extraction in a 20 second preview")
+
+    assert "x" not in intent.target_platforms
+
+
+def test_exact_x_and_twitter_tokens_infer_x_platform():
+    assert parse("Make a preview for X.").target_platforms == ["x"]
+    assert parse("Make a Twitter preview").target_platforms == ["x"]
+
+
+def test_explicit_target_platforms_are_preserved_without_prompt_inference():
+    intent = parse(
+        "Make a YouTube Shorts and Twitter preview",
+        target_platforms=["xiaohongshu"],
+    )
+
+    assert intent.target_platforms == ["xiaohongshu"]

@@ -108,7 +108,7 @@ def _target_platforms_from_prompt(prompt: str) -> list[str]:
     lowered = prompt.lower()
     if "shorts" in lowered or "youtube" in lowered:
         platforms.append("youtube_shorts")
-    if "x" in lowered or "twitter" in lowered:
+    if re.search(r"\b(?:x|twitter)\b", lowered):
         platforms.append("x")
     if "小红书" in prompt:
         platforms.append("xiaohongshu")

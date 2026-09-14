@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.autoflow.clip_ranker import ClipRanker
@@ -41,6 +43,7 @@ class UnsafeSearchService:
                 source_type="asset",
                 asset_id="asset-owned",
                 rights_status="allowed",
+                metadata={"license": "owned"},
             ),
             AutoFlowClipCandidate(
                 id="bad-external-from-material",
@@ -87,6 +90,14 @@ class LicensedSearchService:
                 source_type="material",
                 asset_id="asset-unlicensed",
                 rights_status="allowed",
+            ),
+            AutoFlowClipCandidate(
+                id="garbage-license",
+                title=f"{intent.subject} untrusted license",
+                source_type="material",
+                asset_id="asset-garbage",
+                rights_status="allowed",
+                metadata={"license": "whatever-the-model-said"},
             ),
         ]
 
@@ -198,6 +209,37 @@ async def test_owned_only_selector_returns_no_external_urls():
 
 
 @pytest.mark.asyncio
+async def test_owned_only_selector_rejects_unknown_and_blocked_local_assets():
+    class RightsSearchService:
+        async def search_material(self, intent, request, db=None, max_results=8, **kwargs):
+            base = {
+                "title": "local",
+                "source_type": "asset",
+                "asset_id": "asset-1",
+                "metadata": {"license": "owned"},
+            }
+            return [
+                AutoFlowClipCandidate(id="owned", rights_status="allowed", **base),
+                AutoFlowClipCandidate(id="unknown", rights_status="unknown", **base),
+                AutoFlowClipCandidate(id="blocked", rights_status="blocked", **base),
+                AutoFlowClipCandidate(
+                    id="missing-license",
+                    title="local",
+                    source_type="asset",
+                    asset_id="asset-2",
+                    rights_status="allowed",
+                ),
+            ]
+
+    candidates = await MaterialSelector(search_service=RightsSearchService()).find_candidates(
+        intent("owned_only"),
+        AutoFlowRequest(prompt="只用自有素材", source_policy="owned_only"),
+    )
+
+    assert [candidate.id for candidate in candidates] == ["owned"]
+
+
+@pytest.mark.asyncio
 async def test_research_and_remix_external_candidates_require_review():
     selector = MaterialSelector(search_service=SearchService(platform_client=FakePlatformClient()))
 
@@ -241,6 +283,38 @@ async def test_licensed_only_selector_keeps_only_licensed_material_candidates():
     assert {candidate.source_type for candidate in candidates} <= {"asset", "material"}
     assert all(candidate.metadata.get("license") for candidate in candidates)
     assert all(candidate.rights_status == "allowed" for candidate in candidates)
+    assert [candidate.id for candidate in candidates] == ["licensed"]
+
+
+@pytest.mark.asyncio
+async def test_public_domain_selector_accepts_known_cc_aliases_only():
+    class PublicDomainSearchService:
+        async def search_material(self, intent, request, db=None, max_results=8, **kwargs):
+            return [
+                AutoFlowClipCandidate(
+                    id="cc-by",
+                    title="CC BY",
+                    source_type="material",
+                    asset_id="asset-cc",
+                    rights_status="allowed",
+                    metadata={"license": "CC-BY"},
+                ),
+                AutoFlowClipCandidate(
+                    id="garbage",
+                    title="Garbage",
+                    source_type="material",
+                    asset_id="asset-garbage",
+                    rights_status="allowed",
+                    metadata={"license": "free-ish"},
+                ),
+            ]
+
+    candidates = await MaterialSelector(search_service=PublicDomainSearchService()).find_candidates(
+        intent("public_domain_or_cc"),
+        AutoFlowRequest(prompt="使用 CC 素材", source_policy="public_domain_or_cc"),
+    )
+
+    assert [candidate.id for candidate in candidates] == ["cc-by"]
 
 
 @pytest.mark.asyncio
@@ -300,7 +374,12 @@ async def test_search_material_uses_material_service_materialized_results(monkey
                 "coarse_score": 0.42,
                 "lighthouse_score": 0.81,
                 "confidence": 0.9,
-                "metadata": {"visual": {"motion": "fast"}},
+                "metadata": {
+                    "license": "owned",
+                    "provenance": "original",
+                    "rights_evidence": {"attestation": "user-upload"},
+                    "visual": {"motion": "fast"},
+                },
             }
         ]
 
@@ -341,10 +420,120 @@ async def test_search_material_uses_material_service_materialized_results(monkey
                 "lighthouse": 0.81,
                 "confidence": 0.9,
                 "subtitle": "tiny jump",
+                "license": "owned",
+                "provenance": "original",
+                "rights_evidence": {"attestation": "user-upload"},
                 "visual": {"motion": "fast"},
             },
         )
     ]
+
+
+def test_material_result_conversion_does_not_promote_missing_or_blocked_rights():
+    from app.autoflow.search_service import _candidate_from_material_result
+
+    unknown = _candidate_from_material_result(
+        {"id": "unknown", "asset_id": "asset-unknown", "title": "Unknown"},
+        1,
+    )
+    blocked = _candidate_from_material_result(
+        {
+            "id": "blocked",
+            "asset_id": "asset-blocked",
+            "title": "Blocked",
+            "rights_status": "allowed",
+            "metadata": {"license": "owned", "rights_status": "blocked"},
+        },
+        2,
+    )
+
+    assert unknown.rights_status == "unknown"
+    assert blocked.rights_status == "blocked"
+
+
+def test_material_result_metadata_keeps_rights_facts():
+    window = material_service._candidate_window_from_cluster(
+        [
+            {
+                "library_id": "library-1",
+                "source_asset_id": "asset-source",
+                "clip_id": "clip-1",
+                "start_sec": 0.0,
+                "end_sec": 4.0,
+                "subtitle_text": "cat",
+                "neighbor_clip_ids": [],
+                "coarse_score": 0.8,
+                "metadata": {
+                    "license": "owned",
+                    "provenance": "original",
+                    "rights_evidence": {"attestation": "user-upload"},
+                    "visual": {"objects": ["cat"]},
+                },
+            }
+        ]
+    )
+
+    metadata = material_service._material_result_metadata(window)
+
+    assert metadata["license"] == "owned"
+    assert metadata["provenance"] == "original"
+    assert metadata["rights_evidence"] == {"attestation": "user-upload"}
+
+
+@pytest.mark.asyncio
+async def test_cut_material_asset_inherits_source_rights_facts(monkeypatch, tmp_path):
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    source_asset = SimpleNamespace(
+        storage_backend="local",
+        storage_path="assets/source.mp4",
+        original_name="source.mp4",
+        media_info={
+            "duration": 10.0,
+            "license": "owned",
+            "provenance": "original",
+            "evidence_ref": "capture",
+        },
+    )
+    final_asset = SimpleNamespace(id="asset-cut", media_info={"duration": 3.0})
+
+    class FakeStorage:
+        def get_local_path(self, storage_path):
+            return str(source_path)
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    class FakeDB:
+        def __init__(self):
+            self.flushes = 0
+
+        async def flush(self):
+            self.flushes += 1
+
+    async def fake_subprocess(*args, **kwargs):
+        return FakeProcess()
+
+    async def fake_create_asset(db, local_path, **kwargs):
+        return final_asset
+
+    monkeypatch.setattr(material_service, "get_storage", lambda backend: FakeStorage())
+    monkeypatch.setattr(material_service.asyncio, "create_subprocess_exec", fake_subprocess)
+    monkeypatch.setattr(material_service, "create_asset_from_local_file", fake_create_asset)
+    db = FakeDB()
+
+    result = await material_service._cut_asset_clip(source_asset, 1.0, 4.0, "clip", db)
+
+    assert result.media_info == {
+        "duration": 3.0,
+        "license": "owned",
+        "provenance": "original",
+        "evidence_ref": "capture",
+    }
+    assert db.flushes == 1
 
 
 @pytest.mark.asyncio
@@ -545,11 +734,11 @@ async def test_autoflow_service_uses_selection_warnings_from_return_value():
 
 
 @pytest.mark.asyncio
-async def test_autoflow_service_falls_back_and_ranks_when_selector_is_empty():
+async def test_autoflow_service_blocks_when_selector_is_empty():
     service = AutoFlowService(material_selector=EmptySelector(), clip_ranker=ClipRanker())
     plan = await service.plan(AutoFlowRequest(prompt="我要一个 30 秒小猫视频集锦"))
 
-    assert plan.candidates
-    assert all(candidate.score_breakdown for candidate in plan.candidates)
-    assert any("fewer than 5" in warning for warning in plan.warnings)
-    assert plan.validation["valid"] is True
+    assert plan.candidates == []
+    assert plan.status == "blocked"
+    assert plan.rights["status"] == "blocked"
+    assert "no_material" in plan.rights["reasons"]

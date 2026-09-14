@@ -1999,6 +1999,7 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 	manualSeed := mapFromAny(snapshot["manual_seed"])
 	riskPolicy := mapFromAny(channel["risk_policy_json"])
 	manualSeedConstraints := mapFromAny(manualSeed["constraints_json"])
+	planningOptions := autoflowPlanningOptions(riskPolicy, manualSeed, manualSeedConstraints)
 	sourcePlatforms := effectiveSourcePlatforms(task, laneFormat)
 	inputAssetID, ownedInputProfile := ownedInputAssetID(manualSeedConstraints)
 	constraints := map[string]any{
@@ -2018,24 +2019,29 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 		},
 	}
 	for key, value := range manualSeedConstraints {
-		if key == "input_asset_id" {
+		if key == "input_asset_id" || key == "planning_options" {
 			continue
 		}
 		constraints[key] = value
 	}
 
 	request := map[string]any{
-		"prompt":               task.Prompt,
-		"target_platforms":     []string{"youtube"},
-		"source_platforms":     sourcePlatforms,
-		"duration_sec":         positiveAnyInt(laneFormat["target_duration_sec"], 30),
-		"aspect_ratio":         normalizeAspectRatio(channel["default_aspect_ratio"]),
-		"source_policy":        autoflowSourcePolicy(task),
-		"publish_mode":         autoflowPublishMode(laneFormat, account),
-		"material_library_ids": stringSlice(task.MaterialLibraryIDsJSON),
-		"source_strategy":      normalizeSourceStrategy(firstNonBlank(manualSeed["source_strategy"], manualSeedConstraints["source_strategy"], riskPolicy["source_strategy"])),
-		"planning_mode":        normalizePlanningMode(firstNonBlank(manualSeed["planning_mode"], manualSeedConstraints["planning_mode"], riskPolicy["planning_mode"])),
-		"constraints":          constraints,
+		"prompt":                            task.Prompt,
+		"target_platforms":                  []string{"youtube"},
+		"source_platforms":                  sourcePlatforms,
+		"duration_sec":                      positiveAnyInt(laneFormat["target_duration_sec"], 30),
+		"aspect_ratio":                      normalizeAspectRatio(channel["default_aspect_ratio"]),
+		"source_policy":                     autoflowSourcePolicy(task),
+		"publish_mode":                      autoflowPublishMode(laneFormat, account),
+		"material_library_ids":              stringSlice(task.MaterialLibraryIDsJSON),
+		"source_strategy":                   normalizeSourceStrategy(firstNonBlank(manualSeed["source_strategy"], manualSeedConstraints["source_strategy"], riskPolicy["source_strategy"])),
+		"planning_mode":                     planningOptions["planning_mode"],
+		"provider_config_id":                planningOptions["provider_config_id"],
+		"model":                             planningOptions["model"],
+		"allow_experimental_graph_planning": planningOptions["allow_experimental_graph_planning"],
+		"max_repair_attempts":               planningOptions["max_repair_attempts"],
+		"planning_options":                  planningOptions,
+		"constraints":                       constraints,
 	}
 	if ownedInputProfile {
 		if inputAssetID != "" {
@@ -2044,9 +2050,99 @@ func AutoFlowRequestForTask(task ProductionTaskRow) map[string]any {
 		request["source_platforms"] = []string{}
 		request["source_policy"] = "owned_only"
 		request["source_strategy"] = "input_video"
-		request["planning_mode"] = "template"
+		if strictPlanningMode(planningOptions["planning_mode"]) {
+			request["planning_mode"] = "template"
+			planningOptions["planning_mode"] = "template"
+		}
 	}
 	return request
+}
+
+func autoflowPlanningOptions(riskPolicy map[string]any, manualSeed map[string]any, manualSeedConstraints map[string]any) map[string]any {
+	merged := map[string]any{
+		"version":                           1,
+		"planning_mode":                     "auto",
+		"provider_config_id":                nil,
+		"model":                             nil,
+		"allow_experimental_graph_planning": false,
+		"max_repair_attempts":               3,
+	}
+	// Precedence is low to high: normalized channel legacy fields, normalized
+	// manual constraint legacy fields, normalized manual-seed legacy fields,
+	// raw channel planning_options, then raw manual planning_options. Versioned
+	// values are forwarded without coercion so the Python schema owns rejection.
+	applyLegacyPlanningOptions(merged, riskPolicy)
+	applyLegacyPlanningOptions(merged, manualSeedConstraints)
+	applyLegacyPlanningOptions(merged, manualSeed)
+	applyVersionedPlanningOptions(merged, mapFromAny(riskPolicy["planning_options"]))
+	applyVersionedPlanningOptions(merged, mapFromAny(manualSeedConstraints["planning_options"]))
+	return merged
+}
+
+func applyLegacyPlanningOptions(target map[string]any, source map[string]any) {
+	if value, ok := source["planning_mode"]; ok {
+		target["planning_mode"] = normalizePlanningMode(value)
+	}
+	if value, ok := source["provider_config_id"]; ok {
+		target["provider_config_id"] = optionalPlanningString(value)
+	}
+	if value, ok := source["model"]; ok {
+		target["model"] = optionalPlanningString(value)
+	}
+	if value, ok := source["allow_experimental_graph_planning"]; ok {
+		target["allow_experimental_graph_planning"] = boolValue(value)
+	}
+	if value, ok := source["max_repair_attempts"]; ok {
+		target["max_repair_attempts"] = planningRepairAttempts(value)
+	}
+}
+
+func applyVersionedPlanningOptions(target map[string]any, source map[string]any) {
+	for _, key := range []string{
+		"version",
+		"planning_mode",
+		"provider_config_id",
+		"model",
+		"allow_experimental_graph_planning",
+		"max_repair_attempts",
+	} {
+		if value, ok := source[key]; ok {
+			target[key] = value
+		}
+	}
+}
+
+func strictPlanningMode(value any) bool {
+	mode, ok := value.(string)
+	if !ok {
+		return false
+	}
+	switch mode {
+	case "auto", "template", "storyboard", "ai_graph":
+		return true
+	default:
+		return false
+	}
+}
+
+func optionalPlanningString(value any) any {
+	text, ok := value.(string)
+	if !ok {
+		return nil
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	return text
+}
+
+func planningRepairAttempts(value any) int {
+	parsed := intOrDefault(value, 3)
+	if parsed < 0 || parsed > 5 {
+		return 3
+	}
+	return parsed
 }
 
 func ownedInputAssetID(constraints map[string]any) (string, bool) {

@@ -23,8 +23,20 @@
   "material_library_ids": [
     "library-1"
   ],
+  "allow_experimental_graph_planning": false,
+  "max_repair_attempts": 3,
+  "model": null,
+  "planning_options": {
+    "allow_experimental_graph_planning": false,
+    "max_repair_attempts": 3,
+    "model": null,
+    "planning_mode": "template",
+    "provider_config_id": null,
+    "version": 1
+  },
   "planning_mode": "template",
   "prompt": "Make a short",
+  "provider_config_id": null,
   "publish_mode": "unlisted_upload",
   "source_platforms": [
     "bilibili"

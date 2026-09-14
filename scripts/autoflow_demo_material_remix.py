@@ -6,23 +6,42 @@ import json
 import sys
 import urllib.error
 import urllib.request
+import uuid
 from typing import Any
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create an AutoFlow material-library remix demo plan.")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Running API base URL.")
+    parser.add_argument(
+        "--material-library-id",
+        action="append",
+        dest="material_library_ids",
+        metavar="UUID",
+        required=True,
+        type=_material_library_id,
+        help="Real material library UUID. Repeat for multiple libraries.",
+    )
     args = parser.parse_args()
 
     payload = {
         "prompt": "用素材库里的旅行素材做一个 20 秒海边日落治愈混剪，竖屏，先导出预览。",
-        "material_library_ids": ["travel-library"],
+        "material_library_ids": args.material_library_ids,
+        "planning_mode": "template",
     }
     plan = _post_plan(args.base_url, payload)
+    _require_materials_available(plan)
     _require_plan(plan, expected_intent="material_library_remix", expected_template="material_library_remix")
     _require_rights(plan, expected_status="allowed", expected_review=False)
     print(json.dumps(_summary(plan), ensure_ascii=False, indent=2, sort_keys=True))
     return 0
+
+
+def _material_library_id(value: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except (AttributeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"invalid material library UUID: {value}") from exc
 
 
 def _post_plan(base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -48,6 +67,23 @@ def _endpoint(base_url: str) -> str:
     if base.endswith("/api/v1/autoflow"):
         return f"{base}/plan"
     return f"{base}/api/v1/autoflow/plan"
+
+
+def _require_materials_available(plan: dict[str, Any]) -> None:
+    validation = plan.get("validation") or {}
+    if plan.get("status") != "blocked" and validation.get("material_status") != "no_material":
+        return
+    details = {
+        "status": plan.get("status"),
+        "material_status": validation.get("material_status"),
+        "errors": validation.get("errors", []),
+        "reasons": (plan.get("rights") or {}).get("reasons", []),
+        "warnings": plan.get("warnings", []),
+    }
+    raise SystemExit(
+        "AutoFlow planning blocked; verify that --material-library-id values reference indexed material: "
+        + json.dumps(details, ensure_ascii=False)
+    )
 
 
 def _require_plan(plan: dict[str, Any], *, expected_intent: str, expected_template: str) -> None:

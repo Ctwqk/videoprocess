@@ -936,6 +936,99 @@ func TestAutoFlowRequestForTaskBuildsUploadRequestFromSnapshot(t *testing.T) {
 	}
 }
 
+func TestAutoFlowRequestForTaskMergesVersionedPlanningOptions(t *testing.T) {
+	task := representativeAutoFlowRequestTask()
+	channel := mapFromAny(task.ChannelConfigSnapshotJSON["channel"])
+	riskPolicy := mapFromAny(channel["risk_policy_json"])
+	riskPolicy["planning_options"] = map[string]any{
+		"planning_mode":                     "ai_graph",
+		"provider_config_id":                "risk-provider",
+		"model":                             "risk-model",
+		"allow_experimental_graph_planning": true,
+		"max_repair_attempts":               5,
+	}
+	riskRequest := AutoFlowRequestForTask(task)
+	if riskRequest["planning_mode"] != "ai_graph" {
+		t.Fatalf("versioned channel planning mode did not override legacy fields: %#v", riskRequest)
+	}
+	if riskRequest["allow_experimental_graph_planning"] != true {
+		t.Fatalf("explicit channel experimental opt-in was not forwarded: %#v", riskRequest)
+	}
+	manualSeed := mapFromAny(task.ChannelConfigSnapshotJSON["manual_seed"])
+	manualSeed["constraints_json"] = map[string]any{
+		"tone": "dry",
+		"planning_options": map[string]any{
+			"planning_mode":                     "storyboard",
+			"provider_config_id":                "manual-provider",
+			"allow_experimental_graph_planning": false,
+			"max_repair_attempts":               0,
+		},
+	}
+
+	request := AutoFlowRequestForTask(task)
+
+	want := map[string]any{
+		"version":                           1,
+		"planning_mode":                     "storyboard",
+		"provider_config_id":                "manual-provider",
+		"model":                             "risk-model",
+		"allow_experimental_graph_planning": false,
+		"max_repair_attempts":               0,
+	}
+	if got := mapFromAny(request["planning_options"]); !reflect.DeepEqual(got, want) {
+		t.Fatalf("planning_options = %#v, want %#v", got, want)
+	}
+	for key, value := range want {
+		if key == "version" {
+			continue
+		}
+		if request[key] != value {
+			t.Fatalf("legacy top-level %s = %#v, want %#v", key, request[key], value)
+		}
+	}
+	if _, ok := mapFromAny(request["constraints"])["planning_options"]; ok {
+		t.Fatalf("constraints retained planning_options: %#v", request["constraints"])
+	}
+}
+
+func TestAutoFlowRequestForTaskPreservesInvalidVersionedPlanningOptions(t *testing.T) {
+	task := representativeAutoFlowRequestTask()
+	manualSeed := mapFromAny(task.ChannelConfigSnapshotJSON["manual_seed"])
+	manualSeed["constraints_json"] = map[string]any{
+		"input_asset_id": "00000000-0000-0000-0000-000000000123",
+		"planning_options": map[string]any{
+			"version":                           2,
+			"planning_mode":                     "future_mode",
+			"provider_config_id":                map[string]any{"invalid": true},
+			"model":                             42,
+			"allow_experimental_graph_planning": "true",
+			"max_repair_attempts":               9,
+		},
+	}
+
+	request := AutoFlowRequestForTask(task)
+
+	want := map[string]any{
+		"version":                           2,
+		"planning_mode":                     "future_mode",
+		"provider_config_id":                map[string]any{"invalid": true},
+		"model":                             42,
+		"allow_experimental_graph_planning": "true",
+		"max_repair_attempts":               9,
+	}
+	if got := mapFromAny(request["planning_options"]); !reflect.DeepEqual(got, want) {
+		t.Fatalf("planning_options = %#v, want unmodified %#v", got, want)
+	}
+	for key, value := range want {
+		if key == "version" {
+			continue
+		}
+		if !reflect.DeepEqual(request[key], value) {
+			t.Fatalf("legacy top-level %s = %#v, want unmodified %#v", key, request[key], value)
+		}
+	}
+}
+
 func TestAutoFlowRequestForTaskMatchesSharedFixture(t *testing.T) {
 	raw, err := os.ReadFile("testdata/autoflow_request.json")
 	if err != nil {

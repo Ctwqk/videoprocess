@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api.autoflow import router
 from app.api import autoflow as autoflow_api_module
 from app.autoflow.clip_ranker import ClipRanker
+from tests.autoflow.factories import FixtureMaterialSelector
 from app.autoflow.service import AutoFlowService
 from app.db import get_db
 from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
@@ -31,6 +32,11 @@ from app.schemas.autoflow import (
     AutoFlowRequest,
 )
 from app.schemas.pipeline import PipelineDefinition
+
+
+@pytest.fixture(autouse=True)
+def explicit_test_materials(monkeypatch):
+    monkeypatch.setattr(autoflow_api_module.autoflow_service, "material_selector", FixtureMaterialSelector())
 
 
 @pytest.fixture
@@ -94,7 +100,7 @@ class StaticSelector:
                 start_sec=0,
                 end_sec=5,
                 rights_status="allowed",
-                metadata={"duration": 5, "aspect_ratio": "9:16"},
+                metadata={"duration": 5, "aspect_ratio": "9:16", "license": "owned"},
             ),
             AutoFlowClipCandidate(
                 id="fresh",
@@ -104,7 +110,7 @@ class StaticSelector:
                 start_sec=0,
                 end_sec=5,
                 rights_status="allowed",
-                metadata={"duration": 5, "aspect_ratio": "9:16"},
+                metadata={"duration": 5, "aspect_ratio": "9:16", "license": "owned"},
             ),
         ]
 
@@ -470,7 +476,7 @@ async def test_blocked_db_plan_cannot_be_approved(autoflow_db_session):
 
 @pytest.mark.asyncio
 async def test_approved_plan_persists_exact_execution_revision_hash(autoflow_db_session):
-    service = AutoFlowService()
+    service = AutoFlowService(material_selector=FixtureMaterialSelector())
     plan = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_required")
     autoflow_db_session.add(plan)
     await autoflow_db_session.commit()
@@ -500,7 +506,7 @@ async def test_approved_plan_persists_exact_execution_revision_hash(autoflow_db_
     ],
 )
 async def test_save_invalidates_approval_when_execution_revision_changes(autoflow_db_session, mutation):
-    service = AutoFlowService()
+    service = AutoFlowService(material_selector=FixtureMaterialSelector())
     row = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_required")
     autoflow_db_session.add(row)
     await autoflow_db_session.commit()
@@ -588,7 +594,7 @@ async def test_target_platform_and_constraint_patches_invalidate_exact_approval(
     patch,
     expected_request_field,
 ):
-    service = AutoFlowService()
+    service = AutoFlowService(material_selector=FixtureMaterialSelector())
     row = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_required")
     autoflow_db_session.add(row)
     await autoflow_db_session.commit()
@@ -608,7 +614,7 @@ async def test_target_platform_and_constraint_patches_invalidate_exact_approval(
 
 @pytest.mark.asyncio
 async def test_true_noop_patch_and_save_preserve_exact_approval(autoflow_db_session):
-    service = AutoFlowService()
+    service = AutoFlowService(material_selector=FixtureMaterialSelector())
     row = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_required")
     autoflow_db_session.add(row)
     await autoflow_db_session.commit()
@@ -639,7 +645,7 @@ async def test_true_noop_patch_and_save_preserve_exact_approval(autoflow_db_sess
 
 @pytest.mark.asyncio
 async def test_legacy_approved_plan_without_revision_hash_fails_closed_until_reapproved(autoflow_db_session):
-    service = AutoFlowService()
+    service = AutoFlowService(material_selector=FixtureMaterialSelector())
     row = _plan_row(publish_mode="private_upload", rights_status="review_required", status="review_approved")
     row.review_approved_at = datetime.now(timezone.utc)
     autoflow_db_session.add(row)
@@ -811,6 +817,10 @@ async def test_db_execute_rejects_client_supplied_plan_graph(autoflow_db_session
 @pytest.mark.asyncio
 async def test_patch_plan_replaces_candidates_metadata_rebuilds_and_persists(autoflow_db_session):
     _reset_autoflow_singletons()
+    replacement_asset = _owned_generated_video_asset()
+    autoflow_db_session.add(replacement_asset)
+    await autoflow_db_session.commit()
+    replacement_asset_id = str(replacement_asset.id)
     app = _app_with_db(autoflow_db_session)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -834,7 +844,7 @@ async def test_patch_plan_replaces_candidates_metadata_rebuilds_and_persists(aut
                         "id": "replacement-owned",
                         "title": "Replacement owned clip",
                         "source_type": "asset",
-                        "asset_id": "asset-replacement-owned",
+                        "asset_id": replacement_asset_id,
                         "start_sec": 2,
                         "end_sec": 8,
                         "score": 0.99,
@@ -1058,6 +1068,8 @@ async def test_storyboard_material_plan_materializes_matches_and_keeps_missing_s
                 {
                     "id": f"result-{len(calls)}",
                     "title": f"Matched shot {len(calls)}",
+                    "subtitle_text": ["小猫近景看镜头", "小猫追玩具"][len(calls) - 1],
+                    "metadata": {"license": "owned"},
                     "asset_id": f"asset-matched-{len(calls)}",
                     "source_asset_id": f"asset-source-{len(calls)}",
                     "start_sec": float(len(calls)),

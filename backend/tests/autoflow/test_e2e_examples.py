@@ -6,6 +6,7 @@ import pytest
 
 from app.autoflow.material_selector import MaterialSelector
 from app.autoflow.search_service import SearchService
+from tests.autoflow.factories import FixtureMaterialSelector
 from app.autoflow.service import AutoFlowService
 from app.orchestrator.dag import validate_pipeline
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowRequest
@@ -48,7 +49,7 @@ def _node_types(plan) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_cat_compilation_generates_valid_private_preview_plan():
-    service = AutoFlowService()
+    service = AutoFlowService(material_selector=FixtureMaterialSelector())
 
     plan = await service.plan(
         AutoFlowRequest(
@@ -103,7 +104,7 @@ async def test_hot_topic_explainer_keeps_external_research_in_review_preview():
 
 @pytest.mark.asyncio
 async def test_material_library_remix_uses_owned_material_defaults_and_validates():
-    service = AutoFlowService()
+    service = AutoFlowService(material_selector=FixtureMaterialSelector())
 
     plan = await service.plan(
         AutoFlowRequest(

@@ -228,6 +228,28 @@ class PipelineBuilder:
         source_node_ids: list[str] = []
 
         matched_shots = [shot for shot in storyboard.shots if shot.match_status == "matched" and shot.matched_asset_id]
+        omitted_shots = [
+            shot for shot in storyboard.shots if shot.match_status != "matched" or not shot.matched_asset_id
+        ]
+        missing_required_shot_ids = [shot.id for shot in omitted_shots if shot.required]
+        effective_duration = round(sum(shot.target_duration for shot in matched_shots), 3)
+        storyboard.extra.update(
+            {
+                "omitted_shot_ids": [shot.id for shot in omitted_shots],
+                "missing_required_shot_ids": missing_required_shot_ids,
+                "effective_duration": effective_duration,
+            }
+        )
+        storyboard.warnings = [
+            warning for warning in storyboard.warnings if not warning.startswith("omitted_storyboard_shots:")
+        ]
+        if omitted_shots:
+            storyboard.warnings.append(
+                "omitted_storyboard_shots: " + ", ".join(shot.id for shot in omitted_shots)
+            )
+        if publish_mode != "preview_only" and missing_required_shot_ids:
+            raise ValueError("missing_required_shots: " + ", ".join(missing_required_shot_ids))
+
         for index, shot in enumerate(matched_shots, start=1):
             node_id = f"source_{index}"
             source_node_ids.append(node_id)
@@ -253,6 +275,7 @@ class PipelineBuilder:
             source_node_ids,
             storyboard=storyboard,
             metadata=metadata,
+            target_duration=effective_duration,
         )
         self._append_storyboard_output(nodes, edges, assembly_output, storyboard=storyboard, metadata=metadata)
         self._append_storyboard_upload(nodes, edges, storyboard=storyboard, metadata=metadata, publish_mode=publish_mode)
@@ -266,6 +289,7 @@ class PipelineBuilder:
         *,
         storyboard: StoryboardPlan,
         metadata: AutoFlowMetadata | None,
+        target_duration: float | None = None,
     ) -> str:
         if len(input_node_ids) < 2:
             return input_node_ids[0]
@@ -282,7 +306,7 @@ class PipelineBuilder:
                     "output_format": "mp4",
                     "transition": "none",
                     "transition_duration": 0,
-                    "target_duration": storyboard.total_duration,
+                    "target_duration": storyboard.total_duration if target_duration is None else target_duration,
                     "normalize_resolution": True,
                     "width": width,
                     "height": height,

@@ -1,5 +1,11 @@
 # VideoProcess Smart Trim 与 Storyboard Planner 实施规格
 
+> **Status:** Historical implementation plan
+>
+> **Applies to:** The original Smart Trim and Storyboard Planner design, including proposed phases and future extensions. Code sketches and target behavior below are not current API contracts.
+>
+> **Superseded by:** [`docs/current-architecture.md`](../docs/current-architecture.md) for current planning-mode, storyboard completeness, provenance, and rights behavior. Executable generated assets and a richer structured-script layer remain future work.
+
 > 目标：在 `videoprocess` 中新增面向自然语言剪辑的 `smart_trim` 能力，并新增可扩展的 storyboard planner，使系统能够：
 >
 > 1. 从输入视频中剪辑出语言描述的片段。

@@ -241,7 +241,9 @@ async def test_graph_planner_reports_unavailable_for_generic_prompt():
 
 
 @pytest.mark.asyncio
-async def test_graph_planner_uses_experimental_provider_before_rule_fallback():
+async def test_graph_planner_uses_experimental_provider_before_rule_fallback(monkeypatch):
+    from app.autoflow.graph_planner import settings
+    monkeypatch.setattr(settings, "autoflow_ai_enabled", True)
     class FakeProvider:
         async def draft_for_request(self, request, manifest):
             return _dog_cat_draft(), "fake_llm"

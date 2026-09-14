@@ -7,6 +7,7 @@ import hmac
 import math
 import mimetypes
 import os
+import ssl
 import shutil
 import tempfile
 import time
@@ -397,7 +398,7 @@ class YouTubeUploadHandler(BaseHandler):
     ) -> Any:
         deadline = time.monotonic() + self._timeout_seconds
         while True:
-            if self._cancelled:
+            if self._poll_cancelled():
                 await self._mark_uncertain(
                     operation,
                     "YouTubeManager upload polling was cancelled",
@@ -418,6 +419,13 @@ class YouTubeUploadHandler(BaseHandler):
                     timeout_seconds=request_timeout,
                     cancelled=self._drill_cancelled,
                 )
+            except CancelledError:
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload polling was cancelled",
+                    context,
+                )
+                raise
             except asyncio.CancelledError:
                 await self._mark_uncertain(
                     operation,
@@ -425,6 +433,27 @@ class YouTubeUploadHandler(BaseHandler):
                     context,
                 )
                 raise
+            except (TimeoutError, httpx.TransportError) as exc:
+                if self._poll_cancelled():
+                    await self._mark_uncertain(
+                        operation,
+                        "YouTubeManager upload polling was cancelled",
+                        context,
+                    )
+                    raise CancelledError(
+                        "youtube upload cancelled during polling"
+                    ) from exc
+                if self._is_recoverable_poll_failure(exc):
+                    # The canonical Manager task was durably recorded before
+                    # polling. Keep it submitted so a fresh, authorized claim can
+                    # query that exact task without crossing the POST fence.
+                    raise RuntimeError("YouTubeManager upload status is uncertain") from exc
+                await self._mark_uncertain(
+                    operation,
+                    "YouTubeManager upload status is uncertain",
+                    context,
+                )
+                raise RuntimeError("YouTubeManager upload status is uncertain") from exc
             except Exception as exc:
                 await self._mark_uncertain(
                     operation,
@@ -440,7 +469,7 @@ class YouTubeUploadHandler(BaseHandler):
                 )
                 raise
 
-            if self._cancelled:
+            if self._poll_cancelled():
                 await self._mark_uncertain(
                     operation,
                     "YouTubeManager upload polling was cancelled",
@@ -484,11 +513,6 @@ class YouTubeUploadHandler(BaseHandler):
                 )
                 raise RuntimeError("YouTubeManager returned an unknown upload status")
             if time.monotonic() >= deadline:
-                await self._mark_uncertain(
-                    operation,
-                    "YouTubeManager upload polling timed out",
-                    context,
-                )
                 raise RuntimeError("YouTubeManager upload polling timed out")
             await asyncio.sleep(
                 self._poll_interval_seconds if self._ack_drill is None
@@ -586,6 +610,43 @@ class YouTubeUploadHandler(BaseHandler):
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(request_task, cancellation, return_exceptions=True)
+
+    @classmethod
+    def _is_recoverable_poll_failure(cls, exc: BaseException) -> bool:
+        if cls._exception_chain_contains(exc, ssl.SSLError):
+            return False
+        return isinstance(
+            exc,
+            (TimeoutError, httpx.TimeoutException, httpx.NetworkError),
+        )
+
+    def _poll_cancelled(self) -> bool:
+        return self._cancelled or (
+            self._drill_cancelled is not None
+            and self._drill_cancelled.is_set()
+        )
+
+    @staticmethod
+    def _exception_chain_contains(
+        exc: BaseException,
+        exception_type: type[BaseException],
+    ) -> bool:
+        pending = [exc]
+        seen: set[int] = set()
+        while pending:
+            current = pending.pop()
+            identity = id(current)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if isinstance(current, exception_type):
+                return True
+            pending.extend(
+                linked
+                for linked in (current.__cause__, current.__context__)
+                if linked is not None
+            )
+        return False
 
     async def _persist_manager_task(
         self,

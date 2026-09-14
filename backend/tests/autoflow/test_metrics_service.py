@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.autoflow import router
 from app.api import autoflow as autoflow_api_module
+from tests.autoflow.factories import FixtureMaterialSelector
 from app.autoflow.metrics_service import MetricsService
 from app.db import get_db
 from app.models.autoflow import AutoFlowPlan as AutoFlowPlanModel
@@ -184,7 +185,8 @@ def test_metrics_service_aggregates_by_template_id():
 
 
 @pytest.mark.asyncio
-async def test_metrics_api_collects_lists_and_summarizes_run_metrics():
+async def test_metrics_api_collects_lists_and_summarizes_run_metrics(monkeypatch):
+    monkeypatch.setattr(autoflow_api_module.autoflow_service, "material_selector", FixtureMaterialSelector())
     _reset_autoflow_singletons()
     app = FastAPI()
     app.include_router(router)

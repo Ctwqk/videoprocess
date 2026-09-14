@@ -1,5 +1,11 @@
 # VideoProcess ChannelOps Live Agent Spec
 
+> **Status:** Historical rollout specification
+>
+> **Applies to:** The earlier P0–F ChannelOps rollout proposal and its acceptance criteria. Problem statements and completion marks below are historical, not current runtime guarantees.
+>
+> **Superseded by:** [`docs/current-architecture.md`](../docs/current-architecture.md) for the current Go/Python ownership boundary, PDS fallback policy, review gates, and the distinction between feedback observation and active learning.
+
 > 目标：把 `Ctwqk/videoprocess` 的 ChannelOps Agent 从"控制面齐全的早期 Beta"推进到"YouTube 单平台、unlisted-only、单频道少账号、7 天无人值守可跑、30 天低事故"的可运营 Agent v0.1。
 >
 > 本文综合了内部 review 与外部 gpt pro review 的结论。**不追求一次性自主选题、多平台、多账号或 bandit 学习**，这些放到后续阶段；当前阶段唯一目标是让 live 链路真正跑稳，并把目前结构存在、实际不通的几个保护机制修通。

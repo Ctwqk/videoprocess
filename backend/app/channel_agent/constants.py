@@ -8,6 +8,20 @@ QUEUE_HELD = "held"
 QUEUE_CANCELLED = "cancelled"
 QUEUE_DEAD_LETTERED = "dead_lettered"
 
+PYTHON_RUNNER_QUEUE_KINDS = (
+    "agent_tick",
+    "plan_task",
+    "execute_task",
+    "observe_job",
+    "publish_task",
+    "promote_publication",
+    "reconcile_publication",
+    "collect_metrics",
+    "account_health",
+    "send_alert",
+    "cleanup_expired",
+)
+
 TASK_SEEDED = "seeded"
 TASK_SELECTED = "selected"
 TASK_PLANNING = "planning"

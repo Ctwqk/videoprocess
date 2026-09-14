@@ -4,6 +4,11 @@ from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.autoflow.rights_policy import (
+    candidate_is_licensed,
+    candidate_is_owned,
+    candidate_is_public_domain_or_cc,
+)
 from app.autoflow.search_service import SearchService
 from app.schemas.autoflow import AutoFlowClipCandidate, AutoFlowIntent, AutoFlowRequest
 
@@ -39,10 +44,10 @@ class MaterialSelector:
         material = await self.search_service.search_material(intent, request, db=db, max_results=max_results)
 
         if request.source_policy == "owned_only":
-            return CandidateSelectionResult([candidate for candidate in material if _is_owned_material(candidate)], [])
+            return CandidateSelectionResult([candidate for candidate in material if candidate_is_owned(candidate)], [])
 
         if request.source_policy == "licensed_only":
-            return CandidateSelectionResult([candidate for candidate in material if _is_licensed_material(candidate)], [])
+            return CandidateSelectionResult([candidate for candidate in material if candidate_is_licensed(candidate)], [])
 
         if request.source_policy in {"research_only", "remix_with_review"}:
             search_with_warnings = getattr(self.search_service, "search_external_platforms_with_warnings", None)
@@ -69,29 +74,12 @@ class MaterialSelector:
                 [
                     candidate
                     for candidate in material
-                    if candidate.url is None and candidate.metadata.get("license") in {"public_domain", "creative_commons"}
+                    if candidate_is_public_domain_or_cc(candidate)
                 ],
                 [],
             )
 
         return CandidateSelectionResult([candidate for candidate in material if candidate.url is None], [])
-
-
-def _is_owned_material(candidate: AutoFlowClipCandidate) -> bool:
-    return (
-        candidate.url is None
-        and candidate.source_type in {"asset", "material"}
-        and candidate.metadata.get("license") in {None, "owned"}
-    )
-
-
-def _is_licensed_material(candidate: AutoFlowClipCandidate) -> bool:
-    return (
-        candidate.url is None
-        and candidate.source_type in {"asset", "material"}
-        and bool(candidate.metadata.get("license"))
-        and candidate.rights_status == "allowed"
-    )
 
 
 def _force_review_required(candidate: AutoFlowClipCandidate) -> AutoFlowClipCandidate:

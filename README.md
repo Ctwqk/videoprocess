@@ -2,22 +2,24 @@
 
 Multi-platform media workflow platform with channel-agent orchestration, heterogeneous worker tiers, and an event-driven risk-control extension layer. The stack runs as ~16 containerized services locally via Docker Compose and deploys to Kubernetes in production.
 
+The normative runtime and safety contracts are summarized in [`docs/current-architecture.md`](docs/current-architecture.md). Files under `Design/` are historical plans unless they explicitly say otherwise.
+
 ## What This Repo Is
 
 VideoProcess composes three concentric layers:
 
 1. **Ingestion and processing** — FFmpeg transcode, vision inference, headless browser automation across YouTube and other platforms, and Faster-Whisper transcription utilities.
-2. **Channel-ops orchestration** — a typed node registry, a DAG-based workflow orchestrator (`autoflow`), and LLM-driven channel agents that compose pipelines from registered node types and decouple capability declaration from execution.
-3. **Risk-control extension** — a Postgres event outbox, a Kafka relay, and a fail-open pre-flight gate that calls the standalone [`policy-decision-service`](https://github.com/Ctwqk/policy-decision-service) and reads actor features from the in-repo `services/vp-feature-aggregator/` service before publication decisions.
+2. **Channel-ops orchestration** — a typed node registry, a DAG-based workflow orchestrator (`autoflow`), and a Go-owned production ChannelOps runner that submits capability-constrained, deterministic plans through the Python API.
+3. **Risk-control extension** — a Postgres event outbox, a Kafka relay, and an action-aware preflight gate that calls the standalone [`policy-decision-service`](https://github.com/Ctwqk/policy-decision-service) and reads actor features from the in-repo `services/vp-feature-aggregator/` service.
 
 The repository is a polyrepo-friendly monorepo: PDS remains a standalone repo, while the VP feature aggregator now lives under `services/vp-feature-aggregator/` and still communicates with PDS over HTTP and Kafka topics.
 
 ## Highlights
 
-- **Dual-language backend**: Python FastAPI control plane (`backend/app/*`) for channel-ops, orchestration, and integration; Go services (`cmd/vp-api`, `cmd/vp-ffmpeg-worker`, `internal/*`) for low-latency HTTP and FFmpeg worker paths.
+- **Dual-language backend**: Python FastAPI (`backend/app/*`) owns the API, AutoFlow planning, orchestration, and local/test compatibility paths; Go (`cmd/*`, `internal/*`) is the sole production ChannelOps runner and also provides HTTP and FFmpeg worker paths.
 - **Heterogeneous worker tiers**: CPU FFmpeg transcode, GPU vision inference, headless browser automation, and LLM-driven channel agents, all coordinated through idempotent Redis queues with retry/backoff, dead-letter handling, and operator override paths.
 - **Typed node registry + DAG orchestrator**: pipelines composed from registered node types, decoupling capability declaration from execution for pluggable ML, media-processing, and publishing steps.
-- **Risk-control integration**: actor/action events emitted via a transactional Postgres outbox; a relay drains the outbox to Kafka topic `vp.actor.actions.v1` with exponential backoff and bounded-backlog metrics; the channel-ops service calls PDS for pre-flight decisions and treats unavailability as fail-open with explicit warning metadata.
+- **Risk-control integration**: actor/action events are emitted through a transactional Postgres outbox and relayed to Kafka topic `vp.actor.actions.v1`. PDS unavailability uses per-action fallbacks: candidate acceptance allows, plan approval flags for review, and publication or promotion blocks.
 - **Kubernetes-native deployment**: 20 production objects (7 Deployments, 9 Services, 3 StatefulSets, 1 ConfigMap) under a single namespace, extended by PDS, Redpanda, the feature aggregator, and the outbox relay manifests in the companion k8s repo.
 - **Compose-first local development**: a base compose file plus a `docker-compose.pds-kafka.yml` override that adds Redpanda, PDS, the feature aggregator, and the relay without touching the main compose file.
 
@@ -41,7 +43,7 @@ backend/
 │   ├── events/               # Outbox writer, producer, relay
 │   ├── node_registry/        # Typed node-type registry
 │   ├── orchestrator/         # Pipeline orchestration
-│   ├── pds_client.py         # Fail-open async PDS client
+│   ├── pds_client.py         # Action-aware PDS fallback client
 │   ├── services/             # Application services
 │   ├── storage/, schemas/    # Persistence and event models
 │   └── main.py, db.py
@@ -75,7 +77,7 @@ Base compose stack:
 
 - `postgres`, `redis`, `minio`
 - `api` (Python FastAPI), `api-go` (Go sidecar)
-- `channel-agent-runner`, `ffmpeg-worker`, `ffmpeg-worker-go`, `vision-worker`
+- `channel-agent-runner` (legacy local/test profile), `channelops-runner-go`, `ffmpeg-worker`, `ffmpeg-worker-go`, `vision-worker`
 - `youtube-manager`, `platform-browser-manager`, `xiaohongshu-browser-manager`
 - `frontend`
 
@@ -131,7 +133,7 @@ VP worker (publish_video)
    ├── (1) Postgres transaction: business write + outbox row
    │
    ├── (2) Synchronous POST /v1/decide → PDS
-   │         (fail-open on timeout / 5xx)
+   │         (action-specific fallback on timeout / 5xx)
    │
    └── (3) Outbox relay drains row → Kafka vp.actor.actions.v1
 
@@ -151,7 +153,7 @@ Kafka pds.decisions.v1 ──────────────────┘
                                          PDS rules (next decide)
 ```
 
-The loop is fail-open at every boundary: PDS client, feature provider, Kafka sink, and the outbox relay all degrade gracefully so the risk gate is never a single point of failure for the publishing path.
+PDS fallback is intentionally asymmetric. `candidate_accept` falls back to `allow`; `plan_approval` falls back to `flag`; `publish` and `promote_publication` fall back to `block`. Kafka and feature-observation failures remain recoverable data-path failures, but they do not grant publication authority.
 
 ## Testing
 

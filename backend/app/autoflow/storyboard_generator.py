@@ -20,12 +20,20 @@ _MIN_TRIM_SECONDS = 0.3  # SmartTrim's registered min_clip_duration lower bound.
 
 class StoryboardGenerator:
     def generate(self, request: AutoFlowStoryboardRequest) -> AutoFlowStoryboardResponse:
+        if request.min_shots > request.max_shots:
+            raise ValueError("min_shots must not exceed max_shots")
         strategy = _storyboard_strategy(request)
         platform_profile = PlatformProfileService().for_platforms(request.target_platforms)
         subject = _subject(request.prompt)
         base_shots = _shot_templates(subject, request.allow_video_generation or strategy == "generate_missing")
-        shot_count = max(request.min_shots, min(request.max_shots, len(base_shots)))
-        shots, pacing_warnings = _fit_durations(base_shots[:shot_count], request.target_duration, platform_profile)
+        if len(base_shots) < request.min_shots:
+            raise ValueError(
+                "unsupported_shot_count: "
+                f"requested minimum {request.min_shots}, available templates {len(base_shots)}"
+            )
+        shot_count = min(request.max_shots, len(base_shots))
+        selected_shots = _select_shot_templates(base_shots, shot_count)
+        shots, pacing_warnings = _fit_durations(selected_shots, request.target_duration, platform_profile)
         storyboard = StoryboardPlan(
             subject=subject,
             title=_title(subject),
@@ -56,9 +64,15 @@ def _storyboard_strategy(request: AutoFlowStoryboardRequest) -> str:
         if request.allow_video_generation:
             return "generate_missing"
         return "input_video"
-    if request.source_strategy == "auto":
-        return "input_video"
     return request.source_strategy  # type: ignore[return-value]
+
+
+def _select_shot_templates(shots: list[ShotSpec], count: int) -> list[ShotSpec]:
+    if count >= len(shots):
+        return shots
+    if count <= 1:
+        return shots[:count]
+    return [*shots[: count - 1], shots[-1]]
 
 
 def _subject(prompt: str) -> str:
