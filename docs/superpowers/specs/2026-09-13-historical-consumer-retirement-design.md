@@ -36,10 +36,40 @@ Neither alternative is included.
 - At most 64 retiring identities per service, including the direct predecessor;
   at most 260 identities across four services including current registrations.
   Vision uses its existing direct predecessor and has no extra ancestors.
-- All registration/grant/instance/consumer IDs are unique. Every adjacent pair
+- Registration/instance/consumer IDs are unique. Grant IDs are unique except
+  for the precisely defined retiring restart pairs below. Every adjacent pair
   has the same fixed service topology and strictly increasing epoch/generation
   toward the current identity. Foreign IDs, duplicate rows, forks, broken links,
   cycles, overflow or incomplete facts are refusals, never truncation.
+
+### Verified Same-Grant Restart Exception
+
+Read-only production evidence additionally shows CPU epoch268 was revoked with
+`worker_redis_continuity_unready` and no `superseded_by`, followed six seconds
+later by epoch269 under the exact same grant/generation. This is not a transient
+missing current worker. Version2 must prove this narrow restart edge without
+editing historical records; version1 stays unchanged.
+
+Registration, instance and consumer IDs remain globally unique. Grant IDs may
+repeat only for contiguous retiring registrations with identical grant-bound
+identity fields (service/type/host/slot/capability/release/image/principal and all
+endpoint fingerprints), equal generation, adjacent increasing lease epochs and
+strictly increasing registration time. Current-to-predecessor still requires a
+new grant/generation. Every repeated SQL grant fact must be exactly identical;
+collapse only the exact pin-required multiplicity to one logical grant fact.
+
+An absent successor pointer is accepted only for such a same-grant adjacent
+retiring pair when the older registration is revoked for precisely
+`worker_redis_continuity_unready` and its revocation time lies between its own
+registration time and the newer registration time. A nonnull wrong pointer,
+other reason, missing/reordered epoch, different grant, or changed identity is
+still refused. The shared retiring grant must be revoked and both old leases
+expired before mutation, as with other retiring identities. Explicit same-grant
+successor links may use the same adjacent identity proof.
+
+Capture and the restricted SQL guard use the same exact edge predicate; no
+generic chronological fallback, schema/data repair, active-grant consumer
+retirement, or broader cleanup authority is introduced.
 
 ## Capture
 
@@ -70,7 +100,8 @@ terminal-upload proof, row locks, observed time and typed result checks.
 
 The new guard accepts at most 256 retiring registration IDs and verifies each
 superseded_by link stays within the selected set, on the same service/host/slot,
-with strictly increasing epoch and grant generation. Only the four current IDs
+with strictly increasing epoch and increasing grant generation, except the
+same-grant retiring restart proof above. Only the four current IDs
 may be active roots. Thus every selected retired chain must terminate at its
 corresponding current identity. Preserve SECURITY DEFINER, pg_catalog search
 path and operator-only execution; no new table privilege is granted.

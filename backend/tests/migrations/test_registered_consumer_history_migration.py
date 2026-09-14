@@ -29,9 +29,9 @@ def test_history_guard_is_additive_and_preserves_safety_predicates():
         "cardinality(p_current) <> 4",
         "cardinality(p_predecessor) > 256",
         "HAVING count(*) > 64",
-        "NOT registration.superseded_by = ANY(v_ids)",
+        "successor.id = ANY(v_ids)",
         "old_row.lease_epoch >= next_row.lease_epoch",
-        "old_grant.generation >= next_grant.generation",
+        "old_grant.generation > next_grant.generation",
         "old_row.service_name IS DISTINCT FROM next_row.service_name",
         "old_row.worker_host IS DISTINCT FROM next_row.worker_host",
         "old_row.worker_slot IS DISTINCT FROM next_row.worker_slot",
@@ -43,6 +43,21 @@ def test_history_guard_is_additive_and_preserves_safety_predicates():
         assert fragment in sql
     assert "CREATE OR REPLACE" not in sql
     assert "CREATE FUNCTION public.vp_registered_consumer_reconcile_guard(" not in sql
+
+
+def test_history_guard_restart_exception_is_exact_and_read_only():
+    sql = migration()["guard_sql"]()
+    for fragment in (
+        "registration.superseded_by IS NULL",
+        "registration.revoke_reason = 'worker_redis_continuity_unready'",
+        "registration.grant_id = successor.grant_id",
+        "registration.lease_epoch + 1 = successor.lease_epoch",
+        "registration.revoked_at <= successor.registered_at",
+        "registration.registered_at <= registration.revoked_at",
+        "next_row.id = ANY(p_current)",
+    ):
+        assert fragment in sql
+    assert "UPDATE public.worker_registrations" not in sql
 
 
 def test_history_guard_grants_only_operator_execute_and_drops_only_new_guard(monkeypatch):

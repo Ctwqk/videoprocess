@@ -31,7 +31,7 @@ Interfaces: preserve existing APIs; add `WorkerPin.ancestors=()`,
 Lua. Existing test helpers `document`, `decode`, `facts`, `inventories` provide
 the legacy fixture; new helpers build extra revoked generations explicitly.
 
-- [ ] Write and observe RED for version 2 multi-generation decode/assessment.
+- [x] Write and observe RED for version 2 multi-generation decode/assessment.
 
 ```python
 from tests.services.test_registered_consumer_reconcile import document, decode
@@ -46,31 +46,34 @@ def test_v2_empty_ancestry_round_trip():
     assert all(worker.retiring == (worker.predecessor,) for worker in pins.workers)
 ```
 
-- [ ] Add bounded ancestors, exact chain checks, all-old inventory assessment
+- [x] Add bounded ancestors, exact chain checks, all-old inventory assessment
   and per-stream versioned Lua/result validation, preserving version 1 bytes.
-- [ ] Test three-generation success, missing/foreign/forked identities,
+- [x] Test three-generation success, missing/foreign/forked identities,
   duplicate/overflow, stale current, young old consumers, active leases,
   zero/partial old-name presence and non-replay after uncertainty.
-- [ ] Run old and new pure tests; prepare opt-in real Redis cases for parent.
-- [ ] Parent reviews and commits this tested unit without staging other units.
+- [x] Run old and new pure tests; prepare opt-in real Redis cases for parent.
+- [x] Parent reviews and commits this tested unit without staging other units.
 
 ## Task 2: Capture And Managed Transport
 
 Files: `backend/app/services/registered_consumer_reconcile_job.py`,
 new `backend/app/services/registered_consumer_history_capture.py`,
 `backend/tests/services/test_registered_consumer_reconcile_job.py`,
-new `backend/tests/services/test_registered_consumer_history_capture.py`.
+new `backend/tests/services/test_registered_consumer_history_capture.py`,
+the native capture-result equality check in
+`deploy/swarm/worker-admission-transaction.py` and its
+`tests/test_registered_runtime_deploy.py` tests.
 
 Interfaces: `build_capture_pins(..., history=None)` accepts a mapping from each
 fixed service to its newest-first retiring IdentityPin sequence. Native current
 capture supplies that mapping; legacy callers remain version 1. The helper
 `capture_history(connection, client, snapshot, baseline)` returns this mapping.
 
-- [ ] Write failing tests proving historical capture reaches an old Redis
+- [x] Write failing tests proving historical capture reaches an old Redis
   identity through absent intermediate consumers and refuses a broken link.
-- [ ] Implement bounded fixed-stream Redis reads and recursive read-only DB
+- [x] Implement bounded fixed-stream Redis reads and recursive read-only DB
   capture to the oldest required name, retaining complete grant provenance.
-- [ ] Extend stdlib-only binding validation to version 2 without importing ORM
+- [x] Extend stdlib-only binding validation to version 2 without importing ORM
   dependencies on the deploy host. Bind command hashes to the complete pin set.
 
 ```python
@@ -81,7 +84,7 @@ def test_legacy_binding_still_valid(tmp_path):
     assert binding['pin_json'] == request.pins.canonical_json
 ```
 
-- [ ] Keep 15-second capture bound, direct no-retry Redis connection and bounded
+- [x] Keep 15-second capture bound, direct no-retry Redis connection and bounded
   cleanup. Test changed identities, unknown names, overflow and cancellation.
 - [ ] Run managed-job and new capture tests; parent reviews and commits unit.
 
@@ -97,7 +100,7 @@ migration/runtime/role/head tests.
 Interfaces: new SQL guard name from spec with the existing typed row shape;
 runtime selects it only for version 2 and passes all `worker.retiring` IDs.
 
-- [ ] Write failing migration/runtime tests for new guard, bound and selection.
+- [x] Write failing migration/runtime tests for new guard, bound and selection.
 
 ```python
 def test_release_head_includes_historical_guard():
@@ -105,18 +108,18 @@ def test_release_head_includes_historical_guard():
     assert EXPECTED_MIGRATION_HEAD == '045_registered_consumer_history'
 ```
 
-- [ ] Derive the new guard from existing 039/041 safety semantics, keep old
+- [x] Derive the new guard from existing 039/041 safety semantics, keep old
   guard untouched, enforce bounded complete monotonic same-service chains,
   revoke PUBLIC and add only the operator function allowlist entry.
-- [ ] Extend endpoint and row decoding checks across every retiring pin while
+- [x] Extend endpoint and row decoding checks across every retiring pin while
   preserving all timeout/authority/cleanup behavior.
-- [ ] Run focused offline tests and parent-only real PG/Redis qualification;
+- [x] Run focused offline tests and parent-only real PG/Redis qualification;
   verify wrong roles, chain changes, row locking and rollback cleanup.
-- [ ] Parent reviews and commits the integrated fix after full backend checks.
+- [x] Parent reviews and commits the integrated fix after full backend checks.
 
 ## Task 4: Consolidate And Verify
 
-- [ ] Save original refs, worktree status and untracked document digest in an
+- [x] Save original refs, worktree status and untracked document digest in an
   ignored audit artifact. Confirm live origin/main and absence of origin/master.
 - [ ] Merge all five uncovered branch tips into the fixed integration branch;
   resolve conflicts against current behavior, preserving new tests and APIs.
@@ -127,6 +130,6 @@ def test_release_head_includes_historical_guard():
 - [ ] Fast-forward every clean existing worktree and remaining local branch;
   preserve dirty/untracked work instead of resetting it. Update covered remote
   feature branches to final main using normal fast-forward pushes.
-- [ ] Dry-run and prune only the eight proven missing worktree metadata entries.
+- [x] Dry-run and prune only the eight proven missing worktree metadata entries.
 - [ ] Verify all original branch tips are ancestors, every local/remote branch
   and existing worktree HEAD matches main, and original document digest matches.

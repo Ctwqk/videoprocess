@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
@@ -156,6 +157,21 @@ class IdentityPin:
         )
 
 
+def same_grant_restart(old: IdentityPin, newer: IdentityPin) -> bool:
+    grant_fields = (
+        "grant_id", "generation", "service_name", "worker_type", "worker_host",
+        "worker_slot", "capabilities", "release_commit", "image_identity",
+        "database_principal", "database_fingerprint", "redis_fingerprint",
+        "storage_fingerprint",
+    )
+    return (
+        type(old) is IdentityPin and type(newer) is IdentityPin
+        and old.lease_epoch + 1 == newer.lease_epoch
+        and old.registered_at < newer.registered_at
+        and all(getattr(old, name) == getattr(newer, name) for name in grant_fields)
+    )
+
+
 @dataclass(frozen=True)
 class WorkerPin:
     current: IdentityPin
@@ -180,14 +196,16 @@ class WorkerPin:
         )
         _require(len(self.retiring) <= MAX_RETIRING_PER_SERVICE, "pin_history_limit")
         successor = self.current
-        for old in self.retiring:
+        for index, old in enumerate(self.retiring):
             _require(type(old) is IdentityPin, "pin_predecessor_invalid")
             _require(
                 old.service_name == successor.service_name
                 and old.lease_epoch < successor.lease_epoch
-                and old.generation < successor.generation
+                and (
+                    (old.generation < successor.generation and old.grant_id != successor.grant_id)
+                    or (index > 0 and same_grant_restart(old, successor))
+                )
                 and old.registration_id != successor.registration_id
-                and old.grant_id != successor.grant_id
                 and old.worker_instance_id != successor.worker_instance_id,
                 "pin_successor_invalid",
             )
@@ -257,7 +275,6 @@ class PinDocument:
         )
         for field in (
             "registration_id",
-            "grant_id",
             "worker_instance_id",
             "redis_consumer_id",
         ):
@@ -265,6 +282,17 @@ class PinDocument:
                 len({getattr(pin, field) for pin in identities}) == len(identities),
                 "pin_duplicate_identity",
             )
+        seen_grants = set()
+        for worker in self.workers:
+            previous = worker.current
+            for index, pin in enumerate((worker.current, *worker.retiring)):
+                if pin.grant_id in seen_grants:
+                    _require(
+                        self.version == 2 and index >= 2 and same_grant_restart(pin, previous),
+                        "pin_duplicate_identity",
+                    )
+                seen_grants.add(pin.grant_id)
+                previous = pin
 
     @property
     def canonical_json(self) -> str:
@@ -467,6 +495,27 @@ def _revoked(value: WorkerRegistration | WorkerAdmissionGrant, now: datetime) ->
     )
 
 
+def collapse_grant_facts(
+    pins: PinDocument, grants: Sequence[WorkerAdmissionGrant]
+) -> list[WorkerAdmissionGrant]:
+    """Collapse only exact repeated join rows required by immutable v2 pins."""
+    _require(pins.version == 2, "database_facts_invalid")
+    _require(all(isinstance(row, WorkerAdmissionGrant) for row in grants), "database_facts_invalid")
+    expected = Counter(pin.grant_id for worker in pins.workers for pin in (worker.current, *worker.retiring))
+    _require(Counter(row.id for row in grants) == expected, "database_pin_set_changed")
+    by_id: dict[UUID, WorkerAdmissionGrant] = {}
+    for row in grants:
+        if row.id in by_id:
+            _require(
+                all(getattr(row, column.key) == getattr(by_id[row.id], column.key)
+                    for column in WorkerAdmissionGrant.__table__.columns),
+                "database_duplicate_facts",
+            )
+        else:
+            by_id[row.id] = row
+    return list(by_id.values())
+
+
 def validate_database(
     pins: PinDocument,
     registrations: Sequence[WorkerRegistration],
@@ -560,7 +609,18 @@ def validate_database(
                     and grant.state == "revoked"
                     and _revoked(row, now)
                     and _revoked(grant, now)
-                    and _same(row.superseded_by, successor.registration_id),
+                    and (
+                        _same(row.superseded_by, successor.registration_id)
+                        or (
+                            pins.version == 2
+                            and successor is not worker.current
+                            and row.superseded_by is None
+                            and row.revoke_reason == "worker_redis_continuity_unready"
+                            and same_grant_restart(pin, successor)
+                            and _aware(row.revoked_at)
+                            and pin.registered_at <= row.revoked_at <= successor.registered_at
+                        )
+                    ),
                     "predecessor_not_superseded",
                 )
                 if row.lease_expires_at > now and pin.service_name not in waiting:

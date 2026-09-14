@@ -8,7 +8,12 @@ Runtime imports are lazy so the host journal can reuse the stdlib-only parser.
 from __future__ import annotations
 
 import asyncio
+import ast
+from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 import copy
+from datetime import datetime
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -34,6 +39,18 @@ STREAMS = {
 }
 SERVICES = set(STREAMS) | {"vp-vision-worker-swarm"}
 OUTCOMES = {"retired", "already_absent", "unknown"}
+PIN_TOPOLOGY = {
+    "vp-ffmpeg-worker-go-swarm": ("ffmpeg_go", "colima-127", "media_cpu"),
+    "vp-ffmpeg-worker-gpu-swarm": ("ffmpeg", "150-gpu", "media_gpu"),
+    "vp-vision-worker-swarm": ("vision", "150-vision", "vision_gpu"),
+    "vp-youtube-publisher-swarm": ("youtube_publisher", "150-publisher", "youtube_publisher"),
+}
+IDENTITY_FIELDS = {
+    "registration_id", "grant_id", "generation", "service_name", "worker_type", "worker_host",
+    "capabilities", "release_commit", "image_identity", "database_principal", "worker_instance_id",
+    "worker_slot", "redis_consumer_id", "lease_epoch", "registered_at", "database_fingerprint",
+    "redis_fingerprint", "storage_fingerprint",
+}
 CREDENTIAL_FIELDS = {
     "control_generation",
     "redis_generation",
@@ -245,6 +262,119 @@ def make_binding(request: Any, files: dict, *, descriptor_sha256: str) -> dict:
     return binding
 
 
+@lru_cache(maxsize=2)
+def _command_lua(version: int) -> str:
+    # The deploy host has no ORM. Read only the inert literal from the same
+    # release source as EvalCommand, without importing or executing that module.
+    name = "ATOMIC_RECONCILE_LUA" if version == 1 else "ATOMIC_RECONCILE_HISTORY_LUA"
+    source = Path(__file__).with_name("registered_consumer_reconcile.py").read_text()
+    values = [
+        ast.literal_eval(node.value)
+        for node in ast.parse(source).body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+    ]
+    require(len(values) == 1 and type(values[0]) is str)
+    return values[0]
+
+
+def _validate_pin_identity(value: object, service: str) -> dict:
+    pin = exact(value, IDENTITY_FIELDS)
+    for name in ("registration_id", "grant_id", "worker_instance_id"):
+        require(type(pin[name]) is str)
+        parsed = UUID(pin[name])
+        require(parsed.int != 0 and str(parsed) == pin[name])
+    worker_type, host, capability = PIN_TOPOLOGY[service]
+    require(
+        pin["service_name"] == service and pin["worker_type"] == worker_type
+        and pin["worker_host"] == host and pin["capabilities"] == [capability]
+        and type(pin["worker_slot"]) is int and pin["worker_slot"] == 1
+        and integer(pin["generation"], 1) and integer(pin["lease_epoch"], 1)
+        and pin["redis_consumer_id"] == f"{worker_type}-worker@{host}:1:{pin['worker_instance_id']}"
+    )
+    require(
+        matches(pin["release_commit"], r"[0-9a-f]{40}")
+        and matches(pin["image_identity"], r"[A-Za-z0-9][A-Za-z0-9._/-]*:deploy-[0-9a-f]{12}")
+        and len(pin["image_identity"]) <= 255
+        and pin["image_identity"].endswith(":deploy-" + pin["release_commit"][:12])
+        and matches(pin["database_principal"], r"[A-Za-z_][A-Za-z0-9_]{0,62}")
+    )
+    require(type(pin["registered_at"]) is str)
+    timestamp = datetime.fromisoformat(pin["registered_at"])
+    require(timestamp.tzinfo is not None and timestamp.utcoffset() is not None)
+    for name in ("database_fingerprint", "redis_fingerprint", "storage_fingerprint"):
+        require(matches(pin[name], r"[0-9a-f]{64}"))
+    return pin
+
+
+def validate_capture_pins(value: dict) -> dict:
+    """Strict stdlib-only pin/command validation for the native capture adapter."""
+    try:
+        exact(value, {"pin_json", "pin_sha256", "commands"})
+        require(type(value["pin_json"]) is str)
+        raw = value["pin_json"].encode("ascii")
+        pins = exact(decode(raw + b"\n"), {"version", "transaction_id", "revision", "release_commit", "workers"})
+        require(hashlib.sha256(raw).hexdigest() == value["pin_sha256"])
+        version = pins["version"]
+        require(type(version) is int and version in (1, 2))
+        require(matches(pins["transaction_id"], r"tx-[0-9a-f]{32}"))
+        require(integer(pins["revision"]) and matches(pins["release_commit"], r"[0-9a-f]{40}"))
+        require(type(pins["workers"]) is list and len(pins["workers"]) == 4)
+        identities, commands, seen_grants = [], {}, set()
+        for service, worker in zip(PIN_TOPOLOGY, pins["workers"], strict=True):
+            exact(worker, {"current", "predecessor"} | ({"ancestors"} if version == 2 else set()))
+            current = _validate_pin_identity(worker["current"], service)
+            require(current["release_commit"] == pins["release_commit"])
+            require(current["grant_id"] not in seen_grants)
+            seen_grants.add(current["grant_id"])
+            ancestors = worker.get("ancestors", [])
+            require(type(ancestors) is list)
+            predecessor = worker["predecessor"]
+            require(not ancestors or (predecessor is not None and service in STREAMS))
+            retiring = ([] if predecessor is None else [predecessor]) + ancestors
+            require(len(retiring) <= 64)
+            identities.append(current)
+            successor = current
+            for index, old in enumerate(retiring):
+                _validate_pin_identity(old, service)
+                # Stdlib projection of same_grant_restart: only retiring pairs,
+                # with every grant-bound field identical and an adjacent restart.
+                restart = (
+                    version == 2 and index > 0
+                    and old["lease_epoch"] + 1 == successor["lease_epoch"]
+                    and datetime.fromisoformat(old["registered_at"])
+                    < datetime.fromisoformat(successor["registered_at"])
+                    and all(old[field] == successor[field] for field in IDENTITY_FIELDS - {
+                        "registration_id", "worker_instance_id", "redis_consumer_id",
+                        "lease_epoch", "registered_at",
+                    })
+                )
+                require(
+                    old["lease_epoch"] < successor["lease_epoch"]
+                    and (
+                        old["generation"] < successor["generation"]
+                        and old["grant_id"] != successor["grant_id"]
+                        or restart
+                    )
+                )
+                require(old["grant_id"] not in seen_grants or restart)
+                seen_grants.add(old["grant_id"])
+                identities.append(old)
+                successor = old
+            if retiring and service in STREAMS:
+                commands[STREAMS[service]] = digest([
+                    "EVAL", _command_lua(version), 1, STREAMS[service],
+                    current["redis_consumer_id"], *[old["redis_consumer_id"] for old in retiring],
+                ])
+        require(len(identities) <= 260)
+        for name in ("registration_id", "worker_instance_id", "redis_consumer_id"):
+            require(len({pin[name] for pin in identities}) == len(identities))
+        require(type(value["commands"]) is dict and value["commands"] == commands)
+        return pins
+    except Exception:
+        raise ProtocolError() from None
+
+
 def validate_binding(binding: dict) -> None:
     exact(
         binding,
@@ -289,13 +419,15 @@ def validate_binding(binding: dict) -> None:
         and pins["revision"] == binding["binding_revision"]
         and pins["release_commit"] == binding["release_commit"]
         and type(pins["version"]) is int
-        and pins["version"] == 1
+        and pins["version"] in (1, 2)
     )
+    if pins["version"] == 2:
+        validate_capture_pins({key: binding[key] for key in ("pin_json", "pin_sha256", "commands")})
     require(type(pins["workers"]) is list and len(pins["workers"]) == 4)
     targets = {}
     expected_streams = set()
     for worker in pins["workers"]:
-        exact(worker, {"current", "predecessor"})
+        exact(worker, {"current", "predecessor"} | ({"ancestors"} if pins["version"] == 2 else set()))
         current = worker["current"]
         require(type(current) is dict)
         service = current.get("service_name")
@@ -1057,7 +1189,7 @@ def read_input(path: Path, metadata: dict | None = None) -> dict:
         os.close(descriptor)
 
 
-async def read_snapshot(connection: Any) -> dict:
+async def read_snapshot(connection: Any, *, _in_transaction: bool = False) -> dict:
     from app.models.worker_registration import WorkerAdmissionGrant, WorkerRegistration
 
     registration_fields = (
@@ -1101,7 +1233,11 @@ async def read_snapshot(connection: Any) -> dict:
         "revoked_at",
         "revoke_reason",
     )
-    async with connection.transaction(isolation="repeatable_read", readonly=True):
+    transaction = (
+        nullcontext() if _in_transaction
+        else connection.transaction(isolation="repeatable_read", readonly=True)
+    )
+    async with transaction:
         now = await connection.fetchval("SELECT transaction_timestamp()")
         collections = []
         for table, model, fields, state in (
@@ -1136,26 +1272,39 @@ def build_capture_pins(
     transaction_id: str,
     revision: int,
     release_commit: str,
+    history: Mapping[str, Sequence[Any]] | None = None,
 ) -> dict:
+    from dataclasses import asdict
     from app.services.registered_consumer_reconcile import EvalCommand, decode_pins
+    from app.services.registered_consumer_reconcile import IdentityPin, _json_scalar
 
     try:
         for value in (snapshot, baseline):
             exact(value, {"observed_at", "workers"})
             require(type(value["workers"]) is list and len(value["workers"]) == 4)
+        workers = []
+        if history is not None:
+            require(isinstance(history, Mapping) and set(history) == SERVICES)
+        for current, old in zip(snapshot["workers"], baseline["workers"], strict=True):
+            worker = dict(current=current, predecessor=old)
+            if history is not None:
+                retiring = history[current["service_name"]]
+                require(isinstance(retiring, Sequence) and len(retiring) <= 64)
+                require(all(type(pin) is IdentityPin for pin in retiring))
+                values = json.loads(json.dumps(
+                    [asdict(pin) for pin in retiring], default=_json_scalar
+                ))
+                require((values[0] if values else None) == old)
+                worker["ancestors"] = values[1:]
+            workers.append(worker)
         pins = decode_pins(
             json.dumps(
                 dict(
-                    version=1,
+                    version=1 if history is None else 2,
                     transaction_id=transaction_id,
                     revision=revision,
                     release_commit=release_commit,
-                    workers=[
-                        dict(current=current, predecessor=old)
-                        for current, old in zip(
-                            snapshot["workers"], baseline["workers"], strict=True
-                        )
-                    ],
+                    workers=workers,
                 )
             )
         )
@@ -1379,13 +1528,23 @@ async def capture_managed(value: dict) -> dict:
         _read_mount,
         _line,
         FORBIDDEN_ENV,
+        Credentials,
+        create_redis,
+        _io,
+        _close,
+        _owned_cleanup,
+        CLOSE_SECONDS,
+        ROLLBACK_SECONDS,
     )
+    from app.services.registered_consumer_history_capture import capture_history
     from app.services.worker_control_role_cli import role_names_for_generation
     from app.services.worker_role_cli_common import asyncpg_url
 
-    connection = None
+    connection = client = None
+    deadline = asyncio.get_running_loop().time() + 15
     try:
-        async with asyncio.timeout(15):
+        # Reserve read-only rollback and both closes inside the 15-second budget.
+        async with asyncio.timeout_at(deadline - ROLLBACK_SECONDS - 2 * CLOSE_SECONDS):
             require(not any(os.environ.get(name) for name in FORBIDDEN_ENV))
             credentials = exact(
                 value["credentials"],
@@ -1412,6 +1571,10 @@ async def capture_managed(value: dict) -> dict:
                 and bool(parsed.password)
                 and matches(username, r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
                 and username != "default"
+                and parsed.port is not None
+                and not parsed.query
+                and not parsed.fragment
+                and re.fullmatch(r"/(0|[1-9][0-9]*)", parsed.path) is not None
             )
             connection = await asyncpg.connect(
                 asyncpg_url(_line(database)), timeout=2, command_timeout=2
@@ -1457,19 +1620,33 @@ async def capture_managed(value: dict) -> dict:
                 pins=None,
             )
             if value["baseline"] is not None:
+                client = create_redis(Credentials(
+                    _line(database), _line(redis), database_binding["database"], principal
+                ))
+                require(await _io(client.acl_whoami()) == username)
+                history = await capture_history(connection, client, snapshot, value["baseline"])
                 result["pins"] = build_capture_pins(
                     snapshot,
                     value["baseline"],
                     transaction_id=value["transaction_id"],
                     revision=value["revision"],
                     release_commit=value["release_commit"],
+                    history=history,
                 )
             return result
     except Exception:
         raise ProtocolError() from None
     finally:
-        if connection is not None:
-            await connection.close(timeout=2)
+        try:
+            await _owned_cleanup(_close(connection, client), 2 * CLOSE_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ProtocolError() from None
+        finally:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise asyncio.CancelledError
 
 
 def _mounted_files(files: dict) -> dict:

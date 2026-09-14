@@ -23,6 +23,126 @@ GENERATION = "c-0123456789abcdef0123"
 SECRET = f"vp-wc-orchestrator-{GENERATION}"
 
 
+def registered_capture_result_case(tmp_path, monkeypatch, version, *, restart=False):
+    from uuid import UUID
+
+    helper = runpy.run_path(str(EXTENSION.with_name("worker-admission-transaction.py")))
+    protocol = helper["_registered_protocol"]()
+    commit, transaction = "a" * 40, "tx-" + "b" * 32
+    workers = []
+    for index, (service, topology) in enumerate(protocol["PIN_TOPOLOGY"].items()):
+        worker_type, host, capability = topology
+
+        def pin(depth):
+            number = 100 + index * 100 + depth * 3
+            instance = str(UUID(int=number + 2))
+            return dict(
+                registration_id=str(UUID(int=number)), grant_id=str(UUID(int=number + 1)),
+                generation=4 - depth, service_name=service, worker_type=worker_type,
+                worker_host=host, capabilities=[capability], release_commit=commit,
+                image_identity=f"vp-{worker_type}:deploy-{commit[:12]}", database_principal="vp_worker_1",
+                worker_instance_id=instance, worker_slot=1,
+                redis_consumer_id=f"{worker_type}-worker@{host}:1:{instance}", lease_epoch=4 - depth,
+                registered_at="2026-09-13T00:00:00+00:00", database_fingerprint="c" * 64,
+                redis_fingerprint="d" * 64, storage_fingerprint="e" * 64,
+            )
+
+        worker = dict(current=pin(0), predecessor=pin(1))
+        if version == 2:
+            worker["ancestors"] = [] if worker_type == "vision" else [pin(2), pin(3)]
+        workers.append(worker)
+    if restart:
+        older, newer = workers[0]["ancestors"][0], workers[0]["predecessor"]
+        older["grant_id"] = newer["grant_id"]
+        older["generation"] = newer["generation"]
+        older["registered_at"] = "2026-09-12T23:59:54+00:00"
+    pins = dict(version=version, transaction_id=transaction, revision=7, release_commit=commit, workers=workers)
+    pin_json = protocol["canonical"](pins).decode().rstrip("\n")
+    commands = {
+        protocol["STREAMS"][worker["current"]["service_name"]]: protocol["digest"]([
+            "EVAL", protocol["_command_lua"](version), 1,
+            protocol["STREAMS"][worker["current"]["service_name"]],
+            worker["current"]["redis_consumer_id"], worker["predecessor"]["redis_consumer_id"],
+            *[pin["redis_consumer_id"] for pin in worker.get("ancestors", [])],
+        ])
+        for worker in workers if worker["current"]["service_name"] in protocol["STREAMS"]
+    }
+    credentials = dict(
+        control_generation="control-1", redis_generation="redis-1", redis_secret_name="vp-control-redis-1",
+        database_secret_id="a" * 25, redis_secret_id="b" * 25,
+        database_secret_sha256="c" * 64, redis_secret_sha256="d" * 64, redis_username="vp_control_1",
+    )
+    result = dict(
+        snapshot=dict(observed_at="2026-09-13T00:00:00+00:00", workers=[w["current"] for w in workers]),
+        credentials=credentials,
+        pins=dict(pin_json=pin_json, pin_sha256=hashlib.sha256(pin_json.encode()).hexdigest(), commands=commands),
+    )
+    supplied = dict(revision=7, baseline=dict(
+        observed_at="2026-09-13T00:00:00+00:00", workers=[copy.deepcopy(w["predecessor"]) for w in workers],
+    ))
+    document = dict(
+        transaction_id=transaction, target_commit=commit,
+        baseline=dict(services=[dict(name=w["current"]["service_name"], existed=True,
+                                    image=w["predecessor"]["image_identity"]) for w in workers]),
+        forward=dict(workers=[dict(service=w["current"]["service_name"], generation=4,
+                                  image=w["current"]["image_identity"]) for w in workers]),
+    )
+    root = tmp_path / "capture"
+    root.mkdir(mode=0o700)
+    job = dict(files=protocol["prepare_files"](root))
+    target = helper["_registered_capture_result"]
+    monkeypatch.setitem(target.__globals__, "_registered_input", lambda value: supplied)
+    monkeypatch.setitem(target.__globals__, "_registered_credentials", lambda value: {
+        key: credentials[key] for key in (
+            "control_generation", "redis_generation", "redis_secret_name", "database_secret_id", "redis_secret_id",
+        )
+    })
+    return helper, protocol, target, document, job, result, pins, supplied
+
+
+@pytest.mark.parametrize("version,restart", [(1, False), (2, False), (2, True)])
+def test_native_capture_accepts_exact_snapshot_baseline_and_versioned_ancestry(tmp_path, monkeypatch, version, restart):
+    _, protocol, target, document, job, result, _, _ = registered_capture_result_case(tmp_path, monkeypatch, version, restart=restart)
+    Path(job["files"]["request"]["path"]).write_bytes(protocol["canonical"](result))
+    assert target(document, "current", job) == result
+
+
+@pytest.mark.parametrize("fault", [
+    "current", "baseline", "unknown_version", "unknown_worker", "unknown_identity", "extra_top_level",
+    "missing_ancestors", "unbound_commands", "duplicate", "vision_history", "bool_revision",
+])
+def test_native_capture_refuses_unbound_identity_and_unknown_v2_schemas(tmp_path, monkeypatch, fault):
+    helper, protocol, target, document, job, result, pins, supplied = registered_capture_result_case(tmp_path, monkeypatch, 2)
+    worker = pins["workers"][0]
+    if fault == "current":
+        result["snapshot"]["workers"][0] = {**worker["current"], "database_fingerprint": "f" * 64}
+    elif fault == "baseline":
+        supplied["baseline"]["workers"][0]["database_fingerprint"] = "f" * 64
+    elif fault == "unknown_version":
+        pins["version"] = 3
+    elif fault == "unknown_worker":
+        worker["unrecognized"] = []
+    elif fault == "unknown_identity":
+        worker["ancestors"][0]["unrecognized"] = None
+    elif fault == "extra_top_level":
+        pins["unrecognized"] = None
+    elif fault == "missing_ancestors":
+        del worker["ancestors"]
+    elif fault == "unbound_commands":
+        result["pins"]["commands"][next(iter(result["pins"]["commands"]))] = "0" * 64
+    elif fault == "duplicate":
+        worker["ancestors"][1]["grant_id"] = worker["ancestors"][0]["grant_id"]
+    elif fault == "vision_history":
+        pins["workers"][2]["ancestors"] = [copy.deepcopy(worker["ancestors"][0])]
+    else:
+        pins["revision"] = True
+    result["pins"]["pin_json"] = protocol["canonical"](pins).decode().rstrip("\n")
+    result["pins"]["pin_sha256"] = hashlib.sha256(result["pins"]["pin_json"].encode()).hexdigest()
+    Path(job["files"]["request"]["path"]).write_bytes(protocol["canonical"](result))
+    with pytest.raises((helper["TransactionError"], protocol["ProtocolError"])):
+        target(document, "current", job)
+
+
 def run(script, **data):
     env = {"PATH": os.environ["PATH"], "EXTENSION": str(EXTENSION)}
     env.update(

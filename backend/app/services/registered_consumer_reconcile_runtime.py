@@ -33,6 +33,7 @@ from app.services.registered_consumer_reconcile import (
     MAX_RETIRING_PER_SERVICE,
     PinDocument,
     assess,
+    collapse_grant_facts,
     decode_pins,
     validate_database,
     validate_lua_result,
@@ -469,6 +470,8 @@ def decode_guard(rows: object, pins: PinDocument) -> GuardFacts:
             )
         if not isinstance(now, datetime):
             raise ReconcileRuntimeError("guard_clock_invalid")
+        if pins.version == 2:
+            grants = collapse_grant_facts(pins, grants)
         validate_database(pins, registrations, grants, now=now)
         return GuardFacts(now, registrations, grants)
     except ReconcileRuntimeError:

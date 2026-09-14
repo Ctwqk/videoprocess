@@ -54,6 +54,145 @@ def setup_protocol(tmp_path):
     return job, request, files, binding
 
 
+def test_legacy_binding_still_valid(tmp_path):
+    job, request, files, binding = setup_protocol(tmp_path)
+    job.validate_binding(binding)
+    assert binding['pin_json'] == request.pins.canonical_json
+
+
+@pytest.mark.parametrize("count", [3, 64, "restart"])
+def test_history_binding_roundtrips_stdlib_host_and_one_mib_envelopes(tmp_path, count):
+    import subprocess
+    import sys
+    from tests.services.registered_consumer_history_fixtures import history_document
+
+    job, _, files, _ = setup_protocol(tmp_path)
+    if count == "restart":
+        from tests.services.test_registered_consumer_history_capture import restart_document
+
+        payload = restart_document()
+    else:
+        payload = history_document(count)
+    if count == 64:
+        for worker in payload["workers"]:
+            for pin in [worker["current"], worker["predecessor"], *worker["ancestors"]]:
+                pin["image_identity"] = "x" * 235 + ":deploy-" + pin["release_commit"][:12]
+                pin["database_principal"] = "p" * 63
+    request = invocation(pins=decode(payload))
+    binding = job.make_binding(request, files, descriptor_sha256="e" * 64)
+    assert binding["version"] == 1 and json.loads(binding["pin_json"])["version"] == 2
+    assert binding["commands"] == {
+        job.STREAMS[w.current.service_name]: job.digest(list(EvalCommand(request.pins, w.current.service_name).arguments))
+        for w in request.pins.workers if w.current.service_name in job.STREAMS
+    }
+    record = job.new_record(binding)
+    assert len(job.canonical(record)) < 1024 * 1024
+    assert job.decode(job.canonical(record)) == record
+    path = tmp_path / "input.json"
+    job.write_input(path, {"binding": binding})
+    assert job.read_input(path)["binding"] == binding
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", """
+import json, runpy, sys
+host = runpy.run_path(sys.argv[1])
+with open(sys.argv[2]) as source:
+    binding = json.load(source)['binding']
+host['validate_binding'](binding)
+assert not any(name == 'app' or name.startswith(('app.', 'sqlalchemy', 'asyncpg', 'redis')) for name in sys.modules)
+print('validated')
+""", str(Path(job.__file__).resolve()), str(path)],
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "validated\n"
+
+
+@pytest.mark.parametrize("fault", [
+    "command", "ancestor_name", "ancestor_grant", "unknown_worker_field", "missing_ancestors",
+    "unknown_identity_field", "duplicate", "order", "foreign", "epoch", "version", "overflow",
+])
+def test_history_binding_rejects_schema_and_complete_command_drift(tmp_path, fault):
+    from tests.services.registered_consumer_history_fixtures import history_document
+
+    job, _, files, _ = setup_protocol(tmp_path)
+    request = invocation(pins=decode(history_document()))
+    binding = job.make_binding(request, files, descriptor_sha256="e" * 64)
+    payload = json.loads(binding["pin_json"])
+    worker = payload["workers"][0]
+    if fault == "command":
+        binding["commands"][next(iter(binding["commands"]))] = "0" * 64
+    elif fault == "ancestor_name":
+        worker["ancestors"][-1]["worker_instance_id"] = str(UUID(int=991991))
+        pin = worker["ancestors"][-1]
+        pin["redis_consumer_id"] = f"{pin['worker_type']}-worker@{pin['worker_host']}:1:{pin['worker_instance_id']}"
+    elif fault == "ancestor_grant":
+        # The complete immutable pin digest, not only command names, is bound.
+        worker["ancestors"][-1]["grant_id"] = str(UUID(int=991992))
+    elif fault == "unknown_worker_field":
+        worker["other"] = []
+    elif fault == "missing_ancestors":
+        del worker["ancestors"]
+    elif fault == "unknown_identity_field":
+        worker["ancestors"][0]["other"] = None
+    elif fault == "duplicate":
+        worker["ancestors"][1]["grant_id"] = worker["ancestors"][0]["grant_id"]
+    elif fault == "order":
+        payload["workers"].reverse()
+    elif fault == "foreign":
+        worker["ancestors"][0]["worker_host"] = "foreign"
+    elif fault == "epoch":
+        worker["ancestors"][0]["lease_epoch"] = worker["predecessor"]["lease_epoch"]
+    elif fault == "version":
+        payload["version"] = 3
+    elif fault == "overflow":
+        worker["ancestors"] *= 33
+    binding["pin_json"] = job.canonical(payload).decode().removesuffix("\n")
+    if fault != "ancestor_grant":
+        import hashlib
+        binding["pin_sha256"] = hashlib.sha256(binding["pin_json"].encode()).hexdigest()
+    with pytest.raises(job.ProtocolError):
+        job.validate_binding(binding)
+
+
+@pytest.mark.parametrize("fault", [
+    "current_grant", "epoch_gap", "generation", "registered_equal", "registered_after",
+    "image", "fingerprint", "principal", "noncontiguous_grant",
+])
+def test_history_restart_binding_keeps_exact_retiring_pair_proof(tmp_path, fault):
+    import hashlib
+    from tests.services.test_registered_consumer_history_capture import restart_document
+
+    job, _, files, _ = setup_protocol(tmp_path)
+    request = invocation(pins=decode(restart_document()))
+    binding = job.make_binding(request, files, descriptor_sha256="e" * 64)
+    payload = json.loads(binding["pin_json"])
+    worker = payload["workers"][0]
+    newer, older = worker["predecessor"], worker["ancestors"][0]
+    if fault == "current_grant":
+        for field in ("grant_id", "generation", "release_commit", "image_identity"):
+            newer[field] = worker["current"][field]
+    elif fault == "epoch_gap":
+        older["lease_epoch"] -= 1
+    elif fault == "generation":
+        older["generation"] -= 1
+    elif fault == "registered_equal":
+        older["registered_at"] = newer["registered_at"]
+    elif fault == "registered_after":
+        older["registered_at"] = worker["current"]["registered_at"]
+    elif fault == "image":
+        older["image_identity"] = "different:deploy-" + older["release_commit"][:12]
+    elif fault == "fingerprint":
+        older["storage_fingerprint"] = "f" * 64
+    elif fault == "principal":
+        older["database_principal"] = "vp_other"
+    else:
+        worker["ancestors"][-1]["grant_id"] = worker["current"]["grant_id"]
+    binding["pin_json"] = job.canonical(payload).decode().removesuffix("\n")
+    binding["pin_sha256"] = hashlib.sha256(binding["pin_json"].encode()).hexdigest()
+    with pytest.raises(job.ProtocolError):
+        job.validate_binding(binding)
+
+
 def test_capture_uses_complete_active_registration_and_grant_facts():
     job = module()
     payload = document()
@@ -290,10 +429,16 @@ def test_managed_descriptor_has_only_exact_mounts_and_authority(tmp_path, fault)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("version", [1, 2])
 async def test_fixed_entry_awaits_actual_unit2_and_preserves_result(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, version
 ):
     job, request, files, binding = setup_protocol(tmp_path)
+    if version == 2:
+        from tests.services.registered_consumer_history_fixtures import history_document
+
+        request = invocation(pins=decode(history_document()))
+        binding = job.make_binding(request, files, descriptor_sha256="e" * 64)
     monkeypatch.setattr(job, "require_writer_identity", lambda *args: None)
     from app.services import registered_consumer_reconcile_runtime as runtime
 
@@ -756,6 +901,226 @@ async def test_capture_reads_secret_bytes_but_returns_only_hashes_and_real_princ
     assert result["credentials"]["redis_secret_name"] == credentials["redis_secret_name"]
     assert "private" not in json.dumps(result)
     assert result["snapshot"]["workers"] == [None] * 4
+
+
+def managed_history_case(monkeypatch):
+    import hashlib
+    import asyncpg
+    from app.services import registered_consumer_reconcile_runtime as runtime
+    from app.services.worker_control_role_cli import role_names_for_generation
+    from tests.services.registered_consumer_history_fixtures import history_document
+    from tests.services.test_registered_consumer_history_capture import (
+        HistoryConnection, RedisInventory, snapshots,
+    )
+
+    job = module()
+    payload = history_document()
+    current, baseline = snapshots(payload)
+    credentials = {key: getattr(invocation(), key) for key in (
+        "control_generation", "redis_generation", "redis_secret_name", "database_secret_id", "redis_secret_id",
+    )}
+    principal = role_names_for_generation(credentials["control_generation"]).versioned["operator"]
+    raw = {
+        "database": f"postgresql://{principal}:private@database.invalid:5432/fixture\n",
+        "redis": "redis://vp_control:private@redis.invalid:6379/0\n",
+    }
+    reader_raw = "postgresql://vp_deploy_read:private@database.invalid:5432/fixture\n"
+    closed, created, whoami = [], [], []
+
+    class Connection(HistoryConnection):
+        def __init__(self, user):
+            super().__init__(payload)
+            self.user = user
+            self.terminated = False
+
+        async def fetchrow(self, sql):
+            return dict(session_user=self.user, current_user=self.user, database_name="fixture")
+
+        async def close(self, **kwargs):
+            closed.append(self.user)
+
+        def terminate(self):
+            self.terminated = True
+
+    class Client(RedisInventory):
+        connection = None
+
+        async def acl_whoami(self):
+            whoami.append(True)
+            return "vp_control"
+
+        async def aclose(self, **kwargs):
+            assert kwargs == {"close_connection_pool": True}
+            closed.append("redis")
+
+    operator, reader, client = Connection(principal), Connection("vp_deploy_read"), Client(payload)
+
+    async def connect(url, **kwargs):
+        assert kwargs == {"timeout": 2, "command_timeout": 2}
+        return reader if "vp_deploy_read:" in url else operator
+
+    def create_redis(value):
+        assert isinstance(value, runtime.Credentials)
+        assert value.redis_url == raw["redis"].rstrip("\n")
+        created.append(value)
+        return client
+
+    monkeypatch.setattr(asyncpg, "connect", connect)
+    monkeypatch.setattr(runtime, "create_redis", create_redis)
+    monkeypatch.setattr(runtime, "_read_mount", raw.__getitem__)
+    monkeypatch.setattr(job, "_read_capture_mount", lambda: reader_raw)
+    value = dict(
+        credentials=credentials, baseline=baseline,
+        transaction_id=payload["transaction_id"], revision=payload["revision"],
+        release_commit=payload["release_commit"],
+        capture_read=dict(id="r" * 25, name="vp-registered-read-" + payload["transaction_id"],
+                          sha256=hashlib.sha256(reader_raw.encode()).hexdigest(), principal="vp_deploy_read"),
+    )
+    return SimpleNamespace(**locals())
+
+
+@pytest.mark.asyncio
+async def test_managed_current_capture_reaches_complete_history_and_binds_commands(tmp_path, monkeypatch):
+    case = managed_history_case(monkeypatch)
+    result = await case.job.capture_managed(case.value)
+    assert result["snapshot"] == case.current
+    assert result["pins"]["pin_json"] == decode(case.payload).canonical_json
+    assert case.whoami == [True] and len(case.created) == 1
+    assert sorted(case.closed) == sorted([case.principal, "vp_deploy_read", "redis"])
+    assert "private" not in json.dumps(result)
+    root = tmp_path / "attempt"
+    root.mkdir(mode=0o700)
+    files = case.job.prepare_files(root)
+    request = invocation(pins=decode(case.payload), **result["credentials"])
+    binding = case.job.make_binding(request, files, descriptor_sha256="e" * 64)
+    assert binding["commands"] == result["pins"]["commands"]
+
+
+@pytest.mark.asyncio
+async def test_managed_capture_refuses_actual_redis_principal_mismatch(monkeypatch):
+    case = managed_history_case(monkeypatch)
+
+    async def wrong():
+        return "default"
+
+    monkeypatch.setattr(case.client, "acl_whoami", wrong)
+    with pytest.raises(case.job.ProtocolError):
+        await case.job.capture_managed(case.value)
+    assert case.client.calls == []
+    assert "redis" in case.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["inventory", "query", "cleanup"])
+async def test_managed_capture_cancellation_owns_resources_and_never_retries(monkeypatch, phase):
+    case = managed_history_case(monkeypatch)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked(*args, **kwargs):
+        entered.set()
+        await release.wait()
+
+    if phase == "inventory":
+        monkeypatch.setattr(case.client, "xinfo_consumers", blocked)
+    elif phase == "query":
+        original = case.reader.fetch
+
+        async def fetch(sql, *args):
+            if sql.lstrip().startswith("WITH RECURSIVE"):
+                await blocked()
+            return await original(sql, *args)
+
+        monkeypatch.setattr(case.reader, "fetch", fetch)
+    else:
+        original_close = case.client.aclose
+
+        async def close(**kwargs):
+            await blocked()
+            await original_close(**kwargs)
+
+        monkeypatch.setattr(case.client, "aclose", close)
+    task = asyncio.create_task(case.job.capture_managed(case.value))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        if phase == "cleanup":
+            await asyncio.sleep(0)
+            task.cancel()
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 3)
+        assert sorted(case.closed) == sorted([case.principal, "vp_deploy_read", "redis"])
+        assert len(case.created) == 1
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_managed_capture_cleanup_failure_does_not_hide_cancellation(monkeypatch):
+    case = managed_history_case(monkeypatch)
+    entered = asyncio.Event()
+
+    async def blocked(*args):
+        entered.set()
+        await asyncio.Future()
+
+    async def failed_close(**kwargs):
+        raise RuntimeError("private")
+
+    monkeypatch.setattr(case.client, "xinfo_consumers", blocked)
+    monkeypatch.setattr(case.client, "aclose", failed_close)
+    task = asyncio.create_task(case.job.capture_managed(case.value))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 3)
+        assert "vp_deploy_read" in case.closed
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_managed_capture_redis_io_failure_is_static_without_retry(monkeypatch):
+    case = managed_history_case(monkeypatch)
+    calls = []
+
+    async def failed(stream, group):
+        calls.append((stream, group))
+        raise OSError("private credential detail")
+
+    monkeypatch.setattr(case.client, "xinfo_consumers", failed)
+    with pytest.raises(case.job.ProtocolError, match="^registered_reconcile_protocol_failed$"):
+        await case.job.capture_managed(case.value)
+    assert calls == [("vp:tasks:ffmpeg_go", "ffmpeg_go-workers")]
+    assert len(case.created) == 1
+    assert sorted(case.closed) == sorted([case.principal, "vp_deploy_read", "redis"])
+
+
+@pytest.mark.asyncio
+async def test_managed_capture_hung_redis_close_is_bounded_and_forced(monkeypatch):
+    case = managed_history_case(monkeypatch)
+    forced = []
+
+    class Transport:
+        async def disconnect(self, *, nowait):
+            assert nowait is True
+            await asyncio.Future()
+
+        def _close(self):
+            forced.append(True)
+
+    monkeypatch.setattr(case.client, "connection", Transport())
+    start = time.monotonic()
+    with pytest.raises(case.job.ProtocolError, match="^registered_reconcile_protocol_failed$"):
+        await case.job.capture_managed(case.value)
+    assert time.monotonic() - start < 3
+    assert forced == [True] and "vp_deploy_read" in case.closed
 
 
 def frame(job, binding, sequence=1, action="revalidate", **changes):

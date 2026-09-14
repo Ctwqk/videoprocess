@@ -5449,19 +5449,21 @@ def _registered_capture_result(document: dict, stage: str, job: dict) -> dict:
         raise TransactionError
     if stage == "current":
         protocol["exact"](result["pins"], {"pin_json", "pin_sha256", "commands"})
-        pin_document = json.loads(result["pins"]["pin_json"])
+        pin_document = protocol["validate_capture_pins"](result["pins"])
         supplied = _registered_input(job)
         if (
             pin_document["transaction_id"] != document["transaction_id"]
             or pin_document["revision"] != supplied["revision"]
             or pin_document["release_commit"] != document["target_commit"]
-            or pin_document["workers"]
-            != [
+            or protocol["canonical"]([
+                dict(current=worker["current"], predecessor=worker["predecessor"])
+                for worker in pin_document["workers"]
+            ]) != protocol["canonical"]([
                 dict(current=current, predecessor=old)
                 for current, old in zip(
                     snapshot["workers"], supplied["baseline"]["workers"], strict=True
                 )
-            ]
+            ])
             or hashlib.sha256(result["pins"]["pin_json"].encode("ascii")).hexdigest()
             != result["pins"]["pin_sha256"]
         ):

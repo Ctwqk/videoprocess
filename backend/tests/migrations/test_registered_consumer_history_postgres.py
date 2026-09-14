@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import timedelta
 import hashlib
 import json
+import os
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -173,3 +174,157 @@ async def test_actual_history_guard_locks_ancestor_until_owned_transaction_ends(
             assert await value.case.owner.execute(
                 "UPDATE worker_registrations SET revoke_reason=revoke_reason WHERE id=$1", value.extra.id
             ) == "UPDATE 1"
+
+
+@asynccontextmanager
+async def capture_reader(case):
+    role, password = "vp_history_capture_test_" + uuid4().hex[:16], uuid4().hex + uuid4().hex
+    quoted = legacy.quote_identifier(role)
+    connection = None
+    created = False
+    try:
+        async with case.owner.transaction():
+            await legacy.create_login_role(case.owner, role, password, setting_prefix="history_capture_test")
+            await case.owner.execute(
+                f"GRANT SELECT ON public.worker_registrations,public.worker_admission_grants TO {quoted}"
+            )
+        created = True
+        url = legacy.checked_url(
+            os.environ["REGISTERED_RECONCILE_DISPOSABLE_POSTGRES_URL"],
+            os.environ["REGISTERED_RECONCILE_DISPOSABLE_POSTGRES_CONFIRM"],
+        )
+        connection = await asyncpg.connect(legacy.role_database_url(url, role, password), timeout=2, command_timeout=2)
+        assert await connection.fetchval("SELECT session_user") == role
+        yield connection
+    finally:
+        if connection is not None:
+            await connection.close(timeout=2)
+        if created:
+            await case.owner.execute(
+                f"REVOKE SELECT ON public.worker_registrations,public.worker_admission_grants FROM {quoted}"
+            )
+            await case.owner.execute(f"DROP ROLE {quoted}")
+
+
+def capture_inputs(value, snapshot):
+    from app.services.registered_consumer_reconcile_job import STREAMS
+
+    payload = json.loads(value.request.pins.canonical_json)
+    baseline = {"observed_at": snapshot["observed_at"], "workers": [worker["predecessor"] for worker in payload["workers"]]}
+    inventory = {
+        STREAMS[worker.current.service_name]: [dict(name=worker.current.redis_consumer_id, pending=0, idle=0, inactive=0)]
+        for worker in value.request.pins.workers if worker.current.service_name in STREAMS
+    }
+    cpu = value.request.pins.workers[0]
+    # The direct predecessor is absent from Redis, but remains a required link.
+    inventory[STREAMS[cpu.current.service_name]].append(
+        dict(name=value.extra.redis_consumer_id, pending=0, idle=130001, inactive=130001)
+    )
+
+    class Inventory:
+        async def xinfo_consumers(self, stream, group):
+            assert group == stream.rsplit(":", 1)[1] + "-workers"
+            return copy.deepcopy(inventory[stream])
+
+    return baseline, Inventory(), inventory
+
+
+@pytest.mark.asyncio
+async def test_actual_capture_reaches_present_ancestor_through_absent_intermediate(history_case):
+    from app.services.registered_consumer_history_capture import capture_history
+    from app.services.registered_consumer_reconcile_job import read_snapshot
+
+    async with history_case() as value, capture_reader(value.case) as reader:
+        snapshot = await read_snapshot(reader)
+        baseline, client, _ = capture_inputs(value, snapshot)
+        before = await value.case.snapshot()
+        history = await capture_history(reader, client, snapshot, baseline)
+        assert history == {worker.current.service_name: worker.retiring for worker in value.request.pins.workers}
+        assert await value.case.snapshot() == before
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await reader.execute("UPDATE public.worker_registrations SET revoke_reason=revoke_reason WHERE false")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["unknown_consumer", "missing_chain", "changed_current"])
+async def test_actual_capture_refuses_unproven_history(history_case, fault):
+    from app.services.registered_consumer_history_capture import capture_history
+    from app.services.registered_consumer_reconcile import ReconcileRefused
+    from app.services.registered_consumer_reconcile_job import ProtocolError, STREAMS, read_snapshot
+
+    async with history_case() as value, capture_reader(value.case) as reader:
+        snapshot = await read_snapshot(reader)
+        baseline, client, inventory = capture_inputs(value, snapshot)
+        worker = value.request.pins.workers[0]
+        original = None
+        try:
+            if fault == "unknown_consumer":
+                inventory[STREAMS[worker.current.service_name]].append(dict(name="unknown-" + uuid4().hex, pending=0, idle=130001, inactive=130001))
+            elif fault == "missing_chain":
+                original = ("superseded_by", value.extra.id, value.extra.superseded_by)
+                await value.case.owner.execute("UPDATE public.worker_registrations SET superseded_by=$1 WHERE id=$2", worker.current.registration_id, value.extra.id)
+            else:
+                original = ("lease_epoch", worker.current.registration_id, worker.current.lease_epoch)
+                await value.case.owner.execute("UPDATE public.worker_registrations SET lease_epoch=lease_epoch+1 WHERE id=$1", worker.current.registration_id)
+            with pytest.raises((ProtocolError, ReconcileRefused)):
+                await capture_history(reader, client, snapshot, baseline)
+        finally:
+            if original is not None:
+                field, row_id, previous = original
+                await value.case.owner.execute(f"UPDATE public.worker_registrations SET {field}=$1 WHERE id=$2", previous, row_id)
+
+
+@asynccontextmanager
+async def restart_case(history_case):
+    async with history_case() as value:
+        payload = json.loads(value.request.pins.canonical_json)
+        predecessor = payload["workers"][0]["predecessor"]
+        ancestor = payload["workers"][0]["ancestors"][0]
+        distinct = {"registration_id", "worker_instance_id", "redis_consumer_id", "lease_epoch", "registered_at"}
+        ancestor.update({key: copy.deepcopy(item) for key, item in predecessor.items() if key not in distinct})
+        request = replace(value.request, pins=decode_pins(json.dumps(payload)))
+        newer = request.pins.workers[0].predecessor
+        revoked_at = newer.registered_at - timedelta(seconds=1)
+        await value.case.owner.execute(
+            "UPDATE public.worker_registrations SET grant_id=$1,database_principal=$2,"
+            "superseded_by=NULL,revoke_reason='worker_redis_continuity_unready',revoked_at=$3 WHERE id=$4",
+            newer.grant_id, newer.database_principal, revoked_at, value.extra.id,
+        )
+        yield SimpleNamespace(case=value.case, request=request, extra=value.extra, grant=value.grant)
+
+
+@pytest.mark.asyncio
+async def test_actual_same_grant_restart_guard_and_readonly_capture(history_case):
+    from app.services.registered_consumer_history_capture import capture_history
+    from app.services.registered_consumer_reconcile_job import read_snapshot
+
+    async with restart_case(history_case) as value, capture_reader(value.case) as reader:
+        before = await value.case.snapshot()
+        async with value.case.operator.transaction():
+            facts = await runtime.read_guard(value.case.operator, value.request)
+            assert len(facts.registrations) == 9 and len(facts.grants) == 8
+        snapshot = await read_snapshot(reader)
+        baseline, client, _ = capture_inputs(value, snapshot)
+        history = await capture_history(reader, client, snapshot, baseline)
+        assert history == {worker.current.service_name: worker.retiring for worker in value.request.pins.workers}
+        assert await value.case.snapshot() == before
+        assert await value.case.owner.fetchval(
+            "SELECT superseded_by FROM public.worker_registrations WHERE id=$1", value.extra.id
+        ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["wrong_reason", "nonadjacent_epoch", "late_revocation"])
+async def test_actual_same_grant_restart_guard_refuses_unproven_edge(history_case, fault):
+    async with restart_case(history_case) as value:
+        if fault == "wrong_reason":
+            await value.case.owner.execute("UPDATE public.worker_registrations SET revoke_reason='operator_revoked' WHERE id=$1", value.extra.id)
+        elif fault == "nonadjacent_epoch":
+            await value.case.owner.execute("UPDATE public.worker_registrations SET lease_epoch=lease_epoch-1 WHERE id=$1", value.extra.id)
+        else:
+            await value.case.owner.execute(
+                "UPDATE public.worker_registrations SET revoked_at=$1 WHERE id=$2",
+                value.request.pins.workers[0].predecessor.registered_at + timedelta(seconds=1), value.extra.id,
+            )
+        with pytest.raises(asyncpg.RaiseError, match="registered_reconcile_inventory_changed"):
+            await runtime.read_guard(value.case.operator, value.request)
