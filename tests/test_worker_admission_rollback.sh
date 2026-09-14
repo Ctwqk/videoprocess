@@ -2838,13 +2838,30 @@ PY
 python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" capture-baseline \
   "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 0 \
   <"$rollback_baseline" >/dev/null
+python3 - "$new_commit" <<'PY' | python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" record-control-selection "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 1 forward >/dev/null
+import json
+import sys
+
+commit = sys.argv[1]
+generation = "c-" + commit[:20]
+purposes = ("operator", "orchestrator", "staging-janitor", "staging-minio-access",
+            "staging-minio-secret", "worker-minio-access", "worker-minio-secret")
+print(json.dumps(dict(
+    generation=generation, image="vp-ffmpeg-worker-python:deploy-" + commit[:12],
+    manifest_sha256="f" * 64,
+    secrets=[dict(service="vp-worker-control", generation=generation,
+                  purpose=purpose, name="forward-" + purpose,
+                  docker_secret_id=f"{serial:025x}")
+             for serial, purpose in enumerate(purposes, 1)],
+), sort_keys=True, separators=(",", ":")))
+PY
 python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
   "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
-  1 FORWARD_APPLYING >/dev/null
+  2 FORWARD_APPLYING >/dev/null
 printf '%s\n' '{"control":null,"services":[]}' \
   | python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" \
     capture-failed-forward \
-    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 2 >/dev/null
+    "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" 3 >/dev/null
 
 vp_worker_admission_new_generation() {
   local value
@@ -2902,6 +2919,12 @@ vp_worker_admission_prepare_service() {
   printf 'prepare|%s|%s|%s|%s|%s\n' \
     "$service" "$commit" "$generation" "$namespace" \
     "$_control_image" >>"$CALLS"
+}
+
+# This fixture isolates service/stage orchestration; exact grant replay and
+# secret identity refusal are exercised with real journals in the Python suite.
+vp_worker_admission_prepare_rollback_service() {
+  vp_worker_admission_prepare_service "$@"
 }
 
 vp_require_worker_redis_marker_status() {
@@ -3065,7 +3088,7 @@ expected = {
     "vp-youtube-publisher-swarm": "verified",
 }
 if (
-    document["phase"] != "CANDIDATE_RESTORE_REQUIRED"
+    document["phase"] != "ROLLBACK_APPLYING"
     or stages != expected
     or any(
         worker["docker_service_id"] is None
@@ -3077,19 +3100,6 @@ if (
 print(document["transaction_id"])
 PY
 )" || exit 1
-
-vp_worker_admission_load_replay_plan
-python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
-  "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
-  "$VP_WORKER_ADMISSION_REPLAY_REVISION" CANDIDATE_RESTORING >/dev/null
-vp_worker_admission_load_replay_plan
-python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
-  "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
-  "$VP_WORKER_ADMISSION_REPLAY_REVISION" CANDIDATE_RESTORED >/dev/null
-vp_worker_admission_load_replay_plan
-python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" transition \
-  "$admission_root" "$VP_WORKER_ADMISSION_LOCK_FD" \
-  "$VP_WORKER_ADMISSION_REPLAY_REVISION" ROLLBACK_PREPARING >/dev/null
 
 : >"$CALLS"
 FAIL_READY_SERVICE=
@@ -4637,28 +4647,15 @@ EOF
     : >"$resume_calls"
     RESUME_TEST_PHASE="$phase"
     vp_worker_admission_resume_candidate_restore
-    if [[ "$phase" == CANDIDATE_RESTORED ]]; then
-      expected_candidate="$({
-        printf '%s\n' \
-          "hydrate|$phase" \
-          'verify-candidate' \
-          'transition|ROLLBACK_PREPARING' \
-          'hydrate|ROLLBACK_PREPARING' \
-          "restore-baseline|$VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS|vp-api-swarm|candidate-records"
-      })"
-    else
-      expected_candidate="$({
-        printf '%s\n' \
-          "hydrate|$phase" \
-          'restore-candidate|candidate-identities' \
-          'verify-candidate' \
-          'transition|ROLLBACK_PREPARING' \
-          'hydrate|ROLLBACK_PREPARING' \
-          "restore-baseline|$VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS|vp-api-swarm|candidate-records"
-      })"
-    fi
+    expected_candidate="$({
+      printf '%s\n' \
+        "hydrate|$phase" \
+        'transition|ROLLBACK_PREPARING' \
+        'hydrate|ROLLBACK_PREPARING' \
+        "restore-baseline|$VP_WORKER_ADMISSION_RECOVERY_SNAPSHOTS|vp-api-swarm|candidate-records"
+    })"
     if [[ "$(command cat "$resume_calls")" != "$expected_candidate" ]]; then
-      echo "FAIL: $phase did not complete candidate compensation before rollback" >&2
+      echo "FAIL: $phase did not resume rollback without reactivating revoked candidates" >&2
       exit 1
     fi
   done

@@ -544,6 +544,138 @@ class RollbackPreparedSecretTests(unittest.TestCase):
             self.assertEqual(state["pending_retirements"], [])
             self.assert_rejected_without_write(marker_secret("repair", 502))
 
+    def test_interrupted_candidate_restore_resumes_the_same_rollback(self):
+        self.state["rollback"]["workers"] = [self.worker]
+        for phase in ("CANDIDATE_RESTORE_REQUIRED", "CANDIDATE_RESTORING",
+                      "CANDIDATE_RESTORED"):
+            with self.subTest(phase=phase):
+                self.state["phase"] = phase
+                self.write_state()
+                before = self.read_state()
+                self.shell(r'''
+vp_worker_admission_hydrate_recovery_context() {
+  vp_worker_admission_load_replay_plan
+  VP_WORKER_ADMISSION_RECOVERY_PHASE="$VP_WORKER_ADMISSION_REPLAY_PHASE"
+  VP_WORKER_ADMISSION_RECOVERY_CANDIDATE_IDENTITIES=revoked-forward-grants
+}
+vp_restore_failed_forward_candidate() { echo grant_disabled >&2; return 4; }
+vp_verify_failed_forward_candidate() { echo revoked_candidate_not_ready >&2; return 4; }
+vp_worker_admission_resume_durable_rollback() {
+  vp_worker_admission_load_replay_plan
+  [[ "$VP_WORKER_ADMISSION_REPLAY_PHASE" == ROLLBACK_PREPARING ]]
+}
+vp_worker_admission_resume_candidate_restore
+''')
+                after = self.read_state()
+                self.assertEqual(after.pop("phase"), "ROLLBACK_PREPARING")
+                self.assertEqual(after.pop("revision"), before.pop("revision") + 1)
+                before.pop("phase")
+                self.assertEqual(after, before)
+
+    def test_candidate_restore_reentry_keeps_revision_and_cleanup_guards(self):
+        self.state["phase"] = "CANDIDATE_RESTORING"
+        self.write_state()
+        before = self.active.read_bytes()
+        self.cli("transition", 70, "ROLLBACK_PREPARING", success=False)
+        self.assertEqual(self.active.read_bytes(), before)
+        transition = HELPER["_set_phase"]
+        rejected = HELPER["TransactionError"]
+        def unresolved_cleanup(*args, **kwargs):
+            raise rejected
+        with patch.dict(transition.__globals__, _registered_gate=unresolved_cleanup), \
+                self.assertRaises(rejected):
+            transition(self.state, "ROLLBACK_PREPARING", None)
+        self.assertEqual(self.state["phase"], "CANDIDATE_RESTORING")
+
+    def prepare_rollback_reentry(self):
+        (self.active.parent / TRANSACTION_ID).mkdir(mode=0o700)
+        forward = copy.deepcopy(self.state["baseline"]["control"])
+        forward.update(generation="c-" + "2" * 20,
+                       image="vp-ffmpeg-worker-python:deploy-222222222222")
+        for reference in forward["secrets"]:
+            reference["generation"] = forward["generation"]
+        self.state["forward"]["control"] = forward
+        self.write_state()
+
+    def test_rollback_reentry_selects_namespace_before_stale_scan_and_keeps_forward_control(self):
+        self.prepare_rollback_reentry()
+        result = self.shell(r'''
+VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE=forward-namespace
+VP_WORKER_CONTROL_GENERATION=c-fab36e3a818bef6717c1
+VP_WORKER_ADMISSION_CONTROL_IMAGE=vp-ffmpeg-worker-python:deploy-fab36e3a818b
+vp_prepare_worker_admission_rollback() {
+  VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE=rollback-123456789012345678
+}
+vp_worker_admission_stale_rollback_records() {
+  [[ "$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE" == rollback-123456789012345678 ]]
+}
+vp_worker_admission_stale_rollback_namespaces() {
+  [[ "$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE" == rollback-123456789012345678 ]]
+}
+vp_install_staging_object_janitor() { :; }
+vp_worker_admission_clear_janitor_service() { :; }
+vp_run_staging_object_janitor_once() { :; }
+vp_worker_admission_record_janitor_service() { :; }
+vp_restore_app_snapshots() { :; }
+vp_worker_admission_promote_phase() { :; }
+vp_worker_admission_retire_records() { [[ -z "$1" ]]; }
+vp_worker_admission_discard_namespace() { [[ "$2" == forward-namespace ]]; }
+vp_worker_admission_finish_transaction() {
+  printf '%s|%s|%s\n' "$1" "$VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION" \
+    "$VP_WORKER_ROLLBACK_FAILED_CONTROL_IMAGE"
+}
+vp_restore_worker_admission_transaction '' '' ''
+''')
+        self.assertEqual(result.stdout.strip(),
+                         "rolled_back|c-" + "2" * 20 +
+                         "|vp-ffmpeg-worker-python:deploy-222222222222")
+
+    def test_prepared_rollback_reuses_exact_plan_without_grant_upsert(self):
+        self.prepare_rollback_reentry()
+        body = r'''
+vp_worker_admission_worker_plan_payload() { command cat "$CASE_ROOT/plan.json"; }
+vp_managed_secret_id() { printf '%s\n' "$1"; }
+vp_worker_admission_prepare_service() { echo unexpected_grant_upsert >&2; return 4; }
+vp_worker_admission_prepare_rollback_service vp-ffmpeg-worker-go-swarm \
+  vp-ffmpeg-worker-go:deploy-fab36e3a818b \
+  vp-ffmpeg-worker-python:deploy-fab36e3a818b \
+  fab36e3a818bef6717c1aaaaaaaaaaaaaaaaaaaa \
+  "$CASE_ROOT" rollback-123456789012345678
+'''
+        for stage in ("prepared", "applied", "verified"):
+            with self.subTest(stage=stage):
+                self.worker.update(applied_stage=stage,
+                                   docker_service_id=None if stage == "prepared" else "d" * 24,
+                                   target_spec_digest=None if stage == "prepared" else "e" * 64)
+                self.state["rollback"]["workers"] = [self.worker]
+                self.write_state()
+                plan = {key: value for key, value in self.worker.items()
+                        if key not in {"docker_service_id", "applied_stage"}}
+                plan["target_spec_digest"] = None
+                (self.root / "plan.json").write_bytes(HELPER["_canonical"](plan))
+                before = self.active.read_bytes()
+                self.shell(body)
+                self.assertEqual(self.active.read_bytes(), before)
+                for field, value in (("generation", 901), ("commit", "3" * 40),
+                                     ("database_secret", dict(plan["database_secret"], docker_secret_id="f" * 24))):
+                    (self.root / "plan.json").write_bytes(HELPER["_canonical"](dict(plan, **{field: value})))
+                    result = self.shell(body, success=False)
+                    self.assertNotIn("unexpected_grant_upsert", result.stderr)
+                (self.root / "plan.json").write_bytes(HELPER["_canonical"](plan))
+                self.shell(body.replace("printf '%s\\n' \"$1\"", "printf '%s\\n' wrong-secret-id"), success=False)
+
+    def test_unprepared_rollback_keeps_the_provisioning_path(self):
+        self.prepare_rollback_reentry()
+        result = self.shell(r'''
+vp_worker_admission_prepare_service() { printf 'prepare\n'; }
+vp_worker_admission_prepare_rollback_service vp-ffmpeg-worker-go-swarm \
+  vp-ffmpeg-worker-go:deploy-fab36e3a818b \
+  vp-ffmpeg-worker-python:deploy-fab36e3a818b \
+  fab36e3a818bef6717c1aaaaaaaaaaaaaaaaaaaa \
+  "$CASE_ROOT" rollback-123456789012345678
+''')
+        self.assertEqual(result.stdout, "prepare\n")
+
     def test_marker_selection_cannot_replace_a_recorded_secret_identity(self):
         self.record(marker_secret())
         before = self.active.read_bytes()

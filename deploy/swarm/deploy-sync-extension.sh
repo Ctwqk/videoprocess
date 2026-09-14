@@ -8258,15 +8258,11 @@ vp_worker_admission_resume_forward_failure() {
 vp_worker_admission_resume_candidate_restore() {
   vp_worker_admission_hydrate_recovery_context || return 1
   case "$VP_WORKER_ADMISSION_RECOVERY_PHASE" in
-    CANDIDATE_RESTORE_REQUIRED|CANDIDATE_RESTORING)
-      vp_restore_failed_forward_candidate \
-        "$VP_WORKER_ADMISSION_RECOVERY_CANDIDATE_IDENTITIES" || return 1
-      ;;
-    CANDIDATE_RESTORED)
-      ;;
+    CANDIDATE_RESTORE_REQUIRED|CANDIDATE_RESTORING|CANDIDATE_RESTORED) ;;
     *) return 1 ;;
   esac
-  vp_verify_failed_forward_candidate || return 1
+  # Rollback activation revokes forward grants irreversibly. Resume the saved
+  # rollback instead of trying to compensate with those disabled credentials.
   vp_worker_admission_transition_to ROLLBACK_PREPARING || return 1
   vp_worker_admission_resume_durable_rollback
 }
@@ -8990,6 +8986,67 @@ vp_worker_control_select_prior() {
   VP_WORKER_MINIO_SECRET_SECRET="$VP_WORKER_CONTROL_PRIOR_WORKER_MINIO_SECRET_SECRET"
 }
 
+vp_worker_admission_prepare_rollback_service() {
+  local service="$1" image="$2" control_image="$3" commit="$4" root="$5" namespace="$6"
+  vp_worker_admission_lock_assert || return 1
+  [[ "$root" == "$VP_WORKER_ADMISSION_LOCK_ROOT" \
+    && "$namespace" == "$VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE" ]] || return 1
+  local retained
+  retained="$(vp_worker_admission_recovery_state | python3 -I -c '
+import json
+import sys
+try:
+    state = json.load(sys.stdin)
+    service, image, control_image, commit, namespace = sys.argv[1:]
+    rollback = state["rollback"]
+    if (state["phase"] not in {"ROLLBACK_PREPARING", "ROLLBACK_APPLYING"}
+        or state["operation"] is not None or rollback["namespace"] != namespace
+        or rollback["control"] != state["baseline"]["control"]
+        or rollback["control"]["image"] != control_image):
+        raise ValueError
+    workers = [worker for worker in rollback["workers"] if worker["service"] == service]
+    if len(workers) > 1:
+        raise ValueError
+    if workers and (workers[0]["image"] != image or workers[0]["commit"] != commit):
+        raise ValueError
+    if not workers or workers[0]["applied_stage"] == "pending":
+        print("prepare")
+    else:
+        worker = workers[0]
+        if worker["applied_stage"] not in {"prepared", "applied", "verified"}:
+            raise ValueError
+        plan = {key: value for key, value in worker.items()
+                if key not in {"docker_service_id", "applied_stage"}}
+        plan["target_spec_digest"] = None
+        print(json.dumps(plan, sort_keys=True, separators=(",", ":")))
+except (KeyError, TypeError, ValueError):
+    raise SystemExit(1)
+' "$service" "$image" "$control_image" "$commit" "$namespace")" || return 1
+  if [[ "$retained" == prepare ]]; then
+    vp_worker_admission_prepare_service "$@"
+    return
+  fi
+  # Prepared grants may already be active; upsert intentionally only accepts
+  # pending grants. Reuse the journal-pinned plan and still activate/check it later.
+  local actual
+  actual="$(vp_worker_admission_worker_plan_payload "$service" "$image")" || return 1
+  [[ "$actual" == "$retained" ]] || return 1
+  local secrets
+  secrets="$(printf '%s\n' "$retained" | python3 -I -c '
+import json
+import sys
+plan = json.load(sys.stdin)
+for field in ("database_secret", "admission_secret"):
+    ref = plan[field]
+    print("|".join(ref[key] for key in ("docker_secret_id", "name", "service", "generation", "purpose")))
+')" || return 1
+  local secret_id name owner generation purpose
+  while IFS='|' read -r secret_id name owner generation purpose; do
+    actual="$(vp_managed_secret_id "$secret_id" "$name" "$owner" "$generation" "$purpose")" || return 1
+    [[ "$actual" == "$secret_id" ]] || return 1
+  done <<<"$secrets"
+}
+
 vp_prepare_worker_admission_rollback() {
   local snapshots="$1"
   local attempted_services="$2"
@@ -9070,7 +9127,7 @@ vp_prepare_worker_admission_rollback() {
     if [[ -z "$commit" ]]; then
       commit="$(vp_worker_admission_image_commit "$image")" || return 1
     fi
-    vp_worker_admission_prepare_service \
+    vp_worker_admission_prepare_rollback_service \
       "$service" "$image" "$rollback_control_image" \
       "$commit" "$root" "$namespace" || return 1
     vp_worker_admission_track_candidate "$service" || return 1
@@ -15237,8 +15294,6 @@ vp_restore_worker_admission_transaction() {
   fi
   local failed_candidate_namespace="$VP_WORKER_ROLLBACK_FAILED_CANDIDATE_NAMESPACE"
   VP_WORKER_ADMISSION_ROLLBACK_CONVERGED=false
-  local failed_control_generation="$VP_WORKER_CONTROL_GENERATION"
-  local failed_control_image="$VP_WORKER_ADMISSION_CONTROL_IMAGE"
 
   if [[ "$VP_WORKER_ADMISSION_PREPARED" != true ]]; then
     vp_restore_app_snapshots \
@@ -15282,6 +15337,18 @@ vp_restore_worker_admission_transaction() {
     return
   fi
 
+  local failed_control_identity
+  failed_control_identity="$(vp_worker_admission_recovery_state | python3 -I -c '
+import json
+import sys
+try:
+    control = json.load(sys.stdin)["forward"]["control"]
+    print(control["generation"] + "|" + control["image"])
+except (KeyError, TypeError, ValueError):
+    raise SystemExit(1)
+')" || return 1
+  local failed_control_generation failed_control_image
+  IFS='|' read -r failed_control_generation failed_control_image <<<"$failed_control_identity"
   vp_worker_admission_load_replay_plan || return 1
   case "$VP_WORKER_ADMISSION_REPLAY_PHASE" in
     PREPARING|FORWARD_APPLYING)
@@ -15292,6 +15359,8 @@ vp_restore_worker_admission_transaction() {
     *) return 1 ;;
   esac
 
+  vp_prepare_worker_admission_rollback \
+    "$snapshots" "$attempted_services" || return 1
   local stale_rollback_records
   stale_rollback_records="$(
     vp_worker_admission_stale_rollback_records
@@ -15300,8 +15369,6 @@ vp_restore_worker_admission_transaction() {
   stale_rollback_namespaces="$(
     vp_worker_admission_stale_rollback_namespaces
   )" || return 1
-  vp_prepare_worker_admission_rollback \
-    "$snapshots" "$attempted_services" || return 1
   vp_worker_admission_load_replay_plan || return 1
   if [[ "$VP_WORKER_ADMISSION_REPLAY_PHASE" == ROLLBACK_PREPARING ]]; then
     vp_worker_admission_transition_to ROLLBACK_APPLYING || return 1
@@ -15310,29 +15377,23 @@ vp_restore_worker_admission_transaction() {
   fi
   if ! vp_install_staging_object_janitor \
       "$VP_WORKER_ADMISSION_CONTROL_IMAGE"; then
-    vp_worker_admission_require_candidate_restore || return 1
     return 1
   fi
   if ! vp_worker_admission_clear_janitor_service; then
-    vp_worker_admission_require_candidate_restore || return 1
     return 1
   fi
   if ! vp_run_staging_object_janitor_once; then
-    vp_worker_admission_require_candidate_restore || return 1
     return 1
   fi
   if ! vp_worker_admission_record_janitor_service; then
-    vp_worker_admission_require_candidate_restore || return 1
     return 1
   fi
   if ! vp_restore_app_snapshots \
       "$snapshots" "$attempted_services" true \
       "$process_candidate_records"; then
-    vp_worker_admission_require_candidate_restore || return 1
     return 1
   fi
   if ! vp_worker_admission_transition_to ROLLBACK_VERIFIED; then
-    vp_worker_admission_require_candidate_restore || return 1
     return 1
   fi
   VP_WORKER_ROLLBACK_FAILED_CONTROL_GENERATION="$failed_control_generation"
