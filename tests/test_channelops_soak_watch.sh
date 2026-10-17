@@ -223,10 +223,10 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
       ;;
     CONSUMERS)
       case "$stream" in
-        vp:tasks:ffmpeg_go) consumer=ffmpeg_go-worker@colima-127:1 ;;
-        vp:tasks:ffmpeg) consumer=ffmpeg-worker@150-gpu:1 ;;
-        vp:tasks:vision) consumer=vision-worker@150-vision:1 ;;
-        vp:tasks:youtube_publisher) consumer=youtube_publisher-worker@150-publisher:1 ;;
+        vp:tasks:ffmpeg_go) consumer=ffmpeg_go-worker@colima-127:1:ea1a2312-5c2a-47d6-be67-d8b27d24d80d ;;
+        vp:tasks:ffmpeg) consumer=ffmpeg-worker@150-gpu:1:2e6863b3-1dd0-4a63-a4fe-bf4579f9ed8d ;;
+        vp:tasks:vision) consumer=vision-worker@150-vision:1:2a4d3ad4-e93d-4a4e-a31d-c2c560ef4803 ;;
+        vp:tasks:youtube_publisher) consumer=youtube_publisher-worker@150-publisher:1:57b86542-a870-4823-ae47-1add8c2b6e9f ;;
         vp:events) consumer=orchestrator-api-1 ;;
         *) exit 1 ;;
       esac
@@ -248,7 +248,35 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
           active_idle=120001
           ;;
         duplicate_active_consumer)
-          duplicate_consumer="${consumer%:*}:2"
+          if [[ "$stream" == vp:events ]]; then
+            duplicate_consumer=orchestrator-api-2
+          else
+            duplicate_consumer="${consumer%:*}:11111111-2222-4333-8444-555555555555"
+          fi
+          ;;
+        legacy_worker_consumer)
+          [[ "$stream" == vp:events ]] || consumer="${consumer%:*}"
+          ;;
+        wrong_worker_host)
+          [[ "$stream" == vp:events ]] || consumer="${consumer/@*:1:/@wrong-host:1:}"
+          ;;
+        wrong_worker_slot)
+          [[ "$stream" == vp:events ]] || consumer="${consumer/:1:/:2:}"
+          ;;
+        zero_worker_instance)
+          [[ "$stream" == vp:events ]] || consumer="${consumer%:*}:00000000-0000-0000-0000-000000000000"
+          ;;
+        uppercase_worker_instance)
+          [[ "$stream" == vp:events ]] || consumer="${consumer%:*}:EA1A2312-5C2A-47D6-BE67-D8B27D24D80D"
+          ;;
+        short_worker_instance)
+          [[ "$stream" == vp:events ]] || consumer="${consumer%?}"
+          ;;
+        nonhex_worker_instance)
+          [[ "$stream" == vp:events ]] || consumer="${consumer%?}g"
+          ;;
+        extra_worker_instance_suffix)
+          [[ "$stream" == vp:events ]] || consumer="${consumer}:extra"
           ;;
         malformed_consumer)
           malformed_pending=true
@@ -266,6 +294,11 @@ if [[ "${1:-} ${2:-}" == "exec constructure_vp_redis" \
       active_idle="${active_idle:-500}"
       emit_stale_consumer="${emit_stale_consumer:-false}"
       if [[ "${FAKE_DOCKER_MODE:-healthy}" == "stale_consumer" ]]; then
+        emit_stale_consumer=true
+      fi
+      if [[ "${FAKE_DOCKER_MODE:-healthy}" == "stale_registered_consumer" \
+        && "$stream" != vp:events ]]; then
+        historical_consumer="${consumer%:*}:11111111-2222-4333-8444-555555555555"
         emit_stale_consumer=true
       fi
       if [[ "${FAKE_DOCKER_MODE:-healthy}" == "empty_stale_consumer_name" ]]; then
@@ -662,9 +695,18 @@ assert_contains '|--external-condition|redis_pending_exceeded' "$CALLS"
 for consumer_mode in \
   unknown_consumer \
   near_match_consumer \
+  legacy_worker_consumer \
+  wrong_worker_host \
+  wrong_worker_slot \
+  zero_worker_instance \
+  uppercase_worker_instance \
+  short_worker_instance \
+  nonhex_worker_instance \
+  extra_worker_instance_suffix \
   missing_active_consumer \
   duplicate_active_consumer \
   stale_consumer \
+  stale_registered_consumer \
   malformed_consumer \
   truncated_inactive \
   empty_stale_consumer_name \

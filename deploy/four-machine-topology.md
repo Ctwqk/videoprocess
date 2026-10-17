@@ -255,11 +255,15 @@ stream must have exactly one active consumer matching the production topology:
 
 | Stream / group | Approved active consumer |
 | --- | --- |
-| `vp:tasks:ffmpeg` / `ffmpeg-workers` | `ffmpeg-worker@150-gpu:<positive pid>` |
-| `vp:tasks:ffmpeg_go` / `ffmpeg_go-workers` | `ffmpeg_go-worker@colima-127:<positive pid>` |
-| `vp:tasks:vision` / `vision-workers` | `vision-worker@150-vision:<positive pid>` |
-| `vp:tasks:youtube_publisher` / `youtube_publisher-workers` | `youtube_publisher-worker@150-publisher:<positive pid>` |
+| `vp:tasks:ffmpeg` / `ffmpeg-workers` | `ffmpeg-worker@150-gpu:1:<instance UUID>` |
+| `vp:tasks:ffmpeg_go` / `ffmpeg_go-workers` | `ffmpeg_go-worker@colima-127:1:<instance UUID>` |
+| `vp:tasks:vision` / `vision-workers` | `vision-worker@150-vision:1:<instance UUID>` |
+| `vp:tasks:youtube_publisher` / `youtube_publisher-workers` | `youtube_publisher-worker@150-publisher:1:<instance UUID>` |
 | `vp:events` / `orchestrator` | `orchestrator-api-<positive ordinal>` |
+
+Worker instance UUIDs must use canonical lowercase hexadecimal form and be
+nonzero, matching the registered worker contract's fixed slot 1. Legacy PID-only
+worker names are not admitted identities.
 
 Redis retains consumer records after a worker is replaced. Every record, active
 or stale, must have a non-empty string name. Readiness requires zero stale
@@ -268,8 +272,8 @@ duplicate, or unknown active consumers add only the fixed critical condition
 `redis_consumer_identity_invalid`; the watcher never deletes consumer records.
 The watcher audits the host-networked VP Redis listener with
 `redis-cli -p 6380 --raw` and does not pass or print credentials. This is an
-immediate operational ownership guard, not a replacement for future signed
-worker registration and revocation.
+immediate operational ownership guard, not a replacement for the worker
+registration and revocation gates.
 
 The migration removes zero-pending legacy vision consumers with one atomic
 Redis script. If any pending entry appears, no consumer is deleted and the

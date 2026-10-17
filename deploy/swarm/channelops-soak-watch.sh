@@ -258,11 +258,13 @@ while IFS= read -r service; do
 done <<<"$services"
 
 consumer_active_idle_ms=120000
-stream_groups='vp:tasks:ffmpeg_go|ffmpeg_go-workers|^ffmpeg_go-worker@colima-127:[1-9][0-9]*$
-vp:tasks:ffmpeg|ffmpeg-workers|^ffmpeg-worker@150-gpu:[1-9][0-9]*$
-vp:tasks:vision|vision-workers|^vision-worker@150-vision:[1-9][0-9]*$
-vp:tasks:youtube_publisher|youtube_publisher-workers|^youtube_publisher-worker@150-publisher:[1-9][0-9]*$
-vp:events|orchestrator|^orchestrator-api-[1-9][0-9]*$'
+# Registered worker names bind the fixed slot and canonical process instance UUID.
+consumer_uuid_pattern='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+stream_groups="vp:tasks:ffmpeg_go|ffmpeg_go-workers|^ffmpeg_go-worker@colima-127:1:${consumer_uuid_pattern}\$
+vp:tasks:ffmpeg|ffmpeg-workers|^ffmpeg-worker@150-gpu:1:${consumer_uuid_pattern}\$
+vp:tasks:vision|vision-workers|^vision-worker@150-vision:1:${consumer_uuid_pattern}\$
+vp:tasks:youtube_publisher|youtube_publisher-workers|^youtube_publisher-worker@150-publisher:1:${consumer_uuid_pattern}\$
+vp:events|orchestrator|^orchestrator-api-[1-9][0-9]*\$"
 
 while IFS='|' read -r stream group consumer_pattern; do
   [[ -n "$stream" && -n "$group" && -n "$consumer_pattern" ]] || continue
@@ -324,7 +326,7 @@ while IFS='|' read -r stream group consumer_pattern; do
           fail()
         }
         if (idle <= active_idle_ms) {
-          if (name !~ allowed_pattern) {
+          if (name !~ allowed_pattern || name ~ /:00000000-0000-0000-0000-000000000000$/) {
             fail()
           }
           active_count++
