@@ -73,6 +73,7 @@ VP_WORKER_ABORT_AUTHORITY_CONTROL_GENERATION=""
 VP_WORKER_ABORT_AUTHORITY_OPERATOR_REFERENCE=""
 
 VP_RUNTIME_HOST="${VP_RUNTIME_HOST:-10.0.0.127}"
+VP_RUNTIME_HEALTH_HOST="${VP_RUNTIME_HEALTH_HOST-$VP_RUNTIME_HOST}"
 VP_RUNTIME_NODE="${VP_RUNTIME_NODE:-colima-127}"
 VP_RUNTIME_CONSTRAINT="node.labels.vp.runtime==true"
 VP_RUNTIME_NODE_CONSTRAINT="node.hostname==$VP_RUNTIME_NODE"
@@ -235,6 +236,30 @@ vp_validate_topology() {
     || [[ "$VP_RUNTIME_NODE" != "colima-127" ]] \
     || [[ "$VP_MANAGER_NODE" != "ccttww-lap" ]]; then
     echo "VideoProcess deployment topology must remain fixed to 127 and 150" >&2
+    return 1
+  fi
+}
+
+vp_validate_runtime_health_host() {
+  if ! python3 - "${VP_RUNTIME_HEALTH_HOST-}" <<'PY'
+import ipaddress
+import re
+import sys
+
+host = sys.argv[1]
+if not host or len(host) > 253:
+    raise SystemExit(1)
+if re.fullmatch(r"[0-9.]+", host):
+    try:
+        ipaddress.IPv4Address(host)
+    except ValueError:
+        raise SystemExit(1)
+elif not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+             for label in host.split(".")):
+    raise SystemExit(1)
+PY
+  then
+    echo "VP_RUNTIME_HEALTH_HOST must be an IPv4 address or DNS hostname without scheme, port or path" >&2
     return 1
   fi
 }
@@ -473,6 +498,7 @@ except Exception:
 vp_validate_deploy_config() {
   local principal_probe_image="${1:-}"
   vp_validate_topology || return 1
+  vp_validate_runtime_health_host || return 1
   if [[ "${UPDATE_SERVICES:-1}" -eq 0 ]]; then
     return 0
   fi
@@ -17321,15 +17347,16 @@ vp_apply_app_services() {
   local ffmpeg_go="$5"
   local python_worker="$6"
 
+  vp_validate_runtime_health_host || return 1
   VP_APP_ATTEMPTED_SERVICES=""
   VP_BACKEND_MIGRATION_APPLIED=false
   if [[ "${UPDATE_SERVICES:-1}" -ne 0 ]]; then
     vp_worker_admission_transition_to FORWARD_APPLYING || return 1
   fi
   vp_update_app_runtime_service vp-api-swarm "$api" stop-first || return 1
-  http_health vp-api "http://$VP_RUNTIME_HOST:18080/health" || return 1
+  http_health vp-api "http://$VP_RUNTIME_HEALTH_HOST:18080/health" || return 1
   vp_update_app_runtime_service vp-frontend-swarm "$frontend" stop-first || return 1
-  http_health vp-frontend "http://$VP_RUNTIME_HOST:3001/" || return 1
+  http_health vp-frontend "http://$VP_RUNTIME_HEALTH_HOST:3001/" || return 1
   vp_worker_admission_advance_migration_state pending applying || return 1
   vp_run_worker_registration_migration "$backend" || return 1
   vp_worker_admission_advance_migration_state applying applied || return 1

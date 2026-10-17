@@ -1455,6 +1455,83 @@ if grep -Eq 'YOUTUBE_CREDENTIALS_DIR=|VP_YOUTUBE|--mount-add.*youtube_credential
 fi
 source "$EXTENSION"
 
+test_runtime_health_host_contract() (
+  CALLS="$TEST_ROOT/runtime-health-host-calls"
+  unset VP_RUNTIME_HEALTH_HOST
+  source "$EXTENSION"
+  vp_worker_admission_transition_to() { :; }
+  vp_update_app_runtime_service() {
+    printf 'update|%s|%s|%s\n' "$1" "$VP_RUNTIME_HOST" "$VP_RUNTIME_NODE" >>"$CALLS"
+  }
+  # Stop after both HTTP checks, before any migration or worker action.
+  vp_worker_admission_advance_migration_state() { return 91; }
+
+  : >"$CALLS"
+  if vp_apply_app_services a b c d e f; then
+    echo 'FAIL: health probe fixture passed its migration stop' >&2
+    exit 1
+  fi
+  expected=$'update|vp-api-swarm|10.0.0.127|colima-127\nhealth|vp-api|http://10.0.0.127:18080/health\nupdate|vp-frontend-swarm|10.0.0.127|colima-127\nhealth|vp-frontend|http://10.0.0.127:3001/'
+  [[ "$(<"$CALLS")" == "$expected" ]] || {
+    echo 'FAIL: default runtime HTTP probes changed' >&2; exit 1;
+  }
+
+  VP_RUNTIME_HEALTH_HOST=192.168.20.2
+  for HEALTH_CHECKS in 1 0; do
+    : >"$CALLS"
+    if vp_apply_app_services a b c d e f; then exit 1; fi
+    expected=$'update|vp-api-swarm|10.0.0.127|colima-127\nhealth|vp-api|http://192.168.20.2:18080/health\nupdate|vp-frontend-swarm|10.0.0.127|colima-127\nhealth|vp-frontend|http://192.168.20.2:3001/'
+    [[ "$(<"$CALLS")" == "$expected" ]] || {
+      echo 'FAIL: configured health host did not reach both existing HTTP health checks with fixed runtime identity' >&2
+      exit 1
+    }
+  done
+  HEALTH_CHECKS=1
+  FAIL_HEALTH_CHECK=vp-api
+  : >"$CALLS"
+  if vp_apply_app_services a b c d e f; then exit 1; fi
+  [[ "$(<"$CALLS")" == $'update|vp-api-swarm|10.0.0.127|colima-127\nhealth|vp-api|http://192.168.20.2:18080/health' ]] || {
+    echo 'FAIL: failed runtime HTTP health check did not stop deployment' >&2; exit 1;
+  }
+  FAIL_HEALTH_CHECK=
+
+  UPDATE_SERVICES=0
+  for VP_RUNTIME_HEALTH_HOST in 192.168.20.2 runtime-127.internal localhost; do
+    vp_validate_deploy_config || {
+      echo 'FAIL: valid runtime health hostname was refused' >&2; exit 1;
+    }
+  done
+  for VP_RUNTIME_HEALTH_HOST in '' 'http://192.168.20.2' '192.168.20.2:18080' \
+    '192.168.20.2/path' 'user@192.168.20.2' '192.168.20.2?x=1' \
+    '192.168.20.2#fragment' ' 192.168.20.2' $'192.168.20.2\n' \
+    '192.168.20.2;false' '$(false)' '-runtime' 'runtime-' 'runtime..local' \
+    '999.168.20.2' '192.168.20' '192.168.020.2'; do
+    : >"$CALLS"
+    if vp_validate_deploy_config >/dev/null 2>&1; then
+      echo 'FAIL: invalid runtime health host passed deploy validation' >&2; exit 1;
+    fi
+    if vp_apply_app_services a b c d e f >/dev/null 2>&1 || [[ -s "$CALLS" ]]; then
+      echo 'FAIL: invalid runtime health host reached a deployment action' >&2; exit 1;
+    fi
+  done
+  VP_RUNTIME_HEALTH_HOST=192.168.20.2
+  VP_RUNTIME_HOST=192.168.20.2
+  if vp_validate_deploy_config >/dev/null 2>&1; then
+    echo 'FAIL: health transport setting weakened runtime host identity' >&2; exit 1;
+  fi
+  VP_RUNTIME_HOST=10.0.0.127
+  VP_RUNTIME_NODE=colima-swarmbridged
+  if vp_validate_deploy_config >/dev/null 2>&1; then
+    echo 'FAIL: health transport setting weakened runtime node identity' >&2; exit 1;
+  fi
+  VP_RUNTIME_NODE=colima-127
+  VP_MANAGER_NODE=CASPERs-Mac-mini
+  if vp_validate_deploy_config >/dev/null 2>&1; then
+    echo 'FAIL: health transport setting weakened manager identity' >&2; exit 1;
+  fi
+)
+test_runtime_health_host_contract
+
 test_channelops_build_contract() (
   CALLS="$TEST_ROOT/channelops-contract-calls"
   local context=/Users/wenjieliu/VideoProcess-app

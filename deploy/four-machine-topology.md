@@ -11,6 +11,13 @@ Status date: 2026-07-25.
 - VideoProcess application services run in Docker Swarm on the 127 Colima node.
 - User traffic enters through `http://10.0.0.127:3001`.
 - API traffic is forwarded through `http://10.0.0.127:18080`.
+- Deploy HTTP probes may use `VP_RUNTIME_HEALTH_HOST=192.168.20.2` in the
+  protected deploy environment when 127 is reached over Thunderbolt. This
+  optional IPv4 address or DNS hostname defaults to `VP_RUNTIME_HOST` and
+  changes only API port 18080 and frontend port 3001 health probes; schemes,
+  ports, paths and malformed hosts are rejected. Existing `HEALTH_CHECKS`
+  behavior is preserved. Keep logical `VP_RUNTIME_HOST=10.0.0.127`, runtime
+  node `colima-127`, manager `ccttww-lap` and SSH aliases unchanged.
 - Shared Postgres, Redis, MinIO, Qdrant, Redpanda, embedding, dashboard, and
   IBKR infrastructure stay on `10.0.0.150`.
 - The managed Python FFmpeg worker, managed vision worker, YouTubeManager, and
