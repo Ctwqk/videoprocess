@@ -22,11 +22,11 @@ def restart_document():
     return payload
 
 
-def restart_facts(payload):
+def restart_facts(payload, reason="worker_redis_continuity_unready"):
     registrations, grants = history_facts(payload)
     old = next(row for row in registrations if str(row.id) == payload["workers"][0]["ancestors"][0]["registration_id"])
     old.superseded_by = None
-    old.revoke_reason = "worker_redis_continuity_unready"
+    old.revoke_reason = reason
     old.revoked_at = datetime.fromisoformat(payload["workers"][0]["predecessor"]["registered_at"]) - timedelta(seconds=1)
     unique = {}
     for grant in grants:
@@ -34,10 +34,11 @@ def restart_facts(payload):
     return registrations, list(unique.values()), old
 
 
-def test_v2_exact_restart_bridge_reaches_baseline_without_repairing_rows():
+@pytest.mark.parametrize("reason", ["worker_redis_continuity_unready", "shutdown"])
+def test_v2_exact_restart_bridge_reaches_baseline_without_repairing_rows(reason):
     payload = restart_document()
     pins = decode(payload)
-    registrations, grants, old = restart_facts(payload)
+    registrations, grants, old = restart_facts(payload, reason)
     assert core.validate_database(pins, registrations, grants, now=NOW) == ()
     assert old.superseded_by is None
     assert pins.workers[0].ancestors[0].grant_id == pins.workers[0].predecessor.grant_id
@@ -58,10 +59,11 @@ def test_current_to_predecessor_never_reuses_the_active_grant(version):
 
 
 @pytest.mark.parametrize("fault", ["wrong_reason", "nonnull_wrong_link", "early_revocation", "late_revocation", "active_shared_grant"])
-def test_restart_bridge_never_substitutes_for_unproven_revocation(fault):
+@pytest.mark.parametrize("reason", ["worker_redis_continuity_unready", "shutdown"])
+def test_restart_bridge_never_substitutes_for_unproven_revocation(fault, reason):
     payload = restart_document()
     pins = decode(payload)
-    registrations, grants, old = restart_facts(payload)
+    registrations, grants, old = restart_facts(payload, reason)
     if fault == "wrong_reason":
         old.revoke_reason = "operator_revoked"
     elif fault == "nonnull_wrong_link":

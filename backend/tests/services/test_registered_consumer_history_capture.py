@@ -295,14 +295,14 @@ def restart_document():
 class RestartConnection(HistoryConnection):
     """Model the specified DB edge predicate; parent tests execute the real SQL."""
 
-    def __init__(self, payload, *, explicit=False):
+    def __init__(self, payload, *, explicit=False, reason="worker_redis_continuity_unready"):
         super().__init__(payload)
         old_id = UUID(payload["workers"][0]["ancestors"][0]["registration_id"])
         self.older = next(row for row in self.registrations if row.id == old_id)
         self.newer = next(row for row in self.registrations if row.id == self.older.superseded_by)
         if not explicit:
             self.older.superseded_by = None
-        self.older.revoke_reason = "worker_redis_continuity_unready"
+        self.older.revoke_reason = reason
         self.older.revoked_at = self.newer.registered_at - timedelta(seconds=1)
 
     def incoming(self, newer):
@@ -311,7 +311,7 @@ class RestartConnection(HistoryConnection):
             if older.superseded_by == newer.id or (
                 older.superseded_by is None
                 and older.status == "revoked"
-                and older.revoke_reason == "worker_redis_continuity_unready"
+                and older.revoke_reason in {"worker_redis_continuity_unready", "shutdown"}
                 and older.grant_id == newer.grant_id
                 and older.service_name == newer.service_name
                 and older.lease_epoch + 1 == newer.lease_epoch
@@ -324,9 +324,10 @@ class RestartConnection(HistoryConnection):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("explicit", [False, True])
-async def test_capture_proves_retiring_restart_and_collapses_identical_grant_facts(explicit):
+@pytest.mark.parametrize("reason", ["worker_redis_continuity_unready", "shutdown"])
+async def test_capture_proves_retiring_restart_and_collapses_identical_grant_facts(explicit, reason):
     payload = restart_document()
-    connection, client = RestartConnection(payload, explicit=explicit), RedisInventory(payload)
+    connection, client = RestartConnection(payload, explicit=explicit, reason=reason), RedisInventory(payload)
     inventory = client.inventory[payload["workers"][0]["current"]["service_name"]]
     inventory["consumers"] = [inventory["consumers"][0], inventory["consumers"][-1]]
     history = await capture_module().capture_history(connection, client, *snapshots(payload))
@@ -341,14 +342,15 @@ async def test_capture_proves_retiring_restart_and_collapses_identical_grant_fac
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["worker_redis_continuity_unready", "shutdown"])
 @pytest.mark.parametrize("fault", [
     "reason", "nonnull_wrong_link", "epoch_gap", "different_grant", "registered_equal",
     "revoked_before", "revoked_after", "revoked_missing", "changed_identity",
     "fork", "different_repeated_fact",
 ])
-async def test_capture_restart_bridge_remains_fail_closed(fault):
+async def test_capture_restart_bridge_remains_fail_closed(fault, reason):
     payload = restart_document()
-    connection, client = RestartConnection(payload), RedisInventory(payload)
+    connection, client = RestartConnection(payload, reason=reason), RedisInventory(payload)
     older, newer = connection.older, connection.newer
     if fault == "reason":
         older.revoke_reason = "superseded"

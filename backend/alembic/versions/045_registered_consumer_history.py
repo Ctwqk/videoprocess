@@ -28,7 +28,7 @@ def edge_sql(old: str, newer: str) -> str:
     return f"""({old}.superseded_by = {newer}.id OR (
         {old}.superseded_by IS NULL
         AND {old}.status = 'revoked'
-        AND {old}.revoke_reason = 'worker_redis_continuity_unready'
+        AND {old}.revoke_reason IN ('worker_redis_continuity_unready', 'shutdown')
         AND {old}.grant_id = {newer}.grant_id
         AND {old}.service_name = {newer}.service_name
         AND {old}.lease_epoch + 1 = {newer}.lease_epoch

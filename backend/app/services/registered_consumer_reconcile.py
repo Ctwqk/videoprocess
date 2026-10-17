@@ -632,7 +632,7 @@ def validate_database(
                             pins.version == 2
                             and successor is not worker.current
                             and row.superseded_by is None
-                            and row.revoke_reason == "worker_redis_continuity_unready"
+                            and row.revoke_reason in {"worker_redis_continuity_unready", "shutdown"}
                             and same_grant_restart(pin, successor)
                             and _aware(row.revoked_at)
                             and pin.registered_at <= row.revoked_at <= successor.registered_at

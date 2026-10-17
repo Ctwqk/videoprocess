@@ -49,7 +49,7 @@ def test_history_guard_restart_exception_is_exact_and_read_only():
     sql = migration()["guard_sql"]()
     for fragment in (
         "registration.superseded_by IS NULL",
-        "registration.revoke_reason = 'worker_redis_continuity_unready'",
+        "registration.revoke_reason IN ('worker_redis_continuity_unready', 'shutdown')",
         "registration.grant_id = successor.grant_id",
         "registration.lease_epoch + 1 = successor.lease_epoch",
         "registration.revoked_at <= successor.registered_at",

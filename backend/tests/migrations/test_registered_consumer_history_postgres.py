@@ -275,7 +275,7 @@ async def test_actual_capture_refuses_unproven_history(history_case, fault):
 
 
 @asynccontextmanager
-async def restart_case(history_case):
+async def restart_case(history_case, reason="worker_redis_continuity_unready"):
     async with history_case() as value:
         payload = json.loads(value.request.pins.canonical_json)
         predecessor = payload["workers"][0]["predecessor"]
@@ -287,18 +287,19 @@ async def restart_case(history_case):
         revoked_at = newer.registered_at - timedelta(seconds=1)
         await value.case.owner.execute(
             "UPDATE public.worker_registrations SET grant_id=$1,database_principal=$2,"
-            "superseded_by=NULL,revoke_reason='worker_redis_continuity_unready',revoked_at=$3 WHERE id=$4",
-            newer.grant_id, newer.database_principal, revoked_at, value.extra.id,
+            "superseded_by=NULL,revoke_reason=$5,revoked_at=$3 WHERE id=$4",
+            newer.grant_id, newer.database_principal, revoked_at, value.extra.id, reason,
         )
         yield SimpleNamespace(case=value.case, request=request, extra=value.extra, grant=value.grant)
 
 
 @pytest.mark.asyncio
-async def test_actual_same_grant_restart_guard_and_readonly_capture(history_case):
+@pytest.mark.parametrize("reason", ["worker_redis_continuity_unready", "shutdown"])
+async def test_actual_same_grant_restart_guard_and_readonly_capture(history_case, reason):
     from app.services.registered_consumer_history_capture import capture_history
     from app.services.registered_consumer_reconcile_job import read_snapshot
 
-    async with restart_case(history_case) as value, capture_reader(value.case) as reader:
+    async with restart_case(history_case, reason) as value, capture_reader(value.case) as reader:
         before = await value.case.snapshot()
         async with value.case.operator.transaction():
             facts = await runtime.read_guard(value.case.operator, value.request)
@@ -314,17 +315,27 @@ async def test_actual_same_grant_restart_guard_and_readonly_capture(history_case
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["wrong_reason", "nonadjacent_epoch", "late_revocation"])
-async def test_actual_same_grant_restart_guard_refuses_unproven_edge(history_case, fault):
-    async with restart_case(history_case) as value:
+@pytest.mark.parametrize("reason", ["worker_redis_continuity_unready", "shutdown"])
+@pytest.mark.parametrize("fault", ["wrong_reason", "nonadjacent_epoch", "late_revocation", "early_revocation", "wrong_host", "wrong_slot"])
+async def test_actual_same_grant_restart_guard_refuses_unproven_edge(history_case, fault, reason):
+    async with restart_case(history_case, reason) as value:
         if fault == "wrong_reason":
             await value.case.owner.execute("UPDATE public.worker_registrations SET revoke_reason='operator_revoked' WHERE id=$1", value.extra.id)
         elif fault == "nonadjacent_epoch":
             await value.case.owner.execute("UPDATE public.worker_registrations SET lease_epoch=lease_epoch-1 WHERE id=$1", value.extra.id)
-        else:
+        elif fault == "late_revocation":
             await value.case.owner.execute(
                 "UPDATE public.worker_registrations SET revoked_at=$1 WHERE id=$2",
                 value.request.pins.workers[0].predecessor.registered_at + timedelta(seconds=1), value.extra.id,
             )
-        with pytest.raises(asyncpg.RaiseError, match="registered_reconcile_inventory_changed"):
+        elif fault == "early_revocation":
+            await value.case.owner.execute(
+                "UPDATE public.worker_registrations SET revoked_at=registered_at-interval '1 second' WHERE id=$1", value.extra.id,
+            )
+        elif fault == "wrong_host":
+            await value.case.owner.execute("UPDATE public.worker_registrations SET worker_host='wrong-host' WHERE id=$1", value.extra.id)
+        else:
+            await value.case.owner.execute("UPDATE public.worker_registrations SET worker_slot=2 WHERE id=$1", value.extra.id)
+        expected = "registered_reconcile_history_changed" if fault in {"wrong_host", "wrong_slot"} else "registered_reconcile_inventory_changed"
+        with pytest.raises(asyncpg.RaiseError, match=expected):
             await runtime.read_guard(value.case.operator, value.request)

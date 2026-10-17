@@ -63,7 +63,7 @@ WITH RECURSIVE chain AS (
                WHERE child.superseded_by = c.id OR (
                    child.superseded_by IS NULL
                    AND child.status = 'revoked'
-                   AND child.revoke_reason = 'worker_redis_continuity_unready'
+                   AND child.revoke_reason IN ('worker_redis_continuity_unready', 'shutdown')
                    AND child.grant_id = newer.grant_id
                    AND child.service_name = newer.service_name
                    AND child.lease_epoch + 1 = newer.lease_epoch
