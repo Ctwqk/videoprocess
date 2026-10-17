@@ -60,7 +60,7 @@ channelops_postgres_lines=(
   'set -o pipefail'
   'DATABASE_URL="$CHANNEL_OPS_GO_POSTGRES_TEST_URL" \'
   '  CHANNELOPS_REQUIRE_DATABASE="1" \'
-  '  go test -count=1 -ldflags "-X github.com/Ctwqk/videoprocess/internal/channelops.BuildCommitSHA=$GITHUB_SHA" ./internal/channelops ./internal/store \'
+  '  go test -p 1 -count=1 -ldflags "-X github.com/Ctwqk/videoprocess/internal/channelops.BuildCommitSHA=$GITHUB_SHA" ./internal/channelops ./internal/store \'
   '  | tee ci-evidence/backend/go-channelops-postgres.txt'
 )
 for line in "${channelops_postgres_lines[@]}"; do
