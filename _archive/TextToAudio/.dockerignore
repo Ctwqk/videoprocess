@@ -1,8 +1,0 @@
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.git
-.gitignore
-models
-output/*.wav

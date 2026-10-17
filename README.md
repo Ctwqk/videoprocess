@@ -177,5 +177,6 @@ gofmt -l cmd internal | (! grep .)
 ## Notes
 
 - This repository is a monorepo of related services rather than a single small app; each subdirectory often has its own focused README.
-- The legacy `voice_chat_bot/`, `TextToAudio/`, and `FasterWhisper/` directories are kept for historical media-processing experiments and are not on the critical path of the channel-ops / risk-control flow described above.
+- `TextToAudio/` supplies the host-native TTS deployment in `deploy/macos/deploy_tts_services.sh`.
+- Retired voice-chat and standalone Whisper experiments, duplicate `_archive/` sources, and the old UI ZIP were removed from the working tree. Their source remains available in Git history. Current transcription is implemented by the backend worker handlers; platform upload services come from the companion `constructure-platform-upload` repository.
 - The compose override pattern keeps the base stack and the risk-control extension independently composable so the recently merged Go sidecar work and the new PDS/Kafka integration do not collide.
