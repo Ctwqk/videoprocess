@@ -85,9 +85,10 @@ jobs:
       - name: Run PostgreSQL ChannelOps integration tests
         run: |
           set -o pipefail
+          # These packages share one disposable database; ChannelOps cleanup truncates shared tables.
           DATABASE_URL="$CHANNEL_OPS_GO_POSTGRES_TEST_URL" \
             CHANNELOPS_REQUIRE_DATABASE="1" \
-            go test -count=1 -ldflags "-X github.com/Ctwqk/videoprocess/internal/channelops.BuildCommitSHA=$GITHUB_SHA" ./internal/channelops ./internal/store \
+            go test -p 1 -count=1 -ldflags "-X github.com/Ctwqk/videoprocess/internal/channelops.BuildCommitSHA=$GITHUB_SHA" ./internal/channelops ./internal/store \
             | tee ci-evidence/backend/go-channelops-postgres.txt
       - name: Run Go worker registration fence integration tests
         run: |
