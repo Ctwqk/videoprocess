@@ -8079,12 +8079,15 @@ vp_worker_admission_complete_pending_promotion() {
   esac
   if ! vp_worker_admission_current_promotion_matches "$kind"; then
     vp_worker_admission_hydrate_recovery_context || return 1
-    vp_worker_admission_replay_pending_promotion_effect "$kind" || return 1
-    vp_worker_admission_load_replay_plan || return 1
-    [[ "$VP_WORKER_ADMISSION_REPLAY_OPERATION_KIND" == "$kind" \
-      && "$VP_WORKER_ADMISSION_REPLAY_OPERATION_ID" == "$operation_id" ]] \
-      || return 1
-    vp_worker_admission_current_promotion_matches "$kind" || return 1
+    # A fresh shell needs restored control identity to recognize an applied effect.
+    if ! vp_worker_admission_current_promotion_matches "$kind"; then
+      vp_worker_admission_replay_pending_promotion_effect "$kind" || return 1
+      vp_worker_admission_load_replay_plan || return 1
+      [[ "$VP_WORKER_ADMISSION_REPLAY_OPERATION_KIND" == "$kind" \
+        && "$VP_WORKER_ADMISSION_REPLAY_OPERATION_ID" == "$operation_id" ]] \
+        || return 1
+      vp_worker_admission_current_promotion_matches "$kind" || return 1
+    fi
   fi
   python3 "$VP_WORKER_ADMISSION_TRANSACTION_HELPER" complete-intent \
     "$VP_WORKER_ADMISSION_LOCK_ROOT" \
@@ -10776,6 +10779,8 @@ vp_commit_worker_control_generation() {
     "$VP_PYTHON_WORKER_SERVICE" \
     "$VP_VISION_WORKER_SERVICE" \
     "$VP_PUBLISHER_SERVICE"; do
+    # A replaying shell must restore worker contracts from the pinned manifests.
+    vp_worker_admission_select_candidate "$service" || return 1
     vp_require_worker_service_descriptor "$service" || return 1
   done
   local root

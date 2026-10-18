@@ -460,6 +460,69 @@ vp_worker_admission_process_retirement_journals() { echo bypassed; return 1; }
     assert result.returncode == 1 and result.stdout == "blocked\n"
 
 
+@pytest.mark.parametrize("fault", [None, "missing_manifest", "wrong_service", "descriptor"])
+def test_forward_control_reloads_worker_contracts_in_fresh_recovery_shell(tmp_path, fault):
+    services = [
+        ("vp-ffmpeg-worker-go-swarm", "ffmpeg-go"),
+        ("vp-ffmpeg-worker-gpu-swarm", "ffmpeg"),
+        ("vp-vision-worker-swarm", "vision"),
+        ("vp-youtube-publisher-swarm", "youtube-publisher"),
+    ]
+    directory = tmp_path / "candidates/recovery"
+    directory.mkdir(parents=True, mode=0o700)
+    commit = "2" * 40
+    for index, (service, kind) in enumerate(services):
+        if index == 1 and fault == "missing_manifest":
+            continue
+        identity = "wrong-service" if index == 1 and fault == "wrong_service" else service
+        path = directory / (kind + ".conf")
+        path.write_text(
+            f"VERSION=2\nSERVICE={identity}\nCOMMIT={commit}\n"
+            f"IMAGE=vp-worker:deploy-{commit[:12]}\nGENERATION={900 + index}\n"
+            f"DATABASE_SECRET={service}-database\nADMISSION_SECRET={service}-admission\n"
+            f"DATABASE_SECRET_ID={'a' * 24}{index}\nADMISSION_SECRET_ID={'b' * 24}{index}\n"
+        )
+        path.chmod(0o600)
+    result = run(r"""
+VP_WORKER_CONTROL_PREPARED=true
+VP_WORKER_ADMISSION_COMMITTED=true
+VP_WORKER_REDIS_MARKER_CONTROL_PREPARED=false
+VP_WORKER_ADMISSION_PREPARED=true
+VP_WORKER_ADMISSION_CANDIDATE_NAMESPACE=recovery
+VP_WORKER_ADMISSION_CANDIDATE_SERVICES="$SERVICES"
+VP_WORKER_ADMISSION_COMMIT=2222222222222222222222222222222222222222
+VP_WORKER_MINIO_ACCESS_SECRET=selected-access
+VP_WORKER_MINIO_SECRET_SECRET=selected-secret
+VP_WORKER_REDIS_FFMPEG_GO_SECRET=selected-redis-go
+VP_WORKER_REDIS_FFMPEG_SECRET=selected-redis-ffmpeg
+VP_WORKER_REDIS_VISION_SECRET=selected-redis-vision
+VP_WORKER_REDIS_YOUTUBE_PUBLISHER_SECRET=selected-redis-publisher
+vp_worker_admission_root() { printf '%s\n' "$ADMISSION_ROOT"; }
+vp_require_selected_autoflow_control_ready() { :; }
+vp_require_pipeline_network_identity() { :; }
+vp_require_worker_service_descriptor() {
+  local image
+  image="$(vp_worker_admission_candidate_image "$1")" || return 1
+  vp_worker_service_registration_env "$1" "$image" >/dev/null || return 1
+  vp_worker_service_secret_specs "$1" >/dev/null || return 1
+  [[ "$FAULT" != descriptor || "$1" != vp-vision-worker-swarm ]] || return 1
+  printf 'descriptor:%s\n' "$1"
+}
+# Stop at the next guard, before any control mutation or retirement.
+vp_require_staging_object_janitor_control() { echo janitor-boundary; return 1; }
+vp_worker_control_schedule_retirement() { echo unsafe-retirement; }
+vp_worker_control_write_manifest() { echo unsafe-write; }
+vp_commit_worker_control_generation
+""", ADMISSION_ROOT=str(tmp_path), SERVICES=" ".join(s for s, _ in services),
+        FAULT=fault or "none")
+    assert result.returncode == 1, result.stderr
+    count = 4 if fault is None else 2 if fault == "descriptor" else 1
+    expected = ["descriptor:" + service for service, _ in services[:count]]
+    if fault is None:
+        expected.append("janitor-boundary")
+    assert result.stdout.splitlines() == expected, result.stderr
+
+
 @pytest.mark.parametrize(
     "fault",
     [None, "lock", "secret_id", "selection", "read_error", "service_id", "image"],
@@ -1644,3 +1707,88 @@ printf 'status:%s\nflags:%s:%s\n' "$status" "$VP_WORKER_ADMISSION_PREPARED" "$VP
         paths = [line.split(":", 1)[1] for line in lines if line.startswith(("control:", "worker:"))]
         assert len(paths) == 5 and len(set(paths)) == 5
         assert all(path.startswith("/fixture-only/admission/") for path in paths)
+
+
+@pytest.mark.parametrize("kind", ["PROMOTE_CONTROL", "PROMOTE_ROLLBACK_CONTROL"])
+@pytest.mark.parametrize("fault", [None, "readiness", "mismatch", "hydrate"])
+def test_completed_control_promotion_rechecks_target_after_fresh_shell_hydration(
+    tmp_path, kind, fault,
+):
+    transaction = "tx-" + "a" * 32
+    operation = "operation-" + "b" * 32
+    target = b"completed-control-target\n"
+
+    def manifest_digest(raw):
+        return hashlib.sha256(
+            b"file\0" + len(raw).to_bytes(8, "big") + raw
+        ).hexdigest()
+
+    current = tmp_path / "control-current.conf"
+    current.write_bytes(b"unrelated-control\n" if fault == "mismatch" else target)
+    current.chmod(0o600)
+    before = current.read_bytes()
+    preconditions = tmp_path / "transactions" / transaction / "promotion-preconditions"
+    preconditions.mkdir(parents=True)
+    precondition = preconditions / (kind + ".json")
+    precondition.write_text(json.dumps({
+        "schema": 1,
+        "transaction_id": transaction,
+        "operation_kind": kind,
+        "target": {
+            "name": "control-current.conf",
+            "service": "worker-admission-control",
+            "generation": GENERATION,
+            "spec_digest": manifest_digest(target),
+        },
+        "current": {
+            "state": "present",
+            "spec_digest": manifest_digest(b"prior-control\n"),
+        },
+        "worker_manifests": [],
+    }))
+    precondition.chmod(0o600)
+    original_precondition = precondition.read_bytes()
+    completion = tmp_path / "completed.json"
+    helper = tmp_path / "complete_intent_boundary.py"
+    helper.write_text(
+        "import json, pathlib, sys\n"
+        "pathlib.Path(sys.argv[2], 'completed.json').write_text(json.dumps(sys.argv[1:]))\n"
+    )
+    result = run(r'''
+VP_WORKER_ADMISSION_LOCK_ROOT="$ADMISSION_ROOT"
+VP_WORKER_ADMISSION_LOCK_FD=19
+VP_WORKER_ADMISSION_TRANSACTION_HELPER="$HELPER"
+VP_WORKER_ADMISSION_TRANSACTION_ID="$TRANSACTION"
+VP_WORKER_ADMISSION_REPLAY_OPERATION_KIND="$KIND"
+VP_WORKER_ADMISSION_REPLAY_OPERATION_ID="$OPERATION"
+VP_WORKER_ADMISSION_REPLAY_OPERATION_NAME=control-current.conf
+VP_WORKER_ADMISSION_REPLAY_OPERATION_SERVICE=worker-admission-control
+VP_WORKER_ADMISSION_REPLAY_OPERATION_GENERATION=c-0123456789abcdef0123
+VP_WORKER_ADMISSION_REPLAY_OPERATION_DIGEST="$DIGEST"
+VP_WORKER_ADMISSION_REPLAY_REVISION=209
+VP_WORKER_CONTROL_GENERATION=""
+vp_registered_reconcile_action() { [[ "$1 $2" == 'verify all' ]]; }
+vp_require_selected_autoflow_control_ready() {
+  [[ "$VP_WORKER_CONTROL_GENERATION" == c-0123456789abcdef0123 \
+    && "$FAULT" != readiness ]]
+}
+vp_worker_admission_hydrate_recovery_context() {
+  [[ "$FAULT" != hydrate ]] || return 1
+  VP_WORKER_CONTROL_GENERATION=c-0123456789abcdef0123
+}
+vp_worker_admission_load_replay_plan() { :; }
+vp_worker_admission_complete_pending_promotion "$KIND" "$OPERATION"
+''', ADMISSION_ROOT=str(tmp_path), HELPER=str(helper), TRANSACTION=transaction,
+        KIND=kind, OPERATION=operation, DIGEST=manifest_digest(target),
+        FAULT=fault or "none")
+    assert result.returncode == (0 if fault is None else 1), result.stderr
+    if fault is None:
+        assert json.loads(completion.read_text()) == [
+            "complete-intent", str(tmp_path), "19", "209", operation,
+        ]
+    else:
+        assert not completion.exists()
+    assert current.read_bytes() == before
+    assert precondition.read_bytes() == original_precondition
+    # Completing an already-applied effect must not require its retired candidate.
+    assert not (tmp_path / "control-candidates").exists()

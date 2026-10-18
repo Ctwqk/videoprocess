@@ -275,6 +275,7 @@ chmod 0700 "$(vp_worker_admission_root)"
   vp_require_staging_object_janitor_control() { return 0; }
   vp_worker_control_process_retirements() { return 0; }
   (
+    vp_worker_admission_select_candidate() { return 0; }
     vp_require_worker_service_descriptor() { return 0; }
     vp_commit_worker_control_generation
   )
@@ -4918,6 +4919,9 @@ vp_worker_control_write_manifest \
   "${control_commit_ids[@]}"
 vp_require_worker_service_descriptor() {
   printf 'descriptor|%s\n' "$1" >>"$CONTROL_COMMIT_CALLS"
+}
+vp_worker_admission_select_candidate() {
+  printf 'select|%s\n' "$1" >>"$CONTROL_COMMIT_CALLS"
 }
 vp_require_staging_object_janitor_control() {
   printf 'janitor|converged\n' >>"$CONTROL_COMMIT_CALLS"
