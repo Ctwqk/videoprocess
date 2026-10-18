@@ -497,7 +497,8 @@ async def test_go_scheduler_keeps_sealed_channels_out_of_maintenance(retained_da
     try:
         await admin.execute(f'CREATE DATABASE "{target.database}"')
         created = True
-        await migrate(target, HEAD)
+        # This child runs current Go code; only historical migration tests stay pinned to HEAD.
+        await migrate(target, "head")
         process = await asyncio.create_subprocess_exec(
             "go", "test", "./internal/channelops", "-count=1", "-v", "-run", "^TestOwnedScheduler",
             cwd=Path(__file__).resolve().parents[3],
