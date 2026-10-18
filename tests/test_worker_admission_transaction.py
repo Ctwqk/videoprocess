@@ -1591,11 +1591,54 @@ class RegisteredReconcileJournalTests(unittest.TestCase):
 
         with patch.dict(namespace, _registered_docker=docker):
             result = HELPER["cleanup_registered_read"](str(self.root), str(self.fd))
-            HELPER["cleanup_registered_read"](str(self.root), str(self.fd))
+            repeated = HELPER["cleanup_registered_read"](str(self.root), str(self.fd))
+        self.assertEqual(repeated["revision"], result["revision"])
         self.assertEqual(
             result["registered_reconcile"]["capture_read"]["state"], "removed"
         )
         self.assertEqual(len(removals), 1)
+
+    def test_removed_reconcile_secrets_verify_without_invalidating_revision(self):
+        for key in ("pins", "capture_read"):
+            with self.subTest(key=key):
+                record = (
+                    dict(state="removed", id="p" * 25,
+                         name="vp-registered-pins-" + self.binding["attempt_id"],
+                         sha256=self.binding["pin_sha256"])
+                    if key == "pins"
+                    else {**self.reader_record(), "state": "removed"}
+                )
+                self.fixture.state["registered_reconcile"] = dict(
+                    version=1, baseline=None, current=None, run=None,
+                    **{key: record},
+                )
+                self.fixture.write_state()
+                active = self.root / "transactions/active.json"
+                original = active.read_bytes()
+                original_inode = active.stat().st_ino
+                calls = []
+
+                def inventory(arguments, **kwargs):
+                    self.assertEqual(arguments, ["secret", "ls", "--format", "{{.ID}} {{.Name}}"])
+                    calls.append(arguments)
+                    return ""
+
+                function = HELPER["_cleanup_registered_secret"]
+                with patch.dict(function.__globals__, _registered_docker=inventory):
+                    for _ in range(2):
+                        result = function(str(self.root), str(self.fd), key)
+                        self.assertEqual(result["revision"], self.fixture.state["revision"])
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(active.read_bytes(), original)
+                self.assertEqual(active.stat().st_ino, original_inode)
+
+                for identity in (record["id"], "x" * 25):
+                    with self.subTest(reappeared_identity=identity), patch.dict(
+                        function.__globals__,
+                        _registered_docker=lambda *a, **k: identity + " " + record["name"],
+                    ), self.assertRaises(HELPER["TransactionError"]):
+                        function(str(self.root), str(self.fd), key)
+                self.assertEqual(active.read_bytes(), original)
 
     def test_capture_reader_cannot_retire_while_capture_job_live(self):
         self.capture_job()

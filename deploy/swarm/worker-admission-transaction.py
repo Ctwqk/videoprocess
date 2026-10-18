@@ -5815,6 +5815,10 @@ def _cleanup_registered_secret(raw_root: str, raw_descriptor: str, key: str) -> 
     remaining = inventory()
     if pins["id"] in remaining or pins["name"] in remaining.values():
         raise TransactionError
+    # Promotion verification rechecks absence with a previously loaded CAS
+    # revision. A completed cleanup must not invalidate that revision.
+    if pins["state"] == "removed":
+        return document
 
     def removed(value: dict) -> None:
         if value["registered_reconcile"][key] != pins:
