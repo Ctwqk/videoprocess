@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import time
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -72,7 +73,7 @@ def d_database():
             created.append("database")
         finally:
             await admin.close()
-        await migrate(target, "042_owned_producer_fence")
+        await migrate(target, "046_owned_retained_terminal")
         owner = await asyncpg.connect(dsn(target), timeout=5)
         try:
             await owner.execute("INSERT INTO runtime_schedules(service_name,state,updated_by) VALUES('videoprocess','CLOSED','d-fixture') ON CONFLICT(service_name) DO UPDATE SET state='CLOSED',guarded_job_id=NULL")
@@ -116,7 +117,7 @@ class RealPolicy:
 async def d_pg(d_database, monkeypatch, media_paths, request):
     monkeypatch.setenv("OWNED_INVENTORY_DISPOSABLE_TEST_CONFIRM", d_database.owner_url.database)
     api = api_inventory_env.__wrapped__(monkeypatch, SimpleNamespace(param=d_database.owner_url.render_as_string(hide_password=False),
-        expected_migration_head="042_owned_producer_fence"))
+        expected_migration_head="046_owned_retained_terminal"))
     worker = None
     try:
         env = await anext(api)
@@ -215,9 +216,9 @@ async def reserve(env):
 async def test_pg_d_catalog_no_new_worker_authority(d_database):
     owner = await asyncpg.connect(dsn(d_database.owner_url), timeout=5)
     try:
-        assert await owner.fetchval("SELECT version_num FROM alembic_version") == "042_owned_producer_fence"
+        assert await owner.fetchval("SELECT version_num FROM alembic_version") == "046_owned_retained_terminal"
         rows = await owner.fetch("SELECT proname, has_function_privilege($1,p.oid,'EXECUTE') allowed FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND proname LIKE 'vp_owned_producer_%'", d_database.role)
-        assert len(rows) == 13 and all(not r["allowed"] for r in rows)
+        assert len(rows) == 14 and all(not r["allowed"] for r in rows)
         assert not await owner.fetchval("SELECT has_table_privilege($1,'owned_seed_inventories','SELECT')", d_database.role)
         assert not await owner.fetchval("SELECT has_table_privilege($1,'youtube_upload_operations','INSERT,UPDATE,DELETE')", d_database.role)
     finally:
@@ -330,3 +331,55 @@ async def test_pg_d_final_fence_serializes_revocation(d_pg):
             blocked.cancel()
             await asyncio.gather(blocked, return_exceptions=True)
         await observer.close()
+
+
+async def test_pg_d_queued_worker_release_bounds_final_heartbeat_and_prevents_post(d_pg, d_database):
+    env = d_pg
+    claim = await env.store.claim(env.native.context)
+    releaser = await asyncpg.connect(dsn(d_database.runtime_url), timeout=5)
+    released = None
+    final_started = None
+    refreshes = 0
+    posts = []
+
+    async def refresh(*, minimum_margin_seconds):
+        nonlocal released, final_started, refreshes
+        refreshes += 1
+        if refreshes == 2:
+            holder = await env.store._active_submission_fence.get().db.scalar(text("SELECT pg_backend_pid()"))
+            contender = await releaser.fetchval("SELECT pg_backend_pid()")
+            lease = env.native.lease
+            released = asyncio.create_task(releaser.fetchval(
+                "SELECT public.vp_worker_release($1,$2,$3,$4,$5,$6)",
+                lease.registration_id, lease.service_name, lease.worker_instance_id,
+                lease.lease_epoch, hashlib.sha256(lease.lease_secret.encode()).hexdigest(), "queued-release-test",
+            ))
+            await wait_blocked(env.native.owner, contender, holder)
+            assert not released.done()
+            final_started = time.monotonic()
+        await env.native.refresh(minimum_margin_seconds=minimum_margin_seconds)
+
+    async def submit():
+        async with env.store.submission_fence(env.native.context, lease_refresher=refresh):
+            await env.store.mark_attempting(claim.operation.id, context=env.native.context)
+            posts.append(claim.operation.id)
+
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(submit(), timeout=8)
+        assert final_started is not None and 4.5 <= time.monotonic() - final_started < 7
+        assert refreshes == 2 and posts == []
+        assert released is not None and await asyncio.wait_for(released, timeout=2)
+        row = await env.native.owner.fetchrow(
+            "SELECT status,request_attempted_at,manager_task_id FROM youtube_upload_operations WHERE id=$1",
+            claim.operation.id,
+        )
+        assert row["status"] == "reserved" and row["request_attempted_at"] is not None and row["manager_task_id"] is None
+        assert await env.native.owner.fetchval(
+            "SELECT status FROM worker_registrations WHERE id=$1", env.native.lease.registration_id,
+        ) == "revoked"
+    finally:
+        if released is not None and not released.done():
+            released.cancel()
+            await asyncio.gather(released, return_exceptions=True)
+        await releaser.close()

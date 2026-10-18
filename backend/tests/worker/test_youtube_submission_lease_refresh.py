@@ -235,6 +235,35 @@ async def test_task_cancel_during_authenticated_refresh_never_posts(
     assert env.store._action_for(env.operation) == "block"
 
 
+@pytest.mark.parametrize("point", [2, 3])
+async def test_stalled_refresh_has_its_own_deadline_and_never_posts(
+    slow_submission, monkeypatch, point
+):
+    env = slow_submission
+    env.pause_refresh = point
+    monkeypatch.setattr(
+        operations, "SUBMISSION_LEASE_REFRESH_TIMEOUT_SECONDS", 0.02, raising=False
+    )
+    task = asyncio.create_task(env.run())
+    try:
+        done, _ = await asyncio.wait({task}, timeout=0.5)
+        assert task in done, (
+            "submission refresh must end without an external task cancellation"
+        )
+        with pytest.raises(TimeoutError):
+            await task
+        assert env.posts == 0 and not env.db.active
+        assert (
+            env.operation.request_attempted_at is not None
+            and env.operation.manager_task_id is None
+        )
+        assert env.store._action_for(env.operation) == "block"
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_registered_attempt_without_refresher_refuses_before_attempt_write(
     slow_submission,
 ):

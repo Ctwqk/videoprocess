@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import uuid
@@ -31,6 +32,7 @@ from app.services.job_execution_authority import (
 from app.services.schedule_service import VIDEO_SCHEDULE_SERVICE
 
 SUBMISSION_LEASE_MARGIN_SECONDS = 150
+SUBMISSION_LEASE_REFRESH_TIMEOUT_SECONDS = 5.0
 
 
 def _session_is_postgresql(db: object) -> bool:
@@ -832,9 +834,10 @@ class YouTubeUploadOperationStore:
             # Producer history can outlast the lease's 30-second surplus over
             # the required POST margin. Refresh after the durable attempt and
             # before reacquiring authority; no external upload has happened.
-            await fence.lease_refresher(
-                minimum_margin_seconds=SUBMISSION_LEASE_MARGIN_SECONDS,
-            )
+            async with asyncio.timeout(SUBMISSION_LEASE_REFRESH_TIMEOUT_SECONDS):
+                await fence.lease_refresher(
+                    minimum_margin_seconds=SUBMISSION_LEASE_MARGIN_SECONDS,
+                )
             await fence.db.begin()
             await self._require_registered_submission_authority(
                 fence.db,
@@ -850,9 +853,12 @@ class YouTubeUploadOperationStore:
             # Keep all producer/claim locks while refreshing through the
             # compatible shared lease fence. Recheck DB authority and margin
             # after the last expensive producer check, immediately before POST.
-            await fence.lease_refresher(
-                minimum_margin_seconds=SUBMISSION_LEASE_MARGIN_SECONDS,
-            )
+            # A queued exclusive revoker can make a later shared heartbeat
+            # wait behind it. Bound this wait so rollback releases our fence.
+            async with asyncio.timeout(SUBMISSION_LEASE_REFRESH_TIMEOUT_SECONDS):
+                await fence.lease_refresher(
+                    minimum_margin_seconds=SUBMISSION_LEASE_MARGIN_SECONDS,
+                )
             await self._require_registered_submission_authority(
                 fence.db,
                 fence.context,
