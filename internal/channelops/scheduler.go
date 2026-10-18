@@ -171,6 +171,8 @@ func (s Scheduler) enqueueOperationalMaintenance(ctx context.Context, channels [
 	return nil
 }
 
+// Approved historical channels remain sealed after expiry, revocation, or succession
+// release. Do not enqueue maintenance into them; ordinary paused channels still learn.
 func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]ChannelProfileRow, error) {
 	rows, err := s.db().Query(ctx, `
 		SELECT id, enabled, dry_run, halted_at, intake_paused_at,
@@ -181,6 +183,20 @@ func (s *Store) ListSchedulableChannels(ctx context.Context, now time.Time) ([]C
 		         AND i.state='approved' AND i.approved_at IS NOT NULL AND i.revoked_at IS NULL AND i.succession_released_at IS NULL)
 		FROM channel_profiles
 		WHERE enabled = TRUE AND halted_at IS NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM owned_seed_inventories historical
+		    WHERE historical.approved_at IS NOT NULL
+		      AND historical.manifest_json::jsonb->>'version' = '2'
+		      AND (
+		        historical.manifest_json::jsonb->'legacy_history'->'retired_unassigned_preupload'->>'legacy_channel_profile_id' = channel_profiles.id::text
+		        OR EXISTS (
+		          SELECT 1 FROM jsonb_array_elements(COALESCE(
+		            historical.manifest_json::jsonb->'legacy_history'->'bindings', '[]'::jsonb
+		          )) binding
+		          WHERE binding->>'legacy_channel_profile_id' = channel_profiles.id::text
+		        )
+		      )
+		  )
 		ORDER BY created_at ASC
 	`)
 	if err != nil {

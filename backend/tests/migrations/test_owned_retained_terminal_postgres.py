@@ -486,3 +486,35 @@ async def test_pg_additive_042_to_046_catalog_and_downgrade_preservation(retaine
             await db.close()
         await anchor.execute(f'DROP DATABASE "{target.database}"')
         await anchor.close()
+
+
+async def test_go_scheduler_keeps_sealed_channels_out_of_maintenance(retained_database):
+    """Run the real Go scheduler against native seals in its own disposable child."""
+    target = retained_database.set(database="vp_owned_inventory_test_scheduler_" + uuid4().hex)
+    admin = await asyncpg.connect(dsn(retained_database), timeout=5, command_timeout=10)
+    created = False
+    process = None
+    try:
+        await admin.execute(f'CREATE DATABASE "{target.database}"')
+        created = True
+        await migrate(target, HEAD)
+        process = await asyncio.create_subprocess_exec(
+            "go", "test", "./internal/channelops", "-count=1", "-v", "-run", "^TestOwnedScheduler",
+            cwd=Path(__file__).resolve().parents[3],
+            env={**os.environ, "DATABASE_URL": "invalid-offline",
+                 "OWNED_INVENTORY_DISPOSABLE_TEST_URL": dsn(target),
+                 "OWNED_INVENTORY_DISPOSABLE_TEST_CONFIRM": target.database},
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        output, _ = await asyncio.wait_for(process.communicate(), 180)
+        assert process.returncode == 0, output.decode()[-8000:]
+        assert b"--- SKIP:" not in output
+        assert b"--- PASS: TestOwnedSchedulerDoesNotEnqueueIntoSealedHistory" in output
+        assert b"--- PASS: TestOwnedSchedulerHistoryExclusionOnlyForApprovedV2" in output
+    finally:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        if created:
+            await admin.execute(f'DROP DATABASE "{target.database}"')
+        await admin.close()
