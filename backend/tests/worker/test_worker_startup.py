@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from asyncpg import PostgresError
 from asyncpg.exceptions import RaiseError
 from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
 from sqlalchemy.exc import DBAPIError
@@ -2859,7 +2860,7 @@ async def test_main_restores_process_globals_for_repeated_in_process_runs(
     monkeypatch.setattr(
         worker_main,
         "_require_worker_redis_continuity",
-        lambda: asyncio.sleep(0),
+        lambda _registration: asyncio.sleep(0),
     )
     monkeypatch.setattr(
         worker_main,
@@ -2884,8 +2885,10 @@ async def test_main_restores_process_globals_for_repeated_in_process_runs(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("running_first", [False, True])
 async def test_registered_worker_requires_continuity_and_acl_identity_before_group(
     monkeypatch,
+    running_first,
 ) -> None:
     calls: list[str] = []
     close_reasons: list[str] = []
@@ -2958,8 +2961,21 @@ async def test_registered_worker_requires_continuity_and_acl_identity_before_gro
         calls.append("registration_complete")
         return Registration()
 
-    async def require_continuity():
-        calls.append("continuity_ready")
+    class ContinuitySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, statement, parameters):
+            assert parameters == {"max_age_seconds": 90}
+            if running_first and "continuity_running" not in calls:
+                calls.append("continuity_running")
+                raise DBAPIError(None, None, PostgresError.new({
+                    "C": "P0001", "M": "worker_redis_continuity_running",
+                }))
+            calls.append("continuity_ready")
 
     def construct_redis():
         calls.append("redis_constructed")
@@ -2974,10 +2990,10 @@ async def test_registered_worker_requires_continuity_and_acl_identity_before_gro
     monkeypatch.setattr(worker_main, "_start_worker_registration", register)
     monkeypatch.setattr(
         worker_main,
-        "_require_worker_redis_continuity",
-        require_continuity,
-        raising=False,
+        "get_worker_session",
+        lambda: lambda: ContinuitySession(),
     )
+    monkeypatch.setattr(worker_main, "WORKER_REDIS_CONTINUITY_RETRY_SECONDS", 0)
     monkeypatch.setattr(worker_main, "_redis", construct_redis)
     monkeypatch.setattr(
         worker_main,
@@ -2992,6 +3008,7 @@ async def test_registered_worker_requires_continuity_and_acl_identity_before_gro
     assert calls == [
         "database_open",
         "registration_complete",
+        *(["continuity_running"] if running_first else []),
         "continuity_ready",
         "redis_constructed",
         "redis_whoami",
@@ -3074,7 +3091,7 @@ async def test_registration_lost_during_continuity_performs_zero_redis_io(
         lambda *_args: asyncio.sleep(0, result=registration),
     )
 
-    async def lose_during_continuity() -> None:
+    async def lose_during_continuity(_registration) -> None:
         registration.lost = True
 
     async def consume(*_args) -> None:
@@ -3165,7 +3182,7 @@ async def test_registration_loss_cancels_acl_handshake_before_command_send(
     monkeypatch.setattr(
         worker_main,
         "_require_worker_redis_continuity",
-        lambda: asyncio.sleep(0),
+        lambda _registration: asyncio.sleep(0),
     )
     monkeypatch.setattr(worker_main, "_redis", Redis)
 
@@ -3216,6 +3233,7 @@ async def test_worker_continuity_gate_calls_database_function_with_90_seconds(
         "worker_redis_continuity_stale",
         "worker_redis_continuity_error",
         "worker_redis_continuity_running",
+        "structured_running",
     ],
 )
 async def test_unready_continuity_revokes_registration_before_any_redis(
@@ -3225,12 +3243,18 @@ async def test_unready_continuity_revokes_registration_before_any_redis(
 ) -> None:
     redis_constructions = 0
     close_reasons: list[str] = []
+    continuity_calls = 0
+    monkeypatch.setattr(worker_main, "WORKER_REDIS_CONTINUITY_WAIT_SECONDS", 0.02)
+    monkeypatch.setattr(worker_main, "WORKER_REDIS_CONTINUITY_RETRY_SECONDS", 0.001)
 
     class Registration:
         redis_consumer_id = "ffmpeg-worker@150-gpu:1:registered"
 
         def __init__(self):
             self.closed = False
+
+        def create_guarded_task(self, awaitable):
+            return asyncio.create_task(awaitable)
 
         async def close(self, *, reason: str = "shutdown"):
             if self.closed:
@@ -3246,6 +3270,12 @@ async def test_unready_continuity_revokes_registration_before_any_redis(
             return False
 
         async def execute(self, _statement, _parameters):
+            nonlocal continuity_calls
+            continuity_calls += 1
+            if database_reason == "structured_running":
+                raise DBAPIError(None, None, PostgresError.new({
+                    "C": "P0001", "M": "worker_redis_continuity_running",
+                }))
             raise RuntimeError(f"{database_reason}: sensitive database detail")
 
     monkeypatch.setattr(
@@ -3300,6 +3330,7 @@ async def test_unready_continuity_revokes_registration_before_any_redis(
     assert exc.value.code == 2
     assert redis_constructions == 0
     assert close_reasons == ["worker_redis_continuity_unready"]
+    assert continuity_calls > 1 if database_reason == "structured_running" else continuity_calls == 1
     assert caplog.text.count("worker_redis_continuity_unready") == 1
     assert database_reason not in caplog.text
     assert "sensitive database detail" not in caplog.text
@@ -3377,7 +3408,7 @@ async def test_worker_admission_runs_before_database_and_redis(monkeypatch) -> N
     monkeypatch.setattr(
         worker_main,
         "_require_worker_redis_continuity",
-        lambda: asyncio.sleep(0, result=events.append("continuity")),
+        lambda _registration: asyncio.sleep(0, result=events.append("continuity")),
         raising=False,
     )
 
@@ -3525,7 +3556,7 @@ async def test_local_storage_development_does_not_load_minio_credentials(
     monkeypatch.setattr(
         worker_main,
         "_require_worker_redis_continuity",
-        lambda: asyncio.sleep(0),
+        lambda _registration: asyncio.sleep(0),
     )
     monkeypatch.setattr(
         worker_main,

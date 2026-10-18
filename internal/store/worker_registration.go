@@ -19,6 +19,8 @@ import (
 var (
 	ErrWorkerRegistrationLost    = errors.New("worker registration lost")
 	ErrWorkerRegistrationExpired = errors.New("worker registration expired")
+	// Only the exact PostgreSQL gate result may produce this retryable identity.
+	ErrWorkerRedisContinuityRunning = &WorkerRegistrationError{Code: "worker_redis_continuity_running"}
 )
 
 type WorkerRegistrationError struct {
@@ -325,12 +327,21 @@ func (s *Store) RequireWorkerRedisContinuity(
 		`SELECT public.vp_require_worker_redis_continuity($1)`,
 		maxAgeSeconds,
 	); err != nil {
-		return sanitizeWorkerRegistrationError(err)
+		return workerRedisContinuityError(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return sanitizeWorkerRegistrationError(err)
 	}
 	return nil
+}
+
+func workerRedisContinuityError(err error) error {
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) && postgresError.Code == "P0001" &&
+		postgresError.Message == "worker_redis_continuity_running" {
+		return ErrWorkerRedisContinuityRunning
+	}
+	return sanitizeWorkerRegistrationError(err)
 }
 
 func boundedSecretSHA256(value string, code string) (string, error) {

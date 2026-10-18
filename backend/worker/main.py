@@ -111,6 +111,8 @@ EVENT_EMISSION_SEND_ATTEMPTS = 3
 EVENT_EMISSION_RECONCILE_INTERVAL_SECONDS = 5.0
 EVENT_EMISSION_RECONCILE_LIMIT = 50
 WORKER_REDIS_CONTINUITY_MAX_AGE_SECONDS = 90
+WORKER_REDIS_CONTINUITY_WAIT_SECONDS = 10.0
+WORKER_REDIS_CONTINUITY_RETRY_SECONDS = 0.25
 
 engine_db: AsyncEngine | None = None
 worker_session: async_sessionmaker[AsyncSession] | None = None
@@ -204,20 +206,43 @@ async def _start_worker_registration(
     return lifecycle
 
 
-async def _require_worker_redis_continuity() -> None:
+async def _require_worker_redis_continuity(
+    registration: PythonWorkerRegistration | None = None,
+) -> None:
+    check = _wait_worker_redis_continuity()
+    if registration is None:
+        await check
+        return
     try:
-        async with get_worker_session()() as db:
-            await db.execute(
-                text(
-                    "SELECT public.vp_require_worker_redis_continuity("
-                    ":max_age_seconds)"
-                ),
-                {
-                    "max_age_seconds": (
-                        WORKER_REDIS_CONTINUITY_MAX_AGE_SECONDS
-                    )
-                },
-            )
+        await registration.create_guarded_task(check)
+    except asyncio.CancelledError:
+        registration.raise_if_lost()
+        raise
+
+
+async def _wait_worker_redis_continuity() -> None:
+    try:
+        async with asyncio.timeout(WORKER_REDIS_CONTINUITY_WAIT_SECONDS):
+            while True:
+                try:
+                    async with get_worker_session()() as db:
+                        await db.execute(
+                            text(
+                                "SELECT public.vp_require_worker_redis_continuity("
+                                ":max_age_seconds)"
+                            ),
+                            {"max_age_seconds": WORKER_REDIS_CONTINUITY_MAX_AGE_SECONDS},
+                        )
+                    return
+                except DBAPIError as exc:
+                    original = getattr(exc.orig, "__cause__", None) or exc.orig
+                    if (
+                        getattr(original, "sqlstate", None) != "P0001"
+                        or getattr(original, "message", None) != "worker_redis_continuity_running"
+                    ):
+                        raise
+                # The failed transaction has closed; recheck the full gate next time.
+                await asyncio.sleep(WORKER_REDIS_CONTINUITY_RETRY_SECONDS)
     except Exception:
         raise WorkerRegistrationError(
             "worker_redis_continuity_unready"
@@ -2067,7 +2092,7 @@ async def main() -> None:
                 admission_token,
             )
             try:
-                await _require_worker_redis_continuity()
+                await _require_worker_redis_continuity(registration)
             except WorkerRegistrationError:
                 await registration.close(
                     reason="worker_redis_continuity_unready"

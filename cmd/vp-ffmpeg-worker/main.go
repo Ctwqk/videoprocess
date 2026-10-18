@@ -158,20 +158,22 @@ func runWorker(
 		return err
 	}
 	defer registration.Close(context.Background(), "shutdown")
-	if err := database.RequireWorkerRedisContinuity(
+	continuityErr := waitWorkerRedisContinuity(
 		registration.Context(),
-		worker.WorkerRedisContinuityMaxAge,
-	); err != nil {
+		database,
+		10*time.Second,
+		250*time.Millisecond,
+	)
+	if err := registrationContextError(registration.Context()); err != nil {
+		return err
+	}
+	if continuityErr != nil {
 		_ = registration.Close(
 			context.Background(),
 			"worker_redis_continuity_unready",
 		)
 		return errors.New("worker_redis_continuity_unready")
 	}
-	if err := registrationContextError(registration.Context()); err != nil {
-		return err
-	}
-
 	storageContext, storageCancel := context.WithTimeout(
 		registration.Context(),
 		30*time.Second,
@@ -237,6 +239,30 @@ func runWorker(
 		storageBackend,
 		registration,
 	)
+}
+
+func waitWorkerRedisContinuity(ctx context.Context, database startupDatabase, budget, interval time.Duration) error {
+	waitContext, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	for {
+		if err := context.Cause(waitContext); err != nil {
+			return err
+		}
+		err := database.RequireWorkerRedisContinuity(waitContext, worker.WorkerRedisContinuityMaxAge)
+		if !errors.Is(err, store.ErrWorkerRedisContinuityRunning) {
+			if cause := context.Cause(waitContext); cause != nil {
+				return cause
+			}
+			return err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-waitContext.Done():
+			timer.Stop()
+			return context.Cause(waitContext)
+		case <-timer.C:
+		}
+	}
 }
 
 func registrationContextError(ctx context.Context) error {

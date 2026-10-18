@@ -28,6 +28,7 @@ type startupDatabaseStub struct {
 	continuityErr  error
 	continuityHook func()
 	continuityAge  int
+	releaseReasons []string
 	claims         worker.RegistrationClaims
 	lease          worker.RegistrationLease
 }
@@ -65,11 +66,12 @@ func (s *startupDatabaseStub) HeartbeatWorker(
 }
 
 func (s *startupDatabaseStub) ReleaseWorker(
-	context.Context,
-	worker.RegistrationLease,
-	string,
+	_ context.Context,
+	_ worker.RegistrationLease,
+	reason string,
 ) error {
 	*s.calls = append(*s.calls, "release")
+	s.releaseReasons = append(s.releaseReasons, reason)
 	return nil
 }
 
@@ -91,8 +93,27 @@ func (s *startupDatabaseStub) CloseContext(context.Context) error {
 }
 
 func TestWorkerStartupRegistersAndChecksContinuityBeforeRedis(t *testing.T) {
+	testWorkerStartupContinuityBeforeRedis(t, false)
+}
+
+func TestWorkerStartupRunningContinuityWaitsBeforeRedis(t *testing.T) {
+	testWorkerStartupContinuityBeforeRedis(t, true)
+}
+
+func testWorkerStartupContinuityBeforeRedis(t *testing.T, runningFirst bool) {
+	t.Helper()
 	calls := []string{}
 	database := &startupDatabaseStub{calls: &calls}
+	if runningFirst {
+		database.continuityErr = store.ErrWorkerRedisContinuityRunning
+		attempts := 0
+		database.continuityHook = func() {
+			attempts++
+			if attempts == 2 {
+				database.continuityErr = nil
+			}
+		}
+	}
 	client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"})
 	deps := startupDependencies{
 		loadSecrets: func(map[string]string) (worker.SecretConfig, error) {
@@ -136,6 +157,9 @@ func TestWorkerStartupRegistersAndChecksContinuityBeforeRedis(t *testing.T) {
 		"construct_redis",
 		"redis_identity",
 		"consumer",
+	}
+	if runningFirst {
+		wantPrefix = append(wantPrefix[:4], append([]string{"continuity"}, wantPrefix[4:]...)...)
 	}
 	if len(calls) < len(wantPrefix) || !reflect.DeepEqual(calls[:len(wantPrefix)], wantPrefix) {
 		t.Fatalf("startup calls = %#v; want prefix %#v", calls, wantPrefix)
@@ -470,6 +494,7 @@ func TestWorkerStartupUncertainRegistrationOrContinuityConstructsNoRedis(t *test
 	}{
 		{name: "registration", registerErr: errors.New("token_invalid")},
 		{name: "continuity", continuityErr: errors.New("worker_redis_continuity_unready")},
+		{name: "persistent_running", continuityErr: store.ErrWorkerRedisContinuityRunning},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			calls := []string{}
@@ -511,6 +536,9 @@ func TestWorkerStartupUncertainRegistrationOrContinuityConstructsNoRedis(t *test
 					"startup calls = %#v; continuity failure did not release registration",
 					calls,
 				)
+			}
+			if testCase.continuityErr != nil && !reflect.DeepEqual(database.releaseReasons, []string{"worker_redis_continuity_unready"}) {
+				t.Fatalf("continuity close reasons=%v", database.releaseReasons)
 			}
 		})
 	}
