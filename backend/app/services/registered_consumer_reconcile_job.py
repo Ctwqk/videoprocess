@@ -716,11 +716,17 @@ def read_reply(files: dict, request: dict) -> bool:
             before = os.fstat(descriptor)
             require(
                 stat.S_ISREG(before.st_mode)
-                and before.st_nlink == 1
+                and before.st_nlink in (0, 1)
                 and stat.S_IMODE(before.st_mode) == 0o644
                 and (before.st_uid, before.st_gid)
                 == (files["replies"]["uid"], files["replies"]["gid"])
             )
+            # The owner replaces reply.json atomically for each request. An
+            # already-open predecessor can lose its link before/during this
+            # read. Never accept that retired inode; poll the current reply
+            # again within the existing exchange deadline instead.
+            if before.st_nlink == 0:
+                return False
             raw = os.read(descriptor, MAX_FRAME_BYTES + 1)
             after = os.fstat(descriptor)
             stable = (
@@ -729,14 +735,18 @@ def read_reply(files: dict, request: dict) -> bool:
                 "st_uid",
                 "st_gid",
                 "st_mode",
-                "st_nlink",
                 "st_size",
                 "st_mtime_ns",
-                "st_ctime_ns",
             )
             require(
                 len(raw) <= MAX_FRAME_BYTES
                 and all(getattr(before, key) == getattr(after, key) for key in stable)
+            )
+            if after.st_nlink == 0:
+                return False
+            require(
+                before.st_nlink == after.st_nlink
+                and before.st_ctime_ns == after.st_ctime_ns
             )
         finally:
             os.close(descriptor)

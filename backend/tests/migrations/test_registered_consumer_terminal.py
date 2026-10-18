@@ -47,7 +47,7 @@ def test_new_head_is_an_additive_child_without_rewriting_039():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     assert ScriptDirectory.from_config(config).get_heads() == [
-        "046_owned_retained_terminal"
+        "047_owned_inventory_recovery"
     ]
     assert unit["down_revision"] == "040_owned_history_seal"
 

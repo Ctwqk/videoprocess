@@ -15,6 +15,7 @@ from app.models.autoflow import AutoFlowPlan, AutoFlowRun, AutoFlowUsedClip, Con
 from app.models.youtube_upload_operation import YouTubeUploadOperation
 from app.models.publication_promotion_operation import PublicationPromotionOperation
 from app.models.owned_seed_inventory import OwnedSeedInventory, OwnedSeedInventoryItem
+from app.models.owned_inventory_recovery import OwnedInventoryRecoveryRecord
 from app.models.legacy_worker_event_resolution import LegacyWorkerEventResolution
 from app.models.registered_worker_event_receipt import (
     RegisteredWorkerEventDelivery,
@@ -67,6 +68,7 @@ __all__ = [
     "PublicationPromotionOperation",
     "OwnedSeedInventory",
     "OwnedSeedInventoryItem",
+    "OwnedInventoryRecoveryRecord",
     "LegacyWorkerEventResolution",
     "RegisteredWorkerEventReceipt",
     "RegisteredWorkerEventDelivery",

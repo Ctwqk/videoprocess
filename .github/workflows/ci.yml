@@ -23,6 +23,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
         ports:
           - 5432:5432
+          - 55447:5432
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
@@ -68,6 +69,49 @@ jobs:
             cd backend
             .venv/bin/alembic heads
           ) | tee ci-evidence/backend/alembic-heads.txt
+      - name: Verify audited inventory recovery on isolated PostgreSQL 16
+        run: |
+          set -o pipefail
+          export OWNED_HISTORY_A2_POSTGRES_TEST_URL='postgresql+asyncpg://postgres:postgres@127.0.0.1:55447/vp_owned_inventory_test_a2_recovery_ci'
+          export OWNED_HISTORY_A2_POSTGRES_CONFIRM='vp_owned_inventory_test_a2_recovery_ci'
+          (
+            cd backend
+            .venv/bin/python - <<'PY'
+          import asyncio
+          import asyncpg
+          async def setup():
+              db = await asyncpg.connect('postgresql://postgres:postgres@127.0.0.1:55447/postgres')
+              try:
+                  await db.execute('CREATE DATABASE vp_owned_inventory_test_a2_recovery_ci')
+              finally:
+                  await db.close()
+          asyncio.run(setup())
+          PY
+            DATABASE_URL="$OWNED_HISTORY_A2_POSTGRES_TEST_URL" .venv/bin/alembic upgrade 041_registered_consumer_terminal
+          )
+          export OWNED_HISTORY_A2_POSTGRES_SYSTEM_ID="$(
+            cd backend
+            .venv/bin/python - <<'PY'
+          import asyncio
+          import asyncpg
+          async def identity():
+              db = await asyncpg.connect('postgresql://postgres:postgres@127.0.0.1:55447/postgres')
+              try:
+                  print(await db.fetchval('SELECT system_identifier FROM pg_control_system()'))
+              finally:
+                  await db.close()
+          asyncio.run(identity())
+          PY
+          )"
+          output='ci-evidence/backend/pg16-owned-inventory-recovery.txt'
+          (
+            cd backend
+            .venv/bin/python -m pytest -q -rs tests/api/test_owned_inventory_recovery_postgres.py
+          ) | tee "$output"
+          if grep -Eq '[0-9]+ skipped|SKIPPED' "$output"; then
+            echo 'Owned inventory recovery PostgreSQL tests skipped' >&2
+            exit 1
+          fi
       - name: Verify PG16 non-superuser operator lifecycle
         run: |
           set -o pipefail

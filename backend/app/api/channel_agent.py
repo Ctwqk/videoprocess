@@ -72,6 +72,7 @@ from app.schemas.channel_agent import (
     TopicLaneCreate,
 )
 from app.services import owned_seed_inventory as owned_inventory
+from app.schemas.owned_inventory_recovery import OwnedInventoryRecovery
 from app.services import policy_evidence
 from app.services.discovery_ingestion import (
     DiscoveryIngestionAuthorityError,
@@ -150,6 +151,14 @@ async def approve_owned_inventory(channel_id: uuid.UUID, inventory_id: uuid.UUID
 async def revoke_owned_inventory(channel_id: uuid.UUID, inventory_id: uuid.UUID, data: OwnedSeedInventoryRevoke,
                                  subject: str = Depends(_inventory_operator), db: AsyncSession = Depends(get_db)):
     return await _inventory_result(db, owned_inventory.revoke_inventory(db, channel_id, inventory_id, data, subject))
+
+
+@router.post("/channels/{channel_id}/owned-seed-inventories/{inventory_id}/recover-operational-hold")
+async def recover_owned_inventory(channel_id: uuid.UUID, inventory_id: uuid.UUID, data: OwnedInventoryRecovery,
+                                  subject: str = Depends(_inventory_operator), db: AsyncSession = Depends(get_db)):
+    from app.services.owned_inventory_recovery import recover_inventory
+
+    return await _inventory_result(db, recover_inventory(db, channel_id, inventory_id, data, subject))
 
 
 class DryRunPatch(BaseModel):

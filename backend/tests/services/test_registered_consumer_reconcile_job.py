@@ -1336,6 +1336,89 @@ def test_reply_exact_and_atomic(tmp_path):
     assert not job.read_reply(files, request | {"nonce": "1" * 32})
 
 
+@pytest.mark.parametrize("replacement_at", ["opened", "read"])
+def test_exchange_accepts_current_reply_when_previous_reply_is_atomically_replaced(
+    tmp_path, monkeypatch, replacement_at
+):
+    job, _, files, binding = setup_protocol(tmp_path)
+    previous = frame(job, binding)
+    current = previous | {"sequence": 2, "nonce": "1" * 32}
+    job.write_reply(files, previous)
+    old_inode = (Path(files["replies"]["path"]) / "reply.json").stat().st_ino
+    original_stat, original_read = os.fstat, os.read
+    replaced = False
+
+    def replace_once(descriptor):
+        nonlocal replaced
+        if not replaced and original_stat(descriptor).st_ino == old_inode:
+            replaced = True
+            job.write_reply(files, current)
+
+    def fstat(descriptor):
+        if replacement_at == "opened":
+            replace_once(descriptor)
+        return original_stat(descriptor)
+
+    def read(descriptor, size):
+        raw = original_read(descriptor, size)
+        if replacement_at == "read":
+            replace_once(descriptor)
+        return raw
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    monkeypatch.setattr(os, "read", read)
+    job._exchange(files, current, 0)
+    assert replaced
+    assert Path(files["request"]["path"]).read_bytes() == job.canonical(current)
+    assert job.read_reply(files, current)
+
+
+def test_retired_matching_reply_is_not_authority(tmp_path, monkeypatch):
+    job, _, files, binding = setup_protocol(tmp_path)
+    request = frame(job, binding)
+    job.write_reply(files, request)
+    path = Path(files["replies"]["path"]) / "reply.json"
+    inode = path.stat().st_ino
+    original_stat, original_read = os.fstat, os.read
+
+    def read(descriptor, size):
+        raw = original_read(descriptor, size)
+        if original_stat(descriptor).st_ino == inode:
+            path.unlink()
+        return raw
+
+    monkeypatch.setattr(os, "read", read)
+    assert not job.read_reply(files, request)
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("damage", ["mode", "content"])
+def test_reply_tampering_is_refused_even_if_inode_is_then_retired(
+    tmp_path, monkeypatch, damage
+):
+    job, _, files, binding = setup_protocol(tmp_path)
+    previous = frame(job, binding)
+    current = previous | {"sequence": 2, "nonce": "1" * 32}
+    job.write_reply(files, previous)
+    path = Path(files["replies"]["path"]) / "reply.json"
+    inode = path.stat().st_ino
+    original_stat, original_read = os.fstat, os.read
+
+    def read(descriptor, size):
+        raw = original_read(descriptor, size)
+        if original_stat(descriptor).st_ino == inode:
+            if damage == "mode":
+                path.chmod(0o666)
+            else:
+                path.write_bytes(b"tampered")
+            job.write_reply(files, current)
+        return raw
+
+    monkeypatch.setattr(os, "read", read)
+    with pytest.raises(job.ProtocolError):
+        job.read_reply(files, current)
+
+
 @pytest.mark.parametrize("field", ["version", "sequence"])
 def test_reply_echo_requires_exact_scalar_types(tmp_path, field):
     job, _, files, binding = setup_protocol(tmp_path)

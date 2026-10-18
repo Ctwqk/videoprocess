@@ -240,8 +240,8 @@ func newOwnedPGFixtureWithWindow(t *testing.T, legacy func(*Store, time.Time) ma
 	t.Cleanup(store.Close)
 	store.buildCommitSHA = snapshotTestCommit
 	var revision string
-	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "046_owned_retained_terminal" {
-		t.Fatal("disposable database must be migrated to 046_owned_retained_terminal")
+	if err := store.Pool.QueryRow(ctx, `SELECT version_num FROM alembic_version`).Scan(&revision); err != nil || revision != "047_owned_inventory_recovery" {
+		t.Fatal("disposable database must be migrated to 047_owned_inventory_recovery")
 	}
 	var now time.Time
 	if err := store.Pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
