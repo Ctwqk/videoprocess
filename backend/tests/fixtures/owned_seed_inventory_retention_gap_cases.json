@@ -1,0 +1,605 @@
+[
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "youtube_upload_operations",
+          0,
+          "status"
+        ],
+        "value": "submitted"
+      }
+    ],
+    "name": "unknown_upload"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "publication_promotion_operations",
+          0,
+          "status"
+        ],
+        "value": "uncertain"
+      }
+    ],
+    "name": "uncertain_promotion"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "publication_promotion_operations",
+          0,
+          "platform_video_id"
+        ],
+        "value": "wrongvideo1"
+      }
+    ],
+    "name": "wrong_video"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "publication_promotion_operations",
+          0,
+          "target_privacy"
+        ],
+        "value": "public"
+      }
+    ],
+    "name": "public_promotion"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "publication_promotion_operations",
+          0,
+          "evidence_json"
+        ],
+        "value": {}
+      }
+    ],
+    "name": "empty_promotion_evidence"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "publication_promotion_operations",
+          0,
+          "decision_json"
+        ],
+        "value": {
+          "decision_id": "fixture",
+          "rules_version": "test",
+          "verdict": "deny"
+        }
+      }
+    ],
+    "name": "denied_promotion"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "production_tasks",
+          0,
+          "agent_approval_evidence_json"
+        ],
+        "value": {
+          "owned_inventory": {}
+        }
+      }
+    ],
+    "name": "new_owned_evidence"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "production_tasks",
+          0,
+          "channel_config_snapshot_json"
+        ],
+        "value": {
+          "owned_inventory": {}
+        }
+      }
+    ],
+    "name": "new_owned_snapshot"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "jobs",
+          0,
+          "status"
+        ],
+        "value": "FAILED"
+      }
+    ],
+    "name": "failed_job"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "node_executions",
+          0,
+          "status"
+        ],
+        "value": "RUNNING"
+      }
+    ],
+    "name": "failed_node"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "channel_ops_queue_items",
+          0,
+          "last_error"
+        ],
+        "value": "some_other_cancellation"
+      }
+    ],
+    "name": "wrong_queue_reason"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "channel_ops_queue_items",
+          0,
+          "status"
+        ],
+        "value": "queued"
+      }
+    ],
+    "name": "live_queue"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "channel_ops_queue_items",
+          0,
+          "attempt_count"
+        ],
+        "value": 1
+      }
+    ],
+    "name": "attempted_cancelled_queue"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "channel_ops_queue_items",
+          0,
+          "parent_queue_item_id"
+        ],
+        "value": null
+      }
+    ],
+    "name": "missing_queue_parent"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "publication_metric_schedules",
+          0,
+          "attempt_count"
+        ],
+        "value": 2
+      }
+    ],
+    "name": "retry_metric"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "publication_metric_schedules",
+          0,
+          "last_error_code"
+        ],
+        "value": "metrics_unavailable"
+      }
+    ],
+    "name": "metric_error"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "publication_metric_schedules",
+          0,
+          "status"
+        ],
+        "value": "pending"
+      }
+    ],
+    "name": "metric_pending"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "feedback_snapshots",
+          0,
+          "snapshot_stage"
+        ],
+        "value": "other"
+      }
+    ],
+    "name": "unknown_feedback_stage"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "feedback_snapshots",
+          0,
+          "collected_at"
+        ],
+        "value": "2099-01-01T00:00:00+00:00"
+      }
+    ],
+    "name": "future_feedback"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "feedback_snapshots",
+          0,
+          "publication_id"
+        ],
+        "value": "00000000-0000-0000-0000-000000000999"
+      }
+    ],
+    "name": "missing_feedback"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "youtube_upload_operations",
+          0,
+          "completed_at"
+        ],
+        "value": "2026-10-19T00:00:00+00:00"
+      }
+    ],
+    "name": "recent_upload"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "artifacts",
+          1,
+          "media_info"
+        ],
+        "value": {}
+      }
+    ],
+    "name": "corrupt_artifact"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "owned_seed_inventory_items"
+        ],
+        "value": [
+          {
+            "id": "00000000-0000-0000-0000-000000000999",
+            "platform_channel_id": "UCaaaaaaaaaaaaaaaaaaaaaa",
+            "production_task_id": "00000000-0000-0000-0000-000000000004"
+          }
+        ]
+      }
+    ],
+    "name": "new_owned_item"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "worker_task_dispatches"
+        ],
+        "value": [
+          {
+            "id": "00000000-0000-0000-0000-000000000999",
+            "job_id": "00000000-0000-0000-0000-000000000006",
+            "resolution_state": "pending"
+          }
+        ]
+      }
+    ],
+    "name": "live_dispatch"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "production_tasks",
+          0,
+          "retry_count"
+        ],
+        "value": false
+      }
+    ],
+    "name": "boolean_retry"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "worker_task_delivery_attestations"
+        ],
+        "value": [
+          {
+            "ack_state": "acknowledged",
+            "id": "00000000-0000-0000-0000-000000000990",
+            "job_id": "00000000-0000-0000-0000-000000000006",
+            "node_execution_id": "00000000-0000-0000-0000-000000000008",
+            "worker_registration_id": null
+          }
+        ]
+      },
+      {
+        "path": [
+          "rows",
+          "registered_worker_event_deliveries"
+        ],
+        "value": [
+          {
+            "ack_state": "pending",
+            "consumer_group": "orchestrator",
+            "id": "00000000-0000-0000-0000-000000000992",
+            "message_id": "2-0",
+            "receipt_id": null,
+            "redis_stream": "vp:events",
+            "source_task_attestation_id": "00000000-0000-0000-0000-000000000990"
+          }
+        ]
+      }
+    ],
+    "name": "pending_delivery_attestation"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "worker_task_delivery_attestations"
+        ],
+        "value": [
+          {
+            "ack_state": "acknowledged",
+            "id": "00000000-0000-0000-0000-000000000990",
+            "job_id": "00000000-0000-0000-0000-000000000006",
+            "node_execution_id": "00000000-0000-0000-0000-000000000008",
+            "worker_registration_id": null
+          }
+        ]
+      },
+      {
+        "path": [
+          "rows",
+          "registered_worker_event_deliveries"
+        ],
+        "value": [
+          {
+            "ack_state": "pending",
+            "consumer_group": "orchestrator",
+            "id": "00000000-0000-0000-0000-000000000992",
+            "message_id": "2-0",
+            "receipt_id": "00000000-0000-0000-0000-000000000991",
+            "redis_stream": "vp:events",
+            "source_task_attestation_id": "00000000-0000-0000-0000-000000000993"
+          }
+        ]
+      },
+      {
+        "path": [
+          "rows",
+          "registered_worker_event_receipts"
+        ],
+        "value": [
+          {
+            "ack_state": "acknowledged",
+            "application_state": "applied",
+            "consumer_group": "orchestrator",
+            "id": "00000000-0000-0000-0000-000000000991",
+            "job_id": "00000000-0000-0000-0000-000000000006",
+            "message_id": "1-0",
+            "node_execution_id": "00000000-0000-0000-0000-000000000008",
+            "redis_stream": "vp:events",
+            "source_task_ack_state": "acknowledged",
+            "source_task_attestation_id": "00000000-0000-0000-0000-000000000990",
+            "worker_registration_id": null
+          }
+        ]
+      }
+    ],
+    "name": "pending_delivery_receipt"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "worker_task_delivery_attestations"
+        ],
+        "value": [
+          {
+            "ack_state": "acknowledged",
+            "id": "00000000-0000-0000-0000-000000000990",
+            "job_id": "00000000-0000-0000-0000-000000000006",
+            "node_execution_id": "00000000-0000-0000-0000-000000000008",
+            "worker_registration_id": null
+          }
+        ]
+      },
+      {
+        "path": [
+          "rows",
+          "registered_worker_event_deliveries"
+        ],
+        "value": [
+          {
+            "ack_state": "pending",
+            "consumer_group": "orchestrator",
+            "id": "00000000-0000-0000-0000-000000000992",
+            "message_id": "1-0",
+            "receipt_id": null,
+            "redis_stream": "vp:events",
+            "source_task_attestation_id": "00000000-0000-0000-0000-000000000993"
+          }
+        ]
+      },
+      {
+        "path": [
+          "rows",
+          "registered_worker_event_receipts"
+        ],
+        "value": [
+          {
+            "ack_state": "acknowledged",
+            "application_state": "applied",
+            "consumer_group": "orchestrator",
+            "id": "00000000-0000-0000-0000-000000000991",
+            "job_id": "00000000-0000-0000-0000-000000000006",
+            "message_id": "1-0",
+            "node_execution_id": "00000000-0000-0000-0000-000000000008",
+            "redis_stream": "vp:events",
+            "source_task_ack_state": "acknowledged",
+            "source_task_attestation_id": "00000000-0000-0000-0000-000000000990",
+            "worker_registration_id": null
+          }
+        ]
+      }
+    ],
+    "name": "pending_delivery_event_identity"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "channel_profiles",
+          0,
+          "enabled"
+        ],
+        "value": true
+      }
+    ],
+    "name": "active_legacy_producer"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "channel_profiles",
+          0,
+          "enabled"
+        ],
+        "value": 0
+      }
+    ],
+    "name": "mistyped_enabled"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "channel_profiles",
+          0,
+          "dry_run"
+        ],
+        "value": "false"
+      }
+    ],
+    "name": "mistyped_dry_run"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "channel_profiles",
+          0,
+          "halted_at"
+        ],
+        "value": "2027-01-01T00:00:00Z"
+      }
+    ],
+    "name": "future_halted_at"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "channel_profiles",
+          0,
+          "intake_paused_at"
+        ],
+        "value": false
+      }
+    ],
+    "name": "invalid_intake_pause"
+  },
+  {
+    "changes": [
+      {
+        "path": [
+          "rows",
+          "publishing_accounts",
+          0,
+          "channel_profile_id"
+        ],
+        "value": "00000000-0000-0000-0000-000000000999"
+      }
+    ],
+    "name": "legacy_account_channel_mismatch"
+  }
+]

@@ -75,7 +75,7 @@ async def test_pg_registered_receipt_and_ack_settle_after_real_expiry(elapsed_pg
     env = elapsed_pg
     context = env.native.context
     claim = await env.store.claim(context)
-    async with env.store.submission_fence(context):
+    async with env.store.submission_fence(context, lease_refresher=env.native.refresh):
         await env.store.mark_attempting(claim.operation.id, context=context)
         await env.store.mark_submitted(claim.operation.id, str(uuid.uuid4()), context=context)
     await wait_for_expiry(env)

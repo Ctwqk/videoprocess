@@ -864,8 +864,16 @@ async def test_control_plane_observer_is_separate_and_fences_takeover_and_revoke
             manager_task_id = str(uuid.uuid4())
             simulated_posts: list[uuid.UUID] = []
 
+            async def refresh_upload_lease(*, minimum_margin_seconds):
+                assert minimum_margin_seconds == 150
+                await worker_peer.fetchval(
+                    "SELECT public.vp_worker_heartbeat($1,$2,$3,$4,$5)",
+                    second["registration_id"], "observer-service", second_args[4],
+                    second["lease_epoch"], second_args[17],
+                )
+
             async def run_restricted_submission():
-                async with upload_store.submission_fence(upload_context):
+                async with upload_store.submission_fence(upload_context, lease_refresher=refresh_upload_lease):
                     attempting = await upload_store.mark_attempting(
                         upload_claim.operation.id,
                         context=upload_context,

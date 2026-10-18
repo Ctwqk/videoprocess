@@ -1921,7 +1921,16 @@ async def test_real_role_clis_enforce_exact_cross_role_boundaries(
                 upload_claim = await upload_store.claim(upload_context)
                 assert upload_claim.action == "submit"
                 manager_task_id = str(uuid.uuid4())
-                async with upload_store.submission_fence(upload_context):
+
+                async def refresh_upload_lease(*, minimum_margin_seconds):
+                    assert minimum_margin_seconds == 150
+                    await runtime.fetchval(
+                        "SELECT public.vp_worker_heartbeat($1,$2,$3,$4,$5)",
+                        registration["registration_id"], request["service_name"], worker_instance_id,
+                        registration["lease_epoch"], lease_secret_sha256,
+                    )
+
+                async with upload_store.submission_fence(upload_context, lease_refresher=refresh_upload_lease):
                     attempting = await upload_store.mark_attempting(
                         upload_claim.operation.id,
                         context=upload_context,

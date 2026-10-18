@@ -226,16 +226,25 @@ def _history_sources(snapshot: history.OwnedHistorySnapshot, locators: OwnedHist
                 and task["target_account_id"] == account["id"] and is_youtube_platform(account["platform"])
                 and account["platform_account_id"] in {"", snapshot.platform_channel_id}, "owned_inventory_history_scope_mismatch")
         history._one([c for c in rows["channel_profiles"] if c["id"] == locator.legacy_channel_profile_id], "owned_history_orphan")
-        _, _, effect = history._normal_history(history._task_history(rows, task), None, snapshot.observed_at)
+        retained = None
+        try:
+            _, _, effect = history._normal_history(history._task_history(rows, task), None, snapshot.observed_at)
+        except history.OwnedHistoryError:
+            from app.services.owned_seed_inventory_retention import retained_terminal_facts
+            retained = retained_terminal_facts(rows, task, snapshot.observed_at)
+            effect = {"retained_terminal_upload": history.history_sha256(retained)}
         require(all(other["id"] == op["id"] or
                     (other.get("manager_task_id") != op["manager_task_id"] and
                      other.get("platform_video_id") != op["platform_video_id"])
                     for other in rows["youtube_upload_operations"]), "owned_inventory_history_identity_ambiguous")
         group = groups.setdefault(account["id"], {"legacy_account_id": account["id"],
             "legacy_channel_profile_id": account["channel_profile_id"],
-            "account_descriptor_sha256": history.account_descriptor_sha256(account), "operations": [], "effects": []})
+            "account_descriptor_sha256": history.account_descriptor_sha256(account), "operations": [], "effects": [],
+            "retained_terminal_uploads": []})
         group["operations"].append(op)
         group["effects"].append(effect)
+        if retained is not None:
+            group["retained_terminal_uploads"].append(retained)
     for account_id, group in groups.items():
         tasks = {t["id"] for t in rows["production_tasks"] if t["target_account_id"] == account_id}
         operations = [o for o in rows["youtube_upload_operations"] if o["production_task_id"] in tasks]
@@ -443,7 +452,21 @@ def _qualified_history(snapshot: history.OwnedHistorySnapshot, groups: dict, obs
             binding = original
         history.HistoryOnlyBinding.parse(binding)
         bindings.append(binding)
-    return {"version": 1, "bindings": bindings, "retired_unassigned_preupload": None}
+    from app.services.owned_seed_inventory_retention import approved_certificates, issue_certificate, stable_certificate
+    prior = approved_certificates(snapshot.rows.as_dict(), existing, snapshot.observed_at)
+    certificates = []
+    for group in groups.values():
+        for facts in group.get("retained_terminal_uploads", []):
+            certificate = issue_certificate(facts, observed_at, subject, reference)
+            original = prior.get(certificate["operation_id"])
+            if original is not None:
+                require(stable_certificate(certificate) == stable_certificate(original), "owned_inventory_history_authority_conflict")
+                certificate = original
+            certificates.append(certificate)
+    result = {"version": 1, "bindings": bindings, "retired_unassigned_preupload": None}
+    if certificates:
+        result.update(version=2, retained_terminal_uploads=sorted(certificates, key=lambda value: value["operation_id"]))
+    return result
 
 
 def _assess_qualified_draft(snapshot: history.OwnedHistorySnapshot, row: OwnedSeedInventory, subject: str, now: datetime) -> None:
@@ -649,6 +672,10 @@ async def _requalify_v2_draft(db: AsyncSession, row: OwnedSeedInventory, subject
     qualified = _qualified_history(fresh, fresh_sources, observation, subject, reference, observed_at=initial.observed_at)
     require([_stable_binding(b) for b in qualified["bindings"]] ==
             [_stable_binding(b.document.as_dict()) for b in decoded.legacy_history.bindings], "owned_inventory_history_changed")
+    from app.services.owned_seed_inventory_retention import stable_certificate
+    require([stable_certificate(c) for c in qualified.get("retained_terminal_uploads", [])] ==
+            [stable_certificate(c.as_dict()) for c in decoded.legacy_history.retained_terminal_uploads],
+            "owned_inventory_history_changed")
     retired = _qualified_retirement(fresh, retirement, retired_observation, subject, reference)
     require((retired is None) == (certificate is None), "owned_inventory_retirement_changed")
     if retired is not None:

@@ -162,7 +162,9 @@ class YouTubeUploadHandler(BaseHandler):
                             SUBMISSION_LEASE_MARGIN_SECONDS
                         )
                     )
-                    async with self._operation_store.submission_fence(context):
+                    async with self._operation_store.submission_fence(
+                        context, lease_refresher=self._lease_refresher,
+                    ):
                         await self._preflight_submission(
                             operation,
                             client,

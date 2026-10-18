@@ -97,7 +97,7 @@ class FakeOperationStore:
         return UploadOperationClaim(action=action, operation=self.operation)
 
     @contextlib.asynccontextmanager
-    async def submission_fence(self, context):
+    async def submission_fence(self, context, *, lease_refresher=None):
         self.submission_fence_contexts.append(context)
         assert not self.submission_fence_active
         self.submission_fence_active = True
@@ -357,7 +357,7 @@ async def test_ack_drill_fresh_reader_uses_canonical_runtime_permissions(ack_dri
     )
     reserved = await store.claim(context)
     await runtime.refresh(minimum_margin_seconds=150)
-    async with store.submission_fence(context):
+    async with store.submission_fence(context, lease_refresher=runtime.refresh):
         attempted = await store.mark_attempting(reserved.operation.id, context=context)
         assert attempted.request_attempted_at is not None
         await store.mark_submitted(attempted.id, MANAGER_TASK_ID, context=context)
@@ -986,8 +986,9 @@ async def test_fresh_150_second_lease_is_required_before_submission_fence(
         events.append("refresh")
 
     @contextlib.asynccontextmanager
-    async def ordered_fence(context):
+    async def ordered_fence(context, *, lease_refresher=None):
         assert events == ["refresh"]
+        assert lease_refresher is refresh_worker_lease
         events.append("fence")
         async with original_fence(context):
             yield
@@ -1664,7 +1665,7 @@ async def test_rejected_submission_fence_prevents_preflight_and_state_changes(
     seen: list[tuple[str, str]] = []
 
     @contextlib.asynccontextmanager
-    async def reject_fence(_context):
+    async def reject_fence(_context, *, lease_refresher=None):
         raise JobExecutionAuthorityBlocked("node execution claim changed")
         yield
 

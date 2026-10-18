@@ -239,7 +239,7 @@ async def test_pg_d_python_hash_vectors(d_database, value):
 async def test_pg_d_restricted_reserve_attempt_final_and_expired_settlement(d_pg):
     env = d_pg
     claim = await env.store.claim(env.native.context)
-    async with env.store.submission_fence(env.native.context):
+    async with env.store.submission_fence(env.native.context, lease_refresher=env.native.refresh):
         await env.store.mark_attempting(claim.operation.id, context=env.native.context)
         await env.store.mark_submitted(claim.operation.id, str(uuid.uuid4()), context=env.native.context)
     await env.native.owner.execute("UPDATE owned_seed_inventories SET state='revoked',revoked_at=clock_timestamp() WHERE id=$1", env.inventory_id)
@@ -316,7 +316,7 @@ async def test_pg_d_final_fence_serializes_revocation(d_pg):
     observer = await asyncpg.connect(dsn(env.owner_url), timeout=5)
     blocked = None
     try:
-        async with env.store.submission_fence(env.native.context):
+        async with env.store.submission_fence(env.native.context, lease_refresher=env.native.refresh):
             await env.store.mark_attempting(claim.operation.id, context=env.native.context)
             holder = await env.store._active_submission_fence.get().db.scalar(text("SELECT pg_backend_pid()"))
             contender = await observer.fetchval("SELECT pg_backend_pid()")

@@ -11,7 +11,7 @@ import pytest
 
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/channelops_policy_snapshot_preflight.py"
-HEAD = "045_registered_consumer_history"
+HEAD = "046_owned_retained_terminal"
 SECRET = "postgresql://operator:never-print-this@secret-host/private-db"
 TICK, POLICY, FEATURE, DECISION, CHANNEL = (str(UUID(int=i)) for i in range(1, 6))
 OTHER = str(UUID(int=99))

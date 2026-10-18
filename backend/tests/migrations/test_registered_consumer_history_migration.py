@@ -81,8 +81,8 @@ def test_history_guard_is_release_head_and_operator_allowlisted():
 
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["045_registered_consumer_history"]
-    assert EXPECTED_MIGRATION_HEAD == "045_registered_consumer_history"
+    assert ScriptDirectory.from_config(config).get_heads() == ["046_owned_retained_terminal"]
+    assert EXPECTED_MIGRATION_HEAD == "046_owned_retained_terminal"
     short = SIGNATURE.removeprefix("public.")
     assert short in ROLE_FUNCTIONS["operator"]
     assert all(short not in values for role, values in ROLE_FUNCTIONS.items() if role != "operator")

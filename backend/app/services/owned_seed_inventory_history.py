@@ -385,6 +385,7 @@ class HistoryOnlyBinding:
 class LegacyHistoryFacts:
     bindings: tuple[HistoryOnlyBinding, ...] = ()
     retired_unassigned_preupload: RetiredPreuploadCertificate | None = None
+    retained_terminal_uploads: tuple[FrozenJSON, ...] = ()
 
 
 @dataclass(frozen=True, repr=False)
@@ -435,8 +436,10 @@ def decode_history_manifest(value: Mapping | FrozenJSON) -> HistoryManifest:
         })
         legacy = None
         if version == 2:
-            section = _exact(data["legacy_history"], "version bindings retired_unassigned_preupload")
-            _require(type(section["version"]) is int and section["version"] == 1)
+            section = data["legacy_history"]
+            _require(type(section["version"]) is int and section["version"] in {1, 2})
+            _exact(section, "version bindings retired_unassigned_preupload" +
+                   (" retained_terminal_uploads" if section["version"] == 2 else ""))
             _require(isinstance(section["bindings"], list) and len(section["bindings"]) <= 32)
             bindings = tuple(HistoryOnlyBinding.parse(b) for b in section["bindings"])
             _require(tuple(b.legacy_account_id for b in bindings) == tuple(sorted({b.legacy_account_id for b in bindings})))
@@ -448,7 +451,19 @@ def decode_history_manifest(value: Mapping | FrozenJSON) -> HistoryManifest:
                 _require(data["channel_profile_id"] != certificate.legacy_channel_profile_id and
                          data["target_account_id"] != certificate.legacy_account_id and
                          all(b.legacy_account_id != certificate.legacy_account_id for b in bindings))
-            legacy = LegacyHistoryFacts(bindings, certificate)
+            retained = ()
+            if section["version"] == 2:
+                from app.services.owned_seed_inventory_retention import parse_certificate
+                values = section["retained_terminal_uploads"]
+                _require(isinstance(values, list) and 1 <= len(values) <= 128)
+                retained = tuple(parse_certificate(value) for value in values)
+                ids = [value["operation_id"] for value in values]
+                _require(ids == sorted(set(ids)))
+                for certificate_value in values:
+                    _require(any(certificate_value["legacy_account_id"] == b.legacy_account_id and
+                                 certificate_value["legacy_channel_profile_id"] == b.legacy_channel_profile_id and
+                                 certificate_value["operation_id"] in b.qualified_operation_ids for b in bindings))
+            legacy = LegacyHistoryFacts(bindings, certificate, retained)
         return HistoryManifest(version, document, legacy)
     except (ValueError, TypeError, KeyError, AttributeError):
         raise OwnedHistoryError("owned_history_manifest_invalid") from None
@@ -1211,6 +1226,8 @@ def _assess_owned_history(snapshot: OwnedHistorySnapshot, *, now: datetime,
         accounts = {r["id"]: r for r in rows["publishing_accounts"]}
         channels = {r["id"]: r for r in rows["channel_profiles"]}
         bindings, certificate, authority = _approved_authority(rows, _time(now))
+        from app.services.owned_seed_inventory_retention import approved_certificates
+        retained = approved_certificates(rows, bindings, _time(now))
         source_hashes: tuple[str, ...] = ()
         render_hashes: tuple[str, ...] = ()
         terminal_paths: tuple[TerminalPath, ...] = ()
@@ -1262,6 +1279,11 @@ def _assess_owned_history(snapshot: OwnedHistorySnapshot, *, now: datetime,
             item = items.get(task["id"])
             if item:
                 _require(task.get("manual_seed_id") == item.get("manual_seed_id"), "owned_inventory_history_identity")
+            qualified = [c for c in retained.values() if c["task_id"] == task["id"]]
+            if qualified:
+                _require(item is None and len(qualified) == 1, "owned_history_retained_terminal_invalid")
+                stable.append({"retained_terminal_upload": qualified[0]["retained_facts_sha256"]})
+                continue
             wait, complete, effect = _normal_history(h, item, _time(now))
             wait_reason = wait or wait_reason
             if complete:

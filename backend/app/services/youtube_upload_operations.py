@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -65,6 +65,7 @@ class _SubmissionFenceState:
     db: AsyncSession
     phase: str = "initial"
     operation_id: uuid.UUID | None = None
+    lease_refresher: Callable[..., Awaitable[Any]] | None = None
 
 
 class UploadOperationConflictError(RuntimeError):
@@ -85,6 +86,8 @@ class YouTubeUploadOperationStore:
     async def submission_fence(
         self,
         context: UploadOperationContext,
+        *,
+        lease_refresher: Callable[..., Awaitable[Any]] | None = None,
     ) -> AsyncIterator[None]:
         """Hold durable execution authority across the irreversible upload POST."""
 
@@ -107,6 +110,7 @@ class YouTubeUploadOperationStore:
                     state = _SubmissionFenceState(
                         context=context,
                         db=db,
+                        lease_refresher=lease_refresher,
                     )
                     token = self._active_submission_fence.set(state)
                     try:
@@ -804,6 +808,10 @@ class YouTubeUploadOperationStore:
         fence: _SubmissionFenceState,
         operation_id: uuid.UUID,
     ) -> YouTubeUploadOperation:
+        if fence.lease_refresher is None:
+            raise JobExecutionAuthorityBlocked(
+                "registered upload submission requires a lease refresher"
+            )
         fence.operation_id = operation_id
         try:
             await self._transition_registered(
@@ -821,6 +829,12 @@ class YouTubeUploadOperationStore:
             raise
 
         try:
+            # Producer history can outlast the lease's 30-second surplus over
+            # the required POST margin. Refresh after the durable attempt and
+            # before reacquiring authority; no external upload has happened.
+            await fence.lease_refresher(
+                minimum_margin_seconds=SUBMISSION_LEASE_MARGIN_SECONDS,
+            )
             await fence.db.begin()
             await self._require_registered_submission_authority(
                 fence.db,
@@ -832,6 +846,16 @@ class YouTubeUploadOperationStore:
                 fence.context,
                 expected_status="reserved",
                 transition="fence",
+            )
+            # Keep all producer/claim locks while refreshing through the
+            # compatible shared lease fence. Recheck DB authority and margin
+            # after the last expensive producer check, immediately before POST.
+            await fence.lease_refresher(
+                minimum_margin_seconds=SUBMISSION_LEASE_MARGIN_SECONDS,
+            )
+            await self._require_registered_submission_authority(
+                fence.db,
+                fence.context,
             )
         except BaseException:
             if fence.db.in_transaction():

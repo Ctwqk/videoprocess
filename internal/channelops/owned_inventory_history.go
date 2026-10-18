@@ -522,8 +522,14 @@ func decodeOwnedHistoryManifest(raw []byte) (manifest ownedHistoryManifest, err 
 		historyRequire(strings.TrimSpace(prompt) != "" && utf8.RuneCountInString(prompt) <= 4096 && utf8.RuneCountInString(historyString(e["title_seed"])) <= 512)
 	}
 	if version == 2 {
-		section := historyExact(m["legacy_history"], "version bindings retired_unassigned_preupload")
-		historyRequire(historyInt(section["version"]) == 1)
+		section := historyObject(m["legacy_history"])
+		sectionVersion := historyInt(section["version"])
+		historyRequire(sectionVersion == 1 || sectionVersion == 2)
+		names := "version bindings retired_unassigned_preupload"
+		if sectionVersion == 2 {
+			names += " retained_terminal_uploads"
+		}
+		historyExact(section, names)
 		bindings := historyArray(section["bindings"])
 		historyRequire(len(bindings) <= 32)
 		previous := ""
@@ -533,6 +539,26 @@ func decodeOwnedHistoryManifest(raw []byte) (manifest ownedHistoryManifest, err 
 			historyRequire(id > previous && b["canonical_platform_channel_id"] == m["platform_channel_id"] && b["legacy_account_id"] != m["target_account_id"])
 			previous = id
 		}
+		if sectionVersion == 2 {
+			retained := historyArray(section["retained_terminal_uploads"])
+			historyRequire(len(retained) >= 1 && len(retained) <= 128)
+			previous := ""
+			for _, value := range retained {
+				c := historyParseRetainedTerminal(value)
+				id := historyString(c["operation_id"])
+				historyRequire(id > previous)
+				previous = id
+				found := false
+				for _, value := range bindings {
+					b := historyObject(value)
+					for _, operation := range historyArray(b["qualified_operation_ids"]) {
+						found = found || c["legacy_account_id"] == b["legacy_account_id"] && c["legacy_channel_profile_id"] == b["legacy_channel_profile_id"] && operation == id
+					}
+				}
+				historyRequire(found)
+			}
+		}
+
 		if section["retired_unassigned_preupload"] != nil {
 			c := historyParseCertificate(section["retired_unassigned_preupload"])
 			historyRequire(m["channel_profile_id"] != c["legacy_channel_profile_id"] && m["target_account_id"] != c["legacy_account_id"])
@@ -1605,6 +1631,7 @@ func assessOwnedHistory(snapshot ownedHistorySnapshot, now time.Time, currentTas
 	tasks, accounts, channels := historyIndex(rows["production_tasks"]), historyIndex(rows["publishing_accounts"]), historyIndex(rows["channel_profiles"])
 	historyRequire(currentTaskID == "" || tasks[currentTaskID] != nil, "owned_inventory_producer_missing")
 	bindings, cert, authority := historyApprovedAuthority(rows, now)
+	retained := historyApprovedRetainedTerminal(rows, bindings, now)
 	if cert != nil {
 		result.RetiredSourceSHA256, result.RetiredRenderSHA256, result.TerminalPaths = historyAssessRetired(rows, cert, snapshot, now)
 	}
@@ -1674,6 +1701,19 @@ func assessOwnedHistory(snapshot ownedHistorySnapshot, now time.Time, currentTas
 		if item != nil {
 			historyRequire(task["manual_seed_id"] == item["manual_seed_id"], "owned_inventory_history_identity")
 		}
+		var qualified map[string]any
+		for _, c := range retained {
+			if c["task_id"] == task["id"] {
+				retainedRequire(qualified == nil)
+				qualified = c
+			}
+		}
+		if qualified != nil {
+			retainedRequire(item == nil)
+			stable = append(stable, map[string]any{"retained_terminal_upload": qualified["retained_facts_sha256"]})
+			continue
+		}
+
 		wait, complete, effect := historyNormal(h, item, now)
 		if wait != "" {
 			result.WaitReason = &wait
