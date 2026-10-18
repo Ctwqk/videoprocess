@@ -53,6 +53,12 @@ ROLLBACK_SECONDS = 2.0
 CLOSE_SECONDS = 2.0
 POLL_SECONDS = 1.0
 MOUNT_UID = MOUNT_GID = 10001
+# V2 allows three current+64-retiring chains and vision current+predecessor:
+# 197 identities. At maximum field widths each canonical ASCII identity is at
+# most 1,235 bytes (255-byte image, 63-byte principal, 19-digit bigint fields,
+# 32-byte UTC timestamp); their envelope adds less than 1 KiB. 256 KiB covers
+# that maximum while bounding input whitespace too. Credential limits stay small.
+MAX_PIN_DOCUMENT_BYTES = 256 * 1024
 MOUNTS = {
     "database": Path("/run/secrets/registered-reconcile-database-url"),
     "redis": Path("/run/secrets/registered-reconcile-redis-url"),
@@ -253,7 +259,13 @@ def _read_mount(name: str) -> str:
     _require(
         (before.st_uid, before.st_gid) == (MOUNT_UID, MOUNT_GID), "secret_owner_invalid"
     )
-    value = read_secure_file(path, required_mode=0o400)
+    value = (
+        read_secure_file(
+            path, required_mode=0o400, maximum_bytes=MAX_PIN_DOCUMENT_BYTES
+        )
+        if name == "pins"
+        else read_secure_file(path, required_mode=0o400)
+    )
     after = path.lstat()
     stable = (
         "st_dev",

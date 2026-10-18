@@ -1530,13 +1530,18 @@ def remove_secure_files(
         current = current.parent
 
 
-def read_secure_file(path: Path, *, required_mode: int) -> str:
+def read_secure_file(
+    path: Path,
+    *,
+    required_mode: int,
+    maximum_bytes: int = MAX_DATABASE_URL_BYTES * 4,
+) -> str:
     if required_mode not in {0o400, 0o600}:
         raise WorkerRoleCommonError("state file mode invalid")
     raw = _read_bounded_secure_file(
         path,
         required_mode=required_mode,
-        maximum_bytes=MAX_DATABASE_URL_BYTES * 4,
+        maximum_bytes=maximum_bytes,
         invalid_message="state file invalid",
         changed_message="state file changed",
     )

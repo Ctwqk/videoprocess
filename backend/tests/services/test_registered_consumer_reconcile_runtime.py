@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -849,6 +850,184 @@ def test_exact_secret_bytes_generation_endpoints_and_pin_document(mounted_creden
         == role_names_for_generation("rcr-unit2").versioned["operator"]
     )
     assert "synthetic" not in repr(credentials)
+
+
+def history_document(retiring, *, maximum_width=False):
+    payload = document()
+    payload["version"] = 2
+    if maximum_width:
+        payload["revision"] = 9_223_372_036_854_775_807
+    for index, worker in enumerate(payload["workers"]):
+        # Vision has its own cutover protocol and cannot carry ancestors.
+        count = 1 if index == 2 else retiring
+        pins = []
+        for depth in range(count + 1):
+            pin = identity(index, old=depth > 0)
+            number = 1 + index * 1000 + depth * 3
+            instance = str(UUID(int=number + 2))
+            pin.update(
+                registration_id=str(UUID(int=number)),
+                grant_id=str(UUID(int=number + 1)),
+                worker_instance_id=instance,
+                redis_consumer_id=(
+                    f"{pin['worker_type']}-worker@{pin['worker_host']}:1:{instance}"
+                ),
+                generation=(9_223_372_036_854_775_807 if maximum_width else 1000) - depth,
+                lease_epoch=(9_223_372_036_854_775_807 if maximum_width else 1000) - depth,
+                registered_at=(NOW - timedelta(seconds=depth)).isoformat(),
+            )
+            if maximum_width:
+                suffix = ":deploy-" + pin["release_commit"][:12]
+                pin.update(
+                    image_identity="a" * (255 - len(suffix)) + suffix,
+                    database_principal="a" * 63,
+                    registered_at=(
+                        NOW.replace(year=9999, microsecond=999999)
+                        - timedelta(seconds=depth)
+                    ).isoformat(),
+                )
+            pins.append(pin)
+        worker.update(current=pins[0], predecessor=pins[1], ancestors=pins[2:])
+    return decode(payload)
+
+
+def replace_mounted_file(path, raw):
+    path.chmod(0o600)
+    path.write_bytes(raw)
+    path.chmod(0o400)
+
+
+@pytest.mark.parametrize("retiring,maximum_width", [(24, False), (64, True)])
+def test_mounted_v2_history_above_failed_production_size_loads(
+    mounted_credentials, retiring, maximum_width
+):
+    request, paths = mounted_credentials
+    pins = history_document(retiring, maximum_width=maximum_width)
+    raw = pins.canonical_json.encode("ascii")
+    assert len(raw) > 65_835
+    if maximum_width:
+        assert sum(1 + len(worker.retiring) for worker in pins.workers) == 197
+        assert 230_000 < len(raw) < 256 * 1024
+    replace_mounted_file(paths["pins"], raw)
+
+    credentials = runtime.load_credentials(replace(request, pins=pins))
+
+    assert credentials.database_name == "videoprocess"
+    assert credentials.database_principal == role_names_for_generation(
+        "rcr-unit2"
+    ).versioned["operator"]
+
+
+@pytest.mark.parametrize("extra_byte", [False, True])
+def test_pin_mount_has_a_finite_inclusive_document_bound(
+    mounted_credentials, extra_byte
+):
+    request, paths = mounted_credentials
+    raw = request.pins.canonical_json.encode("ascii")
+    # Whitespace keeps the document valid and equal, isolating the byte bound.
+    raw += b" " * (256 * 1024 + extra_byte - len(raw))
+    replace_mounted_file(paths["pins"], raw)
+    if extra_byte:
+        with pytest.raises(runtime.ReconcileRuntimeError, match="^credential_invalid$"):
+            runtime.load_credentials(request)
+    else:
+        assert runtime.load_credentials(request).database_name == "videoprocess"
+
+
+@pytest.mark.parametrize("name", ["database", "redis"])
+@pytest.mark.parametrize("extra_byte", [False, True])
+def test_credential_mounts_keep_their_existing_small_bound(
+    mounted_credentials, name, extra_byte
+):
+    request, paths = mounted_credentials
+    raw = paths[name].read_bytes()
+    raw = raw.replace(b"synthetic", b"x" * (16_384 + extra_byte - len(raw) + 9))
+    replace_mounted_file(paths[name], raw)
+    request = replace(
+        request, **{name + "_secret_sha256": hashlib.sha256(raw).hexdigest()}
+    )
+    if extra_byte:
+        with pytest.raises(runtime.ReconcileRuntimeError, match="^credential_invalid$"):
+            runtime.load_credentials(request)
+    else:
+        assert runtime.load_credentials(request).database_name == "videoprocess"
+
+
+@pytest.mark.parametrize("fault", ["mode", "symlink", "fifo", "empty", "utf8", "owner"])
+def test_pin_mount_keeps_secure_file_requirements(
+    mounted_credentials, monkeypatch, fault
+):
+    import os
+    from types import SimpleNamespace
+
+    request, paths = mounted_credentials
+    path = paths["pins"]
+    expected = "credential_invalid"
+    if fault == "mode":
+        path.chmod(0o600)
+    elif fault == "symlink":
+        other = path.with_name("other-pins")
+        path.rename(other)
+        path.symlink_to(other)
+    elif fault == "fifo":
+        path.unlink()
+        os.mkfifo(path, 0o400)
+    elif fault in {"empty", "utf8"}:
+        replace_mounted_file(path, b"" if fault == "empty" else b"\xff")
+    else:
+        original = Path.lstat
+
+        def wrong_owner(self):
+            metadata = original(self)
+            return (
+                SimpleNamespace(st_uid=metadata.st_uid + 1, st_gid=metadata.st_gid)
+                if self == path else metadata
+            )
+
+        monkeypatch.setattr(Path, "lstat", wrong_owner)
+        expected = "secret_owner_invalid"
+    with pytest.raises(runtime.ReconcileRuntimeError, match=f"^{expected}$"):
+        runtime.load_credentials(request)
+
+
+@pytest.mark.parametrize("fault", ["replaced_before_open", "changed_during_read"])
+def test_pin_mount_refuses_file_changes(mounted_credentials, monkeypatch, fault):
+    import os
+    from app.services import worker_role_cli_common as common
+
+    request, paths = mounted_credentials
+    path = paths["pins"]
+    if fault == "replaced_before_open":
+        replacement = path.with_name("replacement-pins")
+        replacement.write_bytes(path.read_bytes())
+        replacement.chmod(0o400)
+        original_open = os.open
+
+        def replacing_open(target, flags, *args, **kwargs):
+            if target == path:
+                os.replace(replacement, path)
+            return original_open(target, flags, *args, **kwargs)
+
+        monkeypatch.setattr(common.os, "open", replacing_open)
+    else:
+        original_read = os.read
+        inode = path.stat().st_ino
+        changed = False
+
+        def changing_read(descriptor, count):
+            nonlocal changed
+            raw = original_read(descriptor, count)
+            if not changed and os.fstat(descriptor).st_ino == inode:
+                changed = True
+                path.chmod(0o600)
+                with path.open("ab") as output:
+                    output.write(b" ")
+                path.chmod(0o400)
+            return raw
+
+        monkeypatch.setattr(common.os, "read", changing_read)
+    with pytest.raises(runtime.ReconcileRuntimeError, match="^credential_invalid$"):
+        runtime.load_credentials(request)
 
 
 def test_wrong_secret_owner_refuses_before_read(mounted_credentials, monkeypatch):
