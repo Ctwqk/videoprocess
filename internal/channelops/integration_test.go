@@ -3338,27 +3338,88 @@ func (f *ChannelOpsFixture) CountRows(ctx context.Context, table string) int {
 func (f *ChannelOpsFixture) cleanup(ctx context.Context) {
 	// Row DELETE cannot erase immutable facts. This fixture owns an explicitly
 	// confirmed disposable database and holds its exclusive fixture lock.
+	if err := f.cleanupRows(ctx); err != nil {
+		f.T.Errorf("disposable fixture cleanup: %v", err)
+	}
+}
+
+func (f *ChannelOpsFixture) cleanupRows(ctx context.Context) error {
 	if f.snapshotFixtureLock == nil {
-		f.T.Error("refusing cleanup without disposable fixture lock")
-		return
+		return errors.New("refusing cleanup without disposable fixture lock")
+	}
+	tx, err := f.snapshotFixtureLock.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), testOperationCleanupTimeout)
+		defer cancel()
+		_ = tx.Rollback(rollbackCtx)
+	}()
+	if err := cleanupChannelOpsFixtureRows(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func cleanupChannelOpsFixtureRows(ctx context.Context, tx pgx.Tx) error {
+	var locked bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks
+		WHERE pid=pg_backend_pid() AND locktype='advisory' AND granted AND mode='ExclusiveLock'
+		AND classid=(774403030044::bigint >> 32)::oid
+		AND objid=(774403030044::bigint & 4294967295)::oid AND objsubid=1)`).Scan(&locked); err != nil {
+		return err
+	}
+	if !locked {
+		return errors.New("disposable fixture lock is not held")
+	}
+	// The production audit guard is unconditional, including an empty table.
+	// Only this confirmed disposable fixture may temporarily disable its exact
+	// truncate trigger, with emptiness protected from concurrent insertion.
+	if _, err := tx.Exec(ctx, `LOCK TABLE public.owned_inventory_recoveries,
+		public.owned_inventory_recovery_permits IN ACCESS EXCLUSIVE MODE`); err != nil {
+		return err
+	}
+	var nonempty bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM public.owned_inventory_recoveries)
+		OR EXISTS(SELECT 1 FROM public.owned_inventory_recovery_permits)`).Scan(&nonempty); err != nil {
+		return err
+	}
+	if nonempty {
+		return errors.New("disposable recovery audit is not empty")
+	}
+	var enabled string
+	if err := tx.QueryRow(ctx, `SELECT tgenabled::text FROM pg_trigger
+		WHERE tgrelid='public.owned_inventory_recoveries'::regclass
+		AND tgname='owned_inventory_recovery_audit_no_truncate'`).Scan(&enabled); err != nil {
+		return err
+	}
+	if enabled != "O" {
+		return errors.New("disposable recovery audit truncate guard is not enabled")
+	}
+	if _, err := tx.Exec(ctx, `ALTER TABLE public.owned_inventory_recoveries
+		DISABLE TRIGGER owned_inventory_recovery_audit_no_truncate`); err != nil {
+		return err
 	}
 	// Publication, feedback, ledger, learning and scheduler links are not FKs.
 	// Include those old fixture cleanup roots explicitly, including orphan rows.
-	if _, err := f.snapshotFixtureLock.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		TRUNCATE public.channel_profiles, public.decision_policy_versions,
 		         public.publication_records, public.material_usage_ledger,
 		         public.takedown_events, public.feedback_snapshots,
 		         public.learning_states, public.internal_scheduler_runs CASCADE
 	`); err != nil {
-		f.T.Errorf("disposable fixture cleanup: %v", err)
-		return
+		return err
 	}
-	if _, err := f.snapshotFixtureLock.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		DELETE FROM autoflow_plans
 		WHERE id = '00000000-0000-0000-0000-000000000101'::uuid
 	`); err != nil {
-		f.T.Errorf("fixture plan cleanup: %v", err)
+		return err
 	}
+	_, err := tx.Exec(ctx, `ALTER TABLE public.owned_inventory_recoveries
+		ENABLE TRIGGER owned_inventory_recovery_audit_no_truncate`)
+	return err
 }
 
 func testUUID(t *testing.T, label string) string {

@@ -41,6 +41,7 @@ from app.services.youtube_upload_operations import (
     YouTubeUploadOperationStore,
 )
 from worker import main as worker_main
+from tests.disposable_postgres_cleanup import cleanup_disposable_postgres
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -133,14 +134,7 @@ async def postgres_race_db():
     cleanup_state.engine = engine
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
-        async with engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "TRUNCATE channel_ops_queue_items, publication_records, production_tasks, "
-                    "publishing_accounts, autoflow_runs, autoflow_plans, node_executions, jobs, "
-                    "pipelines, runtime_schedules RESTART IDENTITY CASCADE"
-                )
-            )
+        await cleanup_disposable_postgres(engine, "quarantine")
         yield engine, factory
     finally:
         try:

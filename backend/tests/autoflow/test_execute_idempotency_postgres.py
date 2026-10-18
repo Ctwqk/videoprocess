@@ -35,6 +35,7 @@ from app.services.schedule_service import (
     VideoScheduleState,
     open_video_schedule_for_job,
 )
+from tests.disposable_postgres_cleanup import cleanup_disposable_postgres
 
 
 POSTGRES_URL = os.getenv("CHANNEL_OPS_POSTGRES_TEST_URL", "")
@@ -66,14 +67,6 @@ async def postgres_idempotency_db(monkeypatch):
         pytest.skip("set CHANNEL_OPS_POSTGRES_TEST_URL for PostgreSQL idempotency tests")
     engine = create_async_engine(POSTGRES_URL, pool_size=8, max_overflow=0)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                "TRUNCATE TABLE autoflow_used_clips, autoflow_runs, node_executions, jobs, "
-                "pipelines, runtime_schedules, channel_ops_queue_items, production_tasks, "
-                "channel_profiles, autoflow_plans CASCADE"
-            )
-        )
 
     starts: list[str] = []
 
@@ -81,18 +74,17 @@ async def postgres_idempotency_db(monkeypatch):
         starts.extend(str(job_id) for job_id in job_ids)
 
     monkeypatch.setattr("app.autoflow.service.start_jobs_background", fake_start_jobs_background, raising=False)
+    initialized = False
     try:
+        await cleanup_disposable_postgres(engine, "autoflow")
+        initialized = True
         yield engine, factory, starts
     finally:
-        async with engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "TRUNCATE TABLE autoflow_used_clips, autoflow_runs, node_executions, jobs, "
-                    "pipelines, runtime_schedules, channel_ops_queue_items, production_tasks, "
-                    "channel_profiles, autoflow_plans CASCADE"
-                )
-            )
-        await engine.dispose()
+        try:
+            if initialized:
+                await cleanup_disposable_postgres(engine, "autoflow")
+        finally:
+            await engine.dispose()
 
 
 @pytest_asyncio.fixture
