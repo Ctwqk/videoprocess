@@ -40,6 +40,57 @@ def test_certificate_qualifies_terminal_legacy_without_new_item_credit():
     assert result.classifications[0].classification == "history_only"
 
 
+@pytest.mark.parametrize("active", ["none", "current_tick", "dirty_tick", "other_tick", "legacy_metric"])
+def test_retained_history_queue_admission(active):
+    from app.channel_agent.owned_inventory import queues_safe
+
+    f = fixture()
+    rows = f["rows"]
+    channel = rows["owned_seed_inventories"][0]["channel_profile_id"]
+    if active != "none":
+        queue = copy.deepcopy(rows["channel_ops_queue_items"][0])
+        queue.update(
+            id="00000000-0000-0000-0000-000000000999",
+            channel_profile_id=channel,
+            kind="agent_tick", status="running", attempt_count=1,
+            last_error=None, dead_letter_at=None, parent_queue_item_id=None,
+            locked_at=f["now"], locked_by="current-runner",
+            payload_json={"channel_id": channel},
+        )
+        if active == "dirty_tick":
+            queue["attempt_count"] = 2
+        elif active == "other_tick":
+            queue["channel_profile_id"] = "00000000-0000-0000-0000-000000000998"
+            queue["payload_json"]["channel_id"] = queue["channel_profile_id"]
+        elif active == "legacy_metric":
+            queue.update(kind="collect_metrics", channel_profile_id=rows["production_tasks"][0]["channel_profile_id"],
+                         payload_json={"publication_id": rows["publication_records"][0]["id"]})
+        rows["channel_ops_queue_items"].append(queue)
+    result = assess(f)
+    assert queues_safe(rows, result, channel, datetime.fromisoformat(f["now"])) is (
+        active in {"none", "current_tick"}
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "unapproved", "changed_fact"])
+def test_queue_admission_requires_current_valid_retained_authority(mutation):
+    from app.channel_agent.owned_inventory import queues_safe
+
+    f = fixture()
+    rows = f["rows"]
+    inventory_row = rows["owned_seed_inventories"][0]
+    if mutation == "missing":
+        inventory_row["manifest_json"]["legacy_history"].pop("retained_terminal_uploads")
+        inventory_row["manifest_sha256"] = history.history_sha256(inventory_row["manifest_json"])
+    elif mutation == "unapproved":
+        inventory_row["approved_at"] = None
+    else:
+        rows["feedback_snapshots"][0]["views"] = 987654
+    result = assess(f)
+    assert result.block_reason is not None
+    assert not queues_safe(rows, result, inventory_row["channel_profile_id"], datetime.fromisoformat(f["now"]))
+
+
 def test_native_locators_capture_actual_retained_facts_without_certificate_input():
     f = fixture()
     row = f["rows"]["owned_seed_inventories"].pop()

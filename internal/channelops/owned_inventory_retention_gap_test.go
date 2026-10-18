@@ -1,11 +1,107 @@
 package channelops
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestOwnedRetainedHistoryAllowsNextInventoryCandidate(t *testing.T) {
+	for _, reuseLegacyTask := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy_task_reuse_%v", reuseLegacyTask), func(t *testing.T) {
+			f := retentionGolden(t)
+			now := historyAt(t, f["now"])
+			channel, data, _ := ownedTestFixtureOffset(t, 10000)
+			data.Inventory["approved_at"] = ownedISO(now)
+			data.Inventory["starts_at"] = ownedISO(now.Add(-time.Hour))
+			data.Inventory["expires_at"] = ownedISO(now.Add(167 * time.Hour))
+			manifest := ownedMap(data.Inventory["manifest_json"])
+			manifest["version"] = 2
+			manifest["starts_at"], manifest["expires_at"] = data.Inventory["starts_at"], data.Inventory["expires_at"]
+			manifest["legacy_history"] = historyTestCopy(t, historyTestManifest(f)["legacy_history"])
+			data.Inventory["manifest_sha256"] = ownedTestHash(t, manifest)
+			if reuseLegacyTask {
+				data.Items[0].Item["state"] = "reserved"
+				data.Items[0].Item["production_task_id"] = historyTestFirst(f, "production_tasks")["id"]
+				data.Items[0].Item["consumed_at"] = ownedISO(now)
+				data.Items[0].Seed["status"] = "exhausted"
+			}
+			rows := ownedTestHistoryRows(t, data)
+			for table, records := range historyTestRows(f) {
+				rows[table] = append(historyArray(rows[table]), historyArray(records)...)
+			}
+			snapshot, err := newOwnedHistorySnapshot(historyJSON(t, rows), ownedString(data.Inventory["platform_channel_id"]), now, []byte("[]"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			data.History = &snapshot
+			data.Busy = !ownedQueuesSafe(channel.ID, data, now)
+			state := assessOwnedInventory(channel, data, now)
+			if reuseLegacyTask {
+				if state.HoldReason == "" || state.Candidate != nil || len(state.CompleteItemIDs) != 0 {
+					t.Fatalf("legacy upload credited to new inventory: %+v", state)
+				}
+			} else if state.HoldReason != "" || state.SkipReason != "" || state.Candidate == nil || len(state.CompleteItemIDs) != 0 || state.Candidate.owned.ItemID != data.Items[0].Item["id"] {
+				t.Fatalf("certified history blocked the next owned candidate: %+v", state)
+			}
+		})
+	}
+}
+
+func TestOwnedRetainedHistoryQueueAdmission(t *testing.T) {
+	for _, active := range []string{"none", "current_tick", "dirty_tick", "other_tick", "legacy_metric", "missing", "unapproved", "changed_fact"} {
+		t.Run(active, func(t *testing.T) {
+			f := retentionGolden(t)
+			rows := historyTestRows(f)
+			inventory := historyTestFirst(f, "owned_seed_inventories")
+			channel := historyString(inventory["channel_profile_id"])
+			switch active {
+			case "missing":
+				delete(historyObject(historyTestManifest(f)["legacy_history"]), "retained_terminal_uploads")
+				historyTestRehash(t, f)
+			case "unapproved":
+				inventory["approved_at"] = nil
+			case "changed_fact":
+				historyTestFirst(f, "feedback_snapshots")["views"] = json.Number("987654")
+			case "none":
+			default:
+				q := historyObject(historyTestCopy(t, historyTestFirst(f, "channel_ops_queue_items")))
+				q["id"], q["channel_profile_id"] = historyTestUID(999), channel
+				q["kind"], q["status"], q["attempt_count"] = QueueAgentTick, "running", json.Number("1")
+				q["last_error"], q["dead_letter_at"], q["parent_queue_item_id"] = nil, nil, nil
+				q["locked_at"], q["locked_by"] = f["now"], "current-runner"
+				q["payload_json"] = map[string]any{"channel_id": channel}
+				switch active {
+				case "dirty_tick":
+					q["attempt_count"] = json.Number("2")
+				case "other_tick":
+					q["channel_profile_id"] = historyTestUID(998)
+					q["payload_json"] = map[string]any{"channel_id": historyTestUID(998)}
+				case "legacy_metric":
+					q["kind"] = QueueCollectMetrics
+					q["channel_profile_id"] = historyTestFirst(f, "production_tasks")["channel_profile_id"]
+					q["payload_json"] = map[string]any{"publication_id": historyTestFirst(f, "publication_records")["id"]}
+				}
+				rows["channel_ops_queue_items"] = append(historyArray(rows["channel_ops_queue_items"]), q)
+			}
+			snapshot := historySnapshot(t, f)
+			data := ownedInventoryData{History: &snapshot}
+			for _, q := range historyRows(rows["channel_ops_queue_items"]) {
+				if q["status"] == "queued" || q["status"] == "running" {
+					data.Queues = append(data.Queues, q)
+				}
+			}
+			want := active == "none" || active == "current_tick"
+			if got := ownedQueuesSafe(channel, data, historyAt(t, f["now"])); got != want {
+				t.Fatalf("queues safe = %v, want %v", got, want)
+			}
+		})
+	}
+}
 
 func retentionGolden(t *testing.T) map[string]any {
 	t.Helper()

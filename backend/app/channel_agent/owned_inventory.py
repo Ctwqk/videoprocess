@@ -178,8 +178,17 @@ def production_target(rows, row, now):
 def queues_safe(rows, assessment, channel_id, now):
     allowed = {}
     try:
+        history._require(assessment.block_reason is None)
+        from app.services.owned_seed_inventory_retention import approved_certificates
+
+        bindings, _, _ = history._approved_authority(rows, now)
+        retained_tasks = {c["task_id"] for c in approved_certificates(rows, bindings, now).values()}
         for task in rows["production_tasks"]:
             if task["target_account_id"] not in assessment.account_ids:
+                continue
+            # Certified terminal history cannot reconstruct its pruned metric queues.
+            # It grants no permission for any currently active queue below.
+            if task["id"] in retained_tasks:
                 continue
             facts = history._task_history(rows, task)
             if len(facts["publications"]) != 1 or facts["publications"][0]["scheduled_publish_at"] is None:

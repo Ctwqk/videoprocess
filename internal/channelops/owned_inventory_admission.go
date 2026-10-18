@@ -40,6 +40,11 @@ func ownedQueuesSafe(channelID string, data ownedInventoryData, now time.Time) (
 	rows := data.History.rows()
 	assessment := assessOwnedHistorySnapshot(*data.History, now)
 	historyRequire(assessment.BlockReason == nil)
+	bindings, _, _ := historyApprovedAuthority(rows, now)
+	retainedTasks := map[string]bool{}
+	for _, certificate := range historyApprovedRetainedTerminal(rows, bindings, now) {
+		retainedTasks[historyString(certificate["task_id"])] = true
+	}
 	members := map[string]bool{}
 	for _, id := range assessment.AccountIDs {
 		members[id] = true
@@ -47,6 +52,11 @@ func ownedQueuesSafe(channelID string, data ownedInventoryData, now time.Time) (
 	allowed := map[string]map[string]any{}
 	for _, task := range historyRows(rows["production_tasks"]) {
 		if !members[historyReference(task["target_account_id"])] {
+			continue
+		}
+		// Certified terminal history cannot reconstruct its pruned metric queues.
+		// It grants no permission for any currently active queue below.
+		if retainedTasks[historyString(task["id"])] {
 			continue
 		}
 		h := historyTask(rows, task)
