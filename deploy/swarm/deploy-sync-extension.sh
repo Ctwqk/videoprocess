@@ -73,6 +73,9 @@ VP_WORKER_ABORT_AUTHORITY_CONTROL_GENERATION=""
 VP_WORKER_ABORT_AUTHORITY_OPERATOR_REFERENCE=""
 
 VP_RUNTIME_HOST="${VP_RUNTIME_HOST:-10.0.0.127}"
+# Deploy account home on the runtime Mac; deploy-github-sync.sh sets it
+# (the account was renamed wenjieliu -> magi2 on 2026-10-18).
+VP_MAC_DEPLOY_HOME="${VP_MAC_DEPLOY_HOME:-/Users/magi2}"
 VP_RUNTIME_HEALTH_HOST="${VP_RUNTIME_HEALTH_HOST-$VP_RUNTIME_HOST}"
 VP_RUNTIME_NODE="${VP_RUNTIME_NODE:-colima-127}"
 VP_RUNTIME_CONSTRAINT="node.labels.vp.runtime==true"
@@ -12687,7 +12690,7 @@ vp_build_runtime_worker_image() {
     return 0
   fi
   if [[ "$VP_RUNTIME_HOST" != 10.0.0.127 \
-    || "$context_dir" != /Users/wenjieliu/VideoProcess-app \
+    || "$context_dir" != "$VP_MAC_DEPLOY_HOME/VideoProcess-app" \
     || "$dockerfile" != backend/Dockerfile.ffmpeg-worker-go \
     || ! "$build_commit" =~ ^[0-9a-f]{40}$ \
     || "$image" != "vp-ffmpeg-worker-go:deploy-${build_commit:0:12}" ]]; then
@@ -12695,18 +12698,20 @@ vp_build_runtime_worker_image() {
   fi
   log "build $VP_RUNTIME_HOST:$context_dir $image"
   remote_sh "$VP_RUNTIME_HOST" /bin/sh -s -- \
-    "$context_dir" "$dockerfile" "$image" "$build_commit" <<'REMOTE'
+    "$context_dir" "$dockerfile" "$image" "$build_commit" \
+    "$VP_MAC_DEPLOY_HOME" <<'REMOTE'
 set -eu
 context_dir="$1"
 dockerfile="$2"
 image="$3"
 build_commit="$4"
+deploy_home="$5"
 case "$context_dir|$dockerfile|$image|$build_commit" in
   *10.0.0.126*|*colima-126*|*colima-swarmbridged*|*CASPERs-Mac-mini*)
     exit 1
     ;;
 esac
-[ "$context_dir" = /Users/wenjieliu/VideoProcess-app ]
+[ "$context_dir" = "$deploy_home/VideoProcess-app" ]
 [ "$dockerfile" = backend/Dockerfile.ffmpeg-worker-go ]
 printf '%s\n' "$build_commit" | grep -Eq '^[0-9a-f]{40}$'
 [ "$image" = "vp-ffmpeg-worker-go:deploy-$(printf '%s' "$build_commit" | cut -c1-12)" ]
@@ -12724,7 +12729,7 @@ vp_build_runtime_channelops_image() {
   local image="${3:-}"
   local build_commit="${4:-}"
   if [[ "$VP_RUNTIME_HOST" != 10.0.0.127 \
-    || "$context_dir" != /Users/wenjieliu/VideoProcess-app \
+    || "$context_dir" != "$VP_MAC_DEPLOY_HOME/VideoProcess-app" \
     || "$dockerfile" != backend/Dockerfile.channelops-runner-go \
     || ! "$build_commit" =~ ^[0-9a-f]{40}$ \
     || "$image" != "vp-channelops-runner-go:deploy-${build_commit:0:12}" ]]; then
@@ -12736,18 +12741,20 @@ vp_build_runtime_channelops_image() {
   fi
   log "build $VP_RUNTIME_HOST:$context_dir $image"
   remote_sh "$VP_RUNTIME_HOST" /bin/sh -s -- \
-    "$context_dir" "$dockerfile" "$image" "$build_commit" <<'REMOTE'
+    "$context_dir" "$dockerfile" "$image" "$build_commit" \
+    "$VP_MAC_DEPLOY_HOME" <<'REMOTE'
 set -eu
 context_dir="$1"
 dockerfile="$2"
 image="$3"
 build_commit="$4"
+deploy_home="$5"
 case "$context_dir|$dockerfile|$image|$build_commit" in
   *10.0.0.126*|*colima-126*|*colima-swarmbridged*|*CASPERs-Mac-mini*)
     exit 1
     ;;
 esac
-[ "$context_dir" = /Users/wenjieliu/VideoProcess-app ]
+[ "$context_dir" = "$deploy_home/VideoProcess-app" ]
 [ "$dockerfile" = backend/Dockerfile.channelops-runner-go ]
 [ "${#build_commit}" -eq 40 ]
 printf '%s\n' "$build_commit" | grep -Eq '^[0-9a-f]{40}$'
@@ -12773,19 +12780,20 @@ build_vp_app_images() {
   local channelops_runner="vp-channelops-runner-go:deploy-$short"
   local ffmpeg_go="vp-ffmpeg-worker-go:deploy-$short"
   local python_worker="vp-ffmpeg-worker-python:deploy-$short"
+  local app_dir="$VP_MAC_DEPLOY_HOME/VideoProcess-app"
 
-  build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app \
+  build_image_on_host "$VP_RUNTIME_HOST" "$app_dir" \
     backend/Dockerfile.api-go "$api" || return 1
-  build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app/frontend \
+  build_image_on_host "$VP_RUNTIME_HOST" "$app_dir/frontend" \
     Dockerfile "$frontend" || return 1
-  build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app/backend \
+  build_image_on_host "$VP_RUNTIME_HOST" "$app_dir/backend" \
     Dockerfile.api "$backend" || return 1
   vp_build_runtime_channelops_image \
-    /Users/wenjieliu/VideoProcess-app \
+    "$app_dir" \
     backend/Dockerfile.channelops-runner-go \
     "$channelops_runner" "$commit" || return 1
   vp_build_runtime_worker_image \
-    /Users/wenjieliu/VideoProcess-app \
+    "$app_dir" \
     backend/Dockerfile.ffmpeg-worker-go \
     "$ffmpeg_go" "$commit" || return 1
   vp_build_manager_image "$REPO_ROOT/videoprocess/backend" \
@@ -12805,7 +12813,7 @@ build_feature_aggregator_images() {
   local tag
   tag="$(image_tag vp-feature-aggregator "$commit")"
   build_image_on_host "$VP_RUNTIME_HOST" \
-    /Users/wenjieliu/.deploy-build/vp-feature-aggregator \
+    "$VP_MAC_DEPLOY_HOME/.deploy-build/vp-feature-aggregator" \
     deploy/Dockerfile "$tag" || return 1
   printf '%s\n' "$tag"
 }
@@ -12818,7 +12826,7 @@ build_pds_images() {
   local tag
   tag="$(image_tag vp-pds "$commit")"
   build_image_on_host "$VP_RUNTIME_HOST" \
-    /Users/wenjieliu/.deploy-build/policy-decision-service \
+    "$VP_MAC_DEPLOY_HOME/.deploy-build/policy-decision-service" \
     deploy/Dockerfile "$tag" || return 1
   printf '%s\n' "$tag"
 }

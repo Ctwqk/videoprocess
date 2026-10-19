@@ -450,10 +450,11 @@ remote_sh() {
     && "${1:-}" == "/bin/sh" \
     && "${2:-}" == "-s" \
     && "${3:-}" == "--" \
-    && "${4:-}" == "/Users/wenjieliu/VideoProcess-app" \
+    && "${4:-}" == "/Users/magi2/VideoProcess-app" \
     && "${5:-}" == "backend/Dockerfile.ffmpeg-worker-go" \
     && "${6:-}" == "vp-ffmpeg-worker-go:deploy-0123456789ab" \
-    && "${7:-}" == "$TEST_COMMIT" ]]; then
+    && "${7:-}" == "$TEST_COMMIT" \
+    && "${8:-}" == "/Users/magi2" ]]; then
     grep -Fq -- '--build-arg "VP_BUILD_COMMIT=$build_commit"' \
       <<<"$remote_script"
     return
@@ -1534,7 +1535,7 @@ test_runtime_health_host_contract
 
 test_channelops_build_contract() (
   CALLS="$TEST_ROOT/channelops-contract-calls"
-  local context=/Users/wenjieliu/VideoProcess-app
+  local context=/Users/magi2/VideoProcess-app
   local dockerfile=backend/Dockerfile.channelops-runner-go
   local image=vp-channelops-runner-go:deploy-0123456789ab
   local invalid mode
@@ -1565,11 +1566,12 @@ test_channelops_build_contract() (
     fi
     [[ ! -s "$CALLS" ]] || exit 1
 
-    for invalid in host context dockerfile image; do
+    for invalid in host context home dockerfile image; do
       local host=10.0.0.127 ctx="$context" file="$dockerfile" tag="$image"
       case "$invalid" in
         host) host=10.0.0.126 ;;
-        context) ctx=/Users/wenjieliu/VideoProcess-app/backend ;;
+        context) ctx=/Users/magi2/VideoProcess-app/backend ;;
+        home) ctx=/Users/wenjieliu/VideoProcess-app ;;
         dockerfile) file=backend/Dockerfile.ffmpeg-worker-go ;;
         image) tag=vp-channelops-runner-go:deploy-ffffffffffff ;;
       esac
@@ -1589,7 +1591,7 @@ test_channelops_build_contract() (
   BUILD_IMAGES=1
   : >"$CALLS"
   vp_build_runtime_channelops_image "$context" "$dockerfile" "$image" "$TEST_COMMIT"
-  grep -Fxq "remote|10.0.0.127|/bin/sh|-s|--|$context|$dockerfile|$image|$TEST_COMMIT" "$CALLS"
+  grep -Fxq "remote|10.0.0.127|/bin/sh|-s|--|$context|$dockerfile|$image|$TEST_COMMIT|/Users/magi2" "$CALLS"
   local expected="channelops-docker|build|--build-arg|VP_BUILD_COMMIT_SHA=$TEST_COMMIT|-f|$context/$dockerfile|-t|$image|$context"
   [[ "$(grep '^channelops-docker|' "$CALLS")" == "$expected" ]] || exit 1
 
@@ -1598,26 +1600,33 @@ test_channelops_build_contract() (
   remote_script="$(<"$TEST_ROOT/channelops-build-bin/build.sh")"
   for invalid in '' development 0123456789ab "$TEST_COMMIT"$'\n'; do
     : >"$CALLS"
-    if run_channelops_build_script "$remote_script" "$context" "$dockerfile" "$image" "$invalid"; then
+    if run_channelops_build_script "$remote_script" "$context" "$dockerfile" "$image" "$invalid" /Users/magi2; then
       echo 'FAIL: remote ChannelOps script accepted an invalid identity' >&2
       exit 1
     fi
     [[ ! -s "$CALLS" ]] || exit 1
   done
-  for invalid in context dockerfile image; do
-    local ctx="$context" file="$dockerfile" tag="$image"
+  for invalid in context home dockerfile image; do
+    local ctx="$context" home=/Users/magi2 file="$dockerfile" tag="$image"
     case "$invalid" in
-      context) ctx=/Users/wenjieliu/VideoProcess-app/backend ;;
+      context) ctx=/Users/magi2/VideoProcess-app/backend ;;
+      home) home=/Users/wenjieliu ;;
       dockerfile) file=backend/Dockerfile.ffmpeg-worker-go ;;
       image) tag=vp-channelops-runner-go:deploy-ffffffffffff ;;
     esac
     : >"$CALLS"
-    if run_channelops_build_script "$remote_script" "$ctx" "$file" "$tag" "$TEST_COMMIT"; then
+    if run_channelops_build_script "$remote_script" "$ctx" "$file" "$tag" "$TEST_COMMIT" "$home"; then
       echo "FAIL: remote ChannelOps script accepted invalid $invalid" >&2
       exit 1
     fi
     [[ ! -s "$CALLS" ]] || exit 1
   done
+  : >"$CALLS"
+  if run_channelops_build_script "$remote_script" "$context" "$dockerfile" "$image" "$TEST_COMMIT" 2>/dev/null; then
+    echo 'FAIL: remote ChannelOps script accepted a missing deploy home' >&2
+    exit 1
+  fi
+  [[ ! -s "$CALLS" ]] || exit 1
   : >"$CALLS"
   if CHANNEL_BUILD_STATUS=37 vp_build_runtime_channelops_image "$context" "$dockerfile" "$image" "$TEST_COMMIT"; then
     echo 'FAIL: ChannelOps swallowed a Docker build failure' >&2
@@ -1702,8 +1711,105 @@ test_channelops_migration_head_reporting() (
   echo 'PASS: ChannelOps image-owned migration head reporting contract'
 )
 
+test_mac_deploy_home_contract() (
+  CALLS="$TEST_ROOT/mac-deploy-home-calls"
+  local short=0123456789ab home other helper dockerfile image ctx bad_home script expected
+  if grep -Fq /Users/wenjieliu "$EXTENSION"; then
+    echo 'FAIL: extension still hardcodes the pre-rename Mac home' >&2
+    exit 1
+  fi
+  unset VP_MAC_DEPLOY_HOME
+  source "$EXTENSION"
+  if [[ "$VP_MAC_DEPLOY_HOME" != /Users/magi2 ]]; then
+    echo 'FAIL: Mac deploy home must default to /Users/magi2' >&2
+    exit 1
+  fi
+  VP_MAC_DEPLOY_HOME=/Users/vp-deploy-test
+  source "$EXTENSION"
+  if [[ "$VP_MAC_DEPLOY_HOME" != /Users/vp-deploy-test ]]; then
+    echo 'FAIL: extension replaced the host-provided Mac deploy home' >&2
+    exit 1
+  fi
+
+  image_tag() {
+    printf '%s:deploy-%s\n' "$1" "$(printf '%s' "$2" | cut -c1-12)"
+  }
+  # Capture each remote build script so it can be executed against a fake Docker.
+  remote_sh() {
+    printf 'remote|%s' "$1" >>"$CALLS"
+    shift
+    printf '|%s' "$@" >>"$CALLS"
+    printf '\n' >>"$CALLS"
+    command cat >"$TEST_ROOT/mac-deploy-home-${5##*.}.sh"
+  }
+
+  for home in /Users/magi2 /Users/vp-deploy-test; do
+    VP_MAC_DEPLOY_HOME="$home"
+    if [[ "$home" == /Users/magi2 ]]; then other=/Users/vp-deploy-test; else other=/Users/magi2; fi
+    : >"$CALLS"
+    build_vp_app_images "$TEST_COMMIT" >/dev/null
+    build_feature_aggregator_images "$TEST_COMMIT" >/dev/null
+    build_pds_images "$TEST_COMMIT" >/dev/null
+    for expected in \
+      "build|10.0.0.127|$home/VideoProcess-app|backend/Dockerfile.api-go|vp-api:deploy-$short" \
+      "build|10.0.0.127|$home/VideoProcess-app/frontend|Dockerfile|vp-frontend:deploy-$short" \
+      "build|10.0.0.127|$home/VideoProcess-app/backend|Dockerfile.api|vp-backend-api:deploy-$short" \
+      "remote|10.0.0.127|/bin/sh|-s|--|$home/VideoProcess-app|backend/Dockerfile.channelops-runner-go|vp-channelops-runner-go:deploy-$short|$TEST_COMMIT|$home" \
+      "remote|10.0.0.127|/bin/sh|-s|--|$home/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go|vp-ffmpeg-worker-go:deploy-$short|$TEST_COMMIT|$home" \
+      "build|10.0.0.127|$home/.deploy-build/vp-feature-aggregator|deploy/Dockerfile|vp-feature-aggregator:deploy-$short" \
+      "build|10.0.0.127|$home/.deploy-build/policy-decision-service|deploy/Dockerfile|vp-pds:deploy-$short"; do
+      if ! grep -Fxq -- "$expected" "$CALLS"; then
+        echo "FAIL: Mac deploy home was not applied: $expected" >&2
+        exit 1
+      fi
+    done
+    ! grep -Fq wenjieliu "$CALLS" || exit 1
+
+    for helper in vp_build_runtime_channelops_image vp_build_runtime_worker_image; do
+      case "$helper" in
+        vp_build_runtime_channelops_image) dockerfile=backend/Dockerfile.channelops-runner-go ;;
+        *) dockerfile=backend/Dockerfile.ffmpeg-worker-go ;;
+      esac
+      image="vp-${dockerfile##*.}:deploy-$short"
+      for ctx in "$other/VideoProcess-app" /Users/wenjieliu/VideoProcess-app; do
+        : >"$CALLS"
+        if "$helper" "$ctx" "$dockerfile" "$image" "$TEST_COMMIT"; then
+          echo "FAIL: $helper accepted a context outside the Mac deploy home" >&2
+          exit 1
+        fi
+        [[ ! -s "$CALLS" ]] || exit 1
+      done
+
+      # The remote guard compares against the home passed as an argument.
+      script="$(<"$TEST_ROOT/mac-deploy-home-${dockerfile##*.}.sh")"
+      : >"$CALLS"
+      run_channelops_build_script "$script" \
+        "$home/VideoProcess-app" "$dockerfile" "$image" "$TEST_COMMIT" "$home"
+      grep -Fq "|-f|$home/VideoProcess-app/$dockerfile|-t|$image|$home/VideoProcess-app" "$CALLS"
+      for bad_home in /Users/wenjieliu "$other" "$home/" ''; do
+        : >"$CALLS"
+        if run_channelops_build_script "$script" \
+          "$home/VideoProcess-app" "$dockerfile" "$image" "$TEST_COMMIT" "$bad_home"; then
+          echo "FAIL: remote $dockerfile build accepted deploy home '$bad_home'" >&2
+          exit 1
+        fi
+        [[ ! -s "$CALLS" ]] || exit 1
+      done
+      : >"$CALLS"
+      if run_channelops_build_script "$script" \
+        "$home/VideoProcess-app" "$dockerfile" "$image" "$TEST_COMMIT" 2>/dev/null; then
+        echo "FAIL: remote $dockerfile build accepted a missing deploy home" >&2
+        exit 1
+      fi
+      [[ ! -s "$CALLS" ]] || exit 1
+    done
+  done
+  echo 'PASS: Mac deploy home contract'
+)
+
 test_channelops_build_contract
 test_channelops_migration_head_reporting
+test_mac_deploy_home_contract
 if [[ "${1:-}" == --channelops-build-only ]]; then
   exit 0
 fi
@@ -4724,10 +4830,10 @@ if [[ "$cron_writes_after" -ne "$cron_writes_before" ]]; then
 fi
 
 grep -Fq \
-  "remote|10.0.0.127|/bin/sh|-s|--|/Users/wenjieliu/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go|vp-ffmpeg-worker-go:deploy-0123456789ab|$TEST_COMMIT" \
+  "remote|10.0.0.127|/bin/sh|-s|--|/Users/magi2/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go|vp-ffmpeg-worker-go:deploy-0123456789ab|$TEST_COMMIT|/Users/magi2" \
   "$CALLS"
 if grep -Fq \
-  'build|10.0.0.127|/Users/wenjieliu/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go' \
+  'build|10.0.0.127|/Users/magi2/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go' \
   "$CALLS"; then
   echo 'FAIL: versioned Go worker used the four-argument build helper' >&2
   exit 1
