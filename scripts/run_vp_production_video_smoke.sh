@@ -18,7 +18,7 @@ VP_PYTHON_API="${VP_PYTHON_API:-http://10.0.0.127:18080}"
 VP_REDIS_URL="${VP_REDIS_URL:-redis://10.0.0.150:6380/0}"
 VP_SMOKE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 VP_SMOKE_DEPLOYED_COMMIT="$(ssh 10.0.0.127 \
-  'tr -d "\n" < /Users/wenjieliu/VideoProcess-app/.deploy-sync-source-commit')"
+  'tr -d "\n" < "$HOME/VideoProcess-app/.deploy-sync-source-commit"')"
 
 if [[ "$VP_SMOKE_COMMIT" != "$VP_SMOKE_DEPLOYED_COMMIT" ]]; then
   echo "source/deployed commit mismatch: $VP_SMOKE_COMMIT != $VP_SMOKE_DEPLOYED_COMMIT" >&2

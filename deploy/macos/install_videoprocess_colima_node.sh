@@ -11,8 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLIST_SOURCE="$SCRIPT_DIR/$PLIST_LABEL.plist"
 PLIST_TARGET="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 COLIMA_COMMAND_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-CRON_REBOOT="@reboot /usr/bin/env PATH=$COLIMA_COMMAND_PATH /opt/homebrew/bin/colima start --profile swarmbridged >> /Users/wenjieliu/Library/Logs/constructure/vp-colima-cron.log 2>&1"
-CRON_WATCHDOG="*/5 * * * * /usr/bin/env PATH=$COLIMA_COMMAND_PATH /opt/homebrew/bin/colima start --profile swarmbridged >> /Users/wenjieliu/Library/Logs/constructure/vp-colima-cron.log 2>&1"
+CRON_REBOOT="@reboot /usr/bin/env PATH=$COLIMA_COMMAND_PATH /opt/homebrew/bin/colima start --profile swarmbridged >> $HOME/Library/Logs/constructure/vp-colima-cron.log 2>&1"
+CRON_WATCHDOG="*/5 * * * * /usr/bin/env PATH=$COLIMA_COMMAND_PATH /opt/homebrew/bin/colima start --profile swarmbridged >> $HOME/Library/Logs/constructure/vp-colima-cron.log 2>&1"
 
 run() {
   if [[ "${VP_DRY_RUN:-false}" == "true" ]]; then
@@ -96,7 +96,9 @@ install_node() {
     --label-add role=app --label-add vp.runtime=true "$VM_HOSTNAME"
 
   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/constructure"
-  install -m 0644 "$PLIST_SOURCE" "$PLIST_TARGET"
+  # The plist template carries __HOME__ because launchd does not expand $HOME.
+  sed "s|__HOME__|$HOME|g" "$PLIST_SOURCE" >"$PLIST_TARGET"
+  chmod 0644 "$PLIST_TARGET"
   local launch_domain="gui/$(id -u)"
   if launchctl print "$launch_domain/$PLIST_LABEL" >/dev/null 2>&1; then
     launchctl bootout "$launch_domain/$PLIST_LABEL"

@@ -593,7 +593,7 @@ async def deployment_readiness(args: argparse.Namespace, client: httpx.AsyncClie
         run_readonly_command,
         ssh_readonly_command(
             args.runtime_host,
-            "tr -d '\\n' < /Users/wenjieliu/VideoProcess-app/.deploy-sync-source-commit",
+            "tr -d '\\n' < \"$HOME/VideoProcess-app/.deploy-sync-source-commit\"",
         ),
     )
     if not source_commit or source_commit != deployed_commit:

@@ -1,4 +1,4 @@
-"""Keep native VP source intact when the host still has a legacy patch overlay."""
+"""Keep native VP source intact when the host still has a legacy overlay."""
 
 import os
 from pathlib import Path
@@ -20,7 +20,14 @@ class NativeStageOverlayTests(unittest.TestCase):
         self.repo = self.root / "repos/videoprocess"
         self.stage = self.root / "stage/vp-app"
         self.overlay = self.root / "overlays"
-        for relative in ("backend/app/main.py", "backend/app/config.py", "frontend/vite.config.ts"):
+        for relative in (
+            "backend/app/main.py",
+            "backend/app/config.py",
+            "backend/.dockerignore",
+            "frontend/vite.config.ts",
+            "frontend/.dockerignore",
+            "frontend/nginx.conf",
+        ):
             target = self.repo / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / relative, target)
@@ -73,19 +80,16 @@ stage_from_repo "$PROJECT" videoprocess .
             timeout=15,
         )
 
-    def test_native_source_is_preserved_and_packaging_overlay_is_applied(self):
+    def test_native_source_and_packaging_are_staged_from_repo(self):
         for _ in range(2):
             result = self.run_stage()
             self.assertEqual(result.returncode, 0, result.stderr)
             for source in self.repo.rglob("*"):
                 if source.is_file():
                     self.assertEqual(source.read_bytes(), (self.stage / source.relative_to(self.repo)).read_bytes())
-            for source, target in (
-                ("127-vp-backend.dockerignore", "backend/.dockerignore"),
-                ("127-vp-frontend/.dockerignore", "frontend/.dockerignore"),
-                ("127-vp-frontend/nginx.conf", "frontend/nginx.conf"),
-            ):
-                self.assertEqual((self.overlay / source).read_bytes(), (self.stage / target).read_bytes())
+            # A stale host overlay must not replace repo-versioned packaging.
+            for target in ("backend/.dockerignore", "frontend/.dockerignore", "frontend/nginx.conf"):
+                self.assertEqual((self.repo / target).read_bytes(), (self.stage / target).read_bytes())
             self.assertFalse((self.stage / "old-release").exists())
 
     def test_other_projects_keep_their_original_overlay(self):
@@ -93,8 +97,17 @@ stage_from_repo "$PROJECT" videoprocess .
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "stage/vp-pds/delegated-overlay").read_text(), "vp-pds\n")
 
-    def test_missing_packaging_input_does_not_replace_previous_stage(self):
-        (self.overlay / "127-vp-frontend/nginx.conf").unlink()
+    def test_vp_app_does_not_require_host_overlay(self):
+        shutil.rmtree(self.overlay)
+        result = self.run_stage()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.repo / "frontend/nginx.conf").read_bytes(),
+            (self.stage / "frontend/nginx.conf").read_bytes(),
+        )
+
+    def test_failed_sync_does_not_replace_previous_stage(self):
+        shutil.rmtree(self.repo)
         result = self.run_stage()
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual((self.stage / "old-release").read_text(), "keep on failure")
