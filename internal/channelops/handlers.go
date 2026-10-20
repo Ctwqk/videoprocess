@@ -1228,18 +1228,35 @@ func (h HandlerService) finalizePromotionDecision(
 			return promotionPreparation{}, err
 		}
 	}
+	promotionMetadata := promotionEventMetadata(publication, prepared.TargetVisibility, prepared.ScheduledAt)
 	if decision.Verdict != "allow" {
 		guard := "pds_blocked"
 		if decision.Verdict == "flag" {
 			guard = "pds_flagged_for_review"
 		}
 		prepared.Skip = true
-		return prepared, h.Store.HoldTaskWithPDS(
+		if err := h.Store.HoldTaskWithPDS(
 			ctx,
 			publication.ProductionTaskID,
 			guard,
 			decision,
 			"promote_publication_pds",
+		); err != nil {
+			return prepared, err
+		}
+		if err := h.Store.enqueuePublicationEvent(
+			ctx,
+			publication,
+			ActorActionPublicationPromotionAttempted,
+			promotionMetadata,
+		); err != nil {
+			return prepared, err
+		}
+		return prepared, h.Store.enqueuePublicationEvent(
+			ctx,
+			publication,
+			ActorActionPublicationPromotionBlocked,
+			mergeEventMetadata(promotionMetadata, map[string]any{"guard": guard}, pdsDecisionEventMetadata(decision)),
 		)
 	}
 	operation, err := h.Store.ReservePromotionOperation(
@@ -1251,6 +1268,14 @@ func (h HandlerService) finalizePromotionDecision(
 		decision,
 	)
 	if err != nil {
+		return original, err
+	}
+	if err := h.Store.enqueuePublicationEvent(
+		ctx,
+		publication,
+		ActorActionPublicationPromotionAttempted,
+		promotionMetadata,
+	); err != nil {
 		return original, err
 	}
 	prepared.Operation = operation

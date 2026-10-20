@@ -158,6 +158,14 @@ func (s *Store) PromotePublication(ctx context.Context, publicationID string, ta
 	if err := s.updateTaskState(ctx, publication.ProductionTaskID, TaskScheduled, "", "", "promote_publication", "", now); err != nil {
 		return err
 	}
+	if err := s.enqueuePublicationEvent(
+		ctx,
+		publication,
+		ActorActionPublicationScheduled,
+		mergeEventMetadata(promotionEventMetadata(publication, visibility, scheduledAt), pdsDecisionEventMetadata(decision)),
+	); err != nil {
+		return err
+	}
 	parentID, err := optionalUUID("parent_queue_item_id", parentQueueItemID)
 	if err != nil {
 		return err
