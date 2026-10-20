@@ -2,6 +2,9 @@ package pipeline
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/Ctwqk/videoprocess/internal/contracts"
 )
@@ -24,11 +27,35 @@ var unsupportedGoValidationNodeTypes = map[string]struct{}{
 	"subtitle_to_speech":      {},
 }
 
+// Dynamic video inputs mirror DYNAMIC_VIDEO_INPUT_* in
+// backend/app/orchestrator/dag.py: these nodes accept video_1..video_64, and
+// concat_timeline also accepts its legacy first/second handles.
+const dynamicVideoInputMaxCount = 64
+
+var dynamicVideoInputNodeTypes = map[string]struct{}{
+	"concat_many":     {},
+	"concat_timeline": {},
+}
+
+var legacyTimelineInputHandles = map[string]string{
+	"video_first":  "video_1",
+	"video_second": "video_2",
+}
+
+var videoInputHandlePattern = regexp.MustCompile(`^video_(\d+)$`)
+
+// Node types whose unconnected outputs do not produce a disconnected_node warning.
+var terminalNodeTypes = map[string]struct{}{
+	"transcode":               {},
+	"material_library_ingest": {},
+}
+
 // Validate mirrors backend/app/orchestrator/dag.py `validate_pipeline` for
-// the contract surfaces the Go API exposes today. AutoFlow-specific shapes
-// (zip_records / dynamic video inputs / planner-bound sources) are not yet
-// implemented; callers that rely on those constructs must keep using the
-// Python validator until Go parity is added in a follow-up.
+// the contract surfaces the Go API exposes today. Planner shapes
+// (zip_records / search nodes / planner-bound sources) are not implemented;
+// graphs containing them are rejected as unsupported_go_validation so callers
+// route them to the Python validator. Shared parity cases live in
+// backend/tests/golden/go_migration/pipeline_validation_cases.json.
 func Validate(def contracts.PipelineDefinition) contracts.ValidationResult {
 	errors := make([]contracts.ValidationError, 0)
 	warnings := make([]contracts.ValidationWarning, 0)
@@ -90,28 +117,20 @@ func Validate(def contracts.PipelineDefinition) contracts.ValidationResult {
 			})
 			continue
 		}
-		if !portsCompatible(registry, source.Type, edge.SourceHandle, target.Type, edge.TargetHandle) {
-			id := edge.ID
-			sourcePort := edge.SourceHandle
-			targetPort := edge.TargetHandle
-			errors = append(errors, contracts.ValidationError{
-				Type:       "port_type_mismatch",
-				EdgeID:     &id,
-				SourcePort: &sourcePort,
-				TargetPort: &targetPort,
-				Message:    "Cannot connect '" + edge.SourceHandle + "' to '" + edge.TargetHandle + "' (type mismatch)",
-			})
+		if edgeErr := edgePortError(registry, edge, source, target); edgeErr != nil {
+			errors = append(errors, *edgeErr)
 		}
 
 		// Duplicate input port detection: each input handle may have at
 		// most one inbound edge. Mirrors `connected_inputs` set in
-		// dag.py's validate_pipeline.
+		// dag.py's validate_pipeline, which compares canonical handles.
+		targetHandle := canonicalTargetHandle(target.Type, edge.TargetHandle)
 		if connectedInputs[edge.Target] == nil {
 			connectedInputs[edge.Target] = map[string]bool{}
 		}
-		if connectedInputs[edge.Target][edge.TargetHandle] {
+		if connectedInputs[edge.Target][targetHandle] {
 			id := edge.Target
-			port := edge.TargetHandle
+			port := targetHandle
 			label := nodeLabel(target)
 			errors = append(errors, contracts.ValidationError{
 				Type:       "duplicate_input_port",
@@ -119,11 +138,11 @@ func Validate(def contracts.PipelineDefinition) contracts.ValidationResult {
 				TargetPort: &port,
 				Message: fmt.Sprintf(
 					"Input port '%s' on '%s' has multiple connections (only one allowed)",
-					edge.TargetHandle, label,
+					targetHandle, label,
 				),
 			})
 		}
-		connectedInputs[edge.Target][edge.TargetHandle] = true
+		connectedInputs[edge.Target][targetHandle] = true
 
 		adjacency[edge.Source] = append(adjacency[edge.Source], edge.Target)
 		inDegree[edge.Target]++
@@ -154,8 +173,26 @@ func Validate(def contracts.PipelineDefinition) contracts.ValidationResult {
 		if !ok {
 			continue
 		}
+		// Dynamic-input nodes require any two video_* inputs instead of the
+		// manifest's fixed required ports.
+		_, dynamic := dynamicVideoInputNodeTypes[node.Type]
+		if dynamic {
+			if countDynamicVideoInputs(node, connectedInputs) < 2 {
+				id := node.ID
+				portName := "video_*"
+				errors = append(errors, contracts.ValidationError{
+					Type:       "missing_required_input",
+					NodeID:     &id,
+					TargetPort: &portName,
+					Message: fmt.Sprintf(
+						"At least two video inputs on '%s' must be connected",
+						nodeLabel(node),
+					),
+				})
+			}
+		}
 		for _, port := range typeDef.Inputs {
-			if !port.Required {
+			if dynamic || !port.Required {
 				continue
 			}
 			if !connectedInputs[node.ID][port.Name] {
@@ -198,7 +235,148 @@ func Validate(def contracts.PipelineDefinition) contracts.ValidationResult {
 		}
 	}
 
+	hasOutgoing := map[string]bool{}
+	for _, edge := range def.Edges {
+		hasOutgoing[edge.Source] = true
+	}
+	for _, node := range def.Nodes {
+		typeDef, ok := registry[node.Type]
+		if !ok || len(typeDef.Outputs) == 0 || hasOutgoing[node.ID] {
+			continue
+		}
+		if _, terminal := terminalNodeTypes[node.Type]; terminal {
+			continue
+		}
+		id := node.ID
+		warnings = append(warnings, contracts.ValidationWarning{
+			Type:    "disconnected_node",
+			NodeID:  &id,
+			Message: fmt.Sprintf("Node '%s' has outputs but none are connected", nodeLabel(node)),
+		})
+	}
+
 	return contracts.ValidationResult{Valid: len(errors) == 0, Errors: errors, Warnings: warnings}
+}
+
+// edgePortError applies dag.py's per-edge port checks in the same order:
+// dynamic input limit, dynamic video input typing, registry port
+// compatibility, then the inferred media type of source nodes.
+func edgePortError(registry map[string]NodeTypeDefinition, edge contracts.PipelineEdge, source, target contracts.PipelineNode) *contracts.ValidationError {
+	mismatch := func(message string) *contracts.ValidationError {
+		id := edge.ID
+		sourcePort := edge.SourceHandle
+		targetPort := edge.TargetHandle
+		return &contracts.ValidationError{
+			Type:       "port_type_mismatch",
+			EdgeID:     &id,
+			SourcePort: &sourcePort,
+			TargetPort: &targetPort,
+			Message:    message,
+		}
+	}
+	typeMismatch := "Cannot connect '" + edge.SourceHandle + "' to '" + edge.TargetHandle + "' (type mismatch)"
+
+	if index, dynamic := dynamicVideoInputIndex(target.Type, edge.TargetHandle); dynamic {
+		if index > dynamicVideoInputMaxCount {
+			err := mismatch(fmt.Sprintf(
+				"Dynamic input '%s' exceeds max input count %d",
+				edge.TargetHandle, dynamicVideoInputMaxCount,
+			))
+			err.Type = "invalid_dynamic_input"
+			return err
+		}
+		if !dynamicVideoSourceCompatible(registry, source, edge.SourceHandle) {
+			return mismatch(typeMismatch)
+		}
+		return nil
+	}
+
+	if !portsCompatible(registry, source.Type, edge.SourceHandle, target.Type, edge.TargetHandle) {
+		return mismatch(typeMismatch)
+	}
+
+	actual, inferred := inferActualOutputPortType(source)
+	if !inferred {
+		return nil
+	}
+	targetPort, found := findInput(registry[target.Type], edge.TargetHandle)
+	if !found || targetPort.PortType == PortAnyMedia || targetPort.PortType == actual {
+		return nil
+	}
+	return mismatch(fmt.Sprintf(
+		"Cannot connect '%s' (%s) to '%s' input '%s' (%s)",
+		nodeLabel(source), actual, nodeLabel(target), edge.TargetHandle, targetPort.PortType,
+	))
+}
+
+func canonicalTargetHandle(nodeType, handle string) string {
+	if nodeType == "concat_timeline" {
+		if canonical, ok := legacyTimelineInputHandles[handle]; ok {
+			return canonical
+		}
+	}
+	return handle
+}
+
+// dynamicVideoInputIndex reports the 1-based video input index of handle on a
+// dynamic-input node. Indexes too large to parse are reported as exceeding
+// the limit, matching Python's unbounded integers.
+func dynamicVideoInputIndex(nodeType, handle string) (int, bool) {
+	if _, ok := dynamicVideoInputNodeTypes[nodeType]; !ok {
+		return 0, false
+	}
+	match := videoInputHandlePattern.FindStringSubmatch(canonicalTargetHandle(nodeType, handle))
+	if match == nil {
+		return 0, false
+	}
+	index, err := strconv.Atoi(match[1])
+	if err != nil {
+		return dynamicVideoInputMaxCount + 1, true
+	}
+	return index, index >= 1
+}
+
+func countDynamicVideoInputs(node contracts.PipelineNode, connectedInputs map[string]map[string]bool) int {
+	count := 0
+	for handle := range connectedInputs[node.ID] {
+		if _, dynamic := dynamicVideoInputIndex(node.Type, handle); dynamic {
+			count++
+		}
+	}
+	return count
+}
+
+func dynamicVideoSourceCompatible(registry map[string]NodeTypeDefinition, source contracts.PipelineNode, sourceHandle string) bool {
+	sourceDef, ok := registry[source.Type]
+	if !ok {
+		return false
+	}
+	port, found := findOutput(sourceDef, sourceHandle)
+	if !found || (port.PortType != PortVideo && port.PortType != PortAnyMedia) {
+		return false
+	}
+	actual, inferred := inferActualOutputPortType(source)
+	return !inferred || actual == PortVideo
+}
+
+// inferActualOutputPortType narrows any_media source nodes by their configured
+// media_type. dag.py also narrows url_download, which Go rejects as unsupported.
+func inferActualOutputPortType(node contracts.PipelineNode) (PortType, bool) {
+	if node.Type != "source" {
+		return "", false
+	}
+	mediaType, _ := node.Data.Config["media_type"].(string)
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "video":
+		return PortVideo, true
+	case "audio":
+		return PortAudio, true
+	case "image":
+		return PortImage, true
+	case "subtitle":
+		return PortSubtitle, true
+	}
+	return "", false
 }
 
 // sourceHasAsset reports whether a source node has been bound to an asset

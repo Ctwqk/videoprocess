@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/Ctwqk/videoprocess/internal/contracts"
@@ -29,6 +31,50 @@ func TestValidateMatchesBasicGoldenFixture(t *testing.T) {
 	}
 	if len(result.Warnings) != 0 {
 		t.Fatalf("warnings = %#v", result.Warnings)
+	}
+}
+
+// TestValidateMatchesSharedPythonCases runs the cases that
+// backend/tests/test_go_contract_fixtures.py checks against dag.py.
+func TestValidateMatchesSharedPythonCases(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "backend", "tests", "golden", "go_migration", "pipeline_validation_cases.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	type expectation struct {
+		Valid        bool     `json:"valid"`
+		ErrorTypes   []string `json:"error_types"`
+		WarningTypes []string `json:"warning_types"`
+	}
+	var fixture struct {
+		Cases []struct {
+			Name       string                       `json:"name"`
+			Definition contracts.PipelineDefinition `json:"definition"`
+			Expected   expectation                  `json:"expected"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixture.Cases) == 0 {
+		t.Fatal("no shared validation cases")
+	}
+	for _, tc := range fixture.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			result := Validate(tc.Definition)
+			observed := expectation{Valid: result.Valid, ErrorTypes: []string{}, WarningTypes: []string{}}
+			for _, e := range result.Errors {
+				observed.ErrorTypes = append(observed.ErrorTypes, e.Type)
+			}
+			for _, w := range result.Warnings {
+				observed.WarningTypes = append(observed.WarningTypes, w.Type)
+			}
+			sort.Strings(observed.ErrorTypes)
+			sort.Strings(observed.WarningTypes)
+			if !reflect.DeepEqual(observed, tc.Expected) {
+				t.Fatalf("observed %+v, want %+v (errors %#v)", observed, tc.Expected, result.Errors)
+			}
+		})
 	}
 }
 

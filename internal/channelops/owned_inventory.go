@@ -580,6 +580,9 @@ func (s *Store) finalizeOwnedTick(ctx context.Context, before, current tickPrepa
 	if err != nil {
 		return err
 	}
+	if err := s.enqueueTickCandidateEvent(ctx, candidate, taskID); err != nil {
+		return err
+	}
 	tag, err := db.Exec(ctx, `WITH reservation_clock AS MATERIALIZED (SELECT clock_timestamp() AS at)
 		UPDATE owned_seed_inventory_items item SET state='reserved',production_task_id=$2::uuid,consumed_at=c.at
 		FROM owned_seed_inventories i,reservation_clock c

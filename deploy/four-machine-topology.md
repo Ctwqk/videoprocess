@@ -38,7 +38,7 @@ Status date: 2026-07-25.
 | --- | --- | --- | --- |
 | Infra / Swarm manager | `ccttww-lap` | `10.0.0.150` | shared data stores, GPU/embedding, Redpanda bridge, dashboard, IBKR |
 | ForWin/news node | `CASPERs-Mac-mini.local` | `10.0.0.126` | ForWin and news Swarm tasks |
-| VideoProcess node | `Wenjies-Mac-mini.local` | `10.0.0.127` | VP frontend/API/worker, PDS, feature aggregator, arb app services |
+| VideoProcess node | `magi2.local` (formerly `Wenjies-Mac-mini.local`) | `10.0.0.127` | VP frontend/API/worker, PDS, feature aggregator, arb app services |
 
 ## Service Distribution
 
@@ -111,7 +111,7 @@ Use one of these as a Codex coding project:
 - Auxiliary VP checkout (not a runtime/deploy target): `10.0.0.126:/Users/magi1/VideoProcess-app`
 - 150 Constructure source repo: `10.0.0.150:/home/taiwei/Constructure-repos/videoprocess`
 
-Do not use `10.0.0.127:/Users/wenjieliu/VideoProcess-app` as a long-lived code
+Do not use `10.0.0.127:/Users/magi2/VideoProcess-app` (account renamed from `wenjieliu` on 2026-10-18) as a long-lived code
 project. It is the deploy output marked by `.deploy-sync-project` and
 `.deploy-sync-source-commit`.
 

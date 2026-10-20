@@ -37,3 +37,17 @@ def test_task_fixture_uses_existing_redis_payload_keys():
     ]
     assert json.loads(task["config"])["output_format"] == "mp4"
     assert json.loads(task["input_artifacts"])["input"] == "00000000-0000-0000-0000-000000000301"
+
+
+def test_shared_validation_cases_match_python_validator():
+    # internal/pipeline/validate_test.go runs the same cases against the Go validator.
+    cases = json.loads((FIXTURE_DIR / "pipeline_validation_cases.json").read_text(encoding="utf-8"))["cases"]
+    assert cases
+    for case in cases:
+        result = validate_pipeline(PipelineDefinition.model_validate(case["definition"]))
+        observed = {
+            "valid": result.valid,
+            "error_types": sorted(error.type for error in result.errors),
+            "warning_types": sorted(warning.type for warning in result.warnings),
+        }
+        assert observed == case["expected"], case["name"]

@@ -425,7 +425,7 @@ exit "${CHANNEL_BUILD_STATUS:-0}"
 EOF
   chmod 0700 "$fake_dir/docker"
   printf '%s\n' "$script" >"$fake_dir/build.sh"
-  env -i PATH="$fake_dir:$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-$TEST_ROOT}" \
+  env -i PATH="$fake_dir:$PATH" HOME="${REMOTE_TEST_HOME:-/Users/magi2}" TMPDIR="${TMPDIR:-$TEST_ROOT}" \
     CALLS="$CALLS" CHANNEL_BUILD_STATUS="${CHANNEL_BUILD_STATUS:-0}" \
     /bin/sh "$fake_dir/build.sh" "$@"
 }
@@ -450,7 +450,7 @@ remote_sh() {
     && "${1:-}" == "/bin/sh" \
     && "${2:-}" == "-s" \
     && "${3:-}" == "--" \
-    && "${4:-}" == "/Users/wenjieliu/VideoProcess-app" \
+    && "${4:-}" == "/Users/magi2/VideoProcess-app" \
     && "${5:-}" == "backend/Dockerfile.ffmpeg-worker-go" \
     && "${6:-}" == "vp-ffmpeg-worker-go:deploy-0123456789ab" \
     && "${7:-}" == "$TEST_COMMIT" ]]; then
@@ -1534,7 +1534,7 @@ test_runtime_health_host_contract
 
 test_channelops_build_contract() (
   CALLS="$TEST_ROOT/channelops-contract-calls"
-  local context=/Users/wenjieliu/VideoProcess-app
+  local context=/Users/magi2/VideoProcess-app
   local dockerfile=backend/Dockerfile.channelops-runner-go
   local image=vp-channelops-runner-go:deploy-0123456789ab
   local invalid mode
@@ -1569,7 +1569,7 @@ test_channelops_build_contract() (
       local host=10.0.0.127 ctx="$context" file="$dockerfile" tag="$image"
       case "$invalid" in
         host) host=10.0.0.126 ;;
-        context) ctx=/Users/wenjieliu/VideoProcess-app/backend ;;
+        context) ctx=/Users/magi2/VideoProcess-app/backend ;;
         dockerfile) file=backend/Dockerfile.ffmpeg-worker-go ;;
         image) tag=vp-channelops-runner-go:deploy-ffffffffffff ;;
       esac
@@ -1607,7 +1607,7 @@ test_channelops_build_contract() (
   for invalid in context dockerfile image; do
     local ctx="$context" file="$dockerfile" tag="$image"
     case "$invalid" in
-      context) ctx=/Users/wenjieliu/VideoProcess-app/backend ;;
+      context) ctx=/Users/magi2/VideoProcess-app/backend ;;
       dockerfile) file=backend/Dockerfile.ffmpeg-worker-go ;;
       image) tag=vp-channelops-runner-go:deploy-ffffffffffff ;;
     esac
@@ -1618,6 +1618,14 @@ test_channelops_build_contract() (
     fi
     [[ ! -s "$CALLS" ]] || exit 1
   done
+  # The remote guard binds the context to the remote account, not to a literal path.
+  : >"$CALLS"
+  if REMOTE_TEST_HOME=/Users/wenjieliu \
+    run_channelops_build_script "$remote_script" "$context" "$dockerfile" "$image" "$TEST_COMMIT"; then
+    echo 'FAIL: remote ChannelOps script accepted a context outside the remote home' >&2
+    exit 1
+  fi
+  [[ ! -s "$CALLS" ]] || exit 1
   : >"$CALLS"
   if CHANNEL_BUILD_STATUS=37 vp_build_runtime_channelops_image "$context" "$dockerfile" "$image" "$TEST_COMMIT"; then
     echo 'FAIL: ChannelOps swallowed a Docker build failure' >&2
@@ -4724,10 +4732,10 @@ if [[ "$cron_writes_after" -ne "$cron_writes_before" ]]; then
 fi
 
 grep -Fq \
-  "remote|10.0.0.127|/bin/sh|-s|--|/Users/wenjieliu/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go|vp-ffmpeg-worker-go:deploy-0123456789ab|$TEST_COMMIT" \
+  "remote|10.0.0.127|/bin/sh|-s|--|/Users/magi2/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go|vp-ffmpeg-worker-go:deploy-0123456789ab|$TEST_COMMIT" \
   "$CALLS"
 if grep -Fq \
-  'build|10.0.0.127|/Users/wenjieliu/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go' \
+  'build|10.0.0.127|/Users/magi2/VideoProcess-app|backend/Dockerfile.ffmpeg-worker-go' \
   "$CALLS"; then
   echo 'FAIL: versioned Go worker used the four-argument build helper' >&2
   exit 1

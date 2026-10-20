@@ -223,9 +223,17 @@ func (s *Store) finalizeTick(
 		return auditWrite.complete(ctx, db)
 	}
 
+	for _, candidate := range rejected {
+		if err := s.enqueueTickCandidateEvent(ctx, candidate, ""); err != nil {
+			return err
+		}
+	}
 	for _, candidate := range accepted {
 		taskID, err := s.insertProductionTask(ctx, db, channel, candidate, now)
 		if err != nil {
+			return err
+		}
+		if err := s.enqueueTickCandidateEvent(ctx, candidate, taskID); err != nil {
 			return err
 		}
 		if candidate.DiscoverySignal != nil {

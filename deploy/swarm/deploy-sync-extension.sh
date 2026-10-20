@@ -77,6 +77,11 @@ VP_RUNTIME_HEALTH_HOST="${VP_RUNTIME_HEALTH_HOST-$VP_RUNTIME_HOST}"
 VP_RUNTIME_NODE="${VP_RUNTIME_NODE:-colima-127}"
 VP_RUNTIME_CONSTRAINT="node.labels.vp.runtime==true"
 VP_RUNTIME_NODE_CONSTRAINT="node.hostname==$VP_RUNTIME_NODE"
+# Runtime account home on 127. Not env-overridable; remote build scripts
+# independently require their context to be "$HOME/VideoProcess-app".
+VP_RUNTIME_ACCOUNT_HOME=/Users/magi2
+VP_RUNTIME_APP_ROOT="$VP_RUNTIME_ACCOUNT_HOME/VideoProcess-app"
+VP_RUNTIME_DEPLOY_BUILD_ROOT="$VP_RUNTIME_ACCOUNT_HOME/.deploy-build"
 VP_GPU_CONSTRAINT="node.labels.vp.gpu==true"
 VP_MANAGER_NODE="${VP_MANAGER_NODE:-ccttww-lap}"
 VP_GPU_MANAGER_CONSTRAINT="node.hostname==$VP_MANAGER_NODE"
@@ -212,15 +217,9 @@ stage_from_repo() {
   mkdir -p "$stage_tmp" || return 1
   rsync -a --delete --exclude '.git/' \
     "$REPO_ROOT/$repo_name/$source_subdir"/ "$stage_tmp"/ || return 1
-  if [[ "$project" == vp-app ]]; then
-    # Startup switches and proxy routing are native; the host patch is obsolete.
-    install -m 0644 "$OVERLAY_ROOT/127-vp-backend.dockerignore" \
-      "$stage_tmp/backend/.dockerignore" || return 1
-    install -m 0644 "$OVERLAY_ROOT/127-vp-frontend/.dockerignore" \
-      "$stage_tmp/frontend/.dockerignore" || return 1
-    install -m 0644 "$OVERLAY_ROOT/127-vp-frontend/nginx.conf" \
-      "$stage_tmp/frontend/nginx.conf" || return 1
-  else
+  # vp-app packaging (.dockerignore files, nginx.conf) is versioned in the repo,
+  # so the host overlay is not applied to it.
+  if [[ "$project" != vp-app ]]; then
     apply_overlay "$project" "$stage_tmp" || return 1
   fi
   rm -rf "$stage_dir" || return 1
@@ -12687,7 +12686,7 @@ vp_build_runtime_worker_image() {
     return 0
   fi
   if [[ "$VP_RUNTIME_HOST" != 10.0.0.127 \
-    || "$context_dir" != /Users/wenjieliu/VideoProcess-app \
+    || "$context_dir" != "$VP_RUNTIME_APP_ROOT" \
     || "$dockerfile" != backend/Dockerfile.ffmpeg-worker-go \
     || ! "$build_commit" =~ ^[0-9a-f]{40}$ \
     || "$image" != "vp-ffmpeg-worker-go:deploy-${build_commit:0:12}" ]]; then
@@ -12706,7 +12705,7 @@ case "$context_dir|$dockerfile|$image|$build_commit" in
     exit 1
     ;;
 esac
-[ "$context_dir" = /Users/wenjieliu/VideoProcess-app ]
+[ "$context_dir" = "$HOME/VideoProcess-app" ]
 [ "$dockerfile" = backend/Dockerfile.ffmpeg-worker-go ]
 printf '%s\n' "$build_commit" | grep -Eq '^[0-9a-f]{40}$'
 [ "$image" = "vp-ffmpeg-worker-go:deploy-$(printf '%s' "$build_commit" | cut -c1-12)" ]
@@ -12724,7 +12723,7 @@ vp_build_runtime_channelops_image() {
   local image="${3:-}"
   local build_commit="${4:-}"
   if [[ "$VP_RUNTIME_HOST" != 10.0.0.127 \
-    || "$context_dir" != /Users/wenjieliu/VideoProcess-app \
+    || "$context_dir" != "$VP_RUNTIME_APP_ROOT" \
     || "$dockerfile" != backend/Dockerfile.channelops-runner-go \
     || ! "$build_commit" =~ ^[0-9a-f]{40}$ \
     || "$image" != "vp-channelops-runner-go:deploy-${build_commit:0:12}" ]]; then
@@ -12747,7 +12746,7 @@ case "$context_dir|$dockerfile|$image|$build_commit" in
     exit 1
     ;;
 esac
-[ "$context_dir" = /Users/wenjieliu/VideoProcess-app ]
+[ "$context_dir" = "$HOME/VideoProcess-app" ]
 [ "$dockerfile" = backend/Dockerfile.channelops-runner-go ]
 [ "${#build_commit}" -eq 40 ]
 printf '%s\n' "$build_commit" | grep -Eq '^[0-9a-f]{40}$'
@@ -12774,18 +12773,18 @@ build_vp_app_images() {
   local ffmpeg_go="vp-ffmpeg-worker-go:deploy-$short"
   local python_worker="vp-ffmpeg-worker-python:deploy-$short"
 
-  build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app \
+  build_image_on_host "$VP_RUNTIME_HOST" "$VP_RUNTIME_APP_ROOT" \
     backend/Dockerfile.api-go "$api" || return 1
-  build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app/frontend \
+  build_image_on_host "$VP_RUNTIME_HOST" "$VP_RUNTIME_APP_ROOT/frontend" \
     Dockerfile "$frontend" || return 1
-  build_image_on_host "$VP_RUNTIME_HOST" /Users/wenjieliu/VideoProcess-app/backend \
+  build_image_on_host "$VP_RUNTIME_HOST" "$VP_RUNTIME_APP_ROOT/backend" \
     Dockerfile.api "$backend" || return 1
   vp_build_runtime_channelops_image \
-    /Users/wenjieliu/VideoProcess-app \
+    "$VP_RUNTIME_APP_ROOT" \
     backend/Dockerfile.channelops-runner-go \
     "$channelops_runner" "$commit" || return 1
   vp_build_runtime_worker_image \
-    /Users/wenjieliu/VideoProcess-app \
+    "$VP_RUNTIME_APP_ROOT" \
     backend/Dockerfile.ffmpeg-worker-go \
     "$ffmpeg_go" "$commit" || return 1
   vp_build_manager_image "$REPO_ROOT/videoprocess/backend" \
@@ -12805,7 +12804,7 @@ build_feature_aggregator_images() {
   local tag
   tag="$(image_tag vp-feature-aggregator "$commit")"
   build_image_on_host "$VP_RUNTIME_HOST" \
-    /Users/wenjieliu/.deploy-build/vp-feature-aggregator \
+    "$VP_RUNTIME_DEPLOY_BUILD_ROOT/vp-feature-aggregator" \
     deploy/Dockerfile "$tag" || return 1
   printf '%s\n' "$tag"
 }
@@ -12818,7 +12817,7 @@ build_pds_images() {
   local tag
   tag="$(image_tag vp-pds "$commit")"
   build_image_on_host "$VP_RUNTIME_HOST" \
-    /Users/wenjieliu/.deploy-build/policy-decision-service \
+    "$VP_RUNTIME_DEPLOY_BUILD_ROOT/policy-decision-service" \
     deploy/Dockerfile "$tag" || return 1
   printf '%s\n' "$tag"
 }
