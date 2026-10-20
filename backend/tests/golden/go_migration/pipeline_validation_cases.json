@@ -1,0 +1,2789 @@
+{
+  "_comment": "Shared Python/Go validator parity cases. Expected values come from backend/app/orchestrator/dag.py; both test suites load this file.",
+  "cases": [
+    {
+      "name": "concat_many_two_inputs",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_2"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": true,
+        "error_types": [],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_many_three_inputs",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s3",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s3",
+              "config": {
+                "asset_id": "asset-s3",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_2"
+          },
+          {
+            "id": "e3",
+            "source": "s3",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_3"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": true,
+        "error_types": [],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_many_sparse_inputs",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_7"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": true,
+        "error_types": [],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_many_sixty_four_inputs",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s3",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s3",
+              "config": {
+                "asset_id": "asset-s3",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s4",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s4",
+              "config": {
+                "asset_id": "asset-s4",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s5",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s5",
+              "config": {
+                "asset_id": "asset-s5",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s6",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s6",
+              "config": {
+                "asset_id": "asset-s6",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s7",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s7",
+              "config": {
+                "asset_id": "asset-s7",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s8",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s8",
+              "config": {
+                "asset_id": "asset-s8",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s9",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s9",
+              "config": {
+                "asset_id": "asset-s9",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s10",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s10",
+              "config": {
+                "asset_id": "asset-s10",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s11",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s11",
+              "config": {
+                "asset_id": "asset-s11",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s12",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s12",
+              "config": {
+                "asset_id": "asset-s12",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s13",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s13",
+              "config": {
+                "asset_id": "asset-s13",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s14",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s14",
+              "config": {
+                "asset_id": "asset-s14",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s15",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s15",
+              "config": {
+                "asset_id": "asset-s15",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s16",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s16",
+              "config": {
+                "asset_id": "asset-s16",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s17",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s17",
+              "config": {
+                "asset_id": "asset-s17",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s18",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s18",
+              "config": {
+                "asset_id": "asset-s18",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s19",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s19",
+              "config": {
+                "asset_id": "asset-s19",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s20",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s20",
+              "config": {
+                "asset_id": "asset-s20",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s21",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s21",
+              "config": {
+                "asset_id": "asset-s21",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s22",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s22",
+              "config": {
+                "asset_id": "asset-s22",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s23",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s23",
+              "config": {
+                "asset_id": "asset-s23",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s24",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s24",
+              "config": {
+                "asset_id": "asset-s24",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s25",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s25",
+              "config": {
+                "asset_id": "asset-s25",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s26",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s26",
+              "config": {
+                "asset_id": "asset-s26",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s27",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s27",
+              "config": {
+                "asset_id": "asset-s27",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s28",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s28",
+              "config": {
+                "asset_id": "asset-s28",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s29",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s29",
+              "config": {
+                "asset_id": "asset-s29",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s30",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s30",
+              "config": {
+                "asset_id": "asset-s30",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s31",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s31",
+              "config": {
+                "asset_id": "asset-s31",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s32",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s32",
+              "config": {
+                "asset_id": "asset-s32",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s33",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s33",
+              "config": {
+                "asset_id": "asset-s33",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s34",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s34",
+              "config": {
+                "asset_id": "asset-s34",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s35",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s35",
+              "config": {
+                "asset_id": "asset-s35",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s36",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s36",
+              "config": {
+                "asset_id": "asset-s36",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s37",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s37",
+              "config": {
+                "asset_id": "asset-s37",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s38",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s38",
+              "config": {
+                "asset_id": "asset-s38",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s39",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s39",
+              "config": {
+                "asset_id": "asset-s39",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s40",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s40",
+              "config": {
+                "asset_id": "asset-s40",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s41",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s41",
+              "config": {
+                "asset_id": "asset-s41",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s42",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s42",
+              "config": {
+                "asset_id": "asset-s42",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s43",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s43",
+              "config": {
+                "asset_id": "asset-s43",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s44",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s44",
+              "config": {
+                "asset_id": "asset-s44",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s45",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s45",
+              "config": {
+                "asset_id": "asset-s45",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s46",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s46",
+              "config": {
+                "asset_id": "asset-s46",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s47",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s47",
+              "config": {
+                "asset_id": "asset-s47",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s48",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s48",
+              "config": {
+                "asset_id": "asset-s48",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s49",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s49",
+              "config": {
+                "asset_id": "asset-s49",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s50",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s50",
+              "config": {
+                "asset_id": "asset-s50",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s51",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s51",
+              "config": {
+                "asset_id": "asset-s51",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s52",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s52",
+              "config": {
+                "asset_id": "asset-s52",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s53",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s53",
+              "config": {
+                "asset_id": "asset-s53",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s54",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s54",
+              "config": {
+                "asset_id": "asset-s54",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s55",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s55",
+              "config": {
+                "asset_id": "asset-s55",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s56",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s56",
+              "config": {
+                "asset_id": "asset-s56",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s57",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s57",
+              "config": {
+                "asset_id": "asset-s57",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s58",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s58",
+              "config": {
+                "asset_id": "asset-s58",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s59",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s59",
+              "config": {
+                "asset_id": "asset-s59",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s60",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s60",
+              "config": {
+                "asset_id": "asset-s60",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s61",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s61",
+              "config": {
+                "asset_id": "asset-s61",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s62",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s62",
+              "config": {
+                "asset_id": "asset-s62",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s63",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s63",
+              "config": {
+                "asset_id": "asset-s63",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s64",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s64",
+              "config": {
+                "asset_id": "asset-s64",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_2"
+          },
+          {
+            "id": "e3",
+            "source": "s3",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_3"
+          },
+          {
+            "id": "e4",
+            "source": "s4",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_4"
+          },
+          {
+            "id": "e5",
+            "source": "s5",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_5"
+          },
+          {
+            "id": "e6",
+            "source": "s6",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_6"
+          },
+          {
+            "id": "e7",
+            "source": "s7",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_7"
+          },
+          {
+            "id": "e8",
+            "source": "s8",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_8"
+          },
+          {
+            "id": "e9",
+            "source": "s9",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_9"
+          },
+          {
+            "id": "e10",
+            "source": "s10",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_10"
+          },
+          {
+            "id": "e11",
+            "source": "s11",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_11"
+          },
+          {
+            "id": "e12",
+            "source": "s12",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_12"
+          },
+          {
+            "id": "e13",
+            "source": "s13",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_13"
+          },
+          {
+            "id": "e14",
+            "source": "s14",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_14"
+          },
+          {
+            "id": "e15",
+            "source": "s15",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_15"
+          },
+          {
+            "id": "e16",
+            "source": "s16",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_16"
+          },
+          {
+            "id": "e17",
+            "source": "s17",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_17"
+          },
+          {
+            "id": "e18",
+            "source": "s18",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_18"
+          },
+          {
+            "id": "e19",
+            "source": "s19",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_19"
+          },
+          {
+            "id": "e20",
+            "source": "s20",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_20"
+          },
+          {
+            "id": "e21",
+            "source": "s21",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_21"
+          },
+          {
+            "id": "e22",
+            "source": "s22",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_22"
+          },
+          {
+            "id": "e23",
+            "source": "s23",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_23"
+          },
+          {
+            "id": "e24",
+            "source": "s24",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_24"
+          },
+          {
+            "id": "e25",
+            "source": "s25",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_25"
+          },
+          {
+            "id": "e26",
+            "source": "s26",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_26"
+          },
+          {
+            "id": "e27",
+            "source": "s27",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_27"
+          },
+          {
+            "id": "e28",
+            "source": "s28",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_28"
+          },
+          {
+            "id": "e29",
+            "source": "s29",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_29"
+          },
+          {
+            "id": "e30",
+            "source": "s30",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_30"
+          },
+          {
+            "id": "e31",
+            "source": "s31",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_31"
+          },
+          {
+            "id": "e32",
+            "source": "s32",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_32"
+          },
+          {
+            "id": "e33",
+            "source": "s33",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_33"
+          },
+          {
+            "id": "e34",
+            "source": "s34",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_34"
+          },
+          {
+            "id": "e35",
+            "source": "s35",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_35"
+          },
+          {
+            "id": "e36",
+            "source": "s36",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_36"
+          },
+          {
+            "id": "e37",
+            "source": "s37",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_37"
+          },
+          {
+            "id": "e38",
+            "source": "s38",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_38"
+          },
+          {
+            "id": "e39",
+            "source": "s39",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_39"
+          },
+          {
+            "id": "e40",
+            "source": "s40",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_40"
+          },
+          {
+            "id": "e41",
+            "source": "s41",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_41"
+          },
+          {
+            "id": "e42",
+            "source": "s42",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_42"
+          },
+          {
+            "id": "e43",
+            "source": "s43",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_43"
+          },
+          {
+            "id": "e44",
+            "source": "s44",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_44"
+          },
+          {
+            "id": "e45",
+            "source": "s45",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_45"
+          },
+          {
+            "id": "e46",
+            "source": "s46",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_46"
+          },
+          {
+            "id": "e47",
+            "source": "s47",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_47"
+          },
+          {
+            "id": "e48",
+            "source": "s48",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_48"
+          },
+          {
+            "id": "e49",
+            "source": "s49",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_49"
+          },
+          {
+            "id": "e50",
+            "source": "s50",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_50"
+          },
+          {
+            "id": "e51",
+            "source": "s51",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_51"
+          },
+          {
+            "id": "e52",
+            "source": "s52",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_52"
+          },
+          {
+            "id": "e53",
+            "source": "s53",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_53"
+          },
+          {
+            "id": "e54",
+            "source": "s54",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_54"
+          },
+          {
+            "id": "e55",
+            "source": "s55",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_55"
+          },
+          {
+            "id": "e56",
+            "source": "s56",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_56"
+          },
+          {
+            "id": "e57",
+            "source": "s57",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_57"
+          },
+          {
+            "id": "e58",
+            "source": "s58",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_58"
+          },
+          {
+            "id": "e59",
+            "source": "s59",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_59"
+          },
+          {
+            "id": "e60",
+            "source": "s60",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_60"
+          },
+          {
+            "id": "e61",
+            "source": "s61",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_61"
+          },
+          {
+            "id": "e62",
+            "source": "s62",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_62"
+          },
+          {
+            "id": "e63",
+            "source": "s63",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_63"
+          },
+          {
+            "id": "e64",
+            "source": "s64",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_64"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": true,
+        "error_types": [],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_many_single_input",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "error_types": [
+          "missing_required_input"
+        ],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_many_input_over_limit",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_65"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "error_types": [
+          "invalid_dynamic_input"
+        ],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_many_video_zero_rejected",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s3",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s3",
+              "config": {
+                "asset_id": "asset-s3",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_0"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e3",
+            "source": "s3",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_2"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "error_types": [
+          "port_type_mismatch"
+        ],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_many_audio_source_rejected",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "audio"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_2"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "error_types": [
+          "port_type_mismatch"
+        ],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_timeline_legacy_handles",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_timeline",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_first"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_second"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": true,
+        "error_types": [],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_timeline_legacy_and_canonical_duplicate",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_timeline",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_first"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "error_types": [
+          "duplicate_input_port",
+          "missing_required_input"
+        ],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_many_legacy_handle_not_aliased",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_first"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_second"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "error_types": [
+          "missing_required_input",
+          "port_type_mismatch",
+          "port_type_mismatch"
+        ],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_many_duplicate_handle",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s3",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s3",
+              "config": {
+                "asset_id": "asset-s3",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e3",
+            "source": "s3",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_2"
+          },
+          {
+            "id": "eo",
+            "source": "c",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "error_types": [
+          "duplicate_input_port"
+        ],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "audio_source_into_video_port",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "audio"
+              }
+            }
+          },
+          {
+            "id": "t",
+            "type": "trim",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "t",
+              "config": {
+                "start_time": 0
+              }
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "t",
+            "targetHandle": "input"
+          },
+          {
+            "id": "e2",
+            "source": "t",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": false,
+        "error_types": [
+          "port_type_mismatch"
+        ],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "audio_source_into_any_media_port",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "audio"
+              }
+            }
+          },
+          {
+            "id": "out",
+            "type": "export",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "out",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "out",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": true,
+        "error_types": [],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "disconnected_output_warns",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "t",
+            "type": "trim",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "t",
+              "config": {
+                "start_time": 0
+              }
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "t",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": true,
+        "error_types": [],
+        "warning_types": [
+          "disconnected_node"
+        ]
+      }
+    },
+    {
+      "name": "terminal_transcode_does_not_warn",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "t",
+            "type": "transcode",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "t",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "t",
+            "targetHandle": "input"
+          }
+        ]
+      },
+      "expected": {
+        "valid": true,
+        "error_types": [],
+        "warning_types": []
+      }
+    },
+    {
+      "name": "concat_output_disconnected_warns",
+      "definition": {
+        "nodes": [
+          {
+            "id": "s1",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s1",
+              "config": {
+                "asset_id": "asset-s1",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "s2",
+            "type": "source",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "s2",
+              "config": {
+                "asset_id": "asset-s2",
+                "media_type": "video"
+              }
+            }
+          },
+          {
+            "id": "c",
+            "type": "concat_many",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "data": {
+              "label": "c",
+              "config": {}
+            }
+          }
+        ],
+        "edges": [
+          {
+            "id": "e1",
+            "source": "s1",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_1"
+          },
+          {
+            "id": "e2",
+            "source": "s2",
+            "sourceHandle": "output",
+            "target": "c",
+            "targetHandle": "video_2"
+          }
+        ]
+      },
+      "expected": {
+        "valid": true,
+        "error_types": [],
+        "warning_types": [
+          "disconnected_node"
+        ]
+      }
+    }
+  ]
+}
