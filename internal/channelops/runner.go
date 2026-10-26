@@ -132,6 +132,35 @@ func (c *postgresLeadershipController) Status() LeaderStatus {
 	return status
 }
 
+// ValidateActive checks the retained session without writing the leader row.
+// A heartbeat UPDATE here would contend with our own execution FOR SHARE fence
+// and let a short readiness deadline revoke an otherwise healthy leader.
+func (c *postgresLeadershipController) ValidateActive(ctx context.Context) (*LeaderAuthority, error) {
+	if c == nil {
+		return nil, ErrLeaderAuthorityUnavailable
+	}
+	if err := c.acquireOperation(ctx); err != nil {
+		return nil, err
+	}
+	operationCtx, operation, err := c.beginOperation(ctx)
+	if err != nil {
+		c.releaseOperation()
+		return nil, err
+	}
+	defer c.finishOperation(operation)
+	if c.lease == nil {
+		return nil, nil
+	}
+	if err := c.lease.Validate(operationCtx); err != nil {
+		c.lease = nil
+		c.publishStatus(LeaderStatus{Role: LeaderRoleUnavailable, Err: err})
+		return nil, err
+	}
+	authority := c.lease.Authority()
+	c.publishStatus(LeaderStatus{Role: LeaderRoleActive, Authority: cloneLeaderAuthority(authority)})
+	return cloneLeaderAuthority(authority), nil
+}
+
 func (c *postgresLeadershipController) Close(ctx context.Context, now time.Time) error {
 	if c == nil {
 		return nil

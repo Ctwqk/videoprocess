@@ -236,6 +236,39 @@ func (l *LeaderLease) Heartbeat(ctx context.Context, now time.Time) error {
 	return nil
 }
 
+// Validate performs I/O on the dedicated advisory-lock session, so a dropped
+// session cannot pass readiness using cached authority. It takes no row lock
+// and leaves heartbeat_at unchanged while execution transactions are running.
+func (l *LeaderLease) Validate(ctx context.Context) error {
+	if l == nil {
+		return ErrLeaderAuthorityUnavailable
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.released || l.conn == nil {
+		return ErrLeaderAuthorityLost
+	}
+	authority := l.authority
+	var acquiredAt, heartbeatAt time.Time
+	err := l.conn.QueryRow(ctx, `
+		SELECT acquired_at, heartbeat_at FROM channelops_leader_epochs
+		WHERE service_name = $1 AND holder_id = $2 AND epoch = $3
+		  AND released_at IS NULL
+	`, authority.ServiceName, authority.HolderID, authority.Epoch).Scan(&acquiredAt, &heartbeatAt)
+	if err != nil {
+		l.state.clear(authority)
+		releaseErr := l.releaseConnectionLocked(ctx)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errors.Join(ErrLeaderAuthorityLost, releaseErr)
+		}
+		return errors.Join(err, releaseErr)
+	}
+	l.authority.AcquiredAt = acquiredAt
+	l.authority.HeartbeatAt = heartbeatAt
+	l.state.refresh(authority, acquiredAt, heartbeatAt)
+	return nil
+}
+
 func (l *LeaderLease) Release(ctx context.Context, now time.Time) error {
 	if l == nil {
 		return nil

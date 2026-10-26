@@ -40,6 +40,10 @@ type readinessChecker interface {
 	ReadyCheck(ctx context.Context) HealthStatus
 }
 
+type readinessLeadershipValidator interface {
+	ValidateActive(context.Context) (*LeaderAuthority, error)
+}
+
 func (r *Runner) HealthCheck(ctx context.Context) HealthStatus {
 	status := r.ReadyCheck(ctx)
 	now := time.Now().UTC()
@@ -88,7 +92,13 @@ func (r *Runner) ReadyCheck(ctx context.Context) HealthStatus {
 func (r *Runner) validatedReadinessLeadership(ctx context.Context) LeaderStatus {
 	validationCtx, cancel := context.WithTimeout(ctx, runnerReadinessLeadershipTimeout)
 	defer cancel()
-	authority, err := r.Leadership.EnsureActive(validationCtx, r.now())
+	var authority *LeaderAuthority
+	var err error
+	if validator, ok := r.Leadership.(readinessLeadershipValidator); ok {
+		authority, err = validator.ValidateActive(validationCtx)
+	} else {
+		authority, err = r.Leadership.EnsureActive(validationCtx, r.now())
+	}
 	if err != nil {
 		return LeaderStatus{Role: LeaderRoleUnavailable, Err: err}
 	}
